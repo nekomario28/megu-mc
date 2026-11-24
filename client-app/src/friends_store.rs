@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Persistent `FRL3` device identity and the trusted-friends store.
 //!
 //! [`load_or_create_identity`] keeps the player's 256-bit X25519 static

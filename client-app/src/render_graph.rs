@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic frame render-graph planner for the Vulkan paths.
 //!
 //! [`plan_frame`] turns a [`GpuPipelineKind`] plus a [`FramePlanInput`] into

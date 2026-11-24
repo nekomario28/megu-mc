@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Data-driven 3D cubic planet/orbit sky bridge: a fail-closed coordinator
 //! that lets verified space-mod dimensions (Ad Astra, Create: Aeronautics,

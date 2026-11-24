@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Raytraced 3D spatial audio and acoustic simulation DSP engine.
 //!
 //! The engine couples a deterministic voxel raytracer (Amanatides-Woo DDA,

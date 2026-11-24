@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Opt-in `megu:lod_v1` server plugin channel (Wave B3).
 //
 // Negotiation rides the standard C2S `0x12` plugin-channel payloads: a client

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Culling/perf regression gate for the client-fork render architecture.
 
 See specs/client-fork/sodium-culling-architecture.md for the layer contract

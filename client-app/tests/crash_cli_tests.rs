@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane UX-CRASH-2: end-to-end wiring of the crash reporter into the
 //! `megu-client` executable — the `--crash-report-mode` /
 //! `--report-endpoint` / `--crash-reports-dir` / `--flush-crash-reports` /

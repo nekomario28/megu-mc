@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Phase P3-C core: recipe-book state + `/recipe` engine, player statistics, and
 // the tab-list header/footer packet. Every wire layout below was verified
 // against the 1.21.1 (protocol 767) server jar:

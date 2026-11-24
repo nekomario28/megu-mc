@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Loopback proof for [`megu_proto::session::ServerSession`]: a
 //! `1.21.1`/`767` client and a `26.3`/`777` client both complete status
 //! ping/pong and the full Handshake -> Login -> Configuration -> Play flow

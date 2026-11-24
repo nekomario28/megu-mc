@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic content-addressed custom painting/photo media registry and
 //! chunked `MDIA` sync — a clean-room foundation for immersive-painting,

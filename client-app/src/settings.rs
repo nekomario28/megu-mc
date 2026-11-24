@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Player-facing graphics settings for the native megu client.
 //!
 //! Design rule (low cognitive load): optimizations with zero player-visible

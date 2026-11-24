@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Lane QUAL-INEI-PORT: the "Inei-Raisan" lighting audit
 //! (`audit/inei-raisan-visuals-and-faithful-spatial-audio-audit-20261123.md`

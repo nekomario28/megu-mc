@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Focused proofs for the client-gpu optimization wiring:
 //!
 //! 1. mini-HUD `/proc` + DRM sysfs sampling is throttled to

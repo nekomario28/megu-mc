@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane OPT-WAVE3 proofs:
 //!
 //! 1. `GpuRenderer::cull_live_sections` now feeds retained SoA bounds to

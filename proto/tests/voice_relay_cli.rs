@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! End-to-end tests for the `megu-voice-relay` binary: real process
 //! invocations asserting exit codes (`0` help/self-test/bench, `2` bad args
 //! or a refused public bind) and the machine-readable benchmark report.

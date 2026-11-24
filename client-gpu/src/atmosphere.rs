@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Smooth biome/dimension atmosphere blending and chunk fade-in polish,
 //! plus the geometry bridges that turn client-port's layered voxel clouds
 //! and 3D cubic planets/suns into `TerrainVertex` buffers.

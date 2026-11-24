@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Zero-side-effect parity proofs for `perf_cache`: every cache must return
 //! byte-identical results to the uncached path, invalidate on every
 //! discriminator change, and fail closed on corrupt input — never panic,

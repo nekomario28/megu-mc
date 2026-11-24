@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Dependency-free shaderpack option screen for the client UI.
 //!
 //! Hosts supply plain option/profile/screen metadata parsed by the pack

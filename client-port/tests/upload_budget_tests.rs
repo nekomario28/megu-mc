@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `ChunkUploadBudget`: per-frame upload admission, P95-driven adaptive
 //! throttling, and burst-smooth spreading of join/teleport upload floods.
 

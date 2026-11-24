@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Protocol-version identity and structured capability flags.
 //!
 //! Downstream code branches on [`VersionCapabilities`] instead of scattering

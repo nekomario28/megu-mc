@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane OPS-1 integration tests: the `AUD1` audit WAL + rollback engine
 //! (`audit_log`) and the Chunky-style pregen controller + ticket-driven LRU
 //! unloader (`pregen`), exercised end to end against a live `ServerContext`.

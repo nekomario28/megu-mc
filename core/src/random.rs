@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Java-exact random sources, clean-room from the pinned vanilla contracts.
 //!
 //! Three distinct generators share this module because the game uses three

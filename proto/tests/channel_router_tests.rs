@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use megu_proto::channel_router::{
     classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
     ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelHandlerKind, ChannelNameError,

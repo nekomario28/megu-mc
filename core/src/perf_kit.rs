@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::perf_kit` — reusable, zero-dependency performance
 //! primitives for any block entity, modded machine, transport node, or
 //! persistence unit.

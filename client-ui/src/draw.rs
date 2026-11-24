@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic 2D `UiDrawList`, built-in 8×8 bitmap font, GPU quad
 //! tessellation (with a companion WGSL shader) and a pure-`std` software
 //! RGBA rasterizer.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Geometry audit pins: rim UV sampling, HD sprite extrusion, model-projected
 //! fixture UVs, coplanar z-fighting freedom, and ladder facing orientation.

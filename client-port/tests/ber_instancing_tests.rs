@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //
 // Generic block-entity instancing proofs: a 2,000-unit factory wall must
 // collapse to a handful of instanced draws, and every cull layer must be

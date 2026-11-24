@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane MT-CLIENT-AUDIO-2 tests (audit §3.3 / Gate P3):
 //!
 //!  * P3 — a dedicated real-time `AudioMixThread` decouples all mixing from

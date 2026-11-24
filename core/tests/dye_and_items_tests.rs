@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Behavior-pinning tests for `dye_and_items`: every expectation is a literal
 //! extracted from the pinned vanilla 1.21.1 jar (sha1
 //! `59353fb40c36d304f2035d51e7d6e6baa98dc05c`) — `DyeColor.<clinit>` RGB

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Cross-OS hardening coverage for the folder layer: `eula.txt` parsing
 //! against real-world editor quirks, the `mods/` scanner's typed skip
 //! classification, and the standard dedicated-server / client `<gameDir>`

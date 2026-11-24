@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room `CustomPacketPayload` wire codec for the claims sync feed.
 //!
 //! [`crate::claims`] keeps a monotonic `revision`-stamped

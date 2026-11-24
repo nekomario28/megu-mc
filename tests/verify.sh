@@ -174,6 +174,11 @@ python3 tests/score_1211_features_test.py
 python3 tests/v767_total_parity_audit_test.py
 python3 tests/wiring_audit_av_test.py
 python3 website/check_site.py
+# The licence/SPDX audit is a real gate, not a report: a retired triple-licence
+# header, a stale upstream-donor attribution marker, a manifest licence drift,
+# or a missing licence anchor fails the push.
+python3 tools/license_spdx_audit.py
+python3 tests/license_spdx_audit_test.py
 python3 tests/verify_gate_coverage_test.py
 
 echo "== module layering"

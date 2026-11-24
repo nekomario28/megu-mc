@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Cross-platform OS clipboard through the tools every desktop already
 //! ships: `wl-copy`/`wl-paste` on Wayland, `xclip`/`xsel` on X11,
 //! `pbcopy`/`pbpaste` on macOS and `clip.exe`/PowerShell on Windows.

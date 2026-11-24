@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! CoreProtect-style ultra-lightweight binary audit log with atomic rollback.
 //!
 //! Every world mutation worth undoing — a placed or broken block, an

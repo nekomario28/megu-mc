@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Client UI screen state machine and input router.
 //!
 //! [`UiState`] owns *what* is on screen — the current [`Screen`], every

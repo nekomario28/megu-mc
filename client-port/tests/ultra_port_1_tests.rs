@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane ULTRA-PORT-1 (audit `ultra-50k-fps-1k-low-500mib-plan-20261122`):
 //! `[FPS-2]` O(1) dirty mesh coord queue + Priority-0 near-player rebuild,
 //! `[FPS-5]` `HardFloor1000Fps` upload budget profile,

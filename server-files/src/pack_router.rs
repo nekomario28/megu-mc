@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Bounded, read-only ZIP inspection and capability routing for untrusted packs.
 //!
 //! EOCD and Central Directory parsing is delegated to the canonical

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane S1 coverage: `shader_pack`/`shader_profile` TOML + CLI plumbing and
 //! RenderGraph integration for universal external shaderpacks and Megu
 //! native WGSL packs.

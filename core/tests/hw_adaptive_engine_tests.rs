@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unit, parity and live-host tests for `megu_core::hw_adaptive_engine`.
 
 use megu_core::hw_adaptive_engine::{

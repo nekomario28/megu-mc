@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use megu_kernel::{
     collide, fluid_impulse, nbt_read_gzip_validate, nbt_read_named_validate, nbt_roundtrip_named,
     Aabb, CommandDispatcher, Error, FluidCell, FluidKind, FluidQuery, LightEdit, LightEngine,

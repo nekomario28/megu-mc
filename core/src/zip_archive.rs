@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lazy, zero-dependency ZIP/JAR indexing for the mod loader.
 //!
 //! [`LazyZipIndex`] is the archive substrate the asset pipeline uses when it

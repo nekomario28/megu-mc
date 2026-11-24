@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Vanilla 1.21.1 in-game HUD widgets: vitals, status-effect icons,
 //! bossbars, scoreboard sidebar, title/subtitle/actionbar fades, the
 //! hold-Tab player list, chat input with Brigadier tab-completion, and

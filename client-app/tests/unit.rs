@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unit and integration tests for megu-client (CLI, redaction, Protocol 767,
 //! RFC 1950 zlib, chunk decode -> client-port greedy meshing + vertex packing,
 //! and client-kernel physics prediction).

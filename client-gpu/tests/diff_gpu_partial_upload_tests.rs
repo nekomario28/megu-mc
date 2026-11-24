@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane DIFF-GPU-PARTIAL-UPLOAD proof on the real adapter:
 //!
 //! `encode_gpu_indirect_cull` packs `SectionGpuRecord`s against a CPU

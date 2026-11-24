@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Clean-room magic-mod gameplay primitives — pure `std`, zero new
 //! dependencies, 100% declarative data, and entirely deterministic tick

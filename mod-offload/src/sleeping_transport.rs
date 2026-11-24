@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Deterministic item-slot FIFO transport with one scheduled wake per machine.
 //! Each connection carries items from a machine to its downstream input.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-friend-relay`: standalone TCP operator for the `FRL2` friend
 //! invite relay implemented by `megu_proto::friend_relay`.
 //!

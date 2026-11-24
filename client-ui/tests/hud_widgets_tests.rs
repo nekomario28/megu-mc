@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the vanilla 1.21.1 HUD widget pack: simultaneous rendering
 //! across the supported resolution range, viewport clamping, region
 //! non-overlap, hostile-input sanitization, fade-curve math, Brigadier

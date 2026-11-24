@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Lane M7a integration: a six-tier factory DAG with shared intermediates and
 //! byproducts, a priority chain of 63-type storage cells, and a channel-routed

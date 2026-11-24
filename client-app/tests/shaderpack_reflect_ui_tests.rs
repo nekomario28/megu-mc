@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane X1 coverage: per-pass GLSL reflection binding tables bridged into
 //! [`ActiveShaderSession`] during [`activate_shaderpack`], plus the
 //! plain-data [`ShaderpackUiSnapshot`] consumed by the shaderpack option

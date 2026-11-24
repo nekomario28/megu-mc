@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Minecraft Java wire primitives: `VarInt`/`VarLong`, big-endian scalars,
 //! bounded strings, UUIDs, packed block positions, multi-word bit sets and
 //! framed packets (`VarInt(len) + VarInt(id) + payload`).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Bounded, path-traversal-safe ZIP reader used to pull `sounds.json` and
 //! `.ogg` payloads straight out of Mod JARs / resource-pack archives into
 //! memory — zero files are ever extracted to disk.

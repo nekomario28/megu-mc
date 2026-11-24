@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Coverage for the additive overlay renderers in `megu_client::render`:
 //! articulated entity rigs, vanilla BER meshes, billboard particles, and the
 //! F3+G chunk-border / F3+B hitbox debug wireframes — all composited into

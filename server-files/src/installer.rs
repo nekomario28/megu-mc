@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-installer`: a pure-Rust, zero-Java, single-executable installer that
 //! gives players the Fabric `.exe`-installer / NeoForge-installer experience
 //! even on Windows boxes with broken `.jar` associations or no Java at all.

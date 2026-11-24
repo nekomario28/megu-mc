@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later -->
+<!-- SPDX-License-Identifier: LGPL-3.0-or-later -->
 
 # Create: Aeronautics 6-DOF 剛体サブワールド ＋ 汎用 Create アドオン拡張
 

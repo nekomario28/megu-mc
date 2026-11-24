@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane R1 (H16): pin the multi-word light engine end to end on 16-, 24-, 64-
 //! and 128-payload-section windows. Covers skylight and blocklight
 //! initialization, local block-edit relighting at the section-index

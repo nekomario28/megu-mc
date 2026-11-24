@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Universal Protocol 767 VarInt/string codecs and NeoForge 1.21.1
 //! Configuration `frozen_registry*` synchronization frames for ANY mod's

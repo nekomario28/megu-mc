@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Real loopback proof for [`megu_proto::voice_relay`]: one
 //! [`UdpVoiceRelay`] on an ephemeral `127.0.0.1:0` port plus four real UDP
 //! "client" sockets exercise the whole `VCR1` path — secret-token auth

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic, sans-IO CustomPayload routing for protocol 767 and 777.
 //!
 //! Call [`ChannelFirewall::inspect`] for each payload with the session's tick

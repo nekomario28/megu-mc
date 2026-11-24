@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Multi-version glue: the pieces that turn "one hardcoded 1.21.1 codec" into
 //! "a codec selected per connection, speaking a table loaded per version".
 //!

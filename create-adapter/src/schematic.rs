@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! `.nbt` structure schematic loader — the format Minecraft's Structure
 //! Blocks write and Create ships for its Ponder/showcase factories.

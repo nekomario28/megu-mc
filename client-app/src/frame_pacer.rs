@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic per-frame streaming budget pacer.
 //!
 //! The pacer is pure `std` Rust and wall-clock free: the render/streaming

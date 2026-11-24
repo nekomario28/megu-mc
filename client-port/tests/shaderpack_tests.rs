@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Tests for the clean-room Iris 1.7+/OptiFine shaderpack loader. All pack
 //! contents below are synthetic, written for this suite — no third-party

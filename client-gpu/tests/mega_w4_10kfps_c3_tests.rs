@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane MEGA-W4-GPU-10KFPS-C3 coverage on real headless `wgpu`:
 //!
 //! * §4 F1 — GPU-quad UI overlay frames driven by

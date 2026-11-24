@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Adversarial proof for the `FRL3` E2EE layer in [`megu_proto::frl_e2ee`]:
 //! bit-exact RFC 7748 (X25519) and RFC 8439 (ChaCha20-Poly1305) test
 //! vectors, the RFC 5869 HKDF vector, then a full Host ↔ `TcpFriendRelay` ↔

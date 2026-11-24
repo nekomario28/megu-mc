@@ -16,8 +16,8 @@ Three cheap measurements separate them:
                              an algorithm, so a shared comment is the strongest pointer for a manual look.
 
 Calibrate before judging: run the same three numbers on a pair known to be
-independent (this repo's carver against Pumpkin's carver, both written from the
-same 1.21.1 bytecode) and on a pair known to be identical (any file against
+independent (this repo's carver against an independently written third-party
+reimplementation's carver, both written from the same 1.21.1 bytecode) and on a pair known to be identical (any file against
 itself). A result is only a pointer for a manual look, not a verdict.
 
 The scan strips comments, strings and char literals before tokenizing, so it

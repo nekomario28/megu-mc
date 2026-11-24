@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! End-to-end tests for `megu-client-ui`: every screen must lay out
 //! with zero overlapping interactive hitboxes and rasterize to non-blank
 //! pixels at both `1280×720` and `640×360`, and every interactive flow

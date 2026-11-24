@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-server-files`: the Vanilla server's on-disk files, standalone.
 //!
 //! A zero-dependency crate owning the file formats a dedicated server shares

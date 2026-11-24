@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Lane GEN-MOD-CREATE-DEFLATE: real production Modrinth JARs are ~100%
 //! Deflate-compressed (`method == 8`). These clean-room tests build

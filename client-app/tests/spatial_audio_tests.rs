@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the raytraced spatial audio engine: preset tiers, material
 //! classification, DDA occlusion/diffraction, Eyring reverb estimates,
 //! binaural ITD/ILD, underwater muffle, voice-frame plumbing, and subtitle

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic, data-driven loader extensions closing the remaining NeoForge
 //! 1.21.1 & Fabric/Quilt 1.21.1 compatibility surface:

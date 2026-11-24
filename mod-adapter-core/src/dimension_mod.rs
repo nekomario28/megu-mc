@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Universal dimension-adding mod support: zero-JVM `dimension_type` /
 //! `dimension` / `worldgen` / ore-tag discovery, a declarative mod portal

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Phase 1 Seamless Dimension Transfer (`megu:portal_seamless_v1`, `MSP1`).
 //!
 //! A zero-dependency wire contract plus two sans-IO state machines that let a

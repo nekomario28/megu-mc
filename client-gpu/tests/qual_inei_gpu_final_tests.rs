@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane QUAL-INEI-GPU-FINAL — final `client-gpu` convergence gate:
 //!
 //! * `qual_gpu_live_world_time_moon_shadows_cutout_and_stained_glass_pipelines` —

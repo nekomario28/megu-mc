@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Audio output stage: [`AudioSink`] backends (PipeWire/PulseAudio/ALSA
 //! subprocess pipe, null, WAV file), the bounded PCM queue that feeds a
 //! stalled sink without unbounded growth, and [`AudioRuntime`] — the live

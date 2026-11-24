@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Graph occlusion culling: a direction-monotonic breadth-first search
 //! from the camera section across per-section connectivity masks, gated by the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Bounded, client-side mod translations, item icons, and dynamic registry IDs.
 
 use std::collections::BTreeMap;

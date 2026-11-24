@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Zero-dependency 3D software rasterizer + RFC 2083 PNG encoder.
 //!
 //! Consumes the packed 16-byte `PackedVertex` buffers and `sort_translucent`

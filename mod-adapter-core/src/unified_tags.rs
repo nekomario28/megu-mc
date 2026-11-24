@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Unified cross-mod tag index (`XMOD1-CORE`): one merged item/block/fluid
 //! tag table across every loaded mod JAR — including bounded Jar-in-Jar

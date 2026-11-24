@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! A sparse paletted cluster shares one rigid pose and one cached world AABB.
 //! Collision queries refine that bound against occupied unit cells.

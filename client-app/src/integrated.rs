@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Real `--quickPlaySingleplayer <world>` support: resolve the `megu`
 //! server binary, launch it on an ephemeral loopback port with the world save
 //! rooted at `<gameDir>/saves/<world>`, wait for TCP readiness, and always

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `FRL2` control-channel authentication: pure-`std` SHA-256 and HMAC
 //! (FIPS 180-4 / RFC 2104) plus the domain-separated tags the friend-relay
 //! protocol MACs its privileged frames with.

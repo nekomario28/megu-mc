@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Universal zero-JVM, zero-dependency JSON & stored-ZIP/JAR loader for ANY
 //! mod's recipes, tags, and declarative offload profiles.

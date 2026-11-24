@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane ROUTER-NAMESPACE-GUARD-1 integration tests: the unknown-namespace
 //! preservation router — lossless quarantine of `modid:*` block/item/entity
 //! payloads behind safe vanilla placeholders, schema-verified sidecar

@@ -2167,7 +2167,7 @@ mod tests {
     }
     #[test]
     fn xoroshiro_parity() {
-        // pumpkin xoroshiro128.rs test vectors
+        // Xoroshiro128++ seed/split regression pins.
         let mut x = Xor::seed(0);
         eprintln!("DBG seed0 lo={:#x} hi={:#x}", x.lo, x.hi);
         let mut ng = x.split();

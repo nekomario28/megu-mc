@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! GPU compute Hi-Z pyramid + GPU section culling — clean-room pure-`wgpu`
 //! implementations per `audit/ram-vram-role-separation-and-gpu-hiz-design`.
 //!

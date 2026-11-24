@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic proof that the chunk light/occlusion hot paths keep
 //! bit-identical output while their scratch buffers stop reallocating:
 //! a thread-local counting allocator measures allocation calls per pass, so

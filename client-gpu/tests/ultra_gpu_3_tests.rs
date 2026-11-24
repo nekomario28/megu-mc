@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane ULTRA-GPU-3 coverage:
 //!
 //! * `ultra_render_bundle_and_ubo_skip_execute_on_real_gpu` — steady

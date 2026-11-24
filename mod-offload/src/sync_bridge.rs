@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic external-graph sync bridge: ANY kinetic, fluid, transport, or ME
 //! storage graph — pure-Rust or bridged from a JVM mod — streams incremental

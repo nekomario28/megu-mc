@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Client-fork entity interpolation and sky/fog evaluation, pure `std`.
 //!
 //! Remote entities (mobs, players, boats, minecarts) arrive at 20 TPS while the

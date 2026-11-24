@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The admin CLI shared by the `megu-init` and `megu-admin` binaries:
 //! bootstrap a Vanilla-compatible server directory, run a pre-flight
 //! health check (`doctor`), and administer ops/bans/whitelist offline

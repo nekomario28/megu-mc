@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room chunk claims, parties, allies and force-loading in the spirit of
 //! Open Parties and Claims (`openpartiesandclaims`) and FTB Chunks
 //! (`ftbchunks`), implemented from scratch on `std` + [`megu_core`].

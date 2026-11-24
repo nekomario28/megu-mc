@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Regression coverage for the composed color+depth pass draw order.
 //! Translucent terrain water must be encoded strictly after every
 //! depth-writing opaque stream — opaque 6-DOF sub-worlds, GPU-instanced

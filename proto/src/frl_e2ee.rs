@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #![deny(unsafe_code)]
 //! `FRL3` zero-trust end-to-end encryption for the friend relay: pure-Rust,
 //! zero-dependency RFC 7748 X25519, RFC 8439 ChaCha20-Poly1305 AEAD and

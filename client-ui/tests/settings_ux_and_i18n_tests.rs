@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Feature tests for the UX polish lane: visual-style presets and the
 //! four clean OFF/ON toggles, the mistake-proof `SettingsTransaction`
 //! (dirty dots, per-item revert, multi-step undo/redo, discard, and the

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Real `wgpu` renderer: packed-vertex terrain pipelines, the `client-ui`
 //! RGBA overlay blit, a depth-buffered camera, and a device-validated Megu
 //! native WGSL shaderpack hook that never crashes — any rejection falls back

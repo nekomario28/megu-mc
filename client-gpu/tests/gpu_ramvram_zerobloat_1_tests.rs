@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane GPU-RAMVRAM-ZEROBLOAT-1 proofs:
 //!
 //! 1. V1+V3: `PendingAtlasPixels` CPU bytes are dropped the moment

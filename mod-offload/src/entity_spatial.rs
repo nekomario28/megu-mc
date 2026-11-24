@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Standalone, side-effect-free spatial kernels. The caller owns world state,
 //! movement, damage, random draws, and the AI/visibility rules not represented

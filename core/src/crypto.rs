@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Canonical, zero-dependency cryptographic digests the whole workspace
 //! shares: FIPS 180-4 [`Sha256`] and [`Sha1`], and RFC 1321 [`Md5`].
 //!

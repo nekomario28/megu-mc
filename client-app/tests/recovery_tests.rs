@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane UX-RESILIENCE-1: crash containment (`run_contained` /
 //! `run_session_contained`), the deterministic injected-clock circuit
 //! breaker, and the zero-restart mod reload planner + transaction

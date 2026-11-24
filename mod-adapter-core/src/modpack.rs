@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Modpack pre-flight analyzer for the two manifest formats real players and
 //! server operators actually install: Modrinth `.mrpack`

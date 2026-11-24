@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Quality-contract tests for atlas padding fills, gamma-correct mipmaps,
 //! cutout alpha-coverage preservation and tile-safe UV rects.

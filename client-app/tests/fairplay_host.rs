@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Client-host map fair-play (`minimap_fair_play` / `--fair-play` /
 //! `--allow-cave-map` / `--allow-entity-radar` / `--allow-waypoint-teleport`)
 //! and `--auto-tune` hardware auto-tune CLI wiring tests.

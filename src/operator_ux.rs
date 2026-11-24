@@ -3247,7 +3247,7 @@ impl LiveClaims {
                 .world
                 .check_action(&wkey, Some(actor_name), action)
                 .is_allowed(),
-            None => self.records.get(&key).is_none(),
+            None => !self.records.contains_key(&key),
         }
     }
 }

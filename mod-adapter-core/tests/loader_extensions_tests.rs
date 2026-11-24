@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Integration tests for `loader_extensions`: quilt.mod.json, bounded
 //! Jar-in-Jar, accesstransformer.cfg, the `fabric:registry/sync/direct`

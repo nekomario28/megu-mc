@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Canonical two-target version registry.
 //!
 //! megu simulates exactly two vanilla releases: `1.21.1` (protocol 767)

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Clean-room, zero-dependency, fully generic culinary-mod engine for the
 //! Farmer's Delight (`farmersdelight`) mechanic family — and, crucially, for

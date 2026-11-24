@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Data-driven protocol tables and cross-version id remapping.
 //!
 //! A [`ProtocolTable`] is the authoritative `resource_name <-> protocol_id` map

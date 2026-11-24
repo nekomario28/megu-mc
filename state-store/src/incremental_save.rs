@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Incremental autosave machinery: a deterministic FIFO/oldest-dirty
 //! [`IncrementalSaveQueue`] drained under a per-tick [`IncrementalSaveBudget`],
 //! plus the [`content_fingerprint`]-backed [`PersistedFingerprints`] cache

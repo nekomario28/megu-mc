@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Seven bounded real-player Protocol 767 journeys; no third-party dependencies.
 
 Default/--self-test is offline. --server-bin requires an already built megu.

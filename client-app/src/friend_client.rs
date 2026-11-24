@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! FRL2 friend-invite transport and a loopback adapter for the TCP game client.
 //!
 //! Every link opens by reading the relay's `RelayHello` nonce; afterwards the

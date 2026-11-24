@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! 64-shard [`DimensionState`] and the instance-scoped [`ServerContext`].
 //!
 //! Implements `specs/multi-version-architecture.md` §4: the chunk map is the

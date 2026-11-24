@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unit tests for `megu_core::tier25_guard_batch` — the Tier-2.5
 //! zero-JNI-idle guard pre-filter and O(1)-per-tick `TB25` batch
 //! coalescer.

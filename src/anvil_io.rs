@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // ----- Vanilla Anvil (.mca region + level.dat) import/export, 1.21.1 + 26.3 -----
 //
 // P3-A: a second persistence codec next to the Save v2 format (src/save_v2.rs).

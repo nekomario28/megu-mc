@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Texture atlas packing, alpha-weighted mipmapping, `.mcmeta` animation
 //! timing tables and baked-quad UV remapping — pure `std`, deterministic and

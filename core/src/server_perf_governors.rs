@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::server_perf_governors` — deterministic, zero-dependency
 //! single-node server optimization governors that aim past what Storia (a
 //! Folia fork) and Pumpkin (a Rust reimplementation) do today, while

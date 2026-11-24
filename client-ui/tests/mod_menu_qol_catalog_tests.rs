@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The curated Modrinth catalog and installed-mod precedence stay independent
 //! of the host's installed-mod list and its staged enable/disable actions.
 

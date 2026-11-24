@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Lane PERF-TNT-BLAST: bit-exact Vanilla raycast parity, a real 1,000-TNT
 //! chain stress run, and a power-32 modded mega-TNT sliced across ticks.

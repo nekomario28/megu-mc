@@ -47,7 +47,7 @@ pub(crate) const fn is_air_state(st: u32) -> bool {
 /// Canonical non-straddling accessors: `megu_core::bits` covers every width
 /// `1..=16`, so there is no per-width dispatch to keep in sync — and its
 /// 4-bit bulk unpack reaches the SIMD nibble expander automatically.
-
+///
 /// Decode the packed cells in `[start, end)` into `dst` (length `end - start`).
 /// A word holds `64 / bits` cells and never straddles, so each word emits its
 /// cells in one inner pass and the only per-cell work is the shift, mask and

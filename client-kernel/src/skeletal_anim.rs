@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Pure-std skeletal animation for numeric Bedrock-style geometry and animation data.
 //!
 //! Pivots in `.geo.json` are absolute model coordinates. A bone's world matrix

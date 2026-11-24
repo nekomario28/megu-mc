@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Create Contraption assembly, rigid motion, passenger carry, actor collision,
 //! grid-snapped disassembly, and name-based Save v2 snapshot codec backed by

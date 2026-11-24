@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Multi-draw render regions: an 8x4x8 slab of sections (256) shares one
 //! vertex arena and one index arena. Section uploads carve variable-length

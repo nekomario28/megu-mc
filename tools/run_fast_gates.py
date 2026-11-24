@@ -44,6 +44,8 @@ GATES = (
     "website/check_site.py",
     "tools/security_invariants_audit.py",
     "tests/security_invariants_test.py",
+    "tools/license_spdx_audit.py",
+    "tests/license_spdx_audit_test.py",
 )
 
 

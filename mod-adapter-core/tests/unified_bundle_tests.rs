@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Integration tests for [`mod_adapter_core::unified_bundle`]: the
 //! `megu-mod-bundle/1` declarative mod schema — full JSON roundtrip of a

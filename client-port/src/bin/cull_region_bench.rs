@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! S2 `GraphCuller` + S4 `RenderRegion` perf budget bench. Run:
 //! `cargo run --release --manifest-path client-port/Cargo.toml --bin cull_region_bench`

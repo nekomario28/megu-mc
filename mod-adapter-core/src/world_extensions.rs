@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic world & mod extension primitives shared by every modded-world
 //! adapter — pure `std`, zero new dependencies, 100% clean-room.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! End-to-end tests for the `megu-world-migrate` binary: real process
 //! invocations against real files, asserting stdout content and exit codes
 //! (`0` success, `2` refused downgrade / bad args, `1` file errors).

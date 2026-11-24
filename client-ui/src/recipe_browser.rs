@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unified recipe & resource browser for the client UI — a clean-room
 //! engine covering the feature surface JEI, EMI, REI, JER and Create's
 //! Ponder viewer share:

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Universal deterministic multi-property `BlockState` expansion and Save v2
 //! canonical `"namespace:block[k1=v1,k2=v2]"` palette codec for ANY mod.

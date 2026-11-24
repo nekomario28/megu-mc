@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::os_desktop` — zero-dependency Windows 10/11 and macOS
 //! (Apple Silicon / Intel) native desktop integration, unified with
 //! [`crate::linux_desktop`]'s fail-silent philosophy.

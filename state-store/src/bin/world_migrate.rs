@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-world-migrate`: inspect `STV1` world snapshots and migrate world
 //! data between Minecraft `1.21.1` and `26.3`, plus the pure-offline operator
 //! subcommands `audit-query` / `rollback` over `AUD1` audit logs and

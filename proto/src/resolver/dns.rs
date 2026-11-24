@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The SRV question as vanilla's DNS client asks it: the system's name
 //! servers in turn, one UDP try each, TCP when the reply is truncated, and
 //! the best answer record per RFC 2782 (lowest priority, highest weight).

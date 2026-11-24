@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Integration tests for `WorldState`'s Protocol 767 live-state ingestion via
 //! [`WorldState::apply_play_event`]: tracked entities (spawn, quantized
 //! `VecDeltaCodec` movement, teleport, motion, hurt flash, removal, and the

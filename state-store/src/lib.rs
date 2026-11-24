@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-state-store`: owned, instance-scoped runtime state for the server.
 //!
 //! This crate is a standalone, zero-dependency library implementing the two

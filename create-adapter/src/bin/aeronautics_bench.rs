@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Microbenchmark for `create-adapter`'s 6-DOF aeronautics engine:
 //! 100 simultaneous flying rigid-body sub-worlds, each carrying an internal

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `winit` 0.30 window + input loop: `ApplicationHandler`, FPS camera
 //! controls, pause/settings via `megu_ui`, background-FPS throttling,
 //! and `FrameBudgetGovernor` pacing — all driving the real `wgpu` renderer.

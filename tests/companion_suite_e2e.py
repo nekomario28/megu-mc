@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """End-to-end companion suite smoke test.
 
 Proves the five pure-Rust companion CLI binaries and the multi-binary

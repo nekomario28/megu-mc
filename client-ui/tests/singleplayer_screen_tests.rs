@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The Singleplayer world select & "Create New World" screen: the Title
 //! `Singleplayer` button navigates here instead of launching a
 //! hardcoded world, discovered `<gameDir>/saves/` rows launch verbatim,

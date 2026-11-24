@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Protocol 767 kernel with checked Rust APIs and a versioned C facade.
 
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the client QoL lane: hard max-volume limiter + same-sound
 //! coalescing, smooth zoom, low-durability tool guard, extended chat
 //! history, and `[qol]` settings persistence.

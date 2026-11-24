@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Coarse LOD summaries for chunk columns past the active
 //! mesh distance: per-column top height, block and tint at a 4x4 or 16x16 grid.

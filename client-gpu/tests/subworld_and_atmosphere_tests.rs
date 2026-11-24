@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane GPU-3 coverage: 6-DOF sub-world transforms, the atmosphere blender
 //! and chunk-fade tracker, cloud/planet geometry bridges, WGSL validation of
 //! the composed-pass modules, and a real headless `wgpu` render of the full

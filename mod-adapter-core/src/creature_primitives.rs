@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic creature / pet mod primitives — pure `std`, zero new dependencies,
 //! 100% declarative, and entirely free of mod-specific code.

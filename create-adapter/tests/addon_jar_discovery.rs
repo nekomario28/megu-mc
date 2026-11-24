@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! `discover_addon_from_jar`: a synthetic addon namespace (`my_custom_factory`)
 //! that appears in NO built-in profile must yield real kinetic specs,

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_server_files::sd_notify` — zero-dependency systemd `sd_notify`
 //! and local control-socket status helpers.
 //!

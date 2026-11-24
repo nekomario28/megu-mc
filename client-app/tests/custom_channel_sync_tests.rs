@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 use megu_client::protocol::{
     decode_custom_channel_event, decode_custom_payload_packet, dispatch_custom_channel_to_hosts,

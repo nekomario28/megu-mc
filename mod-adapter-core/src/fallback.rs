@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! 4-tier mod execution classifier and safe fallback planner for unsupported
 //! mods (`Strict`, `Quarantine` with Save v2 integrity guard, `DelegateNeoForge`),

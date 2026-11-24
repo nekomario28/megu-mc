@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! The canonical, fail-closed JSON reader/writer every megu crate shares.
 //!
 //! [`parse_json`] accepts only a complete RFC 8259 document: malformed input

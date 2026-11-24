@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Clean-room tests for [`crop_archetype`]. Every sprite below is a
 //! synthetic 16x16 mask drawn from first principles — zero Mojang or mod

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Create Mod factory adapter bridging world block edits onto `mod-offload`'s
 //! region-isolated `KineticGraph`, `SleepingTransport`, `RecipeProcessor`, and

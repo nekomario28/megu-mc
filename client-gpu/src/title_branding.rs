@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room runtime `MEGU EDITION` title-screen branding.
 //!
 //! When the player's *own* local vanilla client JAR is present, this

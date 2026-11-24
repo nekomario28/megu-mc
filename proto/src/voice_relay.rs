@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room, zero-dependency UDP proximity voice relay (`VCR1` datagrams).
 //!
 //! Multiplayer voice-chat servers are, at the transport layer, a

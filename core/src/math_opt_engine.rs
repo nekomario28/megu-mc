@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::math_opt_engine` — four rigorously paper-backed mathematical
 //! engines for runtime kernel selection, telemetry, budget regulation and
 //! spatial ordering. Everything here is pure `std`, allocation-free in the

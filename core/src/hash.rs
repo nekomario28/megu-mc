@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Canonical, dependency-free checksums and hash primitives.
 
 /// Reflected IEEE 802.3 CRC-32 lookup table (polynomial `0xedb88320`).

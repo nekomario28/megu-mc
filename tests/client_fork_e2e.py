@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """End-to-end test of the whole Client Fork stack.
 
 CF-0 client-kernel + CF-2 client-port + client-app megu-client are built

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Safe Modrinth v2 mod search, one-command add, and missing-dependency installer.
 
   tools/megu_mods.py search <query> [--mc-version 1.21.1|26.3] [--loader neoforge|fabric] [--limit 10] [--json]

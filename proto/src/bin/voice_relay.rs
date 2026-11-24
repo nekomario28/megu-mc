@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu-voice-relay`: zero-dependency operator sidecar for the `VCR1`
 //! UDP proximity voice relay implemented by `megu_proto::voice_relay`.
 //!

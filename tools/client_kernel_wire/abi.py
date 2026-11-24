@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """ctypes bindings for the ABI v1 entry points used by the wire probe."""
 import ctypes as C
 import subprocess

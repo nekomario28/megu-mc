@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Pre-mod-change world snapshots and 1-click rollback.
 //!
 //! [`WorldSnapshotStore`] keeps a content-addressed object store under a

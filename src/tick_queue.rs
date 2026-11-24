@@ -9,9 +9,6 @@
 //!
 //! Indexing the queue by delay makes the per-tick cost proportional to the cells
 //! that come due, and the dedup map means a cell can be waiting only once.
-//!
-//! The shape follows the design of Pumpkin's chunk tick scheduler (a design
-//! reference only, see issue #3 and THIRD_PARTY.md); the code is this repository's own.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};

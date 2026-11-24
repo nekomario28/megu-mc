@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Engine-standard recipe conflict auto-resolver and opt-in tag material
 //! unifier (`XMOD1-CORE`).

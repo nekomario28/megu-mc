@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Ordered draw emission: front-to-back opaque draws for Early-Z,
 //! back-to-front transparent draws for blending, and zero-allocation
 //! scratch reuse across frames.

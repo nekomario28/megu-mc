@@ -73,7 +73,7 @@ def neo_metadata(fixture):
     mod_id = "audit_" + fixture
     metadata = f'''modLoader="javafml"
 loaderVersion="[4.0.39]"
-license="LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later"
+license="LGPL-3.0-or-later"
 
 [[mods]]
 modId="{mod_id}"

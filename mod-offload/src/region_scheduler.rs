@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Region-local simulation and little-endian, direct-buffer-friendly delta batches.
 //! Fluid edits and transport/recipe wakes are scheduled work. Kinetic topology

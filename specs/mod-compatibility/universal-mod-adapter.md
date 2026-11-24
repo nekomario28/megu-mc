@@ -1,4 +1,4 @@
-<!-- SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later -->
+<!-- SPDX-License-Identifier: LGPL-3.0-or-later -->
 
 # 汎用 Mod アダプタ ＋ 全 Mod 向け最適化 ＋ フォールバック設計
 

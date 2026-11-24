@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::hw_adaptive_engine` — a pure-`std`, zero-dependency,
 //! LLM-inference-inspired and hardware-adaptive ultra-lightweight compute
 //! toolkit for the voxel engine hot paths.

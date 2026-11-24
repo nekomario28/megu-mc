@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane OPT-C2+C3+C4 proofs:
 //!
 //! 1. `renderer::draw_light_mask` is bit-exact with client-port's

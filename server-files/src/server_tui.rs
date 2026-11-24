@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #![deny(unsafe_code)]
 //! The native server console mode engine: the same smart, high-signal
 //! dashboard `tools/megu_tui.py` wraps the server in, reimplemented on pure

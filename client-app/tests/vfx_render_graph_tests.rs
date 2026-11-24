@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! VFX1 wire-to-simulation-to-frame-plan integration and resource ceilings.
 
 use std::time::Duration;

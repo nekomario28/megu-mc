@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Item and fluid recipes with one deadline per running machine. Ingress
 //! reconciles only affected machines. Work between deadlines accrues lazily.

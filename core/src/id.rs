@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Vanilla-validated `ResourceLocation` (`namespace:path`).
 //!
 //! Registry keys, packet fields, datapack paths and asset lookups all carry

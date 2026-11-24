@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Integration tests for `ecosystem_compat`: map-mod fair-play mode, the
 //! unified accessory-slot model, and the dual-loader JAR scanner. JAR

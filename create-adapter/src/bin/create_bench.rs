@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Microbenchmark for `create-adapter` on top of `mod-offload`:
 //! 1. Settled factory: 10,000 kinetic/belt nodes across 20 regions (idle tick).

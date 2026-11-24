@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Real loopback proof for [`megu_proto::friend_relay`]: one
 //! [`TcpFriendRelay`] on an ephemeral `127.0.0.1:0` port, one real host
 //! tunnel and multiple real guest links exercise the whole `FRL2` path —

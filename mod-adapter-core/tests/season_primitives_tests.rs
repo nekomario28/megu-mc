@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Integration tests for [`mod_adapter_core::season_primitives`]:
 //! the 12-sub-season calendar and daylight curve, biome climate /

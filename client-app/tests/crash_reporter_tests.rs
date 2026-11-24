@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane UX-CRASH-1: panic-hook capture, redaction + 4 KiB caps, the
 //! `CrashSubmitPolicy` consent gate, loopback `/api/report` relay
 //! transport against a mock that mirrors `website/functions/api/report.js`,

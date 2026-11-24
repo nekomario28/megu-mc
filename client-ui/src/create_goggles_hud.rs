@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Create Engineer's Goggles target telemetry overlay.
 
 use crate::draw::{glyph_is_covered, palette as pal, text_width, UiColor, UiDrawList, UiRect};

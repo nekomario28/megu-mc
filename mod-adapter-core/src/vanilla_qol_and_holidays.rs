@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Vanilla & mod-pack quality-of-life primitives — pure `std`, zero new
 //! dependencies, and zero wall-clock reads: every holiday decision is taken

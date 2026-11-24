@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `CompactVoxelVertex` (12B) upload coverage for `client-gpu`: byte-stride
 //! proof of the terrain vertex layout, bit-exact `PackedVertex` roundtrips
 //! through the production staging path, the region-arena section-word

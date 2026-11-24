@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! RFC 1952 framing and RFC 1951 decoding for the dependency-free NBT API.
 //!
 //! The inner DEFLATE decoder and CRC32 are the `megu_core` canonical

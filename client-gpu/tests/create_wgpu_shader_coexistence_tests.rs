@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Create Comfort Phase 2D — external `MeguWgslPack` coexistence with
 //! Create kinetic/sub-world rendering:
 //!

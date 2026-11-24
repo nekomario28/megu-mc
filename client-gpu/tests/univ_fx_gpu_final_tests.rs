@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane UNIV-FX-GPU-FINAL coverage: front-to-back `RegionArena` ordering,
 //! post-opaque sky `DepthCompare::Equal`, TBDR depth `StoreOp::Discard`,
 //! vertex-hoisted `atlas_rect`/fog in `COMPOSITE_TERRAIN_WGSL` (Naga),

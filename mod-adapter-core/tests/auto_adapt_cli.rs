@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! End-to-end checks of the compiled `megu-mod-check` auto-adapter CLI.
 //! All JAR fixtures are self-contained stored ZIPs with valid central directories.

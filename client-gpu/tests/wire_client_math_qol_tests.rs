@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane WIRE-CLIENT-MATH-QOL proofs on the real adapter:
 //!
 //! 1. `LiveSession` streams every frame through the Jain–Chlamtac `P²`

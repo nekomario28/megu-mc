@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Universal Create addon extensibility: a declarative [`CreateAddonProfile`]
 //! describing any Create companion mod's kinetic sources, consumers,

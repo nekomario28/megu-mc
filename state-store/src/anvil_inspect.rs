@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Pure-`std` inspector for vanilla Anvil world directories, plus the binary
 //! NBT <-> [`DataValue`] bridge every `level.dat` and `*.mca` payload is
 //! stored in.

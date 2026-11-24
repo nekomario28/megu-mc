@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane RAM-VRAM-APP-1: `MeshCache::insert_compressed` wiring, monotonic
 //! per-section `mesh_revision`, and the post-upload zero-duplication CPU
 //! release (`release_uploaded_section_cpu_copies`) per

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Megu mod developer kit: scaffold, validate, pack, and hot-reload `.mmod` packages.
 
 A native Megu mod is plain data: a `megu-mod.toml` package manifest plus a

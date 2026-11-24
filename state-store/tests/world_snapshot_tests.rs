@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane UX-BACKUP-1 integration tests: the content-addressed
 //! `world_snapshot` store — deduplication, verification, retention/GC,
 //! fail-closed path safety, and the atomic 1-click rollback — exercised

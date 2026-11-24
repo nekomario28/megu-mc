@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! ModMenu-inspired Mods & Packs manager screen for the client UI.
 //!
 //! The host supplies plain [`ModMenuEntry`] metadata (parsed by its own mod

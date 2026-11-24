@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! LOD generation speed and section-culling savings. Run:
 //! `cargo run --release --manifest-path client-port/Cargo.toml --bin lod_bench`

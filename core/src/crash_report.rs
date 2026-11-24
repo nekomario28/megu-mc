@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! NotEnoughCrashes-style crash reporting: a deterministic fingerprint plus a
 //! privacy-redacted bilingual operator blame.
 //!

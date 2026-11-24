@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Optional, clean-room Megu Enhanced shaders and deterministic CPU math.
 //! The default is Off, and this module never allocates or submits GPU work.

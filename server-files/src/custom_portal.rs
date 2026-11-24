@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // SERVER-CUSTOM-PORTAL-ENGINE: a pure, deterministic, zero-hardcoding
 // custom-shaped portal solver. `detect_custom_portal_shape` runs a bounded
 // 4-neighbor flood fill inside a portal plane so non-rectangular frames

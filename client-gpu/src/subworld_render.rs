@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! 6-DOF rigid-body sub-world rendering for Create contraptions and
 //! Aeronautics airships/spacecraft, plus GPU-instanced mechanical part
 //! batching (cogwheels, shafts, chests).

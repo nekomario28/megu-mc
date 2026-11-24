@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Integration tests for `png_decode`: real zlib-compressed PNG fixtures
 //! (generated independently with Python's `zlib`, covering stored, fixed

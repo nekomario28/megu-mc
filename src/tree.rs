@@ -1,13 +1,6 @@
 // tree.rs — vanilla `tree` configured feature: trunk placers, foliage placers,
 // feature-size clipping, decorators, mangrove root placer, and leaf-distance
 // propagation.
-//
-// Pumpkin's `feature/features/tree` was read for the *semantics*; this is not a
-// port of its code. Measured 2026-10-21 over all 38 of its files: the longest
-// contiguous shared token run is 58 (a four-corner loop header vanilla dictates),
-// 6-token Jaccard is at most 0.0205, and no comment line is shared — the same
-// band as an independently written control (`tools/provenance_scan.py`,
-// `evidence/foundation/provenance/`).
 
 use crate::block_registry::BReg;
 use crate::generation_leaf_queue::LeafQueue;

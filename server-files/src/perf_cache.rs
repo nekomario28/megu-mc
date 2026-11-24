@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Zero-side-effect performance caches: each layer is proven bit-for-bit
 //! identical to the uncached path it replaces, so enabling them can never
 //! change a byte on the wire or a file on disk — only the work spent

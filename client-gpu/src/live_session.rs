@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Asynchronous live Protocol 767/777 session and renderer-facing world state.
 //! Socket operations happen on a worker thread; `poll` never performs I/O.
 

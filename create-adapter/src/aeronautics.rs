@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Create: Aeronautics-style 6-DOF rigid-body sub-worlds: sparse local voxel
 //! grids with an embedded live [`CreateFactory`] (propellers, shafts, belts

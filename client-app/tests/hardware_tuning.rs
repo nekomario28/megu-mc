@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Hardware auto-tuner + `background_fps_limit` tests.
 //!
 //! Every test is deterministic: the parsers and [`recommend_tuning`] take

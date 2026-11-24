@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Build and test the Protocol 767 client kernel against a disposable server.
 
 Run with python3 tests/client_kernel_wire.py from the checkout. Requires the

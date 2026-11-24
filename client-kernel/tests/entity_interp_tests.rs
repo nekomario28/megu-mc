@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 use megu_kernel::{
     evaluate_sky_and_fog, lerp_angle_deg, megu_interp_entities_batch,
     megu_interp_table_free, megu_interp_table_new, megu_sky_fog_eval,

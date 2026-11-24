@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the `hud.scoreboard`, `hud.title`, and `hud.jade_looking_at`
 //! manifest features: the state models in `state.rs`/`magic_hud.rs` and
 //! their draw-list output through the real `UiState::render` HUD path.

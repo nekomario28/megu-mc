@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Real `naga 30.0.1` WGSL frontend + validator coverage for every shader the
 //! builtin Megu shadow pack ships. These tests compile through the same naga
 //! crate `wgpu` re-exports, so a syntax or type error that would reject a

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Integration tests for `megu_core::perf_kit` adoption in the Create
 //! factory and rail hot paths: idle regions skip `export_into` in O(1),
 //! belt machines wake on the exact scheduled tick, identical re-solves

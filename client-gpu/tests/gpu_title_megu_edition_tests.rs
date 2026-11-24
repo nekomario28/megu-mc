@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! GPU-TITLE-MEGU-EDITION: clean-room runtime `MEGU EDITION` title
 //! branding — the RGBA-memory edition patcher plus the `LazyZipIndex`
 //! in-memory JAR loader. Every fixture is synthetic: in-memory RGBA

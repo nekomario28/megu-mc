@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! QUAL-AUDIO-3 lane tests (audit §2 B1-B5 + §3.6):
 //!
 //!  * B1 — O(1) `block_state_id -> AcousticMaterial` LUT: wool/wood/glass/

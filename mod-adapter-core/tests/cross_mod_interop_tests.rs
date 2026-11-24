@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Cross-mod interoperability end-to-end tests for `XMOD1-CORE`:
 //! multi-hop item pipelines (Mod A → vanilla-style slots → Create-style

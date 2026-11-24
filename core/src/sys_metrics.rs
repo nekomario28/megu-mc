@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::sys_metrics` — a zero-dependency, fail-safe system and
 //! performance telemetry snapshotter powering Megu's opt-in Advanced
 //! MiniHUD and the server TUI.

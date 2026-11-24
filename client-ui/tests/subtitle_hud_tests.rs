@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the spatial subtitle HUD: dedup/capacity/TTL semantics,
 //! directional formatting, fade-out, and viewport/hotbar non-overlap.
 

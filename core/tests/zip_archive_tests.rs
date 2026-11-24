@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane CORE-LAZY-ZIP tests for `megu_core::zip_archive`: lazy index I/O
 //! telemetry, 1-level Jar-in-Jar for NeoForge/Fabric layouts, ZIP64 handling,
 //! and fail-closed traversal/encryption/bomb rejection — all with a pure-std

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::diff_engine` — universal, pure-`std` differential-computation
 //! ("diff-based lightweighting") primitives: compute, store, and transmit
 //! the exact minimal delta `ΔS` of a state `S` instead of rebuilding the

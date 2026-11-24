@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Declarative `DataFixer` for the `1.21.1` (DataVersion 3955) -> `26.3`
 //! (DataVersion 5023) bridge, plus the explicit opt-in
 //! [`DataFixer::v26_3_to_1_21_1_downgrade`] mirror.

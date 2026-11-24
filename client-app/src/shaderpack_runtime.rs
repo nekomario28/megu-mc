@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room universal external shaderpack runtime bridge for `client-app`.
 //!
 //! Unifies four specification-based shaderpack families under one bounded,

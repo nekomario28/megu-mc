@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane P6e: deterministic adversarial fuzz harness for every untrusted
 //! config/wire/cache decoder in `megu-server-files`.
 //!

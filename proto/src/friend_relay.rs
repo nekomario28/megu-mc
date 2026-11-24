@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Port-forwarding-free friend invites: one human-readable `MEGU-XXXX-XXXX`
 //! code, a compact `FRL2` stream-multiplexing wire protocol and a live TCP
 //! relay that bridges a single host tunnel to many guest connections — the

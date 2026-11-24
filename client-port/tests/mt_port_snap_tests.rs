@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane MT-PORT-SNAP (audit `full-multithreading-server-client-parallel-architecture-20261123`
 //! §3.2 + `zero-bloat-minimal-bundling-audit-20261123` #2): lock-free
 //! 27-neighbor `Arc<CompressedSection>` snapshot meshing. Proves

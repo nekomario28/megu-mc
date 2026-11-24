@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! End-to-end tests for the unified recipe & resource browser: JEI/REI
 //! `@mod`/`#tag`/`$category` search, `R`/`U` recipes-vs-uses navigation,
 //! the bookmarks panel, EMI recipe-tree recursion with cycle safety and

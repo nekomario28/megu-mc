@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic cubic-Bezier spline rail network for Create-style trains and any
 //! track-gauge addon (narrow, wide, monorail, or a fully custom gauge id —

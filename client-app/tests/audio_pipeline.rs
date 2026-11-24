@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Behavior-pinning tests for the live sound path: 767 sound packet
 //! decoding, asset-index resolution, the deterministic mixer (cap/steal,
 //! stop, limiter, subtitles), and sink behavior. Synthetic fixtures only —

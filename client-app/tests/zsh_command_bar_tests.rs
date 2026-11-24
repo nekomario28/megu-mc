@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Behavior tests for the zsh-style command bar: readline editing, ghost text,
 //! reverse search, completion cycling, syntax highlighting, and badges.
 

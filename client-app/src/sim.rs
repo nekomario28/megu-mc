@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Client-side 20 Hz physics prediction (`client-kernel`), scripted movement loop,
 //! and headless Protocol 767 session runner.
 

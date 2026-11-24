@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Section visibility masks and emission proofs: a six-bit face mask plus
 //! cheap "emits nothing" proofs that let sealed and uniform-air sections skip

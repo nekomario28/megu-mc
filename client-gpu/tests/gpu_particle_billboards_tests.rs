@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! GPU-instanced particle billboards (L29): CPU-side `ParticleInstance`
 //! packing plus real-adapter readback comparing the instanced draw to
 //! the CPU-staged per-frame quad path it replaces.

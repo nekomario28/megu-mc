@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane ULTRA-APP-2 coverage: `[MEM-1 §3.3]` 32 MiB decoded-PCM LRU cap on
 //! `SoundLibrary`, `[DISK-1 §5.2 ④]` dirty-only debounced settings
 //! persistence, and `[MEM-1 §3.2]` client chunk distance eviction.

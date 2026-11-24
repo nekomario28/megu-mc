@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! CLI integration tests for the `megu-mod-check` binary
 //! (`src/bin/mod_check.rs` + `modpack::ModpackManifest::from_path`).

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Vanilla 1.21.1 parity pins for `model_baker`: clockwise face-UV
 //! `rotation`, the `down` default-UV V flip, `uvlock`, and the clean-room

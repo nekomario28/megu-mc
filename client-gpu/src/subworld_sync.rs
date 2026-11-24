@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Create Aeronautics sub-world synchronization payloads.
 //!
 //! SW6D v1 uses canonical big-endian fields in this order:

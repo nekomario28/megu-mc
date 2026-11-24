@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Live subtitle wiring: drained spatial audio cues reach
 //! `SubtitleHudState` and the in-game HUD draw list through
 //! `record_frame_and_refresh_minihud` + `UiState::render`.

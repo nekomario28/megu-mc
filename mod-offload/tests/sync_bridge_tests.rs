@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! `OffloadSyncBridge` contract tests: external dirty-node deltas stream into
 //! kinetic/fluid/transport/ME kernels with unchanged-node skipping, same-batch

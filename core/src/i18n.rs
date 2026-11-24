@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Deterministic UI translations and Minecraft-format `assets/megu/lang/*.json` packs.
 //!
 //! All built-in translations are static. External packs are loaded atomically

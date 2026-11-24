@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Orbital & planetary dimension transitions for 6-DOF aeronautics
 //! sub-worlds: connects [`crate::aeronautics::RigidBodySubWorld`] flight to

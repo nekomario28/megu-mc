@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Clean-room client-side online-mode login cryptography for Minecraft 1.21.1
 //! (Protocol 767) — pure `std`, zero third-party crates, `#![deny(unsafe_code)]`.
 //!

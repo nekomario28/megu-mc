@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Distance-tiered far-terrain LOD column store: summarized `LodCell` grids
 //! keyed by chunk column, drawing that never overlaps full-detail meshes,
 //! LRU/farthest-first eviction under a strict byte budget, and the opt-in

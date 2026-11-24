@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 use crate::mesh::{DirectionBuckets, DIRECTION_BUCKETS};
 use crate::{Layer, Quad, EDGE, LAVA, QUAD_FALLING, QUAD_TINTED, WATER};

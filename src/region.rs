@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // ----- Anvil region persistence: dirty content-hash skip, incremental save
 // budget, and crash-recovery staging sweep -----
 //

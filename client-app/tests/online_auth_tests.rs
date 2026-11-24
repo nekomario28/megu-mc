@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Online-mode login tests: FIPS-197 AES-128-CFB8 and Minecraft signed SHA-1
 //! known-answer vectors, DER SPKI RSA parsing + PKCS#1 v1.5 round-trips against
 //! a real openssl-generated RSA-1024 keypair, the pluggable session-join

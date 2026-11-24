@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Extended clean-room bitmap glyph coverage for [`crate::draw`]: every
 //! Hiragana (`U+3041..=U+3096`), every Katakana (`U+30A1..=U+30FC`), the CJK
 //! punctuation set used by the bilingual UI (`、。「」『』【】・ー〜！？（）＆`),

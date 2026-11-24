@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 use megu_client_mesh::mesher::{
     evaluate_block_visual_pipeline, BlockVisualInput, VanillaPlusPipelineConfig,

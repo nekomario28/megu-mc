@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! `megu_core::simd_voxel` — runtime-dispatched, hardware-aware low-level
 //! compute kernels for the voxel hot paths.
 //!

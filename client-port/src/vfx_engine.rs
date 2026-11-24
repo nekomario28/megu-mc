@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! CPU-side, fixed-tick visual effect simulation and bounded render payloads.
 //! Consumers choose their own shaders and GPU buffers. No texture, shader or

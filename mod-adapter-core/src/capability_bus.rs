@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Generic cross-mod block-capability bus (`XMOD1-CORE`) — a pure-Rust
 //! model of NeoForge 1.21.1 `BlockCapabilities` / Fabric Transfer API so

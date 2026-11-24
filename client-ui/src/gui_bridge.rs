@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #![deny(unsafe_code)]
 //! Client Tier-2 2D GUI bridge ABI: the pure-Rust `GuiGraphics -> DrawCmd`
 //! contract client HUD/tooltip/screen mods draw through.

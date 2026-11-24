@@ -1083,7 +1083,7 @@ mod entity_spatial_tests {
         let live: Vec<u32> = (0..70u32).filter(|s| ![7, 33, 69].contains(s)).collect();
         assert_eq!(hits, live, "masked slots must not reach queries");
         for &slot in &hits {
-            assert_eq!(grid.entities[slot as usize].aabb.min_x.is_finite(), true);
+            assert!(grid.entities[slot as usize].aabb.min_x.is_finite());
         }
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Lane GPU-JEI-PONDER-WIRE: clean-room verification that real mod-JAR
 //! datapack content (recipes, item tags, JER loot) flows into
 //! `RecipeBrowserState.index` with zero disk extraction, and that the

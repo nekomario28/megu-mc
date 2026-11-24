@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! Clean-room ME-style logistics: a channel-routing graph, a priority
 //! storage-cell index, and a fail-closed auto-crafting DAG planner.
