@@ -3872,9 +3872,11 @@ check "p2_3_s2b_dim2_footer_rejects_unknown_dimension" \
 check "p2_3_s2b_dim2_furnace_loads_into_its_own_dimension" \
   src/save_v2.rs '            for (pos, fr) in dim2.furnaces {
                 fs.insert(pos, fr);
+                wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
             }' \
   '            for (pos, fr) in dim2.furnaces {
                 fs.insert((DimId::Overworld, pos.1, pos.2, pos.3), fr);
+                wake_furnace_at(pos.0, pos.1, pos.2, pos.3);
             }' \
   persistence_tests::p2_3_s2b_chests_furnaces_and_crops_stay_isolated_per_dimension_and_round_trip
 

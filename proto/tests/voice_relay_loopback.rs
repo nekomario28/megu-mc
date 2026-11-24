@@ -75,15 +75,21 @@ fn register(relay: &mut UdpVoiceRelay, c: &Client, dimension: &str, pos: [f64; 3
     relay.state_mut().upsert_player(p);
 }
 
-/// Drain the relay once it has at least one datagram (loopback delivery is
-/// asynchronous by a few microseconds; poll a bounded number of times
-/// rather than assuming one pass catches everything).
+/// Drain the relay until its socket has stayed empty across several
+/// consecutive polls. Loopback UDP delivery is asynchronous and a burst can
+/// arrive staggered across scheduler ticks (seen on macOS CI): a single
+/// non-empty drain does not prove the rest of the burst has even reached the
+/// socket, so returning early under-counts the metrics.
 fn pump(relay: &mut UdpVoiceRelay) {
-    for _ in 0..100 {
+    let mut quiet = 0;
+    for _ in 0..500 {
         if relay.poll_once(Instant::now()).unwrap() > 0 {
-            // One more pass for stragglers queued behind the first drain.
-            relay.poll_once(Instant::now()).unwrap();
-            return;
+            quiet = 0;
+        } else {
+            quiet += 1;
+            if quiet >= 10 {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(2));
     }
