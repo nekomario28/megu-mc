@@ -23,6 +23,7 @@ pub mod blockstates;
 pub mod contraption_adapter;
 pub mod data_loader;
 pub mod factory;
+pub mod factorio_sim;
 pub mod neoforge_wire;
 pub mod offload_bridge;
 pub mod orbital;
