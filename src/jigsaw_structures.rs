@@ -12,14 +12,102 @@ use std::path::Path;
 type Pos = (i32, i32, i32);
 type BBox = [i32; 6]; // [min_x, min_y, min_z, max_x, max_y, max_z], inclusive
 
-const MIN_Y: i32 = -64;
-const WORLD_HEIGHT: i32 = 384;
-const MAX_Y_EXCL: i32 = MIN_Y + WORLD_HEIGHT; // 320
-
 #[cfg(test)]
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A `vertical_anchor` kept unresolved until sample time: vanilla evaluates
+/// `above_bottom`/`below_top` against the *target dimension's* build height
+/// (`WorldGenerationContext`), not when the structure file is parsed, so a
+/// Nether or custom dimension must not inherit the Overworld's -64/320 window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerticalAnchor {
+    Absolute(i32),
+    AboveBottom(i32),
+    BelowTop(i32),
+}
+
+impl VerticalAnchor {
+    fn resolve(self, min_y: i32, max_y_excl: i32) -> i32 {
+        match self {
+            Self::Absolute(y) => y,
+            Self::AboveBottom(offset) => min_y + offset,
+            Self::BelowTop(offset) => max_y_excl - 1 - offset,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum HeightProvider {
+    Constant(VerticalAnchor),
+    Uniform {
+        min: VerticalAnchor,
+        max: VerticalAnchor,
+    },
+}
+
+impl HeightProvider {
+    fn parse_vertical_anchor(v: &J) -> Result<VerticalAnchor, String> {
+        let obj = j_obj(v).ok_or("vertical anchor must be object")?;
+        if let Some(val) = obj.get("absolute") {
+            let n = j_num(val).ok_or("absolute anchor must be number")?;
+            return Ok(VerticalAnchor::Absolute(n as i32));
+        }
+        if let Some(val) = obj.get("above_bottom") {
+            let n = j_num(val).ok_or("above_bottom anchor must be number")?;
+            return Ok(VerticalAnchor::AboveBottom(n as i32));
+        }
+        if let Some(val) = obj.get("below_top") {
+            let n = j_num(val).ok_or("below_top anchor must be number")?;
+            return Ok(VerticalAnchor::BelowTop(n as i32));
+        }
+        Err("unsupported vertical anchor".into())
+    }
+
+    fn parse(v: &J) -> Result<Self, String> {
+        let obj = j_obj(v).ok_or("start_height must be object")?;
+        if let Some(ty) = obj.get("type").map(J::str) {
+            match ty {
+                "minecraft:constant" | "constant" => {
+                    let val = obj.get("value").ok_or("missing constant start_height.value")?;
+                    Ok(Self::Constant(Self::parse_vertical_anchor(val)?))
+                }
+                "minecraft:uniform" | "uniform" => {
+                    let min = Self::parse_vertical_anchor(
+                        obj.get("min_inclusive").ok_or("missing uniform min_inclusive")?,
+                    )?;
+                    let max = Self::parse_vertical_anchor(
+                        obj.get("max_inclusive").ok_or("missing uniform max_inclusive")?,
+                    )?;
+                    Ok(Self::Uniform { min, max })
+                }
+                other => Err(format!("unsupported height_provider type: {other}")),
+            }
+        } else {
+            Ok(Self::Constant(Self::parse_vertical_anchor(v)?))
+        }
+    }
+
+    /// Sample against the placing dimension's `[min_y, max_y_excl)` window —
+    /// the same bounds `generate_pieces_with_hm` clamps pieces to.
+    fn sample(&self, min_y: i32, max_y_excl: i32, rng: &mut Lcg) -> i32 {
+        match *self {
+            Self::Constant(anchor) => anchor.resolve(min_y, max_y_excl),
+            Self::Uniform { min, max } => {
+                let (min, max) = (
+                    min.resolve(min_y, max_y_excl),
+                    max.resolve(min_y, max_y_excl),
+                );
+                if min >= max {
+                    min
+                } else {
+                    min + rng.next_bound(max - min + 1)
+                }
+            }
+        }
+    }
 }
 
 fn j_num(j: &J) -> Option<f64> {
@@ -73,68 +161,6 @@ impl Projection {
             "rigid" => Ok(Self::Rigid),
             "terrain_matching" => Ok(Self::TerrainMatching),
             other => Err(format!("unknown projection: {other}")),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum HeightProvider {
-    Constant(i32),
-    Uniform { min: i32, max: i32 },
-}
-
-impl HeightProvider {
-    fn parse_vertical_anchor(v: &J) -> Result<i32, String> {
-        let obj = j_obj(v).ok_or("vertical anchor must be object")?;
-        if let Some(val) = obj.get("absolute") {
-            let n = j_num(val).ok_or("absolute anchor must be number")?;
-            return Ok(n as i32);
-        }
-        if let Some(val) = obj.get("above_bottom") {
-            let n = j_num(val).ok_or("above_bottom anchor must be number")?;
-            return Ok(MIN_Y + n as i32);
-        }
-        if let Some(val) = obj.get("below_top") {
-            let n = j_num(val).ok_or("below_top anchor must be number")?;
-            return Ok(MAX_Y_EXCL - 1 - n as i32);
-        }
-        Err("unsupported vertical anchor".into())
-    }
-
-    fn parse(v: &J) -> Result<Self, String> {
-        let obj = j_obj(v).ok_or("start_height must be object")?;
-        if let Some(ty) = obj.get("type").map(J::str) {
-            match ty {
-                "minecraft:constant" | "constant" => {
-                    let val = obj.get("value").ok_or("missing constant start_height.value")?;
-                    Ok(Self::Constant(Self::parse_vertical_anchor(val)?))
-                }
-                "minecraft:uniform" | "uniform" => {
-                    let min = Self::parse_vertical_anchor(
-                        obj.get("min_inclusive").ok_or("missing uniform min_inclusive")?,
-                    )?;
-                    let max = Self::parse_vertical_anchor(
-                        obj.get("max_inclusive").ok_or("missing uniform max_inclusive")?,
-                    )?;
-                    Ok(Self::Uniform { min, max })
-                }
-                other => Err(format!("unsupported height_provider type: {other}")),
-            }
-        } else {
-            Ok(Self::Constant(Self::parse_vertical_anchor(v)?))
-        }
-    }
-
-    fn sample(&self, rng: &mut Lcg) -> i32 {
-        match *self {
-            Self::Constant(v) => v,
-            Self::Uniform { min, max } => {
-                if min >= max {
-                    min
-                } else {
-                    min + rng.next_bound(max - min + 1)
-                }
-            }
         }
     }
 }
@@ -1904,7 +1930,9 @@ fn generate_pieces_with_hm<D: JigsawData, W: JigsawWorld>(
     reg: &BReg,
 ) -> Result<Option<(Pos, Vec<JigsawPiece>)>, String> {
     let mut gen_rng = Lcg::for_large_feature(seed as u64, cx, cz);
-    let sampled_y = structure.start_height.sample(&mut gen_rng);
+    let sampled_y = structure
+        .start_height
+        .sample(dim_min_y, dim_max_y_excl, &mut gen_rng);
     let start_pos = (cx << 4, sampled_y, cz << 4);
 
     let mut alias_map = HashMap::new();
@@ -2299,6 +2327,9 @@ fn generate_pieces(
     reg: &BReg,
 ) -> Result<Vec<JigsawPiece>, String> {
     let mut world = TestJigsawWorld { flat_top };
+    // The scene oracle is the Overworld: its start-height anchors resolve
+    // against the Overworld window, as they did under the old constants.
+    let dim = crate::worldgen::DimId::Overworld;
     generate_pieces_with_hm(
         repo,
         &mut world,
@@ -2306,8 +2337,8 @@ fn generate_pieces(
         seed,
         cx,
         cz,
-        MIN_Y,
-        MAX_Y_EXCL,
+        dim.min_y(),
+        dim.min_y() + dim.height(),
         reg,
     )?
     .map(|(_, pieces)| pieces)
@@ -3010,6 +3041,8 @@ fn place_element<D: JigsawData>(
         PoolElement::Feature { feature, .. } => match target {
             #[cfg(test)]
             JigsawTarget::Scene { scene, writes, gen } => {
+                let (world_min_y, world_max_y) =
+                    (gen.world_min_y, gen.world_min_y + gen.world_height - 1);
                 let mut ctx = FC::new(gen);
                 ctx.test_default_air = true;
                 ctx.test_biome("minecraft:plains");
@@ -3019,8 +3052,8 @@ fn place_element<D: JigsawData>(
                         let top = scene_height(scene, x, z);
                         ctx.test_frozen_height(HeightmapKind::WorldSurfaceWg, x, z, top);
                         ctx.test_frozen_height(HeightmapKind::OceanFloorWg, x, z, top);
-                        let y_lo = (top - 8).min(piece_pos.1 - 8).max(MIN_Y);
-                        let y_hi = (top + 2).max(piece_pos.1 + 8).min(MAX_Y_EXCL - 1);
+                        let y_lo = (top - 8).min(piece_pos.1 - 8).max(world_min_y);
+                        let y_hi = (top + 2).max(piece_pos.1 + 8).min(world_max_y);
                         for y in y_lo..=y_hi {
                             let st = scene_state(scene, x, y, z, reg);
                             if st != 0 {
@@ -3139,7 +3172,14 @@ fn place_chunk(
     gen: &mut crate::worldgen::Gen,
     reg: &BReg,
 ) -> Result<(usize, String, i64, String), String> {
-    let clip: BBox = [cx << 4, MIN_Y, cz << 4, (cx << 4) + 15, MAX_Y_EXCL - 1, (cz << 4) + 15];
+    let clip: BBox = [
+        cx << 4,
+        gen.world_min_y,
+        cz << 4,
+        (cx << 4) + 15,
+        gen.world_min_y + gen.world_height - 1,
+        (cz << 4) + 15,
+    ];
     let first_bb = pieces[0].bb;
     let start_center = (
         first_bb[0] + (first_bb[3] - first_bb[0] + 1) / 2,
@@ -3617,5 +3657,56 @@ pub(crate) mod jigsaw_structures {
             "promotion must disconnect the marked fence after its neighbour is carved"
         );
     }
+    }
+}
+
+#[cfg(test)]
+mod jigsaw_bounds_tests {
+    use super::*;
+
+    fn provider(json: &str) -> HeightProvider {
+        HeightProvider::parse(&jparse(json.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// `above_bottom`/`below_top` anchors resolve against the placing
+    /// dimension's `[min_y, max_y_excl)` window at sample time — the same
+    /// bounds `generate_pieces_with_hm` clamps to — not the Overworld's
+    /// historical -64/320 constants.
+    #[test]
+    fn start_height_anchors_follow_the_dimension_window() {
+        let spread = provider(
+            r#"{"type":"minecraft:uniform",
+                "min_inclusive":{"above_bottom":0},
+                "max_inclusive":{"below_top":0}}"#,
+        );
+        let mut rng = Lcg::new(42);
+
+        // Overworld [-64, 320): identical to the old constants' answer.
+        for _ in 0..64 {
+            let y = spread.sample(-64, 320, &mut rng);
+            assert!((-64..320).contains(&y), "overworld sample {y}");
+        }
+        // Nether-shaped [0, 128): the same anchors must stay inside it.
+        for _ in 0..64 {
+            let y = spread.sample(0, 128, &mut rng);
+            assert!((0..128).contains(&y), "nether-shaped sample {y}");
+        }
+        // Tall custom [-128, 384): below_top reaches past the old 320 cap.
+        let mut saw_above_old_top = false;
+        for _ in 0..256 {
+            let y = spread.sample(-128, 384, &mut rng);
+            assert!((-128..384).contains(&y), "tall sample {y}");
+            saw_above_old_top |= y >= 320;
+        }
+        assert!(saw_above_old_top, "uniform must be able to reach the tall window's top");
+
+        // Constant anchors pin exactly, per dimension.
+        let bottom = provider(r#"{"above_bottom": 5}"#);
+        assert_eq!(bottom.sample(0, 128, &mut rng), 5);
+        let top = provider(r#"{"type":"minecraft:constant","value":{"below_top": 3}}"#);
+        assert_eq!(top.sample(0, 128, &mut rng), 124);
+        assert_eq!(top.sample(-64, 320, &mut rng), 316);
+        let absolute = provider(r#"{"absolute": 70}"#);
+        assert_eq!(absolute.sample(-128, 384, &mut rng), 70);
     }
 }

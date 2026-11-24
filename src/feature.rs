@@ -1487,7 +1487,7 @@ fn drip_place_column(
 /// iceberg is drawn from a single stream across all of its helpers.
 #[allow(clippy::too_many_arguments)]
 fn gen_iceberg(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), state: u32) {
-    let pos = (origin.0, crate::worldgen::sea_level(), origin.2);
+    let pos = (origin.0, ctx.g.sea, origin.2);
     let fire = rng.next_f64() > 0.7;
     let angle = rng.next_f64() * 2.0 * std::f64::consts::PI;
     let i = 11 - rng.next_bound(5);
@@ -1843,7 +1843,7 @@ fn gen_desert_well(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     let sandstone = reg.state_of("minecraft:sandstone", None);
     let water = reg.state_of("minecraft:water", None);
     let suspicious = reg.state_of("minecraft:suspicious_sand", None);
-    let min_y = crate::worldgen::min_y();
+    let min_y = ctx.g.min_y;
 
     let mut p = (pos.0, pos.1 + 1, pos.2);
     while p.1 > min_y + 2 && ctx.is_air(p.0, p.1, p.2) {
@@ -4716,7 +4716,7 @@ fn gen_ice_spike(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     let snow = reg.state_of("minecraft:snow_block", None);
     let ice_block = reg.state_of("minecraft:ice", None);
     let packed = reg.state_of("minecraft:packed_ice", None);
-    let min_y = crate::worldgen::min_y();
+    let min_y = ctx.g.min_y;
 
     let mut p = pos;
     while ctx.is_air(p.0, p.1, p.2) && p.1 > min_y + 2 {
@@ -7907,7 +7907,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 // the pickles draw comes before both survival tests, so a rejected
                 // cell still moves the stream
                 let pickles = rng.next_bound(4) + 1;
-                if ctx.out_of_h(y) || y <= crate::worldgen::min_y() {
+                if ctx.out_of_h(y) || y <= ctx.g.min_y {
                     continue;
                 }
                 if ctx.get(x, y, z) != water {
@@ -8823,7 +8823,7 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 (-1, 0, 0),
                 (1, 0, 0),
             ];
-            let sea = crate::worldgen::sea_level();
+            let sea = ctx.g.sea;
             if pos.1 > sea - 1 {
                 return;
             }

@@ -1218,7 +1218,7 @@ impl OverworldSpawnQueries for LiveNaturalSpawnQueries<'_> {
     }
 
     fn sea_level(&self) -> i32 {
-        worldgen::sea_level()
+        worldgen::sea_level_dim(self.dim)
     }
 
     fn is_halloween(&self) -> bool {
@@ -1779,7 +1779,7 @@ fn natural_spawn_column_y(
 ) -> Option<i32> {
     match mob.placement().0 {
         SpawnPlacementType::InWater => {
-            let top = worldgen::sea_level().min(dim.min_y() + dim.height() - 1);
+            let top = worldgen::sea_level_dim(dim).min(dim.min_y() + dim.height() - 1);
             let water_top = (dim.min_y()..=top)
                 .rev()
                 .find(|&y| reg.fluid_name(block_at_dim(dim, x, y, z)) == "minecraft:water")?;
@@ -1846,7 +1846,7 @@ pub(crate) fn spawn_natural_category_scratch(
             | MobCategory::WaterCreature
             | MobCategory::WaterAmbient
     ) {
-        worldgen::sea_level()
+        worldgen::sea_level_dim(dim)
     } else {
         dim.min_y() + dim.height() / 2
     };
@@ -1911,6 +1911,42 @@ pub(crate) fn spawn_natural_category_scratch(
         }
     }
     spawned
+}
+
+/// The generic natural-spawn dispatch for custom dimensions: every registered
+/// `natural` dimension gets [`spawn_natural_category_scratch`] once per
+/// `MobCategory` — the same pass the Overworld and End callers already use —
+/// so a datapack dimension spawns whatever overworld-style spawners its biome
+/// tables declare instead of being skipped entirely. Dimensions the Nether
+/// ruleset serves ([`nether_spawn_dims`]) additionally run that pass on the
+/// Nether tick; this loop only adds the categories it does not cover.
+///
+/// Runs on the Nether spawn cadence (`spawn_nether_natural`), the only
+/// non-Overworld spawn tick `main.rs` already drives.
+fn spawn_custom_dimensions_natural(tick: u64) {
+    let clients = client_snapshot();
+    for dim in DimId::all_registered() {
+        if dim.is_vanilla() {
+            continue;
+        }
+        let Some(spec) = worldgen::dimension_spec(dim) else {
+            continue;
+        };
+        if !spec.natural {
+            continue;
+        }
+        for category in [
+            MobCategory::Monster,
+            MobCategory::Creature,
+            MobCategory::Ambient,
+            MobCategory::Axolotls,
+            MobCategory::UndergroundWaterCreature,
+            MobCategory::WaterCreature,
+            MobCategory::WaterAmbient,
+        ] {
+            spawn_natural_category_scratch(&clients, dim, category, tick);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3315,6 +3351,64 @@ mod natural_spawner_tests {
         assert!(halloween_from_epoch_days(292));
         assert!(!halloween_from_epoch_days(-1));
     }
+
+    static SPAWN_DIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn nether_spawn_dims_dispatches_over_registered_dimensions() {
+        let _world = crate::world_guard();
+        let _gen = worldgen::lock_gen_for_tests();
+        let _guard = SPAWN_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        worldgen::reset_dimension_registry();
+        // Baseline: only the Nether.
+        assert_eq!(nether_spawn_dims(), vec![DimId::Nether]);
+
+        let dim_type = |effects: &str, min_y: i32, height: i32| {
+            format!(
+                r#"{{"min_y": {min_y}, "height": {height}, "natural": true,
+                    "has_skylight": false, "effects": "{effects}"}}"#
+            )
+        };
+        let sources = vec![worldgen::DatapackDimensionSource::Entries(vec![
+            (
+                "data/mymod/dimension_type/nether_like.json".to_string(),
+                dim_type("minecraft:the_nether", 0, 128),
+            ),
+            (
+                "data/mymod/dimension/nether_like.json".to_string(),
+                r#"{"type": "mymod:nether_like", "generator": {"type": "minecraft:noise",
+                    "settings": "minecraft:nether"}}"#
+                    .to_string(),
+            ),
+            (
+                "data/mymod/dimension_type/overworld_like.json".to_string(),
+                dim_type("minecraft:overworld", -64, 384),
+            ),
+            (
+                "data/mymod/dimension/overworld_like.json".to_string(),
+                r#"{"type": "mymod:overworld_like", "generator": {"type": "minecraft:flat",
+                    "settings": {"biome": "minecraft:plains", "layers": [
+                        {"block": "minecraft:stone", "height": 16}]}}}"#
+                    .to_string(),
+            ),
+        ])];
+        assert_eq!(
+            worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap(),
+            2
+        );
+
+        let dims = nether_spawn_dims();
+        assert_eq!(dims.len(), 2);
+        assert_eq!(dims[0], DimId::Nether);
+        assert_eq!(
+            dims[1],
+            DimId::parse_dimension_id("mymod:nether_like").unwrap()
+        );
+        assert!(!dims.contains(
+            &DimId::parse_dimension_id("mymod:overworld_like").unwrap()
+        ));
+        worldgen::reset_dimension_registry();
+    }
 }
 
 include!("nether_spawn_rules.rs");
@@ -3335,6 +3429,7 @@ fn nether_spawn_cycle() -> u64 {
 const NETHER_SPAWN_DIM: DimId = DimId::Nether;
 
 struct LiveNetherSpawnQueries<'a> {
+    dim: DimId,
     reg: &'a BReg,
     clients: &'a [Arc<Client>],
     light: RefCell<NetherSpawnLightCache>,
@@ -3342,12 +3437,12 @@ struct LiveNetherSpawnQueries<'a> {
 
 impl LiveNetherSpawnQueries<'_> {
     fn state(&self, pos: NaturalSpawnPos) -> u32 {
-        if !(NETHER_SPAWN_DIM.min_y()..NETHER_SPAWN_DIM.height()).contains(&pos.y) {
+        if !(self.dim.min_y()..self.dim.min_y() + self.dim.height()).contains(&pos.y) {
             return 0;
         }
-        overlay_block_dim(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z)
-            .or_else(|| stored_state(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z))
-            .unwrap_or_else(|| base_state_dim(NETHER_SPAWN_DIM, pos.x, pos.y, pos.z))
+        overlay_block_dim(self.dim, pos.x, pos.y, pos.z)
+            .or_else(|| stored_state(self.dim, pos.x, pos.y, pos.z))
+            .unwrap_or_else(|| base_state_dim(self.dim, pos.x, pos.y, pos.z))
     }
 
     fn placement_context(
@@ -3390,10 +3485,10 @@ impl NetherSpawnQueries for LiveNetherSpawnQueries<'_> {
         let mut cache = self.light.borrow_mut();
         let sections = cache.entry(chunk).or_insert_with(|| {
             let sources =
-                natural_spawn_light_sources(self.clients, NETHER_SPAWN_DIM, chunk.0, chunk.1);
-            block_light_sections_dim(NETHER_SPAWN_DIM, chunk.0, chunk.1, &sources)
+                natural_spawn_light_sources(self.clients, self.dim, chunk.0, chunk.1);
+            block_light_sections_dim(self.dim, chunk.0, chunk.1, &sources)
         });
-        nibble_at_dim(sections, NETHER_SPAWN_DIM, pos.x, pos.y, pos.z)
+        nibble_at_dim(sections, self.dim, pos.x, pos.y, pos.z)
     }
 
     fn is_valid_spawn(&self, pos: NaturalSpawnPos, _mob: NetherSpawnMob) -> bool {
@@ -3417,11 +3512,31 @@ impl NetherSpawnQueries for LiveNetherSpawnQueries<'_> {
     }
 }
 
-fn spawn_nether_natural(tick: u64) {
-    with_spawn_scratch(|scratch| spawn_nether_natural_scratch(tick, scratch));
+/// The dimensions the Nether spawn ruleset serves: the Nether itself plus any
+/// custom dimension whose `dimension_type.effects` declares
+/// `minecraft:the_nether` — the same "this is a Nether" marker the rest of the
+/// runtime keys on.
+fn nether_spawn_dims() -> Vec<DimId> {
+    DimId::all_registered()
+        .into_iter()
+        .filter(|dim| {
+            *dim == NETHER_SPAWN_DIM
+                || worldgen::dimension_spec(*dim)
+                    .is_some_and(|spec| spec.effects == "minecraft:the_nether")
+        })
+        .collect()
 }
 
-fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
+fn spawn_nether_natural(tick: u64) {
+    with_spawn_scratch(|scratch| {
+        for dim in nether_spawn_dims() {
+            spawn_nether_natural_dim_scratch(tick, dim, scratch);
+        }
+    });
+    spawn_custom_dimensions_natural(tick);
+}
+
+fn spawn_nether_natural_dim_scratch(tick: u64, dim: DimId, scratch: &mut SpawnTickScratch) {
     let SpawnTickScratch {
         players_eid: players,
         chunk_players: chunks,
@@ -3439,8 +3554,8 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         if client.is_spectator() {
             return None;
         }
-        let (dim, x, y, z, ..) = client_dim_pos(client);
-        (dim == NETHER_SPAWN_DIM).then_some((client.eid as u64, [x, y, z]))
+        let (client_dim, x, y, z, ..) = client_dim_pos(client);
+        (client_dim == dim).then_some((client.eid as u64, [x, y, z]))
     }));
     let Some(reg) = breg().filter(|_| !players.is_empty()) else {
         return;
@@ -3450,7 +3565,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
     loaded.clear();
     for client in &clients {
         let held = client.chunks.lock().unwrap_or_else(|e| e.into_inner());
-        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == NETHER_SPAWN_DIM {
+        if *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim {
             loaded.extend(held.iter().copied());
         }
     }
@@ -3472,7 +3587,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         if current.len() >= MOB_CAP {
             return;
         }
-        for mob in current.iter().filter(|mob| mob.dim == NETHER_SPAWN_DIM) {
+        for mob in current.iter().filter(|mob| mob.dim == dim) {
             let Some(spec) = entity_spec_by_id(mob.etype) else {
                 continue;
             };
@@ -3512,14 +3627,16 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         return;
     }
     let query = LiveNetherSpawnQueries {
+        dim,
         reg,
         clients: &clients,
         light: RefCell::new(std::mem::take(nether_light)),
     };
     // The Nether has many floors below the roof. Sample a slice near the anchor,
     // then look down for one open surface instead of using the column's top.
-    let top = (py.floor() as i32 + rng.next_bound(32) - 8).clamp(1, NETHER_SPAWN_DIM.height() - 2);
-    let Some(origin) = ((top - 15).max(1)..=top).rev().find_map(|y| {
+    let top = (py.floor() as i32 + rng.next_bound(32) - 8)
+        .clamp(dim.min_y() + 1, dim.min_y() + dim.height() - 2);
+    let Some(origin) = ((top - 15).max(dim.min_y() + 1)..=top).rev().find_map(|y| {
         let pos = NaturalSpawnPos { x, y, z };
         let site = query.placement_context(pos, NetherSpawnMob::Skeleton);
         (SpawnPlacementType::OnGround.allows(site) || site.lava_here).then_some(pos)
@@ -3530,7 +3647,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
         if !loaded.contains(&chunk) {
             return None;
         }
-        worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+        worldgen::with_gen_dim(dim, |gen| {
             gen.biome_name_at(pos.x, pos.y, pos.z)
         })
         .flatten()
@@ -3585,7 +3702,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                 {
                     continue;
                 }
-                let Some(biome) = worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+                let Some(biome) = worldgen::with_gen_dim(dim, |gen| {
                     let (_, leaf) = gen.biome_blended(pos.x, pos.y, pos.z)?;
                     gen.biome_name_of_leaf(leaf)
                 })
@@ -3599,7 +3716,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     |below| query.block_id(below) == "minecraft:nether_bricks",
                     |pos, check| {
                         let bounds = fortresses.entry(chunk).or_insert_with(|| {
-                            worldgen::with_gen_dim(NETHER_SPAWN_DIM, |gen| {
+                            worldgen::with_gen_dim(dim, |gen| {
                                 feature::fortress_spawn_bounds(gen, chunk.0, chunk.1)
                             })
                             .unwrap_or_default()
@@ -3640,7 +3757,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                 let bounds = EntityAabb::from_dimensions(x, y, z, spec.width, spec.height);
                 let yaw = rng.next_f32() * 360.0;
                 let inserted = with_save_guard(|| {
-                    if !live_mob_block_boxes(NETHER_SPAWN_DIM, reg, bounds.min(), bounds.max())
+                    if !live_mob_block_boxes(dim, reg, bounds.min(), bounds.max())
                         .is_empty()
                         || nether_spawn_in_fluid(&query, bounds, mob)
                     {
@@ -3649,7 +3766,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
                     if current.len() >= MOB_CAP
                         || current.iter().any(|other| {
-                            if other.dim != NETHER_SPAWN_DIM {
+                            if other.dim != dim {
                                 return false;
                             }
                             let (x, y, z, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -3661,7 +3778,7 @@ fn spawn_nether_natural_scratch(tick: u64, scratch: &mut SpawnTickScratch) {
                     }
                     let mob = new_live_mob(
                         spec.id,
-                        NETHER_SPAWN_DIM,
+                        dim,
                         (x, y, z, yaw, 0.0),
                         spec.max_health,
                         None,

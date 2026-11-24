@@ -1480,13 +1480,54 @@ fn apply_anvil_import(report: &AnvilImportReport) {
     }
 }
 
+/// One path segment safe to splice into a world-relative export path: no
+/// separators, no `.`/`..` components, nothing outside the ResourceLocation
+/// character set — a crafted dimension key must never steer a region write
+/// outside the world directory.
+fn anvil_safe_path_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The region subdirectory a custom dimension exports to, relative to the
+/// world root: vanilla 1.21.1 stores non-`DIM±1` dimensions under
+/// `dimensions/<namespace>/<path>/region`.
+fn anvil_custom_dim_region_dir(key: &str) -> Option<String> {
+    let (ns, path) = key.split_once(':')?;
+    if !anvil_safe_path_segment(ns) {
+        return None;
+    }
+    let mut rel = String::with_capacity(key.len() + "dimensions//region".len());
+    rel.push_str("dimensions/");
+    rel.push_str(ns);
+    rel.push('/');
+    for seg in path.split('/') {
+        if !anvil_safe_path_segment(seg) {
+            return None;
+        }
+        rel.push_str(seg);
+        rel.push('/');
+    }
+    rel.push_str("region");
+    Some(rel)
+}
+
 /// The region subdirectory a dimension exports to, relative to the world root.
-fn anvil_dim_region_dir(dim: DimId) -> Option<&'static str> {
+/// Vanilla dimensions keep their historical paths; a registered custom
+/// dimension maps onto the vanilla `dimensions/<namespace>/<path>/region`
+/// layout. `None` only for an unregistered slot or a key that fails path
+/// sanitization.
+fn anvil_dim_region_dir(dim: DimId) -> Option<String> {
     match dim {
-        DimId::Overworld => Some("region"),
-        DimId::Nether => Some("DIM-1/region"),
-        DimId::End => Some("DIM1/region"),
-        _ => None, // custom dimensions have no vanilla directory shape
+        DimId::Overworld => Some("region".to_string()),
+        DimId::Nether => Some("DIM-1/region".to_string()),
+        DimId::End => Some("DIM1/region".to_string()),
+        _ => worldgen::dimension_spec(dim)
+            .and_then(|spec| anvil_custom_dim_region_dir(spec.key)),
     }
 }
 
@@ -1499,9 +1540,9 @@ fn anvil_export_sections(
     cz: i32,
     overlay: &HashMap<u32, u32>,
 ) -> Vec<AnvilSection> {
-    let min_y = dim.min_y();
+    let min_y = worldgen::min_y_dim(dim);
     let mut sections = Vec::new();
-    for sec in 0..dim.sections() {
+    for sec in 0..worldgen::height_dim(dim) / 16 {
         let sy = min_y + sec * 16;
         let mut cells = Box::new([0u32; 4096]);
         if let Some(base) = worldgen::terrain_section_dim(dim, cx, sy, cz, crate::feature::populate)
@@ -1533,10 +1574,15 @@ fn anvil_export_sections(
 /// (`biome_quart` + `biome_name_of_leaf`), or a per-dimension default when no
 /// generator is installed.
 fn anvil_export_biomes(dim: DimId, cx: i32, sy: i32, cz: i32) -> Option<Box<[String; 64]>> {
-    let fallback = match dim {
-        DimId::Overworld => "minecraft:plains",
-        DimId::Nether => "minecraft:nether_wastes",
-        _ => "minecraft:the_end",
+    // A custom dimension's fallback is the biome its generator declares for
+    // flat/void fills; a noise custom dimension or a spec-less slot falls back
+    // to the plains default every biome-less reader already uses.
+    let fallback: String = match dim {
+        DimId::Overworld => "minecraft:plains".to_string(),
+        DimId::Nether => "minecraft:nether_wastes".to_string(),
+        DimId::End => "minecraft:the_end".to_string(),
+        _ => worldgen::dimension_default_biome(dim)
+            .unwrap_or_else(|| "minecraft:plains".to_string()),
     };
     let names = worldgen::with_gen_dim(dim, |g| {
         let mut out = Box::new(std::array::from_fn::<String, 64, _>(|_| String::new()));
@@ -1672,7 +1718,7 @@ fn export_anvil_world_with_options(
         }
     }
     for ((dim, rx, rz), chunks) in by_region {
-        let rel = anvil_dim_region_dir(dim).expect("vanilla dims only");
+        let rel = anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
         let region_dir = out_dir.join(rel);
         std::fs::create_dir_all(&region_dir)
             .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
@@ -2453,7 +2499,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     for ((dim, rx, rz), chunks) in by_region {
-        let rel = anvil_dim_region_dir(dim).expect("vanilla dims only");
+        let rel = anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
         let region_dir = dir.join(rel);
         std::fs::create_dir_all(&region_dir)
             .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
@@ -4878,6 +4924,84 @@ mod anvil_bit_packing_tests {
         assert_eq!(
             anvil_nbt_fingerprint(&tag),
             anvil_fingerprint_final(ref_fnv1a(&stream)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod anvil_dim_tests {
+    use super::*;
+
+    /// The dimension registry is process-global; serialize the
+    /// register/assert/reset sequence the way the other dynamic-dimension
+    /// fixtures do.
+    static ANVIL_DIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn custom_dimension_maps_to_the_vanilla_dimensions_path() {
+        let _world = crate::world_guard();
+        let _gen = worldgen::lock_gen_for_tests();
+        let _guard = ANVIL_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        worldgen::reset_dimension_registry();
+        let sources = vec![worldgen::DatapackDimensionSource::Entries(vec![
+            (
+                "data/mymod/dimension_type/sky.json".to_string(),
+                r#"{"min_y": 0, "height": 128}"#.to_string(),
+            ),
+            (
+                "data/mymod/dimension/sky_realm.json".to_string(),
+                r#"{"type": "mymod:sky", "generator": {"type": "minecraft:flat",
+                    "settings": {"biome": "mymod:sky_biome", "layers": [
+                        {"block": "minecraft:stone", "height": 16}]}}}"#
+                    .to_string(),
+            ),
+        ])];
+        assert_eq!(
+            worldgen::register_datapack_dimensions(&sources, |_| Some(1)).unwrap(),
+            1
+        );
+        let dim = DimId::parse_dimension_id("mymod:sky_realm").unwrap();
+        assert_eq!(
+            anvil_dim_region_dir(dim).as_deref(),
+            Some("dimensions/mymod/sky_realm/region")
+        );
+        // The vanilla paths are untouched.
+        assert_eq!(
+            anvil_dim_region_dir(DimId::Overworld).as_deref(),
+            Some("region")
+        );
+        assert_eq!(
+            anvil_dim_region_dir(DimId::Nether).as_deref(),
+            Some("DIM-1/region")
+        );
+        assert_eq!(
+            anvil_dim_region_dir(DimId::End).as_deref(),
+            Some("DIM1/region")
+        );
+        // An unregistered slot still has no directory.
+        assert_eq!(anvil_dim_region_dir(DimId::from_raw(200)), None);
+        worldgen::reset_dimension_registry();
+    }
+
+    #[test]
+    fn custom_dimension_region_dir_rejects_traversal() {
+        for key in [
+            "mymod:../evil",
+            "mymod:a/../../b",
+            "mymod:a//b",
+            "mymod:a/./b",
+            "mymod:a b",
+            "mymod:a\\b",
+            "mymod:",
+            ":path",
+            "mymod",
+        ] {
+            assert_eq!(anvil_custom_dim_region_dir(key), None, "{key}");
+        }
+        // A multi-segment dimension path keeps its structure under `dimensions/`.
+        assert_eq!(
+            anvil_custom_dim_region_dir("mymod:deep/sky_realm").as_deref(),
+            Some("dimensions/mymod/deep/sky_realm/region")
         );
     }
 }

@@ -449,6 +449,11 @@ pub(crate) struct DimensionSpec {
     pub monster_spawn_light_level: i32,
     pub monster_spawn_block_light_limit: i32,
     pub generator: CustomGeneratorKind,
+    /// The biome name the generator declares for its fills — `settings.biome`
+    /// for flat, `biome` for void/unknown — canonicalized. `None` for noise
+    /// generators (their biomes come from the climate sampler) and for the
+    /// vanilla dimensions, whose answers live elsewhere.
+    pub default_biome: Option<String>,
 }
 
 /// The registered custom dimensions. `specs[i]` owns slot `3 + i`; `by_key` maps a
@@ -485,6 +490,14 @@ pub(crate) fn dimension_spec(dimension: DimId) -> Option<DimensionSpec> {
 /// Every custom dimension, in registration (and therefore slot) order.
 pub(crate) fn custom_dimension_specs() -> Vec<DimensionSpec> {
     DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.clone()
+}
+
+/// The biome a custom dimension's generator declares for its fills — the
+/// `default_biome` its `dimension_type`/generator registration recorded.
+/// `None` for the vanilla dimensions and for noise/flat generators that name
+/// no biome; callers needing a name fall back on their own.
+pub(crate) fn dimension_default_biome(dim: DimId) -> Option<String> {
+    dimension_spec(dim)?.default_biome.clone()
 }
 
 /// A custom dimension's canonical key without cloning its spec.
@@ -614,6 +627,7 @@ fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
         monster_spawn_light_level: 0,
         monster_spawn_block_light_limit: 0,
         generator: CustomGeneratorKind::Void { biome_id: 39 },
+        default_biome: None,
     })
 }
 
@@ -664,6 +678,7 @@ fn parse_dimension_type(key: &str, j: &J) -> Result<DimensionSpec, String> {
         monster_spawn_block_light_limit: jint(j, "monster_spawn_block_light_limit")
             .unwrap_or(0) as i32,
         generator: CustomGeneratorKind::Void { biome_id: 39 },
+        default_biome: None,
     })
 }
 
@@ -674,6 +689,22 @@ fn generator_biome_id(generator: &J) -> i64 {
         .map(J::str)
         .map(biome_id)
         .unwrap_or(39) // plains
+}
+
+/// The canonical `"namespace:path"` biome name a generator object declares —
+/// the same holder [`generator_biome_id`] reduces to an id.
+fn generator_biome_name(generator: &J) -> Option<String> {
+    canonical_key(generator.get("biome").map(J::str)?)
+}
+
+/// The biome a `dimension/*.json` generator declares for its flat/void fills,
+/// read from the same holder [`parse_dimension_generator`] uses.
+fn dimension_generator_biome(dim_j: &J) -> Option<String> {
+    let generator = dim_j.get("generator")?;
+    match generator.get("type").map(J::str) {
+        Some("minecraft:flat") => generator_biome_name(generator.get("settings")?),
+        _ => generator_biome_name(generator),
+    }
 }
 
 /// Parse the `generator` object of a `dimension/*.json` into a generator kind.
@@ -882,6 +913,7 @@ fn register_dimension_maps(
                 continue;
             }
         };
+        spec.default_biome = dimension_generator_biome(dim_j);
         spec.key = Box::leak(key.clone().into_boxed_str());
         spec.type_key = match dim_j.get("type") {
             Some(J::Obj(_)) => spec.key,
@@ -13796,6 +13828,41 @@ pub fn world_max_y() -> i32 {
     world_min_y() + world_height() - 1
 }
 
+/// `sea_level()` for one named dimension, answered from that dimension's own
+/// published facts — never the active dimension's global, so a Nether or
+/// custom-dimension reader does not inherit the Overworld's sea level. Before
+/// the dimension's generator is installed the answer falls back to its noise
+/// preset's vanilla sea level (`Overworld` 63, `Nether` 32, `End` 0); a
+/// flat/void custom dimension has no noise sea level and answers the
+/// Overworld default, matching `sea_level()`'s own pre-init fallback.
+pub(crate) fn sea_level_dim(dim: DimId) -> i32 {
+    if let Some(facts) = facts_dim(dim) {
+        return facts.sea;
+    }
+    match dim.preset() {
+        NoisePreset::Overworld => 63,
+        NoisePreset::Nether => 32,
+        NoisePreset::End => 0,
+    }
+}
+
+/// `world_min_y()` for one named dimension: the `dimension_type` floor. This
+/// is the world window, not the generator's `min_y()`/`max_y()` noise window —
+/// chunk sections, heightmaps, feature/structure write bounds and spawn column
+/// scans all want this one. It agrees with [`DimId::min_y`] (which reads the
+/// same `dimension_spec`), but routes through `facts_dim` first so a custom
+/// `Noise` dimension's installed window wins over its spec.
+pub(crate) fn min_y_dim(dim: DimId) -> i32 {
+    facts_dim(dim).map_or_else(|| dim.min_y(), |f| f.world_min_y)
+}
+
+/// `world_height()` for one named dimension: the `dimension_type` height —
+/// the same window [`min_y_dim`] floors. See [`min_y_dim`] for the window
+/// distinction versus the generator's `height`.
+pub(crate) fn height_dim(dim: DimId) -> i32 {
+    facts_dim(dim).map_or_else(|| dim.height(), |f| f.world_height)
+}
+
 /// First solid (density>0) y when scanning down from max_y. -min_y-1 if none.
 pub fn surface_of(x: i32, z: i32) -> i32 {
     let mut y = max_y();
@@ -22354,3 +22421,128 @@ mod weird_sampler_tests;
 #[path = "aquifer_native_tests.rs"]
 mod aquifer_native_tests;
 
+
+#[cfg(test)]
+mod dim_facts_tests {
+    use super::*;
+
+    /// The dimension registry is process-global; the shared generator lock is
+    /// the only cross-file guard a test in this module can take, so the whole
+    /// register/assert/reset sequence runs under it.
+    static DIM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn dim_entries(files: &[(&str, &str)]) -> Vec<DatapackDimensionSource> {
+        vec![DatapackDimensionSource::Entries(
+            files
+                .iter()
+                .map(|(p, b)| (p.to_string(), b.to_string()))
+                .collect(),
+        )]
+    }
+
+    const SKY_TYPE: &str = r#"{
+        "min_y": -128, "height": 512, "logical_height": 512,
+        "has_skylight": true, "has_ceiling": false, "natural": true,
+        "coordinate_scale": 1.0, "ambient_light": 0.0,
+        "effects": "minecraft:overworld"
+    }"#;
+
+    const DEEP_TYPE: &str = r#"{
+        "min_y": 0, "height": 128, "logical_height": 128,
+        "has_skylight": false, "has_ceiling": true, "ultrawarm": true,
+        "natural": true, "coordinate_scale": 1.0, "ambient_light": 0.1,
+        "effects": "minecraft:the_nether"
+    }"#;
+
+    #[test]
+    fn dim_fact_accessors_answer_each_dimensions_own_window() {
+        let _gen = lock_gen_for_tests();
+        let _world = crate::world_guard();
+        let _guard = DIM_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_dimension_registry();
+
+        // Vanilla answers come from the pinned slots. With no generator
+        // installed (the clean-room `cargo test` profile) the spec/preset
+        // fallback path answers — and it must still be per-dimension, never
+        // the active dimension's.
+        assert_eq!(sea_level_dim(DimId::Overworld), 63);
+        assert_eq!(sea_level_dim(DimId::Nether), 32);
+        assert_eq!(sea_level_dim(DimId::End), 0);
+        assert_eq!(min_y_dim(DimId::Overworld), -64);
+        assert_eq!(height_dim(DimId::Overworld), 384);
+        assert_eq!(min_y_dim(DimId::Nether), 0);
+        assert_eq!(height_dim(DimId::Nether), 256);
+        assert_eq!(min_y_dim(DimId::End), 0);
+        assert_eq!(height_dim(DimId::End), 256);
+
+        let sources = dim_entries(&[
+            ("data/mymod/dimension_type/sky.json", SKY_TYPE),
+            (
+                "data/mymod/dimension/sky_realm.json",
+                r#"{"type": "mymod:sky", "generator": {"type": "minecraft:noise",
+                    "settings": "minecraft:nether"}}"#,
+            ),
+            ("data/mymod/dimension_type/deep.json", DEEP_TYPE),
+            (
+                "data/mymod/dimension/deep_realm.json",
+                r#"{"type": "mymod:deep", "generator": {"type": "minecraft:flat",
+                    "settings": {"biome": "mymod:deep_biome", "layers": [
+                        {"block": "minecraft:stone", "height": 32}]}}}"#,
+            ),
+        ]);
+        assert_eq!(
+            register_datapack_dimensions(&sources, |_| Some(1)).unwrap(),
+            2
+        );
+
+        let sky = DimId::parse_dimension_id("mymod:sky_realm").unwrap();
+        let deep = DimId::parse_dimension_id("mymod:deep_realm").unwrap();
+        assert_eq!(min_y_dim(sky), -128);
+        assert_eq!(height_dim(sky), 512);
+        assert_eq!(min_y_dim(deep), 0);
+        assert_eq!(height_dim(deep), 128);
+        // The noise preset supplies the fallback sea level; a flat generator
+        // has none and answers the Overworld default.
+        assert_eq!(sea_level_dim(sky), 32);
+        assert_eq!(sea_level_dim(deep), 63);
+        // The generator-declared biome lands on the spec for biome readers.
+        assert_eq!(
+            dimension_default_biome(deep).as_deref(),
+            Some("mymod:deep_biome")
+        );
+        assert_eq!(dimension_default_biome(sky), None);
+        assert_eq!(dimension_default_biome(DimId::Overworld), None);
+
+        // Installed facts win over the spec/preset fallbacks — and they are
+        // per-slot, so publishing Nether facts cannot move the Overworld's
+        // answer whatever the active dimension is.
+        {
+            let mut facts = PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner());
+            if facts.len() <= DimId::Nether.index() {
+                facts.resize(DimId::Nether.index() + 1, None);
+            }
+            facts[DimId::Nether.index()] = Some(GenFacts {
+                preset: NoisePreset::Nether,
+                sea: 77,
+                min_y: 0,
+                height: 128,
+                world_min_y: 0,
+                world_height: 200,
+                def_st: 0,
+                def_fl: 0,
+                bedrock_st: 0,
+            });
+        }
+        assert_eq!(sea_level_dim(DimId::Nether), 77);
+        assert_eq!(height_dim(DimId::Nether), 200);
+        assert_eq!(min_y_dim(DimId::Nether), 0);
+        assert_eq!(sea_level_dim(DimId::Overworld), 63);
+        assert_eq!(height_dim(DimId::Overworld), 384);
+        {
+            let mut facts = PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner());
+            facts[DimId::Nether.index()] = None;
+        }
+
+        reset_dimension_registry();
+    }
+}

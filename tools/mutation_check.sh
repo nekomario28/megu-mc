@@ -1246,7 +1246,7 @@ check "a pointed dripstone carries the direction it was grown in" \
   dripstone_cluster_hangs_stalactites_below_and_stands_stalagmites_above
 
 check "an iceberg re-anchors itself to sea level" \
-  src/feature.rs '    let pos = (origin.0, crate::worldgen::sea_level(), origin.2);' \
+  src/feature.rs '    let pos = (origin.0, ctx.g.sea, origin.2);' \
   '    let pos = (origin.0, origin.1, origin.2);' \
   iceberg_builds_a_shape_around_sea_level
 
