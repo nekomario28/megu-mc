@@ -4055,6 +4055,11 @@ impl RemoteControlServer {
                 Ok(pair) => pair,
                 Err(_) => break, // WouldBlock or a real error: step ends
             };
+            // On macOS/BSD, accepted sockets inherit O_NONBLOCK from a
+            // non-blocking listener; switch to blocking before the bounded
+            // 250 ms read/write so requests do not fail with WouldBlock -> 400.
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
             let raw = read_http_request(&mut stream);
             let reply = self.handle_request(&raw, status_json);
             let head = format!(
