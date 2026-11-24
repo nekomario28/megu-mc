@@ -17,7 +17,7 @@ type AnvilNbt = crate::nbt::Tag;
 // The `version` field vanilla writes for this release, the DataVersion integer,
 // and one sector's size in bytes.
 const ANVIL_LEVEL_VERSION: i32 = 19133;
-const ANVIL_DATA_VERSION: i32 = 3955;
+const ANVIL_DATA_VERSION: i32 = megu_core::version::TargetVersion::V1_21_1.data_version();
 const ANVIL_SECTOR: usize = 4096;
 // Decompression budgets: one chunk payload is at most 255 sectors (~1 MiB) on
 // disk but can inflate far past that; level.dat is unbounded on disk. Both are
@@ -553,10 +553,18 @@ include!("region.rs");
 
 /// One 16x16x16 section decoded to this registry's state ids. `biomes` keeps the
 /// canonical names (import does not apply them; export writes them back out).
+/// `tombstones` maps a cell index whose palette entry the block registry could
+/// not resolve (a mod block like `mekanism:metallurgic_infuser`) to that entry's
+/// verbatim compound — decoding mapped the cell to air, but the original
+/// `{Name, Properties}` is kept so a re-encode restores it instead of erasing
+/// the block.
 #[derive(Clone, Debug, PartialEq)]
 struct AnvilSection {
     y: i8,
     blocks: Box<[u32; 4096]>,
+    /// Cell index -> original palette-entry compound for cells the registry
+    /// does not know. Empty for sections whose palette fully resolved.
+    tombstones: HashMap<u16, AnvilNbt>,
     biomes: Option<Box<[String; 64]>>,
     block_light: Option<Box<[u8; 2048]>>,
     sky_light: Option<Box<[u8; 2048]>>,
@@ -601,22 +609,35 @@ fn anvil_section_from_nbt(
         return Ok(None);
     };
     let mut blocks = Box::new([0u32; 4096]);
+    let mut tombstones: HashMap<u16, AnvilNbt> = HashMap::new();
     if let Some(bs) = sec.get("block_states") {
         let palette_tag = bs
             .get("palette")
             .and_then(AnvilNbt::list)
             .ok_or("block_states palette missing")?;
         let mut palette = Vec::with_capacity(palette_tag.len());
-        for entry in palette_tag {
+        // Palette positions whose entry resolved to no known state: those
+        // decode as air but keep their original compound so a re-encode can
+        // restore them instead of writing air over a mod block.
+        let mut unresolved: HashMap<usize, AnvilNbt> = HashMap::new();
+        for (pi, entry) in palette_tag.iter().enumerate() {
+            let before = *unknown;
             palette.push(anvil_state_id(entry, unknown));
+            if *unknown != before {
+                unresolved.insert(pi, entry.clone());
+            }
         }
         match bs.get("data") {
             Some(AnvilNbt::LongArray(data)) => {
                 let bits = anvil_bits_for(palette.len(), 4);
                 for (i, p) in anvil_unpack_longs(data, bits, 4096)?.iter().enumerate() {
+                    let pi = *p as usize;
                     blocks[i] = *palette
-                        .get(*p as usize)
+                        .get(pi)
                         .ok_or("block_states palette index out of range")?;
+                    if let Some(entry) = unresolved.get(&pi) {
+                        tombstones.insert(i as u16, entry.clone());
+                    }
                 }
             }
             Some(_) => return Err("block_states data is not a long array".to_string()),
@@ -625,6 +646,11 @@ fn anvil_section_from_nbt(
                     return Err("block_states data missing".to_string());
                 }
                 blocks.fill(palette[0]);
+                if let Some(entry) = unresolved.get(&0) {
+                    for i in 0..4096u16 {
+                        tombstones.insert(i, entry.clone());
+                    }
+                }
             }
         }
     }
@@ -662,6 +688,7 @@ fn anvil_section_from_nbt(
     Ok(Some(AnvilSection {
         y,
         blocks,
+        tombstones,
         biomes,
         block_light: anvil_light(sec, "BlockLight"),
         sky_light: anvil_light(sec, "SkyLight"),
@@ -708,6 +735,167 @@ fn anvil_chunk_from_nbt(
     })
 }
 
+// ---------- lossless round-trip preservation ----------
+//
+// A real Vanilla/NeoForge/Fabric save carries fields this codec never
+// interprets — `Heightmaps`, `structures`, `neoforge:attachments`,
+// `ForgeData`, `ForgeCaps`, `fabric:attachments`, `cardinal_components`,
+// `InhabitedTime`, `LastUpdate`, `blending_data`, `below_zero_retrogen`,
+// `CarvingMasks`, `entities`, `block_ticks`, `fluid_ticks` on chunk roots;
+// `recipeBook`, `warden_spawn_tracker`, `ShoulderEntityLeft`/`Right`,
+// `RootVehicle` on playerdata — plus palette entries the block registry
+// cannot resolve (mod blocks). Dropping any of them on a load -> save cycle
+// silently destroys a player's world, so each is captured at decode into a
+// bounded per-record map and merged back when that record re-encodes.
+
+/// Root-compound keys `anvil_chunk_to_nbt` emits itself. Every other root
+/// entry a loaded chunk carries — including `block_ticks`/`fluid_ticks`,
+/// which pass straight back through — is preserved and merged on re-encode.
+const ANVIL_CHUNK_EMITTED_KEYS: &[&str] = &[
+    "DataVersion",
+    "xPos",
+    "zPos",
+    "yPos",
+    "Status",
+    "sections",
+    "block_entities",
+];
+
+/// Root-compound keys `playerdata_nbt_root` emits itself (the `PlayerSave`
+/// schema plus the `UUID` int array); every other root entry a player file
+/// carries is preserved and merged on re-encode.
+const ANVIL_PLAYER_EMITTED_KEYS: &[&str] = &[
+    "DataVersion",
+    "Dimension",
+    "Pos",
+    "Rotation",
+    "Health",
+    "AbsorptionAmount",
+    "foodLevel",
+    "foodSaturationLevel",
+    "foodExhaustionLevel",
+    "foodTickTimer",
+    "XpLevel",
+    "XpP",
+    "XpTotal",
+    "playerGameType",
+    "previousPlayerGameType",
+    "SelectedItemSlot",
+    "Inventory",
+    "EnderItems",
+    "ActiveEffects",
+    "SpawnDimension",
+    "SpawnX",
+    "SpawnY",
+    "SpawnZ",
+    "SpawnAngle",
+    "SpawnForced",
+    "SpawnKind",
+    "UUID",
+];
+
+/// Per-record bound on preserved root fields. A legitimate 1.21.1 chunk or
+/// player file carries well under a hundred root entries; the cap keeps a
+/// hostile file from growing the preservation maps without bound.
+const ANVIL_PRESERVE_MAX_FIELDS: usize = 128;
+
+/// The root-compound entries of `root` whose keys are not in `emitted`,
+/// sorted by the compound's own key order and bounded by
+/// `ANVIL_PRESERVE_MAX_FIELDS`. A non-compound root preserves nothing.
+fn anvil_preserved_root_fields(
+    root: &AnvilNbt,
+    emitted: &[&str],
+) -> std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt> {
+    let mut kept = std::collections::BTreeMap::new();
+    let AnvilNbt::Compound(fields) = root else {
+        return kept;
+    };
+    for (key, value) in fields {
+        if kept.len() >= ANVIL_PRESERVE_MAX_FIELDS {
+            break;
+        }
+        if emitted
+            .iter()
+            .any(|k| String::from_utf16_lossy(&key.0) == *k)
+        {
+            continue;
+        }
+        kept.insert(key.clone(), value.clone());
+    }
+    kept
+}
+
+/// Unknown root-NBT entries of decoded chunks, keyed `(dim, cx, cz)`: what
+/// `anvil_chunk_to_nbt` merges back so a modified chunk keeps its mod and
+/// vanilla fields the codec does not own.
+static ANVIL_CHUNK_PRESERVED: Registry<
+    DimChunkKey,
+    std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+> = OnceLock::new();
+fn anvil_chunk_preserved(
+) -> &'static LockedMap<DimChunkKey, std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>
+{
+    ANVIL_CHUNK_PRESERVED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The mod-block tombstone overlay: `(dim, cx, cz)` -> section `Y` -> cell
+/// index -> the unresolved palette-entry compound. Captured at decode; an
+/// export restores the entry verbatim for any cell that still decodes to
+/// air, so a modded base never silently re-saves as air.
+static ANVIL_BLOCK_TOMBSTONES: Registry<DimChunkKey, HashMap<i8, HashMap<u16, AnvilNbt>>> =
+    OnceLock::new();
+fn anvil_block_tombstones(
+) -> &'static LockedMap<DimChunkKey, HashMap<i8, HashMap<u16, AnvilNbt>>> {
+    ANVIL_BLOCK_TOMBSTONES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Unknown root-NBT entries of `playerdata/<uuid>.dat` records, keyed by the
+/// player's uuid: `neoforge:attachments`, `ForgeData`, `recipeBook`,
+/// `fabric:attachments` and friends merge back on write.
+static ANVIL_PLAYER_PRESERVED: Registry<
+    [u8; 16],
+    std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+> = OnceLock::new();
+fn anvil_playerdata_preserved(
+) -> &'static LockedMap<[u8; 16], std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>
+{
+    ANVIL_PLAYER_PRESERVED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Capture what a decoded chunk carries that the export rewrite would drop:
+/// every root-compound entry outside `ANVIL_CHUNK_EMITTED_KEYS` into
+/// `anvil_chunk_preserved`, and every section's unresolved-palette tombstones
+/// into `anvil_block_tombstones`. Called once per decoded record — import and
+/// live reload — so a modified chunk re-encodes with its mod data intact. An
+/// empty capture clears any stale entry for the slot: the newest read wins.
+fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
+    let extras = anvil_preserved_root_fields(root, ANVIL_CHUNK_EMITTED_KEYS);
+    {
+        let mut map = anvil_chunk_preserved()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if extras.is_empty() {
+            map.remove(&(dim, chunk.cx, chunk.cz));
+        } else {
+            map.insert((dim, chunk.cx, chunk.cz), extras);
+        }
+    }
+    let mut tombstones: HashMap<i8, HashMap<u16, AnvilNbt>> = HashMap::new();
+    for section in &chunk.sections {
+        if !section.tombstones.is_empty() {
+            tombstones.insert(section.y, section.tombstones.clone());
+        }
+    }
+    let mut map = anvil_block_tombstones()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if tombstones.is_empty() {
+        map.remove(&(dim, chunk.cx, chunk.cz));
+    } else {
+        map.insert((dim, chunk.cx, chunk.cz), tombstones);
+    }
+}
+
 /// The `data` long array for one section's 4096 palette indices, or `None`
 /// when a single-entry palette makes it implicit (the exact 1.21.1 omission).
 fn anvil_pack_section(
@@ -733,14 +921,66 @@ fn anvil_pack_section(
     ))
 }
 
+/// One cell's encode-time value: a live registry state id, or the verbatim
+/// palette-entry compound a mod block kept in the source file.
+#[derive(Clone, Debug, PartialEq)]
+enum AnvilSectionCell {
+    State(u32),
+    Tombstone(AnvilNbt),
+}
+
 /// Assemble one chunk's `sections` list entry: `Y`, `block_states`, `biomes`,
-/// and the two light arrays when they exist.
+/// and the two light arrays when they exist. Cells whose tombstone marks an
+/// unresolved mod-block palette entry contribute that entry verbatim — a
+/// cell that still decodes to air (its tombstone state) restores the mod
+/// block; a cell gameplay overwrote with a real state keeps the new state.
 fn anvil_section_to_nbt(sec: &AnvilSection) -> AnvilNbt {
-    let mut palette = Vec::new();
-    let data = anvil_pack_section(&sec.blocks, &mut palette);
+    let mut palette: Vec<AnvilSectionCell> = Vec::new();
+    let data = if sec.tombstones.is_empty() {
+        let mut ids = Vec::new();
+        let data = anvil_pack_section(&sec.blocks, &mut ids);
+        palette = ids.into_iter().map(AnvilSectionCell::State).collect();
+        data
+    } else {
+        // Tombstone-aware packing: palette entries are full compounds, so a
+        // mod block's `Properties` ride along byte-for-byte. A cell still at
+        // state 0 (the id a mod block decoded as) rewrites its tombstone;
+        // any other state wins over the tombstone.
+        let mut indices = Vec::with_capacity(4096);
+        for (i, &st) in sec.blocks.iter().enumerate() {
+            let cell = match (st == 0, sec.tombstones.get(&(i as u16))) {
+                (true, Some(entry)) => AnvilSectionCell::Tombstone(entry.clone()),
+                _ => AnvilSectionCell::State(st),
+            };
+            let idx = match palette.iter().position(|p| *p == cell) {
+                Some(p) => p,
+                None => {
+                    palette.push(cell);
+                    palette.len() - 1
+                }
+            };
+            indices.push(idx as u64);
+        }
+        if palette.len() <= 1 {
+            None
+        } else {
+            Some(anvil_pack_longs(
+                &indices,
+                anvil_bits_for(palette.len(), 4),
+            ))
+        }
+    };
     let mut block_states = vec![(
         "palette",
-        anvil_list(palette.iter().map(|&st| anvil_state_entry(st)).collect()),
+        anvil_list(
+            palette
+                .iter()
+                .map(|cell| match cell {
+                    AnvilSectionCell::State(st) => anvil_state_entry(*st),
+                    AnvilSectionCell::Tombstone(entry) => entry.clone(),
+                })
+                .collect(),
+        ),
     )];
     if let Some(data) = data {
         block_states.push(("data", AnvilNbt::LongArray(data)));
@@ -794,11 +1034,15 @@ fn anvil_section_to_nbt(sec: &AnvilSection) -> AnvilNbt {
 }
 
 /// Encode a decoded chunk to the 1.21.1 root compound: `DataVersion`,
-/// `xPos`/`zPos`/`yPos`, `Status`, `sections`, `block_entities`.
-fn anvil_chunk_to_nbt(chunk: &AnvilChunk, y_pos: i32) -> AnvilNbt {
+/// `xPos`/`zPos`/`yPos`, `Status`, `sections`, `block_entities` — plus every
+/// preserved root entry this chunk's source record carried (`Heightmaps`,
+/// `structures`, `neoforge:attachments`, `ForgeData`, `fabric:attachments`,
+/// `entities`, `block_ticks`, ...). Preserved entries never overwrite a key
+/// the codec emits itself.
+fn anvil_chunk_to_nbt(dim: DimId, chunk: &AnvilChunk, y_pos: i32) -> AnvilNbt {
     let sections: Vec<AnvilNbt> =
         chunk.sections.iter().map(anvil_section_to_nbt).collect();
-    anvil_obj(&[
+    let mut root = anvil_obj(&[
         ("DataVersion", AnvilNbt::Int(chunk.data_version)),
         ("xPos", AnvilNbt::Int(chunk.cx)),
         ("zPos", AnvilNbt::Int(chunk.cz)),
@@ -809,7 +1053,20 @@ fn anvil_chunk_to_nbt(chunk: &AnvilChunk, y_pos: i32) -> AnvilNbt {
             "block_entities",
             anvil_list(chunk.block_entities.clone()),
         ),
-    ])
+    ]);
+    if let AnvilNbt::Compound(fields) = &mut root {
+        let preserved = anvil_chunk_preserved()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(dim, chunk.cx, chunk.cz))
+            .cloned();
+        if let Some(extras) = preserved {
+            for (key, value) in extras {
+                fields.entry(key).or_insert(value);
+            }
+        }
+    }
+    root
 }
 
 /// A decoded chunk's blocks as `world()` overlay cells for `dim`. Cells outside
@@ -860,18 +1117,15 @@ impl AnvilLevelDat {
         &mut self.data
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     fn data_version(&self) -> i32 {
         anvil_i32(self.data(), "DataVersion").unwrap_or(0)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     fn version_id(&self) -> i32 {
         anvil_i32(self.data(), "version").unwrap_or(0)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     fn level_name(&self) -> String {
         anvil_str(self.data(), "LevelName").unwrap_or_default()
     }
@@ -899,13 +1153,11 @@ impl AnvilLevelDat {
     fn difficulty(&self) -> i8 {
         anvil_i8(self.data(), "Difficulty").unwrap_or(2)
     }
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     fn difficulty_locked(&self) -> bool {
         anvil_i8(self.data(), "DifficultyLocked").unwrap_or(0) != 0
     }
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     fn game_type(&self) -> i32 {
         anvil_i32(self.data(), "GameType").unwrap_or(0)
     }
@@ -1060,7 +1312,7 @@ fn anvil_level_dimensions() -> AnvilNbt {
             ("preset", anvil_s(preset)),
         ])
     };
-    anvil_obj(&[
+    let mut dims = anvil_obj(&[
         (
             "minecraft:overworld",
             anvil_obj(&[
@@ -1091,7 +1343,122 @@ fn anvil_level_dimensions() -> AnvilNbt {
                 ),
             ]),
         ),
-    ])
+    ]);
+    // Registered custom dimensions ride along the same way vanilla writes
+    // them: `<ns>:<path>` -> {type, generator}. The type is emitted as a full
+    // inline compound — a holder accepts a direct value, and carrying every
+    // field means an import of this exact level.dat restores the dimension's
+    // real window instead of the fallback's.
+    if let AnvilNbt::Compound(fields) = &mut dims {
+        for spec in worldgen::custom_dimension_specs() {
+            fields.insert(
+                crate::nbt::NbtString::text(spec.key),
+                anvil_obj(&[
+                    ("type", anvil_dimension_type_nbt(&spec)),
+                    ("generator", anvil_custom_dim_generator_nbt(&spec)),
+                ]),
+            );
+        }
+    }
+    dims
+}
+
+/// A registered custom dimension's `dimension_type` as a full inline
+/// compound — the same fields `parse_dimension_type` reads, so importing
+/// this level.dat reproduces the spec field-for-field.
+fn anvil_dimension_type_nbt(spec: &worldgen::DimensionSpec) -> AnvilNbt {
+    let byte = |b: bool| AnvilNbt::Byte(i8::from(b));
+    let mut fields = vec![
+        ("min_y", AnvilNbt::Int(spec.min_y)),
+        ("height", AnvilNbt::Int(spec.height)),
+        ("logical_height", AnvilNbt::Int(spec.logical_height)),
+        ("has_skylight", byte(spec.has_skylight)),
+        ("has_ceiling", byte(spec.has_ceiling)),
+        ("ultrawarm", byte(spec.ultrawarm)),
+        ("natural", byte(spec.natural)),
+        ("coordinate_scale", AnvilNbt::Double(spec.coordinate_scale.to_bits())),
+        ("ambient_light", AnvilNbt::Float(spec.ambient_light.to_bits())),
+        ("piglin_safe", byte(spec.piglin_safe)),
+        ("has_raids", byte(spec.has_raids)),
+        ("bed_works", byte(spec.bed_works)),
+        (
+            "respawn_anchor_works",
+            byte(spec.respawn_anchor_works),
+        ),
+        ("effects", anvil_s(&spec.effects)),
+        ("infiniburn", anvil_s(&spec.infiniburn)),
+        (
+            "monster_spawn_light_level",
+            AnvilNbt::Int(spec.monster_spawn_light_level),
+        ),
+        (
+            "monster_spawn_block_light_limit",
+            AnvilNbt::Int(spec.monster_spawn_block_light_limit),
+        ),
+    ];
+    if let Some(fixed) = spec.fixed_time {
+        fields.push(("fixed_time", AnvilNbt::Long(fixed)));
+    }
+    anvil_obj(&fields)
+}
+
+/// A registered custom dimension's `generator` compound, reconstructed from
+/// its `CustomGeneratorKind`: noise presets name their settings + biome
+/// preset, flat worlds name their layers and biome, void worlds keep their
+/// declared biome. Everything else a level.dat reader needs lives in the
+/// inline type next to it.
+fn anvil_custom_dim_generator_nbt(spec: &worldgen::DimensionSpec) -> AnvilNbt {
+    let biome = spec
+        .default_biome
+        .as_deref()
+        .unwrap_or("minecraft:plains");
+    match &spec.generator {
+        worldgen::CustomGeneratorKind::Noise { preset } => anvil_obj(&[
+            ("type", anvil_s("minecraft:noise")),
+            (
+                "settings",
+                anvil_s(&format!("minecraft:{}", preset.name())),
+            ),
+            (
+                "biome_source",
+                anvil_obj(&[
+                    ("type", anvil_s("minecraft:multi_noise")),
+                    (
+                        "preset",
+                        anvil_s(&format!("minecraft:{}", preset.name())),
+                    ),
+                ]),
+            ),
+        ]),
+        worldgen::CustomGeneratorKind::Flat { layers, .. } => {
+            let layer_nbt: Vec<AnvilNbt> = layers
+                .iter()
+                .map(|&(state, height)| {
+                    let name = breg()
+                        .map(|r| r.name_of(u32::from(state)).to_string())
+                        .unwrap_or_else(|| "minecraft:air".to_string());
+                    anvil_obj(&[
+                        ("block", anvil_s(&name)),
+                        ("height", AnvilNbt::Int(height as i32)),
+                    ])
+                })
+                .collect();
+            anvil_obj(&[
+                ("type", anvil_s("minecraft:flat")),
+                (
+                    "settings",
+                    anvil_obj(&[
+                        ("layers", anvil_list(layer_nbt)),
+                        ("biome", anvil_s(biome)),
+                    ]),
+                ),
+            ])
+        }
+        worldgen::CustomGeneratorKind::Void { .. } => anvil_obj(&[
+            ("type", anvil_s("minecraft:debug")),
+            ("biome", anvil_s(biome)),
+        ]),
+    }
 }
 
 /// Snapshot the live world state into a `Data` compound: identity fields, spawn,
@@ -1238,12 +1605,10 @@ struct AnvilImportedChunk {
     edits: HashMap<u32, u32>,
     block_entities: Vec<AnvilNbt>,
     /// Palette entries that resolved to no known state — reported, not applied.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     unknown_states: usize,
     /// Section entries dropped for carrying no `Y` index at all.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     dropped_sections: usize,
 }
 
@@ -1302,6 +1667,7 @@ fn anvil_import_region_dir(
         for (&slot, record) in &region.chunks {
             match anvil_chunk_from_nbt(&record.nbt, slot) {
                 Ok(chunk) => {
+                    anvil_remember_chunk(dim, &chunk, &record.nbt);
                     *report
                         .data_version_counts
                         .entry(chunk.data_version)
@@ -1353,6 +1719,21 @@ fn import_anvil_world(vanilla_world_dir: &std::path::Path) -> Result<AnvilImport
         DimId::End,
         &mut report,
     )?;
+    // Custom dimensions: `dimensions/<ns>/<path>/region/*.mca`, each importing
+    // under the `DimId` its key registers (level.dat supplies the real
+    // dimension_type when it carries one). A key that can never register
+    // skips its directory with a diagnostic rather than dropping it silently.
+    for (key, region_dir) in
+        anvil_custom_dim_region_dirs(vanilla_world_dir, &mut report.chunk_errors)
+    {
+        match anvil_register_dimension_for_import(&key, report.level.as_ref()) {
+            Some(dim) => anvil_import_region_dir(&region_dir, dim, &mut report)?,
+            None => report.chunk_errors.push(format!(
+                "{}: dimension '{key}' is not registered and level.dat cannot supply it",
+                region_dir.display()
+            )),
+        }
+    }
     Ok(report)
 }
 
@@ -1531,6 +1912,315 @@ fn anvil_dim_region_dir(dim: DimId) -> Option<String> {
     }
 }
 
+/// A path segment legal inside a vanilla `dimensions/` tree: the lowercase
+/// ResourceLocation character set, never empty, never `.`/`..`. Anything else
+/// is not a dimension directory and is never descended into — the inverse of
+/// `anvil_safe_path_segment`'s export-side check.
+fn anvil_mc_path_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+        })
+}
+
+/// Depth bound on the `dimensions/<ns>/<path>/...` walk — a real save nests
+/// one segment deep; the bound keeps a pathological tree cheap to reject.
+const ANVIL_DIM_SCAN_MAX_DEPTH: usize = 8;
+
+/// `dimensions/<ns>/<path>/region` directories inside `world_root`, as
+/// `(canonical "ns:path", region_dir)` pairs in canonical order. A symlinked
+/// `dimensions` root or any symlinked/invalid namespace or path segment
+/// skips that branch with a diagnostic, so a crafted tree can never steer the
+/// scan outside the world or into a name that fails ResourceLocation rules.
+/// A `region` directory directly under a namespace (`dimensions/<ns>/region`)
+/// has no dimension path to name and is ignored.
+fn anvil_custom_dim_region_dirs(
+    world_root: &std::path::Path,
+    errors: &mut Vec<String>,
+) -> Vec<(String, std::path::PathBuf)> {
+    let root = world_root.join("dimensions");
+    if root
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink() || !m.is_dir())
+    {
+        return Vec::new();
+    }
+    let mut found: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // (directory, namespace, path-so-far, depth)
+    let mut stack: Vec<(std::path::PathBuf, String, String, usize)> = Vec::new();
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&root)
+        .map(|read| read.flatten().collect())
+        .unwrap_or_default();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue; // file_type() never follows: a symlinked dir fails is_dir
+        }
+        let Some(ns) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if anvil_mc_path_segment(&ns) {
+            stack.push((entry.path(), ns, String::new(), 0));
+        } else {
+            errors.push(format!(
+                "{}: unsafe dimension namespace segment",
+                entry.path().display()
+            ));
+        }
+    }
+    while let Some((dir, ns, path, depth)) = stack.pop() {
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(&dir)
+            .map(|read| read.flatten().collect())
+            .unwrap_or_default();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if !kind.is_dir() {
+                continue;
+            }
+            let Some(seg) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if seg == "region" && !path.is_empty() {
+                found.push((format!("{ns}:{path}"), entry.path()));
+            }
+            if depth + 1 >= ANVIL_DIM_SCAN_MAX_DEPTH {
+                continue;
+            }
+            if !anvil_mc_path_segment(&seg) {
+                errors.push(format!(
+                    "{}: unsafe dimension path segment",
+                    entry.path().display()
+                ));
+                continue;
+            }
+            let child = if path.is_empty() {
+                seg
+            } else {
+                format!("{path}/{seg}")
+            };
+            stack.push((entry.path(), ns.clone(), child, depth + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One JSON string literal — `level.dat` NBT values become `dimension/*.json`
+/// bodies through this and `anvil_nbt_to_json_into`.
+fn anvil_json_string(value: &str, out: &mut String) {
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// One JSON number for a float NBT tag: exact integers stay integers, a
+/// non-finite value degrades to 0 rather than emitting invalid JSON.
+fn anvil_json_f64(v: f64, out: &mut String) {
+    if v.is_finite() && v.fract() == 0.0 && v.abs() <= 9_007_199_254_740_992.0 {
+        out.push_str(&(v as i64).to_string());
+    } else if v.is_finite() {
+        out.push_str(&v.to_string());
+    } else {
+        out.push('0');
+    }
+}
+
+/// An NBT tag as a JSON literal, appended — how a `level.dat` dimension entry
+/// becomes the `dimension/*.json` body `register_datapack_dimensions` reads.
+/// Numbers keep their values; strings/compound keys escape the JSON minimum.
+fn anvil_nbt_to_json(tag: &AnvilNbt) -> String {
+    let mut out = String::new();
+    anvil_nbt_to_json_into(tag, &mut out);
+    out
+}
+
+fn anvil_nbt_to_json_into(tag: &AnvilNbt, out: &mut String) {
+    match tag {
+        AnvilNbt::End => out.push_str("null"),
+        AnvilNbt::Byte(v) => out.push_str(&v.to_string()),
+        AnvilNbt::Short(v) => out.push_str(&v.to_string()),
+        AnvilNbt::Int(v) => out.push_str(&v.to_string()),
+        AnvilNbt::Long(v) => out.push_str(&v.to_string()),
+        AnvilNbt::Float(v) => anvil_json_f64(f64::from(f32::from_bits(*v)), out),
+        AnvilNbt::Double(v) => anvil_json_f64(f64::from_bits(*v), out),
+        AnvilNbt::ByteArray(v) => {
+            out.push('[');
+            for (i, b) in v.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&b.to_string());
+            }
+            out.push(']');
+        }
+        AnvilNbt::String(s) => anvil_json_string(&String::from_utf16_lossy(&s.0), out),
+        AnvilNbt::List(_, items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                anvil_nbt_to_json_into(item, out);
+            }
+            out.push(']');
+        }
+        AnvilNbt::Compound(fields) => {
+            out.push('{');
+            for (i, (key, value)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                anvil_json_string(&String::from_utf16_lossy(&key.0), out);
+                out.push(':');
+                anvil_nbt_to_json_into(value, out);
+            }
+            out.push('}');
+        }
+        AnvilNbt::IntArray(v) => {
+            out.push('[');
+            for (i, n) in v.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&n.to_string());
+            }
+            out.push(']');
+        }
+        AnvilNbt::LongArray(v) => {
+            out.push('[');
+            for (i, n) in v.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&n.to_string());
+            }
+            out.push(']');
+        }
+    }
+}
+
+/// The `dimension_type/*.json` body `anvil_register_dimension_for_import`
+/// falls back to when `level.dat` cannot supply a usable window: the vanilla
+/// `min_y -64` / `height 384` window. The imported terrain lives in the
+/// region files themselves — the window only bounds which sections apply.
+const ANVIL_FALLBACK_DIMENSION_TYPE_JSON: &str = "{\"min_y\":-64,\"height\":384}";
+
+/// The `generator` body used when `level.dat` names none this server can
+/// build: `debug` — an all-air void.
+const ANVIL_FALLBACK_GENERATOR_JSON: &str = "{\"type\":\"minecraft:debug\"}";
+
+/// Resolve or register the `DimId` a discovered `dimensions/<ns>/<path>`
+/// directory imports under. An already-registered key resolves directly;
+/// otherwise the entry `level.dat`'s `WorldGenSettings.dimensions` carries is
+/// converted into `dimension/` + `dimension_type/` JSON bodies and run
+/// through the datapack registrar. The registrar takes the dimension's
+/// `type` as a name, so an inline level.dat type object becomes the
+/// `dimension_type` file the name resolves to — the real `min_y`/`height`
+/// window survives. Retries degrade gracefully: the declared window with a
+/// `debug` generator, then the fallback window — a `type` naming a
+/// dimension_type this server does not carry never drops the dimension's
+/// chunks. `None` only when the key can never parse.
+fn anvil_register_dimension_for_import(
+    key: &str,
+    level: Option<&AnvilLevelDat>,
+) -> Option<DimId> {
+    let (ns, path) = key.split_once(':')?;
+    if !anvil_mc_path_segment(ns)
+        || path.is_empty()
+        || !path.split('/').all(anvil_mc_path_segment)
+    {
+        return None;
+    }
+    if let Some(dim) = DimId::parse_dimension_id(key) {
+        return Some(dim);
+    }
+    let dim_file = format!("data/{ns}/dimension/{path}.json");
+    let type_file = format!("data/{ns}/dimension_type/{path}.json");
+    // The `type` name the dimension file uses when it owns its own
+    // dimension_type: the dimension's key itself.
+    let mut self_type = String::new();
+    anvil_json_string(key, &mut self_type);
+    let entry = level
+        .map(|l| l.data())
+        .and_then(|d| d.get("WorldGenSettings"))
+        .and_then(|w| w.get("dimensions"))
+        .and_then(|dims| dims.get(key));
+    let (type_body, type_json) = match entry.and_then(|e| e.get("type")) {
+        // An inline type object becomes the dimension_type file the
+        // dimension names — `min_y`/`height` and every flag ride along.
+        Some(ty @ AnvilNbt::Compound(_)) => {
+            (Some(anvil_nbt_to_json(ty)), self_type.clone())
+        }
+        // A type name resolves directly: `minecraft:*` through
+        // `vanilla_dimension_type`, a datapack key only if it is already
+        // registered.
+        Some(AnvilNbt::String(s)) => {
+            let mut lit = String::new();
+            anvil_json_string(&String::from_utf16_lossy(&s.0), &mut lit);
+            (None, lit)
+        }
+        _ => (
+            Some(ANVIL_FALLBACK_DIMENSION_TYPE_JSON.to_string()),
+            self_type.clone(),
+        ),
+    };
+    let generator = entry
+        .and_then(|e| e.get("generator"))
+        .map(anvil_nbt_to_json)
+        .unwrap_or_else(|| ANVIL_FALLBACK_GENERATOR_JSON.to_string());
+    // (dimension_type body, `type` name, generator body) — as declared, then
+    // the declared window over the fallback generator, then pure fallback.
+    let attempts: [(Option<String>, String, String); 3] = [
+        (type_body.clone(), type_json, generator),
+        (
+            Some(
+                type_body
+                    .unwrap_or_else(|| ANVIL_FALLBACK_DIMENSION_TYPE_JSON.to_string()),
+            ),
+            self_type.clone(),
+            ANVIL_FALLBACK_GENERATOR_JSON.to_string(),
+        ),
+        (
+            Some(ANVIL_FALLBACK_DIMENSION_TYPE_JSON.to_string()),
+            self_type,
+            ANVIL_FALLBACK_GENERATOR_JSON.to_string(),
+        ),
+    ];
+    for (ty_body, ty_json, gen_json) in attempts {
+        let mut files = Vec::new();
+        if let Some(body) = ty_body {
+            files.push((type_file.clone(), body));
+        }
+        files.push((
+            dim_file.clone(),
+            format!("{{\"type\":{ty_json},\"generator\":{gen_json}}}"),
+        ));
+        let sources = [worldgen::DatapackDimensionSource::Entries(files)];
+        if let Err(e) = worldgen::register_datapack_dimensions(&sources, name_to_state) {
+            eprintln!("[spine] dimension {key}: datapack registration failed: {e}");
+        }
+        if let Some(dim) = DimId::parse_dimension_id(key) {
+            return Some(dim);
+        }
+    }
+    None
+}
+
 /// One chunk's sections as generated terrain plus its overlay edits. With no
 /// generator installed (tests, `MEGU_WG=old`, custom dims) the base is air;
 /// the overlay still lands on top.
@@ -1541,6 +2231,12 @@ fn anvil_export_sections(
     overlay: &HashMap<u32, u32>,
 ) -> Vec<AnvilSection> {
     let min_y = worldgen::min_y_dim(dim);
+    let tombstones = anvil_block_tombstones()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(dim, cx, cz))
+        .cloned()
+        .unwrap_or_default();
     let mut sections = Vec::new();
     for sec in 0..worldgen::height_dim(dim) / 16 {
         let sy = min_y + sec * 16;
@@ -1562,6 +2258,7 @@ fn anvil_export_sections(
         sections.push(AnvilSection {
             y: (sy >> 4) as i8,
             blocks: cells,
+            tombstones: tombstones.get(&((sy >> 4) as i8)).cloned().unwrap_or_default(),
             biomes: anvil_export_biomes(dim, cx, sy, cz),
             block_light: None,
             sky_light: None,
@@ -1743,7 +2440,7 @@ fn export_anvil_world_with_options(
                 AnvilChunkRecord {
                     timestamp,
                     compression: 2,
-                    nbt: anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4),
+                    nbt: anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4),
                 },
             );
             report.chunks_written += 1;
@@ -1847,13 +2544,22 @@ fn anvil_dir_has_data(dir: &std::path::Path) -> bool {
     if dir.join("level.dat").is_file() {
         return true;
     }
-    ["region", "DIM-1/region", "DIM1/region"].iter().any(|rel| {
-        std::fs::read_dir(dir.join(rel)).is_ok_and(|mut entries| {
+    let has_mca = |dir: &std::path::Path| {
+        std::fs::read_dir(dir).is_ok_and(|mut entries| {
             entries.any(|e| {
                 e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "mca"))
             })
         })
-    })
+    };
+    ["region", "DIM-1/region", "DIM1/region"]
+        .iter()
+        .any(|rel| has_mca(&dir.join(rel)))
+        || {
+            let mut ignored = Vec::new();
+            anvil_custom_dim_region_dirs(dir, &mut ignored)
+                .iter()
+                .any(|(_, region_dir)| has_mca(region_dir))
+        }
 }
 
 /// `level.dat` with vanilla's own rotation: the new contents are staged as
@@ -2277,6 +2983,21 @@ fn playerdata_nbt_root(uuid: &[u8; 16], save: &PlayerSave) -> AnvilNbt {
             crate::nbt::NbtString::text("UUID"),
             AnvilNbt::IntArray(uuid_to_int_array(uuid)),
         );
+        // Everything this record carried that `PlayerSave` does not own
+        // (`neoforge:attachments`, `ForgeData`, `recipeBook`,
+        // `fabric:attachments`, `warden_spawn_tracker`,
+        // `ShoulderEntityLeft`/`Right`, `RootVehicle`, ...) merges back
+        // verbatim — never over an emitted key.
+        let preserved = anvil_playerdata_preserved()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(uuid)
+            .cloned();
+        if let Some(extras) = preserved {
+            for (key, value) in extras {
+                map.entry(key).or_insert(value);
+            }
+        }
     }
     root
 }
@@ -2295,16 +3016,27 @@ fn playerdata_to_bytes(uuid: &[u8; 16], save: &PlayerSave) -> Result<Vec<u8>, St
         .map_err(|e| format!("cannot gzip playerdata: {e}"))
 }
 
-/// One `.dat`'s decoded record plus the `UUID` int array it stamped, for the
-/// file-name cross-check the loader does.
-fn playerdata_from_bytes(bytes: &[u8]) -> Result<(Option<[u8; 16]>, PlayerSave), String> {
+/// One `.dat`'s decoded record: the `UUID` int array it stamped (for the
+/// file-name cross-check the loader does), the `PlayerSave`, and every
+/// root-compound entry the schema does not own — the mod attachments and
+/// vanilla metadata `playerdata_nbt_root` merges back on write.
+type AnvilPlayerdataRecord = (
+    Option<[u8; 16]>,
+    PlayerSave,
+    std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+);
+
+/// Decode one gzipped `playerdata/*.dat` record into its
+/// `AnvilPlayerdataRecord` triple.
+fn playerdata_from_bytes(bytes: &[u8]) -> Result<AnvilPlayerdataRecord, String> {
     let (_, root) = crate::nbt::read_gzip(bytes, ANVIL_LEVEL_NBT_BUDGET)
         .map_err(|e| format!("invalid playerdata NBT: {e}"))?;
     let recorded = match root.get("UUID") {
         Some(AnvilNbt::IntArray(values)) => uuid_from_int_array(values),
         _ => None,
     };
-    Ok((recorded, playerdata_from_nbt(&root)?))
+    let extras = anvil_preserved_root_fields(&root, ANVIL_PLAYER_EMITTED_KEYS);
+    Ok((recorded, playerdata_from_nbt(&root)?, extras))
 }
 
 /// Write one player's `.dat`: staged temp + fsync + atomic rename, the same
@@ -2405,9 +3137,20 @@ fn load_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String>
         };
         let bytes = std::fs::read(entry.path())
             .map_err(|e| format!("cannot read {}: {e}", entry.path().display()))?;
-        let (recorded, save) = playerdata_from_bytes(&bytes).map_err(|e| format!("{name}: {e}"))?;
+        let (recorded, save, extras) =
+            playerdata_from_bytes(&bytes).map_err(|e| format!("{name}: {e}"))?;
         if recorded.is_some_and(|recorded| recorded != uuid) {
             eprintln!("[spine] {name}: NBT UUID does not match file name; keeping the file name");
+        }
+        {
+            let mut preserved = anvil_playerdata_preserved()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if extras.is_empty() {
+                preserved.remove(&uuid);
+            } else {
+                preserved.insert(uuid, extras);
+            }
         }
         saved_players()
             .lock()
@@ -2529,7 +3272,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
                 unknown_states: 0,
                 dropped_sections: 0,
             };
-            let fresh_nbt = anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4);
+            let fresh_nbt = anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4);
             let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
             // Dirty-but-identical: the payload on disk already holds exactly
             // this content, so re-encoding and rewriting it would be pure
@@ -2937,7 +3680,7 @@ fn flush_single_chunk_to_anvil_dir_outcome(
         unknown_states: 0,
         dropped_sections: 0,
     };
-    let fresh_nbt = anvil_chunk_to_nbt(&chunk, dim.min_y() >> 4);
+    let fresh_nbt = anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4);
     let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
     let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
     let mut outcome = AnvilChunkFlushOutcome {
@@ -3136,6 +3879,7 @@ fn reload_single_chunk_from_anvil_dir(
         return Ok(false);
     };
     let chunk = anvil_chunk_from_nbt(&record.nbt, (cx, cz))?;
+    anvil_remember_chunk(dim, &chunk, &record.nbt);
     let edits = anvil_chunk_edits(&chunk, dim);
     let mut w = world().write(&(dim, cx, cz));
     if edits.is_empty() {
@@ -5076,5 +5820,621 @@ mod anvil_dim_tests {
             anvil_custom_dim_region_dir("mymod:deep/sky_realm").as_deref(),
             Some("dimensions/mymod/deep/sky_realm/region")
         );
+    }
+}
+
+#[cfg(test)]
+mod anvil_lossless_tests {
+    use super::*;
+
+    /// The dimension registry is process-global; serialize the
+    /// register/import/reset sequence the way `anvil_dim_tests` does.
+    static ANVIL_LOSSLESS_DIM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "megu-anvil-lossless-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Snapshot every process-global these paths touch, cleared on entry and
+    /// restored on drop — the same discipline `AnvilWorldFixture` gives the
+    /// gated suite, minus its vanilla-data requirement.
+    struct LosslessFixture {
+        world: HashMap<DimChunkKey, HashMap<u32, u32>>,
+        block_entities: HashMap<DimBlockPos, AnvilNbt>,
+        chunk_preserved:
+            HashMap<DimChunkKey, std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>,
+        tombstones: HashMap<DimChunkKey, HashMap<i8, HashMap<u16, AnvilNbt>>>,
+        player_preserved:
+            HashMap<[u8; 16], std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>>,
+        saved: HashMap<[u8; 16], PlayerSave>,
+        persisted: HashMap<AnvilPersistedKey, u64>,
+        playerdata_hashes: HashMap<(std::path::PathBuf, [u8; 16]), u64>,
+        _world: std::sync::MutexGuard<'static, ()>,
+        _gen: std::sync::MutexGuard<'static, ()>,
+        _dim: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LosslessFixture {
+        fn new() -> Self {
+            let _world = crate::world_guard();
+            let _gen = worldgen::lock_gen_for_tests();
+            let _dim = ANVIL_LOSSLESS_DIM_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            worldgen::reset_dimension_registry();
+            let fixture = LosslessFixture {
+                world: world().snapshot(),
+                block_entities: anvil_block_entities()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                chunk_preserved: anvil_chunk_preserved()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                tombstones: anvil_block_tombstones()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                player_preserved: anvil_playerdata_preserved()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                saved: saved_players()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                persisted: anvil_persisted_hashes()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                playerdata_hashes: anvil_playerdata_hashes()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                _world,
+                _gen,
+                _dim,
+            };
+            world().clear();
+            anvil_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            anvil_chunk_preserved()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            anvil_block_tombstones()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            anvil_playerdata_preserved()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            saved_players()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            anvil_persisted_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            anvil_playerdata_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            fixture
+        }
+    }
+
+    impl std::ops::Drop for LosslessFixture {
+        fn drop(&mut self) {
+            world().restore_all(std::mem::take(&mut self.world));
+            *anvil_block_entities()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.block_entities);
+            *anvil_chunk_preserved()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.chunk_preserved);
+            *anvil_block_tombstones()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.tombstones);
+            *anvil_playerdata_preserved()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.player_preserved);
+            *saved_players()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.saved);
+            *anvil_persisted_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.persisted);
+            *anvil_playerdata_hashes()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) =
+                std::mem::take(&mut self.playerdata_hashes);
+            worldgen::reset_dimension_registry();
+        }
+    }
+
+    /// A single-section chunk record: every cell of section `sec_y` is
+    /// `palette[0]` (no `data`), the way an all-one-block section stores.
+    fn one_palette_chunk_nbt(cx: i32, cz: i32, sec_y: i8, palette: Vec<AnvilNbt>) -> AnvilNbt {
+        anvil_obj(&[
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            ("xPos", AnvilNbt::Int(cx)),
+            ("zPos", AnvilNbt::Int(cz)),
+            ("yPos", AnvilNbt::Int(-4)),
+            ("Status", anvil_s("minecraft:full")),
+            (
+                "sections",
+                anvil_list(vec![anvil_obj(&[
+                    ("Y", AnvilNbt::Byte(sec_y)),
+                    (
+                        "block_states",
+                        anvil_obj(&[("palette", anvil_list(palette))]),
+                    ),
+                ])]),
+            ),
+            ("block_entities", anvil_list(Vec::new())),
+        ])
+    }
+
+    fn write_one_chunk_region(dir: &std::path::Path, nbt: AnvilNbt) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut region = AnvilRegion::default();
+        region.chunks.insert(
+            (0, 0),
+            AnvilChunkRecord {
+                timestamp: 1,
+                compression: 2,
+                nbt,
+            },
+        );
+        write_region_file(&dir.join("r.0.0.mca"), &region).unwrap();
+    }
+
+    /// The palette compound `cell` indexes into inside one section NBT's
+    /// `block_states`.
+    fn cell_palette_entry(section: &AnvilNbt, cell: usize) -> AnvilNbt {
+        let bs = section.get("block_states").unwrap();
+        let palette = bs.get("palette").and_then(AnvilNbt::list).unwrap();
+        let idx = match bs.get("data") {
+            Some(AnvilNbt::LongArray(data)) => {
+                let bits = anvil_bits_for(palette.len(), 4);
+                anvil_unpack_longs(data, bits, 4096).unwrap()[cell] as usize
+            }
+            _ => 0,
+        };
+        palette[idx].clone()
+    }
+
+    /// Every unknown root entry a modded chunk carries survives an
+    /// import -> edit -> save cycle, and the codec's own keys are emitted
+    /// exactly once, with the codec's values.
+    #[test]
+    fn chunk_roundtrip_preserves_unknown_root_nbt_and_block_entities() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("chunk-extras");
+        let mod_be = anvil_obj(&[
+            ("id", anvil_s("mekanism:metallurgic_infuser")),
+            ("x", AnvilNbt::Int(3)),
+            ("y", AnvilNbt::Int(65)),
+            ("z", AnvilNbt::Int(4)),
+            ("stored_energy", AnvilNbt::Long(987654)),
+        ]);
+        let extras: Vec<(&str, AnvilNbt)> = vec![
+            (
+                "Heightmaps",
+                anvil_obj(&[(
+                    "MOTION_BLOCKING",
+                    AnvilNbt::LongArray(vec![0x80402010; 37]),
+                )]),
+            ),
+            (
+                "structures",
+                anvil_obj(&[
+                    ("References", anvil_obj(&[])),
+                    ("starts", anvil_obj(&[])),
+                ]),
+            ),
+            (
+                "neoforge:attachments",
+                anvil_obj(&[("mekanism:heat", AnvilNbt::Double(1.5f64.to_bits()))]),
+            ),
+            ("ForgeData", anvil_obj(&[("flag", AnvilNbt::Byte(1))])),
+            ("ForgeCaps", anvil_obj(&[("parent", anvil_s("forge:energy"))])),
+            ("fabric:attachments", anvil_list(vec![anvil_s("fabric:x")])),
+            ("cardinal_components", anvil_obj(&[("c", AnvilNbt::Int(3))])),
+            ("InhabitedTime", AnvilNbt::Long(4321)),
+            ("LastUpdate", AnvilNbt::Long(9999)),
+            ("blending_data", anvil_obj(&[("status", AnvilNbt::Byte(2))])),
+            (
+                "below_zero_retrogen",
+                anvil_obj(&[("target_status", anvil_s("minecraft:full"))]),
+            ),
+            (
+                "entities",
+                anvil_list(vec![anvil_obj(&[("id", anvil_s("minecraft:zombie"))])]),
+            ),
+            (
+                "block_ticks",
+                anvil_list(vec![anvil_obj(&[("i", anvil_s("minecraft:water"))])]),
+            ),
+            ("fluid_ticks", anvil_list(Vec::new())),
+            (
+                "CarvingMasks",
+                anvil_obj(&[("air", AnvilNbt::ByteArray(vec![1, 2, 3]))]),
+            ),
+        ];
+        let mut root_fields: Vec<(&str, AnvilNbt)> = vec![
+            ("DataVersion", AnvilNbt::Int(ANVIL_DATA_VERSION)),
+            ("xPos", AnvilNbt::Int(0)),
+            ("zPos", AnvilNbt::Int(0)),
+            ("yPos", AnvilNbt::Int(-4)),
+            ("Status", anvil_s("minecraft:full")),
+            (
+                "sections",
+                anvil_list(vec![anvil_obj(&[
+                    ("Y", AnvilNbt::Byte(0)),
+                    (
+                        "block_states",
+                        anvil_obj(&[(
+                            "palette",
+                            anvil_list(vec![anvil_obj(&[(
+                                "Name",
+                                anvil_s("minecraft:stone"),
+                            )])]),
+                        )]),
+                    ),
+                ])]),
+            ),
+            ("block_entities", anvil_list(vec![mod_be.clone()])),
+        ];
+        root_fields.extend(extras.iter().cloned());
+        write_one_chunk_region(&dir.join("region"), anvil_obj(&root_fields));
+
+        let report = import_anvil_world(&dir).unwrap();
+        assert_eq!(report.chunks.len(), 1);
+        apply_anvil_import(&report);
+        // One real edit makes the chunk dirty so it re-encodes; a different
+        // state than anything the source palette carried keeps the write
+        // forced in every registry environment.
+        let dirt = name_to_state("minecraft:dirt").unwrap();
+        world()
+            .write(&(DimId::Overworld, 0, 0))
+            .entry((DimId::Overworld, 0, 0))
+            .or_default()
+            .insert(local_idx(1, 5, 2), dirt);
+
+        let summary = live_anvil_save_dir(&dir).unwrap();
+        assert!(summary.chunks_written >= 1);
+
+        let saved = read_region_file(&dir.join("region/r.0.0.mca")).unwrap();
+        let nbt = &saved.chunks[&(0, 0)].nbt;
+        for (key, value) in &extras {
+            assert_eq!(
+                nbt.get(key),
+                Some(value),
+                "preserved root entry {key} round-trips"
+            );
+        }
+        // Emitted keys carry the codec's own values, not a stale duplicate.
+        assert_eq!(anvil_i32(nbt, "xPos"), Some(0));
+        assert_eq!(anvil_i32(nbt, "DataVersion"), Some(ANVIL_DATA_VERSION));
+        assert_eq!(anvil_str(nbt, "Status").as_deref(), Some("minecraft:full"));
+        // The mod block entity comes back out verbatim.
+        let entities = nbt
+            .get("block_entities")
+            .and_then(AnvilNbt::list)
+            .unwrap();
+        assert!(
+            entities.contains(&mod_be),
+            "modded block entity survives: {entities:?}"
+        );
+
+        // A second save finds the merged payload already on disk and skips.
+        let again = live_anvil_save_dir(&dir).unwrap();
+        assert!(again.skipped_unchanged_writes >= 1);
+    }
+
+    /// `playerdata/<uuid>.dat` round-trips every root field the `PlayerSave`
+    /// schema does not own — mod attachments and vanilla metadata alike.
+    #[test]
+    fn playerdata_roundtrip_preserves_unknown_root_nbt() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("player-extras");
+        let uuid = [0x42u8; 16];
+        let save = PlayerSave {
+            position: (DimId::Overworld, 1.5, 65.0, -2.5, 45.0, -5.0),
+            inventory: HashMap::new(),
+            ender_chest: HashMap::new(),
+            held: 4,
+            health: 18.0,
+            absorption: 2.0,
+            food: 17,
+            saturation: 3.5,
+            exhaustion: 0.75,
+            xp_level: 9,
+            xp_progress: 0.25,
+            xp_total: 120,
+            gamemode: 1,
+            effects: vec![],
+            respawn: None,
+        };
+        let extras: Vec<(&str, AnvilNbt)> = vec![
+            (
+                "neoforge:attachments",
+                anvil_obj(&[("mekanism:skills", AnvilNbt::Int(7))]),
+            ),
+            ("ForgeData", anvil_obj(&[("seen", AnvilNbt::Byte(1))])),
+            ("ForgeCaps", anvil_obj(&[("mana", AnvilNbt::Int(50))])),
+            (
+                "recipeBook",
+                anvil_obj(&[("isFilteringCraftable", AnvilNbt::Byte(1))]),
+            ),
+            (
+                "warden_spawn_tracker",
+                anvil_obj(&[("warning_level", AnvilNbt::Int(2))]),
+            ),
+            ("fabric:attachments", anvil_list(vec![anvil_s("fabric:y")])),
+            (
+                "cardinal_components",
+                anvil_obj(&[("c", AnvilNbt::Int(9))]),
+            ),
+            (
+                "ShoulderEntityLeft",
+                anvil_obj(&[("id", anvil_s("minecraft:parrot"))]),
+            ),
+            (
+                "ShoulderEntityRight",
+                anvil_obj(&[("id", anvil_s("minecraft:parrot"))]),
+            ),
+            ("RootVehicle", anvil_obj(&[("attach", AnvilNbt::Int(1))])),
+        ];
+        let mut root = playerdata_nbt_root(&uuid, &save);
+        if let AnvilNbt::Compound(map) = &mut root {
+            for (key, value) in &extras {
+                map.insert(crate::nbt::NbtString::text(key), value.clone());
+            }
+        }
+        let nbt = crate::nbt::write_named(&crate::nbt::NbtString(Vec::new()), &root).unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        use std::io::Write as _;
+        encoder.write_all(&nbt).unwrap();
+        let bytes = encoder.finish().unwrap();
+        let player_dir = dir.join("playerdata");
+        std::fs::create_dir_all(&player_dir).unwrap();
+        std::fs::write(player_dir.join(playerdata_file_name(&uuid)), bytes).unwrap();
+
+        assert_eq!(load_all_playerdata_dat(&dir).unwrap(), 1);
+        let (written, skipped) = write_all_playerdata_dat(&dir).unwrap();
+        assert_eq!((written, skipped), (1, 0));
+
+        let back = std::fs::read(player_dir.join(playerdata_file_name(&uuid))).unwrap();
+        let (_, root) = crate::nbt::read_gzip(&back, ANVIL_LEVEL_NBT_BUDGET).unwrap();
+        for (key, value) in &extras {
+            assert_eq!(
+                root.get(key),
+                Some(value),
+                "preserved playerdata entry {key} round-trips"
+            );
+        }
+        assert_eq!(
+            root.get("UUID"),
+            Some(&AnvilNbt::IntArray(uuid_to_int_array(&uuid)))
+        );
+        // The `PlayerSave` fields still decode to the same record.
+        let (_, parsed, _) = playerdata_from_bytes(&back).unwrap();
+        assert_eq!(parsed.health, 18.0);
+        assert_eq!(parsed.xp_level, 9);
+    }
+
+    /// An unresolvable palette entry is never rewritten as air: every cell a
+    /// mod block filled restores its `{Name, Properties}` verbatim, while a
+    /// cell gameplay genuinely edited keeps the edit.
+    #[test]
+    fn mod_block_palette_entry_survives_chunk_roundtrip() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("mod-block");
+        let mod_entry = anvil_obj(&[
+            ("Name", anvil_s("othermod:quantum_quarry")),
+            (
+                "Properties",
+                anvil_obj(&[
+                    ("facing", anvil_s("north")),
+                    ("active", anvil_s("true")),
+                ]),
+            ),
+        ]);
+        write_one_chunk_region(
+            &dir.join("region"),
+            one_palette_chunk_nbt(0, 0, 0, vec![mod_entry.clone()]),
+        );
+
+        let report = import_anvil_world(&dir).unwrap();
+        assert_eq!(report.chunks.len(), 1);
+        assert_eq!(report.chunks[0].unknown_states, 1);
+        apply_anvil_import(&report);
+        // The decode mapped the mod block to air everywhere.
+        let edits = world()
+            .get_cloned(&(DimId::Overworld, 0, 0))
+            .expect("chunk imported");
+        assert!(edits.values().all(|&st| st == 0));
+
+        // A genuine gameplay edit in the same section: dirt at (1, 5, 2).
+        let dirt = name_to_state("minecraft:dirt").unwrap();
+        world()
+            .write(&(DimId::Overworld, 0, 0))
+            .entry((DimId::Overworld, 0, 0))
+            .or_default()
+            .insert(local_idx(1, 5, 2), dirt);
+        let summary = live_anvil_save_dir(&dir).unwrap();
+        assert!(summary.chunks_written >= 1);
+
+        let saved = read_region_file(&dir.join("region/r.0.0.mca")).unwrap();
+        let nbt = &saved.chunks[&(0, 0)].nbt;
+        let sections = nbt.get("sections").and_then(AnvilNbt::list).unwrap();
+        let section = sections
+            .iter()
+            .find(|s| anvil_i8(s, "Y") == Some(0))
+            .unwrap();
+        // Untouched cell: the original palette entry, Properties included.
+        assert_eq!(cell_palette_entry(section, 0), mod_entry);
+        // The edited cell carries the edit, not the tombstone. ly=5, lz=2,
+        // lx=1 -> (5<<8)|(2<<4)|1.
+        assert_eq!(
+            cell_palette_entry(section, (5 << 8) | (2 << 4) | 1),
+            anvil_state_entry(dirt)
+        );
+        // And the palette holds a real block somewhere the tombstone does
+        // not explain: only one untouched cell is enough to prove it.
+        let palette = section
+            .get("block_states")
+            .and_then(|bs| bs.get("palette"))
+            .and_then(AnvilNbt::list)
+            .unwrap();
+        assert!(palette.contains(&mod_entry));
+    }
+
+    /// `dimensions/<ns>/<path>/region` imports under a registered `DimId`,
+    /// keeps the level.dat window, and exports back to the same layout —
+    /// while symlinked and invalid directory names never import.
+    #[test]
+    fn custom_dimension_import_and_export_roundtrip() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("custom-dim");
+        let level = AnvilLevelDat {
+            data: anvil_obj(&[(
+                "WorldGenSettings",
+                anvil_obj(&[(
+                    "dimensions",
+                    anvil_obj(&[(
+                        "mymod:sky_realm",
+                        anvil_obj(&[
+                            (
+                                "type",
+                                anvil_obj(&[
+                                    ("min_y", AnvilNbt::Int(0)),
+                                    ("height", AnvilNbt::Int(128)),
+                                ]),
+                            ),
+                            ("generator", anvil_obj(&[("type", anvil_s("minecraft:debug"))])),
+                        ]),
+                    )]),
+                )]),
+            )]),
+        };
+        write_level_dat_path(&dir.join("level.dat"), &level).unwrap();
+        write_one_chunk_region(
+            &dir.join("dimensions/mymod/sky_realm/region"),
+            one_palette_chunk_nbt(
+                0,
+                0,
+                0,
+                vec![anvil_obj(&[("Name", anvil_s("minecraft:stone"))])],
+            ),
+        );
+        // Decoys that must never import: a symlinked namespace pointing
+        // outside the world, an invalid segment, and a bare
+        // `dimensions/<ns>/region` with no dimension path.
+        let outside = tmp_dir("custom-dim-outside");
+        write_one_chunk_region(
+            &outside.join("region"),
+            one_palette_chunk_nbt(
+                5,
+                5,
+                0,
+                vec![anvil_obj(&[("Name", anvil_s("minecraft:dirt"))])],
+            ),
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, dir.join("dimensions/evil")).unwrap();
+        write_one_chunk_region(
+            &dir.join("dimensions/BadNS/deep/region"),
+            one_palette_chunk_nbt(
+                7,
+                7,
+                0,
+                vec![anvil_obj(&[("Name", anvil_s("minecraft:dirt"))])],
+            ),
+        );
+        write_one_chunk_region(
+            &dir.join("dimensions/mymod/region"),
+            one_palette_chunk_nbt(
+                9,
+                9,
+                0,
+                vec![anvil_obj(&[("Name", anvil_s("minecraft:dirt"))])],
+            ),
+        );
+
+        let report = import_anvil_world(&dir).unwrap();
+        let dim =
+            DimId::parse_dimension_id("mymod:sky_realm").expect("dimension registered");
+        // The level.dat `type` supplied the real window, not the fallback's.
+        assert_eq!(dim.min_y(), 0);
+        assert_eq!(dim.height(), 128);
+        let imported: Vec<_> = report
+            .chunks
+            .iter()
+            .filter(|c| c.dim == dim)
+            .collect();
+        assert_eq!(imported.len(), 1);
+        assert_eq!((imported[0].cx, imported[0].cz), (0, 0));
+        // None of the decoys imported a chunk.
+        assert!(!report.chunks.iter().any(|c| (c.cx, c.cz) == (5, 5)));
+        assert!(!report.chunks.iter().any(|c| (c.cx, c.cz) == (7, 7)));
+        assert!(!report.chunks.iter().any(|c| (c.cx, c.cz) == (9, 9)));
+
+        apply_anvil_import(&report);
+        let out = tmp_dir("custom-dim-out");
+        export_anvil_world(&out).unwrap();
+        assert!(
+            out.join("dimensions/mymod/sky_realm/region/r.0.0.mca")
+                .is_file(),
+            "custom dimension exports back to the same vanilla layout"
+        );
+        // The exported level.dat keeps the dimension entry so a re-import
+        // recovers the real window rather than the fallback's.
+        let exported = read_level_dat_path(&out.join("level.dat")).unwrap();
+        let entry = exported
+            .data()
+            .get("WorldGenSettings")
+            .and_then(|w| w.get("dimensions"))
+            .and_then(|dims| dims.get("mymod:sky_realm"))
+            .expect("exported level.dat keeps the custom dimension");
+        let ty = entry.get("type").unwrap();
+        assert_eq!(anvil_i32(ty, "min_y"), Some(0));
+        assert_eq!(anvil_i32(ty, "height"), Some(128));
+    }
+
+    /// `dimensions/<ns>/<path>/region` alone counts as world data for the
+    /// live loader's shape check.
+    #[test]
+    fn anvil_dir_has_data_sees_custom_dimension_regions() {
+        let _f = LosslessFixture::new();
+        let dir = tmp_dir("has-data");
+        assert!(!anvil_dir_has_data(&dir));
+        write_one_chunk_region(
+            &dir.join("dimensions/mymod/sky_realm/region"),
+            one_palette_chunk_nbt(
+                0,
+                0,
+                0,
+                vec![anvil_obj(&[("Name", anvil_s("minecraft:stone"))])],
+            ),
+        );
+        assert!(anvil_dir_has_data(&dir));
     }
 }
