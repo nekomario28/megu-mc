@@ -1380,6 +1380,16 @@ pub struct HudState {
     pub title_overlay: TitleOverlayState,
     /// Jade/WAILA-style looking-at-block overlay (`hud.jade_looking_at`).
     pub looking_at: crate::magic_hud::LookingAtBlockState,
+    /// Chat/command input bar mirror: the host fills `open`, `text`,
+    /// `cursor` and the completion popup rows each frame while the chat
+    /// bar is up; `layout::hud` draws the input box + suggestion popup
+    /// bottom-left, vanilla style.
+    pub chat_input: crate::hud_widgets::ChatInputOverlay,
+    /// Item cooldown wipe per item name (the same registry id
+    /// `hotbar` entries carry): `0.0..=1.0` fraction of the cooldown
+    /// remaining. `layout::hud` darkens the top fraction of matching
+    /// hotbar slots exactly like vanilla's descending curtain.
+    pub item_cooldowns: std::collections::BTreeMap<String, f32>,
 }
 
 /// Compact in-HUD recipe-conflict resolver state.
@@ -1618,6 +1628,8 @@ impl Default for HudState {
             scoreboard: ScoreboardState::default(),
             title_overlay: TitleOverlayState::default(),
             looking_at: crate::magic_hud::LookingAtBlockState::default(),
+            chat_input: crate::hud_widgets::ChatInputOverlay::default(),
+            item_cooldowns: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1660,6 +1672,8 @@ impl HudState {
             scoreboard: ScoreboardState::default(),
             title_overlay: TitleOverlayState::default(),
             looking_at: crate::magic_hud::LookingAtBlockState::default(),
+            chat_input: crate::hud_widgets::ChatInputOverlay::default(),
+            item_cooldowns: std::collections::BTreeMap::new(),
         }
     }
 }

@@ -13,6 +13,10 @@ use megu_client::integrated;
 use megu_client::protocol::{encode_slot_stack, NbtValue, WireReader};
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
+use megu_client::settings::{
+    ClientSettings, CrashReportMode as ClientCrashReportMode, DistantHorizon,
+    HostMinimapMode, HostPlayerRadarScope, QualityPreset,
+};
 use megu_client::spatial_audio::SpatialAudioPreset;
 use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
@@ -49,8 +53,10 @@ use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::state::{invite_code_display, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
-    DisconnectedScreenState, MultiplayerScreenState, MultiplayerServerEntry, Screen, SettingsTab,
-    UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
+    CrashReportMode as UiCrashReportMode, DisconnectedScreenState, GpuBackend, LodMode,
+    MinimapMode, MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen,
+    SettingsTab, UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset,
+    VisualStylePreset,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -60,7 +66,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::live_session::{
-    CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths, SessionStatus,
+    jar_version_ids, CrosshairPick, LiveSession, PlayerMovement, PlayerPose, SessionPaths,
+    SessionStatus,
 };
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
@@ -557,6 +564,30 @@ pub struct GpuApp {
     chat_bar: Option<ZshCommandBar>,
     /// Latest `complete_suggestions` hit for the open chat bar's `/`-input.
     chat_suggestions: Vec<String>,
+    /// `command_suggestion` transaction id the last Tab press sent —
+    /// replies carrying any other id are stale and ignored.
+    pending_suggestion_tx: Option<i32>,
+    /// Revision counters already folded into `chat_bar` from the live
+    /// session's suggestion/completion mirrors.
+    seen_suggestions_rev: u64,
+    seen_completions_rev: u64,
+    /// Fractional-tick accumulator driving `LiveSession::tick_item_cooldowns`
+    /// at 20 Hz from the frame clock.
+    cooldown_tick_accum: f32,
+    /// Physical Shift state while the chat bar owns the keyboard —
+    /// Shift+Tab cycles completions backwards (kept off `keys.down`
+    /// so sneak edge tracking stays untouched by chat input).
+    chat_shift_held: bool,
+    /// Settings as last loaded/saved through `client-app`
+    /// (`megu-client.toml` under `--gameDir`, `.` when unset) — the base
+    /// `ui_to_client_settings` overlays the UI's mapped keys onto so
+    /// file-only fields (shader pack, report endpoint) survive a save.
+    persisted_settings: megu_client::settings::ClientSettings,
+    /// Where [`persisted_settings`](Self::persisted_settings) writes.
+    settings_path: std::path::PathBuf,
+    /// Debounced atomic writer for `persisted_settings` — dirty-only,
+    /// byte-compare, temp-file + rename (`SettingsSaveGuard`).
+    settings_save_guard: megu_client::settings::SettingsSaveGuard,
     /// QoL container sorter armed by the `SortInventory` keybind.
     inventory_sort: InventorySortState,
     /// Launcher filesystem paths handed to every `LiveSession` this app
@@ -732,7 +763,25 @@ impl GpuApp {
         let splash_seed = splash_seed_for(&config);
         let mut ui = UiState::new();
         apply_megu_default_links(&mut ui);
-        ui.settings.video.vsync = render_config.vsync;
+        // Persisted `megu-client.toml` (launcher-root `<gameDir>/`, `.`
+        // fallback): CLI flags seed the base, the file overlays whatever
+        // keys it defines, and every UI-visible field mirrors the result
+        // so `apply_settings` below activates it in one shot.
+        let settings_path = config
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(megu_client::settings::SETTINGS_FILE_NAME);
+        let mut persisted_settings = megu_client::settings::ClientSettings {
+            vsync: render_config.vsync,
+            ..megu_client::settings::ClientSettings::default()
+        };
+        if let Ok(text) = std::fs::read_to_string(&settings_path) {
+            for warning in persisted_settings.apply_toml(&text) {
+                startup_status.push(format!("{}: {warning}", settings_path.display()));
+            }
+        }
+        apply_client_settings_to_ui(&persisted_settings, &mut ui.settings);
         // Straight into gameplay when a world/server is already targeted;
         // the title screen otherwise — like a vanilla launch with no
         // quick-play argument.
@@ -766,6 +815,14 @@ impl GpuApp {
             advancements_open: false,
             chat_bar: None,
             chat_suggestions: Vec::new(),
+            pending_suggestion_tx: None,
+            seen_suggestions_rev: 0,
+            seen_completions_rev: 0,
+            cooldown_tick_accum: 0.0,
+            chat_shift_held: false,
+            settings_save_guard: megu_client::settings::SettingsSaveGuard::new(),
+            persisted_settings,
+            settings_path,
             inventory_sort: InventorySortState::default(),
             session_paths,
             recipe_ingest: crate::recipe_ingest::IngestReport::default(),
@@ -819,10 +876,31 @@ impl GpuApp {
         // the edition strip patched to `MEGU` — and mod JARs contribute
         // their own splash pools. Zero temp files, graceful fallback.
         let (jar, mod_jars) = title_branding_sources(&app.session_paths);
+        let vanilla_jar_missing = jar.is_none();
         app.title_branding = match jar {
             Some(jar) => crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars),
             None => TitleBrandingAssets::fallback(),
         };
+        // First-run asset guidance: no local vanilla JAR under the
+        // launcher paths means procedural textures + silent sounds — say
+        // so plainly on stderr AND the title/status banner, pointing at
+        // `megu-installer` instead of degrading cryptically.
+        if vanilla_jar_missing {
+            let version = jar_version_ids(&app.session_paths)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "1.21.1".to_string());
+            app.status_line(format!(
+                "Vanilla {version} client assets not found — run `megu-installer` (or pass \
+                 --gameDir pointing at a Minecraft install) to download them; using \
+                 procedural fallback textures and silent sounds for now"
+            ));
+        }
+        // Activate the loaded settings in one pass (video -> render
+        // config, camera values -> controller/FOV, volumes -> live audio
+        // mixer when a session already attached at boot).
+        let boot_settings = app.ui.settings.clone();
+        app.apply_settings(&boot_settings);
         app.refresh_singleplayer_worlds();
         app
     }
@@ -920,15 +998,15 @@ impl GpuApp {
     /// revision, so the log lives in `live.hud` where the sync carries it.
     fn on_live_attached(&mut self) {
         self.live_strategy_pending = true;
+        let audio_settings = self.ui.settings.audio.clone();
         let Some(live) = &mut self.live else {
             return;
         };
-        live.hud
-            .chat_lines
-            .extend(self.debug_messages.iter().cloned());
-        if live.hud.chat_lines.len() > 100 {
-            let excess = live.hud.chat_lines.len() - 100;
-            live.hud.chat_lines.drain(..excess);
+        // The session spawns its own mixer — seed the persisted volume
+        // sliders before the first packet can start a voice.
+        live.set_audio_volumes(&audio_settings);
+        for message in self.debug_messages.iter().cloned() {
+            live.push_chat_line(message);
         }
         live.hud_revision += 1;
     }
@@ -1115,6 +1193,18 @@ impl GpuApp {
             UiAction::SettingsChanged => {
                 let settings = self.ui.settings.clone();
                 self.apply_settings(&settings);
+                // Atomic persistence: overlay the mapped keys onto the
+                // last loaded file state (file-only keys survive), then
+                // the save guard writes only on real byte changes.
+                self.persisted_settings =
+                    ui_to_client_settings(&settings, &self.persisted_settings);
+                self.settings_save_guard.mark_dirty();
+                if let Err(err) = self
+                    .settings_save_guard
+                    .flush_if_dirty(&self.persisted_settings, &self.settings_path)
+                {
+                    self.status_line(format!("Settings save: {err}"));
+                }
             }
             UiAction::StartSingleplayer => {
                 if let Err(err) = self.start_singleplayer() {
@@ -1346,12 +1436,18 @@ impl GpuApp {
     }
 
     /// Apply settings immediately, including the active swapchain and GPU.
-    /// `UiSettings` currently offers video/visual presets and a zoom toggle;
-    /// camera numerical values are accepted through `apply_camera_settings`.
+    /// Video/visual presets ride the render config; camera values (FOV,
+    /// sensitivity, zoom divisor) and the audio volume sliders apply here
+    /// too, so every `SettingsChanged` action is fully live.
     pub fn apply_settings(&mut self, settings: &UiSettings) {
         let video = &settings.video;
         self.camera_controller
             .set_smooth_zoom(settings.qol.smooth_zoom);
+        self.apply_camera_settings(
+            settings.fov_f32(),
+            settings.mouse_sensitivity_f32(),
+            settings.zoom_divisor_f32(),
+        );
         let vsync_changed = self.render_config.vsync != video.vsync;
         let fps_cap = (video.fps_cap > 0).then_some(video.fps_cap);
         if self.render_config.max_fps != fps_cap {
@@ -1416,6 +1512,10 @@ impl GpuApp {
                 SpatialAudioPreset::Off
             };
             live.set_spatial_audio_preset(preset);
+            // After the preset (it replaces the mixer wholesale): master
+            // + per-category gains and the limiter ceiling apply live on
+            // both the sync mixer and the dedicated mix thread.
+            live.set_audio_volumes(&settings.audio);
             // Render-distance changes while connected re-announce
             // `client_information` so the server re-centers the chunk
             // view (no-op unless the value actually moved).
@@ -1497,12 +1597,7 @@ impl GpuApp {
             self.ui.hud.chat_lines.drain(..excess);
         }
         if let Some(live) = &mut self.live {
-            live.hud.chat_lines.push(message);
-            if live.hud.chat_lines.len() > 100 {
-                let excess = live.hud.chat_lines.len() - 100;
-                live.hud.chat_lines.drain(..excess);
-            }
-            live.hud_revision += 1;
+            live.push_chat_line(message);
         }
     }
 
@@ -2361,6 +2456,15 @@ impl GpuApp {
     /// editing keys, Tab cycles badge completions, Enter sends through
     /// `send_chat`, Escape closes and re-grabs the pointer.
     fn chat_bar_key(&mut self, event: &winit::event::KeyEvent) {
+        // Shift presses/releases must track even through the early
+        // release-return so Shift+Tab cycles completions backwards.
+        if matches!(
+            event.physical_key,
+            PhysicalKey::Code(KeyCode::ShiftLeft | KeyCode::ShiftRight)
+        ) {
+            self.chat_shift_held = event.state == ElementState::Pressed;
+            return;
+        }
         if event.state != ElementState::Pressed {
             return;
         }
@@ -2393,7 +2497,19 @@ impl GpuApp {
             }
             PhysicalKey::Code(KeyCode::Tab) => {
                 if let Some(bar) = &mut self.chat_bar {
-                    bar.cycle_completion(true);
+                    // Slash-commands ask the server first
+                    // (`command_suggestion` C2S) — the reply lands as
+                    // `command_suggestions` and replaces the menu when
+                    // its transaction id matches the pending request.
+                    // Local completion still answers immediately so Tab
+                    // never stalls on latency.
+                    if bar.text().starts_with('/') {
+                        if let Some(live) = &mut self.live {
+                            self.pending_suggestion_tx =
+                                live.request_command_suggestion(bar.text());
+                        }
+                    }
+                    bar.cycle_completion(!self.chat_shift_held);
                 }
             }
             PhysicalKey::Code(KeyCode::ArrowLeft) => {
@@ -2420,7 +2536,50 @@ impl GpuApp {
         if close {
             self.chat_bar = None;
             self.chat_suggestions.clear();
+            self.pending_suggestion_tx = None;
             self.maybe_regrab();
+        }
+        sync_chat_input_hud(&mut self.ui.hud.chat_input, self.chat_bar.as_ref());
+    }
+
+    /// Fold the live session's server-driven completion channels into
+    /// the open chat bar: a `command_suggestions` reply whose
+    /// `transaction_id` matches the pending request replaces the bar's
+    /// menu verbatim; `custom_chat_completions` re-seeds the word set on
+    /// every revision. Cooldowns tick at 20 Hz on the frame clock.
+    fn sync_chat_completion_state(&mut self, dt: f32) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        if live.command_suggestions_rev != self.seen_suggestions_rev {
+            self.seen_suggestions_rev = live.command_suggestions_rev;
+            if let Some(reply) = &live.command_suggestions {
+                if Some(reply.transaction_id) == self.pending_suggestion_tx {
+                    if let Some(bar) = &mut self.chat_bar {
+                        if bar.apply_server_suggestions(
+                            reply.start.max(0) as usize,
+                            reply.length.max(0) as usize,
+                            &reply.matches,
+                        ) {
+                            self.chat_suggestions = reply.matches.clone();
+                        }
+                    }
+                }
+            }
+        }
+        if live.custom_chat_completions_rev != self.seen_completions_rev {
+            self.seen_completions_rev = live.custom_chat_completions_rev;
+            if let Some(bar) = &mut self.chat_bar {
+                bar.set_custom_chat_completions(
+                    live.custom_chat_completions.iter().cloned(),
+                );
+            }
+        }
+        // Cooldowns decrement on the client tick (20 Hz), not per frame.
+        self.cooldown_tick_accum = (self.cooldown_tick_accum + dt).min(1.0);
+        while self.cooldown_tick_accum >= 0.05 {
+            self.cooldown_tick_accum -= 0.05;
+            live.tick_item_cooldowns();
         }
     }
 
@@ -2590,6 +2749,7 @@ impl GpuApp {
         self.sync_disconnected_screen();
         self.sync_death_screen();
         self.sync_container_screen();
+        self.sync_chat_completion_state(dt);
 
         let player_dead = self.live.as_ref().is_some_and(|live| live.is_dead());
         // Camera movement only applies while unpaused and alive — a dead
@@ -2833,6 +2993,10 @@ impl GpuApp {
                     SessionStatus::Disconnected(reason) => format!("Disconnected: {reason}"),
                 })
         };
+        // Chat-bar mirror lands after `sync_hud_to` (which clones
+        // `live.hud` wholesale) and before the draw list rebuild — the
+        // input strip + suggestion popup read it this frame.
+        sync_chat_input_hud(&mut self.ui.hud.chat_input, self.chat_bar.as_ref());
         // Pooled draw list (C4): `render_into` clears + refills
         // `self.ui_draw_list` in place so steady frames allocate
         // nothing (text payloads recycle inside the list). The command
@@ -3298,8 +3462,7 @@ impl GpuApp {
                 match action {
                     DebugChordAction::ChatFeedback(message) => {
                         if let Some(live) = &mut self.live {
-                            live.hud.chat_lines.push(message.clone());
-                            live.hud_revision += 1;
+                            live.push_chat_line(message.clone());
                         } else {
                             self.ui.hud.chat_lines.push(message.clone());
                         }
@@ -3307,8 +3470,9 @@ impl GpuApp {
                     }
                     DebugChordAction::HelpLines(lines) => {
                         if let Some(live) = &mut self.live {
-                            live.hud.chat_lines.extend(lines.iter().cloned());
-                            live.hud_revision += 1;
+                            for line in &lines {
+                                live.push_chat_line(line.clone());
+                            }
                         } else {
                             self.ui.hud.chat_lines.extend(lines.iter().cloned());
                         }
@@ -3318,8 +3482,7 @@ impl GpuApp {
                         self.debug_messages.clear();
                         self.ui.hud.chat_lines.clear();
                         if let Some(live) = &mut self.live {
-                            live.hud.chat_lines.clear();
-                            live.hud_revision += 1;
+                            live.clear_chat_log();
                         }
                     }
                     _ => {}
@@ -3331,12 +3494,6 @@ impl GpuApp {
                 if self.ui.hud.chat_lines.len() > 100 {
                     let excess = self.ui.hud.chat_lines.len() - 100;
                     self.ui.hud.chat_lines.drain(..excess);
-                }
-                if let Some(live) = &mut self.live {
-                    if live.hud.chat_lines.len() > 100 {
-                        let excess = live.hud.chat_lines.len() - 100;
-                        live.hud.chat_lines.drain(..excess);
-                    }
                 }
             }
             WindowInputEvent::SelectHotbar(slot) => {
@@ -3818,6 +3975,178 @@ fn list_saved_worlds(game_dir: Option<&std::path::Path>) -> Vec<String> {
     };
     worlds.sort();
     worlds
+}
+
+/// Mirror the open `ZshCommandBar` into `hud.chat_input` — the HUD
+/// draws the vanilla-style input strip + suggestion popup from that
+/// mirror each frame (`sync_hud_to` clones `live.hud` over `ui.hud`,
+/// so callers run this after the clone in `render_frame` and on every
+/// key the bar consumes).
+fn sync_chat_input_hud(
+    input: &mut megu_ui::hud_widgets::ChatInputOverlay,
+    bar: Option<&ZshCommandBar>,
+) {
+    match bar {
+        Some(bar) => {
+            input.open = true;
+            input.text = bar.text().to_string();
+            input.cursor = bar.text()[..bar.cursor()].chars().count();
+            if let Some((list, selected)) = bar.completion_menu_list() {
+                input.completions = list;
+                input.completion_index = selected;
+            } else {
+                input.completions = bar
+                    .completions()
+                    .iter()
+                    .map(|candidate| candidate.text.clone())
+                    .collect();
+                input.completion_index = megu_ui::hud_widgets::NO_COMPLETION;
+            }
+        }
+        None => {
+            input.open = false;
+            input.text.clear();
+            input.completions.clear();
+            input.completion_index = megu_ui::hud_widgets::NO_COMPLETION;
+        }
+    }
+}
+
+/// Mirror the persisted `client-app` settings into `UiSettings` — every
+/// UI-visible key the file defines (video/audio/camera/QoL/fair-play)
+/// lands on its widget state so `apply_settings` activates it. UI-only
+/// surfaces (visual style, locale, shader quick-toggle, language) stay
+/// untouched.
+fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
+    ui.video.preset = match src.preset {
+        QualityPreset::Fast => VideoPreset::Fast,
+        QualityPreset::Balanced => VideoPreset::Balanced,
+        QualityPreset::High => VideoPreset::High,
+        QualityPreset::Ultra => VideoPreset::Ultra,
+        QualityPreset::Custom => VideoPreset::Custom,
+    };
+    ui.video.view_distance = src.view_distance;
+    ui.video.lod = match src.distant_horizon {
+        DistantHorizon::Off => LodMode::Off,
+        DistantHorizon::Medium => LodMode::Medium,
+        DistantHorizon::Far => LodMode::Far,
+    };
+    ui.video.gpu_backend = match src.gpu_backend {
+        megu_client_mesh::RenderBackendPreference::Auto => GpuBackend::Auto,
+        megu_client_mesh::RenderBackendPreference::MeshShader => GpuBackend::MeshShader,
+        megu_client_mesh::RenderBackendPreference::ComputeIndirect => {
+            GpuBackend::ComputeIndirect
+        }
+        megu_client_mesh::RenderBackendPreference::Classic => GpuBackend::Classic,
+        megu_client_mesh::RenderBackendPreference::ClassicLowSpec => GpuBackend::ClassicLowSpec,
+    };
+    ui.video.fps_cap = src.max_fps.unwrap_or(0);
+    ui.video.background_fps = src.background_fps_limit;
+    ui.video.vsync = src.vsync;
+    ui.video.smooth_lighting = src.smooth_lighting;
+    ui.audio.master = src.volume_master;
+    ui.audio.music = src.volume_music;
+    ui.audio.blocks = src.volume_blocks;
+    ui.audio.hostile = src.volume_hostile;
+    ui.audio.friendly = src.volume_friendly;
+    ui.audio.max_volume_cap = (src.qol.max_volume_cap * 100.0).round() as u8;
+    ui.audio.max_concurrent_same_sound = src.qol.max_concurrent_same_sound;
+    ui.fov_deg = u16::from(src.fov);
+    ui.mouse_sensitivity_pct = src.mouse_sensitivity_pct;
+    ui.zoom_divisor_tenths = (src.qol.zoom_divisor * 10.0).round() as u16;
+    ui.qol.tool_warn_percent = src.qol.tool_warn_percent;
+    ui.qol.prevent_tool_break = src.qol.prevent_tool_break;
+    ui.qol.chat_history_lines = src.qol.chat_history_lines;
+    ui.qol.retain_chat_on_reconnect = src.qol.retain_chat_on_reconnect;
+    ui.qol.crash_report_mode = match src.crash_report_mode {
+        ClientCrashReportMode::Ask => UiCrashReportMode::Ask,
+        ClientCrashReportMode::AutoCrashOnly => UiCrashReportMode::AutoCrashOnly,
+        ClientCrashReportMode::Off => UiCrashReportMode::Off,
+    };
+    ui.fair_play.minimap_mode = match src.map_fair_play.minimap_mode {
+        HostMinimapMode::Unrestricted => MinimapMode::Unrestricted,
+        HostMinimapMode::FairPlay => MinimapMode::FairPlay,
+        HostMinimapMode::Disabled => MinimapMode::Disabled,
+    };
+    ui.fair_play.allow_cave_map = src.map_fair_play.allow_cave_map;
+    ui.fair_play.allow_mob_radar = src.map_fair_play.allow_mob_radar;
+    ui.fair_play.player_radar_scope = match src.map_fair_play.player_radar_scope {
+        HostPlayerRadarScope::All => PlayerRadarScope::All,
+        HostPlayerRadarScope::PartyOnly => PlayerRadarScope::PartyOnly,
+        HostPlayerRadarScope::None => PlayerRadarScope::None,
+    };
+    ui.fair_play.allow_waypoint_teleport = src.map_fair_play.allow_waypoint_teleport;
+}
+
+/// Overlay the UI-visible settings onto `base` (the last loaded file
+/// state): every widget-owned key writes back, and file-only fields
+/// (`shader_pack`, `shader_profile`, `report_endpoint`, `particles`,
+/// `clouds`, `entity_shadows`) survive untouched.
+fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettings {
+    let mut out = base.clone();
+    out.preset = match ui.video.preset {
+        VideoPreset::Fast => QualityPreset::Fast,
+        VideoPreset::Balanced => QualityPreset::Balanced,
+        VideoPreset::High => QualityPreset::High,
+        VideoPreset::Ultra => QualityPreset::Ultra,
+        VideoPreset::Custom => QualityPreset::Custom,
+    };
+    out.view_distance = ui.video.view_distance;
+    out.distant_horizon = match ui.video.lod {
+        LodMode::Off => DistantHorizon::Off,
+        LodMode::Medium => DistantHorizon::Medium,
+        LodMode::Far => DistantHorizon::Far,
+    };
+    out.gpu_backend = match ui.video.gpu_backend {
+        GpuBackend::Auto => megu_client_mesh::RenderBackendPreference::Auto,
+        GpuBackend::MeshShader => megu_client_mesh::RenderBackendPreference::MeshShader,
+        GpuBackend::ComputeIndirect => {
+            megu_client_mesh::RenderBackendPreference::ComputeIndirect
+        }
+        GpuBackend::Classic => megu_client_mesh::RenderBackendPreference::Classic,
+        GpuBackend::ClassicLowSpec => megu_client_mesh::RenderBackendPreference::ClassicLowSpec,
+    };
+    out.max_fps = (ui.video.fps_cap > 0).then_some(ui.video.fps_cap);
+    out.background_fps_limit = ui.video.background_fps;
+    out.vsync = ui.video.vsync;
+    out.smooth_lighting = ui.video.smooth_lighting;
+    out.volume_master = ui.audio.master;
+    out.volume_music = ui.audio.music;
+    out.volume_blocks = ui.audio.blocks;
+    out.volume_hostile = ui.audio.hostile;
+    out.volume_friendly = ui.audio.friendly;
+    out.qol.max_volume_cap = f32::from(ui.audio.max_volume_cap.min(100)) / 100.0;
+    out.qol.max_concurrent_same_sound = ui.audio.max_concurrent_same_sound;
+    out.fov = ui.fov_deg.clamp(30, 110) as u8;
+    out.mouse_sensitivity_pct = ui.mouse_sensitivity_pct;
+    out.qol.zoom_divisor = f32::from(ui.zoom_divisor_tenths) / 10.0;
+    out.qol.tool_warn_percent = ui.qol.tool_warn_percent;
+    out.qol.prevent_tool_break = ui.qol.prevent_tool_break;
+    out.qol.chat_history_lines = ui.qol.chat_history_lines;
+    out.qol.retain_chat_on_reconnect = ui.qol.retain_chat_on_reconnect;
+    out.crash_report_mode = match ui.qol.crash_report_mode {
+        UiCrashReportMode::Ask => ClientCrashReportMode::Ask,
+        UiCrashReportMode::AutoCrashOnly => ClientCrashReportMode::AutoCrashOnly,
+        UiCrashReportMode::Off => ClientCrashReportMode::Off,
+    };
+    out.map_fair_play.minimap_mode = match ui.fair_play.minimap_mode {
+        MinimapMode::Unrestricted => HostMinimapMode::Unrestricted,
+        MinimapMode::FairPlay => HostMinimapMode::FairPlay,
+        MinimapMode::Disabled => HostMinimapMode::Disabled,
+    };
+    out.map_fair_play.minimap_fair_play =
+        ui.fair_play.minimap_mode != MinimapMode::Unrestricted;
+    out.map_fair_play.allow_cave_map = ui.fair_play.allow_cave_map;
+    out.map_fair_play.allow_mob_radar = ui.fair_play.allow_mob_radar;
+    // `allow_entity_radar` mirrors `allow_mob_radar` (same restriction).
+    out.map_fair_play.allow_entity_radar = ui.fair_play.allow_mob_radar;
+    out.map_fair_play.player_radar_scope = match ui.fair_play.player_radar_scope {
+        PlayerRadarScope::All => HostPlayerRadarScope::All,
+        PlayerRadarScope::PartyOnly => HostPlayerRadarScope::PartyOnly,
+        PlayerRadarScope::None => HostPlayerRadarScope::None,
+    };
+    out.map_fair_play.allow_waypoint_teleport = ui.fair_play.allow_waypoint_teleport;
+    out
 }
 
 /// Deterministic per-session splash seed: FNV-1a over the launch

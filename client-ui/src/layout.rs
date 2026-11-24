@@ -1968,15 +1968,16 @@ fn hud(ctx: &mut Ctx) {
     if show_hotbar {
         if let Some(item) = &hud.offhand {
             slot_cell(ctx, hx, hy, Some(item), false);
+            if let Some(frac) = hud.item_cooldowns.get(item) {
+                slot_cooldown_wipe(ctx, hx, hy, *frac);
+            }
         }
         for (i, item) in hud.hotbar.iter().enumerate() {
-            slot_cell(
-                ctx,
-                hx + slot + 4 + i as i32 * slot,
-                hy,
-                item.as_ref(),
-                i == hud.selected_slot,
-            );
+            let sx = hx + slot + 4 + i as i32 * slot;
+            slot_cell(ctx, sx, hy, item.as_ref(), i == hud.selected_slot);
+            if let Some(frac) = item.as_ref().and_then(|n| hud.item_cooldowns.get(n)) {
+                slot_cooldown_wipe(ctx, sx, hy, *frac);
+            }
         }
     }
 
@@ -2179,6 +2180,55 @@ fn hud(ctx: &mut Ctx) {
         ctx.text(4, y, 1, pal::TEXT, &text);
         chat_top = chat_top.min(y - 1);
         chat_right = chat_right.max(8 + tw);
+    }
+
+    // Chat/command input bar (open chat screen): a dark input strip at
+    // the bottom-left with a caret, plus the vanilla-style suggestion
+    // popup stacked above it listing `completions` with the applied
+    // candidate highlighted.
+    if hud.chat_input.open {
+        let box_w = ((w * 3) / 5).clamp(80, w - 8);
+        let box_y = h - 13;
+        ctx.fill(2, box_y, box_w, 11, UiColor::rgba(0, 0, 0, 160));
+        ctx.border(2, box_y, box_w, 11, pal::PANEL_BORDER);
+        let cells = ((box_w - 8) / 8).max(0) as usize;
+        let text = hud_str(&hud.chat_input.text, cells);
+        ctx.text(4, box_y + 2, 1, pal::TEXT, &text);
+        let caret = hud.chat_input.cursor().min(cells);
+        let caret_x = (4 + caret as i32 * 8).min(2 + box_w - 3);
+        ctx.fill(caret_x, box_y + 2, 1, 7, pal::TEXT);
+        let rows = hud.chat_input.completions.len().min(10);
+        if rows > 0 {
+            let widest = hud
+                .chat_input
+                .completions
+                .iter()
+                .take(rows)
+                .map(|cand| {
+                    crate::draw::text_width(&hud_str(cand, 40), 1) as i32
+                })
+                .max()
+                .unwrap_or(0);
+            let pop_w = (widest + 8).min(w - 8);
+            let pop_h = rows as i32 * 10 + 2;
+            let pop_y = (box_y - 2 - pop_h).max(2);
+            let selected = hud.chat_input.selected_completion();
+            ctx.fill(4, pop_y, pop_w, pop_h, UiColor::rgba(8, 10, 14, 220));
+            ctx.border(4, pop_y, pop_w, pop_h, pal::PANEL_BORDER);
+            for (i, cand) in hud.chat_input.completions.iter().take(rows).enumerate() {
+                let ry = pop_y + 1 + i as i32 * 10;
+                if Some(i) == selected {
+                    ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
+                }
+                ctx.text(
+                    7,
+                    ry + 1,
+                    1,
+                    pal::TEXT,
+                    &hud_str(cand, ((pop_w - 10) / 8).max(1) as usize),
+                );
+            }
+        }
     }
 
     // Player list overlay (hold-Tab): stacked below the bossbars and
@@ -2894,6 +2944,25 @@ fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: boo
         // Two cells max: three glyphs would spill into the next slot.
         ctx.text(x + 3, y + 7, 1, pal::TEXT_DIM, &hud_str(name, 2));
     }
+}
+
+/// Vanilla item-cooldown curtain: a translucent wipe covering the top
+/// `frac` of the slot's icon area (`frac` = cooldown remaining `0..=1`),
+/// with a darker leading edge so the sweep reads as a progress bar.
+fn slot_cooldown_wipe(ctx: &mut Ctx, x: i32, y: i32, frac: f32) {
+    let frac = frac.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    let cover = ((frac * 20.0).round() as i32).clamp(1, 20);
+    ctx.fill(x + 1, y + 1, 20, cover, UiColor::rgba(215, 215, 215, 110));
+    ctx.fill(
+        x + 1,
+        (y + 1 + cover).min(y + 21),
+        20,
+        1,
+        UiColor::rgba(40, 40, 40, 160),
+    );
 }
 
 /// `count`-icon row of 8px cells (half-unit granularity like vanilla

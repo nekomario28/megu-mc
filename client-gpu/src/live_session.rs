@@ -318,6 +318,12 @@ pub(crate) enum WorkerCommand {
     /// `chat`/`chat_command` — the worker splits on a leading `/` exactly
     /// like vanilla's chat screen.
     Chat(String),
+    /// `command_suggestion` — play-phase tab-completion request; the
+    /// server's `command_suggestions` reply echoes `transaction_id`.
+    CommandSuggestion {
+        transaction_id: i32,
+        text: String,
+    },
     /// `use_item` — right-click in air (no block target).
     UseItem {
         hand: i32,
@@ -569,6 +575,51 @@ pub struct LiveHudFeed {
     pub title_text: Option<String>,
     pub subtitle_text: Option<String>,
     pub looking_at_block: Option<([i32; 3], String)>,
+}
+
+/// Block cell adjacent to `pos` on `face` (vanilla `Direction` ordinals
+/// 0..=5: down, up, north, south, west, east — anything else leaves the
+/// position unchanged).
+fn adjacent_block_pos(pos: [i32; 3], face: i32) -> [i32; 3] {
+    let (dx, dy, dz) = match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => (0, 0, 0),
+    };
+    [pos[0] + dx, pos[1] + dy, pos[2] + dz]
+}
+
+/// `cooldown` S2C state for one item id: `remaining` ticks left of
+/// `total` at the 20 Hz client tick — `hud.item_cooldowns` mirrors the
+/// fraction for the hotbar wipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemCooldown {
+    pub remaining_ticks: i32,
+    pub total_ticks: i32,
+}
+
+/// Stored `command_suggestions` reply: the C2S `transaction_id` plus the
+/// buffer range (`start`/`length`, char indices) the server completed
+/// over and the candidate texts (tooltips already decoded away —
+/// `WireSuggestion::tooltip_nbt` stays packet-side for now).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerCommandSuggestions {
+    pub transaction_id: i32,
+    pub start: i32,
+    pub length: i32,
+    pub matches: Vec<String>,
+}
+
+/// Deletion key for one chat line: `player_chat`'s global message index
+/// and 256-byte signature, either of which `delete_chat` can name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChatMessageKey {
+    pub index: i32,
+    pub signature: Option<[u8; 256]>,
 }
 
 /// One registered Create-style kinetic part (shaft / cog / belt) resolved
@@ -1346,6 +1397,45 @@ pub struct LiveSession {
     /// Vanilla use-item/container sequence counter echoed on `use_item`,
     /// `use_item_on`, `player_action`, and `container_click` packets.
     use_item_sequence: i32,
+    /// Block positions each in-flight interaction sequence may have
+    /// predicted: `use_item_on` records the clicked block plus the
+    /// face-adjacent placement cell, `player_action` (dig) records the
+    /// dig target. `block_changed_ack` drains every entry at or below
+    /// the acknowledged sequence and re-dirties the touched sections so
+    /// stale predictions reconcile against the authoritative world —
+    /// vanilla's ghost-block fix under latency and protected regions.
+    pending_interaction_seqs: BTreeMap<i32, Vec<[i32; 3]>>,
+    /// Highest `block_changed_ack` sequence seen (diagnostics/tests).
+    pub highest_acknowledged_sequence: i32,
+    /// Server `set_center_chunk` view anchor — the prefetch cone anchors
+    /// here instead of at the last pose when the server moves the view
+    /// center (vehicles, forced spectate, teleport lag).
+    pub view_center_chunk: Option<(i32, i32)>,
+    /// Per-item-registry-id cooldown state from `cooldown` S2C packets:
+    /// `remaining_ticks`/`total_ticks` at 20 Hz, mirrored into
+    /// `hud.item_cooldowns` as the hotbar wipe fraction.
+    item_cooldowns: BTreeMap<i32, ItemCooldown>,
+    /// Latest `command_suggestions` reply awaiting chat-bar consumption
+    /// (`transaction_id` matches [`Self::request_command_suggestion`]).
+    pub command_suggestions: Option<ServerCommandSuggestions>,
+    /// Revision bumped per stored reply — the window polls it once per
+    /// frame instead of diffing the payload.
+    pub command_suggestions_rev: u64,
+    /// Monotonic C2S `command_suggestion` transaction counter.
+    command_suggestion_tx: i32,
+    /// Server-declared custom chat-completion words
+    /// (`custom_chat_completions` S2C actions add/remove/set).
+    pub custom_chat_completions: BTreeSet<String>,
+    /// Revision for [`Self::custom_chat_completions`] mirroring into the
+    /// chat bar's word set.
+    pub custom_chat_completions_rev: u64,
+    /// Deletion keys parallel to `hud.chat_lines`: `Some(index,
+    /// signature)` for `player_chat` lines, `None` for unsigned/system
+    /// lines. `delete_chat` retracts by signature (or index fallback);
+    /// `reset_chat` clears both. Kept in sync by
+    /// [`Self::reconcile_chat_keys`] even when host code appends to
+    /// `hud.chat_lines` directly.
+    chat_log_keys: std::collections::VecDeque<Option<ChatMessageKey>>,
     /// Launcher filesystem paths this session resolves assets against
     /// (`--gameDir`/`--assetsDir`/`--assetIndex`/`--version`/
     /// `--resourcePackDir`). Empty means env-lookup defaults only.
@@ -1897,6 +1987,16 @@ impl LiveSession {
             actionbar_nbt: None,
             pending_transfer: None,
             use_item_sequence: 0,
+            pending_interaction_seqs: BTreeMap::new(),
+            highest_acknowledged_sequence: 0,
+            view_center_chunk: None,
+            item_cooldowns: BTreeMap::new(),
+            command_suggestions: None,
+            command_suggestions_rev: 0,
+            command_suggestion_tx: 0,
+            custom_chat_completions: BTreeSet::new(),
+            custom_chat_completions_rev: 0,
+            chat_log_keys: std::collections::VecDeque::new(),
             session_paths: paths,
             resolved_assets_dir,
             resolved_asset_index,
@@ -2881,6 +2981,64 @@ impl LiveSession {
             .try_send(WorkerCommand::Chat(message.to_string()));
     }
 
+    /// `command_suggestion` C2S — ask the server to tab-complete `text`
+    /// (the full chat-bar buffer, `/` included). Returns the
+    /// `transaction_id` the [`PlayEvent::CommandSuggestions`] reply will
+    /// echo — `None` while not playing or when the outgoing queue is
+    /// full (the caller falls back to local completion).
+    pub fn request_command_suggestion(&mut self, text: &str) -> Option<i32> {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return None;
+        }
+        self.command_suggestion_tx = self.command_suggestion_tx.wrapping_add(1);
+        let transaction_id = self.command_suggestion_tx;
+        self.outgoing
+            .try_send(WorkerCommand::CommandSuggestion {
+                transaction_id,
+                text: text.to_string(),
+            })
+            .ok()?;
+        Some(transaction_id)
+    }
+
+    /// One 20 Hz client tick of item cooldowns — the window drives this
+    /// from the frame clock; expired entries drop out of
+    /// `hud.item_cooldowns` so the hotbar wipe ends cleanly.
+    pub fn tick_item_cooldowns(&mut self) {
+        if self.item_cooldowns.is_empty() {
+            return;
+        }
+        self.item_cooldowns.retain(|_, cd| {
+            cd.remaining_ticks -= 1;
+            cd.remaining_ticks > 0
+        });
+        self.sync_hud_item_cooldowns();
+    }
+
+    /// Apply the audio settings sliders (vanilla sound categories):
+    /// `master` → mixer master gain, `music` → sources 1+2 (music +
+    /// jukebox records), `blocks` → 4, `hostile` → 5, `friendly` →
+    /// 6+7 (neutral + players); sources 0/3/8/9 keep full gain under
+    /// master like vanilla. `max_volume_cap`/`max_concurrent_same_sound`
+    /// retune the admission limiter. Applies immediately to both the
+    /// synchronous mixer and, via `SetVolumes`, the dedicated mix thread.
+    pub fn set_audio_volumes(&mut self, audio: &megu_ui::state::AudioSettings) {
+        let pct = |value: u8| f32::from(value.min(100)) / 100.0;
+        let mut categories = [1.0f32; 10];
+        categories[1] = pct(audio.music);
+        categories[2] = pct(audio.music);
+        categories[4] = pct(audio.blocks);
+        categories[5] = pct(audio.hostile);
+        categories[6] = pct(audio.friendly);
+        categories[7] = pct(audio.friendly);
+        self.audio
+            .set_volume_profile(pct(audio.master), categories, pct(audio.max_volume_cap));
+        self.audio
+            .mixer
+            .limiter
+            .set_max_concurrent_same_sound(audio.max_concurrent_same_sound);
+    }
+
     /// `use_item` — right-click in air with `hand` (0 main, 1 off), using
     /// the current look angles and the next interaction sequence.
     pub fn use_item(&mut self, hand: i32) {
@@ -2913,6 +3071,12 @@ impl LiveSession {
             inside,
             sequence: self.use_item_sequence,
         });
+        // Placement predicts the clicked cell and the face-adjacent cell;
+        // the `block_changed_ack` for this sequence reconciles both.
+        self.track_pending_interaction(
+            self.use_item_sequence,
+            &[pos, adjacent_block_pos(pos, face)],
+        );
     }
 
     /// `player_action` drop: `Q` drops one item, `Ctrl+Q` the whole stack
@@ -2981,6 +3145,12 @@ impl LiveSession {
             face,
             sequence: self.use_item_sequence,
         });
+        // Dig statuses (0 start, 1 abort, 2 finish) predict the target
+        // block may change; drop/swap statuses carry `pos = [0; 3]` and
+        // touch no blocks, so they stay untracked.
+        if (0..=2).contains(&status) {
+            self.track_pending_interaction(self.use_item_sequence, &[pos]);
+        }
     }
 
     /// `START_DESTROY_BLOCK` — left-click on a diggable block.
@@ -3084,13 +3254,42 @@ impl LiveSession {
     }
 
     /// One chat line into the bounded HUD scrollback (vanilla's 100-line
-      /// cap — oldest evicted first).
-    fn push_chat_line(&mut self, line: String) {
+    /// cap — oldest evicted first).
+    pub fn push_chat_line(&mut self, line: String) {
+        self.push_chat_line_keyed(line, None);
+    }
+
+    /// Wipe the HUD scrollback plus its retraction keys (debug clear /
+    /// reconnect reset paths that host code owns).
+    pub fn clear_chat_log(&mut self) {
+        self.hud.chat_lines.clear();
+        self.chat_log_keys.clear();
+        self.hud_revision += 1;
+    }
+
+    /// [`push_chat_line`](Self::push_chat_line) carrying the `player_chat`
+    /// deletion key (`index` + `signature`) so `delete_chat` can retract
+    /// the line later.
+    fn push_chat_line_keyed(&mut self, line: String, key: Option<ChatMessageKey>) {
         self.hud.chat_lines.push(line);
+        self.chat_log_keys.push_back(key);
         if self.hud.chat_lines.len() > 100 {
             self.hud.chat_lines.remove(0);
+            self.chat_log_keys.pop_front();
         }
         self.hud_revision += 1;
+    }
+
+    /// Keep `chat_log_keys` exactly parallel to `hud.chat_lines`: host
+    /// code may append status lines to `hud.chat_lines` directly, so any
+    /// surplus gets unsigned `None` keys on the right side.
+    fn reconcile_chat_keys(&mut self) {
+        while self.chat_log_keys.len() < self.hud.chat_lines.len() {
+            self.chat_log_keys.push_back(None);
+        }
+        while self.chat_log_keys.len() > self.hud.chat_lines.len() {
+            self.chat_log_keys.pop_front();
+        }
     }
 
     /// Mirror the tab-list roster into `hud.players` (name + ping rows
@@ -3599,10 +3798,17 @@ impl LiveSession {
         let Some(pose) = self.pose else {
             return;
         };
+        // `set_center_chunk` wins over the pose: the server's view
+        // center is the authoritative anchor while it differs from the
+        // local position (vehicle seats, forced spectate, teleport lag).
+        let (anchor_x, anchor_z) = self
+            .view_center_chunk
+            .map(|(cx, cz)| (f64::from(cx) * 16.0 + 8.0, f64::from(cz) * 16.0 + 8.0))
+            .unwrap_or((pose.feet[0], pose.feet[2]));
         let columns = &self.world.columns;
         self.prefetcher.update(
-            pose.feet[0],
-            pose.feet[2],
+            anchor_x,
+            anchor_z,
             self.last_motion_delta[0],
             self.last_motion_delta[1],
             PREFETCH_VIEW_DISTANCE,
@@ -4615,6 +4821,149 @@ impl LiveSession {
         }
     }
 
+    /// Record block positions a just-sent interaction sequence may have
+    /// predicted — see [`Self::pending_interaction_seqs`]. Bounded: the
+    /// map never exceeds 256 in-flight sequences (oldest evicted, same
+    /// bound vanilla's pending-prediction ledger keeps).
+    fn track_pending_interaction(&mut self, sequence: i32, positions: &[[i32; 3]]) {
+        const MAX_PENDING_INTERACTIONS: usize = 256;
+        self.pending_interaction_seqs
+            .entry(sequence)
+            .or_default()
+            .extend_from_slice(positions);
+        while self.pending_interaction_seqs.len() > MAX_PENDING_INTERACTIONS {
+            self.pending_interaction_seqs.pop_first();
+        }
+    }
+
+    /// `block_changed_ack`: the server confirmed every interaction
+    /// sequence at or below `sequence` is processed — the blocks those
+    /// interactions touched now match the authoritative world. Drain
+    /// the recorded positions and re-dirty their sections so the mesh
+    /// picks up any reconciled state (ghost blocks under latency or
+    /// protected regions disappear instead of lingering forever).
+    fn apply_block_changed_ack(&mut self, sequence: i32) {
+        self.highest_acknowledged_sequence = sequence;
+        // Wrapping subtraction keeps `k <= sequence` true across the
+        // i32 wrap point for any sane in-flight window (< 2^31 deep).
+        let drained: Vec<i32> = self
+            .pending_interaction_seqs
+            .keys()
+            .filter(|seq_key| sequence.wrapping_sub(**seq_key) >= 0)
+            .copied()
+            .collect();
+        for key in drained {
+            if let Some(positions) = self.pending_interaction_seqs.remove(&key) {
+                for pos in positions {
+                    self.mark_block_dirty(pos);
+                }
+                self.terrain_dirty = true;
+            }
+        }
+    }
+
+    /// Re-anchor the speculative prefetch cone on the server-issued view
+    /// center (`set_center_chunk`) when one is active, else on the pose.
+    fn apply_set_center_chunk(&mut self, cx: i32, cz: i32) {
+        self.view_center_chunk = Some((cx, cz));
+        self.refresh_prefetcher();
+    }
+
+    /// `command_suggestions` reply for a C2S request — stored for the
+    /// window to fold into the chat bar's completion menu (matching
+    /// `transaction_id` checked there; stale replies stay ignored).
+    fn apply_command_suggestions(&mut self, reply: ServerCommandSuggestions) {
+        self.command_suggestions = Some(reply);
+        self.command_suggestions_rev = self.command_suggestions_rev.wrapping_add(1);
+    }
+
+    /// `custom_chat_completions` (aka `chat_completions`) actions:
+    /// 0 add, 1 remove, 2 set — the vanilla `CustomChatCompletions`
+    /// word set merged into plain-chat tab completion.
+    fn apply_chat_completions(&mut self, action: i32, entries: &[String]) {
+        match action {
+            0 => {
+                for entry in entries {
+                    self.custom_chat_completions.insert(entry.clone());
+                }
+            }
+            1 => {
+                for entry in entries {
+                    self.custom_chat_completions.remove(entry);
+                }
+            }
+            _ => {
+                self.custom_chat_completions =
+                    entries.iter().cloned().collect();
+            }
+        }
+        self.custom_chat_completions_rev =
+            self.custom_chat_completions_rev.wrapping_add(1);
+    }
+
+    /// `cooldown` S2C: start (or replace) the cooldown on item registry
+    /// `item` for `ticks` ticks at the 20 Hz client tick. `ticks <= 0`
+    /// clears — the packet only ever carries positive durations, so a
+    /// non-positive value is treated as a removal guard.
+    fn apply_cooldown(&mut self, item: i32, ticks: i32) {
+        if ticks > 0 {
+            self.item_cooldowns.insert(
+                item,
+                ItemCooldown {
+                    remaining_ticks: ticks,
+                    total_ticks: ticks,
+                },
+            );
+        } else {
+            self.item_cooldowns.remove(&item);
+        }
+        self.sync_hud_item_cooldowns();
+    }
+
+    /// Mirror `item_cooldowns` into `hud.item_cooldowns` keyed by the
+    /// same registry name `sync_hud_inventory` writes into `hud.hotbar`
+    /// — the layout's slot wipe matches on that name.
+    fn sync_hud_item_cooldowns(&mut self) {
+        self.hud.item_cooldowns = self
+            .item_cooldowns
+            .iter()
+            .filter(|(_, cd)| cd.remaining_ticks > 0)
+            .map(|(item, cd)| {
+                (
+                    crate::recipe_ingest::item_name_for_id(*item as u32),
+                    cd.remaining_ticks as f32 / i32::max(cd.total_ticks, 1) as f32,
+                )
+            })
+            .collect();
+        self.hud_revision += 1;
+    }
+
+    /// `delete_chat` S2C: retract the message the packet identifies —
+    /// signature match when present, global chat index otherwise.
+    fn apply_delete_chat(&mut self, message_index: Option<i32>, signature: Option<[u8; 256]>) {
+        self.reconcile_chat_keys();
+        let position = self.chat_log_keys.iter().position(|key| {
+            key.is_some_and(|key| match (signature, message_index) {
+                (Some(sig), _) => key.signature == Some(sig),
+                (None, Some(index)) => key.index == index,
+                (None, None) => false,
+            })
+        });
+        if let Some(position) = position {
+            self.hud.chat_lines.remove(position);
+            self.chat_log_keys.remove(position);
+            self.hud_revision += 1;
+        }
+    }
+
+    /// `reset_chat` S2C: the server cleared the whole chat history —
+    /// drop every line plus its deletion key (vanilla wipes the log).
+    fn apply_reset_chat(&mut self) {
+        self.hud.chat_lines.clear();
+        self.chat_log_keys.clear();
+        self.hud_revision += 1;
+    }
+
     fn apply_play(&mut self, event: PlayEvent) -> Result<(), String> {
         // World-side tracking (chunks, block/light updates, entities, block
         // entities, time/weather, break overlays) is owned by
@@ -4957,21 +5306,24 @@ impl LiveSession {
             PlayEvent::SystemChat { text, overlay } => {
                 if overlay {
                     self.hud.actionbar = text.clone();
+                    self.hud_revision += 1;
                 } else {
-                    self.hud.chat_lines.push(text.clone());
-                    if self.hud.chat_lines.len() > 100 {
-                        self.hud.chat_lines.remove(0);
-                    }
+                    self.push_chat_line(text.clone());
                 }
                 self.chat_message = Some(text);
-                self.hud_revision += 1;
             }
             PlayEvent::SetActionBarText { nbt_bytes } => {
                 self.hud.actionbar = nbt_text(&nbt_bytes).unwrap_or_default();
                 self.actionbar_nbt = Some(nbt_bytes);
                 self.hud_revision += 1;
             }
-            PlayEvent::PlayerChat { sender, text, .. } => {
+            PlayEvent::PlayerChat {
+                sender,
+                index,
+                signature,
+                text,
+                ..
+            } => {
                 // Vanilla renders `<sender> message` for the default
                 // chat type; the display name wins when the tab list
                 // has one for this sender UUID.
@@ -4986,7 +5338,13 @@ impl LiveSession {
                             .or_else(|| entry.name.clone())
                     })
                     .unwrap_or_else(|| uuid_label(&sender));
-                self.push_chat_line(format!("<{name}> {text}"));
+                self.push_chat_line_keyed(
+                    format!("<{name}> {text}"),
+                    Some(ChatMessageKey {
+                        index,
+                        signature,
+                    }),
+                );
                 self.chat_message = Some(text);
             }
             PlayEvent::DisguisedChat { text, .. } => {
@@ -5456,6 +5814,28 @@ impl LiveSession {
                     .unwrap_or([0.0; 3]);
                 self.emit_effect_sound("minecraft:entity.item.pickup", 7, 0.2, 1.0, pos);
             }
+            PlayEvent::BlockChangedAck(sequence) => self.apply_block_changed_ack(sequence),
+            PlayEvent::SetCenterChunk { cx, cz } => self.apply_set_center_chunk(cx, cz),
+            PlayEvent::CommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches,
+            } => self.apply_command_suggestions(ServerCommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches: matches.iter().map(|m| m.text.clone()).collect(),
+            }),
+            PlayEvent::ChatCompletions { action, entries } => {
+                self.apply_chat_completions(action, &entries)
+            }
+            PlayEvent::Cooldown { item, ticks } => self.apply_cooldown(item, ticks),
+            PlayEvent::DeleteChat {
+                message_index,
+                signature,
+            } => self.apply_delete_chat(message_index, signature),
+            PlayEvent::ResetChat => self.apply_reset_chat(),
             PlayEvent::Disconnect(reason) => self.status = SessionStatus::Disconnected(reason),
             _ => {}
         }
@@ -5684,6 +6064,12 @@ impl LiveSession {
         self.last_motion_delta = [0.0; 2];
         self.chunk_fades = ChunkFadeTracker::new();
         self.prefetcher = SpeculativeChunkPrefetcher::new();
+        // Interaction bookkeeping is dimension-scoped: acks for the old
+        // dimension's predicted positions must not re-dirty the new one,
+        // and the server re-sends `set_center_chunk` after respawn.
+        self.pending_interaction_seqs.clear();
+        self.view_center_chunk = None;
+        self.command_suggestions = None;
         // A dimension change invalidates the previous dimension's
         // season frame: restore the untinted atmosphere base instead
         // of snapping to a possibly season-tinted target, and drop
@@ -5983,6 +6369,12 @@ fn run_connection(
                 Ok(WorkerCommand::Movement(movement)) => last_input = Some(movement),
                 Ok(WorkerCommand::Chat(message)) => {
                     client.send_chat_message(&message)?;
+                }
+                Ok(WorkerCommand::CommandSuggestion {
+                    transaction_id,
+                    text,
+                }) => {
+                    client.send_command_suggestion(transaction_id, &text)?;
                 }
                 Ok(WorkerCommand::UseItem {
                     hand,

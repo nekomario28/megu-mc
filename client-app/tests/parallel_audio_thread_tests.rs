@@ -43,6 +43,7 @@ fn play_cmd(voice_id: u64, mono: &Arc<DecodedPcm>, stereo: &Arc<DecodedPcm>) -> 
         pitch: 1.0,
         attenuation_distance: 16.0,
         is_2d,
+        category: 0,
     }
 }
 

@@ -4745,6 +4745,16 @@ pub fn encode_chat_command(command: &str) -> (&'static str, Vec<u8>) {
     ("chat_command", p)
 }
 
+/// `command_suggestion` — play-phase tab-completion request: a
+/// monotonically increasing `transaction_id` plus the full input text
+/// (vanilla sends the buffer verbatim, `/` included).
+pub fn encode_command_suggestion(transaction_id: i32, text: &str) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(8 + text.len());
+    write_varint(&mut p, transaction_id);
+    write_string(&mut p, text);
+    ("command_suggestion", p)
+}
+
 /// `chat` — unsigned chat message. Produces the unsigned envelope: message,
 /// client timestamp (unix millis), zero salt, no signature, offset 0, and an
 /// empty acknowledged bitset. Servers that require signed chat will reject
@@ -5728,6 +5738,20 @@ impl ProtocolClient {
         } else {
             encode_chat_message(message)
         };
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// `command_suggestion` — request server-driven tab completion for
+    /// `text` (the full chat-bar buffer, leading `/` included for
+    /// commands). The reply arrives as [`PlayEvent::CommandSuggestions`]
+    /// carrying the same `transaction_id`; callers bump a session counter
+    /// per request so stale replies are detectable.
+    pub fn send_command_suggestion(
+        &mut self,
+        transaction_id: i32,
+        text: &str,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_command_suggestion(transaction_id, text);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 

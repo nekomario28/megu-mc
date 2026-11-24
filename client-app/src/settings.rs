@@ -425,6 +425,18 @@ pub struct ClientSettings {
     pub entity_shadows: bool,
     /// `30..=110` degrees.
     pub fov: u8,
+    /// Mouse-look sensitivity percent `10..=200` (`100` = 1.0×).
+    pub mouse_sensitivity_pct: u16,
+    /// Vanilla sound-category volume sliders, percent `0..=100`:
+    /// `volume_master` scales every source; `volume_music` covers the
+    /// music + records(jukebox) sources, `volume_blocks`/`volume_hostile`/
+    /// `volume_friendly` cover the blocks, hostile-mob and
+    /// neutral+players sources respectively.
+    pub volume_master: u8,
+    pub volume_music: u8,
+    pub volume_blocks: u8,
+    pub volume_hostile: u8,
+    pub volume_friendly: u8,
     pub vsync: bool,
     /// `None` = unlimited; `Some(10..=2000)` otherwise.
     pub max_fps: Option<u32>,
@@ -490,6 +502,12 @@ impl ClientSettings {
             smooth_lighting: true,
             entity_shadows: true,
             fov: DEFAULT_FOV,
+            mouse_sensitivity_pct: 100,
+            volume_master: 100,
+            volume_music: 70,
+            volume_blocks: 100,
+            volume_hostile: 100,
+            volume_friendly: 100,
             vsync: true,
             max_fps: None,
             background_fps_limit: DEFAULT_BACKGROUND_FPS_LIMIT,
@@ -590,6 +608,12 @@ impl ClientSettings {
              smooth_lighting = {}\n\
              entity_shadows = {}\n\
              fov = {}\n\
+             mouse_sensitivity_pct = {}\n\
+             volume_master = {}\n\
+             volume_music = {}\n\
+             volume_blocks = {}\n\
+             volume_hostile = {}\n\
+             volume_friendly = {}\n\
              vsync = {}\n\
              max_fps = {}\n\
              background_fps_limit = {}\n\
@@ -623,6 +647,12 @@ impl ClientSettings {
             self.smooth_lighting,
             self.entity_shadows,
             self.fov,
+            self.mouse_sensitivity_pct,
+            self.volume_master,
+            self.volume_music,
+            self.volume_blocks,
+            self.volume_hostile,
+            self.volume_friendly,
             self.vsync,
             max_fps,
             self.background_fps_limit,
@@ -669,6 +699,14 @@ impl ClientSettings {
                 "smooth_lighting" => self.smooth_lighting = parsed.smooth_lighting,
                 "entity_shadows" => self.entity_shadows = parsed.entity_shadows,
                 "fov" => self.fov = parsed.fov,
+                "mouse_sensitivity_pct" => {
+                    self.mouse_sensitivity_pct = parsed.mouse_sensitivity_pct;
+                }
+                "volume_master" => self.volume_master = parsed.volume_master,
+                "volume_music" => self.volume_music = parsed.volume_music,
+                "volume_blocks" => self.volume_blocks = parsed.volume_blocks,
+                "volume_hostile" => self.volume_hostile = parsed.volume_hostile,
+                "volume_friendly" => self.volume_friendly = parsed.volume_friendly,
                 "vsync" => self.vsync = parsed.vsync,
                 "max_fps" => self.max_fps = parsed.max_fps,
                 "background_fps_limit" => {
@@ -825,6 +863,44 @@ impl ClientSettings {
                             &mut warnings,
                         );
                         seen.push("fov");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "mouse_sensitivity_pct" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        settings.mouse_sensitivity_pct =
+                            clamp_i64(v, 10, 200, key, &mut warnings) as u16;
+                        seen.push("mouse_sensitivity_pct");
+                    }
+                    Err(_) => invalid(&mut warnings),
+                },
+                "volume_master" | "volume_music" | "volume_blocks" | "volume_hostile"
+                | "volume_friendly" => match value.parse::<i64>() {
+                    Ok(v) => {
+                        let volume = clamp_u8(v, 0, 100, key, &mut warnings);
+                        let canonical: &'static str = match key {
+                            "volume_master" => {
+                                settings.volume_master = volume;
+                                "volume_master"
+                            }
+                            "volume_music" => {
+                                settings.volume_music = volume;
+                                "volume_music"
+                            }
+                            "volume_blocks" => {
+                                settings.volume_blocks = volume;
+                                "volume_blocks"
+                            }
+                            "volume_hostile" => {
+                                settings.volume_hostile = volume;
+                                "volume_hostile"
+                            }
+                            _ => {
+                                settings.volume_friendly = volume;
+                                "volume_friendly"
+                            }
+                        };
+                        seen.push(canonical);
                     }
                     Err(_) => invalid(&mut warnings),
                 },
@@ -1459,6 +1535,12 @@ mod tests {
             smooth_lighting: false,
             entity_shadows: false,
             fov: 90,
+            mouse_sensitivity_pct: 150,
+            volume_master: 80,
+            volume_music: 55,
+            volume_blocks: 95,
+            volume_hostile: 60,
+            volume_friendly: 40,
             vsync: false,
             max_fps: Some(144),
             background_fps_limit: 45,

@@ -144,6 +144,11 @@ fn settings_change_updates_active_camera_values_and_pacing_without_window() {
     settings.video.vsync = false;
     settings.video.view_distance = 24;
     settings.video.preset = VideoPreset::Fast;
+    // `apply_settings` owns the camera too — the Options widgets feed
+    // the same values the manual `apply_camera_settings` call set.
+    settings.fov_deg = 95;
+    settings.mouse_sensitivity_pct = 170;
+    settings.zoom_divisor_tenths = 60;
     app.apply_settings(&settings);
     assert!(!app.render_config().vsync);
     assert_eq!(app.render_config().max_fps, Some(144));

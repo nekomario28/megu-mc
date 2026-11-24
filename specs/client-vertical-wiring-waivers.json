@@ -28,21 +28,9 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::BlockChangedAck",
-      "priority": "P1",
-      "reason": "block_changed_ack drops \u2014 dig/place sequence acknowledgements ignored (dig lane correctness)"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::ChangeDifficulty",
       "priority": "P2",
       "reason": "change_difficulty drops \u2014 difficulty display only"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ChatCompletions",
-      "priority": "P1",
-      "reason": "chat_completions drops \u2014 chat completion lists ignored"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -52,33 +40,15 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::CommandSuggestions",
-      "priority": "P1",
-      "reason": "command_suggestions drops \u2014 tab-completion never populates"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CookieRequest",
       "priority": "P2",
       "reason": "cookie_request drops \u2014 server cookie store unused"
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::Cooldown",
-      "priority": "P1",
-      "reason": "cooldown drops \u2014 item cooldown overlay never shows"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::CustomReportDetails",
       "priority": "P2",
       "reason": "custom_report_details drops \u2014 crash-report payload unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::DeleteChat",
-      "priority": "P1",
-      "reason": "delete_chat drops \u2014 server-retracted messages stay visible"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -160,12 +130,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::ResetChat",
-      "priority": "P1",
-      "reason": "reset_chat drops \u2014 chat reset ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::ServerData",
       "priority": "P2",
       "reason": "server_data drops \u2014 MOTD/favicon push unused"
@@ -211,12 +175,6 @@
       "id": "PlayEvent::SetCamera",
       "priority": "P1",
       "reason": "set_camera drops \u2014 spectator/mob camera switching dead"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetCenterChunk",
-      "priority": "P1",
-      "reason": "set_center_chunk drops \u2014 client chunk-view centre never follows the server"
     },
     {
       "check": "s2c_play_event_consumption",

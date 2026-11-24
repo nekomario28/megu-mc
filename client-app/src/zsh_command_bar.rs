@@ -440,6 +440,10 @@ pub struct ZshCommandBar {
     effects: BTreeSet<String>,
     enchants: BTreeSet<String>,
     blocks: BTreeSet<String>,
+    /// Server-declared custom chat completions (`custom_chat_completions`
+    /// S2C): vanilla merges these words into plain (non-command) text
+    /// completion, so they surface for `CompletionContext::None` targets.
+    custom_chat_completions: BTreeSet<String>,
 }
 
 impl Default for ZshCommandBar {
@@ -468,6 +472,7 @@ impl ZshCommandBar {
             effects: BTreeSet::new(),
             enchants: BTreeSet::new(),
             blocks: BTreeSet::new(),
+            custom_chat_completions: BTreeSet::new(),
         }
     }
 
@@ -640,6 +645,77 @@ impl ZshCommandBar {
 
     pub fn register_block(&mut self, id: impl AsRef<str>) {
         self.blocks.insert(normalize_registry_id(id.as_ref()));
+    }
+
+    /// Replace the server-declared custom chat-completion word set
+    /// (`custom_chat_completions` action 2 = set; the host folds
+    /// add/remove deltas into the full set before calling).
+    pub fn set_custom_chat_completions(
+        &mut self,
+        entries: impl IntoIterator<Item = impl Into<String>>,
+    ) {
+        self.custom_chat_completions = entries.into_iter().map(Into::into).collect();
+    }
+
+    /// The open completion menu's candidate texts plus the selected
+    /// index — HUD overlays mirror this verbatim so the popup shows the
+    /// same list (and the same selection) the bar will cycle through.
+    /// `None` while no menu is open.
+    pub fn completion_menu_list(&self) -> Option<(Vec<String>, usize)> {
+        self.completion_menu.as_ref().map(|menu| {
+            (
+                menu.candidates
+                    .iter()
+                    .map(|candidate| candidate.text.clone())
+                    .collect(),
+                menu.index,
+            )
+        })
+    }
+
+    /// Install a server `command_suggestions` reply as the completion
+    /// menu: `start`/`length` are *char* indices into the buffer naming
+    /// the range the server completed over (the vanilla packet contract).
+    /// The first match is applied immediately and the menu stays open,
+    /// so subsequent [`cycle_completion`](Self::cycle_completion) presses
+    /// walk the server list exactly like vanilla's suggestion box.
+    /// Returns `false` on an empty or out-of-range reply so the caller
+    /// can fall back to local completion.
+    pub fn apply_server_suggestions(
+        &mut self,
+        start: usize,
+        length: usize,
+        matches: &[String],
+    ) -> bool {
+        if matches.is_empty() {
+            return false;
+        }
+        let char_to_byte = |char_index: usize| -> usize {
+            self.buffer
+                .char_indices()
+                .nth(char_index)
+                .map(|(byte, _)| byte)
+                .unwrap_or(self.buffer.len())
+        };
+        let byte_start = char_to_byte(start);
+        let byte_end = char_to_byte(start.saturating_add(length));
+        if byte_start > byte_end {
+            return false;
+        }
+        let mut menu = CompletionMenu {
+            candidates: matches
+                .iter()
+                .map(|text| CompletionCandidate::simple(text.clone()))
+                .collect(),
+            start: byte_start,
+            end: byte_end,
+            index: 0,
+        };
+        let candidate = menu.candidates[0].clone();
+        self.apply_completion_candidate(&mut menu, &candidate);
+        self.cursor = menu.end;
+        self.completion_menu = Some(menu);
+        true
     }
 
     /// Ranked completion candidates for the token at the cursor.
@@ -1400,7 +1476,14 @@ impl ZshCommandBar {
                     );
                 }
             }
-            CompletionContext::None => {}
+            CompletionContext::None => {
+                // Server-declared custom words (`custom_chat_completions`)
+                // merge into plain chat-text completion; the ranker below
+                // drops non-matches so no prefix filter is needed here.
+                for word in &self.custom_chat_completions {
+                    candidates.push(CompletionCandidate::simple(word.clone()));
+                }
+            }
         }
 
         if matches!(

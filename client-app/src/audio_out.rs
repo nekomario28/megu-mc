@@ -2494,6 +2494,30 @@ impl AudioRuntime {
         self.mix_thread.as_ref()
     }
 
+    /// Live volume retune from the settings screen: `master` scales every
+    /// voice, `categories` is the vanilla `0..=9` source-id gain table,
+    /// `max_volume_cap` the bus limiter ceiling. Applies to the
+    /// synchronous mixer directly and, when a dedicated
+    /// [`AudioMixThread`] owns the sink, forwards the same retune as a
+    /// [`AudioCmd::SetVolumes`] so both paths hear the same sliders.
+    pub fn set_volume_profile(
+        &mut self,
+        master: f32,
+        categories: [f32; 10],
+        max_volume_cap: f32,
+    ) {
+        self.mixer.set_master_gain(master);
+        for (category, gain) in categories.iter().enumerate() {
+            self.mixer.set_category_gain(category as i32, *gain);
+        }
+        self.mixer.limiter.set_max_volume_cap(max_volume_cap);
+        let _ = self.submit_cmd_nonblocking(AudioCmd::SetVolumes {
+            master,
+            categories,
+            max_volume_cap,
+        });
+    }
+
     /// Mixer counters (events seen, voices, limiter verdicts, placeholders).
     pub fn stats(&self) -> &AudioStats {
         &self.mixer.stats
@@ -2587,6 +2611,9 @@ struct PendingVoice {
     pitch: f32,
     attenuation_distance: f32,
     is_2d: bool,
+    /// Vanilla sound-source id (`0..=9`) — `SetVolumes`' per-category
+    /// gains index by it exactly like the synchronous mixer does.
+    category: i32,
 }
 
 /// Lightweight commands the Render Thread posts to the Audio Mix Thread
@@ -2630,6 +2657,22 @@ pub enum AudioCmd {
         attenuation_distance: f32,
         /// `true` for the 2D stereo bypass (no spatializer, no reverb send).
         is_2d: bool,
+        /// Vanilla sound-source id (`0..=9`) selecting the category gain.
+        category: i32,
+    },
+    /// Live volume retune: master gain, the ten per-category gains, and
+    /// the bus limiter ceiling — the dedicated-thread mirror of
+    /// `SoundMixer::set_master_gain`/`set_category_gain` plus
+    /// `AudioLimiter::set_max_volume_cap`. Gains apply to voices admitted
+    /// after the command drains (vanilla applies volume sliders to new
+    /// sounds; running voices keep their admission gain).
+    SetVolumes {
+        /// Master gain `0..=1` applied to every voice.
+        master: f32,
+        /// Per-source gains `0..=1`, indexed by the vanilla category id.
+        categories: [f32; 10],
+        /// `qol.max_volume_cap` bus ceiling.
+        max_volume_cap: f32,
     },
     /// Latest tracked pose for an entity-bound voice.
     UpdateEntityPos {
@@ -2916,6 +2959,11 @@ pub struct AudioMixCore {
     sample_rate: u32,
     preset: SpatialAudioPreset,
     max_volume_cap: f32,
+    /// Master + per-category voice gains (`AudioCmd::SetVolumes`) —
+    /// folded into a voice's admission gain, matching the synchronous
+    /// `SoundMixer` slider semantics.
+    master_gain: f32,
+    category_gain: [f32; 10],
     /// Pre-allocated block scratch — the zero-alloc steady state.
     mix_f32: [f32; AUDIO_MIX_BLOCK_SAMPLES],
     mono_scratch: [f32; AUDIO_MIX_BLOCK_FRAMES],
@@ -2942,6 +2990,8 @@ impl AudioMixCore {
             sample_rate: opts.sample_rate,
             preset: opts.preset,
             max_volume_cap: opts.max_volume_cap,
+            master_gain: 1.0,
+            category_gain: [1.0; 10],
             mix_f32: [0.0; AUDIO_MIX_BLOCK_SAMPLES],
             mono_scratch: [0.0; AUDIO_MIX_BLOCK_FRAMES],
             send_scratch: [0.0; AUDIO_MIX_BLOCK_FRAMES],
@@ -3015,6 +3065,7 @@ impl AudioMixCore {
                 pitch,
                 attenuation_distance,
                 is_2d,
+                category,
             } => self.pending.push_back(PendingVoice {
                 voice_id,
                 pcm,
@@ -3024,7 +3075,29 @@ impl AudioMixCore {
                 pitch,
                 attenuation_distance,
                 is_2d,
+                category,
             }),
+            AudioCmd::SetVolumes {
+                master,
+                categories,
+                max_volume_cap,
+            } => {
+                self.master_gain = if master.is_finite() {
+                    master.clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                for (slot, gain) in self.category_gain.iter_mut().zip(categories.iter()) {
+                    *slot = if gain.is_finite() {
+                        gain.clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                }
+                if max_volume_cap.is_finite() {
+                    self.max_volume_cap = max_volume_cap.clamp(0.0, 1.0);
+                }
+            }
             AudioCmd::UpdateEntityPos {
                 entity_id,
                 pos,
@@ -3095,6 +3168,7 @@ impl AudioMixCore {
             pitch,
             attenuation_distance,
             is_2d,
+            category,
         } = voice;
         self.order += 1;
         let order = self.order;
@@ -3121,6 +3195,13 @@ impl AudioMixCore {
         } else {
             0.0
         };
+        // Volume sliders fold in at admission: `master * category[source]`
+        // scales the voice gain only — the vanilla range law above keeps
+        // using the raw packet volume.
+        let gain = (gain
+            * self.master_gain
+            * self.category_gain[category.clamp(0, 9) as usize])
+            .clamp(0.0, 1.0);
         let engine = if is_2d {
             None
         } else {
