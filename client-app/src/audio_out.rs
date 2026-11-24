@@ -2668,6 +2668,7 @@ impl AudioRuntime {
                 pitch: 1.0,
                 attenuation_distance: 0.0,
                 is_2d: true,
+                category: SOUND_CATEGORY_PLAYERS,
             });
         }
         self.submit_play(PlaySoundEvent {
