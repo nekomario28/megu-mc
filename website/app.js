@@ -2709,26 +2709,46 @@
     return "";
   }
 
+  // The exact installer name published for one release target.
+  function installerAssetName(target) {
+    if (!target) {
+      return "";
+    }
+    return "megu-installer-" + target +
+      (target.indexOf("windows-") === 0 ? ".exe" : "");
+  }
+
+  // Exact per-target installer asset only — never a coarse OS fallback, so a
+  // row for a different CPU architecture is never silently rewritten.
+  function exactTargetAsset(assets, target) {
+    if (!Array.isArray(assets) || !target) {
+      return null;
+    }
+    var expectedName = installerAssetName(target);
+    for (var e = 0; e < assets.length; e++) {
+      var exact = assets[e];
+      if (exact && exact.name === expectedName &&
+          typeof exact.url === "string" &&
+          exact.url.indexOf("https://github.com/") === 0) {
+        return exact;
+      }
+    }
+    return null;
+  }
+
   // Pick the best download asset for this visitor's OS and architecture. The cross-platform
   // bootstrapper JAR and Prism/mrpack packs are the graceful fallback when
   // no native installer exists; URLs are re-validated against the GitHub
-  // origin even though /api/latest already fails closed.
+  // origin even though /api/latest already fails closed. The static hrefs in
+  // index.html stay pinned to site-config.js's releaseTag, so a failed fetch
+  // or a prerelease-only channel never leaves a dead "latest/download" link.
   function pickReleaseAsset(assets, target) {
+    var exact = exactTargetAsset(assets, target);
+    if (exact) {
+      return exact;
+    }
     if (!Array.isArray(assets)) {
       return null;
-    }
-    var expectedName = target
-      ? "megu-installer-" + target + (target.indexOf("windows-") === 0 ? ".exe" : "")
-      : "";
-    if (expectedName) {
-      for (var e = 0; e < assets.length; e++) {
-        var exact = assets[e];
-        if (exact && exact.name === expectedName &&
-            typeof exact.url === "string" &&
-            exact.url.indexOf("https://github.com/") === 0) {
-          return exact;
-        }
-      }
     }
     // A coarse OS-only kind can be the wrong CPU architecture. If the exact
     // target asset is absent, use only architecture-neutral fallbacks.
@@ -2791,6 +2811,30 @@
           break;
         }
       }
+    }
+    var prismBtn = $("dl-prism-btn");
+    if (prismBtn && Array.isArray(st.assets)) {
+      for (var p = 0; p < st.assets.length; p++) {
+        var pa = st.assets[p];
+        if (pa && pa.kind === "prism_zip" && typeof pa.url === "string" &&
+            pa.url.indexOf("https://github.com/") === 0) {
+          prismBtn.setAttribute("href", pa.url);
+          break;
+        }
+      }
+    }
+    // Upgrade each pinned installer row to the published asset for the same
+    // exact target; rows the release does not ship keep their pinned href.
+    if (Array.isArray(st.assets) && document.querySelectorAll) {
+      Array.prototype.forEach.call(
+        document.querySelectorAll("[data-release-target]"),
+        function (row) {
+          var rowAsset = exactTargetAsset(
+            st.assets, row.getAttribute("data-release-target"));
+          if (rowAsset) {
+            row.setAttribute("href", rowAsset.url);
+          }
+        });
     }
   }
 

@@ -92,7 +92,7 @@
         </h1>
 
         <p class="lead" data-i18n="hero_lead">
-          Open-source LGPL-3.0 Minecraft: Java Edition 1.21.1 client &amp; server written in Rust. Native Vulkan / DX12 / Metal rendering via wgpu and automatic NeoForge / Fabric mod inspection.
+          Open-source LGPL-3.0 Minecraft: Java Edition 1.21.1 client &amp; server written in Rust. Native Vulkan / DX12 / Metal rendering via wgpu (zero OpenGL), no JVM on either side, and automatic NeoForge / Fabric mod inspection.
         </p>
 
         <div class="hero-kpis" aria-label="Measured highlights">
@@ -126,7 +126,7 @@
             <button class="dl-tab active" id="tab-client" role="tab" type="button"
                     aria-selected="true" aria-controls="panel-client" data-dl-tab="client">
               <span class="dl-tab-title" data-i18n="dl_tab_client">Players · Client</span>
-              <span class="dl-tab-sub" data-i18n="dl_tab_client_sub">Pure wgpu · Vulkan / DX12 / Metal</span>
+              <span class="dl-tab-sub" data-i18n="dl_tab_client_sub">Pure wgpu · Zero OpenGL · Zero JVM</span>
             </button>
             <button class="dl-tab" id="tab-server" role="tab" type="button"
                     aria-selected="false" aria-controls="panel-server" data-dl-tab="server">
@@ -147,9 +147,12 @@
                   <span class="dl-badge accent">1-Click Installer</span>
                   <span class="dl-badge" id="dl-os-badge">Windows .exe · Linux · macOS</span>
                 </div>
-                <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Standalone Client</h3>
+                <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Native wgpu Client</h3>
                 <p data-i18n="dl_client_body">
-                  megu-installer needs no Java and supports GUI (double-click or megu-installer gui) and CLI modes. It registers Megu 1.21.1 in the Official Launcher and stages the native wgpu client. Windows requires Windows 10/11; macOS requires macOS 11 or later.
+                  megu-installer needs no Java. GUI (double-click or megu-installer gui) and CLI modes register the Megu (1.21.1) profile in the Official Launcher and stage megu-client-gpu, the native client. Windows requires Windows 10/11; macOS requires macOS 11 or later.
+                </p>
+                <p class="section-note" data-i18n="dl_client_zero_manual">
+                  Zero manual steps: megu-client-gpu is pure wgpu (Vulkan / DX12 / Metal) with zero OpenGL and zero JVM. On first launch it reuses an existing Vanilla 1.21.1 install when present, otherwise downloads the client JAR from Mojang's official HTTPS hosts, verifies SHA-1, and starts.
                 </p>
                 <div class="dl-meta-row">
                   <span class="dl-chip">1.21.1</span>
@@ -166,14 +169,14 @@
                 <table class="data-table" id="release-targets">
                   <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
                   <tbody>
-                    <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64" data-release-target="linux-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-arm64" data-release-target="linux-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>Linux x86_64 (musl)</td><td data-i18n="dl_linux_musl_note">Alpine and other musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-x86_64-musl" data-release-target="linux-x86_64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>Linux ARM64 (musl)</td><td data-i18n="dl_linux_arm_musl_note">64-bit ARM musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-linux-arm64-musl" data-release-target="linux-arm64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>macOS Apple Silicon (arm64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-arm64" data-release-target="macos-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>macOS Intel (x86_64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-macos-x86_64" data-release-target="macos-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
-                    <tr><td>Windows x64</td><td data-i18n="dl_windows_note">Windows 10/11 · Intel/AMD 64-bit</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-x86_64.exe" data-release-target="windows-x86_64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
-                    <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-installer-windows-arm64.exe" data-release-target="windows-arm64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
+                    <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-x86_64" data-release-target="linux-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-arm64" data-release-target="linux-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux x86_64 (musl)</td><td data-i18n="dl_linux_musl_note">Alpine and other musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-x86_64-musl" data-release-target="linux-x86_64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Linux ARM64 (musl)</td><td data-i18n="dl_linux_arm_musl_note">64-bit ARM musl Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-linux-arm64-musl" data-release-target="linux-arm64-musl" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>macOS Apple Silicon (arm64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-macos-arm64" data-release-target="macos-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>macOS Intel (x86_64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-macos-x86_64" data-release-target="macos-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
+                    <tr><td>Windows x64</td><td data-i18n="dl_windows_note">Windows 10/11 · Intel/AMD 64-bit</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-windows-x86_64.exe" data-release-target="windows-x86_64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
+                    <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-installer-windows-arm64.exe" data-release-target="windows-arm64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
                   </tbody>
                 </table>
                 <p class="section-note" data-i18n="dl_targets_caveat">Linux architecture is detected locally; choose the musl build for Alpine/musl systems. Linux distribution names indicate likely libc families and are not a compatibility guarantee.</p>
@@ -189,9 +192,9 @@ curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/inst
                   Import megu-1.21.1.mrpack into Modrinth App or megu-prism-1.21.1.zip into Prism Launcher. You can also run megu-installer prism.
                 </p>
                 <div class="dl-actions">
-                  <a class="btn primary" id="dl-mrpack-btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-1.21.1.mrpack"
+                  <a class="btn primary" id="dl-mrpack-btn" href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-1.21.1.mrpack"
                      target="_blank" rel="noopener noreferrer" data-i18n="dl_mrpack_btn">Modrinth App (.mrpack)</a>
-                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases/latest/download/megu-prism-1.21.1.zip"
+                  <a class="btn" id="dl-prism-btn" href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-prism-1.21.1.zip"
                      target="_blank" rel="noopener noreferrer" data-i18n="dl_prism_zip_btn">Prism Launcher (.zip)</a>
                   <a class="btn" href="#checker" data-i18n="dl_check_pack_btn">Pre-flight your Modpack</a>
                 </div>
@@ -210,13 +213,30 @@ megu-installer prism</code></pre>
                 </div>
                 <h3 data-i18n="dl_server_title">Megu Dedicated Server (megu)</h3>
                 <p data-i18n="dl_server_body">
-                  Standalone Rust binary for 1.21.1 with online-mode AES-CFB8 auth, Velocity Modern Forwarding, RCON, and async backups.
+                  Dedicated server binary (megu) for 1.21.1 with online-mode AES-CFB8 auth, Velocity Modern Forwarding, RCON, and async backups. The server is a separate Rust binary from the native client and needs no JVM.
                 </p>
                 <div class="dl-actions">
                   <a class="btn primary" href="https://github.com/nekomario28/megu-mc/releases"
                      data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_server_btn">Get Server Binaries</a>
                   <a class="btn" href="#quickstart" data-i18n="dl_qs_jump">3-Step Quickstart</a>
                 </div>
+                <h4 data-i18n="dl_server_archive_title">All 8 full server archive targets</h4>
+                <table class="data-table" id="server-archives">
+                  <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
+                  <tbody>
+                    <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-x86_64.tar.gz" data-server-archive="linux-x86_64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-arm64.tar.gz" data-server-archive="linux-arm64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>Linux x86_64 (musl)</td><td data-i18n="dl_server_only_note">Static · server-only (megu + megu-installer)</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-x86_64-musl.tar.gz" data-server-archive="linux-x86_64-musl" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>Linux ARM64 (musl)</td><td data-i18n="dl_server_only_note">Static · server-only (megu + megu-installer)</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-linux-arm64-musl.tar.gz" data-server-archive="linux-arm64-musl" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>macOS Apple Silicon (arm64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-arm64.tar.gz" data-server-archive="macos-arm64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>macOS Intel (x86_64)</td><td data-i18n="dl_macos_note">macOS 11 or later</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-macos-x86_64.tar.gz" data-server-archive="macos-x86_64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>Windows x64</td><td data-i18n="dl_windows_note">Windows 10/11 · Intel/AMD 64-bit</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-windows-x86_64.tar.gz" data-server-archive="windows-x86_64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                    <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.2/megu-v0.1.0-alpha.2-windows-arm64.tar.gz" data-server-archive="windows-arm64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
+                  </tbody>
+                </table>
+                <p class="section-note" data-i18n="dl_server_archive_note">
+                  Non-musl archives bundle megu (dedicated server) with megu-client-gpu, megu-client, megu-installer, megu-mod-check, megu-world-migrate, megu-init, and megu-admin. The static musl archives are server-only: megu + megu-installer.
+                </p>
               </div>
               <div class="dl-card">
                 <div class="dl-card-head">
@@ -385,9 +405,9 @@ megu-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json</code></pre>
             </p>
           </article>
           <article class="pillar">
-            <h3 data-i18n="p4_title">Standalone CLI binaries</h3>
+            <h3 data-i18n="p4_title">Standalone binaries</h3>
             <p data-i18n="p4_body">
-              The five tools are megu (server), megu-client (client utilities), megu-mod-check (inspect/adapt/scaffold), megu-world-migrate (1.21.1 ↔ 26.3), and megu-init (server setup with explicit EULA acceptance).
+              The eight binaries are megu (dedicated server), megu-client-gpu (native wgpu game client), megu-client (headless client utilities), megu-installer (launcher setup), megu-mod-check (inspect/adapt/scaffold), megu-world-migrate (1.21.1 ↔ 26.3), megu-init (server setup with explicit EULA acceptance), and megu-admin.
             </p>
           </article>
         </div>
@@ -447,6 +467,7 @@ megu-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json</code></pre>
     <section id="quickstart">
       <div class="wrap">
         <h2 data-i18n="qs_title">Start a server with explicit EULA acceptance</h2>
+        <p class="section-note" data-i18n="qs_client_note">The native client needs no manual setup: install megu-installer, pick the Megu (1.21.1) profile, and let the first launch fetch SHA-1-verified Vanilla assets automatically.</p>
         <div class="steps">
           <div class="step">
             <div class="step-label" data-i18n="qs_1">1. Initialize for 1.21.1 and accept the EULA explicitly</div>
@@ -510,7 +531,7 @@ megu-client --ping localhost:25565</code></pre>
             <ul>
               <li data-i18n="scope_now_1">Vanilla 1.21.1 protocol, online-mode AES-CFB8 auth, and Velocity modern forwarding</li>
               <li data-i18n="scope_now_2">Deterministic worldgen, random ticks, villagers, commands, ops/bans/whitelist, RCON, and async backups</li>
-              <li data-i18n="scope_now_3">Twelve standalone crates (eleven without third-party dependencies and isolated client-gpu), plus five CLI tools for server, client, mod inspection/adaptation, world migration, and setup</li>
+              <li data-i18n="scope_now_3">Twelve standalone crates (eleven without third-party dependencies plus the isolated client-gpu), plus eight released binaries: megu, megu-client-gpu, megu-client, megu-installer, megu-mod-check, megu-world-migrate, megu-init, and megu-admin</li>
             </ul>
           </div>
           <div class="scope-col">
@@ -732,7 +753,7 @@ megu-client --ping localhost:25565</code></pre>
       nav_mods: "Mod・シェーダー",
       nav_support: "支援・法人",
       hero_headline: "Rust + wgpu の Minecraft 1.21.1 エンジン。",
-      hero_lead: "Minecraft: Java Edition 1.21.1 向けのオープンソース（LGPL-3.0）Rust 製クライアント＆サーバー。wgpu（Vulkan / DX12 / Metal）ネイティブ描画と NeoForge / Fabric Mod の自動検査・適応を備えます。",
+      hero_lead: "Minecraft: Java Edition 1.21.1 向けのオープンソース（LGPL-3.0）Rust 製クライアント＆サーバー。wgpu（Vulkan / DX12 / Metal）ネイティブ描画（OpenGL 不要）、双方とも JVM 不要、NeoForge / Fabric Mod の自動検査・適応を備えます。",
       kpi_ram_unit: "バニラ比で省メモリ",
       kpi_ram_sub: "122 MiB vs バニラ 1,168 MiB（1.21.1 サーバー実測）",
       cta_download: "Megu を入手",
@@ -743,13 +764,14 @@ megu-client --ping localhost:25565</code></pre>
       dl_desc: "用途に合わせて選択できます — 純 wgpu クライアント、JSON API 付き Rust 専用サーバー、または NeoForge / Fabric Mod 検査＆ネイティブ雛形生成。",
       dl_tabs_aria: "配布ターゲットを選択",
       dl_tab_client: "プレイヤー・クライアント",
-      dl_tab_client_sub: "純 wgpu · Vulkan / DX12 / Metal",
+      dl_tab_client_sub: "純 wgpu · OpenGL 不要 · JVM 不要",
       dl_tab_server: "サーバー・ホスティング",
       dl_tab_server_sub: "122 MiB RAM · /api/latest",
       dl_tab_dev: "Mod 作者・MDK",
       dl_tab_dev_sub: "JAR 検査 · ネイティブ雛形",
-      dl_client_title: "1. 公式ランチャー＆単体クライアント（1 クリック導入）",
-      dl_client_body: "megu-installer は Java 不要で、GUI（ダブルクリックまたは megu-installer gui）と CLI の両方に対応します。公式ランチャーへの Megu 1.21.1 プロファイル登録とネイティブ wgpu クライアント配置を自動で行います。Windows は Windows 10/11、macOS は macOS 11 以降が必要です。",
+      dl_client_title: "1. 公式ランチャー＆ネイティブ wgpu クライアント",
+      dl_client_body: "megu-installer は Java 不要です。GUI（ダブルクリックまたは megu-installer gui）と CLI の両モードで、公式ランチャーに Megu (1.21.1) プロファイルを登録し、ネイティブクライアント megu-client-gpu を配置します。Windows は Windows 10/11、macOS は macOS 11 以降が必要です。",
+      dl_client_zero_manual: "手動設定は不要です。megu-client-gpu は Vulkan / DX12 / Metal 対応の純 wgpu クライアントで、OpenGL も JVM も使いません。初回起動時は既存の Vanilla 1.21.1 を再利用し、無い場合は Mojang 公式 HTTPS ホストからクライアント JAR を取得して SHA-1 を検証してから起動します。",
       dl_releases_btn: "この端末向けの推奨版",
       dl_linux_installer_btn: "Linux x86_64",
       dl_macos_installer_btn: "macOS arm64",
@@ -773,7 +795,10 @@ megu-client --ping localhost:25565</code></pre>
       dl_client_src_title: "2. Modpack として 1 発インポート（.mrpack / .zip）",
       dl_client_src_body: "Modrinth App には megu-1.21.1.mrpack、Prism Launcher には megu-prism-1.21.1.zip をインポートしてください。megu-installer prism でも導入できます。",
       dl_server_title: "Megu 専用サーバー（megu）",
-      dl_server_body: "1.21.1 対応の単体 Rust バイナリ。online-mode AES-CFB8 認証、Velocity Modern Forwarding、RCON、非同期バックアップを搭載しています。",
+      dl_server_body: "1.21.1 対応の専用サーバーバイナリ（megu）。online-mode AES-CFB8 認証、Velocity Modern Forwarding、RCON、非同期バックアップを搭載します。ネイティブクライアントとは別の Rust バイナリで、JVM は不要です。",
+      dl_server_archive_title: "サーバー用フルアーカイブ 8 種",
+      dl_server_only_note: "静的リンク · サーバー専用（megu + megu-installer）",
+      dl_server_archive_note: "musl 以外のアーカイブには megu（専用サーバー）と megu-client-gpu・megu-client・megu-installer・megu-mod-check・megu-world-migrate・megu-init・megu-admin が同梱されます。静的リンクの musl 版はサーバー専用（megu + megu-installer）です。",
       dl_server_btn: "サーバーバイナリを入手",
       dl_qs_jump: "3 ステップ起動手順へ",
       dl_api_title: "管理パネル・自動更新用 JSON API",
@@ -812,8 +837,8 @@ megu-client --ping localhost:25565</code></pre>
       p2_body: "クライアントにはプロトコル Ping、Magic/VFX/Animation/Combat-Motion 処理、保守的なシェーダーパック機能計画があります。独立した client-gpu には winit + wgpu の実ウィンドウ／オフスクリーン描画があり、AMD RX 7800 XT（RADV）で非空の Vulkan オフスクリーン描画を確認した記録があります。",
       p3_title: "起動時の Mod 自動適応",
       p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 54 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
-      p4_title: "独立した 5 個の CLI バイナリ",
-      p4_body: "megu（サーバー）、megu-client（クライアント補助）、megu-mod-check（検査・適応・雛形生成）、megu-world-migrate（1.21.1 ↔ 26.3 のワールド移行）、megu-init（EULA 明示同意付き初期化）を提供します。",
+      p4_title: "独立バイナリ",
+      p4_body: "8 個のバイナリは megu（専用サーバー）、megu-client-gpu（ネイティブ wgpu ゲームクライアント）、megu-client（ヘッドレスなクライアント補助）、megu-installer（ランチャー導入）、megu-mod-check（検査・適応・雛形生成）、megu-world-migrate（1.21.1 ↔ 26.3 のワールド移行）、megu-init（EULA 明示同意付きサーバー初期化）、megu-admin です。",
       mods_title: "Mod の自動適応とネイティブ制作",
       mods_intro: "既存の NeoForge / Fabric JAR を mods/ に配置すると、起動時に自動解析されます。Rust の live_mod_bridge / auto_adapter は、置き換え済み軽量化 Mod のスキップと、対応するデータ・調理・Mixin の JVM 不要な変換を試みます。",
       mods_auto_title: "起動時に自動分類",
@@ -829,6 +854,7 @@ megu-client --ping localhost:25565</code></pre>
       shader_dh_body: "DistantHorizons LOD の dh_shadow・dh_terrain・dh_water パスを扱います。ネイティブ WGSL パックは megu-shader.toml のパス宣言と .wgsl ファイルを使用します。",
       shader_boundary: "シェーダーパックの対応範囲は現時点で解析・フォールバック計画です。winit + wgpu の GPU クライアントは実装済みですが、第三者シェーダーの描画再現度とサーバー／Modpack での相互運用は未検証です。",
       qs_title: "EULA に明示同意してサーバーを開始",
+      qs_client_note: "ネイティブクライアント側の手動設定はありません。megu-installer で導入し、Megu (1.21.1) プロファイルを選ぶだけで、初回起動時に SHA-1 検証済みの Vanilla アセットを自動取得します。",
       qs_1: "1. 1.21.1 用のサーバーを初期化し、EULA に明示同意",
       qs_2: "2. 必要なら mods/ を JVM 不要でスキャン",
       qs_3: "3. サーバーディレクトリから起動",
@@ -837,7 +863,7 @@ megu-client --ping localhost:25565</code></pre>
       scope_now_h: "Alpha で動作するもの",
       scope_now_1: "Vanilla 1.21.1 プロトコル、online-mode AES-CFB8 認証、Velocity Modern Forwarding",
       scope_now_2: "決定論的ワールド生成、ランダムティック、村人・取引、管理コマンド、ops/BAN/ホワイトリスト、RCON、非同期バックアップ",
-      scope_now_3: "独立した 12 クレート（外部依存ゼロの 11 クレート＋分離した client-gpu）と、サーバー・クライアント補助・Mod 検査／適応・ワールド移行・初期化の 5 個の CLI",
+      scope_now_3: "独立した 12 クレート（外部依存ゼロの 11 クレート＋分離した client-gpu）と、リリースされる 8 バイナリ（megu、megu-client-gpu、megu-client、megu-installer、megu-mod-check、megu-world-migrate、megu-init、megu-admin）",
       scope_wip_h: "開発中・対象外",
       scope_wip_1: "一般シードの地形生成とゲームプレイ全体の完全 Vanilla パリティ",
       scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",

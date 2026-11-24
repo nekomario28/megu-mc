@@ -16,7 +16,11 @@ Checks, all fail-closed:
      tools/provenance_check.py appear anywhere under website/ (they are
      assembled below without writing them contiguously, so this script
      does not flag itself).
-  4. website/site-config.js declares every required SITE_CONFIG key.
+  4. website/site-config.js declares every required SITE_CONFIG key, and
+     every static download href is pinned to its `releaseTag`. GitHub's
+     /releases/latest redirect only points at a *stable* release, so while
+     only prereleases exist that URL (and each asset below it) answers
+     404 — this check makes the pinned-vs-latest regression fail closed.
   5. When `node` is on PATH, a unit harness exercises the modpack checker,
      bounded ZIP extraction, and the feedback report builder, client-side
      redaction, 4 KiB cap, and pre-filled GitHub fallback links.
@@ -56,6 +60,7 @@ REQUIRED_CONFIG_KEYS = (
     "mcTargets",
     "githubUrl",
     "releasesUrl",
+    "releaseTag",
     "docsBaseUrl",
     "customDomain",
 )
@@ -234,8 +239,17 @@ def check_forbidden_names():
     return findings
 
 
+def pinned_release_tag(config_text):
+    """Return the release tag site-config.js pins static downloads to."""
+    match = re.search(r'\breleaseTag\s*:\s*"([^"]+)"', config_text)
+    return match.group(1) if match else ""
+
+
+RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$")
+
+
 def check_site_config_keys():
-    """Check 4: site configuration and EN/JA markup copies are complete."""
+    """Check 4: site configuration, EN/JA copies, pinned download links."""
     cfg = WEBSITE / "site-config.js"
     if not cfg.is_file():
         return ["website/site-config.js is missing"]
@@ -245,6 +259,14 @@ def check_site_config_keys():
         for key in REQUIRED_CONFIG_KEYS
         if not re.search(rf"\b{re.escape(key)}\s*:", text)
     ]
+    release_tag = pinned_release_tag(text)
+    if not release_tag:
+        findings.append(
+            "site-config.js does not declare a pinned 'releaseTag'")
+    elif not RELEASE_TAG_RE.match(release_tag):
+        findings.append(
+            f"site-config.js releaseTag '{release_tag}' is not a pinned "
+            "version tag (expected e.g. v0.1.0-alpha.2)")
     markup = (WEBSITE / "index.html").read_text(encoding="utf-8")
     ja = re.search(r"var JA\s*=\s*\{(.*?)\n\s*\};", markup, re.S)
     if not ja:
@@ -255,18 +277,23 @@ def check_site_config_keys():
         r'data-i18n(?:-placeholder|-aria-label)?="([a-z0-9_]+)"', markup))
     for key in sorted(referenced - keys):
         findings.append(f"index.html is missing JA copy for '{key}'")
+
+    base = (f"https://github.com/nekomario28/megu-mc/releases/download/"
+            f"{release_tag}/")
     client_start = markup.find('id="panel-client"')
     client_end = markup.find('id="panel-server"')
+    dev_start = markup.find('id="panel-dev"')
     if client_start == -1 or client_end <= client_start:
         findings.append("index.html is missing the player download panel")
     else:
         client_panel = markup[client_start:client_end]
-        base = "https://github.com/nekomario28/megu-mc/releases/latest/download/"
         for filename in (*RELEASE_TARGETS.values(),
                          "megu-1.21.1.mrpack",
                          "megu-prism-1.21.1.zip"):
             if f'href="{base}{filename}"' not in client_panel:
-                findings.append(f"player downloads are missing direct link for {filename}")
+                findings.append(
+                    f"player downloads must link {filename} from the pinned "
+                    f"{release_tag} release")
         for target, filename in RELEASE_TARGETS.items():
             expected = (f'href="{base}{filename}" data-release-target="{target}"')
             if expected not in client_panel:
@@ -284,6 +311,8 @@ def check_site_config_keys():
         ):
             if requirement not in client_panel:
                 findings.append(f"player downloads are missing platform requirement: {requirement}")
+        if "curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh" not in client_panel:
+            findings.append("player downloads are missing the Linux one-line installer")
         workflow = (ROOT / ".github/workflows/release.yml")
         if not workflow.is_file():
             findings.append("release workflow is missing; cannot validate target names")
@@ -299,8 +328,44 @@ def check_site_config_keys():
             if workflow_targets != set(RELEASE_TARGETS):
                 findings.append(
                     "website release target list does not match .github/workflows/release.yml")
-        if "curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh" not in client_panel:
-            findings.append("player downloads are missing the Linux one-line installer")
+
+    if client_end == -1 or dev_start <= client_end:
+        findings.append("index.html is missing the server download panel")
+    else:
+        server_panel = markup[client_end:dev_start]
+        for target in RELEASE_TARGETS:
+            archive = f"megu-{release_tag}-{target}.tar.gz"
+            expected = (f'href="{base}{archive}" '
+                        f'data-server-archive="{target}"')
+            if expected not in server_panel:
+                findings.append(
+                    f"server download mapping for {target} must link to {archive}")
+        archive_attrs = re.findall(r'data-server-archive="([^"]+)"', server_panel)
+        if (len(archive_attrs) != len(RELEASE_TARGETS)
+                or set(archive_attrs) != set(RELEASE_TARGETS)):
+            findings.append(
+                "server downloads must expose each of the 8 release targets exactly once")
+
+    # GitHub 404s /releases/latest (and therefore every asset URL under
+    # that redirect) while the repository publishes only
+    # prereleases. Assembled piecewise so this scanner never flags itself.
+    broken_latest = (
+        "releases/" "latest/download/",
+        "github.com/" "nekomario28/megu-mc/releases/" "latest",
+    )
+    for path in sorted(WEBSITE.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for needle in broken_latest:
+            if needle in body:
+                findings.append(
+                    f"{path.relative_to(WEBSITE)}: '{needle}' resolves to 404 "
+                    "while only prereleases exist — pin the release tag instead")
+
     for required in (
         "Runs 100% locally in your browser — nothing is uploaded.",
         "ブラウザ内で完結します — ファイルは一切送信されません。",

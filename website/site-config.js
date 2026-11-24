@@ -40,6 +40,16 @@
     // Canonical repository and derived links.
     githubUrl: "https://github.com/nekomario28/megu-mc",
     releasesUrl: "https://github.com/nekomario28/megu-mc/releases",
+
+    // Pinned release tag behind every static download link in index.html.
+    // GitHub's /releases/latest redirect only resolves to a *stable* release,
+    // so while the project ships prereleases (alpha/beta) it returns 404 and
+    // every "latest/download" href would be dead without JavaScript. The
+    // static hrefs therefore point at this exact published tag, and app.js
+    // upgrades them to /api/latest when that endpoint is reachable. Bump this
+    // and the matching index.html hrefs together; website/check_site.py fails
+    // closed when they disagree.
+    releaseTag: "v0.1.0-alpha.2",
     docsBaseUrl: "https://github.com/nekomario28/megu-mc/tree/main/docs",
 
     // Optional custom domain once the brand name is final, e.g.
