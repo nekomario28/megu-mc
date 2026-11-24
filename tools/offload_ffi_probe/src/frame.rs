@@ -3,53 +3,8 @@ pub const MAX_FRAME: usize = 64 * 1024;
 const MAGIC: u32 = 0x3546_464f; // OFF5, little endian
 const MAX_RECORDS: usize = 4096;
 
-const fn crc_tables() -> [[u32; 256]; 8] {
-    let mut tables = [[0; 256]; 8];
-    let mut byte = 0;
-    while byte < 256 {
-        let mut crc = byte as u32;
-        let mut bit = 0;
-        while bit < 8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
-            bit += 1;
-        }
-        tables[0][byte] = crc;
-        byte += 1;
-    }
-    let mut lane = 1;
-    while lane < 8 {
-        let mut byte = 0;
-        while byte < 256 {
-            let crc = tables[lane - 1][byte];
-            tables[lane][byte] = (crc >> 8) ^ tables[0][(crc & 255) as usize];
-            byte += 1;
-        }
-        lane += 1;
-    }
-    tables
-}
-
-static CRC_TABLES: [[u32; 256]; 8] = crc_tables();
-
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    let (chunks, tail) = bytes.as_chunks::<8>();
-    for chunk in chunks {
-        let word = u64::from_le_bytes(*chunk) ^ u64::from(crc);
-        let [a, b, c, d, e, f, g, h] = word.to_le_bytes().map(usize::from);
-        crc = CRC_TABLES[7][a]
-            ^ CRC_TABLES[6][b]
-            ^ CRC_TABLES[5][c]
-            ^ CRC_TABLES[4][d]
-            ^ CRC_TABLES[3][e]
-            ^ CRC_TABLES[2][f]
-            ^ CRC_TABLES[1][g]
-            ^ CRC_TABLES[0][h];
-    }
-    for &byte in tail {
-        crc = (crc >> 8) ^ CRC_TABLES[0][((crc as u8) ^ byte) as usize];
-    }
-    !crc
+    megu_core::hash::crc32_ieee(bytes)
 }
 
 fn u16at(b: &[u8], i: usize) -> usize {

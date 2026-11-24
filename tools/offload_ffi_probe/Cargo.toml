@@ -10,3 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 mod_offload = { package = "mod-offload", path = "../../mod-offload" }
+megu_core = { package = "megu-core", path = "../../core" }
