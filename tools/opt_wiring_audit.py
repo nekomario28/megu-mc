@@ -429,6 +429,10 @@ def _call(name):
     return {"kind": "call", "name": name}
 
 
+def _call_any(*names):
+    return {"kind": "call_any", "names": list(names)}
+
+
 CHECKS = [
     # -- Client GPU / rendering hot paths -------------------------------
     {"id": "opt-gpu-compute-strategy",
@@ -444,9 +448,13 @@ CHECKS = [
      "file": WINDOW_RS,
      "requirements": [_call("sync_external_sections_from")]},
     {"id": "opt-entity-ber-mesh-upload",
-     "summary": "entity + BER instanced meshes uploaded every frame",
+     "summary": "entity + BER instanced meshes uploaded every frame (world-lit)",
      "file": WINDOW_RS,
-     "requirements": [_call("set_entity_and_ber_meshes")]},
+     "requirements": [_call_any(
+         "set_lit_entity_ber_quads",
+         "set_entity_and_ber_meshes_lit",
+         "set_entity_and_ber_meshes",
+     )]},
     {"id": "opt-particle-billboards",
      "summary": "particle billboard quads uploaded every frame",
      "file": WINDOW_RS,
@@ -776,6 +784,11 @@ def _eval_requirement(requirement, code, raw):
         if call_sites(code, name):
             return True, ""
         return False, f"{name}: no non-test call site"
+    if kind == "call_any":
+        names = requirement["names"]
+        if any(call_sites(code, name) for name in names):
+            return True, ""
+        return False, "no non-test call site for any of: " + ", ".join(names)
     if kind == "simd_guards":
         violations = simd_guard_violations(code, raw)
         if violations:

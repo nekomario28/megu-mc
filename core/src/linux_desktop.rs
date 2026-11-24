@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn linux_xdg_absolute_paths_are_respected() {
         let env = env_with(&[
-            ("HOME", "/home/yuu"),
+            ("HOME", "/home/player"),
             ("XDG_CONFIG_HOME", "/cfg"),
             ("XDG_DATA_HOME", "/data"),
             ("XDG_CACHE_HOME", "/cache"),
@@ -477,23 +477,23 @@ mod tests {
     #[test]
     fn linux_relative_and_empty_xdg_values_fall_back() {
         let env = env_with(&[
-            ("HOME", "/home/yuu"),
+            ("HOME", "/home/player"),
             ("XDG_CONFIG_HOME", "relative/cfg"),
             ("XDG_DATA_HOME", ""),
             ("XDG_CACHE_HOME", "./cache"),
             ("XDG_RUNTIME_DIR", "relative/run"),
         ]);
         let p = resolve_paths_with_env(TargetOs::Linux, None, env);
-        assert_eq!(p.config_dir, PathBuf::from("/home/yuu/.config/megu"));
-        assert_eq!(p.data_dir, PathBuf::from("/home/yuu/.local/share/megu"));
-        assert_eq!(p.cache_dir, PathBuf::from("/home/yuu/.cache/megu"));
+        assert_eq!(p.config_dir, PathBuf::from("/home/player/.config/megu"));
+        assert_eq!(p.data_dir, PathBuf::from("/home/player/.local/share/megu"));
+        assert_eq!(p.cache_dir, PathBuf::from("/home/player/.cache/megu"));
         assert_eq!(p.runtime_dir, None);
     }
 
     #[test]
     fn game_dir_override_wins_and_stays_inside_the_instance() {
         let env = env_with(&[
-            ("HOME", "/home/yuu"),
+            ("HOME", "/home/player"),
             ("XDG_CONFIG_HOME", "/cfg"),
             ("XDG_RUNTIME_DIR", "/run/user/1000"),
         ]);

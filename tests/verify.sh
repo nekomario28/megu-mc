@@ -111,6 +111,7 @@ python3 tests/release_workflow_test.py
 python3 tests/alpha_release_smoke.py --self-test
 python3 tests/multi_mod_e2e_wire.py --self-test
 python3 tests/magic_vfx_anim_live_wire.py --self-test
+python3 tests/modpack_kitchen_sink_e2e.py
 python3 tests/dev_check_test.py
 python3 tests/megu_translate_test.py
 python3 tests/megu_bench_test.py
@@ -146,6 +147,12 @@ python3 tools/opt_wiring_audit.py
 # any bridge-module entrypoint with zero production callers fails here unless
 # it is waived with a reason in audit/wiring_connectivity_waivers.json.
 python3 tools/wiring_connectivity_audit.py
+# The hardcode and security-invariant audits are real gates, not reports: both
+# fail closed on a weakened guard or a new violation class.
+python3 tools/hardcode_guard_audit.py
+python3 tests/hardcode_guard_test.py
+python3 tools/security_invariants_audit.py
+python3 tests/security_invariants_test.py
 python3 tests/docker_entrypoint_test.py
 python3 tests/install_linux_test.py
 python3 tests/installer_cross_os_test.py
