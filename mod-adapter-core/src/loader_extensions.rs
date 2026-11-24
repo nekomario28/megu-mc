@@ -808,6 +808,276 @@ pub fn inspect_jar_in_jar(
     Ok(scan)
 }
 
+/// Fabric Jar-in-Jar member prefix (`META-INF/jars/*.jar`).
+///
+/// [`JAR_IN_JAR_MEMBER_PREFIX`] is the NeoForge/Forge `jarjar` layout;
+/// Fabric Loader nests bundled mods under `META-INF/jars/` and declares
+/// them in `fabric.mod.json`'s `jars[]` array.
+pub const JAR_IN_JAR_FABRIC_MEMBER_PREFIX: &str = "META-INF/jars/";
+
+/// Deepest embedded-JAR nesting level whose *contents* the auto-adapter
+/// data pipeline extracts: direct children of the scanned archive are
+/// depth 1, their children depth 2, and anything deeper is rejected —
+/// stricter than the inspection-only [`MAX_JAR_IN_JAR_DEPTH`] so a
+/// content-extraction pass cannot be turned into a deep decompression
+/// chain.
+pub const MAX_JAR_IN_JAR_EXTRACT_DEPTH: usize = 2;
+
+/// Validate an embedded-JAR member path under either Jar-in-Jar layout:
+/// must live under [`JAR_IN_JAR_MEMBER_PREFIX`] (NeoForge) or
+/// [`JAR_IN_JAR_FABRIC_MEMBER_PREFIX`] (Fabric), end in `.jar`, and must
+/// not contain a leading `/`, `\\`, `..`/`.`/empty segments, or NUL
+/// bytes — fail closed on every path-traversal or non-JAR shape.
+pub fn validate_embedded_jar_path(path: &str) -> Result<(), LoaderExtensionError> {
+    if path.is_empty() || path.len() > 512 {
+        return Err(err("jar-in-jar: invalid embedded path length"));
+    }
+    if path.bytes().any(|b| b == 0) {
+        return Err(err("jar-in-jar: NUL byte in embedded path"));
+    }
+    if path.starts_with('/') || path.contains('\\') {
+        return Err(err(format!(
+            "jar-in-jar: path traversal rejected in '{path}'"
+        )));
+    }
+    if !path.starts_with(JAR_IN_JAR_MEMBER_PREFIX)
+        && !path.starts_with(JAR_IN_JAR_FABRIC_MEMBER_PREFIX)
+    {
+        return Err(err(format!(
+            "jar-in-jar: embedded path '{path}' is outside {JAR_IN_JAR_MEMBER_PREFIX} or {JAR_IN_JAR_FABRIC_MEMBER_PREFIX}"
+        )));
+    }
+    for seg in path.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(err(format!(
+                "jar-in-jar: path traversal rejected in '{path}'"
+            )));
+        }
+    }
+    if !path.ends_with(".jar") {
+        return Err(err(format!(
+            "jar-in-jar: embedded path '{path}' is not a .jar member"
+        )));
+    }
+    Ok(())
+}
+
+/// Normalize one `fabric.mod.json` `jars[]` `file`/`path` value onto an
+/// embedded-JAR member path: a bare file name resolves under
+/// [`JAR_IN_JAR_FABRIC_MEMBER_PREFIX`], an absolute-in-archive path must
+/// already sit under a recognized Jar-in-Jar prefix. `None` when the
+/// value cannot name a valid embedded JAR.
+fn normalize_fabric_jar_path(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains('\\') || value.contains('\0') {
+        return None;
+    }
+    let candidate = if value.contains('/') {
+        value.trim_start_matches('/').to_string()
+    } else {
+        format!("{JAR_IN_JAR_FABRIC_MEMBER_PREFIX}{value}")
+    };
+    validate_embedded_jar_path(&candidate).ok()?;
+    Some(candidate)
+}
+
+/// Sorted, deduplicated, validated member paths of every embedded JAR
+/// one archive level carries — the union of:
+///
+/// - every `.jar` member present under [`JAR_IN_JAR_MEMBER_PREFIX`] or
+///   [`JAR_IN_JAR_FABRIC_MEMBER_PREFIX`] (present-member discovery covers
+///   archives that ship nested JARs without usable declarations);
+/// - every `path` declared by `META-INF/jarjar/metadata.json`;
+/// - every `file`/`path` declared by `fabric.mod.json`'s `jars[]`.
+///
+/// Only paths that exist as members of this archive level are returned.
+/// Present-but-malformed member names fail [`validate_embedded_jar_path`]
+/// and are skipped (never extracted); a corrupt `metadata.json` is a
+/// hard error, matching [`inspect_jar_in_jar`]'s fail-closed contract.
+pub(crate) fn embedded_jar_paths(
+    entries: &[ZipMemberEntry],
+    jar_bytes: &[u8],
+    display: &str,
+) -> Result<Vec<String>, LoaderExtensionError> {
+    let mut paths = BTreeSet::new();
+    for entry in entries {
+        let name = entry.name.as_str();
+        if name.ends_with(".jar")
+            && (name.starts_with(JAR_IN_JAR_MEMBER_PREFIX)
+                || name.starts_with(JAR_IN_JAR_FABRIC_MEMBER_PREFIX))
+            && validate_embedded_jar_path(name).is_ok()
+        {
+            paths.insert(name.to_string());
+        }
+    }
+    if let Some(meta_entry) = entries.iter().find(|e| e.name == JAR_IN_JAR_METADATA_PATH) {
+        let meta_bytes = modpack::read_zip_member(jar_bytes, meta_entry, display)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?;
+        for desc in parse_jarjar_metadata(&meta_bytes)
+            .map_err(|e| err(format!("{display}: {}", e.reason())))?
+        {
+            paths.insert(desc.path);
+        }
+    }
+    if let Some(fabric_entry) = entries.iter().find(|e| e.name == "fabric.mod.json") {
+        // The `jars[]` declaration is advisory for extraction: a corrupt
+        // or non-array value simply falls back to present-member
+        // discovery — the primary manifest scan already rejects a
+        // malformed fabric.mod.json upstream.
+        if let Ok(bytes) = modpack::read_zip_member(jar_bytes, fabric_entry, display) {
+            if let Ok(doc) = parse_json(&bytes) {
+                if let Some(jars) = doc
+                    .as_object()
+                    .and_then(|o| o.get("jars"))
+                    .and_then(JsonValue::as_array)
+                {
+                    for jar in jars {
+                        let file = jar.as_object().and_then(|o| {
+                            o.get("file")
+                                .or_else(|| o.get("path"))
+                                .and_then(JsonValue::as_str)
+                        });
+                        if let Some(path) = file.and_then(normalize_fabric_jar_path) {
+                            paths.insert(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(paths
+        .into_iter()
+        .filter(|path| entries.iter().any(|e| e.name == *path))
+        .collect())
+}
+
+/// One embedded JAR recovered by [`extract_embedded_jars`].
+#[derive(Clone, Debug)]
+pub struct EmbeddedJarContent {
+    /// `!`-joined member-path chain from the scanned archive
+    /// (`META-INF/jarjar/a.jar!META-INF/jars/b.jar`) — the operator-facing
+    /// identity of this nested JAR.
+    pub path: String,
+    /// Immediate member path inside the parent archive.
+    pub member_path: String,
+    /// Nesting depth: 1 = direct child of the scanned archive, capped by
+    /// [`MAX_JAR_IN_JAR_EXTRACT_DEPTH`].
+    pub depth: usize,
+    /// Verified decompressed member bytes (Stored or Deflate, CRC-checked
+    /// by [`crate::modpack`]'s fail-closed reader).
+    pub bytes: Vec<u8>,
+}
+
+/// Result of [`extract_embedded_jars`]: every embedded JAR successfully
+/// read (parents before children, sorted path order per level) plus the
+/// bounded list of embedded members that were discovered but rejected.
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddedJarReport {
+    /// Successfully extracted embedded JARs in deterministic order.
+    pub jars: Vec<EmbeddedJarContent>,
+    /// `"path (reason)"` notes for embedded members rejected by the
+    /// depth/count/byte budgets or by the fail-closed member reader —
+    /// recorded, never silently dropped.
+    pub rejected: Vec<String>,
+}
+
+struct EmbeddedJarBudget {
+    count: usize,
+    bytes: u64,
+}
+
+fn collect_embedded_level(
+    jar_bytes: &[u8],
+    chain: &str,
+    depth: usize,
+    budget: &mut EmbeddedJarBudget,
+    report: &mut EmbeddedJarReport,
+) -> Result<(), LoaderExtensionError> {
+    let entries = modpack::zip_member_list(jar_bytes, chain)
+        .map_err(|e| err(format!("{chain}: {}", e.reason())))?;
+    let paths = embedded_jar_paths(&entries, jar_bytes, chain)?;
+    if depth > MAX_JAR_IN_JAR_EXTRACT_DEPTH {
+        for path in paths {
+            report.rejected.push(format!(
+                "{chain}!{path} (nested deeper than {MAX_JAR_IN_JAR_EXTRACT_DEPTH} levels)"
+            ));
+        }
+        return Ok(());
+    }
+    for path in paths {
+        let child_chain = format!("{chain}!{path}");
+        if budget.count >= MAX_JAR_IN_JAR_NESTED_JARS {
+            report.rejected.push(format!(
+                "{child_chain} (more than {MAX_JAR_IN_JAR_NESTED_JARS} nested JARs)"
+            ));
+            continue;
+        }
+        let Some(entry) = entries.iter().find(|e| e.name == path) else {
+            continue;
+        };
+        let bytes = match modpack::read_zip_member(jar_bytes, entry, &child_chain) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                report
+                    .rejected
+                    .push(format!("{child_chain} ({})", e.reason()));
+                continue;
+            }
+        };
+        let member_bytes = bytes.len() as u64;
+        if budget
+            .bytes
+            .checked_add(member_bytes)
+            .is_none_or(|total| total > MAX_JAR_IN_JAR_TOTAL_BYTES)
+        {
+            report.rejected.push(format!(
+                "{child_chain} (nested JAR members exceed the {MAX_JAR_IN_JAR_TOTAL_BYTES}-byte total budget)"
+            ));
+            continue;
+        }
+        budget.count += 1;
+        budget.bytes += member_bytes;
+        report.jars.push(EmbeddedJarContent {
+            path: child_chain.clone(),
+            member_path: path,
+            depth,
+            bytes: bytes.clone(),
+        });
+        // A nested archive that cannot even be listed (corrupt, or its
+        // own jarjar metadata unparsable) rejects only its subtree —
+        // valid siblings are never corrupted by one bad member.
+        if let Err(e) = collect_embedded_level(&bytes, &child_chain, depth + 1, budget, report) {
+            report
+                .rejected
+                .push(format!("{child_chain} ({})", e.reason()));
+        }
+    }
+    Ok(())
+}
+
+/// Recursively recover every embedded Jar-in-Jar member of one archive —
+/// NeoForge `META-INF/jarjar/*` (metadata-declared or merely present) and
+/// Fabric `META-INF/jars/*` (present or `fabric.mod.json` `jars[]`-
+/// declared) — in deterministic sorted order under the shared
+/// [`MAX_JAR_IN_JAR_EXTRACT_DEPTH`] /
+/// [`MAX_JAR_IN_JAR_NESTED_JARS`] /
+/// [`MAX_JAR_IN_JAR_TOTAL_BYTES`] bounds.
+///
+/// Fail-closed like the rest of the pipeline: a corrupt *outer* archive
+/// or an unparsable outer `metadata.json` is a hard `Err`; every
+/// per-member failure (unreadable, oversized, over-depth, or a nested
+/// archive that cannot be listed) lands in
+/// [`EmbeddedJarReport::rejected`] so valid sibling JARs still extract.
+pub fn extract_embedded_jars(
+    jar_bytes: &[u8],
+    display: &str,
+) -> Result<EmbeddedJarReport, LoaderExtensionError> {
+    let mut report = EmbeddedJarReport::default();
+    let mut budget = EmbeddedJarBudget { count: 0, bytes: 0 };
+    collect_embedded_level(jar_bytes, display, 1, &mut budget, &mut report)?;
+    Ok(report)
+}
+
 // ===========================================================================
 // 3. META-INF/accesstransformer.cfg (NeoForge/Forge Access Transformer)
 // ===========================================================================

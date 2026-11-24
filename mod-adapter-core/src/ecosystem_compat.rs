@@ -2265,6 +2265,61 @@ fn dedup_keep_order(list: Vec<String>) -> Vec<String> {
     list.into_iter().filter(|s| seen.insert(s.clone())).collect()
 }
 
+/// Provided mod-id/dependency surface contributed by Jar-in-Jar embedded
+/// JARs (NeoForge `META-INF/jarjar/*` and Fabric `META-INF/jars/*`),
+/// recovered through [`loader_extensions::extract_embedded_jars`]'s
+/// bounded recursive scan. Each nested JAR's own loader manifest —
+/// `fabric.mod.json`, `quilt.mod.json`, `META-INF/neoforge.mods.toml`,
+/// `META-INF/mods.toml` — contributes its declared mod ids and
+/// dependencies so bundled mods register as provided in the unified
+/// table and satisfy cross-dependencies without a JVM.
+///
+/// Best-effort per member: an unreadable or manifest-less nested JAR
+/// simply contributes nothing here (the data-extraction pass records
+/// the same member in `rejected_members`); only a failure to list the
+/// outer archive itself propagates.
+fn nested_jar_mod_surface(
+    jar_bytes: &[u8],
+    display: &str,
+) -> Result<(Vec<String>, Vec<ModDependency>), JarScanError> {
+    let report = loader_extensions::extract_embedded_jars(jar_bytes, display)
+        .map_err(|e| jar_err(format!("{display}: {}", e.reason())))?;
+    let mut ids = Vec::new();
+    let mut deps = Vec::new();
+    for jar in &report.jars {
+        let Ok(entries) = modpack::zip_member_list(&jar.bytes, &jar.path) else {
+            continue;
+        };
+        let read = |name: &str| -> Option<Vec<u8>> {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| modpack::read_zip_member(&jar.bytes, e, &jar.path).ok())
+        };
+        if let Some(bytes) = read("fabric.mod.json") {
+            if let Ok(meta) = parse_fabric_meta(&bytes) {
+                ids.push(meta.mod_id);
+                deps.extend(meta.dependencies);
+            }
+        }
+        if let Some(bytes) = read(loader_extensions::QUILT_MOD_JSON) {
+            if let Ok(meta) = loader_extensions::parse_quilt_mod_json(&bytes) {
+                ids.push(meta.mod_id);
+                deps.extend(meta.dependencies);
+            }
+        }
+        for manifest in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+            if let Some(bytes) = read(manifest) {
+                if let Ok(meta) = parse_forge_meta(&bytes, manifest) {
+                    ids.extend(meta.mod_ids);
+                    deps.extend(meta.dependencies);
+                }
+            }
+        }
+    }
+    Ok((dedup_keep_order(ids), deps))
+}
+
 /// Scan one complete mod JAR in memory, reading `fabric.mod.json` and
 /// `META-INF/neoforge.mods.toml` / `META-INF/mods.toml` through
 /// [`crate::modpack`]'s fail-closed ZIP reader (traversal, zip-bomb,
@@ -2466,6 +2521,15 @@ pub fn scan_mod_jar_named(
             .map(|f| f.dependencies.clone())
             .unwrap_or_default(),
     );
+
+    // Jar-in-Jar: every embedded JAR's own loader manifest contributes
+    // its declared mod ids and dependencies, so bundled mods (NeoForge
+    // `META-INF/jarjar/*`, Fabric `META-INF/jars/*`) register as
+    // provided in the unified table and satisfy cross-dependencies.
+    let (nested_ids, nested_deps) = nested_jar_mod_surface(jar_bytes, display)?;
+    let declared_mod_ids =
+        dedup_keep_order(declared_mod_ids.into_iter().chain(nested_ids).collect());
+    let dependencies = merge_dependencies(dependencies, nested_deps);
 
     Ok(ModJarDescriptor {
         loader,

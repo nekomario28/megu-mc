@@ -258,8 +258,15 @@ pub struct ModDataBundle {
     pub items: BTreeSet<String>,
     /// `data/` and `assets/` members that matched a recognized family but
     /// failed to parse, recorded as `"path (reason)"` — never silently
-    /// dropped.
+    /// dropped. Also carries one note per embedded Jar-in-Jar member
+    /// (NeoForge `META-INF/jarjar/*`, Fabric `META-INF/jars/*`) that the
+    /// bounded recursive extraction rejected.
     pub rejected_members: Vec<String>,
+    /// `!`-joined member-path chains of every embedded JAR whose
+    /// `data/`+`assets/` content was recursively folded into this bundle
+    /// (parents before children, sorted order per level) — empty when the
+    /// JAR ships no Jar-in-Jar contents.
+    pub embedded_jars: Vec<String>,
 }
 
 /// The artifact [`synthesize_bundle`] produces for a native JAR: the
@@ -652,65 +659,51 @@ fn reject_member(bundle: &mut ModDataBundle, name: &str, reason: impl std::fmt::
     bundle.rejected_members.push(format!("{name} ({reason})"));
 }
 
-/// Extract the six 1.21.1 generic `data/` families plus the declared
-/// `assets/` families from one mod JAR for ANY namespace — the real
-/// parsed content [`synthesize_bundle`] packages into the native
-/// artifact.
-///
-/// Every `data/<ns>/(recipe|recipes|tags|tag|loot_table|loot_tables|
-/// dimension|dimension_type|worldgen|data_maps|neoforge/data_maps|
-/// neoforge/biome_modifier)/**.json` member is read through the crate's
-/// bounded ZIP reader (Stored and Deflate members, per-member and total
-/// byte budgets) and parsed by its family's real parser — nothing is
-/// faked, nothing is keyed on a hardcoded mod id. Every
-/// `assets/<ns>/(blockstates|models|items)/**.json` member is read under
-/// the same budgets and recorded as declared ids (`models`, `items`) or
-/// parsed into its blockstate property table (`blockstates`), so the
-/// adapted output carries the blocks/items a data-driven mod ships even
-/// when no declarative bundle JSON exists.
-///
-/// Fail-closed like the rest of the pipeline: a corrupt archive, an
-/// unsafe (traversal) member path, or a member the bounded reader
-/// rejects is a hard `Err`; a member that reads cleanly but fails its
-/// family's parser is recorded in [`ModDataBundle::rejected_members`]
-/// with the reason rather than silently dropped.
-///
-/// # Errors
-///
-/// `Err` on archive corruption, unsafe member paths, or a bounded-read
-/// rejection — never a partial silent skip.
-pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle, String> {
-    let entries = zip_member_list(jar_bytes, display).map_err(|e| e.reason().to_string())?;
-    if entries.len() > MAX_DATA_MEMBERS {
-        return Err(format!(
-            "{display}: data scan member count exceeds {MAX_DATA_MEMBERS}"
-        ));
-    }
-    let mut out = ModDataBundle::default();
-    let mut namespaces = BTreeSet::new();
-    let mut dim_inputs: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut ids = ItemFluidIdTable::new();
-    let mut next_recipe_id = 1u32;
-    let mut extracted = 0u64;
+/// Mutable fold state shared by [`extract_mod_data`] across the outer
+/// archive and every recursively extracted embedded JAR — one
+/// [`ItemFluidIdTable`], one recipe-id counter, and one decoded-byte
+/// budget keep ids deterministic and the whole nested tree inside the
+/// same [`MAX_DATA_SCAN_BYTES`] envelope.
+#[derive(Default)]
+struct ModDataExtractState {
+    out: ModDataBundle,
+    namespaces: BTreeSet<String>,
+    dim_inputs: Vec<(String, Vec<u8>)>,
+    ids: ItemFluidIdTable,
+    next_recipe_id: u32,
+    data_bytes: u64,
+}
 
-    for entry in &entries {
+/// Ingest every wanted `data/`+`assets/` member of ONE archive level
+/// (the outer JAR or one embedded JAR) into `state` — the exact parsing
+/// rules [`extract_mod_data`] documents, applied verbatim at every
+/// nesting level so bundled mods contribute identical content.
+fn ingest_archive_members(
+    entries: &[crate::modpack::ZipMemberEntry],
+    jar_bytes: &[u8],
+    display: &str,
+    state: &mut ModDataExtractState,
+) -> Result<(), String> {
+    let out = &mut state.out;
+    for entry in entries {
         let name = entry.name.as_str();
         validate_member_name(name).map_err(|why| format!("{display}: {why}: {name}"))?;
         if !data_member_wanted(name) && !asset_member_wanted(name) {
             continue;
         }
-        let bytes = read_zip_member(jar_bytes, entry, display)
-            .map_err(|e| e.reason().to_string())?;
+        let bytes =
+            read_zip_member(jar_bytes, entry, display).map_err(|e| e.reason().to_string())?;
         if bytes.len() as u64 > MAX_DATA_MEMBER_BYTES {
             return Err(format!(
                 "{display}: data member {name} exceeds the {} MiB per-member budget",
                 MAX_DATA_MEMBER_BYTES / (1024 * 1024)
             ));
         }
-        extracted = extracted
+        state.data_bytes = state
+            .data_bytes
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| format!("{display}: data scan byte budget overflow"))?;
-        if extracted > MAX_DATA_SCAN_BYTES {
+        if state.data_bytes > MAX_DATA_SCAN_BYTES {
             return Err(format!("{display}: data scan byte budget exceeded"));
         }
         if let Some((ns, rest)) = name
@@ -726,7 +719,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
                         };
                         match parse_json(&bytes) {
                             Err(e) => reject_member(
-                                &mut out,
+                                out,
                                 name,
                                 format!("unparseable: {}", data_load_error_message(&e)),
                             ),
@@ -735,7 +728,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
                                     out.blockstates.insert(format!("{ns}:{stem}"), props);
                                 }
                                 None => reject_member(
-                                    &mut out,
+                                    out,
                                     name,
                                     "no 'variants' or 'multipart' blockstate form",
                                 ),
@@ -775,7 +768,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
         if ns.is_empty() {
             continue;
         }
-        namespaces.insert(ns.to_string());
+        state.namespaces.insert(ns.to_string());
         let stem = rest.strip_suffix(".json").unwrap_or(rest);
         // `ns:path-below-the-category` — `recipes/foo/bar` → `ns:foo/bar`,
         // `tags/items/veggies` → `ns:items/veggies`.
@@ -784,22 +777,22 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
             stem.split_once('/').map(|(_, tail)| tail).unwrap_or(stem)
         );
         if dimension_member_wanted(name) {
-            dim_inputs.push((name.to_string(), bytes.clone()));
+            state.dim_inputs.push((name.to_string(), bytes.clone()));
         }
         match rest.split('/').next().unwrap_or("") {
             "recipe" | "recipes" => {
-                match parse_mod_recipe_json(&id, next_recipe_id, &bytes, &mut ids) {
+                match parse_mod_recipe_json(&id, state.next_recipe_id, &bytes, &mut state.ids) {
                     Ok(Some(recipe)) => {
                         out.recipes.push(recipe);
-                        next_recipe_id = next_recipe_id.wrapping_add(1);
+                        state.next_recipe_id = state.next_recipe_id.wrapping_add(1);
                     }
                     Ok(None) => reject_member(
-                        &mut out,
+                        out,
                         name,
                         "does not match the generic processing recipe schema",
                     ),
                     Err(e) => reject_member(
-                        &mut out,
+                        out,
                         name,
                         format!("unparseable: {}", data_load_error_message(&e)),
                     ),
@@ -807,7 +800,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
             }
             "tags" | "tag" => match parse_json(&bytes) {
                 Err(e) => reject_member(
-                    &mut out,
+                    out,
                     name,
                     format!("unparseable: {}", data_load_error_message(&e)),
                 ),
@@ -817,7 +810,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
                         .and_then(|obj| obj.get("values"))
                         .and_then(JsonValue::as_array);
                     match values {
-                        None => reject_member(&mut out, name, "tag has no 'values' array"),
+                        None => reject_member(out, name, "tag has no 'values' array"),
                         Some(values) => {
                             let mut list = Vec::with_capacity(values.len());
                             let mut bad = false;
@@ -837,7 +830,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
                                 }
                             }
                             if bad {
-                                reject_member(&mut out, name, "tag 'values' holds a non-id entry");
+                                reject_member(out, name, "tag 'values' holds a non-id entry");
                             } else {
                                 out.tags.insert(id, list);
                             }
@@ -847,7 +840,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
             },
             "loot_table" | "loot_tables" => match parse_json(&bytes) {
                 Err(e) => reject_member(
-                    &mut out,
+                    out,
                     name,
                     format!("unparseable: {}", data_load_error_message(&e)),
                 ),
@@ -859,20 +852,148 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
                 if data_map_key_for_path(name).is_some() {
                     match out.data_maps.ingest_member(name, &bytes) {
                         Ok(_) => {}
-                        Err(e) => reject_member(&mut out, name, format!("unparseable: {}", e.reason())),
+                        Err(e) => reject_member(out, name, format!("unparseable: {}", e.reason())),
                     }
                 } else if let Some(modifier_id) = biome_modifier_id_for_path(name) {
                     match parse_biome_modifier(&modifier_id, &bytes, name) {
                         Ok(modifier) => out.biome_modifiers.push(modifier),
-                        Err(e) => reject_member(&mut out, name, format!("unparseable: {}", e.reason())),
+                        Err(e) => reject_member(out, name, format!("unparseable: {}", e.reason())),
                     }
                 }
             }
         }
     }
-    out.namespaces = namespaces.into_iter().collect();
-    out.dimensions = discover_dimension_mod_entries(
-        dim_inputs.iter().map(|(p, b)| (p.as_str(), b.as_slice())),
+    Ok(())
+}
+
+/// Extract the six 1.21.1 generic `data/` families plus the declared
+/// `assets/` families from one mod JAR for ANY namespace — the real
+/// parsed content [`synthesize_bundle`] packages into the native
+/// artifact.
+///
+/// Every `data/<ns>/(recipe|recipes|tags|tag|loot_table|loot_tables|
+/// dimension|dimension_type|worldgen|data_maps|neoforge/data_maps|
+/// neoforge/biome_modifier)/**.json` member is read through the crate's
+/// bounded ZIP reader (Stored and Deflate members, per-member and total
+/// byte budgets) and parsed by its family's real parser — nothing is
+/// faked, nothing is keyed on a hardcoded mod id. Every
+/// `assets/<ns>/(blockstates|models|items)/**.json` member is read under
+/// the same budgets and recorded as declared ids (`models`, `items`) or
+/// parsed into its blockstate property table (`blockstates`), so the
+/// adapted output carries the blocks/items a data-driven mod ships even
+/// when no declarative bundle JSON exists.
+///
+/// Jar-in-Jar: embedded JARs under `META-INF/jarjar/*` (NeoForge,
+/// metadata-declared or merely present) and `META-INF/jars/*` (Fabric,
+/// present or `fabric.mod.json` `jars[]`-declared) are opened
+/// recursively — up to [`crate::loader_extensions::MAX_JAR_IN_JAR_EXTRACT_DEPTH`]
+/// levels, [`crate::loader_extensions::MAX_JAR_IN_JAR_NESTED_JARS`] jars,
+/// and [`crate::loader_extensions::MAX_JAR_IN_JAR_TOTAL_BYTES`] total —
+/// and each one's `data/`+`assets/` members are folded into the same
+/// bundle under identical parsing rules, so a bundled mod like Create
+/// Aeronautics contributes every inner mod's blockstates, recipes,
+/// tags, loot tables, dimensions, data maps, biome modifiers, models,
+/// and items. Extracted member chains land in
+/// [`ModDataBundle::embedded_jars`]; rejected embedded members land in
+/// [`ModDataBundle::rejected_members`] without corrupting valid
+/// siblings.
+///
+/// Fail-closed like the rest of the pipeline: a corrupt archive, an
+/// unsafe (traversal) member path, or a member the bounded reader
+/// rejects is a hard `Err`; a member that reads cleanly but fails its
+/// family's parser — or an entire embedded JAR that fails its bounded
+/// read — is recorded in [`ModDataBundle::rejected_members`] with the
+/// reason rather than silently dropped.
+///
+/// # Errors
+///
+/// `Err` on archive corruption, unsafe member paths, or a bounded-read
+/// rejection — never a partial silent skip.
+pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle, String> {
+    let entries = zip_member_list(jar_bytes, display).map_err(|e| e.reason().to_string())?;
+    if entries.len() > MAX_DATA_MEMBERS {
+        return Err(format!(
+            "{display}: data scan member count exceeds {MAX_DATA_MEMBERS}"
+        ));
+    }
+    let mut state = ModDataExtractState {
+        next_recipe_id: 1,
+        ..ModDataExtractState::default()
+    };
+    ingest_archive_members(&entries, jar_bytes, display, &mut state)?;
+
+    // Jar-in-Jar: recursively fold every embedded JAR's `data/`+`assets/`
+    // content into the same bundle — NeoForge `META-INF/jarjar/*` and
+    // Fabric `META-INF/jars/*` — under the loader_extensions
+    // depth/count/byte bounds. Bundled mods like Create Aeronautics
+    // ship their real blockstates/recipes/tags inside nested JARs while
+    // the outer `lowcodefml` shell holds none.
+    let embedded = match crate::loader_extensions::extract_embedded_jars(jar_bytes, display) {
+        Ok(report) => report,
+        Err(e) => {
+            // The outer listing already succeeded above, so this is only
+            // reachable through a nested-archive structural failure —
+            // record it and keep the outer content.
+            state
+                .out
+                .rejected_members
+                .push(format!("{display}: jar-in-jar scan failed: {}", e.reason()));
+            crate::loader_extensions::EmbeddedJarReport::default()
+        }
+    };
+    for note in &embedded.rejected {
+        state
+            .out
+            .rejected_members
+            .push(format!("{display}: jar-in-jar: {note}"));
+    }
+    let mut folded_jars = Vec::new();
+    for jar in &embedded.jars {
+        // Snapshot the fold so a corrupt, oversized, or unsafe nested
+        // archive rejects only itself — valid sibling inner JARs still
+        // contribute their content.
+        let saved_out = state.out.clone();
+        let saved_dim_inputs = state.dim_inputs.len();
+        let saved_namespaces = state.namespaces.clone();
+        let result = zip_member_list(&jar.bytes, &jar.path)
+            .map_err(|e| e.reason().to_string())
+            .and_then(|child_entries| {
+                if child_entries.len() > MAX_DATA_MEMBERS {
+                    Err(format!(
+                        "{}: data scan member count exceeds {MAX_DATA_MEMBERS}",
+                        jar.path
+                    ))
+                } else {
+                    ingest_archive_members(&child_entries, &jar.bytes, &jar.path, &mut state)
+                }
+            });
+        if let Err(reason) = result {
+            state.out = saved_out;
+            state.dim_inputs.truncate(saved_dim_inputs);
+            state.namespaces = saved_namespaces;
+            state
+                .out
+                .rejected_members
+                .push(format!("{}: {reason}", jar.path));
+        } else {
+            folded_jars.push(jar.path.clone());
+        }
+    }
+    state.out.embedded_jars = folded_jars;
+
+    state.out.namespaces = std::mem::take(&mut state.namespaces).into_iter().collect();
+    // Nested JARs may repeat a member path (two bundled libs shipping the
+    // same `data/` layout); the dimension scan keeps the first
+    // deterministic occurrence.
+    let mut seen_dim_paths = BTreeSet::new();
+    state
+        .dim_inputs
+        .retain(|(path, _)| seen_dim_paths.insert(path.clone()));
+    state.out.dimensions = discover_dimension_mod_entries(
+        state
+            .dim_inputs
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_slice())),
     )
     .map_err(|e| {
         format!(
@@ -880,7 +1001,7 @@ pub fn extract_mod_data(jar_bytes: &[u8], display: &str) -> Result<ModDataBundle
             data_load_error_message(&e)
         )
     })?;
-    Ok(out)
+    Ok(state.out)
 }
 
 fn describe_site(site: &MixinSite) -> String {
@@ -1308,6 +1429,25 @@ pub fn auto_adapt_jar_bytes(
                 data_bundle.rejected_members.len(),
             ));
         }
+    }
+    if !data_bundle.embedded_jars.is_empty() {
+        let shown = data_bundle
+            .embedded_jars
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rest = data_bundle.embedded_jars.len().saturating_sub(4);
+        audit_notes.push(format!(
+            "jar-in-jar extraction: {} embedded JAR(s) folded in recursively ({shown}{})",
+            data_bundle.embedded_jars.len(),
+            if rest > 0 {
+                format!(", +{rest} more")
+            } else {
+                String::new()
+            },
+        ));
     }
     if dimensions.is_dimension_mod() || !dimensions.dimension_types.is_empty() {
         audit_notes.push(format!(
@@ -2322,6 +2462,13 @@ fn json_data_bundle(out: &mut String, level: usize, data: &ModDataBundle) {
         level + 1,
         "items",
         &data.items.iter().cloned().collect::<Vec<_>>(),
+        true,
+    );
+    jf_str_list(
+        out,
+        level + 1,
+        "embedded_jars",
+        &data.embedded_jars,
         true,
     );
     jf_str_list(out, level + 1, "rejected_members", &data.rejected_members, false);
@@ -3957,5 +4104,392 @@ mod tests {
             .audit_notes
             .iter()
             .any(|n| n.contains("Missing mod dependencies")));
+    }
+
+    // -------------------------------------------------------------------
+    // Recursive Jar-in-Jar extraction (NeoForge jarjar + Fabric jars)
+    // -------------------------------------------------------------------
+
+    fn neoforge_manifest(mod_id: &str) -> String {
+        format!(
+            "modLoader=\"javafml\"\nloaderVersion=\"[4.0.0,)\"\n\n[[mods]]\nmodId=\"{mod_id}\"\nversion=\"1.0.0\"\n"
+        )
+    }
+
+    fn jarjar_metadata(paths: &[&str]) -> Vec<u8> {
+        let jars = paths
+            .iter()
+            .map(|path| {
+                format!(
+                    r#"{{"identifier":{{"group":"com.example","artifact":"nested"}},"version":{{"artifactVersion":"1.0.0"}},"path":"{path}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"jars":[{jars}]}}"#).into_bytes()
+    }
+
+    fn blockstate_json(prop: &str, value: &str) -> Vec<u8> {
+        format!(r#"{{"variants":{{"{prop}={value}":{{"model":"x"}}}},"":{{"model":"y"}}}}"#)
+            .into_bytes()
+    }
+
+    fn recipe_json(item: &str) -> Vec<u8> {
+        format!(
+            r#"{{"type":"minecraft:crafting_shaped","ingredient":{{"item":"minecraft:stick"}},"result":{{"item":"{item}","count":4}}}}"#
+        )
+        .into_bytes()
+    }
+
+    fn tag_json(values: &[&str]) -> Vec<u8> {
+        let inner = values
+            .iter()
+            .map(|v| format!(r#""{v}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"values":[{inner}]}}"#).into_bytes()
+    }
+
+    /// One inner mod JAR carrying a manifest plus one member per data
+    /// family — the shape the real `create-aeronautics-bundled` nested
+    /// JARs have.
+    fn inner_mod_jar(
+        mod_id: &str,
+        manifest: &[u8],
+        manifest_path: &str,
+        block: &str,
+        recipe_item: &str,
+        tag_path: &str,
+    ) -> Vec<u8> {
+        jar(&[
+            (manifest_path, manifest),
+            (
+                &format!("assets/{mod_id}/blockstates/{block}.json"),
+                blockstate_json("facing", "north").as_slice(),
+            ),
+            (
+                &format!("data/{mod_id}/recipe/{block}.json"),
+                recipe_json(recipe_item).as_slice(),
+            ),
+            (
+                &format!("data/{mod_id}/{tag_path}.json"),
+                tag_json(&[recipe_item]).as_slice(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn jar_in_jar_neoforge_bundled_mods_fold_all_inner_content() {
+        // Mimics create-aeronautics-bundled-1.21.1-1.3.3.jar: an outer
+        // `lowcodefml` shell (`aeronautics_bundled`) with zero own
+        // blockstates/recipes and three nested mods under
+        // META-INF/jarjar/ declared by metadata.json.
+        let aero = inner_mod_jar(
+            "aeronautics",
+            neoforge_manifest("aeronautics").as_bytes(),
+            "META-INF/neoforge.mods.toml",
+            "propeller",
+            "aeronautics:propeller",
+            "tags/items/props",
+        );
+        let offroad = inner_mod_jar(
+            "offroad",
+            neoforge_manifest("offroad").as_bytes(),
+            "META-INF/neoforge.mods.toml",
+            "winch",
+            "offroad:winch",
+            "tags/blocks/machines",
+        );
+        let simulated = inner_mod_jar(
+            "simulated",
+            neoforge_manifest("simulated").as_bytes(),
+            "META-INF/neoforge.mods.toml",
+            "gyro",
+            "simulated:gyro",
+            "tags/items/tools",
+        );
+        let outer = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("aeronautics_bundled").as_bytes(),
+            ),
+            (
+                crate::loader_extensions::JAR_IN_JAR_METADATA_PATH,
+                jarjar_metadata(&[
+                    "META-INF/jarjar/aeronautics-1.3.3.jar",
+                    "META-INF/jarjar/offroad-1.3.3.jar",
+                    "META-INF/jarjar/simulated-1.3.3.jar",
+                ])
+                .as_slice(),
+            ),
+            ("META-INF/jarjar/aeronautics-1.3.3.jar", aero.as_slice()),
+            ("META-INF/jarjar/offroad-1.3.3.jar", offroad.as_slice()),
+            ("META-INF/jarjar/simulated-1.3.3.jar", simulated.as_slice()),
+        ]);
+
+        let data = extract_mod_data(&outer, "create-aeronautics-bundled.jar")
+            .expect("bundled jar data extraction");
+        assert_eq!(data.embedded_jars.len(), 3, "{:?}", data.embedded_jars);
+        for block in ["aeronautics:propeller", "offroad:winch", "simulated:gyro"] {
+            assert!(
+                data.blockstates.contains_key(block),
+                "missing inner blockstate {block}"
+            );
+        }
+        for recipe in ["aeronautics:propeller", "offroad:winch", "simulated:gyro"] {
+            assert!(
+                data.recipes.iter().any(|r| r.name == recipe),
+                "missing inner recipe {recipe}"
+            );
+        }
+        for tag in [
+            "aeronautics:items/props",
+            "offroad:blocks/machines",
+            "simulated:items/tools",
+        ] {
+            assert!(data.tags.contains_key(tag), "missing inner tag {tag}");
+        }
+        assert!(data.namespaces.contains(&"aeronautics".to_string()));
+        assert!(data.namespaces.contains(&"offroad".to_string()));
+        assert!(data.namespaces.contains(&"simulated".to_string()));
+
+        // The manifest scan registers every inner mod id as provided.
+        let desc = scan_mod_jar_named(&outer, "create-aeronautics-bundled.jar")
+            .expect("bundled jar scans");
+        for id in ["aeronautics_bundled", "aeronautics", "offroad", "simulated"] {
+            assert!(
+                desc.declared_mod_ids.iter().any(|d| d == id),
+                "missing provided mod id {id}: {:?}",
+                desc.declared_mod_ids
+            );
+        }
+
+        // Full pipeline: the unified registry plan sees the inner
+        // blockstates/recipes/tags exactly like top-level mod content.
+        let result = auto_adapt_jar_bytes(
+            &outer,
+            "create-aeronautics-bundled-1.21.1-1.3.3.jar",
+            &opts(),
+        )
+        .expect("auto adapt bundled jar");
+        assert_eq!(result.data_bundle.embedded_jars.len(), 3);
+        let report = ModsDirAdaptationReport {
+            dir: "mods".to_string(),
+            jars: vec![result],
+            non_jar_entries: 0,
+            audit_notes: Vec::new(),
+        };
+        let plan =
+            crate::live_registry_bridge::UnifiedModRegistryPlan::from_auto_adapt(1_000, 1_000, &report)
+                .expect("registry plan");
+        assert!(
+            plan.block_states
+                .iter()
+                .any(|s| s.block_id == "aeronautics:propeller"),
+            "inner blockstate missing from unified registry"
+        );
+        assert!(
+            plan.block_states
+                .iter()
+                .any(|s| s.block_id == "simulated:gyro"),
+            "inner blockstate missing from unified registry"
+        );
+        assert!(plan.content.recipes.contains_key("aeronautics:propeller"));
+        assert!(plan.content.recipes.contains_key("offroad:winch"));
+        assert!(plan.content.tags.contains_key("simulated:items/tools"));
+    }
+
+    #[test]
+    fn jar_in_jar_fabric_nested_jars_contribute_content_and_ids() {
+        let inner_a = inner_mod_jar(
+            "fabric_inner_a",
+            fabric_manifest("fabric_inner_a", "1.0.0", "").as_bytes(),
+            "fabric.mod.json",
+            "coil",
+            "fabric_inner_a:coil",
+            "tags/items/coils",
+        );
+        let inner_b = inner_mod_jar(
+            "fabric_inner_b",
+            fabric_manifest("fabric_inner_b", "2.0.0", "").as_bytes(),
+            "fabric.mod.json",
+            "drill",
+            "fabric_inner_b:drill",
+            "tags/blocks/tools",
+        );
+        // inner_c is present under META-INF/jars/ but NOT declared in
+        // jars[] — present-member discovery still folds it in.
+        let inner_c = inner_mod_jar(
+            "fabric_inner_c",
+            fabric_manifest("fabric_inner_c", "3.0.0", "").as_bytes(),
+            "fabric.mod.json",
+            "turbine",
+            "fabric_inner_c:turbine",
+            "tags/items/parts",
+        );
+        let manifest = fabric_manifest(
+            "fabric_bundler",
+            "1.0.0",
+            r#","jars":[{"file":"META-INF/jars/inner-a.jar"},{"file":"META-INF/jars/inner-b.jar"}]"#,
+        );
+        let outer = jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            ("META-INF/jars/inner-a.jar", inner_a.as_slice()),
+            ("META-INF/jars/inner-b.jar", inner_b.as_slice()),
+            ("META-INF/jars/inner-c.jar", inner_c.as_slice()),
+        ]);
+
+        let data = extract_mod_data(&outer, "fabric-bundler.jar").expect("fabric bundled data");
+        assert_eq!(data.embedded_jars.len(), 3, "{:?}", data.embedded_jars);
+        for block in [
+            "fabric_inner_a:coil",
+            "fabric_inner_b:drill",
+            "fabric_inner_c:turbine",
+        ] {
+            assert!(data.blockstates.contains_key(block), "missing {block}");
+        }
+
+        let desc = scan_mod_jar_named(&outer, "fabric-bundler.jar").expect("fabric bundled scan");
+        for id in [
+            "fabric_bundler",
+            "fabric_inner_a",
+            "fabric_inner_b",
+            "fabric_inner_c",
+        ] {
+            assert!(
+                desc.declared_mod_ids.iter().any(|d| d == id),
+                "missing provided mod id {id}: {:?}",
+                desc.declared_mod_ids
+            );
+        }
+    }
+
+    #[test]
+    fn jar_in_jar_depth_cap_rejects_only_the_too_deep_member() {
+        // l3 sits at depth 3 (> MAX_JAR_IN_JAR_EXTRACT_DEPTH = 2): its
+        // content must be rejected while l1/l2 still fold in.
+        let l3 = inner_mod_jar(
+            "deep_mod",
+            neoforge_manifest("deep_mod").as_bytes(),
+            "META-INF/neoforge.mods.toml",
+            "deepblock",
+            "deep_mod:deepblock",
+            "tags/items/deep",
+        );
+        let l2 = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("mid_mod").as_bytes(),
+            ),
+            (
+                "assets/mid_mod/blockstates/mid.json",
+                blockstate_json("axis", "y").as_slice(),
+            ),
+            ("META-INF/jarjar/l3.jar", l3.as_slice()),
+        ]);
+        let l1 = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("top_mod").as_bytes(),
+            ),
+            (
+                "assets/top_mod/blockstates/top.json",
+                blockstate_json("axis", "x").as_slice(),
+            ),
+            ("META-INF/jarjar/l2.jar", l2.as_slice()),
+        ]);
+        let outer = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("outer_mod").as_bytes(),
+            ),
+            ("META-INF/jarjar/l1.jar", l1.as_slice()),
+        ]);
+
+        let data = extract_mod_data(&outer, "deep-chain.jar").expect("depth chain extraction");
+        assert!(data.blockstates.contains_key("top_mod:top"));
+        assert!(data.blockstates.contains_key("mid_mod:mid"));
+        assert!(
+            !data.blockstates.contains_key("deep_mod:deepblock"),
+            "depth-3 content must be rejected"
+        );
+        assert!(
+            data.rejected_members
+                .iter()
+                .any(|n| n.contains("l3.jar") && n.contains("deeper than")),
+            "missing depth rejection note: {:?}",
+            data.rejected_members
+        );
+        // Depth-2 manifests still register their mod ids.
+        let desc = scan_mod_jar_named(&outer, "deep-chain.jar").expect("scan");
+        for id in ["outer_mod", "top_mod", "mid_mod"] {
+            assert!(desc.declared_mod_ids.iter().any(|d| d == id), "{id}");
+        }
+    }
+
+    #[test]
+    fn jar_in_jar_corrupt_or_unsafe_members_reject_without_harming_siblings() {
+        let good = inner_mod_jar(
+            "good_mod",
+            neoforge_manifest("good_mod").as_bytes(),
+            "META-INF/neoforge.mods.toml",
+            "goodblock",
+            "good_mod:goodblock",
+            "tags/items/good",
+        );
+        // A nested member path with `..` fails validate_member_name —
+        // the whole unsafe inner JAR rejects atomically.
+        let unsafe_inner = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("unsafe_mod").as_bytes(),
+            ),
+            ("data/unsafe_mod/../../escape.json", b"{}".as_slice()),
+            (
+                "assets/unsafe_mod/blockstates/bad.json",
+                blockstate_json("facing", "up").as_slice(),
+            ),
+        ]);
+        let corrupt = b"this is not a zip archive".to_vec();
+        let oversized_inner = jar(&[("pad.bin", vec![0u8; 16 * 1024 * 1024 + 1].as_slice())]);
+        let outer = jar(&[
+            (
+                "META-INF/neoforge.mods.toml",
+                neoforge_manifest("outer_mod").as_bytes(),
+            ),
+            (
+                crate::loader_extensions::JAR_IN_JAR_METADATA_PATH,
+                jarjar_metadata(&[
+                    "META-INF/jarjar/corrupt.jar",
+                    "META-INF/jarjar/good.jar",
+                    "META-INF/jarjar/oversized.jar",
+                    "META-INF/jarjar/unsafe.jar",
+                ])
+                .as_slice(),
+            ),
+            ("META-INF/jarjar/good.jar", good.as_slice()),
+            ("META-INF/jarjar/corrupt.jar", corrupt.as_slice()),
+            ("META-INF/jarjar/unsafe.jar", unsafe_inner.as_slice()),
+            ("META-INF/jarjar/oversized.jar", oversized_inner.as_slice()),
+        ]);
+
+        let data = extract_mod_data(&outer, "hostile-bundle.jar")
+            .expect("hostile bundle must not abort the whole extraction");
+        // The valid sibling still contributed everything.
+        assert!(data.blockstates.contains_key("good_mod:goodblock"));
+        assert!(data.recipes.iter().any(|r| r.name == "good_mod:goodblock"));
+        // Every hostile member was rejected with a recorded reason.
+        let rejects = data.rejected_members.join("\n");
+        for needle in ["corrupt.jar", "unsafe.jar", "oversized.jar"] {
+            assert!(
+                rejects.contains(needle),
+                "missing rejection for {needle}: {rejects}"
+            );
+        }
+        assert!(
+            !data.blockstates.contains_key("unsafe_mod:bad"),
+            "unsafe inner jar content must not fold in"
+        );
+        assert_eq!(data.embedded_jars.len(), 1, "{:?}", data.embedded_jars);
     }
 }
