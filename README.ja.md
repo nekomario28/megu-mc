@@ -17,7 +17,7 @@
 
 Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設計された、**Minecraft: Java Edition 1.21.1** 対応のクリーンルーム Rust 製サーバー＆純 `wgpu` ネイティブ GPU クライアントです。
 
-> **Alpha 版（`v0.1.0-alpha.1`）**: 初期プレリリース版です。1.21.1 の基本ゲームプレイ、純 Vulkan / DX12 / Metal 描画、データ駆動 Mod が動作します。全バニラ要素の完全網羅や任意の複雑な Java Mixin 実行は開発進行中です（詳細: [ロードマップ](specs/ROADMAP.md)）。
+> **Alpha 版（`v0.1.0-alpha.2`）**: 初期プレリリース版です。1.21.1 の基本ゲームプレイ、純 Vulkan / DX12 / Metal 描画、データ駆動 Mod が動作します。全バニラ要素の完全網羅や任意の複雑な Java Mixin 実行は開発進行中です（詳細: [ロードマップ](specs/ROADMAP.md)）。
 
 ## 使い方（プレイヤー向け）
 
@@ -42,13 +42,13 @@ Megu は、省メモリ・高速起動・OpenGL 依存ゼロを目指して設�
 
 ## 使い方（サーバー管理者・全 CLI ツール一式）
 
-専用サーバー `megu`・GPU クライアント `megu-client-gpu`・各種 CLI ツール一式を同梱した OS 別フルアーカイブ（`megu-<version>-<os>.tar.gz`）を **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から取得します：
+専用サーバー `megu`・GPU クライアント `megu-client-gpu`・各種 CLI ツール一式を同梱した OS 別フルアーカイブ（`megu-<version>-<target>.tar.gz`）を **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)** から取得します。1 リリースあたり 8 ターゲットを公開しています：`linux-x86_64`、`linux-x86_64-musl`、`linux-arm64`、`linux-arm64-musl`、`macos-arm64`、`macos-x86_64`、`windows-x86_64`、`windows-arm64`。
 
 | OS | フルアーカイブ名 | 同梱バイナリ一覧 |
 | :--- | :--- | :--- |
-| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-windows-x86_64.tar.gz)** | `megu.exe`（サーバー）, `megu-client-gpu.exe`（GPU クライアント）, `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
-| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.1-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-linux-x86_64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
-| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.1-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-macos-arm64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.2-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-windows-x86_64.tar.gz)** | `megu.exe`（サーバー）, `megu-client-gpu.exe`（GPU クライアント）, `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.2-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-linux-x86_64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu`（サーバー）, `megu-client-gpu`（GPU クライアント）, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 
 ```sh
 ./megu-installer server --dir ./megu-server

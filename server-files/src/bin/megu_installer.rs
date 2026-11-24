@@ -273,7 +273,7 @@ fn auto_discover_sibling(explicit: &Option<PathBuf>, stem: &str) -> Option<PathB
     auto_discover_sibling_in(explicit, stem, &dirs)
 }
 
-const DEFAULT_RELEASE_TAG: &str = "v0.1.0-alpha.1";
+const DEFAULT_RELEASE_TAG: &str = "v0.1.0-alpha.2";
 const DEFAULT_GITHUB_REPO: &str = "nekomario28/megu-mc";
 
 fn host_release_target_for(

@@ -17,7 +17,7 @@
 
 Megu is a free, open-source, clean-room Rust server and pure-`wgpu` native GPU client for **Minecraft: Java Edition 1.21.1**, built for low memory usage, fast startup, and zero OpenGL dependency.
 
-> **Alpha Status (`v0.1.0-alpha.1`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
+> **Alpha Status (`v0.1.0-alpha.2`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
 
 ## How To (Players)
 
@@ -42,13 +42,13 @@ Automatically downloads/stages `megu-client-gpu` into `<minecraft_dir>/bin/` and
 
 ## How To (Server Admins &amp; Full CLI Suite)
 
-Download the full platform archive (`megu-<version>-<os>.tar.gz`, bundling `megu` dedicated server, `megu-client-gpu`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**:
+Download the full platform archive (`megu-<version>-<target>.tar.gz`, bundling `megu` dedicated server, `megu-client-gpu`, `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, and `megu-admin`) from **[GitHub Releases](https://github.com/nekomario28/megu-mc/releases/latest)**. Eight targets are published per release: `linux-x86_64`, `linux-x86_64-musl`, `linux-arm64`, `linux-arm64-musl`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`, and `windows-arm64`.
 
 | OS | Full Archive | Included Binaries |
 | :--- | :--- | :--- |
-| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.1-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-windows-x86_64.tar.gz)** | `megu.exe` (Server), `megu-client-gpu.exe` (GPU Client), `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
-| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.1-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-linux-x86_64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
-| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.1-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.1-macos-arm64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **Windows (x86_64)** | **[`megu-v0.1.0-alpha.2-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-windows-x86_64.tar.gz)** | `megu.exe` (Server), `megu-client-gpu.exe` (GPU Client), `megu-installer.exe`, `megu-mod-check.exe`, `megu-world-migrate.exe`, `megu-init.exe`, `megu-admin.exe` |
+| **Linux (x86_64)** | **[`megu-v0.1.0-alpha.2-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-linux-x86_64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
+| **macOS (Apple Silicon)** | **[`megu-v0.1.0-alpha.2-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/latest/download/megu-v0.1.0-alpha.2-macos-arm64.tar.gz)** | `megu` (Server), `megu-client-gpu` (GPU Client), `megu-installer`, `megu-mod-check`, `megu-world-migrate`, `megu-init`, `megu-admin` |
 
 ```sh
 ./megu-installer server --dir ./megu-server

@@ -19469,12 +19469,12 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
 /// The line `--version` prints: the engine name, the build tag and the vanilla
 /// release/protocol pair it speaks.
 const MEGU_VERSION_LINE: &str =
-    "Megu (megu) 0.1.0-alpha.1 (Minecraft 1.21.1 / 26.3, Protocol 767)";
+    "Megu (megu) 0.1.0-alpha.2 (Minecraft 1.21.1 / 26.3, Protocol 767)";
 
 /// `--help` output: every flag a first boot can take, and what each one does.
 /// Printed and exited before the world, the config or a socket exists.
 const MEGU_CLI_USAGE: &str = "\
-Megu v0.1.0-alpha.1 - clean-room Rust Minecraft engine (Minecraft 1.21.1 / 26.3, protocol 767)
+Megu v0.1.0-alpha.2 - clean-room Rust Minecraft engine (Minecraft 1.21.1 / 26.3, protocol 767)
 
 USAGE:
     megu [options]
@@ -19504,7 +19504,7 @@ const MEGU_BANNER: &str = r#"
 | |  | || |___ | |_| | | |_| |
 |_|  |_||_____| \____|  \___/
 
-Megu v0.1.0-alpha.1 - clean-room Rust Minecraft engine (1.21.1 / 26.3)
+Megu v0.1.0-alpha.2 - clean-room Rust Minecraft engine (1.21.1 / 26.3)
 Let's blow past 20 TPS!
 "#;
 
