@@ -1,0 +1,45 @@
+{
+  "frame_blocking": {
+    "client-gpu/src/atmosphere.rs": 0,
+    "client-gpu/src/live_session.rs": 0,
+    "client-gpu/src/renderer.rs": 0,
+    "client-gpu/src/window.rs": 1
+  },
+  "frame_gpu_create": {
+    "client-gpu/src/atmosphere.rs": 0,
+    "client-gpu/src/live_session.rs": 0,
+    "client-gpu/src/renderer.rs": 4,
+    "client-gpu/src/window.rs": 1
+  },
+  "hot_loop_map_clone": {
+    "src/feature.rs": 0,
+    "src/jigsaw_structures.rs": 0,
+    "src/main.rs": 0,
+    "src/play_protocol.rs": 0,
+    "src/worldgen.rs": 0
+  },
+  "hot_loop_systemtime": {
+    "src/feature.rs": 0,
+    "src/jigsaw_structures.rs": 0,
+    "src/main.rs": 0,
+    "src/play_protocol.rs": 0,
+    "src/worldgen.rs": 0
+  },
+  "server_thread_sleep": {
+    "src/feature.rs": 0,
+    "src/jigsaw_structures.rs": 0,
+    "src/play_protocol.rs": 0,
+    "src/worldgen.rs": 0
+  },
+  "uncached_cube_scan": {
+    "client-gpu/src/live_session.rs": 0,
+    "client-gpu/src/window.rs": 0
+  },
+  "vec_remove_zero": {
+    "src/feature.rs": 0,
+    "src/jigsaw_structures.rs": 0,
+    "src/main.rs": 1,
+    "src/play_protocol.rs": 0,
+    "src/worldgen.rs": 0
+  }
+}

@@ -156,6 +156,11 @@ python3 tools/hardcode_guard_audit.py
 python3 tests/hardcode_guard_test.py
 python3 tools/playblocker_guard_audit.py
 python3 tests/playblocker_guard_test.py
+# The performance anti-pattern audit is a real gate, not a report: blocking
+# calls in frame paths, per-frame GPU allocations, O(n) front-removals and
+# unwired shipped optimizers all fail against audit/perf_antipattern_baseline.json.
+python3 tools/perf_antipattern_audit.py
+python3 tests/perf_antipattern_test.py
 python3 tools/security_invariants_audit.py
 python3 tests/security_invariants_test.py
 python3 tests/docker_entrypoint_test.py

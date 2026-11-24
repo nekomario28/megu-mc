@@ -41,9 +41,11 @@ jobs:
           bash tools/debt_ratchet.sh
           bash tools/clippy_ratchet.sh
           # Parallel runner retains every Python gate above, including the optional
-          # live playability test. Hardcode gate coverage checks these command names:
+          # live playability test. Gate coverage tests check these command names:
           # python3 tools/hardcode_guard_audit.py
           # python3 tests/hardcode_guard_test.py
+          # python3 tools/perf_antipattern_audit.py
+          # python3 tests/perf_antipattern_test.py
           python3 tools/run_fast_gates.py
           node website/test_functions.mjs
       - name: Install the required dependency inspector from an immutable revision
