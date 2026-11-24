@@ -19,6 +19,12 @@
 //! * [`layout`] — responsive builders that lay every screen out across
 //!   `640×360` through `3840×2160` (`ui_scale` aware), producing each
 //!   frame's `(UiDrawList, Vec<HitRegion>)`.
+//! * [`qol_helpers`] — the pure-logic core of the `Settings -> QoL`
+//!   tiny-annoyance systems: OS system-language auto-detect, the opt-in
+//!   auto-reconnect state machine, the bounded toast stack, Shulker/
+//!   Bundle tooltip peek summaries, food saturation previews,
+//!   keybind-conflict detection, inventory planners, and chat
+//!   scroll-lock.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -42,6 +48,7 @@ pub mod layout;
 pub mod magic_hud;
 pub mod mod_i18n;
 pub mod mod_menu;
+pub mod qol_helpers;
 pub mod recipe_browser;
 pub mod shader_screen;
 pub mod sign_and_chat;

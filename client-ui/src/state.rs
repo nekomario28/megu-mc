@@ -469,6 +469,27 @@ pub struct QolSettings {
     pub mini_hud: MiniHudConfig,
     /// Directional accessibility subtitles — opt-in (`false` by default).
     pub show_subtitles: bool,
+    /// Opt-in auto-reconnect on unexpected drops
+    /// ([`crate::qol_helpers::AutoReconnectController`]) — `false` by
+    /// default so public servers never see an unattended redial.
+    pub auto_reconnect: bool,
+    /// Opt-in hotbar refill from the inventory on stack depletion —
+    /// `false` by default (opinionated gameplay helper).
+    pub auto_replenish: bool,
+    /// Opt-in quick-stack-to-nearby-chests helper — `false` by
+    /// default (opinionated gameplay helper).
+    pub quick_stack_nearby: bool,
+    /// Opt-in hunger/saturation preview on food tooltips — `false` by
+    /// default (yields to a dedicated food-stats mod install).
+    pub food_saturation_preview: bool,
+    /// Shulker Box / Bundle contents inside the item tooltip — pure UX,
+    /// `true` by default.
+    pub shulker_tooltip_peek: bool,
+    /// Chat scroll-lock: reading older chat is never yanked to the
+    /// bottom by new messages — pure UX, `true` by default.
+    pub chat_scroll_lock: bool,
+    /// Non-intrusive top-right toast stack — `true` by default.
+    pub toast_notifications: bool,
 }
 
 impl Default for QolSettings {
@@ -483,6 +504,15 @@ impl Default for QolSettings {
             show_support_links: true,
             mini_hud: MiniHudConfig::default(),
             show_subtitles: false,
+            // Opinionated gameplay helpers are strictly opt-in; pure-UX
+            // improvements ship on.
+            auto_reconnect: false,
+            auto_replenish: false,
+            quick_stack_nearby: false,
+            food_saturation_preview: false,
+            shulker_tooltip_peek: true,
+            chat_scroll_lock: true,
+            toast_notifications: true,
         }
     }
 }
@@ -984,6 +1014,38 @@ impl UiSettings {
     pub fn builtin_inventory_sort_active(&self, inventory_sort_installed: bool) -> bool {
         self.qol_inventory_sort && !inventory_sort_installed
     }
+
+    /// Built-in hotbar refill runs only when the player opted in AND no
+    /// dedicated inventory-management mod owns
+    /// the feature AND the joined server is not fair-play strict —
+    /// inventory automation on a strict server trips Watchdog/Grim-style
+    /// anti-cheat, so Megu yields automatically.
+    pub fn builtin_auto_replenish_active(
+        &self,
+        inventory_mod_installed: bool,
+        fair_play_strict: bool,
+    ) -> bool {
+        self.qol.auto_replenish && !inventory_mod_installed && !fair_play_strict
+    }
+
+    /// Built-in Quick Stack runs only when the player opted in AND no
+    /// dedicated inventory mod owns it AND the joined server is not
+    /// fair-play strict (same anti-cheat yield as
+    /// [`builtin_auto_replenish_active`](Self::builtin_auto_replenish_active)).
+    pub fn builtin_quick_stack_active(
+        &self,
+        inventory_mod_installed: bool,
+        fair_play_strict: bool,
+    ) -> bool {
+        self.qol.quick_stack_nearby && !inventory_mod_installed && !fair_play_strict
+    }
+
+    /// Built-in food-value preview runs only when the player opted in
+    /// AND a dedicated food-stats mod does not already own the tooltip —
+    /// a modded client sees exactly one hunger preview, never two.
+    pub fn builtin_food_preview_active(&self, mod_installed: bool) -> bool {
+        self.qol.food_saturation_preview && !mod_installed
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1108,13 @@ pub enum SettingKey {
     QolShowSupportLinks,
     QolMiniHud,
     QolShowSubtitles,
+    QolAutoReconnect,
+    QolAutoReplenish,
+    QolQuickStack,
+    QolFoodPreview,
+    QolShulkerPeek,
+    QolChatScrollLock,
+    QolToastNotifications,
     FpMinimapMode,
     FpAllowCaveMap,
     FpAllowMobRadar,
@@ -1139,6 +1208,21 @@ impl SettingsTransaction {
             }
             K::QolMiniHud => current.qol.mini_hud == opened.qol.mini_hud,
             K::QolShowSubtitles => current.qol.show_subtitles == opened.qol.show_subtitles,
+            K::QolAutoReconnect => current.qol.auto_reconnect == opened.qol.auto_reconnect,
+            K::QolAutoReplenish => current.qol.auto_replenish == opened.qol.auto_replenish,
+            K::QolQuickStack => current.qol.quick_stack_nearby == opened.qol.quick_stack_nearby,
+            K::QolFoodPreview => {
+                current.qol.food_saturation_preview == opened.qol.food_saturation_preview
+            }
+            K::QolShulkerPeek => {
+                current.qol.shulker_tooltip_peek == opened.qol.shulker_tooltip_peek
+            }
+            K::QolChatScrollLock => {
+                current.qol.chat_scroll_lock == opened.qol.chat_scroll_lock
+            }
+            K::QolToastNotifications => {
+                current.qol.toast_notifications == opened.qol.toast_notifications
+            }
             K::FpMinimapMode => current.fair_play.minimap_mode == opened.fair_play.minimap_mode,
             K::FpAllowCaveMap => {
                 current.fair_play.allow_cave_map == opened.fair_play.allow_cave_map
@@ -1228,6 +1312,23 @@ impl SettingsTransaction {
             }
             K::QolMiniHud => current.qol.mini_hud = opened.qol.mini_hud.clone(),
             K::QolShowSubtitles => current.qol.show_subtitles = opened.qol.show_subtitles,
+            K::QolAutoReconnect => current.qol.auto_reconnect = opened.qol.auto_reconnect,
+            K::QolAutoReplenish => current.qol.auto_replenish = opened.qol.auto_replenish,
+            K::QolQuickStack => {
+                current.qol.quick_stack_nearby = opened.qol.quick_stack_nearby
+            }
+            K::QolFoodPreview => {
+                current.qol.food_saturation_preview = opened.qol.food_saturation_preview
+            }
+            K::QolShulkerPeek => {
+                current.qol.shulker_tooltip_peek = opened.qol.shulker_tooltip_peek
+            }
+            K::QolChatScrollLock => {
+                current.qol.chat_scroll_lock = opened.qol.chat_scroll_lock
+            }
+            K::QolToastNotifications => {
+                current.qol.toast_notifications = opened.qol.toast_notifications
+            }
             K::FpMinimapMode => current.fair_play.minimap_mode = opened.fair_play.minimap_mode,
             K::FpAllowCaveMap => current.fair_play.allow_cave_map = opened.fair_play.allow_cave_map,
             K::FpAllowMobRadar => {
@@ -2117,6 +2218,13 @@ pub enum WidgetId {
     QolShowSupportLinks,
     QolMiniHud,
     QolSubtitles,
+    QolAutoReconnect,
+    QolAutoReplenish,
+    QolQuickStack,
+    QolFoodPreview,
+    QolShulkerPeek,
+    QolChatScrollLock,
+    QolToasts,
     // Fair-Play tab
     FpMinimapMode,
     FpCaveMap,
@@ -2237,6 +2345,13 @@ impl WidgetId {
                 | Self::QolShowSupportLinks
                 | Self::QolMiniHud
                 | Self::QolSubtitles
+                | Self::QolAutoReconnect
+                | Self::QolAutoReplenish
+                | Self::QolQuickStack
+                | Self::QolFoodPreview
+                | Self::QolShulkerPeek
+                | Self::QolChatScrollLock
+                | Self::QolToasts
                 | Self::FpMinimapMode
                 | Self::FpCaveMap
                 | Self::FpMobRadar
@@ -2732,6 +2847,22 @@ pub struct UiState {
     /// `lang`/`ui_scale` are re-synced every frame.
     pub recipe_browser: crate::recipe_browser::RecipeBrowserState,
 
+    /// Bounded top-right toast stack
+    /// ([`crate::qol_helpers::ToastQueue`]); rendered by
+    /// [`crate::layout::layout_toast_stack`] while
+    /// `settings.qol.toast_notifications` is on.
+    pub toasts: crate::qol_helpers::ToastQueue,
+    /// Controls-page binding table the host syncs; the QoL Controls
+    /// section audits it with
+    /// [`crate::qol_helpers::detect_keybind_conflicts`].
+    pub keybinds: crate::qol_helpers::KeyBindings,
+    /// Opt-in auto-reconnect countdown state; the host ticks it and
+    /// dials [`crate::qol_helpers::AutoReconnectController::dial_target`].
+    pub auto_reconnect: crate::qol_helpers::AutoReconnectController,
+    /// Chat scroll-lock: while the player reads older chat, incoming
+    /// lines count unread instead of yanking the view to the bottom.
+    pub chat_scroll: crate::qol_helpers::ChatScrollLockState,
+
     invite_counter: u64,
     fps_field_focused: bool,
     fps_field_text: String,
@@ -2785,6 +2916,10 @@ impl Default for UiState {
             startup_timeline: None,
             mod_menu: crate::mod_menu::ModMenuState::default(),
             recipe_browser: crate::recipe_browser::RecipeBrowserState::default(),
+            toasts: crate::qol_helpers::ToastQueue::default(),
+            keybinds: crate::qol_helpers::KeyBindings::vanilla_defaults(),
+            auto_reconnect: crate::qol_helpers::AutoReconnectController::default(),
+            chat_scroll: crate::qol_helpers::ChatScrollLockState::default(),
             invite_counter: 0,
             fps_field_focused: false,
             fps_field_text: String::new(),
@@ -2838,11 +2973,24 @@ impl UiState {
         }
     }
 
-    /// Detect the OS locale (POSIX `LC_ALL`/`LC_MESSAGES`/`LANG`) and
-    /// apply it as the player's language preference. Reports `Auto` in
-    /// the legacy field because the choice was automatic.
+    /// Detect the OS locale and apply it as the player's language
+    /// preference. The coarse En/Ja projection resolves through
+    /// [`crate::qol_helpers::detect_system_language_from_env`]
+    /// (`LC_ALL`/`LC_MESSAGES`/`LANG`/`LANGUAGE`, including
+    /// Windows-style names like `Japanese_Japan.932` that the core
+    /// catalog parser cannot read), while the full 16-locale `locale`
+    /// field resolves through `megu_core::i18n`. Reports `Auto` in the
+    /// legacy field because the choice was automatic.
     pub fn detect_and_apply_os_locale(&mut self) {
-        let detected = megu_core::i18n::detect_os_locale();
+        let mut detected = megu_core::i18n::detect_os_locale();
+        // A Japanese system language always wins `ja_jp` — the QoL
+        // parser accepts Windows-style names (`Japanese_Japan.932`,
+        // bare `japanese`) the stricter catalog parser falls back on.
+        if detected != BuiltinLocale::JaJp
+            && crate::qol_helpers::detect_system_language_from_env() == UiLang::Ja
+        {
+            detected = BuiltinLocale::JaJp;
+        }
         self.set_locale(detected);
         self.settings.language = LanguageSetting::Auto;
     }
@@ -3011,6 +3159,24 @@ impl UiState {
         list
     }
 
+    /// Queue a toast for the top-right stack — a no-op while
+    /// `settings.qol.toast_notifications` is off, so hosts can report
+    /// events unconditionally.
+    pub fn push_toast(&mut self, kind: crate::qol_helpers::ToastKind, title: &str, body: &str) {
+        if self.settings.qol.toast_notifications {
+            self.toasts.push(kind, title, body);
+        }
+    }
+
+    /// Record a newly arrived chat line under the scroll-lock contract:
+    /// locked readers keep their place (the unread badge ticks up),
+    /// bottom-pinned readers are untouched.
+    pub fn on_chat_message(&mut self) {
+        if self.settings.qol.chat_scroll_lock {
+            self.chat_scroll.on_new_message();
+        }
+    }
+
     /// Buffer-reusing [`render`](Self::render): `out` is cleared and
     /// refilled (its `Text` payload buffers are recycled, so steady-state
     /// frames emit no text allocations), and `self.hit_regions` is rebuilt
@@ -3037,6 +3203,7 @@ impl UiState {
         // The sign-edit session composites over whatever screen is up —
         // the server owns its open/close lifecycle, not the nav stack.
         layout::layout_sign_editor(self, width, height, out);
+        layout::layout_toast_stack(self, width, height, out);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
             if i >= self.hit_regions.len() {
@@ -4472,6 +4639,42 @@ impl UiState {
                 q.show_subtitles = !q.show_subtitles;
                 true
             }
+            WidgetId::QolAutoReconnect => {
+                q.auto_reconnect = !q.auto_reconnect;
+                // Toggling off mid-countdown cancels any pending redial.
+                self.auto_reconnect.enabled = q.auto_reconnect;
+                true
+            }
+            WidgetId::QolAutoReplenish => {
+                q.auto_replenish = !q.auto_replenish;
+                true
+            }
+            WidgetId::QolQuickStack => {
+                q.quick_stack_nearby = !q.quick_stack_nearby;
+                true
+            }
+            WidgetId::QolFoodPreview => {
+                q.food_saturation_preview = !q.food_saturation_preview;
+                true
+            }
+            WidgetId::QolShulkerPeek => {
+                q.shulker_tooltip_peek = !q.shulker_tooltip_peek;
+                true
+            }
+            WidgetId::QolChatScrollLock => {
+                q.chat_scroll_lock = !q.chat_scroll_lock;
+                // Disabling the lock drops any stale scroll offset so
+                // chat returns to bottom-pinned immediately.
+                self.chat_scroll.scroll_to_bottom();
+                true
+            }
+            WidgetId::QolToasts => {
+                q.toast_notifications = !q.toast_notifications;
+                if !q.toast_notifications {
+                    self.toasts.clear();
+                }
+                true
+            }
             WidgetId::FpMinimapMode => {
                 f.minimap_mode = f.minimap_mode.next();
                 true
@@ -4960,3 +5163,130 @@ mod sign_editor_overlay_tests {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qol_settings_seamless_defaults() {
+        let q = QolSettings::default();
+        // Opinionated gameplay helpers are strictly opt-in.
+        assert!(!q.auto_reconnect);
+        assert!(!q.auto_replenish);
+        assert!(!q.quick_stack_nearby);
+        assert!(!q.food_saturation_preview);
+        // Pure-UX improvements ship on.
+        assert!(q.shulker_tooltip_peek);
+        assert!(q.chat_scroll_lock);
+        assert!(q.toast_notifications);
+    }
+
+    #[test]
+    fn seamless_toggles_round_trip_through_adjust_and_undo() {
+        let mut ui = UiState::new();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        let cases = [
+            (WidgetId::QolAutoReconnect, SettingKey::QolAutoReconnect),
+            (WidgetId::QolAutoReplenish, SettingKey::QolAutoReplenish),
+            (WidgetId::QolQuickStack, SettingKey::QolQuickStack),
+            (WidgetId::QolFoodPreview, SettingKey::QolFoodPreview),
+            (WidgetId::QolShulkerPeek, SettingKey::QolShulkerPeek),
+            (WidgetId::QolChatScrollLock, SettingKey::QolChatScrollLock),
+            (WidgetId::QolToasts, SettingKey::QolToastNotifications),
+        ];
+        for (widget, key) in cases {
+            let acts = ui.adjust(widget, 1);
+            assert_eq!(acts, vec![UiAction::SettingsChanged], "{widget:?}");
+            assert!(ui.is_setting_dirty(key), "{key:?} should be dirty");
+            assert_eq!(ui.revert_single_setting(key), vec![UiAction::SettingsChanged]);
+            assert!(!ui.is_setting_dirty(key), "{key:?} revert restores");
+        }
+        assert_eq!(ui.settings.qol, QolSettings::default());
+    }
+
+    #[test]
+    fn auto_reconnect_toggle_syncs_controller_gate() {
+        let mut ui = UiState::new();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        ui.adjust(WidgetId::QolAutoReconnect, 1);
+        assert!(ui.settings.qol.auto_reconnect);
+        assert!(ui.auto_reconnect.enabled);
+        ui.auto_reconnect
+            .on_unexpected_disconnect("example.org", 25565, "timed out");
+        assert!(ui.auto_reconnect.is_reconnecting());
+        ui.adjust(WidgetId::QolAutoReconnect, -1);
+        assert!(!ui.auto_reconnect.enabled);
+        assert!(!ui.auto_reconnect.tick(60_000));
+    }
+
+    #[test]
+    fn inventory_helpers_yield_to_mods_and_strict_fair_play() {
+        let mut s = UiSettings::default();
+        s.qol.auto_replenish = true;
+        s.qol.quick_stack_nearby = true;
+        s.qol.food_saturation_preview = true;
+        // Opted-in, no mod, permissive server -> built-ins run.
+        assert!(s.builtin_auto_replenish_active(false, false));
+        assert!(s.builtin_quick_stack_active(false, false));
+        assert!(s.builtin_food_preview_active(false));
+        // A dedicated mod installed -> built-ins yield (zero conflicts).
+        assert!(!s.builtin_auto_replenish_active(true, false));
+        assert!(!s.builtin_quick_stack_active(true, false));
+        assert!(!s.builtin_food_preview_active(true));
+        // Strict fair-play server -> inventory automation yields.
+        assert!(!s.builtin_auto_replenish_active(false, true));
+        assert!(!s.builtin_quick_stack_active(false, true));
+        // Food preview is display-only — safe even on strict servers.
+        assert!(s.builtin_food_preview_active(false));
+        // Default settings: nothing runs even on permissive servers.
+        let d = UiSettings::default();
+        assert!(!d.builtin_auto_replenish_active(false, false));
+        assert!(!d.builtin_quick_stack_active(false, false));
+        assert!(!d.builtin_food_preview_active(false));
+    }
+
+    #[test]
+    fn push_toast_respects_the_toggle() {
+        let mut ui = UiState::new();
+        ui.push_toast(crate::qol_helpers::ToastKind::Info, "hi", "");
+        assert_eq!(ui.toasts.len(), 1);
+        ui.settings.qol.toast_notifications = false;
+        ui.push_toast(crate::qol_helpers::ToastKind::Info, "nope", "");
+        assert_eq!(ui.toasts.len(), 1);
+    }
+
+    #[test]
+    fn chat_scroll_lock_toggle_resets_stale_offset() {
+        let mut ui = UiState::new();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        ui.chat_scroll.scroll_by(4);
+        ui.on_chat_message();
+        assert_eq!(ui.chat_scroll.unread_while_scrolled, 1);
+        ui.adjust(WidgetId::QolChatScrollLock, 1);
+        assert!(!ui.settings.qol.chat_scroll_lock);
+        assert!(!ui.chat_scroll.scrolled_up);
+        assert_eq!(ui.chat_scroll.scroll_offset, 0);
+        // With the lock off, new messages no longer count unread.
+        ui.on_chat_message();
+        assert_eq!(ui.chat_scroll.unread_while_scrolled, 0);
+    }
+
+    #[test]
+    fn toast_toggle_off_clears_queue() {
+        let mut ui = UiState::new();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        ui.push_toast(crate::qol_helpers::ToastKind::Info, "a", "");
+        ui.adjust(WidgetId::QolToasts, 1);
+        assert!(ui.toasts.is_empty());
+    }
+
+    #[test]
+    fn ui_state_defaults_carry_seamless_qol() {
+        let ui = UiState::new();
+        assert!(ui.toasts.is_empty());
+        assert!(!ui.keybinds.entries.is_empty());
+        assert!(crate::qol_helpers::detect_keybind_conflicts(&ui.keybinds).is_empty());
+        assert_eq!(ui.chat_scroll, crate::qol_helpers::ChatScrollLockState::default());
+        assert!(!ui.auto_reconnect.is_reconnecting());
+    }
+}

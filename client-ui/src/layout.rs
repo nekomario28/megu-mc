@@ -1667,30 +1667,19 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
 fn qol_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let q = &ctx.state.settings.qol;
-    // Below 300 logical px the tab tightens to a 20px/18px rhythm so the
-    // extra MiniHUD + Subtitles row still clears Done/About Megu at the
-    // tightest size (480x270 at scale 4); larger screens keep the
+    // Below 400 logical px the tab tightens to a 20px/18px rhythm so all
+    // seven QoL toggles plus the Controls header clear Done/About Megu
+    // at the standard 360px-tall window; larger screens keep the
     // standard 24px/20px grid.
-    let compact = ctx.h < 300;
+    let compact = ctx.h < 400;
     let (step, bh) = if compact { (20, 18) } else { (24, 20) };
     let x = ctx.w / 2 - 160;
     let y0 = if compact { y0 - 2 } else { y0 };
     let qy = |i: i32| y0 + i * step;
 
-    ctx.btn(
-        WidgetId::QolSmoothZoom,
-        lr(x, qy(0), 320, bh),
-        &format!(
-            "{}: {}",
-            tr(lang, "Smooth Zoom", "スムーズズーム"),
-            onoff(q.smooth_zoom)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::QolSmoothZoom, x + 326, qy(0) + (bh - 8) / 2);
-
     ctx.slider(
         WidgetId::QolToolWarn,
-        lr(x, qy(1), 320, bh),
+        lr(x, qy(0), 320, bh),
         q.tool_warn_percent as f32 / 100.0,
         &format!(
             "{}: {}%",
@@ -1698,32 +1687,12 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             q.tool_warn_percent
         ),
     );
-    ctx.dirty_dot(
-        SettingKey::QolToolWarnPercent,
-        x + 326,
-        qy(1) + (bh - 8) / 2,
-    );
-
-    ctx.btn(
-        WidgetId::QolPreventBreak,
-        lr(x, qy(2), 320, bh),
-        &format!(
-            "{}: {} ({})",
-            tr(lang, "Tool Break Guard", "ツール破壊ガード"),
-            onoff(q.prevent_tool_break),
-            tr(lang, "opt-in", "オプトイン")
-        ),
-    );
-    ctx.dirty_dot(
-        SettingKey::QolPreventToolBreak,
-        x + 326,
-        qy(2) + (bh - 8) / 2,
-    );
+    ctx.dirty_dot(SettingKey::QolToolWarnPercent, x + 326, qy(0) + (bh - 8) / 2);
 
     let frac = (q.chat_history_lines as f32 - 100.0) / 4900.0;
     ctx.slider(
         WidgetId::QolChatHistory,
-        lr(x, qy(3), 320, bh),
+        lr(x, qy(1), 320, bh),
         frac,
         &format!(
             "{}: {} {}",
@@ -1732,45 +1701,189 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "lines", "行")
         ),
     );
-    ctx.dirty_dot(
-        SettingKey::QolChatHistoryLines,
-        x + 326,
-        qy(3) + (bh - 8) / 2,
-    );
+    ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, qy(1) + (bh - 8) / 2);
 
-    ctx.btn(
-        WidgetId::QolRetainChat,
-        lr(x, qy(4), 320, bh),
+    // Boolean toggles share compact two-per-row cells — the same
+    // 156px pairing the MiniHUD/Subtitles row already uses — so every
+    // setting stays reachable at the smallest sane window. Labels that
+    // need the full width (Support Links, Crash mode) keep their own
+    // row.
+    let pair = |ctx: &mut Ctx,
+                i: i32,
+                col: i32,
+                id: WidgetId,
+                key: SettingKey,
+                label: &str| {
+        let bx = x + col * 164;
+        ctx.btn(id, lr(bx, qy(i), 156, bh), label);
+        ctx.dirty_dot(key, bx + 162, qy(i) + (bh - 8) / 2);
+    };
+
+    pair(
+        ctx,
+        2,
+        0,
+        WidgetId::QolSmoothZoom,
+        SettingKey::QolSmoothZoom,
         &format!(
             "{}: {}",
-            tr(lang, "Keep Chat on Reconnect", "再接続時にチャット保持"),
+            tr(lang, "Smooth Zoom", "ズーム"),
+            onoff(q.smooth_zoom)
+        ),
+    );
+    pair(
+        ctx,
+        2,
+        1,
+        WidgetId::QolPreventBreak,
+        SettingKey::QolPreventToolBreak,
+        &format!(
+            "{}: {}",
+            tr(lang, "Break Guard", "破壊ガード"),
+            onoff(q.prevent_tool_break)
+        ),
+    );
+
+    let minihud_label = match q.mini_hud_preset() {
+        MiniHudPreset::Off => "OFF",
+        MiniHudPreset::Basic => tr(lang, "Basic", "基本"),
+        MiniHudPreset::Advanced => tr(lang, "Advanced", "詳細"),
+    };
+    pair(
+        ctx,
+        3,
+        0,
+        WidgetId::QolMiniHud,
+        SettingKey::QolMiniHud,
+        &format!("MiniHUD: {minihud_label}"),
+    );
+    pair(
+        ctx,
+        3,
+        1,
+        WidgetId::QolSubtitles,
+        SettingKey::QolShowSubtitles,
+        &format!(
+            "{}: {}",
+            tr(lang, "Subtitles", "字幕"),
+            onoff(q.show_subtitles)
+        ),
+    );
+
+    pair(
+        ctx,
+        4,
+        0,
+        WidgetId::QolRetainChat,
+        SettingKey::QolRetainChatOnReconnect,
+        &format!(
+            "{}: {}",
+            tr(lang, "Keep Chat", "履歴保持"),
             onoff(q.retain_chat_on_reconnect)
         ),
     );
-    ctx.dirty_dot(
-        SettingKey::QolRetainChatOnReconnect,
-        x + 326,
-        qy(4) + (bh - 8) / 2,
+    pair(
+        ctx,
+        4,
+        1,
+        WidgetId::QolToasts,
+        SettingKey::QolToastNotifications,
+        &format!(
+            "{}: {}",
+            tr(lang, "Toasts", "トースト"),
+            onoff(q.toast_notifications)
+        ),
+    );
+
+    // Seamless QoL toggles: the four opinionated gameplay helpers are
+    // default-OFF (opt-in), the three pure-UX improvements default ON.
+    pair(
+        ctx,
+        5,
+        0,
+        WidgetId::QolAutoReconnect,
+        SettingKey::QolAutoReconnect,
+        &format!(
+            "{}: {}",
+            tr(lang, "Reconnect", "再接続"),
+            onoff(q.auto_reconnect)
+        ),
+    );
+    pair(
+        ctx,
+        5,
+        1,
+        WidgetId::QolAutoReplenish,
+        SettingKey::QolAutoReplenish,
+        &format!(
+            "{}: {}",
+            tr(lang, "Replenish", "リフィル"),
+            onoff(q.auto_replenish)
+        ),
+    );
+    pair(
+        ctx,
+        6,
+        0,
+        WidgetId::QolQuickStack,
+        SettingKey::QolQuickStack,
+        &format!(
+            "{}: {}",
+            tr(lang, "Quick Stack", "クイックスタック"),
+            onoff(q.quick_stack_nearby)
+        ),
+    );
+    pair(
+        ctx,
+        6,
+        1,
+        WidgetId::QolFoodPreview,
+        SettingKey::QolFoodPreview,
+        &format!(
+            "{}: {}",
+            tr(lang, "Food Saturation", "食料の回復量"),
+            onoff(q.food_saturation_preview)
+        ),
+    );
+    pair(
+        ctx,
+        7,
+        0,
+        WidgetId::QolShulkerPeek,
+        SettingKey::QolShulkerPeek,
+        &format!(
+            "{}: {}",
+            tr(lang, "Shulker Peek", "中身プレビュー"),
+            onoff(q.shulker_tooltip_peek)
+        ),
+    );
+    pair(
+        ctx,
+        7,
+        1,
+        WidgetId::QolChatScrollLock,
+        SettingKey::QolChatScrollLock,
+        &format!(
+            "{}: {}",
+            tr(lang, "Scroll Lock", "スクロール保持"),
+            onoff(q.chat_scroll_lock)
+        ),
     );
 
     ctx.btn(
         WidgetId::QolCrashMode,
-        lr(x, qy(5), 320, bh),
+        lr(x, qy(8), 320, bh),
         &format!(
             "{}: {}",
             tr(lang, "Crash Report Mode", "クラッシュレポート"),
             q.crash_report_mode.label()
         ),
     );
-    ctx.dirty_dot(
-        SettingKey::QolCrashReportMode,
-        x + 326,
-        qy(5) + (bh - 8) / 2,
-    );
+    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(8) + (bh - 8) / 2);
 
     ctx.btn(
         WidgetId::QolShowSupportLinks,
-        lr(x, qy(6), 320, bh),
+        lr(x, qy(9), 320, bh),
         if q.show_support_links {
             tr(
                 lang,
@@ -1785,41 +1898,79 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             )
         },
     );
-    ctx.dirty_dot(
-        SettingKey::QolShowSupportLinks,
-        x + 326,
-        qy(6) + (bh - 8) / 2,
-    );
+    ctx.dirty_dot(SettingKey::QolShowSupportLinks, x + 326, qy(9) + (bh - 8) / 2);
 
-    // The two opt-in overlays share one compact row of half-width
-    // toggles: the MiniHUD cycles Off/Basic/Advanced presets, the
-    // subtitles flip on/off.
-    let minihud_label = match q.mini_hud_preset() {
-        MiniHudPreset::Off => "OFF",
-        MiniHudPreset::Basic => tr(lang, "Basic", "基本"),
-        MiniHudPreset::Advanced => tr(lang, "Advanced", "詳細"),
-    };
-    ctx.btn(
-        WidgetId::QolMiniHud,
-        lr(x, qy(7), 156, bh),
-        &format!("MiniHUD: {minihud_label}"),
-    );
-    ctx.btn(
-        WidgetId::QolSubtitles,
-        lr(x + 164, qy(7), 156, bh),
-        &format!(
-            "{}: {}",
-            tr(lang, "Subtitles", "字幕"),
-            onoff(q.show_subtitles)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::QolMiniHud, x + 162, qy(7) + (bh - 8) / 2);
-    ctx.dirty_dot(SettingKey::QolShowSubtitles, x + 326, qy(7) + (bh - 8) / 2);
+    // -- Controls: keybind conflict highlighting ---------------------
+    let conflicts = crate::qol_helpers::detect_keybind_conflicts(&ctx.state.keybinds);
+    let flagged = crate::qol_helpers::conflicted_bind_indices(&conflicts);
 
-    if ctx.h >= 300 {
+    // Controls section: conflicted bindings first with `[!]` badges
+    // (red when a row collides more than once, amber otherwise), then
+    // the unflagged table — two display-only columns clipped by the
+    // footer band like every other row.
+    if qy(10) + 10 <= ctx.band_top {
+        let header = if conflicts.is_empty() {
+            tr(lang, "Controls - no conflicts", "操作 — 重複なし").to_string()
+        } else {
+            format!(
+                "{} — {} {}",
+                tr(lang, "Controls", "操作"),
+                conflicts.len(),
+                tr(lang, "conflict(s)", "重複")
+            )
+        };
         ctx.ctext(
             ctx.w / 2,
-            qy(8) + 4,
+            qy(10) + 2,
+            1,
+            if conflicts.is_empty() {
+                pal::ACCENT
+            } else {
+                pal::WARNING
+            },
+            &header,
+        );
+    }
+    let mut order: Vec<usize> = flagged.clone();
+    order.extend(
+        (0..ctx.state.keybinds.entries.len()).filter(|i| !flagged.contains(i)),
+    );
+    for (row_i, chunk) in order.chunks(2).enumerate() {
+        let y = qy(11) + row_i as i32 * 10;
+        if y + 10 > ctx.band_top {
+            break;
+        }
+        for (col, &ei) in chunk.iter().enumerate() {
+            let entry = &ctx.state.keybinds.entries[ei];
+            let (mark, color) = if flagged.contains(&ei) {
+                let multi = conflicts
+                    .iter()
+                    .filter(|(a, b, _)| *a == ei || *b == ei)
+                    .count()
+                    > 1;
+                ("[!] ", if multi { pal::DANGER } else { pal::WARNING })
+            } else {
+                ("", pal::TEXT_DIM)
+            };
+            let key = if entry.key.is_empty() {
+                "-"
+            } else {
+                entry.key.as_str()
+            };
+            ctx.text(
+                x + col as i32 * 164 + 4,
+                y,
+                1,
+                color,
+                &format!("{mark}{}: {key}", entry.action),
+            );
+        }
+    }
+
+    if ctx.h >= 340 {
+        ctx.ctext(
+            ctx.w / 2,
+            ctx.band_top - 10,
             1,
             pal::TEXT_DIM,
             tr(
@@ -2762,10 +2913,27 @@ fn hud(ctx: &mut Ctx) {
 
     // Chat scrollback, bottom-left. Lines clip to the viewport, to the
     // left vitals column, to the actionbar, and to whatever subtitle row
-    // shares their band.
+    // shares their band. While the scroll-lock is engaged the window
+    // shifts `scroll_offset` lines up and the freed bottom slot carries
+    // the "+N new" badge instead of the newest line.
+    let scroll_locked = qol.chat_scroll_lock && ctx.state.chat_scroll.scrolled_up;
+    let scroll_off = if scroll_locked {
+        ctx.state.chat_scroll.scroll_offset
+    } else {
+        0
+    };
+    let chat_take = if scroll_locked { 5 } else { 6 };
     let mut chat_top = i32::MAX;
     let mut chat_right = 0i32;
-    for (i, line) in hud.chat_lines.iter().rev().take(6).enumerate() {
+    for (k, line) in hud
+        .chat_lines
+        .iter()
+        .rev()
+        .skip(scroll_off)
+        .take(chat_take)
+        .enumerate()
+    {
+        let i = k + usize::from(scroll_locked);
         let y = hy - 12 - i as i32 * 10;
         let (band_top, band_bot) = (y - 1, y + 9);
         let mut cells = ((w - 14) / 8).max(0) as usize;
@@ -2791,6 +2959,19 @@ fn hud(ctx: &mut Ctx) {
         ctx.text(4, y, 1, pal::TEXT, &text);
         chat_top = chat_top.min(y - 1);
         chat_right = chat_right.max(8 + tw);
+    }
+    // Scroll-lock badge in the freed bottom slot.
+    if scroll_locked && hy - 12 >= 0 {
+        let badge = ctx
+            .state
+            .chat_scroll
+            .unread_label(lang)
+            .unwrap_or_else(|| tr(lang, "scrolled", "保持中").to_string());
+        let bw = text_width(&badge, 1) as i32 + 6;
+        ctx.fill(2, hy - 13, bw + 2, 10, UiColor::rgba(0, 0, 0, 110));
+        ctx.text(4, hy - 12, 1, pal::WARNING, &badge);
+        chat_top = chat_top.min(hy - 13);
+        chat_right = chat_right.max(8 + bw);
     }
 
     // Chat/command input bar (open chat screen): a dark input strip at
@@ -3414,6 +3595,137 @@ pub fn layout_sign_editor(
     true
 }
 
+/// Append the toast-notification stack (`state.toasts`) to the draw
+/// list: a bounded, right-anchored stack with a severity stripe and
+/// fade alpha — display-only, no hit regions. On the in-game HUD every
+/// toast slides below whatever [`hud_occupied_rects`] reports
+/// (bossbars, MagicHUD status badges); menu screens keep the free
+/// top-right corner. Returns `false` — emitting nothing — while
+/// `settings.qol.toast_notifications` is off or the queue is empty.
+pub fn layout_toast_stack(state: &UiState, width: u32, height: u32, out: &mut UiDrawList) -> bool {
+    if !state.settings.qol.toast_notifications || state.toasts.is_empty() {
+        return false;
+    }
+    // Same auto GUI scale the other corner overlays use.
+    let ms = ((height as f32 / 360.0).floor() as u32)
+        .clamp(1, 4)
+        .min(((width as f32 / 320.0).floor() as u32).max(1));
+    let lw = (width / ms) as i32;
+    let lh = (height / ms) as i32;
+    if lw < 64 || lh < 48 {
+        return false;
+    }
+
+    const EDGE: i32 = 4;
+    const ROW_H: i32 = 10;
+    const PAD: i32 = 3;
+    const STRIPE_W: i32 = 3;
+    let max_w = (lw / 2).clamp(40, 190);
+    let text_cells = ((max_w - 2 * PAD - STRIPE_W) / 8).max(1) as usize;
+
+    // Reserved HUD chrome in this overlay's logical space; empty on
+    // menus where the top-right corner is already clear.
+    let reserved: Vec<UiRect> = if state.screen == Screen::InGameHud {
+        hud_occupied_rects(state, width, height)
+            .iter()
+            .map(|r| {
+                let x0 = (r.x as f32 / ms as f32).floor() as i32;
+                let y0 = (r.y as f32 / ms as f32).floor() as i32;
+                let x1 = (r.right() as f32 / ms as f32).ceil() as i32;
+                let y1 = (r.bottom() as f32 / ms as f32).ceil() as i32;
+                UiRect::new(x0, y0, (x1 - x0).max(0) as u32, (y1 - y0).max(0) as u32)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let mut y = EDGE;
+    let mut drew = false;
+    for toast in state.toasts.visible() {
+        let title = hud_str(&toast.title, text_cells);
+        let body = hud_str(&toast.body, text_cells);
+        let rows = 1 + usize::from(!body.is_empty());
+        let line_w = [title.as_str(), body.as_str()]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| text_width(s, 1) as i32)
+            .max()
+            .unwrap_or(0);
+        let pw = (line_w + 2 * PAD + STRIPE_W + 2).min(max_w);
+        let ph = rows as i32 * ROW_H + 2 * PAD - 1;
+        let px = (lw - EDGE - pw).max(EDGE);
+        // Slide below whatever HUD chrome the panel would intersect.
+        loop {
+            let rect = UiRect::new(px, y, pw as u32, ph as u32);
+            match reserved.iter().find(|r| rect.intersects(**r)) {
+                Some(r) => y = r.bottom() + 2,
+                None => break,
+            }
+            if y + ph > lh - EDGE {
+                break;
+            }
+        }
+        if y + ph > lh - EDGE {
+            break; // No room for this toast or anything below it.
+        }
+        let a = toast.alpha();
+        let fade = |c: UiColor| c.with_alpha((f32::from(c.a) * a).round() as u8);
+        let (ppx, ppy) = (px * ms as i32, y * ms as i32);
+        let (ppw, pph) = ((pw * ms as i32) as u32, (ph * ms as i32) as u32);
+        out.fill_rect(UiRect::new(ppx, ppy, ppw, pph), fade(pal::PANEL));
+        out.border_rect(
+            UiRect::new(ppx, ppy, ppw, pph),
+            fade(pal::PANEL_BORDER),
+            ms,
+        );
+        let stripe = match toast.kind {
+            crate::qol_helpers::ToastKind::Info => pal::TEXT_DIM,
+            crate::qol_helpers::ToastKind::Success => pal::ACCENT,
+            crate::qol_helpers::ToastKind::Warning => pal::WARNING,
+            crate::qol_helpers::ToastKind::Error => pal::DANGER,
+        };
+        out.fill_rect(
+            UiRect::new(ppx, ppy, STRIPE_W as u32 * ms, pph),
+            fade(stripe),
+        );
+        out.text_str(
+            (px + STRIPE_W + PAD) * ms as i32,
+            (y + PAD) * ms as i32,
+            ms,
+            fade(pal::TEXT),
+            &title,
+        );
+        if !body.is_empty() {
+            out.text_str(
+                (px + STRIPE_W + PAD) * ms as i32,
+                (y + PAD + ROW_H) * ms as i32,
+                ms,
+                fade(pal::TEXT_DIM),
+                &body,
+            );
+        }
+        y += ph + 4;
+        drew = true;
+    }
+    // "+N more" tail for toasts waiting behind the visible window.
+    if drew {
+        let pending = state.toasts.pending_count();
+        if pending > 0 && y + ROW_H <= lh - EDGE {
+            let label = format!("+{pending} more");
+            let tw = text_width(&label, 1) as i32;
+            out.text_str(
+                (lw - EDGE - tw) * ms as i32,
+                y * ms as i32,
+                ms,
+                pal::TEXT_DIM,
+                &label,
+            );
+        }
+    }
+    drew
+}
+
 /// Every rectangle the in-game HUD occupies, in *physical* pixels, for
 /// overlays that composite after [`layout_screen`]. Mirrors the `hud()`
 /// collision model exactly — same scale, same constants, same clip math —
@@ -3432,6 +3744,7 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
 pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: &mut Vec<UiRect>) {
     rects.clear();
     let hud = &state.hud;
+    let qol = &state.settings.qol;
     let s = state.effective_scale(height) as i32;
     if s <= 0 {
         return;
@@ -3579,8 +3892,26 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             add(bx, by, bw, 14);
         }
 
-        // Chat scrollback rows, clipped exactly like `hud()`.
-        for (i, line) in hud.chat_lines.iter().rev().take(6).enumerate() {
+        // Chat scrollback rows, clipped exactly like `hud()` — scroll-
+        // lock shifts the window and frees the bottom slot for the
+        // unread badge.
+        let scroll_locked =
+            qol.chat_scroll_lock && state.chat_scroll.scrolled_up;
+        let scroll_off = if scroll_locked {
+            state.chat_scroll.scroll_offset
+        } else {
+            0
+        };
+        let chat_take = if scroll_locked { 5 } else { 6 };
+        for (k, line) in hud
+            .chat_lines
+            .iter()
+            .rev()
+            .skip(scroll_off)
+            .take(chat_take)
+            .enumerate()
+        {
+            let i = k + usize::from(scroll_locked);
             let y = hy - 12 - i as i32 * 10;
             let (band_top, band_bot) = (y - 1, y + 9);
             let mut cells = ((w - 14) / 8).max(0) as usize;
@@ -3603,6 +3934,15 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             let text = hud_str(line, cells);
             let tw = text_width(&text, 1) as i32;
             add(2, y - 1, tw + 6, 10);
+        }
+        // Scroll-lock badge in the freed bottom slot (`hud()` mirror).
+        if scroll_locked && hy - 12 >= 0 {
+            let badge = state
+                .chat_scroll
+                .unread_label(state.lang())
+                .unwrap_or_else(|| "scrolled".to_string());
+            let bw = text_width(&badge, 1) as i32 + 6;
+            add(2, hy - 13, bw + 2, 10);
         }
 
         // Bossbar stack (name text + progress bar per row).
@@ -4138,3 +4478,150 @@ fn modal(ctx: &mut Ctx) {
         None => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qol_helpers::{KeybindEntry, KeyBindings, ToastKind};
+
+    fn rect_of(cmd: &UiCommand) -> Option<UiRect> {
+        match cmd {
+            UiCommand::FillRect { rect, .. } | UiCommand::BorderRect { rect, .. } => Some(*rect),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn toast_stack_hidden_when_off_or_empty() {
+        let mut state = UiState::default();
+        let mut out = UiDrawList::new();
+        assert!(!layout_toast_stack(&state, 1280, 720, &mut out));
+        assert!(out.commands.is_empty());
+
+        state.push_toast(ToastKind::Info, "hi", "");
+        state.settings.qol.toast_notifications = false;
+        assert!(!layout_toast_stack(&state, 1280, 720, &mut out));
+        assert!(out.commands.is_empty());
+    }
+
+    #[test]
+    fn toast_stack_draws_top_right_on_menu() {
+        let mut state = UiState::default();
+        state.push_toast(ToastKind::Success, "Connected", "lobby.example.com");
+        // Age the toast past the fade-in so its alpha is 1.
+        state.toasts.tick(500);
+        let mut out = UiDrawList::new();
+        assert!(layout_toast_stack(&state, 1280, 720, &mut out));
+        assert!(!out.commands.is_empty());
+        // Every emitted rect stays inside the physical viewport and in
+        // the right half (right-anchored stack).
+        for cmd in &out.commands {
+            if let Some(r) = rect_of(cmd) {
+                assert!(r.x >= 1280 / 2, "toast leaked left: {r:?}");
+                assert!(r.right() <= 1280, "toast overflow: {r:?}");
+                assert!(r.bottom() <= 720, "toast overflow: {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn toast_stack_slides_below_hud_status_column() {
+        let mut state = UiState::default();
+        state.screen = Screen::InGameHud;
+        // MagicHUD status badges anchor the same top-right column the
+        // toast stack uses — the toast must slide below them.
+        state
+            .hud
+            .magic
+            .custom_statuses
+            .push(crate::magic_hud::StatusBadgeState {
+                label: "Haste".to_string(),
+                remaining_ticks: 100,
+                ..Default::default()
+            });
+        state.push_toast(ToastKind::Info, "tip", "");
+        state.toasts.tick(500);
+        let mut out = UiDrawList::new();
+        assert!(layout_toast_stack(&state, 1280, 720, &mut out));
+        // Status badge stack ends ~24 logical px down (≈48 physical at
+        // ms=2); the toast panel must start below it.
+        let top = out
+            .commands
+            .iter()
+            .filter_map(rect_of)
+            .map(|r| r.y)
+            .min()
+            .unwrap();
+        assert!(top >= 40, "toast overlaps HUD statuses: top={top}");
+    }
+
+    #[test]
+    fn qol_tab_exposes_new_toggle_hit_regions() {
+        let mut ui = UiState::default();
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        let (_draw, regions) = layout_screen(&ui, 1280, 720);
+        for id in [
+            WidgetId::QolAutoReconnect,
+            WidgetId::QolAutoReplenish,
+            WidgetId::QolQuickStack,
+            WidgetId::QolFoodPreview,
+            WidgetId::QolShulkerPeek,
+            WidgetId::QolChatScrollLock,
+            WidgetId::QolToasts,
+        ] {
+            assert!(
+                regions.iter().any(|r| r.id == id),
+                "missing hit region for {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qol_tab_badges_keybind_conflicts() {
+        let mut ui = UiState::default();
+        ui.keybinds = KeyBindings {
+            entries: vec![
+                KeybindEntry::new("Jump", "Space", false),
+                KeybindEntry::new("Boost", "Space", false),
+            ],
+        };
+        ui.navigate(Screen::Settings(SettingsTab::Qol));
+        let (draw, _regions) = layout_screen(&ui, 1280, 720);
+        let texts: Vec<&str> = draw
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                UiCommand::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("[!]")),
+            "no conflict badge in {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("conflict")),
+            "no conflict header in {texts:?}"
+        );
+    }
+
+    #[test]
+    fn hud_scroll_lock_shows_unread_badge() {
+        let mut state = UiState::default();
+        state.screen = Screen::InGameHud;
+        for i in 0..12 {
+            state.hud.chat_lines.push(format!("line{i}"));
+        }
+        state.chat_scroll.scroll_by(4);
+        for _ in 0..3 {
+            state.chat_scroll.on_new_message();
+        }
+        let (draw, _) = layout_screen(&state, 1280, 720);
+        assert!(draw.commands.iter().any(|c| matches!(
+            c,
+            UiCommand::Text { text, color, .. }
+                if text.contains("+") && *color == pal::WARNING
+        )));
+    }
+}
+

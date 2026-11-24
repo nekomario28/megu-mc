@@ -457,6 +457,51 @@ impl Default for ClientQolSettings {
     }
 }
 
+/// The "seamless" tiny-annoyance QoL toggles: four opinionated gameplay
+/// helpers that are strictly opt-in (`false` by default) plus three
+/// non-intrusive pure-UX improvements (`true` by default). Persisted
+/// under the `[qol]` TOML table next to [`ClientQolSettings`]; a
+/// separate struct so integrations constructing `ClientQolSettings`
+/// literals keep compiling unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClientSeamlessQolSettings {
+    /// Opt-in auto-reconnect after an unexpected disconnect (with a
+    /// capped exponential backoff; server refusals are never redialed).
+    /// `false` by default — a strict opt-in.
+    pub auto_reconnect: bool,
+    /// Opt-in automatic hotbar-stack replenish from the inventory.
+    /// `false` by default.
+    pub auto_replenish: bool,
+    /// Opt-in quick-stack-to-nearby-chests helper. `false` by default.
+    pub quick_stack_nearby: bool,
+    /// Opt-in hunger/saturation preview on food tooltips and the hunger
+    /// bar. `false` by default (yields to a dedicated food-stats mod).
+    pub food_saturation_preview: bool,
+    /// Show a compact contents summary on Shulker Box / Bundle tooltips.
+    /// `true` by default (pure UX, non-intrusive).
+    pub shulker_tooltip_peek: bool,
+    /// Keep the chat view anchored while reading scrollback instead of
+    /// yanking to the newest line. `true` by default.
+    pub chat_scroll_lock: bool,
+    /// Show the non-intrusive top-right toast stack (connection status,
+    /// warnings). `true` by default.
+    pub toast_notifications: bool,
+}
+
+impl Default for ClientSeamlessQolSettings {
+    fn default() -> Self {
+        Self {
+            auto_reconnect: false,
+            auto_replenish: false,
+            quick_stack_nearby: false,
+            food_saturation_preview: false,
+            shulker_tooltip_peek: true,
+            chat_scroll_lock: true,
+            toast_notifications: true,
+        }
+    }
+}
+
 /// Everything a player can tune. Fields are self-documenting; the TOML file
 /// mirrors them 1:1.
 #[derive(Clone, Debug, PartialEq)]
@@ -518,6 +563,10 @@ pub struct ClientSettings {
     /// Quality-of-life toggles (audio limiter, zoom, tool warnings, chat
     /// history) persisted under the `[qol]` TOML table.
     pub qol: ClientQolSettings,
+    /// Seamless tiny-annoyance QoL helpers (auto-reconnect, replenish,
+    /// quick stack, food preview, shulker peek, chat scroll-lock,
+    /// toasts), persisted in the same `[qol]` table.
+    pub seamless_qol: ClientSeamlessQolSettings,
     /// Crash-report consent policy (`crash_report_mode`): `ask` (the
     /// default) writes reports locally and asks before transmitting,
     /// `auto_crash_only` relays crash fingerprints without prompting, and
@@ -583,6 +632,7 @@ impl ClientSettings {
             shader_profile: None,
             map_fair_play: HostMapFairPlaySettings::default(),
             qol: ClientQolSettings::default(),
+            seamless_qol: ClientSeamlessQolSettings::default(),
             crash_report_mode: CrashReportMode::default(),
             report_endpoint: None,
             fullscreen: false,
@@ -730,7 +780,14 @@ impl ClientSettings {
              tool_warn_percent = {}\n\
              prevent_tool_break = {}\n\
              chat_history_lines = {}\n\
-             retain_chat_on_reconnect = {}\n",
+             retain_chat_on_reconnect = {}\n\
+             auto_reconnect = {}\n\
+             auto_replenish = {}\n\
+             quick_stack_nearby = {}\n\
+             food_saturation_preview = {}\n\
+             shulker_tooltip_peek = {}\n\
+             chat_scroll_lock = {}\n\
+             toast_notifications = {}\n",
             self.preset.as_str(),
             self.view_distance,
             self.distant_horizon.as_str(),
@@ -768,6 +825,13 @@ impl ClientSettings {
             self.qol.prevent_tool_break,
             self.qol.chat_history_lines,
             self.qol.retain_chat_on_reconnect,
+            self.seamless_qol.auto_reconnect,
+            self.seamless_qol.auto_replenish,
+            self.seamless_qol.quick_stack_nearby,
+            self.seamless_qol.food_saturation_preview,
+            self.seamless_qol.shulker_tooltip_peek,
+            self.seamless_qol.chat_scroll_lock,
+            self.seamless_qol.toast_notifications,
         ) + &format!(
             "\n[keys]\nforward = \"{}\"\nback = \"{}\"\nleft = \"{}\"\nright = \"{}\"\njump = \"{}\"\nsneak = \"{}\"\nsprint = \"{}\"\ninventory = \"{}\"\ndrop = \"{}\"\nswap_offhand = \"{}\"\nchat = \"{}\"\ncommand = \"{}\"\nzoom = \"{}\"\ncamera_toggle = \"{}\"\nfullscreen = \"{}\"\nadvancements = \"{}\"\nsort_inventory = \"{}\"\n",
             self.keys.forward,
@@ -899,6 +963,21 @@ impl ClientSettings {
                 }
                 "retain_chat_on_reconnect" => {
                     self.qol.retain_chat_on_reconnect = parsed.qol.retain_chat_on_reconnect;
+                }
+                "auto_reconnect" => self.seamless_qol.auto_reconnect = parsed.seamless_qol.auto_reconnect,
+                "auto_replenish" => self.seamless_qol.auto_replenish = parsed.seamless_qol.auto_replenish,
+                "quick_stack_nearby" => {
+                    self.seamless_qol.quick_stack_nearby = parsed.seamless_qol.quick_stack_nearby;
+                }
+                "food_saturation_preview" => {
+                    self.seamless_qol.food_saturation_preview = parsed.seamless_qol.food_saturation_preview;
+                }
+                "shulker_tooltip_peek" => {
+                    self.seamless_qol.shulker_tooltip_peek = parsed.seamless_qol.shulker_tooltip_peek;
+                }
+                "chat_scroll_lock" => self.seamless_qol.chat_scroll_lock = parsed.seamless_qol.chat_scroll_lock,
+                "toast_notifications" => {
+                    self.seamless_qol.toast_notifications = parsed.seamless_qol.toast_notifications;
                 }
                 "crash_report_mode" => self.crash_report_mode = parsed.crash_report_mode,
                 "report_endpoint" => self.report_endpoint = parsed.report_endpoint.clone(),
@@ -1385,6 +1464,55 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
+                "auto_reconnect" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.auto_reconnect = b;
+                        seen.push("auto_reconnect");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "auto_replenish" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.auto_replenish = b;
+                        seen.push("auto_replenish");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "quick_stack_nearby" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.quick_stack_nearby = b;
+                        seen.push("quick_stack_nearby");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "food_saturation_preview" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.food_saturation_preview = b;
+                        seen.push("food_saturation_preview");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "shulker_tooltip_peek" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.shulker_tooltip_peek = b;
+                        seen.push("shulker_tooltip_peek");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "chat_scroll_lock" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.chat_scroll_lock = b;
+                        seen.push("chat_scroll_lock");
+                    }
+                    None => invalid(&mut warnings),
+                },
+                "toast_notifications" => match parse_bool(value) {
+                    Some(b) => {
+                        settings.seamless_qol.toast_notifications = b;
+                        seen.push("toast_notifications");
+                    }
+                    None => invalid(&mut warnings),
+                },
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
         }
@@ -1837,6 +1965,15 @@ mod tests {
                 chat_history_lines: 250,
                 retain_chat_on_reconnect: false,
             },
+            seamless_qol: ClientSeamlessQolSettings {
+                auto_reconnect: true,
+                auto_replenish: true,
+                quick_stack_nearby: true,
+                food_saturation_preview: true,
+                shulker_tooltip_peek: false,
+                chat_scroll_lock: false,
+                toast_notifications: false,
+            },
             crash_report_mode: CrashReportMode::AutoCrashOnly,
             report_endpoint: Some("https://reports.example.com/api/report".to_owned()),
             fullscreen: true,
@@ -1858,6 +1995,65 @@ mod tests {
         let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
         assert_eq!(back.max_fps, None);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn seamless_qol_defaults_opt_in_off_and_ux_on() {
+        let q = ClientSeamlessQolSettings::default();
+        // Opinionated gameplay helpers are strictly opt-in.
+        assert!(!q.auto_reconnect);
+        assert!(!q.auto_replenish);
+        assert!(!q.quick_stack_nearby);
+        assert!(!q.food_saturation_preview);
+        // Non-intrusive pure-UX improvements default on.
+        assert!(q.shulker_tooltip_peek);
+        assert!(q.chat_scroll_lock);
+        assert!(q.toast_notifications);
+    }
+
+    #[test]
+    fn seamless_qol_toml_roundtrip_and_omitted_defaults() {
+        let settings = ClientSettings {
+            seamless_qol: ClientSeamlessQolSettings {
+                auto_reconnect: true,
+                auto_replenish: true,
+                quick_stack_nearby: true,
+                food_saturation_preview: true,
+                shulker_tooltip_peek: false,
+                chat_scroll_lock: false,
+                toast_notifications: false,
+            },
+            ..ClientSettings::default()
+        };
+        let text = settings.to_toml();
+        assert!(text.contains("[qol]"));
+        assert!(text.contains("auto_reconnect = true"));
+        assert!(text.contains("food_saturation_preview = true"));
+        assert!(text.contains("chat_scroll_lock = false"));
+
+        let (back, warnings) = ClientSettings::from_toml(&text);
+        assert_eq!(back.seamless_qol, settings.seamless_qol);
+        assert_eq!(back, settings);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        // apply_toml overlays only the keys a file defines.
+        let mut s = ClientSettings::default();
+        let warnings = s.apply_toml("[qol]\nauto_reconnect = true\ntoast_notifications = false\n");
+        assert!(warnings.is_empty());
+        assert!(s.seamless_qol.auto_reconnect);
+        assert!(!s.seamless_qol.toast_notifications);
+        assert!(!s.seamless_qol.auto_replenish, "undefined keys keep defaults");
+        assert!(s.seamless_qol.shulker_tooltip_peek);
+
+        // Files written before the seamless keys existed parse clean.
+        let (legacy, warnings) = ClientSettings::from_toml("[qol]\nmax_volume_cap = 0.5\n");
+        assert_eq!(legacy.seamless_qol, ClientSeamlessQolSettings::default());
+        assert!(warnings.is_empty());
+
+        // Non-boolean junk warns and falls back to the default.
+        let (parsed, warnings) = ClientSettings::from_toml("[qol]\nauto_reconnect = \"yes\"\n");
+        assert!(!parsed.seamless_qol.auto_reconnect);
+        assert!(!warnings.is_empty());
     }
 
     #[test]
