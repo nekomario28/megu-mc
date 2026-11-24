@@ -23,7 +23,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-type CachedChunkLookup = (Arc<Vec<u8>>, Vec<((i32, i32, i32), u8)>);
+type CachedChunkLookup = (Arc<[u8]>, Vec<((i32, i32, i32), u8)>);
 
 // ----------------------------------------------------------- protocol codecs
 
@@ -251,25 +251,58 @@ fn with_zlib_inflate<R>(f: impl FnOnce(&mut ZlibDecompressScratch) -> R) -> R {
 
 /// Frame a packet (including its packet ID) after compression is enabled.
 pub(crate) fn encode_compressed_frame(raw: &[u8], threshold: usize) -> Vec<u8> {
-    // One body buffer for both paths; the zlib stream is appended to it from
-    // the thread's scratch state, then the outer length is prepended in a
-    // single allocation. Every compressed frame on this path — chunk-cache
-    // misses (`ChunkPacketCache`), per-broadcast arms (`SharedBroadcastFrame`)
-    // and uncached sends (`ChunkPacketCache::frame_uncached`) — lands in the
-    // same per-thread deflate state.
-    let mut body = Vec::with_capacity(raw.len() + 8);
     if raw.len() < threshold {
-        crate::write_varint(&mut body, 0);
-        body.extend_from_slice(raw);
+        let mut frame = Vec::with_capacity(raw.len() + 1 + 5);
+        crate::write_varint(&mut frame, 0);
+        frame.extend_from_slice(raw);
+        finish_compressed_frame(frame)
     } else {
-        crate::write_varint(&mut body, raw.len() as i64);
         let level = zlib_level();
-        with_zlib_scratch(|scratch| body.extend_from_slice(scratch.compress_at(level, raw)));
+        with_zlib_scratch(|scratch| {
+            let compressed = scratch.compress_at(level, raw);
+            let mut frame = Vec::with_capacity(
+                compressed.len() + protocol_varint_u32_len(raw.len() as u32) + 5,
+            );
+            crate::write_varint(&mut frame, raw.len() as i64);
+            frame.extend_from_slice(compressed);
+            finish_compressed_frame(frame)
+        })
     }
-    let mut frame = Vec::with_capacity(body.len() + 5);
-    crate::write_varint(&mut frame, body.len() as i64);
-    frame.extend_from_slice(&body);
+}
+
+fn finish_compressed_frame(mut frame: Vec<u8>) -> Vec<u8> {
+    let body_len = frame.len();
+    let mut prefix = [0u8; 5];
+    let mut value = body_len as u32;
+    let prefix_len = protocol_varint_u32_len(value);
+    let mut index = 0;
+    while value != 0 {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        prefix[index] = byte;
+        index += 1;
+    }
+    if body_len == 0 {
+        prefix[0] = 0;
+    }
+    frame.reserve(prefix_len);
+    frame.resize(body_len + prefix_len, 0);
+    frame.copy_within(0..body_len, prefix_len);
+    frame[..prefix_len].copy_from_slice(&prefix[..prefix_len]);
+    frame.truncate(body_len + prefix_len);
     frame
+}
+
+fn protocol_varint_u32_len(mut value: u32) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        len += 1;
+    }
+    len
 }
 
 /// Decode the frame body after its outer packet length has been removed.
@@ -547,10 +580,10 @@ mod chunk_delivery_tests {
 enum CachedPayload {
     /// `varint(len)` + `varint(0x27)` + payload — the exact bytes an
     /// uncompressed client receives.
-    Plain(Arc<Vec<u8>>),
+    Plain(Arc<[u8]>),
     /// `encode_compressed_frame` of the same body, built on first request for
     /// the negotiated threshold (uniform per server: one env knob).
-    Compressed { threshold: usize, frame: Arc<Vec<u8>> },
+    Compressed { threshold: usize, frame: Arc<[u8]> },
 }
 
 /// One fully encoded `0x27` chunk packet, shared by every client that asks for
@@ -562,6 +595,7 @@ struct CachedChunkPacket {
     /// neighbour generated emitters, the settled light revision — so a relit
     /// chunk invalidates too), and the live block entities spliced on send.
     revision: u64,
+    last_used: u64,
     /// The chunk's own generated light emitters, restored into the caller's
     /// `GenSources` on a hit exactly as a rebuild would record them.
     own_emitters: Vec<((i32, i32, i32), u8)>,
@@ -600,7 +634,7 @@ fn body_of_frame(plain: &[u8]) -> &[u8] {
 /// most expensive step of the send. The bytes depend only on the world state
 /// the revision folds together, so every reader at the same revision receives
 /// literally the same `Arc`, and a player re-entering a column reuses it too.
-/// Entries are bounded (the same 512 the payload/light caches use) and dropped
+/// Entries are bounded (2048 by default) and dropped
 /// wholesale when the generator's `generation` moves, like `MapChunkCache`.
 ///
 /// The key's last field is the anti-xray occlusion lane: `false` is the real
@@ -610,26 +644,32 @@ fn body_of_frame(plain: &[u8]) -> &[u8] {
 pub(crate) struct ChunkPacketCache {
     generation: u64,
     map: HashMap<(crate::DimId, i32, i32, bool), CachedChunkPacket>,
-    order: VecDeque<(crate::DimId, i32, i32, bool)>,
+    capacity: usize,
+    use_clock: u64,
 }
 
 /// Entries retained; each holds one wire form of a full chunk frame — the
 /// plain frame, or only its compressed form once a compressed client asks.
-const CHUNK_PACKET_CACHE_CAP: usize = 512;
+const CHUNK_PACKET_CACHE_CAP: usize = 2048;
 
 impl ChunkPacketCache {
     pub(crate) fn new() -> Self {
         Self {
             generation: 0,
             map: HashMap::new(),
-            order: VecDeque::new(),
+            capacity: CHUNK_PACKET_CACHE_CAP,
+            use_clock: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn with_capacity(capacity: usize) -> Self {
+        Self { capacity, ..Self::new() }
     }
 
     fn sync_generation(&mut self, generation: u64) {
         if self.generation != generation {
             self.map.clear();
-            self.order.clear();
             self.generation = generation;
         }
     }
@@ -645,6 +685,7 @@ impl ChunkPacketCache {
         compression: Option<usize>,
     ) -> Option<CachedChunkLookup> {
         self.sync_generation(generation);
+        self.use_clock = self.use_clock.wrapping_add(1);
         let entry = self.map.get_mut(&key)?;
         if entry.revision != revision {
             return None;
@@ -667,9 +708,8 @@ impl ChunkPacketCache {
                 CachedPayload::Plain(plain) => {
                     // Compress once, then swap the payload: assigning drops
                     // the ~20-40 KiB plain buffer in the same move.
-                    let frame = Arc::new(encode_compressed_frame(
-                        body_of_frame(plain),
-                        threshold,
+                    let frame: Arc<[u8]> = Arc::from(encode_compressed_frame(
+                        body_of_frame(plain), threshold,
                     ));
                     entry.payload = CachedPayload::Compressed {
                         threshold,
@@ -679,12 +719,13 @@ impl ChunkPacketCache {
                 }
             },
         };
+        entry.last_used = self.use_clock;
         Some((frame, entry.own_emitters.clone()))
     }
 
-    /// Approximate heap bytes retained: each entry's frame buffer at its
-    /// allocated capacity, its emitter list, and the entry struct itself.
-    /// Measures the plain-drop win directly in tests and diagnostics.
+    /// Approximate live heap bytes retained: each entry's frame length, its
+    /// emitter list, and the entry struct itself. Arc slice capacity is not
+    /// observable, so the metric deliberately uses the owned byte length.
     #[allow(dead_code)]
     pub(crate) fn estimated_bytes(&self) -> usize {
         self.map
@@ -692,7 +733,7 @@ impl ChunkPacketCache {
             .map(|entry| {
                 let frame_bytes = match &entry.payload {
                     CachedPayload::Plain(frame)
-                    | CachedPayload::Compressed { frame, .. } => frame.capacity(),
+                    | CachedPayload::Compressed { frame, .. } => frame.len(),
                 };
                 frame_bytes
                     + entry.own_emitters.capacity()
@@ -717,26 +758,33 @@ impl ChunkPacketCache {
         self.sync_generation(generation);
         let entry = CachedChunkPacket {
             revision,
+            last_used: self.use_clock.wrapping_add(1),
             own_emitters,
-            payload: CachedPayload::Plain(Arc::new(plain_frame(&chunk_packet_body(&payload)))),
+            payload: CachedPayload::Plain(Arc::from(plain_frame(&chunk_packet_body(&payload)))),
         };
-        if self.map.insert(key, entry).is_none() {
-            self.order.push_back(key);
-        }
-        while self.order.len() > CHUNK_PACKET_CACHE_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
+        self.use_clock = self.use_clock.wrapping_add(1);
+        self.map.insert(key, entry);
+        while self.map.len() > self.capacity {
+            let least_recent = self
+                .map
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key);
+            if let Some(key) = least_recent {
+                self.map.remove(&key);
+            } else {
+                break;
             }
         }
     }
 
     /// The frame for a payload that must not be retained (the build raced an
     /// edit). The bytes sent are identical to a cached entry's.
-    pub(crate) fn frame_uncached(payload: &[u8], compression: Option<usize>) -> Arc<Vec<u8>> {
+    pub(crate) fn frame_uncached(payload: &[u8], compression: Option<usize>) -> Arc<[u8]> {
         let body = chunk_packet_body(payload);
         match compression {
-            None => Arc::new(plain_frame(&body)),
-            Some(threshold) => Arc::new(encode_compressed_frame(&body, threshold)),
+            None => Arc::from(plain_frame(&body)),
+            Some(threshold) => Arc::from(encode_compressed_frame(&body, threshold)),
         }
     }
 
@@ -744,7 +792,6 @@ impl ChunkPacketCache {
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     pub(crate) fn clear(&mut self) {
         self.map.clear();
-        self.order.clear();
     }
 }
 
@@ -907,7 +954,7 @@ pub(crate) enum TxQueueError {
 ///
 /// `game_tick` must never wait on a socket: one client whose TCP send buffer
 /// is full would otherwise hold the whole broadcast loop head-of-line while
-/// every other player waits. Producers `try_enqueue` `Arc<[u8]>` frames —
+/// every other player waits. Producers `try_enqueue_arc` `Arc<[u8]>` frames —
 /// the same allocations a `SharedBroadcastFrame` hands out, so a broadcast
 /// queueing onto 50 clients is 50 refcount bumps and zero copies — in O(1)
 /// and never block on I/O; over the byte budget the call fails fast with
@@ -925,10 +972,31 @@ pub(crate) struct ClientTxQueue {
 
 #[derive(Default)]
 struct TxQueueInner {
-    queue: VecDeque<Arc<[u8]>>,
+    queue: VecDeque<OutboundFrame>,
     /// Sum of `frame.len()` over `queue` — the bound `try_enqueue` enforces.
     queued_bytes: usize,
     closed: bool,
+}
+
+pub(crate) enum OutboundFrame {
+    Owned(Vec<u8>),
+    Shared(Arc<[u8]>),
+}
+
+impl OutboundFrame {
+    fn len(&self) -> usize {
+        match self {
+            Self::Owned(frame) => frame.len(),
+            Self::Shared(frame) => frame.len(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(frame) => frame,
+            Self::Shared(frame) => frame,
+        }
+    }
 }
 
 impl ClientTxQueue {
@@ -948,7 +1016,17 @@ impl ClientTxQueue {
     /// Queue `frame` for the writer thread without ever blocking. Fails fast
     /// — rather than stalling the caller — when the byte budget would be
     /// exceeded or the queue is closed.
-    pub(crate) fn try_enqueue(&self, frame: Arc<[u8]>) -> Result<(), TxQueueError> {
+    pub(crate) fn try_enqueue(&self, frame: Vec<u8>) -> Result<(), TxQueueError> {
+        self.enqueue(OutboundFrame::Owned(frame))
+    }
+
+    /// Queue a cached/shared frame by refcount bump only; the cached bytes
+    /// remain in the same allocation and are never copied per recipient.
+    pub(crate) fn try_enqueue_arc(&self, frame: Arc<[u8]>) -> Result<(), TxQueueError> {
+        self.enqueue(OutboundFrame::Shared(frame))
+    }
+
+    fn enqueue(&self, frame: OutboundFrame) -> Result<(), TxQueueError> {
         let mut inner = lock(&self.inner);
         if inner.closed {
             return Err(TxQueueError::Closed);
@@ -971,7 +1049,7 @@ impl ClientTxQueue {
 
     /// Move every currently queued frame into `out` in FIFO order and zero
     /// the byte count. `writer_loop` calls this once per woken batch.
-    pub(crate) fn drain_batch(&self, out: &mut Vec<Arc<[u8]>>) {
+    pub(crate) fn drain_batch(&self, out: &mut Vec<OutboundFrame>) {
         let mut inner = lock(&self.inner);
         inner.queued_bytes = 0;
         out.extend(inner.queue.drain(..));
@@ -1012,7 +1090,7 @@ impl ClientTxQueue {
         while self.wait_for_work() {
             self.drain_batch(&mut batch);
             for frame in batch.drain(..) {
-                coalescer.push_frame(&frame, w)?;
+                coalescer.push_frame(frame.as_slice(), w)?;
             }
             coalescer.flush(w)?;
         }
@@ -2004,7 +2082,7 @@ mod tests {
 
         assert_eq!(&*broadcast, &*uncached, "identical bytes from both paths");
         assert_eq!(&*cached, &*broadcast, "the cache stores the same frame");
-        let mut body = cached.as_slice();
+        let mut body = &cached[..];
         crate::read_protocol_i32(&mut body).expect("outer length");
         let decoded = decode_compressed_frame(body, 256, 1 << 20).unwrap();
         assert_eq!(&decoded[1..], &payload[..], "the frame holds the payload");
@@ -2438,6 +2516,24 @@ mod tests {
     }
 
     #[test]
+    fn chunk_packet_cache_lru_retains_hot_entry_and_evicts_cold_entry() {
+        let mut cache = ChunkPacketCache::with_capacity(3);
+        let keys = (0..4)
+            .map(|x| (crate::DimId::Overworld, x, 0, false))
+            .collect::<Vec<_>>();
+        for (index, key) in keys.iter().copied().enumerate().take(3) {
+            cache.insert(1, key, 1, vec![], vec![index as u8]);
+        }
+        let (hot_before, _) = cache.frame(1, keys[0], 1, None).unwrap();
+        assert!(Arc::ptr_eq(&hot_before, &cache.frame(1, keys[0], 1, None).unwrap().0));
+        cache.insert(1, keys[3], 1, vec![], vec![3]);
+        assert!(cache.frame(1, keys[0], 1, None).is_some(), "recently read entry stays cached");
+        assert!(cache.frame(1, keys[1], 1, None).is_none(), "least recently used entry is evicted");
+        let (shared, _) = cache.frame(1, keys[0], 1, None).unwrap();
+        assert!(Arc::ptr_eq(&hot_before, &shared), "cache hits return the same Arc allocation");
+    }
+
+    #[test]
     fn broadcast_radius_reads_the_vanilla_range_contract() {
         // named sound: id+1 varint, source varint, fixed-point pos, f32 volume.
         let mut snd = Vec::new();
@@ -2572,8 +2668,8 @@ mod tests {
             raw,
             "fast level round-trips byte-for-byte"
         );
-        // Two allocations total (body + one prepend): the returned Vec has no
-        // oversized spare capacity beyond the 5-byte length prefix.
+        // One final-frame allocation: compression stays in thread-local
+        // scratch and the returned Vec has only header-sized spare capacity.
         assert!(frame.capacity() >= frame.len());
         assert!(
             frame.capacity() - frame.len() <= 5,
@@ -2775,7 +2871,7 @@ mod tests {
         for i in 0..30u8 {
             let frame: Arc<[u8]> = Arc::from(vec![i; 100 + usize::from(i)]);
             expected.extend_from_slice(&frame);
-            queue.try_enqueue(frame).unwrap();
+            queue.try_enqueue_arc(frame).unwrap();
         }
         assert_eq!(queue.queued_bytes(), expected.len());
 
@@ -2803,7 +2899,7 @@ mod tests {
         assert_eq!(out.writes, 1, "the 30-frame burst is one coalesced write");
         assert_eq!(out.bytes, expected, "frames leave in exact wire order");
         assert_eq!(
-            queue.try_enqueue(Arc::from(vec![1u8])),
+            queue.try_enqueue(vec![1u8]),
             Err(TxQueueError::Closed)
         );
     }
@@ -2831,13 +2927,13 @@ mod tests {
         let queue = ClientTxQueue::new(300);
         let frame: Arc<[u8]> = Arc::from(vec![7u8; 100]);
         for _ in 0..3 {
-            queue.try_enqueue(frame.clone()).unwrap();
+            queue.try_enqueue_arc(frame.clone()).unwrap();
         }
         assert_eq!(queue.queued_bytes(), 300);
 
         let start = Instant::now();
         assert_eq!(
-            queue.try_enqueue(Arc::from(vec![9u8; 1])),
+            queue.try_enqueue(vec![9u8; 1]),
             Err(TxQueueError::BackpressureSlowClient)
         );
         assert!(
@@ -2848,7 +2944,7 @@ mod tests {
         // even an old frame still over the limit keeps failing.
         assert_eq!(queue.queued_bytes(), 300);
         assert_eq!(
-            queue.try_enqueue(frame.clone()),
+            queue.try_enqueue_arc(frame.clone()),
             Err(TxQueueError::BackpressureSlowClient)
         );
 
@@ -2856,14 +2952,34 @@ mod tests {
         let mut out = Vec::new();
         queue.drain_batch(&mut out);
         assert_eq!(out.len(), 3);
-        assert!(out.iter().all(|f| Arc::ptr_eq(f, &frame)));
+        assert!(out.iter().all(|f| matches!(f, OutboundFrame::Shared(shared) if Arc::ptr_eq(shared, &frame))));
         assert_eq!(queue.queued_bytes(), 0);
-        queue.try_enqueue(frame).unwrap();
+        queue.try_enqueue_arc(frame).unwrap();
 
         queue.close();
         assert_eq!(
-            queue.try_enqueue(Arc::from(vec![1u8; 1])),
+            queue.try_enqueue(vec![1u8; 1]),
             Err(TxQueueError::Closed)
         );
+    }
+
+    #[test]
+    fn tx_queue_arc_enqueue_accounts_bytes_and_preserves_mixed_delivery_order() {
+        let queue = ClientTxQueue::new(32);
+        let shared: Arc<[u8]> = Arc::from([1u8, 2, 3, 4]);
+        let shared_ptr = Arc::clone(&shared);
+        queue.try_enqueue(vec![0]).unwrap();
+        queue.try_enqueue_arc(Arc::clone(&shared)).unwrap();
+        queue.try_enqueue(vec![5, 6]).unwrap();
+        assert_eq!(queue.queued_bytes(), 7);
+        let mut out = Vec::new();
+        queue.drain_batch(&mut out);
+        assert_eq!(queue.queued_bytes(), 0);
+        assert!(matches!(&out[1], OutboundFrame::Shared(frame) if Arc::ptr_eq(frame, &shared_ptr)));
+        let mut bytes = Vec::new();
+        for frame in &out {
+            bytes.extend_from_slice(frame.as_slice());
+        }
+        assert_eq!(bytes, [0, 1, 2, 3, 4, 5, 6]);
     }
 }

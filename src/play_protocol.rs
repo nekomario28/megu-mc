@@ -1247,13 +1247,9 @@ struct ConnCipher {
 /// `None` — one map lookup per socket call, on top of the lookup `send_packet`
 /// already performs.
 fn conn_cipher(s: &TcpStream) -> Option<Arc<ConnCipher>> {
-    SOCKET_WIRE
-        .get()?
-        .lock()
-        .unwrap()
-        .get(&socket_key(s))?
-        .cipher
-        .clone()
+    let state = wire_state(socket_key(s))?;
+    let cipher = state.lock().unwrap_or_else(|e| e.into_inner()).cipher.clone();
+    cipher
 }
 
 /// Arm encryption on `s`'s wire entry with the negotiated shared secret. Called
@@ -1264,12 +1260,8 @@ fn enable_conn_encryption(s: &TcpStream, secret: &[u8; 16]) {
         rx: Mutex::new(Aes128Cfb8::new(secret, secret)),
         tx: Mutex::new(Aes128Cfb8::new(secret, secret)),
     });
-    socket_wire()
-        .lock()
-        .unwrap()
-        .entry(socket_key(s))
-        .or_default()
-        .cipher = Some(cipher);
+    let state = wire_state_or_insert(socket_key(s));
+    state.lock().unwrap_or_else(|e| e.into_inner()).cipher = Some(cipher);
 }
 
 #[derive(Default)]
@@ -1462,21 +1454,31 @@ impl PlayWireState {
 // Existing packet producers share TcpStream, including the cloned Play writer.
 // Store framing against each owned handle until its owner drops, before the OS
 // can reuse the handle. The registry lock is released before compression or I/O.
-static SOCKET_WIRE: OnceLock<Mutex<HashMap<u64, SocketWireState>>> = OnceLock::new();
+static SOCKET_WIRE: OnceLock<std::sync::RwLock<HashMap<u64, Arc<Mutex<SocketWireState>>>>> = OnceLock::new();
 
-fn socket_wire() -> &'static Mutex<HashMap<u64, SocketWireState>> {
-    SOCKET_WIRE.get_or_init(Mutex::default)
+fn socket_wire() -> &'static std::sync::RwLock<HashMap<u64, Arc<Mutex<SocketWireState>>>> {
+    SOCKET_WIRE.get_or_init(std::sync::RwLock::default)
+}
+
+fn wire_state(key: u64) -> Option<Arc<Mutex<SocketWireState>>> {
+    SOCKET_WIRE.get()?.read().unwrap_or_else(|e| e.into_inner()).get(&key).cloned()
+}
+
+fn wire_state_or_insert(key: u64) -> Arc<Mutex<SocketWireState>> {
+    let mut states = socket_wire().write().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(states.entry(key).or_insert_with(|| Arc::new(Mutex::default())))
 }
 
 fn with_play_wire<T>(socket: &TcpStream, f: impl FnOnce(&mut PlayWireState) -> T) -> Option<T> {
-    let mut states = SOCKET_WIRE.get()?.lock().unwrap_or_else(|e| e.into_inner());
-    states.get_mut(&socket_key(socket))?.play.as_mut().map(f)
+    let state = wire_state(socket_key(socket))?;
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.play.as_mut().map(f)
 }
 
 fn unregister_socket_wire(key: u64) {
     if let Some(states) = SOCKET_WIRE.get() {
         states
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
     }
@@ -1510,10 +1512,10 @@ fn negotiate_compression(
     };
     send_packet(s, 0x03, connection_limits::set_compression(threshold))?;
     let key = socket_key(s);
-    let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
+    let state = wire_state_or_insert(key);
     // Merge, not overwrite: online-mode login arms a cipher on this socket
     // before compression is negotiated.
-    states.entry(key).or_default().compression = Some(size);
+    state.lock().unwrap_or_else(|e| e.into_inner()).compression = Some(size);
     Ok(Some(LoginCompression(key)))
 }
 
@@ -1530,10 +1532,8 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
         }
     }
     let mut send = true;
-    let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
-        let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let key = socket_key(s);
-        let state = states.get_mut(&key)?;
+    let (compression, queued) = wire_state(socket_key(s)).map(|state| {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(play) = &mut state.play {
             send = play.update_packet(&mut id, &mut payload, TICK_IDX.load(Ordering::Relaxed));
         }
@@ -1544,11 +1544,11 @@ fn send_packet(s: &mut TcpStream, mut id: i64, mut payload: Vec<u8>) -> std::io:
             let mut body = Vec::with_capacity(payload.len() + 5);
             write_varint(&mut body, id);
             body.extend_from_slice(&payload);
-            queue_play_frame(state, Arc::from(encoded_frame(&body, state.compression)))
+            queue_play_owned_frame(&state, encoded_frame(&body, state.compression))
         } else {
             None
         };
-        Some((state.compression, queued))
+        (state.compression, queued)
     }).unwrap_or((None, None));
     if !send {
         return Ok(());
@@ -1574,7 +1574,7 @@ fn encoded_frame(body: &[u8], compression: Option<usize>) -> Vec<u8> {
     }
 }
 
-/// Queue already-framed bytes while holding `SOCKET_WIRE`. Encryption must
+/// Queue already-framed bytes while holding this connection's wire state. Encryption must
 /// precede FIFO enqueue: AES-CFB8 is a stream cipher, so rearranging the
 /// producer-side cipher advances would corrupt every later packet. Concatenating
 /// encrypted frames in the writer's coalescer is byte-preserving.
@@ -1587,6 +1587,21 @@ fn queue_play_frame(
         let mut bytes = frame.to_vec();
         cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut bytes);
         frame = Arc::from(bytes);
+    }
+    let result = queue.try_enqueue_arc(frame);
+    if result == Err(connection_limits::TxQueueError::BackpressureSlowClient) {
+        queue.close();
+    }
+    Some(result)
+}
+
+fn queue_play_owned_frame(
+    state: &SocketWireState,
+    mut frame: Vec<u8>,
+) -> Option<Result<(), connection_limits::TxQueueError>> {
+    let queue = state.tx_queue.as_ref()?;
+    if let Some(cipher) = &state.cipher {
+        cipher.tx.lock().unwrap_or_else(|e| e.into_inner()).encrypt(&mut frame);
     }
     let result = queue.try_enqueue(frame);
     if result == Err(connection_limits::TxQueueError::BackpressureSlowClient) {
@@ -1616,12 +1631,10 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
     // Login/status/configuration sockets have no TX queue and keep their
     // synchronous handshake writes. Once Play is armed, all entry points use
     // the same produce-order serialization, including direct frame writers.
-    let queued = SOCKET_WIRE.get().and_then(|states| {
-        let states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let key = socket_key(s);
-        let state = states.get(&key)?;
+    let queued = wire_state(socket_key(s)).and_then(|state| {
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
         if state.tx_queue.is_some() {
-            queue_play_frame(state, Arc::from(encoded_frame(body, compression)))
+            queue_play_owned_frame(&state, encoded_frame(body, compression))
         } else {
             None
         }
@@ -1646,12 +1659,10 @@ fn write_frame(s: &mut TcpStream, body: &[u8], compression: Option<usize>) -> st
 /// plain connection writes them with no copy at all, while a ciphered
 /// connection encrypts a scratch copy rather than mutating the shared
 /// allocation the other recipients still have to send.
-fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
-    let queued = SOCKET_WIRE.get().and_then(|states| {
-        let states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let key = socket_key(s);
-        let state = states.get(&key)?;
-        queue_play_frame(state, Arc::from(frame))
+fn write_raw_frame_arc(s: &mut TcpStream, frame: Arc<[u8]>) -> std::io::Result<()> {
+    let queued = wire_state(socket_key(s)).and_then(|state| {
+        let state = state.lock().unwrap_or_else(|e| e.into_inner());
+        queue_play_frame(&state, frame.clone())
     });
     if let Some(result) = queued {
         return queued_send_result(s, result);
@@ -1665,13 +1676,18 @@ fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
             .encrypt(&mut bytes);
         s.write_all(&bytes)
     } else {
-        s.write_all(frame)
+        s.write_all(&frame)
     };
     if result.is_err() {
         // A partial write invalidates both the frame boundary and entity baselines.
         let _ = s.shutdown(std::net::Shutdown::Both);
     }
     result
+}
+
+#[cfg(test)]
+fn write_raw_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
+    write_raw_frame_arc(s, Arc::from(frame))
 }
 
 /// One broadcast's reusable wire form. The first `(id, payload)` `mk` produces
@@ -1733,10 +1749,8 @@ fn send_broadcast_frame(
     }
     let mut send = true;
     let mut rewritten: Option<Vec<u8>> = None;
-    let (compression, queued) = SOCKET_WIRE.get().and_then(|states| {
-        let mut states = states.lock().unwrap_or_else(|e| e.into_inner());
-        let key = socket_key(s);
-        let state = states.get_mut(&key)?;
+    let (compression, queued) = wire_state(socket_key(s)).map(|state| {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(play) = &mut state.play {
             let mut wire_id = id;
             let mut scratch = payload.to_vec();
@@ -1751,19 +1765,21 @@ fn send_broadcast_frame(
             }
         }
         let queued = if send && state.tx_queue.is_some() {
-            let frame = if let Some(payload) = &rewritten {
+            if let Some(payload) = &rewritten {
                 let mut body = Vec::with_capacity(payload.len() + 5);
                 write_varint(&mut body, id);
                 body.extend_from_slice(payload);
-                Arc::from(encoded_frame(&body, state.compression))
+                queue_play_owned_frame(&state, encoded_frame(&body, state.compression))
             } else {
-                broadcast_frame(cache, id, payload).frame_for(state.compression)
-            };
-            queue_play_frame(state, frame)
+                queue_play_frame(
+                    &state,
+                    broadcast_frame(cache, id, payload).frame_for(state.compression),
+                )
+            }
         } else {
             None
         };
-        Some((state.compression, queued))
+        (state.compression, queued)
     }).unwrap_or((None, None));
     if !send {
         return Ok(());
@@ -1778,7 +1794,7 @@ fn send_broadcast_frame(
         return write_frame(s, &body, compression);
     }
     let frame = broadcast_frame(cache, id, payload).frame_for(compression);
-    write_raw_frame(s, frame.as_ref())
+    write_raw_frame_arc(s, frame)
 }
 
 /// A START_DESTROY_BLOCK the client has not cancelled. Vanilla survival mining
@@ -1958,10 +1974,10 @@ impl Client {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
                 }
             })?;
-        let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
+        let state = wire_state_or_insert(key);
         // Merge, not overwrite: the encryption handshake may have armed a
         // cipher on this writer fd before the play state existed.
-        let state = states.entry(key).or_default();
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         state.compression = compression;
         state.play = Some(PlayWireState {
             chunk_delivery,
@@ -1980,9 +1996,11 @@ impl Client {
             socket_key(&socket)
         };
         let (queue, writer) = {
-            let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
-            match states.get_mut(&key) {
-                Some(state) => (state.tx_queue.clone(), state.tx_writer.take()),
+            match wire_state(key) {
+                Some(state) => {
+                    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                    (state.tx_queue.clone(), state.tx_writer.take())
+                }
                 None => (None, None),
             }
         };
@@ -5770,21 +5788,22 @@ fn chunk_packet_revision(
 /// `stream_chunks` call: the frames the cache hands out are shared, so the
 /// per-packet `send_packet` lookup is not repeated per chunk.
 fn socket_compression(s: &TcpStream) -> Option<usize> {
-    SOCKET_WIRE.get().and_then(|states| {
-        states
-            .lock()
-            .unwrap()
-            .get(&socket_key(s))?
-            .compression
-    })
+    let state = wire_state(socket_key(s))?;
+    let compression = state.lock().unwrap_or_else(|e| e.into_inner()).compression;
+    compression
 }
 
 /// Write an already-framed packet (bytes shared from `ChunkPacketCache`) with
 /// `write_frame`'s failure contract: a partial write kills the socket.
+#[cfg(test)]
 fn write_shared_frame(s: &mut TcpStream, frame: &[u8]) -> std::io::Result<()> {
     // Cached chunks share the exact same producer order and encryption path
     // as tracker broadcasts. The writer receives opaque, fully encoded bytes.
     write_raw_frame(s, frame)
+}
+
+fn write_shared_frame_arc(s: &mut TcpStream, frame: Arc<[u8]>) -> std::io::Result<()> {
+    write_raw_frame_arc(s, frame)
 }
 
 /// The shared `0x27` frame for `(dim, cx, cz)` at its current world revision.
@@ -5807,7 +5826,7 @@ fn cached_chunk_frame(
     cx: i32,
     cz: i32,
     occluded: bool,
-) -> Arc<Vec<u8>> {
+) -> Arc<[u8]> {
     let key = (dim, cx, cz, occluded);
     let generation = current_gen_seq();
     // `live_chunk_block_entities` iterates a map; sort so the spliced bytes
@@ -6036,7 +6055,7 @@ fn stream_chunks(
             if conn_prof() && __cfe > Duration::from_millis(50) {
                 eprintln!("[conn-prof] chunk_frame ({cx},{cz}) {:?}", __cfe);
             }
-            if write_shared_frame(s, &frame).is_err() {
+            if write_shared_frame_arc(s, frame).is_err() {
                 failed = true;
                 break 'delivery;
             }
@@ -7225,7 +7244,7 @@ fn resend_loaded_chunks(me: &Client, occluded: bool) {
             cached_chunk_frame(compression, &mut gen, dim, cx, cz, occluded)
         };
         let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-        if write_shared_frame(&mut sock, &frame).is_err() {
+        if write_shared_frame_arc(&mut sock, frame).is_err() {
             return;
         }
     }
@@ -7772,18 +7791,25 @@ fn materialize_end_spawn() {
     }
 }
 
-/// The Nether portal landing, as a pure function of the source block: 1:8 horizontal
-/// scaling and a y clamped into the destination's own 0..256 window. Split out so the
-/// scaling and the bounce guard can be asserted without a live connection.
+fn portal_coordinate_ratio(from_scale: f64, to_scale: f64) -> f64 {
+    let ratio = from_scale / to_scale;
+    if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 }
+}
+
+/// The Nether portal landing, as a pure function of the source block. Horizontal
+/// scaling follows the registered dimension coordinate scales; y is clamped
+/// into the destination dimension's own bounds.
 fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId, i32, i32, i32)> {
     if dim == DimId::End {
         return None;
     }
-    let (ndim, nx, nz) = if dim == DimId::Overworld {
-        (DimId::Nether, bx as f64 / 8.0, bz as f64 / 8.0)
+    let ndim = if dim == DimId::Overworld {
+        DimId::Nether
     } else {
-        (DimId::Overworld, bx as f64 * 8.0, bz as f64 * 8.0)
+        DimId::Overworld
     };
+    let ratio = portal_coordinate_ratio(dim.coordinate_scale(), ndim.coordinate_scale());
+    let (nx, nz) = (bx as f64 * ratio, bz as f64 * ratio);
     let ny = (by as f64).clamp(
         (ndim.min_y() + 4) as f64,
         (ndim.min_y() + ndim.height() - 8) as f64,
@@ -9111,9 +9137,11 @@ fn disconnect_all_clients(reason: &str) {
             socket_key(&socket)
         };
         let (queue, writer) = {
-            let mut states = socket_wire().lock().unwrap_or_else(|error| error.into_inner());
-            match states.get_mut(&key) {
-                Some(state) => (state.tx_queue.clone(), state.tx_writer.take()),
+            match wire_state(key) {
+                Some(state) => {
+                    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+                    (state.tx_queue.clone(), state.tx_writer.take())
+                }
                 None => (None, None),
             }
         };
@@ -10893,11 +10921,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // `s` during the encryption handshake must cover it or broadcasts to this
     // client would leave in the clear.
     if let Some(cipher) = conn_cipher(&s) {
-        socket_wire()
+        wire_state_or_insert(socket_key(&writer))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(socket_key(&writer))
-            .or_default()
             .cipher = Some(cipher);
     }
     let me = Arc::new(Client {
@@ -11715,6 +11741,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             } else {
                                 0
                             };
+                            let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                             let a = Arrow {
                                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                                 owner: me.eid,
@@ -11737,13 +11764,16 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 stuck: false,
                             };
                             let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
+                            let arrow_eid = a.eid;
                             arrows().lock().unwrap_or_else(|e| e.into_inner()).push(a);
+                            set_entity_dim(arrow_eid, projectile_dim);
                             // multishot (crossbow): +2 arrows spread +-10deg
                             if hit == 1192 && enchant_level(&held_c, 23) > 0 {
                                 for off in [-0.1745f64, 0.1745] {
                                     let yr2 = yr + off;
+                                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                                     arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
-                                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                        eid,
                                         owner: me.eid,
                                         x,
                                         y: y + 1.5,
@@ -11763,6 +11793,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         last_hit: -1,
                                         stuck: false,
                                     });
+                                    set_entity_dim(eid, projectile_dim);
                                 }
                             }
                             // spawn streams via interest_tick
@@ -11827,8 +11858,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                             let yr = (yaw as f64).to_radians();
                             let pr = (pitch as f64).to_radians();
+                            let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
                             arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                                eid,
                                 owner: me.eid,
                                 x,
                                 y: y + 1.5,
@@ -11848,6 +11881,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 last_hit: -1,
                                 stuck: false,
                             });
+                            set_entity_dim(eid, projectile_dim);
                             held_slot_resync(&me);
                         }
                     }
@@ -15471,6 +15505,50 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     }
     // The `_disconnect_guard` armed at registration runs `disconnect_cleanup`
     // here — and on any panic unwind — so every exit takes the same teardown.
+}
+
+#[cfg(test)]
+mod play_protocol_opt_s2_tests {
+    use super::*;
+
+    #[test]
+    fn portal_coordinate_scale_matches_vanilla_and_custom_ratios() {
+        assert_eq!(portal_coordinate_ratio(1.0, 8.0), 0.125);
+        assert_eq!(portal_coordinate_ratio(8.0, 1.0), 8.0);
+        assert_eq!(portal_coordinate_ratio(2.0, 0.5), 4.0);
+        assert_eq!(portal_coordinate_ratio(0.5, 1.0), 0.5);
+        assert_eq!(portal_coordinate_ratio(f64::NAN, 8.0), 1.0);
+        assert_eq!(
+            nether_portal_target(DimId::Overworld, 80, 64, -40),
+            Some((DimId::Nether, 10, 64, -5))
+        );
+        assert_eq!(
+            nether_portal_target(DimId::Nether, 10, 64, -5),
+            Some((DimId::Overworld, 80, 64, -40))
+        );
+    }
+
+    #[test]
+    fn per_connection_state_lookup_does_not_wait_on_another_connection() {
+        let first_key = u64::MAX - 101;
+        let second_key = u64::MAX - 102;
+        let first = wire_state_or_insert(first_key);
+        let second = wire_state_or_insert(second_key);
+        let held_first = first.lock().unwrap_or_else(|e| e.into_inner());
+        let (done, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let second_lookup = wire_state(second_key).expect("second connection remains addressable");
+            let _held_second = second_lookup.lock().unwrap_or_else(|e| e.into_inner());
+            done.send(Arc::ptr_eq(&second_lookup, &second)).unwrap();
+        });
+        assert!(result
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap());
+        worker.join().unwrap();
+        drop(held_first);
+        unregister_socket_wire(first_key);
+        unregister_socket_wire(second_key);
+    }
 }
 
 /// The whole `ServerPlayer.disconnect` teardown for one registered client:
@@ -21217,11 +21295,9 @@ mod bot_net2_tests {
             let sock = client.sock.lock().unwrap_or_else(|e| e.into_inner());
             socket_key(&sock)
         };
-        socket_wire()
+        wire_state_or_insert(key)
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .entry(key)
-            .or_default()
             .compression = Some(threshold);
     }
 
@@ -21349,12 +21425,12 @@ mod bot_net2_tests {
         {
             let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
             enable_conn_encryption(&socket, &secret);
-            let mut states = socket_wire().lock().unwrap_or_else(|e| e.into_inner());
-            let state = states.get_mut(&socket_key(&socket)).unwrap();
+            let state = wire_state(socket_key(&socket)).unwrap();
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
             state.compression = Some(256);
             state.play = Some(PlayWireState::default());
             state.tx_queue = Some(Arc::clone(&queue));
-            drop(states);
+            drop(state);
 
             send_packet(&mut socket, packets[0].0, packets[0].1.clone()).unwrap();
             let mut body = Vec::new();
