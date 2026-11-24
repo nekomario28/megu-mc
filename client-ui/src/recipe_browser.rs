@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 
+use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 use megu_core::math::Mth;
 
 use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
@@ -579,7 +580,8 @@ pub struct EnchantmentCompat {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal fail-closed JSON parser (std-only; recipe datapack ingestion)
+// Fail-closed JSON parsing — canonical `megu_core::json` reader adapted to
+// this module's `Json` tree (recipe datapack ingestion)
 // ---------------------------------------------------------------------------
 
 /// Parsed JSON value. Numbers are `f64` — recipe files only carry small
@@ -645,234 +647,39 @@ impl Json {
 /// this is hostile/cyclic input and rejected instead of overflowing.
 const JSON_MAX_DEPTH: usize = 48;
 
-struct JsonParser<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn new(src: &'a str) -> Self {
-        Self {
-            b: src.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.b.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-
-    fn value(&mut self, depth: usize) -> Option<Json> {
-        if depth > JSON_MAX_DEPTH {
-            return None;
-        }
-        self.skip_ws();
-        match self.peek()? {
-            b'{' => self.object(depth),
-            b'[' => self.array(depth),
-            b'"' => self.string().map(Json::Str),
-            b't' => self.lit("true", Json::Bool(true)),
-            b'f' => self.lit("false", Json::Bool(false)),
-            b'n' => self.lit("null", Json::Null),
-            b'-' | b'0'..=b'9' => self.number(),
-            _ => None,
-        }
-    }
-
-    fn lit(&mut self, word: &str, v: Json) -> Option<Json> {
-        if self.b.len() - self.pos >= word.len() && &self.b[self.pos..self.pos + word.len()] == word.as_bytes() {
-            self.pos += word.len();
-            Some(v)
-        } else {
-            None
-        }
-    }
-
-    fn number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let s = std::str::from_utf8(&self.b[start..self.pos]).ok()?;
-        s.parse::<f64>().ok().map(Json::Num)
-    }
-
-    fn string(&mut self) -> Option<String> {
-        if self.peek() != Some(b'"') {
-            return None;
-        }
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            match self.peek()? {
-                b'"' => {
-                    self.pos += 1;
-                    return Some(out);
-                }
-                b'\\' => {
-                    self.pos += 1;
-                    match self.peek()? {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            self.pos += 1;
-                            let hi = self.hex4()?;
-                            let cp = if (0xD800..0xDC00).contains(&hi) {
-                                // Surrogate pair: requires a following \uXXXX low.
-                                if self.peek() == Some(b'\\') {
-                                    self.pos += 1;
-                                    if self.peek() != Some(b'u') {
-                                        return None;
-                                    }
-                                    self.pos += 1;
-                                    let lo = self.hex4()?;
-                                    if !(0xDC00..0xE000).contains(&lo) {
-                                        return None;
-                                    }
-                                    0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
-                                } else {
-                                    return None;
-                                }
-                            } else {
-                                hi
-                            };
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                            continue;
-                        }
-                        _ => return None,
-                    }
-                    self.pos += 1;
-                }
-                c if c < 0x20 => return None, // raw control chars are invalid
-                _ => {
-                    // Consume one UTF-8 code point verbatim.
-                    let start = self.pos;
-                    let len = utf8_len(self.b[self.pos])?;
-                    if self.b.len() - self.pos < len {
-                        return None; // truncated UTF-8 sequence
-                    }
-                    self.pos += len;
-                    let s = std::str::from_utf8(&self.b[start..self.pos]).ok()?;
-                    out.push_str(s);
-                }
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Option<u32> {
-        if self.b.len() - self.pos < 4 {
-            return None;
-        }
-        let s = std::str::from_utf8(&self.b[self.pos..self.pos + 4]).ok()?;
-        let v = u32::from_str_radix(s, 16).ok()?;
-        self.pos += 4;
-        Some(v)
-    }
-
-    fn array(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1; // '['
-        let mut out = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Some(Json::Arr(out));
-        }
-        loop {
-            out.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek()? {
-                b',' => self.pos += 1,
-                b']' => {
-                    self.pos += 1;
-                    return Some(Json::Arr(out));
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    fn object(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1; // '{'
-        let mut out = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Some(Json::Obj(out));
-        }
-        loop {
-            self.skip_ws();
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return None;
-            }
-            self.pos += 1;
-            let v = self.value(depth + 1)?;
-            out.insert(key, v);
-            self.skip_ws();
-            match self.peek()? {
-                b',' => self.pos += 1,
-                b'}' => {
-                    self.pos += 1;
-                    return Some(Json::Obj(out));
-                }
-                _ => return None,
-            }
-        }
-    }
-}
-
-/// Length of the UTF-8 sequence starting at `b`, or `None` if `b` is a
-/// continuation byte / invalid lead (fail-closed: invalid JSON anyway).
-fn utf8_len(b: u8) -> Option<usize> {
-    match b {
-        0x00..=0x7F => Some(1),
-        0xC2..=0xDF => Some(2),
-        0xE0..=0xEF => Some(3),
-        0xF0..=0xF4 => Some(4),
-        _ => None,
-    }
-}
+/// Bounds for [`parse_json`], matching the retired parser: nesting deeper
+/// than [`JSON_MAX_DEPTH`] levels rejected, no node or byte ceiling of its
+/// own — recipe documents are already small and caller-bounded.
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: JSON_MAX_DEPTH + 1,
+    max_nodes: usize::MAX,
+    max_bytes: usize::MAX,
+};
 
 /// Parse `src` into a [`Json`] value; `None` on any malformed input.
 fn parse_json(src: &str) -> Option<Json> {
-    let mut p = JsonParser::new(src);
-    let v = p.value(0)?;
-    p.skip_ws();
-    if p.pos != p.b.len() {
-        return None;
+    let value = parse_json_with_limits(src, JSON_LIMITS, false).ok()?;
+    Some(json_value_to_json(&value))
+}
+
+/// Fold the canonical [`JsonValue`] tree into this module's [`Json`]:
+/// document-ordered members collapse into a `BTreeMap` with
+/// last-duplicate-key wins, exactly like the retired parser's `insert`.
+fn json_value_to_json(value: &JsonValue) -> Json {
+    match value {
+        JsonValue::Null => Json::Null,
+        JsonValue::Bool(b) => Json::Bool(*b),
+        JsonValue::Number(n) => Json::Num(*n),
+        JsonValue::String(s) => Json::Str(s.clone()),
+        JsonValue::Array(items) => Json::Arr(items.iter().map(json_value_to_json).collect()),
+        JsonValue::Object(members) => {
+            let mut map = BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), json_value_to_json(member));
+            }
+            Json::Obj(map)
+        }
     }
-    Some(v)
 }
 
 // ---------------------------------------------------------------------------

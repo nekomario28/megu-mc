@@ -11,10 +11,6 @@
 //! the event loop hostage. Entry names are validated before use, Stored
 //! and Deflate methods are supported, and encrypted/ZIP64/multi-disk
 //! archives are rejected outright.
-//!
-//! The DEFLATE decoder is the same clean-room RFC 1951 implementation
-//! `client-port`'s shaderpack loader carries (private there, so this lane
-//! keeps its own copy rather than widening another crate's API).
 
 use std::fmt;
 use std::fs::File;

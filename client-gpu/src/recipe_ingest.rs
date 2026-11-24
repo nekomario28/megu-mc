@@ -38,6 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 use megu_core::zip_archive::LazyZipIndex;
 use megu_proto::table::ProtocolTable;
 use megu_ui::draw::UiColor;
@@ -1440,8 +1441,8 @@ fn write_json(v: &Json, out: &mut String) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal fail-closed JSON parser (std-only; mirrors the client-ui recipe
-// parser's semantics: numbers are f64, depth/node bounded)
+// Fail-closed JSON parsing — canonical `megu_core::json` reader adapted to
+// this module's mutable `Json` tree (numbers are f64, depth/node bounded)
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1498,194 +1499,37 @@ impl Json {
     }
 }
 
-struct JsonParser<'a> {
-    src: &'a [u8],
-    pos: usize,
-    nodes: usize,
-}
+/// Bounds for [`parse_json`], matching the retired parser: nesting deeper
+/// than [`MAX_JSON_DEPTH`] levels rejected, at most [`MAX_JSON_NODES`]
+/// value nodes, and no byte ceiling of its own — callers already bound
+/// each document at [`MAX_JSON_BYTES`].
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: MAX_JSON_DEPTH + 1,
+    max_nodes: MAX_JSON_NODES,
+    max_bytes: usize::MAX,
+};
 
 fn parse_json(src: &str) -> Option<Json> {
-    let mut p = JsonParser {
-        src: src.as_bytes(),
-        pos: 0,
-        nodes: 0,
-    };
-    let value = p.value(0)?;
-    p.ws();
-    (p.pos == p.src.len()).then_some(value)
+    let value = parse_json_with_limits(src, JSON_LIMITS, false).ok()?;
+    Some(json_value_to_json(&value))
 }
 
-impl<'a> JsonParser<'a> {
-    fn ws(&mut self) {
-        while matches!(self.src.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn node(&mut self) -> Option<()> {
-        self.nodes += 1;
-        (self.nodes <= MAX_JSON_NODES).then_some(())
-    }
-
-    fn value(&mut self, depth: usize) -> Option<Json> {
-        if depth > MAX_JSON_DEPTH {
-            return None;
-        }
-        self.node()?;
-        self.ws();
-        match *self.src.get(self.pos)? {
-            b'{' => self.object(depth),
-            b'[' => self.array(depth),
-            b'"' => self.string().map(Json::Str),
-            b't' => self.literal(b"true").map(|_| Json::Bool(true)),
-            b'f' => self.literal(b"false").map(|_| Json::Bool(false)),
-            b'n' => self.literal(b"null").map(|_| Json::Null),
-            _ => self.number(),
-        }
-    }
-
-    fn literal(&mut self, lit: &[u8]) -> Option<()> {
-        if self.src.get(self.pos..self.pos + lit.len()) == Some(lit) {
-            self.pos += lit.len();
-            Some(())
-        } else {
-            None
-        }
-    }
-
-    fn string(&mut self) -> Option<String> {
-        (self.src.get(self.pos) == Some(&b'"')).then_some(())?;
-        self.pos += 1;
-        let mut out = String::new();
-        loop {
-            let b = *self.src.get(self.pos)?;
-            self.pos += 1;
-            match b {
-                b'"' => return Some(out),
-                b'\\' => {
-                    let esc = *self.src.get(self.pos)?;
-                    self.pos += 1;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000c}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = self.src.get(self.pos..self.pos + 4)?;
-                            let code = u32::from_str_radix(
-                                std::str::from_utf8(hex).ok()?,
-                                16,
-                            )
-                            .ok()?;
-                            self.pos += 4;
-                            // Surrogate pairs: emit the replacement char
-                            // rather than emitting a lone surrogate.
-                            out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                        }
-                        _ => return None,
-                    }
-                }
-                0x00..=0x1f => return None,
-                _ => {
-                    // Re-decode UTF-8: `pos` already advanced; walk back one
-                    // byte and take the full char.
-                    let rest = std::str::from_utf8(&self.src[self.pos - 1..]).ok()?;
-                    let ch = rest.chars().next()?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8() - 1;
-                }
+/// Fold the canonical [`JsonValue`] tree into this module's [`Json`]:
+/// document-ordered members collapse into a `BTreeMap` with
+/// last-duplicate-key wins, exactly like the retired parser's `insert`.
+fn json_value_to_json(value: &JsonValue) -> Json {
+    match value {
+        JsonValue::Null => Json::Null,
+        JsonValue::Bool(b) => Json::Bool(*b),
+        JsonValue::Number(n) => Json::Num(*n),
+        JsonValue::String(s) => Json::Str(s.clone()),
+        JsonValue::Array(items) => Json::Arr(items.iter().map(json_value_to_json).collect()),
+        JsonValue::Object(members) => {
+            let mut map = BTreeMap::new();
+            for (key, member) in members {
+                map.insert(key.clone(), json_value_to_json(member));
             }
-        }
-    }
-
-    fn number(&mut self) -> Option<Json> {
-        let start = self.pos;
-        if matches!(self.src.get(self.pos), Some(b'-' | b'+')) {
-            self.pos += 1;
-        }
-        let mut digits = false;
-        while matches!(self.src.get(self.pos), Some(b'0'..=b'9')) {
-            self.pos += 1;
-            digits = true;
-        }
-        if self.src.get(self.pos) == Some(&b'.') {
-            self.pos += 1;
-            while matches!(self.src.get(self.pos), Some(b'0'..=b'9')) {
-                self.pos += 1;
-                digits = true;
-            }
-        }
-        if matches!(self.src.get(self.pos), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.src.get(self.pos), Some(b'-' | b'+')) {
-                self.pos += 1;
-            }
-            let exp_start = self.pos;
-            while matches!(self.src.get(self.pos), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-            if self.pos == exp_start {
-                return None;
-            }
-        }
-        if !digits {
-            return None;
-        }
-        let text = std::str::from_utf8(&self.src[start..self.pos]).ok()?;
-        text.parse::<f64>().ok().map(Json::Num)
-    }
-
-    fn object(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1;
-        let mut map = BTreeMap::new();
-        self.ws();
-        if self.src.get(self.pos) == Some(&b'}') {
-            self.pos += 1;
-            return Some(Json::Obj(map));
-        }
-        loop {
-            self.ws();
-            let key = self.string()?;
-            self.ws();
-            (self.src.get(self.pos) == Some(&b':')).then_some(())?;
-            self.pos += 1;
-            let value = self.value(depth + 1)?;
-            map.insert(key, value);
-            self.ws();
-            match *self.src.get(self.pos)? {
-                b',' => self.pos += 1,
-                b'}' => {
-                    self.pos += 1;
-                    return Some(Json::Obj(map));
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Option<Json> {
-        self.pos += 1;
-        let mut arr = Vec::new();
-        self.ws();
-        if self.src.get(self.pos) == Some(&b']') {
-            self.pos += 1;
-            return Some(Json::Arr(arr));
-        }
-        loop {
-            arr.push(self.value(depth + 1)?);
-            self.ws();
-            match *self.src.get(self.pos)? {
-                b',' => self.pos += 1,
-                b']' => {
-                    self.pos += 1;
-                    return Some(Json::Arr(arr));
-                }
-                _ => return None,
-            }
+            Json::Obj(map)
         }
     }
 }

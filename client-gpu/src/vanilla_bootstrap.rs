@@ -24,16 +24,16 @@
 //! set, and under `cfg(test)` unless a test explicitly spawns against a
 //! loopback URL — unit tests never touch the real network.
 //!
-//! The SHA-1 below is a clean-room FIPS 180-4 implementation (no extra
-//! crate), and the JSON reader is a bounded clean-room parser in the same
-//! style `client-port`'s model baker carries (private there, so this lane
-//! keeps its own copy rather than widening another crate's API).
+//! The SHA-1 and JSON reader are the canonical `megu_core::crypto::Sha1`
+//! and `megu_core::json` implementations every crate shares.
 
-use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use megu_core::crypto::Sha1;
+use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
 use crate::live_session::{jar_version_ids, SessionPaths};
 use crate::vanilla_jar::MAX_ARCHIVE_BYTES;
@@ -422,388 +422,28 @@ pub fn bootstrap_dest_dir(paths: &SessionPaths) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Clean-room FIPS 180-4 SHA-1 (incremental, streaming download digest)
+// Verified-download JSON parsing — canonical megu-core reader
 // ---------------------------------------------------------------------------
 
-struct Sha1 {
-    state: [u32; 5],
-    block: [u8; 64],
-    block_len: usize,
-    total: u64,
+/// Bounds for [`parse_json`]: the retired parser capped container nesting
+/// at 32 levels and the document at [`MAX_MANIFEST_BYTES`], with no node
+/// ceiling of its own.
+const JSON_LIMITS: JsonLimits = JsonLimits {
+    max_depth: 33,
+    max_nodes: usize::MAX,
+    max_bytes: MAX_MANIFEST_BYTES as usize,
+};
+
+fn parse_json(text: &str) -> Result<JsonValue, String> {
+    parse_json_with_limits(text, JSON_LIMITS, false).map_err(|e| e.to_string())
 }
 
-impl Sha1 {
-    fn new() -> Self {
-        Self {
-            state: [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476, 0xC3D2_E1F0],
-            block: [0; 64],
-            block_len: 0,
-            total: 0,
-        }
-    }
-
-    fn compress(state: &mut [u32; 5], block: &[u8]) {
-        let mut w = [0u32; 80];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            *word = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = *state;
-        for (i, word) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ED9_EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDC),
-                _ => (b ^ c ^ d, 0xCA62_C1D6),
-            };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = t;
-        }
-        for (acc, v) in state.iter_mut().zip([a, b, c, d, e]) {
-            *acc = acc.wrapping_add(v);
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.total = self.total.wrapping_add(data.len() as u64);
-        if self.block_len > 0 {
-            let take = (64 - self.block_len).min(data.len());
-            self.block[self.block_len..self.block_len + take].copy_from_slice(&data[..take]);
-            self.block_len += take;
-            data = &data[take..];
-            if self.block_len == 64 {
-                let block = self.block;
-                Self::compress(&mut self.state, &block);
-                self.block_len = 0;
-            }
-        }
-        while data.len() >= 64 {
-            Self::compress(&mut self.state, &data[..64]);
-            data = &data[64..];
-        }
-        if !data.is_empty() {
-            self.block[..data.len()].copy_from_slice(data);
-            self.block_len = data.len();
-        }
-    }
-
-    fn finish_hex(mut self) -> String {
-        let bit_len = self.total.wrapping_mul(8);
-        self.update(&[0x80]);
-        while self.block_len != 56 {
-            self.update(&[0]);
-        }
-        self.update(&bit_len.to_be_bytes());
-        let mut out = String::with_capacity(40);
-        for word in self.state {
-            out.push_str(&format!("{word:08x}"));
-        }
-        out
-    }
-}
-
-#[cfg(test)]
-fn sha1_hex(data: &[u8]) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    hasher.finish_hex()
-}
-
-// ---------------------------------------------------------------------------
-// Bounded clean-room JSON reader (same style as client-port's model baker)
-// ---------------------------------------------------------------------------
-
-const MAX_JSON_DEPTH: usize = 32;
-
-enum Json {
-    Null,
-    Bool,
-    Num(f64),
-    Str(String),
-    Arr(Vec<Json>),
-    Obj(BTreeMap<String, Json>),
-}
-
-impl Json {
-    fn get(&self, key: &str) -> Option<&Json> {
-        match self {
-            Self::Obj(map) => map.get(key),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Str(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn as_array(&self) -> Option<&[Json]> {
-        match self {
-            Self::Arr(items) => Some(items),
-            _ => None,
-        }
-    }
-
-    fn as_u64(&self) -> Option<u64> {
-        match self {
-            Self::Num(n) if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
-            _ => None,
-        }
-    }
-}
-
-struct JsonParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonParser<'a> {
-    fn err(&self, message: &str) -> String {
-        format!("JSON error at byte {}: {message}", self.pos)
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-            self.pos += 1;
-        }
-    }
-
-    fn literal(&mut self, literal: &'static [u8], value: Json) -> Result<Json, String> {
-        if self.bytes[self.pos..].starts_with(literal) {
-            self.pos += literal.len();
-            Ok(value)
-        } else {
-            Err(self.err("expected a JSON value"))
-        }
-    }
-
-    fn value(&mut self, depth: usize) -> Result<Json, String> {
-        self.skip_ws();
-        match self.peek() {
-            None => Err(self.err("expected a JSON value")),
-            Some(b'{') => self.object(depth),
-            Some(b'[') => self.array(depth),
-            Some(b'"') => Ok(Json::Str(self.string()?)),
-            Some(b't') => self.literal(b"true", Json::Bool),
-            Some(b'f') => self.literal(b"false", Json::Bool),
-            Some(b'n') => self.literal(b"null", Json::Null),
-            Some(b'-' | b'0'..=b'9') => self.number(),
-            Some(_) => Err(self.err("expected a JSON value")),
-        }
-    }
-
-    fn container_open(&self, depth: usize) -> Result<(), String> {
-        if depth >= MAX_JSON_DEPTH {
-            return Err(self.err("JSON nesting too deep"));
-        }
-        Ok(())
-    }
-
-    fn object(&mut self, depth: usize) -> Result<Json, String> {
-        self.container_open(depth)?;
-        self.pos += 1; // '{'
-        let mut map = BTreeMap::new();
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            return Ok(Json::Obj(map));
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return Err(self.err("expected an object key"));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(self.err("expected ':' after object key"));
-            }
-            self.pos += 1;
-            let value = self.value(depth + 1)?;
-            map.insert(key, value);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(Json::Obj(map));
-                }
-                _ => return Err(self.err("expected ',' or '}' in object")),
-            }
-        }
-    }
-
-    fn array(&mut self, depth: usize) -> Result<Json, String> {
-        self.container_open(depth)?;
-        self.pos += 1; // '['
-        let mut items = Vec::new();
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            return Ok(Json::Arr(items));
-        }
-        loop {
-            items.push(self.value(depth + 1)?);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => self.pos += 1,
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(Json::Arr(items));
-                }
-                _ => return Err(self.err("expected ',' or ']' in array")),
-            }
-        }
-    }
-
-    fn string(&mut self) -> Result<String, String> {
-        self.pos += 1; // opening '"'
-        let mut out = String::new();
-        loop {
-            let run_start = self.pos;
-            while let Some(b) = self.peek() {
-                if b == b'"' || b == b'\\' || b < 0x20 {
-                    break;
-                }
-                self.pos += 1;
-            }
-            // `text` is already UTF-8; `"` `\` and control bytes can never
-            // appear inside a multi-byte sequence, so runs stay valid.
-            out.push_str(
-                std::str::from_utf8(&self.bytes[run_start..self.pos])
-                    .map_err(|_| self.err("invalid UTF-8 in string"))?,
-            );
-            match self.peek() {
-                None => return Err(self.err("unterminated string")),
-                Some(b'"') => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                Some(b'\\') => {
-                    self.pos += 1;
-                    match self.peek() {
-                        Some(b'"') => out.push('"'),
-                        Some(b'\\') => out.push('\\'),
-                        Some(b'/') => out.push('/'),
-                        Some(b'b') => out.push('\u{0008}'),
-                        Some(b'f') => out.push('\u{000C}'),
-                        Some(b'n') => out.push('\n'),
-                        Some(b'r') => out.push('\r'),
-                        Some(b't') => out.push('\t'),
-                        Some(b'u') => {
-                            let cp = self.hex4()?;
-                            if (0xD800..0xDC00).contains(&cp) {
-                                // High surrogate: pair with a following \uXXXX.
-                                self.pos += 1;
-                                if self.peek() != Some(b'\\') {
-                                    return Err(self.err("unpaired surrogate in string"));
-                                }
-                                self.pos += 1;
-                                if self.peek() != Some(b'u') {
-                                    return Err(self.err("unpaired surrogate in string"));
-                                }
-                                let lo = self.hex4()?;
-                                if !(0xDC00..0xE000).contains(&lo) {
-                                    return Err(self.err("unpaired surrogate in string"));
-                                }
-                                let c = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                                out.push(char::from_u32(c).unwrap_or('\u{FFFD}'));
-                                continue;
-                            }
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                        }
-                        _ => return Err(self.err("invalid string escape")),
-                    }
-                    self.pos += 1;
-                }
-                Some(_) => return Err(self.err("unescaped control byte in string")),
-            }
-        }
-    }
-
-    fn hex4(&mut self) -> Result<u32, String> {
-        self.pos += 1; // 'u'
-        let mut value = 0u32;
-        for _ in 0..4 {
-            let digit = match self.peek() {
-                Some(b @ b'0'..=b'9') => u32::from(b - b'0'),
-                Some(b @ b'a'..=b'f') => u32::from(b - b'a') + 10,
-                Some(b @ b'A'..=b'F') => u32::from(b - b'A') + 10,
-                _ => return Err(self.err("invalid \\u escape")),
-            };
-            value = value * 16 + digit;
-            self.pos += 1;
-        }
-        Ok(value)
-    }
-
-    fn number(&mut self) -> Result<Json, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
-        }
-        if self.peek() == Some(b'.') {
-            self.pos += 1;
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        if matches!(self.peek(), Some(b'e' | b'E')) {
-            self.pos += 1;
-            if matches!(self.peek(), Some(b'+' | b'-')) {
-                self.pos += 1;
-            }
-            while matches!(self.peek(), Some(b'0'..=b'9')) {
-                self.pos += 1;
-            }
-        }
-        let text = std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| self.err("invalid number"))?;
-        text.parse::<f64>()
-            .map(Json::Num)
-            .map_err(|_| self.err("invalid number"))
-    }
-}
-
-fn parse_json(text: &str) -> Result<Json, String> {
-    if text.len() > MAX_MANIFEST_BYTES as usize {
-        return Err("JSON document exceeds size cap".to_owned());
-    }
-    let mut parser = JsonParser {
-        bytes: text.as_bytes(),
-        pos: 0,
-    };
-    let value = parser.value(0)?;
-    parser.skip_ws();
-    if parser.pos != text.len() {
-        return Err(parser.err("trailing bytes after JSON value"));
-    }
-    Ok(value)
+/// Strict non-negative integer read for `downloads.client.size` —
+/// [`JsonValue::as_u64`] truncates fractions and saturates negatives where
+/// the retired parser rejected them; the declared size must stay exact.
+fn strict_u64(value: &JsonValue) -> Option<u64> {
+    let n = value.as_f64()?;
+    (n.is_finite() && n >= 0.0 && n.fract() == 0.0).then_some(n as u64)
 }
 
 // ---------------------------------------------------------------------------
@@ -817,13 +457,13 @@ fn manifest_version_url(manifest_text: &str, version_id: &str) -> Result<String,
     let manifest = parse_json(manifest_text)?;
     let versions = manifest
         .get("versions")
-        .and_then(Json::as_array)
+        .and_then(JsonValue::as_array)
         .ok_or_else(|| "manifest has no versions array".to_owned())?;
     for entry in versions {
-        if entry.get("id").and_then(Json::as_str) == Some(version_id) {
+        if entry.get("id").and_then(JsonValue::as_str) == Some(version_id) {
             let url = entry
                 .get("url")
-                .and_then(Json::as_str)
+                .and_then(JsonValue::as_str)
                 .ok_or_else(|| format!("version {version_id:?} entry has no url"))?;
             if !url_allowed(url) {
                 return Err(format!("version {version_id:?} url is not a Mojang host"));
@@ -851,14 +491,14 @@ fn client_download_info(version_text: &str) -> Result<ClientDownload, String> {
         .ok_or_else(|| "version JSON has no downloads.client".to_owned())?;
     let url = client
         .get("url")
-        .and_then(Json::as_str)
+        .and_then(JsonValue::as_str)
         .ok_or_else(|| "downloads.client has no url".to_owned())?;
     if !url_allowed(url) {
         return Err("client JAR url is not a Mojang host".to_owned());
     }
     let sha1 = client
         .get("sha1")
-        .and_then(Json::as_str)
+        .and_then(JsonValue::as_str)
         .ok_or_else(|| "downloads.client has no sha1".to_owned())?;
     if sha1.len() != 40
         || !sha1
@@ -869,7 +509,7 @@ fn client_download_info(version_text: &str) -> Result<ClientDownload, String> {
     }
     let size = client
         .get("size")
-        .and_then(Json::as_u64)
+        .and_then(strict_u64)
         .ok_or_else(|| "downloads.client has no size".to_owned())?;
     if size == 0 || size > MAX_CLIENT_JAR_BYTES {
         return Err(format!("client JAR size {size} outside 1..={MAX_CLIENT_JAR_BYTES}"));
@@ -987,7 +627,7 @@ fn download_and_verify(
             client.size
         ));
     }
-    let actual = hasher.finish_hex();
+    let actual = hasher.finalize_hex();
     if actual != client.sha1 {
         return fail(format!(
             "SHA-1 mismatch: got {actual}, manifest declared {}",
@@ -1079,6 +719,7 @@ pub fn spawn_vanilla_jar_bootstrap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use megu_core::crypto::sha1_hex;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1287,7 +928,7 @@ mod tests {
         for chunk in input.chunks(63) {
             hasher.update(chunk);
         }
-        assert_eq!(hasher.finish_hex(), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+        assert_eq!(hasher.finalize_hex(), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
     }
 
     // -- URL allowlist -----------------------------------------------------
