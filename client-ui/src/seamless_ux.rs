@@ -1222,7 +1222,9 @@ impl ExistingLauncherImporter {
 /// Does `name` match the secret-file denylist? Hard-coded, case
 /// insensitive; covers launcher account stores, MSA credential caches,
 /// Microsoft-account artifacts, token/key/credential/session/auth
-/// files and certificate bundles.
+/// files, certificate bundles, and — by substring so nothing with a
+/// common auth-secret word slips through — any name containing
+/// `token`, `secret`, `passwd` or `password`.
 fn is_forbidden_name(name: &str) -> bool {
     let n = name.to_lowercase();
     n == "launcher_accounts.json"
@@ -1237,6 +1239,10 @@ fn is_forbidden_name(name: &str) -> bool {
         || n.ends_with(".key")
         || n.ends_with(".pem")
         || n.ends_with(".pfx")
+        || n.contains("token")
+        || n.contains("secret")
+        || n.contains("passwd")
+        || n.contains("password")
 }
 
 /// Expand a candidate root into the concrete `.minecraft`-style

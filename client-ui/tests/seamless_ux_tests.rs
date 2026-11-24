@@ -563,7 +563,7 @@ fn not_a_zip_and_missing_paths_are_unsupported() {
 
 #[test]
 fn secret_named_drop_is_never_inspected() {
-    let dir = fresh_dir("secretdrop");
+    let dir = fresh_dir("baddrop");
     // A file on the denylist must be rejected before any content read.
     let p = write_file(&dir, "accounts.json", b"{\"token\":\"x\"}");
     let v = DropPayloadClassifier::classify_path(&p);
@@ -736,6 +736,18 @@ fn denylist_matches_case_insensitively_at_any_depth() {
         "auth_cache",
         "cert.pem",
         "bundle.PFX",
+        "token",
+        "tokens",
+        "token.json",
+        "tokens.json",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "oauth_token.txt",
+        "secret",
+        "secrets.toml",
+        "passwd",
+        "password.txt",
     ];
     for name in positives {
         assert!(
@@ -765,7 +777,7 @@ fn denylist_matches_case_insensitively_at_any_depth() {
 
 #[test]
 fn importer_never_lists_secret_files() {
-    let home = fresh_dir("nosecrets");
+    let home = fresh_dir("cleanimport");
     let mc = home.join(".minecraft");
     populate_minecraft(&mc);
     // Extra secrets inside whitelisted directories.
@@ -851,4 +863,72 @@ fn symlink_to_secret_is_refused_via_canonical_target() {
         ExistingLauncherImporter::read_options_txt(&innocent),
         Err(ImportError::ForbiddenSecret(_))
     ));
+}
+
+#[test]
+fn token_secret_passwd_password_files_fail_closed_everywhere() {
+    let dir = fresh_dir("worddeny");
+    // Every common auth-secret word variant — bare names, extensionless,
+    // and JSON/txt forms — must be refused by every entry point.
+    for name in [
+        "token",
+        "tokens",
+        "token.json",
+        "tokens.json",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "oauth_token.txt",
+        "secret",
+        "secrets.toml",
+        "passwd",
+        "password.txt",
+    ] {
+        let p = write_file(&dir, name, b"fov:1.0\n");
+        assert!(
+            ExistingLauncherImporter::is_forbidden_secret_path(&p),
+            "{name} must be denylisted"
+        );
+        let v = DropPayloadClassifier::classify_path(&p);
+        assert_eq!(
+            v.rejection,
+            Some(DropRejection::ForbiddenSecretName),
+            "drop of {name} must fail closed as ForbiddenSecretName, got {:?}",
+            v.rejection
+        );
+        assert!(
+            matches!(
+                ExistingLauncherImporter::read_options_txt(&p),
+                Err(ImportError::ForbiddenSecret(_))
+            ),
+            "read_options_txt({name}) must refuse before opening"
+        );
+    }
+}
+
+#[test]
+fn token_named_payload_is_never_listed_by_discovery() {
+    let home = fresh_dir("dirdeny");
+    let mc = home.join(".minecraft");
+    populate_minecraft(&mc);
+    // Plant token-family files inside whitelisted directories.
+    fs::write(mc.join("resourcepacks/token_cache"), b"PK").unwrap();
+    fs::write(mc.join("refresh_token"), b"x").unwrap();
+    let p = &ExistingLauncherImporter::with_default_candidates(&home).discover()[0];
+    for path in p
+        .saves
+        .iter()
+        .chain(&p.resource_packs)
+        .chain(&p.servers_dat)
+        .chain(&p.options_txt)
+    {
+        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+        for word in ["token", "secret", "passwd", "password"] {
+            assert!(
+                !name.contains(word),
+                "{word}-named path leaked into discovery: {}",
+                path.display()
+            );
+        }
+    }
 }
