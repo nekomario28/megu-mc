@@ -10650,6 +10650,11 @@ fn populate_diag_env() -> bool {
         || env_str!("MEGU_HM_DUMP").is_some()
         || env_str!("CEL_COLUMN_TRACE").is_some()
         || env_flag!("MINESHAFT_TRACE")
+        // The sculk-cursor sink is thread-local and its stderr arm is an ordered
+        // stream: both can only observe the calling thread's work, in order, so a
+        // population armed for one stays serial too.
+        || env_flag!("SPC_CURSOR_TRACE")
+        || SPC_TRACE_SINK.with(|s| s.borrow().is_some())
 }
 
 /// Pre-carve the union of every pending chunk's 3x3 before any feature runs.
@@ -10994,92 +10999,186 @@ fn commit_populate(g: &mut Gen, sx: i32, sz: i32, res: PopulateWorkerResult) -> 
     }
 }
 
-/// Run the feature placement of a multi-chunk population in dependency-DAG waves.
+/// Run the feature placement of a multi-chunk population as a dependency-DAG
+/// ready-queue instead of barrier-per-wave.
+///
+/// A chunk's only predecessors are the *earlier* `pending` entries whose write
+/// windows overlap its own (`wave_conflict` under `pop_wave_spacing()`): every
+/// owner mutation a commit lands stays within two chunks of its own chunk, so
+/// a worker's reads — bounded by its 3x3 placement window — can only observe
+/// its conflicting predecessors' commits. It is therefore runnable the moment
+/// those predecessors are *committed*, not when the slowest chunk of the
+/// previous wave finished, which is what the wave barrier waited for.
+///
+/// Commits still land on the owner in exactly the (level, index) order the
+/// per-wave schedule used — wave `k`'s chunks in index order, then wave
+/// `k+1`'s — and a chunk is only dispatched after all its conflicting
+/// predecessors are committed. Both rules together make the output
+/// bit-identical to the serial arm; only the idle time between waves is gone.
 pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) -> usize {
-    // Feature-time lighting sees the caller's order even when distant waves
+    // Feature-time lighting sees the caller's order even when distant chunks
     // run ahead of one another.
     let order: HashMap<_, _> = pending.iter().copied().zip(0..).collect();
-    let levels = wave_levels(pending, pop_wave_spacing());
-    let wave_count = levels.iter().copied().max().unwrap_or(0) + 1;
-    let mut results: Vec<Option<PopulateWorkerResult>> = (0..pending.len()).map(|_| None).collect();
-    let mut ticks: Vec<Option<TickBatch>> = (0..pending.len()).map(|_| None).collect();
-    // Ticks filed by the pre-carve stay in front of the feature ticks, as they do in the
-    // serial arm (CARVERS precede FEATURES for every chunk).
-    let (pre_leaves, pre_fluids) = g.take_generated_ticks();
-    for wave in 0..wave_count {
-        let idxs: Vec<usize> = (0..pending.len()).filter(|&i| levels[i] == wave).collect();
-        if idxs.is_empty() {
-            continue;
-        }
-        let nthreads = idxs.len().min(jobs.max(1));
-        let per = idxs.len().div_ceil(nthreads).max(1);
-        if idxs.len() == 1 {
-            // A one-chunk wave has nothing to overlap: a thread and a channel would cost more
-            // than the placement itself.
-            let i = idxs[0];
-            let mut scratch = Gen::fresh_scratch(g.data.clone());
-            scratch.starts_round = g.starts_round;
-            if let Some(resolver) = g.beard_resolver() {
-                scratch.set_beard_resolver(resolver);
-            }
-            let owner: &Gen = &*g;
-            results[i] = Some(populate_worker(&mut scratch, owner, pending[i], &order, i));
-            let (sx, sz) = pending[i];
-            let res = results[i].take().expect("just stored");
-            ticks[i] = Some(commit_populate(g, sx, sz, res));
-            continue;
-        }
-        {
-            let owner: &Gen = &*g;
-            let (tx, rx) = std::sync::mpsc::channel();
-            bg_scope!(|s| {
-                for slice in idxs.chunks(per) {
-                    let coords: Vec<usize> = slice.to_vec();
-                    let tx = tx.clone();
-                    let order = &order;
-                    s.spawn(move || {
-                        let _m3w = crate::worldgen::M3WorkerScope::enter();
-                        // One scratch generator per worker (not per chunk): the structure
-                        // starts, columns and memos it warms are reused by the next chunk on
-                        // this thread, which is where the per-chunk arm paid most of its cost.
-                        let mut scratch = Gen::fresh_scratch(owner.data.clone());
-                        scratch.starts_round = owner.starts_round;
-                        if let Some(resolver) = owner.beard_resolver() {
-                            scratch.set_beard_resolver(resolver);
-                        }
-                        for &i in &coords {
-                            // Results are indexed by the chunk's place in `pending`, so a
-                            // worker finishing early cannot change the commit order.
-                            let result = populate_worker(&mut scratch, owner, pending[i], order, i);
-                            let _ = tx.send((i, result));
-                        }
-                        crate::worldgen::m3_flush();
-                    });
-                }
-            });
-            drop(tx);
-            for (i, res) in rx {
-                results[i] = Some(res);
-            }
-        }
-        // Commit in caller order within the wave, never worker-finish order: a chunk's
-        // conflicting predecessors are in earlier waves, so their writes are already on the
-        // owner when a later wave is committed.
-        for &i in &idxs {
-            let (sx, sz) = pending[i];
-            if let Some(res) = results[i].take() {
-                ticks[i] = Some(commit_populate(g, sx, sz, res));
+    let n = pending.len();
+    let spacing = pop_wave_spacing();
+    let levels = wave_levels(pending, spacing);
+    // The commit order the per-wave schedule produced: stable-sort by level
+    // keeps each wave's index order and orders whole waves ascending.
+    let mut commit_seq: Vec<usize> = (0..n).collect();
+    commit_seq.sort_by_key(|&i| levels[i]);
+    // The DAG edges: `j -> i` when `j` is an earlier chunk whose write window
+    // overlaps `i`'s. `dep_left[i]` counts the predecessors not yet committed.
+    let mut dep_left = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = (0..n).map(|_| Vec::new()).collect();
+    for i in 0..n {
+        for j in 0..i {
+            if wave_conflict(pending[i], pending[j], spacing) {
+                dep_left[i] += 1;
+                dependents[j].push(i);
             }
         }
     }
-    // Replay every tick queue in the caller's order. Waves are dependency-ordered, which can
-    // differ from `order` for independent chunks; the tick queue is the one global observable
-    // where that difference would be visible.
+    let mut results: Vec<Option<PopulateWorkerResult>> = (0..n).map(|_| None).collect();
+    let mut arrived = vec![false; n];
+    let mut ticks: Vec<Option<TickBatch>> = (0..n).map(|_| None).collect();
+    // Ticks filed by the pre-carve stay in front of the feature ticks, as they do in the
+    // serial arm (CARVERS precede FEATURES for every chunk).
+    let (pre_leaves, pre_fluids) = g.take_generated_ticks();
+
+    let data = g.data.clone();
+    let starts_round = g.starts_round;
+    let resolver = g.beard_resolver();
+    let workers = n.min(jobs.max(1));
+    // `shared` is how a worker reads the owner and how the owner still commits:
+    // a worker holds the read side for one chunk's whole placement — its
+    // predecessors are already committed, and a non-conflicting commit can
+    // never reach into its read window — while the owner takes the write side
+    // for one commit at a time. A queued writer could starve under a steady
+    // stream of new readers, so `commit_pending` keeps freshly queued chunks
+    // from joining the reader set until the write lands.
+    let shared = std::sync::RwLock::new(&mut *g);
+    let commit_pending = std::sync::atomic::AtomicBool::new(false);
+    let (rtx, rrx) = std::sync::mpsc::channel::<(usize, Option<PopulateWorkerResult>)>();
+    // The ready queue: the owner pushes chunks whose predecessors are all
+    // committed; workers drain it on their own scratch generators.
+    let queue = std::sync::Mutex::new(std::collections::VecDeque::<usize>::new());
+    let queue_cv = std::sync::Condvar::new();
+    let queue_closed = std::sync::atomic::AtomicBool::new(false);
+    let mut ready: std::collections::VecDeque<usize> =
+        (0..n).filter(|&i| dep_left[i] == 0).collect();
+
+    bg_scope!(|s| {
+        for _ in 0..workers {
+            let rtx = rtx.clone();
+            let data = data.clone();
+            let queue = &queue;
+            let queue_cv = &queue_cv;
+            let queue_closed = &queue_closed;
+            let commit_pending = &commit_pending;
+            let shared = &shared;
+            let order = &order;
+            s.spawn(move || {
+                let _m3w = crate::worldgen::M3WorkerScope::enter();
+                // One scratch generator per worker (not per chunk): the structure
+                // starts, columns and memos it warms are reused by the next chunk on
+                // this thread, which is where the per-chunk arm paid most of its cost.
+                let mut scratch = Gen::fresh_scratch(data);
+                scratch.starts_round = starts_round;
+                if let Some(resolver) = resolver {
+                    scratch.set_beard_resolver(resolver);
+                }
+                loop {
+                    let i = {
+                        let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(i) = q.pop_front() {
+                                break Some(i);
+                            }
+                            if queue_closed.load(std::sync::atomic::Ordering::Relaxed) {
+                                break None;
+                            }
+                            q = queue_cv.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    let Some(i) = i else { break };
+                    while commit_pending.load(std::sync::atomic::Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
+                    let guard = shared.read().unwrap_or_else(|e| e.into_inner());
+                    let owner: &Gen = &**guard;
+                    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // Results are indexed by the chunk's place in `pending`, so a
+                        // worker finishing early cannot change the commit order.
+                        populate_worker(&mut scratch, owner, pending[i], order, i)
+                    }));
+                    drop(guard);
+                    let res = match out {
+                        Ok(r) => Some(r),
+                        Err(payload) => {
+                            // Unblock the owner before the panic reaches the scope's
+                            // latch; an uncommitted chunk is skipped exactly as a
+                            // missing wave result was.
+                            let _ = rtx.send((i, None));
+                            std::panic::resume_unwind(payload);
+                        }
+                    };
+                    let _ = rtx.send((i, res));
+                }
+                crate::worldgen::m3_flush();
+            });
+        }
+        // The owner event loop: feed the ready queue, land results, and commit
+        // in the fixed (level, index) order as soon as each result is in.
+        let mut next_commit = 0usize;
+        loop {
+            if next_commit >= n {
+                break;
+            }
+            while let Some(&i) = ready.front() {
+                ready.pop_front();
+                queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(i);
+                queue_cv.notify_one();
+            }
+            let Ok((i, res)) = rrx.recv() else { break };
+            arrived[i] = true;
+            results[i] = res;
+            while next_commit < n {
+                let ci = commit_seq[next_commit];
+                if !arrived[ci] {
+                    break;
+                }
+                next_commit += 1;
+                if let Some(res) = results[ci].take() {
+                    commit_pending.store(true, std::sync::atomic::Ordering::Release);
+                    {
+                        let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
+                        let (sx, sz) = pending[ci];
+                        ticks[ci] = Some(commit_populate(&mut **guard, sx, sz, res));
+                    }
+                    commit_pending.store(false, std::sync::atomic::Ordering::Release);
+                }
+                for &d in &dependents[ci] {
+                    dep_left[d] -= 1;
+                    if dep_left[d] == 0 {
+                        ready.push_back(d);
+                    }
+                }
+            }
+        }
+        queue_closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        queue_cv.notify_all();
+    });
+    // Replay every tick queue in the caller's order. The commit order can
+    // differ from `order` for independent chunks; the tick queue is the one
+    // global observable where that difference would be visible.
     g.append_generated_ticks(pre_leaves, pre_fluids);
     for batch in ticks.into_iter().flatten() {
         g.append_generated_ticks(batch.leaves, batch.fluids);
     }
-    pending.len()
+    n
 }
 
 /// Everything one chunk's carver pass produces, before it is committed onto an owner.
@@ -13137,6 +13236,35 @@ mod a3a_tests {
         assert!(
             workers >= 2 || crate::worldgen::terrain_jobs() <= 1,
             "the real dispatch must use wave workers when jobs > 1, got {workers}"
+        );
+    }
+
+    /// The round-less arm — the live-server path, where the caller opens no
+    /// `starts_round` — must still dispatch to the workers (on the bounded
+    /// fallback share and the thread-local start caches) and still leave the
+    /// owner in the serial state, bit for bit.
+    #[test]
+    fn populate_in_order_without_round_dispatches_to_waves_bit_for_bit() {
+        crate::test_support::require_vanilla_data();
+        let _guard = lock_gen_for_tests();
+        let order = window(5);
+        let mut a = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        serial(&mut a, &order);
+        let a = state(&mut a, 0, 0, 5);
+        super::POPULATE_WORKERS.store(0, Ordering::Relaxed);
+        let mut b = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        // No `starts_round` on the generator: the dispatch must not need one.
+        assert_eq!(
+            b.populate_in_order(order.iter().copied(), super::populate),
+            25
+        );
+        assert!(b.starts_round.is_none());
+        let workers = super::populate_workers();
+        let b = state(&mut b, 0, 0, 5);
+        assert_same(&a, &b, "populate_in_order round-less dispatch");
+        assert!(
+            workers >= 2 || crate::worldgen::terrain_jobs() <= 1,
+            "the round-less dispatch must use wave workers when jobs > 1, got {workers}"
         );
     }
 

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// `thread::current().id()` of the game-tick thread, installed when the tick
 /// loop spawns so populate passes executing on the tick thread are measurable
@@ -631,7 +631,7 @@ pub(crate) fn reset_dimension_registry() {
     registry.specs.clear();
     registry.by_key.clear();
     drop(registry);
-    PER_DIM.gens.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
+    PER_DIM.gens.write().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
     PER_DIM.data.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
     PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
 }
@@ -3025,6 +3025,10 @@ pub(crate) struct TerrainShare {
     bases: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
     beards: FlightCache<TerrainKey, Option<std::sync::Arc<BeardChunkData>>>,
     cols: FlightCache<TerrainKey, Option<std::sync::Arc<ChunkCols>>>,
+    /// `prelim_est_raw` per quart column: the preliminary surface level a column build's
+    /// surface rules ask for. Pure in the same key as the columns (its chunk fields carry
+    /// the quart column), so the same share answers it.
+    prelims: FlightCache<TerrainKey, i32>,
     base_surf: Mutex<HashMap<(u64, u8, i32, i32), i32>>,
 }
 
@@ -3038,6 +3042,7 @@ type TerrainKey = (u64, u8, i32, i32, u8, usize);
 const SHARE_DOMAIN_BASES: u64 = 0x1_0000_0001;
 const SHARE_DOMAIN_BEARDS: u64 = 0x1_0000_0002;
 const SHARE_DOMAIN_COLS: u64 = 0x1_0000_0003;
+const SHARE_DOMAIN_PRELIMS: u64 = 0x1_0000_0004;
 
 /// `MEGU_NOFEAT=1` is the terrain-only switch: it skips the whole feature layer, and a
 /// structure-shaped terrain is part of that layer. Cached once per process (the flag cannot
@@ -3057,6 +3062,9 @@ impl TerrainShare {
             bases: FlightCache::new(Some(BASE_CACHE_CAP)),
             beards: FlightCache::new(Some(BEARD_CACHE_CAP)),
             cols: FlightCache::new(Some(COL_CACHE_CAP)),
+            // A chunk's surface pass touches a 5x5 quart window; the bound keeps one
+            // round's worth (~2k) resident the way the column caps do.
+            prelims: FlightCache::new(Some(4096)),
             base_surf: Mutex::new(HashMap::default()),
         }
     }
@@ -8649,7 +8657,41 @@ impl Gen {
             return v;
         }
         inc_if(m3_read, M3_PRELIM_MISS);
-        let v = match self.prelim_df {
+        // The answer is pure in (seed, preset, quart column) — the same purity the
+        // shared column caches key on — so a worker asks the round's share instead of
+        // re-scanning the density column a sibling already scanned (the `prelim miss`
+        // jump 19 -> ~11k when the feature layer moved to cold workers).
+        let share = self.round_share();
+        let v = match share {
+            Some(share) => {
+                let key = self.terrain_share_key(k.0, k.1);
+                if let Some(v) = share.prelims.peek(&key) {
+                    v
+                } else if let Some(v) =
+                    self.share_fallback(&share).and_then(|f| f.prelims.peek(&key))
+                {
+                    v
+                } else {
+                    let token = flight_token(SHARE_DOMAIN_PRELIMS, &key);
+                    share
+                        .prelims
+                        .get_or_build(key, token, || self.prelim_est_eval(k))
+                }
+            }
+            None => self.prelim_est_eval(k),
+        };
+        self.prelim_c.insert(k, v);
+        self.prelim_ord.push_back(k);
+        if self.prelim_ord.len() > 32768 {
+            let old = self.prelim_ord.pop_front().unwrap();
+            self.prelim_c.remove(&old);
+        }
+        v
+    }
+
+    /// [`Gen::prelim_est_raw`]'s density scan, split out so the shared cache can wrap it.
+    fn prelim_est_eval(&mut self, k: (i32, i32)) -> i32 {
+        match self.prelim_df {
             Some(id) => {
                 let top = self.min_y + self.height;
                 let (density, start, step, threshold) = match self.dfs.get(id) {
@@ -8687,14 +8729,7 @@ impl Gen {
                 found.unwrap_or(i32::MAX)
             }
             None => i32::MAX,
-        };
-        self.prelim_c.insert(k, v);
-        self.prelim_ord.push_back(k);
-        if self.prelim_ord.len() > 32768 {
-            let old = self.prelim_ord.pop_front().unwrap();
-            self.prelim_c.remove(&old);
         }
-        v
     }
 
     /// Vanilla's preliminary surface level for one column: the bilinear
@@ -9028,10 +9063,10 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
 /// generator" for a slot that has not been installed, so a `Flat`/`Void` custom
 /// dimension — which has no `Gen` — just never fills its slot.
 pub(crate) struct PerDimGen {
-    /// The generators, indexed by [`DimId::index`]. One lock for all of them, because a
-    /// `Gen` is not `Send`-shareable work in progress: generation holds its dimension's
-    /// generator exclusively, exactly as it held `GEN`.
-    gens: Mutex<Vec<Option<Gen>>>,
+    /// The generators, indexed by [`DimId::index`]. The outer lock only guards slot
+    /// registration: once a dimension's slot exists, generation holds *that slot's* mutex,
+    /// so one dimension's section pass never queues behind another's.
+    gens: RwLock<Vec<Option<std::sync::Arc<Mutex<Option<Gen>>>>>>,
     /// The immutable half of each generator, published at init. A worker clones the `Arc`
     /// once and then reads a dimension's inputs without touching the generator lock.
     data: Mutex<Vec<Option<std::sync::Arc<GenData>>>>,
@@ -9041,7 +9076,7 @@ pub(crate) struct PerDimGen {
 }
 
 static PER_DIM: PerDimGen = PerDimGen {
-    gens: Mutex::new(Vec::new()),
+    gens: RwLock::new(Vec::new()),
     data: Mutex::new(Vec::new()),
     facts: Mutex::new(Vec::new()),
 };
@@ -9158,13 +9193,14 @@ pub(crate) mod parallel_probe {
 /// behind the one world lock. Off unless `FEAT_PROFILE` is set, in which case the
 /// two `Instant` calls are paid on every acquisition.
 ///
-/// The guard is over the registry's whole slot array, and the derefs hand out the one slot
-/// the lock was taken for — so `gen_lock().as_mut()` still means "the Overworld generator",
-/// unchanged, and `gen_lock_dim(dim)` means the same thing for another dimension.
+/// The guard is over one dimension's slot mutex, so `gen_lock().as_mut()` still means "the
+/// Overworld generator", unchanged, and `gen_lock_dim(dim)` means the same thing for another
+/// dimension — while a different dimension's callers lock their own slot in parallel.
 pub(crate) struct GenLock {
-    guard: std::sync::MutexGuard<'static, Vec<Option<Gen>>>,
-    dim: DimId,
-    /// `Some` when profiling: the time spent inside `PER_DIM.gens.lock()`.
+    guard: std::sync::MutexGuard<'static, Option<Gen>>,
+    /// The slot whose `Mutex` produced `guard`: held so the mutex outlives its guard.
+    _slot: std::sync::Arc<Mutex<Option<Gen>>>,
+    /// `Some` when profiling: the time spent acquiring the slot's lock.
     waited_ns: Option<u64>,
     held_since: Option<std::time::Instant>,
 }
@@ -9187,12 +9223,12 @@ impl Drop for GenLock {
 impl std::ops::Deref for GenLock {
     type Target = Option<Gen>;
     fn deref(&self) -> &Self::Target {
-        &self.guard[self.dim.index()]
+        &self.guard
     }
 }
 impl std::ops::DerefMut for GenLock {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard[self.dim.index()]
+        &mut self.guard
     }
 }
 
@@ -9285,17 +9321,43 @@ fn gen_lock_dim(dimension: DimId) -> GenLock {
     // that queues behind a section pass.
     let prof = env_flag!("FEAT_PROFILE") || env_flag!("MEGU_TICK_PROFILE");
     let started = prof.then(std::time::Instant::now);
-    let mut guard = PER_DIM.gens.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = dimension.index();
     // The caller's slot always exists: a custom dimension registers before it can be
     // named, and this grow is what turns "slot beyond the vanilla three" from a panic
-    // into a `None` generator.
-    let need = dimension.index() + 1;
-    if guard.len() < need {
-        guard.resize_with(need, || None);
+    // into a `None` generator. Slot registration needs the write half of the registry
+    // lock; locking a registered slot needs only the read half plus the slot's own mutex.
+    let mut arc = PER_DIM
+        .gens
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(slot)
+        .cloned()
+        .flatten();
+    if arc.is_none() {
+        let mut registry = PER_DIM.gens.write().unwrap_or_else(|e| e.into_inner());
+        if registry.len() <= slot {
+            registry.resize_with(slot + 1, || None);
+        }
+        if registry[slot].is_none() {
+            registry[slot] = Some(std::sync::Arc::new(Mutex::new(None)));
+        }
+        arc = registry[slot].clone();
     }
+    let arc = arc.unwrap_or_else(|| unreachable!("slot just installed"));
+    let guard = {
+        let guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the `Arc` is stored in `GenLock` and dropped after `guard`
+        // (field order), so the `Mutex` outlives the guard borrowing it.
+        unsafe {
+            std::mem::transmute::<
+                std::sync::MutexGuard<'_, Option<Gen>>,
+                std::sync::MutexGuard<'static, Option<Gen>>,
+            >(guard)
+        }
+    };
     GenLock {
         guard,
-        dim: dimension,
+        _slot: arc,
         waited_ns: started.map(|t| t.elapsed().as_nanos() as u64),
         held_since: started,
     }
@@ -9675,10 +9737,11 @@ fn ensure_dim_generator(dimension: DimId) {
     }
     let slot_ready = PER_DIM
         .gens
-        .lock()
+        .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(dimension.index())
-        .is_some_and(|slot| slot.is_some());
+        .and_then(|s| s.as_ref())
+        .is_some_and(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).is_some());
     if slot_ready {
         return;
     }
@@ -10137,12 +10200,21 @@ pub(crate) enum PeekCols {
 }
 
 pub(crate) fn peek_cols_dim(dimension: DimId, cx: i32, cz: i32) -> PeekCols {
-    let Some(guard) = PER_DIM.gens.try_lock().ok() else {
+    let Some(slot) = PER_DIM
+        .gens
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dimension.index())
+        .cloned()
+        .flatten()
+    else {
+        return PeekCols::Absent;
+    };
+    let Some(guard) = slot.try_lock().ok() else {
         return PeekCols::Contended;
     };
     match guard
-        .get(dimension.index())
-        .and_then(|g| g.as_ref())
+        .as_ref()
         .and_then(|g| g.col_c.get(&(cx, cz)).cloned())
     {
         Some(cols) => PeekCols::Ready(cols),
@@ -10716,6 +10788,10 @@ impl Gen {
                 let key = self.terrain_share_key(cx, cz);
                 if let Some(v) = share.beards.peek(&key) {
                     v
+                } else if let Some(v) =
+                    self.share_fallback(&share).and_then(|f| f.beards.peek(&key))
+                {
+                    v
                 } else {
                     let token = flight_token(SHARE_DOMAIN_BEARDS, &key);
                     share
@@ -10791,6 +10867,24 @@ impl Gen {
         }
     }
 
+    /// The per-world fallback share, when `share` is a *different* (round-scoped) one.
+    ///
+    /// A scoped round opens with cold caches while the fallback share may already carry
+    /// the same pure answers (streamed-fill workers publish there without a round). The
+    /// callers peek this second tier before building, so a fresh round never rebuilds a
+    /// column the world already computed. `None` when the selected share *is* the
+    /// fallback — peeking it twice answers nothing new.
+    fn share_fallback<'a>(
+        &'a self,
+        share: &'a std::sync::Arc<TerrainShare>,
+    ) -> Option<&'a std::sync::Arc<TerrainShare>> {
+        if std::sync::Arc::ptr_eq(share, &self.data.fallback_share) {
+            None
+        } else {
+            Some(&self.data.fallback_share)
+        }
+    }
+
     /// The share key for one chunk. Two things beyond the chunk's identity change what a
     /// shared column contains and are therefore part of the key: the `MEGU_NOFEAT` switch
     /// (a terrain-only run has no beardifier at all) and which beardifier resolver is in force
@@ -10828,6 +10922,11 @@ impl Gen {
                 if let Some(v) = share.cols.peek(&key) {
                     // The column another thread of this round already built: this is the
                     // `cols hit worker = 0` row of the P1a table, answered.
+                    m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
+                    v
+                } else if let Some(v) =
+                    self.share_fallback(&share).and_then(|f| f.cols.peek(&key))
+                {
                     m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
                     v
                 } else {
@@ -10878,6 +10977,10 @@ impl Gen {
             Some(share) => {
                 let key = self.terrain_share_key(cx, cz);
                 if let Some(v) = share.bases.peek(&key) {
+                    v
+                } else if let Some(v) =
+                    self.share_fallback(&share).and_then(|f| f.bases.peek(&key))
+                {
                     v
                 } else {
                     let token = flight_token(SHARE_DOMAIN_BASES, &key);
@@ -11393,6 +11496,13 @@ impl Gen {
                         .peek(&key)
                         .flatten()
                         .or_else(|| share.cols.peek(&key).flatten())
+                        .or_else(|| {
+                            let f = g.share_fallback(&share)?;
+                            f.bases
+                                .peek(&key)
+                                .flatten()
+                                .or_else(|| f.cols.peek(&key).flatten())
+                        })
                         .map(|c| c.grids.clone())
                 });
             let have_density = reused.is_some();
@@ -13099,15 +13209,15 @@ impl Gen {
         // The type name is a dispatch gate only: a false negative costs a optimisation, never
         // correctness, and a false positive is ruled out by the explicit call sites.
         let is_feature_driver = std::any::type_name_of_val(&populate).contains("feature::populate");
-        // A3-a scratch generators copy `owner.starts_round`. With parallel terrain jobs but no
-        // shared round cache (the delivery default: `terrain_jobs()` is 8 while
-        // `delivery_prefetch_jobs()` is 1), every worker rebuilds structure starts and terrain
-        // answers on its own thread-local cache; E4-12 measured ~58-63 s for the first 81-chunk
-        // window. Only dispatch in parallel when a round is open. Batch worldgen / `perf_bench`
-        // open one for `--jobs 5/8`, so those stay parallel; the round-less delivery path runs
-        // the serial arm and keeps its tick-latency contract.
+        // A caller that did not open a `starts_round` — the live-server delivery
+        // path — still dispatches: the workers then run round-less, sharing
+        // `data.fallback_share` and their thread-local start caches instead of a
+        // round's. Both are bounded and live for the world's lifetime, which a
+        // scoped per-call round cannot give them: measured on
+        // `load_compare.sh`, opening and dropping a round per request rebuilt
+        // the whole shared column/start set for every request and cost 3.6x the
+        // CPU of the serial arm it replaced.
         let gate = jobs > 1
-            && self.starts_round.is_some()
             && self.pop_region.is_none()
             && is_feature_driver;
 
@@ -20027,7 +20137,21 @@ mod wg_tests {
 
         // The same-key race, forced: two scratch generators of one round ask for one chunk's
         // final columns at the same moment. One leads the flight, the other takes the
-        // publication, and both must get the same bytes.
+        // publication, and both must get the same bytes. The round's callers also consult
+        // the per-world fallback share before building, and the arms above published into
+        // it — the raced key must be one the fallback does not already hold, or the ask is
+        // answered there and the round's flight never runs.
+        let raced = {
+            let mut probe = Gen::fresh_scratch(std::sync::Arc::clone(&data));
+            probe.set_beard_resolver(resolver);
+            (0..)
+                .map(|i| (7 + i, 7))
+                .find(|&(cx, cz)| {
+                    let key = probe.terrain_share_key(cx, cz);
+                    probe.data.fallback_share.cols.peek(&key).is_none()
+                })
+                .expect("a chunk whose columns the fallback share has never seen")
+        };
         let round = crate::feature::starts_round_begin();
         let barrier = std::sync::Barrier::new(2);
         let fingers = std::sync::Mutex::new(Vec::new());
@@ -20041,7 +20165,7 @@ mod wg_tests {
                     g.starts_round = Some(round);
                     g.set_beard_resolver(resolver);
                     barrier.wait();
-                    let cc = g.cols(7, 7).expect("columns for the raced chunk");
+                    let cc = g.cols(raced.0, raced.1).expect("columns for the raced chunk");
                     fingers.lock().unwrap_or_else(|e| e.into_inner()).push(cols_fingerprint(&mut g, &cc));
                 });
             }
@@ -20329,6 +20453,26 @@ mod wg_tests {
         });
         eprintln!("GENLOCK wall={:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
         report_gen_lock();
+    }
+
+    /// One dimension's generator lock must not queue another dimension's caller: the
+    /// registry is a slot per dimension, so a Nether generation hold leaves the
+    /// Overworld's slot free. (The pre-split single `Mutex<Vec>` would re-block the
+    /// second `gen_lock_dim` outright, including on this same thread.)
+    #[test]
+    fn dimension_generator_locks_are_independent() {
+        let _guard = lock_gen();
+        let nether = gen_lock_dim(DimId::Nether);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _overworld = gen_lock_dim(DimId::Overworld);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
+            "the overworld slot blocked behind the nether generator lock"
+        );
+        drop(nether);
     }
 
     #[test]
@@ -22408,7 +22552,12 @@ mod wg_tests {
     /// old eager in-pipeline scan produced.
     #[test]
     fn a2b_lazy_surface_mats_stays_uncomputed_on_height_queries_and_matches_eager() {
-        let mut g = Gen::load_preset(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
+        // An uncached generator: `load_preset`'s test cache shares `GenData` — and
+        // therefore the fallback share's columns — between tests, and a populate on
+        // another thread can publish the material cell on a column this test has not
+        // asked about yet.
+        let mut g =
+            Gen::load_preset_uncached(0, crate::name_to_state, NoisePreset::Overworld).unwrap();
         let (cx, cz) = (0, 0);
         let cc = g.cols(cx, cz).unwrap();
         assert!(
