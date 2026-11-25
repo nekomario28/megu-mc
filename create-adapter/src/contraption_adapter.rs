@@ -21,6 +21,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use megu_core::world_view::{rotate_block_properties, SubLevelTransform, WorldView};
+use mod_adapter_core::blockstates::{format_canonical, BlockRegistry};
 use mod_offload::contraption::{Aabb, BlockCluster, ClusterError, Contraption, Pose};
 
 use crate::blockstates::CreateBlockRegistry;
@@ -765,7 +767,24 @@ impl LiveContraption {
 
     /// Disassemble the contraption by snapping its current rigid rotation to
     /// the nearest 90° increment and translation to integer world coordinates.
+    /// Blockstate ids pass through unrotated — callers with a
+    /// [`BlockRegistry`] use [`Self::disassemble_to_world_with_rotator`] so
+    /// directional properties (`facing`, `axis`, rail `shape`, cardinal
+    /// connection keys…) rotate together with the cell coordinates.
     pub fn disassemble_to_world(&self) -> Vec<WorldBlockEdit> {
+        self.disassemble_to_world_with_rotator(|state_id, _turns| state_id)
+    }
+
+    /// [`disassemble_to_world`](Self::disassemble_to_world) with a blockstate
+    /// rotator: `rotate_state(state_id, rot)` maps each cell's runtime state
+    /// id to its `rot`-quarter-turns-rotated sibling (`rot` in `0..=3`, the
+    /// same convention the `(x, z) -> (z, -x)` coordinate map and
+    /// [`megu_core::world_view::rotate_block_properties`] share). Compose it
+    /// from [`registry_state_rotator`] when a [`BlockRegistry`] is at hand.
+    pub fn disassemble_to_world_with_rotator(
+        &self,
+        rotate_state: impl Fn(u32, i32) -> u32,
+    ) -> Vec<WorldBlockEdit> {
         let quarter_turns = (self.yaw_deg / 90.0).round() as i32;
         let rot = quarter_turns.rem_euclid(4);
         let base_x = self.translation[0].round() as i32;
@@ -795,7 +814,7 @@ impl LiveContraption {
                         base_y.saturating_add(ly),
                         base_z.saturating_add(rz),
                     ),
-                    state_id: Some(state_id),
+                    state_id: Some(rotate_state(state_id, rot)),
                 }
             })
             .collect()
@@ -809,7 +828,20 @@ impl LiveContraption {
         &self,
         is_occupied: impl Fn(DimBlockPos) -> bool,
     ) -> Result<Vec<WorldBlockEdit>, Vec<DimBlockPos>> {
-        let edits = self.disassemble_to_world();
+        self.disassemble_to_world_checked_with_rotator(is_occupied, |state_id, _turns| state_id)
+    }
+
+    /// [`disassemble_to_world_checked`](Self::disassemble_to_world_checked)
+    /// with a blockstate rotator — the conflict list reports the rotated
+    /// target cells exactly as
+    /// [`disassemble_to_world_with_rotator`](Self::disassemble_to_world_with_rotator)
+    /// would emit them.
+    pub fn disassemble_to_world_checked_with_rotator(
+        &self,
+        is_occupied: impl Fn(DimBlockPos) -> bool,
+        rotate_state: impl Fn(u32, i32) -> u32,
+    ) -> Result<Vec<WorldBlockEdit>, Vec<DimBlockPos>> {
+        let edits = self.disassemble_to_world_with_rotator(rotate_state);
         let conflicts: Vec<DimBlockPos> = edits
             .iter()
             .filter(|edit| is_occupied(edit.pos))
@@ -990,6 +1022,75 @@ impl LiveContraption {
     }
 }
 
+/// Compose a `rotate_state(state_id, rot)` closure over a [`BlockRegistry`]
+/// for [`LiveContraption::disassemble_to_world_with_rotator`]: resolves the
+/// runtime state id to its canonical properties, runs
+/// [`megu_core::world_view::rotate_block_properties`] (every directional
+/// property — `facing`, `axis`, `rotation`, `orientation`, rail `shape`,
+/// cardinal connection keys), and resolves the rotated canonical form back
+/// to a runtime id. Unknown states and `rot == 0` pass through unchanged so
+/// propertyless blocks and unresolved registries degrade gracefully.
+pub fn registry_state_rotator<'a, R>(
+    registry: &'a BlockRegistry<R>,
+) -> impl Fn(u32, i32) -> u32 + 'a {
+    move |state_id, turns| {
+        let turns = turns.rem_euclid(4);
+        if turns == 0 {
+            return state_id;
+        }
+        let Some(entry) = registry.state(state_id) else {
+            return state_id;
+        };
+        if entry.properties.is_empty() {
+            return state_id;
+        }
+        let props: Vec<(&str, &str)> = entry
+            .properties
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let rotated = rotate_block_properties(&props, turns);
+        let canonical = format_canonical(&entry.block_id, &rotated);
+        registry.decode_canonical(&canonical).unwrap_or(state_id)
+    }
+}
+
+/// Canonical [`WorldView`] for a live contraption sub-level: local block
+/// cells read/write through the paletted [`BlockCluster`], and
+/// [`Self::world_transform`] reports the rigid [`Pose`] (pivot at the local
+/// origin — `Pose` translation already refers to it). Writes rebuild the
+/// cluster via [`Contraption::replace_cluster`] so palette invariants stay
+/// intact; an invalid rebuild is refused (`false`).
+impl WorldView for LiveContraption {
+    fn block_state_at(&self, pos: [i32; 3]) -> Option<u32> {
+        self.inner.cluster().state_at(pos)
+    }
+
+    fn set_block_state(&mut self, pos: [i32; 3], state: u32) -> bool {
+        let mut cells: Vec<([i32; 3], u32)> = self.inner.cluster().blocks().collect();
+        match cells.iter_mut().find(|(p, _)| *p == pos) {
+            Some(slot) => slot.1 = state,
+            None => cells.push((pos, state)),
+        }
+        match BlockCluster::new(cells) {
+            Ok(cluster) => {
+                self.inner.replace_cluster(cluster);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn world_transform(&self) -> SubLevelTransform {
+        let pose = self.inner.pose();
+        SubLevelTransform {
+            rotation: pose.rotation(),
+            translation: pose.translation(),
+            pivot: [0.0; 3],
+        }
+    }
+}
+
 /// The world cell swept by `actor` this tick: `local + facing` rotated by the
 /// rigid pose and snapped to the integer grid.
 fn actor_target_cell(inner: &Contraption, actor: &ContraptionActor) -> [i32; 3] {
@@ -1149,5 +1250,271 @@ mod tests {
         // Saturated to the i32 edges rather than wrapping or panicking.
         assert!(edits.iter().all(|e| e.pos.x == i32::MAX));
         assert!(edits.iter().all(|e| e.pos.y == i32::MIN));
+    }
+
+    // -- P0-E: blockstate rotation on disassembly -----------------------
+
+    /// Tiny registry with real directional properties so the rotator has
+    /// something to resolve against (`R = ()`: no gameplay role needed).
+    fn directional_test_registry() -> BlockRegistry<()> {
+        use mod_adapter_core::blockstates::{BlockDef, PropertyDef};
+        BlockRegistry::build(
+            DEFAULT_BASE_STATE_ID,
+            vec![
+                BlockDef::<()> {
+                    id: "test:furnace".into(),
+                    properties: vec![PropertyDef::new(
+                        "facing",
+                        &["north", "east", "south", "west", "up", "down"],
+                    )],
+                    load_factor: 0.0,
+                    capacity_factor: 0.0,
+                    role: (),
+                },
+                BlockDef::<()> {
+                    id: "test:log".into(),
+                    properties: vec![PropertyDef::new("axis", &["x", "y", "z"])],
+                    load_factor: 0.0,
+                    capacity_factor: 0.0,
+                    role: (),
+                },
+                BlockDef::<()> {
+                    id: "test:rail".into(),
+                    properties: vec![PropertyDef::new(
+                        "shape",
+                        &[
+                            "north_south",
+                            "east_west",
+                            "ascending_east",
+                            "ascending_north",
+                            "ascending_west",
+                            "ascending_south",
+                            "south_east",
+                            "north_east",
+                            "north_west",
+                            "south_west",
+                        ],
+                    )],
+                    load_factor: 0.0,
+                    capacity_factor: 0.0,
+                    role: (),
+                },
+                BlockDef::<()> {
+                    id: "test:pipe".into(),
+                    properties: vec![
+                        PropertyDef::new("north", &["none", "side"]),
+                        PropertyDef::new("east", &["none", "side"]),
+                        PropertyDef::new("south", &["none", "side"]),
+                        PropertyDef::new("west", &["none", "side"]),
+                    ],
+                    load_factor: 0.0,
+                    capacity_factor: 0.0,
+                    role: (),
+                },
+                BlockDef::<()> {
+                    id: "test:plain".into(),
+                    properties: vec![],
+                    load_factor: 0.0,
+                    capacity_factor: 0.0,
+                    role: (),
+                },
+            ],
+        )
+        .unwrap()
+    }
+
+    fn gather_by_pos(edits: &[WorldBlockEdit]) -> BTreeMap<(i32, i32, i32), Option<u32>> {
+        edits
+            .iter()
+            .map(|e| ((e.pos.x, e.pos.y, e.pos.z), e.state_id))
+            .collect()
+    }
+
+    #[test]
+    fn disassembly_90_deg_rotates_cells_and_directional_states_together() {
+        let reg = directional_test_registry();
+        let east = reg.decode_canonical("test:furnace[facing=east]").unwrap();
+        let x_axis = reg.decode_canonical("test:log[axis=x]").unwrap();
+        let ew_rail = reg.decode_canonical("test:rail[shape=east_west]").unwrap();
+        let asc_east = reg.decode_canonical("test:rail[shape=ascending_east]").unwrap();
+        let pipe_n = reg
+            .decode_canonical("test:pipe[north=side,east=none,south=none,west=none]")
+            .unwrap();
+        let plain = reg.decode_canonical("test:plain").unwrap();
+
+        let mut world = BTreeMap::new();
+        world.insert([10, 64, 10], east);
+        world.insert([11, 64, 10], x_axis);
+        world.insert([12, 64, 10], ew_rail);
+        world.insert([13, 64, 10], asc_east);
+        world.insert([14, 64, 10], pipe_n);
+        world.insert([15, 64, 10], plain);
+        let (mut c, _) = LiveContraption::assemble_from_world(
+            1,
+            0,
+            [10, 64, 10],
+            [10, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [0.0; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )
+        .unwrap();
+
+        // 90° yaw: local +x lands on world -z; facing east -> north,
+        // axis x -> z, east_west -> north_south, ascending_east ->
+        // ascending_north, the pipe's north=side leg rotates to west=side.
+        c.yaw_deg = 90.0;
+        let edits = c.disassemble_to_world_with_rotator(registry_state_rotator(&reg));
+        let at = gather_by_pos(&edits);
+        assert_eq!(edits.len(), 6);
+        let state = |canonical: &str| Some(reg.decode_canonical(canonical).unwrap());
+        assert_eq!(
+            at[&(10, 64, 10)],
+            state("test:furnace[facing=north]")
+        );
+        assert_eq!(at[&(10, 64, 9)], state("test:log[axis=z]"));
+        assert_eq!(at[&(10, 64, 8)], state("test:rail[shape=north_south]"));
+        assert_eq!(
+            at[&(10, 64, 7)],
+            state("test:rail[shape=ascending_north]")
+        );
+        assert_eq!(
+            at[&(10, 64, 6)],
+            state("test:pipe[north=none,east=none,south=none,west=side]")
+        );
+        // Propertyless blocks pass through untouched.
+        assert_eq!(at[&(10, 64, 5)], Some(plain));
+    }
+
+    #[test]
+    fn disassembly_180_and_270_rotate_states_consistently_with_coordinates() {
+        let reg = directional_test_registry();
+        let east = reg.decode_canonical("test:furnace[facing=east]").unwrap();
+        let x_axis = reg.decode_canonical("test:log[axis=x]").unwrap();
+        let asc_east = reg.decode_canonical("test:rail[shape=ascending_east]").unwrap();
+        let mut world = BTreeMap::new();
+        world.insert([10, 64, 10], east);
+        world.insert([11, 64, 10], x_axis);
+        world.insert([12, 64, 10], asc_east);
+        let build = |yaw: f32| {
+            let (mut c, _) = LiveContraption::assemble_from_world(
+                2,
+                0,
+                [10, 64, 10],
+                [10, 64, 10],
+                &world,
+                ContraptionKind::Linear {
+                    velocity_per_tick: [0.0; 3],
+                },
+                DEFAULT_MAX_CONTRAPTION_BLOCKS,
+            )
+            .unwrap();
+            c.yaw_deg = yaw;
+            gather_by_pos(&c.disassemble_to_world_with_rotator(registry_state_rotator(&reg)))
+        };
+        let state = |canonical: &str| Some(reg.decode_canonical(canonical).unwrap());
+
+        // 180°: (x,z) -> (-x,-z); facing east -> west, axis x -> x (even
+        // turn keeps the axis), ascending_east -> ascending_west.
+        let at = build(180.0);
+        assert_eq!(at[&(10, 64, 10)], state("test:furnace[facing=west]"));
+        assert_eq!(at[&(9, 64, 10)], state("test:log[axis=x]"));
+        assert_eq!(at[&(8, 64, 10)], state("test:rail[shape=ascending_west]"));
+
+        // 270°: (x,z) -> (-z,x); facing east -> south — the same
+        // right-handed convention the coordinate map uses: east(+x) -> +z
+        // which is `south`; ascending_east -> ascending_south.
+        let at = build(270.0);
+        assert_eq!(at[&(10, 64, 10)], state("test:furnace[facing=south]"));
+        assert_eq!(at[&(10, 64, 11)], state("test:log[axis=z]"));
+        assert_eq!(at[&(10, 64, 12)], state("test:rail[shape=ascending_south]"));
+    }
+
+    #[test]
+    fn disassembly_without_rotator_preserves_states_and_checked_reports_conflicts() {
+        let reg = directional_test_registry();
+        let east = reg.decode_canonical("test:furnace[facing=east]").unwrap();
+        let mut world = BTreeMap::new();
+        world.insert([10, 64, 10], east);
+        world.insert([11, 64, 10], east);
+        let (mut c, _) = LiveContraption::assemble_from_world(
+            3,
+            0,
+            [10, 64, 10],
+            [10, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [0.0; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )
+        .unwrap();
+        c.yaw_deg = 90.0;
+        // Legacy entry point: coordinates rotate, state ids pass through.
+        let at = gather_by_pos(&c.disassemble_to_world());
+        assert_eq!(at[&(10, 64, 10)], Some(east));
+        assert_eq!(at[&(10, 64, 9)], Some(east));
+
+        // The checked rotator variant reports conflicts at the *rotated*
+        // target cells.
+        let conflicts = c
+            .disassemble_to_world_checked_with_rotator(
+                |p| p.x == 10 && p.z == 9,
+                registry_state_rotator(&reg),
+            )
+            .unwrap_err();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!((conflicts[0].x, conflicts[0].z), (10, 9));
+    }
+
+    #[test]
+    fn registry_state_rotator_passes_through_unknown_and_zero_turn_states() {
+        let reg = directional_test_registry();
+        let rot = registry_state_rotator(&reg);
+        let east = reg.decode_canonical("test:furnace[facing=east]").unwrap();
+        assert_eq!(rot(east, 0), east);
+        assert_eq!(rot(east, 4), east, "a full turn is the identity");
+        assert_eq!(rot(east, -3), rot(east, 1), "turns are mod-4 Euclidean");
+        assert_eq!(rot(u32::MAX, 1), u32::MAX, "unresolved states pass through");
+        // Invalid combinations (e.g. a canonical that resolves to no
+        // registered state) degrade to the input id.
+        let plain = reg.decode_canonical("test:plain").unwrap();
+        assert_eq!(rot(plain, 1), plain);
+    }
+
+    // -- Common foundation: WorldView on the live contraption ------------
+
+    #[test]
+    fn world_view_reads_writes_and_reports_the_rigid_pose() {
+        let reg = core_create_registry(DEFAULT_BASE_STATE_ID);
+        let shaft = reg.default_state("create:shaft").unwrap();
+        let mut world = BTreeMap::new();
+        world.insert([10, 64, 10], shaft);
+        let (mut c, _) = LiveContraption::assemble_from_world(
+            4,
+            0,
+            [10, 64, 10],
+            [10, 64, 10],
+            &world,
+            ContraptionKind::Linear {
+                velocity_per_tick: [0.0; 3],
+            },
+            DEFAULT_MAX_CONTRAPTION_BLOCKS,
+        )
+        .unwrap();
+        assert_eq!(WorldView::block_state_at(&c, [0, 0, 0]), Some(shaft));
+        assert_eq!(WorldView::block_state_at(&c, [5, 5, 5]), None);
+        // Writes rebuild the cluster and keep palette invariants.
+        assert!(c.set_block_state([1, 0, 0], shaft));
+        assert_eq!(c.block_count(), 2);
+        assert_eq!(WorldView::block_state_at(&c, [1, 0, 0]), Some(shaft));
+        // The transform is the rigid pose with the pivot at the local
+        // origin: local cell 0 maps straight onto the anchor.
+        let t = WorldView::world_transform(&c);
+        assert_eq!(t.pivot, [0.0; 3]);
+        let w = t.local_to_world([0.0, 0.0, 0.0]).unwrap();
+        assert_eq!(w, [10.0, 64.0, 10.0]);
     }
 }

@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use megu_core::world_view::{SubLevelTransform, WorldView};
 use mod_adapter_core::neoforge_wire::{read_mc_string, read_varint, write_mc_string, write_varint};
 use mod_adapter_core::version_compat::{data_version_for, McVersion};
 use mod_offload::kinetic_graph::NetworkStatus;
@@ -32,6 +33,10 @@ pub const AERO_DATA_VERSION_1_21_1: i32 = 3955;
 pub const AERO_DATA_VERSION_26_3: i32 = 5023;
 /// Default per-block mass (kg) when the caller has no better table.
 pub const DEFAULT_BLOCK_MASS: f64 = 100.0;
+/// Per-substep solver default: 4 substeps per 20 TPS tick = 80 Hz
+/// internal integration, matching the update rate real rigid-body mods
+/// target so resting contacts never tunnel.
+pub const DEFAULT_PHYSICS_SUBSTEPS: u32 = 4;
 /// Sea-level air density normalization for `step`'s `air_density` argument.
 pub const SEA_LEVEL_AIR_DENSITY: f64 = 1.0;
 /// Hard linear speed bound (m/s); exceeded components are renormalized.
@@ -453,6 +458,110 @@ pub struct RudderMount {
     pub gain: f64,
 }
 
+/// Per-material mass table: `(path_substring, mass_kg)` pairs checked in
+/// order against the block's resource path (first match wins), scaled so
+/// the heaviest blocks a ship can plausibly carry dominate the lighter
+/// hull/insulation materials by realistic density ratios. This is a
+/// gameplay-scaled table (a vanilla-scale "kg per block"), not a
+/// geological survey — what matters is that an obsidian keel outweighs a
+/// wool balloon by roughly the same ratio real materials do.
+const MATERIAL_MASS_TABLE: &[(&str, f64)] = &[
+    // Composite Create/Aeronautics machinery before raw material names: an
+    // `andesite_propeller` is mostly wooden blades and a small casing, not a
+    // solid andesite cube — calibrated so a one-envelope test ship retains
+    // positive net lift under helm control. An airship
+    // assembler is dense machinery: metal gearing in a stone casing.
+    ("propeller", 100.0),
+    ("airship_assembler", 192.0),
+    // Ultra-dense exotic hull materials.
+    ("netherite", 4000.0),
+    ("ancient_debris", 4000.0),
+    ("bedrock", 2000.0),
+    ("obsidian", 1200.0),
+    // Metals: structural mass a real hull would carry.
+    ("raw_gold", 1500.0),
+    ("gold", 1900.0),
+    ("raw_copper", 650.0),
+    ("copper", 900.0),
+    ("anvil", 800.0),
+    ("raw_iron", 700.0),
+    ("iron", 800.0),
+    ("chain", 400.0),
+    ("lantern", 100.0),
+    // Dense rock.
+    ("deepslate", 300.0),
+    ("blackstone", 280.0),
+    ("basalt", 280.0),
+    ("end_stone", 260.0),
+    ("netherrack", 180.0),
+    ("stone", 200.0),
+    ("andesite", 200.0),
+    ("granite", 200.0),
+    ("diorite", 200.0),
+    ("tuff", 190.0),
+    ("calcite", 190.0),
+    ("brick", 220.0),
+    ("concrete", 240.0),
+    ("terracotta", 180.0),
+    ("magma", 260.0),
+    // Loose sediments.
+    ("sandstone", 200.0),
+    ("sand", 160.0),
+    ("gravel", 160.0),
+    ("dirt", 120.0),
+    ("grass_block", 120.0),
+    ("mud", 130.0),
+    ("clay", 140.0),
+    ("soul_soil", 110.0),
+    ("ice", 90.0),
+    ("snow", 60.0),
+    // Manufactured light materials.
+    ("glass", 25.0),
+    ("wool", 15.0),
+    ("carpet", 15.0),
+    // Wood.
+    ("log", 70.0),
+    ("stem", 70.0),
+    ("hyphae", 70.0),
+    ("wood", 65.0),
+    ("planks", 60.0),
+    ("slab", 40.0),
+    ("stairs", 60.0),
+    ("fence", 30.0),
+    ("door", 40.0),
+    ("trapdoor", 20.0),
+    ("ladder", 10.0),
+    // Aeronautics-grade ultralights: the whole point of a balloon hull.
+    ("sail", 10.0),
+    ("canvas", 10.0),
+    ("envelope", 8.0),
+    ("balloon", 8.0),
+    ("blimp", 8.0),
+    // Flora and utility blocks.
+    ("leaves", 5.0),
+    ("torch", 2.0),
+    ("flower", 2.0),
+    ("sapling", 2.0),
+    ("cactus", 8.0),
+    ("lava", 280.0),
+    ("water", 100.0),
+];
+
+/// Per-block mass (kg) for `block_id` (`"namespace:path[props]"` or bare
+/// `"namespace:path"`): the first [`MATERIAL_MASS_TABLE`] substring match
+/// on the resource path, `default_mass` when nothing matches. The table
+/// keys on the *path* so `"minecraft:smooth_stone"` and
+/// `"minecraft:stone_stairs"` both hit the stone entry.
+pub fn material_mass_kg(block_id: &str, default_mass: f64) -> f64 {
+    let path = id_path(canonical_block_id(block_id));
+    for (needle, mass) in MATERIAL_MASS_TABLE {
+        if path.contains(needle) {
+            return *mass;
+        }
+    }
+    default_mass
+}
+
 /// A flying 6-DOF rigid-body sub-world generalizing Create's 1-axis
 /// contraptions: compatible with Create: Aeronautics, Create: Simulated,
 /// Clockwork, and Valkyrien Skies-style airships.
@@ -488,7 +597,36 @@ pub struct RigidBodySubWorld {
     min_rpms: BTreeMap<String, f64>,
     pub mass: f64,
     pub center_of_mass: [f64; 3],
+    /// Body-frame inertia diagonal `[Ixx, Iyy, Izz]` — kept populated for
+    /// backwards compatibility; the authoritative rotational state is the
+    /// full [`Self::inertia_tensor`].
     pub inertia_diag: [f64; 3],
+    /// Full symmetric 3×3 body-frame inertia tensor (row-major,
+    /// off-diagonal products of inertia included). Always
+    /// positive-definite — the unit-cube self-inertia term keeps even a
+    /// one-block or collinear ship invertible.
+    pub inertia_tensor: [[f64; 3]; 3],
+    /// Exact inverse of [`Self::inertia_tensor`] (row-major), maintained
+    /// alongside so the angular integrator never inverts on the hot path.
+    pub inv_inertia_tensor: [[f64; 3]; 3],
+    /// Per-block-id mass overrides (kg) consulted before
+    /// [`material_mass_kg`]'s table — a ship builder can declare heavier
+    /// plating or lighter composites without forking the table.
+    pub mass_overrides: BTreeMap<String, f64>,
+    /// Physics substeps per [`Self::step_env_with_contacts`] call
+    /// (`4` = 80 Hz internal integration per 20 TPS tick).
+    pub substeps: u32,
+    /// Dormancy flag: `false` marks a stably-resting ship that the contact
+    /// solver leaves completely untouched. Any helm input, block edit or
+    /// external impulse wakes it.
+    pub awake: bool,
+    /// Solver bookkeeping: consecutive supported low-energy substeps seen
+    /// by the contact backend. Sleeping takes hysteresis — a parked hull
+    /// limit-cycles at tiny velocities as gravity refeeds `v` each substep,
+    /// so the backend parks only after [`BuiltinContactSolver::min_sleep_substeps`]
+    /// straight quiet substeps. Reset by [`Self::wake`]. Not serialized:
+    /// a restored ship simply re-times.
+    pub rest_substeps: u32,
     pub buoyancy_blocks: u32,
     pub propellers: Vec<PropellerMount>,
     pub rudders: Vec<RudderMount>,
@@ -545,6 +683,12 @@ impl RigidBodySubWorld {
             mass: 0.0,
             center_of_mass: [0.0; 3],
             inertia_diag: [0.0; 3],
+            inertia_tensor: [[0.0; 3]; 3],
+            inv_inertia_tensor: [[0.0; 3]; 3],
+            mass_overrides: BTreeMap::new(),
+            substeps: DEFAULT_PHYSICS_SUBSTEPS,
+            awake: true,
+            rest_substeps: 0,
             buoyancy_blocks: 0,
             propellers: Vec::new(),
             rudders: Vec::new(),
@@ -600,20 +744,97 @@ impl RigidBodySubWorld {
 
     /// Place/replace a local block (canonical blockstate string), updating the
     /// embedded kinetic graph and recomputing mass/CoM/inertia/mounts.
+    /// Editing a flying ship shifts its mass-weighted center of mass;
+    /// [`Self::pos`] is translated by the world-space COM delta so every
+    /// *existing* block keeps its exact world position — a mid-flight
+    /// block place never teleports the hull.
     pub fn set_block(&mut self, local: [i32; 3], canonical: impl Into<String>) {
+        self.wake();
         self.blocks.insert(local, canonical.into());
         self.rebuild_factory();
-        self.recompute_physics();
+        self.preserve_world_geometry_during_physics_update();
     }
 
-    /// Remove a local block and recompute physical properties.
+    /// Remove a local block and recompute physical properties. Like
+    /// [`Self::set_block`], the world-space COM shift is compensated in
+    /// [`Self::pos`] so the remaining hull stays world-exact.
     pub fn remove_block(&mut self, local: [i32; 3]) -> bool {
         if self.blocks.remove(&local).is_none() {
             return false;
         }
+        self.wake();
         self.rebuild_factory();
-        self.recompute_physics();
+        self.preserve_world_geometry_during_physics_update();
         true
+    }
+
+    /// Re-run [`Self::recompute_physics`], then translate `pos` by the
+    /// world-frame COM delta `R·Δcom`: `local_to_world` is
+    /// `pos + R·(p − com)`, so `pos' = pos + R·Δcom` cancels the COM
+    /// shift exactly and every pre-existing cell's world position is
+    /// preserved bit-for-bit.
+    fn preserve_world_geometry_during_physics_update(&mut self) {
+        let old_com = self.center_of_mass;
+        self.recompute_physics();
+        let delta_local = [
+            self.center_of_mass[0] - old_com[0],
+            self.center_of_mass[1] - old_com[1],
+            self.center_of_mass[2] - old_com[2],
+        ];
+        if delta_local.iter().all(|&d| d == 0.0) {
+            return;
+        }
+        let delta_world = quat_rotate(self.quat, delta_local);
+        for (p, &d) in self.pos.iter_mut().zip(&delta_world) {
+            *p = sanitize(*p + d);
+        }
+    }
+
+    /// Register a per-block-id mass override (kg) consulted before
+    /// [`material_mass_kg`]'s table — e.g. declare heavier plating or a
+    /// fictional ultralight alloy. Recomputes physics immediately; a
+    /// non-positive or non-finite `mass_kg` is rejected (`false`).
+    pub fn set_block_mass_override(&mut self, block_id: &str, mass_kg: f64) -> bool {
+        if !(mass_kg.is_finite() && mass_kg > 0.0) {
+            return false;
+        }
+        self.wake();
+        self.mass_overrides
+            .insert(canonical_block_id(block_id).to_string(), mass_kg);
+        self.preserve_world_geometry_during_physics_update();
+        true
+    }
+
+    /// Clear a mass override previously set by
+    /// [`Self::set_block_mass_override`]; returns `true` when one existed.
+    pub fn clear_block_mass_override(&mut self, block_id: &str) -> bool {
+        if self
+            .mass_overrides
+            .remove(canonical_block_id(block_id))
+            .is_none()
+        {
+            return false;
+        }
+        self.wake();
+        self.preserve_world_geometry_during_physics_update();
+        true
+    }
+
+    /// The mass (kg) of one block id on *this* ship: `mass_overrides`
+    /// first, then [`material_mass_kg`] with `block_mass` as fallback.
+    fn block_mass_kg(&self, canonical: &str) -> f64 {
+        let id = canonical_block_id(canonical);
+        self.mass_overrides
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| material_mass_kg(id, self.block_mass))
+    }
+
+    /// Dormancy: mark the ship awake so the next contact step actually
+    /// runs. Called by every mutating entry point.
+    pub fn wake(&mut self) {
+        self.awake = true;
+        self.rest_substeps = 0;
     }
 
     fn rebuild_factory(&mut self) {
@@ -627,38 +848,36 @@ impl RigidBodySubWorld {
         }
     }
 
-    /// Recompute mass, center of mass, diagonal inertia tensor, buoyancy
-    /// count, and propeller/rudder mounts from the current `blocks` map.
-    /// Called on assemble and on every `set_block`/`remove_block` edit.
+    /// Recompute mass, center of mass, the full symmetric 3×3 inertia
+    /// tensor (and its exact inverse), buoyancy count, and
+    /// propeller/rudder mounts from the current `blocks` map.
+    ///
+    /// Mass is mass-weighted: `M = Σ m_i` with `m_i` from
+    /// [`Self::block_mass_kg`], `com = Σ m_i (p_i + 0.5) / M`, and the
+    /// tensor carries real off-diagonal products of inertia
+    /// (`I_xy = −Σ m_i d_x d_y`) plus each voxel's unit-cube
+    /// self-inertia `m_i/6` on the diagonal — the term that keeps even a
+    /// one-block or collinear ship's tensor strictly positive-definite
+    /// and exactly invertible. `inertia_diag` stays populated as
+    /// `[Ixx, Iyy, Izz]` for backwards compatibility. Called on assemble
+    /// and on every `set_block`/`remove_block` edit.
     pub fn recompute_physics(&mut self) {
-        let n = self.blocks.len() as f64;
-        self.mass = n * self.block_mass;
+        // Mass-weighted total mass and center of mass.
+        let mut mass = 0.0f64;
         let mut com = [0.0f64; 3];
-        for p in self.blocks.keys() {
+        for (p, canonical) in &self.blocks {
+            let m = self.block_mass_kg(canonical);
+            mass += m;
             for i in 0..3 {
-                com[i] += f64::from(p[i]) + 0.5;
+                com[i] += m * (f64::from(p[i]) + 0.5);
             }
         }
+        self.mass = sanitize(mass).max(1e-9);
         for c in &mut com {
-            *c = sanitize(*c / n.max(1e-9));
+            *c = sanitize(*c / self.mass);
         }
         self.center_of_mass = com;
-
-        let mut inertia = [0.0f64; 3];
-        for p in self.blocks.keys() {
-            let d = [
-                f64::from(p[0]) + 0.5 - com[0],
-                f64::from(p[1]) + 0.5 - com[1],
-                f64::from(p[2]) + 0.5 - com[2],
-            ];
-            inertia[0] += self.block_mass * (d[1] * d[1] + d[2] * d[2]);
-            inertia[1] += self.block_mass * (d[0] * d[0] + d[2] * d[2]);
-            inertia[2] += self.block_mass * (d[0] * d[0] + d[1] * d[1]);
-        }
-        for i in &mut inertia {
-            *i = sanitize(*i).max(1e-9);
-        }
-        self.inertia_diag = inertia;
+        self.refresh_inertia_tensor();
 
         let prop_set: BTreeSet<&str> = self
             .propulsion
@@ -711,6 +930,49 @@ impl RigidBodySubWorld {
         }
     }
 
+    /// Recompute `inertia_tensor` / `inv_inertia_tensor` / `inertia_diag`
+    /// from the current blocks around the *current* `center_of_mass`:
+    /// parallel-axis term per voxel plus the unit-cube self-inertia `m/6`
+    /// so the matrix stays positive-definite — and exactly invertible —
+    /// even for a single block or a collinear rod. The snapshot decoder
+    /// calls this to rehydrate the off-diagonal products of inertia that
+    /// the legacy `AERO` v1 format (diagonal only) never serialized.
+    fn refresh_inertia_tensor(&mut self) {
+        let com = self.center_of_mass;
+        let mut tensor = [[0.0f64; 3]; 3];
+        for (p, canonical) in &self.blocks {
+            let m = self.block_mass_kg(canonical);
+            let d = [
+                f64::from(p[0]) + 0.5 - com[0],
+                f64::from(p[1]) + 0.5 - com[1],
+                f64::from(p[2]) + 0.5 - com[2],
+            ];
+            let self_inertia = m / 6.0;
+            tensor[0][0] += m * (d[1] * d[1] + d[2] * d[2]) + self_inertia;
+            tensor[1][1] += m * (d[0] * d[0] + d[2] * d[2]) + self_inertia;
+            tensor[2][2] += m * (d[0] * d[0] + d[1] * d[1]) + self_inertia;
+            tensor[0][1] -= m * d[0] * d[1];
+            tensor[0][2] -= m * d[0] * d[2];
+            tensor[1][2] -= m * d[1] * d[2];
+        }
+        tensor[1][0] = tensor[0][1];
+        tensor[2][0] = tensor[0][2];
+        tensor[2][1] = tensor[1][2];
+        for row in &mut tensor {
+            for v in row.iter_mut() {
+                *v = sanitize(*v);
+            }
+        }
+        self.inertia_tensor = tensor;
+        self.inv_inertia_tensor =
+            mat3_invert(&tensor).unwrap_or_else(|| diag3([1.0, 1.0, 1.0]));
+        self.inertia_diag = [
+            tensor[0][0].max(1e-9),
+            tensor[1][1].max(1e-9),
+            tensor[2][2].max(1e-9),
+        ];
+    }
+
     /// Apply validated pilot controls to this sub-world.
     pub fn apply_helm_input(&mut self, input: &SubWorldHelmInput) -> Result<(), String> {
         input.encode()?;
@@ -725,6 +987,9 @@ impl RigidBodySubWorld {
             input.buoyancy_delta,
         ]
         .map(f64::from);
+        if self.helm.iter().any(|h| h.abs() > 1e-12) {
+            self.wake();
+        }
         Ok(())
     }
 
@@ -801,6 +1066,26 @@ impl RigidBodySubWorld {
         if !dt.is_finite() || dt <= 0.0 {
             return;
         }
+        self.tick = self.tick.saturating_add(1);
+        let _ = self
+            .factory
+            .step_tick(self.tick, INTERNAL_REGION_STEPS, None);
+        self.integrate_forces(dt, gravity, air_density, buoyancy_scale, vacuum_damping);
+    }
+
+    /// One force/integration step over `dt` seconds *without* ticking the
+    /// embedded factory — the unit [`Self::step_env`] and each substep of
+    /// [`Self::step_env_with_contacts`] share. Angular dynamics run in the
+    /// world frame against the full inertia tensor:
+    /// `ω̇ = I_w⁻¹ (τ − ω × (I_w ω))` with `I_w = R I Rᵀ`.
+    fn integrate_forces(
+        &mut self,
+        dt: f64,
+        gravity: f64,
+        air_density: f64,
+        buoyancy_scale: f64,
+        vacuum_damping: f64,
+    ) {
         let gravity = if gravity.is_finite() { gravity } else { 0.0 };
         let air_density = if air_density.is_finite() && air_density >= 0.0 {
             air_density
@@ -817,10 +1102,6 @@ impl RigidBodySubWorld {
         } else {
             0.0
         };
-        self.tick = self.tick.saturating_add(1);
-        let _ = self
-            .factory
-            .step_tick(self.tick, INTERNAL_REGION_STEPS, None);
 
         let conj = quat_conjugate(self.quat);
         // Ship-relative airflow and spin in the local (body) frame.
@@ -889,43 +1170,137 @@ impl RigidBodySubWorld {
             *p = sanitize(*p + v * dt);
         }
 
-        // Euler angular dynamics in the body frame: I*ω̇ = τ - ω×(I·ω).
-        let mut omega_local = omega_local_in;
-        let iw = [
-            omega_local[0] * self.inertia_diag[0],
-            omega_local[1] * self.inertia_diag[1],
-            omega_local[2] * self.inertia_diag[2],
+        // Euler angular dynamics in the *world* frame against the full
+        // tensor: ω̇ = I_w⁻¹·(τ_w − ω × (I_w·ω)) with I_w = R·I·Rᵀ.
+        let torque_world = quat_rotate(self.quat, torque_local);
+        let rot = quat_to_mat3(self.quat);
+        let rot_t = mat3_transpose(rot);
+        let i_world = mat3_mul(mat3_mul(rot, self.inertia_tensor), rot_t);
+        let i_world_inv = mat3_mul(mat3_mul(rot, self.inv_inertia_tensor), rot_t);
+        let gyro = cross3(self.omega, mat3_vec_mul(i_world, self.omega));
+        let rhs = [
+            sanitize(torque_world[0] - gyro[0]),
+            sanitize(torque_world[1] - gyro[1]),
+            sanitize(torque_world[2] - gyro[2]),
         ];
-        let gyro = cross3(omega_local, iw);
-        for i in 0..3 {
-            let alpha = sanitize((torque_local[i] - gyro[i]) / self.inertia_diag[i].max(1e-9));
-            omega_local[i] = sanitize(omega_local[i] + alpha * dt);
+        let alpha = mat3_vec_mul(i_world_inv, rhs);
+        for (w, &a) in self.omega.iter_mut().zip(&alpha) {
+            *w = sanitize(*w + a * dt);
         }
-        self.omega = quat_rotate(self.quat, omega_local);
         clamp_magnitude(&mut self.omega, MAX_OMEGA);
 
         // q̇ = 1/2 * [ω_world, 0] ⊗ q (world-frame angular velocity).
-        let wq = [self.omega[0], self.omega[1], self.omega[2], 0.0];
-        let qdot = quat_mul(wq, self.quat);
-        for (q, &dq) in self.quat.iter_mut().zip(&qdot) {
-            *q += 0.5 * dq * dt;
-        }
-        self.quat = quat_normalize(self.quat);
+        self.quat = integrate_quat(self.quat, self.omega, dt);
     }
 
-    /// Exact world-space displacement of a carried passenger over `dt` given
-    /// their rigid-body point `local_offset` (the rider's local position
-    /// measured from [`Self::center_of_mass`]): `(v + ω × (R·offset)) * dt`.
-    /// Feeds `megu`'s `ac_note_carried_motion` hook so anti-cheat never
+    /// Advance one game tick through `dt` seconds of terrain/peer contact
+    /// physics: the embedded factory ticks *once* (it is a game tick, not
+    /// a solver substep), then `self.substeps` force-integration substeps
+    /// run at `dt / substeps` each — 80 Hz with the default
+    /// [`DEFAULT_PHYSICS_SUBSTEPS`] — with `backend` resolving
+    /// voxel-vs-terrain and ship-vs-ship contacts after every substep.
+    ///
+    /// `terrain_solid` answers "is world cell occupied" in the parent
+    /// dimension; `other_ships` are the awake peer sub-worlds this ship
+    /// may collide with. Dormancy is exact: when `self.awake` is `false`
+    /// the body is left untouched — zero force work, zero contact work —
+    /// and a `substeps` of `0` degrades gracefully to a single step.
+    /// `step`/`step_with_atmosphere` keep their legacy single-step path;
+    /// call this entry point only where contacts matter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_env_with_contacts(
+        &mut self,
+        dt: f64,
+        gravity: f64,
+        air_density: f64,
+        buoyancy_scale: f64,
+        vacuum_damping: f64,
+        backend: &mut dyn SubLevelPhysicsBackend,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+        other_ships: &mut [&mut RigidBodySubWorld],
+    ) {
+        if !dt.is_finite() || dt <= 0.0 {
+            return;
+        }
+        self.tick = self.tick.saturating_add(1);
+        let _ = self
+            .factory
+            .step_tick(self.tick, INTERNAL_REGION_STEPS, None);
+        if !self.awake {
+            return;
+        }
+        let n = self.substeps.clamp(1, 64);
+        let h = dt / f64::from(n);
+        for _ in 0..n {
+            if !self.awake {
+                // The solver put the body to sleep mid-tick: remaining
+                // substeps are skipped entirely (zero work dormancy).
+                break;
+            }
+            self.integrate_forces(h, gravity, air_density, buoyancy_scale, vacuum_damping);
+            backend.resolve_substep(self, h, terrain_solid, other_ships);
+        }
+    }
+
+    /// Exact finite-step world-space displacement of a rigid point:
+    /// `Δx = (p₁ + R₁·r) − (p₀ + R₀·r)` for a body that moved
+    /// `(pos, quat)` -> `(next_pos, next_quat)` carrying a point at
+    /// COM-relative local offset `r`. Chord-exact for any rotation
+    /// magnitude — no small-angle approximation, no radial drift on
+    /// high-RPM hulls.
+    pub fn passenger_world_delta_exact(
+        prev_pos: [f64; 3],
+        prev_quat: [f64; 4],
+        next_pos: [f64; 3],
+        next_quat: [f64; 4],
+        local_offset: [f64; 3],
+    ) -> [f64; 3] {
+        let r0 = quat_rotate(prev_quat, local_offset);
+        let r1 = quat_rotate(next_quat, local_offset);
+        [
+            (next_pos[0] + r1[0]) - (prev_pos[0] + r0[0]),
+            (next_pos[1] + r1[1]) - (prev_pos[1] + r0[1]),
+            (next_pos[2] + r1[2]) - (prev_pos[2] + r0[2]),
+        ]
+    }
+
+    /// Exact world-space displacement of a carried passenger over `dt`
+    /// given their COM-relative local offset: the ship is forward-simulated
+    /// through the *same* quaternion integrator `step` uses
+    /// (`q₁ = integrate(q₀, ω, dt)`, `p₁ = p₀ + v·dt`) and the finite-step
+    /// delta `(p₁ + R₁·r) − (p₀ + R₀·r)` returned — a 90° turn at a
+    /// 20-block lever arm moves the rider along the true chord, not the
+    /// tangent, so high-RPM hulls exhibit zero radial drift. Feeds
+    /// `megu`'s `ac_note_carried_motion` hook so anti-cheat never
     /// rubber-bands airship pilots or passengers.
     pub fn passenger_world_delta(&self, local_offset: [f64; 3], dt: f64) -> [f64; 3] {
-        let r_world = quat_rotate(self.quat, local_offset);
-        let tangential = cross3(self.omega, r_world);
-        [
-            (self.vel[0] + tangential[0]) * dt,
-            (self.vel[1] + tangential[1]) * dt,
-            (self.vel[2] + tangential[2]) * dt,
-        ]
+        if !dt.is_finite() || dt <= 0.0 {
+            return [0.0; 3];
+        }
+        let next_pos = [
+            sanitize(self.pos[0] + self.vel[0] * dt),
+            sanitize(self.pos[1] + self.vel[1] * dt),
+            sanitize(self.pos[2] + self.vel[2] * dt),
+        ];
+        if self.omega.iter().all(|&w| w == 0.0) {
+            // Pure translation: rotation terms cancel exactly, and returning
+            // `v·dt` directly avoids the round-off artifact of subtracting
+            // two large, nearly equal world positions. This is the same
+            // finite-step displacement, not the old tangent approximation.
+            return [
+                sanitize(self.vel[0] * dt),
+                sanitize(self.vel[1] * dt),
+                sanitize(self.vel[2] * dt),
+            ];
+        }
+        let next_quat = integrate_quat(self.quat, self.omega, dt);
+        Self::passenger_world_delta_exact(
+            self.pos,
+            self.quat,
+            next_pos,
+            next_quat,
+            local_offset,
+        )
     }
 
     /// Local -> world transform of point `p` (local frame is centered on
@@ -968,6 +1343,489 @@ impl RigidBodySubWorld {
         out.extend_from_slice(&crc32_ieee(&payload).to_be_bytes());
         out.extend_from_slice(&payload);
         out
+    }
+}
+
+/// Canonical [`WorldView`] surface for an airship sub-level: local block
+/// cells read/write through the sparse `blocks` map via the embedded
+/// registry's canonical-state codec, and [`Self::world_transform`]
+/// reports the live rigid transform — `rotation` is `quat` as a 3×3,
+/// `translation` is `pos`, `pivot` is `center_of_mass` — so callers see
+/// exactly the `pos + R·(p − com)` mapping [`Self::local_to_world`]
+/// documents.
+impl WorldView for RigidBodySubWorld {
+    fn block_state_at(&self, pos: [i32; 3]) -> Option<u32> {
+        let canonical = self.blocks.get(&pos)?;
+        self.factory.registry().decode_canonical(canonical)
+    }
+
+    fn set_block_state(&mut self, pos: [i32; 3], state: u32) -> bool {
+        let Some(canonical) = self.factory.registry().encode_canonical(state) else {
+            return false;
+        };
+        let canonical = canonical.to_string();
+        self.set_block(pos, canonical);
+        true
+    }
+
+    fn world_transform(&self) -> SubLevelTransform {
+        SubLevelTransform {
+            rotation: quat_to_mat3(self.quat),
+            translation: self.pos,
+            pivot: self.center_of_mass,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SubLevelPhysicsBackend: pluggable rigid-body contact solver contract
+// ---------------------------------------------------------------------------
+
+/// Rigid-body/contact solver backend decoupling Minecraft gameplay
+/// semantics (propulsion, buoyancy, assembly/disassembly, passenger
+/// transforms — all owned by [`RigidBodySubWorld`]) from *how* contacts
+/// are resolved. [`RigidBodySubWorld::step_env_with_contacts`] drives
+/// `substeps` force-integration substeps per game tick and calls
+/// [`Self::resolve_substep`] after each; a `rapier3d-f64` adapter can
+/// replace [`BuiltinContactSolver`] behind this trait without touching
+/// any gameplay code.
+///
+/// The backend mutates `ship` in place (impulses + positional
+/// depenetration) and may apply equal-and-opposite impulses to entries of
+/// `other_ships`, waking them. It must be deterministic: same inputs,
+/// same floating-point result.
+pub trait SubLevelPhysicsBackend {
+    /// Resolve contacts for `ship` over one sub-step of `dt` seconds:
+    /// voxel-vs-terrain contacts against `terrain_solid` cells and
+    /// ship-vs-ship contacts against `other_ships`. Called after
+    /// `integrate_forces` so `ship` reflects this sub-step's free motion.
+    fn resolve_substep(
+        &mut self,
+        ship: &mut RigidBodySubWorld,
+        dt: f64,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+        other_ships: &mut [&mut RigidBodySubWorld],
+    );
+
+    /// Backend identifier for diagnostics (`"builtin"`).
+    fn backend_name(&self) -> &'static str;
+}
+
+/// Compact deterministic built-in contact solver: impulse-based normal
+/// reaction with restitution, Coulomb friction, positional depenetration
+/// and resting-sleep dormancy — strictly scoped to stable resting,
+/// landing and basic ship-ship collision so `rapier3d-f64` can replace it
+/// later. OBB-style voxel tests: terrain contacts probe each occupied
+/// voxel's 8 world-space corners against the solid cell set; ship-vs-ship
+/// contacts run voxel world-AABB overlap under a bounding-sphere broad
+/// phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuiltinContactSolver {
+    /// Coefficient of restitution for hard impacts (`0` = perfectly
+    /// plastic). Suppressed below [`Self::restitution_cutoff`] approach
+    /// speed so resting stacks never jitter.
+    pub restitution: f64,
+    /// Approach speed (m/s) above which restitution applies.
+    pub restitution_cutoff: f64,
+    /// Coulomb friction coefficient `μ` clamping tangential impulse.
+    pub friction: f64,
+    /// Fraction of contact depth corrected positionally per sub-step.
+    pub depenetration: f64,
+    /// Maximum positional correction applied per contact (m).
+    pub max_depenetration: f64,
+    /// Extra linear/angular velocity bleed (`1/s`) applied while the hull
+    /// is supported — lets sequential-impulse corner jitter decay to the
+    /// sleep threshold instead of shivering forever.
+    pub contact_damping: f64,
+    /// Speed²+spin² threshold under which a *supported* substep counts
+    /// toward sleep. Loose enough to admit the gravity-refeed limit cycle
+    /// (~0.05–0.2 m/s) of a truly parked hull.
+    pub sleep_epsilon2: f64,
+    /// Consecutive supported quiet substeps required before the body is
+    /// parked — the hysteresis that keeps a momentary contact pause from
+    /// freezing a still-moving ship.
+    pub min_sleep_substeps: u32,
+}
+
+impl Default for BuiltinContactSolver {
+    fn default() -> Self {
+        Self {
+            restitution: 0.15,
+            restitution_cutoff: 0.5,
+            friction: 0.5,
+            depenetration: 0.8,
+            max_depenetration: 0.5,
+            contact_damping: 6.0,
+            sleep_epsilon2: 0.04,
+            min_sleep_substeps: 16,
+        }
+    }
+}
+
+/// The eight local corners of a voxel cell (offsets `{0,1}³`).
+const VOXEL_CORNER_OFFSETS: [[f64; 3]; 8] = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [0.0, 1.0, 1.0],
+    [1.0, 1.0, 1.0],
+];
+
+/// The six axis-aligned unit directions (terrain face candidates).
+const FACE_DIRS: [[i32; 3]; 6] = [
+    [1, 0, 0],
+    [-1, 0, 0],
+    [0, 1, 0],
+    [0, -1, 0],
+    [0, 0, 1],
+    [0, 0, -1],
+];
+
+/// `R·I⁻¹·Rᵀ` — the world-space inverse inertia of `ship`.
+fn world_inv_inertia(ship: &RigidBodySubWorld) -> [[f64; 3]; 3] {
+    let rot = quat_to_mat3(ship.quat);
+    let rot_t = mat3_transpose(rot);
+    mat3_mul(mat3_mul(rot, ship.inv_inertia_tensor), rot_t)
+}
+
+/// Point velocity of `ship` at world offset `r` from its COM:
+/// `v + ω × r`.
+fn contact_point_velocity(ship: &RigidBodySubWorld, r: [f64; 3]) -> [f64; 3] {
+    let spin = cross3(ship.omega, r);
+    [
+        ship.vel[0] + spin[0],
+        ship.vel[1] + spin[1],
+        ship.vel[2] + spin[2],
+    ]
+}
+
+/// Apply impulse `j` (kg·m/s) at world point `at`: `Δv = j/m`,
+/// `Δω = I_w⁻¹ (r × j)` using the world inverse inertia computed once by
+/// the caller.
+fn apply_impulse(
+    ship: &mut RigidBodySubWorld,
+    i_world_inv: [[f64; 3]; 3],
+    impulse: [f64; 3],
+    at: [f64; 3],
+) {
+    let inv_m = 1.0 / ship.mass.max(1e-9);
+    for (v, &j) in ship.vel.iter_mut().zip(&impulse) {
+        *v = sanitize(*v + j * inv_m);
+    }
+    let r = [
+        at[0] - ship.pos[0],
+        at[1] - ship.pos[1],
+        at[2] - ship.pos[2],
+    ];
+    let d_omega = mat3_vec_mul(i_world_inv, cross3(r, impulse));
+    for (w, &dw) in ship.omega.iter_mut().zip(&d_omega) {
+        *w = sanitize(*w + dw);
+    }
+    clamp_magnitude(&mut ship.vel, MAX_SPEED);
+    clamp_magnitude(&mut ship.omega, MAX_OMEGA);
+}
+
+/// Impulse-denominator for direction `dir` at offset `r`:
+/// `k = 1/m + (r×d)·I_w⁻¹·(r×d)`.
+fn impulse_denominator(inv_m: f64, i_world_inv: [[f64; 3]; 3], r: [f64; 3], dir: [f64; 3]) -> f64 {
+    let rxn = cross3(r, dir);
+    let term = mat3_vec_mul(i_world_inv, rxn);
+    inv_m + rxn[0] * term[0] + rxn[1] * term[1] + rxn[2] * term[2]
+}
+
+/// World-space AABB `(min, max)` of the voxel at `local` on `ship`.
+fn voxel_world_aabb(ship: &RigidBodySubWorld, local: [i32; 3]) -> ([f64; 3], [f64; 3]) {
+    let mut min = [f64::INFINITY; 3];
+    let mut max = [f64::NEG_INFINITY; 3];
+    for off in VOXEL_CORNER_OFFSETS {
+        let w = ship.local_to_world([
+            f64::from(local[0]) + off[0],
+            f64::from(local[1]) + off[1],
+            f64::from(local[2]) + off[2],
+        ]);
+        for i in 0..3 {
+            min[i] = min[i].min(w[i]);
+            max[i] = max[i].max(w[i]);
+        }
+    }
+    (min, max)
+}
+
+/// Bounding-sphere radius of `ship`: farthest voxel-center distance from
+/// COM plus one half-diagonal (√3/2).
+fn ship_bounding_radius(ship: &RigidBodySubWorld) -> f64 {
+    let mut r2 = 0.0f64;
+    for local in ship.blocks.keys() {
+        let d = [
+            f64::from(local[0]) + 0.5 - ship.center_of_mass[0],
+            f64::from(local[1]) + 0.5 - ship.center_of_mass[1],
+            f64::from(local[2]) + 0.5 - ship.center_of_mass[2],
+        ];
+        r2 = r2.max(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    }
+    r2.sqrt() + 0.87
+}
+
+impl BuiltinContactSolver {
+    /// Effective restitution: hard impacts bounce, slow contacts stay
+    /// plastic so a resting hull never chatters.
+    fn restitution_at(&self, approach_speed: f64) -> f64 {
+        if approach_speed > self.restitution_cutoff {
+            self.restitution
+        } else {
+            0.0
+        }
+    }
+
+    /// Collect voxel-corner-vs-terrain contacts: every world-space corner
+    /// of every occupied voxel sitting inside a solid cell becomes a
+    /// `(point, normal, depth)` contact whose normal is the shortest exit
+    /// direction through a non-solid neighbor face.
+    fn collect_terrain_contacts(
+        ship: &RigidBodySubWorld,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+    ) -> Vec<([f64; 3], [f64; 3], f64)> {
+        let mut contacts = Vec::new();
+        for local in ship.blocks.keys() {
+            for off in VOXEL_CORNER_OFFSETS {
+                let w = ship.local_to_world([
+                    f64::from(local[0]) + off[0],
+                    f64::from(local[1]) + off[1],
+                    f64::from(local[2]) + off[2],
+                ]);
+                let cell = [
+                    w[0].floor() as i32,
+                    w[1].floor() as i32,
+                    w[2].floor() as i32,
+                ];
+                if !terrain_solid(cell) {
+                    continue;
+                }
+                // Shallowest exit through a non-solid neighbor face.
+                let mut best: Option<([f64; 3], f64)> = None;
+                for dir in FACE_DIRS {
+                    let axis = if dir[0] != 0 { 0 } else if dir[1] != 0 { 1 } else { 2 };
+                    let sign = dir[axis];
+                    let depth = if sign > 0 {
+                        f64::from(cell[axis] + 1) - w[axis]
+                    } else {
+                        w[axis] - f64::from(cell[axis])
+                    };
+                    if depth <= 0.0 {
+                        continue;
+                    }
+                    let mut neighbor = cell;
+                    neighbor[axis] += sign;
+                    if terrain_solid(neighbor) {
+                        continue;
+                    }
+                    if best.is_none_or(|(_, d)| depth < d) {
+                        best = Some((
+                            [f64::from(dir[0]), f64::from(dir[1]), f64::from(dir[2])],
+                            depth,
+                        ));
+                    }
+                }
+                if let Some((normal, depth)) = best {
+                    contacts.push((w, normal, depth));
+                }
+            }
+        }
+        contacts
+    }
+
+    /// Collect ship-vs-ship contacts as `(point, normal, depth,
+    /// other_index)` — `normal` pushes `ship` away from `other_ships[i]`.
+    /// Broad phase rejects distant ships by bounding sphere; narrow phase
+    /// tests voxel world-AABB overlap and picks the minimum-overlap axis.
+    fn collect_ship_contacts(
+        ship: &RigidBodySubWorld,
+        other_ships: &[&mut RigidBodySubWorld],
+    ) -> Vec<([f64; 3], [f64; 3], f64, usize)> {
+        let mut contacts = Vec::new();
+        let self_radius = ship_bounding_radius(ship);
+        for (oi, other) in other_ships.iter().enumerate() {
+            let span = [
+                ship.pos[0] - other.pos[0],
+                ship.pos[1] - other.pos[1],
+                ship.pos[2] - other.pos[2],
+            ];
+            let reach = self_radius + ship_bounding_radius(other) + 1.0;
+            if span[0] * span[0] + span[1] * span[1] + span[2] * span[2] > reach * reach {
+                continue;
+            }
+            for la in ship.blocks.keys() {
+                let (a_min, a_max) = voxel_world_aabb(ship, *la);
+                for lb in other.blocks.keys() {
+                    let (b_min, b_max) = voxel_world_aabb(other, *lb);
+                    let mut overlap = [0.0f64; 3];
+                    let mut touching = true;
+                    for axis in 0..3 {
+                        overlap[axis] = a_max[axis].min(b_max[axis]) - a_min[axis].max(b_min[axis]);
+                        if overlap[axis] <= 0.0 {
+                            touching = false;
+                            break;
+                        }
+                    }
+                    if !touching {
+                        continue;
+                    }
+                    // Minimum-overlap axis becomes the contact normal,
+                    // oriented from the other ship's voxel toward ours.
+                    let axis = (0..3)
+                        .min_by(|&a, &b| overlap[a].total_cmp(&overlap[b]))
+                        .unwrap_or(1);
+                    let a_c = (a_min[axis] + a_max[axis]) * 0.5;
+                    let b_c = (b_min[axis] + b_max[axis]) * 0.5;
+                    let mut normal = [0.0f64; 3];
+                    normal[axis] = if a_c >= b_c { 1.0 } else { -1.0 };
+                    let point = [
+                        (a_min[0].max(b_min[0]) + a_max[0].min(b_max[0])) * 0.5,
+                        (a_min[1].max(b_min[1]) + a_max[1].min(b_max[1])) * 0.5,
+                        (a_min[2].max(b_min[2]) + a_max[2].min(b_max[2])) * 0.5,
+                    ];
+                    contacts.push((point, normal, overlap[axis], oi));
+                }
+            }
+        }
+        contacts
+    }
+}
+
+impl SubLevelPhysicsBackend for BuiltinContactSolver {
+    fn resolve_substep(
+        &mut self,
+        ship: &mut RigidBodySubWorld,
+        dt: f64,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+        other_ships: &mut [&mut RigidBodySubWorld],
+    ) {
+        let inv_m = 1.0 / ship.mass.max(1e-9);
+        let i_world_inv = world_inv_inertia(ship);
+        let mut supported = false;
+
+        // -- Voxel vs terrain: sequential impulses + positional correction.
+        for (point, normal, depth) in Self::collect_terrain_contacts(ship, terrain_solid) {
+            supported = supported || normal[1] > 0.5;
+            let r = [
+                point[0] - ship.pos[0],
+                point[1] - ship.pos[1],
+                point[2] - ship.pos[2],
+            ];
+            let v_c = contact_point_velocity(ship, r);
+            let vn = v_c[0] * normal[0] + v_c[1] * normal[1] + v_c[2] * normal[2];
+            if vn < 0.0 {
+                let e = self.restitution_at(-vn);
+                let k = impulse_denominator(inv_m, i_world_inv, r, normal).max(1e-12);
+                let j_normal = -(1.0 + e) * vn / k;
+                apply_impulse(ship, i_world_inv, [j_normal * normal[0], j_normal * normal[1], j_normal * normal[2]], point);
+                // Coulomb friction: stop tangential sliding, clamped by μ·j_n.
+                let v2 = contact_point_velocity(ship, r);
+                let tvn = v2[0] * normal[0] + v2[1] * normal[1] + v2[2] * normal[2];
+                let tangential = [
+                    v2[0] - tvn * normal[0],
+                    v2[1] - tvn * normal[1],
+                    v2[2] - tvn * normal[2],
+                ];
+                let t_len = norm3(tangential);
+                if t_len > 1e-9 {
+                    let t_hat = [tangential[0] / t_len, tangential[1] / t_len, tangential[2] / t_len];
+                    let kt = impulse_denominator(inv_m, i_world_inv, r, t_hat).max(1e-12);
+                    let jt = (t_len / kt).min(self.friction * j_normal);
+                    apply_impulse(
+                        ship,
+                        i_world_inv,
+                        [-jt * t_hat[0], -jt * t_hat[1], -jt * t_hat[2]],
+                        point,
+                    );
+                }
+            }
+            // Positional depenetration: the corner exits the terrain cell
+            // along the contact normal — capped per contact so a deeply
+            // embedded voxel recovers over substeps, not explosively.
+            let corr = depth.min(self.max_depenetration).max(0.0) * self.depenetration;
+            for i in 0..3 {
+                ship.pos[i] = sanitize(ship.pos[i] + normal[i] * corr);
+            }
+        }
+
+        // -- Ship vs ship: paired impulse keeps total linear momentum.
+        for (point, normal, depth, oi) in Self::collect_ship_contacts(ship, other_ships) {
+            let other = &mut *other_ships[oi];
+            let inv_mo = 1.0 / other.mass.max(1e-9);
+            let i_world_inv_o = world_inv_inertia(other);
+            let ra = [
+                point[0] - ship.pos[0],
+                point[1] - ship.pos[1],
+                point[2] - ship.pos[2],
+            ];
+            let rb = [
+                point[0] - other.pos[0],
+                point[1] - other.pos[1],
+                point[2] - other.pos[2],
+            ];
+            let rel = {
+                let va = contact_point_velocity(ship, ra);
+                let vb = contact_point_velocity(other, rb);
+                [va[0] - vb[0], va[1] - vb[1], va[2] - vb[2]]
+            };
+            let rn = rel[0] * normal[0] + rel[1] * normal[1] + rel[2] * normal[2];
+            if rn < 0.0 {
+                let e = self.restitution_at(-rn);
+                let k = (impulse_denominator(inv_m, i_world_inv, ra, normal)
+                    + impulse_denominator(inv_mo, i_world_inv_o, rb, normal))
+                .max(1e-12);
+                let j = -(1.0 + e) * rn / k;
+                let impulse = [j * normal[0], j * normal[1], j * normal[2]];
+                apply_impulse(ship, i_world_inv, impulse, point);
+                apply_impulse(other, i_world_inv_o, [-impulse[0], -impulse[1], -impulse[2]], point);
+                other.wake();
+            }
+            // Positional depenetration split by inverse mass.
+            let share = inv_m / (inv_m + inv_mo);
+            let corr = depth.min(self.max_depenetration).max(0.0) * self.depenetration;
+            for i in 0..3 {
+                ship.pos[i] = sanitize(ship.pos[i] + normal[i] * corr * share);
+                other.pos[i] = sanitize(other.pos[i] - normal[i] * corr * (1.0 - share));
+            }
+        }
+
+        // Contact damping: while the hull is supported, bleed residual
+        // linear+angular jitter so corner-probe noise from sequential
+        // impulses actually decays toward the sleep threshold instead of
+        // holding the body at a low-grade shiver forever.
+        if supported {
+            let damp = (1.0 - self.contact_damping * dt).max(0.0);
+            for v in &mut ship.vel {
+                *v *= damp;
+            }
+            for w in &mut ship.omega {
+                *w *= damp;
+            }
+        }
+
+        // Resting-sleep dormancy with hysteresis: count consecutive
+        // supported quiet substeps and park only after `min_sleep_substeps`
+        // straight — zero solver work until something wakes the ship.
+        if supported
+            && norm3(ship.vel) * norm3(ship.vel) + norm3(ship.omega) * norm3(ship.omega)
+                < self.sleep_epsilon2
+        {
+            ship.rest_substeps = ship.rest_substeps.saturating_add(1);
+            if ship.rest_substeps >= self.min_sleep_substeps {
+                ship.rest_substeps = 0;
+                ship.awake = false;
+            }
+        } else if supported {
+            ship.rest_substeps = 0;
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "builtin"
     }
 }
 
@@ -1164,11 +2022,26 @@ pub fn decode_aeronautics_snapshot(
         mass,
         center_of_mass,
         inertia_diag,
+        inertia_tensor: diag3(inertia_diag),
+        inv_inertia_tensor: diag3([
+            1.0 / inertia_diag[0].max(1e-9),
+            1.0 / inertia_diag[1].max(1e-9),
+            1.0 / inertia_diag[2].max(1e-9),
+        ]),
+        mass_overrides: BTreeMap::new(),
+        substeps: DEFAULT_PHYSICS_SUBSTEPS,
+        awake: true,
+        rest_substeps: 0,
         buoyancy_blocks,
         propellers,
         rudders,
         helm: [0.0; 5],
     };
+    // Legacy snapshots carry only `inertia_diag`; recompute the full
+    // tensor from the (deterministic) block set + stored COM so a
+    // restored asymmetric hull keeps the writer's exact products of
+    // inertia instead of silently going diagonal.
+    sub.refresh_inertia_tensor();
     sub.rebuild_factory();
     Ok(sub)
 }
@@ -1307,6 +2180,12 @@ fn quat_normalize(q: [f64; 4]) -> [f64; 4] {
     if !n.is_finite() || n < 1e-12 {
         return [0.0, 0.0, 0.0, 1.0];
     }
+    // Already unit to within fp noise: dividing through would only
+    // perturb the low bits — and would break the byte-for-byte snapshot
+    // roundtrip, since decode re-normalizes every decoded quaternion.
+    if (n - 1.0).abs() <= 1e-15 {
+        return q;
+    }
     [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
 }
 
@@ -1321,6 +2200,73 @@ fn quat_rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
         v[1] + q[3] * t2[1] + u[1],
         v[2] + q[3] * t2[2] + u[2],
     ]
+}
+
+/// Unit quaternion `q` as a row-major 3×3 rotation matrix (`world = R·local`),
+/// the same basis `quat_rotate` uses.
+fn quat_to_mat3(q: [f64; 4]) -> [[f64; 3]; 3] {
+    let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
+    [
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ]
+}
+
+/// Advance `q` by `ω` (world frame, rad/s) for `dt` seconds:
+/// `q̇ = ½ [ω, 0] ⊗ q`, Euler step + renormalize — the identical
+/// integrator [`RigidBodySubWorld::integrate_forces`] uses so passenger
+/// deltas and the pose trajectory never diverge.
+fn integrate_quat(q: [f64; 4], omega: [f64; 3], dt: f64) -> [f64; 4] {
+    let wq = [omega[0], omega[1], omega[2], 0.0];
+    let qdot = quat_mul(wq, q);
+    let mut out = q;
+    for (c, &dq) in out.iter_mut().zip(&qdot) {
+        *c += 0.5 * dq * dt;
+    }
+    quat_normalize(out)
+}
+
+/// Diagonal 3×3 matrix with `d` on the diagonal.
+fn diag3(d: [f64; 3]) -> [[f64; 3]; 3] {
+    [[d[0], 0.0, 0.0], [0.0, d[1], 0.0], [0.0, 0.0, d[2]]]
+}
+
+fn mat3_transpose(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
+}
+
+fn mat3_vec_mul(m: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
+}
+
+fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j])
+    })
+}
+
+/// Exact 3×3 inverse via the adjugate; `None` for a singular or
+/// non-finite matrix (callers fall back to a safe diagonal). Body
+/// inertia tensors are positive-definite by construction, so the `None`
+/// path is a defensive guard, not a reachable failure.
+fn mat3_invert(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let c = |r0: usize, r1: usize, c0: usize, c1: usize| {
+        m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
+    };
+    let cof = [
+        [c(1, 2, 1, 2), -c(1, 2, 0, 2), c(1, 2, 0, 1)],
+        [-c(0, 2, 1, 2), c(0, 2, 0, 2), -c(0, 2, 0, 1)],
+        [c(0, 1, 1, 2), -c(0, 1, 0, 2), c(0, 1, 0, 1)],
+    ];
+    let det = m[0][0] * cof[0][0] + m[0][1] * cof[0][1] + m[0][2] * cof[0][2];
+    if !det.is_finite() || det.abs() < 1e-30 {
+        return None;
+    }
+    // Inverse is the transposed cofactor matrix scaled by 1/det.
+    Some(std::array::from_fn(|i| {
+        std::array::from_fn(|j| sanitize(cof[j][i] / det))
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,12 +2600,23 @@ mod tests {
 
         let sub = RigidBodySubWorld::assemble(1, 0, cells, &reg, Some(&addon), 100.0).unwrap();
         assert_eq!(sub.blocks.len(), 7);
-        assert_eq!(sub.mass, 700.0);
-        // CoM = mean of cell centers.
+        // Mass is the sum of per-block material masses (the envelope is
+        // an ultralight, the rest fall back to the default block mass).
+        let mass_of = |id: &str| material_mass_kg(id, 100.0);
+        let expected_mass: f64 = sub.blocks.values().map(|id| mass_of(id)).sum();
+        assert_eq!(sub.mass, expected_mass);
+        // CoM is the mass-weighted mean of cell centers.
+        let mut weighted = [0.0f64; 3];
+        for (p, id) in &sub.blocks {
+            let m = mass_of(id);
+            for i in 0..3 {
+                weighted[i] += m * (f64::from(p[i]) + 0.5);
+            }
+        }
         let expected_com = [
-            (0.5 + 1.5 + 0.5 + 1.5 + 0.5 + 2.5 + 1.5) / 7.0,
-            4.5 / 7.0,
-            (0.5 + 0.5 + 1.5 + 1.5 + 0.5 + 0.5 + 2.5) / 7.0,
+            weighted[0] / expected_mass,
+            weighted[1] / expected_mass,
+            weighted[2] / expected_mass,
         ];
         for (&got, &want) in sub.center_of_mass.iter().zip(&expected_com) {
             assert!((got - want).abs() < 1e-9);
@@ -1670,21 +2627,21 @@ mod tests {
         assert_eq!(sub.propellers[0].min_rpm, 4.0);
         assert_eq!(sub.rudders.len(), 1);
         assert_eq!(sub.rudders[0].torque_axis, Axis::Y);
-        // Inertia diagonal: I_x = Σ m(dy²+dz²) etc., all strictly positive.
+        // Inertia diagonal: I_x = Σ m(dy²+dz²) + m/6 etc., all strictly positive.
         for &i in &sub.inertia_diag {
             assert!(i > 0.0 && i.is_finite());
         }
-        // Symmetric deck contributes equal x/z inertia about its own axes.
         let mut manual = [0.0f64; 3];
-        for p in sub.blocks.keys() {
+        for (p, id) in &sub.blocks {
+            let m = mass_of(id);
             let d = [
                 f64::from(p[0]) + 0.5 - expected_com[0],
                 f64::from(p[1]) + 0.5 - expected_com[1],
                 f64::from(p[2]) + 0.5 - expected_com[2],
             ];
-            manual[0] += 100.0 * (d[1] * d[1] + d[2] * d[2]);
-            manual[1] += 100.0 * (d[0] * d[0] + d[2] * d[2]);
-            manual[2] += 100.0 * (d[0] * d[0] + d[1] * d[1]);
+            manual[0] += m * (d[1] * d[1] + d[2] * d[2]) + m / 6.0;
+            manual[1] += m * (d[0] * d[0] + d[2] * d[2]) + m / 6.0;
+            manual[2] += m * (d[0] * d[0] + d[1] * d[1]) + m / 6.0;
         }
         for (&got, &want) in sub.inertia_diag.iter().zip(&manual) {
             assert!((got - want).abs() < 1e-9);
@@ -1693,7 +2650,10 @@ mod tests {
         // Edits recompute physicals.
         let mut sub = sub;
         sub.remove_block([0, 1, 0]);
-        assert_eq!(sub.mass, 600.0);
+        assert_eq!(
+            sub.mass,
+            expected_mass - material_mass_kg("createaeronautics:balloon_envelope", 100.0)
+        );
         assert_eq!(sub.buoyancy_blocks, 0);
         sub.set_block(
             [0, 1, 0],
@@ -1759,11 +2719,14 @@ mod tests {
         let envelope = canonical(&reg, "createaeronautics:balloon_envelope");
         let deck = canonical(&reg, "createaeronautics:airship_assembler");
         cells.insert([0, 0, 0], deck.clone());
-        cells.insert([1, 0, 0], deck);
+        cells.insert([1, 0, 0], deck.clone());
         cells.insert([0, 1, 0], envelope.clone());
-        cells.insert([1, 1, 0], envelope);
+        cells.insert([1, 1, 0], envelope.clone());
         let block_mass = 100.0;
-        let mass = 4.0 * block_mass;
+        // Mass comes from the per-material table: assembler decks weigh
+        // the default mass, envelopes are ultralight.
+        let mass = 2.0 * material_mass_kg(&deck, block_mass)
+            + 2.0 * material_mass_kg(&envelope, block_mass);
         // Exact equilibrium: 2 envelopes lift exactly `mass * g`.
         let mut addon = addon;
         addon.propulsion = Some(PropulsionSpec {
@@ -1811,22 +2774,28 @@ mod tests {
             }
         }
 
-        // Formula pinned: (v + ω × (R·offset)) * dt.
+        // Formula pinned: the exact finite-step rigid-body chord
+        // `(p₁ + R₁·r) − (p₀ + R₀·r)` with `p₁ = p₀ + v·dt` and `q₁`
+        // from the same quaternion integrator `step` uses.
         let offset = [0.5, 1.0, -2.0];
-        let r = quat_rotate(sub.quat, offset);
-        let expect = [
-            (sub.vel[0] + (sub.omega[1] * r[2] - sub.omega[2] * r[1])) * 0.05,
-            (sub.vel[1] + (sub.omega[2] * r[0] - sub.omega[0] * r[2])) * 0.05,
-            (sub.vel[2] + (sub.omega[0] * r[1] - sub.omega[1] * r[0])) * 0.05,
+        let next_pos = [
+            sub.pos[0] + sub.vel[0] * 0.05,
+            sub.pos[1] + sub.vel[1] * 0.05,
+            sub.pos[2] + sub.vel[2] * 0.05,
         ];
+        let next_quat = integrate_quat(sub.quat, sub.omega, 0.05);
+        let expect = RigidBodySubWorld::passenger_world_delta_exact(
+            sub.pos, sub.quat, next_pos, next_quat, offset,
+        );
         let got = sub.passenger_world_delta(offset, 0.05);
         for i in 0..3 {
             assert_eq!(got[i], expect[i]);
         }
 
-        // Finite-difference consistency: with gravity/drag disabled and a
-        // ship carrying no propellers, ω and v are constant over the step, so
-        // the first-order delta matches the actual pose change to O(|ω|²·dt²).
+        // Finite-difference consistency: with gravity/drag disabled the
+        // delta reproduces the actual pose change up to the gyroscopic
+        // term — on an asymmetric hull ω precesses under `ω × (Iw·ω)`
+        // even torque-free, so the tolerance covers O(|ω|²·dt²) drift.
         let local_pos = [
             sub.center_of_mass[0] + offset[0],
             sub.center_of_mass[1] + offset[1],
@@ -2069,4 +3038,419 @@ mod tests {
         assert_eq!(sol.status, NetworkStatus::Running);
         assert!((sol.speed - 96.0).abs() < 1e-9);
     }
+
+    // -- P0-A: per-material mass + full 3x3 inertia tensor -------------
+
+    fn single_ship(blocks: &[([i32; 3], &str)]) -> RigidBodySubWorld {
+        let (_addon, reg) = aero_registry();
+        let cells: BTreeMap<[i32; 3], String> = blocks
+            .iter()
+            .map(|(p, id)| (*p, (*id).to_string()))
+            .collect();
+        RigidBodySubWorld::assemble(7, 0, cells, &reg, None, DEFAULT_BLOCK_MASS).unwrap()
+    }
+
+    #[test]
+    fn material_mass_table_weighs_hulls_and_balloons_realistically() {
+        assert_eq!(material_mass_kg("minecraft:obsidian", 100.0), 1200.0);
+        assert_eq!(material_mass_kg("minecraft:iron_block", 100.0), 800.0);
+        assert_eq!(material_mass_kg("minecraft:stone", 100.0), 200.0);
+        assert_eq!(material_mass_kg("minecraft:cobblestone", 100.0), 200.0);
+        assert_eq!(material_mass_kg("minecraft:oak_log[axis=y]", 100.0), 70.0);
+        assert_eq!(material_mass_kg("minecraft:white_wool", 100.0), 15.0);
+        assert_eq!(material_mass_kg("aeronautics:red_envelope", 100.0), 8.0);
+        assert_eq!(
+            material_mass_kg("aeronautics:andesite_propeller", 100.0),
+            100.0,
+            "composite propellers weigh like mixed machinery, not solid andesite"
+        );
+        assert_eq!(
+            material_mass_kg("createaeronautics:airship_assembler", 100.0),
+            192.0,
+            "assembly machinery is dense metal gearing in a stone casing"
+        );
+        assert_eq!(
+            material_mass_kg("somemod:mystery_alloy", 100.0),
+            100.0,
+            "unlisted materials fall back to the default mass"
+        );
+    }
+
+    #[test]
+    fn mass_weighted_com_and_full_inertia_tensor_are_exact() {
+        // Two uniform stones: COM lands on the midpoint cell boundary,
+        // diagonal terms get the m/6 self-inertia floor.
+        let sub = single_ship(&[([0, 0, 0], "minecraft:stone"), ([1, 0, 0], "minecraft:stone")]);
+        assert!((sub.mass - 400.0).abs() < 1e-9);
+        assert!((sub.center_of_mass[0] - 1.0).abs() < 1e-12);
+        assert!((sub.center_of_mass[1] - 0.5).abs() < 1e-12);
+        // Iyy = Izz = 2*(200*0.25) + 2*(200/6); Ixx = 2*(200/6).
+        let s = 200.0 / 6.0;
+        assert!((sub.inertia_tensor[0][0] - 2.0 * s).abs() < 1e-9);
+        assert!((sub.inertia_tensor[1][1] - (100.0 + 2.0 * s)).abs() < 1e-9);
+        assert_eq!(sub.inertia_diag[0], sub.inertia_tensor[0][0]);
+        assert_eq!(sub.inertia_diag[1], sub.inertia_tensor[1][1]);
+        assert_eq!(sub.inertia_diag[2], sub.inertia_tensor[2][2]);
+        // I·I⁻¹ == identity.
+        let product = mat3_mul(sub.inertia_tensor, sub.inv_inertia_tensor);
+        for (i, row) in product.iter().enumerate() {
+            for (j, got) in row.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (*got - want).abs() < 1e-9,
+                    "I·I⁻¹[{i}][{j}] = {got}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn asymmetric_materials_shift_com_and_produce_products_of_inertia() {
+        // Obsidian keel far out on +X, wool superstructure on +Y.
+        let sub = single_ship(&[
+            ([0, 0, 0], "minecraft:white_wool"),
+            ([0, 1, 0], "minecraft:white_wool"),
+            ([4, 0, 0], "minecraft:obsidian"),
+        ]);
+        let m = 15.0 + 15.0 + 1200.0;
+        assert!((sub.mass - m).abs() < 1e-9);
+        // Mass-weighted COM: x pulled hard toward the obsidian.
+        let cx = (15.0 * 0.5 + 15.0 * 0.5 + 1200.0 * 4.5) / m;
+        let cy = (15.0 * 0.5 + 15.0 * 1.5 + 1200.0 * 0.5) / m;
+        assert!((sub.center_of_mass[0] - cx).abs() < 1e-12);
+        assert!((sub.center_of_mass[1] - cy).abs() < 1e-12);
+        assert!(
+            sub.inertia_tensor[0][1].abs() > 1e-9,
+            "an asymmetric hull must carry a nonzero Ixy product of inertia"
+        );
+        // Symmetric + invertible.
+        assert_eq!(sub.inertia_tensor[0][1], sub.inertia_tensor[1][0]);
+        assert_eq!(sub.inertia_tensor[0][2], sub.inertia_tensor[2][0]);
+        assert_eq!(sub.inertia_tensor[1][2], sub.inertia_tensor[2][1]);
+        let product = mat3_mul(sub.inertia_tensor, sub.inv_inertia_tensor);
+        for (i, row) in product.iter().enumerate() {
+            for (j, got) in row.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((*got - want).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn single_block_and_collinear_ships_have_invertible_tensors() {
+        let single = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        // I = m/6 on the diagonal even with zero parallel-axis offset.
+        assert!((single.inertia_tensor[0][0] - 200.0 / 6.0).abs() < 1e-9);
+        let product = mat3_mul(single.inertia_tensor, single.inv_inertia_tensor);
+        assert!((product[0][0] - 1.0).abs() < 1e-9);
+        // Three blocks in a row: a collinear rod still inverts.
+        let rod = single_ship(&[
+            ([0, 0, 0], "minecraft:stone"),
+            ([1, 0, 0], "minecraft:stone"),
+            ([2, 0, 0], "minecraft:stone"),
+        ]);
+        let product = mat3_mul(rod.inertia_tensor, rod.inv_inertia_tensor);
+        assert!((product[1][1] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mass_overrides_beat_the_table() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        assert!((sub.mass - 200.0).abs() < 1e-9);
+        assert!(sub.set_block_mass_override("minecraft:stone", 950.0));
+        assert!((sub.mass - 950.0).abs() < 1e-9);
+        assert!(sub.clear_block_mass_override("minecraft:stone"));
+        assert!((sub.mass - 200.0).abs() < 1e-9);
+        assert!(!sub.set_block_mass_override("minecraft:stone", f64::NAN));
+        assert!(!sub.set_block_mass_override("minecraft:stone", -5.0));
+    }
+
+    // -- P0-B: exact finite-step passenger displacement -----------------
+
+    #[test]
+    fn passenger_delta_small_angle_matches_tangent_approximation() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        sub.pos = [10.0, 100.0, 10.0];
+        sub.vel = [1.0, 0.0, 0.0];
+        sub.omega = [0.0, 0.01, 0.0];
+        let r = [2.0, 0.0, 0.0];
+        let dt = 0.001;
+        let d = sub.passenger_world_delta(r, dt);
+        // (v + ω × (R·r))·dt: ω×r = [0,0,-0.02] → [0.001, 0, -0.00002].
+        assert!((d[0] - 0.001).abs() < 1e-6, "{}", d[0]);
+        assert!(d[1].abs() < 1e-9);
+        assert!((d[2] + 0.00002).abs() < 1e-6, "{}", d[2]);
+    }
+
+    #[test]
+    fn passenger_delta_pure_translation_is_exact_velocity_step() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        sub.pos = [1.0e6, 100.0, -1.0e6];
+        sub.vel = [97.97957773551134, -0.25, 3.5];
+        sub.omega = [0.0; 3];
+        assert_eq!(
+            sub.passenger_world_delta([0.5, 1.0, -0.5], 0.05),
+            [
+                sub.vel[0] * 0.05,
+                sub.vel[1] * 0.05,
+                sub.vel[2] * 0.05,
+            ],
+            "with no rotation the finite-step rotational terms cancel exactly"
+        );
+    }
+
+    #[test]
+    fn passenger_delta_exact_quarter_turn_has_zero_radial_drift() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        sub.pos = [0.0, 100.0, 0.0];
+        sub.vel = [0.0; 3];
+        // ω·dt = 2 → integrated turn is exactly 90° about +Y
+        // (2·atan(ωdt/2) = 2·atan(1) = π/2).
+        sub.omega = [0.0, 40.0, 0.0];
+        let d = sub.passenger_world_delta([20.0, 0.0, 0.0], 0.05);
+        // Exact chord: r0=(20,0,0) -> r1=(0,0,-20), Δ = (-20,0,-20).
+        assert!((d[0] + 20.0).abs() < 1e-9, "{}", d[0]);
+        assert!(d[1].abs() < 1e-9);
+        assert!((d[2] + 20.0).abs() < 1e-9, "{}", d[2]);
+        // Zero radial drift: the endpoint stays exactly on the 20-block
+        // sphere — the old tangent step placed it at r·√(1+θ²) ≈ 25.8.
+        let endpoint_r = norm3([d[0] + 20.0, d[1], d[2]]);
+        assert!((endpoint_r - 20.0).abs() < 1e-9, "radial drift {}", endpoint_r - 20.0);
+    }
+
+    #[test]
+    fn passenger_world_delta_exact_is_chord_exact_between_poses() {
+        let q0 = [0.0, 0.0, 0.0, 1.0];
+        let s45 = std::f64::consts::FRAC_1_SQRT_2;
+        let q90y = [0.0, s45, 0.0, s45];
+        let d = RigidBodySubWorld::passenger_world_delta_exact(
+            [0.0; 3],
+            q0,
+            [0.0; 3],
+            q90y,
+            [20.0, 0.0, 0.0],
+        );
+        assert!((d[0] + 20.0).abs() < 1e-12);
+        assert!((d[2] + 20.0).abs() < 1e-12);
+        // Translation and rotation compose.
+        let d = RigidBodySubWorld::passenger_world_delta_exact(
+            [1.0, 2.0, 3.0],
+            q0,
+            [5.0, 6.0, 7.0],
+            q90y,
+            [20.0, 0.0, 0.0],
+        );
+        assert!((d[0] + 16.0).abs() < 1e-12, "{}", d[0]); // (5+0)-(1+20)
+        assert!((d[1] - 4.0).abs() < 1e-12);
+        assert!((d[2] + 16.0).abs() < 1e-12); // (7-20)-(3+0)
+    }
+
+    // -- P0-D: dynamic COM conservation on block edits ------------------
+
+    #[test]
+    fn block_edits_shift_pos_so_existing_voxels_stay_world_exact() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone"), ([1, 0, 0], "minecraft:stone")]);
+        // Nontrivial pose: 45° about +Y so the COM delta rotates too.
+        let s = (45.0_f64 / 2.0).to_radians().sin();
+        let c = (45.0_f64 / 2.0).to_radians().cos();
+        sub.quat = [0.0, s, 0.0, c];
+        sub.pos = [10.0, 100.0, 10.0];
+        let before: Vec<[f64; 3]> = sub
+            .blocks
+            .keys()
+            .map(|p| sub.local_to_world([p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5]))
+            .collect();
+
+        // A heavy keel far off-axis must shift the COM — and `pos` must
+        // absorb the shift so the two old voxels keep their world cells.
+        sub.set_block([4, 0, 0], "minecraft:obsidian");
+        for (p, &w0) in sub.blocks.keys().take(2).zip(&before) {
+            let w1 = sub.local_to_world([p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5]);
+            for i in 0..3 {
+                assert!(
+                    (w0[i] - w1[i]).abs() < 1e-12,
+                    "voxel {p:?} drifted on set_block: {w0:?} -> {w1:?}"
+                );
+            }
+        }
+
+        // Removing the keel restores the original COM — and again the
+        // remaining voxels must not move in world space.
+        let mid: Vec<[f64; 3]> = sub
+            .blocks
+            .keys()
+            .map(|p| sub.local_to_world([p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5]))
+            .collect();
+        assert!(sub.remove_block([4, 0, 0]));
+        for (p, &w0) in sub.blocks.keys().zip(&mid[..2]) {
+            let w1 = sub.local_to_world([p[0] as f64 + 0.5, p[1] as f64 + 0.5, p[2] as f64 + 0.5]);
+            for i in 0..3 {
+                assert!((w0[i] - w1[i]).abs() < 1e-12);
+            }
+        }
+    }
+
+    // -- P0-C: substepped contact solver --------------------------------
+
+    #[test]
+    fn airship_lands_and_rests_on_flat_ground() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        sub.pos = [10.0, 66.0, 10.0];
+        sub.vel = [0.0, -4.0, 0.0];
+        let terrain = |cell: [i32; 3]| cell[1] < 64;
+        let mut solver = BuiltinContactSolver::default();
+        let mut others: [&mut RigidBodySubWorld; 0] = [];
+        let mut last_pos = sub.pos;
+        let mut settled_tick = None;
+        for tick in 0..400 {
+            sub.step_env_with_contacts(
+                0.05,
+                9.81,
+                1.0,
+                0.0,
+                0.0,
+                &mut solver,
+                &terrain,
+                &mut others,
+            );
+            if !sub.awake && settled_tick.is_none() {
+                settled_tick = Some(tick);
+                last_pos = sub.pos;
+            }
+        }
+        assert!(settled_tick.is_some(), "the hull never came to rest");
+        // Lowest voxel corner rests at the floor surface y=64:
+        // pos.y ≈ com.y + 64 → 0.5 + 64 = 64.5.
+        assert!(
+            (sub.pos[1] - 64.5).abs() < 0.15,
+            "resting height {} (want ≈64.5)",
+            sub.pos[1]
+        );
+        // No tunneling: bottom corner must never have sunk below the floor.
+        let corner = sub.local_to_world([0.0, 0.0, 0.0]);
+        assert!(corner[1] >= 63.999, "sank to {}", corner[1]);
+        // Rest is stable: once asleep the pose is bit-frozen.
+        for _ in 0..20 {
+            sub.step_env_with_contacts(
+                0.05,
+                9.81,
+                1.0,
+                0.0,
+                0.0,
+                &mut solver,
+                &terrain,
+                &mut others,
+            );
+        }
+        assert_eq!(sub.pos, last_pos, "a sleeping ship does zero work");
+        assert!(norm3(sub.vel) < 0.05 && norm3(sub.omega) < 0.05);
+    }
+
+    #[test]
+    fn airship_bounces_off_a_wall() {
+        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        sub.pos = [8.0, 100.0, 10.0];
+        sub.vel = [5.0, 0.0, 0.0];
+        // Wall: every cell with x >= 10 solid.
+        let terrain = |cell: [i32; 3]| cell[0] >= 10;
+        let mut solver = BuiltinContactSolver::default();
+        let mut others: [&mut RigidBodySubWorld; 0] = [];
+        for _ in 0..40 {
+            sub.step_env_with_contacts(
+                0.05,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                &mut solver,
+                &terrain,
+                &mut others,
+            );
+        }
+        assert!(
+            sub.vel[0] < 0.0,
+            "the wall must reflect the ship, vel.x = {}",
+            sub.vel[0]
+        );
+        // Never tunneled: max-x corner stays at-or-below x=10.
+        let corner = sub.local_to_world([1.0, 0.0, 0.0]);
+        assert!(corner[0] <= 10.001, "tunneled to {}", corner[0]);
+    }
+
+    #[test]
+    fn ship_to_ship_collision_conserves_linear_momentum() {
+        let mut a = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        let mut b = single_ship(&[([0, 0, 0], "minecraft:stone")]);
+        a.pos = [0.0, 100.0, 0.0];
+        a.vel = [6.0, 0.0, 0.0];
+        b.pos = [3.0, 100.0, 0.0];
+        b.vel = [-6.0, 0.0, 0.0];
+        let momentum = |a: &RigidBodySubWorld, b: &RigidBodySubWorld| -> [f64; 3] {
+            [
+                a.mass * a.vel[0] + b.mass * b.vel[0],
+                a.mass * a.vel[1] + b.mass * b.vel[1],
+                a.mass * a.vel[2] + b.mass * b.vel[2],
+            ]
+        };
+        let p0 = momentum(&a, &b);
+        let mut solver = BuiltinContactSolver::default();
+        for _ in 0..20 {
+            {
+                let mut others = [&mut b];
+                a.step_env_with_contacts(
+                    0.05, 0.0, 0.0, 0.0, 0.0, &mut solver, &|_| false, &mut others,
+                );
+            }
+            let p = momentum(&a, &b);
+            for i in 0..3 {
+                assert!(
+                    (p[i] - p0[i]).abs() < 1e-6,
+                    "momentum not conserved on axis {i}: {p:?} vs {p0:?}"
+                );
+            }
+        }
+        // Head-on equal-mass collision at e=0.15: the ships must actually
+        // have exchanged velocity — A should be moving back or at least
+        // slowed drastically.
+        assert!(a.vel[0] < 3.0, "no collision response: vel={:?}", a.vel);
+    }
+
+    // -- Common foundation: WorldView on the sub-world ------------------
+
+    #[test]
+    fn world_view_reads_writes_and_transforms_like_local_to_world() {
+        let mut sub = single_ship(&[([0, 0, 0], "create:shaft")]);
+        sub.pos = [10.0, 100.0, 10.0];
+        // Reads go through the embedded registry's canonical codec.
+        let state = sub
+            .factory
+            .registry()
+            .decode_canonical("create:shaft")
+            .expect("shaft decodes");
+        assert_eq!(WorldView::block_state_at(&sub, [0, 0, 0]), Some(state));
+        assert_eq!(WorldView::block_state_at(&sub, [9, 9, 9]), None);
+        // Writes route through set_block (canonical re-encode).
+        let casing = sub
+            .factory
+            .registry()
+            .decode_canonical("create:andesite_casing")
+            .expect("casing decodes");
+        assert!(sub.set_block_state([1, 0, 0], casing));
+        assert!(sub.blocks.contains_key(&[1, 0, 0]));
+        assert!(!sub.set_block_state([2, 0, 0], u32::MAX), "bad id refused");
+        // The transform is exactly the ship's rigid map: cell centers map
+        // through pos + R·(p - com) — identical to local_to_world.
+        let t = WorldView::world_transform(&sub);
+        for local in [[0.0, 0.0, 0.0], [0.5, 0.5, 0.5], [3.0, -2.0, 7.0]] {
+            let via_view = t.local_to_world(local).unwrap();
+            let via_ship = sub.local_to_world(local);
+            for i in 0..3 {
+                assert!((via_view[i] - via_ship[i]).abs() < 1e-12);
+            }
+        }
+    }
+
+
+
+
 }

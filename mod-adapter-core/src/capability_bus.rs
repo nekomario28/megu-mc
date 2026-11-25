@@ -473,16 +473,94 @@ impl EnergyAmount {
 // The bus
 // ---------------------------------------------------------------------------
 
+/// Exact accounting of one committed item transfer so **zero** items can
+/// silently vanish: `delivered + returned_to_source + overflow.count` is
+/// always exactly the count extracted from the source (`taken`). A
+/// destination that refused part of the stack drives `delivered` down;
+/// a source that refuses the rollback surfaces the unreturned remainder
+/// as [`ItemTransferResult::overflow`] instead of deleting it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ItemTransferResult {
+    /// Items the destination actually accepted.
+    pub delivered: u32,
+    /// Items pushed back into the source (destination-refused remainder).
+    pub returned_to_source: u32,
+    /// Items neither endpoint accepted — surfaced, never dropped.
+    pub overflow: Option<CapabilityItemStack>,
+}
+
+impl ItemTransferResult {
+    /// Total items accounted for: `delivered + returned + overflow`.
+    pub fn accounted(&self) -> u32 {
+        self.delivered
+            .saturating_add(self.returned_to_source)
+            .saturating_add(self.overflow.as_ref().map_or(0, |s| s.count))
+    }
+}
+
+/// Exact accounting of one committed fluid transfer (milli-buckets):
+/// `delivered + returned_to_source + overflow.amount_mb` is always exactly
+/// the amount drained from the source.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FluidTransferResult {
+    /// Milli-buckets the destination tank accepted.
+    pub delivered: u64,
+    /// Milli-buckets pushed back into the source tank.
+    pub returned_to_source: u64,
+    /// Fluid neither tank accepted — surfaced, never deleted.
+    pub overflow: Option<CapabilityFluidStack>,
+}
+
+impl FluidTransferResult {
+    /// Total milli-buckets accounted for.
+    pub fn accounted_mb(&self) -> u64 {
+        self.delivered
+            .saturating_add(self.returned_to_source)
+            .saturating_add(self.overflow.as_ref().map_or(0, |f| f.amount_mb))
+    }
+}
+
+/// Exact accounting of one committed energy transfer (FE): `delivered +
+/// returned_to_source + overflow_fe` is always exactly the amount drawn
+/// from the source.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnergyTransferResult {
+    /// FE the destination buffer accepted.
+    pub delivered: u64,
+    /// FE pushed back into the source buffer.
+    pub returned_to_source: u64,
+    /// FE neither buffer accepted — surfaced, never deleted.
+    pub overflow_fe: u64,
+}
+
+impl EnergyTransferResult {
+    /// Total FE accounted for.
+    pub fn accounted_fe(&self) -> u64 {
+        self.delivered
+            .saturating_add(self.returned_to_source)
+            .saturating_add(self.overflow_fe)
+    }
+}
+
 /// One registry of heterogeneous item/fluid/energy endpoints keyed by
 /// [`BlockCoord`]. Vanilla chests and hoppers, Create belts and tanks,
 /// culinary pots, and arbitrary mod machines all register in the same
 /// bus; the `transfer_*_between` helpers then move cargo between any two
 /// endpoints atomically.
+///
+/// Every register/unregister/[`invalidate_at`](Self::invalidate_at) bumps
+/// a per-coord revision counter, the NeoForge
+/// `invalidateCapabilities(pos)` contract: a listener that cached a
+/// capability compares [`invalidation_rev`](Self::invalidation_rev)
+/// against the revision it cached and re-queries on any bump.
 #[derive(Default)]
 pub struct BlockCapabilityBus {
     items: HashMap<BlockCoord, Box<dyn ItemTransferHandler + Send>>,
     fluids: HashMap<BlockCoord, Box<dyn FluidTransferHandler + Send>>,
     energy: HashMap<BlockCoord, Box<dyn EnergyTransferHandler + Send>>,
+    /// Per-coord capability invalidation revision (NeoForge
+    /// `invalidateCapabilities`); bumped on register/unregister/block-change.
+    invalidation_revs: HashMap<BlockCoord, u64>,
 }
 
 impl BlockCapabilityBus {
@@ -492,41 +570,53 @@ impl BlockCapabilityBus {
     }
 
     /// Register an item endpoint at `coord`; returns the replaced
-    /// handler, if any.
+    /// handler, if any. Bumps the coord's capability invalidation
+    /// revision so cached `IItemHandler` lookups re-query.
     pub fn register_item_handler(
         &mut self,
         coord: BlockCoord,
         handler: Box<dyn ItemTransferHandler + Send>,
     ) -> Option<Box<dyn ItemTransferHandler + Send>> {
-        self.items.insert(coord, handler)
+        let replaced = self.items.insert(coord.clone(), handler);
+        self.bump_invalidation(&coord);
+        replaced
     }
 
     /// Register a fluid endpoint at `coord`; returns the replaced
-    /// handler, if any.
+    /// handler, if any. Bumps the coord's invalidation revision.
     pub fn register_fluid_handler(
         &mut self,
         coord: BlockCoord,
         handler: Box<dyn FluidTransferHandler + Send>,
     ) -> Option<Box<dyn FluidTransferHandler + Send>> {
-        self.fluids.insert(coord, handler)
+        let replaced = self.fluids.insert(coord.clone(), handler);
+        self.bump_invalidation(&coord);
+        replaced
     }
 
     /// Register an energy endpoint at `coord`; returns the replaced
-    /// handler, if any.
+    /// handler, if any. Bumps the coord's invalidation revision.
     pub fn register_energy_handler(
         &mut self,
         coord: BlockCoord,
         handler: Box<dyn EnergyTransferHandler + Send>,
     ) -> Option<Box<dyn EnergyTransferHandler + Send>> {
-        self.energy.insert(coord, handler)
+        let replaced = self.energy.insert(coord.clone(), handler);
+        self.bump_invalidation(&coord);
+        replaced
     }
 
-    /// Remove the item endpoint at `coord`, if any.
+    /// Remove the item endpoint at `coord`, if any. Bumps the
+    /// invalidation revision only when a handler was actually removed.
     pub fn unregister_item_handler(
         &mut self,
         coord: &BlockCoord,
     ) -> Option<Box<dyn ItemTransferHandler + Send>> {
-        self.items.remove(coord)
+        let removed = self.items.remove(coord);
+        if removed.is_some() {
+            self.bump_invalidation(coord);
+        }
+        removed
     }
 
     /// Remove the fluid endpoint at `coord`, if any.
@@ -534,7 +624,11 @@ impl BlockCapabilityBus {
         &mut self,
         coord: &BlockCoord,
     ) -> Option<Box<dyn FluidTransferHandler + Send>> {
-        self.fluids.remove(coord)
+        let removed = self.fluids.remove(coord);
+        if removed.is_some() {
+            self.bump_invalidation(coord);
+        }
+        removed
     }
 
     /// Remove the energy endpoint at `coord`, if any.
@@ -542,7 +636,35 @@ impl BlockCapabilityBus {
         &mut self,
         coord: &BlockCoord,
     ) -> Option<Box<dyn EnergyTransferHandler + Send>> {
-        self.energy.remove(coord)
+        let removed = self.energy.remove(coord);
+        if removed.is_some() {
+            self.bump_invalidation(coord);
+        }
+        removed
+    }
+
+    /// The coord's capability invalidation revision (`0` when it has
+    /// never changed). NeoForge-style contract: a listener that cached a
+    /// capability handle records this revision and re-queries when it
+    /// bumps.
+    pub fn invalidation_rev(&self, pos: &BlockCoord) -> u64 {
+        self.invalidation_revs.get(pos).copied().unwrap_or(0)
+    }
+
+    /// Explicitly invalidate every cached capability at `pos` — the
+    /// block-change path (`setBlock`/`neighborChanged`) that NeoForge's
+    /// `level.invalidateCapabilities(pos)` models. Always bumps, even
+    /// when no endpoint is currently registered, because a block swap may
+    /// have replaced a handler outside this registry.
+    pub fn invalidate_at(&mut self, pos: &BlockCoord) {
+        self.bump_invalidation(pos);
+    }
+
+    /// Increment `coord`'s invalidation revision (wrapping at `u64::MAX`
+    /// rather than panicking in a long-lived registry).
+    fn bump_invalidation(&mut self, coord: &BlockCoord) {
+        let rev = self.invalidation_revs.entry(coord.clone()).or_insert(0);
+        *rev = rev.wrapping_add(1);
     }
 
     /// Borrow the item endpoint at `coord`.
@@ -596,9 +718,11 @@ impl BlockCapabilityBus {
     /// destination can neither duplicate nor vanish items. Anything the
     /// committed insert refuses is pushed back into the source.
     ///
-    /// Returns the item count actually delivered. `0` when either
-    /// endpoint is missing, the source is empty, the destination rejects,
-    /// or `from == to`.
+    /// Returns the item count actually delivered to the destination —
+    /// exactly [`ItemTransferResult::delivered`] of
+    /// [`transfer_item_checked`](Self::transfer_item_checked). `0` when
+    /// either endpoint is missing, the source is empty, the destination
+    /// rejects, or `from == to`.
     pub fn transfer_item_between(
         &mut self,
         from: &BlockCoord,
@@ -608,25 +732,47 @@ impl BlockCapabilityBus {
         max_count: u32,
         filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
     ) -> u32 {
+        self.transfer_item_checked(from, from_face, to, to_face, max_count, filter)
+            .delivered
+    }
+
+    /// [`transfer_item_between`](Self::transfer_item_between) with exact
+    /// conservation accounting: `result.delivered +
+    /// result.returned_to_source + result.overflow.count` is always the
+    /// count committed out of the source. `delivered` is
+    /// `taken − leftover` — the destination's refused remainder is rolled
+    /// back into the source, and anything the source refuses on the
+    /// rollback is surfaced as `overflow` rather than counted as
+    /// delivered or silently deleted.
+    pub fn transfer_item_checked(
+        &mut self,
+        from: &BlockCoord,
+        from_face: Option<FaceDirection>,
+        to: &BlockCoord,
+        to_face: Option<FaceDirection>,
+        max_count: u32,
+        filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
+    ) -> ItemTransferResult {
+        let empty = ItemTransferResult::default;
         if from == to || max_count == 0 {
-            return 0;
+            return empty();
         }
         let Some(src) = self.items.get_mut(from) else {
-            return 0;
+            return empty();
         };
         let Some(probe) = src.extract_item(from_face, max_count, filter, true) else {
-            return 0;
+            return empty();
         };
         if probe.is_empty() {
-            return 0;
+            return empty();
         }
         let Some(dst) = self.items.get_mut(to) else {
-            return 0;
+            return empty();
         };
         let remainder = dst.insert_item(to_face, &probe, true);
         let movable = probe.count.saturating_sub(remainder.count);
         if movable == 0 {
-            return 0;
+            return empty();
         }
         // Commit: extract exactly the probed identity (components must
         // match too) so a destination never receives a different stack
@@ -646,27 +792,48 @@ impl BlockCapabilityBus {
                 false,
             )
         }) else {
-            return 0;
+            return empty();
         };
         let taken_count = taken.count;
+        let mut result = ItemTransferResult {
+            delivered: taken_count,
+            ..ItemTransferResult::default()
+        };
         let Some(dst) = self.items.get_mut(to) else {
-            return 0;
+            result.overflow = Some(taken);
+            result.delivered = 0;
+            return result;
         };
         let leftover = dst.insert_item(to_face, &taken, false);
+        // `insert_item` returns the unaccepted remainder, so the delivered
+        // count is `taken − leftover` — never the source's re-insert
+        // response.
+        result.delivered = taken_count.saturating_sub(leftover.count);
         if leftover.count > 0 {
-            // Roll the refused remainder back into the source so nothing
-            // is lost between simulation and commit.
-            if let Some(src) = self.items.get_mut(from) {
-                let reinserted = src.insert_item(from_face, &leftover, false);
-                return taken_count.saturating_sub(reinserted.count);
+            // Roll the refused remainder back into the source. Whatever
+            // the source refuses is overflow: it left the source, reached
+            // neither endpoint, and must be surfaced rather than vanish.
+            match self.items.get_mut(from) {
+                Some(src) => {
+                    let refused = src.insert_item(from_face, &leftover, false);
+                    result.returned_to_source = leftover.count.saturating_sub(refused.count);
+                    if refused.count > 0 {
+                        result.overflow = Some(refused);
+                    }
+                }
+                None => {
+                    result.overflow = Some(leftover);
+                }
             }
         }
-        taken_count
+        result
     }
 
     /// Atomically move up to `max_mb` of fluid from `from` to `to` via
     /// simulate-then-commit; a rejecting or full destination rolls the
-    /// committed drain back into the source. Returns mB delivered.
+    /// committed drain back into the source. Returns mB delivered —
+    /// exactly [`FluidTransferResult::delivered`] of
+    /// [`transfer_fluid_checked`](Self::transfer_fluid_checked).
     pub fn transfer_fluid_between(
         &mut self,
         from: &BlockCoord,
@@ -675,6 +842,23 @@ impl BlockCapabilityBus {
         to_face: Option<FaceDirection>,
         max_mb: u64,
     ) -> u64 {
+        self.transfer_fluid_impl(from, from_face, to, to_face, None, max_mb)
+            .delivered
+    }
+
+    /// [`transfer_fluid_between`](Self::transfer_fluid_between) with
+    /// exact conservation accounting: `delivered +
+    /// returned_to_source + overflow.amount_mb` is always the amount
+    /// drained from the source. A rollback the source refuses is
+    /// surfaced as `overflow`, never counted as delivered or deleted.
+    pub fn transfer_fluid_checked(
+        &mut self,
+        from: &BlockCoord,
+        from_face: Option<FaceDirection>,
+        to: &BlockCoord,
+        to_face: Option<FaceDirection>,
+        max_mb: u64,
+    ) -> FluidTransferResult {
         self.transfer_fluid_impl(from, from_face, to, to_face, None, max_mb)
     }
 
@@ -690,12 +874,16 @@ impl BlockCapabilityBus {
         max_mb: u64,
     ) -> u64 {
         self.transfer_fluid_impl(from, None, to, None, fluid_filter, max_mb)
+            .delivered
     }
 
     /// Shared simulate-then-commit fluid move. `fluid_filter`
     /// constrains the probe drain; the committed drain then pins the
     /// *probed* fluid id so the destination can never receive a fluid
-    /// it did not simulate.
+    /// it did not simulate. The result conserves exactly:
+    /// `delivered + returned_to_source + overflow.amount_mb ==
+    /// taken.amount_mb` — mB the source refuses on rollback are reported
+    /// as `overflow`, not silently absorbed into `delivered`.
     fn transfer_fluid_impl(
         &mut self,
         from: &BlockCoord,
@@ -704,25 +892,26 @@ impl BlockCapabilityBus {
         to_face: Option<FaceDirection>,
         fluid_filter: Option<&str>,
         max_mb: u64,
-    ) -> u64 {
+    ) -> FluidTransferResult {
+        let empty = FluidTransferResult::default;
         if from == to || max_mb == 0 {
-            return 0;
+            return empty();
         }
         let Some(src) = self.fluids.get_mut(from) else {
-            return 0;
+            return empty();
         };
         let Some(probe) = src.drain_fluid(from_face, max_mb, fluid_filter, true) else {
-            return 0;
+            return empty();
         };
         if probe.is_empty() {
-            return 0;
+            return empty();
         }
         let Some(dst) = self.fluids.get_mut(to) else {
-            return 0;
+            return empty();
         };
         let accepted = dst.fill_fluid(to_face, &probe, true).min(probe.amount_mb);
         if accepted == 0 {
-            return 0;
+            return empty();
         }
         let probe_id = probe.fluid_id.clone();
         let Some(taken) = self
@@ -730,28 +919,36 @@ impl BlockCapabilityBus {
             .get_mut(from)
             .and_then(|h| h.drain_fluid(from_face, accepted, Some(&probe_id), false))
         else {
-            return 0;
+            return empty();
         };
-        let mut delivered = 0u64;
+        let mut result = FluidTransferResult::default();
         let mut pending = taken;
         if let Some(dst) = self.fluids.get_mut(to) {
             let filled = dst.fill_fluid(to_face, &pending, false);
-            delivered = filled;
+            result.delivered = filled;
             pending.amount_mb = pending.amount_mb.saturating_sub(filled);
         }
         if pending.amount_mb > 0 {
-            // Roll the undelivered remainder back into the source.
+            // Roll the undelivered remainder back into the source; any
+            // mB the source refuses are overflow — surfaced, not
+            // silently counted as delivered.
             if let Some(src) = self.fluids.get_mut(from) {
                 let back = src.fill_fluid(from_face, &pending, false);
-                delivered += pending.amount_mb.saturating_sub(back);
+                result.returned_to_source = back;
+                pending.amount_mb = pending.amount_mb.saturating_sub(back);
+            }
+            if pending.amount_mb > 0 {
+                result.overflow = Some(pending);
             }
         }
-        delivered
+        result
     }
 
     /// Atomically move up to `max_fe` of energy from `from` to `to` via
     /// simulate-then-commit; any FE the committed receive refuses is
-    /// pushed back into the source. Returns FE delivered.
+    /// pushed back into the source. Returns FE delivered — exactly
+    /// [`EnergyTransferResult::delivered`] of
+    /// [`transfer_energy_checked`](Self::transfer_energy_checked).
     pub fn transfer_energy_between(
         &mut self,
         from: &BlockCoord,
@@ -760,44 +957,63 @@ impl BlockCapabilityBus {
         to_face: Option<FaceDirection>,
         max_fe: u64,
     ) -> u64 {
+        self.transfer_energy_checked(from, from_face, to, to_face, max_fe)
+            .delivered
+    }
+
+    /// [`transfer_energy_between`](Self::transfer_energy_between) with
+    /// exact conservation accounting: `delivered + returned_to_source +
+    /// overflow_fe` is always the amount drawn from the source.
+    pub fn transfer_energy_checked(
+        &mut self,
+        from: &BlockCoord,
+        from_face: Option<FaceDirection>,
+        to: &BlockCoord,
+        to_face: Option<FaceDirection>,
+        max_fe: u64,
+    ) -> EnergyTransferResult {
+        let empty = EnergyTransferResult::default;
         if from == to || max_fe == 0 {
-            return 0;
+            return empty();
         }
         let Some(src) = self.energy.get_mut(from) else {
-            return 0;
+            return empty();
         };
         let available = src.extract_energy(from_face, max_fe, true);
         if available == 0 {
-            return 0;
+            return empty();
         }
         let Some(dst) = self.energy.get_mut(to) else {
-            return 0;
+            return empty();
         };
         let wanted = dst.receive_energy(to_face, available, true).min(available);
         if wanted == 0 {
-            return 0;
+            return empty();
         }
         let drawn = self
             .energy
             .get_mut(from)
             .map_or(0, |h| h.extract_energy(from_face, wanted, false));
-        let mut delivered = 0u64;
+        let mut result = EnergyTransferResult::default();
         if drawn > 0 {
             let accepted = self
                 .energy
                 .get_mut(to)
                 .map_or(0, |h| h.receive_energy(to_face, drawn, false));
-            delivered = accepted;
+            result.delivered = accepted;
             let bounced = drawn.saturating_sub(accepted);
             if bounced > 0 {
-                // Roll refused FE back into the source.
-                let _ = self
+                // Roll refused FE back into the source; whatever the
+                // source refuses is overflow — surfaced, never deleted.
+                let recovered = self
                     .energy
                     .get_mut(from)
-                    .map(|h| h.receive_energy(from_face, bounced, false));
+                    .map_or(0, |h| h.receive_energy(from_face, bounced, false));
+                result.returned_to_source = recovered;
+                result.overflow_fe = bounced.saturating_sub(recovered);
             }
         }
-        delivered
+        result
     }
 }
 
@@ -1607,5 +1823,458 @@ mod tests {
             .filter_map(|at| stored_fe(&bus, at))
             .sum();
         assert_eq!(final_total, 9_500);
+    }
+
+    // -- Divergent test endpoints -------------------------------------
+    // Well-behaved endpoints can never reach the rollback paths (their
+    // commit always matches their simulation), so these stubs accept at
+    // simulate and refuse at commit — or refuse whole directions — to
+    // prove the bus's accounting stays exact under NeoForge-legal
+    // misbehaviour.
+
+    /// Item destination that simulates inserts honestly but refuses
+    /// every committed insert.
+    struct RejectOnCommitItems {
+        inner: SimpleSlotInventory,
+    }
+
+    impl ItemTransferHandler for RejectOnCommitItems {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn insert_item(
+            &mut self,
+            face: Option<FaceDirection>,
+            stack: &CapabilityItemStack,
+            simulate: bool,
+        ) -> CapabilityItemStack {
+            if simulate {
+                self.inner.insert_item(face, stack, true)
+            } else {
+                stack.clone()
+            }
+        }
+        fn extract_item(
+            &mut self,
+            _face: Option<FaceDirection>,
+            _max_count: u32,
+            _filter: Option<&dyn Fn(&CapabilityItemStack) -> bool>,
+            _simulate: bool,
+        ) -> Option<CapabilityItemStack> {
+            None
+        }
+        fn slots(&self) -> usize {
+            self.inner.slots()
+        }
+    }
+
+    /// Fluid source that drains honestly but refuses every fill — the
+    /// rollback-refusing source that forces the overflow path.
+    struct DrainOnlyFluid {
+        inner: SimpleFluidTank,
+    }
+
+    impl FluidTransferHandler for DrainOnlyFluid {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn fill_fluid(
+            &mut self,
+            _face: Option<FaceDirection>,
+            _resource: &CapabilityFluidStack,
+            _simulate: bool,
+        ) -> u64 {
+            0
+        }
+        fn drain_fluid(
+            &mut self,
+            face: Option<FaceDirection>,
+            max_mb: u64,
+            filter_fluid: Option<&str>,
+            simulate: bool,
+        ) -> Option<CapabilityFluidStack> {
+            self.inner.drain_fluid(face, max_mb, filter_fluid, simulate)
+        }
+        fn peek_fluid(&self, tank: usize) -> Option<CapabilityFluidStack> {
+            self.inner.peek_fluid(tank)
+        }
+    }
+
+    /// Fluid destination that simulates fills honestly but refuses every
+    /// committed fill.
+    struct RejectOnCommitFluid {
+        inner: SimpleFluidTank,
+    }
+
+    impl FluidTransferHandler for RejectOnCommitFluid {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn fill_fluid(
+            &mut self,
+            face: Option<FaceDirection>,
+            resource: &CapabilityFluidStack,
+            simulate: bool,
+        ) -> u64 {
+            if simulate {
+                self.inner.fill_fluid(face, resource, true)
+            } else {
+                0
+            }
+        }
+        fn drain_fluid(
+            &mut self,
+            _face: Option<FaceDirection>,
+            _max_mb: u64,
+            _filter_fluid: Option<&str>,
+            _simulate: bool,
+        ) -> Option<CapabilityFluidStack> {
+            None
+        }
+    }
+
+    /// Energy destination that simulates receives honestly but refuses
+    /// every committed receive.
+    struct RejectOnCommitEnergy {
+        inner: SimpleEnergyBuffer,
+    }
+
+    impl EnergyTransferHandler for RejectOnCommitEnergy {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn receive_energy(
+            &mut self,
+            face: Option<FaceDirection>,
+            max_receive_fe: u64,
+            simulate: bool,
+        ) -> u64 {
+            if simulate {
+                self.inner.receive_energy(face, max_receive_fe, true)
+            } else {
+                0
+            }
+        }
+        fn extract_energy(
+            &mut self,
+            _face: Option<FaceDirection>,
+            _max_extract_fe: u64,
+            _simulate: bool,
+        ) -> u64 {
+            0
+        }
+        fn energy_stored(&self) -> u64 {
+            self.inner.energy_stored()
+        }
+        fn max_energy_stored(&self) -> u64 {
+            self.inner.max_energy_stored()
+        }
+    }
+
+    /// Energy source that extracts honestly but refuses every receive —
+    /// the rollback-refusing source that forces `overflow_fe`.
+    struct ExtractOnlyEnergy {
+        inner: SimpleEnergyBuffer,
+    }
+
+    impl EnergyTransferHandler for ExtractOnlyEnergy {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn receive_energy(
+            &mut self,
+            _face: Option<FaceDirection>,
+            _max_receive_fe: u64,
+            _simulate: bool,
+        ) -> u64 {
+            0
+        }
+        fn extract_energy(
+            &mut self,
+            face: Option<FaceDirection>,
+            max_extract_fe: u64,
+            simulate: bool,
+        ) -> u64 {
+            self.inner.extract_energy(face, max_extract_fe, simulate)
+        }
+        fn energy_stored(&self) -> u64 {
+            self.inner.energy_stored()
+        }
+        fn max_energy_stored(&self) -> u64 {
+            self.inner.max_energy_stored()
+        }
+    }
+
+    fn stored_items(bus: &BlockCapabilityBus, at: &BlockCoord) -> Option<u64> {
+        bus.item_endpoint(at)
+            .and_then(|h| h.as_any().downcast_ref::<SimpleSlotInventory>())
+            .map(|inv| inv.total_items())
+    }
+
+    #[test]
+    fn item_transfer_checked_counts_delivered_exactly_on_partial() {
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 10);
+        let dst_at = coord("mod_a:dim", 11);
+        let mut src = SimpleSlotInventory::new(1, 64);
+        src.set_slot(0, Some(CapabilityItemStack::new("minecraft:cobblestone", 10)));
+        let mut dst = SimpleSlotInventory::new(1, 64);
+        dst.set_slot(0, Some(CapabilityItemStack::new("minecraft:cobblestone", 58)));
+        bus.register_item_handler(src_at.clone(), Box::new(src));
+        bus.register_item_handler(dst_at.clone(), Box::new(dst));
+
+        let result = bus.transfer_item_checked(&src_at, None, &dst_at, None, 10, None);
+        assert_eq!(result.delivered, 6, "exactly the destination's room");
+        assert_eq!(result.returned_to_source, 0);
+        assert!(result.overflow.is_none());
+        assert_eq!(result.accounted(), 6, "every committed item accounted");
+        assert_eq!(stored_items(&bus, &src_at), Some(4));
+        assert_eq!(stored_items(&bus, &dst_at), Some(64));
+
+        // A now-full destination refuses: nothing extracted, nothing lost.
+        let refused = bus.transfer_item_checked(&src_at, None, &dst_at, None, 4, None);
+        assert_eq!(refused, ItemTransferResult::default());
+        assert_eq!(stored_items(&bus, &src_at), Some(4));
+    }
+
+    #[test]
+    fn commit_refusal_rolls_back_and_never_overreports() {
+        // Regression: `insert_item` returns the *unaccepted remainder*,
+        // so `delivered = taken − leftover` — never `taken − reinserted`.
+        // A destination refusing at commit must report `delivered == 0`.
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 12);
+        let dst_at = coord("mod_a:dim", 13);
+        let mut src = SimpleSlotInventory::new(1, 64);
+        src.set_slot(0, Some(CapabilityItemStack::new("minecraft:cobblestone", 10)));
+        bus.register_item_handler(src_at.clone(), Box::new(src));
+        bus.register_item_handler(
+            dst_at.clone(),
+            Box::new(RejectOnCommitItems {
+                inner: SimpleSlotInventory::new(1, 64),
+            }),
+        );
+
+        let result = bus.transfer_item_checked(&src_at, None, &dst_at, None, 10, None);
+        assert_eq!(result.delivered, 0, "refused commit delivers nothing");
+        assert_eq!(result.returned_to_source, 10, "whole stack rolled back");
+        assert!(result.overflow.is_none());
+        assert_eq!(result.accounted(), 10);
+        assert_eq!(stored_items(&bus, &src_at), Some(10), "source restored");
+        // The convenience API reports the same exact delivered count.
+        assert_eq!(
+            bus.transfer_item_between(&src_at, None, &dst_at, None, 10, None),
+            0
+        );
+        assert_eq!(stored_items(&bus, &src_at), Some(10));
+    }
+
+    #[test]
+    fn refused_rollback_surfaces_overflow_instead_of_vanishing() {
+        // Source extracts through `Up` but refuses inserts through `Up`;
+        // the destination refuses at commit — the 10 items must surface
+        // as `overflow`, not silently vanish.
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 14);
+        let dst_at = coord("mod_a:dim", 15);
+        let mut src =
+            SimpleSlotInventory::new(1, 64).with_insert_faces([Some(FaceDirection::Down)]);
+        src.set_slot(0, Some(CapabilityItemStack::new("minecraft:cobblestone", 10)));
+        bus.register_item_handler(src_at.clone(), Box::new(src));
+        bus.register_item_handler(
+            dst_at.clone(),
+            Box::new(RejectOnCommitItems {
+                inner: SimpleSlotInventory::new(1, 64),
+            }),
+        );
+
+        let result = bus.transfer_item_checked(
+            &src_at,
+            Some(FaceDirection::Up),
+            &dst_at,
+            None,
+            10,
+            None,
+        );
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.returned_to_source, 0, "source refused the rollback");
+        assert_eq!(
+            result.overflow,
+            Some(CapabilityItemStack::new("minecraft:cobblestone", 10)),
+            "unreturned items surface, never delete"
+        );
+        assert_eq!(result.accounted(), 10);
+        assert_eq!(
+            stored_items(&bus, &src_at),
+            Some(0),
+            "items did leave the source — the overflow now owns them"
+        );
+    }
+
+    #[test]
+    fn fluid_transfer_checked_conserves_delivered_returned_overflow() {
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 16);
+        let dst_at = coord("mod_b:dim", 17);
+        let mut src = SimpleFluidTank::new(4000);
+        src.set_fluid(Some(CapabilityFluidStack::new("minecraft:water", 2000)));
+        bus.register_fluid_handler(src_at.clone(), Box::new(src));
+        bus.register_fluid_handler(dst_at.clone(), Box::new(SimpleFluidTank::new(500)));
+
+        // Partial acceptance: exactly the destination's capacity.
+        let result = bus.transfer_fluid_checked(&src_at, None, &dst_at, None, 2000);
+        assert_eq!(result.delivered, 500);
+        assert_eq!(result.returned_to_source, 0);
+        assert!(result.overflow.is_none());
+        assert_eq!(result.accounted_mb(), 500);
+
+        // Diverging destination + honest source: the whole commit rolls
+        // back, `delivered` stays 0.
+        let src2_at = coord("mod_a:dim", 18);
+        let dst2_at = coord("mod_b:dim", 19);
+        let mut src2 = SimpleFluidTank::new(4000);
+        src2.set_fluid(Some(CapabilityFluidStack::new("mod_a:steam", 2000)));
+        bus.register_fluid_handler(src2_at.clone(), Box::new(src2));
+        bus.register_fluid_handler(
+            dst2_at.clone(),
+            Box::new(RejectOnCommitFluid {
+                inner: SimpleFluidTank::new(1000),
+            }),
+        );
+        let result = bus.transfer_fluid_checked(&src2_at, None, &dst2_at, None, 2000);
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.returned_to_source, 1000);
+        assert!(result.overflow.is_none());
+        assert_eq!(result.accounted_mb(), 1000);
+        assert_eq!(
+            stored_fluid(&bus, &src2_at).map(|f| f.amount_mb),
+            Some(2000),
+            "rollback restored the source whole"
+        );
+
+        // Drain-only source + diverging destination: the undelivered mB
+        // surface as overflow, never counted as delivered.
+        let src3_at = coord("mod_a:dim", 20);
+        let dst3_at = coord("mod_b:dim", 21);
+        let mut inner = SimpleFluidTank::new(4000);
+        inner.set_fluid(Some(CapabilityFluidStack::new("mod_c:lava", 1500)));
+        bus.register_fluid_handler(src3_at.clone(), Box::new(DrainOnlyFluid { inner }));
+        bus.register_fluid_handler(
+            dst3_at.clone(),
+            Box::new(RejectOnCommitFluid {
+                inner: SimpleFluidTank::new(1000),
+            }),
+        );
+        let result = bus.transfer_fluid_checked(&src3_at, None, &dst3_at, None, 2000);
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.returned_to_source, 0);
+        assert_eq!(
+            result.overflow,
+            Some(CapabilityFluidStack::new("mod_c:lava", 1000)),
+            "undeliverable, unreturnable mB surfaced"
+        );
+        assert_eq!(result.accounted_mb(), 1000);
+        // The convenience API keeps reporting the exact delivered amount.
+        assert_eq!(
+            bus.transfer_fluid_between(&src3_at, None, &dst3_at, None, 100),
+            0
+        );
+    }
+
+    #[test]
+    fn energy_transfer_checked_conserves_every_fe() {
+        let mut bus = BlockCapabilityBus::new();
+        let src_at = coord("mod_a:dim", 22);
+        let dst_at = coord("mod_b:dim", 23);
+        let mut src = SimpleEnergyBuffer::new(4000);
+        src.set_stored(1000);
+        bus.register_energy_handler(src_at.clone(), Box::new(src));
+        bus.register_energy_handler(dst_at.clone(), Box::new(SimpleEnergyBuffer::new(400)));
+
+        let result = bus.transfer_energy_checked(&src_at, None, &dst_at, None, 800);
+        assert_eq!(result.delivered, 400, "clamped by destination capacity");
+        assert_eq!(result.returned_to_source, 0);
+        assert_eq!(result.overflow_fe, 0);
+        assert_eq!(result.accounted_fe(), 400);
+        assert_eq!(stored_fe(&bus, &src_at), Some(600));
+
+        // Diverging destination + honest source: bounced FE rolls back.
+        let src2_at = coord("mod_a:dim", 24);
+        let dst2_at = coord("mod_b:dim", 25);
+        let mut src2 = SimpleEnergyBuffer::new(4000);
+        src2.set_stored(900);
+        bus.register_energy_handler(src2_at.clone(), Box::new(src2));
+        bus.register_energy_handler(
+            dst2_at.clone(),
+            Box::new(RejectOnCommitEnergy {
+                inner: SimpleEnergyBuffer::new(1000),
+            }),
+        );
+        let result = bus.transfer_energy_checked(&src2_at, None, &dst2_at, None, 900);
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.returned_to_source, 900);
+        assert_eq!(result.overflow_fe, 0);
+        assert_eq!(result.accounted_fe(), 900);
+        assert_eq!(stored_fe(&bus, &src2_at), Some(900), "source restored");
+
+        // Extract-only source + diverging destination: refused FE surface
+        // as `overflow_fe`, never silently deleted.
+        let src3_at = coord("mod_a:dim", 26);
+        let dst3_at = coord("mod_b:dim", 27);
+        let mut inner = SimpleEnergyBuffer::new(4000);
+        inner.set_stored(700);
+        bus.register_energy_handler(src3_at.clone(), Box::new(ExtractOnlyEnergy { inner }));
+        bus.register_energy_handler(
+            dst3_at.clone(),
+            Box::new(RejectOnCommitEnergy {
+                inner: SimpleEnergyBuffer::new(1000),
+            }),
+        );
+        let result = bus.transfer_energy_checked(&src3_at, None, &dst3_at, None, 700);
+        assert_eq!(result.delivered, 0);
+        assert_eq!(result.returned_to_source, 0);
+        assert_eq!(result.overflow_fe, 700, "orphaned FE surfaced");
+        assert_eq!(result.accounted_fe(), 700);
+    }
+
+    #[test]
+    fn invalidation_rev_bumps_on_register_unregister_and_block_change() {
+        let mut bus = BlockCapabilityBus::new();
+        let at = coord("mod_a:dim", 30);
+        let other = coord("mod_a:dim", 31);
+        assert_eq!(bus.invalidation_rev(&at), 0);
+
+        bus.register_item_handler(at.clone(), Box::new(SimpleSlotInventory::new(1, 64)));
+        assert_eq!(bus.invalidation_rev(&at), 1);
+        bus.register_fluid_handler(at.clone(), Box::new(SimpleFluidTank::new(100)));
+        assert_eq!(bus.invalidation_rev(&at), 2);
+        bus.register_item_handler(at.clone(), Box::new(SimpleSlotInventory::new(1, 64)));
+        assert_eq!(bus.invalidation_rev(&at), 3, "replacing a handler invalidates");
+        assert!(bus.unregister_item_handler(&at).is_some());
+        assert_eq!(bus.invalidation_rev(&at), 4);
+        assert!(bus.unregister_energy_handler(&at).is_none());
+        assert_eq!(
+            bus.invalidation_rev(&at),
+            4,
+            "removing nothing invalidates nothing"
+        );
+        bus.invalidate_at(&at);
+        assert_eq!(bus.invalidation_rev(&at), 5);
+        assert_eq!(bus.invalidation_rev(&other), 0, "unrelated coord untouched");
     }
 }
