@@ -12,73 +12,72 @@ use megu_client::audio_out::{
     AudioCmd, AudioCmdRing, AudioRuntime, AudioSessionConfig, AudioSinkKind,
 };
 use megu_client::kinetic_sync::{
-    CHANNEL_CREATE_KINETIC_SYNC, CHANNEL_CREATE_KINETIC_UPDATE, KineticSyncRecord,
-    decode_kinetic_sync_batch,
+    decode_kinetic_sync_batch, KineticSyncRecord, CHANNEL_CREATE_KINETIC_SYNC,
+    CHANNEL_CREATE_KINETIC_UPDATE,
 };
 use megu_client::mod_assets_meta::{
-    CHANNEL_MOD_REGISTRY_SYNC, ClientModRegistry, ModMetaReport, ModTranslationTable,
-    decode_mrs1_frame,
+    decode_mrs1_frame, ClientModRegistry, ModMetaReport, ModTranslationTable,
+    CHANNEL_MOD_REGISTRY_SYNC,
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
-    ClientCustomChannelEvent, ClientPlayEvent, DecodedMagicCastState, DecodedMagicSync,
-    DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents, PlayEvent,
-    PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
-    WireReader, WireSoundEvent, WireStopSound, decode_item_stack_components,
-    handle_transfer_packet, offline_uuid, pack_position, parse_entity_metadata, parse_uuid,
-    write_string,
+    decode_item_stack_components, handle_transfer_packet, offline_uuid, pack_position,
+    parse_entity_metadata, parse_uuid, write_string, ClientCustomChannelEvent, ClientPlayEvent,
+    DecodedMagicCastState, DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, EntityMetaValue,
+    ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync,
+    TeleportSync, TransferTarget, WireReader, WireSoundEvent, WireStopSound,
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
 use megu_client::session::{AudioStats, DeathLoopState, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
-use megu_client::world::{BlockTable, WorldState, pack_vertices, sort_translucent};
+use megu_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
-use megu_client_mesh::builtin_shadow_wgsl::{BuiltinShadowQuality, enchantment_glint_rgb};
+use megu_client_mesh::builtin_shadow_wgsl::{enchantment_glint_rgb, BuiltinShadowQuality};
 use megu_client_mesh::dynamic_light_resolver::{
-    BlockLightInput, LightModulation, ResolvedLightEmitter, evaluate_modulated_intensity,
-    resolve_block_light_emitter, resolve_entity_light_emitter, resolve_item_light_emitter,
+    evaluate_modulated_intensity, resolve_block_light_emitter, resolve_entity_light_emitter,
+    resolve_item_light_emitter, BlockLightInput, LightModulation, ResolvedLightEmitter,
 };
-use megu_client_mesh::entity_rig::{EntityRigArchetype, EntityRigSpec, classify_entity_rig};
+use megu_client_mesh::entity_rig::{classify_entity_rig, EntityRigArchetype, EntityRigSpec};
 use megu_client_mesh::mesher::{
-    BlockVisualEnhancementResult, BlockVisualInput, VanillaPlusPipelineConfig,
-    torch_flame_kind, torch_flame_world_offset,
+    torch_flame_kind, torch_flame_world_offset, BlockVisualEnhancementResult, BlockVisualInput,
+    VanillaPlusPipelineConfig,
 };
-use megu_client_mesh::model_baker::ResourcePackModelStack;
 use megu_client_mesh::model_baker::blockstate::{self, BlockStateDef, BlockStateResolution};
+use megu_client_mesh::model_baker::ResourcePackModelStack;
 use megu_client_mesh::tactile_effects::{
-    CameraMicroOffset, EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial,
-    LeafCanopyKind, NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
-    compute_environment_audio_hint, evaluate_night_sky_drama,
+    compute_environment_audio_hint, evaluate_night_sky_drama, CameraMicroOffset,
+    EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
+    NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
 };
 use megu_client_mesh::vanilla_plus_nature::{
-    ActiveSeasonKind, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK, CloudLighting,
-    NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry, SeasonAmbienceInput,
     compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
+    ActiveSeasonKind, CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
+    SeasonAmbienceInput, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
 use megu_client_mesh::{
-    BuiltSectionMesh, DIRECTION_BUCKETS, DirectionBuckets, SECTION_CELLS, SectionCoord,
-    box_in_frustum, section_index,
+    box_in_frustum, section_index, BuiltSectionMesh, DirectionBuckets, SectionCoord,
+    DIRECTION_BUCKETS, SECTION_CELLS,
+};
+use megu_kernel::player_physics::{
+    step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
+};
+use megu_kernel::qol_gameplay::{
+    evaluate_looking_at_hud, HarvestTool, LookingAtBlock, LookingAtEntity, LookingAtHudInfo,
+    LookingAtTarget,
+};
+use megu_kernel::raycast::{
+    raycast_blocks, raycast_entities, EntityRayHit, FluidClipMode, RayBlockShapes, RayHit,
 };
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
-use megu_kernel::player_physics::{
-    PlayerInputState, PlayerPhysicsState, SurfaceKind, step_player_physics,
-};
-use megu_kernel::qol_gameplay::{
-    HarvestTool, LookingAtBlock, LookingAtEntity, LookingAtHudInfo, LookingAtTarget,
-    evaluate_looking_at_hud,
-};
-use megu_kernel::raycast::{
-    EntityRayHit, FluidClipMode, RayBlockShapes, RayHit, raycast_blocks, raycast_entities,
-};
 use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
 use megu_ui::state::{HudState, MiniHudPreset, UiState};
-use megu_ui::subtitle_hud::{DEFAULT_TTL_SECS, SubtitleArrow};
+use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
 // Re-exported so embedders and tests keep the historical
 // `live_session::{hw_adaptive_engine,sys_metrics}` paths while the crate
@@ -89,30 +88,30 @@ use megu_core::math_opt_engine::{
     DiscountedUcbAutotuner, P2QuantileEstimator, PidBudgetController,
 };
 
-use crate::SecretString;
 use crate::atmosphere::{
-    AtmosphereParams, BiomeAtmosphereBlender, CLOUD_RENDER_ALPHA, ChunkFadeTracker,
-    voxel_clouds_to_geometry_flagged,
+    voxel_clouds_to_geometry_flagged, AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker,
+    CLOUD_RENDER_ALPHA,
 };
 use crate::subworld_render::{
-    InstancedPartBatch, InstancedPartRecord, MAT_FLAG_CLOUD, SubWorldRenderBank,
-    SubWorldRenderEntry, SubWorldTransform, TerrainVertex, box_mesh, quat_from_axis_angle,
+    box_mesh, quat_from_axis_angle, InstancedPartBatch, InstancedPartRecord, SubWorldRenderBank,
+    SubWorldRenderEntry, SubWorldTransform, TerrainVertex, MAT_FLAG_CLOUD,
 };
 use crate::subworld_sync::{
     decode_sync_frame, encode_helm_cmd, SubWorldHelmCmd, SUBWORLD_HELM_CHANNEL,
     SUBWORLD_SYNC_CHANNEL,
 };
+use crate::SecretString;
 use hw_adaptive_engine::{
-    ComputeKernelMode, ComputeStrategy, DomainKind, DomainSpecializationPlan, HostHardwareCaps,
-    KernelAutotuner, PagedSectionPool, SpeculativeChunkPrefetcher, SpeculativeState,
-    UnifiedOptimizationPlan, build_unified_optimization_plan, detect_host_hardware_caps,
-    detect_universal_hardware_profile, select_compute_strategy,
+    build_unified_optimization_plan, detect_host_hardware_caps, detect_universal_hardware_profile,
+    select_compute_strategy, ComputeKernelMode, ComputeStrategy, DomainKind,
+    DomainSpecializationPlan, HostHardwareCaps, KernelAutotuner, PagedSectionPool,
+    SpeculativeChunkPrefetcher, SpeculativeState, UnifiedOptimizationPlan,
 };
-use sys_metrics::{CpuSampler, FrameTimingStats, sample_host_metrics};
+use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
 use crate::mesh_pool::{MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
 use crate::renderer::{
-    ExternalSectionMesh, GpuRenderer, external_packed_digest, translucent_order_digest,
+    external_packed_digest, translucent_order_digest, ExternalSectionMesh, GpuRenderer,
 };
 
 /// Sections per poll the priority-0 lane may rebuild inline, nearest
@@ -429,7 +428,9 @@ pub(crate) enum WorkerCommand {
         window_id: u8,
     },
     RenameItem(String),
-    SelectTrade { index: i32 },
+    SelectTrade {
+        index: i32,
+    },
     SetBeacon {
         primary: Option<i32>,
         secondary: Option<i32>,
@@ -502,7 +503,10 @@ pub(crate) enum WorkerCommand {
         view_distance: i8,
     },
     /// Versioned Play C2S plugin/custom payload.
-    SendCustomPayload { channel: String, payload: Vec<u8> },
+    SendCustomPayload {
+        channel: String,
+        payload: Vec<u8>,
+    },
 }
 
 /// Live view of the server's open-container instruction: the decoded
@@ -1515,10 +1519,7 @@ fn vanilla_entity_light_level(rig_name: &str) -> Option<u8> {
 /// flames (torches and campfires drown — enclosed lanterns and carved
 /// pumpkins keep burning underwater, matching vanilla block behavior).
 /// Returns `None` for non-glowing items and for emitters that quench.
-pub fn item_dynamic_light_spec(
-    item_name: &str,
-    submerged: bool,
-) -> Option<DynamicLightSpec> {
+pub fn item_dynamic_light_spec(item_name: &str, submerged: bool) -> Option<DynamicLightSpec> {
     let emitter = resolve_item_light_emitter(
         item_name,
         vanilla_item_light_level(item_name),
@@ -1689,10 +1690,7 @@ fn placed_scan_axis(c: i32) -> [(i32, std::ops::RangeInclusive<i32>); 2] {
     let hi = c.wrapping_add(PLACED_LIGHT_SCAN_RADIUS);
     [
         (lo.div_euclid(16), lo.rem_euclid(16)..=15),
-        (
-            lo.div_euclid(16).wrapping_add(1),
-            0..=hi.rem_euclid(16),
-        ),
+        (lo.div_euclid(16).wrapping_add(1), 0..=hi.rem_euclid(16)),
     ]
 }
 
@@ -1755,8 +1753,7 @@ fn push_cached_placed_lights(
     use megu_client_mesh::vfx_engine::DynamicColoredLight;
     out.reserve(entries.len());
     for entry in entries {
-        let intensity =
-            evaluate_modulated_intensity(&entry.emitter, tick_time_sec, entry.phase);
+        let intensity = evaluate_modulated_intensity(&entry.emitter, tick_time_sec, entry.phase);
         if !intensity.is_finite() || intensity <= 0.0 {
             continue;
         }
@@ -2371,24 +2368,46 @@ struct ReplayEventEncoder {
 }
 
 impl ReplayEventEncoder {
-    fn new() -> Self { Self { bytes: [0; 512], len: 0 } }
+    fn new() -> Self {
+        Self {
+            bytes: [0; 512],
+            len: 0,
+        }
+    }
     fn put(&mut self, value: &[u8]) {
         let take = value.len().min(self.bytes.len().saturating_sub(self.len));
         self.bytes[self.len..self.len + take].copy_from_slice(&value[..take]);
         self.len += take;
     }
-    fn i32(&mut self, value: i32) { self.put(&value.to_le_bytes()); }
-    fn u32(&mut self, value: u32) { self.put(&value.to_le_bytes()); }
-    fn i64(&mut self, value: i64) { self.put(&value.to_le_bytes()); }
-    fn f32(&mut self, value: f32) { self.put(&value.to_le_bytes()); }
-    fn f64(&mut self, value: f64) { self.put(&value.to_le_bytes()); }
-    fn flag(&mut self, value: bool) { self.put(&[u8::from(value)]); }
+    fn i32(&mut self, value: i32) {
+        self.put(&value.to_le_bytes());
+    }
+    fn u32(&mut self, value: u32) {
+        self.put(&value.to_le_bytes());
+    }
+    fn i64(&mut self, value: i64) {
+        self.put(&value.to_le_bytes());
+    }
+    fn f32(&mut self, value: f32) {
+        self.put(&value.to_le_bytes());
+    }
+    fn f64(&mut self, value: f64) {
+        self.put(&value.to_le_bytes());
+    }
+    fn flag(&mut self, value: bool) {
+        self.put(&[u8::from(value)]);
+    }
     fn bytes(&mut self, value: &[u8]) {
-        let len = value.len().min(u16::MAX as usize).min(self.bytes.len().saturating_sub(self.len + 2));
+        let len = value
+            .len()
+            .min(u16::MAX as usize)
+            .min(self.bytes.len().saturating_sub(self.len + 2));
         self.put(&(len as u16).to_le_bytes());
         self.put(&value[..len]);
     }
-    fn text(&mut self, value: &str) { self.bytes(value.as_bytes()); }
+    fn text(&mut self, value: &str) {
+        self.bytes(value.as_bytes());
+    }
     fn finish(self, tag: u16) -> (i32, [u8; 512], usize) {
         (0x4d52_0000 | i32::from(tag), self.bytes, self.len)
     }
@@ -2401,62 +2420,462 @@ fn compact_replay_event(event: &PlayEvent) -> Option<(i32, [u8; 512], usize)> {
     use PlayEvent as E;
     let mut out = ReplayEventEncoder::new();
     let tag = match event {
-        E::JoinGame { entity_id, dimension, hardcore } => { out.i32(*entity_id); out.text(&dimension.name); out.i32(dimension.min_y); out.i32(dimension.height); out.flag(dimension.has_skylight); out.flag(*hardcore); 1 }
-        E::Respawn { dimension } => { out.text(&dimension.name); out.i32(dimension.min_y); out.i32(dimension.height); out.flag(dimension.has_skylight); 2 }
-        E::KeepAlive(id) => { out.i64(*id); 3 }
-        E::Teleport(t) => { out.f64(t.x); out.f64(t.y); out.f64(t.z); out.f32(t.yaw); out.f32(t.pitch); out.i32(t.flags); out.i32(t.teleport_id); 4 }
+        E::JoinGame {
+            entity_id,
+            dimension,
+            hardcore,
+        } => {
+            out.i32(*entity_id);
+            out.text(&dimension.name);
+            out.i32(dimension.min_y);
+            out.i32(dimension.height);
+            out.flag(dimension.has_skylight);
+            out.flag(*hardcore);
+            1
+        }
+        E::Respawn { dimension } => {
+            out.text(&dimension.name);
+            out.i32(dimension.min_y);
+            out.i32(dimension.height);
+            out.flag(dimension.has_skylight);
+            2
+        }
+        E::KeepAlive(id) => {
+            out.i64(*id);
+            3
+        }
+        E::Teleport(t) => {
+            out.f64(t.x);
+            out.f64(t.y);
+            out.f64(t.z);
+            out.f32(t.yaw);
+            out.f32(t.pitch);
+            out.i32(t.flags);
+            out.i32(t.teleport_id);
+            4
+        }
         E::ChunkBatchStart => 5,
         E::ChunkData(chunk) => {
-            out.i32(chunk.cx); out.i32(chunk.cz); out.u32(chunk.sections.len().min(u32::MAX as usize) as u32);
+            out.i32(chunk.cx);
+            out.i32(chunk.cz);
+            out.u32(chunk.sections.len().min(u32::MAX as usize) as u32);
             let mut digest = 0xcbf2_9ce4_8422_2325u64;
-            for section in &chunk.sections { out.i32(i32::from(section.non_air)); for state in section.states.iter() { digest ^= u64::from(*state); digest = digest.wrapping_mul(0x100_0000_01b3); } }
-            out.put(&digest.to_le_bytes()); 6
+            for section in &chunk.sections {
+                out.i32(i32::from(section.non_air));
+                for state in section.states.iter() {
+                    digest ^= u64::from(*state);
+                    digest = digest.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            out.put(&digest.to_le_bytes());
+            6
         }
-        E::ChunkBatchFinished(count) => { out.i32(*count); 7 }
-        E::UpdateLight { cx, cz, light } => { out.i32(*cx); out.i32(*cz); out.u32(light.sky_arrays.len() as u32); out.u32(light.block_arrays.len() as u32); 8 }
-        E::BlockUpdate { pos, state_id } => { for v in pos { out.i32(*v); } out.u32(*state_id); 9 }
-        E::SectionBlocksUpdate(entries) => { let n = entries.len().min(24); out.put(&[n as u8]); for (pos, state) in entries.iter().take(n) { for v in pos { out.i32(*v); } out.u32(*state); } 10 }
-        E::UnloadChunk { cx, cz } => { out.i32(*cx); out.i32(*cz); 11 }
-        E::SetCenterChunk { cx, cz } => { out.i32(*cx); out.i32(*cz); 12 }
-        E::SetHealth { health, food, saturation } => { out.f32(*health); out.i32(*food); out.f32(*saturation); 13 }
-        E::SystemChat { text, overlay } => { out.text(text); out.flag(*overlay); 14 }
-        E::AddEntity { eid, uuid, entity_type, x, y, z, pitch, yaw, head_yaw, data, vx, vy, vz } => { out.i32(*eid); out.put(uuid); out.i32(*entity_type); out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*pitch); out.f32(*yaw); out.f32(*head_yaw); out.i32(*data); out.f64(*vx); out.f64(*vy); out.f64(*vz); 15 }
-        E::RemoveEntities { eids } => { let n = eids.len().min(80); out.put(&[n as u8]); for eid in eids.iter().take(n) { out.i32(*eid); } 16 }
-        E::MoveEntityPos { eid, dx, dy, dz, on_ground } => { out.i32(*eid); out.f64(*dx); out.f64(*dy); out.f64(*dz); out.flag(*on_ground); 17 }
-        E::MoveEntityPosRot { eid, dx, dy, dz, yaw, pitch, on_ground } => { out.i32(*eid); out.f64(*dx); out.f64(*dy); out.f64(*dz); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 18 }
-        E::MoveEntityRot { eid, yaw, pitch, on_ground } => { out.i32(*eid); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 19 }
-        E::TeleportEntity { eid, x, y, z, yaw, pitch, on_ground } => { out.i32(*eid); out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*yaw); out.f32(*pitch); out.flag(*on_ground); 20 }
-        E::RotateHead { eid, head_yaw } => { out.i32(*eid); out.f32(*head_yaw); 21 }
-        E::SetEntityMotion { eid, vx, vy, vz } => { out.i32(*eid); out.f64(*vx); out.f64(*vy); out.f64(*vz); 22 }
-        E::EntityEvent { eid, status } => { out.i32(*eid); out.put(&[*status as u8]); 23 }
-        E::HurtAnimation { eid, yaw } => { out.i32(*eid); out.f32(*yaw); 24 }
-        E::SetEntityData { eid, raw_entries } => { out.i32(*eid); out.bytes(raw_entries); 25 }
-        E::SetTime { world_age, time_of_day } => { out.i64(*world_age); out.i64(*time_of_day); 26 }
-        E::GameEvent { event, value } => { out.put(&[*event]); out.f32(*value); 27 }
-        E::LevelEvent { event, pos, data, disable_relative_volume } => { out.i32(*event); for v in pos { out.i32(*v); } out.i32(*data); out.flag(*disable_relative_volume); 28 }
-        E::BlockDestruction { breaker_eid, pos, stage } => { out.i32(*breaker_eid); for v in pos { out.i32(*v); } out.put(&[*stage as u8]); 29 }
-        E::Explosion { x, y, z, power, records, knockback, block_interaction, small_particle_id, large_particle_id, .. } => { out.f64(*x); out.f64(*y); out.f64(*z); out.f32(*power); out.u32(records.len().min(u32::MAX as usize) as u32); for v in knockback { out.f32(*v); } out.i32(*block_interaction); out.i32(*small_particle_id); out.i32(*large_particle_id); 30 }
-        E::BlockEntityData { pos, kind, nbt_bytes } => { for v in pos { out.i32(*v); } out.i32(*kind); out.bytes(nbt_bytes); 31 }
-        E::ContainerSetContent { window_id, state_id, slot_count, raw_payload } => { out.put(&[*window_id]); out.i32(*state_id); out.i32(*slot_count); out.bytes(raw_payload); 32 }
-        E::ContainerSetSlot { window_id, state_id, slot, raw_item } => { out.put(&[*window_id]); out.i32(*state_id); out.put(&slot.to_le_bytes()); out.bytes(raw_item); 33 }
-        E::SetExperience { bar, level, total } => { out.f32(*bar); out.i32(*level); out.i32(*total); 34 }
-        E::UpdateMobEffect { eid, effect_id, amplifier, duration, flags } => { out.i32(*eid); out.i32(*effect_id); out.i32(*amplifier); out.i32(*duration); out.put(&[*flags]); 35 }
-        E::RemoveMobEffect { eid, effect_id } => { out.i32(*eid); out.i32(*effect_id); 36 }
-        E::SetActionBarText { nbt_bytes } => { out.bytes(nbt_bytes); 37 }
-        E::SetTitleText { nbt_bytes } => { out.bytes(nbt_bytes); 38 }
-        E::SetSubtitleText { nbt_bytes } => { out.bytes(nbt_bytes); 39 }
-        E::BossEvent { uuid, action, raw_payload } => { out.put(uuid); out.i32(*action); out.bytes(raw_payload); 40 }
-        E::SetPassengers { vehicle, passengers } => { out.i32(*vehicle); let n = passengers.len().min(80); out.put(&[n as u8]); for id in passengers.iter().take(n) { out.i32(*id); } 41 }
-        E::TakeItemEntity { item_entity, player, amount } => { out.i32(*item_entity); out.i32(*player); out.i32(*amount); 42 }
-        E::SetCamera { eid } => { out.i32(*eid); 43 }
-        E::PlayerChat { sender, index, text, nbt_bytes, .. } => { out.put(sender); out.i32(*index); out.text(text); out.bytes(nbt_bytes); 44 }
-        E::DisguisedChat { text, nbt_bytes } => { out.text(text); out.bytes(nbt_bytes); 45 }
-        E::Ping(id) => { out.i32(*id); 46 }
-        E::BlockChangedAck(id) => { out.i32(*id); 47 }
-        E::PlayerAbilities { flags, flying_speed, walking_speed } => { out.put(&[*flags]); out.f32(*flying_speed); out.f32(*walking_speed); 48 }
-        E::PlayerCombatKill { player_id, message_nbt } => { out.i32(*player_id); out.bytes(message_nbt); 49 }
-        E::Disconnect(reason) => { out.text(reason); 50 }
-        E::Other(packet_id) => { out.i32(*packet_id); 51 }
+        E::ChunkBatchFinished(count) => {
+            out.i32(*count);
+            7
+        }
+        E::UpdateLight { cx, cz, light } => {
+            out.i32(*cx);
+            out.i32(*cz);
+            out.u32(light.sky_arrays.len() as u32);
+            out.u32(light.block_arrays.len() as u32);
+            8
+        }
+        E::BlockUpdate { pos, state_id } => {
+            for v in pos {
+                out.i32(*v);
+            }
+            out.u32(*state_id);
+            9
+        }
+        E::SectionBlocksUpdate(entries) => {
+            let n = entries.len().min(24);
+            out.put(&[n as u8]);
+            for (pos, state) in entries.iter().take(n) {
+                for v in pos {
+                    out.i32(*v);
+                }
+                out.u32(*state);
+            }
+            10
+        }
+        E::UnloadChunk { cx, cz } => {
+            out.i32(*cx);
+            out.i32(*cz);
+            11
+        }
+        E::SetCenterChunk { cx, cz } => {
+            out.i32(*cx);
+            out.i32(*cz);
+            12
+        }
+        E::SetHealth {
+            health,
+            food,
+            saturation,
+        } => {
+            out.f32(*health);
+            out.i32(*food);
+            out.f32(*saturation);
+            13
+        }
+        E::SystemChat { text, overlay } => {
+            out.text(text);
+            out.flag(*overlay);
+            14
+        }
+        E::AddEntity {
+            eid,
+            uuid,
+            entity_type,
+            x,
+            y,
+            z,
+            pitch,
+            yaw,
+            head_yaw,
+            data,
+            vx,
+            vy,
+            vz,
+        } => {
+            out.i32(*eid);
+            out.put(uuid);
+            out.i32(*entity_type);
+            out.f64(*x);
+            out.f64(*y);
+            out.f64(*z);
+            out.f32(*pitch);
+            out.f32(*yaw);
+            out.f32(*head_yaw);
+            out.i32(*data);
+            out.f64(*vx);
+            out.f64(*vy);
+            out.f64(*vz);
+            15
+        }
+        E::RemoveEntities { eids } => {
+            let n = eids.len().min(80);
+            out.put(&[n as u8]);
+            for eid in eids.iter().take(n) {
+                out.i32(*eid);
+            }
+            16
+        }
+        E::MoveEntityPos {
+            eid,
+            dx,
+            dy,
+            dz,
+            on_ground,
+        } => {
+            out.i32(*eid);
+            out.f64(*dx);
+            out.f64(*dy);
+            out.f64(*dz);
+            out.flag(*on_ground);
+            17
+        }
+        E::MoveEntityPosRot {
+            eid,
+            dx,
+            dy,
+            dz,
+            yaw,
+            pitch,
+            on_ground,
+        } => {
+            out.i32(*eid);
+            out.f64(*dx);
+            out.f64(*dy);
+            out.f64(*dz);
+            out.f32(*yaw);
+            out.f32(*pitch);
+            out.flag(*on_ground);
+            18
+        }
+        E::MoveEntityRot {
+            eid,
+            yaw,
+            pitch,
+            on_ground,
+        } => {
+            out.i32(*eid);
+            out.f32(*yaw);
+            out.f32(*pitch);
+            out.flag(*on_ground);
+            19
+        }
+        E::TeleportEntity {
+            eid,
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+            on_ground,
+        } => {
+            out.i32(*eid);
+            out.f64(*x);
+            out.f64(*y);
+            out.f64(*z);
+            out.f32(*yaw);
+            out.f32(*pitch);
+            out.flag(*on_ground);
+            20
+        }
+        E::RotateHead { eid, head_yaw } => {
+            out.i32(*eid);
+            out.f32(*head_yaw);
+            21
+        }
+        E::SetEntityMotion { eid, vx, vy, vz } => {
+            out.i32(*eid);
+            out.f64(*vx);
+            out.f64(*vy);
+            out.f64(*vz);
+            22
+        }
+        E::EntityEvent { eid, status } => {
+            out.i32(*eid);
+            out.put(&[*status as u8]);
+            23
+        }
+        E::HurtAnimation { eid, yaw } => {
+            out.i32(*eid);
+            out.f32(*yaw);
+            24
+        }
+        E::SetEntityData { eid, raw_entries } => {
+            out.i32(*eid);
+            out.bytes(raw_entries);
+            25
+        }
+        E::SetTime {
+            world_age,
+            time_of_day,
+        } => {
+            out.i64(*world_age);
+            out.i64(*time_of_day);
+            26
+        }
+        E::GameEvent { event, value } => {
+            out.put(&[*event]);
+            out.f32(*value);
+            27
+        }
+        E::LevelEvent {
+            event,
+            pos,
+            data,
+            disable_relative_volume,
+        } => {
+            out.i32(*event);
+            for v in pos {
+                out.i32(*v);
+            }
+            out.i32(*data);
+            out.flag(*disable_relative_volume);
+            28
+        }
+        E::BlockDestruction {
+            breaker_eid,
+            pos,
+            stage,
+        } => {
+            out.i32(*breaker_eid);
+            for v in pos {
+                out.i32(*v);
+            }
+            out.put(&[*stage as u8]);
+            29
+        }
+        E::Explosion {
+            x,
+            y,
+            z,
+            power,
+            records,
+            knockback,
+            block_interaction,
+            small_particle_id,
+            large_particle_id,
+            ..
+        } => {
+            out.f64(*x);
+            out.f64(*y);
+            out.f64(*z);
+            out.f32(*power);
+            out.u32(records.len().min(u32::MAX as usize) as u32);
+            for v in knockback {
+                out.f32(*v);
+            }
+            out.i32(*block_interaction);
+            out.i32(*small_particle_id);
+            out.i32(*large_particle_id);
+            30
+        }
+        E::BlockEntityData {
+            pos,
+            kind,
+            nbt_bytes,
+        } => {
+            for v in pos {
+                out.i32(*v);
+            }
+            out.i32(*kind);
+            out.bytes(nbt_bytes);
+            31
+        }
+        E::ContainerSetContent {
+            window_id,
+            state_id,
+            slot_count,
+            raw_payload,
+        } => {
+            out.put(&[*window_id]);
+            out.i32(*state_id);
+            out.i32(*slot_count);
+            out.bytes(raw_payload);
+            32
+        }
+        E::ContainerSetSlot {
+            window_id,
+            state_id,
+            slot,
+            raw_item,
+        } => {
+            out.put(&[*window_id]);
+            out.i32(*state_id);
+            out.put(&slot.to_le_bytes());
+            out.bytes(raw_item);
+            33
+        }
+        E::SetExperience { bar, level, total } => {
+            out.f32(*bar);
+            out.i32(*level);
+            out.i32(*total);
+            34
+        }
+        E::UpdateMobEffect {
+            eid,
+            effect_id,
+            amplifier,
+            duration,
+            flags,
+        } => {
+            out.i32(*eid);
+            out.i32(*effect_id);
+            out.i32(*amplifier);
+            out.i32(*duration);
+            out.put(&[*flags]);
+            35
+        }
+        E::RemoveMobEffect { eid, effect_id } => {
+            out.i32(*eid);
+            out.i32(*effect_id);
+            36
+        }
+        E::SetActionBarText { nbt_bytes } => {
+            out.bytes(nbt_bytes);
+            37
+        }
+        E::SetTitleText { nbt_bytes } => {
+            out.bytes(nbt_bytes);
+            38
+        }
+        E::SetSubtitleText { nbt_bytes } => {
+            out.bytes(nbt_bytes);
+            39
+        }
+        E::BossEvent {
+            uuid,
+            action,
+            raw_payload,
+        } => {
+            out.put(uuid);
+            out.i32(*action);
+            out.bytes(raw_payload);
+            40
+        }
+        E::SetPassengers {
+            vehicle,
+            passengers,
+        } => {
+            out.i32(*vehicle);
+            let n = passengers.len().min(80);
+            out.put(&[n as u8]);
+            for id in passengers.iter().take(n) {
+                out.i32(*id);
+            }
+            41
+        }
+        E::TakeItemEntity {
+            item_entity,
+            player,
+            amount,
+        } => {
+            out.i32(*item_entity);
+            out.i32(*player);
+            out.i32(*amount);
+            42
+        }
+        E::SetCamera { eid } => {
+            out.i32(*eid);
+            43
+        }
+        E::PlayerChat {
+            sender,
+            index,
+            text,
+            nbt_bytes,
+            ..
+        } => {
+            out.put(sender);
+            out.i32(*index);
+            out.text(text);
+            out.bytes(nbt_bytes);
+            44
+        }
+        E::DisguisedChat { text, nbt_bytes } => {
+            out.text(text);
+            out.bytes(nbt_bytes);
+            45
+        }
+        E::Ping(id) => {
+            out.i32(*id);
+            46
+        }
+        E::BlockChangedAck(id) => {
+            out.i32(*id);
+            47
+        }
+        E::PlayerAbilities {
+            flags,
+            flying_speed,
+            walking_speed,
+        } => {
+            out.put(&[*flags]);
+            out.f32(*flying_speed);
+            out.f32(*walking_speed);
+            48
+        }
+        E::PlayerCombatKill {
+            player_id,
+            message_nbt,
+        } => {
+            out.i32(*player_id);
+            out.bytes(message_nbt);
+            49
+        }
+        E::Disconnect(reason) => {
+            out.text(reason);
+            50
+        }
+        E::Other(packet_id) => {
+            out.i32(*packet_id);
+            51
+        }
         _ => return None,
     };
     Some(out.finish(tag))
@@ -2472,8 +2891,7 @@ impl LiveSession {
                 return None;
             }
             let value = f64::from(value).floor();
-            (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX))
-                .then_some(value as i32)
+            (value >= f64::from(i32::MIN) && value <= f64::from(i32::MAX)).then_some(value as i32)
         }
 
         let (Some(x), Some(y), Some(z)) = (floor_i32(wx), floor_i32(wy), floor_i32(wz)) else {
@@ -2491,7 +2909,11 @@ impl LiveSession {
             .saturating_add(section_count.saturating_mul(16))
             .saturating_sub(1);
         let y = y.clamp(min_y, max_y);
-        let Some(column) = self.world.columns.get(&(x.div_euclid(16), z.div_euclid(16))) else {
+        let Some(column) = self
+            .world
+            .columns
+            .get(&(x.div_euclid(16), z.div_euclid(16)))
+        else {
             return (0, 15);
         };
         let section_index = y.div_euclid(16).saturating_sub(min_section_y) as usize;
@@ -3238,11 +3660,7 @@ impl LiveSession {
             if !intensity.is_finite() || intensity <= 0.0 {
                 return;
             }
-            let delta = [
-                pos[0] - camera[0],
-                pos[1] - camera[1],
-                pos[2] - camera[2],
-            ];
+            let delta = [pos[0] - camera[0], pos[1] - camera[1], pos[2] - camera[2]];
             candidates.push((
                 delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2],
                 DynamicColoredLight {
@@ -3280,11 +3698,9 @@ impl LiveSession {
                 let right = [-yaw.cos(), -yaw.sin()];
                 push(
                     [
-                        (pose.feet[0]
-                            + f64::from(0.35 * forward[0] + 0.25 * right[0])) as f32,
+                        (pose.feet[0] + f64::from(0.35 * forward[0] + 0.25 * right[0])) as f32,
                         (pose.feet[1] + 1.48) as f32,
-                        (pose.feet[2]
-                            + f64::from(0.35 * forward[1] + 0.25 * right[1])) as f32,
+                        (pose.feet[2] + f64::from(0.35 * forward[1] + 0.25 * right[1])) as f32,
                     ],
                     emitter,
                     0.0,
@@ -3358,9 +3774,7 @@ impl LiveSession {
         // signal components, resolved through the shared block emitter
         // resolver so modded lamps/conduits glow without a mod table.
         candidates.extend(self.placed_block_light_candidates(camera, tick_time_sec));
-        candidates.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(MAX_DYNAMIC_LIGHTS);
         candidates.into_iter().map(|(_, light)| light).collect()
     }
@@ -3477,8 +3891,7 @@ impl LiveSession {
                 for (sx, _) in placed_scan_axis(center[0]) {
                     section_revs[slot] = (
                         (sx, sy, sz),
-                        self.world
-                            .section_mesh_revision(SectionCoord(sx, sy, sz)),
+                        self.world.section_mesh_revision(SectionCoord(sx, sy, sz)),
                     );
                     slot += 1;
                 }
@@ -3553,8 +3966,7 @@ impl LiveSession {
                         // inside it a missing section reads `None`
                         // (skipped upstream), outside it reads the
                         // `Some(0)` air sentinel.
-                        let in_dim =
-                            i64::from(y) >= min_y && i64::from(y) < max_y;
+                        let in_dim = i64::from(y) >= min_y && i64::from(y) < max_y;
                         for lz in zs.clone() {
                             let z = sz.wrapping_mul(16).wrapping_add(lz);
                             for lx in xs.clone() {
@@ -3562,12 +3974,13 @@ impl LiveSession {
                                 let state = if in_dim {
                                     match source {
                                         PlacedSectionStates::Uniform(state) => state,
-                                        PlacedSectionStates::Dense(_) => dense
-                                            [section_index(
+                                        PlacedSectionStates::Dense(_) => {
+                                            dense[section_index(
                                                 lx as usize,
                                                 ly as usize,
                                                 lz as usize,
-                                            )],
+                                            )]
+                                        }
                                         PlacedSectionStates::Skip => unreachable!(),
                                     }
                                 } else {
@@ -3591,8 +4004,7 @@ impl LiveSession {
                                     } else {
                                         None
                                     };
-                                    emitter.local_origin =
-                                        torch_flame_world_offset(wall_facing);
+                                    emitter.local_origin = torch_flame_world_offset(wall_facing);
                                 }
                                 let pos = [
                                     x as f32 + emitter.local_origin[0],
@@ -3601,12 +4013,15 @@ impl LiveSession {
                                 ];
                                 // Position-keyed phase keeps neighbours
                                 // out of sync.
-                                let phase = (x.wrapping_mul(31)
-                                    ^ y.wrapping_mul(57)
-                                    ^ z.wrapping_mul(13))
-                                    as f32
-                                    * 0.618_034;
-                                entries.push(CachedPlacedLight { pos, emitter, phase });
+                                let phase =
+                                    (x.wrapping_mul(31) ^ y.wrapping_mul(57) ^ z.wrapping_mul(13))
+                                        as f32
+                                        * 0.618_034;
+                                entries.push(CachedPlacedLight {
+                                    pos,
+                                    emitter,
+                                    phase,
+                                });
                             }
                         }
                     }
@@ -5110,15 +5525,29 @@ impl LiveSession {
                 .is_ok()
     }
 
-    /// Queue beacon effect IDs (`0x2c`), preserving the protocol's optional
-    /// primary and secondary effect representation.
+    /// Queue beacon effect IDs (`0x2e` in Protocol 767), preserving the
+    /// protocol's optional primary and secondary effect representation.
     pub fn set_beacon(&self, primary: Option<i32>, secondary: Option<i32>) -> bool {
         self.outgoing
-            .try_send(WorkerCommand::SetBeacon {
-                primary,
-                secondary,
-            })
+            .try_send(WorkerCommand::SetBeacon { primary, secondary })
             .is_ok()
+    }
+
+    /// Dispatch one typed workstation action to its Protocol 767 packet
+    /// emitter. The UI remains responsible for producing a valid action;
+    /// each packet method still enforces its own wire bounds.
+    pub fn dispatch_workstation_action(
+        &self,
+        action: &megu_ui::container_screen::WorkstationAction,
+    ) -> bool {
+        use megu_ui::container_screen::WorkstationAction;
+        match action {
+            WorkstationAction::RenameItem(text) => self.rename_item(text),
+            WorkstationAction::SetBeacon { primary, secondary } => {
+                self.set_beacon(*primary, *secondary)
+            }
+            WorkstationAction::SelectTrade(index) => self.select_trade(*index),
+        }
     }
 
     /// Queue one crafter disabled-state transition (`0x10`). Only grid
@@ -5957,7 +6386,11 @@ impl LiveSession {
             let (vertices, indices) =
                 voxel_clouds_to_geometry_flagged(&cells, &lighting, material_flags);
             let mut entry = SubWorldRenderEntry::new(spec.id, transform, vertices, indices);
-            entry.alpha = if hybrid { spec.alpha } else { CLOUD_RENDER_ALPHA };
+            entry.alpha = if hybrid {
+                spec.alpha
+            } else {
+                CLOUD_RENDER_ALPHA
+            };
             self.subworlds.upsert(entry);
             self.cloud_deck_cache[deck] = CloudDeckCache {
                 mesh_key: Some(key),
@@ -6647,7 +7080,10 @@ impl LiveSession {
         if let ClientPlayEvent::Play(play) = &event {
             if let Some((tag, payload, len)) = compact_replay_event(play) {
                 self.replay_ring.push(
-                    self.replay_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                    self.replay_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
                     tag,
                     &payload[..len],
                 );
@@ -7023,8 +7459,7 @@ impl LiveSession {
                 }
             }
             PlayEvent::OpenSignEditor { pos, front_side } => {
-                self.pending_sign_editor =
-                    Some(((pos[0], pos[1], pos[2]), front_side));
+                self.pending_sign_editor = Some(((pos[0], pos[1], pos[2]), front_side));
             }
             PlayEvent::ContainerSetContent {
                 window_id,
@@ -8227,7 +8662,11 @@ fn encode_custom_payload_body(channel: &str, payload: &[u8]) -> Vec<u8> {
 }
 
 fn play_custom_payload_packet_id(protocol_number: i32) -> i32 {
-    if protocol_number == 777 { 0x16 } else { 0x12 }
+    if protocol_number == 777 {
+        0x16
+    } else {
+        0x12
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8369,10 +8808,7 @@ fn run_connection(
                 Ok(WorkerCommand::SelectTrade { index }) => {
                     client.send_select_trade(index)?;
                 }
-                Ok(WorkerCommand::SetBeacon {
-                    primary,
-                    secondary,
-                }) => {
+                Ok(WorkerCommand::SetBeacon { primary, secondary }) => {
                     client.send_set_beacon(primary, secondary)?;
                 }
                 Ok(WorkerCommand::ContainerSlotStateChanged {
@@ -8748,7 +9184,9 @@ pub fn discover_asset_layers(
             report.pack_sources.push(path.display().to_string());
         }
         for (path, err) in mod_report.rejected {
-            report.notes.push(format!("server mod JAR {} skipped: {err}", path.display()));
+            report
+                .notes
+                .push(format!("server mod JAR {} skipped: {err}", path.display()));
         }
         layers.extend(mod_layers);
     }
@@ -8941,9 +9379,7 @@ pub(crate) fn encode_sign_update_payload(
     lines: &[String; 4],
 ) -> Vec<u8> {
     let mut payload = Vec::with_capacity(9 + 5 + 4 * 5);
-    payload.extend_from_slice(
-        &pack_position([pos.0, pos.1, pos.2]).to_be_bytes(),
-    );
+    payload.extend_from_slice(&pack_position([pos.0, pos.1, pos.2]).to_be_bytes());
     payload.push(u8::from(is_front));
     for line in lines {
         write_string(&mut payload, line);
@@ -9187,22 +9623,22 @@ fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Camera;
     use crate::renderer::{
-        GpuRenderer, OFFSCREEN_FORMAT, RendererError, probe_adapters, request_gpu_device,
-        section_geometry,
+        probe_adapters, request_gpu_device, section_geometry, GpuRenderer, RendererError,
+        OFFSCREEN_FORMAT,
     };
+    use crate::Camera;
     use megu_client::protocol::{
-        CHANNEL_ANIM_V1, CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1,
-        DecodedMotionPhase, EquipmentEntry, SSN1_MAGIC, SSN1_VERSION, WireReader,
         decode_chunk_packet, decode_custom_payload_packet, decode_packet_body, encode_packet,
-        write_varint,
+        write_varint, DecodedMotionPhase, EquipmentEntry, WireReader, CHANNEL_ANIM_V1,
+        CHANNEL_MAGIC_V1, CHANNEL_MOTION_V1, CHANNEL_SEASON_V1, CHANNEL_VFX_V1, SSN1_MAGIC,
+        SSN1_VERSION,
     };
-    use megu_client_mesh::RenderBackendPreference;
     use megu_client_mesh::tactile_effects::{FluidEntryBody, TactileParticleKind, TactilePreset};
     use megu_client_mesh::vanilla_plus_nature::{ActiveSeasonKind, NatureParticleKind};
     use megu_client_mesh::vfx_engine::{DynamicColoredLight, Vfx1Packet, VfxCommand};
-    use megu_kernel::skeletal_anim::{AnimationTrigger, LoopMode, encode_animation_trigger};
+    use megu_client_mesh::RenderBackendPreference;
+    use megu_kernel::skeletal_anim::{encode_animation_trigger, AnimationTrigger, LoopMode};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
 
@@ -9219,19 +9655,53 @@ mod tests {
         let mut live = LiveSession::with_channels(incoming, outgoing);
         drop(incoming_tx);
 
-        assert!(live.rename_item("Repairable tool"));
-        assert!(live.select_trade(2));
+        assert!(live.dispatch_workstation_action(
+            &megu_ui::container_screen::WorkstationAction::RenameItem("Repairable tool".into())
+        ));
+        assert!(live.dispatch_workstation_action(
+            &megu_ui::container_screen::WorkstationAction::SelectTrade(2)
+        ));
         assert!(!live.select_trade(-1));
-        assert!(live.set_beacon(Some(5), Some(12)));
+        assert!(live.dispatch_workstation_action(
+            &megu_ui::container_screen::WorkstationAction::SetBeacon {
+                primary: Some(5),
+                secondary: Some(12),
+            }
+        ));
         assert_eq!(live.toggle_crafter_slot(4, 8), Some(true));
         assert_eq!(live.toggle_crafter_slot(4, 8), Some(false));
         assert_eq!(live.toggle_crafter_slot(4, 9), None);
 
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::RenameItem(name) if name == "Repairable tool"));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::SelectTrade { index: 2 }));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::SetBeacon { primary: Some(5), secondary: Some(12) }));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::ContainerSlotStateChanged { slot_id: 8, window_id: 4, state: true }));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::ContainerSlotStateChanged { slot_id: 8, window_id: 4, state: false }));
+        assert!(
+            matches!(rx.recv().unwrap(), WorkerCommand::RenameItem(name) if name == "Repairable tool")
+        );
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::SelectTrade { index: 2 }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::SetBeacon {
+                primary: Some(5),
+                secondary: Some(12)
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::ContainerSlotStateChanged {
+                slot_id: 8,
+                window_id: 4,
+                state: true
+            }
+        ));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            WorkerCommand::ContainerSlotStateChanged {
+                slot_id: 8,
+                window_id: 4,
+                state: false
+            }
+        ));
         assert!(rx.try_recv().is_err());
     }
 
@@ -9240,7 +9710,10 @@ mod tests {
         let (mut live, _) = session();
         assert_eq!(live.sample_block_and_sky_light(-0.2, -64.0, -16.1), (0, 15));
         assert_eq!(live.sample_block_and_sky_light(0.0, f32::NAN, 0.0), (0, 15));
-        assert_eq!(live.sample_block_and_sky_light(0.0, f32::INFINITY, 0.0), (0, 15));
+        assert_eq!(
+            live.sample_block_and_sky_light(0.0, f32::INFINITY, 0.0),
+            (0, 15)
+        );
         let chunk = decode_chunk_packet(&decoded_frame(0x27, &stone_chunk()), 24, 64).unwrap();
         live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
             .unwrap();
@@ -9257,20 +9730,38 @@ mod tests {
         sw6d.push(1);
         sw6d.extend_from_slice(&1u16.to_be_bytes());
         sw6d.extend_from_slice(&77u64.to_be_bytes());
-        for value in [4.0f64, 5.0, 6.0] { sw6d.extend_from_slice(&value.to_be_bytes()); }
-        for value in [0.0f32, 0.0, 0.0, 1.0] { sw6d.extend_from_slice(&value.to_be_bytes()); }
-        for _ in 0..6 { sw6d.extend_from_slice(&0.0f32.to_be_bytes()); }
+        for value in [4.0f64, 5.0, 6.0] {
+            sw6d.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in [0.0f32, 0.0, 0.0, 1.0] {
+            sw6d.extend_from_slice(&value.to_be_bytes());
+        }
+        for _ in 0..6 {
+            sw6d.extend_from_slice(&0.0f32.to_be_bytes());
+        }
         sw6d.push(0);
-        live.apply_event(framed(SUBWORLD_SYNC_CHANNEL, &sw6d)).unwrap();
-        assert_eq!(live.subworlds.get(77).unwrap().transform.position, [4.0, 5.0, 6.0]);
+        live.apply_event(framed(SUBWORLD_SYNC_CHANNEL, &sw6d))
+            .unwrap();
+        assert_eq!(
+            live.subworlds.get(77).unwrap().transform.position,
+            [4.0, 5.0, 6.0]
+        );
 
-        let cmd = SubWorldHelmCmd { subworld_id: 77, throttle: 0.25, ..Default::default() };
+        let cmd = SubWorldHelmCmd {
+            subworld_id: 77,
+            throttle: 0.25,
+            ..Default::default()
+        };
         assert!(live.send_subworld_helm(&cmd));
-        let WorkerCommand::SendCustomPayload { channel, payload } = outgoing_rx.recv().unwrap() else {
+        let WorkerCommand::SendCustomPayload { channel, payload } = outgoing_rx.recv().unwrap()
+        else {
             panic!("helm helper must enqueue a custom payload")
         };
         assert_eq!(channel, SUBWORLD_HELM_CHANNEL);
-        assert_eq!(crate::subworld_sync::decode_helm_cmd(&payload).unwrap(), cmd);
+        assert_eq!(
+            crate::subworld_sync::decode_helm_cmd(&payload).unwrap(),
+            cmd
+        );
         let wire = encode_custom_payload_body(&channel, &payload);
         assert!(wire.ends_with(&payload));
         assert_eq!(play_custom_payload_packet_id(767), 0x12);
@@ -9434,7 +9925,11 @@ mod tests {
             state_id: 0x1234,
         }))
         .unwrap();
-        let frame = live.replay_ring.frames().back().expect("captured play event");
+        let frame = live
+            .replay_ring
+            .frames()
+            .back()
+            .expect("captured play event");
         assert_eq!(frame.packet_id, 0x4d52_0009);
         assert_eq!(frame.payload.len(), 16);
         assert_eq!(&frame.payload[0..4], &12i32.to_le_bytes());
@@ -9740,8 +10235,13 @@ mod tests {
 
             let mut keep_alive = false;
             let mut accepted_teleport = false;
-            for _ in 0..8 {
+            let mut renamed = false;
+            let mut beacon_set = false;
+            let mut trade_selected = false;
+            let mut received_ids = Vec::new();
+            for _ in 0..32 {
                 let (packet_id, body) = read_loopback_frame(&mut socket);
+                received_ids.push(packet_id);
                 if packet_id == 0x18 {
                     assert_eq!(body, 29i64.to_be_bytes());
                     keep_alive = true;
@@ -9750,13 +10250,30 @@ mod tests {
                     assert_eq!(WireReader::new(&body).read_varint().unwrap(), 3);
                     accepted_teleport = true;
                 }
-                if keep_alive && accepted_teleport {
+                if packet_id == 0x2a {
+                    assert_eq!(body, vec![1, b'M']);
+                    renamed = true;
+                }
+                if packet_id == 0x2e {
+                    assert_eq!(body, vec![1, 5, 1, 12]);
+                    beacon_set = true;
+                }
+                if packet_id == 0x2d {
+                    assert_eq!(body, vec![2]);
+                    trade_selected = true;
+                }
+                if keep_alive
+                    && accepted_teleport
+                    && renamed
+                    && beacon_set
+                    && trade_selected
+                {
                     break;
                 }
             }
             assert!(
-                keep_alive && accepted_teleport,
-                "server must receive play acknowledgments"
+                keep_alive && accepted_teleport && renamed && beacon_set && trade_selected,
+                "server must receive play acknowledgments and all workstation packet bodies; got {received_ids:?}"
             );
             done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
@@ -9788,6 +10305,16 @@ mod tests {
             "TCP ANM1 should reach animation host"
         );
         assert_eq!(live.camera_sync.unwrap().feet, [8.0, 64.0, 30.0]);
+        for action in [
+            megu_ui::container_screen::WorkstationAction::RenameItem("M".to_owned()),
+            megu_ui::container_screen::WorkstationAction::SetBeacon {
+                primary: Some(5),
+                secondary: Some(12),
+            },
+            megu_ui::container_screen::WorkstationAction::SelectTrade(2),
+        ] {
+            assert!(live.dispatch_workstation_action(&action));
+        }
         done_tx.send(()).unwrap();
         server.join().unwrap();
         let mesh = live.world.packed_meshes().next().expect("TCP chunk mesh");
@@ -9795,9 +10322,9 @@ mod tests {
             mesh.1,
             live.world.translucent_order(mesh.0).unwrap_or(&[]),
             [
-                mesh.0.0 as f32 * 16.0,
-                mesh.0.1 as f32 * 16.0,
-                mesh.0.2 as f32 * 16.0,
+                mesh.0 .0 as f32 * 16.0,
+                mesh.0 .1 as f32 * 16.0,
+                mesh.0 .2 as f32 * 16.0,
             ],
         );
         assert!(!geometry.opaque.is_empty());
@@ -10346,9 +10873,9 @@ mod tests {
             mesh.1,
             live.world.translucent_order(mesh.0).unwrap_or(&[]),
             [
-                mesh.0.0 as f32 * 16.0,
-                mesh.0.1 as f32 * 16.0,
-                mesh.0.2 as f32 * 16.0,
+                mesh.0 .0 as f32 * 16.0,
+                mesh.0 .1 as f32 * 16.0,
+                mesh.0 .2 as f32 * 16.0,
             ],
         );
         assert!(!geometry.opaque.is_empty());
@@ -10706,7 +11233,8 @@ mod tests {
         live.apply_event(ClientPlayEvent::Play(PlayEvent::BossEvent {
             uuid,
             action: 0,
-            raw_payload: vec![1, 2, 3],
+            // Anonymous empty string name, zero progress/style, and no flags.
+            raw_payload: vec![8, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         }))
         .unwrap();
         assert_eq!(live.boss_bars[&uuid].action, 0);
@@ -10979,11 +11507,9 @@ mod tests {
                 "dig status {status} missing"
             );
         }
-        assert!(
-            commands
-                .iter()
-                .any(|c| matches!(c, WorkerCommand::SetCarriedItem { slot: 4 }))
-        );
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::SetCarriedItem { slot: 4 })));
         for action in [0, 3] {
             assert!(commands.iter().any(|c| matches!(
                 c,
@@ -10994,21 +11520,15 @@ mod tests {
                 } if *a == action
             )));
         }
-        assert!(
-            commands
-                .iter()
-                .any(|c| matches!(c, WorkerCommand::UseItem { .. }))
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|c| matches!(c, WorkerCommand::UseItemOn { .. }))
-        );
-        assert!(
-            commands
-                .iter()
-                .any(|c| matches!(c, WorkerCommand::Swing { hand: 0 }))
-        );
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::UseItem { .. })));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::UseItemOn { .. })));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, WorkerCommand::Swing { hand: 0 })));
 
         // Movement carries the sneak bit through to `player_input`.
         live.send_movement(PlayerMovement {
@@ -11231,13 +11751,12 @@ mod tests {
             vz: 0.0,
         }))
         .unwrap();
-        assert!(
-            live.world
-                .animations
-                .evaluate_entity_pose(10)
-                .unwrap()
-                .is_some()
-        );
+        assert!(live
+            .world
+            .animations
+            .evaluate_entity_pose(10)
+            .unwrap()
+            .is_some());
         // An entity with no registered CEM model stays unbound.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::AddEntity {
             eid: 11,
@@ -11255,13 +11774,12 @@ mod tests {
             vz: 0.0,
         }))
         .unwrap();
-        assert!(
-            live.world
-                .animations
-                .evaluate_entity_pose(11)
-                .unwrap()
-                .is_none()
-        );
+        assert!(live
+            .world
+            .animations
+            .evaluate_entity_pose(11)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -11384,10 +11902,9 @@ mod tests {
         // nor physics prediction advance.
         live.send_movement(move_cmd([1.0, 64.0, 3.0]));
         assert!(rx.try_recv().is_err(), "dead player must not move");
-        assert!(
-            live.predict_movement(0.0, 1.0, false, false, false, 0.0, 0.0)
-                .is_none()
-        );
+        assert!(live
+            .predict_movement(0.0, 1.0, false, false, false, 0.0, 0.0)
+            .is_none());
 
         // The kill packet enriches the snapshot with the death message.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::PlayerCombatKill {
@@ -12069,6 +12586,10 @@ mod tests {
     #[test]
     fn world_feedback_events_route_to_queues_and_sound() {
         let (mut live, _tx) = session();
+        let particle_data = [0.2f32, 0.8, 0.4, 1.0]
+            .into_iter()
+            .flat_map(f32::to_be_bytes)
+            .collect();
         live.apply_event(ClientPlayEvent::Play(PlayEvent::LevelEvent {
             event: 1006,
             pos: [1, 64, 2],
@@ -12098,7 +12619,7 @@ mod tests {
             offset_z: 0.0,
             max_speed: 0.0,
             count: 4,
-            particle_data: Vec::new(),
+            particle_data,
         }))
         .unwrap();
         assert_eq!(live.world.level_particles.len(), 1);
@@ -12165,10 +12686,7 @@ mod tests {
             front_side: true,
         }))
         .unwrap();
-        assert_eq!(
-            live.take_pending_sign_editor(),
-            Some(((10, 64, -20), true))
-        );
+        assert_eq!(live.take_pending_sign_editor(), Some(((10, 64, -20), true)));
         assert_eq!(live.take_pending_sign_editor(), None);
     }
 
@@ -12180,10 +12698,7 @@ mod tests {
             front_side: false,
         }))
         .unwrap();
-        assert_eq!(
-            live.take_pending_sign_editor(),
-            Some(((-3, 70, 42), false))
-        );
+        assert_eq!(live.take_pending_sign_editor(), Some(((-3, 70, 42), false)));
     }
 
     #[test]
@@ -12268,7 +12783,6 @@ mod tests {
         }
     }
 
-
     // ------------------------------------------------------------------
     // REALISM-DYNAMIC-LIGHTS-LIVE
     // ------------------------------------------------------------------
@@ -12276,8 +12790,7 @@ mod tests {
     fn item_id(name: &str) -> i32 {
         megu_proto::table::ProtocolTable::v767_builtin()
             .registry_id("minecraft:item", name)
-            .unwrap_or_else(|| panic!("builtin item table must know {name}"))
-            as i32
+            .unwrap_or_else(|| panic!("builtin item table must know {name}")) as i32
     }
 
     fn stack(item_id: i32) -> ItemStackComponents {
@@ -12403,7 +12916,11 @@ mod tests {
         let lights = live.collect_dynamic_lights([8.0, 64.0, 8.0]);
         assert_eq!(lights.len(), 1);
         assert_eq!(lights[0].rgb[0], 1.0);
-        assert!(lights[0].rgb[2] < 0.2, "lava stays golden: {:?}", lights[0].rgb);
+        assert!(
+            lights[0].rgb[2] < 0.2,
+            "lava stays golden: {:?}",
+            lights[0].rgb
+        );
         assert_eq!(lights[0].radius, 15.0);
     }
 
@@ -12446,23 +12963,15 @@ mod tests {
         // player (dist² ~72.8) sorts last.
         assert_eq!(lights[3].pos, [6.0, 64.9, 6.0]);
         assert!(
-            lights
-                .iter()
-                .any(|l| l.rgb[0] == 1.0 && l.rgb[2] < 0.2),
+            lights.iter().any(|l| l.rgb[0] == 1.0 && l.rgb[2] < 0.2),
             "blaze must glow magma-gold: {lights:?}"
         );
         assert!(
-            lights
-                .iter()
-                .any(|l| l.rgb[1] == 1.0 && l.rgb[0] < 1.0),
+            lights.iter().any(|l| l.rgb[1] == 1.0 && l.rgb[0] < 1.0),
             "glow squid must emit its phosphor tint: {lights:?}"
         );
         assert!(
-            lights
-                .iter()
-                .filter(|l| l.rgb == [1.0, 0.62, 0.22])
-                .count()
-                == 2,
+            lights.iter().filter(|l| l.rgb == [1.0, 0.62, 0.22]).count() == 2,
             "dropped + remote-held torches: {lights:?}"
         );
 
@@ -12498,12 +13007,7 @@ mod tests {
         live.vanilla_plus_cfg.nature.enabled = true;
         // 80 blazes receding along +X from the camera.
         for index in 0..80 {
-            add_entity(
-                &mut live,
-                1000 + index,
-                8,
-                [(index + 1) as f64, 64.0, 0.0],
-            );
+            add_entity(&mut live, 1000 + index, 8, [(index + 1) as f64, 64.0, 0.0]);
         }
         let lights = live.collect_dynamic_lights([0.0, 64.0, 0.0]);
         assert_eq!(lights.len(), MAX_DYNAMIC_LIGHTS);
@@ -12546,8 +13050,7 @@ mod tests {
         row(SOLID, 0xff, 0x3f); // 4 lamp lit, luminance 15
         row(FLUID_EMPTY, 0x00, 0x00); // 5 redstone wire
         row(FLUID_EMPTY, 0xf0, 0x00); // 6 modded lantern, luminance 15
-        megu_kernel::Registry::from_parts(blocks, None, &facts)
-            .expect("synthetic pack must parse")
+        megu_kernel::Registry::from_parts(blocks, None, &facts).expect("synthetic pack must parse")
     }
 
     /// Empty 24-section air column at `(0, 0)` bound to `state_count`
@@ -12803,9 +13306,8 @@ mod tests {
                         cells.insert(s * 16 + l);
                     }
                 }
-                let expect: BTreeSet<i32> = (c - PLACED_LIGHT_SCAN_RADIUS
-                    ..=c + PLACED_LIGHT_SCAN_RADIUS)
-                    .collect();
+                let expect: BTreeSet<i32> =
+                    (c - PLACED_LIGHT_SCAN_RADIUS..=c + PLACED_LIGHT_SCAN_RADIUS).collect();
                 assert_eq!(cells, expect, "axis coverage for c={c}");
             }
         }
@@ -12835,8 +13337,7 @@ mod tests {
         {
             use megu_client::world::StoredSection;
             let floor: StoredSection = StoredSection {
-                palette: megu_kernel::PalettedSection::new_single_bounded(5, state_count)
-                    .unwrap(),
+                palette: megu_kernel::PalettedSection::new_single_bounded(5, state_count).unwrap(),
                 block_light: [0; megu_client_mesh::LIGHT_BYTES],
                 sky_light: [0x00; megu_client_mesh::LIGHT_BYTES],
                 biomes: [0; 64],
@@ -12892,10 +13393,12 @@ mod tests {
     fn enchanted_item_glint_modulates_3d_quad_tint() {
         let (live, _tx) = session();
         let mut enchanted = stack(item_id("minecraft:diamond_sword"));
-        enchanted.added.push(megu_client::protocol::ItemComponentPatch {
-            type_id: 9, // minecraft:enchantments
-            data: vec![1, 0x1d, 0x05, 0x00],
-        });
+        enchanted
+            .added
+            .push(megu_client::protocol::ItemComponentPatch {
+                type_id: 9, // minecraft:enchantments
+                data: vec![1, 0x1d, 0x05, 0x00],
+            });
         let plain = stack(item_id("minecraft:diamond_sword"));
 
         assert!(item_stack_has_glint(&enchanted));
@@ -12910,7 +13413,10 @@ mod tests {
         // The shimmer stays a subtle violet-lavender highlight.
         assert!(glinted[2] >= glinted[1], "glint stays violet: {glinted:?}");
         // Non-enchanted stacks pass the base tint through untouched.
-        assert_eq!(live.enchanted_item_quad_tint(&plain, base, [0.0, 0.0]), base);
+        assert_eq!(
+            live.enchanted_item_quad_tint(&plain, base, [0.0, 0.0]),
+            base
+        );
     }
 
     #[test]

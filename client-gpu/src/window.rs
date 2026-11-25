@@ -6,24 +6,24 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::live_session::LiveHudFeed;
 use megu_client::audio_qol::{
-    DEFAULT_ZOOM_SMOOTHING_RATE, ToolDurability, ZoomState, check_tool_durability_warning,
+    check_tool_durability_warning, ToolDurability, ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE,
 };
 use megu_client::friend_client::{FriendGuestBridge, FriendHostEvent, FriendHostSession};
 use megu_client::friends_store::{
-    FriendShareMode as StoreShareMode, FriendsStore, load_or_create_identity,
+    load_or_create_identity, FriendShareMode as StoreShareMode, FriendsStore,
 };
 use megu_client::integrated;
 use megu_client::protocol::{
-    ItemComponentPatch, ItemStackComponents, NbtValue, WireReader, encode_slot_stack,
+    encode_slot_stack, ItemComponentPatch, ItemStackComponents, NbtValue, WireReader,
 };
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
-use megu_client::settings::CloudMode;
 use megu_client::server_list::{ServerEntry, ServerListStore};
+use megu_client::settings::CloudMode;
 use megu_client::settings::{
     ClientSettings, CrashReportMode as ClientCrashReportMode, DistantHorizon, HostMinimapMode,
     HostPlayerRadarScope, QualityPreset,
@@ -31,17 +31,19 @@ use megu_client::settings::{
 use megu_client::spatial_audio::SpatialAudioPreset;
 use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
-use megu_client_mesh::ChunkUploadBudget;
 use megu_client_mesh::ber_instancing::{
-    VanillaBerFacing, VanillaBerKind, VanillaBerState, VanillaParticleQuad, VanillaParticleWorld,
-    build_ber_mesh,
+    build_ber_mesh, build_extended_ber_mesh, BerBellMount, BerChestKind, BerDyeColor,
+    VanillaBerExtendedState, VanillaBerFacing, VanillaBerKind,
+    VanillaBerState, VanillaParticlePayload, VanillaParticleQuad, VanillaParticleWorld,
 };
 use megu_client_mesh::builtin_shadow_wgsl::{
-    BuiltinShadowQuality, RenderScalePreset, enchantment_glint_rgb,
+    enchantment_glint_rgb, BuiltinShadowQuality, RenderScalePreset,
 };
+#[cfg(test)]
+use megu_client_mesh::entity_rig::build_entity_rig_mesh_with_mouth_item;
 use megu_client_mesh::entity_rig::{
-    EntityPose, EntityRigSpec, build_entity_rig_mesh_with_mouth_item,
-    classify_entity_rig_or_fallback,
+    build_entity_rig_mesh_with_pose, classify_entity_rig_or_fallback, EntityPose, EntityRigPose,
+    EntityRigSpec,
 };
 use megu_client_mesh::mesher::classify_vanilla_ber;
 use megu_client_mesh::tactile_effects::{
@@ -50,38 +52,39 @@ use megu_client_mesh::tactile_effects::{
 use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
-use megu_core::hash::{FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, Fnv1a64};
-use megu_core::sys_metrics::{CpuSampler, HostMetricsSnapshot, sample_host_metrics};
+use megu_client_mesh::ChunkUploadBudget;
+use megu_core::hash::{Fnv1a64, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME};
+use megu_core::sys_metrics::{sample_host_metrics, CpuSampler, HostMetricsSnapshot};
 use megu_kernel::debug_chords::{
-    DebugChordAction, DebugChordContext, DebugChordState, DebugLine, DebugTarget, F3Chord,
-    PlayerDebugInfo, finish_gamemode_switcher, handle_f3_chord,
+    finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
+    DebugChordState, DebugLine, DebugTarget, F3Chord, PlayerDebugInfo,
+};
+use megu_proto::frl_e2ee::{parse_friend_id, FriendAllowlist, Frl3GuestToken, Frl3Identity};
+use megu_proto::seamless_portal::{
+    decode_seamless_portal_packet, SeamlessDimTransitionState, SeamlessPortalPacket,
+    SEAMLESS_PORTAL_CHANNEL,
 };
 use megu_ui::container_screen::{
-    ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
-    UiItemStack, menu_schema,
+    menu_schema, ContainerScreenState, DragState, InventorySortState, MenuScreenSchema,
+    MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction,
 };
 use megu_ui::draw::tessellate_draw_list;
-use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
-use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
+use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
+use megu_ui::gui_bridge::{lower_bridge_batch_to_draw_cmds, GuiBridgeBatch};
 use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
-use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::magic_hud::build_magic_hud_draw_list;
+use megu_ui::magic_hud::LookingAtBlockState;
 use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
-use megu_proto::frl_e2ee::{FriendAllowlist, Frl3GuestToken, Frl3Identity, parse_friend_id};
-use megu_proto::seamless_portal::{
-    SEAMLESS_PORTAL_CHANNEL, SeamlessDimTransitionState, SeamlessPortalPacket,
-    decode_seamless_portal_packet,
-};
 use megu_ui::sign_and_chat::SignEditorState;
+use megu_ui::state::{invite_code_display, tr, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
     FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
     MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen, SettingsTab,
     UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
 };
-use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display, tr};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
@@ -93,21 +96,19 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
-use crate::atmosphere::{
-    BiomeAtmosphereBlender, ChunkFadeTracker, blend_dimension_crossfade,
-};
+use crate::atmosphere::{blend_dimension_crossfade, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
 use crate::live_session::{
-    CLOUD_SUBWORLD_ID, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
-    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, jar_version_ids,
+    jar_version_ids, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
+    PlayerMovement, PlayerPose, SessionPaths, SessionStatus, CLOUD_SUBWORLD_ID,
 };
-use crate::renderer::{GpuRenderer, request_gpu_device};
+use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::subworld_sync::SubWorldHelmCmd;
-use crate::title_branding::{TitleBrandingAssets, title_branding_sources};
+use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
 use crate::{
-    Camera, DisplayPresentationPolicy, GpuCliConfig, MoveInput, build_demo_scene,
-    detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode, present_mode_for,
-    select_display_presentation_policy,
+    build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
+    present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
+    GpuCliConfig, MoveInput,
 };
 
 /// Window title.
@@ -153,6 +154,69 @@ const FRIEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// doubles as the worker's event poll, so allowlist refreshes (friend
 /// removal kicks) apply within about this window.
 const FRIEND_SHARE_TIMEOUT: Duration = Duration::from_secs(3);
+
+fn merchant_offer_views(
+    offers: &[megu_client::protocol::MerchantOfferEntry],
+) -> Vec<MerchantOfferView> {
+    offers
+        .iter()
+        .map(|offer| {
+            let item_name = |id: i64| {
+                crate::recipe_ingest::item_name_for_id(u32::try_from(id).unwrap_or_default())
+            };
+            let base_cost = offer.cost_a.count.max(1) as f32;
+            let adjustment = (base_cost * offer.demand as f32 * offer.price_multiplier).floor();
+            let effective = (base_cost + adjustment + offer.special_price as f32)
+                .floor()
+                .max(1.0)
+                .min(u32::MAX as f32) as u32;
+            let output = (|| {
+                let mut reader = WireReader::new(&offer.result_slot_wire);
+                if !reader.read_bool().ok()? {
+                    return None;
+                }
+                let item = reader.read_varint().ok()?;
+                let count = reader.read_i8().ok()?;
+                (count > 0).then(|| item_name(i64::from(item)))
+            })()
+            .unwrap_or_else(|| "minecraft:air".to_owned());
+            MerchantOfferView {
+                input1: item_name(offer.cost_a.item),
+                input2: offer.cost_b.as_ref().map(|cost| item_name(cost.item)),
+                output,
+                original_cost: offer.cost_a.count.max(0) as u32,
+                effective_cost: effective,
+                uses: offer.uses.max(0) as u32,
+                max_uses: offer.max_uses.max(0) as u32,
+                out_of_stock: offer.disabled || offer.uses >= offer.max_uses,
+            }
+        })
+        .collect()
+}
+
+fn merchant_signature(offers: &[megu_client::protocol::MerchantOfferEntry]) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    let mut mix = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    };
+    for offer in offers {
+        mix(offer.cost_a.item as u64);
+        mix(offer.cost_a.count as u64);
+        mix(offer.cost_b.as_ref().map_or(0, |cost| cost.item as u64));
+        mix(offer.cost_b.as_ref().map_or(0, |cost| cost.count as u64));
+        mix(offer.uses as u64);
+        mix(offer.max_uses as u64);
+        mix(offer.special_price as u64);
+        mix(offer.demand as u64);
+        mix(offer.price_multiplier.to_bits() as u64);
+        mix(u64::from(offer.disabled));
+        for byte in &offer.result_slot_wire {
+            mix(u64::from(*byte));
+        }
+    }
+    hash
+}
 
 /// Vanilla's chat length cap — paste and IME feeds into the chat bar
 /// stop at this many characters.
@@ -787,8 +851,13 @@ impl RainWetnessRamp {
                 self.elapsed = 0.0;
                 self.was_raining = false;
             }
-            self.elapsed = (self.elapsed + if dt.is_finite() { dt.clamp(0.0, 1.0) } else { 0.0 })
-                .min(20.0);
+            self.elapsed = (self.elapsed
+                + if dt.is_finite() {
+                    dt.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                })
+            .min(20.0);
             let t = self.elapsed / 20.0;
             let eased = t * t * (3.0 - 2.0 * t);
             self.wetness = self.dry_start * (1.0 - eased);
@@ -833,6 +902,8 @@ pub struct GpuApp {
     mouse_pos: (i32, i32),
     left_mouse_held: bool,
     container_screen: Option<ContainerScreenState>,
+    merchant_offer_signature: Option<(u8, u64)>,
+    vanilla_particles: VanillaParticleWorld,
     /// `container_screen` currently holds the client-side window-0 player
     /// inventory opened by `E` (not a server `open_screen`).
     own_inventory_open: bool,
@@ -1094,6 +1165,10 @@ struct LiveEntityRenderCache {
     /// Pose-fingerprint-keyed rig meshes; rebuilt only when an entity's
     /// spec or pose actually changes.
     entity_meshes: std::collections::HashMap<i32, (u64, ExtrudedMesh)>,
+    entity_interpolation: std::collections::HashMap<i32, EntityInterpolation>,
+    dynamic_ber_meshes:
+        std::collections::HashMap<[i32; 3], (VanillaBerExtendedState, ExtrudedMesh)>,
+    ber_animation_easing: std::collections::HashMap<[i32; 3], f32>,
     /// Canonical template per [`VanillaBerKind`] — the default states are
     /// per-kind constants, so every placed block entity of a family
     /// shares one mesh.
@@ -1113,12 +1188,83 @@ impl Default for LiveEntityRenderCache {
     fn default() -> Self {
         Self {
             entity_meshes: std::collections::HashMap::new(),
+            entity_interpolation: std::collections::HashMap::new(),
+            dynamic_ber_meshes: std::collections::HashMap::new(),
+            ber_animation_easing: std::collections::HashMap::new(),
             ber_meshes: std::array::from_fn(|_| None),
             contact_shadow_quads: Vec::new(),
             next_refresh: None,
             staged: false,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EntityInterpolation {
+    initialized: bool,
+    position: [f64; 3],
+    target_position: [f64; 3],
+    body_yaw: f32,
+    head_yaw: f32,
+    pitch: f32,
+    hurt_ticks: f32,
+    limb_swing: f32,
+    limb_swing_amount: f32,
+}
+
+fn interpolate_angle(current: f32, target: f32, amount: f32) -> f32 {
+    let delta = (target - current + 180.0).rem_euclid(360.0) - 180.0;
+    (current + delta * amount).rem_euclid(360.0)
+}
+
+fn interpolate_entity(
+    cache: &mut LiveEntityRenderCache,
+    eid: i32,
+    target_position: [f64; 3],
+    tracked: Option<&TrackedEntity>,
+) -> EntityInterpolation {
+    let sample = cache.entity_interpolation.entry(eid).or_default();
+    let target_limb_swing_amount = tracked.map_or(0.0, |entity| {
+        let speed = entity.vel[0].hypot(entity.vel[2]);
+        if speed.is_finite() {
+            (speed as f32 * 4.0).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    });
+    let target = EntityInterpolation {
+        initialized: true,
+        position: target_position,
+        target_position,
+        body_yaw: tracked.map_or(0.0, |entity| entity.yaw_deg),
+        head_yaw: tracked.map_or(0.0, |entity| entity.head_yaw_deg),
+        pitch: tracked.map_or(0.0, |entity| entity.pitch_deg),
+        hurt_ticks: tracked.map_or(0.0, |entity| f32::from(entity.hurt_ticks)),
+        limb_swing: sample.limb_swing,
+        limb_swing_amount: target_limb_swing_amount,
+    };
+    if !sample.initialized {
+        *sample = target;
+    } else {
+        let dx = target_position[0] - sample.target_position[0];
+        let dz = target_position[2] - sample.target_position[2];
+        let stride = dx.hypot(dz);
+        if stride.is_finite() {
+            sample.limb_swing =
+                (sample.limb_swing + stride as f32 * 4.0).rem_euclid(std::f32::consts::TAU);
+        }
+        sample.target_position = target_position;
+        for axis in 0..3 {
+            sample.position[axis] += (target.position[axis] - sample.position[axis]) * 0.5;
+        }
+        sample.body_yaw = interpolate_angle(sample.body_yaw, target.body_yaw, 0.5);
+        sample.head_yaw = interpolate_angle(sample.head_yaw, target.head_yaw, 0.5);
+        sample.pitch += (target.pitch - sample.pitch) * 0.5;
+        sample.hurt_ticks += (target.hurt_ticks - sample.hurt_ticks) * 0.5;
+        sample.limb_swing_amount +=
+            (target.limb_swing_amount - sample.limb_swing_amount) * 0.5;
+    }
+    *sample
 }
 
 /// Milliseconds between host-RAM guard samples (~2 Hz — cheap enough to
@@ -1324,6 +1470,8 @@ impl GpuApp {
             mouse_pos: (0, 0),
             left_mouse_held: false,
             container_screen: None,
+            merchant_offer_signature: None,
+            vanilla_particles: VanillaParticleWorld::new(),
             own_inventory_open: false,
             advancements_open: false,
             chat_bar: None,
@@ -1739,10 +1887,7 @@ impl GpuApp {
     /// every render by `vanilla_widgets::draw_mod_ui_manifest_sprites`
     /// (title-screen overlay attempts are rejected upstream by
     /// `audit_manifest`), so the host can hand it straight through.
-    pub fn set_mod_ui_manifest(
-        &mut self,
-        manifest: Option<megu_core::ui_contract::ModUiManifest>,
-    ) {
+    pub fn set_mod_ui_manifest(&mut self, manifest: Option<megu_core::ui_contract::ModUiManifest>) {
         self.mod_ui_manifest = manifest;
     }
 
@@ -1919,6 +2064,15 @@ impl GpuApp {
         cache.entity_meshes.retain(|eid, _| {
             live.entity_rig(*eid).is_some() || live.world.entities.contains_key(eid)
         });
+        cache
+            .entity_interpolation
+            .retain(|eid, _| live.world.entities.contains_key(eid));
+        cache
+            .dynamic_ber_meshes
+            .retain(|pos, _| live.world.block_entities.contains_key(pos));
+        cache
+            .ber_animation_easing
+            .retain(|pos, _| live.world.block_entities.contains_key(pos));
         // Pass 1 mutates the caches (new/pose-changed meshes only); pass
         // 2 then borrows them immutably to assemble the draw list — the
         // renderer consumes `&ExtrudedMesh` refs so no mesh is cloned.
@@ -1958,7 +2112,20 @@ impl GpuApp {
         // `entity_shadows` settings key.
         stage_contact_shadow_quads(live, entity_shadows, &mut cache.contact_shadow_quads);
         let mut ber_refs: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
+        let mut animated_ber_refs: Vec<([i32; 3], [f32; 3])> = Vec::new();
         for (block_pos, be) in &live.world.block_entities {
+            if let Some(visual) = live.world.block_entity_visual_state(*block_pos) {
+                if let Some(state) = live_animated_ber_state(live, cache, *block_pos, visual) {
+                    let mesh = cache.dynamic_ber_meshes.entry(*block_pos).or_insert_with(|| {
+                        (state, build_extended_ber_mesh(state.kind(), state))
+                    });
+                    if mesh.0 != state {
+                        *mesh = (state, build_extended_ber_mesh(state.kind(), state));
+                    }
+                    animated_ber_refs.push((*block_pos, [1.0; 3]));
+                    continue;
+                }
+            }
             let Some(kind) = classify_tracked_block_entity(be) else {
                 continue;
             };
@@ -1978,7 +2145,10 @@ impl GpuApp {
             ));
         }
         let mut meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])> = Vec::with_capacity(
-            entity_refs.len() + ber_refs.len() + cache.contact_shadow_quads.len(),
+            entity_refs.len()
+                + ber_refs.len()
+                + animated_ber_refs.len()
+                + cache.contact_shadow_quads.len(),
         );
         for (eid, origin, tint) in entity_refs {
             if let Some((_, mesh)) = cache.entity_meshes.get(&eid) {
@@ -1993,6 +2163,15 @@ impl GpuApp {
         for (slot, origin, tint) in ber_refs {
             if let Some(mesh) = cache.ber_meshes[slot].as_ref() {
                 meshes.push((mesh, origin, tint));
+            }
+        }
+        for (pos, tint) in animated_ber_refs {
+            if let Some((_, mesh)) = cache.dynamic_ber_meshes.get(&pos) {
+                meshes.push((
+                    mesh,
+                    [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+                    tint,
+                ));
             }
         }
         if meshes.is_empty() {
@@ -2018,6 +2197,7 @@ impl GpuApp {
     /// `is_empty` checks — zero wasted CPU when particles are off.
     fn stage_live_particles(
         live: &LiveSession,
+        vanilla_particles: &VanillaParticleWorld,
         frame: &VfxFrameOutput,
         camera: &Camera,
         scratch: &mut Vec<VanillaParticleQuad>,
@@ -2036,6 +2216,17 @@ impl GpuApp {
         for particle in &frame.particles {
             push_vfx_particle(scratch, particle, right, up, camera.forward_vector());
         }
+        for particle in vanilla_particles.particles() {
+            let half = particle.billboard_half_size();
+            let color = particle.color_at_age();
+            push_particle_quad(
+                scratch,
+                particle.pos,
+                right.map(|axis| axis * half),
+                up.map(|axis| axis * half),
+                color,
+            );
+        }
         if scratch.is_empty() {
             if *staged {
                 renderer.set_particle_billboards(&[]);
@@ -2045,6 +2236,136 @@ impl GpuApp {
         }
         *staged = true;
         renderer.set_particle_billboards(scratch);
+    }
+
+    fn drain_protocol_particles(
+        live: &mut LiveSession,
+        particles: &mut VanillaParticleWorld,
+        dt: f32,
+    ) {
+        while let Some(spawn) = live.world.level_particles.pop_front() {
+            let options = live
+                .world
+                .level_particle_options
+                .pop_front()
+                .filter(|(id, _)| *id == spawn.particle_id)
+                .map(|(_, options)| options);
+            let Some(protocol_id) = u8::try_from(spawn.particle_id).ok() else {
+                continue;
+            };
+            let Some(options) = options else {
+                continue;
+            };
+            let payload = match options {
+                megu_client::protocol::DecodedParticleOptions::Empty
+                | megu_client::protocol::DecodedParticleOptions::Unknown(_) => {
+                    VanillaParticlePayload::None
+                }
+                megu_client::protocol::DecodedParticleOptions::BlockState(state) => {
+                    VanillaParticlePayload::BlockState(state.max(0) as u32)
+                }
+                megu_client::protocol::DecodedParticleOptions::Dust {
+                    red,
+                    green,
+                    blue,
+                    scale,
+                } => VanillaParticlePayload::Dust {
+                    rgb: [red, green, blue],
+                    scale,
+                },
+                megu_client::protocol::DecodedParticleOptions::DustColorTransition {
+                    from,
+                    scale,
+                    to,
+                } => VanillaParticlePayload::DustColorTransition {
+                    from_rgb: from,
+                    to_rgb: to,
+                    scale,
+                },
+                megu_client::protocol::DecodedParticleOptions::SculkCharge { roll } => {
+                    VanillaParticlePayload::SculkCharge { roll }
+                }
+                megu_client::protocol::DecodedParticleOptions::Item { slot_wire } => {
+                    let mut reader = WireReader::new(&slot_wire);
+                    if !reader.read_bool().unwrap_or(false) {
+                        VanillaParticlePayload::None
+                    } else {
+                        VanillaParticlePayload::ItemStack(
+                            reader.read_varint().unwrap_or_default().max(0) as u32,
+                        )
+                    }
+                }
+                megu_client::protocol::DecodedParticleOptions::Vibration {
+                    source,
+                    arrival_ticks,
+                } => {
+                    let destination = match source {
+                        megu_client::protocol::VibrationSource::Block(pos) => [
+                            pos[0] as f32 + 0.5,
+                            pos[1] as f32 + 0.5,
+                            pos[2] as f32 + 0.5,
+                        ],
+                        megu_client::protocol::VibrationSource::Entity { .. } => [
+                            spawn.pos[0] as f32,
+                            spawn.pos[1] as f32,
+                            spawn.pos[2] as f32,
+                        ],
+                    };
+                    VanillaParticlePayload::Vibration {
+                        origin: spawn.pos.map(|value| value as f32),
+                        destination,
+                        travel_ticks: arrival_ticks.clamp(1, i32::from(u16::MAX)) as u16,
+                    }
+                }
+                megu_client::protocol::DecodedParticleOptions::Shriek { delay } => {
+                    VanillaParticlePayload::Shriek {
+                        delay_ticks: delay.max(0) as u32,
+                    }
+                }
+                megu_client::protocol::DecodedParticleOptions::EntityEffect { argb } => {
+                    VanillaParticlePayload::EntityEffect {
+                        rgba: [
+                            ((argb >> 16) & 0xff) as f32 / 255.0,
+                            ((argb >> 8) & 0xff) as f32 / 255.0,
+                            (argb & 0xff) as f32 / 255.0,
+                            ((argb >> 24) & 0xff) as f32 / 255.0,
+                        ],
+                    }
+                }
+            };
+            let count = if spawn.count == 0 {
+                1
+            } else {
+                spawn.count.clamp(0, 32) as usize
+            };
+            for index in 0..count {
+                let seed = spawn.pos[0].to_bits()
+                    ^ (spawn.pos[1].to_bits() << 17)
+                    ^ (spawn.pos[2].to_bits() << 37)
+                    ^ ((index as u64) << 8)
+                    ^ u64::from(protocol_id);
+                let spread = |shift: u32| {
+                    let bits = seed.rotate_left(shift).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    ((bits >> 40) as f32 / 16_777_215.0) * 2.0 - 1.0
+                };
+                let velocity = if spawn.count == 0 {
+                    spawn.offset.map(|value| value * spawn.max_speed)
+                } else {
+                    spawn
+                        .offset
+                        .map(|value| value * spread(11 + (index as u32 % 19)))
+                };
+                particles.spawn_protocol(
+                    protocol_id,
+                    spawn.pos.map(|value| value as f32),
+                    velocity,
+                    seed,
+                    payload,
+                );
+            }
+        }
+        live.world.level_particle_options.clear();
+        particles.step(dt.clamp(0.0, 0.1));
     }
 
     /// Drive one [`WindowInputEvent`] through the same handler `handle_key`
@@ -2218,8 +2539,10 @@ impl GpuApp {
             // with a truncated preview so the click reads back what it
             // copied.
             UiAction::CopyText(text) => match self.clipboard.set_text(text) {
-                ClipboardOutcome::System => self
-                    .status_line(format!("Copied to clipboard: {}", truncate_for_status(text))),
+                ClipboardOutcome::System => self.status_line(format!(
+                    "Copied to clipboard: {}",
+                    truncate_for_status(text)
+                )),
                 ClipboardOutcome::Fallback => self.status_line(format!(
                     "Copied (in-app buffer): {}",
                     truncate_for_status(text)
@@ -2294,27 +2617,35 @@ impl GpuApp {
     ) {
         self.last_server_address = Some(server_address.clone());
         let mismatches = crate::mod_sync_auto::compute_missing_mods(required, installed);
-        let rows = mismatches.into_iter().filter_map(|entry| {
-            let requirement = required.iter().find(|requirement| requirement.mod_id == entry.mod_id)?;
-            let installed_version = match entry.kind {
-                crate::mod_sync_auto::ModMismatchKind::Missing => None,
-                crate::mod_sync_auto::ModMismatchKind::VersionMismatch { installed, .. } => Some(installed),
-            };
-            Some(megu_ui::state::ModSyncPromptRow {
-                mod_id: entry.mod_id,
-                required_version: requirement.required_version.clone(),
-                installed_version,
-                sha512: requirement.sha512.clone(),
-                sha256: requirement.sha256.clone(),
-                modrinth_slug: requirement.modrinth_slug.clone(),
+        let rows = mismatches
+            .into_iter()
+            .filter_map(|entry| {
+                let requirement = required
+                    .iter()
+                    .find(|requirement| requirement.mod_id == entry.mod_id)?;
+                let installed_version = match entry.kind {
+                    crate::mod_sync_auto::ModMismatchKind::Missing => None,
+                    crate::mod_sync_auto::ModMismatchKind::VersionMismatch {
+                        installed, ..
+                    } => Some(installed),
+                };
+                Some(megu_ui::state::ModSyncPromptRow {
+                    mod_id: entry.mod_id,
+                    required_version: requirement.required_version.clone(),
+                    installed_version,
+                    sha512: requirement.sha512.clone(),
+                    sha256: requirement.sha256.clone(),
+                    modrinth_slug: requirement.modrinth_slug.clone(),
+                })
             })
-        }).collect();
-        self.ui.open_mod_sync_prompt(megu_ui::state::ModSyncPromptState {
-            server_address,
-            rows,
-            progress_label: "Waiting for confirmation".into(),
-            progress_percent: None,
-        });
+            .collect();
+        self.ui
+            .open_mod_sync_prompt(megu_ui::state::ModSyncPromptState {
+                server_address,
+                rows,
+                progress_label: "Waiting for confirmation".into(),
+                progress_percent: None,
+            });
     }
 
     /// Death-screen `Title Screen` button (also the only escape on
@@ -2729,10 +3060,9 @@ impl GpuApp {
                 self.ime_state.set_ime_cursor_area(area);
                 if let Some(active) = &self.active {
                     let (x, y, w, h) = area;
-                    active.window.set_ime_cursor_area(
-                        PhysicalPosition::new(x, y),
-                        PhysicalSize::new(w, h),
-                    );
+                    active
+                        .window
+                        .set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(w, h));
                 }
             }
         }
@@ -2802,6 +3132,22 @@ impl GpuApp {
             }
             if fed {
                 self.refresh_chat_suggestions();
+            }
+            return Vec::new();
+        }
+        if self
+            .container_screen
+            .as_ref()
+            .is_some_and(|screen| screen.rename_focused)
+        {
+            for ch in text.chars().filter(|c| !c.is_control()) {
+                let action = self
+                    .container_screen
+                    .as_mut()
+                    .and_then(|screen| screen.handle_rename_char(ch));
+                if let Some(action) = action {
+                    self.dispatch_workstation_action(action);
+                }
             }
             return Vec::new();
         }
@@ -2978,7 +3324,11 @@ impl GpuApp {
             };
             self.status_line(format!(
                 "{}{name}: {reason}",
-                tr(lang, "Dropped file rejected: ", "ドロップされたファイルは拒否されました: "),
+                tr(
+                    lang,
+                    "Dropped file rejected: ",
+                    "ドロップされたファイルは拒否されました: "
+                ),
             ));
         }
     }
@@ -3063,31 +3413,61 @@ impl GpuApp {
             self.ui.mod_sync_prompt.progress_label = "Invalid server address".into();
             return;
         }
-        let requirements = self.ui.mod_sync_prompt.rows.iter().map(|row| crate::mod_sync_auto::ModRequirement {
-            mod_id: row.mod_id.clone(),
-            required_version: row.required_version.clone(),
-            sha512: row.sha512.clone(),
-            sha256: row.sha256.clone(),
-            modrinth_slug: row.modrinth_slug.clone(),
-        }).collect();
-        let game_dir = self.session_paths.game_dir.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let requirements = self
+            .ui
+            .mod_sync_prompt
+            .rows
+            .iter()
+            .map(|row| crate::mod_sync_auto::ModRequirement {
+                mod_id: row.mod_id.clone(),
+                required_version: row.required_version.clone(),
+                sha512: row.sha512.clone(),
+                sha256: row.sha256.clone(),
+                modrinth_slug: row.modrinth_slug.clone(),
+            })
+            .collect();
+        let game_dir = self
+            .session_paths
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
         let server_key = self.ui.mod_sync_prompt.server_address.clone();
-        self.mod_sync_worker = Some(crate::mod_sync_auto::spawn_modrinth_mod_sync(requirements, game_dir, server_key));
+        self.mod_sync_worker = Some(crate::mod_sync_auto::spawn_modrinth_mod_sync(
+            requirements,
+            game_dir,
+            server_key,
+        ));
         self.ui.mod_sync_prompt.progress_label = "Resolving mods on Modrinth...".into();
         self.ui.mod_sync_prompt.progress_percent = None;
     }
 
     fn poll_mod_sync_worker(&mut self) {
         use crate::mod_sync_auto::ModSyncProgress as P;
-        let Some(progress) = self.mod_sync_worker.as_ref().map(|worker| worker.task.progress()) else { return; };
+        let Some(progress) = self
+            .mod_sync_worker
+            .as_ref()
+            .map(|worker| worker.task.progress())
+        else {
+            return;
+        };
         match progress {
             P::Resolving => {
                 self.ui.mod_sync_prompt.progress_label = "Resolving mods on Modrinth...".into();
                 self.ui.mod_sync_prompt.progress_percent = None;
             }
-            P::Downloading { mod_id, file_index, total_files, downloaded_bytes, total_bytes } => {
-                self.ui.mod_sync_prompt.progress_label = format!("Downloading {mod_id} ({file_index}/{total_files}) - {downloaded_bytes} bytes");
-                self.ui.mod_sync_prompt.progress_percent = total_bytes.filter(|size| *size > 0).map(|size| ((downloaded_bytes.saturating_mul(100) / size).min(100)) as u8);
+            P::Downloading {
+                mod_id,
+                file_index,
+                total_files,
+                downloaded_bytes,
+                total_bytes,
+            } => {
+                self.ui.mod_sync_prompt.progress_label = format!(
+                    "Downloading {mod_id} ({file_index}/{total_files}) - {downloaded_bytes} bytes"
+                );
+                self.ui.mod_sync_prompt.progress_percent = total_bytes
+                    .filter(|size| *size > 0)
+                    .map(|size| ((downloaded_bytes.saturating_mul(100) / size).min(100)) as u8);
             }
             P::Verifying { mod_id } => {
                 self.ui.mod_sync_prompt.progress_label = format!("Verifying {mod_id}...");
@@ -3098,19 +3478,31 @@ impl GpuApp {
                 self.ui.mod_sync_prompt.progress_label = reason;
                 self.ui.mod_sync_prompt.progress_percent = None;
             }
-            P::Ready { mods_dir, downloaded_files } => {
+            P::Ready {
+                mods_dir,
+                downloaded_files,
+            } => {
                 self.mod_sync_worker = None;
                 self.session_paths.server_mods_dir = Some(mods_dir);
-                let endpoint = megu_ui::state::parse_server_address(&self.ui.mod_sync_prompt.server_address);
-                self.ui.mod_sync_prompt.progress_label = format!("Verified {downloaded_files} mods; reconnecting...");
-                if let Some((host, port)) = endpoint { self.connect_to(host, port); }
-                else { self.ui.mod_sync_prompt.progress_label = "Invalid server address".into(); }
+                let endpoint =
+                    megu_ui::state::parse_server_address(&self.ui.mod_sync_prompt.server_address);
+                self.ui.mod_sync_prompt.progress_label =
+                    format!("Verified {downloaded_files} mods; reconnecting...");
+                if let Some((host, port)) = endpoint {
+                    self.connect_to(host, port);
+                } else {
+                    self.ui.mod_sync_prompt.progress_label = "Invalid server address".into();
+                }
             }
         }
     }
 
     fn save_instant_replay(&mut self) {
-        let game_dir = self.session_paths.game_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
+        let game_dir = self
+            .session_paths
+            .game_dir
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("."));
         let Some(live) = self.live.as_ref() else {
             self.status_line("No live session is available to save a replay");
             return;
@@ -3120,12 +3512,33 @@ impl GpuApp {
             return;
         }
         let replay_dir = game_dir.join("replays");
-        let next = std::fs::read_dir(&replay_dir).ok().into_iter().flatten().flatten()
-            .filter_map(|entry| entry.file_name().to_str().and_then(|name| name.strip_prefix("replay-")).and_then(|name| name.strip_suffix(".megu-replay")).and_then(|number| number.parse::<u64>().ok()))
-            .max().unwrap_or(0).saturating_add(1);
+        let next = std::fs::read_dir(&replay_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("replay-"))
+                    .and_then(|name| name.strip_suffix(".megu-replay"))
+                    .and_then(|number| number.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         let path = replay_dir.join(format!("replay-{next}.megu-replay"));
-        match live.replay_ring.save_to_file(&path, self.config.mc_version.parse().unwrap_or(767), self.last_server_address.as_deref().unwrap_or("local world")) {
-            Ok(summary) => self.status_line(format!("Saved 60s replay ({} frames, {:.1} KB)", summary.frame_count, summary.payload_bytes as f64 / 1024.0)),
+        match live.replay_ring.save_to_file(
+            &path,
+            self.config.mc_version.parse().unwrap_or(767),
+            self.last_server_address.as_deref().unwrap_or("local world"),
+        ) {
+            Ok(summary) => self.status_line(format!(
+                "Saved 60s replay ({} frames, {:.1} KB)",
+                summary.frame_count,
+                summary.payload_bytes as f64 / 1024.0
+            )),
             Err(error) => self.status_line(format!("Replay save failed: {error}")),
         }
     }
@@ -3444,9 +3857,7 @@ impl GpuApp {
         self.friends_store
             .as_ref()
             .and_then(|store| store.relay_addr.clone())
-            .ok_or_else(|| {
-                "set a relay address on the Friends screen (or pass --relay)".to_owned()
-            })
+            .ok_or_else(|| "set a relay address on the Friends screen (or pass --relay)".to_owned())
     }
 
     /// The allowlist the share session enforces right now: the store's
@@ -3559,9 +3970,8 @@ impl GpuApp {
                         }
                     }
                 } else if self.friend_share.is_none() {
-                    self.ui.friends.status = Some(
-                        "Sharing armed — starts when you host a world".to_owned(),
-                    );
+                    self.ui.friends.status =
+                        Some("Sharing armed — starts when you host a world".to_owned());
                 }
             }
         }
@@ -3574,11 +3984,7 @@ impl GpuApp {
         let Some(store) = &mut self.friends_store else {
             return;
         };
-        if let Some(entry) = store
-            .friends
-            .iter_mut()
-            .find(|f| f.friend_id == friend_id)
-        {
+        if let Some(entry) = store.friends.iter_mut().find(|f| f.friend_id == friend_id) {
             entry.selected_for_share = selected;
             if let Err(err) = self.commit_friends_store() {
                 self.ui.friends.status = Some(err);
@@ -3641,10 +4047,12 @@ impl GpuApp {
             },
         )
         .map_err(|e| format!("publish plan: {e}"))?;
-        if !plan
-            .iter()
-            .any(|step| matches!(step, megu_proto::friend_session::PublishStep::OpenRelayTunnel))
-        {
+        if !plan.iter().any(|step| {
+            matches!(
+                step,
+                megu_proto::friend_session::PublishStep::OpenRelayTunnel
+            )
+        }) {
             return Err("publish plan has no reachable transport".to_owned());
         }
         let relay = self.friend_relay_addr()?;
@@ -3764,8 +4172,7 @@ impl GpuApp {
     }
 
     fn build_guest_link(&mut self, friend_id: &str) -> Result<String, String> {
-        let friend_pk =
-            parse_friend_id(friend_id).map_err(|e| format!("friend id: {e}"))?;
+        let friend_pk = parse_friend_id(friend_id).map_err(|e| format!("friend id: {e}"))?;
         let token = Frl3GuestToken::generate();
         self.guest_link_grant = Some(GuestLinkGrant { friend_pk, token });
         let worker = self
@@ -4221,21 +4628,31 @@ impl GpuApp {
             window_id: u8,
             state_id: i32,
             properties: std::collections::BTreeMap<i16, i16>,
+            merchant_signature: Option<u64>,
+            merchant_offers: Option<Vec<MerchantOfferView>>,
         }
-        let snap = self
-            .live
-            .as_ref()
-            .and_then(|live| live.open_screen.as_ref())
-            .and_then(|open| {
-                let schema = open.menu_type.try_into().ok().and_then(menu_schema)?;
-                let window_id = u8::try_from(open.window_id).ok()?;
-                Some(Snapshot {
-                    schema,
-                    window_id,
-                    state_id: open.state_id,
-                    properties: open.properties.clone(),
+        let previous_merchant_signature = self.merchant_offer_signature;
+        let snap = self.live.as_ref().and_then(|live| {
+            let open = live.open_screen.as_ref()?;
+            let schema = open.menu_type.try_into().ok().and_then(menu_schema)?;
+            let window_id = u8::try_from(open.window_id).ok()?;
+            let merchant_panel = live.world.merchant_panels.get(&window_id);
+            let merchant_signature = merchant_panel.map(|panel| merchant_signature(&panel.offers));
+            let merchant_offers = merchant_panel
+                .filter(|_| {
+                    previous_merchant_signature
+                        != merchant_signature.map(|signature| (window_id, signature))
                 })
-            });
+                .map(|panel| merchant_offer_views(&panel.offers));
+            Some(Snapshot {
+                schema,
+                window_id,
+                state_id: open.state_id,
+                properties: open.properties.clone(),
+                merchant_signature,
+                merchant_offers,
+            })
+        });
         // Phase 2: mutate `self.container_screen` / grab state freely.
         match snap {
             Some(Snapshot {
@@ -4243,6 +4660,8 @@ impl GpuApp {
                 window_id,
                 state_id,
                 properties,
+                merchant_signature,
+                merchant_offers,
             }) => {
                 // A server-opened window always replaces the local
                 // inventory surface.
@@ -4266,6 +4685,11 @@ impl GpuApp {
                 // mirror the whole property map every frame so a mid-open
                 // update reaches the rendered bars.
                 screen.properties.clone_from(&properties);
+                if let Some(offers) = merchant_offers {
+                    screen.set_merchant_offers(offers);
+                }
+                self.merchant_offer_signature =
+                    merchant_signature.map(|signature| (window_id, signature));
                 if opened_now || screen.state_id != state_id {
                     screen.state_id = state_id;
                     if let Some(open) = self
@@ -4304,6 +4728,7 @@ impl GpuApp {
                 }
             }
             None => {
+                self.merchant_offer_signature = None;
                 if self.own_inventory_open {
                     // Window-0 sync without an `open_screen`: refresh the
                     // local inventory's slots when `state_id` bumps.
@@ -4519,6 +4944,37 @@ impl GpuApp {
                         return true;
                     }
                 }
+                let panel = screen.layout(w, h).panel;
+                let before = (
+                    screen.rename_focused,
+                    screen.beacon_primary,
+                    screen.beacon_secondary,
+                    screen.selected_trade_index,
+                );
+                let workstation_action = screen.click_at(mx, my, w, h);
+                let after = (
+                    screen.rename_focused,
+                    screen.beacon_primary,
+                    screen.beacon_secondary,
+                    screen.selected_trade_index,
+                );
+                let menu_id = screen.schema().menu_id;
+                let rename_hit = screen
+                    .rename_input_rect(w, h)
+                    .is_some_and(|rect| rect.contains(mx, my));
+                let merchant_row_hit = menu_id == 19
+                    && (panel.x + 12..panel.x + 108).contains(&mx)
+                    && (panel.y + 22..panel.y + 134).contains(&my);
+                let beacon_control_hit = menu_id == 9
+                    && (panel.x + 4..panel.x + 204).contains(&mx)
+                    && (panel.y + 20..panel.y + 142).contains(&my);
+                if let Some(action) = workstation_action {
+                    self.dispatch_workstation_action(action);
+                    return true;
+                }
+                if before != after || rename_hit || merchant_row_hit || beacon_control_hit {
+                    return true;
+                }
                 let layout = screen.layout(w, h);
                 if let Some(hit) = layout.slots.iter().find(|slot| slot.rect.contains(mx, my)) {
                     let slot_index = hit.index;
@@ -4551,6 +5007,13 @@ impl GpuApp {
             }
         }
         true
+    }
+
+    fn dispatch_workstation_action(&mut self, action: WorkstationAction) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        live.dispatch_workstation_action(&action);
     }
 
     /// Mouse Tweaks style wheel transfer: while a container owns the pointer,
@@ -5276,6 +5739,7 @@ impl GpuApp {
                 self.camera.position,
                 planes.as_ref().map_or(&[][..], |p| &p[..]),
             );
+            Self::drain_protocol_particles(live, &mut self.vanilla_particles, dt);
             // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
             // session's custom-channel dispatch; applied below once the
             // `live` borrow ends.
@@ -5310,10 +5774,7 @@ impl GpuApp {
         for bytes in seamless_portal_frames {
             self.apply_seamless_portal_channel(SEAMLESS_PORTAL_CHANNEL, &bytes);
         }
-        let rain_level = self
-            .live
-            .as_ref()
-            .map_or(0.0, |live| live.world.rain_level);
+        let rain_level = self.live.as_ref().map_or(0.0, |live| live.world.rain_level);
         let rain_wetness = self.rain_wetness.update(rain_level, dt);
         self.sync_disconnected_screen();
         self.sync_death_screen();
@@ -5508,7 +5969,8 @@ impl GpuApp {
                 })
                 .collect();
             for (id, block_light, sky_light) in subworld_lights {
-                live.subworlds.set_subworld_light(id, block_light, sky_light);
+                live.subworlds
+                    .set_subworld_light(id, block_light, sky_light);
             }
             active.renderer.sync_subworlds(&mut live.subworlds);
             // First live frame on this renderer (attach order or
@@ -5761,14 +6223,9 @@ impl GpuApp {
                             .ok()
                             .and_then(|index| screen.slot_rect(index, panel))
                         {
-                            if let Some(cmd) = enchant_glint_overlay_cmd(
-                                true,
-                                stack,
-                                rect,
-                                w,
-                                h,
-                                glint_elapsed,
-                            ) {
+                            if let Some(cmd) =
+                                enchant_glint_overlay_cmd(true, stack, rect, w, h, glint_elapsed)
+                            {
                                 self.ui_overlay_list.commands.push(cmd);
                             }
                         }
@@ -5790,7 +6247,11 @@ impl GpuApp {
         if !self.gui_bridge_batch.ops.is_empty() {
             self.ui_modoverlay_list
                 .commands
-                .extend(lower_bridge_batch_to_draw_cmds(&self.gui_bridge_batch, w, h));
+                .extend(lower_bridge_batch_to_draw_cmds(
+                    &self.gui_bridge_batch,
+                    w,
+                    h,
+                ));
         }
         // Declarative mod-UI manifest: the shared Vanilla widget kit
         // renders it on the same layer (Vanilla 1.21.1 sprite atlas when
@@ -5815,7 +6276,10 @@ impl GpuApp {
                 (megu_core::rev::UiLayer::Screen, &self.ui_draw_list),
                 (megu_core::rev::UiLayer::ModHud, &self.ui_modhud_list),
                 (megu_core::rev::UiLayer::Overlay, &self.ui_overlay_list),
-                (megu_core::rev::UiLayer::ModOverlay, &self.ui_modoverlay_list),
+                (
+                    megu_core::rev::UiLayer::ModOverlay,
+                    &self.ui_modoverlay_list,
+                ),
             ];
             for (layer, list) in &layer_lists {
                 let fp = fingerprint_draw_list(w, h, list);
@@ -5826,9 +6290,8 @@ impl GpuApp {
             }
             let dirty = self.ui_retained.begin_frame(&self.ui_layer_bus);
             for index in dirty.iter() {
-                let Some((layer, list)) = layer_lists
-                    .iter()
-                    .find(|(layer, _)| layer.index() == index)
+                let Some((layer, list)) =
+                    layer_lists.iter().find(|(layer, _)| layer.index() == index)
                 else {
                     continue;
                 };
@@ -5844,7 +6307,9 @@ impl GpuApp {
             let _ = self.ui_retained.composite();
             if self.ui_retained.gpu_upload_needed() {
                 let (vertices, indices) = self.ui_retained.composite();
-                active.renderer.update_ui_mesh_parts(w, h, vertices, indices);
+                active
+                    .renderer
+                    .update_ui_mesh_parts(w, h, vertices, indices);
                 self.ui_retained.mark_uploaded();
             }
         }
@@ -5896,8 +6361,7 @@ impl GpuApp {
                         // light UBO (`dynamic_colored_lights` did the
                         // same call and discarded the rest) and the
                         // particle staging below.
-                        let mut vfx_frame =
-                            live.vfx.frame_output(render_camera.forward_vector());
+                        let mut vfx_frame = live.vfx.frame_output(render_camera.forward_vector());
                         // Gameplay dynamic lights (held torches, glowing
                         // mobs, dropped glow items) share the 64-light
                         // WGSL UBO with the server VFX1 lights —
@@ -5914,6 +6378,7 @@ impl GpuApp {
                         }
                         Self::stage_live_particles(
                             live,
+                            &self.vanilla_particles,
                             &vfx_frame,
                             &render_camera,
                             &mut self.particle_scratch,
@@ -6229,6 +6694,22 @@ impl GpuApp {
                     }
                 }
                 _ => self.clipboard_copy(),
+            }
+            return;
+        }
+        if pressed
+            && code == KeyCode::Backspace
+            && self
+                .container_screen
+                .as_ref()
+                .is_some_and(|screen| screen.rename_focused)
+        {
+            let action = self
+                .container_screen
+                .as_mut()
+                .and_then(ContainerScreenState::handle_rename_backspace);
+            if let Some(action) = action {
+                self.dispatch_workstation_action(action);
             }
             return;
         }
@@ -6565,10 +7046,7 @@ fn run_friend_share_worker(
                     s.guests.insert(stream_id, (guest_name, friend_id));
                 }
             }
-            Ok(FriendHostEvent::GameData {
-                stream_id,
-                payload,
-            }) => {
+            Ok(FriendHostEvent::GameData { stream_id, payload }) => {
                 let dead = pipes
                     .get_mut(&stream_id)
                     .is_some_and(|tcp| tcp.write_all(&payload).is_err());
@@ -6711,8 +7189,7 @@ fn parse_guest_link(
     }
     let host_id = format!("megu-id:{}", segs[2]);
     let host_pk = parse_friend_id(&host_id).map_err(|e| format!("host id: {e}"))?;
-    let code =
-        megu_proto::InviteCode::parse(segs[3]).map_err(|e| format!("invite code: {e}"))?;
+    let code = megu_proto::InviteCode::parse(segs[3]).map_err(|e| format!("invite code: {e}"))?;
     let token = guest_link_b32_decode(segs[4])?;
     let token: [u8; 16] = token
         .try_into()
@@ -6732,15 +7209,35 @@ fn parse_missing_mod_disconnect(reason: &str) -> Option<Vec<crate::mod_sync_auto
     let tail = tail.split(['\n', '\r']).next().unwrap_or(tail);
     let mut requirements = Vec::new();
     for entry in tail.split([',', ';']) {
-        let entry = entry.trim().trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
-        let Some((mod_id, version)) = entry.split_once('@').or_else(|| entry.split_once('=')) else { continue; };
+        let entry = entry
+            .trim()
+            .trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
+        let Some((mod_id, version)) = entry.split_once('@').or_else(|| entry.split_once('='))
+        else {
+            continue;
+        };
         let mod_id = mod_id.trim();
-        let version = version.trim().trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
-        if mod_id.is_empty() || mod_id.len() > 128 || version.is_empty() || version.len() > 128
-            || !mod_id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
-            || !version.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
-        { continue; }
-        let slug = mod_id.rsplit(':').next().filter(|slug| !slug.is_empty()).map(str::to_owned);
+        let version = version
+            .trim()
+            .trim_matches(|c: char| matches!(c, '.' | ')' | ']' | '}' | '"' | '\''));
+        if mod_id.is_empty()
+            || mod_id.len() > 128
+            || version.is_empty()
+            || version.len() > 128
+            || !mod_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+            || !version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'+'))
+        {
+            continue;
+        }
+        let slug = mod_id
+            .rsplit(':')
+            .next()
+            .filter(|slug| !slug.is_empty())
+            .map(str::to_owned);
         requirements.push(crate::mod_sync_auto::ModRequirement {
             mod_id: mod_id.to_owned(),
             required_version: version.to_owned(),
@@ -6748,7 +7245,9 @@ fn parse_missing_mod_disconnect(reason: &str) -> Option<Vec<crate::mod_sync_auto
             sha256: None,
             modrinth_slug: slug,
         });
-        if requirements.len() >= crate::mod_sync_auto::MAX_MODS { break; }
+        if requirements.len() >= crate::mod_sync_auto::MAX_MODS {
+            break;
+        }
     }
     (!requirements.is_empty()).then_some(requirements)
 }
@@ -6898,7 +7397,11 @@ fn toggle_fullscreen_setting(settings: &mut UiSettings) {
 }
 
 fn mouse_pitch_delta(delta_y: f64, invert_y: bool) -> f64 {
-    if invert_y { -delta_y } else { delta_y }
+    if invert_y {
+        -delta_y
+    } else {
+        delta_y
+    }
 }
 
 fn effective_camera_far(view_distance: u8, lod: LodMode) -> f32 {
@@ -6925,7 +7428,11 @@ fn resolve_shaderpack_path(game_dir: Option<&std::path::Path>, pack: &str) -> St
 }
 
 fn retained_chat_on_reconnect(retain: bool, chat: &[String]) -> Vec<String> {
-    if retain { chat.to_vec() } else { Vec::new() }
+    if retain {
+        chat.to_vec()
+    } else {
+        Vec::new()
+    }
 }
 
 fn ui_key(code: KeyCode) -> Option<UiKey> {
@@ -7048,14 +7555,30 @@ impl ApplicationHandler for GpuApp {
                         // `event.text`). A payload that only echoes the
                         // `Ime::Commit` delivered moments ago must not
                         // insert twice.
-                        if event.state == ElementState::Pressed && self.ui_wants_input() {
+                        if event.state == ElementState::Pressed
+                            && (self.ui_wants_input()
+                                || self
+                                    .container_screen
+                                    .as_ref()
+                                    .is_some_and(|screen| screen.rename_focused))
+                        {
                             if let Some(text) = &event.text {
                                 if !self.swallow_ime_echo(text) {
-                                    for ch in text.chars().filter(|c| !c.is_control()) {
-                                        for action in
-                                            self.ui.handle_input(UiInputEvent::CharTyped(ch))
-                                        {
+                                    if self
+                                        .container_screen
+                                        .as_ref()
+                                        .is_some_and(|screen| screen.rename_focused)
+                                    {
+                                        for action in self.committed_text_actions(text) {
                                             self.apply_ui_action(&action, event_loop);
+                                        }
+                                    } else {
+                                        for ch in text.chars().filter(|c| !c.is_control()) {
+                                            for action in
+                                                self.ui.handle_input(UiInputEvent::CharTyped(ch))
+                                            {
+                                                self.apply_ui_action(&action, event_loop);
+                                            }
                                         }
                                     }
                                 }
@@ -7105,6 +7628,14 @@ impl ApplicationHandler for GpuApp {
                     winit::event::MouseScrollDelta::PixelDelta(pos) => (pos.y / 40.0) as f32,
                 };
                 let steps = lines.round() as i32;
+                if steps != 0 {
+                    if let Some(screen) = &mut self.container_screen {
+                        if screen.schema().menu_id == 19 {
+                            screen.scroll_merchant(-steps);
+                            return;
+                        }
+                    }
+                }
                 if !self.cursor_grabbed && !self.paused && self.container_scroll_tweak(steps) {
                     return;
                 }
@@ -7439,14 +7970,22 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
 /// `1/true/yes/on` alphabet, but the env pair stays canonical `"1"` /
 /// `"0"` like the other boot switches.
 fn directional_shadow_light_env_value(on: bool) -> &'static str {
-    if on { "1" } else { "0" }
+    if on {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 /// `MEGU_LAZY_CATCHUP` value for the integrated/hosted server spawn —
 /// the same canonical `"1"` / `"0"` pair the server-side `ops_bool_str`
 /// reader resolves.
 fn lazy_catchup_env_value(on: bool) -> &'static str {
-    if on { "1" } else { "0" }
+    if on {
+        "1"
+    } else {
+        "0"
+    }
 }
 
 /// Overlay alpha for the 2D enchant-glint shimmer — subtle (~0.24) so
@@ -7513,7 +8052,11 @@ fn hotbar_slot_rect(viewport_w: u32, viewport_h: u32, scale: u32, index: i32) ->
     let slot = HOTBAR_SLOT_PX;
     let hx = logical_w / 2 - (9 * slot + slot + 4) / 2;
     let hy = logical_h - slot - 4;
-    let x = if index < 0 { hx } else { hx + slot + 4 + index * slot };
+    let x = if index < 0 {
+        hx
+    } else {
+        hx + slot + 4 + index * slot
+    };
     UiRect::new(x * s, hy * s, (slot * s) as u32, (slot * s) as u32)
 }
 
@@ -7826,6 +8369,108 @@ fn vanilla_ber_base_color_f32(kind: VanillaBerKind) -> [f32; 3] {
     ]
 }
 
+fn ease_ber_animation(
+    cache: &mut LiveEntityRenderCache,
+    pos: [i32; 3],
+    target: f32,
+) -> f32 {
+    let current = cache.ber_animation_easing.entry(pos).or_insert(target);
+    *current += (target - *current) * 0.35;
+    if (*current - target).abs() < 0.001 {
+        *current = target;
+    }
+    *current
+}
+
+fn live_animated_ber_state(
+    live: &LiveSession,
+    cache: &mut LiveEntityRenderCache,
+    pos: [i32; 3],
+    visual: megu_client::world::BlockEntityVisualState,
+) -> Option<VanillaBerExtendedState> {
+    let facing = VanillaBerFacing::South;
+    let phase = (live.world.world_age.rem_euclid(24_000) as f32 / 24_000.0)
+        * std::f32::consts::TAU;
+    Some(match visual {
+        megu_client::world::BlockEntityVisualState::Chest {
+            open_count,
+            trapped,
+            ender,
+        } => VanillaBerExtendedState::Chest {
+            lid_open: ease_ber_animation(cache, pos, if open_count > 0 { 1.0 } else { 0.0 }),
+            double: false,
+            facing,
+            chest: if ender {
+                BerChestKind::Ender
+            } else if trapped {
+                BerChestKind::Trapped
+            } else {
+                BerChestKind::Normal
+            },
+        },
+        megu_client::world::BlockEntityVisualState::ShulkerBox { open_count, color } => {
+            let dye = BerDyeColor::ALL[usize::from(color.min(15))];
+            VanillaBerExtendedState::ShulkerBox {
+                open_progress: ease_ber_animation(
+                    cache,
+                    pos,
+                    (f32::from(open_count) / 100.0).clamp(0.0, 1.0),
+                ),
+                facing,
+                dye,
+            }
+        }
+        megu_client::world::BlockEntityVisualState::Bell {
+            ring_dir,
+            ringing_ticks,
+        } => {
+            let elapsed = f32::from(50u16.saturating_sub(ringing_ticks));
+            let envelope = (f32::from(ringing_ticks) / 50.0).clamp(0.0, 1.0);
+            VanillaBerExtendedState::Bell {
+                mount: BerBellMount::Floor,
+                facing: match ring_dir % 4 {
+                    0 => VanillaBerFacing::South,
+                    1 => VanillaBerFacing::West,
+                    2 => VanillaBerFacing::North,
+                    _ => VanillaBerFacing::East,
+                },
+                swing_rad: (elapsed * 0.24).sin() * envelope * 0.45,
+            }
+        }
+        megu_client::world::BlockEntityVisualState::EnchantingTable { book_open } => {
+            VanillaBerExtendedState::EnchantingTable {
+                facing_yaw: 0.0,
+                book_yaw_rad: phase + pos[0] as f32 * 0.17 + pos[2] as f32 * 0.11,
+                page_open: ease_ber_animation(cache, pos, if book_open { 1.0 } else { 0.0 }),
+            }
+        }
+        megu_client::world::BlockEntityVisualState::Beacon { level, .. } => {
+            VanillaBerExtendedState::Beacon {
+                beam_height: level.clamp(0, 4) as f32,
+                active: level > 0,
+                rgb: [0.35, 0.75, 1.0],
+                beam_yaw: phase,
+            }
+        }
+        megu_client::world::BlockEntityVisualState::TrialSpawner { active, ominous } => {
+            VanillaBerExtendedState::TrialSpawner {
+                spin_rad: phase * 2.0,
+                active,
+                ominous,
+                mob_scale: if active { 0.8 } else { 0.0 },
+            }
+        }
+        megu_client::world::BlockEntityVisualState::Vault { ominous, state } => {
+            VanillaBerExtendedState::Vault {
+                spin_rad: phase * 1.5,
+                active: state != 0,
+                ominous,
+            }
+        }
+        _ => return None,
+    })
+}
+
 /// Pose for one live entity: relative head yaw from the tracked packet
 /// state, hurt flash while `hurt_ticks` is hot, and the metadata-driven
 /// body poses vanilla exposes (`sneak`/`swim`/`elytra`).
@@ -7937,6 +8582,50 @@ fn entity_pose_key(spec: EntityRigSpec, pose: &EntityPose, held_item_id: Option<
     hash
 }
 
+fn entity_rig_pose(live: &LiveSession, eid: i32, tracked: Option<&TrackedEntity>) -> EntityRigPose {
+    let mut pose = EntityRigPose::from(live_entity_pose(live, eid, tracked));
+    let Some(visual) = live.world.entity_visual_state(eid) else {
+        return pose;
+    };
+    pose.base.baby = visual.is_baby;
+    pose.base.sneaking |= visual.crouching;
+    pose.base.swimming |= visual.swimming;
+    pose.sitting = visual.pose == Some(10);
+    pose.sleeping = visual.pose == Some(2);
+    pose.wither_armored = visual.wither_invul_ticks.is_some_and(|ticks| ticks > 0)
+        || visual.health.is_some_and(|health| health < 150.0);
+    pose.carried_block = visual.enderman_carried_block.is_some_and(|block| block > 0);
+    pose.open_amount = visual
+        .shulker_peek
+        .map_or(0.0, |peek| f32::from(peek) / 100.0);
+    pose.swell_amount = visual
+        .creeper_state
+        .map_or(0.0, |state| (state.max(0) as f32 / 2.0).clamp(0.0, 1.0));
+    pose.main_hand_item = tracked.is_some_and(|entity| entity.equipment_slots & 1 != 0);
+    pose.offhand_item = tracked.is_some_and(|entity| entity.equipment_slots & 2 != 0);
+    pose.using_item = tracked.is_some_and(|entity| entity.last_animation == Some(0));
+    pose
+}
+
+fn extended_entity_pose_key(mut key: u64, pose: &EntityRigPose) -> u64 {
+    for value in [pose.open_amount, pose.swell_amount] {
+        key ^= (f64::from(value) * 64.0).round() as i64 as u64;
+        key = key.wrapping_mul(FNV1A64_PRIME);
+    }
+    let flags = u64::from(pose.sitting)
+        | u64::from(pose.sleeping) << 1
+        | u64::from(pose.spellcasting) << 2
+        | u64::from(pose.using_item) << 3
+        | u64::from(pose.armor_visible) << 4
+        | u64::from(pose.main_hand_item) << 5
+        | u64::from(pose.offhand_item) << 6
+        | u64::from(pose.carried_block) << 7
+        | u64::from(pose.wither_armored) << 8
+        | u64::from(pose.rolled_up) << 9
+        | u64::from(pose.screaming) << 10;
+    (key ^ flags).wrapping_mul(FNV1A64_PRIME)
+}
+
 /// Per-entity tint: hurt flash overrides, otherwise the golden-ratio
 /// hue keyed on the rig's type id (the same convention the software
 /// renderer uses for its entity palette).
@@ -7948,9 +8637,17 @@ fn live_entity_tint(spec: EntityRigSpec, tracked: Option<&TrackedEntity>) -> [f3
     hsv_to_rgb_f32(hue, 0.5, 0.85)
 }
 
+fn live_entity_tint_interpolated(spec: EntityRigSpec, hurt_ticks: f32) -> [f32; 3] {
+    let base = live_entity_tint(spec, None);
+    let hurt = [1.0, 0.45, 0.45];
+    let amount = (hurt_ticks / 10.0).clamp(0.0, 1.0);
+    std::array::from_fn(|channel| base[channel] + (hurt[channel] - base[channel]) * amount)
+}
+
 /// Deterministic vibrant colour for the fox's held mouth item — the
 /// golden-ratio hue walk [`live_entity_tint`] uses, keyed on the item id
 /// so distinct pickups tint the mouth prism differently.
+#[cfg(test)]
 fn mouth_item_rgb(item_id: i32) -> [u8; 3] {
     let hue = (f64::from(item_id as u32) * 0.618_033_988_749_895).fract() as f32;
     hsv_to_rgb_f32(hue, 0.85, 0.95).map(|c| (c * 255.0).round() as u8)
@@ -7998,7 +8695,13 @@ fn stage_live_entity(
     pos: [f64; 3],
     tracked: Option<&TrackedEntity>,
 ) {
-    let pose = live_entity_pose(live, eid, tracked);
+    let sample = interpolate_entity(cache, eid, pos, tracked);
+    let mut pose = entity_rig_pose(live, eid, tracked);
+    pose.base.head_yaw_deg = sample.head_yaw - sample.body_yaw;
+    pose.base.head_pitch_deg = sample.pitch;
+    pose.base.hurt_flash = sample.hurt_ticks > 0.5;
+    pose.base.limb_swing = sample.limb_swing;
+    pose.base.limb_swing_amount = sample.limb_swing_amount;
     // The fox (id 42) carries pickups in its mouth slot: the held
     // item id joins the cache key so pick-up/drop rebuilds the
     // mesh immediately, without waiting on a pose change.
@@ -8007,21 +8710,21 @@ fn stage_live_entity(
     } else {
         None
     };
-    let key = entity_pose_key(spec, &pose, mouth_item_id);
+    let mut key = extended_entity_pose_key(entity_pose_key(spec, &pose.base, mouth_item_id), &pose);
+    key ^= (f64::from(sample.body_yaw) * 64.0).round() as i64 as u64;
+    key = key.wrapping_mul(FNV1A64_PRIME);
     if cache.entity_meshes.get(&eid).is_none_or(|(k, _)| *k != key) {
-        cache.entity_meshes.insert(
-            eid,
-            (
-                key,
-                build_entity_rig_mesh_with_mouth_item(
-                    spec,
-                    pose,
-                    mouth_item_id.map(mouth_item_rgb),
-                ),
-            ),
+        let mut mesh = build_entity_rig_mesh_with_pose(spec, pose);
+        let angle = sample.body_yaw.to_radians();
+        let (sin, cos) = angle.sin_cos();
+        mesh.affine(
+            [[cos, 0.0, sin], [0.0, 1.0, 0.0], [-sin, 0.0, cos]],
+            [0.0; 3],
+            [0.0; 3],
         );
+        cache.entity_meshes.insert(eid, (key, mesh));
     }
-    let mut tint = live_entity_tint(spec, tracked);
+    let mut tint = live_entity_tint_interpolated(spec, sample.hurt_ticks);
     if glint_on && live.entity_enchanted_item_glint(eid) {
         tint = match live
             .entity_metadata
@@ -8035,7 +8738,11 @@ fn stage_live_entity(
     }
     entity_refs.push((
         eid,
-        [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+        [
+            sample.position[0] as f32,
+            sample.position[1] as f32,
+            sample.position[2] as f32,
+        ],
         tint,
     ));
 }
@@ -8357,10 +9064,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entity_interpolation_smooths_pose_locomotion_and_hurt_flash() {
+        let mut live = LiveSession::offline_with_null_audio();
+        window_test_add_entity(&mut live, 90, 124, [0.0, 64.0, 0.0]);
+        let mut cache = LiveEntityRenderCache::default();
+        {
+            let tracked = live.world.entities.get_mut(&90).unwrap();
+            tracked.yaw_deg = 350.0;
+            tracked.head_yaw_deg = 350.0;
+            tracked.pitch_deg = 10.0;
+        }
+        let first = interpolate_entity(
+            &mut cache,
+            90,
+            [0.0, 64.0, 0.0],
+            live.world.entities.get(&90),
+        );
+        assert_eq!(first.body_yaw, 350.0);
+
+        {
+            let tracked = live.world.entities.get_mut(&90).unwrap();
+            tracked.yaw_deg = 10.0;
+            tracked.head_yaw_deg = 10.0;
+            tracked.pitch_deg = 20.0;
+            tracked.hurt_ticks = 10;
+            tracked.vel = [0.25, 0.0, 0.0];
+        }
+        let next = interpolate_entity(
+            &mut cache,
+            90,
+            [2.0, 64.0, 0.0],
+            live.world.entities.get(&90),
+        );
+        assert!((next.position[0] - 1.0).abs() < f64::EPSILON);
+        assert!(next.body_yaw.abs() < f32::EPSILON);
+        assert!(next.head_yaw.abs() < f32::EPSILON);
+        assert!((next.pitch - 15.0).abs() < f32::EPSILON);
+        assert!((next.hurt_ticks - 5.0).abs() < f32::EPSILON);
+        assert!((next.limb_swing - 8.0f32.rem_euclid(std::f32::consts::TAU)).abs() < 1.0e-5);
+        assert!((next.limb_swing_amount - 0.5).abs() < f32::EPSILON);
+        assert_ne!(
+            live_entity_tint_interpolated(*live.entity_rig(90).unwrap(), next.hurt_ticks),
+            live_entity_tint(*live.entity_rig(90).unwrap(), None),
+        );
+    }
+
+    #[test]
     fn missing_mod_disconnect_text_opens_structured_prompt() {
-        let requirements = parse_missing_mod_disconnect(
-            "Missing required mods: fabric-api@0.102.0, sodium@0.6.5",
-        ).expect("recognizable dependency kick");
+        let requirements =
+            parse_missing_mod_disconnect("Missing required mods: fabric-api@0.102.0, sodium@0.6.5")
+                .expect("recognizable dependency kick");
         assert_eq!(requirements.len(), 2);
         assert_eq!(requirements[0].mod_id, "fabric-api");
         assert_eq!(requirements[0].required_version, "0.102.0");
@@ -8654,22 +9407,19 @@ mod tests {
             status.contains("Singleplayer") && status.contains("New World"),
             "title_status did not capture the failure: {status:?}"
         );
-        assert!(
-            app.status_messages()
-                .iter()
-                .any(|m| m.contains("Singleplayer"))
-        );
+        assert!(app
+            .status_messages()
+            .iter()
+            .any(|m| m.contains("Singleplayer")));
     }
 
     #[test]
     fn host_ram_pressure_trims_on_low_available_and_ignores_missing_data() {
-        let snap = |total: Option<u64>, avail: Option<u64>, rss: Option<u64>| {
-            HostMetricsSnapshot {
-                mem_total_mib: total,
-                mem_available_mib: avail,
-                process_rss_mib: rss,
-                ..HostMetricsSnapshot::default()
-            }
+        let snap = |total: Option<u64>, avail: Option<u64>, rss: Option<u64>| HostMetricsSnapshot {
+            mem_total_mib: total,
+            mem_available_mib: avail,
+            process_rss_mib: rss,
+            ..HostMetricsSnapshot::default()
         };
         // No memory data at all -> the guard idles (fail-safe).
         assert_eq!(
@@ -9327,7 +10077,10 @@ mod tests {
         .unwrap();
         assert_eq!(live.entity_mainhand_item_id(9), Some(5));
         let held_key = entity_pose_key(spec, &pose, Some(5));
-        assert_ne!(held_key, bare_key, "held item id must invalidate the mesh cache");
+        assert_ne!(
+            held_key, bare_key,
+            "held item id must invalidate the mesh cache"
+        );
         let held = build_entity_rig_mesh_with_mouth_item(spec, pose, Some(mouth_item_rgb(5)));
         assert_eq!(
             held.quads.len(),
@@ -9614,9 +10367,7 @@ mod tests {
         });
         app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Friends));
 
-        app.dispatch_ui_action(&UiAction::SetFriendShareMode(
-            UiShareMode::SelectedFriends,
-        ));
+        app.dispatch_ui_action(&UiAction::SetFriendShareMode(UiShareMode::SelectedFriends));
         let store = FriendsStore::load(&dir).unwrap();
         assert_eq!(store.share_mode, StoreShareMode::SelectedFriends);
         // No hosted world → armed, not a bogus "live" claim.
@@ -9673,10 +10424,7 @@ mod tests {
         assert!(parse_guest_link("nonsense").is_err());
         assert!(parse_guest_link("megu-friend:megu-id:BADID:MEGU-0000-0000:AAAA").is_err());
         // Token must decode to exactly 16 bytes.
-        assert!(parse_guest_link(&format!(
-            "megu-friend:{host_id}:{code}:AAAA"
-        ))
-        .is_err());
+        assert!(parse_guest_link(&format!("megu-friend:{host_id}:{code}:AAAA")).is_err());
         // A missing segment can't be salvaged.
         assert!(parse_guest_link(&format!("megu-friend:{host_id}")).is_err());
     }
@@ -9686,8 +10434,7 @@ mod tests {
     /// without panicking or leaving a bridge behind.
     #[test]
     fn join_friend_world_surfaces_errors_not_panics() {
-        let dir =
-            std::env::temp_dir().join(format!("megu-gpu-friend-join-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("megu-gpu-friend-join-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut app = GpuApp::new(GpuCliConfig {
@@ -10149,11 +10896,7 @@ mod tests {
         live.status = SessionStatus::Playing;
         app.attach_live(live);
         app.ui.screen = Screen::InGameHud;
-        app.ui.sign_editor = Some(SignEditorState::new(
-            (1, 64, 1),
-            true,
-            Default::default(),
-        ));
+        app.ui.sign_editor = Some(SignEditorState::new((1, 64, 1), true, Default::default()));
 
         // Ime::Commit path: multi-byte UTF-8 inserts intact.
         app.dispatch_committed_text("看板");
@@ -10326,10 +11069,12 @@ mod tests {
                 count: 1,
                 item_id: 5,
                 added: patch
-                    .map(|(type_id, data)| megu_client::protocol::ItemComponentPatch {
-                        type_id,
-                        data,
-                    })
+                    .map(
+                        |(type_id, data)| megu_client::protocol::ItemComponentPatch {
+                            type_id,
+                            data,
+                        },
+                    )
                     .into_iter()
                     .collect(),
                 removed: Vec::new(),
@@ -10348,10 +11093,7 @@ mod tests {
         // slot's normalized center.
         let cmd = enchant_glint_overlay_cmd(true, &enchanted, rect, 800, 600, 1.25)
             .expect("enchanted stack must shimmer while enabled");
-        let expected = enchantment_glint_rgb(
-            [(4.0 + 11.0) / 800.0, (6.0 + 11.0) / 600.0],
-            1.25,
-        );
+        let expected = enchantment_glint_rgb([(4.0 + 11.0) / 800.0, (6.0 + 11.0) / 600.0], 1.25);
         let channel = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
         assert_eq!(
             cmd,
@@ -10428,9 +11170,14 @@ mod tests {
             biomes: [0; 64],
             has_non_air: true,
         };
-        live.world
-            .columns
-            .insert((0, 0), ChunkColumn { cx: 0, cz: 0, sections });
+        live.world.columns.insert(
+            (0, 0),
+            ChunkColumn {
+                cx: 0,
+                cz: 0,
+                sections,
+            },
+        );
     }
 
     /// The `entity_shadows` toggle gates live contact-shadow staging:
@@ -10475,7 +11222,7 @@ mod tests {
     /// and fall back to the deterministic per-entity hue while off.
     #[test]
     fn staged_entity_glint_follows_enchantment_glint_gate() {
-        use megu_client::protocol::{ClientPlayEvent, PlayEvent, write_varint};
+        use megu_client::protocol::{write_varint, ClientPlayEvent, PlayEvent};
         let mut live = LiveSession::offline_with_null_audio();
         // Dropped enchanted stack: `minecraft:item` (type 58) carrying a
         // component-patched slot at metadata index 8.
@@ -10597,11 +11344,14 @@ mod tests {
     #[test]
     fn seamless_portal_channel_drives_crossfade_and_suppression() {
         use megu_proto::seamless_portal::{
-            PortalPrefetchHint, SeamlessDimCommit, encode_seamless_portal_packet,
+            encode_seamless_portal_packet, PortalPrefetchHint, SeamlessDimCommit,
         };
         let mut app = GpuApp::new(GpuCliConfig::default());
         app.attach_live(LiveSession::offline_with_null_audio());
-        assert_eq!(app.live.as_ref().unwrap().world.dimension.name, "minecraft:overworld");
+        assert_eq!(
+            app.live.as_ref().unwrap().world.dimension.name,
+            "minecraft:overworld"
+        );
 
         // Wrong channel and undecodable payloads are handed back.
         assert!(!app.apply_seamless_portal_channel("megu:other", &[]));
@@ -10731,7 +11481,10 @@ mod title_text_filter_tests {
         };
         assert!(is_builtin_title_text(&text_cmd(3, "MINECRAFT")));
         assert!(is_builtin_title_text(&text_cmd(1, "MEGU EDITION")));
-        assert!(is_builtin_title_text(&text_cmd(1, "clean-room native client")));
+        assert!(is_builtin_title_text(&text_cmd(
+            1,
+            "clean-room native client"
+        )));
         assert!(is_builtin_title_text(&text_cmd(
             1,
             "クリーンルーム ネイティブクライアント"
