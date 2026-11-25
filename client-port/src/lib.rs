@@ -42,6 +42,7 @@ pub mod upload_budget;
 pub mod vanilla_plus_3d;
 pub mod vanilla_plus_nature;
 pub mod vanilla_plus_visuals;
+pub mod vanilla_block_models;
 pub mod vfx_engine;
 pub mod visibility;
 pub mod voxel_dda_shadows;
