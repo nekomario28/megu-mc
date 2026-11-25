@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
+#![forbid(unsafe_code)]
 //! `megu_core::morton` — branchless SWAR magic-bit Morton (Z-order)
 //! encoders for cache-locality spatial indexing.
 //!
@@ -142,6 +143,62 @@ pub fn morton2_decode_u32(code: u32) -> (i16, i16) {
     (((bx ^ 0x8000) as i16), ((bz ^ 0x8000) as i16))
 }
 
+// ===========================================================================
+// 2D Morton — full 32 bits per axis (vanilla ±30M world border)
+// ===========================================================================
+
+/// Spread all 32 bits of `value` into every second bit position inside a
+/// `u64` (Morton `part1by1` over the full word).
+#[inline]
+fn spread_32_bits(mut value: u64) -> u64 {
+    value &= 0xffff_ffff;
+    value = (value | (value << 16)) & 0x0000_ffff_0000_ffff;
+    value = (value | (value << 8)) & 0x00ff_00ff_00ff_00ff;
+    value = (value | (value << 4)) & 0x0f0f_0f0f_0f0f_0f0f;
+    value = (value | (value << 2)) & 0x3333_3333_3333_3333;
+    (value | (value << 1)) & 0x5555_5555_5555_5555
+}
+
+/// Inverse of [`spread_32_bits`].
+#[inline]
+fn compact_32_bits(mut value: u64) -> u64 {
+    value &= 0x5555_5555_5555_5555;
+    value = (value | (value >> 1)) & 0x3333_3333_3333_3333;
+    value = (value | (value >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    value = (value | (value >> 4)) & 0x00ff_00ff_00ff_00ff;
+    value = (value | (value >> 8)) & 0x0000_ffff_0000_ffff;
+    (value | (value >> 16)) & 0xffff_ffff
+}
+
+/// Interleave the full 32 bits of each axis into a 64-bit Z-order code.
+///
+/// Unlike [`morton2_encode_i16`] this covers the entire `i32` coordinate
+/// space, so chunk columns out to the vanilla ±30M world border
+/// (`±1_875_000` chunks) — and far beyond — encode without truncation.
+#[inline]
+pub fn morton2_encode_u32_axes(cx: u32, cz: u32) -> u64 {
+    spread_32_bits(u64::from(cx)) | (spread_32_bits(u64::from(cz)) << 1)
+}
+
+/// Encode signed chunk coordinates `(cx, cz)` into a 64-bit Z-order key.
+///
+/// Each axis is sign-biased by `0x8000_0000` before interleaving, keeping
+/// the four quadrants around the world origin contiguous in code space
+/// over the full `i32` range — the full-width counterpart of
+/// [`morton2_encode_i16`].
+#[inline]
+pub fn morton2_encode_i32(cx: i32, cz: i32) -> u64 {
+    morton2_encode_u32_axes((cx as u32) ^ 0x8000_0000, (cz as u32) ^ 0x8000_0000)
+}
+
+/// Exact inverse of [`morton2_encode_i32`].
+#[inline]
+pub fn morton2_decode_u64(code: u64) -> (i32, i32) {
+    let bx = compact_32_bits(code) as u32;
+    let bz = compact_32_bits(code >> 1) as u32;
+    ((bx ^ 0x8000_0000) as i32, (bz ^ 0x8000_0000) as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +221,56 @@ mod tests {
             assert_eq!(spread_16_bits(v), expect, "spread16({v})");
             assert_eq!(compact_16_bits(expect), v, "compact16({expect})");
         }
+    }
+
+    #[test]
+    fn spread_32_matches_bit_by_bit_reference() {
+        for v in [
+            0u32,
+            1,
+            0x8000_0000,
+            0xffff_ffff,
+            0x1234_5678,
+            0xabcd_ef01,
+            1_875_000,
+        ] {
+            let mut expect = 0u64;
+            for i in 0..32 {
+                expect |= (u64::from(v >> i) & 1) << (2 * i);
+            }
+            assert_eq!(spread_32_bits(u64::from(v)), expect, "spread32({v})");
+            assert_eq!(compact_32_bits(expect) as u32, v, "compact32({expect})");
+        }
+    }
+
+    #[test]
+    fn morton2_full_width_roundtrips_world_border() {
+        // i32 extremes plus the vanilla ±30M-block border (±1_875_000
+        // chunks) and the origin quadrants.
+        let axes = [
+            i32::MIN,
+            -1_875_000,
+            -1,
+            0,
+            1,
+            1_875_000,
+            i32::MAX,
+        ];
+        for &cx in &axes {
+            for &cz in &axes {
+                assert_eq!(
+                    morton2_decode_u64(morton2_encode_i32(cx, cz)),
+                    (cx, cz),
+                    "roundtrip({cx}, {cz})"
+                );
+            }
+        }
+        // Deterministic code values at the sign-bias seam: -1 biases to
+        // 0x7fffffff (low 31 spread bits set) and 0 to 0x80000000.
+        assert_eq!(morton2_encode_i32(-1, -1), 0x3fff_ffff_ffff_ffff);
+        assert_eq!(morton2_encode_i32(0, 0), 0xc000_0000_0000_0000);
+        // The +1 neighbours of the origin sit one Z-order cell away.
+        assert_eq!(morton2_encode_i32(1, 0) - morton2_encode_i32(0, 0), 1);
+        assert_eq!(morton2_encode_i32(0, 1) - morton2_encode_i32(0, 0), 2);
     }
 }

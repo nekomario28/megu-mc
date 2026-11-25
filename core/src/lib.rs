@@ -151,10 +151,31 @@
 //!   (Omarchy/macOS/Windows sources), injection-proof AppleScript and
 //!   Toast notification builders, `caffeinate` keep-awake args, and the
 //!   fail-silent [`os_desktop::detect_os_theme`] entrypoint.
+//! * [`coords`] — the canonical dimension-aware spatial keys every
+//!   subsystem shares: [`coords::DimIndex`] (`u32`, vanilla `0..=2` plus
+//!   modded `>= 3`), [`coords::BlockPos`] with floor-division
+//!   chunk/section/section-local accessors, [`coords::ChunkKey`] and
+//!   [`coords::SectionKey`] (with a full `i32` `sy` for arbitrary world
+//!   heights), plus the deterministic zero-DoS [`coords::CoordHasher`]
+//!   and [`coords::CoordMap`]/[`coords::CoordSet`] aliases.
+//! * [`lz4`] — the single canonical bounded LZ4 block codec:
+//!   [`lz4::compress_block`] / [`lz4::compress_block_into`] and the
+//!   fail-closed [`lz4::decompress_block`] /
+//!   [`lz4::decompress_block_into`] / [`lz4::decompress_block_exact`],
+//!   which reject truncated streams, out-of-range match offsets and any
+//!   output past the caller's `max_output` cap *before* writing it.
+//! * [`section_rev`] — [`section_rev::SharedSectionRevTable`], the one
+//!   shared invalidation spine lighting, meshing, spatial audio, redstone
+//!   netlists, writeback and chunk wire caches all subscribe to: O(1)
+//!   [`section_rev::SharedSectionRevTable::bump_block`] bumps the owning
+//!   section, its chunk aggregate and every border-adjacent neighbour
+//!   section, keyed by the [`coords`] types so no duplicate revision
+//!   scheme can drift out of sync.
 
 #![deny(unsafe_code)]
 
 pub mod bits;
+pub mod coords;
 pub mod crash_report;
 pub mod crypto;
 pub mod diff_engine;
@@ -167,6 +188,7 @@ pub mod id;
 pub mod i18n;
 pub mod json;
 pub mod linux_desktop;
+pub mod lz4;
 pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
@@ -176,6 +198,7 @@ pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
+pub mod section_rev;
 pub mod server_perf_governors;
 pub mod simd_voxel;
 pub(crate) mod stats;

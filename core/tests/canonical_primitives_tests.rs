@@ -24,6 +24,68 @@ fn crc32_and_fnv_vectors_and_chunking() {
     assert_eq!(incremental.finish(), hash::fnv1a64(b"hello"));
 }
 
+/// Classic per-byte IEEE 802.3 reference (polynomial `0xEDB8_8320`),
+/// implemented here — not via `hash::CRC32_IEEE_TABLE` — so the test
+/// pins the public CRC against the definition, not against itself.
+fn crc32_reference(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        let mut crc = i as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                0xedb8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
+        }
+        *slot = crc;
+    }
+    let mut state = !0u32;
+    for &byte in data {
+        state = table[((state ^ u32::from(byte)) & 0xff) as usize] ^ (state >> 8);
+    }
+    !state
+}
+
+#[test]
+fn crc32_slice_by_8_is_bit_exact_against_reference() {
+    // Deterministic byte pattern with no period aligned to the 8-byte
+    // slicing stride.
+    let mut buf = Vec::with_capacity(65_536);
+    let mut state = 0x9e37_79b9u32;
+    while buf.len() < 65_536 {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        buf.push((state >> 16) as u8);
+    }
+
+    // Every length across several slice-by-8 block boundaries, plus a
+    // spread covering the whole 0..64KiB contract.
+    let mut lengths: Vec<usize> = (0..=520).collect();
+    lengths.extend([1_000, 4_095, 4_096, 4_097, 8_191, 16_384, 32_767, 65_535, 65_536]);
+    for &len in &lengths {
+        let data = &buf[..len];
+        assert_eq!(
+            hash::crc32_ieee(data),
+            crc32_reference(data),
+            "crc32_ieee differs from per-byte reference at len {len}"
+        );
+        // Incremental update across a split must equal the one-shot hash
+        // at every split point class (inside a block, on the boundary,
+        // mid-tail).
+        for &split in &[0usize, 1, 7, 8, 9, len / 2, len.saturating_sub(1), len] {
+            let split = split.min(len);
+            let first = hash::crc32_ieee(&data[..split]);
+            assert_eq!(
+                hash::crc32_ieee_update(first, &data[split..]),
+                crc32_reference(data),
+                "chunked update differs at len {len} split {split}"
+            );
+        }
+    }
+}
+
 #[test]
 fn protocol_varint_boundaries_and_rejection() {
     for value in [i32::MIN, -1, 0, 1, 127, 128, 16_383, 16_384, i32::MAX] {
