@@ -50,7 +50,11 @@ ureq = { version = "3.4.2", features = ["rustls"] }
 wgpu = { version = "30.0.1", default-features = false, features = ["wgsl", "std"] }
 winit = "0.30"
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# Vulkan on every Unix where wgpu exposes it: Linux plus the four BSDs
+# (FreeBSD / OpenBSD / NetBSD / DragonFly all ship Vulkan loader + drivers
+# through ports). Windows/macOS keep their native backends below; any other
+# OS falls back to the default-features = false base (headless-probe only).
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly"))'.dependencies]
 wgpu = { version = "30.0.1", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

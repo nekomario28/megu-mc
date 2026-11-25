@@ -1,0 +1,41 @@
+{
+  "version": "v0.1.0-alpha.3",
+  "description": "A Minecraft-compatible engine written in Rust",
+  "homepage": "https://github.com/nekomario28/megu-mc",
+  "license": "LGPL-3.0-or-later",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/megu-$version-windows-x86_64.tar.gz",
+      "extract_dir": "megu-$version-windows-x86_64"
+    },
+    "arm64": {
+      "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/megu-$version-windows-arm64.tar.gz",
+      "extract_dir": "megu-$version-windows-arm64"
+    }
+  },
+  "bin": ["megu.exe", "megu-client-gpu.exe", "megu-installer.exe"],
+  "checkver": {
+    "url": "https://api.github.com/repos/nekomario28/megu-mc/releases?per_page=1",
+    "jsonpath": "$[0].tag_name"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/megu-$version-windows-x86_64.tar.gz",
+        "extract_dir": "megu-$version-windows-x86_64",
+        "hash": {
+          "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/SHA256SUMS-all.txt",
+          "regex": "(?m)^([a-f0-9]{64})  megu-$version-windows-x86_64\\.tar\\.gz$"
+        }
+      },
+      "arm64": {
+        "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/megu-$version-windows-arm64.tar.gz",
+        "extract_dir": "megu-$version-windows-arm64",
+        "hash": {
+          "url": "https://github.com/nekomario28/megu-mc/releases/download/$version/SHA256SUMS-all.txt",
+          "regex": "(?m)^([a-f0-9]{64})  megu-$version-windows-arm64\\.tar\\.gz$"
+        }
+      }
+    }
+  }
+}

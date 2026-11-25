@@ -36,7 +36,8 @@ pub enum Lz4Error {
     /// The stream ended before the token-implied structure was complete.
     Truncated,
     /// A match offset was zero or pointed before the block's output start.
-    BadOffset,
+    /// Carries the offending encoded offset for caller diagnostics.
+    BadOffset(usize),
     /// Decoded output would exceed the caller's output bound.
     TooLarge,
     /// The stream decoded cleanly but not to the exact length the caller
@@ -48,7 +49,9 @@ impl fmt::Display for Lz4Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Truncated => f.write_str("truncated LZ4 stream"),
-            Self::BadOffset => f.write_str("LZ4 match offset out of range"),
+            Self::BadOffset(offset) => {
+                write!(f, "LZ4 match offset {offset} out of range")
+            }
             Self::TooLarge => f.write_str("LZ4 output exceeds the bound"),
             Self::LengthMismatch => f.write_str("LZ4 output length differs from expected"),
         }
@@ -219,7 +222,7 @@ pub fn decompress_block_into(
         let offset = usize::from(u16::from_le_bytes([src[i], src[i + 1]]));
         i = offset_end;
         if offset == 0 || offset > out.len() - base {
-            return Err(Lz4Error::BadOffset);
+            return Err(Lz4Error::BadOffset(offset));
         }
 
         let mut match_len = usize::from(token & 0x0f);
@@ -348,12 +351,12 @@ mod tests {
         // offset = 0
         assert_eq!(
             decompress_block(&[0x00, 0x00, 0x00], 64),
-            Err(Lz4Error::BadOffset)
+            Err(Lz4Error::BadOffset(0))
         );
         // offset points before block start (1 literal, offset 5)
         assert_eq!(
             decompress_block(&[0x10, b'x', 0x05, 0x00], 64),
-            Err(Lz4Error::BadOffset)
+            Err(Lz4Error::BadOffset(5))
         );
     }
 
@@ -399,7 +402,7 @@ mod tests {
         // Offsets may not reach into the pre-existing bytes.
         assert_eq!(
             decompress_block_into(&[0x10, b'x', 0x02, 0x00], &mut vec![0xaa; 4], 64),
-            Err(Lz4Error::BadOffset)
+            Err(Lz4Error::BadOffset(2))
         );
         // The cap counts pre-existing bytes too.
         assert_eq!(

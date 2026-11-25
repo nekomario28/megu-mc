@@ -151,6 +151,12 @@
 //!   (Omarchy/macOS/Windows sources), injection-proof AppleScript and
 //!   Toast notification builders, `caffeinate` keep-awake args, and the
 //!   fail-silent [`os_desktop::detect_os_theme`] entrypoint.
+//! * [`autostart_service`] — opt-in cross-platform boot-service plans with
+//!   atomic file installation, ownership-checked uninstall and status checks.
+//! * [`landlock_sandbox`] — Linux Landlock kernel filesystem sandboxing
+//!   (ABI-aware through v7) with graceful unsupported-kernel degradation.
+//! * [`self_updater`] — atomic self-update and instant-rollback engine with
+//!   strict release selection, SHA-256 verification and launcher pin sync.
 //! * [`coords`] — the canonical dimension-aware spatial keys every
 //!   subsystem shares: [`coords::DimIndex`] (`u32`, vanilla `0..=2` plus
 //!   modded `>= 3`), [`coords::BlockPos`] with floor-division
@@ -174,6 +180,7 @@
 
 #![deny(unsafe_code)]
 
+pub mod autostart_service;
 pub mod bits;
 pub mod coords;
 pub mod crash_report;
@@ -187,6 +194,7 @@ pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
 pub mod json;
+pub mod landlock_sandbox;
 pub mod linux_desktop;
 pub mod lz4;
 pub mod math;
@@ -198,6 +206,7 @@ pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
+pub mod self_updater;
 pub mod section_rev;
 pub mod server_perf_governors;
 pub mod simd_voxel;

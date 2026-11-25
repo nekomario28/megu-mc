@@ -10,10 +10,13 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
 TOOLCHAIN = ROOT / "rust-toolchain.toml"
 REQUIRED_JOBS = {"preflight", "build-matrix", "docker-check", "publish-release"}
-BINARIES = (
-    "megu", "megu-client", "megu-mod-check",
-    "megu-world-migrate", "megu-init", "megu-admin",
-    "megu-client-gpu", "megu-installer",
+# The full desktop+server lanes ship exactly these three end-user binaries.
+BINARIES = ("megu", "megu-client-gpu", "megu-installer")
+# Internal/companion tools stay source-buildable but must not be built,
+# bundled or published by the release matrix.
+DROPPED_BINARIES = (
+    "megu-client", "megu-mod-check", "megu-world-migrate",
+    "megu-init", "megu-admin",
 )
 
 
@@ -106,28 +109,38 @@ class ReleaseWorkflowTest(unittest.TestCase):
             ("ubuntu-22.04", "linux-x86_64-musl"),
             ("ubuntu-22.04-arm", "linux-arm64"),
             ("ubuntu-22.04-arm", "linux-arm64-musl"),
+            ("ubuntu-22.04", "linux-x86_64-musl-client"),
+            ("ubuntu-22.04-arm", "linux-arm64-musl-client"),
+            ("ubuntu-22.04", "freebsd-x86_64"),
+            ("ubuntu-22.04", "linux-riscv64"),
             ("macos-latest", "macos-arm64"),
             ("macos-latest", "macos-x86_64"),
             ("windows-latest", "windows-x86_64"),
             ("windows-11-arm", "windows-arm64"),
         ):
             self.assertIn(f"- os: {runner}\n            target: {target}", job)
-        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 8)
+        self.assertEqual(len(re.findall(r"(?m)^          - os:", job)), 12)
+        for manifest in ("server-files/Cargo.toml", "client-gpu/Cargo.toml"):
+            self.assertIn(manifest, job)
+        # The dropped companion crates must not be built for release.
         for manifest in (
             "client-app/Cargo.toml", "mod-adapter-core/Cargo.toml",
-            "state-store/Cargo.toml", "server-files/Cargo.toml",
-            "client-gpu/Cargo.toml",
+            "state-store/Cargo.toml",
         ):
-            self.assertIn(manifest, job)
-        # Six full builds (glibc/macos/windows, incl. the x86_64 cross lane)
-        # plus the two-command musl branch.
-        self.assertEqual(job.count("cargo build --locked --release"), 8)
-        self.assertIn("--manifest-path server-files/Cargo.toml --bins", job)
+            self.assertNotIn(manifest, job)
+        # Three full-lane builds (megu, megu-client-gpu, megu-installer)
+        # plus the shared two-command server-only branch used by the musl,
+        # FreeBSD and RISC-V lanes; the musl-client lanes build in Docker.
+        self.assertEqual(job.count("cargo build --locked --release"), 5)
+        self.assertNotIn("--bins", job)
+        self.assertIn("--manifest-path server-files/Cargo.toml --bin megu-installer", job)
         self.assertIn("--manifest-path client-gpu/Cargo.toml --bin megu-client-gpu", job)
         self.assertIn("tools/release_bundle.py build", job)
         self.assertIn("tools/release_bundle.py verify", job)
-        # Seven glibc extras plus the single musl installer extra-binary.
-        self.assertEqual(job.count("--extra-binary"), 8)
+        # Two full-lane extras (GPU client + installer) plus the single
+        # server-only installer extra-binary shared by the
+        # musl/FreeBSD/RISC-V lanes.
+        self.assertEqual(job.count("--extra-binary"), 3)
         self.assertIn(
             '--extra-binary "server-files/target/$rel_dir/megu-installer$suffix"',
             job,
@@ -135,6 +148,8 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn('$rel_dir', job)
         for binary in BINARIES:
             self.assertIn(f"/{binary}$suffix", job)
+        for binary in DROPPED_BINARIES:
+            self.assertNotIn(f"/{binary}$suffix", job)
         self.assertIn("if-no-files-found: error", job)
         self.assertIn(
             "cargo build --locked --release --features mod-suite,create-offload --bin megu",
@@ -168,6 +183,46 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # glibc runners moved to the 2.35 baseline for Debian 12+ compatibility.
         self.assertNotIn("ubuntu-latest\n            target: linux", job)
         self.assertNotIn("ubuntu-24.04-arm", job)
+
+    def test_xplat_server_and_musl_client_lanes(self):
+        job = self.jobs["build-matrix"]
+        # Dynamic-musl GPU client: dedicated container step, never the host
+        # musl-gcc path (that one must stay +crt-static for `FROM scratch`).
+        self.assertIn("kind: musl-client", job)
+        self.assertIn("if: matrix.kind == 'musl-client'", job)
+        self.assertIn("-f packaging/docker/Dockerfile.alpine-client", job)
+        self.assertIn('--build-arg RUST_TARGET="$RUST_TARGET"', job)
+        self.assertIn("docker cp", job)
+        self.assertIn('readelf -l dist-bin/megu-client-gpu | grep -q', job)
+        # FreeBSD server: clang+lld against a checksum-pinned base.txz
+        # sysroot — every input is first-party, no third-party VM action.
+        self.assertIn("kind: bsd", job)
+        self.assertIn("if: matrix.kind == 'bsd'", job)
+        self.assertIn("x86_64-unknown-freebsd", job)
+        self.assertIn("base.txz", job)
+        self.assertIn("sha256sum -c -", job)
+        self.assertIn(
+            "CARGO_TARGET_X86_64_UNKNOWN_FREEBSD_LINKER=clang", job)
+        self.assertIn("CC_x86_64_unknown_freebsd=clang", job)
+        self.assertIn("--sysroot=$FREEBSD_SYSROOT", job)
+        # RISC-V 64 server: Ubuntu gcc-riscv64-linux-gnu cross toolchain.
+        self.assertIn("kind: riscv", job)
+        self.assertIn("if: matrix.kind == 'riscv'", job)
+        self.assertIn("gcc-riscv64-linux-gnu", job)
+        self.assertIn("riscv64gc-unknown-linux-gnu", job)
+        self.assertIn(
+            "CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER="
+            "riscv64-linux-gnu-gcc",
+            job,
+        )
+        self.assertIn(
+            "AR_riscv64gc_unknown_linux_gnu=riscv64-linux-gnu-ar", job)
+        # All three server-only kinds share the musl two-binary build branch.
+        self.assertIn(
+            '"$MATRIX_KIND" == musl || "$MATRIX_KIND" == bsd'
+            ' || "$MATRIX_KIND" == riscv',
+            job,
+        )
 
     def test_macos_deployment_target_and_extended_platforms(self):
         job = self.jobs["build-matrix"]
@@ -229,7 +284,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
             job,
         )
         self.assertIn(
-            "'linux-arm64-musl', 'macos-arm64', 'macos-x86_64',",
+            "'linux-arm64-musl', 'linux-x86_64-musl-client',",
+            job,
+        )
+        self.assertIn(
+            "'linux-arm64-musl-client', 'freebsd-x86_64',",
+            job,
+        )
+        self.assertIn(
+            "'linux-riscv64', 'macos-arm64', 'macos-x86_64',",
             job,
         )
         self.assertIn(
@@ -238,13 +301,33 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         for target in (
             "linux-x86_64", "linux-x86_64-musl", "linux-arm64", "linux-arm64-musl",
+            "linux-x86_64-musl-client", "linux-arm64-musl-client",
+            "freebsd-x86_64", "linux-riscv64",
             "macos-arm64", "macos-x86_64", "windows-x86_64", "windows-arm64",
         ):
             self.assertIn(f"'{target}'", job)
-        self.assertIn("musl_binaries = ('megu', 'megu-installer')", job)
+        self.assertIn(
+            "desktop_binaries = ('megu', 'megu-client-gpu', 'megu-installer')",
+            job,
+        )
+        self.assertIn("server_binaries = ('megu', 'megu-installer')", job)
+        self.assertIn("client_binaries = ('megu-client-gpu',)", job)
+        self.assertIn("'freebsd-x86_64', 'linux-riscv64'", job)
+        self.assertIn("target.endswith('-musl-client')", job)
         self.assertIn("target.endswith('-musl')", job)
         self.assertIn("tools/release_bundle.py', 'verify'", job)
+        # Every archive is still verified against its per-target
+        # release-manifest.json, but only one aggregated manifest is
+        # published — the twelve release-manifest-<target>.json files must
+        # never reach dist/publish.
         self.assertIn("'release-manifest.json'", job)
+        self.assertIn("manifests[target] = metadata", job)
+        self.assertIn(
+            'f\'megu-{os.environ["RELEASE_VERSION"]}-release-manifest.json\'',
+            job,
+        )
+        self.assertNotIn("release-manifest-{target}", job)
+        self.assertNotIn("release-manifest-{", job)
         self.assertIn("SHA256SUMS-all.txt", job)
         self.assertIn("--verify-tag", job)
         self.assertIn("--target", job)

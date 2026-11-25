@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Template file for 'megu'
+pkgname=megu
+version=0.1.0a3
+# Upstream tags are v<ver>-alpha.<n>; xbps version folds the pre-release.
+_upstream_tag="0.1.0-alpha.3"
+revision=1
+build_wrksrc="megu-mc-${_upstream_tag}"
+build_style=cargo
+build_helper="rust"
+hostmakedepends="pkg-config"
+makedepends="alsa-lib-devel libxkbcommon-devel vulkan-loader-devel
+ wayland-devel wayland-protocols"
+short_desc="Clean-room Minecraft-compatible server and native GPU client"
+maintainer="nekomario28 <206304251+nekomario28@users.noreply.github.com>"
+license="LGPL-3.0-or-later"
+homepage="https://github.com/nekomario28/megu-mc"
+distfiles="https://github.com/nekomario28/megu-mc/archive/v${_upstream_tag}.tar.gz"
+# Fill in with `xgensum -i megu` once the upstream tag is published.
+checksum=""
+
+# glibc and musl share this template. Void's musl Rust keeps the upstream
+# +crt-static default; the GPU client must be dynamic so it can dlopen the
+# system's Vulkan/Wayland/X11 drivers. The statically-linked server and
+# installer are unaffected because they are built with plain `cargo build`
+# for the host triple only when RUSTFLAGS is scoped to the client build.
+pre_build() {
+	if [ "$XBPS_TARGET_LIBC" = "musl" ]; then
+		export MEGU_CLIENT_RUSTFLAGS="-C target-feature=-crt-static"
+	else
+		export MEGU_CLIENT_RUSTFLAGS=""
+	fi
+}
+
+do_build() {
+	cargo build --release --locked --target "${RUST_TARGET}" \
+		--features mod-suite,create-offload --bin megu \
+		${make_build_args}
+	(cd server-files && cargo build --release --locked \
+		--target "${RUST_TARGET}" \
+		--bin megu-installer ${make_build_args})
+	(cd client-gpu && \
+		RUSTFLAGS="${MEGU_CLIENT_RUSTFLAGS} ${RUSTFLAGS:-}" \
+		cargo build --release --locked --target "${RUST_TARGET}" \
+		--bin megu-client-gpu ${make_build_args})
+}
+
+do_install() {
+	vbin "target/${RUST_TARGET}/release/megu" megu
+	vbin "server-files/target/${RUST_TARGET}/release/megu-installer" \
+		megu-installer
+	vbin "client-gpu/target/${RUST_TARGET}/release/megu-client-gpu" \
+		megu-client-gpu
+	vlicense LICENSE
+	vlicense LICENSING.md
+	vdoc README.md
+}

@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Template: fill PackageVersion and InstallerSha256 from the published
+# SHA256SUMS-all.txt entry when submitting to the WinGet community repository.
+PackageIdentifier: nekomario28.Megu
+PackageVersion: 0.1.0-alpha.3
+PackageName: Megu
+Publisher: nekomario28
+License: LGPL-3.0-or-later
+ShortDescription: A Minecraft-compatible engine written in Rust
+PackageUrl: https://github.com/nekomario28/megu-mc
+ManifestType: singleton
+ManifestVersion: 1.6.0
+Installers:
+  - Architecture: x64
+    InstallerType: portable
+    InstallerUrl: https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.3/megu-installer-windows-x86_64.exe
+    InstallerSha256: PLACEHOLDER
+    Commands:
+      - megu
+  - Architecture: arm64
+    InstallerType: portable
+    InstallerUrl: https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.3/megu-installer-windows-arm64.exe
+    InstallerSha256: PLACEHOLDER
+    Commands:
+      - megu
