@@ -36,6 +36,7 @@ use crate::protocol::{
     decode_megu_custom_payload, MeguCustomPayload, PlayEvent, SeasonWireSync, WireReader,
 };
 use crate::recovery::{ContainmentOutcome, CrashCircuitBreaker, CrashGuard, RecoveryAction};
+use crate::replay::{InstantReplayBuffer, ReplayError, ReplayStats};
 use crate::sound_assets::{normalize_sound_name, sound_name_hash};
 use crate::spatial_audio::{
     AcousticMaterial, AcousticTracer, ListenerPose, MaterialClass, SharedListenerFdnBus,
@@ -46,6 +47,9 @@ use megu_client_mesh::tactile_effects::EnvironmentAudioHint;
 
 /// Default spatial-audio sample rate (matches the `VCR1` PCM path).
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+
+/// Uncompressed-history cap for the session's instant-replay ring.
+const INSTANT_REPLAY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 
 /// A session subsystem that [`ClientSession::run_guarded_subsystem`] can
 /// contain individually. Once the circuit breaker trips on a subsystem's
@@ -124,6 +128,10 @@ pub struct ClientSession {
     pub latest_season: Option<SeasonWireSync>,
     /// Live Create kinetic nodes and changes waiting for the GPU session.
     kinetic_sync: KineticSyncStore,
+    /// Bounded instant-replay ring of raw custom-payload frames: every
+    /// routed frame is snapshotted losslessly so an Instant Replay owner
+    /// can flush the trailing window without a second network pass.
+    instant_replay: InstantReplayBuffer,
     /// Subsystems disabled after their breaker trip.
     disabled_subsystems: BTreeSet<GuardedSubsystem>,
     /// Blame metadata for crash reports captured by [`CrashGuard`].
@@ -146,6 +154,7 @@ impl ClientSession {
             crash_breaker: CrashCircuitBreaker::new(),
             latest_season: None,
             kinetic_sync: KineticSyncStore::default(),
+            instant_replay: InstantReplayBuffer::new(INSTANT_REPLAY_BUFFER_BYTES),
             disabled_subsystems: BTreeSet::new(),
             report_env,
             crash_dir,
@@ -158,6 +167,7 @@ impl ClientSession {
     /// [`MeguCustomPayload::Season`]. Malformed frames and unrecognized
     /// channels fail closed with `false` and leave session state untouched.
     pub fn handle_megu_custom_payload(&mut self, channel: &str, data: &[u8]) -> bool {
+        self.instant_replay.push_packet(data);
         if matches!(
             channel,
             CHANNEL_CREATE_KINETIC_SYNC | CHANNEL_CREATE_KINETIC_UPDATE
@@ -177,6 +187,24 @@ impl ClientSession {
             Some(_) => true,
             None => false,
         }
+    }
+
+    /// Instant-replay ring counters (`packets`, `blocks`, byte totals,
+    /// milli compression ratio) for the debug overlay.
+    pub fn instant_replay_stats(&self) -> ReplayStats {
+        self.instant_replay.stats()
+    }
+
+    /// Decode the retained instant-replay window, capped at `max_out`
+    /// packets, for an export/flush path. Frames too large for the
+    /// bounded ring were rejected at push time and never reach here.
+    pub fn instant_replay_packets(&self, max_out: usize) -> Result<Vec<Vec<u8>>, ReplayError> {
+        self.instant_replay.packets_capped(max_out)
+    }
+
+    /// Seal the partial instant-replay block before an export snapshot.
+    pub fn flush_instant_replay(&mut self) {
+        self.instant_replay.flush();
     }
 
     /// Drain Create nodes received since the previous drain and positions

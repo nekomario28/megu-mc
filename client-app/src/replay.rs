@@ -198,7 +198,7 @@ impl From<Lz4Error> for ReplayError {
     fn from(error: Lz4Error) -> Self {
         match error {
             Lz4Error::TooLarge => Self::OutputLimit,
-            Lz4Error::Truncated | Lz4Error::BadOffset | Lz4Error::LengthMismatch => {
+            Lz4Error::Truncated | Lz4Error::BadOffset(_) | Lz4Error::LengthMismatch => {
                 Self::Malformed
             }
         }

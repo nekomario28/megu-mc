@@ -512,6 +512,20 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
             ));
         }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok() {
+            // Best-effort instant-resume record: the last world the
+            // integrated server actually reached is what a later
+            // `resolve_resume` offers — a failed store write must never
+            // block a running server.
+            let _ = crate::seamless_runtime::InstantResumeStore::new(
+                game_dir.join("megu-resume.json"),
+            )
+            .save(
+                crate::seamless_runtime::ResumeTarget::SingleplayerWorld {
+                    world_dir: world_dir.clone(),
+                    display_name: world.to_string(),
+                },
+                None,
+            );
             return Ok(SingleplayerServer {
                 child,
                 port,

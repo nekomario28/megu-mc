@@ -248,6 +248,24 @@ impl LodManager {
         self.tier_at(self.camera, cx, cz)
     }
 
+    /// Far-horizon ring a column beyond `coarse_lod_radius` falls into,
+    /// measured from the last camera position. The summarized-column
+    /// store stops at the coarse radius; every `LodTier::Culled` column
+    /// past it is drawn by the direct-sampled [`crate::far_direct_lod`]
+    /// rings, classified by the same Chebyshev chunk distance. Columns
+    /// still inside the summarized radii return `None`.
+    pub fn far_ring_for(
+        &self,
+        cx: i32,
+        cz: i32,
+    ) -> Option<crate::far_direct_lod::LodRingLevel> {
+        let distance = chebyshev(self.camera, cx, cz);
+        if distance <= i64::from(self.config.coarse_lod_radius) {
+            return None;
+        }
+        crate::far_direct_lod::LodRingLevel::for_distance(distance as u32)
+    }
+
     fn tier_at(&self, camera: (i32, i32), cx: i32, cz: i32) -> LodTier {
         let distance = chebyshev(camera, cx, cz);
         if distance <= i64::from(self.config.full_detail_radius) {
