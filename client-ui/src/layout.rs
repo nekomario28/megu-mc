@@ -596,12 +596,12 @@ fn title(ctx: &mut Ctx) {
     ctx.btn(
         WidgetId::TitleSingleplayer,
         lr(x, y, bw, bh),
-        tr(lang, "Singleplayer", "シングルプレイ"),
+        ctx.state.translate("menu.singleplayer", tr(lang, "Singleplayer", "シングルプレイ")),
     );
     ctx.btn(
         WidgetId::TitleMultiplayer,
         lr(x, y + step, bw, bh),
-        tr(lang, "Multiplayer", "マルチプレイ"),
+        ctx.state.translate("menu.multiplayer", tr(lang, "Multiplayer", "マルチプレイ")),
     );
     // Vanilla's Realms/Mods slot splits into two half-width buttons.
     let y3 = y + 2 * step;
@@ -627,12 +627,12 @@ fn title(ctx: &mut Ctx) {
     ctx.btn(
         WidgetId::TitleSettings,
         lr(x, y4, half, bh),
-        tr(lang, "Options...", "設定..."),
+        ctx.state.translate("menu.options", tr(lang, "Options...", "設定...")),
     );
     ctx.btn(
         WidgetId::TitleQuit,
         lr(x + bw - half, y4, half, bh),
-        tr(lang, "Quit Game", "ゲームを終了"),
+        ctx.state.translate("menu.quit", tr(lang, "Quit Game", "ゲームを終了")),
     );
     icon_btn(
         ctx,
@@ -692,7 +692,7 @@ fn singleplayer(ctx: &mut Ctx) {
 
     // The create block anchors to the footer: label + name field + seed
     // field + button = 78 logical px. The world list owns what remains.
-    let create_h = 78;
+    let create_h = 100;
     let create_top = (ctx.band_top - 4 - create_h).max(36);
     let list_top = 34;
     let list_bottom = create_top - 4;
@@ -776,9 +776,13 @@ fn singleplayer(ctx: &mut Ctx) {
         ctx.state.world_seed_field_active(),
         tr(lang, "Seed (optional)", "シード（オプション）"),
     );
+    let mode = match ctx.state.singleplayer.game_mode { crate::state::SingleplayerGameMode::Survival => "Survival", crate::state::SingleplayerGameMode::Creative => "Creative", crate::state::SingleplayerGameMode::Hardcore => "Hardcore" };
+    let difficulty = match ctx.state.singleplayer.difficulty { crate::state::SingleplayerDifficulty::Peaceful => "Peaceful", crate::state::SingleplayerDifficulty::Easy => "Easy", crate::state::SingleplayerDifficulty::Normal => "Normal", crate::state::SingleplayerDifficulty::Hard => "Hard" };
+    ctx.btn(WidgetId::SingleplayerGameMode, lr(px, create_top + 56, pw / 2 - 2, 18), &format!("Game Mode: {mode}"));
+    ctx.btn(WidgetId::SingleplayerDifficulty, lr(px + pw / 2 + 2, create_top + 56, pw / 2 - 2, 18), &format!("Difficulty: {difficulty}"));
     ctx.btn(
         WidgetId::SingleplayerCreate,
-        lr(px, create_top + 56, pw, 18),
+        lr(px, create_top + 78, pw, 18),
         tr(lang, "Create & Play", "作成してプレイ"),
     );
     ctx.band_top = i32::MAX;
@@ -3054,10 +3058,26 @@ fn embedded_recipe_browser(ctx: &mut Ctx) {
 
 fn hud(ctx: &mut Ctx) {
     let hud: &HudState = &ctx.state.hud;
+    if hud.hud_hidden { return; }
     let qol = &ctx.state.settings.qol;
     let lang = ctx.lang;
     let (w, h) = (ctx.w, ctx.h);
     let cx = w / 2;
+
+    let overlay = hud.screen_overlay;
+    for (alpha,color) in [(overlay.hurt_alpha, UiColor::rgb(180,0,0)), (overlay.fire_alpha, UiColor::rgb(255,90,0)), (overlay.underwater_alpha, UiColor::rgb(20,70,180)), (overlay.portal_alpha, UiColor::rgb(110,20,150)), (overlay.freezing_alpha, UiColor::rgb(120,210,255)), (overlay.vignette_alpha, UiColor::rgb(0,0,0))] {
+        let a=(alpha.clamp(0.0,1.0)*100.0) as u8;
+        if a>0 { ctx.fill(0,0,w,h,UiColor::rgba(color.r,color.g,color.b,a)); }
+    }
+    if overlay.pumpkin_blur { ctx.fill(0,0,w,h,UiColor::rgba(35,20,0,28)); }
+    for (i,effect) in hud.status_effects.iter().enumerate() {
+        let x=w-104; let y=8+i as i32*18;
+        let color=if effect.beneficial {UiColor::rgb(60,150,70)} else {UiColor::rgb(160,55,55)};
+        ctx.fill(x,y,16,16,color); ctx.text(x+3,y+4,1,pal::TEXT,&effect.effect_id.rem_euclid(10).to_string());
+        let level=match effect.amplifier {0=>"",1=>" II",2=>" III",3=>" IV",n=>if n>=4 {" V"} else {""}};
+        let secs=effect.duration_ticks/20; let label=format!("{}{level} {:02}:{:02}",effect.name,secs/60,secs%60);
+        ctx.text(x+19,y+4,1,pal::TEXT,&label);
+    }
 
     // Opt-in MiniHUD lines — empty while disabled, so the disabled path
     // emits exactly zero commands.
@@ -3099,6 +3119,7 @@ fn hud(ctx: &mut Ctx) {
         let cc = UiColor::rgba(230, 230, 230, 190);
         ctx.fill(cx - 5, h / 2, 11, 1, cc);
         ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+        if hud.attack_cooldown < 1.0 { ctx.progress(lr(cx-45,h/2+8,90,4),hud.attack_cooldown.clamp(0.0,1.0),pal::TEXT,UiColor::rgb(35,35,35),pal::BUTTON_BORDER); }
     }
 
     // Hotbar: offhand + 9 slots.
@@ -3133,6 +3154,7 @@ fn hud(ctx: &mut Ctx) {
             icon_row(ctx, hx0, vy - 20, hud.absorption, 20.0, pal::ABSORPTION);
         }
         icon_row_r(ctx, rx, vy, hud.hunger as f32, 20.0, pal::HUNGER);
+        if let Some((health,max))=hud.mount_health { icon_row_r(ctx,rx,vy-10,health,max.max(1.0),pal::HEALTH); }
         if hud.air < 300 {
             icon_row_r(ctx, rx, vy - 10, hud.air as f32 / 30.0, 10.0, pal::AIR);
         }
@@ -3145,6 +3167,7 @@ fn hud(ctx: &mut Ctx) {
             UiColor::rgb(20, 30, 14),
             pal::BUTTON_BORDER,
         );
+        if let Some(charge)=hud.mount_jump_charge { ctx.progress(lr(cx-91,hy-4,182,3),charge.clamp(0.0,1.0),pal::XP,UiColor::rgb(20,30,14),pal::BUTTON_BORDER); }
         if hud.xp_level > 0 {
             ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
         }
@@ -4514,7 +4537,7 @@ fn pause(ctx: &mut Ctx) {
     ctx.btn(
         WidgetId::PauseBackToGame,
         lr(x, y, bw, bh),
-        tr(lang, "Back to Game", "ゲームに戻る"),
+        ctx.state.translate("menu.returnToGame", tr(lang, "Back to Game", "ゲームに戻る")),
     );
     y += step;
     ctx.btn(
