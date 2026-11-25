@@ -53,6 +53,7 @@ python3 tests/native_survival_oracle_test.py
 python3 tests/native_neighbor_trace_test.py
 python3 tests/native_cargo_gate_test.py
 python3 tests/feature_coverage_test.py
+python3 tests/startup_bench_test.py
 python3 tests/test_saved_tick_inventory.py
 python3 tests/biome_tree_test.py
 python3 tests/carver_diff_test.py

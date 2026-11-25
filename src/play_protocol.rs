@@ -5691,6 +5691,51 @@ impl ChunkWindow {
     }
 }
 
+/// Explicit bound for a connection's `sent` chunk set: the bounding box of
+/// one full window at `radius` (the delivery scan extends one chunk past the
+/// nominal radius, so the side is `2*radius + 3`). The `leaving` prune in
+/// `stream_chunks` keeps the set exactly at the window on every call; this
+/// bound is the invariant a future insert path must also respect.
+fn sent_chunks_bound(radius: i32) -> usize {
+    let side = (2 * radius.max(0) + 3) as usize;
+    side * side
+}
+
+#[cfg(test)]
+mod sent_chunks_bound_tests {
+    use super::*;
+
+    #[test]
+    fn sent_chunk_set_is_explicitly_bounded_by_the_window() {
+        // The bounding-box side extends one chunk past the nominal radius.
+        assert_eq!(sent_chunks_bound(0), 9);
+        assert_eq!(sent_chunks_bound(2), 49);
+        assert_eq!(sent_chunks_bound(32), 67 * 67);
+        // A set flooded far past the window prunes back to the bound: first
+        // the exact `leaving` pass the stream runs, then the explicit
+        // retain invariant — the result never exceeds one bounding box.
+        let window = ChunkWindow {
+            center: (0, 0),
+            radius: 2,
+        };
+        let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for x in -60..60 {
+            for z in -60..60 {
+                sent.insert((x, z));
+            }
+        }
+        assert!(sent.len() > sent_chunks_bound(window.radius));
+        for c in window.leaving(None, &sent) {
+            sent.remove(&c);
+        }
+        if sent.len() > sent_chunks_bound(window.radius) {
+            sent.retain(|&c| window.contains(c));
+        }
+        assert!(sent.len() <= sent_chunks_bound(window.radius));
+        assert!(sent.iter().all(|&c| window.contains(c)));
+    }
+}
+
 /// The login path sends only the spawn chunk and its immediate ring before the
 /// teleport handshake. The configured view distance is filled by the ordinary
 /// chunk delivery loop after the player is registered.
@@ -6495,6 +6540,13 @@ fn stream_chunks(
         }
         sent.remove(&c);
         gen.remove(&c);
+    }
+    // Defense-in-depth bound: `sent` may never hold more than one window
+    // bounding box. The prune above already enforces it exactly; this retain
+    // is the explicit invariant against any path that could insert outside
+    // the window without pruning.
+    if sent.len() > sent_chunks_bound(window.radius) {
+        sent.retain(|&c| window.contains(c));
     }
     // The centre update is not part of a batch, but it is the answer a view
     // request waits for even when nothing new is to be sent.
@@ -16362,6 +16414,7 @@ mod play_protocol_opt_s2_tests {
 /// broadcasts. Runs exactly once per connection through
 /// `ConnectionCleanupGuard`; `forget_live_client` covers the residual client
 /// list/maps when a panic interrupted it partway.
+#[cfg(test)]
 fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
     disconnect_cleanup_with_login(me_cleanup, peer, &mut None);
 }
@@ -16377,6 +16430,14 @@ fn disconnect_cleanup_with_login(
     cls.retain(|c| c.eid != me_cleanup.eid);
     let last_client_left = cls.is_empty();
     drop(cls);
+    // The sent-chunk set is only meaningful while the connection is live:
+    // drop it explicitly so a lingering `Client` Arc in a reader's snapshot
+    // cannot retain the bounding-box of chunk keys past disconnect.
+    me_cleanup
+        .chunks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     {
         eprintln!("[spine] {} left (from {})", me_cleanup.name, peer);
         {

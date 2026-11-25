@@ -169,7 +169,6 @@ impl RedstoneWireSolver {
 pub struct RedstoneNetlistCache {
     section_rev: Option<u64>,
     components: Vec<Vec<WireNode>>,
-    component_by_pos: HashMap<WirePos, usize>,
     dirty_components: HashSet<usize>,
     dirty_positions: HashSet<WirePos>,
     solver: Option<RedstoneWireSolver>,
@@ -286,19 +285,8 @@ impl RedstoneNetlistCache {
     }
 
     fn reindex(&mut self) {
-        self.component_by_pos.clear();
-        for (component, nodes) in self.components.iter().enumerate() {
-            for node in nodes {
-                self.component_by_pos.insert(node.position, component);
-            }
-        }
         self.dirty_components
             .retain(|&id| id < self.components.len());
-    }
-
-    #[allow(dead_code)]
-    fn component_id(&self, position: WirePos) -> Option<usize> {
-        self.component_by_pos.get(&position).copied()
     }
 }
 

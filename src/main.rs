@@ -278,6 +278,56 @@ impl EntityAabb {
 const MOB_CAP: usize = 4096;
 const DROP_CAP: usize = 8192;
 const XP_CAP: usize = 4096;
+
+/// Evict the oldest `vec.len() - cap` entries in a single `drain` pass —
+/// O(1) amortized per evicted entry (one tail move for the whole batch)
+/// instead of the O(N)-per-entry `Vec::remove(0)` shift loop it replaces —
+/// invoking `on_evict` on each evicted entry in oldest-first order.
+fn evict_oldest_front<T>(vec: &mut Vec<T>, cap: usize, mut on_evict: impl FnMut(T)) {
+    let excess = vec.len().saturating_sub(cap);
+    if excess == 0 {
+        return;
+    }
+    for item in vec.drain(..excess) {
+        on_evict(item);
+    }
+}
+
+#[cfg(test)]
+mod evict_oldest_front_tests {
+    use super::evict_oldest_front;
+
+    #[test]
+    fn cap_trim_evicts_oldest_first_in_one_pass() {
+        let mut vec: Vec<u32> = (0..10).collect();
+        let mut evicted = Vec::new();
+        evict_oldest_front(&mut vec, 4, |item| evicted.push(item));
+        assert_eq!(evicted, vec![0, 1, 2, 3, 4, 5], "oldest entries leave FIFO");
+        assert_eq!(vec, vec![6, 7, 8, 9], "newest `cap` entries remain in order");
+    }
+
+    #[test]
+    fn cap_trim_is_a_no_op_at_or_under_cap() {
+        let mut vec = vec![1_u32, 2, 3];
+        let mut calls = 0;
+        evict_oldest_front(&mut vec, 3, |_| calls += 1);
+        evict_oldest_front(&mut vec, 8, |_| calls += 1);
+        assert_eq!(calls, 0, "nothing may be evicted at or under the cap");
+        assert_eq!(vec, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cap_trim_yields_owned_entries_without_cloning() {
+        // A non-Clone, non-Copy payload proves entries are yielded by
+        // value — no hidden per-entry copy pass inside the trim.
+        struct Owned(u32);
+        let mut vec: Vec<Owned> = (0..6).map(Owned).collect();
+        let mut evicted = Vec::new();
+        evict_oldest_front(&mut vec, 2, |Owned(id)| evicted.push(id));
+        assert_eq!(evicted, vec![0, 1, 2, 3]);
+        assert_eq!(vec.iter().map(|o| o.0).collect::<Vec<_>>(), vec![4, 5]);
+    }
+}
 // A generated hanging entity is static, so nothing turns one back into a spawn:
 // the cap is what bounds a placement bug that stages the same marker in every
 // chunk of a structure.
@@ -1720,10 +1770,7 @@ fn environment_time_tick() {
                 broadcast_seen_destroy(*eid);
             }
         }
-        while xl.len() > XP_CAP {
-            let x = xl.remove(0);
-            broadcast_seen_destroy(x.eid);
-        }
+        evict_oldest_front(&mut xl, XP_CAP, |x| broadcast_seen_destroy(x.eid));
         if let Some(t) = __t {
             tickprof::add("env/xp_age", t.elapsed());
         }
@@ -12327,6 +12374,178 @@ struct LiveRedstoneState {
     ticks: BinaryHeap<LiveRedstoneTick>,
     pending: BTreeMap<(RsPos, u32), u64>,
     sequence: u64,
+    /// Compiled dust topology from the last pass, reusable while every
+    /// covered section revision holds (`live_wire_settle`).
+    netlist: Option<LiveWireNetlist>,
+}
+
+/// A compiled dust netlist (`megu_core::redstone_eda`) plus the section
+/// revision cover it stays valid for. On a cover hit a pass settles power
+/// through the Dial 16-bucket solver — O(V+E) flat arrays — instead of
+/// rebuilding the whole `wire_network`/`downstream` BTreeMap topology
+/// under the `live_redstone` lock.
+struct LiveWireNetlist {
+    /// Section revisions captured at compile time: every section holding
+    /// an inspected seed or a wire node, dilated one section on each axis
+    /// so any topology-relevant edit bumps a covered revision.
+    cover: BTreeMap<megu_core::coords::SectionKey, u64>,
+    /// The settled dust positions — feeds the device-eval neighbourhood.
+    network: RsBTreeSet<RsPos>,
+    solver: megu_core::redstone_eda::RedstoneWireSolver,
+}
+
+/// Shared per-section revision spine (`megu_core::section_rev`): bumped on
+/// every live block write so the redstone wire netlist can prove a
+/// compiled dust topology is still valid with O(covered) map reads.
+fn shared_section_revs() -> &'static Mutex<megu_core::section_rev::SharedSectionRevTable> {
+    static TABLE: OnceLock<Mutex<megu_core::section_rev::SharedSectionRevTable>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(megu_core::section_rev::SharedSectionRevTable::new()))
+}
+
+/// Sections a compiled wire netlist depends on, each mapped to the shared
+/// revision read right now: the sections holding `inspect` seeds and wire
+/// nodes, dilated by one section on every axis. A topology-relevant edit
+/// always lands within two blocks of a wire node, hence inside the
+/// dilation, and [`SharedSectionRevTable::bump_block_local`] always bumps
+/// the edited block's own section — so equality of this map and the
+/// stored cover is exact proof the compiled graph is still valid.
+fn wire_netlist_cover(
+    dim: DimId,
+    inspect: &RsBTreeSet<RsPos>,
+    network: &RsBTreeSet<RsPos>,
+) -> BTreeMap<megu_core::coords::SectionKey, u64> {
+    use megu_core::coords::{DimIndex, SectionKey};
+    let dim = DimIndex(dim.raw());
+    let mut sections = megu_core::coords::CoordSet::default();
+    for &RsPos(x, y, z) in inspect.iter().chain(network.iter()) {
+        sections.insert(SectionKey::from_block_pos(dim, x, y, z));
+    }
+    let table = shared_section_revs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut cover = BTreeMap::new();
+    for s in sections {
+        for dx in -1..=1_i32 {
+            for dy in -1..=1_i32 {
+                for dz in -1..=1_i32 {
+                    let (Some(cx), Some(sy), Some(cz)) = (
+                        s.cx.checked_add(dx),
+                        s.sy.checked_add(dy),
+                        s.cz.checked_add(dz),
+                    ) else {
+                        continue;
+                    };
+                    let key = SectionKey { dim, cx, sy, cz };
+                    cover
+                        .entry(key)
+                        .or_insert_with(|| table.section_rev(key));
+                }
+            }
+        }
+    }
+    cover
+}
+
+/// Settle the dust network the way [`RedstoneWorldAdapter::propagate`]
+/// does, but through the `megu_core::redstone_eda` netlist solver: while
+/// the covering section revisions are unchanged the compiled topology is
+/// reused and only the power solve runs, so an unchanged tick does not
+/// rebuild the wire graph under the global lock.
+///
+/// The compile path mirrors `wire_network` + `rs_settle_wires` exactly —
+/// same BFS node set, same `with_connections` refresh staged off-world,
+/// same external signal as each node's source power, and the same
+/// `input -> pos` wire-only edges — so the solver's converged powers are
+/// identical to the BTreeMap settle it replaces.
+fn live_wire_settle<W: RedstoneBlockWorld>(
+    adapter: &mut RedstoneWorldAdapter<'_, W>,
+    dim: DimId,
+    inspect: &RsBTreeSet<RsPos>,
+    slot: &mut Option<LiveWireNetlist>,
+) -> RsBTreeSet<RsPos> {
+    use megu_core::redstone_eda::{RedstoneWireSolver, WireLink, WireNode, WirePos};
+
+    if let Some(cached) = slot.as_mut() {
+        if wire_netlist_cover(dim, inspect, &cached.network) == cached.cover {
+            let result = cached.solver.solve();
+            for update in result.updates {
+                let pos = RsPos(update.position.x, update.position.y, update.position.z);
+                if let RsBlock::Wire(wire) = adapter.redstone_block(pos) {
+                    if wire.power != update.new_power {
+                        adapter.set_component(
+                            pos,
+                            RsBlock::Wire(RedStoneWireBlock {
+                                power: update.new_power,
+                                ..wire
+                            }),
+                        );
+                    }
+                }
+            }
+            return cached.network.clone();
+        }
+    }
+
+    // Compile: the same node set the canonical settle BFS would visit.
+    let network = adapter.wire_network(inspect);
+    let mut index: BTreeMap<RsPos, usize> = BTreeMap::new();
+    let mut nodes: Vec<WireNode> = Vec::with_capacity(network.len());
+    let mut staged: Vec<(RsPos, RedStoneWireBlock, RedStoneWireBlock)> =
+        Vec::with_capacity(network.len());
+    let mut inputs: Vec<Vec<RsPos>> = Vec::with_capacity(network.len());
+    for &pos in &network {
+        let RsBlock::Wire(wire) = adapter.redstone_block(pos) else {
+            continue;
+        };
+        // `rs_settle_wires` stages shape refreshes off-world until the
+        // final write, so every neighbour read during discovery sees the
+        // same pre-pass state the canonical settle does.
+        let updated = wire.with_connections(adapter, pos);
+        index.insert(pos, nodes.len());
+        nodes.push(WireNode {
+            position: WirePos {
+                x: pos.0,
+                y: pos.1,
+                z: pos.2,
+            },
+            power: wire.power,
+            source_power: Some(rs_neighbor_signal(adapter, pos, false)),
+            links: Vec::new(),
+        });
+        // Only wire inputs conduct through links; non-wire sources feed
+        // the wire through `source_power` (the `rs_neighbor_signal`
+        // floor), exactly matching the downstream edges `rs_settle_wires`
+        // builds.
+        inputs.push(
+            rs_wire_inputs(adapter, pos)
+                .filter(|&input| matches!(adapter.redstone_block(input), RsBlock::Wire(_)))
+                .collect(),
+        );
+        staged.push((pos, wire, updated));
+    }
+    for (to, ins) in inputs.iter().enumerate() {
+        for &input in ins {
+            if let Some(&from) = index.get(&input) {
+                nodes[from].links.push(WireLink { to });
+            }
+        }
+    }
+    let mut solver = RedstoneWireSolver::new(nodes);
+    solver.solve();
+    for (i, (pos, wire, mut updated)) in staged.into_iter().enumerate() {
+        updated.power = solver.nodes()[i].power;
+        if updated != wire {
+            adapter.set_component(pos, RsBlock::Wire(updated));
+        }
+    }
+    let cover = wire_netlist_cover(dim, inspect, &network);
+    *slot = Some(LiveWireNetlist {
+        cover,
+        network: network.clone(),
+        solver,
+    });
+    network
 }
 
 fn live_redstone() -> &'static LockedMap<DimId, LiveRedstoneState> {
@@ -12528,6 +12747,13 @@ fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u3
     if old == new {
         return;
     }
+    // The netlist cover keys on `bump_block_local` (edited section only):
+    // the dilated cover already spans every section a topology edit can
+    // reach, so border propagation is unnecessary per write.
+    shared_section_revs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bump_block_local(megu_core::coords::DimIndex(dim.raw()), x, y, z);
     let Some(reg) = breg() else { return };
     if reg.block_id_of(old) != reg.block_id_of(new) {
         if let Some(state) = live_redstone()
@@ -12570,6 +12796,7 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
         let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
         let state = dimensions.entry(dim).or_default();
         let mut torches = std::mem::take(&mut state.torches);
+        let mut netlist = state.netlist.take();
         let now = TICK_IDX.load(Ordering::Relaxed);
         let mut world = LiveRedstoneWorld {
             dim,
@@ -12615,8 +12842,19 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
             // observer through the shared pending-tick scheduler.
             rs_notify_block_update(&mut adapter, origin);
         }
-        adapter.propagate(&[origin]);
+        // `propagate`'s two halves, split so the dust settle can reuse the
+        // section-rev-keyed netlist cache: unchanged ticks run only the
+        // O(V+E) solve; the device-eval tail is identical to `propagate`.
+        let mut inspect = RsBTreeSet::new();
+        rs_extend_neighborhood(&mut inspect, [origin]);
+        let network = live_wire_settle(&mut adapter, dim, &inspect, &mut netlist);
+        rs_extend_neighborhood(&mut inspect, network);
+        for pos in inspect {
+            let block = adapter.redstone_block(pos);
+            rs_update_device(&mut adapter, pos, block);
+        }
         world.state.torches = torches;
+        world.state.netlist = netlist;
         (world.writes, world.dispensers)
     };
     for (RsPos(x, y, z), state) in writes {

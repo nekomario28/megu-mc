@@ -1975,6 +1975,16 @@ impl ScoreboardOperation {
     }
 }
 
+/// Hard bound on score holders per objective — a command flood must not
+/// grow the owner map without limit. Shared with the command precheck in
+/// `commands_core` (`scoreboard_entry_available`).
+const SCOREBOARD_ENTRY_LIMIT: usize = 4096;
+
+/// Hard bound on a score-holder (owner) name length in bytes. Player
+/// names cap at 16 and entity-UUID holders at 36; 64 leaves headroom for
+/// modded selectors while capping wire-string retention per entry.
+const SCOREBOARD_OWNER_NAME_MAX: usize = 64;
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScoreboardError {
@@ -1984,6 +1994,8 @@ enum ScoreboardError {
     NotTrigger,
     TriggerLocked,
     DivisionByZero,
+    TooManyScores,
+    NameTooLong,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -2046,13 +2058,13 @@ impl ScoreboardEngine {
 
     fn set(&mut self, player: &str, objective: &str, value: i32) -> Result<(), ScoreboardError> {
         self.require_writable(objective)?;
-        self.score_mut(player, objective).value = value;
+        self.score_mut(player, objective)?.value = value;
         Ok(())
     }
 
     fn add(&mut self, player: &str, objective: &str, value: i32) -> Result<i32, ScoreboardError> {
         self.require_writable(objective)?;
-        let score = self.score_mut(player, objective);
+        let score = self.score_mut(player, objective)?;
         score.value = score.value.wrapping_add(value);
         Ok(score.value)
     }
@@ -2092,20 +2104,21 @@ impl ScoreboardEngine {
     fn update_health(&mut self, player: &str, health: i32) {
         for (name, objective) in &self.objectives {
             if objective.criteria == ScoreboardCriteria::Health {
-                let score = self
-                    .scores
-                    .entry(name.clone())
-                    .or_default()
-                    .entry(player.to_owned())
-                    .or_default();
-                score.value = health;
+                let scores = self.scores.entry(name.clone()).or_default();
+                if player.len() > SCOREBOARD_OWNER_NAME_MAX
+                    || (scores.len() >= SCOREBOARD_ENTRY_LIMIT
+                        && !scores.contains_key(player))
+                {
+                    continue;
+                }
+                scores.entry(player.to_owned()).or_default().value = health;
             }
         }
     }
 
     fn enable_trigger(&mut self, player: &str, objective: &str) -> Result<(), ScoreboardError> {
         self.require_trigger(objective)?;
-        self.score_mut(player, objective).trigger_enabled = true;
+        self.score_mut(player, objective)?.trigger_enabled = true;
         Ok(())
     }
 
@@ -2166,20 +2179,31 @@ impl ScoreboardEngine {
             ScoreboardOperation::Swap => rhs,
         };
         // Vanilla creates a zero-valued score for a previously unscored source.
-        let source_score = self.score_mut(source.0, source.1);
+        let source_score = self.score_mut(source.0, source.1)?;
         if operation == ScoreboardOperation::Swap {
             source_score.value = lhs;
         }
-        self.score_mut(target.0, target.1).value = value;
+        self.score_mut(target.0, target.1)?.value = value;
         Ok(value)
     }
 
-    fn score_mut(&mut self, player: &str, objective: &str) -> &mut ScoreboardScore {
-        self.scores
-            .entry(objective.to_owned())
-            .or_default()
-            .entry(player.to_owned())
-            .or_default()
+    /// The one score-entry insertion point: every write path — `set`,
+    /// `add`, `enable_trigger`, `operation` — enforces the owner-name and
+    /// per-objective entry bounds here so a flood of unique holders or an
+    /// oversized name cannot grow `scores` past the explicit caps.
+    fn score_mut(
+        &mut self,
+        player: &str,
+        objective: &str,
+    ) -> Result<&mut ScoreboardScore, ScoreboardError> {
+        if player.len() > SCOREBOARD_OWNER_NAME_MAX {
+            return Err(ScoreboardError::NameTooLong);
+        }
+        let scores = self.scores.entry(objective.to_owned()).or_default();
+        if scores.len() >= SCOREBOARD_ENTRY_LIMIT && !scores.contains_key(player) {
+            return Err(ScoreboardError::TooManyScores);
+        }
+        Ok(scores.entry(player.to_owned()).or_default())
     }
 
     fn criteria(&self, objective: &str) -> Result<ScoreboardCriteria, ScoreboardError> {
@@ -2212,8 +2236,81 @@ fn scoreboard_command_error(error: ScoreboardError) -> String {
         ScoreboardError::NotTrigger => "Objective is not a trigger",
         ScoreboardError::TriggerLocked => "Trigger is locked",
         ScoreboardError::DivisionByZero => "Cannot divide by zero",
+        ScoreboardError::TooManyScores => "Too many scores for objective",
+        ScoreboardError::NameTooLong => "Score holder name is too long",
     }
     .into()
+}
+
+#[cfg(test)]
+mod scoreboard_cap_tests {
+    use super::*;
+
+    fn objective(name: &str, criteria: ScoreboardCriteria) -> ScoreboardObjective {
+        ScoreboardObjective {
+            name: name.to_owned(),
+            criteria,
+            display_name: name.to_owned(),
+            render_type: ScoreboardRenderType::Integer,
+        }
+    }
+
+    fn board_with_objective() -> ScoreboardEngine {
+        let mut board = ScoreboardEngine::default();
+        board
+            .add_objective(objective("obj", ScoreboardCriteria::Dummy))
+            .unwrap();
+        board
+    }
+
+    #[test]
+    fn owner_name_over_limit_is_rejected_on_every_write_path() {
+        let mut board = board_with_objective();
+        let long = "o".repeat(SCOREBOARD_OWNER_NAME_MAX + 1);
+        assert_eq!(
+            board.set(&long, "obj", 1),
+            Err(ScoreboardError::NameTooLong)
+        );
+        assert_eq!(
+            board.add(&long, "obj", 1),
+            Err(ScoreboardError::NameTooLong)
+        );
+        board.update_health(&long, 20);
+        assert!(
+            board.scores.get("obj").is_none()
+                || board.scores["obj"].is_empty(),
+            "no score entry may be created for an oversized owner name"
+        );
+        let at_limit = "o".repeat(SCOREBOARD_OWNER_NAME_MAX);
+        assert!(board.set(&at_limit, "obj", 1).is_ok());
+    }
+
+    #[test]
+    fn objective_entry_count_is_capped() {
+        let mut board = board_with_objective();
+        for i in 0..SCOREBOARD_ENTRY_LIMIT {
+            board.set(&format!("p{i}"), "obj", i as i32).unwrap();
+        }
+        assert_eq!(board.scores["obj"].len(), SCOREBOARD_ENTRY_LIMIT);
+        assert_eq!(
+            board.set("overflow", "obj", 1),
+            Err(ScoreboardError::TooManyScores)
+        );
+        // Existing owners still update at the cap.
+        assert!(board.set("p0", "obj", 7).is_ok());
+        // The health-criteria fan-out must not grow the map either.
+        board
+            .add_objective(objective("life", ScoreboardCriteria::Health))
+            .unwrap();
+        let life = board.scores.entry("life".to_owned()).or_default();
+        for i in 0..SCOREBOARD_ENTRY_LIMIT {
+            life.entry(format!("h{i}")).or_default().value = 20;
+        }
+        board.update_health("health_overflow", 20);
+        assert_eq!(board.scores["life"].len(), SCOREBOARD_ENTRY_LIMIT);
+        board.update_health("h0", 5);
+        assert_eq!(board.scores["life"]["h0"].value, 5);
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -3876,8 +3876,8 @@ fn broadcast_score(board: &ScoreboardEngine, owner: &str, objective: &str) {
     }
 }
 
-const SCOREBOARD_ENTRY_LIMIT: usize = 4096;
-
+// `SCOREBOARD_ENTRY_LIMIT` is defined once in `world_mechanisms` beside the
+// engine — the same module sees it here.
 fn scoreboard_entry_available(board: &ScoreboardEngine, owner: &str, objective: &str) -> bool {
     board
         .scores

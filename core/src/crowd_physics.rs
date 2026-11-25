@@ -514,7 +514,7 @@ fn prime_stride(n: usize) -> usize {
         return 1;
     }
     let mut candidate = (n / 2).max(2);
-    if candidate > 2 && candidate % 2 == 0 {
+    if candidate > 2 && candidate.is_multiple_of(2) {
         candidate -= 1;
     }
     while candidate > 2 {
@@ -524,7 +524,7 @@ fn prime_stride(n: usize) -> usize {
         candidate -= 2;
     }
     let mut candidate = (n / 2 + 1).max(3);
-    if candidate % 2 == 0 {
+    if candidate.is_multiple_of(2) {
         candidate += 1;
     }
     while candidate < n {
@@ -541,7 +541,7 @@ fn is_prime(n: usize) -> bool {
     }
     let mut d = 2;
     while d <= n / d {
-        if n % d == 0 {
+        if n.is_multiple_of(d) {
             return false;
         }
         d += if d == 2 { 1 } else { 2 };
@@ -671,7 +671,10 @@ impl CrowdSyncGovernor {
         } else {
             (0.0, 0)
         };
-        let forced = stride > 0 && ((eid.unsigned_abs() as u64).wrapping_add(tick) % stride == 0);
+        let forced = stride > 0
+            && (eid.unsigned_abs() as u64)
+                .wrapping_add(tick)
+                .is_multiple_of(stride);
         let send = critical || density <= 8 || !delta.is_finite() || delta.abs() >= band || forced;
         if send {
             self.stats.sent += 1;
@@ -747,7 +750,7 @@ impl CrowdSleepGovernor {
             return true;
         }
         let stride = Self::stride(density, stationary_ticks);
-        (eid.unsigned_abs() as u64 + tick) % stride == 0
+        (eid.unsigned_abs() as u64 + tick).is_multiple_of(stride)
     }
 }
 

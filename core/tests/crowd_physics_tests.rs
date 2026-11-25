@@ -63,7 +63,7 @@ fn reference(entities: &[CrowdEntity]) -> Vec<[f64; 2]> {
 fn exact_small_clusters_match_symmetric_reference_for_requested_sizes() {
     for n in [2, 8, 24, 25, 32] {
         let mut es: Vec<_> = (0..n)
-            .map(|i| mob(i as i32, (i % 6) as f64 * 0.2, 0.0, (i / 6) as f64 * 0.2))
+            .map(|i| mob(i, (i % 6) as f64 * 0.2, 0.0, (i / 6) as f64 * 0.2))
             .collect();
         if n > 4 {
             es[2].pushable = false;
@@ -195,7 +195,7 @@ fn two_thousand_mobs_separate_into_eight_3d_groups() {
         );
         for n in 0..250 {
             es.push(mob(
-                (g * 250 + n) as i32,
+                g * 250 + n,
                 x + (n % 10) as f64 * 0.002,
                 y + (n / 10 % 10) as f64 * 0.002,
                 z + (n / 100) as f64 * 0.002,
@@ -330,8 +330,8 @@ fn render_budget_preserves_priority_caps_ordinary_cells_and_pose_quantizes() {
     es[5].combat_target = true;
     let mut b = CrowdRenderBudget::default();
     let lod = b.apply(&es);
-    for i in 0..6 {
-        assert_eq!(lod[i], RenderLod::Full)
+    for lod_entry in lod.iter().take(6) {
+        assert_eq!(*lod_entry, RenderLod::Full)
     }
     assert_eq!(lod.iter().filter(|x| **x == RenderLod::Full).count(), 18);
     let first = lod.to_vec();

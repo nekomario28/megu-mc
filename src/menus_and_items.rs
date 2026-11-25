@@ -3145,11 +3145,10 @@ fn drop_tick() {
             }
             DROP_DESPAWN_SCRATCH.with(|s| scratch_return(s, burned));
         }
-        while dp.len() > DROP_CAP {
-            let d = dp.remove(0);
+        evict_oldest_front(&mut dp, DROP_CAP, |d| {
             death_slot_hint_forget(d.eid);
             broadcast_seen_destroy(d.eid);
-        }
+        });
         if let Some(t) = __t {
             tickprof::add("drops/despawn", t.elapsed());
         }
@@ -8678,9 +8677,7 @@ impl Vault {
         self.total_ejections_needed = items.len() as i32;
         self.items_to_eject = items;
         self.rewarded_players.push(player);
-        if self.rewarded_players.len() > 128 {
-            self.rewarded_players.remove(0);
-        }
+        evict_oldest_front(&mut self.rewarded_players, 128, |_| {});
         self.connected_players
             .retain(|&connected| connected != player);
         self.phase = VaultPhase::Unlocking;
