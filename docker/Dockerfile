@@ -20,7 +20,7 @@ WORKDIR /build
 # Everything `cargo build --release --locked` (including `--features mod-suite`
 # and the companion CLI crates) resolves, and nothing more.
 ARG CARGO_FEATURES="mod-suite,create-offload"
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
 COPY core/Cargo.toml core/Cargo.lock core/
 COPY core/src core/src
@@ -30,6 +30,8 @@ COPY state-store/Cargo.toml state-store/Cargo.lock state-store/
 COPY state-store/src state-store/src
 COPY server-files/Cargo.toml server-files/Cargo.lock server-files/
 COPY server-files/src server-files/src
+COPY wasm-mod-runtime/Cargo.toml wasm-mod-runtime/Cargo.lock wasm-mod-runtime/
+COPY wasm-mod-runtime/src wasm-mod-runtime/src
 COPY mod-adapter-core/Cargo.toml mod-adapter-core/Cargo.lock mod-adapter-core/
 COPY mod-adapter-core/src mod-adapter-core/src
 COPY mod-offload/Cargo.toml mod-offload/Cargo.lock mod-offload/
