@@ -48,7 +48,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use megu_core::crash_report::{redact_sensitive, CrashContext};
-use megu_core::crypto::{hex_encode, Sha256};
+use megu_core::crypto::{hex_encode, sha256, Sha256};
+use megu_core::lz4::Lz4Error;
+use megu_core::merkle_cas::{CasBlobStore, Digest32, MerkleTree};
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 use megu_core::version::TargetVersion;
 
@@ -758,6 +760,159 @@ pub struct SnapshotRecord {
     pub total_bytes: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotDelta {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+impl SnapshotDelta {
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.added.len() + self.removed.len() + self.changed.len()
+    }
+}
+
+fn snapshot_leaf_key(path: &str) -> u64 {
+    let digest = sha256(path.as_bytes());
+    u64::from_be_bytes(digest[..8].try_into().expect("sha256 digest is 32 bytes"))
+}
+
+fn decode_snapshot_digest(record: &SnapshotRecord, raw: &str) -> Result<Digest32, TimeMachineError> {
+    let corrupt = || TimeMachineError::CorruptManifest {
+        id: record.id.clone(),
+        detail: format!("file sha256 {raw:?} is not 32 lowercase-hex bytes"),
+    };
+    if raw.len() != 64 {
+        return Err(corrupt());
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let hi = u8::from_str_radix(raw.get(index * 2..index * 2 + 1).ok_or_else(corrupt)?, 16)
+            .map_err(|_| corrupt())?;
+        let lo = u8::from_str_radix(
+            raw.get(index * 2 + 1..index * 2 + 2).ok_or_else(corrupt)?,
+            16,
+        )
+        .map_err(|_| corrupt())?;
+        *byte = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+pub fn snapshot_merkle_tree(record: &SnapshotRecord) -> Result<MerkleTree, TimeMachineError> {
+    let mut leaves = Vec::with_capacity(record.files.len());
+    for file in &record.files {
+        leaves.push((
+            snapshot_leaf_key(&file.path),
+            decode_snapshot_digest(record, &file.sha256)?,
+        ));
+    }
+    Ok(MerkleTree::new(&leaves))
+}
+
+pub fn diff_snapshot_records(
+    before: &SnapshotRecord,
+    after: &SnapshotRecord,
+) -> Result<SnapshotDelta, TimeMachineError> {
+    let before_tree = snapshot_merkle_tree(before)?;
+    let after_tree = snapshot_merkle_tree(after)?;
+    let mut keys = Vec::new();
+    before_tree.diff_keys(&after_tree, &mut keys);
+    let before_by_key: HashMap<u64, &SnapshotFileEntry> = before
+        .files
+        .iter()
+        .map(|file| (snapshot_leaf_key(&file.path), file))
+        .collect();
+    let after_by_key: HashMap<u64, &SnapshotFileEntry> = after
+        .files
+        .iter()
+        .map(|file| (snapshot_leaf_key(&file.path), file))
+        .collect();
+    let mut delta = SnapshotDelta::default();
+    for key in keys {
+        match (before_by_key.get(&key), after_by_key.get(&key)) {
+            (Some(old), Some(new)) if old.sha256 != new.sha256 => {
+                delta.changed.push(new.path.clone());
+            }
+            (Some(old), None) => delta.removed.push(old.path.clone()),
+            (None, Some(new)) => delta.added.push(new.path.clone()),
+            _ => {}
+        }
+    }
+    delta.added.sort();
+    delta.removed.sort();
+    delta.changed.sort();
+    Ok(delta)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotCasError {
+    BlobTooLarge { len: usize, max: usize },
+}
+
+impl fmt::Display for SnapshotCasError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlobTooLarge { len, max } => {
+                write!(f, "snapshot CAS blob is {len} bytes, over the {max}-byte cap")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotCasError {}
+
+#[derive(Debug)]
+pub struct SnapshotCasDeduper {
+    store: CasBlobStore,
+    max_blob_bytes: usize,
+}
+
+impl SnapshotCasDeduper {
+    #[must_use]
+    pub fn new(max_blob_bytes: usize) -> Self {
+        Self {
+            store: CasBlobStore::new(),
+            max_blob_bytes: max_blob_bytes.max(1),
+        }
+    }
+
+    pub fn put_blob(&mut self, raw: &[u8]) -> Result<Digest32, SnapshotCasError> {
+        if raw.len() > self.max_blob_bytes {
+            return Err(SnapshotCasError::BlobTooLarge {
+                len: raw.len(),
+                max: self.max_blob_bytes,
+            });
+        }
+        Ok(self.store.put(raw))
+    }
+
+    pub fn get_blob(&self, digest: &Digest32) -> Result<Option<Vec<u8>>, Lz4Error> {
+        self.store.get(digest, self.max_blob_bytes)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn unique_blobs(&self) -> usize {
+        self.store.unique_blobs()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn stored_bytes(&self) -> usize {
+        self.store.stored_bytes()
+    }
+}
+
 /// What [`WorldTimeMachine::restore_snapshot`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestoreReport {
@@ -1269,6 +1424,16 @@ impl WorldTimeMachine {
             return Err(TimeMachineError::SnapshotNotFound { id: id.to_string() });
         }
         self.load_manifest(&path)
+    }
+
+    pub fn diff_snapshots(
+        &self,
+        before_id: &str,
+        after_id: &str,
+    ) -> Result<SnapshotDelta, TimeMachineError> {
+        let before = self.get_snapshot(before_id)?;
+        let after = self.get_snapshot(after_id)?;
+        diff_snapshot_records(&before, &after)
     }
 
     /// Prune to `max_snapshots` and `max_total_bytes`, then mark-and-sweep

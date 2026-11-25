@@ -9,6 +9,7 @@
 //! allocated region.
 
 use megu_core::coords::{ChunkKey, DimIndex, SectionKey};
+use megu_core::rev::UiLayer;
 
 use crate::abi::{CapabilitySet, HostBinding, MeguHost};
 use crate::error::Trap;
@@ -334,6 +335,19 @@ impl<'m> Vm<'m> {
                     )
                     .unwrap_or(0);
                 Ok(vec![Value::I64(rev as i64)])
+            }
+            HostBinding::UiMarkDirty => {
+                if let Some(c) = b.capability() {
+                    self.caps.require(c, "megu_ui_mark_dirty")?;
+                }
+                let raw = args.first().map_or(-1, |v| v.i32());
+                let status = match UiLayer::from_index(raw as usize) {
+                    Some(layer @ (UiLayer::ModHud | UiLayer::ModOverlay)) => {
+                        self.host.ui_mark_dirty(layer)
+                    }
+                    _ => -1,
+                };
+                Ok(vec![Value::I32(status)])
             }
         }
     }

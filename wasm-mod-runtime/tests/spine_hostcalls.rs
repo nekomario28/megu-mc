@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use megu_core::coords::{ChunkKey, DimIndex, SectionKey};
+use megu_core::rev::UiLayer;
 use megu_core::section_rev::SharedSectionRevTable;
 use megu_wasm_mod_runtime::testutil::*;
 use megu_wasm_mod_runtime::{
@@ -320,4 +321,94 @@ fn shared_table_handle_round_trips() {
         )),
         1
     );
+}
+
+
+#[derive(Default)]
+struct UiRecordingHost {
+    inner: StubHost,
+    calls: Vec<UiLayer>,
+}
+
+impl MeguHost for UiRecordingHost {
+    fn log(&mut self, msg: &str) {
+        self.inner.log(msg);
+    }
+    fn get_block(&mut self, x: i32, y: i32, z: i32) -> i32 {
+        self.inner.get_block(x, y, z)
+    }
+    fn set_block(&mut self, x: i32, y: i32, z: i32, state: i32) -> i32 {
+        self.inner.set_block(x, y, z, state)
+    }
+    fn emit_chat(&mut self, player_id: i32, msg: &str) -> i32 {
+        self.inner.emit_chat(player_id, msg)
+    }
+    fn ui_mark_dirty(&mut self, layer: UiLayer) -> i32 {
+        self.calls.push(layer);
+        0
+    }
+}
+
+fn ui_probe_mod() -> Vec<u8> {
+    let abi_ty: (&[u8], &[u8]) = (&[], &[I32]);
+    let tick_ty: (&[u8], &[u8]) = (&[I64], &[I32]);
+    let ui_ty: (&[u8], &[u8]) = (&[I32], &[I32]);
+    module(&[
+        types_sec(&[abi_ty, tick_ty, ui_ty]),
+        import_funcs_sec(&[("megu_v1", "megu_ui_mark_dirty", 2)]),
+        func_sec(&[0, 1]),
+        export_sec(&[
+            ("megu_abi_version", KIND_FUNC, 1),
+            ("megu_on_tick", KIND_FUNC, 2),
+        ]),
+        code_sec(&[
+            body(&[], &concat(&[&i32_const(1), &[0x0B]])),
+            // valid ModOverlay status plus 10 * invalid vanilla-layer status;
+            // expected 0 + 10 * -1 = -10.
+            body(
+                &[],
+                &concat(&[
+                    &i32_const(6),
+                    &call(0),
+                    &i32_const(3),
+                    &call(0),
+                    &i32_const(10),
+                    &[0x6C],
+                    &[0x6A],
+                    &[0x0B],
+                ]),
+            ),
+        ]),
+    ])
+}
+
+#[test]
+fn ui_mark_dirty_accepts_only_mod_owned_layers() {
+    let host = UiRecordingHost::default();
+    let mut m = WasmMod::from_wasm(
+        &ui_probe_mod(),
+        Box::new(host),
+        CapabilitySet::all(),
+        ModConfig::default(),
+    )
+    .expect("loads");
+    assert_eq!(m.on_tick(1).unwrap(), -10);
+}
+
+#[test]
+fn ui_mark_dirty_gates_on_ui_surface_capability() {
+    let mut m = WasmMod::from_wasm(
+        &ui_probe_mod(),
+        Box::new(UiRecordingHost::default()),
+        CapabilitySet::NONE,
+        ModConfig::default(),
+    )
+    .expect("loads");
+    match m.on_tick(1) {
+        Err(ModFault::Trap(Trap::CapabilityDenied {
+            capability: Capability::UiSurface,
+            import: "megu_ui_mark_dirty",
+        })) => {}
+        other => panic!("expected ui_surface denial, got {other:?}"),
+    }
 }

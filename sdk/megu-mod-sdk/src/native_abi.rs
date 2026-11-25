@@ -7,7 +7,7 @@
 //! crate, derives [`MeguMod`]-style behaviour from a struct, and stamps the
 //! four exported entry points with [`megu_native_mod!`]. At load time the
 //! server validates `megu_abi_version() == 1`, then meters every call with a
-//! hard fuel budget and gates each `host_*` import on the capabilities the
+//! hard fuel budget and gates each host import on the capabilities the
 //! mod declared in `megu-mod.toml`'s `[capabilities]` table.
 //!
 //! ```toml
@@ -15,12 +15,13 @@
 //! read_blocks = true
 //! write_blocks = true
 //! chat_broadcast = true
+//! ui_surface = true
 //! ```
 //!
 //! Undeclared capabilities fail closed at the ABI boundary — there is no
 //! ambient authority. When this crate is compiled for a **native** target
 //! (tests, host-side tooling) the same `log`/`get_block`/`set_block`/
-//! `emit_chat` calls route through a thread-local [`HostBackend`] mock
+//! `emit_chat`/`ui_mark_dirty` calls route through a thread-local [`HostBackend`] mock
 //! instead of wasm imports, so a mod's logic is unit-testable without a wasm
 //! toolchain.
 
@@ -56,6 +57,8 @@ pub enum Capability {
     WriteBlocks,
     /// `host_emit_chat` — send a chat message to a player.
     ChatBroadcast,
+    /// `megu_ui_mark_dirty` — invalidate this mod's retained HUD/overlay.
+    UiSurface,
 }
 
 impl Capability {
@@ -64,6 +67,7 @@ impl Capability {
         Capability::ReadBlocks,
         Capability::WriteBlocks,
         Capability::ChatBroadcast,
+        Capability::UiSurface,
     ];
 
     /// The `megu-mod.toml` `[capabilities]` key for this capability.
@@ -72,6 +76,7 @@ impl Capability {
             Capability::ReadBlocks => "read_blocks",
             Capability::WriteBlocks => "write_blocks",
             Capability::ChatBroadcast => "chat_broadcast",
+            Capability::UiSurface => "ui_surface",
         }
     }
 
@@ -141,6 +146,11 @@ pub trait HostBackend {
     /// dimension `dim`; returns the edited section's new revision.
     fn bump_block(&mut self, _dim: u32, _x: i32, _y: i32, _z: i32) -> u64 {
         0
+    }
+    /// `megu_ui_mark_dirty` — invalidate a mod-owned retained UI layer;
+    /// returns `0` when the host accepted it.
+    fn ui_mark_dirty(&mut self, _layer: i32) -> i32 {
+        -1
     }
 }
 
@@ -212,6 +222,13 @@ mod host {
             None => 0,
         })
     }
+
+    pub fn ui_mark_dirty(layer: i32) -> i32 {
+        BACKEND.with(|b| match b.borrow_mut().as_mut() {
+            Some(h) => h.ui_mark_dirty(layer),
+            None => -1,
+        })
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -236,6 +253,8 @@ mod host {
         fn megu_chunk_rev(dim: u32, cx: i32, cz: i32) -> u64;
         #[link_name = "megu_bump_block"]
         fn megu_bump_block(dim: u32, x: i32, y: i32, z: i32) -> u64;
+        #[link_name = "megu_ui_mark_dirty"]
+        fn megu_ui_mark_dirty(layer: i32) -> i32;
     }
 
     #[allow(unsafe_code)]
@@ -271,6 +290,11 @@ mod host {
     #[allow(unsafe_code)]
     pub fn bump_block(dim: u32, x: i32, y: i32, z: i32) -> u64 {
         unsafe { megu_bump_block(dim, x, y, z) }
+    }
+
+    #[allow(unsafe_code)]
+    pub fn ui_mark_dirty(layer: i32) -> i32 {
+        unsafe { megu_ui_mark_dirty(layer) }
     }
 }
 
@@ -315,6 +339,13 @@ pub fn chunk_rev(dim: u32, cx: i32, cz: i32) -> u64 {
 /// Requires `write_blocks`.
 pub fn bump_block(dim: u32, x: i32, y: i32, z: i32) -> u64 {
     host::bump_block(dim, x, y, z)
+}
+
+/// Mark a mod-owned retained UI layer dirty (`5` = mod HUD, `6` = mod
+/// overlay); returns `0` when the host accepted the invalidation. Requires
+/// `ui_surface`.
+pub fn ui_mark_dirty(layer: i32) -> i32 {
+    host::ui_mark_dirty(layer)
 }
 
 /// Install a native-target mock host (no-op signature on wasm32).
@@ -439,6 +470,7 @@ mod tests {
     struct Recorder {
         log: RefCell<Vec<String>>,
         blocks: RefCell<Vec<(i32, i32, i32, i32)>>,
+        ui_layers: RefCell<Vec<i32>>,
     }
 
     impl HostBackend for Recorder {
@@ -452,6 +484,10 @@ mod tests {
             self.blocks.borrow_mut().push((x, y, z, state));
             0
         }
+        fn ui_mark_dirty(&mut self, layer: i32) -> i32 {
+            self.ui_layers.borrow_mut().push(layer);
+            0
+        }
     }
 
     #[test]
@@ -460,12 +496,15 @@ mod tests {
         install_host(Recorder {
             log: RefCell::new(Vec::new()),
             blocks: RefCell::new(Vec::new()),
+            ui_layers: RefCell::new(Vec::new()),
         });
         log("hello megu");
         assert_eq!(get_block(1, 2, 3), 6);
         assert_eq!(set_block(0, 64, 0, 7), 0);
         assert_eq!(emit_chat(3, "hi"), 0);
+        assert_eq!(ui_mark_dirty(5), 0);
         uninstall_host();
+        assert_eq!(ui_mark_dirty(5), -1);
     }
 
     #[derive(Default)]

@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use megu_core::coords::{ChunkKey, DimIndex, SectionKey};
+use megu_core::rev::UiLayer;
 use megu_core::section_rev::SharedSectionRevTable;
 
 use crate::error::Trap;
@@ -50,6 +51,9 @@ pub const IMPORT_CHUNK_REV: &str = "megu_chunk_rev";
 /// Canonical-spine mutation: `megu_bump_block(dim: u32, x, y, z) -> u64`,
 /// returning the edited section's new revision.
 pub const IMPORT_BUMP_BLOCK: &str = "megu_bump_block";
+/// Retained-UI invalidation: `megu_ui_mark_dirty(layer: u32) -> i32`.
+/// Only `UiLayer::ModHud` (5) and `UiLayer::ModOverlay` (6) are accepted.
+pub const IMPORT_UI_MARK_DIRTY: &str = "megu_ui_mark_dirty";
 
 /// Guest return-code convention: `>= 0` is success, `< 0` is a
 /// mod-reported soft error (logged, not trapped).
@@ -68,6 +72,8 @@ pub enum Capability {
     ChatBroadcast,
     /// Reserved: entity event subscriptions (no v1 import yet).
     EntityEvents,
+    /// `megu_ui_mark_dirty` for mod-owned HUD/overlay surfaces.
+    UiSurface,
 }
 
 impl Capability {
@@ -79,6 +85,7 @@ impl Capability {
             Capability::RegisterRecipes => "register_recipes",
             Capability::ChatBroadcast => "chat_broadcast",
             Capability::EntityEvents => "entity_events",
+            Capability::UiSurface => "ui_surface",
         }
     }
 
@@ -90,16 +97,18 @@ impl Capability {
             "register_recipes" => Some(Capability::RegisterRecipes),
             "chat_broadcast" => Some(Capability::ChatBroadcast),
             "entity_events" => Some(Capability::EntityEvents),
+            "ui_surface" => Some(Capability::UiSurface),
             _ => None,
         }
     }
 
-    pub const ALL: [Capability; 5] = [
+    pub const ALL: [Capability; 6] = [
         Capability::ReadBlocks,
         Capability::WriteBlocks,
         Capability::RegisterRecipes,
         Capability::ChatBroadcast,
         Capability::EntityEvents,
+        Capability::UiSurface,
     ];
 }
 
@@ -200,6 +209,13 @@ pub trait MeguHost {
     fn spine_bump_block(&mut self, _dim: DimIndex, _x: i32, _y: i32, _z: i32) -> Option<u64> {
         None
     }
+
+    /// `megu_ui_mark_dirty` — invalidate one mod-owned retained UI layer.
+    /// Hosts return `0` on success; the default `-1` reports unsupported.
+    /// Gated by [`Capability::UiSurface`].
+    fn ui_mark_dirty(&mut self, _layer: UiLayer) -> i32 {
+        -1
+    }
 }
 
 /// `MeguHost` decorator wiring one shared canonical
@@ -272,6 +288,7 @@ pub(crate) enum HostBinding {
     SectionRev,
     ChunkRev,
     BumpBlock,
+    UiMarkDirty,
 }
 
 impl HostBinding {
@@ -285,6 +302,7 @@ impl HostBinding {
             HostBinding::EmitChat => Some(Capability::ChatBroadcast),
             HostBinding::SectionRev | HostBinding::ChunkRev => Some(Capability::ReadBlocks),
             HostBinding::BumpBlock => Some(Capability::WriteBlocks),
+            HostBinding::UiMarkDirty => Some(Capability::UiSurface),
         }
     }
 
@@ -308,6 +326,7 @@ impl HostBinding {
             IMPORT_SECTION_REV => (HostBinding::SectionRev, &[I32, I32, I32, I32], &[I64]),
             IMPORT_CHUNK_REV => (HostBinding::ChunkRev, &[I32, I32, I32], &[I64]),
             IMPORT_BUMP_BLOCK => (HostBinding::BumpBlock, &[I32, I32, I32, I32], &[I64]),
+            IMPORT_UI_MARK_DIRTY => (HostBinding::UiMarkDirty, &[I32], &[I32]),
             _ => return Err(format!("unknown import `{module}.{name}`")),
         };
         if params != want_p || results != want_r {

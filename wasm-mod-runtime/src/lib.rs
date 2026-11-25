@@ -31,7 +31,8 @@
 //! `megu_chunk_rev(dim, cx, cz) -> i64` and
 //! `megu_bump_block(dim, x, y, z) -> i64` delegating to the shared
 //! `megu_core::section_rev::SharedSectionRevTable` (wire one in with
-//! [`SpineRevHost`]).
+//! [`SpineRevHost`]), plus `megu_ui_mark_dirty(layer) -> i32` for
+//! capability-gated retained mod-HUD/overlay invalidation.
 //!
 //! See `docs/rust-native-mods.md` for the full spec and packaging guide.
 
@@ -55,7 +56,8 @@ pub use abi::{
     Capability, CapabilitySet, MeguHost, SpineRevHost, ABI_VERSION, EXPORT_ABI_VERSION,
     EXPORT_ON_BLOCK_INTERACT, EXPORT_ON_LOAD, EXPORT_ON_TICK, IMPORT_BUMP_BLOCK,
     IMPORT_CHUNK_REV, IMPORT_EMIT_CHAT, IMPORT_GET_BLOCK, IMPORT_LOG, IMPORT_MODULES,
-    IMPORT_SECTION_REV, IMPORT_SET_BLOCK, MANIFEST_ENTRY, MOD_WASM_ENTRY, STATUS_OK,
+    IMPORT_SECTION_REV, IMPORT_SET_BLOCK, IMPORT_UI_MARK_DIRTY, MANIFEST_ENTRY, MOD_WASM_ENTRY,
+    STATUS_OK,
 };
 pub use archive::{inspect_archive, ArchiveMod};
 pub use error::{LoadError, ModFault, Trap};

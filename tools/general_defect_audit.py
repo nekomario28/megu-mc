@@ -258,22 +258,11 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/world_mechanisms.rs:COUNTS:OnceLock<Mutex<HashMap<DimId, Arc<BeDimCounts>>>>': 1,
  'src/world_mechanisms.rs:SPONGE_SEEN:std::cell::RefCell<HashSet<BlockPos>>': 1,
  'src/worldgen.rs:TERRAIN_SHARES:std::sync::OnceLock<Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>>>': 1}
-UNWIRED_MODULE_BASELINE = {'core/bloom',
- 'core/bvh',
- 'core/rev',
- 'core/registry',
- 'core/ui_contract',
- 'core/search_index',
- 'core/timing_wheel',
- 'core/union_find',
- 'core/merkle_cas',
- 'core/sparse_set',
+UNWIRED_MODULE_BASELINE = {'core/search_index',
  'core/dep_graph',
  'core/dye_and_items',
  'core/geom',
- 'core/intern',
  'core/os_desktop',
- 'core/ring_spsc',
  'create-adapter/rail_network',
  'state-store/chunk_packet_cache'}
 

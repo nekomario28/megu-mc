@@ -34,15 +34,25 @@
 //! clock or the filesystem, so any lane can embed it anywhere `std` runs.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
 
+use megu_core::bloom::{BlockedBloomFilter, VoxelBitset4096};
+use megu_core::bvh::{Aabb3, BvhNodeId, DynamicBvh};
 use megu_core::coords::{BlockPos, ChunkKey, CoordMap, DimIndex, SectionKey};
-use megu_core::hash::crc32_ieee;
+use megu_core::hash::{crc32_ieee, crc32_ieee_update};
 use megu_core::id::{InvalidResourceLocation, ResourceLocation};
+use megu_core::intern::{GenArena, GenIndex, StringInterner};
 use megu_core::lz4::{compress_block_into, decompress_block_exact, Lz4Error};
+use megu_core::registry::{NamespacedId, RegistryError, RegistryId, UniversalRegistry};
+use megu_core::rev::{Revision, UiLayer, UiLayerBus};
+use megu_core::ring_spsc::{spsc_u64, BoundedRing, SpscU64Consumer, SpscU64Producer};
 use megu_core::section_rev::SharedSectionRevTable;
+use megu_core::sparse_set::SparseSet;
+use megu_core::timing_wheel::{TimerHandle, TimingWheel};
+use megu_core::ui_contract::{audit_manifest, ModUiManifest, UiContractError, UiExtensionSlot};
+use megu_core::union_find::DisjointSet;
 
 /// First dense dimension index a modded dimension may take (`0..=2` are
 /// the pinned vanilla dimensions).
@@ -160,6 +170,505 @@ impl ModDimRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Universal content registries
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModContentMeta {
+    owner: String,
+}
+
+impl ModContentMeta {
+    pub fn new(owner: impl Into<String>) -> Self {
+        Self {
+            owner: owner.into(),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModContentRegistrationError {
+    InvalidId(InvalidResourceLocation),
+    Registry(RegistryError),
+}
+
+impl fmt::Display for ModContentRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidId(err) => write!(f, "invalid registry id: {err}"),
+            Self::Registry(err) => write!(f, "registry insertion failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ModContentRegistrationError {}
+
+impl From<InvalidResourceLocation> for ModContentRegistrationError {
+    fn from(value: InvalidResourceLocation) -> Self {
+        Self::InvalidId(value)
+    }
+}
+
+impl From<RegistryError> for ModContentRegistrationError {
+    fn from(value: RegistryError) -> Self {
+        Self::Registry(value)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModContentRegistries {
+    blocks: UniversalRegistry<ModContentMeta>,
+    items: UniversalRegistry<ModContentMeta>,
+    channels: UniversalRegistry<ModContentMeta>,
+    ui_screens: UniversalRegistry<ModContentMeta>,
+}
+
+impl ModContentRegistries {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn blocks(&self) -> &UniversalRegistry<ModContentMeta> {
+        &self.blocks
+    }
+
+    #[inline]
+    pub fn blocks_mut(&mut self) -> &mut UniversalRegistry<ModContentMeta> {
+        &mut self.blocks
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn items(&self) -> &UniversalRegistry<ModContentMeta> {
+        &self.items
+    }
+
+    #[inline]
+    pub fn items_mut(&mut self) -> &mut UniversalRegistry<ModContentMeta> {
+        &mut self.items
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn channels(&self) -> &UniversalRegistry<ModContentMeta> {
+        &self.channels
+    }
+
+    #[inline]
+    pub fn channels_mut(&mut self) -> &mut UniversalRegistry<ModContentMeta> {
+        &mut self.channels
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn ui_screens(&self) -> &UniversalRegistry<ModContentMeta> {
+        &self.ui_screens
+    }
+
+    #[inline]
+    pub fn ui_screens_mut(&mut self) -> &mut UniversalRegistry<ModContentMeta> {
+        &mut self.ui_screens
+    }
+
+    pub fn register_block(
+        &mut self,
+        owner: &str,
+        id: &str,
+    ) -> Result<RegistryId, ModContentRegistrationError> {
+        let parsed = NamespacedId::parse(id)?;
+        Ok(self
+            .blocks
+            .register(parsed, ModContentMeta::new(owner))?)
+    }
+
+    pub fn register_item(
+        &mut self,
+        owner: &str,
+        id: &str,
+    ) -> Result<RegistryId, ModContentRegistrationError> {
+        let parsed = NamespacedId::parse(id)?;
+        Ok(self
+            .items
+            .register(parsed, ModContentMeta::new(owner))?)
+    }
+
+    pub fn register_channel(
+        &mut self,
+        owner: &str,
+        id: &str,
+    ) -> Result<RegistryId, ModContentRegistrationError> {
+        let parsed = NamespacedId::parse(id)?;
+        Ok(self
+            .channels
+            .register(parsed, ModContentMeta::new(owner))?)
+    }
+
+    pub fn register_ui_screen(
+        &mut self,
+        owner: &str,
+        id: &str,
+    ) -> Result<RegistryId, ModContentRegistrationError> {
+        let parsed = NamespacedId::parse(id)?;
+        Ok(self
+            .ui_screens
+            .register(parsed, ModContentMeta::new(owner))?)
+    }
+
+    pub fn freeze_all(&mut self) {
+        self.blocks.freeze();
+        self.items.freeze();
+        self.channels.freeze();
+        self.ui_screens.freeze();
+    }
+
+    #[must_use]
+    pub fn digest_crc32(&self) -> u32 {
+        let mut crc = 0u32;
+        for digest in [
+            self.blocks.digest_crc32(),
+            self.items.digest_crc32(),
+            self.channels.digest_crc32(),
+            self.ui_screens.digest_crc32(),
+        ] {
+            crc = crc32_ieee_update(crc, &digest.to_le_bytes());
+        }
+        crc
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mod UI contract wiring
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct RegisteredModUi {
+    manifest: ModUiManifest,
+    registry_id: RegistryId,
+    layer: UiLayer,
+    revision: Revision,
+}
+
+impl RegisteredModUi {
+    #[inline]
+    #[must_use]
+    pub fn manifest(&self) -> &ModUiManifest {
+        &self.manifest
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn registry_id(&self) -> RegistryId {
+        self.registry_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn layer(&self) -> UiLayer {
+        self.layer
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn revision(&self) -> Revision {
+        self.revision
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModUiRegistrationError {
+    Contract(Vec<UiContractError>),
+    Content(ModContentRegistrationError),
+}
+
+impl fmt::Display for ModUiRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(violations) => {
+                write!(f, "mod UI manifest violates the contract")?;
+                if let Some(first) = violations.first() {
+                    write!(f, ": {first}")?;
+                }
+                Ok(())
+            }
+            Self::Content(err) => write!(f, "mod UI registry insertion failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ModUiRegistrationError {}
+
+fn ui_layer_for_slot(slot: UiExtensionSlot) -> UiLayer {
+    match slot {
+        UiExtensionSlot::HudTopLeft
+        | UiExtensionSlot::HudTopRight
+        | UiExtensionSlot::HudBottomLeft
+        | UiExtensionSlot::HudBottomRight => UiLayer::ModHud,
+        UiExtensionSlot::ContainerLeftPanel
+        | UiExtensionSlot::ContainerRightPanel
+        | UiExtensionSlot::PauseMenuAction
+        | UiExtensionSlot::OptionsCategory
+        | UiExtensionSlot::CustomScreen => UiLayer::ModOverlay,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mod connectivity, attachments, and spatial indexing
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModNetworkNodeKind {
+    Pipe,
+    Cable,
+    Belt,
+    Contraption,
+    Generic,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModNetworkNode {
+    pub mod_id: String,
+    pub kind: ModNetworkNodeKind,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModNetworkComponents {
+    sets: DisjointSet,
+    nodes: Vec<ModNetworkNode>,
+}
+
+impl ModNetworkComponents {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add_node(&mut self, mod_id: impl Into<String>, kind: ModNetworkNodeKind) -> u32 {
+        let id = self.sets.push();
+        self.nodes.push(ModNetworkNode {
+            mod_id: mod_id.into(),
+            kind,
+        });
+        id
+    }
+
+    pub fn connect_nodes(&mut self, a: u32, b: u32) -> bool {
+        self.sets.union(a, b)
+    }
+
+    pub fn connected(&mut self, a: u32, b: u32) -> bool {
+        self.sets.connected(a, b)
+    }
+
+    pub fn component_size(&mut self, node: u32) -> u32 {
+        self.sets.component_size(node)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn component_count(&self) -> usize {
+        self.sets.component_count()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn node(&self, node: u32) -> Option<&ModNetworkNode> {
+        self.nodes.get(node as usize)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModAttachmentTarget {
+    Entity { network_id: u32 },
+    Block { dim: DimIndex, pos: BlockPos },
+}
+
+#[derive(Default)]
+pub struct ModComponentStore {
+    interner: StringInterner,
+    targets: GenArena<ModAttachmentTarget>,
+    rows: SparseSet<SparseSet<Vec<u8>>>,
+}
+
+impl fmt::Debug for ModComponentStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModComponentStore")
+            .field("live_targets", &self.targets.len())
+            .field("rows", &self.rows.len())
+            .finish()
+    }
+}
+
+impl ModComponentStore {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn track_target(&mut self, target: ModAttachmentTarget) -> GenIndex {
+        let handle = self.targets.insert(target);
+        self.rows.insert(handle.index, SparseSet::new());
+        handle
+    }
+
+    #[must_use]
+    pub fn target(&self, handle: GenIndex) -> Option<&ModAttachmentTarget> {
+        self.targets.get(handle)
+    }
+
+    pub fn untrack_target(&mut self, handle: GenIndex) -> bool {
+        if self.targets.remove(handle).is_none() {
+            return false;
+        }
+        self.rows.remove(handle.index);
+        true
+    }
+
+    pub fn attach_bytes(&mut self, target: GenIndex, key: &str, bytes: &[u8]) -> bool {
+        if !self.targets.contains(target) {
+            return false;
+        }
+        let symbol = self.interner.intern(key);
+        if self.rows.get(target.index).is_none() {
+            self.rows.insert(target.index, SparseSet::new());
+        }
+        if let Some(row) = self.rows.get_mut(target.index) {
+            row.insert(symbol.0, bytes.to_vec());
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn component(&self, target: GenIndex, key: &str) -> Option<&[u8]> {
+        let symbol = self.interner.get(key)?;
+        self.rows
+            .get(target.index)?
+            .get(symbol.0)
+            .map(Vec::as_slice)
+    }
+
+    pub fn remove_component(&mut self, target: GenIndex, key: &str) -> Option<Vec<u8>> {
+        let symbol = self.interner.get(key)?;
+        if !self.targets.contains(target) {
+            return None;
+        }
+        self.rows.get_mut(target.index)?.remove(symbol.0)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn interned_key(&self, key: &str) -> Option<megu_core::intern::Symbol> {
+        self.interner.get(key)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModSpatialObjectKind {
+    Contraption,
+    Zone,
+    Machine,
+    Volume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModSpatialObject {
+    pub mod_id: String,
+    pub kind: ModSpatialObjectKind,
+}
+
+#[derive(Default)]
+pub struct ModSpatialIndex {
+    bvh: DynamicBvh<ModSpatialObject>,
+}
+
+impl fmt::Debug for ModSpatialIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModSpatialIndex")
+            .field("len", &self.bvh.len())
+            .finish()
+    }
+}
+
+impl ModSpatialIndex {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(
+        &mut self,
+        aabb: Aabb3,
+        mod_id: impl Into<String>,
+        kind: ModSpatialObjectKind,
+    ) -> BvhNodeId {
+        self.bvh.insert(
+            aabb,
+            ModSpatialObject {
+                mod_id: mod_id.into(),
+                kind,
+            },
+        )
+    }
+
+    pub fn remove(&mut self, id: BvhNodeId) -> Option<ModSpatialObject> {
+        self.bvh.remove(id)
+    }
+
+    pub fn update(&mut self, id: BvhNodeId, aabb: Aabb3) -> bool {
+        self.bvh.update(id, aabb)
+    }
+
+    #[must_use]
+    pub fn get(&self, id: BvhNodeId) -> Option<&ModSpatialObject> {
+        self.bvh.get(id)
+    }
+
+    pub fn query_aabb<'a>(
+        &'a self,
+        query: Aabb3,
+        out: &mut Vec<(BvhNodeId, &'a ModSpatialObject)>,
+    ) {
+        self.bvh.query_aabb(query, out);
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bvh.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bvh.is_empty()
+    }
+}
+
+struct ScheduledModCallback(Box<dyn FnOnce(&mut ModSpineHost)>);
+
+// ---------------------------------------------------------------------------
 // Generic subscriptions & wakes
 // ---------------------------------------------------------------------------
 
@@ -171,6 +680,8 @@ pub enum ModWatch {
     Section(SectionKey),
     /// A whole `16×height` chunk column — the aggregate invalidator.
     Chunk(ChunkKey),
+    /// A registered block identity from [`ModContentRegistries`].
+    Block(RegistryId),
 }
 
 /// One generic mod subscription: `mod_id` wants a wake whenever `watch`'s
@@ -225,7 +736,6 @@ pub trait ModEventSink {
 /// [`shared_rev_table`](Self::shared_rev_table) instead of drifting onto a
 /// private copy. Single-threaded sharing matches how the lanes actually
 /// execute: mods are driven from the server tick, never concurrently.
-#[derive(Debug)]
 pub struct ModSpineHost {
     dims: ModDimRegistry,
     revs: Rc<RefCell<SharedSectionRevTable>>,
@@ -235,7 +745,36 @@ pub struct ModSpineHost {
     section_subs: CoordMap<SectionKey, Vec<u64>>,
     /// `ChunkKey -> subscription ids`.
     chunk_subs: CoordMap<ChunkKey, Vec<u64>>,
-    wakes: VecDeque<ModWakeEvent>,
+    block_subs: HashMap<RegistryId, Vec<u64>>,
+    block_watch_filter: BlockedBloomFilter,
+    dirty_voxels: CoordMap<SectionKey, VoxelBitset4096>,
+    wakes: BoundedRing<ModWakeEvent>,
+    wake_producer: SpscU64Producer,
+    wake_consumer: SpscU64Consumer,
+    content: ModContentRegistries,
+    ui_bus: UiLayerBus,
+    mod_ui: HashMap<String, RegisteredModUi>,
+    timers: TimingWheel<ScheduledModCallback>,
+    networks: ModNetworkComponents,
+    components: ModComponentStore,
+    spatial: ModSpatialIndex,
+}
+
+impl fmt::Debug for ModSpineHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ModSpineHost")
+            .field("dims", &self.dims)
+            .field("next_sub", &self.next_sub)
+            .field("subscription_count", &self.subs.len())
+            .field("pending_wakes", &self.wakes.len())
+            .field("content", &self.content)
+            .field("mod_ui_count", &self.mod_ui.len())
+            .field("pending_timers", &self.timers.len())
+            .field("networks", &self.networks)
+            .field("components", &self.components)
+            .field("spatial", &self.spatial)
+            .finish()
+    }
 }
 
 impl Default for ModSpineHost {
@@ -257,6 +796,7 @@ impl ModSpineHost {
     /// *same* revisions as the rest of the mod ecosystem.
     #[must_use]
     pub fn with_rev_table(revs: Rc<RefCell<SharedSectionRevTable>>) -> Self {
+        let (wake_producer, wake_consumer) = spsc_u64(1024);
         Self {
             dims: ModDimRegistry::new(),
             revs,
@@ -264,7 +804,19 @@ impl ModSpineHost {
             subs: HashMap::new(),
             section_subs: CoordMap::default(),
             chunk_subs: CoordMap::default(),
-            wakes: VecDeque::new(),
+            block_subs: HashMap::new(),
+            block_watch_filter: BlockedBloomFilter::with_capacity(1024, 8),
+            dirty_voxels: CoordMap::default(),
+            wakes: BoundedRing::with_capacity(MAX_PENDING_WAKES),
+            wake_producer,
+            wake_consumer,
+            content: ModContentRegistries::new(),
+            ui_bus: UiLayerBus::new(),
+            mod_ui: HashMap::new(),
+            timers: TimingWheel::new(),
+            networks: ModNetworkComponents::new(),
+            components: ModComponentStore::new(),
+            spatial: ModSpatialIndex::new(),
         }
     }
 
@@ -315,6 +867,10 @@ impl ModSpineHost {
         match watch {
             ModWatch::Section(key) => self.section_subs.entry(key).or_default().push(id),
             ModWatch::Chunk(key) => self.chunk_subs.entry(key).or_default().push(id),
+            ModWatch::Block(block) => {
+                self.block_watch_filter.insert_u64(u64::from(block.0));
+                self.block_subs.entry(block).or_default().push(id);
+            }
         }
         self.subs.insert(id, sub);
         id
@@ -330,6 +886,26 @@ impl ModSpineHost {
         self.subscribe(mod_id, ModWatch::Chunk(key))
     }
 
+    /// Shorthand for `subscribe(mod_id, ModWatch::Block(block))`.
+    pub fn subscribe_block(&mut self, mod_id: impl Into<String>, block: RegistryId) -> u64 {
+        self.subscribe(mod_id, ModWatch::Block(block))
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn block_watch_maybe(&self, block: RegistryId) -> bool {
+        self.block_watch_filter.contains_u64(u64::from(block.0))
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn block_watcher_count(&self, block: RegistryId) -> usize {
+        if !self.block_watch_maybe(block) {
+            return 0;
+        }
+        self.block_subs.get(&block).map_or(0, Vec::len)
+    }
+
     /// Remove one subscription by id; `false` when it no longer exists.
     pub fn unsubscribe(&mut self, id: u64) -> bool {
         let Some(sub) = self.subs.remove(&id) else {
@@ -338,6 +914,7 @@ impl ModSpineHost {
         let index = match sub.watch {
             ModWatch::Section(key) => self.section_subs.get_mut(&key),
             ModWatch::Chunk(key) => self.chunk_subs.get_mut(&key),
+            ModWatch::Block(block) => self.block_subs.get_mut(&block),
         };
         if let Some(ids) = index {
             ids.retain(|&s| s != id);
@@ -390,21 +967,46 @@ impl ModSpineHost {
 
     /// Drain every queued wake (oldest first).
     pub fn drain_wakes(&mut self) -> Vec<ModWakeEvent> {
-        self.wakes.drain(..).collect()
+        let mut out = Vec::with_capacity(self.wakes.len());
+        while let Some(event) = self.wakes.pop_front() {
+            out.push(event);
+        }
+        out
     }
 
     /// Drain only `mod_id`'s queued wakes; other mods' events stay queued.
     pub fn drain_wakes_for(&mut self, mod_id: &str) -> Vec<ModWakeEvent> {
         let mut mine = Vec::new();
-        self.wakes.retain(|e| {
-            if e.mod_id == mod_id {
-                mine.push(e.clone());
-                false
+        let mut kept = Vec::with_capacity(self.wakes.len());
+        while let Some(event) = self.wakes.pop_front() {
+            if event.mod_id == mod_id {
+                mine.push(event);
             } else {
-                true
+                kept.push(event);
             }
-        });
+        }
+        for event in kept {
+            self.wakes.push_overwrite_oldest(event);
+        }
         mine
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn dirty_voxel_mask(&self, key: SectionKey) -> Option<&VoxelBitset4096> {
+        self.dirty_voxels.get(&key)
+    }
+
+    pub fn clear_dirty_voxels(&mut self, key: SectionKey) -> bool {
+        self.dirty_voxels.remove(&key).is_some()
+    }
+
+    pub fn drain_wake_signals(&mut self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(self.wake_consumer.len());
+        while let Some(token) = self.wake_consumer.try_pop() {
+            out.push(token);
+        }
+        out
     }
 
     /// Generic mutation hook: record one block edit, bump the canonical
@@ -417,7 +1019,27 @@ impl ModSpineHost {
     /// always mirrors the canonical border-propagation rule exactly,
     /// without duplicating it.
     pub fn notify_block_changed(&mut self, dim: DimIndex, pos: BlockPos) -> (u64, u64) {
+        self.notify_block_changed_inner(dim, pos, None)
+    }
+
+    pub fn notify_block_state_changed(
+        &mut self,
+        dim: DimIndex,
+        pos: BlockPos,
+        block: RegistryId,
+    ) -> (u64, u64) {
+        self.notify_block_changed_inner(dim, pos, Some(block))
+    }
+
+    fn notify_block_changed_inner(
+        &mut self,
+        dim: DimIndex,
+        pos: BlockPos,
+        block: Option<RegistryId>,
+    ) -> (u64, u64) {
         let center = pos.section_key(dim);
+        let voxel = pos.local_index() as u16;
+        self.dirty_voxels.entry(center).or_default().set(voxel);
         let mut sections: Vec<SectionKey> = Vec::with_capacity(27);
         for dx in -1..=1_i32 {
             for dy in -1..=1_i32 {
@@ -472,11 +1094,12 @@ impl ModSpineHost {
             if let Some(ids) = self.section_subs.get(&key) {
                 for &id in ids {
                     if let Some(sub) = self.subs.get(&id) {
-                        self.wakes.push_back(ModWakeEvent {
+                        self.wakes.push_overwrite_oldest(ModWakeEvent {
                             mod_id: sub.mod_id.clone(),
                             watch: sub.watch,
                             revision,
                         });
+                        let _ = self.wake_producer.try_push(revision);
                     }
                 }
             }
@@ -485,17 +1108,31 @@ impl ModSpineHost {
             if let Some(ids) = self.chunk_subs.get(&key) {
                 for &id in ids {
                     if let Some(sub) = self.subs.get(&id) {
-                        self.wakes.push_back(ModWakeEvent {
+                        self.wakes.push_overwrite_oldest(ModWakeEvent {
                             mod_id: sub.mod_id.clone(),
                             watch: sub.watch,
                             revision,
                         });
+                        let _ = self.wake_producer.try_push(revision);
                     }
                 }
             }
         }
-        while self.wakes.len() > MAX_PENDING_WAKES {
-            self.wakes.pop_front();
+        if let Some(block) = block {
+            if self.block_watch_filter.contains_u64(u64::from(block.0)) {
+                if let Some(ids) = self.block_subs.get(&block) {
+                    for &id in ids {
+                        if let Some(sub) = self.subs.get(&id) {
+                            self.wakes.push_overwrite_oldest(ModWakeEvent {
+                                mod_id: sub.mod_id.clone(),
+                                watch: sub.watch,
+                                revision: primary.0,
+                            });
+                            let _ = self.wake_producer.try_push(primary.0);
+                        }
+                    }
+                }
+            }
         }
         primary
     }
@@ -515,6 +1152,166 @@ impl ModSpineHost {
     ) -> Result<(u64, u64), InvalidResourceLocation> {
         let dim = self.dims.resolve_or_register(dim_name)?;
         Ok(self.notify_block_changed(dim, pos))
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn content_registries(&self) -> &ModContentRegistries {
+        &self.content
+    }
+
+    #[inline]
+    pub fn content_registries_mut(&mut self) -> &mut ModContentRegistries {
+        &mut self.content
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn ui_layer_bus(&self) -> &UiLayerBus {
+        &self.ui_bus
+    }
+
+    #[inline]
+    pub fn ui_layer_bus_mut(&mut self) -> &mut UiLayerBus {
+        &mut self.ui_bus
+    }
+
+    fn bump_mod_ui_layer(&mut self, layer: UiLayer) -> Option<Revision> {
+        match layer {
+            UiLayer::ModHud => Some(self.ui_bus.bump(UiLayer::ModHud.index())),
+            UiLayer::ModOverlay => Some(self.ui_bus.bump(UiLayer::ModOverlay.index())),
+            _ => None,
+        }
+    }
+
+    pub fn register_mod_ui(
+        &mut self,
+        manifest: ModUiManifest,
+    ) -> Result<RegistryId, ModUiRegistrationError> {
+        let report = audit_manifest(&manifest, 854, 480, 0);
+        if !report.is_within_budget() {
+            return Err(ModUiRegistrationError::Contract(report.violations));
+        }
+        let registry_name = format!("{}:{}", manifest.mod_id, manifest.slot.as_str());
+        let registry_id = self
+            .content
+            .register_ui_screen(&manifest.mod_id, &registry_name)
+            .map_err(ModUiRegistrationError::Content)?;
+        let layer = ui_layer_for_slot(manifest.slot);
+        let revision = self
+            .bump_mod_ui_layer(layer)
+            .expect("mod UI slots always map to a mod layer");
+        let key = format!("{}:{}", manifest.mod_id, manifest.slot.as_str());
+        self.mod_ui.insert(
+            key,
+            RegisteredModUi {
+                manifest,
+                registry_id,
+                layer,
+                revision,
+            },
+        );
+        Ok(registry_id)
+    }
+
+    pub fn mark_mod_ui_dirty(&mut self, mod_id: &str, layer: UiLayer) -> Option<Revision> {
+        if !matches!(layer, UiLayer::ModHud | UiLayer::ModOverlay) {
+            return None;
+        }
+        let mut found = false;
+        for registered in self.mod_ui.values_mut() {
+            if registered.manifest.mod_id == mod_id && registered.layer == layer {
+                found = true;
+            }
+        }
+        if !found {
+            return None;
+        }
+        let revision = self.bump_mod_ui_layer(layer)?;
+        for registered in self.mod_ui.values_mut() {
+            if registered.manifest.mod_id == mod_id && registered.layer == layer {
+                registered.revision = revision;
+            }
+        }
+        Some(revision)
+    }
+
+    #[must_use]
+    pub fn registered_mod_ui(&self, mod_id: &str) -> Vec<&RegisteredModUi> {
+        let mut out: Vec<&RegisteredModUi> = self
+            .mod_ui
+            .values()
+            .filter(|ui| ui.manifest.mod_id == mod_id)
+            .collect();
+        out.sort_by_key(|ui| ui.registry_id);
+        out
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn registered_mod_ui_count(&self) -> usize {
+        self.mod_ui.len()
+    }
+
+    pub fn schedule_mod_callback<F>(&mut self, delay_ticks: u64, callback: F) -> TimerHandle
+    where
+        F: FnOnce(&mut Self) + 'static,
+    {
+        self.timers
+            .schedule_after(delay_ticks, ScheduledModCallback(Box::new(callback)))
+    }
+
+    pub fn cancel_mod_callback(&mut self, handle: TimerHandle) -> bool {
+        self.timers.cancel(handle)
+    }
+
+    pub fn advance_mod_timers(&mut self) -> usize {
+        let mut due = Vec::new();
+        self.timers.advance_into(&mut due);
+        let count = due.len();
+        for scheduled in due {
+            (scheduled.0)(self);
+        }
+        count
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn pending_mod_timers(&self) -> usize {
+        self.timers.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn network_components(&self) -> &ModNetworkComponents {
+        &self.networks
+    }
+
+    #[inline]
+    pub fn network_components_mut(&mut self) -> &mut ModNetworkComponents {
+        &mut self.networks
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn component_store(&self) -> &ModComponentStore {
+        &self.components
+    }
+
+    #[inline]
+    pub fn component_store_mut(&mut self) -> &mut ModComponentStore {
+        &mut self.components
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn spatial_index(&self) -> &ModSpatialIndex {
+        &self.spatial
+    }
+
+    #[inline]
+    pub fn spatial_index_mut(&mut self) -> &mut ModSpatialIndex {
+        &mut self.spatial
     }
 }
 
