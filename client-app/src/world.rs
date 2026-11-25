@@ -7,6 +7,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use megu_core::coords::CoordMap;
+
 use megu_client_mesh::ffi::{
     megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
@@ -1343,36 +1345,36 @@ pub struct WorldState {
     /// drains as one `apply_edits_multi_word` call per touched chunk
     /// instead of one engine call per edit.
     light_queue: CoalescedLightQueue,
-    pub columns: HashMap<(i32, i32), ChunkColumn>,
+    pub columns: CoordMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
     packed_meshes: HashMap<SectionCoord, Vec<PackedVertex>>,
-    packed_mesh_digests: HashMap<SectionCoord, u64>,
+    packed_mesh_digests: CoordMap<SectionCoord, u64>,
     /// Monotonic per-section mesh-content revision, bumped on every mesh
     /// rebuild or translucent re-sort so `client-gpu` detects changes with
     /// one `u64` compare instead of byte-comparing `Vec<PackedVertex>`
     /// slices. Entries are removed on chunk unload/evict and survive
     /// [`WorldState::release_uploaded_section_cpu_copies`] so unchanged
     /// frames keep matching the VRAM-resident copy.
-    section_mesh_revisions: HashMap<SectionCoord, u64>,
+    section_mesh_revisions: CoordMap<SectionCoord, u64>,
     /// Source of [`section_mesh_revisions`] values. Starts at 1 so `0`
     /// stays a usable "never uploaded" sentinel for consumers, and never
     /// resets — a later section cannot inherit a stale predecessor's
     /// revision across dimension resets.
     next_mesh_revision: u64,
-    translucent_orders: HashMap<SectionCoord, Vec<u32>>,
+    translucent_orders: CoordMap<SectionCoord, Vec<u32>>,
     /// Per-released-section map from a kept translucent quad's position key
     /// to its index in the grouped (packed) order the GPU uploaded. Lets a
     /// camera-driven re-sort of a released section re-derive a valid
     /// `translucent_order` over the VRAM-resident mesh without the deleted
     /// full CPU copy.
     released_translucent_slots:
-        HashMap<SectionCoord, HashMap<TranslucentSlotKey, u32>>,
-    quad_counts: HashMap<SectionCoord, usize>,
+        CoordMap<SectionCoord, HashMap<TranslucentSlotKey, u32>>,
+    quad_counts: CoordMap<SectionCoord, usize>,
     /// Per-section 6x6 face-to-face visibility graph (including uniform-air
     /// sections) plus the renderable flag fed to `GraphCuller`.
     visibility: HashMap<SectionCoord, SectionVisibility>,
     /// Per-section direction-bucket ranges over the grouped packed mesh.
-    direction_buckets: HashMap<SectionCoord, DirectionBuckets>,
+    direction_buckets: CoordMap<SectionCoord, DirectionBuckets>,
     /// Shared 8x4x8-section arena producing batched multi-draw submissions.
     render_regions: RenderRegions,
     pub chunks_decoded: u64,
@@ -1513,17 +1515,17 @@ impl WorldState {
             state_count,
             light_engine,
             light_queue: CoalescedLightQueue::new(),
-            columns: HashMap::new(),
+            columns: CoordMap::default(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
             packed_meshes: HashMap::new(),
-            packed_mesh_digests: HashMap::new(),
-            section_mesh_revisions: HashMap::new(),
+            packed_mesh_digests: CoordMap::default(),
+            section_mesh_revisions: CoordMap::default(),
             next_mesh_revision: 1,
-            translucent_orders: HashMap::new(),
-            released_translucent_slots: HashMap::new(),
-            quad_counts: HashMap::new(),
+            translucent_orders: CoordMap::default(),
+            released_translucent_slots: CoordMap::default(),
+            quad_counts: CoordMap::default(),
             visibility: HashMap::new(),
-            direction_buckets: HashMap::new(),
+            direction_buckets: CoordMap::default(),
             render_regions: RenderRegions::default(),
             chunks_decoded: 0,
             chunks_unloaded: 0,

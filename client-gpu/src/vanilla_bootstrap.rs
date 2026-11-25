@@ -45,6 +45,10 @@ pub const VANILLA_MANIFEST_URL: &str =
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 /// Per-version metadata JSON cap.
 const MAX_VERSION_JSON_BYTES: u64 = 2 * 1024 * 1024;
+/// Mojang asset indexes are bounded separately from version metadata.
+pub const MAX_ASSET_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+/// An individual asset is never allowed to exceed this disk/network budget.
+pub const MAX_ASSET_OBJECT_BYTES: u64 = 256 * 1024 * 1024;
 /// The 1.21.1 client JAR is ~26 MiB; 128 MiB bounds the download.
 pub const MAX_CLIENT_JAR_BYTES: u64 = 128 * 1024 * 1024;
 /// Download stream chunk size.
@@ -53,10 +57,11 @@ const DOWNLOAD_CHUNK: usize = 64 * 1024;
 const ZIP_MAGIC: [u8; 4] = *b"PK\x03\x04";
 
 /// HTTPS-only official Mojang hosts the whole chain may resolve to.
-const MOJANG_HOST_PREFIXES: [&str; 3] = [
+const MOJANG_HOST_PREFIXES: [&str; 4] = [
     "https://piston-meta.mojang.com/",
     "https://piston-data.mojang.com/",
     "https://launchermeta.mojang.com/",
+    "https://resources.download.minecraft.net/",
 ];
 
 /// What the background bootstrap thread is doing right now — the UI
@@ -554,6 +559,19 @@ fn fetch_text(agent: &ureq::Agent, url: &str, cap: u64) -> Result<String, String
         .map_err(|e| format!("GET {url}: {e}"))
 }
 
+fn fetch_asset_version_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    if !url_allowed(url) && !loopback_http_url(url) {
+        return Err(format!("refusing non-Mojang URL {url}"));
+    }
+    let mut response = agent.get(url).call().map_err(|e| format!("GET {url}: {e}"))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(MAX_VERSION_JSON_BYTES)
+        .read_to_string()
+        .map_err(|e| format!("GET {url}: {e}"))
+}
+
 /// Stream `client.url` into `part` in 64 KiB chunks while hashing, then
 /// verify SHA-1 + ZIP magic and atomically rename to `jar`.
 fn download_and_verify(
@@ -708,6 +726,750 @@ pub fn spawn_vanilla_jar_bootstrap(
     dest_game_dir: &Path,
 ) -> Option<VanillaJarBootstrap> {
     spawn_vanilla_jar_bootstrap_with_manifest(version_id, dest_game_dir, VANILLA_MANIFEST_URL)
+}
+
+// ---------------------------------------------------------------------------
+// Mojang asset bootstrap
+// ---------------------------------------------------------------------------
+
+/// The Mojang `assetIndex` reference embedded in a version JSON document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetIndexRef {
+    pub id: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+/// Downloadable object from an asset index, ordered by startup importance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetObjectSpec {
+    pub logical_path: String,
+    pub hash: String,
+    pub size: u64,
+    pub priority: AssetPriority,
+}
+
+/// Stable asset-fetch priority. Derive order is the transfer order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AssetPriority {
+    Tier0FontsAndLang,
+    Tier1UiAndIcons,
+    Tier2Sounds,
+    Tier3Other,
+}
+
+/// Optional bandwidth policy for asset synchronization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetTierFilter {
+    All,
+    FontsAndLangOnly,
+}
+
+/// Observable state of the asset worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AssetBootstrapProgress {
+    FetchingIndex,
+    Downloading {
+        completed_objects: usize,
+        total_objects: usize,
+        downloaded_bytes: u64,
+        total_bytes: u64,
+        fonts_ready: bool,
+    },
+    Ready {
+        assets_dir: PathBuf,
+        index_id: String,
+    },
+    Failed(String),
+}
+
+impl AssetBootstrapProgress {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Ready { .. } | Self::Failed(_))
+    }
+}
+
+/// Pollable handle for an asset bootstrap worker.
+pub struct VanillaAssetsBootstrap {
+    shared: Arc<Mutex<AssetBootstrapProgress>>,
+}
+
+impl VanillaAssetsBootstrap {
+    pub fn progress(&self) -> AssetBootstrapProgress {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+fn set_asset_progress(shared: &Mutex<AssetBootstrapProgress>, progress: AssetBootstrapProgress) {
+    *shared.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+}
+
+fn valid_sha1(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+fn safe_asset_index_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Parse and validate `assetIndex` from Mojang's version metadata.
+pub fn parse_asset_index_ref(version_text: &str) -> Result<AssetIndexRef, String> {
+    let json = parse_json(version_text)?;
+    let index = json
+        .get("assetIndex")
+        .ok_or_else(|| "version JSON has no assetIndex".to_owned())?;
+    let id = index
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "assetIndex has no id".to_owned())?;
+    if !safe_asset_index_id(id) {
+        return Err("assetIndex id is unsafe".to_owned());
+    }
+    let sha1 = index
+        .get("sha1")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "assetIndex has no sha1".to_owned())?;
+    if !valid_sha1(sha1) {
+        return Err("assetIndex sha1 is not 40 lowercase hex".to_owned());
+    }
+    let size = index
+        .get("size")
+        .and_then(strict_u64)
+        .ok_or_else(|| "assetIndex has no exact non-negative size".to_owned())?;
+    if size == 0 || size > MAX_ASSET_INDEX_BYTES {
+        return Err(format!(
+            "asset index size {size} outside 1..={MAX_ASSET_INDEX_BYTES}"
+        ));
+    }
+    let url = index
+        .get("url")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| "assetIndex has no url".to_owned())?;
+    if !url_allowed(url) {
+        return Err("assetIndex url is not a Mojang HTTPS host".to_owned());
+    }
+    Ok(AssetIndexRef {
+        id: id.to_owned(),
+        sha1: sha1.to_owned(),
+        size,
+        url: url.to_owned(),
+    })
+}
+
+fn valid_logical_asset_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 1024
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn asset_priority(path: &str) -> AssetPriority {
+    if path.starts_with("minecraft/font/") || path.starts_with("minecraft/lang/") {
+        AssetPriority::Tier0FontsAndLang
+    } else if path.starts_with("icons/")
+        || path.starts_with("minecraft/texts/")
+        || path.starts_with("minecraft/shaders/")
+    {
+        AssetPriority::Tier1UiAndIcons
+    } else if path.starts_with("minecraft/sounds/") {
+        AssetPriority::Tier2Sounds
+    } else {
+        AssetPriority::Tier3Other
+    }
+}
+
+/// Parse the content-addressed `objects` map and return deterministic priority order.
+pub fn parse_asset_objects(index_text: &str) -> Result<Vec<AssetObjectSpec>, String> {
+    let limits = JsonLimits {
+        max_depth: 8,
+        max_nodes: 2_000_000,
+        max_bytes: MAX_ASSET_INDEX_BYTES as usize,
+    };
+    let json = parse_json_with_limits(index_text, limits, true).map_err(|e| e.to_string())?;
+    let objects = json
+        .get("objects")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "asset index has no objects object".to_owned())?;
+    let mut parsed = Vec::with_capacity(objects.len());
+    for (logical_path, value) in objects {
+        if !valid_logical_asset_path(logical_path) {
+            return Err(format!("unsafe asset logical path {logical_path:?}"));
+        }
+        let hash = value
+            .get("hash")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("asset {logical_path:?} has no hash"))?;
+        if !valid_sha1(hash) {
+            return Err(format!(
+                "asset {logical_path:?} hash is not 40 lowercase hex"
+            ));
+        }
+        let size = value
+            .get("size")
+            .and_then(strict_u64)
+            .ok_or_else(|| format!("asset {logical_path:?} has no exact size"))?;
+        if size > MAX_ASSET_OBJECT_BYTES {
+            return Err(format!(
+                "asset {logical_path:?} exceeds per-object size cap"
+            ));
+        }
+        parsed.push(AssetObjectSpec {
+            logical_path: logical_path.clone(),
+            hash: hash.to_owned(),
+            size,
+            priority: asset_priority(logical_path),
+        });
+    }
+    parsed.sort_by(|a, b| {
+        let a_music = a.logical_path.starts_with("minecraft/sounds/music/")
+            && a.logical_path.ends_with(".ogg");
+        let b_music = b.logical_path.starts_with("minecraft/sounds/music/")
+            && b.logical_path.ends_with(".ogg");
+        (a.priority, a_music, &a.logical_path).cmp(&(b.priority, b_music, &b.logical_path))
+    });
+    Ok(parsed)
+}
+
+fn asset_dir_candidates(
+    os: LauncherOs,
+    env: &OsEnv,
+    game_dir: Option<&Path>,
+    assets_dir: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(dir) = assets_dir {
+        out.push(dir.to_path_buf());
+    }
+    if let Some(dir) = game_dir {
+        out.push(dir.join("assets"));
+    }
+    if let Some(home) = &env.home {
+        match os {
+            LauncherOs::Linux => {
+                out.push(home.join(".minecraft/assets"));
+                out.push(home.join(".var/app/com.mojang.Minecraft/.minecraft/assets"));
+                let data = env
+                    .xdg_data_home
+                    .clone()
+                    .unwrap_or_else(|| home.join(".local/share"));
+                out.push(data.join("PrismLauncher/assets"));
+                out.push(
+                    home.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/assets"),
+                );
+                out.push(data.join("ModrinthApp/meta/assets"));
+            }
+            LauncherOs::MacOs => {
+                let support = home.join("Library/Application Support");
+                out.push(support.join("minecraft/assets"));
+                out.push(support.join("PrismLauncher/assets"));
+                out.push(support.join("ModrinthApp/meta/assets"));
+            }
+            LauncherOs::Windows => {
+                let roaming = env
+                    .appdata
+                    .clone()
+                    .or_else(|| env.userprofile.as_ref().map(|u| u.join("AppData/Roaming")));
+                if let Some(root) = roaming {
+                    out.push(root.join(".minecraft/assets"));
+                    out.push(root.join("PrismLauncher/assets"));
+                    out.push(root.join("ModrinthApp/meta/assets"));
+                }
+            }
+        }
+    }
+    if let Some(cache) = megu_cache_dir(os, env) {
+        out.push(cache.join("assets"));
+    }
+    out
+}
+
+/// Find an existing local `indexes/<id>.json` and `objects/` tree.
+pub fn discover_local_assets_dir(index_id: &str, paths: &SessionPaths) -> Option<PathBuf> {
+    if !safe_asset_index_id(index_id) {
+        return None;
+    }
+    asset_dir_candidates(
+        host_os(),
+        &OsEnv::from_env(),
+        paths.game_dir.as_deref(),
+        paths.assets_dir.as_deref(),
+    )
+    .into_iter()
+    .find(|dir| {
+        dir.join("indexes")
+            .join(format!("{index_id}.json"))
+            .is_file()
+            && dir.join("objects").is_dir()
+    })
+}
+
+fn file_matches_spec(path: &Path, spec: &AssetObjectSpec) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != spec.size {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha1::new();
+    let mut total = 0u64;
+    let mut buffer = [0u8; DOWNLOAD_CHUNK];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n as u64;
+                hasher.update(&buffer[..n]);
+            }
+            Err(_) => return false,
+        }
+    }
+    total == spec.size && hasher.finalize_hex() == spec.hash
+}
+
+fn fetch_asset_index(
+    agent: &ureq::Agent,
+    reference: &AssetIndexRef,
+    url: &str,
+    dir: &Path,
+) -> Result<String, String> {
+    if !url_allowed(url) && !loopback_http_url(url) {
+        return Err("refusing non-Mojang asset index URL".to_owned());
+    }
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let part = dir
+        .join("indexes")
+        .join(format!("{}.json.part", reference.id));
+    let final_path = dir.join("indexes").join(format!("{}.json", reference.id));
+    let mut file = std::fs::File::create(&part)
+        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
+    let mut hash = Sha1::new();
+    let mut count = 0u64;
+    let mut body = Vec::new();
+    let mut buf = [0u8; DOWNLOAD_CHUNK];
+    let mut reader = response.body_mut().as_reader();
+    let result = loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                count += n as u64;
+                if count > reference.size || count > MAX_ASSET_INDEX_BYTES {
+                    break Err("asset index exceeded declared size/cap".to_owned());
+                }
+                hash.update(&buf[..n]);
+                body.extend_from_slice(&buf[..n]);
+                if let Err(e) = file.write_all(&buf[..n]) {
+                    break Err(format!("write {}: {e}", part.display()));
+                }
+            }
+            Err(e) => break Err(format!("read asset index: {e}")),
+        }
+    };
+    if let Err(e) = result {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    if count != reference.size || hash.finalize_hex() != reference.sha1 {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err("asset index size or SHA-1 mismatch".to_owned());
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("sync asset index: {e}"));
+    }
+    drop(file);
+    std::fs::rename(&part, &final_path).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        format!("install asset index: {e}")
+    })?;
+    String::from_utf8(body).map_err(|e| format!("asset index is not UTF-8: {e}"))
+}
+
+fn loopback_http_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")
+}
+
+fn download_asset_object(
+    agent: &ureq::Agent,
+    spec: &AssetObjectSpec,
+    url: &str,
+    dest: &Path,
+) -> Result<(), String> {
+    if !url_allowed(url) && !loopback_http_url(url) {
+        return Err(format!("refusing non-Mojang asset URL {url}"));
+    }
+    let part = dest.with_extension("part");
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("GET {url}: {e}"))?;
+    let mut file = std::fs::File::create(&part)
+        .map_err(|e| format!("cannot create {}: {e}", part.display()))?;
+    let mut hasher = Sha1::new();
+    let mut count = 0u64;
+    let mut buffer = [0u8; DOWNLOAD_CHUNK];
+    let mut reader = response.body_mut().as_reader();
+    let result = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                count += n as u64;
+                if count > spec.size || count > MAX_ASSET_OBJECT_BYTES {
+                    break Err("asset object exceeded declared size/cap".to_owned());
+                }
+                hasher.update(&buffer[..n]);
+                if let Err(e) = file.write_all(&buffer[..n]) {
+                    break Err(format!("write {}: {e}", part.display()));
+                }
+            }
+            Err(e) => break Err(format!("read {url}: {e}")),
+        }
+    };
+    if let Err(e) = result {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    if count != spec.size || hasher.finalize_hex() != spec.hash {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(format!(
+            "asset {} size or SHA-1 mismatch",
+            spec.logical_path
+        ));
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = std::fs::remove_file(&part);
+        return Err(format!("sync {}: {e}", part.display()));
+    }
+    drop(file);
+    std::fs::rename(&part, dest).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        format!("install {}: {e}", dest.display())
+    })
+}
+
+struct AssetBootstrapEndpoints {
+    index_url: Option<String>,
+    object_base_url: Option<String>,
+    local_candidates: Option<Vec<PathBuf>>,
+}
+
+fn assets_run(
+    index_id: &str,
+    version_json_url: &str,
+    dest: &Path,
+    tier_filter: AssetTierFilter,
+    endpoints: &AssetBootstrapEndpoints,
+    shared: &Mutex<AssetBootstrapProgress>,
+) -> Result<(), String> {
+    let agent = http_agent();
+    std::fs::create_dir_all(dest.join("indexes")).map_err(|e| format!("create index dir: {e}"))?;
+    std::fs::create_dir_all(dest.join("objects"))
+        .map_err(|e| format!("create objects dir: {e}"))?;
+    // Discover complete launcher layouts before any network request. A local
+    // index is bounded and its objects are still independently SHA-1 checked.
+    let local_candidates = endpoints
+        .local_candidates
+        .clone()
+        .unwrap_or_else(|| vec![dest.to_path_buf()]);
+    let local = local_candidates.iter().find(|dir| {
+        dir.join("indexes")
+            .join(format!("{index_id}.json"))
+            .is_file()
+            && dir.join("objects").is_dir()
+    });
+    let mut local_index = None;
+    if let Some(source_dir) = local {
+        let source = source_dir.join("indexes").join(format!("{index_id}.json"));
+        if let Ok(meta) = std::fs::metadata(&source) {
+            if meta.is_file() && meta.len() <= MAX_ASSET_INDEX_BYTES {
+                if let Ok(text) = std::fs::read_to_string(&source) {
+                    if parse_asset_objects(&text).is_ok() {
+                        local_index = Some((source_dir, text));
+                    }
+                }
+            }
+        }
+    }
+    let index_text = if let Some((source_dir, text)) = local_index {
+        let source_dir = source_dir.clone();
+        let staged = dest.join("indexes").join(format!("{index_id}.json"));
+        if source_dir != dest && !staged.exists() {
+            let part = staged.with_extension("json.part");
+            std::fs::copy(
+                source_dir.join("indexes").join(format!("{index_id}.json")),
+                &part,
+            )
+            .map_err(|e| format!("stage local asset index: {e}"))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&part)
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&part);
+                    format!("open staged asset index: {e}")
+                })?;
+            if let Err(e) = file.sync_all() {
+                drop(file);
+                let _ = std::fs::remove_file(&part);
+                return Err(format!("sync staged asset index: {e}"));
+            }
+            std::fs::rename(&part, &staged).map_err(|e| {
+                let _ = std::fs::remove_file(&part);
+                format!("install local asset index: {e}")
+            })?;
+        }
+        text
+    } else {
+        set_asset_progress(shared, AssetBootstrapProgress::FetchingIndex);
+        let version_text = fetch_asset_version_text(&agent, version_json_url)?;
+        let reference = parse_asset_index_ref(&version_text)?;
+        if reference.id != index_id {
+            return Err(format!(
+                "requested asset index {index_id:?}, version JSON declares {:?}",
+                reference.id
+            ));
+        }
+        let index_url = endpoints.index_url.as_deref().unwrap_or(&reference.url);
+        if !url_allowed(index_url) && !loopback_http_url(index_url) {
+            return Err("asset index endpoint is not allowlisted".to_owned());
+        }
+        fetch_asset_index(&agent, &reference, index_url, dest)?
+    };
+    let mut objects = parse_asset_objects(&index_text)?;
+    if tier_filter == AssetTierFilter::FontsAndLangOnly {
+        objects.retain(|o| o.priority == AssetPriority::Tier0FontsAndLang);
+    }
+    let total_objects = objects.len();
+    let total_bytes = objects.iter().map(|o| o.size).sum();
+    let mut completed_objects = 0usize;
+    let mut downloaded_bytes = 0u64;
+    let mut fonts_ready = objects
+        .iter()
+        .all(|object| object.priority != AssetPriority::Tier0FontsAndLang);
+    set_asset_progress(
+        shared,
+        AssetBootstrapProgress::Downloading {
+            completed_objects,
+            total_objects,
+            downloaded_bytes,
+            total_bytes,
+            fonts_ready,
+        },
+    );
+    let object_base = endpoints
+        .object_base_url
+        .as_deref()
+        .unwrap_or("https://resources.download.minecraft.net");
+    for spec in &objects {
+        let prefix = &spec.hash[..2];
+        let object_dir = dest.join("objects").join(prefix);
+        std::fs::create_dir_all(&object_dir).map_err(|e| format!("create object dir: {e}"))?;
+        let object_path = object_dir.join(&spec.hash);
+        if !file_matches_spec(&object_path, spec) {
+            if object_path.exists() {
+                std::fs::remove_file(&object_path)
+                    .map_err(|e| format!("remove invalid cached object: {e}"))?;
+            }
+            let mut reused = false;
+            for source_dir in &local_candidates {
+                if source_dir.as_path() == dest {
+                    continue;
+                }
+                let source = source_dir.join("objects").join(prefix).join(&spec.hash);
+                if file_matches_spec(&source, spec) {
+                    let part = object_path.with_extension("part");
+                    std::fs::copy(&source, &part)
+                        .map_err(|e| format!("copy verified local asset: {e}"))?;
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&part)
+                        .map_err(|e| format!("open staged local asset: {e}"))?;
+                    file.sync_all()
+                        .map_err(|e| format!("sync staged local asset: {e}"))?;
+                    std::fs::rename(&part, &object_path).map_err(|e| {
+                        let _ = std::fs::remove_file(&part);
+                        format!("install staged local asset: {e}")
+                    })?;
+                    reused = true;
+                    break;
+                }
+            }
+            if !reused {
+                let url = format!(
+                    "{}/{}/{}",
+                    object_base.trim_end_matches('/'),
+                    prefix,
+                    spec.hash
+                );
+                download_asset_object(&agent, spec, &url, &object_path)?;
+                downloaded_bytes = downloaded_bytes.saturating_add(spec.size);
+            }
+        }
+        completed_objects += 1;
+        if spec.priority == AssetPriority::Tier0FontsAndLang
+            && objects
+                .iter()
+                .filter(|o| o.priority == AssetPriority::Tier0FontsAndLang)
+                .all(|o| {
+                    file_matches_spec(&dest.join("objects").join(&o.hash[..2]).join(&o.hash), o)
+                })
+        {
+            fonts_ready = true;
+        }
+        set_asset_progress(
+            shared,
+            AssetBootstrapProgress::Downloading {
+                completed_objects,
+                total_objects,
+                downloaded_bytes,
+                total_bytes,
+                fonts_ready,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn spawn_assets_worker(
+    index_id: &str,
+    version_json_url: &str,
+    dest: &Path,
+    tier_filter: AssetTierFilter,
+    index_url_override: Option<String>,
+    object_base_override: Option<String>,
+    local_candidates: Option<Vec<PathBuf>>,
+) -> Option<VanillaAssetsBootstrap> {
+    let injected_endpoints = index_url_override.is_some() && object_base_override.is_some();
+    if !safe_asset_index_id(index_id)
+        || (!url_allowed(version_json_url)
+            && !(injected_endpoints && loopback_http_url(version_json_url)))
+    {
+        return None;
+    }
+    if let Some(url) = &index_url_override {
+        if !url_allowed(url) && !(injected_endpoints && loopback_http_url(url)) {
+            return None;
+        }
+    }
+    if let Some(url) = &object_base_override {
+        if !url_allowed(url) && !(injected_endpoints && loopback_http_url(url)) {
+            return None;
+        }
+    }
+    let shared = Arc::new(Mutex::new(AssetBootstrapProgress::FetchingIndex));
+    let worker_shared = Arc::clone(&shared);
+    let id = index_id.to_owned();
+    let version_url = version_json_url.to_owned();
+    let root = dest.to_path_buf();
+    let endpoints = AssetBootstrapEndpoints {
+        index_url: index_url_override,
+        object_base_url: object_base_override,
+        local_candidates,
+    };
+    std::thread::Builder::new()
+        .name("megu-vanilla-assets-bootstrap".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assets_run(
+                    &id,
+                    &version_url,
+                    &root,
+                    tier_filter,
+                    &endpoints,
+                    &worker_shared,
+                )
+            }));
+            let final_state = match result {
+                Ok(Ok(())) => AssetBootstrapProgress::Ready {
+                    assets_dir: root,
+                    index_id: id,
+                },
+                Ok(Err(reason)) => AssetBootstrapProgress::Failed(reason),
+                Err(_) => {
+                    AssetBootstrapProgress::Failed("asset download worker crashed".to_owned())
+                }
+            };
+            set_asset_progress(&worker_shared, final_state);
+        })
+        .ok()?;
+    Some(VanillaAssetsBootstrap { shared })
+}
+
+/// Spawn a Mojang asset bootstrap using the session's launcher paths and the
+/// official resource object endpoint. Existing launcher stores are scanned first.
+pub fn spawn_vanilla_assets_bootstrap(
+    index_id: &str,
+    version_json_url: &str,
+    paths: &SessionPaths,
+    tier_filter: AssetTierFilter,
+) -> Option<VanillaAssetsBootstrap> {
+    let dest_assets = paths
+        .assets_dir
+        .clone()
+        .or_else(|| paths.game_dir.as_ref().map(|dir| dir.join("assets")))
+        .or_else(|| default_vanilla_cache_dir().map(|dir| dir.join("assets")))?;
+    let local_candidates = asset_dir_candidates(
+        host_os(),
+        &OsEnv::from_env(),
+        paths.game_dir.as_deref(),
+        paths.assets_dir.as_deref(),
+    );
+    spawn_assets_worker(
+        index_id,
+        version_json_url,
+        &dest_assets,
+        tier_filter,
+        None,
+        None,
+        Some(local_candidates),
+    )
+}
+
+/// Endpoint-injectable variant for hermetic loopback tests and controlled mirrors.
+#[doc(hidden)]
+pub fn spawn_vanilla_assets_bootstrap_with_endpoints(
+    index_id: &str,
+    version_json_url: &str,
+    dest_assets: &Path,
+    index_url: &str,
+    object_base_url: &str,
+    tier_filter: AssetTierFilter,
+) -> Option<VanillaAssetsBootstrap> {
+    spawn_assets_worker(
+        index_id,
+        version_json_url,
+        dest_assets,
+        tier_filter,
+        Some(index_url.to_owned()),
+        Some(object_base_url.to_owned()),
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -938,8 +1700,17 @@ mod tests {
         assert!(url_allowed(VANILLA_MANIFEST_URL));
         assert!(url_allowed("https://piston-data.mojang.com/v1/objects/ab/cd/client.jar"));
         assert!(url_allowed("https://launchermeta.mojang.com/v1/packages/x/1.21.1.json"));
+        assert!(url_allowed(
+            "https://resources.download.minecraft.net/ab/cd"
+        ));
         assert!(!url_allowed("http://piston-meta.mojang.com/mc/game/version_manifest_v2.json"));
         assert!(!url_allowed("https://piston-meta.mojang.com.evil.example/x"));
+        assert!(!url_allowed(
+            "https://resources.download.minecraft.net.evil.example/ab/cd"
+        ));
+        assert!(!url_allowed(
+            "https://piston-meta.mojang.com@evil.example/mc/game/version_manifest_v2.json"
+        ));
         assert!(!url_allowed("https://evil.example/piston-meta.mojang.com/"));
         assert!(!url_allowed("ftp://piston-meta.mojang.com/x"));
         assert!(!url_allowed(""));

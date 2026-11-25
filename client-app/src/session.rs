@@ -1161,6 +1161,37 @@ impl VoxelAcousticWorld for WorldAcousticView<'_> {
             None => AcousticMaterial::AIR,
         }
     }
+    fn world_mutation_epoch(&self) -> Option<[u64; 4]> {
+        Some([
+            self.world.block_updates,
+            self.world.chunks_decoded,
+            self.world.chunks_unloaded,
+            self.world.columns.len() as u64,
+        ])
+    }
+
+    fn section_revision(&self, cx: i32, sy: i32, cz: i32) -> Option<u64> {
+        self.world
+            .section_mesh_revision(megu_client_mesh::SectionCoord(cx, sy, cz))
+    }
+
+    fn uniform_section_material(&self, cx: i32, sy: i32, cz: i32) -> Option<AcousticMaterial> {
+        let min_sy = self.world.dimension.min_section_y();
+        let max_sy = min_sy + self.world.dimension.section_count() as i32;
+        if sy < min_sy || sy >= max_sy {
+            return Some(AcousticMaterial::AIR);
+        }
+        let section = self
+            .world
+            .columns
+            .get(&(cx, cz))?
+            .sections
+            .get((sy - min_sy) as usize)?;
+        section
+            .palette
+            .uniform_state()
+            .map(|state| acoustic_material_for_state(self.world, state))
+    }
 }
 
 /// O(1) material lookup for one block state: air and fluids short-circuit

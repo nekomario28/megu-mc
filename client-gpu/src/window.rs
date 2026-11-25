@@ -81,12 +81,16 @@ use megu_ui::state::{
     MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen, SettingsTab,
     UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
 };
-use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display};
+use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display, tr};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(all(unix, not(target_os = "macos")))]
+use winit::platform::wayland::WindowAttributesExtWayland;
+#[cfg(all(unix, not(target_os = "macos")))]
+use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::atmosphere::{
@@ -871,9 +875,12 @@ pub struct GpuApp {
     /// Last delivered `ModifiersChanged` state — `Ctrl` (and `Cmd` on
     /// macOS) gates the copy/paste chords on text surfaces.
     modifiers: ModifiersState,
-    /// Live IME composition string from `Ime::Preedit` — cleared on
-    /// `Commit`/`Disabled` so a stale preedit can never double-insert.
-    ime_preedit: Option<String>,
+    /// Live IME composition state from `Ime::Enabled`/`Preedit`/`Commit`/
+    /// `Disabled` — preedit text + clamped cursor byte range plus the
+    /// candidate-window anchor rect pushed through
+    /// `set_ime_cursor_area`. Reset on disable/focus loss so a stale
+    /// composition can never double-insert.
+    ime_state: crate::linux_desktop::ImeCompositionState,
     /// Last `set_ime_allowed` pushed to the window: `true` while a text
     /// surface owns typing, `false` during raw WASD gameplay so the IME
     /// can never hijack movement keys.
@@ -882,6 +889,17 @@ pub struct GpuApp {
     /// `KeyEvent.text` would double-insert; the commit string + instant
     /// is recorded so the keyboard path can swallow the echo.
     last_ime_commit: Option<(String, Instant)>,
+    /// Tiling-WM focus/grab recovery policy seeded from the detected
+    /// [`crate::linux_desktop::LinuxCompositor`]: focus loss and pointer
+    /// exit release the grab cleanly, focus gain / pointer re-entry
+    /// re-arm it in the compositor's preferred `CursorGrabMode` order
+    /// (Hyprland/Sway/Niri/COSMIC lock first; X11 WMs and Gamescope
+    /// confine first).
+    tiling_grab_policy: crate::linux_desktop::TilingGrabPolicy,
+    /// Last `WindowEvent::DroppedFile` payload, staged for the alpha.4
+    /// `DropPayloadClassifier` wiring — recorded plus surfaced as a
+    /// localized status notice, never silently executed.
+    last_dropped_file: Option<std::path::PathBuf>,
     /// QoL container sorter armed by the `SortInventory` keybind.
     inventory_sort: InventorySortState,
     /// Launcher filesystem paths handed to every `LiveSession` this app
@@ -1291,9 +1309,13 @@ impl GpuApp {
             settings_path,
             clipboard: SystemClipboard::new(),
             modifiers: ModifiersState::empty(),
-            ime_preedit: None,
+            ime_state: crate::linux_desktop::ImeCompositionState::default(),
             ime_allowed: false,
             last_ime_commit: None,
+            tiling_grab_policy: crate::linux_desktop::TilingGrabPolicy::new(
+                crate::linux_desktop::detect_compositor_from_env(),
+            ),
+            last_dropped_file: None,
             inventory_sort: InventorySortState::default(),
             session_paths,
             mod_sync_worker: None,
@@ -2491,23 +2513,45 @@ impl GpuApp {
         }
     }
 
+    /// `(try, fallback)` grab modes for mouselook. On Linux the detected
+    /// [`crate::linux_desktop::TilingGrabPolicy`] picks the compositor's
+    /// preferred order: `Locked`→`Confined` for native Wayland
+    /// compositors (`zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`
+    /// unaccelerated raw deltas, so the invisible cursor can never hit
+    /// the window borders), `Confined`→`Locked` for X11 WMs and
+    /// Gamescope, where XI2 `DeviceEvent::MouseMotion` already delivers
+    /// unaccelerated raw deltas and pointer lock trips cursor quirks.
+    /// Other OSes keep the display-policy order (`Locked` first —
+    /// macOS/Windows raw input). The second mode is always the fallback.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn cursor_grab_order(&self) -> (CursorGrabMode, CursorGrabMode) {
+        match self.tiling_grab_policy.preferred_grabs()[0] {
+            crate::linux_desktop::PointerGrab::Locked => {
+                (CursorGrabMode::Locked, CursorGrabMode::Confined)
+            }
+            crate::linux_desktop::PointerGrab::Confined => {
+                (CursorGrabMode::Confined, CursorGrabMode::Locked)
+            }
+        }
+    }
+
+    /// Non-Linux grab order: the display policy's
+    /// `prefer_locked_pointer_first` flag (see the Unix sibling).
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn cursor_grab_order(&self) -> (CursorGrabMode, CursorGrabMode) {
+        if self.policy.prefer_locked_pointer_first {
+            (CursorGrabMode::Locked, CursorGrabMode::Confined)
+        } else {
+            (CursorGrabMode::Confined, CursorGrabMode::Locked)
+        }
+    }
+
     fn set_cursor_grab(&mut self, grab: bool) {
         let Some(active) = &self.active else {
             return;
         };
         if grab && !self.cursor_grabbed {
-            // The display policy picks the grab order: `Locked` first on
-            // Wayland (`zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`
-            // unaccelerated raw deltas, so the invisible cursor can never
-            // hit the window borders), macOS and Windows; `Confined` first
-            // on X11, where XI2 `DeviceEvent::MouseMotion` already delivers
-            // unaccelerated raw deltas and `Locked` hits X11/RDP cursor
-            // lock quirks. The other mode is always the fallback.
-            let (first, second) = if self.policy.prefer_locked_pointer_first {
-                (CursorGrabMode::Locked, CursorGrabMode::Confined)
-            } else {
-                (CursorGrabMode::Confined, CursorGrabMode::Locked)
-            };
+            let (first, second) = self.cursor_grab_order();
             active
                 .window
                 .set_cursor_grab(first)
@@ -2585,10 +2629,28 @@ impl GpuApp {
     /// Push the current text-input state to the OS's IME: allowed while
     /// a text surface owns typing (chat bar, focused UI field, delegated
     /// search), forbidden during raw 3D gameplay so the compositor can
-    /// never hijack WASD movement keys. Only transitions reach the
-    /// window — `set_ime_allowed` is not a per-event call.
+    /// never hijack WASD movement keys. Only transitions reach
+    /// `set_ime_allowed`; while typing is live the candidate-window
+    /// anchor (`set_ime_cursor_area`) tracks whichever surface owns the
+    /// caret so Fcitx5/IBus popups land beside the input, not the
+    /// crosshair. Losing the text surface clears the tracked
+    /// composition state so a stale preedit can't corrupt the next
+    /// commit.
     fn update_ime(&mut self) {
         let allowed = self.text_input_active();
+        if allowed {
+            let area = self.ime_cursor_area();
+            if area != self.ime_state.ime_cursor_area {
+                self.ime_state.set_ime_cursor_area(area);
+                if let Some(active) = &self.active {
+                    let (x, y, w, h) = area;
+                    active.window.set_ime_cursor_area(
+                        PhysicalPosition::new(x, y),
+                        PhysicalSize::new(w, h),
+                    );
+                }
+            }
+        }
         if allowed == self.ime_allowed {
             return;
         }
@@ -2596,6 +2658,39 @@ impl GpuApp {
         if let Some(active) = &self.active {
             active.window.set_ime_allowed(allowed);
         }
+        if !allowed {
+            self.ime_state.on_disabled();
+        }
+    }
+
+    /// Physical-pixel rect the IME candidate window should hug while a
+    /// text surface owns typing: the chat input strip at the bottom-left
+    /// (mirroring `hud_widgets::chat_chrome` — EDGE=4,
+    /// ACTIONBAR_LIFT=64, CHAT_INPUT_H=10, width cap 280), the focused
+    /// widget's hit region (server address, world name/seed, FPS and
+    /// join-code fields), a mid-screen band for the sign editor, or a
+    /// bottom strip fallback so the popup never lands on the center
+    /// crosshair.
+    fn ime_cursor_area(&self) -> (i32, i32, u32, u32) {
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map(|active| (active.size.width as i32, active.size.height as i32))
+            .unwrap_or((0, 0));
+        if self.chat_bar.is_some() {
+            let box_w = 280.min((w - 8).max(40)).max(1);
+            return (4, (h - 76).max(0), box_w as u32, 10);
+        }
+        if self.ui.sign_editor.is_some() {
+            return (w / 4, h / 2, (w / 2).max(1) as u32, 12);
+        }
+        if let Some(id) = self.ui.focused() {
+            if let Some(region) = self.ui.hit_regions.iter().find(|r| r.id == id) {
+                let rect = region.rect;
+                return (rect.x, rect.y, rect.w.max(1), rect.h.max(8));
+            }
+        }
+        (4, (h - 40).max(0), 280.min(w).max(1) as u32, 12)
     }
 
     /// Route committed text — an `Ime::Commit` string, a sanitized
@@ -2736,6 +2831,60 @@ impl GpuApp {
             self.last_ime_commit = None;
         }
         echo
+    }
+
+    /// `WindowEvent::Ime` state update, factored so tests can drive it
+    /// without an `ActiveEventLoop`: transitions `ime_state` on
+    /// `Enabled`/`Preedit`/`Disabled`, and on `Commit` clears the preedit
+    /// and returns the committed string for
+    /// [`committed_text_actions`](Self::committed_text_actions) — the
+    /// same route `Key::Character` text takes, so multi-byte Japanese
+    /// output is never dropped. The commit is also latched for the
+    /// `KeyEvent.text` echo swallow. `None` means nothing to insert.
+    fn on_ime_event(&mut self, ime: Ime) -> Option<String> {
+        match ime {
+            Ime::Enabled => {
+                self.ime_state.on_enabled();
+                None
+            }
+            Ime::Disabled => {
+                self.ime_state.on_disabled();
+                None
+            }
+            Ime::Preedit(text, cursor) => {
+                self.ime_state.on_preedit(text, cursor);
+                None
+            }
+            Ime::Commit(text) => {
+                let committed = self.ime_state.on_commit(text);
+                if committed.is_empty() {
+                    None
+                } else {
+                    self.last_ime_commit = Some((committed.clone(), Instant::now()));
+                    Some(committed)
+                }
+            }
+        }
+    }
+
+    /// `WindowEvent::DroppedFile` staging hook: remember the path and
+    /// surface a non-fatal localized notice. The payload is only
+    /// recorded — classification (`DropPayloadClassifier`) and any
+    /// action on it are alpha.4 wiring, so nothing executes here.
+    fn record_dropped_file(&mut self, path: &std::path::Path) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.last_dropped_file = Some(path.to_path_buf());
+        self.status_line(format!(
+            "{}{name}",
+            tr(
+                self.ui.lang(),
+                "Dropped file (import not wired yet): ",
+                "ドロップされたファイル（取り込みは未対応）: ",
+            )
+        ));
     }
 
     /// A user-visible status line for actions that can't silently no-op:
@@ -3771,6 +3920,21 @@ impl GpuApp {
             .with_title(WINDOW_TITLE)
             .with_inner_size(size)
             .with_resizable(true);
+        // Wayland `app_id` and X11 `WM_CLASS` share one
+        // `platform_specific.name` slot in winit 0.30, so the detected
+        // compositor picks the `(general, instance)` pair the active
+        // backend consumes — `app_id` for `.desktop`/`StartupWMClass`
+        // matching on Wayland, `WM_CLASS(STRING)` on X11.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let compositor = self.tiling_grab_policy.compositor();
+            let (general, instance) = crate::linux_desktop::window_name_hints(compositor);
+            attrs = if compositor.is_wayland() {
+                WindowAttributesExtWayland::with_name(attrs, general, instance)
+            } else {
+                WindowAttributesExtX11::with_name(attrs, general, instance)
+            };
+        }
         if self.config.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -6621,6 +6785,12 @@ impl ApplicationHandler for GpuApp {
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 if !focused {
+                    // Tiling-WM workspace switch (Hyprland/Sway/Niri/i3):
+                    // the policy forgets the grab request, the grab and
+                    // hidden cursor release cleanly, and any live
+                    // composition state drops so a cancelled preedit can
+                    // never corrupt input on return.
+                    self.tiling_grab_policy.focus_lost();
                     self.keys = Keys::default();
                     self.modifiers = ModifiersState::empty();
                     if let Some(event) = self.input_router.release_held_keys() {
@@ -6628,32 +6798,46 @@ impl ApplicationHandler for GpuApp {
                     }
                     self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
-                } else if !self.paused {
+                    self.ime_state.on_disabled();
+                } else {
+                    self.tiling_grab_policy.focus_gained();
+                    // Re-arm only while the policy agrees the pointer is
+                    // inside — tiling WMs can focus a window without
+                    // moving the pointer into it, and grabbing then
+                    // would swallow the desktop's cursor.
+                    if self.tiling_grab_policy.request_grab() {
+                        self.maybe_regrab();
+                    }
+                }
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.tiling_grab_policy.pointer_entered();
+                // Pointer re-entry onto a focused game window (tiling WM
+                // mouse-follows-focus, Alt+Tab back onto the window)
+                // re-arms the grab exactly like focus gain does.
+                if self.tiling_grab_policy.request_grab() {
                     self.maybe_regrab();
                 }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.tiling_grab_policy.pointer_left();
+                self.set_cursor_grab(false);
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.record_dropped_file(&path);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
             WindowEvent::Ime(ime) => {
-                match ime {
-                    Ime::Enabled => {}
-                    Ime::Disabled => self.ime_preedit = None,
-                    Ime::Preedit(text, _cursor) => {
-                        self.ime_preedit = if text.is_empty() { None } else { Some(text) };
-                    }
-                    Ime::Commit(text) => {
-                        // The preedit clears on commit; the composed
-                        // string feeds the active text surface exactly
-                        // once — a platform echo of the same string as
-                        // `KeyEvent.text` is swallowed downstream.
-                        self.ime_preedit = None;
-                        if !text.is_empty() {
-                            self.last_ime_commit = Some((text.clone(), Instant::now()));
-                            for action in self.committed_text_actions(&text) {
-                                self.apply_ui_action(&action, event_loop);
-                            }
-                        }
+                // The composed string routes through the same text
+                // surface as `Key::Character` input — a platform echo
+                // of the commit as `KeyEvent.text` is swallowed
+                // downstream. Preedit/cursor state is tracked in
+                // `ime_state` so cancels and focus loss stay clean.
+                if let Some(committed) = self.on_ime_event(ime) {
+                    for action in self.committed_text_actions(&committed) {
+                        self.apply_ui_action(&action, event_loop);
                     }
                 }
             }
@@ -8093,7 +8277,7 @@ mod tests {
     }
 
     #[test]
-    fn megu_default_links_wire_into_gpu_app_and_respect_show_support_links_toggle() {
+    fn megu_default_links_wire_into_gpu_app_via_about_screen() {
         // `UiState::default()` stays empty so `client-ui` default-URL tests stay intact.
         let bare = UiState::default();
         assert!(bare.website_url.is_empty());
@@ -8112,7 +8296,43 @@ mod tests {
         assert_eq!(app.ui.screen, Screen::Title);
         assert!(app.ui.settings.qol.show_support_links);
 
-        // With `show_support_links = true`, all 4 links render on Title and open Megu URLs.
+        // Vanilla-faithful title: no link row ever reaches Title, with the
+        // support-links toggle on or off — every link lives on About Megu.
+        for support in [true, false] {
+            app.ui.settings.qol.show_support_links = support;
+            let _ = app.ui.render(1280, 720);
+            for id in [
+                megu_ui::state::WidgetId::WebsiteLink,
+                megu_ui::state::WidgetId::SupportLink,
+                megu_ui::state::WidgetId::ContributeLink,
+                megu_ui::state::WidgetId::ReportLink,
+            ] {
+                assert!(
+                    !app.ui.hit_regions.iter().any(|h| h.id == id),
+                    "{id:?} must never render on Title (show_support_links={support})"
+                );
+            }
+        }
+
+        // The `?` chip navigates to About Megu where all 4 links open Megu URLs.
+        let _ = app.ui.render(1280, 720);
+        let about = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::TitleAbout)
+            .cloned()
+            .expect("expected TitleAbout chip on Title");
+        let acts = app.ui.handle_input(megu_ui::state::UiInputEvent::Click {
+            x: about.rect.x + 2,
+            y: about.rect.y + 2,
+        });
+        assert_eq!(
+            acts,
+            vec![UiAction::OpenScreen(megu_ui::state::Screen::AboutMegu)]
+        );
+        assert_eq!(app.ui.screen, megu_ui::state::Screen::AboutMegu);
+
         let _ = app.ui.render(1280, 720);
         for (id, expected) in [
             (
@@ -8138,38 +8358,13 @@ mod tests {
                 .iter()
                 .find(|h| h.id == id)
                 .cloned()
-                .expect("expected link hit region on Title when show_support_links=true");
+                .expect("expected link hit region on About Megu");
             let acts = app.ui.handle_input(megu_ui::state::UiInputEvent::Click {
                 x: hit.rect.x + 2,
                 y: hit.rect.y + 2,
             });
             assert_eq!(acts, vec![UiAction::OpenUrl(expected.to_owned())]);
         }
-
-        // With `show_support_links = false`, SupportLink and ContributeLink hide on Title.
-        app.ui.settings.qol.show_support_links = false;
-        let _ = app.ui.render(1280, 720);
-        assert!(
-            !app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::SupportLink),
-            "SupportLink must hide when show_support_links=false"
-        );
-        assert!(
-            !app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::ContributeLink),
-            "ContributeLink must hide when show_support_links=false"
-        );
-        assert!(
-            app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::ReportLink),
-            "ReportLink stays accessible even when show_support_links=false"
-        );
     }
 
     #[test]
@@ -9540,6 +9735,152 @@ mod tests {
         assert!(app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("い"));
+    }
+
+    /// The `WindowEvent::Ime` state update tracks the full composition
+    /// lifecycle in `ime_state`: `Enabled`/`Preedit`/`Commit`/`Disabled`
+    /// transition deterministically, committed text is returned exactly
+    /// once for the shared text-insertion route (multi-byte Japanese
+    /// survives byte-for-byte), and an empty commit inserts nothing and
+    /// arms no echo swallow.
+    #[test]
+    fn ime_event_state_tracks_composition_and_commit() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        assert_eq!(app.on_ime_event(Ime::Enabled), None);
+        assert!(app.ime_state.active);
+
+        assert_eq!(
+            app.on_ime_event(Ime::Preedit("にほん".to_string(), Some((1, 4)))),
+            None
+        );
+        assert_eq!(app.ime_state.preedit, "にほん");
+        assert_eq!(app.ime_state.cursor_byte_range, Some((0, 3)));
+
+        // A cleared preedit arrives as an empty string.
+        assert_eq!(app.on_ime_event(Ime::Preedit(String::new(), None)), None);
+        assert_eq!(app.ime_state.preedit, "");
+
+        // Commit returns the composed string for the text surface and
+        // latches it for the `KeyEvent.text` echo swallow.
+        assert_eq!(
+            app.on_ime_event(Ime::Commit("日本".to_string())),
+            Some("日本".to_string())
+        );
+        assert_eq!(app.ime_state.preedit, "");
+        assert!(app.swallow_ime_echo("日本"));
+        assert!(!app.swallow_ime_echo("日本"));
+
+        // An empty commit inserts nothing and arms no swallow.
+        app.last_ime_commit = None;
+        assert_eq!(app.on_ime_event(Ime::Commit(String::new())), None);
+        assert!(app.last_ime_commit.is_none());
+
+        app.on_ime_event(Ime::Preedit("かな".to_string(), Some((0, 3))));
+        assert_eq!(app.on_ime_event(Ime::Disabled), None);
+        assert!(!app.ime_state.active);
+        assert_eq!(app.ime_state.preedit, "");
+    }
+
+    /// `update_ime` pushes a candidate-window anchor that tracks the
+    /// text surface: the chat strip when the chat bar is open, the
+    /// focused widget's hit region for UI fields — and dropping the
+    /// text surface clears composition state.
+    #[test]
+    fn ime_cursor_area_tracks_active_text_surface() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        // No window: anchors compute from a 0-size surface but never panic.
+        app.chat_bar = Some(ZshCommandBar::new());
+        let (x, _y, w, _h) = app.ime_cursor_area();
+        assert_eq!(x, 4);
+        assert_eq!(w, 40); // minimum width clamp
+        app.chat_bar = None;
+
+        // A focused UI text field anchors to its own hit region.
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Multiplayer));
+        let _ = app.ui.render(1280, 720);
+        let hit = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::MultiplayerAddressField)
+            .cloned()
+            .expect("address field hit region");
+        for action in app.ui.handle_input(UiInputEvent::Click {
+            x: hit.rect.x + 2,
+            y: hit.rect.y + 2,
+        }) {
+            app.dispatch_ui_action(&action);
+        }
+        assert!(app.ui.server_address_field_active());
+        let area = app.ime_cursor_area();
+        assert_eq!(area.0, hit.rect.x);
+        assert_eq!(area.1, hit.rect.y);
+        assert_eq!(area.2, hit.rect.w);
+
+        // `update_ime` records the same anchor into `ime_state`.
+        app.update_ime();
+        assert!(app.ime_allowed);
+        assert_eq!(app.ime_state.ime_cursor_area, area);
+
+        // Leaving the text surface clears the tracked composition.
+        app.ime_state.on_enabled();
+        app.ime_state.on_preedit("かな", Some((0, 3)));
+        for action in app.ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape)) {
+            app.dispatch_ui_action(&action);
+        }
+        app.update_ime();
+        assert!(!app.ime_allowed);
+        assert!(!app.ime_state.active);
+        assert_eq!(app.ime_state.preedit, "");
+    }
+
+    /// `DroppedFile` records the payload and surfaces a non-fatal
+    /// localized status notice — nothing executes, matching the alpha.4
+    /// `DropPayloadClassifier` staging contract.
+    #[test]
+    fn dropped_file_is_recorded_and_announced() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        assert!(app.last_dropped_file.is_none());
+
+        let path = std::path::Path::new("/tmp/worlds/cool-pack.zip");
+        app.record_dropped_file(path);
+        assert_eq!(app.last_dropped_file.as_deref(), Some(path));
+        assert!(app
+            .status_messages()
+            .iter()
+            .any(|m| m.contains("cool-pack.zip") && m.contains("not wired")));
+
+        // A second drop replaces the staged payload.
+        let other = std::path::Path::new("/tmp/shader");
+        app.record_dropped_file(other);
+        assert_eq!(app.last_dropped_file.as_deref(), Some(other));
+    }
+
+    /// The grab policy is seeded from live compositor detection and the
+    /// focus/pointer transitions gate re-arming exactly like the
+    /// `Focused`/`CursorEntered` event arms do.
+    #[test]
+    fn tiling_grab_policy_tracks_focus_and_pointer_for_rearm() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        assert_eq!(
+            app.tiling_grab_policy.compositor(),
+            crate::linux_desktop::detect_compositor_from_env()
+        );
+        assert!(!app.tiling_grab_policy.should_grab());
+
+        // Pointer entry while focused arms the request; focus loss
+        // releases it; focus gain re-arms only while the pointer is
+        // still inside, and pointer exit releases again.
+        app.tiling_grab_policy.pointer_entered();
+        assert!(app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.focus_lost();
+        assert!(!app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.focus_gained();
+        assert!(app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.pointer_left();
+        assert!(!app.tiling_grab_policy.request_grab());
     }
 
     /// `open_sign_editor` lifts into `ui.sign_editor` via

@@ -1573,6 +1573,33 @@ struct PlacedLightScanCache {
     misses: u64,
 }
 
+#[derive(Clone, Default, PartialEq)]
+struct NatureAmbienceScanKey {
+    center_block: [i32; 3],
+    block_table_ptr: usize,
+    nature_registry_ptr: usize,
+    state_count: usize,
+    block_updates: u64,
+    chunks_decoded: u64,
+    chunks_unloaded: u64,
+    loaded_columns: usize,
+    section_revs: [((i32, i32, i32), Option<u64>); 8],
+}
+
+#[derive(Default)]
+struct NatureAmbienceScanCache {
+    key: NatureAmbienceScanKey,
+    valid: bool,
+    leaf_blocks: Vec<[f32; 3]>,
+    blossom_blocks: Vec<[f32; 3]>,
+    evergreen_blocks: Vec<[f32; 3]>,
+    rain_exposed_water: Vec<[f32; 3]>,
+    waterfall_bases: Vec<([f32; 3], f32)>,
+    hits: u64,
+    misses: u64,
+    block_reads: u64,
+}
+
 /// Per-state resolution memo for one scan pass: `facts`, the
 /// always-dark signal classification and the resolver output are all
 /// pure functions of `(state, registry)`, so a state repeated across
@@ -2264,6 +2291,7 @@ pub struct LiveSession {
     /// unchanged while steady-state frames skip the 4,913-cell sweep
     /// entirely.
     placed_light_scan: RefCell<PlacedLightScanCache>,
+    nature_ambience_scan: RefCell<NatureAmbienceScanCache>,
 }
 
 /// `client_information` view distance announced when a connect site has
@@ -2756,6 +2784,7 @@ impl LiveSession {
             atlas_anim_clock: 0.0,
             last_atlas_anim_tick: Instant::now(),
             placed_light_scan: RefCell::new(PlacedLightScanCache::default()),
+            nature_ambience_scan: RefCell::new(NatureAmbienceScanCache::default()),
         }
     }
 
@@ -2769,11 +2798,241 @@ impl LiveSession {
         )
     }
 
+    fn update_nature_ambience_sites(&mut self) {
+        let center = self.nature_env.origin.map(|v| v.floor() as i32);
+        let mut section_revs = [((0, 0, 0), None); 8];
+        let mut slot = 0;
+        for (sy, _) in placed_scan_axis(center[1]) {
+            for (sz, _) in placed_scan_axis(center[2]) {
+                for (sx, _) in placed_scan_axis(center[0]) {
+                    section_revs[slot] = (
+                        (sx, sy, sz),
+                        self.world.section_mesh_revision(SectionCoord(sx, sy, sz)),
+                    );
+                    slot += 1;
+                }
+            }
+        }
+        let key = NatureAmbienceScanKey {
+            center_block: center,
+            block_table_ptr: &self.world.blocks as *const BlockTable as usize,
+            nature_registry_ptr: &self.nature_mod_registry as *const NatureModRegistry as usize,
+            state_count: self.world.state_count,
+            block_updates: self.world.block_updates,
+            chunks_decoded: self.world.chunks_decoded,
+            chunks_unloaded: self.world.chunks_unloaded,
+            loaded_columns: self.world.columns.len(),
+            section_revs,
+        };
+        let mut cache = self.nature_ambience_scan.borrow_mut();
+        let manual_sites = |current: &[[f32; 3]], scanned: &[[f32; 3]]| {
+            current
+                .iter()
+                .copied()
+                .filter(|site| !scanned.contains(site))
+                .collect::<Vec<_>>()
+        };
+        let manual_leaves = manual_sites(&self.nature_env.leaf_blocks, &cache.leaf_blocks);
+        let manual_blossoms = manual_sites(&self.nature_env.blossom_blocks, &cache.blossom_blocks);
+        let manual_evergreens =
+            manual_sites(&self.nature_env.evergreen_blocks, &cache.evergreen_blocks);
+        let manual_water = manual_sites(
+            &self.nature_env.rain_exposed_water,
+            &cache.rain_exposed_water,
+        );
+        let manual_waterfalls: Vec<_> = self
+            .nature_env
+            .waterfall_bases
+            .iter()
+            .copied()
+            .filter(|site| !cache.waterfall_bases.contains(site))
+            .collect();
+        if cache.valid && cache.key == key {
+            cache.hits += 1;
+        } else {
+            cache.misses += 1;
+            let [cx, cy, cz] = center;
+            let min_y = i64::from(self.world.dimension.min_y);
+            let max_y = min_y + i64::from(self.world.dimension.height);
+            let min_sy = self.world.dimension.min_section_y();
+            let max_sy = min_sy + self.world.dimension.section_count() as i32;
+            let mut leaves = Vec::new();
+            let mut blossoms = Vec::new();
+            let mut evergreens = Vec::new();
+            let mut water = Vec::new();
+            let waterfalls = Vec::new();
+            let mut reads = 0u64;
+            for (sy, ys) in placed_scan_axis(cy) {
+                for (sz, zs) in placed_scan_axis(cz) {
+                    for (sx, xs) in placed_scan_axis(cx) {
+                        let Some(section) = (sy >= min_sy && sy < max_sy)
+                            .then(|| {
+                                self.world
+                                    .columns
+                                    .get(&(sx, sz))
+                                    .and_then(|c| c.sections.get((sy - min_sy) as usize))
+                            })
+                            .flatten()
+                        else {
+                            continue;
+                        };
+                        let uniform = section.palette.uniform_state();
+                        if let Some(state) = uniform {
+                            let Some(name) = self.world.blocks.state_name(state) else {
+                                continue;
+                            };
+                            let path = name.rsplit(':').next().unwrap_or(name);
+                            let block_center = |s: i32, r: &std::ops::RangeInclusive<i32>| {
+                                s.wrapping_mul(16)
+                                    .wrapping_add(8.clamp(*r.start(), *r.end()))
+                            };
+                            let pos = [
+                                block_center(sx, &xs) as f32 + 0.5,
+                                block_center(sy, &ys) as f32 + 0.5,
+                                block_center(sz, &zs) as f32 + 0.5,
+                            ];
+                            if path.contains("leaves") {
+                                if path.contains("blossom")
+                                    || path.contains("sakura")
+                                    || path.contains("cherry")
+                                {
+                                    if blossoms.len() < 256 {
+                                        blossoms.push(pos);
+                                    }
+                                } else if path.contains("spruce")
+                                    || path.contains("pine")
+                                    || path.contains("conifer")
+                                {
+                                    if evergreens.len() < 256 {
+                                        evergreens.push(pos);
+                                    }
+                                } else if leaves.len() < 256 {
+                                    leaves.push(pos);
+                                }
+                            }
+                            if (path.contains("water")
+                                || self.world.blocks.fluid_cell(state).kind.is_some())
+                                && water.len() < 256
+                            {
+                                water.push([pos[0], pos[1] + 0.5, pos[2]]);
+                            }
+                            // Uniform air/stone and other irrelevant sections
+                            // terminate here; uniform emitters contribute one
+                            // representative anchor without expanding 4096 cells.
+                            continue;
+                        }
+                        let mut dense = [0u32; SECTION_CELLS];
+                        if uniform.is_none() {
+                            section.palette.unpack_into(&mut dense);
+                        }
+                        for ly in ys.clone() {
+                            let y = sy.wrapping_mul(16).wrapping_add(ly);
+                            if i64::from(y) < min_y || i64::from(y) >= max_y {
+                                continue;
+                            }
+                            for lz in zs.clone() {
+                                let z = sz.wrapping_mul(16).wrapping_add(lz);
+                                for lx in xs.clone() {
+                                    let x = sx.wrapping_mul(16).wrapping_add(lx);
+                                    let state = match uniform {
+                                        Some(state) => state,
+                                        None => {
+                                            reads += 1;
+                                            dense[section_index(
+                                                lx as usize,
+                                                ly as usize,
+                                                lz as usize,
+                                            )]
+                                        }
+                                    };
+                                    let Some(name) = self.world.blocks.state_name(state) else {
+                                        continue;
+                                    };
+                                    let path = name.rsplit(':').next().unwrap_or(name);
+                                    let pos = [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5];
+                                    if path.contains("leaves") {
+                                        if path.contains("blossom")
+                                            || path.contains("sakura")
+                                            || path.contains("cherry")
+                                        {
+                                            if blossoms.len() < 256 {
+                                                blossoms.push(pos);
+                                            }
+                                        } else if path.contains("spruce")
+                                            || path.contains("pine")
+                                            || path.contains("conifer")
+                                        {
+                                            if evergreens.len() < 256 {
+                                                evergreens.push(pos);
+                                            }
+                                        } else if leaves.len() < 256 {
+                                            leaves.push(pos);
+                                        }
+                                    }
+                                    if (path.contains("water")
+                                        || self.world.blocks.fluid_cell(state).kind.is_some())
+                                        && water.len() < 256
+                                    {
+                                        reads += 1;
+                                        let above =
+                                            self.world.get_block_state(x, y.saturating_add(1), z);
+                                        if above.is_none_or(|sid| self.world.blocks.is_air(sid)) {
+                                            water.push([
+                                                x as f32 + 0.5,
+                                                y as f32 + 1.0,
+                                                z as f32 + 0.5,
+                                            ]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cache.block_reads = cache.block_reads.wrapping_add(reads);
+            cache.leaf_blocks = leaves;
+            cache.blossom_blocks = blossoms;
+            cache.evergreen_blocks = evergreens;
+            cache.rain_exposed_water = water;
+            cache.waterfall_bases = waterfalls;
+            cache.key = key;
+            cache.valid = true;
+        }
+        self.nature_env.leaf_blocks = manual_leaves;
+        self.nature_env
+            .leaf_blocks
+            .extend_from_slice(&cache.leaf_blocks);
+        self.nature_env.blossom_blocks = manual_blossoms;
+        self.nature_env
+            .blossom_blocks
+            .extend_from_slice(&cache.blossom_blocks);
+        self.nature_env.evergreen_blocks = manual_evergreens;
+        self.nature_env
+            .evergreen_blocks
+            .extend_from_slice(&cache.evergreen_blocks);
+        self.nature_env.rain_exposed_water = manual_water;
+        self.nature_env
+            .rain_exposed_water
+            .extend_from_slice(&cache.rain_exposed_water);
+        self.nature_env.waterfall_bases = manual_waterfalls;
+        self.nature_env
+            .waterfall_bases
+            .extend_from_slice(&cache.waterfall_bases);
+    }
+
+    /// Nature site scan cache telemetry: `(hits, misses, dense state reads)`.
+    pub fn nature_ambience_scan_stats(&self) -> (u64, u64, u64) {
+        let cache = self.nature_ambience_scan.borrow();
+        (cache.hits, cache.misses, cache.block_reads)
+    }
+
     /// Advance the retained nature-ambience particle sim by `dt_sec` using
     /// `nature_env` plus the live `season_ambience`. The pack's own
     /// `enabled`/`nature_ambience` toggles gate spawning, so a default
     /// (vanilla) config ticks existing particles out silently.
     pub fn step_nature_ambience(&mut self, dt_sec: f32) {
+        self.update_nature_ambience_sites();
         self.nature_env.season = self.season_ambience;
         tick_nature_ambience(
             &mut self.nature_ambience,
@@ -12515,5 +12774,75 @@ mod cloud_deck_tests {
                 .all(|&id| live.subworlds.get(id).is_none()),
             "a skylight-less dimension must remove every cloud deck"
         );
+    }
+}
+
+#[cfg(test)]
+mod nature_ambience_cache_tests {
+    use super::*;
+
+    #[test]
+    fn nature_site_cache_hits_without_dense_reads_and_invalidates_on_edit_or_move() {
+        let mut live = LiveSession::offline_with_null_audio();
+        live.step_nature_ambience(0.05);
+        let (_, misses, reads) = live.nature_ambience_scan_stats();
+        assert_eq!(misses, 1);
+        live.step_nature_ambience(0.05);
+        let (hits, _, reads_after_hit) = live.nature_ambience_scan_stats();
+        assert_eq!(hits, 1);
+        assert_eq!(
+            reads_after_hit, reads,
+            "cache hit must not read block states"
+        );
+
+        live.world.block_updates = live.world.block_updates.wrapping_add(1);
+        live.step_nature_ambience(0.05);
+        assert_eq!(
+            live.nature_ambience_scan_stats().1,
+            2,
+            "block edit epoch must invalidate"
+        );
+
+        live.nature_env.origin[0] += 1.0;
+        live.step_nature_ambience(0.05);
+        assert_eq!(
+            live.nature_ambience_scan_stats().1,
+            3,
+            "moving to another center block must invalidate"
+        );
+    }
+
+    #[test]
+    fn uniform_air_and_stone_sections_skip_dense_site_scans() {
+        let mut live = LiveSession::offline_with_null_audio();
+        let min_sy = live.world.dimension.min_section_y();
+        let count = live.world.dimension.section_count();
+        for cz in [-1, 0] {
+            for cx in [-1, 0] {
+                let sections = (0..count)
+                    .map(|index| {
+                        let state = if index % 2 == 0 { 0 } else { 1 };
+                        megu_client::world::StoredSection {
+                            palette: megu_kernel::PalettedSection::new_single_bounded(
+                                state,
+                                live.world.state_count,
+                            )
+                            .unwrap(),
+                            block_light: [0; megu_client_mesh::LIGHT_BYTES],
+                            sky_light: [0; megu_client_mesh::LIGHT_BYTES],
+                            biomes: [0; 64],
+                            has_non_air: state != 0,
+                        }
+                    })
+                    .collect();
+                live.world.columns.insert(
+                    (cx, cz),
+                    megu_client::world::ChunkColumn { cx, cz, sections },
+                );
+            }
+        }
+        assert_eq!(min_sy, -4);
+        live.step_nature_ambience(0.05);
+        assert_eq!(live.nature_ambience_scan_stats().2, 0);
     }
 }

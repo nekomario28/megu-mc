@@ -56,14 +56,24 @@ fn whole_range(value: f32, min: f32, max: f32) -> bool {
 
 #[inline(always)]
 fn extents(quad: &Quad) -> [f32; 2] {
-    if quad.layer == Layer::Fluid {
-        return [1.0; 2];
-    }
     let (u, v) = quad.direction.tangents();
-    [
+    let mut out = [
         quad.positions[1][u] - quad.positions[0][u],
         quad.positions[3][v] - quad.positions[0][v],
-    ]
+    ];
+    if quad.layer == Layer::Fluid {
+        // Sloped fluid faces have a fractional (or zero) Y extent the
+        // whole-block width/height fields cannot encode, so they keep the
+        // historical 1x1 tile footprint; merged flat +Y/-Y sheets carry
+        // their real whole-block extents through unchanged.
+        let edge_f = EDGE as f32;
+        for extent in &mut out {
+            if !whole_range(*extent, 1.0, edge_f) {
+                *extent = 1.0;
+            }
+        }
+    }
+    out
 }
 
 #[inline(always)]

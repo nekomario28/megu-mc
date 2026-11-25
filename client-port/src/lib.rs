@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 //! CPU section meshing for Minecraft Java 1.21.1 (protocol 767).
+//!
+//! - [`perceptual_gpu_offload`]: human-perception priority scheduling
+//!   (60° frontal cone boost, distance-scaled entity sync with client-side
+//!   interpolation) and compact 16-byte GPU instance packing.
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod asset_pipeline;
@@ -26,6 +30,7 @@ mod mesh;
 pub mod mesher;
 pub mod model_baker;
 mod packed;
+pub mod perceptual_gpu_offload;
 pub mod png_decode;
 mod region;
 mod section;
@@ -39,6 +44,7 @@ pub mod vanilla_plus_nature;
 pub mod vanilla_plus_visuals;
 pub mod vfx_engine;
 pub mod visibility;
+pub mod voxel_dda_shadows;
 pub mod world;
 
 #[cfg(test)]
@@ -125,6 +131,11 @@ pub use upload_budget::{
     HARD_FLOOR_1000FPS_MAX_UPLOAD_WORK_US_PER_FRAME, HARD_FLOOR_1000FPS_TARGET_FRAME_US,
 };
 pub use visibility::FaceVisibility;
+pub use voxel_dda_shadows::{
+    voxel_shadow_factor, voxel_shadow_factor_world, VoxelOccupancyGrid, VoxelShadowParams,
+    DEFAULT_LIGHT_RADIUS, MAX_DDA_STEPS, VOXEL_DDA_SHADOW_WGSL, VOXEL_GRID_BYTES, VOXEL_GRID_CELLS,
+    VOXEL_GRID_DIM, VOXEL_GRID_WORDS,
+};
 pub use world::WorldState;
 
 /// Wire protocol version for the simulated target release (1.21.1 = 767),

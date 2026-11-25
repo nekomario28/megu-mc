@@ -145,9 +145,16 @@ fi
 
 if [ "$1" = "client" ]; then
     mkdir -p "${MC_DIR}/bin"
-    cp -f "${BUNDLE_DIR}/megu-client-gpu" "${MC_DIR}/bin/megu-client-gpu"
+    # The static musl server bundle ships no GPU client binary; guard
+    # the copy so musl users never hit a `cp` error mid-install.
+    if [ -f "${BUNDLE_DIR}/megu-client-gpu" ]; then
+        cp -f "${BUNDLE_DIR}/megu-client-gpu" "${MC_DIR}/bin/megu-client-gpu"
+        chmod 0755 "${MC_DIR}/bin/megu-client-gpu"
+    else
+        say "note: megu-client-gpu not included in the ${TARGET} bundle; skipping GPU client copy"
+    fi
     cp -f "${BUNDLE_DIR}/megu" "${MC_DIR}/bin/megu"
-    chmod 0755 "${MC_DIR}/bin/megu-client-gpu" "${MC_DIR}/bin/megu"
+    chmod 0755 "${MC_DIR}/bin/megu"
 fi
 
 say "Running: megu-installer $*"
