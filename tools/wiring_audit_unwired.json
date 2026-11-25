@@ -21,6 +21,36 @@
       "module": "client-port/src/world.rs",
       "reason": "WorldState facade staged for the embedding-friendly client split; client-app uses its own world module today",
       "date": "2026-11-23"
+    },
+    {
+      "module": "client-gpu/src/pipeline_cache_store.rs",
+      "reason": "Disk pipeline-cache store is implemented and tested, but the renderer has not yet negotiated wgpu PIPELINE_CACHE or connected load/save at pipeline creation; retained as an explicitly staged alpha4 performance feature",
+      "date": "2026-11-25"
+    },
+    {
+      "module": "client-port/src/voxel_dda_shadows.rs",
+      "reason": "Voxel DDA shadow traversal is experimental renderer infrastructure with no live client-gpu consumer yet; retained as explicitly staged rendering work rather than treated as a production path",
+      "date": "2026-11-25"
+    },
+    {
+      "module": "core/src/geom.rs",
+      "reason": "Fixed six-plane/clip-space geometry helper is incompatible with the current wgpu renderer frustum conventions and has no compatible production consumer; retained pending a correct consumer or removal after alpha4",
+      "date": "2026-11-25"
+    },
+    {
+      "module": "core/src/os_desktop.rs",
+      "reason": "Windows/macOS desktop integration helpers are implemented as a platform API but no live shell/UI consumer uses them in alpha4; retained as explicitly staged platform integration",
+      "date": "2026-11-25"
+    },
+    {
+      "module": "mod-adapter-core/src/mod_isolation.rs",
+      "reason": "Mod isolation/quarantine runtime is implemented and tested but is not yet connected to the live WASM/mod lifecycle; retained as explicitly staged mod-runtime hardening",
+      "date": "2026-11-25"
+    },
+    {
+      "module": "mod-adapter-core/src/spine_bridge.rs",
+      "reason": "Shared mod spine host bridge is implemented for integration tests but is not yet owned by the live mod runtime; retained as explicitly staged mod-runtime integration",
+      "date": "2026-11-25"
     }
   ]
 }
