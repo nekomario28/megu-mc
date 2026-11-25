@@ -166,6 +166,45 @@ impl ChunkPacketCache {
         result
     }
 
+    /// Look up `key` at the chunk's current generation without running an
+    /// encoder while holding `&mut self`. Returns `Ok(frame)` on a cache hit
+    /// (including an encode-once promotion hit) or `Err(generation)` on a miss
+    /// so the caller can build the frame outside any lock and commit it with
+    /// [`Self::insert_if_generation`].
+    pub fn try_get(&mut self, key: ChunkPacketKey) -> Result<Arc<[u8]>, u64> {
+        self.lookup_for_build(key).map(|(frame, _)| frame)
+    }
+
+    /// Store a frame encoded outside the cache lock when the chunk is still at
+    /// `expected_generation`. If a concurrent invalidation bumped the chunk
+    /// while encoding was in flight, the frame is returned without being cached.
+    pub fn insert_if_generation<B>(
+        &mut self,
+        key: ChunkPacketKey,
+        expected_generation: u64,
+        frame: B,
+    ) -> Arc<[u8]>
+    where
+        B: Into<Arc<[u8]>>,
+    {
+        let frame: Arc<[u8]> = frame.into();
+        let current_generation = self.generations.get(&key.chunk()).copied().unwrap_or(0);
+        if current_generation != expected_generation {
+            return frame;
+        }
+        if key.compression_threshold == -1 {
+            let wire_key = WireChunkKey {
+                dim: DimIndex(key.dim),
+                cx: key.cx,
+                cz: key.cz,
+            };
+            self.encode_once
+                .store(wire_key, expected_generation, Arc::clone(&frame));
+        }
+        self.store_entry(key, expected_generation, Arc::clone(&frame));
+        frame
+    }
+
     /// Return the shared wire frame and whether it came from the cache.
     /// The encoder is invoked exactly once on a miss and never on a hit.
     /// Oversized packets and zero-capacity caches return the encoded frame
@@ -175,6 +214,16 @@ impl ChunkPacketCache {
         F: FnOnce() -> B,
         B: Into<Arc<[u8]>>,
     {
+        match self.lookup_for_build(key) {
+            Ok(hit) => hit,
+            Err(generation) => {
+                let frame = self.insert_if_generation(key, generation, encode_fn());
+                (frame, false)
+            }
+        }
+    }
+
+    fn lookup_for_build(&mut self, key: ChunkPacketKey) -> Result<(Arc<[u8]>, bool), u64> {
         let generation = self.generations.get(&key.chunk()).copied().unwrap_or(0);
         if let Some(entry) = self.entries.get(&key) {
             if entry.packet.generation == generation {
@@ -185,7 +234,7 @@ impl ChunkPacketCache {
                 self.entries.get_mut(&key).unwrap().last_touch = touch;
                 self.lru.insert((touch, key));
                 self.stats.hits += 1;
-                return (frame, true);
+                return Ok((frame, true));
             }
 
             if self.remove(key) {
@@ -194,27 +243,30 @@ impl ChunkPacketCache {
         }
 
         self.stats.misses += 1;
-        let frame: Arc<[u8]> = if key.compression_threshold == -1 {
+        if key.compression_threshold == -1 {
             let wire_key = WireChunkKey {
                 dim: DimIndex(key.dim),
                 cx: key.cx,
                 cz: key.cz,
             };
             if let Some(frame) = self.encode_once.get_rev(wire_key, generation) {
-                Arc::clone(&frame.bytes)
-            } else {
-                let frame: Arc<[u8]> = encode_fn().into();
-                self.encode_once.store(wire_key, generation, Arc::clone(&frame));
-                frame
+                let frame = Arc::clone(&frame.bytes);
+                self.store_entry(key, generation, Arc::clone(&frame));
+                return Ok((frame, false));
             }
-        } else {
-            encode_fn().into()
-        };
+        }
+        Err(generation)
+    }
+
+    fn store_entry(&mut self, key: ChunkPacketKey, generation: u64, frame: Arc<[u8]>) {
         let frame_len = frame.len();
         if self.max_entries == 0 || frame_len > self.max_bytes {
-            return (frame, false);
+            return;
         }
 
+        if self.remove(key) {
+            self.stats.invalidations += 1;
+        }
         while self.entries.len() >= self.max_entries
             || self.stats.bytes_used > self.max_bytes - frame_len
         {
@@ -229,7 +281,7 @@ impl ChunkPacketCache {
             Entry {
                 packet: CachedChunkPacket {
                     generation,
-                    encoded_frame: Arc::clone(&frame),
+                    encoded_frame: frame,
                 },
                 last_touch: touch,
             },
@@ -240,7 +292,6 @@ impl ChunkPacketCache {
             .insert(key);
         self.lru.insert((touch, key));
         self.stats.bytes_used += frame_len;
-        (frame, false)
     }
 
     /// Remove every packet entry belonging to `chunk`. The returned token makes

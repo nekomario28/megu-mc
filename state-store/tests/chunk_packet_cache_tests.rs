@@ -174,3 +174,30 @@ fn encode_once_backing_reuses_uncompressed_frame_after_outer_lru_eviction() {
     assert!(Arc::ptr_eq(&first, &reused));
     assert_eq!(reused.as_ref(), [0x27; 8]);
 }
+
+#[test]
+fn try_get_and_insert_if_generation_rejects_stale_concurrent_encode() {
+    let mut cache = ChunkPacketCache::default();
+    let k = key(0, 2, 3, -1);
+
+    // Miss returns the expected generation so encoding can happen unlocked.
+    let gen0 = cache.try_get(k).expect_err("initial lookup must miss");
+    assert_eq!(gen0, 0);
+
+    // Simulate a concurrent block mutation while the frame was encoding.
+    let gen1 = cache.bump_block(0, 34, 50);
+    assert_eq!(gen1, 1);
+
+    // Committing the stale gen0 frame returns the bytes to the caller without
+    // poisoning the cache for generation 1.
+    let stale = cache.insert_if_generation(k, gen0, vec![0xAA; 4]);
+    assert_eq!(stale.as_ref(), [0xAA; 4]);
+    assert_eq!(cache.len(), 0);
+    assert_eq!(cache.try_get(k).expect_err("stale frame must not be cached"), gen1);
+
+    // Committing a fresh gen1 frame populates the cache and serves hits.
+    let fresh = cache.insert_if_generation(k, gen1, vec![0xBB; 4]);
+    let hit = cache.try_get(k).expect("fresh gen1 frame must hit");
+    assert!(Arc::ptr_eq(&fresh, &hit));
+    assert_eq!(hit.as_ref(), [0xBB; 4]);
+}

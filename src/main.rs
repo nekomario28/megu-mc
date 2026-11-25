@@ -771,6 +771,9 @@ fn dim_ultrawarm(dim: DimId) -> bool {
 }
 // world spawn (vanilla /setworldspawn) + difficulty — both persisted
 static WORLD_SPAWN: Mutex<(f64, f64, f64, f32)> = Mutex::new((0.5, 16.0, 0.5, 0.0));
+/// Whether the boot safe-spawn search selected the current world spawn; while
+/// active, spawnRadius scattering must not move a fresh player back onto unsafe ground.
+static SAFE_WORLD_SPAWN_ACTIVE: AtomicBool = AtomicBool::new(false);
 // 0=peaceful 1=easy 2=normal 3=hard; gates hostile night spawns
 static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
 // vanilla `LevelData.difficultyLocked`, set by the OP-only `lock_difficulty`
@@ -18148,6 +18151,33 @@ fn map_chunk(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources) -> Vec<u8> {
     map_chunk_lane(cx, cz, dim, gen, false)
 }
 
+#[cfg(feature = "mod-suite")]
+fn state_chunk_packet_get_or_build(
+    packet_key: megu_state_store::chunk_packet_cache::ChunkPacketKey,
+    build: impl FnOnce() -> Vec<u8>,
+) -> Vec<u8> {
+    let expected_gen = {
+        let mut cache = state_chunk_packet_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match cache.try_get(packet_key) {
+            Ok(frame) => return frame.to_vec(),
+            Err(generation) => generation,
+        }
+    };
+    // Build outside the cache mutex: `build_map_chunk_lane` calls
+    // `materialize_pending_generation` -> `with_save_guard` (`SAVE_LOCK`), while
+    // block mutations hold `SAVE_LOCK` when calling `quiescent_note_block_mutation`
+    // -> `state_chunk_packet_cache()`. Releasing the lock here removes the AB-BA
+    // deadlock and lets chunk-delivery workers encode in parallel.
+    let built = build();
+    state_chunk_packet_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert_if_generation(packet_key, expected_gen, built)
+        .to_vec()
+}
+
 fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: bool) -> Vec<u8> {
     // M3 P5: the 0x27 payload is shared by every player that loads the same chunk at
     // matching 3x3 versions and entity/neighbor-light signatures; a hit also restores
@@ -18181,18 +18211,15 @@ fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: 
             if let Some(stored_emitters) = hit_emitters {
                 #[cfg(feature = "mod-suite")]
                 {
-                    let (frame, _frame_hit) = state_chunk_packet_cache()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_or_encode(packet_key, || {
-                            build_map_chunk_lane(cx, cz, dim, gen, occluded)
-                        });
+                    let frame = state_chunk_packet_get_or_build(packet_key, || {
+                        build_map_chunk_lane(cx, cz, dim, gen, occluded)
+                    });
                     // The metadata hit already proves these exact generation/light
                     // inputs, so its emitter set is authoritative even when the
                     // state-store outer entry was evicted but the encode-once
                     // backing supplied the bytes without rerunning the encoder.
                     gen.insert((cx, cz), stored_emitters);
-                    return frame.to_vec();
+                    return frame;
                 }
                 #[cfg(not(feature = "mod-suite"))]
                 {
@@ -18211,15 +18238,18 @@ fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: 
         // Any validation-input change outside ordinary block edits (sign/block-entity
         // data, generator emitters, lighting signatures, or first population of the
         // metadata index) must retire bytes cached under the old generation too.
-        state_chunk_packet_cache()
+        // Release the cache mutex before encoding so `build_map_chunk_lane` never
+        // acquires `SAVE_LOCK` while holding `state_chunk_packet_cache()`.
+        let expected_gen = state_chunk_packet_cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .bump_chunk(dim.raw(), cx, cz);
-        let (frame, _) = state_chunk_packet_cache()
+        let built = build_map_chunk_lane(cx, cz, dim, gen, occluded);
+        state_chunk_packet_cache()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get_or_encode(packet_key, || build_map_chunk_lane(cx, cz, dim, gen, occluded));
-        frame.to_vec()
+            .insert_if_generation(packet_key, expected_gen, built)
+            .to_vec()
     };
     #[cfg(not(feature = "mod-suite"))]
     let payload = build_map_chunk_lane(cx, cz, dim, gen, occluded);
@@ -23162,6 +23192,7 @@ fn main() {
         let (x, y, z) = compute_safe_initial_world_spawn();
         let mut spawn = WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         *spawn = (x, y, z, spawn.3);
+        SAFE_WORLD_SPAWN_ACTIVE.store(true, Ordering::Relaxed);
         eprintln!("[spine] safe world spawn at {x:.1} {y:.1} {z:.1}");
     }
     boot_prof.mark("spawn-search");

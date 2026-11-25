@@ -2833,6 +2833,11 @@ fn eval_limited_crafting_allowed(limited_crafting: bool, recipe_unlocked: bool) 
 /// respawning player scatters into.
 #[allow(dead_code)] // read by the respawn path in play_protocol (another lane)
 pub(crate) fn spawn_radius_blocks() -> i32 {
+    if SAFE_WORLD_SPAWN_ACTIVE.load(Ordering::Relaxed)
+        || std::env::var("MEGU_SAFE_SPAWN").as_deref() == Ok("1")
+    {
+        return 0;
+    }
     gamerule_live_value("spawnRadius").max(0)
 }
 

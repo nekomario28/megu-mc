@@ -143,23 +143,53 @@ fn find_safe_spawn_column(
 /// The search, then the guaranteed exit: the centre column's surface + 1 when no
 /// dry spot exists inside the radius (an all-ocean custom world still spawns the
 /// player instead of hanging).
-fn safe_spawn_or_fallback(
+fn safe_spawn_or_fallback_with_relaxed(
     surface: &dyn Fn(i32, i32) -> i32,
     block: &dyn Fn(i32, i32, i32) -> u32,
     min_feet_y: i32,
     max_feet_y: i32,
+    relaxed_min_feet_y: i32,
 ) -> (f64, f64, f64) {
-    match find_safe_spawn_column(
+    let found = find_safe_spawn_column(
         surface,
         block,
         min_feet_y,
         max_feet_y,
         SPAWN_SEARCH_RADIUS,
         SPAWN_SEARCH_STEP,
-    ) {
+    )
+    .or_else(|| {
+        (relaxed_min_feet_y < min_feet_y).then(|| {
+            find_safe_spawn_column(
+                surface,
+                block,
+                relaxed_min_feet_y,
+                max_feet_y,
+                SPAWN_SEARCH_RADIUS,
+                SPAWN_SEARCH_STEP,
+            )
+        })?
+    });
+    match found {
         Some((x, feet, z)) => (x as f64 + 0.5, feet as f64, z as f64 + 0.5),
         None => (0.5, surface(0, 0) as f64 + 1.0, 0.5),
     }
+}
+
+#[cfg(test)]
+fn safe_spawn_or_fallback(
+    surface: &dyn Fn(i32, i32) -> i32,
+    block: &dyn Fn(i32, i32, i32) -> u32,
+    min_feet_y: i32,
+    max_feet_y: i32,
+) -> (f64, f64, f64) {
+    safe_spawn_or_fallback_with_relaxed(
+        surface,
+        block,
+        min_feet_y,
+        max_feet_y,
+        min_feet_y,
+    )
 }
 
 /// A safe initial spawn in `dim`, searched over the real world (`height_at_dim`
@@ -176,7 +206,13 @@ fn find_safe_world_spawn(dim: DimId) -> (f64, f64, f64) {
     let max_feet_y = dim.min_y() + dim.height() - 2;
     let surface = |x: i32, z: i32| height_at_dim(dim, x, z);
     let block = |x: i32, y: i32, z: i32| block_at_dim(dim, x, y, z);
-    safe_spawn_or_fallback(&surface, &block, min_feet_y, max_feet_y)
+    safe_spawn_or_fallback_with_relaxed(
+        &surface,
+        &block,
+        min_feet_y,
+        max_feet_y,
+        dim.min_y() + 1,
+    )
 }
 
 // ---------------------------------------------------------- server list ping
