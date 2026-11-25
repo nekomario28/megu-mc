@@ -15,11 +15,11 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
+import protocol767  # noqa: E402
 from protocol767 import (  # noqa: E402
     Client,
     ContractFailure,
     Reader,
-    WIRE_BLOCKS,
     local_server,
     position,
     require,
@@ -102,7 +102,7 @@ def place_block(client, cell, sequence=1):
 def breakable_states():
     return {
         st
-        for b in WIRE_BLOCKS
+        for b in protocol767.WIRE_BLOCKS
         if b["boundingBox"] == "block" and 0 <= b["hardness"] < 50
         for st in range(b["minStateId"], b["maxStateId"] + 1)
     }

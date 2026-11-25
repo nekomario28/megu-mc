@@ -19,7 +19,7 @@ import unittest
 from container_wire import stack, wire_stack
 from protocol767 import (AIR_STATES, Client, Reader, ROOT,
                          WIRE_BLOCKS, frame_packet, local_server, position,
-                         require, unpack_position, unframe_packet, vint)
+                         require, string, unpack_position, unframe_packet, vint)
 
 
 CRITERIA = (
@@ -68,6 +68,17 @@ def chat_component(body):
     return root if isinstance(root, str) else root.get("text", "")
 
 
+def disguised_chat_line(body):
+    """Decode protocol-767 disguised chat as the decorated line clients show."""
+    reader = Reader(body)
+    content_root = reader.nbt()
+    content = content_root if isinstance(content_root, str) else content_root.get("text", "")
+    reader.varint()
+    sender_root = reader.nbt()
+    sender = sender_root if isinstance(sender_root, str) else sender_root.get("text", "")
+    return f"<{sender}> {content}" if sender else content
+
+
 class AlphaClient(Client):
     """Record messages the base Protocol 767 fixture would otherwise consume."""
 
@@ -103,7 +114,7 @@ class AlphaClient(Client):
         elif pid in (0x2e, 0x2f, 0x30, 0x70):
             self.entity_movements.append(Reader(body).varint())
         elif pid == 0x1e:
-            self.chat_lines.append(chat_component(body))
+            self.chat_lines.append(disguised_chat_line(body))
         elif pid == 0x13:
             r = Reader(body)
             window, state = r.number("B"), r.varint()
@@ -124,8 +135,13 @@ class AlphaClient(Client):
         return pid, body
 
     def command(self, command, response):
-        self.chat_action("/" + command)
         before = len(self.messages)
+        time.sleep(max(0, self.last_chat + 1.1 - time.monotonic()))
+        self.last_chat = time.monotonic()
+        # Serverbound chat_command (0x04) carries the command without the
+        # leading slash; a 0x06 chat message is ordinary chat even when its
+        # text starts with '/'.
+        self.send(0x04, string(command.lstrip("/")))
         # Responses arrive asynchronously; the command is confirmed only by its reply.
         self.until(lambda *_: any((response(message) if callable(response) else response in message)
                                   for message in self.messages[before:]),
@@ -272,6 +288,10 @@ def exercise(binary, root, passed):
             alice.command("seed", lambda reply: reply.strip().lstrip("-").isdigit())
             alice.command("time set day", "Set time to")
             passed.append(CRITERIA[4])
+            # Bob's multiplayer witness role is complete. Close him before the
+            # single-player death/reconnect phase so the harness does not leave
+            # an unread socket backed up behind the server's chunk writer.
+            bob.socket.close()
 
             alice.command("kill Alice", "Killed")
             alice.until(lambda *_: any(value <= 0 for value in alice.health), "Alice-death-health")

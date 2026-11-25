@@ -69,6 +69,10 @@ class PacketBuilderTests(unittest.TestCase):
         self.assertEqual(psb.plain_stack(1, 1), b"\x01\x01\x00\x00")
         self.assertEqual(psb.plain_stack(0, 0), b"\x00")
 
+    @unittest.skipUnless(
+        (ROOT / "assets/blocks_1211.json").is_file(),
+        "requires local assets/blocks_1211.json",
+    )
     def test_breakable_states_nonempty(self):
         states = psb.breakable_states()
         self.assertTrue(states)
