@@ -482,7 +482,8 @@ fn aabb_in_lava_dim(dim: DimId, aabb: EntityAabb) -> bool {
 }
 
 /// 1.21.1 `Player.<clinit>` (`cmx`) pose eye heights:
-/// standing `1.62f`, crouching `1.27f`, fall-flying `0.4f`.
+/// standing `1.62f`, crouching `1.27f`, and `0.4f` for every `0.6`-high
+/// pose — fall-flying, swimming, and the 1x1 trapdoor crawl share it.
 fn player_eye_height(sneaking: bool, fall_fly: bool) -> f32 {
     if fall_fly {
         0.4
@@ -490,6 +491,46 @@ fn player_eye_height(sneaking: bool, fall_fly: bool) -> f32 {
         1.27
     } else {
         1.62
+    }
+}
+
+/// Whether a player box `0.6 x height` fits at `(x, y, z)`, checked against
+/// real block collision shapes (trapdoors, slabs, ceilings). The box is
+/// deflated by a hair so a pose that only *touches* the geometry — a sneaker
+/// under a 1.5-high gap — still counts as fitting.
+fn player_pose_fits(dim: DimId, x: f64, y: f64, z: f64, height: f64) -> bool {
+    let e = 1e-4;
+    !any_block_collision_box_dim(
+        dim,
+        [x - 0.3 + e, y + e, z - 0.3 + e],
+        [x + 0.3 - e, y + height - e, z + 0.3 - e],
+    )
+}
+
+/// The one canonical pose-aware eye height: the tallest pose the client can
+/// legitimately occupy at `(x, y, z)` — `0.4` for fall-flying, swimming or
+/// the forced 1x1 crawl under a ceiling/trapdoor, `1.27` when the client
+/// reports sneaking or a 1.8 standing box cannot fit, `1.62` otherwise.
+/// Dig reach, place reach, attack reach and every `+ 1.62` hack share it.
+fn player_eye_height_at(
+    dim: DimId,
+    x: f64,
+    y: f64,
+    z: f64,
+    sneaking: bool,
+    fall_fly: bool,
+    swimming: bool,
+) -> f32 {
+    if fall_fly || swimming {
+        0.4
+    } else if sneaking && player_pose_fits(dim, x, y, z, 1.5) {
+        1.27
+    } else if player_pose_fits(dim, x, y, z, 1.8) {
+        1.62
+    } else if player_pose_fits(dim, x, y, z, 1.5) {
+        1.27
+    } else {
+        0.4
     }
 }
 

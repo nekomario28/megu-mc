@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Tests for tools/strict_vanilla_parity_audit.py (megu-strict-vanilla-parity/1).
 
-Every one of the 10 gates is driven twice over synthetic Rust fixtures:
+Every one of the 11 gates is driven twice over synthetic Rust fixtures:
 once against the buggy pattern the gate was built to catch (the fishing
 `(age % 5)` stub, `surface_y` inside the chorus_fruit arm, a missing 0x3d
 disconnect broadcast, a datapack-only roll_loot_container_slots, an
 is_world_gen -> false stub, ...) and once against the fixed wiring. A gate
 that cannot fail, or that still fails on fixed code, is decoration — these
-fixtures keep all ten honest.
+fixtures keep all eleven honest.
 """
 
 import contextlib
@@ -728,6 +728,178 @@ fn live_mob_tick_dimension(dim: DimId, x: i32, z: i32) {
 
 
 # ---------------------------------------------------------------------------
+# gate11_branch_mining
+# ---------------------------------------------------------------------------
+
+_DIG_ARM_FIXED = """
+        0x24 => {
+            let eye_y = client_eye_y(&me, dim, px, py, pz);
+            let modified_speed = mining_speed_with_modifiers(
+                base_speed, false, 0, haste, fatigue, under, on_ground);
+            let instant = instant_mining_break(
+                modified_speed, block_hardness(old), can);
+            if (gm_creative && status == 0) || instant {
+                break_now = true;
+            }
+            if !break_now && old != 0 {
+                note_block_update_dim(dim, x, y, z, old);
+            }
+            if break_now {
+                finish_block_break(&me, dim, x, y, z, old);
+            }
+            let _ = send_packet(&mut sock, 0x05, ack(seq));
+        }
+"""
+
+_DIG_ARM_STUB = """
+        0x24 => {
+            let req = dig_seconds(old, &held);
+            let dd = (px - x).powi(2) + (py + 1.62 - y).powi(2) + (pz - z).powi(2);
+            if (gm_creative && status == 0) || req == Some(0.0) {
+                break_now = true;
+            }
+            if break_now {
+                finish_block_break(&me, dim, x, y, z, old);
+            }
+            let _ = send_packet(&mut sock, 0x05, ack(seq));
+        }
+"""
+
+_PLACE_ARM_FIXED = """
+        0x38 => {
+            let eye_y = client_eye_y(&me, dim, px, py, pz);
+            let ddy = y as f64 + 0.5 - eye_y;
+        }
+"""
+
+_PLACE_ARM_STUB = """
+        0x38 => {
+            let ddy = y as f64 + 0.5 - (py + 1.62);
+        }
+"""
+
+_MINING_HELPERS_LIVE = """
+fn mining_speed_with_modifiers(
+    base_speed: f32,
+    effective_tool: bool,
+    efficiency_level: i32,
+) -> f32 {
+    base_speed + efficiency_level as f32
+}
+fn mining_damage_per_tick(speed: f32, h: f32, can_harvest: bool) -> f32 {
+    speed / h
+}
+fn instant_mining_break(speed: f32, h: f32, can_harvest: bool) -> bool {
+    h == 0.0 || mining_damage_per_tick(speed, h, can_harvest) >= 1.0
+}
+"""
+
+_MINING_HELPERS_DEAD = """
+#[cfg_attr(not(test), allow(dead_code))]
+fn mining_speed_with_modifiers(base_speed: f32) -> f32 {
+    base_speed
+}
+#[cfg_attr(not(test), allow(dead_code))]
+fn mining_damage_per_tick(speed: f32, h: f32, can_harvest: bool) -> f32 {
+    speed / h
+}
+#[cfg_attr(not(test), allow(dead_code))]
+fn instant_mining_break(speed: f32, h: f32, can_harvest: bool) -> bool {
+    h == 0.0 || mining_damage_per_tick(speed, h, can_harvest) >= 1.0
+}
+"""
+
+_EYE_HELPER = """
+fn player_eye_height_at(sneaking: bool, fall_fly: bool, swimming: bool) -> f32 {
+    if fall_fly || swimming { 0.4 } else if sneaking { 1.27 } else { 1.62 }
+}
+"""
+
+
+def _mining_files(dig_arm=_DIG_ARM_FIXED, place_arm=_PLACE_ARM_FIXED,
+                  helpers=_MINING_HELPERS_LIVE, fluid=_EYE_HELPER):
+    return {
+        "src/play_protocol.rs": "fn handle() {\n    match pid {\n"
+            + dig_arm + place_arm + "    }\n}\n",
+        "src/player_mechanisms.rs": helpers,
+        "src/entity_fluid.rs": fluid,
+    }
+
+
+class Gate11BranchMiningTest(unittest.TestCase):
+    def test_flags_req_some_zero_regression(self):
+        buggy = _mining_files(dig_arm=_DIG_ARM_FIXED.replace(
+            "(gm_creative && status == 0) || instant",
+            "(gm_creative && status == 0) || req == Some(0.0)"))
+        g = gate(buggy, "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn("req == Some(0.0)", "\n".join(g["findings"]))
+
+    def test_flags_missing_canonical_instant_model(self):
+        buggy = _mining_files(dig_arm=_DIG_ARM_STUB)
+        g = gate(buggy, "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn("break-progress model", "\n".join(g["findings"]))
+
+    def test_flags_hardcoded_standing_eye(self):
+        buggy = _mining_files(
+            dig_arm=_DIG_ARM_FIXED.replace(
+                "client_eye_y(&me, dim, px, py, pz)", "py + 1.62"),
+            place_arm=_PLACE_ARM_STUB)
+        g = gate(buggy, "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+        text = "\n".join(g["findings"])
+        self.assertIn("+ 1.62", text)
+        self.assertIn("0x38", text)
+
+    def test_flags_missing_resync_before_ack(self):
+        no_resync = _DIG_ARM_FIXED.replace(
+            """            if !break_now && old != 0 {
+                note_block_update_dim(dim, x, y, z, old);
+            }
+""", "")
+        g = gate(_mining_files(dig_arm=no_resync), "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn("resync", "\n".join(g["findings"]))
+
+    def test_flags_resync_after_ack(self):
+        after = _DIG_ARM_FIXED.replace(
+            """            if !break_now && old != 0 {
+                note_block_update_dim(dim, x, y, z, old);
+            }
+            if break_now {
+                finish_block_break(&me, dim, x, y, z, old);
+            }
+            let _ = send_packet(&mut sock, 0x05, ack(seq));""",
+            """            if break_now {
+                finish_block_break(&me, dim, x, y, z, old);
+            }
+            let _ = send_packet(&mut sock, 0x05, ack(seq));
+            if !break_now && old != 0 {
+                note_block_update_dim(dim, x, y, z, old);
+            }""")
+        g = gate(_mining_files(dig_arm=after), "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+
+    def test_flags_dead_or_unwired_helpers(self):
+        buggy = _mining_files(helpers=_MINING_HELPERS_DEAD)
+        g = gate(buggy, "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+        self.assertIn("allow(dead_code)", "\n".join(g["findings"]))
+
+    def test_flags_unwired_helper_no_call_site(self):
+        no_call = _DIG_ARM_FIXED.replace(
+            "instant_mining_break(", "breakable_instantly(")
+        buggy = _mining_files(dig_arm=no_call)
+        g = gate(buggy, "gate11_branch_mining")
+        self.assertEqual(g["status"], "FAIL")
+
+    def test_passes_on_canonical_wiring(self):
+        g = gate(_mining_files(), "gate11_branch_mining")
+        self.assertEqual(g["status"], "PASS", g["findings"])
+
+
+# ---------------------------------------------------------------------------
 # dim_guarded unit coverage
 # ---------------------------------------------------------------------------
 
@@ -791,7 +963,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(code, 0)
         report = json.loads(blob)
         self.assertEqual(report["schema"], "megu-strict-vanilla-parity/1")
-        self.assertEqual(len(report["gates"]), 10)
+        self.assertEqual(len(report["gates"]), 11)
         self.assertEqual(
             report["summary"]["total"],
             report["summary"]["pass"] + report["summary"]["warn"]

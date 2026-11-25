@@ -1172,7 +1172,6 @@ fn tool_base_mining_speed(item: &str) -> f32 {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn mining_speed_with_modifiers(
     base_speed: f32,
     effective_tool: bool,
@@ -1205,17 +1204,21 @@ fn mining_speed_with_modifiers(
     speed
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn mining_damage_per_tick(speed: f32, block_hardness: f32) -> f32 {
-    if block_hardness <= 0.0 {
-        return 1.0;
-    }
-    speed.max(0.0) / block_hardness / 30.0
+/// `getDestroyProgress` for one tick — delegates to the canonical
+/// `megu_core::break_progress` model the dig path and mod breakers share.
+fn mining_damage_per_tick(speed: f32, block_hardness: f32, can_harvest: bool) -> f32 {
+    megu_core::break_progress::destroy_progress_per_tick(speed, block_hardness, can_harvest)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn instant_mining_break(speed: f32, block_hardness: f32) -> bool {
-    block_hardness <= 0.0 || mining_damage_per_tick(speed, block_hardness) >= 1.0
+/// `ServerPlayerGameMode`'s insta-break predicate — the same canonical
+/// `f32` boundary check `megu_core::break_progress::instant_break` makes,
+/// expressed through `mining_damage_per_tick` so the whole chain shares
+/// one formula and one epsilon.
+fn instant_mining_break(speed: f32, block_hardness: f32, can_harvest: bool) -> bool {
+    block_hardness == 0.0
+        || (block_hardness > 0.0
+            && mining_damage_per_tick(speed, block_hardness, can_harvest)
+                >= 1.0 - megu_core::break_progress::INSTANT_BREAK_EPSILON)
 }
 
 /// Every input vanilla 1.21.1 `Player.getDestroySpeed` consults, pre-resolved
@@ -1369,7 +1372,8 @@ fn vanilla_mining_ticks(hardness: f32, can_harvest: bool, speed: f32) -> u32 {
     if hardness < 0.0 || speed <= 0.0 {
         return u32::MAX;
     }
-    let damage_per_tick = speed / hardness / if can_harvest { 30.0 } else { 100.0 };
+    let damage_per_tick =
+        megu_core::break_progress::destroy_progress_per_tick(speed, hardness, can_harvest);
     if damage_per_tick >= 1.0 {
         return 0;
     }
@@ -1560,10 +1564,14 @@ mod player_mechanisms_combat_mining_durability_tests {
                 .abs()
                 < 0.00001
         );
-        assert!(instant_mining_break(30.0, 1.0));
-        assert!(!instant_mining_break(29.9, 1.0));
-        assert!(instant_mining_break(0.0, 0.0));
-        assert!((mining_damage_per_tick(6.0, 2.0) - 0.1).abs() < 0.0001);
+        assert!(instant_mining_break(30.0, 1.0, true));
+        assert!(!instant_mining_break(29.9, 1.0, true));
+        assert!(instant_mining_break(0.0, 0.0, true));
+        // The can_harvest divisor is the same formula megu_core owns: the
+        // wrong-tool /100 path must not read as instant.
+        assert!(!instant_mining_break(30.0, 1.0, false));
+        assert!((mining_damage_per_tick(6.0, 2.0, true) - 0.1).abs() < 0.0001);
+        assert!((mining_damage_per_tick(6.0, 2.0, false) - 0.03).abs() < 0.0001);
     }
 
     #[test]

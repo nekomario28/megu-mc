@@ -405,6 +405,21 @@ impl<T> BoundedRing<T> {
         self.buf[idx].as_ref()
     }
 
+    /// Exclusive reference to the newest element.
+    pub fn back_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            return None;
+        }
+        let idx = (self.head + self.len - 1) % self.buf.len();
+        self.buf[idx].as_mut()
+    }
+
+    /// Iterate the stored elements oldest to newest.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        let (buf, head, len) = (&self.buf, self.head, self.len);
+        (0..len).filter_map(move |i| buf[(head + i) % buf.len().max(1)].as_ref())
+    }
+
     /// Number of stored elements.
     pub fn len(&self) -> usize {
         self.len

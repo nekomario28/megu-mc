@@ -13862,6 +13862,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
         if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
             *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            ac_v2_note_use_item(me);
             return;
         }
         let asl = armor_slot_for(main);
@@ -13919,6 +13920,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             if !eat_release {
                 // vanilla: milk is a 32-tick drink like food
                 *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                ac_v2_note_use_item(me);
                 return;
             }
             drop(inv);
@@ -13972,6 +13974,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
         if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
             *me.bow_draw.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            ac_v2_note_use_item(me);
             return;
         }
     }
@@ -14003,6 +14006,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         if edible && !eat_release {
             // vanilla: eating holds use for 32 ticks; nothing consumed yet
             *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            ac_v2_note_use_item(me);
         }
         if edible && eat_release {
             let fc = fc.clone().unwrap_or(FoodComponent {

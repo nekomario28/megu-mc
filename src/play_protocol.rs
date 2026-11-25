@@ -1825,6 +1825,23 @@ fn dig_min_ticks(seconds: f32) -> u64 {
     dig_required_ticks(seconds, 0.7)
 }
 
+/// The one canonical pose-aware eye Y for every dig/place/attack reach and
+/// underwater check: `player_eye_height_at` resolves standing `1.62`,
+/// sneaking `1.27` and the `0.40` crawl/swim/fall-fly pose from the
+/// client's flags and the collision shapes that would force the 1x1 pose.
+/// A hardcoded `py + 1.62` rejects real 1x1-trapdoor branch mining.
+fn client_eye_y(me: &Client, dim: DimId, px: f64, py: f64, pz: f64) -> f64 {
+    let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    let fall_fly = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    let sprinting = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
+    // `Player.updateSwimming`: the swim flag is `isSprinting && isInWater`.
+    let swimming =
+        sprinting && aabb_in_water_dim(dim, player_bounding_box(px, py, pz, false, false));
+    py + f64::from(player_eye_height_at(
+        dim, px, py, pz, sneaking, fall_fly, swimming,
+    ))
+}
+
 /// A queued `use_on` resend: `(dim, x, y, z, tick)` of the clicked cell.
 type UseOnResend = Mutex<Option<(DimId, i32, i32, i32, i64)>>;
 
@@ -3702,9 +3719,12 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
                 stat_increment(me, StatCategory::Mined, block_id, 1);
             }
         }
-                                               // vanilla: breaking a block damages the held tool
-        if tool_max_damage(held.0).is_some()
-            || comp_get(&held.2, COMP_MAX_DAMAGE).is_some()
+        // `Item.mineBlock` damages the held tool only when the broken
+        // state has a nonzero destroy speed — insta-mine blocks (torch,
+        // tall grass, TNT…) never cost durability, even for a tool.
+        if block_hardness(old as i64) != 0.0
+            && (tool_max_damage(held.0).is_some()
+                || comp_get(&held.2, COMP_MAX_DAMAGE).is_some())
         {
             if damage_held(me) {
                 let (pxx, pyy, pzz, ..) = {
@@ -8119,6 +8139,7 @@ fn switch_client_dimension(
         let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
         let id = teleport.begin();
         ac_expect_teleport(me.eid);
+        ac_note_tx_grant(me.eid, i64::from(id), megu_core::anticheat_v2::TxKind::Teleport);
         // Spawn eligibility reads this pair in the same lock order.
         let mut dim = me.dim.lock().unwrap_or_else(|e| e.into_inner());
         let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -9450,6 +9471,7 @@ fn teleport_in_dimension(
     let mut teleport = c.teleport.lock().unwrap_or_else(|e| e.into_inner());
     let id = teleport.begin();
     ac_expect_teleport(c.eid);
+    ac_note_tx_grant(c.eid, i64::from(id), megu_core::anticheat_v2::TxKind::Teleport);
     *c.pos.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, yaw, pitch, true);
     send_prepared_teleport(sock, &mut teleport, (x, y, z, yaw, pitch), id);
 }
@@ -12026,6 +12048,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 let mut payload = b.as_slice();
                 if let Some(id) = read_protocol_i32(&mut payload).filter(|_| payload.is_empty()) {
                     me.teleport.lock().unwrap_or_else(|e| e.into_inner()).confirm(id);
+                    // v2: the confirm echoes the matching transaction —
+                    // pending velocity/teleport grants activate and the
+                    // confirmed RTT folds into lag compensation.
+                    ac_note_tx_confirm(&me, i64::from(id));
                     retry_chunks = pump_client_chunks(&me, false);
                 }
             }
@@ -12229,8 +12255,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         2 => {
                             wake_if_sleeping(&me);
                         }
-                        3 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = true,
-                        4 => *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false,
+                        3 | 4 => {
+                            *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = act == 3;
+                            // v2: sprint-while-using-item is impossible for
+                            // a vanilla client — the FSM keeps the proof.
+                            ac_v2_note_sprint(&me, act == 3);
+                        }
                         7 => {
                             // OPEN_INVENTORY: riding an equine opens its
                             // inventory screen (`openHorseInventory`).
@@ -12674,19 +12704,24 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         );
                     }
                 }
+                let mut instant_possible = true;
                 if status == 0 || status == 2 {
                     // vanilla block_interaction_range: 4.5 survival / 5.0 creative
                     let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
                     let gm_creative = game_mode == 1;
                     let reach = if gm_creative { 5.6f64 } else { 4.9 };
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    // Canonical pose-aware eye: a crawling, sneaking or
+                    // swimming branch miner reaches from `0.40`/`1.27`, not
+                    // a hardcoded standing `py + 1.62`.
+                    let eye_y = client_eye_y(&me, dim, px, py, pz);
                     let (ddx, ddy, ddz) = (
                         x as f64 + 0.5 - px,
-                        y as f64 + 0.5 - (py + 1.62),
+                        y as f64 + 0.5 - eye_y,
                         z as f64 + 0.5 - pz,
                     );
                     let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let old = block_at_dim(dim, x, y, z);
                     let held = {
                         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -12694,7 +12729,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()))
                     };
-                    let req = if in_range {
+                    let (req, instant) = if in_range {
                         let (haste, fatigue) = {
                             let effects = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                             (
@@ -12705,7 +12740,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let underwater = block_registry::breg().is_some_and(|registry| {
                             let (bx, by, bz) = (
                                 px.floor() as i32,
-                                (py + 1.62).floor() as i32,
+                                eye_y.floor() as i32,
                                 pz.floor() as i32,
                             );
                             registry.has_water(block_at_dim(dim, bx, by, bz))
@@ -12722,11 +12757,31 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             underwater && !aqua_affinity,
                             on_ground,
                         );
-                        dig_seconds(old as i64, &held)
-                            .map(|seconds| seconds * base_speed / modified_speed.max(f32::MIN_POSITIVE))
+                        // One canonical break-progress model for every tool
+                        // and breaker: `destroy_progress_per_tick` decides
+                        // insta-mine directly in `f32`, never via a
+                        // seconds round-trip.
+                        let can = if let (Some(tool), Some(reg)) =
+                            (tool_component_for(&held), block_registry::breg())
+                        {
+                            tool_component_correct(&tool, old, reg)
+                        } else {
+                            can_harvest(old as i64, held.0)
+                        };
+                        (
+                            dig_seconds(old as i64, &held).map(|seconds| {
+                                seconds * base_speed / modified_speed.max(f32::MIN_POSITIVE)
+                            }),
+                            instant_mining_break(
+                                modified_speed,
+                                block_hardness(old as i64),
+                                can,
+                            ),
+                        )
                     } else {
-                        None
+                        (None, false)
                     };
+                    instant_possible = instant || !in_range;
                     // vanilla dig timing: survival needs the destroy duration for
                     // the block+tool; finish packets arriving early are rejected.
                     let mut break_now = false;
@@ -12747,7 +12802,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         client_permission_level(&me),
                     );
                     if in_range && old != 0 && may_destroy && can_modify {
-                        if (gm_creative && status == 0) || req == Some(0.0) {
+                        // `ServerPlayerGameMode`: an insta-minable block
+                        // breaks on START_DESTROY_BLOCK — the insta-mine
+                        // client never sends STOP_DESTROY_BLOCK.
+                        if (gm_creative && status == 0) || instant {
                             break_now = true;
                         } else if let Some(t) = req {
                             if status == 0 {
@@ -12778,11 +12836,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if break_now {
                         *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     }
-                    if !break_now && status == 2 && old != 0 {
-                        note_block_update_dim(dim, x, y, z, old); // rejected: resync truth
-                    }
-                    if !can_modify && old != 0 {
-                        note_block_update_dim(dim, x, y, z, old); // denied: resync truth
+                    // Canonical resync-before-ack: EVERY rejected dig
+                    // outcome — a denied insta-mine START, an early FINISH,
+                    // a claim or reach failure — resyncs the authoritative
+                    // block BEFORE the 0x05 sequence ack, so the client can
+                    // never keep a phantom hole.
+                    if !break_now && old != 0 {
+                        note_block_update_dim(dim, x, y, z, old);
                     }
                     if break_now {
                         finish_block_break(&me, dim, x, y, z, old);
@@ -12796,6 +12856,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         );
                     }
                 }
+                ac_v2_note_dig(&me, status, instant_possible, seq);
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
             }
             0x38 => {
@@ -12841,6 +12902,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // vanilla block_interaction_range: 4.5 survival / 5.0 creative
                 // (clicked block center vs eye) — gates placement AND
                 // block interactions (containers/signs/buckets all below).
+                // The eye is the canonical pose-aware height, never a raw
+                // foot-Y: placing ahead while crawling must not misfire.
                 {
                     let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let reach = if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
@@ -12848,15 +12911,23 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     } else {
                         5.5
                     };
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let eye_y = client_eye_y(&me, dim, px, py, pz);
                     let (rx, ry, rz) = (
                         x as f64 + 0.5 - px,
-                        y as f64 + 0.5 - py,
+                        y as f64 + 0.5 - eye_y,
                         z as f64 + 0.5 - pz,
                     );
                     if rx * rx + ry * ry + rz * rz > reach * reach {
+                        // Rejected place: the client predicted the placement;
+                        // resync the clicked cell before the ack so it never
+                        // keeps a phantom block.
+                        ac_resync_block(&me, dim, (x, y, z));
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
+                    let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                    ac_v2_note_use_on(&me, face, seq, yaw);
                 }
                 let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
                 let (tx, ty, tz) = (x + dx, y + dy, z + dz);
@@ -13697,10 +13768,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     )
                                 })
                         });
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let eye_y = client_eye_y(&me, dim, px, py, pz);
                     let ok = tp
                         .map(|(tx, ty, tz, is_cart)| {
                             let center_y = ty + if is_cart { 0.35 } else { 0.9 };
-                            let (dx, dy, dz) = (tx - px, center_y - (py + 1.62), tz - pz);
+                            let (dx, dy, dz) = (tx - px, center_y - eye_y, tz - pz);
                             dx * dx + dy * dy + dz * dz <= 3.2 * 3.2
                         })
                         .unwrap_or(false);
@@ -13710,8 +13783,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if mouse == 1 {
                         if let Some((tx, ty, tz, is_cart)) = tp {
                             let target_center = [tx, ty + if is_cart { 0.35 } else { 0.9 }, tz];
-                            let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                            if !ac_check_attack(&me, dim, target_center) {
+                            if !ac_check_attack(&me, dim, target_center, target) {
                                 continue;
                             }
                             // Persistent claims: damaging an entity inside a
@@ -22560,6 +22632,268 @@ mod p5c_live_tests {
             body.windows(7).any(|w| w == b"FallGuy"),
             "victim name must be in the message, got {body:?}"
         );
+    }
+
+    /// Lane ALPHA4-BRANCH-MINE-AND-AC-V2: the unified insta-mine break path
+    /// must keep survival-vs-creative bookkeeping parity with vanilla
+    /// `ServerPlayerGameMode.destroyBlock` + `Item.mineBlock`, and every
+    /// tool family must go through the same canonical break-progress model.
+    mod branch_mining_tests {
+        use super::*;
+
+        fn varint(value: i64) -> Vec<u8> {
+            let mut out = Vec::new();
+            write_varint(&mut out, value);
+            out
+        }
+
+        /// Client in `gm` holding `item` (with `comps`) in the held slot.
+        fn mining_client(
+            name: &str,
+            eid: i32,
+            gm: i64,
+            item: i64,
+            comps: Vec<(i64, Vec<u8>)>,
+        ) -> (Arc<Client>, std::net::TcpStream) {
+            let (me, peer) = loopback_client(name, eid);
+            *me.gm.lock().unwrap_or_else(|e| e.into_inner()) = gm;
+            let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36 + held_slot, (item, 1, comps));
+            (me, peer)
+        }
+
+        fn held_damage(me: &Client) -> Option<i64> {
+            let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&(36 + held_slot))
+                .and_then(|s| comp_varint(&s.2, COMP_DAMAGE))
+        }
+
+        fn mined_stat(me: &Client, block_id: i32) -> i32 {
+            player_stats()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&me.uuid)
+                .map(|s| s.get(StatCategory::Mined, block_id))
+                .unwrap_or(0)
+        }
+
+        fn drops_at(x: i32, y: i32, z: i32) -> Vec<i64> {
+            drops()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|d| {
+                    (d.x - (x as f64 + 0.5)).abs() < 1.0
+                        && (d.y - (y as f64 + 0.25)).abs() < 1.0
+                        && (d.z - (z as f64 + 0.5)).abs() < 1.0
+                })
+                .map(|d| d.item)
+                .collect()
+        }
+
+        /// (a)–(d): a survival insta-mine of a `hardness > 0` block pays
+        /// drops, `BLOCK_MINED`, +0.005 exhaustion and tool durability.
+        #[test]
+        fn survival_instant_break_keeps_full_bookkeeping() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let reg = crate::block_registry::breg().unwrap();
+            let stone = reg.state_of("minecraft:stone", None);
+            let (x, y, z) = (6100, 80, 6100);
+            let mut cells = Cells::new();
+            cells.set(x, y, z, stone);
+            // 840 = diamond_pickaxe in the tool band; explicit durability so
+            // `damage_held` records a delta.
+            let (me, _peer) = mining_client(
+                "bm_surv",
+                0x7d01,
+                0,
+                840,
+                vec![(COMP_MAX_DAMAGE, varint(100)), (COMP_DAMAGE, varint(0))],
+            );
+            let walk_before = *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner());
+            let stat_before = mined_stat(&me, reg.block_id_of(stone).unwrap_or(-1));
+            finish_block_break(&me, DimId::Overworld, x, y, z, stone);
+            assert_eq!(block_at(x, y, z), reg.state_of("minecraft:air", None));
+            assert!(
+                !drops_at(x, y, z).is_empty(),
+                "survival break must spawn drops"
+            );
+            assert_eq!(
+                mined_stat(&me, reg.block_id_of(stone).unwrap_or(-1)),
+                stat_before + 1,
+                "Stats.BLOCK_MINED increments once"
+            );
+            assert!(
+                (*me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) - walk_before
+                    - 0.005)
+                    .abs()
+                    < 1e-6,
+                "block-break exhaustion is +0.005"
+            );
+            assert_eq!(
+                held_damage(&me),
+                Some(1),
+                "the pickaxe pays one durability"
+            );
+        }
+
+        /// (e): creative breaks consume no durability, no exhaustion and
+        /// spawn no drops.
+        #[test]
+        fn creative_break_skips_all_survival_bookkeeping() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let reg = crate::block_registry::breg().unwrap();
+            let stone = reg.state_of("minecraft:stone", None);
+            let (x, y, z) = (6120, 80, 6100);
+            let mut cells = Cells::new();
+            cells.set(x, y, z, stone);
+            let (me, _peer) = mining_client(
+                "bm_creative",
+                0x7d02,
+                1,
+                840,
+                vec![(COMP_MAX_DAMAGE, varint(100)), (COMP_DAMAGE, varint(0))],
+            );
+            finish_block_break(&me, DimId::Overworld, x, y, z, stone);
+            assert_eq!(block_at(x, y, z), reg.state_of("minecraft:air", None));
+            assert!(
+                drops_at(x, y, z).is_empty(),
+                "creative break spawns no drops"
+            );
+            assert_eq!(
+                *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()),
+                0.0,
+                "creative break adds no exhaustion"
+            );
+            assert_ne!(
+                held_damage(&me),
+                Some(1),
+                "creative break consumes no durability"
+            );
+        }
+
+        /// (f): vanilla `Item.mineBlock` damages the tool only when
+        /// `state.getDestroySpeed() != 0.0` — insta-mine blocks like torch
+        /// never cost durability, even in survival.
+        #[test]
+        fn survival_zero_hardness_break_consumes_no_durability() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let reg = crate::block_registry::breg().unwrap();
+            let torch = reg.state_of("minecraft:torch", None);
+            assert_eq!(
+                block_hardness(i64::from(torch)),
+                0.0,
+                "torch is a hardness-0 insta-mine block"
+            );
+            let (x, y, z) = (6140, 80, 6100);
+            let mut cells = Cells::new();
+            cells.set(x, y, z, torch);
+            let (me, _peer) = mining_client(
+                "bm_torch",
+                0x7d03,
+                0,
+                840,
+                vec![(COMP_MAX_DAMAGE, varint(100)), (COMP_DAMAGE, varint(0))],
+            );
+            finish_block_break(&me, DimId::Overworld, x, y, z, torch);
+            assert_eq!(block_at(x, y, z), reg.state_of("minecraft:air", None));
+            assert_ne!(
+                held_damage(&me),
+                Some(1),
+                "hardness-0 blocks never cost tool durability"
+            );
+        }
+
+        /// The pose-aware eye height resolves crawl/swim/fall-fly to `0.4`,
+        /// sneaking to `1.27` and standing to `1.62` — a 1x1-trapdoor
+        /// branch miner is never reach-rejected by a hardcoded `1.62`.
+        #[test]
+        fn eye_height_matches_vanilla_poses() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let reg = crate::block_registry::breg().unwrap();
+            let stone = reg.state_of("minecraft:stone", None);
+            let (x, y, z) = (6200.5, 90.0, 6200.5);
+            let mut cells = Cells::new();
+            // Open air all around the 1.8 box.
+            for dy in 0..=2 {
+                cells.set(6200, 90 + dy, 6200, reg.state_of("minecraft:air", None));
+            }
+            assert_eq!(
+                player_eye_height_at(DimId::Overworld, x, y, z, false, false, false),
+                1.62,
+                "standing eye height"
+            );
+            assert_eq!(
+                player_eye_height_at(DimId::Overworld, x, y, z, true, false, false),
+                1.27,
+                "sneaking eye height"
+            );
+            assert_eq!(
+                player_eye_height_at(DimId::Overworld, x, y, z, false, true, false),
+                0.4,
+                "fall-flying eye height"
+            );
+            // Trapdoor/ceiling crawl: solid blocks at head level force the
+            // 0.6-high pose even with no flags set.
+            cells.set(6200, 91, 6200, stone);
+            cells.set(6200, 92, 6200, stone);
+            assert_eq!(
+                player_eye_height_at(DimId::Overworld, x, y, z, false, false, false),
+                0.4,
+                "1x1 trapdoor crawl eye height"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod branch_mine_model_tests {
+    use super::*;
+
+    /// The canonical model answers uniformly for every tool family and for
+    /// generic mod breakers — pickaxe, shovel, axe, hoe and a Create-drill
+    /// style machine speed all evaluate through `destroy_progress_per_tick`.
+    /// Pure model math: no vanilla data needed.
+    #[test]
+    fn instant_break_decision_is_tool_family_generic() {
+        let haste_ii = Some(1);
+        // Pickaxe: Eff V diamond (8 + 26) * Haste II 1.4 = 47.6 on
+        // stone (h 1.5) -> 1.0577… >= 1.0 insta-mines.
+        let pick =
+            mining_speed_with_modifiers(8.0, true, 5, haste_ii, None, false, true);
+        assert!(instant_mining_break(pick, 1.5, true));
+        // Same pick without Haste II: 34/1.5/30 = 0.755 — multi-tick.
+        let pick_no_haste =
+            mining_speed_with_modifiers(8.0, true, 5, None, None, false, true);
+        assert!(!instant_mining_break(pick_no_haste, 1.5, true));
+        // Shovel: Eff V iron (6 + 26) * 1.4 = 44.8 on dirt (h 0.5).
+        let shovel =
+            mining_speed_with_modifiers(6.0, true, 5, haste_ii, None, false, true);
+        assert!(instant_mining_break(shovel, 0.5, true));
+        // Axe: Eff V netherite (9 + 26) * 1.4 = 49 on oak_log (h 2.0)
+        // -> 0.8167 — vanilla correctly stays multi-tick.
+        let axe =
+            mining_speed_with_modifiers(9.0, true, 5, haste_ii, None, false, true);
+        assert!(!instant_mining_break(axe, 2.0, true));
+        // Hoe: Eff V diamond (8 + 26) * 1.4 = 47.6 on leaves (h 0.2).
+        let hoe =
+            mining_speed_with_modifiers(8.0, true, 5, haste_ii, None, false, true);
+        assert!(instant_mining_break(hoe, 0.2, true));
+        // Generic mod breaker (Create Mechanical Drill style): any
+        // speed >= 60 insta-mines a log through the same formula.
+        assert!(instant_mining_break(60.0, 2.0, true));
+        // Wrong-tool divisor /100 never insta-mines these.
+        assert!(!instant_mining_break(pick, 1.5, false));
     }
 }
 
