@@ -962,6 +962,27 @@ fn quickplay_singleplayer_loopback_e2e_renders_png() {
     let png_path = game_dir.join("frame.png");
     let _ = std::fs::remove_dir_all(&game_dir);
 
+    // This live E2E is meaningful only with a complete generated vanilla runtime.
+    // CI/release smoke supplies one explicitly; a clean checkout must skip rather
+    // than pass a half-install or fail because Mojang-derived data is absent.
+    #[cfg(unix)]
+    {
+        let Some(runtime_root) = std::env::var_os("MEGU_E2E_RUNTIME_ROOT").map(PathBuf::from) else {
+            eprintln!("MEGU_E2E_RUNTIME_ROOT not set; skipping live quickplay E2E");
+            return;
+        };
+        std::fs::create_dir_all(&game_dir).expect("create e2e game dir");
+        for name in ["assets", "datapacks", "config_packets.bin"] {
+            std::os::unix::fs::symlink(runtime_root.join(name), game_dir.join(name))
+                .expect("link complete runtime into e2e game dir");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("live quickplay E2E runtime staging is not implemented on this platform");
+        return;
+    }
+
     let argv: Vec<String> = vec![
         "--headless".to_string(),
         "--quickPlaySingleplayer".to_string(),
@@ -986,7 +1007,21 @@ fn quickplay_singleplayer_loopback_e2e_renders_png() {
     cfg.server = Some("127.0.0.1".to_string());
     cfg.port = server.port;
     let summary = run_session(&cfg).expect("run session against integrated server");
+    let server_stderr = server.stderr_capture();
     drop(server); // SIGTERM + reap before touching artifacts
+    let server_stderr = server_stderr
+        .lock()
+        .map(|text| text.clone())
+        .unwrap_or_default();
+    assert!(
+        server_stderr.contains("[wg] vanilla datapack worldgen active"),
+        "integrated server did not activate vanilla datapack worldgen:\n{server_stderr}"
+    );
+    assert!(
+        !server_stderr.contains("worldgen datapack missing")
+            && !server_stderr.contains("flat generator"),
+        "integrated server fell back to flat worldgen:\n{server_stderr}"
+    );
 
     let png = std::fs::read(&png_path).expect("render PNG must exist");
     assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n", "PNG signature");

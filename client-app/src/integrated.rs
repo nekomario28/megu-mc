@@ -7,6 +7,8 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::io::{Read as _, Write as _};
+use std::sync::{Arc, Mutex};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -67,12 +69,53 @@ pub struct SingleplayerServer {
     pub port: u16,
     #[allow(dead_code)]
     world_dir: PathBuf,
+    stderr: Arc<Mutex<String>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl SingleplayerServer {
     pub fn addr(&self) -> SocketAddr {
         SocketAddr::from((INTEGRATED_BIND_IP, self.port))
     }
+
+    /// Bounded child-stderr capture, mirrored to this process's stderr while the
+    /// server runs. Tests and diagnostics use this to distinguish a successful
+    /// vanilla-datapack boot from the explicit flat-generator fallback.
+    pub fn stderr_capture(&self) -> Arc<Mutex<String>> {
+        Arc::clone(&self.stderr)
+    }
+}
+
+fn spawn_stderr_tee(child: &mut Child) -> (Arc<Mutex<String>>, thread::JoinHandle<()>) {
+    let captured = Arc::new(Mutex::new(String::new()));
+    let writer = Arc::clone(&captured);
+    let mut pipe = child
+        .stderr
+        .take()
+        .expect("integrated server stderr must be piped");
+    let thread = thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match pipe.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    let _ = std::io::stderr().write_all(chunk);
+                    if let Ok(mut text) = writer.lock() {
+                        // Startup diagnostics are small and early. Cap the capture so a
+                        // chatty long-running server cannot grow memory without bound.
+                        if text.len() < 256 * 1024 {
+                            text.push_str(&String::from_utf8_lossy(chunk));
+                            if text.len() > 256 * 1024 {
+                                text.truncate(256 * 1024);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (captured, thread)
 }
 
 impl Drop for SingleplayerServer {
@@ -102,6 +145,9 @@ impl Drop for SingleplayerServer {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(thread) = self.stderr_thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -558,7 +604,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
         .env("MEGU_WORLD_DIR", &world_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     if let Some(view) = server_view_distance(cfg) {
         command.env("MEGU_VIEW_DISTANCE", view.to_string());
     }
@@ -605,10 +651,13 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
                 },
                 None,
             );
+            let (stderr, stderr_thread) = spawn_stderr_tee(&mut child);
             return Ok(SingleplayerServer {
                 child,
                 port,
                 world_dir,
+                stderr,
+                stderr_thread: Some(stderr_thread),
             });
         }
         if Instant::now() >= deadline {
