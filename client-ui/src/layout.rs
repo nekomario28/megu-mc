@@ -27,6 +27,8 @@ use crate::state::{
 };
 use crate::subtitle_hud::SubtitleHudState;
 
+const HUD_HOTBAR_MIN_WIDTH: u32 = 224;
+
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
 /// `width`/`height` are physical pixels.
 pub fn layout_screen(state: &UiState, width: u32, height: u32) -> (UiDrawList, Vec<HitRegion>) {
@@ -79,7 +81,7 @@ fn build_ctx<'a>(
     list: UiDrawList,
     regions: Vec<HitRegion>,
 ) -> Ctx<'a> {
-    let s = state.effective_scale(height) as i32;
+    let s = layout_scale(state, width, height);
     let mut ctx = Ctx {
         list,
         regions,
@@ -116,6 +118,19 @@ fn build_ctx<'a>(
         modal(&mut ctx);
     }
     ctx
+}
+
+/// Resolve the requested GUI scale for this frame. The in-game hotbar
+/// needs 224 logical pixels for the offhand gap and all nine slots; cap
+/// its scale when a narrow viewport cannot hold that complete row.
+fn layout_scale(state: &UiState, width: u32, height: u32) -> i32 {
+    let requested = state.effective_scale(height) as i32;
+    if state.screen == Screen::InGameHud {
+        let width_limit = (width / HUD_HOTBAR_MIN_WIDTH).max(1) as i32;
+        requested.min(width_limit)
+    } else {
+        requested
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -556,9 +571,14 @@ fn title(ctx: &mut Ctx) {
     // vanilla's 8px breathing gap, the classic bottom row: a 20px
     // language chip | Options | Quit | a 20px About chip. Everything
     // stays above the version line (h-14); `step`/`bh` squeeze first.
-    let bw = 200.min(ctx.w - 8).max(24);
     let step = 24.min((ctx.h - 96) / 2).max(4);
     let bh = 20.min(step);
+    let sq = 20.min(bh);
+    // Keep the language and About chips fully inside the logical
+    // viewport. At compact resolutions with a large GUI scale, the
+    // normal 200px column would push both corner chips off-screen.
+    let max_column_width = ctx.w - 2 * (sq + 4);
+    let bw = 200.min(max_column_width).max(24) & !1;
     let y = 92.min(ctx.h - 14 - 2 * step - 2 * bh - 8).max(34);
     let x = cx - bw / 2;
     let half = (bw - 4) / 2;
@@ -587,7 +607,6 @@ fn title(ctx: &mut Ctx) {
     // Bottom row: the corner chips hang off the column ends exactly
     // where vanilla parks its globe and accessibility buttons.
     let y4 = y3 + bh + 8;
-    let sq = 20.min(bh);
     icon_btn(
         ctx,
         WidgetId::TitleLanguage,
@@ -4115,7 +4134,7 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     rects.clear();
     let hud = &state.hud;
     let qol = &state.settings.qol;
-    let s = state.effective_scale(height) as i32;
+    let s = layout_scale(state, width, height);
     if s <= 0 {
         return;
     }
