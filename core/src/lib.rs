@@ -171,6 +171,19 @@
 //!   section, its chunk aggregate and every border-adjacent neighbour
 //!   section, keyed by the [`coords`] types so no duplicate revision
 //!   scheme can drift out of sync.
+//! * [`search_index`] — Unicode-safe trigram inverted search with ranked
+//!   prefix/boundary/substring/subsequence matching and reusable query
+//!   scratch for recipes, settings, commands, catalogs, items, and mods.
+//! * [`timing_wheel`] — a hierarchical Varghese & Lauck timing wheel with
+//!   O(1) scheduling, generation-checked O(1) cancellation, exact-tick
+//!   cascading, and an overflow horizon for long-delayed callbacks.
+//! * [`union_find`] — Tarjan disjoint-set union with path halving and
+//!   union-by-rank for kinetic/pipe/multiblock/claim/room connectivity.
+//! * [`merkle_cas`] — domain-separated SHA-256 Merkle trees with subtree-
+//!   pruning key diffs plus an LZ4-compressed content-addressed blob store.
+//! * [`sparse_set`] — Briggs & Torczon sparse-set storage whose live values
+//!   stay dense and cache-contiguous for components, ticking objects, and
+//!   active widget tables.
 
 #![deny(unsafe_code)]
 
@@ -192,19 +205,24 @@ pub mod lz4;
 pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
+pub mod merkle_cas;
 pub mod morton;
 pub mod nbt_wire;
 pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
 pub mod romaji_ime;
+pub mod search_index;
 pub mod section_rev;
 pub mod server_perf_governors;
 pub mod simd_voxel;
+pub mod sparse_set;
 pub(crate) mod stats;
 pub mod sys_metrics;
 pub mod task_pool;
 pub mod tier25_guard_batch;
+pub mod timing_wheel;
+pub mod union_find;
 pub mod varint;
 pub mod version;
 pub mod zip_archive;
