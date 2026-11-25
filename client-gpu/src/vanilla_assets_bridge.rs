@@ -226,23 +226,30 @@ fn append_mob_effect_icons(
         .iter()
         .filter_map(|id| extras.mob_effect(id).map(|image| (*id, image)))
         .collect();
-    if available.is_empty() || atlas.width == 0 || atlas.height == 0 {
+    if available.is_empty() {
         return BTreeMap::new();
     }
+    let was_empty = atlas.entries.is_empty() && atlas.named_entries.is_empty();
+    let canvas_width = if was_empty {
+        256
+    } else {
+        atlas.width.max(256)
+    };
     let old_width = atlas.width as usize;
-    let old_height = atlas.height as usize;
+    let old_height = if was_empty { 0 } else { atlas.height as usize };
+    let new_width = canvas_width as usize;
     let mut x = 0u32;
-    let mut y = atlas.height;
+    let mut y = old_height as u32;
     let mut row_height = 0u32;
     let mut positions = Vec::with_capacity(available.len());
     for (id, image) in available {
         let Some(needed) = image.width.checked_add(2) else {
             continue;
         };
-        if needed > atlas.width {
+        if needed > canvas_width {
             continue;
         }
-        if x + needed > atlas.width {
+        if x + needed > canvas_width {
             y = y.saturating_add(row_height);
             x = 0;
             row_height = 0;
@@ -254,44 +261,63 @@ fn append_mob_effect_icons(
     if positions.is_empty() {
         return BTreeMap::new();
     }
-    let new_height = y.saturating_add(row_height).max(atlas.height);
-    let mut pixels = vec![0; old_width * new_height as usize * 4];
+    let new_height = y.saturating_add(row_height).max(old_height as u32).max(1);
+    let mut pixels = vec![0; new_width * new_height as usize * 4];
     for row in 0..old_height {
         let src = row * old_width * 4;
-        let dst = src;
+        let dst = row * new_width * 4;
         pixels[dst..dst + old_width * 4].copy_from_slice(&atlas.rgba[src..src + old_width * 4]);
     }
     for (_, image, px, py) in &positions {
         for row in 0..image.height as usize {
             let src = row * image.width as usize * 4;
-            let dst = ((py + row as u32) as usize * old_width + *px as usize) * 4;
+            let dst = ((py + row as u32) as usize * new_width + *px as usize) * 4;
             let len = image.width as usize * 4;
             pixels[dst..dst + len].copy_from_slice(&image.rgba[src..src + len]);
         }
     }
-    let scale_y = old_height as f32 / new_height as f32;
-    for (_, entry) in &mut atlas.entries {
-        entry.uv_min[1] *= scale_y;
-        entry.uv_max[1] *= scale_y;
+    if old_height > 0 && old_width > 0 {
+        let scale_x = old_width as f32 / new_width as f32;
+        let scale_y = old_height as f32 / new_height as f32;
+        for (_, entry) in &mut atlas.entries {
+            entry.uv_min[0] *= scale_x;
+            entry.uv_max[0] *= scale_x;
+            entry.uv_min[1] *= scale_y;
+            entry.uv_max[1] *= scale_y;
+        }
+        for (_, entry) in &mut atlas.named_entries {
+            entry.uv_min[0] *= scale_x;
+            entry.uv_max[0] *= scale_x;
+            entry.uv_min[1] *= scale_y;
+            entry.uv_max[1] *= scale_y;
+        }
     }
-    for (_, entry) in &mut atlas.named_entries {
-        entry.uv_min[1] *= scale_y;
-        entry.uv_max[1] *= scale_y;
-    }
+    atlas.width = canvas_width;
     atlas.height = new_height;
     atlas.rgba = pixels;
-    positions
-        .into_iter()
-        .map(|(id, image, px, py)| {
-            let uv = [
-                px as f32 / atlas.width as f32,
-                py as f32 / atlas.height as f32,
-                (px + image.width) as f32 / atlas.width as f32,
-                (py + image.height) as f32 / atlas.height as f32,
-            ];
-            (id, uv)
-        })
-        .collect()
+    let mut uvs = BTreeMap::new();
+    for (id, image, px, py) in positions {
+        let uv_min = [
+            px as f32 / atlas.width as f32,
+            py as f32 / atlas.height as f32,
+        ];
+        let uv_max = [
+            (px + image.width) as f32 / atlas.width as f32,
+            (py + image.height) as f32 / atlas.height as f32,
+        ];
+        atlas.named_entries.push((
+            format!("mob_effect/{id}"),
+            crate::vanilla_gui_sprites::SpriteAtlasEntry {
+                uv_min,
+                uv_max,
+                width: image.width,
+                height: image.height,
+                nine_slice_border: None,
+            },
+        ));
+        uvs.insert(id, [uv_min[0], uv_min[1], uv_max[0], uv_max[1]]);
+    }
+    uvs
 }
 
 fn read_bounded(path: &Path) -> Option<Vec<u8>> {

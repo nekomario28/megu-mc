@@ -43,6 +43,7 @@ fn missing_local_assets_build_a_diagnostic_fallback_bundle() {
     let summary = bundle.summary();
     assert_eq!(summary.locale, "ja_jp");
     assert_eq!(summary.world_textures, 27);
-    assert!(!bundle.gui_atlas.is_empty());
+    assert!(!bundle.mob_effect_uvs.is_empty());
+    assert!(bundle.gui_textures.width >= 256);
     assert!(summary.notes > 0);
 }
