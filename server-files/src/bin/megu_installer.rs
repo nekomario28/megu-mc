@@ -1278,7 +1278,12 @@ fn generate_runtime_data(cli: &Cli, root: &Path) -> io::Result<()> {
             missing.join(", ")
         )));
     }
-    move_runtime_output(&stage, root)
+    move_runtime_output(&stage, root)?;
+    // The stage is installer-owned scratch space. Keep it on failure for
+    // diagnostics, but do not leave duplicate reports/test vectors behind after
+    // the validated outputs have been moved into the runtime root.
+    let _ = std::fs::remove_dir_all(&stage);
+    Ok(())
 }
 
 fn ensure_runtime_data(cli: &Cli, root: &Path) -> io::Result<bool> {
