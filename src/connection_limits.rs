@@ -1090,6 +1090,15 @@ impl ClientTxQueue {
         self.wake.notify_all();
     }
 
+    /// Drop frames not yet handed to the writer. Server shutdown uses this for
+    /// stale bulk world traffic before enqueueing Disconnect: the reason frame
+    /// must not wait behind chunks whose owner is already leaving.
+    pub(crate) fn clear_pending(&self) {
+        let mut inner = lock(&self.inner);
+        inner.queue.clear();
+        inner.queued_bytes = 0;
+    }
+
     /// Bytes currently queued — the budget `try_enqueue` enforces.
     #[cfg(test)]
     pub(crate) fn queued_bytes(&self) -> usize {

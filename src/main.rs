@@ -9120,6 +9120,16 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
                 .get(&(x >> 4, z >> 4))
                 .is_none_or(|c| !c.contains_key(&local_idx(x, y, z)))
         })
+        .filter(|&i| {
+            let (x, y, z) = positions[i];
+            match stored_state(DimId::Overworld, x, y, z) {
+                Some(st) => {
+                    out[i] = st;
+                    false
+                }
+                None => true,
+            }
+        })
         .collect();
     if !generated.is_empty() {
         crate::worldgen::with_gen(|g| {
@@ -9139,10 +9149,48 @@ fn read_states_batched(positions: &[(i32, i32, i32)]) -> Vec<u32> {
     out
 }
 
-fn scheduled_block_tick() {
-    with_save_guard(scheduled_block_tick_inner);
+/// Read the cells the next scheduled-block pass is expected to need *before*
+/// entering `SAVE_LOCK`. The queue is cloned, so this changes no persistent
+/// state. The pass below uses these states only when the persisted-world epoch
+/// is unchanged after the lock is acquired — proving no committed block write
+/// could have raced the read — and otherwise falls back to the original
+/// in-transaction batch. Without this split a leaf-tick burst at a generated-
+/// chunk edge can populate terrain for seconds with `SAVE_LOCK` held, and
+/// SIGTERM's final save waits behind terrain that the overlay does not persist.
+struct ScheduledBlockReadPrelude {
+    epoch: u64,
+    states: HashMap<(i32, i32, i32), u32>,
 }
-fn scheduled_block_tick_inner() {
+
+fn scheduled_block_tick_prelude() -> ScheduledBlockReadPrelude {
+    let epoch = WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire);
+    let now = TICK_IDX.load(Ordering::Relaxed) as i64;
+    let generated = worldgen::peek_generated_leaf_ticks();
+    let eligible = scheduled_tick_chunks();
+    let mut preview = block_ticks().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if !generated.is_empty() {
+        preview.unpack_generated(generated, now);
+    }
+    let due = preview.collect(now, 65_536, |chunk| eligible.contains(&chunk));
+    const STRIDE: usize = 7;
+    let mut positions: Vec<(i32, i32, i32)> = Vec::with_capacity(due.len() * STRIDE);
+    for tick in &due {
+        let (x, y, z) = tick.pos;
+        positions.push(tick.pos);
+        for (dx, dy, dz) in LEAF_NEIGHBORS {
+            positions.push((x + dx, y + dy, z + dz));
+        }
+    }
+    let read = read_states_batched(&positions);
+    let states = positions.into_iter().zip(read).collect();
+    ScheduledBlockReadPrelude { epoch, states }
+}
+
+fn scheduled_block_tick() {
+    let prelude = scheduled_block_tick_prelude();
+    with_save_guard(|| scheduled_block_tick_inner(prelude));
+}
+fn scheduled_block_tick_inner(prelude: ScheduledBlockReadPrelude) {
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
@@ -9192,7 +9240,26 @@ fn scheduled_block_tick_inner() {
             positions.push((x + dx, y + dy, z + dz));
         }
     }
-    let states = read_states_batched(&positions);
+    let states = if prelude.epoch == WORLD_PERSIST_DIRTY_EPOCH.load(Ordering::Acquire) {
+        // No committed block write raced the unlocked prelude, so those reads
+        // are exactly the states this transaction would read now. Any entries
+        // absent because brand-new generated ticks arrived are the only cells
+        // still resolved here; in the common shutdown path there are none.
+        let missing: Vec<(i32, i32, i32)> = positions
+            .iter()
+            .copied()
+            .filter(|pos| !prelude.states.contains_key(pos))
+            .collect();
+        let extra = read_states_batched(&missing);
+        let mut resolved = prelude.states;
+        resolved.extend(missing.into_iter().zip(extra));
+        positions
+            .iter()
+            .map(|pos| resolved[pos])
+            .collect::<Vec<u32>>()
+    } else {
+        read_states_batched(&positions)
+    };
     if let Some(t) = __t {
         tickprof::add("sched/read_batch", t.elapsed());
     }
@@ -9355,6 +9422,9 @@ impl GeneratedFluidOwner {
             .collect(now, 65_536, |chunk| eligible.contains(&chunk));
         let mut first_error = None;
         for event in due {
+            if shutdown_requested() {
+                return Ok(());
+            }
             let kind = if event.block < 2 {
                 flowing_fluid::Kind::Water
             } else {
@@ -9373,6 +9443,9 @@ impl GeneratedFluidOwner {
                     plan
                 }
                 Err(error) => {
+                    if shutdown_requested() {
+                        return Ok(());
+                    }
                     self.queue.schedule(scheduled_ticks::ScheduledTick {
                         due: now + 1,
                         ..event
@@ -9409,6 +9482,9 @@ fn generated_fluid_tick() {
     with_save_guard(generated_fluid_tick_inner);
 }
 fn generated_fluid_tick_inner() {
+    if shutdown_requested() {
+        return;
+    }
     let now = TICK_IDX.load(Ordering::Relaxed) as i64;
     let generated = worldgen::take_generated_fluid_ticks();
     if generated.is_empty() && GENERATED_FLUID_OWNER.get().is_none() {
@@ -9634,10 +9710,13 @@ struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
     fn cell(&mut self, pos: BlockPos) -> Result<flowing_fluid::Cell, String> {
+        if shutdown_requested() {
+            return Err("shutdown requested during fluid tick".into());
+        }
         if pos.1 < MIN_Y || pos.1 >= MIN_Y + 384 {
             return Err(format!("fluid read outside world at {pos:?}"));
         }
-        let st = block_at(pos.0, pos.1, pos.2);
+        let st = block_at_cached(pos.0, pos.1, pos.2);
         if let Some(f) = fluid_from_block(st) {
             return Ok(flowing_fluid::Cell::Fluid(f));
         }
@@ -19971,6 +20050,14 @@ fn live_save_worker() -> Option<&'static AsyncSaveWorker> {
 /// Starts at 1 so the first periodic pass after boot always writes — a fresh
 /// world's seed must reach disk even when nobody built yet.
 static WORLD_PERSIST_DIRTY_EPOCH: AtomicU64 = AtomicU64::new(1);
+/// Set by the SIGTERM/SIGINT owner before it attempts the final save. The
+/// tick loop stops entering further simulation stages: shutdown must snapshot
+/// the world as it is, not keep enqueueing fresh leaf/fluid work behind the
+/// saver until the client-side watchdog kills the server.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
 /// Highest dirty epoch a completed save is known to cover.
 static LAST_SAVED_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Highest dirty epoch handed to the async save worker and not yet confirmed.
@@ -20569,20 +20656,6 @@ fn shutdown_world_save() {
         Err(error) => eprintln!("[spine] WORLD SAVE FAILED: {error}"),
     }
     live_anvil_save_if_armed();
-}
-
-/// Run the final durable save on a helper thread and cap signal shutdown's
-/// wait. A slow filesystem is logged as an incomplete shutdown instead of
-/// holding the signal path (and connected clients) indefinitely.
-fn shutdown_world_save_bounded(deadline: Instant) -> bool {
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        shutdown_world_save();
-        let _ = done_tx.send(());
-    });
-    done_rx
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .is_ok()
 }
 
 /// Per-natural-spawn-pass fractional credit. `mob_spawn_scale` below 1.0 means
@@ -21189,6 +21262,9 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
         crate::worldgen::report_gen_lock();
     }
     let mut run = |name: &'static str, f: fn()| {
+        if shutdown_requested() {
+            return;
+        }
         if prof {
             let t = std::time::Instant::now();
             step(name, f);
@@ -23191,14 +23267,12 @@ fn main() {
         .expect("signal hook");
         thread::spawn(move || {
             if sigs.forever().next().is_some() {
+                SHUTDOWN_REQUESTED.store(true, Ordering::Release);
                 restore_tui_terminal();
-                let deadline = Instant::now() + Duration::from_millis(900);
                 disconnect_all_clients("Server closed");
                 stop_lan_announcer();
                 stop_gs4_query();
-                if !shutdown_world_save_bounded(deadline) {
-                    eprintln!("[shutdown] save did not finish before the 900ms deadline");
-                }
+                shutdown_world_save();
                 #[cfg(feature = "neoforge-events")]
                 if let Some(runtime) = java_compat::NEOFORGE.get() {
                     runtime.cleanup_staged_mods();

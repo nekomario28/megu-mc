@@ -9040,6 +9040,16 @@ pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.leaves))
 }
 
+/// Inspect the active world's leaf queue without consuming it. The scheduled-tick
+/// warmup uses this to predict the next drain; the authoritative drain still
+/// happens inside the persistence transaction.
+pub fn peek_generated_leaf_ticks() -> Vec<GeneratedTick> {
+    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    queues.map_or_else(Vec::new, |q| {
+        q.leaves.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+    })
+}
+
 pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
     let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))

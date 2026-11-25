@@ -1879,21 +1879,33 @@ fn save_world_guarded(
     if SAVE_GUARD.with(|guard| guard.get()) {
         return Err("world save called inside an ownership transition".into());
     }
+    let trace = std::env::var_os("MEGU_TRACE_SAVE").is_some();
+    let started = std::time::Instant::now();
     let _writer = SAVE_WRITER
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    if trace {
+        eprintln!("[save-trace] writer lock {:?}", started.elapsed());
+    }
     let snapshot = with_save_guard(|| {
         persistence_boundary("world snapshot panicked", || {
             Ok(WorldSaveSnapshot::capture())
         })
     })?;
+    if trace {
+        eprintln!("[save-trace] capture {:?}", started.elapsed());
+    }
     // The writer runs outside the world guard but inside the same panic
     // boundary: a panic while flushing must fail closed like a capture panic,
     // never escape into the tick loop or shutdown path.
-    match persistence_boundary("world save write panicked", || Ok(write(snapshot))) {
+    let result = match persistence_boundary("world save write panicked", || Ok(write(snapshot))) {
         Ok(result) => result,
         Err(message) => Err(message.into()),
+    };
+    if trace {
+        eprintln!("[save-trace] write total {:?}", started.elapsed());
     }
+    result
 }
 
 type WorldCompanionSlots = [(DimId, Option<Vec<u8>>); 2];

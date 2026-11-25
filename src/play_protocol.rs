@@ -2005,6 +2005,48 @@ impl Client {
         Ok(())
     }
 
+    /// Drop queued Play traffic that has not entered the writer's current
+    /// batch. Used only when the server itself is closing and a Disconnect
+    /// reason is about to replace that backlog.
+    fn clear_play_backlog(&self) {
+        let Ok(socket) = self.sock.try_lock() else {
+            return;
+        };
+        let key = socket_key(&socket);
+        drop(socket);
+        let queue = wire_state(key).and_then(|state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tx_queue
+                .clone()
+        });
+        if let Some(queue) = queue {
+            queue.clear_pending();
+        }
+    }
+
+    /// Close the queue without joining the writer. This is only for process
+    /// shutdown: the final save must never wait behind socket backpressure,
+    /// and process exit is the writer thread's hard teardown boundary.
+    fn close_play_writer_detached(&self) {
+        let Ok(socket) = self.sock.try_lock() else {
+            return;
+        };
+        let key = socket_key(&socket);
+        drop(socket);
+        let queue = wire_state(key).and_then(|state| {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .tx_queue
+                .clone()
+        });
+        if let Some(queue) = queue {
+            queue.close();
+        }
+    }
+
     /// Closing keeps queued Play Disconnect packets ahead of writer shutdown;
     /// joining here ensures no detached per-client writer survives teardown.
     fn close_play_writer(&self) {
@@ -9870,35 +9912,22 @@ fn play_disconnect(s: &mut TcpStream, reason: &str) {
 fn disconnect_all_clients(reason: &str) {
     let connected = client_snapshot();
     for client in &connected {
-        let mut socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
-        play_disconnect(&mut socket, reason);
-    }
-    // Close every queue before waiting on any writer. The short per-socket
-    // write deadline lets queued Disconnect frames drain for healthy peers and
-    // bounds a blocked write before its writer is joined.
-    let mut writers = Vec::with_capacity(connected.len());
-    for client in &connected {
-        let key = {
-            let socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
-            socket_key(&socket)
-        };
-        let (queue, writer) = {
-            match wire_state(key) {
-                Some(state) => {
-                    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-                    (state.tx_queue.clone(), state.tx_writer.take())
-                }
-                None => (None, None),
-            }
-        };
-        if let Some(queue) = queue {
-            queue.close();
+        // Server shutdown is not an orderly client-initiated logout: chunks and
+        // entity traffic already sitting in the queue are stale before the
+        // reason frame can matter. Drop them so Disconnect is the only backlog
+        // the writer has to flush inside the shutdown budget.
+        client.clear_play_backlog();
+        if let Ok(mut socket) = client.sock.try_lock() {
+            play_disconnect(&mut socket, reason);
         }
-        writers.push((client, writer));
     }
-    for (client, writer) in writers {
-        let socket = client.sock.lock().unwrap_or_else(|error| error.into_inner());
-        shutdown_and_join_writer(&socket, writer, &client.name);
+    // Close the writers without joining them. Joining can wait hundreds of
+    // milliseconds (or the full socket write timeout) behind a chunk batch on a
+    // slow or already-departed client; shutdown's persistence transaction must
+    // not pay that network cost. The small Disconnect queue drains while the
+    // final save runs, and process exit closes every socket immediately after.
+    for client in connected {
+        client.close_play_writer_detached();
     }
 }
 

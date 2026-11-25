@@ -286,7 +286,8 @@ def runtime_root_for(server_bin, cwd):
         resolved = resolved.resolve()
     except OSError:
         pass
-    bases = list(resolved.parents[:8]) + list(Path(cwd).resolve().parents[:8])
+    cwd_resolved = Path(cwd).resolve()
+    bases = list(resolved.parents[:8]) + [cwd_resolved] + list(cwd_resolved.parents[:8])
     seen = set()
     for base in bases:
         if base in seen:

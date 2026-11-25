@@ -27,8 +27,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
+import signal
+import socket
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 
@@ -756,19 +762,131 @@ class LiveBinaries(unittest.TestCase):
     """Optional: run the gate for real when compiled binaries + generated
     runtime data exist under this checkout. Skipped on bare worktrees."""
 
-    def test_real_gate_when_binaries_present(self):
+    @staticmethod
+    def _real_bins():
         server = gate.find_default_server_bin()
         client = gate.find_default_client_bin()
         runtime = gate.runtime_root_for(server, ROOT) if server else None
         if not (server and client and runtime):
+            return None
+        return server, client, runtime
+
+    def test_real_gate_when_binaries_present(self):
+        bins = self._real_bins()
+        if bins is None:
             self.skipTest(
                 "no compiled megu/megu-client + generated runtime data "
                 "in this checkout")
+        server, client, _ = bins
         code, out = run_gate(
             "--server-bin", str(server),
             "--client-bin", str(client),
             "--mode", "vanilla")
         self.assertEqual(code, 0, out)
+
+    def test_sigterm_save_finishes_within_shutdown_budget(self):
+        """A live client leaves leaf/fluid tick work queued; SIGTERM still
+        exits with world_overlay.bin inside the corrected shutdown budget."""
+        bins = self._real_bins()
+        if bins is None:
+            self.skipTest(
+                "no compiled megu/megu-client + generated runtime data "
+                "in this checkout")
+        server_bin, client_bin, runtime = bins
+
+        def link_or_copy(src, dst):
+            try:
+                os.symlink(src, dst)
+            except OSError:
+                if src.is_dir():
+                    shutil.copytree(src, dst)
+                else:
+                    shutil.copy2(src, dst)
+
+        with tempfile.TemporaryDirectory(prefix="megu-shutdown-e2e-") as tmp:
+            tmp = Path(tmp)
+            world = tmp / "world"
+            world.mkdir()
+            link_or_copy(runtime / "assets", world / "assets")
+            link_or_copy(runtime / "config_packets.bin", world / "config_packets.bin")
+            (world / "datapacks").mkdir()
+            link_or_copy(runtime / "datapacks" / "vanilla", world / "datapacks" / "vanilla")
+
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+            env = os.environ.copy()
+            env.update({
+                "MEGU_BIND_ADDR": "127.0.0.1",
+                "MEGU_PORT": str(port),
+                "MEGU_WORLD_DIR": str(world),
+                "MEGU_SEED": "12026",
+                "MEGU_CHUNK_PROFILE": "1",
+                "MEGU_TRACE_SAVE": "1",
+            })
+            server = subprocess.Popen(
+                [str(server_bin)], cwd=world, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, text=True, bufsize=1)
+            stderr_lines = []
+            listening = threading.Event()
+
+            def read_server_stderr():
+                for line in server.stderr:
+                    stderr_lines.append(line.rstrip("\n"))
+                    if " listening " in line:
+                        listening.set()
+
+            reader = threading.Thread(target=read_server_stderr, daemon=True)
+            reader.start()
+            try:
+                self.assertTrue(
+                    listening.wait(30),
+                    "server never listened; stderr: " + "\n".join(stderr_lines[-20:]))
+
+                client_env = {k: v for k, v in os.environ.items()
+                              if not k.startswith("MEGU_")}
+                client_env["MEGU_CHUNK_PROFILE"] = "1"
+                client = subprocess.run(
+                    [str(client_bin), "--username", "E2EGate",
+                     "--gameDir", str(tmp / "game"),
+                     "--server", "127.0.0.1", "--port", str(port),
+                     "--headless", "--ticks", "20", "--script", "idle",
+                     "--view-distance", "4", "--json-summary"],
+                    cwd=ROOT, env=client_env, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=60)
+                self.assertEqual(
+                    client.returncode, 0,
+                    "client session failed\nstdout:\n" + client.stdout
+                    + "\nstderr:\n" + client.stderr)
+                # The integrated quickplay contract stops the server as soon as
+                # the client session ends; mirror that ordering exactly.
+                start = time.monotonic()
+                server.send_signal(signal.SIGTERM)
+                try:
+                    rc = server.wait(timeout=2.0)
+                except subprocess.TimeoutExpired as error:
+                    raise self.failureException(
+                        "server did not exit within 2s after SIGTERM; stderr: "
+                        + "\n".join(stderr_lines[-30:])) from error
+                elapsed_ms = (time.monotonic() - start) * 1000.0
+                self.assertEqual(rc, 0, "server exit was not clean")
+                self.assertLessEqual(
+                    elapsed_ms, 3000.0,
+                    f"shutdown save took {elapsed_ms:.1f}ms, over the shutdown budget; stderr: "
+                    + "\n".join(stderr_lines[-30:]))
+                overlay = world / "world_overlay.bin"
+                self.assertTrue(overlay.is_file(), "world_overlay.bin missing after SIGTERM")
+                self.assertGreater(overlay.stat().st_size, 0, "world_overlay.bin is empty")
+            finally:
+                if server.poll() is None:
+                    server.kill()
+                    server.wait(timeout=5)
+                if server.stderr is not None:
+                    server.stderr.close()
+                reader.join(timeout=2)
 
 
 if __name__ == "__main__":
