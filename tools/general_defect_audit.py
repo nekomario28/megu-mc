@@ -262,7 +262,6 @@ UNWIRED_MODULE_BASELINE = {
     'core/dye_and_items',
     'core/geom',
     'core/os_desktop',
-    'create-adapter/rail_network',
 }
 
 HOME_NAME_CHARS = r"[A-Za-z0-9._-]+"

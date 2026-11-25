@@ -30,3 +30,109 @@ pub mod offload_bridge;
 pub mod orbital;
 pub mod rail_network;
 pub mod schematic;
+
+use std::collections::BTreeSet;
+
+use crate::offload_bridge::{OffloadBridge, OffloadBudget, OffloadError, OffloadTickReport};
+use crate::rail_network::{ChunkKey, RailNetwork, TransitEvent};
+
+/// Combined live Create adapter engine.
+///
+/// [`OffloadBridge`] remains the owner of factory, contraption, orbital,
+/// combat-motion, and companion-storage state. This facade composes that
+/// bridge with the live [`RailNetwork`] so train simulation is consumed by
+/// the same production engine surface instead of existing as a library-only
+/// module. Each tick runs the offload bridge first and then advances trains
+/// against the most recently supplied loaded rail chunk set.
+///
+/// The rail side is dormant-by-shape when no trains are registered: one
+/// empty sorted-key snapshot iteration per tick, no chunk access, and no
+/// allocation beyond the network's retained scratch buffer.
+pub struct CreateAdapterEngine {
+    offload: OffloadBridge,
+    rail_network: RailNetwork,
+    loaded_rail_chunks: BTreeSet<ChunkKey>,
+}
+
+/// Deterministic output of one [`CreateAdapterEngine::step_tick`].
+#[derive(Clone, Debug)]
+pub struct CreateAdapterTickReport {
+    pub offload: OffloadTickReport,
+    pub rail_events: Vec<TransitEvent>,
+    /// Rail-network logical tick after the advance.
+    pub rail_tick: u64,
+}
+
+impl CreateAdapterEngine {
+    /// Empty production engine: empty offload bridge, empty rail network,
+    /// and no loaded rail chunks.
+    pub fn new() -> Self {
+        Self {
+            offload: OffloadBridge::new(),
+            rail_network: RailNetwork::new(),
+            loaded_rail_chunks: BTreeSet::new(),
+        }
+    }
+
+    /// Engine around a preconfigured offload bridge.
+    pub fn with_offload(offload: OffloadBridge) -> Self {
+        Self {
+            offload,
+            ..Self::new()
+        }
+    }
+
+    pub fn offload(&self) -> &OffloadBridge {
+        &self.offload
+    }
+
+    /// Mutable offload access for registration/setup. Per-tick execution
+    /// still goes through [`step_tick`](Self::step_tick) so rail/offload
+    /// ordering stays fixed.
+    pub fn offload_mut(&mut self) -> &mut OffloadBridge {
+        &mut self.offload
+    }
+
+    pub fn rail_network(&self) -> &RailNetwork {
+        &self.rail_network
+    }
+
+    /// Mutable rail access for topology, station, signal, and train setup.
+    pub fn rail_network_mut(&mut self) -> &mut RailNetwork {
+        &mut self.rail_network
+    }
+
+    /// Replace the loaded chunk-column set used for train render-mode
+    /// transitions. Trains outside this set continue virtually in O(1).
+    pub fn set_loaded_rail_chunks(&mut self, chunks: BTreeSet<ChunkKey>) {
+        self.loaded_rail_chunks = chunks;
+    }
+
+    pub fn loaded_rail_chunks(&self) -> &BTreeSet<ChunkKey> {
+        &self.loaded_rail_chunks
+    }
+
+    /// Advance the combined engine one server tick. The ordering contract is
+    /// fixed: offload state first, rail network second, then one immutable
+    /// report value pairing both outputs.
+    pub fn step_tick(
+        &mut self,
+        tick: u64,
+        budget: OffloadBudget,
+    ) -> Result<CreateAdapterTickReport, OffloadError> {
+        let offload = self.offload.step_tick(tick, budget)?;
+        let rail_events =
+            rail_network::tick_rail_network(&mut self.rail_network, &self.loaded_rail_chunks);
+        Ok(CreateAdapterTickReport {
+            offload,
+            rail_events,
+            rail_tick: self.rail_network.tick,
+        })
+    }
+}
+
+impl Default for CreateAdapterEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
