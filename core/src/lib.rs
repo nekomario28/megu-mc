@@ -327,15 +327,32 @@
 //!   radix sorting, and [`render_cs::RenderGraph`] dead-pass culling with
 //!   linear-scan transient VRAM aliasing — all fail-closed for modded
 //!   blocks whose visuals leave the `1×1×1` cube.
+//! * [`break_progress`] — the canonical Vanilla `getDestroyProgress` model:
+//!   [`break_progress::destroy_progress_per_tick`]'s
+//!   `speed / hardness / (can_harvest ? 30 : 100)` formula, the
+//!   [`break_progress::instant_break`] predicate, closed-form
+//!   [`break_progress::ticks_to_break`], and the reusable
+//!   [`break_progress::BreakProgressModel`] accumulator every player,
+//!   machine, and prediction-side dig shares.
+//! * [`anticheat_v2`] — bounded-memory competitive-survival anti-cheat:
+//!   [`anticheat_v2::TransactionEchoQueue`] confirmed-RTT transaction
+//!   tracking, [`anticheat_v2::HitboxRewindBuffer`] lag-compensated
+//!   NaN-safe ray-reach validation, [`anticheat_v2::PhysicsPredictionStep`]
+//!   with [`anticheat_v2::AcModGrantToken`] mod-declared motion,
+//!   [`anticheat_v2::BehavioralCusumDetector`] Page-CUSUM/EWMA cadence
+//!   analysis, and [`anticheat_v2::ProtocolInvariantFsm`] O(1)
+//!   packet-order invariants.
 
 #![deny(unsafe_code)]
 
+pub mod anticheat_v2;
 pub mod autostart_service;
 pub mod bits;
 pub mod bloom;
 pub mod bounded;
 pub mod bvh;
 pub mod block_flags_lut;
+pub mod break_progress;
 pub mod coords;
 pub mod crash_report;
 pub mod crowd_physics;

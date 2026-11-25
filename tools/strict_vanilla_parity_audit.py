@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""strict_vanilla_parity_audit.py -- 10-gate Vanilla 1.21.1 survival parity scorecard.
+"""strict_vanilla_parity_audit.py -- 11-gate Vanilla 1.21.1 survival parity scorecard.
 
 Schema: "megu-strict-vanilla-parity/1".
 
@@ -38,7 +38,12 @@ previously discovered silent parity gap:
                          never silently bypassed.
   gate10_dimension_leak  dimension-aware handlers (enter_portal, chorus_fruit,
                          end_gateway_warp, live_mob_tick_dimension) never call
-                         Overworld-only surface_y( / block_at( unguarded.
+                         Overworld-only lookups.
+  gate11_branch_mining   0x24 dig insta-mine runs the canonical
+                         break-progress model (never `req == Some(0.0)`),
+                         dig/place reach uses pose-aware eye height (never
+                         `+ 1.62`), rejected digs resync before the 0x05 ack,
+                         and the mining helpers stay live-wired.
 
 Pure Python 3 stdlib. Run: python3 tools/strict_vanilla_parity_audit.py
 [--root DIR] [--json] [--strict]. Default prints a per-gate scorecard and
@@ -99,6 +104,7 @@ class AuditError(Exception):
 AUDIT_FILES = (
     "chest_loot.rs",
     "combat_and_health.rs",
+    "entity_fluid.rs",
     "entity_push.rs",
     "feature.rs",
     "generated_content.rs",
@@ -683,6 +689,105 @@ def gate10_dimension_leak(texts):
     return _finish(g)
 
 
+_ARM_HEAD = r"(?m)^[ \t]*0x[0-9a-fA-F]+[ \t]*=>"
+
+
+def _packet_arm(text, packet_id):
+    """(start, end) of a `0xNN =>` match arm in the packet dispatch."""
+    m = re.search(r"(?m)^[ \t]*" + packet_id + r"[ \t]*=>", text)
+    if not m:
+        return None
+    nxt = re.search(_ARM_HEAD, text[m.end():])
+    return (m.start(), m.end() + nxt.start() if nxt else len(text))
+
+
+def gate11_branch_mining(texts):
+    g = _gate("gate11_branch_mining",
+              "Branch-mining parity (insta-mine/eye-height/resync)")
+    live = _live(texts, "src/play_protocol.rs")
+    dig = _packet_arm(live, "0x24")
+    if dig is None:
+        g["findings"].append(
+            "src/play_protocol.rs: no 0x24 block_dig match arm found")
+    else:
+        arm = live[dig[0]:dig[1]]
+        base = dig[0]
+        if re.search(r"\breq\s*==\s*Some\(\s*0(?:\.0+)?\s*\)", arm):
+            g["findings"].append(
+                f"{rel_line(live, base + arm.find('req'))}: 0x24 dig "
+                "regressed to `req == Some(0.0)` instead of the canonical "
+                "instant-break model")
+        if not re.search(
+                r"\b(?:instant_mining_break|instant_break|"
+                r"destroy_progress_per_tick)\s*\(", arm):
+            g["findings"].append(
+                "0x24 dig never calls the canonical break-progress model "
+                "(instant_mining_break/instant_break/destroy_progress_per_tick)")
+        if re.search(r"\+\s*1\.62\b", arm):
+            g["findings"].append(
+                "0x24 dig hardcodes `+ 1.62` standing eye height instead of "
+                "the pose-aware client_eye_y")
+        if "client_eye_y(" not in arm:
+            g["findings"].append(
+                "0x24 dig reach/underwater checks do not use the canonical "
+                "pose-aware `client_eye_y` helper")
+        resync = min(
+            (arm.find(p) for p in
+             ("note_block_update_dim(", "ac_resync_block(")
+             if arm.find(p) >= 0),
+            default=-1)
+        ack = arm.find("ack(seq)")
+        if ack >= 0 and (resync < 0 or resync > ack):
+            g["findings"].append(
+                "0x24 dig: rejected insta-mine/finish paths do not resync "
+                "the authoritative block before the 0x05 ack(seq) — ghost "
+                "blocks possible")
+    place = _packet_arm(live, "0x38")
+    if place is None:
+        g["findings"].append(
+            "src/play_protocol.rs: no 0x38 block_place match arm found")
+    else:
+        arm = live[place[0]:place[1]]
+        if re.search(r"\+\s*1\.62\b", arm):
+            g["findings"].append(
+                "0x38 place hardcodes `+ 1.62` standing eye height instead of "
+                "the pose-aware client_eye_y")
+        if "client_eye_y(" not in arm:
+            g["findings"].append(
+                "0x38 place reach does not use the canonical pose-aware "
+                "`client_eye_y` helper")
+    # The eye-height source of truth must exist and be consumed.
+    fluid = _live(texts, "src/entity_fluid.rs")
+    if fluid and not re.search(
+            r"\bfn\s+(?:player_eye_height_at|player_eye_height_for_pose)\b",
+            fluid):
+        g["findings"].append(
+            "src/entity_fluid.rs: no canonical pose-aware eye-height helper "
+            "(player_eye_height_at/player_eye_height_for_pose)")
+    # The mining helper chain must stay live-wired — never sink back into
+    # test-only or dead-code'd stubs.
+    mech = _live(texts, "src/player_mechanisms.rs")
+    for helper in ("instant_mining_break", "mining_speed_with_modifiers",
+                   "mining_damage_per_tick"):
+        if not live_wired(texts, helper):
+            g["findings"].append(
+                f"mining helper `{helper}` has no live call site")
+            continue
+        m = re.search(r"(?m)^[ \t]*fn\s+" + helper + r"\b", mech)
+        if m:
+            pre = mech[max(0, m.start() - 400):m.start()]
+            tail = pre.split("allow(dead_code)")[-1]
+            if "allow(dead_code)" in pre and "fn " not in tail:
+                g["findings"].append(
+                    f"mining helper `{helper}` fell back under "
+                    "allow(dead_code) despite being live-wired")
+    return _finish(g)
+
+
+def rel_line(text, pos):
+    return f"src/play_protocol.rs:{_line_of(text, pos)}"
+
+
 GATES = (
     gate1_fishing,
     gate2_enchanting,
@@ -694,11 +799,12 @@ GATES = (
     gate8_survival,
     gate9_builtin_bypass,
     gate10_dimension_leak,
+    gate11_branch_mining,
 )
 
 
 def run_gates(texts):
-    """Run all 10 gates over a texts dict -> report."""
+    """Run all 11 gates over a texts dict -> report."""
     gates = [fn(texts) for fn in GATES]
     summary = {
         "pass": sum(1 for g in gates if g["status"] == "PASS"),

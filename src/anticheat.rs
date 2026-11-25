@@ -405,11 +405,18 @@ enum AcCheckId {
     Movement,
     NoFall,
     Attack,
+    Protocol,
 }
 
 impl AcCheckId {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const ALL: [AcCheckId; 4] = [AcCheckId::Place, AcCheckId::Movement, AcCheckId::NoFall, AcCheckId::Attack];
+    pub(crate) const ALL: [AcCheckId; 5] = [
+        AcCheckId::Place,
+        AcCheckId::Movement,
+        AcCheckId::NoFall,
+        AcCheckId::Attack,
+        AcCheckId::Protocol,
+    ];
     fn index(self) -> usize {
         self as usize
     }
@@ -419,6 +426,7 @@ impl AcCheckId {
             AcCheckId::Movement => "movement",
             AcCheckId::NoFall => "nofall",
             AcCheckId::Attack => "attack",
+            AcCheckId::Protocol => "protocol",
         }
     }
 }
@@ -456,6 +464,7 @@ pub(crate) struct PlaceCheck;
 pub(crate) struct MovementCheck;
 pub(crate) struct NoFallCheck;
 pub(crate) struct AttackCheck;
+pub(crate) struct ProtocolCheck;
 
 const fn ac_pol(slack: f64, burst_ticks: f64, decay_per_sec: f64) -> Option<AcPolicy> {
     Some(AcPolicy {
@@ -511,6 +520,19 @@ impl AcCheck for AttackCheck {
     }
 }
 
+impl AcCheck for ProtocolCheck {
+    const ID: AcCheckId = AcCheckId::Protocol;
+    const ACTION: Action = Action::Cancel;
+    fn policy(preset: AcPreset) -> Option<AcPolicy> {
+        match preset {
+            AcPreset::Off => None,
+            // FSM/CUSUM violations are cumulative evidence: one odd packet is
+            // noise, a stream of impossible orderings is a client.
+            AcPreset::Standard => ac_pol(1.0, 0.0, 0.5),
+        }
+    }
+}
+
 /// One registered check.
 #[derive(Clone, Copy)]
 struct AcRegistered {
@@ -529,11 +551,12 @@ const fn ac_register<C: AcCheck>() -> AcRegistered {
 
 /// The registry: every check, its action and its policy per preset. A new check is a
 /// type implementing [`Check`] plus one line here.
-const AC_REGISTRY: [AcRegistered; 4] = [
+const AC_REGISTRY: [AcRegistered; 5] = [
     ac_register::<PlaceCheck>(),
     ac_register::<MovementCheck>(),
     ac_register::<NoFallCheck>(),
     ac_register::<AttackCheck>(),
+    ac_register::<ProtocolCheck>(),
 ];
 
 fn ac_registered(check: AcCheckId) -> &'static AcRegistered {
@@ -884,17 +907,49 @@ impl AcMoveState {
     }
 }
 
+/// Per-player state of the `megu_core::anticheat_v2` engine: the
+/// confirmed-RTT transaction queue, the behavioural CUSUM channels, the
+/// packet-order FSM and the mod-declared motion grant — all bounded, all
+/// updated from the live packet checks below.
+#[derive(Debug)]
+struct PlayerAcV2 {
+    tx: megu_core::anticheat_v2::TransactionEchoQueue<32>,
+    cusum: megu_core::anticheat_v2::BehavioralCusumDetector,
+    fsm: megu_core::anticheat_v2::ProtocolInvariantFsm,
+    grant: Option<megu_core::anticheat_v2::AcModGrantToken>,
+    last_attack_at: Option<Instant>,
+    last_attack_yaw: Option<f32>,
+    last_dig_at: Option<Instant>,
+    last_place_at: Option<Instant>,
+}
+
+impl PlayerAcV2 {
+    fn new() -> Self {
+        Self {
+            tx: megu_core::anticheat_v2::TransactionEchoQueue::new(),
+            cusum: megu_core::anticheat_v2::BehavioralCusumDetector::new(),
+            fsm: megu_core::anticheat_v2::ProtocolInvariantFsm::new(),
+            grant: None,
+            last_attack_at: None,
+            last_attack_yaw: None,
+            last_dig_at: None,
+            last_place_at: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PlayerAc {
     #[cfg_attr(not(test), allow(dead_code))]
     name: String,
-    vl: [f64; 4],
-    vl_at: [Option<Instant>; 4],
-    alert_at: [Option<Instant>; 4],
-    flags: [u64; 4],
+    vl: [f64; 5],
+    vl_at: [Option<Instant>; 5],
+    alert_at: [Option<Instant>; 5],
+    flags: [u64; 5],
     attack_clicks: std::collections::VecDeque<Instant>,
     killaura: AcKillAuraState,
     moves: AcMoveState,
+    v2: PlayerAcV2,
     nofall_reported: bool,
     last_game_mode: Option<u8>,
     game_mode_grace_until: Option<Instant>,
@@ -904,13 +959,14 @@ impl PlayerAc {
     fn new(name: &str) -> PlayerAc {
         PlayerAc {
             name: name.to_owned(),
-            vl: [0.0; 4],
-            vl_at: [None; 4],
-            alert_at: [None; 4],
-            flags: [0; 4],
+            vl: [0.0; 5],
+            vl_at: [None; 5],
+            alert_at: [None; 5],
+            flags: [0; 5],
             attack_clicks: std::collections::VecDeque::new(),
             killaura: AcKillAuraState::default(),
             moves: AcMoveState::default(),
+            v2: PlayerAcV2::new(),
             nofall_reported: false,
             last_game_mode: None,
             game_mode_grace_until: None,
@@ -928,6 +984,36 @@ impl PlayerAc {
 fn ac_players() -> &'static Mutex<HashMap<i32, PlayerAc>> {
     static P: OnceLock<Mutex<HashMap<i32, PlayerAc>>> = OnceLock::new();
     P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Bound on the lag-compensation rewind registry: unknown eids never grow
+/// it past this, and `ac_forget` drops departed entries.
+const MAX_AC_REWIND_ENTRIES: usize = 512;
+
+fn ac_rewinds(
+) -> &'static Mutex<HashMap<i32, megu_core::anticheat_v2::HitboxRewindBuffer<128>>> {
+    static R: OnceLock<
+        Mutex<HashMap<i32, megu_core::anticheat_v2::HitboxRewindBuffer<128>>>,
+    > = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one entity AABB snapshot for lag-compensated reach validation.
+fn ac_record_hitbox(eid: i32, tick: u64, aabb: megu_core::bvh::Aabb3) {
+    let mut map = ac_rewinds().lock().unwrap_or_else(|e| e.into_inner());
+    if !map.contains_key(&eid) && map.len() >= MAX_AC_REWIND_ENTRIES {
+        return;
+    }
+    map.entry(eid)
+        .or_insert_with(megu_core::anticheat_v2::HitboxRewindBuffer::new)
+        .record(tick, aabb);
+}
+
+/// Monotonic milliseconds for the transaction queue — only the *relative*
+/// ages matter, so an arbitrary epoch is fine.
+fn ac_now_ms() -> u64 {
+    static T0: OnceLock<Instant> = OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 fn ac_with_player<R>(me: &Client, f: impl FnOnce(&mut PlayerAc) -> R) -> R {
@@ -990,6 +1076,9 @@ fn ac_forget(eid: i32) {
     if let Some(map) = ac_rtts().lock().ok().as_mut() {
         map.remove(&eid);
     }
+    if let Some(map) = ac_rewinds().lock().ok().as_mut() {
+        map.remove(&eid);
+    }
 }
 
 // ---------- hooks for server-side motion (mods, knockback, explosions, teleports) ----------
@@ -1012,6 +1101,46 @@ fn ac_note_server_velocity(eid: i32, v: [f64; 3]) {
     let fall = if v[1] < 0.0 { -v[1] * 12.0 } else { 0.0 };
     p.moves
         .grant([h * 12.0 + 0.5, rise + 0.5, fall], Instant::now());
+    // v2: the velocity grant is a pending transaction until the client
+    // echoes progress past it, and an `AcModGrantToken` widens the strict
+    // 1-tick envelope by exactly the declared velocity — no blanket
+    // exemption needed for knockback, launches or mod carriers.
+    p.v2.tx.issue(
+        megu_core::anticheat_v2::TxKind::VelocityGrant,
+        ac_now_ms(),
+    );
+    p.v2.grant = Some(megu_core::anticheat_v2::AcModGrantToken::new(v, 40));
+}
+
+/// The client echoed a server transaction id (teleport confirm): folds the
+/// true round-trip into the EWMA estimate and drains every earlier grant.
+fn ac_note_tx_confirm(me: &Client, wire_id: i64) {
+    if wire_id < 0 {
+        return;
+    }
+    let now_ms = ac_now_ms();
+    let confirmed = ac_with_player(me, |p| {
+        p.v2.tx.expire(now_ms, 5_000);
+        p.v2.tx.note_echo(wire_id as u64, now_ms)
+    });
+    if let Some(ms) = confirmed {
+        ac_note_player_rtt_ms(me.eid, ms.min(u64::from(u32::MAX)) as u32);
+    }
+}
+
+/// A transaction with a wire id the client will echo — the teleport
+/// confirmation id a prepared/setback teleport already carries.
+fn ac_note_tx_grant(eid: i32, wire_id: i64, kind: megu_core::anticheat_v2::TxKind) {
+    if wire_id < 0 {
+        return;
+    }
+    if let Some(p) = ac_players()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&eid)
+    {
+        p.v2.tx.note_grant(wire_id as u64, kind, ac_now_ms());
+    }
 }
 
 /// Public hook: server-side code is about to move this player by `v` blocks/tick.
@@ -1045,6 +1174,13 @@ fn ac_note_carried_motion(eid: i32, delta: [f64; 3]) {
 fn ac_expect_teleport(eid: i32) {
     if let Some(p) = ac_players().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid) {
         p.moves.fresh = true;
+        // v2: mark a teleport transaction pending — its high-bit id can
+        // never collide with a real wire id, and any later client echo
+        // drains it in order.
+        p.v2.tx.issue(
+            megu_core::anticheat_v2::TxKind::Teleport,
+            ac_now_ms(),
+        );
     }
 }
 
@@ -1376,7 +1512,7 @@ fn attack_click_window(clicks: &mut std::collections::VecDeque<Instant>, now: In
 
 /// Accumulate weak evidence across hits, cancelling only sustained anomalies.
 /// This lets lag spikes and legitimate fast turns pass without an immediate setback.
-fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3]) -> bool {
+fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3], target_eid: i32) -> bool {
     if ac_policy(AcCheckId::Attack, ac_checked_preset(me)).is_none() {
         return true;
     }
@@ -1386,7 +1522,73 @@ fn ac_check_attack(me: &Client, dim: DimId, target: [f64; 3]) -> bool {
         ac_flag(me, AcCheckId::Attack, 1.0, "more than 25 attacks per second");
     }
     let (x, y, z, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-    let eye = [x, y + 1.62, z];
+    // Canonical pose-aware eye: a crawling or sneaking attacker aims from
+    // 0.40/1.27, not a hardcoded standing 1.62.
+    let eye = [x, client_eye_y(me, dim, x, y, z), z];
+    // v2 behavioural channels — AutoClicker cadence + KillAura yaw snaps,
+    // notify evidence exactly like the killaura pass below.
+    let v2_flag = ac_with_player(me, |p| {
+        let mut out = None;
+        if let Some(prev) = p.v2.last_attack_at {
+            out = p.v2.cusum.note_click_interval(
+                now.saturating_duration_since(prev).as_secs_f64(),
+            );
+        }
+        if let Some(prev_yaw) = p.v2.last_attack_yaw {
+            let d = (yaw - prev_yaw).abs() % 360.0;
+            let d = if d > 180.0 { 360.0 - d } else { d };
+            if out.is_none() {
+                out = p.v2.cusum.note_yaw_delta(f64::from(d));
+            }
+        }
+        p.v2.last_attack_at = Some(now);
+        p.v2.last_attack_yaw = Some(yaw);
+        out
+    });
+    if let Some(flag) = v2_flag {
+        ac_flag(me, AcCheckId::Attack, 1.5, &format!("v2 behavioural {flag:?}"));
+    }
+    // v2 lag-compensated rewind: NaN-safely test the attack ray against
+    // the victim's rewind-interpolated, RTT-fattened box — judged on the
+    // *pre-attack* history, then the new position is recorded.
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    let rewind_miss = {
+        let map = ac_rewinds().lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&target_eid).is_some_and(|buf| {
+            // One sample cannot rewind; two or more give a real verdict.
+            buf.len() >= 2
+                && buf
+                    .verify_ray_reach(
+                        eye,
+                        [
+                            target[0] - eye[0],
+                            target[1] - eye[1],
+                            target[2] - eye[2],
+                        ],
+                        3.6,
+                        tick,
+                        (ac_player_rtt_ms(me.eid) as f32 / 1000.0 * 3.0)
+                            .clamp(0.05, 0.5),
+                    )
+                    .is_none()
+        })
+    };
+    if rewind_miss {
+        ac_flag(me, AcCheckId::Attack, 1.0, "v2 lag-compensated reach miss");
+    }
+    let feet_y = target[1] - 0.9;
+    ac_record_hitbox(
+        target_eid,
+        tick,
+        megu_core::bvh::Aabb3::new(
+            [target[0] as f32 - 0.3, feet_y as f32, target[2] as f32 - 0.3],
+            [
+                target[0] as f32 + 0.3,
+                feet_y as f32 + 1.8,
+                target[2] as f32 + 0.3,
+            ],
+        ),
+    );
     let angle = attack_angle_off_axis(yaw, pitch, eye, target);
     if angle.is_some_and(|angle| angle > 85.0) {
         ac_flag(me, AcCheckId::Attack, 1.0, "attack outside view angle");
@@ -1601,6 +1803,132 @@ fn ac_consume_placed_item(me: &Client, held_slot: i16) {
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);
 }
 
+// ---------- anticheat_v2 packet-order & cadence observers ----------
+//
+// Every `block_dig`, `use_on`, `entity_action` and item-use packet feeds
+// the per-player `ProtocolInvariantFsm` and `BehavioralCusumDetector`.
+// Violations flag the `protocol` check — cumulative evidence, never a
+// single-packet kick.
+
+/// `block_dig` (0x24): dig-order invariants, sequence monotonicity and the
+/// FastBreak cadence channel. `instant_possible` is the server-computed
+/// insta-mine verdict for this block+tool (or `true` when the dig could
+/// not be judged — a rejected START may still legally precede a FINISH).
+fn ac_v2_note_dig(me: &Client, status: i64, instant_possible: bool, seq: i64) {
+    if ac_policy(AcCheckId::Protocol, ac_checked_preset(me)).is_none() {
+        return;
+    }
+    let now = Instant::now();
+    let (violation, behavioural) = ac_with_player(me, |p| {
+        let v = p
+            .v2
+            .fsm
+            .note_dig_status(status, instant_possible)
+            .err()
+            .or_else(|| p.v2.fsm.note_sequence(seq).err());
+        let c = if status == 0 {
+            p.v2
+                .last_dig_at
+                .replace(now)
+                .and_then(|prev| {
+                    p.v2
+                        .cusum
+                        .note_dig_interval(now.saturating_duration_since(prev).as_secs_f64())
+                })
+        } else {
+            None
+        };
+        if status == 5 {
+            p.v2.fsm.note_use_item_stop();
+        }
+        (v, c)
+    });
+    if let Some(v) = violation {
+        ac_flag(
+            me,
+            AcCheckId::Protocol,
+            1.0,
+            &format!("v2 protocol invariant {v:?}"),
+        );
+    }
+    if let Some(f) = behavioural {
+        ac_flag(me, AcCheckId::Protocol, 1.0, &format!("v2 behavioural {f:?}"));
+    }
+}
+
+/// `use_on` (0x38): face-enum bounds, sequence monotonicity and the
+/// Scaffold placement-cadence/yaw-lock channel.
+fn ac_v2_note_use_on(me: &Client, face: i64, seq: i64, yaw: f32) {
+    if ac_policy(AcCheckId::Protocol, ac_checked_preset(me)).is_none() {
+        return;
+    }
+    let now = Instant::now();
+    let (violation, behavioural) = ac_with_player(me, |p| {
+        let v = p
+            .v2
+            .fsm
+            .note_face(face)
+            .err()
+            .or_else(|| p.v2.fsm.note_sequence(seq).err());
+        let c = p
+            .v2
+            .last_place_at
+            .replace(now)
+            .and_then(|prev| {
+                p.v2.cusum.note_place(
+                    now.saturating_duration_since(prev).as_secs_f64(),
+                    yaw,
+                )
+            });
+        (v, c)
+    });
+    if let Some(v) = violation {
+        ac_flag(
+            me,
+            AcCheckId::Protocol,
+            1.0,
+            &format!("v2 protocol invariant {v:?}"),
+        );
+    }
+    if let Some(f) = behavioural {
+        ac_flag(me, AcCheckId::Protocol, 1.0, &format!("v2 behavioural {f:?}"));
+    }
+}
+
+/// `entity_action` 3/4: sprint flag changes — sprinting while an item use
+/// is open is impossible for a vanilla client.
+fn ac_v2_note_sprint(me: &Client, sprinting: bool) {
+    if ac_policy(AcCheckId::Protocol, ac_checked_preset(me)).is_none() {
+        return;
+    }
+    let violation = ac_with_player(me, |p| p.v2.fsm.note_sprint(sprinting).err());
+    if let Some(v) = violation {
+        ac_flag(
+            me,
+            AcCheckId::Protocol,
+            1.0,
+            &format!("v2 protocol invariant {v:?}"),
+        );
+    }
+}
+
+/// An item use begins (use_item / use_on that activates food, shield,
+/// bow): illegal while the sprint flag is still up.
+fn ac_v2_note_use_item(me: &Client) {
+    if ac_policy(AcCheckId::Protocol, ac_checked_preset(me)).is_none() {
+        return;
+    }
+    let violation = ac_with_player(me, |p| p.v2.fsm.note_use_item().err());
+    if let Some(v) = violation {
+        ac_flag(
+            me,
+            AcCheckId::Protocol,
+            1.0,
+            &format!("v2 protocol invariant {v:?}"),
+        );
+    }
+}
+
 /// Undo a client-side prediction for one cell.
 fn ac_resync_block(me: &Client, dim: DimId, (x, y, z): BlockPos) {
     let state = block_at_dim(dim, x, y, z);
@@ -1745,6 +2073,50 @@ fn ac_check_move(
             (to.1 - from.1).max(0.0),
             (from.1 - to.1).max(0.0),
         ];
+        // v2 strict 1-tick envelope over the same mover state, per elapsed
+        // tick, honoring the live `AcModGrantToken`. A move the token
+        // bucket absorbed but the deterministic predictor calls impossible
+        // is still real evidence.
+        let verdict = ac_with_player(me, |ac| {
+            let ticks = ac
+                .moves
+                .last
+                .map(|l| now.saturating_duration_since(l).as_secs_f64() * 20.0)
+                .unwrap_or(1.0)
+                .max(1.0);
+            let env = megu_core::anticheat_v2::PhysicsEnv {
+                gravity: state.gravity,
+                jump_velocity: state.jump_strength
+                    + 0.1 * f64::from(state.jump_level.max(0)),
+                movement_speed: state.movement_speed,
+                speed_level: state.speed_level,
+                friction: if state.slippery {
+                    megu_core::anticheat_v2::SLIP_ICE
+                } else {
+                    megu_core::anticheat_v2::SLIP_GROUND
+                },
+                on_ground: claimed_ground,
+                in_water: state.in_fluid,
+                in_lava: false,
+                on_climbable: false,
+                fall_flying: state.gliding || state.riptide,
+                levitation_level: state.levitation_level,
+                flying: matches!(state.game_mode, 1 | 3),
+            };
+            let per_tick = [need[0] / ticks, need[1] / ticks, need[2] / ticks];
+            let verdict = megu_core::anticheat_v2::PhysicsPredictionStep::evaluate(
+                &env,
+                per_tick,
+                ac.v2.grant.as_ref(),
+            );
+            if let Some(g) = ac.v2.grant.as_mut() {
+                g.tick_down();
+                if g.expired() {
+                    ac.v2.grant = None;
+                }
+            }
+            verdict
+        });
         let excess = ac_with_player(me, |ac| ac.moves.evaluate(now, &allowance, &p, need));
         if let Some(excess) = excess {
             let detail = format!(
@@ -1754,7 +2126,31 @@ fn ac_check_move(
             if ac_flag(me, AcCheckId::Movement, 1.0 + excess.min(10.0), &detail) {
                 return AcMoveVerdict::Setback;
             }
+        } else if !verdict.within {
+            let worst = verdict
+                .excess_residual
+                .iter()
+                .copied()
+                .fold(0.0, f64::max);
+            if worst > 0.5 {
+                ac_flag(
+                    me,
+                    AcCheckId::Movement,
+                    0.5 + worst.min(4.0) * 0.25,
+                    &format!("v2 physics envelope exceeded by {worst:.2} blocks/tick"),
+                );
+            }
         }
+        // Lag-compensation rewind: the accepted position becomes a
+        // timestamped hitbox snapshot for reach validation.
+        ac_record_hitbox(
+            me.eid,
+            TICK_IDX.load(Ordering::Relaxed),
+            megu_core::bvh::Aabb3::new(
+                [to.0 as f32 - 0.3, to.1 as f32, to.2 as f32 - 0.3],
+                [to.0 as f32 + 0.3, to.1 as f32 + 1.8, to.2 as f32 + 0.3],
+            ),
+        );
     }
     let mut ground = claimed_ground;
     if nofall.is_some() && claimed_ground {
@@ -1784,6 +2180,7 @@ fn ac_setback(me: &Client, to: (f64, f64, f64, f32, f32, bool)) {
     let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
     let mut teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
     let id = teleport.begin();
+    ac_note_tx_grant(me.eid, i64::from(id), megu_core::anticheat_v2::TxKind::Teleport);
     *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = to;
     send_prepared_teleport(&mut sock, &mut teleport, (to.0, to.1, to.2, to.3, to.4), id);
 }

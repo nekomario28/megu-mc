@@ -130,7 +130,9 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # (vanilla-mob batch 247b2f6c +19, aeronautics & client batches the rest).
 # 2680 -> 2439: the deduplication & dead-code sweep merged duplicate cfg_attr
 # pairs and removed or wired staged helpers across lanes.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2439 \
+# 2439 -> 2436: the branch-mining helpers went live through the canonical
+# break-progress model and shed their silencers.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2436 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
