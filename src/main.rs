@@ -70,6 +70,7 @@ include!("play_protocol.rs");
 include!("lod_protocol.rs");
 include!("anvil_io.rs");
 include!("recipes_and_stats.rs");
+include!("startup_bench.rs");
 #[cfg(feature = "create-offload")]
 include!("mod_offload_bridge.rs");
 #[cfg(feature = "create-offload")]
@@ -277,6 +278,56 @@ impl EntityAabb {
 const MOB_CAP: usize = 4096;
 const DROP_CAP: usize = 8192;
 const XP_CAP: usize = 4096;
+
+/// Evict the oldest `vec.len() - cap` entries in a single `drain` pass —
+/// O(1) amortized per evicted entry (one tail move for the whole batch)
+/// instead of the O(N)-per-entry `Vec::remove(0)` shift loop it replaces —
+/// invoking `on_evict` on each evicted entry in oldest-first order.
+fn evict_oldest_front<T>(vec: &mut Vec<T>, cap: usize, mut on_evict: impl FnMut(T)) {
+    let excess = vec.len().saturating_sub(cap);
+    if excess == 0 {
+        return;
+    }
+    for item in vec.drain(..excess) {
+        on_evict(item);
+    }
+}
+
+#[cfg(test)]
+mod evict_oldest_front_tests {
+    use super::evict_oldest_front;
+
+    #[test]
+    fn cap_trim_evicts_oldest_first_in_one_pass() {
+        let mut vec: Vec<u32> = (0..10).collect();
+        let mut evicted = Vec::new();
+        evict_oldest_front(&mut vec, 4, |item| evicted.push(item));
+        assert_eq!(evicted, vec![0, 1, 2, 3, 4, 5], "oldest entries leave FIFO");
+        assert_eq!(vec, vec![6, 7, 8, 9], "newest `cap` entries remain in order");
+    }
+
+    #[test]
+    fn cap_trim_is_a_no_op_at_or_under_cap() {
+        let mut vec = vec![1_u32, 2, 3];
+        let mut calls = 0;
+        evict_oldest_front(&mut vec, 3, |_| calls += 1);
+        evict_oldest_front(&mut vec, 8, |_| calls += 1);
+        assert_eq!(calls, 0, "nothing may be evicted at or under the cap");
+        assert_eq!(vec, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cap_trim_yields_owned_entries_without_cloning() {
+        // A non-Clone, non-Copy payload proves entries are yielded by
+        // value — no hidden per-entry copy pass inside the trim.
+        struct Owned(u32);
+        let mut vec: Vec<Owned> = (0..6).map(Owned).collect();
+        let mut evicted = Vec::new();
+        evict_oldest_front(&mut vec, 2, |Owned(id)| evicted.push(id));
+        assert_eq!(evicted, vec![0, 1, 2, 3]);
+        assert_eq!(vec.iter().map(|o| o.0).collect::<Vec<_>>(), vec![4, 5]);
+    }
+}
 // A generated hanging entity is static, so nothing turns one back into a spawn:
 // the cap is what bounds a placement bug that stages the same marker in every
 // chunk of a structure.
@@ -1388,9 +1439,10 @@ fn environment_time_tick() {
         // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
         for b in fb.iter_mut() {
-            let dim = env_clients
+            let owner = env_clients
                 .iter()
-                .find(|client| client.eid == b.owner)
+                .find(|client| client.eid == b.owner);
+            let dim = owner
                 .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
                 .unwrap_or(DimId::Overworld);
             if !region.is_hot(b.x as i32, b.z as i32) {
@@ -1418,7 +1470,37 @@ fn environment_time_tick() {
                 b.dx = 0.0;
                 b.dy = 0.0;
                 b.dz = 0.0;
-                if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 {
+                let (luck, lure) = owner.map_or((0, 0), |client| fishing_enchant_levels(client));
+                let wait_roll = (b.eid.unsigned_abs() as u32).wrapping_mul(2654435761) % 501;
+                let wait = fishing_wait_ticks(lure, wait_roll);
+                let open_water = fishing_open_water(
+                    dim,
+                    b.x.floor() as i32,
+                    b.y.floor() as i32,
+                    b.z.floor() as i32,
+                );
+                let _category_weights = fishing_category_weights(luck, open_water);
+                let rain_bonus = RAINING.load(Ordering::Relaxed) > 0;
+                let sky_blocked = (1..=32).any(|dy| {
+                    breg().is_some_and(|registry| {
+                        !registry.is_air(block_at_dim(
+                            dim,
+                            b.x.floor() as i32,
+                            b.y.floor() as i32 + dy,
+                            b.z.floor() as i32,
+                        ))
+                    })
+                });
+                // Rain advances the bite countdown 25% faster; a blocked sky
+                // advances it at half speed, matching FishingHook's tick checks.
+                let mut countdown = b.age.max(0) as u32;
+                if rain_bonus {
+                    countdown = countdown.saturating_add(countdown / 4);
+                }
+                if sky_blocked {
+                    countdown /= 2;
+                }
+                if !b.bit && countdown >= wait {
                     b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6;
                     if b.bit {
                         // vanilla FishingHook: on a bite the bobber dips, a
@@ -1688,10 +1770,7 @@ fn environment_time_tick() {
                 broadcast_seen_destroy(*eid);
             }
         }
-        while xl.len() > XP_CAP {
-            let x = xl.remove(0);
-            broadcast_seen_destroy(x.eid);
-        }
+        evict_oldest_front(&mut xl, XP_CAP, |x| broadcast_seen_destroy(x.eid));
         if let Some(t) = __t {
             tickprof::add("env/xp_age", t.elapsed());
         }
@@ -12295,6 +12374,178 @@ struct LiveRedstoneState {
     ticks: BinaryHeap<LiveRedstoneTick>,
     pending: BTreeMap<(RsPos, u32), u64>,
     sequence: u64,
+    /// Compiled dust topology from the last pass, reusable while every
+    /// covered section revision holds (`live_wire_settle`).
+    netlist: Option<LiveWireNetlist>,
+}
+
+/// A compiled dust netlist (`megu_core::redstone_eda`) plus the section
+/// revision cover it stays valid for. On a cover hit a pass settles power
+/// through the Dial 16-bucket solver — O(V+E) flat arrays — instead of
+/// rebuilding the whole `wire_network`/`downstream` BTreeMap topology
+/// under the `live_redstone` lock.
+struct LiveWireNetlist {
+    /// Section revisions captured at compile time: every section holding
+    /// an inspected seed or a wire node, dilated one section on each axis
+    /// so any topology-relevant edit bumps a covered revision.
+    cover: BTreeMap<megu_core::coords::SectionKey, u64>,
+    /// The settled dust positions — feeds the device-eval neighbourhood.
+    network: RsBTreeSet<RsPos>,
+    solver: megu_core::redstone_eda::RedstoneWireSolver,
+}
+
+/// Shared per-section revision spine (`megu_core::section_rev`): bumped on
+/// every live block write so the redstone wire netlist can prove a
+/// compiled dust topology is still valid with O(covered) map reads.
+fn shared_section_revs() -> &'static Mutex<megu_core::section_rev::SharedSectionRevTable> {
+    static TABLE: OnceLock<Mutex<megu_core::section_rev::SharedSectionRevTable>> =
+        OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(megu_core::section_rev::SharedSectionRevTable::new()))
+}
+
+/// Sections a compiled wire netlist depends on, each mapped to the shared
+/// revision read right now: the sections holding `inspect` seeds and wire
+/// nodes, dilated by one section on every axis. A topology-relevant edit
+/// always lands within two blocks of a wire node, hence inside the
+/// dilation, and [`SharedSectionRevTable::bump_block_local`] always bumps
+/// the edited block's own section — so equality of this map and the
+/// stored cover is exact proof the compiled graph is still valid.
+fn wire_netlist_cover(
+    dim: DimId,
+    inspect: &RsBTreeSet<RsPos>,
+    network: &RsBTreeSet<RsPos>,
+) -> BTreeMap<megu_core::coords::SectionKey, u64> {
+    use megu_core::coords::{DimIndex, SectionKey};
+    let dim = DimIndex(dim.raw());
+    let mut sections = megu_core::coords::CoordSet::default();
+    for &RsPos(x, y, z) in inspect.iter().chain(network.iter()) {
+        sections.insert(SectionKey::from_block_pos(dim, x, y, z));
+    }
+    let table = shared_section_revs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut cover = BTreeMap::new();
+    for s in sections {
+        for dx in -1..=1_i32 {
+            for dy in -1..=1_i32 {
+                for dz in -1..=1_i32 {
+                    let (Some(cx), Some(sy), Some(cz)) = (
+                        s.cx.checked_add(dx),
+                        s.sy.checked_add(dy),
+                        s.cz.checked_add(dz),
+                    ) else {
+                        continue;
+                    };
+                    let key = SectionKey { dim, cx, sy, cz };
+                    cover
+                        .entry(key)
+                        .or_insert_with(|| table.section_rev(key));
+                }
+            }
+        }
+    }
+    cover
+}
+
+/// Settle the dust network the way [`RedstoneWorldAdapter::propagate`]
+/// does, but through the `megu_core::redstone_eda` netlist solver: while
+/// the covering section revisions are unchanged the compiled topology is
+/// reused and only the power solve runs, so an unchanged tick does not
+/// rebuild the wire graph under the global lock.
+///
+/// The compile path mirrors `wire_network` + `rs_settle_wires` exactly —
+/// same BFS node set, same `with_connections` refresh staged off-world,
+/// same external signal as each node's source power, and the same
+/// `input -> pos` wire-only edges — so the solver's converged powers are
+/// identical to the BTreeMap settle it replaces.
+fn live_wire_settle<W: RedstoneBlockWorld>(
+    adapter: &mut RedstoneWorldAdapter<'_, W>,
+    dim: DimId,
+    inspect: &RsBTreeSet<RsPos>,
+    slot: &mut Option<LiveWireNetlist>,
+) -> RsBTreeSet<RsPos> {
+    use megu_core::redstone_eda::{RedstoneWireSolver, WireLink, WireNode, WirePos};
+
+    if let Some(cached) = slot.as_mut() {
+        if wire_netlist_cover(dim, inspect, &cached.network) == cached.cover {
+            let result = cached.solver.solve();
+            for update in result.updates {
+                let pos = RsPos(update.position.x, update.position.y, update.position.z);
+                if let RsBlock::Wire(wire) = adapter.redstone_block(pos) {
+                    if wire.power != update.new_power {
+                        adapter.set_component(
+                            pos,
+                            RsBlock::Wire(RedStoneWireBlock {
+                                power: update.new_power,
+                                ..wire
+                            }),
+                        );
+                    }
+                }
+            }
+            return cached.network.clone();
+        }
+    }
+
+    // Compile: the same node set the canonical settle BFS would visit.
+    let network = adapter.wire_network(inspect);
+    let mut index: BTreeMap<RsPos, usize> = BTreeMap::new();
+    let mut nodes: Vec<WireNode> = Vec::with_capacity(network.len());
+    let mut staged: Vec<(RsPos, RedStoneWireBlock, RedStoneWireBlock)> =
+        Vec::with_capacity(network.len());
+    let mut inputs: Vec<Vec<RsPos>> = Vec::with_capacity(network.len());
+    for &pos in &network {
+        let RsBlock::Wire(wire) = adapter.redstone_block(pos) else {
+            continue;
+        };
+        // `rs_settle_wires` stages shape refreshes off-world until the
+        // final write, so every neighbour read during discovery sees the
+        // same pre-pass state the canonical settle does.
+        let updated = wire.with_connections(adapter, pos);
+        index.insert(pos, nodes.len());
+        nodes.push(WireNode {
+            position: WirePos {
+                x: pos.0,
+                y: pos.1,
+                z: pos.2,
+            },
+            power: wire.power,
+            source_power: Some(rs_neighbor_signal(adapter, pos, false)),
+            links: Vec::new(),
+        });
+        // Only wire inputs conduct through links; non-wire sources feed
+        // the wire through `source_power` (the `rs_neighbor_signal`
+        // floor), exactly matching the downstream edges `rs_settle_wires`
+        // builds.
+        inputs.push(
+            rs_wire_inputs(adapter, pos)
+                .filter(|&input| matches!(adapter.redstone_block(input), RsBlock::Wire(_)))
+                .collect(),
+        );
+        staged.push((pos, wire, updated));
+    }
+    for (to, ins) in inputs.iter().enumerate() {
+        for &input in ins {
+            if let Some(&from) = index.get(&input) {
+                nodes[from].links.push(WireLink { to });
+            }
+        }
+    }
+    let mut solver = RedstoneWireSolver::new(nodes);
+    solver.solve();
+    for (i, (pos, wire, mut updated)) in staged.into_iter().enumerate() {
+        updated.power = solver.nodes()[i].power;
+        if updated != wire {
+            adapter.set_component(pos, RsBlock::Wire(updated));
+        }
+    }
+    let cover = wire_netlist_cover(dim, inspect, &network);
+    *slot = Some(LiveWireNetlist {
+        cover,
+        network: network.clone(),
+        solver,
+    });
+    network
 }
 
 fn live_redstone() -> &'static LockedMap<DimId, LiveRedstoneState> {
@@ -12496,6 +12747,13 @@ fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u3
     if old == new {
         return;
     }
+    // The netlist cover keys on `bump_block_local` (edited section only):
+    // the dilated cover already spans every section a topology edit can
+    // reach, so border propagation is unnecessary per write.
+    shared_section_revs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bump_block_local(megu_core::coords::DimIndex(dim.raw()), x, y, z);
     let Some(reg) = breg() else { return };
     if reg.block_id_of(old) != reg.block_id_of(new) {
         if let Some(state) = live_redstone()
@@ -12538,6 +12796,7 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
         let mut dimensions = live_redstone().lock().unwrap_or_else(|e| e.into_inner());
         let state = dimensions.entry(dim).or_default();
         let mut torches = std::mem::take(&mut state.torches);
+        let mut netlist = state.netlist.take();
         let now = TICK_IDX.load(Ordering::Relaxed);
         let mut world = LiveRedstoneWorld {
             dim,
@@ -12583,8 +12842,19 @@ fn run_redstone_pass(dim: DimId, origin: RsPos, scheduled: Option<u32>) {
             // observer through the shared pending-tick scheduler.
             rs_notify_block_update(&mut adapter, origin);
         }
-        adapter.propagate(&[origin]);
+        // `propagate`'s two halves, split so the dust settle can reuse the
+        // section-rev-keyed netlist cache: unchanged ticks run only the
+        // O(V+E) solve; the device-eval tail is identical to `propagate`.
+        let mut inspect = RsBTreeSet::new();
+        rs_extend_neighborhood(&mut inspect, [origin]);
+        let network = live_wire_settle(&mut adapter, dim, &inspect, &mut netlist);
+        rs_extend_neighborhood(&mut inspect, network);
+        for pos in inspect {
+            let block = adapter.redstone_block(pos);
+            rs_update_device(&mut adapter, pos, block);
+        }
         world.state.torches = torches;
+        world.state.netlist = netlist;
         (world.writes, world.dispensers)
     };
     for (RsPos(x, y, z), state) in writes {
@@ -21465,23 +21735,27 @@ fn write_server_fatal_crash_report(panic_msg: &str) {
 }
 
 fn main() {
+    // `MEGU_STARTUP_PROFILE=1` prints one `[startup]` line per stage to stderr
+    // (src/startup_bench.rs); unarmed it costs one `OnceLock` read per mark.
+    let mut boot_prof = StartupProfiler::new();
     // Startup flags first, before anything reads the world, the config or a
     // socket: `--help`/`--version` return inside the parser, `--dir` relocates
     // before `server.toml`/`eula.txt`/the world are resolved.
     let rest = parse_startup_flags();
+    boot_prof.mark("cli-flags");
     // `server.toml` first, while the process is single-threaded: its `[server]` keys are
     // exported as the `MEGU_*` variables everything below already reads.
     // Tool modes (probe arguments, worldgen dumps) never touch it — and neither do
     // the EULA gate nor the banner, which belong to the real boot alone.
-    if rest.is_empty()
+    let real_boot = rest.is_empty()
         && std::env::var_os("MEGU_WG_DUMP").is_none()
-        && std::env::var_os("MEGU_WG_PROFILE").is_none()
-    {
+        && std::env::var_os("MEGU_WG_PROFILE").is_none();
+    if real_boot {
         eula_direct_launch_check();
         megu_startup_banner();
         let doc = server_config_boot();
         ac_install(AcConfig::from_doc(&doc, |name| std::env::var(name).ok()));
-        refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
+        boot_prof.mark("server-config");
     }
     // Live mod suite (mod-suite feature): scans MEGU_MODS_DIR and arms the
     // operator mod-sync/progression files. Inert unless the feature is built
@@ -22449,6 +22723,88 @@ fn main() {
         }
         return;
     }
+    // ---- cold-start fast path --------------------------------------------
+    // Everything past this line is a live server boot: every tool/dump/probe
+    // mode above has already returned. The game listener therefore binds
+    // *before* the seed/worldgen/save datapack work, so exec->`listening`
+    // stays in the low milliseconds instead of paying the full world load.
+    // Two invariants keep that safe:
+    //   * every check that gates whether the port may be bound at all —
+    //     `check_bind` and `offline_public_bind_check` — still runs ahead of
+    //     `bind`, so a refused configuration exits exactly as before;
+    //   * the accept loop below only runs after the full sequential init, so
+    //     a client that connects at t=2ms parks in the kernel backlog and can
+    //     never observe a half-loaded world.
+    // Fail before any state is loaded or listener opened.
+    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+    if let Err(why) = connection_limits::check_bind(
+        "game listener",
+        &bind,
+        connection_limits::public_bind_allowed(),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
+    // A public bind without an identity layer fails closed too: offline mode
+    // trusts the claimed name for every privilege check, so a reachable
+    // listener must run online-mode or Velocity forwarding — or carry the
+    // operator's explicit insecure-override.
+    if let Err(why) = offline_public_bind_check(
+        &bind,
+        online_mode_enabled(),
+        velocity_forwarding_enabled(),
+        env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
+    ) {
+        eprintln!("[security] {why}");
+        std::process::exit(2);
+    }
+    let port: u16 = std::env::var("MEGU_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_LISTEN_PORT);
+    let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
+    boot_prof.mark("tcp-bind");
+    // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
+    // armed on the port the listener actually owns.
+    start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
+    // The GS4 query responder follows the same rule: it is armed only once
+    // the game listener owns its port, and only when opted into.
+    start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
+    let identity_mode = if velocity_forwarding_enabled() {
+        "Velocity-forwarded identities"
+    } else if online_mode_enabled() {
+        "Mojang-authenticated online identities"
+    } else {
+        "offline identities; no Mojang authentication"
+    };
+    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
+    boot_prof.mark("listening");
+    // systemd `Type=notify`: READY=1 once the game listener owns its port —
+    // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
+    megu_server_files::sd_notify::notify_ready();
+    // ---- deferred init: nothing below is needed to own the port ----------
+    // The block registry parses ~3 MB of generated JSON/fact tables on its
+    // first `breg()` call; running that beside the seed/save load below keeps
+    // the parse out of whichever stage would otherwise pay it serially.
+    // `breg()`'s `OnceLock` keeps it a single load — the first caller that
+    // needs the registry simply blocks until this thread finishes.
+    thread::spawn(|| {
+        let t = Instant::now();
+        let _ = block_registry::breg();
+        startup_profile_parallel("block-registry", t.elapsed());
+    });
+    // The RSA-1024 keypair serves the whole process lifetime but is pure CPU
+    // work: overlap it with the world/save load too. The join below stays
+    // ahead of the accept loop, so no login can ever observe a missing
+    // provider — online mode still fails closed if keygen fails.
+    let online_auth = online_mode_enabled().then(|| thread::spawn(RsaOnlineAuth::new));
+    // The anti-xray hidden-tag scan (datapack tag walk + the registry the warm
+    // thread above is already parsing) is only consulted by the chunk encoder,
+    // which cannot run before the accept loop anyway.
+    if real_boot {
+        refresh_hidden_tags_from_datapacks(std::path::Path::new(DATAPACK_DIRECTORY));
+        boot_prof.mark("hidden-tags");
+    }
     // datapack worldgen uses the saved seed by default. An explicit environment seed may only
     // select a new world's seed or confirm the existing one.
     let requested_seed = std::env::var("MEGU_SEED").ok().map(|v| {
@@ -22469,6 +22825,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    boot_prof.mark("seed-resolve");
     if std::env::var("MEGU_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
             // The Nether and the End are generated by the same seed with their own noise
@@ -22500,6 +22857,7 @@ fn main() {
     }
     WORLD_SEED.store(wg_seed, Ordering::Relaxed);
     world_rng::seed(wg_seed);
+    boot_prof.mark("worldgen-init");
 
     // A corrupt protected save must stop startup rather than silently
     // continuing with a world that failed validation.
@@ -22508,6 +22866,7 @@ fn main() {
         eprintln!("[spine] refusing corrupt world save: {error} (original file preserved)");
         std::process::exit(1);
     }
+    boot_prof.mark("save-load");
     // A configured live Anvil directory imports after the overlay save so its
     // chunks win where both stores name the same position.
     live_anvil_load_if_armed();
@@ -22515,6 +22874,7 @@ fn main() {
     // last so the newest recorded write wins, then arm the journal for live
     // edits. A no-op unless the variable names a valid path.
     dwal_boot_recover_and_arm();
+    boot_prof.mark("save-extras");
     // The initial-spawn decision happens after the save loads so a recorded
     // `setworldspawn` always wins; only a world with nothing recorded (or an
     // explicit MEGU_SAFE_SPAWN=1) takes the dry-ground search.
@@ -22524,50 +22884,38 @@ fn main() {
         *spawn = (x, y, z, spawn.3);
         eprintln!("[spine] safe world spawn at {x:.1} {y:.1} {z:.1}");
     }
+    boot_prof.mark("spawn-search");
     if let Err(error) = landing::initialize() {
         eprintln!("[mod-compatibility] {error}");
         std::process::exit(1);
     }
-    // Fail before any state is loaded or listener opened.
-    let bind = std::env::var("MEGU_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-    if let Err(why) = connection_limits::check_bind(
-        "game listener",
-        &bind,
-        connection_limits::public_bind_allowed(),
-    ) {
-        eprintln!("[security] {why}");
-        std::process::exit(2);
-    }
-    if online_mode_enabled() {
+    boot_prof.mark("landing");
+    if let Some(keygen) = online_auth {
         // One RSA keypair serves the process lifetime, before accepting any
-        // connection whose identity must be verified by Mojang.
-        let provider = RsaOnlineAuth::new().unwrap_or_else(|error| {
-            eprintln!("[security] {error}");
-            std::process::exit(2);
-        });
+        // connection whose identity must be verified by Mojang. The keygen was
+        // overlapped with the world load above; this join stays ahead of the
+        // accept loop, so no login can observe a missing provider.
+        let provider = keygen
+            .join()
+            .unwrap_or_else(|_| Err("online-mode RSA keygen thread panicked".to_string()))
+            .unwrap_or_else(|error| {
+                eprintln!("[security] {error}");
+                std::process::exit(2);
+            });
         set_online_auth_provider(Some(Arc::new(provider)));
-    }
-    // A public bind without an identity layer fails closed too: offline mode
-    // trusts the claimed name for every privilege check, so a reachable
-    // listener must run online-mode or Velocity forwarding — or carry the
-    // operator's explicit insecure-override.
-    if let Err(why) = offline_public_bind_check(
-        &bind,
-        online_mode_enabled(),
-        velocity_forwarding_enabled(),
-        env_flag("MEGU_ALLOW_INSECURE_OFFLINE_PUBLIC"),
-    ) {
-        eprintln!("[security] {why}");
-        std::process::exit(2);
+        boot_prof.mark("online-auth");
     }
     if let Err(error) = load_operators(std::path::Path::new(OPS_FILE)) {
         eprintln!("[spine] could not load {OPS_FILE}: {error}");
     }
+    boot_prof.mark("operators");
     if let Err(error) = reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, true) {
         eprintln!("[spine] {error}");
     }
+    boot_prof.mark("datapacks");
     std::thread::spawn(rcon_listener);
     http_server();
+    boot_prof.mark("side-listeners");
     // Opt-in debug seeding of a few mobs near spawn (only if none restored
     // from save). Vanilla spawns nothing at startup; a live natural spawner
     // populates the area instead. `MEGU_DEBUG_SEED_MOBS=1` (the issue-#88
@@ -22669,28 +23017,7 @@ fn main() {
             });
         });
     }
-    let port: u16 = std::env::var("MEGU_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_LISTEN_PORT);
-    let l = TcpListener::bind((bind.as_str(), port)).expect("game listener bind failed");
-    // Vanilla's "Open to LAN" multicast advertisement — opt-in, and only ever
-    // armed on the port the listener actually owns.
-    start_lan_announcer(l.local_addr().map(|a| a.port()).unwrap_or(port));
-    // The GS4 query responder follows the same rule: it is armed only once
-    // the game listener owns its port, and only when opted into.
-    start_gs4_query(&bind, l.local_addr().map(|a| a.port()).unwrap_or(port));
-    let identity_mode = if velocity_forwarding_enabled() {
-        "Velocity-forwarded identities"
-    } else if online_mode_enabled() {
-        "Mojang-authenticated online identities"
-    } else {
-        "offline identities; no Mojang authentication"
-    };
-    eprintln!("megu v0.6 listening {bind}:{port} ({identity_mode})");
-    // systemd `Type=notify`: READY=1 once the game listener owns its port —
-    // a 0-cost no-op when `$NOTIFY_SOCKET` is absent (non-systemd hosts).
-    megu_server_files::sd_notify::notify_ready();
+    boot_prof.mark("service-threads");
     let startup_summary = operator_status_summary();
     if resolved_console_mode() == ServerConsoleMode::PlainCli {
         println!("{startup_summary}");
@@ -22699,6 +23026,7 @@ fn main() {
     if !connection_limits::is_loopback_bind(&bind) {
         eprintln!("[security] non-loopback bind (MEGU_ALLOW_PUBLIC_BIND set): restrict access with a firewall/private network");
     }
+    boot_prof.mark("ready");
     static ACTIVE: AtomicUsize = AtomicUsize::new(0);
     for s in l.incoming().flatten() {
         // connection cap: refuse above 64 live handler threads

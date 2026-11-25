@@ -2254,6 +2254,17 @@ fn player_info_add(c: &Client) -> Vec<u8> {
     write_varint(&mut p, 0); // latency
     p
 }
+
+/// S2C `ClientboundPlayerInfoRemovePacket` (`0x3d`): a VarInt count followed
+/// by the UUIDs whose tab-list entries are removed.
+fn player_info_remove_pkt(uuids: &[[u8; 16]]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(5 + uuids.len() * 16);
+    write_varint(&mut p, uuids.len() as i64);
+    for uuid in uuids {
+        p.extend_from_slice(uuid);
+    }
+    p
+}
 fn spawn_player(c: &Client) -> Vec<u8> {
     let (x, y, z, yaw, pitch, _g) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
     let mut p = Vec::new();
@@ -5680,6 +5691,51 @@ impl ChunkWindow {
     }
 }
 
+/// Explicit bound for a connection's `sent` chunk set: the bounding box of
+/// one full window at `radius` (the delivery scan extends one chunk past the
+/// nominal radius, so the side is `2*radius + 3`). The `leaving` prune in
+/// `stream_chunks` keeps the set exactly at the window on every call; this
+/// bound is the invariant a future insert path must also respect.
+fn sent_chunks_bound(radius: i32) -> usize {
+    let side = (2 * radius.max(0) + 3) as usize;
+    side * side
+}
+
+#[cfg(test)]
+mod sent_chunks_bound_tests {
+    use super::*;
+
+    #[test]
+    fn sent_chunk_set_is_explicitly_bounded_by_the_window() {
+        // The bounding-box side extends one chunk past the nominal radius.
+        assert_eq!(sent_chunks_bound(0), 9);
+        assert_eq!(sent_chunks_bound(2), 49);
+        assert_eq!(sent_chunks_bound(32), 67 * 67);
+        // A set flooded far past the window prunes back to the bound: first
+        // the exact `leaving` pass the stream runs, then the explicit
+        // retain invariant — the result never exceeds one bounding box.
+        let window = ChunkWindow {
+            center: (0, 0),
+            radius: 2,
+        };
+        let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for x in -60..60 {
+            for z in -60..60 {
+                sent.insert((x, z));
+            }
+        }
+        assert!(sent.len() > sent_chunks_bound(window.radius));
+        for c in window.leaving(None, &sent) {
+            sent.remove(&c);
+        }
+        if sent.len() > sent_chunks_bound(window.radius) {
+            sent.retain(|&c| window.contains(c));
+        }
+        assert!(sent.len() <= sent_chunks_bound(window.radius));
+        assert!(sent.iter().all(|&c| window.contains(c)));
+    }
+}
+
 /// The login path sends only the spawn chunk and its immediate ring before the
 /// teleport handshake. The configured view distance is filled by the ordinary
 /// chunk delivery loop after the player is registered.
@@ -6484,6 +6540,13 @@ fn stream_chunks(
         }
         sent.remove(&c);
         gen.remove(&c);
+    }
+    // Defense-in-depth bound: `sent` may never hold more than one window
+    // bounding box. The prune above already enforces it exactly; this retain
+    // is the explicit invariant against any path that could insert outside
+    // the window without pruning.
+    if sent.len() > sent_chunks_bound(window.radius) {
+        sent.retain(|&c| window.contains(c));
     }
     // The centre update is not part of a batch, but it is the answer a view
     // request waits for even when nothing new is to be sent.
@@ -8304,6 +8367,23 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
     Some((ndim, nx.floor() as i32, ny.floor() as i32, nz.floor() as i32))
 }
 
+/// `ClientboundGameEventPacket.WIN_GAME` (event id 4): param 1.0 rolls the
+/// credits on the player's first exit from the End, 0.0 on every later one.
+/// Vanilla stores the flag as `seenCredits`/`wonGame` on the player; this port
+/// keys it on the session eid, same shape as the gateway cooldown map.
+fn send_win_game_event(me: &Client) {
+    static END_WINS: Registry<i32, ()> = OnceLock::new();
+    let first = END_WINS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(me.eid, ())
+        .is_none();
+    let mut ge = vec![4u8];
+    ge.extend_from_slice(&(if first { 1.0f32 } else { 0.0f32 }).to_be_bytes());
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
+}
+
 /// Complete one portal trip. `st` is the block the player stood in, which decides whether
 /// this is an Overworld<->Nether trip (1:8 horizontal scaling) or an End trip.
 #[allow(clippy::too_many_arguments)]
@@ -8324,22 +8404,16 @@ fn enter_portal(
     let (lx, ly, lz) = *me.lastp.lock().unwrap_or_else(|e| e.into_inner());
     let entry_vel = [px - lx, py - ly, pz - lz];
     let (target_dim, landing) = if is_end_portal_state(st) {
-        if dim == DimId::Overworld {
+        if dim != DimId::End {
+            // `EndPortalBlock.getPortalDestination`: every dimension that is
+            // not the End — Overworld *and* Nether — enters the End. The old
+            // `== Overworld` arm routed a Nether entry back to spawn.
             materialize_end_spawn();
-            // Void-proof arrival: the entry velocity is clamped onto the
-            // 5x5 obsidian platform so a fast entry can never carry the
-            // player off the edge into the Void.
-            let plan = megu_server_files::custom_portal::compute_safe_gravity_flip_landing(
-                entry_vel,
-                [100.5, 49.0, 0.5],
-                2.5,
-                true,
-            );
-            let landing = (
-                plan.landing_pos[0],
-                plan.landing_pos[1],
-                plan.landing_pos[2],
-            );
+            // The fixed arrival on the materialised platform: (100.5, 49.0,
+            // 0.5) is the spawn point `resolve_portal_destination` pins — a
+            // fast entry cannot carry the player off the edge into the Void,
+            // and `switch_client_dimension` re-bases `fall_from` here.
+            let landing = (100.5, 49.0, 0.5);
             switch_client_dimension(
                 me,
                 DimId::End,
@@ -8357,6 +8431,9 @@ fn enter_portal(
                 (sdim, pos.0, pos.1, pos.2)
             };
             switch_client_dimension(me, sdim, (sx, sy, sz, yaw, pitch), view);
+            // Leaving the End through the portal triggers vanilla's WIN_GAME:
+            // 1.0 rolls the credits the first time, 0.0 on later exits.
+            send_win_game_event(me);
             (sdim, (sx, sy, sz))
         }
     } else {
@@ -11048,16 +11125,22 @@ fn forget_per_eid_state(eid: i32) {
 struct ConnectionCleanupGuard {
     client: Option<Arc<Client>>,
     peer: String,
+    login: Option<connection_limits::LoginGuard>,
 }
 
 impl ConnectionCleanupGuard {
     /// Arm the guard the moment the client joins the online list: from then on
     /// the end of the handler's scope — clean exit or panic unwind alike —
     /// runs `disconnect_cleanup` exactly once.
-    fn new(client: Arc<Client>, peer: &str) -> Self {
+    fn new(
+        client: Arc<Client>,
+        peer: &str,
+        login: connection_limits::LoginGuard,
+    ) -> Self {
         Self {
             client: Some(client),
             peer: peer.to_owned(),
+            login: Some(login),
         }
     }
 }
@@ -11073,11 +11156,12 @@ impl std::ops::Drop for ConnectionCleanupGuard {
             // residual sweep in `handle` cover anything it could not finish.
             let peer = self.peer.clone();
             let cleanup_client = Arc::clone(&client);
+            let login = &mut self.login;
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                disconnect_cleanup(&cleanup_client, &peer);
+                disconnect_cleanup_with_login(&cleanup_client, &peer, login);
             }));
         } else {
-            disconnect_cleanup(&client, &self.peer);
+            disconnect_cleanup_with_login(&client, &self.peer, &mut self.login);
         }
         client.close_play_writer();
     }
@@ -11228,7 +11312,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // Held until this function returns, i.e. through the player's save on
     // logout: a second session under the same identity cannot start from stale
     // saved state or write over this one.
-    let _login = match LOGINS.reserve(&name, uuid) {
+    let login = match LOGINS.reserve(&name, uuid) {
         Ok(g) => g,
         Err(why) => {
             eprintln!("[security] duplicate login refused for {name} from {peer}: {why:?}");
@@ -11690,7 +11774,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
     // runs the whole disconnect teardown when this function's scope ends —
     // a clean `'conn` break and a panic unwind take the same path. `handle`'s
     // `forget_live_client` then sweeps anything a mid-unwind teardown missed.
-    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer);
+    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer, login);
     // An operator change can happen during the initial chunk stream, before
     // the client is present in the online list used by /op and /reload.
     if login_admin != client_is_admin(&me) {
@@ -16330,7 +16414,30 @@ mod play_protocol_opt_s2_tests {
 /// broadcasts. Runs exactly once per connection through
 /// `ConnectionCleanupGuard`; `forget_live_client` covers the residual client
 /// list/maps when a panic interrupted it partway.
+#[cfg(test)]
 fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
+    disconnect_cleanup_with_login(me_cleanup, peer, &mut None);
+}
+
+fn disconnect_cleanup_with_login(
+    me_cleanup: &Arc<Client>,
+    peer: &str,
+    login: &mut Option<connection_limits::LoginGuard>,
+) {
+    // EOF ends the live session immediately. Do this before item, menu and
+    // persistence work so status/login admission stops counting a dead socket.
+    let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
+    cls.retain(|c| c.eid != me_cleanup.eid);
+    let last_client_left = cls.is_empty();
+    drop(cls);
+    // The sent-chunk set is only meaningful while the connection is live:
+    // drop it explicitly so a lingering `Client` Arc in a reader's snapshot
+    // cannot retain the bounding-box of chunk keys past disconnect.
+    me_cleanup
+        .chunks
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     {
         eprintln!("[spine] {} left (from {})", me_cleanup.name, peer);
         {
@@ -16436,6 +16543,10 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&ender_container_key(&me_cleanup.uuid));
         }
+        // The player snapshot is now durable in memory/on disk. Let a fast
+        // reconnect load it while the remaining world and tracker cleanup runs.
+        // Keeping the reservation through the save prevents stale-state races.
+        drop(login.take());
         // vanilla `ServerPlayer.disconnect` -> `containerMenu.removed` -> stopOpen:
         // the leaving viewer stops counting before it leaves the client list. The window
         // is read into a local first: `if let Some(open) = *mutex.lock().unwrap_or_else(|e| e.into_inner())` holds
@@ -16456,10 +16567,6 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
                 java_compat::S1Event::PlayerLogout(me_cleanup.eid, me_cleanup.name.clone()),
             );
         }
-        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
-        cls.retain(|c| c.eid != me_cleanup.eid);
-        let last_client_left = cls.is_empty();
-        drop(cls);
         *me_cleanup.sleeping.lock().unwrap_or_else(|e| e.into_inner()) = None;
         forget_per_eid_state(me_cleanup.eid);
         // `Entity.remove` on the leaving player: they step out of any vehicle
@@ -16470,10 +16577,14 @@ fn disconnect_cleanup(me_cleanup: &Arc<Client>, peer: &str) {
         detach_tethers_involving(me_cleanup.eid, None);
         // vanilla culls the destroy to this entity's trackers
         broadcast_seen_destroy(me_cleanup.eid);
-        let mut p = Vec::new();
-        write_varint(&mut p, 1);
-        p.extend_from_slice(&me_cleanup.uuid);
-        broadcast_packet(me_cleanup.eid, 0x3d, &p);
+        let p = player_info_remove_pkt(&[me_cleanup.uuid]);
+        for viewer in client_snapshot() {
+            let _ = send_packet(
+                &mut viewer.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x3d,
+                p.clone(),
+            );
+        }
         // `PlayerList.remove` also drops the name from everyone's completion
         // set — the `custom_chat_completions` remove complement to the join add.
         let (_, gone_name) =
@@ -21925,6 +22036,273 @@ mod p5c_live_tests {
             );
             GR_MOB_SPAWNING.store(1, Ordering::Relaxed);
         }
+
+        /// Drains `peer` of every pending frame into `(id, body)` pairs.
+        /// Unlike `read_frame` it parses the whole buffered stream, so
+        /// coalesced packets are not dropped.
+        fn drain_packets(peer: &mut std::net::TcpStream) -> Vec<(i64, Vec<u8>)> {
+            use std::io::Read;
+            peer.set_read_timeout(Some(Duration::from_millis(250))).ok();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let mut quiet = 0u8;
+            while quiet < 3 {
+                match peer.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        raw.extend_from_slice(&chunk[..n]);
+                        quiet = 0;
+                    }
+                    Err(_) => quiet += 1,
+                }
+            }
+            let mut out = Vec::new();
+            let mut s = raw.as_slice();
+            while let Some(len) = read_varint(&mut s) {
+                if len < 0 || len as usize > s.len() {
+                    break;
+                }
+                let mut body = &s[..len as usize];
+                s = &s[len as usize..];
+                let Some(id) = read_varint(&mut body) else {
+                    break;
+                };
+                out.push((id, body.to_vec()));
+            }
+            out
+        }
+
+        /// The WIN_GAME (GameEvent id 4) parameters on the wire, in order.
+        fn win_game_events(peer: &mut std::net::TcpStream) -> Vec<f32> {
+            drain_packets(peer)
+                .iter()
+                .filter(|(id, body)| *id == 0x22 && body.len() == 5 && body[0] == 4)
+                .map(|(_, body)| f32::from_be_bytes(body[1..5].try_into().unwrap()))
+                .collect()
+        }
+
+        /// `EndPortalBlock.getPortalDestination`: an end portal entered from
+        /// the Nether still targets the End — the obsidian platform at
+        /// (100, 48, 0), arrival (100.5, 49.0, 0.5), `fall_from` re-based at
+        /// the landing so the trip carries no fall debt.
+        #[test]
+        fn vanilla_end_portal_nether_entry_lands_on_platform() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _rules = Rules::take(&[
+                "playersNetherPortalDefaultDelay",
+                "playersNetherPortalCreativeDelay",
+            ]);
+            _rules.set("playersNetherPortalDefaultDelay", 0);
+            let (me, _peer) = loopback_client("vanillaendportin", 0x7a10);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (0.5, 65.0, 0.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5);
+            let mut cells = DimCells::new();
+            cells.set(DimId::Nether, 0, 65, 0, END_PORTAL_STATE);
+            // Register the platform region for restore: materialise_end_spawn
+            // writes real End cells during the trip.
+            for dx in -2..=2 {
+                for dz in -2..=2 {
+                    for y in 48..=51 {
+                        let st = block_at_dim(DimId::End, 100 + dx, y, dz);
+                        cells.set(DimId::End, 100 + dx, y, dz, st);
+                    }
+                }
+            }
+            assert!(tick_portal(&me, 2), "a live end portal in the Nether warps");
+            assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::End);
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (p.0, p.1, p.2),
+                (100.5, 49.0, 0.5),
+                "platform arrival, got {p:?}"
+            );
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                49.0,
+                "fall_from re-bases at the platform"
+            );
+            assert_eq!(
+                block_at_dim(DimId::End, 100, 48, 0),
+                name_to_state("obsidian").unwrap(),
+                "the obsidian platform materialised"
+            );
+        }
+
+        /// The exit arm: an End-dweller returns to the respawn point (or world
+        /// spawn), `fall_from` re-bases at the arrival y, and the wire carries
+        /// `GameEvent` WIN_GAME — 1.0 on the first exit, 0.0 on later ones.
+        #[test]
+        fn vanilla_end_portal_exit_win_game_and_fall_reset() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let _rules = Rules::take(&[
+                "playersNetherPortalDefaultDelay",
+                "playersNetherPortalCreativeDelay",
+            ]);
+            _rules.set("playersNetherPortalDefaultDelay", 0);
+            let (me, mut peer) = loopback_client("vanillaendportout", 0x7a11);
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (5.5, 61.0, 5.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (5.5, 61.0, 5.5);
+            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((10.5, 66.0, -20.5, 0.0));
+            *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 300.0;
+            let mut cells = DimCells::new();
+            cells.set(DimId::End, 5, 61, 5, END_PORTAL_STATE);
+            assert!(tick_portal(&me, 2), "the exit portal warps");
+            assert_eq!(
+                *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                DimId::Overworld
+            );
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (p.0, p.1, p.2),
+                (10.5, 66.0, -20.5),
+                "respawn arrival, got {p:?}"
+            );
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                66.0,
+                "fall_from re-bases at the respawn y"
+            );
+            assert_eq!(
+                win_game_events(&mut peer),
+                vec![1.0],
+                "the first exit carries WIN_GAME param 1.0 — the credits roll"
+            );
+
+            // A second exit carries param 0.0 — no credits again.
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (5.5, 61.0, 5.5, 0.0, 0.0, true);
+            *me.lastp.lock().unwrap_or_else(|e| e.into_inner()) = (5.5, 61.0, 5.5);
+            *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+            *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            assert!(tick_portal(&me, 2), "the second exit warps");
+            assert_eq!(
+                win_game_events(&mut peer),
+                vec![0.0],
+                "later exits carry WIN_GAME param 0.0"
+            );
+        }
+
+        /// `end_top_solid` finds the column's top safe landing — a solid,
+        /// non-liquid block with two air cells above. A column with a real top
+        /// lands the exit at top+1 instead of the void pad; an `end_gateway`
+        /// beam cell disqualifies the floor below it and the pad takes the exit.
+        #[test]
+        fn vanilla_end_gateway_exit_lands_on_top_solid() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let mut cells = DimCells::new();
+            let end_stone = name_to_state("end_stone").unwrap();
+            // The column the (100,60,50) gateway's ray exits on, ~1024 out.
+            let len = (100.0f64 * 100.0 + 50.0f64 * 50.0).sqrt().max(1.0);
+            let ex = (100.0 / len * 1024.0).round() as i32;
+            let ez = (50.0 / len * 1024.0).round() as i32;
+            // Clear the whole column so generated islands cannot leak a top.
+            for y in DimId::End.min_y()..DimId::End.min_y() + DimId::End.height() {
+                cells.set(DimId::End, ex, y, ez, 0);
+            }
+            cells.set(DimId::End, ex, 70, ez, end_stone);
+            let (_, ey, _) = end_gateway_exit_pos((100, 60, 50));
+            assert_eq!(ey, 71.0, "the exit lands on the top solid, got {ey}");
+            // An end_gateway beam cell is not a landing: the floor below it
+            // loses its air-above cells and the void pad takes the exit.
+            cells.set(DimId::End, ex, 71, ez, 12514);
+            let (_, ey2, _) = end_gateway_exit_pos((100, 60, 50));
+            assert_eq!(ey2, 66.0, "a gateway cell is no floor — the pad takes it");
+            assert_eq!(
+                block_at_dim(DimId::End, ex, 65, ez),
+                end_stone,
+                "the pad materialised at y=65"
+            );
+        }
+
+        /// `ChorusFruitItem.finishUsingItem` live: eating the fruit in the End
+        /// teleports inside the dimension (never the Overworld `surface_y`),
+        /// re-bases `fall_from`, arms the 20-tick cooldown on the wire, and a
+        /// second eat inside the cooldown does nothing.
+        #[test]
+        fn vanilla_chorus_fruit_teleports_inside_the_end() {
+            crate::test_support::require_vanilla_data();
+            let _guard = world_guard();
+            let (me, mut peer) = loopback_client("vanillachorus1", 0x7a12);
+            let fruit = name_to_item("chorus_fruit").unwrap();
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (fruit, 1, Vec::new()));
+            *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::End;
+            *me.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+                (100.5, 62.0, 0.5, 0.0, 0.0, true);
+            *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 140.0;
+            // A 17x17 end_stone island at y=60 under the player: every +-8
+            // roll lands on it with feet at y=61.
+            let mut cells = DimCells::new();
+            let end_stone = name_to_state("end_stone").unwrap();
+            for x in 92..=108 {
+                for z in -8..=8 {
+                    cells.set(DimId::End, x, 60, z, end_stone);
+                    for y in 61..=72 {
+                        cells.set(DimId::End, x, y, z, 0);
+                    }
+                }
+            }
+            chorus_cd()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&me.eid);
+            air_use_item(&me, 0, 0, None, true);
+            let p = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(p.1, 61.0, "the roll stands on the island, got {p:?}");
+            assert!(
+                (p.0 - 100.5).abs() <= 8.5 && (p.2 - 0.5).abs() <= 8.5,
+                "the hop stays inside +-8 blocks, got {p:?}"
+            );
+            assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::End);
+            assert_eq!(
+                *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+                61.0,
+                "fall_from re-bases at the landing"
+            );
+            // The wire carries the 20-tick SetCooldown for the fruit.
+            let cooldown = drain_packets(&mut peer).iter().any(|(id, body)| {
+                if *id != 0x17 {
+                    return false;
+                }
+                let mut b = body.as_slice();
+                read_varint(&mut b) == Some(fruit) && read_varint(&mut b) == Some(20)
+            });
+            assert!(cooldown, "the 20-tick cooldown packet rides the wire");
+            // Inside the cooldown a second fruit does nothing.
+            me.inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(36, (fruit, 1, Vec::new()));
+            let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            air_use_item(&me, 0, 0, None, true);
+            let after = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                (before.0, before.1, before.2),
+                (after.0, after.1, after.2),
+                "a cooling-down fruit cannot teleport"
+            );
+            assert_eq!(
+                me.inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&36)
+                    .map(|s| s.1),
+                Some(1),
+                "the blocked eat keeps the fruit"
+            );
+        }
     }
 
     /// Lane WIRE-MINECUT-ORBITAL-SYNC (`mod-suite`): the opt-in MineAll /
@@ -23739,6 +24117,13 @@ mod security_hardening_tests {
         client.eid = 97001; // unique: parallel tests share the static tables
         let me = Arc::new(client);
         let eid = me.eid;
+        let login = LOGINS
+            .reserve(&me.name, me.uuid)
+            .expect("initial active login reserves its identity");
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_err(),
+            "an active live connection still rejects a duplicate login"
+        );
 
         clients()
             .lock()
@@ -23794,7 +24179,7 @@ mod security_hardening_tests {
         // The panic unwinds through the guard's Drop — exactly the leak the
         // audit found when a mid-loop panic skipped the teardown block.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ConnectionCleanupGuard::new(me.clone(), "127.0.0.1:test");
+            let _guard = ConnectionCleanupGuard::new(me.clone(), "127.0.0.1:test", login);
             panic!("simulated handler panic");
         }));
         assert!(result.is_err(), "the simulated panic reached the harness");
@@ -23890,6 +24275,60 @@ mod security_hardening_tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key("totem-test"),
             "disconnect saved the position snapshot"
+        );
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_ok(),
+            "disconnect releases the identity reservation after saving, allowing immediate reconnect"
+        );
+    }
+
+    #[test]
+    fn player_info_remove_packet_encodes_count_and_uuid_bytes() {
+        let uuids = [[0x11; 16], [0x22; 16]];
+        let packet = player_info_remove_pkt(&uuids);
+        let mut expected = vec![2];
+        expected.extend_from_slice(&uuids[0]);
+        expected.extend_from_slice(&uuids[1]);
+        assert_eq!(packet, expected, "0x3d is VarInt count followed by UUIDs");
+    }
+
+    #[test]
+    fn duplicate_login_is_rejected_while_live_and_allowed_after_disconnect_save() {
+        let _world = world_guard();
+        let (mut client, _peer) = effect_tests::client_pair();
+        client.eid = 97003;
+        client.name = "reconnect-after-save".to_owned();
+        client.uuid = [0x63; 16];
+        let me = Arc::new(client);
+        let login = LOGINS
+            .reserve(&me.name, me.uuid)
+            .expect("first connection reserves identity");
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_err(),
+            "a second active connection remains refused"
+        );
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(me.clone());
+
+        drop(ConnectionCleanupGuard::new(
+            me.clone(),
+            "127.0.0.1:reconnect-test",
+            login,
+        ));
+
+        assert!(
+            !clients()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|client| client.eid == me.eid),
+            "EOF cleanup unregisters the client before reconnect"
+        );
+        assert!(
+            LOGINS.reserve(&me.name, me.uuid).is_ok(),
+            "saved disconnect state allows an immediate reconnect"
         );
     }
 

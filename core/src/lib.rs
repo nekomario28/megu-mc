@@ -90,6 +90,8 @@
 //!   n > 0)` and every declared length larger than the remaining input, and
 //!   uses a fixed frame stack so hostile nesting cannot overflow the process
 //!   stack.
+//! * [`redstone_eda`] — deterministic bucket-queue propagation for compiled
+//!   redstone wire graphs, with per-component topology cache invalidation.
 //! * [`diff_engine`] — universal differential-computation primitives so
 //!   chunks, GPU buffers, entity state, inventories, and snapshots only
 //!   compute, store, and transmit the exact minimal delta `ΔS`: the
@@ -99,6 +101,9 @@
 //!   GPU/inventory arrays, the [`diff_engine::SubtileDiffMask`] 64-bit
 //!   `4³` sub-tile locality mask for `16³` voxel sections, and the
 //!   [`diff_engine::FieldDiffBitset`] zero-alloc 64-field dirty tracker.
+//! * [`crowd_physics`] — zero-dependency 3D micro-cell indexing, bounded
+//!   crowd push/sync/sleep policies, floor-support caching, and per-cell
+//!   render/pose budgets for dense entity groups.
 //! * [`math_opt_engine`] — four paper-backed, allocation-free mathematical
 //!   engines: a [`math_opt_engine::DiscountedUcbAutotuner`] Discounted-UCB
 //!   non-stationary bandit (Garivier & Moulines 2011) that detects kernel
@@ -177,13 +182,41 @@
 //!   section, its chunk aggregate and every border-adjacent neighbour
 //!   section, keyed by the [`coords`] types so no duplicate revision
 //!   scheme can drift out of sync.
+//! * [`zero_change_sim`] — zero-allocation simulation kernels that are
+//!   bit-exact drop-ins for the entity-heavy per-tick stages:
+//!   [`zero_change_sim::PathFinderScratch`] swaps the pathfinder's
+//!   per-call `BTreeMap`/`BTreeSet`/`BinaryHeap` for a
+//!   generation-stamped flat record table and a re-warmed heap while
+//!   preserving the exact `(f, h, position)` expansion order — plus a
+//!   *certified* straight-line fast path that only fires when it can
+//!   prove the A* result, with a [`zero_change_sim::LosCache`]
+//!   section-rev line-of-sight memo —
+//!   [`zero_change_sim::ReusableCellMerger`] runs the exact-order XP-orb
+//!   and dropped-item merges over pooled spatial cells with a
+//!   generation-stamped `eaten` bitset and a full-stack pre-filter, and
+//!   [`zero_change_sim::RestingEntitySleepState`] gives resting items,
+//!   orbs and lodged projectiles exact-tick sleep keyed on
+//!   `(block_pos, section_rev)`, waking on the precise tick a floor
+//!   breaks, fluid arrives or an impulse lands while age/despawn/pickup
+//!   ticks keep running untouched.
+//! * [`block_flags_lut`] — hot-loop lookup structures that replace
+//!   per-tick string comparisons with direct-indexed tables: a
+//!   [`block_flags_lut::BlockFlagsLut`] `state_id → u64` flag table (18
+//!   block flags plus packed 4-bit emission/opacity nibbles, so
+//!   `reg.name_of(state) == "minecraft:fire"` collapses to
+//!   `(flags & MASK) != 0`), and a
+//!   [`block_flags_lut::SectionBitTree4096`] 520-byte hierarchical bit
+//!   index that iterates a section's sparse predicates in ascending order
+//!   while skipping empty sections in O(1).
 
 #![deny(unsafe_code)]
 
 pub mod autostart_service;
 pub mod bits;
+pub mod block_flags_lut;
 pub mod coords;
 pub mod crash_report;
+pub mod crowd_physics;
 pub mod crypto;
 pub mod diff_engine;
 pub mod dye_and_items;
@@ -205,10 +238,12 @@ pub mod nbt_wire;
 pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
+pub mod redstone_eda;
 pub mod romaji_ime;
 pub mod self_updater;
 pub mod section_rev;
 pub mod server_perf_governors;
+pub mod sim_graph;
 pub mod simd_voxel;
 pub(crate) mod stats;
 pub mod sys_metrics;
@@ -216,4 +251,5 @@ pub mod task_pool;
 pub mod tier25_guard_batch;
 pub mod varint;
 pub mod version;
+pub mod zero_change_sim;
 pub mod zip_archive;

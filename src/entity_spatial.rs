@@ -1,6 +1,8 @@
 // M3 P5 Spatial Grid: Chunk-Cell Entity Spatial Grid Index (`EntitySpatialGrid`)
 // Eliminates O(N^2) neighborhood scans in `mob_tick` (`pushEntities` AABB overlap + breeding radius).
 
+use megu_core::coords::CoordMap;
+
 #[derive(Clone, Copy, Debug)]
 struct SpatialEntity {
     idx: usize,
@@ -43,12 +45,12 @@ impl SpatialScratch {
     }
 }
 
-type SpatialCellRanges = HashMap<(i32, i32), (u32, u32)>;
+type SpatialCellRanges = CoordMap<(i32, i32), (u32, u32)>;
 type ChunkViewDelta = (Vec<(i32, i32)>, Vec<(i32, i32)>);
 
 struct EntitySpatialGrid {
     entities: Vec<SpatialEntity>,
-    cells: HashMap<(i32, i32), (u32, u32)>,
+    cells: SpatialCellRanges,
     cell_entries: Vec<u32>,
 }
 
@@ -64,7 +66,7 @@ fn bound_spatial_vec<T>(v: &mut Vec<T>) {
     }
 }
 
-fn bound_spatial_cells(cells: &mut HashMap<(i32, i32), (u32, u32)>) {
+fn bound_spatial_cells(cells: &mut SpatialCellRanges) {
     let keep =
         SPATIAL_POOL_KEEP_BYTES / std::mem::size_of::<((i32, i32), (u32, u32))>().max(1);
     if cells.capacity() > keep {
@@ -78,7 +80,7 @@ fn bound_spatial_cells(cells: &mut HashMap<(i32, i32), (u32, u32)>) {
 #[derive(Default)]
 struct SpatialPool {
     entities: Vec<SpatialEntity>,
-    cells: HashMap<(i32, i32), (u32, u32)>,
+    cells: SpatialCellRanges,
     cell_entries: Vec<u32>,
     query_scratch: SpatialScratch,
     query_out: Vec<u32>,
@@ -88,7 +90,7 @@ thread_local! {
     static SPATIAL_POOL: std::cell::RefCell<SpatialPool> =
         std::cell::RefCell::new(SpatialPool {
             entities: Vec::new(),
-            cells: HashMap::new(),
+            cells: CoordMap::default(),
             cell_entries: Vec::new(),
             query_scratch: SpatialScratch::default(),
             query_out: Vec::new(),
@@ -124,7 +126,7 @@ fn spatial_pool_take_entities() -> Vec<SpatialEntity> {
 /// capacity so a small grid never evicts a larger warmed buffer.
 fn spatial_pool_stash(
     mut entities: Vec<SpatialEntity>,
-    mut cells: HashMap<(i32, i32), (u32, u32)>,
+    mut cells: SpatialCellRanges,
     mut cell_entries: Vec<u32>,
 ) {
     entities.clear();
