@@ -537,6 +537,7 @@ mod entity_push_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            generic_kill_pending: AtomicBool::new(false),
             use_on_resend: Mutex::new(None),
         });
         (client, peer)

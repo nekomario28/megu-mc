@@ -9153,6 +9153,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                 } else if let Ok(eid) = t.parse::<i32>() {
                     let cls: Vec<Arc<Client>> = client_snapshot();
                     if let Some(c) = cls.iter().find(|c| c.eid == eid) {
+                        c.generic_kill_pending.store(true, Ordering::SeqCst);
                         *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
                         if let Ok(mut w) = c.sock.lock() { let _ = send_packet(&mut w, 0x5d, health_pkt_c(0.0, c)); }
                         killed += 1;

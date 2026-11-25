@@ -1455,6 +1455,7 @@ mod aeronautics_and_dim_bridge_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            generic_kill_pending: AtomicBool::new(false),
             use_on_resend: Mutex::new(None),
             pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
             xp: Mutex::new(0),

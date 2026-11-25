@@ -2514,7 +2514,9 @@ fn totem_check(c: &Client) {
     let kind = {
         let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
         let below = p.1 < f64::from(c.dim.lock().unwrap_or_else(|e| e.into_inner()).min_y());
-        if below {
+        if c.generic_kill_pending.load(Ordering::SeqCst) {
+            TotemDamageKind::Kill
+        } else if below {
             TotemDamageKind::Void
         } else {
             TotemDamageKind::Ordinary
@@ -4655,6 +4657,7 @@ fn reset_player_food(c: &Client) {
     *c.air.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(AIR_SUPPLY_GT) as i32;
     *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 0;
     *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    c.generic_kill_pending.store(false, Ordering::SeqCst);
     *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
     *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false;
     *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false;
@@ -6562,6 +6565,30 @@ mod vanilla_combat2_tests {
         }
         totem_check(&c);
         assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+    }
+
+    #[test]
+    fn vanilla_combat2_totem_check_generic_kill_bypasses_until_respawn_reset() {
+        let _guard = crate::world_guard();
+        let _g = LaneGuard::new();
+        let (c, _r) = client_pair();
+        let totem = name_to_item("totem_of_undying").unwrap();
+        c.inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(45, (totem, 1, Vec::new()));
+        c.generic_kill_pending.store(true, Ordering::SeqCst);
+        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        totem_check(&c);
+        totem_check(&c);
+        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        assert_eq!(
+            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            Some(&(totem, 1, Vec::new()))
+        );
+        assert!(c.generic_kill_pending.load(Ordering::SeqCst));
+        reset_player_food(&c);
+        assert!(!c.generic_kill_pending.load(Ordering::SeqCst));
     }
 
     #[test]

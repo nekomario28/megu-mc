@@ -1932,6 +1932,7 @@ struct Client {
     // Window-0/container stateId counter: every server-initiated full-content
     // resync bumps it so a stale client echo on 0x0e can be detected.
     inv_state_id: AtomicI32,
+    generic_kill_pending: AtomicBool,
     // `handleUseItemOn` resends `ClientboundBlockUpdatePacket` for the clicked
     // cell and `clicked + face` at the end of every use_on; the next queued
     // flush emits them so they carry post-write states like vanilla's tail.
@@ -11829,6 +11830,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
         underground_revealed: AtomicBool::new(!initial_occluded),
         sleeping: Mutex::new(None),
         inv_state_id: AtomicI32::new(0),
+        generic_kill_pending: AtomicBool::new(false),
         use_on_resend: Mutex::new(None),
     });
     // Published to the panic cleanup in `handle` before the client list sees
@@ -20497,6 +20499,7 @@ mod p5c_live_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            generic_kill_pending: AtomicBool::new(false),
             use_on_resend: Mutex::new(None),
         });
         (me, peer)
@@ -23246,6 +23249,7 @@ mod p8a_parity_protocol_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            generic_kill_pending: AtomicBool::new(false),
             use_on_resend: Mutex::new(None),
         });
         (me, peer)
@@ -23890,6 +23894,7 @@ mod parity_58_c2s_tests {
             underground_revealed: AtomicBool::new(false),
             sleeping: Mutex::new(None),
             inv_state_id: AtomicI32::new(0),
+            generic_kill_pending: AtomicBool::new(false),
             use_on_resend: Mutex::new(None),
         });
         (me, peer)
