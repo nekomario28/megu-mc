@@ -4,17 +4,18 @@
 This answers three questions a newcomer has before any test: what works with only the
 tracked tree, which prerequisite is missing and why, and which command to type next.
 It never builds, downloads, installs, starts a server or executes a binary it found
-in the tree: it reads source and files, and it runs exactly two probes
-(`rustup toolchain list`, `javac -version`) whose only effect is to print a version.
+in the tree: it reads source and files, and it runs read-only probes for installed
+toolchains, Java, and (when requested) Git worktree ownership.
 The timeout bounds wall time, not bytes: a probe's output is captured whole and only
 truncated when it is quoted into the report (`quote`).
 
-Why the probes are those two. Inside a repository with a `rust-toolchain.toml`,
+Why the toolchain probes are those two. Inside a repository with a `rust-toolchain.toml`,
 `cargo`/`rustc` are rustup proxies: invoking them can try to satisfy the pinned
 channel and its components over the network. So this script does not invoke them at
 all. `rustup toolchain list` only reads the installed toolchain directories, and
 `javac -version` compiles nothing. A pinned compiler that is not installed is
-therefore reported as MISSING by this script and *not* verified against the source.
+therefore reported as MISSING by this script and *not* verified against the source. The
+optional lane ownership check reads Git's worktree list and porcelain status only.
 
 Statuses
   OK          the check ran and the requirement holds
@@ -39,6 +40,7 @@ Every line states whether it executed something (`ran:`) or skipped it (`not run
 so a report is never mistaken for work that did not happen.
 
   python3 tools/dev_check.py [--timeout-ms N]     # run from anywhere
+  python3 tools/dev_check.py --lane-branch BRANCH  # fail closed if branch is attached
   MEGU_DEV_CHECK_TIMEOUT_MS=N                 # the same bound; non-integer exits 2
 """
 import argparse
@@ -509,6 +511,104 @@ def check_disk_headroom():
                                   "to make it block")
 
 
+def parse_worktree_porcelain(output):
+    """Return worktree records from `git worktree list --porcelain` output."""
+    records = []
+    current = {}
+    for line in output.splitlines() + [""]:
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            if "path" in current or not value:
+                raise ValueError("worktree record has a duplicate or empty path")
+            current["path"] = value
+        elif key in ("HEAD", "branch"):
+            if key in current or not value:
+                raise ValueError(f"worktree record has a duplicate or empty {key}")
+            current[key] = value
+        elif key in ("detached", "bare", "locked", "prunable"):
+            if key in current:
+                raise ValueError(f"worktree record has duplicate {key} field")
+            current[key] = value
+        else:
+            # Unknown fields may change ownership semantics; reject them rather than
+            # treating an incomplete parse as proof that a lane is free.
+            raise ValueError(f"unknown worktree field {key!r}")
+    if any("path" not in record or "HEAD" not in record for record in records):
+        raise ValueError("worktree record has no path or HEAD")
+    if any(not any(key in record for key in ("branch", "detached", "bare"))
+           for record in records):
+        raise ValueError("worktree record has no branch, detached, or bare marker")
+    if not records:
+        raise ValueError("worktree listing is empty")
+    return records
+
+
+def check_lane_ownership(branch, timeout_ms):
+    """Fail closed unless a requested lane branch is unattached and inspectable."""
+    git = shutil.which("git")
+    if git is None:
+        return Result("lane_ownership", ERROR, "cannot verify lane ownership",
+                      "not run: git is not on PATH", required=True,
+                      detail=f"lane branch {branch!r} is not allocated safely")
+    argv = [git, "worktree", "list", "--porcelain"]
+    code, output, elapsed, timed_out = run(argv, timeout_ms)
+    executed = ran(["git", "worktree", "list", "--porcelain"], code, elapsed, timed_out)
+    if timed_out or code != 0:
+        reason = "timed out" if timed_out else f"exit {code}: {quote(output)}"
+        return Result("lane_ownership", ERROR, "cannot verify lane ownership", executed,
+                      required=True, detail=f"{reason}; allocation blocked closed")
+    try:
+        records = parse_worktree_porcelain(output)
+    except ValueError as exc:
+        return Result("lane_ownership", ERROR, "ambiguous worktree listing", executed,
+                      required=True, detail=f"{exc}; allocation blocked closed")
+
+    by_branch = {}
+    for record in records:
+        if "branch" in record:
+            by_branch.setdefault(record["branch"], []).append(record["path"])
+    duplicate_branches = {ref: sorted(paths) for ref, paths in by_branch.items()
+                          if len(paths) > 1}
+    if duplicate_branches:
+        conflicts = "; ".join(
+            f"{ref}: {', '.join(paths)}"
+            for ref, paths in sorted(duplicate_branches.items()))
+        return Result("lane_ownership", ERROR, "duplicate branch attachments",
+                      executed, required=True,
+                      detail="allocation blocked closed; conflicting branches and paths: "
+                             + conflicts)
+
+    ref = branch if branch.startswith("refs/heads/") else f"refs/heads/{branch}"
+    owners = [record for record in records if record.get("branch") == ref]
+    if not owners:
+        return Result("lane_ownership", OK, f"{branch} is unattached", executed,
+                      required=True, detail="lane allocation is clear")
+
+    owner = owners[0]
+    status_argv = [git, "-C", owner["path"], "status", "--porcelain", "--untracked-files=normal"]
+    status_code, status_output, status_elapsed, status_timed_out = run(status_argv, timeout_ms)
+    status_executed = ran(["git", "status --porcelain"], status_code,
+                          status_elapsed, status_timed_out)
+    executed += "; " + status_executed
+    if status_timed_out or status_code != 0:
+        reason = "timed out" if status_timed_out else f"exit {status_code}: {quote(status_output)}"
+        return Result("lane_ownership", ERROR, f"ownership at {owner['path']} is unknown",
+                      executed, required=True,
+                      detail=f"{reason}; allocation blocked closed")
+    if status_output.strip():
+        return Result("lane_ownership", ERROR, f"{branch} has dirty ownership",
+                      executed, required=True,
+                      detail=f"conflicting path: {owner['path']}; allocation blocked closed")
+    return Result("lane_ownership", ERROR, f"{branch} is already attached",
+                  executed, required=True,
+                  detail=f"conflicting path: {owner['path']}; allocation blocked closed")
+
+
 # Which inspected checks each route depends on. A route is READY only when every one of
 # them is OK at this preflight's limited scope: a missing included file blocks the Rust
 # route even when the compiler is installed, and an unreadable javac version blocks the
@@ -598,6 +698,8 @@ def main(argv=None):
                     "them. Read-only: no build, download, install or server.")
     parser.add_argument("--timeout-ms", type=int, default=env_timeout,
                         help="bound for each probe command (default %(default)s)")
+    parser.add_argument("--lane-branch", metavar="BRANCH",
+                        help="check that a lane branch is unattached and safe to allocate")
     args = parser.parse_args(argv)
     if env_problem is not None:
         print(f"dev_check: MEGU_DEV_CHECK_TIMEOUT_MS must be an integer, got "
@@ -623,6 +725,8 @@ def main(argv=None):
             check_workspace(),
             check_disk_headroom(),
         ]
+        if args.lane_branch:
+            results.append(check_lane_ownership(args.lane_branch, timeout_ms))
     except Exception as exc:  # noqa: BLE001 - a preflight crash must not look like a report
         print(f"dev_check: internal error: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2

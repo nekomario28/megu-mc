@@ -60,6 +60,15 @@ NOOP_SHIM = """#!/bin/sh
 exit 0
 """
 
+GIT_SHIM = """#!/bin/sh
+case "$*" in
+  *"worktree list --porcelain"*) printf '%s\\n' "${FAKE_WORKTREES:-}" ;;
+  *"status --porcelain"*) printf '%s' "${FAKE_GIT_STATUS:-}" ;;
+  *) echo "unexpected git command: $*" >&2; exit 90 ;;
+esac
+exit "${FAKE_GIT_EXIT:-0}"
+"""
+
 
 class Fixture:
     """A synthetic megu-shaped tree plus the fake tools the probes will find."""
@@ -295,6 +304,60 @@ class DevCheckContract(unittest.TestCase):
         statuses = self.fixture.statuses(output)
         self.assertEqual(statuses["toolchain_pin"], "MISSING")
         self.assertIn("route rust build/test: NOT READY (toolchain_pin MISSING", output)
+
+    # ---- opt-in lane allocation guard: inspect only, fail closed ----------------------
+
+    def test_unattached_lane_branch_is_available(self):
+        self.fixture.write_shim("git", GIT_SHIM)
+        env = self.fixture.env(FAKE_WORKTREES=(
+            "worktree /checkout/current\nHEAD abc123\nbranch refs/heads/main\n"))
+        code, output = self.fixture.run("--lane-branch", "alpha04/lane", env=env)
+        self.assertEqual(code, 0, output)
+        self.assertEqual(self.fixture.statuses(output)["lane_ownership"], "OK")
+        self.assertIn("alpha04/lane is unattached", output)
+        self.assertIn("git worktree list --porcelain", output)
+
+    def test_attached_clean_or_dirty_lane_branch_blocks_and_names_path(self):
+        self.fixture.write_shim("git", GIT_SHIM)
+        env_base = {"FAKE_WORKTREES": (
+            "worktree /checkout/lane with spaces\nHEAD abc123\n"
+            "branch refs/heads/alpha04/lane\n")}
+        for dirty, status in ((False, ""), (True, " M tracked.txt\n")):
+            with self.subTest(dirty=dirty):
+                env = self.fixture.env(**{**env_base, "FAKE_GIT_STATUS": status})
+                code, output = self.fixture.run("--lane-branch", "alpha04/lane", env=env)
+                self.assertEqual(code, 1, output)
+                self.assertEqual(self.fixture.statuses(output)["lane_ownership"], "ERROR")
+                self.assertIn("/checkout/lane with spaces", output)
+                self.assertIn("dirty ownership" if dirty else "already attached", output)
+
+    def test_duplicate_branch_attachments_fail_closed_with_all_paths(self):
+        self.fixture.write_shim("git", GIT_SHIM)
+        env = self.fixture.env(FAKE_WORKTREES=(
+            "worktree /checkout/one\nHEAD abc123\nbranch refs/heads/alpha04/lane\n\n"
+            "worktree /checkout/two\nHEAD def456\nbranch refs/heads/alpha04/lane\n"))
+        code, output = self.fixture.run("--lane-branch", "alpha04/lane", env=env)
+        self.assertEqual(code, 1, output)
+        self.assertIn("duplicate branch attachments", output)
+        self.assertIn("refs/heads/alpha04/lane", output)
+        self.assertIn("/checkout/one", output)
+        self.assertIn("/checkout/two", output)
+
+    def test_unreadable_worktree_state_fails_closed(self):
+        self.fixture.write_shim("git", GIT_SHIM)
+        env = self.fixture.env(FAKE_GIT_EXIT="2")
+        code, output = self.fixture.run("--lane-branch", "alpha04/lane", env=env)
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.fixture.statuses(output)["lane_ownership"], "ERROR")
+        self.assertIn("allocation blocked closed", output)
+
+    def test_empty_worktree_listing_fails_closed(self):
+        self.fixture.write_shim("git", GIT_SHIM)
+        code, output = self.fixture.run("--lane-branch", "alpha04/lane",
+                                        env=self.fixture.env(FAKE_WORKTREES=""))
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.fixture.statuses(output)["lane_ownership"], "ERROR")
+        self.assertIn("worktree listing is empty", output)
 
     # ---- the JDK version must be parsed, not guessed ------------------------------------
 
