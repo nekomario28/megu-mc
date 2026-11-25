@@ -260,6 +260,8 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/worldgen.rs:TERRAIN_SHARES:std::sync::OnceLock<Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>>>': 1}
 UNWIRED_MODULE_BASELINE = {'core/search_index',
  'core/dep_graph',
+ 'core/dst_oracle',
+ 'core/mesh_elision',
  'core/dye_and_items',
  'core/geom',
  'core/os_desktop',
