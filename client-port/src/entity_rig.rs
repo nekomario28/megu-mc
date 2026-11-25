@@ -5,7 +5,7 @@
 //! centered horizontally. The 130 registered dimensions are collision sizes,
 //! not promises of exact Vanilla renderer model geometry.
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use crate::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad, MAX_UPGRADE_QUADS};
 
@@ -281,7 +281,14 @@ struct ModdedFamily {
 const MODDED_FAMILIES: &[ModdedFamily] = &[
     ModdedFamily {
         // Large winged quadruped: dragons, wyverns, drakes, griffins.
-        tokens: &["dragon", "wyvern", "drake", "griffin", "hippogriff", "manticore"],
+        tokens: &[
+            "dragon",
+            "wyvern",
+            "drake",
+            "griffin",
+            "hippogriff",
+            "manticore",
+        ],
         suffixes: &[],
         archetype: EntityRigArchetype::Avian,
         default_width: 2.4,
@@ -329,9 +336,8 @@ const MODDED_FAMILIES: &[ModdedFamily] = &[
     },
     ModdedFamily {
         tokens: &[
-            "golem", "knight", "wizard", "mage", "goblin", "orc", "elf", "bandit",
-            "guard", "villager", "zombie", "skeleton", "witch", "lich", "boss", "human",
-            "npc",
+            "golem", "knight", "wizard", "mage", "goblin", "orc", "elf", "bandit", "guard",
+            "villager", "zombie", "skeleton", "witch", "lich", "boss", "human", "npc",
         ],
         suffixes: &[],
         archetype: EntityRigArchetype::Biped,
@@ -340,8 +346,8 @@ const MODDED_FAMILIES: &[ModdedFamily] = &[
     },
     ModdedFamily {
         tokens: &[
-            "wolf", "fox", "bear", "deer", "boar", "lion", "tiger", "horse", "mount",
-            "hound", "beast",
+            "wolf", "fox", "bear", "deer", "boar", "lion", "tiger", "horse", "mount", "hound",
+            "beast",
         ],
         suffixes: &[],
         archetype: EntityRigArchetype::Quadruped,
@@ -350,7 +356,13 @@ const MODDED_FAMILIES: &[ModdedFamily] = &[
     },
     ModdedFamily {
         tokens: &[
-            "arrow", "bolt", "fireball", "orb", "spell", "projectile", "snowball",
+            "arrow",
+            "bolt",
+            "fireball",
+            "orb",
+            "spell",
+            "projectile",
+            "snowball",
             "bullet",
         ],
         suffixes: &[],
@@ -531,6 +543,105 @@ impl EntityPose {
     }
 }
 
+/// Extended optional pose state for the detailed vanilla rigs.
+///
+/// [`EntityPose`] intentionally remains the small stable payload consumed by
+/// existing renderers and cache keys. `EntityRigPose` layers less common
+/// entity-state bits on top without changing any existing entrypoint: callers
+/// that only know [`EntityPose`] get the same animation as before, while
+/// callers that track Vanilla metadata can opt into sitting/sleeping,
+/// spellcasting, armor/held-item attachments, and entity-specific shell or
+/// jaw states through [`build_entity_rig_mesh_with_pose`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntityRigPose {
+    /// Stable locomotion/head/hurt/baby state used by the original API.
+    pub base: EntityPose,
+    /// Legs fold forward and the torso settles downward (cats, wolves,
+    /// villagers in seats, and similar poses).
+    pub sitting: bool,
+    /// Body pitches into a recumbent pose and head motion is damped.
+    pub sleeping: bool,
+    /// Illager-style arms unfold for a spell/casting animation.
+    pub spellcasting: bool,
+    /// The entity is actively using an item (bow, crossbow, food, potion).
+    pub using_item: bool,
+    /// Emit simple armor-layer shells around supported humanoid bodies.
+    pub armor_visible: bool,
+    /// Attach a generic main-hand item using the transform below.
+    pub main_hand_item: bool,
+    /// Attach a generic off-hand item using the transform below.
+    pub offhand_item: bool,
+    /// Attach a carried block (notably endermen) at the hands.
+    pub carried_block: bool,
+    /// Wither armor shell toggle used below half health in Vanilla.
+    pub wither_armored: bool,
+    /// Armadillo rolled-ball pose toggle.
+    pub rolled_up: bool,
+    /// Enderman screaming/jaw-drop pose toggle.
+    pub screaming: bool,
+    /// Normalized opening amount for shulker lids, guardian spikes, jaws,
+    /// and similar shell/mouth mechanisms (`0..=1`).
+    pub open_amount: f32,
+    /// Normalized swelling/inflation amount for creepers and pufferfish
+    /// (`0..=1`).
+    pub swell_amount: f32,
+    /// Local translation applied to the generated main-hand item prism.
+    pub main_hand_offset: [f32; 3],
+    /// Local XYZ rotation in degrees applied to the main-hand item prism.
+    pub main_hand_rotation_deg: [f32; 3],
+    /// Local translation applied to the generated off-hand item prism.
+    pub offhand_offset: [f32; 3],
+    /// Local XYZ rotation in degrees applied to the off-hand item prism.
+    pub offhand_rotation_deg: [f32; 3],
+}
+
+impl Default for EntityRigPose {
+    fn default() -> Self {
+        Self::from(EntityPose::default())
+    }
+}
+
+impl From<EntityPose> for EntityRigPose {
+    fn from(base: EntityPose) -> Self {
+        Self {
+            base,
+            sitting: false,
+            sleeping: false,
+            spellcasting: false,
+            using_item: false,
+            armor_visible: false,
+            main_hand_item: false,
+            offhand_item: false,
+            carried_block: false,
+            wither_armored: false,
+            rolled_up: false,
+            screaming: false,
+            open_amount: 0.0,
+            swell_amount: 0.0,
+            main_hand_offset: [0.0; 3],
+            main_hand_rotation_deg: [0.0; 3],
+            offhand_offset: [0.0; 3],
+            offhand_rotation_deg: [0.0; 3],
+        }
+    }
+}
+
+impl EntityRigPose {
+    fn sanitized(self) -> Self {
+        let sanitize_vec = |values: [f32; 3]| values.map(finite_or_zero);
+        Self {
+            base: self.base.sanitized(),
+            open_amount: finite_or_zero(self.open_amount).clamp(0.0, 1.0),
+            swell_amount: finite_or_zero(self.swell_amount).clamp(0.0, 1.0),
+            main_hand_offset: sanitize_vec(self.main_hand_offset),
+            main_hand_rotation_deg: sanitize_vec(self.main_hand_rotation_deg),
+            offhand_offset: sanitize_vec(self.offhand_offset),
+            offhand_rotation_deg: sanitize_vec(self.offhand_rotation_deg),
+            ..self
+        }
+    }
+}
+
 /// Body-part binding for resolved CEM geometry and procedural articulation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntityRigPart {
@@ -626,10 +737,7 @@ const RIG_TINT_DEFAULT: i32 = i32::MIN;
 const MOUTH_ITEM_TINT_FLAG: i32 = 1 << 30;
 
 fn mouth_item_tint(rgb: [u8; 3]) -> i32 {
-    MOUTH_ITEM_TINT_FLAG
-        | (i32::from(rgb[0]) << 16)
-        | (i32::from(rgb[1]) << 8)
-        | i32::from(rgb[2])
+    MOUTH_ITEM_TINT_FLAG | (i32::from(rgb[0]) << 16) | (i32::from(rgb[1]) << 8) | i32::from(rgb[2])
 }
 
 #[derive(Clone, Copy)]
@@ -663,29 +771,35 @@ impl From<&CemBox> for RigBox {
     }
 }
 
-fn articulation(part: EntityRigPart, pose: EntityPose) -> [f32; 3] {
+fn articulation(part: EntityRigPart, pose: EntityRigPose) -> [f32; 3] {
     use EntityRigPart::*;
-    let stride = pose.limb_swing.cos() * pose.limb_swing_amount * 0.8;
-    let attack = (pose.swing_progress * PI).sin() * 1.2;
-    let flight = if pose.elytra_flying {
+    let base = pose.base;
+    let stride = base.limb_swing.cos() * base.limb_swing_amount * 0.8;
+    let attack = (base.swing_progress * PI).sin() * 1.2;
+    let flight = if base.elytra_flying {
         -1.15
-    } else if pose.swimming {
+    } else if base.swimming {
         -0.75
     } else {
         0.0
     };
-    let crouch = if pose.sneaking { 0.32 } else { 0.0 };
-    let flap = (pose.age_ticks * 0.7 + pose.limb_swing).sin() * 0.5;
-    let tail = (pose.age_ticks * 0.35 + pose.limb_swing).sin() * 0.35;
+    let crouch = if base.sneaking { 0.32 } else { 0.0 };
+    let flap = (base.age_ticks * 0.7 + base.limb_swing).sin() * 0.5;
+    let tail = (base.age_ticks * 0.35 + base.limb_swing).sin() * 0.35;
+    let sitting = if pose.sitting { 1.0 } else { 0.0 };
+    let sleeping = if pose.sleeping { 1.0 } else { 0.0 };
+    let head_scale = if pose.sleeping { 0.35 } else { 1.0 };
     match part {
         Head => [
-            pose.head_pitch_deg.to_radians(),
-            pose.head_yaw_deg.to_radians(),
+            base.head_pitch_deg.to_radians() * head_scale + sleeping * 0.35,
+            base.head_yaw_deg.to_radians() * head_scale,
             0.0,
         ],
         Torso => [
             crouch
-                + if pose.swimming || pose.elytra_flying {
+                + sleeping * 1.25
+                + sitting * 0.12
+                + if base.swimming || base.elytra_flying {
                     0.25
                 } else {
                     0.0
@@ -693,10 +807,22 @@ fn articulation(part: EntityRigPart, pose: EntityPose) -> [f32; 3] {
             0.0,
             0.0,
         ],
-        LeftArm => [-stride + flight, 0.0, 0.0],
-        RightArm => [stride - attack + flight, 0.0, 0.0],
-        LeftLeg => [stride * 0.85 + crouch * 0.4, 0.0, 0.0],
-        RightLeg => [-stride * 0.85 + crouch * 0.4, 0.0, 0.0],
+        LeftArm => [-stride + flight + sleeping * 0.7, 0.0, sitting * 0.18],
+        RightArm => [
+            stride - attack + flight + sleeping * 0.7,
+            0.0,
+            -sitting * 0.18,
+        ],
+        LeftLeg => [
+            stride * 0.85 + crouch * 0.4 - sitting * 1.05 + sleeping * 0.9,
+            0.0,
+            0.0,
+        ],
+        RightLeg => [
+            -stride * 0.85 + crouch * 0.4 - sitting * 1.05 + sleeping * 0.9,
+            0.0,
+            0.0,
+        ],
         LeftWing => [0.0, 0.0, -flap - 0.12],
         RightWing => [0.0, 0.0, flap + 0.12],
         Tail => [0.0, tail, 0.0],
@@ -722,12 +848,11 @@ fn baby_scale(part: EntityRigPart, point: [f32; 3], height: f32, baby: bool) -> 
         return point;
     }
     if part == EntityRigPart::Head {
+        // Vanilla babies use half-scale bodies with effectively full-size
+        // heads (the familiar 2:1 head-to-body ratio). Keep the head geometry
+        // unscaled, but lower it so its neck joint lands on the half-scale body.
         let joint_y = height * 0.70;
-        [
-            point[0] * 0.75,
-            joint_y * 0.5 + (point[1] - joint_y) * 0.75,
-            point[2] * 0.75,
-        ]
+        [point[0], joint_y * 0.5 + (point[1] - joint_y), point[2]]
     } else {
         [point[0] * 0.5, point[1] * 0.5, point[2] * 0.5]
     }
@@ -753,7 +878,7 @@ fn outward_normal(positions: &[[f32; 3]; 4]) -> Option<[f32; 3]> {
     (length.is_finite() && length > 1e-10).then(|| normal.map(|v| v / length))
 }
 
-fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose, shape: RigBox) {
+fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose, shape: RigBox) {
     if mesh.quads.len() + 6 > MAX_UPGRADE_QUADS {
         return;
     }
@@ -809,7 +934,7 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose, shap
                 shape.pivot[1] + animated[1],
                 shape.pivot[2] + animated[2],
             ];
-            *dest = baby_scale(shape.part, p, spec.height, pose.baby);
+            *dest = baby_scale(shape.part, p, spec.height, pose.base.baby);
         }
         if let Some(normal) = outward_normal(&positions) {
             if positions.iter().flatten().all(|v| v.is_finite()) {
@@ -817,10 +942,10 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose, shap
                     positions,
                     normal,
                     uv,
-                    tint_index: if shape.tint != RIG_TINT_DEFAULT {
-                        shape.tint
-                    } else if pose.hurt_flash {
+                    tint_index: if pose.base.hurt_flash {
                         1
+                    } else if shape.tint != RIG_TINT_DEFAULT {
+                        shape.tint
                     } else {
                         -1
                     },
@@ -834,7 +959,7 @@ fn emit_box(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose, shap
 fn add(
     mesh: &mut ExtrudedMesh,
     spec: EntityRigSpec,
-    pose: EntityPose,
+    pose: EntityRigPose,
     part: EntityRigPart,
     center: [f32; 3],
     size: [f32; 3],
@@ -864,7 +989,7 @@ fn add(
 fn add_tinted(
     mesh: &mut ExtrudedMesh,
     spec: EntityRigSpec,
-    pose: EntityPose,
+    pose: EntityRigPose,
     part: EntityRigPart,
     center: [f32; 3],
     size: [f32; 3],
@@ -897,7 +1022,7 @@ fn add_tinted(
 fn add_fox(
     mesh: &mut ExtrudedMesh,
     spec: EntityRigSpec,
-    pose: EntityPose,
+    pose: EntityRigPose,
     mouth_item_rgb: Option<[u8; 3]>,
 ) {
     use EntityRigPart::*;
@@ -1023,7 +1148,7 @@ fn add_fox(
 
 /// Snow golem (id 96): stacked lower/upper snow cubes, a pumpkin head,
 /// and two angled stick arms.
-fn add_snow_golem(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose) {
+fn add_snow_golem(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
     use EntityRigPart::*;
     let w = spec.width;
     let h = spec.height;
@@ -1087,38 +1212,4756 @@ fn add_snow_golem(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityPose
 fn add_thrown_projectile(
     mesh: &mut ExtrudedMesh,
     spec: EntityRigSpec,
-    pose: EntityPose,
+    pose: EntityRigPose,
     entity_type_id: u16,
 ) {
     use EntityRigPart::*;
     let w = spec.width;
     let h = spec.height;
     let tint = match entity_type_id {
-        97 => 2,  // snowball: crisp ice white
-        28 => 3,  // egg
-        32 => 4,  // ender_pearl
+        97 => 2,       // snowball: crisp ice white
+        28 => 3,       // egg
+        32 => 4,       // ender_pearl
         117 | 13 => 5, // wind_charge / breeze_wind_charge
-        _ => 6,   // fireball / small_fireball: flame accent
+        _ => 6,        // fireball / small_fireball: flame accent
     };
     let center = [0.0, h * 0.5, 0.0];
     add_tinted(
-        mesh, spec, pose, Core, center, [w * 0.94, h * 0.94, w * 0.94], [0.0; 3],
-        [0.0; 3], 0.0, tint,
+        mesh,
+        spec,
+        pose,
+        Core,
+        center,
+        [w * 0.94, h * 0.94, w * 0.94],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        tint,
     );
     add_tinted(
-        mesh, spec, pose, Shell, center, [w * 0.70, h * 0.70, w * 0.70], [0.0; 3],
-        [0.0, PI * 0.25, 0.0], 0.0, tint + 1,
+        mesh,
+        spec,
+        pose,
+        Shell,
+        center,
+        [w * 0.70, h * 0.70, w * 0.70],
+        [0.0; 3],
+        [0.0, PI * 0.25, 0.0],
+        0.0,
+        tint + 1,
     );
     add_tinted(
-        mesh, spec, pose, Core, center, [w * 0.38, h * 0.38, w * 0.38], [0.0; 3],
-        [0.0; 3], 0.0, tint,
+        mesh,
+        spec,
+        pose,
+        Core,
+        center,
+        [w * 0.38, h * 0.38, w * 0.38],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        tint,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated vanilla rigs
+// ---------------------------------------------------------------------------
+
+/// Emit a box authored in a normalized unit template, scaling positions and
+/// dimensions but leaving rotations in radians. This keeps large rigs such as
+/// the ender dragon readable without repeating scale factors at every vertex.
+#[allow(clippy::too_many_arguments)]
+fn add_unit_tinted(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    scale: f32,
+    part: EntityRigPart,
+    center: [f32; 3],
+    size: [f32; 3],
+    pivot: [f32; 3],
+    rotation: [f32; 3],
+    tint: i32,
+) {
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        part,
+        center.map(|v| v * scale),
+        size.map(|v| v * scale),
+        pivot.map(|v| v * scale),
+        rotation,
+        0.0,
+        tint,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_unit(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    scale: f32,
+    part: EntityRigPart,
+    center: [f32; 3],
+    size: [f32; 3],
+    pivot: [f32; 3],
+    rotation: [f32; 3],
+) {
+    add_unit_tinted(
+        mesh,
+        spec,
+        pose,
+        scale,
+        part,
+        center,
+        size,
+        pivot,
+        rotation,
+        RIG_TINT_DEFAULT,
+    );
+}
+
+/// Ender dragon (id 31), authored in a 16-block-wingspan unit template.
+/// Forward is -Z. The rig has the Vanilla silhouette cues that the old avian
+/// proxy lacked: jawed horned head, five neck bones, broad torso, two
+/// three-panel bat wings, four legs, and an eight-segment whip tail.
+fn add_vanilla_ender_dragon(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let s = (spec.width / 16.0).min(spec.height / 8.0);
+    let base = pose.base;
+    let flap =
+        (base.age_ticks * 0.32 + base.limb_swing).sin() * (0.28 + base.limb_swing_amount * 0.35);
+    let tail_drive = base.age_ticks * 0.22 + base.limb_swing;
+    let yaw = base.head_yaw_deg.to_radians();
+    let pitch = base.head_pitch_deg.to_radians();
+    let accent = 8;
+
+    // Torso, chest keel, and dorsal spine ridge.
+    add_unit(
+        mesh,
+        spec,
+        pose,
+        s,
+        Torso,
+        [0.0, 3.25, 0.2],
+        [2.3, 1.35, 4.3],
+        [0.0, 3.3, 0.0],
+        [0.0; 3],
+    );
+    add_unit_tinted(
+        mesh,
+        spec,
+        pose,
+        s,
+        Torso,
+        [0.0, 2.58, 0.15],
+        [1.55, 0.20, 3.8],
+        [0.0, 3.3, 0.0],
+        [0.0; 3],
+        accent,
+    );
+    for z in [-1.45, -0.55, 0.35, 1.25] {
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            Torso,
+            [0.0, 4.08, z],
+            [0.18, 0.55, 0.24],
+            [0.0, 3.9, z],
+            [-0.16, 0.0, 0.0],
+            accent,
+        );
+    }
+
+    // Five articulated neck segments rising toward the head.
+    let neck = [
+        ([0.0, 3.75, -1.75], [0.58, 0.62, 0.92], -0.46),
+        ([0.0, 4.08, -2.28], [0.55, 0.58, 0.86], -0.50),
+        ([0.0, 4.38, -2.78], [0.51, 0.54, 0.80], -0.54),
+        ([0.0, 4.66, -3.25], [0.47, 0.50, 0.74], -0.58),
+        ([0.0, 4.90, -3.70], [0.43, 0.46, 0.68], -0.62),
+    ];
+    for (center, size, neck_pitch) in neck {
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            Other,
+            center,
+            size,
+            center,
+            [neck_pitch + pitch * 0.15, yaw * 0.12, 0.0],
+        );
+    }
+
+    // Skull, long snout, articulated jaw, teeth, eyes, and swept horns.
+    let head_pivot = [0.0, 5.02, -4.12];
+    let head_rot = [pitch - 0.08, yaw, 0.0];
+    add_unit(
+        mesh,
+        spec,
+        pose,
+        s,
+        Head,
+        [0.0, 5.12, -4.45],
+        [0.72, 0.62, 0.98],
+        head_pivot,
+        head_rot,
+    );
+    add_unit(
+        mesh,
+        spec,
+        pose,
+        s,
+        Head,
+        [0.0, 5.02, -5.12],
+        [0.52, 0.38, 0.72],
+        head_pivot,
+        head_rot,
+    );
+    let jaw_open = 0.18 + pose.open_amount * 0.72 + (base.swing_progress * PI).sin() * 0.25;
+    add_unit_tinted(
+        mesh,
+        spec,
+        pose,
+        s,
+        Head,
+        [0.0, 4.76, -4.98],
+        [0.56, 0.16, 0.78],
+        [0.0, 4.92, -4.35],
+        [pitch + jaw_open, yaw, 0.0],
+        accent,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            Head,
+            [side * 0.25, 5.18, -5.45],
+            [0.08, 0.12, 0.24],
+            head_pivot,
+            head_rot,
+            accent,
+        );
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            Head,
+            [side * 0.28, 5.52, -4.08],
+            [0.14, 0.18, 0.72],
+            head_pivot,
+            [-0.55, side * 0.38, side * 0.18],
+            accent,
+        );
+    }
+
+    // Four legs, each with thigh, shin, and clawed foot. The dragon is often
+    // airborne, but the folded legs remain part of the Vanilla silhouette.
+    for (side, z, phase) in [
+        (-1.0_f32, -1.15_f32, 0.0_f32),
+        (1.0, -1.15, PI),
+        (-1.0, 1.35, PI),
+        (1.0, 1.35, 0.0),
+    ] {
+        let swing = (base.limb_swing + phase).cos() * base.limb_swing_amount * 0.28;
+        let hip = [side * 0.86, 2.88, z];
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            if side < 0.0 { LeftLeg } else { RightLeg },
+            [side * 0.92, 2.38, z + 0.04],
+            [0.44, 0.88, 0.52],
+            hip,
+            [swing + 0.18, 0.0, 0.0],
+        );
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            if side < 0.0 { LeftLeg } else { RightLeg },
+            [side * 0.98, 1.78, z - 0.03],
+            [0.34, 0.66, 0.38],
+            hip,
+            [swing - 0.12, 0.0, 0.0],
+        );
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            if side < 0.0 { LeftLeg } else { RightLeg },
+            [side * 0.99, 1.40, z - 0.18],
+            [0.43, 0.18, 0.62],
+            hip,
+            [swing, 0.0, 0.0],
+            accent,
+        );
+    }
+
+    // Eight tapering tail bones with alternating lateral sway and dorsal spikes.
+    for i in 0..8 {
+        let f = i as f32;
+        let radius = 0.54 - f * 0.045;
+        let phase = tail_drive - f * 0.52;
+        let x = phase.sin() * 0.10 * (f + 1.0);
+        let y = 3.20 - f * 0.07 + phase.cos() * 0.035 * f;
+        let z = 2.10 + f * 0.78;
+        let pivot = [x, y, z - 0.34];
+        let rot = [0.03 * f, phase.cos() * 0.10 * (0.5 + f * 0.12), 0.0];
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            Tail,
+            [x, y, z],
+            [radius * 1.55, radius * 1.25, 0.86],
+            pivot,
+            rot,
+        );
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            Tail,
+            [x, y + radius * 0.70, z - 0.04],
+            [0.13, 0.34, 0.22],
+            pivot,
+            [-0.18 + rot[0], rot[1], 0.0],
+            accent,
+        );
+    }
+
+    // Dual three-panel wings. Inner bones are opaque body material; the broad
+    // outer membranes are thin accent plates with progressive flap angles.
+    for side in [-1.0_f32, 1.0] {
+        let wing_part = if side < 0.0 { LeftWing } else { RightWing };
+        let root = [side * 1.02, 3.82, -0.72];
+        let inner_rot = [0.03, -side * 0.18, side * (flap * 0.35 - 0.10)];
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            wing_part,
+            [side * 2.25, 3.85, -0.52],
+            [2.55, 0.20, 0.55],
+            root,
+            inner_rot,
+        );
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            wing_part,
+            [side * 2.45, 3.68, -0.05],
+            [2.55, 0.07, 1.25],
+            root,
+            inner_rot,
+            accent,
+        );
+        let elbow = [side * 3.40, 3.82, -0.66];
+        let mid_rot = [0.04, -side * 0.38, side * (flap * 0.78 - 0.16)];
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            wing_part,
+            [side * 4.85, 3.72, -0.05],
+            [3.10, 0.075, 1.72],
+            elbow,
+            mid_rot,
+            accent,
+        );
+        add_unit(
+            mesh,
+            spec,
+            pose,
+            s,
+            wing_part,
+            [side * 4.30, 3.88, -0.70],
+            [1.85, 0.16, 0.30],
+            elbow,
+            mid_rot,
+        );
+        let tip_pivot = [side * 6.10, 3.70, 0.20];
+        let tip_rot = [0.02, -side * 0.58, side * (flap * 1.05 - 0.20)];
+        add_unit_tinted(
+            mesh,
+            spec,
+            pose,
+            s,
+            wing_part,
+            [side * 6.85, 3.62, 0.95],
+            [1.72, 0.065, 1.42],
+            tip_pivot,
+            tip_rot,
+            accent,
+        );
+    }
+}
+
+/// Wither (id 119): three independent skulls, ribcage, spine/tail bones, and
+/// an optional translucent armor shell for the half-health armored state.
+fn add_vanilla_wither(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let yaw = pose.base.head_yaw_deg.to_radians();
+    let pitch = pose.base.head_pitch_deg.to_radians();
+    let center_pivot = [0.0, h * 0.72, 0.0];
+    let head_size = [w * 0.72, h * 0.18, w * 0.72];
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.55, 0.0],
+        [w * 0.56, h * 0.32, w * 0.48],
+        center_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    // Ribcage slats and the tapering spine/tail beneath the center head.
+    for i in 0..4 {
+        let f = i as f32;
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * (0.49 - f * 0.065), 0.0],
+            [w * (0.86 - f * 0.12), h * 0.035, w * 0.42],
+            center_pivot,
+            [0.0, 0.0, (f - 1.5) * 0.035],
+            0.0,
+        );
+    }
+    let body_sway = pose.base.limb_swing.sin() * pose.base.limb_swing_amount * 0.12
+        + (pose.base.swing_progress * PI).sin() * 0.10;
+    for i in 0..3 {
+        let f = i as f32;
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, h * (0.31 - f * 0.09), w * 0.03],
+            [w * (0.22 - f * 0.04), h * 0.12, w * (0.22 - f * 0.04)],
+            [0.0, h * 0.38, 0.0],
+            [0.12 * f, body_sway * (f + 1.0), 0.0],
+            0.0,
+        );
+    }
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.82, -w * 0.02],
+        head_size,
+        center_pivot,
+        [pitch, yaw, 0.0],
+        0.0,
+    );
+    // Side heads tilt outward and scan independently with a small age-driven nod.
+    for side in [-1.0_f32, 1.0] {
+        let nod = (pose.base.age_ticks * 0.35 + side).sin() * 0.08 + body_sway * side;
+        let pivot = [side * w * 0.58, h * 0.70, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.76, h * 0.74, 0.0],
+            [w * 0.54, h * 0.14, w * 0.54],
+            pivot,
+            [pitch * 0.5 + nod, yaw * 0.35 + side * 0.42, side * 0.10],
+            0.0,
+        );
+    }
+    if pose.wither_armored {
+        // Transparent armor is represented by slightly inflated shell plates;
+        // the renderer resolves translucency from the shell part/material.
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.61, 0.0],
+            [w * 0.92, h * 0.46, w * 0.72],
+            center_pivot,
+            [0.0; 3],
+            w * 0.025,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.82, -w * 0.02],
+            head_size,
+            center_pivot,
+            [pitch, yaw, 0.0],
+            w * 0.025,
+        );
+    }
+}
+
+/// Warden (id 116): wide horned head with vibrating tendrils, barrel chest,
+/// pulsing soul core, and heavy articulated arms/legs.
+fn add_vanilla_warden(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let pulse = 1.0 + (pose.base.age_ticks * 0.45).sin() * 0.10;
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.58, 0.0],
+        [w * 1.12, h * 0.38, w * 0.72],
+        [0.0, h * 0.68, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.62, -w * 0.39],
+        [w * 0.34 * pulse, h * 0.12 * pulse, w * 0.08],
+        [0.0, h * 0.62, -w * 0.30],
+        [0.0; 3],
+        0.0,
+        9,
+    );
+    let head_pivot = [0.0, h * 0.78, 0.0];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.86, -w * 0.02],
+        [w * 1.12, h * 0.22, w * 0.86],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    // Wide antler-like horns.
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.70, h * 0.91, 0.0],
+            [w * 0.46, h * 0.07, w * 0.16],
+            head_pivot,
+            [0.0, 0.0, side * 0.35],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.91, h * 0.98, 0.0],
+            [w * 0.15, h * 0.16, w * 0.13],
+            head_pivot,
+            [0.0, 0.0, side * 0.18],
+            0.0,
+        );
+        // Four independently vibrating tendrils (two per side).
+        for index in 0..2 {
+            let f = index as f32;
+            let vibration = (pose.base.age_ticks * 1.7 + side * 0.8 + f * 1.9).sin() * 0.18;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [
+                    side * w * (0.28 + f * 0.20),
+                    h * (0.76 - f * 0.035),
+                    -w * 0.34,
+                ],
+                [w * 0.055, h * 0.18, w * 0.055],
+                head_pivot,
+                [vibration, 0.0, side * (0.15 + f * 0.10)],
+                0.0,
+                9,
+            );
+        }
+    }
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let shoulder = [side * w * 0.70, h * 0.70, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.88, h * 0.47, 0.0],
+            [w * 0.34, h * 0.48, w * 0.38],
+            shoulder,
+            [0.0; 3],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.91, h * 0.20, -w * 0.02],
+            [w * 0.40, h * 0.17, w * 0.44],
+            shoulder,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let hip = [side * w * 0.28, h * 0.39, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.30, h * 0.20, 0.0],
+            [w * 0.34, h * 0.40, w * 0.38],
+            hip,
+            [0.0; 3],
+            0.0,
+        );
+    }
+}
+
+/// Guardian/elder guardian: cube body, eye pupil, twelve retractable spikes,
+/// and a three-piece tail fin. `elder` only changes proportions through the
+/// registry dimensions already present on `spec`.
+fn add_vanilla_guardian(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let body_y = h * 0.53;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, body_y, 0.0],
+        [w * 0.72, h * 0.72, w * 0.72],
+        [0.0, body_y, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    // Large eye and dark pupil on the forward (-Z) face.
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, body_y, -w * 0.39],
+        [w * 0.30, h * 0.24, w * 0.055],
+        [0.0, body_y, -w * 0.25],
+        [0.0; 3],
+        0.0,
+        10,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, body_y, -w * 0.43],
+        [w * 0.13, h * 0.11, w * 0.04],
+        [0.0, body_y, -w * 0.25],
+        [0.0; 3],
+        0.0,
+        11,
+    );
+    // Twelve spikes: four top/bottom diagonal directions and eight around the
+    // sides. Extension breathes with age/open_amount instead of popping.
+    for i in 0..12 {
+        let f = i as f32;
+        let ring = i % 4;
+        let tier = i / 4;
+        let angle = f32::from(ring as u8) * FRAC_PI_2 + f32::from(tier as u8) * 0.32;
+        let x = angle.cos() * w * 0.43;
+        let z = angle.sin() * w * 0.43;
+        let y = body_y + (f32::from(tier as u8) - 1.0) * h * 0.25;
+        let extension =
+            0.72 + pose.open_amount * 0.35 + (pose.base.age_ticks * 0.4 + f).sin() * 0.08;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [
+                x * (1.0 + extension * 0.18),
+                y,
+                z * (1.0 + extension * 0.18),
+            ],
+            [w * 0.07, h * 0.25 * extension, w * 0.07],
+            [x, y, z],
+            [0.45 * z.signum(), angle, -0.45 * x.signum()],
+            0.0,
+            12,
+        );
+    }
+    // Three tail-fin segments trail behind +Z and undulate independently.
+    for i in 0..3 {
+        let f = i as f32;
+        let wave = (pose.base.age_ticks * 0.5 + pose.base.limb_swing - f * 0.7).sin() * 0.18;
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, body_y - f * h * 0.03, w * (0.43 + f * 0.20)],
+            [w * (0.30 - f * 0.05), h * 0.13, w * 0.23],
+            [0.0, body_y, w * 0.34],
+            [wave, wave * 0.5, 0.0],
+            0.0,
+        );
+    }
+}
+
+/// Ghast (id 45): large floating cube head/body and nine independently waving
+/// tentacles hanging below it.
+fn add_vanilla_ghast(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.69, 0.0],
+        [w * 0.88, h * 0.55, w * 0.88],
+        [0.0, h * 0.82, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for ix in -1..=1 {
+        for iz in -1..=1 {
+            let index = (ix + 1) * 3 + (iz + 1);
+            let phase = pose.base.age_ticks * 0.55 + f32::from(index as u8) * 0.73;
+            let x = ix as f32 * w * 0.24;
+            let z = iz as f32 * w * 0.24;
+            let pivot = [x, h * 0.43, z];
+            add(
+                mesh,
+                spec,
+                pose,
+                Tail,
+                [
+                    x + phase.sin() * w * 0.025,
+                    h * 0.25,
+                    z + phase.cos() * w * 0.018,
+                ],
+                [w * 0.11, h * 0.38, w * 0.11],
+                pivot,
+                [phase.sin() * 0.15, 0.0, phase.cos() * 0.13],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Blaze (id 8): floating head plus twelve rods orbiting in three tiers.
+fn add_vanilla_blaze(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let head_pivot = [0.0, h * 0.72, 0.0];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.82, 0.0],
+        [w * 0.62, h * 0.28, w * 0.62],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    for tier in 0..3 {
+        for index in 0..4 {
+            let rod = tier * 4 + index;
+            let angle = pose.base.age_ticks * 0.72 + rod as f32 * TAU / 12.0 + tier as f32 * 0.28;
+            let radius = w * (0.58 + tier as f32 * 0.08);
+            let x = angle.cos() * radius;
+            let z = angle.sin() * radius;
+            let y = h * (0.35 + tier as f32 * 0.17);
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Other,
+                [x, y, z],
+                [w * 0.10, h * 0.43, w * 0.10],
+                [x, y - h * 0.18, z],
+                [0.08 * angle.sin(), angle, 0.08 * angle.cos()],
+                0.0,
+                6,
+            );
+        }
+    }
+}
+
+/// Breeze (id 12): floating head, two orbiting wind-rod rings, and a tapered
+/// wind-cloak cone. Rods counter-rotate so even a static pose reads as moving air.
+fn add_vanilla_breeze(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.83, 0.0],
+        [w * 0.58, h * 0.24, w * 0.58],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for tier in 0..2 {
+        let direction = if tier == 0 { 1.0_f32 } else { -1.0 };
+        for index in 0..6 {
+            let angle = direction * pose.base.age_ticks * 0.85
+                + index as f32 * TAU / 6.0
+                + tier as f32 * 0.4;
+            let radius = w * (0.48 + tier as f32 * 0.18);
+            let x = angle.cos() * radius;
+            let z = angle.sin() * radius;
+            let y = h * (0.54 + tier as f32 * 0.13);
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Other,
+                [x, y, z],
+                [w * 0.075, h * 0.28, w * 0.075],
+                [x, y - h * 0.12, z],
+                [0.2, angle, direction * 0.15],
+                0.0,
+                5,
+            );
+        }
+    }
+    // Cloak cone: stacked, yawed thin plates tapering downward.
+    for i in 0..4 {
+        let f = i as f32;
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * (0.47 - f * 0.10), 0.0],
+            [w * (0.58 - f * 0.09), h * 0.09, w * (0.58 - f * 0.09)],
+            [0.0, h * 0.58, 0.0],
+            [0.0, pose.base.age_ticks * 0.35 + f * 0.35, 0.0],
+            0.0,
+        );
+    }
+}
+
+/// Shulker (id 88): box shell base, hinged rotating lid, and a small inner
+/// head that rises as the shell opens.
+fn add_vanilla_shulker(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let auto_open = ((pose.base.age_ticks * 0.18).sin() + 1.0) * 0.20;
+    let open = pose.open_amount.max(auto_open).clamp(0.0, 1.0);
+    add(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.28, 0.0],
+        [w * 0.86, h * 0.56, w * 0.86],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+    );
+    let hinge = [0.0, h * 0.57, w * 0.42];
+    add(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.72, 0.0],
+        [w * 0.90, h * 0.28, w * 0.90],
+        hinge,
+        [-open * 1.15, 0.0, 0.0],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * (0.53 + open * 0.18), -w * 0.03],
+        [w * 0.40, h * 0.30, w * 0.40],
+        [0.0, h * 0.47, 0.0],
+        [0.0; 3],
+        0.0,
+        13,
+    );
+}
+
+/// Slime/magma cube shared layered body. Slime gets a translucent outer gel
+/// cube, inner core, eyes, and mouth; magma cube gets stacked dark slices with
+/// a glowing core. Size pulses with `swell_amount` and locomotion squash.
+fn add_vanilla_slime_like(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let squash = 1.0
+        + pose.swell_amount * 0.25
+        + pose.base.limb_swing_amount * pose.base.limb_swing.sin().abs() * 0.06;
+    if spec.entity_type_id == 67 {
+        // Magma cube: separated horizontal slices sliding subtly out of phase.
+        for i in 0..4 {
+            let f = i as f32;
+            let offset = (pose.base.age_ticks * 0.5 + f).sin() * 0.018 * f;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Shell,
+                [offset, h * (0.15 + f * 0.22), 0.0],
+                [
+                    w * (0.92 - f * 0.07) * squash,
+                    h * 0.19,
+                    w * (0.92 - f * 0.07) * squash,
+                ],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                14,
+            );
+        }
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, h * 0.43, 0.0],
+            [w * 0.48, h * 0.42, w * 0.48],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            6,
+        );
+    } else {
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.5, 0.0],
+            [w * squash, h, w * squash],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, h * 0.45, 0.0],
+            [w * 0.54, h * 0.50, w * 0.54],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            15,
+        );
+        for side in [-1.0_f32, 1.0] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [side * w * 0.17, h * 0.58, -w * 0.47],
+                [w * 0.12, h * 0.12, w * 0.035],
+                [0.0, h * 0.55, 0.0],
+                [0.0; 3],
+                0.0,
+                16,
+            );
+        }
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.39, -w * 0.47],
+            [w * 0.22, h * 0.06, w * 0.035],
+            [0.0, h * 0.45, 0.0],
+            [0.0; 3],
+            0.0,
+            16,
+        );
+    }
+}
+
+/// Phantom (id 76): flat head/body, broad flapping wings, and tapering tail.
+fn add_vanilla_phantom(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.55, 0.0],
+        [w * 0.44, h * 0.25, w * 0.76],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.57, -w * 0.48],
+        [w * 0.38, h * 0.28, w * 0.32],
+        [0.0, h * 0.55, -w * 0.20],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftWing, -1.0_f32), (RightWing, 1.0)] {
+        let pivot = [side * w * 0.18, h * 0.58, -w * 0.02];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.72, h * 0.56, 0.0],
+            [w * 0.98, h * 0.055, w * 0.54],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 1.20, h * 0.53, w * 0.10],
+            [w * 0.56, h * 0.045, w * 0.38],
+            pivot,
+            [0.0, -side * 0.20, 0.0],
+            0.0,
+        );
+    }
+    for i in 0..3 {
+        let f = i as f32;
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, h * (0.54 - f * 0.02), w * (0.48 + f * 0.20)],
+            [w * (0.18 - f * 0.035), h * 0.08, w * 0.25],
+            [0.0, h * 0.54, w * 0.35],
+            [0.0; 3],
+            0.0,
+        );
+    }
+}
+
+/// Humanoid silhouette families used by the dedicated vanilla rigs. These are
+/// internal modeling tags, not public archetypes: the public eight-family
+/// classification remains stable for compatibility.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HumanoidStyle {
+    Player,
+    Zombie,
+    Skeleton,
+    Bogged,
+    Stray,
+    Illager,
+    IllagerArmed,
+    IllagerHooded,
+    Witch,
+    Piglin,
+    ZombieVillager,
+    ZombifiedPiglin,
+    WitherSkeleton,
+}
+
+fn radians3(degrees: [f32; 3]) -> [f32; 3] {
+    degrees.map(f32::to_radians)
+}
+
+/// Generic hand-item and armor attachment shells. The item prisms are
+/// deliberately simple; their importance is that they bind to the correct
+/// hand pivots and inherit walk/attack articulation.
+fn add_humanoid_attachments(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    if pose.main_hand_item {
+        let offset = pose.main_hand_offset;
+        let rotation = radians3(pose.main_hand_rotation_deg);
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [
+                w * 0.48 + offset[0],
+                h * 0.43 + offset[1],
+                -w * 0.22 + offset[2],
+            ],
+            [w * 0.09, h * 0.34, w * 0.09],
+            [w * 0.43, h * 0.73, 0.0],
+            rotation,
+            0.0,
+            18,
+        );
+    }
+    if pose.offhand_item {
+        let offset = pose.offhand_offset;
+        let rotation = radians3(pose.offhand_rotation_deg);
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            LeftArm,
+            [
+                -w * 0.48 + offset[0],
+                h * 0.43 + offset[1],
+                -w * 0.22 + offset[2],
+            ],
+            [w * 0.09, h * 0.30, w * 0.09],
+            [-w * 0.43, h * 0.73, 0.0],
+            rotation,
+            0.0,
+            19,
+        );
+    }
+    if pose.armor_visible {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * 0.57, 0.0],
+            [w * 0.70, h * 0.38, w * 0.43],
+            [0.0, h * 0.75, 0.0],
+            [0.0; 3],
+            w * 0.018,
+            20,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.875, 0.0],
+            [w * 0.58, h * 0.21, w * 0.58],
+            [0.0, h * 0.75, 0.0],
+            [0.0; 3],
+            w * 0.018,
+            20,
+        );
+    }
+}
+
+/// Shared articulated humanoid body. Style controls the parts that make the
+/// vanilla families legible at a glance: illager noses and crossed arms,
+/// witch hats, piglin snouts/ears, skeletal thin limbs, zombie forward arms,
+/// and the extended armor/held-item attachment state.
+fn add_humanoid_rig(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    style: HumanoidStyle,
+) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let skeletal = matches!(
+        style,
+        HumanoidStyle::Skeleton
+            | HumanoidStyle::Bogged
+            | HumanoidStyle::Stray
+            | HumanoidStyle::WitherSkeleton
+    );
+    let illager = matches!(
+        style,
+        HumanoidStyle::Illager
+            | HumanoidStyle::IllagerArmed
+            | HumanoidStyle::IllagerHooded
+            | HumanoidStyle::Witch
+            | HumanoidStyle::ZombieVillager
+    );
+    let piglin = matches!(
+        style,
+        HumanoidStyle::Piglin | HumanoidStyle::ZombifiedPiglin
+    );
+    let zombie_forward = matches!(
+        style,
+        HumanoidStyle::Zombie | HumanoidStyle::ZombieVillager | HumanoidStyle::ZombifiedPiglin
+    );
+    let limb_w = if skeletal { 0.13 } else { 0.22 };
+    let limb_d = if skeletal { 0.16 } else { 0.30 };
+    let leg_h = if skeletal { 0.43 } else { 0.40 };
+    let torso_h = if illager { 0.43 } else { 0.38 };
+    let torso_depth = if illager { 0.48 } else { 0.40 };
+    let head_factor = (spec.proportions.head / 0.25).clamp(0.5, 2.0);
+    let head_size = if skeletal {
+        [w * 0.58, h * 0.21 * head_factor, w * 0.58]
+    } else {
+        [w * 0.62, h * 0.22 * head_factor, w * 0.62]
+    };
+    let head_pivot = [0.0, h * 0.76, 0.0];
+    let torso_pivot = [0.0, h * 0.68, 0.0];
+
+    // Legs and torso. Illager robes extend below the belt as a skirt; other
+    // humanoids keep the familiar two-leg silhouette.
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let pivot = [side * w * 0.18, h * leg_h, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [pivot[0], h * leg_h * 0.5, 0.0],
+            [w * (limb_w + 0.04), h * leg_h, w * (limb_d + 0.03)],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * (leg_h + torso_h * 0.5), 0.0],
+        [w * 0.66, h * torso_h, w * torso_depth],
+        torso_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    if illager {
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * 0.39, 0.0],
+            [w * 0.72, h * 0.24, w * 0.50],
+            torso_pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+
+    // Head and family-specific facial silhouette.
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.875, 0.0],
+        head_size,
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    if illager {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.82, -w * 0.43],
+            [w * 0.16, h * 0.11, w * 0.23],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+        );
+        // Heavy unibrow silhouette shared by villagers and illagers.
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.91, -w * 0.34],
+            [w * 0.44, h * 0.045, w * 0.08],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    if piglin {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.82, -w * 0.42],
+            [w * 0.35, h * 0.10, w * 0.24],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+        );
+        for side in [-1.0_f32, 1.0] {
+            add(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [side * w * 0.34, h * 0.94, -w * 0.02],
+                [w * 0.12, h * 0.12, w * 0.07],
+                head_pivot,
+                [0.0, 0.0, side * 0.35],
+                0.0,
+            );
+        }
+    }
+    if matches!(style, HumanoidStyle::Witch) {
+        // Wide brim plus three shrinking hat tiers, tilted backwards.
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.985, 0.0],
+            [w * 0.98, h * 0.035, w * 0.98],
+            head_pivot,
+            [-0.08, 0.0, 0.0],
+            0.0,
+            21,
+        );
+        for i in 0..3 {
+            let f = i as f32;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [0.0, h * (1.02 + f * 0.055), w * 0.02],
+                [w * (0.58 - f * 0.13), h * 0.07, w * (0.58 - f * 0.13)],
+                head_pivot,
+                [-0.12 - f * 0.04, 0.0, 0.0],
+                0.0,
+                21,
+            );
+        }
+    }
+    if matches!(style, HumanoidStyle::IllagerHooded) {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.90, 0.0],
+            [w * 0.69, h * 0.25, w * 0.69],
+            head_pivot,
+            [0.0; 3],
+            w * 0.018,
+        );
+    }
+    if matches!(style, HumanoidStyle::Bogged) {
+        // Mossy cap and two tiny mushrooms make bogged distinct from stray.
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.98, 0.0],
+            [w * 0.64, h * 0.06, w * 0.64],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+            22,
+        );
+        for side in [-1.0_f32, 1.0] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [side * w * 0.22, h * 1.03, -w * 0.08],
+                [w * 0.14, h * 0.06, w * 0.14],
+                head_pivot,
+                [0.0; 3],
+                0.0,
+                23,
+            );
+        }
+    }
+    if matches!(style, HumanoidStyle::Stray) {
+        // Ragged icy hood/strips.
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.93, 0.0],
+            [w * 0.67, h * 0.11, w * 0.67],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+            24,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * 0.63, -w * 0.23],
+            [w * 0.70, h * 0.08, w * 0.06],
+            torso_pivot,
+            [0.0; 3],
+            0.0,
+            24,
+        );
+    }
+
+    // Arms. Villager-line mobs cross their arms inside the robe until a cast,
+    // attack, or item-use state unfolds them. Zombies hold both arms forward;
+    // skeletons keep thinner limbs for the bow silhouette.
+    let unfold = pose.spellcasting
+        || pose.using_item
+        || pose.main_hand_item
+        || pose.offhand_item
+        || pose.base.swing_progress > 0.0;
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let pivot = [side * w * 0.43, h * 0.72, 0.0];
+        if illager && !unfold && !matches!(style, HumanoidStyle::ZombieVillager) {
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.12, h * 0.61, -w * 0.29],
+                [w * 0.52, h * 0.075, w * 0.16],
+                pivot,
+                [0.0, -side * 0.42, side * 0.10],
+                0.0,
+            );
+        } else {
+            let forward = if zombie_forward { -1.25 } else { 0.0 };
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [
+                    pivot[0],
+                    h * 0.50,
+                    if zombie_forward { -w * 0.27 } else { 0.0 },
+                ],
+                [w * limb_w, h * 0.40, w * limb_d],
+                pivot,
+                [forward, 0.0, 0.0],
+                0.0,
+            );
+        }
+    }
+
+    // Family weapons/tools baked into the default silhouette where Vanilla
+    // almost always carries them; the generic attachment state can add more.
+    if skeletal {
+        // Bow arcs: three thin tinted rods on the left hand.
+        for i in 0..3 {
+            let f = i as f32 - 1.0;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                LeftArm,
+                [-w * 0.51, h * (0.43 + f * 0.08), -w * 0.22],
+                [w * 0.045, h * 0.17, w * 0.045],
+                [-w * 0.43, h * 0.72, 0.0],
+                [0.35, 0.0, f * 0.28],
+                0.0,
+                18,
+            );
+        }
+    }
+    if matches!(style, HumanoidStyle::IllagerArmed) {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [w * 0.50, h * 0.39, -w * 0.25],
+            [w * 0.07, h * 0.34, w * 0.07],
+            [w * 0.43, h * 0.72, 0.0],
+            [-0.55, 0.0, 0.12],
+            0.0,
+            18,
+        );
+    }
+    if matches!(style, HumanoidStyle::WitherSkeleton) {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [w * 0.50, h * 0.42, -w * 0.32],
+            [w * 0.08, h * 0.48, w * 0.08],
+            [w * 0.43, h * 0.72, 0.0],
+            [-0.70, 0.0, 0.10],
+            0.0,
+            18,
+        );
+    }
+    if pose.base.enable_skin_3d_layers {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.875, 0.0],
+            head_size,
+            head_pivot,
+            [0.0; 3],
+            w * 0.018,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * (leg_h + torso_h * 0.5), 0.0],
+            [w * 0.66, h * torso_h, w * torso_depth],
+            torso_pivot,
+            [0.0; 3],
+            w * 0.012,
+        );
+        for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+            let pivot = [side * w * 0.43, h * 0.72, 0.0];
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [pivot[0], h * 0.50, 0.0],
+                [w * limb_w, h * 0.40, w * limb_d],
+                pivot,
+                [0.0; 3],
+                w * 0.010,
+            );
+        }
+        for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+            let pivot = [side * w * 0.18, h * leg_h, 0.0];
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [pivot[0], h * leg_h * 0.5, 0.0],
+                [w * (limb_w + 0.04), h * leg_h, w * (limb_d + 0.03)],
+                pivot,
+                [0.0; 3],
+                w * 0.010,
+            );
+        }
+    }
+    add_humanoid_attachments(mesh, spec, pose);
+}
+
+/// Iron golem (id 57): broad torso, villager-like nose, very long arms, and
+/// heavy legs. The proportions intentionally dwarf the standard biped instead
+/// of merely scaling it uniformly.
+fn add_vanilla_iron_golem(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let head_pivot = [0.0, h * 0.79, 0.0];
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.61, 0.0],
+        [w * 0.95, h * 0.36, w * 0.55],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.38, 0.0],
+        [w * 0.70, h * 0.16, w * 0.44],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.86, -w * 0.02],
+        [w * 0.55, h * 0.16, w * 0.50],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.81, -w * 0.36],
+        [w * 0.14, h * 0.10, w * 0.20],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let pivot = [side * w * 0.55, h * 0.73, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.66, h * 0.43, 0.0],
+            [w * 0.22, h * 0.62, w * 0.28],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.66, h * 0.12, -w * 0.01],
+            [w * 0.28, h * 0.13, w * 0.32],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let pivot = [side * w * 0.24, h * 0.34, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.25, h * 0.17, 0.0],
+            [w * 0.28, h * 0.34, w * 0.34],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    if pose.main_hand_item {
+        // The golem's poppy: stem and blossom attached to the right hand.
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [w * 0.68, h * 0.21, -w * 0.21],
+            [w * 0.035, h * 0.20, w * 0.035],
+            [w * 0.55, h * 0.73, 0.0],
+            [-0.35, 0.0, 0.0],
+            0.0,
+            25,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [w * 0.68, h * 0.31, -w * 0.25],
+            [w * 0.12, h * 0.07, w * 0.12],
+            [w * 0.55, h * 0.73, 0.0],
+            [-0.35, 0.0, 0.0],
+            0.0,
+            26,
+        );
+    }
+}
+
+/// Enderman (id 33): very tall thin limbs, cuboid head, dropping jaw when
+/// screaming, and an optional carried block mounted between the long hands.
+fn add_vanilla_enderman(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let head_pivot = [0.0, h * 0.82, 0.0];
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.61, 0.0],
+        [w * 0.55, h * 0.28, w * 0.36],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.91, 0.0],
+        [w * 0.62, h * 0.17, w * 0.62],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    let jaw_drop = if pose.screaming {
+        0.55
+    } else {
+        pose.open_amount * 0.55
+    };
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * (0.84 - jaw_drop * 0.05), -w * 0.18],
+        [w * 0.44, h * 0.045 + jaw_drop * h * 0.02, w * 0.36],
+        head_pivot,
+        [jaw_drop, 0.0, 0.0],
+        0.0,
+        27,
+    );
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let pivot = [side * w * 0.38, h * 0.73, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.43, h * 0.43, 0.0],
+            [w * 0.13, h * 0.62, w * 0.16],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let pivot = [side * w * 0.16, h * 0.43, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.17, h * 0.215, 0.0],
+            [w * 0.15, h * 0.43, w * 0.18],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    if pose.carried_block {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            [0.0, h * 0.49, -w * 0.52],
+            [w * 0.52, w * 0.52, w * 0.52],
+            [0.0, h * 0.55, -w * 0.25],
+            [0.15, 0.25, 0.0],
+            0.0,
+            28,
+        );
+    }
+}
+
+/// Creeper (id 23): tall headless-neck torso, four stubby diagonal-gait legs,
+/// and a swelling factor used by the primed flashing animation.
+fn add_vanilla_creeper(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let swell = 1.0 + pose.swell_amount * 0.28;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.48, 0.0],
+        [w * 0.58 * swell, h * 0.58 * swell, w * 0.45 * swell],
+        [0.0, h * 0.60, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    // Creeper head is fused directly atop the torso: no visible neck.
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.86, -w * 0.01],
+        [w * 0.66 * swell, h * 0.24 * swell, w * 0.66 * swell],
+        [0.0, h * 0.72, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for (z, phase) in [(-0.20_f32, 0.0_f32), (0.22, PI)] {
+            let pivot = [side * w * 0.20, h * 0.24, z * w];
+            let gait = (pose.base.limb_swing + phase + if side < 0.0 { 0.0 } else { PI }).cos()
+                * pose.base.limb_swing_amount
+                * 0.35;
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [pivot[0], h * 0.11, pivot[2]],
+                [w * 0.22, h * 0.22, w * 0.24],
+                pivot,
+                [gait, 0.0, side * 0.06],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Armor stand (id 3): stone base plate, central post, and a posed wooden
+/// mannequin frame rather than a living biped.
+fn add_vanilla_armor_stand(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.025, 0.0],
+        [w * 1.15, h * 0.05, w * 1.15],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        29,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.45, 0.0],
+        [w * 0.10, h * 0.78, w * 0.10],
+        [0.0, h * 0.45, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.66, 0.0],
+        [w * 0.66, h * 0.08, w * 0.10],
+        [0.0, h * 0.66, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.90, 0.0],
+        [w * 0.42, h * 0.20, w * 0.42],
+        [0.0, h * 0.78, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        let pivot = [side * w * 0.35, h * 0.66, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.43, h * 0.43, 0.0],
+            [w * 0.08, h * 0.44, w * 0.08],
+            pivot,
+            [0.0, 0.0, side * 0.08],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let pivot = [side * w * 0.14, h * 0.39, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.18, h * 0.20, 0.0],
+            [w * 0.09, h * 0.36, w * 0.09],
+            pivot,
+            [0.0, 0.0, side * 0.06],
+            0.0,
+        );
+    }
+}
+
+/// Evoker fangs (id 36): paired triangular-looking upper/lower tooth rows.
+/// Cuboids are rotated rather than smoothed so the shape stays voxel-clean.
+fn add_vanilla_evoker_fangs(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let snap = (pose.base.swing_progress * PI).sin() * 0.35 + pose.open_amount * 0.35;
+    for side in [-1.0_f32, 1.0] {
+        for i in 0..3 {
+            let f = i as f32;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Other,
+                [
+                    side * w * (0.10 + f * 0.10),
+                    h * (0.30 + f * 0.10),
+                    -w * 0.08,
+                ],
+                [w * 0.10, h * (0.40 - f * 0.06), w * 0.10],
+                [0.0, h * 0.15, 0.0],
+                [snap, 0.0, side * (0.22 + f * 0.08)],
+                0.0,
+                30,
+            );
+        }
+    }
+}
+
+/// Feature switches for the parameterized mammal/quadruped rig. Forward is
+/// -Z; rows of legs are articulated in diagonal pairs. The switches cover the
+/// major silhouette-carrying anatomy without introducing per-species public
+/// types or changing the stable archetype enum.
+#[derive(Clone, Copy, Debug, Default)]
+struct QuadrupedFeatures {
+    long_neck: bool,
+    long_ears: bool,
+    hump: bool,
+    snout: bool,
+    pointed_ears: bool,
+    horns: bool,
+    bearded: bool,
+    wool: bool,
+    shell: bool,
+    mane: bool,
+    udder: bool,
+    mushrooms: bool,
+    long_tail: bool,
+    bushy_tail: bool,
+    six_legs: bool,
+    stocky: bool,
+    slim: bool,
+}
+
+/// Parameterized articulated quadruped used by horses, camelids, cattle,
+/// pigs, sheep, canines/felines, bears, goats, hoglins, and sniffer-like
+/// mammals. Dimensions derive from the registry collision box while anatomy
+/// remains independently proportioned rather than a uniform cube scale.
+fn add_quadruped_rig(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    features: QuadrupedFeatures,
+) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let body_len = w * if features.stocky {
+        1.02
+    } else if features.slim {
+        0.76
+    } else {
+        0.88
+    };
+    let body_w = w * if features.stocky {
+        0.82
+    } else if features.slim {
+        0.55
+    } else {
+        0.68
+    };
+    let body_h = h * if features.stocky { 0.42 } else { 0.36 };
+    let leg_h = h * if features.long_neck { 0.48 } else { 0.43 };
+    let body_y = leg_h + body_h * 0.48;
+    let torso_pivot = [0.0, leg_h + body_h * 0.75, 0.0];
+
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, body_y, 0.0],
+        [body_w, body_h, body_len],
+        torso_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    if features.wool {
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, body_y + body_h * 0.04, 0.0],
+            [body_w, body_h, body_len],
+            torso_pivot,
+            [0.0; 3],
+            w * 0.035,
+        );
+    }
+    if features.shell {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, body_y + body_h * 0.25, 0.0],
+            [body_w * 1.04, body_h * 0.55, body_len * 0.94],
+            torso_pivot,
+            [0.0; 3],
+            0.0,
+            31,
+        );
+    }
+    if features.hump {
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, body_y + body_h * 0.54, body_len * 0.02],
+            [body_w * 0.58, body_h * 0.55, body_len * 0.38],
+            torso_pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    if features.udder {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, leg_h * 0.88, body_len * 0.18],
+            [body_w * 0.34, h * 0.12, body_len * 0.20],
+            torso_pivot,
+            [0.0; 3],
+            0.0,
+            32,
+        );
+    }
+
+    // Neck/head. Long-neck species use an inclined neck column; stockier
+    // species keep the head mounted directly on the front torso edge.
+    let head_w = w * if features.stocky { 0.52 } else { 0.44 };
+    let head_h = h * if features.long_neck { 0.20 } else { 0.25 };
+    let head_l = w * if features.stocky { 0.46 } else { 0.40 };
+    let neck_len = if features.long_neck { h * 0.28 } else { 0.0 };
+    let head_y = body_y + body_h * 0.18 + neck_len * 0.70;
+    let head_z = -body_len * 0.50 - head_l * 0.30;
+    let head_pivot = [0.0, head_y - head_h * 0.30, head_z + head_l * 0.35];
+    if features.long_neck {
+        add(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, body_y + neck_len * 0.38, -body_len * 0.44],
+            [body_w * 0.38, neck_len + head_h * 0.35, body_w * 0.34],
+            [0.0, body_y, -body_len * 0.34],
+            [-0.25, 0.0, 0.0],
+            0.0,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, head_y, head_z],
+        [head_w, head_h, head_l],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    if features.snout {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, head_y - head_h * 0.12, head_z - head_l * 0.58],
+            [head_w * 0.62, head_h * 0.55, head_l * 0.58],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    if features.pointed_ears || features.long_ears {
+        let ear_len = if features.long_ears { 1.9 } else { 1.0 };
+        for side in [-1.0_f32, 1.0] {
+            add(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [
+                    side * head_w * 0.32,
+                    head_y + head_h * (0.62 + ear_len * 0.20),
+                    head_z + head_l * 0.05,
+                ],
+                [head_w * 0.16, head_h * 0.52 * ear_len, head_l * 0.12],
+                head_pivot,
+                [0.08, 0.0, -side * 0.28],
+                0.0,
+            );
+        }
+    }
+    if features.horns {
+        for side in [-1.0_f32, 1.0] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [
+                    side * head_w * 0.42,
+                    head_y + head_h * 0.58,
+                    head_z + head_l * 0.02,
+                ],
+                [head_w * 0.13, head_h * 0.55, head_l * 0.13],
+                head_pivot,
+                [-0.30, 0.0, side * 0.42],
+                0.0,
+                33,
+            );
+        }
+    }
+    if features.bearded {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, head_y - head_h * 0.52, head_z - head_l * 0.35],
+            [head_w * 0.24, head_h * 0.35, head_l * 0.18],
+            head_pivot,
+            [0.18, 0.0, 0.0],
+            0.0,
+        );
+    }
+    if features.mane {
+        for i in 0..3 {
+            let f = i as f32;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Torso,
+                [
+                    0.0,
+                    body_y + body_h * (0.48 + f * 0.06),
+                    -body_len * (0.18 + f * 0.10),
+                ],
+                [body_w * 0.22, body_h * 0.28, body_len * 0.16],
+                torso_pivot,
+                [-0.22, 0.0, 0.0],
+                0.0,
+                34,
+            );
+        }
+    }
+
+    // Legs in diagonal gait. Six-legged species insert a middle row; the part
+    // binding still uses left/right so walk articulation stays coherent.
+    let rows: &[f32] = if features.six_legs {
+        &[-0.34, 0.0, 0.34]
+    } else {
+        &[-0.32, 0.34]
+    };
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for (row_index, z_factor) in rows.iter().copied().enumerate() {
+            let z = z_factor * body_len;
+            let pivot = [side * body_w * 0.34, leg_h, z];
+            let diagonal_phase = if (row_index + usize::from(side > 0.0)) % 2 == 0 {
+                0.0
+            } else {
+                PI
+            };
+            let gait =
+                (pose.base.limb_swing + diagonal_phase).cos() * pose.base.limb_swing_amount * 0.28;
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [pivot[0], leg_h * 0.50, z],
+                [
+                    w * if features.stocky { 0.22 } else { 0.16 },
+                    leg_h,
+                    w * 0.18,
+                ],
+                pivot,
+                [gait, 0.0, 0.0],
+                0.0,
+            );
+        }
+    }
+
+    // Tails: bushy tails are thick and raised, long tails are thin whips, and
+    // otherwise a short rear nub keeps the silhouette readable.
+    let tail_pivot = [0.0, body_y + body_h * 0.12, body_len * 0.52];
+    if features.bushy_tail {
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, body_y + body_h * 0.24, body_len * 0.66],
+            [body_w * 0.25, body_h * 0.28, body_len * 0.34],
+            tail_pivot,
+            [-0.65, 0.0, 0.0],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, body_y + body_h * 0.46, body_len * 0.78],
+            [body_w * 0.18, body_h * 0.22, body_len * 0.24],
+            tail_pivot,
+            [-0.95, 0.0, 0.0],
+            0.0,
+        );
+    } else if features.long_tail {
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, body_y, body_len * 0.69],
+            [body_w * 0.10, body_h * 0.12, body_len * 0.42],
+            tail_pivot,
+            [-0.30, 0.0, 0.0],
+            0.0,
+        );
+    } else {
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, body_y + body_h * 0.08, body_len * 0.57],
+            [body_w * 0.12, body_h * 0.13, body_len * 0.18],
+            tail_pivot,
+            [-0.30, 0.0, 0.0],
+            0.0,
+        );
+    }
+
+    if features.mushrooms {
+        for (x, z) in [(-0.24_f32, -0.08_f32), (0.18, 0.10), (0.0, 0.30)] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Torso,
+                [x * body_w, body_y + body_h * 0.62, z * body_len],
+                [body_w * 0.20, body_h * 0.16, body_len * 0.15],
+                torso_pivot,
+                [0.0; 3],
+                0.0,
+                35,
+            );
+        }
+    }
+    if pose.armor_visible {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, body_y + body_h * 0.03, 0.0],
+            [body_w, body_h, body_len],
+            torso_pivot,
+            [0.0; 3],
+            w * 0.025,
+            20,
+        );
+    }
+}
+
+/// Armadillo (id 2), including the rolled-ball defensive pose. Walking form
+/// is a low shell-plated quadruped; rolled form retracts the head, legs, and
+/// tail into a banded ball.
+fn add_vanilla_armadillo(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    if pose.rolled_up {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.48, 0.0],
+            [w * 0.88, h * 0.82, w * 0.88],
+            [0.0; 3],
+            [0.0, 0.35, 0.0],
+            0.0,
+            31,
+        );
+        for i in 0..3 {
+            let f = i as f32 - 1.0;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Shell,
+                [0.0, h * (0.48 + f * 0.16), -w * 0.03],
+                [w * 0.92, h * 0.055, w * 0.92],
+                [0.0; 3],
+                [0.0, f * 0.4, 0.0],
+                0.0,
+                36,
+            );
+        }
+        return;
+    }
+    add_quadruped_rig(
+        mesh,
+        spec,
+        pose,
+        QuadrupedFeatures {
+            snout: true,
+            pointed_ears: true,
+            shell: true,
+            long_tail: true,
+            slim: true,
+            ..QuadrupedFeatures::default()
+        },
+    );
+    // Shell bands across the dome.
+    for i in 0..4 {
+        let f = i as f32 - 1.5;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.68, f * w * 0.17],
+            [w * 0.66, h * 0.055, w * 0.045],
+            [0.0, h * 0.55, 0.0],
+            [0.0; 3],
+            0.0,
+            36,
+        );
+    }
+}
+
+/// Frog (id 43): wide head/jaw, squat torso, long folded hind legs, and
+/// webbed feet.
+fn add_vanilla_frog(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.42, w * 0.05],
+        [w * 0.72, h * 0.38, w * 0.62],
+        [0.0, h * 0.50, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.58, -w * 0.18];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.61, -w * 0.28],
+        [w * 0.82, h * 0.30, w * 0.42],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    let jaw = pose.open_amount * 0.5 + (pose.base.swing_progress * PI).sin() * 0.2;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.50, -w * 0.43],
+        [w * 0.74, h * 0.08, w * 0.38],
+        head_pivot,
+        [jaw, 0.0, 0.0],
+        0.0,
+        37,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.24, h * 0.80, -w * 0.31],
+            [w * 0.14, h * 0.13, w * 0.14],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+            38,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for z in [-0.20_f32, 0.22] {
+            let pivot = [side * w * 0.31, h * 0.34, z * w];
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.42, h * 0.22, z * w],
+                [w * 0.28, h * 0.18, w * 0.18],
+                pivot,
+                [0.0, side * 0.35, side * 0.20],
+                0.0,
+            );
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.52, h * 0.08, z * w - w * 0.04],
+                [w * 0.34, h * 0.055, w * 0.27],
+                pivot,
+                [0.0, side * 0.18, 0.0],
+                0.0,
+                39,
+            );
+        }
+    }
+}
+
+/// Turtle (id 111): broad domed shell, small head, and four flippers.
+fn add_vanilla_turtle(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.45, 0.0],
+        [w * 0.88, h * 0.48, w * 0.78],
+        [0.0, h * 0.36, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.68, 0.0],
+        [w * 0.68, h * 0.18, w * 0.60],
+        [0.0, h * 0.42, 0.0],
+        [0.0; 3],
+        0.0,
+        31,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.42, -w * 0.50],
+        [w * 0.24, h * 0.23, w * 0.28],
+        [0.0, h * 0.40, -w * 0.34],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for (z, front) in [(-0.24_f32, true), (0.24, false)] {
+            let pivot = [side * w * 0.38, h * 0.30, z * w];
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.52, h * 0.20, z * w],
+                [w * if front { 0.36 } else { 0.28 }, h * 0.08, w * 0.24],
+                pivot,
+                [0.0, side * if front { 0.30 } else { -0.20 }, 0.0],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Ravager (id 85): huge bull-like head with horns, heavy jaw, armored torso,
+/// and four thick legs.
+fn add_vanilla_ravager(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.57, w * 0.08],
+        [w * 0.65, h * 0.38, w * 0.72],
+        [0.0, h * 0.66, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.70, -w * 0.28];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.72, -w * 0.46],
+        [w * 0.55, h * 0.32, w * 0.36],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.63, -w * 0.68],
+        [w * 0.43, h * 0.15, w * 0.25],
+        head_pivot,
+        [pose.open_amount * 0.35, 0.0, 0.0],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.34, h * 0.84, -w * 0.40],
+            [w * 0.10, h * 0.20, w * 0.10],
+            head_pivot,
+            [-0.45, 0.0, side * 0.55],
+            0.0,
+            33,
+        );
+        for z in [-0.22_f32, 0.28] {
+            let pivot = [side * w * 0.25, h * 0.40, z * w];
+            add(
+                mesh,
+                spec,
+                pose,
+                if side < 0.0 { LeftLeg } else { RightLeg },
+                [pivot[0], h * 0.20, pivot[2]],
+                [w * 0.18, h * 0.40, w * 0.18],
+                pivot,
+                [0.0; 3],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Sniffer (id 95): long low torso, very wide sniffing snout, ear/frill fins,
+/// six short legs, and a mossy dorsal ridge.
+fn add_vanilla_sniffer(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    add_quadruped_rig(
+        mesh,
+        spec,
+        pose,
+        QuadrupedFeatures {
+            snout: true,
+            long_tail: true,
+            six_legs: true,
+            stocky: true,
+            ..QuadrupedFeatures::default()
+        },
+    );
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    // Broad nose pad and two side frills are the clearest sniffer silhouette.
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.72, -w * 0.67],
+        [w * 0.40, h * 0.10, w * 0.17],
+        [0.0, h * 0.66, -w * 0.25],
+        [0.0; 3],
+        0.0,
+        40,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.30, h * 0.83, -w * 0.30],
+            [w * 0.18, h * 0.06, w * 0.28],
+            [0.0, h * 0.72, -w * 0.18],
+            [0.0, side * 0.35, side * 0.35],
+            0.0,
+            41,
+        );
+    }
+    for i in 0..4 {
+        let f = i as f32;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * (0.82 + f * 0.015), w * (-0.22 + f * 0.15)],
+            [w * 0.12, h * 0.12, w * 0.10],
+            [0.0, h * 0.70, 0.0],
+            [0.0; 3],
+            0.0,
+            42,
+        );
+    }
+}
+
+/// Rabbit (id 84): compact body, long upright ears, powerful hind legs, small
+/// forelegs, and a round tail nub.
+fn add_vanilla_rabbit(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.43, w * 0.03],
+        [w * 0.62, h * 0.46, w * 0.70],
+        [0.0, h * 0.52, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.60, -w * 0.25];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.67, -w * 0.35],
+        [w * 0.52, h * 0.38, w * 0.42],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.15, h * 1.08, -w * 0.34],
+            [w * 0.13, h * 0.70, w * 0.09],
+            head_pivot,
+            [0.10, 0.0, -side * 0.12],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.22, h * 0.16, w * 0.20],
+            [w * 0.20, h * 0.30, w * 0.28],
+            [side * w * 0.20, h * 0.36, w * 0.18],
+            [0.0; 3],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.19, h * 0.14, -w * 0.21],
+            [w * 0.13, h * 0.25, w * 0.13],
+            [side * w * 0.18, h * 0.34, -w * 0.20],
+            [0.0; 3],
+            0.0,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.43, w * 0.43],
+        [w * 0.20, h * 0.18, w * 0.16],
+        [0.0, h * 0.43, w * 0.30],
+        [0.0; 3],
+        0.0,
+    );
+}
+
+/// Spider/cave spider: cephalothorax, abdomen, eye cluster, and eight long
+/// jointed legs with alternating lift phase.
+fn add_vanilla_spider(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.58, w * 0.18],
+        [w * 0.52, h * 0.48, w * 0.48],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.52, -w * 0.17],
+        [w * 0.44, h * 0.36, w * 0.36],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        for eye in 0..3 {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [
+                    side * w * (0.06 + eye as f32 * 0.055),
+                    h * (0.58 - eye as f32 * 0.04),
+                    -w * 0.37,
+                ],
+                [w * 0.045, h * 0.045, w * 0.025],
+                [0.0, h * 0.54, -w * 0.20],
+                [0.0; 3],
+                0.0,
+                43,
+            );
+        }
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        for index in 0..4 {
+            let f = index as f32;
+            let z = (f - 1.5) * w * 0.18;
+            let pivot = [side * w * 0.22, h * 0.52, z];
+            let lift = (pose.base.limb_swing + f * FRAC_PI_2 + if side < 0.0 { 0.0 } else { PI })
+                .cos()
+                * pose.base.limb_swing_amount
+                * 0.18;
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.43, h * 0.43, z],
+                [w * 0.48, h * 0.09, w * 0.07],
+                pivot,
+                [lift, (f - 1.5) * 0.14, side * 0.42],
+                0.0,
+            );
+            add(
+                mesh,
+                spec,
+                pose,
+                part,
+                [side * w * 0.65, h * 0.25, z],
+                [w * 0.08, h * 0.38, w * 0.06],
+                pivot,
+                [lift, (f - 1.5) * 0.14, side * 0.15],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Silverfish/endermite segmented crawler with tiny side feet.
+fn add_vanilla_segmented_pest(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    for i in 0..4 {
+        let f = i as f32;
+        let z = (f - 1.5) * w * 0.22;
+        let wave = (pose.base.age_ticks * 0.8 + pose.base.limb_swing - f * 0.7).sin() * 0.06;
+        add(
+            mesh,
+            spec,
+            pose,
+            if i == 0 { Head } else { Core },
+            [wave * w, h * 0.50, z],
+            [w * (0.52 - f * 0.04), h * (0.55 - f * 0.03), w * 0.24],
+            [0.0, h * 0.50, 0.0],
+            [0.0, wave, 0.0],
+            0.0,
+        );
+        for side in [-1.0_f32, 1.0] {
+            add(
+                mesh,
+                spec,
+                pose,
+                if side < 0.0 { LeftLeg } else { RightLeg },
+                [side * w * 0.34, h * 0.26, z],
+                [w * 0.18, h * 0.08, w * 0.055],
+                [side * w * 0.22, h * 0.38, z],
+                [0.0, 0.0, side * 0.28],
+                0.0,
+            );
+        }
+    }
+}
+
+/// Bee (id 7): striped plump body, two independent wings, antennae, legs,
+/// and rear stinger.
+fn add_vanilla_bee(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.50, 0.0],
+        [w * 0.68, h * 0.58, w * 0.82],
+        [0.0, h * 0.50, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for z in [-0.22_f32, 0.12, 0.38] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Torso,
+            [0.0, h * 0.50, z * w],
+            [w * 0.70, h * 0.60, w * 0.10],
+            [0.0, h * 0.50, 0.0],
+            [0.0; 3],
+            0.0,
+            44,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.55, -w * 0.46],
+        [w * 0.46, h * 0.42, w * 0.26],
+        [0.0, h * 0.50, -w * 0.30],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftWing, -1.0_f32), (RightWing, 1.0)] {
+        let pivot = [side * w * 0.18, h * 0.76, -w * 0.02];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.43, h * 0.78, w * 0.06],
+            [w * 0.48, h * 0.045, w * 0.40],
+            pivot,
+            [0.0, -side * 0.25, 0.0],
+            0.0,
+        );
+    }
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.15, h * 0.84, -w * 0.54],
+            [w * 0.045, h * 0.22, w * 0.045],
+            [0.0, h * 0.62, -w * 0.44],
+            [0.45, 0.0, -side * 0.35],
+            0.0,
+        );
+        for z in [-0.18_f32, 0.15] {
+            add(
+                mesh,
+                spec,
+                pose,
+                if side < 0.0 { LeftLeg } else { RightLeg },
+                [side * w * 0.25, h * 0.18, z * w],
+                [w * 0.06, h * 0.26, w * 0.06],
+                [side * w * 0.20, h * 0.36, z * w],
+                [0.0; 3],
+                0.0,
+            );
+        }
+    }
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.50, w * 0.52],
+        [w * 0.10, h * 0.10, w * 0.22],
+        [0.0, h * 0.50, w * 0.38],
+        [0.0; 3],
+        0.0,
+        45,
+    );
+}
+
+/// Bat (id 6): small body/head, tall ears, and wide membraned wings.
+fn add_vanilla_bat(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.45, 0.0],
+        [w * 0.42, h * 0.48, w * 0.36],
+        [0.0, h * 0.55, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.67, -w * 0.03];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.73, -w * 0.04],
+        [w * 0.44, h * 0.28, w * 0.38],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [side * w * 0.16, h * 0.94, -w * 0.03],
+            [w * 0.10, h * 0.28, w * 0.08],
+            head_pivot,
+            [0.0, 0.0, -side * 0.20],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftWing, -1.0_f32), (RightWing, 1.0)] {
+        let pivot = [side * w * 0.18, h * 0.57, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.67, h * 0.52, 0.0],
+            [w * 0.92, h * 0.07, w * 0.52],
+            pivot,
+            [0.0, -side * 0.12, 0.0],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.82, h * 0.39, w * 0.16],
+            [w * 0.55, h * 0.055, w * 0.32],
+            pivot,
+            [0.0, -side * 0.34, 0.0],
+            0.0,
+        );
+    }
+}
+
+/// Small bird body shared by chicken/parrot. `long_tail` selects the parrot
+/// silhouette; chickens receive comb, wattles, and a shorter fan tail.
+fn add_vanilla_bird(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    long_tail: bool,
+) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.43, 0.0],
+        [w * 0.62, h * 0.48, w * 0.62],
+        [0.0, h * 0.60, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.68, -w * 0.18];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.75, -w * 0.25],
+        [w * 0.46, h * 0.34, w * 0.42],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.72, -w * 0.55],
+        [w * 0.22, h * 0.12, w * 0.22],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+        46,
+    );
+    if long_tail {
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [0.0, h * 0.42, w * 0.52],
+            [w * 0.26, h * 0.10, w * 0.62],
+            [0.0, h * 0.43, w * 0.28],
+            [-0.28, 0.0, 0.0],
+            0.0,
+        );
+    } else {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.96, -w * 0.23],
+            [w * 0.14, h * 0.17, w * 0.09],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+            47,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Head,
+            [0.0, h * 0.57, -w * 0.47],
+            [w * 0.14, h * 0.18, w * 0.08],
+            head_pivot,
+            [0.0; 3],
+            0.0,
+            47,
+        );
+        for side in [-1.0_f32, 1.0] {
+            add(
+                mesh,
+                spec,
+                pose,
+                Tail,
+                [side * w * 0.12, h * 0.55, w * 0.44],
+                [w * 0.14, h * 0.28, w * 0.34],
+                [0.0, h * 0.45, w * 0.28],
+                [-0.55, side * 0.18, 0.0],
+                0.0,
+            );
+        }
+    }
+    for (part, side) in [(LeftWing, -1.0_f32), (RightWing, 1.0)] {
+        let pivot = [side * w * 0.29, h * 0.55, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.42, h * 0.44, 0.0],
+            [w * 0.18, h * 0.38, w * 0.52],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.16, h * 0.12, -w * 0.02],
+            [w * 0.07, h * 0.24, w * 0.07],
+            [side * w * 0.16, h * 0.25, 0.0],
+            [0.0; 3],
+            0.0,
+        );
+    }
+}
+
+/// Allay/vex fairy-like body with glowing or dark wing blades and small arms.
+fn add_vanilla_spirit(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let hostile = spec.entity_type_id == 112;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.43, 0.0],
+        [w * 0.55, h * 0.42, w * 0.42],
+        [0.0, h * 0.62, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.79, -w * 0.02],
+        [w * 0.62, h * 0.32, w * 0.56],
+        [0.0, h * 0.62, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for (part, side) in [(LeftArm, -1.0_f32), (RightArm, 1.0)] {
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.36, h * 0.42, -w * 0.03],
+            [w * 0.10, h * 0.38, w * 0.10],
+            [side * w * 0.30, h * 0.62, 0.0],
+            [0.0; 3],
+            0.0,
+        );
+    }
+    for (part, side) in [(LeftWing, -1.0_f32), (RightWing, 1.0)] {
+        let pivot = [side * w * 0.18, h * 0.60, w * 0.14];
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.48, h * 0.64, w * 0.20],
+            [w * 0.55, h * 0.055, w * 0.36],
+            pivot,
+            [0.0, -side * 0.28, 0.0],
+            0.0,
+            if hostile { 48 } else { 49 },
+        );
+    }
+    if hostile {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            RightArm,
+            [w * 0.45, h * 0.30, -w * 0.18],
+            [w * 0.07, h * 0.38, w * 0.07],
+            [w * 0.30, h * 0.62, 0.0],
+            [-0.55, 0.0, 0.12],
+            0.0,
+            18,
+        );
+    }
+}
+
+/// Generic fish body for cod/salmon/tropical fish, with tail, dorsal, and
+/// pectoral fins. Width/height differences in the registry preserve species.
+fn add_vanilla_fish(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.52, -w * 0.03],
+        [w * 0.46, h * 0.56, w * 0.82],
+        [0.0, h * 0.52, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.53, -w * 0.43],
+        [w * 0.38, h * 0.44, w * 0.24],
+        [0.0, h * 0.52, -w * 0.25],
+        [0.0; 3],
+        0.0,
+    );
+    let tail_wave = (pose.base.age_ticks * 0.8 + pose.base.limb_swing).sin() * 0.35;
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.52, w * 0.55],
+        [w * 0.10, h * 0.52, w * 0.32],
+        [0.0, h * 0.52, w * 0.34],
+        [0.0, tail_wave, 0.0],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.84, -w * 0.02],
+        [w * 0.08, h * 0.24, w * 0.34],
+        [0.0, h * 0.62, 0.0],
+        [0.0; 3],
+        0.0,
+        50,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            if side < 0.0 { LeftWing } else { RightWing },
+            [side * w * 0.28, h * 0.43, -w * 0.08],
+            [w * 0.18, h * 0.06, w * 0.24],
+            [side * w * 0.20, h * 0.48, -w * 0.04],
+            [0.0, side * 0.35, side * 0.30],
+            0.0,
+        );
+    }
+}
+
+/// Dolphin (id 24): elongated torso, beak snout, dorsal fin, side flippers,
+/// and horizontal tail fluke.
+fn add_vanilla_dolphin(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.52, 0.0],
+        [w * 0.46, h * 0.55, w * 1.05],
+        [0.0, h * 0.52, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.55, -w * 0.58],
+        [w * 0.42, h * 0.45, w * 0.30],
+        [0.0, h * 0.54, -w * 0.40],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.49, -w * 0.83],
+        [w * 0.20, h * 0.16, w * 0.34],
+        [0.0, h * 0.54, -w * 0.40],
+        [0.0; 3],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.86, -w * 0.02],
+        [w * 0.10, h * 0.34, w * 0.30],
+        [0.0, h * 0.62, 0.0],
+        [-0.20, 0.0, 0.0],
+        0.0,
+        50,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            if side < 0.0 { LeftWing } else { RightWing },
+            [side * w * 0.34, h * 0.32, -w * 0.12],
+            [w * 0.28, h * 0.07, w * 0.34],
+            [side * w * 0.20, h * 0.43, -w * 0.10],
+            [0.0, side * 0.25, side * 0.40],
+            0.0,
+        );
+    }
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [side * w * 0.17, h * 0.52, w * 0.65],
+            [w * 0.32, h * 0.07, w * 0.32],
+            [0.0, h * 0.52, w * 0.48],
+            [0.0, side * 0.35, 0.0],
+            0.0,
+        );
+    }
+}
+
+/// Axolotl (id 5): broad smiling head, three gill frills per side, small legs,
+/// and a vertical fin tail.
+fn add_vanilla_axolotl(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.43, w * 0.06],
+        [w * 0.54, h * 0.42, w * 0.70],
+        [0.0, h * 0.46, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let head_pivot = [0.0, h * 0.50, -w * 0.25];
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.52, -w * 0.38],
+        [w * 0.62, h * 0.38, w * 0.36],
+        head_pivot,
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        for i in 0..3 {
+            let f = i as f32 - 1.0;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Head,
+                [side * w * 0.40, h * (0.52 + f * 0.15), -w * 0.30],
+                [w * 0.18, h * 0.055, w * 0.10],
+                head_pivot,
+                [0.0, side * 0.25, side * (0.35 + f * 0.12)],
+                0.0,
+                51,
+            );
+        }
+        for z in [-0.18_f32, 0.22] {
+            add(
+                mesh,
+                spec,
+                pose,
+                if side < 0.0 { LeftLeg } else { RightLeg },
+                [side * w * 0.28, h * 0.16, z * w],
+                [w * 0.12, h * 0.25, w * 0.10],
+                [side * w * 0.22, h * 0.30, z * w],
+                [0.0; 3],
+                0.0,
+            );
+        }
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.44, w * 0.52],
+        [w * 0.12, h * 0.38, w * 0.42],
+        [0.0, h * 0.45, w * 0.34],
+        [0.0; 3],
+        0.0,
+    );
+}
+
+/// Squid/glow squid: mantle/head and eight individually waving tentacles.
+fn add_vanilla_squid(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.68, -w * 0.04],
+        [w * 0.72, h * 0.55, w * 0.72],
+        [0.0, h * 0.62, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for i in 0..8 {
+        let f = i as f32;
+        let angle = f * TAU / 8.0;
+        let x = angle.cos() * w * 0.20;
+        let z = angle.sin() * w * 0.20;
+        let wave = (pose.base.age_ticks * 0.65 + f * 0.7).sin() * 0.22;
+        add(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [x + wave * w * 0.05, h * 0.23, z + wave * w * 0.03],
+            [w * 0.10, h * 0.48, w * 0.10],
+            [x, h * 0.43, z],
+            [wave * 0.45, angle, -wave * 0.25],
+            0.0,
+        );
+    }
+}
+
+/// Pufferfish: cubic body, fins, tail, and retractable radial spikes controlled
+/// by `swell_amount`.
+fn add_vanilla_pufferfish(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let inflate = 1.0 + pose.swell_amount * 0.35;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, 0.0],
+        [w * 0.58 * inflate, h * 0.58 * inflate, w * 0.58 * inflate],
+        [0.0, h * 0.50, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    for i in 0..12 {
+        let f = i as f32;
+        let angle = f * TAU / 12.0;
+        let x = angle.cos() * w * 0.34 * inflate;
+        let z = angle.sin() * w * 0.34 * inflate;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [x, h * (0.50 + (i % 3) as f32 * 0.10 - 0.10), z],
+            [w * 0.045, h * 0.17 * (0.6 + pose.swell_amount), w * 0.045],
+            [x * 0.75, h * 0.50, z * 0.75],
+            [0.45 * z.signum(), angle, -0.45 * x.signum()],
+            0.0,
+            52,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.50, w * 0.48],
+        [w * 0.10, h * 0.34, w * 0.24],
+        [0.0, h * 0.50, w * 0.32],
+        [0.0; 3],
+        0.0,
+    );
+}
+
+/// Tadpole (id 104): tiny round body and large flexible tail fin.
+fn add_vanilla_tadpole(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.52, -w * 0.15],
+        [w * 0.55, h * 0.55, w * 0.55],
+        [0.0, h * 0.50, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    let wave = (pose.base.age_ticks * 0.9 + pose.base.limb_swing).sin() * 0.4;
+    add(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [0.0, h * 0.50, w * 0.34],
+        [w * 0.16, h * 0.36, w * 0.65],
+        [0.0, h * 0.50, w * 0.05],
+        [0.0, wave, 0.0],
+        0.0,
+    );
+}
+
+/// Strider (id 103): broad flat head/body, bristle crown, and two very tall
+/// thin legs for lava walking.
+fn add_vanilla_strider(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Torso,
+        [0.0, h * 0.72, 0.0],
+        [w * 0.82, h * 0.24, w * 0.72],
+        [0.0, h * 0.76, 0.0],
+        [0.0; 3],
+        0.0,
+    );
+    add(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.69, -w * 0.32],
+        [w * 0.64, h * 0.20, w * 0.26],
+        [0.0, h * 0.72, -w * 0.15],
+        [0.0; 3],
+        0.0,
+    );
+    for i in 0..7 {
+        let f = i as f32 - 3.0;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [f * w * 0.09, h * 0.89 + f.abs() * -h * 0.015, w * 0.02],
+            [w * 0.045, h * 0.18, w * 0.045],
+            [0.0, h * 0.78, 0.0],
+            [0.15, 0.0, f * 0.08],
+            0.0,
+            53,
+        );
+    }
+    for (part, side) in [(LeftLeg, -1.0_f32), (RightLeg, 1.0)] {
+        let pivot = [side * w * 0.18, h * 0.62, 0.0];
+        add(
+            mesh,
+            spec,
+            pose,
+            part,
+            [side * w * 0.20, h * 0.31, 0.0],
+            [w * 0.10, h * 0.62, w * 0.10],
+            pivot,
+            [0.0; 3],
+            0.0,
+        );
+    }
+}
+
+/// Emit the twelve thin edges of a rectangular frame. Every edge shares the
+/// same pivot/rotation, so the whole cage can rotate as one rigid object.
+#[allow(clippy::too_many_arguments)]
+fn add_cube_frame(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    center: [f32; 3],
+    size: [f32; 3],
+    pivot: [f32; 3],
+    rotation: [f32; 3],
+    tint: i32,
+) {
+    use EntityRigPart::Shell;
+    let sx = size[0];
+    let sy = size[1];
+    let sz = size[2];
+    let t = sx.min(sy).min(sz) * 0.055;
+    for y in [-0.5_f32, 0.5] {
+        for z in [-0.5_f32, 0.5] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Shell,
+                [center[0], center[1] + y * sy, center[2] + z * sz],
+                [sx, t, t],
+                pivot,
+                rotation,
+                0.0,
+                tint,
+            );
+        }
+    }
+    for x in [-0.5_f32, 0.5] {
+        for z in [-0.5_f32, 0.5] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Shell,
+                [center[0] + x * sx, center[1], center[2] + z * sz],
+                [t, sy, t],
+                pivot,
+                rotation,
+                0.0,
+                tint,
+            );
+        }
+    }
+    for x in [-0.5_f32, 0.5] {
+        for y in [-0.5_f32, 0.5] {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Shell,
+                [center[0] + x * sx, center[1] + y * sy, center[2]],
+                [t, t, sz],
+                pivot,
+                rotation,
+                0.0,
+                tint,
+            );
+        }
+    }
+}
+
+/// Boat/chest boat: open hull with bottom, side walls, bow/stern transoms,
+/// seat slats, paddles, and an optional centered chest.
+fn add_vanilla_boat(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.16, 0.0],
+        [w * 0.78, h * 0.16, w * 0.82],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [side * w * 0.43, h * 0.43, 0.0],
+            [w * 0.10, h * 0.52, w * 0.84],
+            [0.0; 3],
+            [0.0, 0.0, -side * 0.12],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [side * w * 0.28, h * 0.49, -w * 0.43],
+            [w * 0.34, h * 0.45, w * 0.10],
+            [0.0; 3],
+            [0.0, side * 0.35, 0.0],
+            0.0,
+        );
+        // Paddles stowed along the gunwales.
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            [side * w * 0.48, h * 0.70, w * 0.06],
+            [w * 0.055, h * 0.08, w * 0.62],
+            [0.0; 3],
+            [0.0, side * 0.08, 0.0],
+            0.0,
+            54,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            [side * w * 0.48, h * 0.70, -w * 0.32],
+            [w * 0.16, h * 0.10, w * 0.20],
+            [0.0; 3],
+            [0.0, side * 0.08, 0.0],
+            0.0,
+            54,
+        );
+    }
+    add(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.43, w * 0.43],
+        [w * 0.74, h * 0.48, w * 0.10],
+        [0.0; 3],
+        [0.10, 0.0, 0.0],
+        0.0,
+    );
+    for z in [-0.16_f32, 0.18] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            [0.0, h * 0.48, z * w],
+            [w * 0.64, h * 0.08, w * 0.10],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            55,
+        );
+    }
+    if spec.entity_type_id == 17 {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, h * 0.72, w * 0.18],
+            [w * 0.42, h * 0.48, w * 0.34],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            56,
+        );
+    }
+}
+
+/// Minecart tub plus optional chest/furnace/TNT/hopper/spawner/command-block
+/// cargo. The tub is five walls: bottom plus four side plates.
+fn add_vanilla_minecart(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.18, 0.0],
+        [w * 0.78, h * 0.12, w * 0.70],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [side * w * 0.43, h * 0.43, 0.0],
+            [w * 0.10, h * 0.48, w * 0.72],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+        );
+        add(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.43, side * w * 0.39],
+            [w * 0.78, h * 0.48, w * 0.10],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+        );
+    }
+    let cargo_y = h * 0.72;
+    match spec.entity_type_id {
+        18 => add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, cargo_y, 0.0],
+            [w * 0.56, h * 0.52, w * 0.48],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            56,
+        ),
+        21 => add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, cargo_y, 0.0],
+            [w * 0.52, h * 0.48, w * 0.48],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            57,
+        ),
+        44 => {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, cargo_y, 0.0],
+                [w * 0.54, h * 0.52, w * 0.50],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                58,
+            );
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, cargo_y, -w * 0.26],
+                [w * 0.30, h * 0.28, w * 0.035],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                59,
+            );
+        }
+        52 => {
+            for i in 0..3 {
+                let f = i as f32;
+                add_tinted(
+                    mesh,
+                    spec,
+                    pose,
+                    Core,
+                    [0.0, h * (0.64 + f * 0.12), 0.0],
+                    [w * (0.62 - f * 0.14), h * 0.12, w * (0.56 - f * 0.12)],
+                    [0.0; 3],
+                    [0.0; 3],
+                    0.0,
+                    60,
+                );
+            }
+        }
+        98 => {
+            add_cube_frame(
+                mesh,
+                spec,
+                pose,
+                [0.0, cargo_y, 0.0],
+                [w * 0.58, h * 0.56, w * 0.52],
+                [0.0, cargo_y, 0.0],
+                [0.0; 3],
+                61,
+            );
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, cargo_y, 0.0],
+                [w * 0.18, h * 0.18, w * 0.18],
+                [0.0, cargo_y, 0.0],
+                [0.0, pose.base.age_ticks * 0.8, 0.0],
+                0.0,
+                62,
+            );
+        }
+        107 => {
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, cargo_y, 0.0],
+                [w * 0.54, h * 0.52, w * 0.50],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                63,
+            );
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Core,
+                [0.0, cargo_y + h * 0.04, 0.0],
+                [w * 0.56, h * 0.09, w * 0.52],
+                [0.0; 3],
+                [0.0; 3],
+                0.0,
+                64,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// End crystal (id 30): bright inner core inside two tilted counter-rotating
+/// glass cube frames.
+fn add_vanilla_end_crystal(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let center = [0.0, h * 0.52, 0.0];
+    let spin = pose.base.age_ticks * 0.35;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        center,
+        [w * 0.20, h * 0.20, w * 0.20],
+        center,
+        [0.45, spin * 1.7, 0.45],
+        0.0,
+        65,
+    );
+    add_cube_frame(
+        mesh,
+        spec,
+        pose,
+        center,
+        [w * 0.48, h * 0.48, w * 0.48],
+        center,
+        [0.35, spin, 0.18],
+        66,
+    );
+    add_cube_frame(
+        mesh,
+        spec,
+        pose,
+        center,
+        [w * 0.62, h * 0.62, w * 0.62],
+        center,
+        [-0.25, -spin * 0.75, 0.42],
+        67,
+    );
+    // Small bedrock-like base fragment keeps the crystal grounded.
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.08, 0.0],
+        [w * 0.34, h * 0.14, w * 0.34],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        68,
+    );
+}
+
+/// Arrow/spectral arrow: long shaft, flint head, and three fletching vanes.
+fn add_vanilla_arrow(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let glow = spec.entity_type_id == 99;
+    let tint = if glow { 69 } else { 70 };
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, 0.0],
+        [w * 0.08, h * 0.08, w * 0.92],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        tint,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, -w * 0.49],
+        [w * 0.16, h * 0.16, w * 0.18],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        tint + 1,
+    );
+    for i in 0..3 {
+        let angle = i as f32 * TAU / 3.0;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [
+                angle.cos() * w * 0.08,
+                h * 0.50 + angle.sin() * w * 0.08,
+                w * 0.36,
+            ],
+            [w * 0.035, h * 0.15, w * 0.23],
+            [0.0, h * 0.50, w * 0.20],
+            [angle, 0.0, 0.0],
+            0.0,
+            tint + 2,
+        );
+    }
+}
+
+/// Trident (id 109): long shaft, crossbar, and three forward prongs.
+fn add_vanilla_trident(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, 0.0],
+        [w * 0.08, h * 0.08, w * 1.05],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        71,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, -w * 0.42],
+        [w * 0.45, h * 0.07, w * 0.08],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        72,
+    );
+    for x in [-0.18_f32, 0.0, 0.18] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [x * w, h * 0.50, -w * 0.58],
+            [w * 0.065, h * 0.065, w * 0.34],
+            [0.0; 3],
+            [0.0; 3],
+            0.0,
+            72,
+        );
+    }
+}
+
+/// Falling block / primed TNT full cube. TNT receives the white center band
+/// and black cap strips that make it distinct from a generic block drop.
+fn add_vanilla_block_entity(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let spin = if spec.entity_type_id == 106 {
+        pose.base.age_ticks * 0.25
+    } else {
+        0.0
+    };
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.50, 0.0],
+        [w * 0.92, h * 0.92, w * 0.92],
+        [0.0, h * 0.5, 0.0],
+        [0.0, spin, 0.0],
+        0.0,
+    );
+    if spec.entity_type_id == 106 {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.50, 0.0],
+            [w * 0.94, h * 0.18, w * 0.94],
+            [0.0, h * 0.5, 0.0],
+            [0.0, spin, 0.0],
+            0.0,
+            64,
+        );
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Shell,
+            [0.0, h * 0.90, 0.0],
+            [w * 0.94, h * 0.08, w * 0.94],
+            [0.0, h * 0.5, 0.0],
+            [0.0, spin, 0.0],
+            0.0,
+            63,
+        );
+    }
+}
+
+/// Firework rocket: paper tube, nose cone approximation, fuse, and fins.
+fn add_vanilla_firework(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.45, 0.0],
+        [w * 0.30, h * 0.70, w * 0.30],
+        [0.0, h * 0.45, 0.0],
+        [0.35, pose.base.age_ticks * 0.5, 0.0],
+        0.0,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.86, 0.0],
+        [w * 0.22, h * 0.18, w * 0.22],
+        [0.0, h * 0.70, 0.0],
+        [0.35, 0.0, 0.0],
+        0.0,
+        73,
+    );
+    for side in [-1.0_f32, 1.0] {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Tail,
+            [side * w * 0.20, h * 0.19, 0.0],
+            [w * 0.16, h * 0.25, w * 0.05],
+            [0.0, h * 0.35, 0.0],
+            [0.25, 0.0, side * 0.35],
+            0.0,
+            74,
+        );
+    }
+}
+
+/// Area effect cloud: nested flat translucent voxel puffs spanning the large
+/// effect radius rather than a single invisible collision box.
+fn add_vanilla_area_cloud(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height.max(0.5);
+    for ring in 0..4 {
+        let f = ring as f32;
+        let spin =
+            pose.base.age_ticks * (0.08 + f * 0.025) * if ring % 2 == 0 { 1.0 } else { -1.0 };
+        let radius = w * (0.16 + f * 0.12);
+        for i in 0..5 {
+            let angle = spin + i as f32 * TAU / 5.0 + f * 0.35;
+            add_tinted(
+                mesh,
+                spec,
+                pose,
+                Other,
+                [
+                    angle.cos() * radius,
+                    h * (0.18 + f * 0.12),
+                    angle.sin() * radius,
+                ],
+                [w * 0.11, h * 0.10, w * 0.11],
+                [0.0; 3],
+                [0.0, angle, 0.0],
+                0.0,
+                75,
+            );
+        }
+    }
+}
+
+/// Lightning bolt placeholder: a tall jagged chain of thin bright segments.
+/// The registry collision size is zero, so this rig intentionally uses fixed
+/// visual units rather than inheriting the clamped 0.125 placeholder size.
+fn add_vanilla_lightning(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let visual_h = 8.0_f32;
+    for i in 0..7 {
+        let f = i as f32;
+        let y0 = visual_h * (0.08 + f * 0.13);
+        let jitter = ((i as u32 * 37 + 11) % 5) as f32 - 2.0;
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            [jitter * 0.07, y0, ((i as u32 * 19) % 3) as f32 * 0.05],
+            [0.10, visual_h * 0.17, 0.10],
+            [0.0, y0 - visual_h * 0.06, 0.0],
+            [0.10 * jitter, 0.0, -0.16 * jitter],
+            0.0,
+            76,
+        );
+    }
+}
+
+/// Small item/frame/painting/plate rigs used by item frames, glow frames,
+/// paintings, text displays, and dropped/display items.
+fn add_vanilla_flat_hanging(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width.max(0.5);
+    let h = spec.height.max(0.5);
+    let painting = spec.entity_type_id == 73;
+    let frame_tint = if painting { 77 } else { 78 };
+    let width = if painting { w * 1.8 } else { w };
+    let height = if painting { h * 1.5 } else { h };
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.5, 0.0],
+        [width, height, w * 0.06],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        frame_tint,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.5, -w * 0.04],
+        [width * 0.78, height * 0.78, w * 0.035],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        if painting { 79 } else { 80 },
+    );
+    if spec.entity_type_id == 47 {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Core,
+            [0.0, h * 0.5, -w * 0.07],
+            [width * 0.34, height * 0.34, w * 0.025],
+            [0.0; 3],
+            [0.0, pose.base.age_ticks * 0.4, 0.0],
+            0.0,
+            81,
+        );
+    }
+}
+
+/// Dropped item / item display / generic throwable item placeholder: a small
+/// bobbing, rotating item prism with a bright edge cap.
+fn add_vanilla_item_entity(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width.max(0.25);
+    let h = spec.height.max(0.25);
+    let bob = (pose.base.age_ticks * 0.45).sin() * h * 0.08;
+    let spin = pose.base.age_ticks * 0.55;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.55 + bob, 0.0],
+        [w * 0.62, h * 0.20, w * 0.62],
+        [0.0, h * 0.55, 0.0],
+        [0.20, spin, 0.0],
+        0.0,
+        82,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Shell,
+        [0.0, h * 0.58 + bob, 0.0],
+        [w * 0.68, h * 0.055, w * 0.68],
+        [0.0, h * 0.55, 0.0],
+        [0.20, spin, 0.0],
+        0.0,
+        83,
+    );
+}
+
+/// Ominous item spawner: rotating tiny cage with a glowing item core.
+fn add_vanilla_ominous_spawner(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width.max(0.3125);
+    let h = spec.height.max(0.3125);
+    let center = [0.0, h * 0.55, 0.0];
+    let spin = pose.base.age_ticks * 0.75;
+    add_cube_frame(
+        mesh,
+        spec,
+        pose,
+        center,
+        [w, h, w],
+        center,
+        [0.2, spin, 0.0],
+        84,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        center,
+        [w * 0.38, h * 0.38, w * 0.38],
+        center,
+        [0.0, -spin * 1.3, 0.0],
+        0.0,
+        85,
+    );
+}
+
+/// Wither skull projectile: compact black skull with brow/jaw accents.
+fn add_vanilla_wither_skull(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.56, 0.0],
+        [w * 0.86, h * 0.74, w * 0.82],
+        [0.0; 3],
+        [0.0, pose.base.age_ticks * 0.7, 0.0],
+        0.0,
+        86,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Head,
+        [0.0, h * 0.45, -w * 0.35],
+        [w * 0.68, h * 0.18, w * 0.18],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        87,
+    );
+}
+
+/// Fishing bobber: red/white float and a tiny hook below it.
+fn add_vanilla_fishing_bobber(mesh: &mut ExtrudedMesh, spec: EntityRigSpec, pose: EntityRigPose) {
+    use EntityRigPart::*;
+    let w = spec.width;
+    let h = spec.height;
+    let bob = (pose.base.age_ticks * 0.6).sin() * h * 0.08;
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.60 + bob, 0.0],
+        [w * 0.55, h * 0.34, w * 0.55],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        88,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Core,
+        [0.0, h * 0.83 + bob, 0.0],
+        [w * 0.44, h * 0.16, w * 0.44],
+        [0.0; 3],
+        [0.0; 3],
+        0.0,
+        89,
+    );
+    add_tinted(
+        mesh,
+        spec,
+        pose,
+        Tail,
+        [w * 0.10, h * 0.20 + bob, 0.0],
+        [w * 0.08, h * 0.42, w * 0.08],
+        [0.0, h * 0.45, 0.0],
+        [0.0, 0.0, 0.45],
+        0.0,
+        90,
+    );
+}
+
+/// Tiny visible placeholder for logical zero-size entities (display entities,
+/// interaction, marker). These are deliberately small translucent frames so
+/// debug/freecam inspection can distinguish them without pretending that the
+/// entities have a Vanilla creature model.
+fn add_vanilla_logic_placeholder(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+) {
+    use EntityRigPart::*;
+    let size = 0.22_f32;
+    let center = [0.0, size * 0.5, 0.0];
+    if spec.entity_type_id == 105 {
+        add_tinted(
+            mesh,
+            spec,
+            pose,
+            Other,
+            center,
+            [size * 1.8, size, size * 0.08],
+            center,
+            [0.0; 3],
+            0.0,
+            91,
+        );
+    } else {
+        add_cube_frame(
+            mesh,
+            spec,
+            pose,
+            center,
+            [size, size, size],
+            center,
+            [0.0, pose.base.age_ticks * 0.2, 0.0],
+            91,
+        );
+    }
+}
+
+/// Dispatch the dedicated vanilla rigs implemented above. Returning `false`
+/// means the caller should use the reusable archetype fallback (still required
+/// for modded names and for canonical rows whose dedicated rig is scheduled
+/// in a later slice).
+fn build_dedicated_vanilla_rig(
+    mesh: &mut ExtrudedMesh,
+    spec: EntityRigSpec,
+    pose: EntityRigPose,
+    mouth_item_rgb: Option<[u8; 3]>,
+) -> bool {
+    match spec.entity_type_id {
+        0 | 112 => add_vanilla_spirit(mesh, spec, pose),
+        1 => add_vanilla_area_cloud(mesh, spec, pose),
+        2 => add_vanilla_armadillo(mesh, spec, pose),
+        4 | 99 => add_vanilla_arrow(mesh, spec, pose),
+        9 | 56 | 59 | 68 | 105 => add_vanilla_logic_placeholder(mesh, spec, pose),
+        10 | 17 => add_vanilla_boat(mesh, spec, pose),
+        18 | 21 | 44 | 52 | 69 | 98 | 107 => add_vanilla_minecart(mesh, spec, pose),
+        26 | 37 | 39 | 66 | 82 | 89 => add_thrown_projectile(mesh, spec, pose, spec.entity_type_id),
+        30 => add_vanilla_end_crystal(mesh, spec, pose),
+        38 => add_vanilla_item_entity(mesh, spec, pose),
+        40 | 106 => add_vanilla_block_entity(mesh, spec, pose),
+        41 => add_vanilla_firework(mesh, spec, pose),
+        47 | 60 | 73 => add_vanilla_flat_hanging(mesh, spec, pose),
+        58 => add_vanilla_item_entity(mesh, spec, pose),
+        61 => add_vanilla_ominous_spawner(mesh, spec, pose),
+        63 => add_vanilla_logic_placeholder(mesh, spec, pose),
+        64 => add_vanilla_lightning(mesh, spec, pose),
+        109 => add_vanilla_trident(mesh, spec, pose),
+        121 => add_vanilla_wither_skull(mesh, spec, pose),
+        129 => add_vanilla_fishing_bobber(mesh, spec, pose),
+        3 => add_vanilla_armor_stand(mesh, spec, pose),
+        5 => add_vanilla_axolotl(mesh, spec, pose),
+        6 => add_vanilla_bat(mesh, spec, pose),
+        7 => add_vanilla_bee(mesh, spec, pose),
+        8 => add_vanilla_blaze(mesh, spec, pose),
+        16 | 100 => add_vanilla_spider(mesh, spec, pose),
+        19 => add_vanilla_bird(mesh, spec, pose, false),
+        20 | 86 | 110 => add_vanilla_fish(mesh, spec, pose),
+        24 => add_vanilla_dolphin(mesh, spec, pose),
+        34 | 90 => add_vanilla_segmented_pest(mesh, spec, pose),
+        48 | 101 => add_vanilla_squid(mesh, spec, pose),
+        75 => add_vanilla_bird(mesh, spec, pose, true),
+        83 => add_vanilla_pufferfish(mesh, spec, pose),
+        103 => add_vanilla_strider(mesh, spec, pose),
+        104 => add_vanilla_tadpole(mesh, spec, pose),
+        14 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                long_neck: true,
+                hump: true,
+                snout: true,
+                pointed_ears: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        15 | 72 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                long_tail: true,
+                slim: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        22 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                horns: true,
+                udder: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        25 | 71 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                long_neck: true,
+                long_ears: true,
+                snout: true,
+                mane: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        43 => add_vanilla_frog(mesh, spec, pose),
+        49 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                horns: true,
+                bearded: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        51 | 123 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                horns: true,
+                mane: true,
+                stocky: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        53 | 92 | 125 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                long_neck: true,
+                pointed_ears: true,
+                snout: true,
+                mane: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        65 | 108 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                long_neck: true,
+                long_ears: true,
+                snout: true,
+                wool: true,
+                long_tail: true,
+                slim: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        70 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                horns: true,
+                udder: true,
+                mushrooms: true,
+                long_tail: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        74 | 81 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                stocky: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        77 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                stocky: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        84 => add_vanilla_rabbit(mesh, spec, pose),
+        85 => add_vanilla_ravager(mesh, spec, pose),
+        87 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                wool: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        95 => add_vanilla_sniffer(mesh, spec, pose),
+        111 => add_vanilla_turtle(mesh, spec, pose),
+        122 => add_quadruped_rig(
+            mesh,
+            spec,
+            pose,
+            QuadrupedFeatures {
+                snout: true,
+                pointed_ears: true,
+                bushy_tail: true,
+                slim: true,
+                ..QuadrupedFeatures::default()
+            },
+        ),
+        11 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Bogged),
+        12 => add_vanilla_breeze(mesh, spec, pose),
+        23 => add_vanilla_creeper(mesh, spec, pose),
+        27 | 54 | 124 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Zombie),
+        29 | 50 => add_vanilla_guardian(mesh, spec, pose),
+        31 => add_vanilla_ender_dragon(mesh, spec, pose),
+        33 => add_vanilla_enderman(mesh, spec, pose),
+        35 | 55 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::IllagerHooded),
+        36 => add_vanilla_evoker_fangs(mesh, spec, pose),
+        42 => add_fox(mesh, spec, pose, mouth_item_rgb),
+        45 => add_vanilla_ghast(mesh, spec, pose),
+        46 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Zombie),
+        57 => add_vanilla_iron_golem(mesh, spec, pose),
+        67 | 93 => add_vanilla_slime_like(mesh, spec, pose),
+        76 => add_vanilla_phantom(mesh, spec, pose),
+        78 | 79 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Piglin),
+        80 | 114 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::IllagerArmed),
+        113 | 115 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Illager),
+        88 => add_vanilla_shulker(mesh, spec, pose),
+        91 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Skeleton),
+        96 => add_snow_golem(mesh, spec, pose),
+        102 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Stray),
+        116 => add_vanilla_warden(mesh, spec, pose),
+        118 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Witch),
+        119 => add_vanilla_wither(mesh, spec, pose),
+        120 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::WitherSkeleton),
+        126 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::ZombieVillager),
+        127 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::ZombifiedPiglin),
+        128 => add_humanoid_rig(mesh, spec, pose, HumanoidStyle::Player),
+        13 | 28 | 32 | 62 | 94 | 97 | 117 => {
+            add_thrown_projectile(mesh, spec, pose, spec.entity_type_id)
+        }
+        _ => return false,
+    }
+    true
 }
 
 /// Build the shared procedural template for all 130 vanilla protocol IDs.
 /// Zero-size collision entities receive small drawable placeholders; skin
 /// overlay alpha/blending is a responsibility of the consuming renderer.
 pub fn build_entity_rig_mesh(spec: EntityRigSpec, pose: EntityPose) -> ExtrudedMesh {
+    build_entity_rig_mesh_inner(spec, EntityRigPose::from(pose), None)
+}
+
+/// Build a detailed rig with the extended optional pose state. This is an
+/// additive entrypoint: the legacy [`build_entity_rig_mesh`] API is unchanged
+/// and behaves exactly as if `EntityRigPose::from(pose)` were passed here.
+pub fn build_entity_rig_mesh_with_pose(spec: EntityRigSpec, pose: EntityRigPose) -> ExtrudedMesh {
     build_entity_rig_mesh_inner(spec, pose, None)
 }
 
@@ -1131,12 +5974,12 @@ pub fn build_entity_rig_mesh_with_mouth_item(
     pose: EntityPose,
     mouth_item_rgb: Option<[u8; 3]>,
 ) -> ExtrudedMesh {
-    build_entity_rig_mesh_inner(spec, pose, mouth_item_rgb)
+    build_entity_rig_mesh_inner(spec, EntityRigPose::from(pose), mouth_item_rgb)
 }
 
 fn build_entity_rig_mesh_inner(
     spec: EntityRigSpec,
-    pose: EntityPose,
+    pose: EntityRigPose,
     mouth_item_rgb: Option<[u8; 3]>,
 ) -> ExtrudedMesh {
     use EntityRigArchetype::*;
@@ -1150,6 +5993,9 @@ fn build_entity_rig_mesh_inner(
         width: w,
         ..spec
     };
+    if build_dedicated_vanilla_rig(&mut mesh, spec, pose, mouth_item_rgb) {
+        return mesh;
+    }
     match spec.archetype {
         Biped if spec.entity_type_id == 96 => {
             add_snow_golem(&mut mesh, spec, pose);
@@ -1187,7 +6033,7 @@ fn build_entity_rig_mesh_inner(
                     &mut mesh, spec, pose, part, center, size, pivot, [0.0; 3], 0.0,
                 );
             }
-            if pose.enable_skin_3d_layers {
+            if pose.base.enable_skin_3d_layers {
                 add(
                     &mut mesh,
                     spec,
@@ -1534,7 +6380,7 @@ pub fn build_entity_from_cem_boxes(
     boxes: &[CemBox],
 ) -> ExtrudedMesh {
     let mut mesh = ExtrudedMesh::new();
-    let pose = pose.sanitized();
+    let pose = EntityRigPose::from(pose).sanitized();
     let safe_height = finite_or_zero(spec.height).clamp(0.125, 32.0);
     let safe_spec = EntityRigSpec {
         height: safe_height,
@@ -1546,7 +6392,7 @@ pub fn build_entity_from_cem_boxes(
         }
     }
     if mesh.quads.is_empty() {
-        build_entity_rig_mesh(spec, pose)
+        build_entity_rig_mesh_inner(spec, pose, None)
     } else {
         mesh
     }
@@ -1710,7 +6556,12 @@ fn build_winged_dragon(
     for (pivot, center, size, pitch) in [
         ([0.0, 1.5, -1.2], [0.0, 1.72, -1.5], [0.6, 0.7, 0.8], -0.55),
         ([0.0, 1.9, -1.75], [0.0, 2.1, -2.0], [0.55, 0.62, 0.7], -0.6),
-        ([0.0, 2.35, -2.2], [0.0, 2.5, -2.45], [0.5, 0.55, 0.6], -0.65),
+        (
+            [0.0, 2.35, -2.2],
+            [0.0, 2.5, -2.45],
+            [0.5, 0.55, 0.6],
+            -0.65,
+        ),
     ] {
         emit_colossal_box(mesh, s, pivot, center, size, [pitch, 0.0, 0.0], primary);
     }
@@ -1771,15 +6622,7 @@ fn build_winged_dragon(
             ([side * 0.6, 0.32, z + 0.05], [0.36, 0.5, 0.45]),
             ([side * 0.6, 0.09, z - 0.08], [0.4, 0.18, 0.6]),
         ] {
-            emit_colossal_box(
-                mesh,
-                s,
-                hip,
-                center,
-                size,
-                [swing, 0.0, 0.0],
-                primary,
-            );
+            emit_colossal_box(mesh, s, hip, center, size, [swing, 0.0, 0.0], primary);
         }
     }
 
@@ -1792,7 +6635,11 @@ fn build_winged_dragon(
         let pivot = if i == 0 {
             [0.0, 1.15, 2.15]
         } else {
-            [0.0, 1.15 + (f - 1.0) * 0.18 - (f - 1.0) * (f - 1.0) * 0.02, z - 0.85]
+            [
+                0.0,
+                1.15 + (f - 1.0) * 0.18 - (f - 1.0) * (f - 1.0) * 0.02,
+                z - 0.85,
+            ]
         };
         let sway = (pose.limb_swing - f * 0.55).sin() * 0.14 * (f + 1.0) * 0.45;
         emit_colossal_box(
@@ -1894,13 +6741,7 @@ fn build_winged_dragon(
 /// Sea serpent / hydra template. Unit space: head toward -Z, body floats
 /// around y = 0.8 so the silhouette stays near the origin, `stage_scale`
 /// applied inside [`emit_colossal_box`].
-fn build_sea_serpent(
-    mesh: &mut ExtrudedMesh,
-    s: f32,
-    pose: EntityPose,
-    primary: i32,
-    accent: i32,
-) {
+fn build_sea_serpent(mesh: &mut ExtrudedMesh, s: f32, pose: EntityPose, primary: i32, accent: i32) {
     let head_pitch = pose.head_pitch_deg.to_radians();
     let head_yaw = pose.head_yaw_deg.to_radians();
     let head_rot = [head_pitch - 0.05, head_yaw, 0.0];
@@ -2130,11 +6971,7 @@ mod tests {
             // Feet rest at y = 0 and the body stays within a generous
             // multiple of the collision box on every axis.
             assert!(lo[1] >= -0.05 && lo[1] <= 0.05, "id {id} feet y");
-            let span = [
-                hi[0] - lo[0],
-                hi[1] - lo[1],
-                hi[2] - lo[2],
-            ];
+            let span = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
             assert!(span[0] <= spec.width * 2.0 + 0.05, "id {id} x span");
             assert!(span[2] <= spec.width * 2.0 + 0.05, "id {id} z span");
             assert!(span[1] <= spec.height * 1.75 + 0.05, "id {id} y span");
@@ -2245,11 +7082,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_archetype_rigs_are_unchanged() {
-        // Biped (128), generic quadruped (22), avian (19), slime (93),
-        // aquatic (20), vehicle (10): fixed quad counts pin the templates
-        // against accidental drift.
-        let expected = [
+    fn dedicated_rigs_surpass_legacy_proxy_density() {
+        // The old coarse templates topped out at one box per major body part.
+        // Dedicated vanilla rigs must remain richer than those proxies while
+        // preserving the same finite/CCW mesh contract.
+        let expected_minimums = [
             (128_u16, 36_usize),
             (22, 36),
             (19, 24),
@@ -2257,12 +7094,16 @@ mod tests {
             (93, 12),
             (20, 30),
             (10, 12),
-            (4, 6), // arrow keeps the generic single-box proxy
+            (4, 6),
         ];
-        for (id, quads) in expected {
+        for (id, minimum_quads) in expected_minimums {
             let spec = classify_entity_rig(id).unwrap();
             let mesh = build_entity_rig_mesh(spec, EntityPose::default());
-            assert_eq!(mesh.quads.len(), quads, "id {id}");
+            assert!(
+                mesh.quads.len() >= minimum_quads,
+                "id {id}: {} < {minimum_quads}",
+                mesh.quads.len()
+            );
             assert_valid_mesh(&mesh);
         }
     }
@@ -2391,7 +7232,10 @@ mod colossal_rig_tests {
         let b = build_colossal_rig_mesh(kind, pose, 1.5, [10, 20, 30], [200, 210, 220]);
         assert_eq!(entity_mesh_fingerprint(&a), entity_mesh_fingerprint(&b));
         let untinted = build_colossal_rig_mesh(kind, pose, 1.5, [0, 0, 0], [0, 0, 0]);
-        assert_ne!(entity_mesh_fingerprint(&a), entity_mesh_fingerprint(&untinted));
+        assert_ne!(
+            entity_mesh_fingerprint(&a),
+            entity_mesh_fingerprint(&untinted)
+        );
         verify_colossal_mesh(&a);
         verify_colossal_mesh(&untinted);
     }
@@ -2400,8 +7244,13 @@ mod colossal_rig_tests {
     fn colossal_stage_scale_sanitizes_non_finite_and_nonpositive() {
         for kind in [ColossalRigKind::WingedDragon, ColossalRigKind::SeaSerpent] {
             for scale in [f32::NAN, f32::INFINITY, 0.0, -2.5, f32::NEG_INFINITY] {
-                let mesh =
-                    build_colossal_rig_mesh(kind, EntityPose::default(), scale, [1, 2, 3], [4, 5, 6]);
+                let mesh = build_colossal_rig_mesh(
+                    kind,
+                    EntityPose::default(),
+                    scale,
+                    [1, 2, 3],
+                    [4, 5, 6],
+                );
                 verify_colossal_mesh(&mesh);
             }
             // Clamped floor: NaN and zero both land on the 0.35 minimum.
@@ -2450,7 +7299,10 @@ mod modded_classifier_tests {
             let canonical = classify_entity_rig(id).expect("protocol id must classify");
             for alias in [
                 canonical.name,
-                canonical.name.strip_prefix("minecraft:").unwrap_or(canonical.name),
+                canonical
+                    .name
+                    .strip_prefix("minecraft:")
+                    .unwrap_or(canonical.name),
             ] {
                 let named = classify_entity_rig_named(alias, None, None);
                 assert_eq!(named, canonical, "id {id} alias {alias}");
@@ -2480,7 +7332,10 @@ mod modded_classifier_tests {
             ("mymod:void_wolf", EntityRigArchetype::Quadruped),
             ("mymod:arcane_bolt", EntityRigArchetype::ProjectileOrItem),
             ("mymod:sky_boat", EntityRigArchetype::VehicleOrHanging),
-            ("mymod:totally_unknown_florb", EntityRigArchetype::ProjectileOrItem),
+            (
+                "mymod:totally_unknown_florb",
+                EntityRigArchetype::ProjectileOrItem,
+            ),
             ("custommod:flooble", EntityRigArchetype::GenericProxy),
         ];
         for &(name, expected) in cases {
@@ -2519,8 +7374,14 @@ mod modded_classifier_tests {
         let mesh_a = build_entity_rig_mesh(spec_a, EntityPose::default());
         let mesh_b = build_entity_rig_mesh(spec_b, EntityPose::default());
         let mesh_c = build_entity_rig_mesh(spec_c, EntityPose::default());
-        assert_eq!(entity_mesh_fingerprint(&mesh_a), entity_mesh_fingerprint(&mesh_b));
-        assert_ne!(entity_mesh_fingerprint(&mesh_a), entity_mesh_fingerprint(&mesh_c));
+        assert_eq!(
+            entity_mesh_fingerprint(&mesh_a),
+            entity_mesh_fingerprint(&mesh_b)
+        );
+        assert_ne!(
+            entity_mesh_fingerprint(&mesh_a),
+            entity_mesh_fingerprint(&mesh_c)
+        );
         // Every quad carries the packed sRGB material flag — never the
         // untinted default — and both palette slots appear.
         assert!(mesh_a.quads.iter().all(|q| q.tint_index >= 0x0100_0000));
