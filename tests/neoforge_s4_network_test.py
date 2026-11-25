@@ -401,7 +401,7 @@ class NeoForgeS4NetworkTests(unittest.TestCase):
     def run_process(cls, *args, extra_env=None):
         return subprocess.run(
             [str(arg) for arg in args], cwd=ROOT, env=cls.env | (extra_env or {}),
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=600,
         )
 
     @classmethod

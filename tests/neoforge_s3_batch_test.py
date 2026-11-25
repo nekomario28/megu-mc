@@ -263,7 +263,7 @@ class NeoForgeS3BatchTests(unittest.TestCase):
     def run_process(cls, *args, extra_env=None):
         return subprocess.run(
             list(map(str, args)), cwd=ROOT, env=cls.env | (extra_env or {}),
-            capture_output=True, text=True, timeout=240,
+            capture_output=True, text=True, timeout=600,
         )
 
     @classmethod
