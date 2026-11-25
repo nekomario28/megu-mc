@@ -262,6 +262,192 @@ fn container_pickup_respects_component_limits_on_empty_slots_and_swaps() {
     assert_eq!(carried, (stone, 4, comps));
 }
 
+fn container_item_totals(stacks: impl IntoIterator<Item = Stack>) -> HashMap<(i64, Comps), u16> {
+    let mut totals = HashMap::new();
+    for (item, count, comps) in stacks {
+        if count > 0 {
+            *totals.entry((item, comps)).or_insert(0) += u16::from(count);
+        }
+    }
+    totals
+}
+
+#[test]
+fn container_left_right_clicks_conserve_items_at_stack_limits() {
+    let stone = name_to_item("stone").unwrap();
+    let mut slots = HashMap::new();
+    let mut cursor = (stone, 70, vec![]);
+    let before = container_item_totals([cursor.clone()]);
+
+    // Left-click an empty slot takes as much as that stack can hold.
+    click_slot(&mut slots, &mut cursor, 0, 0);
+    assert_eq!(slots[&0], (stone, 64, vec![]));
+    assert_eq!(cursor, (stone, 6, vec![]));
+    assert_eq!(
+        container_item_totals(slots.values().cloned().chain([cursor.clone()])),
+        before
+    );
+
+    // Right-click an odd stack takes ceil(n/2); right-click with a cursor places one.
+    let mut odd = HashMap::from([(1, (stone, 5, vec![]))]);
+    let mut empty_cursor = (0, 0, vec![]);
+    let odd_before = container_item_totals(odd.values().cloned());
+    click_slot(&mut odd, &mut empty_cursor, 1, 1);
+    assert_eq!(odd[&1], (stone, 2, vec![]));
+    assert_eq!(empty_cursor, (stone, 3, vec![]));
+    assert_eq!(
+        container_item_totals(odd.values().cloned().chain([empty_cursor.clone()])),
+        odd_before
+    );
+    click_slot(&mut odd, &mut empty_cursor, 1, 1);
+    assert_eq!(odd[&1], (stone, 3, vec![]));
+    assert_eq!(empty_cursor, (stone, 2, vec![]));
+    assert_eq!(
+        container_item_totals(odd.values().cloned().chain([empty_cursor])),
+        odd_before
+    );
+}
+
+#[test]
+fn container_same_item_with_different_components_never_merges() {
+    let stone = name_to_item("stone").unwrap();
+    let mut named = vec![];
+    comp_set(&mut named, COMP_CUSTOM_NAME, b"named".to_vec());
+    let mut slots = HashMap::from([(0, (stone, 60, vec![]))]);
+    let mut cursor = (stone, 10, named.clone());
+    let before = container_item_totals(slots.values().cloned().chain([cursor.clone()]));
+
+    click_slot(&mut slots, &mut cursor, 0, 0);
+
+    // Vanilla's stack identity includes the full component patch. An unlike
+    // component stack may swap, but it can never be coalesced with the target.
+    assert_eq!(slots[&0], (stone, 10, named));
+    assert_eq!(cursor, (stone, 60, vec![]));
+    assert_eq!(
+        container_item_totals(slots.values().cloned().chain([cursor])),
+        before
+    );
+}
+
+#[test]
+fn container_quick_move_merges_before_empty_slots_and_keeps_full_target_remainder() {
+    let stone = name_to_item("stone").unwrap();
+    let chest = ContainerKey::ow((0, 70, 0));
+    let mut all = HashMap::from([(
+        chest,
+        HashMap::from([(0, (stone, 60, vec![])), (2, (stone, 63, vec![]))]),
+    )]);
+    let mut inv = HashMap::from([(45, (stone, 10, vec![]))]);
+    let before = container_item_totals(
+        all.values()
+            .flat_map(|slots| slots.values().cloned())
+            .chain(inv.values().cloned()),
+    );
+
+    // Player inventory window slot 63 maps to native inventory key 45.
+    quick_move_chest(&mut all, &mut inv, chest, None, 63);
+
+    let moved = &all[&chest];
+    assert_eq!(moved[&0], (stone, 64, vec![]));
+    assert_eq!(moved[&2], (stone, 64, vec![]));
+    assert_eq!(moved[&1], (stone, 5, vec![]));
+    assert!(!inv.contains_key(&45));
+    assert_eq!(
+        container_item_totals(
+            all.values()
+                .flat_map(|slots| slots.values().cloned())
+                .chain(inv.values().cloned()),
+        ),
+        before
+    );
+
+    // A completely full destination leaves the origin unchanged.
+    let mut full = (0..27)
+        .map(|slot| (slot, (stone, 64, vec![])))
+        .collect::<HashMap<_, _>>();
+    full.insert(0, (stone, 7, vec![]));
+    let mut all = HashMap::from([(chest, full)]);
+    let inv_before = (9..=44)
+        .map(|slot| (slot, (name_to_item("dirt").unwrap(), 64, vec![])))
+        .collect();
+    let mut inv = inv_before;
+    let before = container_item_totals(
+        all.values()
+            .flat_map(|slots| slots.values().cloned())
+            .chain(inv.values().cloned()),
+    );
+    quick_move_chest(&mut all, &mut inv, chest, None, 0);
+    assert_eq!(all[&chest][&0], (stone, 7, vec![]));
+    assert_eq!(
+        container_item_totals(
+            all.values()
+                .flat_map(|slots| slots.values().cloned())
+                .chain(inv.values().cloned()),
+        ),
+        before
+    );
+}
+
+#[test]
+fn container_drag_paint_splits_evenly_or_places_one_each() {
+    let _guard = world_guard();
+    let (client, _receiver) = effect_tests::client_pair();
+    let stone = name_to_item("stone").unwrap();
+    *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (stone, 10, vec![]);
+    let before = container_item_totals([(stone, 10, vec![])]);
+
+    drag_paint_click(&client, -1, 0);
+    for slot in [9, 10, 11] {
+        drag_paint_click(&client, slot, 1);
+    }
+    drag_paint_click(&client, -1, 2);
+
+    let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let cursor = client
+        .cursor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(inv[&9].1, 3);
+    assert_eq!(inv[&10].1, 3);
+    assert_eq!(inv[&11].1, 3);
+    assert_eq!(cursor, (stone, 1, vec![]));
+    assert_eq!(
+        container_item_totals(inv.values().cloned().chain([cursor])),
+        before
+    );
+
+    *client.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (stone, 2, vec![]);
+    let before_right = container_item_totals(
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .chain([(stone, 2, vec![])]),
+    );
+    drag_paint_click(&client, -1, 4);
+    for slot in [12, 13, 14] {
+        drag_paint_click(&client, slot, 5);
+    }
+    drag_paint_click(&client, -1, 6);
+    let inv = client.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let cursor = client
+        .cursor
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(inv[&12].1, 1);
+    assert_eq!(inv[&13].1, 1);
+    assert!(
+        !inv.contains_key(&14),
+        "right-drag cannot overdraw its cursor"
+    );
+    assert_eq!(cursor, (0, 0, vec![]));
+    assert_eq!(container_item_totals(inv.values().cloned()), before_right);
+}
+
 /// `LootTable.fill` fills `container.getContainerSize()` slots, so a rolled table must stay
 /// inside the slots the block actually has: a decorated pot holds one, a hopper five, a
 /// dispenser nine, a chest twenty-seven. Before `ContainerKind::BlockContainer` every
