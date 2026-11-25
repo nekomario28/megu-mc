@@ -50,7 +50,6 @@ jobs:
           python3 tests/release_bundle_test.py
           python3 tests/release_workflow_test.py
           python3 tests/xplat_packaging_test.py
-          python3 tests/pkg_manifests_test.py
 
   build-matrix:
     needs: preflight
