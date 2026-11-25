@@ -307,6 +307,17 @@
 //!   [`net_budget::should_emit_tick`] cut entity/chunk update rates to
 //!   20/10/4/0 Hz by frustum, distance and motion — usable by both the
 //!   server streamer and the client LOD lane.
+//! * [`render_cs`] — the five foundational graphics/GPU primitives the
+//!   Vanilla renderer and modded subworlds share: [`render_cs::SectionVisBits`]
+//!   8-byte portal connectivity with the Tommo/Sodium no-backtrack
+//!   [`render_cs::bfs_visible_sections`], [`render_cs::visible_face_mask`]
+//!   six-axis half-space culling feeding [`render_cs::SixAxisBuckets`]
+//!   (with a never-culled `UnculledCustom` bucket for protruding/diagonal
+//!   mod geometry), [`render_cs::BinaryGreedyMesher`] bit-parallel greedy
+//!   meshing, [`render_cs::TranslucentSortCache`] half-block-quantized lazy
+//!   radix sorting, and [`render_cs::RenderGraph`] dead-pass culling with
+//!   linear-scan transient VRAM aliasing — all fail-closed for modded
+//!   blocks whose visuals leave the `1×1×1` cube.
 
 #![deny(unsafe_code)]
 
@@ -346,6 +357,7 @@ pub mod os_desktop;
 pub mod perf_kit;
 pub mod quiescent;
 pub mod random;
+pub mod render_cs;
 pub mod registry;
 pub mod rev;
 pub mod ring_spsc;
