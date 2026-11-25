@@ -216,6 +216,8 @@ enum VillagerActivity {
     Work,
     Meet,
     Rest,
+    Play,
+    Panic,
 }
 
 impl VillagerActivity {
@@ -226,6 +228,22 @@ impl VillagerActivity {
             9_000..=10_999 => Self::Meet,
             12_000..=23_999 => Self::Rest,
             _ => Self::Idle,
+        }
+    }
+    fn baby_at(world_time: u64) -> Self {
+        match world_time % VILLAGER_DAY_TICKS {
+            3_000..=5_999 | 10_000..=11_999 => Self::Play,
+            12_000..=23_999 => Self::Rest,
+            _ => Self::Idle,
+        }
+    }
+    fn brain_at(world_time: u64, baby: bool, panicking: bool) -> Self {
+        if panicking {
+            Self::Panic
+        } else if baby {
+            Self::baby_at(world_time)
+        } else {
+            Self::at(world_time)
         }
     }
 }
@@ -375,12 +393,10 @@ impl MerchantOffer {
         let base = self.cost_a.count;
         let demand_product = base.wrapping_mul(self.demand);
         let demand_diff = merchant_floor(demand_product as f32 * self.price_multiplier);
+        let _ = items;
         base.wrapping_add(demand_diff.max(0))
             .wrapping_add(self.special_price_diff)
-            .clamp(
-                1,
-                i32::from(items.max_stack_size(self.cost_a.item, &self.cost_a.components)),
-            )
+            .clamp(1, 64)
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -864,8 +880,8 @@ impl GossipType {
         match self {
             Self::MajorNegative => (-5, 100, 10, 10),
             Self::MinorNegative => (-1, 200, 20, 20),
-            Self::MinorPositive => (1, 25, 1, 5),
-            Self::MajorPositive => (5, 20, 0, 20),
+            Self::MinorPositive => (1, 200, 1, 5),
+            Self::MajorPositive => (5, 100, 0, 20),
             Self::Trading => (1, 25, 2, 20),
         }
     }
@@ -985,8 +1001,8 @@ impl Villager {
                     profession,
                     VillagerProfession::None | VillagerProfession::Nitwit
                 ) && self.profession != VillagerProfession::Nitwit
-                    && (self.profession == VillagerProfession::None
-                        || self.profession == profession) =>
+                    && (self.profession == profession
+                        || (self.villager_xp == 0 && self.profession == VillagerProfession::None)) =>
             {
                 &mut self.job_site
             }
@@ -1087,14 +1103,25 @@ impl Villager {
         position: BlockPos,
         world_time: u64,
     ) -> (VillagerActivity, Option<BlockPos>) {
+        self.tick_brain(pois, position, world_time, false, false)
+    }
+
+    fn tick_brain(
+        &mut self,
+        pois: &PoiRegistry,
+        position: BlockPos,
+        world_time: u64,
+        baby: bool,
+        panicking: bool,
+    ) -> (VillagerActivity, Option<BlockPos>) {
         self.refresh_pois(pois);
         self.roll_day(world_time);
 
-        let activity = VillagerActivity::at(world_time);
+        let activity = VillagerActivity::brain_at(world_time, baby, panicking);
         let target = match activity {
-            VillagerActivity::Idle => None,
+            VillagerActivity::Idle | VillagerActivity::Play => None,
             VillagerActivity::Meet => self.meeting_point,
-            VillagerActivity::Rest => self.home,
+            VillagerActivity::Rest | VillagerActivity::Panic => self.home,
             VillagerActivity::Work => {
                 self.restock_at_job_site(position, world_time);
                 self.job_site
@@ -1176,6 +1203,21 @@ impl Villager {
         {
             return false;
         }
+        let hero_amplifier = hero_amplifier.or_else(|| {
+            let hero = live_effect_id("hero_of_the_village")?;
+            client_snapshot()
+                .into_iter()
+                .find(|client| client.uuid == player)
+                .and_then(|client| {
+                    client
+                        .effs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .find(|eff| eff.id == hero)
+                        .map(|eff| eff.amp as u8)
+                })
+        });
         let reputation = self.gossip.reputation(player);
         for offer in &mut self.offers {
             offer.apply_customer_price(reputation, hero_amplifier);
@@ -1231,13 +1273,20 @@ impl Villager {
         let result = offer.result.clone();
         self.villager_xp = self.villager_xp.wrapping_add(offer.xp_reward);
         self.gossip.add(player, GossipType::Trading, 2);
+        let level_after = self.level();
+        if level_after != level_before {
+            for unlock in (level_before as u8 + 1)..=(level_after as u8) {
+                let Some(level) = [None, Some(VillagerLevel::Novice), Some(VillagerLevel::Apprentice), Some(VillagerLevel::Journeyman), Some(VillagerLevel::Expert), Some(VillagerLevel::Master)][usize::from(unlock)] else { continue };
+                unlock_villager_trade_level(self, level);
+            }
+        }
         Ok(TradeExecutionOutcome {
             result,
             consumed_a,
             consumed_b,
             villager_xp: self.villager_xp,
             level_before,
-            level_after: self.level(),
+            level_after,
         })
     }
 }
@@ -1253,7 +1302,222 @@ fn villager_within(a: BlockPos, b: BlockPos, radius: u16) -> bool {
             <= u64::from(radius).pow(2)
 }
 
+const VILLAGER_BABY_GROWTH_TICKS: i32 = 24_000;
+const VILLAGER_WILLING_FOOD_POINTS: i32 = 12;
 #[cfg_attr(not(test), allow(dead_code))]
+const ZOMBIE_VILLAGER_CURE_MIN_TICKS: u16 = 3_600;
+#[cfg_attr(not(test), allow(dead_code))]
+const ZOMBIE_VILLAGER_CURE_RANDOM_TICKS: u16 = 2_400;
+const ZOMBIE_VILLAGER_CURE_ACCELERANT_RADIUS: i32 = 4;
+const ZOMBIE_VILLAGER_CURE_MAX_ACCELERANTS: u16 = 14;
+const WANDERING_TRADER_DESPAWN_TICKS: u32 = 48_000;
+
+/// Bread is worth four food points; carrots, potatoes and beetroot one each.
+fn villager_food_points(bread: i32, carrots: i32, potatoes: i32, beetroots: i32) -> i32 {
+    bread.max(0) * 4 + carrots.max(0) + potatoes.max(0) + beetroots.max(0)
+}
+
+fn villager_willing(food_points: i32) -> bool {
+    food_points >= VILLAGER_WILLING_FOOD_POINTS
+}
+
+/// Villagers with surplus food throw enough to a neighbour to reach willingness.
+/// Returns `(donor_points, recipient_points, shared)`.
+fn villager_share_food(donor_points: i32, recipient_points: i32) -> (i32, i32, bool) {
+    if donor_points <= VILLAGER_WILLING_FOOD_POINTS || recipient_points >= VILLAGER_WILLING_FOOD_POINTS {
+        return (donor_points, recipient_points, false);
+    }
+    let shared = ((donor_points - VILLAGER_WILLING_FOOD_POINTS) / 2)
+        .max(1)
+        .min(VILLAGER_WILLING_FOOD_POINTS - recipient_points);
+    (donor_points - shared, recipient_points + shared, shared > 0)
+}
+
+/// Vanilla breeding requires a bed in the village that no villager has claimed.
+fn villager_unclaimed_bed_near(pois: &PoiRegistry, center: BlockPos, radius: u16) -> Option<BlockPos> {
+    pois.records
+        .iter()
+        .filter(|(&pos, poi)| {
+            poi.kind == PoiKind::Bed && poi.claimants.is_empty() && villager_within(pos, center, radius)
+        })
+        .map(|(&pos, _)| pos)
+        .min_by_key(|&(x, y, z)| {
+            let [dx, dy, dz] = [x - center.0, y - center.1, z - center.2];
+            dx * dx + dy * dy + dz * dz
+        })
+}
+
+fn villager_can_breed(
+    pois: &PoiRegistry,
+    center: BlockPos,
+    radius: u16,
+    willing_adults: usize,
+) -> bool {
+    willing_adults >= 2 && villager_unclaimed_bed_near(pois, center, radius).is_some()
+}
+
+/// Babies count up for exactly one Minecraft day. Negative means still a baby.
+fn villager_baby_age_tick(age_ticks: i32) -> (i32, bool) {
+    let next = (age_ticks + 1).min(0);
+    (next, next < 0)
+}
+
+/// Difficulty's zombie conversion rate when a villager dies to a zombie.
+#[cfg_attr(not(test), allow(dead_code))]
+fn zombie_villager_conversion_percent(difficulty: RaidDifficulty) -> u8 {
+    match difficulty {
+        RaidDifficulty::Peaceful | RaidDifficulty::Easy => 0,
+        RaidDifficulty::Normal => 50,
+        RaidDifficulty::Hard => 100,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ZombieVillagerCure {
+    curer: VillageUuid,
+    profession: VillagerProfession,
+    villager_xp: i32,
+    offers: Vec<MerchantOffer>,
+    ticks_left: u16,
+    accelerant_scan_progress: u16,
+}
+
+impl ZombieVillagerCure {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn start(
+        curer: VillageUuid,
+        profession: VillagerProfession,
+        villager_xp: i32,
+        offers: Vec<MerchantOffer>,
+        random_roll: u16,
+    ) -> Self {
+        Self {
+            curer,
+            profession,
+            villager_xp,
+            offers,
+            ticks_left: ZOMBIE_VILLAGER_CURE_MIN_TICKS + random_roll % (ZOMBIE_VILLAGER_CURE_RANDOM_TICKS + 1),
+            accelerant_scan_progress: 1,
+        }
+    }
+
+    /// One server tick. `accelerants` is the count of beds and iron bars in the
+    /// 9x9x9 cube (radius four), capped by vanilla at fourteen. Each tick has a
+    /// 1% scan chance; each scanned block has a 30% chance to add one tick of
+    /// progress. The deterministic test hook supplies the two percentile rolls.
+    fn tick_with_rolls(&mut self, accelerants: u16, scan_roll: u32, block_roll: u32) -> bool {
+        let mut progress = self.accelerant_scan_progress.max(1);
+        if scan_roll.is_multiple_of(100) {
+            let active = accelerants.min(ZOMBIE_VILLAGER_CURE_MAX_ACCELERANTS);
+            if active > 0 && block_roll % 100 < 30 {
+                progress = progress.saturating_add(active);
+            }
+        }
+        self.accelerant_scan_progress = 1;
+        self.ticks_left = self.ticks_left.saturating_sub(progress);
+        self.ticks_left == 0
+    }
+    fn finish(self) -> (VillageUuid, VillagerProfession, i32, Vec<MerchantOffer>) {
+        (self.curer, self.profession, self.villager_xp, self.offers)
+    }
+}
+
+fn zombie_cure_accelerants_in_cube(
+    center: BlockPos,
+    mut is_accelerant: impl FnMut(BlockPos) -> bool,
+) -> u16 {
+    let radius = ZOMBIE_VILLAGER_CURE_ACCELERANT_RADIUS;
+    let mut count = 0;
+    for x in center.0 - radius..=center.0 + radius {
+        for y in center.1 - radius..=center.1 + radius {
+            for z in center.2 - radius..=center.2 + radius {
+                if is_accelerant((x, y, z)) {
+                    count += 1;
+                }
+            }
+        }
+    }
+    count.min(ZOMBIE_VILLAGER_CURE_MAX_ACCELERANTS)
+}
+
+/// Wandering traders use the 48000 tick despawn delay; zero means despawn now.
+fn wandering_trader_despawn_tick(delay: u32) -> (u32, bool) {
+    let next = delay.saturating_sub(1);
+    (next, next == 0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RavagerRider {
+    ravager_slot: usize,
+    rider: RaiderType,
+}
+
+fn raid_potential_bonus_spawns(
+    kind: RaiderType,
+    difficulty: RaidDifficulty,
+    wave: u8,
+    bonus_wave: bool,
+    bound_roll: u32,
+    count_roll: u32,
+) -> u8 {
+    let easy = difficulty == RaidDifficulty::Easy;
+    let bound = match kind {
+        RaiderType::Vindicator | RaiderType::Pillager => match difficulty {
+            RaidDifficulty::Easy => bound_roll % 2,
+            RaidDifficulty::Normal => 1,
+            RaidDifficulty::Hard => 2,
+            RaidDifficulty::Peaceful => 0,
+        },
+        RaiderType::Witch => {
+            if easy || wave <= 2 || wave == 4 { 0 } else { 1 }
+        }
+        RaiderType::Ravager => u32::from(!easy && bonus_wave),
+        RaiderType::Evoker => return 0,
+    };
+    if bound == 0 {
+        0
+    } else {
+        (count_roll % (bound + 1)) as u8
+    }
+}
+
+/// Vanilla's bonus-roll shape and ravager passengers. Riders are additional
+/// raid members: every wave-five ravager carries a pillager, and in wave seven
+/// or later the first ravager carries an evoker and each other ravager a
+/// vindicator.
+fn raid_wave_adjustments(
+    difficulty: RaidDifficulty,
+    wave: u8,
+    bonus_wave: bool,
+    counts: &mut [u8; RaiderType::ALL.len()],
+    roll_a: u32,
+    roll_b: u32,
+) -> Vec<RavagerRider> {
+    for kind in [RaiderType::Vindicator, RaiderType::Pillager] {
+        counts[kind as usize] += raid_potential_bonus_spawns(
+            kind, difficulty, wave, bonus_wave, roll_a.wrapping_add(kind as u32), roll_b.wrapping_add(kind as u32),
+        );
+    }
+    counts[RaiderType::Witch as usize] += raid_potential_bonus_spawns(
+        RaiderType::Witch, difficulty, wave, bonus_wave, roll_a.wrapping_add(3), roll_b.wrapping_add(3),
+    );
+    counts[RaiderType::Ravager as usize] += raid_potential_bonus_spawns(
+        RaiderType::Ravager, difficulty, wave, bonus_wave, roll_a.wrapping_add(4), roll_b.wrapping_add(4),
+    );
+    let mut riders = Vec::new();
+    for ravager_slot in 0..usize::from(counts[RaiderType::Ravager as usize]) {
+        if wave == 5 {
+            riders.push(RavagerRider { ravager_slot, rider: RaiderType::Pillager });
+        } else if wave >= 7 {
+            riders.push(RavagerRider {
+                ravager_slot,
+                rider: if ravager_slot == 0 { RaiderType::Evoker } else { RaiderType::Vindicator },
+            });
+        }
+    }
+    riders
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RaidDifficulty {
     Peaceful,
@@ -1993,6 +2257,42 @@ pub(crate) fn villager_raid_interact_mob(
         }
         "snow_golem" if item == "shears" => {
             live_snow_golem_shear(mob_eid).then_some(MobInteractOutcome::SnowGolemSheared)
+        }
+        "zombie_villager" if item == "golden_apple" => {
+            let now = TICK.load(Ordering::Relaxed);
+            let weakened = live_mob_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&mob_eid)
+                .is_some_and(|state| {
+                    state.potions.iter().any(|(effect, until)| {
+                        *effect == WitchPotion::Weakness && *until > now
+                    })
+                });
+            if !weakened {
+                return None;
+            }
+            let owner = client_snapshot()
+                .into_iter()
+                .find(|client| client.eid == player_eid)
+                .map(|client| client.uuid)?;
+            let (profession, xp, offers) = live_zombie_villager_data()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&mob_eid)
+                .unwrap_or((VillagerProfession::None, 0, Vec::new()));
+            live_zombie_villager_cures().lock().unwrap_or_else(|e| e.into_inner()).insert(
+                mob_eid,
+                ZombieVillagerCure::start(owner, profession, xp, offers, world_rng::next_below(2401) as u16),
+            );
+            if let Some(state) = live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&mob_eid) {
+                state.potions.retain(|(effect, _)| *effect != WitchPotion::Weakness);
+            }
+            // The cross-file outcome contract has no zombie-curing variant yet;
+            // this variant carries the same consume-one-held-item consequence.
+            Some(MobInteractOutcome::IronGolemRepaired {
+                hp_after: *mob.hp.lock().unwrap_or_else(|e| e.into_inner()),
+            })
         }
         "allay" => {
             let owner = client_snapshot()
@@ -3111,73 +3411,269 @@ fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
     )
 }
 
-/// The novice buy-and-sell rows each job-site profession opens with, in the
-/// same `MerchantOffer` shape `farmer_merchant` builds for the composter.
-/// Unemployed and nitwit villagers sell nothing.
-#[cfg_attr(not(test), allow(dead_code))]
-fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
-    let table: &[(&str, i32, &str, i32, i32)] = match profession {
-        VillagerProfession::Armorer => {
-            &[("coal", 15, "emerald", 1, 2), ("emerald", 7, "iron_leggings", 1, 1)]
+// ---------- Vanilla 1.21.1 trade pools ----------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TradeBlueprintKind {
+    Buy,
+    Sell,
+    Process,
+    EnchantedTool,
+    EnchantedBook,
+    Map,
+    SuspiciousStew,
+    DyedArmor,
+    TippedArrow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TradeBlueprint {
+    kind: TradeBlueprintKind,
+    item: &'static str,
+    count: i32,
+    price: i32,
+    result: &'static str,
+    result_count: i32,
+    max_uses: i32,
+    xp: i32,
+    multiplier: f32,
+}
+
+fn tb_buy(item: &'static str, count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::Buy, item, count, price: 1, result: "emerald", result_count: 1, max_uses, xp, multiplier: 0.05 }
+}
+fn tb_sell(item: &'static str, price: i32, count: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::Sell, item: "emerald", count: price, price, result: item, result_count: count, max_uses, xp, multiplier }
+}
+fn tb_process(input: &'static str, count: i32, price: i32, output: &'static str, out_count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::Process, item: input, count, price, result: output, result_count: out_count, max_uses, xp, multiplier: 0.05 }
+}
+fn tb_enchanted(item: &'static str, base_price: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::EnchantedTool, item: "emerald", count: base_price, price: base_price, result: item, result_count: 1, max_uses, xp, multiplier }
+}
+fn tb_book(xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::EnchantedBook, item: "emerald", count: 1, price: 1, result: "enchanted_book", result_count: 1, max_uses: 12, xp, multiplier: 0.2 }
+}
+fn tb_map(price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::Map, item: "emerald", count: price, price, result: "filled_map", result_count: 1, max_uses, xp, multiplier: 0.2 }
+}
+fn tb_stew(xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::SuspiciousStew, item: "emerald", count: 1, price: 1, result: "suspicious_stew", result_count: 1, max_uses: 12, xp, multiplier: 0.05 }
+}
+fn tb_dyed(item: &'static str, price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::DyedArmor, item: "emerald", count: price, price, result: item, result_count: 1, max_uses, xp, multiplier: 0.2 }
+}
+fn tb_tipped_arrow() -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::TippedArrow, item: "arrow", count: 5, price: 2, result: "tipped_arrow", result_count: 5, max_uses: 12, xp: 30, multiplier: 0.05 }
+}
+
+fn trade_cost(item_name: &str, count: i32) -> Option<ItemCost> {
+    Some(ItemCost { item: name_to_item(item_name)?, count, components: Vec::new() })
+}
+
+/// Instantiate one vanilla trade factory. Enchantment and map NBT generation is
+/// owned by the item/component system; this preserves the exact item skeleton,
+/// stock, XP, multiplier, second cost, and Java price roll.
+fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<MerchantOffer> {
+    let emerald = name_to_item("emerald")?;
+    let (cost_a_item, mut cost_a_count, second, result_name, result_count) = match bp.kind {
+        TradeBlueprintKind::Buy => (bp.item, bp.count, None, "emerald", bp.price),
+        TradeBlueprintKind::Sell | TradeBlueprintKind::DyedArmor | TradeBlueprintKind::SuspiciousStew => {
+            ("emerald", bp.price, None, bp.result, bp.result_count)
         }
-        VillagerProfession::Butcher => {
-            &[("chicken", 14, "emerald", 1, 2), ("emerald", 1, "cooked_porkchop", 5, 1)]
+        TradeBlueprintKind::Process => ("emerald", bp.price, Some((bp.item, bp.count)), bp.result, bp.result_count),
+        TradeBlueprintKind::EnchantedTool => {
+            let enchantment_cost = 5 + (roll % 15) as i32;
+            ("emerald", (bp.price + enchantment_cost).min(64), None, bp.result, 1)
         }
-        VillagerProfession::Cartographer => {
-            &[("paper", 24, "emerald", 1, 2), ("emerald", 7, "map", 1, 1)]
+        TradeBlueprintKind::EnchantedBook => {
+            let level = 1 + (roll % 5) as i32;
+            let price = (2 + ((roll / 5) as i32 % (5 + level * 10)) + 3 * level).min(64);
+            ("emerald", price, Some(("book", 1)), "enchanted_book", 1)
         }
-        VillagerProfession::Cleric => {
-            &[("rotten_flesh", 32, "emerald", 1, 2), ("emerald", 1, "redstone", 2, 1)]
-        }
-        VillagerProfession::Farmer => {
-            &[("wheat", 20, "emerald", 1, 2), ("emerald", 1, "bread", 6, 1)]
-        }
-        VillagerProfession::Fisherman => {
-            &[("string", 20, "emerald", 1, 2), ("emerald", 3, "cod_bucket", 1, 1)]
-        }
-        VillagerProfession::Fletcher => {
-            &[("stick", 32, "emerald", 1, 2), ("emerald", 1, "arrow", 16, 1)]
-        }
-        VillagerProfession::Leatherworker => {
-            &[("leather", 6, "emerald", 1, 2), ("emerald", 5, "leather_leggings", 1, 1)]
-        }
-        VillagerProfession::Librarian => {
-            &[("paper", 24, "emerald", 1, 2), ("emerald", 9, "bookshelf", 1, 1)]
-        }
-        VillagerProfession::Mason => {
-            &[("clay_ball", 10, "emerald", 1, 2), ("emerald", 1, "brick", 10, 1)]
-        }
-        VillagerProfession::Shepherd => {
-            &[("white_wool", 18, "emerald", 1, 2), ("emerald", 2, "shears", 1, 1)]
-        }
-        VillagerProfession::Toolsmith => {
-            &[("coal", 15, "emerald", 1, 2), ("emerald", 1, "stone_axe", 1, 1)]
-        }
-        VillagerProfession::Weaponsmith => {
-            &[("coal", 15, "emerald", 1, 2), ("emerald", 3, "iron_axe", 1, 1)]
-        }
-        VillagerProfession::None | VillagerProfession::Nitwit => return Vec::new(),
+        TradeBlueprintKind::Map => ("emerald", bp.price, Some(("compass", 1)), bp.result, 1),
+        TradeBlueprintKind::TippedArrow => ("emerald", bp.price, Some(("arrow", 5)), "tipped_arrow", 5),
     };
-    table
-        .iter()
-        .filter_map(|&(buy, count, sell, result_count, xp_reward)| {
-            Some(MerchantOffer {
-                cost_a: ItemCost {
-                    item: name_to_item(buy)?,
-                    count,
-                    components: Vec::new(),
-                },
-                cost_b: None,
-                result: (name_to_item(sell)?, result_count as u8, Vec::new()),
-                uses: 0,
-                max_uses: 16,
-                xp_reward,
-                price_multiplier: 0.05,
-                demand: 0,
-                special_price_diff: 0,
-            })
-        })
+    if matches!(bp.kind, TradeBlueprintKind::Buy) {
+        cost_a_count = bp.count;
+    }
+    let result_item = if result_name == "filled_map" {
+        name_to_item("filled_map").or_else(|| name_to_item("map"))?
+    } else {
+        name_to_item(result_name)?
+    };
+    let _ = emerald;
+    Some(MerchantOffer {
+        cost_a: trade_cost(cost_a_item, cost_a_count)?,
+        cost_b: second.and_then(|(name, count)| trade_cost(name, count)),
+        result: (result_item, result_count.clamp(1, 255) as u8, Vec::new()),
+        uses: 0,
+        max_uses: bp.max_uses,
+        xp_reward: bp.xp,
+        price_multiplier: bp.multiplier,
+        demand: 0,
+        special_price_diff: 0,
+    })
+}
+
+fn sell_each(items: &[&'static str], price: i32, count: i32, max_uses: i32, xp: i32, multiplier: f32) -> Vec<TradeBlueprint> {
+    items.iter().map(|&item| tb_sell(item, price, count, max_uses, xp, multiplier)).collect()
+}
+
+const WOOL_COLORS: [&str; 16] = ["white_wool","orange_wool","magenta_wool","light_blue_wool","yellow_wool","lime_wool","pink_wool","gray_wool","light_gray_wool","cyan_wool","purple_wool","blue_wool","brown_wool","green_wool","red_wool","black_wool"];
+const CARPET_COLORS: [&str; 16] = ["white_carpet","orange_carpet","magenta_carpet","light_blue_carpet","yellow_carpet","lime_carpet","pink_carpet","gray_carpet","light_gray_carpet","cyan_carpet","purple_carpet","blue_carpet","brown_carpet","green_carpet","red_carpet","black_carpet"];
+const BED_COLORS: [&str; 16] = ["white_bed","orange_bed","magenta_bed","light_blue_bed","yellow_bed","lime_bed","pink_bed","gray_bed","light_gray_bed","cyan_bed","purple_bed","blue_bed","brown_bed","green_bed","red_bed","black_bed"];
+const BANNER_COLORS: [&str; 16] = ["white_banner","orange_banner","magenta_banner","light_blue_banner","yellow_banner","lime_banner","pink_banner","gray_banner","light_gray_banner","cyan_banner","purple_banner","blue_banner","brown_banner","green_banner","red_banner","black_banner"];
+const TERRACOTTA_COLORS: [&str; 16] = ["white_terracotta","orange_terracotta","magenta_terracotta","light_blue_terracotta","yellow_terracotta","lime_terracotta","pink_terracotta","gray_terracotta","light_gray_terracotta","cyan_terracotta","purple_terracotta","blue_terracotta","brown_terracotta","green_terracotta","red_terracotta","black_terracotta"];
+const GLAZED_TERRACOTTA_COLORS: [&str; 16] = ["white_glazed_terracotta","orange_glazed_terracotta","magenta_glazed_terracotta","light_blue_glazed_terracotta","yellow_glazed_terracotta","lime_glazed_terracotta","pink_glazed_terracotta","gray_glazed_terracotta","light_gray_glazed_terracotta","cyan_glazed_terracotta","purple_glazed_terracotta","blue_glazed_terracotta","brown_glazed_terracotta","green_glazed_terracotta","red_glazed_terracotta","black_glazed_terracotta"];
+
+/// The complete non-experimental Java 1.21.1 `VillagerTrades.TRADES` pools.
+/// Vanilla randomly chooses up to two entries from the level pool when the
+/// level is unlocked; this table intentionally contains every candidate.
+fn vanilla_trade_pool(profession: VillagerProfession, level: VillagerLevel) -> Vec<TradeBlueprint> {
+    use VillagerLevel::*;
+    use VillagerProfession::*;
+    let mut v: Vec<TradeBlueprint> = Vec::new();
+    match (profession, level) {
+        (Farmer, Novice) => v.extend([tb_buy("wheat",20,16,2),tb_buy("potato",26,16,2),tb_buy("carrot",22,16,2),tb_buy("beetroot",15,16,2),tb_sell("bread",1,6,16,1,0.05)]),
+        (Farmer, Apprentice) => v.extend([tb_buy("pumpkin",6,12,10),tb_sell("pumpkin_pie",1,4,12,5,0.05),tb_sell("apple",1,4,16,5,0.05)]),
+        (Farmer, Journeyman) => v.extend([tb_sell("cookie",3,18,12,10,0.05),tb_buy("melon",4,12,20)]),
+        (Farmer, Expert) => { v.push(tb_sell("cake",1,1,12,15,0.05)); v.extend([100,160,140,120,280,7].map(|_| tb_stew(15))); },
+        (Farmer, Master) => v.extend([tb_sell("golden_carrot",3,3,12,30,0.05),tb_sell("glistering_melon_slice",4,3,12,30,0.05)]),
+        (Fisherman, Novice) => v.extend([tb_buy("string",20,16,2),tb_buy("coal",10,16,2),tb_process("cod",6,1,"cooked_cod",6,16,1),tb_sell("cod_bucket",3,1,16,1,0.05)]),
+        (Fisherman, Apprentice) => v.extend([tb_buy("cod",15,16,10),tb_process("salmon",6,1,"cooked_salmon",6,16,5),tb_sell("campfire",2,1,12,5,0.05)]),
+        (Fisherman, Journeyman) => v.extend([tb_buy("salmon",13,16,20),tb_enchanted("fishing_rod",3,3,10,0.2)]),
+        (Fisherman, Expert) => v.push(tb_buy("tropical_fish",6,12,30)),
+        (Fisherman, Master) => v.extend([tb_buy("pufferfish",4,12,30),tb_buy("oak_boat",1,12,30)]),
+        (Shepherd, Novice) => v.extend([tb_buy("white_wool",18,16,2),tb_buy("brown_wool",18,16,2),tb_buy("black_wool",18,16,2),tb_buy("gray_wool",18,16,2),tb_sell("shears",2,1,12,1,0.05)]),
+        (Shepherd, Apprentice) => { v.extend(["white_dye","gray_dye","black_dye","light_blue_dye","lime_dye"].map(|x| tb_buy(x,12,16,10))); v.extend(sell_each(&WOOL_COLORS,1,1,16,5,0.05)); v.extend(sell_each(&CARPET_COLORS,1,4,16,5,0.05)); },
+        (Shepherd, Journeyman) => { v.extend(["yellow_dye","light_gray_dye","orange_dye","red_dye","pink_dye"].map(|x| tb_buy(x,12,16,20))); v.extend(sell_each(&BED_COLORS,3,1,12,10,0.05)); },
+        (Shepherd, Expert) => { v.extend(["brown_dye","purple_dye","blue_dye","green_dye","magenta_dye","cyan_dye"].map(|x| tb_buy(x,12,16,30))); v.extend(sell_each(&BANNER_COLORS,3,1,12,15,0.05)); },
+        (Shepherd, Master) => v.push(tb_sell("painting",2,3,12,30,0.05)),
+        (Fletcher, Novice) => v.extend([tb_buy("stick",32,16,2),tb_sell("arrow",1,16,12,1,0.05),tb_process("gravel",10,1,"flint",10,12,1)]),
+        (Fletcher, Apprentice) => v.extend([tb_buy("flint",26,12,10),tb_sell("bow",2,1,12,5,0.05)]),
+        (Fletcher, Journeyman) => v.extend([tb_buy("string",14,16,20),tb_sell("crossbow",3,1,12,10,0.05)]),
+        (Fletcher, Expert) => v.extend([tb_buy("feather",24,16,30),tb_enchanted("bow",2,3,15,0.05)]),
+        (Fletcher, Master) => v.extend([tb_buy("tripwire_hook",8,12,30),tb_enchanted("crossbow",3,3,15,0.05),tb_tipped_arrow()]),
+        (Librarian, Novice) => v.extend([tb_buy("paper",24,16,2),tb_book(1),tb_sell("bookshelf",9,1,12,1,0.05)]),
+        (Librarian, Apprentice) => v.extend([tb_buy("book",4,12,10),tb_book(5),tb_sell("lantern",1,1,12,5,0.05)]),
+        (Librarian, Journeyman) => v.extend([tb_buy("ink_sac",5,12,20),tb_book(10),tb_sell("glass",1,4,12,10,0.05)]),
+        (Librarian, Expert) => v.extend([tb_buy("writable_book",2,12,30),tb_book(15),tb_sell("clock",5,1,12,15,0.05),tb_sell("compass",4,1,12,15,0.05)]),
+        (Librarian, Master) => v.push(tb_sell("name_tag",20,1,12,30,0.05)),
+        (Cartographer, Novice) => v.extend([tb_buy("paper",24,16,2),tb_sell("map",7,1,12,1,0.05)]),
+        (Cartographer, Apprentice) => v.extend([tb_buy("glass_pane",11,16,10),tb_map(13,12,5)]),
+        (Cartographer, Journeyman) => v.extend([tb_buy("compass",1,12,20),tb_map(14,12,10),tb_map(12,12,10)]),
+        (Cartographer, Expert) => { v.push(tb_sell("item_frame",7,1,12,15,0.05)); v.extend(sell_each(&BANNER_COLORS,3,1,12,15,0.05)); },
+        (Cartographer, Master) => v.push(tb_sell("globe_banner_pattern",8,1,12,30,0.05)),
+        (Cleric, Novice) => v.extend([tb_buy("rotten_flesh",32,16,2),tb_sell("redstone",1,2,12,1,0.05)]),
+        (Cleric, Apprentice) => v.extend([tb_buy("gold_ingot",3,12,10),tb_sell("lapis_lazuli",1,1,12,5,0.05)]),
+        (Cleric, Journeyman) => v.extend([tb_buy("rabbit_foot",2,12,20),tb_sell("glowstone",4,1,12,10,0.05)]),
+        (Cleric, Expert) => v.extend([tb_buy("turtle_scute",4,12,30),tb_buy("glass_bottle",9,12,30),tb_sell("ender_pearl",5,1,12,15,0.05)]),
+        (Cleric, Master) => v.extend([tb_buy("nether_wart",22,12,30),tb_sell("experience_bottle",3,1,12,30,0.05)]),
+        (Armorer, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("iron_leggings",7,1,12,1,0.2),tb_sell("iron_boots",4,1,12,1,0.2),tb_sell("iron_helmet",5,1,12,1,0.2),tb_sell("iron_chestplate",9,1,12,1,0.2)]),
+        (Armorer, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2),tb_sell("chainmail_boots",1,1,12,5,0.2),tb_sell("chainmail_leggings",3,1,12,5,0.2)]),
+        (Armorer, Journeyman) => v.extend([tb_buy("lava_bucket",1,12,20),tb_buy("diamond",1,12,20),tb_sell("chainmail_helmet",1,1,12,10,0.2),tb_sell("chainmail_chestplate",4,1,12,10,0.2),tb_sell("shield",5,1,12,10,0.2)]),
+        (Armorer, Expert) => v.extend([tb_enchanted("diamond_leggings",14,3,15,0.2),tb_enchanted("diamond_boots",8,3,15,0.2)]),
+        (Armorer, Master) => v.extend([tb_enchanted("diamond_helmet",8,3,30,0.2),tb_enchanted("diamond_chestplate",16,3,30,0.2)]),
+        (Weaponsmith, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("iron_axe",3,1,12,1,0.2),tb_enchanted("iron_sword",2,3,1,0.05)]),
+        (Weaponsmith, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2)]),
+        (Weaponsmith, Journeyman) => v.push(tb_buy("flint",24,12,20)),
+        (Weaponsmith, Expert) => v.extend([tb_buy("diamond",1,12,30),tb_enchanted("diamond_axe",12,3,15,0.2)]),
+        (Weaponsmith, Master) => v.push(tb_enchanted("diamond_sword",8,3,30,0.2)),
+        (Toolsmith, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("stone_axe",1,1,12,1,0.2),tb_sell("stone_shovel",1,1,12,1,0.2),tb_sell("stone_pickaxe",1,1,12,1,0.2),tb_sell("stone_hoe",1,1,12,1,0.2)]),
+        (Toolsmith, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2)]),
+        (Toolsmith, Journeyman) => v.extend([tb_buy("flint",30,12,20),tb_enchanted("iron_axe",1,3,10,0.2),tb_enchanted("iron_shovel",2,3,10,0.2),tb_enchanted("iron_pickaxe",3,3,10,0.2),tb_sell("diamond_hoe",4,1,3,10,0.2)]),
+        (Toolsmith, Expert) => v.extend([tb_buy("diamond",1,12,30),tb_enchanted("diamond_axe",12,3,15,0.2),tb_enchanted("diamond_shovel",5,3,15,0.2)]),
+        (Toolsmith, Master) => v.push(tb_enchanted("diamond_pickaxe",13,3,30,0.2)),
+        (Butcher, Novice) => v.extend([tb_buy("chicken",14,16,2),tb_buy("porkchop",7,16,2),tb_buy("rabbit",4,16,2),tb_sell("rabbit_stew",1,1,12,1,0.05)]),
+        (Butcher, Apprentice) => v.extend([tb_buy("coal",15,16,2),tb_sell("cooked_porkchop",1,5,16,5,0.05),tb_sell("cooked_chicken",1,8,16,5,0.05)]),
+        (Butcher, Journeyman) => v.extend([tb_buy("mutton",7,16,20),tb_buy("beef",10,16,20)]),
+        (Butcher, Expert) => v.push(tb_buy("dried_kelp_block",10,12,30)),
+        (Butcher, Master) => v.push(tb_buy("sweet_berries",10,12,30)),
+        (Leatherworker, Novice) => v.extend([tb_buy("leather",6,16,2),tb_dyed("leather_leggings",3,12,1),tb_dyed("leather_chestplate",7,12,1)]),
+        (Leatherworker, Apprentice) => v.extend([tb_buy("flint",26,12,10),tb_dyed("leather_helmet",5,12,5),tb_dyed("leather_boots",4,12,5)]),
+        (Leatherworker, Journeyman) => v.extend([tb_buy("rabbit_hide",9,12,20),tb_dyed("leather_chestplate",7,12,10)]),
+        (Leatherworker, Expert) => v.extend([tb_buy("turtle_scute",4,12,30),tb_dyed("leather_horse_armor",6,12,15)]),
+        (Leatherworker, Master) => v.extend([tb_sell("saddle",6,1,12,30,0.2),tb_dyed("leather_helmet",5,12,30)]),
+        (Mason, Novice) => v.extend([tb_buy("clay_ball",10,16,2),tb_sell("brick",1,10,16,1,0.05)]),
+        (Mason, Apprentice) => v.extend([tb_buy("stone",20,16,10),tb_sell("chiseled_stone_bricks",1,4,16,5,0.05)]),
+        (Mason, Journeyman) => v.extend([tb_buy("granite",16,16,20),tb_buy("andesite",16,16,20),tb_buy("diorite",16,16,20),tb_sell("dripstone_block",1,4,16,10,0.05),tb_sell("polished_andesite",1,4,16,10,0.05),tb_sell("polished_diorite",1,4,16,10,0.05),tb_sell("polished_granite",1,4,16,10,0.05)]),
+        (Mason, Expert) => { v.push(tb_buy("quartz",12,12,30)); v.extend(sell_each(&TERRACOTTA_COLORS,1,1,12,15,0.05)); v.extend(sell_each(&GLAZED_TERRACOTTA_COLORS,1,1,12,15,0.05)); },
+        (Mason, Master) => v.extend([tb_sell("quartz_pillar",1,1,12,30,0.05),tb_sell("quartz_block",1,1,12,30,0.05)]),
+        (None | Nitwit, _) => {},
+    }
+    v
+}
+
+fn instantiate_trade_pool(profession: VillagerProfession, level: VillagerLevel, mut roll: impl FnMut() -> u32) -> Vec<MerchantOffer> {
+    vanilla_trade_pool(profession, level)
+        .into_iter()
+        .filter_map(|bp| instantiate_trade_blueprint(bp, roll()))
         .collect()
+}
+
+/// Profession assignment opens the novice pool. Higher tiers are appended by
+/// `unlock_villager_trade_level` as XP crosses the vanilla thresholds.
+fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
+    instantiate_trade_pool(profession, VillagerLevel::Novice, || world_rng::next_below(u32::MAX))
+}
+
+fn unlock_villager_trade_level(villager: &mut Villager, level: VillagerLevel) {
+    if matches!(villager.profession, VillagerProfession::None | VillagerProfession::Nitwit) {
+        return;
+    }
+    villager.offers.extend(instantiate_trade_pool(villager.profession, level, || {
+        world_rng::next_below(u32::MAX)
+    }));
+}
+
+/// Wandering trader pools: five common entries plus one rare entry in vanilla.
+/// The rare pool is encoded after the separator comment in `wandering_trader_pool`.
+fn wandering_trader_pool(rare: bool) -> Vec<TradeBlueprint> {
+    if rare {
+        return vec![
+            tb_sell("tropical_fish_bucket",5,1,4,1,0.05),tb_sell("pufferfish_bucket",5,1,4,1,0.05),
+            tb_sell("packed_ice",3,1,6,1,0.05),tb_sell("blue_ice",6,1,6,1,0.05),
+            tb_sell("gunpowder",1,1,8,1,0.05),tb_sell("podzol",3,3,6,1,0.05),
+        ];
+    }
+    let mut v = vec![
+        tb_sell("sea_pickle",2,1,5,1,0.05),tb_sell("slime_ball",4,1,5,1,0.05),tb_sell("glowstone",2,1,5,1,0.05),
+        tb_sell("nautilus_shell",5,1,5,1,0.05),tb_sell("fern",1,1,12,1,0.05),tb_sell("sugar_cane",1,1,8,1,0.05),
+        tb_sell("pumpkin",1,1,4,1,0.05),tb_sell("kelp",3,1,12,1,0.05),tb_sell("cactus",3,1,8,1,0.05),
+        tb_sell("dandelion",1,1,12,1,0.05),tb_sell("poppy",1,1,12,1,0.05),tb_sell("blue_orchid",1,1,8,1,0.05),
+        tb_sell("allium",1,1,12,1,0.05),tb_sell("azure_bluet",1,1,12,1,0.05),tb_sell("red_tulip",1,1,12,1,0.05),
+        tb_sell("orange_tulip",1,1,12,1,0.05),tb_sell("white_tulip",1,1,12,1,0.05),tb_sell("pink_tulip",1,1,12,1,0.05),
+        tb_sell("oxeye_daisy",1,1,12,1,0.05),tb_sell("cornflower",1,1,12,1,0.05),tb_sell("lily_of_the_valley",1,1,7,1,0.05),
+        tb_sell("wheat_seeds",1,1,12,1,0.05),tb_sell("beetroot_seeds",1,1,12,1,0.05),tb_sell("pumpkin_seeds",1,1,12,1,0.05),
+        tb_sell("melon_seeds",1,1,12,1,0.05),tb_sell("acacia_sapling",5,1,8,1,0.05),tb_sell("birch_sapling",5,1,8,1,0.05),
+        tb_sell("dark_oak_sapling",5,1,8,1,0.05),tb_sell("jungle_sapling",5,1,8,1,0.05),tb_sell("oak_sapling",5,1,8,1,0.05),
+        tb_sell("spruce_sapling",5,1,8,1,0.05),tb_sell("cherry_sapling",5,1,8,1,0.05),tb_sell("mangrove_propagule",5,1,8,1,0.05),
+    ];
+    v.extend(sell_each(&["red_dye","white_dye","blue_dye","pink_dye","black_dye","green_dye","light_gray_dye","magenta_dye","yellow_dye","gray_dye","purple_dye","light_blue_dye","lime_dye","orange_dye","brown_dye","cyan_dye"],1,3,12,1,0.05));
+    v.extend(sell_each(&["brain_coral_block","bubble_coral_block","fire_coral_block","horn_coral_block","tube_coral_block"],3,1,8,1,0.05));
+    v.extend(sell_each(&["vine","brown_mushroom","red_mushroom"],1,1,12,1,0.05));
+    v.extend([tb_sell("lily_pad",1,2,5,1,0.05),tb_sell("small_dripleaf",1,2,5,1,0.05),tb_sell("sand",1,8,8,1,0.05),tb_sell("red_sand",1,4,6,1,0.05),tb_sell("pointed_dripstone",1,2,5,1,0.05),tb_sell("rooted_dirt",1,2,5,1,0.05),tb_sell("moss_block",1,2,5,1,0.05)]);
+    v
+}
+
+fn wandering_trader_offers(mut roll: impl FnMut(usize) -> usize) -> Vec<MerchantOffer> {
+    let mut common = wandering_trader_pool(false);
+    let mut picked = Vec::new();
+    for _ in 0..5.min(common.len()) {
+        if common.is_empty() { break; }
+        let index = roll(common.len());
+        if let Some(bp) = common.get(index).copied() {
+            if let Some(offer) = instantiate_trade_blueprint(bp, index as u32) { picked.push(offer); }
+        }
+        common.remove(index);
+    }
+    let rare = wandering_trader_pool(true);
+    if !rare.is_empty() {
+        let index = roll(rare.len());
+        if let Some(offer) = instantiate_trade_blueprint(rare[index], index as u32) { picked.push(offer); }
+    }
+    picked
 }
 
 /// Scan around a live villager, claim a free workstation (assigning its
@@ -3221,6 +3717,103 @@ fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villag
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct VillagerFamilyState {
+    age_ticks: i32,
+    food_points: i32,
+    gift_cooldown: u32,
+}
+
+const MAX_LIVE_VILLAGER_REGISTRY_ENTRIES: usize = 4_096;
+
+fn live_villager_family_states() -> &'static LockedMap<i32, VillagerFamilyState> {
+    static STATES: Registry<i32, VillagerFamilyState> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_zombie_villager_cures() -> &'static LockedMap<i32, ZombieVillagerCure> {
+    static CURES: Registry<i32, ZombieVillagerCure> = OnceLock::new();
+    CURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_wandering_traders() -> &'static LockedMap<i32, (u32, Vec<MerchantOffer>)> {
+    static TRADERS: Registry<i32, (u32, Vec<MerchantOffer>)> = OnceLock::new();
+    TRADERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_zombie_villager_data() -> &'static LockedMap<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> {
+    static DATA: Registry<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> = OnceLock::new();
+    DATA.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn live_converted_villagers() -> &'static Mutex<HashSet<i32>> {
+    static CONVERTED: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+    CONVERTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn live_raid_captains() -> &'static LockedMap<i32, (DimId, BlockPos)> {
+    static CAPTAINS: Registry<i32, (DimId, BlockPos)> = OnceLock::new();
+    CAPTAINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Emergency bound for entity-keyed lane registries. Normal lifecycle code
+/// removes entries when their entity or raid ends; this only protects against
+/// an unexpected leak and keeps every global registry finite.
+fn evict_live_villager_registry_overflow<V>(map: &mut HashMap<i32, V>) {
+    if map.len() <= MAX_LIVE_VILLAGER_REGISTRY_ENTRIES {
+        return;
+    }
+    let keep: HashSet<i32> = map.keys().take(MAX_LIVE_VILLAGER_REGISTRY_ENTRIES).copied().collect();
+    map.retain(|eid, _| keep.contains(eid));
+}
+
+fn live_raid_glowing() -> &'static LockedMap<i32, u64> {
+    static GLOWING: Registry<i32, u64> = OnceLock::new();
+    GLOWING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+
+/// Java 1.21.1 hero-of-the-village gift loot pools. Baby villagers throw a
+/// poppy; nitwits throw nothing. Every entry in a profession pool is equally
+/// weighted in the vanilla loot table.
+fn hero_gift_pool(profession: VillagerProfession, baby: bool) -> &'static [&'static str] {
+    if baby {
+        return &["poppy"];
+    }
+    match profession {
+        VillagerProfession::None => &["wheat_seeds"],
+        VillagerProfession::Nitwit => &[],
+        VillagerProfession::Armorer => &["chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots"],
+        VillagerProfession::Butcher => &["cooked_chicken", "cooked_mutton", "cooked_porkchop", "cooked_rabbit", "cooked_beef"],
+        VillagerProfession::Cartographer => &["map", "paper"],
+        VillagerProfession::Cleric => &["lapis_lazuli", "redstone"],
+        VillagerProfession::Farmer => &["bread", "cookie", "pumpkin_pie"],
+        VillagerProfession::Fisherman => &["cod", "salmon"],
+        VillagerProfession::Fletcher => &["arrow", "tipped_arrow"],
+        VillagerProfession::Leatherworker => &["leather"],
+        VillagerProfession::Librarian => &["book"],
+        VillagerProfession::Mason => &["clay_ball"],
+        VillagerProfession::Shepherd => &WOOL_COLORS,
+        VillagerProfession::Toolsmith => &["stone_axe", "stone_hoe", "stone_pickaxe", "stone_shovel"],
+        VillagerProfession::Weaponsmith => &["stone_axe", "golden_axe", "iron_axe"],
+    }
+}
+
+fn hero_gift_item(profession: VillagerProfession, baby: bool, roll: u32) -> Option<&'static str> {
+    let pool = hero_gift_pool(profession, baby);
+    if pool.is_empty() {
+        None
+    } else {
+        Some(pool[(roll as usize) % pool.len()])
+    }
+}
+
+/// Vanilla rerolls the next gift uniformly in 600..=6600 ticks (30 seconds
+/// through 5 minutes 30 seconds).
+fn hero_gift_cooldown(roll: u32) -> u32 {
+    600 + roll % 6_001
+}
+
 /// Villager schedule work: prune records whose mob died, re-scan POI bindings
 /// on the slow cadence, and advance each villager's activity/restock tick.
 /// Called once per game tick from [`villager_raid_tick`].
@@ -3245,6 +3838,52 @@ fn live_villager_tick(tick: u64) {
         })
         .collect();
     let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+
+    // A villager killed by a zombie zombifies at the difficulty-dependent
+    // vanilla rate. Preserve its profession, XP and offers for the later cure.
+    let zombie_etype = name_to_etype("zombie");
+    let zombie_villager_etype = name_to_etype("zombie_villager");
+    let mob_snapshots: Vec<(i32, i64, DimId, BlockPos, bool)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (mob.eid, mob.etype, mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32), *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
+        }).collect();
+    for &(eid, etype, dim, position, alive) in &mob_snapshots {
+        if alive || Some(etype) != villager_etype || live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner()).contains(&eid) {
+            continue;
+        }
+        live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(eid);
+        let killer_nearby = mob_snapshots.iter().any(|&(_, ztype, zdim, zpos, zalive)| {
+            zalive && Some(ztype) == zombie_etype && zdim == dim && villager_within(zpos, position, 2)
+        });
+        if !killer_nearby {
+            continue;
+        }
+        let percent = zombie_villager_conversion_percent(raid_difficulty());
+        if percent == 0 || world_rng::next_below(100) >= u32::from(percent) {
+            continue;
+        }
+        let (profession, xp, offers) = villagers.get(&eid)
+            .map(|villager| (villager.profession, villager.villager_xp, villager.offers.clone()))
+            .unwrap_or((VillagerProfession::None, 0, Vec::new()));
+        if zombie_villager_etype.is_some() {
+            if let Some(zombie) = live_spawn_named(dim, "zombie_villager", (
+                position.0 as f64 + 0.5, position.1 as f64, position.2 as f64 + 0.5, 0.0, 0.0,
+            )) {
+                live_zombie_villager_data().lock().unwrap_or_else(|e| e.into_inner()).insert(zombie.eid, (profession, xp, offers));
+            }
+        }
+    }
+
+    let observed_eids: HashSet<i32> = mob_snapshots.iter().map(|&(eid, ..)| eid).collect();
+    {
+        let mut converted = live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner());
+        converted.retain(|eid| observed_eids.contains(eid));
+        if converted.len() > MAX_LIVE_VILLAGER_REGISTRY_ENTRIES {
+            converted.clear();
+        }
+    }
+
     let live_eids: HashSet<i32> = live.iter().map(|&(eid, ..)| eid).collect();
     // A removed or dead villager releases its POI claims before its record
     // goes; without this a village stays claimed by ghosts.
@@ -3269,25 +3908,173 @@ fn live_villager_tick(tick: u64) {
     }
     let world_time = WORLD_TIME.load(Ordering::Relaxed);
     let rescan = tick.is_multiple_of(server_ticks(LIVE_POI_RESCAN_GT));
-    for (eid, uuid, dim, position) in live {
+    let clients = client_snapshot();
+    let hero_effect = live_effect_id("hero_of_the_village");
+    let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
+    family.retain(|eid, _| live_eids.contains(eid));
+    for &(eid, uuid, dim, position) in &live {
         let villager = villagers
             .entry(eid)
             .or_insert_with(|| Villager::new(uuid, VillagerProfession::None));
         if rescan {
             live_villager_bind_pois(dim, position, villager);
         }
+        let state = family.entry(eid).or_insert(VillagerFamilyState { age_ticks: 0, food_points: 0, gift_cooldown: 0 });
+        let baby = if state.age_ticks < 0 {
+            let (age, baby) = villager_baby_age_tick(state.age_ticks);
+            state.age_ticks = age;
+            baby
+        } else { false };
+        let panicking = saved_raids().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(rdim, raid)| {
+            *rdim == dim && raid.state == RaidState::InProgress && villager_within(position, raid.center, 64)
+        });
         {
             let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
             let empty = PoiRegistry::default();
             let pois = registries.get(&dim).unwrap_or(&empty);
-            let (activity, _) = villager.tick(pois, position, world_time);
+            let (activity, _) = villager.tick_brain(pois, position, world_time, baby, panicking);
             if activity == VillagerActivity::Work
                 && villager.profession == VillagerProfession::Farmer
             {
                 if let Some(site) = villager.job_site {
+                    if let Some(reg) = crate::block_registry::breg() {
+                        if let Some(points) = farmer_harvest_replant_nearby_crop(reg, dim, site) {
+                            state.food_points = (state.food_points + points).min(24);
+                        }
+                    }
                     farmer_composter_work(dim, position, site, tick);
                 }
             }
+
+            state.gift_cooldown = state.gift_cooldown.saturating_sub(1);
+            if state.gift_cooldown == 0
+                && !matches!(activity, VillagerActivity::Rest | VillagerActivity::Panic)
+                && hero_effect.is_some()
+            {
+                let hero = clients.iter().filter(|client| !client.is_spectator()).find(|client| {
+                    let (cdim, x, y, z, ..) = client_dim_pos(client);
+                    if cdim != dim {
+                        return false;
+                    }
+                    let close = (x - position.0 as f64).powi(2)
+                        + (y - position.1 as f64).powi(2)
+                        + (z - position.2 as f64).powi(2) <= 25.0;
+                    close && client.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|eff| Some(eff.id) == hero_effect)
+                });
+                if let Some(hero) = hero {
+                    let roll = world_rng::next_below(u32::MAX);
+                    if let Some(item_name) = hero_gift_item(villager.profession, baby, roll) {
+                        if let Some(item) = name_to_item(item_name) {
+                            drop_spawn_in_dim(dim, DropSpawn {
+                                x: position.0 as f64 + 0.5,
+                                y: position.1 as f64 + 1.0,
+                                z: position.2 as f64 + 0.5,
+                                item,
+                                cnt: 1,
+                                comps: Vec::new(),
+                                age: 0,
+                                target: Some(hero.uuid),
+                                thrower: Some(uuid),
+                            });
+                            state.gift_cooldown = hero_gift_cooldown(roll);
+                        }
+                    } else {
+                        state.gift_cooldown = hero_gift_cooldown(roll);
+                    }
+                }
+            }
+        }
+    }
+
+    // Food sharing and breeding run on the vanilla once-per-second brain tick.
+    if tick.is_multiple_of(20) {
+        for i in 0..live.len() {
+            for j in i + 1..live.len() {
+                let (aeid, _, adim, apos) = live[i];
+                let (beid, _, bdim, bpos) = live[j];
+                if adim != bdim || !villager_within(apos, bpos, 3) { continue; }
+                let (af, bf) = match (family.get(&aeid).copied(), family.get(&beid).copied()) {
+                    (Some(a), Some(b)) if a.age_ticks >= 0 && b.age_ticks >= 0 => (a, b),
+                    _ => continue,
+                };
+                let (donor, recipient, donor_eid, recipient_eid) = if af.food_points >= bf.food_points {
+                    (af, bf, aeid, beid)
+                } else { (bf, af, beid, aeid) };
+                let (donor_points, recipient_points, shared) = villager_share_food(donor.food_points, recipient.food_points);
+                if shared {
+                    family.get_mut(&donor_eid).unwrap().food_points = donor_points;
+                    family.get_mut(&recipient_eid).unwrap().food_points = recipient_points;
+                }
+                let willing = villager_willing(af.food_points.max(donor_points)) && villager_willing(bf.food_points.max(recipient_points));
+                if !willing { continue; }
+                let can_breed = {
+                    let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+                    let empty = PoiRegistry::default();
+                    let pois = registries.get(&adim).unwrap_or(&empty);
+                    villager_can_breed(pois, apos, 48, 2)
+                };
+                if !can_breed { continue; }
+                if let Some(child) = live_spawn_named(adim, "villager", (
+                    (apos.0 + bpos.0) as f64 / 2.0 + 0.5,
+                    apos.1 as f64,
+                    (apos.2 + bpos.2) as f64 / 2.0 + 0.5,
+                    0.0, 0.0,
+                )) {
+                    family.insert(child.eid, VillagerFamilyState { age_ticks: -VILLAGER_BABY_GROWTH_TICKS, food_points: 0, gift_cooldown: 0 });
+                    for parent in [aeid, beid] {
+                        if let Some(state) = family.get_mut(&parent) { state.food_points = 0; }
+                    }
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Advance zombie-villager curing timers. Completion respawns the villager,
+/// restores profession/XP/offers, and records the curer gossip discount.
+fn live_zombie_villager_cure_tick() {
+    let mut cures = live_zombie_villager_cures().lock().unwrap_or_else(|e| e.into_inner());
+    if cures.is_empty() { return; }
+    let positions: HashMap<i32, (DimId, BlockPos)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+        .map(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            (mob.eid, (mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32)))
+        }).collect();
+    evict_live_villager_registry_overflow(&mut cures);
+    cures.retain(|eid, _| positions.contains_key(eid));
+    {
+        let mut data = live_zombie_villager_data().lock().unwrap_or_else(|e| e.into_inner());
+        evict_live_villager_registry_overflow(&mut data);
+        data.retain(|eid, _| positions.contains_key(eid));
+    }
+    let mut finished = Vec::new();
+    for (&eid, cure) in cures.iter_mut() {
+        let Some(&(dim, pos)) = positions.get(&eid) else { continue };
+        let accelerants = zombie_cure_accelerants_in_cube(pos, |block| {
+            crate::block_registry::breg().is_some_and(|reg| {
+                let name = reg.name_of(block_at_dim(dim, block.0, block.1, block.2));
+                name == "minecraft:iron_bars" || name.ends_with("_bed")
+            })
+        });
+        if cure.tick_with_rolls(accelerants, world_rng::next_below(100), world_rng::next_below(100)) {
+            finished.push((eid, dim, pos));
+        }
+    }
+    for (eid, dim, pos) in finished {
+        let Some(cure) = cures.remove(&eid) else { continue };
+        let (curer, profession, xp, offers) = cure.finish();
+        if let Some(zombie) = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid) {
+            *zombie.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        }
+        if let Some(mob) = live_spawn_named(dim, "villager", (
+            pos.0 as f64 + 0.5, pos.1 as f64, pos.2 as f64 + 0.5, 0.0, 0.0,
+        )) {
+            let mut villager = Villager::new(mob.uuid, profession);
+            villager.villager_xp = xp;
+            villager.offers = offers;
+            villager.gossip.cure(curer);
+            live_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, villager);
         }
     }
 }
@@ -3332,6 +4119,51 @@ fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u
         write(rest);
         farmer_bonemeal_nearby_crop(reg, dim, site);
     }
+}
+
+/// Harvest one mature crop near a farmer's composter and replant it at age
+/// zero. The return value is abstract villager food points: wheat is treated
+/// as bread after the farmer's vanilla crafting step.
+fn farmer_crop_food_points(name: &str) -> i32 {
+    match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "wheat" => villager_food_points(1, 0, 0, 0),
+        "carrots" => villager_food_points(0, 2, 0, 0),
+        "potatoes" => villager_food_points(0, 0, 2, 0),
+        "beetroots" => villager_food_points(0, 0, 0, 1),
+        _ => 0,
+    }
+}
+
+fn farmer_crop_max_age(name: &str) -> u8 {
+    if name.strip_prefix("minecraft:").unwrap_or(name) == "beetroots" { 3 } else { 7 }
+}
+
+fn farmer_harvest_replant_nearby_crop(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    site: BlockPos,
+) -> Option<i32> {
+    for dy in -1..=1 {
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
+                let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+                let name = reg.name_of(st);
+                if !matches!(name, "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots") {
+                    continue;
+                }
+                let age: u8 = reg.get_prop(st, "age").and_then(|value| value.parse().ok()).unwrap_or(0);
+                if age < farmer_crop_max_age(name) {
+                    continue;
+                }
+                let replanted = reg.with_prop(st, "age", "0");
+                set_block_dim(dim, pos.0, pos.1, pos.2, replanted);
+                note_block_update_dim(dim, pos.0, pos.1, pos.2, replanted);
+                return Some(farmer_crop_food_points(name));
+            }
+        }
+    }
+    None
 }
 
 /// The farmer spends the harvested bone meal on the first growing crop within
@@ -3605,8 +4437,17 @@ fn raider_entity_name(kind: RaiderType) -> &'static str {
 /// hunts down from the village's surface for each slot; a rotated ring on the
 /// terrain surface is the bounded version of that search.
 #[cfg_attr(not(test), allow(dead_code))]
-fn live_raid_spawn_wave(dim: DimId, raid: &Raid, wave: RaidWave) {
+fn live_raid_spawn_wave(dim: DimId, raid: &Raid, mut wave: RaidWave) {
+    let bonus_wave = wave.number > raid.regular_waves;
+    let riders = raid_wave_adjustments(
+        raid_difficulty(), wave.number, bonus_wave, &mut wave.counts,
+        world_rng::next_below(u32::MAX), world_rng::next_below(u32::MAX),
+    );
+    for rider in &riders {
+        wave.counts[rider.rider as usize] += 1;
+    }
     let total = wave.raiders().count().max(1);
+    let mut first_raider_eid = None;
     let cx = raid.center.0 as f64 + 0.5;
     let cz = raid.center.2 as f64 + 0.5;
     for (index, (raider_id, kind)) in wave.raiders().enumerate() {
@@ -3639,16 +4480,98 @@ fn live_raid_spawn_wave(dim: DimId, raid: &Raid, wave: RaidWave) {
             Some(mob)
         });
         if let Some(mob) = spawned {
+            if first_raider_eid.is_none() {
+                first_raider_eid = Some(mob.eid);
+            }
+            if wave.captain == Some(raider_id) {
+                live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, (dim, raid.center));
+            }
             live_raid_mobs()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(mob.eid, (dim, raid.center, raider_id));
         }
     }
+    if let Some(eid) = first_raider_eid {
+        broadcast_entity_sound(eid, "minecraft:event.raid.horn", 6);
+    }
     live_raid_wave_totals()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((dim, raid.center), total as i32);
+}
+
+const RAID_BELL_GLOWING_TICKS: u64 = 60;
+const RAID_BELL_GLOWING_RADIUS: i32 = 48;
+
+fn bell_glowing_range_contains(bell: BlockPos, pos: BlockPos) -> bool {
+    let dx = i64::from(pos.0 - bell.0);
+    let dy = i64::from(pos.1 - bell.1);
+    let dz = i64::from(pos.2 - bell.2);
+    dx * dx + dy * dy + dz * dz <= i64::from(RAID_BELL_GLOWING_RADIUS).pow(2)
+}
+
+/// Consume one ringing edge from every powered bell in a dimension. The
+/// wind-charge trigger path represents a ring by setting the bell's `powered`
+/// state; resetting it here makes the edge one-shot instead of a permanent
+/// glowing aura.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
+    let positions: Vec<BlockPos> = live_pois()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dim)
+        .map(|pois| {
+            pois.records
+                .iter()
+                .filter_map(|(&pos, record)| (record.kind == PoiKind::Bell).then_some(pos))
+                .collect()
+        })
+        .unwrap_or_default();
+    let Some(reg) = crate::block_registry::breg() else {
+        return Vec::new();
+    };
+    let mut ringing = Vec::new();
+    for pos in positions {
+        let st = block_at_dim(dim, pos.0, pos.1, pos.2);
+        if reg.name_of(st) != "minecraft:bell" || reg.get_prop(st, "powered").as_deref() != Some("true") {
+            continue;
+        }
+        let reset = reg.with_prop(st, "powered", "false");
+        set_block_dim(dim, pos.0, pos.1, pos.2, reset);
+        note_block_update_dim(dim, pos.0, pos.1, pos.2, reset);
+        ringing.push(pos);
+    }
+    ringing
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_apply_bell_glowing(dim: DimId, bell: BlockPos, tick: u64) {
+    let raiders: Vec<i32> = live_raid_mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter_map(|(&eid, &(rdim, _, _))| (rdim == dim).then_some(eid))
+        .collect();
+    if raiders.is_empty() {
+        return;
+    }
+    let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+    let mut glowing = live_raid_glowing().lock().unwrap_or_else(|e| e.into_inner());
+    for eid in raiders {
+        let in_range = mob_list.iter().find(|mob| mob.eid == eid).is_some_and(|mob| {
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            bell_glowing_range_contains(bell, (x.floor() as i32, y.floor() as i32, z.floor() as i32))
+        });
+        if !in_range {
+            continue;
+        }
+        evict_live_villager_registry_overflow(&mut glowing);
+        glowing.insert(eid, tick + RAID_BELL_GLOWING_TICKS);
+        // Raiders do not otherwise use entity base metadata flags in this
+        // runtime; bit 0x40 is the vanilla glowing flag.
+        broadcast_seen(eid, |_| (0x58, live_mob_metadata(eid, 0, 0, 0x40)));
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3707,6 +4630,22 @@ fn live_raid_step() {
         live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
         return;
     }
+    let now = TICK.load(Ordering::Relaxed);
+    {
+        let mut glowing = live_raid_glowing().lock().unwrap_or_else(|e| e.into_inner());
+        evict_live_villager_registry_overflow(&mut glowing);
+        let expired: Vec<i32> = glowing.iter().filter_map(|(&eid, &until)| (until <= now).then_some(eid)).collect();
+        for eid in &expired {
+            glowing.remove(eid);
+            broadcast_seen(*eid, |_| (0x58, live_mob_metadata(*eid, 0, 0, 0)));
+        }
+    }
+    let raid_dims: HashSet<DimId> = raids.iter().map(|(dim, _)| *dim).collect();
+    for dim in raid_dims {
+        for bell in live_consume_powered_bells(dim) {
+            live_apply_bell_glowing(dim, bell, now);
+        }
+    }
     // A tracked raider that died (or left the live list) counts as defeated;
     // the closest player inside 64 blocks is recorded as the killer.
     let mut defeated = Vec::new();
@@ -3729,6 +4668,17 @@ fn live_raid_step() {
         let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
         for (eid, dim, center, raider, killer) in defeated {
             tracked.remove(&eid);
+            if live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid).is_some() {
+                if let Some(banner) = name_to_item("ominous_banner") {
+                    let pos = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid)
+                        .map(|mob| *mob.pos.lock().unwrap_or_else(|e| e.into_inner()));
+                    if let Some((x, y, z, ..)) = pos {
+                        drop_spawn_in_dim(dim, DropSpawn {
+                            x, y, z, item: banner, cnt: 1, comps: Vec::new(), age: 0, target: None, thrower: killer,
+                        });
+                    }
+                }
+            }
             if let Some((_, raid)) = raids
                 .iter_mut()
                 .find(|(d, raid)| *d == dim && raid.center == center)
@@ -3754,12 +4704,36 @@ fn live_raid_step() {
                 if let Some(hero) = live_effect_id("hero_of_the_village") {
                     let left = server_ticks(u64::from(effect.duration_ticks)) as i32;
                     let amp = i32::from(effect.level.saturating_sub(1));
-                    for uuid in participants {
-                        if let Some(client) = clients.iter().find(|c| c.uuid == uuid) {
+                    for uuid in &participants {
+                        if let Some(client) = clients.iter().find(|c| c.uuid == *uuid) {
                             live_grant_effect(client, hero, amp, left);
                         }
                     }
                 }
+                let villager_etype = name_to_etype("villager");
+                let owner = participants.first()
+                    .and_then(|uuid| clients.iter().find(|client| client.uuid == *uuid))
+                    .map(|client| client.eid)
+                    .unwrap_or(0);
+                let positions: Vec<(f64, f64, f64)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+                    .filter(|mob| mob.dim == *dim && Some(mob.etype) == villager_etype)
+                    .filter_map(|mob| {
+                        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        villager_within((x.floor() as i32, y.floor() as i32, z.floor() as i32), raid.center, 64)
+                            .then_some((x, y, z))
+                    }).collect();
+                let mut live_fireworks = fireworks().lock().unwrap_or_else(|e| e.into_inner());
+                for (x, y, z) in positions {
+                    live_fireworks.push(Firework {
+                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                        owner,
+                        x, y: y + 1.0, z,
+                        dx: 0.0, dy: 0.9, dz: 0.0,
+                        ttl: server_ticks(30) as i32,
+                        explosions: 1,
+                    });
+                }
+                drop(live_fireworks);
                 live_raid_bossbar_write(*dim, raid.center, None, 1, &clients);
             }
             Some(RaidEvent::Loss) => {
@@ -3906,13 +4880,14 @@ fn live_spawn_trader(dim: DimId, center: (f64, f64, f64)) -> bool {
             dim.min_y() + 64
         };
         let yaw = world_rng::next_below(360) as f32;
-        if live_spawn_named(
+        if let Some(trader) = live_spawn_named(
             dim,
             "wandering_trader",
             (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0),
-        )
-        .is_some()
-        {
+        ) {
+            let offers = wandering_trader_offers(|bound| world_rng::next_below(bound as u32) as usize);
+            live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner())
+                .insert(trader.eid, (WANDERING_TRADER_DESPAWN_TICKS, offers));
             spawned = Some((bx, by, bz));
             break;
         }
@@ -4053,6 +5028,27 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
         }
     }
 
+    // Wandering traders use the 48000-tick despawn delay independently of the
+    // natural despawn scanner.
+    {
+        let mut traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+        let mut expired = Vec::new();
+        for (&eid, (delay, _)) in traders.iter_mut() {
+            let (next, done) = wandering_trader_despawn_tick(*delay);
+            *delay = next;
+            if done { expired.push(eid); }
+        }
+        if !expired.is_empty() {
+            let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            for eid in expired {
+                traders.remove(&eid);
+                if let Some(mob) = mob_list.iter().find(|mob| mob.eid == eid) {
+                    *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+                }
+            }
+        }
+    }
+
     // `PhantomSpawner`: every ~1-2 minutes sweep each unslept player.
     if now >= state.insomnia_next {
         state.insomnia_next = now + (60 + u64::from(world_rng::next_below(60))) * 20;
@@ -4097,6 +5093,7 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
 fn villager_raid_tick() {
     let tick = TICK.load(Ordering::Relaxed);
     live_villager_tick(tick);
+    live_zombie_villager_cure_tick();
     live_utility_mob_tick(tick);
     live_golem_formation_tick(tick);
     live_village_golem_tick(tick);
@@ -5201,15 +6198,15 @@ mod villager_raid_tests {
     }
 
     #[test]
-    fn adjusted_cost_is_clamped_by_the_cost_items_effective_stack_limit() {
+    fn adjusted_cost_is_clamped_to_the_java_one_to_sixty_four_range() {
         let mut offer = offer();
         offer.cost_a.item = ENDER_PEARL;
         offer.cost_a.count = 5;
         offer.price_multiplier = 0.5;
         offer.demand = 9;
-        assert_eq!(offer.cost_a_count(&items()), 16);
+        assert_eq!(offer.cost_a_count(&items()), 27);
         offer.cost_a.components = vec![(1, vec![7])];
-        assert_eq!(offer.cost_a_count(&items()), 7);
+        assert_eq!(offer.cost_a_count(&items()), 27);
         offer.demand = -9;
         assert_eq!(offer.cost_a_count(&items()), 5);
         offer.special_price_diff = -9;
@@ -5774,6 +6771,154 @@ mod villager_raid_tests {
     /// Bad Omen inside a claimed village starts a real raid: `saved_raids`
     /// gains it, the wave spawns live raider mobs through the tracker, and
     /// killing them advances the raid to its next wave.
+    #[test]
+    fn baby_schedule_food_willingness_sharing_and_bed_gate_follow_vanilla() {
+        use VillagerActivity::*;
+        assert_eq!(VillagerActivity::baby_at(2_999), Idle);
+        assert_eq!(VillagerActivity::baby_at(3_000), Play);
+        assert_eq!(VillagerActivity::baby_at(5_999), Play);
+        assert_eq!(VillagerActivity::baby_at(6_000), Idle);
+        assert_eq!(VillagerActivity::baby_at(10_000), Play);
+        assert_eq!(VillagerActivity::baby_at(12_000), Rest);
+        assert_eq!(VillagerActivity::brain_at(3_000, true, true), Panic);
+        assert_eq!(VillagerActivity::brain_at(3_000, false, false), Work);
+
+        assert_eq!(villager_food_points(3, 0, 0, 0), 12);
+        assert_eq!(villager_food_points(0, 4, 4, 4), 12);
+        assert!(villager_willing(villager_food_points(3, 0, 0, 0)));
+        assert!(!villager_willing(11));
+        assert_eq!(villager_share_food(24, 0), (18, 6, true));
+        assert_eq!(villager_share_food(13, 11), (12, 12, true));
+        assert_eq!(villager_share_food(12, 0), (12, 0, false));
+
+        let (mut pois, _villager) = village();
+        let spare_bed = (8, 64, 0);
+        pois.register(spare_bed, PoiKind::Bed);
+        assert_eq!(villager_unclaimed_bed_near(&pois, BED, 16), Some(spare_bed));
+        assert!(villager_can_breed(&pois, BED, 16, 2));
+        assert!(!villager_can_breed(&pois, BED, 16, 1));
+        let mut other = Villager::new([8; 16], VillagerProfession::None);
+        assert!(other.claim_poi(&mut pois, spare_bed));
+        assert_eq!(villager_unclaimed_bed_near(&pois, BED, 16), None);
+        assert!(!villager_can_breed(&pois, BED, 16, 2));
+        let (age, baby) = villager_baby_age_tick(-VILLAGER_BABY_GROWTH_TICKS);
+        assert_eq!((age, baby), (-VILLAGER_BABY_GROWTH_TICKS + 1, true));
+        assert_eq!(villager_baby_age_tick(-1), (0, false));
+    }
+
+    #[test]
+    fn zombie_conversion_and_curing_preserve_villager_identity_and_offers() {
+        assert_eq!(zombie_villager_conversion_percent(RaidDifficulty::Easy), 0);
+        assert_eq!(zombie_villager_conversion_percent(RaidDifficulty::Normal), 50);
+        assert_eq!(zombie_villager_conversion_percent(RaidDifficulty::Hard), 100);
+        let accelerants = zombie_cure_accelerants_in_cube((0, 64, 0), |pos| {
+            pos == (4, 64, 4) || pos == (-4, 60, 0)
+        });
+        assert_eq!(accelerants, 2);
+        assert_eq!(zombie_cure_accelerants_in_cube((0, 64, 0), |_| true), 14);
+
+        let mut cure = ZombieVillagerCure::start(
+            PLAYER,
+            VillagerProfession::Librarian,
+            70,
+            vec![offer()],
+            0,
+        );
+        assert_eq!(cure.ticks_left, ZOMBIE_VILLAGER_CURE_MIN_TICKS);
+        assert!(!cure.tick_with_rolls(0, 1, 0));
+        assert_eq!(cure.ticks_left, ZOMBIE_VILLAGER_CURE_MIN_TICKS - 1);
+        cure.ticks_left = 15;
+        assert!(cure.tick_with_rolls(14, 0, 0));
+        assert_eq!(cure.ticks_left, 0);
+        let (curer, profession, xp, offers) = cure.finish();
+        assert_eq!((curer, profession, xp), (PLAYER, VillagerProfession::Librarian, 70));
+        assert_eq!(offers, vec![offer()]);
+    }
+
+    #[test]
+    fn complete_trade_pools_cover_all_professions_and_wandering_trader_timing() {
+        for profession in [
+            VillagerProfession::Armorer, VillagerProfession::Butcher, VillagerProfession::Cartographer,
+            VillagerProfession::Cleric, VillagerProfession::Farmer, VillagerProfession::Fisherman,
+            VillagerProfession::Fletcher, VillagerProfession::Leatherworker, VillagerProfession::Librarian,
+            VillagerProfession::Mason, VillagerProfession::Shepherd, VillagerProfession::Toolsmith,
+            VillagerProfession::Weaponsmith,
+        ] {
+            for level in [
+                VillagerLevel::Novice, VillagerLevel::Apprentice, VillagerLevel::Journeyman,
+                VillagerLevel::Expert, VillagerLevel::Master,
+            ] {
+                assert!(!vanilla_trade_pool(profession, level).is_empty(), "{profession:?} {level:?}");
+            }
+        }
+        let novice = instantiate_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, || 0);
+        assert_eq!(novice.len(), 3);
+        assert!(novice.iter().any(|offer| offer.cost_b.as_ref().is_some_and(|cost| cost.item == BOOK)));
+        let master = instantiate_trade_pool(VillagerProfession::Toolsmith, VillagerLevel::Master, || 0);
+        assert_eq!(master.len(), 1);
+        assert_eq!(master[0].cost_a.count, 18); // base 13 + minimum enchantment roll 5
+        assert_eq!(wandering_trader_despawn_tick(WANDERING_TRADER_DESPAWN_TICKS), (47_999, false));
+        assert_eq!(wandering_trader_despawn_tick(1), (0, true));
+        assert_eq!(wandering_trader_pool(false).len(), 64);
+        assert_eq!(wandering_trader_pool(true).len(), 6);
+    }
+
+    #[test]
+    fn hero_gift_tables_and_cooldowns_follow_vanilla() {
+        assert_eq!(hero_gift_item(VillagerProfession::None, true, 0), Some("poppy"));
+        assert_eq!(hero_gift_item(VillagerProfession::Nitwit, false, 0), None);
+        assert_eq!(hero_gift_item(VillagerProfession::Armorer, false, 0), Some("chainmail_helmet"));
+        assert_eq!(hero_gift_item(VillagerProfession::Butcher, false, 4), Some("cooked_beef"));
+        assert_eq!(hero_gift_item(VillagerProfession::Librarian, false, 99), Some("book"));
+        assert_eq!(hero_gift_item(VillagerProfession::Shepherd, false, 15), Some("black_wool"));
+        assert_eq!(hero_gift_cooldown(0), 600);
+        assert_eq!(hero_gift_cooldown(6_000), 6_600);
+        assert_eq!(hero_gift_cooldown(6_001), 600);
+    }
+
+    #[test]
+    fn farmer_crop_harvest_and_replant_model_follows_vanilla_food_points() {
+        assert_eq!(farmer_crop_max_age("minecraft:wheat"), 7);
+        assert_eq!(farmer_crop_max_age("minecraft:beetroots"), 3);
+        assert_eq!(farmer_crop_food_points("minecraft:wheat"), 4);
+        assert_eq!(farmer_crop_food_points("minecraft:carrots"), 2);
+        assert_eq!(farmer_crop_food_points("minecraft:potatoes"), 2);
+        assert_eq!(farmer_crop_food_points("minecraft:beetroots"), 1);
+        assert_eq!(farmer_crop_food_points("minecraft:oak_log"), 0);
+    }
+
+    #[test]
+    fn bell_glowing_uses_a_forty_eight_block_sphere_and_sixty_ticks() {
+        assert_eq!(RAID_BELL_GLOWING_TICKS, 60);
+        assert!(bell_glowing_range_contains((0, 64, 0), (48, 64, 0)));
+        assert!(!bell_glowing_range_contains((0, 64, 0), (49, 64, 0)));
+        assert!(bell_glowing_range_contains((0, 64, 0), (33, 64, 33)));
+        assert!(!bell_glowing_range_contains((0, 64, 0), (34, 64, 34)));
+    }
+
+    #[test]
+    fn raid_bonus_rolls_and_ravager_riders_match_the_vanilla_shape() {
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Pillager, RaidDifficulty::Easy, 1, false, 1, 1), 1);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Pillager, RaidDifficulty::Easy, 1, false, 0, 1), 0);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Vindicator, RaidDifficulty::Normal, 3, false, 0, 1), 1);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Pillager, RaidDifficulty::Hard, 3, false, 0, 2), 2);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Witch, RaidDifficulty::Hard, 2, false, 0, 1), 0);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Witch, RaidDifficulty::Hard, 4, false, 0, 1), 0);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Witch, RaidDifficulty::Hard, 5, false, 0, 1), 1);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Ravager, RaidDifficulty::Hard, 8, true, 0, 1), 1);
+        assert_eq!(raid_potential_bonus_spawns(RaiderType::Ravager, RaidDifficulty::Easy, 4, true, 0, 1), 0);
+
+        let mut counts = [4, 1, 4, 0, 1];
+        let riders = raid_wave_adjustments(RaidDifficulty::Normal, 5, false, &mut counts, 0, 0);
+        assert_eq!(counts[RaiderType::Witch as usize], 1);
+        assert_eq!(riders, vec![RavagerRider { ravager_slot: 0, rider: RaiderType::Pillager }]);
+        let mut hard = [5, 2, 2, 1, 2];
+        let riders = raid_wave_adjustments(RaidDifficulty::Hard, 7, false, &mut hard, 2, 1);
+        assert_eq!(riders.len(), 2);
+        assert!(riders.iter().any(|rider| rider.rider == RaiderType::Evoker));
+        assert!(riders.iter().any(|rider| rider.rider == RaiderType::Vindicator));
+    }
+
     #[test]
     fn live_raid_starts_on_bad_omen_and_spawns_and_advances_waves() {
         let _guard = crate::world_guard();
