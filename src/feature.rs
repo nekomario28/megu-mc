@@ -13600,6 +13600,76 @@ mod p8b1_issue199_tests {
     }
 }
 
+
+#[cfg(all(test, megu_vanilla_data))]
+mod biome_decoration_contract_tests {
+    use super::*;
+
+    fn flatten_strings(j: &J, out: &mut Vec<String>) {
+        match j {
+            J::Arr(v) => {
+                for e in v {
+                    flatten_strings(e, out);
+                }
+            }
+            J::Str(s) => out.push(s.clone()),
+            _ => {}
+        }
+    }
+
+    fn biome_features(name: &str) -> Vec<String> {
+        let files = Gen::dp_files("biome");
+        let key = format!("minecraft:{name}");
+        let bytes = files
+            .get(&key)
+            .unwrap_or_else(|| panic!("pinned vanilla biome {key} missing"));
+        let j = crate::json::jparse(bytes)
+            .unwrap_or_else(|| panic!("pinned vanilla biome {key} is malformed"));
+        let mut out = Vec::new();
+        flatten_strings(js(&j, "features").expect("biome feature steps"), &mut out);
+        out
+    }
+
+    /// The biome half of decoration parity: the pinned 1.21.1 biome JSON must still
+    /// wire every family to its marker placed features. The configured-feature bodies
+    /// themselves are covered by the native cell/RNG oracle tests above; this matrix is
+    /// what prevents a correct feature implementation from becoming unreachable in the
+    /// biome that owns it.
+    #[test]
+    fn vanilla_1211_biome_families_wire_their_decoration_marker_features() {
+        for (biome, markers) in [
+            ("lush_caves", &["minecraft:lush_caves_ceiling_vegetation", "minecraft:cave_vines", "minecraft:lush_caves_clay", "minecraft:lush_caves_vegetation", "minecraft:rooted_azalea_tree", "minecraft:spore_blossom"][..]),
+            ("dripstone_caves", &["minecraft:large_dripstone", "minecraft:dripstone_cluster", "minecraft:pointed_dripstone"][..]),
+            ("deep_dark", &["minecraft:sculk_vein", "minecraft:sculk_patch_deep_dark"][..]),
+            ("warm_ocean", &["minecraft:warm_ocean_vegetation", "minecraft:seagrass_warm", "minecraft:sea_pickle"][..]),
+            ("lukewarm_ocean", &["minecraft:seagrass_warm", "minecraft:kelp_warm"][..]),
+            ("ice_spikes", &["minecraft:ice_spike", "minecraft:ice_patch"][..]),
+            ("frozen_ocean", &["minecraft:iceberg_packed", "minecraft:iceberg_blue", "minecraft:blue_ice"][..]),
+            ("wooded_badlands", &["minecraft:trees_badlands", "minecraft:patch_dead_bush_badlands", "minecraft:patch_cactus_decorated"][..]),
+            ("desert", &["minecraft:patch_dead_bush_2", "minecraft:patch_cactus_desert"][..]),
+            ("savanna", &["minecraft:trees_savanna", "minecraft:patch_grass_savanna"][..]),
+            ("meadow", &["minecraft:flower_meadow", "minecraft:trees_meadow"][..]),
+            ("flower_forest", &["minecraft:flower_forest_flowers", "minecraft:trees_flower_forest", "minecraft:flower_flower_forest"][..]),
+            ("cherry_grove", &["minecraft:flower_cherry", "minecraft:trees_cherry"][..]),
+            ("bamboo_jungle", &["minecraft:bamboo", "minecraft:bamboo_vegetation"][..]),
+            ("basalt_deltas", &["minecraft:delta", "minecraft:small_basalt_columns", "minecraft:large_basalt_columns", "minecraft:basalt_blobs", "minecraft:blackstone_blobs", "minecraft:ore_ancient_debris_large"][..]),
+            ("crimson_forest", &["minecraft:weeping_vines", "minecraft:crimson_fungi", "minecraft:crimson_forest_vegetation"][..]),
+            ("warped_forest", &["minecraft:warped_fungi", "minecraft:warped_forest_vegetation", "minecraft:nether_sprouts", "minecraft:twisting_vines"][..]),
+            ("the_end", &["minecraft:end_spike", "minecraft:end_platform"][..]),
+            ("end_highlands", &["minecraft:end_gateway_return", "minecraft:chorus_plant"][..]),
+            ("small_end_islands", &["minecraft:end_island_decorated"][..]),
+        ] {
+            let features = biome_features(biome);
+            for marker in markers {
+                assert!(
+                    features.iter().any(|f| f == marker),
+                    "{biome} does not wire {marker}; feature list: {features:?}"
+                );
+            }
+        }
+    }
+}
+
 // The unified StructureSet / StructureStart pipeline. Included rather than declared as a
 // submodule: `feature` is the layer that may see `structure_template` and `mineshaft`
 // together, and `tools/layers_check.sh` forbids new `mod` edges in production files.

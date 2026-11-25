@@ -2287,6 +2287,23 @@ fn clip_allows_top(top: i32, height: i32, min_clipped: Option<i32>) -> bool {
     top >= height || min_clipped.is_some_and(|min| top >= min)
 }
 
+/// `TreeFeature.doPlace`'s vertical rejection (`edq.a(...)` in the pinned jar):
+/// the lowest of the feature origin and root-adjusted trunk base must be above
+/// `minBuildHeight`, and `max(originY,trunkY) + trunkHeight + 1` must not pass
+/// `maxBuildHeight` (the exclusive top). The draws before this gate have already
+/// happened in vanilla, so this helper is used only after they are consumed.
+fn tree_vertical_span_ok(
+    world_min_y: i32,
+    world_height: i32,
+    origin_y: i32,
+    trunk_y: i32,
+    height: i32,
+) -> bool {
+    let low = origin_y.min(trunk_y);
+    let high = origin_y.max(trunk_y) + height + 1;
+    low > world_min_y && high <= world_min_y + world_height
+}
+
 /// `Vec3i.hashCode` in the pinned version: `(getY() + getZ() * 31) * 31 + getX()`, with
 /// Java's wrapping `int` arithmetic (`kh.hashCode`, read off the pinned jar).
 fn java_blockpos_hash(p: P3) -> i32 {
@@ -2370,6 +2387,15 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
         .root_placer
         .as_ref()
         .map_or(pos, |p| (pos.0, pos.1 + p.trunk_off_y.get(rng), pos.2));
+    if !tree_vertical_span_ok(
+        ctx.g.world_min_y,
+        ctx.g.world_height,
+        pos.1,
+        trunk_start.1,
+        height,
+    ) {
+        return false;
+    }
     // obstruction clipping: scan y 0..height+1 at size radius
     let Some(reg) = breg() else { return false };
     let tables = tree_tables(reg);
@@ -2411,7 +2437,11 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
     let (nodes, logs) = t.trunk_placer.generate(
         ctx,
         rng,
-        top.max(0),
+        // Vanilla passes the clipped height through even when it is negative: a
+        // config whose `min_clipped_height` is zero can accept an obstruction at
+        // the first layer (`top == -1`). Clamping that value changed branch counts
+        // and foliage-node heights for exactly those accepted trees.
+        top,
         trunk_start,
         &t.dirt_provider,
         trunk_st,
@@ -3627,6 +3657,157 @@ mod tests {
                     "state {st} tags {tags:?}"
                 );
             }
+        }
+    }
+
+    fn pinned_tree(name: &str) -> TreeExtra {
+        let path =
+            format!("datapacks/vanilla/data/minecraft/worldgen/configured_feature/{name}.json");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let j = crate::json::jparse(&bytes).unwrap_or_else(|| panic!("{path}: invalid json"));
+        assert_eq!(
+            jstr(&j, "type").as_deref(),
+            Some("minecraft:tree"),
+            "{name} must be a vanilla tree configured feature"
+        );
+        p_tree(js(&j, "config").expect("tree config"))
+            .unwrap_or_else(|| panic!("{name} must parse without dropping its tree shape"))
+    }
+
+    #[test]
+    fn vanilla_1211_tree_species_parse_into_their_native_placers_and_decorators() {
+        for (name, trunk, foliage) in [
+            ("oak", "straight", "blob"),
+            ("swamp_oak", "straight", "blob"),
+            ("fancy_oak", "fancy", "fancy"),
+            ("birch", "straight", "blob"),
+            ("super_birch_bees_0002", "straight", "blob"),
+            ("spruce", "straight", "spruce"),
+            ("pine", "straight", "pine"),
+            ("mega_spruce", "giant", "mega_pine"),
+            ("mega_pine", "giant", "mega_pine"),
+            ("jungle_tree", "straight", "blob"),
+            ("mega_jungle_tree", "mega_jungle", "jungle"),
+            ("acacia", "forking", "acacia"),
+            ("dark_oak", "dark_oak", "dark_oak"),
+            ("mangrove", "upwards_branching", "random_spread"),
+            ("tall_mangrove", "upwards_branching", "random_spread"),
+            ("cherry", "cherry", "cherry"),
+            ("azalea_tree", "bending", "random_spread"),
+        ] {
+            let tree = pinned_tree(name);
+            let trunk_ok = match (trunk, &tree.trunk_placer.ty) {
+                ("straight", TP::Straight)
+                | ("fancy", TP::Fancy)
+                | ("giant", TP::Giant)
+                | ("mega_jungle", TP::MegaJungle)
+                | ("forking", TP::Forking)
+                | ("dark_oak", TP::DarkOak)
+                | ("upwards_branching", TP::UpwardsBranching { .. })
+                | ("cherry", TP::Cherry { .. })
+                | ("bending", TP::Bending { .. }) => true,
+                _ => false,
+            };
+            let foliage_ok = match (foliage, &tree.foliage_placer) {
+                ("blob", FP::Blob { .. })
+                | ("fancy", FP::Fancy { .. })
+                | ("spruce", FP::Spruce { .. })
+                | ("pine", FP::Pine { .. })
+                | ("mega_pine", FP::MegaPine { .. })
+                | ("jungle", FP::Jungle { .. } | FP::MegaJungle { .. })
+                | ("acacia", FP::Acacia)
+                | ("dark_oak", FP::DarkOak)
+                | ("random_spread", FP::RandomSpread { .. })
+                | ("cherry", FP::Cherry { .. }) => true,
+                _ => false,
+            };
+            assert!(trunk_ok, "{name}: wrong trunk placer");
+            assert!(foliage_ok, "{name}: wrong foliage placer");
+        }
+
+        for name in ["mega_spruce", "mega_pine"] {
+            let tree = pinned_tree(name);
+            assert!(
+                tree.decorators
+                    .iter()
+                    .any(|d| matches!(d, Deco::AlterGround(_))),
+                "{name}: podzol alter-ground decorator missing"
+            );
+        }
+        let jungle = pinned_tree("jungle_tree");
+        assert!(jungle
+            .decorators
+            .iter()
+            .any(|d| matches!(d, Deco::Cocoa(_))));
+        assert!(jungle
+            .decorators
+            .iter()
+            .any(|d| matches!(d, Deco::TrunkVine)));
+        assert!(jungle
+            .decorators
+            .iter()
+            .any(|d| matches!(d, Deco::LeaveVine(_))));
+        for name in ["mangrove", "tall_mangrove"] {
+            let tree = pinned_tree(name);
+            assert!(tree.root_placer.is_some(), "{name}: mangrove roots missing");
+            assert!(
+                tree.decorators
+                    .iter()
+                    .any(|d| matches!(d, Deco::AttachedLeaves { .. })),
+                "{name}: hanging propagules missing"
+            );
+            let roots = tree.root_placer.as_ref().expect("mangrove root placer");
+            assert!(
+                matches!(roots.above_bsp.as_ref(), Some(Bsp::Simple(st)) if breg().is_some_and(|reg| reg.name_of(*st) == "minecraft:moss_carpet")),
+                "{name}: moss carpet above-root provider missing"
+            );
+        }
+        let cherry = pinned_tree("cherry_bees_005");
+        assert!(
+            cherry
+                .decorators
+                .iter()
+                .any(|d| matches!(d, Deco::Beehive(p) if (*p - 0.05).abs() < f32::EPSILON)),
+            "cherry_bees_005 must keep its 0.05 bee-nest chance"
+        );
+    }
+
+    #[test]
+    fn tree_vertical_span_uses_vanilla_exclusive_build_height() {
+        assert!(tree_vertical_span_ok(-64, 384, 64, 64, 6));
+        assert!(
+            !tree_vertical_span_ok(-64, 384, -64, -64, 6),
+            "the low endpoint must be above minBuildHeight"
+        );
+        assert!(
+            !tree_vertical_span_ok(-64, 384, 319, 319, 2),
+            "origin + height + 1 reaches exclusive maxBuildHeight"
+        );
+        assert!(
+            tree_vertical_span_ok(-64, 384, 319, 319, -1),
+            "a negative clipped height is not clamped before the span test"
+        );
+        assert!(
+            !tree_vertical_span_ok(-64, 384, 70, 64, 250),
+            "a root-adjusted lower trunk base still uses the upper origin for the top span"
+        );
+    }
+
+    #[test]
+    fn a_tree_at_the_build_bounds_returns_false_before_writing() {
+        let tree = pinned_tree("oak");
+        for y in [-64, 320] {
+            let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).unwrap();
+            let mut ctx = FC::new(&mut g);
+            let mut rng = Xor::seed_worldgen(0);
+            assert!(
+                !gen_tree(&mut ctx, &mut rng, (0, y, 0), &tree),
+                "an oak rooted at y={y} must be rejected by the vanilla vertical span"
+            );
+            assert!(
+                ctx.wr.is_empty(),
+                "a vertically rejected tree must not write blocks"
+            );
         }
     }
 
