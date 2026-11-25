@@ -447,8 +447,8 @@ pub(crate) fn block_entity_id(name: &str) -> Option<&'static str> {
         "shulker_box" => "minecraft:shulker_box",
         "spawner" => "minecraft:mob_spawner",
         _ if bare.ends_with("_bed") => "minecraft:bed",
-        _ if bare.ends_with("_sign") => "minecraft:sign",
         _ if bare.ends_with("_hanging_sign") => "minecraft:hanging_sign",
+        _ if bare.ends_with("_sign") => "minecraft:sign",
         _ if bare.ends_with("_banner") => "minecraft:banner",
         _ if bare.ends_with("_shulker_box") => "minecraft:shulker_box",
         _ if bare.ends_with("_skull") || bare.ends_with("_head") => "minecraft:skull",
@@ -1257,10 +1257,9 @@ fn update_shape<W: TemplateWorld>(
     let name = reg.name_of(state);
     let air = reg.state_of("minecraft:air", None);
     // `WallBannerBlock.updateShape`: a wall banner hangs on the block behind
-    // it, so a change on that side with nothing solid there drops it to air.
-    // This is the one surviving attachment shape in the pinned corpus - the
-    // end city's tower tops put `magenta_wall_banner`s on their outer edge, and
-    // the tower's own wall is what keeps them.
+    // it, so a change on that side with a block that fails `canSurvive` drops it
+    // to air. `BannerBlock.canSurvive` asks the legacy `isSolid` heuristic of
+    // the backing block, not `isSolidRender` or face sturdiness.
     if name
         .strip_prefix("minecraft:")
         .unwrap_or(name)
@@ -1276,7 +1275,7 @@ fn update_shape<W: TemplateWorld>(
                 "east" => Some(5),
                 _ => None,
             };
-            if facing == Some(direction ^ 1) && !reg.is_solid(neighbor) {
+            if facing == Some(direction ^ 1) && !reg.is_legacy_solid(neighbor) {
                 return air;
             }
         }
@@ -1375,16 +1374,26 @@ fn update_shape<W: TemplateWorld>(
         {
             return air;
         }
+        // `SeagrassBlock.canSurvive` (`dnc.a`) for the lower half: the block
+        // below must offer a FULL sturdy UP face, with magma explicitly
+        // excluded.
+        if half.as_deref() == Some("lower")
+            && direction == 0
+            && (!is_face_sturdy(reg, neighbor, 1) || reg.name_of(neighbor) == "minecraft:magma_block")
+        {
+            return air;
+        }
     }
     // `DoorBlock.updateShape`: the vertical partner copies the partner's state
-    // (keeping this half); a lower half whose `canSurvive` fails becomes air
-    // (modelled as "nothing solid below").
+    // (keeping this half); a lower half whose `canSurvive` fails becomes air -
+    // `DoorBlock.canSurvive` is the block below's `isFaceSturdy(UP)` (FULL), so
+    // a bottom slab or a fence also drops it, not only air or liquid.
     if bare.ends_with("_door") {
         let half = reg.get_prop(state, "half");
         let lower = half.as_deref() == Some("lower");
         let partner = (direction == 1 && lower) || (direction == 0 && !lower);
         if !partner {
-            if lower && direction == 0 && (reg.is_air(neighbor) || reg.is_liquid(neighbor)) {
+            if lower && direction == 0 && !is_face_sturdy(reg, neighbor, 1) {
                 return air;
             }
         } else if reg.name_of(neighbor).ends_with("_door")
@@ -1498,35 +1507,536 @@ fn update_shape<W: TemplateWorld>(
     if let Some(next) = reg.connection_after_neighbor(state, neighbor, 0, direction) {
         return next;
     }
-    if reg.fragile_loses_support(state, direction, neighbor) {
+    // `TorchBlock.updateShape`/`LanternBlock.updateShape`/`WallTorchBlock.updateShape`
+    // (`dhf.a`/`djm.a`/`dom.a`): `direction == attach && !canSurvive -> AIR`.
+    // `canSurvive` re-asks the support face, so a support replaced by a
+    // non-sturdy block - not only by air or liquid - also drops the block. The
+    // registry owns each family's attachment direction and `Support` plane
+    // (`attached_support`): CENTER below/above for floor torches and lanterns,
+    // FULL for wall torches.
+    if let Some((attach, plane)) = reg.attached_support(state) {
+        if attach == direction && !reg.is_face_sturdy(neighbor, direction ^ 1, plane) {
+            return air;
+        }
+    }
+    // `LadderBlock.updateShape` (`dke.a`): the block on `facing.getOpposite()`
+    // must offer the FULL sturdy face toward the ladder.
+    if name == "minecraft:ladder" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return air;
+            }
+        }
+    }
+    // `FaceAttachedHorizontalDirectionalBlock.updateShape` (`dgz.a`): buttons,
+    // levers and grindstones drop when the cell on `getConnectedDirection()
+    // .getOpposite()` changes and `canAttach` fails; `canAttach` is the
+    // three-argument `isFaceSturdy` (FULL) on the support's facing side.
+    if bare.ends_with("_button") || matches!(bare, "lever" | "grindstone") {
+        if let Some(attach) = attach_face_direction(reg, state) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return air;
+            }
+        }
+    }
+    // `CarpetBlock.updateShape` (`cyn.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
+    // still counts as occupied.
+    if bare.ends_with("_carpet")
+        && reg.is_air(world.get(pos.0, pos.1.wrapping_sub(1), pos.2))
+    {
         return air;
     }
-    if name == "minecraft:ladder" {
-        let facing = reg.get_prop(state, "facing");
-        let behind = match facing.as_deref() {
-            Some("north") => Some(3u8),
-            Some("south") => Some(2),
-            Some("west") => Some(5),
-            Some("east") => Some(4),
-            _ => None,
-        };
-        if behind == Some(direction)
-            && (reg.is_air(neighbor) || reg.is_liquid(neighbor))
+    // `SnowLayerBlock.updateShape` (`dms.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is `#minecraft:snow_layer_can_survive_on`
+    // (honey/soul_sand/mud) below or a FULL sturdy UP face that is not
+    // `#minecraft:snow_layer_cannot_survive_on` (ice/packed_ice/barrier).
+    if bare == "snow" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let full_snow_below = reg.name_of(below) == "minecraft:snow"
+            && reg.get_prop(below, "layers").as_deref() == Some("8");
+        if !reg.in_tag(below, "minecraft:snow_layer_can_survive_on")
+            && !full_snow_below
+            && (!is_face_sturdy(reg, below, 1)
+                || reg.in_tag(below, "minecraft:snow_layer_cannot_survive_on"))
         {
             return air;
         }
     }
-    if name.ends_with("_button") && reg.is_air(neighbor) {
-        let attached = reg.get_prop(state, "face");
-        let breaks = matches!(
-            (attached.as_deref(), direction),
-            (Some("floor"), 0) | (Some("ceiling"), 1) | (Some("wall"), 2..=5)
+    // `BaseFireBlock.updateShape` (`dgc.a`): `!canSurvive -> AIR` on every
+    // direction; `canSurvive` is a FULL sturdy UP face below (the portal-frame
+    // limb `isPortal` is not modelled - portal frames write `nether_portal`,
+    // never `fire`). `SoulFireBlock.canSurvive` (`dnz.a`) narrows the support
+    // to `#minecraft:soul_fire_base_blocks`.
+    if bare == "fire" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        if !is_face_sturdy(reg, below, 1) {
+            return air;
+        }
+    }
+    if bare == "soul_fire" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        if !reg.in_tag(below, "minecraft:soul_fire_base_blocks") {
+            return air;
+        }
+    }
+    // `RedStoneWireBlock.updateShape` (`dmb.a`): only DOWN carries the
+    // survival check - a FULL sturdy UP face or a hopper. Repeaters and
+    // comparators ask the RIGID support plane (`dia.b`); pressure plates ask
+    // RIGID or CENTER (`dfm.a`).
+    if bare == "redstone_wire"
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+        && reg.name_of(neighbor) != "minecraft:hopper"
+    {
+        return air;
+    }
+    if matches!(bare, "repeater" | "comparator")
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
+    {
+        return air;
+    }
+    if bare.ends_with("_pressure_plate")
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Rigid)
+        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
+    {
+        return air;
+    }
+    // `SeagrassBlock.updateShape` (`dmx.a`): `direction == DOWN &&
+    // !canSurvive -> AIR`; `canSurvive` = the block below's FULL sturdy UP
+    // face, with magma explicitly excluded.
+    if bare == "seagrass"
+        && direction == 0
+        && (!is_face_sturdy(reg, neighbor, 1) || reg.name_of(neighbor) == "minecraft:magma_block")
+    {
+        return air;
+    }
+    // `BaseCoralWallFanBlock.updateShape` (`czu.a`): the wall fan drops when the
+    // block on `facing.getOpposite()` fails the FULL `isFaceSturdy` recheck.
+    if bare.ends_with("_coral_wall_fan") {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return air;
+            }
+        }
+    }
+    // `BaseCoralPlantTypeBlock.updateShape`/`BaseCoralFanBlock.updateShape`
+    // (`czs.a`/`czt.a`): `direction == DOWN && !canSurvive -> AIR`; the block
+    // below must have a FULL sturdy UP face.
+    if (bare.ends_with("_coral_fan") || bare.ends_with("_coral"))
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+    {
+        return air;
+    }
+    // Cake and candle cake use the legacy solid predicate; candles use
+    // `canSupportCenter`; a conduit also uses legacy solid. Sea pickles accept
+    // a non-empty collision face as well as a FULL sturdy face.
+    if (bare == "cake" || bare.ends_with("_candle_cake"))
+        && direction == 0
+        && !reg.is_legacy_solid(neighbor)
+    {
+        return air;
+    }
+    if (bare == "candle" || (bare.ends_with("_candle") && !bare.ends_with("_candle_cake")))
+        && direction == 0
+        && !reg.is_face_sturdy(neighbor, 1, Support::Center)
+    {
+        return air;
+    }
+    if bare == "sea_pickle"
+        && direction == 0
+        && !is_face_sturdy(reg, neighbor, 1)
+        && !reg
+            .collision_boxes(neighbor)
+            .any(|(_, max)| max[1] >= 1.0)
+    {
+        return air;
+    }
+    // Flower pots, end rods, turtle eggs and conduits do not override
+    // `canSurvive` in 1.21.1: the native matrix answers T even in the empty
+    // context, so support loss must not remove them here.
+    // `CocoaBlock.updateShape` (`dgh.a`-family): the pod only survives on
+    // `#minecraft:jungle_logs` at `facing.getOpposite()`.
+    if bare == "cocoa" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !reg.in_tag(neighbor, "minecraft:jungle_logs") {
+                return air;
+            }
+        }
+    }
+    // `AmethystClusterBlock.updateShape` (the three bud sizes and the cluster):
+    // `direction == facing.getOpposite() && !canSurvive -> AIR`; `canSurvive`
+    // is the support's FULL sturdy face toward the cluster.
+    if matches!(
+        bare,
+        "small_amethyst_bud" | "medium_amethyst_bud" | "large_amethyst_bud" | "amethyst_cluster"
+    ) {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return air;
+            }
+        }
+    }
+    // `PointedDripstoneBlock.updateShape` (`dmf.a`): on the support side
+    // (`tip_direction.getOpposite()`) `canSurvive` accepts a FULL sturdy face on
+    // `tip_direction` or another pointed dripstone with the same tip direction.
+    if bare == "pointed_dripstone" {
+        let tip = match reg.get_prop(state, "tip_direction").as_deref() {
+            Some("up") => 1u8,
+            _ => 0u8,
+        };
+        if direction == (tip ^ 1) {
+            let same_dripstone = reg.name_of(neighbor) == name
+                && reg.get_prop(neighbor, "tip_direction")
+                    == reg.get_prop(state, "tip_direction");
+            if !reg.is_face_sturdy(neighbor, tip, Support::Full) && !same_dripstone {
+                return air;
+            }
+        }
+    }
+    // `TripWireHookBlock.updateShape` (`doq.a`): the block on
+    // `facing.getOpposite()` must offer a FULL sturdy face toward the hook.
+    if bare == "tripwire_hook" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !is_face_sturdy(reg, neighbor, direction ^ 1) {
+                return air;
+            }
+        }
+    }
+    // `TripWireBlock.updateShape` (`doa.a`): a horizontal change re-evaluates
+    // `shouldConnectTo` - another tripwire, or a hook whose `facing` points back
+    // at this side.
+    if bare == "tripwire" && matches!(direction, 2..=5) {
+        let key = match direction {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            _ => "east",
+        };
+        let neighbor_name = reg.name_of(neighbor);
+        let connect = neighbor_name == name
+            || (neighbor_name.ends_with("tripwire_hook")
+                && facing_dir(reg, neighbor) == Some(direction ^ 1));
+        let want = if connect { "true" } else { "false" };
+        if reg.get_prop(state, key).as_deref() != Some(want) {
+            return reg.with_prop(state, key, want);
+        }
+    }
+    // `PistonHeadBlock.updateShape` (`dlg.a`): `direction ==
+    // facing.getOpposite() && !canSurvive -> AIR`; the head survives while the
+    // cell behind it is a piston body, moving piston, or another head.
+    if bare == "piston_head" {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach
+                && !matches!(
+                    reg.name_of(neighbor),
+                    "minecraft:piston"
+                        | "minecraft:sticky_piston"
+                        | "minecraft:moving_piston"
+                        | "minecraft:piston_head"
+                )
+            {
+                return air;
+            }
+        }
+    }
+    // `BedBlock.updateShape` (`cyk.a`): on `getNeighbourDirection` (the foot
+    // looks toward `facing` for its head, the head toward
+    // `facing.getOpposite()`) a cell that is no longer the same bed breaks this
+    // half.
+    if bare.ends_with("_bed") {
+        let part = reg.get_prop(state, "part");
+        let pair = match (part.as_deref(), facing_dir(reg, state)) {
+            (Some("foot"), Some(f)) => Some(f),
+            (Some("head"), Some(f)) => Some(f ^ 1),
+            _ => None,
+        };
+        if pair == Some(direction) && reg.name_of(neighbor) != name {
+            return air;
+        }
+    }
+    // `BellBlock.updateShape`: a change on an attached side re-asks
+    // `canSurvive`; floor/ceiling bells ask CENTER, while wall bells ask the
+    // FULL sturdy face toward the bell. A single-wall bell's `facing` points
+    // toward its support in 1.21.1 (measured: facing=north survives a north
+    // stone, not a south one).
+    if bare == "bell" {
+        let facing = facing_dir(reg, state).unwrap_or(2);
+        let sides: [u8; 2] = match reg.get_prop(state, "attachment").as_deref() {
+            Some("floor") => [0, 7],
+            Some("ceiling") => [1, 7],
+            Some("single_wall") => [facing, 7],
+            Some("double_wall") => [facing ^ 1, facing],
+            _ => [7, 7],
+        };
+        if sides.contains(&direction) {
+            let survives = sides.iter().all(|&s| {
+                if s > 5 {
+                    return true;
+                }
+                let support = if s == direction {
+                    neighbor
+                } else {
+                    let (dx, dz) = match s {
+                        2 => (0, -1),
+                        3 => (0, 1),
+                        4 => (-1, 0),
+                        _ => (1, 0),
+                    };
+                    world.get(pos.0 + dx, pos.1, pos.2 + dz)
+                };
+                let plane = if s <= 1 { Support::Center } else { Support::Full };
+                reg.is_face_sturdy(support, s ^ 1, plane)
+            });
+            if !survives {
+                return air;
+            }
+        }
+    }
+    // `ScaffoldingBlock.updateShape` (`dmo.a`) returns the state unchanged and
+    // schedules the distance recompute tick; it does not rewrite `bottom` in
+    // the shape callback itself.
+    // `WallSignBlock`/`CeilingHangingSignBlock`/`StandingSignBlock`: the sign
+    // drops when the side it hangs or stands on changes to a block that fails
+    // `canSurvive` - legacy `isSolid` for the wooden sign family and CENTER
+    // above for ceiling hanging signs.
+    if bare.ends_with("_wall_sign") {
+        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+            if direction == attach && !reg.is_legacy_solid(neighbor) {
+                return air;
+            }
+        }
+    } else if bare.ends_with("_hanging_sign") && !bare.ends_with("_wall_hanging_sign") {
+        // CeilingHangingSignBlock.canSurvive always asks CENTER; `attached`
+        // selects chains/planks visually and is not a support-plane switch.
+        if direction == 1 && !reg.is_face_sturdy(neighbor, 0, Support::Center) {
+            return air;
+        }
+    } else if bare.ends_with("_sign") && !bare.ends_with("_wall_hanging_sign") && direction == 0 && !reg.is_legacy_solid(neighbor) {
+        return air;
+    }
+    // WallHangingSignBlock does not override `canSurvive` in 1.21.1, so its
+    // `updateShape` guard is inert and the block survives even in air.
+    // `BannerBlock.updateShape` (the standing form; the wall form is handled
+    // above): the block below must pass legacy `isSolid`.
+    if bare.ends_with("_banner")
+        && !bare.ends_with("_wall_banner")
+        && direction == 0
+        && !reg.is_legacy_solid(neighbor)
+    {
+        return air;
+    }
+    // `CactusBlock.updateShape` (`czc.a`): `!canSurvive -> AIR` on every
+    // direction - `#minecraft:sand` or another cactus below and no solid or
+    // lava-bearing cell beside it.
+    if bare == "cactus" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let base_ok =
+            reg.name_of(below) == "minecraft:cactus" || reg.in_tag(below, "minecraft:sand");
+        let blocked = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)]
+            .iter()
+            .any(|&(dx, dz)| {
+                let s = world.get(pos.0 + dx, pos.1, pos.2 + dz);
+                reg.is_legacy_solid(s) || reg.fluid_name(s).ends_with("lava")
+            });
+        let above_wet = reg.is_liquid_block(world.get(pos.0, pos.1.wrapping_add(1), pos.2));
+        if !base_ok || blocked || above_wet {
+            return air;
+        }
+    }
+    // `SugarCaneBlock.updateShape` (`dob.a` family): `direction == DOWN &&
+    // !canSurvive -> AIR`; `canSurvive` is cane on cane, or a `#dirt`/`#sand`
+    // support with water (or `frosted_ice`) beside the support block.
+    if bare == "sugar_cane" && direction == 0 {
+        let survives = reg.name_of(neighbor) == "minecraft:sugar_cane" || {
+            (reg.in_tag(neighbor, "minecraft:dirt") || reg.in_tag(neighbor, "minecraft:sand"))
+                && [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)]
+                    .iter()
+                    .any(|&(dx, dz)| {
+                        let s = world.get(
+                            pos.0 + dx,
+                            pos.1.wrapping_sub(1),
+                            pos.2 + dz,
+                        );
+                        reg.fluid_name(s) == "minecraft:water"
+                            || reg.name_of(s) == "minecraft:frosted_ice"
+                    })
+        };
+        if !survives {
+            return air;
+        }
+    }
+    // `BambooBlock.updateShape`/`BambooSaplingBlock.updateShape` (`cyc.a`/`cza.a`):
+    // `!canSurvive -> AIR` on every direction; `canSurvive` is
+    // `#minecraft:bamboo_plantable_on` below. The UP limb also copies the
+    // neighbour bamboo's `leaves` property onto this stalk.
+    if matches!(bare, "bamboo" | "bamboo_sapling") {
+        if direction == 1 && matches!(reg.name_of(neighbor), "minecraft:bamboo" | "minecraft:bamboo_sapling") {
+            if let Some(leaves) = reg.get_prop(neighbor, "leaves") {
+                return reg.with_prop(state, "leaves", &leaves);
+            }
+        }
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        if !reg.in_tag(below, "minecraft:bamboo_plantable_on") {
+            return air;
+        }
+    }
+    // `GrowingPlantHeadBlock`/`GrowingPlantBodyBlock.updateShape`: the
+    // attach-direction cell (`growthDirection.getOpposite()`) must be
+    // attachable - the head/body of the same plant or a FULL sturdy face
+    // toward the plant - or the plant becomes AIR. A head whose
+    // growth-direction neighbour stops being the same plant turns into the
+    // body block, and a body whose growth-direction neighbour is neither
+    // body nor head turns back into the head. Kelp's `canAttachTo` is the
+    // only override: magma fails it. `direction` == attach direction means
+    // `neighbor` is the support itself.
+    let growing = match bare {
+        "kelp" => Some((1u8, true, "kelp_plant", true)),
+        "kelp_plant" => Some((1u8, false, "kelp", true)),
+        "twisting_vines" => Some((1u8, true, "twisting_vines_plant", false)),
+        "twisting_vines_plant" => Some((1u8, false, "twisting_vines", false)),
+        "weeping_vines" => Some((0u8, true, "weeping_vines_plant", false)),
+        "weeping_vines_plant" => Some((0u8, false, "weeping_vines", false)),
+        "cave_vines" => Some((0u8, true, "cave_vines_plant", false)),
+        "cave_vines_plant" => Some((0u8, false, "cave_vines", false)),
+        _ => None,
+    };
+    if let Some((growth, head, partner, magma_fails)) = growing {
+        let attach = growth ^ 1;
+        let family = |st: u32| {
+            matches!(reg.name_of(st), "minecraft:kelp" | "minecraft:kelp_plant") && growth == 1
+                || matches!(
+                    reg.name_of(st),
+                    "minecraft:twisting_vines" | "minecraft:twisting_vines_plant"
+                ) && bare.starts_with("twisting")
+                || matches!(
+                    reg.name_of(st),
+                    "minecraft:weeping_vines" | "minecraft:weeping_vines_plant"
+                ) && bare.starts_with("weeping")
+                || matches!(
+                    reg.name_of(st),
+                    "minecraft:cave_vines" | "minecraft:cave_vines_plant"
+                ) && bare.starts_with("cave")
+        };
+        if direction == growth && head {
+            if !family(neighbor) && reg.name_of(neighbor) != name {
+                let body = reg.state_of(&format!("minecraft:{partner}"), None);
+                return body;
+            }
+        } else if direction == growth {
+            if !family(neighbor) {
+                let head_st = reg.state_of(&format!("minecraft:{partner}"), None);
+                return head_st;
+            }
+        }
+        if direction == attach {
+            let can_attach = !(magma_fails && reg.name_of(neighbor) == "minecraft:magma_block");
+            if !can_attach || !(family(neighbor) || is_face_sturdy(reg, neighbor, growth)) {
+                return air;
+            }
+        }
+    }
+    // `VineBlock.updateShape` (`don.a`): a DOWN change defers to
+    // `BlockBehaviour.updateShape` (state unchanged); any other direction
+    // re-derives the claimed faces through `getUpdatedState` - a face survives
+    // while its support is a FULL sturdy face or the vine above claims the
+    // same face - and a vine with no face left becomes AIR.
+    if bare == "vine" && direction != 0 {
+        let mut next = state;
+        let above = world.get(pos.0, pos.1.wrapping_add(1), pos.2);
+        if reg.get_prop(next, "up").as_deref() == Some("true")
+            && !is_face_sturdy(reg, above, 0)
+        {
+            next = reg.with_prop(next, "up", "false");
+        }
+        for d in [2u8, 3, 4, 5] {
+            let key = match d {
+                2 => "north",
+                3 => "south",
+                4 => "west",
+                _ => "east",
+            };
+            if reg.get_prop(next, key).as_deref() == Some("true") {
+                let side = if direction == d {
+                    neighbor
+                } else {
+                    let (dx, dz) = match d {
+                        2 => (0, -1),
+                        3 => (0, 1),
+                        4 => (-1, 0),
+                        _ => (1, 0),
+                    };
+                    world.get(pos.0 + dx, pos.1, pos.2 + dz)
+                };
+                let hangs = reg.name_of(above) == name
+                    && reg.get_prop(above, key).as_deref() == Some("true");
+                if !is_face_sturdy(reg, side, d ^ 1) && !hangs {
+                    next = reg.with_prop(next, key, "false");
+                }
+            }
+        }
+        let has_face = ["up", "north", "south", "west", "east"]
+            .iter()
+            .any(|k| reg.get_prop(next, k).as_deref() == Some("true"));
+        return if has_face { next } else { air };
+    }
+    // `ChorusPlantBlock`/`ChorusFlowerBlock.updateShape` (`ddf.a`/`ddg.a`): a
+    // failed `canSurvive` schedules the break tick rather than rewriting the
+    // state; the tick's outcome is removal, so this pass emits AIR directly.
+    // (The tick itself exists to let the whole plant collapse as one wave.)
+    if bare == "chorus_plant" || bare == "chorus_flower" {
+        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below_name = reg.name_of(below);
+        let mut survives = matches!(
+            below_name,
+            "minecraft:chorus_plant" | "minecraft:end_stone" | "minecraft:chorus_flower"
         );
-        if breaks {
+        if bare == "chorus_plant" && !survives {
+            for (dx, dz) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                let side = world.get(pos.0 + dx, pos.1, pos.2 + dz);
+                if reg.name_of(side) == name {
+                    let side_below = world.get(pos.0 + dx, pos.1.wrapping_sub(1), pos.2 + dz);
+                    survives = matches!(
+                        reg.name_of(side_below),
+                        "minecraft:chorus_plant" | "minecraft:end_stone"
+                    ) || matches!(below_name, "minecraft:chorus_plant" | "minecraft:end_stone");
+                    if survives {
+                        break;
+                    }
+                }
+            }
+        }
+        if !survives {
             return air;
         }
     }
     state
+}
+fn facing_dir(reg: &BReg, state: u32) -> Option<u8> {
+    match reg.get_prop(state, "facing").as_deref() {
+        Some("down") => Some(0),
+        Some("up") => Some(1),
+        Some("north") => Some(2),
+        Some("south") => Some(3),
+        Some("west") => Some(4),
+        Some("east") => Some(5),
+        _ => None,
+    }
+}
+
+/// `FaceAttachedHorizontalDirectionalBlock.getConnectedDirection().getOpposite()`:
+/// the direction from the block toward its support - DOWN for `face=floor`,
+/// UP for `face=ceiling`, `facing.getOpposite()` for `face=wall`.
+fn attach_face_direction(reg: &BReg, state: u32) -> Option<u8> {
+    match reg.get_prop(state, "face").as_deref() {
+        Some("floor") => Some(0),
+        Some("ceiling") => Some(1),
+        Some("wall") => facing_dir(reg, state).map(|f| f ^ 1),
+        _ => None,
+    }
 }
 
 /// `MultifaceBlock.hasAnyFace`: at least one of the six face properties is set.
@@ -2016,6 +2526,139 @@ fn postprocess_bush_shape<W: TemplateWorld>(
     if is_plain_bush {
         let below = world.get(pos.0, pos.1 - 1, pos.2);
         let ok = reg.in_tag(below, "minecraft:dirt") || reg.name_of(below) == "minecraft:farmland";
+        return Some(if ok { state } else { air });
+    }
+    // `BushBlock` subclasses that override `mayPlaceOn`/`canSurvive` but keep
+    // the `updateShape -> !canSurvive -> AIR` contract. Each arm names the
+    // subclass's own substrate rule; `mushroom`s are the one family whose
+    // survival also reads the promotion light engine (the arm in
+    // `update_shape`).
+    let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+    let below_name = reg.name_of(below);
+    let survives = match bare {
+        // `NetherWartBlock.canSurvive` (`dlc.a`): SOUL_SAND only.
+        "nether_wart" => Some(below_name == "minecraft:soul_sand"),
+        // `StemBlock`/`AttachedStemBlock.canSurvive` (`dns.a`/`cxs.a`): the
+        // `mayPlaceOn` set is FARMLAND only.
+        "pumpkin_stem" | "melon_stem" | "attached_pumpkin_stem" | "attached_melon_stem" => {
+            Some(below_name == "minecraft:farmland")
+        }
+        // `DeadBushBlock.mayPlaceOn` (`dhr.a`): sand/red_sand, the `#terracotta`
+        // family, or plain dirt/podzol/mycelium - not grass or farmland.
+        "dead_bush" => Some(
+            matches!(
+                below_name,
+                "minecraft:sand"
+                    | "minecraft:red_sand"
+                    | "minecraft:dirt"
+                    | "minecraft:coarse_dirt"
+                    | "minecraft:podzol"
+                    | "minecraft:mycelium"
+            ) || reg.in_tag(below, "minecraft:terracotta"),
+        ),
+        // `WitherRoseBlock.mayPlaceOn` (`dom.a`): the bush default plus
+        // netherrack and the soul family.
+        "wither_rose" => Some(
+            reg.in_tag(below, "minecraft:dirt")
+                || matches!(
+                    below_name,
+                    "minecraft:farmland"
+                        | "minecraft:netherrack"
+                        | "minecraft:soul_sand"
+                        | "minecraft:soul_soil"
+                ),
+        ),
+        // `RootsBlock`/`NetherSproutsBlock.mayPlaceOn` (`dmi.a`/`dkz.a`): the
+        // bush default plus `#nylium` and soul soil.
+        "crimson_roots" | "warped_roots" | "nether_sprouts" => Some(
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.in_tag(below, "minecraft:dirt")
+                || matches!(below_name, "minecraft:soul_soil" | "minecraft:farmland"),
+        ),
+        // `FungusBlock.mayPlaceOn` (`diz.a`): the roots set plus mycelium.
+        "crimson_fungus" | "warped_fungus" => Some(
+            reg.in_tag(below, "minecraft:nylium")
+                || reg.in_tag(below, "minecraft:dirt")
+                || matches!(
+                    below_name,
+                    "minecraft:mycelium" | "minecraft:soul_soil" | "minecraft:farmland"
+                ),
+        ),
+        // `AzaleaBlock.mayPlaceOn` (`cyg.a`): the bush default plus clay.
+        "azalea" | "flowering_azalea" => Some(
+            reg.in_tag(below, "minecraft:dirt")
+                || matches!(below_name, "minecraft:farmland" | "minecraft:clay"),
+        ),
+        // `BigDripleafBlock.canSurvive` (`czk.a`): clay/moss or the bush
+        // default; the leaf also sits on its stem. `BigDripleafStemBlock`
+        // (`czl.a`) drops the stem limb.
+        "big_dripleaf" => Some(
+            reg.in_tag(below, "minecraft:dirt")
+                || matches!(
+                    below_name,
+                    "minecraft:clay"
+                        | "minecraft:moss_block"
+                        | "minecraft:farmland"
+                        | "minecraft:big_dripleaf_stem"
+                ),
+        ),
+        "big_dripleaf_stem" => Some(
+            reg.in_tag(below, "minecraft:dirt")
+                || matches!(
+                    below_name,
+                    "minecraft:clay" | "minecraft:moss_block" | "minecraft:farmland"
+                ),
+        ),
+        // `HangingRootsBlock.canSurvive` (`djx.a`): the support is the block
+        // ABOVE - a FULL sturdy DOWN face.
+        "hanging_roots" => {
+            let above = world.get(pos.0, pos.1.wrapping_add(1), pos.2);
+            Some(reg.is_face_sturdy(above, 0, Support::Full))
+        }
+        // `MangrovePropaguleBlock.canSurvive` (`dlh.a`): a hanging propagule
+        // holds onto a sturdy DOWN face or mangrove leaves above; a standing
+        // one takes the bush default plus clay.
+        "mangrove_propagule" => {
+            if reg.get_prop(state, "hanging").as_deref() == Some("true") {
+                let above = world.get(pos.0, pos.1.wrapping_add(1), pos.2);
+                Some(
+                    reg.is_face_sturdy(above, 0, Support::Full)
+                        || reg.name_of(above) == "minecraft:mangrove_leaves",
+                )
+            } else {
+                Some(
+                    reg.in_tag(below, "minecraft:dirt")
+                        || matches!(below_name, "minecraft:farmland" | "minecraft:clay"),
+                )
+            }
+        }
+        // `SmallDripleafBlock` (`dnq.a`): a `DoublePlantBlock` - the lower half
+        // wants `#minecraft:small_dripleaf_placeable` (clay/moss) under any
+        // cell, or `#dirt`/farmland under a waterlogged one; the upper half
+        // wants its lower half.
+        "small_dripleaf" => {
+            let half = reg.get_prop(state, "half");
+            match half.as_deref() {
+                Some("upper") => Some(
+                    below_name == "minecraft:small_dripleaf"
+                        && reg.get_prop(below, "half").as_deref() == Some("lower"),
+                ),
+                Some("lower") => {
+                    let wet =
+                        reg.get_prop(state, "waterlogged").as_deref() == Some("true");
+                    Some(
+                        reg.in_tag(below, "minecraft:small_dripleaf_placeable")
+                            || (wet
+                                && (reg.in_tag(below, "minecraft:dirt")
+                                    || below_name == "minecraft:farmland")),
+                    )
+                }
+                _ => Some(false),
+            }
+        }
+        _ => None,
+    };
+    if let Some(ok) = survives {
         return Some(if ok { state } else { air });
     }
     if matches!(
@@ -5665,5 +6308,845 @@ mod template_structures_tests {
         assert_eq!(ctx.get(5, 71, 0), air, "tall_grass upper without lower must be removed");
         assert_eq!(ctx.get(6, 70, 0), double_ok_lower, "large_fern lower over dirt must remain");
         assert_eq!(ctx.get(6, 71, 0), double_ok_upper, "large_fern upper over lower must remain");
+    }
+
+    // ------------------------------------------------------------ canSurvive matrix
+
+    /// One `updateShape` call: `state` sits at `pos` and the neighbour on
+    /// `direction` just became `neighbor`. `cells` are the rest of the world
+    /// (substrates below, the block above, partner halves) - the caller places
+    /// the neighbour cell itself only when the same block must survive the
+    /// `updateShape` read AND stay on the map.
+    fn shape_case(
+        reg: &BReg,
+        state: u32,
+        pos: (i32, i32, i32),
+        direction: u8,
+        neighbor: u32,
+        cells: &[((i32, i32, i32), &str)],
+    ) -> u32 {
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        world.set(pos.0, pos.1, pos.2, state);
+        for &(cpos, name) in cells {
+            let st = reg.state_of(name, None);
+            world.set(cpos.0, cpos.1, cpos.2, st);
+        }
+        update_shape(reg, state, direction, neighbor, &mut world, pos)
+    }
+
+    /// The DOWN-change shorthand used by most `canSurviveOn` rules.
+    fn below_case(reg: &BReg, name: &str, below: &str) -> (u32, u32) {
+        let air = reg.state_of("minecraft:air", None);
+        let st = reg.state_of(name, None);
+        let below_st = reg.state_of(below, None);
+        (
+            shape_case(reg, st, (0, 100, 0), 0, below_st, &[]),
+            air,
+        )
+    }
+
+    #[test]
+    fn update_shape_torches_ask_the_attached_face_sturdiness() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        // Floor torches ask CENTER on UP (`TorchBlock.canSurvive` /
+        // `canSupportCenter`): a fence post supports them, a bottom slab does
+        // not, and air below drops them.
+        for name in ["minecraft:torch", "minecraft:soul_torch", "minecraft:redstone_torch"] {
+            for (below, keeps) in [
+                ("minecraft:stone", true),
+                ("minecraft:oak_fence", true),
+                ("minecraft:glass", true),
+                ("minecraft:smooth_stone_slab[type=bottom]", false),
+                ("minecraft:air", false),
+            ] {
+                let st = reg.state_of(name, None);
+                let below_st = reg
+                    .checked_state(below, &[])
+                    .unwrap_or_else(|| reg.state_of(below.split('[').next().unwrap(), None));
+                let out = shape_case(reg, st, (0, 100, 0), 0, below_st, &[]);
+                assert_eq!(
+                    out == st,
+                    keeps,
+                    "{name} on {below}: survival answer differs"
+                );
+                assert!(out == st || out == air);
+            }
+        }
+        // Wall torches ask FULL sturdiness on the block behind (`facing`'s
+        // opposite): solid render is not enough (glass is sturdy but not
+        // solid), and a fence's bare post is not a full face.
+        let wall = reg.with_prop(
+            reg.state_of("minecraft:wall_torch", None),
+            "facing",
+            "north",
+        );
+        for (behind, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:glass", true),
+            ("minecraft:oak_fence", false),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let behind_st = reg.state_of(behind, None);
+            // `facing=north` means attached to the block at z-1, which is
+            // direction 2 (NORTH) from the torch.
+            let out = shape_case(reg, wall, (0, 100, 0), 2, behind_st, &[]);
+            assert_eq!(
+                out == wall,
+                keeps,
+                "wall_torch attached to {behind}: survival answer differs"
+            );
+            assert!(out == wall || out == air);
+            // A change anywhere else (e.g. the block in front) never drops it.
+            let front = shape_case(reg, wall, (0, 100, 0), 3, air, &[]);
+            assert_eq!(front, wall, "wall_torch dropped by a front-side change");
+        }
+        // Lanterns: standing asks CENTER UP, hanging asks CENTER DOWN.
+        let standing = reg.state_of("minecraft:lantern", None);
+        let hanging = reg.with_prop(standing, "hanging", "true");
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        let slab = reg.with_prop(
+            reg.state_of("minecraft:smooth_stone_slab", None),
+            "type",
+            "bottom",
+        );
+        assert_eq!(
+            shape_case(reg, standing, (0, 100, 0), 0, fence, &[]),
+            standing,
+            "standing lantern rides a fence post"
+        );
+        assert_eq!(
+            shape_case(reg, standing, (0, 100, 0), 0, slab, &[]),
+            air,
+            "standing lantern drops off a bottom slab"
+        );
+        assert_eq!(
+            shape_case(reg, hanging, (0, 100, 0), 1, fence, &[]),
+            hanging,
+            "hanging lantern rides under a fence post"
+        );
+        assert_eq!(
+            shape_case(reg, hanging, (0, 100, 0), 1, air, &[]),
+            air,
+            "hanging lantern drops under air"
+        );
+    }
+
+    #[test]
+    fn update_shape_face_attached_blocks_need_a_full_face() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let pos = (0, 100, 0);
+        for name in [
+            "minecraft:stone_button",
+            "minecraft:lever",
+            "minecraft:grindstone",
+        ] {
+            // face=floor reads the block below (dir DOWN -> neighbour dir 0).
+            let floor = reg.with_prop(reg.state_of(name, None), "face", "floor");
+            let floor = reg.with_prop(floor, "facing", "north");
+            for (below, keeps) in [
+                ("minecraft:stone", true),
+                ("minecraft:smooth_stone_slab[type=top]", true),
+                ("minecraft:oak_fence", false),
+                ("minecraft:air", false),
+            ] {
+                let st = reg.state_of(below.split('[').next().unwrap(), None);
+                let st = if below.contains("type=top") {
+                    reg.with_prop(st, "type", "top")
+                } else {
+                    st
+                };
+                let out = shape_case(reg, floor, pos, 0, st, &[]);
+                assert_eq!(out == floor, keeps, "{name} floor on {below}");
+                assert!(out == floor || out == air);
+            }
+            // face=wall attached to the north block; face=ceiling reads UP.
+            let wallf = reg.with_prop(reg.state_of(name, None), "face", "wall");
+            let wallf = reg.with_prop(wallf, "facing", "north");
+            let glass = reg.state_of("minecraft:glass", None);
+            let leaves = reg.state_of("minecraft:oak_leaves", None);
+            assert_eq!(
+                shape_case(reg, wallf, pos, 2, glass, &[]),
+                wallf,
+                "{name} on glass wall (sturdy full face)"
+            );
+            assert_eq!(
+                shape_case(reg, wallf, pos, 2, leaves, &[]),
+                air,
+                "{name} drops off leaves (no full face)"
+            );
+            let ceil = reg.with_prop(reg.state_of(name, None), "face", "ceiling");
+            let ceil = reg.with_prop(ceil, "facing", "north");
+            assert_eq!(
+                shape_case(reg, ceil, pos, 1, glass, &[]),
+                ceil,
+                "{name} hangs under a sturdy face"
+            );
+            assert_eq!(shape_case(reg, ceil, pos, 1, air, &[]), air);
+        }
+    }
+
+    #[test]
+    fn update_shape_ladders_need_solid_render_behind() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let ladder = reg.with_prop(reg.state_of("minecraft:ladder", None), "facing", "east");
+        // facing=east attaches to the block EAST (dir 5).
+        for (behind, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:glowstone", true),
+            ("minecraft:glass", false),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let st = reg.state_of(behind, None);
+            let out = shape_case(reg, ladder, (0, 100, 0), 5, st, &[]);
+            assert_eq!(out == ladder, keeps, "ladder against {behind}");
+            assert!(out == ladder || out == air);
+        }
+    }
+
+    #[test]
+    fn update_shape_redstone_support_planes() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        // Redstone dust: FULL sturdy UP or a hopper. Glass is FULL-sturdy in
+        // vanilla even though it is not a redstone conductor.
+        for (below, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:hopper", true),
+            ("minecraft:glass", true),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:oak_fence", false),
+            ("minecraft:air", false),
+        ] {
+            let (out, _) = below_case(reg, "minecraft:redstone_wire", below);
+            let st = reg.state_of("minecraft:redstone_wire", None);
+            assert_eq!(out == st, keeps, "redstone_wire on {below}");
+            assert!(out == st || out == air);
+        }
+        // Repeaters/comparators: the RIGID plane, without the hopper special
+        // case. Fences are not rigid; stone, glass and hoppers' UP face are.
+        for name in ["minecraft:repeater", "minecraft:comparator"] {
+            for (below, keeps) in [
+                ("minecraft:stone", true),
+                ("minecraft:glass", true),
+                ("minecraft:hopper", true),
+                ("minecraft:oak_leaves", false),
+                ("minecraft:oak_fence", false),
+                ("minecraft:air", false),
+            ] {
+                let (out, _) = below_case(reg, name, below);
+                let st = reg.state_of(name, None);
+                assert_eq!(out == st, keeps, "{name} on {below}");
+                assert!(out == st || out == air);
+            }
+        }
+        // Pressure plates accept RIGID or CENTER, so a fence post is enough.
+        for (below, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:oak_fence", true),
+            ("minecraft:hopper", true),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let (out, _) = below_case(reg, "minecraft:stone_pressure_plate", below);
+            let st = reg.state_of("minecraft:stone_pressure_plate", None);
+            assert_eq!(out == st, keeps, "stone_pressure_plate on {below}");
+            assert!(out == st || out == air);
+        }
+        let st = reg.state_of("minecraft:redstone_wire", None);
+        for d in [1u8, 2, 3, 4, 5] {
+            assert_eq!(
+                shape_case(reg, st, (0, 100, 0), d, air, &[]),
+                st,
+                "redstone dust dropped by a non-DOWN neighbour change"
+            );
+        }
+    }
+
+    #[test]
+    fn update_shape_carpet_and_snow_layer() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        // Carpet: `!canSurvive` on any changed face; canSurvive = below not air.
+        for name in ["minecraft:white_carpet", "minecraft:moss_carpet"] {
+            let st = reg.state_of(name, None);
+            for (below, keeps) in [
+                ("minecraft:stone", true),
+                ("minecraft:water", true),
+                ("minecraft:air", false),
+            ] {
+                let (out, _) = below_case(reg, name, below);
+                assert_eq!(out == st, keeps, "{name} over {below}");
+                assert!(out == st || out == air);
+            }
+            // A horizontal change drops it too when nothing is below.
+            assert_eq!(shape_case(reg, st, (0, 100, 0), 2, air, &[]), air);
+        }
+        // Snow layers: `canSurvive` = `#snow_layer_can_survive_on` below OR a
+        // FULL sturdy UP face. The tag is honey_block/soul_sand/mud only.
+        for (below, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:honey_block", true),
+            ("minecraft:soul_sand", true),
+            ("minecraft:mud", true),
+            ("minecraft:oak_fence", false),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let (out, _) = below_case(reg, "minecraft:snow", below);
+            let st = reg.state_of("minecraft:snow", None);
+            assert_eq!(out == st, keeps, "snow over {below}");
+            assert!(out == st || out == air);
+        }
+    }
+
+    #[test]
+    fn update_shape_fire_bases() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        // Regular fire needs a FULL sturdy UP face below.
+        for (below, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:magma_block", true),
+            ("minecraft:oak_fence", false),
+            ("minecraft:air", false),
+        ] {
+            let (out, _) = below_case(reg, "minecraft:fire", below);
+            let st = reg.state_of("minecraft:fire", None);
+            assert_eq!(out == st, keeps, "fire over {below}");
+            assert!(out == st || out == air);
+        }
+        // Soul fire rides `#soul_fire_base_blocks` (soul_sand + soul_soil),
+        // not sturdiness.
+        for (below, keeps) in [
+            ("minecraft:soul_sand", true),
+            ("minecraft:soul_soil", true),
+            ("minecraft:stone", false),
+            ("minecraft:netherrack", false),
+        ] {
+            let (out, _) = below_case(reg, "minecraft:soul_fire", below);
+            let st = reg.state_of("minecraft:soul_fire", None);
+            assert_eq!(out == st, keeps, "soul_fire over {below}");
+        }
+    }
+
+    #[test]
+    fn update_shape_surface_blocks_use_their_native_support_predicates() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        // Cake/candle cake use legacy `isSolid`; bottom slabs pass the legacy
+        // dimensional heuristic even though their UP face is not FULL-sturdy.
+        for name in ["minecraft:cake", "minecraft:candle_cake"] {
+            for (below, keeps, top) in [
+                ("minecraft:smooth_stone_slab", true, false),
+                ("minecraft:oak_leaves", true, false),
+                ("minecraft:smooth_stone_slab", true, true),
+                ("minecraft:air", false, false),
+            ] {
+                let mut st = reg.state_of(below, None);
+                st = reg.with_prop(st, "type", if top { "top" } else { "bottom" });
+                let placed = reg.state_of(name, None);
+                let out = shape_case(reg, placed, (0, 100, 0), 0, st, &[]);
+                assert_eq!(out == placed, keeps, "{name} on {below} top={top}");
+                assert!(out == placed || out == air);
+            }
+        }
+        // Candles use CENTER; sea pickles accept a non-empty collision face as
+        // well as a FULL face. Both therefore sit on fence posts.
+        for name in ["minecraft:candle", "minecraft:sea_pickle"] {
+            let fence = reg.state_of("minecraft:oak_fence", None);
+            let placed = reg.state_of(name, None);
+            assert_eq!(shape_case(reg, placed, (0, 100, 0), 0, fence, &[]), placed, "{name} on fence");
+            assert_eq!(shape_case(reg, placed, (0, 100, 0), 0, air, &[]), air, "{name} in air");
+        }
+        // These four do not override canSurvive in 1.21.1 and survive in air.
+        for name in [
+            "minecraft:flower_pot",
+            "minecraft:potted_oak_sapling",
+            "minecraft:end_rod",
+            "minecraft:turtle_egg",
+            "minecraft:conduit",
+        ] {
+            let placed = reg.state_of(name, None);
+            assert_eq!(shape_case(reg, placed, (0, 100, 0), 0, air, &[]), placed, "{name} survives in air");
+        }
+    }
+
+    #[test]
+    fn update_shape_directional_attachments() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let pos = (0, 100, 0);
+        // End rods do not override canSurvive; they remain even in air.
+        let rod = reg.with_prop(reg.state_of("minecraft:end_rod", None), "facing", "up");
+        assert_eq!(shape_case(reg, rod, pos, 0, air, &[]), rod);
+        // Amethyst buds/clusters attach to the FULL sturdy face on facing's
+        // opposite side - glass passes, leaves fail.
+        let bud = reg.with_prop(
+            reg.state_of("minecraft:amethyst_cluster", None),
+            "facing",
+            "up",
+        );
+        for (below, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:glowstone", true),
+            ("minecraft:glass", true),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let st = reg.state_of(below, None);
+            let out = shape_case(reg, bud, pos, 0, st, &[]);
+            assert_eq!(out == bud, keeps, "amethyst_cluster on {below}");
+            assert!(out == bud || out == air);
+        }
+        // Cocoa hangs on `#jungle_logs` only.
+        let cocoa = reg.with_prop(reg.state_of("minecraft:cocoa", None), "facing", "south");
+        for (log, keeps) in [
+            ("minecraft:jungle_log", true),
+            ("minecraft:stripped_jungle_log", true),
+            ("minecraft:jungle_wood", true),
+            ("minecraft:oak_log", false),
+            ("minecraft:stone", false),
+        ] {
+            let st = reg.state_of(log, None);
+            let out = shape_case(reg, cocoa, pos, 3, st, &[]);
+            assert_eq!(out == cocoa, keeps, "cocoa on {log}");
+            assert!(out == cocoa || out == air);
+        }
+        // Pointed dripstone: a stalactite (tip down) rides under a sturdy
+        // ceiling or under another down-tipped dripstone.
+        let tip = reg.with_prop(
+            reg.state_of("minecraft:pointed_dripstone", None),
+            "tip_direction",
+            "down",
+        );
+        let stone = reg.state_of("minecraft:stone", None);
+        let leaves = reg.state_of("minecraft:oak_leaves", None);
+        assert_eq!(shape_case(reg, tip, pos, 1, stone, &[]), tip);
+        assert_eq!(shape_case(reg, tip, pos, 1, leaves, &[]), air);
+        // Chained dripstone: same block above with the same tip keeps it.
+        let world_cells = &[];
+        let above = shape_case(reg, tip, pos, 1, tip, &world_cells[..]);
+        assert_eq!(above, tip, "chained pointed_dripstone holds");
+        // Tripwire hook needs a redstone conductor on facing's opposite side.
+        let hook = reg.with_prop(
+            reg.state_of("minecraft:tripwire_hook", None),
+            "facing",
+            "south",
+        );
+        for (behind, keeps) in [
+            ("minecraft:stone", true),
+            ("minecraft:glass", false),
+            ("minecraft:oak_leaves", false),
+            ("minecraft:air", false),
+        ] {
+            let st = reg.state_of(behind, None);
+            let out = shape_case(reg, hook, pos, 3, st, &[]);
+            assert_eq!(out == hook, keeps, "tripwire_hook on {behind}");
+            assert!(out == hook || out == air);
+        }
+    }
+
+    #[test]
+    fn update_shape_vines_sugar_cane_cactus_bamboo() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let pos = (0, 100, 0);
+        // Sugar cane: stays while the block below is cane or a substrate; the
+        // water check lives in the bush pass, but the diagonal-arm regression
+        // is that DOWN changes no longer fall through to "keep everything".
+        let cane = reg.state_of("minecraft:sugar_cane", None);
+        let sand = reg.state_of("minecraft:sand", None);
+        let water = reg.state_of("minecraft:water", None);
+        let stone = reg.state_of("minecraft:stone", None);
+        // Cane over cane over sand next to water survives both changes.
+        let cells = &[
+            ((0, 98, 0), "minecraft:sand"),
+            ((1, 98, 0), "minecraft:water"),
+        ];
+        let out = shape_case(reg, cane, pos, 0, cane, &cells[..]);
+        assert_eq!(out, cane, "cane over cane stays");
+        // Cane directly over sand without adjacent water dies on its own
+        // `canSurvive` (placement validity is out of scope here; the update
+        // answer is).
+        let out = shape_case(reg, cane, pos, 0, sand, &[]);
+        assert_eq!(out, air, "cane over dry sand dies");
+        let out = shape_case(reg, cane, pos, 0, stone, &[]);
+        assert_eq!(out, air, "cane over stone dies");
+        // Cactus on cactus keeps; cactus on sand (no neighbours) keeps on the
+        // DOWN rule alone - side-contact popping is the other arm of the same
+        // vanilla check and `canSurvive` also verifies nothing solid touches.
+        let cactus = reg.state_of("minecraft:cactus", None);
+        assert_eq!(shape_case(reg, cactus, pos, 0, cactus, &[]), cactus);
+        assert_eq!(
+            shape_case(reg, cactus, pos, 0, sand, &[]),
+            cactus,
+            "cactus over open sand stays"
+        );
+        assert_eq!(shape_case(reg, cactus, pos, 0, stone, &[]), air);
+        // Cactus pops when a solid block appears beside it.
+        let out = shape_case(reg, cactus, pos, 2, stone, &[]);
+        assert_eq!(out, air, "cactus next to a new solid block pops");
+        // Bamboo follows the same below-is-bamboo-or-substrate rule.
+        let bamboo = reg.state_of("minecraft:bamboo", None);
+        assert_eq!(shape_case(reg, bamboo, pos, 0, bamboo, &[]), bamboo);
+        assert_eq!(shape_case(reg, bamboo, pos, 0, sand, &[]), bamboo);
+        assert_eq!(shape_case(reg, bamboo, pos, 0, water, &[]), air);
+        assert_eq!(shape_case(reg, bamboo, pos, 0, stone, &[]), air);
+        // Chorus plant: end_stone below, chorus below, or a same-height
+        // side-chain back to end_stone.
+        let chorus = reg.state_of("minecraft:chorus_plant", None);
+        let end_stone = reg.state_of("minecraft:end_stone", None);
+        assert_eq!(shape_case(reg, chorus, pos, 0, end_stone, &[]), chorus);
+        assert_eq!(shape_case(reg, chorus, pos, 0, chorus, &[]), chorus);
+        assert_eq!(shape_case(reg, chorus, pos, 0, stone, &[]), air);
+        // Kelp/water plants: water above + supported-or-kelp below.
+        let kelp = reg.state_of("minecraft:kelp", None);
+        let cells = &[((0, 101, 0), "minecraft:water")];
+        let out = shape_case(reg, kelp, pos, 0, stone, &cells[..]);
+        assert_eq!(out, kelp, "kelp over a full block under water");
+        let out = shape_case(reg, kelp, pos, 0, air, &cells[..]);
+        assert_eq!(out, air, "kelp over air dies");
+    }
+
+    #[test]
+    fn update_shape_bed_bell_scaffolding_doors() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let pos = (0, 100, 0);
+        // Bed foot keeps only while its head half occupies the facing side.
+        let foot = reg.with_prop(reg.state_of("minecraft:red_bed", None), "part", "foot");
+        let foot = reg.with_prop(foot, "facing", "north");
+        let head = reg.with_prop(reg.state_of("minecraft:red_bed", None), "part", "head");
+        let head = reg.with_prop(head, "facing", "north");
+        assert_eq!(shape_case(reg, foot, pos, 2, head, &[]), foot);
+        assert_eq!(shape_case(reg, foot, pos, 2, air, &[]), air);
+        // Bell attachments ride the sturdy rule per `attachment` value.
+        let floor_bell = reg.with_prop(reg.state_of("minecraft:bell", None), "attachment", "floor");
+        let ceil_bell = reg.with_prop(reg.state_of("minecraft:bell", None), "attachment", "ceiling");
+        let wall_bell = reg.with_prop(reg.state_of("minecraft:bell", None), "attachment", "single_wall");
+        let wall_bell = reg.with_prop(wall_bell, "facing", "north");
+        let dwall_bell = reg.with_prop(reg.state_of("minecraft:bell", None), "attachment", "double_wall");
+        let dwall_bell = reg.with_prop(dwall_bell, "facing", "north");
+        let stone = reg.state_of("minecraft:stone", None);
+        assert_eq!(shape_case(reg, floor_bell, pos, 0, stone, &[]), floor_bell);
+        assert_eq!(shape_case(reg, floor_bell, pos, 0, air, &[]), air);
+        assert_eq!(shape_case(reg, ceil_bell, pos, 1, stone, &[]), ceil_bell);
+        assert_eq!(shape_case(reg, ceil_bell, pos, 1, air, &[]), air);
+        assert_eq!(shape_case(reg, wall_bell, pos, 2, stone, &[]), wall_bell);
+        assert_eq!(shape_case(reg, wall_bell, pos, 2, air, &[]), air);
+        // double_wall reads the two side faces: with facing=north those are
+        // west(4)/east(5) - losing one drops it, losing a front/back does not.
+        assert_eq!(shape_case(reg, dwall_bell, pos, 4, air, &[]), air);
+        // Scaffolding's shape callback does not rewrite `bottom`; it returns
+        // the state unchanged and schedules the distance recompute tick.
+        let scaf = reg.state_of("minecraft:scaffolding", None);
+        assert_eq!(shape_case(reg, scaf, pos, 0, stone, &[]), scaf);
+        assert_eq!(shape_case(reg, scaf, pos, 0, scaf, &[]), scaf);
+        // Door lower half: below must offer a FULL sturdy UP face; a change to
+        // a non-sturdy floor drops the lower half.
+        let door = reg.with_prop(reg.state_of("minecraft:oak_door", None), "half", "lower");
+        let door = reg.with_prop(door, "facing", "north");
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        assert_eq!(shape_case(reg, door, pos, 0, stone, &[]), door);
+        assert_eq!(shape_case(reg, door, pos, 0, fence, &[]), air);
+    }
+
+    #[test]
+    fn update_shape_signs_banners_multiface_and_chains() {
+        let reg = breg().unwrap();
+        let air = reg.state_of("minecraft:air", None);
+        let pos = (0, 100, 0);
+        let stone = reg.state_of("minecraft:stone", None);
+        // Standing signs use the legacy `isSolid` predicate; wall signs do
+        // the same for their backing block.
+        let sign = reg.state_of("minecraft:oak_sign", None);
+        let fence = reg.state_of("minecraft:oak_fence", None);
+        assert_eq!(shape_case(reg, sign, pos, 0, fence, &[]), sign);
+        assert_eq!(shape_case(reg, sign, pos, 0, air, &[]), air);
+        let wall_sign = reg.with_prop(reg.state_of("minecraft:oak_wall_sign", None), "facing", "west");
+        assert_eq!(shape_case(reg, wall_sign, pos, 5, stone, &[]), wall_sign);
+        assert_eq!(shape_case(reg, wall_sign, pos, 5, air, &[]), air);
+        // Wall banners use legacy `isSolid` backing, so glass qualifies.
+        let banner = reg.with_prop(reg.state_of("minecraft:white_wall_banner", None), "facing", "south");
+        let glass = reg.state_of("minecraft:glass", None);
+        assert_eq!(shape_case(reg, banner, pos, 3, stone, &[]), banner);
+        assert_eq!(shape_case(reg, banner, pos, 3, glass, &[]), banner);
+        // Standing banners use the same legacy solid predicate.
+        let floor_banner = reg.state_of("minecraft:white_banner", None);
+        assert_eq!(shape_case(reg, floor_banner, pos, 0, fence, &[]), floor_banner);
+        assert_eq!(shape_case(reg, floor_banner, pos, 0, air, &[]), air);
+        // Hanging signs: ceiling variants need a sturdy DOWN face above; wall
+        // variants attach like wall signs. A chain rides a sturdy face above,
+        // another chain, or a lantern-like hanging parent; below alone is air.
+        let chain = reg.state_of("minecraft:chain", None);
+        assert_eq!(shape_case(reg, chain, pos, 1, stone, &[]), chain);
+        assert_eq!(shape_case(reg, chain, pos, 1, chain, &[]), chain);
+        assert_eq!(shape_case(reg, chain, pos, 1, air, &[]), air);
+        // A horizontal chain (axis=x) hangs from east/west neighbours.
+        let hchain = reg.with_prop(chain, "axis", "x");
+        assert_eq!(shape_case(reg, hchain, pos, 5, chain, &[]), hchain);
+        assert_eq!(shape_case(reg, hchain, pos, 5, air, &[]), air);
+        // Multiface blocks (glow lichen, sculk vein, moss, resin) stay while
+        // any claimed face has sturdy backing; they vanish when the last one
+        // goes. A lichen claiming only `down` reads the block above.
+        let lichen = reg.with_prop(reg.state_of("minecraft:glow_lichen", None), "down", "true");
+        assert_eq!(shape_case(reg, lichen, pos, 1, stone, &[]), lichen);
+        assert_eq!(shape_case(reg, lichen, pos, 1, air, &[]), air);
+        // Tripwire itself updates its attachment props; only hooks have a
+        // support question. A wire with no hooks keeps a state.
+        let wire = reg.state_of("minecraft:tripwire", None);
+        let out = shape_case(reg, wire, pos, 2, air, &[]);
+        assert_eq!(reg.name_of(out), "minecraft:tripwire");
+    }
+
+    #[test]
+    fn postprocess_bush_shape_substrate_matrix() {
+        let reg = breg().unwrap();
+        let pos = (0, 100, 0);
+        let mut world = TestWorld::new(SceneSpec::parse(None, reg));
+        // `postprocess_bush_shape` answers Some(air) exactly when the vanilla
+        // `canSurvive` substrate rule fails for the neighbour-aware arms added
+        // here; the bush/farm arm is covered by
+        // `postprocess_shape_marks_removes_unsupported_bush_blocks_only_at_promotion`.
+        let cases: &[(&str, &str, bool)] = &[
+            ("minecraft:nether_wart", "minecraft:soul_sand", true),
+            ("minecraft:nether_wart", "minecraft:stone", false),
+            ("minecraft:wheat", "minecraft:farmland", true),
+            ("minecraft:pumpkin_stem", "minecraft:farmland", true),
+            ("minecraft:wheat", "minecraft:dirt", false),
+            ("minecraft:dead_bush", "minecraft:sand", true),
+            ("minecraft:dead_bush", "minecraft:red_terracotta", true),
+            ("minecraft:dead_bush", "minecraft:dirt", true),
+            ("minecraft:dead_bush", "minecraft:grass_block", false),
+            ("minecraft:dead_bush", "minecraft:farmland", false),
+            ("minecraft:wither_rose", "minecraft:netherrack", true),
+            ("minecraft:wither_rose", "minecraft:soul_sand", true),
+            ("minecraft:wither_rose", "minecraft:stone", false),
+            ("minecraft:crimson_roots", "minecraft:crimson_nylium", true),
+            ("minecraft:nether_sprouts", "minecraft:soul_soil", true),
+            ("minecraft:crimson_fungus", "minecraft:mycelium", true),
+            ("minecraft:azalea", "minecraft:clay", true),
+            ("minecraft:azalea", "minecraft:stone", false),
+            ("minecraft:big_dripleaf", "minecraft:clay", true),
+            ("minecraft:big_dripleaf_stem", "minecraft:clay", true),
+            ("minecraft:mangrove_propagule", "minecraft:mud", true),
+            ("minecraft:mangrove_propagule", "minecraft:stone", false),
+        ];
+        for &(name, below, keeps) in cases {
+            let st = reg.state_of(name, None);
+            let below_st = reg.state_of(below, None);
+            world.set(pos.0, pos.1, pos.2, st);
+            world.set(pos.0, pos.1 - 1, pos.2, below_st);
+            let out = postprocess_bush_shape(reg, st, &mut world, pos);
+            assert_eq!(
+                out.is_none(),
+                keeps,
+                "{name} over {below}: postprocess answer differs"
+            );
+        }
+        // Hanging roots need a FULL sturdy DOWN face above.
+        let roots = reg.state_of("minecraft:hanging_roots", None);
+        world.set(pos.0, pos.1, pos.2, roots);
+        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:stone", None));
+        assert!(postprocess_bush_shape(reg, roots, &mut world, pos).is_none());
+        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:oak_fence", None));
+        assert!(postprocess_bush_shape(reg, roots, &mut world, pos).is_some());
+        // A hanging propagule ignores the floor and reads the block above.
+        let prop = reg.with_prop(
+            reg.state_of("minecraft:mangrove_propagule", None),
+            "hanging",
+            "true",
+        );
+        world.set(pos.0, pos.1, pos.2, prop);
+        world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:air", None));
+        world.set(
+            pos.0,
+            pos.1 + 1,
+            pos.2,
+            reg.state_of("minecraft:mangrove_leaves", None),
+        );
+        assert!(postprocess_bush_shape(reg, prop, &mut world, pos).is_none());
+        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:air", None));
+        assert!(postprocess_bush_shape(reg, prop, &mut world, pos).is_some());
+        // Small dripleaf lower half: `#small_dripleaf_placeable` (clay, and
+        // moss under water) or `#dirt` while submerged.
+        let small = reg.state_of("minecraft:small_dripleaf", None);
+        world.set(pos.0, pos.1, pos.2, small);
+        world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:clay", None));
+        assert!(postprocess_bush_shape(reg, small, &mut world, pos).is_none());
+        world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:dirt", None));
+        assert!(
+            postprocess_bush_shape(reg, small, &mut world, pos).is_some(),
+            "small_dripleaf over dry dirt dies"
+        );
+        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:water", None));
+        assert!(
+            postprocess_bush_shape(reg, small, &mut world, pos).is_none(),
+            "small_dripleaf over dirt under water stays"
+        );
+        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:air", None));
+        // Upper half reads the lower half.
+        let upper = reg.with_prop(small, "half", "upper");
+        let lower = reg.with_prop(small, "half", "lower");
+        world.set(pos.0, pos.1, pos.2, upper);
+        world.set(pos.0, pos.1 - 1, pos.2, lower);
+        assert!(postprocess_bush_shape(reg, upper, &mut world, pos).is_none());
+        world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:stone", None));
+        assert!(postprocess_bush_shape(reg, upper, &mut world, pos).is_some());
+    }
+}
+
+// This small suite is intentionally outside the vanilla-data-only structure
+// suite above: the support predicates are registry facts, not generated-test
+// data, and must be pinned in the ordinary `cargo test --bin megu` build too.
+#[cfg(test)]
+mod support_shape_matrix_tests {
+    use super::*;
+    use crate::block_registry::breg;
+    use std::collections::HashMap;
+
+    struct MiniWorld {
+        cells: HashMap<Pos, u32>,
+    }
+    impl MiniWorld {
+        fn new() -> Self {
+            Self { cells: HashMap::new() }
+        }
+    }
+    impl TemplateWorld for MiniWorld {
+        fn get(&mut self, x: i32, y: i32, z: i32) -> u32 {
+            *self.cells.get(&(x, y, z)).unwrap_or(&0)
+        }
+        fn set(&mut self, x: i32, y: i32, z: i32, state: u32) -> bool {
+            self.cells.insert((x, y, z), state);
+            true
+        }
+        fn heightmap(&mut self, _kind: HeightmapKind, _x: i32, _z: i32) -> i32 { 0 }
+        fn base_height(&mut self, _kind: HeightmapKind, _x: i32, _z: i32) -> i32 { 0 }
+        fn sea_level(&self) -> i32 { 63 }
+        fn min_y(&self) -> i32 { -64 }
+        fn height(&self) -> i32 { 384 }
+    }
+
+    fn state(reg: &BReg, spec: &str) -> u32 {
+        let (name, prop) = spec.split_once('[').unwrap_or((spec, ""));
+        let mut st = reg.state_of(name, None);
+        if !prop.is_empty() {
+            for kv in prop.trim_end_matches(']').split(',') {
+                let (k, v) = kv.split_once('=').unwrap();
+                st = reg.with_prop(st, k, v);
+            }
+        }
+        st
+    }
+
+    fn below_case(reg: &BReg, placed_spec: &str, below_spec: &str) -> u32 {
+        let mut world = MiniWorld::new();
+        let placed = state(reg, placed_spec);
+        let below = state(reg, below_spec);
+        update_shape(reg, placed, 0, below, &mut world, (0, 64, 0))
+    }
+
+    fn side_case(reg: &BReg, placed_spec: &str, direction: u8, neighbor_spec: &str) -> u32 {
+        let mut world = MiniWorld::new();
+        update_shape(reg, state(reg, placed_spec), direction, state(reg, neighbor_spec), &mut world, (0, 64, 0))
+    }
+
+    #[test]
+    fn support_shape_torch_and_wall_torch_planes() {
+        let Some(reg) = breg() else { return };
+        let air = state(&reg, "minecraft:air");
+        for below in ["minecraft:stone", "minecraft:glass", "minecraft:oak_fence"] {
+            assert_eq!(below_case(&reg, "minecraft:torch", below), state(&reg, "minecraft:torch"), "torch on {below}");
+        }
+        for below in ["minecraft:oak_leaves", "minecraft:air"] {
+            assert_eq!(below_case(&reg, "minecraft:torch", below), air, "torch on {below}");
+        }
+        // facing=north attaches to the south neighbour (direction 3) on the
+        // FULL plane: glass is sturdy, a fence post is not.
+        let wall = "minecraft:wall_torch[facing=north]";
+        assert_eq!(side_case(&reg, wall, 3, "minecraft:glass"), state(&reg, wall));
+        assert_eq!(side_case(&reg, wall, 3, "minecraft:oak_fence"), air);
+        assert_eq!(side_case(&reg, wall, 3, "minecraft:air"), air);
+    }
+
+    #[test]
+    fn support_shape_redstone_uses_three_distinct_planes() {
+        let Some(reg) = breg() else { return };
+        let air = state(&reg, "minecraft:air");
+        // Dust: FULL or hopper. Glass is full-sturdy even though it is not a
+        // redstone conductor.
+        assert_eq!(below_case(&reg, "minecraft:redstone_wire", "minecraft:glass"), state(&reg, "minecraft:redstone_wire"));
+        assert_eq!(below_case(&reg, "minecraft:redstone_wire", "minecraft:oak_fence"), air);
+        // Gates: RIGID. Dust's fence failure also applies here.
+        for gate in ["minecraft:repeater", "minecraft:comparator"] {
+            assert_eq!(below_case(&reg, gate, "minecraft:stone"), state(&reg, gate));
+            assert_eq!(below_case(&reg, gate, "minecraft:oak_fence"), air);
+        }
+        // Pressure plates: RIGID or CENTER, so a fence post supports them.
+        assert_eq!(below_case(&reg, "minecraft:stone_pressure_plate", "minecraft:oak_fence"), state(&reg, "minecraft:stone_pressure_plate"));
+    }
+
+    #[test]
+    fn support_shape_signs_and_banners_use_legacy_solid() {
+        let Some(reg) = breg() else { return };
+        let air = state(&reg, "minecraft:air");
+        // Leaves fail FULL face-sturdiness but pass legacy `isSolid`; vanilla
+        // signs/banners therefore keep them as support.
+        for name in ["minecraft:oak_sign", "minecraft:white_banner"] {
+            assert_eq!(below_case(&reg, name, "minecraft:oak_leaves"), state(&reg, name), "{name} over leaves");
+            assert_eq!(below_case(&reg, name, "minecraft:air"), air, "{name} in air");
+        }
+        let wall_sign = "minecraft:oak_wall_sign[facing=west]";
+        assert_eq!(side_case(&reg, wall_sign, 5, "minecraft:glass"), state(&reg, wall_sign));
+        assert_eq!(side_case(&reg, wall_sign, 5, "minecraft:air"), air);
+        // Ceiling hanging signs always ask CENTER; wall hanging signs have no
+        // canSurvive override in 1.21.1 and survive even unsupported.
+        let hang = "minecraft:oak_hanging_sign[attached=false,rotation=0]";
+        assert_eq!(side_case(&reg, hang, 1, "minecraft:oak_fence"), state(&reg, hang));
+        assert_eq!(side_case(&reg, hang, 1, "minecraft:air"), air);
+        let wall_hang = "minecraft:oak_wall_hanging_sign[facing=north]";
+        assert_eq!(side_case(&reg, wall_hang, 3, "minecraft:air"), state(&reg, wall_hang));
+    }
+
+    #[test]
+    fn support_shape_surface_family_matrix() {
+        let Some(reg) = breg() else { return };
+        // Cake uses legacy solid, so even leaves support it; candles and sea
+        // pickles sit on fence posts by their center/collision rules.
+        assert_eq!(below_case(&reg, "minecraft:cake", "minecraft:oak_leaves"), state(&reg, "minecraft:cake"));
+        assert_eq!(below_case(&reg, "minecraft:candle", "minecraft:oak_fence"), state(&reg, "minecraft:candle"));
+        assert_eq!(below_case(&reg, "minecraft:sea_pickle", "minecraft:oak_fence"), state(&reg, "minecraft:sea_pickle"));
+        for floating in ["minecraft:flower_pot", "minecraft:end_rod", "minecraft:turtle_egg", "minecraft:conduit"] {
+            assert_eq!(below_case(&reg, floating, "minecraft:air"), state(&reg, floating), "{floating} survives unsupported");
+        }
+    }
+
+    #[test]
+    fn support_shape_water_and_column_families() {
+        let Some(reg) = breg() else { return };
+        let air = state(&reg, "minecraft:air");
+        // Seagrass needs a full top face and explicitly rejects magma.
+        assert_eq!(below_case(&reg, "minecraft:seagrass", "minecraft:stone"), state(&reg, "minecraft:seagrass"));
+        assert_eq!(below_case(&reg, "minecraft:seagrass", "minecraft:magma_block"), air);
+        // Coral floor fans need a full top face; wall fans attach opposite
+        // their facing.
+        assert_eq!(below_case(&reg, "minecraft:tube_coral_fan", "minecraft:stone"), state(&reg, "minecraft:tube_coral_fan"));
+        assert_eq!(below_case(&reg, "minecraft:tube_coral_fan", "minecraft:oak_fence"), air);
+        let wallfan = "minecraft:tube_coral_wall_fan[facing=north]";
+        assert_eq!(side_case(&reg, wallfan, 3, "minecraft:stone"), state(&reg, wallfan));
+        assert_eq!(side_case(&reg, wallfan, 3, "minecraft:air"), air);
+        // Vertical growing plants attach opposite their growth direction.
+        let twisting = state(&reg, "minecraft:twisting_vines");
+        assert_eq!(below_case(&reg, "minecraft:twisting_vines", "minecraft:stone"), twisting);
+        assert_eq!(below_case(&reg, "minecraft:twisting_vines", "minecraft:air"), air);
+        let weeping = state(&reg, "minecraft:weeping_vines");
+        assert_eq!(side_case(&reg, "minecraft:weeping_vines", 1, "minecraft:stone"), weeping);
+        assert_eq!(side_case(&reg, "minecraft:weeping_vines", 1, "minecraft:air"), air);
     }
 }
