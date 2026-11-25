@@ -263,6 +263,10 @@ UNWIRED_MODULE_BASELINE = {'core/search_index',
  'core/dye_and_items',
  'core/geom',
  'core/os_desktop',
+ 'core/quiescent',
+ 'core/bounded',
+ 'core/local_transport',
+ 'core/net_budget',
  'create-adapter/rail_network',
  'state-store/chunk_packet_cache'}
 

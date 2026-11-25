@@ -278,12 +278,42 @@
 //!   [`block_flags_lut::SectionBitTree4096`] 520-byte hierarchical bit
 //!   index that iterates a section's sparse predicates in ascending order
 //!   while skipping empty sections in O(1).
+//! * [`quiescent`] — a zero-work quiescent chunk scheduler:
+//!   [`quiescent::QuiescentChunkScheduler`] stores only chunks whose
+//!   [`quiescent::ActivityMask`] is non-zero in the canonical `SparseSet`
+//!   (idle chunks are physically absent — `O(0)`, never visited in the
+//!   tick loop), delayed wakeups ride the canonical `TimingWheel`, and
+//!   [`quiescent::QuiescentChunkScheduler::on_block_mutated`] bumps the
+//!   canonical `SharedSectionRevTable` while waking border-adjacent
+//!   neighbour columns.
+//! * [`bounded`] — compile-time bug prevention:
+//!   [`bounded::BoundedMap`]'s `const MAX` makes unbounded registries
+//!   structurally impossible (deterministic `O(1)` lookup, oldest-write
+//!   eviction at capacity), `#[must_use]` [`bounded::LootSeedToken`] /
+//!   [`bounded::SpawnerDrawToken`] / [`bounded::MustConsume`] turn dropped
+//!   critical draws into compile errors, and [`bounded::DimBound`] blocks
+//!   cross-dimension coordinate mix-ups.
+//! * [`local_transport`] — a zero-socket, zero-copy integrated-singleplayer
+//!   loopback: [`local_transport::local_pair`] gives a full-duplex lane
+//!   built on the canonical `WaitFreeSpscU64` rings plus shared `Arc<T>`
+//!   slot tables, so payloads cross server ↔ client threads as bare
+//!   pointers (`Arc::ptr_eq`-identical) with `Full`/`Disconnected`
+//!   backpressure and no serialization, compression or copies.
+//! * [`net_budget`] — symmetric streaming bandwidth savers:
+//!   [`net_budget::EncodeOnceFrameCache`] encodes a chunk frame once and
+//!   hands the same `Arc<[u8]>` to every player, invalidated the instant
+//!   `SharedSectionRevTable::chunk_rev` moves, and
+//!   [`net_budget::classify_perceptual_band`] +
+//!   [`net_budget::should_emit_tick`] cut entity/chunk update rates to
+//!   20/10/4/0 Hz by frustum, distance and motion — usable by both the
+//!   server streamer and the client LOD lane.
 
 #![deny(unsafe_code)]
 
 pub mod autostart_service;
 pub mod bits;
 pub mod bloom;
+pub mod bounded;
 pub mod bvh;
 pub mod block_flags_lut;
 pub mod coords;
@@ -303,6 +333,7 @@ pub mod intern;
 pub mod json;
 pub mod landlock_sandbox;
 pub mod linux_desktop;
+pub mod local_transport;
 pub mod lz4;
 pub mod math;
 pub mod math_opt_engine;
@@ -310,8 +341,10 @@ pub mod math_opt_foundation;
 pub mod merkle_cas;
 pub mod morton;
 pub mod nbt_wire;
+pub mod net_budget;
 pub mod os_desktop;
 pub mod perf_kit;
+pub mod quiescent;
 pub mod random;
 pub mod registry;
 pub mod rev;
