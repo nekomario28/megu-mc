@@ -31,6 +31,7 @@ let failed = 0;
 let testIpIndex = 0;
 async function test(name, fn) {
   testIpIndex++;
+  report.__resetIsolateState();
   try {
     await fn();
     passed++;
@@ -294,6 +295,98 @@ await test("onRequestPost creates a fresh issue then dedups", async () => {
   }
 });
 
+await test("onRequestPost never files duplicate issues for a same-isolate burst", async () => {
+  const kv = makeKv();
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    const env = baseEnv(kv);
+    // Identical crash reports race within one isolate: KV's eventual
+    // consistency window is wide open, but the in-isolate burst cache
+    // must still file exactly ONE GitHub Issue.
+    const results = await Promise.all([
+      report.onRequestPost(postContext(validPayload(), env, "192.0.2.10")),
+      report.onRequestPost(postContext(validPayload(), env, "192.0.2.10")),
+      report.onRequestPost(postContext(validPayload(), env, "192.0.2.10")),
+    ]);
+    const jsons = await Promise.all(results.map(r => r.json()));
+    assert.equal(state.issues, 1, "a same-isolate burst must file one issue");
+    assert.equal(new Set(jsons.map(j => j.issue_url)).size, 1);
+    assert.deepEqual(jsons.map(j => j.duplicate).sort(), [false, true, true]);
+    // Chained bumps: each burst member counts exactly once (1, 2, 3).
+    assert.deepEqual(jsons.map(j => j.total_reports).sort((a, b) => a - b),
+      [1, 2, 3]);
+    const rec = JSON.parse(kv.map.get("report:fp:MEGU-E-1A2B3C4D"));
+    assert.equal(rec.count, 3);
+    assert.equal(reportKeys(kv).length, 1);
+    // A later sighting after the burst keeps stacking on the same issue.
+    const later = await report.onRequestPost(
+      postContext(validPayload(), env, "192.0.2.10"));
+    const jl = await later.json();
+    assert.equal(jl.duplicate, true);
+    assert.equal(jl.total_reports, 4);
+    assert.equal(jl.issue_url, jsons[0].issue_url);
+    assert.equal(state.issues, 1);
+  } finally {
+    restore();
+  }
+});
+
+await test("isolate dedup capacity fails closed without evicting live keys", () => {
+  const expires = Date.now() + 60_000;
+  for (let i = 0; i < 500; i++) {
+    assert.equal(report.isolateDedupSet(`key-${i}`, { expires, state: null }), true);
+  }
+  assert.equal(report.isolateDedupSet("overflow", { expires, state: null }), false);
+  assert.ok(report.isolateDedupGet("key-0"), "live lock must not be evicted");
+  assert.equal(report.isolateDedupGet("overflow"), null);
+});
+
+await test("onRequestPost normalizes bug dedup keys across case and whitespace", async () => {
+  const kv = makeKv();
+  const state = { calls: [], issues: 0, comments: 0 };
+  const restore = mockFetch(state);
+  try {
+    const env = baseEnv(kv);
+    const bugA = validPayload({
+      kind: "bug", summary: "  Player  fell through   WORLD on spawn ",
+      culprit: "CREATE-1.21.1.jar",
+    });
+    delete bugA.fingerprint;
+    const first = await report.onRequestPost(postContext(bugA, env));
+    const j1 = await first.json();
+    assert.equal(j1.duplicate, false);
+
+    const bugB = validPayload({
+      kind: "bug", summary: "player fell through world on spawn",
+      culprit: "create-1.21.1.jar",
+    });
+    delete bugB.fingerprint;
+    const second = await report.onRequestPost(postContext(bugB, env));
+    const j2 = await second.json();
+    assert.equal(j2.duplicate, true, "case/whitespace variants must dedup");
+    assert.equal(j2.issue_url, j1.issue_url);
+    assert.equal(j2.total_reports, 2);
+    assert.equal(state.issues, 1);
+    assert.equal(reportKeys(kv).length, 1);
+  } finally {
+    restore();
+  }
+});
+
+await test("redactSensitiveText strips IPv6 addresses for PII parity", () => {
+  const dirty = "crash on 2001:db8::1 via fe80::1%eth0 next to ::1";
+  const clean = report.redactSensitiveText(dirty);
+  for (const leak of ["2001:db8", "fe80::1", "::1"]) {
+    assert.ok(!clean.includes(leak), `leaked '${leak}' in: ${clean}`);
+  }
+  assert.ok(clean.includes("[REDACTED]"));
+  assert.equal(report.redactSensitiveText("token=secret123"),
+    "token=[REDACTED]");
+  assert.equal(report.redactSensitiveText("access_token: abc123"),
+    "access_token: [REDACTED]");
+});
+
 await test("onRequestPost returns redacted 502 on GitHub API errors", async () => {
   for (const failure of [
     { method: "GET", path: "/labels/auto-crash", status: 401 },
@@ -327,6 +420,8 @@ await test("onRequestPost returns redacted 502 on GitHub API errors", async () =
 
 await test("onRequestPost keeps recorded counts on comment failure", async () => {
   for (const [caseIndex, network] of [false, true].entries()) {
+    // Each case simulates a fresh isolate against a fresh KV namespace.
+    report.__resetIsolateState();
     const kv = makeKv();
     const state = { calls: [], issues: 0, comments: 0 };
     const restore = mockFetch(state);
@@ -626,6 +721,9 @@ await test("onRequestGet /api/latest returns tiny release JSON", async () => {
       published_at: "2026-11-20T10:00:00Z",
       html_url: "https://github.com/o/r/releases/tag/v0.9.1",
       mc_targets: ["1.21.1", "26.3"],
+      total_downloads: 0,
+      release_downloads: 0,
+      assets: [],
     });
     assert.ok(JSON.stringify(j).length < 512);
   } finally {
@@ -666,6 +764,9 @@ await test("onRequestGet /api/latest falls back to newest prerelease on 404", as
       html_url: "https://github.com/o/r/releases/tag/v0.1.0-alpha",
       mc_targets: ["1.21.1", "26.3"],
       prerelease: true,
+      total_downloads: 0,
+      release_downloads: 0,
+      assets: [],
     });
     assert.equal(urls.length, 2);
   } finally {
@@ -889,6 +990,26 @@ await test("onRequestGet /api/latest prefers stable latest and sums every eligib
     assert.equal(j.total_downloads, 130);
     assert.deepEqual(j.assets.map(a => a.name),
       ["megu-installer.exe", "megu-bootstrapper.jar"]);
+  } finally {
+    restore();
+  }
+});
+
+await test("onRequestGet /api/latest returns an empty asset list for the fetched tag", async () => {
+  const restore = mockLatestFetch({
+    latest: releaseFixture({
+      tag_name: "v2.0.0",
+      assets: [assetFixture("megu-installer-linux-x86_64", 12)],
+    }),
+    releases: [releaseFixture({ tag_name: "v2.0.0", assets: [] })],
+  });
+  try {
+    const res = await latest.onRequestGet(latestContext());
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.equal(json.version, "v2.0.0");
+    assert.deepEqual(json.assets, [],
+      "the UI needs an explicit empty list to hide pinned older targets");
   } finally {
     restore();
   }

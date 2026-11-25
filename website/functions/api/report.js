@@ -34,6 +34,19 @@ const RATE_LIMIT = 5;
 const RATE_WINDOW_MS = 10 * 60 * 1000;
 const isolateRates = new Map();
 
+// --- In-isolate dedup burst cache (KV is eventually consistent) ---------
+// Two identical reports landing on the same isolate in the same burst used
+// to race: both read CRASH_INDEX before either wrote it, so both filed a
+// GitHub Issue. This short-lived isolate-local cache sits in FRONT of KV:
+// the first sighting of a key stores its in-flight seed promise and every
+// simultaneous duplicate awaits that same promise instead of re-reading KV,
+// so a burst on one edge isolate never spawns duplicate issues. Count bumps
+// are chained through the same entry, so concurrent duplicates each count
+// exactly once before the milestone logic runs.
+const ISOLATE_DEDUP_TTL_MS = 5 * 60 * 1000;
+const ISOLATE_DEDUP_MAX_ENTRIES = 500;
+const isolateDedup = new Map(); // kvKey -> { expires, state }
+
 const KINDS = new Set(["crash", "bug", "idea"]);
 const KIND_LABEL = { crash: "auto-crash", bug: "triage", idea: "idea" };
 const KIND_TITLE = { crash: "[Crash]", bug: "[Bug]", idea: "[Idea]" };
@@ -50,15 +63,19 @@ function shouldPostMilestoneComment(count) {
   return false;
 }
 
-// Server-side double redaction: strips home paths, IPv4 addresses,
+// Server-side double redaction: strips home paths, IPv4/IPv6 addresses,
 // bearer tokens, rcon passwords, and common GitHub token shapes.
 function redactSensitiveText(text) {
   if (typeof text !== "string") return text;
   return text
     .replace(/(rcon\.password\s*[=:]\s*)[^\s&"']+/gi, "$1[REDACTED]")
+    .replace(/\b((?:access[_-]?token|api[_-]?key|token|password)\s*[=:]\s*)[^\s&"'<>]+/gi,
+      "$1[REDACTED]")
     .replace(/\bBearer\s+[^\s"']+/gi, "Bearer [REDACTED]")
     .replace(/\b(?:ghp_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,})\b/g,
       "[REDACTED]")
+    .replace(/(^|[^A-Za-z0-9_.])((?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f]{0,4}(?:%[A-Za-z0-9]+)?)(?=$|[^A-Za-z0-9_.])/g,
+      "$1[REDACTED]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "[REDACTED]")
     .replace(/(\/home\/)[^/\s"']+/g, "$1[REDACTED]")
     .replace(/(\/Users\/)[^/\s"']+/g, "$1[REDACTED]")
@@ -298,15 +315,100 @@ function dedupKeyFor(report) {
   if (report.kind !== "idea" && report.fingerprint) {
     return "fp:" + report.fingerprint;
   }
+  // Bug reports without a fingerprint: normalize user-authored fields the
+  // same way ideas are, so case/whitespace variants of one bug stack onto
+  // the same GitHub Issue instead of fanning out.
   if (report.kind === "bug") {
     return "bug:" + fnv1a(
-      [report.summary, report.culprit || "", report.mc_version].join("|"));
+      [report.summary, report.culprit || "", report.mc_version]
+        .map(s => s.trim().toLowerCase().replace(/\s+/g, " "))
+        .join("|"));
   }
   // Ideas have no fingerprint. Normalize user-authored text so case and
   // whitespace variations of the same suggestion share a GitHub Issue.
   const normalized = [report.summary, report.culprit || "",
     report.subsystem || ""].map(s => s.trim().toLowerCase().replace(/\s+/g, " "));
   return "idea:" + fnv1a(JSON.stringify(normalized));
+}
+
+function isolateDedupGet(key) {
+  const entry = isolateDedup.get(key);
+  if (!entry) {
+    return null;
+  }
+  if (entry.expires <= Date.now()) {
+    isolateDedup.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+function isolateDedupSet(key, entry) {
+  const now = Date.now();
+  for (const [oldKey, old] of isolateDedup) {
+    if (old.expires <= now) isolateDedup.delete(oldKey);
+  }
+  // Never evict a live dedup key: KV may still return a stale read, which
+  // could turn eviction into a duplicate Issue. Fail closed at capacity.
+  if (!isolateDedup.has(key) && isolateDedup.size >= ISOLATE_DEDUP_MAX_ENTRIES) {
+    return false;
+  }
+  isolateDedup.set(key, entry);
+  return true;
+}
+
+// First sighting of a dedup key in this isolate: read KV, and when KV has
+// no record yet, file the GitHub Issue and seed the record. Resolves to
+// { record, exists } — exists=true means KV (another isolate) already
+// mapped the key to a filed issue. A rejected promise means issue creation
+// failed and nothing was recorded.
+async function seedDedupRecord(env, kvKey, repo, report) {
+  const raw = await env.CRASH_INDEX.get(kvKey);
+  let record = null;
+  if (raw) {
+    try { record = JSON.parse(raw); } catch (_) { record = null; }
+  }
+  if (record && record.issue_url) {
+    return { record, exists: true };
+  }
+  let issue;
+  try {
+    issue = await createIssue(env, repo, report);
+  } catch (_) {
+    throw new Error("github issue creation failed");
+  }
+  record = {
+    count: 1,
+    versions: [report.mc_version],
+    os_list: [report.os],
+    issue_number: issue.number,
+    issue_url: issue.html_url,
+  };
+  await env.CRASH_INDEX.put(kvKey, JSON.stringify(record));
+  return { record, exists: false };
+}
+
+// One additional sighting of an existing issue: bump the counter, merge the
+// version/os trackers, and persist. Resolves to { record, exists: true }.
+async function bumpDedupRecord(env, kvKey, base, report) {
+  const count = (base.count || 0) + 1;
+  const versions = Array.isArray(base.versions) ? base.versions.slice() : [];
+  const osList = Array.isArray(base.os_list) ? base.os_list.slice() : [];
+  if (!versions.includes(report.mc_version) && versions.length < MAX_TRACKED) {
+    versions.push(report.mc_version);
+  }
+  if (!osList.includes(report.os) && osList.length < MAX_TRACKED) {
+    osList.push(report.os);
+  }
+  const record = {
+    count,
+    versions,
+    os_list: osList,
+    issue_number: base.issue_number,
+    issue_url: base.issue_url,
+  };
+  await env.CRASH_INDEX.put(kvKey, JSON.stringify(record));
+  return { record, exists: true };
 }
 
 async function verifyTurnstile(env, token) {
@@ -366,6 +468,13 @@ async function overRateLimit(env, request) {
   return false;
 }
 
+// Test-only hook: clears the isolate-local caches so unit tests stay
+// hermetic across cases. Production code never calls it.
+function __resetIsolateState() {
+  isolateDedup.clear();
+  isolateRates.clear();
+}
+
 export {
   MAX_BODY_BYTES,
   MAX_TOP_FRAMES,
@@ -374,6 +483,11 @@ export {
   validateReportPayload,
   formatCompactIssueBody,
   issueTitleFor,
+  isolateDedupGet,
+  isolateDedupSet,
+  seedDedupRecord,
+  bumpDedupRecord,
+  __resetIsolateState,
 };
 
 export async function onRequestPost(context) {
@@ -433,65 +547,87 @@ export async function onRequestPost(context) {
       return errorResponse(503, "CRASH_INDEX KV binding is not configured");
     }
     const kvKey = "report:" + dedupKey;
-    const raw = await env.CRASH_INDEX.get(kvKey);
-    let record = null;
-    if (raw) {
-      try { record = JSON.parse(raw); } catch (_) { record = null; }
+
+    // Burst cache in front of KV: the first sighting in this isolate seeds
+    // (KV read -> issue create -> KV seed) and stores the in-flight
+    // promise; simultaneous duplicates share that promise and chain their
+    // count bumps onto it, so a same-isolate burst can never file two
+    // issues and every sighting still counts exactly once.
+    let entry = isolateDedupGet(kvKey);
+    const firstInIsolate = entry === null;
+    if (firstInIsolate) {
+      entry = {
+        expires: Date.now() + ISOLATE_DEDUP_TTL_MS,
+        state: null,
+      };
+      if (!isolateDedupSet(kvKey, entry)) {
+        return errorResponse(503, "report dedup capacity reached; retry later");
+      }
+      entry.state = seedDedupRecord(env, kvKey, repo, report);
     }
 
-    if (record && record.issue_url) {
-      const count = (record.count || 0) + 1;
-      const versions = Array.isArray(record.versions) ? record.versions : [];
-      const osList = Array.isArray(record.os_list) ? record.os_list : [];
-      if (!versions.includes(report.mc_version) &&
-          versions.length < MAX_TRACKED) versions.push(report.mc_version);
-      if (!osList.includes(report.os) && osList.length < MAX_TRACKED) {
-        osList.push(report.os);
+    let record;
+    let isDuplicate = !firstInIsolate;
+    if (firstInIsolate) {
+      let seeded;
+      try {
+        seeded = await entry.state;
+      } catch (_) {
+        // Failed creation must not poison the cache: a later report retries.
+        isolateDedup.delete(kvKey);
+        return errorResponse(502, "github issue creation failed");
       }
-      record.count = count;
-      record.versions = versions;
-      record.os_list = osList;
-      await env.CRASH_INDEX.put(kvKey, JSON.stringify(record));
+      if (seeded.exists) {
+        // KV already knew the issue (another isolate filed it): this is a
+        // duplicate, so bump like any other sighting.
+        isDuplicate = true;
+        const bumped = entry.state.then((s) =>
+          bumpDedupRecord(env, kvKey, s.record, report));
+        entry.state = bumped;
+        record = (await bumped).record;
+      } else {
+        record = seeded.record;
+      }
+    } else {
+      // Chain the bump onto the newest shared state so concurrent
+      // duplicates each count exactly once before milestone logic runs.
+      const bumped = entry.state.then((s) =>
+        bumpDedupRecord(env, kvKey, s.record, report));
+      entry.state = bumped;
+      try {
+        record = (await bumped).record;
+      } catch (_) {
+        isolateDedup.delete(kvKey);
+        return errorResponse(502, "github issue creation failed");
+      }
+    }
 
-      let commentPosted = false;
-      if (shouldPostMilestoneComment(count)) {
-        try {
-          commentPosted = await postMilestoneComment(
-            env, repo, record.issue_number, report, count);
-        } catch (_) {
-          // The report count is already stored; a comment failure is optional.
-        }
-      }
+    if (!isDuplicate) {
       return jsonResponse({
         ok: true,
         fingerprint: report.fingerprint || null,
         issue_url: record.issue_url,
-        duplicate: true,
-        total_reports: count,
-        comment_posted: commentPosted,
+        duplicate: false,
+        total_reports: record.count,
       });
     }
 
-    // First sighting: file the issue, then seed the dedup record.
-    let issue;
-    try {
-      issue = await createIssue(env, repo, report);
-    } catch (_) {
-      return errorResponse(502, "github issue creation failed");
+    let commentPosted = false;
+    if (shouldPostMilestoneComment(record.count)) {
+      try {
+        commentPosted = await postMilestoneComment(
+          env, repo, record.issue_number, report, record.count);
+      } catch (_) {
+        // The report count is already stored; a comment failure is optional.
+      }
     }
-    await env.CRASH_INDEX.put(kvKey, JSON.stringify({
-      count: 1,
-      versions: [report.mc_version],
-      os_list: [report.os],
-      issue_number: issue.number,
-      issue_url: issue.html_url,
-    }));
     return jsonResponse({
       ok: true,
       fingerprint: report.fingerprint || null,
-      issue_url: issue.html_url,
-      duplicate: false,
-      total_reports: 1,
+      issue_url: record.issue_url,
+      duplicate: true,
+      total_reports: record.count,
+      comment_posted: commentPosted,
     });
   }
 

@@ -2807,45 +2807,100 @@
     }
 
     var btn = $("dl-client-btn");
-    if (btn && st.asset) {
-      btn.setAttribute("href", st.asset.url);
-      var label = DOWNLOAD_TARGET_LABEL[st.target] || "";
-      btn.textContent = label
-        ? (ja ? label + " インストーラーを入手" : "Download for " + label)
-        : (ja ? "インストーラを入手" : "Download Installer");
+    if (btn) {
+      if (st.asset) {
+        btn.setAttribute("href", st.asset.url);
+        btn.removeAttribute("hidden");
+        var label = DOWNLOAD_TARGET_LABEL[st.target] || "";
+        btn.textContent = label
+          ? (ja ? label + " インストーラーを入手" : "Download for " + label)
+          : (ja ? "インストーラを入手" : "Download Installer");
+      } else {
+        btn.setAttribute("hidden", "");
+        btn.removeAttribute("href");
+      }
     }
     var mrpackBtn = $("dl-mrpack-btn");
+    var hasMrpack = false;
     if (mrpackBtn && Array.isArray(st.assets)) {
       for (var m = 0; m < st.assets.length; m++) {
         var ma = st.assets[m];
         if (ma && ma.kind === "mrpack" && typeof ma.url === "string" &&
             ma.url.indexOf("https://github.com/") === 0) {
           mrpackBtn.setAttribute("href", ma.url);
+          mrpackBtn.removeAttribute("hidden");
+          hasMrpack = true;
           break;
         }
       }
+      if (!hasMrpack) {
+        mrpackBtn.removeAttribute("href");
+        mrpackBtn.setAttribute("hidden", "");
+      }
     }
     var prismBtn = $("dl-prism-btn");
+    var hasPrism = false;
     if (prismBtn && Array.isArray(st.assets)) {
       for (var p = 0; p < st.assets.length; p++) {
         var pa = st.assets[p];
         if (pa && pa.kind === "prism_zip" && typeof pa.url === "string" &&
             pa.url.indexOf("https://github.com/") === 0) {
           prismBtn.setAttribute("href", pa.url);
+          prismBtn.removeAttribute("hidden");
+          hasPrism = true;
           break;
         }
       }
+      if (!hasPrism) {
+        prismBtn.removeAttribute("href");
+        prismBtn.setAttribute("hidden", "");
+      }
     }
-    // Upgrade each pinned installer row to the published asset for the same
-    // exact target; rows the release does not ship keep their pinned href.
+    // Dynamic release rows must point into this exact release. Remove the
+    // pinned fallback when a newer tag lacks that target, so the older asset
+    // cannot appear to belong to the newer release.
     if (Array.isArray(st.assets) && document.querySelectorAll) {
       Array.prototype.forEach.call(
         document.querySelectorAll("[data-release-target]"),
         function (row) {
           var rowAsset = exactTargetAsset(
             st.assets, row.getAttribute("data-release-target"));
+          var parentRow = row.closest ? row.closest("tr") : null;
           if (rowAsset) {
             row.setAttribute("href", rowAsset.url);
+            row.removeAttribute("hidden");
+            if (parentRow) parentRow.removeAttribute("hidden");
+          } else {
+            row.removeAttribute("href");
+            row.setAttribute("hidden", "");
+            row.setAttribute("aria-disabled", "true");
+            if (parentRow) parentRow.setAttribute("hidden", "");
+          }
+        });
+      Array.prototype.forEach.call(
+        document.querySelectorAll("[data-server-archive]"),
+        function (link) {
+          var target = link.getAttribute("data-server-archive");
+          var name = "megu-" + st.version + "-" + target + ".tar.gz";
+          var archive = null;
+          for (var a = 0; a < st.assets.length; a++) {
+            if (st.assets[a] && st.assets[a].name === name &&
+                typeof st.assets[a].url === "string" &&
+                st.assets[a].url.indexOf("https://github.com/") === 0) {
+              archive = st.assets[a];
+              break;
+            }
+          }
+          var parentRow = link.closest ? link.closest("tr") : null;
+          if (archive) {
+            link.setAttribute("href", archive.url);
+            link.removeAttribute("hidden");
+            if (parentRow) parentRow.removeAttribute("hidden");
+          } else {
+            link.removeAttribute("href");
+            link.setAttribute("hidden", "");
+            link.setAttribute("aria-disabled", "true");
+            if (parentRow) parentRow.setAttribute("hidden", "");
           }
         });
     }

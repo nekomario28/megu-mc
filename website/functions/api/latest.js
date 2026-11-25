@@ -205,11 +205,11 @@ export async function onRequestGet(context) {
   if (release.prerelease === true) {
     body.prerelease = true;
   }
-  if (totalDownloads > 0 || assets.length) {
-    body.total_downloads = totalDownloads;
-    body.release_downloads = releaseDownloads;
-    body.assets = assets;
-  }
+  // Always return this release's asset list, including an empty list. The
+  // client uses it to hide pinned fallback targets absent from this exact tag.
+  body.total_downloads = totalDownloads;
+  body.release_downloads = releaseDownloads;
+  body.assets = assets;
 
   return new Response(JSON.stringify(body), {
     status: 200,

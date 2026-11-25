@@ -220,6 +220,21 @@ megu-installer prism</code></pre>
                      data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_server_btn">Get Server Binaries</a>
                   <a class="btn" href="#quickstart" data-i18n="dl_qs_jump">3-Step Quickstart</a>
                 </div>
+                <details class="section-note">
+                  <summary>Verify a pinned Linux archive before installing / 固定タグの Linux アーカイブをインストール前に検証</summary>
+                  <p>Release tag: <code>v0.1.0-alpha.3</code>. The release publishes <code>SHA256SUMS-all.txt</code>; this selects the chosen archive into <code>SHA256SUMS.txt</code> for a focused check. / リリースの <code>SHA256SUMS-all.txt</code> から対象アーカイブの行を選び、検証します。</p>
+                  <pre class="code"><code>TAG=v0.1.0-alpha.3
+TARGET=linux-x86_64
+ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
+BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
+curl -fLO "${BASE}/${ARCHIVE}"
+curl -fLO "${BASE}/SHA256SUMS-all.txt"
+grep -F "  ${ARCHIVE}" SHA256SUMS-all.txt &gt; SHA256SUMS.txt
+test "$(wc -l &lt; SHA256SUMS.txt)" -eq 1
+sha256sum -c SHA256SUMS.txt
+tar -xzf "${ARCHIVE}"
+"./megu-${TAG}-${TARGET}/megu-installer" server --dir ./megu-server</code></pre>
+                </details>
                 <h4 data-i18n="dl_server_archive_title">All 8 full server archive targets</h4>
                 <table class="data-table" id="server-archives">
                   <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
