@@ -569,25 +569,24 @@ fn refresh_equip_attrs(c: &Client) {
             m.insert(id, (add, mb, mt));
         }
     }
-    // Vanilla `MaceItem` smash with Density (id 6): a held mace whose wielder
-    // has fallen more than the 1.5-block smash trigger adds `0.5 * level`
-    // damage per block fallen past the threshold. The bonus rides the same
-    // attack-damage attribute view the melee damage line reads next.
+    // Vanilla `MaceItem.getAttackDamageBonus`: once the 1.5-block smash gate
+    // is open, the tiered smash bonus uses the *whole* fall distance — +4 per
+    // block through 3, +2 per block through 8, then +1 per block — and Density
+    // adds its own `0.5 * level * fallDistance` enchantment bonus on top.
     if let Some((_, mace)) = pairs
         .iter()
         .find(|(group, _)| *group == ItemAttrSlotGroup::MainHand)
     {
-        let density = if mace.0 == name_to_item("mace").unwrap_or(-6) {
-            enchant_level(&mace.2, 6)
-        } else {
-            0
-        };
-        if density > 0 {
+        if mace.0 == name_to_item("mace").unwrap_or(-6) {
+            let density = enchant_level(&mace.2, 6);
             let (_, y, _, _, _, grounded) = *c.pos.lock().unwrap_or_else(|e| e.into_inner());
             let fall = *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) - y;
             if !grounded && fall > 1.5 {
-                let bonus =
-                    f64::from(density_smash_bonus_damage(density as i32, (fall - 1.5) as f32));
+                let fall = fall as f32;
+                let bonus = f64::from(
+                    mace_smash_bonus_damage(fall)
+                        + density_smash_bonus_damage(density as i32, fall),
+                );
                 let (add, mb, mt) =
                     m.get(&ATTR_ATTACK_DAMAGE).copied().unwrap_or((0.0, 0.0, 1.0));
                 m.insert(ATTR_ATTACK_DAMAGE, (add + bonus, mb, mt));
@@ -1360,6 +1359,42 @@ fn mace_smashes() -> &'static Mutex<HashMap<i32, MaceSmash>> {
 
 /// Vanilla `WindBurstEnchantment` (id 41): the wielder is flung `0.3 +
 /// 0.9 * level` blocks upward — I=1.2, II=2.1, III=3.0.
+/// Vanilla `MaceItem.getAttackDamageBonus` tier arithmetic. The 1.5-block
+/// airborne check is a gate, not an offset subtracted from the fall distance:
+/// falls through 3 blocks pay 4 per block, the next 5 pay 2 per block, and
+/// every block after 8 pays 1.
+pub fn mace_smash_bonus_damage(fall_blocks: f32) -> f32 {
+    if fall_blocks <= 0.0 {
+        0.0
+    } else if fall_blocks <= 3.0 {
+        4.0 * fall_blocks
+    } else if fall_blocks <= 8.0 {
+        12.0 + 2.0 * (fall_blocks - 3.0)
+    } else {
+        fall_blocks + 14.0
+    }
+}
+
+/// Combined unenchanted smash and Density bonus for one qualifying hit.
+pub fn mace_smash_damage_bonus(fall_blocks: f32, density_level: i32) -> f32 {
+    if fall_blocks <= 1.5 {
+        0.0
+    } else {
+        mace_smash_bonus_damage(fall_blocks)
+            + density_smash_bonus_damage(density_level.max(0), fall_blocks)
+    }
+}
+
+/// Breach reduces the victim's armor effectiveness by 15% per level before
+/// protection enchantments. `armor_dmg_factor` returns the fraction of damage
+/// surviving armor, so its reduction `(1 - factor)` is the part Breach scales.
+fn dmg_after_breach(c: &Client, raw: f32, kind: u8, breach_level: i64) -> f32 {
+    let factor = armor_dmg_factor(c, raw);
+    let armor_reduction = (1.0 - factor) * (1.0 - 0.15 * breach_level.clamp(0, 4) as f64);
+    let arm = f64::from(raw) * (1.0 - armor_reduction.max(0.0));
+    (arm * (1.0 - 0.04 * enchant_epf(c, kind) as f64)) as f32
+}
+
 fn wind_burst_bounce_velocity(level: i64) -> f64 {
     if level <= 0 {
         0.0
@@ -1386,9 +1421,6 @@ fn mace_smash_eval(me: &Arc<Client>, item: i64) {
             .map(|stack| enchant_level(&stack.2, 41))
             .unwrap_or(0)
     };
-    if level <= 0 {
-        return;
-    }
     let (x, y, z, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     if grounded || *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
         return;
@@ -1414,11 +1446,15 @@ fn mace_smash_eval(me: &Arc<Client>, item: i64) {
 /// at the burst Y so the mace combo only counts the drop below it.
 fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     let bounce = wind_burst_bounce_velocity(smash.level);
-    let pkt = velocity_pkt(c.eid, 0, (bounce * 8000.0) as i16, 0);
-    if let Ok(mut w) = c.sock.lock() {
-        let _ = send_packet(&mut w, 0x5a, pkt.clone());
+    if smash.level > 0 {
+        let pkt = velocity_pkt(c.eid, 0, (bounce * 8000.0) as i16, 0);
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x5a, pkt.clone());
+        }
+        broadcast_seen_ex(c.eid, c.eid, |_c| (0x5a, pkt.clone()));
     }
-    broadcast_seen_ex(c.eid, c.eid, |_c| (0x5a, pkt.clone()));
+    // Every successful smash resets fall distance; Wind Burst merely adds the
+    // upward combo bounce on top.
     wind_charge_reset_fall(c, smash.pos[1]);
     // `WindBurstEnchantment` detonates a level-scaled burst (strength
     // `3.5 * level`); `wind_burst_bounce_strength` gives that per level
@@ -2500,8 +2536,7 @@ fn enchant_epf(c: &Client, kind: u8) -> i64 {
     epf.min(20)
 }
 fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
-    let arm = f64::from(raw) * armor_dmg_factor(c, raw);
-    (arm * (1.0 - 0.04 * enchant_epf(c, kind) as f64)) as f32
+    dmg_after_breach(c, raw, kind, 0)
 }
 // call AFTER the hp write: if hp hit 0 and a totem is held (main or
 // offhand), consume it — vanilla sets hp to 1, fires entity_status 35,
@@ -3041,7 +3076,11 @@ fn arrow_tick() {
                         0.4,
                         2.1,
                     ) {
-                        let kind = if a.kind == 0 { BossHit::Arrow } else { BossHit::Other };
+                        let kind = match a.kind {
+                            0 => BossHit::Arrow,
+                            1 => BossHit::Trident,
+                            _ => BossHit::Other,
+                        };
                         if !live_mob_hit_allowed(m, a.owner, kind) {
                             dead.push(eid);
                             break;
@@ -4188,7 +4227,7 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
         }
         Some(MobBehaviorState::Warden(warden)) => {
             if source > 0 {
-                warden.anger.add_vibration(source);
+                warden.anger.add_direct_hit(source);
             }
             true
         }
@@ -4984,11 +5023,15 @@ mod p1_combat_tests {
     }
 
     fn test_mob(eid: i32) -> Arc<Mob> {
+        test_mob_etype(eid, 124)
+    }
+
+    fn test_mob_etype(eid: i32, etype: i64) -> Arc<Mob> {
         Arc::new(Mob {
             dim: DimId::Overworld,
             eid,
             uuid: [eid as u8; 16],
-            etype: 124,
+            etype,
             pos: Mutex::new((0.0, 64.0, 0.0, 0.0, 0.0)),
             hp: Mutex::new(20.0),
             last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
@@ -5293,7 +5336,8 @@ mod p1_combat_tests {
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         // Airborne 6.5 blocks into a fall with a Density II mace in hand:
-        // +0.5 * 2 * (6.5 - 1.5) = +5 attack damage.
+        // the base smash is 12 + 2*(6.5-3) = 19 and Density II adds
+        // 0.5*2*6.5 = 6.5, for +25.5 attack damage.
         {
             let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
             *p = (0.0, 63.5, 0.0, 0.0, 0.0, false);
@@ -5314,8 +5358,8 @@ mod p1_combat_tests {
             .unwrap_or_default()
             .0;
         assert!(
-            (add - 5.0).abs() < 1e-6,
-            "density II after 5 smash blocks must add 5.0, got {add}"
+            (add - 25.5).abs() < 1e-6,
+            "density II after a 6.5-block fall must add 25.5, got {add}"
         );
         // On the ground the smash bonus never applies.
         client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = true;
@@ -5454,7 +5498,9 @@ mod p1_combat_tests {
             p.1 = 79.0;
         }
         mace_smash_eval(&client, mace);
-        // And without Wind Burst on the mace: refused.
+        // Without Wind Burst a qualifying hit still queues the ordinary smash:
+        // vanilla resets fall distance and emits the knockback wave even when
+        // there is no upward enchantment bounce.
         client
             .inv
             .lock()
@@ -5468,12 +5514,86 @@ mod p1_combat_tests {
         assert!(mace_smashes()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+            .values()
+            .any(|smash| smash.level == 0));
+        mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).clear();
         // Levels I–III bounce 1.2 / 2.1 / 3.0 blocks.
         assert!((wind_burst_bounce_velocity(1) - 1.2).abs() < 1e-9);
         assert!((wind_burst_bounce_velocity(2) - 2.1).abs() < 1e-9);
         assert!((wind_burst_bounce_velocity(3) - 3.0).abs() < 1e-9);
         assert_eq!(wind_burst_bounce_velocity(0), 0.0);
+    }
+
+    #[test]
+    fn p1_combat_mace_v1211_tiered_smash_density_breach_and_fall_reset() {
+        assert_eq!(mace_smash_bonus_damage(1.4), 5.6);
+        assert_eq!(mace_smash_bonus_damage(3.0), 12.0);
+        assert_eq!(mace_smash_bonus_damage(8.0), 22.0);
+        assert_eq!(mace_smash_bonus_damage(10.0), 24.0);
+        assert_eq!(mace_smash_damage_bonus(1.5, 5), 0.0);
+        assert!((mace_smash_damage_bonus(6.5, 2) - 25.5).abs() < 1e-6);
+        assert!((mace_smash_damage_bonus(6.5, 0) - 19.0).abs() < 1e-6);
+
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let (client, _rx) = client_pair();
+        client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(5, (name_to_item("diamond_chestplate").unwrap(), 1, Vec::new()));
+        *client.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = 20;
+        let normal = dmg_after(&client, 20.0, 0);
+        let breach = dmg_after_breach(&client, 20.0, 0, 4);
+        assert!(breach > normal, "breach must bypass part of armor: {breach} <= {normal}");
+        assert!(dmg_after_breach(&client, 20.0, 0, 0) <= normal + 1e-6);
+
+        // A successful level-0 smash still drains on the combat tick and resets
+        // fall distance; only the Wind Burst bounce is absent.
+        let (plain, _plain_rx) = client_pair();
+        let plain = Arc::new(plain);
+        clients()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(plain.clone());
+        {
+            let mut pos = plain.pos.lock().unwrap_or_else(|e| e.into_inner());
+            *pos = (0.0, 60.0, 0.0, 0.0, 0.0, false);
+        }
+        *plain.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
+        mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            plain.eid,
+            MaceSmash {
+                dim: DimId::Overworld,
+                pos: [0.0, 60.0, 0.0],
+                level: 0,
+                fall: 10.0,
+            },
+        );
+        combat2_state_tick();
+        assert_eq!(*plain.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 60.0);
+        assert!(mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+    }
+
+    #[test]
+    fn p1_combat_warden_direct_hit_adds_hundred_anger() {
+        let _guard = crate::world_guard();
+        let _g = CombatGuard::new();
+        let mob = test_mob_etype(9200, 116);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        states.insert(9200, LiveMobState::new(116));
+        drop(states);
+        assert!(live_mob_hit_allowed(&mob, 33, BossHit::Other));
+        let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        let Some(LiveMobState {
+            behavior: Some(MobBehaviorState::Warden(warden)),
+            ..
+        }) = states.get(&9200)
+        else {
+            panic!("warden behavior missing");
+        };
+        assert_eq!(warden.anger.entities.get(&33).copied(), Some(100));
     }
 }
 

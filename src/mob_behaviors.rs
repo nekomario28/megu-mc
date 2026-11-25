@@ -750,6 +750,7 @@ enum DragonPhase {
     SittingFlaming,
     SittingScanning,
     SittingAttacking,
+    ChargingPlayer,
     Takeoff,
     Dying,
     Dead,
@@ -758,6 +759,7 @@ enum DragonPhase {
 #[derive(Clone, Copy)]
 enum BossHit {
     Arrow,
+    Trident,
     Other,
 }
 
@@ -767,6 +769,7 @@ struct DragonTick<'a> {
     path_complete: bool,
     strafe_target: Option<i32>,
     strafe_aligned: bool,
+    strafe_target_distance: Option<f64>,
     crystals: &'a [DragonCrystal],
 }
 
@@ -829,6 +832,7 @@ struct EnderDragonBehavior {
     strafe_charge: u8,
     strafe_target: Option<i32>,
     linked_crystal: Option<i32>,
+    flame_count: u8,
     death_landed: bool,
     previously_killed: bool,
 }
@@ -843,6 +847,7 @@ impl EnderDragonBehavior {
             strafe_charge: 0,
             strafe_target: None,
             linked_crystal: None,
+            flame_count: 0,
             death_landed: false,
             previously_killed,
         }
@@ -965,23 +970,41 @@ impl EnderDragonBehavior {
                 self.set_phase(DragonPhase::Landing)
             }
             DragonPhase::Landing if near_perch => {
+                self.flame_count = self.flame_count.saturating_add(1);
                 self.set_phase(DragonPhase::SittingFlaming);
+            }
+            DragonPhase::SittingFlaming if self.phase_ticks == 10 => {
                 return Some(DragonEvent::FlameBreath);
             }
             DragonPhase::SittingFlaming if self.phase_ticks == 200 => {
-                self.set_phase(DragonPhase::SittingScanning)
+                let takeoff = self.flame_count >= 4;
+                if takeoff {
+                    self.flame_count = 0;
+                }
+                self.set_phase(if takeoff {
+                    DragonPhase::Takeoff
+                } else {
+                    DragonPhase::SittingScanning
+                })
             }
             DragonPhase::SittingScanning
                 if self.phase_ticks >= 25 && input.strafe_target.is_some() =>
             {
-                self.set_phase(DragonPhase::SittingAttacking);
-                return Some(DragonEvent::PerchAttack);
+                if input.strafe_target_distance.is_some_and(|distance| distance <= 20.0) {
+                    self.set_phase(DragonPhase::SittingAttacking);
+                    return Some(DragonEvent::PerchAttack);
+                }
+                self.set_phase(DragonPhase::ChargingPlayer);
             }
             DragonPhase::SittingScanning if self.phase_ticks >= 100 => {
+                self.flame_count = 0;
                 self.set_phase(DragonPhase::Takeoff)
             }
             DragonPhase::SittingAttacking if self.phase_ticks >= 40 => {
-                self.set_phase(DragonPhase::Takeoff)
+                self.set_phase(DragonPhase::SittingFlaming)
+            }
+            DragonPhase::ChargingPlayer if self.phase_ticks >= 10 => {
+                self.set_phase(DragonPhase::HoldingPattern)
             }
             DragonPhase::Takeoff if input.path_complete => {
                 self.set_phase(DragonPhase::HoldingPattern)
@@ -1439,7 +1462,8 @@ impl WitherBehavior {
     }
 
     fn immune_to(&self, hit: BossHit) -> bool {
-        self.spawn_ticks > 0 || (self.has_wither_armor() && matches!(hit, BossHit::Arrow))
+        self.spawn_ticks > 0
+            || (self.has_wither_armor() && matches!(hit, BossHit::Arrow | BossHit::Trident))
     }
 
     fn tick(&mut self) -> Option<WitherEvent> {
@@ -1503,6 +1527,13 @@ impl WardenAngerManagement {
         self.add_vibration(entity)
     }
 
+    /// A direct hit angers the warden far more strongly than a vibration.
+    fn add_direct_hit(&mut self, entity: i32) -> u16 {
+        let anger = self.entities.entry(entity).or_default();
+        *anger = (*anger + 100).min(Self::ROAR);
+        *anger
+    }
+
     fn anger(&self, entity: i32) -> u16 {
         self.entities.get(&entity).copied().unwrap_or(0)
     }
@@ -1512,9 +1543,11 @@ impl WardenAngerManagement {
     }
 
     fn roar_target(&self) -> Option<i32> {
+        // Vanilla converts anger into a target lock at 80; 150 is only the
+        // stored anger ceiling, not the acquisition threshold.
         self.entities
             .iter()
-            .filter(|&(_, &anger)| anger >= Self::ROAR)
+            .filter(|&(_, &anger)| anger >= Self::AGITATED)
             .map(|(&entity, _)| entity)
             .min()
     }
@@ -1618,7 +1651,7 @@ impl WardenBehavior {
         if self.sonic_charge > 0 {
             self.sonic_charge -= 1;
             if self.sonic_charge == 0 {
-                self.sonic_cooldown = 40;
+                self.sonic_cooldown = 200;
                 return in_range.then_some(WardenEvent::SonicBoom {
                     target,
                     damage: 10.0,
@@ -1992,6 +2025,10 @@ impl MobBehaviorState {
                     path_complete,
                     strafe_target: target.map(|target| target.eid),
                     strafe_aligned,
+                    strafe_target_distance: target.map(|target| {
+                        let delta = mob_behavior_delta(ctx.pos, target.pos);
+                        mob_behavior_dot(delta, delta).sqrt()
+                    }),
                     crystals: &anchored,
                 });
                 let healed = dragon.hp.min(ctx.max_hp) - hp_before;
@@ -2152,6 +2189,459 @@ impl MobBehaviorState {
         };
         effect.into_iter().collect()
     }
+}
+
+
+// ---------- Vanilla 1.21.1 boss-fight and trial-mob contracts ----------
+//
+// These evaluators own the parts of the boss fights that cannot be expressed
+// by the single live target snapshot: dragon body parts and fight ceremony,
+// wither skull/block rules, warden lifecycle timing, and the 1.21 trial mobs.
+// They are deliberately deterministic: the world supplies positions, block
+// facts and scripted random draws, while these types own vanilla's arithmetic.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragonCombatPart {
+    Head,
+    Neck,
+    Body,
+    Wing,
+    Tail,
+}
+
+/// Vanilla `EnderDragon.hurt(EnderDragonPart, ...)`: the head pays the hit
+/// through unchanged, while every other part first passes through
+/// `damage / 4 + 1` (the minimum enormous-body-part hit is therefore one).
+pub fn dragon_part_damage(part: DragonCombatPart, damage: f32) -> f32 {
+    if part == DragonCombatPart::Head {
+        damage.max(0.0)
+    } else {
+        damage.max(0.0) / 4.0 + 1.0
+    }
+}
+
+/// A wing sweep pushes entities horizontally away from the dragon and lifts
+/// them by the wingbeat's small vertical impulse. `wing_center` lets the
+/// caller supply the animated part centre; anything inside the vanilla wing
+/// band (three blocks horizontally, two vertically) is launched.
+pub fn dragon_wing_knockback(wing_center: [f64; 3], entity: [f64; 3]) -> Option<[f64; 3]> {
+    let delta = mob_behavior_delta(wing_center, entity);
+    if delta[0].abs() > 3.0 || delta[1].abs() > 2.0 || delta[2].abs() > 3.0 {
+        return None;
+    }
+    let horizontal = mob_behavior_unit([delta[0], 0.0, delta[2]]);
+    Some([horizontal[0] * 0.8, 0.35, horizontal[2] * 0.8])
+}
+
+/// Dragon-breath area-effect cloud. A sitting flame attack creates a radius-5
+/// cloud lasting 200 ticks; glass bottles scoop dragon breath and shrink the
+/// cloud by the vanilla half-block per bottle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DragonBreathCloud {
+    pos: [f64; 3],
+    radius: f32,
+    left: u16,
+}
+
+impl DragonBreathCloud {
+    pub fn sitting_flame(pos: [f64; 3]) -> Self {
+        Self {
+            pos,
+            radius: 5.0,
+            left: 200,
+        }
+    }
+
+    pub fn tick(&mut self) -> bool {
+        self.left = self.left.saturating_sub(1);
+        self.left > 0 && self.radius > 0.0
+    }
+
+    /// Returns the filled bottle item when a glass bottle can scoop this cloud.
+    pub fn scoop(&mut self, bottle: &str) -> Option<&'static str> {
+        if mob_behavior_id(bottle) != "glass_bottle" || self.radius <= 0.0 || self.left == 0 {
+            return None;
+        }
+        self.radius -= 0.5;
+        if self.radius <= 0.0 {
+            self.left = 0;
+        }
+        Some("dragon_breath")
+    }
+}
+
+/// End-gateway positions on vanilla's 96-block ring. One gateway is opened per
+/// dragon kill until all twenty exist; the deterministic index order is the
+/// ring order, which keeps the cap and spacing testable without exposing an
+/// implementation random stream.
+pub fn end_gateway_ring_positions(count: usize, surface_y: i32) -> Vec<[i32; 3]> {
+    let count = count.min(20);
+    (0..count)
+        .map(|index| {
+            let angle = 2.0 * std::f64::consts::PI * index as f64 / 20.0;
+            [
+                (96.0 * angle.cos()).round() as i32,
+                surface_y,
+                (96.0 * angle.sin()).round() as i32,
+            ]
+        })
+        .collect()
+}
+
+/// The four crystal positions of the dragon respawn ritual: one on each side
+/// of the exit portal's bedrock rim.
+pub fn dragon_respawn_crystal_positions(portal_y: i32) -> [[i32; 3]; 4] {
+    [
+        [3, portal_y + 1, 0],
+        [0, portal_y + 1, 3],
+        [-3, portal_y + 1, 0],
+        [0, portal_y + 1, -3],
+    ]
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DragonRespawnEvent {
+    CloseExitPortal,
+    BeamAt { crystal: [i32; 3] },
+    RestoreCrystal { crystal: [i32; 3] },
+    SpawnDragon,
+}
+
+/// The four-crystal respawn ceremony. The first tick closes the portal, beams
+/// then rebuild the four crystals over the next hundred ticks, and the dragon
+/// is summoned only after every crystal has been restored.
+#[derive(Debug)]
+pub struct DragonRespawnRitual {
+    portal_y: i32,
+    ticks: u16,
+    complete: bool,
+}
+
+impl DragonRespawnRitual {
+    pub fn start(portal_y: i32, placed: &[[i32; 3]]) -> Option<Self> {
+        let mut required = dragon_respawn_crystal_positions(portal_y);
+        required.sort();
+        let mut placed = placed.to_vec();
+        placed.sort();
+        (placed == required).then_some(Self {
+            portal_y,
+            ticks: 0,
+            complete: false,
+        })
+    }
+
+    pub fn tick(&mut self) -> Vec<DragonRespawnEvent> {
+        if self.complete {
+            return Vec::new();
+        }
+        self.ticks = self.ticks.saturating_add(1);
+        let crystals = dragon_respawn_crystal_positions(self.portal_y);
+        let mut events = Vec::new();
+        if self.ticks == 1 {
+            events.push(DragonRespawnEvent::CloseExitPortal);
+        }
+        if self.ticks <= 100 && self.ticks.is_multiple_of(25) {
+            let crystal = crystals[(self.ticks as usize / 25 - 1) % crystals.len()];
+            events.push(DragonRespawnEvent::BeamAt { crystal });
+        }
+        if self.ticks == 100 {
+            events.extend(crystals.map(|crystal| DragonRespawnEvent::RestoreCrystal { crystal }));
+        }
+        if self.ticks == 101 {
+            self.complete = true;
+            events.push(DragonRespawnEvent::SpawnDragon);
+        }
+        events
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WitherHead {
+    Center,
+    Left,
+    Right,
+}
+
+/// Independent wither-head cadence. The centre head uses its faster normal
+/// attack timer while the two side heads carry separate cooldowns; blue skulls
+/// remain the rare one-in-a-thousand shot unless the caller forces one.
+pub fn wither_head_cadence(head: WitherHead) -> u16 {
+    match head {
+        WitherHead::Center => 20,
+        WitherHead::Left | WitherHead::Right => 40,
+    }
+}
+
+/// Vanilla blue wither skulls ignore ordinary explosion resistance when they
+/// erase blocks, but still cannot remove bedrock or end-portal framework.
+pub fn wither_skull_breaks_block(blue: bool, block: &str) -> bool {
+    if !blue {
+        return false;
+    }
+    !matches!(
+        mob_behavior_id(block),
+        "bedrock" | "end_portal" | "end_portal_frame" | "barrier" | "command_block"
+            | "chain_command_block" | "repeating_command_block" | "structure_block" | "jigsaw"
+    )
+}
+
+/// The wither's damage-triggered cage clear is a 3x4x3 box centred on its XZ
+/// position and rising from its feet. The predicate supplies blast resistance
+/// or unbreakable knowledge; positions are returned in vanilla's deterministic
+/// x/y/z scan order.
+pub fn wither_cage_clear(
+    center: [i32; 3],
+    mut breakable: impl FnMut([i32; 3]) -> bool,
+) -> Vec<[i32; 3]> {
+    let mut cleared = Vec::new();
+    for dy in 0..4 {
+        for dx in -1..=1 {
+            for dz in -1..=1 {
+                let pos = [center[0] + dx, center[1] + dy, center[2] + dz];
+                if breakable(pos) {
+                    cleared.push(pos);
+                }
+            }
+        }
+    }
+    cleared
+}
+
+/// Nether stars survive the explosion that produced them (and later explosions)
+/// as blast-resistant item entities.
+pub fn nether_star_ignores_explosions(item: &str) -> bool {
+    mob_behavior_id(item) == "nether_star"
+}
+
+/// Warden melee damage before protection: 16/30/45 by Easy/Normal/Hard.
+pub fn warden_melee_damage(difficulty: u8) -> f32 {
+    match difficulty {
+        1 => 16.0,
+        3 => 45.0,
+        _ => 30.0,
+    }
+}
+
+/// The darkness pulse repeats every 120 ticks while a player is inside the
+/// warden's 20-block horizontal/vertical aura.
+pub fn warden_darkness_pulse(tick: u64, offset: [f64; 3]) -> bool {
+    tick.is_multiple_of(120)
+        && offset[0].abs() <= 20.0
+        && offset[1].abs() <= 20.0
+        && offset[2].abs() <= 20.0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WardenLifecyclePhase {
+    Emerging(u16),
+    Roaring(u16),
+    Sniffing(u16),
+    Investigating,
+    Attacking,
+    Digging(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WardenLifecycleEvent {
+    Emerged,
+    Roar,
+    Sniff,
+    Attack,
+    Dig,
+    Resurface,
+}
+
+/// Vanilla's spawn/lifecycle shell: emerge for 134 ticks, roar for 84 when a
+/// target locks, sniff for 84, investigate or attack, and dig for 100 ticks
+/// after 1200 calm ticks. The behavior owns no wall clock; tests and the live
+/// adapter feed one game tick at a time.
+#[derive(Debug)]
+pub struct WardenLifecycle {
+    phase: WardenLifecyclePhase,
+    calm_ticks: u16,
+}
+
+impl WardenLifecycle {
+    pub fn emerging() -> Self {
+        Self {
+            phase: WardenLifecyclePhase::Emerging(134),
+            calm_ticks: 0,
+        }
+    }
+
+    pub fn tick(&mut self, angry: bool, target_reachable: bool) -> Option<WardenLifecycleEvent> {
+        match self.phase {
+            WardenLifecyclePhase::Emerging(left) => {
+                if left == 1 {
+                    self.phase = WardenLifecyclePhase::Sniffing(84);
+                    Some(WardenLifecycleEvent::Emerged)
+                } else {
+                    self.phase = WardenLifecyclePhase::Emerging(left - 1);
+                    None
+                }
+            }
+            WardenLifecyclePhase::Roaring(left) => {
+                if left == 1 {
+                    self.phase = WardenLifecyclePhase::Attacking;
+                    Some(WardenLifecycleEvent::Attack)
+                } else {
+                    self.phase = WardenLifecyclePhase::Roaring(left - 1);
+                    None
+                }
+            }
+            WardenLifecyclePhase::Sniffing(left) => {
+                if angry {
+                    self.phase = WardenLifecyclePhase::Roaring(84);
+                    return Some(WardenLifecycleEvent::Roar);
+                }
+                if left == 1 {
+                    self.phase = WardenLifecyclePhase::Investigating;
+                    Some(WardenLifecycleEvent::Sniff)
+                } else {
+                    self.phase = WardenLifecyclePhase::Sniffing(left - 1);
+                    None
+                }
+            }
+            WardenLifecyclePhase::Investigating | WardenLifecyclePhase::Attacking => {
+                if angry {
+                    self.calm_ticks = 0;
+                    if !matches!(self.phase, WardenLifecyclePhase::Attacking) {
+                        self.phase = WardenLifecyclePhase::Roaring(84);
+                        return Some(WardenLifecycleEvent::Roar);
+                    }
+                    if target_reachable {
+                        return Some(WardenLifecycleEvent::Attack);
+                    }
+                } else {
+                    self.calm_ticks = self.calm_ticks.saturating_add(1);
+                    if self.calm_ticks >= 1200 {
+                        self.calm_ticks = 0;
+                        self.phase = WardenLifecyclePhase::Digging(100);
+                        return Some(WardenLifecycleEvent::Dig);
+                    }
+                }
+                None
+            }
+            WardenLifecyclePhase::Digging(left) => {
+                if angry {
+                    self.phase = WardenLifecyclePhase::Emerging(134);
+                    return Some(WardenLifecycleEvent::Resurface);
+                }
+                if left == 1 {
+                    self.phase = WardenLifecyclePhase::Investigating;
+                    None
+                } else {
+                    self.phase = WardenLifecyclePhase::Digging(left - 1);
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Guardian thorns: a melee attacker takes 2 damage while the guardian's
+/// spikes are extended. Elder guardians use the same reflection rule.
+pub fn guardian_spikes_reflect_damage(spikes_extended: bool, melee_attack: bool) -> f32 {
+    if spikes_extended && melee_attack {
+        2.0
+    } else {
+        0.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BreezeEvent {
+    LongJump { velocity: [f64; 3] },
+    Slide { velocity: [f64; 3] },
+    WindCharge { target: i32 },
+    ReflectProjectile { projectile: i32, back_at: i32 },
+}
+
+/// Breeze movement and volley state. The long jump is the high arc used to
+/// close distance, the slide is the low post-jump strafe, and wind charges are
+/// launched only after the vanilla ranged cooldown has elapsed.
+#[derive(Debug, Default)]
+pub struct BreezeBehavior {
+    attack_cooldown: u16,
+    jump_ticks: u8,
+    sliding: bool,
+}
+
+impl BreezeBehavior {
+    pub fn new() -> Self {
+        Self {
+            attack_cooldown: 0,
+            jump_ticks: 0,
+            sliding: false,
+        }
+    }
+
+    pub fn tick(&mut self, pos: [f64; 3], target: Option<(i32, [f64; 3])>, grounded: bool) -> Option<BreezeEvent> {
+        self.attack_cooldown = self.attack_cooldown.saturating_sub(1);
+        let (target_eid, target_pos) = target?;
+        let delta = mob_behavior_delta(pos, target_pos);
+        let horizontal = mob_behavior_unit([delta[0], 0.0, delta[2]]);
+        if self.jump_ticks > 0 {
+            self.jump_ticks -= 1;
+            self.sliding = self.jump_ticks == 0;
+            return Some(BreezeEvent::LongJump {
+                velocity: [horizontal[0] * 0.7, 0.8, horizontal[2] * 0.7],
+            });
+        }
+        if self.sliding {
+            self.sliding = false;
+            return Some(BreezeEvent::Slide {
+                velocity: [horizontal[2] * 0.45, 0.0, -horizontal[0] * 0.45],
+            });
+        }
+        let distance = mob_behavior_dot(delta, delta).sqrt();
+        if grounded && distance > 8.0 {
+            self.jump_ticks = 8;
+            return Some(BreezeEvent::LongJump {
+                velocity: [horizontal[0] * 0.7, 0.8, horizontal[2] * 0.7],
+            });
+        }
+        if self.attack_cooldown == 0 && distance <= 16.0 {
+            self.attack_cooldown = 20;
+            return Some(BreezeEvent::WindCharge { target: target_eid });
+        }
+        None
+    }
+
+    pub fn reflect_projectile(&self, projectile: i32, shooter: i32) -> BreezeEvent {
+        BreezeEvent::ReflectProjectile {
+            projectile,
+            back_at: shooter,
+        }
+    }
+}
+
+/// Wind bursts flip the redstone interactables vanilla marks as wind-sensitive.
+pub fn wind_charge_flips_block(block: &str) -> bool {
+    let block = mob_behavior_id(block);
+    block.ends_with("_door")
+        || block.ends_with("_trapdoor")
+        || block.ends_with("_button")
+        || block == "lever"
+}
+
+/// Bogged arrows apply Poison I for the 1.21.1 four-second tipped-arrow hit.
+pub fn bogged_arrow_poison() -> (i32, u16) {
+    (0, 80)
+}
+
+pub fn bogged_attack_interval_ticks() -> u16 {
+    70
+}
+
+pub fn bogged_max_hp() -> f32 {
+    16.0
+}
+
+/// Shearing removes both head mushrooms and leaves the bogged alive; vanilla
+/// drops the two mushroom items and makes the operation irreversible.
+pub fn bogged_shear_mushrooms(sheared: bool) -> Option<(&'static str, u8)> {
+    (!sheared).then_some(("brown_mushroom", 2))
 }
 
 // ---------- P2: mob gamerules ----------
@@ -2681,7 +3171,7 @@ const WARDEN_MELEE_DAMAGE: f32 = 30.0;
 #[cfg_attr(not(test), allow(dead_code))]
 const WARDEN_SONIC_TRIGGER_TICKS: u16 = 200;
 #[cfg_attr(not(test), allow(dead_code))]
-const WARDEN_SONIC_CHARGE_TICKS: u8 = 60;
+const WARDEN_SONIC_CHARGE_TICKS: u8 = 34;
 
 #[derive(Default)]
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4729,6 +5219,7 @@ mod mob_behaviors_tests {
             path_complete: false,
             strafe_target: None,
             strafe_aligned: false,
+            strafe_target_distance: None,
             crystals,
         }
     }
@@ -4917,21 +5408,21 @@ mod mob_behaviors_tests {
         tick.path_complete = true;
         assert_eq!(dragon.tick(tick), None);
         assert_eq!(dragon.phase, DragonPhase::Landing);
-        assert_eq!(
-            dragon.tick(dragon_tick(&[])),
-            Some(DragonEvent::FlameBreath)
-        );
+        assert_eq!(dragon.tick(dragon_tick(&[])), None);
         assert_eq!(dragon.phase, DragonPhase::SittingFlaming);
         assert!(!dragon.hurt(BossHit::Arrow, 30.0));
 
-        for _ in 0..200 {
-            assert_eq!(dragon.tick(dragon_tick(&[])), None);
+        for count in 1..=199 {
+            let event = dragon.tick(dragon_tick(&[]));
+            assert_eq!(event, (count == 10).then_some(DragonEvent::FlameBreath));
         }
+        assert_eq!(dragon.tick(dragon_tick(&[])), None);
         assert_eq!(dragon.phase, DragonPhase::SittingScanning);
         assert!(!dragon.hurt(BossHit::Arrow, 30.0));
         for count in 1..=25 {
             let mut tick = dragon_tick(&[]);
             tick.strafe_target = Some(12);
+            tick.strafe_target_distance = Some(12.0);
             assert_eq!(
                 dragon.tick(tick),
                 (count == 25).then_some(DragonEvent::PerchAttack)
@@ -4944,7 +5435,8 @@ mod mob_behaviors_tests {
         for _ in 0..40 {
             assert_eq!(dragon.tick(dragon_tick(&[])), None);
         }
-        assert_eq!(dragon.phase, DragonPhase::Takeoff);
+        assert_eq!(dragon.phase, DragonPhase::SittingFlaming);
+        dragon.set_phase(DragonPhase::Takeoff);
         assert!(dragon.hurt(BossHit::Arrow, 2.0));
         let mut tick = dragon_tick(&[]);
         tick.path_complete = true;
@@ -5247,10 +5739,12 @@ mod mob_behaviors_tests {
         assert_eq!(wither.hurt(BossHit::Arrow, 149.0), None);
         assert_eq!(wither.hp, 151.0);
         assert!(!wither.immune_to(BossHit::Arrow));
+        assert!(!wither.immune_to(BossHit::Trident));
         assert_eq!(wither.hurt(BossHit::Arrow, 1.0), None);
         assert_eq!(wither.hp, 150.0);
         assert!(wither.has_wither_armor());
         assert_eq!(wither.hurt(BossHit::Arrow, 500.0), None);
+        assert_eq!(wither.hurt(BossHit::Trident, 500.0), None);
         assert_eq!(wither.hp, 150.0);
         assert_eq!(
             wither.shoot(4, false, &mut highest),
@@ -5280,21 +5774,24 @@ mod mob_behaviors_tests {
         assert_eq!(warden.hp, 500.0);
         assert_eq!(warden.anger.anger(target), 0);
         assert!(!warden.anger.agitated(target));
-        for anger in [35, 70, 105] {
+        for anger in [35, 70] {
             assert_eq!(warden.anger.add_vibration(target), anger);
         }
         assert_eq!(warden.anger.add_vibration(8), 35);
         for _ in 0..500 {
             assert_eq!(warden.tick(None), None);
         }
-        assert_eq!(warden.anger.anger(target), 80);
+        assert_eq!(warden.anger.anger(target), 45);
         assert_eq!(warden.anger.anger(8), 10);
-        assert!(warden.anger.agitated(target));
+        assert!(!warden.anger.agitated(target));
         assert!(warden.target.is_none());
-        assert_eq!(warden.anger.add_vibration(target), 115);
-        assert_eq!(warden.anger.add_vibration(target), 150);
+        assert_eq!(warden.anger.add_vibration(target), 80);
+        assert!(warden.anger.agitated(target));
+        // Eighty anger is already the vanilla target-lock threshold.
         assert_eq!(warden.tick(None), Some(WardenEvent::Roar { target }));
         assert_eq!(warden.target, Some(target));
+        assert_eq!(warden.anger.add_vibration(target), 115);
+        assert_eq!(warden.anger.add_vibration(target), 150);
 
         assert_eq!(
             warden.tick(Some(WardenTarget {
@@ -5724,6 +6221,169 @@ mod mob_behaviors_tests {
         // Eye-height and aim offsets shift the trajectory deterministically.
         let high_aim = skeleton_arrow_velocity([0.0, 1.0, 0.0], [10.0, 1.0, 0.0], 1.2, 1.74);
         assert!(high_aim[1] > velocity[1], "a higher aim line lifts the shot");
+    }
+
+    #[test]
+    fn dragon_v1211_multipart_breath_gateways_and_respawn_ritual() {
+        assert_eq!(dragon_part_damage(DragonCombatPart::Head, 20.0), 20.0);
+        assert_eq!(dragon_part_damage(DragonCombatPart::Body, 20.0), 6.0);
+        assert_eq!(dragon_part_damage(DragonCombatPart::Wing, 0.0), 1.0);
+        assert!(dragon_wing_knockback([0.0, 64.0, 0.0], [2.0, 64.5, 0.0]).is_some());
+        assert!(dragon_wing_knockback([0.0, 64.0, 0.0], [4.0, 64.5, 0.0]).is_none());
+
+        let mut cloud = DragonBreathCloud::sitting_flame([0.0, 80.0, 0.0]);
+        assert_eq!(cloud.radius, 5.0);
+        assert_eq!(cloud.left, 200);
+        assert_eq!(cloud.scoop("glass_bottle"), Some("dragon_breath"));
+        assert_eq!(cloud.radius, 4.5);
+        assert_eq!(cloud.scoop("water_bucket"), None);
+
+        let gateways = end_gateway_ring_positions(25, 75);
+        assert_eq!(gateways.len(), 20, "the end gateway ring caps at twenty");
+        for [x, y, z] in gateways {
+            assert_eq!(y, 75);
+            let radius = ((x * x + z * z) as f64).sqrt();
+            assert!((radius - 96.0).abs() <= 1.0, "gateway radius {radius}");
+        }
+
+        let crystals = dragon_respawn_crystal_positions(80);
+        assert_eq!(crystals.len(), 4);
+        assert!(DragonRespawnRitual::start(80, &crystals[..3]).is_none());
+        let mut ritual = DragonRespawnRitual::start(80, &crystals).unwrap();
+        assert_eq!(ritual.tick(), vec![DragonRespawnEvent::CloseExitPortal]);
+        let mut beams = 0;
+        let mut restores = 0;
+        let mut spawned = false;
+        for _ in 1..101 {
+            for event in ritual.tick() {
+                match event {
+                    DragonRespawnEvent::BeamAt { .. } => beams += 1,
+                    DragonRespawnEvent::RestoreCrystal { .. } => restores += 1,
+                    DragonRespawnEvent::SpawnDragon => spawned = true,
+                    DragonRespawnEvent::CloseExitPortal => unreachable!(),
+                }
+            }
+        }
+        assert_eq!((beams, restores, spawned), (4, 4, true));
+    }
+
+    #[test]
+    fn dragon_scanning_far_target_enters_charging_player_then_holding() {
+        let mut dragon = EnderDragonBehavior::new(false);
+        dragon.set_phase(DragonPhase::SittingScanning);
+        for _ in 0..25 {
+            let mut tick = dragon_tick(&[]);
+            tick.strafe_target = Some(12);
+            tick.strafe_target_distance = Some(60.0);
+            assert_eq!(dragon.tick(tick), None);
+        }
+        assert_eq!(dragon.phase, DragonPhase::ChargingPlayer);
+        assert!(dragon.hurt(BossHit::Other, 20.0));
+        assert!(dragon.hp < 200.0);
+        for _ in 0..10 {
+            assert_eq!(dragon.tick(dragon_tick(&[])), None);
+        }
+        assert_eq!(dragon.phase, DragonPhase::HoldingPattern);
+    }
+
+    #[test]
+    fn wither_v1211_head_cadence_skull_cage_and_star_rules() {
+        assert_eq!(wither_head_cadence(WitherHead::Center), 20);
+        assert_eq!(wither_head_cadence(WitherHead::Left), 40);
+        assert_eq!(wither_head_cadence(WitherHead::Right), 40);
+        assert!(wither_skull_breaks_block(true, "obsidian"));
+        assert!(wither_skull_breaks_block(true, "ancient_debris"));
+        for protected in ["bedrock", "end_portal", "end_portal_frame"] {
+            assert!(!wither_skull_breaks_block(true, protected), "{protected}");
+        }
+        assert!(!wither_skull_breaks_block(false, "stone"));
+        assert!(nether_star_ignores_explosions("minecraft:nether_star"));
+        assert!(!nether_star_ignores_explosions("diamond"));
+
+        let cleared = wither_cage_clear([10, 64, 10], |pos| pos != [10, 64, 10]);
+        assert_eq!(cleared.len(), 35, "3x4x3 has 36 cells; one unbreakable remains");
+        assert!(cleared.contains(&[9, 64, 9]));
+        assert!(cleared.contains(&[11, 67, 11]));
+        assert!(!cleared.contains(&[10, 64, 10]));
+    }
+
+    #[test]
+    fn warden_v1211_lifecycle_anger_darkness_and_damage_rules() {
+        let mut lifecycle = WardenLifecycle::emerging();
+        for tick in 1..=134 {
+            let event = lifecycle.tick(false, false);
+            assert_eq!(event, (tick == 134).then_some(WardenLifecycleEvent::Emerged));
+        }
+        assert_eq!(lifecycle.phase, WardenLifecyclePhase::Sniffing(84));
+        assert_eq!(lifecycle.tick(true, true), Some(WardenLifecycleEvent::Roar));
+        for tick in 1..=84 {
+            let event = lifecycle.tick(true, true);
+            assert_eq!(event, (tick == 84).then_some(WardenLifecycleEvent::Attack));
+        }
+        assert_eq!(lifecycle.phase, WardenLifecyclePhase::Attacking);
+
+        lifecycle.phase = WardenLifecyclePhase::Investigating;
+        lifecycle.calm_ticks = 1199;
+        assert_eq!(lifecycle.tick(false, false), Some(WardenLifecycleEvent::Dig));
+        assert_eq!(lifecycle.phase, WardenLifecyclePhase::Digging(100));
+        assert_eq!(lifecycle.tick(true, false), Some(WardenLifecycleEvent::Resurface));
+        assert_eq!(lifecycle.phase, WardenLifecyclePhase::Emerging(134));
+
+        assert_eq!(warden_melee_damage(1), 16.0);
+        assert_eq!(warden_melee_damage(2), 30.0);
+        assert_eq!(warden_melee_damage(3), 45.0);
+        assert!(warden_darkness_pulse(120, [20.0, 20.0, 20.0]));
+        assert!(!warden_darkness_pulse(121, [0.0, 0.0, 0.0]));
+        assert!(!warden_darkness_pulse(240, [20.1, 0.0, 0.0]));
+
+        let mut anger = WardenAngerManagement::default();
+        assert_eq!(anger.add_vibration(7), 35);
+        assert_eq!(anger.add_direct_hit(7), 135);
+        assert!(anger.roar_target() == Some(7));
+    }
+
+    #[test]
+    fn guardian_breeze_and_bogged_v1211_signature_rules() {
+        assert_eq!(guardian_spikes_reflect_damage(true, true), 2.0);
+        assert_eq!(guardian_spikes_reflect_damage(true, false), 0.0);
+        assert_eq!(guardian_spikes_reflect_damage(false, true), 0.0);
+
+        let mut breeze = BreezeBehavior::new();
+        let first = breeze.tick([0.0, 64.0, 0.0], Some((5, [12.0, 64.0, 0.0])), true);
+        assert!(matches!(first, Some(BreezeEvent::LongJump { .. })), "{first:?}");
+        for _ in 0..8 {
+            assert!(matches!(
+                breeze.tick([0.0, 64.0, 0.0], Some((5, [12.0, 64.0, 0.0])), false),
+                Some(BreezeEvent::LongJump { .. })
+            ));
+        }
+        assert!(matches!(
+            breeze.tick([0.0, 64.0, 0.0], Some((5, [12.0, 64.0, 0.0])), false),
+            Some(BreezeEvent::Slide { .. })
+        ));
+        assert!(matches!(
+            breeze.reflect_projectile(99, 5),
+            BreezeEvent::ReflectProjectile {
+                projectile: 99,
+                back_at: 5
+            }
+        ));
+        for block in ["oak_door", "spruce_trapdoor", "stone_button", "lever"] {
+            assert!(wind_charge_flips_block(block), "{block}");
+        }
+        assert!(!wind_charge_flips_block("iron_block"));
+
+        let mut close = BreezeBehavior::new();
+        assert!(matches!(
+            close.tick([0.0, 64.0, 0.0], Some((5, [8.0, 64.0, 0.0])), true),
+            Some(BreezeEvent::WindCharge { target: 5 })
+        ));
+
+        assert_eq!(bogged_arrow_poison(), (0, 80));
+        assert_eq!(bogged_attack_interval_ticks(), 70);
+        assert_eq!(bogged_max_hp(), 16.0);
+        assert_eq!(bogged_shear_mushrooms(false), Some(("brown_mushroom", 2)));
+        assert_eq!(bogged_shear_mushrooms(true), None);
     }
 }
 
