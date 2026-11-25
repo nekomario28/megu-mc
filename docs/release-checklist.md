@@ -98,6 +98,27 @@ pins the jar by sha1 and refetches only CC0 Fabric mappings; the regenerated
 outputs are gitignored, so the export stays clean while remaining
 reproducible.
 
+The datapack/config capture alone is not the complete runtime block-registry
+pack. After the shell generator, supply the pinned MIT minecraft-data block
+metadata documented in [NOTICE](../NOTICE) and export the physical-fact tables
+from the same pinned jar:
+
+```sh
+curl -fL -o /tmp/blocks-1.21.1.json \
+  https://raw.githubusercontent.com/PrismarineJS/minecraft-data/d56346a4e32defcd28d9ba6750957c12001e78d6/data/pc/1.21.1/blocks.json
+printf '%s  /tmp/blocks-1.21.1.json\n' \
+  7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654 | sha256sum -c -
+python3 tools/vanilla_data/export_block_registry_assets.py \
+  --jar /path/to/1.21.1-server.jar \
+  --blocks-json /tmp/blocks-1.21.1.json \
+  --out-dir assets
+```
+
+The installer performs this acquisition/generation path automatically only
+after the explicit runtime-data/EULA consent. It validates the complete
+`assets/*_1211` pack and fails closed rather than installing a partial
+singleplayer runtime.
+
 ## 4. Release bundle
 
 ```sh

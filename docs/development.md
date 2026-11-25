@@ -41,6 +41,16 @@ tools/vanilla_data/gen_vanilla_data.sh --jar /path/to/server.jar --fetch-fabric-
 - `--accept-eula` は **Minecraft EULA（https://aka.ms/MinecraftEULA）に同意したという意味**です。サーバーをオフライン・ループバックで一時起動するためで、付けなければ `config_packets.bin` 以外が生成されます。他人の代わりに同意したり、CIで自動的に付けたりしないでください。
 - 生成器の出力先はリポジトリ内です。生成物は手元のテスト用です。**コミットしないでください**（2.4）。
 - `config_packets.bin` が無い場合、サーバーは起動してもクライアントへregistryを送れません（`src/main.rs` の起動時メッセージ）。
+- `datapacks/vanilla/`・`assets/block_states_1211.json`・`config_packets.bin` だけでは integrated singleplayer の完全な runtime ではありません。`blocks_1211.json`、7つの物理事実 `.bin` table、`feature_order_1211.json` も必要です。NOTICE に記録された pinned MIT minecraft-data `blocks.json` を用意し、次を実行します。
+
+```sh
+python3 tools/vanilla_data/export_block_registry_assets.py \
+  --jar /path/to/server.jar \
+  --blocks-json /path/to/blocks-1.21.1.json \
+  --out-dir assets
+```
+
+`export_block_registry_assets.py` は pinned jar の sha1 と blocks json の sha256 を検証し、物理事実 table を利用者の jar から生成します。installer は明示的な EULA/runtime-data 同意後にこの取得・生成経路を自動実行し、不完全な runtime を fail-closed で拒否します。
 
 生成器と抽出器（`tools/vanilla_data/Extract.java`、`build_vanilla_data.py`）はこのツリーにあります。ただし、
 「生成器を手元で実行し、全テストが緑になること」は確認していません（NOT RUN。jar・Java 21・EULA同意が必要）。
