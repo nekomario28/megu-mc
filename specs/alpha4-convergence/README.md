@@ -8,18 +8,18 @@ This plan is a control-plane reset for converging the current alpha4 audit and c
 ## Current integration status — refreshed 2026-11-25
 
 The control-plane state above is historical. The active local integration branch is now
-`alpha4/integration-alpha4-convergence-local` at `421dd560d` (`test(client): require vanilla worldgen in quickplay e2e`),
-19 commits ahead of `origin/alpha4/integration-alpha4-convergence` and not yet pushed.
+`alpha4/integration-alpha4-convergence-local` at `0f7f8f222` (`docs(release): clarify installer-first download choice`),
+27 commits ahead of `origin/alpha4/integration-alpha4-convergence` and not yet pushed.
 
-Release-blocking lanes already integrated on this head include inventory conservation, non-vacuous A04 Anvil
+Release-blocking lanes already integrated on this line include inventory conservation, non-vacuous A04 Anvil
 transaction tests, clippy warning elimination to the ratchet baseline, broad A08 UI recovery with explicitly held
-limitations, wiring-audit scanner correction with documented staged boundaries, and installer/runtime-data generation.
-The installer now generates the canonical datapack plus the complete block-registry runtime asset pack. A fresh full
-install probe at `/home/yuu/.cache/megu-install-fullassets.Z2z3GG/server` exited 0; every generated `assets/*_1211*`
-file byte-matched the canonical local generated assets. A server boot using that installed runtime printed
-`[wg] vanilla datapack worldgen active (seed 0)`. The quickplay loopback E2E passed with the runtime supplied through
-`MEGU_E2E_RUNTIME_ROOT` and now fails if the child server logs the flat-generator fallback instead of vanilla datapack
-worldgen.
+limitations, wiring-audit scanner correction with documented staged boundaries, installer/runtime-data generation,
+complete runtime-pack inventory in `tools/dev_check.py`, and release artifact/documentation shape correction.
+The installer generates the canonical datapack plus the complete block-registry runtime asset pack. A fresh client
+install probe at `/home/yuu/.cache/megu-client-install-final.ELI6Tq/mc` exited 0. Using that installed runtime root,
+a direct `megu-client` quickplay loopback run exited 0, decoded/loaded 9 chunks, rendered a nonzero PNG, and the child
+server logged `[wg] vanilla datapack worldgen active (seed 0)` rather than the flat-generator fallback. The client E2E
+also fails if that fallback line appears.
 
 This is still not release authority. Same-SHA static/unit/export/bundle/live gates are being rerun on the final head;
 no tag, push, release artifact publication, or external comment has occurred.
@@ -209,7 +209,7 @@ These are valuable but should not block a verified-scope alpha unless the user c
 
 ## Alpha04 release critical path — current minimum plan
 
-Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla or mod compatibility. The current canonical local integration head is `cff205939`; it is not pushed and not release-approved.
+Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla or mod compatibility. The current canonical local integration line is `0f7f8f222`; it is not pushed and not release-approved.
 
 1. **Freeze and finish the integration candidate**
    - Treat `cff205939` as the candidate assembly point unless a fresh upstream `origin/main` change invalidates it.
