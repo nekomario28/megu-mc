@@ -137,7 +137,9 @@ impl Drop for SingleplayerServer {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 match self.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => return,
+                    // Even an already-reaped child must fall through so the stderr
+                    // tee is joined and the captured boot diagnostics are complete.
+                    Ok(Some(_)) | Err(_) => break,
                     Ok(None) if Instant::now() >= deadline => break,
                     Ok(None) => thread::sleep(Duration::from_millis(25)),
                 }
