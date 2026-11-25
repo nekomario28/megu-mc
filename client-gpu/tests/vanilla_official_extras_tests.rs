@@ -5,7 +5,8 @@ use megu_client_gpu::vanilla_official_extras::{default_skin_for_uuid, VanillaOff
 fn uuid_skin_selection_is_deterministic_and_in_range() {
     let mut selected = std::collections::BTreeSet::new();
     for n in 0..=255u8 {
-        let uuid = [n; 16];
+        let mut uuid = [0u8; 16];
+        uuid[15] = n;
         let first = default_skin_for_uuid(uuid);
         assert_eq!(first, default_skin_for_uuid(uuid));
         assert!(matches!(

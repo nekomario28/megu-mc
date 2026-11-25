@@ -76,7 +76,7 @@ const SKINS: [&str; 9] = [
 
 /// Vanilla's stable UUID-derived default skin choice and arm model.
 pub fn default_skin_for_uuid(uuid: [u8; 16]) -> (&'static str, bool) {
-    let n = (java_uuid_hash(uuid) % 18).unsigned_abs() as usize;
+    let n = java_uuid_hash(uuid).rem_euclid(18) as usize;
     (SKINS[n / 2], n % 2 == 1)
 }
 
