@@ -324,6 +324,14 @@ pub enum TactileParticleKind {
     ShockRing { max_radius: f32 },
     /// Ultra-thin wind-cut mote marking a fast arrow's path.
     ArrowTrailMote,
+    /// Vanilla block-break debris cube fragment.
+    BlockBreakDebris,
+    /// Vanilla sword-sweep attack arc mote.
+    SwordSweepArc,
+    /// Vanilla critical-hit star spark.
+    CriticalHitSpark,
+    /// Vanilla 1.21.1 mace-smash expanding shockwave ring.
+    MaceSmashShockwaveRing { max_radius: f32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,6 +1293,29 @@ impl GrassPartingField {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Vanilla gameplay feedback (not part of the opt-in Vanilla+ preset)
+// ---------------------------------------------------------------------------
+
+/// Progressive vanilla block-breaking crack overlay state. `stage` is the
+/// exact protocol/vanilla stage `0..=9`; `progress()` exposes `stage/10`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockCrackFeedback {
+    pub pos: [f32; 3],
+    pub face_normal: [f32; 3],
+    pub stage: u8,
+}
+
+impl BlockCrackFeedback {
+    pub fn progress(self) -> f32 {
+        f32::from(self.stage.min(9)) / 10.0
+    }
+}
+
+/// Maximum independent crack overlays retained by one tactile sim.
+pub const MAX_BLOCK_CRACK_FEEDBACK: usize = 16;
+
 // ---------------------------------------------------------------------------
 // Simulation
 // ---------------------------------------------------------------------------
@@ -1307,6 +1338,7 @@ pub struct TactileEffectsSim {
     /// Whether precipitation overhead is snow — footprint decals age
     /// [`FOOTPRINT_SNOWFALL_AGE_RATE`]x faster while it falls.
     is_snowing: bool,
+    crack_feedback: Vec<BlockCrackFeedback>,
     tick_index: u64,
 }
 
@@ -1327,6 +1359,7 @@ impl TactileEffectsSim {
             footprints: FootprintTrail::new(tier),
             grass_parting: GrassPartingField::new(),
             is_snowing: false,
+            crack_feedback: Vec::with_capacity(MAX_BLOCK_CRACK_FEEDBACK),
             tick_index: 0,
         }
     }
@@ -1994,6 +2027,281 @@ impl TactileEffectsSim {
         spawned
     }
 
+
+    // ----- Vanilla gameplay feedback -----------------------------------------
+
+    /// Current progressive block-crack overlays.
+    pub fn crack_feedback(&self) -> &[BlockCrackFeedback] {
+        &self.crack_feedback
+    }
+
+    /// Set/update one vanilla crack overlay. This path is vanilla gameplay
+    /// feedback, so it is intentionally **not** gated by the opt-in Vanilla+
+    /// preset. Stages are clamped to the exact vanilla `0..=9` range and the
+    /// retained overlay count is bounded at [`MAX_BLOCK_CRACK_FEEDBACK`].
+    pub fn set_block_crack_stage(
+        &mut self,
+        pos: [f32; 3],
+        face_normal: [f32; 3],
+        stage: u8,
+    ) -> bool {
+        if !valid_pos(&pos) || !face_normal.iter().all(|v| v.is_finite()) {
+            return false;
+        }
+        let stage = stage.min(9);
+        let normal = normalized_dir(face_normal, [0.0, 1.0, 0.0]);
+        if let Some(existing) = self.crack_feedback.iter_mut().find(|c| {
+            (c.pos[0] - pos[0]).abs() < 0.01
+                && (c.pos[1] - pos[1]).abs() < 0.01
+                && (c.pos[2] - pos[2]).abs() < 0.01
+        }) {
+            existing.stage = stage;
+            existing.face_normal = normal;
+            return true;
+        }
+        if self.crack_feedback.len() >= MAX_BLOCK_CRACK_FEEDBACK {
+            self.crack_feedback.remove(0);
+        }
+        self.crack_feedback.push(BlockCrackFeedback { pos, face_normal: normal, stage });
+        true
+    }
+
+    /// Clear the crack overlay nearest to `pos` within half a block.
+    pub fn clear_block_crack(&mut self, pos: [f32; 3]) -> bool {
+        let before = self.crack_feedback.len();
+        self.crack_feedback.retain(|c| {
+            let dx = c.pos[0] - pos[0];
+            let dy = c.pos[1] - pos[1];
+            let dz = c.pos[2] - pos[2];
+            dx * dx + dy * dy + dz * dz > 0.25
+        });
+        self.crack_feedback.len() != before
+    }
+
+    /// Vanilla block-break debris burst. Unlike decorative Vanilla+ systems,
+    /// this is required gameplay feedback and emits even when the tactile
+    /// preset is `Off`; only the shared hardware-tier cap applies.
+    pub fn emit_block_break_debris(
+        &mut self,
+        pos: [f32; 3],
+        block_rgb: [f32; 3],
+        count: u8,
+        tick: u64,
+    ) -> usize {
+        if !valid_pos(&pos) {
+            return 0;
+        }
+        let rgb = block_rgb.map(|c| clamped(c, 0.0, 1.0));
+        let count = usize::from(count.clamp(1, 32));
+        let mut spawned = 0;
+        for i in 0..count {
+            let h = hash3(tick as i64, i as i64, SEED_SPARK ^ 0x51de);
+            let vel = [
+                (h[0] - 0.5) * 4.2,
+                2.0 + 3.2 * h[1],
+                (h[2] - 0.5) * 4.2,
+            ];
+            if self.spawn_particle(
+                TactileParticleKind::BlockBreakDebris,
+                pos,
+                vel,
+                0.55 + 0.65 * h[1],
+                0.045 + 0.035 * h[2],
+                h[0] * TAU,
+                h[1],
+                [rgb[0], rgb[1], rgb[2], 1.0],
+            ) {
+                spawned += 1;
+            }
+        }
+        spawned
+    }
+
+    /// Vanilla footstep dust puff, independent of cosmetic preset gates.
+    pub fn emit_footstep_dust(&mut self, pos: [f32; 3], surface: GroundSurfaceKind, tick: u64) -> usize {
+        if !valid_pos(&pos) {
+            return 0;
+        }
+        let h = hash01(tick as i64, 1, SEED_STEP);
+        let rgb = surface.puff_rgb();
+        usize::from(self.spawn_particle(
+            TactileParticleKind::FootstepPuff,
+            [pos[0], pos[1] + 0.04, pos[2]],
+            [(h - 0.5) * 0.25, 0.18 + 0.12 * h, (0.5 - h) * 0.2],
+            0.38,
+            0.06 + 0.04 * h,
+            h * TAU,
+            h,
+            [rgb[0], rgb[1], rgb[2], 0.55],
+        ))
+    }
+
+    /// Vanilla heavy-landing dust ring plus puffs, independent of cosmetic
+    /// preset gates. `impact_speed` controls radius/count deterministically.
+    pub fn emit_landing_puffs(
+        &mut self,
+        pos: [f32; 3],
+        surface: GroundSurfaceKind,
+        impact_speed: f32,
+        tick: u64,
+    ) -> usize {
+        if !valid_pos(&pos) || !impact_speed.is_finite() || impact_speed <= 0.0 {
+            return 0;
+        }
+        let speed = clamped(impact_speed / 12.0, 0.0, 1.0);
+        let rgb = surface.puff_rgb();
+        let mut spawned = self.emit_footstep_dust(pos, surface, tick);
+        let h = hash01(tick as i64, 7, SEED_STEP ^ 0x33cc);
+        if self.spawn_particle(
+            TactileParticleKind::LandingDustRing { max_radius: 0.32 + 0.45 * speed },
+            [pos[0], pos[1] + 0.02, pos[2]],
+            [0.0; 3],
+            0.48,
+            0.04,
+            0.0,
+            h,
+            [rgb[0], rgb[1], rgb[2], 0.55],
+        ) {
+            spawned += 1;
+        }
+        spawned
+    }
+
+    /// Vanilla water-entry splash column and ripple ring, independent of the
+    /// decorative fluid-reaction preset toggle.
+    pub fn emit_water_entry_splash(
+        &mut self,
+        pos: [f32; 3],
+        impact_speed: f32,
+        body: FluidEntryBody,
+        tick: u64,
+    ) -> usize {
+        if !valid_pos(&pos) || !impact_speed.is_finite() {
+            return 0;
+        }
+        let speed = clamped(impact_speed / 10.0, 0.15, 1.0);
+        let mass = body.mass_factor();
+        let count = (4.0 + 8.0 * speed * mass).round().min(18.0) as usize;
+        let mut spawned = 0;
+        for i in 0..count {
+            let h = hash3(tick as i64, i as i64, SEED_SPLASH);
+            let angle = h[0] * TAU;
+            if self.spawn_particle(
+                TactileParticleKind::SplashDroplet,
+                pos,
+                [angle.cos() * (0.6 + speed), 1.2 + 2.8 * speed * h[1], angle.sin() * (0.6 + speed)],
+                0.42 + 0.28 * h[2],
+                0.035 + 0.025 * h[0],
+                h[0] * TAU,
+                h[1],
+                [0.45, 0.68, 1.0, 0.85],
+            ) {
+                spawned += 1;
+            }
+        }
+        if self.spawn_particle(
+            TactileParticleKind::WaterRippleRing { max_radius: 0.35 + 0.75 * speed * mass },
+            [pos[0], pos[1] + 0.01, pos[2]],
+            [0.0; 3],
+            0.55,
+            0.04,
+            0.0,
+            0.5,
+            [0.55, 0.75, 1.0, 0.6],
+        ) {
+            spawned += 1;
+        }
+        spawned
+    }
+
+    /// Vanilla sword-sweep attack arc. Motes form a deterministic half-ring
+    /// centered on `yaw_rad`; the cosmetic preset does not gate this combat
+    /// feedback.
+    pub fn emit_sword_sweep_arc(
+        &mut self,
+        pos: [f32; 3],
+        yaw_rad: f32,
+        strength: f32,
+        tick: u64,
+    ) -> usize {
+        if !valid_pos(&pos) || !yaw_rad.is_finite() || !strength.is_finite() || strength <= 0.0 {
+            return 0;
+        }
+        let radius = 0.65 + 0.35 * clamped(strength, 0.0, 1.0);
+        let mut spawned = 0;
+        for i in 0..7 {
+            let f = i as f32 / 6.0 - 0.5;
+            let a = yaw_rad + f * 1.5;
+            let h = hash01(tick as i64, i as i64, SEED_SPARK ^ 0xa5a5);
+            if self.spawn_particle(
+                TactileParticleKind::SwordSweepArc,
+                [pos[0] - a.sin() * radius, pos[1] + 0.8, pos[2] + a.cos() * radius],
+                [-a.sin() * 0.5, 0.0, a.cos() * 0.5],
+                0.20 + 0.04 * h,
+                0.08,
+                a,
+                h,
+                [0.92, 0.94, 1.0, 0.72],
+            ) {
+                spawned += 1;
+            }
+        }
+        spawned
+    }
+
+    /// Vanilla critical-hit star sparks, independent of cosmetic impact-spark
+    /// toggles but bounded by the same hardware particle cap.
+    pub fn emit_critical_hit_sparks(&mut self, pos: [f32; 3], tick: u64) -> usize {
+        if !valid_pos(&pos) {
+            return 0;
+        }
+        let mut spawned = 0;
+        for i in 0..8 {
+            let h = hash3(tick as i64, i as i64, SEED_SPARK ^ 0xc11);
+            let vel = [(h[0] - 0.5) * 3.4, 1.0 + 2.5 * h[1], (h[2] - 0.5) * 3.4];
+            if self.spawn_particle(
+                TactileParticleKind::CriticalHitSpark,
+                pos,
+                vel,
+                0.35 + 0.2 * h[2],
+                0.045 + 0.02 * h[0],
+                h[0] * TAU,
+                h[1],
+                [1.0, 0.82, 0.18, 1.0],
+            ) {
+                spawned += 1;
+            }
+        }
+        spawned
+    }
+
+    /// Vanilla 1.21.1 mace smash shockwave ring. Radius scales with fall
+    /// distance and is strictly bounded; emits in every tactile preset.
+    pub fn emit_mace_smash_shockwave(
+        &mut self,
+        pos: [f32; 3],
+        fall_distance: f32,
+        tick: u64,
+    ) -> usize {
+        if !valid_pos(&pos) || !fall_distance.is_finite() || fall_distance <= 0.0 {
+            return 0;
+        }
+        let h = hash01(tick as i64, 0, SEED_SPARK ^ 0xace1);
+        let radius = (0.8 + fall_distance.min(30.0) * 0.12).min(4.5);
+        let mut spawned = usize::from(self.spawn_particle(
+            TactileParticleKind::MaceSmashShockwaveRing { max_radius: radius },
+            [pos[0], pos[1] + 0.03, pos[2]],
+            [0.0; 3],
+            0.48,
+            0.08,
+            0.0,
+            h,
+            [0.75, 0.85, 1.0, 0.72],
+        ));
+        spawned += self.emit_block_break_debris(pos, [0.55, 0.55, 0.60], 8, tick ^ 0x5eed);
+        spawned
+    }
+
     // ----- Simulation step ---------------------------------------------------
 
     /// Convenience wrapper: update the wetness tracker then advance the
@@ -2040,7 +2348,10 @@ impl TactileEffectsSim {
                         *c *= drag;
                     }
                 }
-                TactileParticleKind::LavaSizzleSpark | TactileParticleKind::ImpactSpark => {
+                TactileParticleKind::LavaSizzleSpark
+                | TactileParticleKind::ImpactSpark
+                | TactileParticleKind::BlockBreakDebris
+                | TactileParticleKind::CriticalHitSpark => {
                     p.vel[1] -= 18.0 * dt;
                 }
                 TactileParticleKind::SteamPuff | TactileParticleKind::ColdBreathVapor => {
@@ -2068,7 +2379,9 @@ impl TactileEffectsSim {
                     p.vel[1] = -0.55;
                     p.vel[2] = -r * w * (p.age_sec * w + p.phase).sin();
                 }
-                TactileParticleKind::FootstepPuff | TactileParticleKind::ArrowTrailMote => {
+                TactileParticleKind::FootstepPuff
+                | TactileParticleKind::ArrowTrailMote
+                | TactileParticleKind::SwordSweepArc => {
                     let drag = (-3.0 * dt).exp();
                     for c in &mut p.vel {
                         *c *= drag;
@@ -2078,7 +2391,8 @@ impl TactileEffectsSim {
                 | TactileParticleKind::BubblePopRing { max_radius }
                 | TactileParticleKind::LandingDustRing { max_radius }
                 | TactileParticleKind::DripLandingRing { max_radius }
-                | TactileParticleKind::ShockRing { max_radius } => {
+                | TactileParticleKind::ShockRing { max_radius }
+                | TactileParticleKind::MaceSmashShockwaveRing { max_radius } => {
                     // Framerate-independent expansion: eased toward the
                     // kind's max radius purely from normalized age.
                     let ease = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
