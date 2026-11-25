@@ -15,6 +15,21 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
 
+// Vanilla-faithful scheduled ticks vs. megu-internal performance queues —
+// deliberately kept apart:
+//
+// * `VanillaScheduledTickQueue` (re-exported from `megu_core::world_view`)
+//   is the *correctness* surface for Vanilla/mod compat: it drains in the
+//   exact `(trigger_tick, priority, sub_tick_order)` total order Vanilla
+//   1.21.1's `LevelTicks` imposes, tie-broken by a monotonic schedule
+//   counter and never reordered by `swap_remove`-style tricks.
+// * `DueMachineQueue` / `TickQueue` below are megu-specific optimization
+//   structures for machine wakeups and cell revisits: they batch work
+//   cheaply and intentionally do NOT reproduce vanilla tie-breaking.
+//   Neither is a substitute for the other.
+#[allow(unused_imports)]
+pub(crate) use megu_core::world_view::{VanillaScheduledTick, VanillaScheduledTickQueue};
+
 /// Four seconds, in ticks. Derived from the cadence rather than written as a
 /// literal so it stays four seconds if the cadence changes.
 pub(crate) const MAX_DELAY: usize = super::MAX_DELAY_TICKS;
@@ -361,6 +376,33 @@ mod tests {
             assert!(q.due().is_empty());
         }
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn vanilla_scheduled_ticks_drain_in_level_ticks_order() {
+        // The re-exported `megu_core` queue must reproduce Vanilla's
+        // `(trigger_tick, priority, sub_tick_order)` total order exactly —
+        // including interleaved schedule/drain streams.
+        let mut q = VanillaScheduledTickQueue::new();
+        q.schedule([0, 64, 0], "water", 5, 1);
+        q.schedule([1, 64, 0], "ice", 4, -3);
+        q.schedule([2, 64, 0], "sand", 5, 0);
+        q.schedule([3, 64, 0], "torch", 5, 0);
+        let mut out = Vec::new();
+        q.drain_due(4, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload, "ice");
+        out.clear();
+        q.drain_due(5, &mut out);
+        assert_eq!(
+            out.iter().map(|t| t.payload).collect::<Vec<_>>(),
+            ["sand", "torch", "water"],
+            "same-tick entries order by (priority, insertion) — never reordered"
+        );
+        assert!(q.is_empty());
+        // A scheduled-unique duplicate is refused like LevelChunkTicks.
+        q.schedule_unique([0, 0, 0], "lava", 7, 0);
+        assert_eq!(q.schedule_unique([0, 0, 0], "lava", 8, 0), None);
     }
 }
 

@@ -407,5 +407,6 @@ pub mod timing_wheel;
 pub mod union_find;
 pub mod varint;
 pub mod version;
+pub mod world_view;
 pub mod zero_change_sim;
 pub mod zip_archive;

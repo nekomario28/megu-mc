@@ -241,9 +241,11 @@ impl AeronauticsRuntimeBridge {
         Some(self.airships.get(ship)?.passenger_world_delta(*offset, dt))
     }
 
-    /// Anything worth ticking: live ships or attached passengers.
+    /// Anything worth ticking: live ships. Passenger entries without a
+    /// ship cannot produce motion or sync work, so an empty fleet is a
+    /// strict zero-work dormant state even if a stale attachment remains.
     fn has_work(&self) -> bool {
-        !self.airships.is_empty() || !self.passengers.is_empty()
+        !self.airships.is_empty()
     }
 
     /// Advance every airship by `dt` seconds (0.05 at 20 TPS): each
@@ -1049,10 +1051,15 @@ fn aeronautics_bridge_assemble_ship(
     let Some(sub) = bridge.airships.get_mut(&id) else {
         return Err("assembled ship was not registered".into());
     };
+    // `pos` is the *center of mass* in world space, not the local origin:
+    // `local_to_world([lx + 0.5, ly + 0.5, lz + 0.5])` must equal
+    // `[world + 0.5]` for every assembled block, so the COM sits at
+    // `origin + com`, not at `origin` — on asymmetric hulls the two differ
+    // by whole blocks and the old code silently displaced the ship.
     sub.pos = [
-        f64::from(origin[0]),
-        f64::from(origin[1]),
-        f64::from(origin[2]),
+        f64::from(origin[0]) + sub.center_of_mass[0],
+        f64::from(origin[1]) + sub.center_of_mass[1],
+        f64::from(origin[2]) + sub.center_of_mass[2],
     ];
     let frame = SubWorldSyncFrame {
         kind: SubWorldSyncKind::FullSpawn,
@@ -1388,6 +1395,19 @@ mod aeronautics_and_dim_bridge_tests {
         dimension_mod_bridge()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn empty_fleet_with_stale_passenger_is_zero_work() {
+        let _serial = ADB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *adb_lock() = AeronauticsRuntimeBridge::new();
+        adb_lock().passengers.insert(77, (999, [0.0; 3]));
+        aeronautics_bridge_tick(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
+        assert_eq!(
+            adb_lock().ticks_stepped,
+            0,
+            "a passenger whose ship no longer exists must not keep the fleet awake"
+        );
     }
 
     /// Synthetic `Client` (same fixture style as `mod_offload_bridge`'s tests)
@@ -2151,5 +2171,52 @@ mod aeronautics_and_dim_bridge_tests {
             .iter()
             .any(|(_, bytes)| SubWorldSyncFrame::decode(bytes)
                 .is_ok_and(|f| f.kind == SubWorldSyncKind::Despawn)));
+    }
+
+    #[test]
+    fn assembly_pos_is_world_com_so_voxels_stay_cell_exact_on_asymmetric_hulls() {
+        let _serial = ADB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        *adb_lock() = AeronauticsRuntimeBridge::new();
+        // Heavily asymmetric hull: a dense obsidian keel four cells out on
+        // +x, a wool fin on +y — the mass-weighted COM sits far off the
+        // origin cell.
+        let blocks = [
+            ([10, 100, 10], 1u32, "minecraft:stone"),
+            ([11, 100, 10], 2u32, "minecraft:stone"),
+            ([14, 100, 10], 3u32, "minecraft:obsidian"),
+            ([10, 101, 10], 4u32, "minecraft:white_wool"),
+        ];
+        let origin = [10, 100, 10];
+        let id = aeronautics_bridge_assemble_ship(DimId::Overworld, origin, &blocks).unwrap();
+        let bridge = adb_lock();
+        let sub = bridge.airships.get(&id).expect("ship registered");
+        // Every voxel's world-space cell center must equal its source
+        // world cell to <1e-12 — the bug this guards against placed `pos`
+        // at `origin` instead of `origin + com`, displacing the whole ship.
+        for (world, _state, _name) in &blocks {
+            let local = [
+                world[0] - origin[0],
+                world[1] - origin[1],
+                world[2] - origin[2],
+            ];
+            let w = sub.local_to_world([
+                local[0] as f64 + 0.5,
+                local[1] as f64 + 0.5,
+                local[2] as f64 + 0.5,
+            ]);
+            for i in 0..3 {
+                assert!(
+                    (w[i] - (world[i] as f64 + 0.5)).abs() < 1e-12,
+                    "voxel {world:?} displaced on assembly: {w:?}"
+                );
+            }
+        }
+        // Sanity: the COM is genuinely off-origin (the test isn't trivially
+        // passing because com ≈ [0.5; 3]).
+        assert!(
+            (sub.center_of_mass[0] - 0.5).abs() > 0.5,
+            "expected an off-origin COM, got {:?}",
+            sub.center_of_mass
+        );
     }
 }
