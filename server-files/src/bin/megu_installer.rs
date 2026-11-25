@@ -894,7 +894,7 @@ fn canonical_blocks_asset_semantics_valid(blocks: &[Json]) -> bool {
                     if values.is_empty()
                         || values.len() > 64
                         || !values.iter().all(|v| {
-                            v.as_str().is_some_and(|value| valid_minecraft_name(value))
+                            v.as_str().is_some_and(valid_minecraft_name)
                         })
                     {
                         return false;
@@ -1065,8 +1065,9 @@ fn binary_runtime_asset_valid(path: &Path, rel: &str) -> bool {
         "assets/structure_state_transforms_1211.bin" => {
             data[..48].iter().all(|byte| *byte == 0)
                 && data[48..96]
-                    .chunks_exact(4)
-                    .all(|word| word == [0, 0, 0, 1])
+                    .as_chunks::<4>().0
+                    .iter()
+                    .all(|word| *word == [0, 0, 0, 1])
                 && distinct > 8
         }
         _ => false,
