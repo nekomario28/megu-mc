@@ -428,6 +428,17 @@ pub(crate) enum WorkerCommand {
     ContainerClose {
         window_id: u8,
     },
+    RenameItem(String),
+    SelectTrade { index: i32 },
+    SetBeacon {
+        primary: Option<i32>,
+        secondary: Option<i32>,
+    },
+    ContainerSlotStateChanged {
+        slot_id: i32,
+        window_id: i32,
+        state: bool,
+    },
     /// `seen_advancements` — the advancements screen opened (`Some(tab)`)
     /// or closed (`None`), per vanilla's screen-notification packet.
     SeenAdvancements {
@@ -1867,6 +1878,8 @@ pub struct LiveSession {
     pub looking_at_entity: Option<i32>,
     /// Server's open-container instruction, if any.
     pub open_screen: Option<LiveOpenScreen>,
+    /// Locally toggled crafter grid state, keyed by `(window, slot)`.
+    crafter_disabled_slots: BTreeMap<(u8, i32), bool>,
     /// `container_set_data` properties keyed by `(window_id, property)` —
     /// persisted even when no `open_screen` matches (late opens, window-0
     /// sync) so a screen opened after the updates still shows them.
@@ -2679,6 +2692,7 @@ impl LiveSession {
             physics_state: PlayerPhysicsState::default(),
             looking_at_entity: None,
             open_screen: None,
+            crafter_disabled_slots: BTreeMap::new(),
             container_properties: BTreeMap::new(),
             player_abilities: LivePlayerAbilities::default(),
             server_resource_packs: VecDeque::new(),
@@ -5070,9 +5084,83 @@ impl LiveSession {
         {
             self.open_screen = None;
         }
+        self.crafter_disabled_slots
+            .retain(|(id, _), _| *id != window_id);
         let _ = self
             .outgoing
             .try_send(WorkerCommand::ContainerClose { window_id });
+    }
+
+    /// Queue the anvil rename text (`0x2a`); protocol 767 accepts at most
+    /// 150 Unicode scalar values.
+    pub fn rename_item(&self, name: &str) -> bool {
+        let bounded: String = name.chars().take(150).collect();
+        self.outgoing
+            .try_send(WorkerCommand::RenameItem(bounded))
+            .is_ok()
+    }
+
+    /// Queue a merchant offer selection (`0x2f`). Negative indices are
+    /// rejected because they cannot identify a row in the open offer list.
+    pub fn select_trade(&self, index: i32) -> bool {
+        index >= 0
+            && self
+                .outgoing
+                .try_send(WorkerCommand::SelectTrade { index })
+                .is_ok()
+    }
+
+    /// Queue beacon effect IDs (`0x2c`), preserving the protocol's optional
+    /// primary and secondary effect representation.
+    pub fn set_beacon(&self, primary: Option<i32>, secondary: Option<i32>) -> bool {
+        self.outgoing
+            .try_send(WorkerCommand::SetBeacon {
+                primary,
+                secondary,
+            })
+            .is_ok()
+    }
+
+    /// Queue one crafter disabled-state transition (`0x10`). Only grid
+    /// slots 0..=8 are valid in the 1.21.1 menu.
+    pub fn set_crafter_slot_disabled(
+        &mut self,
+        window_id: u8,
+        slot_id: i32,
+        disabled: bool,
+    ) -> bool {
+        if !(0..9).contains(&slot_id) {
+            return false;
+        }
+        if self
+            .outgoing
+            .try_send(WorkerCommand::ContainerSlotStateChanged {
+                slot_id,
+                window_id: i32::from(window_id),
+                state: disabled,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        self.crafter_disabled_slots
+            .insert((window_id, slot_id), disabled);
+        true
+    }
+
+    /// Toggle and send one crafter grid slot; returns the new disabled state
+    /// only when the worker accepted the packet.
+    pub fn toggle_crafter_slot(&mut self, window_id: u8, slot_id: i32) -> Option<bool> {
+        if !(0..9).contains(&slot_id) {
+            return None;
+        }
+        let next = !self
+            .crafter_disabled_slots
+            .get(&(window_id, slot_id))
+            .copied()
+            .unwrap_or(false);
+        self.set_crafter_slot_disabled(window_id, slot_id, next)
+            .then_some(next)
     }
 
     /// `place_recipe` — the JEI `+` / recipe-book grid-fill request for
@@ -8275,6 +8363,25 @@ fn run_connection(
                 Ok(WorkerCommand::ContainerClose { window_id }) => {
                     client.send_container_close(window_id)?;
                 }
+                Ok(WorkerCommand::RenameItem(name)) => {
+                    client.send_rename_item(&name)?;
+                }
+                Ok(WorkerCommand::SelectTrade { index }) => {
+                    client.send_select_trade(index)?;
+                }
+                Ok(WorkerCommand::SetBeacon {
+                    primary,
+                    secondary,
+                }) => {
+                    client.send_set_beacon(primary, secondary)?;
+                }
+                Ok(WorkerCommand::ContainerSlotStateChanged {
+                    slot_id,
+                    window_id,
+                    state,
+                }) => {
+                    client.send_container_slot_state_changed(slot_id, window_id, state)?;
+                }
                 Ok(WorkerCommand::SeenAdvancements { tab }) => {
                     client.send_seen_advancements(tab.as_deref())?;
                 }
@@ -9103,6 +9210,29 @@ mod tests {
         let (tx, incoming) = mpsc::sync_channel(8);
         let (outgoing, _rx) = mpsc::sync_channel(8);
         (LiveSession::with_channels(incoming, outgoing), tx)
+    }
+
+    #[test]
+    fn workstation_actions_reach_the_protocol_worker_queue() {
+        let (incoming_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        drop(incoming_tx);
+
+        assert!(live.rename_item("Repairable tool"));
+        assert!(live.select_trade(2));
+        assert!(!live.select_trade(-1));
+        assert!(live.set_beacon(Some(5), Some(12)));
+        assert_eq!(live.toggle_crafter_slot(4, 8), Some(true));
+        assert_eq!(live.toggle_crafter_slot(4, 8), Some(false));
+        assert_eq!(live.toggle_crafter_slot(4, 9), None);
+
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::RenameItem(name) if name == "Repairable tool"));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::SelectTrade { index: 2 }));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::SetBeacon { primary: Some(5), secondary: Some(12) }));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::ContainerSlotStateChanged { slot_id: 8, window_id: 4, state: true }));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::ContainerSlotStateChanged { slot_id: 8, window_id: 4, state: false }));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
