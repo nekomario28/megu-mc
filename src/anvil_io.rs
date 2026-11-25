@@ -25,6 +25,20 @@ const ANVIL_SECTOR: usize = 4096;
 const ANVIL_CHUNK_NBT_BUDGET: usize = 64 << 20;
 const ANVIL_LEVEL_NBT_BUDGET: usize = 256 << 20;
 
+// The Anvil writers use fixed sibling staging names (`.tmp`, `_new`, `_old`).
+// Keep each read/merge/write and level.dat rotation indivisible within this
+// process so concurrent autosaves cannot reuse those names or merge against a
+// stale region image. A single lock is deliberately conservative: region I/O
+// is infrequent and the on-disk transaction must be correct first.
+static ANVIL_SAVE_TRANSACTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ANVIL_ATOMIC_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn anvil_save_transaction_lock() -> std::sync::MutexGuard<'static, ()> {
+    ANVIL_SAVE_TRANSACTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Capture the on-disk Anvil world before importing or migrating it. The
 /// caller supplies the timestamp so snapshot identities are deterministic.
 #[cfg(feature = "mod-suite")]
@@ -478,6 +492,9 @@ fn read_region_file(path: &std::path::Path) -> Result<AnvilRegion, String> {
 /// `path.tmp` -> `path`, fsynced before the rename — the same discipline
 /// `write_world_file` uses for the v2 save, minus its backup generations.
 fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let _write = ANVIL_ATOMIC_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp_name);
@@ -2569,6 +2586,7 @@ fn write_level_dat_rotating(
     path: &std::path::Path,
     level: &AnvilLevelDat,
 ) -> Result<bool, String> {
+    let _transaction = anvil_save_transaction_lock();
     let bytes = write_level_dat(level)?;
     let mut new_name = path.as_os_str().to_owned();
     new_name.push("_new");
@@ -3235,6 +3253,9 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
                 .push((cx, cz));
         }
     }
+    // Full-save and incremental paths take the transaction lock before the
+    // persisted-hash lock, keeping one lock order across both writers.
+    let _transaction = anvil_save_transaction_lock();
     let mut hashes = anvil_persisted_hashes()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -3309,6 +3330,7 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
         }
     }
     drop(hashes);
+    drop(_transaction);
     let (players_written, players_skipped) = write_all_playerdata_dat(dir)?;
     summary.players_written = players_written;
     summary.skipped_unchanged_writes += players_skipped;
@@ -3647,6 +3669,8 @@ fn flush_single_chunk_to_anvil_dir_outcome(
     cx: i32,
     cz: i32,
 ) -> Result<AnvilChunkFlushOutcome, String> {
+    // Keep the selected read and raw merge/write in the same transaction.
+    let _transaction = anvil_save_transaction_lock();
     let rel = anvil_dim_region_dir(dim)
         .ok_or_else(|| format!("dimension {dim:?} has no anvil region directory"))?;
     let region_dir = dir.join(rel);
@@ -3887,6 +3911,95 @@ fn reload_single_chunk_from_anvil_dir(
     drop(w);
     apply_chunk_block_entities(dim, &chunk.block_entities);
     Ok(true)
+}
+
+#[cfg(test)]
+mod anvil_io_transaction_tests {
+    use super::*;
+
+    fn anvil_tmp_dir(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "megu-anvil-{tag}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a04_concurrent_chunk_flushes_preserve_both_region_updates() {
+        let _guard = crate::world_guard();
+        world().write_all().clear();
+        let dir = anvil_tmp_dir("a04-region-race");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for cx in [0i32, 1] {
+            let worker_dir = dir.clone();
+            let worker_start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                worker_start.wait();
+                flush_single_chunk_to_anvil_dir(&worker_dir, DimId::Overworld, cx, 0)
+                    .expect("concurrent chunk flush succeeds")
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), 0);
+        }
+        let region = read_region_file(&dir.join("region/r.0.0.mca")).unwrap();
+        assert!(region.chunks.contains_key(&(0, 0)));
+        assert!(region.chunks.contains_key(&(1, 0)));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a04_concurrent_level_rotations_leave_valid_live_and_backup_files() {
+        let dir = anvil_tmp_dir("a04-level-race");
+        let path = dir.join("level.dat");
+        let initial = anvil_level_dat_from_state("initial", ANVIL_DATA_VERSION);
+        write_level_dat_rotating(&path, &initial).unwrap();
+
+        let start = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut workers = Vec::new();
+        for i in 0..4 {
+            let worker_path = path.clone();
+            let worker_start = start.clone();
+            workers.push(std::thread::spawn(move || {
+                let level = anvil_level_dat_from_state(
+                    &format!("writer-{i}"),
+                    ANVIL_DATA_VERSION,
+                );
+                worker_start.wait();
+                for _ in 0..8 {
+                    write_level_dat_rotating(&worker_path, &level)
+                        .expect("serialized level rotation succeeds");
+                }
+            }));
+        }
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(read_level_dat_path(&path).is_ok());
+        assert!(read_level_dat_path(&dir.join("level.dat_old")).is_ok());
+        assert!(!dir.join("level.dat_new").exists());
+
+        // A backup-path failure must leave the live file usable and discard
+        // the staged copy instead of losing the original during rollback.
+        let before = std::fs::read(&path).unwrap();
+        std::fs::remove_file(dir.join("level.dat_old")).unwrap();
+        std::fs::create_dir(dir.join("level.dat_old")).unwrap();
+        let replacement = anvil_level_dat_from_state("replacement", ANVIL_DATA_VERSION);
+        assert!(write_level_dat_rotating(&path, &replacement).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!dir.join("level.dat_new").exists());
+        assert!(read_level_dat_path(&path).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(all(test, megu_vanilla_data))]
