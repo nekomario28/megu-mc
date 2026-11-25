@@ -461,9 +461,10 @@ fn dst_campaign_multiple_seeds_verifies_all_invariants_under_two_seconds() {
     assert!(aggregate_restarts >= 200);
     assert!(aggregate_cross_dim > 0);
     assert!(aggregate_faults > 0);
+    let budget_secs = if cfg!(debug_assertions) { 20.0 } else { 2.0 };
     assert!(
-        started.elapsed().as_secs_f64() < 2.0,
-        "DST campaign took {:?}",
+        started.elapsed().as_secs_f64() < budget_secs,
+        "DST campaign took {:?} (budget {budget_secs}s)",
         started.elapsed()
     );
 }

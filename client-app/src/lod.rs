@@ -48,6 +48,11 @@ pub struct LodConfig {
     /// columns until the total fits. A single column larger than the cap is
     /// not stored at all.
     pub max_memory_bytes: usize,
+    /// Deadband, in chunk columns, applied around tier transitions. The last
+    /// rendered tier is retained while the camera oscillates inside this
+    /// margin so boundary crossings do not flicker between full detail,
+    /// fine LOD and coarse LOD.
+    pub transition_hysteresis_chunks: i32,
 }
 
 impl Default for LodConfig {
@@ -57,6 +62,7 @@ impl Default for LodConfig {
             fine_lod_radius: 32,
             coarse_lod_radius: 128,
             max_memory_bytes: 64 * 1024 * 1024,
+            transition_hysteresis_chunks: 1,
         }
     }
 }
@@ -176,11 +182,180 @@ pub fn coarse_cells(fine: &[LodCell]) -> [LodCell; LOD_COARSE * LOD_COARSE] {
     out
 }
 
+/// How a fine 16x16 summary is reduced to a coarse 4x4 footprint summary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LodDownsampleMode {
+    /// Historical maximum-height reduction. This exactly matches
+    /// `summarize_column(..., LOD_COARSE, ...)` and remains the wire/default
+    /// compatibility mode.
+    #[default]
+    Legacy,
+    /// Prominence-aware reduction used by the seamless renderer: narrow,
+    /// low-prominence spikes do not smear across a whole 4x4 footprint,
+    /// while broad roofs, tall landmarks, water surfaces and bright
+    /// emissive blocks remain visible at distance.
+    Faithful,
+}
+
+fn emissive_lod_cell(cell: LodCell) -> bool {
+    cell.light & 0x0f >= 12
+}
+
+/// Prominence-aware coarse reduction. A spike is suppressed only when it is
+/// narrow (fewer than three mutually supporting fine cells), moderately
+/// taller than the neighborhood median (three to nine blocks), and not a
+/// bright emissive block. Taller spikes remain as landmarks, broad roofs
+/// remain through their support count, and contiguous water/terrain surfaces
+/// remain through the median-high contour.
+pub fn coarse_cells_faithful(fine: &[LodCell]) -> [LodCell; LOD_COARSE * LOD_COARSE] {
+    debug_assert_eq!(fine.len(), LOD_FINE * LOD_FINE);
+    let foot = LOD_FINE / LOD_COARSE;
+    let mut out = [LodCell::EMPTY; LOD_COARSE * LOD_COARSE];
+    for cz in 0..LOD_COARSE {
+        for cx in 0..LOD_COARSE {
+            let mut cells = [LodCell::EMPTY; 16];
+            for bz in 0..foot {
+                for bx in 0..foot {
+                    cells[bz * foot + bx] = fine[(cz * foot + bz) * LOD_FINE + cx * foot + bx];
+                }
+            }
+            let mut heights: Vec<i16> = cells
+                .iter()
+                .copied()
+                .filter(|cell| !cell.is_empty())
+                .map(|cell| cell.top_y)
+                .collect();
+            if heights.is_empty() {
+                out[cz * LOD_COARSE + cx] = LodCell::EMPTY;
+                continue;
+            }
+            heights.sort_unstable();
+            let median = heights[heights.len() / 2];
+            let best = cells
+                .iter()
+                .copied()
+                .filter(|cell| !cell.is_empty())
+                .max_by_key(|cell| (cell.top_y, cell.state_id))
+                .unwrap_or(LodCell::EMPTY);
+            let support = cells
+                .iter()
+                .copied()
+                .filter(|cell| !cell.is_empty() && cell.top_y >= best.top_y.saturating_sub(2))
+                .count();
+            let prominence = i32::from(best.top_y) - i32::from(median);
+            let isolated_small_spike =
+                (3..10).contains(&prominence) && support < 3 && !emissive_lod_cell(best);
+            let selected = if isolated_small_spike {
+                let spike_floor = best.top_y.saturating_sub(1);
+                cells
+                    .iter()
+                    .copied()
+                    .filter(|cell| {
+                        !cell.is_empty() && (cell.top_y < spike_floor || emissive_lod_cell(*cell))
+                    })
+                    .max_by_key(|cell| (cell.top_y, cell.state_id))
+                    .unwrap_or(best)
+            } else {
+                best
+            };
+            out[cz * LOD_COARSE + cx] = selected;
+        }
+    }
+    out
+}
+
+/// Reduce `fine` with the selected mode.
+pub fn coarse_cells_with_mode(
+    fine: &[LodCell],
+    mode: LodDownsampleMode,
+) -> [LodCell; LOD_COARSE * LOD_COARSE] {
+    match mode {
+        LodDownsampleMode::Legacy => coarse_cells(fine),
+        LodDownsampleMode::Faithful => coarse_cells_faithful(fine),
+    }
+}
+
+/// Drop-skirt depth in blocks for the four horizontal sides of one LOD cell.
+/// Depths are conservative, saturated at 32 blocks, and boundary sides carry
+/// at least a one-block skirt so the transition into full-detail terrain has
+/// no sky crack while the neighboring mesh streams in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LodSkirtDepth {
+    pub neg_x: u8,
+    pub pos_x: u8,
+    pub neg_z: u8,
+    pub pos_z: u8,
+}
+
+impl LodSkirtDepth {
+    pub const NONE: Self = Self {
+        neg_x: 0,
+        pos_x: 0,
+        neg_z: 0,
+        pos_z: 0,
+    };
+    pub const MAX_DEPTH: u8 = 32;
+
+    pub fn max_depth(self) -> u8 {
+        self.neg_x.max(self.pos_x).max(self.neg_z).max(self.pos_z)
+    }
+}
+
+/// Compute per-cell drop skirts for an `edge * edge` x-fastest, z-major LOD
+/// grid. A high cell skirts toward lower or empty neighbors; edge cells use
+/// the nearest interior column as the continuation estimate and always keep
+/// a one-block seam-overlap skirt.
+pub fn compute_cell_skirts(cells: &[LodCell], edge: usize) -> Vec<LodSkirtDepth> {
+    assert!(edge > 0 && cells.len() == edge * edge);
+    let at = |x: isize, z: isize| -> Option<LodCell> {
+        if x >= 0 && z >= 0 && (x as usize) < edge && (z as usize) < edge {
+            Some(cells[z as usize * edge + x as usize])
+        } else {
+            None
+        }
+    };
+    let mut out = vec![LodSkirtDepth::NONE; cells.len()];
+    for z in 0..edge {
+        for x in 0..edge {
+            let cell = cells[z * edge + x];
+            if cell.is_empty() {
+                continue;
+            }
+            let mut depths = [0u8; 4];
+            for (side, (dx, dz)) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)]
+                .iter()
+                .enumerate()
+            {
+                let xi = x as isize;
+                let zi = z as isize;
+                let neighbor = at(xi + dx, zi + dz);
+                let boundary = neighbor.is_none();
+                let estimate = neighbor.or_else(|| at(xi - dx, zi - dz)).unwrap_or(cell);
+                let depth = if estimate.is_empty() {
+                    LodSkirtDepth::MAX_DEPTH
+                } else {
+                    (i32::from(cell.top_y) - i32::from(estimate.top_y))
+                        .clamp(0, i32::from(LodSkirtDepth::MAX_DEPTH)) as u8
+                };
+                depths[side] = if boundary { depth.max(1) } else { depth };
+            }
+            out[z * edge + x] = LodSkirtDepth {
+                neg_x: depths[0],
+                pos_x: depths[1],
+                neg_z: depths[2],
+                pos_z: depths[3],
+            };
+        }
+    }
+    out
+}
+
 /// Store of summarized LOD columns with distance-tiered drawing and a strict
 /// memory budget. Single-threaded; no interior locking.
 pub struct LodManager {
     config: LodConfig,
     entries: HashMap<(i32, i32), LodEntry>,
+    last_tiers: HashMap<(i32, i32), LodTier>,
     memory_bytes: usize,
     evictions: u64,
     tick: u64,
@@ -201,6 +376,7 @@ impl LodManager {
         Self {
             config,
             entries: HashMap::new(),
+            last_tiers: HashMap::new(),
             memory_bytes: 0,
             evictions: 0,
             tick: 0,
@@ -309,6 +485,7 @@ impl LodManager {
         match self.entries.remove(&(cx, cz)) {
             Some(entry) => {
                 self.memory_bytes -= entry_bytes(&entry);
+                self.last_tiers.remove(&(cx, cz));
                 true
             }
             None => false,
@@ -335,6 +512,17 @@ impl LodManager {
         self.fine_cells(cx, cz).map(|cells| coarse_cells(&cells))
     }
 
+    /// Coarse-resolution cells reduced with `mode`.
+    pub fn coarse_cells_with_mode(
+        &self,
+        cx: i32,
+        cz: i32,
+        mode: LodDownsampleMode,
+    ) -> Option<[LodCell; LOD_COARSE * LOD_COARSE]> {
+        self.fine_cells(cx, cz)
+            .map(|cells| coarse_cells_with_mode(&cells, mode))
+    }
+
     /// Columns that should be drawn as LOD this frame, sorted by ascending
     /// distance then coordinates for deterministic output. `loaded_full`
     /// holds the chunk columns currently rendered at full detail; stored
@@ -347,19 +535,70 @@ impl LodManager {
         camera: (i32, i32),
         loaded_full: &HashSet<(i32, i32)>,
     ) -> Vec<LodDrawColumn> {
+        let mut out = self.collect_active_lod_columns(camera, loaded_full);
+        out.sort_by_key(|c| (chebyshev(camera, c.cx, c.cz), c.cx, c.cz));
+        out
+    }
+
+    /// Velocity-aware variant of [`LodManager::active_lod_columns`]. Columns
+    /// inside the forward movement cone (`dot >= 0.5`) are ordered before
+    /// trailing columns; within each class ordering remains distance then
+    /// coordinates, so ties and zero velocity are fully deterministic.
+    pub fn active_lod_columns_with_velocity(
+        &mut self,
+        camera: (i32, i32),
+        vel_xz: (f32, f32),
+        loaded_full: &HashSet<(i32, i32)>,
+    ) -> Vec<LodDrawColumn> {
+        let mut out = self.collect_active_lod_columns(camera, loaded_full);
+        let speed = vel_xz.0.hypot(vel_xz.1);
+        if !speed.is_finite() || speed <= 1.0e-4 {
+            out.sort_by_key(|c| (chebyshev(camera, c.cx, c.cz), c.cx, c.cz));
+            return out;
+        }
+        let dir = (f64::from(vel_xz.0 / speed), f64::from(vel_xz.1 / speed));
+        let in_forward_cone = |column: &LodDrawColumn| {
+            let dx = f64::from(column.cx) - f64::from(camera.0);
+            let dz = f64::from(column.cz) - f64::from(camera.1);
+            let len = dx.hypot(dz);
+            len > 0.0 && (dx * dir.0 + dz * dir.1) / len >= 0.5
+        };
+        out.sort_by_key(|c| {
+            (
+                !in_forward_cone(c),
+                chebyshev(camera, c.cx, c.cz),
+                c.cx,
+                c.cz,
+            )
+        });
+        out
+    }
+
+    fn collect_active_lod_columns(
+        &mut self,
+        camera: (i32, i32),
+        loaded_full: &HashSet<(i32, i32)>,
+    ) -> Vec<LodDrawColumn> {
         self.camera = camera;
         self.fine_drawn = 0;
         self.coarse_drawn = 0;
         self.skipped_full_detail = 0;
         let mut out = Vec::new();
-        for &(cx, cz) in self.entries.keys() {
-            match self.tier_at(camera, cx, cz) {
-                LodTier::Culled => {}
+        let keys: Vec<(i32, i32)> = self.entries.keys().copied().collect();
+        for (cx, cz) in keys {
+            let raw_tier = self.tier_at(camera, cx, cz);
+            let tier = self.tier_with_hysteresis(camera, cx, cz, raw_tier);
+            match tier {
+                LodTier::Culled => {
+                    self.last_tiers.insert((cx, cz), LodTier::Culled);
+                }
                 LodTier::FullDetail => {
                     if loaded_full.contains(&(cx, cz)) {
                         self.skipped_full_detail += 1;
+                        self.last_tiers.insert((cx, cz), LodTier::FullDetail);
                     } else {
                         self.fine_drawn += 1;
+                        self.last_tiers.insert((cx, cz), LodTier::Fine);
                         out.push(LodDrawColumn {
                             cx,
                             cz,
@@ -369,6 +608,7 @@ impl LodManager {
                 }
                 LodTier::Fine => {
                     self.fine_drawn += 1;
+                    self.last_tiers.insert((cx, cz), LodTier::Fine);
                     out.push(LodDrawColumn {
                         cx,
                         cz,
@@ -377,6 +617,7 @@ impl LodManager {
                 }
                 LodTier::Coarse => {
                     self.coarse_drawn += 1;
+                    self.last_tiers.insert((cx, cz), LodTier::Coarse);
                     out.push(LodDrawColumn {
                         cx,
                         cz,
@@ -385,8 +626,35 @@ impl LodManager {
                 }
             }
         }
-        out.sort_by_key(|c| (chebyshev(camera, c.cx, c.cz), c.cx, c.cz));
         out
+    }
+
+    fn tier_with_hysteresis(&self, camera: (i32, i32), cx: i32, cz: i32, raw: LodTier) -> LodTier {
+        let Some(previous) = self.last_tiers.get(&(cx, cz)).copied() else {
+            return raw;
+        };
+        let distance = chebyshev(camera, cx, cz);
+        let hysteresis = i64::from(self.config.transition_hysteresis_chunks.max(0));
+        let full = i64::from(self.config.full_detail_radius);
+        let fine = i64::from(self.config.fine_lod_radius);
+        let coarse = i64::from(self.config.coarse_lod_radius);
+        match (previous, raw) {
+            // Crossing outward is delayed until the camera clears the old
+            // radius plus the margin; crossing inward is delayed until it
+            // clears the radius minus the margin. The two deadbands overlap,
+            // so boundary oscillation cannot alternate tiers every frame.
+            (LodTier::FullDetail, LodTier::Fine) if distance <= full + hysteresis => {
+                LodTier::FullDetail
+            }
+            (LodTier::Fine, LodTier::FullDetail) if distance > full - hysteresis => LodTier::Fine,
+            (LodTier::Fine, LodTier::Coarse) if distance <= fine + hysteresis => LodTier::Fine,
+            (LodTier::Coarse, LodTier::Fine) if distance > fine - hysteresis => LodTier::Coarse,
+            (LodTier::Coarse, LodTier::Culled) if distance <= coarse + hysteresis => {
+                LodTier::Coarse
+            }
+            (LodTier::Culled, LodTier::Coarse) if distance > coarse - hysteresis => LodTier::Culled,
+            _ => raw,
+        }
     }
 
     /// Evict farthest-then-oldest columns until the stored bytes fit
@@ -413,6 +681,7 @@ impl LodManager {
             };
             if let Some(entry) = self.entries.remove(&key) {
                 self.memory_bytes -= entry_bytes(&entry);
+                self.last_tiers.remove(&key);
                 self.evictions += 1;
             }
         }
@@ -519,6 +788,163 @@ mod tests {
         section
     }
 
+    fn synthetic_cell(state_id: u32, top_y: i16, light: u8) -> LodCell {
+        let mut cell = LodCell::EMPTY;
+        cell.state_id = state_id;
+        cell.top_y = top_y;
+        cell.light = light;
+        cell
+    }
+
+    fn flat_fine_cells(state_id: u32, top_y: i16) -> Vec<LodCell> {
+        vec![synthetic_cell(state_id, top_y, 0); LOD_FINE * LOD_FINE]
+    }
+
+    #[test]
+    fn hysteresis_prevents_fine_coarse_boundary_flicker() {
+        let mut lod = LodManager::new(LodConfig {
+            full_detail_radius: 0,
+            fine_lod_radius: 2,
+            coarse_lod_radius: 6,
+            max_memory_bytes: usize::MAX,
+            transition_hysteresis_chunks: 1,
+        });
+        let section = column_with_top(7, 9);
+        let views = [section.view()];
+        assert!(lod.insert_column(4, 0, &views));
+        let loaded = HashSet::new();
+        let tier_at = |lod: &mut LodManager, camera_x| {
+            lod.active_lod_columns((camera_x, 0), &loaded)
+                .iter()
+                .find(|column| (column.cx, column.cz) == (4, 0))
+                .map(|column| column.tier)
+        };
+
+        assert_eq!(tier_at(&mut lod, 0), Some(LodTier::Coarse));
+        // Distance 3 is inside the coarse-side deadband of the fine radius.
+        assert_eq!(tier_at(&mut lod, 1), Some(LodTier::Coarse));
+        // Distance 1 crosses fully through the deadband and becomes fine.
+        assert_eq!(tier_at(&mut lod, 3), Some(LodTier::Fine));
+        // Moving back across the boundary by one chunk stays fine instead
+        // of alternating every frame.
+        assert_eq!(tier_at(&mut lod, 1), Some(LodTier::Fine));
+        // Clearing the outward deadband finally permits coarse again.
+        assert_eq!(tier_at(&mut lod, 0), Some(LodTier::Coarse));
+    }
+
+    #[test]
+    fn velocity_ordering_prefers_forward_cone_with_deterministic_ties() {
+        let config = LodConfig {
+            full_detail_radius: 0,
+            fine_lod_radius: 32,
+            coarse_lod_radius: 64,
+            max_memory_bytes: usize::MAX,
+            transition_hysteresis_chunks: 0,
+        };
+        let mut lod = LodManager::new(config);
+        let section = column_with_top(7, 9);
+        let views = [section.view()];
+        for coord in [(5, 0), (-1, 0), (0, 5)] {
+            assert!(lod.insert_column(coord.0, coord.1, &views));
+        }
+        let loaded = HashSet::new();
+        let still = lod.active_lod_columns((0, 0), &loaded);
+        assert_eq!((still[0].cx, still[0].cz), (-1, 0));
+
+        let moving = lod.active_lod_columns_with_velocity((0, 0), (1.0, 0.0), &loaded);
+        assert_eq!(
+            (moving[0].cx, moving[0].cz),
+            (5, 0),
+            "forward +X columns precede a nearer trailing column"
+        );
+        assert_eq!(
+            moving,
+            lod.active_lod_columns_with_velocity((0, 0), (1.0, 0.0), &loaded)
+        );
+        let zero = lod.active_lod_columns_with_velocity((0, 0), (0.0, 0.0), &loaded);
+        assert_eq!(
+            zero.iter().map(|c| (c.cx, c.cz)).collect::<Vec<_>>(),
+            still.iter().map(|c| (c.cx, c.cz)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn faithful_downsample_suppresses_small_spike_but_keeps_roof() {
+        let mut fine = flat_fine_cells(10, 64);
+        // One fence/leaf-like protrusion in the first 4x4 coarse footprint.
+        fine[1] = synthetic_cell(99, 68, 0);
+        assert_eq!(coarse_cells(&fine)[0].state_id, 99);
+        let faithful = coarse_cells_faithful(&fine);
+        assert_eq!(faithful[0].state_id, 10);
+        assert_eq!(faithful[0].top_y, 64);
+
+        // A broad roof has three mutually supporting high cells and must
+        // survive the same prominence filter.
+        let mut roof = flat_fine_cells(10, 64);
+        for index in [1, 2, 17] {
+            roof[index] = synthetic_cell(20, 68, 0);
+        }
+        assert_eq!(coarse_cells_faithful(&roof)[0].state_id, 20);
+        assert_eq!(coarse_cells_faithful(&roof)[0].top_y, 68);
+    }
+
+    #[test]
+    fn faithful_downsample_preserves_landmarks_water_and_emissive_blocks() {
+        // Tall narrow towers are landmarks, not small-shape noise.
+        let mut tower = flat_fine_cells(10, 64);
+        tower[1] = synthetic_cell(30, 76, 0);
+        assert_eq!(coarse_cells_faithful(&tower)[0].state_id, 30);
+
+        // Bright emissive blocks stay visible even when geometrically narrow.
+        let mut beacon = flat_fine_cells(10, 64);
+        beacon[1] = synthetic_cell(40, 68, 12);
+        assert_eq!(coarse_cells_faithful(&beacon)[0].state_id, 40);
+
+        // A contiguous raised water surface has broad support and survives.
+        let mut water = flat_fine_cells(10, 60);
+        for index in [0, 1, 16, 17] {
+            let mut cell = synthetic_cell(50, 64, 0);
+            cell.tint = 0x3f76e4;
+            water[index] = cell;
+        }
+        let selected = coarse_cells_faithful(&water)[0];
+        assert_eq!(selected.state_id, 50);
+        assert_eq!(selected.tint, 0x3f76e4);
+
+        // Median-high rolling terrain remains representative instead of
+        // collapsing to the lowest or noisiest cell.
+        let mut terrain = flat_fine_cells(10, 64);
+        for z in 0..4 {
+            for x in 0..4 {
+                terrain[z * LOD_FINE + x].top_y = 64 + ((x + z) % 5) as i16;
+            }
+        }
+        let selected = coarse_cells_faithful(&terrain)[0];
+        assert!((66..=68).contains(&selected.top_y));
+    }
+
+    #[test]
+    fn cliff_and_boundary_skirts_are_conservative() {
+        let mut cells = vec![LodCell::EMPTY; 4];
+        cells[0] = synthetic_cell(1, 10, 0);
+        cells[1] = synthetic_cell(2, 20, 0);
+        let skirts = compute_cell_skirts(&cells, 2);
+        assert_eq!(
+            skirts[1].neg_x, 10,
+            "high cliff side drops to the lower neighbor"
+        );
+        assert!(
+            skirts[1].pos_x >= 1 && skirts[1].neg_z >= 1,
+            "outer LOD/full-detail seams carry at least a one-block overlap"
+        );
+        assert_eq!(
+            skirts[1].pos_z,
+            LodSkirtDepth::MAX_DEPTH,
+            "an empty neighboring column is a conservative full drop"
+        );
+        assert_eq!(skirts[0].pos_x, 0, "low cells never skirt upward");
+    }
+
     #[test]
     fn tier_boundaries_and_full_detail_handoff() {
         let config = LodConfig {
@@ -526,6 +952,7 @@ mod tests {
             fine_lod_radius: 4,
             coarse_lod_radius: 8,
             max_memory_bytes: usize::MAX,
+            transition_hysteresis_chunks: 0,
         };
         let mut lod = LodManager::new(config);
         let section = column_with_top(7, 9);
@@ -576,6 +1003,7 @@ mod tests {
             fine_lod_radius: 100,
             coarse_lod_radius: 200,
             max_memory_bytes: usize::MAX,
+            transition_hysteresis_chunks: 0,
         };
         let mut lod = LodManager::new(config);
         assert!(lod.insert_column(4, -2, &views));
@@ -606,6 +1034,7 @@ mod tests {
             fine_lod_radius: 1_000,
             coarse_lod_radius: 2_000,
             max_memory_bytes: usize::MAX,
+            transition_hysteresis_chunks: 0,
         });
         lod.insert_column(0, 0, &views);
         let one_entry = lod.stats().memory_bytes;
@@ -616,6 +1045,7 @@ mod tests {
             fine_lod_radius: 1_000,
             coarse_lod_radius: 2_000,
             max_memory_bytes: cap,
+            transition_hysteresis_chunks: 0,
         });
         // Camera defaults to (0,0): (50,0) is farthest, (10,0) mid, (1,0) near.
         assert!(lod.insert_column(1, 0, &views));
@@ -635,6 +1065,7 @@ mod tests {
             fine_lod_radius: 1_000,
             coarse_lod_radius: 2_000,
             max_memory_bytes: one_entry - 1,
+            transition_hysteresis_chunks: 0,
         });
         assert!(!tiny.insert_column(0, 0, &views));
         assert_eq!(tiny.stats().stored_columns, 0);
