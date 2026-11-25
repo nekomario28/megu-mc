@@ -196,10 +196,27 @@ impl FaceVisibility {
     /// uniform sections.
     pub fn compute(blocks: &[Block; SECTION_CELLS]) -> Self {
         let mut opaque = VoxelBitset4096::new();
-        for (index, &block) in blocks.iter().enumerate() {
-            if blocks_sight(block) {
-                opaque.set(index as u16);
+        let mut any_open = false;
+        let mut any_closed = false;
+        let mut states = [0u16; 64];
+        for (w, chunk) in blocks.as_chunks::<64>().0.iter().enumerate() {
+            for (i, &block) in chunk.iter().enumerate() {
+                states[i] = u16::from(blocks_sight(block));
             }
+            let mut m = megu_core::simd_voxel::build_non_air_bitmask_64(&states);
+            any_closed |= m != 0;
+            any_open |= m != u64::MAX;
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                opaque.set((w * 64 + bit) as u16);
+                m &= m - 1;
+            }
+        }
+        if !any_open {
+            return Self::NONE;
+        }
+        if !any_closed {
+            return Self::ALL;
         }
         Self::from_vis_bits(compute_section_visibility(&opaque))
     }
