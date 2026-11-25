@@ -1747,8 +1747,8 @@ impl SubLevelPhysicsBackend for BuiltinContactSolver {
             // along the contact normal — capped per contact so a deeply
             // embedded voxel recovers over substeps, not explosively.
             let corr = depth.min(self.max_depenetration).max(0.0) * self.depenetration;
-            for i in 0..3 {
-                ship.pos[i] = sanitize(ship.pos[i] + normal[i] * corr);
+            for (pos, &n) in ship.pos.iter_mut().zip(&normal) {
+                *pos = sanitize(*pos + n * corr);
             }
         }
 
@@ -1787,9 +1787,11 @@ impl SubLevelPhysicsBackend for BuiltinContactSolver {
             // Positional depenetration split by inverse mass.
             let share = inv_m / (inv_m + inv_mo);
             let corr = depth.min(self.max_depenetration).max(0.0) * self.depenetration;
-            for i in 0..3 {
-                ship.pos[i] = sanitize(ship.pos[i] + normal[i] * corr * share);
-                other.pos[i] = sanitize(other.pos[i] - normal[i] * corr * (1.0 - share));
+            for ((pos, other_pos), &n) in
+                ship.pos.iter_mut().zip(other.pos.iter_mut()).zip(&normal)
+            {
+                *pos = sanitize(*pos + n * corr * share);
+                *other_pos = sanitize(*other_pos - n * corr * (1.0 - share));
             }
         }
 

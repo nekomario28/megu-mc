@@ -1949,9 +1949,9 @@ fn container_player_inventory_uses_non_overlapping_vanilla_slot_pitches() {
             for bar in durability_bars {
                 assert!(
                     player_slots.iter().any(|slot| {
-                        bar.x >= slot.rect.x + 1
+                        bar.x > slot.rect.x
                             && bar.y == slot.rect.bottom() - 4
-                            && bar.right() <= slot.rect.right() - 1
+                            && bar.right() < slot.rect.right()
                             && bar.bottom() <= slot.rect.bottom()
                     }),
                     "{context}: durability bar escapes its slot: {bar:?}"

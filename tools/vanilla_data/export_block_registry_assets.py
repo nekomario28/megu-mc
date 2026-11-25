@@ -130,7 +130,6 @@ def export_assets(jar, blocks_json, out_dir):
                   probe_source("block-state-facts-oracle/BlockStateFactsOracle.java",
                                "BlockStateFactsOracle.java"),
                   "dev.megu.tools.BlockStateFactsOracle", facts_out)
-        rows = facts_out.read_text().splitlines()
         # Reuse the facts encoder indirectly: it is keyed through the same native/wire
         # translation as the predicate encoder, but its row format is six columns.
         from block_state_facts_from_jar import encode as encode_facts
