@@ -44,8 +44,34 @@ class ProbeBoundary(unittest.TestCase):
                 self.assertEqual(error.exception.errno, errno.ENOSPC)
                 write.assert_not_called()
 
+    def test_jre_only_multi_source_probe_fails_before_launching_java(self):
+        def which(tool):
+            return "/runtime/bin/java" if tool == "java" else None
+
+        with patch.object(native.shutil, "which", side_effect=which), \
+                patch.object(native.subprocess, "run") as run:
+            with self.assertRaisesRegex(OSError, "JDK.*multi-source"):
+                native.run_probe(Path("/work"), "classpath", Path("Probe.java"), "Main", "out",
+                                 extra_sources=[Path("Tags.java")])
+        run.assert_not_called()
+
+    def test_jre_only_single_source_probe_uses_source_file_mode(self):
+        def which(tool):
+            return "/runtime/bin/java" if tool == "java" else None
+
+        with patch.object(native.shutil, "which", side_effect=which), \
+                patch.object(native.subprocess, "run") as run:
+            native.run_probe(Path("/work"), "classpath", Path("Probe.java"), "Main", "out")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0],
+                         ["java", "-Xmx768m", "-cp", "classpath", "Probe.java", "out"])
+
     def test_shared_native_helpers_are_compiled_with_the_probe(self):
-        with patch.object(native.subprocess, "run") as run:
+        def which(tool):
+            return f"/jdk/bin/{tool}" if tool in ("java", "javac") else None
+
+        with patch.object(native.shutil, "which", side_effect=which), \
+                patch.object(native.subprocess, "run") as run:
             native.run_probe(Path("/work"), "classpath", Path("Probe.java"), "Main", "out",
                              extra_sources=[Path("Tags.java")])
         self.assertEqual(run.call_count, 2)

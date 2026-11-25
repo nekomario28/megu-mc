@@ -45,12 +45,31 @@ def pinned_runtime(jar):
         yield work, os.pathsep.join(map(str, jars)), inner
 
 
+def require_jdk(purpose):
+    missing = [tool for tool in ("java", "javac") if shutil.which(tool) is None]
+    if missing:
+        raise OSError(
+            f"a JDK is required for {purpose} (missing {', '.join(missing)} on PATH): "
+            "the pinned Java 21 runtime's source-file launcher compiles only one source file; "
+            "install a JDK or put both java and javac on PATH"
+        )
+
+
+def require_java_runtime():
+    if shutil.which("java") is None:
+        raise OSError("a Java runtime is required for Java probes: missing java on PATH")
+
+
 def run_probe(work, classpath, source, main, *args, extra_sources=(), capture=False):
     """Compile and run one probe. `capture=True` returns its stdout instead of echoing it.
 
     The native oracle runners need the probe's lines to validate and store them, and a
     subprocess that writes straight to our stdout cannot be parsed afterwards.
     """
+    if extra_sources:
+        require_jdk("multi-source Java probes")
+    else:
+        require_java_runtime()
     if shutil.which("javac"):
         subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source),
                         *map(str, extra_sources)],
@@ -58,8 +77,6 @@ def run_probe(work, classpath, source, main, *args, extra_sources=(), capture=Fa
         command = ["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
                    main, *map(str, args)]
     else:
-        if extra_sources:
-            raise OSError("a JDK is required for multi-source Java probes")
         # Single-source probes can still run through the java launcher in
         # source-file mode. This keeps first-run data generation working on
         # installations that expose java without a separate javac executable;

@@ -4,7 +4,9 @@
 The block topology/gameplay metadata input (`blocks_1211.json`) is the pinned MIT
 PrismarineJS minecraft-data file documented in NOTICE/THIRD_PARTY.md. Every binary
 physical-fact table is measured from the user's own pinned vanilla server jar at install
-time; no generated output is committed.
+time; no generated output is committed. The complete pack needs a JDK with both java
+and javac on PATH: the mineshaft support probe is multi-source, and the pinned Java 21
+runtime's source-file launcher cannot compile that shape without javac.
 
 Usage:
   export_block_registry_assets.py --jar server.jar --blocks-json blocks.json --out-dir assets
@@ -15,9 +17,7 @@ import io
 import json
 import os
 from pathlib import Path
-import shutil
 import sys
-import tempfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
@@ -25,7 +25,7 @@ for candidate in (HERE, HERE.parent):
     if str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
-from vanilla_java import JAR_SHA1, pinned_runtime, run_probe  # noqa: E402
+from vanilla_java import JAR_SHA1, pinned_runtime, require_jdk, run_probe  # noqa: E402
 from block_predicate_oracle import encode as encode_predicates  # noqa: E402
 from structure_transform_oracle import encode as encode_transforms  # noqa: E402
 
@@ -106,6 +106,7 @@ def extract_templates(inner, target):
 
 
 def export_assets(jar, blocks_json, out_dir):
+    require_jdk("block registry asset generation")
     raw_blocks = blocks_json.read_bytes()
     blocks = validate_blocks(raw_blocks)
     if hashlib.sha1(jar.read_bytes()).hexdigest() != JAR_SHA1:

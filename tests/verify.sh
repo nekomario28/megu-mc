@@ -62,6 +62,7 @@ python3 tests/sculk_gate_test.py
 python3 tests/carve_agent_build_test.py
 python3 tests/java_toolchain_test.py
 python3 tests/vanilla_java_test.py
+python3 tests/export_block_registry_assets_test.py
 python3 tests/forest_stage_check_test.py
 python3 tests/container_oracle_test.py
 python3 tests/surface_oracle_test.py
