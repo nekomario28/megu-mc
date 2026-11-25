@@ -221,16 +221,32 @@ pub fn resolve_server_bin(explicit: Option<&Path>) -> Result<PathBuf, String> {
 
 /// Return the runtime payload pieces missing from `dir`, in the fixed order
 /// used by user-facing diagnostics.
-fn missing_runtime_root_parts(dir: &Path) -> Vec<&'static str> {
+const REQUIRED_RUNTIME_ASSETS: [&str; 10] = [
+    "block_states_1211.json",
+    "blocks_1211.json",
+    "block_predicates_1211.bin",
+    "block_state_facts_1211.bin",
+    "collision_shape_full_1211.bin",
+    "mineshaft_support_1211.bin",
+    "multiface_support_1211.bin",
+    "structure_state_transforms_1211.bin",
+    "template_solid_1211.bin",
+    "feature_order_1211.json",
+];
+
+fn missing_runtime_root_parts(dir: &Path) -> Vec<String> {
     let mut missing = Vec::new();
     if !dir.join("config_packets.bin").is_file() {
-        missing.push("config_packets.bin");
+        missing.push("config_packets.bin".to_string());
     }
     if !dir.join("datapacks").is_dir() {
-        missing.push("datapacks/");
+        missing.push("datapacks/".to_string());
     }
-    if !dir.join("assets/block_states_1211.json").is_file() {
-        missing.push("assets/block_states_1211.json");
+    for name in REQUIRED_RUNTIME_ASSETS {
+        let rel = format!("assets/{name}");
+        if !dir.join(&rel).is_file() {
+            missing.push(rel);
+        }
     }
     missing
 }
@@ -282,7 +298,7 @@ fn find_runtime_root(server_bin: &Path, game_dir: &Path) -> Option<PathBuf> {
 
 fn runtime_root_error(server_bin: &Path, game_dir: &Path) -> String {
     let mut error = format!(
-        "could not find a complete megu runtime root for server '{}' in game dir '{}'; required: config_packets.bin, datapacks/, assets/block_states_1211.json",
+        "could not find a complete megu runtime root for server '{}' in game dir '{}'; required: config_packets.bin, datapacks/, and the complete assets/*_1211 block-registry pack",
         server_bin.display(),
         game_dir.display()
     );
@@ -624,7 +640,9 @@ mod tests {
 
     fn write_complete_runtime(root: &Path) {
         fs::create_dir_all(root.join("assets")).unwrap();
-        fs::write(root.join("assets").join("block_states_1211.json"), b"{}").unwrap();
+        for name in REQUIRED_RUNTIME_ASSETS {
+            fs::write(root.join("assets").join(name), b"{}").unwrap();
+        }
         fs::write(root.join("config_packets.bin"), b"cfg").unwrap();
         fs::create_dir_all(root.join("datapacks").join("vanilla")).unwrap();
         fs::write(
@@ -732,7 +750,7 @@ mod tests {
         assert!(error.contains("assets/block_states_1211.json"));
         assert!(error.contains(&bin_dir.display().to_string()));
         assert!(error.contains("megu-runtime"));
-        assert!(error.contains("missing datapacks/, assets/block_states_1211.json"));
+        assert!(error.contains("missing datapacks/"));
         assert!(error.contains("incomplete roots are skipped"));
     }
 
@@ -755,7 +773,7 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("could not find a complete megu runtime root"));
-        assert!(error.contains("missing datapacks/, assets/block_states_1211.json"));
+        assert!(error.contains("missing datapacks/"));
         assert!(
             !game_dir.join("saves").exists(),
             "launch must fail before creating or spawning in the world directory"
@@ -823,9 +841,7 @@ mod tests {
         let bin = runtime.join("target").join("release").join("megu");
         fs::create_dir_all(bin.parent().unwrap()).unwrap();
         fs::write(&bin, b"stub").unwrap();
-        fs::create_dir_all(runtime.join("assets")).unwrap();
-        fs::write(runtime.join("assets").join("block_states_1211.json"), b"{}").unwrap();
-        fs::write(runtime.join("config_packets.bin"), b"cfg").unwrap();
+        write_complete_runtime(&runtime);
         fs::create_dir_all(runtime.join("datapacks").join("vanilla")).unwrap();
         fs::write(
             runtime.join("datapacks").join("vanilla").join("pack.mcmeta"),

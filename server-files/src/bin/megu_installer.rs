@@ -635,6 +635,9 @@ fn stage_into_mc_bin_dir(mc_dir: &std::path::Path, client_bin: &PathBuf) -> Opti
 const VANILLA_SERVER_SHA1: &str = "59353fb40c36d304f2035d51e7d6e6baa98dc05c";
 const VANILLA_SERVER_URL: &str =
     "https://piston-data.mojang.com/v1/objects/59353fb40c36d304f2035d51e7d6e6baa98dc05c/server.jar";
+const BLOCKS_JSON_SHA256: &str =
+    "7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654";
+const BLOCKS_JSON_URL: &str = "https://raw.githubusercontent.com/PrismarineJS/minecraft-data/d56346a4e32defcd28d9ba6750957c12001e78d6/data/pc/1.21.1/blocks.json";
 
 // These are Megu's own clean-room generator/checker sources, embedded by
 // reference (not copied) so the installer remains usable from a bare release
@@ -653,10 +656,37 @@ const VANILLA_STRUCTURE_ASSETS_PY: &str = include_str!("../../../tools/vanilla_s
 const BIOME_TREE_FROM_JAR_PY: &str = include_str!("../../../tools/biome_tree_from_jar.py");
 const BIOME_TREE_EXPORT_JAVA: &str = include_str!("../../../tools/biome-tree/ExportBiomeTree.java");
 const EXTRACT_JAVA: &str = include_str!("../../../tools/vanilla_data/Extract.java");
+const EXPORT_BLOCK_REGISTRY_ASSETS_PY: &str =
+    include_str!("../../../tools/vanilla_data/export_block_registry_assets.py");
+const BLOCK_PREDICATE_ORACLE_PY: &str = include_str!("../../../tools/block_predicate_oracle.py");
+const BLOCK_STATE_FACTS_FROM_JAR_PY: &str = include_str!("../../../tools/block_state_facts_from_jar.py");
+const STRUCTURE_TRANSFORM_ORACLE_PY: &str = include_str!("../../../tools/structure_transform_oracle.py");
+const BLOCK_PREDICATE_ORACLE_JAVA: &str =
+    include_str!("../../../tools/block-predicate-oracle/BlockPredicateOracle.java");
+const BLOCK_STATE_FACTS_ORACLE_JAVA: &str =
+    include_str!("../../../tools/block-state-facts-oracle/BlockStateFactsOracle.java");
+const MINESHAFT_SUPPORT_ORACLE_JAVA: &str =
+    include_str!("../../../tools/structure-oracle/MineshaftSupportOracle.java");
+const NATIVE_HARNESS_JAVA: &str = include_str!("../../../tools/structure-oracle/NativeHarness.java");
+const STRUCTURE_TEMPLATE_ORACLE_JAVA: &str =
+    include_str!("../../../tools/structure-oracle/StructureTemplateOracle.java");
+const STRUCTURE_TRANSFORM_ORACLE_JAVA: &str =
+    include_str!("../../../tools/structure-oracle/StructureTransformOracle.java");
+const FEATURE_ORDER_ORACLE_JAVA: &str =
+    include_str!("../../../tools/structure-oracle/FeatureOrderOracle.java");
 
-const RUNTIME_REQUIRED: [&str; 13] = [
+const RUNTIME_REQUIRED: [&str; 22] = [
     "config_packets.bin",
     "assets/block_states_1211.json",
+    "assets/blocks_1211.json",
+    "assets/block_predicates_1211.bin",
+    "assets/block_state_facts_1211.bin",
+    "assets/collision_shape_full_1211.bin",
+    "assets/mineshaft_support_1211.bin",
+    "assets/multiface_support_1211.bin",
+    "assets/structure_state_transforms_1211.bin",
+    "assets/template_solid_1211.bin",
+    "assets/feature_order_1211.json",
     "datapacks/vanilla/pack.mcmeta",
     "datapacks/vanilla/multi_noise_biome_tree.json",
     "datapacks/vanilla/structure-provenance.json",
@@ -760,6 +790,78 @@ fn pack_mcmeta_valid(path: &Path) -> bool {
         .is_some_and(|format| format == 48.0)
 }
 
+fn sha256_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = megu_core::crypto::Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
+}
+
+fn canonical_blocks_asset_valid(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(blocks) = megu_server_files::json::parse(&text) else {
+        return false;
+    };
+    let Some(blocks) = blocks.as_array() else {
+        return false;
+    };
+    if blocks.len() != 1060 {
+        return false;
+    }
+    let mut total = 0u64;
+    blocks.iter().all(|block| {
+        let required = ["id", "name", "hardness", "resistance", "stackSize", "defaultState", "minStateId", "maxStateId", "states", "drops"];
+        if required.iter().any(|key| block.get(key).is_none()) {
+            return false;
+        }
+        let Some(lo) = block.get("minStateId").and_then(Json::as_f64) else {
+            return false;
+        };
+        let Some(hi) = block.get("maxStateId").and_then(Json::as_f64) else {
+            return false;
+        };
+        if lo < 0.0 || hi < lo {
+            return false;
+        }
+        total += (hi - lo + 1.0) as u64;
+        true
+    }) && total == 26_684
+}
+
+fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    if rel == "assets/blocks_1211.json" {
+        return canonical_blocks_asset_valid(path);
+    }
+    let expected = match rel {
+        "assets/block_predicates_1211.bin"
+        | "assets/collision_shape_full_1211.bin"
+        | "assets/mineshaft_support_1211.bin"
+        | "assets/multiface_support_1211.bin"
+        | "assets/template_solid_1211.bin" => 26_684,
+        "assets/block_state_facts_1211.bin" => 26_684 * 6,
+        "assets/structure_state_transforms_1211.bin" => 26_684 * 12 * 4,
+        "assets/feature_order_1211.json" => return meta.len() > 2,
+        _ => return true,
+    };
+    meta.len() == expected
+}
+
 fn config_packets_valid(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|meta| meta.is_file() && meta.len() >= 1024)
@@ -776,6 +878,9 @@ fn runtime_path_present(root: &Path, rel: &str) -> bool {
         Ok(_) if rel == "config_packets.bin" => config_packets_valid(&path),
         Ok(meta) if rel == "datapacks/vanilla/pack.mcmeta" => {
             meta.is_file() && pack_mcmeta_valid(&path)
+        }
+        Ok(meta) if rel.starts_with("assets/") && (rel.ends_with(".json") || rel.ends_with(".bin")) => {
+            meta.is_file() && runtime_asset_file_valid(&path, rel)
         }
         Ok(meta) if rel.ends_with(".json") || rel.ends_with(".bin") => meta.is_file(),
         Ok(meta) => meta.is_dir(),
@@ -912,6 +1017,48 @@ fn acquire_vanilla_server_jar(cli: &Cli, runtime_cache: &Path) -> io::Result<Pat
     }
 }
 
+fn acquire_blocks_json(cli: &Cli, runtime_cache: &Path) -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os("MEGU_BLOCKS_JSON").map(PathBuf::from) {
+        let digest = sha256_file(&path)?;
+        if digest != BLOCKS_JSON_SHA256 {
+            return Err(invalid_runtime(format!(
+                "{} is not the pinned minecraft-data 1.21.1 blocks.json (sha256 {}, expected {})",
+                path.display(), digest, BLOCKS_JSON_SHA256
+            )));
+        }
+        return Ok(path);
+    }
+    let cache = runtime_cache.join("blocks-1.21.1.json");
+    if cache.is_file() {
+        if sha256_file(&cache)? == BLOCKS_JSON_SHA256 {
+            return Ok(cache);
+        }
+        return Err(invalid_runtime(format!(
+            "cached {} has the wrong sha256; remove/repair it explicitly",
+            cache.display()
+        )));
+    }
+    if !cli.download_vanilla_server {
+        return Err(invalid_runtime(
+            "pinned minecraft-data blocks.json is required for block-registry generation. Provide it with MEGU_BLOCKS_JSON or explicitly opt in with --download-vanilla-server",
+        ));
+    }
+    let part = runtime_cache.join(format!("blocks-1.21.1.json.part-{}", std::process::id()));
+    if download_release_file(BLOCKS_JSON_URL, &part).is_none() {
+        let _ = std::fs::remove_file(&part);
+        return Err(invalid_runtime("failed to download pinned minecraft-data blocks.json"));
+    }
+    let digest = sha256_file(&part)?;
+    if digest != BLOCKS_JSON_SHA256 {
+        let _ = std::fs::remove_file(&part);
+        return Err(invalid_runtime(format!(
+            "downloaded blocks.json sha256 {digest}, expected {BLOCKS_JSON_SHA256}"
+        )));
+    }
+    std::fs::rename(&part, &cache)?;
+    Ok(cache)
+}
+
 fn write_embedded_python_tools(dir: &Path) -> io::Result<PathBuf> {
     ensure_real_directory(dir)?;
     for (name, source) in [
@@ -925,6 +1072,17 @@ fn write_embedded_python_tools(dir: &Path) -> io::Result<PathBuf> {
         ("biome_tree_from_jar.py", BIOME_TREE_FROM_JAR_PY),
         ("ExportBiomeTree.java", BIOME_TREE_EXPORT_JAVA),
         ("Extract.java", EXTRACT_JAVA),
+        ("export_block_registry_assets.py", EXPORT_BLOCK_REGISTRY_ASSETS_PY),
+        ("block_predicate_oracle.py", BLOCK_PREDICATE_ORACLE_PY),
+        ("block_state_facts_from_jar.py", BLOCK_STATE_FACTS_FROM_JAR_PY),
+        ("structure_transform_oracle.py", STRUCTURE_TRANSFORM_ORACLE_PY),
+        ("BlockPredicateOracle.java", BLOCK_PREDICATE_ORACLE_JAVA),
+        ("BlockStateFactsOracle.java", BLOCK_STATE_FACTS_ORACLE_JAVA),
+        ("MineshaftSupportOracle.java", MINESHAFT_SUPPORT_ORACLE_JAVA),
+        ("NativeHarness.java", NATIVE_HARNESS_JAVA),
+        ("StructureTemplateOracle.java", STRUCTURE_TEMPLATE_ORACLE_JAVA),
+        ("StructureTransformOracle.java", STRUCTURE_TRANSFORM_ORACLE_JAVA),
+        ("FeatureOrderOracle.java", FEATURE_ORDER_ORACLE_JAVA),
     ] {
         let path = dir.join(name);
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
@@ -1002,6 +1160,18 @@ fn move_runtime_output(stage: &Path, root: &Path) -> io::Result<()> {
             "assets/block_states_1211.json",
         ),
         ("config_packets.bin", "config_packets.bin"),
+        ("assets/blocks_1211.json", "assets/blocks_1211.json"),
+        ("assets/block_predicates_1211.bin", "assets/block_predicates_1211.bin"),
+        ("assets/block_state_facts_1211.bin", "assets/block_state_facts_1211.bin"),
+        ("assets/collision_shape_full_1211.bin", "assets/collision_shape_full_1211.bin"),
+        ("assets/mineshaft_support_1211.bin", "assets/mineshaft_support_1211.bin"),
+        ("assets/multiface_support_1211.bin", "assets/multiface_support_1211.bin"),
+        (
+            "assets/structure_state_transforms_1211.bin",
+            "assets/structure_state_transforms_1211.bin",
+        ),
+        ("assets/template_solid_1211.bin", "assets/template_solid_1211.bin"),
+        ("assets/feature_order_1211.json", "assets/feature_order_1211.json"),
     ];
     for (from_rel, to_rel) in mappings {
         let from = stage.join(from_rel);
@@ -1068,6 +1238,23 @@ fn generate_runtime_data(cli: &Cli, root: &Path) -> io::Result<()> {
         .map(String::as_str)
         .collect::<Vec<_>>();
     run_python_script(&generator, &generator_arg_refs)?;
+
+    let blocks_json = acquire_blocks_json(cli, &runtime_cache)?;
+    let block_exporter = tools_dir.join("export_block_registry_assets.py");
+    let stage_assets = stage.join("assets");
+    let stage_assets_string = stage_assets.to_string_lossy().into_owned();
+    let blocks_string = blocks_json.to_string_lossy().into_owned();
+    run_python_script(
+        &block_exporter,
+        &[
+            "--jar",
+            &jar_string,
+            "--blocks-json",
+            &blocks_string,
+            "--out-dir",
+            &stage_assets_string,
+        ],
+    )?;
     let missing_before_capture = missing_runtime_data(&stage)
         .into_iter()
         .filter(|rel| *rel != "config_packets.bin")
@@ -1398,7 +1585,7 @@ ttk.Button(frame_d, text="Browse...", command=browse).pack(side="left", padx=(6,
 eula_var = tk.BooleanVar(value=False)
 ttk.Checkbutton(
     root,
-    text="I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server plus pinned CC0 mappings, then run the server locally once for runtime data",
+    text="I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server, pinned CC0 mappings and pinned MIT minecraft-data block metadata, then run the server locally once for runtime data",
     variable=eula_var,
     wraplength=460,
     justify="left",
@@ -1499,7 +1686,7 @@ $btnBrowse.Add_Click({
 $form.Controls.Add($btnBrowse)
 
 $chkEula = New-Object System.Windows.Forms.CheckBox
-$chkEula.Text = "I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server plus pinned CC0 mappings, then run the server locally once for runtime data"
+$chkEula.Text = "I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server, pinned CC0 mappings and pinned MIT minecraft-data block metadata, then run the server locally once for runtime data"
 $chkEula.Location = New-Object System.Drawing.Point(20, 230)
 $chkEula.Size = New-Object System.Drawing.Size(450, 42)
 $chkEula.Checked = $false
@@ -1860,6 +2047,33 @@ mod tests {
             }"#,
         )
         .unwrap();
+        let mut blocks = String::from("[");
+        let mut first = 0u32;
+        for id in 0..1060u32 {
+            let count = if id == 0 { 25_625 } else { 1 };
+            if id != 0 {
+                blocks.push(',');
+            }
+            blocks.push_str(&format!(
+                "{{\"id\":{id},\"name\":\"block{id}\",\"hardness\":1.0,\"resistance\":1.0,\"stackSize\":64,\"defaultState\":{first},\"minStateId\":{first},\"maxStateId\":{},\"states\":[],\"drops\":[]}}",
+                first + count - 1
+            ));
+            first += count;
+        }
+        blocks.push(']');
+        std::fs::write(root.join("assets/blocks_1211.json"), blocks).unwrap();
+        for (name, len) in [
+            ("block_predicates_1211.bin", 26_684usize),
+            ("block_state_facts_1211.bin", 26_684 * 6),
+            ("collision_shape_full_1211.bin", 26_684),
+            ("mineshaft_support_1211.bin", 26_684),
+            ("multiface_support_1211.bin", 26_684),
+            ("structure_state_transforms_1211.bin", 26_684 * 12 * 4),
+            ("template_solid_1211.bin", 26_684),
+        ] {
+            std::fs::write(root.join("assets").join(name), vec![0u8; len]).unwrap();
+        }
+        std::fs::write(root.join("assets/feature_order_1211.json"), br#"{"overworld":{}}"#).unwrap();
         std::fs::write(
             root.join("datapacks/vanilla/pack.mcmeta"),
             br#"{"pack":{"pack_format":48,"description":"test"}}"#,
