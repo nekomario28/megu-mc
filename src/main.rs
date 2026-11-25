@@ -1471,7 +1471,7 @@ fn environment_time_tick() {
                 b.dy = 0.0;
                 b.dz = 0.0;
                 let (luck, lure) = owner.map_or((0, 0), |client| fishing_enchant_levels(client));
-                let wait_roll = (b.eid.unsigned_abs() as u32).wrapping_mul(2654435761) % 501;
+                let wait_roll = b.eid.unsigned_abs().wrapping_mul(2654435761) % 501;
                 let wait = fishing_wait_ticks(lure, wait_roll);
                 let open_water = fishing_open_water(
                     dim,
@@ -6208,9 +6208,11 @@ fn live_mob_tick_dimension(
         players,
         dead_by_cramming,
         hot,
-        day,
-        hostile,
-        activation,
+        crate::tick_workers::MobPlanOptions {
+            day,
+            hostile,
+            activation,
+        },
     );
     for (mob_idx, m) in mobs_snap.iter().enumerate() {
         if dead_by_cramming[mob_idx] {
@@ -7301,6 +7303,7 @@ fn materialize_generation_payloads(
     }
     with_save_guard(|| materialize_generation_payloads_inner(staged));
 }
+#[cfg(test)]
 fn materialize_generation_payloads_inner(
     staged: Vec<(
         (i32, i32, i32),
@@ -12754,7 +12757,7 @@ fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u3
     // light note per cell. Light-preserving writes take the unlit path so
     // the drain knows which cells actually need a relight note.
     if breg()
-        .map(|reg| light_properties(&reg, old) == light_properties(&reg, new))
+        .map(|reg| light_properties(reg, old) == light_properties(reg, new))
         .unwrap_or(false)
     {
         live_mod_bulk_record_set_block_unlit(dim, x, y, z, old, new);

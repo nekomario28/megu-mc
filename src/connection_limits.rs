@@ -30,6 +30,7 @@ type CachedChunkLookup = (Arc<[u8]>, Vec<((i32, i32, i32), u8)>);
 /// Largest pre-login/status/configuration frame body admitted before play
 /// state. These packets are small; capping the frame before allocation is the
 /// per-connection pre-auth memory ceiling (one in-flight frame at a time).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const MAX_PRELOGIN_FRAME_BYTES: usize = 64 * 1024;
 
 /// Inclusive absolute ceiling for one inflated compressed packet, matching

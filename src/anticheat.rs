@@ -1005,7 +1005,7 @@ fn ac_record_hitbox(eid: i32, tick: u64, aabb: megu_core::bvh::Aabb3) {
         return;
     }
     map.entry(eid)
-        .or_insert_with(megu_core::anticheat_v2::HitboxRewindBuffer::new)
+        .or_default()
         .record(tick, aabb);
 }
 
@@ -1444,8 +1444,7 @@ fn ac_violation_level(eid: i32, check: AcCheckId) -> f64 {
     p.decayed_vl(check, Instant::now(), decay)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn ac_flag_count(eid: i32, check: AcCheckId) -> u64 {
     ac_players()
         .lock()

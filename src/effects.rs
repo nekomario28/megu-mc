@@ -460,7 +460,7 @@ pub(super) fn infested_on_hurt_silverfish_count(seed: u64, has_infested: bool) -
         return 0;
     }
     let roll = fx_mix64(seed);
-    if roll % 10 != 0 {
+    if !roll.is_multiple_of(10) {
         return 0;
     }
     1 + ((roll >> 8) & 1) as u8

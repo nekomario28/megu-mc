@@ -132,7 +132,10 @@ fn prof_note() {
     if !prof_enabled() {
         return;
     }
-    if PROF_COUNT.fetch_add(1, Ordering::Relaxed) % 64 != 0 {
+    if !PROF_COUNT
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(64)
+    {
         return;
     }
     eprintln!(
@@ -626,7 +629,7 @@ struct MobJobInput {
 enum Slot {
     Skipped,
     Failed,
-    Done(MobPlan),
+    Done(Box<MobPlan>),
 }
 
 /// Shared state for one dimension's worth of plan jobs. `results[i]` is
@@ -832,7 +835,7 @@ fn run_plan_range_into(
             continue;
         }
         let slot = match catch_unwind(AssertUnwindSafe(|| prepare(batch, idx))) {
-            Ok(Ok(plan)) => Slot::Done(plan),
+            Ok(Ok(plan)) => Slot::Done(Box::new(plan)),
             _ => Slot::Failed,
         };
         buf.push((idx, slot));
@@ -930,7 +933,7 @@ impl MobPlanSet {
         loop {
             if let Some(r) = results[i].take() {
                 return match r {
-                    Slot::Done(plan) => Some(plan),
+                    Slot::Done(plan) => Some(*plan),
                     Slot::Failed => {
                         TICKPAR_FAILED.fetch_add(1, Ordering::Relaxed);
                         None
@@ -1007,15 +1010,20 @@ impl Drop for MobPlanSet {
 /// Entry point for `live_mob_tick_dimension`: snapshot the planning inputs and
 /// hand the pure probes to the pool. Every mutation still happens on the tick
 /// thread; this only prepares answers.
+#[derive(Clone, Copy)]
+pub(crate) struct MobPlanOptions {
+    pub day: bool,
+    pub hostile: bool,
+    pub activation: i32,
+}
+
 pub(crate) fn mob_plans(
     dim: DimId,
     mobs_snap: &[Arc<Mob>],
     players: &[LiveMobPlayer<'_>],
     dead: &[bool],
     hot: &[bool],
-    day: bool,
-    hostile: bool,
-    activation: i32,
+    options: MobPlanOptions,
 ) -> MobPlanSet {
     let players: Arc<Vec<TargetPlayer>> = Arc::new(
         players
@@ -1050,8 +1058,8 @@ pub(crate) fn mob_plans(
     // Job selection mirrors the loop's own early-out gates (dead, cold, dead-
     // soon, spec-less, out of activation range) so workers don't spend time on
     // plans the loop can never consume.
-    let activation_full = activation >= crate::LoadBudget::FULL.entity_activation_range;
-    let activation_sq = (activation as f64).powi(2);
+    let activation_full = options.activation >= crate::LoadBudget::FULL.entity_activation_range;
+    let activation_sq = (options.activation as f64).powi(2);
     // The two per-mob buffers ride the tick thread's recycling pool: taken
     // out with their steady-state capacity and handed back by
     // `BatchShared::drop`, so a stable mob count allocates nothing here.
@@ -1098,8 +1106,8 @@ pub(crate) fn mob_plans(
         done_cv: Condvar::new(),
         players,
         dim,
-        day,
-        hostile,
+        day: options.day,
+        hostile: options.hostile,
     });
     // Chunk the mob list into fixed-size ranges: each pool task prepares a
     // contiguous slice and commits it under one lock + one wake, so 500 mobs
@@ -1225,7 +1233,7 @@ mod tests {
             for (idx, pos) in [(2usize, pos_c), (0, pos_a), (1, pos_b)] {
                 std::thread::sleep(Duration::from_millis(10));
                 writer.results.lock().unwrap_or_else(|e| e.into_inner())[idx] =
-                    Some(Slot::Done(stub_plan(pos)));
+                    Some(Slot::Done(Box::new(stub_plan(pos))));
                 writer.done_cv.notify_all();
             }
         });
@@ -1255,7 +1263,7 @@ mod tests {
         let before = TICKPAR_STALE.load(Ordering::Relaxed);
         let plan_pos = (1.0, 65.0, 1.0);
         let (_batch, mut set) =
-            make_set(vec![None], vec![Some(Slot::Done(stub_plan(plan_pos)))]);
+            make_set(vec![None], vec![Some(Slot::Done(Box::new(stub_plan(plan_pos))))]);
         // The mob moved between dispatch and commit (pet teleport, knockback):
         // the plan no longer describes it and must not be consumed.
         assert!(set.take_valid(0, (9.0, 65.0, 9.0)).is_none());
@@ -1266,7 +1274,7 @@ mod tests {
     fn block_write_stales_every_plan_in_the_batch() {
         let plan_pos = (1.0, 65.0, 1.0);
         let (_batch, mut set) =
-            make_set(vec![None], vec![Some(Slot::Done(stub_plan(plan_pos)))]);
+            make_set(vec![None], vec![Some(Slot::Done(Box::new(stub_plan(plan_pos))))]);
         // A `set_block` (or generation write) after dispatch bumps the epoch;
         // the plan's world reads no longer describe the world serial would see.
         // Simulated by rewinding the batch's recorded epoch — touching the
@@ -1355,9 +1363,11 @@ mod tests {
             &players,
             &[],
             &[],
-            true,
-            true,
-            32,
+            MobPlanOptions {
+                day: true,
+                hostile: true,
+                activation: 32,
+            },
         );
         assert!(set.batch.is_none());
         assert!(set.take_valid(0, (0.0, 0.0, 0.0)).is_none());
@@ -1465,9 +1475,11 @@ mod tests {
                 &[],
                 &dead,
                 &hot,
-                true,
-                true,
-                i32::MAX,
+                MobPlanOptions {
+                    day: true,
+                    hostile: true,
+                    activation: i32::MAX,
+                },
             );
             let mut out = Vec::with_capacity(n);
             for i in 0..n {

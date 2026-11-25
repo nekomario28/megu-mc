@@ -331,7 +331,7 @@ pub(crate) fn prof_note() {
         return;
     }
     let completed = ASYNC_FRAMES_COMPLETED.load(Ordering::Relaxed);
-    if completed % 64 == 0 {
+    if completed.is_multiple_of(64) {
         eprintln!(
             "[async-chunk] requested={} completed={} deduped={} full={}",
             ASYNC_FRAMES_REQUESTED.load(Ordering::Relaxed),

@@ -1333,10 +1333,10 @@ mod paletted_canonical_tests {
             let mut round = [0u16; 4096];
             megu_core::bits::unpack_to_u16(&words, bits, 4096, &mut round);
             assert_eq!(round, values, "bits={bits} unpack");
-            for i in 0..64 {
+            for (i, value) in values.iter().take(64).enumerate() {
                 assert_eq!(
                     megu_core::bits::get(&words, bits, i),
-                    Some(u32::from(values[i])),
+                    Some(u32::from(*value)),
                     "bits={bits} cell={i}"
                 );
                 let mut rewritten = words.clone();
@@ -1344,7 +1344,7 @@ mod paletted_canonical_tests {
                     &mut rewritten,
                     bits,
                     i,
-                    u32::from(values[i])
+                    u32::from(*value)
                 ));
                 assert_eq!(rewritten, words, "bits={bits} set cell={i}");
             }

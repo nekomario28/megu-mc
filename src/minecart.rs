@@ -56,7 +56,9 @@ fn project(w: &mut impl World,p:[f64;3])->Option<[f64;3]> {
 impl State {
     fn move_by(&mut self,w:&mut impl World,delta:[f64;3]) {
         let (actual,ground)=w.move_cart(self.pos,delta);
-        for i in 0..3 { self.pos[i]+=actual[i]; }
+        for (i, displacement) in actual.iter().enumerate() {
+            self.pos[i] += displacement;
+        }
         // `Entity.move` zeroes only horizontally-colliding components, using
         // `Mth.equal`'s widened `1.0E-5f` tolerance; vertical velocity is not
         // cleared merely because the vertical move was clipped.

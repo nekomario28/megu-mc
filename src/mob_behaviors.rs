@@ -1974,7 +1974,7 @@ impl MobBehaviorState {
                 // positions so a stray crystal entity cannot feed the dragon.
                 let anchors: Vec<[f64; 3]> = end_crystal_pillars(WORLD_SEED.load(Ordering::Relaxed))
                     .iter()
-                    .map(|pillar| end_crystal_spawn_position(pillar))
+                    .map(end_crystal_spawn_position)
                     .collect();
                 let anchored: Vec<DragonCrystal> = crystals
                     .iter()

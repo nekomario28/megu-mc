@@ -985,8 +985,7 @@ const DROP_MERGE_FLOOR: usize = 256;
 /// `drop_spawn` in `dim`: same spawn, plus the side-index entry that tells
 /// dimension-aware readers (hopper suction, chunk drains) which world the
 /// entity rests in.
-fn drop_spawn_in_dim(
-    dim: DimId,
+struct DropSpawn {
     x: f64,
     y: f64,
     z: f64,
@@ -996,19 +995,21 @@ fn drop_spawn_in_dim(
     age: i32,
     target: Option<[u8; 16]>,
     thrower: Option<[u8; 16]>,
-) -> i32 {
+}
+
+fn drop_spawn_in_dim(dim: DimId, spawn: DropSpawn) -> i32 {
     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
         eid,
-        x,
-        y,
-        z,
-        item,
-        cnt,
-        comps,
-        age,
-        target,
-        thrower,
+        x: spawn.x,
+        y: spawn.y,
+        z: spawn.z,
+        item: spawn.item,
+        cnt: spawn.cnt,
+        comps: spawn.comps,
+        age: spawn.age,
+        target: spawn.target,
+        thrower: spawn.thrower,
     });
     note_drop_dim(eid, dim);
     drop_pending()
@@ -1020,6 +1021,9 @@ fn drop_spawn_in_dim(
 
 /// Spawn an item entity, marking it merge-pending so the next `drop_tick`
 /// pass can collapse a spawn burst inside the same tick.
+// Cross-module callers retain this positional helper contract; changing it
+// would require edits outside the assigned RUNTIME lane.
+#[allow(clippy::too_many_arguments)]
 fn drop_spawn(
     x: f64,
     y: f64,
@@ -1031,12 +1035,28 @@ fn drop_spawn(
     target: Option<[u8; 16]>,
     thrower: Option<[u8; 16]>,
 ) -> i32 {
-    drop_spawn_in_dim(DimId::Overworld, x, y, z, item, cnt, comps, age, target, thrower)
+    drop_spawn_in_dim(
+        DimId::Overworld,
+        DropSpawn {
+            x,
+            y,
+            z,
+            item,
+            cnt,
+            comps,
+            age,
+            target,
+            thrower,
+        },
+    )
 }
 
 /// `drop_spawn` for world drops: the vanilla `popResource` scatter runs first,
 /// then the same merge-pending mark so a loot burst still collapses inside the
 /// tick it lands in. Player-thrown and restored drops never take this path.
+// Cross-module callers retain this positional helper contract; changing it
+// would require edits outside the assigned RUNTIME lane.
+#[allow(clippy::too_many_arguments)]
 fn drop_spawn_scattered(
     dim: DimId,
     x: f64,
@@ -3084,31 +3104,29 @@ fn fuel_ticks(item: i64) -> i32 {
                 .iter()
                 .any(|suffix| {
                     path.strip_suffix(suffix)
-                        .is_some_and(|stem| wooden(stem))
+                        .is_some_and(&wooden)
                 })
-            {
-                300
-            } else if path.ends_with("_hanging_sign") || path.ends_with("_sign") {
-                300
-            } else if matches!(
-                path,
-                "crafting_table"
-                    | "bookshelf"
-                    | "chiseled_bookshelf"
-                    | "lectern"
-                    | "composter"
-                    | "chest"
-                    | "trapped_chest"
-                    | "barrel"
-                    | "jukebox"
-                    | "note_block"
-                    | "loom"
-                    | "cartography_table"
-                    | "fletching_table"
-                    | "smithing_table"
-                    | "daylight_detector"
-                    | "bamboo_mosaic"
-            ) || path == "banner"
+                || path.ends_with("_hanging_sign")
+                || path.ends_with("_sign")
+                || matches!(
+                    path,
+                    "crafting_table"
+                        | "bookshelf"
+                        | "chiseled_bookshelf"
+                        | "lectern"
+                        | "composter"
+                        | "chest"
+                        | "trapped_chest"
+                        | "barrel"
+                        | "jukebox"
+                        | "note_block"
+                        | "loom"
+                        | "cartography_table"
+                        | "fletching_table"
+                        | "smithing_table"
+                        | "daylight_detector"
+                        | "bamboo_mosaic"
+                ) || path == "banner"
                 || path.ends_with("_banner")
             {
                 300
@@ -8612,6 +8630,7 @@ pub(crate) fn materialize_generated_brushable(
 }
 
 #[cfg(test)]
+#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
 pub(crate) fn generated_brushable_loot_table(dim: DimId, pos: (i32, i32, i32)) -> Option<String> {
     let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
     let (_, entity) = store.entries.get(&(dim, pos.0, pos.1, pos.2))?;
@@ -19743,15 +19762,17 @@ mod s5_multidim_tests {
         let (hx, hy, hz) = (8_700_007, 64, -8_700_007);
         let eid = drop_spawn_in_dim(
             DimId::Nether,
-            hx as f64 + 0.5,
-            hy as f64 + 1.2,
-            hz as f64 + 0.5,
-            803,
-            3,
-            Vec::new(),
-            0,
-            None,
-            None,
+            DropSpawn {
+                x: hx as f64 + 0.5,
+                y: hy as f64 + 1.2,
+                z: hz as f64 + 0.5,
+                item: 803,
+                cnt: 3,
+                comps: Vec::new(),
+                age: 0,
+                target: None,
+                thrower: None,
+            },
         );
         assert_eq!(drop_dim_of(eid), DimId::Nether);
         assert!(suction_nonempty_in(DimId::Nether, hx, hy, hz));

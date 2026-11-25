@@ -2277,7 +2277,7 @@ mod scoreboard_cap_tests {
         );
         board.update_health(&long, 20);
         assert!(
-            board.scores.get("obj").is_none()
+            !board.scores.contains_key("obj")
                 || board.scores["obj"].is_empty(),
             "no score entry may be created for an oversized owner name"
         );

@@ -1371,7 +1371,7 @@ impl Goal for RandomLookAroundGoal {
     }
     fn idle_tick(&mut self, _: &GoalContext<'_>) {
         // vanilla `mob.getRandom().nextFloat() < 0.02`
-        self.armed = goal_seed_draw(&mut self.seed) % 50 == 0;
+        self.armed = goal_seed_draw(&mut self.seed).is_multiple_of(50);
     }
 }
 
@@ -1451,7 +1451,7 @@ impl Goal for LeapAtTargetGoal {
             .horizontal_distance_sq(ctx)
             .is_some_and(|distance_sq| {
                 (4.0..=16.0).contains(&distance_sq)
-                    && goal_seed_draw(&mut self.seed) % 5 == 0
+                    && goal_seed_draw(&mut self.seed).is_multiple_of(5)
             });
     }
 }
@@ -1791,7 +1791,7 @@ impl Goal for ZombieAttackTurtleEggGoal {
         }
         Some(GoalOutput {
             // Every 20 ticks the mob hops onto the egg again.
-            jump: self.stomp_ticks >= 20 && self.stomp_ticks % 20 == 0,
+            jump: self.stomp_ticks >= 20 && self.stomp_ticks.is_multiple_of(20),
             look_target: Some((f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5)),
             ..GoalOutput::default()
         })
@@ -5159,27 +5159,28 @@ mod mob_ai_tests {
         let out = goal.tick(&start).unwrap();
         assert_eq!(out.move_target, Some((3.5, 2.0, 0.5)));
         // Standing on the egg, the stomp counter removes it after 60 ticks.
-        let on_egg = GoalContext {
-            position: (3.5, 2.0, 0.5),
-            world: Some(&world),
-            ..GoalContext::default()
-        };
-        let mut destroyed = None;
-        let mut stomp_jumps = 0;
-        for _ in 0..61 {
-            let out = goal.tick(&on_egg).unwrap();
-            if out.jump {
-                stomp_jumps += 1;
+        {
+            let on_egg = GoalContext {
+                position: (3.5, 2.0, 0.5),
+                world: Some(&world),
+                ..GoalContext::default()
+            };
+            let mut destroyed = None;
+            let mut stomp_jumps = 0;
+            for _ in 0..61 {
+                let out = goal.tick(&on_egg).unwrap();
+                if out.jump {
+                    stomp_jumps += 1;
+                }
+                if let Some(cell) = out.destroy_block {
+                    destroyed = Some(cell);
+                }
             }
-            if let Some(cell) = out.destroy_block {
-                destroyed = Some(cell);
-            }
+            // Vanilla hops at stomp ticks 20, 40 and 60 before the break.
+            assert_eq!(stomp_jumps, 3);
+            assert_eq!(destroyed, Some((3, 1, 0)));
         }
-        // Vanilla hops at stomp ticks 20, 40 and 60 before the break.
-        assert_eq!(stomp_jumps, 3);
-        assert_eq!(destroyed, Some((3, 1, 0)));
         // With the egg gone the goal drops out.
-        drop(on_egg);
         world.name(3, 1, 0, "minecraft:air");
         let gone = GoalContext {
             position: (3.5, 2.0, 0.5),

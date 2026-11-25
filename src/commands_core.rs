@@ -4967,9 +4967,11 @@ fn adv_key_fingerprint(advs: &HashMap<String, Advancement>) -> u64 {
 /// `tr == event && (want.is_none() || *want == etype)` match the full path
 /// applies — plus whether "tick" appears at all (etype-typed criteria
 /// included).
+type TickAdvCandidates = (Vec<(String, Vec<String>, Vec<String>)>, bool);
+
 fn tick_adv_candidates(
     advs: &HashMap<String, Advancement>,
-) -> (Vec<(String, Vec<String>, Vec<String>)>, bool) {
+) -> TickAdvCandidates {
     let mut any_tick = false;
     let candidates = advs
         .iter()
@@ -8727,7 +8729,7 @@ fn run_world_command(ctx: &CmdCtx, args: &[&str]) -> String {
             let world = {
                 let worlds = managed_worlds().lock().unwrap_or_else(|e| e.into_inner());
                 worlds
-                    .get(*name)
+                    .get(name)
                     .map(|w| (w.id.clone(), w.generator, w.spawn))
             };
             let Some((id, generator, spawn)) = world else {
@@ -9717,7 +9719,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
                         return "usage: /title <targets> clear|reset".into();
                     }
                     // 0x0f clear_titles carries a single `reset` flag.
-                    let n = send_to(0x0f, &vec![u8::from(mode == "reset")]);
+                    let n = send_to(0x0f, &[u8::from(mode == "reset")]);
                     format!("{} title for {} player(s)",
                         if mode == "reset" { "Reset" } else { "Cleared" }, n)
                 }

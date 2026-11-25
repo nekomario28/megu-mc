@@ -4763,7 +4763,7 @@ fn run_megu_claim(ctx: &CmdCtx, level: u8, args: &[&str]) -> String {
             if owner != player && level < 4 {
                 return format!("Only the claim owner ({owner}) or an operator may do that");
             }
-            claims.set_trusted(&key, *name, trust);
+            claims.set_trusted(&key, name, trust);
             if trust {
                 format!("Trusted {name} on this claim")
             } else {
@@ -11671,7 +11671,8 @@ mod ops_admin_builtin_tests {
         assert!(can_explosion_damage_block(dim, 700, 700, 799, 799, None));
         // Trust grants the whole surface again — and untrust revokes it.
         assert!(ops_run(&alice, "/megu claim trust ops_enf_bob").contains("Trusted"));
-        for (name, is_op) in [("ops_enf_bob", false)] {
+        {
+            let (name, is_op) = ("ops_enf_bob", false);
             let uuid = format!("uuid-{name}");
             assert!(can_player_open_container(dim, 800, 800, &uuid, name, is_op));
             assert!(can_player_interact_entity(dim, 800, 800, &uuid, name, is_op));
