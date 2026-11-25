@@ -111,6 +111,218 @@ fn scale3(rgb: [f32; 3], k: f32) -> [f32; 3] {
     [rgb[0] * k, rgb[1] * k, rgb[2] * k]
 }
 
+/// Vanilla's eight texture phases repeat every eight in-game days.
+pub const fn vanilla_moon_phase(day: i64) -> u8 {
+    day.rem_euclid(8) as u8
+}
+
+/// Dimension palette used by the built-in Vanilla sky/fog resolver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VanillaDimension {
+    Overworld,
+    Nether,
+    End,
+}
+
+/// Medium or status effect that replaces the dimension's ordinary fog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VanillaFogOverride {
+    None,
+    Underwater { biome_tint: [f32; 3], depth_blocks: f32 },
+    Lava,
+    PowderSnow,
+    Blindness { ticks_remaining: u32 },
+    Darkness { ticks_remaining: u32 },
+}
+
+/// Inputs needed to resolve a deterministic, headless Vanilla sky state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VanillaAtmosphereInput {
+    pub dimension: VanillaDimension,
+    pub day: i64,
+    pub time_of_day_ticks: u64,
+    pub rain_strength: f32,
+    pub snow_strength: f32,
+    pub lightning_flash: f32,
+    pub fog_override: VanillaFogOverride,
+}
+
+impl Default for VanillaAtmosphereInput {
+    fn default() -> Self {
+        Self {
+            dimension: VanillaDimension::Overworld,
+            day: 0,
+            time_of_day_ticks: 6000,
+            rain_strength: 0.0,
+            snow_strength: 0.0,
+            lightning_flash: 0.0,
+            fog_override: VanillaFogOverride::None,
+        }
+    }
+}
+
+/// Resolved Vanilla celestial/weather data alongside the interpolated fog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VanillaSkyState {
+    pub atmosphere: AtmosphereParams,
+    pub moon_phase: u8,
+    pub rain_strength: f32,
+    pub snow_strength: f32,
+    pub lightning_flash: f32,
+    pub sunrise_glow: f32,
+    pub night_strength: f32,
+}
+
+/// Rain or snow plane type for the deterministic camera-centered sheet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrecipitationKind {
+    Rain,
+    Snow,
+}
+
+/// One world-space precipitation quad and its alpha tint.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PrecipitationQuad {
+    pub positions: [[f32; 3]; 4],
+    pub color: [f32; 4],
+}
+
+/// Fixed-capacity precipitation batch. Building or clearing it never allocates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrecipitationSheet {
+    pub quads: [PrecipitationQuad; 64],
+    pub len: usize,
+}
+
+impl Default for PrecipitationSheet {
+    fn default() -> Self {
+        Self { quads: [PrecipitationQuad::default(); 64], len: 0 }
+    }
+}
+
+/// Build a deterministic, fixed-capacity rain or snow sheet around the camera.
+pub fn build_precipitation_sheet(
+    camera: [f32; 3],
+    intensity: f32,
+    kind: PrecipitationKind,
+    seed: u64,
+) -> PrecipitationSheet {
+    let mut sheet = PrecipitationSheet::default();
+    if !camera.iter().all(|value| value.is_finite()) {
+        return sheet;
+    }
+    let strength = clean(intensity, 0.0).clamp(0.0, 1.0);
+    sheet.len = (64.0 * strength).round() as usize;
+    for i in 0..sheet.len {
+        let hash = seed
+            .wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        let unit = |shift: u32| ((hash.rotate_left(shift) & 0xffff) as f32) / 65535.0;
+        let x = camera[0] + (unit(13) - 0.5) * 16.0;
+        let z = camera[2] + (unit(31) - 0.5) * 16.0;
+        let y = camera[1] + 7.0 + unit(47) * 12.0;
+        let (half_width, length, slant, color) = match kind {
+            PrecipitationKind::Rain => (0.025, 0.75, 0.08, [0.72, 0.82, 1.0, 0.62]),
+            PrecipitationKind::Snow => (0.06, 0.11, 0.025, [0.94, 0.97, 1.0, 0.86]),
+        };
+        sheet.quads[i] = PrecipitationQuad {
+            positions: [
+                [x - half_width, y, z],
+                [x + half_width, y, z],
+                [x + half_width + slant, y - length, z],
+                [x - half_width + slant, y - length, z],
+            ],
+            color,
+        };
+    }
+    sheet
+}
+
+/// Resolve dimension, weather, celestial and status fog without a GPU.
+pub fn resolve_vanilla_sky(input: VanillaAtmosphereInput) -> VanillaSkyState {
+    let (mut atmosphere, sky_enabled) = match input.dimension {
+        VanillaDimension::Overworld => (AtmosphereParams::default(), true),
+        VanillaDimension::Nether => (AtmosphereParams {
+            sky_zenith_rgb: [0.20, 0.035, 0.025],
+            sky_horizon_rgb: [0.42, 0.075, 0.035],
+            fog_rgb: [0.20, 0.035, 0.025],
+            fog_density: 0.025,
+            depth_tint_rgb: [0.7, 0.2, 0.1],
+            depth_tint_strength: 0.1,
+            ambient_rgb: [0.30, 0.08, 0.04],
+            sun_intensity: 0.0,
+        }, false),
+        VanillaDimension::End => (AtmosphereParams {
+            sky_zenith_rgb: [0.015, 0.006, 0.035],
+            sky_horizon_rgb: [0.025, 0.012, 0.055],
+            fog_rgb: [0.015, 0.006, 0.035],
+            fog_density: 0.002,
+            depth_tint_rgb: [0.35, 0.08, 0.6],
+            depth_tint_strength: 0.0,
+            ambient_rgb: [0.15, 0.08, 0.22],
+            sun_intensity: 0.0,
+        }, false),
+    };
+    let rain = clean(input.rain_strength, 0.0).clamp(0.0, 1.0);
+    let snow = clean(input.snow_strength, 0.0).clamp(0.0, 1.0);
+    let flash = clean(input.lightning_flash, 0.0).clamp(0.0, 1.0);
+    let ticks = input.time_of_day_ticks % TICKS_PER_DAY;
+    let day_curve = ((ticks as f32 / TICKS_PER_DAY as f32) * std::f32::consts::TAU
+        - std::f32::consts::FRAC_PI_2)
+        .cos();
+    let night = if sky_enabled { ((0.08 - day_curve) / 0.2).clamp(0.0, 1.0) } else { 1.0 };
+    let horizon = if sky_enabled { (1.0 - day_curve.abs() / 0.22).clamp(0.0, 1.0) } else { 0.0 };
+    if sky_enabled {
+        atmosphere = atmosphere.with_time_of_day(input.time_of_day_ticks, rain);
+        let weather = (rain + snow * 0.65).clamp(0.0, 1.0);
+        atmosphere.sky_zenith_rgb = lerp3(atmosphere.sky_zenith_rgb, [0.42, 0.48, 0.55], weather * 0.48);
+        atmosphere.sky_horizon_rgb = lerp3(atmosphere.sky_horizon_rgb, [0.58, 0.62, 0.68], weather * 0.38);
+        atmosphere.fog_rgb = atmosphere.sky_horizon_rgb;
+        atmosphere.fog_density = (atmosphere.fog_density * (1.0 + weather * 0.7)).clamp(0.0, 4.0);
+    }
+    if flash > 0.0 {
+        atmosphere.sky_zenith_rgb = lerp3(atmosphere.sky_zenith_rgb, [1.0, 1.0, 1.0], flash * 0.82);
+        atmosphere.sky_horizon_rgb = lerp3(atmosphere.sky_horizon_rgb, [1.0, 1.0, 1.0], flash * 0.82);
+        atmosphere.fog_rgb = lerp3(atmosphere.fog_rgb, [1.0; 3], flash * 0.82);
+    }
+    atmosphere = match input.fog_override {
+        VanillaFogOverride::None => atmosphere,
+        VanillaFogOverride::Underwater { biome_tint, depth_blocks } => atmosphere.underwater_from(biome_tint, depth_blocks),
+        VanillaFogOverride::Lava => AtmosphereParams {
+            sky_zenith_rgb: [0.35, 0.08, 0.015], sky_horizon_rgb: [0.6, 0.14, 0.02],
+            fog_rgb: [0.6, 0.14, 0.02], fog_density: 0.18, depth_tint_rgb: [1.0, 0.3, 0.05],
+            depth_tint_strength: 0.65, ambient_rgb: [0.5, 0.16, 0.04], sun_intensity: 0.0,
+        },
+        VanillaFogOverride::PowderSnow => AtmosphereParams {
+            sky_zenith_rgb: [0.72, 0.84, 0.94], sky_horizon_rgb: [0.78, 0.88, 0.96],
+            fog_rgb: [0.78, 0.88, 0.96], fog_density: 0.16, depth_tint_rgb: [0.8, 0.9, 1.0],
+            depth_tint_strength: 0.2, ambient_rgb: [0.72, 0.82, 0.94], sun_intensity: 0.2,
+        },
+        VanillaFogOverride::Blindness { ticks_remaining } => {
+            let blend = (ticks_remaining as f32 / 20.0).clamp(0.0, 1.0);
+            let target = [0.0; 3];
+            atmosphere.sky_zenith_rgb = lerp3(atmosphere.sky_zenith_rgb, target, blend);
+            atmosphere.sky_horizon_rgb = lerp3(atmosphere.sky_horizon_rgb, target, blend);
+            atmosphere.fog_rgb = lerp3(atmosphere.fog_rgb, target, blend);
+            atmosphere.fog_density = (atmosphere.fog_density + 0.08 * blend).clamp(0.0, 4.0);
+            atmosphere
+        }
+        VanillaFogOverride::Darkness { ticks_remaining } => {
+            let blend = (ticks_remaining as f32 / 40.0).clamp(0.0, 1.0);
+            let target = [0.015, 0.012, 0.02];
+            atmosphere.sky_zenith_rgb = lerp3(atmosphere.sky_zenith_rgb, target, blend);
+            atmosphere.sky_horizon_rgb = lerp3(atmosphere.sky_horizon_rgb, target, blend);
+            atmosphere.fog_rgb = lerp3(atmosphere.fog_rgb, target, blend);
+            atmosphere.fog_density = (atmosphere.fog_density + 0.035 * blend).clamp(0.0, 4.0);
+            atmosphere
+        }
+    }.sanitized();
+    VanillaSkyState {
+        atmosphere, moon_phase: vanilla_moon_phase(input.day), rain_strength: rain,
+        snow_strength: snow, lightning_flash: flash, sunrise_glow: horizon, night_strength: night,
+    }
+}
+
 fn sstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)

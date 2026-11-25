@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
+use crate::atmosphere::PrecipitationSheet;
 use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
@@ -3585,8 +3586,11 @@ pub struct GpuRenderer {
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
     entity_ber: Option<DynamicGeometryRing>,
+    entity_ber_scratch: EntityBerGeometry,
     particles: Option<DynamicGeometryRing>,
     particle_alphas: Vec<f32>,
+    particle_vertex_scratch: Vec<TerrainVertex>,
+    particle_index_scratch: Vec<u32>,
     /// Instanced billboard path: per-frame `ParticleInstance` records
     /// staged into `particle_instances` — replaces the CPU quad staging
     /// whenever `particle_instancing` is on.
@@ -3965,24 +3969,40 @@ pub fn vanilla_light_brightness(block_light: u8, sky_light: u8, daylight_factor:
 /// same dark-cave/torch-bright response the receiver path gives
 /// `Shadows: On`. Each quad samples world light once at its centroid,
 /// so the two streams can never disagree on the sample.
-struct EntityBerGeometry {
-    lit_vertices: Vec<LitTerrainVertex>,
-    lit_indices: Vec<u32>,
-    vertices: Vec<TerrainVertex>,
-    indices: Vec<u32>,
+#[derive(Default)]
+pub struct EntityBerGeometry {
+    pub lit_vertices: Vec<LitTerrainVertex>,
+    pub lit_indices: Vec<u32>,
+    pub vertices: Vec<TerrainVertex>,
+    pub indices: Vec<u32>,
 }
 
-fn build_entity_ber_geometry(
+/// Pack articulated-entity and block-entity meshes into the two renderer
+/// vertex formats without creating a GPU device. Use
+/// [`build_entity_ber_geometry_into`] when the caller needs retained scratch.
+pub fn build_entity_ber_geometry(
     meshes: &[(&ExtrudedMesh, [f32; 3], [f32; 3])],
     sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
     daylight_factor: f32,
 ) -> EntityBerGeometry {
-    let mut out = EntityBerGeometry {
-        lit_vertices: Vec::new(),
-        lit_indices: Vec::new(),
-        vertices: Vec::new(),
-        indices: Vec::new(),
-    };
+    let mut out = EntityBerGeometry::default();
+    build_entity_ber_geometry_into(&mut out, meshes, sample_light, daylight_factor);
+    out
+}
+
+/// Refill caller-owned entity/BER scratch. This path allocates only when the
+/// supplied vectors lack capacity; renderer-owned scratch is pre-sized to the
+/// per-frame geometry cap.
+pub fn build_entity_ber_geometry_into(
+    out: &mut EntityBerGeometry,
+    meshes: &[(&ExtrudedMesh, [f32; 3], [f32; 3])],
+    sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
+    daylight_factor: f32,
+) {
+    out.lit_vertices.clear();
+    out.lit_indices.clear();
+    out.vertices.clear();
+    out.indices.clear();
     'meshes: for &(mesh, origin, tint) in meshes {
         if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
             continue;
@@ -4037,7 +4057,6 @@ fn build_entity_ber_geometry(
             );
         }
     }
-    out
 }
 
 /// Test-only view of the lit stream — production consumes the combined
@@ -4878,12 +4897,23 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
                          * 43758.55);
         if (roll > 0.996) {
             let bright = (roll - 0.996) / 0.004;
+            let twinkle = 0.82 + 0.18 * sin(shadow.render_params.y * 6.2831853 + roll * 91.7);
             color += vec3<f16>(0.90, 0.93, 1.0)
-                     * f16(bright * shadow.celestial_params.x * 0.85);
+                     * f16(bright * twinkle * shadow.celestial_params.x * 0.85);
         }
     }
     let sun_disc = smoothstep(0.9998, 0.99998, mu);
     let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
+    let moon_dir = -sun;
+    var moon_axis = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(moon_dir.y) > 0.99) { moon_axis = vec3<f32>(1.0, 0.0, 0.0); }
+    let moon_right = normalize(cross(moon_axis, moon_dir));
+    let moon_up = normalize(cross(moon_dir, moon_right));
+    let moon_x = dot(view, moon_right) / 0.018;
+    let moon_y = dot(view, moon_up) / 0.018;
+    let phase_angle = round(shadow.sun_color.w) * 0.7853982;
+    let terminator = -cos(phase_angle) * sqrt(max(1.0 - moon_y * moon_y, 0.0));
+    let moon_lit = smoothstep(terminator - 0.035, terminator + 0.035, moon_x);
     color += vec3<f16>(3.2, 2.55, 1.65)
              * f16(day * sun_disc * (1.0 - shadow.celestial_params.w));
     // The eclipse corona appears as a pale ring once the disc is covered.
@@ -4893,7 +4923,7 @@ fn fs_main(input: SkyOutput) -> @location(0) vec4<f32> {
                  * f16(ring * shadow.celestial_params.y * 1.6);
     }
     color += vec3<f16>(0.55, 0.67, 0.88)
-             * f16((1.0 - day) * moon_disc * (1.0 - shadow.celestial_params.w * 0.4));
+             * f16((1.0 - day) * moon_disc * moon_lit * (1.0 - shadow.celestial_params.w * 0.4));
     return vec4<f32>(pow(max(vec3<f32>(color), vec3<f32>(0.0)),
                          vec3<f32>(1.0 / 2.2)), 1.0);
 }
@@ -4922,11 +4952,42 @@ pub fn sky_wgsl_f16() -> String {
     let split = MEGU_SKY_ATMOSPHERE_WGSL
         .find(ANCHOR)
         .expect("MEGU_SKY_ATMOSPHERE_WGSL fragment anchor missing");
-    format!(
+    let source = format!(
         "enable f16;\n{}{}",
         &MEGU_SKY_ATMOSPHERE_WGSL[..split],
         SKY_FRAGMENT_F16_WGSL
-    )
+    );
+    with_moon_phase_terminator(source)
+}
+
+fn with_moon_phase_terminator(mut source: String) -> String {
+    const DISC: &str = "let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));";
+    const PHASE: &str = r#"let moon_disc = smoothstep(0.99984, 0.99996, dot(view, -sun));
+    let moon_dir = -sun;
+    var moon_axis = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(moon_dir.y) > 0.99) { moon_axis = vec3<f32>(1.0, 0.0, 0.0); }
+    let moon_right = normalize(cross(moon_axis, moon_dir));
+    let moon_up = normalize(cross(moon_dir, moon_right));
+    let moon_x = dot(view, moon_right) / 0.018;
+    let moon_y = dot(view, moon_up) / 0.018;
+    let phase_angle = round(shadow.sun_color.w) * 0.7853982;
+    let terminator = -cos(phase_angle) * sqrt(max(1.0 - moon_y * moon_y, 0.0));
+    let moon_lit = smoothstep(terminator - 0.035, terminator + 0.035, moon_x);"#;
+    if !source.contains("let moon_lit = smoothstep") {
+        source = source.replace(DISC, PHASE);
+    }
+    if !source.contains("let twinkle =") {
+        source = source.replace(
+            "let bright = (roll - 0.996) / 0.004;",
+            "let bright = (roll - 0.996) / 0.004;\n            let twinkle = 0.82 + 0.18 * sin(shadow.render_params.y * 6.2831853 + roll * 91.7);",
+        );
+    }
+    source = source.replace(
+        "* (1.0 - day) * moon_disc\n             * (1.0 - shadow.celestial_params.w * 0.4);",
+        "* (1.0 - day) * moon_disc * moon_lit\n             * (1.0 - shadow.celestial_params.w * 0.4);",
+    );
+    source = source.replace("* bright\n                     * shadow.celestial_params.x", "* bright * twinkle\n                     * shadow.celestial_params.x");
+    source
 }
 
 /// Capability-gated terrain WGSL: the `enable f16;` fragment variant when
@@ -4949,6 +5010,19 @@ pub fn sky_wgsl(shader_f16: bool) -> Cow<'static, str> {
         Cow::Owned(sky_wgsl_f16())
     } else {
         Cow::Borrowed(MEGU_SKY_ATMOSPHERE_WGSL)
+    }
+}
+
+/// Renderer pipeline source with the Vanilla eight-phase lunar terminator.
+/// The public compatibility selector above continues to expose the original
+/// baseline WGSL unchanged for callers that compare module identity.
+pub fn sky_wgsl_with_moon_phase(shader_f16: bool) -> Cow<'static, str> {
+    if shader_f16 {
+        Cow::Owned(sky_wgsl_f16())
+    } else {
+        Cow::Owned(with_moon_phase_terminator(
+            MEGU_SKY_ATMOSPHERE_WGSL.to_owned(),
+        ))
     }
 }
 
@@ -5146,6 +5220,9 @@ fn build_stable_shadow_uniforms(
         moon_phase,
         EclipseMode::None,
     );
+    // `sun_color.w` is unused by the built-in lighting shaders; carry the
+    // Vanilla moon texture phase there for the sky dome's terminator.
+    uniforms.sun_color[3] = f32::from(moon_phase % 8);
     let position = if camera.position.iter().all(|v| v.is_finite()) {
         camera.position
     } else {
@@ -6531,7 +6608,9 @@ impl SkyGpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sky-atmosphere"),
-                source: wgpu::ShaderSource::Wgsl(sky_wgsl(ctx.report.shader_f16)),
+                source: wgpu::ShaderSource::Wgsl(sky_wgsl_with_moon_phase(
+                    ctx.report.shader_f16,
+                )),
             });
         let layout = ctx
             .device
@@ -7646,10 +7725,18 @@ impl GpuRenderer {
             debug_line_pipeline,
             debug_lines: None,
             entity_ber: None,
+            entity_ber_scratch: EntityBerGeometry {
+                lit_vertices: Vec::with_capacity(MAX_DYNAMIC_QUADS * 4),
+                lit_indices: Vec::with_capacity(MAX_DYNAMIC_QUADS * 6),
+                vertices: Vec::with_capacity(MAX_DYNAMIC_QUADS * 4),
+                indices: Vec::with_capacity(MAX_DYNAMIC_QUADS * 6),
+            },
             particles: None,
-            particle_alphas: Vec::new(),
+            particle_alphas: Vec::with_capacity(MAX_DYNAMIC_QUADS),
+            particle_vertex_scratch: Vec::with_capacity(MAX_DYNAMIC_QUADS * 4),
+            particle_index_scratch: Vec::with_capacity(MAX_DYNAMIC_QUADS * 6),
             particle_instances: None,
-            particle_instance_scratch: Vec::new(),
+            particle_instance_scratch: Vec::with_capacity(MAX_DYNAMIC_QUADS),
             particle_instancing,
             particle_instance_uploads: 0,
             particle_instances_capped: 0,
@@ -7768,7 +7855,9 @@ impl GpuRenderer {
         meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])>,
         mut sample_light: impl FnMut(f32, f32, f32) -> (u8, u8),
     ) {
-        let geometry = build_entity_ber_geometry(
+        let mut geometry = std::mem::take(&mut self.entity_ber_scratch);
+        build_entity_ber_geometry_into(
+            &mut geometry,
             &meshes,
             &mut sample_light,
             self.entity_light_daylight,
@@ -7784,6 +7873,63 @@ impl GpuRenderer {
             &mut self.entity_ber,
             &geometry.vertices,
             &geometry.indices,
+        );
+        self.dynamic_buffer_allocs += allocs;
+        self.dynamic_ring_reuses += reuses;
+        self.entity_ber_scratch = geometry;
+    }
+
+    /// Upload a fixed-capacity rain/snow sheet through the existing
+    /// depth-tested alpha particle geometry ring.
+    pub fn set_precipitation_sheet(&mut self, sheet: &PrecipitationSheet) {
+        self.particle_vertex_scratch.clear();
+        self.particle_index_scratch.clear();
+        self.particle_alphas.clear();
+        self.particle_instance_scratch.clear();
+        if let Some(ring) = self.particle_instances.as_mut() {
+            ring.count = 0;
+        }
+        for quad in sheet.quads.iter().take(sheet.len.min(MAX_DYNAMIC_QUADS)) {
+            if !quad.color.iter().all(|value| value.is_finite())
+                || !quad.positions.iter().flatten().all(|value| value.is_finite())
+            {
+                continue;
+            }
+            let edge_u = [
+                quad.positions[1][0] - quad.positions[0][0],
+                quad.positions[1][1] - quad.positions[0][1],
+                quad.positions[1][2] - quad.positions[0][2],
+            ];
+            let edge_v = [
+                quad.positions[3][0] - quad.positions[0][0],
+                quad.positions[3][1] - quad.positions[0][1],
+                quad.positions[3][2] - quad.positions[0][2],
+            ];
+            let cross = [
+                edge_u[1] * edge_v[2] - edge_u[2] * edge_v[1],
+                edge_u[2] * edge_v[0] - edge_u[0] * edge_v[2],
+                edge_u[0] * edge_v[1] - edge_u[1] * edge_v[0],
+            ];
+            let length = (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+            if !length.is_finite() || length <= f32::EPSILON {
+                continue;
+            }
+            if append_dynamic_quad(
+                &mut self.particle_vertex_scratch,
+                &mut self.particle_index_scratch,
+                quad.positions,
+                cross.map(|value| value / length),
+                [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                [quad.color[0], quad.color[1], quad.color[2]],
+            ) {
+                self.particle_alphas.push(quad.color[3].clamp(0.0, 1.0));
+            }
+        }
+        let (allocs, reuses) = stage_dynamic_geometry(
+            &self.ctx,
+            &mut self.particles,
+            &self.particle_vertex_scratch,
+            &self.particle_index_scratch,
         );
         self.dynamic_buffer_allocs += allocs;
         self.dynamic_ring_reuses += reuses;
@@ -7827,8 +7973,8 @@ impl GpuRenderer {
         if let Some(r) = self.particle_instances.as_mut() {
             r.count = 0;
         }
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        self.particle_vertex_scratch.clear();
+        self.particle_index_scratch.clear();
         for quad in quads.iter().take(MAX_DYNAMIC_QUADS) {
             if !quad.color.iter().all(|v| v.is_finite()) {
                 continue;
@@ -7854,8 +8000,8 @@ impl GpuRenderer {
             }
             let normal = n.map(|component| component / length);
             if append_dynamic_quad(
-                &mut vertices,
-                &mut indices,
+                &mut self.particle_vertex_scratch,
+                &mut self.particle_index_scratch,
                 quad.positions,
                 normal,
                 quad.uv,
@@ -7864,8 +8010,12 @@ impl GpuRenderer {
                 self.particle_alphas.push(quad.color[3].clamp(0.0, 1.0));
             }
         }
-        let (allocs, reuses) =
-            stage_dynamic_geometry(&self.ctx, &mut self.particles, &vertices, &indices);
+        let (allocs, reuses) = stage_dynamic_geometry(
+            &self.ctx,
+            &mut self.particles,
+            &self.particle_vertex_scratch,
+            &self.particle_index_scratch,
+        );
         self.dynamic_buffer_allocs += allocs;
         self.dynamic_ring_reuses += reuses;
     }
