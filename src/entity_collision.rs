@@ -225,6 +225,102 @@ fn collide_with_shapes(
     [x, y, z]
 }
 
+/// 1.21.1 `Player` edge probe (`cmx.b(DDF)Z`): the box is offset horizontally
+/// and extended downward by the step height plus the widened `1.0E-5f` epsilon.
+#[cfg(test)]
+fn player_edge_probe_no_collision(
+    aabb: EntityAabb,
+    dx: f64,
+    dz: f64,
+    step_down: f32,
+    no_collision: &mut dyn FnMut(EntityAabb) -> bool,
+) -> bool {
+    no_collision(EntityAabb {
+        min_x: aabb.min_x + dx,
+        min_y: aabb.min_y - f64::from(step_down) - f64::from(1.0e-5f32),
+        min_z: aabb.min_z + dz,
+        max_x: aabb.max_x + dx,
+        max_y: aabb.min_y,
+        max_z: aabb.max_z + dz,
+    })
+}
+
+/// 1.21.1 `Player.maybeBackOffFromEdge` (`cmx.a(Lexc;Lbts;)Lexc`). The caller
+/// supplies the mover/flying/sneaking/support facts because this physics module
+/// does not own the player object.
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn player_maybe_back_off_from_edge(
+    aabb: EntityAabb,
+    delta: [f64; 3],
+    mover_self_or_player: bool,
+    flying: bool,
+    sneaking: bool,
+    on_ground: bool,
+    fall_distance: f32,
+    max_up_step: f32,
+    mut no_collision: impl FnMut(EntityAabb) -> bool,
+) -> [f64; 3] {
+    if flying
+        || delta[1] > 0.0
+        || !mover_self_or_player
+        || !sneaking
+        || !delta[0].is_finite()
+        || !delta[2].is_finite()
+    {
+        return delta;
+    }
+    let supported = on_ground
+        || (fall_distance < max_up_step
+            && !player_edge_probe_no_collision(
+                aabb,
+                0.0,
+                0.0,
+                max_up_step - fall_distance,
+                &mut no_collision,
+            ));
+    if !supported {
+        return delta;
+    }
+
+    let mut x = delta[0];
+    let mut z = delta[2];
+    let x_step = x.signum() * 0.05;
+    let z_step = z.signum() * 0.05;
+    while x != 0.0 && player_edge_probe_no_collision(aabb, x, 0.0, max_up_step, &mut no_collision)
+    {
+        if x.abs() <= 0.05 {
+            x = 0.0;
+        } else {
+            x -= x_step;
+        }
+    }
+    while z != 0.0 && player_edge_probe_no_collision(aabb, 0.0, z, max_up_step, &mut no_collision)
+    {
+        if z.abs() <= 0.05 {
+            z = 0.0;
+        } else {
+            z -= z_step;
+        }
+    }
+    while x != 0.0
+        && z != 0.0
+        && player_edge_probe_no_collision(aabb, x, z, max_up_step, &mut no_collision)
+    {
+        if x.abs() <= 0.05 {
+            x = 0.0;
+        } else {
+            x -= x_step;
+        }
+        if z.abs() <= 0.05 {
+            z = 0.0;
+        } else {
+            z -= z_step;
+        }
+    }
+    [x, delta[1], z]
+}
+
 /// 1.21.1 `Entity.collectCandidateStepUpHeights(AABB, List<VoxelShape>, float, float)`
 /// (`bsr.a(ewx, List, F, F)`). Writes the sorted, deduplicated heights into
 /// `out` (cleared first) so the caller can reuse one buffer per collide.
@@ -319,6 +415,10 @@ fn entity_collide_scratch(
     mut collect_world_boxes: impl FnMut(EntityAabb, &mut Vec<([f64; 3], [f64; 3])>),
     scratch: &mut CollideScratch,
 ) -> CollideResult {
+    // Vanilla rejects non-finite positions when an entity is loaded; at this
+    // physics boundary a malformed mover must not turn one bad component into
+    // a NaN/Inf sweep or position escape. Clamp only the malformed component.
+    let delta = delta.map(|v| if v.is_finite() { v } else { 0.0 });
     let len_sq = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
     // A stationary entity resolves to its requested delta untouched: no sweep,
     // no world-box read, no step-up — the flags all compute to false below.
@@ -478,6 +578,138 @@ fn mob_collide_move(m: &Arc<Mob>, mp: &mut (f64, f64, f64, f32, f32), dx: f64, d
     mp.2 = next_pos[2];
     if !res.stepped_up && !mob_has_support(m.etype, mp.0, mp.1, mp.2) {
         mob_snap_y(m, mp);
+    }
+}
+
+#[cfg(test)]
+mod collision_regression_tests {
+    use super::*;
+
+    fn overlapping(probe: EntityAabb, boxes: &[([f64; 3], [f64; 3])]) -> bool {
+        boxes
+            .iter()
+            .any(|&b| aabb_overlaps((probe.min(), probe.max()), b))
+    }
+
+    #[test]
+    fn collision_zero_delta_does_not_scan_or_step() {
+        let aabb = EntityAabb::from_min_max([0.0, 0.0, 0.0], [0.6, 1.8, 0.6]);
+        let res = entity_collide(aabb, [0.0, 0.0, -0.0], true, 0.6, &[], |_| {
+            panic!("zero-length movement must not scan collision shapes")
+        });
+        assert_eq!(res.delta, [0.0, 0.0, -0.0]);
+        assert!(!res.horizontal_collision);
+        assert!(!res.vertical_collision);
+        assert!(!res.stepped_up);
+    }
+
+    #[test]
+    fn collision_non_finite_delta_components_are_zeroed_before_the_sweep() {
+        let aabb = EntityAabb::from_min_max([0.0, 0.0, 0.0], [0.6, 1.8, 0.6]);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let res = entity_collide(aabb, [bad, 0.0, 0.0], true, 0.6, &[], |_| {
+                panic!("a fully non-finite horizontal move reduces to zero before scanning")
+            });
+            assert_eq!(res.delta, [0.0, 0.0, 0.0]);
+            assert!(!res.horizontal_collision);
+        }
+        let res = entity_collide(aabb, [f64::NAN, 0.1, f64::INFINITY], false, 0.0, &[], |sweep| {
+            assert!(sweep.min().into_iter().chain(sweep.max()).all(f64::is_finite));
+            Vec::new()
+        });
+        assert_eq!(res.delta, [0.0, 0.1, 0.0]);
+    }
+
+    #[test]
+    fn collision_axis_order_and_step_up_half_block_are_vanilla() {
+        fn slice(
+            all: &[([f64; 3], [f64; 3])],
+            sweep: EntityAabb,
+        ) -> Vec<([f64; 3], [f64; 3])> {
+            all.iter()
+                .copied()
+                .filter(|&b| aabb_overlaps((sweep.min(), sweep.max()), b))
+                .collect()
+        }
+
+        let pillar = [([1.0, 0.0, 1.0], [2.0, 2.0, 2.0])];
+        let unit = EntityAabb::from_min_max([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let z_first = entity_collide(unit, [0.2, 0.0, 0.5], true, 0.0, &[], |s| {
+            slice(&pillar, s)
+        });
+        assert_eq!(z_first.delta, [0.0, 0.0, 0.5]);
+        let tie_x_first = entity_collide(unit, [0.5, 0.0, 0.5], true, 0.0, &[], |s| {
+            slice(&pillar, s)
+        });
+        assert_eq!(tie_x_first.delta, [0.5, 0.0, 0.0]);
+
+        let floor_and_step = [
+            ([-2.0, 0.0, -2.0], [4.0, 1.0, 2.0]),
+            ([1.0, 1.0, 0.0], [2.0, 1.5, 1.0]),
+        ];
+        let body = EntityAabb::from_min_max([0.2, 1.0, 0.2], [0.8, 2.8, 0.8]);
+        let stepped = entity_collide(body, [0.5, 0.0, 0.0], true, 0.6, &[], |s| {
+            slice(&floor_and_step, s)
+        });
+        assert!(stepped.stepped_up);
+        assert_eq!(stepped.delta, [0.5, 0.5, 0.0]);
+        let too_tall = entity_collide(body, [0.5, 0.0, 0.0], true, 0.49, &[], |s| {
+            slice(&floor_and_step, s)
+        });
+        assert!(!too_tall.stepped_up);
+        assert!(too_tall.horizontal_collision);
+        assert!((too_tall.delta[0] - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn collision_crouch_edge_clamp_uses_005_steps_and_joint_diagonal_probe() {
+        let straight_floor = [([-8.0, 0.0, -8.0], [1.0, 1.0, 8.0])];
+        let aabb = EntityAabb::from_min_max([0.94, 1.0, 0.2], [1.54, 2.8, 0.8]);
+        let clamped = player_maybe_back_off_from_edge(
+            aabb,
+            [0.1, -0.08, 0.0],
+            true,
+            false,
+            true,
+            true,
+            0.0,
+            0.6,
+            |probe| !overlapping(probe, &straight_floor),
+        );
+        assert_eq!(clamped, [0.05, -0.08, 0.0]);
+
+        // Around a convex corner the one-axis probes can still find the two
+        // legs of the floor; the final joint probe is what arrests diagonal escape.
+        let corner_floor = [
+            ([-8.0, 0.0, -8.0], [1.0, 1.0, 8.0]),
+            ([-8.0, 0.0, -8.0], [8.0, 1.0, 1.0]),
+        ];
+        let corner_aabb = EntityAabb::from_min_max([0.94, 1.0, 0.94], [1.54, 2.8, 1.54]);
+        let diagonal = player_maybe_back_off_from_edge(
+            corner_aabb,
+            [0.1, -0.08, 0.1],
+            true,
+            false,
+            true,
+            true,
+            0.0,
+            0.6,
+            |probe| !overlapping(probe, &corner_floor),
+        );
+        assert_eq!(diagonal, [0.05, -0.08, 0.05]);
+
+        let unchanged = player_maybe_back_off_from_edge(
+            corner_aabb,
+            [0.1, -0.08, 0.1],
+            true,
+            true,
+            true,
+            true,
+            0.0,
+            0.6,
+            |probe| !overlapping(probe, &corner_floor),
+        );
+        assert_eq!(unchanged, [0.1, -0.08, 0.1]);
     }
 }
 

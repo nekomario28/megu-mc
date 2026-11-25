@@ -443,7 +443,7 @@ pub(crate) fn tick_in_dim<W: Reader>(
     })
 }
 
-#[cfg(all(test, megu_vanilla_data))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -457,6 +457,7 @@ mod tests {
             p
         }
     }
+    #[cfg(megu_vanilla_data)]
     fn cell(s: &str) -> Option<Cell> {
         match s {
             "A" => Some(Cell::Air),
@@ -723,6 +724,7 @@ mod tests {
         );
     }
 
+    #[cfg(megu_vanilla_data)]
     #[test]
     fn cave_fluid_ticks_match_native_writes() {
         let mut count = 0;
