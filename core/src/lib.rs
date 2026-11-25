@@ -204,14 +204,47 @@
 //!   [`ui_contract::UiWidgetSpec`] declarative tree every Fabric,
 //!   NeoForge, Create and WASM surface emits — with title-screen purity
 //!   kept as a type-level invariant.
+//! * [`intern`] — [`intern::StringInterner`]/[`intern::Symbol`] string
+//!   deduplication for O(1) `u32` ID equality/hashing, plus
+//!   [`intern::GenArena`]/[`intern::GenIndex`], a dense generational arena
+//!   giving ABA-free O(1) insert/remove/lookup entity, mod-object, UI
+//!   widget and session handles with no dangling IDs.
+//! * [`bvh`] — [`bvh::DynamicBvh`], a Box2D/Bullet-style incremental-SAH
+//!   dynamic AABB tree with fattened leaves for moving entities and
+//!   contraptions: O(log N) insert/remove/query, a `NaN`-safe slab-test
+//!   [`bvh::Aabb3::ray_intersects`], stable generational [`bvh::BvhNodeId`]s,
+//!   and caller-scratch zero-alloc AABB/ray queries that answer on *tight*
+//!   bounds — bit-identical to a brute-force scan.
+//! * [`dep_graph`] — [`dep_graph::IncrementalDag`], an Adapton/Salsa-style
+//!   dependency DAG for derived computation (`SectionBlocks → Light →
+//!   Mesh`): cycle-rejecting edges, digest-driven [`dep_graph::IncrementalDag::mark_input_changed`]
+//!   invalidation, [`dep_graph::IncrementalDag::recompute_with_cutoff`]
+//!   early-cutoff verification that rescues untouched downstream
+//!   subgraphs, and zero-alloc topological [`dep_graph::IncrementalDag::dirty_order_into`].
+//! * [`bloom`] — [`bloom::BlockedBloomFilter`], a 64-byte cache-line
+//!   blocked Bloom filter probing exactly one L1 line per lookup via
+//!   Kirsch–Mitzenmacher double hashing over canonical [`hash::fnv1a64`],
+//!   and [`bloom::VoxelBitset4096`], a 520-byte two-level bitset whose
+//!   `u64` summary word makes `is_empty`/`for_each_set` O(popcount) for
+//!   `16³` section occupancy.
+//! * [`ring_spsc`] — cache-line-padded single-producer/single-consumer
+//!   primitives: [`ring_spsc::spsc_u64`]'s true wait-free `AtomicU64`
+//!   `Acquire`/`Release` ring ([`ring_spsc::SpscU64Producer`] /
+//!   [`ring_spsc::SpscU64Consumer`]) for audio/network/wakeup tokens, the
+//!   generic [`ring_spsc::spsc_channel`], [`ring_spsc::CachePadded`], and
+//!   [`ring_spsc::BoundedRing`], an O(1) fixed-capacity FIFO replacing
+//!   `Vec::remove(0)`.
 
 #![deny(unsafe_code)]
 
 pub mod autostart_service;
 pub mod bits;
+pub mod bloom;
+pub mod bvh;
 pub mod coords;
 pub mod crash_report;
 pub mod crypto;
+pub mod dep_graph;
 pub mod diff_engine;
 pub mod dye_and_items;
 pub mod fault_isolation;
@@ -220,6 +253,7 @@ pub mod hash;
 pub mod hw_adaptive_engine;
 pub mod id;
 pub mod i18n;
+pub mod intern;
 pub mod json;
 pub mod landlock_sandbox;
 pub mod linux_desktop;
@@ -234,6 +268,7 @@ pub mod perf_kit;
 pub mod random;
 pub mod registry;
 pub mod rev;
+pub mod ring_spsc;
 pub mod romaji_ime;
 pub mod self_updater;
 pub mod section_rev;
