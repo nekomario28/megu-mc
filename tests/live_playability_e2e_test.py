@@ -786,7 +786,7 @@ class LiveBinaries(unittest.TestCase):
 
     def test_sigterm_save_finishes_within_shutdown_budget(self):
         """A live client leaves leaf/fluid tick work queued; SIGTERM still
-        exits with world_overlay.bin inside the corrected shutdown budget."""
+        exits with world_overlay.bin within the 900 ms shutdown budget."""
         bins = self._real_bins()
         if bins is None:
             self.skipTest(
@@ -874,8 +874,8 @@ class LiveBinaries(unittest.TestCase):
                 elapsed_ms = (time.monotonic() - start) * 1000.0
                 self.assertEqual(rc, 0, "server exit was not clean")
                 self.assertLessEqual(
-                    elapsed_ms, 3000.0,
-                    f"shutdown save took {elapsed_ms:.1f}ms, over the shutdown budget; stderr: "
+                    elapsed_ms, 900.0,
+                    f"shutdown save took {elapsed_ms:.1f}ms, over the 900ms budget; stderr: "
                     + "\n".join(stderr_lines[-30:]))
                 overlay = world / "world_overlay.bin"
                 self.assertTrue(overlay.is_file(), "world_overlay.bin missing after SIGTERM")
