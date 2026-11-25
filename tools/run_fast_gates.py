@@ -50,6 +50,8 @@ GATES = (
     "tools/general_defect_audit.py --strict",
     "tests/strict_vanilla_parity_audit_test.py",
     "tests/megu_port_mod_test.py",
+    "tests/xplat_packaging_test.py",
+    "tests/install_linux_test.py",
 )
 
 

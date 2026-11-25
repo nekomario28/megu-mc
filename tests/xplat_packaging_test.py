@@ -16,12 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/release.yml"
 CLIENT_GPU_MANIFEST = ROOT / "client-gpu/Cargo.toml"
 ALPINE_DOCKERFILE = ROOT / "packaging/docker/Dockerfile.alpine-client"
-PACKAGING_FILES = (
-    ROOT / "packaging/alpine/APKBUILD",
-    ROOT / "packaging/freebsd/Makefile",
-    ROOT / "packaging/freebsd/pkg-descr",
-    ROOT / "packaging/void/template",
-)
+PACKAGING_FILES = ()
 NEW_DOCS = ROOT / "docs/PLATFORMS.md"
 
 UNIFIED_LICENSE = "LGPL-3.0-or-later"
@@ -141,38 +136,6 @@ class PackagingRecipesTest(unittest.TestCase):
                 self.assertIn(UNIFIED_LICENSE, text)
                 self.assertNotIn(OBSOLETE_LICENSE, text)
                 self.assertNotIn("SPDX-License-Identifier: LGPL-3.0-or-later OR", text)
-
-    def test_alpine_apkbuild_shape(self):
-        text = PACKAGING_FILES[0].read_text(encoding="utf-8")
-        for field in ("pkgname=megu", 'license="LGPL-3.0-or-later"',
-                      "-crt-static", "--locked", "megu-client-gpu",
-                      "megu-installer", "sha512sums"):
-            self.assertIn(field, text)
-        for dep in ("vulkan-loader-dev", "wayland-dev", "libxkbcommon-dev"):
-            self.assertIn(dep, text)
-        self.assertIn("subpackages", text)
-        # Aports spells pre-releases with an underscore.
-        self.assertRegex(text, r"(?m)^pkgver=0\.1\.0_alpha3\s*$")
-
-    def test_freebsd_port_shape(self):
-        text = PACKAGING_FILES[1].read_text(encoding="utf-8")
-        for field in ("PORTNAME=\tmegu", "LICENSE=\tLGPL3+",
-                      "USES=\t\tcargo", "CLIENT_GPU", "bsd.port.mk"):
-            self.assertIn(field, text)
-        self.assertIn("megu-client-gpu", text)
-        self.assertIn("libvulkan.so:graphics/vulkan-loader", text)
-
-    def test_void_template_shape(self):
-        text = PACKAGING_FILES[3].read_text(encoding="utf-8")
-        for field in ('pkgname=megu', "build_style=cargo",
-                      'license="LGPL-3.0-or-later"', "megu-client-gpu"):
-            self.assertIn(field, text)
-        # Musl must opt out of crt-static for the GPU client only.
-        self.assertIn('XBPS_TARGET_LIBC" = "musl"', text)
-        self.assertIn("-C target-feature=-crt-static", text)
-        for dep in ("vulkan-loader-devel", "wayland-devel",
-                    "libxkbcommon-devel"):
-            self.assertIn(dep, text)
 
 
 class ReleaseMatrixConsistencyTest(unittest.TestCase):

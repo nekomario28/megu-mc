@@ -89,8 +89,7 @@ BSDs for free. Verified: `cargo check --target x86_64-unknown-freebsd` for
 ## Explicit non-goals
 
 - **OpenBSD / NetBSD / DragonFly builds**: the Vulkan cfg is unlocked in
-  `client-gpu/Cargo.toml`, but no CI lane, sysroot or package recipe exists
-  yet — the ports skeleton in `packaging/freebsd/` is the template to copy.
+  `client-gpu/Cargo.toml`, but no CI lane or sysroot exists yet.
 - **FreeBSD client, OpenBSD/NetBSD anything**: see above.
 - **32-bit targets, big-endian, RISC-V client, s390x/ppc64le**: not built.
 - **musl client for `megu-client` (headless CLI)**: covered by glibc builds;

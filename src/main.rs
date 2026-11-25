@@ -20970,6 +20970,36 @@ fn parse_startup_flags() -> Vec<String> {
         } else if arg == "-V" || arg == "--version" {
             println!("{MEGU_VERSION_LINE}");
             std::process::exit(0);
+        } else if arg == "--sandbox" {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let spec = megu_core::landlock_sandbox::ServerSandboxSpec::for_server_root(&root);
+            let outcome = megu_core::landlock_sandbox::enforce_sandbox(&spec);
+            eprintln!("megu: sandbox outcome: {outcome:?}");
+        } else if arg == "--service-status" {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin/megu"));
+            let spec = megu_core::autostart_service::ServiceSpec::new(
+                "megu",
+                megu_core::autostart_service::ServiceBackend::SystemdUser,
+                exe.to_string_lossy().into_owned(),
+                cwd.to_string_lossy().into_owned(),
+            );
+            match megu_core::autostart_service::plan_install(&spec) {
+                Ok(plan) => {
+                    let st = megu_core::autostart_service::inspect_status(std::path::Path::new("/"), &plan);
+                    println!("megu service status: {st:?}");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("megu: service plan error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        } else if arg == "--update-check" {
+            let cur = megu_core::self_updater::SemVer::parse(env!("CARGO_PKG_VERSION"));
+            let host = megu_core::self_updater::TargetPlatform::host();
+            println!("megu update target: version={cur:?} host={host:?}");
+            std::process::exit(0);
         } else if arg == "--dir" || arg.starts_with("--dir=") {
             let dir = if arg == "--dir" {
                 match args.next() {

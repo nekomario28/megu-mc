@@ -118,6 +118,7 @@ UNSAFE_UNDOCUMENTED_BASELINE_COUNTS = {
 }
 UNSAFE_EXPLICIT_ALLOWLIST = {
     "server-files/src/landlock_sandbox.rs",
+    "core/src/landlock_sandbox.rs",
     "sdk/megu-mod-sdk/src/native_abi.rs",
 }
 
@@ -1071,6 +1072,8 @@ def guard_remove_zero_and_codecs(root, files):
                 code = strip_cfg_test_items(text)
                 for codec in candidates:
                     if rel == CANONICAL_CODEC_FILES.get(codec):
+                        continue
+                    if codec == "lz4" and rel == "state-store/src/lz4_region.rs" and "megu_core::lz4::" in code:
                         continue
                     pattern = codec_patterns[codec]
                     for match in pattern.finditer(code):

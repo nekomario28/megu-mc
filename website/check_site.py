@@ -80,6 +80,13 @@ RELEASE_TARGETS = {
     "windows-arm64": "megu-installer-windows-arm64.exe",
 }
 
+EXTRA_RELEASE_TARGETS = frozenset({
+    "linux-x86_64-musl-client",
+    "linux-arm64-musl-client",
+    "freebsd-x86_64",
+    "linux-riscv64",
+})
+
 # Removed-asset names that must never reappear anywhere in website/. Built
 # piecewise so this scanner does not trip over its own source.
 FORBIDDEN_NAMES = (
@@ -327,9 +334,9 @@ def check_site_config_keys():
                     "release workflow no longer builds the standalone installer names")
             if "megu-{os.environ[\"RELEASE_VERSION\"]}-{target}.tar.gz" not in release_workflow:
                 findings.append("release workflow archive naming contract changed")
-            workflow_targets = set(re.findall(r"^\s+target: (linux-[^\s]+|macos-[^\s]+|windows-[^\s]+)$",
+            workflow_targets = set(re.findall(r"^\s+target: (linux-[^\s]+|macos-[^\s]+|windows-[^\s]+|freebsd-[^\s]+)$",
                                               release_workflow, re.M))
-            if workflow_targets != set(RELEASE_TARGETS):
+            if workflow_targets != set(RELEASE_TARGETS) | EXTRA_RELEASE_TARGETS:
                 findings.append(
                     "website release target list does not match .github/workflows/release.yml")
 

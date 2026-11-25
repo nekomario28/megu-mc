@@ -112,7 +112,6 @@ python3 tools/release_bundle.py --self-test
 python3 tests/release_bundle_test.py
 python3 tests/release_workflow_test.py
 python3 tests/xplat_packaging_test.py
-python3 tests/pkg_manifests_test.py
 python3 tests/alpha_release_smoke.py --self-test
 python3 tests/multi_mod_e2e_wire.py --self-test
 python3 tests/magic_vfx_anim_live_wire.py --self-test

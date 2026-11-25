@@ -144,6 +144,16 @@ pub use sharded::{
     ServerContext, TickKind, SHARD_COUNT,
 };
 pub use snapshot::{decode_snapshot, encode_snapshot, SnapshotError};
+
+/// Decode a `.mlz4` compressed region container under the default 128 MiB aggregate budget.
+pub fn decode_lz4_region(
+    bytes: &[u8],
+) -> Result<lz4_region::Lz4Region, lz4_region::Lz4Error> {
+    lz4_region::Lz4Region::read_all_with_budget(
+        bytes,
+        lz4_region::MAX_REGION_DECOMPRESSED_BYTES,
+    )
+}
 pub use world_interop::{
     extract_preserved_attachments, inspect_world_interop, merge_preserved_attachments,
     prepare_cross_loader_handoff, roundtrip_level_dat_preserving_attachments,
