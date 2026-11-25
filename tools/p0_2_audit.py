@@ -490,7 +490,7 @@ def parse_spawn_runtime(root=ROOT, sources=None):
     require_runtime(rust_function(potential_impl[1], "add_charge"),
                     r"self\.charges\.push\(", "PotentialCalculator accumulates charges")
     nightly = rust_function(natural, "spawn_nightly_hostile_scratch")
-    nether = rust_function(natural, "spawn_nether_natural_scratch")
+    nether = rust_function(natural, "spawn_nether_natural_dim_scratch")
     require_runtime(nightly, r"nightly_monster_spawners\(pos\)", "Overworld biome monster lookup")
     require_runtime(nightly, r"choose_nightly_spawner\(entries\)", "Overworld weighted monster selection")
     require_runtime(nightly, r"!\s*matches!\(\s*entry\.kind\.as_str\(\)", "Overworld monster exclusion guard")
@@ -536,7 +536,7 @@ def parse_spawn_runtime(root=ROOT, sources=None):
         if fn == "spawn_nightly_hostile":
             require_runtime(body, r"spawn_nightly_hostile_scratch", "nightly wrapper -> scratch")
         if fn == "spawn_nether_natural":
-            require_runtime(body, r"spawn_nether_natural_scratch", "Nether wrapper -> scratch")
+            require_runtime(body, r"spawn_nether_natural_dim_scratch", "Nether wrapper -> dimension scratch")
 
     # A category is reachable only when the gated tick calls a weighted
     # biome-table selector whose selected mob reaches the live insertion path.
