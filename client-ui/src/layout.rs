@@ -17,6 +17,7 @@ use megu_core::i18n::UiTextKey;
 use megu_core::sys_metrics::{MiniHudAnchor, format_mini_hud_lines};
 
 use crate::draw::{UiColor, UiCommand, UiDrawList, UiRect, palette as pal, text_width};
+use crate::mod_sync_ui::ModSyncDiffKind;
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::magic_hud::MagicHudState;
 use crate::sign_and_chat::SIGN_LINE_COUNT;
@@ -2847,17 +2848,23 @@ fn mod_sync(ctx: &mut Ctx) {
     } else {
         for (i, e) in entries.iter().take(7).enumerate() {
             let y = 50 + i as i32 * 17;
-            let (marker, color) = match e.change {
-                ModSyncChange::Added => ("+", pal::ACCENT),
-                ModSyncChange::Updated => ("~", pal::WARNING),
-                ModSyncChange::Removed => ("-", pal::DANGER),
+            // Row badges share `mod_sync_ui`'s canonical diff vocabulary
+            // so the consent screen and the dedicated diff screen read
+            // identically (NEW / UPDATE / REMOVE, same tints).
+            let kind = match e.change {
+                ModSyncChange::Added => ModSyncDiffKind::Missing,
+                ModSyncChange::Updated => ModSyncDiffKind::VersionMismatch,
+                ModSyncChange::Removed => ModSyncDiffKind::Removed,
             };
-            ctx.text(px + 8, y, 1, color, marker);
+            let badge = kind.badge(lang);
+            let bw = text_width(badge, 1) as i32;
+            ctx.text(px + 8, y, 1, kind.color(), badge);
             // Mod names come from the host: sanitize control chars and
             // clip so they can't overrun the SHA column or the panel edge.
             let sha = e.short_sha().to_string();
-            let name_cells = ((pw - 28 - text_width(&sha, 1) as i32 - 8) / 8).max(1) as usize;
-            ctx.hud_text(px + 20, y, 1, pal::TEXT, &e.name, name_cells);
+            let name_cells =
+                ((pw - 36 - bw - text_width(&sha, 1) as i32 - 8) / 8).max(1) as usize;
+            ctx.hud_text(px + 16 + bw, y, 1, pal::TEXT, &e.name, name_cells);
             let sw = text_width(&sha, ctx.s as u32) as i32;
             ctx.text(px + pw - 8 - sw / ctx.s, y, 1, pal::TEXT_DIM, &sha);
         }

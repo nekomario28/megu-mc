@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the Polymorph-style crafting-conflict switcher
 //! (`conflict_widget`) and the mod-sync diff consent screen
 //! (`mod_sync_ui`): hide-unless-conflicted semantics, `< k/N >` cycling
@@ -29,6 +29,8 @@ fn assert_commands_in_viewport(list: &UiDrawList, w: u32, h: u32) {
         match cmd {
             UiCommand::FillRect { rect, .. }
             | UiCommand::BorderRect { rect, .. }
+            | UiCommand::ItemIcon { rect, .. }
+            | UiCommand::Sprite { rect, .. }
             | UiCommand::ProgressBar { rect, .. } => {
                 assert!(rect.w > 0 && rect.h > 0, "empty rect: {rect:?}");
                 assert!(

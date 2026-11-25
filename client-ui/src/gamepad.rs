@@ -7,7 +7,7 @@
 //!
 //! * [`GamepadBrand`] / [`GamepadButton`] / [`GamepadAxis`] — device profiles,
 //!   per-brand prompt labels (`A/B/X/Y`, `Cross/Circle/Square/Triangle`,
-//!   Nintendo `B/A/Y/X`) and bilingual EN/JA action names
+//!   Switch `B/A/Y/X`) and bilingual EN/JA action names
 //!   ([`GamepadAction::name`]).
 //! * [`StickConfig`] / [`process_radial_stick`] — scaled radial deadzone,
 //!   outer deadzone, exponential response curve and Y-invert with fail-closed
@@ -18,7 +18,7 @@
 //!   R3 sneak, D-pad camera/zoom/recipe/debug) plus a full UI/container mode:
 //!   magnetic virtual cursor that slows over [`HitRegion`] centers, D-pad
 //!   spatial focus jumps, confirm/cancel/quick-move/split-stack and bumper
-//!   tab switching — with the Nintendo confirm-swap option.
+//!   tab switching — with the Switch confirm-swap option.
 //! * [`RadialWheelState`] — an 8-slice action wheel driven by the right
 //!   stick while Select is held, plus [`RadialWheelState::layout`]'s
 //!   pure-geometry render model for `client-gpu`.
@@ -63,14 +63,14 @@ impl GamepadBrand {
         match vendor_id {
             0x045E => return Self::Xbox,      // Microsoft
             0x054C => return Self::PlayStation, // Sony
-            0x057E => return Self::Switch,    // Nintendo
+            0x057E => return Self::Switch,    // Switch (Pro / Joy-Con vendor id)
             0x28DE => return Self::SteamDeck, // Valve
             _ => {}
         }
         let n = name.to_ascii_lowercase();
         if n.contains("dualsense") || n.contains("dualshock") || n.contains("playstation") {
             Self::PlayStation
-        } else if n.contains("switch") || n.contains("nintendo") || n.contains("pro controller") {
+        } else if n.contains("switch") || n.contains("pro controller") {
             Self::Switch
         } else if n.contains("steam") || n.contains("valve") {
             Self::SteamDeck
@@ -84,7 +84,7 @@ impl GamepadBrand {
         match self {
             Self::Xbox => "Xbox",
             Self::PlayStation => "PlayStation",
-            Self::Switch => "Nintendo Switch",
+            Self::Switch => "Switch",
             Self::SteamDeck => "Steam Deck",
         }
     }
@@ -185,7 +185,7 @@ impl GamepadButton {
 
     /// On-screen prompt label for this button on `brand`.
     ///
-    /// Face buttons follow the physical position, so Nintendo pads
+    /// Face buttons follow the physical position, so Switch pads
     /// correctly read `B/A/Y/X` (confirm sits on the *east* label `A`).
     /// Symbols (`✕○□△`, arrows, `☰`, `⧉`) are drawn by the built-in
     /// extended glyph table — no external brand assets anywhere.
@@ -402,9 +402,9 @@ impl GamepadAxis {
 /// UI/container navigation so prompt rendering has a single vocabulary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GamepadAction {
-    /// South (or East on swapped Nintendo): jump / confirm.
+    /// South (or East on swapped Switch pads): jump / confirm.
     Jump,
-    /// East (or South on swapped Nintendo): drop held item / go back.
+    /// East (or South on swapped Switch pads): drop held item / go back.
     DropOrBack,
     /// West: open/close the inventory.
     OpenInventory,
@@ -1016,6 +1016,15 @@ impl InputModeTracker {
         self.mode = InputSourceMode::KeyboardMouse;
         self.mode
     }
+
+    /// Event-driven equivalent of [`on_gamepad_state`](Self::on_gamepad_state):
+    /// a host that dispatches per-event button presses (rather than a
+    /// polled [`GamepadState`]) reports gamepad activity here — any
+    /// pressed button selects [`InputSourceMode::Gamepad`].
+    pub fn on_gamepad_input(&mut self) -> InputSourceMode {
+        self.mode = InputSourceMode::Gamepad;
+        self.mode
+    }
 }
 
 /// How the left stick maps onto movement input.
@@ -1031,9 +1040,9 @@ pub enum AnalogMovementMode {
 }
 
 /// The physical button meaning "confirm / jump / primary" for `brand`
-/// under the Nintendo confirm-swap setting.
-const fn confirm_button_for(brand: GamepadBrand, nintendo_confirm_swap: bool) -> GamepadButton {
-    if matches!(brand, GamepadBrand::Switch) && nintendo_confirm_swap {
+/// under the Switch confirm-swap setting.
+const fn confirm_button_for(brand: GamepadBrand, switch_confirm_swap: bool) -> GamepadButton {
+    if matches!(brand, GamepadBrand::Switch) && switch_confirm_swap {
         GamepadButton::East
     } else {
         GamepadButton::South
@@ -1041,8 +1050,8 @@ const fn confirm_button_for(brand: GamepadBrand, nintendo_confirm_swap: bool) ->
 }
 
 /// The physical button meaning "cancel / drop / back" for `brand`.
-const fn cancel_button_for(brand: GamepadBrand, nintendo_confirm_swap: bool) -> GamepadButton {
-    if matches!(brand, GamepadBrand::Switch) && nintendo_confirm_swap {
+const fn cancel_button_for(brand: GamepadBrand, switch_confirm_swap: bool) -> GamepadButton {
+    if matches!(brand, GamepadBrand::Switch) && switch_confirm_swap {
         GamepadButton::South
     } else {
         GamepadButton::East
@@ -1077,8 +1086,8 @@ pub struct GamepadMapper {
     pub trigger_release: f32,
     /// When `brand` is [`GamepadBrand::Switch`], treat the east (`A`)
     /// button as confirm/jump and south (`B`) as cancel/back — matching
-    /// Nintendo system conventions. No effect on other brands.
-    pub nintendo_confirm_swap: bool,
+    /// Switch system conventions. No effect on other brands.
+    pub switch_confirm_swap: bool,
     /// Master haptics switch.
     pub rumble_enabled: bool,
     /// Haptic intensity scale, clamped to `0.0..=1.0` per command.
@@ -1117,7 +1126,7 @@ impl GamepadMapper {
             right_stick: StickConfig::default(),
             trigger_press: TRIGGER_PRESS_THRESHOLD,
             trigger_release: TRIGGER_RELEASE_THRESHOLD,
-            nintendo_confirm_swap: true,
+            switch_confirm_swap: true,
             rumble_enabled: true,
             rumble_strength: 1.0,
             ui_mode: false,
@@ -1138,15 +1147,15 @@ impl GamepadMapper {
     }
 
     /// The physical button that means "confirm / jump / primary" right
-    /// now — `East` (`A`) on Switch when [`Self::nintendo_confirm_swap`]
+    /// now — `East` (`A`) on Switch when [`Self::switch_confirm_swap`]
     /// is set, `South` everywhere else.
     pub fn confirm_button(&self) -> GamepadButton {
-        confirm_button_for(self.brand, self.nintendo_confirm_swap)
+        confirm_button_for(self.brand, self.switch_confirm_swap)
     }
 
     /// The physical button that means "cancel / drop / back".
     pub fn cancel_button(&self) -> GamepadButton {
-        cancel_button_for(self.brand, self.nintendo_confirm_swap)
+        cancel_button_for(self.brand, self.switch_confirm_swap)
     }
 
     /// Current hotbar slot (`0..9`).
@@ -1673,15 +1682,15 @@ pub struct ConsoleHintItem {
 /// "button = action" prompts shown at the bottom of every screen.
 ///
 /// Badges follow `brand`; the confirm/cancel pair honors
-/// `nintendo_confirm_swap` exactly like [`GamepadMapper`].
+/// `switch_confirm_swap` exactly like [`GamepadMapper`].
 pub fn build_context_hints(
     context: HintContext,
     brand: GamepadBrand,
     lang: UiLang,
-    nintendo_confirm_swap: bool,
+    switch_confirm_swap: bool,
 ) -> Vec<ConsoleHintItem> {
-    let confirm = confirm_button_for(brand, nintendo_confirm_swap);
-    let cancel = cancel_button_for(brand, nintendo_confirm_swap);
+    let confirm = confirm_button_for(brand, switch_confirm_swap);
+    let cancel = cancel_button_for(brand, switch_confirm_swap);
     let item = |btn: GamepadButton, label: &'static str| ConsoleHintItem {
         badge: btn.badge_spec(brand),
         label,

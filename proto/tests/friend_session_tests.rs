@@ -624,6 +624,32 @@ fn upnp_post_request_shape() {
     assert!(text.starts_with("POST /ctl/IPConn HTTP/1.1\r\n"));
     assert!(text.contains("SOAPACTION: \"urn:schemas-upnp-org:service:WANIPConnection:1#DeletePortMapping\""));
     assert!(text.contains(&format!("CONTENT-LENGTH: {}", body.len())));
+    // Every header line must terminate with CRLF and carry no raw
+    // control or non-ascii bytes of its own.
+    let head = text.split("\r\n\r\n").next().unwrap();
+    for line in head.split("\r\n") {
+        assert!(!line.contains('\r') && !line.contains('\n'));
+        assert!(line.bytes().all(|b| b.is_ascii() && b >= 0x20));
+    }
+}
+
+#[test]
+fn upnp_post_rejects_crlf_injection() {
+    let body = "b";
+    // CR/LF (or other control bytes) in any request-field must fail
+    // closed — a smuggled header can never reach the wire.
+    for (host, path, service, action) in [
+        ("gw\r\nINJECTED: 1", "/ctl/IPConn", UPNP_WANIP_SERVICE, "Act"),
+        ("gw", "/ctl/IPConn\r\nINJECTED: 1", UPNP_WANIP_SERVICE, "Act"),
+        ("gw", "/ctl/IPConn", "svc\r\nX", "Act"),
+        ("gw", "/ctl/IPConn", UPNP_WANIP_SERVICE, "Act\r\nX"),
+        ("gw\u{e9}", "/ctl/IPConn", UPNP_WANIP_SERVICE, "Act"),
+    ] {
+        assert!(
+            upnp_http_post_request(host, path, service, action, body).is_err(),
+            "field with control or non-ascii byte accepted: {host:?} {path:?}"
+        );
+    }
 }
 
 #[test]

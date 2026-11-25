@@ -1051,6 +1051,10 @@ pub struct GpuApp {
     /// straight into `ui_draw_list`. `Default` is empty, so the hook is
     /// free until a mod host feeds it through [`Self::set_gui_bridge_batch`].
     gui_bridge_batch: GuiBridgeBatch,
+    /// Declarative mod-UI manifest (`megu_core::ui_contract::ModUiManifest`)
+    /// rendered through `client-ui`'s shared Vanilla widget kit into the
+    /// `ModOverlay` retained layer — `None` when no mod manifest is up.
+    mod_ui_manifest: Option<megu_core::ui_contract::ModUiManifest>,
     /// Monotonic epoch for time-driven 2D HUD shimmer (enchantment
     /// glint): `Instant`, never `SystemTime`, so every overlay stays
     /// deterministic under replay and headless tests.
@@ -1394,6 +1398,7 @@ impl GpuApp {
             live_strategy_pending: true,
             ui_draw_list: UiDrawList::new(),
             gui_bridge_batch: GuiBridgeBatch::default(),
+            mod_ui_manifest: None,
             ui_anim_epoch: Instant::now(),
             particle_scratch: Vec::new(),
             live_particles_staged: false,
@@ -1727,6 +1732,18 @@ impl GpuApp {
     /// before touching the draw list.
     pub fn set_gui_bridge_batch(&mut self, batch: GuiBridgeBatch) {
         self.gui_bridge_batch = batch;
+    }
+
+    /// Install (or clear) the declarative mod-UI manifest composited on
+    /// the `ModOverlay` layer each frame. The manifest is re-audited
+    /// every render by `vanilla_widgets::draw_mod_ui_manifest_sprites`
+    /// (title-screen overlay attempts are rejected upstream by
+    /// `audit_manifest`), so the host can hand it straight through.
+    pub fn set_mod_ui_manifest(
+        &mut self,
+        manifest: Option<megu_core::ui_contract::ModUiManifest>,
+    ) {
+        self.mod_ui_manifest = manifest;
     }
 
     /// The recipe/resource browser state (JEI/EMI/JER/Ponder index, tabs,
@@ -2226,6 +2243,12 @@ impl GpuApp {
                 if let Err(err) = self.join_guest_link(link) {
                     self.status_line(format!("Guest link: {err}"));
                 }
+            }
+            UiAction::Claims(action) => {
+                // The `ClaimsWorld` sync channel is not wired into the
+                // session yet — surface the overlay's request instead of
+                // dropping it silently.
+                self.status_line(format!("Claims: {action:?} (no claims-capable session)"));
             }
             _ => {}
         }
@@ -2929,24 +2952,35 @@ impl GpuApp {
         }
     }
 
-    /// `WindowEvent::DroppedFile` staging hook: remember the path and
-    /// surface a non-fatal localized notice. The payload is only
-    /// recorded — classification (`DropPayloadClassifier`) and any
-    /// action on it are alpha.4 wiring, so nothing executes here.
+    /// `WindowEvent::DroppedFile` staging hook: record the path, run the
+    /// universal payload classifier, and surface its verdict. Nothing
+    /// installs from the verdict alone — installable kinds carry a
+    /// mandatory bilingual consent prompt the UI must still show.
     fn record_dropped_file(&mut self, path: &std::path::Path) {
+        let verdict = megu_ui::seamless_ux::DropPayloadClassifier::classify_path(path);
+        let lang = self.ui.lang();
+        self.last_dropped_file = Some(path.to_path_buf());
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.last_dropped_file = Some(path.to_path_buf());
-        self.status_line(format!(
-            "{}{name}",
-            tr(
-                self.ui.lang(),
-                "Dropped file (import not wired yet): ",
-                "ドロップされたファイル（取り込みは未対応）: ",
-            )
-        ));
+        if let Some(prompt) = &verdict.prompt {
+            self.status_line(format!(
+                "{} {} {}{name}",
+                prompt.title(lang),
+                prompt.message(lang),
+                tr(lang, "Import: ", "取り込み: "),
+            ));
+        } else {
+            let reason = match &verdict.rejection {
+                Some(r) => format!("{r:?}"),
+                None => tr(lang, "unrecognized payload", "未対応のペイロード").to_owned(),
+            };
+            self.status_line(format!(
+                "{}{name}: {reason}",
+                tr(lang, "Dropped file rejected: ", "ドロップされたファイルは拒否されました: "),
+            ));
+        }
     }
 
     /// A user-visible status line for actions that can't silently no-op:
@@ -3593,6 +3627,26 @@ impl GpuApp {
             .frl_identity
             .clone()
             .ok_or_else(|| "no FRL3 identity (megu-identity.key)".to_owned())?;
+        // One-click publish goes through `friend_session`'s consent plan:
+        // the player's Friends-screen toggle is the explicit
+        // `PublishToFriends` consent, and the plan orders every transport
+        // it allows. Port mapping is not requested, so the plan is
+        // `[ProbeStunAndPunch, OpenRelayTunnel]`; the relay tunnel is the
+        // implemented step today and the plan is validated before it.
+        let policy = megu_proto::friend_session::FriendPublishPolicy::default();
+        let plan = megu_proto::friend_session::plan_publish(
+            &policy,
+            megu_proto::friend_session::PublishConsent::PublishToFriends {
+                allow_port_mapping: false,
+            },
+        )
+        .map_err(|e| format!("publish plan: {e}"))?;
+        if !plan
+            .iter()
+            .any(|step| matches!(step, megu_proto::friend_session::PublishStep::OpenRelayTunnel))
+        {
+            return Err("publish plan has no reachable transport".to_owned());
+        }
         let relay = self.friend_relay_addr()?;
         let protocol = self.config.mc_version.parse::<i32>().unwrap_or(767);
         let world = self
@@ -5731,6 +5785,18 @@ impl GpuApp {
             self.ui_modoverlay_list
                 .commands
                 .extend(lower_bridge_batch_to_draw_cmds(&self.gui_bridge_batch, w, h));
+        }
+        // Declarative mod-UI manifest: the shared Vanilla widget kit
+        // renders it on the same layer (Vanilla 1.21.1 sprite atlas when
+        // the client JAR supplied one, pixel-authentic bevels otherwise).
+        if let Some(manifest) = &self.mod_ui_manifest {
+            megu_ui::vanilla_widgets::draw_mod_ui_manifest_sprites(
+                &mut self.ui_modoverlay_list,
+                manifest,
+                self.ui.effective_scale(h),
+                UiRect::new(0, 0, w, h),
+                self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
+            );
         }
         // Retained per-layer upload: fingerprint each layer's list and
         // bump its `UiLayer` revision only when content moved — the
@@ -9957,8 +10023,8 @@ mod tests {
     }
 
     /// `DroppedFile` records the payload and surfaces a non-fatal
-    /// localized status notice — nothing executes, matching the alpha.4
-    /// `DropPayloadClassifier` staging contract.
+    /// localized status notice carrying the universal classifier's
+    /// verdict — a nonexistent path is rejected, nothing executes.
     #[test]
     fn dropped_file_is_recorded_and_announced() {
         let mut app = GpuApp::new(GpuCliConfig::default());
@@ -9970,7 +10036,7 @@ mod tests {
         assert!(app
             .status_messages()
             .iter()
-            .any(|m| m.contains("cool-pack.zip") && m.contains("not wired")));
+            .any(|m| m.contains("cool-pack.zip") && m.contains("rejected")));
 
         // A second drop replaces the staged payload.
         let other = std::path::Path::new("/tmp/shader");

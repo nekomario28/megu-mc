@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Tests for the Controllable-class gamepad engine: radial deadzone math,
-//! brand prompt glyphs and the Nintendo confirm-swap, hotbar wrap-around,
+//! brand prompt glyphs and the Switch confirm-swap, hotbar wrap-around,
 //! analog-trigger hysteresis, magnetic virtual-cursor navigation, D-pad
 //! focus jumps, the 8-slice radial wheel, and the bounded rumble queue.
 
@@ -201,7 +201,7 @@ fn per_brand_prompt_labels() {
     assert_eq!(GamepadButton::North.prompt_label(GamepadBrand::PlayStation), "△");
     assert_eq!(GamepadButton::DpadUp.prompt_label(GamepadBrand::PlayStation), "↑");
 
-    // Nintendo positions: the physical south button is labeled B; the
+    // Switch positions: the physical south button is labeled B; the
     // Select glyph is U+2212, not an ASCII hyphen.
     assert_eq!(GamepadButton::South.prompt_label(GamepadBrand::Switch), "B");
     assert_eq!(GamepadButton::East.prompt_label(GamepadBrand::Switch), "A");
@@ -300,7 +300,7 @@ fn brand_detection_uses_usb_ids_then_name() {
         GamepadBrand::PlayStation
     );
     assert_eq!(
-        GamepadBrand::detect(0, 0, "Nintendo Switch Pro Controller"),
+        GamepadBrand::detect(0, 0, "Switch Pro Controller"),
         GamepadBrand::Switch
     );
     assert_eq!(GamepadBrand::detect(0, 0, "mystery pad"), GamepadBrand::Xbox);
@@ -333,9 +333,9 @@ fn switch_confirm_swap_vs_xbox() {
         GamepadAction::UiCancel
     ));
 
-    // Swap disabled: Nintendo falls back to positional semantics.
+    // Swap disabled: Switch falls back to positional semantics.
     let mut switch = GamepadMapper::new(GamepadBrand::Switch);
-    switch.nintendo_confirm_swap = false;
+    switch.switch_confirm_swap = false;
     switch.ui_mode = true;
     assert_eq!(switch.confirm_button(), GamepadButton::South);
     assert!(has_action(
@@ -343,7 +343,7 @@ fn switch_confirm_swap_vs_xbox() {
         GamepadAction::UiConfirm
     ));
 
-    // The swap also drives gameplay binds (east `A` = jump on Nintendo).
+    // The swap also drives gameplay binds (east `A` = jump on Switch).
     let mut gp = GamepadMapper::new(GamepadBrand::Switch);
     assert!(has_action(
         &tap(&mut gp, GamepadButton::East),

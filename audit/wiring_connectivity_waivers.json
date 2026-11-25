@@ -993,7 +993,7 @@
       "symbol": "set_gui_bridge_batch",
       "file": "client-gpu/src/window.rs",
       "line": 1386,
-      "reason": "Tier-2 mod GUI batch feed deferred to alpha.4: the gui_bridge_batch field is consumed by the HUD lowering pass, but no production caller pushes a batch yet — only the staged setter and tests.",
+      "reason": "Tier-2 mod GUI batch feed deferred to alpha.4: the gui_bridge_batch field is consumed by the HUD lowering pass, but no production caller pushes a batch yet \u2014 only the staged setter and tests.",
       "lane": "ALPHA4-GUI-BRIDGE",
       "date": "2026-11-24"
     },
@@ -1004,6 +1004,15 @@
       "line": 1910,
       "reason": "Alpha.4 mod-sync consent planner: produces the per-server ModSyncApprovalPlan (sandboxed profile staging, personal-mod preservation/suspension) but the client approval flow that would invoke it is intentionally deferred to alpha.4.",
       "lane": "ALPHA4-MOD-SYNC",
+      "date": "2026-11-24"
+    },
+    {
+      "check": "dead_client_config_field",
+      "symbol": "UiSettings.qol.show_support_links",
+      "file": "client-ui/src/state.rs",
+      "line": 670,
+      "reason": "Setting scoped the removed title-screen link row; the Vanilla-pure Title never renders links and About keeps all links regardless (pinned by title_link_row_removed_about_keeps_all_links). Kept for settings-file and programmatic compatibility.",
+      "lane": "CLIENT-UI-QOL",
       "date": "2026-11-24"
     }
   ]

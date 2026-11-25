@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: LGPL-3.0-or-later OR GPL-3.0-or-later OR AGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later
 //! Mod Sync Diff & Explicit Consent approval screen.
 //!
 //! When a server's mod list differs from the client's, the host computes
@@ -50,6 +50,9 @@ pub enum ModSyncDiffKind {
     Incompatible,
     /// Identical on both sides — no action needed.
     Matched,
+    /// The server's set excludes it — the client's copy is removed from
+    /// the isolated profile for this server.
+    Removed,
 }
 
 impl ModSyncDiffKind {
@@ -61,6 +64,7 @@ impl ModSyncDiffKind {
             Self::Optional => tr(lang, "OPTION", "オプション"),
             Self::Incompatible => tr(lang, "BLOCKED", "利用不可"),
             Self::Matched => tr(lang, "OK", "一致"),
+            Self::Removed => tr(lang, "REMOVE", "削除"),
         }
     }
 
@@ -72,6 +76,7 @@ impl ModSyncDiffKind {
             Self::Optional => palette::AIR,
             Self::Incompatible => palette::DANGER,
             Self::Matched => palette::BUTTON_DISABLED,
+            Self::Removed => palette::DANGER,
         }
     }
 }
@@ -380,7 +385,9 @@ impl ModSyncUiState {
                         plan.sync_ids.push(e.mod_id.clone());
                     }
                 }
-                ModSyncDiffKind::Incompatible => plan.blocked_ids.push(e.mod_id.clone()),
+                ModSyncDiffKind::Incompatible | ModSyncDiffKind::Removed => {
+                    plan.blocked_ids.push(e.mod_id.clone())
+                }
                 ModSyncDiffKind::Matched => {}
                 kind => {
                     if e.source == ModSyncSource::ManualRequired {
