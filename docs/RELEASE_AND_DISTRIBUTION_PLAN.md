@@ -1,6 +1,6 @@
 # Release & Distribution Plan — Megu (megu)
 
-`v0.1.0-alpha.1` 公開に向けた、ライセンス・配布経路・公式サイト・
+`v0.1.0-alpha.x` 系列の公開に向けた、ライセンス・配布経路・公式サイト・
 スポンサーシップ・ローンチチェックリストの実践ガイド。
 対象読者は日本在住の学生開発者。英語の技術用語はそのまま使う。
 
@@ -113,28 +113,31 @@ Windows `.exe` 名（`megu-client-gpu.exe` 等）も `--gameDir` /
 
 ### 2.2 GitHub Releases（一次配布）
 
-[.github/workflows/release.yml](../.github/workflows/release.yml) が
-既に 8 バイナリのクロスプラットフォームビルドとアーカイブ検証を持つ。
-公開時の成果物セット:
+[.github/workflows/release.yml](../.github/workflows/release.yml) は
+12 target のクロスプラットフォームビルドと、アーカイブごとの
+`tools/release_bundle.py verify` を持つ。公開時の成果物セットは
+target-dependent で、全 OS 共通の単一形ではない:
 
-| Platform | Artifact | 備考 |
+| Lane | Targets | 同梱 binary |
 |---|---|---|
-| Linux x86_64 | `megu-<ver>-x86_64-unknown-linux-gnu.tar.gz` | `tools/release_bundle.py` の決定的 tarball |
-| Linux arm64 | `megu-<ver>-aarch64-unknown-linux-gnu.tar.gz` | 同上 |
-| Linux x86_64 | `megu-<ver>-x86_64.AppImage` | AppImage 化（任意・後追い可） |
-| Windows x86_64 | `megu-<ver>-windows-x86_64.zip` | `.msi` は WiX/インストーラ整備後に検討 |
-| macOS Universal | `megu-<ver>-macos-universal.dmg` | arm64+x86_64 universal binary |
+| full desktop | `linux-x86_64`, `linux-arm64`, `macos-arm64`, `macos-x86_64`, `windows-x86_64`, `windows-arm64` | `megu`, `megu-client-gpu`, `megu-installer` |
+| server-only | `linux-x86_64-musl`, `linux-arm64-musl`, `freebsd-x86_64`, `linux-riscv64` | `megu`, `megu-installer` |
+| dynamic-musl client | `linux-x86_64-musl-client`, `linux-arm64-musl-client` | `megu-client-gpu` のみ |
+
+AppImage / `.msi` / macOS universal `.dmg` は現行 workflow の成果物ではない。
+後追いで追加する場合も、まずこの target-dependent matrix と矛盾しない
+ことを [tests/release_workflow_test.py](../tests/release_workflow_test.py) で固定する。
 
 - 各リリースに `SHA256SUMS` と `release-manifest.json` を必ず添付
   （`release_bundle.py verify` が bytes レベルで再検証する）。
 - **SBOM**: `cargo-sbom` / `cargo-cyclonedx` で CycloneDX SBOM を生成し
   `megu-<ver>.cdx.json` として添付する（サプライチェーン透明性、
   `deny.toml` の advisory 情報と整合）。
-- Companion binaries（`megu-client`, `megu-mod-check`,
-  `megu-world-migrate`, `megu-init`, `megu-admin`,
-  `megu-client-gpu`, `megu-installer`）は
-  `--extra-binary` で同一 tarball に同梱する（H18 で対応済み）。
-  ※同梱 8 バイナリの削減ポリシーは zero-bloat 監査 #4 の未決事項。
+- 内部 tool binary（`megu-client`, `megu-mod-check`,
+  `megu-world-migrate`, `megu-init`, `megu-admin`）は source-buildable
+  だが現行 release tarball には同梱しない。end-user artifact は上表の
+  target-dependent 3/2/1 binary 形だけであり、[tests/release_bundle_test.py](../tests/release_bundle_test.py)
+  と release workflow の両方で検証する。
 - コンテナイメージ `megu:<ver>` は GHCR (`ghcr.io/<owner>/megu`)
   へ push。Docker Hub は学生アカウントでも可だが GHCR が無料・連携が楽。
 
