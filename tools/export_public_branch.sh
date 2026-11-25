@@ -3,7 +3,10 @@
 set -euo pipefail
 usage() { echo 'Usage: export_public_branch.sh --out <empty-or-new-dir> [--branch <name>] [--verify] [--from-worktree]'; }
 die() { echo "export: $*" >&2; exit 1; }
-out= branch=public-export verify=0 worktree=0
+out=
+branch=public-export
+verify=0
+worktree=0
 while (($#)); do
     case $1 in
         --out|--branch)

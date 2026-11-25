@@ -25,7 +25,7 @@
 # happens before the build, and a cargo or an editor that does not take the lock still reads the
 # live file.
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 # Strictness is a contract, not a truthiness test: "0" is not "on" and a typo is not "off".
 case "${MUTATION_STABILITY:-0}" in

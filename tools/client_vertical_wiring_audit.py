@@ -421,7 +421,7 @@ def check_worker_commands(sources, gpu_sources):
     fns = fn_ranges(live)
 
     def enclosing_fn(pos):
-        for name, is_pub, start, end in fns:
+        for name, _is_pub, start, end in fns:
             if start <= pos < end:
                 return name
         return None
@@ -439,7 +439,7 @@ def check_worker_commands(sources, gpu_sources):
     # another client-gpu file, or from a method that itself is (one level of
     # internal helpers covers the real call shapes).
     internal_edges = {}  # callee -> {callers}
-    for name, is_pub, start, end in fns:
+    for name, _is_pub, start, end in fns:
         body_text = live[start:end]
         for callee in re.finditer(
                 r"(?<![\w:])(?:self\.)?([a-z_][A-Za-z0-9_]*)\s*\(", body_text):

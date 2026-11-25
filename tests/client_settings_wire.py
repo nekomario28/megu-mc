@@ -52,7 +52,7 @@ def session(binary, late):
                     want = disc(radius) if requested == 127 else square(radius)
                     if barrier is None:
                         before = len(client.chunk_batches)
-                        client.until(lambda *_: want <= set(client.chunks),
+                        client.until(lambda *_, want=want: want <= set(client.chunks),
                                      f"play-view-{requested}")
                         # the requested rate (30 chunks/tick) cannot carry the 17x17
                         # window in one batch, so the acknowledgement gated at least

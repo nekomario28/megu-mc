@@ -766,10 +766,10 @@ def gen_wave5(rng, budget):
     dig_coords = [(0, 70, 0), (0, 71, 0), (0, -60, 0), (100000, 70, 100000),
                   (-30000000, 319, 30000000), (0, 320, 0)]
     i = 0
-    for status in dig_statuses:
+    for dig_status in dig_statuses:
         x, y, z = dig_coords[i % len(dig_coords)]
-        add(P_DIG, dig_body(status, x, y, z, dig_faces[i % len(dig_faces)], i),
-            f"dig-status{status}")
+        add(P_DIG, dig_body(dig_status, x, y, z, dig_faces[i % len(dig_faces)], i),
+            f"dig-status{dig_status}")
         i += 1
     for j, (x, y, z) in enumerate(dig_coords):
         add(P_DIG, dig_body(2, x, y, z, 1, j), f"dig-finish-{j}")
@@ -811,7 +811,7 @@ def gen_wave5(rng, budget):
     for i, body in enumerate([b"", vint_i32(0), vint_i32(-1), vint_i32(9999),
                               b"\xff" * 8, rng.randbytes(6)]):
         add(P_PICK_ITEM, body, f"pickitem-{i}")
-    for i, slot in enumerate([-32768, -1, 0, 8, 9, 300, 32767]):
+    for slot in [-32768, -1, 0, 8, 9, 300, 32767]:
         add(P_HELD, struct.pack(">h", slot), f"held-{slot}")
     add(P_HELD, b"\x00", "held-1byte")
     add(P_HELD, b"", "held-empty")
@@ -823,7 +823,6 @@ def gen_wave5(rng, budget):
 
 def allocate_cases(seed, total):
     """Distribute `total` cases across waves 1..5 deterministically."""
-    rng = random.Random(seed ^ 0x5EED)
     weights = [0.20, 0.20, 0.26, 0.22, 0.12]
     mins = [12, 10, 16, 14, 8]
     counts = [max(mins[i], int(total * weights[i])) for i in range(5)]
@@ -1206,7 +1205,7 @@ def run_wave1(srv, cases, problems, notes):
         sess = None
         try:
             if stage == "pre":
-                for kind, *rest in sends:
+                for _kind, *rest in sends:
                     data = rest[0]
                     with socket.create_connection(("127.0.0.1", game),
                                                   timeout=5) as s:
@@ -1218,12 +1217,12 @@ def run_wave1(srv, cases, problems, notes):
                 continue
             sess = RawSession(game)
             if stage == "hs":
-                for kind, *rest in sends:
+                for _kind, *rest in sends:
                     sess.send_raw(rest[0])
             elif stage == "post_hs":
                 sess.send_raw(login_frame(0, hs_body(PROTOCOL, b"localhost",
                                                    game, 2)))
-                for kind, *rest in sends:
+                for _kind, *rest in sends:
                     sess.send_raw(rest[0])
             elif stage == "post_login":
                 ident = (f"FzW1{idx:03d}", idx.to_bytes(16, "big"))
@@ -1500,7 +1499,7 @@ DENIAL_MARKERS = ("do not have permission", "unknown command",
 
 
 def run_wave4(srv, cases, problems, notes, clients):
-    game, rcon = srv["game"], srv["rcon"]
+    game, _rcon = srv["game"], srv["rcon"]
     names = ["FzCmdA", "FzCmdB", "FzCmdC", "FzCmdD"]
     replies = []
     sent = 0

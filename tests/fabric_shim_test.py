@@ -413,13 +413,15 @@ def main():
             return json.dumps(value, sort_keys=True)
 
         good = {**server_classes, "fixture/ClientHelper.class": classpath["fixture/ClientHelper.class"], "fabric.mod.json": metadata()}
-        mixin_cfg = json.dumps({"package": "fixture.mixin", "server": ["RedirectMixin"]})
+        redirect_mixin_cfg = json.dumps({"package": "fixture.mixin", "server": ["RedirectMixin"]})
         good_mixin = {**good, "fixture/mixin/GoodMixin.class": mixin_classes["fixture/mixin/GoodMixin.class"],
                       "fabric.mod.json": metadata(mixins=["good.mixins.json"]),
                       "good.mixins.json": json.dumps({"package":"fixture.mixin","server":["GoodMixin"]})}
         client_mod = {"fixture/ClientMod.class": classpath["fixture/ClientMod.class"], "fabric.mod.json": metadata(env="client", entry="fixture.ClientMod")}
         aw = {**good, "fabric.mod.json": metadata()[:-1] + ', "accessWidener": "fixture.accesswidener"}', "fixture.accesswidener": "accessWidener v2 named"}
-        redirect = {**good_mixin, "fixture/mixin/RedirectMixin.class": mixin_classes["fixture/mixin/RedirectMixin.class"]}
+        redirect = {**good, "fixture/mixin/RedirectMixin.class": mixin_classes["fixture/mixin/RedirectMixin.class"],
+                    "fabric.mod.json": metadata(mixins=["redirect.mixins.json"]),
+                    "redirect.mixins.json": redirect_mixin_cfg}
         invoke = {**good, "fixture/mixin/InvokeMixin.class": mixin_classes["fixture/mixin/InvokeMixin.class"], "fabric.mod.json": metadata(mixins=["invoke.mixins.json"]), "invoke.mixins.json": json.dumps({"package":"fixture.mixin","server":["InvokeMixin"]})}
         unknown = {"fixture/Unknown.class": classpath["fixture/Unknown.class"], "fabric.mod.json": metadata(entry="fixture.Unknown")}
         cases = {"good": good, "good_mixin": good_mixin, "client_mod": client_mod, "access_widener": aw,

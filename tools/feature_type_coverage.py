@@ -191,7 +191,7 @@ def main():
     print(f"unimplemented types a biome reaches ({scope}): {len(reaching_any_biome)} "
           f"({', '.join(r[0] for r in reaching_any_biome)})")
     if overworld_only:
-        print(f"  the widest of them: "
+        print("  the widest of them: "
               + ", ".join(f"{t} in {nb} biomes" for t, _, _, nb in
                           sorted(reaching_any_biome, key=lambda r: -r[3])[:5]))
     return 0

@@ -122,7 +122,7 @@ def server(binary, world):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-                raise AssertionError("server did not shut down within 3 seconds")
+                raise AssertionError("server did not shut down within 3 seconds") from None
             log.flush()
             log.seek(0)
             output = log.read()

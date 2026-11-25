@@ -35,7 +35,6 @@ import math
 import socket
 import struct
 import sys
-import tempfile
 import time
 from collections import Counter
 from pathlib import Path
@@ -44,7 +43,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 from container_wire import stack as read_stack, wire_stack  # noqa: E402
 from protocol767 import (Client, Reader, WIRE_BLOCKS, local_server, position,  # noqa: E402
-                         require, vint)
+                         vint)
 from wire_smoke import port, rcon_frame, rcon_response  # noqa: E402
 
 RCON_PASS = "wire-minimality-local"

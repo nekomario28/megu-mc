@@ -156,7 +156,7 @@ def run_server(binary, world, client, stopping):
                     return result if result >= 0 else 128 - result
                 except subprocess.TimeoutExpired:
                     if server.poll() is not None:
-                        raise ValueError(f"server exited while client was running ({server.returncode})")
+                        raise ValueError(f"server exited while client was running ({server.returncode})") from None
             return 1
         finally:
             stop_process(process)

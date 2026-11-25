@@ -11,7 +11,6 @@ import sys
 import tempfile
 from threading import Thread
 import unittest
-from unittest import mock
 import zipfile
 
 

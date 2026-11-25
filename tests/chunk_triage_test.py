@@ -6,7 +6,6 @@ import io
 import json
 from pathlib import Path
 import struct
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -255,7 +254,6 @@ class ChunkTriageContracts(unittest.TestCase):
     def test_port_bin_slicing_and_world_b_noise_split(self):
         blocks_meta = json.loads((ROOT / "assets/blocks_1211.json").read_text())
         grass = next(b for b in blocks_meta if b["name"] == "grass_block")
-        snowy_true = grass["minStateId"]   # snowy=true
         snowy_false = grass["minStateId"] + 1  # snowy=false
         stone = next(b for b in blocks_meta if b["name"] == "stone")["minStateId"]
 
@@ -319,7 +317,6 @@ class ChunkTriageContracts(unittest.TestCase):
     def test_multi_chunk_grid_bin_and_incomplete_handling(self):
         blocks_meta = json.loads((ROOT / "assets/blocks_1211.json").read_text())
         stone = next(b for b in blocks_meta if b["name"] == "stone")["minStateId"]
-        diorite = next(b for b in blocks_meta if b["name"] == "diorite")["minStateId"]
 
         chunks_a = {
             (0, 0): make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})}),

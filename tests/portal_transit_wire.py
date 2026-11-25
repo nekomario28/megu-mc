@@ -8,7 +8,6 @@ the survival delay and both dimension transitions.
 Usage: python3 tests/portal_transit_wire.py target/release/megu
 """
 import json
-import math
 import os
 from pathlib import Path
 import socket

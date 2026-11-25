@@ -3,7 +3,6 @@
 import copy
 import importlib.util
 from pathlib import Path
-import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -372,19 +372,19 @@ class ModrinthClient:
                 return b"".join(chunks)
         except urllib.error.HTTPError as error:
             if error.code == 404:
-                raise MeguModsError(f"not found on Modrinth: {url}")
+                raise MeguModsError(f"not found on Modrinth: {url}") from error
             raise MeguModsError(
-                f"Modrinth request failed: HTTP {error.code} for {url}")
+                f"Modrinth request failed: HTTP {error.code} for {url}") from error
         except urllib.error.URLError as error:
             raise MeguModsError(
-                f"Modrinth request failed: {error.reason} ({url})")
+                f"Modrinth request failed: {error.reason} ({url})") from error
 
     def get_json(self, path):
         body = self._fetch(f"{self.api_base}{path}", MAX_HTTP_BODY)
         try:
             return json.loads(body)
         except json.JSONDecodeError as error:
-            raise MeguModsError(f"invalid Modrinth response: {error}")
+            raise MeguModsError(f"invalid Modrinth response: {error}") from error
 
     def download(self, url):
         """Fetch verified-artifact bytes with the JAR cap enforced inline."""
@@ -1196,7 +1196,7 @@ def cmd_resolve_deps(args):
         planned_files.add(artifact["file_name"])
         plan.append(artifact)
 
-    for _mod_id, dep_id, rng in missing:
+    for _mod_id, dep_id, _rng in missing:
         dep_key = dep_id.lower()
         if not SLUG_RE.match(dep_key):
             manual.append(dep_id)

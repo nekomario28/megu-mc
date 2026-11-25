@@ -98,7 +98,6 @@ class PortTriageContracts(unittest.TestCase):
     def test_end_to_end_fake_binary_clean_env_grid_and_provenance(self):
         blocks_meta = json.loads((ROOT / "assets/blocks_1211.json").read_text())
         stone = next(b for b in blocks_meta if b["name"] == "stone")["minStateId"]
-        granite = next(b for b in blocks_meta if b["name"] == "granite")["minStateId"]
 
         chunks = {
             (0, 0): make_chunk_nbt(0, 0, blocks={(0, -60, 0): ("minecraft:stone", {})}, world_surface_val="auto"),

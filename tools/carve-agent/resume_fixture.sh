@@ -3,7 +3,6 @@
 # Run in a resource-gated, capped scope. Outputs are not proof of a frozen
 # start unless the pre-unfreeze snapshot and runtime log are checked.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SOURCE="${1:?frozen capture}"; DIR="${2:?new output directory}"
 [[ -f "$SOURCE/finished.txt" && -f "$SOURCE/agent/carveagent.jar" ]] || { echo 'incomplete frozen capture' >&2; exit 2; }
 [[ ! -e "$DIR" ]] || { echo 'refusing to overwrite output' >&2; exit 2; }

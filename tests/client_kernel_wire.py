@@ -220,7 +220,9 @@ def exercise_dry(move, game, x, y, z):
     require(move.coords[0] > wall[0] + 1, "sprint-crosses-removed-wall")
 
     height, velocity, apex = move.coords[1], C.c_float(0.42).value, move.coords[1]
+    landed_tick = 0
     for tick in range(16):
+        landed_tick = tick + 1
         move.step((0.0, velocity, 0.0))
         apex = max(apex, move.coords[1])
         if move.grounded:
@@ -241,7 +243,7 @@ def exercise_dry(move, game, x, y, z):
                     "slab-blocks-without-step-up")
             break
     require(stepped and move.coords[1] == y + 0.5, "slab-step-height")
-    return tick + 1
+    return landed_tick
 
 
 def exercise_water(move, x, y, z):

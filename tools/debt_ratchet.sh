@@ -13,7 +13,7 @@
 #
 # Run: bash tools/debt_ratchet.sh
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 
 # A ratchet that cannot see the source reports zero and passes. Running this from the wrong
 # directory, or looking for a pattern that no longer matches, must be an error rather than a

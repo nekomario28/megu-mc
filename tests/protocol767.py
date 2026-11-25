@@ -17,7 +17,8 @@ import tempfile
 import time
 import zlib
 
-from wire_smoke import frame, port, recv_exact, recv_vint, status, vint
+from wire_smoke import frame  # noqa: F401 - re-exported to wire test helpers
+from wire_smoke import port, recv_exact, recv_vint, status, vint
 
 ROOT = Path(__file__).resolve().parents[1]
 MIN_Y = -64

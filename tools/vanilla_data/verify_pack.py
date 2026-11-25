@@ -83,7 +83,7 @@ def check_inventory(pack):
             try:
                 json.loads(path.read_text())
             except json.JSONDecodeError as error:
-                raise Failure(f"{path.relative_to(pack)} is not valid JSON: {error}")
+                raise Failure(f"{path.relative_to(pack)} is not valid JSON: {error}") from error
     for prefix, (suffix, expected) in JAR.items():
         directory = pack / prefix
         require(directory.is_dir(), f"missing directory {prefix}")
@@ -97,7 +97,7 @@ def check_inventory(pack):
                 try:
                     json.loads(path.read_text())
                 except json.JSONDecodeError as error:
-                    raise Failure(f"{path.relative_to(pack)} is not valid JSON: {error}")
+                    raise Failure(f"{path.relative_to(pack)} is not valid JSON: {error}") from error
 
     # An unexpected directory is not harmless: it is either a stale version's data that the
     # consumer would now read, or a generator change this inventory has not been told about.

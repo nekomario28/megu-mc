@@ -124,10 +124,10 @@ def main():
         output = work / f'{args.name}.tsv'
         cells = work / f'{args.name}_cells.tsv'
         argv = ([args.cases] if args.cases else []) + [output] \
-            + ([args.cells] if args.cells else [])
+            + ([cells] if args.cells else [])
         run_probe(work, cp, oracle, main, *argv, extra_sources=(HARNESS,))
         actual = output.read_bytes()
-        cells_actual = args.cells.read_bytes() if args.cells else None
+        cells_actual = cells.read_bytes() if args.cells else None
     if cells_actual is not None:
         args.cells.write_bytes(cells_actual)
     if args.write:

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Offline guards for the pinned biome-carver corpus; no Java or jar is run."""
-import copy
 import hashlib
 import json
 from pathlib import Path

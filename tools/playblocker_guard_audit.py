@@ -44,7 +44,7 @@ def audit(root, baseline):
     source = {}
     parsed = {}
     needed = set(HOTPATHS)
-    for channel, magic, owner, peer in WIRES:
+    for _channel, _magic, owner, peer in WIRES:
         needed.update((owner, peer))
     for path in sorted(needed):
         source[path] = (root / path).read_text(encoding='utf-8')

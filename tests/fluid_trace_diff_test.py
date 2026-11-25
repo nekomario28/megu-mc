@@ -9,7 +9,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from fluid_trace_diff import TraceError, compare, load_trace  # noqa: E402
 
 SCRIPT = ROOT / "tools/fluid_trace_diff.py"
 PREFIX = (

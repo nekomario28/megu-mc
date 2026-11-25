@@ -22,7 +22,6 @@ import json
 import re
 import socket
 import sys
-import tempfile
 import time
 from collections import Counter
 from pathlib import Path

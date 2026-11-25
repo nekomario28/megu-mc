@@ -1478,7 +1478,7 @@ def validate_png(path):
     try:
         raw = zlib.decompress(bytes(idat))
     except zlib.error as error:
-        raise OracleFailure(f"PNG IDAT zlib decompress failed: {error}")
+        raise OracleFailure(f"PNG IDAT zlib decompress failed: {error}") from error
     check(len(raw) == (stride + 1) * height,
           f"PNG pixel data size {len(raw)} != expected "
           f"{(stride + 1) * height}")
@@ -1987,6 +1987,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except OracleFailure as error:
         print(f"client oracle: FAIL ({error})", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

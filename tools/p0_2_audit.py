@@ -180,7 +180,9 @@ def audit_density_and_surface(noise_settings, df_files, noise_files, dim_biomes,
         noise_missing = set()
         seen_refs = set()
 
-        def walk_df(node, parent_key=None, parent_type=None):
+        def walk_df(node, parent_key=None, parent_type=None, *,
+                    noise_missing=noise_missing, seen_refs=seen_refs,
+                    df_refs=df_refs, df_missing=df_missing, df_types=df_types):
             if isinstance(node, str) and parent_key in DF_CHILD_KEYS:
                 if parent_key == "argument" and parent_type in ("shift_a", "shift_b", "shift_x", "shift_z"):
                     if node not in noise_files:
@@ -215,7 +217,7 @@ def audit_density_and_surface(noise_settings, df_files, noise_files, dim_biomes,
         sc_types = Counter()
         biome_refs = set()
 
-        def walk_sr(node):
+        def walk_sr(node, *, sr_types=sr_types):
             if isinstance(node, dict):
                 if "type" in node:
                     sr_types[strip_ns(node["type"])] += 1
@@ -228,7 +230,7 @@ def audit_density_and_surface(noise_settings, df_files, noise_files, dim_biomes,
                 for v in node:
                     walk_sr(v)
 
-        def walk_sc(node):
+        def walk_sc(node, *, sc_types=sc_types, biome_refs=biome_refs):
             if isinstance(node, dict):
                 if "type" in node:
                     sc_types[strip_ns(node["type"])] += 1
@@ -298,7 +300,7 @@ def audit_features_and_placements(biomes, placed_features, configured_features, 
         missing_pf = set()
         missing_cf = set()
 
-        def visit_pf(node):
+        def visit_pf(node, *, seen_pf=seen_pf, missing_pf=missing_pf):
             if isinstance(node, str):
                 if node in seen_pf:
                     return
@@ -313,7 +315,7 @@ def audit_features_and_placements(biomes, placed_features, configured_features, 
             elif isinstance(node, dict):
                 walk_node(node)
 
-        def walk_node(node):
+        def walk_node(node, *, pm_types=pm_types):
             if isinstance(node, dict):
                 if "feature" in node and "placement" in node:
                     for pm in node.get("placement") or []:
@@ -330,7 +332,7 @@ def audit_features_and_placements(biomes, placed_features, configured_features, 
                 for v in node:
                     walk_node(v)
 
-        def visit_cf(node):
+        def visit_cf(node, *, seen_cf=seen_cf, missing_cf=missing_cf, cf_types=cf_types):
             if isinstance(node, str):
                 if node in seen_cf:
                     return

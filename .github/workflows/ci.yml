@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+env:
+  RUFF_VERSION: 0.17.0
+  RUFF_SHA256: c94fc1dc71f054d06d9f1149442dcb471516aa2b7d4b7e8124e05d082d4c91d3
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
 jobs:
   rust:
     runs-on: ubuntu-latest
@@ -25,6 +31,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Python, shell, and workflow lint (bug rules only)
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/ruff.tar.gz" \
+            "https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSION}/ruff-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${RUFF_SHA256}  $RUNNER_TEMP/ruff.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/ruff.tar.gz" -C "$RUNNER_TEMP" ruff-x86_64-unknown-linux-gnu/ruff
+          curl -fsSL -o "$RUNNER_TEMP/actionlint.tar.gz" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/ruff-x86_64-unknown-linux-gnu/ruff" check --select E9,F,B tools tests website
+          git ls-files -z '*.sh' | xargs -0 shellcheck -S warning
+          "$RUNNER_TEMP/actionlint" .github/workflows/*.yml
       # Toolchain pinned (audit item 197); bump deliberately together with a green build.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:

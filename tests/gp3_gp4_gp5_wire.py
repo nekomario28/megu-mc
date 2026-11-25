@@ -319,7 +319,7 @@ def brewing_and_redstone(game):
         require(client.window != original and 0 < client.properties[client.window][0] < 400,
                 "brew-progress-persists-across-menu-close")
         for stage in (300, 200, 100):
-            client.until(lambda *_: client.brew_clock is not None and 0 < client.brew_clock <= stage,
+            client.until(lambda *_, stage=stage: client.brew_clock is not None and 0 < client.brew_clock <= stage,
                          f"brewing-countdown-{stage}")
         client.until(lambda *_: client.brew_clock == 0
                      and client.contents[client.window][1][0][2] == {31: 3}

@@ -31,7 +31,6 @@ input/parse error.
 import argparse
 import bisect
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -530,7 +529,7 @@ def audit_packets(repo):
     consts = parse_int_consts((repo / "src/brigadier_wire.rs").read_text())
     consts.update(parse_int_consts(pp))
     for mp in match_positions:
-        for a, b, eq in extract_match_arms(skel, mp):
+        for a, b, _eq in extract_match_arms(skel, mp):
             pat = skel[a:b].strip()
             if pat == "_" or not pat:
                 continue
@@ -659,7 +658,7 @@ def audit_gamerules(repo, texts):
     #  - the gamerule_atomic_value/store plumbing bodies in main.rs
     #  - COMMAND_GAMERULE_DEFAULTS tuple lines in commands_core.rs
     exclude = {}  # rel -> list[(start,end)]
-    for rel, (live, _t, skel) in texts.items():
+    for rel, (_live, _t, skel) in texts.items():
         spans = []
         sk = skel if skel is not None else ""
         for gm in re.finditer(r'\bstatic\s+GR_[A-Z0-9_]+\s*:', sk):
@@ -879,7 +878,7 @@ def audit_mechanisms(repo, texts):
             fns.append((name, m.start()))
         wired = only_test = dead = 0
         details = []
-        for name, def_pos in fns:
+        for name, _def_pos in fns:
             # `name(` occurrences in live code minus this definition site
             lc = live_calls.get(name, 0) - 1
             tc = test_calls.get(name, 0)
@@ -1304,7 +1303,7 @@ def audit_s2c(repo, texts):
 
     # packet-id constants across all live files (consts + literal statics)
     consts = {}
-    for rel, (live, _t, _s) in texts.items():
+    for _rel, (live, _t, _s) in texts.items():
         if not live:
             continue
         consts.update(parse_int_consts(live))
@@ -1374,14 +1373,14 @@ def audit_s2c(repo, texts):
         if packet_id in s2c_ids:
             emitted.setdefault(packet_id, set()).add(via)
 
-    for rel, (sk, live, letmap, letmap_hex, fns) in per_file.items():
+    for rel, (sk, _live, _letmap, letmap_hex, fns) in per_file.items():
         positions = [p for p, _n, _u in fns]
 
-        def enclosing(pos):
+        def enclosing(pos, positions=positions, fns=fns):
             i = bisect.bisect_right(positions, pos) - 1
             return fns[i] if i >= 0 else None
 
-        def in_nonplay(pos):
+        def in_nonplay(pos, rel=rel, enclosing=enclosing):
             if any(a <= pos < b for a, b in nonplay_spans.get(rel, ())):
                 return True
             fn = enclosing(pos)
@@ -1852,8 +1851,6 @@ def audit_vanilla(repo, report_offline, data, source):
         tables = ours_tables.get(reg, [])
         v_ids = set(vanilla_table)
         missing, mismatched, extra = [], [], []
-        # name -> id in vanilla for mismatch detection
-        v_by_name = {n: i for i, n in vanilla_table.items()}
         covered_ids = set()
         for eid, ename in sorted(vanilla_table.items()):
             hit = False
@@ -1978,7 +1975,7 @@ def render_text(report):
     p = off["packets"]
     lines.append("megu vanilla parity audit (megu-parity-audit/1)")
     lines.append("=" * 60)
-    lines.append(f"Mode A - offline static & live-wiring audit")
+    lines.append("Mode A - offline static & live-wiring audit")
     lines.append(f"  C2S Play packets (protocol 767): "
                  f"{p['handled_count']}/{p['total']} handled "
                  f"({p['handled_pct']}%)")

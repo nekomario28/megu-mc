@@ -9,7 +9,6 @@ block``. A failed probe is never silently replaced with an expected value.
 """
 
 import argparse
-from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path

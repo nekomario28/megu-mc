@@ -3,7 +3,6 @@
 import os
 import math
 import struct
-import ctypes as C
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -210,7 +209,7 @@ def live_wire_e2e(lib):
             for pos in (torch, east):
                 if client.block(*pos) != 0:
                     chat_command(client, f"setblock {pos[0]} {pos[1]} {pos[2]} minecraft:air")
-                    client.until(lambda *_: client.block(*pos) == 0, "clear-torch-light-path")
+                    client.until(lambda *_, pos=pos: client.block(*pos) == 0, "clear-torch-light-path")
             light_before = light_level(client, torch)
             east_before = light_level(client, east)
             start_light = len(client.light_updates)
@@ -258,7 +257,8 @@ def live_wire_e2e(lib):
             for state, sky_level in (("stone", 14), ("air", 15)):
                 start_light = len(client.light_updates)
                 chat_command(client, f"setblock {roof[0]} {roof[1]} {roof[2]} minecraft:{state}")
-                client.until(lambda *_: (x//16, z//16) in client.light_updates[start_light:]
+                client.until(lambda *_, start_light=start_light, sky_level=sky_level:
+                             (x//16, z//16) in client.light_updates[start_light]
                              and light_level(client, below_roof, sky=True) == sky_level,
                              f"live-sky-light-{state}")
 
