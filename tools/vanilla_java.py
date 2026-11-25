@@ -51,11 +51,21 @@ def run_probe(work, classpath, source, main, *args, extra_sources=(), capture=Fa
     The native oracle runners need the probe's lines to validate and store them, and a
     subprocess that writes straight to our stdout cannot be parsed afterwards.
     """
-    subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source),
-                    *map(str, extra_sources)],
-                   check=True, timeout=60)
-    command = ["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
-               main, *map(str, args)]
+    if shutil.which("javac"):
+        subprocess.run(["javac", "-proc:none", "-cp", classpath, "-d", str(work), str(source),
+                        *map(str, extra_sources)],
+                       check=True, timeout=60)
+        command = ["java", "-Xmx768m", "-cp", str(work) + os.pathsep + classpath,
+                   main, *map(str, args)]
+    else:
+        if extra_sources:
+            raise OSError("a JDK is required for multi-source Java probes")
+        # Single-source probes can still run through the java launcher in
+        # source-file mode. This keeps first-run data generation working on
+        # installations that expose java without a separate javac executable;
+        # a runtime without the compiler module fails the subprocess and the
+        # caller still fails closed.
+        command = ["java", "-Xmx768m", "-cp", classpath, str(source), *map(str, args)]
     if capture:
         return subprocess.run(command, check=True, timeout=300, cwd=work,
                               capture_output=True, text=True).stdout

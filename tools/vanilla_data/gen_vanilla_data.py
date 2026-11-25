@@ -80,6 +80,13 @@ PHYSICAL_ASSET_KEYS = (
     "blocks", "flags", "luminance", "light_block", "full_sides", "shapes", "collision_shapes"
 )
 DATAGEN_TIMEOUT_SECONDS = 600
+RUNTIME_DATA_PREFIXES = (
+    "dimension_type/",
+    "structure/",
+    "tags/block/",
+    "tags/worldgen/",
+    "worldgen/",
+)
 
 
 class VanillaDataError(Exception):
@@ -169,7 +176,7 @@ def bundled_inner_name(outer):
     return sorted(candidates)[0] if candidates else None
 
 
-def extract_datapack(jar_path, out_dir):
+def extract_datapack(jar_path, out_dir, canonical_runtime=False):
     """Extract `data/minecraft/**` into `<out-dir>/datapacks/vanilla`.
 
     Returns the provenance record used by the manifest. Validation of every
@@ -203,6 +210,8 @@ def extract_datapack(jar_path, out_dir):
             seen = set()
             for info in infos:
                 rel = safe_data_member(info.filename)
+                if canonical_runtime and not rel.startswith(RUNTIME_DATA_PREFIXES):
+                    continue
                 folded = rel.casefold()
                 if rel in seen or folded in seen:
                     fail(f"duplicate or case-colliding vanilla data member: {info.filename}")
@@ -620,6 +629,61 @@ def run_checked(command, cwd=None, timeout=240, label="command"):
     return result
 
 
+def runtime_tool(name):
+    """Locate a generator helper in either the repository or installer-embedded layout."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / name, here.parent / name):
+        if candidate.is_file():
+            return candidate
+    fail(f"required runtime-data helper is missing: {name}")
+
+
+def prune_to_canonical_runtime_pack(pack_root):
+    """Restrict a freshly generated staging pack to the canonical server runtime inventory."""
+    data = Path(pack_root) / "data" / "minecraft"
+    if not data.is_dir():
+        fail(f"generated datapack is missing {data}")
+    for child in list(data.iterdir()):
+        if child.name not in {"dimension_type", "structure", "tags", "worldgen"}:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    tags = data / "tags"
+    if tags.is_dir():
+        for child in list(tags.iterdir()):
+            if child.name not in {"block", "worldgen"}:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+
+
+def complete_runtime_pack(jar_path, out_dir):
+    """Add jar-member provenance and the climate tree, then verify the canonical inventory."""
+    pack = Path(out_dir) / PACK_REL
+    prune_to_canonical_runtime_pack(pack)
+    jar_string = str(jar_path)
+    run_checked(
+        [sys.executable, str(runtime_tool("vanilla_structure_assets.py")),
+         "--jar", jar_string, "--output", str(pack), "--write"],
+        timeout=120,
+        label="vanilla structure asset extraction",
+    )
+    run_checked(
+        [sys.executable, str(runtime_tool("biome_tree_from_jar.py")),
+         "--jar", jar_string, "--output", str(pack / "multi_noise_biome_tree.json")],
+        timeout=300,
+        label="vanilla biome-tree extraction",
+    )
+    run_checked(
+        [sys.executable, str(runtime_tool("verify_pack.py")),
+         "--pack", str(pack), "--jar-sha1", sha1_file(jar_path)],
+        timeout=120,
+        label="canonical vanilla datapack verification",
+    )
+
+
 def generate_physical_block_states(jar_path, work_dir, reports_dir, out_dir, mappings_dir, fetch_mappings):
     """Use Extract.java + the pinned CC0 mappings to replace the report-only state index."""
     tool_dir = Path(__file__).resolve().parent
@@ -685,7 +749,7 @@ def finish_generation(jar_path, out_dir, extraction, reports_src):
 def generate(jar_path, out_dir, full_runtime=False, mappings_dir=None, fetch_mappings=False):
     jar_path = Path(jar_path)
     out_dir = Path(out_dir)
-    extraction = extract_datapack(jar_path, out_dir)
+    extraction = extract_datapack(jar_path, out_dir, canonical_runtime=full_runtime)
     with tempfile.TemporaryDirectory(prefix="mc-vanilla-data-") as tmp:
         work_dir = Path(tmp)
         reports_src = run_datagen(jar_path, work_dir)
@@ -693,6 +757,7 @@ def generate(jar_path, out_dir, full_runtime=False, mappings_dir=None, fetch_map
         if full_runtime:
             if mappings_dir is None:
                 fail("--full-runtime requires --mappings-dir")
+            complete_runtime_pack(jar_path, out_dir)
             reports_installed = out_dir / "reports"
             asset_info = generate_physical_block_states(
                 jar_path, work_dir, reports_installed, out_dir, mappings_dir, fetch_mappings

@@ -18,6 +18,10 @@ from vanilla_java import DEFAULT_JAR, JAR_SHA1, pinned_runtime, run_probe
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tools/biome-tree/ExportBiomeTree.java"
+if not SOURCE.is_file():
+    sibling = Path(__file__).resolve().with_name("ExportBiomeTree.java")
+    if sibling.is_file():
+        SOURCE = sibling
 
 
 def validate_tree(tree, biomes):

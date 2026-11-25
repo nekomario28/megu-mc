@@ -647,18 +647,27 @@ const CAPTURE_CONFIG_PACKETS_PY: &str =
     include_str!("../../../tools/vanilla_data/capture_config_packets.py");
 const BUILD_VANILLA_DATA_PY: &str =
     include_str!("../../../tools/vanilla_data/build_vanilla_data.py");
+const VERIFY_PACK_PY: &str = include_str!("../../../tools/vanilla_data/verify_pack.py");
+const VANILLA_JAVA_PY: &str = include_str!("../../../tools/vanilla_java.py");
+const VANILLA_STRUCTURE_ASSETS_PY: &str = include_str!("../../../tools/vanilla_structure_assets.py");
+const BIOME_TREE_FROM_JAR_PY: &str = include_str!("../../../tools/biome_tree_from_jar.py");
+const BIOME_TREE_EXPORT_JAVA: &str = include_str!("../../../tools/biome-tree/ExportBiomeTree.java");
 const EXTRACT_JAVA: &str = include_str!("../../../tools/vanilla_data/Extract.java");
 
-const RUNTIME_REQUIRED: [&str; 9] = [
+const RUNTIME_REQUIRED: [&str; 13] = [
     "config_packets.bin",
     "assets/block_states_1211.json",
     "datapacks/vanilla/pack.mcmeta",
+    "datapacks/vanilla/multi_noise_biome_tree.json",
+    "datapacks/vanilla/structure-provenance.json",
     "datapacks/vanilla/data",
     "datapacks/vanilla/data/minecraft",
     "datapacks/vanilla/data/minecraft/worldgen",
     "datapacks/vanilla/data/minecraft/worldgen/biome",
     "datapacks/vanilla/data/minecraft/dimension_type",
     "datapacks/vanilla/data/minecraft/tags/block",
+    "datapacks/vanilla/data/minecraft/tags/worldgen",
+    "datapacks/vanilla/data/minecraft/structure",
 ];
 
 fn invalid_runtime(message: impl Into<String>) -> io::Error {
@@ -910,6 +919,11 @@ fn write_embedded_python_tools(dir: &Path) -> io::Result<PathBuf> {
         ("version_pack.py", VERSION_PACK_PY),
         ("capture_config_packets.py", CAPTURE_CONFIG_PACKETS_PY),
         ("build_vanilla_data.py", BUILD_VANILLA_DATA_PY),
+        ("verify_pack.py", VERIFY_PACK_PY),
+        ("vanilla_java.py", VANILLA_JAVA_PY),
+        ("vanilla_structure_assets.py", VANILLA_STRUCTURE_ASSETS_PY),
+        ("biome_tree_from_jar.py", BIOME_TREE_FROM_JAR_PY),
+        ("ExportBiomeTree.java", BIOME_TREE_EXPORT_JAVA),
         ("Extract.java", EXTRACT_JAVA),
     ] {
         let path = dir.join(name);
@@ -1819,7 +1833,20 @@ mod tests {
         std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/dimension_type"))
             .unwrap();
         std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/tags/block")).unwrap();
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/tags/worldgen"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/structure")).unwrap();
         std::fs::write(root.join("config_packets.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(
+            root.join("datapacks/vanilla/multi_noise_biome_tree.json"),
+            br#"{"overworld":{"_type":"leaf","biome":"minecraft:plains","parameters":[]},"nether":{"_type":"leaf","biome":"minecraft:nether_wastes","parameters":[]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("datapacks/vanilla/structure-provenance.json"),
+            br#"{"minecraft":"1.21.1"}"#,
+        )
+        .unwrap();
         std::fs::write(
             root.join("assets/block_states_1211.json"),
             br#"{
