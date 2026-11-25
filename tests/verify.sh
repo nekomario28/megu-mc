@@ -98,6 +98,8 @@ python3 tests/megu_port_mod_test.py
 python3 tests/general_defect_audit_test.py
 python3 tests/ui_consistency_audit_test.py
 python3 tests/dist_feature_matrix_audit.py
+python3 tests/docs_sync_audit_test.py
+python3 tools/docs_sync_audit.py --strict
 python3 tools/ui_consistency_audit.py --strict
 python3 tests/strict_vanilla_parity_audit_test.py
 python3 tests/megu_tui_test.py
