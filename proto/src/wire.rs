@@ -14,16 +14,25 @@ use std::fmt;
 /// Vanilla's maximum for most length-prefixed text (`Utf8String`, 32767 chars).
 pub const MAX_STRING_CHARS: usize = 32_767;
 
-/// Upper bound accepted on a frame's declared length (`VarInt21FrameDecoder`
-/// allows three VarInt bytes; this stays far below that while covering every
-/// vanilla packet, including chunk columns).
-pub const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
+/// Vanilla's byte-side preallocation bound for a maximum-length string:
+/// four UTF-8 bytes per UTF-16 code unit.
+pub const MAX_STRING_BYTES: usize = MAX_STRING_CHARS * 4;
 
-/// The vanilla-compatible per-frame cap: 2 MiB (`2_097_152` bytes), the
-/// bound a stock client/server applies to a single packet frame. Offered as
-/// the conservative [`PacketCapPolicy`] for deployments that want vanilla
-/// semantics without touching the crate-wide [`MAX_FRAME_LENGTH`] default.
-pub const VANILLA_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Protocol 767's exact upper bound on a frame's declared length:
+/// vanilla's `Varint21FrameDecoder` accepts at most a three-byte VarInt,
+/// whose largest positive value is `2^21 - 1` (`2_097_151`) bytes.
+pub const PROTOCOL_767_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024 - 1;
+
+/// Upper bound accepted on a frame's declared length by the canonical
+/// frame reader. This is the protocol-767/vanilla bound; deployments that
+/// deliberately admit oversized modded frames must opt into
+/// [`PacketCapPolicy::extended`] or an explicit bounded policy.
+pub const MAX_FRAME_LENGTH: usize = PROTOCOL_767_MAX_FRAME_BYTES;
+
+/// The vanilla-compatible per-frame cap. Kept as a semantic alias of
+/// [`PROTOCOL_767_MAX_FRAME_BYTES`] so server ingress and the canonical
+/// reader cannot drift by an off-by-one.
+pub const VANILLA_FRAME_BYTES: usize = PROTOCOL_767_MAX_FRAME_BYTES;
 
 /// Hard ceiling for [`PacketCapPolicy`]: 32 MiB. Sized for giant modded
 /// recipe/NBT payloads while still failing closed on absurd declarations —
@@ -944,12 +953,16 @@ mod tests {
 
     #[test]
     fn packet_cap_policy_bounds_and_validation() {
-        assert_eq!(PacketCapPolicy::vanilla().max_frame_bytes(), 2_097_152);
+        assert_eq!(PacketCapPolicy::vanilla().max_frame_bytes(), 2_097_151);
         assert_eq!(
             PacketCapPolicy::extended().max_frame_bytes(),
             MAX_EXTENDED_FRAME_BYTES
         );
         assert_eq!(PacketCapPolicy::default(), PacketCapPolicy::vanilla());
+        assert_eq!(PROTOCOL_767_MAX_FRAME_BYTES, 2 * 1024 * 1024 - 1);
+        assert_eq!(MAX_STRING_BYTES, 32_767 * 4);
+        assert_eq!(MAX_FRAME_LENGTH, PROTOCOL_767_MAX_FRAME_BYTES);
+        assert_eq!(VANILLA_FRAME_BYTES, PROTOCOL_767_MAX_FRAME_BYTES);
         // 0 and anything above 32 MiB fail closed.
         assert!(PacketCapPolicy::try_new(0).is_err());
         assert!(PacketCapPolicy::try_new(MAX_EXTENDED_FRAME_BYTES + 1).is_err());
@@ -971,10 +984,11 @@ mod tests {
             read_frame_with_policy(&big, PacketCapPolicy::vanilla()),
             Err(ProtoError::FrameTooLarge { .. } | ProtoError::LengthOutOfBounds { .. })
         ));
-        // ... but extended() admits it, and the crate default is unaffected.
+        // ... but extended() admits it. The canonical default stays at the
+        // exact protocol-767 ingress bound and rejects it fail-closed.
         let (id, body) = read_frame_with_policy(&big, PacketCapPolicy::extended()).unwrap();
         assert_eq!((id, body.len()), (0x26, VANILLA_FRAME_BYTES));
-        assert!(read_frame(&big).is_ok());
+        assert!(read_frame(&big).is_err());
         // A declaration beyond even the extended cap still fails closed.
         let mut huge = Vec::new();
         write_frame(&mut huge, 0x26, &vec![0u8; MAX_EXTENDED_FRAME_BYTES]);
