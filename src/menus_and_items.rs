@@ -718,6 +718,32 @@ struct Drop {
     target: Option<[u8; 16]>,
     thrower: Option<[u8; 16]>,
 }
+/// The `SimItem` view lets the `megu_core::zero_change_sim` merge kernels run
+/// the live drop pool — `same_stack` is the exact vanilla mergeability test
+/// (item id, pickup target, component blob; `thrower` deliberately absent).
+impl megu_core::zero_change_sim::SimItem for Drop {
+    fn eid(&self) -> i32 {
+        self.eid
+    }
+    fn pos(&self) -> [f64; 3] {
+        [self.x, self.y, self.z]
+    }
+    fn age(&self) -> i32 {
+        self.age
+    }
+    fn count(&self) -> u32 {
+        u32::from(self.cnt)
+    }
+    fn set_count(&mut self, cnt: u32) {
+        self.cnt = cnt.min(u32::from(u8::MAX)) as u8;
+    }
+    fn stack_cap(&self) -> u32 {
+        item_stack_max(self.item, &self.comps).max(1) as u32
+    }
+    fn same_stack(&self, other: &Self) -> bool {
+        self.item == other.item && self.target == other.target && self.comps == other.comps
+    }
+}
 impl Drop {
     /// Vanilla keeps an ItemEntity out of reach for its pickup delay. Both collectors of a
     /// drop ask this one question: the fake-actor absorb and the real client's take. The
@@ -911,133 +937,6 @@ fn collect_pkt(drop_eid: i32, collector: i32, count: u8) -> Vec<u8> {
     p
 }
 
-/// The cell -> member index both merge scans use, sized once from the item count.
-///
-/// A `HashMap` is the wrong shape for this: there are no removals, the key is three
-/// integers, every bucket is a short list, and the scan probes the own cell plus its
-/// 26 neighbours for every item (16,200 probes for 600 entities). Measured on the
-/// entity-heavy fixture, the SipHash probe was the whole cost of the merge - 84 us of
-/// walking the neighbourhood plus 25 us of building the map, in a 127 us `drops` stage,
-/// and 105 us of a 135 us `environment` stage - while the distance test it guards is
-/// under a nanosecond. This is a chained table over pre-sized arrays: no
-/// resizing, no per-cell allocation, a probe that is three multiplies and a mask, and
-/// an exact key comparison so a collision changes speed and nothing else.
-struct CellBuckets {
-    cell: Vec<(i32, i32, i32)>,
-    used: Vec<bool>,
-    head: Vec<u32>,
-    next: Vec<u32>,
-    mask: usize,
-}
-
-const NO_MEMBER: u32 = u32::MAX;
-
-impl CellBuckets {
-    /// The empty index a thread-local scratch slot starts from; `reset` grows
-    /// it on first use.
-    const EMPTY: CellBuckets = CellBuckets {
-        cell: Vec::new(),
-        used: Vec::new(),
-        head: Vec::new(),
-        next: Vec::new(),
-        mask: 0,
-    };
-
-    fn new(items: usize) -> Self {
-        // At most `items` distinct cells, and a load factor of at most one half.
-        let cap = (items.max(4) * 2).next_power_of_two();
-        CellBuckets {
-            cell: vec![(0, 0, 0); cap],
-            used: vec![false; cap],
-            head: vec![NO_MEMBER; cap],
-            next: vec![NO_MEMBER; items],
-            mask: cap - 1,
-        }
-    }
-
-    /// Rebuild for `items` reusing the existing allocation when the table
-    /// size matches — `cell` needs no clearing because every read is gated
-    /// by `used`.
-    fn reset(&mut self, items: usize) {
-        let cap = (items.max(4) * 2).next_power_of_two();
-        if self.cell.len() != cap {
-            *self = CellBuckets::new(items);
-            return;
-        }
-        self.used.fill(false);
-        self.head.fill(NO_MEMBER);
-        self.next.clear();
-        self.next.resize(items, NO_MEMBER);
-    }
-
-    /// Rough heap footprint of the table, for the scratch cap.
-    fn byte_capacity(&self) -> usize {
-        self.cell.capacity() * std::mem::size_of::<(i32, i32, i32)>()
-            + self.used.capacity()
-            + (self.head.capacity() + self.next.capacity()) * std::mem::size_of::<u32>()
-    }
-
-    #[inline]
-    fn slot(&self, cell: (i32, i32, i32)) -> usize {
-        let h = (cell.0 as u32)
-            .wrapping_mul(0x9E37_79B1)
-            .wrapping_add((cell.1 as u32).wrapping_mul(0x85EB_CA77))
-            .wrapping_add((cell.2 as u32).wrapping_mul(0xC2B2_AE3D));
-        // xorshift mix: the multiply chain alone leaves low-bit structure that a mask
-        // and a linear probe would turn into long clusters.
-        let h = h ^ (h >> 15) ^ (h >> 7);
-        (h as usize) & self.mask
-    }
-
-    /// Link `idx` into `cell`'s bucket. The chain runs newest first, so a bucket is
-    /// walked in descending index order; both callers sort their candidates before
-    /// comparing, because the merge contract is ascending index order.
-    fn push(&mut self, cell: (i32, i32, i32), idx: u32) {
-        let mut at = self.slot(cell);
-        while self.used[at] && self.cell[at] != cell {
-            at = (at + 1) & self.mask;
-        }
-        if !self.used[at] {
-            self.used[at] = true;
-            self.cell[at] = cell;
-        }
-        self.next[idx as usize] = self.head[at];
-        self.head[at] = idx;
-    }
-
-    /// The members of `cell`, in no particular order; `None` when no item is there.
-    #[inline]
-    fn members(&self, cell: (i32, i32, i32)) -> Option<u32> {
-        let mut at = self.slot(cell);
-        while self.used[at] {
-            if self.cell[at] == cell {
-                return Some(self.head[at]);
-            }
-            at = (at + 1) & self.mask;
-        }
-        None
-    }
-}
-
-/// Walk one cell's members into `out`, keeping only indices past `after`.
-fn collect_members(
-    buckets: &CellBuckets,
-    cell: (i32, i32, i32),
-    after: usize,
-    out: &mut Vec<usize>,
-) {
-    let Some(mut member) = buckets.members(cell) else {
-        return;
-    };
-    while member != NO_MEMBER {
-        let idx = member as usize;
-        if idx > after {
-            out.push(idx);
-        }
-        member = buckets.next[idx];
-    }
-}
-
 /// Vanilla merges same-item drops within ~0.5 blocks into one stack (fits <=64); the
 /// merged entity keeps the fresher age.
 ///
@@ -1056,76 +955,14 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     }
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
-    let mut buckets =
-        MERGE_CELL_SCRATCH.with(|s| std::mem::replace(&mut *s.borrow_mut(), CellBuckets::EMPTY));
-    buckets.reset(dp.len());
-    for (idx, d) in dp.iter().enumerate() {
-        buckets.push(
-            (d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32),
-            idx as u32,
-        );
-    }
-    if let Some(t) = __t {
-        tickprof::add("drops/merge_cells", t.elapsed());
-    }
-    __t = __prof.then(std::time::Instant::now);
-    let mut merged: Vec<i32> = Vec::new();
-    let mut candidates = MERGE_CAND_SCRATCH.with(scratch_take);
-    for i in 0..dp.len() {
-        let (cx, cy, cz) = (
-            dp[i].x.floor() as i32,
-            dp[i].y.floor() as i32,
-            dp[i].z.floor() as i32,
-        );
-        candidates.clear();
-        // checked arithmetic: a drop whose cell is at the i32 limit has no neighbour
-        // there, and wrapping would invent a cell that aliases.
-        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
-                    if let (Some(kx), Some(ky), Some(kz)) = key {
-                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable();
-        for &j in candidates.iter() {
-            let (ax, ay, az, ait, acnt, aage) = {
-                let a = &dp[i];
-                (a.x, a.y, a.z, a.item, a.cnt, a.age)
-            };
-            let (bx, by, bz, bit, bcnt, bage) = {
-                let b = &dp[j];
-                (b.x, b.y, b.z, b.item, b.cnt, b.age)
-            };
-            // Cheap integer and distance tests first; the component blobs are a Vec
-            // comparison, so they run only for a real candidate.
-            if ait == bit
-                && dp[i].target == dp[j].target
-                && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
-                && dp[i].comps == dp[j].comps
-                && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
-            {
-                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
-                merged.push(dp[eat].eid);
-                break;
-            }
-        }
-    }
+    // `ReusableCellMerger::merge_items` reproduces this scan bit-identically —
+    // integer cell buckets, ascending-index candidates, the exact same-stack
+    // test, `dist^2 < 0.25`, older-keeps order — while bucketing and scanning
+    // inside its own retained scratch instead of the MERGE_*_SCRATCH pair.
+    let merged = XP_DROP_MERGER.with(|m| m.borrow_mut().merge_items(dp).to_vec());
     if let Some(t) = __t {
         tickprof::add("drops/merge_scan", t.elapsed());
     }
-    MERGE_CAND_SCRATCH.with(|s| scratch_return(s, candidates));
-    MERGE_CELL_SCRATCH.with(|s| {
-        *s.borrow_mut() = if buckets.byte_capacity() <= SCRATCH_CAP_BYTES {
-            buckets
-        } else {
-            CellBuckets::EMPTY
-        };
-    });
     merged
 }
 
@@ -1236,149 +1073,26 @@ fn drop_spawn_scattered(
     eid
 }
 
-/// Stable FNV-1a over a drop's merge key (component blob + pickup target):
-/// the `component_hash` `merge_item_stacks` partitions by under `mod-suite`.
-/// `thrower` does not join the key — `merge_drops` does not compare it.
-#[cfg(feature = "mod-suite")]
-fn drop_merge_hash(comps: &Comps, target: &Option<[u8; 16]>) -> u64 {
-    let mut h = megu_core::hash::Fnv1a64::new();
-    for (ty, data) in comps {
-        h.update(&ty.to_be_bytes());
-        h.update(data);
-    }
-    match target {
-        Some(t) => h.update(t),
-        None => h.update_u8(0xff),
-    }
-    h.finish()
-}
-
-/// The merge kernel over one partitioned pool (keepers first, donors after,
-/// both in `drops` order, parallel `cnts`/`maxes`). Under `mod-suite` this is
-/// `mod_offload::entity_spatial::merge_item_stacks` directly; the local build
-/// runs the same cell-bucketed scan — cell size 2.0, radius 0.5, same
-/// item+key, bounded by both stack sizes — so both builds agree.
-#[cfg(feature = "mod-suite")]
-fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
-    let mut items: Vec<mod_offload::entity_spatial::DroppedItem> = pool
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| mod_offload::entity_spatial::DroppedItem {
-            id: k as u32,
-            pos: [dp[i].x, dp[i].y, dp[i].z],
-            vel: [0.0; 3],
-            item_id: dp[i].item.max(0) as u32,
-            component_hash: drop_merge_hash(&dp[i].comps, &dp[i].target),
-            count: cnts[k],
-            max_stack_size: maxes[k],
-        })
-        .collect();
-    mod_offload::entity_spatial::merge_item_stacks(&mut items);
-    for d in &items {
-        cnts[d.id as usize] = d.count;
-    }
-}
-
-#[cfg(not(feature = "mod-suite"))]
-fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
-    const CELL: f64 = 2.0;
-    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(cnts.len());
-    let mut candidates: Vec<usize> = Vec::new();
-    for i in 0..cnts.len() {
-        if cnts[i] == 0 {
-            continue;
-        }
-        let (px, py, pz) = (dp[pool[i]].x, dp[pool[i]].y, dp[pool[i]].z);
-        let (cx, cy, cz) = (
-            (px / CELL).floor() as i32,
-            (py / CELL).floor() as i32,
-            (pz / CELL).floor() as i32,
-        );
-        candidates.clear();
-        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    if let (Some(kx), Some(ky), Some(kz)) = (
-                        cx.checked_add(dx),
-                        cy.checked_add(dy),
-                        cz.checked_add(dz),
-                    ) {
-                        if let Some(list) = cells.get(&(kx, ky, kz)) {
-                            candidates.extend_from_slice(list);
-                        }
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable();
-        let mut alive = true;
-        for &j in &candidates {
-            let (qx, qy, qz) = (dp[pool[j]].x, dp[pool[j]].y, dp[pool[j]].z);
-            let a = &dp[pool[i]];
-            let b = &dp[pool[j]];
-            if a.item == b.item
-                && a.target == b.target
-                && a.comps == b.comps
-                && (px - qx).powi(2) + (py - qy).powi(2) + (pz - qz).powi(2) <= 0.25
-            {
-                let max = maxes[j].min(maxes[i]);
-                let transfer = cnts[i].min(max.saturating_sub(cnts[j]));
-                cnts[j] += transfer;
-                cnts[i] -= transfer;
-                if cnts[i] == 0 {
-                    alive = false;
-                    break;
-                }
-            }
-        }
-        if alive {
-            cells.entry((cx, cy, cz)).or_default().push(i);
-        }
-    }
-}
-
 /// Merge `pending` donor eids into the locked drop pool. Keepers (pre-existing
 /// drops) precede donors in the pool, so a fresh drop feeds the earliest
 /// compatible neighbour within 0.5 up to `item_stack_max`; tombstoned drops
 /// are removed in one `retain` pass. Returns the absorbed eids in merge order.
 fn drop_merge_pending_locked(dp: &mut Vec<Drop>, pending: &HashSet<i32>) -> Vec<i32> {
-    let mut pool: Vec<usize> = Vec::with_capacity(dp.len());
-    pool.extend(
-        dp.iter()
-            .enumerate()
-            .filter(|(_, d)| !pending.contains(&d.eid) && d.cnt > 0)
-            .map(|(i, _)| i),
-    );
-    pool.extend(
-        dp.iter()
-            .enumerate()
-            .filter(|(_, d)| pending.contains(&d.eid) && d.cnt > 0)
-            .map(|(i, _)| i),
-    );
-    if pool.len() < 2 {
-        return Vec::new();
-    }
-    let mut cnts: Vec<u32> = pool.iter().map(|&i| u32::from(dp[i].cnt)).collect();
-    let maxes: Vec<u32> = pool
-        .iter()
-        .map(|&i| item_stack_max(dp[i].item, &dp[i].comps).max(1) as u32)
-        .collect();
-    drop_merge_run(&pool, dp, &mut cnts, &maxes);
-    let mut eaten = HashSet::new();
-    let mut order = Vec::new();
-    for (k, &i) in pool.iter().enumerate() {
-        if cnts[k] == 0 {
-            if eaten.insert(dp[i].eid) {
-                order.push(dp[i].eid);
-            }
-        } else {
-            dp[i].cnt = cnts[k].min(u32::from(u8::MAX)) as u8;
-        }
-    }
+    // `ReusableCellMerger::merge_pending_items` is the same keeper/donor
+    // kernel both builds used to pick between — 2.0 cells, the exact
+    // same-stack compare, `cnt`/`max` transfer bound, `u8::MAX` clamp on
+    // survivors — so `mod-suite` and local runs share one engine instead of
+    // mirroring `merge_item_stacks`.
+    let eaten = XP_DROP_MERGER.with(|m| {
+        m.borrow_mut()
+            .merge_pending_items(dp, |eid| pending.contains(&eid))
+            .to_vec()
+    });
     if !eaten.is_empty() {
-        dp.retain(|d| !eaten.contains(&d.eid));
+        let gone: HashSet<i32> = eaten.iter().copied().collect();
+        dp.retain(|d| !gone.contains(&d.eid));
     }
-    order
+    eaten
 }
 
 /// Collapse freshly spawned drops into their older neighbours — the merge the
@@ -1983,11 +1697,11 @@ thread_local! {
     /// `chest_viewer_tick_on`'s per-viewer slot-diff batch.
     static CHEST_SYNC_SCRATCH: std::cell::RefCell<Vec<(i16, i32, Stack)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// `merge_drops`' cell index and candidate list.
-    static MERGE_CELL_SCRATCH: std::cell::RefCell<CellBuckets> =
-        const { std::cell::RefCell::new(CellBuckets::EMPTY) };
-    static MERGE_CAND_SCRATCH: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// `merge_drops`/`merge_xp_orbs`/`drop_merge_pending_locked`'s shared
+    /// merge engine: cell index, candidates and output all retained across
+    /// calls, replacing the per-pass `CellBuckets`/`Vec` scratch pair.
+    static XP_DROP_MERGER: std::cell::RefCell<megu_core::zero_change_sim::ReusableCellMerger> =
+        std::cell::RefCell::new(megu_core::zero_change_sim::ReusableCellMerger::new());
     /// `drop_tick`'s despawn eid list.
     static DROP_DESPAWN_SCRATCH: std::cell::RefCell<Vec<i32>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -13806,6 +13520,9 @@ static CHORUS_CD: Registry<i32, Instant> = OnceLock::new();
 fn chorus_cd() -> &'static Mutex<HashMap<i32, Instant>> {
     CHORUS_CD.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Entries die with the 1 s cooldown; the cap only binds pathological
+/// reconnect storms that never let the expiry sweep run.
+const MAX_CHORUS_CD_ENTRIES: usize = 4096;
 
 /// Whether `eid`'s chorus cooldown is still running server-side.
 fn chorus_on_cooldown(eid: i32) -> bool {
@@ -13819,10 +13536,18 @@ fn chorus_on_cooldown(eid: i32) -> bool {
 /// Arm the cooldown and send `SetCooldown` (0x17) so the client greys the icon
 /// for 20 game ticks — the same wire shape the ender-pearl cooldown uses.
 fn chorus_cooldown_start(me: &Client, item: i64) {
-    chorus_cd()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(me.eid, Instant::now());
+    {
+        let mut cds = chorus_cd().lock().unwrap_or_else(|e| e.into_inner());
+        // An entry is dead weight once the cooldown elapses; sweeping here
+        // keeps the map bounded by concurrent cooldowns, not lifetime eats.
+        cds.retain(|_, t| t.elapsed() < Duration::from_secs(1));
+        if cds.len() >= MAX_CHORUS_CD_ENTRIES && !cds.contains_key(&me.eid) {
+            if let Some(&oldest) = cds.keys().min() {
+                cds.remove(&oldest);
+            }
+        }
+        cds.insert(me.eid, Instant::now());
+    }
     let mut cp = Vec::new();
     write_varint(&mut cp, item);
     write_varint(&mut cp, 20);
@@ -13916,7 +13641,17 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                                 })
                                 .collect()
                         });
-                    let (luck, _lure) = fishing_enchant_levels(me);
+                    // Luck of the Sea: `apply_fishing_enchants` parked this
+                    // bobber's re-weighted catch table under the owner's eid
+                    // (`treasure = 5 + 2*luck` encodes the level exactly), so
+                    // the reel reads that store; the enchant scan is the
+                    // fallback for a bobber the movement tick never visited.
+                    let luck = fishing_luck()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&me.eid)
+                        .map(|w| (w.treasure - FISHING_BASE_WEIGHTS.treasure) / 2)
+                        .unwrap_or_else(|| fishing_enchant_levels(me).0);
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let open_water = fishing_open_water(
                         dim,

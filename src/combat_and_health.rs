@@ -126,6 +126,26 @@ struct Xp {
     val: i16,
     age: i32,
 }
+/// The `SimXp` view lets the `megu_core::zero_change_sim` merge kernel run
+/// the live orb pool — same cell table, chain order and merge contract as
+/// the hand-rolled scan it replaced.
+impl megu_core::zero_change_sim::SimXp for Xp {
+    fn eid(&self) -> i32 {
+        self.eid
+    }
+    fn pos(&self) -> [f64; 3] {
+        [self.x, self.y, self.z]
+    }
+    fn age(&self) -> i32 {
+        self.age
+    }
+    fn value(&self) -> i16 {
+        self.val
+    }
+    fn set_value(&mut self, val: i16) {
+        self.val = val;
+    }
+}
 static XPS: OnceLock<Mutex<Vec<Xp>>> = OnceLock::new();
 fn xps() -> &'static Mutex<Vec<Xp>> {
     XPS.get_or_init(|| Mutex::new(Vec::new()))
@@ -299,7 +319,9 @@ fn xp_merge_run(pool: &[usize], xs: &[Xp], vals: &mut [u64]) {
 /// respawns as fresh bounded orbs. Returns the absorbed eids in merge order,
 /// which is the order the destroy packets go out in.
 fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32> {
-    let mut pool: Vec<usize> = Vec::with_capacity(xs.len());
+    // The keeper/donor index staging rides `sim_graph`'s retained tick scratch
+    // instead of a fresh `Vec` every merge pass.
+    let mut pool = XP_POOL_SCRATCH.with(|s| std::mem::take(&mut s.borrow_mut().indices));
     pool.extend(
         xs.iter()
             .enumerate()
@@ -313,6 +335,10 @@ fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32>
             .map(|(i, _)| i),
     );
     if pool.len() < 2 {
+        XP_POOL_SCRATCH.with(|s| {
+            pool.clear();
+            s.borrow_mut().indices = pool;
+        });
         return Vec::new();
     }
     // Merge only within a dimension: two orbs at the same coordinates in
@@ -370,7 +396,22 @@ fn xp_merge_pending_locked(xs: &mut Vec<Xp>, pending: &HashSet<i32>) -> Vec<i32>
             left -= u64::from(take as u16);
         }
     }
+    XP_POOL_SCRATCH.with(|s| {
+        pool.clear();
+        s.borrow_mut().indices = pool;
+    });
     order
+}
+
+thread_local! {
+    /// `xp_merge_pending_locked`'s keeper/donor index list: one retained
+    /// `sim_graph` tick scratch instead of a `Vec` allocated per merge pass.
+    static XP_POOL_SCRATCH: std::cell::RefCell<megu_core::sim_graph::TickScratch> =
+        const {
+            std::cell::RefCell::new(megu_core::sim_graph::TickScratch {
+                indices: Vec::new(),
+            })
+        };
 }
 
 /// Collapse freshly spawned orbs into their older neighbours — the merge the
@@ -2612,65 +2653,23 @@ fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
 /// full pairwise scan made, so which orb is eaten does not change. Sorting the orbs
 /// first, or visiting candidates in any other order, *would* change it.
 fn merge_xp_orbs(xl: &mut [Xp]) -> Vec<i32> {
-    // Nothing to pair, and the index below allocates: an idle world must not pay for a
-    // merge it cannot perform.
+    // Nothing to pair: an idle world must not pay even the merger borrow.
     if xl.len() < 2 {
         return Vec::new();
     }
-    let mut buckets = CellBuckets::new(xl.len());
-    for (idx, x) in xl.iter().enumerate() {
-        buckets.push(
-            (x.x.floor() as i32, x.y.floor() as i32, x.z.floor() as i32),
-            idx as u32,
-        );
-    }
-    let mut merged: Vec<i32> = Vec::new();
-    let mut candidates: Vec<usize> = Vec::new();
-    for i in 0..xl.len() {
-        let (cx, cy, cz) = (
-            xl[i].x.floor() as i32,
-            xl[i].y.floor() as i32,
-            xl[i].z.floor() as i32,
-        );
-        candidates.clear();
-        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    let key = (
-                        cx.checked_add(dx),
-                        cy.checked_add(dy),
-                        cz.checked_add(dz),
-                    );
-                    if let (Some(kx), Some(ky), Some(kz)) = key {
-                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable();
-        for &j in candidates.iter() {
-            let (ax, ay, az, aage) = {
-                let a = &xl[i];
-                (a.x, a.y, a.z, a.age)
-            };
-            let (bx, by, bz, bage) = {
-                let b = &xl[j];
-                (b.x, b.y, b.z, b.age)
-            };
-            // Same-dimension orbs only: equal coordinates in different
-            // dimensions are not adjacent in any world.
-            if (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 1.0
-                && entity_dim_of(xl[i].eid) == entity_dim_of(xl[j].eid)
-            {
-                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);
-                merged.push(xl[eat].eid);
-                clear_entity_dim(xl[eat].eid);
-                break;
-            }
-        }
-    }
-    merged
+    // `ReusableCellMerger::merge_orbs` reproduces this scan bit-identically —
+    // integer cell buckets, ascending-index candidates, `dist^2 < 1.0`, the
+    // dimension side table including the cleared-eid quirk — out of one
+    // retained scratch instead of a fresh `CellBuckets` per pass.
+    XP_DROP_MERGER.with(|m| {
+        m.borrow_mut()
+            .merge_orbs(
+                xl,
+                |eid| u64::from(entity_dim_of(eid).raw()),
+                clear_entity_dim,
+            )
+            .to_vec()
+    })
 }
 
 /// Finite segment geometry. Unlike Valence's inclusive infinite ray, pinned

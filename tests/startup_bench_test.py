@@ -11,7 +11,6 @@ import importlib.util
 import io
 import os
 import stat
-import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout

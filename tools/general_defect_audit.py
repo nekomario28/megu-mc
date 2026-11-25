@@ -122,7 +122,7 @@ UNSAFE_EXPLICIT_ALLOWLIST = {
     "sdk/megu-mod-sdk/src/native_abi.rs",
 }
 
-REMOVE_ZERO_BASELINE_COUNT = 8
+REMOVE_ZERO_BASELINE_COUNT = 5
 CODEC_BASELINE_COUNTS = {"sha256": 6, "crc32": 8, "lz4": 0}
 CANONICAL_CODEC_FILES = {"lz4": "core/src/lz4.rs", "crc32": "core/src/hash.rs"}
 HOT_LOOP_ALLOC_BASELINE = {

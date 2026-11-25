@@ -8372,13 +8372,24 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
 /// Vanilla stores the flag as `seenCredits`/`wonGame` on the player; this port
 /// keys it on the session eid, same shape as the gateway cooldown map.
 fn send_win_game_event(me: &Client) {
+    /// First-win flags keyed by session eid: entries live until disconnect,
+    /// so the cap binds only a same-session End-exit storm of distinct eids.
+    const MAX_END_WINS_ENTRIES: usize = 8192;
     static END_WINS: Registry<i32, ()> = OnceLock::new();
-    let first = END_WINS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(me.eid, ())
-        .is_none();
+    let first = {
+        let mut wins = END_WINS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if wins.len() >= MAX_END_WINS_ENTRIES && !wins.contains_key(&me.eid) {
+            // Evict one stale winner so the map cannot grow without bound;
+            // the evicted player simply re-sees credits on a later exit.
+            if let Some(&stale) = wins.keys().min() {
+                wins.remove(&stale);
+            }
+        }
+        wins.insert(me.eid, ()).is_none()
+    };
     let mut ge = vec![4u8];
     ge.extend_from_slice(&(if first { 1.0f32 } else { 0.0f32 }).to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
@@ -8423,12 +8434,17 @@ fn enter_portal(
             (DimId::End, landing)
         } else {
             let (sdim, sx, sy, sz) = {
-                let sdim = *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
-                let pos = me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| {
+                let spawn = *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pos) = spawn {
+                    let sdim = *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
+                    (sdim, pos.0, pos.1, pos.2)
+                } else {
+                    // No respawn point: `EndPortalBlock.getPortalDestination`
+                    // returns the Overworld's shared spawn, not whatever
+                    // `spawn_dim` last recorded.
                     let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-                    (w.0, w.1, w.2, w.3)
-                });
-                (sdim, pos.0, pos.1, pos.2)
+                    (DimId::Overworld, w.0, w.1, w.2)
+                }
             };
             switch_client_dimension(me, sdim, (sx, sy, sz, yaw, pitch), view);
             // Leaving the End through the portal triggers vanilla's WIN_GAME:
