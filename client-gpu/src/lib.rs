@@ -32,6 +32,7 @@ pub mod subworld_render;
 pub mod subworld_sync;
 pub mod title_branding;
 pub mod vanilla_bootstrap;
+pub mod vanilla_atlas_extras;
 pub mod vanilla_font;
 pub mod vanilla_gui_sprites;
 pub mod vanilla_jar;
