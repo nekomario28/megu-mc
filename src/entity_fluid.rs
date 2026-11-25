@@ -712,13 +712,6 @@ fn fluid_push_scale(kind: EntityFluidKind, ultra_warm: bool) -> f64 {
     }
 }
 
-/// Lava's motion scale for the dimension the entity is in. `Entity.bm()` reads
-/// that dimension's `dimensionType().ultraWarm()`, so Nether (and custom
-/// ultrawarm) entities must not inherit the Overworld owner's flag.
-fn lava_motion_scale_for_dim(dim: DimId) -> f64 {
-    fluid_push_scale(EntityFluidKind::Lava, crate::dim_ultrawarm(dim))
-}
-
 /// `Entity.getFluidJumpThreshold()` (`bsr.di()`, offsets 0–19): `eyeHeight < 0.4F ? 0.0 : 0.4`.
 fn fluid_jump_threshold(eye_height: f32) -> f64 {
     if eye_height < 0.4 {
@@ -726,6 +719,13 @@ fn fluid_jump_threshold(eye_height: f32) -> f64 {
     } else {
         0.4
     }
+}
+
+/// Lava's motion scale for the dimension the entity is in. `Entity.bm()` reads
+/// that dimension's `dimensionType().ultraWarm()`, so Nether (and custom
+/// ultrawarm) entities must not inherit the Overworld owner's flag.
+fn lava_motion_scale_for_dim(dim: DimId) -> f64 {
+    fluid_push_scale(EntityFluidKind::Lava, crate::dim_ultrawarm(dim))
 }
 
 /// `btn.a` offsets 8–53: `d = getGravity()`, lowered to `0.01` while descending under
