@@ -1926,11 +1926,9 @@ fn update_shape<W: TemplateWorld>(
                 let body = reg.state_of(&format!("minecraft:{partner}"), None);
                 return body;
             }
-        } else if direction == growth {
-            if !family(neighbor) {
-                let head_st = reg.state_of(&format!("minecraft:{partner}"), None);
-                return head_st;
-            }
+        } else if direction == growth && !family(neighbor) {
+            let head_st = reg.state_of(&format!("minecraft:{partner}"), None);
+            return head_st;
         }
         if direction == attach {
             let can_attach = !(magma_fails && reg.name_of(neighbor) == "minecraft:magma_block");
@@ -7060,58 +7058,58 @@ mod support_shape_matrix_tests {
     #[test]
     fn support_shape_torch_and_wall_torch_planes() {
         let Some(reg) = breg() else { return };
-        let air = state(&reg, "minecraft:air");
+        let air = state(reg, "minecraft:air");
         for below in ["minecraft:stone", "minecraft:glass", "minecraft:oak_fence"] {
-            assert_eq!(below_case(&reg, "minecraft:torch", below), state(&reg, "minecraft:torch"), "torch on {below}");
+            assert_eq!(below_case(reg, "minecraft:torch", below), state(reg, "minecraft:torch"), "torch on {below}");
         }
         for below in ["minecraft:oak_leaves", "minecraft:air"] {
-            assert_eq!(below_case(&reg, "minecraft:torch", below), air, "torch on {below}");
+            assert_eq!(below_case(reg, "minecraft:torch", below), air, "torch on {below}");
         }
         // facing=north attaches to the south neighbour (direction 3) on the
         // FULL plane: glass is sturdy, a fence post is not.
         let wall = "minecraft:wall_torch[facing=north]";
-        assert_eq!(side_case(&reg, wall, 3, "minecraft:glass"), state(&reg, wall));
-        assert_eq!(side_case(&reg, wall, 3, "minecraft:oak_fence"), air);
-        assert_eq!(side_case(&reg, wall, 3, "minecraft:air"), air);
+        assert_eq!(side_case(reg, wall, 3, "minecraft:glass"), state(reg, wall));
+        assert_eq!(side_case(reg, wall, 3, "minecraft:oak_fence"), air);
+        assert_eq!(side_case(reg, wall, 3, "minecraft:air"), air);
     }
 
     #[test]
     fn support_shape_redstone_uses_three_distinct_planes() {
         let Some(reg) = breg() else { return };
-        let air = state(&reg, "minecraft:air");
+        let air = state(reg, "minecraft:air");
         // Dust: FULL or hopper. Glass is full-sturdy even though it is not a
         // redstone conductor.
-        assert_eq!(below_case(&reg, "minecraft:redstone_wire", "minecraft:glass"), state(&reg, "minecraft:redstone_wire"));
-        assert_eq!(below_case(&reg, "minecraft:redstone_wire", "minecraft:oak_fence"), air);
+        assert_eq!(below_case(reg, "minecraft:redstone_wire", "minecraft:glass"), state(reg, "minecraft:redstone_wire"));
+        assert_eq!(below_case(reg, "minecraft:redstone_wire", "minecraft:oak_fence"), air);
         // Gates: RIGID. Dust's fence failure also applies here.
         for gate in ["minecraft:repeater", "minecraft:comparator"] {
-            assert_eq!(below_case(&reg, gate, "minecraft:stone"), state(&reg, gate));
-            assert_eq!(below_case(&reg, gate, "minecraft:oak_fence"), air);
+            assert_eq!(below_case(reg, gate, "minecraft:stone"), state(reg, gate));
+            assert_eq!(below_case(reg, gate, "minecraft:oak_fence"), air);
         }
         // Pressure plates: RIGID or CENTER, so a fence post supports them.
-        assert_eq!(below_case(&reg, "minecraft:stone_pressure_plate", "minecraft:oak_fence"), state(&reg, "minecraft:stone_pressure_plate"));
+        assert_eq!(below_case(reg, "minecraft:stone_pressure_plate", "minecraft:oak_fence"), state(reg, "minecraft:stone_pressure_plate"));
     }
 
     #[test]
     fn support_shape_signs_and_banners_use_legacy_solid() {
         let Some(reg) = breg() else { return };
-        let air = state(&reg, "minecraft:air");
+        let air = state(reg, "minecraft:air");
         // Leaves fail FULL face-sturdiness but pass legacy `isSolid`; vanilla
         // signs/banners therefore keep them as support.
         for name in ["minecraft:oak_sign", "minecraft:white_banner"] {
-            assert_eq!(below_case(&reg, name, "minecraft:oak_leaves"), state(&reg, name), "{name} over leaves");
-            assert_eq!(below_case(&reg, name, "minecraft:air"), air, "{name} in air");
+            assert_eq!(below_case(reg, name, "minecraft:oak_leaves"), state(reg, name), "{name} over leaves");
+            assert_eq!(below_case(reg, name, "minecraft:air"), air, "{name} in air");
         }
         let wall_sign = "minecraft:oak_wall_sign[facing=west]";
-        assert_eq!(side_case(&reg, wall_sign, 5, "minecraft:glass"), state(&reg, wall_sign));
-        assert_eq!(side_case(&reg, wall_sign, 5, "minecraft:air"), air);
+        assert_eq!(side_case(reg, wall_sign, 5, "minecraft:glass"), state(reg, wall_sign));
+        assert_eq!(side_case(reg, wall_sign, 5, "minecraft:air"), air);
         // Ceiling hanging signs always ask CENTER; wall hanging signs have no
         // canSurvive override in 1.21.1 and survive even unsupported.
         let hang = "minecraft:oak_hanging_sign[attached=false,rotation=0]";
-        assert_eq!(side_case(&reg, hang, 1, "minecraft:oak_fence"), state(&reg, hang));
-        assert_eq!(side_case(&reg, hang, 1, "minecraft:air"), air);
+        assert_eq!(side_case(reg, hang, 1, "minecraft:oak_fence"), state(reg, hang));
+        assert_eq!(side_case(reg, hang, 1, "minecraft:air"), air);
         let wall_hang = "minecraft:oak_wall_hanging_sign[facing=north]";
-        assert_eq!(side_case(&reg, wall_hang, 3, "minecraft:air"), state(&reg, wall_hang));
+        assert_eq!(side_case(reg, wall_hang, 3, "minecraft:air"), state(reg, wall_hang));
     }
 
     #[test]
@@ -7119,34 +7117,34 @@ mod support_shape_matrix_tests {
         let Some(reg) = breg() else { return };
         // Cake uses legacy solid, so even leaves support it; candles and sea
         // pickles sit on fence posts by their center/collision rules.
-        assert_eq!(below_case(&reg, "minecraft:cake", "minecraft:oak_leaves"), state(&reg, "minecraft:cake"));
-        assert_eq!(below_case(&reg, "minecraft:candle", "minecraft:oak_fence"), state(&reg, "minecraft:candle"));
-        assert_eq!(below_case(&reg, "minecraft:sea_pickle", "minecraft:oak_fence"), state(&reg, "minecraft:sea_pickle"));
+        assert_eq!(below_case(reg, "minecraft:cake", "minecraft:oak_leaves"), state(reg, "minecraft:cake"));
+        assert_eq!(below_case(reg, "minecraft:candle", "minecraft:oak_fence"), state(reg, "minecraft:candle"));
+        assert_eq!(below_case(reg, "minecraft:sea_pickle", "minecraft:oak_fence"), state(reg, "minecraft:sea_pickle"));
         for floating in ["minecraft:flower_pot", "minecraft:end_rod", "minecraft:turtle_egg", "minecraft:conduit"] {
-            assert_eq!(below_case(&reg, floating, "minecraft:air"), state(&reg, floating), "{floating} survives unsupported");
+            assert_eq!(below_case(reg, floating, "minecraft:air"), state(reg, floating), "{floating} survives unsupported");
         }
     }
 
     #[test]
     fn support_shape_water_and_column_families() {
         let Some(reg) = breg() else { return };
-        let air = state(&reg, "minecraft:air");
+        let air = state(reg, "minecraft:air");
         // Seagrass needs a full top face and explicitly rejects magma.
-        assert_eq!(below_case(&reg, "minecraft:seagrass", "minecraft:stone"), state(&reg, "minecraft:seagrass"));
-        assert_eq!(below_case(&reg, "minecraft:seagrass", "minecraft:magma_block"), air);
+        assert_eq!(below_case(reg, "minecraft:seagrass", "minecraft:stone"), state(reg, "minecraft:seagrass"));
+        assert_eq!(below_case(reg, "minecraft:seagrass", "minecraft:magma_block"), air);
         // Coral floor fans need a full top face; wall fans attach opposite
         // their facing.
-        assert_eq!(below_case(&reg, "minecraft:tube_coral_fan", "minecraft:stone"), state(&reg, "minecraft:tube_coral_fan"));
-        assert_eq!(below_case(&reg, "minecraft:tube_coral_fan", "minecraft:oak_fence"), air);
+        assert_eq!(below_case(reg, "minecraft:tube_coral_fan", "minecraft:stone"), state(reg, "minecraft:tube_coral_fan"));
+        assert_eq!(below_case(reg, "minecraft:tube_coral_fan", "minecraft:oak_fence"), air);
         let wallfan = "minecraft:tube_coral_wall_fan[facing=north]";
-        assert_eq!(side_case(&reg, wallfan, 3, "minecraft:stone"), state(&reg, wallfan));
-        assert_eq!(side_case(&reg, wallfan, 3, "minecraft:air"), air);
+        assert_eq!(side_case(reg, wallfan, 3, "minecraft:stone"), state(reg, wallfan));
+        assert_eq!(side_case(reg, wallfan, 3, "minecraft:air"), air);
         // Vertical growing plants attach opposite their growth direction.
-        let twisting = state(&reg, "minecraft:twisting_vines");
-        assert_eq!(below_case(&reg, "minecraft:twisting_vines", "minecraft:stone"), twisting);
-        assert_eq!(below_case(&reg, "minecraft:twisting_vines", "minecraft:air"), air);
-        let weeping = state(&reg, "minecraft:weeping_vines");
-        assert_eq!(side_case(&reg, "minecraft:weeping_vines", 1, "minecraft:stone"), weeping);
-        assert_eq!(side_case(&reg, "minecraft:weeping_vines", 1, "minecraft:air"), air);
+        let twisting = state(reg, "minecraft:twisting_vines");
+        assert_eq!(below_case(reg, "minecraft:twisting_vines", "minecraft:stone"), twisting);
+        assert_eq!(below_case(reg, "minecraft:twisting_vines", "minecraft:air"), air);
+        let weeping = state(reg, "minecraft:weeping_vines");
+        assert_eq!(side_case(reg, "minecraft:weeping_vines", 1, "minecraft:stone"), weeping);
+        assert_eq!(side_case(reg, "minecraft:weeping_vines", 1, "minecraft:air"), air);
     }
 }
