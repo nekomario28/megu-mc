@@ -37,6 +37,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use megu_core::bloom::{BlockedBloomFilter, VoxelBitset4096};
 use megu_core::bvh::{Aabb3, BvhNodeId, DynamicBvh};
@@ -44,6 +45,7 @@ use megu_core::coords::{BlockPos, ChunkKey, CoordMap, DimIndex, SectionKey};
 use megu_core::hash::{crc32_ieee, crc32_ieee_update};
 use megu_core::id::{InvalidResourceLocation, ResourceLocation};
 use megu_core::intern::{GenArena, GenIndex, StringInterner};
+use megu_core::local_transport::{local_pair, LocalEndpoint};
 use megu_core::lz4::{compress_block_into, decompress_block_exact, Lz4Error};
 use megu_core::registry::{NamespacedId, RegistryError, RegistryId, UniversalRegistry};
 use megu_core::rev::{Revision, UiLayer, UiLayerBus};
@@ -420,6 +422,29 @@ fn ui_layer_for_slot(slot: UiExtensionSlot) -> UiLayer {
     }
 }
 
+/// Commands an embedded in-process bridge can send back to the host over
+/// the zero-copy local transport. They are deliberately small control
+/// messages; bulk world state continues to flow through canonical keys and
+/// revisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModBridgeCommand {
+    /// Drain all currently queued wake events at the next host opportunity.
+    DrainWakes,
+    /// Re-read subscriptions after the bridge changed its watch set.
+    RefreshSubscriptions,
+}
+
+/// Counters exposed by the host end of the embedded loopback transport.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ModLocalTransportStats {
+    /// Wake events handed to the in-process bridge.
+    pub sent: u64,
+    /// Bridge commands received by the host.
+    pub received: u64,
+    /// Conservative TCP/copy avoidance estimate reported by the transport.
+    pub bytes_saved_estimate: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Mod connectivity, attachments, and spatial indexing
 // ---------------------------------------------------------------------------
@@ -758,6 +783,12 @@ pub struct ModSpineHost {
     networks: ModNetworkComponents,
     components: ModComponentStore,
     spatial: ModSpatialIndex,
+    /// Host end of the embedded host<->bridge loopback. Wake events are
+    /// mirrored here as `Arc` payloads while the bounded wake ring remains
+    /// the authoritative backlog for same-thread lanes.
+    local_host: LocalEndpoint<ModWakeEvent, ModBridgeCommand>,
+    /// Bridge end, handed out exactly once to an embedded bridge lane.
+    local_bridge: Option<LocalEndpoint<ModBridgeCommand, ModWakeEvent>>,
 }
 
 impl fmt::Debug for ModSpineHost {
@@ -797,6 +828,7 @@ impl ModSpineHost {
     #[must_use]
     pub fn with_rev_table(revs: Rc<RefCell<SharedSectionRevTable>>) -> Self {
         let (wake_producer, wake_consumer) = spsc_u64(1024);
+        let (local_host, local_bridge) = local_pair(1024);
         Self {
             dims: ModDimRegistry::new(),
             revs,
@@ -817,6 +849,37 @@ impl ModSpineHost {
             networks: ModNetworkComponents::new(),
             components: ModComponentStore::new(),
             spatial: ModSpatialIndex::new(),
+            local_host,
+            local_bridge: Some(local_bridge),
+        }
+    }
+
+    /// Take the embedded bridge endpoint exactly once. The retained host
+    /// endpoint is exercised by every wake-producing block notification;
+    /// the returned endpoint receives those events without TCP framing,
+    /// compression, or payload copies.
+    pub fn take_local_bridge_endpoint(
+        &mut self,
+    ) -> Option<LocalEndpoint<ModBridgeCommand, ModWakeEvent>> {
+        self.local_bridge.take()
+    }
+
+    /// Drain control commands sent by the embedded bridge endpoint.
+    pub fn drain_local_bridge_commands(&mut self) -> Vec<Arc<ModBridgeCommand>> {
+        let mut out = Vec::new();
+        while let Some(command) = self.local_host.try_recv() {
+            out.push(command);
+        }
+        out
+    }
+
+    /// Host-end counters for the embedded loopback transport.
+    #[must_use]
+    pub fn local_transport_stats(&self) -> ModLocalTransportStats {
+        ModLocalTransportStats {
+            sent: self.local_host.sent_count(),
+            received: self.local_host.received_count(),
+            bytes_saved_estimate: self.local_host.bytes_saved_estimate(),
         }
     }
 
@@ -1094,11 +1157,15 @@ impl ModSpineHost {
             if let Some(ids) = self.section_subs.get(&key) {
                 for &id in ids {
                     if let Some(sub) = self.subs.get(&id) {
-                        self.wakes.push_overwrite_oldest(ModWakeEvent {
+                        let event = ModWakeEvent {
                             mod_id: sub.mod_id.clone(),
                             watch: sub.watch,
                             revision,
-                        });
+                        };
+                        self.wakes.push_overwrite_oldest(event.clone());
+                        if self.local_bridge.is_none() {
+                            let _ = self.local_host.try_send(Arc::new(event));
+                        }
                         let _ = self.wake_producer.try_push(revision);
                     }
                 }
@@ -1108,11 +1175,15 @@ impl ModSpineHost {
             if let Some(ids) = self.chunk_subs.get(&key) {
                 for &id in ids {
                     if let Some(sub) = self.subs.get(&id) {
-                        self.wakes.push_overwrite_oldest(ModWakeEvent {
+                        let event = ModWakeEvent {
                             mod_id: sub.mod_id.clone(),
                             watch: sub.watch,
                             revision,
-                        });
+                        };
+                        self.wakes.push_overwrite_oldest(event.clone());
+                        if self.local_bridge.is_none() {
+                            let _ = self.local_host.try_send(Arc::new(event));
+                        }
                         let _ = self.wake_producer.try_push(revision);
                     }
                 }

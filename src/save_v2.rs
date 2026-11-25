@@ -1401,8 +1401,22 @@ impl WorldChunkTables {
             .map_or(&[0u8][..], |(_, bytes)| bytes.as_slice())
     }
 
-    fn take(&mut self, dim: DimId) -> Option<(usize, Vec<u8>)> {
-        self.tables.remove(&dim)
+    fn take(&mut self, dim: DimId) -> Option<megu_core::bounded::DimBound<(usize, Vec<u8>)>> {
+        self.tables
+            .remove(&dim)
+            .map(|value| megu_core::bounded::DimBound::new(megu_core::coords::DimIndex(dim.raw()), value))
+    }
+}
+
+fn dim_bound_overlay_value(
+    bound: Option<megu_core::bounded::DimBound<(usize, Vec<u8>)>>,
+    dim: DimId,
+) -> (usize, Vec<u8>) {
+    match bound {
+        None => (0, vec![0u8]),
+        Some(bound) => bound
+            .into_inner_checked(megu_core::coords::DimIndex(dim.raw()))
+            .expect("dimension-bound overlay crossed dimensions"),
     }
 }
 
@@ -1415,7 +1429,7 @@ impl WorldChunkTables {
 #[allow(dead_code)]
 fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
     let mut tables = WorldChunkTables::capture(&[dim]);
-    let (count, bytes) = tables.take(dim).unwrap_or((0, vec![0u8]));
+    let (count, bytes) = dim_bound_overlay_value(tables.take(dim), dim);
     f.extend_from_slice(&bytes);
     count
 }
@@ -2278,7 +2292,7 @@ fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompan
     let mut chunk_tables = WorldChunkTables::capture(&overlay_dims);
     if let Some(sink) = companion_sink {
         for (slot, dim) in [DimId::Nether, DimId::End].into_iter().enumerate() {
-            let (count, bytes) = chunk_tables.take(dim).unwrap_or((0, vec![0u8]));
+            let (count, bytes) = dim_bound_overlay_value(chunk_tables.take(dim), dim);
             sink[slot] = (dim, (count != 0).then_some(bytes));
         }
     }
@@ -2862,7 +2876,8 @@ fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompan
     // Everything a custom dimension owns, named by its canonical key so a
     // datapack added, removed or reordered between restarts cannot move it.
     for spec in &custom_specs {
-        if let Some((count, table)) = chunk_tables.take(spec.id) {
+        if let Some(bound) = chunk_tables.take(spec.id) {
+            let (count, table) = dim_bound_overlay_value(Some(bound), spec.id);
             if count != 0 {
                 dxt.overlays.push((spec.key.to_string(), table));
             }
@@ -4425,7 +4440,14 @@ fn load_dim_overlay_file(dir: &std::path::Path, dim: DimId) -> Result<(), &'stat
         Err(_) => return Err("failed to read world save"),
     };
     persistence_boundary("dimension load panicked", || {
-        load_dim_overlay_from(dim, &unwrap_world_payload(raw)?)
+        let bound = megu_core::bounded::DimBound::new(
+            megu_core::coords::DimIndex(dim.raw()),
+            unwrap_world_payload(raw)?,
+        );
+        let payload = bound
+            .into_inner_checked(megu_core::coords::DimIndex(dim.raw()))
+            .ok_or("cross-dimension overlay payload")?;
+        load_dim_overlay_from(dim, &payload)
     })
 }
 

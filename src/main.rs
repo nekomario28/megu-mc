@@ -1551,7 +1551,7 @@ fn environment_time_tick() {
             }
             if let Some(ty) = tele_y {
                 let (ax, az, eid) = (b.x, b.z, b.eid);
-                broadcast_seen(eid, |_c| {
+                broadcast_seen_net_budget(eid, (ax, ty, az), true, |_c| {
                     (0x70, entity_teleport(eid, ax, ty, az, 0.0, 0.0, true))
                 });
             }
@@ -1595,7 +1595,7 @@ fn environment_time_tick() {
                 p0.z += p0.dz;
             }
             let (ax, ay, az, eid) = (p0.x, p0.y, p0.z, p0.eid);
-            broadcast_seen(eid, |_c| {
+            broadcast_seen_net_budget(eid, (ax, ay, az), true, |_c| {
                 (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
             });
         }
@@ -1704,7 +1704,7 @@ fn environment_time_tick() {
                 p0.x += p0.dx;
                 p0.y += p0.dy;
                 p0.z += p0.dz;
-                broadcast_seen(p0.eid, |_c| {
+                broadcast_seen_net_budget(p0.eid, (p0.x, p0.y, p0.z), true, |_c| {
                     (
                         0x70,
                         entity_teleport(p0.eid, p0.x, p0.y, p0.z, 0.0, 0.0, true),
@@ -9990,38 +9990,37 @@ fn random_tick_pass() {
     // player/world edits in `WORLD` (when worldgen is enabled), matching Vanilla's invariant
     // that random ticks never synchronously generate unloaded frontier chunks on the tick thread.
     let wg_on = worldgen::enabled();
-    for dim in DimId::all_registered() {
-        for (cx, cz) in ticked_chunks() {
-            if wg_on {
-                let key = (dim, cx, cz);
-                let has_sections = section_store().map.read(&key).contains_key(&key);
-                if !has_sections {
-                    let has_edits = world().read(&key).contains_key(&key);
-                    if !has_edits {
-                        continue;
-                    }
+    let quiescent_chunks = quiescent_random_tick_chunks();
+    for (dim, cx, cz) in quiescent_chunks {
+        if wg_on {
+            let key = (dim, cx, cz);
+            let has_sections = section_store().map.read(&key).contains_key(&key);
+            if !has_sections {
+                let has_edits = world().read(&key).contains_key(&key);
+                if !has_edits {
+                    continue;
                 }
             }
-            for sy in ticked_sections(dim, cx, cz) {
-                for _ in 0..speed {
-                    let x = cx * 16 + world_rng::next_below(16) as i32;
-                    let Some(y) = random_tick_y(dim, sy, world_rng::next_below(16)) else {
-                        continue;
-                    };
-                    let z = cz * 16 + world_rng::next_below(16) as i32;
-                    let state = block_at_cached_dim(dim, x, y, z);
-                    let block_name = reg.name_of(state);
-                    if player_mechanism_random_tick(dim, x, y, z, block_name) {
-                        // This dispatcher owns leaves as well as copper, coral,
-                        // and brushable blocks. Its block mutations already
-                        // stage the dimension-aware block update.
-                        continue;
-                    }
-                    if dim == DimId::Overworld {
-                        on_random_tick(reg, x, y, z);
-                    } else {
-                        on_random_tick_dim(reg, dim, x, y, z);
-                    }
+        }
+        for sy in ticked_sections(dim, cx, cz) {
+            for _ in 0..speed {
+                let x = cx * 16 + world_rng::next_below(16) as i32;
+                let Some(y) = random_tick_y(dim, sy, world_rng::next_below(16)) else {
+                    continue;
+                };
+                let z = cz * 16 + world_rng::next_below(16) as i32;
+                let state = block_at_cached_dim(dim, x, y, z);
+                let block_name = reg.name_of(state);
+                if player_mechanism_random_tick(dim, x, y, z, block_name) {
+                    // This dispatcher owns leaves as well as copper, coral,
+                    // and brushable blocks. Its block mutations already
+                    // stage the dimension-aware block update.
+                    continue;
+                }
+                if dim == DimId::Overworld {
+                    on_random_tick(reg, x, y, z);
+                } else {
+                    on_random_tick_dim(reg, dim, x, y, z);
                 }
             }
         }
@@ -12769,13 +12768,9 @@ fn live_block_changed(dim: DimId, pos @ RsPos(x, y, z): RsPos, old: u32, new: u3
     if old == new {
         return;
     }
-    // The netlist cover keys on `bump_block_local` (edited section only):
-    // the dilated cover already spans every section a topology edit can
-    // reach, so border propagation is unnecessary per write.
-    shared_section_revs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .bump_block_local(megu_core::coords::DimIndex(dim.raw()), x, y, z);
+    // One ingress feeds the canonical revision spine, quiescent border wakes,
+    // shared packet invalidation, and the lazy-schedule backoff reset.
+    quiescent_note_block_mutation(dim, x, y, z, old, new);
     let Some(reg) = breg() else { return };
     if reg.block_id_of(old) != reg.block_id_of(new) {
         if let Some(state) = live_redstone()
@@ -17859,6 +17854,7 @@ struct MapChunkEntry {
     versions: [u64; 9],
     sig: u64,
     own_emitters: Vec<((i32, i32, i32), u8)>,
+    #[cfg(not(feature = "mod-suite"))]
     payload: Vec<u8>,
 }
 
@@ -17888,6 +17884,40 @@ const MAP_CHUNK_CACHE_CAP: usize = 512;
 
 fn map_chunk_cache() -> &'static Mutex<MapChunkCache> {
     MAP_CHUNK_CACHE.get_or_init(|| Mutex::new(MapChunkCache::default()))
+}
+
+/// Canonical shared backing store for complete chunk-packet frames. The local
+/// metadata cache above decides whether the frame is valid for these exact
+/// generation/light/signature inputs; this store owns the immutable bytes and
+/// their bounded LRU/generation invalidation. `compression_threshold` is used
+/// as the lane discriminator (`-1` surface, `1` occluded), not as the network
+/// compression setting, because the payload here is the uncompressed 0x27
+/// frame before per-connection compression.
+#[cfg(feature = "mod-suite")]
+fn state_chunk_packet_cache() -> &'static Mutex<megu_state_store::chunk_packet_cache::ChunkPacketCache> {
+    static CACHE: OnceLock<Mutex<megu_state_store::chunk_packet_cache::ChunkPacketCache>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| {
+        Mutex::new(megu_state_store::chunk_packet_cache::ChunkPacketCache::new(
+            1024,
+            128 * 1024 * 1024,
+        ))
+    })
+}
+
+#[cfg(feature = "mod-suite")]
+fn state_chunk_packet_key(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    occluded: bool,
+) -> megu_state_store::chunk_packet_cache::ChunkPacketKey {
+    megu_state_store::chunk_packet_cache::ChunkPacketKey {
+        dim: dim.raw(),
+        cx,
+        cz,
+        compression_threshold: if occluded { 1 } else { -1 },
+    }
 }
 
 /// Snapshot the center chunk's full write version plus its 8 neighbors' light
@@ -18041,8 +18071,12 @@ fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: 
     // matching 3x3 versions and entity/neighbor-light signatures; a hit also restores
     // `(cx, cz)`'s generated emitters into `gen` so downstream light updates stay exact.
     // `occluded` splits the lanes: a surface player's masked payload must never be
-    // served to an underground player nor the other way round.
+    // served to an underground player nor the other way round. Metadata stays in the
+    // small local index; the complete frame bytes live in the canonical state-store
+    // generation/LRU cache so invalidation and bounded sharing have one owner.
     let key = (dim, cx, cz, occluded);
+    #[cfg(feature = "mod-suite")]
+    let packet_key = state_chunk_packet_key(dim, cx, cz, occluded);
     let versions = chunk_versions_3x3(dim, cx, cz);
     let candidate_sig = {
         let mut cache = map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -18055,16 +18089,57 @@ fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: 
     if let Some(want_sig) = candidate_sig {
         let sig = map_chunk_sig(dim, cx, cz, gen);
         if sig == want_sig {
-            let mut cache = map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner());
-            cache.sync_generation();
-            if let Some(e) = cache.map.get(&key) {
-                if e.versions == versions && e.sig == sig {
-                    gen.insert((cx, cz), e.own_emitters.clone());
-                    return e.payload.clone();
+            let hit_emitters = {
+                let mut cache = map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner());
+                cache.sync_generation();
+                cache.map.get(&key).and_then(|e| {
+                    (e.versions == versions && e.sig == sig).then(|| e.own_emitters.clone())
+                })
+            };
+            if let Some(stored_emitters) = hit_emitters {
+                #[cfg(feature = "mod-suite")]
+                {
+                    let (frame, _frame_hit) = state_chunk_packet_cache()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get_or_encode(packet_key, || {
+                            build_map_chunk_lane(cx, cz, dim, gen, occluded)
+                        });
+                    // The metadata hit already proves these exact generation/light
+                    // inputs, so its emitter set is authoritative even when the
+                    // state-store outer entry was evicted but the encode-once
+                    // backing supplied the bytes without rerunning the encoder.
+                    gen.insert((cx, cz), stored_emitters);
+                    return frame.to_vec();
+                }
+                #[cfg(not(feature = "mod-suite"))]
+                {
+                    let cache = map_chunk_cache().lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = cache.map.get(&key) {
+                        gen.insert((cx, cz), stored_emitters);
+                        return entry.payload.clone();
+                    }
                 }
             }
         }
     }
+
+    #[cfg(feature = "mod-suite")]
+    let payload = {
+        // Any validation-input change outside ordinary block edits (sign/block-entity
+        // data, generator emitters, lighting signatures, or first population of the
+        // metadata index) must retire bytes cached under the old generation too.
+        state_chunk_packet_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .bump_chunk(dim.raw(), cx, cz);
+        let (frame, _) = state_chunk_packet_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_encode(packet_key, || build_map_chunk_lane(cx, cz, dim, gen, occluded));
+        frame.to_vec()
+    };
+    #[cfg(not(feature = "mod-suite"))]
     let payload = build_map_chunk_lane(cx, cz, dim, gen, occluded);
     if chunk_versions_3x3(dim, cx, cz) == versions {
         let sig = map_chunk_sig(dim, cx, cz, gen);
@@ -18079,6 +18154,7 @@ fn map_chunk_lane(cx: i32, cz: i32, dim: DimId, gen: &mut GenSources, occluded: 
                     versions,
                     sig,
                     own_emitters,
+                    #[cfg(not(feature = "mod-suite"))]
                     payload: payload.clone(),
                 },
             )
@@ -21024,6 +21100,49 @@ fn aeronautics_sync_tick() {
     }
 }
 
+/// Broadcast one moving entity's positional update through the perceptual
+/// net-budget scheduler. Near/frustum motion remains every tick; mid, rear,
+/// far, and quiescent viewers receive deterministic staggered strides instead
+/// of every projectile/bobber emitting at full rate to every viewer.
+fn broadcast_seen_net_budget<F: Fn(&Client) -> (i64, Vec<u8>)>(
+    eid: i32,
+    target: (f64, f64, f64),
+    moving: bool,
+    mk: F,
+) {
+    let tick = TICK_IDX.load(Ordering::Relaxed);
+    let mut shared = None;
+    for client in client_snapshot().iter() {
+        let seen = client.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if !seen.contains(&eid) {
+            continue;
+        }
+        let p = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let yaw = (p.3 as f64).to_radians();
+        let pitch = (p.4 as f64).to_radians();
+        let fwd = [
+            (-yaw.sin() * pitch.cos()) as f32,
+            (-pitch.sin()) as f32,
+            (yaw.cos() * pitch.cos()) as f32,
+        ];
+        let band = megu_core::net_budget::classify_perceptual_band(
+            [p.0 as f32, p.1 as f32, p.2 as f32],
+            fwd,
+            [target.0 as f32, target.1 as f32, target.2 as f32],
+            moving,
+            24.0,
+            96.0,
+        );
+        if !megu_core::net_budget::should_emit_tick(band, tick, eid as u32) {
+            continue;
+        }
+        let (id, packet) = mk(client);
+        if let Ok(mut socket) = client.sock.lock() {
+            let _ = send_broadcast_frame(&mut socket, &mut shared, id, &packet);
+        }
+    }
+}
+
 fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     // §5.2③: drain leftover coalesced WAL frames even when this tick is
     // frozen, so `/tick freeze` (or a skipped tick) cannot strand journaled
@@ -21078,6 +21197,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     run("environment", environment_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
     run("hot_regions", refresh_hot);
+    run("quiescent_chunks", quiescent_chunk_tick);
     // Vanilla 1.21.1 `ServerLevel.tick` phase order: scheduled block ticks,
     // fluid ticks, raids, then the chunk-source pass (entities, block entities,
     // `tickChunk` random ticks), then pending block events. The subsystem
@@ -21207,6 +21327,9 @@ OPTIONS:
     --ascii           Use ASCII dashboard glyphs.
     --log-filter <events|alerts|all>
                      Choose the dashboard log filter (default: events).
+    --dst-check [ticks] [seed]
+                     Run the deterministic simulation/Merkle restart oracle,
+                     print one JSON report, and exit nonzero on violation.
     -V, --version    Print the version and exit.
     -h, --help       Print this help and exit.
 
@@ -21228,6 +21351,63 @@ const MEGU_BANNER: &str = r#"
 Megu v0.1.0-alpha.3 - clean-room Rust Minecraft engine (1.21.1 / 26.3)
 Let's blow past 20 TPS!
 "#;
+
+fn dst_check_report_json(report: &megu_core::dst_oracle::DstCampaignReport) -> String {
+    format!(
+        "{{\"status\":\"pass\",\"seed\":{},\"ticks_executed\":{},\"restarts_verified\":{},\"merkle_roots_matched\":{},\"conservation_checks\":{},\"cross_dim_ops\":{},\"mod_faults_isolated\":{}}}",
+        report.seed,
+        report.ticks_executed,
+        report.restarts_verified,
+        report.merkle_roots_matched,
+        report.conservation_checks,
+        report.cross_dim_ops,
+        report.mod_faults_isolated
+    )
+}
+
+/// `megu --dst-check [ticks] [seed]`: run the deterministic TigerStyle
+/// campaign in the shipped binary. The default length crosses two scheduled
+/// crash/restart boundaries; explicit arguments let CI choose a smaller or
+/// larger deterministic campaign without recompiling.
+fn run_dst_check_cli(args: &[String]) -> i32 {
+    if args.len() > 3 {
+        eprintln!("usage: --dst-check [ticks] [seed]");
+        return 2;
+    }
+    let ticks = match args.get(1) {
+        None => 1_000usize,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(ticks) if ticks > 0 => ticks,
+            _ => {
+                eprintln!("megu: --dst-check ticks must be a positive integer");
+                return 2;
+            }
+        },
+    };
+    let seed = match args.get(2) {
+        None => 0x4d45_4755_4453_5401u64,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(seed) => seed,
+            _ => {
+                eprintln!("megu: --dst-check seed must be an unsigned integer");
+                return 2;
+            }
+        },
+    };
+    match megu_core::dst_oracle::run_dst_campaign(seed, ticks) {
+        Ok(report) => {
+            println!("{}", dst_check_report_json(&report));
+            0
+        }
+        Err(violation) => {
+            eprintln!(
+                "{{\"status\":\"fail\",\"seed\":{seed},\"ticks_requested\":{ticks},\"violation\":\"{}\"}}",
+                violation.to_string().replace("\\", "\\\\").replace('"', "\\\"")
+            );
+            1
+        }
+    }
+}
 
 /// Consume the startup flags and return the arguments left for the probe/tool
 /// dispatch below. `--help`/`--version` print and exit 0 without the server ever
@@ -21796,6 +21976,12 @@ fn main() {
         std::process::exit(2);
     }
     let probe_args: Vec<String> = rest.clone();
+    if probe_args
+        .first()
+        .is_some_and(|arg| arg == "--dst-check")
+    {
+        std::process::exit(run_dst_check_cli(&probe_args));
+    }
     if probe_args
         .first()
         .is_some_and(|arg| arg == "--import-anvil")
@@ -28068,5 +28254,81 @@ mod hardcode_fix_generic_rules_tests {
         assert!(slab_absorbs(reg, oak, "oak_slab", &ctx));
         assert!(!slab_absorbs(reg, spruce, "oak_slab", &ctx));
         assert!(!slab_absorbs(reg, oak, "stone_slab", &ctx));
+    }
+}
+
+#[cfg(test)]
+mod wired_server_state_cs_tests {
+    use super::*;
+
+    #[test]
+    fn dst_check_report_json_is_machine_readable_summary() {
+        let report = megu_core::dst_oracle::DstCampaignReport {
+            seed: 7,
+            ticks_executed: 1_000,
+            restarts_verified: 2,
+            merkle_roots_matched: 2,
+            conservation_checks: 1_000,
+            cross_dim_ops: 5,
+            mod_faults_isolated: 3,
+        };
+        assert_eq!(
+            dst_check_report_json(&report),
+            "{\"status\":\"pass\",\"seed\":7,\"ticks_executed\":1000,\"restarts_verified\":2,\"merkle_roots_matched\":2,\"conservation_checks\":1000,\"cross_dim_ops\":5,\"mod_faults_isolated\":3}"
+        );
+    }
+
+    #[test]
+    fn net_budget_stride_staggers_mid_band_entities_deterministically() {
+        let band = megu_core::net_budget::PerceptualBand::InFrustumMid;
+        let stride = band.tick_stride();
+        assert!(stride > 1);
+        let emissions: Vec<u64> = (0..stride * 2)
+            .filter(|tick| megu_core::net_budget::should_emit_tick(band, *tick, 11))
+            .collect();
+        assert_eq!(emissions.len(), 2);
+        assert_eq!(emissions[1] - emissions[0], stride);
+    }
+
+    #[test]
+    fn quiescent_scheduler_publishes_only_random_tick_active_chunks() {
+        let _guard = crate::test_support::global_world_test_guard();
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((0, 0));
+        refresh_hot();
+        quiescent_chunk_tick();
+        let chunks = quiescent_random_tick_chunks();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|&(_, cx, cz)| (cx, cz) == (0, 0)));
+        assert!(chunks.iter().any(|&(dim, _, _)| dim == DimId::Overworld));
+
+        forceloaded()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(0, 0));
+        refresh_hot();
+        quiescent_chunk_tick();
+        assert!(quiescent_random_tick_chunks().is_empty());
+    }
+
+    #[test]
+    fn save_v2_dim_bound_overlay_rejects_cross_dimension_unwrap() {
+        let bound = megu_core::bounded::DimBound::new(
+            megu_core::coords::DimIndex(DimId::Nether.raw()),
+            (1, vec![9u8]),
+        );
+        assert!(bound
+            .into_inner_checked(megu_core::coords::DimIndex(DimId::Overworld.raw()))
+            .is_none());
+        let correct = megu_core::bounded::DimBound::new(
+            megu_core::coords::DimIndex(DimId::Nether.raw()),
+            (1, vec![9u8]),
+        );
+        assert_eq!(
+            dim_bound_overlay_value(Some(correct), DimId::Nether),
+            (1, vec![9u8])
+        );
     }
 }

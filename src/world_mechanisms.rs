@@ -11063,3 +11063,181 @@ mod parity_live_wire_world_tests {
     }
 
 }
+
+/// Sparse wake scheduler for live chunk activity (`megu_core::quiescent`).
+///
+/// Every live mutation enters through `quiescent_note_block_mutation`: the
+/// canonical section/chunk revision bump, horizontal border wakes, and the
+/// lazy-schedule backoff reset share one ingress. Tick-scoped systems then
+/// read dense active slices instead of scanning loaded-but-idle columns.
+fn quiescent_scheduler() -> &'static Mutex<megu_core::quiescent::QuiescentChunkScheduler> {
+    static SCHEDULER: OnceLock<Mutex<megu_core::quiescent::QuiescentChunkScheduler>> =
+        OnceLock::new();
+    SCHEDULER.get_or_init(|| Mutex::new(megu_core::quiescent::QuiescentChunkScheduler::new()))
+}
+
+/// Generic live-mutation wake bit. Vanilla categories are added when the old
+/// or replacement state identifies a more specific owner.
+fn quiescent_mutation_bit() -> megu_core::quiescent::ActivityMask {
+    megu_core::quiescent::ActivityMask::custom(6)
+}
+
+/// Wake bits introduced by the block-mutation edge itself. They are valid for
+/// the current scheduler round and are cleared on the next one; long-running
+/// systems must re-wake chunks from their own persistent state rather than
+/// relying on one historical edit to keep the column active forever.
+fn quiescent_transient_mutation_bits() -> megu_core::quiescent::ActivityMask {
+    use megu_core::quiescent::ActivityMask;
+    quiescent_mutation_bit() | ActivityMask::FLUID | ActivityMask::REDSTONE | ActivityMask::BLOCK_ENTITY
+}
+
+fn quiescent_activity_for_mutation(
+    reg: Option<&crate::block_registry::BReg>,
+    dim: DimId,
+    pos: (i32, i32, i32),
+    old: u32,
+    new: u32,
+) -> megu_core::quiescent::ActivityMask {
+    use megu_core::quiescent::ActivityMask;
+    let mut bits = quiescent_mutation_bit();
+    let Some(reg) = reg else {
+        return bits;
+    };
+    if redstone_component(reg, old)
+        || redstone_component(reg, new)
+        || nearby_redstone(reg, dim, RsPos(pos.0, pos.1, pos.2))
+    {
+        bits.insert(ActivityMask::REDSTONE);
+    }
+    for state in [old, new] {
+        let name = reg.name_of(state);
+        if matches!(name, "minecraft:water" | "minecraft:lava")
+            || name.ends_with("_water")
+            || name.ends_with("_lava")
+        {
+            bits.insert(ActivityMask::FLUID);
+        }
+        if name.contains("sign")
+            || name.contains("chest")
+            || name.contains("furnace")
+            || name.contains("hopper")
+            || name.contains("spawner")
+            || name.contains("beacon")
+        {
+            bits.insert(ActivityMask::BLOCK_ENTITY);
+        }
+    }
+    bits
+}
+
+/// Wake the owning chunk and every touched horizontal border neighbor, bump
+/// the shared revision spine exactly once, invalidate the shared chunk-packet
+/// backing cache, and reset the documented lazy-schedule backoff cell plus
+/// its six neighbors. Returns the canonical `(section_rev, chunk_rev)` pair.
+fn quiescent_note_block_mutation(
+    dim: DimId,
+    x: i32,
+    y: i32,
+    z: i32,
+    old: u32,
+    new: u32,
+) -> (u64, u64) {
+    let bits = quiescent_activity_for_mutation(breg(), dim, (x, y, z), old, new);
+    let dim_index = megu_core::coords::DimIndex(dim.raw());
+    let revs = {
+        let mut rev_table = shared_section_revs()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        quiescent_scheduler()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .on_block_mutated(dim_index, x, y, z, bits, &mut rev_table)
+    };
+    #[cfg(feature = "mod-suite")]
+    state_chunk_packet_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bump_block(dim.raw(), x, z);
+
+    // The backoff contract above the registry says any neighbor block change
+    // invalidates the cell back to full rate. The scheduler wake is the
+    // mutation ingress for that reset; removing exact positions keeps the
+    // reset precise rather than chunk-coarse.
+    let mut backoff = backoff().lock().unwrap_or_else(|e| e.into_inner());
+    backoff.remove(&(dim, x, y, z));
+    for (dx, dy, dz) in LEAF_NEIGHBORS {
+        backoff.remove(&(dim, x + dx, y + dy, z + dz));
+    }
+    drop(backoff);
+    revs
+}
+
+fn quiescent_random_snapshot_store() -> &'static Mutex<Vec<(DimId, i32, i32)>> {
+    static SNAPSHOT: OnceLock<Mutex<Vec<(DimId, i32, i32)>>> = OnceLock::new();
+    SNAPSHOT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn quiescent_random_tick_chunks() -> Vec<(DimId, i32, i32)> {
+    quiescent_random_snapshot_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Advance the scheduler once per server tick and publish the dense active
+/// random-tick slice. Chunks outside the hot/forceloaded input are never
+/// inserted at all; a chunk leaving the input has its random-tick bit removed
+/// and physically leaves the dense set when no other wake source remains.
+fn quiescent_chunk_tick() {
+    use megu_core::coords::{ChunkKey, DimIndex};
+    use megu_core::quiescent::ActivityMask;
+
+    let ticked = ticked_chunks();
+    let dims = DimId::all_registered();
+    let mut wanted = std::collections::HashSet::with_capacity(ticked.len() * dims.len());
+    let mut wanted_keys = Vec::with_capacity(ticked.len() * dims.len());
+    for dim in &dims {
+        let dim_index = DimIndex(dim.raw());
+        for &(cx, cz) in &ticked {
+            let key = ChunkKey { dim: dim_index, cx, cz };
+            wanted.insert(key);
+            wanted_keys.push(key);
+        }
+    }
+
+    let mut woken = Vec::new();
+    let mut scheduler = quiescent_scheduler()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    scheduler.advance_tick(&mut woken);
+    let current_tick = scheduler.current_tick();
+    let active: Vec<_> = scheduler.active_chunks().to_vec();
+    for entry in active {
+        if entry.mask.intersects(ActivityMask::RANDOM_TICK) && !wanted.contains(&entry.key) {
+            scheduler.clear_bits(entry.key, ActivityMask::RANDOM_TICK);
+        }
+        // Mutation wakes are one-tick edge events. The bit is cleared on the
+        // next scheduler round so a single edit does not keep a column in the
+        // dense active set forever; persistent owners re-wake themselves.
+        if entry.last_woken_tick < current_tick {
+            scheduler.clear_bits(entry.key, quiescent_transient_mutation_bits());
+        }
+    }
+    for key in wanted_keys {
+        scheduler.wake(key, ActivityMask::RANDOM_TICK);
+    }
+    let mut snapshot: Vec<(DimId, i32, i32)> = scheduler
+        .active_chunks()
+        .iter()
+        .filter(|entry| entry.mask.intersects(ActivityMask::RANDOM_TICK))
+        .filter_map(|entry| {
+            DimId::from_index(entry.key.dim.0 as usize)
+                .map(|dim| (dim, entry.key.cx, entry.key.cz))
+        })
+        .collect();
+    snapshot.sort_by_key(|&(dim, cx, cz)| (dim.raw(), cx, cz));
+    drop(scheduler);
+    *quiescent_random_snapshot_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = snapshot;
+}

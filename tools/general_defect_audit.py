@@ -259,18 +259,12 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
  'src/world_mechanisms.rs:SPONGE_SEEN:std::cell::RefCell<HashSet<BlockPos>>': 1,
  'src/worldgen.rs:TERRAIN_SHARES:std::sync::OnceLock<Mutex<HashMap<u64, std::sync::Arc<TerrainShare>>>>': 1}
 UNWIRED_MODULE_BASELINE = {
-    'core/bounded',
-    'core/dst_oracle',
     'core/dye_and_items',
     'core/geom',
-    'core/local_transport',
     'core/mesh_elision',
-    'core/net_budget',
     'core/os_desktop',
-    'core/quiescent',
     'core/render_cs',
     'create-adapter/rail_network',
-    'state-store/chunk_packet_cache',
 }
 
 HOME_NAME_CHARS = r"[A-Za-z0-9._-]+"
