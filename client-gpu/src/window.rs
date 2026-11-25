@@ -4522,6 +4522,12 @@ impl GpuApp {
                 let layout = screen.layout(w, h);
                 if let Some(hit) = layout.slots.iter().find(|slot| slot.rect.contains(mx, my)) {
                     let slot_index = hit.index;
+                    if screen.schema().menu_id == 7 && (0..9).contains(&slot_index) {
+                        if let Some(live) = &mut self.live {
+                            live.toggle_crafter_slot(screen.window_id, i32::from(slot_index));
+                        }
+                        return true;
+                    }
                     if let Some(action) = screen.click(slot_index, button_id) {
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
@@ -6445,6 +6451,7 @@ impl GpuApp {
             WindowInputEvent::OpenChat { slash_prefill } => {
                 // Vanilla `T`/`/` open the chat/command bar; the pointer is
                 // released for text entry like a server screen.
+                self.close_container_surface();
                 let mut bar = ZshCommandBar::new();
                 if slash_prefill {
                     bar.push_char('/');
