@@ -33,6 +33,11 @@
       "date": "2026-11-23"
     },
     {
+      "module": "server-files/src/admin_cli.rs",
+      "reason": "Admin CLI is consumed by the production megu-init/server_init binaries under src/bin, which the module-consumer audit excludes by design; no additional lib consumer is needed",
+      "date": "2026-11-25"
+    },
+    {
       "module": "mod-offload/src/ffi.rs",
       "reason": "C ABI boundary consumed via include/megu_mod_offload.h by non-Rust callers \u2014 invisible to the Rust consumer graph by design",
       "date": "2026-11-23"
