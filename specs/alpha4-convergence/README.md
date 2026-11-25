@@ -4,6 +4,26 @@ Status: **draft persistent plan / not yet a completion claim**.
 
 This plan is a control-plane reset for converging the current alpha4 audit and compatibility work into a releasable, evidence-honest candidate. It does not replace `specs/ROADMAP.md`, `docs/release-checklist.md`, or the audit ledgers; it orders their execution.
 
+
+## Current integration status — refreshed 2026-11-25
+
+The control-plane state above is historical. The active local integration branch is now
+`alpha4/integration-alpha4-convergence-local` at `421dd560d` (`test(client): require vanilla worldgen in quickplay e2e`),
+19 commits ahead of `origin/alpha4/integration-alpha4-convergence` and not yet pushed.
+
+Release-blocking lanes already integrated on this head include inventory conservation, non-vacuous A04 Anvil
+transaction tests, clippy warning elimination to the ratchet baseline, broad A08 UI recovery with explicitly held
+limitations, wiring-audit scanner correction with documented staged boundaries, and installer/runtime-data generation.
+The installer now generates the canonical datapack plus the complete block-registry runtime asset pack. A fresh full
+install probe at `/home/yuu/.cache/megu-install-fullassets.Z2z3GG/server` exited 0; every generated `assets/*_1211*`
+file byte-matched the canonical local generated assets. A server boot using that installed runtime printed
+`[wg] vanilla datapack worldgen active (seed 0)`. The quickplay loopback E2E passed with the runtime supplied through
+`MEGU_E2E_RUNTIME_ROOT` and now fails if the child server logs the flat-generator fallback instead of vanilla datapack
+worldgen.
+
+This is still not release authority. Same-SHA static/unit/export/bundle/live gates are being rerun on the final head;
+no tag, push, release artifact publication, or external comment has occurred.
+
 ## Evidence baseline refreshed for this plan
 
 Live evidence below was checked locally on 2026-11-25. It supersedes stale chat/handoff text.
@@ -143,7 +163,7 @@ All release claims must be re-proven on one exact candidate SHA. A green lane re
 1. Static and unit gates:
    - `bash tests/verify.sh` only after its current cleanup trap is made non-destructive or the affected standalone-crate commands are run directly; do not execute the current `rm -rf` cleanup path under the no-approval/no-destructive-command contract
    - standalone crate clippy loop from `docs/release-checklist.md`
-   - `python3 tools/wiring_audit.py --strict`
+   - `python3 tools/wiring_audit.py --strict --tolerated-unwired tools/wiring_audit_unwired.json` (the canonical gate used by `tests/verify.sh`; plain `--strict` intentionally reports the documented staged unwired modules)
    - `python3 tools/vanilla_parity_audit.py --format text --strict --min-c2s-handled 58 --min-gamerules-wired 51`
    - `python3 tools/modloader_parity_audit.py --format text --strict --min-overall-pct 100`
    - `python3 tools/provenance_check.py --self-test`
@@ -156,7 +176,7 @@ All release claims must be re-proven on one exact candidate SHA. A green lane re
 3. Bundle/container:
    - deterministic release bundle build and `verify`
    - Docker image build, EULA refusal checks, and runtime smoke
-   - fresh-profile installer smoke must prove the integrated-singleplayer runtime-data path end to end: profile registration, server binary discovery, runtime-root discovery, `config_packets.bin`, `assets/block_states_1211.json`, and `datapacks/vanilla` availability, and world creation. This is a release blocker because alpha3 installed successfully but could not create a world on a fresh laptop
+   - fresh-profile installer smoke must prove the integrated-singleplayer runtime-data path end to end: profile registration, server binary discovery, runtime-root discovery, `config_packets.bin`, `datapacks/vanilla`, the complete `assets/*_1211` block-registry pack (including `blocks_1211.json`, the binary physical-fact tables, and `feature_order_1211.json`) availability, vanilla-datapack worldgen activation, and world creation. This is a release blocker because alpha3 installed successfully but could not create a world on a fresh laptop
    - artifact hashes and mtimes recorded with the exact candidate SHA
 4. Live behavior:
    - fresh automated alpha smoke, not only historical recorded results
@@ -217,7 +237,7 @@ Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla o
    - Push branch, open/update PR, tag `v0.1.0-alpha.4`, publish assets, deploy website/crash relay, or comment externally only after explicit user instruction and publish guard authorization.
    - Required protected checks on the exact release SHA: `gitleaks`, `cargo-deny`, `rust`, `mutation`, and `xplat` Ubuntu/macOS/Windows.
 
-Current first safe action: finish the missing exact-head validation inventory for `cff205939` without restarting broad suites blindly, then open the inventory-conservation lane because it is the clearest functional release blocker.
+Current first safe action: finish the same-SHA release-candidate gate inventory on the active final integration head, integrate any first-failure fixes, then rebuild/verify artifacts and update release documentation before publication.
 
 ## Reopen / hold conditions
 
@@ -230,4 +250,4 @@ Current first safe action: finish the missing exact-head validation inventory fo
 
 ## Immediate next safe action
 
-Finish the missing exact-head validation inventory for local integration head `cff205939` without rerunning broad suites blindly, then start the inventory-conservation implementation lane. Do not push, publish, clean the root checkout, or treat filtered/zero-match tests as release evidence.
+Finish the same-SHA release-candidate gate inventory on the active integration head. Do not push, publish, clean the root checkout, treat filtered/zero-match tests as release evidence, or publish while the installer/worldgen blocker lacks exact-head end-to-end evidence.
