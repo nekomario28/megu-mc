@@ -153,6 +153,10 @@ fn decompressor_rejects_truncation_bad_offsets_and_bombs_without_panicking() {
         "only {checked_errors} hostile inputs rejected"
     );
     assert!(matches!(
+        lz4_decompress_block(&[0x10, b'x', 5, 0], 64),
+        Err(Lz4Error::InvalidOffset(5))
+    ));
+    assert!(matches!(
         lz4_decompress_block(&[0x10, b'x', 1, 0], 4),
         Err(Lz4Error::OutputLimit { .. })
     ));

@@ -118,7 +118,7 @@ pub fn lz4_decompress_block(src: &[u8], max_uncompressed: usize) -> Result<Vec<u
     }
     megu_core::lz4::decompress_block(src, max_uncompressed).map_err(|error| match error {
         megu_core::lz4::Lz4Error::Truncated => Lz4Error::Truncated("block stream"),
-        megu_core::lz4::Lz4Error::BadOffset => Lz4Error::InvalidOffset(0),
+        megu_core::lz4::Lz4Error::BadOffset(offset) => Lz4Error::InvalidOffset(offset),
         megu_core::lz4::Lz4Error::TooLarge => Lz4Error::OutputLimit {
             limit: max_uncompressed,
         },
