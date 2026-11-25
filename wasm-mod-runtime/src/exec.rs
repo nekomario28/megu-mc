@@ -154,7 +154,8 @@ impl<'m> Vm<'m> {
                     return Err(Trap::Unreachable);
                 }
                 let mut locals = args.to_vec();
-                for t in &self.m.locals[def] {
+                let local_types = self.m.locals.get(def).ok_or(Trap::Unreachable)?;
+                for t in local_types {
                     locals.push(t.zero());
                 }
                 self.frames.push(Frame {
@@ -166,6 +167,9 @@ impl<'m> Vm<'m> {
                 });
                 self.run()?;
                 let n = self.stack.len();
+                if n < results {
+                    return Err(Trap::Unreachable);
+                }
                 Ok(self.stack.split_off(n - results))
             }
             None => Err(Trap::Unreachable),
@@ -181,7 +185,7 @@ impl<'m> Vm<'m> {
                     None => break,
                 }
             };
-            let ops = &self.m.funcs[def];
+            let ops = self.m.funcs.get(def).ok_or(Trap::Unreachable)?;
             if pc >= ops.len() {
                 self.finish_frame();
                 continue;
@@ -209,11 +213,17 @@ impl<'m> Vm<'m> {
 
     /// Apply a resolved branch: carry the top `keep` values down to the
     /// frame-relative `height`, truncate, jump to `pc`.
-    fn jump(&mut self, d: JumpDest) {
+    fn jump(&mut self, d: JumpDest) -> XResult<()> {
         let base = self.frames.last().map_or(0, |f| f.base);
-        let h = base + d.height as usize;
+        let h = base
+            .checked_add(d.height as usize)
+            .ok_or(Trap::Unreachable)?;
         let keep = d.keep as usize;
-        let src = self.stack.len() - keep;
+        let len = self.stack.len();
+        let src = len.checked_sub(keep).ok_or(Trap::Unreachable)?;
+        if h.checked_add(keep).is_none_or(|end| end > len) {
+            return Err(Trap::Unreachable);
+        }
         for i in 0..keep {
             self.stack[h + i] = self.stack[src + i];
         }
@@ -221,6 +231,7 @@ impl<'m> Vm<'m> {
         if let Some(f) = self.frames.last_mut() {
             f.pc = d.pc as usize;
         }
+        Ok(())
     }
 
     fn push(&mut self, v: Value) {
@@ -421,11 +432,11 @@ impl<'m> Vm<'m> {
         match op {
             Op::Unreachable => return Err(Trap::Unreachable),
             Op::Nop => {}
-            Op::Jump(d) => self.jump(*d),
+            Op::Jump(d) => self.jump(*d)?,
             Op::JumpIf(d) => {
                 let c = self.pop_i32();
                 if c != 0 {
-                    self.jump(*d);
+                    self.jump(*d)?;
                 }
             }
             Op::JumpIfZero { pc } => {
@@ -439,7 +450,7 @@ impl<'m> Vm<'m> {
             Op::JumpTable { targets, default } => {
                 let i = self.pop_i32() as u32;
                 let d = targets.get(i as usize).copied().unwrap_or(*default);
-                self.jump(d);
+                self.jump(d)?;
             }
             Op::Return => self.finish_frame(),
             Op::Call { func } => {
@@ -454,6 +465,9 @@ impl<'m> Vm<'m> {
                         results: _,
                     } => {
                         let len = self.stack.len();
+                        if len < params {
+                            return Err(Trap::Unreachable);
+                        }
                         let args = self.stack.split_off(len - params);
                         let r = self.host_call(binding, &args)?;
                         for v in r {
@@ -469,8 +483,12 @@ impl<'m> Vm<'m> {
                             return Err(Trap::StackOverflow);
                         }
                         let len = self.stack.len();
+                        if len < params {
+                            return Err(Trap::Unreachable);
+                        }
                         let mut locals = self.stack.split_off(len - params);
-                        for t in &self.m.locals[def] {
+                        let local_types = self.m.locals.get(def).ok_or(Trap::Unreachable)?;
+                        for t in local_types {
                             locals.push(t.zero());
                         }
                         let base = self.stack.len();
@@ -507,6 +525,9 @@ impl<'m> Vm<'m> {
                         results: _,
                     }) => {
                         let len = self.stack.len();
+                        if len < params {
+                            return Err(Trap::Unreachable);
+                        }
                         let args = self.stack.split_off(len - params);
                         let r = self.host_call(binding, &args)?;
                         for v in r {
@@ -522,8 +543,12 @@ impl<'m> Vm<'m> {
                             return Err(Trap::StackOverflow);
                         }
                         let len = self.stack.len();
+                        if len < params {
+                            return Err(Trap::Unreachable);
+                        }
                         let mut locals = self.stack.split_off(len - params);
-                        for t in &self.m.locals[def] {
+                        let local_types = self.m.locals.get(def).ok_or(Trap::Unreachable)?;
+                        for t in local_types {
                             locals.push(t.zero());
                         }
                         let base = self.stack.len();
@@ -572,7 +597,11 @@ impl<'m> Vm<'m> {
                 }
             }
             Op::GlobalGet(i) => {
-                let v = self.globals.get(*i as usize).copied().unwrap_or(Value::I32(0));
+                let v = self
+                    .globals
+                    .get(*i as usize)
+                    .copied()
+                    .unwrap_or(Value::I32(0));
                 self.push(v);
             }
             Op::GlobalSet(i) => {
@@ -584,22 +613,30 @@ impl<'m> Vm<'m> {
             Op::I32Load { off } => {
                 let a = self.pop_i32();
                 let b = self.mem.load(a, *off, 4)?;
-                self.push(Value::I32(i32::from_le_bytes(b.try_into().unwrap_or([0; 4]))));
+                self.push(Value::I32(i32::from_le_bytes(
+                    b.try_into().unwrap_or([0; 4]),
+                )));
             }
             Op::I64Load { off } => {
                 let a = self.pop_i32();
                 let b = self.mem.load(a, *off, 8)?;
-                self.push(Value::I64(i64::from_le_bytes(b.try_into().unwrap_or([0; 8]))));
+                self.push(Value::I64(i64::from_le_bytes(
+                    b.try_into().unwrap_or([0; 8]),
+                )));
             }
             Op::F32Load { off } => {
                 let a = self.pop_i32();
                 let b = self.mem.load(a, *off, 4)?;
-                self.push(Value::F32(f32::from_le_bytes(b.try_into().unwrap_or([0; 4]))));
+                self.push(Value::F32(f32::from_le_bytes(
+                    b.try_into().unwrap_or([0; 4]),
+                )));
             }
             Op::F64Load { off } => {
                 let a = self.pop_i32();
                 let b = self.mem.load(a, *off, 8)?;
-                self.push(Value::F64(f64::from_le_bytes(b.try_into().unwrap_or([0; 8]))));
+                self.push(Value::F64(f64::from_le_bytes(
+                    b.try_into().unwrap_or([0; 8]),
+                )));
             }
             Op::I32Load8S { off } => {
                 let a = self.pop_i32();
@@ -701,12 +738,14 @@ impl<'m> Vm<'m> {
             Op::I64Store16 { off } => {
                 let v = self.pop_i64();
                 let a = self.pop_i32();
-                self.mem.store(a, *off, &((v & 0xFFFF) as u16).to_le_bytes())?;
+                self.mem
+                    .store(a, *off, &((v & 0xFFFF) as u16).to_le_bytes())?;
             }
             Op::I64Store32 { off } => {
                 let v = self.pop_i64();
                 let a = self.pop_i32();
-                self.mem.store(a, *off, &((v & 0xFFFF_FFFF) as u32).to_le_bytes())?;
+                self.mem
+                    .store(a, *off, &((v & 0xFFFF_FFFF) as u32).to_le_bytes())?;
             }
             Op::MemSize => {
                 let p = self.mem.pages() as i32;
@@ -961,18 +1000,15 @@ impl<'m> Vm<'m> {
             }
             Op::I32TruncF32U => {
                 let a = self.pop_f32();
-                self.push(Value::I32(trunc_u64_range(
-                    f64::from(a),
-                    4_294_967_296.0,
-                )? as i32));
+                self.push(Value::I32(
+                    trunc_u64_range(f64::from(a), 4_294_967_296.0)? as i32
+                ));
             }
             Op::I32TruncF64S => {
                 let a = self.pop_f64();
-                self.push(Value::I32(trunc_i64_range(
-                    a,
-                    -2_147_483_648.0,
-                    2_147_483_648.0,
-                )? as i32));
+                self.push(Value::I32(
+                    trunc_i64_range(a, -2_147_483_648.0, 2_147_483_648.0)? as i32,
+                ));
             }
             Op::I32TruncF64U => {
                 let a = self.pop_f64();
@@ -996,10 +1032,9 @@ impl<'m> Vm<'m> {
             }
             Op::I64TruncF32U => {
                 let a = self.pop_f32();
-                self.push(Value::I64(trunc_u64_range(
-                    f64::from(a),
-                    18_446_744_073_709_551_616.0,
-                )? as i64));
+                self.push(Value::I64(
+                    trunc_u64_range(f64::from(a), 18_446_744_073_709_551_616.0)? as i64,
+                ));
             }
             Op::I64TruncF64S => {
                 let a = self.pop_f64();
@@ -1011,7 +1046,9 @@ impl<'m> Vm<'m> {
             }
             Op::I64TruncF64U => {
                 let a = self.pop_f64();
-                self.push(Value::I64(trunc_u64_range(a, 18_446_744_073_709_551_616.0)? as i64));
+                self.push(Value::I64(
+                    trunc_u64_range(a, 18_446_744_073_709_551_616.0)? as i64,
+                ));
             }
             Op::F32ConvertI32S => {
                 let a = self.pop_i32();

@@ -27,6 +27,16 @@ type CachedChunkLookup = (Arc<[u8]>, Vec<((i32, i32, i32), u8)>);
 
 // ----------------------------------------------------------- protocol codecs
 
+/// Largest pre-login/status/configuration frame body admitted before play
+/// state. These packets are small; capping the frame before allocation is the
+/// per-connection pre-auth memory ceiling (one in-flight frame at a time).
+pub(crate) const MAX_PRELOGIN_FRAME_BYTES: usize = 64 * 1024;
+
+/// Inclusive absolute ceiling for one inflated compressed packet, matching
+/// vanilla's `CompressionDecoder` maximum. Callers may choose a stricter live
+/// policy, but no caller may widen decompression beyond this.
+pub(crate) const MAX_UNCOMPRESSED_PACKET_BYTES: usize = 8 * 1024 * 1024;
+
 /// Login packet 0x03 payload; send before enabling compressed framing.
 pub(crate) fn set_compression(threshold: i32) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -311,6 +321,9 @@ pub(crate) fn decode_compressed_frame(
     threshold: usize,
     max_uncompressed: usize,
 ) -> Result<Vec<u8>, String> {
+    // The caller's live policy can tighten the cap, never widen it past
+    // vanilla's absolute 8 MiB CompressionDecoder ceiling.
+    let max_uncompressed = max_uncompressed.min(MAX_UNCOMPRESSED_PACKET_BYTES);
     let length = crate::read_protocol_i32(&mut body)
         .and_then(|n| usize::try_from(n).ok())
         .ok_or("invalid data length")?;
@@ -1851,6 +1864,29 @@ mod tests {
         let mut trailing = body.to_vec();
         trailing.push(0);
         assert!(decode_compressed_frame(&trailing, 6, 100).is_err());
+    }
+
+    #[test]
+    fn decompression_cap_is_absolute_and_prelogin_cap_is_canonical() {
+        assert_eq!(MAX_PRELOGIN_FRAME_BYTES, 64 * 1024);
+        assert_eq!(MAX_UNCOMPRESSED_PACKET_BYTES, 8 * 1024 * 1024);
+
+        // Exactly 8 MiB inflated is the vanilla-inclusive ceiling; one byte
+        // beyond it is rejected even when the caller asks for a wider cap.
+        let exact = vec![0u8; MAX_UNCOMPRESSED_PACKET_BYTES];
+        let framed = encode_compressed_frame(&exact, 1);
+        let mut body = framed.as_slice();
+        crate::read_protocol_i32(&mut body).unwrap();
+        assert_eq!(
+            decode_compressed_frame(body, 1, usize::MAX).unwrap(),
+            exact
+        );
+
+        let over = vec![0u8; MAX_UNCOMPRESSED_PACKET_BYTES + 1];
+        let framed = encode_compressed_frame(&over, 1);
+        let mut body = framed.as_slice();
+        crate::read_protocol_i32(&mut body).unwrap();
+        assert!(decode_compressed_frame(body, 1, usize::MAX).is_err());
     }
 
     // ------------------------------------------------- zlib scratch reusage

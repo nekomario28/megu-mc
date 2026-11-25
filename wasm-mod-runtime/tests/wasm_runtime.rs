@@ -88,7 +88,7 @@ fn counter_mod() -> Vec<u8> {
             &i32_const(0),
             &i32_const(7),
             &call(2), // host_set_block (import idx 2)
-            &[0x1A], // drop
+            &[0x1A],  // drop
             &global_get(0),
             &[0x0B],
         ]),
@@ -280,10 +280,7 @@ fn infinite_loop_traps_on_fuel() {
         Err(ModFault::Trap(Trap::FuelExhausted)) => {}
         other => panic!("expected FuelExhausted, got {other:?}"),
     }
-    assert!(
-        t0.elapsed().as_secs() < 5,
-        "fuel trap took far too long"
-    );
+    assert!(t0.elapsed().as_secs() < 5, "fuel trap took far too long");
     assert!(matches!(
         m.quarantined(),
         Some(ModFault::Trap(Trap::FuelExhausted))
@@ -295,10 +292,7 @@ fn out_of_bounds_memory_traps() {
     // on_tick: i32.load at address 0x7FFF_FFFF → OOB.
     let ty: (&[u8], &[u8]) = (&[I64], &[I32]);
     let abi: (&[u8], &[u8]) = (&[], &[I32]);
-    let body_bytes = body(
-        &[],
-        &concat(&[&i32_const(-1), &i32_load(), &[0x0B]]),
-    );
+    let body_bytes = body(&[], &concat(&[&i32_const(-1), &i32_load(), &[0x0B]]));
     let abi_body = body(&[], &concat(&[&i32_const(1), &[0x0B]]));
     let bytes = module(&[
         types_sec(&[abi, ty]),
@@ -327,10 +321,7 @@ fn malformed_and_invalid_binaries_fail_closed() {
     // Truncated section: declares 10 bytes, supplies 1.
     let mut bad = b"\0asm\x01\0\0\0".to_vec();
     bad.extend_from_slice(&[1, 10, 0x60]);
-    assert!(matches!(
-        load(&bad, all_caps()),
-        Err(ModFault::Load(_))
-    ));
+    assert!(matches!(load(&bad, all_caps()), Err(ModFault::Load(_))));
     // Valid module missing megu_abi_version.
     let no_abi = module(&[
         types_sec(&[(&[], &[I32])]),
@@ -450,19 +441,19 @@ fn bounded_loops_get_fresh_fuel_per_tick() {
     let spin = body(
         &[(1, I32)],
         &concat(&[
-            &[0x02, 0x40],       // block
-            &[0x03, 0x40],       // loop
+            &[0x02, 0x40], // block
+            &[0x03, 0x40], // loop
             &local_get(1),
             &i32_const(1),
-            &[0x6A],             // i32.add
+            &[0x6A], // i32.add
             &local_tee(1),
             &i32_const(5000),
-            &[0x48],             // i32.lt_s
-            &[0x0D, 0x00],       // br_if 0 (loop)
-            &[0x0B],             // end loop
-            &[0x0B],             // end block
+            &[0x48],       // i32.lt_s
+            &[0x0D, 0x00], // br_if 0 (loop)
+            &[0x0B],       // end loop
+            &[0x0B],       // end block
             &local_get(1),
-            &[0x0B],             // func end
+            &[0x0B], // func end
         ]),
     );
     let abi_body = body(&[], &concat(&[&i32_const(1), &[0x0B]]));
@@ -499,20 +490,20 @@ fn nested_control_and_globals_work() {
         &concat(&[
             &local_get(0),
             &i64_const(1),
-            &[0x83],             // i64.and
-            &[0x50],             // i64.eqz
-            &[0x04, 0x7F],       // if (result i32)
+            &[0x83],       // i64.and
+            &[0x50],       // i64.eqz
+            &[0x04, 0x7F], // if (result i32)
             &i32_const(1),
-            &[0x05],             // else
+            &[0x05], // else
             &i32_const(2),
-            &[0x0B],             // end if
+            &[0x0B], // end if
             &global_set(0),
             &global_get(0),
             &i32_const(10),
-            &[0x6C],             // i32.mul
+            &[0x6C], // i32.mul
             &i32_const(5),
-            &[0x6A],             // i32.add
-            &[0x0B],             // func end
+            &[0x6A], // i32.add
+            &[0x0B], // func end
         ]),
     );
     let abi_body = body(&[], &concat(&[&i32_const(1), &[0x0B]]));
@@ -554,4 +545,149 @@ fn start_function_runs_at_instantiate() {
     ]);
     let mut m = load(&bytes, all_caps()).unwrap();
     assert_eq!(m.on_load().unwrap(), 42);
+}
+
+// ------------------------------------------------------ A15 hostile sandbox --
+
+fn abi_and_tick_module(tick_body: Vec<u8>, memory: Option<(u32, Option<u32>)>) -> Vec<u8> {
+    let abi_ty: (&[u8], &[u8]) = (&[], &[I32]);
+    let tick_ty: (&[u8], &[u8]) = (&[I64], &[I32]);
+    let mut sections = vec![types_sec(&[abi_ty, tick_ty]), func_sec(&[0, 1])];
+    if let Some((min, max)) = memory {
+        sections.push(mem_sec(min, max));
+    }
+    sections.extend([
+        export_sec(&[
+            ("megu_abi_version", KIND_FUNC, 0),
+            ("megu_on_tick", KIND_FUNC, 1),
+        ]),
+        code_sec(&[body(&[], &concat(&[&i32_const(1), &[0x0B]])), tick_body]),
+    ]);
+    module(&sections)
+}
+
+#[test]
+fn memory_growth_ceiling_fails_closed_without_trapping() {
+    // status = grow(2) + 10*grow(1) + 100*memory.size.
+    // With min=1 and cap=2: grow(2) fails as -1, grow(1) succeeds returning
+    // the old size 1, and the final size is 2 pages -> -1 + 10 + 200 = 209.
+    let tick = body(
+        &[],
+        &concat(&[
+            &i32_const(2),
+            &[0x40, 0x00], // memory.grow
+            &i32_const(1),
+            &[0x40, 0x00],
+            &i32_const(10),
+            &[0x6C],       // i32.mul
+            &[0x6A],       // i32.add
+            &[0x3F, 0x00], // memory.size
+            &i32_const(100),
+            &[0x6C],
+            &[0x6A],
+            &[0x0B],
+        ]),
+    );
+    let bytes = abi_and_tick_module(tick, Some((1, None)));
+    let config = ModConfig {
+        max_mem_pages: 2,
+        ..ModConfig::default()
+    };
+    let mut m = WasmMod::from_wasm(&bytes, Box::new(MockHost::default()), all_caps(), config)
+        .expect("loads");
+    assert_eq!(m.on_tick(0).unwrap(), 209);
+    assert!(m.quarantined().is_none());
+}
+
+#[test]
+fn declared_memory_minimum_above_config_or_hard_cap_never_instantiates() {
+    let tick = body(&[], &concat(&[&i32_const(0), &[0x0B]]));
+    let bytes = abi_and_tick_module(tick.clone(), Some((2, None)));
+    let config = ModConfig {
+        max_mem_pages: 1,
+        ..ModConfig::default()
+    };
+    assert!(matches!(
+        WasmMod::from_wasm(&bytes, Box::new(MockHost::default()), all_caps(), config),
+        Err(ModFault::Load(LoadError::LimitExceeded(_)))
+    ));
+
+    // Even a misconfigured unlimited budget cannot lift the runtime's hard
+    // 1024-page ceiling, so this module is rejected before a 64+ MiB allocation.
+    let bytes = abi_and_tick_module(tick, Some((1025, None)));
+    let config = ModConfig {
+        max_mem_pages: u32::MAX,
+        ..ModConfig::default()
+    };
+    assert!(matches!(
+        WasmMod::from_wasm(&bytes, Box::new(MockHost::default()), all_caps(), config),
+        Err(ModFault::Load(LoadError::LimitExceeded(_)))
+    ));
+}
+
+fn host_log_probe(ptr: i32, len: i32) -> Vec<u8> {
+    let abi_ty: (&[u8], &[u8]) = (&[], &[I32]);
+    let load_ty: (&[u8], &[u8]) = (&[], &[I32]);
+    let log_ty: (&[u8], &[u8]) = (&[I32, I32], &[]);
+    module(&[
+        types_sec(&[abi_ty, load_ty, log_ty]),
+        import_funcs_sec(&[("env", "host_log", 2)]),
+        func_sec(&[0, 1]),
+        mem_sec(1, Some(1)),
+        export_sec(&[
+            ("megu_abi_version", KIND_FUNC, 1),
+            ("megu_on_load", KIND_FUNC, 2),
+        ]),
+        code_sec(&[
+            body(&[], &concat(&[&i32_const(1), &[0x0B]])),
+            body(
+                &[],
+                &concat(&[
+                    &i32_const(ptr),
+                    &i32_const(len),
+                    &call(0),
+                    &i32_const(0),
+                    &[0x0B],
+                ]),
+            ),
+        ]),
+    ])
+}
+
+#[test]
+fn hostile_hostcall_ptr_len_traps_without_host_memory_access() {
+    // ptr=65535,len=2 crosses the single 64 KiB page boundary.
+    let mut m = WasmMod::from_wasm(
+        &host_log_probe(65_535, 2),
+        Box::new(MockHost::default()),
+        all_caps(),
+        ModConfig::default(),
+    )
+    .expect("loads");
+    assert!(matches!(
+        m.on_load(),
+        Err(ModFault::Trap(Trap::HostMemoryAccess {
+            ptr: 65_535,
+            len: 2
+        }))
+    ));
+    assert!(m.quarantined().is_some());
+
+    // len above the configured host-string ceiling fails before memory is read.
+    let config = ModConfig {
+        max_string: 4,
+        ..ModConfig::default()
+    };
+    let mut m = WasmMod::from_wasm(
+        &host_log_probe(0, 5),
+        Box::new(MockHost::default()),
+        all_caps(),
+        config,
+    )
+    .expect("loads");
+    assert!(matches!(
+        m.on_load(),
+        Err(ModFault::Trap(Trap::HostMemoryAccess { ptr: 0, len: 5 }))
+    ));
+    assert!(m.quarantined().is_some());
 }

@@ -17,7 +17,19 @@ NETWORK_FILES = (
     "src/server_reliability.rs", "server-files/src/claims.rs",
     "mod-adapter-core/src/mod_sync.rs",
 )
-FILES = (*NETWORK_FILES, "src/nbt.rs", "client-app/src/integrated.rs", "src/main.rs")
+FILES = (
+    *NETWORK_FILES,
+    "src/nbt.rs",
+    "client-app/src/integrated.rs",
+    "src/main.rs",
+    "proto/src/wire.rs",
+    "proto/src/session.rs",
+    "wasm-mod-runtime/src/exec.rs",
+    "wasm-mod-runtime/src/wasm_mod.rs",
+    "server-files/src/bin/megu_installer.rs",
+    "server-files/src/modrinth_sync.rs",
+    "core/src/crash_report.rs",
+)
 # Pre-existing gameplay mutex unwraps in play_protocol.rs. Not auth/claims,
 # but these must be removed in Rust before this file can be zero-baseline.
 # Exact surrounding-code fingerprints: any *new* occurrence fails closed.
@@ -93,6 +105,53 @@ def audit(root):
         "NBT container depth cap": len(re.findall(r"if depth >= 512\s*\{\s*return Err\(\"NBT exceeds container depth\"\)", sources["src/nbt.rs"])) >= 4,
         "server push rejects JARs": has(mod, r"if is_server_push_url\(&entry\.download_url\)\s*\{\s*if !has_suffix_ci\(&entry\.file_name, \"\.mmod\"\)\s*\{\s*return Err\([^;]*;\s*\}\s*validate_mmod_file_name\(&entry\.file_name\)\?;\s*return Ok\(\(ModSourceKind::ServerDeclarativeMmod, true\)\)"),
         "integrated loopback ephemeral port": has("client-app/src/integrated.rs", r"INTEGRATED_BIND_IP:\s*Ipv4Addr\s*=\s*Ipv4Addr::LOCALHOST\s*;") and has("client-app/src/integrated.rs", r"TcpListener::bind\(\(INTEGRATED_BIND_IP,\s*0\)\)"),
+        "canonical protocol 767 frame cap": (
+            has("proto/src/wire.rs", r"PROTOCOL_767_MAX_FRAME_BYTES:\s*usize\s*=\s*2\s*\*\s*1024\s*\*\s*1024\s*-\s*1\s*;")
+            and has("proto/src/wire.rs", r"MAX_FRAME_LENGTH:\s*usize\s*=\s*PROTOCOL_767_MAX_FRAME_BYTES\s*;")
+            and has("proto/src/wire.rs", r"VANILLA_FRAME_BYTES:\s*usize\s*=\s*PROTOCOL_767_MAX_FRAME_BYTES\s*;")
+            and has("proto/src/wire.rs", r"MAX_STRING_BYTES:\s*usize\s*=\s*MAX_STRING_CHARS\s*\*\s*4\s*;")),
+        "pre-login frame cap before allocation": (
+            has(play, r"MAX_LOGIN_FRAME:\s*usize\s*=\s*64\s*\*\s*1024\s*;")
+            and has(play, r"len\s*>\s*MAX_LOGIN_FRAME as u64[\s\S]{0,180}?vec!\[0u8; len as usize\]")
+            and has(limits, r"MAX_PRELOGIN_FRAME_BYTES:\s*usize\s*=\s*64\s*\*\s*1024\s*;")),
+        "absolute 8 MiB decompression ceiling": (
+            has(limits, r"MAX_UNCOMPRESSED_PACKET_BYTES:\s*usize\s*=\s*8\s*\*\s*1024\s*\*\s*1024\s*;")
+            and has(limits, r"max_uncompressed\.min\(MAX_UNCOMPRESSED_PACKET_BYTES\)")
+            and has(limits, r"length\s*<\s*threshold\s*\|\|\s*length\s*>\s*max_uncompressed")),
+        "pre-login packet rate and slowloris deadlines": (
+            has(play, r"fn read_preplay_frame\([\s\S]*?rate\.allow\(now\)[\s\S]*?rate\.should_disconnect\(now\)")
+            and has(play, r"set_read_timeout\(Some\(Duration::from_secs\(10\)\)\)[\s\S]{0,120}?set_write_timeout\(Some\(Duration::from_secs\(10\)\)\)")
+            and has(play, r"Instant::now\(\)\s*\+\s*connection_limits::login_timeout\(\)")
+            and has(limits, r"fn login_timeout\(\)[\s\S]*?unwrap_or\(15\)[\s\S]*?\.max\(1\)")
+            and has(limits, r"fn idle_timeout_secs\(\)[\s\S]*?MEGU_IDLE_TIMEOUT_SECS")),
+        "verified UUID binding before admission": (
+            has(play, r"let mut authenticated\s*=\s*false\s*;")
+            and len(re.findall(r"authenticated\s*=\s*true\s*;", sources[play])) == 2
+            and has(play, r"check_login_admission_verified\([\s\S]*?authenticated\s*,\s*\)")),
+        "login state machine cannot skip success": (
+            has("proto/src/session.rs", r"duplicate login_start")
+            and has("proto/src/session.rs", r"login_acknowledged before login_success")
+            and has("proto/src/session.rs", r"awaiting_ack:\s*true")),
+        "WASM fuel ceiling enforcement": has("wasm-mod-runtime/src/exec.rs", r"self\.fuel\s*=\s*self\.fuel\s*\.checked_sub\(1\)\s*\.ok_or\(Trap::FuelExhausted\)\?"),
+        "WASM memory hard ceiling": (
+            has("wasm-mod-runtime/src/wasm_mod.rs", r"MAX_MEM_PAGES_HARD_CAP:\s*u32\s*=\s*1024\s*;")
+            and has("wasm-mod-runtime/src/wasm_mod.rs", r"config\.max_mem_pages\.min\(MAX_MEM_PAGES_HARD_CAP\)")
+            and has("wasm-mod-runtime/src/wasm_mod.rs", r"decl\.limits\.min\s*>\s*hard_max")
+            and has("wasm-mod-runtime/src/exec.rs", r"if\s+new\s*>\s*self\.max_pages\s*\{\s*return -1;\s*\}")),
+        "WASM hostcall memory and string caps": (
+            len(re.findall(r"if\s+len\s*>\s*self\.max_string\s*\{\s*return Err\(Trap::HostMemoryAccess", sources["wasm-mod-runtime/src/exec.rs"])) >= 2
+            and len(re.findall(r"pub fn read\(&self, ptr: u32, len: u32\)[\s\S]*?end > self\.data\.len\(\) as u64[\s\S]*?Trap::HostMemoryAccess", sources["wasm-mod-runtime/src/exec.rs"])) >= 1),
+        "installer hash verification fail closed": (
+            has("server-files/src/bin/megu_installer.rs", r"parse_expected_sha256\(&sums_text, fname\)")
+            and has("server-files/src/bin/megu_installer.rs", r"installer::sha256_file\(path\)")
+            and has("server-files/src/bin/megu_installer.rs", r"if\s+actual\s*!=\s*expected[\s\S]*?std::fs::remove_file\(path\)")
+            and has("server-files/src/bin/megu_installer.rs", r"installer::normalize_sha256_hex\(value\)")),
+        "mrpack/installer path traversal rejection": (
+            has("server-files/src/modrinth_sync.rs", r"fn validate_mrpack_path\([\s\S]*?NulByte[\s\S]*?Backslash[\s\S]*?AbsolutePath[\s\S]*?ParentTraversal")
+            and has("server-files/src/modrinth_sync.rs", r"validate_mrpack_path\(path\)\.map_err")),
+        "crash report redacts PII before output/fingerprint": (
+            len(re.findall(r"let\s+r\s*=\s*self\.redacted\(\)\s*;", sources["core/src/crash_report.rs"])) >= 3
+            and has("core/src/crash_report.rs", r"let mut out = redact_user_paths\(input\);\s*out = redact_bearer_tokens\(&out\);\s*out = redact_rcon_password\(&out\);\s*out = redact_ipv4\(&out\);")),
     }
     forbidden = re.compile(r"\bSystemTime\s*::\s*now\s*\(\s*\)|\.lock\s*\(\s*\)\s*\.unwrap\s*\(\s*\)")
     for name in NETWORK_FILES:

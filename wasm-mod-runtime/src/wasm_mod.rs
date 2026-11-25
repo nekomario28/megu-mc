@@ -13,6 +13,10 @@ use crate::module::{ConstExpr, ExternKind, ImportDesc, Module, ValType, Value};
 use crate::validate::validate;
 
 const PAGE: usize = 65_536;
+/// Absolute linear-memory ceiling even when an embedder misconfigures
+/// `ModConfig`: 1024 pages = 64 MiB per mod. The configurable budget can only
+/// tighten this hard cap, never disable it.
+const MAX_MEM_PAGES_HARD_CAP: u32 = 1024;
 
 /// Per-mod resource budgets. All bounds are hard: crossing one produces a
 /// [`ModFault`], never silent slowdown or host memory growth.
@@ -144,7 +148,11 @@ impl WasmMod {
 
     /// `megu_on_tick(tick)`.
     pub fn on_tick(&mut self, tick: i64) -> Result<i32, ModFault> {
-        self.call_optional(EXPORT_ON_TICK, &[Value::I64(tick)], self.config.fuel_per_tick)
+        self.call_optional(
+            EXPORT_ON_TICK,
+            &[Value::I64(tick)],
+            self.config.fuel_per_tick,
+        )
     }
 
     /// `megu_on_block_interact(x, y, z, player_id)`.
@@ -261,9 +269,11 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
     // Memory: allocate the declared minimum, capped by config.
     let mem = match module.mems.first() {
         Some(decl) => {
-            let hard_max = config.max_mem_pages;
+            let hard_max = config.max_mem_pages.min(MAX_MEM_PAGES_HARD_CAP);
             if decl.limits.min > hard_max {
-                return Err(LoadError::LimitExceeded("memory minimum exceeds cap".into()));
+                return Err(LoadError::LimitExceeded(
+                    "memory minimum exceeds cap".into(),
+                ));
             }
             let max_pages = decl.limits.max.unwrap_or(hard_max).min(hard_max);
             LinearMem {

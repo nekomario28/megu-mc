@@ -134,4 +134,7 @@ pub use voice_relay::{
     VoiceRelayConfig, VoiceRelayMetrics, VoiceRelayState, MAX_OPUS_PAYLOAD_BYTES,
     MAX_VOICE_DATAGRAM_BYTES, VOICE_MAGIC, VOICE_RATE_WINDOW,
 };
-pub use wire::{BitSet, BlockPos, ProtoError, WireReader, WireWriter};
+pub use wire::{
+    BitSet, BlockPos, ProtoError, WireReader, WireWriter, MAX_FRAME_LENGTH,
+    PROTOCOL_767_MAX_FRAME_BYTES, VANILLA_FRAME_BYTES, MAX_STRING_BYTES,
+};
