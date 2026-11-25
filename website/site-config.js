@@ -49,7 +49,7 @@
     // upgrades them to /api/latest when that endpoint is reachable. Bump this
     // and the matching index.html hrefs together; website/check_site.py fails
     // closed when they disagree.
-    releaseTag: "v0.1.0-alpha.3",
+    releaseTag: "v0.1.0-alpha.4",
     docsBaseUrl: "https://github.com/nekomario28/megu-mc/tree/main/docs",
 
     // Optional custom domain once the brand name is final, e.g.

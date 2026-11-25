@@ -8,7 +8,7 @@ This plan is a control-plane reset for converging the current alpha4 audit and c
 ## Current integration status — refreshed 2026-11-25
 
 The control-plane state above is historical. The active local integration branch is now
-`alpha4/integration-alpha4-convergence-local` at `0f7f8f222` (`docs(release): clarify installer-first download choice`),
+`alpha4/integration-alpha4-convergence-local` at the current local HEAD (inspect `git rev-parse HEAD`; prior hard-coded SHAs in this file are historical),
 27 commits ahead of `origin/alpha4/integration-alpha4-convergence` and not yet pushed.
 
 Release-blocking lanes already integrated on this line include inventory conservation, non-vacuous A04 Anvil
@@ -161,7 +161,7 @@ Non-next work during Phase 1: cosmetic refactors, additional optimization kernel
 All release claims must be re-proven on one exact candidate SHA. A green lane report is not release evidence.
 
 1. Static and unit gates:
-   - `bash tests/verify.sh` only after its current cleanup trap is made non-destructive or the affected standalone-crate commands are run directly; do not execute the current `rm -rf` cleanup path under the no-approval/no-destructive-command contract
+   - `bash tests/verify.sh`; its artifact-preserving trap is non-destructive in the current tree
    - standalone crate clippy loop from `docs/release-checklist.md`
    - `python3 tools/wiring_audit.py --strict --tolerated-unwired tools/wiring_audit_unwired.json` (the canonical gate used by `tests/verify.sh`; plain `--strict` intentionally reports the documented staged unwired modules)
    - `python3 tools/vanilla_parity_audit.py --format text --strict --min-c2s-handled 58 --min-gamerules-wired 51`
@@ -209,7 +209,7 @@ These are valuable but should not block a verified-scope alpha unless the user c
 
 ## Alpha04 release critical path — current minimum plan
 
-Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla or mod compatibility. The current canonical local integration line is `0f7f8f222`; it is not pushed and not release-approved.
+Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla or mod compatibility. The current canonical local integration line is the branch HEAD; it is not pushed and not release-approved.
 
 1. **Freeze and finish the integration candidate**
    - Treat `cff205939` as the candidate assembly point unless a fresh upstream `origin/main` change invalidates it.
@@ -219,7 +219,6 @@ Assumption: alpha04 is a **verified-scope alpha**, not a claim of full vanilla o
 2. **Close hard release blockers before broad gates**
    - Inventory/crafting conservation implementation in `src/play_protocol.rs`: offhand button 40, crafting-output remainders, shift-click crafting results, and container-close overflow must be fixed with non-vacuous tests.
    - Pre-existing clippy debt: measured 47 warnings vs baseline 39. Fix warnings; do not raise the baseline merely to obtain green.
-   - `tests/verify.sh` destructive cleanup trap: make it non-destructive or bypass it with the direct standalone-crate commands; do not run the current `rm -rf` path.
    - Branch/worktree ownership preflight inside existing `tools/dev_check.py` / `tests/dev_check_test.py`; duplicate attached branches must hold lane allocation.
    - Root checkout classification: preserve and classify all unique/untracked work before any cleanup; no deletion without explicit approval.
 
