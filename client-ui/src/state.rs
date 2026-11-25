@@ -26,6 +26,7 @@
 use megu_core::crash_report::CrashContext;
 use megu_core::i18n::{ALL_BUILTIN_LOCALES, BuiltinLocale, I18nCatalog, UiTextKey};
 use megu_core::sys_metrics::{CpuSampler, MiniHudConfig, MiniHudData, sample_host_metrics};
+use std::collections::HashMap;
 
 use crate::draw::UiRect;
 use crate::layout;
@@ -1835,6 +1836,13 @@ pub struct HudSubtitle {
 /// (300 = full). Pure data — the game fills it, the HUD draws it.
 #[derive(Clone, Debug)]
 pub struct HudState {
+    /// Hides every native HUD element (vanilla F1 state).
+    pub hud_hidden: bool,
+    pub status_effects: Vec<LiveStatusEffect>,
+    pub attack_cooldown: f32,
+    pub mount_health: Option<(f32, f32)>,
+    pub mount_jump_charge: Option<f32>,
+    pub screen_overlay: HudScreenOverlay,
     pub health: f32,
     pub absorption: f32,
     pub armor: u8,
@@ -1902,6 +1910,11 @@ pub struct HudState {
     /// hotbar slots exactly like vanilla's descending curtain.
     pub item_cooldowns: std::collections::BTreeMap<String, f32>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveStatusEffect { pub effect_id: i32, pub name: String, pub amplifier: u8, pub duration_ticks: u32, pub beneficial: bool }
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HudScreenOverlay { pub hurt_alpha:f32, pub fire_alpha:f32, pub underwater_alpha:f32, pub portal_alpha:f32, pub freezing_alpha:f32, pub pumpkin_blur:bool, pub vignette_alpha:f32 }
 
 /// Compact in-HUD recipe-conflict resolver state.
 ///
@@ -2115,6 +2128,12 @@ impl TitleOverlayState {
 impl Default for HudState {
     fn default() -> Self {
         Self {
+            hud_hidden: false,
+            status_effects: Vec::new(),
+            attack_cooldown: 1.0,
+            mount_health: None,
+            mount_jump_charge: None,
+            screen_overlay: HudScreenOverlay::default(),
             health: 20.0,
             absorption: 0.0,
             armor: 0,
@@ -2156,6 +2175,12 @@ impl HudState {
         hotbar[2] = Some("Torch".to_string());
         hotbar[8] = Some("Food".to_string());
         Self {
+            hud_hidden: false,
+            status_effects: Vec::new(),
+            attack_cooldown: 0.75,
+            mount_health: None,
+            mount_jump_charge: None,
+            screen_overlay: HudScreenOverlay::default(),
             health: 18.0,
             absorption: 4.0,
             armor: 15,
@@ -2448,6 +2473,8 @@ pub enum WidgetId {
     SingleplayerNameField,
     SingleplayerSeedField,
     SingleplayerCreate,
+    SingleplayerGameMode,
+    SingleplayerDifficulty,
     SingleplayerBack,
     SingleplayerListUp,
     SingleplayerListDown,
@@ -2796,9 +2823,16 @@ pub struct SingleplayerState {
     pub seed_text: String,
     /// First visible row in `worlds` when the list overflows the panel.
     pub scroll: usize,
+    pub game_mode: SingleplayerGameMode,
+    pub difficulty: SingleplayerDifficulty,
     name_focused: bool,
     seed_focused: bool,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SingleplayerGameMode { #[default] Survival, Creative, Hardcore }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SingleplayerDifficulty { Peaceful, Easy, #[default] Normal, Hard }
 
 impl Default for SingleplayerState {
     fn default() -> Self {
@@ -2807,6 +2841,8 @@ impl Default for SingleplayerState {
             new_name: "New World".to_string(),
             seed_text: String::new(),
             scroll: 0,
+            game_mode: SingleplayerGameMode::Survival,
+            difficulty: SingleplayerDifficulty::Normal,
             name_focused: false,
             seed_focused: false,
         }
@@ -3080,6 +3116,12 @@ pub fn parse_server_address(text: &str) -> Option<(String, u16)> {
 /// The whole client UI state machine.
 #[derive(Clone, Debug)]
 pub struct UiState {
+    /// Runtime-provided vanilla or mod translation overrides.
+    pub translations: HashMap<String, String>,
+    pub creative_inventory: crate::creative_screen::CreativeInventoryState,
+    pub bed_sleep_overlay: Option<crate::gameplay_screens::BedSleepOverlay>,
+    pub book_editor: Option<crate::gameplay_screens::BookEditorState>,
+    pub end_credits: Option<crate::gameplay_screens::EndCreditsState>,
     /// Current screen.
     pub screen: Screen,
     /// Navigation stack for Back/Escape (`navigate` pushes).
@@ -3229,6 +3271,11 @@ pub struct UiState {
 impl Default for UiState {
     fn default() -> Self {
         Self {
+            translations: HashMap::new(),
+            creative_inventory: crate::creative_screen::CreativeInventoryState::default(),
+            bed_sleep_overlay: None,
+            book_editor: None,
+            end_credits: None,
             screen: Screen::Title,
             nav_stack: Vec::new(),
             settings: UiSettings::default(),
@@ -3288,6 +3335,12 @@ impl Default for UiState {
 }
 
 impl UiState {
+    pub fn set_translations(&mut self, map: HashMap<String, String>) { self.translations = map; }
+
+    pub fn translate<'a>(&'a self, key: &str, fallback: &'a str) -> &'a str {
+        self.translations.get(key).map(String::as_str).unwrap_or(fallback)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -3567,6 +3620,9 @@ impl UiState {
             let (list, _regions) = claims.render(width, height);
             out.commands.extend(list.commands);
         }
+        if let Some(overlay) = &self.bed_sleep_overlay { overlay.render(width, height, out); }
+        if let Some(editor) = &self.book_editor { editor.render(width, height, out); }
+        if let Some(credits) = &self.end_credits { credits.render(width, height, out); }
         layout::layout_toast_stack(self, width, height, out);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
@@ -4427,6 +4483,14 @@ impl UiState {
                 Vec::new()
             }
             WidgetId::SingleplayerCreate => self.try_create_world(),
+            WidgetId::SingleplayerGameMode => {
+                self.singleplayer.game_mode = match self.singleplayer.game_mode { SingleplayerGameMode::Survival => SingleplayerGameMode::Creative, SingleplayerGameMode::Creative => SingleplayerGameMode::Hardcore, SingleplayerGameMode::Hardcore => SingleplayerGameMode::Survival };
+                Vec::new()
+            }
+            WidgetId::SingleplayerDifficulty => {
+                self.singleplayer.difficulty = match self.singleplayer.difficulty { SingleplayerDifficulty::Peaceful => SingleplayerDifficulty::Easy, SingleplayerDifficulty::Easy => SingleplayerDifficulty::Normal, SingleplayerDifficulty::Normal => SingleplayerDifficulty::Hard, SingleplayerDifficulty::Hard => SingleplayerDifficulty::Peaceful };
+                Vec::new()
+            }
             WidgetId::SingleplayerBack => {
                 self.back();
                 vec![UiAction::Back]

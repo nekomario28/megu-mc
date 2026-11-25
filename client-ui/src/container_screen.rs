@@ -20,6 +20,46 @@ pub const SLOT_SIZE: i32 = 18;
 const CONTENT_PAD: i32 = 4;
 const EMPTY_SLOT_INDEX: i16 = -999;
 
+/// Canonical vanilla GUI texture key for each protocol-767 workstation menu.
+/// Generic chest sizes share `container/generic_54`; the window-0 inventory
+/// uses `u32::MAX` for compatibility with the GUI atlas mapping.
+pub const fn container_skin_sprite_key(menu_id: u32) -> &'static str {
+    match menu_id {
+        0..=5 => "container/generic_54",
+        6 => "container/dispenser",
+        7 => "container/crafter",
+        8 => "container/anvil",
+        9 => "container/beacon",
+        10 => "container/blast_furnace",
+        11 => "container/brewing_stand",
+        12 => "container/crafting_table",
+        13 => "container/enchanting_table",
+        14 => "container/furnace",
+        15 => "container/grindstone",
+        16 => "container/hopper",
+        17 => "container/lectern",
+        18 => "container/loom",
+        19 => "container/villager",
+        20 => "container/shulker_box",
+        21 => "container/smithing",
+        22 => "container/smoker",
+        23 => "container/cartography_table",
+        24 => "container/stonecutter",
+        u32::MAX => "container/inventory",
+        _ => "",
+    }
+}
+
+/// Keyboard shortcuts supported by vanilla container slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContainerSlotHotkey {
+    HotbarSwap(u8),
+    OffhandSwap,
+    DropOne,
+    DropStack,
+    DoubleClickGather,
+}
+
 /// Semantic role of a container slot. `Output`/`Locked` slots reject
 /// placement but can still be taken when the cursor is empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2510,6 +2550,11 @@ impl ContainerScreenState {
     }
 
     fn hotbar_swap(&mut self, slot_index: i16, hotbar_index: i8) -> Option<ClickWindowAction> {
+        if hotbar_index == 40 {
+            let index = usize::try_from(slot_index).ok()?;
+            if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX { return None; }
+            return Some(self.finish_action(slot_index, hotbar_index, 2, &BTreeSet::new()));
+        }
         if !(0..=8).contains(&hotbar_index) || !self.schema.has_player_inventory {
             return None;
         }
@@ -2594,6 +2639,20 @@ impl ContainerScreenState {
         let mut changed = BTreeSet::new();
         changed.insert(slot_index);
         Some(self.finish_action(slot_index, button, 5, &changed))
+    }
+
+    /// Begin or extend a protocol-mode-5 distribution gesture at `slot`.
+    /// Button `0` evenly splits the carried stack; button `1` distributes
+    /// one item per eligible slot.
+    pub fn drag_start(&mut self, slot: i16, button: i8) -> Option<ClickWindowAction> {
+        if self.drag_mode.is_some() { return None; }
+        self.drag_click(slot, button)
+    }
+
+    /// Add a slot to an active drag distribution.
+    pub fn drag_over(&mut self, slot: i16, button: i8) -> Option<ClickWindowAction> {
+        self.drag_mode.as_ref()?;
+        self.drag_click(slot, button)
     }
 
     pub fn drag_end(&mut self) -> Option<ClickWindowAction> {
@@ -2734,6 +2793,35 @@ impl ContainerScreenState {
     /// Left (`button = 0`) or right (`button = 1`) click, mode `0`.
     pub fn click(&mut self, slot: i16, button: i8) -> Option<ClickWindowAction> {
         self.click_mode(slot, button, 0)
+    }
+
+    /// Click a slot, converting Shift+click to the vanilla quick-move mode.
+    pub fn click_with_shift(
+        &mut self,
+        slot: i16,
+        button: i8,
+        shift_held: bool,
+    ) -> Option<ClickWindowAction> {
+        self.click_mode(slot, button, if shift_held { 1 } else { 0 })
+    }
+
+    /// Apply a vanilla inventory keyboard shortcut to the currently
+    /// hovered slot. Hotbar index `0..=8` maps directly to protocol button.
+    pub fn handle_slot_hotkey(
+        &mut self,
+        key: ContainerSlotHotkey,
+    ) -> Option<ClickWindowAction> {
+        let slot = i16::try_from(self.hovered_slot?).ok()?;
+        match key {
+            ContainerSlotHotkey::HotbarSwap(index) if index <= 8 => {
+                self.click_mode(slot, i8::try_from(index).ok()?, 2)
+            }
+            ContainerSlotHotkey::HotbarSwap(_) => None,
+            ContainerSlotHotkey::OffhandSwap => self.click_mode(slot, 40, 2),
+            ContainerSlotHotkey::DropOne => self.click_mode(slot, 0, 4),
+            ContainerSlotHotkey::DropStack => self.click_mode(slot, 1, 4),
+            ContainerSlotHotkey::DoubleClickGather => self.click_mode(slot, 0, 6),
+        }
     }
 
     /// Deterministic `container_button_click` (`0x0d`) emission.
