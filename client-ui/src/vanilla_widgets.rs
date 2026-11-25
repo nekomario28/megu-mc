@@ -270,6 +270,32 @@ pub fn draw_vanilla_slot(
     }
 }
 
+/// Empty-slot item silhouette used by Vanilla workstation screens.
+pub fn draw_vanilla_ghost_item(list: &mut UiDrawList, rect: UiRect, item_id: &str) {
+    if rect.w < 8 || rect.h < 8 || item_id.is_empty() {
+        return;
+    }
+    list.item_icon_str(
+        UiRect::new(rect.x + 2, rect.y + 2, rect.w - 4, rect.h - 4),
+        item_id,
+    );
+}
+
+/// Small recipe or workstation arrow using the shared Vanilla palette.
+pub fn draw_vanilla_arrow(list: &mut UiDrawList, rect: UiRect, active: bool) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    let (glyph, color) = if active {
+        (">", palette::TEXT_DARK)
+    } else {
+        ("X", palette::DANGER)
+    };
+    let x = rect.x + ((rect.w as i32 - 8) / 2).max(0);
+    let y = rect.y + ((rect.h as i32 - 8) / 2).max(0);
+    list.text_str(x, y, 1, color, glyph);
+}
+
 /// Classic tooltip: `rgba(16,0,16,240)` near-black body, 1px purple
 /// gradient frame (`#5000FF50` top → `#28007F50` bottom) — or the
 /// tooltip sprites when the atlas carries them. `lines` paints each

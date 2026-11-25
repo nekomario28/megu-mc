@@ -141,16 +141,10 @@ fn unit_frac(value: f32) -> f32 {
 }
 
 /// Dark cell backing shared by every icon row (matches `layout.rs`).
-const ICON_BACK: UiColor = UiColor::rgb(26, 26, 30);
+const ICON_BACK: UiColor = palette::TOOLTIP_BG;
 
 /// Translucent row backing shared by chat scrollback.
-const ROW_BACK: UiColor = UiColor::rgba(0, 0, 0, 110);
-
-/// Slightly lighter variant of `c` for icon cores.
-fn lighten(c: UiColor) -> UiColor {
-    let lift = |v: u8| v.saturating_add((255 - v) / 3);
-    UiColor::rgba(lift(c.r), lift(c.g), lift(c.b), c.a)
-}
+const ROW_BACK: UiColor = palette::OVERLAY_DIM.with_alpha(110);
 
 /// First `limit` chars of `text` as a `&str` slice (no allocation).
 fn first_chars(text: &str, limit: usize) -> &str {
@@ -182,10 +176,10 @@ impl HeartStyle {
     fn color(self) -> UiColor {
         match self {
             HeartStyle::Normal => palette::HEALTH,
-            HeartStyle::Poison => UiColor::rgb(110, 205, 95),
-            HeartStyle::Wither => UiColor::rgb(75, 45, 95),
-            HeartStyle::Frozen => UiColor::rgb(165, 220, 255),
-            HeartStyle::Hardcore => UiColor::rgb(165, 35, 35),
+            HeartStyle::Poison => palette::ACCENT,
+            HeartStyle::Wither => palette::TEXT_DARK,
+            HeartStyle::Frozen => palette::AIR,
+            HeartStyle::Hardcore => palette::DANGER,
         }
     }
 }
@@ -341,13 +335,13 @@ pub enum BossBarColor {
 impl BossBarColor {
     fn color(self) -> UiColor {
         match self {
-            BossBarColor::Pink => UiColor::rgb(255, 80, 160),
-            BossBarColor::Blue => UiColor::rgb(85, 85, 255),
-            BossBarColor::Red => UiColor::rgb(255, 60, 50),
-            BossBarColor::Green => UiColor::rgb(60, 220, 60),
-            BossBarColor::Yellow => UiColor::rgb(255, 220, 40),
-            BossBarColor::Purple => UiColor::rgb(200, 60, 255),
-            BossBarColor::White => UiColor::rgb(255, 255, 255),
+            BossBarColor::Pink => palette::HEALTH,
+            BossBarColor::Blue => palette::AIR,
+            BossBarColor::Red => palette::DANGER,
+            BossBarColor::Green => palette::XP,
+            BossBarColor::Yellow => palette::WARNING,
+            BossBarColor::Purple => palette::ACCENT,
+            BossBarColor::White => palette::TEXT,
         }
     }
 }
@@ -808,6 +802,18 @@ pub struct HudSnapshot {
     pub debug: F3DebugOverlay,
 }
 
+/// Optional vehicle and attack indicators rendered alongside the core HUD.
+/// Keeping this separate preserves existing [`HudSnapshot`] struct literals.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HudAuxiliaryState {
+    pub mount_health: f32,
+    pub mount_max_health: f32,
+    pub jump_charge: f32,
+    pub attack_cooldown: f32,
+    /// Damage flash phase for mount hearts.
+    pub damage_flash: bool,
+}
+
 impl HudSnapshot {
     /// A fully populated snapshot exercising every widget — useful for
     /// demos, screenshots, and the non-overlap test matrix.
@@ -997,6 +1003,48 @@ impl HudWidgetsRenderer {
         Self { gui_scale }
     }
 
+    /// Render mount hearts, mount jump charge, and the attack cooldown
+    /// meter without changing the existing [`HudSnapshot`] contract.
+    pub fn render_auxiliary(
+        &self,
+        state: &HudAuxiliaryState,
+        viewport_w: u32,
+        viewport_h: u32,
+        out: &mut UiDrawList,
+    ) -> HudRegionReport {
+        let mut report = HudRegionReport::default();
+        let s = if self.gui_scale == 0 {
+            (viewport_h / 360)
+                .clamp(1, 4)
+                .min((viewport_w / 320).max(1))
+        } else {
+            self.gui_scale.clamp(1, 4)
+        };
+        let lw = viewport_w / s;
+        let lh = viewport_h / s;
+        if lw < 96 || lh < 96 {
+            return report;
+        }
+        let mut ctx = Ctx {
+            out,
+            s,
+            w: lw as i32,
+            h: lh as i32,
+            claims: Vec::new(),
+            top_left_reserve: 0,
+        };
+        ctx.auxiliary(state);
+        report.regions = ctx
+            .claims
+            .iter()
+            .map(|(name, rect)| HudRegion {
+                name,
+                rect: ctx.phys(*rect),
+            })
+            .collect();
+        report
+    }
+
     /// Render `snapshot` at `viewport_w`×`viewport_h` **physical** pixels,
     /// appending commands to `out` and returning the region report.
     pub fn render(
@@ -1167,7 +1215,7 @@ impl Ctx<'_> {
 
     /// Pre-clipped left-aligned text with a 1-logical-px drop shadow.
     fn shadow(&mut self, x: i32, y: i32, m: u32, color: UiColor, s: &str) {
-        self.emit(x + 1, y + 1, m, UiColor::rgba(0, 0, 0, 140), s);
+        self.emit(x + 1, y + 1, m, palette::TEXT_SHADOW, s);
         self.emit(x, y, m, color, s);
     }
 
@@ -1194,7 +1242,7 @@ impl Ctx<'_> {
                 self.phys(r),
                 unit_frac(fraction),
                 fill,
-                UiColor::rgb(20, 24, 20),
+                palette::SLOT_INNER_DARK,
                 palette::BUTTON_BORDER,
             );
         }
@@ -1272,7 +1320,7 @@ impl Ctx<'_> {
 
 impl Ctx<'_> {
     fn effects(&mut self, hud: &StatusEffectHud) {
-        let visible: Vec<&StatusEffectEntry> = hud
+        let mut visible: Vec<&StatusEffectEntry> = hud
             .entries
             .iter()
             .filter(|e| effect_icon_visible(e.remaining_ticks))
@@ -1281,6 +1329,7 @@ impl Ctx<'_> {
         if visible.is_empty() {
             return;
         }
+        visible.sort_by_key(|entry| !entry.beneficial);
         // The grid hugs the top-right corner but must stay clear of the
         // debug-left lane reserved before any claims existed. Columns
         // shrink to fit; entries past two rows are dropped so the grid
@@ -1305,13 +1354,13 @@ impl Ctx<'_> {
             let cx = x0 + col as i32 * EFFECT_CELL_W;
             let cy = y0 + row as i32 * EFFECT_CELL_H;
             let tint = if entry.beneficial {
-                UiColor::rgb(110, 170, 255)
+                palette::AIR
             } else {
-                UiColor::rgb(235, 90, 90)
+                palette::DANGER
             };
             // Icon: tinted cell with a lighter core.
             self.fill(cx, cy, 8, 8, tint.with_alpha(220));
-            self.fill(cx + 1, cy + 1, 6, 6, lighten(tint));
+            self.fill(cx + 1, cy + 1, 6, 6, palette::TEXT_FOCUSED);
             // Amplifier pips (level II+) along the icon's bottom edge.
             let pips = usize::from(entry.amplifier).min(4);
             for p in 0..pips {
@@ -1320,7 +1369,7 @@ impl Ctx<'_> {
                     cy + 6,
                     2,
                     2,
-                    UiColor::rgba(255, 255, 255, 200),
+                    palette::TEXT,
                 );
             }
             let dur = effect_duration_label(entry.remaining_ticks);
@@ -1603,7 +1652,7 @@ impl Ctx<'_> {
             let notches = usize::from(bar.notches).min(20);
             for k in 1..=notches {
                 let nx = bar_x + (bw as i64 * k as i64 / (notches as i64 + 1)) as i32;
-                self.fill(nx, by, 1, 5, UiColor::rgb(18, 14, 22));
+                self.fill(nx, by, 1, 5, palette::SLOT_INNER_DARK);
             }
         }
         self.claim("bossbars", bar_x, EDGE, bw, stack_h);
@@ -1632,6 +1681,44 @@ fn icon_count(value: f32, per_icon: f32, max_icons: i32) -> i32 {
 }
 
 impl Ctx<'_> {
+    fn auxiliary(&mut self, state: &HudAuxiliaryState) {
+        let max_health = finite_or(state.mount_max_health, 0.0).max(0.0);
+        let health = finite_or(state.mount_health, 0.0).clamp(0.0, max_health);
+        let hearts = icon_count(max_health, 2.0, 10);
+        if hearts > 0 {
+            let x0 = (self.w / 2 - hearts * 4).max(EDGE);
+            let y = self.h - HOTBAR_RESERVE - 16;
+            let color = if state.damage_flash {
+                palette::DANGER
+            } else {
+                palette::HEALTH
+            };
+            for i in 0..hearts {
+                let fill = ((health - i as f32 * 2.0) / 2.0).clamp(0.0, 1.0);
+                icon_cell(self, x0 + i * 8, y, fill, color);
+            }
+            self.claim("mount_hearts", x0, y, hearts * 8, 8);
+        }
+
+        let jump = unit_frac(state.jump_charge);
+        if jump > 0.0 {
+            let width = 90;
+            let x = self.w / 2 - width / 2;
+            let y = self.h - HOTBAR_RESERVE - 28;
+            self.progress(x, y, width, 4, jump, palette::XP);
+            self.claim("mount_jump_charge", x, y, width, 4);
+        }
+
+        let cooldown = unit_frac(state.attack_cooldown);
+        if cooldown > 0.0 {
+            let width = 18;
+            let x = self.w / 2 - width / 2;
+            let y = self.h / 2 + 14;
+            self.progress(x, y, width, 3, cooldown, palette::ACCENT);
+            self.claim("attack_cooldown", x, y, width, 3);
+        }
+    }
+
     fn vitals(&mut self, v: &VitalsState) {
         let hotbar_top = self.h - HOTBAR_RESERVE;
         let cx = self.w / 2;
@@ -1712,7 +1799,7 @@ impl Ctx<'_> {
                     let sat = ((saturation - i as f32 * 2.0) / 2.0).clamp(0.0, 1.0);
                     let sw = (8.0 * sat) as i32;
                     if sw > 0 {
-                        self.fill(x, food_y + 6, sw, 2, UiColor::rgb(238, 238, 238));
+                        self.fill(x, food_y + 6, sw, 2, palette::TEXT);
                     }
                 }
                 right_top = right_top.min(food_y);
@@ -2038,7 +2125,7 @@ impl Ctx<'_> {
             else {
                 continue;
             };
-            self.fill(x, top, width, height, UiColor::rgba(8, 10, 14, 170));
+            self.fill(x, top, width, height, palette::TOOLTIP_BG);
             self.border(x, top, width, height, palette::PANEL_BORDER, 1);
             let mut y = top + 2;
             if has_title {
@@ -2082,7 +2169,7 @@ impl Ctx<'_> {
                 let box_x = EDGE;
                 let box_y = self.h - ACTIONBAR_LIFT - 2 - CHAT_INPUT_H;
                 let box_h = CHAT_INPUT_H;
-                self.fill(box_x, box_y, box_w, box_h, UiColor::rgb(10, 11, 14));
+                self.fill(box_x, box_y, box_w, box_h, palette::TOOLTIP_BG);
                 self.border(box_x, box_y, box_w, box_h, palette::PANEL_BORDER, 1);
                 let text = clip_cells(&chat.text, ((box_w - 6) / 8).max(0) as usize);
                 self.emit(box_x + 3, box_y + 1, 1, palette::TEXT, &text);
@@ -2127,7 +2214,7 @@ impl Ctx<'_> {
                     if rows > 0 {
                         let pop_h = rows as i32 * ROW_H + 2;
                         let top = bottom - pop_h;
-                        self.fill(EDGE, top, pop_w, pop_h, UiColor::rgba(8, 10, 14, 200));
+                        self.fill(EDGE, top, pop_w, pop_h, palette::TOOLTIP_BG);
                         self.border(EDGE, top, pop_w, pop_h, palette::PANEL_BORDER, 1);
                         for (i, cand) in chat.completions.iter().take(rows).enumerate() {
                             let y = top + 1 + i as i32 * ROW_H;
@@ -2137,7 +2224,7 @@ impl Ctx<'_> {
                                     y,
                                     pop_w - 2,
                                     ROW_H - 1,
-                                    UiColor::rgba(80, 88, 110, 120),
+                                    palette::BUTTON_HOVER,
                                 );
                             }
                             let label =
