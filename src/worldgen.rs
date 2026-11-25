@@ -185,8 +185,7 @@ static WG_PARSE_REPORT: Mutex<WorldgenParseReport> =
 
 /// The process-wide worldgen parse diagnostics: every failure any registry or
 /// generator load has recorded, in the order it happened.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub fn last_worldgen_parse_report() -> WorldgenParseReport {
     WG_PARSE_REPORT
         .lock()
@@ -9061,11 +9060,13 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
 /// and custom dimensions extend them in registration order. A vector reads as "no
 /// generator" for a slot that has not been installed, so a `Flat`/`Void` custom
 /// dimension — which has no `Gen` — just never fills its slot.
+type SharedDimGen = std::sync::Arc<Mutex<Option<Gen>>>;
+
 pub(crate) struct PerDimGen {
     /// The generators, indexed by [`DimId::index`]. The outer lock only guards slot
     /// registration: once a dimension's slot exists, generation holds *that slot's* mutex,
     /// so one dimension's section pass never queues behind another's.
-    gens: RwLock<Vec<Option<std::sync::Arc<Mutex<Option<Gen>>>>>>,
+    gens: RwLock<Vec<Option<SharedDimGen>>>,
     /// The immutable half of each generator, published at init. A worker clones the `Arc`
     /// once and then reads a dimension's inputs without touching the generator lock.
     data: Mutex<Vec<Option<std::sync::Arc<GenData>>>>,

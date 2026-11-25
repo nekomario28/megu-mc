@@ -458,7 +458,7 @@ pub(crate) fn prof_note() {
         return;
     }
     let committed = STREAMGEN_COMMITTED.load(Ordering::Relaxed);
-    if committed % 64 == 0 {
+    if committed.is_multiple_of(64) {
         eprintln!(
             "[streamgen] requested={} committed={} failed={} full={} tick_generated={}",
             STREAMGEN_REQUESTED.load(Ordering::Relaxed),

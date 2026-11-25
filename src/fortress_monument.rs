@@ -398,8 +398,7 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
 }
 
 /// Java's `boolean` spelling in the piece tags.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn piece_bool(v: bool) -> &'static str {
     if v {
         "1"

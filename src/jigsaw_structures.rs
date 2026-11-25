@@ -1723,12 +1723,13 @@ fn rotated_jigsaws(
     rot: Rotation,
     reg: &BReg,
 ) -> Vec<std::sync::Arc<BlockInfo>> {
+    type RotatedJigsawCache =
+        HashMap<(usize, u8), (std::sync::Weak<Template>, Vec<std::sync::Arc<BlockInfo>>)>;
     thread_local! {
         // Keyed by the template's Arc identity so an entry can never outlive a
         // reload and answer for a different template at a reused address.
-        static ROTATED_JIGSAWS: std::cell::RefCell<
-            HashMap<(usize, u8), (std::sync::Weak<Template>, Vec<std::sync::Arc<BlockInfo>>)>,
-        > = std::cell::RefCell::new(HashMap::new());
+        static ROTATED_JIGSAWS: std::cell::RefCell<RotatedJigsawCache> =
+            std::cell::RefCell::new(HashMap::new());
     }
     let key = (std::sync::Arc::as_ptr(tpl) as usize, rot as u8);
     if let Some((weak, list)) = ROTATED_JIGSAWS.with(|c| c.borrow().get(&key).cloned()) {

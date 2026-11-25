@@ -50,8 +50,7 @@ pub(crate) fn lava_spreads_fast_in_dim(dim: i32) -> bool {
 
 /// `LavaFluid.getTickDelay`: 10 game ticks in an ultrawarm dimension, 30 game
 /// ticks everywhere else.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) fn lava_tick_delay_for_dim(dim: i32) -> u32 {
     if lava_spreads_fast_in_dim(dim) {
         10
@@ -73,8 +72,7 @@ pub(crate) fn lava_drop_off_for_dim(dim: i32) -> u8 {
 
 /// `FlowingFluid.getTickDelay` for a scheduled tick of `kind` in `dim`: water
 /// is always 5 game ticks; lava is dimension-aware.
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 pub(crate) fn fluid_tick_delay(kind: Kind, dim: i32) -> u32 {
     match kind {
         Kind::Water => 5,

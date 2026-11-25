@@ -60,6 +60,7 @@ pub(crate) struct Cart {
     pub data: Tag,
 }
 impl Cart {
+    #[allow(dead_code)] // Retained for generated-content test fixtures.
     pub fn new(eid: i32, uuid: [u8; 16], p: Pos, seed: i64) -> Self {
         Self::new_in_dim(eid, uuid, p, seed, crate::worldgen::DimId::Overworld)
     }
@@ -207,6 +208,7 @@ pub(crate) struct Frame {
     pub data: Tag,
 }
 impl Frame {
+    #[allow(dead_code)] // Retained for generated-content test fixtures.
     pub fn new(
         eid: i32,
         uuid: [u8; 16],

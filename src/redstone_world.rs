@@ -1,8 +1,7 @@
 use crate::block_registry::{BReg, Support};
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 struct RsDaylightDetectorState {
     inverted: bool,
 }
@@ -23,8 +22,7 @@ struct RsSculkSensorState {
     power: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn rs_daylight_detector_state(reg: &BReg, state: u32) -> Option<RsDaylightDetectorState> {
     (reg.name_of(state) == "minecraft:daylight_detector").then(|| RsDaylightDetectorState {
         inverted: reg.get_prop(state, "inverted").as_deref() == Some("true"),

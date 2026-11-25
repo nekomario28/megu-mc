@@ -11128,7 +11128,7 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
                         std::thread::yield_now();
                     }
                     let guard = shared.read().unwrap_or_else(|e| e.into_inner());
-                    let owner: &Gen = &**guard;
+                    let owner: &Gen = &guard;
                     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         // Results are indexed by the chunk's place in `pending`, so a
                         // worker finishing early cannot change the commit order.
@@ -11179,7 +11179,7 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
                     {
                         let mut guard = shared.write().unwrap_or_else(|e| e.into_inner());
                         let (sx, sz) = pending[ci];
-                        ticks[ci] = Some(commit_populate(&mut **guard, sx, sz, res));
+                        ticks[ci] = Some(commit_populate(&mut guard, sx, sz, res));
                     }
                     commit_pending.store(false, std::sync::atomic::Ordering::Release);
                 }
