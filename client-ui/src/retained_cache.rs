@@ -164,6 +164,7 @@ impl UiRetainedCache {
         let dirty = self.tracker.poll(bus);
         self.pending = dirty;
         self.composited = false;
+        self.order_scratch.clear();
         if dirty.is_empty() {
             self.stats.idle_frames += 1;
         } else {
@@ -179,13 +180,13 @@ impl UiRetainedCache {
                 // composite + upload downstream.
                 let _ = self.dag.mark_input_changed(input, rev.get());
             }
-            // The DAG's topo-ordered work plan for this frame —
-            // `composite` before `upload`, retained so the plan itself
-            // allocates nothing. `composite()` consults it to decide
-            // whether a merge is owed.
-            self.order_scratch.clear();
-            self.dag.dirty_order_into(&mut self.order_scratch);
         }
+        // Rebuild the topo-ordered work plan from the DAG's actual dirty
+        // state, not from this frame's revision diff alone. A caller that
+        // deferred the previous frame's composite still finds it owed here,
+        // while a completed composite leaves no stale scratch entry that
+        // would merge again on every idle frame.
+        self.dag.dirty_order_into(&mut self.order_scratch);
         dirty
     }
 
@@ -319,6 +320,40 @@ mod tests {
 
     fn empty_sprites() -> GuiSpriteAtlas {
         GuiSpriteAtlas::default()
+    }
+
+    #[test]
+    fn deferred_composite_survives_an_idle_begin_frame_once() {
+        let bus = UiLayerBus::new();
+        let mut cache = UiRetainedCache::new();
+        let icons = empty_icons();
+        let sprites = empty_sprites();
+        let dirty = cache.begin_frame(&bus);
+        assert!(!dirty.is_empty());
+        for layer in UiLayer::ALL {
+            cache.update_layer(
+                layer,
+                &list_with_rect(layer.index() as i32),
+                100,
+                100,
+                &icons,
+                &sprites,
+            );
+        }
+
+        // The next poll has no new revision diff, but the first frame's
+        // composite is still genuinely owed by the DAG and must remain
+        // reachable exactly once.
+        assert_eq!(cache.begin_frame(&bus), DirtyLayers::NONE);
+        let before = cache.stats().composites;
+        let (vertices, indices) = cache.composite();
+        assert!(!vertices.is_empty() && !indices.is_empty());
+        assert_eq!(cache.stats().composites, before + 1);
+        cache.mark_uploaded();
+
+        assert_eq!(cache.begin_frame(&bus), DirtyLayers::NONE);
+        cache.composite();
+        assert_eq!(cache.stats().composites, before + 1);
     }
 
     #[test]

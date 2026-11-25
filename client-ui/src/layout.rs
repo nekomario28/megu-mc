@@ -563,7 +563,18 @@ fn title(ctx: &mut Ctx) {
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 34, 3, pal::TEXT, "MINECRAFT");
+    // The wordmark never truncates: explicit high GUI scales can make
+    // the logical viewport narrower than the 3× text, so step the clean-
+    // room text logo down before clipping it. The smaller form still reads
+    // as the masthead and leaves the button grid untouched.
+    let masthead_mult = if text_width("MINECRAFT", 3) as i32 + 8 <= ctx.w {
+        3
+    } else if text_width("MINECRAFT", 2) as i32 + 8 <= ctx.w {
+        2
+    } else {
+        1
+    };
+    ctx.ctext(cx, 34, masthead_mult, pal::TEXT, "MINECRAFT");
     ctx.ctext(cx, 62, 1, pal::TEXT_DIM, "MEGU EDITION");
 
     // Vanilla 1.21.1 silhouette: a centered 200px column — two
