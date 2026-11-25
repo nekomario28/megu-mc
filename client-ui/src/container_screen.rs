@@ -13,6 +13,7 @@ use std::ops::Range;
 
 use crate::conflict_widget::ConflictWidget;
 use crate::draw::{palette, text_height, text_width, UiColor, UiDrawList, UiRect};
+use crate::vanilla_widgets::{draw_vanilla_arrow, draw_vanilla_ghost_item};
 
 pub const VANILLA_MENU_COUNT: usize = 25;
 pub const SLOT_SIZE: i32 = 18;
@@ -1110,7 +1111,6 @@ impl ContainerScreenState {
             return;
         }
         let layout = self.layout(viewport_w, viewport_h);
-
         for slot in &layout.slots {
             let item = self
                 .slots
@@ -1129,11 +1129,17 @@ impl ContainerScreenState {
                 if hovered { 2 } else { 1 },
             );
             if item.is_empty() {
+                if let Some(ghost) = ghost_item(self.schema.menu_id, slot.index) {
+                    draw_vanilla_ghost_item(out, slot.rect, ghost);
+                }
+                if self.schema.menu_id == 7 && self.property(slot.index) != 0 && slot.index < 9 {
+                    out.text_str(slot.rect.x + 5, slot.rect.y + 4, 1, palette::DANGER, "X");
+                }
                 continue;
             }
             let inset = UiRect::new(slot.rect.x + 2, slot.rect.y + 2, 16, 16);
             if item.namespaced_id.is_empty() {
-                let icon = item_icon_color(item.item_id);
+                let icon = palette::ACCENT;
                 out.fill_rect(UiRect::new(slot.rect.x + 3, slot.rect.y + 3, 12, 12), icon);
             } else {
                 out.item_icon_str(inset, &item.namespaced_id);
@@ -1180,6 +1186,7 @@ impl ContainerScreenState {
                 button.label,
             );
         }
+        self.draw_station_chrome(panel, out);
         // Polymorph strip beside the station's output slot — only while
         // two or more recipes conflict; a quiet grid emits nothing.
         if self.conflict.is_active() {
@@ -1195,7 +1202,7 @@ impl ContainerScreenState {
             if cursor.namespaced_id.is_empty() {
                 out.fill_rect(
                     UiRect::new(rect.x + 3, rect.y + 3, 14, 14),
-                    item_icon_color(cursor.item_id),
+                    palette::ACCENT,
                 );
             } else {
                 out.item_icon_str(
@@ -1227,13 +1234,154 @@ impl ContainerScreenState {
     }
 }
 
-fn item_icon_color(item_id: u32) -> UiColor {
-    let h = item_id.wrapping_mul(2654435761);
-    UiColor::rgb(
-        ((h >> 16) & 0xff) as u8,
-        ((h >> 8) & 0xff) as u8,
-        (h & 0xff) as u8,
-    )
+impl ContainerScreenState {
+    fn draw_station_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let px = panel.x + CONTENT_PAD;
+        let py = panel.y + CONTENT_PAD;
+        match self.schema.menu_id {
+            0..=5 => {
+                let rows = (self.schema.menu_id + 1) as i32;
+                let divider_y = py + 29 + rows * SLOT_SIZE;
+                out.fill_rect(
+                    UiRect::new(px + 4, divider_y, panel.w.saturating_sub(16), 1),
+                    palette::SEPARATOR,
+                );
+            }
+            6 => {
+                draw_vanilla_arrow(out, UiRect::new(px + 94, py + 26, 22, 18), true);
+                out.text_str(px + 92, py + 46, 1, palette::TEXT_DIM, "DISPENSER");
+            }
+            7 => {
+                out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "CRAFTER");
+                draw_vanilla_arrow(out, UiRect::new(px + 104, py + 31, 20, 18), self.property(0) == 0);
+                out.text_str(
+                    px + 120,
+                    py + 50,
+                    1,
+                    if self.property(0) == 0 { palette::ACCENT } else { palette::DANGER },
+                    if self.property(0) == 0 { "ON" } else { "OFF" },
+                );
+            }
+            8 => {
+                let field = UiRect::new(px + 29, py + 27, 96, 12);
+                out.fill_rect(field, palette::TOOLTIP_BG);
+                out.border_rect(field, palette::TEXT_DIM, 1);
+                let name = clip_text(&self.title, (field.w as i32 - 6).max(1));
+                out.text(px + 32, py + 29, 1, palette::TEXT, name);
+                draw_vanilla_arrow(out, UiRect::new(px + 104, py + 43, 20, 18), true);
+                let cost = self.property(0);
+                let footer = if cost > 0 {
+                    format!("Enchantment Cost: {cost}")
+                } else {
+                    "Too Expensive!".to_owned()
+                };
+                out.text(
+                    px + 8,
+                    py + 76,
+                    1,
+                    if cost > 0 { palette::ACCENT } else { palette::DANGER },
+                    clip_text(&footer, (panel.w as i32 - 20).max(1)),
+                );
+            }
+            9 => {
+                out.text_str(px + 67, py + 30, 1, palette::TEXT_DARK, "Beacon Powers");
+                out.text_str(px + 76, py + 54, 1, palette::ACCENT, "I  II  III  IV");
+                out.text_str(px + 58, py + 103, 1, palette::TEXT_DIM, "Payment");
+            }
+            10 | 14 | 22 => {
+                draw_vanilla_arrow(out, UiRect::new(px + 80, py + 33, 20, 18), true);
+                out.text_str(px + 77, py + 55, 1, palette::TEXT_DIM, "COOK");
+            }
+            11 => {
+                out.text_str(px + 34, py + 73, 1, palette::TEXT_DIM, "BREW");
+                draw_vanilla_arrow(out, UiRect::new(px + 77, py + 34, 16, 14), true);
+            }
+            12 => {
+                draw_vanilla_arrow(out, UiRect::new(px + 91, py + 26, 22, 18), true);
+                out.text_str(px + 91, py + 46, 1, palette::TEXT_DIM, "CRAFT");
+            }
+            13 => {
+                out.text_str(px + 53, py + 15, 1, palette::TEXT_DARK, "Select Enchantment");
+                for i in 0..3 {
+                    let y = py + 71 + i * 12;
+                    out.text_str(px + 57, y, 1, palette::WARNING, "ᚠᚢᚦ");
+                    let cost = self.property(i as i16);
+                    out.text(
+                        px + 119,
+                        y,
+                        1,
+                        if cost > 0 { palette::ACCENT } else { palette::DANGER },
+                        cost.to_string(),
+                    );
+                }
+            }
+            15 => draw_vanilla_arrow(out, UiRect::new(px + 77, py + 26, 34, 24), false),
+            16 => out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "HOPPER"),
+            17 => {
+                out.text_str(px + 61, py + 13, 1, palette::TEXT_DARK, "Lectern");
+                out.text_str(px + 63, py + 51, 1, palette::TEXT_DIM, "Book Page");
+            }
+            18 => {
+                out.text_str(px + 74, py + 15, 1, palette::TEXT_DARK, "Banner Pattern");
+                out.text_str(px + 75, py + 43, 1, palette::ACCENT, "PREVIEW");
+            }
+            19 => {
+                out.text_str(px + 109, py + 14, 1, palette::TEXT_DARK, "Villager Trades");
+                out.progress_bar(
+                    UiRect::new(px + 108, py + 26, 96, 5),
+                    f32::from(self.property(2)).clamp(0.0, 1.0),
+                    palette::ACCENT,
+                    palette::BUTTON_DISABLED,
+                    palette::PANEL_BORDER,
+                );
+            }
+            20 => out.text_str(px + 100, py + 5, 1, palette::TEXT_DARK, "SHULKER BOX"),
+            21 => {
+                out.text(
+                    px + 8,
+                    py + 30,
+                    1,
+                    palette::TEXT_DIM,
+                    clip_text("TEMPLATE  BASE  ADDITION", (panel.w as i32 - 20).max(1)),
+                );
+                draw_vanilla_arrow(out, UiRect::new(px + 61, py + 41, 21, 18), true);
+            }
+            23 => {
+                out.text_str(px + 93, py + 20, 1, palette::TEXT_DARK, "MAP PREVIEW");
+                out.border_rect(
+                    UiRect::new(px + 92, py + 34, 50, 38),
+                    palette::PANEL_BORDER,
+                    1,
+                );
+                out.text_str(px + 104, py + 48, 1, palette::ACCENT, "MAP");
+            }
+            24 => out.text_str(px + 8, py + 44, 1, palette::TEXT_DARK, "STONECUTTER"),
+            _ => {}
+        }
+    }
+}
+
+fn ghost_item(menu_id: u32, slot: i16) -> Option<&'static str> {
+    match (menu_id, slot) {
+        (8, 0) => Some("minecraft:iron_sword"),
+        (9, 0) => Some("minecraft:iron_ingot"),
+        (10 | 14 | 22, 0) => Some("minecraft:iron_ore"),
+        (10 | 14 | 22, 1) => Some("minecraft:coal"),
+        (11, 1..=3) => Some("minecraft:glass_bottle"),
+        (11, 4) => Some("minecraft:blaze_powder"),
+        (12, 1..=9) => Some("minecraft:oak_planks"),
+        (13, 0) => Some("minecraft:book"),
+        (13, 1) => Some("minecraft:lapis_lazuli"),
+        (18, 0) => Some("minecraft:white_banner"),
+        (18, 1) => Some("minecraft:white_dye"),
+        (18, 2) => Some("minecraft:paper"),
+        (21, 0) => Some("minecraft:smithing_template"),
+        (21, 1) => Some("minecraft:diamond_chestplate"),
+        (21, 2) => Some("minecraft:netherite_ingot"),
+        (23, 0) => Some("minecraft:filled_map"),
+        (23, 1) => Some("minecraft:paper"),
+        _ => None,
+    }
 }
 
 fn clip_text(text: &str, max_width: i32) -> String {
