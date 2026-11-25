@@ -311,7 +311,6 @@ _CFG_TEST_CACHE = {}
 _READ_TEXT_CACHE = {}
 _REL_PATH_CACHE = {}
 _SPLIT_LINES_CACHE = {}
-_LINE_OFFSETS_CACHE = {}
 _PY_COMMENT_MASK_CACHE = {}
 
 
@@ -541,16 +540,6 @@ def cached_lines(text):
     if key not in _SPLIT_LINES_CACHE:
         _SPLIT_LINES_CACHE[key] = text.splitlines()
     return _SPLIT_LINES_CACHE[key]
-
-
-def cached_line_offsets(text):
-    key = _text_cache_key(text)
-    if key not in _LINE_OFFSETS_CACHE:
-        offsets = [0]
-        for match in re.finditer("\n", text):
-            offsets.append(match.end())
-        _LINE_OFFSETS_CACHE[key] = offsets
-    return _LINE_OFFSETS_CACHE[key]
 
 
 def python_comments_masked(text):
@@ -1134,9 +1123,8 @@ def guard_hot_render_loop_allocations(root, files):
     return findings
 
 
-def bounded_global_context(text, start):
+def bounded_global_context(text, line):
     lines = cached_lines(rust_code_only(text))
-    line = line_number(text, start)
     context = "\n".join(lines[max(0, line - 8):min(len(lines), line + 32)])
     return re.search(r"\bMAX_[A-Z0-9_]+\b|\.retain\s*\(|\bevict[A-Za-z0-9_]*\s*\(", context) is not None
 
@@ -1144,31 +1132,42 @@ def bounded_global_context(text, start):
 def static_hash_globals(text, static_lines=None):
     code = strip_cfg_test_items(text)
     if static_lines is None:
-        matches = STATIC_START_RE.finditer(code)
-    else:
-        offsets = cached_line_offsets(code)
-        candidate_matches = []
-        for line in sorted(static_lines):
-            if line - 1 >= len(offsets):
+        for match in STATIC_START_RE.finditer(code):
+            name = match.group(1)
+            type_start = match.end()
+            # Static type annotations in this workspace wrap over at most a
+            # few lines.  Bounding the search keeps the scan linear and
+            # prevents a malformed file from consuming the rest of the input.
+            limit = min(len(code), type_start + 1200)
+            equals = code.find("=", type_start, limit)
+            if equals == -1:
                 continue
-            match = STATIC_START_RE.match(code, offsets[line - 1])
-            if match is not None:
-                candidate_matches.append(match)
-        matches = candidate_matches
-    for match in matches:
-        name = match.group(1)
-        type_start = match.end()
-        # Static type annotations in this workspace wrap over at most a few
-        # lines.  Bounding the search keeps the scan linear and prevents a
-        # malformed file from making one static consume the rest of the input.
-        limit = min(len(code), type_start + 1200)
-        equals = code.find("=", type_start, limit)
+            type_text = " ".join(code[type_start:equals].split())
+            registry_alias = REGISTRY_TYPE_RE.search(type_text) is not None
+            if "HashMap" in type_text or "HashSet" in type_text or registry_alias:
+                yield name, type_text, line_number(text, match.start())
+        return
+
+    lines = cached_lines(code)
+    for line in sorted(static_lines):
+        if line > len(lines):
+            continue
+        line_text = lines[line - 1]
+        match = STATIC_START_RE.match(line_text)
+        if match is None:
+            continue
+        fragment = line_text[match.end():]
+        next_index = line
+        while "=" not in fragment and len(fragment) < 1200 and next_index < len(lines):
+            fragment += "\n" + lines[next_index]
+            next_index += 1
+        equals = fragment.find("=", 0, 1200)
         if equals == -1:
             continue
-        type_text = " ".join(code[type_start:equals].split())
+        type_text = " ".join(fragment[:equals].split())
         registry_alias = REGISTRY_TYPE_RE.search(type_text) is not None
         if "HashMap" in type_text or "HashSet" in type_text or registry_alias:
-            yield name, type_text, match.start()
+            yield match.group(1), type_text, line
 
 
 def guard_unbounded_global_registries(root, files):
@@ -1191,8 +1190,8 @@ def guard_unbounded_global_registries(root, files):
             lines_for_file = static_rows.get(rel, set())
             if not lines_for_file:
                 continue
-        for name, type_text, position in static_hash_globals(text, lines_for_file):
-            bounded = bounded_global_context(text, position)
+        for name, type_text, static_line in static_hash_globals(text, lines_for_file):
+            bounded = bounded_global_context(text, static_line)
             identity = f"{rel}:{name}:{' '.join(type_text.split())}"
             if bounded:
                 continue
@@ -1202,7 +1201,7 @@ def guard_unbounded_global_registries(root, files):
             findings.append(finding(
                 "unbounded-global-registry",
                 rel,
-                line_number(text, position),
+                static_line,
                 f"static global {name} ({type_text}) lacks a nearby MAX_/eviction/retain bound",
             ))
     return findings
