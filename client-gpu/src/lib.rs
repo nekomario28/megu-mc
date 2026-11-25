@@ -35,6 +35,7 @@ pub mod vanilla_bootstrap;
 pub mod vanilla_font;
 pub mod vanilla_gui_sprites;
 pub mod vanilla_jar;
+pub mod vanilla_world_assets;
 pub mod window;
 
 use std::path::PathBuf;
