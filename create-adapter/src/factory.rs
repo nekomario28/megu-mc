@@ -25,6 +25,10 @@ use mod_offload::region_scheduler::{
 use mod_offload::sleeping_transport::TransportError;
 
 use crate::blockstates::{CreateBlockRegistry, CreateBlockRole};
+use crate::create_compat::{create_gearbox_transfer_sign, CreateFace, CREATE_MAX_RPM};
+
+/// Create 6.0.x's default symmetric rotation-speed ceiling.
+pub const CREATE_MAX_ROTATION_RPM: f64 = CREATE_MAX_RPM as f64;
 
 /// Capacity (elements) the reconcile scratch vecs retain across calls —
 /// past this, [`BoundedScratchVec::clear_bounded`] shrinks them back so a
@@ -305,7 +309,10 @@ impl CreateFactory {
     pub fn kinetic_solution(&self, pos: DimBlockPos) -> Option<Solution> {
         let placed = self.kinetics.get(&pos)?;
         let region = self.scheduler.region(pos.region_key())?;
-        region.kinetic.solution(placed.id)
+        region
+            .kinetic
+            .solution(placed.id)
+            .map(clamp_create_solution)
     }
 
     /// Place or replace a Create block at `pos`, updating the kinetic graph
@@ -651,29 +658,77 @@ impl CreateFactory {
                     if neighbor.axis == placed.axis
                         && !matches!(neighbor.role, CreateBlockRole::Clutch if neighbor.powered)
                     {
-                        let effective = if matches!(neighbor.role, CreateBlockRole::Gearshift if neighbor.powered)
+                        let mut effective = if matches!(neighbor.role, CreateBlockRole::Gearshift if neighbor.powered)
                         {
                             -ratio
                         } else {
                             ratio
                         };
+                        // A gearbox port is not a plain shaft splice. Pin its
+                        // static scalar sign to Create's direction-sensitive
+                        // bevel-gear rule using the positive end of the
+                        // gearbox axis as the canonical input port; as in the
+                        // upstream propagator, the input-port sign cancels
+                        // when power enters from the opposite axial end.
+                        if placed.role == CreateBlockRole::Gearbox {
+                            if let Some(face) = face_from_delta(dx, dy, dz) {
+                                effective = gearbox_port_ratio(placed.axis, face);
+                            }
+                        } else if neighbor.role == CreateBlockRole::Gearbox {
+                            if let Some(face) = face_from_delta(-dx, -dy, -dz) {
+                                effective = gearbox_port_ratio(neighbor.axis, face);
+                            }
+                        }
                         out.push((npos, effective));
                     }
                 }
             }
         }
 
-        // 2. Cogwheel <-> Cogwheel (same axis, perpendicular neighbor -> -1:1)
-        //    and Large Cogwheel <-> Large Cogwheel (-1:1).
+        // 2. Small Cogwheel <-> Small Cogwheel: same axis, perpendicular
+        //    neighbor, exact meshing inversion (-1:1). Large cogwheels occupy
+        //    a 2x2 plane in Create and cannot mesh in that coplanar-adjacent
+        //    arrangement; their valid large-to-large mesh is cross-axis and
+        //    diagonal, handled separately below.
+        if placed.role == CreateBlockRole::Cogwheel {
+            for (dx, dy, dz) in placed.axis.perpendicular_deltas() {
+                let npos = pos.offset(dx, dy, dz);
+                if let Some(&neighbor) = self.kinetics.get(&npos) {
+                    if neighbor.axis == placed.axis && neighbor.role == CreateBlockRole::Cogwheel {
+                        out.push((npos, -1.0));
+                    }
+                }
+            }
+        }
         if matches!(
             placed.role,
             CreateBlockRole::Cogwheel | CreateBlockRole::LargeCogwheel
         ) {
-            for (dx, dy, dz) in placed.axis.perpendicular_deltas() {
-                let npos = pos.offset(dx, dy, dz);
-                if let Some(&neighbor) = self.kinetics.get(&npos) {
-                    if neighbor.axis == placed.axis && neighbor.role == placed.role {
-                        out.push((npos, -1.0));
+            // Large Cogwheel <-> Large Cogwheel: both center offsets must be
+            // nonzero along their two different rotation axes and zero along
+            // the remaining axis. The sign is the xor of those two offsets.
+            if placed.role == CreateBlockRole::LargeCogwheel {
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            if dx == 0 && dy == 0 && dz == 0 {
+                                continue;
+                            }
+                            let npos = pos.offset(dx, dy, dz);
+                            if let Some(&neighbor) = self.kinetics.get(&npos) {
+                                if neighbor.role == CreateBlockRole::LargeCogwheel {
+                                    if let Some(ratio) = large_cog_mesh_ratio(
+                                        placed.axis,
+                                        neighbor.axis,
+                                        dx,
+                                        dy,
+                                        dz,
+                                    ) {
+                                        out.push((npos, ratio));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -711,7 +766,9 @@ impl CreateFactory {
                     if neighbor.axis == dir_axis
                         && !matches!(neighbor.role, CreateBlockRole::Clutch if neighbor.powered)
                     {
-                        out.push((npos, -1.0));
+                        if let Some(face) = face_from_delta(dx, dy, dz) {
+                            out.push((npos, gearbox_port_ratio(placed.axis, face)));
+                        }
                     }
                 }
             }
@@ -721,7 +778,9 @@ impl CreateFactory {
                 let npos = pos.offset(dx, dy, dz);
                 if let Some(&neighbor) = self.kinetics.get(&npos) {
                     if neighbor.role == CreateBlockRole::Gearbox && neighbor.axis != placed.axis {
-                        out.push((npos, -1.0));
+                        if let Some(face) = face_from_delta(-dx, -dy, -dz) {
+                            out.push((npos, gearbox_port_ratio(neighbor.axis, face)));
+                        }
                     }
                 }
             }
@@ -765,6 +824,7 @@ impl CreateFactory {
                 let rpm = region
                     .kinetic
                     .solution(placed.id)
+                    .map(clamp_create_solution)
                     .map(|s| s.speed.abs())
                     .unwrap_or(0.0);
                 (placed, rpm)
@@ -786,6 +846,7 @@ impl CreateFactory {
                 .scheduler
                 .region(region_key)
                 .and_then(|r| r.kinetic.solution(placed.id))
+                .map(clamp_create_solution)
             else {
                 continue;
             };
@@ -858,6 +919,73 @@ impl RegionSchedulerExt for RegionScheduler {
             None
         }
     }
+}
+
+/// Adapter-facing Create RPM presentation. Graph algebra intentionally keeps
+/// theoretical uncapped ratios so conflict detection remains exact; blocks,
+/// update tags, stress scaling, and machine drives observe Create's ±256 cap.
+fn clamp_create_solution(mut solution: Solution) -> Solution {
+    if solution.status == NetworkStatus::Running {
+        solution.speed = solution
+            .speed
+            .clamp(-CREATE_MAX_ROTATION_RPM, CREATE_MAX_ROTATION_RPM);
+    }
+    solution
+}
+
+fn face_from_delta(dx: i32, dy: i32, dz: i32) -> Option<CreateFace> {
+    match (dx, dy, dz) {
+        (1, 0, 0) => Some(CreateFace::East),
+        (-1, 0, 0) => Some(CreateFace::West),
+        (0, 1, 0) => Some(CreateFace::Up),
+        (0, -1, 0) => Some(CreateFace::Down),
+        (0, 0, 1) => Some(CreateFace::South),
+        (0, 0, -1) => Some(CreateFace::North),
+        _ => None,
+    }
+}
+
+fn positive_face_for_axis(axis: Axis) -> CreateFace {
+    match axis {
+        Axis::X => CreateFace::East,
+        Axis::Y => CreateFace::Up,
+        Axis::Z => CreateFace::South,
+    }
+}
+
+/// Static scalar sign for one gearbox port. The positive end of the gearbox
+/// axis is the canonical input face; upstream input-face signs cancel across
+/// a driven path, while perpendicular ports keep their exact polarity rule.
+fn gearbox_port_ratio(gearbox_axis: Axis, port_face: CreateFace) -> f64 {
+    f64::from(create_gearbox_transfer_sign(
+        positive_face_for_axis(gearbox_axis),
+        port_face,
+    ))
+}
+
+/// Rotation-speed ratio for a diagonal large-cogwheel mesh, mirroring
+/// `RotationPropagator.isLargeToLargeGear` and its xor sign rule.
+fn large_cog_mesh_ratio(from_axis: Axis, to_axis: Axis, dx: i32, dy: i32, dz: i32) -> Option<f64> {
+    if from_axis == to_axis {
+        return None;
+    }
+    let component = |axis: Axis| match axis {
+        Axis::X => dx,
+        Axis::Y => dy,
+        Axis::Z => dz,
+    };
+    for axis in [Axis::X, Axis::Y, Axis::Z] {
+        let diff = component(axis);
+        if axis == from_axis || axis == to_axis {
+            if diff == 0 {
+                return None;
+            }
+        } else if diff != 0 {
+            return None;
+        }
+    }
+    let inverted = (component(from_axis) > 0) != (component(to_axis) > 0);
+    Some(if inverted { -1.0 } else { 1.0 })
 }
 
 fn kinetic_node_input(placed: PlacedKinetic, rpm_scale: f64) -> KineticNode {

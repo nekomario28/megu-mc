@@ -21,6 +21,7 @@ pub mod addon_profile;
 pub mod aeronautics;
 pub mod blockstates;
 pub mod contraption_adapter;
+pub mod create_compat;
 pub mod data_loader;
 pub mod factory;
 pub mod factorio_sim;
