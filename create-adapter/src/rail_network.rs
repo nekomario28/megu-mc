@@ -29,15 +29,14 @@
 //!   persistence; decode fails closed on bad magic/version, truncation,
 //!   CRC mismatch, or oversized counts.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 use std::fmt;
 
 use megu_core::perf_kit::{
     BoundedScratchVec, DirtyFingerprintGate, FingerprintBuilder, FingerprintStats,
 };
-use mod_adapter_core::neoforge_wire::{
-    read_mc_string, read_varint, write_mc_string, write_varint,
-};
+use mod_adapter_core::neoforge_wire::{read_mc_string, read_varint, write_mc_string, write_varint};
 
 /// Train-id scratch capacity retained between ticks; a burst past this
 /// shrinks back via [`BoundedScratchVec::clear_bounded`].
@@ -143,11 +142,23 @@ pub enum RailError {
     InvalidAnchor(String),
     /// A switch selection that does not reference an outgoing edge of the
     /// junction node.
-    InvalidSwitch { node: NodeId, edge: EdgeId },
+    InvalidSwitch {
+        node: NodeId,
+        edge: EdgeId,
+    },
     /// Carriages of one articulated train disagree on gauge.
     MixedCarriageGauge,
     /// Bogey offsets outside `[0, carriage_length]`.
     InvalidCarriageSpec(String),
+    /// A train with the same id is already live in the network.
+    DuplicateTrain(TrainId),
+    /// The entry block is already occupied or reserved by another train.
+    BlockConflict {
+        block: BlockId,
+        held_by: TrainId,
+    },
+    /// `u64::MAX` is reserved as the snapshot's no-train sentinel.
+    InvalidTrainId(TrainId),
     CorruptSnapshot(String),
 }
 
@@ -167,6 +178,13 @@ impl fmt::Display for RailError {
             }
             Self::MixedCarriageGauge => f.write_str("mixed-gauge carriages"),
             Self::InvalidCarriageSpec(what) => write!(f, "invalid carriage spec: {what}"),
+            Self::DuplicateTrain(id) => write!(f, "train {id} already exists"),
+            Self::BlockConflict { block, held_by } => {
+                write!(f, "signal block {block} is already held by train {held_by}")
+            }
+            Self::InvalidTrainId(id) => {
+                write!(f, "train id {id} is reserved as the empty sentinel")
+            }
             Self::CorruptSnapshot(what) => write!(f, "corrupt RAIL snapshot: {what}"),
         }
     }
@@ -263,7 +281,15 @@ impl CubicBezierSegment {
     /// distance `s` (clamped to `[0, length]`). The tangent falls back to
     /// the local LUT chord on cusps where the analytic derivative vanishes.
     pub fn sample_at_distance(&self, s: f64) -> ([f64; 3], [f64; 3]) {
-        let s = s.clamp(0.0, self.length);
+        // `f64::clamp` propagates NaN into the spline evaluation. Treat NaN
+        // as the spline start instead: sampling is a rendering/query path and
+        // must never amplify a bad caller-supplied distance into NaN world
+        // geometry. Infinities already clamp to the correct endpoint.
+        let s = if s.is_nan() {
+            0.0
+        } else {
+            s.clamp(0.0, self.length)
+        };
         // Largest LUT index i with lut_cum[i] <= s, bounded to 0..N-2.
         let mut i = self.lut_cum.partition_point(|&l| l <= s).saturating_sub(1);
         if i > ARC_LUT_SAMPLES - 2 {
@@ -314,6 +340,14 @@ impl TrackEdge {
         if segments.is_empty() {
             return Err(RailError::DegenerateEdge);
         }
+        // The edge is one continuous spline chain. Without this check two
+        // unrelated curves can be concatenated into a hidden geometry
+        // teleport while still passing every finite/length validation.
+        for pair in segments.windows(2) {
+            if dist3(pair[0].control[3], pair[1].control[0]) > 1e-9 {
+                return Err(RailError::DegenerateEdge);
+            }
+        }
         let mut seg_starts = Vec::with_capacity(segments.len() + 1);
         let mut length = 0.0;
         for seg in &segments {
@@ -343,7 +377,15 @@ impl TrackEdge {
     /// O(1) world position + unit tangent at arc distance `s` along the
     /// whole edge (spans segments transparently).
     pub fn sample_at_distance(&self, s: f64) -> ([f64; 3], [f64; 3]) {
-        let s = s.clamp(0.0, self.length);
+        // `f64::clamp` propagates NaN into the spline evaluation. Treat NaN
+        // as the spline start instead: sampling is a rendering/query path and
+        // must never amplify a bad caller-supplied distance into NaN world
+        // geometry. Infinities already clamp to the correct endpoint.
+        let s = if s.is_nan() {
+            0.0
+        } else {
+            s.clamp(0.0, self.length)
+        };
         let i = self
             .seg_starts
             .partition_point(|&start| start <= s)
@@ -491,7 +533,11 @@ impl TrackGraph {
                 .is_some_and(|edge| edge.gauge.is_compatible_with(gauge))
         };
         if let Some(sw) = self.switches.get(&node) {
-            return if compatible(sw) { vec![*sw] } else { Vec::new() };
+            return if compatible(sw) {
+                vec![*sw]
+            } else {
+                Vec::new()
+            };
         }
         n.out_edges.iter().copied().filter(compatible).collect()
     }
@@ -530,11 +576,18 @@ pub struct Signal {
 }
 
 /// A signal section: a partition of edges sharing one occupancy/reservation
-/// state, tracked per [`TrainId`].
+/// state, tracked per [`TrainId`]. `occupants` is the authoritative set;
+/// `occupied_by` is its deterministic lowest-id projection retained for the
+/// v1 snapshot wire format and for existing inspectors. Keeping both is
+/// deliberate: a single optional train id cannot represent an accidental
+/// overlap fail-closed, while the occupancy set can.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SignalBlock {
     pub id: BlockId,
     pub edges: BTreeSet<EdgeId>,
+    pub occupants: BTreeSet<TrainId>,
+    /// Lowest-id occupant, derived from [`Self::occupants`] whenever the
+    /// block is maintained through [`RailNetwork`].
     pub occupied_by: Option<TrainId>,
     pub reserved_by: Option<TrainId>,
 }
@@ -543,15 +596,30 @@ impl SignalBlock {
     /// Aspect contribution of this block for `train`: `Red` when occupied
     /// by another train, `Yellow` when only reserved by another, `Green`
     /// when free for `train` (empty, or already occupied/reserved *by*
-    /// `train`).
+    /// `train`). The projection is also consulted so directly edited legacy
+    /// state degrades toward red rather than silently green.
     fn aspect_for(&self, train: TrainId) -> SignalAspect {
-        if self.occupied_by.is_some_and(|t| t != train) {
+        let occupied_by_other = self.occupants.iter().any(|t| *t != train)
+            || self.occupied_by.is_some_and(|t| t != train);
+        if occupied_by_other {
             SignalAspect::Red
         } else if self.reserved_by.is_some_and(|t| t != train) {
             SignalAspect::Yellow
         } else {
             SignalAspect::Green
         }
+    }
+}
+
+/// Re-sync the v1 single-occupant projection after mutating `occupants`.
+/// Returns whether the visible block state changed.
+fn sync_occupied_projection(block: &mut SignalBlock) -> bool {
+    let projected = block.occupants.iter().next().copied();
+    if block.occupied_by == projected {
+        false
+    } else {
+        block.occupied_by = projected;
+        true
     }
 }
 
@@ -714,6 +782,9 @@ impl ArticulatedTrain {
         schedule: TrainSchedule,
     ) -> Result<Self, RailError> {
         let bad = |what: &str| RailError::InvalidCarriageSpec(what.to_string());
+        if id.0 == u64::MAX {
+            return Err(RailError::InvalidTrainId(id));
+        }
         if carriages.is_empty() {
             return Err(bad("no carriages"));
         }
@@ -723,6 +794,10 @@ impl ArticulatedTrain {
         let gauge = &carriages[0].gauge;
         if !carriages.iter().all(|c| &c.gauge == gauge) {
             return Err(RailError::MixedCarriageGauge);
+        }
+        let total_length: f64 = carriages.iter().map(|c| c.length).sum();
+        if !total_length.is_finite() {
+            return Err(bad("total_length"));
         }
         if !(max_speed.is_finite() && max_speed > 0.0) {
             return Err(bad("max_speed"));
@@ -814,16 +889,27 @@ impl ArticulatedTrain {
 /// Tick-level report from [`tick_rail_network`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransitEvent {
-    ArrivedAtStation { train: TrainId, station: String },
-    DepartedStation { train: TrainId, station: String },
+    ArrivedAtStation {
+        train: TrainId,
+        station: String,
+    },
+    DepartedStation {
+        train: TrainId,
+        station: String,
+    },
     RenderModeChanged {
         train: TrainId,
         mode: TrainRenderMode,
     },
     /// A running train could not route to its next station.
-    NoRoute { train: TrainId, station: String },
+    NoRoute {
+        train: TrainId,
+        station: String,
+    },
     /// End of schedule or end of line reached; the train stays put.
-    ReachedTerminus { train: TrainId },
+    ReachedTerminus {
+        train: TrainId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -929,6 +1015,45 @@ impl RailNetwork {
         self.graph.add_segmented_edge(from, to, gauge, segments)
     }
 
+    /// Remove one track edge (a broken/removed rail segment) and every
+    /// signal/switch/block membership attached to it. Station names are kept
+    /// as logical markers so operators can re-anchor them; trains routed over
+    /// the missing edge re-plan on their next tick, while a train physically
+    /// standing on the removed edge parks fail-closed through the normal
+    /// missing-edge path.
+    pub fn remove_edge(&mut self, edge: EdgeId) -> Option<TrackEdge> {
+        let removed = self.graph.edges.remove(&edge)?;
+        self.bump_occupancy_epoch();
+        if let Some(node) = self.graph.nodes.get_mut(&removed.from) {
+            node.out_edges.remove(&edge);
+        }
+        if let Some(node) = self.graph.nodes.get_mut(&removed.to) {
+            node.in_edges.remove(&edge);
+        }
+        self.graph.switches.retain(|_, selected| *selected != edge);
+        self.signals.remove(&edge);
+        if let Some(block_id) = self.edge_block.remove(&edge) {
+            if let Some(block) = self.blocks.get_mut(&block_id) {
+                block.edges.remove(&edge);
+            }
+        }
+        self.refresh_all_occupancy_after_topology_change();
+        Some(removed)
+    }
+
+    /// Recompute occupancy after a topology edit. Reservations are transient
+    /// approach locks, so a topology edit drops them all and lets the next
+    /// running step reacquire only still-valid ones.
+    fn refresh_all_occupancy_after_topology_change(&mut self) {
+        for block in self.blocks.values_mut() {
+            block.reserved_by = None;
+        }
+        let ids: Vec<TrainId> = self.trains.keys().copied().collect();
+        for id in ids {
+            refresh_occupancy(self, id);
+        }
+    }
+
     /// Partition `edges` into a new signal section. An edge already in
     /// another block is moved into the new one.
     pub fn add_block(&mut self, edges: &[EdgeId]) -> Result<BlockId, RailError> {
@@ -954,10 +1079,12 @@ impl RailNetwork {
             SignalBlock {
                 id,
                 edges: set,
+                occupants: BTreeSet::new(),
                 occupied_by: None,
                 reserved_by: None,
             },
         );
+        self.refresh_all_occupancy_after_topology_change();
         Ok(id)
     }
 
@@ -998,7 +1125,14 @@ impl RailNetwork {
         edge: EdgeId,
         s: f64,
     ) -> Result<(), RailError> {
-        let e = self.graph.edges.get(&edge).ok_or(RailError::EdgeNotFound(edge))?;
+        if self.trains.contains_key(&train.id) {
+            return Err(RailError::DuplicateTrain(train.id));
+        }
+        let e = self
+            .graph
+            .edges
+            .get(&edge)
+            .ok_or(RailError::EdgeNotFound(edge))?;
         if !train.gauge().is_compatible_with(&e.gauge) {
             return Err(RailError::IncompatibleGauge {
                 train: train.gauge().clone(),
@@ -1010,6 +1144,21 @@ impl RailNetwork {
                 "spawn s={s} outside edge {edge} length {}",
                 e.length()
             )));
+        }
+        if let Some(block) = self.block_of(edge) {
+            let held_by = block
+                .occupants
+                .iter()
+                .copied()
+                .find(|id| *id != train.id)
+                .or_else(|| block.occupied_by.filter(|id| *id != train.id))
+                .or_else(|| block.reserved_by.filter(|id| *id != train.id));
+            if let Some(held_by) = held_by {
+                return Err(RailError::BlockConflict {
+                    block: block.id,
+                    held_by,
+                });
+            }
         }
         train.pos_edge = edge;
         train.pos_s = s;
@@ -1031,6 +1180,8 @@ impl RailNetwork {
         self.trains.remove(&id);
         self.occupancy_gate.remove(&id);
         for b in self.blocks.values_mut() {
+            b.occupants.remove(&id);
+            sync_occupied_projection(b);
             if b.occupied_by == Some(id) {
                 b.occupied_by = None;
             }
@@ -1047,40 +1198,65 @@ impl RailNetwork {
 
     /// Aspect the entry signal on `edge` shows `train` right now. Unguarded
     /// or unpartitioned edges read `Green`. Chain signals look through the
-    /// junction to the exit block the train would take next.
+    /// junction to the exit the train would take next; when that exit is
+    /// itself chain-guarded the lookup recurses, so a train never enters the
+    /// first half of a chain relay only to stop inside a later junction.
     pub fn signal_aspect_for(&self, edge: EdgeId, train: TrainId) -> SignalAspect {
-        let Some(&bid) = self.edge_block.get(&edge) else {
-            return SignalAspect::Green;
-        };
-        let Some(block) = self.blocks.get(&bid) else {
-            return SignalAspect::Green;
-        };
-        let kind = self.signals.get(&edge).map(|s| s.kind).unwrap_or(SignalKind::Block);
-        let mine = block.aspect_for(train);
-        match kind {
-            SignalKind::Block => mine,
-            SignalKind::Chain => {
-                let exit_aspect = self
-                    .chain_exit_block(edge, train)
-                    .map(|b| b.aspect_for(train))
-                    .unwrap_or(SignalAspect::Green);
-                mine.max(exit_aspect)
+        let mut visited = BTreeSet::new();
+        let mut current = edge;
+        let mut aspect = SignalAspect::Green;
+        loop {
+            // A signalling cycle has no safe exit proof. Fail closed rather
+            // than looping forever or optimistically treating it as clear.
+            // The iterative scan scales to arbitrarily long finite relays
+            // without recursion-depth or stack-size limits.
+            if !visited.insert(current) {
+                return SignalAspect::Red;
+            }
+            let Some(&bid) = self.edge_block.get(&current) else {
+                return aspect;
+            };
+            let Some(block) = self.blocks.get(&bid) else {
+                return aspect;
+            };
+            let mine = block.aspect_for(train);
+            match self.signals.get(&current).map(|s| s.kind) {
+                Some(SignalKind::Chain) => {
+                    aspect = aspect.max(mine);
+                    let Some(next) = self.chain_next_edge(current, train) else {
+                        return aspect;
+                    };
+                    if self
+                        .signals
+                        .get(&next)
+                        .is_some_and(|s| s.kind == SignalKind::Chain)
+                    {
+                        current = next;
+                    } else {
+                        return aspect.max(
+                            self.block_of(next)
+                                .map(|b| b.aspect_for(train))
+                                .unwrap_or(SignalAspect::Green),
+                        );
+                    }
+                }
+                // Unguarded and ordinary block signals terminate the scan.
+                _ => return aspect.max(mine),
             }
         }
     }
 
-    /// Block of the edge a train would enter *after* `edge` (through the
-    /// junction at `edge.to`), following the train's route, switch, or the
-    /// lowest-id compatible exit.
-    fn chain_exit_block(&self, edge: EdgeId, train: TrainId) -> Option<&SignalBlock> {
+    /// Edge a train would enter *after* `edge` (through the junction at
+    /// `edge.to`), following the train's route, switch, or the lowest-id
+    /// compatible exit.
+    fn chain_next_edge(&self, edge: EdgeId, train: TrainId) -> Option<EdgeId> {
         let e = self.graph.edges.get(&edge)?;
         let gauge = self
             .trains
             .get(&train)
             .map(|t| t.gauge())
             .unwrap_or(&e.gauge);
-        let next = self
-            .trains
+        self.trains
             .get(&train)
             .and_then(|t| {
                 if t.pos_edge == edge {
@@ -1091,54 +1267,114 @@ impl RailNetwork {
                     None
                 }
             })
-            .or_else(|| self.graph.next_edge_for(e.to, gauge))?;
-        self.block_of(next)
+            .or_else(|| self.graph.next_edge_for(e.to, gauge))
     }
 
     /// Reserve the block containing `edge` for `train` when it is free for
     /// that train (no-op otherwise — a reservation by another train is
     /// never stolen).
     pub fn reserve_block_for(&mut self, edge: EdgeId, train: TrainId) {
-        self.bump_occupancy_epoch();
         let Some(&bid) = self.edge_block.get(&edge) else {
             return;
         };
+        let mut wrote = false;
         if let Some(b) = self.blocks.get_mut(&bid) {
-            if b.occupied_by.is_none() && b.reserved_by.is_none() {
+            if b.occupants.is_empty() && b.occupied_by.is_none() && b.reserved_by.is_none() {
                 b.reserved_by = Some(train);
+                wrote = true;
             }
+        }
+        if wrote {
+            self.bump_occupancy_epoch();
         }
     }
 
-    /// BFS route (fewest edges, gauge-filtered, switch-respecting) from
-    /// `start` node to the entry of `target_edge`. Returns the edge list
-    /// ending in `target_edge`, or `None` when unreachable.
+    /// Dijkstra route (shortest spline arc length, gauge-filtered,
+    /// switch-respecting) from `start` node to the entry of `target_edge`.
+    /// Returns the edge list ending in `target_edge`, or `None` when
+    /// unreachable. Edge ids and node ids break priority ties in sorted order,
+    /// so equal-cost routes are deterministic too.
     pub fn find_route(
         &self,
         start: NodeId,
         target_edge: EdgeId,
         gauge: &TrackGauge,
     ) -> Option<Vec<EdgeId>> {
+        #[derive(Clone, Copy, Debug)]
+        struct RouteState {
+            cost: f64,
+            node: NodeId,
+        }
+        impl PartialEq for RouteState {
+            fn eq(&self, other: &Self) -> bool {
+                self.cmp(other) == Ordering::Equal
+            }
+        }
+        impl Eq for RouteState {}
+        impl PartialOrd for RouteState {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for RouteState {
+            fn cmp(&self, other: &Self) -> Ordering {
+                // BinaryHeap is a max-heap; reverse both keys so the lowest
+                // cost, then lowest node id, pops first.
+                other
+                    .cost
+                    .total_cmp(&self.cost)
+                    .then_with(|| other.node.cmp(&self.node))
+            }
+        }
+
         let target = self.graph.edges.get(&target_edge)?;
-        if !target.gauge.is_compatible_with(gauge) {
+        if !target.gauge.is_compatible_with(gauge) || !self.graph.nodes.contains_key(&start) {
             return None;
         }
         let goal = target.from;
         if start == goal {
             return Some(vec![target_edge]);
         }
+
+        let mut dist: BTreeMap<NodeId, f64> = BTreeMap::from([(start, 0.0)]);
         let mut prev: BTreeMap<NodeId, (NodeId, EdgeId)> = BTreeMap::new();
-        let mut visited: BTreeSet<NodeId> = BTreeSet::from([start]);
-        let mut queue = VecDeque::from([start]);
-        while let Some(n) = queue.pop_front() {
-            for eid in self.graph.traversable_from(n, gauge) {
-                let e = &self.graph.edges[&eid];
-                if visited.insert(e.to) {
-                    prev.insert(e.to, (n, eid));
-                    queue.push_back(e.to);
+        let mut heap = BinaryHeap::from([RouteState {
+            cost: 0.0,
+            node: start,
+        }]);
+        while let Some(RouteState { cost, node }) = heap.pop() {
+            if cost > dist.get(&node).copied().unwrap_or(f64::INFINITY) {
+                continue; // stale queue entry superseded by a shorter path
+            }
+            if node == goal {
+                break;
+            }
+            for eid in self.graph.traversable_from(node, gauge) {
+                let Some(edge) = self.graph.edges.get(&eid) else {
+                    continue;
+                };
+                let next_cost = cost + edge.length();
+                // Positive finite edge lengths cannot produce NaN here, but
+                // they can saturate to infinity for absurdly large splines;
+                // infinity is not a useful routing cost and would poison ties.
+                if !next_cost.is_finite() {
+                    continue;
+                }
+                let shorter = dist.get(&edge.to).is_none_or(|best| next_cost < *best);
+                if shorter {
+                    dist.insert(edge.to, next_cost);
+                    prev.insert(edge.to, (node, eid));
+                    heap.push(RouteState {
+                        cost: next_cost,
+                        node: edge.to,
+                    });
                 }
             }
         }
+        if !dist.contains_key(&goal) {
+            return None;
+        }
+
         let mut edges = vec![target_edge];
         let mut cur = goal;
         while cur != start {
@@ -1225,10 +1461,15 @@ pub fn tick_rail_network(
 /// Clear all block reservations held by `train`; they are re-acquired fresh
 /// during the same tick's running step, so stale holds never linger.
 fn release_reservations(net: &mut RailNetwork, train: TrainId) {
+    let mut wrote = false;
     for b in net.blocks.values_mut() {
         if b.reserved_by == Some(train) {
             b.reserved_by = None;
+            wrote = true;
         }
+    }
+    if wrote {
+        net.bump_occupancy_epoch();
     }
 }
 
@@ -1300,17 +1541,30 @@ fn refresh_occupancy(net: &mut RailNetwork, train: TrainId) {
     let mut wrote = false;
     for (bid, b) in net.blocks.iter_mut() {
         if covered.contains(bid) {
-            if b.occupied_by != Some(train) {
-                b.occupied_by = Some(train);
+            if b.occupants.insert(train) {
+                wrote = true;
+            }
+            if sync_occupied_projection(b) {
                 wrote = true;
             }
             if b.reserved_by == Some(train) {
                 b.reserved_by = None;
                 wrote = true;
             }
-        } else if b.occupied_by == Some(train) {
-            b.occupied_by = None;
-            wrote = true;
+        } else {
+            if b.occupants.remove(&train) {
+                wrote = true;
+            }
+            if sync_occupied_projection(b) {
+                wrote = true;
+            }
+            // `occupied_by` is a public v1 projection and may have been
+            // edited directly; stale state for this train still fails closed
+            // by being cleared rather than inherited by another refresh.
+            if b.occupied_by == Some(train) && !b.occupants.contains(&train) {
+                b.occupied_by = b.occupants.iter().next().copied();
+                wrote = true;
+            }
         }
     }
     if wrote {
@@ -1351,6 +1605,90 @@ fn update_render_mode(
     }
 }
 
+/// Whether the train's active target/route still forms a connected,
+/// gauge-compatible directed path from its current edge. Public graph fields
+/// are intentionally inspectable/mutable for integrators, so the tick loop
+/// revalidates this invariant instead of trusting a plan captured before a
+/// track break or station edit.
+fn route_plan_valid(net: &RailNetwork, id: TrainId) -> bool {
+    let Some(t) = net.trains.get(&id) else {
+        return false;
+    };
+    let Some(current) = net.graph.edges.get(&t.pos_edge) else {
+        return false;
+    };
+    if !t.gauge().is_compatible_with(&current.gauge) {
+        return false;
+    }
+    if let Some(target) = &t.target {
+        let Some(target_edge) = net.graph.edges.get(&target.edge) else {
+            return false;
+        };
+        if !t.gauge().is_compatible_with(&target_edge.gauge)
+            || !target.s.is_finite()
+            || target.s < 0.0
+            || target.s > target_edge.length()
+        {
+            return false;
+        }
+        // A station re-anchored after route capture invalidates the stale
+        // target copy; the next planning pass reads the new anchor.
+        if net.stations.get(&target.station_name)
+            != Some(&StationAnchor {
+                edge: target.edge,
+                s: target.s,
+            })
+        {
+            return false;
+        }
+    }
+    if t.route.is_empty() {
+        return t
+            .target
+            .as_ref()
+            .is_none_or(|target| target.edge == t.pos_edge && target.s + 1e-9 >= t.pos_s);
+    }
+    if t.target.is_none() {
+        return false;
+    }
+
+    let mut node = current.to;
+    for edge_id in &t.route {
+        let Some(edge) = net.graph.edges.get(edge_id) else {
+            return false;
+        };
+        if edge.from != node || !t.gauge().is_compatible_with(&edge.gauge) {
+            return false;
+        }
+        node = edge.to;
+    }
+    t.target
+        .as_ref()
+        .is_some_and(|target| t.route.back() == Some(&target.edge))
+}
+
+/// Drop a stale plan and immediately re-run station planning. A missing
+/// intermediate edge therefore reroutes onto the next shortest available
+/// path in the same tick; a genuinely unreachable target still fails closed
+/// through `NoRoute`/`Terminus`.
+fn repair_route_if_broken(
+    net: &mut RailNetwork,
+    id: TrainId,
+    events: &mut Vec<TransitEvent>,
+) -> bool {
+    if route_plan_valid(net, id) {
+        return true;
+    }
+    let had_target = {
+        let t = net.trains.get_mut(&id).expect("checked");
+        let had_target = t.target.is_some();
+        t.route.clear();
+        t.target = None;
+        had_target
+    };
+    !had_target || ensure_target(net, id, events)
+}
+
 /// Resolve the train's next schedule target into a route when needed.
 /// Returns `false` when the train was parked (`Terminus`).
 fn ensure_target(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEvent>) -> bool {
@@ -1382,17 +1720,17 @@ fn ensure_target(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEve
     let gauge = t.gauge().clone();
     let pos_edge = t.pos_edge;
     let pos_s = t.pos_s;
-    let route: Option<VecDeque<EdgeId>> = if anchor.edge == pos_edge {
-        if anchor.s + 1e-9 >= pos_s {
-            Some(VecDeque::new())
-        } else {
-            None
-        }
+    let route: Option<VecDeque<EdgeId>> = if anchor.edge == pos_edge && anchor.s + 1e-9 >= pos_s {
+        Some(VecDeque::new())
     } else {
         match net.graph.edges.get(&pos_edge) {
             // The edge under the train vanished from the public graph map:
             // park it rather than panic on the index.
             None => None,
+            // A station behind the head on this same directional edge is not
+            // automatically unreachable: a loop may bring the train back onto
+            // the edge with the anchor ahead. Dijkstra decides whether such a
+            // directed loop exists.
             Some(e) => net
                 .find_route(e.to, anchor.edge, &gauge)
                 .map(VecDeque::from),
@@ -1430,17 +1768,13 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
     if !ensure_target(net, id, events) {
         return;
     }
-    let (pos_edge, pos_s, speed, target, next_via_route) = {
-        let t = net.trains.get(&id).expect("checked");
-        (
-            t.pos_edge,
-            t.pos_s,
-            t.speed,
-            t.target.as_ref().map(|target| (target.edge, target.s)),
-            t.route.front().copied(),
-        )
-    };
-    let Some(edge) = net.graph.edges.get(&pos_edge) else {
+    let pos_edge = net.trains[&id].pos_edge;
+    let Some((edge_len, head_node)) = net
+        .graph
+        .edges
+        .get(&pos_edge)
+        .map(|edge| (edge.length(), edge.to))
+    else {
         // The edge under the train vanished from the public graph map:
         // park it rather than panic on the index.
         let t = net.trains.get_mut(&id).expect("checked");
@@ -1449,9 +1783,48 @@ fn step_running(net: &mut RailNetwork, id: TrainId, events: &mut Vec<TransitEven
         events.push(TransitEvent::ReachedTerminus { train: id });
         return;
     };
-    let edge_len = edge.length();
+
+    // Train fields are public for integration tests and adapters. Clamp bad
+    // runtime mutations before they can propagate NaN/infinity into motion;
+    // invalid dynamic constants park the train fail-closed instead.
+    {
+        let t = net.trains.get_mut(&id).expect("checked");
+        if !(t.max_speed.is_finite() && t.max_speed > 0.0)
+            || !(t.accel.is_finite() && t.accel > 0.0)
+            || !(t.decel.is_finite() && t.decel > 0.0)
+        {
+            t.speed = 0.0;
+            t.state = TrainRunState::Terminus;
+            events.push(TransitEvent::ReachedTerminus { train: id });
+            return;
+        }
+        if !t.pos_s.is_finite() || t.pos_s < 0.0 {
+            t.pos_s = 0.0;
+            t.speed = 0.0;
+        } else if t.pos_s > edge_len {
+            t.pos_s = edge_len;
+            t.speed = 0.0;
+        }
+        if !t.speed.is_finite() || t.speed < 0.0 {
+            t.speed = 0.0;
+        } else if t.speed > t.max_speed {
+            t.speed = t.max_speed;
+        }
+    }
+
+    if !repair_route_if_broken(net, id, events) {
+        return;
+    }
+    let (pos_s, speed, target, next_via_route) = {
+        let t = net.trains.get(&id).expect("checked");
+        (
+            t.pos_s,
+            t.speed,
+            t.target.as_ref().map(|target| (target.edge, target.s)),
+            t.route.front().copied(),
+        )
+    };
     let remaining = (edge_len - pos_s).max(0.0);
-    let head_node = edge.to;
 
     let mut dist_to_stop = f64::INFINITY;
     let mut stop_kind = StopKind::None;
@@ -1558,12 +1931,25 @@ fn can_enter(net: &RailNetwork, edge: EdgeId, train: TrainId) -> bool {
     let Some(e) = net.graph.edges.get(&edge) else {
         return false;
     };
-    t.gauge().is_compatible_with(&e.gauge) && net.signal_aspect_for(edge, train) == SignalAspect::Green
+    let Some(current) = net.graph.edges.get(&t.pos_edge) else {
+        return false;
+    };
+    // A decoded or externally mutated route must never teleport the train
+    // onto a disconnected edge that merely exists somewhere in the graph.
+    e.from == current.to
+        && t.gauge().is_compatible_with(&e.gauge)
+        && net.signal_aspect_for(edge, train) == SignalAspect::Green
 }
 
 /// Move the head `d` blocks along the route, crossing nodes only through
 /// passable edges; clamps at a boundary that turned red mid-move.
 fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
+    // A cyclic free-running route plus an absurdly large finite speed must
+    // still terminate. At most one traversal of every edge plus the entry
+    // edge is physically meaningful for one fixed tick; beyond that the
+    // train is parked fail-closed at the node it just reached.
+    let max_crossings = net.graph.edges.len().saturating_add(1);
+    let mut crossings = 0usize;
     loop {
         let (pos_edge, pos_s) = {
             let t = net.trains.get(&id).expect("checked");
@@ -1576,7 +1962,10 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
             t.speed = 0.0;
             return;
         };
-        if pos_s + d <= edge_len + 1e-9 {
+        let remaining_on_edge = edge_len - pos_s;
+        // Compare distances instead of forming `pos_s + d`: hostile finite
+        // values near `f64::MAX` must not overflow or lose all precision.
+        if d <= remaining_on_edge + 1e-9 {
             let t = net.trains.get_mut(&id).expect("checked");
             t.pos_s = (pos_s + d).min(edge_len);
             return;
@@ -1592,7 +1981,10 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
         };
         match next {
             Some(ne) if can_enter(net, ne, id) => {
-                d -= edge_len - pos_s;
+                let before = d;
+                d -= remaining_on_edge;
+                crossings += 1;
+                let representable_progress = d < before;
                 let t = net.trains.get_mut(&id).expect("checked");
                 t.history.push_back(pos_edge);
                 if t.route.front() == Some(&ne) {
@@ -1626,6 +2018,15 @@ fn advance(net: &mut RailNetwork, id: TrainId, mut d: f64) {
                     .and_then(|e| net.graph.nodes.get(&e.from))
                     .map(|n| n.dim.clone())
                     .unwrap_or_else(|| t.current_dim.clone());
+                if !representable_progress || crossings > max_crossings {
+                    // Either subtraction stopped making numeric progress at
+                    // extreme magnitude, or a cyclic graph let one tick lap
+                    // the whole network. Both are outside meaningful fixed
+                    // tick movement; park at the reached node rather than
+                    // spinning forever.
+                    t.speed = 0.0;
+                    return;
+                }
             }
             _ => {
                 let t = net.trains.get_mut(&id).expect("checked");
@@ -1811,16 +2212,23 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
         if !pos.iter().all(|v| v.is_finite()) {
             return Err(corrupt("non-finite node pos"));
         }
-        net.graph.nodes.insert(
-            id,
-            TrackNode {
+        if net
+            .graph
+            .nodes
+            .insert(
                 id,
-                dim,
-                pos,
-                out_edges: BTreeSet::new(),
-                in_edges: BTreeSet::new(),
-            },
-        );
+                TrackNode {
+                    id,
+                    dim,
+                    pos,
+                    out_edges: BTreeSet::new(),
+                    in_edges: BTreeSet::new(),
+                },
+            )
+            .is_some()
+        {
+            return Err(corrupt("duplicate node id"));
+        }
     }
     let n_edges = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad edge count"))?;
     for _ in 0..n_edges {
@@ -1848,8 +2256,11 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             .map(CubicBezierSegment::new)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| corrupt("degenerate edge geometry"))?;
-        let edge = TrackEdge::new(id, from, to, gauge, segs)
-            .map_err(|_| corrupt("degenerate edge"))?;
+        let edge =
+            TrackEdge::new(id, from, to, gauge, segs).map_err(|_| corrupt("degenerate edge"))?;
+        if net.graph.edges.contains_key(&id) {
+            return Err(corrupt("duplicate edge id"));
+        }
         net.graph
             .nodes
             .get_mut(&from)
@@ -1861,15 +2272,24 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
     for _ in 0..n_sw {
         let n = NodeId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated switch"))?);
         let e = EdgeId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated switch"))?);
-        let node = net.graph.nodes.get(&n).ok_or_else(|| corrupt("switch node missing"))?;
+        let node = net
+            .graph
+            .nodes
+            .get(&n)
+            .ok_or_else(|| corrupt("switch node missing"))?;
         if !node.out_edges.contains(&e) {
             return Err(corrupt("switch edge not outgoing"));
         }
-        net.graph.switches.insert(n, e);
+        if net.graph.switches.insert(n, e).is_some() {
+            return Err(corrupt("duplicate switch entry"));
+        }
     }
     let n_blocks = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad block count"))?;
     for _ in 0..n_blocks {
         let id = BlockId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated block"))?);
+        if net.blocks.contains_key(&id) {
+            return Err(corrupt("duplicate block id"));
+        }
         let n_be = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad block edge count"))?;
         let mut edges = BTreeSet::new();
         for _ in 0..n_be {
@@ -1877,20 +2297,31 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             if !net.graph.edges.contains_key(&e) {
                 return Err(corrupt("block references unknown edge"));
             }
+            if net.edge_block.contains_key(&e) || !edges.insert(e) {
+                return Err(corrupt("edge assigned to multiple signal blocks"));
+            }
             net.edge_block.insert(e, id);
-            edges.insert(e);
         }
         let occ = r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated occupancy"))?;
         let res = r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated occupancy"))?;
-        net.blocks.insert(
-            id,
-            SignalBlock {
+        let occupied_by = (occ != NO_TRAIN).then_some(TrainId(occ));
+        let occupants = occupied_by.into_iter().collect();
+        if net
+            .blocks
+            .insert(
                 id,
-                edges,
-                occupied_by: (occ != NO_TRAIN).then_some(TrainId(occ)),
-                reserved_by: (res != NO_TRAIN).then_some(TrainId(res)),
-            },
-        );
+                SignalBlock {
+                    id,
+                    edges,
+                    occupants,
+                    occupied_by,
+                    reserved_by: (res != NO_TRAIN).then_some(TrainId(res)),
+                },
+            )
+            .is_some()
+        {
+            return Err(corrupt("duplicate block id"));
+        }
     }
     let n_sig = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad signal count"))?;
     for _ in 0..n_sig {
@@ -1903,12 +2334,14 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             1 => SignalKind::Chain,
             _ => return Err(corrupt("bad signal kind")),
         };
-        net.signals.insert(e, Signal { kind });
+        if net.signals.insert(e, Signal { kind }).is_some() {
+            return Err(corrupt("duplicate signal entry"));
+        }
     }
     let n_st = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad station count"))?;
     for _ in 0..n_st {
-        let name =
-            read_mc_string(bytes, &mut c, MAX_NAME_LEN).ok_or_else(|| corrupt("bad station name"))?;
+        let name = read_mc_string(bytes, &mut c, MAX_NAME_LEN)
+            .ok_or_else(|| corrupt("bad station name"))?;
         let edge = EdgeId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated station"))?);
         let s = r_f64(bytes, &mut c).ok_or_else(|| corrupt("truncated station"))?;
         let len = net
@@ -1920,11 +2353,20 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
         if !(s.is_finite() && s >= 0.0 && s <= len) {
             return Err(corrupt("station anchor out of range"));
         }
-        net.stations.insert(name, StationAnchor { edge, s });
+        if net
+            .stations
+            .insert(name, StationAnchor { edge, s })
+            .is_some()
+        {
+            return Err(corrupt("duplicate station name"));
+        }
     }
     let n_trains = r_count(bytes, &mut c).ok_or_else(|| corrupt("bad train count"))?;
     for _ in 0..n_trains {
         let id = TrainId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated train"))?);
+        if net.trains.contains_key(&id) {
+            return Err(corrupt("duplicate train id"));
+        }
         let max_speed = r_f64(bytes, &mut c).ok_or_else(|| corrupt("truncated train"))?;
         let accel = r_f64(bytes, &mut c).ok_or_else(|| corrupt("truncated train"))?;
         let decel = r_f64(bytes, &mut c).ok_or_else(|| corrupt("truncated train"))?;
@@ -1971,7 +2413,8 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             });
         }
         let schedule_idx =
-            r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated schedule_idx"))? as usize;
+            usize::try_from(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated schedule_idx"))?)
+                .map_err(|_| corrupt("schedule_idx does not fit usize"))?;
         let state = match r_u8(bytes, &mut c).ok_or_else(|| corrupt("truncated state"))? {
             0 => TrainRunState::Running,
             1 => {
@@ -1998,11 +2441,9 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             1 => {
                 let station_name = read_mc_string(bytes, &mut c, MAX_NAME_LEN)
                     .ok_or_else(|| corrupt("bad target station"))?;
-                let edge =
-                    EdgeId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated target"))?);
+                let edge = EdgeId(r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated target"))?);
                 let s = r_f64(bytes, &mut c).ok_or_else(|| corrupt("truncated target"))?;
-                let wait_ticks =
-                    r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated target"))?;
+                let wait_ticks = r_u64(bytes, &mut c).ok_or_else(|| corrupt("truncated target"))?;
                 Some(StationTarget {
                     station_name,
                     edge,
@@ -2032,8 +2473,8 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
         if !pos_s.is_finite() || pos_s < 0.0 || pos_s > net.graph.edges[&pos_edge].length() {
             return Err(corrupt("train position out of range"));
         }
-        if !speed.is_finite() {
-            return Err(corrupt("non-finite train speed"));
+        if !speed.is_finite() || speed < 0.0 || speed > max_speed {
+            return Err(corrupt("train speed out of range"));
         }
         for e in route.iter().chain(history.iter()) {
             if !net.graph.edges.contains_key(e) {
@@ -2041,8 +2482,19 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
             }
         }
         if let Some(tg) = &target {
-            if !net.graph.edges.contains_key(&tg.edge) {
+            let Some(target_edge) = net.graph.edges.get(&tg.edge) else {
                 return Err(corrupt("target references unknown edge"));
+            };
+            if !tg.s.is_finite() || tg.s < 0.0 || tg.s > target_edge.length() {
+                return Err(corrupt("target anchor out of range"));
+            }
+            if net.stations.get(&tg.station_name)
+                != Some(&StationAnchor {
+                    edge: tg.edge,
+                    s: tg.s,
+                })
+            {
+                return Err(corrupt("target does not match station anchor"));
             }
         }
         let mut train = ArticulatedTrain::new(
@@ -2067,20 +2519,89 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
         train.target = target;
         train.route = route;
         train.history = history;
-        net.trains.insert(id, train);
+
+        let current_edge = &net.graph.edges[&pos_edge];
+        if !train.gauge().is_compatible_with(&current_edge.gauge) {
+            return Err(corrupt("train gauge incompatible with current edge"));
+        }
+        if net
+            .graph
+            .nodes
+            .get(&current_edge.from)
+            .is_some_and(|node| node.dim != train.current_dim)
+        {
+            return Err(corrupt("train dimension does not match current edge"));
+        }
+        for edge_id in train.route.iter().chain(train.history.iter()) {
+            let edge = &net.graph.edges[edge_id];
+            if !train.gauge().is_compatible_with(&edge.gauge) {
+                return Err(corrupt("train path gauge mismatch"));
+            }
+        }
+        let mut next_node = current_edge.to;
+        for edge_id in &train.route {
+            let edge = &net.graph.edges[edge_id];
+            if edge.from != next_node {
+                return Err(corrupt("train route is not connected"));
+            }
+            next_node = edge.to;
+        }
+        if let Some(target) = &train.target {
+            if train.route.is_empty() {
+                if target.edge != pos_edge || target.s + 1e-9 < pos_s {
+                    return Err(corrupt("empty route does not reach target"));
+                }
+            } else if train.route.back() != Some(&target.edge) {
+                return Err(corrupt("route does not end at target edge"));
+            }
+        }
+        for pair in train.history.iter().zip(train.history.iter().skip(1)) {
+            if net.graph.edges[pair.0].to != net.graph.edges[pair.1].from {
+                return Err(corrupt("train history is not connected"));
+            }
+        }
+        if let Some(last) = train.history.back() {
+            if net.graph.edges[last].to != current_edge.from {
+                return Err(corrupt("train history does not reach current edge"));
+            }
+        }
+        if net.trains.insert(id, train).is_some() {
+            return Err(corrupt("duplicate train id"));
+        }
     }
     if c != bytes.len() {
         return Err(corrupt("trailing bytes"));
     }
-    // Counters must cover every id actually in use.
-    let max_node = net.graph.nodes.keys().next_back().map(|n| n.0).unwrap_or(0);
-    let max_edge = net.graph.edges.keys().next_back().map(|e| e.0).unwrap_or(0);
-    let max_block = net.blocks.keys().next_back().map(|b| b.0).unwrap_or(0);
-    if net.graph.next_node <= max_node
-        || net.graph.next_edge <= max_edge
-        || net.next_block <= max_block
+    for block in net.blocks.values() {
+        for train in block
+            .occupants
+            .iter()
+            .copied()
+            .chain(block.occupied_by)
+            .chain(block.reserved_by)
+        {
+            if !net.trains.contains_key(&train) {
+                return Err(corrupt("block references unknown train"));
+            }
+        }
+        if block.occupied_by != block.occupants.iter().next().copied() {
+            return Err(corrupt("occupancy projection mismatch"));
+        }
+    }
+    // Counters must cover every id actually in use, while an empty network
+    // legitimately starts every counter at zero. `u64::MAX` is not usable as
+    // the next counter because allocating one more id would overflow.
+    let max_node = net.graph.nodes.keys().next_back().map(|n| n.0);
+    let max_edge = net.graph.edges.keys().next_back().map(|e| e.0);
+    let max_block = net.blocks.keys().next_back().map(|b| b.0);
+    if max_node.is_some_and(|max| net.graph.next_node <= max)
+        || max_edge.is_some_and(|max| net.graph.next_edge <= max)
+        || max_block.is_some_and(|max| net.next_block <= max)
+        || net.graph.next_node == u64::MAX
+        || net.graph.next_edge == u64::MAX
+        || net.next_block == u64::MAX
     {
-        return Err(corrupt("id counters below live ids"));
+        return Err(corrupt("id counters below live ids or exhausted"));
     }
     Ok(net)
 }
@@ -2091,8 +2612,6 @@ fn decode_payload(bytes: &[u8]) -> Result<RailNetwork, RailError> {
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     megu_core::hash::crc32_ieee(data)
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Vector & codec helpers
@@ -2159,11 +2678,7 @@ fn r_gauge(bytes: &[u8], c: &mut usize) -> Option<TrackGauge> {
         1 => Some(TrackGauge::Narrow),
         2 => Some(TrackGauge::Wide),
         3 => Some(TrackGauge::Monorail),
-        4 => Some(TrackGauge::Custom(read_mc_string(
-            bytes,
-            c,
-            MAX_NAME_LEN,
-        )?)),
+        4 => Some(TrackGauge::Custom(read_mc_string(bytes, c, MAX_NAME_LEN)?)),
         _ => None,
     }
 }
