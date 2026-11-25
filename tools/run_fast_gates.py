@@ -50,6 +50,7 @@ GATES = (
     "tools/general_defect_audit.py --strict",
     "tools/ui_consistency_audit.py --strict",
     "tests/ui_consistency_audit_test.py",
+    "tests/dist_feature_matrix_audit.py",
     "tests/strict_vanilla_parity_audit_test.py",
     "tests/payload_wiring_audit_test.py",
     "tools/payload_wiring_audit.py --strict",
