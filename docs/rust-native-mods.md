@@ -39,6 +39,7 @@ chat_broadcast = true
 | key | unlocks |
 | --- | --- |
 | `read_blocks` | `host_get_block`, `megu_section_rev`, `megu_chunk_rev` |
+| `ui_surface` | Mark `UiLayer::ModHud` / `UiLayer::ModOverlay` dirty via `megu_ui_mark_dirty` |
 | `write_blocks` | `host_set_block`, `megu_bump_block` |
 | `chat_broadcast` | `host_emit_chat` |
 
