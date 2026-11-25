@@ -52,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -69,6 +70,15 @@ DATA_PREFIX = "data/minecraft/"
 REQUIRED_REPORTS = ("blocks.json", "registries.json", "packets.json")
 ASSET_REL = "assets/block_states_1211.json"
 PACK_REL = "datapacks/vanilla"
+INTERMEDIARY_JAR = "intermediary-1.21.1-v2.jar"
+INTERMEDIARY_URL = "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.1/" + INTERMEDIARY_JAR
+INTERMEDIARY_SHA256 = "e8bd6a4c39e235ee2dc73063558610775c72a2572fa0c6b32915b149074012a6"
+YARN_JAR = "yarn-1.21.1+build.3-v2.jar"
+YARN_URL = "https://maven.fabricmc.net/net/fabricmc/yarn/1.21.1+build.3/" + YARN_JAR
+YARN_SHA256 = "4ec570889585cb958b7d3c9dd94ce4064b16ab797dffec152bc8486c59a4010b"
+PHYSICAL_ASSET_KEYS = (
+    "blocks", "flags", "luminance", "light_block", "full_sides", "shapes", "collision_shapes"
+)
 DATAGEN_TIMEOUT_SECONDS = 600
 
 
@@ -409,7 +419,43 @@ def write_manifest(out_dir, jar_info, members, report_hashes, asset_info):
     return manifest
 
 
-def verify_output(out_dir, jar_path=None):
+def physical_asset_schema_ok(asset):
+    """True only for the canonical physical-facts asset, never the report-only index."""
+    blocks = asset.get("blocks")
+    if not (isinstance(blocks, list) and blocks):
+        return False
+    if not all(
+        isinstance(row, list) and len(row) == 3 and isinstance(row[0], str)
+        and isinstance(row[1], (int, float)) and isinstance(row[2], (int, float))
+        for row in blocks
+    ):
+        return False
+    columns = []
+    for key in ("flags", "luminance", "light_block", "full_sides"):
+        column = asset.get(key)
+        if not (isinstance(column, list) and column
+                and all(isinstance(value, (int, float)) for value in column)):
+            return False
+        columns.append(column)
+    if len({len(column) for column in columns}) != 1:
+        return False
+    state_count = len(columns[0])
+    shapes = asset.get("shapes")
+    if not (isinstance(shapes, list) and shapes and all(
+        isinstance(shape, dict)
+        and isinstance(shape.get("min"), list) and len(shape["min"]) == 3
+        and isinstance(shape.get("max"), list) and len(shape["max"]) == 3
+        for shape in shapes
+    )):
+        return False
+    collision = asset.get("collision_shapes")
+    return (isinstance(collision, list) and len(collision) == state_count and all(
+        isinstance(entry, list) and all(isinstance(index, (int, float)) for index in entry)
+        for entry in collision
+    ))
+
+
+def verify_output(out_dir, jar_path=None, require_physical=False):
     out_dir = Path(out_dir)
     manifest_path = out_dir / MANIFEST_NAME
     if not manifest_path.is_file():
@@ -495,12 +541,129 @@ def verify_output(out_dir, jar_path=None):
         fail(f"{ASSET_REL} is not valid JSON: {error}")
     if "blocks" not in asset:
         fail(f"{ASSET_REL} has no block table")
+    if require_physical and not physical_asset_schema_ok(asset):
+        fail(f"{ASSET_REL} lacks the canonical physical-facts columns")
 
     return {
         "members": len(members),
         "reports": len(reports),
         "asset_bytes": asset_path.stat().st_size,
     }
+
+
+def sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def pinned_download(url, dest, expected_sha256):
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".part")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response, open(part, "wb") as out:
+            shutil.copyfileobj(response, out, 1024 * 256)
+        got = sha256_path(part)
+        if got != expected_sha256:
+            part.unlink(missing_ok=True)
+            fail(f"{dest.name} sha256 is {got}, expected pinned {expected_sha256}")
+        if dest.exists():
+            part.unlink(missing_ok=True)
+            fail(f"refusing to replace existing mapping jar {dest}")
+        os.replace(part, dest)
+    finally:
+        if part.exists() and dest.exists():
+            part.unlink(missing_ok=True)
+
+
+def ensure_mapping_jars(mappings_dir, fetch_mappings):
+    mappings_dir = Path(mappings_dir)
+    mappings_dir.mkdir(parents=True, exist_ok=True)
+    result = {}
+    for filename, url, digest in (
+        (INTERMEDIARY_JAR, INTERMEDIARY_URL, INTERMEDIARY_SHA256),
+        (YARN_JAR, YARN_URL, YARN_SHA256),
+    ):
+        path = mappings_dir / filename
+        if not path.is_file():
+            if not fetch_mappings:
+                fail(
+                    f"missing {path}; pass --fetch-mappings or place the pinned Fabric CC0 mapping jar there"
+                )
+            pinned_download(url, path, digest)
+        got = sha256_path(path)
+        if got != digest:
+            fail(f"{path} sha256 is {got}, expected pinned {digest}")
+        result[filename] = path
+    return result[INTERMEDIARY_JAR], result[YARN_JAR]
+
+
+def extract_tiny_mapping(jar_path, out_path):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(jar_path) as archive:
+            data = archive.read("mappings/mappings.tiny")
+    except (KeyError, zipfile.BadZipFile) as error:
+        fail(f"{jar_path} does not contain mappings/mappings.tiny: {error}")
+    out_path.write_bytes(data)
+    return out_path
+
+
+def run_checked(command, cwd=None, timeout=240, label="command"):
+    result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        tail = ((result.stderr or result.stdout or "").strip().splitlines())[-20:]
+        fail(label + " failed:\n" + "\n".join(tail))
+    return result
+
+
+def generate_physical_block_states(jar_path, work_dir, reports_dir, out_dir, mappings_dir, fetch_mappings):
+    """Use Extract.java + the pinned CC0 mappings to replace the report-only state index."""
+    tool_dir = Path(__file__).resolve().parent
+    extract_java = tool_dir / "Extract.java"
+    build_py = tool_dir / "build_vanilla_data.py"
+    if not extract_java.is_file() or not build_py.is_file():
+        fail("Extract.java and build_vanilla_data.py must be beside gen_vanilla_data.py for --full-runtime")
+    if shutil.which("java") is None:
+        fail("java was not found on PATH; physical block-state extraction requires Java 21")
+    inter_jar, yarn_jar = ensure_mapping_jars(mappings_dir, fetch_mappings)
+    map_dir = Path(work_dir) / "mappings"
+    inter_tiny = extract_tiny_mapping(inter_jar, map_dir / "intermediary.tiny")
+    yarn_tiny = extract_tiny_mapping(yarn_jar, map_dir / "yarn.tiny")
+
+    run_dir = Path(work_dir) / "run"
+    nested = run_dir / "versions/1.21.1/server-1.21.1.jar"
+    if not nested.is_file():
+        fail(f"the bundler did not unpack {nested}")
+    libraries = sorted((run_dir / "libraries").rglob("*.jar"))
+    if not libraries:
+        fail("the bundler did not unpack its server libraries")
+    extract_out = Path(work_dir) / "extract"
+    extract_out.mkdir(parents=True, exist_ok=True)
+    run_checked(
+        [
+            "java",
+            str(extract_java),
+            str(extract_out),
+            str(inter_tiny),
+            str(yarn_tiny),
+            str(nested),
+            *[str(path) for path in libraries],
+        ],
+        timeout=240,
+        label="vanilla physical-facts extraction",
+    )
+    extraction_sha1 = sha1_file(jar_path)
+    run_checked(
+        [sys.executable, str(build_py), str(extract_out), str(reports_dir), str(out_dir), extraction_sha1],
+        timeout=120,
+        label="canonical block-state assembly",
+    )
+    asset_path = Path(out_dir) / ASSET_REL
+    return {"action": "written-full", "sha256": sha256_file(asset_path)}
 
 
 def finish_generation(jar_path, out_dir, extraction, reports_src):
@@ -519,13 +682,32 @@ def finish_generation(jar_path, out_dir, extraction, reports_src):
     return {"manifest": manifest, "summary": summary, "asset": asset_info}
 
 
-def generate(jar_path, out_dir):
+def generate(jar_path, out_dir, full_runtime=False, mappings_dir=None, fetch_mappings=False):
     jar_path = Path(jar_path)
     out_dir = Path(out_dir)
     extraction = extract_datapack(jar_path, out_dir)
     with tempfile.TemporaryDirectory(prefix="mc-vanilla-data-") as tmp:
-        reports_src = run_datagen(jar_path, Path(tmp))
-        return finish_generation(jar_path, out_dir, extraction, reports_src)
+        work_dir = Path(tmp)
+        reports_src = run_datagen(jar_path, work_dir)
+        result = finish_generation(jar_path, out_dir, extraction, reports_src)
+        if full_runtime:
+            if mappings_dir is None:
+                fail("--full-runtime requires --mappings-dir")
+            reports_installed = out_dir / "reports"
+            asset_info = generate_physical_block_states(
+                jar_path, work_dir, reports_installed, out_dir, mappings_dir, fetch_mappings
+            )
+            manifest = write_manifest(
+                out_dir,
+                dict(extraction["jar"], pack_mcmeta_sha256=extraction["pack_mcmeta_sha256"]),
+                extraction["members"],
+                result["manifest"]["reports"],
+                asset_info,
+            )
+            result["asset"] = asset_info
+            result["manifest"] = manifest
+            result["summary"] = verify_output(out_dir, jar_path=jar_path, require_physical=True)
+        return result
 
 
 # ---- --self-test ------------------------------------------------------------
@@ -623,7 +805,33 @@ def self_test():
         if finished["summary"]["members"] != 2 or finished["summary"]["reports"] != 3:
             fail("self-test: manifest verification counted the wrong outputs")
         verify_output(final_out, jar_path=clean_jar)
-    print("self-test: PASS (traversal rejection, bundled/direct extraction, reports, state index, verify)")
+        report_only = json.loads((final_out / ASSET_REL).read_text())
+        if physical_asset_schema_ok(report_only):
+            fail("self-test: report-only state index passed the physical-facts schema gate")
+        canonical_probe = {
+            "blocks": [["minecraft:stone", 1, 1]],
+            "flags": [8],
+            "luminance": [0],
+            "light_block": [15],
+            "full_sides": [63],
+            "shapes": [{"min": [0, 0, 0], "max": [1, 1, 1]}],
+            "collision_shapes": [[0]],
+        }
+        if not physical_asset_schema_ok(canonical_probe):
+            fail("self-test: physical-facts schema probe was rejected")
+        try:
+            ensure_mapping_jars(root / "missing-mappings", False)
+        except VanillaDataError:
+            pass
+        else:
+            fail("self-test: missing pinned mappings did not fail closed")
+        mapping_jar = root / "mapping.jar"
+        with zipfile.ZipFile(mapping_jar, "w") as archive:
+            archive.writestr("mappings/mappings.tiny", "tiny\t2\t0\tofficial\tintermediary\n")
+        tiny = extract_tiny_mapping(mapping_jar, root / "tiny-out" / "mapping.tiny")
+        if "intermediary" not in tiny.read_text():
+            fail("self-test: mapping tiny extraction lost its payload")
+    print("self-test: PASS (traversal rejection, bundled/direct extraction, reports, state index, schema/mapping gates, verify)")
     return 0
 
 
@@ -635,6 +843,9 @@ def main(argv=None):
     parser.add_argument("--out-dir", type=Path, default=Path("."), help="output root (default: .)")
     parser.add_argument("--verify", action="store_true", help="verify an existing output tree")
     parser.add_argument("--self-test", action="store_true", help="run the clean-room self-test")
+    parser.add_argument("--full-runtime", action="store_true", help="also derive the canonical physical block-state asset through Extract.java")
+    parser.add_argument("--mappings-dir", type=Path, help="directory containing pinned Fabric CC0 mapping jars")
+    parser.add_argument("--fetch-mappings", action="store_true", help="download the pinned CC0 mapping jars when absent")
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -653,7 +864,13 @@ def main(argv=None):
     if args.jar is None:
         parser.error("--jar is required unless --verify or --self-test is used")
     try:
-        result = generate(args.jar, args.out_dir)
+        result = generate(
+            args.jar,
+            args.out_dir,
+            full_runtime=args.full_runtime,
+            mappings_dir=args.mappings_dir,
+            fetch_mappings=args.fetch_mappings,
+        )
     except (VanillaDataError, PackError, OSError, ValueError, zipfile.BadZipFile) as error:
         print(f"vanilla data: FAILED {error}", file=sys.stderr)
         return 1

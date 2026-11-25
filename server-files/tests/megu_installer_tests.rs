@@ -5,13 +5,13 @@
 //! layout, the dedicated-server layout with scripts and a never-forced
 //! EULA, and the fail-closed traversal/version/symlink matrix.
 
+use megu_core::version::TargetVersion;
 use megu_server_files::installer::{
-    self, ClientInstallOptions, OsKind, ServerInstallOptions, BOOTSTRAP_LIBRARY_REL,
-    BOOTSTRAP_PATCH_FILE, LAUNCHER_PROFILES_FILE, LAUNCHER_PROFILES_STORE_FILE,
+    self, BOOTSTRAP_LIBRARY_REL, BOOTSTRAP_PATCH_FILE, ClientInstallOptions,
+    LAUNCHER_PROFILES_FILE, LAUNCHER_PROFILES_STORE_FILE, OsKind, ServerInstallOptions,
 };
 use megu_server_files::json::{self, Json};
-use megu_server_files::{check_eula, EulaStatus, CLIENT_STANDARD_FOLDERS};
-use megu_core::version::TargetVersion;
+use megu_server_files::{CLIENT_STANDARD_FOLDERS, EulaStatus, check_eula};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,7 +59,8 @@ fn read_json(path: &Path) -> Json {
 }
 
 fn get<'a>(doc: &'a Json, key: &str) -> &'a Json {
-    doc.get(key).unwrap_or_else(|| panic!("missing {key} in {doc:?}"))
+    doc.get(key)
+        .unwrap_or_else(|| panic!("missing {key} in {doc:?}"))
 }
 
 fn client_options() -> ClientInstallOptions {
@@ -139,7 +140,9 @@ fn official_launcher_install_upgrade_uninstall_across_windows_macos_linux_paths(
     );
     assert_eq!(
         installer::detect_minecraft_dir_for_os(OsKind::MacOs, home, None),
-        home.join("Library").join("Application Support").join("minecraft")
+        home.join("Library")
+            .join("Application Support")
+            .join("minecraft")
     );
     assert_eq!(
         installer::detect_minecraft_dir_for_os(OsKind::Linux, home, None),
@@ -264,7 +267,11 @@ fn official_launcher_install_upgrade_uninstall_across_windows_macos_linux_paths(
         assert!(!profiles.iter().any(|(k, _)| k == "megu-1.21.1"), "{name}");
     }
     let std_profiles = read_json(&mc_dir.join(LAUNCHER_PROFILES_FILE));
-    assert!(profile_entry(&std_profiles, "vanilla prof").get("name").is_some());
+    assert!(
+        profile_entry(&std_profiles, "vanilla prof")
+            .get("name")
+            .is_some()
+    );
     assert_eq!(
         get(&std_profiles, "selectedProfile"),
         &Json::String("vanilla prof".into())
@@ -310,9 +317,7 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
     );
     assert_eq!(
         installer::resolve_prism_instances_dir(OsKind::Linux, home, None, None, |p| p
-            == home.join(
-                ".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances"
-            )),
+            == home.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances")),
         home.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances")
     );
     assert_eq!(
@@ -345,8 +350,14 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
     assert_eq!(get(&mmc, "formatVersion"), &Json::Number(1.0));
     let components = get(&mmc, "components").as_array().unwrap();
     assert_eq!(components.len(), 2);
-    assert_eq!(get(&components[0], "uid"), &Json::String("net.minecraft".into()));
-    assert_eq!(get(&components[0], "version"), &Json::String("1.21.1".into()));
+    assert_eq!(
+        get(&components[0], "uid"),
+        &Json::String("net.minecraft".into())
+    );
+    assert_eq!(
+        get(&components[0], "version"),
+        &Json::String("1.21.1".into())
+    );
     assert_eq!(get(&components[0], "important"), &Json::Bool(true));
     assert_eq!(
         get(&components[1], "uid"),
@@ -366,12 +377,16 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
     );
     assert_eq!(get(&libs[0], "MMC-hint"), &Json::String("local".into()));
     let jvm_args = get(&patch, "+jvmArgs").as_array().unwrap();
-    assert!(jvm_args
-        .iter()
-        .any(|a| a.as_str().unwrap().starts_with("-Dmegu.clientBin=")));
-    assert!(jvm_args
-        .iter()
-        .any(|a| a.as_str().unwrap() == format!("-Dmegu.clientSha256={client_sha}")));
+    assert!(
+        jvm_args
+            .iter()
+            .any(|a| a.as_str().unwrap().starts_with("-Dmegu.clientBin="))
+    );
+    assert!(
+        jvm_args
+            .iter()
+            .any(|a| a.as_str().unwrap() == format!("-Dmegu.clientSha256={client_sha}"))
+    );
     assert_eq!(
         std::fs::read(instance.join("libraries").join(BOOTSTRAP_LIBRARY_REL)).unwrap(),
         b"PK\x03\x04fake-jar"
@@ -406,7 +421,12 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
     let components = get(&mmc, "components").as_array().unwrap();
     assert_eq!(components.len(), 1);
     assert_eq!(get(&components[0], "version"), &Json::String("26.3".into()));
-    assert!(!wrap_instance.join("patches").join(BOOTSTRAP_PATCH_FILE).exists());
+    assert!(
+        !wrap_instance
+            .join("patches")
+            .join(BOOTSTRAP_PATCH_FILE)
+            .exists()
+    );
     assert!(wrap_instance.join("bin/megu-client").is_file());
     for folder in CLIENT_STANDARD_FOLDERS {
         assert!(
@@ -452,11 +472,17 @@ fn server_install_creates_standard_layout_run_scripts_and_never_auto_accepts_eul
     assert!(!sh.contains(&b'\r'), "run.sh must be LF-only");
     assert!(sh.starts_with(b"#!/bin/sh"), "run.sh shebang");
     assert!(sh.windows(9).any(|w| w == b"eula=true"), "run.sh EULA gate");
-    assert!(sh.windows(4).any(|w| w == b"\"$@\""), "run.sh forwards args");
+    assert!(
+        sh.windows(4).any(|w| w == b"\"$@\""),
+        "run.sh forwards args"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(run_sh.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            run_sh.metadata().unwrap().permissions().mode() & 0o777,
+            0o755
+        );
         let staged = dir.join("megu");
         assert_eq!(
             staged.metadata().unwrap().permissions().mode() & 0o111,
@@ -476,15 +502,24 @@ fn server_install_creates_standard_layout_run_scripts_and_never_auto_accepts_eul
         "all lines present"
     );
     assert!(bat_text.contains("\r\n"));
-    assert!(!bat_text.replace("\r\n", "").contains('\n'), "every line ends CRLF");
+    assert!(
+        !bat_text.replace("\r\n", "").contains('\n'),
+        "every line ends CRLF"
+    );
     assert!(bat_text.contains("eula=true"), "run.bat EULA gate");
-    assert!(bat_text.contains("megu.exe %*"), "run.bat launches megu.exe");
+    assert!(
+        bat_text.contains("megu.exe %*"),
+        "run.bat launches megu.exe"
+    );
 
     let readme = std::fs::read_to_string(dir.join("README-SERVER.txt")).unwrap();
     assert!(readme.to_ascii_lowercase().contains("eula"), "{readme}");
 
     // The staged server binary is byte-identical to the input.
-    assert_eq!(std::fs::read(dir.join("megu")).unwrap(), std::fs::read(&fake_bin).unwrap());
+    assert_eq!(
+        std::fs::read(dir.join("megu")).unwrap(),
+        std::fs::read(&fake_bin).unwrap()
+    );
 
     // The generated run.sh genuinely refuses before the EULA is accepted.
     #[cfg(unix)]
@@ -579,23 +614,27 @@ fn installer_fails_closed_on_traversal_bad_version_and_symlink_targets() {
         std::fs::write(&bin_target, b"x").unwrap();
         let bin_link = scratch.path().join("bin-link");
         std::os::unix::fs::symlink(&bin_target, &bin_link).unwrap();
-        assert!(installer::install_server(
-            &scratch.path().join("s2"),
-            &ServerInstallOptions {
-                mc_version: TargetVersion::V1_21_1,
-                server_bin: Some(bin_link),
-            },
-        )
-        .is_err());
+        assert!(
+            installer::install_server(
+                &scratch.path().join("s2"),
+                &ServerInstallOptions {
+                    mc_version: TargetVersion::V1_21_1,
+                    server_bin: Some(bin_link),
+                },
+            )
+            .is_err()
+        );
         // A directory is not a binary either.
-        assert!(installer::install_server(
-            &scratch.path().join("s3"),
-            &ServerInstallOptions {
-                mc_version: TargetVersion::V1_21_1,
-                server_bin: Some(real.clone()),
-            },
-        )
-        .is_err());
+        assert!(
+            installer::install_server(
+                &scratch.path().join("s3"),
+                &ServerInstallOptions {
+                    mc_version: TargetVersion::V1_21_1,
+                    server_bin: Some(real.clone()),
+                },
+            )
+            .is_err()
+        );
     }
 
     // Traversal and symlinks are refused in the client lane too.
@@ -626,7 +665,9 @@ fn installer_fails_closed_on_traversal_bad_version_and_symlink_targets() {
         let outside = scratch.path().join("outside-versions");
         std::fs::create_dir(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, mc_versions_dir.join("versions")).unwrap();
-        assert!(installer::install_client(&mc_versions_dir, &client_options(), false, NOW).is_err());
+        assert!(
+            installer::install_client(&mc_versions_dir, &client_options(), false, NOW).is_err()
+        );
         assert!(!outside.join("megu-1.21.1").exists());
     }
 
@@ -657,12 +698,18 @@ fn cli_help_version_json_and_usage_errors() {
         "--minecraft-dir",
         mc.to_str().unwrap(),
         "--json",
+        "--no-runtime-data",
     ]);
     assert!(out.status.success(), "{:?}", out.stderr);
     let report = json::parse(&String::from_utf8(out.stdout).unwrap()).unwrap();
     assert_eq!(get(&report, "command"), &Json::String("client".into()));
     assert_eq!(get(&report, "mc_version"), &Json::String("1.21.1".into()));
-    assert!(mc.join("versions").join("megu-1.21.1").join("megu-1.21.1.json").is_file());
+    assert!(
+        mc.join("versions")
+            .join("megu-1.21.1")
+            .join("megu-1.21.1.json")
+            .is_file()
+    );
 
     let out = run_installer(&[
         "uninstall",
@@ -684,6 +731,43 @@ fn cli_help_version_json_and_usage_errors() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+#[test]
+fn cli_fresh_install_fails_closed_without_runtime_data_consent() {
+    let scratch = Scratch::new();
+    let mc = scratch.path().join("fresh-mc");
+    let out = run_installer(&[
+        "client",
+        "--minecraft-dir",
+        mc.to_str().unwrap(),
+        "--no-profile",
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{:?}", out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("integrated-singleplayer runtime data is missing"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--accept-eula"), "{stderr}");
+    assert!(!mc.join("versions").join("megu-1.21.1").exists());
+
+    let out = run_installer(&[
+        "client",
+        "--minecraft-dir",
+        mc.to_str().unwrap(),
+        "--no-profile",
+        "--json",
+        "--no-runtime-data",
+    ]);
+    assert!(out.status.success(), "{:?}", out.stderr);
+    assert!(
+        mc.join("versions")
+            .join("megu-1.21.1")
+            .join("megu-1.21.1.json")
+            .is_file()
+    );
+}
+
 /// A failed auto-download must say why on stderr instead of silently
 /// returning `None`. Point MEGU_GITHUB_REPO at a repo that cannot serve a
 /// release so curl/wget fail deterministically (offline hosts fail the same
@@ -697,7 +781,7 @@ fn cli_auto_fetch_failure_logs_reason_and_install_continues() {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&work).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_megu-installer"))
-        .args(["client"])
+        .args(["client", "--no-runtime-data"])
         .current_dir(&work)
         .env("HOME", &home)
         .env("MEGU_GITHUB_REPO", "megu-test/no-such-repo-release-test")

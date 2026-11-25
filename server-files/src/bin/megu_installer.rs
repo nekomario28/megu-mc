@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! `megu-installer`: the zero-Java native installer — Official Launcher,
+//! `megu-installer`: the native installer — Official Launcher,
 //! Prism Launcher and dedicated-server lanes.
 //!
-//! Pure `std` plus `megu-core`: the binary shares the crate's
-//! zero-dependency contract, so it runs on a Windows box with no Java and
-//! broken `.jar` associations exactly like the Fabric `.exe` installer.
+//! Pure `std` plus `megu-core`: the installer lanes share the crate's
+//! zero-dependency contract, so profile/instance setup runs on a Windows box
+//! with no Java and broken `.jar` associations exactly like the Fabric `.exe`
+//! installer. Explicit integrated-singleplayer runtime-data generation
+//! separately uses Python 3 plus Java 21 on the user's pinned official jar.
 //!
 //! Exit codes: `0` success, `2` bad command line, `1` a file-level
 //! failure (unsafe or unreadable target).
@@ -16,10 +18,11 @@ use megu_server_files::installer::{
     self, ClientInstallOptions, InstallReport, ServerInstallOptions,
 };
 use megu_server_files::json::Json;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const HELP: &str = "megu-installer — install Megu like the Fabric/NeoForge installers, no Java needed\n\
+const HELP: &str = "megu-installer — install Megu like the Fabric/NeoForge installers\n\
 \n\
 USAGE:\n\
     megu-installer [client|gui] [--minecraft-dir <dir>] [--mc-version 1.21.1|26.3]\n\
@@ -51,6 +54,14 @@ COMMANDS:\n\
     uninstall   Remove the megu-<mc> version directory and its launcher\n\
                 profile entries; every other profile is preserved.\n\
 \n\
+INTEGRATED SINGLEPLAYER RUNTIME DATA:\n\
+    config_packets.bin, the canonical physical block-state asset and the\n\
+    vanilla datapack are required by default. If they are missing the\n\
+    installer fails closed instead of creating a half-working profile.\n\
+    Generation is opt-in through --accept-eula plus a user-supplied or\n\
+    Mojang-downloaded pinned 1.21.1 server jar. It uses Python 3 and Java 21\n\
+    locally; --no-runtime-data is the explicit multiplayer-only escape.\n\
+\n\
 OPTIONS:\n\
     --minecraft-dir <dir>  Minecraft directory (default: the OS-standard one)\n\
     --instances-dir <dir>  Prism instances directory (default: OS-standard)\n\
@@ -61,6 +72,19 @@ OPTIONS:\n\
                            automatically and written into the profile)\n\
     --client-sha256 <hex>  Expected SHA-256 of --client-bin (64 hex digits)\n\
     --server-bin <path>    Stage a native server binary as megu/megu.exe\n\
+    --vanilla-server-jar <path>\n\
+                           Use your official 1.21.1 server jar to generate\n\
+                           integrated-singleplayer runtime data\n\
+    --download-vanilla-server\n\
+                           Download that jar from Mojang's pinned object URL\n\
+                           when no user-supplied/cached copy is available;\n\
+                           also permits pinned CC0 mapping downloads needed\n\
+                           for physical block-state generation\n\
+    --accept-eula          You accept https://aka.ms/MinecraftEULA and allow\n\
+                           one local offline vanilla-server run to capture\n\
+                           registry data (never implied or automatic)\n\
+    --no-runtime-data      Explicitly install without integrated-singleplayer\n\
+                           runtime data (multiplayer-only; not the default)\n\
     --no-profile           Skip launcher_profiles.json edits\n\
     --json                 Print the report as JSON instead of text\n";
 
@@ -95,6 +119,10 @@ struct Cli {
     client_sha256: Option<String>,
     bootstrap_jar: Option<PathBuf>,
     server_bin: Option<PathBuf>,
+    vanilla_server_jar: Option<PathBuf>,
+    download_vanilla_server: bool,
+    accept_eula: bool,
+    no_runtime_data: bool,
     no_profile: bool,
     json: bool,
 }
@@ -126,6 +154,10 @@ fn parse(args: &[String]) -> Result<Cli, String> {
         client_sha256: None,
         bootstrap_jar: None,
         server_bin: None,
+        vanilla_server_jar: None,
+        download_vanilla_server: false,
+        accept_eula: false,
+        no_runtime_data: false,
         no_profile: false,
         json: false,
     };
@@ -144,16 +176,32 @@ fn parse(args: &[String]) -> Result<Cli, String> {
                 matches!(command, Command::Client | Command::Prism)
             }
             "--server-bin" => command == Command::Server,
+            "--vanilla-server-jar"
+            | "--download-vanilla-server"
+            | "--accept-eula"
+            | "--no-runtime-data" => {
+                matches!(command, Command::Client | Command::Prism | Command::Server)
+            }
             "--mc-version" | "--json" => true,
             "--no-profile" => matches!(command, Command::Client | Command::Uninstall),
             _ => false,
         };
         if !allowed {
-            return Err(format!("unrecognized argument {flag:?} for {}", command.name()));
+            return Err(format!(
+                "unrecognized argument {flag:?} for {}",
+                command.name()
+            ));
         }
         match flag {
-            "--minecraft-dir" | "--instances-dir" | "--dir" | "--client-bin"
-            | "--client-sha256" | "--bootstrap-jar" | "--server-bin" | "--mc-version" => {
+            "--minecraft-dir"
+            | "--instances-dir"
+            | "--dir"
+            | "--client-bin"
+            | "--client-sha256"
+            | "--bootstrap-jar"
+            | "--server-bin"
+            | "--vanilla-server-jar"
+            | "--mc-version" => {
                 index += 1;
                 let value = rest
                     .get(index)
@@ -165,10 +213,14 @@ fn parse(args: &[String]) -> Result<Cli, String> {
                     "--client-bin" => cli.client_bin = Some(path_value(flag, value)?),
                     "--bootstrap-jar" => cli.bootstrap_jar = Some(path_value(flag, value)?),
                     "--server-bin" => cli.server_bin = Some(path_value(flag, value)?),
+                    "--vanilla-server-jar" => {
+                        cli.vanilla_server_jar = Some(path_value(flag, value)?)
+                    }
                     "--client-sha256" => {
-                        cli.client_sha256 = Some(installer::normalize_sha256_hex(value).map_err(
-                            |err| err.to_string(),
-                        )?);
+                        cli.client_sha256 = Some(
+                            installer::normalize_sha256_hex(value)
+                                .map_err(|err| err.to_string())?,
+                        );
                     }
                     "--mc-version" => {
                         cli.mc_version = TargetVersion::parse(value)
@@ -177,6 +229,9 @@ fn parse(args: &[String]) -> Result<Cli, String> {
                     _ => unreachable!(),
                 }
             }
+            "--download-vanilla-server" => cli.download_vanilla_server = true,
+            "--accept-eula" => cli.accept_eula = true,
+            "--no-runtime-data" => cli.no_runtime_data = true,
             "--no-profile" => cli.no_profile = true,
             "--json" => cli.json = true,
             _ => unreachable!(),
@@ -186,10 +241,23 @@ fn parse(args: &[String]) -> Result<Cli, String> {
     if command == Command::Server && cli.dir.is_none() {
         return Err("server requires --dir <path>".into());
     }
+    if cli.no_runtime_data
+        && (cli.accept_eula || cli.download_vanilla_server || cli.vanilla_server_jar.is_some())
+    {
+        return Err(
+            "--no-runtime-data conflicts with --accept-eula, --download-vanilla-server and --vanilla-server-jar"
+                .into(),
+        );
+    }
     Ok(cli)
 }
 
-fn report_json(command: Command, dir: &str, mc_version: TargetVersion, report: &InstallReport) -> Json {
+fn report_json(
+    command: Command,
+    dir: &str,
+    mc_version: TargetVersion,
+    report: &InstallReport,
+) -> Json {
     let actions = report
         .actions
         .iter()
@@ -205,14 +273,8 @@ fn report_json(command: Command, dir: &str, mc_version: TargetVersion, report: &
         .collect();
     Json::Object(vec![
         ("command".into(), Json::String(command.name().into())),
-        (
-            "dir".into(),
-            Json::String(dir.to_owned()),
-        ),
-        (
-            "mc_version".into(),
-            Json::String(mc_version.id().into()),
-        ),
+        ("dir".into(), Json::String(dir.to_owned())),
+        ("mc_version".into(), Json::String(mc_version.id().into())),
         ("summary".into(), Json::String(report.summary.clone())),
         ("actions".into(), Json::Array(actions)),
     ])
@@ -342,7 +404,11 @@ fn download_release_file(url: &str, dest: &std::path::Path) -> Option<()> {
         // The bundled curl.exe ships in System32 even when it is not on
         // PATH (e.g. older images or stripped environments).
         let curl_exe = std::env::var_os("SystemRoot")
-            .map(|root| std::path::Path::new(&root).join("System32").join("curl.exe"))
+            .map(|root| {
+                std::path::Path::new(&root)
+                    .join("System32")
+                    .join("curl.exe")
+            })
             .filter(|path| path.is_file())
             .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows\System32\curl.exe"));
         if curl_exe.is_file() {
@@ -390,7 +456,7 @@ fn download_release_file(url: &str, dest: &std::path::Path) -> Option<()> {
 /// sibling `megu-client-gpu` / `megu-bootstrapper.jar` next to it) against the
 /// real OS default directory, automatically fetch and verify the release bundle
 /// from GitHub Releases into `<base_dir>/megu-runtime/`.
-fn auto_fetch_release_bundle(base_dir: & std::path::Path) -> Option<PathBuf> {
+fn auto_fetch_release_bundle(base_dir: &std::path::Path) -> Option<PathBuf> {
     if std::env::var_os("MEGU_NO_AUTO_FETCH").is_some() {
         return None;
     }
@@ -562,6 +628,495 @@ fn stage_into_mc_bin_dir(mc_dir: &std::path::Path, client_bin: &PathBuf) -> Opti
     Some(dest_client)
 }
 
+// ---------------------------------------------------------------------------
+// Integrated-singleplayer runtime data (fail closed, clean-room local inputs)
+// ---------------------------------------------------------------------------
+
+const VANILLA_SERVER_SHA1: &str = "59353fb40c36d304f2035d51e7d6e6baa98dc05c";
+const VANILLA_SERVER_URL: &str =
+    "https://piston-data.mojang.com/v1/objects/59353fb40c36d304f2035d51e7d6e6baa98dc05c/server.jar";
+
+// These are Megu's own clean-room generator/checker sources, embedded by
+// reference (not copied) so the installer remains usable from a bare release
+// binary. They contain no Mojang assets; at runtime they read only the user's
+// pinned official server jar and write generated data into that user's game
+// directory.
+const GEN_VANILLA_DATA_PY: &str = include_str!("../../../tools/vanilla_data/gen_vanilla_data.py");
+const VERSION_PACK_PY: &str = include_str!("../../../tools/vanilla_data/version_pack.py");
+const CAPTURE_CONFIG_PACKETS_PY: &str =
+    include_str!("../../../tools/vanilla_data/capture_config_packets.py");
+const BUILD_VANILLA_DATA_PY: &str =
+    include_str!("../../../tools/vanilla_data/build_vanilla_data.py");
+const EXTRACT_JAVA: &str = include_str!("../../../tools/vanilla_data/Extract.java");
+
+const RUNTIME_REQUIRED: [&str; 9] = [
+    "config_packets.bin",
+    "assets/block_states_1211.json",
+    "datapacks/vanilla/pack.mcmeta",
+    "datapacks/vanilla/data",
+    "datapacks/vanilla/data/minecraft",
+    "datapacks/vanilla/data/minecraft/worldgen",
+    "datapacks/vanilla/data/minecraft/worldgen/biome",
+    "datapacks/vanilla/data/minecraft/dimension_type",
+    "datapacks/vanilla/data/minecraft/tags/block",
+];
+
+fn invalid_runtime(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn canonical_block_state_asset_valid(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let limits = megu_core::json::JsonLimits {
+        max_nodes: 1_000_000,
+        max_bytes: 64 * 1024 * 1024,
+        ..Default::default()
+    };
+    let Ok(asset) = megu_core::json::parse_json_with_limits(&text, limits, false) else {
+        return false;
+    };
+    // The report-only generator index has `blocks` but none of the physical-facts
+    // columns. The server registry consumes those columns for lighting, collision,
+    // occlusion and state ordering, so they are part of the install contract.
+    let numeric_column = |key| {
+        asset
+            .get(key)
+            .and_then(Json::as_array)
+            .filter(|values| !values.is_empty() && values.iter().all(|v| v.as_f64().is_some()))
+    };
+    let flags = numeric_column("flags");
+    let luminance = numeric_column("luminance");
+    let light_block = numeric_column("light_block");
+    let full_sides = numeric_column("full_sides");
+    let collision_shapes = asset.get("collision_shapes").and_then(Json::as_array);
+    let shapes_valid = asset
+        .get("shapes")
+        .and_then(Json::as_array)
+        .is_some_and(|shapes| {
+            !shapes.is_empty()
+                && shapes.iter().all(|shape| {
+                    shape
+                        .get("min")
+                        .and_then(Json::as_array)
+                        .is_some_and(|v| v.len() == 3)
+                        && shape
+                            .get("max")
+                            .and_then(Json::as_array)
+                            .is_some_and(|v| v.len() == 3)
+                })
+        });
+    let blocks_valid = asset
+        .get("blocks")
+        .and_then(Json::as_array)
+        .is_some_and(|blocks| {
+            !blocks.is_empty()
+                && blocks.iter().all(|row| {
+                    row.as_array().is_some_and(|fields| {
+                        fields.len() == 3
+                            && fields[0].as_str().is_some()
+                            && fields[1].as_f64().is_some()
+                            && fields[2].as_f64().is_some()
+                    })
+                })
+        });
+    let column_len = flags.map(|v| v.len());
+    blocks_valid
+        && shapes_valid
+        && column_len.is_some()
+        && luminance.is_some_and(|v| Some(v.len()) == column_len)
+        && light_block.is_some_and(|v| Some(v.len()) == column_len)
+        && full_sides.is_some_and(|v| Some(v.len()) == column_len)
+        && collision_shapes.is_some_and(|v| {
+            Some(v.len()) == column_len
+                && v.iter().all(|entry| {
+                    entry
+                        .as_array()
+                        .is_some_and(|indexes| indexes.iter().all(|index| index.as_f64().is_some()))
+                })
+        })
+}
+
+fn pack_mcmeta_valid(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(meta) = megu_server_files::json::parse(&text) else {
+        return false;
+    };
+    meta.get("pack")
+        .and_then(|pack| pack.get("pack_format"))
+        .and_then(Json::as_f64)
+        .is_some_and(|format| format == 48.0)
+}
+
+fn config_packets_valid(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() >= 1024)
+        .unwrap_or(false)
+}
+
+fn runtime_path_present(root: &Path, rel: &str) -> bool {
+    let path = root.join(rel);
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => false,
+        Ok(meta) if rel == "assets/block_states_1211.json" => {
+            meta.is_file() && canonical_block_state_asset_valid(&path)
+        }
+        Ok(_) if rel == "config_packets.bin" => config_packets_valid(&path),
+        Ok(meta) if rel == "datapacks/vanilla/pack.mcmeta" => {
+            meta.is_file() && pack_mcmeta_valid(&path)
+        }
+        Ok(meta) if rel.ends_with(".json") || rel.ends_with(".bin") => meta.is_file(),
+        Ok(meta) => meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
+fn missing_runtime_data(root: &Path) -> Vec<&'static str> {
+    RUNTIME_REQUIRED
+        .iter()
+        .copied()
+        .filter(|rel| !runtime_path_present(root, rel))
+        .collect()
+}
+
+fn runtime_data_partially_present(root: &Path) -> bool {
+    RUNTIME_REQUIRED
+        .iter()
+        .any(|rel| std::fs::symlink_metadata(root.join(rel)).is_ok())
+}
+
+fn prepare_runtime_root(root: &Path) -> io::Result<()> {
+    installer::reject_traversal(root)?;
+    for ancestor in root.ancestors() {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(invalid_runtime(format!(
+                    "{} has an unsafe or incompatible file type",
+                    ancestor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    std::fs::create_dir_all(root)?;
+    ensure_real_directory(root)
+}
+
+fn ensure_real_directory(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(invalid_runtime(
+            format!("{} has an unsafe or incompatible file type", path.display()),
+        )),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(path)?;
+            ensure_real_directory(path)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn sha1_file(path: &Path) -> io::Result<String> {
+    use std::io::Read;
+    match std::fs::symlink_metadata(path)? {
+        meta if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(invalid_runtime(format!(
+                "{} has an unsafe or incompatible file type",
+                path.display()
+            )));
+        }
+        _ => {}
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = megu_core::crypto::Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
+}
+
+fn verified_vanilla_server_jar(path: &Path) -> io::Result<PathBuf> {
+    let digest = sha1_file(path)?;
+    if digest != VANILLA_SERVER_SHA1 {
+        return Err(invalid_runtime(format!(
+            "{} is not the pinned official 1.21.1 server jar (sha1 {}, expected {})",
+            path.display(),
+            digest,
+            VANILLA_SERVER_SHA1
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn acquire_vanilla_server_jar(cli: &Cli, runtime_cache: &Path) -> io::Result<PathBuf> {
+    if let Some(path) = cli
+        .vanilla_server_jar
+        .clone()
+        .or_else(|| std::env::var_os("MEGU_VANILLA_SERVER_JAR").map(PathBuf::from))
+    {
+        return verified_vanilla_server_jar(&path);
+    }
+
+    let cache_jar = runtime_cache.join("server-1.21.1.jar");
+    if cache_jar.is_file() {
+        return verified_vanilla_server_jar(&cache_jar);
+    }
+    if !cli.download_vanilla_server {
+        return Err(invalid_runtime(
+            "integrated-singleplayer runtime data is missing. Provide the official 1.21.1 server jar with --vanilla-server-jar <path> (or MEGU_VANILLA_SERVER_JAR), or explicitly opt in with --download-vanilla-server; use --no-runtime-data only for a deliberate multiplayer-only install",
+        ));
+    }
+
+    ensure_real_directory(runtime_cache)?;
+    let part = runtime_cache.join(format!("server-1.21.1.jar.part-{}", std::process::id()));
+    if download_release_file(VANILLA_SERVER_URL, &part).is_none() {
+        let _ = std::fs::remove_file(&part);
+        return Err(invalid_runtime(
+            "failed to download the official Mojang 1.21.1 server jar",
+        ));
+    }
+    match verified_vanilla_server_jar(&part) {
+        Ok(_) => {
+            if cache_jar.exists() {
+                return Err(invalid_runtime(format!(
+                    "refusing to replace existing cached jar {}",
+                    cache_jar.display()
+                )));
+            }
+            std::fs::rename(&part, &cache_jar)?;
+            Ok(cache_jar)
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&part);
+            Err(err)
+        }
+    }
+}
+
+fn write_embedded_python_tools(dir: &Path) -> io::Result<PathBuf> {
+    ensure_real_directory(dir)?;
+    for (name, source) in [
+        ("gen_vanilla_data.py", GEN_VANILLA_DATA_PY),
+        ("version_pack.py", VERSION_PACK_PY),
+        ("capture_config_packets.py", CAPTURE_CONFIG_PACKETS_PY),
+        ("build_vanilla_data.py", BUILD_VANILLA_DATA_PY),
+        ("Extract.java", EXTRACT_JAVA),
+    ] {
+        let path = dir.join(name);
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(invalid_runtime(format!(
+                    "{} has an unsafe or incompatible file type",
+                    path.display()
+                )));
+            }
+        }
+        let current = std::fs::read(&path).unwrap_or_default();
+        if current != source.as_bytes() {
+            std::fs::write(&path, source)?;
+        }
+    }
+    Ok(dir.join("gen_vanilla_data.py"))
+}
+
+fn command_output_lossy(output: &std::process::Output) -> String {
+    let mut text = String::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.trim().is_empty() {
+        text.push_str(stdout.trim());
+    }
+    if !stderr.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr.trim());
+    }
+    if text.len() > 1200 {
+        text.truncate(1200);
+        text.push_str("...");
+    }
+    text
+}
+
+fn run_python_script(script: &Path, args: &[&str]) -> io::Result<()> {
+    let candidates: Vec<(&str, Vec<&str>)> = if cfg!(windows) {
+        vec![("py", vec!["-3"]), ("python", vec![]), ("python3", vec![])]
+    } else {
+        vec![("python3", vec![]), ("python", vec![])]
+    };
+    let mut not_found = Vec::new();
+    for (program, prefix) in candidates {
+        let mut command = std::process::Command::new(program);
+        command.args(prefix).arg(script).args(args);
+        match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                return Err(invalid_runtime(format!(
+                    "{} failed while generating runtime data: {}",
+                    script.display(),
+                    command_output_lossy(&output)
+                )));
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                not_found.push(program.to_owned());
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(invalid_runtime(format!(
+        "Python 3 is required for first-run vanilla-data generation but none of [{}] was found",
+        not_found.join(", ")
+    )))
+}
+
+fn move_runtime_output(stage: &Path, root: &Path) -> io::Result<()> {
+    let mappings = [
+        ("datapacks/vanilla", "datapacks/vanilla"),
+        (
+            "assets/block_states_1211.json",
+            "assets/block_states_1211.json",
+        ),
+        ("config_packets.bin", "config_packets.bin"),
+    ];
+    for (from_rel, to_rel) in mappings {
+        let from = stage.join(from_rel);
+        let to = root.join(to_rel);
+        if !from.exists() {
+            return Err(invalid_runtime(format!(
+                "generator did not produce required runtime-data path {}",
+                from_rel
+            )));
+        }
+        if to.exists() || std::fs::symlink_metadata(&to).is_ok() {
+            return Err(invalid_runtime(format!(
+                "refusing to overwrite existing runtime-data path {}",
+                to.display()
+            )));
+        }
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&from, &to)?;
+    }
+    Ok(())
+}
+
+fn generate_runtime_data(cli: &Cli, root: &Path) -> io::Result<()> {
+    prepare_runtime_root(root)?;
+    let runtime_cache = root.join("megu-runtime");
+    ensure_real_directory(&runtime_cache)?;
+    let tools_dir = runtime_cache.join("generator");
+    let stage = runtime_cache.join(format!("data-stage-{}", std::process::id()));
+    if stage.exists() || std::fs::symlink_metadata(&stage).is_ok() {
+        return Err(invalid_runtime(format!(
+            "refusing to reuse existing runtime-data staging directory {}",
+            stage.display()
+        )));
+    }
+    std::fs::create_dir_all(&stage)?;
+
+    let jar = acquire_vanilla_server_jar(cli, &runtime_cache)?;
+    let generator = write_embedded_python_tools(&tools_dir)?;
+    let stage_string = stage.to_string_lossy().into_owned();
+    let jar_string = jar.to_string_lossy().into_owned();
+    let mappings_dir = std::env::var_os("MEGU_FABRIC_MAPPINGS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| runtime_cache.join("mappings"));
+    if mappings_dir.exists() {
+        ensure_real_directory(&mappings_dir)?;
+    }
+    let mappings_string = mappings_dir.to_string_lossy().into_owned();
+    let mut generator_args = vec![
+        "--jar".to_owned(),
+        jar_string.clone(),
+        "--out-dir".to_owned(),
+        stage_string,
+        "--full-runtime".to_owned(),
+        "--mappings-dir".to_owned(),
+        mappings_string,
+    ];
+    if cli.download_vanilla_server {
+        generator_args.push("--fetch-mappings".to_owned());
+    }
+    let generator_arg_refs = generator_args
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    run_python_script(&generator, &generator_arg_refs)?;
+    let missing_before_capture = missing_runtime_data(&stage)
+        .into_iter()
+        .filter(|rel| *rel != "config_packets.bin")
+        .collect::<Vec<_>>();
+    if !missing_before_capture.is_empty() {
+        return Err(invalid_runtime(format!(
+            "generated runtime data is incomplete before packet capture; missing {}",
+            missing_before_capture.join(", ")
+        )));
+    }
+
+    let capture = tools_dir.join("capture_config_packets.py");
+    let config_out = stage.join("config_packets.bin");
+    let config_string = config_out.to_string_lossy().into_owned();
+    run_python_script(&capture, &[&jar_string, &config_string, "--accept-eula"])?;
+
+    let missing = missing_runtime_data(&stage);
+    if !missing.is_empty() {
+        return Err(invalid_runtime(format!(
+            "generated runtime data is incomplete; missing {}",
+            missing.join(", ")
+        )));
+    }
+    move_runtime_output(&stage, root)
+}
+
+fn ensure_runtime_data(cli: &Cli, root: &Path) -> io::Result<bool> {
+    let missing = missing_runtime_data(root);
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    if cli.no_runtime_data {
+        eprintln!(
+            "megu-installer: warning: installing without integrated-singleplayer runtime data because --no-runtime-data was explicit (missing {})",
+            missing.join(", ")
+        );
+        return Ok(false);
+    }
+    if runtime_data_partially_present(root) {
+        return Err(invalid_runtime(format!(
+            "integrated-singleplayer runtime data at {} is incomplete (missing {}). Refusing to overwrite or silently continue from a half-install; remove/repair that data explicitly or rerun with --no-runtime-data for multiplayer-only",
+            root.display(),
+            missing.join(", ")
+        )));
+    }
+    if !cli.accept_eula {
+        return Err(invalid_runtime(format!(
+            "integrated-singleplayer runtime data is missing ({}). Refusing a silent half-install. Rerun with --accept-eula plus --vanilla-server-jar <official-1.21.1-server.jar> (or --download-vanilla-server), or explicitly choose --no-runtime-data for multiplayer-only",
+            missing.join(", ")
+        )));
+    }
+    generate_runtime_data(cli, root)?;
+    let remaining = missing_runtime_data(root);
+    if remaining.is_empty() {
+        Ok(true)
+    } else {
+        Err(invalid_runtime(format!(
+            "runtime-data generation finished but validation still misses {}",
+            remaining.join(", ")
+        )))
+    }
+}
+
 fn run(cli: &Cli) -> std::io::Result<()> {
     match cli.command {
         Command::Client => {
@@ -569,6 +1124,7 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                 Some(dir) => dir.clone(),
                 None => installer::detect_minecraft_dir()?,
             };
+            ensure_runtime_data(cli, &mc_dir)?;
             let mut bootstrap_jar =
                 auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar");
             let mut client_bin = auto_discover_sibling(&cli.client_bin, "megu-client-gpu");
@@ -586,11 +1142,8 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                         );
                     }
                     if client_bin.is_none() {
-                        client_bin = auto_discover_sibling_in(
-                            &cli.client_bin,
-                            "megu-client-gpu",
-                            &dirs,
-                        );
+                        client_bin =
+                            auto_discover_sibling_in(&cli.client_bin, "megu-client-gpu", &dirs);
                     }
                 }
             }
@@ -621,6 +1174,10 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                 Some(dir) => dir.clone(),
                 None => installer::detect_prism_instances_dir()?,
             };
+            let runtime_root = instances
+                .join(installer::prism_instance_name(cli.mc_version))
+                .join(".minecraft");
+            ensure_runtime_data(cli, &runtime_root)?;
             let mut bootstrap_jar =
                 auto_discover_sibling(&cli.bootstrap_jar, "megu-bootstrapper.jar");
             let mut client_bin = auto_discover_sibling(&cli.client_bin, "megu-client-gpu");
@@ -635,11 +1192,8 @@ fn run(cli: &Cli) -> std::io::Result<()> {
                         );
                     }
                     if client_bin.is_none() {
-                        client_bin = auto_discover_sibling_in(
-                            &cli.client_bin,
-                            "megu-client-gpu",
-                            &dirs,
-                        );
+                        client_bin =
+                            auto_discover_sibling_in(&cli.client_bin, "megu-client-gpu", &dirs);
                     }
                 }
             }
@@ -655,6 +1209,7 @@ fn run(cli: &Cli) -> std::io::Result<()> {
         }
         Command::Server => {
             let dir = cli.dir.clone().unwrap_or_default();
+            ensure_runtime_data(cli, &dir)?;
             let options = ServerInstallOptions {
                 mc_version: cli.mc_version,
                 server_bin: auto_discover_sibling(&cli.server_bin, "megu"),
@@ -685,7 +1240,12 @@ fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
     if trimmed.is_empty() || trimmed == "CANCEL" {
         return Ok(None);
     }
-    let mut parts = trimmed.splitn(3, '|');
+    let (base, accept_eula) = match trimmed.rsplit_once('|') {
+        Some((head, "0")) => (head, false),
+        Some((head, "1")) => (head, true),
+        _ => (trimmed, false),
+    };
+    let mut parts = base.splitn(3, '|');
     let mode = parts.next().unwrap_or("client").trim();
     let ver_str = parts.next().unwrap_or("1.21.1").trim();
     let target_dir = parts.next().unwrap_or("").trim();
@@ -707,6 +1267,10 @@ fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
             client_sha256: None,
             bootstrap_jar: None,
             server_bin: None,
+            vanilla_server_jar: None,
+            download_vanilla_server: accept_eula,
+            accept_eula,
+            no_runtime_data: false,
             no_profile: false,
             json: false,
         },
@@ -720,6 +1284,10 @@ fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
             client_sha256: None,
             bootstrap_jar: None,
             server_bin: None,
+            vanilla_server_jar: None,
+            download_vanilla_server: accept_eula,
+            accept_eula,
+            no_runtime_data: false,
             no_profile: false,
             json: false,
         },
@@ -733,6 +1301,10 @@ fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
             client_sha256: None,
             bootstrap_jar: None,
             server_bin: None,
+            vanilla_server_jar: None,
+            download_vanilla_server: accept_eula,
+            accept_eula,
+            no_runtime_data: false,
             no_profile: false,
             json: false,
         },
@@ -746,6 +1318,10 @@ fn parse_gui_selection(raw: &str) -> Result<Option<Cli>, String> {
             client_sha256: None,
             bootstrap_jar: None,
             server_bin: None,
+            vanilla_server_jar: None,
+            download_vanilla_server: accept_eula,
+            accept_eula,
+            no_runtime_data: false,
             no_profile: false,
             json: false,
         },
@@ -805,9 +1381,18 @@ def browse():
         dir_var.set(p)
 ttk.Button(frame_d, text="Browse...", command=browse).pack(side="left", padx=(6, 0))
 
+eula_var = tk.BooleanVar(value=False)
+ttk.Checkbutton(
+    root,
+    text="I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server plus pinned CC0 mappings, then run the server locally once for runtime data",
+    variable=eula_var,
+    wraplength=460,
+    justify="left",
+).pack(anchor="w", padx=14, pady=(2, 0))
+
 result = ["CANCEL"]
 def do_ok():
-    result[0] = f"{mode_var.get()}|{ver_var.get()}|{dir_var.get()}"
+    result[0] = f"{mode_var.get()}|{ver_var.get()}|{dir_var.get()}|{1 if eula_var.get() else 0}"
     root.destroy()
 def do_cancel():
     root.destroy()
@@ -826,7 +1411,7 @@ Add-Type -AssemblyName System.Drawing
 $mcDir = $args[0]; $prismDir = $args[1]; $srvDir = $args[2]
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Megu Installer"
-$form.Size = New-Object System.Drawing.Size(500, 330)
+$form.Size = New-Object System.Drawing.Size(500, 365)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -899,23 +1484,31 @@ $btnBrowse.Add_Click({
 })
 $form.Controls.Add($btnBrowse)
 
+$chkEula = New-Object System.Windows.Forms.CheckBox
+$chkEula.Text = "I accept the Minecraft EULA and allow Megu to download the official 1.21.1 server plus pinned CC0 mappings, then run the server locally once for runtime data"
+$chkEula.Location = New-Object System.Drawing.Point(20, 230)
+$chkEula.Size = New-Object System.Drawing.Size(450, 42)
+$chkEula.Checked = $false
+$form.Controls.Add($chkEula)
+
 $btnOk = New-Object System.Windows.Forms.Button
 $btnOk.Text = "Install"
-$btnOk.Location = New-Object System.Drawing.Point(300, 245)
+$btnOk.Location = New-Object System.Drawing.Point(300, 282)
 $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
 $form.AcceptButton = $btnOk
 $form.Controls.Add($btnOk)
 
 $btnCancel = New-Object System.Windows.Forms.Button
 $btnCancel.Text = "Cancel"
-$btnCancel.Location = New-Object System.Drawing.Point(388, 245)
+$btnCancel.Location = New-Object System.Drawing.Point(388, 282)
 $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 $form.CancelButton = $btnCancel
 $form.Controls.Add($btnCancel)
 
 if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     $m = if ($rbPrism.Checked) { "prism" } elseif ($rbServer.Checked) { "server" } elseif ($rbUninstall.Checked) { "uninstall" } else { "client" }
-    Write-Output "$m|$($cmbVer.SelectedItem)|$($txtDir.Text)"
+    $consent = if ($chkEula.Checked) { "1" } else { "0" }
+    Write-Output "$m|$($cmbVer.SelectedItem)|$($txtDir.Text)|$consent"
 } else {
     Write-Output "CANCEL"
 }
@@ -1001,7 +1594,13 @@ fn show_gui_message(title: &str, message: &str, is_error: bool) {
     let py_script = "import sys, tkinter as tk; from tkinter import messagebox; r=tk.Tk(); r.withdraw(); (messagebox.showerror if sys.argv[3]=='1' else messagebox.showinfo)(sys.argv[1], sys.argv[2]); r.destroy()";
     for py in ["python3", "python"] {
         if let Ok(st) = std::process::Command::new(py)
-            .args(["-c", py_script, title, message, if is_error { "1" } else { "0" }])
+            .args([
+                "-c",
+                py_script,
+                title,
+                message,
+                if is_error { "1" } else { "0" },
+            ])
             .status()
         {
             if st.success() {
@@ -1157,11 +1756,15 @@ mod tests {
         assert_eq!(cli.command, Command::Client);
 
         assert!(parse_gui_selection("CANCEL").unwrap().is_none());
-        let g = parse_gui_selection("client|1.21.1|/tmp/mc").unwrap().unwrap();
+        let g = parse_gui_selection("client|1.21.1|/tmp/mc")
+            .unwrap()
+            .unwrap();
         assert_eq!(g.command, Command::Client);
         assert_eq!(g.mc_version, TargetVersion::V1_21_1);
         assert_eq!(g.minecraft_dir, Some(PathBuf::from("/tmp/mc")));
-        let g2 = parse_gui_selection("server|26.3|/tmp/srv").unwrap().unwrap();
+        let g2 = parse_gui_selection("server|26.3|/tmp/srv")
+            .unwrap()
+            .unwrap();
         assert_eq!(g2.command, Command::Server);
         assert_eq!(g2.mc_version, TargetVersion::V26_3);
         assert_eq!(g2.dir, Some(PathBuf::from("/tmp/srv")));
@@ -1169,10 +1772,8 @@ mod tests {
 
     #[test]
     fn auto_discovers_sibling_binaries_and_respects_explicit_override() {
-        let dir = std::env::temp_dir().join(format!(
-            "megu-installer-discover-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("megu-installer-discover-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let gpu = dir.join("megu-client-gpu");
         let jar = dir.join("megu-bootstrapper.jar");
@@ -1196,5 +1797,171 @@ mod tests {
         let _ = std::fs::remove_file(&gpu);
         let _ = std::fs::remove_file(&jar);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    fn parse_cli(items: &[&str]) -> Cli {
+        parse(&items.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "megu-installer-runtime-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_minimal_runtime_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/worldgen/biome"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/dimension_type"))
+            .unwrap();
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/tags/block")).unwrap();
+        std::fs::write(root.join("config_packets.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(
+            root.join("assets/block_states_1211.json"),
+            br#"{
+              "blocks":[["minecraft:stone",1,1]],
+              "flags":[8],
+              "luminance":[0],
+              "light_block":[15],
+              "full_sides":[63],
+              "shapes":[{"min":[0.0,0.0,0.0],"max":[1.0,1.0,1.0]}],
+              "collision_shapes":[[0]]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("datapacks/vanilla/pack.mcmeta"),
+            br#"{"pack":{"pack_format":48,"description":"test"}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn runtime_data_detection_requires_the_integrated_singleplayer_layout() {
+        let root = scratch_dir("detect");
+        assert_eq!(missing_runtime_data(&root), RUNTIME_REQUIRED.to_vec());
+        write_minimal_runtime_tree(&root);
+        assert!(missing_runtime_data(&root).is_empty());
+
+        // A directory with the right file name is not a usable packet capture or asset.
+        std::fs::remove_file(root.join("config_packets.bin")).unwrap();
+        std::fs::create_dir(root.join("config_packets.bin")).unwrap();
+        assert_eq!(missing_runtime_data(&root), vec!["config_packets.bin"]);
+    }
+
+    #[test]
+    fn report_only_block_state_index_is_not_accepted_as_runtime_data() {
+        let root = scratch_dir("schema");
+        write_minimal_runtime_tree(&root);
+        assert!(missing_runtime_data(&root).is_empty());
+        std::fs::write(
+            root.join("assets/block_states_1211.json"),
+            br#"{
+              "format":1,
+              "source_reports":{"blocks.json":"deadbeef"},
+              "blocks":[["minecraft:stone",1,1]],
+              "block_index":{"minecraft:stone":{"first_state_id":1,"state_count":1}}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            missing_runtime_data(&root),
+            vec!["assets/block_states_1211.json"]
+        );
+    }
+
+    #[test]
+    fn runtime_data_defaults_fail_closed_and_explicit_opt_out_is_distinct() {
+        let root = scratch_dir("fail-closed").join("fresh-mc");
+        let cli = parse_cli(&["client", "--minecraft-dir", root.to_str().unwrap()]);
+        let err = ensure_runtime_data(&cli, &root).expect_err("fresh install must fail closed");
+        assert!(err.to_string().contains("--accept-eula"), "{err}");
+        assert!(err.to_string().contains("--no-runtime-data"), "{err}");
+        assert!(!root.join("versions").exists());
+
+        let cli = parse_cli(&[
+            "client",
+            "--minecraft-dir",
+            root.to_str().unwrap(),
+            "--no-runtime-data",
+        ]);
+        assert!(!ensure_runtime_data(&cli, &root).unwrap());
+
+        assert!(
+            parse(&[
+                "client".to_owned(),
+                "--no-runtime-data".to_owned(),
+                "--accept-eula".to_owned(),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_data_partial_install_is_not_overwritten_or_silently_reused() {
+        let root = scratch_dir("partial");
+        std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft")).unwrap();
+        let cli = parse_cli(&[
+            "client",
+            "--minecraft-dir",
+            root.to_str().unwrap(),
+            "--accept-eula",
+        ]);
+        let err = ensure_runtime_data(&cli, &root).expect_err("partial data must fail closed");
+        assert!(err.to_string().contains("incomplete"), "{err}");
+        assert!(!root.join("megu-runtime").exists());
+    }
+
+    #[test]
+    fn runtime_output_move_is_ordered_and_refuses_existing_targets() {
+        let base = scratch_dir("move");
+        let stage = base.join("stage");
+        let root = base.join("root");
+        write_minimal_runtime_tree(&stage);
+        move_runtime_output(&stage, &root).unwrap();
+        assert!(root.join("config_packets.bin").is_file());
+        assert!(root.join("assets/block_states_1211.json").is_file());
+        assert!(root.join("datapacks/vanilla/data/minecraft").is_dir());
+        assert!(!stage.join("datapacks/vanilla").exists());
+
+        write_minimal_runtime_tree(&stage);
+        let err = move_runtime_output(&stage, &root).expect_err("existing target must win");
+        assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+    }
+
+    #[test]
+    fn vanilla_server_jar_pin_rejects_other_bytes() {
+        let root = scratch_dir("jar-pin");
+        let jar = root.join("server.jar");
+        std::fs::write(&jar, b"not the official server").unwrap();
+        let err = verified_vanilla_server_jar(&jar).expect_err("wrong jar must fail");
+        assert!(
+            err.to_string()
+                .contains("not the pinned official 1.21.1 server jar"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn gui_selection_consent_suffix_is_explicit_and_backward_compatible() {
+        let old = parse_gui_selection("client|1.21.1|/tmp/mc")
+            .unwrap()
+            .unwrap();
+        assert!(!old.accept_eula);
+        assert!(!old.download_vanilla_server);
+        let yes = parse_gui_selection("client|1.21.1|/tmp/mc|1")
+            .unwrap()
+            .unwrap();
+        assert!(yes.accept_eula);
+        assert!(yes.download_vanilla_server);
+        let no = parse_gui_selection("client|1.21.1|/tmp/mc|0")
+            .unwrap()
+            .unwrap();
+        assert!(!no.accept_eula);
+        assert!(!no.download_vanilla_server);
     }
 }
