@@ -36,6 +36,14 @@
 //!   container GUI, the classic `#C6C6C6` recipe popup card, the
 //!   purple-gradient item tooltip, and parallel `ItemSpriteSlot`
 //!   emission for runtime `client-gpu` item sprites.
+//! * [`recipe_search`] — the pure-logic core a JEI/EMI-style overlay
+//!   wires in: a Japanese-aware kana/romaji normalizer
+//!   (`daia`/`だいあ`/`ダイア` all reach `ダイヤモンド`), an inverted
+//!   [`recipe_search::RecipeSearchIndex`] with `@mod`/`#tag`/text
+//!   tokens plus `R`/`U` lookups and Polymorph-style conflict groups,
+//!   and [`recipe_search::NearbyChestCraftPlanner`] emitting atomic
+//!   transfer plans that pull from the player inventory and nearby
+//!   chests for 1-click and max-stack shift-crafts.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -63,6 +71,7 @@ pub mod mod_i18n;
 pub mod mod_menu;
 pub mod qol_helpers;
 pub mod recipe_browser;
+pub mod recipe_search;
 pub mod retained_cache;
 pub mod shader_screen;
 pub mod sign_and_chat;
