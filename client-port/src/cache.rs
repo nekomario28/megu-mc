@@ -4,15 +4,27 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 
+use megu_core::bloom::VoxelBitset4096;
 use megu_core::diff_engine::SubtileDiffMask;
+use megu_core::mesh_elision::{
+    compute_section_fingerprint, BlockRenderTraits, ContentHashMeshCache, RemeshDecision,
+    SectionContentFingerprint, SectionOcclusionMask,
+};
+use megu_core::render_cs::{
+    compute_section_visibility, BinaryGreedyMesher, DrawBucket, GreedyQuad,
+    SectionRenderMetadata, SectionVisBits, SixAxisBuckets, SortOutcome, TranslucentQuadKey,
+    TranslucentSortCache,
+};
 
 use crate::cull::box_in_frustum;
-use crate::packed::{depth_key, is_translucent, pack_quad, PackedVertex};
+use crate::packed::{is_translucent, pack_quad, PackedVertex};
 use crate::upload_budget::ChunkUploadBudget;
+use crate::visibility::{blocks_sight, direction_face_dir, face_dir_direction};
 use crate::{
-    edge_corner_index, mesh_section, Block, CompressedSection, Direction, DirectionBuckets,
-    Light, MissingNeighbor, Quad, Sample, Section, SectionBlocks, SectionView, EDGE,
-    EDGE_CORNER_CELLS, FACE_CELLS, SECTION_CELLS, DIRECTION_BUCKETS,
+    edge_corner_index, mesh_section, section_index, Block, CompressedSection, Direction,
+    DirectionBuckets, Light, MissingNeighbor, Quad, Sample, Section, SectionBlocks, SectionView,
+    DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED, EDGE, EDGE_CORNER_CELLS, FACE_CELLS, NO_FLUID,
+    SECTION_CELLS,
 };
 
 /// Signed section coordinates in one world/dimension, measured in 16-block units.
@@ -131,6 +143,32 @@ impl SectionMeshInput {
     }
 }
 
+/// Certified render traits of one block for
+/// [`megu_core::mesh_elision::SectionOcclusionMask`]. Fail-closed: only a
+/// plain full-occlusion non-fluid opaque cube earns
+/// [`BlockRenderTraits::FULL_OPAQUE_CUBE`] (with `SAME_STATE_CULL` adding
+/// [`BlockRenderTraits::NEIGHBOR_DEPENDENT_VISUAL`]); air certifies
+/// [`BlockRenderTraits::EMPTY`]; everything else — cutout, translucent,
+/// waterlogged, partial-occlusion or fluid cells — is
+/// `UNKNOWN_CONSERVATIVE | NEIGHBOR_DEPENDENT_VISUAL | PROTRUDING_BOUNDS` so
+/// no uncertified block can ever be elided and every mutation next to one
+/// keeps the expanded conservative border radius.
+fn block_render_traits(block: Block) -> BlockRenderTraits {
+    if blocks_sight(block) && block.fluid() == NO_FLUID {
+        let mut traits = BlockRenderTraits::FULL_OPAQUE_CUBE;
+        if block.flags & crate::SAME_STATE_CULL != 0 {
+            traits = traits.union(BlockRenderTraits::NEIGHBOR_DEPENDENT_VISUAL);
+        }
+        traits
+    } else if !block.renderable() && !blocks_sight(block) {
+        BlockRenderTraits::EMPTY
+    } else {
+        BlockRenderTraits::UNKNOWN_CONSERVATIVE
+            .union(BlockRenderTraits::NEIGHBOR_DEPENDENT_VISUAL)
+            .union(BlockRenderTraits::PROTRUDING_BOUNDS)
+    }
+}
+
 /// Result of [`build_and_pack_section_mesh`]: the fully packed, upload-ready
 /// mesh for one [`SectionMeshInput`]. `Send` so workers can hand it back
 /// through a channel.
@@ -158,6 +196,18 @@ pub struct BuiltSectionMesh {
     /// `Direction::bit` mask of every face direction present in the meshed
     /// section (opaque and translucent), for whole-section culling.
     pub visibility_mask: u8,
+    /// Core render descriptors of the built section: `vis_bits` is the
+    /// portal connectivity [`megu_core::render_cs::bfs_visible_sections`]
+    /// consumes, `has_protruding_bounds`/`max_protrusion_blocks` come from
+    /// the actual quad extents, and `has_non_axis_geometry` reports
+    /// `DrawBucket::UnculledCustom` quads a directional culler must never
+    /// clip.
+    pub render_meta: SectionRenderMetadata,
+    /// Greedily merged strict-occluder surface — the quads
+    /// [`megu_core::render_cs::BinaryGreedyMesher`] emits for the same
+    /// full-opaque non-protruding cube subset `render_meta.vis_bits` was
+    /// computed from, ready for the depth-splat or shadow-caster paths.
+    pub occluder_quads: Vec<GreedyQuad>,
 }
 
 /// Appends `quad`'s four packed vertices, normalizing the diagonal flip:
@@ -189,6 +239,8 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
         opaque_bucket_ranges: [(0, 0); DIRECTION_BUCKETS],
         translucent_quads: Vec::new(),
         visibility_mask: 0,
+        render_meta: SectionRenderMetadata::new(SectionVisBits::EMPTY),
+        occluder_quads: Vec::new(),
     };
     let Some(center) = input.cells[0].as_deref() else {
         return out;
@@ -207,8 +259,9 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
             &expanded
         }
     };
-    let (borders, edges) =
-        sample_neighbor_halo(coord, input.missing, |_, offset| input.cell_at_offset(offset));
+    let (borders, edges) = sample_neighbor_halo(coord, input.missing, |_, offset| {
+        input.cell_at_offset(offset)
+    });
     let view = SectionView {
         blocks,
         block_light: &center.block_light,
@@ -219,28 +272,103 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
     };
     let quads = mesh_section(&view);
 
-    let mut opaque_counts = [0u32; DIRECTION_BUCKETS];
-    let mut opaque_total = 0usize;
+    // One strict-occluder pass feeds both the portal connectivity the
+    // render_cs BFS consumes and the merged occluder surface —
+    // `BinaryGreedyMesher`'s contract is exactly `blocks_sight`.
+    let mut opaque = VoxelBitset4096::new();
+    for (index, &block) in blocks.iter().enumerate() {
+        if blocks_sight(block) {
+            opaque.set(index as u16);
+        }
+    }
+    let vis_bits = compute_section_visibility(&opaque);
+    BinaryGreedyMesher::mesh(
+        &opaque,
+        |dir, u, v| {
+            // The voxel just outside `dir`: the neighbor halo sample across
+            // our own matching `Direction` face. `border_index` drops the
+            // face axis, so `along` only needs to be a valid coordinate.
+            let axis = dir.index() >> 1;
+            let along = usize::from(dir.index() & 1 == 0) * (EDGE - 1);
+            let p = match axis {
+                0 => [along, u as usize, v as usize],
+                1 => [u as usize, along, v as usize],
+                _ => [u as usize, v as usize, along],
+            };
+            let direction = face_dir_direction(dir);
+            blocks_sight(borders[direction as usize][direction.border_index(p)].block)
+        },
+        |x, y, z| blocks[section_index(x as usize, y as usize, z as usize)].state_id,
+        &mut out.occluder_quads,
+    );
+
+    let mut buckets: SixAxisBuckets<Quad> = SixAxisBuckets::new();
     for quad in &quads {
         out.visibility_mask |= quad.direction.bit();
         if is_translucent(quad) {
             out.translucent_quads.push(*quad);
         } else {
-            opaque_counts[DirectionBuckets::index_of(quad.direction)] += 1;
-            opaque_total += 1;
+            let bucket =
+                if DirectionBuckets::index_of(quad.direction) == DIRECTION_BUCKET_UNASSIGNED {
+                    DrawBucket::UnculledCustom
+                } else {
+                    DrawBucket::Face(direction_face_dir(quad.direction))
+                };
+            buckets.push(bucket, *quad);
         }
     }
-    let buckets = DirectionBuckets::laid_out(opaque_counts, 0);
-    out.opaque_bucket_ranges = buckets.vertex_ranges();
-    out.opaque_packed = Vec::with_capacity(opaque_total * 4);
-    for bucket in 0..DIRECTION_BUCKETS {
-        for quad in quads.iter().filter(|quad| {
-            !is_translucent(quad) && DirectionBuckets::index_of(quad.direction) == bucket
-        }) {
+    buckets.bake();
+    out.opaque_packed = Vec::with_capacity(buckets.len() * 4);
+    // The packed stream keeps `DirectionBuckets::group`'s Direction
+    // order bit-for-bit — `SixAxisBuckets` supplies the ranges, the
+    // `FaceDir`→`Direction` permutation orders the emission.
+    let items = buckets.items();
+    let mut next = 0u32;
+    for direction in Direction::ALL {
+        let range = buckets.range(direction_face_dir(direction));
+        for quad in &items[range.offset as usize..(range.offset + range.count) as usize] {
             push_normalized_packed_quad(quad, &mut out.opaque_packed);
         }
+        out.opaque_bucket_ranges[direction as usize] = (next, range.count * 4);
+        next += range.count * 4;
     }
+    let custom = buckets.custom_range();
+    for quad in &items[custom.offset as usize..(custom.offset + custom.count) as usize] {
+        push_normalized_packed_quad(quad, &mut out.opaque_packed);
+    }
+    out.opaque_bucket_ranges[DIRECTION_BUCKET_UNASSIGNED] = (next, custom.count * 4);
+    out.render_meta = quads_render_meta(&quads);
+    out.render_meta.vis_bits = vis_bits;
     out
+}
+
+/// The geometric half of [`SectionRenderMetadata`] measured on built
+/// quads: `max_protrusion_blocks` from vertex positions escaping the
+/// `16³` cell (sub-millimeter float noise rounded away) and
+/// `has_non_axis_geometry` when any quad classifies outside the six
+/// cardinal buckets — the same predicate the [`SixAxisBuckets`] split
+/// applies. `vis_bits` stays EMPTY; the caller owns connectivity.
+fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
+    let mut max_protrusion = 0f32;
+    let mut non_axis = false;
+    for quad in quads {
+        for point in &quad.positions {
+            for &value in point {
+                max_protrusion = max_protrusion.max(-value).max(value - EDGE as f32);
+            }
+        }
+        non_axis |= DirectionBuckets::index_of(quad.direction) == DIRECTION_BUCKET_UNASSIGNED;
+    }
+    let protrusion_blocks = (max_protrusion - 0.0001)
+        .max(0.0)
+        .ceil()
+        .min(f32::from(u8::MAX)) as u8;
+    let mut meta =
+        SectionRenderMetadata::new(SectionVisBits::EMPTY).with_protrusion(protrusion_blocks);
+    if non_axis {
+        meta = meta.with_non_axis_geometry();
+    }
+    meta
 }
 
 /// Samples the 6 face borders and 12 edge + 8 corner halo cells around `coord`
@@ -306,6 +434,11 @@ pub struct ReleasedMeshMeta {
     pub kept_translucent_quads: usize,
 }
 
+/// Retention bound for [`MeshCache::content_meshes`]: enough distinct
+/// section contents that a streamed world almost never evicts a still-live
+/// fingerprint before its `meshes` entry dies anyway.
+const CONTENT_MESH_CAPACITY: usize = 4096;
+
 /// Owns section snapshots and meshes. Repeated changes are coalesced until
 /// rebuilding. Use one cache per world or dimension.
 ///
@@ -318,7 +451,33 @@ pub struct MeshCache {
     /// hand out lock-free [`SectionMeshInput`] jobs with zero voxel copies;
     /// [`set_cell`](Self::set_cell) copy-on-writes through `Arc::make_mut`.
     sections: HashMap<SectionCoord, Arc<CompressedSection>>,
-    meshes: HashMap<SectionCoord, Vec<Quad>>,
+    /// Shared mesh payloads: identical section content across the world
+    /// reuses one `Arc<Vec<Quad>>` via `content_meshes`.
+    meshes: HashMap<SectionCoord, Arc<Vec<Quad>>>,
+    /// Bounded LRU content-hash cache keyed on
+    /// [`compute_section_fingerprint`] of the exact mesher preimage
+    /// (blocks + light + neighbor halo). A hit hands the already-built
+    /// `Arc` to `meshes` without re-meshing.
+    content_meshes: ContentHashMeshCache<Vec<Quad>>,
+    /// Per-section render-trait occupancy feeding
+    /// [`SectionOcclusionMask::classify_section_mutation`]: kept in sync
+    /// with `sections` on every write path so buried strict-occluder
+    /// swaps can be elided in O(1).
+    occlusion: HashMap<SectionCoord, SectionOcclusionMask>,
+    /// Per-section lazy radix sorter for translucent re-sorts, keyed on
+    /// `mesh_revisions` so rebuilt geometry always re-sorts once.
+    sort_caches: HashMap<SectionCoord, TranslucentSortCache>,
+    /// Render descriptors measured from the built quads
+    /// ([`quads_render_meta`]) on every `meshes` write: protrusion span and
+    /// non-axis-geometry flag for the renderer's portal-BFS and draw-bucket
+    /// planners. `vis_bits` stays EMPTY — portal connectivity is the
+    /// world's `SectionVisibility` graph's job.
+    render_metas: HashMap<SectionCoord, SectionRenderMetadata>,
+    /// Monotonic mesh-content revision per section; bumped on every
+    /// `meshes` write so a [`TranslucentSortCache`] proves its cached
+    /// order still describes the stored quads.
+    mesh_revisions: HashMap<SectionCoord, u64>,
+    next_mesh_revision: u64,
     dirty: BTreeSet<SectionCoord>,
     /// Exact `4³`-sub-tile dirty locality for each coordinate in `dirty`:
     /// single-block edits keep their 1–8 sub-tile footprint instead of
@@ -341,6 +500,12 @@ pub struct MeshCache {
     resort_threshold: f32,
     /// Admission allowance for sections passed to the render upload path.
     upload_budget: ChunkUploadBudget,
+    /// Reused word stream for [`MeshCache::mesh_fingerprint`]'s block
+    /// serialization (state_id/tint/fluid_tint + packed flags).
+    fp_words: Vec<u32>,
+    /// Reused byte stream for [`MeshCache::mesh_fingerprint`]'s light and
+    /// halo sample serialization.
+    fp_bytes: Vec<u8>,
 }
 
 impl Default for MeshCache {
@@ -348,6 +513,12 @@ impl Default for MeshCache {
         Self {
             sections: HashMap::new(),
             meshes: HashMap::new(),
+            content_meshes: ContentHashMeshCache::new(CONTENT_MESH_CAPACITY),
+            occlusion: HashMap::new(),
+            sort_caches: HashMap::new(),
+            render_metas: HashMap::new(),
+            mesh_revisions: HashMap::new(),
+            next_mesh_revision: 0,
             dirty: BTreeSet::new(),
             subtile_masks: HashMap::new(),
             rebuilt: VecDeque::new(),
@@ -357,6 +528,8 @@ impl Default for MeshCache {
             sort_origin: None,
             resort_threshold: DEFAULT_RESORT_THRESHOLD,
             upload_budget: ChunkUploadBudget::default(),
+            fp_words: Vec::new(),
+            fp_bytes: Vec::new(),
         }
     }
 }
@@ -402,6 +575,23 @@ impl MeshCache {
                 self.subtile_masks.insert(neighbor, SubtileDiffMask::ALL);
             }
         }
+        // Render-trait occupancy for `set_cell`'s mutation classifier —
+        // the exact same per-cell predicate the mesher's occlusion pass
+        // uses, so an elide decision is sound by construction.
+        let mut occlusion = SectionOcclusionMask::new();
+        for y in 0..EDGE {
+            for z in 0..EDGE {
+                for x in 0..EDGE {
+                    occlusion.set_render_traits(
+                        x as u8,
+                        y as u8,
+                        z as u8,
+                        block_render_traits(section.get(x, y, z).block),
+                    );
+                }
+            }
+        }
+        self.occlusion.insert(coord, occlusion);
         self.sections.insert(coord, Arc::new(section));
         true
     }
@@ -411,6 +601,10 @@ impl MeshCache {
             return false;
         };
         self.meshes.remove(&coord);
+        self.occlusion.remove(&coord);
+        self.sort_caches.remove(&coord);
+        self.render_metas.remove(&coord);
+        self.mesh_revisions.remove(&coord);
         self.dirty.remove(&coord);
         self.subtile_masks.remove(&coord);
         self.released_meta.remove(&coord);
@@ -439,8 +633,32 @@ impl MeshCache {
         let Some(section) = self.sections.get_mut(&coord) else {
             return false;
         };
+        let old_sample = section.get(x, y, z);
         if !Arc::make_mut(section).set(x, y, z, block, light) {
             return false;
+        }
+        let new_traits = block_render_traits(block);
+        // Classify against the pre-mutation mask, then record the new
+        // traits. A light change is never elidable: the classifier only
+        // models block geometry. `Elide` means the emitted mesh is
+        // bit-identical, so no dirty marking is needed at all; every
+        // other decision falls through to the ordinary boundary-exact
+        // marking below, a superset of the classifier's face mask.
+        let decision = if old_sample.light == light {
+            let mask = self.occlusion.entry(coord).or_default();
+            let decision = SectionOcclusionMask::classify_section_mutation(
+                mask, x as u8, y as u8, z as u8, new_traits,
+            );
+            mask.set_render_traits(x as u8, y as u8, z as u8, new_traits);
+            decision
+        } else {
+            if let Some(mask) = self.occlusion.get_mut(&coord) {
+                mask.set_render_traits(x as u8, y as u8, z as u8, new_traits);
+            }
+            RemeshDecision::LocalSectionOnly
+        };
+        if decision == RemeshDecision::Elide {
+            return true;
         }
         self.dirty.insert(coord);
         self.subtile_masks
@@ -541,7 +759,15 @@ impl MeshCache {
         if self.dirty.contains(&coord) {
             return None;
         }
-        self.meshes.get(&coord).map(Vec::as_slice)
+        self.meshes.get(&coord).map(|mesh| mesh.as_slice())
+    }
+
+    /// The render descriptor the last mesh build measured for `coord`
+    /// (protrusion span + non-axis-geometry flag). Dirty sections keep
+    /// their previous descriptor — it still describes the GPU-resident
+    /// geometry until the rebuild lands.
+    pub fn render_meta(&self, coord: SectionCoord) -> Option<SectionRenderMetadata> {
+        self.render_metas.get(&coord).copied()
     }
 
     /// The stored section snapshot, in [`CompressedSection`] form.
@@ -561,7 +787,10 @@ impl MeshCache {
 
     /// Total block-storage heap bytes held by section snapshots.
     pub fn mesh_cache_blocks_heap_bytes(&self) -> usize {
-        self.sections.values().map(|section| section.heap_bytes()).sum()
+        self.sections
+            .values()
+            .map(|section| section.heap_bytes())
+            .sum()
     }
 
     /// Total bytes held by dense section arrays still retained in this cache.
@@ -646,9 +875,10 @@ impl MeshCache {
                 break;
             };
             self.subtile_masks.remove(&coord);
-            let mesh = self.build(coord);
+            let mesh = self.build_shared(coord);
             self.compact_dense_snapshot(coord);
             self.meshes.insert(coord, mesh);
+            self.bump_mesh_revision(coord);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
             rebuilt.push(coord);
@@ -681,7 +911,7 @@ impl MeshCache {
             if rebuilt.len() >= limit || self.upload_budget.remaining_uploads() == 0 {
                 break;
             }
-            let mesh = self.build(coord);
+            let mesh = self.build_shared(coord);
             self.compact_dense_snapshot(coord);
             // RenderRegion uploads four packed vertices and six u32 indices
             // for each quad. Budget the actual payload rather than the in-RAM
@@ -705,6 +935,7 @@ impl MeshCache {
             self.dirty.remove(&coord);
             self.subtile_masks.remove(&coord);
             self.meshes.insert(coord, mesh);
+            self.bump_mesh_revision(coord);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
             rebuilt.push(coord);
@@ -740,9 +971,10 @@ impl MeshCache {
         for (_, coord) in near.into_iter().take(max_near) {
             self.dirty.remove(&coord);
             self.subtile_masks.remove(&coord);
-            let mesh = self.build(coord);
+            let mesh = self.build_shared(coord);
             self.compact_dense_snapshot(coord);
             self.meshes.insert(coord, mesh);
+            self.bump_mesh_revision(coord);
             self.released_meta.remove(&coord);
             self.note_rebuilt(coord);
             rebuilt.push(coord);
@@ -813,6 +1045,9 @@ impl MeshCache {
         let Some(mesh) = self.meshes.get_mut(&coord) else {
             return 0;
         };
+        // A shared content-hash payload must not mutate in place:
+        // `Arc::make_mut` clones only when another section aliases it.
+        let mesh = Arc::make_mut(mesh);
         let mut meta = ReleasedMeshMeta {
             quad_count: mesh.len(),
             vertex_count: mesh.len() * 4,
@@ -844,6 +1079,7 @@ impl MeshCache {
         }
         mesh.shrink_to_fit();
         self.released_meta.insert(coord, meta);
+        self.bump_mesh_revision(coord);
         dropped * std::mem::size_of::<Quad>()
     }
 
@@ -911,13 +1147,16 @@ impl MeshCache {
 
     /// Incremental translucent re-sort. While the camera stays inside
     /// `resort_threshold` of the last sort this is a no-op and returns an
-    /// empty list. Once the camera crosses it, every clean mesh has its
+    /// empty list. Once the camera crosses it, every clean mesh's
     /// translucent quads (the `is_translucent` set: translucent blocks and
-    /// water) reordered back-to-front with the same depth key and tie-break
-    /// as `megu_client_mesh_sort_translucent`, and `camera` is recorded
-    /// as the new sort origin. Dirty sections are skipped: their rebuild
-    /// replaces the order anyway. Returns the coordinates whose translucent
-    /// quad order actually changed.
+    /// water) are reordered back-to-front by its per-section
+    /// [`TranslucentSortCache`]: a stable two-pass radix sort over
+    /// 1/256-block-quantized distance keys that additionally short-circuits
+    /// to [`SortOutcome::Cached`] while the half-block camera cell and the
+    /// mesh revision both hold. `camera` is recorded as the new sort
+    /// origin. Dirty sections are skipped: their rebuild replaces the
+    /// order anyway. Returns the coordinates whose translucent quad order
+    /// actually changed.
     pub fn resort_translucent(&mut self, camera: [f32; 3]) -> Vec<SectionCoord> {
         if !self.translucent_resort_due(camera) {
             return Vec::new();
@@ -933,45 +1172,54 @@ impl MeshCache {
                 camera[1] - coord.1 as f32 * EDGE as f32,
                 camera[2] - coord.2 as f32 * EDGE as f32,
             ];
-            if Self::sort_back_to_front(mesh, local) {
-                changed.push(coord);
+            // Translucent quads in mesh order: `slots` are their positions
+            // inside `mesh`, `keys`/`quads` the sorter's input records.
+            let mut keys = Vec::new();
+            let mut slots = Vec::new();
+            let mut quads = Vec::new();
+            for (slot, quad) in mesh.iter().enumerate() {
+                if !is_translucent(quad) {
+                    continue;
+                }
+                let mut center = [0f32; 3];
+                for point in &quad.positions {
+                    for (axis, &value) in point.iter().enumerate() {
+                        center[axis] += value;
+                    }
+                }
+                for value in &mut center {
+                    *value *= 0.25;
+                }
+                keys.push(TranslucentQuadKey {
+                    quad_idx: keys.len() as u32,
+                    center,
+                });
+                slots.push(slot);
+                quads.push(*quad);
             }
+            if keys.len() < 2 {
+                continue;
+            }
+            let revision = self.mesh_revisions.get(&coord).copied().unwrap_or(0);
+            let cache = self.sort_caches.entry(coord).or_default();
+            if cache.sort(local, revision, &keys) != SortOutcome::Resorted {
+                continue;
+            }
+            let order = cache.order();
+            if order.iter().is_sorted() {
+                continue;
+            }
+            let mesh = Arc::make_mut(mesh);
+            for (slot, &source) in slots.iter().zip(order.iter()) {
+                mesh[*slot] = quads[source as usize];
+            }
+            changed.push(coord);
         }
         changed.sort_unstable();
         for &coord in &changed {
             self.note_rebuilt(coord);
         }
         changed
-    }
-
-    /// Reorders `mesh`'s translucent quads by decreasing `depth_key`, keeping
-    /// every other quad in place and ascending input index for ties. Returns
-    /// whether the order changed.
-    fn sort_back_to_front(mesh: &mut [Quad], camera: [f32; 3]) -> bool {
-        let mut order: Vec<(f64, u32)> = mesh
-            .iter()
-            .enumerate()
-            .filter(|(_, q)| is_translucent(q))
-            .map(|(i, q)| (depth_key(q, camera), i as u32))
-            .collect();
-        if order.len() < 2 {
-            return false;
-        }
-        order.sort_unstable_by(|(l, i), (r, j)| {
-            r.partial_cmp(l)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(i.cmp(j))
-        });
-        if order.iter().map(|&(_, i)| i).is_sorted() {
-            return false;
-        }
-        let sorted: Vec<Quad> = order.iter().map(|&(_, i)| mesh[i as usize]).collect();
-        let mut slots: Vec<usize> = order.iter().map(|&(_, i)| i as usize).collect();
-        slots.sort_unstable();
-        for (slot, quad) in slots.into_iter().zip(sorted) {
-            mesh[slot] = quad;
-        }
-        true
     }
 
     /// Captures a lock-free mesh-job snapshot for `coord`: the center section
@@ -1003,9 +1251,87 @@ impl MeshCache {
         })
     }
 
+    /// Bump `coord`'s mesh revision so its [`TranslucentSortCache`] can
+    /// never serve an order computed for a different mesh payload.
+    fn bump_mesh_revision(&mut self, coord: SectionCoord) {
+        self.next_mesh_revision = self.next_mesh_revision.wrapping_add(1);
+        self.mesh_revisions.insert(coord, self.next_mesh_revision);
+    }
+
+    /// Fingerprint of every byte the mesher reads for `coord`: the section
+    /// blocks serialized as `(state_id, tint, fluid_tint, packed flags)`
+    /// words into `fp_words`, both light arrays plus every halo sample's
+    /// block and light into `fp_bytes`. The result keys
+    /// [`ContentHashMeshCache`]: identical content — wherever it lives —
+    /// yields the same mesh and shares one `Arc`.
+    fn mesh_fingerprint(&mut self, coord: SectionCoord) -> SectionContentFingerprint {
+        self.fp_words.clear();
+        self.fp_bytes.clear();
+        let Some(stored) = self.sections.get(&coord) else {
+            return compute_section_fingerprint(&self.fp_words, &self.fp_bytes);
+        };
+        for index in 0..SECTION_CELLS {
+            Self::fingerprint_push_block(&mut self.fp_words, stored.blocks.cell(index));
+        }
+        self.fp_bytes.extend_from_slice(&stored.block_light);
+        self.fp_bytes.extend_from_slice(&stored.sky_light);
+        let (borders, edges) = sample_neighbor_halo(coord, self.missing, |neighbor, _| {
+            self.sections.get(&neighbor).map(|arc| &**arc)
+        });
+        for border in &borders {
+            for sample in border {
+                Self::fingerprint_push_block(&mut self.fp_words, sample.block);
+                self.fp_bytes.push(sample.light.0);
+            }
+        }
+        for sample in &edges {
+            Self::fingerprint_push_block(&mut self.fp_words, sample.block);
+            self.fp_bytes.push(sample.light.0);
+        }
+        compute_section_fingerprint(&self.fp_words, &self.fp_bytes)
+    }
+
+    fn fingerprint_push_block(words: &mut Vec<u32>, block: Block) {
+        words.push(block.state_id);
+        words.push(block.tint);
+        words.push(block.fluid_tint);
+        words.push(
+            u32::from(block.flags)
+                | u32::from(block.occlusion) << 8
+                | u32::from(block.fluid_kind) << 16
+                | u32::from(block.fluid_level) << 24,
+        );
+    }
+
+    /// Rebuild `coord`'s mesh through the content-hash cache: the
+    /// fingerprint lookup returns the shared `Arc` on a hit and only the
+    /// miss path runs the mesher. Reused `fp_words`/`fp_bytes` keep the
+    /// fingerprint allocation-free past warm-up.
+    fn build_shared(&mut self, coord: SectionCoord) -> Arc<Vec<Quad>> {
+        let fp = self.mesh_fingerprint(coord);
+        let sections = &self.sections;
+        let missing = self.missing;
+        let (mesh, _hit) = self
+            .content_meshes
+            .get_or_build(fp, || Self::build_sections(sections, missing, coord));
+        // Identical content fingerprints produce identical quads, so the
+        // dedup-hit path still derives the same descriptor.
+        self.render_metas.insert(coord, quads_render_meta(&mesh));
+        mesh
+    }
+
+    #[cfg(test)]
     fn build(&self, coord: SectionCoord) -> Vec<Quad> {
-        let stored = &self.sections[&coord];
-    // Compact and uniform sections hold no dense array; materialize one just for
+        Self::build_sections(&self.sections, self.missing, coord)
+    }
+
+    fn build_sections(
+        sections: &HashMap<SectionCoord, Arc<CompressedSection>>,
+        missing: MissingNeighbor,
+        coord: SectionCoord,
+    ) -> Vec<Quad> {
+        let stored = &sections[&coord];
+        // Compact and uniform sections hold no dense array; materialize one just for
         // this meshing pass so `SectionView` keeps its flat-block layout and
         // the mesher output is bit-identical to a dense snapshot.
         let expanded;
@@ -1020,8 +1346,8 @@ impl MeshCache {
                 &expanded
             }
         };
-        let (borders, edges) = sample_neighbor_halo(coord, self.missing, |neighbor, _| {
-            self.sections.get(&neighbor).map(|arc| &**arc)
+        let (borders, edges) = sample_neighbor_halo(coord, missing, |neighbor, _| {
+            sections.get(&neighbor).map(|arc| &**arc)
         });
         let view = SectionView {
             blocks,
@@ -1029,7 +1355,7 @@ impl MeshCache {
             sky_light: &stored.sky_light,
             borders: borders.each_ref().map(Some),
             edges_and_corners: Some(&edges),
-            missing: self.missing,
+            missing,
         };
         mesh_section(&view)
     }
@@ -1218,8 +1544,10 @@ mod tests {
         let opaque_quad = quad_at(9.0, Layer::Opaque);
         cache
             .meshes
-            .insert(coord, vec![near_quad, far_quad, opaque_quad]);
-        cache.meshes.insert(stale, vec![near_quad, far_quad]);
+            .insert(coord, Arc::new(vec![near_quad, far_quad, opaque_quad]));
+        cache
+            .meshes
+            .insert(stale, Arc::new(vec![near_quad, far_quad]));
         cache.dirty.insert(stale);
 
         // First sort always runs; camera at x=4 makes x=6.5 the far quad.

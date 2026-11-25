@@ -12,56 +12,57 @@
 //! A cell is open when it is not a full-occlusion opaque cube (`OPAQUE` with
 //! all six `occlusion` bits set). Air, partial-occlusion cubes, cutout and
 //! translucent blocks, and fluids all admit sight; a waterlogged opaque cube
-//! still blocks it. The flood fill is allocation-free: a 512-bit closed
-//! bitmap, a 512-bit visited bitmap reused from it, and a fixed 4096-entry
-//! stack live entirely in stack memory.
+//! still blocks it. The flood fill itself is
+//! [`megu_core::render_cs::compute_section_visibility`] — allocation-free
+//! with a `VoxelBitset4096` visited set and a fixed 4096-entry stack.
 
-use crate::section::{Block, Direction, ALL_FACES, EDGE, FACE_CELLS, OPAQUE, SECTION_CELLS};
+use megu_core::bloom::VoxelBitset4096;
+use megu_core::render_cs::{compute_section_visibility, FaceDir, SectionVisBits};
 
-const WORD_BITS: usize = u64::BITS as usize;
-const WORDS: usize = SECTION_CELLS / WORD_BITS;
+use crate::section::{Block, Direction, ALL_FACES, OPAQUE, SECTION_CELLS};
+
 const FACES: usize = 6;
 /// All 36 entries of the 6x6 matrix, bit `enter * 6 + exit` per pair.
 const MATRIX_BITS: u64 = (1 << (FACES * FACES)) - 1;
-const STEPS: [isize; FACES] = [
-    -(FACE_CELLS as isize),
-    FACE_CELLS as isize,
-    -(EDGE as isize),
-    EDGE as isize,
-    -1,
-    1,
+
+/// `Direction` order (Down/Up/North/South/West/East) expressed as
+/// `FaceDir`s — `DIR_TO_FACEDIR[d as usize]` is the same world face.
+const DIR_TO_FACEDIR: [FaceDir; FACES] = [
+    FaceDir::NegY, // Direction::Down
+    FaceDir::PosY, // Direction::Up
+    FaceDir::NegZ, // Direction::North
+    FaceDir::PosZ, // Direction::South
+    FaceDir::NegX, // Direction::West
+    FaceDir::PosX, // Direction::East
 ];
+
+/// `FaceDir` index order (PosX/NegX/PosY/NegY/PosZ/NegZ) expressed as
+/// `Direction`s — `FACEDIR_TO_DIR[fd as usize]` is the same world face.
+const FACEDIR_TO_DIR: [Direction; FACES] = [
+    Direction::East,  // FaceDir::PosX
+    Direction::West,  // FaceDir::NegX
+    Direction::Up,    // FaceDir::PosY
+    Direction::Down,  // FaceDir::NegY
+    Direction::South, // FaceDir::PosZ
+    Direction::North, // FaceDir::NegZ
+];
+
+/// The `FaceDir` naming the same world axis/sign as `direction`.
+#[inline(always)]
+pub const fn direction_face_dir(direction: Direction) -> FaceDir {
+    DIR_TO_FACEDIR[direction as usize]
+}
+
+/// The `Direction` naming the same world axis/sign as `face`.
+#[inline(always)]
+pub const fn face_dir_direction(face: FaceDir) -> Direction {
+    FACEDIR_TO_DIR[face as usize]
+}
 
 /// Whether `block` stops sight traversal through its cell.
 #[inline(always)]
-fn blocks_sight(block: Block) -> bool {
+pub(crate) fn blocks_sight(block: Block) -> bool {
     block.flags & OPAQUE != 0 && block.occlusion & ALL_FACES == ALL_FACES
-}
-
-/// `Direction::bit` for every boundary plane the cell at `index` lies on; an
-/// edge or corner cell reports two or three faces.
-#[inline(always)]
-fn cell_faces(x: usize, y: usize, z: usize) -> u8 {
-    let mut faces = 0;
-    if y == 0 {
-        faces |= Direction::Down.bit();
-    }
-    if y == EDGE - 1 {
-        faces |= Direction::Up.bit();
-    }
-    if z == 0 {
-        faces |= Direction::North.bit();
-    }
-    if z == EDGE - 1 {
-        faces |= Direction::South.bit();
-    }
-    if x == 0 {
-        faces |= Direction::West.bit();
-    }
-    if x == EDGE - 1 {
-        faces |= Direction::East.bit();
-    }
-    faces
 }
 
 /// Symmetric 6x6 face-to-face reachability for one 16x16x16 section. Bit
@@ -93,6 +94,12 @@ impl FaceVisibility {
     /// The packed matrix: bit `from * 6 + to`.
     pub const fn bits(self) -> u64 {
         self.0
+    }
+
+    /// Wrap an already-packed `Direction`-ordered matrix — the inverse of
+    /// [`Self::bits`].
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
     }
 
     /// Whether exiting through `to` is possible after entering through `from`.
@@ -137,109 +144,71 @@ impl FaceVisibility {
         }
     }
 
-    /// Compute the graph from cell data alone. One pass packs a closed-cell
-    /// bitmap (uniform sections exit there), then each unvisited open cell
-    /// floods its connected component and connects every boundary-face pair
-    /// the component touches.
-    pub fn compute(blocks: &[Block; SECTION_CELLS]) -> Self {
-        let mut visited = [0u64; WORDS];
-        let mut any_open = false;
-        let mut any_closed = false;
-        let mut states = [0u16; WORD_BITS];
-        for (w, word) in visited.iter_mut().enumerate() {
-            for (i, &block) in blocks[w * WORD_BITS..(w + 1) * WORD_BITS]
-                .iter()
-                .enumerate()
-            {
-                states[i] = u16::from(blocks_sight(block));
-            }
-            let m = megu_core::simd_voxel::build_non_air_bitmask_64(&states);
-            *word = m;
-            any_closed |= m != 0;
-            any_open |= m != u64::MAX;
+    /// The same connectivity in `FaceDir` bit order — bit `a * 6 + b` of
+    /// the [`SectionVisBits`] is set iff entering through `FaceDir` `a`
+    /// can exit through `b`. `SectionVisBits::set` marks both directions,
+    /// matching this matrix's symmetry.
+    #[must_use]
+    pub fn to_vis_bits(self) -> SectionVisBits {
+        if self.0 == 0 {
+            return SectionVisBits::EMPTY;
         }
-        if !any_open {
+        if self.0 == MATRIX_BITS {
+            return SectionVisBits::ALL;
+        }
+        let mut out = SectionVisBits::EMPTY;
+        for (enter, &fd_enter) in DIR_TO_FACEDIR.iter().enumerate() {
+            for (exit, &fd_exit) in DIR_TO_FACEDIR.iter().enumerate() {
+                if self.0 >> (enter * FACES + exit) & 1 != 0 {
+                    out.set(fd_enter, fd_exit);
+                }
+            }
+        }
+        out
+    }
+
+    /// The same connectivity in `Direction` bit order — the inverse of
+    /// [`Self::to_vis_bits`].
+    #[must_use]
+    pub fn from_vis_bits(bits: SectionVisBits) -> Self {
+        if bits == SectionVisBits::EMPTY {
             return Self::NONE;
         }
-        if !any_closed {
+        if bits == SectionVisBits::ALL {
             return Self::ALL;
         }
-
-        // Closed cells start marked visited, so the walk only enters open ones.
-        let mut stack = [0u16; SECTION_CELLS];
-        let mut bits = 0u64;
-        for start in 0..SECTION_CELLS {
-            let word = &mut visited[start / WORD_BITS];
-            let start_bit = 1 << (start % WORD_BITS);
-            if *word & start_bit != 0 {
-                continue;
-            }
-            let mut faces = 0u8;
-            let mut top = 0usize;
-            *word |= start_bit;
-            stack[top] = start as u16;
-            top += 1;
-            while top != 0 {
-                top -= 1;
-                let index = stack[top] as usize;
-                let x = index % EDGE;
-                let z = (index / EDGE) % EDGE;
-                let y = index / FACE_CELLS;
-                faces |= cell_faces(x, y, z);
-                let mut count = 0usize;
-                let mut next = [0usize; FACES];
-                if x != 0 {
-                    next[count] = (index as isize + STEPS[Direction::West as usize]) as usize;
-                    count += 1;
+        let mut out = 0u64;
+        for (enter, &fd_enter) in DIR_TO_FACEDIR.iter().enumerate() {
+            for (exit, &fd_exit) in DIR_TO_FACEDIR.iter().enumerate() {
+                if bits.can_see(fd_enter, fd_exit) {
+                    out |= 1 << (enter * FACES + exit);
                 }
-                if x != EDGE - 1 {
-                    next[count] = (index as isize + STEPS[Direction::East as usize]) as usize;
-                    count += 1;
-                }
-                if z != 0 {
-                    next[count] = (index as isize + STEPS[Direction::North as usize]) as usize;
-                    count += 1;
-                }
-                if z != EDGE - 1 {
-                    next[count] = (index as isize + STEPS[Direction::South as usize]) as usize;
-                    count += 1;
-                }
-                if y != 0 {
-                    next[count] = (index as isize + STEPS[Direction::Down as usize]) as usize;
-                    count += 1;
-                }
-                if y != EDGE - 1 {
-                    next[count] = (index as isize + STEPS[Direction::Up as usize]) as usize;
-                    count += 1;
-                }
-                for &n in &next[..count] {
-                    let word = &mut visited[n / WORD_BITS];
-                    let bit = 1 << (n % WORD_BITS);
-                    if *word & bit == 0 {
-                        *word |= bit;
-                        stack[top] = n as u16;
-                        top += 1;
-                    }
-                }
-            }
-            let row = u64::from(faces);
-            let mut touched = faces;
-            while touched != 0 {
-                let enter = touched.trailing_zeros() as usize;
-                touched &= touched - 1;
-                bits |= row << (enter * FACES);
-            }
-            if bits == MATRIX_BITS {
-                break;
             }
         }
-        Self(bits)
+        Self(out)
+    }
+
+    /// Compute the graph from cell data alone. The closed-cell predicate
+    /// packs into a [`VoxelBitset4096`] whose flood fill is
+    /// [`megu_core::render_cs::compute_section_visibility`]'s — the same
+    /// 6-connected component walk, the same "every pair of faces one
+    /// component touches is mutually reachable" rule, and O(1) exits for
+    /// uniform sections.
+    pub fn compute(blocks: &[Block; SECTION_CELLS]) -> Self {
+        let mut opaque = VoxelBitset4096::new();
+        for (index, &block) in blocks.iter().enumerate() {
+            if blocks_sight(block) {
+                opaque.set(index as u16);
+            }
+        }
+        Self::from_vis_bits(compute_section_visibility(&opaque))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::section::{EDGE, FACE_CELLS};
 
     fn blocks_of(block: Block) -> Box<[Block; SECTION_CELLS]> {
         Box::new([block; SECTION_CELLS])

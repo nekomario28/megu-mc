@@ -13,70 +13,76 @@ use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use megu_client::shaders::{
-    TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL, WgslStage, validate_wgsl_module,
+    validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
 use megu_client::world::WorldState;
 use megu_client_mesh::atlas::{AtlasMip, AtlasTileRect, PackedAtlas, SpriteAnimation};
 use megu_client_mesh::ber_instancing::{VanillaParticleQuad, VanillaParticleWorld};
 use megu_client_mesh::builtin_shadow_wgsl::{
-    BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
-    MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL, MEGU_SHADOW_DEPTH_WGSL,
-    MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL, MEGU_SPATIAL_SHARPEN_WGSL,
-    MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL, MEGU_WATER_SURFACE_WGSL,
+    build_shadow_uniforms_celestial, compute_cascade_splits, compute_region_light_mask,
+    compute_sun_direction, negotiate_builtin_shadow_quality, pack_lighting_feature_flags,
+    pack_vfx1_lights, BuiltinShadowQuality, CascadeConfig, DirtyOnlyShadowCache, EclipseMode,
     RenderScalePreset, ShadowCacheDecision, ShadowCamera, ShadowDirtyReason, ShadowUniforms,
-    VfxLightUniforms, build_shadow_uniforms_celestial, compute_cascade_splits,
-    compute_region_light_mask, compute_sun_direction, negotiate_builtin_shadow_quality,
-    pack_lighting_feature_flags, pack_vfx1_lights,
+    VfxLightUniforms, MEGU_SHADOW_CASTERS_WGSL, MEGU_SHADOW_CUTOUT_DEPTH_WGSL,
+    MEGU_SHADOW_DEPTH_WGSL, MEGU_SHADOW_SAMPLING_WGSL, MEGU_SKY_ATMOSPHERE_WGSL,
+    MEGU_SPATIAL_SHARPEN_WGSL, MEGU_STAINED_GLASS_SHADOW_COLOR_WGSL, MEGU_TERRAIN_LIT_WGSL,
+    MEGU_WATER_SURFACE_WGSL,
 };
 use megu_client_mesh::compact_vertex::{
-    COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID, COMPACT_VERTEX_MAX_TINT,
-    COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK, CompactVoxelVertex,
+    CompactVoxelVertex, COMPACT_VERTEX_MAX_EDGE, COMPACT_VERTEX_MAX_STATE_ID,
+    COMPACT_VERTEX_MAX_TINT, COMPACT_VERTEX_MAX_Y_FIXED, COMPACT_VERTEX_WGSL_UNPACK,
 };
 use megu_client_mesh::ffi::PackedVertex;
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vfx_engine::DynamicColoredLight;
 use megu_client_mesh::{
-    BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind, PipelineStage,
-    RenderBackendPreference, ShaderPackSource, is_megu_wgsl_pack,
+    box_in_frustum, face_dir_direction, ChunkUploadBudget, DirectionBuckets, HiZPyramid,
+    RenderRegions, SectionCoord, SectionGraph, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED,
+    EDGE, REGION_X, REGION_Y, REGION_Z,
 };
 use megu_client_mesh::{
-    ChunkUploadBudget, DIRECTION_BUCKETS, Direction, DirectionBuckets, EDGE, GraphCuller,
-    HiZPyramid, REGION_X, REGION_Y, REGION_Z, RenderRegions, SectionCoord, SectionGraph,
-    box_facing_mask, box_in_frustum, bucket_draw_mask,
+    is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
+    PipelineStage, RenderBackendPreference, ShaderPackSource,
 };
+use megu_core::coords::{DimIndex, SectionKey};
 use megu_core::hash::{
-    FNV1A64_OFFSET_BASIS as FNV1A_OFFSET, FNV1A64_PRIME as FNV1A_PRIME, Fnv1a64,
+    Fnv1a64, FNV1A64_OFFSET_BASIS as FNV1A_OFFSET, FNV1A64_PRIME as FNV1A_PRIME,
 };
 use megu_core::math_opt_engine::{morton3d_encode, morton3d_signed, projected_sphere_diameter_px};
 use megu_core::math_opt_foundation::{LipschitzTileClassifier, TileSignDecision};
+use megu_core::mesh_elision::FramePacingUploadRing;
+use megu_core::render_cs::{
+    bfs_visible_sections, visible_face_mask_protrusion, BfsScratch, FaceDir, RenderGraph,
+    ResourceDesc, SectionRenderMetadata, SectionVisBits,
+};
 use megu_kernel::debug_chords::DebugLine;
-use megu_kernel::entity_interp::{SkyFogInput, SkyFogOutput, evaluate_sky_and_fog};
-use megu_ui::draw::{FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH, UiMesh, font_atlas_rgba};
+use megu_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
+use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::gpu_hiz::{CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord};
 use crate::live_session::hw_adaptive_engine::{
-    ComputeStrategy, GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
-    detect_universal_hardware_profile, select_compute_strategy,
+    detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
+    GpuComputeParadigm, MemoryFootprintClass, MemoryTransferStrategy,
 };
 use crate::live_session::{is_cloud_subworld_id, ExternalSectionsDelta, LiveSession};
 use crate::mat4_mul;
 use crate::mesh_pool::{
-    HiZSplatSection, MeshJob, MeshJobPool, MeshResult, build_hiz_stream,
-    compute_opaque_bucket_ranges,
+    build_hiz_stream, compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool,
+    MeshResult,
 };
 use crate::subworld_render::{
-    COMPOSITE_TERRAIN_WGSL, CompositeDrawUniforms, CompositeEnvUniforms, DEBUG_LINE_VERTEX_LAYOUT,
-    DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, DebugLineVertex, LIT_VERTEX_LAYOUT, PART_INSTANCE_LAYOUT,
+    lit_wgsl, pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms,
+    DebugLineVertex, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank,
+    SubWorldTransform, TerrainVertex, VfxLightsGpu, COMPOSITE_TERRAIN_WGSL,
+    DEBUG_LINE_VERTEX_LAYOUT, DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT,
     PARTICLE_BILLBOARD_CORNERS, PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT,
-    PARTICLE_QUAD_LAYOUT, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache,
-    SubWorldRenderBank, SubWorldTransform, TerrainVertex, VfxLightsGpu, lit_wgsl,
-    pack_particle_billboard,
+    PARTICLE_QUAD_LAYOUT, PART_INSTANCE_LAYOUT,
 };
 use crate::{
-    Camera, DemoScene, Mat4, build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for,
-    mat4_mul_vec4, negotiate_pipeline, pack_quads_to_vertices, wgpu_backends_for,
+    build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, mat4_mul_vec4,
+    negotiate_pipeline, pack_quads_to_vertices, wgpu_backends_for, Camera, DemoScene, Mat4,
 };
 
 // ---------------------------------------------------------------------------
@@ -2292,6 +2298,14 @@ const HIZ_RESPLAT_EPSILON: f32 = 1e-3;
 /// bounds how long the pyramid can lag a slowly-panning camera.
 const HIZ_RESPLAT_CADENCE: u32 = 8;
 
+/// Protrusion scan reach for [`bfs_visible_sections`], in blocks: every
+/// newly-visible section probes neighbours within this reach and reveals
+/// any whose declared `max_protrusion_blocks` can geometrically bridge
+/// the gap — a modded overhang can never pop out behind sealed portals.
+/// 16 blocks = the ring-1 neighbourhood, which covers vanilla models and
+/// any protrusion the packed quad stream can represent.
+const BFS_PROTRUSION_SCAN_BLOCKS: u8 = 16;
+
 /// The non-visual halves of a [`ComputeStrategy`]: which
 /// [`ChunkUploadBudget`] preset the memory topology warrants and how many
 /// mesh-worker threads the worker split reserves for the foreground path.
@@ -2580,31 +2594,39 @@ pub(crate) fn view_proj_row_major(view_proj: &Mat4) -> [[f32; 4]; 4] {
     std::array::from_fn(|row| std::array::from_fn(|col| view_proj[col][row]))
 }
 
-/// Per-axis boundary sides in `box_facing_mask` order: `(axis, low, high)`
-/// mapped from the same (West/East, Down/Up, North/South) pairing.
-const FACING_AXIS_SIDES: [(usize, Direction, Direction); 3] = [
-    (0, Direction::West, Direction::East),
-    (1, Direction::Down, Direction::Up),
-    (2, Direction::North, Direction::South),
-];
-
-/// The buckets a section may draw this frame. Starts from
-/// [`bucket_draw_mask`] of the boundary sides facing the camera (which
-/// always keeps the unassigned bucket), then re-adds both directions on
-/// every axis the camera sits *inside* — an interior face can front-face
-/// a camera embedded in the section's span, so only the strict far-side
-/// opposite buckets drop. The skipped set is therefore exactly the
-/// back-facing direction buckets the S3 audit targets (a camera strictly
-/// west skips every `+X`/East bucket), never a face that could show.
-fn section_draw_mask(min: [f32; 3], camera: [f32; 3]) -> u8 {
-    let facing = box_facing_mask(min, camera);
-    let mut draw = bucket_draw_mask(facing);
-    for &(axis, low, high) in &FACING_AXIS_SIDES {
-        if camera[axis] >= min[axis] && camera[axis] <= min[axis] + EDGE as f32 {
-            draw |= low.bit() | high.bit();
+/// The buckets a section may draw this frame.
+/// [`visible_face_mask_protrusion`] computes the strict `FaceDir` half-space
+/// mask in section coords (i64 block math, expanded by the section's
+/// declared protrusion span) and `face_dir_direction` permutes it into
+/// `Direction`-ordered bucket bits; the always-drawn
+/// [`DIRECTION_BUCKET_UNASSIGNED`] bit carries geometry no facing test can
+/// classify. Emits the same "strict far-side opposite drops, inside-axis
+/// keeps both sides" set the old `box_facing_mask` + inside-axis re-add
+/// produced — an overhanging model simply widens its own box.
+fn section_draw_mask(coord: SectionCoord, camera: [f32; 3], protrusion_blocks: u8) -> u8 {
+    let cam_sec = (
+        (camera[0] / EDGE as f32).floor() as i32,
+        (camera[1] / EDGE as f32).floor() as i32,
+        (camera[2] / EDGE as f32).floor() as i32,
+    );
+    let face_mask =
+        visible_face_mask_protrusion(cam_sec, (coord.0, coord.1, coord.2), protrusion_blocks);
+    let mut draw = 1u8 << DIRECTION_BUCKET_UNASSIGNED;
+    for dir in FaceDir::ALL {
+        if face_mask & dir.bit() != 0 {
+            draw |= face_dir_direction(dir).bit();
         }
     }
     draw
+}
+
+/// The `protrusion_blocks` a section declared at mesh build, or `0` when no
+/// [`SectionRenderMetadata`] is mirrored for `coord`.
+fn section_protrusion(
+    meta: &HashMap<SectionCoord, SectionRenderMetadata>,
+    coord: SectionCoord,
+) -> u8 {
+    meta.get(&coord).map_or(0, |m| m.effective_protrusion())
 }
 
 /// Rewrite the section-local opaque vertex decode of `source` (one of
@@ -2772,6 +2794,7 @@ fn emitted_section_count(
     bucket_records: &[Vec<ArenaDrawRecord>; DIRECTION_BUCKETS],
     culled_sections: &CullVerdicts,
     camera_position: [f32; 3],
+    render_meta: &HashMap<SectionCoord, SectionRenderMetadata>,
     scratch: &mut HashSet<SectionCoord>,
 ) -> usize {
     scratch.clear();
@@ -2781,12 +2804,8 @@ fn emitted_section_count(
             if culled_sections.contains(coord) {
                 continue;
             }
-            let min = [
-                coord.0 as f32 * EDGE as f32,
-                coord.1 as f32 * EDGE as f32,
-                coord.2 as f32 * EDGE as f32,
-            ];
-            if section_draw_mask(min, camera_position) >> bucket & 1 != 0 {
+            let protrusion = section_protrusion(render_meta, *coord);
+            if section_draw_mask(*coord, camera_position, protrusion) >> bucket & 1 != 0 {
                 scratch.insert(*coord);
             }
         }
@@ -2817,6 +2836,7 @@ fn encode_opaque_terrain<'a>(
     shared_index: &'a wgpu::Buffer,
     culled_sections: &CullVerdicts,
     camera_position: [f32; 3],
+    render_meta: &'a HashMap<SectionCoord, SectionRenderMetadata>,
     chunk_fades: &ChunkFadeTracker,
     frame_bind_group: &'a wgpu::BindGroup,
     env_bind_group: &'a wgpu::BindGroup,
@@ -2912,13 +2932,14 @@ fn encode_opaque_terrain<'a>(
                 for record in records {
                     let coord = &record.coord;
                     let culled = culled_sections.contains(coord);
-                    let min = [
-                        coord.0 as f32 * EDGE as f32,
-                        coord.1 as f32 * EDGE as f32,
-                        coord.2 as f32 * EDGE as f32,
-                    ];
-                    let kept =
-                        !culled && section_draw_mask(min, camera_position) >> bucket & 1 != 0;
+                    let kept = !culled
+                        && section_draw_mask(
+                            *coord,
+                            camera_position,
+                            section_protrusion(render_meta, *coord),
+                        ) >> bucket
+                            & 1
+                            != 0;
                     if !kept {
                         if !culled {
                             skipped_buckets += 1;
@@ -2965,6 +2986,7 @@ fn encode_opaque_terrain<'a>(
                 &arena.bucket_records,
                 culled_sections,
                 camera_position,
+                render_meta,
                 emitted_scratch,
             );
             arena_regions += usize::from(bound);
@@ -3000,7 +3022,11 @@ fn encode_opaque_terrain<'a>(
             draw_light_mask(min, [min[0] + edge, min[1] + edge, min[2] + edge], lights);
         match section.opaque_bucket_ranges {
             Some(ranges) => {
-                let draw_mask = section_draw_mask(min, camera_position);
+                let draw_mask = section_draw_mask(
+                    *coord,
+                    camera_position,
+                    section_protrusion(render_meta, *coord),
+                );
                 for (bucket, &(start, count)) in ranges.iter().enumerate() {
                     if count == 0 {
                         continue;
@@ -3242,11 +3268,48 @@ pub struct GpuRenderer {
     pub hiz_splat_recycled: u64,
     /// Visibility graphs mirrored from the world on the last
     /// [`Self::update_live_terrain`] pass; feeds the composed frame's
-    /// [`GraphCuller`] search. Empty until the first terrain sync.
+    /// zero-alloc [`bfs_visible_sections`] portal flood. Empty until the
+    /// first terrain sync.
     section_graphs: HashMap<SectionCoord, SectionGraph>,
+    /// Per-section render descriptors mirrored on the same events as
+    /// `section_graphs`: `has_protruding_bounds`/`max_protrusion_blocks`
+    /// (measured at mesh build) drive the BFS protrusion scan and the
+    /// `section_draw_mask` box expansion, `has_non_axis_geometry` keeps
+    /// their custom-bucket geometry unconditionally drawn. `vis_bits`
+    /// here is unused — portal connectivity always comes from
+    /// `section_graphs`.
+    section_render_meta: HashMap<SectionCoord, SectionRenderMetadata>,
+    /// Reusable BFS state for [`bfs_visible_sections`] — `clear` keeps
+    /// the queue/map allocations, so steady frames perform zero heap
+    /// traffic in the portal flood.
+    bfs_scratch: BfsScratch,
+    /// Caller-owned `out` of the same BFS — the visible `SectionKey` set
+    /// for the frame, drained into `cull_result`'s bitmask.
+    bfs_out: Vec<SectionKey>,
     /// Dirty-coord refresh passes that kept `section_graphs` instead of
     /// rebuilding it, cumulative — proves the incremental sync path ran.
     pub section_graph_partial_syncs: u64,
+    /// Byte-paced upload ring mirroring `pending_uploads`' coord set:
+    /// the drain's non-P0 ordering comes from its proximity-score heap
+    /// and `drain_frame_budget` caps staged bytes per frame; payloads
+    /// stay in `pending_uploads`. Stale entries (dropped by reconcile or
+    /// a P0 install) self-heal on the next drain.
+    upload_ring: FramePacingUploadRing<()>,
+    /// Retained `drain_frame_budget` output — refilled every drain.
+    upload_ring_scratch: Vec<(SectionKey, ())>,
+    /// Last compiled composed-frame [`RenderGraph`]'s answer to "does a
+    /// post-world pass consume the depth attachment": drives
+    /// `depth_store_op`. `None` before the first compiled frame keeps the
+    /// conservative `Store`.
+    graph_depth_consumed: Option<bool>,
+    /// Dead passes culled by the most recent render-graph compile,
+    /// cumulative.
+    pub render_graph_culled_passes: u64,
+    /// Transient bytes the last compiled graph proved aliasable into
+    /// shared slots, cumulative — the render-graph VRAM report.
+    pub render_graph_aliased_bytes: u64,
+    /// Composed-frame render graphs compiled, cumulative.
+    pub render_graph_compiles: u64,
     /// Hi-Z occlusion pyramid consulted after the graph/frustum test in
     /// the composed pass. The background worker pool rebuilds it from each
     /// frame's drawn occluder depth (`hiz_source_vp` records the
@@ -7477,7 +7540,16 @@ impl GpuRenderer {
             hiz_splat_scratch: Vec::new(),
             hiz_splat_recycled: 0,
             section_graphs: HashMap::new(),
+            section_render_meta: HashMap::new(),
+            bfs_scratch: BfsScratch::default(),
+            bfs_out: Vec::new(),
             section_graph_partial_syncs: 0,
+            upload_ring: FramePacingUploadRing::new(),
+            upload_ring_scratch: Vec::new(),
+            graph_depth_consumed: None,
+            render_graph_culled_passes: 0,
+            render_graph_aliased_bytes: 0,
+            render_graph_compiles: 0,
             hiz_pyramid: None,
             hiz_source_vp: None,
             hiz_manual: false,
@@ -8992,6 +9064,15 @@ impl GpuRenderer {
         });
         self.section_graphs.clear();
         self.section_graphs.extend(world.section_graphs());
+        // The render-metadata mirror shares the graphs' domain — every
+        // loaded section gets its build-measured protrusion/non-axis
+        // facts (or nothing while its first mesh is unbuilt).
+        self.section_render_meta.clear();
+        self.section_render_meta.extend(
+            self.section_graphs
+                .keys()
+                .filter_map(|&coord| world.section_render_meta(coord).map(|meta| (coord, meta))),
+        );
         // Order-independent stamp of the mirrored graph set — a graph-only
         // world change must still invalidate the composed-frame cull cache.
         let graphs_stamp = self.compute_graphs_stamp();
@@ -9002,6 +9083,7 @@ impl GpuRenderer {
                     arena.remove(coord);
                 }
             }
+            self.section_render_meta.remove(&coord);
             self.invalidate_hiz();
         }
         let grace = self.transfer_budget.idle_slab_reclaim_frames;
@@ -9078,6 +9160,7 @@ impl GpuRenderer {
             coord,
             PendingSectionUpload::new(packed.clone(), packed_digest, order.clone(), buckets),
         );
+        self.push_upload_ring(coord);
         // Speculative geometry build off the render thread: the drain
         // prefers this result when the worker finishes before the
         // budget admits the section; a full queue falls back inline.
@@ -9129,6 +9212,7 @@ impl GpuRenderer {
                 external.buckets,
             ),
         );
+        self.push_upload_ring(coord);
         // Same speculative geometry prefetch the world path submits —
         // the external stream feeds `section_geometry` identically.
         if self.mesh_pool.try_submit(MeshJob::SectionGeometry {
@@ -9185,6 +9269,7 @@ impl GpuRenderer {
                     self.external_sections.remove(&coord);
                     self.pending_uploads.remove(&coord);
                     self.completed_geometry.remove(&coord);
+                    self.section_render_meta.remove(&coord);
                     if let Some(section) = self.live_sections.remove(&coord) {
                         removed_any = true;
                         self.water_sections = self
@@ -9250,6 +9335,7 @@ impl GpuRenderer {
                         continue;
                     }
                     self.external_sections.remove(&coord);
+                    self.section_render_meta.remove(&coord);
                     if let Some(section) = self.live_sections.remove(&coord) {
                         removed_any = true;
                         self.water_sections = self
@@ -9293,6 +9379,11 @@ impl GpuRenderer {
                         self.cull_graphs_stamp =
                             self.cull_graphs_stamp.wrapping_add(graph_key_stamp(coord));
                     }
+                    // Same O(dirty) refresh for the render-metadata mirror.
+                    match world.section_render_meta(coord) {
+                        Some(meta) => self.section_render_meta.insert(coord, meta),
+                        None => self.section_render_meta.remove(&coord),
+                    };
                 }
                 self.section_graph_partial_syncs += 1;
             }
@@ -9842,7 +9933,11 @@ impl GpuRenderer {
                 origin: min,
                 positions: section.hiz_positions.clone(),
                 bucket_ranges: section.hiz_ranges,
-                draw_mask: section_draw_mask(min, camera_position),
+                draw_mask: section_draw_mask(
+                    *coord,
+                    camera_position,
+                    section_protrusion(&self.section_render_meta, *coord),
+                ),
             });
         }
         if self.mesh_pool.try_submit(MeshJob::HiZDepth {
@@ -10024,12 +10119,45 @@ impl GpuRenderer {
         self.player_position = position;
     }
 
+    /// The ring priority for one queued coord: a proximity score — the
+    /// nearer a section sits to the player the earlier its bytes stage.
+    /// Saturates at `u32::MAX` for the player's own cell and decays by
+    /// squared section distance, so equal-distance ties keep FIFO order.
+    fn upload_priority(&self, coord: SectionCoord) -> u32 {
+        let player_section = SectionCoord(
+            (self.player_position[0] / 16.0).floor() as i32,
+            (self.player_position[1] / 16.0).floor() as i32,
+            (self.player_position[2] / 16.0).floor() as i32,
+        );
+        let d2 = (i64::from(coord.0 - player_section.0)).pow(2)
+            + (i64::from(coord.1 - player_section.1)).pow(2)
+            + (i64::from(coord.2 - player_section.2)).pow(2);
+        u32::MAX.saturating_sub(u32::try_from(d2.min(i64::from(u32::MAX))).unwrap_or(u32::MAX))
+    }
+
+    /// Mirror one freshly-queued `pending_uploads` entry into the
+    /// byte-pacing ring — requeues generation-bump the stale entry so a
+    /// rebuilt payload never drains twice.
+    fn push_upload_ring(&mut self, coord: SectionCoord) {
+        let bytes = self.pending_uploads[&coord].upload_bytes;
+        let key = SectionKey {
+            dim: DimIndex::OVERWORLD,
+            cx: coord.0,
+            sy: coord.1,
+            cz: coord.2,
+        };
+        let priority = self.upload_priority(coord);
+        self.upload_ring.push(priority, bytes, key, ());
+    }
+
     /// Admit queued section uploads through the open [`ChunkUploadBudget`]
     /// frame and install the ones that fit; the rest stay queued for later
     /// frames. Priority-0 first: sections within one section (16 m) of the
     /// player bypass the budget and install immediately — a near edit
     /// must swap its slot atomically this frame, never X-ray-flicker
-    /// behind a far upload. Returns the number installed this frame.
+    /// behind a far upload. The remainder drains through
+    /// [`FramePacingUploadRing`]'s proximity-ordered, per-frame
+    /// byte-paced walk. Returns the number installed this frame.
     fn drain_pending_uploads(&mut self) -> usize {
         if self.pending_uploads.is_empty() {
             return 0;
@@ -10050,10 +10178,6 @@ impl GpuRenderer {
         // its slot swaps atomically this frame (no X-ray flicker). New
         // installs — even near ones — still flow through the per-frame
         // budget so a chunk burst cannot stall the render thread.
-        // P0 order first, remainder after — two passes over the retained
-        // buffer instead of `partition` + `chain` allocating a pair of
-        // vectors every drain (BTreeMap key order is preserved within
-        // each half, so the ordering is identical).
         let mut coords = std::mem::take(&mut self.upload_drain_scratch);
         coords.clear();
         for coord in self.pending_uploads.keys() {
@@ -10061,19 +10185,35 @@ impl GpuRenderer {
                 coords.push(*coord);
             }
         }
-        for coord in self.pending_uploads.keys() {
-            if !(near(coord) && self.live_sections.contains_key(coord)) {
-                coords.push(*coord);
+        for coord in coords.drain(..) {
+            if let Some(pending) = self.pending_uploads.remove(&coord) {
+                self.admitted_uploads += 1;
+                self.install_pending_upload(coord, pending);
+                admitted += 1;
             }
         }
-        for coord in coords.drain(..) {
+        self.upload_drain_scratch = coords;
+        // Non-P0: the ring orders candidates by proximity score and caps
+        // the bytes this frame may stage; `ChunkUploadBudget` still gates
+        // each admission on the live dual (bytes + µs) allowance. Entries
+        // the budget rejects go back onto the ring for a later frame;
+        // ring entries whose pending payload was dropped elsewhere
+        // (reconcile retain, P0 install) drain once and self-heal.
+        let mut ring_out = std::mem::take(&mut self.upload_ring_scratch);
+        ring_out.clear();
+        let budget_bytes = self.upload_budget.remaining_bytes();
+        self.upload_ring
+            .drain_frame_budget(budget_bytes, &mut ring_out);
+        for (key, ()) in ring_out.drain(..) {
+            let coord = SectionCoord(key.cx, key.sy, key.cz);
             let Some(pending) = self.pending_uploads.get(&coord) else {
                 continue;
             };
             let (bytes, cost_us) = (pending.upload_bytes, pending.cost_us);
-            let priority0 = near(&coord) && self.live_sections.contains_key(&coord);
-            if !priority0 && !self.upload_budget.try_schedule(bytes, cost_us) {
+            if !self.upload_budget.try_schedule(bytes, cost_us) {
                 self.deferred_uploads += 1;
+                self.upload_ring
+                    .push(self.upload_priority(coord), bytes, key, ());
                 continue;
             }
             let pending = self
@@ -10081,38 +10221,43 @@ impl GpuRenderer {
                 .remove(&coord)
                 .expect("pending checked");
             self.admitted_uploads += 1;
-            // Prefer the worker-built geometry when it is still for this
-            // exact packed payload; otherwise convert inline.
-            let completed = self
-                .completed_geometry
-                .remove(&coord)
-                .filter(|done| Arc::ptr_eq(&done.packed, &pending.packed));
-            match completed {
-                Some(done) => self.install_live_section_geometry(
-                    coord,
-                    &pending.packed,
-                    pending.packed_digest,
-                    translucent_order_digest(&pending.order),
-                    pending.order.len() as u32,
-                    pending.buckets,
-                    done.opaque_bucket_ranges,
-                    done.geometry,
-                ),
-                None => self.install_live_section(
-                    coord,
-                    &pending.packed,
-                    pending.packed_digest,
-                    &pending.order,
-                    pending.buckets,
-                ),
-            }
+            self.install_pending_upload(coord, pending);
             admitted += 1;
         }
-        self.upload_drain_scratch = coords;
+        self.upload_ring_scratch = ring_out;
         if admitted > 0 {
             self.shadow_cache.invalidate();
         }
         admitted
+    }
+
+    /// Install one admitted pending upload — the shared tail of both
+    /// drain passes. Prefers the worker-built geometry when it is still
+    /// for this exact packed payload; otherwise converts inline.
+    fn install_pending_upload(&mut self, coord: SectionCoord, pending: PendingSectionUpload) {
+        let completed = self
+            .completed_geometry
+            .remove(&coord)
+            .filter(|done| Arc::ptr_eq(&done.packed, &pending.packed));
+        match completed {
+            Some(done) => self.install_live_section_geometry(
+                coord,
+                &pending.packed,
+                pending.packed_digest,
+                translucent_order_digest(&pending.order),
+                pending.order.len() as u32,
+                pending.buckets,
+                done.opaque_bucket_ranges,
+                done.geometry,
+            ),
+            None => self.install_live_section(
+                coord,
+                &pending.packed,
+                pending.packed_digest,
+                &pending.order,
+                pending.buckets,
+            ),
+        }
     }
 
     /// Refresh `self.cull_result`: sections the composed pass will skip
@@ -10162,18 +10307,63 @@ impl GpuRenderer {
         }
         if !self.live_sections.is_empty() {
             let planes = frustum_planes_from_view_proj(view_proj);
-            // One graph-culler BFS per frame over the mirrored visibility
-            // set. Coords absent from the snapshot (mesh-only worlds) fall
-            // back to the frustum test rather than being treated as
-            // unreachable.
+            // One zero-alloc portal BFS per frame over the mirrored
+            // visibility set (`bfs_scratch`/`bfs_out` keep their
+            // allocations). Coords absent from the snapshot (mesh-only
+            // worlds) fall back to the frustum test rather than being
+            // treated as unreachable. The BFS's fail-closed protrusion
+            // scan additionally reveals any section whose declared
+            // `max_protrusion_blocks` can bridge into visible space —
+            // an overhanging model can never pop out behind sealed
+            // portals.
             let has_graphs = !self.section_graphs.is_empty();
-            let graph_visible = if has_graphs {
-                GraphCuller::new(camera_section, &planes)
-                    .search(self.section_graphs.iter().map(|(&c, &g)| (c, g)))
-                    .visible
+            if has_graphs {
+                let camera_key = SectionKey {
+                    dim: DimIndex::OVERWORLD,
+                    cx: camera_section.0,
+                    sy: camera_section.1,
+                    cz: camera_section.2,
+                };
+                let graphs = &self.section_graphs;
+                let render_meta = &self.section_render_meta;
+                // `meta` folds the old culler's two gates into the
+                // descriptor lookup: an absent graph means unloaded (never
+                // propagates) and an off-frustum node is culled *and* not
+                // traversed, exactly like the previous search.
+                let meta = |key: SectionKey| -> Option<SectionRenderMetadata> {
+                    let coord = SectionCoord(key.cx, key.sy, key.cz);
+                    if key == camera_key {
+                        // The camera seed expands unconditionally — open
+                        // air when no graph covers it.
+                        let mut m = render_meta.get(&coord).copied().unwrap_or_default();
+                        m.vis_bits = graphs
+                            .get(&coord)
+                            .map_or(SectionVisBits::ALL, |g| g.vis_bits());
+                        return Some(m);
+                    }
+                    let graph = graphs.get(&coord)?;
+                    let min = [
+                        coord.0 as f32 * EDGE as f32,
+                        coord.1 as f32 * EDGE as f32,
+                        coord.2 as f32 * EDGE as f32,
+                    ];
+                    if !box_in_frustum(min, &planes) {
+                        return None;
+                    }
+                    let mut m = render_meta.get(&coord).copied().unwrap_or_default();
+                    m.vis_bits = graph.vis_bits();
+                    Some(m)
+                };
+                bfs_visible_sections(
+                    camera_key,
+                    meta,
+                    BFS_PROTRUSION_SCAN_BLOCKS,
+                    &mut self.bfs_scratch,
+                    &mut self.bfs_out,
+                );
             } else {
-                Vec::new()
-            };
+                self.bfs_out.clear();
+            }
             // A worker-built pyramid only applies to the exact view it was
             // splatted with — a stale camera can't false-cull. Embedder
             // pyramids (`hiz_source_vp == None`) always apply.
@@ -10239,11 +10429,28 @@ impl GpuRenderer {
             let n = soa.coords.len();
             let words = n.div_ceil(64);
             // Scatter the BFS-reachable set into the per-slot mask —
-            // `visible` is a `Vec`, so this is one `index_of` probe per
+            // `bfs_out` is a `Vec`, so this is one `index_of` probe per
             // reached coord and no `HashSet` materialization at all.
+            // `visible`-list parity with the old search: only renderable
+            // sections in the frustum count as graph-visible.
             soa.graph_visible_bits.clear();
             soa.graph_visible_bits.resize(words, 0);
-            for &coord in &graph_visible {
+            for &key in &self.bfs_out {
+                let coord = SectionCoord(key.cx, key.sy, key.cz);
+                let Some(graph) = self.section_graphs.get(&coord) else {
+                    continue;
+                };
+                if !graph.renderable {
+                    continue;
+                }
+                let min = [
+                    coord.0 as f32 * EDGE as f32,
+                    coord.1 as f32 * EDGE as f32,
+                    coord.2 as f32 * EDGE as f32,
+                ];
+                if !box_in_frustum(min, &planes) {
+                    continue;
+                }
                 if let Some(&i) = culled.index_of.get(&coord) {
                     soa.graph_visible_bits[i as usize / 64] |= 1_u64 << (i % 64);
                 }
@@ -12734,10 +12941,15 @@ impl GpuRenderer {
     /// `TileBasedTbdr` adapters drop the on-chip depth tile after the
     /// pass instead of writing it back.
     fn depth_store_op(&self) -> wgpu::StoreOp {
-        // An active GPU Hi-Z culler reads the depth attachment after the
-        // pass to build next frame's pyramid — that counts as a real
-        // depth consumer, forcing `Store` even on `TileBasedTbdr`.
-        select_depth_store_op(self.gpu_paradigm, self.gpu_hiz.is_some())
+        // The compiled frame render graph reports whether any post-world
+        // pass still consumes the depth attachment — today that is the
+        // GPU Hi-Z pyramid build. `None` (no composed frame compiled
+        // yet) falls back to the presence signal, so the answer is never
+        // less conservative than the pre-graph check.
+        let depth_consumed = self
+            .graph_depth_consumed
+            .unwrap_or_else(|| self.gpu_hiz.is_some());
+        select_depth_store_op(self.gpu_paradigm, depth_consumed)
     }
 
     /// Report the negotiated [`GpuComputeParadigm`] (host detection at
@@ -13450,6 +13662,45 @@ impl GpuRenderer {
             world_time_ticks,
         } = *target;
         self.ensure_depth(width, height);
+        // Composed-frame render graph: the transient frame depth plus
+        // every post-world consumer registered this frame. The compiled
+        // plan's `lifetime(frame_depth)` answers "does anything past the
+        // world pass still read the attachment" — the dead-pass-culled,
+        // alias-coloured view of the same dependency the depth store op
+        // needs — and the aliasing telemetry reports how much transient
+        // VRAM the frame's pass set could share.
+        let mut graph = RenderGraph::new();
+        let frame_depth = graph.add_transient_resource(ResourceDesc {
+            bytes: u64::from(width) * u64::from(height) * 4,
+            kind_tag: 1, // depth32 target family
+        });
+        let world_pass = graph.add_pass("composed-world", &[], &[frame_depth], true);
+        if self.gpu_hiz.is_some() {
+            // The GPU Hi-Z culler reads the depth attachment after the
+            // pass to build next frame's pyramid — a real downstream
+            // consumer forcing depth writeback.
+            graph.add_pass("gpu-hiz-depth-build", &[frame_depth], &[], false);
+        }
+        match graph.compile() {
+            Ok(compiled) => {
+                self.render_graph_compiles += 1;
+                self.render_graph_culled_passes += compiled.culled_passes.len() as u64;
+                self.render_graph_aliased_bytes += compiled.vram_saved_bytes;
+                let world_pos = compiled
+                    .order
+                    .iter()
+                    .position(|&pass| pass == world_pass)
+                    .unwrap_or(0) as u32;
+                self.graph_depth_consumed = compiled
+                    .lifetime(frame_depth)
+                    .map(|(_, last)| last > world_pos);
+            }
+            Err(_) => {
+                // A failed compile must never drop the depth writeback —
+                // fail closed so the attachment stays readable.
+                self.graph_depth_consumed = Some(true);
+            }
+        }
         // Lazily stand up the dedicated water pass the first frame any
         // resident section carries decoded water geometry, and refresh
         // its shadow-uniform (stable frame state when shadow resources
@@ -13546,6 +13797,7 @@ impl GpuRenderer {
         let live_sections = &self.live_sections;
         let region_arenas = &self.region_arenas;
         let shared_index = &self.shared_quad_index_buffer;
+        let render_meta = &self.section_render_meta;
         let mut skipped_buckets = 0u64;
         let mut arena_draws = 0u64;
         let mut arena_sections = 0usize;
@@ -13677,6 +13929,7 @@ impl GpuRenderer {
                         shared_index,
                         culled_sections,
                         camera_position,
+                        render_meta,
                         chunk_fades,
                         frame_bind_group,
                         &gpu.env_bg,
@@ -13711,6 +13964,7 @@ impl GpuRenderer {
                         shared_index,
                         culled_sections,
                         camera_position,
+                        render_meta,
                         chunk_fades,
                         frame_bind_group,
                         &gpu.env_bg,
@@ -13878,13 +14132,13 @@ impl GpuRenderer {
             // Opaque entities and block entities.
             if lit_terrain.is_none() {
                 if let Some(mesh) = entity_ber {
-                pass.set_pipeline(&lit_opaque_pipeline);
-                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                let off = slot(identity, 1.0, 1.0, 0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.set_pipeline(&lit_opaque_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    let off = slot(identity, 1.0, 1.0, 0);
+                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
             }
 
@@ -14503,6 +14757,7 @@ mod tests {
         verdicts.len = 1;
 
         // Scalar replay of the pre-fix per-record dedup.
+        let empty_meta = HashMap::new();
         let mut reference = HashSet::new();
         for (bucket, records) in bucket_records.iter().enumerate() {
             for record in records {
@@ -14510,12 +14765,7 @@ mod tests {
                 if verdicts.contains(coord) {
                     continue;
                 }
-                let min = [
-                    coord.0 as f32 * EDGE as f32,
-                    coord.1 as f32 * EDGE as f32,
-                    coord.2 as f32 * EDGE as f32,
-                ];
-                if section_draw_mask(min, camera) >> bucket & 1 != 0 {
+                if section_draw_mask(*coord, camera, 0) >> bucket & 1 != 0 {
                     reference.insert(*coord);
                 }
             }
@@ -14523,12 +14773,23 @@ mod tests {
 
         let mut scratch = HashSet::new();
         // Frame 1 warms the scratch's capacity (may allocate once).
-        let first = emitted_section_count(&bucket_records, &verdicts, camera, &mut scratch);
+        let first = emitted_section_count(
+            &bucket_records,
+            &verdicts,
+            camera,
+            &empty_meta,
+            &mut scratch,
+        );
         assert_eq!(first, reference.len(), "count must match the old loop");
         let capacity = scratch.capacity();
         // Frame 2 reuses it — the capacity must not move at all.
-        let second =
-            emitted_section_count(&bucket_records, &verdicts, camera, &mut scratch);
+        let second = emitted_section_count(
+            &bucket_records,
+            &verdicts,
+            camera,
+            &empty_meta,
+            &mut scratch,
+        );
         assert_eq!(second, first);
         assert_eq!(scratch.capacity(), capacity, "capacity must persist");
     }

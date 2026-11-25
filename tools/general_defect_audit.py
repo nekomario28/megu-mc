@@ -261,9 +261,7 @@ UNBOUNDED_GLOBAL_BASELINE_COUNTS = {'src/anticheat.rs:P:OnceLock<Mutex<HashMap<i
 UNWIRED_MODULE_BASELINE = {
     'core/dye_and_items',
     'core/geom',
-    'core/mesh_elision',
     'core/os_desktop',
-    'core/render_cs',
     'create-adapter/rail_network',
 }
 

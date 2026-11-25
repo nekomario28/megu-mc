@@ -1168,6 +1168,10 @@ fn ac_note_carried_motion(eid: i32, delta: [f64; 3]) {
     let down = (-delta[1]).max(0.0) + 0.25;
     p.moves.grant([h, up, down], now);
     p.moves.carried_until = Some(now + Duration::from_millis(250));
+    p.v2.grant = Some(megu_core::anticheat_v2::AcModGrantToken::new(
+        [delta[0].abs() + 0.25, delta[1].abs() + 0.25, delta[2].abs() + 0.25],
+        5,
+    ));
 }
 
 /// The server placed the player somewhere: refill credit from the new position.
@@ -2077,7 +2081,10 @@ fn ac_check_move(
         // tick, honoring the live `AcModGrantToken`. A move the token
         // bucket absorbed but the deterministic predictor calls impossible
         // is still real evidence.
-        let verdict = ac_with_player(me, |ac| {
+        let (v2_exempt, verdict) = ac_with_player(me, |ac| {
+            let exempt = ac.moves.fresh
+                || ac.moves.grace_until.is_some_and(|t| now < t)
+                || state.unknown_modifiers;
             let ticks = ac
                 .moves
                 .last
@@ -2115,7 +2122,7 @@ fn ac_check_move(
                     ac.v2.grant = None;
                 }
             }
-            verdict
+            (exempt, verdict)
         });
         let excess = ac_with_player(me, |ac| ac.moves.evaluate(now, &allowance, &p, need));
         if let Some(excess) = excess {
@@ -2126,7 +2133,7 @@ fn ac_check_move(
             if ac_flag(me, AcCheckId::Movement, 1.0 + excess.min(10.0), &detail) {
                 return AcMoveVerdict::Setback;
             }
-        } else if !verdict.within {
+        } else if !v2_exempt && !verdict.within {
             let worst = verdict
                 .excess_residual
                 .iter()
