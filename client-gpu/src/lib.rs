@@ -39,6 +39,7 @@ pub mod vanilla_gui_sprites;
 pub mod vanilla_assets_bridge;
 pub mod vanilla_jar;
 pub mod vanilla_world_assets;
+pub mod vanilla_official_extras;
 pub mod window;
 
 use std::path::PathBuf;
