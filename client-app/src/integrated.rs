@@ -305,17 +305,24 @@ fn push_runtime_root_candidate(candidates: &mut Vec<PathBuf>, candidate: PathBuf
     }
 }
 
-/// Runtime-root candidates in their deterministic search order: the resolved
-/// server binary's ancestors nearest-first, then `<gameDir>/bin`, `<gameDir>`,
-/// and the lexicographically sorted direct bundle children of
-/// `<gameDir>/megu-runtime`.
+/// Runtime-root candidates in their deterministic search order. When the
+/// server binary lives inside `<gameDir>` (the normal installed layout), only
+/// its ancestors through `<gameDir>` are considered before the explicit
+/// `<gameDir>/megu-runtime` bundles: an outer source checkout or unrelated
+/// parent install must not silently satisfy that game directory. An external
+/// server binary keeps the ancestor-first development/bundle fallback, then
+/// `<gameDir>/bin`, `<gameDir>`, and sorted direct bundle children.
 fn runtime_root_candidates(server_bin: &Path, game_dir: &Path) -> Vec<PathBuf> {
     let resolved_bin = absolute_path_best_effort(server_bin);
     let game_dir = absolute_path_best_effort(game_dir);
     let mut candidates = Vec::new();
+    let bin_inside_game = resolved_bin.starts_with(&game_dir);
     if let Some(dir) = resolved_bin.parent() {
         for ancestor in dir.ancestors().filter(|path| !path.as_os_str().is_empty()) {
             push_runtime_root_candidate(&mut candidates, ancestor.to_path_buf());
+            if bin_inside_game && ancestor == game_dir {
+                break;
+            }
         }
     }
     push_runtime_root_candidate(&mut candidates, game_dir.join("bin"));
@@ -629,11 +636,16 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
             server_bin.display()
         )
     })?;
+    // Drain stderr before waiting for readiness: the server binds before some
+    // worldgen diagnostics, and a verbose child can otherwise fill the pipe
+    // and deadlock before it ever listens.
+    let (stderr, stderr_thread) = spawn_stderr_tee(&mut child);
 
     let addr = SocketAddr::from((INTEGRATED_BIND_IP, port));
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            let _ = stderr_thread.join();
             return Err(format!(
                 "megu server exited during startup (status {status}) for world '{world}'"
             ));
@@ -653,7 +665,6 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
                 },
                 None,
             );
-            let (stderr, stderr_thread) = spawn_stderr_tee(&mut child);
             return Ok(SingleplayerServer {
                 child,
                 port,
@@ -665,6 +676,7 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stderr_thread.join();
             return Err(format!(
                 "timed out after {}s waiting for megu server on {addr}",
                 READY_TIMEOUT.as_secs()
@@ -829,6 +841,21 @@ mod tests {
             !game_dir.join("saves").exists(),
             "launch must fail before creating or spawning in the world directory"
         );
+    }
+
+    #[test]
+    fn runtime_root_inside_game_dir_does_not_escape_to_complete_ancestor() {
+        let root = synthetic_root("contained");
+        write_complete_runtime(&root);
+        let game_dir = root.join("game");
+        let bin_dir = game_dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let server_bin = bin_dir.join("megu");
+        fs::write(&server_bin, b"stub").unwrap();
+
+        assert!(find_runtime_root(&server_bin, &game_dir).is_none());
+        let candidates = runtime_root_candidates(&server_bin, &game_dir);
+        assert!(!candidates.iter().any(|candidate| candidate == &canonicalize_best_effort(root.clone())));
     }
 
     #[test]

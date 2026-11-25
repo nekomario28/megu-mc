@@ -9791,6 +9791,10 @@ mod tests {
         assert_eq!(live.kinetic_part_count(), 0);
     }
 
+    // The server starts Create's dynamic block states at the pinned vanilla count.
+    const MRS1_WATER_WHEEL_STATE_ID: u32 = megu_kernel::STATE_COUNT;
+    const MRS1_SHAFT_STATE_ID: u32 = MRS1_WATER_WHEEL_STATE_ID + 1;
+
     fn mrs1_frame() -> Vec<u8> {
         fn crc32(bytes: &[u8]) -> u32 {
             let mut crc = !0u32;
@@ -9805,12 +9809,12 @@ mod tests {
         }
         let mut frame = b"MRS1".to_vec();
         frame.extend_from_slice(&1u16.to_be_bytes());
-        frame.extend_from_slice(&40u32.to_be_bytes()); // base_block_state_id
+        frame.extend_from_slice(&MRS1_WATER_WHEEL_STATE_ID.to_be_bytes()); // base_block_state_id
         frame.extend_from_slice(&9_000u32.to_be_bytes()); // base_item_id
         frame.extend_from_slice(&2u32.to_be_bytes()); // block state count
         for (id, name, axis) in [
-            (40_u32, "create:water_wheel", "x"),
-            (41_u32, "create:shaft", "y"),
+            (MRS1_WATER_WHEEL_STATE_ID, "create:water_wheel", "x"),
+            (MRS1_SHAFT_STATE_ID, "create:shaft", "y"),
         ] {
             frame.extend_from_slice(&id.to_be_bytes());
             frame.extend_from_slice(&(name.len() as u16).to_be_bytes());
@@ -9829,6 +9833,18 @@ mod tests {
         let crc = crc32(&frame);
         frame.extend_from_slice(&crc.to_be_bytes());
         frame
+    }
+
+    fn load_mrs1_fixture(live: &mut LiveSession) {
+        // Reserve the dynamic ids in the test world's palettes before chunk ingest.
+        assert!(live.world.state_count <= MRS1_WATER_WHEEL_STATE_ID as usize);
+        live.world.state_count = (MRS1_SHAFT_STATE_ID + 1) as usize;
+        let body = decoded_frame(0x27, &stone_chunk());
+        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
+            .unwrap();
+        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
+            .unwrap();
     }
 
     fn template_bounds(vertices: &[TerrainVertex]) -> ([f32; 3], [f32; 3]) {
@@ -9914,8 +9930,11 @@ mod tests {
         live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
             .unwrap();
         let registry = live.mod_registry.as_ref().unwrap();
-        assert_eq!(registry.base_block_state_id, 40);
-        assert_eq!(registry.block_state_name(40), Some("create:water_wheel"));
+        assert_eq!(registry.base_block_state_id, MRS1_WATER_WHEEL_STATE_ID);
+        assert_eq!(
+            registry.block_state_name(MRS1_WATER_WHEEL_STATE_ID),
+            Some("create:water_wheel")
+        );
         assert_eq!(registry.item_name(9_000), Some("create:wrench"));
 
         let mut bad = mrs1_frame();
@@ -9926,7 +9945,10 @@ mod tests {
         assert_eq!(live.mod_registry_rejected, 1);
         // The rejected frame never clobbers the stored registry.
         assert_eq!(
-            live.mod_registry.as_ref().unwrap().block_state_name(40),
+            live.mod_registry
+                .as_ref()
+                .unwrap()
+                .block_state_name(MRS1_WATER_WHEEL_STATE_ID),
             Some("create:water_wheel")
         );
     }
@@ -9934,14 +9956,12 @@ mod tests {
     #[test]
     fn dynamic_blocks_drive_family_templates_and_goggles_names() {
         let (mut live, _tx) = session();
-        let body = decoded_frame(0x27, &stone_chunk());
-        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
-        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
-            .unwrap();
-        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
-            .unwrap();
+        load_mrs1_fixture(&mut live);
         // Dynamic mod block states: water wheel on X, shaft on Y.
-        for (pos, state_id) in [([7, 64, 3], 40_u32), ([8, 64, 3], 41_u32)] {
+        for (pos, state_id) in [
+            ([7, 64, 3], MRS1_WATER_WHEEL_STATE_ID),
+            ([8, 64, 3], MRS1_SHAFT_STATE_ID),
+        ] {
             live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
                 pos,
                 state_id,
@@ -10042,7 +10062,7 @@ mod tests {
     #[test]
     fn goggles_display_name_uses_loaded_mod_lang_table() {
         let dir =
-            std::env::temp_dir().join(format!("megu-live-mrs1-{}-{}", std::process::id(), 40_u32));
+            std::env::temp_dir().join(format!("megu-live-mrs1-goggles-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("mods")).expect("create mod dir");
         write_test_jar(
             &dir.join("mods/00-create.jar"),
@@ -10062,15 +10082,10 @@ mod tests {
             ..SessionPaths::default()
         });
         live.set_ui_locale("ja-JP");
-        let body = decoded_frame(0x27, &stone_chunk());
-        let chunk = decode_chunk_packet(&body, 24, 64).unwrap();
-        live.apply_event(ClientPlayEvent::Play(PlayEvent::ChunkData(Box::new(chunk))))
-            .unwrap();
-        live.apply_event(framed(CHANNEL_MOD_REGISTRY_SYNC, &mrs1_frame()))
-            .unwrap();
+        load_mrs1_fixture(&mut live);
         live.apply_event(ClientPlayEvent::Play(PlayEvent::BlockUpdate {
             pos: [7, 64, 3],
-            state_id: 40,
+            state_id: MRS1_WATER_WHEEL_STATE_ID,
         }))
         .unwrap();
         let mut payload = vec![1];
