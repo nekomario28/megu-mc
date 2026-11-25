@@ -297,11 +297,16 @@ public interface ItemLike { net.minecraft.world.item.Item asItem(); }
             cls.jars[mod_id] = cls.pack(compiled, mod_id, name)
         cls.mixin_jar = cls.pack(compiled, "fixture_c", "s2c/ModC", mixin=True)
 
+        core_rlib = cls.root / "libmegu_core.rlib"
+        cls.checked("rustc", "--edition=2021", "--crate-type", "rlib",
+                    "--crate-name", "megu_core", ROOT / "core/src/lib.rs",
+                    "-o", core_rlib)
         codec = cls.root / "codec.rs"
         codec.write_text(f'#[path = "{ROOT / "src/landing_types.rs"}"]\n'
                          f'mod landing_types;\n{CODEC_RUNNER}')
         cls.codec = cls.root / "codec"
-        cls.checked("rustc", "--edition=2021", codec, "-o", cls.codec)
+        cls.checked("rustc", "--edition=2021", codec, "--extern", f"megu_core={core_rlib}",
+                    "-o", cls.codec)
 
     @classmethod
     def pack(cls, compiled, mod_id, name, *, mixin=False):
