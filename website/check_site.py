@@ -392,6 +392,48 @@ def check_site_config_keys():
     return findings
 
 
+def check_release_sync_invariants():
+    """Check pinned verification guidance and exact-tag dynamic targets."""
+    findings = []
+    tag = pinned_release_tag(
+        (WEBSITE / "site-config.js").read_text(encoding="utf-8"))
+    for relpath in ("README.md", "README.ja.md", "website/index.html"):
+        path = ROOT / relpath
+        text = path.read_text(encoding="utf-8") if path.is_file() else ""
+        for required in ("SHA256SUMS-all.txt", "SHA256SUMS.txt",
+                         "sha256sum -c", "megu-${TAG}-${TARGET}.tar.gz"):
+            if required not in text:
+                findings.append(
+                    f"{relpath} is missing pinned archive verification step: "
+                    f"{required}")
+        if tag and f"TAG={tag}" not in text:
+            findings.append(
+                f"{relpath} verification example must pin site release tag {tag}")
+
+    app_path = WEBSITE / "app.js"
+    latest_path = WEBSITE / "functions" / "api" / "latest.js"
+    app = app_path.read_text(encoding="utf-8") if app_path.is_file() else ""
+    latest = latest_path.read_text(encoding="utf-8") if latest_path.is_file() else ""
+    for required in (
+        'row.removeAttribute("href")',
+        'row.setAttribute("hidden", "")',
+        'link.removeAttribute("href")',
+        'link.setAttribute("hidden", "")',
+        '"megu-" + st.version + "-" + target + ".tar.gz"',
+    ):
+        if required not in app:
+            findings.append(
+                "app.js must hide missing exact-tag download targets "
+                f"(missing {required})")
+    if "body.assets = assets;" not in latest:
+        findings.append(
+            "/api/latest must always return the fetched release's asset list")
+    if '"/releases/latest"' in latest or '"/releases/" + "latest"' in latest:
+        findings.append(
+            "/api/latest must not introduce /releases/latest asset URLs")
+    return findings
+
+
 CANONICAL_URL = "https://megu.megumin.tech/"
 SITEMAP_URL = "https://megu.megumin.tech/sitemap.xml"
 OG_IMAGE_URL = "https://megu.megumin.tech/og-card.png"
@@ -1242,6 +1284,7 @@ def main():
         ("BUILTIN_SUPERSEDED_PERF_MODS sync", check_perf_mod_sync),
         ("forbidden asset names", check_forbidden_names),
         ("site config & EN/JA copy", check_site_config_keys),
+        ("pinned verification & release target sync", check_release_sync_invariants),
         ("app.js unit check (node)", check_js_unit),
         ("functions unit check (node)", check_functions_unit),
         ("SEO metadata & crawler files", check_seo_metadata),

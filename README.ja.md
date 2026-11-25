@@ -59,6 +59,22 @@ Megu は、**Minecraft: Java Edition 1.21.1** のクリーンルーム再実装�
 
 インストーラは `megu-client-gpu` を `<minecraft_dir>/bin/` へ配置し、**Megu (1.21.1)** ランチャープロファイルを登録します。初回起動時、クライアントは公式ランチャー / PrismLauncher / Modrinth App の既存 1.21.1 クライアント JAR を再利用するか、Mojang CDN から SHA-1 検証付きで取得します。Java も `-Xmx` 調整も不要。必要なら **設定 → ビデオ** の RAM 上限スライダーをいつでも調整できます。
 
+**Linux サーバーアーカイブをインストール前に検証する場合** — 以下は `v0.1.0-alpha.3` に固定した例です。別バージョンを選ぶ場合は `TAG` を明示的に変更してください。リリースには `SHA256SUMS-all.txt` が公開されるため、対象アーカイブの行だけを `SHA256SUMS.txt` に取り出し、`sha256sum -c` で検証します。
+
+```sh
+TAG=v0.1.0-alpha.3
+TARGET=linux-x86_64
+ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
+BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
+curl -fLO "${BASE}/${ARCHIVE}"
+curl -fLO "${BASE}/SHA256SUMS-all.txt"
+grep -F "  ${ARCHIVE}" SHA256SUMS-all.txt > SHA256SUMS.txt
+test "$(wc -l < SHA256SUMS.txt)" -eq 1
+sha256sum -c SHA256SUMS.txt
+tar -xzf "${ARCHIVE}"
+"./megu-${TAG}-${TARGET}/megu-installer" server --dir ./megu-server
+```
+
 **サーバー管理者** — フルアーカイブ内の 1 コマンド：
 
 ```sh

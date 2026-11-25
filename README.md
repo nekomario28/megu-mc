@@ -59,6 +59,22 @@ Megu is a free, open-source, clean-room reimplementation of **Minecraft: Java Ed
 
 The installer stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** launcher profile. On first launch the client reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher or Modrinth App — or fetches and SHA-1-verifies it from Mojang's CDN. No Java, no `-Xmx` tuning: adjust the optional RAM budget slider anytime in **Settings → Video**.
 
+**Verify a pinned Linux server archive before installing** — the example pins `v0.1.0-alpha.3`; change `TAG` only when intentionally selecting another release. The release publishes `SHA256SUMS-all.txt`; the commands extract the selected archive's entry to `SHA256SUMS.txt` so `sha256sum -c` verifies just the downloaded file:
+
+```sh
+TAG=v0.1.0-alpha.3
+TARGET=linux-x86_64
+ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
+BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
+curl -fLO "${BASE}/${ARCHIVE}"
+curl -fLO "${BASE}/SHA256SUMS-all.txt"
+grep -F "  ${ARCHIVE}" SHA256SUMS-all.txt > SHA256SUMS.txt
+test "$(wc -l < SHA256SUMS.txt)" -eq 1
+sha256sum -c SHA256SUMS.txt
+tar -xzf "${ARCHIVE}"
+"./megu-${TAG}-${TARGET}/megu-installer" server --dir ./megu-server
+```
+
 **Server admins** — one command from any full platform archive:
 
 ```sh
