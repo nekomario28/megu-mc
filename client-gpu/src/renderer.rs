@@ -7,12 +7,12 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytemuck::{Pod, Zeroable};
 use crate::atmosphere::PrecipitationSheet;
+use bytemuck::{Pod, Zeroable};
 use megu_client::shaders::{
     validate_wgsl_module, WgslStage, TERRAIN_OPAQUE_WGSL, TERRAIN_TRANSLUCENT_WGSL,
 };
@@ -80,6 +80,9 @@ use crate::subworld_render::{
     DEBUG_LINE_VERTEX_LAYOUT, DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT,
     PARTICLE_BILLBOARD_CORNERS, PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT,
     PARTICLE_QUAD_LAYOUT, PART_INSTANCE_LAYOUT,
+};
+use crate::vanilla_world_assets::{
+    DecodedRgbaTexture, VanillaEnvTexture, VanillaMiscOverlay, VanillaWorldAssets,
 };
 use crate::{
     build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, mat4_mul_vec4,
@@ -3733,10 +3736,248 @@ pub struct GpuRenderer {
     pack_subworld: Option<PackSubworldGpu>,
     /// Latest notice line the HUD/diagnostics can display.
     pub notice: Option<String>,
+    first_person_viewmodel: FirstPersonViewmodel,
+    gameplay_screen_overlay: GameplayScreenOverlay,
+    biome_tint: [f32; 3],
+    biome_tint_strength: f32,
+    entity_atlas_texture: wgpu::Texture,
+    particle_atlas_texture: wgpu::Texture,
+    destroy_stage_textures: Vec<wgpu::Texture>,
+    world_env_textures: BTreeMap<VanillaEnvTexture, wgpu::Texture>,
+    world_overlay_textures: BTreeMap<VanillaMiscOverlay, wgpu::Texture>,
+    block_break_overlay: Option<([i32; 3], u8)>,
 }
 
 pub const MAX_DEBUG_LINES: usize = 65_536;
 const MAX_DYNAMIC_QUADS: usize = 16_384;
+
+/// First-person item use animation selected by the client HUD.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FirstPersonUseKind {
+    #[default]
+    None,
+    Eat,
+    Drink,
+    BowDraw,
+    CrossbowCharge,
+    ShieldBlock,
+    TridentThrow,
+}
+
+/// Snapshot of first-person hand and held-item animation inputs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FirstPersonViewmodel {
+    pub visible: bool,
+    pub held_item_name: Option<String>,
+    pub held_color_rgb: [f32; 3],
+    pub is_block: bool,
+    pub swing_progress: f32,
+    pub use_progress: f32,
+    pub using_kind: FirstPersonUseKind,
+    pub walk_bob_x: f32,
+    pub walk_bob_y: f32,
+    pub equip_progress: f32,
+}
+
+impl Default for FirstPersonViewmodel {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            held_item_name: None,
+            held_color_rgb: [1.0; 3],
+            is_block: false,
+            swing_progress: 0.0,
+            use_progress: 0.0,
+            using_kind: FirstPersonUseKind::None,
+            walk_bob_x: 0.0,
+            walk_bob_y: 0.0,
+            equip_progress: 0.0,
+        }
+    }
+}
+
+/// Alpha values and clock for the vanilla gameplay screen overlays.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GameplayScreenOverlay {
+    pub hurt_alpha: f32,
+    pub fire_alpha: f32,
+    pub underwater_alpha: f32,
+    pub portal_alpha: f32,
+    pub freezing_alpha: f32,
+    pub pumpkin_alpha: f32,
+    pub vignette_alpha: f32,
+    pub time_secs: f32,
+}
+
+/// Twelve edges of a block selection AABB, expanded slightly to avoid
+/// z-fighting with the selected block's faces.
+pub fn block_selection_outline_lines(pos: [i32; 3]) -> [DebugLine; 12] {
+    let min = [
+        pos[0] as f32 - 0.002,
+        pos[1] as f32 - 0.002,
+        pos[2] as f32 - 0.002,
+    ];
+    let max = [
+        pos[0] as f32 + 1.002,
+        pos[1] as f32 + 1.002,
+        pos[2] as f32 + 1.002,
+    ];
+    let corners = [
+        [min[0], min[1], min[2]],
+        [max[0], min[1], min[2]],
+        [max[0], min[1], max[2]],
+        [min[0], min[1], max[2]],
+        [min[0], max[1], min[2]],
+        [max[0], max[1], min[2]],
+        [max[0], max[1], max[2]],
+        [min[0], max[1], max[2]],
+    ];
+    let edges = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (4, 5),
+        (5, 6),
+        (6, 7),
+        (7, 4),
+        (0, 4),
+        (1, 5),
+        (2, 6),
+        (3, 7),
+    ];
+    edges.map(|(a, b)| DebugLine {
+        start: corners[a],
+        end: corners[b],
+        rgba: [0, 0, 0, 115],
+    })
+}
+
+/// Encode tightly packed RGBA8 pixels as a PNG without adding a crate
+/// dependency. The encoder uses valid uncompressed DEFLATE blocks.
+pub fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let row = (width as usize)
+        .checked_mul(4)
+        .ok_or("PNG dimensions overflow")?;
+    let expected = row
+        .checked_mul(height as usize)
+        .ok_or("PNG dimensions overflow")?;
+    if width == 0 || height == 0 || rgba.len() != expected {
+        return Err("RGBA byte length does not match nonzero PNG dimensions".into());
+    }
+    let raw_len = (row + 1)
+        .checked_mul(height as usize)
+        .ok_or("PNG dimensions overflow")?;
+    let mut raw = Vec::with_capacity(raw_len);
+    for scanline in rgba.chunks_exact(row) {
+        raw.push(0);
+        raw.extend_from_slice(scanline);
+    }
+    let mut zlib = Vec::with_capacity(raw.len() + raw.len() / 65535 * 5 + 8);
+    zlib.extend_from_slice(&[0x78, 0x01]);
+    for (index, block) in raw.chunks(65535).enumerate() {
+        zlib.push(u8::from((index + 1) * 65535 >= raw.len()));
+        let len = block.len() as u16;
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let mut a = 1u32;
+    let mut b = 0u32;
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+    append_png_chunk(&mut png, *b"IHDR", &ihdr);
+    append_png_chunk(&mut png, *b"IDAT", &zlib);
+    append_png_chunk(&mut png, *b"IEND", &[]);
+    std::fs::write(path, png).map_err(|error| error.to_string())
+}
+
+/// Minecraft-style screenshot name under `<game_dir>/screenshots`.
+pub fn screenshot_output_path(game_dir: &Path, unix_secs: u64) -> PathBuf {
+    game_dir
+        .join("screenshots")
+        .join(format!("Megu_{unix_secs}.png"))
+}
+
+fn append_png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(&kind);
+    out.extend_from_slice(data);
+    let mut crc = !0u32;
+    for byte in kind.iter().chain(data) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    out.extend_from_slice(&(!crc).to_be_bytes());
+}
+
+fn upload_rgba_texture(
+    ctx: &GpuDevice,
+    label: &str,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> wgpu::Texture {
+    let texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    ctx.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(width * 4),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    texture
+}
+
+fn decoded_texture_is_valid(width: u32, height: u32, rgba: &[u8]) -> bool {
+    width > 0
+        && height > 0
+        && usize::try_from(u64::from(width) * u64::from(height) * 4).ok() == Some(rgba.len())
+}
+
+fn upload_world_image(ctx: &GpuDevice, label: &str, image: &DecodedRgbaTexture) -> wgpu::Texture {
+    upload_rgba_texture(ctx, label, image.width, image.height, &image.rgba)
+}
 
 /// Grow-only persistent vertex/index buffer pair for per-frame dynamic
 /// geometry (entities, block-entity renders, particles). After the
@@ -3818,7 +4059,11 @@ fn stage_dynamic_geometry(
     ctx.queue
         .write_buffer(&r.indices, 0, bytemuck::cast_slice(indices));
     r.index_count = indices.len() as u32;
-    if allocated { (1, 0) } else { (0, 1) }
+    if allocated {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
 }
 
 /// FNV-1a digest of the staged dynamic geometry draw state — part of the
@@ -3889,7 +4134,11 @@ fn stage_particle_instances(
     ctx.queue
         .write_buffer(&r.buffer, 0, bytemuck::cast_slice(instances));
     r.count = instances.len() as u32;
-    if allocated { (1, 0) } else { (0, 1) }
+    if allocated {
+        (1, 0)
+    } else {
+        (0, 1)
+    }
 }
 
 /// Digest of the staged billboard instance ring — the instanced twin of
@@ -4014,11 +4263,13 @@ pub fn build_entity_ber_geometry_into(
             if lit_full && out.vertices.len() / 4 >= MAX_DYNAMIC_QUADS {
                 break 'meshes;
             }
-            let positions = quad.positions.map(|point| [
-                point[0] + origin[0],
-                point[1] + origin[1],
-                point[2] + origin[2],
-            ]);
+            let positions = quad.positions.map(|point| {
+                [
+                    point[0] + origin[0],
+                    point[1] + origin[1],
+                    point[2] + origin[2],
+                ]
+            });
             if !positions.iter().flatten().all(|v| v.is_finite())
                 || !quad.normal.iter().all(|v| v.is_finite())
             {
@@ -4029,8 +4280,7 @@ pub fn build_entity_ber_geometry_into(
                 positions.iter().map(|p| p[1]).sum::<f32>() * 0.25,
                 positions.iter().map(|p| p[2]).sum::<f32>() * 0.25,
             ];
-            let (block_light, sky_light) =
-                sample_light(centroid[0], centroid[1], centroid[2]);
+            let (block_light, sky_light) = sample_light(centroid[0], centroid[1], centroid[2]);
             if !lit_full {
                 let base = out.lit_vertices.len() as u32;
                 for position in positions {
@@ -4042,11 +4292,16 @@ pub fn build_entity_ber_geometry_into(
                             | (u32::from(sky_light.min(15)) << 9),
                     });
                 }
-                out.lit_indices
-                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                out.lit_indices.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                ]);
             }
-            let brightness =
-                vanilla_light_brightness(block_light, sky_light, daylight_factor);
+            let brightness = vanilla_light_brightness(block_light, sky_light, daylight_factor);
             append_dynamic_quad(
                 &mut out.vertices,
                 &mut out.indices,
@@ -4139,7 +4394,7 @@ mod entity_lighting_tests {
         build_entity_ber_geometry, build_lit_entity_ber_geometry, entity_quad_tint,
         lit_subworld_mesh, vanilla_light_brightness,
     };
-    use crate::subworld_render::{SubWorldTransform, box_mesh};
+    use crate::subworld_render::{box_mesh, SubWorldTransform};
     use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
 
     fn quad(y: f32, normal: [f32; 3], tint_index: i32) -> ExtrudedQuad {
@@ -4159,12 +4414,19 @@ mod entity_lighting_tests {
     #[test]
     fn parts_sample_separate_light_and_keep_face_normals() {
         let mesh = ExtrudedMesh {
-            quads: vec![quad(0.0, [1.0, 0.0, 0.0], -1), quad(2.0, [0.0, 0.0, -1.0], -1)],
+            quads: vec![
+                quad(0.0, [1.0, 0.0, 0.0], -1),
+                quad(2.0, [0.0, 0.0, -1.0], -1),
+            ],
         };
-        let (vertices, indices) = build_lit_entity_ber_geometry(
-            &[(&mesh, [4.0, 0.0, 8.0], [1.0; 3])],
-            &mut |_, y, _| if y < 1.0 { (0, 0) } else { (14, 15) },
-        );
+        let (vertices, indices) =
+            build_lit_entity_ber_geometry(&[(&mesh, [4.0, 0.0, 8.0], [1.0; 3])], &mut |_, y, _| {
+                if y < 1.0 {
+                    (0, 0)
+                } else {
+                    (14, 15)
+                }
+            });
         assert_eq!(indices.len(), 12);
         assert!(vertices[..4].iter().all(|v| v.light_attr == 0));
         assert!(vertices[4..]
@@ -4255,9 +4517,7 @@ mod entity_lighting_tests {
         let (lit, lit_indices) = lit_subworld_mesh(&(vertices, indices), &transform, 14, 9);
         assert_eq!(lit.len(), 24);
         assert_eq!(lit_indices.len(), 36);
-        assert!(lit
-            .iter()
-            .all(|v| v.light_attr == ((14 << 5) | (9 << 9))));
+        assert!(lit.iter().all(|v| v.light_attr == ((14 << 5) | (9 << 9))));
         // A +Y face normal rotated 90° about Y lands on ±X/±Z, and every
         // position stays inside the 1-block box around the pivot.
         assert!(lit.iter().all(|v| {
@@ -4986,7 +5246,10 @@ fn with_moon_phase_terminator(mut source: String) -> String {
         "* (1.0 - day) * moon_disc\n             * (1.0 - shadow.celestial_params.w * 0.4);",
         "* (1.0 - day) * moon_disc * moon_lit\n             * (1.0 - shadow.celestial_params.w * 0.4);",
     );
-    source = source.replace("* bright\n                     * shadow.celestial_params.x", "* bright * twinkle\n                     * shadow.celestial_params.x");
+    source = source.replace(
+        "* bright\n                     * shadow.celestial_params.x",
+        "* bright * twinkle\n                     * shadow.celestial_params.x",
+    );
     source
 }
 
@@ -6608,9 +6871,7 @@ impl SkyGpu {
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("sky-atmosphere"),
-                source: wgpu::ShaderSource::Wgsl(sky_wgsl_with_moon_phase(
-                    ctx.report.shader_f16,
-                )),
+                source: wgpu::ShaderSource::Wgsl(sky_wgsl_with_moon_phase(ctx.report.shader_f16)),
             });
         let layout = ctx
             .device
@@ -7577,6 +7838,10 @@ impl GpuRenderer {
         };
         let gpu_paradigm = profile.gpu_paradigm;
         let sky = SkyGpu::new(&ctx, target_format);
+        let entity_fallback =
+            upload_rgba_texture(&ctx, "entity-texture-fallback-white", 1, 1, &[255; 4]);
+        let particle_fallback =
+            upload_rgba_texture(&ctx, "particle-texture-fallback-white", 1, 1, &[255; 4]);
         Self {
             ctx,
             target_format,
@@ -7793,6 +8058,16 @@ impl GpuRenderer {
             night_sky_enabled: true,
             pack_subworld: None,
             notice: None,
+            first_person_viewmodel: FirstPersonViewmodel::default(),
+            gameplay_screen_overlay: GameplayScreenOverlay::default(),
+            biome_tint: [1.0; 3],
+            biome_tint_strength: 0.0,
+            entity_atlas_texture: entity_fallback,
+            particle_atlas_texture: particle_fallback,
+            destroy_stage_textures: Vec::new(),
+            world_env_textures: BTreeMap::new(),
+            world_overlay_textures: BTreeMap::new(),
+            block_break_overlay: None,
         }
     }
 
@@ -7836,6 +8111,159 @@ impl GpuRenderer {
                 .write_buffer(&buffer, 0, bytemuck::cast_slice(&vertices));
             Some((buffer, vertices.len() as u32))
         };
+    }
+
+    /// Retain first-person animation inputs for the camera-space renderer.
+    pub fn set_first_person_viewmodel(&mut self, vm: FirstPersonViewmodel) {
+        self.first_person_viewmodel = vm;
+    }
+
+    /// Current first-person viewmodel inputs, exposed for UI/render adapters.
+    pub fn first_person_viewmodel(&self) -> &FirstPersonViewmodel {
+        &self.first_person_viewmodel
+    }
+
+    /// Set the screen-space gameplay overlay values for the UI compositor.
+    pub fn set_gameplay_screen_overlay(&mut self, overlay: GameplayScreenOverlay) {
+        self.gameplay_screen_overlay = overlay;
+    }
+
+    /// Read the current screen overlay state without allocating.
+    pub fn gameplay_screen_overlay(&self) -> GameplayScreenOverlay {
+        self.gameplay_screen_overlay
+    }
+
+    /// Configure section tint consumed by the terrain section uniforms.
+    pub fn set_biome_tint(&mut self, rgb: [f32; 3], strength: f32) {
+        self.biome_tint = rgb.map(|v| {
+            if v.is_finite() {
+                v.clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        });
+        self.biome_tint_strength = if strength.is_finite() {
+            strength.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Replace world-space debug lines with the targeted block outline.
+    pub fn set_block_selection(&mut self, pos: Option<[i32; 3]>) {
+        if let Some(pos) = pos {
+            self.set_debug_lines(&block_selection_outline_lines(pos));
+        } else {
+            self.debug_lines = None;
+        }
+    }
+
+    /// Upload the player's entity and block-entity texture atlas.
+    pub fn upload_entity_texture_atlas(
+        &mut self,
+        atlas: &crate::vanilla_jar::VanillaEntityTextureAtlas,
+    ) {
+        if decoded_texture_is_valid(atlas.width, atlas.height, &atlas.rgba) {
+            self.entity_atlas_texture = upload_rgba_texture(
+                &self.ctx,
+                "entity-texture-atlas",
+                atlas.width,
+                atlas.height,
+                &atlas.rgba,
+            );
+        }
+    }
+
+    /// Upload the player's animated particle texture atlas.
+    pub fn upload_particle_texture_atlas(
+        &mut self,
+        atlas: &crate::vanilla_jar::VanillaParticleTextureAtlas,
+    ) {
+        if decoded_texture_is_valid(atlas.width, atlas.height, &atlas.rgba) {
+            self.particle_atlas_texture = upload_rgba_texture(
+                &self.ctx,
+                "particle-texture-atlas",
+                atlas.width,
+                atlas.height,
+                &atlas.rgba,
+            );
+        }
+    }
+
+    /// Upload all ten destroy-stage crack images and retain them for the
+    /// translucent block-break overlay path.
+    pub fn upload_destroy_stage_textures(&mut self, assets: &VanillaWorldAssets) {
+        self.destroy_stage_textures.clear();
+        self.destroy_stage_textures
+            .reserve(assets.destroy_stages.len());
+        for image in &assets.destroy_stages {
+            if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+                self.destroy_stage_textures.push(upload_rgba_texture(
+                    &self.ctx,
+                    "destroy-stage-texture",
+                    image.width,
+                    image.height,
+                    &image.rgba,
+                ));
+            } else {
+                self.destroy_stage_textures.push(upload_rgba_texture(
+                    &self.ctx,
+                    "destroy-stage-transparent-fallback",
+                    1,
+                    1,
+                    &[0; 4],
+                ));
+            }
+        }
+    }
+
+    /// Set the targeted block and crack stage for the world overlay pass.
+    pub fn set_block_break_overlay(&mut self, target: Option<([i32; 3], u8)>) {
+        self.block_break_overlay = target.map(|(pos, stage)| (pos, stage.min(9)));
+    }
+
+    /// Upload the environment and full-screen overlay images. Missing
+    /// categories keep their existing neutral/fallback GPU resources.
+    pub fn upload_world_env_assets(&mut self, assets: &VanillaWorldAssets) {
+        self.world_env_textures.clear();
+        for key in VanillaEnvTexture::ALL {
+            if let Some(image) = assets.env_textures.get(&key) {
+                if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+                    self.world_env_textures.insert(
+                        key,
+                        upload_world_image(&self.ctx, "world-environment-texture", image),
+                    );
+                }
+            }
+        }
+        self.world_overlay_textures.clear();
+        for key in VanillaMiscOverlay::ALL {
+            if let Some(image) = assets.misc_overlays.get(&key) {
+                if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+                    self.world_overlay_textures.insert(
+                        key,
+                        upload_world_image(&self.ctx, "world-screen-overlay-texture", image),
+                    );
+                }
+            }
+        }
+        self.upload_destroy_stage_textures(assets);
+    }
+
+    /// Number of resident visual asset textures, useful for F3 diagnostics.
+    pub fn visual_texture_count(&self) -> usize {
+        let _fallback_atlases = (
+            self.entity_atlas_texture.size(),
+            self.particle_atlas_texture.size(),
+        );
+        2 + self.destroy_stage_textures.len()
+            + self.world_env_textures.len()
+            + self.world_overlay_textures.len()
+    }
+
+    /// Current target of the translucent block-break overlay, if any.
+    pub fn block_break_overlay(&self) -> Option<([i32; 3], u8)> {
+        self.block_break_overlay
     }
 
     /// Backwards-compatible entity/BER staging entry point. Callers with
@@ -7891,7 +8319,11 @@ impl GpuRenderer {
         }
         for quad in sheet.quads.iter().take(sheet.len.min(MAX_DYNAMIC_QUADS)) {
             if !quad.color.iter().all(|value| value.is_finite())
-                || !quad.positions.iter().flatten().all(|value| value.is_finite())
+                || !quad
+                    .positions
+                    .iter()
+                    .flatten()
+                    .all(|value| value.is_finite())
             {
                 continue;
             }
@@ -9069,7 +9501,11 @@ impl GpuRenderer {
     /// `MEGU_TERRAIN_LIT_WGSL` comfort roll-off and indirect bounce on
     /// the next encoded frame. A mid-frame call patches the already
     /// built frame state so the toggle never waits a frame.
-    pub fn set_lighting_comfort_flags(&mut self, comfort_exposure: bool, indirect_light_bounce: bool) {
+    pub fn set_lighting_comfort_flags(
+        &mut self,
+        comfort_exposure: bool,
+        indirect_light_bounce: bool,
+    ) {
         self.comfort_exposure = comfort_exposure;
         self.indirect_light_bounce = indirect_light_bounce;
         if let Some(stable) = self.frame_stable_shadow.as_mut() {
@@ -9753,8 +10189,8 @@ impl GpuRenderer {
                     coord.2 as f32 * 16.0,
                 ],
                 _pad0: 0.0,
-                biome_tint: [1.0; 3],
-                biome_tint_strength: 0.0,
+                biome_tint: self.biome_tint,
+                biome_tint_strength: self.biome_tint_strength,
             };
             self.ctx
                 .queue
@@ -11364,12 +11800,12 @@ impl GpuRenderer {
     }
 
     /// Update the `section` uniform (world origin + biome tint).
-    pub fn set_section_origin(&self, origin: [f32; 3]) {
+    pub fn set_section_origin(&mut self, origin: [f32; 3]) {
         let uniforms = SectionUniforms {
             origin,
             _pad0: 0.0,
-            biome_tint: [1.0, 1.0, 1.0],
-            biome_tint_strength: 0.0,
+            biome_tint: self.biome_tint,
+            biome_tint_strength: self.biome_tint_strength,
         };
         self.ctx
             .queue
@@ -12902,13 +13338,9 @@ impl GpuRenderer {
             fnv1a_u64(&mut casters, u64::from(arena.index_extent()));
             fnv1a_u64(&mut casters, arena.vertex_capacity as u64);
         }
-        for entry in self
-            .subworld_gpu
-            .entries()
-            .filter(|entry| {
-                entry.index_count > 0 && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id)
-            })
-        {
+        for entry in self.subworld_gpu.entries().filter(|entry| {
+            entry.index_count > 0 && entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id)
+        }) {
             fnv1a_u64(&mut casters, u64::from(entry.index_count));
             fnv1a_u32(&mut casters, entry.alpha.to_bits());
             for v in entry.transform.position {
@@ -14237,10 +14669,7 @@ impl GpuRenderer {
             // contraptions).
             let mut drew_opaque_subworld = false;
             for entry in subworld_gpu.entries() {
-                if entry.index_count == 0
-                    || entry.alpha < 0.999
-                    || is_cloud_subworld_id(entry.id)
-                {
+                if entry.index_count == 0 || entry.alpha < 0.999 || is_cloud_subworld_id(entry.id) {
                     continue;
                 }
                 if !drew_opaque_subworld {
@@ -15053,7 +15482,10 @@ mod tests {
             "repacked records must be identical"
         );
         assert_eq!(
-            record_coords.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            record_coords
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
             baseline_coords,
             "repacked coords must be identical",
         );
