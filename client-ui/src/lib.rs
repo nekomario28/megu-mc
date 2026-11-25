@@ -68,6 +68,7 @@
 //! # assert_eq!(rgba.len(), 1280 * 720 * 4);
 //! ```
 
+pub mod claims_ui;
 pub mod conflict_widget;
 pub mod container_screen;
 pub mod create_goggles_hud;
