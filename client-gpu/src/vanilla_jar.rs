@@ -12,6 +12,7 @@
 //! and Deflate methods are supported, and encrypted/ZIP64/multi-disk
 //! archives are rejected outright.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -19,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
 use megu_client_mesh::png_decode;
+use megu_core::zip_archive::ZipSliceIndex;
 use megu_core::zip_archive::{inflate_raw_rfc1951, LazyZipIndex, ZipError};
 
 /// Total on-disk bytes the archive itself may occupy.
@@ -1049,6 +1051,750 @@ pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
         }
     }
     packs
+}
+
+/// Entity renderer texture path for a protocol-767 entity type. Models that
+/// have no dedicated renderer texture (display/effect/projectile types) use
+/// the closest vanilla entity texture, allowing callers to use a single
+/// texture lookup for every registered type.
+pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
+    use megu_client_mesh::entity_rig::classify_entity_rig;
+    let name = classify_entity_rig(entity_type_id)?
+        .name
+        .strip_prefix("minecraft:")?;
+    Some(match name {
+        "allay" => "assets/minecraft/textures/entity/allay/allay.png",
+        "area_effect_cloud" | "interaction" | "marker" | "block_display" | "item_display"
+        | "text_display" => "assets/minecraft/textures/entity/creeper/creeper.png",
+        "armadillo" => "assets/minecraft/textures/entity/armadillo.png",
+        "armor_stand" => "assets/minecraft/textures/entity/armorstand/wood.png",
+        "arrow" | "spectral_arrow" => "assets/minecraft/textures/entity/projectiles/arrow.png",
+        "axolotl" => "assets/minecraft/textures/entity/axolotl/axolotl_lucy.png",
+        "bat" => "assets/minecraft/textures/entity/bat.png",
+        "bee" => "assets/minecraft/textures/entity/bee/bee.png",
+        "blaze" => "assets/minecraft/textures/entity/blaze.png",
+        "boat" | "chest_boat" => "assets/minecraft/textures/entity/boat/oak.png",
+        "bogged" => "assets/minecraft/textures/entity/skeleton/bogged.png",
+        "breeze" => "assets/minecraft/textures/entity/breeze/breeze.png",
+        "breeze_wind_charge" | "wind_charge" => {
+            "assets/minecraft/textures/entity/projectiles/wind_charge.png"
+        }
+        "camel" => "assets/minecraft/textures/entity/camel/camel.png",
+        "cat" | "ocelot" => "assets/minecraft/textures/entity/cat/tabby.png",
+        "cave_spider" => "assets/minecraft/textures/entity/spider/cave_spider.png",
+        "chest_minecart"
+        | "command_block_minecart"
+        | "furnace_minecart"
+        | "hopper_minecart"
+        | "minecart"
+        | "spawner_minecart"
+        | "tnt_minecart" => "assets/minecraft/textures/entity/minecart.png",
+        "chicken" => "assets/minecraft/textures/entity/chicken.png",
+        "cod" => "assets/minecraft/textures/entity/fish/cod.png",
+        "cow" => "assets/minecraft/textures/entity/cow/cow.png",
+        "creeper" | "falling_block" => "assets/minecraft/textures/entity/creeper/creeper.png",
+        "tnt" => "assets/minecraft/textures/entity/tnt.png",
+        "dolphin" => "assets/minecraft/textures/entity/dolphin.png",
+        "donkey" | "mule" => "assets/minecraft/textures/entity/horse/donkey.png",
+        "dragon_fireball" | "fireball" | "small_fireball" => {
+            "assets/minecraft/textures/entity/projectiles/fireball.png"
+        }
+        "drowned" | "zombie" | "zombie_villager" | "husk" | "giant" => {
+            "assets/minecraft/textures/entity/zombie/zombie.png"
+        }
+        "egg" => "assets/minecraft/textures/entity/projectiles/egg.png",
+        "elder_guardian" => "assets/minecraft/textures/entity/guardian_elder.png",
+        "end_crystal" => "assets/minecraft/textures/entity/end_crystal/end_crystal.png",
+        "ender_dragon" => "assets/minecraft/textures/entity/enderdragon/dragon.png",
+        "ender_pearl" => "assets/minecraft/textures/entity/projectiles/enderpearl.png",
+        "enderman" => "assets/minecraft/textures/entity/enderman/enderman.png",
+        "endermite" => "assets/minecraft/textures/entity/endermite.png",
+        "evoker" => "assets/minecraft/textures/entity/illager/evoker.png",
+        "illusioner" => "assets/minecraft/textures/entity/illager/illusioner.png",
+        "pillager" => "assets/minecraft/textures/entity/illager/pillager.png",
+        "vindicator" => "assets/minecraft/textures/entity/illager/vindicator.png",
+        "evoker_fangs" => "assets/minecraft/textures/entity/illager/evoker.png",
+        "experience_bottle" => "assets/minecraft/textures/entity/projectiles/experience_bottle.png",
+        "experience_orb" => "assets/minecraft/textures/entity/experience_orb.png",
+        "eye_of_ender" => "assets/minecraft/textures/entity/projectiles/ender_eye.png",
+        "firework_rocket" => "assets/minecraft/textures/entity/projectiles/firework.png",
+        "fox" => "assets/minecraft/textures/entity/fox/fox.png",
+        "frog" => "assets/minecraft/textures/entity/frog/temperate_frog.png",
+        "ghast" => "assets/minecraft/textures/entity/ghast/ghast.png",
+        "glow_item_frame" | "item_frame" => "assets/minecraft/textures/entity/item_frame.png",
+        "glow_squid" => "assets/minecraft/textures/entity/squid/glow_squid.png",
+        "goat" => "assets/minecraft/textures/entity/goat.png",
+        "guardian" => "assets/minecraft/textures/entity/guardian.png",
+        "hoglin" => "assets/minecraft/textures/entity/hoglin/hoglin.png",
+        "horse" => "assets/minecraft/textures/entity/horse/horse_chestnut.png",
+        "iron_golem" => "assets/minecraft/textures/entity/iron_golem/iron_golem.png",
+        "item" | "ominous_item_spawner" => "assets/minecraft/textures/entity/item.png",
+        "leash_knot" => "assets/minecraft/textures/entity/lead.png",
+        "lightning_bolt" => "assets/minecraft/textures/entity/lightning_bolt.png",
+        "llama" | "trader_llama" => "assets/minecraft/textures/entity/llama/creamy.png",
+        "llama_spit" => "assets/minecraft/textures/entity/llama/spit.png",
+        "magma_cube" => "assets/minecraft/textures/entity/slime/magmacube.png",
+        "mooshroom" => "assets/minecraft/textures/entity/cow/mooshroom.png",
+        "painting" => "assets/minecraft/textures/painting/paintings/kebab.png",
+        "panda" => "assets/minecraft/textures/entity/panda/panda.png",
+        "parrot" => "assets/minecraft/textures/entity/parrot/parrot_red_blue.png",
+        "phantom" => "assets/minecraft/textures/entity/phantom.png",
+        "pig" => "assets/minecraft/textures/entity/pig/pig.png",
+        "piglin" | "piglin_brute" | "zombified_piglin" => {
+            "assets/minecraft/textures/entity/piglin/piglin.png"
+        }
+        "polar_bear" => "assets/minecraft/textures/entity/polar_bear.png",
+        "potion" => "assets/minecraft/textures/entity/projectiles/splash_potion.png",
+        "pufferfish" => "assets/minecraft/textures/entity/fish/pufferfish.png",
+        "rabbit" => "assets/minecraft/textures/entity/rabbit/black.png",
+        "ravager" => "assets/minecraft/textures/entity/illager/ravager.png",
+        "salmon" => "assets/minecraft/textures/entity/fish/salmon.png",
+        "sheep" => "assets/minecraft/textures/entity/sheep/sheep.png",
+        "shulker" | "shulker_bullet" => "assets/minecraft/textures/entity/shulker/shulker.png",
+        "silverfish" => "assets/minecraft/textures/entity/silverfish.png",
+        "skeleton" => "assets/minecraft/textures/entity/skeleton/skeleton.png",
+        "skeleton_horse" => "assets/minecraft/textures/entity/horse/horse_skeleton.png",
+        "slime" => "assets/minecraft/textures/entity/slime/slime.png",
+        "sniffer" => "assets/minecraft/textures/entity/sniffer/sniffer.png",
+        "snow_golem" => "assets/minecraft/textures/entity/snow_golem.png",
+        "snowball" => "assets/minecraft/textures/entity/projectiles/snowball.png",
+        "trident" => "assets/minecraft/textures/entity/trident.png",
+        "tropical_fish" => "assets/minecraft/textures/entity/fish/tropical_a.png",
+        "turtle" => "assets/minecraft/textures/entity/turtle/big_sea_turtle.png",
+        "vex" => "assets/minecraft/textures/entity/illager/vex.png",
+        "villager" | "wandering_trader" => "assets/minecraft/textures/entity/villager/villager.png",
+        "witch" => "assets/minecraft/textures/entity/witch.png",
+        "spider" => "assets/minecraft/textures/entity/spider/spider.png",
+        "squid" => "assets/minecraft/textures/entity/squid/squid.png",
+        "stray" => "assets/minecraft/textures/entity/skeleton/stray.png",
+        "strider" => "assets/minecraft/textures/entity/strider/strider.png",
+        "tadpole" => "assets/minecraft/textures/entity/tadpole/tadpole.png",
+        "wither" => "assets/minecraft/textures/entity/wither/wither.png",
+        "warden" => "assets/minecraft/textures/entity/warden/warden.png",
+        "wither_skeleton" => "assets/minecraft/textures/entity/skeleton/wither_skeleton.png",
+        "wither_skull" => "assets/minecraft/textures/entity/projectiles/wither_skull.png",
+        "wolf" => "assets/minecraft/textures/entity/wolf/wolf.png",
+        "zoglin" => "assets/minecraft/textures/entity/hoglin/zoglin.png",
+        "zombie_horse" => "assets/minecraft/textures/entity/horse/horse_zombie.png",
+        "player" => "assets/minecraft/textures/entity/player/wide/steve.png",
+        "fishing_bobber" => "assets/minecraft/textures/entity/fishing_hook.png",
+        _ => "assets/minecraft/textures/entity/creeper/creeper.png",
+    })
+}
+
+/// Texture path for a vanilla block-entity renderer (BER) by normalized
+/// renderer name. Names may be supplied with or without `minecraft:`.
+pub fn ber_texture_path_for_name(name: &str) -> Option<&'static str> {
+    Some(match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "chest" => "assets/minecraft/textures/entity/chest/normal.png",
+        "trapped_chest" => "assets/minecraft/textures/entity/chest/trapped.png",
+        "ender_chest" => "assets/minecraft/textures/entity/chest/ender.png",
+        "shulker" => "assets/minecraft/textures/entity/shulker/shulker.png",
+        "bed" => "assets/minecraft/textures/entity/bed/red.png",
+        "sign" | "hanging_sign" => "assets/minecraft/textures/entity/signs/oak.png",
+        "banner" => "assets/minecraft/textures/entity/banner_base.png",
+        "bell" => "assets/minecraft/textures/entity/bell/bell_body.png",
+        "enchanting_table" => "assets/minecraft/textures/entity/enchanting_table_book.png",
+        "beacon" => "assets/minecraft/textures/entity/beacon_beam.png",
+        "conduit" => "assets/minecraft/textures/entity/conduit/base.png",
+        "decorated_pot" => "assets/minecraft/textures/entity/decorated_pot/decorated_pot_base.png",
+        _ => return None,
+    })
+}
+
+/// Sprite paths used by the protocol-767 particle palette. Animated entries
+/// are represented as a frame sequence; nonanimated particles have one path.
+pub fn particle_texture_paths_for_id(particle_id: u16) -> &'static [&'static str] {
+    const EMPTY: &[&str] = &[];
+    const GENERIC: &[&str] = &[
+        "assets/minecraft/textures/particle/generic_0.png",
+        "assets/minecraft/textures/particle/generic_1.png",
+        "assets/minecraft/textures/particle/generic_2.png",
+        "assets/minecraft/textures/particle/generic_3.png",
+        "assets/minecraft/textures/particle/generic_4.png",
+        "assets/minecraft/textures/particle/generic_5.png",
+        "assets/minecraft/textures/particle/generic_6.png",
+        "assets/minecraft/textures/particle/generic_7.png",
+    ];
+    const FLAME: &[&str] = &["assets/minecraft/textures/particle/flame.png"];
+    const SOUL_FLAME: &[&str] = &["assets/minecraft/textures/particle/soul_fire_flame.png"];
+    const BUBBLE: &[&str] = &["assets/minecraft/textures/particle/bubble.png"];
+    const HEART: &[&str] = &["assets/minecraft/textures/particle/heart.png"];
+    const NOTE: &[&str] = &["assets/minecraft/textures/particle/note.png"];
+    const EXPLOSION: &[&str] = &[
+        "assets/minecraft/textures/particle/explosion_0.png",
+        "assets/minecraft/textures/particle/explosion_1.png",
+        "assets/minecraft/textures/particle/explosion_2.png",
+        "assets/minecraft/textures/particle/explosion_3.png",
+        "assets/minecraft/textures/particle/explosion_4.png",
+        "assets/minecraft/textures/particle/explosion_5.png",
+        "assets/minecraft/textures/particle/explosion_6.png",
+        "assets/minecraft/textures/particle/explosion_7.png",
+        "assets/minecraft/textures/particle/explosion_8.png",
+        "assets/minecraft/textures/particle/explosion_9.png",
+        "assets/minecraft/textures/particle/explosion_10.png",
+        "assets/minecraft/textures/particle/explosion_11.png",
+        "assets/minecraft/textures/particle/explosion_12.png",
+        "assets/minecraft/textures/particle/explosion_13.png",
+        "assets/minecraft/textures/particle/explosion_14.png",
+        "assets/minecraft/textures/particle/explosion_15.png",
+    ];
+    const GUST: &[&str] = &[
+        "assets/minecraft/textures/particle/gust_0.png",
+        "assets/minecraft/textures/particle/gust_1.png",
+        "assets/minecraft/textures/particle/gust_2.png",
+        "assets/minecraft/textures/particle/gust_3.png",
+        "assets/minecraft/textures/particle/gust_4.png",
+        "assets/minecraft/textures/particle/gust_5.png",
+        "assets/minecraft/textures/particle/gust_6.png",
+        "assets/minecraft/textures/particle/gust_7.png",
+        "assets/minecraft/textures/particle/gust_8.png",
+        "assets/minecraft/textures/particle/gust_9.png",
+        "assets/minecraft/textures/particle/gust_10.png",
+        "assets/minecraft/textures/particle/gust_11.png",
+    ];
+    const SONIC: &[&str] = &[
+        "assets/minecraft/textures/particle/sonic_boom_0.png",
+        "assets/minecraft/textures/particle/sonic_boom_1.png",
+        "assets/minecraft/textures/particle/sonic_boom_2.png",
+        "assets/minecraft/textures/particle/sonic_boom_3.png",
+        "assets/minecraft/textures/particle/sonic_boom_4.png",
+        "assets/minecraft/textures/particle/sonic_boom_5.png",
+        "assets/minecraft/textures/particle/sonic_boom_6.png",
+        "assets/minecraft/textures/particle/sonic_boom_7.png",
+        "assets/minecraft/textures/particle/sonic_boom_8.png",
+        "assets/minecraft/textures/particle/sonic_boom_9.png",
+        "assets/minecraft/textures/particle/sonic_boom_10.png",
+        "assets/minecraft/textures/particle/sonic_boom_11.png",
+        "assets/minecraft/textures/particle/sonic_boom_12.png",
+        "assets/minecraft/textures/particle/sonic_boom_13.png",
+        "assets/minecraft/textures/particle/sonic_boom_14.png",
+        "assets/minecraft/textures/particle/sonic_boom_15.png",
+    ];
+    const SCULK: &[&str] = &[
+        "assets/minecraft/textures/particle/sculk_soul_0.png",
+        "assets/minecraft/textures/particle/sculk_soul_1.png",
+        "assets/minecraft/textures/particle/sculk_soul_2.png",
+        "assets/minecraft/textures/particle/sculk_soul_3.png",
+        "assets/minecraft/textures/particle/sculk_soul_4.png",
+        "assets/minecraft/textures/particle/sculk_soul_5.png",
+        "assets/minecraft/textures/particle/sculk_soul_6.png",
+        "assets/minecraft/textures/particle/sculk_soul_7.png",
+        "assets/minecraft/textures/particle/sculk_soul_8.png",
+        "assets/minecraft/textures/particle/sculk_soul_9.png",
+        "assets/minecraft/textures/particle/sculk_soul_10.png",
+    ];
+    const CHERRY: &[&str] = &[
+        "assets/minecraft/textures/particle/cherry_0.png",
+        "assets/minecraft/textures/particle/cherry_1.png",
+        "assets/minecraft/textures/particle/cherry_2.png",
+        "assets/minecraft/textures/particle/cherry_3.png",
+        "assets/minecraft/textures/particle/cherry_4.png",
+        "assets/minecraft/textures/particle/cherry_5.png",
+        "assets/minecraft/textures/particle/cherry_6.png",
+        "assets/minecraft/textures/particle/cherry_7.png",
+        "assets/minecraft/textures/particle/cherry_8.png",
+        "assets/minecraft/textures/particle/cherry_9.png",
+        "assets/minecraft/textures/particle/cherry_10.png",
+        "assets/minecraft/textures/particle/cherry_11.png",
+    ];
+    const EFFECT: &[&str] = &[
+        "assets/minecraft/textures/particle/effect_0.png",
+        "assets/minecraft/textures/particle/effect_1.png",
+        "assets/minecraft/textures/particle/effect_2.png",
+        "assets/minecraft/textures/particle/effect_3.png",
+        "assets/minecraft/textures/particle/effect_4.png",
+        "assets/minecraft/textures/particle/effect_5.png",
+        "assets/minecraft/textures/particle/effect_6.png",
+        "assets/minecraft/textures/particle/effect_7.png",
+    ];
+    const SPARK: &[&str] = &[
+        "assets/minecraft/textures/particle/spark_0.png",
+        "assets/minecraft/textures/particle/spark_1.png",
+        "assets/minecraft/textures/particle/spark_2.png",
+        "assets/minecraft/textures/particle/spark_3.png",
+        "assets/minecraft/textures/particle/spark_4.png",
+        "assets/minecraft/textures/particle/spark_5.png",
+        "assets/minecraft/textures/particle/spark_6.png",
+        "assets/minecraft/textures/particle/spark_7.png",
+    ];
+    const DRIP_HANG: &[&str] = &["assets/minecraft/textures/particle/drip_hang.png"];
+    const DRIP_FALL: &[&str] = &["assets/minecraft/textures/particle/drip_fall.png"];
+    const DRIP_LAND: &[&str] = &["assets/minecraft/textures/particle/drip_land.png"];
+    const GLITTER: &[&str] = &[
+        "assets/minecraft/textures/particle/glitter_0.png",
+        "assets/minecraft/textures/particle/glitter_1.png",
+        "assets/minecraft/textures/particle/glitter_2.png",
+        "assets/minecraft/textures/particle/glitter_3.png",
+        "assets/minecraft/textures/particle/glitter_4.png",
+        "assets/minecraft/textures/particle/glitter_5.png",
+        "assets/minecraft/textures/particle/glitter_6.png",
+        "assets/minecraft/textures/particle/glitter_7.png",
+    ];
+    const SGA: &[&str] = &[
+        "assets/minecraft/textures/particle/sga_a.png",
+        "assets/minecraft/textures/particle/sga_b.png",
+        "assets/minecraft/textures/particle/sga_c.png",
+        "assets/minecraft/textures/particle/sga_d.png",
+        "assets/minecraft/textures/particle/sga_e.png",
+        "assets/minecraft/textures/particle/sga_f.png",
+        "assets/minecraft/textures/particle/sga_g.png",
+        "assets/minecraft/textures/particle/sga_h.png",
+        "assets/minecraft/textures/particle/sga_i.png",
+        "assets/minecraft/textures/particle/sga_j.png",
+        "assets/minecraft/textures/particle/sga_k.png",
+        "assets/minecraft/textures/particle/sga_l.png",
+        "assets/minecraft/textures/particle/sga_m.png",
+        "assets/minecraft/textures/particle/sga_n.png",
+        "assets/minecraft/textures/particle/sga_o.png",
+        "assets/minecraft/textures/particle/sga_p.png",
+        "assets/minecraft/textures/particle/sga_q.png",
+        "assets/minecraft/textures/particle/sga_r.png",
+        "assets/minecraft/textures/particle/sga_s.png",
+        "assets/minecraft/textures/particle/sga_t.png",
+        "assets/minecraft/textures/particle/sga_u.png",
+        "assets/minecraft/textures/particle/sga_v.png",
+        "assets/minecraft/textures/particle/sga_w.png",
+        "assets/minecraft/textures/particle/sga_x.png",
+        "assets/minecraft/textures/particle/sga_y.png",
+        "assets/minecraft/textures/particle/sga_z.png",
+    ];
+    use megu_client_mesh::ber_instancing::VanillaParticleKind as K;
+    let Some(kind) = u8::try_from(particle_id).ok().and_then(K::from_protocol_id) else {
+        return EMPTY;
+    };
+    match kind.registry_name() {
+        "flame" | "small_flame" => FLAME,
+        "soul_fire_flame" => SOUL_FLAME,
+        "bubble" | "bubble_pop" | "bubble_column_up" => BUBBLE,
+        "heart" => HEART,
+        "splash" => &[
+            "assets/minecraft/textures/particle/splash_0.png",
+            "assets/minecraft/textures/particle/splash_1.png",
+            "assets/minecraft/textures/particle/splash_2.png",
+            "assets/minecraft/textures/particle/splash_3.png",
+        ],
+        "note" => NOTE,
+        "explosion" | "explosion_emitter" => EXPLOSION,
+        "gust" | "small_gust" | "gust_emitter_large" | "gust_emitter_small" => GUST,
+        "sonic_boom" => SONIC,
+        "sculk_soul" => SCULK,
+        "cherry_leaves" => CHERRY,
+        "effect" | "instant_effect" | "entity_effect" => EFFECT,
+        "crit" | "damage_indicator" => &["assets/minecraft/textures/particle/critical_hit.png"],
+        "electric_spark" | "enchanted_hit" | "end_rod" => SPARK,
+        "dripping_lava"
+        | "dripping_water"
+        | "dripping_honey"
+        | "dripping_obsidian_tear"
+        | "dripping_dripstone_lava"
+        | "dripping_dripstone_water" => DRIP_HANG,
+        "falling_lava"
+        | "falling_water"
+        | "falling_honey"
+        | "falling_obsidian_tear"
+        | "falling_dripstone_lava"
+        | "falling_dripstone_water" => DRIP_FALL,
+        "landing_lava" | "landing_honey" | "landing_obsidian_tear" => DRIP_LAND,
+        "wax_on" | "wax_off" | "glow" | "glow_squid_ink" => GLITTER,
+        "enchant" => SGA,
+        "angry_villager"
+        | "block"
+        | "block_marker"
+        | "cloud"
+        | "dragon_breath"
+        | "dust"
+        | "dust_color_transition"
+        | "elder_guardian"
+        | "falling_dust"
+        | "firework"
+        | "fishing"
+        | "infested"
+        | "sculk_charge"
+        | "sculk_charge_pop"
+        | "soul"
+        | "flash"
+        | "happy_villager"
+        | "composter"
+        | "item"
+        | "vibration"
+        | "item_slime"
+        | "item_cobweb"
+        | "item_snowball"
+        | "large_smoke"
+        | "lava"
+        | "mycelium"
+        | "poof"
+        | "portal"
+        | "rain"
+        | "smoke"
+        | "white_smoke"
+        | "spit"
+        | "squid_ink"
+        | "sweep_attack"
+        | "totem_of_undying"
+        | "underwater"
+        | "witch"
+        | "current_down"
+        | "nautilus"
+        | "dolphin"
+        | "campfire_cosy_smoke"
+        | "campfire_signal_smoke"
+        | "falling_nectar"
+        | "falling_spore_blossom"
+        | "ash"
+        | "crimson_spore"
+        | "warped_spore"
+        | "spore_blossom_air"
+        | "reverse_portal"
+        | "white_ash"
+        | "snowflake"
+        | "shriek"
+        | "egg_crack"
+        | "dust_plume"
+        | "trial_spawner_detected_player"
+        | "trial_spawner_detected_player_ominous"
+        | "vault_connection"
+        | "dust_pillar"
+        | "ominous_spawning"
+        | "raid_omen"
+        | "trial_omen" => GENERIC,
+        _ => GENERIC,
+    }
+}
+
+/// CPU-side tightly packed atlas pixels and normalized UV rectangles.
+#[derive(Clone, Debug)]
+pub struct VanillaEntityTextureAtlas {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    entity_uvs: Vec<[f32; 4]>,
+    ber_uvs: BTreeMap<String, [f32; 4]>,
+}
+
+impl VanillaEntityTextureAtlas {
+    pub fn entity_uv(&self, entity_type_id: u16) -> Option<[f32; 4]> {
+        self.entity_uvs.get(entity_type_id as usize).copied()
+    }
+    pub fn ber_uv(&self, name: &str) -> Option<[f32; 4]> {
+        let path = ber_texture_path_for_name(name)?;
+        self.ber_uvs.get(path).copied()
+    }
+}
+
+/// CPU-side particle atlas. `normalized_age` selects a frame across the
+/// particle's authored sequence, clamped to `[0, 1]`.
+#[derive(Clone, Debug)]
+pub struct VanillaParticleTextureAtlas {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+    frames: Vec<Vec<[f32; 4]>>,
+}
+
+impl VanillaParticleTextureAtlas {
+    pub fn particle_uv(&self, particle_id: u16, normalized_age: f32) -> Option<[f32; 4]> {
+        let frames = self.frames.get(particle_id as usize)?;
+        if frames.is_empty() {
+            return None;
+        }
+        let t = if normalized_age.is_finite() {
+            normalized_age.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let frame = ((t * frames.len() as f32).floor() as usize).min(frames.len() - 1);
+        Some(frames[frame])
+    }
+}
+
+fn archive_textures(bytes: &[u8], wanted: &BTreeMap<String, bool>) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        return out;
+    }
+    let Ok(index) = ZipSliceIndex::open_filtered(bytes, |n| wanted.contains_key(n)) else {
+        return out;
+    };
+    if index.entries().len() > MAX_ARCHIVE_ENTRIES {
+        return out;
+    }
+    let mut total = 0u64;
+    for e in index.entries() {
+        if e.name.ends_with(".png") && e.uncompressed_size <= MAX_ENTRY_BYTES {
+            if e.uncompressed_size > MAX_UNPACKED_BYTES.saturating_sub(total) {
+                break;
+            }
+            if let Ok(data) = index.read_entry(&e.name, MAX_ENTRY_BYTES as usize) {
+                total += data.len() as u64;
+                out.insert(e.name.clone(), data);
+            }
+        }
+    }
+    out
+}
+
+fn procedural_pixels(path: &str, particle: bool) -> (u32, u32, Vec<u8>) {
+    let mut hash = 0x811c9dc5u32;
+    for b in path.bytes() {
+        hash = (hash ^ u32::from(b)).wrapping_mul(0x01000193);
+    }
+    let color = [(hash >> 16) as u8, (hash >> 8) as u8, hash as u8];
+    let (w, h) = (16, 16);
+    let mut pixels = vec![0; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - 7.5;
+            let dy = y as f32 - 7.5;
+            let d = (dx * dx + dy * dy).sqrt();
+            let spark = particle
+                && (path.contains("spark")
+                    || path.contains("critical_hit")
+                    || path.contains("explosion")
+                    || path.contains("sonic_boom"));
+            let spark_mask =
+                dx.abs() <= 1.25 || dy.abs() <= 1.25 || (dx.abs() - dy.abs()).abs() <= 1.1;
+            let alpha = if particle && spark {
+                if spark_mask && d <= 8.0 {
+                    255
+                } else {
+                    0
+                }
+            } else if particle {
+                ((8.0 - d).clamp(0.0, 1.0) * 255.0) as u8
+            } else {
+                255
+            };
+            let i = (y * w + x) * 4;
+            let shade = if particle {
+                255
+            } else if (x + y) % 5 == 0 {
+                160
+            } else {
+                255
+            };
+            pixels[i] = (u16::from(color[0]) * shade / 255) as u8;
+            pixels[i + 1] = (u16::from(color[1]) * shade / 255) as u8;
+            pixels[i + 2] = (u16::from(color[2]) * shade / 255) as u8;
+            pixels[i + 3] = alpha;
+        }
+    }
+    (w as u32, h as u32, pixels)
+}
+
+fn pack_texture_map(
+    mut sprites: BTreeMap<String, (u32, u32, Vec<u8>)>,
+) -> (u32, u32, Vec<u8>, BTreeMap<String, [f32; 4]>) {
+    let mut positions = BTreeMap::new();
+    let mut x = 0u32;
+    let mut y = 0u32;
+    let mut shelf_h = 0u32;
+    let width = sprites
+        .values()
+        .map(|(w, _, _)| *w)
+        .max()
+        .unwrap_or(1)
+        .max(2048)
+        .next_power_of_two();
+    for (key, (w, h, _)) in &sprites {
+        if x + w > width {
+            x = 0;
+            y += shelf_h;
+            shelf_h = 0;
+        }
+        positions.insert(key.clone(), (x, y, *w, *h));
+        x += w;
+        shelf_h = shelf_h.max(*h);
+    }
+    let height = (y + shelf_h).max(1).next_power_of_two();
+    let mut rgba = vec![0; (width * height * 4) as usize];
+    for (key, (sw, sh, pixels)) in sprites.iter_mut() {
+        if let Some(&(px, py, _, _)) = positions.get(key) {
+            for row in 0..*sh {
+                let src = (row * *sw * 4) as usize;
+                let dst = ((py + row) * width + px) as usize * 4;
+                let len = (*sw * 4) as usize;
+                rgba[dst..dst + len].copy_from_slice(&pixels[src..src + len]);
+            }
+        }
+    }
+    let uv = positions
+        .into_iter()
+        .map(|(k, (x, y, w, h))| {
+            (
+                k,
+                [
+                    x as f32 / width as f32,
+                    y as f32 / height as f32,
+                    (x + w) as f32 / width as f32,
+                    (y + h) as f32 / height as f32,
+                ],
+            )
+        })
+        .collect();
+    (width, height, rgba, uv)
+}
+
+const MAX_TEXTURE_ATLAS_BYTES: usize = 64 * 1024 * 1024;
+
+fn decoded_or_fallback(
+    path: &str,
+    particle: bool,
+    bytes: Option<&Vec<u8>>,
+    remaining_rgba_bytes: usize,
+) -> (u32, u32, Vec<u8>) {
+    if let Some(decoded) = bytes.and_then(|png| png_decode::decode_png_rgba(png).ok()) {
+        if decoded.2.len() <= remaining_rgba_bytes {
+            return decoded;
+        }
+    }
+    procedural_pixels(path, particle)
+}
+
+/// Decode the listed entity and BER images from the supplied vanilla JAR,
+/// then overlay resource packs in order (last pack has highest priority).
+/// Missing or invalid PNGs receive deterministic clean-room fallback tiles.
+pub fn load_vanilla_entity_atlas_from_jar_bytes(
+    jar: &[u8],
+    packs: &[&[u8]],
+) -> VanillaEntityTextureAtlas {
+    let mut paths = BTreeMap::<String, bool>::new();
+    for id in 0..130 {
+        if let Some(path) = entity_texture_path_for_id(id) {
+            paths.insert(path.to_owned(), false);
+        }
+    }
+    for name in [
+        "chest",
+        "trapped_chest",
+        "ender_chest",
+        "shulker",
+        "bed",
+        "sign",
+        "banner",
+        "bell",
+        "enchanting_table",
+        "beacon",
+        "conduit",
+        "decorated_pot",
+    ] {
+        if let Some(path) = ber_texture_path_for_name(name) {
+            paths.insert(path.to_owned(), false);
+        }
+    }
+    let mut files = archive_textures(jar, &paths);
+    for pack in packs {
+        files.extend(archive_textures(pack, &paths));
+    }
+    let mut sprites = BTreeMap::new();
+    let mut decoded_bytes = 0usize;
+    for (path, particle) in paths {
+        let (w, h, rgba) = decoded_or_fallback(
+            &path,
+            particle,
+            files.get(&path),
+            MAX_TEXTURE_ATLAS_BYTES.saturating_sub(decoded_bytes),
+        );
+        decoded_bytes = decoded_bytes.saturating_add(rgba.len());
+        sprites.insert(path, (w, h, rgba));
+    }
+    let (width, height, rgba, rects) = pack_texture_map(sprites);
+    let entity_uvs = (0..130)
+        .map(|id| {
+            entity_texture_path_for_id(id)
+                .and_then(|p| rects.get(p).copied())
+                .unwrap_or([0.0; 4])
+        })
+        .collect();
+    let ber_uvs = [
+        "chest",
+        "trapped_chest",
+        "ender_chest",
+        "shulker",
+        "bed",
+        "sign",
+        "banner",
+        "bell",
+        "enchanting_table",
+        "beacon",
+        "conduit",
+        "decorated_pot",
+    ]
+    .into_iter()
+    .filter_map(|n| {
+        ber_texture_path_for_name(n)
+            .and_then(|p| rects.get(p).copied().map(|uv| (p.to_owned(), uv)))
+    })
+    .collect();
+    VanillaEntityTextureAtlas {
+        width,
+        height,
+        rgba,
+        entity_uvs,
+        ber_uvs,
+    }
+}
+
+/// Decode particle frames from the supplied vanilla JAR and priority-ordered
+/// resource packs. Invalid/missing frames use procedural spark/circle tiles.
+pub fn load_vanilla_particle_atlas_from_jar_bytes(
+    jar: &[u8],
+    packs: &[&[u8]],
+) -> VanillaParticleTextureAtlas {
+    let mut paths = BTreeMap::new();
+    let mut sprites = BTreeMap::new();
+    let frames: Vec<Vec<String>> = (0..=108)
+        .map(|id| {
+            particle_texture_paths_for_id(id)
+                .iter()
+                .map(|p| {
+                    paths.insert((*p).to_owned(), true);
+                    (*p).to_owned()
+                })
+                .collect()
+        })
+        .collect();
+    let mut files = archive_textures(jar, &paths);
+    for pack in packs {
+        files.extend(archive_textures(pack, &paths));
+    }
+    let mut decoded_bytes = 0usize;
+    for (path, is_particle) in paths {
+        let (w, h, rgba) = decoded_or_fallback(
+            &path,
+            is_particle,
+            files.get(&path),
+            MAX_TEXTURE_ATLAS_BYTES.saturating_sub(decoded_bytes),
+        );
+        decoded_bytes = decoded_bytes.saturating_add(rgba.len());
+        sprites_insert(path, w, h, rgba, &mut sprites);
+    }
+    let (width, height, rgba, rects) = pack_texture_map(sprites);
+    let uv_frames = frames
+        .into_iter()
+        .map(|seq| {
+            seq.into_iter()
+                .filter_map(|p| rects.get(&p).copied())
+                .collect()
+        })
+        .collect();
+    VanillaParticleTextureAtlas {
+        width,
+        height,
+        rgba,
+        frames: uv_frames,
+    }
+}
+
+fn sprites_insert(
+    path: String,
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+    sprites: &mut BTreeMap<String, (u32, u32, Vec<u8>)>,
+) {
+    sprites.insert(path, (w, h, rgba));
 }
 
 // ---------------------------------------------------------------------------
