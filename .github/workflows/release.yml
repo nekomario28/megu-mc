@@ -491,11 +491,20 @@ jobs:
           cat > release-notes.md <<'EOF'
           ## Quick Start
 
-          - **Playing (GUI):** run `megu-client-gpu` — the native GPU game client (Vulkan / DX12 / Metal).
-          - **First-time setup:** `megu-installer` fetches the required vanilla 1.21.1 assets and registers the Megu profile.
-          - **Server:** `megu` runs the dedicated server.
+          Most desktop users need only the standalone installer for their platform:
 
-          `*-musl`, `freebsd-*` and `*-riscv64` archives are **server-only** (`megu` + `megu-installer`; the musl ones are statically linked). `*-musl-client` archives carry the dynamically linked musl `megu-client-gpu` (Vulkan/Wayland/X11).
+          | Platform | Start with |
+          |---|---|
+          | Linux x86_64 | `megu-installer-linux-x86_64` |
+          | Linux arm64 | `megu-installer-linux-arm64` |
+          | macOS arm64 | `megu-installer-macos-arm64` |
+          | macOS x86_64 | `megu-installer-macos-x86_64` |
+          | Windows x86_64 | `megu-installer-windows-x86_64.exe` |
+          | Windows arm64 | `megu-installer-windows-arm64.exe` |
+
+          Run the installer, then choose the **Megu (1.21.1)** profile in your launcher. First-time integrated-singleplayer setup is explicit: the installer asks for EULA/runtime-data consent, downloads or uses the pinned official 1.21.1 server jar plus pinned MIT minecraft-data block metadata, and generates the runtime data locally. It fails closed rather than creating a partial singleplayer install.
+
+          The platform tarballs are for manual/advanced installs. Full desktop archives contain `megu`, `megu-client-gpu`, and `megu-installer`. `*-musl`, `freebsd-*` and `*-riscv64` archives are **server-only** (`megu` + `megu-installer`; the musl ones are statically linked). `*-musl-client` archives carry only the dynamically linked musl `megu-client-gpu` (Vulkan/Wayland/X11).
           EOF
           options=(--title "$RELEASE_VERSION" --generate-notes --notes-file release-notes.md)
           if [[ "$GITHUB_EVENT_NAME" == push ]]; then
