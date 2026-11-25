@@ -49,6 +49,12 @@
 //!   translucent live-preview settings backdrop, the universal
 //!   drag-and-drop payload classifier with mandatory consent prompts,
 //!   and the secret-denylist-guarded existing-launcher importer.
+//! * [`gamepad`] — the Controllable-class native gamepad engine: brand
+//!   profiles and bilingual prompt glyphs for Xbox / PlayStation /
+//!   Switch / Steam Deck, radial-deadzone stick processing, console
+//!   gameplay bindings, magnetic virtual-cursor UI navigation with
+//!   D-pad focus jumps, an 8-slice radial wheel, and a bounded rumble
+//!   queue.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -68,6 +74,7 @@ pub mod create_goggles_hud;
 pub mod death_screen;
 pub mod draw;
 pub mod font_cjk;
+pub mod gamepad;
 pub mod gui_bridge;
 pub mod hud_widgets;
 pub mod jei_emi_overlay;
