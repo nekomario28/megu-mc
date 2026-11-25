@@ -2903,7 +2903,7 @@ fn monument_building_body(
     w.generate_water_box(s, 0, 0, 0, 58, top, 58, sea_level);
     monument_generate_wing(w, s, clip, false, 0, sea_level);
     monument_generate_wing(w, s, clip, true, 33, sea_level);
-    monument_generate_entrance_archs(w, s, clip);
+    monument_generate_entrance_archs(w, s, clip, sea_level);
     monument_generate_entrance_wall(w, s, clip, sea_level);
     monument_generate_roof_piece(w, s, clip, sea_level);
     monument_generate_lower_wall(w, s, clip, sea_level);
@@ -3045,14 +3045,19 @@ fn monument_generate_wing(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn monument_generate_entrance_archs(w: &mut PieceWorld<'_, '_>, s: &MonumentStates, clip: Bounds) {
+fn monument_generate_entrance_archs(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    clip: Bounds,
+    sea_level: i32,
+) {
     if !w.chunk_intersects(&clip, 22, 5, 35, 17) {
         return;
     }
     let g = s.gray;
     let l = s.light;
     let m = s.lamp;
-    w.generate_water_box(s, 25, 0, 0, 32, 8, 20, 63);
+    w.generate_water_box(s, 25, 0, 0, 32, 8, 20, sea_level);
     for k in 0..4 {
         let z = 5 + k * 4;
         w.generate_box(24, 2, z, 24, 4, z, l, l, false);
@@ -4212,5 +4217,153 @@ pub(crate) fn place_monument_chunk<R: StructureRng + FullIntRng>(
         let piece = piece.clone();
         let mut w = PieceWorld::new(ctx, reg, clip, piece.bounds, Some(piece.orient), loots);
         monument_piece_post_process(&mut w, &states, &piece, rooms, rng, clip, sea_level, elders);
+    }
+}
+
+#[cfg(test)]
+mod structure_signature_tests {
+    use super::*;
+
+    fn union_bounds(pieces: &[FortressPiece]) -> Bounds {
+        let mut out = pieces[0].bounds;
+        for piece in &pieces[1..] {
+            fm_bb_encapsulate(&mut out, &piece.bounds);
+        }
+        out
+    }
+
+    #[test]
+    fn fortress_layout_bounds_cover_every_piece_without_overlap() {
+        for seed in [1, 7, 4242, 1_21_1] {
+            let mut rng = Xor::seed_worldgen(seed);
+            let layout = generate_fortress_pieces(&mut rng, -3, 11);
+            assert!(!layout.pieces.is_empty());
+            assert_eq!(layout.pieces[0].kind, FortressKind::Start);
+            assert_eq!(layout.bounds, union_bounds(&layout.pieces));
+            for (i, piece) in layout.pieces.iter().enumerate() {
+                assert!(
+                    piece.bounds[1] > FORTRESS_LOWEST_Y,
+                    "seed {seed} piece {i} dips below the fortress floor: {:?}",
+                    piece.bounds
+                );
+                for (j, other) in layout.pieces.iter().enumerate().skip(i + 1) {
+                    assert!(
+                        !fm_bb_intersects(&piece.bounds, &other.bounds),
+                        "seed {seed} pieces {i} and {j} overlap: {:?} vs {:?}",
+                        piece.bounds,
+                        other.bounds
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fortress_piece_weights_expose_the_vanilla_signature_rooms() {
+        let expected = [
+            (FortressKind::BridgeStraight, 30, 0, true),
+            (FortressKind::BridgeCrossing, 10, 4, false),
+            (FortressKind::RoomCrossing, 10, 4, false),
+            (FortressKind::StairsRoom, 10, 3, false),
+            (FortressKind::MonsterThrone, 5, 2, false),
+            (FortressKind::CastleEntrance, 5, 1, false),
+            (FortressKind::CastleSmallCorridor, 25, 0, true),
+            (FortressKind::CastleSmallCorridorCrossing, 15, 5, false),
+            (FortressKind::CastleSmallCorridorRightTurn, 5, 10, false),
+            (FortressKind::CastleSmallCorridorLeftTurn, 5, 10, false),
+            (FortressKind::CastleCorridorStairs, 10, 3, true),
+            (FortressKind::CastleCorridorTBalcony, 7, 2, false),
+            (FortressKind::CastleStalkRoom, 5, 2, false),
+        ];
+        assert_eq!(FORTRESS_WEIGHTS.len(), expected.len());
+        for (got, want) in FORTRESS_WEIGHTS.iter().zip(expected) {
+            assert_eq!(
+                (got.kind, got.weight, got.max_place_count, got.allow_in_row),
+                want
+            );
+        }
+        assert_eq!(FORTRESS_LOOT_TABLE, "minecraft:chests/nether_bridge");
+    }
+
+    fn monument_open_reachable(layout: &MonumentLayout) -> std::collections::HashSet<u32> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![layout.source_room];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let room = &layout.rooms[id as usize];
+            for direction in 0..6 {
+                if room.has_opening[direction] {
+                    if let Some(next) = room.connections[direction] {
+                        stack.push(next);
+                    }
+                }
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn monument_layout_has_signature_pieces_inside_a_connected_room_graph() {
+        for seed in [1, 7, 4242, 1_21_1] {
+            let mut rng = Xor::seed_worldgen(seed);
+            let layout = generate_monument_pieces(&mut rng, 5, -9);
+            let count = |kind| {
+                layout
+                    .pieces
+                    .iter()
+                    .filter(|piece| piece.kind == kind)
+                    .count()
+            };
+            assert_eq!(count(MonumentKind::Building), 1, "seed {seed} building");
+            assert_eq!(count(MonumentKind::Entry), 1, "seed {seed} entry");
+            assert_eq!(count(MonumentKind::Core), 1, "seed {seed} core");
+            assert_eq!(count(MonumentKind::Penthouse), 1, "seed {seed} penthouse");
+            assert_eq!(count(MonumentKind::Wing), 2, "seed {seed} wings");
+            let wing_designs: Vec<i32> = layout
+                .pieces
+                .iter()
+                .filter(|piece| piece.kind == MonumentKind::Wing)
+                .map(|piece| piece.main_design)
+                .collect();
+            assert_ne!(wing_designs[0], wing_designs[1], "seed {seed} wing designs");
+
+            let building = layout.pieces[0].bounds;
+            for piece in layout.pieces.iter().skip(1) {
+                for axis in 0..3 {
+                    assert!(
+                        piece.bounds[axis] >= building[axis]
+                            && piece.bounds[axis + 3] <= building[axis + 3],
+                        "seed {seed} {:?} escapes the building on axis {axis}: {:?} not in {:?}",
+                        piece.kind,
+                        piece.bounds,
+                        building
+                    );
+                }
+            }
+
+            assert!(layout.rooms[layout.source_room as usize].is_source);
+            assert!(layout.rooms[layout.core_room as usize].claimed);
+            for special in [1001, 1002, 1003] {
+                assert!(
+                    layout.rooms.iter().any(|room| room.index == special && room.claimed),
+                    "seed {seed} missing claimed monument room {special}"
+                );
+            }
+            let reachable_indexes: std::collections::HashSet<i32> = monument_open_reachable(&layout)
+                .into_iter()
+                .map(|id| layout.rooms[id as usize].index)
+                .collect();
+            for room in &layout.rooms {
+                if room.index < 75 {
+                    assert!(
+                        reachable_indexes.contains(&room.index),
+                        "seed {seed} room {} is disconnected from the source",
+                        room.index
+                    );
+                }
+            }
+        }
     }
 }

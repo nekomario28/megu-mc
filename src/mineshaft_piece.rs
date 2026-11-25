@@ -733,4 +733,25 @@ mod tests {
         assert_ne!(a.pieces.len(), 0);
         let _ = n;
     }
+
+    #[test]
+    fn mesa_layout_centre_stays_inside_the_surface_spawn_band() {
+        for surface_height in [64, 80, 120] {
+            let layout = crate::mineshaft_layout::mesa_layout(
+                4242,
+                3,
+                -7,
+                63,
+                -64,
+                |_, _| surface_height,
+            );
+            let low = layout.pieces.iter().map(|piece| piece.bounds[1]).min().unwrap();
+            let high = layout.pieces.iter().map(|piece| piece.bounds[4]).max().unwrap();
+            let centre = low + (high - low + 1) / 2;
+            assert!(
+                (63..=surface_height).contains(&centre),
+                "surface {surface_height}: centre {centre} outside 63..={surface_height}"
+            );
+        }
+    }
 }
