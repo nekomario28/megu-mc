@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
+use crate::ber_instancing::{VanillaParticleKind, VanillaParticleMotion};
 use crate::perceptual_gpu_offload::GpuParticleInstance;
 
 pub const VFX1_CHANNEL: &str = "megu:vfx_v1";
@@ -251,6 +252,85 @@ impl ParticleEmitterSpec {
         Ok(())
     }
 }
+
+
+/// Convert one exact protocol-767 particle type into the generic bounded
+/// fixed-tick emitter representation used by this module. The authoritative
+/// simulation remains [`crate::ber_instancing::VanillaParticleWorld`]; this
+/// adapter lets existing VFX1 consumers render/catalog vanilla effects
+/// without duplicating registry tables. Conversion is deterministic and
+/// closed-form: per-second drag/gravity are converted to per-tick units and
+/// lifetime uses the kind's maximum vanilla range.
+pub fn vanilla_particle_emitter_spec(
+    kind: VanillaParticleKind,
+    pos: Vec3,
+    velocity: Vec3,
+) -> ParticleEmitterSpec {
+    let spec = kind.spec();
+    let drag = (-spec.drag_per_sec / 20.0).exp().clamp(0.0, 1.0) as f32;
+    let gravity_per_tick = (spec.gravity_per_sec2 / 400.0) as f32;
+    let base_radius = spec.base_radius;
+    let mid_scale = spec.size_curve.scale(0.5);
+    let end_scale = spec.size_curve.scale(1.0);
+    let orientation = match spec.motion {
+        VanillaParticleMotion::Shockwave => ParticleOrientation::FlatGroundDecal,
+        VanillaParticleMotion::Flutter | VanillaParticleMotion::Swirl => {
+            ParticleOrientation::VelocityStretched
+        }
+        VanillaParticleMotion::Linear
+        | VanillaParticleMotion::Static
+        | VanillaParticleMotion::Buoyant
+        | VanillaParticleMotion::Emitter => ParticleOrientation::CameraBillboard,
+    };
+    let priority = match spec.motion {
+        VanillaParticleMotion::Shockwave | VanillaParticleMotion::Static => 220,
+        VanillaParticleMotion::Emitter => 180,
+        _ => 128,
+    };
+    ParticleEmitterSpec {
+        pos,
+        initial_velocity: velocity,
+        position_spread: [0.02; 3],
+        velocity_spread: [0.02; 3],
+        spawn_rate_per_tick: 1.0,
+        particle_lifetime_ticks: spec.max_lifetime_ticks,
+        emitter_ttl_ticks: 1,
+        gravity_per_tick,
+        drag,
+        spin_per_tick: match spec.motion {
+            VanillaParticleMotion::Swirl => 0.22,
+            VanillaParticleMotion::Flutter => 0.08,
+            _ => 0.0,
+        },
+        orientation,
+        color: ColorRamp::new(vec![
+            ColorStop { t: 0.0, rgba: spec.tint_rgba },
+            ColorStop {
+                t: 1.0,
+                rgba: [
+                    spec.tint_rgba[0],
+                    spec.tint_rgba[1],
+                    spec.tint_rgba[2],
+                    spec.tint_rgba[3] * 0.15,
+                ],
+            },
+        ]),
+        size: ScalarCurve::new(vec![
+            ScalarStop { t: 0.0, value: base_radius },
+            ScalarStop { t: 0.5, value: base_radius * mid_scale },
+            ScalarStop { t: 1.0, value: base_radius * end_scale },
+        ]),
+        priority,
+    }
+}
+
+/// `true` when the protocol particle's vanilla sprite should be rendered
+/// without diffuse lighting. This mirrors the catalog's fullbright flag for
+/// shader selection in consumers that do not use `VanillaParticleSpec`.
+pub fn vanilla_particle_is_fullbright(kind: VanillaParticleKind) -> bool {
+    kind.spec().fullbright
+}
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActiveParticle {
