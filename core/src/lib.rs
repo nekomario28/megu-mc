@@ -171,6 +171,33 @@
 //!   section, its chunk aggregate and every border-adjacent neighbour
 //!   section, keyed by the [`coords`] types so no duplicate revision
 //!   scheme can drift out of sync.
+//! * [`rev`] — the universal zero-allocation revision spine for UI and
+//!   retained rendering: [`rev::Revision`] monotonic generation tokens,
+//!   the fixed-capacity [`rev::LayerRevBus`] dirty-layer bus carrying
+//!   the canonical [`rev::UiLayer`] render stack (backdrop → mod
+//!   overlay, with dedicated `ModHud`/`ModOverlay` layers so modded
+//!   surfaces never re-tessellate the vanilla HUD), and
+//!   [`rev::RetainedLayerTracker`], whose [`rev::DirtyLayers`] bitmask
+//!   makes a no-change frame cost 0 rebuilds, 0 heap allocs and 0 GPU
+//!   uploads.
+//! * [`registry`] — the universal namespaced registry spine vanilla and
+//!   mods share: [`registry::NamespacedId`] `namespace:path` identity
+//!   validated once through [`id`], dense [`registry::RegistryId`]
+//!   handles for zero-string-hash hot paths, and
+//!   [`registry::UniversalRegistry`] with deterministic insertion order,
+//!   duplicate rejection, a post-load [`registry::UniversalRegistry::freeze`]
+//!   and a 4-byte [`registry::UniversalRegistry::digest_crc32`]
+//!   fingerprint for server ↔ client registry-sync checks.
+//! * [`ui_contract`] — the canonical Vanilla 1.21.1 UI theme and
+//!   declarative mod/vanilla UI contract: [`ui_contract::Rgba8`] plus
+//!   the [`ui_contract::VANILLA_1_21_1`] token table (stone bevels,
+//!   recessed slots, tooltip gradient, exact text/shadow colors and
+//!   widget metrics), the vanilla-exact
+//!   [`ui_contract::compute_gui_scale`] integer-scale rule, and the
+//!   bounded [`ui_contract::ModUiManifest`] /
+//!   [`ui_contract::UiWidgetSpec`] declarative tree every Fabric,
+//!   NeoForge, Create and WASM surface emits — with title-screen purity
+//!   kept as a type-level invariant.
 
 #![deny(unsafe_code)]
 
@@ -197,6 +224,8 @@ pub mod nbt_wire;
 pub mod os_desktop;
 pub mod perf_kit;
 pub mod random;
+pub mod registry;
+pub mod rev;
 pub mod romaji_ime;
 pub mod section_rev;
 pub mod server_perf_governors;
@@ -205,6 +234,7 @@ pub(crate) mod stats;
 pub mod sys_metrics;
 pub mod task_pool;
 pub mod tier25_guard_batch;
+pub mod ui_contract;
 pub mod varint;
 pub mod version;
 pub mod zip_archive;
