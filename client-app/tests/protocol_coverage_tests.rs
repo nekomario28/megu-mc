@@ -9,7 +9,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use megu_client::protocol::{
     decode_chunk_packet, decode_extended_play_event, encode_chat_command, encode_chat_message,
     encode_container_button_click, encode_container_click, encode_container_close,
-    encode_interact_attack, encode_interact_use, encode_pick_item, encode_player_action,
+    encode_interact_attack, encode_interact_use, encode_move_vehicle, encode_paddle_boat,
+    encode_pick_item, encode_player_action, encode_release_use_item, encode_set_creative_mode_slot,
     encode_slot_stack, encode_swing, encode_use_item, encode_use_item_on, pack_position,
     write_varint, write_varlong, PlayEvent, WireReader, PROTOCOL_767,
 };
@@ -610,6 +611,35 @@ fn decodes_block_destruction_and_block_entity_data() {
 }
 
 #[test]
+fn decodes_passengers_and_server_vehicle_pose() {
+    let mut passengers = vi(41);
+    passengers.extend(vi(2));
+    passengers.extend(vi(7));
+    passengers.extend(vi(9));
+    assert!(matches!(
+        decode("set_passengers", &passengers),
+        PlayEvent::SetPassengers { vehicle: 41, passengers } if passengers == [7, 9]
+    ));
+
+    let mut pose = Vec::new();
+    for value in [1.25f64, 64.0, -2.5] {
+        pose.extend_from_slice(&value.to_be_bytes());
+    }
+    pose.extend_from_slice(&90.0f32.to_be_bytes());
+    pose.extend_from_slice(&(-15.0f32).to_be_bytes());
+    assert!(matches!(
+        decode("move_vehicle", &pose),
+        PlayEvent::MoveVehicle {
+            x: 1.25,
+            y: 64.0,
+            z: -2.5,
+            yaw: 90.0,
+            pitch: -15.0
+        }
+    ));
+}
+
+#[test]
 fn chunk_block_entities_are_retained() {
     // Minimal 767 chunk: 0 sections, heightmaps = empty compound, one block
     // entity, all-empty light masks.
@@ -872,6 +902,40 @@ fn encodes_swing_and_pick_item() {
 }
 
 #[test]
+fn encodes_vehicle_and_creative_slot_packets() {
+    let (name, body) = encode_move_vehicle(1.25, 64.0, -2.5, 90.0, -15.0);
+    assert_eq!(name, "move_vehicle");
+    let mut r = WireReader::new(&body);
+    assert_eq!(
+        (
+            r.read_f64().unwrap(),
+            r.read_f64().unwrap(),
+            r.read_f64().unwrap()
+        ),
+        (1.25, 64.0, -2.5)
+    );
+    assert_eq!(
+        (r.read_f32().unwrap(), r.read_f32().unwrap()),
+        (90.0, -15.0)
+    );
+    assert_eq!(r.remaining(), 0);
+
+    let (name, body) = encode_paddle_boat(true, false);
+    assert_eq!(name, "paddle_boat");
+    assert_eq!(body, [1, 0]);
+
+    let (name, body) = encode_set_creative_mode_slot(4, 12, 3);
+    assert_eq!(name, "set_creative_mode_slot");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_i16().unwrap(), 4);
+    assert_eq!(r.read_varint().unwrap(), 3);
+    assert_eq!(r.read_varint().unwrap(), 12);
+    assert_eq!(r.read_varint().unwrap(), 0); // added components
+    assert_eq!(r.read_varint().unwrap(), 0); // removed components
+    assert_eq!(r.remaining(), 0);
+}
+
+#[test]
 fn encodes_use_item_on_full_layout() {
     let (name, body) = encode_use_item_on(0, [10, 64, -3], 1, [0.5, 0.25, 0.75], true, 42);
     assert_eq!(name, "use_item_on");
@@ -905,6 +969,15 @@ fn encodes_use_item_and_player_action() {
     assert_eq!(r.read_position().unwrap(), [1, 2, 3]);
     assert_eq!(r.read_i8().unwrap(), -1); // face
     assert_eq!(r.read_varint().unwrap(), 7);
+    assert_eq!(r.remaining(), 0);
+
+    let (name, body) = encode_release_use_item();
+    assert_eq!(name, "player_action");
+    let mut r = WireReader::new(&body);
+    assert_eq!(r.read_varint().unwrap(), 5);
+    assert_eq!(r.read_position().unwrap(), [0, 0, 0]);
+    assert_eq!(r.read_i8().unwrap(), 0);
+    assert_eq!(r.read_varint().unwrap(), 0);
     assert_eq!(r.remaining(), 0);
 }
 

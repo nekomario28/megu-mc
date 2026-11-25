@@ -2373,25 +2373,25 @@ pub fn decode_particle_options(
 ) -> Result<DecodedParticleOptions, String> {
     let mut r = WireReader::new(payload);
     let decoded = match particle_id {
-        2 | 3 | 29 | 104 => DecodedParticleOptions::BlockState(r.read_varint()?),
-        14 => DecodedParticleOptions::Dust {
+        1 | 2 | 28 | 105 => DecodedParticleOptions::BlockState(r.read_varint()?),
+        13 => DecodedParticleOptions::Dust {
             red: r.read_f32()?,
             green: r.read_f32()?,
             blue: r.read_f32()?,
             scale: r.read_f32()?,
         },
-        15 => DecodedParticleOptions::DustColorTransition {
+        14 => DecodedParticleOptions::DustColorTransition {
             from: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
             scale: r.read_f32()?,
             to: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
         },
-        21 => DecodedParticleOptions::EntityEffect {
+        20 => DecodedParticleOptions::EntityEffect {
             argb: r.read_i32()?,
         },
-        36 => DecodedParticleOptions::SculkCharge {
+        35 => DecodedParticleOptions::SculkCharge {
             roll: r.read_f32()?,
         },
-        45 => {
+        44 => {
             let end = slot_skip_extent(payload, 0)
                 .ok_or_else(|| "malformed item particle slot".to_string())?;
             r.take(end)?;
@@ -2399,7 +2399,7 @@ pub fn decode_particle_options(
                 slot_wire: payload[..end].to_vec(),
             }
         }
-        46 => {
+        45 => {
             let source = match r.read_varint()? {
                 0 => VibrationSource::Block(r.read_position()?),
                 1 => VibrationSource::Entity {
@@ -2413,7 +2413,7 @@ pub fn decode_particle_options(
                 arrival_ticks: r.read_varint()?,
             }
         }
-        98 => DecodedParticleOptions::Shriek {
+        99 => DecodedParticleOptions::Shriek {
             delay: r.read_varint()?,
         },
         _ if payload.is_empty() => DecodedParticleOptions::Empty,
@@ -4906,11 +4906,49 @@ pub fn encode_player_action(
     ("player_action", p)
 }
 
+/// `player_action` status 5 — release the currently used item.
+pub fn encode_release_use_item() -> (&'static str, Vec<u8>) {
+    encode_player_action(5, [0; 3], 0, 0)
+}
+
 /// `pick_item` — pick-block / pick-entity-from-hotbar slot request.
 pub fn encode_pick_item(slot: i32) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(5);
     write_varint(&mut p, slot);
     ("pick_item", p)
+}
+
+/// `move_vehicle` — client-controlled vehicle pose.
+pub fn encode_move_vehicle(
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+) -> (&'static str, Vec<u8>) {
+    let mut p = Vec::with_capacity(28);
+    p.extend_from_slice(&x.to_be_bytes());
+    p.extend_from_slice(&y.to_be_bytes());
+    p.extend_from_slice(&z.to_be_bytes());
+    p.extend_from_slice(&yaw.to_be_bytes());
+    p.extend_from_slice(&pitch.to_be_bytes());
+    ("move_vehicle", p)
+}
+
+/// `paddle_boat` — the two paddle state booleans.
+pub fn encode_paddle_boat(left: bool, right: bool) -> (&'static str, Vec<u8>) {
+    ("paddle_boat", vec![u8::from(left), u8::from(right)])
+}
+
+/// `set_creative_mode_slot` — slot index followed by the Protocol 767 Slot.
+pub fn encode_set_creative_mode_slot(
+    slot: i16,
+    item_id: i32,
+    count: i32,
+) -> (&'static str, Vec<u8>) {
+    let mut p = slot.to_be_bytes().to_vec();
+    p.extend_from_slice(&encode_slot_stack(item_id, count));
+    ("set_creative_mode_slot", p)
 }
 
 /// `interact` with `mouse` = 1 — attack the target entity.
@@ -6089,6 +6127,44 @@ impl ProtocolClient {
         sequence: i32,
     ) -> Result<(), String> {
         let (name, payload) = encode_player_action(status, pos, face, sequence);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    /// Release a charged/used item using the vanilla `player_action` status 5.
+    pub fn send_release_use_item(&mut self) -> Result<(), String> {
+        let (name, payload) = encode_release_use_item();
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    pub fn send_move_vehicle(
+        &mut self,
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_move_vehicle(x, y, z, yaw, pitch);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    pub fn send_paddle_boat(&mut self, left: bool, right: bool) -> Result<(), String> {
+        let (name, payload) = encode_paddle_boat(left, right);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    pub fn send_pick_item(&mut self, slot: i32) -> Result<(), String> {
+        let (name, payload) = encode_pick_item(slot);
+        self.send_named(PacketPhase::Play, name, &payload)
+    }
+
+    pub fn send_set_creative_mode_slot(
+        &mut self,
+        slot: i16,
+        item_id: i32,
+        count: i32,
+    ) -> Result<(), String> {
+        let (name, payload) = encode_set_creative_mode_slot(slot, item_id, count);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 

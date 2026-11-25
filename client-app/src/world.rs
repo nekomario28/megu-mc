@@ -15,10 +15,10 @@ use megu_client_mesh::ffi::{
     megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
 };
 use megu_client_mesh::{
-    section_index, Block, CompressedSection, DirectionBuckets, FaceVisibility, Layer, Light,
-    MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta, RenderRegions, Section, SectionBlocks,
-    SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID,
-    OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
+    section_index, Block, BlockShape, CompressedSection, DirectionBuckets, FaceVisibility, Layer,
+    Light, MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta, RenderRegions, Section,
+    SectionBlocks, SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES,
+    NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
 use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::skeletal_anim::{
@@ -155,11 +155,111 @@ pub struct BlockTable {
     /// Per-state registry name (`"minecraft:oak_planks"`) when the table was
     /// built from `block_states_1211.json`; empty in builtin fallback mode.
     state_names: Vec<String>,
+    biome_tints: BiomeTintResolver,
     /// O(1) state→material table built once alongside `state_names`
     /// (empty → StoneLike fallback in builtin mode).
     acoustic_lut: crate::spatial_audio::AcousticMaterialLut,
     pub loaded_from_json: bool,
     pub source_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BiomeTintKind {
+    Grass,
+    Foliage,
+    Water,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BiomeColormap {
+    grass_rgba: Option<Vec<u8>>,
+    foliage_rgba: Option<Vec<u8>>,
+}
+
+impl BiomeColormap {
+    pub fn from_rgba(grass: Option<Vec<u8>>, foliage: Option<Vec<u8>>) -> Result<Self, String> {
+        const RGBA_BYTES: usize = 256 * 256 * 4;
+        for (name, bytes) in [("grass", &grass), ("foliage", &foliage)] {
+            if bytes
+                .as_ref()
+                .is_some_and(|pixels| pixels.len() != RGBA_BYTES)
+            {
+                return Err(format!(
+                    "{name} colormap must contain exactly {RGBA_BYTES} RGBA bytes"
+                ));
+            }
+        }
+        Ok(Self {
+            grass_rgba: grass,
+            foliage_rgba: foliage,
+        })
+    }
+
+    fn sample(&self, kind: BiomeTintKind, temperature: f32, downfall: f32) -> Option<u32> {
+        let pixels = match kind {
+            BiomeTintKind::Grass => self.grass_rgba.as_ref()?,
+            BiomeTintKind::Foliage => self.foliage_rgba.as_ref()?,
+            BiomeTintKind::Water => return None,
+        };
+        let temperature = temperature.clamp(0.0, 1.0);
+        let downfall = downfall.clamp(0.0, 1.0) * temperature;
+        let x = ((1.0 - temperature) * 255.0) as usize;
+        let y = ((1.0 - downfall) * 255.0) as usize;
+        let offset = (y * 256 + x) * 4;
+        Some(
+            (u32::from(pixels[offset]) << 16)
+                | (u32::from(pixels[offset + 1]) << 8)
+                | u32::from(pixels[offset + 2]),
+        )
+    }
+}
+
+/// Resolves optional asset colormaps using the biome's vanilla temperature
+/// and downfall values. Biome registry ids can be populated from the active
+/// registry; unknown ids preserve the block's established fallback tint.
+#[derive(Clone, Debug, Default)]
+pub struct BiomeTintResolver {
+    colormap: BiomeColormap,
+    climate: BTreeMap<u32, (f32, f32)>,
+    water_colors: BTreeMap<u32, u32>,
+}
+
+impl BiomeTintResolver {
+    pub fn set_colormap(&mut self, colormap: BiomeColormap) {
+        self.colormap = colormap;
+    }
+
+    pub fn set_biome_climate(&mut self, biome_id: u32, temperature: f32, downfall: f32) -> bool {
+        if !temperature.is_finite() || !downfall.is_finite() {
+            return false;
+        }
+        self.climate.insert(biome_id, (temperature, downfall));
+        true
+    }
+
+    pub fn set_water_color(&mut self, biome_id: u32, color: u32) {
+        self.water_colors.insert(biome_id, color & 0x00ff_ffff);
+    }
+
+    pub fn resolve(&self, biome_id: u32, kind: BiomeTintKind, fallback: u32) -> u32 {
+        if kind == BiomeTintKind::Water {
+            return self
+                .water_colors
+                .get(&biome_id)
+                .copied()
+                .unwrap_or(fallback);
+        }
+        self.climate
+            .get(&biome_id)
+            .and_then(|&(temperature, downfall)| self.colormap.sample(kind, temperature, downfall))
+            .unwrap_or(fallback)
+    }
+}
+
+impl BlockTable {
+    pub fn set_biome_tint_resolver(&mut self, resolver: BiomeTintResolver) {
+        self.biome_tints = resolver;
+    }
 }
 
 impl BlockTable {
@@ -220,6 +320,7 @@ impl BlockTable {
             fluid_cells,
             air_mask,
             state_names: Vec::new(),
+            biome_tints: BiomeTintResolver::default(),
             acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&[]),
             loaded_from_json: false,
             source_path: None,
@@ -375,6 +476,18 @@ impl BlockTable {
                     fluid_tint: 0,
                 }
             };
+            let state_collision_shapes = &parsed.collision_shapes[idx];
+            let shape = classify_render_shape(short, &parsed.shapes, state_collision_shapes);
+            let mut block = block.with_shape(shape);
+            if shape == BlockShape::ThinLayer {
+                let height = state_collision_shapes
+                    .iter()
+                    .filter_map(|&shape_id| parsed.shapes.get(usize::from(shape_id)))
+                    .map(|shape| shape.max[1])
+                    .fold(0.0f64, f64::max);
+                let parameter = (height * 16.0).round().clamp(1.0, 2.0) as u8;
+                block = block.with_shape_parameter(parameter);
+            }
             mesh_blocks.push(block);
             fluid_cells.push(FluidCell {
                 kind: None,
@@ -394,6 +507,7 @@ impl BlockTable {
             air_mask,
             acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&owned_names),
             state_names: owned_names,
+            biome_tints: BiomeTintResolver::default(),
             loaded_from_json: true,
             source_path: None,
         })
@@ -404,6 +518,27 @@ impl BlockTable {
             .get(state_id as usize)
             .copied()
             .unwrap_or_else(|| Block::opaque_cube(state_id))
+    }
+
+    fn mesh_block_for_biome(&self, state_id: u32, biome_id: u32) -> Block {
+        let mut block = self.mesh_block(state_id);
+        if block.flags & TINTED != 0 {
+            let kind = if self
+                .state_name(state_id)
+                .is_some_and(|name| name.ends_with("_leaves"))
+            {
+                BiomeTintKind::Foliage
+            } else {
+                BiomeTintKind::Grass
+            };
+            block.tint = self.biome_tints.resolve(biome_id, kind, block.tint);
+        }
+        if block.flags & FLUID_TINTED != 0 {
+            block.fluid_tint =
+                self.biome_tints
+                    .resolve(biome_id, BiomeTintKind::Water, block.fluid_tint);
+        }
+        block
     }
 
     pub fn is_air(&self, state_id: u32) -> bool {
@@ -469,6 +604,94 @@ impl BlockTable {
                 }
             }
         }
+    }
+}
+
+fn classify_render_shape(name: &str, shapes: &[LocalBox], collision_shapes: &[u16]) -> BlockShape {
+    if matches!(
+        name,
+        "short_grass"
+            | "tall_grass"
+            | "fern"
+            | "large_fern"
+            | "dead_bush"
+            | "cobweb"
+            | "sugar_cane"
+            | "seagrass"
+            | "tall_seagrass"
+            | "kelp"
+            | "kelp_plant"
+            | "sweet_berry_bush"
+            | "bamboo_sapling"
+            | "vine"
+            | "glow_lichen"
+            | "brown_mushroom"
+            | "red_mushroom"
+            | "wither_rose"
+            | "torchflower"
+            | "pitcher_plant"
+            | "poppy"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "cornflower"
+            | "oxeye_daisy"
+            | "dandelion"
+            | "sunflower"
+            | "lilac"
+            | "rose_bush"
+            | "peony"
+            | "wheat"
+            | "carrots"
+            | "potatoes"
+            | "beetroots"
+            | "nether_wart"
+    ) || name.ends_with("_flower")
+        || name.ends_with("_sapling")
+    {
+        BlockShape::CrossPlant
+    } else if name.ends_with("_slab") {
+        let boxes = collision_shapes
+            .iter()
+            .filter_map(|&shape_id| shapes.get(usize::from(shape_id)));
+        if boxes
+            .clone()
+            .any(|shape| shape.min[1] >= 0.5 && shape.max[1] > 0.5)
+        {
+            BlockShape::SlabTop
+        } else {
+            BlockShape::SlabBottom
+        }
+    } else if name.ends_with("_stairs") {
+        BlockShape::Stair
+    } else if name.ends_with("_torch")
+        || name == "torch"
+        || name == "lantern"
+        || name == "soul_lantern"
+        || name == "candle"
+        || name.ends_with("_candle")
+    {
+        BlockShape::Torch
+    } else if name.ends_with("_fence")
+        || name.ends_with("_wall")
+        || name == "iron_bars"
+        || name.ends_with("_pane")
+    {
+        BlockShape::FencePost
+    } else if name.ends_with("_door") || name.ends_with("_trapdoor") {
+        BlockShape::DoorPanel
+    } else if name.ends_with("_carpet")
+        || name == "snow"
+        || name.ends_with("_pressure_plate")
+        || name.ends_with("_rail")
+        || name == "lily_pad"
+        || name == "redstone_wire"
+    {
+        BlockShape::ThinLayer
+    } else if name.ends_with("_bed") {
+        BlockShape::BedHalf
+    } else {
+        BlockShape::Cube
     }
 }
 
@@ -789,8 +1012,12 @@ impl StoredSection {
         let mut unpacked = [0u32; SECTION_CELLS];
         self.palette.unpack_into(&mut unpacked);
         let mut mesh_blocks = Box::new([Block::AIR; SECTION_CELLS]);
-        for (dst, &sid) in mesh_blocks.iter_mut().zip(unpacked.iter()) {
-            *dst = blocks.mesh_block(sid);
+        for (index, (dst, &sid)) in mesh_blocks.iter_mut().zip(unpacked.iter()).enumerate() {
+            let x = index % 16;
+            let z = (index / 16) % 16;
+            let y = index / 256;
+            let biome_index = (y / 4) * 16 + (z / 4) * 4 + (x / 4);
+            *dst = blocks.mesh_block_for_biome(sid, self.biomes[biome_index]);
         }
         Section {
             blocks: mesh_blocks,
@@ -806,9 +1033,12 @@ impl StoredSection {
     /// [`to_mesh_section`](Self::to_mesh_section) plus the
     /// `CompressedSection::from` collapse.
     fn to_compressed_mesh_section(&self, blocks: &BlockTable) -> CompressedSection {
-        if let Some(state) = self.palette.uniform_state() {
+        let uniform_biome = self.biomes[1..]
+            .iter()
+            .all(|&biome| biome == self.biomes[0]);
+        if let Some(state) = self.palette.uniform_state().filter(|_| uniform_biome) {
             return CompressedSection {
-                blocks: SectionBlocks::Uniform(blocks.mesh_block(state)),
+                blocks: SectionBlocks::Uniform(blocks.mesh_block_for_biome(state, self.biomes[0])),
                 block_light: self.block_light,
                 sky_light: self.sky_light,
             };
@@ -3736,6 +3966,100 @@ pub fn evaluate_entity_easter_egg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn biome_tint_resolver_samples_optional_rgba_colormap() {
+        let mut grass = vec![0; 256 * 256 * 4];
+        let mut foliage = vec![0; 256 * 256 * 4];
+        // At temperature=0.5/downfall=0.5 the sample is (127,191).
+        let offset = (191 * 256 + 127) * 4;
+        grass[offset..offset + 4].copy_from_slice(&[0x12, 0x34, 0x56, 0xff]);
+        foliage[offset..offset + 4].copy_from_slice(&[0x65, 0x43, 0x21, 0xff]);
+        let cmap = BiomeColormap::from_rgba(Some(grass), Some(foliage)).unwrap();
+        let mut resolver = BiomeTintResolver::default();
+        resolver.set_colormap(cmap);
+        assert!(resolver.set_biome_climate(7, 0.5, 0.5));
+        assert_eq!(resolver.resolve(7, BiomeTintKind::Grass, 0), 0x123456);
+        assert_eq!(resolver.resolve(7, BiomeTintKind::Foliage, 0), 0x654321);
+        resolver.set_water_color(7, 0xabcdef);
+        assert_eq!(resolver.resolve(7, BiomeTintKind::Water, 0), 0xabcdef);
+        assert!(BiomeColormap::from_rgba(Some(vec![0; 4]), None).is_err());
+    }
+
+    #[test]
+    fn render_shape_classifier_uses_names_and_slab_collision_bounds() {
+        let boxes = [
+            LocalBox {
+                min: [0.0, 0.0, 0.0],
+                max: [1.0, 0.5, 1.0],
+            },
+            LocalBox {
+                min: [0.0, 0.5, 0.0],
+                max: [1.0, 1.0, 1.0],
+            },
+        ];
+        assert_eq!(
+            classify_render_shape("oak_slab", &boxes, &[0]),
+            BlockShape::SlabBottom
+        );
+        assert_eq!(
+            classify_render_shape("oak_slab", &boxes, &[1]),
+            BlockShape::SlabTop
+        );
+        assert_eq!(
+            classify_render_shape("poppy", &[], &[]),
+            BlockShape::CrossPlant
+        );
+        assert_eq!(
+            classify_render_shape("oak_door", &[], &[]),
+            BlockShape::DoorPanel
+        );
+        assert_eq!(
+            classify_render_shape("redstone_wire", &[], &[]),
+            BlockShape::ThinLayer
+        );
+    }
+
+    #[test]
+    fn stored_section_applies_biome_tints_per_quart_cell() {
+        let mut pixels = vec![0; 256 * 256 * 4];
+        pixels[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0xff]);
+        let last = 256 * 256 * 4 - 4;
+        pixels[last..].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xff]);
+        let colormap = BiomeColormap::from_rgba(Some(pixels), None).unwrap();
+        let mut resolver = BiomeTintResolver::default();
+        resolver.set_colormap(colormap);
+        // Temperature 1/downfall 1 samples colormap (0, 0); temperature
+        // 0/downfall 0 samples (255, 255).
+        assert!(resolver.set_biome_climate(1, 1.0, 1.0));
+        assert!(resolver.set_biome_climate(2, 0.0, 0.0));
+        let blocks = BlockTable {
+            mesh_blocks: vec![Block {
+                state_id: 0,
+                flags: CUTOUT | TINTED,
+                tint: 0x7cbd6b,
+                ..Block::AIR
+            }],
+            shapes: vec![],
+            collision_shapes: vec![vec![]],
+            fluid_cells: vec![FluidCell::default()],
+            air_mask: vec![false],
+            state_names: vec!["minecraft:short_grass".to_string()],
+            biome_tints: resolver,
+            acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&[]),
+            loaded_from_json: false,
+            source_path: None,
+        };
+        let states = [0; SECTION_CELLS];
+        let mut stored =
+            StoredSection::from_states(&states, [0; LIGHT_BYTES], [0; LIGHT_BYTES], &blocks, 1)
+                .unwrap();
+        stored.biomes[0] = 1;
+        stored.biomes[1] = 2;
+        let mesh = stored.to_mesh_section(&blocks);
+        assert_eq!(mesh.blocks[0].tint, 0x112233);
+        assert_eq!(mesh.blocks[4].tint, 0xaabbcc);
+    }
 
     #[test]
     fn dinnerbone_and_grumm_flip_any_entity_type() {

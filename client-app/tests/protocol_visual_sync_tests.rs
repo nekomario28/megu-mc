@@ -576,7 +576,7 @@ fn visual_level_event_mapping_and_render_snapshot_projection() {
         .unwrap();
     world
         .apply_play_event(&PlayEvent::LevelParticles {
-            particle_id: 36,
+            particle_id: 35,
             long_distance: false,
             x: 1.0,
             y: 2.0,
@@ -665,20 +665,20 @@ fn particle_payloads_decode_all_requested_option_shapes() {
         DecodedParticleOptions::BlockState(31)
     );
     assert_eq!(
-        decode_particle_options(3, &vi(8)).unwrap(),
+        decode_particle_options(1, &vi(8)).unwrap(),
         DecodedParticleOptions::BlockState(8)
     );
     assert_eq!(
-        decode_particle_options(29, &vi(9)).unwrap(),
+        decode_particle_options(28, &vi(9)).unwrap(),
         DecodedParticleOptions::BlockState(9)
     );
     assert_eq!(
-        decode_particle_options(104, &vi(10)).unwrap(),
+        decode_particle_options(105, &vi(10)).unwrap(),
         DecodedParticleOptions::BlockState(10)
     );
     assert_eq!(
         decode_particle_options(
-            14,
+            13,
             &[f32be(0.1), f32be(0.2), f32be(0.3), f32be(1.5)].concat()
         )
         .unwrap(),
@@ -694,7 +694,7 @@ fn particle_payloads_decode_all_requested_option_shapes() {
         transition.extend_from_slice(&f32be(value));
     }
     assert_eq!(
-        decode_particle_options(15, &transition).unwrap(),
+        decode_particle_options(14, &transition).unwrap(),
         DecodedParticleOptions::DustColorTransition {
             from: [0.1, 0.2, 0.3],
             scale: 0.5,
@@ -702,15 +702,15 @@ fn particle_payloads_decode_all_requested_option_shapes() {
         }
     );
     assert_eq!(
-        decode_particle_options(21, &0x7f12_3456i32.to_be_bytes()).unwrap(),
+        decode_particle_options(20, &0x7f12_3456i32.to_be_bytes()).unwrap(),
         DecodedParticleOptions::EntityEffect { argb: 0x7f12_3456 }
     );
     assert_eq!(
-        decode_particle_options(36, &f32be(1.25)).unwrap(),
+        decode_particle_options(35, &f32be(1.25)).unwrap(),
         DecodedParticleOptions::SculkCharge { roll: 1.25 }
     );
     assert_eq!(
-        decode_particle_options(45, &[0]).unwrap(),
+        decode_particle_options(44, &[0]).unwrap(),
         DecodedParticleOptions::Item { slot_wire: vec![0] }
     );
 
@@ -718,7 +718,7 @@ fn particle_payloads_decode_all_requested_option_shapes() {
     vibration.extend_from_slice(&pack_position([1, 2, 3]).to_be_bytes());
     vibration.extend(vi(27));
     assert_eq!(
-        decode_particle_options(46, &vibration).unwrap(),
+        decode_particle_options(45, &vibration).unwrap(),
         DecodedParticleOptions::Vibration {
             source: VibrationSource::Block([1, 2, 3]),
             arrival_ticks: 27,
@@ -729,7 +729,7 @@ fn particle_payloads_decode_all_requested_option_shapes() {
     entity_vibration.extend_from_slice(&f32be(1.6));
     entity_vibration.extend(vi(15));
     assert_eq!(
-        decode_particle_options(46, &entity_vibration).unwrap(),
+        decode_particle_options(45, &entity_vibration).unwrap(),
         DecodedParticleOptions::Vibration {
             source: VibrationSource::Entity {
                 entity_id: 72,
@@ -739,9 +739,32 @@ fn particle_payloads_decode_all_requested_option_shapes() {
         }
     );
     assert_eq!(
-        decode_particle_options(98, &vi(8)).unwrap(),
+        decode_particle_options(99, &vi(8)).unwrap(),
         DecodedParticleOptions::Shriek { delay: 8 }
     );
+}
+
+#[test]
+fn particle_option_ids_match_protocol_767_particle_registry() {
+    use megu_client_mesh::ber_instancing::{
+        VanillaParticleKind as Kind, PROTOCOL767_PARTICLE_KINDS,
+    };
+
+    for (id, expected) in [
+        (1, Kind::Block),
+        (2, Kind::BlockMarker),
+        (13, Kind::Dust),
+        (14, Kind::DustColorTransition),
+        (20, Kind::EntityEffect),
+        (28, Kind::FallingDust),
+        (35, Kind::SculkCharge),
+        (44, Kind::Item),
+        (45, Kind::Vibration),
+        (99, Kind::Shriek),
+        (105, Kind::DustPillar),
+    ] {
+        assert_eq!(PROTOCOL767_PARTICLE_KINDS[id], expected, "particle id {id}");
+    }
 }
 
 #[test]
@@ -799,7 +822,7 @@ fn packet_decode_and_world_updates_keep_visual_state() {
         particle.extend_from_slice(&value.to_be_bytes());
     }
     particle.extend_from_slice(&2i32.to_be_bytes()); // count
-    particle.extend(vi(36)); // sculk_charge
+    particle.extend(vi(35)); // sculk_charge
     particle.extend_from_slice(&f32be(0.75));
     let event = decode_extended_play_event("level_particles", &particle)
         .unwrap()
@@ -807,7 +830,7 @@ fn packet_decode_and_world_updates_keep_visual_state() {
     world.apply_play_event(&event).unwrap();
     assert_eq!(
         world.level_particle_options.back().unwrap(),
-        &(36, DecodedParticleOptions::SculkCharge { roll: 0.75 })
+        &(35, DecodedParticleOptions::SculkCharge { roll: 0.75 })
     );
 
     world

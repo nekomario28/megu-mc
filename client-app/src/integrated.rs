@@ -620,6 +620,15 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
     if let Some(seed) = cfg.seed {
         command.env("MEGU_SEED", seed.to_string());
     }
+    if let Some(game_mode) = cfg.game_mode.as_deref() {
+        command.env("MEGU_DEFAULT_GAMEMODE", game_mode);
+    }
+    if let Some(difficulty) = cfg.difficulty.as_deref() {
+        command.env("MEGU_DIFFICULTY", difficulty);
+    }
+    if cfg.hardcore {
+        command.env("MEGU_HARDCORE", "true");
+    }
     if env::var_os("MEGU_MODS_DIR").is_none() {
         if let Some(mods_dir) = resolve_mods_dir(&game_dir) {
             command.env("MEGU_MODS_DIR", mods_dir);
