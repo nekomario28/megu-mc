@@ -2408,6 +2408,11 @@ pub enum WidgetId {
     TitleMods,
     TitleSettings,
     TitleQuit,
+    /// 1-click EN/JA flip — vanilla's globe-button chip on the title
+    /// bottom row.
+    TitleLanguage,
+    /// `?` chip on the title bottom row — opens [`Screen::AboutMegu`].
+    TitleAbout,
     WebsiteLink,
     SupportLink,
     ContributeLink,
@@ -3104,6 +3109,11 @@ pub struct UiState {
     /// [`Screen::Singleplayer`] so errors never fail silently; the HUD
     /// shows the same text through `hud.chat_lines` in game.
     pub title_status: Option<String>,
+    /// `true` while the host composites the rotating 1.21.1 panorama
+    /// behind the Title screen — `title()` then skips its opaque menu
+    /// gradient so the 3D backdrop shows through (`false` = painted
+    /// fallback, e.g. headless).
+    pub title_panorama_active: bool,
     /// The [`Screen::Singleplayer`] world select & create state.
     pub singleplayer: SingleplayerState,
     /// The [`Screen::Multiplayer`] server select & direct-connect state.
@@ -3118,13 +3128,13 @@ pub struct UiState {
     /// `true` after the report was submitted once (button disables).
     pub crash_sent: bool,
 
-    /// Optional quiet corner link on the title screen — hidden when empty.
+    /// Optional link on the About screen — hidden when empty.
     pub support_url: String,
-    /// Optional project website, shown on Title and About when configured.
+    /// Optional project website, shown on About when configured.
     pub website_url: String,
-    /// Optional quiet corner link on the title screen — hidden when empty.
+    /// Optional link on the About screen — hidden when empty.
     pub contribute_url: String,
-    /// Optional bug report URL on Title and Pause, hidden while empty.
+    /// Optional bug report URL on About and Pause, hidden while empty.
     pub report_url: String,
     /// Current shaderpack display name, or empty for vanilla rendering.
     pub active_shaderpack_name: String,
@@ -3203,6 +3213,7 @@ impl Default for UiState {
             sign_editor: None,
             death: crate::death_screen::DeathScreenState::default(),
             title_status: None,
+            title_panorama_active: false,
             singleplayer: SingleplayerState::default(),
             multiplayer: MultiplayerScreenState::default(),
             friends: FriendsScreenState::default(),
@@ -4272,6 +4283,21 @@ impl UiState {
                 vec![UiAction::OpenScreen(s)]
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
+            WidgetId::TitleLanguage => {
+                // Vanilla-globe 1-click flip between the two resolved UI
+                // languages.
+                let next = if self.lang() == UiLang::Ja {
+                    BuiltinLocale::EnUs
+                } else {
+                    BuiltinLocale::JaJp
+                };
+                self.set_locale(next);
+                vec![UiAction::SettingsChanged]
+            }
+            WidgetId::TitleAbout => {
+                self.navigate(Screen::AboutMegu);
+                vec![UiAction::OpenScreen(Screen::AboutMegu)]
+            }
 
             WidgetId::SingleplayerWorld(i) => match self.singleplayer.worlds.get(i) {
                 Some(name) => vec![UiAction::PlayWorld {

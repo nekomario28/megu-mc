@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Standalone native Minecraft 1.21.1 (Protocol 767) client library combining
 //! `megu-kernel` and `megu-client-mesh`.
+//!
+//! - Seamless resume, audio device recovery, and frame-boundary reload coordination.
 
 pub mod audio_out;
 pub mod audio_qol;
 pub mod cli;
 pub mod crash_reporter;
 pub mod frame_pacer;
+pub mod far_direct_lod;
 pub mod friend_client;
 pub mod friends_store;
 pub mod hardware_profile;
@@ -19,6 +22,8 @@ pub mod protocol;
 pub mod recovery;
 pub mod render;
 pub mod render_graph;
+pub mod replay;
+pub mod seamless_runtime;
 pub mod server_list;
 pub mod session;
 pub mod settings;

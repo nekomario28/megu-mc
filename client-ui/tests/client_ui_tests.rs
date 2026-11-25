@@ -264,21 +264,31 @@ fn modal_leaves_only_modal_regions() {
 }
 
 #[test]
-fn title_flow_and_support_links() {
+fn title_flow_and_links_live_on_about() {
     let mut ui = UiState::new();
     let (w, h) = (1280u32, 720u32);
+    ui.website_url = "https://example.invalid".into();
+    ui.support_url = "https://example.invalid/support".into();
+    ui.contribute_url = "https://example.invalid/contribute".into();
+    ui.report_url = "https://example.invalid/issues".into();
     ui.render(w, h);
 
-    // Support/Contribute hidden while URLs are empty.
-    assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::SupportLink));
-    assert!(
-        !ui.hit_regions
-            .iter()
-            .any(|r| r.id == WidgetId::ContributeLink)
-    );
+    // The vanilla-faithful title has no link row at all — every external
+    // link lives on About Megu behind the `?` chip.
+    for id in [
+        WidgetId::WebsiteLink,
+        WidgetId::SupportLink,
+        WidgetId::ContributeLink,
+        WidgetId::ReportLink,
+    ] {
+        assert!(!ui.hit_regions.iter().any(|r| r.id == id));
+    }
 
-    ui.support_url = "https://example.invalid/support".to_string();
-    ui.contribute_url = "https://example.invalid/contribute".to_string();
+    assert_eq!(
+        click(&mut ui, WidgetId::TitleAbout, w, h),
+        vec![UiAction::OpenScreen(Screen::AboutMegu)]
+    );
+    assert_eq!(ui.screen, Screen::AboutMegu);
     ui.render(w, h);
     for (id, url) in [
         (WidgetId::SupportLink, ui.support_url.clone()),
@@ -295,6 +305,7 @@ fn title_flow_and_support_links() {
         });
         assert_eq!(acts, vec![UiAction::OpenUrl(url)]);
     }
+    ui.back();
 
     // Title buttons via real click hit-testing.
     click(&mut ui, WidgetId::TitleSettings, w, h);
@@ -306,7 +317,7 @@ fn title_flow_and_support_links() {
 }
 
 #[test]
-fn title_links_respect_support_preference_and_report_is_always_accessible() {
+fn title_link_row_removed_about_keeps_all_links() {
     let mut ui = UiState::new();
     ui.website_url = "https://example.invalid".into();
     ui.support_url = "https://example.invalid/support".into();
@@ -314,9 +325,38 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
     ui.report_url = "https://example.invalid/issues".into();
     assert!(ui.settings.qol.show_support_links);
 
+    // No link region ever reaches the title screen — support-links
+    // toggle on or off, every resolution. The `?` chip is the single
+    // clean path to them.
+    for support in [true, false] {
+        ui.settings.qol.show_support_links = support;
+        for &(w, h) in &HIT_SIZES {
+            ui.screen = Screen::Title;
+            ui.render(w, h);
+            assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+            assert!(!ui.hit_regions.iter().any(|r| {
+                matches!(
+                    r.id,
+                    WidgetId::WebsiteLink
+                        | WidgetId::ReportLink
+                        | WidgetId::SupportLink
+                        | WidgetId::ContributeLink
+                )
+            }));
+        }
+    }
+
+    // About keeps every configured link 1 click away — even with the
+    // support-links QoL toggle off (its scope was the title row that no
+    // longer exists).
+    ui.settings.qol.show_support_links = false;
     for &(w, h) in &HIT_SIZES {
-        ui.screen = Screen::Title;
-        let commands = ui.render(w, h);
+        ui.go_title();
+        assert_eq!(
+            click(&mut ui, WidgetId::TitleAbout, w, h),
+            vec![UiAction::OpenScreen(Screen::AboutMegu)]
+        );
+        ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
         for (id, url) in [
             (WidgetId::WebsiteLink, ui.website_url.clone()),
@@ -327,71 +367,13 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
             assert!(ui.hit_regions.iter().any(|r| r.id == id));
             assert_eq!(click(&mut ui, id, w, h), vec![UiAction::OpenUrl(url)]);
         }
-        // Even at scale 4, links occupy the top-right above the title.
-        let s = ui.effective_scale(h) as i32;
-        let links: Vec<_> = ui
-            .hit_regions
-            .iter()
-            .filter(|r| {
-                matches!(
-                    r.id,
-                    WidgetId::WebsiteLink
-                        | WidgetId::ReportLink
-                        | WidgetId::SupportLink
-                        | WidgetId::ContributeLink
-                )
-            })
-            .collect();
-        assert_eq!(links.len(), 4);
-        assert!(
-            links
-                .iter()
-                .all(|r| r.rect.y == 6 * s && r.rect.bottom() < 34 * s)
-        );
-        assert_eq!(
-            links.iter().map(|r| r.rect.right()).max(),
-            Some(w as i32 - 4 * s)
-        );
-        let version = commands
-            .commands
-            .iter()
-            .find_map(|cmd| match cmd {
-                UiCommand::Text { y, text, .. } if text.starts_with("Megu 1.") => Some(*y),
-                _ => None,
-            })
-            .expect("version label");
-        assert!(
-            links.iter().all(|r| r.rect.bottom() <= version),
-            "version overlaps link bar at {w}x{h}"
-        );
     }
 
-    ui.settings.qol.show_support_links = false;
-    for &(w, h) in &HIT_SIZES {
-        ui.render(w, h);
-        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
-        assert!(
-            !ui.hit_regions
-                .iter()
-                .any(|r| matches!(r.id, WidgetId::SupportLink | WidgetId::ContributeLink))
-        );
-        assert_eq!(
-            click(&mut ui, WidgetId::ReportLink, w, h),
-            vec![UiAction::OpenUrl(ui.report_url.clone())]
-        );
-        assert_eq!(
-            click(&mut ui, WidgetId::WebsiteLink, w, h),
-            vec![UiAction::OpenUrl(ui.website_url.clone())]
-        );
-    }
     ui.settings.language = LanguageSetting::Japanese;
     let commands = ui.render(640, 360);
-    assert!(
-        commands
-            .commands
-            .iter()
-            .any(|cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "報告"))
-    );
+    assert!(commands.commands.iter().any(
+        |cmd| matches!(cmd, UiCommand::Text { text, .. } if text == "バグ報告")
+    ));
 
     ui.report_url.clear();
     ui.render(640, 360);
@@ -399,6 +381,135 @@ fn title_links_respect_support_preference_and_report_is_always_accessible() {
     ui.website_url.clear();
     ui.render(640, 360);
     assert!(!ui.hit_regions.iter().any(|r| r.id == WidgetId::WebsiteLink));
+}
+
+#[test]
+fn title_matches_vanilla_1211_button_grid() {
+    let mut ui = UiState::new();
+    for &(w, h) in &HIT_SIZES {
+        ui.screen = Screen::Title;
+        ui.render(w, h);
+        assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+        let s = ui.effective_scale(h) as i32;
+        let cx = w as i32 / 2;
+        let get = |id: WidgetId| -> UiRect {
+            ui.hit_regions
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("{id:?} missing @{w}x{h}"))
+                .rect
+        };
+        let sp = get(WidgetId::TitleSingleplayer);
+        let mp = get(WidgetId::TitleMultiplayer);
+        let mods = get(WidgetId::TitleMods);
+        let friends = get(WidgetId::TitleFriends);
+        let lang = get(WidgetId::TitleLanguage);
+        let opts = get(WidgetId::TitleSettings);
+        let quit = get(WidgetId::TitleQuit);
+        let about = get(WidgetId::TitleAbout);
+
+        // Centered 200px column: rows 1-2 full width, stacked 24px apart.
+        for r in [sp, mp] {
+            assert_eq!(r.w, 200 * s as u32, "{w}x{h}");
+            assert_eq!(r.h, 20 * s as u32, "{w}x{h}");
+            assert_eq!(r.x + r.w as i32 / 2, cx, "{w}x{h}");
+        }
+        assert_eq!(mp.y - sp.y, 24 * s);
+        // Row 3: the 98 + 4 + 98 split pair.
+        assert_eq!(mods.w, 98 * s as u32, "{w}x{h}");
+        assert_eq!(friends.w, 98 * s as u32, "{w}x{h}");
+        assert_eq!(mods.y, friends.y, "{w}x{h}");
+        assert_eq!(mods.x, sp.x, "{w}x{h}");
+        assert_eq!(friends.x - mods.right(), 4 * s, "{w}x{h}");
+        assert_eq!(friends.right(), sp.right(), "{w}x{h}");
+        // The 8px breathing gap above the bottom row.
+        assert_eq!(opts.y - mods.bottom(), 8 * s, "{w}x{h}");
+        // Bottom row: 20px lang chip | Options 98px | Quit 98px | 20px `?` chip.
+        assert_eq!(opts.w, 98 * s as u32, "{w}x{h}");
+        assert_eq!(quit.w, 98 * s as u32, "{w}x{h}");
+        assert_eq!(quit.x - opts.right(), 4 * s, "{w}x{h}");
+        assert_eq!(lang.w, 20 * s as u32, "{w}x{h}");
+        assert_eq!(lang.h, 20 * s as u32, "{w}x{h}");
+        assert_eq!(opts.x - lang.right(), 4 * s, "{w}x{h}");
+        assert_eq!(about.w, 20 * s as u32, "{w}x{h}");
+        assert_eq!(about.h, 20 * s as u32, "{w}x{h}");
+        assert_eq!(about.x - quit.right(), 4 * s, "{w}x{h}");
+        assert_eq!(lang.y, opts.y, "{w}x{h}");
+        assert_eq!(about.y, quit.y, "{w}x{h}");
+    }
+}
+
+#[test]
+fn title_language_chip_toggles_ui_lang_in_one_click() {
+    let mut ui = UiState::new();
+    let (w, h) = (1280u32, 720u32);
+    assert_eq!(ui.lang(), UiLang::En);
+
+    assert_eq!(
+        click(&mut ui, WidgetId::TitleLanguage, w, h),
+        vec![UiAction::SettingsChanged]
+    );
+    assert_eq!(ui.lang(), UiLang::Ja);
+    let list = ui.render(w, h);
+    assert!(list.commands.iter().any(|cmd| matches!(
+        cmd,
+        UiCommand::Text { text, .. } if text == "シングルプレイ"
+    )));
+    // The chip caption tracks the resolved language.
+    assert!(list.commands.iter().any(|cmd| matches!(
+        cmd,
+        UiCommand::Text { text, .. } if text == "JA"
+    )));
+
+    assert_eq!(
+        click(&mut ui, WidgetId::TitleLanguage, w, h),
+        vec![UiAction::SettingsChanged]
+    );
+    assert_eq!(ui.lang(), UiLang::En);
+    let list = ui.render(w, h);
+    assert!(list.commands.iter().any(|cmd| matches!(
+        cmd,
+        UiCommand::Text { text, .. } if text == "EN"
+    )));
+}
+
+#[test]
+fn title_panorama_flag_swaps_opaque_gradient_for_vignette() {
+    let mut ui = UiState::new();
+    let (w, h) = (1280u32, 720u32);
+    let opaque_full_width = |list: &UiDrawList| {
+        list.commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    UiCommand::FillRect { rect, color }
+                        if rect.x == 0 && rect.w == w && color.a == 255
+                )
+            })
+            .count()
+    };
+
+    // Fallback: the painted gradient covers the frame with opaque bands.
+    let list = ui.render(w, h);
+    assert!(opaque_full_width(&list) >= 16);
+
+    // Live panorama: zero opaque fills — the GPU backdrop shows through —
+    // but a translucent scrim still edges the frame for readability.
+    ui.title_panorama_active = true;
+    let list = ui.render(w, h);
+    assert_eq!(opaque_full_width(&list), 0);
+    assert!(list.commands.iter().any(|cmd| matches!(
+        cmd,
+        UiCommand::FillRect { rect, color }
+            if rect.x == 0 && rect.w == w && color.a > 0 && color.a < 255
+    )));
+    assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
+    assert!(
+        ui.hit_regions
+            .iter()
+            .any(|r| r.id == WidgetId::TitleSingleplayer)
+    );
 }
 
 #[test]

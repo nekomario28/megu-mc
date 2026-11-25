@@ -573,6 +573,22 @@ pub trait VoxelAcousticWorld {
     /// count as open sky rather than an invisible wall.
     fn acoustic_material(&self, x: i32, y: i32, z: i32) -> AcousticMaterial;
 
+    /// Monotonic world-content epoch used by bounded ray-result caches.
+    /// Implementations without mutation tracking may leave this unavailable.
+    fn world_mutation_epoch(&self) -> Option<[u64; 4]> {
+        None
+    }
+
+    /// Content revision for a section; `None` means unloaded or unknown.
+    fn section_revision(&self, _cx: i32, _sy: i32, _cz: i32) -> Option<u64> {
+        None
+    }
+
+    /// Material when every cell in a section is uniform.
+    fn uniform_section_material(&self, _cx: i32, _sy: i32, _cz: i32) -> Option<AcousticMaterial> {
+        None
+    }
+
     /// `true` when a ray may travel through the cell (air or liquid).
     fn is_ray_open(&self, x: i32, y: i32, z: i32) -> bool {
         !self.acoustic_material(x, y, z).is_solid()
@@ -585,7 +601,7 @@ pub trait VoxelAcousticWorld {
     /// cell. The default `false` keeps every existing implementation on the
     /// exact per-cell march, so adopting it is opt-in only.
     fn is_uniform_air_section(&self, _sx: i32, _sy: i32, _sz: i32) -> bool {
-        false
+        self.uniform_section_material(_sx, _sy, _sz) == Some(AcousticMaterial::AIR)
     }
 }
 
@@ -2161,6 +2177,55 @@ pub struct SpatialAudioEngine {
     /// Vanilla audible range (`attenuation_distance * max(volume, 1)` or the
     /// server `range` override). `INFINITY` disables range fading.
     max_range_m: f32,
+    ray_cache: Option<AcousticRayCacheEntry>,
+}
+
+#[derive(Clone)]
+struct AcousticRayCacheEntry {
+    key: AcousticRayCacheKey,
+    epoch: [u64; 4],
+    sections: Vec<((i32, i32, i32), Option<u64>)>,
+    scene: AcousticScene,
+    underwater: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AcousticRayCacheKey {
+    source: [i32; 3],
+    listener: [i32; 3],
+    preset: SpatialAudioPreset,
+    sample_rate: u32,
+    submerged: bool,
+}
+
+fn acoustic_cache_position(position: [f32; 3]) -> [i32; 3] {
+    position.map(|v| (v * 16.0).floor() as i32)
+}
+
+struct TrackingAcousticWorld<'a> {
+    world: &'a dyn VoxelAcousticWorld,
+    touched: std::cell::RefCell<std::collections::BTreeSet<(i32, i32, i32)>>,
+}
+
+impl VoxelAcousticWorld for TrackingAcousticWorld<'_> {
+    fn acoustic_material(&self, x: i32, y: i32, z: i32) -> AcousticMaterial {
+        self.touched
+            .borrow_mut()
+            .insert((x.div_euclid(16), y.div_euclid(16), z.div_euclid(16)));
+        self.world.acoustic_material(x, y, z)
+    }
+
+    fn world_mutation_epoch(&self) -> Option<[u64; 4]> {
+        self.world.world_mutation_epoch()
+    }
+    fn section_revision(&self, x: i32, y: i32, z: i32) -> Option<u64> {
+        self.touched.borrow_mut().insert((x, y, z));
+        self.world.section_revision(x, y, z)
+    }
+    fn uniform_section_material(&self, x: i32, y: i32, z: i32) -> Option<AcousticMaterial> {
+        self.touched.borrow_mut().insert((x, y, z));
+        self.world.uniform_section_material(x, y, z)
+    }
 }
 
 impl SpatialAudioEngine {
@@ -2213,6 +2278,7 @@ impl SpatialAudioEngine {
             distance_m: 0.0,
             base_delay: 8.0,
             max_range_m: f32::INFINITY,
+            ray_cache: None,
         }
     }
 
@@ -2243,10 +2309,46 @@ impl SpatialAudioEngine {
     ) -> &AcousticScene {
         self.source = *source;
         self.listener = *listener;
+        let key = AcousticRayCacheKey {
+            source: acoustic_cache_position(source.position),
+            listener: acoustic_cache_position(listener.position),
+            preset: self.preset,
+            sample_rate: self.sample_rate as u32,
+            submerged: listener.submerged,
+        };
+        let epoch = world.world_mutation_epoch();
+        if let (Some(epoch), Some(cached)) = (epoch, self.ray_cache.as_ref()) {
+            let revisions_match = cached.epoch == epoch
+                && cached.key == key
+                && cached
+                    .sections
+                    .iter()
+                    .all(|&(coord, rev)| world.section_revision(coord.0, coord.1, coord.2) == rev);
+            if revisions_match {
+                self.scene = cached.scene.clone();
+                self.underwater = cached.underwater;
+                if let Some(fdn) = &mut self.fdn {
+                    fdn.set_rt60(
+                        [
+                            self.scene.rt60_low_s,
+                            self.scene.rt60_mid_s,
+                            self.scene.rt60_high_s,
+                        ],
+                        self.sample_rate,
+                    );
+                }
+                self.update_geometry();
+                return &self.scene;
+            }
+        }
+        let tracked = TrackingAcousticWorld {
+            world,
+            touched: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+        };
         let head = listener.position;
         self.underwater = listener.submerged
             || matches!(
-                world
+                tracked
                     .acoustic_material(
                         head[0].floor() as i32,
                         head[1].floor() as i32,
@@ -2255,9 +2357,25 @@ impl SpatialAudioEngine {
                     .class,
                 MaterialClass::Liquid
             );
-        let tracer = AcousticTracer::new(world, self.preset);
+        let tracer = AcousticTracer::new(&tracked, self.preset);
         self.scene =
             tracer.compute_scene(source.position, listener.position, self.sample_rate as u32);
+        if let Some(epoch) = epoch {
+            let touched = tracked.touched.into_inner();
+            let sections = touched
+                .into_iter()
+                .map(|coord| (coord, world.section_revision(coord.0, coord.1, coord.2)))
+                .collect();
+            self.ray_cache = Some(AcousticRayCacheEntry {
+                key,
+                epoch,
+                sections,
+                scene: self.scene.clone(),
+                underwater: self.underwater,
+            });
+        } else {
+            self.ray_cache = None;
+        }
         if let Some(fdn) = &mut self.fdn {
             fdn.set_rt60(
                 [

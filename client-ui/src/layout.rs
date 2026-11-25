@@ -458,6 +458,27 @@ impl Ctx<'_> {
         self.region(id, r);
     }
 
+    /// Translucent edge vignette used in place of
+    /// [`Ctx::menu_background`] while the host's rotating panorama is
+    /// live: the frame edges fade to black so captions stay readable
+    /// while the 3D backdrop shows through everywhere — every fill
+    /// stays under full alpha.
+    fn panorama_vignette(&mut self) {
+        const BANDS: i32 = 6;
+        /// Each edge's vignette spans 1/DEPTH of the frame height.
+        const DEPTH: i32 = 5;
+        for i in 0..BANDS {
+            let y0 = self.h * i / (BANDS * DEPTH);
+            let y1 = self.h * (i + 1) / (BANDS * DEPTH);
+            let a = (112 * (BANDS - i) / BANDS) as u8;
+            self.fill(0, y0, self.w, y1 - y0, UiColor::rgba(0, 0, 0, a));
+            let by0 = self.h - y1;
+            let by1 = self.h - y0;
+            let a = (112 * (i + 1) / BANDS) as u8;
+            self.fill(0, by0, self.w, by1 - by0, UiColor::rgba(0, 0, 0, a));
+        }
+    }
+
     /// Background gradient shared by menu screens: sixteen vertical
     /// bands interpolate [`pal::BACKGROUND_TOP`] →
     /// [`pal::BACKGROUND_BOTTOM`] so there is no seam across the middle.
@@ -516,86 +537,79 @@ impl Ctx<'_> {
 // ---------------------------------------------------------------------------
 
 fn title(ctx: &mut Ctx) {
-    ctx.menu_background();
+    // A live host panorama replaces the painted gradient; only the
+    // translucent edge vignette is drawn so captions stay readable.
+    if ctx.state.title_panorama_active {
+        ctx.panorama_vignette();
+    } else {
+        ctx.menu_background();
+    }
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
     ctx.ctext(cx, 34, 3, pal::TEXT, "MINECRAFT");
     ctx.ctext(cx, 62, 1, pal::TEXT_DIM, "MEGU EDITION");
 
+    // Vanilla 1.21.1 silhouette: a centered 200px column — two
+    // full-width rows, then the 98 + 4 + 98 split pair — and, after
+    // vanilla's 8px breathing gap, the classic bottom row: a 20px
+    // language chip | Options | Quit | a 20px About chip. Everything
+    // stays above the version line (h-14); `step`/`bh` squeeze first.
     let bw = 200.min(ctx.w - 8).max(24);
-    let x = cx - bw / 2;
-    // Buttons must end above the version line (h-12); tighten the
-    // 92px/24px grid before they ever reach it.
-    let step = 24.min((ctx.h - 14 - 20 - 92) / 5).max(4);
+    let step = 24.min((ctx.h - 96) / 2).max(4);
     let bh = 20.min(step);
-    let mut y = 92.min(ctx.h - 14 - 5 * step - bh).max(34);
+    let y = 92.min(ctx.h - 14 - 2 * step - 2 * bh - 8).max(34);
+    let x = cx - bw / 2;
+    let half = (bw - 4) / 2;
     ctx.btn(
         WidgetId::TitleSingleplayer,
         lr(x, y, bw, bh),
         tr(lang, "Singleplayer", "シングルプレイ"),
     );
-    y += step;
     ctx.btn(
         WidgetId::TitleMultiplayer,
-        lr(x, y, bw, bh),
+        lr(x, y + step, bw, bh),
         tr(lang, "Multiplayer", "マルチプレイ"),
     );
-    y += step;
-    ctx.btn(
-        WidgetId::TitleFriends,
-        lr(x, y, bw, bh),
-        tr(lang, "Play with Friends", "フレンドと遊ぶ"),
-    );
-    y += step;
+    // Vanilla's Realms/Mods slot splits into two half-width buttons.
+    let y3 = y + 2 * step;
     ctx.btn(
         WidgetId::TitleMods,
-        lr(x, y, bw, bh),
-        tr(lang, "Mods & Packs", "Modとパック"),
+        lr(x, y3, half, bh),
+        tr(lang, "Mods&Packs", "Modとパック"),
     );
-    y += step;
+    ctx.btn(
+        WidgetId::TitleFriends,
+        lr(x + bw - half, y3, half, bh),
+        tr(lang, "Friends", "フレンドと遊ぶ"),
+    );
+    // Bottom row: the corner chips hang off the column ends exactly
+    // where vanilla parks its globe and accessibility buttons.
+    let y4 = y3 + bh + 8;
+    let sq = 20.min(bh);
+    icon_btn(
+        ctx,
+        WidgetId::TitleLanguage,
+        lr(x - 4 - sq, y4, sq, sq),
+        if lang == UiLang::Ja { "JA" } else { "EN" },
+    );
     ctx.btn(
         WidgetId::TitleSettings,
-        lr(x, y, bw, bh),
-        tr(lang, "Settings", "設定"),
+        lr(x, y4, half, bh),
+        tr(lang, "Options...", "設定..."),
     );
-    y += step;
     ctx.btn(
         WidgetId::TitleQuit,
-        lr(x, y, bw, bh),
-        tr(lang, "Quit", "終了"),
+        lr(x + bw - half, y4, half, bh),
+        tr(lang, "Quit Game", "ゲームを終了"),
+    );
+    icon_btn(
+        ctx,
+        WidgetId::TitleAbout,
+        lr(x + bw + 4, y4, sq, sq),
+        tr(lang, "?", "？"),
     );
 
-    // Compact quiet links stay above the title, including at 480x270
-    // logical px. Widths follow the rendered label so both languages
-    // fit without clipping.
-    let ly = 6;
-    let mut lx = ctx.w;
-    let mut link = |ctx: &mut Ctx, id: WidgetId, label: &str| {
-        let w = (text_width(label, 1) as i32 + 8).max(24);
-        lx -= w + 4;
-        ctx.btn(id, lr(lx, ly, w, 16), label);
-    };
-    if ctx.state.settings.qol.show_support_links && !ctx.state.contribute_url.is_empty() {
-        link(
-            ctx,
-            WidgetId::ContributeLink,
-            tr(lang, "Contribute", "貢献する"),
-        );
-    }
-    if ctx.state.settings.qol.show_support_links && !ctx.state.support_url.is_empty() {
-        link(ctx, WidgetId::SupportLink, tr(lang, "Support", "支援する"));
-    }
-    if !ctx.state.report_url.is_empty() {
-        link(ctx, WidgetId::ReportLink, tr(lang, "Report", "報告"));
-    }
-    if !ctx.state.website_url.is_empty() {
-        link(
-            ctx,
-            WidgetId::WebsiteLink,
-            tr(lang, "Website", "公式サイト"),
-        );
-    }
     ctx.text(4, ctx.h - 12, 1, pal::TEXT_DIM, "Megu 1.21.1");
 
     // Host-reported status/errors stay visible on the menu — a failed
@@ -604,7 +618,20 @@ fn title(ctx: &mut Ctx) {
         ctx.hud_ctext(cx, ctx.h - 24, 1, pal::WARNING, status, 56);
     }
 
-    boot_badge(ctx, 106);
+    boot_badge(ctx, 128);
+}
+
+/// A compact square icon chip (vanilla's globe/accessibility buttons):
+/// standard button chrome plus a centered caption allowed to span the
+/// whole rect — the normal 8px label margin would clip a 2-glyph tag.
+fn icon_btn(ctx: &mut Ctx, id: WidgetId, r: UiRect, label: &str) {
+    if r.bottom() > ctx.band_top {
+        return;
+    }
+    ctx.btn(id, r, "");
+    let (tx, ty) = ctx.centered_in(r.x + r.w as i32 / 2, r.y, r.h as i32, label, 1);
+    ctx.text(tx + 1, ty + 1, 1, UiColor::rgba(0, 0, 0, 140), label);
+    ctx.text(tx, ty, 1, pal::TEXT, label);
 }
 
 // ---------------------------------------------------------------------------

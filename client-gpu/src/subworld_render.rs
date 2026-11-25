@@ -1569,6 +1569,134 @@ pub fn box_mesh(min: [f32; 3], max: [f32; 3], albedo: [f32; 3]) -> (Vec<TerrainV
     (vertices, indices)
 }
 
+/// One filled voxel of a sub-world hull grid (a Create contraption block or
+/// an Aeronautics airship deck block): the material every exposed face of
+/// the cell carries verbatim — albedo color, the `TerrainVertex`
+/// material-flags byte, and the atlas tile (`u32::MAX` = untextured).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubWorldCell {
+    /// Linear-ish albedo rgb.
+    pub albedo: [f32; 3],
+    /// Material-flags byte in `TerrainVertex::packed_albedo` bits 24..32.
+    pub material_flags: u8,
+    /// Index into the uploaded atlas rectangle table; `u32::MAX` untextured.
+    pub atlas_index: u32,
+}
+
+/// Greedy-merged voxel-hull geometry: [`TerrainVertex`] vertices plus `u32`
+/// indices — the exact layout [`box_mesh`] and the lit pipeline consume.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SubWorldMesh {
+    /// Merged-quad vertices, four per quad.
+    pub vertices: Vec<TerrainVertex>,
+    /// Two triangles per quad.
+    pub indices: Vec<u32>,
+}
+
+/// 6-axis 2D greedy voxel-hull mesher for Create contraption and
+/// Aeronautics airship sub-worlds.
+///
+/// `cell_at` samples the bounded `dims` grid: `Some(cell)` is a solid voxel,
+/// `None` empty space. A cell face is exposed exactly when the neighbour
+/// along its normal is empty or outside the grid — shared interior faces
+/// are culled on both sides. Exposed faces are then greedy-merged into
+/// maximal coplanar rectangles whose cells carry the identical
+/// [`SubWorldCell`] material, so the emitted hull preserves the exact
+/// exposed surface area, outward normals, material flags and per-block UV
+/// tiling of the naive one-quad-per-face mesh (merged quads keep
+/// world-proportional tangent-plane UVs, like the cloud mesher).
+pub fn greedy_voxel_hull_mesh(
+    dims: [usize; 3],
+    mut cell_at: impl FnMut(usize, usize, usize) -> Option<SubWorldCell>,
+) -> SubWorldMesh {
+    let mut mesh = SubWorldMesh::default();
+    if dims.contains(&0) {
+        return mesh;
+    }
+    let mut mask: Vec<Option<SubWorldCell>> = Vec::new();
+    for axis in 0..3 {
+        let u_ax = (axis + 1) % 3;
+        let v_ax = (axis + 2) % 3;
+        let (nu, nv) = (dims[u_ax], dims[v_ax]);
+        for step in [-1i32, 1] {
+            // `box_face_corners` order is +X,-X,+Y,-Y,+Z,-Z.
+            let face_index = axis * 2 + usize::from(step < 0);
+            for slice in 0..dims[axis] {
+                mask.clear();
+                mask.resize(nu * nv, None);
+                for v in 0..nv {
+                    for u in 0..nu {
+                        let mut p = [0usize; 3];
+                        p[axis] = slice;
+                        p[u_ax] = u;
+                        p[v_ax] = v;
+                        let Some(cell) = cell_at(p[0], p[1], p[2]) else {
+                            continue;
+                        };
+                        let next = p[axis] as i32 + step;
+                        let exposed = !(0..dims[axis] as i32).contains(&next) || {
+                            let mut q = p;
+                            q[axis] = next as usize;
+                            cell_at(q[0], q[1], q[2]).is_none()
+                        };
+                        if exposed {
+                            mask[v * nu + u] = Some(cell);
+                        }
+                    }
+                }
+                for v in 0..nv {
+                    for u in 0..nu {
+                        let index = v * nu + u;
+                        let Some(cell) = mask[index] else {
+                            continue;
+                        };
+                        let mut width = 1usize;
+                        while u + width < nu && mask[v * nu + u + width] == Some(cell) {
+                            width += 1;
+                        }
+                        let mut height = 1usize;
+                        'grow: while v + height < nv {
+                            for k in 0..width {
+                                if mask[(v + height) * nu + u + k] != Some(cell) {
+                                    break 'grow;
+                                }
+                            }
+                            height += 1;
+                        }
+                        for dv in 0..height {
+                            mask[(v + dv) * nu + u..(v + dv) * nu + u + width].fill(None);
+                        }
+                        let mut min = [0.0f32; 3];
+                        let mut max = [0.0f32; 3];
+                        min[axis] = (slice as i32 + i32::from(step > 0)) as f32;
+                        max[axis] = min[axis];
+                        min[u_ax] = u as f32;
+                        max[u_ax] = (u + width) as f32;
+                        min[v_ax] = v as f32;
+                        max[v_ax] = (v + height) as f32;
+                        let (normal, corners) = box_face_corners(min, max)[face_index];
+                        let base = mesh.vertices.len() as u32;
+                        for position in corners {
+                            let mut vertex = TerrainVertex::new(
+                                position,
+                                normal,
+                                cell.albedo,
+                                [position[u_ax], position[v_ax]],
+                                cell.atlas_index,
+                            );
+                            vertex.set_material_flags(cell.material_flags);
+                            mesh.vertices.push(vertex);
+                        }
+                        mesh.indices
+                            .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+                    }
+                }
+            }
+        }
+    }
+    mesh
+}
+
 // ---------------------------------------------------------------------------
 // Composed-pass WGSL modules
 // ---------------------------------------------------------------------------
@@ -2565,3 +2693,276 @@ pub fn lit_wgsl(shader_f16: bool) -> Cow<'static, str> {
         Cow::Borrowed(COMPOSITE_LIT_WGSL)
     }
 }
+
+#[cfg(test)]
+mod voxel_hull_tests {
+    use super::*;
+
+    const DECK: SubWorldCell = SubWorldCell {
+        albedo: [0.45, 0.32, 0.18],
+        material_flags: 0,
+        atlas_index: 7,
+    };
+    const CABIN: SubWorldCell = SubWorldCell {
+        albedo: [0.7, 0.68, 0.6],
+        material_flags: 2,
+        atlas_index: 11,
+    };
+
+    /// Naive per-cell exposed-face counts, one entry per
+    /// `box_face_corners` face (`+X, -X, +Y, -Y, +Z, -Z`).
+    fn naive_exposed_faces(
+        dims: [usize; 3],
+        mut cell_at: impl FnMut(usize, usize, usize) -> Option<SubWorldCell>,
+    ) -> [usize; 6] {
+        let mut counts = [0usize; 6];
+        for z in 0..dims[2] {
+            for y in 0..dims[1] {
+                for x in 0..dims[0] {
+                    if cell_at(x, y, z).is_none() {
+                        continue;
+                    }
+                    for axis in 0..3 {
+                        for step in [-1i32, 1] {
+                            let mut n = [x as i32, y as i32, z as i32];
+                            n[axis] += step;
+                            let exposed = !(0..dims[axis] as i32).contains(&n[axis])
+                                || cell_at(n[0] as usize, n[1] as usize, n[2] as usize)
+                                    .is_none();
+                            if exposed {
+                                counts[axis * 2 + usize::from(step < 0)] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        counts
+    }
+
+    /// Planar-quad area + normal classification for one emitted quad.
+    fn quad_area_and_face(quad: &[TerrainVertex]) -> (f32, usize) {
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        for vertex in quad {
+            for (axis, &p) in vertex.position.iter().enumerate() {
+                min[axis] = min[axis].min(p);
+                max[axis] = max[axis].max(p);
+            }
+        }
+        let normal = quad[0].normal();
+        let (axis, sign) = (0..3)
+            .map(|axis| (axis, normal[axis]))
+            .find(|(_, n)| n.abs() > 0.5)
+            .expect("quad has an axis normal");
+        assert!(quad.iter().all(|v| v.normal() == normal));
+        let mut area = 1.0f32;
+        for a in 0..3 {
+            if a != axis {
+                area *= max[a] - min[a];
+            }
+        }
+        (area, axis * 2 + usize::from(sign < 0.0))
+    }
+
+    /// Per-face area totals of the merged mesh, keyed like
+    /// [`naive_exposed_faces`].
+    fn merged_areas(mesh: &SubWorldMesh) -> [f32; 6] {
+        assert_eq!(mesh.vertices.len() % 4, 0);
+        assert_eq!(mesh.indices.len() / 6, mesh.vertices.len() / 4);
+        let mut areas = [0.0f32; 6];
+        for quad in mesh.vertices.as_chunks::<4>().0 {
+            let (area, face) = quad_area_and_face(quad);
+            areas[face] += area;
+        }
+        areas
+    }
+
+    fn grid(
+        dims: [usize; 3],
+        filled: impl Fn(usize, usize, usize) -> bool,
+    ) -> Vec<Option<SubWorldCell>> {
+        let mut cells = vec![None; dims[0] * dims[1] * dims[2]];
+        for z in 0..dims[2] {
+            for y in 0..dims[1] {
+                for x in 0..dims[0] {
+                    if filled(x, y, z) {
+                        cells[(z * dims[1] + y) * dims[0] + x] = Some(DECK);
+                    }
+                }
+            }
+        }
+        cells
+    }
+
+    fn airship_hull(dims: [usize; 3]) -> Vec<Option<SubWorldCell>> {
+        let mut cells = vec![None; dims[0] * dims[1] * dims[2]];
+        let mut put = |x: usize, y: usize, z: usize, cell: SubWorldCell| {
+            cells[(z * dims[1] + y) * dims[0] + x] = Some(cell);
+        };
+        // Keel, flared lower hull, two full main decks, tapered upper
+        // deck, a cabin block and a mast — a multi-deck airship hull.
+        for z in 3..6 {
+            for x in 4..8 {
+                put(x, 0, z, DECK);
+            }
+        }
+        for z in 2..7 {
+            for x in 2..10 {
+                put(x, 1, z, DECK);
+            }
+        }
+        for y in 2..=3 {
+            for z in 1..8 {
+                for x in 0..12 {
+                    put(x, y, z, DECK);
+                }
+            }
+        }
+        for z in 2..7 {
+            for x in 1..11 {
+                put(x, 4, z, DECK);
+            }
+        }
+        for z in 3..6 {
+            for x in 5..8 {
+                put(x, 5, z, CABIN);
+            }
+        }
+        put(6, 6, 4, CABIN);
+        cells
+    }
+
+    #[test]
+    fn subworld_single_voxel_emits_six_unit_faces() {
+        let dims = [1, 1, 1];
+        let cells = grid(dims, |_, _, _| true);
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(mesh.indices.len(), 36);
+        let areas = merged_areas(&mesh);
+        assert_eq!(areas, [1.0; 6]);
+        // Untextured cells keep `u32::MAX` and the exact material byte.
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.atlas_index == 7 && v.material_flags() == 0));
+    }
+
+    #[test]
+    fn subworld_empty_and_degenerate_grids_emit_nothing() {
+        let mesh = greedy_voxel_hull_mesh([4, 4, 4], |_, _, _| None);
+        assert!(mesh.vertices.is_empty() && mesh.indices.is_empty());
+        for dims in [[0, 4, 4], [4, 0, 4], [4, 4, 0]] {
+            let mesh = greedy_voxel_hull_mesh(dims, |_, _, _| Some(DECK));
+            assert!(mesh.vertices.is_empty() && mesh.indices.is_empty());
+        }
+    }
+
+    #[test]
+    fn subworld_solid_cube_collapses_to_six_quads() {
+        let dims = [4, 4, 4];
+        let cells = grid(dims, |_, _, _| true);
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(merged_areas(&mesh), [16.0; 6]);
+        assert_eq!(naive_exposed_faces(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        }), [16; 6]);
+    }
+
+    #[test]
+    fn subworld_airship_hull_reduces_quads_and_preserves_area() {
+        let dims = [12, 7, 9];
+        let cells = airship_hull(dims);
+        let naive = naive_exposed_faces(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        let naive_total: usize = naive.iter().sum();
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        let merged_quads = mesh.vertices.len() / 4;
+        assert!(
+            merged_quads * 4 <= naive_total,
+            "expected >= 75% quad reduction: {merged_quads} vs naive {naive_total}"
+        );
+        // Exact exposed surface area, per direction and overall.
+        let areas = merged_areas(&mesh);
+        for face in 0..6 {
+            assert_eq!(areas[face], naive[face] as f32, "face {face} area drifted");
+        }
+        // Two materials survive on the merged hull: cabin quads carry the
+        // cabin flags/atlas, deck quads the deck ones.
+        let cabin_quads = mesh
+            .vertices
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| q[0].material_flags() == 2)
+            .count();
+        assert!(cabin_quads >= 6);
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.atlas_index == if v.material_flags() == 2 { 11 } else { 7 }));
+    }
+
+    #[test]
+    fn subworld_material_boundaries_stop_merging() {
+        // A 4x2 deck whose right half is a different material: the top
+        // must split into exactly two 2x2 quads, never one 4x2.
+        let dims = [4, 1, 2];
+        let mut cells = [None; 8];
+        for z in 0..2 {
+            for x in 0..4 {
+                cells[z * 4 + x] = Some(if x < 2 { DECK } else { CABIN });
+            }
+        }
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        let tops: Vec<_> = mesh
+            .vertices
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|q| q[0].normal()[1] > 0.5)
+            .collect();
+        assert_eq!(tops.len(), 2);
+        for quad in tops {
+            let (area, _) = quad_area_and_face(quad);
+            assert_eq!(area, 4.0);
+            let want_cabin = quad.iter().all(|v| v.position[0] >= 2.0);
+            assert_eq!(
+                quad[0].material_flags(),
+                if want_cabin { 2 } else { 0 },
+                "material flags leaked across the boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn subworld_contraption_l_shape_keeps_exact_area() {
+        // Stepped contraption platform: two offset slabs sharing a side.
+        let dims = [6, 3, 4];
+        let cells = grid(dims, |x, y, z| {
+            (x < 4 && y == 0 && z < 4) || (x >= 2 && y == 1 && z < 2)
+        });
+        let naive = naive_exposed_faces(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
+            cells[(z * dims[1] + y) * dims[0] + x]
+        });
+        let areas = merged_areas(&mesh);
+        for face in 0..6 {
+            assert_eq!(areas[face], naive[face] as f32, "face {face} area drifted");
+        }
+    }
+}
+
