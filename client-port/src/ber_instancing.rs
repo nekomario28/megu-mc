@@ -3347,9 +3347,9 @@ fn apply_vanilla_motion_overlay(particle: &mut VanillaParticle, t: f32) {
         VanillaParticleMotion::Shockwave => {
             let expansion = 1.0 + 0.85 * t;
             let vel = particle.initial_velocity.map(|v| v as f32);
-            for axis in 0..3 {
-                particle.pos[axis] = particle.origin[axis] as f32 + vel[axis] * t * expansion;
-                particle.vel[axis] = vel[axis] * (1.0 + 1.7 * t);
+            for (axis, &v) in vel.iter().enumerate() {
+                particle.pos[axis] = particle.origin[axis] as f32 + v * t * expansion;
+                particle.vel[axis] = v * (1.0 + 1.7 * t);
             }
         }
         VanillaParticleMotion::Emitter => {
