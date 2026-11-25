@@ -15,12 +15,14 @@ if [[ ! "$baseline" =~ ^[0-9]+$ ]]; then
 fi
 
 output=$(mktemp)
-trap 'rm -f "$output"' EXIT
-if ! cargo clippy --all-targets --locked 2>&1 | tee "$output"; then
+clean=$(mktemp)
+trap 'rm -f "$output" "$clean"' EXIT
+if ! CARGO_TERM_COLOR=never cargo clippy --all-targets --locked 2>&1 | tee "$output"; then
   echo "root cargo clippy failed" >&2
   exit 1
 fi
-warnings=$(grep -c '^warning:' "$output" || true)
+sed $'s/\x1b\\[[0-9;]*m//g' "$output" > "$clean"
+warnings=$(grep -c '^warning:' "$clean" || true)
 if (( warnings > baseline )); then
   echo "clippy ratchet: $warnings warnings, baseline $baseline" >&2
   exit 1

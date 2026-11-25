@@ -26,10 +26,14 @@
 //! The pool is a bounded `mpsc::sync_channel` work queue shared by a small
 //! fixed set of threads. Submission is non-blocking (`try_send`): a full
 //! queue drops the speculative job and the render thread falls back to the
-//! synchronous path, so backpressure can never stall a frame. Shutdown is a
-//! plain channel close plus `join` in [`Drop`]; workers contain no
-//! `unwrap`/panicking calls.
+//! synchronous path, so backpressure can never stall a frame. Shutdown
+//! sets a [`std::sync::atomic::AtomicBool`] flag, closes the job channel,
+//! drops the result receiver, and joins every worker in [`Drop`]: a worker
+//! blocked in `result_tx.send` on a full result buffer wakes immediately
+//! with `SendError`, so teardown can never deadlock waiting for a drainer
+//! that no longer exists. Workers contain no `unwrap`/panicking calls.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -130,9 +134,14 @@ pub enum MeshResult {
 /// `Arc<Mutex<Receiver>>` and contends on it only to pull the next job.
 pub struct MeshJobPool {
     job_tx: Option<SyncSender<MeshJob>>,
-    result_rx: Receiver<MeshResult>,
+    result_rx: Option<Receiver<MeshResult>>,
     workers: Vec<JoinHandle<()>>,
     threads: usize,
+    /// Workers poll this after each `recv`; [`Drop`] and
+    /// [`Self::set_threads`] set it before closing the channels so a
+    /// stale job already dequeued from a closing pool skips its expensive
+    /// meshing instead of running to completion for nobody.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl MeshJobPool {
@@ -144,21 +153,24 @@ impl MeshJobPool {
         let (job_tx, job_rx) = sync_channel::<MeshJob>(JOB_QUEUE_BOUND);
         let (result_tx, result_rx) = sync_channel::<MeshResult>(JOB_QUEUE_BOUND * 2);
         let job_rx = Arc::new(Mutex::new(job_rx));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let workers = (0..threads)
             .filter_map(|index| {
                 let rx = Arc::clone(&job_rx);
                 let tx = result_tx.clone();
+                let shutdown = Arc::clone(&shutdown);
                 std::thread::Builder::new()
                     .name(format!("mesh-job-{index}"))
-                    .spawn(move || worker_loop(rx, tx))
+                    .spawn(move || worker_loop(rx, tx, shutdown))
                     .ok()
             })
             .collect();
         Self {
             job_tx: Some(job_tx),
-            result_rx,
+            result_rx: Some(result_rx),
             workers,
             threads,
+            shutdown,
         }
     }
 
@@ -175,8 +187,10 @@ impl MeshJobPool {
 
     /// Invoke `f` on every finished result without blocking.
     pub fn drain(&self, mut f: impl FnMut(MeshResult)) {
-        while let Ok(result) = self.result_rx.try_recv() {
-            f(result);
+        if let Some(result_rx) = &self.result_rx {
+            while let Ok(result) = result_rx.try_recv() {
+                f(result);
+            }
         }
     }
 
@@ -186,24 +200,39 @@ impl MeshJobPool {
     pub fn set_threads(&mut self, threads: u32) {
         let threads = (threads.max(1) as usize).min(MAX_WORKERS);
         if threads != self.threads || self.workers.is_empty() {
+            // Tear the old generation down BEFORE spawning the new one:
+            // its workers are parked in `send` on a possibly-full result
+            // buffer, and only the receiver drop wakes them.
+            self.shutdown();
             *self = Self::new(threads as u32);
         }
     }
-}
 
-impl Drop for MeshJobPool {
-    fn drop(&mut self) {
-        // Closing the job channel ends every worker's blocking `recv`
-        // loop once queued work drains; results the receiver dropped are
-        // simply abandoned.
+    /// Signal workers, close both channels, and join every worker. The
+    /// receiver is dropped BEFORE the joins: that is what wakes a worker
+    /// blocked in `result_tx.send`, so a full result buffer cannot stall
+    /// teardown (or a `set_threads` resize) forever.
+    fn shutdown(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         drop(self.job_tx.take());
+        drop(self.result_rx.take());
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
     }
 }
 
-fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<MeshResult>) {
+impl Drop for MeshJobPool {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn worker_loop(
+    job_rx: Arc<Mutex<Receiver<MeshJob>>>,
+    result_tx: SyncSender<MeshResult>,
+    shutdown: Arc<AtomicBool>,
+) {
     // Retained Hi-Z scratch: the depth grid and compact occluder stream
     // stay allocated across jobs, so steady-state frames never allocate
     // on the worker.
@@ -213,6 +242,12 @@ fn worker_loop(job_rx: Arc<Mutex<Receiver<MeshJob>>>, result_tx: SyncSender<Mesh
             let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
             rx.recv()
         };
+        // Shutdown/resize: a stale job dequeued from a closing pool has
+        // no receiver to deliver to, so meshing it would only delay the
+        // join — drop it and exit.
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let Ok(job) = job else {
             return;
         };
@@ -1360,5 +1395,140 @@ mod tests {
             ranges,
             [(0, 6), (6, 0), (6, 6), (12, 0), (12, 0), (12, 0), (12, 0)]
         );
+    }
+
+    /// A job whose execution is trivial but whose result still occupies one
+    /// bounded result-channel slot.
+    fn cheap_geometry_job() -> MeshJob {
+        MeshJob::SectionGeometry {
+            coord: SectionCoord(0, 0, 0),
+            packed: Vec::<PackedVertex>::new().into(),
+            order: Vec::<u32>::new().into(),
+            buckets: None,
+        }
+    }
+
+    /// Fill BOTH channels without ever draining: keep topping the job
+    /// queue up while workers consume. The moment the result buffer fills,
+    /// workers park in `result_tx.send` and stop consuming, so the job
+    /// queue fills for good — a run of consecutive `try_submit` failures
+    /// (not one transient full queue) is the saturation signal.
+    fn saturate_both_channels(pool: &MeshJobPool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut consecutive_failures = 0u32;
+        loop {
+            if pool.try_submit(cheap_geometry_job()) {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+                // 64 failed submits in a row (~64 ms): workers stopped
+                // consuming, i.e. they are parked in `result_tx.send`
+                // with a full result buffer — the deadlock state.
+                if consecutive_failures >= 64 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "channels never saturated"
+            );
+        }
+    }
+
+    /// Regression test for the shutdown deadlock: saturate both channels
+    /// (never calling `drain`), then resize and drop the pool. A watchdog
+    /// bounds the whole teardown: with the bug, workers blocked in
+    /// `result_tx.send` never exit and the watchdog trips.
+    #[test]
+    fn saturated_pool_set_threads_and_drop_complete_without_deadlock() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mesh-pool-shutdown-watchdog".into())
+            .spawn(move || {
+                let mut pool = MeshJobPool::new(2);
+                saturate_both_channels(&pool);
+                let _ = ready_tx.send(());
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                // Resize tears the old generation down (dropping its
+                // result receiver) and joins its parked workers before
+                // the new pool spawns.
+                pool.set_threads(4);
+                assert_eq!(pool.threads, 4);
+                drop(pool);
+                let _ = done_tx.send(());
+            })
+            .expect("spawn watchdog");
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+            "channels never saturated"
+        );
+        let _ = start_tx.send(());
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok(),
+            "pool teardown deadlocked with a saturated result channel"
+        );
+    }
+
+    /// Same saturation, but plain `drop` (no resize first).
+    #[test]
+    fn saturated_pool_drop_completes_without_deadlock() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("mesh-pool-drop-watchdog".into())
+            .spawn(move || {
+                let pool = MeshJobPool::new(2);
+                saturate_both_channels(&pool);
+                let _ = ready_tx.send(());
+                if start_rx.recv().is_err() {
+                    return;
+                }
+                drop(pool);
+                let _ = done_tx.send(());
+            })
+            .expect("spawn watchdog");
+        assert!(
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+            "channels never saturated"
+        );
+        let _ = start_tx.send(());
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_ok(),
+            "pool drop deadlocked with a saturated result channel"
+        );
+    }
+
+    #[test]
+    fn set_threads_same_count_is_a_noop() {
+        let mut pool = MeshJobPool::new(2);
+        pool.set_threads(2);
+        assert_eq!(pool.threads, 2);
+    }
+
+    /// The new generation spawned by a resize is fully functional: submit
+    /// and drain one cheap job.
+    #[test]
+    fn resized_pool_still_serves_jobs() {
+        let mut pool = MeshJobPool::new(1);
+        pool.set_threads(2);
+        assert!(pool.try_submit(cheap_geometry_job()));
+        let MeshResult::SectionGeometry { coord, .. } = next_result(&pool) else {
+            panic!("expected SectionGeometry result");
+        };
+        assert_eq!(coord, SectionCoord(0, 0, 0));
     }
 }
