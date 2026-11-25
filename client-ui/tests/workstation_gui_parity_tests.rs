@@ -2,7 +2,7 @@
 
 use megu_client_ui::container_screen::{menu_schema, ContainerScreenState, ALL_VANILLA_MENUS};
 use megu_client_ui::draw::{text_height, text_width, UiCommand, UiDrawList, UiRect};
-use megu_client_ui::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
+use megu_client_ui::hud_widgets::{HudAuxiliaryState, HudSnapshot, HudWidgetsRenderer};
 
 const RESOLUTIONS: [(u32, u32); 4] = [(854, 480), (1280, 720), (1920, 1080), (3840, 2160)];
 
@@ -196,6 +196,45 @@ fn hud_widgets_fit_every_resolution_and_gui_scale() {
                     assert!(
                         !overlaps(a.rect, b.rect),
                         "HUD regions {} and {} overlap at scale {scale}",
+                        a.name,
+                        b.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn mount_jump_and_attack_indicators_fit_every_gui_scale() {
+    let state = HudAuxiliaryState {
+        mount_health: 13.0,
+        mount_max_health: 20.0,
+        jump_charge: 0.75,
+        attack_cooldown: 0.6,
+        damage_flash: true,
+    };
+    for (width, height) in RESOLUTIONS {
+        for scale in 1..=4 {
+            let renderer = HudWidgetsRenderer::with_gui_scale(scale);
+            let mut draw = UiDrawList::new();
+            let report = renderer.render_auxiliary(&state, width, height, &mut draw);
+            assert_eq!(report.regions().len(), 3);
+            for region in report.regions() {
+                assert!(
+                    region.rect.x >= 0
+                        && region.rect.y >= 0
+                        && region.rect.right() <= width as i32
+                        && region.rect.bottom() <= height as i32,
+                    "{} exceeds viewport at scale {scale}",
+                    region.name
+                );
+            }
+            for (index, a) in report.regions().iter().enumerate() {
+                for b in report.regions().iter().skip(index + 1) {
+                    assert!(
+                        !overlaps(a.rect, b.rect),
+                        "{} and {} overlap at scale {scale}",
                         a.name,
                         b.name
                     );

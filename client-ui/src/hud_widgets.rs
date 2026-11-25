@@ -802,6 +802,18 @@ pub struct HudSnapshot {
     pub debug: F3DebugOverlay,
 }
 
+/// Optional vehicle and attack indicators rendered alongside the core HUD.
+/// Keeping this separate preserves existing [`HudSnapshot`] struct literals.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HudAuxiliaryState {
+    pub mount_health: f32,
+    pub mount_max_health: f32,
+    pub jump_charge: f32,
+    pub attack_cooldown: f32,
+    /// Damage flash phase for mount hearts.
+    pub damage_flash: bool,
+}
+
 impl HudSnapshot {
     /// A fully populated snapshot exercising every widget — useful for
     /// demos, screenshots, and the non-overlap test matrix.
@@ -989,6 +1001,48 @@ impl HudWidgetsRenderer {
     /// Renderer pinned to a fixed GUI scale.
     pub fn with_gui_scale(gui_scale: u32) -> Self {
         Self { gui_scale }
+    }
+
+    /// Render mount hearts, mount jump charge, and the attack cooldown
+    /// meter without changing the existing [`HudSnapshot`] contract.
+    pub fn render_auxiliary(
+        &self,
+        state: &HudAuxiliaryState,
+        viewport_w: u32,
+        viewport_h: u32,
+        out: &mut UiDrawList,
+    ) -> HudRegionReport {
+        let mut report = HudRegionReport::default();
+        let s = if self.gui_scale == 0 {
+            (viewport_h / 360)
+                .clamp(1, 4)
+                .min((viewport_w / 320).max(1))
+        } else {
+            self.gui_scale.clamp(1, 4)
+        };
+        let lw = viewport_w / s;
+        let lh = viewport_h / s;
+        if lw < 96 || lh < 96 {
+            return report;
+        }
+        let mut ctx = Ctx {
+            out,
+            s,
+            w: lw as i32,
+            h: lh as i32,
+            claims: Vec::new(),
+            top_left_reserve: 0,
+        };
+        ctx.auxiliary(state);
+        report.regions = ctx
+            .claims
+            .iter()
+            .map(|(name, rect)| HudRegion {
+                name,
+                rect: ctx.phys(*rect),
+            })
+            .collect();
+        report
     }
 
     /// Render `snapshot` at `viewport_w`×`viewport_h` **physical** pixels,
@@ -1266,7 +1320,7 @@ impl Ctx<'_> {
 
 impl Ctx<'_> {
     fn effects(&mut self, hud: &StatusEffectHud) {
-        let visible: Vec<&StatusEffectEntry> = hud
+        let mut visible: Vec<&StatusEffectEntry> = hud
             .entries
             .iter()
             .filter(|e| effect_icon_visible(e.remaining_ticks))
@@ -1275,6 +1329,7 @@ impl Ctx<'_> {
         if visible.is_empty() {
             return;
         }
+        visible.sort_by_key(|entry| !entry.beneficial);
         // The grid hugs the top-right corner but must stay clear of the
         // debug-left lane reserved before any claims existed. Columns
         // shrink to fit; entries past two rows are dropped so the grid
@@ -1626,6 +1681,44 @@ fn icon_count(value: f32, per_icon: f32, max_icons: i32) -> i32 {
 }
 
 impl Ctx<'_> {
+    fn auxiliary(&mut self, state: &HudAuxiliaryState) {
+        let max_health = finite_or(state.mount_max_health, 0.0).max(0.0);
+        let health = finite_or(state.mount_health, 0.0).clamp(0.0, max_health);
+        let hearts = icon_count(max_health, 2.0, 10);
+        if hearts > 0 {
+            let x0 = (self.w / 2 - hearts * 4).max(EDGE);
+            let y = self.h - HOTBAR_RESERVE - 16;
+            let color = if state.damage_flash {
+                palette::DANGER
+            } else {
+                palette::HEALTH
+            };
+            for i in 0..hearts {
+                let fill = ((health - i as f32 * 2.0) / 2.0).clamp(0.0, 1.0);
+                icon_cell(self, x0 + i * 8, y, fill, color);
+            }
+            self.claim("mount_hearts", x0, y, hearts * 8, 8);
+        }
+
+        let jump = unit_frac(state.jump_charge);
+        if jump > 0.0 {
+            let width = 90;
+            let x = self.w / 2 - width / 2;
+            let y = self.h - HOTBAR_RESERVE - 28;
+            self.progress(x, y, width, 4, jump, palette::XP);
+            self.claim("mount_jump_charge", x, y, width, 4);
+        }
+
+        let cooldown = unit_frac(state.attack_cooldown);
+        if cooldown > 0.0 {
+            let width = 18;
+            let x = self.w / 2 - width / 2;
+            let y = self.h / 2 + 14;
+            self.progress(x, y, width, 3, cooldown, palette::ACCENT);
+            self.claim("attack_cooldown", x, y, width, 3);
+        }
+    }
+
     fn vitals(&mut self, v: &VitalsState) {
         let hotbar_top = self.h - HOTBAR_RESERVE;
         let cx = self.w / 2;
