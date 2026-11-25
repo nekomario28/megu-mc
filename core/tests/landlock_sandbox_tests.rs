@@ -172,17 +172,47 @@ fn plan_canonicalises_symlinks_and_honours_allow_tmp() {
 // Outcome semantics that never touch kernel enforcement
 // ---------------------------------------------------------------------
 
+// Process-global env mutations must be serialized so parallel tests on
+// Windows/macOS never observe `DISABLE_ENV_VAR=1` set by another test.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvRestoreGuard {
+    prev: Option<std::ffi::OsString>,
+}
+
+impl EnvRestoreGuard {
+    fn set(val: Option<&str>) -> Self {
+        let prev = std::env::var_os(DISABLE_ENV_VAR);
+        match val {
+            Some(v) => std::env::set_var(DISABLE_ENV_VAR, v),
+            None => std::env::remove_var(DISABLE_ENV_VAR),
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for EnvRestoreGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(DISABLE_ENV_VAR, v),
+            None => std::env::remove_var(DISABLE_ENV_VAR),
+        }
+    }
+}
+
 #[test]
 fn env_opt_out_returns_disabled() {
-    std::env::set_var(DISABLE_ENV_VAR, "1");
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvRestoreGuard::set(Some("1"));
     let res = enforce_sandbox(&ServerSandboxSpec::default());
-    std::env::remove_var(DISABLE_ENV_VAR);
     assert_eq!(res, SandboxOutcome::Disabled);
 }
 
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn non_linux_reports_unsupported_os() {
+    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvRestoreGuard::set(None);
     assert_eq!(detect_landlock_abi(), None);
     let relaxed = enforce_sandbox(&ServerSandboxSpec {
         best_effort: true,
