@@ -14,9 +14,8 @@ use megu_client_gpu::renderer::{
 };
 use megu_client_gpu::subworld_render::COMPOSITE_TERRAIN_WGSL;
 use megu_client_mesh::builtin_shadow_wgsl::MEGU_SKY_ATMOSPHERE_WGSL;
-use megu_client_mesh::{
-    BuiltSectionMesh, SectionCoord, SectionMeshInput, DIRECTION_BUCKETS,
-};
+use megu_client_mesh::{BuiltSectionMesh, SectionCoord, SectionMeshInput, DIRECTION_BUCKETS};
+use megu_core::render_cs::SectionRenderMetadata;
 
 /// Protocol 767 `level_chunk_with_light` body, dimension -64..320 (24
 /// sections). Section index 4 covers world y 0..16 — a single
@@ -93,10 +92,12 @@ fn fake_built(coord: SectionCoord, revision: u64) -> BuiltSectionMesh {
     BuiltSectionMesh {
         coord,
         revision,
+        occluder_quads: Vec::new(),
         opaque_packed: Vec::new(),
         opaque_bucket_ranges: [(0, 0); DIRECTION_BUCKETS],
         translucent_quads: Vec::new(),
         visibility_mask: 0,
+        render_meta: SectionRenderMetadata::default(),
     }
 }
 

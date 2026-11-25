@@ -15,7 +15,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use megu_core::render_cs::SectionVisBits;
+
 use crate::cull::box_in_frustum;
+use crate::visibility::FaceVisibility;
 use crate::{Direction, SectionCoord, ALL_FACES, EDGE};
 
 /// Bit `entry * 6 + exit` of a `SectionGraph::through` mask.
@@ -54,6 +57,12 @@ impl SectionGraph {
     /// Whether sight entering through `entry` can exit through `exit`.
     pub const fn can_reach(self, entry: Direction, exit: Direction) -> bool {
         self.through & through_bit(entry, exit) != 0
+    }
+
+    /// The same connectivity as a [`SectionVisBits`] — the `FaceDir`-ordered
+    /// portal matrix the core BFS and draw-bucket planners consume.
+    pub fn vis_bits(self) -> SectionVisBits {
+        FaceVisibility::from_bits(self.through).to_vis_bits()
     }
 }
 

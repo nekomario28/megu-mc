@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use megu_core::coords::CoordMap;
+use megu_core::render_cs::SectionRenderMetadata;
 
 use megu_client_mesh::ffi::{
     megu_client_mesh_pack_vertices, megu_client_mesh_sort_translucent, PackedVertex, ABI_OK,
@@ -2284,6 +2285,14 @@ impl WorldState {
     /// order. `None` until the section's first rebuild.
     pub fn direction_buckets(&self, coord: SectionCoord) -> Option<DirectionBuckets> {
         self.direction_buckets.get(&coord).copied()
+    }
+
+    /// The render descriptor the mesh build measured for one section:
+    /// protrusion span and non-axis-geometry flag the renderer's cull and
+    /// draw-bucket planners consume. `None` until the section's first
+    /// rebuild.
+    pub fn section_render_meta(&self, coord: SectionCoord) -> Option<SectionRenderMetadata> {
+        self.mesh_cache.render_meta(coord)
     }
 
     /// Shared render-region arena for multi-draw command batching.

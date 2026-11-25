@@ -130,7 +130,7 @@ pub use upload_budget::{
     HARD_FLOOR_1000FPS_MAX_UPLOADS_PER_FRAME, HARD_FLOOR_1000FPS_MAX_UPLOAD_BYTES_PER_FRAME,
     HARD_FLOOR_1000FPS_MAX_UPLOAD_WORK_US_PER_FRAME, HARD_FLOOR_1000FPS_TARGET_FRAME_US,
 };
-pub use visibility::FaceVisibility;
+pub use visibility::{direction_face_dir, face_dir_direction, FaceVisibility};
 pub use voxel_dda_shadows::{
     voxel_shadow_factor, voxel_shadow_factor_world, VoxelOccupancyGrid, VoxelShadowParams,
     DEFAULT_LIGHT_RADIUS, MAX_DDA_STEPS, VOXEL_DDA_SHADOW_WGSL, VOXEL_GRID_BYTES, VOXEL_GRID_CELLS,

@@ -264,11 +264,9 @@ UNWIRED_MODULE_BASELINE = {
     'core/dye_and_items',
     'core/geom',
     'core/local_transport',
-    'core/mesh_elision',
     'core/net_budget',
     'core/os_desktop',
     'core/quiescent',
-    'core/render_cs',
     'create-adapter/rail_network',
     'state-store/chunk_packet_cache',
 }
