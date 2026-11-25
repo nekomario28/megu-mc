@@ -166,8 +166,7 @@ pub mod palette {
     /// Tooltip frame gradient top `rgba(80,0,255,80)`.
     pub const TOOLTIP_FRAME_TOP: UiColor = UiColor::from_rgba8(V.tooltip_border_top);
     /// Tooltip frame gradient bottom `rgba(40,0,127,80)`.
-    pub const TOOLTIP_FRAME_BOTTOM: UiColor =
-        UiColor::from_rgba8(V.tooltip_border_bottom);
+    pub const TOOLTIP_FRAME_BOTTOM: UiColor = UiColor::from_rgba8(V.tooltip_border_bottom);
     /// Primary light text `#FFFFFF`.
     pub const TEXT: UiColor = UiColor::from_rgba8(V.text_light);
     /// Light-text 1px drop shadow `#3F3F3F`.
@@ -1109,6 +1108,110 @@ pub struct GuiSpriteEntry {
     pub nine_slice_border: [u32; 4],
 }
 
+/// UV rectangle and source pixel dimensions for a GUI sprite.
+pub type GuiSpriteUv = GuiSpriteEntry;
+
+/// Vanilla 1.21.1 container background texture catalog.
+///
+/// The path is relative to `assets/minecraft/textures/gui/`. Background
+/// entries in the GPU atlas are cropped to `panel_size` before packing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VanillaContainerTextureId {
+    Inventory,
+    CraftingTable,
+    Generic54,
+    ShulkerBox,
+    Dispenser,
+    Hopper,
+    Furnace,
+    BlastFurnace,
+    Smoker,
+    EnchantingTable,
+    Anvil,
+    BrewingStand,
+    Beacon,
+    Grindstone,
+    Loom,
+    Stonecutter,
+    CartographyTable,
+    Smithing,
+    Villager,
+    Crafter,
+    Horse,
+    Book,
+}
+
+impl VanillaContainerTextureId {
+    /// Exact GUI texture path relative to `textures/gui/`.
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::Inventory => "container/inventory.png",
+            Self::CraftingTable => "container/crafting_table.png",
+            Self::Generic54 => "container/generic_54.png",
+            Self::ShulkerBox => "container/shulker_box.png",
+            Self::Dispenser => "container/dispenser.png",
+            Self::Hopper => "container/hopper.png",
+            Self::Furnace => "container/furnace.png",
+            Self::BlastFurnace => "container/blast_furnace.png",
+            Self::Smoker => "container/smoker.png",
+            Self::EnchantingTable => "container/enchanting_table.png",
+            Self::Anvil => "container/anvil.png",
+            Self::BrewingStand => "container/brewing_stand.png",
+            Self::Beacon => "container/beacon.png",
+            Self::Grindstone => "container/grindstone.png",
+            Self::Loom => "container/loom.png",
+            Self::Stonecutter => "container/stonecutter.png",
+            Self::CartographyTable => "container/cartography_table.png",
+            Self::Smithing => "container/smithing.png",
+            Self::Villager => "container/villager.png",
+            Self::Crafter => "container/crafter.png",
+            Self::Horse => "container/horse.png",
+            Self::Book => "book.png",
+        }
+    }
+
+    /// Logical crop dimensions at vanilla 1x scale.
+    pub const fn panel_size(self) -> (u32, u32) {
+        match self {
+            Self::Generic54 => (176, 222),
+            Self::Hopper => (176, 133),
+            Self::Beacon => (230, 219),
+            Self::Villager => (276, 166),
+            Self::Book => (192, 192),
+            _ => (176, 166),
+        }
+    }
+
+    /// Vanilla menu registry ID to background mapping; `u32::MAX` is
+    /// the client's window-0 player inventory screen.
+    pub const fn for_menu_id(menu_id: u32) -> Option<Self> {
+        match menu_id {
+            0..=5 => Some(Self::Generic54),
+            6 => Some(Self::Dispenser),
+            7 => Some(Self::Crafter),
+            8 => Some(Self::Anvil),
+            9 => Some(Self::Beacon),
+            10 => Some(Self::BlastFurnace),
+            11 => Some(Self::BrewingStand),
+            12 => Some(Self::CraftingTable),
+            13 => Some(Self::EnchantingTable),
+            14 => Some(Self::Furnace),
+            15 => Some(Self::Grindstone),
+            16 => Some(Self::Hopper),
+            17 => Some(Self::Book),
+            18 => Some(Self::Loom),
+            19 => Some(Self::Villager),
+            20 => Some(Self::ShulkerBox),
+            21 => Some(Self::Smithing),
+            22 => Some(Self::Smoker),
+            23 => Some(Self::CartographyTable),
+            24 => Some(Self::Stonecutter),
+            u32::MAX => Some(Self::Inventory),
+            _ => None,
+        }
+    }
+}
+
 /// Packed RGBA8 GUI-sprite atlas plus the `SpriteId → entry` lookup the
 /// tessellator resolves [`UiCommand::Sprite`] against. `client-gpu`
 /// builds one from decoded vanilla `widget/*` sprites and uploads
@@ -1124,12 +1227,21 @@ pub struct GuiSpriteAtlas {
     pub rgba: Vec<u8>,
     /// `SpriteId` (as `u8`) → placement.
     entries: std::collections::BTreeMap<u8, GuiSpriteEntry>,
+    /// Container menu ID → background texture placement.
+    container_panels: std::collections::BTreeMap<u32, GuiSpriteUv>,
 }
 
 impl GuiSpriteAtlas {
     /// Atlas entry for `sprite`, if one was packed.
     pub fn entry(&self, sprite: megu_core::ui_contract::SpriteId) -> Option<&GuiSpriteEntry> {
         self.entries.get(&(sprite as u8))
+    }
+
+    /// Authentic Vanilla container background placement for a menu ID.
+    /// Missing local assets return `None` so callers keep their vector
+    /// panel fallback.
+    pub fn container_panel_sprite(&self, menu_id: u32) -> Option<GuiSpriteUv> {
+        self.container_panels.get(&menu_id).copied()
     }
 
     /// `true` when `sprite` has a packed entry — the check the widget
@@ -1164,6 +1276,25 @@ impl GuiSpriteAtlas {
             height,
             rgba,
             entries: entries.into_iter().map(|(id, e)| (id as u8, e)).collect(),
+            container_panels: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Construct an atlas with both canonical widget sprites and
+    /// optional container panel placements.
+    pub fn from_packed_with_container_panels(
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        entries: Vec<(megu_core::ui_contract::SpriteId, GuiSpriteEntry)>,
+        container_panels: Vec<(u32, GuiSpriteUv)>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            rgba,
+            entries: entries.into_iter().map(|(id, e)| (id as u8, e)).collect(),
+            container_panels: container_panels.into_iter().collect(),
         }
     }
 }
@@ -1370,7 +1501,13 @@ fn push_ui_border(
     if t <= 0 {
         return;
     }
-    push_ui_quad(vertices, indices, UiRect::new(rect.x, rect.y, rect.w, t as u32), uv, color);
+    push_ui_quad(
+        vertices,
+        indices,
+        UiRect::new(rect.x, rect.y, rect.w, t as u32),
+        uv,
+        color,
+    );
     push_ui_quad(
         vertices,
         indices,
@@ -1419,12 +1556,17 @@ fn emit_gui_sprite(
     }
     let border = entry.nine_slice_border;
     if border == [0; 4] {
-        push_sprite_quad(vertices, indices, rect, [
-            entry.uv_min[0],
-            entry.uv_min[1],
-            entry.uv_max[0],
-            entry.uv_max[1],
-        ]);
+        push_sprite_quad(
+            vertices,
+            indices,
+            rect,
+            [
+                entry.uv_min[0],
+                entry.uv_min[1],
+                entry.uv_max[0],
+                entry.uv_max[1],
+            ],
+        );
         return;
     }
     let src_w = entry.width.max(1) as f32;
@@ -1639,7 +1781,9 @@ pub fn tessellate_draw_list_full_into(
                                 for (row, bits) in bits.iter().enumerate() {
                                     for col in 0..8u32 {
                                         if (bits & (0x80 >> col)) != 0 {
-                                            push_ui_quad(vertices, indices, 
+                                            push_ui_quad(
+                                                vertices,
+                                                indices,
                                                 UiRect::new(
                                                     cx + col as i32 * *scale as i32,
                                                     cy + row as i32 * *scale as i32,
@@ -1660,7 +1804,9 @@ pub fn tessellate_draw_list_full_into(
                             for dy in 0..cell {
                                 for dx in 0..adv {
                                     if scaled_unifont_lit(&g, dx, dy, adv, cell) {
-                                        push_ui_quad(vertices, indices, 
+                                        push_ui_quad(
+                                            vertices,
+                                            indices,
                                             UiRect::new(cx + dx as i32, cy + dy as i32, 1, 1),
                                             white,
                                             *color,
@@ -1677,18 +1823,24 @@ pub fn tessellate_draw_list_full_into(
                                 // columns: each 8-px tile paints into half
                                 // the advance so strokes compress, never clip.
                                 let half = adv / 2;
-                                push_ui_quad(vertices, indices, 
+                                push_ui_quad(
+                                    vertices,
+                                    indices,
                                     UiRect::new(cx, cy, half, cell),
                                     tile_uv(base),
                                     *color,
                                 );
-                                push_ui_quad(vertices, indices, 
+                                push_ui_quad(
+                                    vertices,
+                                    indices,
                                     UiRect::new(cx + half as i32, cy, adv - half, cell),
                                     tile_uv(base + 1),
                                     *color,
                                 );
                             } else {
-                                push_ui_quad(vertices, indices, 
+                                push_ui_quad(
+                                    vertices,
+                                    indices,
                                     UiRect::new(cx, cy, cell, cell),
                                     tile_uv(base),
                                     *color,
@@ -1711,7 +1863,13 @@ pub fn tessellate_draw_list_full_into(
                 push_ui_quad(vertices, indices, inner, white, *back);
                 let fw = (inner.w as f32 * fraction.clamp(0.0, 1.0)) as u32;
                 if fw > 0 {
-                    push_ui_quad(vertices, indices, UiRect::new(inner.x, inner.y, fw, inner.h), white, *fill);
+                    push_ui_quad(
+                        vertices,
+                        indices,
+                        UiRect::new(inner.x, inner.y, fw, inner.h),
+                        white,
+                        *fill,
+                    );
                 }
             }
             UiCommand::ItemIcon { rect, item_id } => {
@@ -1828,10 +1986,7 @@ impl Frame<'_> {
             color,
         );
         let inner_h = rect.h.saturating_sub(2 * t);
-        self.fill(
-            UiRect::new(rect.x, rect.y + t as i32, t, inner_h),
-            color,
-        );
+        self.fill(UiRect::new(rect.x, rect.y + t as i32, t, inner_h), color);
         self.fill(
             UiRect::new(rect.right() - t as i32, rect.y + t as i32, t, inner_h),
             color,
