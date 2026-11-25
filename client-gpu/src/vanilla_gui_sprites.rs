@@ -32,6 +32,7 @@ use megu_client_mesh::png_decode;
 use megu_core::zip_archive::{LazyZipIndex, ZipError, ZipSliceIndex};
 
 use crate::title_branding::RgbaImage;
+use megu_ui::draw::VanillaContainerTextureId;
 
 // ---------------------------------------------------------------------------
 // Sprite catalog
@@ -106,6 +107,88 @@ pub enum VanillaGuiSpriteId {
 /// Prefix shared by every catalogued GUI texture entry.
 const GUI_TEX_PREFIX: &str = "assets/minecraft/textures/gui/";
 
+/// Every supported Vanilla 1.21.1 container background, kept separate
+/// from `ALL_GUI_SPRITES` so its legacy public shape stays unchanged.
+pub const ALL_CONTAINER_TEXTURES: [VanillaContainerTextureId; 22] = [
+    VanillaContainerTextureId::Inventory,
+    VanillaContainerTextureId::CraftingTable,
+    VanillaContainerTextureId::Generic54,
+    VanillaContainerTextureId::ShulkerBox,
+    VanillaContainerTextureId::Dispenser,
+    VanillaContainerTextureId::Hopper,
+    VanillaContainerTextureId::Furnace,
+    VanillaContainerTextureId::BlastFurnace,
+    VanillaContainerTextureId::Smoker,
+    VanillaContainerTextureId::EnchantingTable,
+    VanillaContainerTextureId::Anvil,
+    VanillaContainerTextureId::BrewingStand,
+    VanillaContainerTextureId::Beacon,
+    VanillaContainerTextureId::Grindstone,
+    VanillaContainerTextureId::Loom,
+    VanillaContainerTextureId::Stonecutter,
+    VanillaContainerTextureId::CartographyTable,
+    VanillaContainerTextureId::Smithing,
+    VanillaContainerTextureId::Villager,
+    VanillaContainerTextureId::Crafter,
+    VanillaContainerTextureId::Horse,
+    VanillaContainerTextureId::Book,
+];
+
+/// Workstation and HUD overlay textures loaded from the same local GUI
+/// resource tree. Paths are relative to `textures/gui/`.
+pub const VANILLA_WORKSTATION_SPRITES: &[&str] = &[
+    "sprites/container/furnace/lit_progress.png",
+    "sprites/container/furnace/burn_progress.png",
+    "sprites/container/blast_furnace/lit_progress.png",
+    "sprites/container/blast_furnace/burn_progress.png",
+    "sprites/container/smoker/lit_progress.png",
+    "sprites/container/smoker/burn_progress.png",
+    "sprites/container/brewing_stand/fuel_length.png",
+    "sprites/container/brewing_stand/bubbles.png",
+    "sprites/container/brewing_stand/brew_progress.png",
+    "sprites/container/enchanting_table/enchantment_slot.png",
+    "sprites/container/enchanting_table/enchantment_slot_highlighted.png",
+    "sprites/container/enchanting_table/enchantment_slot_disabled.png",
+    "sprites/container/anvil/text_field.png",
+    "sprites/container/anvil/text_field_disabled.png",
+    "sprites/container/anvil/error_arrow.png",
+    "sprites/container/beacon/button.png",
+    "sprites/container/beacon/button_highlighted.png",
+    "sprites/container/beacon/button_selected.png",
+    "sprites/container/beacon/button_disabled.png",
+    "sprites/container/beacon/confirm.png",
+    "sprites/container/beacon/cancel.png",
+    "sprites/container/crafter/disabled_slot.png",
+    "sprites/container/crafter/powered_redstone.png",
+    "sprites/container/crafter/unpowered_redstone.png",
+    "sprites/container/villager/trade_arrow.png",
+    "sprites/container/villager/trade_arrow_out_of_stock.png",
+    "sprites/container/villager/experience_bar_background.png",
+    "sprites/container/villager/experience_bar_current.png",
+    "sprites/container/villager/experience_bar_result.png",
+    "sprites/hud/heart/absorbing_full.png",
+    "sprites/hud/heart/poisoned_full.png",
+    "sprites/hud/heart/withered_full.png",
+    "sprites/hud/heart/frozen_full.png",
+    "sprites/hud/heart/hardcore_full.png",
+    "sprites/hud/air.png",
+    "sprites/hud/air_bursting.png",
+    "sprites/boss_bar/pink_background.png",
+    "sprites/boss_bar/pink_progress.png",
+    "sprites/boss_bar/blue_background.png",
+    "sprites/boss_bar/blue_progress.png",
+    "sprites/boss_bar/red_background.png",
+    "sprites/boss_bar/red_progress.png",
+    "sprites/boss_bar/green_background.png",
+    "sprites/boss_bar/green_progress.png",
+    "sprites/boss_bar/yellow_background.png",
+    "sprites/boss_bar/yellow_progress.png",
+    "sprites/boss_bar/purple_background.png",
+    "sprites/boss_bar/purple_progress.png",
+    "sprites/boss_bar/white_background.png",
+    "sprites/boss_bar/white_progress.png",
+];
+
 /// Every sprite id in deterministic catalog order — the same order
 /// [`VanillaGuiAtlas`] packs shelves, so atlas output is stable.
 pub const ALL_GUI_SPRITES: [VanillaGuiSpriteId; 28] = [
@@ -154,9 +237,7 @@ impl VanillaGuiSpriteId {
             Self::SliderHighlighted => {
                 "assets/minecraft/textures/gui/sprites/widget/slider_highlighted.png"
             }
-            Self::SliderHandle => {
-                "assets/minecraft/textures/gui/sprites/widget/slider_handle.png"
-            }
+            Self::SliderHandle => "assets/minecraft/textures/gui/sprites/widget/slider_handle.png",
             Self::SliderHandleHighlighted => {
                 "assets/minecraft/textures/gui/sprites/widget/slider_handle_highlighted.png"
             }
@@ -174,33 +255,19 @@ impl VanillaGuiSpriteId {
             Self::XpBarFill => {
                 "assets/minecraft/textures/gui/sprites/hud/experience_bar_progress.png"
             }
-            Self::HeartContainer => {
-                "assets/minecraft/textures/gui/sprites/hud/heart/container.png"
-            }
+            Self::HeartContainer => "assets/minecraft/textures/gui/sprites/hud/heart/container.png",
             Self::HeartFull => "assets/minecraft/textures/gui/sprites/hud/heart/full.png",
             Self::HeartHalf => "assets/minecraft/textures/gui/sprites/hud/heart/half.png",
             Self::FoodEmpty => "assets/minecraft/textures/gui/sprites/hud/food_empty.png",
             Self::FoodFull => "assets/minecraft/textures/gui/sprites/hud/food_full.png",
             Self::ArmorEmpty => "assets/minecraft/textures/gui/sprites/hud/armor_empty.png",
             Self::ArmorFull => "assets/minecraft/textures/gui/sprites/hud/armor_full.png",
-            Self::Panorama0 => {
-                "assets/minecraft/textures/gui/title/background/panorama_0.png"
-            }
-            Self::Panorama1 => {
-                "assets/minecraft/textures/gui/title/background/panorama_1.png"
-            }
-            Self::Panorama2 => {
-                "assets/minecraft/textures/gui/title/background/panorama_2.png"
-            }
-            Self::Panorama3 => {
-                "assets/minecraft/textures/gui/title/background/panorama_3.png"
-            }
-            Self::Panorama4 => {
-                "assets/minecraft/textures/gui/title/background/panorama_4.png"
-            }
-            Self::Panorama5 => {
-                "assets/minecraft/textures/gui/title/background/panorama_5.png"
-            }
+            Self::Panorama0 => "assets/minecraft/textures/gui/title/background/panorama_0.png",
+            Self::Panorama1 => "assets/minecraft/textures/gui/title/background/panorama_1.png",
+            Self::Panorama2 => "assets/minecraft/textures/gui/title/background/panorama_2.png",
+            Self::Panorama3 => "assets/minecraft/textures/gui/title/background/panorama_3.png",
+            Self::Panorama4 => "assets/minecraft/textures/gui/title/background/panorama_4.png",
+            Self::Panorama5 => "assets/minecraft/textures/gui/title/background/panorama_5.png",
         }
     }
 
@@ -449,7 +516,9 @@ fn procedural_core_sprites() -> BTreeMap<VanillaGuiSpriteId, RgbaImage> {
                 VanillaGuiSpriteId::HeartFull | VanillaGuiSpriteId::HeartHalf => [190, 42, 48],
                 VanillaGuiSpriteId::FoodEmpty | VanillaGuiSpriteId::FoodFull => [181, 96, 35],
                 VanillaGuiSpriteId::ArmorEmpty | VanillaGuiSpriteId::ArmorFull => [160, 174, 190],
-                VanillaGuiSpriteId::ButtonHighlighted | VanillaGuiSpriteId::SliderHighlighted => [115, 151, 68],
+                VanillaGuiSpriteId::ButtonHighlighted | VanillaGuiSpriteId::SliderHighlighted => {
+                    [115, 151, 68]
+                }
                 VanillaGuiSpriteId::ButtonDisabled => [85, 85, 85],
                 VanillaGuiSpriteId::Crosshair => [235, 235, 235],
                 _ => [104, 82, 57],
@@ -471,7 +540,13 @@ fn procedural_core_sprites() -> BTreeMap<VanillaGuiSpriteId, RgbaImage> {
                     if !mark {
                         continue;
                     }
-                    let shade = if edge { 0.55 } else if y < height / 3 { 1.2 } else { 1.0 };
+                    let shade = if edge {
+                        0.55
+                    } else if y < height / 3 {
+                        1.2
+                    } else {
+                        1.0
+                    };
                     let at = (y as usize * width as usize + x as usize) * 4;
                     rgba[at] = (base[0] as f32 * shade).min(255.0) as u8;
                     rgba[at + 1] = (base[1] as f32 * shade).min(255.0) as u8;
@@ -479,7 +554,14 @@ fn procedural_core_sprites() -> BTreeMap<VanillaGuiSpriteId, RgbaImage> {
                     rgba[at + 3] = 255;
                 }
             }
-            (id, RgbaImage { width, height, rgba })
+            (
+                id,
+                RgbaImage {
+                    width,
+                    height,
+                    rgba,
+                },
+            )
         })
         .collect()
 }
@@ -631,8 +713,7 @@ pub struct PanoramaCube {
 /// Decode one PNG entry into [`RgbaImage`], validating the buffer size
 /// against the header exactly like `title_branding` does.
 fn decode_sprite_png(bytes: &[u8]) -> Result<RgbaImage, String> {
-    let (width, height, rgba) =
-        png_decode::decode_png_rgba(bytes).map_err(|e| e.to_string())?;
+    let (width, height, rgba) = png_decode::decode_png_rgba(bytes).map_err(|e| e.to_string())?;
     let expected = width as usize * height as usize * 4;
     if rgba.len() != expected {
         return Err(format!(
@@ -647,18 +728,67 @@ fn decode_sprite_png(bytes: &[u8]) -> Result<RgbaImage, String> {
     })
 }
 
+/// Crop the upper-left Vanilla panel area, scaling crop coordinates for
+/// high-DPI resource packs. Only integral, uniform scale factors are
+/// accepted; a malformed/truncated sheet fails closed.
+fn crop_container_panel(id: VanillaContainerTextureId, image: &RgbaImage) -> Option<RgbaImage> {
+    let (panel_w, panel_h) = id.panel_size();
+    let (sheet_w, sheet_h) = if id == VanillaContainerTextureId::Villager {
+        (512, 256)
+    } else {
+        (256, 256)
+    };
+    let scale = if image.width.is_multiple_of(sheet_w)
+        && image.height.is_multiple_of(sheet_h)
+        && image.width / sheet_w == image.height / sheet_h
+    {
+        image.width / sheet_w
+    } else if image.width >= panel_w && image.height >= panel_h {
+        1
+    } else {
+        return None;
+    };
+    if scale == 0 {
+        return None;
+    }
+    let width = panel_w.checked_mul(scale)?;
+    let height = panel_h.checked_mul(scale)?;
+    if width > image.width || height > image.height {
+        return None;
+    }
+    let expected = (image.width as usize)
+        .checked_mul(image.height as usize)?
+        .checked_mul(4)?;
+    if image.rgba.len() != expected {
+        return None;
+    }
+    let mut rgba = vec![
+        0;
+        (width as usize)
+            .checked_mul(height as usize)?
+            .checked_mul(4)?
+    ];
+    for row in 0..height as usize {
+        let src = row.checked_mul(image.width as usize)?.checked_mul(4)?;
+        let dst = row.checked_mul(width as usize)?.checked_mul(4)?;
+        let bytes = width as usize * 4;
+        rgba[dst..dst + bytes].copy_from_slice(&image.rgba[src..src + bytes]);
+    }
+    Some(RgbaImage {
+        width,
+        height,
+        rgba,
+    })
+}
+
 /// Fold one archive layer into `out`: for each catalogued sprite, a
 /// present-and-decodable `.png` overwrites any earlier layer's copy,
 /// and a parseable `.png.mcmeta` `nine_slice.border` overwrites any
 /// earlier border — exactly Minecraft's later-pack-wins precedence.
 /// `read` fetches one member by name (fail-closed) and `layer` labels
 /// notes.
-fn fold_archive_layer<F>(
-    read: &mut F,
-    layer: &str,
-    names: &[String],
-    out: &mut VanillaGuiAssets,
-) where
+fn fold_archive_layer<F>(read: &mut F, layer: &str, names: &[String], out: &mut VanillaGuiAssets)
+where
     F: FnMut(&str, usize) -> Result<Vec<u8>, ZipError>,
 {
     for name in names {
@@ -671,13 +801,30 @@ fn fold_archive_layer<F>(
         match read(name, MAX_GUI_SPRITE_BYTES) {
             Ok(bytes) => match decode_sprite_png(&bytes) {
                 Ok(image) => {
-                    out.named_textures.insert(relative.to_owned(), image);
+                    if let Some(id) = ALL_CONTAINER_TEXTURES
+                        .iter()
+                        .copied()
+                        .find(|id| id.path() == relative)
+                    {
+                        if crop_container_panel(id, &image).is_some() {
+                            out.named_textures.insert(relative.to_owned(), image);
+                        } else {
+                            out.notes.push(format!(
+                                "{layer}:{name}: container panel dimensions invalid for {}",
+                                relative
+                            ));
+                        }
+                    } else {
+                        out.named_textures.insert(relative.to_owned(), image);
+                    }
                 }
-                Err(reason) => out.notes.push(format!(
-                    "{layer}:{name}: GUI texture rejected: {reason}"
-                )),
+                Err(reason) => out
+                    .notes
+                    .push(format!("{layer}:{name}: GUI texture rejected: {reason}")),
             },
-            Err(err) => out.notes.push(format!("{layer}:{name}: GUI texture unreadable: {err}")),
+            Err(err) => out
+                .notes
+                .push(format!("{layer}:{name}: GUI texture unreadable: {err}")),
         }
     }
     for id in ALL_GUI_SPRITES {
@@ -735,13 +882,17 @@ pub fn load_vanilla_gui_from_jar_bytes(
     let mut out = VanillaGuiAssets::fallback();
     match ZipSliceIndex::open_filtered(jar_bytes, VanillaGuiSpriteId::is_catalog_entry) {
         Ok(index) => {
-            let names: Vec<String> = index.entries().iter().map(|entry| entry.name.clone()).collect();
+            let names: Vec<String> = index
+                .entries()
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
             let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
             fold_archive_layer(&mut read, "client.jar", &names, &mut out);
         }
-        Err(err) => out
-            .notes
-            .push(format!("client JAR bytes unreadable: {err}; using built-in UI")),
+        Err(err) => out.notes.push(format!(
+            "client JAR bytes unreadable: {err}; using built-in UI"
+        )),
     }
     for (pack_no, pack) in resource_pack_layers
         .iter()
@@ -750,7 +901,11 @@ pub fn load_vanilla_gui_from_jar_bytes(
     {
         match ZipSliceIndex::open_filtered(pack, VanillaGuiSpriteId::is_catalog_entry) {
             Ok(index) => {
-                let names: Vec<String> = index.entries().iter().map(|entry| entry.name.clone()).collect();
+                let names: Vec<String> = index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect();
                 let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
                 fold_archive_layer(&mut read, &format!("pack[{pack_no}]"), &names, &mut out);
             }
@@ -781,7 +936,11 @@ pub fn load_vanilla_gui_from_path(
         out.source_jar = Some(jar_path.to_path_buf());
         match LazyZipIndex::open_filtered(jar_path, VanillaGuiSpriteId::is_catalog_entry) {
             Ok(index) => {
-                let names: Vec<String> = index.entries().iter().map(|entry| entry.name.clone()).collect();
+                let names: Vec<String> = index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect();
                 let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
                 fold_archive_layer(&mut read, "client.jar", &names, &mut out);
             }
@@ -797,7 +956,11 @@ pub fn load_vanilla_gui_from_path(
         }
         match LazyZipIndex::open_filtered(pack, VanillaGuiSpriteId::is_catalog_entry) {
             Ok(index) => {
-                let names: Vec<String> = index.entries().iter().map(|entry| entry.name.clone()).collect();
+                let names: Vec<String> = index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect();
                 let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
                 fold_archive_layer(&mut read, &pack.display().to_string(), &names, &mut out);
             }
@@ -859,6 +1022,67 @@ pub struct VanillaGuiTextureAtlas {
     pub named_entries: Vec<(String, SpriteAtlasEntry)>,
 }
 
+impl VanillaGuiTextureAtlas {
+    /// Build the UI bridge with both widget sprites and container panels.
+    /// Container menu IDs resolve to the matching cropped background UV;
+    /// unavailable textures remain absent and keep the caller's fallback.
+    #[must_use]
+    pub fn to_gui_sprite_atlas(&self) -> megu_ui::draw::GuiSpriteAtlas {
+        let entries = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                id.to_ui_contract().map(|sprite| {
+                    let border = entry.nine_slice_border.unwrap_or_default();
+                    (
+                        sprite,
+                        megu_ui::draw::GuiSpriteEntry {
+                            uv_min: entry.uv_min,
+                            uv_max: entry.uv_max,
+                            width: entry.width,
+                            height: entry.height,
+                            nine_slice_border: [
+                                border.left,
+                                border.top,
+                                border.right,
+                                border.bottom,
+                            ],
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let container_panels = (0..=24)
+            .chain(std::iter::once(u32::MAX))
+            .filter_map(|menu_id| {
+                let id = VanillaContainerTextureId::for_menu_id(menu_id)?;
+                let entry = self
+                    .named_entries
+                    .iter()
+                    .find(|(name, _)| name == id.path())?
+                    .1;
+                Some((
+                    menu_id,
+                    megu_ui::draw::GuiSpriteEntry {
+                        uv_min: entry.uv_min,
+                        uv_max: entry.uv_max,
+                        width: entry.width,
+                        height: entry.height,
+                        nine_slice_border: [0; 4],
+                    },
+                ))
+            })
+            .collect();
+        megu_ui::draw::GuiSpriteAtlas::from_packed_with_container_panels(
+            self.width,
+            self.height,
+            self.rgba.clone(),
+            entries,
+            container_panels,
+        )
+    }
+}
+
 /// Smallest atlas edge emitted for an empty sprite set — a valid 1x1
 /// transparent texture.
 const EMPTY_ATLAS_DIM: u32 = 1;
@@ -869,10 +1093,7 @@ const MAX_ATLAS_DIM: u32 = 8192;
 impl VanillaGuiAtlas {
     /// Look up one sprite's placement.
     pub fn entry(&self, id: VanillaGuiSpriteId) -> Option<&SpriteAtlasEntry> {
-        self.entries
-            .iter()
-            .find(|(k, _)| *k == id)
-            .map(|(_, e)| e)
+        self.entries.iter().find(|(k, _)| *k == id).map(|(_, e)| e)
     }
 
     /// Re-key the packed atlas to [`megu_ui::draw::GuiSpriteAtlas`] — the
@@ -931,22 +1152,38 @@ fn pack_gui_atlas(
     include_named: bool,
     include_fallbacks: bool,
 ) -> VanillaGuiTextureAtlas {
-    let mut sprites: Vec<(Option<VanillaGuiSpriteId>, Option<String>, &RgbaImage)> = ALL_GUI_SPRITES
+    let container_crops: BTreeMap<String, RgbaImage> = ALL_CONTAINER_TEXTURES
         .iter()
-        .filter(|id| !id.is_panorama_face())
         .filter_map(|id| {
-            assets
-                .sprites
-                .get(id)
-                .or_else(|| include_fallbacks.then(|| assets.procedural_fallbacks.get(id)).flatten())
-                .map(|img| (Some(*id), None, img))
+            let source = assets.named_textures.get(id.path())?;
+            Some((id.path().to_owned(), crop_container_panel(*id, source)?))
         })
         .collect();
+    let mut sprites: Vec<(Option<VanillaGuiSpriteId>, Option<String>, &RgbaImage)> =
+        ALL_GUI_SPRITES
+            .iter()
+            .filter(|id| !id.is_panorama_face())
+            .filter_map(|id| {
+                assets
+                    .sprites
+                    .get(id)
+                    .or_else(|| {
+                        include_fallbacks
+                            .then(|| assets.procedural_fallbacks.get(id))
+                            .flatten()
+                    })
+                    .map(|img| (Some(*id), None, img))
+            })
+            .collect();
     if include_named {
         sprites.extend(assets.named_textures.iter().filter_map(|(name, image)| {
             let full_name = format!("{GUI_TEX_PREFIX}{name}");
             let already_typed = ALL_GUI_SPRITES.iter().any(|id| id.jar_entry() == full_name);
-            (!already_typed).then(|| (None, Some(name.clone()), image))
+            if already_typed {
+                return None;
+            }
+            let packed_image = container_crops.get(name).unwrap_or(image);
+            Some((None, Some(name.clone()), packed_image))
         }));
     }
     if sprites.is_empty() {
@@ -1021,7 +1258,11 @@ fn pack_gui_atlas(
         }
         // Extrude rows: copy the first/last inner row into the gutter.
         for row in [p.cell_y, iy + img.height] {
-            let src_row = if row == p.cell_y { iy } else { iy + img.height - 1 };
+            let src_row = if row == p.cell_y {
+                iy
+            } else {
+                iy + img.height - 1
+            };
             let src = (src_row * atlas_w + ix) as usize * 4;
             let dst = (row * atlas_w + ix) as usize * 4;
             rgba.copy_within(src..src + img.width as usize * 4, dst);
@@ -1039,12 +1280,12 @@ fn pack_gui_atlas(
         let aw = atlas_w as f32;
         let ah = atlas_h as f32;
         let entry = SpriteAtlasEntry {
-                uv_min: [ix as f32 / aw, iy as f32 / ah],
-                uv_max: [(ix + img.width) as f32 / aw, (iy + img.height) as f32 / ah],
-                width: img.width,
-                height: img.height,
-                nine_slice_border: p.id.and_then(|id| assets.nine_slice_border(id)),
-            };
+            uv_min: [ix as f32 / aw, iy as f32 / ah],
+            uv_max: [(ix + img.width) as f32 / aw, (iy + img.height) as f32 / ah],
+            width: img.width,
+            height: img.height,
+            nine_slice_border: p.id.and_then(|id| assets.nine_slice_border(id)),
+        };
         if let Some(id) = p.id {
             entries.push((id, entry));
         } else if let Some(name) = &p.name {
@@ -1087,15 +1328,17 @@ pub struct TexturedUiQuad {
 /// overlap. Degenerate (zero-area) slices are skipped; a sprite with no
 /// border emits a single stretched quad. Return order is row-major:
 /// top row, middle row, bottom row, left-to-right within each row.
-pub fn tessellate_nine_slice(
-    dest: [f32; 4],
-    entry: &SpriteAtlasEntry,
-) -> Vec<TexturedUiQuad> {
+pub fn tessellate_nine_slice(dest: [f32; 4], entry: &SpriteAtlasEntry) -> Vec<TexturedUiQuad> {
     let [x, y, w, h] = dest;
     let Some(b) = entry.nine_slice_border.filter(|b| !b.is_zero()) else {
         return vec![TexturedUiQuad {
             pos: [x, y, w, h],
-            uv: [entry.uv_min[0], entry.uv_min[1], entry.uv_max[0], entry.uv_max[1]],
+            uv: [
+                entry.uv_min[0],
+                entry.uv_min[1],
+                entry.uv_max[0],
+                entry.uv_max[1],
+            ],
         }];
     };
 
