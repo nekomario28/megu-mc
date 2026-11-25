@@ -10,6 +10,8 @@
 //!   native WGSL shaderpack modules against the live `wgpu::Device`.
 //! * [`window`] — a `winit` 0.30 `ApplicationHandler` driving the window,
 //!   FPS input and the `FrameBudgetGovernor` pacing loop.
+//! * [`linux_desktop`] — compositor, IME, cursor-grab and XDG desktop-entry
+//!   policies for Linux desktop sessions.
 //!
 //! This module itself stays GPU-API-free where it can: camera math, the
 //! quad->buffer conversion, the capability mapping and the CLI parser are
@@ -19,8 +21,10 @@ pub mod atmosphere;
 pub mod clipboard;
 pub mod gpu_hiz;
 pub mod live_session;
+pub mod linux_desktop;
 pub mod mesh_pool;
 pub mod mod_sync_auto;
+pub mod pipeline_cache_store;
 pub mod recipe_ingest;
 pub mod renderer;
 pub mod replay_ring;
@@ -29,6 +33,7 @@ pub mod subworld_sync;
 pub mod title_branding;
 pub mod vanilla_bootstrap;
 pub mod vanilla_font;
+pub mod vanilla_gui_sprites;
 pub mod vanilla_jar;
 pub mod window;
 
@@ -1119,6 +1124,11 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 fnv1a_color(&mut hash, fill);
                 fnv1a_color(&mut hash, back);
                 fnv1a_color(&mut hash, border);
+            }
+            UiCommand::Sprite { rect, sprite } => {
+                hash.update_u8(5);
+                fnv1a_rect(&mut hash, rect);
+                hash.update_u8(*sprite as u8);
             }
             UiCommand::ItemIcon { rect, item_id } => {
                 hash.update_u8(4);

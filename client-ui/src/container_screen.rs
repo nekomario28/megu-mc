@@ -11,6 +11,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use crate::conflict_widget::ConflictWidget;
 use crate::draw::{palette, text_height, text_width, UiColor, UiDrawList, UiRect};
 
 pub const VANILLA_MENU_COUNT: usize = 25;
@@ -765,6 +766,11 @@ pub struct ContainerScreenState {
     pub properties: BTreeMap<i16, i16>,
     pub drag_mode: Option<DragState>,
     pub hovered_slot: Option<usize>,
+    /// Polymorph-style crafting-conflict switcher. The host refills it
+    /// with [`ConflictWidget::set_candidates`] whenever the station's
+    /// inputs change; with fewer than two candidates it draws and
+    /// accepts nothing, so a conflict-free screen is pixel-identical.
+    pub conflict: ConflictWidget,
 }
 
 impl ContainerScreenState {
@@ -784,6 +790,7 @@ impl ContainerScreenState {
             properties: BTreeMap::new(),
             drag_mode: None,
             hovered_slot: None,
+            conflict: ConflictWidget::new(),
         }
     }
 
@@ -914,6 +921,20 @@ impl ContainerScreenState {
             SLOT_SIZE as u32,
             SLOT_SIZE as u32,
         ))
+    }
+
+    /// Physical-pixel rect of the first `Output` slot — the anchor the
+    /// Polymorph conflict strip docks beside. `None` for menus without
+    /// an output slot (chest, hopper, inventory).
+    pub fn output_slot_rect(&self, viewport_w: f32, viewport_h: f32) -> Option<UiRect> {
+        let panel = self.panel_rect(viewport_w, viewport_h);
+        let layout = self.layout(viewport_w, viewport_h);
+        let index = layout
+            .slots
+            .iter()
+            .find(|s| s.kind == SlotKind::Output)?
+            .index;
+        self.slot_rect(index, panel)
     }
 
     pub fn layout(&self, viewport_w: f32, viewport_h: f32) -> ContainerLayout {
@@ -1158,6 +1179,14 @@ impl ContainerScreenState {
                 palette::TEXT,
                 button.label,
             );
+        }
+        // Polymorph strip beside the station's output slot — only while
+        // two or more recipes conflict; a quiet grid emits nothing.
+        if self.conflict.is_active() {
+            if let Some(anchor) = self.output_slot_rect(viewport_w, viewport_h) {
+                self.conflict
+                    .render(anchor, 1, vw as u32, vh as u32, out);
+            }
         }
         if let Some(cursor) = self.cursor.clone().filter(|s| !s.is_empty()) {
             let rect = UiRect::new(vw - 24, vh - 24, 20, 20);

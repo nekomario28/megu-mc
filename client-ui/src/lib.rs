@@ -29,6 +29,32 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
+//! * [`jei_emi_overlay`] — the JEI/EMI-style *native* side-by-side
+//!   container overlay: non-overlapping left (bookmarks + EMI craft
+//!   tree) and right (paginated 18×18 item grid + search with the
+//!   double-click yellow highlight mode) sidebars around any centered
+//!   container GUI, the classic `#C6C6C6` recipe popup card, the
+//!   purple-gradient item tooltip, and parallel `ItemSpriteSlot`
+//!   emission for runtime `client-gpu` item sprites.
+//! * [`recipe_search`] — the pure-logic core a JEI/EMI-style overlay
+//!   wires in: a Japanese-aware kana/romaji normalizer
+//!   (`daia`/`だいあ`/`ダイア` all reach `ダイヤモンド`), an inverted
+//!   [`recipe_search::RecipeSearchIndex`] with `@mod`/`#tag`/text
+//!   tokens plus `R`/`U` lookups and Polymorph-style conflict groups,
+//!   and [`recipe_search::NearbyChestCraftPlanner`] emitting atomic
+//!   transfer plans that pull from the player inventory and nearby
+//!   chests for 1-click and max-stack shift-crafts.
+//! * [`seamless_ux`] — the seamless-onboarding layer: one-click
+//!   bilingual quality presets + ranked settings search + the
+//!   translucent live-preview settings backdrop, the universal
+//!   drag-and-drop payload classifier with mandatory consent prompts,
+//!   and the secret-denylist-guarded existing-launcher importer.
+//! * [`gamepad`] — the Controllable-class native gamepad engine: brand
+//!   profiles and bilingual prompt glyphs for Xbox / PlayStation /
+//!   Switch / Steam Deck, radial-deadzone stick processing, console
+//!   gameplay bindings, magnetic virtual-cursor UI navigation with
+//!   D-pad focus jumps, an 8-slice radial wheel, and a bounded rumble
+//!   queue.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -42,20 +68,29 @@
 //! # assert_eq!(rgba.len(), 1280 * 720 * 4);
 //! ```
 
+pub mod claims_ui;
+pub mod conflict_widget;
 pub mod container_screen;
 pub mod create_goggles_hud;
 pub mod death_screen;
 pub mod draw;
 pub mod font_cjk;
+pub mod gamepad;
 pub mod gui_bridge;
 pub mod hud_widgets;
+pub mod jei_emi_overlay;
 pub mod layout;
 pub mod magic_hud;
 pub mod mod_i18n;
 pub mod mod_menu;
+pub mod mod_sync_ui;
 pub mod qol_helpers;
 pub mod recipe_browser;
+pub mod recipe_search;
+pub mod retained_cache;
+pub mod seamless_ux;
 pub mod shader_screen;
 pub mod sign_and_chat;
 pub mod state;
 pub mod subtitle_hud;
+pub mod vanilla_widgets;

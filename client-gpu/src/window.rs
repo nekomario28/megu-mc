@@ -60,7 +60,7 @@ use megu_ui::container_screen::{
     ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
     UiItemStack, menu_schema,
 };
-use megu_ui::draw::{tessellate_draw_list, tessellate_draw_list_icons};
+use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
 use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
 use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
@@ -81,12 +81,16 @@ use megu_ui::state::{
     MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen, SettingsTab,
     UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
 };
-use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display};
+use megu_ui::state::{ScoreboardState, TitleOverlayState, invite_code_display, tr};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, ElementState, Ime, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+#[cfg(all(unix, not(target_os = "macos")))]
+use winit::platform::wayland::WindowAttributesExtWayland;
+#[cfg(all(unix, not(target_os = "macos")))]
+use winit::platform::x11::WindowAttributesExtX11;
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::atmosphere::{
@@ -871,9 +875,12 @@ pub struct GpuApp {
     /// Last delivered `ModifiersChanged` state — `Ctrl` (and `Cmd` on
     /// macOS) gates the copy/paste chords on text surfaces.
     modifiers: ModifiersState,
-    /// Live IME composition string from `Ime::Preedit` — cleared on
-    /// `Commit`/`Disabled` so a stale preedit can never double-insert.
-    ime_preedit: Option<String>,
+    /// Live IME composition state from `Ime::Enabled`/`Preedit`/`Commit`/
+    /// `Disabled` — preedit text + clamped cursor byte range plus the
+    /// candidate-window anchor rect pushed through
+    /// `set_ime_cursor_area`. Reset on disable/focus loss so a stale
+    /// composition can never double-insert.
+    ime_state: crate::linux_desktop::ImeCompositionState,
     /// Last `set_ime_allowed` pushed to the window: `true` while a text
     /// surface owns typing, `false` during raw WASD gameplay so the IME
     /// can never hijack movement keys.
@@ -882,6 +889,17 @@ pub struct GpuApp {
     /// `KeyEvent.text` would double-insert; the commit string + instant
     /// is recorded so the keyboard path can swallow the echo.
     last_ime_commit: Option<(String, Instant)>,
+    /// Tiling-WM focus/grab recovery policy seeded from the detected
+    /// [`crate::linux_desktop::LinuxCompositor`]: focus loss and pointer
+    /// exit release the grab cleanly, focus gain / pointer re-entry
+    /// re-arm it in the compositor's preferred `CursorGrabMode` order
+    /// (Hyprland/Sway/Niri/COSMIC lock first; X11 WMs and Gamescope
+    /// confine first).
+    tiling_grab_policy: crate::linux_desktop::TilingGrabPolicy,
+    /// Last `WindowEvent::DroppedFile` payload, staged for the alpha.4
+    /// `DropPayloadClassifier` wiring — recorded plus surfaced as a
+    /// localized status notice, never silently executed.
+    last_dropped_file: Option<std::path::PathBuf>,
     /// QoL container sorter armed by the `SortInventory` keybind.
     inventory_sort: InventorySortState,
     /// Launcher filesystem paths handed to every `LiveSession` this app
@@ -957,7 +975,33 @@ pub struct GpuApp {
     /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
     title_tick_accum: f32,
     ui: UiState,
-    ui_cache: UiUploadCache,
+    /// Revision bus feeding the retained UI cache: the window bumps a
+    /// `UiLayer` only when that layer's draw-list fingerprint moved, so
+    /// a chat tick never re-tessellates the container layer.
+    ui_layer_bus: megu_core::rev::UiLayerBus,
+    /// Per-layer retained tessellation cache — replaces the old
+    /// fingerprint-gated whole-list re-tessellate. See
+    /// [`UiRetainedCache`](megu_ui::retained_cache::UiRetainedCache) for
+    /// the zero-alloc/zero-upload contract.
+    ui_retained: megu_ui::retained_cache::UiRetainedCache,
+    /// Last fingerprint per `UiLayer` index — the host-side change
+    /// detector that drives `ui_layer_bus` bumps.
+    ui_layer_fps: [u64; 7],
+    /// Retained layer lists composited beside `ui_draw_list` each frame:
+    /// mod HUD (goggles, magic HUD, hotbar glint), vanilla overlay
+    /// (container, JEI sidebar, advancements, container glint) and the
+    /// mod-GUI bridge batch.
+    ui_modhud_list: UiDrawList,
+    ui_overlay_list: UiDrawList,
+    ui_modoverlay_list: UiDrawList,
+    /// Decoded vanilla `widget/*` sprite atlas re-keyed to the contract
+    /// `SpriteId` table — empty on clean-room installs (the
+    /// `vanilla_widgets` vector chrome then draws everything). Uploaded
+    /// to GPU `ui_quad` binding 5 once per JAR arrival.
+    gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas,
+    /// `true` once the JAR scan for `gui_sprite_atlas` ran — bootstrap
+    /// completion re-arms it.
+    gui_sprites_loaded: bool,
     render_config: RenderConfig,
     policy: DisplayPresentationPolicy,
     governor: FrameBudgetGovernor,
@@ -1007,6 +1051,10 @@ pub struct GpuApp {
     /// straight into `ui_draw_list`. `Default` is empty, so the hook is
     /// free until a mod host feeds it through [`Self::set_gui_bridge_batch`].
     gui_bridge_batch: GuiBridgeBatch,
+    /// Declarative mod-UI manifest (`megu_core::ui_contract::ModUiManifest`)
+    /// rendered through `client-ui`'s shared Vanilla widget kit into the
+    /// `ModOverlay` retained layer — `None` when no mod manifest is up.
+    mod_ui_manifest: Option<megu_core::ui_contract::ModUiManifest>,
     /// Monotonic epoch for time-driven 2D HUD shimmer (enchantment
     /// glint): `Instant`, never `SystemTime`, so every overlay stays
     /// deterministic under replay and headless tests.
@@ -1291,9 +1339,13 @@ impl GpuApp {
             settings_path,
             clipboard: SystemClipboard::new(),
             modifiers: ModifiersState::empty(),
-            ime_preedit: None,
+            ime_state: crate::linux_desktop::ImeCompositionState::default(),
             ime_allowed: false,
             last_ime_commit: None,
+            tiling_grab_policy: crate::linux_desktop::TilingGrabPolicy::new(
+                crate::linux_desktop::detect_compositor_from_env(),
+            ),
+            last_dropped_file: None,
             inventory_sort: InventorySortState::default(),
             session_paths,
             mod_sync_worker: None,
@@ -1321,7 +1373,14 @@ impl GpuApp {
             title_seen_rev: 0,
             title_tick_accum: 0.0,
             ui,
-            ui_cache: UiUploadCache::default(),
+            ui_layer_bus: megu_core::rev::UiLayerBus::new(),
+            ui_retained: megu_ui::retained_cache::UiRetainedCache::new(),
+            ui_layer_fps: [0; 7],
+            ui_modhud_list: UiDrawList::new(),
+            ui_overlay_list: UiDrawList::new(),
+            ui_modoverlay_list: UiDrawList::new(),
+            gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas::default(),
+            gui_sprites_loaded: false,
             render_config,
             policy,
             governor,
@@ -1339,6 +1398,7 @@ impl GpuApp {
             live_strategy_pending: true,
             ui_draw_list: UiDrawList::new(),
             gui_bridge_batch: GuiBridgeBatch::default(),
+            mod_ui_manifest: None,
             ui_anim_epoch: Instant::now(),
             particle_scratch: Vec::new(),
             live_particles_staged: false,
@@ -1417,6 +1477,31 @@ impl GpuApp {
             app.maybe_start_friend_share();
         }
         app
+    }
+
+    /// Decode the local client JAR's `widget/*` GUI sprites into
+    /// `gui_sprite_atlas` (re-keyed to the `SpriteId` contract) and push
+    /// the texture to `ui_quad` binding 5 when a renderer is live.
+    /// Clean-room hosts keep the empty atlas — `UiCommand::Sprite` then
+    /// never emits and `vanilla_widgets` draws the vector bevel chrome.
+    /// Runs once per JAR arrival (`gui_sprites_loaded` gates rescans).
+    fn load_gui_sprite_atlas(&mut self) {
+        let (jar, _mod_jars) = title_branding_sources(&self.session_paths);
+        self.gui_sprites_loaded = true;
+        let Some(jar) = jar else {
+            return;
+        };
+        let assets = crate::vanilla_gui_sprites::load_vanilla_gui_from_path(&jar, &[]);
+        let atlas = assets.build_atlas().to_gui_sprite_atlas();
+        if atlas.is_empty() {
+            return;
+        }
+        self.gui_sprite_atlas = atlas;
+        if let Some(active) = self.active.as_mut() {
+            active
+                .renderer
+                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+        }
     }
 
     /// One-shot local-Minecraft font probe: installs the shared
@@ -1557,6 +1642,10 @@ impl GpuApp {
                 // The downloaded JAR + assets may now satisfy the font
                 // probe (it stays silent while nothing local exists).
                 self.maybe_load_vanilla_fonts();
+                // …and the `widget/*` GUI sprites: decode + upload the
+                // chrome atlas now that a real JAR exists.
+                self.gui_sprites_loaded = false;
+                self.load_gui_sprite_atlas();
                 if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
                     self.ui.title_status = None;
                 }
@@ -1643,6 +1732,18 @@ impl GpuApp {
     /// before touching the draw list.
     pub fn set_gui_bridge_batch(&mut self, batch: GuiBridgeBatch) {
         self.gui_bridge_batch = batch;
+    }
+
+    /// Install (or clear) the declarative mod-UI manifest composited on
+    /// the `ModOverlay` layer each frame. The manifest is re-audited
+    /// every render by `vanilla_widgets::draw_mod_ui_manifest_sprites`
+    /// (title-screen overlay attempts are rejected upstream by
+    /// `audit_manifest`), so the host can hand it straight through.
+    pub fn set_mod_ui_manifest(
+        &mut self,
+        manifest: Option<megu_core::ui_contract::ModUiManifest>,
+    ) {
+        self.mod_ui_manifest = manifest;
     }
 
     /// The recipe/resource browser state (JEI/EMI/JER/Ponder index, tabs,
@@ -2143,6 +2244,12 @@ impl GpuApp {
                     self.status_line(format!("Guest link: {err}"));
                 }
             }
+            UiAction::Claims(action) => {
+                // The `ClaimsWorld` sync channel is not wired into the
+                // session yet — surface the overlay's request instead of
+                // dropping it silently.
+                self.status_line(format!("Claims: {action:?} (no claims-capable session)"));
+            }
             _ => {}
         }
         // Screen navigations change whether IME is allowed — settle the
@@ -2491,23 +2598,45 @@ impl GpuApp {
         }
     }
 
+    /// `(try, fallback)` grab modes for mouselook. On Linux the detected
+    /// [`crate::linux_desktop::TilingGrabPolicy`] picks the compositor's
+    /// preferred order: `Locked`→`Confined` for native Wayland
+    /// compositors (`zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`
+    /// unaccelerated raw deltas, so the invisible cursor can never hit
+    /// the window borders), `Confined`→`Locked` for X11 WMs and
+    /// Gamescope, where XI2 `DeviceEvent::MouseMotion` already delivers
+    /// unaccelerated raw deltas and pointer lock trips cursor quirks.
+    /// Other OSes keep the display-policy order (`Locked` first —
+    /// macOS/Windows raw input). The second mode is always the fallback.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn cursor_grab_order(&self) -> (CursorGrabMode, CursorGrabMode) {
+        match self.tiling_grab_policy.preferred_grabs()[0] {
+            crate::linux_desktop::PointerGrab::Locked => {
+                (CursorGrabMode::Locked, CursorGrabMode::Confined)
+            }
+            crate::linux_desktop::PointerGrab::Confined => {
+                (CursorGrabMode::Confined, CursorGrabMode::Locked)
+            }
+        }
+    }
+
+    /// Non-Linux grab order: the display policy's
+    /// `prefer_locked_pointer_first` flag (see the Unix sibling).
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    fn cursor_grab_order(&self) -> (CursorGrabMode, CursorGrabMode) {
+        if self.policy.prefer_locked_pointer_first {
+            (CursorGrabMode::Locked, CursorGrabMode::Confined)
+        } else {
+            (CursorGrabMode::Confined, CursorGrabMode::Locked)
+        }
+    }
+
     fn set_cursor_grab(&mut self, grab: bool) {
         let Some(active) = &self.active else {
             return;
         };
         if grab && !self.cursor_grabbed {
-            // The display policy picks the grab order: `Locked` first on
-            // Wayland (`zwp_locked_pointer_v1` + `zwp_relative_pointer_v1`
-            // unaccelerated raw deltas, so the invisible cursor can never
-            // hit the window borders), macOS and Windows; `Confined` first
-            // on X11, where XI2 `DeviceEvent::MouseMotion` already delivers
-            // unaccelerated raw deltas and `Locked` hits X11/RDP cursor
-            // lock quirks. The other mode is always the fallback.
-            let (first, second) = if self.policy.prefer_locked_pointer_first {
-                (CursorGrabMode::Locked, CursorGrabMode::Confined)
-            } else {
-                (CursorGrabMode::Confined, CursorGrabMode::Locked)
-            };
+            let (first, second) = self.cursor_grab_order();
             active
                 .window
                 .set_cursor_grab(first)
@@ -2585,10 +2714,28 @@ impl GpuApp {
     /// Push the current text-input state to the OS's IME: allowed while
     /// a text surface owns typing (chat bar, focused UI field, delegated
     /// search), forbidden during raw 3D gameplay so the compositor can
-    /// never hijack WASD movement keys. Only transitions reach the
-    /// window — `set_ime_allowed` is not a per-event call.
+    /// never hijack WASD movement keys. Only transitions reach
+    /// `set_ime_allowed`; while typing is live the candidate-window
+    /// anchor (`set_ime_cursor_area`) tracks whichever surface owns the
+    /// caret so Fcitx5/IBus popups land beside the input, not the
+    /// crosshair. Losing the text surface clears the tracked
+    /// composition state so a stale preedit can't corrupt the next
+    /// commit.
     fn update_ime(&mut self) {
         let allowed = self.text_input_active();
+        if allowed {
+            let area = self.ime_cursor_area();
+            if area != self.ime_state.ime_cursor_area {
+                self.ime_state.set_ime_cursor_area(area);
+                if let Some(active) = &self.active {
+                    let (x, y, w, h) = area;
+                    active.window.set_ime_cursor_area(
+                        PhysicalPosition::new(x, y),
+                        PhysicalSize::new(w, h),
+                    );
+                }
+            }
+        }
         if allowed == self.ime_allowed {
             return;
         }
@@ -2596,6 +2743,39 @@ impl GpuApp {
         if let Some(active) = &self.active {
             active.window.set_ime_allowed(allowed);
         }
+        if !allowed {
+            self.ime_state.on_disabled();
+        }
+    }
+
+    /// Physical-pixel rect the IME candidate window should hug while a
+    /// text surface owns typing: the chat input strip at the bottom-left
+    /// (mirroring `hud_widgets::chat_chrome` — EDGE=4,
+    /// ACTIONBAR_LIFT=64, CHAT_INPUT_H=10, width cap 280), the focused
+    /// widget's hit region (server address, world name/seed, FPS and
+    /// join-code fields), a mid-screen band for the sign editor, or a
+    /// bottom strip fallback so the popup never lands on the center
+    /// crosshair.
+    fn ime_cursor_area(&self) -> (i32, i32, u32, u32) {
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map(|active| (active.size.width as i32, active.size.height as i32))
+            .unwrap_or((0, 0));
+        if self.chat_bar.is_some() {
+            let box_w = 280.min((w - 8).max(40)).max(1);
+            return (4, (h - 76).max(0), box_w as u32, 10);
+        }
+        if self.ui.sign_editor.is_some() {
+            return (w / 4, h / 2, (w / 2).max(1) as u32, 12);
+        }
+        if let Some(id) = self.ui.focused() {
+            if let Some(region) = self.ui.hit_regions.iter().find(|r| r.id == id) {
+                let rect = region.rect;
+                return (rect.x, rect.y, rect.w.max(1), rect.h.max(8));
+            }
+        }
+        (4, (h - 40).max(0), 280.min(w).max(1) as u32, 12)
     }
 
     /// Route committed text — an `Ime::Commit` string, a sanitized
@@ -2736,6 +2916,71 @@ impl GpuApp {
             self.last_ime_commit = None;
         }
         echo
+    }
+
+    /// `WindowEvent::Ime` state update, factored so tests can drive it
+    /// without an `ActiveEventLoop`: transitions `ime_state` on
+    /// `Enabled`/`Preedit`/`Disabled`, and on `Commit` clears the preedit
+    /// and returns the committed string for
+    /// [`committed_text_actions`](Self::committed_text_actions) — the
+    /// same route `Key::Character` text takes, so multi-byte Japanese
+    /// output is never dropped. The commit is also latched for the
+    /// `KeyEvent.text` echo swallow. `None` means nothing to insert.
+    fn on_ime_event(&mut self, ime: Ime) -> Option<String> {
+        match ime {
+            Ime::Enabled => {
+                self.ime_state.on_enabled();
+                None
+            }
+            Ime::Disabled => {
+                self.ime_state.on_disabled();
+                None
+            }
+            Ime::Preedit(text, cursor) => {
+                self.ime_state.on_preedit(text, cursor);
+                None
+            }
+            Ime::Commit(text) => {
+                let committed = self.ime_state.on_commit(text);
+                if committed.is_empty() {
+                    None
+                } else {
+                    self.last_ime_commit = Some((committed.clone(), Instant::now()));
+                    Some(committed)
+                }
+            }
+        }
+    }
+
+    /// `WindowEvent::DroppedFile` staging hook: record the path, run the
+    /// universal payload classifier, and surface its verdict. Nothing
+    /// installs from the verdict alone — installable kinds carry a
+    /// mandatory bilingual consent prompt the UI must still show.
+    fn record_dropped_file(&mut self, path: &std::path::Path) {
+        let verdict = megu_ui::seamless_ux::DropPayloadClassifier::classify_path(path);
+        let lang = self.ui.lang();
+        self.last_dropped_file = Some(path.to_path_buf());
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        if let Some(prompt) = &verdict.prompt {
+            self.status_line(format!(
+                "{} {} {}{name}",
+                prompt.title(lang),
+                prompt.message(lang),
+                tr(lang, "Import: ", "取り込み: "),
+            ));
+        } else {
+            let reason = match &verdict.rejection {
+                Some(r) => format!("{r:?}"),
+                None => tr(lang, "unrecognized payload", "未対応のペイロード").to_owned(),
+            };
+            self.status_line(format!(
+                "{}{name}: {reason}",
+                tr(lang, "Dropped file rejected: ", "ドロップされたファイルは拒否されました: "),
+            ));
+        }
     }
 
     /// A user-visible status line for actions that can't silently no-op:
@@ -3382,6 +3627,26 @@ impl GpuApp {
             .frl_identity
             .clone()
             .ok_or_else(|| "no FRL3 identity (megu-identity.key)".to_owned())?;
+        // One-click publish goes through `friend_session`'s consent plan:
+        // the player's Friends-screen toggle is the explicit
+        // `PublishToFriends` consent, and the plan orders every transport
+        // it allows. Port mapping is not requested, so the plan is
+        // `[ProbeStunAndPunch, OpenRelayTunnel]`; the relay tunnel is the
+        // implemented step today and the plan is validated before it.
+        let policy = megu_proto::friend_session::FriendPublishPolicy::default();
+        let plan = megu_proto::friend_session::plan_publish(
+            &policy,
+            megu_proto::friend_session::PublishConsent::PublishToFriends {
+                allow_port_mapping: false,
+            },
+        )
+        .map_err(|e| format!("publish plan: {e}"))?;
+        if !plan
+            .iter()
+            .any(|step| matches!(step, megu_proto::friend_session::PublishStep::OpenRelayTunnel))
+        {
+            return Err("publish plan has no reachable transport".to_owned());
+        }
         let relay = self.friend_relay_addr()?;
         let protocol = self.config.mc_version.parse::<i32>().unwrap_or(767);
         let world = self
@@ -3771,6 +4036,21 @@ impl GpuApp {
             .with_title(WINDOW_TITLE)
             .with_inner_size(size)
             .with_resizable(true);
+        // Wayland `app_id` and X11 `WM_CLASS` share one
+        // `platform_specific.name` slot in winit 0.30, so the detected
+        // compositor picks the `(general, instance)` pair the active
+        // backend consumes — `app_id` for `.desktop`/`StartupWMClass`
+        // matching on Wayland, `WM_CLASS(STRING)` on X11.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let compositor = self.tiling_grab_policy.compositor();
+            let (general, instance) = crate::linux_desktop::window_name_hints(compositor);
+            attrs = if compositor.is_wayland() {
+                WindowAttributesExtWayland::with_name(attrs, general, instance)
+            } else {
+                WindowAttributesExtX11::with_name(attrs, general, instance)
+            };
+        }
         if self.config.fullscreen {
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -3883,6 +4163,17 @@ impl GpuApp {
         // authentic vanilla font when the host has 1.21.1 installed.
         // Silent no-op on offline hosts / CI.
         self.maybe_load_vanilla_fonts();
+        // The same JAR feeds the GUI-sprite atlas (`widget/*` chrome →
+        // `ui_quad` binding 5). First call decodes; later `init_gpu`s
+        // just re-upload the resident atlas after device/surface loss.
+        if !self.gui_sprites_loaded {
+            self.load_gui_sprite_atlas();
+        }
+        if !self.gui_sprite_atlas.is_empty() {
+            active
+                .renderer
+                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+        }
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
         // stay resident in `title_branding` for a later surface loss.
@@ -5336,6 +5627,12 @@ impl GpuApp {
         // fingerprint below feeds the same dirty-check either way.
         self.ui.render_into(w, h, &mut self.ui_draw_list);
         let draw_list = &mut self.ui_draw_list;
+        // Per-layer overlay lists: rebuilt every frame, fingerprinted
+        // below so only layers whose content actually moved bump their
+        // `UiLayer` revision (and re-tessellate).
+        self.ui_modhud_list.clear();
+        self.ui_overlay_list.clear();
+        self.ui_modoverlay_list.clear();
         // Runtime `MEGU EDITION` title branding: with the local JAR's
         // wordmark + patched edition strip GPU-resident, the banner
         // replaces the built-in wordmark text commands and the session's
@@ -5376,7 +5673,7 @@ impl GpuApp {
         );
         if let Some(live) = &self.live {
             if !live.magic.is_empty() {
-                draw_list
+                self.ui_modhud_list
                     .commands
                     .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
             }
@@ -5385,7 +5682,7 @@ impl GpuApp {
         // in-game HUD only (hidden behind menus/containers by the
         // `Screen::InGameHud` gate where `goggles_draw` was produced).
         if let Some(goggles) = goggles_draw {
-            draw_list.commands.extend(goggles.commands);
+            self.ui_modhud_list.commands.extend(goggles.commands);
         }
         // Enchantment glint shimmer over enchanted 2D slots: the same
         // `enchantment_glint_rgb` the 3D path runs, composited as a
@@ -5411,15 +5708,16 @@ impl GpuApp {
                         if let Some(cmd) =
                             enchant_glint_overlay_cmd(true, stack, rect, w, h, glint_elapsed)
                         {
-                            draw_list.commands.push(cmd);
+                            self.ui_modhud_list.commands.push(cmd);
                         }
                     }
                 }
             }
         }
-        // Server-driven container screen draws above the HUD.
+        // Server-driven container screen draws above the HUD — the
+        // `Overlay` layer in the retained cache.
         if let Some(screen) = &self.container_screen {
-            screen.render(w as f32, h as f32, draw_list);
+            screen.render(w as f32, h as f32, &mut self.ui_overlay_list);
             // JEI/EMI side overlay: bookmark column left, search+grid
             // right — only when the QoL toggle is on and both columns
             // fit without overlapping the container panel.
@@ -5427,7 +5725,7 @@ impl GpuApp {
                 let panel = screen.panel_rect(w as f32, h as f32);
                 if let Some((overlay, regions)) = self.ui.recipe_browser.render_overlay(w, h, panel)
                 {
-                    draw_list.commands.extend(overlay.commands);
+                    self.ui_overlay_list.commands.extend(overlay.commands);
                     self.recipe_overlay_regions = regions;
                 } else {
                     self.recipe_overlay_regions.clear();
@@ -5465,7 +5763,7 @@ impl GpuApp {
                                 h,
                                 glint_elapsed,
                             ) {
-                                draw_list.commands.push(cmd);
+                                self.ui_overlay_list.commands.push(cmd);
                             }
                         }
                     }
@@ -5473,24 +5771,76 @@ impl GpuApp {
             }
         }
         if self.advancements_open {
-            Self::render_advancements_overlay(self.live.as_ref(), w as i32, h as i32, draw_list);
+            Self::render_advancements_overlay(
+                self.live.as_ref(),
+                w as i32,
+                h as i32,
+                &mut self.ui_overlay_list,
+            );
         }
         // Tier-2 mod GUI bridge: the active batch lowers straight into
-        // the native list (scissor-safe inside the frame's clip), zero
-        // cost while no mod recorded ops this frame.
+        // the mod-overlay layer list (scissor-safe inside the frame's
+        // clip), zero cost while no mod recorded ops this frame.
         if !self.gui_bridge_batch.ops.is_empty() {
-            draw_list
+            self.ui_modoverlay_list
                 .commands
                 .extend(lower_bridge_batch_to_draw_cmds(&self.gui_bridge_batch, w, h));
         }
-        // Dirty-only upload: unchanged HUD frames skip even the quad
-        // tessellation; changed frames upload only the small dynamic
-        // vertex/index buffers — never a `w*h*4` CPU raster + texture
-        // write (`renderer.ui_cpu_raster_uploads` stays at zero).
-        let fingerprint = fingerprint_draw_list(w, h, draw_list);
-        if self.ui_cache.should_upload(w, h, fingerprint) {
-            let mesh = tessellate_draw_list_icons(w, h, draw_list, &self.item_icon_atlas);
-            active.renderer.update_ui_mesh(w, h, &mesh);
+        // Declarative mod-UI manifest: the shared Vanilla widget kit
+        // renders it on the same layer (Vanilla 1.21.1 sprite atlas when
+        // the client JAR supplied one, pixel-authentic bevels otherwise).
+        if let Some(manifest) = &self.mod_ui_manifest {
+            megu_ui::vanilla_widgets::draw_mod_ui_manifest_sprites(
+                &mut self.ui_modoverlay_list,
+                manifest,
+                self.ui.effective_scale(h),
+                UiRect::new(0, 0, w, h),
+                self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
+            );
+        }
+        // Retained per-layer upload: fingerprint each layer's list and
+        // bump its `UiLayer` revision only when content moved — the
+        // retained cache then re-tessellates just the dirty layers into
+        // warm buffers and uploads the single merged batch only when the
+        // composite actually differs (`renderer.ui_cpu_raster_uploads`
+        // stays at zero either way).
+        {
+            let layer_lists: [(megu_core::rev::UiLayer, &UiDrawList); 4] = [
+                (megu_core::rev::UiLayer::Screen, &self.ui_draw_list),
+                (megu_core::rev::UiLayer::ModHud, &self.ui_modhud_list),
+                (megu_core::rev::UiLayer::Overlay, &self.ui_overlay_list),
+                (megu_core::rev::UiLayer::ModOverlay, &self.ui_modoverlay_list),
+            ];
+            for (layer, list) in &layer_lists {
+                let fp = fingerprint_draw_list(w, h, list);
+                if self.ui_layer_fps[layer.index()] != fp {
+                    self.ui_layer_fps[layer.index()] = fp;
+                    layer.bump(&mut self.ui_layer_bus);
+                }
+            }
+            let dirty = self.ui_retained.begin_frame(&self.ui_layer_bus);
+            for index in dirty.iter() {
+                let Some((layer, list)) = layer_lists
+                    .iter()
+                    .find(|(layer, _)| layer.index() == index)
+                else {
+                    continue;
+                };
+                self.ui_retained.update_layer(
+                    *layer,
+                    list,
+                    w,
+                    h,
+                    &self.item_icon_atlas,
+                    &self.gui_sprite_atlas,
+                );
+            }
+            let _ = self.ui_retained.composite();
+            if self.ui_retained.gpu_upload_needed() {
+                let (vertices, indices) = self.ui_retained.composite();
+                active.renderer.update_ui_mesh_parts(w, h, vertices, indices);
+                self.ui_retained.mark_uploaded();
+            }
         }
         let mut render_camera = self.camera_controller.view_camera(&self.camera);
         // Tactile micro-motion: transient turn-roll + landing dip from
@@ -6621,6 +6971,12 @@ impl ApplicationHandler for GpuApp {
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
                 if !focused {
+                    // Tiling-WM workspace switch (Hyprland/Sway/Niri/i3):
+                    // the policy forgets the grab request, the grab and
+                    // hidden cursor release cleanly, and any live
+                    // composition state drops so a cancelled preedit can
+                    // never corrupt input on return.
+                    self.tiling_grab_policy.focus_lost();
                     self.keys = Keys::default();
                     self.modifiers = ModifiersState::empty();
                     if let Some(event) = self.input_router.release_held_keys() {
@@ -6628,32 +6984,46 @@ impl ApplicationHandler for GpuApp {
                     }
                     self.camera_controller.set_zoomed(false);
                     self.set_cursor_grab(false);
-                } else if !self.paused {
+                    self.ime_state.on_disabled();
+                } else {
+                    self.tiling_grab_policy.focus_gained();
+                    // Re-arm only while the policy agrees the pointer is
+                    // inside — tiling WMs can focus a window without
+                    // moving the pointer into it, and grabbing then
+                    // would swallow the desktop's cursor.
+                    if self.tiling_grab_policy.request_grab() {
+                        self.maybe_regrab();
+                    }
+                }
+            }
+            WindowEvent::CursorEntered { .. } => {
+                self.tiling_grab_policy.pointer_entered();
+                // Pointer re-entry onto a focused game window (tiling WM
+                // mouse-follows-focus, Alt+Tab back onto the window)
+                // re-arms the grab exactly like focus gain does.
+                if self.tiling_grab_policy.request_grab() {
                     self.maybe_regrab();
                 }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.tiling_grab_policy.pointer_left();
+                self.set_cursor_grab(false);
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.record_dropped_file(&path);
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
             }
             WindowEvent::Ime(ime) => {
-                match ime {
-                    Ime::Enabled => {}
-                    Ime::Disabled => self.ime_preedit = None,
-                    Ime::Preedit(text, _cursor) => {
-                        self.ime_preedit = if text.is_empty() { None } else { Some(text) };
-                    }
-                    Ime::Commit(text) => {
-                        // The preedit clears on commit; the composed
-                        // string feeds the active text surface exactly
-                        // once — a platform echo of the same string as
-                        // `KeyEvent.text` is swallowed downstream.
-                        self.ime_preedit = None;
-                        if !text.is_empty() {
-                            self.last_ime_commit = Some((text.clone(), Instant::now()));
-                            for action in self.committed_text_actions(&text) {
-                                self.apply_ui_action(&action, event_loop);
-                            }
-                        }
+                // The composed string routes through the same text
+                // surface as `Key::Character` input — a platform echo
+                // of the commit as `KeyEvent.text` is swallowed
+                // downstream. Preedit/cursor state is tracked in
+                // `ime_state` so cancels and focus loss stay clean.
+                if let Some(committed) = self.on_ime_event(ime) {
+                    for action in self.committed_text_actions(&committed) {
+                        self.apply_ui_action(&action, event_loop);
                     }
                 }
             }
@@ -8093,7 +8463,7 @@ mod tests {
     }
 
     #[test]
-    fn megu_default_links_wire_into_gpu_app_and_respect_show_support_links_toggle() {
+    fn megu_default_links_wire_into_gpu_app_via_about_screen() {
         // `UiState::default()` stays empty so `client-ui` default-URL tests stay intact.
         let bare = UiState::default();
         assert!(bare.website_url.is_empty());
@@ -8112,7 +8482,43 @@ mod tests {
         assert_eq!(app.ui.screen, Screen::Title);
         assert!(app.ui.settings.qol.show_support_links);
 
-        // With `show_support_links = true`, all 4 links render on Title and open Megu URLs.
+        // Vanilla-faithful title: no link row ever reaches Title, with the
+        // support-links toggle on or off — every link lives on About Megu.
+        for support in [true, false] {
+            app.ui.settings.qol.show_support_links = support;
+            let _ = app.ui.render(1280, 720);
+            for id in [
+                megu_ui::state::WidgetId::WebsiteLink,
+                megu_ui::state::WidgetId::SupportLink,
+                megu_ui::state::WidgetId::ContributeLink,
+                megu_ui::state::WidgetId::ReportLink,
+            ] {
+                assert!(
+                    !app.ui.hit_regions.iter().any(|h| h.id == id),
+                    "{id:?} must never render on Title (show_support_links={support})"
+                );
+            }
+        }
+
+        // The `?` chip navigates to About Megu where all 4 links open Megu URLs.
+        let _ = app.ui.render(1280, 720);
+        let about = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::TitleAbout)
+            .cloned()
+            .expect("expected TitleAbout chip on Title");
+        let acts = app.ui.handle_input(megu_ui::state::UiInputEvent::Click {
+            x: about.rect.x + 2,
+            y: about.rect.y + 2,
+        });
+        assert_eq!(
+            acts,
+            vec![UiAction::OpenScreen(megu_ui::state::Screen::AboutMegu)]
+        );
+        assert_eq!(app.ui.screen, megu_ui::state::Screen::AboutMegu);
+
         let _ = app.ui.render(1280, 720);
         for (id, expected) in [
             (
@@ -8138,38 +8544,13 @@ mod tests {
                 .iter()
                 .find(|h| h.id == id)
                 .cloned()
-                .expect("expected link hit region on Title when show_support_links=true");
+                .expect("expected link hit region on About Megu");
             let acts = app.ui.handle_input(megu_ui::state::UiInputEvent::Click {
                 x: hit.rect.x + 2,
                 y: hit.rect.y + 2,
             });
             assert_eq!(acts, vec![UiAction::OpenUrl(expected.to_owned())]);
         }
-
-        // With `show_support_links = false`, SupportLink and ContributeLink hide on Title.
-        app.ui.settings.qol.show_support_links = false;
-        let _ = app.ui.render(1280, 720);
-        assert!(
-            !app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::SupportLink),
-            "SupportLink must hide when show_support_links=false"
-        );
-        assert!(
-            !app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::ContributeLink),
-            "ContributeLink must hide when show_support_links=false"
-        );
-        assert!(
-            app.ui
-                .hit_regions
-                .iter()
-                .any(|h| h.id == megu_ui::state::WidgetId::ReportLink),
-            "ReportLink stays accessible even when show_support_links=false"
-        );
     }
 
     #[test]
@@ -9540,6 +9921,152 @@ mod tests {
         assert!(app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("あ"));
         assert!(!app.swallow_ime_echo("い"));
+    }
+
+    /// The `WindowEvent::Ime` state update tracks the full composition
+    /// lifecycle in `ime_state`: `Enabled`/`Preedit`/`Commit`/`Disabled`
+    /// transition deterministically, committed text is returned exactly
+    /// once for the shared text-insertion route (multi-byte Japanese
+    /// survives byte-for-byte), and an empty commit inserts nothing and
+    /// arms no echo swallow.
+    #[test]
+    fn ime_event_state_tracks_composition_and_commit() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        assert_eq!(app.on_ime_event(Ime::Enabled), None);
+        assert!(app.ime_state.active);
+
+        assert_eq!(
+            app.on_ime_event(Ime::Preedit("にほん".to_string(), Some((1, 4)))),
+            None
+        );
+        assert_eq!(app.ime_state.preedit, "にほん");
+        assert_eq!(app.ime_state.cursor_byte_range, Some((0, 3)));
+
+        // A cleared preedit arrives as an empty string.
+        assert_eq!(app.on_ime_event(Ime::Preedit(String::new(), None)), None);
+        assert_eq!(app.ime_state.preedit, "");
+
+        // Commit returns the composed string for the text surface and
+        // latches it for the `KeyEvent.text` echo swallow.
+        assert_eq!(
+            app.on_ime_event(Ime::Commit("日本".to_string())),
+            Some("日本".to_string())
+        );
+        assert_eq!(app.ime_state.preedit, "");
+        assert!(app.swallow_ime_echo("日本"));
+        assert!(!app.swallow_ime_echo("日本"));
+
+        // An empty commit inserts nothing and arms no swallow.
+        app.last_ime_commit = None;
+        assert_eq!(app.on_ime_event(Ime::Commit(String::new())), None);
+        assert!(app.last_ime_commit.is_none());
+
+        app.on_ime_event(Ime::Preedit("かな".to_string(), Some((0, 3))));
+        assert_eq!(app.on_ime_event(Ime::Disabled), None);
+        assert!(!app.ime_state.active);
+        assert_eq!(app.ime_state.preedit, "");
+    }
+
+    /// `update_ime` pushes a candidate-window anchor that tracks the
+    /// text surface: the chat strip when the chat bar is open, the
+    /// focused widget's hit region for UI fields — and dropping the
+    /// text surface clears composition state.
+    #[test]
+    fn ime_cursor_area_tracks_active_text_surface() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+
+        // No window: anchors compute from a 0-size surface but never panic.
+        app.chat_bar = Some(ZshCommandBar::new());
+        let (x, _y, w, _h) = app.ime_cursor_area();
+        assert_eq!(x, 4);
+        assert_eq!(w, 40); // minimum width clamp
+        app.chat_bar = None;
+
+        // A focused UI text field anchors to its own hit region.
+        app.dispatch_ui_action(&UiAction::OpenScreen(Screen::Multiplayer));
+        let _ = app.ui.render(1280, 720);
+        let hit = app
+            .ui
+            .hit_regions
+            .iter()
+            .find(|h| h.id == megu_ui::state::WidgetId::MultiplayerAddressField)
+            .cloned()
+            .expect("address field hit region");
+        for action in app.ui.handle_input(UiInputEvent::Click {
+            x: hit.rect.x + 2,
+            y: hit.rect.y + 2,
+        }) {
+            app.dispatch_ui_action(&action);
+        }
+        assert!(app.ui.server_address_field_active());
+        let area = app.ime_cursor_area();
+        assert_eq!(area.0, hit.rect.x);
+        assert_eq!(area.1, hit.rect.y);
+        assert_eq!(area.2, hit.rect.w);
+
+        // `update_ime` records the same anchor into `ime_state`.
+        app.update_ime();
+        assert!(app.ime_allowed);
+        assert_eq!(app.ime_state.ime_cursor_area, area);
+
+        // Leaving the text surface clears the tracked composition.
+        app.ime_state.on_enabled();
+        app.ime_state.on_preedit("かな", Some((0, 3)));
+        for action in app.ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape)) {
+            app.dispatch_ui_action(&action);
+        }
+        app.update_ime();
+        assert!(!app.ime_allowed);
+        assert!(!app.ime_state.active);
+        assert_eq!(app.ime_state.preedit, "");
+    }
+
+    /// `DroppedFile` records the payload and surfaces a non-fatal
+    /// localized status notice carrying the universal classifier's
+    /// verdict — a nonexistent path is rejected, nothing executes.
+    #[test]
+    fn dropped_file_is_recorded_and_announced() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        assert!(app.last_dropped_file.is_none());
+
+        let path = std::path::Path::new("/tmp/worlds/cool-pack.zip");
+        app.record_dropped_file(path);
+        assert_eq!(app.last_dropped_file.as_deref(), Some(path));
+        assert!(app
+            .status_messages()
+            .iter()
+            .any(|m| m.contains("cool-pack.zip") && m.contains("rejected")));
+
+        // A second drop replaces the staged payload.
+        let other = std::path::Path::new("/tmp/shader");
+        app.record_dropped_file(other);
+        assert_eq!(app.last_dropped_file.as_deref(), Some(other));
+    }
+
+    /// The grab policy is seeded from live compositor detection and the
+    /// focus/pointer transitions gate re-arming exactly like the
+    /// `Focused`/`CursorEntered` event arms do.
+    #[test]
+    fn tiling_grab_policy_tracks_focus_and_pointer_for_rearm() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        assert_eq!(
+            app.tiling_grab_policy.compositor(),
+            crate::linux_desktop::detect_compositor_from_env()
+        );
+        assert!(!app.tiling_grab_policy.should_grab());
+
+        // Pointer entry while focused arms the request; focus loss
+        // releases it; focus gain re-arms only while the pointer is
+        // still inside, and pointer exit releases again.
+        app.tiling_grab_policy.pointer_entered();
+        assert!(app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.focus_lost();
+        assert!(!app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.focus_gained();
+        assert!(app.tiling_grab_policy.request_grab());
+        app.tiling_grab_policy.pointer_left();
+        assert!(!app.tiling_grab_policy.request_grab());
     }
 
     /// `open_sign_editor` lifts into `ui.sign_editor` via

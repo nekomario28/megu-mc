@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
+use crate::perceptual_gpu_offload::GpuParticleInstance;
+
 pub const VFX1_CHANNEL: &str = "megu:vfx_v1";
 pub const MAX_VFX1_PACKET_BYTES: usize = 64 * 1024;
 pub const MAX_VFX1_COMMANDS: usize = 64;
@@ -287,6 +289,23 @@ pub struct ParticleDraw {
     pub orientation: ParticleOrientation,
     pub size: f32,
     pub rgba: Rgba,
+}
+
+impl ParticleDraw {
+    /// Pack into the 16-byte [`GpuParticleInstance`] the GPU-offload
+    /// particle path uploads: `pos`/`velocity` quantize exactly as the
+    /// shader-side decode expects, `rgba` becomes both the tint and the
+    /// fade byte, and `phase`/`flags` are caller-chosen shader seeds.
+    pub fn gpu_instance(&self, phase: u8, flags: u8) -> GpuParticleInstance {
+        let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let tint = [
+            channel(self.rgba[0]),
+            channel(self.rgba[1]),
+            channel(self.rgba[2]),
+            channel(self.rgba[3]),
+        ];
+        GpuParticleInstance::pack(self.pos, self.velocity, tint, tint[3], phase, flags)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

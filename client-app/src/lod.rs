@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use megu_client_mesh::{summarize_column, LodCell, SectionView, LOD_COARSE, LOD_FINE};
+use megu_core::lz4::{compress_block, decompress_block};
 
 /// Distance tier for one chunk column, measured in Chebyshev chunk units
 /// from the camera column.
@@ -66,7 +67,12 @@ impl Default for LodConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LodStats {
     pub stored_columns: usize,
+    /// Resident entry metadata plus compressed payload capacity.
     pub memory_bytes: usize,
+    pub uncompressed_bytes: usize,
+    pub compressed_bytes: usize,
+    /// Compression ratio scaled by 1000 (`2500` means 2.5x).
+    pub compression_ratio_milli: usize,
     pub evictions: u64,
     pub fine_drawn: usize,
     pub coarse_drawn: usize,
@@ -101,14 +107,42 @@ const LOD_V1_HEADER: usize = 16;
 const LOD_V1_CELL_BYTES: usize = 11;
 
 struct LodEntry {
-    /// Fine-resolution cells (`LOD_FINE * LOD_FINE`); coarse cells are
-    /// derived on demand by [`LodManager::coarse_cells`].
-    cells: Vec<LodCell>,
+    /// LZ4 block containing the fine-resolution cells in the stable 11-byte
+    /// wire representation. Decoded cells are materialized only on demand.
+    compressed_cells: Vec<u8>,
+    uncompressed_bytes: usize,
     last_tick: u64,
 }
 
 fn entry_bytes(entry: &LodEntry) -> usize {
-    std::mem::size_of::<LodEntry>() + entry.cells.capacity() * std::mem::size_of::<LodCell>()
+    std::mem::size_of::<LodEntry>() + entry.compressed_cells.capacity()
+}
+
+fn encode_cells(cells: &[LodCell]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(cells.len() * 11);
+    for cell in cells {
+        bytes.extend_from_slice(&cell.state_id.to_le_bytes());
+        bytes.extend_from_slice(&cell.tint.to_le_bytes());
+        bytes.extend_from_slice(&cell.top_y.to_le_bytes());
+        bytes.push(cell.light);
+    }
+    bytes
+}
+
+fn decode_cells(bytes: &[u8]) -> Vec<LodCell> {
+    bytes
+        .as_chunks::<11>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let mut cell = LodCell::EMPTY;
+            cell.state_id = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            cell.tint = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            cell.top_y = i16::from_le_bytes([chunk[8], chunk[9]]);
+            cell.light = chunk[10];
+            cell
+        })
+        .collect()
 }
 
 fn chebyshev(camera: (i32, i32), cx: i32, cz: i32) -> i64 {
@@ -182,9 +216,25 @@ impl LodManager {
     }
 
     pub fn stats(&self) -> LodStats {
+        let uncompressed_bytes = self
+            .entries
+            .values()
+            .map(|entry| entry.uncompressed_bytes)
+            .sum();
+        let compressed_bytes = self
+            .entries
+            .values()
+            .map(|entry| entry.compressed_cells.len())
+            .sum();
         LodStats {
             stored_columns: self.entries.len(),
             memory_bytes: self.memory_bytes,
+            uncompressed_bytes,
+            compressed_bytes,
+            compression_ratio_milli: uncompressed_bytes
+                .saturating_mul(1000)
+                .checked_div(compressed_bytes)
+                .unwrap_or(0),
             evictions: self.evictions,
             fine_drawn: self.fine_drawn,
             coarse_drawn: self.coarse_drawn,
@@ -196,6 +246,24 @@ impl LodManager {
     /// passed to [`LodManager::active_lod_columns`] (or (0, 0) before then).
     pub fn tier_for(&self, cx: i32, cz: i32) -> LodTier {
         self.tier_at(self.camera, cx, cz)
+    }
+
+    /// Far-horizon ring a column beyond `coarse_lod_radius` falls into,
+    /// measured from the last camera position. The summarized-column
+    /// store stops at the coarse radius; every `LodTier::Culled` column
+    /// past it is drawn by the direct-sampled [`crate::far_direct_lod`]
+    /// rings, classified by the same Chebyshev chunk distance. Columns
+    /// still inside the summarized radii return `None`.
+    pub fn far_ring_for(
+        &self,
+        cx: i32,
+        cz: i32,
+    ) -> Option<crate::far_direct_lod::LodRingLevel> {
+        let distance = chebyshev(self.camera, cx, cz);
+        if distance <= i64::from(self.config.coarse_lod_radius) {
+            return None;
+        }
+        crate::far_direct_lod::LodRingLevel::for_distance(distance as u32)
     }
 
     fn tier_at(&self, camera: (i32, i32), cx: i32, cz: i32) -> LodTier {
@@ -219,21 +287,18 @@ impl LodManager {
     pub fn insert_column(&mut self, cx: i32, cz: i32, views: &[SectionView<'_>]) -> bool {
         self.tick += 1;
         let tick = self.tick;
-        if let Some(entry) = self.entries.get_mut(&(cx, cz)) {
-            entry.cells.clear();
-            entry.cells.resize(LOD_FINE * LOD_FINE, LodCell::EMPTY);
-            summarize_column(views, LOD_FINE, &mut entry.cells);
-            entry.last_tick = tick;
-        } else {
-            let mut cells = vec![LodCell::EMPTY; LOD_FINE * LOD_FINE];
-            summarize_column(views, LOD_FINE, &mut cells);
-            let entry = LodEntry {
-                cells,
-                last_tick: tick,
-            };
-            self.memory_bytes += entry_bytes(&entry);
-            self.entries.insert((cx, cz), entry);
+        let mut cells = vec![LodCell::EMPTY; LOD_FINE * LOD_FINE];
+        summarize_column(views, LOD_FINE, &mut cells);
+        let encoded = encode_cells(&cells);
+        let entry = LodEntry {
+            compressed_cells: compress_block(&encoded),
+            uncompressed_bytes: encoded.len(),
+            last_tick: tick,
+        };
+        if let Some(old) = self.entries.insert((cx, cz), entry) {
+            self.memory_bytes -= entry_bytes(&old);
         }
+        self.memory_bytes += entry_bytes(self.entries.get(&(cx, cz)).expect("inserted entry"));
         self.evict_over_budget();
         self.entries.contains_key(&(cx, cz))
     }
@@ -254,15 +319,20 @@ impl LodManager {
         self.entries.contains_key(&(cx, cz))
     }
 
-    /// Fine-resolution cells for a stored column.
-    pub fn fine_cells(&self, cx: i32, cz: i32) -> Option<&[LodCell]> {
-        self.entries.get(&(cx, cz)).map(|e| e.cells.as_slice())
+    /// Fine-resolution cells for a stored column, decoded on demand.
+    pub fn fine_cells(&self, cx: i32, cz: i32) -> Option<Vec<LodCell>> {
+        let entry = self.entries.get(&(cx, cz))?;
+        let bytes = decompress_block(&entry.compressed_cells, entry.uncompressed_bytes).ok()?;
+        if bytes.len() != entry.uncompressed_bytes || bytes.len() % 11 != 0 {
+            return None;
+        }
+        Some(decode_cells(&bytes))
     }
 
     /// Coarse-resolution cells for a stored column, derived from the fine
     /// summary on demand.
     pub fn coarse_cells(&self, cx: i32, cz: i32) -> Option<[LodCell; LOD_COARSE * LOD_COARSE]> {
-        self.entries.get(&(cx, cz)).map(|e| coarse_cells(&e.cells))
+        self.fine_cells(cx, cz).map(|cells| coarse_cells(&cells))
     }
 
     /// Columns that should be drawn as LOD this frame, sorted by ascending
@@ -520,7 +590,10 @@ mod tests {
         // Fine cells agree with a direct fine summary too.
         let mut fine_expected = vec![LodCell::EMPTY; LOD_FINE * LOD_FINE];
         summarize_column(&views, LOD_FINE, &mut fine_expected);
-        assert_eq!(lod.fine_cells(4, -2).unwrap(), fine_expected.as_slice());
+        assert_eq!(
+            lod.fine_cells(4, -2).unwrap().as_slice(),
+            fine_expected.as_slice()
+        );
     }
 
     #[test]
@@ -566,6 +639,44 @@ mod tests {
         assert!(!tiny.insert_column(0, 0, &views));
         assert_eq!(tiny.stats().stored_columns, 0);
         assert!(tiny.stats().memory_bytes < one_entry);
+    }
+
+    #[test]
+    fn compressed_lod_tiles_round_trip_and_report_resident_ratio() {
+        let mut section = Section::filled(Block::AIR, Light::new(0, 15));
+        for z in 0..16 {
+            for x in 0..16 {
+                let height = 2 + (x * 5 + z * 7) % 12;
+                let state = 1 + ((x + z * 3) % 4) as u32;
+                section.set(
+                    x,
+                    height,
+                    z,
+                    Block::opaque_cube(state),
+                    Light::new((x % 16) as u8, (z % 16) as u8),
+                );
+            }
+        }
+        let views = [section.view()];
+        let mut lod = LodManager::new(LodConfig {
+            max_memory_bytes: 64 * 1024,
+            ..LodConfig::default()
+        });
+        for x in 0..24 {
+            assert!(lod.insert_column(x, 40, &views));
+        }
+        let cells = lod.fine_cells(7, 40).unwrap();
+        assert!(cells.iter().any(|cell| cell.state_id != 0));
+        let stats = lod.stats();
+        println!(
+            "LOD fixture: {} raw -> {} compressed bytes ({:.3}x)",
+            stats.uncompressed_bytes,
+            stats.compressed_bytes,
+            stats.compression_ratio_milli as f64 / 1000.0
+        );
+        assert!(stats.memory_bytes <= lod.config().max_memory_bytes);
+        assert!(stats.compressed_bytes < stats.uncompressed_bytes);
+        assert!(stats.compression_ratio_milli > 1_000);
     }
 
     #[test]

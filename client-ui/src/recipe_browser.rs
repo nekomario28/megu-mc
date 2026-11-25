@@ -36,12 +36,16 @@
 //! [`RecipeBrowserAction`]s the embedding application performs. Pure
 //! `std` — no GPU resources, no I/O, no external crates.
 
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 use megu_core::math::Mth;
+use megu_core::search_index::{SearchDocId, SearchHit, TrigramIndex};
 
 use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
+use crate::jei_emi_overlay;
+use crate::recipe_search;
 use crate::state::{tr, GamepadButton, UiInputEvent, UiKey, UiLang};
 
 // ---------------------------------------------------------------------------
@@ -749,7 +753,7 @@ impl FuelEntry {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct RecipeIndex {
     pub items: Vec<ItemEntry>,
     pub recipes: Vec<Recipe>,
@@ -766,11 +770,152 @@ pub struct RecipeIndex {
     /// registered namespace becomes a declared
     /// [`RecipeCategory::CustomModCategory`] on load.
     custom_namespaces: Vec<(String, String, String)>,
+    /// Character-trigram shortlist over every field
+    /// `item_text_score` can match: English + every localized name
+    /// (raw, kana-folded and romaji-folded), id, mod, tags and
+    /// tooltips. For a positive text token its `query` hits are a
+    /// strict superset of the items the exact scorer accepts (a
+    /// substring's trigrams are a subset of its field's trigrams;
+    /// `score_field` also covers prefix/subsequence matches), so the
+    /// per-item gate keeps results identical while the full-catalog
+    /// scan is skipped. `RefCell` because `TrigramIndex::query`
+    /// reuses internal scratch (`&mut`) while
+    /// [`RecipeBrowserState::visible_items`] is a `&self` API.
+    text_trigram: RefCell<TrigramIndex>,
+    /// Fingerprint [`Self::search_fingerprint`] the trigram index was
+    /// built against — `None` until first build. The fingerprint
+    /// hashes every scored byte, so mutation through the `pub` fields
+    /// (direct `items` pushes, in-place renames, lang merges) can
+    /// never serve a stale shortlist.
+    text_trigram_fp: Cell<Option<u64>>,
+}
+
+/// `TrigramIndex` has no `Clone` — the clone keeps the catalog and
+/// lazily rebuilds the shortlist on first search.
+impl Clone for RecipeIndex {
+    fn clone(&self) -> Self {
+        Self {
+            items: self.items.clone(),
+            recipes: self.recipes.clone(),
+            mob_drops: self.mob_drops.clone(),
+            ore_distributions: self.ore_distributions.clone(),
+            villager_trades: self.villager_trades.clone(),
+            dungeon_loot: self.dungeon_loot.clone(),
+            enchant_compat: self.enchant_compat.clone(),
+            fuels: self.fuels.clone(),
+            custom_categories: self.custom_categories.clone(),
+            custom_namespaces: self.custom_namespaces.clone(),
+            text_trigram: RefCell::new(TrigramIndex::new()),
+            text_trigram_fp: Cell::new(None),
+        }
+    }
+}
+
+/// Every field `item_text_score` can score, as index documents:
+/// English + each localized name (raw lowercase, kana-folded and
+/// romaji-folded — the same transforms the search fallback applies),
+/// id, mod, tags and tooltips.
+fn search_doc_fields(item: &ItemEntry) -> Vec<String> {
+    let mut fields = vec![
+        item.display_name.to_lowercase(),
+        item.id.to_lowercase(),
+        item.mod_id.to_lowercase(),
+    ];
+    for tag in &item.tags {
+        fields.push(tag.to_lowercase());
+    }
+    for line in &item.tooltip_lines {
+        fields.push(line.to_lowercase());
+    }
+    for name in item.localized_names.values() {
+        let lc = name.to_lowercase();
+        let folded = recipe_search::normalize_kana(&lc);
+        let romaji = recipe_search::glide_fold(&recipe_search::kana_to_romaji(&folded));
+        fields.push(lc);
+        fields.push(folded);
+        if !romaji.is_empty() {
+            fields.push(romaji);
+        }
+    }
+    fields
 }
 
 impl RecipeIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// FNV-1a over every byte `item_text_score` can score. Compared
+    /// against [`Self::text_trigram_fp`] to decide whether the trigram
+    /// shortlist is still fresh — hashing the field bytes themselves
+    /// (not just lengths) means even in-place `pub`-field edits are
+    /// detected.
+    fn search_fingerprint(&self) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut mix = |s: &str| {
+            for &b in s.as_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= 0xff;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        for item in &self.items {
+            mix(&item.id);
+            mix(&item.display_name);
+            mix(&item.mod_id);
+            for tag in &item.tags {
+                mix(tag);
+            }
+            for line in &item.tooltip_lines {
+                mix(line);
+            }
+            for (locale, name) in &item.localized_names {
+                mix(locale);
+                mix(name);
+            }
+        }
+        h
+    }
+
+    /// Build the trigram shortlist when the catalog moved since the
+    /// last build (or it was never built). No-op when fresh.
+    fn ensure_text_index(&self) {
+        let fp = self.search_fingerprint();
+        if self.text_trigram_fp.get() == Some(fp) {
+            return;
+        }
+        let mut index = TrigramIndex::new();
+        for (i, item) in self.items.iter().enumerate() {
+            let fields = search_doc_fields(item);
+            if let Some((primary, aliases)) = fields.split_first() {
+                index.add_document(SearchDocId(i as u32), primary, aliases);
+            }
+        }
+        *self.text_trigram.borrow_mut() = index;
+        self.text_trigram_fp.set(Some(fp));
+    }
+
+    /// Item indices the trigram shortlist admits for `token` — the
+    /// union of hits for the token itself plus every
+    /// [`recipe_search::query_variants`] expansion, so the kana/romaji
+    /// fallback in `item_text_score` stays inside the candidate set.
+    /// Always a superset of the token's true match set.
+    fn text_candidates(&self, token: &str, out_ids: &mut Vec<u32>) {
+        self.ensure_text_index();
+        let index = &mut *self.text_trigram.borrow_mut();
+        let mut hits: Vec<SearchHit> = Vec::new();
+        // `query` clears `out` on every call — drain into `out_ids`
+        // after each probe or earlier results are lost.
+        index.query(token, usize::MAX, &mut hits);
+        out_ids.extend(hits.iter().map(|hit| hit.doc.0));
+        for variant in recipe_search::query_variants(token) {
+            if variant.is_empty() {
+                continue;
+            }
+            index.query(&variant, usize::MAX, &mut hits);
+            out_ids.extend(hits.iter().map(|hit| hit.doc.0));
+        }
     }
 
     pub fn add_item(&mut self, entry: ItemEntry) {
@@ -2466,13 +2611,59 @@ impl RecipeBrowserState {
     /// alphabetical display order.
     pub fn visible_items(&self) -> Vec<usize> {
         let clauses = parse_query(&self.search);
+        // Positive Text tokens prefilter each clause through the
+        // trigram shortlist: an item outside a token's candidate set
+        // cannot satisfy `item_text_score` (the set is a proven
+        // superset), so the exact per-item gate only runs on plausible
+        // survivors. Negated and non-text tokens don't restrict the
+        // set — `token_matches`/`token_blocked` still decide them.
+        let n = self.index.items.len();
+        let clause_cands: Vec<Option<Vec<bool>>> = clauses
+            .iter()
+            .map(|clause| {
+                let mut cand: Option<Vec<bool>> = None;
+                let mut ids: Vec<u32> = Vec::new();
+                for token in clause {
+                    let QueryToken::Text(t) = token else {
+                        continue;
+                    };
+                    if t.is_empty() {
+                        continue;
+                    }
+                    ids.clear();
+                    self.index.text_candidates(t, &mut ids);
+                    match &mut cand {
+                        None => {
+                            let mut bits = vec![false; n];
+                            for &i in &ids {
+                                bits[i as usize] = true;
+                            }
+                            cand = Some(bits);
+                        }
+                        Some(bits) => {
+                            let mut keep = vec![false; n];
+                            for &i in &ids {
+                                keep[i as usize] = true;
+                            }
+                            for (b, k) in bits.iter_mut().zip(keep) {
+                                *b &= k;
+                            }
+                        }
+                    }
+                }
+                cand
+            })
+            .collect();
         let mut scored: Vec<(usize, u32)> = Vec::with_capacity(self.index.items.len());
         'items: for (index, item) in self.index.items.iter().enumerate() {
             if !self.craftable_check(item) {
                 continue;
             }
             let mut best_clause_score = None;
-            for clause in &clauses {
+            for (ci, clause) in clauses.iter().enumerate() {
+                if clause_cands[ci].as_ref().is_some_and(|bits| !bits[index]) {
+                    continue;
+                }
                 if clause
                     .iter()
                     .any(|t| self.token_blocked(item, t) || !self.token_matches(item, t))
@@ -3098,6 +3289,38 @@ impl RecipeBrowserState {
         for line in &item.tooltip_lines {
             best = best.max(field_rank(token, &line.to_lowercase()).map(|r| r * 10 + 1));
         }
+        // Japanese-aware fallback shared with `recipe_search`: the token
+        // expands through `query_variants` (romaji→kana, kana→romaji,
+        // glide-folded spellings) and is matched against the localized
+        // name's normalized forms, so `daia`, `ダイヤ` and `だいあ` all
+        // reach the same entry even when its display name is kanji or
+        // the typed spelling drifts (`daiya`/`diya`).
+        if best.is_none() {
+            let mut fields: Vec<&str> = Vec::with_capacity(2);
+            if let Some(local) = item.localized_names.get(&self.active_locale) {
+                fields.push(local);
+            }
+            if let Some(ja) = item.localized_names.get("ja_jp") {
+                if !fields.contains(&ja.as_str()) {
+                    fields.push(ja);
+                }
+            }
+            'outer: for variant in recipe_search::query_variants(token) {
+                if variant.is_empty() {
+                    continue;
+                }
+                for field in &fields {
+                    let folded = recipe_search::normalize_kana(&field.to_lowercase());
+                    let romaji = recipe_search::glide_fold(&recipe_search::kana_to_romaji(&folded));
+                    if folded.contains(&variant)
+                        || (!romaji.is_empty() && romaji.contains(&variant))
+                    {
+                        best = Some(4);
+                        break 'outer;
+                    }
+                }
+            }
+        }
         best
     }
 }
@@ -3495,73 +3718,46 @@ impl RecipeBrowserState {
             return;
         };
         let s = lay.s.max(1);
-        let (mx, my) = (mx / s, my / s);
         let entry = self.index.item(&item_id);
         let local_name = self
             .index
             .display_name_for_locale(&item_id, &self.active_locale);
-        let mut lines: Vec<(String, UiColor)> = vec![(local_name.clone(), palette::TEXT)];
+        // The classic purple-bordered JEI tooltip — shared verbatim with
+        // `jei_emi_overlay` so an item hover looks identical on the full
+        // browser and the native container overlay.
+        let mut item = jei_emi_overlay::OverlayItem::new(
+            &item_id,
+            &local_name,
+            entry.map(|e| e.mod_id.as_str()).unwrap_or("minecraft"),
+        );
         if let Some(e) = entry {
+            item.tags = e.tags.clone();
             if e.display_name != local_name {
-                lines.push((e.display_name.clone(), palette::TEXT_DIM));
-            }
-            lines.push((format!("@{}", e.mod_id), palette::AIR));
-            if !e.tags.is_empty() {
-                let tags = e
-                    .tags
-                    .iter()
-                    .take(3)
-                    .map(|t| format!("#{t}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let tags = if e.tags.len() > 3 {
-                    format!("{tags} +{}", e.tags.len() - 3)
-                } else {
-                    tags
-                };
-                lines.push((tags, palette::TEXT_DIM));
+                item.info_lines.push(e.display_name.clone());
             }
         }
         let have = self.inventory.get(&item_id).copied().unwrap_or(0);
         if have > 0 {
-            lines.push((
-                format!("{} x{have}", tr(lang, "In inventory", "所持")),
-                UiColor::rgb(120, 220, 120),
-            ));
+            item.info_lines
+                .push(format!("{} x{have}", tr(lang, "In inventory", "所持")));
         }
-        lines.push((
+        item.info_lines.push(
             tr(
                 lang,
                 "R: recipes  U: uses  A: bookmark",
                 "R: レシピ  U: 用途  A: 登録",
             )
             .to_owned(),
-            palette::TEXT_DIM,
-        ));
-        let w = lines
-            .iter()
-            .map(|(t, _)| crate::draw::text_width(t, 1) as i32)
-            .max()
-            .unwrap_or(0)
-            + 8;
-        let h = lines.len() as i32 * 10 + 6;
-        let tx = (mx + 10).min((lay.w - w - 2).max(0));
-        let ty = (my + 8).min((lay.h - h - 2).max(0));
-        let rect = UiRect::new(tx, ty, w.max(0) as u32, h.max(0) as u32);
-        lay.fill_rect(rect, UiColor::rgba(16, 16, 24, 244));
-        lay.border_rect(rect, UiColor::rgb(70, 60, 110));
-        let mut ty = rect.y + 3;
-        for (line, color) in lines {
-            lay.text_fit(
-                rect.x + 4,
-                ty,
-                1,
-                color,
-                &line,
-                ((rect.w as i32 - 8) / 8).max(1) as usize,
-            );
-            ty += 10;
-        }
+        );
+        jei_emi_overlay::render_item_tooltip(
+            &mut lay.list,
+            lay.w * s,
+            lay.h * s,
+            (mx, my),
+            &item,
+            false,
+            s,
+        );
     }
 
     fn render_header(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {

@@ -2224,6 +2224,25 @@ pub enum GamepadButton {
     Start,
 }
 
+/// Translate a [`crate::gamepad`] engine button into the nav-level
+/// [`GamepadButton`] of [`UiInputEvent::GamepadPressed`]. `None` for
+/// buttons with no UI navigation role (stick clicks, triggers,
+/// shoulders, `Guide`, `West`/`North` face — those still flip
+/// [`UiState::input_mode`] to gamepad via the engine's own event feed).
+pub fn nav_button(btn: crate::gamepad::GamepadButton) -> Option<GamepadButton> {
+    use crate::gamepad::GamepadButton as G;
+    Some(match btn {
+        G::DpadUp => GamepadButton::DpadUp,
+        G::DpadDown => GamepadButton::DpadDown,
+        G::DpadLeft => GamepadButton::DpadLeft,
+        G::DpadRight => GamepadButton::DpadRight,
+        G::South => GamepadButton::South,
+        G::East => GamepadButton::East,
+        G::Start => GamepadButton::Start,
+        _ => return None,
+    })
+}
+
 /// One device-agnostic input event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiInputEvent {
@@ -2391,6 +2410,11 @@ pub enum UiAction {
     /// The recipe & resource browser produced a host action (crafting
     /// grid transfer). `Close` is flattened into [`UiAction::Back`].
     RecipeBrowser(crate::recipe_browser::RecipeBrowserAction),
+    /// The claim-map overlay asks the host to run a claims operation
+    /// (`claim`/`unclaim`/`SetPlayerPermission`/`RevokePlayer`) on the
+    /// `ClaimsWorld` channel. `Close` is flattened into an internal
+    /// overlay close and never reaches the host.
+    Claims(crate::claims_ui::ClaimsUiAction),
     /// Player cycled the crafting-conflict switcher; the new candidate
     /// is `hud.crafting_conflict.selected_index`.
     CycleCraftingConflict,
@@ -2408,6 +2432,11 @@ pub enum WidgetId {
     TitleMods,
     TitleSettings,
     TitleQuit,
+    /// 1-click EN/JA flip — vanilla's globe-button chip on the title
+    /// bottom row.
+    TitleLanguage,
+    /// `?` chip on the title bottom row — opens [`Screen::AboutMegu`].
+    TitleAbout,
     WebsiteLink,
     SupportLink,
     ContributeLink,
@@ -3095,6 +3124,19 @@ pub struct UiState {
     /// `Some`, the HUD composites the 4-line editor overlay and the host
     /// routes all keyboard/IME/clipboard input into it.
     pub sign_editor: Option<crate::sign_and_chat::SignEditorState>,
+    /// Claim-map overlay (OpenPAC/FTB-Chunks style): while `Some` it
+    /// composites over the current screen and owns all input — its
+    /// [`crate::claims_ui::ClaimsUiAction`]s surface to the host as
+    /// [`UiAction::Claims`]. The host fills chunk/roster data from the
+    /// `ClaimsWorld` sync feed and opens/closes it on the map keybind.
+    pub claims_ui: Option<crate::claims_ui::ClaimsUiState>,
+    /// Which input family owns the UI right now — keyboard/mouse vs
+    /// controller — fed by [`handle_input`](Self::handle_input) through
+    /// the `gamepad` engine's tracker. Prompts stay keyboard/mouse until
+    /// the first real pad activity arrives.
+    pub input_mode: crate::gamepad::InputModeTracker,
+    /// Last mouse position, for motion-delta source switching.
+    last_mouse: Option<(i32, i32)>,
     /// Death-screen data the live session fills on `player_combat_kill` /
     /// `set_health(<=0)`; rendered while [`Screen::Death`] is up.
     pub death: crate::death_screen::DeathScreenState,
@@ -3104,6 +3146,11 @@ pub struct UiState {
     /// [`Screen::Singleplayer`] so errors never fail silently; the HUD
     /// shows the same text through `hud.chat_lines` in game.
     pub title_status: Option<String>,
+    /// `true` while the host composites the rotating 1.21.1 panorama
+    /// behind the Title screen — `title()` then skips its opaque menu
+    /// gradient so the 3D backdrop shows through (`false` = painted
+    /// fallback, e.g. headless).
+    pub title_panorama_active: bool,
     /// The [`Screen::Singleplayer`] world select & create state.
     pub singleplayer: SingleplayerState,
     /// The [`Screen::Multiplayer`] server select & direct-connect state.
@@ -3118,13 +3165,13 @@ pub struct UiState {
     /// `true` after the report was submitted once (button disables).
     pub crash_sent: bool,
 
-    /// Optional quiet corner link on the title screen — hidden when empty.
+    /// Optional link on the About screen — hidden when empty.
     pub support_url: String,
-    /// Optional project website, shown on Title and About when configured.
+    /// Optional project website, shown on About when configured.
     pub website_url: String,
-    /// Optional quiet corner link on the title screen — hidden when empty.
+    /// Optional link on the About screen — hidden when empty.
     pub contribute_url: String,
-    /// Optional bug report URL on Title and Pause, hidden while empty.
+    /// Optional bug report URL on About and Pause, hidden while empty.
     pub report_url: String,
     /// Current shaderpack display name, or empty for vanilla rendering.
     pub active_shaderpack_name: String,
@@ -3201,8 +3248,12 @@ impl Default for UiState {
             mod_sync_decision: None,
             hud: HudState::default(),
             sign_editor: None,
+            claims_ui: None,
+            input_mode: crate::gamepad::InputModeTracker::default(),
+            last_mouse: None,
             death: crate::death_screen::DeathScreenState::default(),
             title_status: None,
+            title_panorama_active: false,
             singleplayer: SingleplayerState::default(),
             multiplayer: MultiplayerScreenState::default(),
             friends: FriendsScreenState::default(),
@@ -3510,6 +3561,12 @@ impl UiState {
         // The sign-edit session composites over whatever screen is up —
         // the server owns its open/close lifecycle, not the nav stack.
         layout::layout_sign_editor(self, width, height, out);
+        // The claim-map overlay composites over everything else too —
+        // the host owns its open/close lifecycle (map keybind, sync loss).
+        if let Some(claims) = &self.claims_ui {
+            let (list, _regions) = claims.render(width, height);
+            out.commands.extend(list.commands);
+        }
         layout::layout_toast_stack(self, width, height, out);
         self.hit_regions = regions;
         if let Some(i) = self.focus_index {
@@ -3703,6 +3760,39 @@ impl UiState {
 
     /// Route one input event; returns the actions the app must perform.
     pub fn handle_input(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
+        // Input-source tracking runs first so prompt glyphs switch the
+        // instant the device family changes (whichever produced the last
+        // event wins; small mouse jitter never flips the mode).
+        match &ev {
+            UiInputEvent::MouseMove { x, y } => {
+                let (dx, dy) = self
+                    .last_mouse
+                    .map_or((0.0, 0.0), |(lx, ly)| {
+                        ((*x - lx) as f32, (*y - ly) as f32)
+                    });
+                self.last_mouse = Some((*x, *y));
+                self.input_mode.on_mouse_motion(dx, dy);
+            }
+            UiInputEvent::Click { .. } => {
+                self.input_mode.on_mouse_button();
+            }
+            UiInputEvent::KeyPressed(_) | UiInputEvent::CharTyped(_) => {
+                self.input_mode.on_keyboard_input();
+            }
+            UiInputEvent::GamepadPressed(_) => {
+                self.input_mode.on_gamepad_input();
+            }
+        }
+        // The claim-map overlay owns all input while open — its actions
+        // translate to [`UiAction::Claims`] (or close internally).
+        if self.claims_ui.is_some() {
+            let actions = self
+                .claims_ui
+                .as_mut()
+                .map(|claims| claims.handle_input(ev, self.render_w, self.render_h))
+                .unwrap_or_default();
+            return self.apply_claims_actions(actions);
+        }
         // Embedded screens own their hit-testing, search focus, and
         // scroll state — while one is up (and no modal blocks it) the
         // raw event is forwarded verbatim and its actions are translated
@@ -3740,6 +3830,37 @@ impl UiState {
                 GamepadButton::East | GamepadButton::Start => self.handle_key(UiKey::Escape),
             },
         }
+    }
+
+    /// Bridge from the [`crate::gamepad`] engine: feed one physical
+    /// button press edge. The press always flips
+    /// [`UiState::input_mode`] to gamepad; buttons with a UI navigation
+    /// role ([`nav_button`]) are then routed as
+    /// [`UiInputEvent::GamepadPressed`] and produce their usual actions.
+    /// `Start` still opens the pause/back path — D-pad hold-repeat stays
+    /// with the engine's own `FocusJumped` feed.
+    pub fn on_gamepad_button(&mut self, btn: crate::gamepad::GamepadButton) -> Vec<UiAction> {
+        self.input_mode.on_gamepad_input();
+        nav_button(btn)
+            .map(|nav| self.handle_input(UiInputEvent::GamepadPressed(nav)))
+            .unwrap_or_default()
+    }
+
+    /// Map the claim-map overlay's actions onto [`UiAction`]s —
+    /// `Close` is handled internally, everything else reaches the host.
+    fn apply_claims_actions(
+        &mut self,
+        actions: Vec<crate::claims_ui::ClaimsUiAction>,
+    ) -> Vec<UiAction> {
+        let mut out = Vec::with_capacity(actions.len());
+        for action in actions {
+            if action == crate::claims_ui::ClaimsUiAction::Close {
+                self.claims_ui = None;
+            } else {
+                out.push(UiAction::Claims(action));
+            }
+        }
+        out
     }
 
     /// Forward `ev` into [`crate::mod_menu::ModMenuState`] and map its
@@ -4272,6 +4393,21 @@ impl UiState {
                 vec![UiAction::OpenScreen(s)]
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
+            WidgetId::TitleLanguage => {
+                // Vanilla-globe 1-click flip between the two resolved UI
+                // languages.
+                let next = if self.lang() == UiLang::Ja {
+                    BuiltinLocale::EnUs
+                } else {
+                    BuiltinLocale::JaJp
+                };
+                self.set_locale(next);
+                vec![UiAction::SettingsChanged]
+            }
+            WidgetId::TitleAbout => {
+                self.navigate(Screen::AboutMegu);
+                vec![UiAction::OpenScreen(Screen::AboutMegu)]
+            }
 
             WidgetId::SingleplayerWorld(i) => match self.singleplayer.worlds.get(i) {
                 Some(name) => vec![UiAction::PlayWorld {
@@ -5480,6 +5616,7 @@ mod sign_editor_overlay_tests {
                     crate::draw::UiCommand::FillRect { rect, .. }
                     | crate::draw::UiCommand::BorderRect { rect, .. }
                     | crate::draw::UiCommand::ItemIcon { rect, .. }
+                    | crate::draw::UiCommand::Sprite { rect, .. }
                     | crate::draw::UiCommand::ProgressBar { rect, .. } => {
                         assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
                         assert!(

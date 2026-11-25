@@ -105,35 +105,102 @@ impl UiColor {
             f32::from(self.a) / 255.0,
         ]
     }
+
+    /// Lossless copy of a canonical [`megu_core::ui_contract::Rgba8`]
+    /// token — the single conversion point that keeps `client-ui` and
+    /// `megu-core` sharing one exact color truth.
+    pub const fn from_rgba8(c: megu_core::ui_contract::Rgba8) -> Self {
+        Self::rgba(c.r, c.g, c.b, c.a)
+    }
 }
 
-/// Common UI palette, chosen once so every screen agrees.
+/// Common UI palette, derived once from the canonical
+/// [`megu_core::ui_contract::VANILLA_1_21_1`] token table so every
+/// screen — vanilla, Megu UX, or mod manifest — agrees on the same
+/// Minecraft 1.21.1 chrome. Entries not covered by the contract (HUD
+/// vitals) keep their measured vanilla colors as literals.
 pub mod palette {
     use super::UiColor;
+    use megu_core::ui_contract::VANILLA_1_21_1 as V;
 
-    pub const BACKGROUND_TOP: UiColor = UiColor::rgb(24, 26, 32);
-    pub const BACKGROUND_BOTTOM: UiColor = UiColor::rgb(13, 14, 18);
-    pub const PANEL: UiColor = UiColor::rgba(30, 33, 42, 235);
-    pub const PANEL_BORDER: UiColor = UiColor::rgb(80, 88, 110);
-    pub const BUTTON: UiColor = UiColor::rgb(58, 62, 76);
-    pub const BUTTON_HOVER: UiColor = UiColor::rgb(84, 96, 130);
-    pub const BUTTON_DISABLED: UiColor = UiColor::rgb(38, 40, 48);
-    pub const BUTTON_BORDER: UiColor = UiColor::rgb(14, 15, 20);
-    pub const BUTTON_BORDER_HOVER: UiColor = UiColor::rgb(215, 225, 255);
-    pub const TEXT: UiColor = UiColor::rgb(238, 238, 238);
-    pub const TEXT_DIM: UiColor = UiColor::rgb(160, 165, 178);
-    pub const TEXT_DARK: UiColor = UiColor::rgb(40, 42, 50);
-    pub const ACCENT: UiColor = UiColor::rgb(84, 170, 90);
-    pub const DANGER: UiColor = UiColor::rgb(190, 60, 55);
-    pub const WARNING: UiColor = UiColor::rgb(230, 180, 60);
-    pub const HEALTH: UiColor = UiColor::rgb(210, 45, 45);
+    /// Menu-blur scrim behind screens (`rgba(16,16,16,192)`), top of the
+    /// screen backdrop. Vanilla's backdrop is the blur+dirt composite;
+    /// the flat fallback is the scrim.
+    pub const BACKGROUND_TOP: UiColor = UiColor::from_rgba8(V.scrim);
+    /// See [`BACKGROUND_TOP`].
+    pub const BACKGROUND_BOTTOM: UiColor = UiColor::from_rgba8(V.scrim);
+    /// Panel face — the flat stone-gray field `#C6C6C6`.
+    pub const PANEL: UiColor = UiColor::from_rgba8(V.panel_face);
+    /// Panel top/left bevel — lit edge `#FFFFFF`.
+    pub const PANEL_BEVEL_LIGHT: UiColor = UiColor::from_rgba8(V.panel_bevel_light);
+    /// Panel bottom/right bevel — shaded edge `#555555`.
+    pub const PANEL_BEVEL_DARK: UiColor = UiColor::from_rgba8(V.panel_bevel_dark);
+    /// Crisp 1px panel outline `#000000`.
+    pub const PANEL_BORDER: UiColor = UiColor::from_rgba8(V.panel_outline);
+    /// Stone button face, normal state `#6F6F6F`.
+    pub const BUTTON: UiColor = UiColor::from_rgba8(V.button_face);
+    /// Button top/left bevel `#A6A6A6`.
+    pub const BUTTON_BEVEL_LIGHT: UiColor = UiColor::from_rgba8(V.button_bevel_light);
+    /// Button bottom/right bevel `#484848`.
+    pub const BUTTON_BEVEL_DARK: UiColor = UiColor::from_rgba8(V.button_bevel_dark);
+    /// Clean-room hover face `#7E88A8`.
+    pub const BUTTON_HOVER: UiColor = UiColor::from_rgba8(V.button_hover_face);
+    /// Disabled button face `#3A3A3A`.
+    pub const BUTTON_DISABLED: UiColor = UiColor::from_rgba8(V.button_disabled_face);
+    /// Disabled button label `#A0A0A0`.
+    pub const BUTTON_DISABLED_TEXT: UiColor = UiColor::from_rgba8(V.button_disabled_text);
+    /// 1px crisp button outline `#000000`.
+    pub const BUTTON_BORDER: UiColor = UiColor::from_rgba8(V.panel_outline);
+    /// Crisp `#FFFFFF` highlight border around a focused button's label.
+    pub const BUTTON_BORDER_HOVER: UiColor = UiColor::from_rgba8(V.button_highlight_border);
+    /// Recessed inventory slot face `#8B8B8B`.
+    pub const SLOT: UiColor = UiColor::from_rgba8(V.slot_face);
+    /// Slot recessed shadow (top/left) `#373737`.
+    pub const SLOT_INNER_DARK: UiColor = UiColor::from_rgba8(V.slot_inner_bevel_dark);
+    /// Slot recessed light edge (bottom/right) `#FFFFFF`.
+    pub const SLOT_INNER_LIGHT: UiColor = UiColor::from_rgba8(V.slot_inner_bevel_light);
+    /// Slot hover highlight wash `rgba(255,255,255,128)`.
+    pub const SLOT_HOVER: UiColor = UiColor::from_rgba8(V.slot_hover_highlight);
+    /// Classic tooltip background `rgba(16,0,16,240)`.
+    pub const TOOLTIP_BG: UiColor = UiColor::from_rgba8(V.tooltip_background);
+    /// Tooltip frame gradient top `rgba(80,0,255,80)`.
+    pub const TOOLTIP_FRAME_TOP: UiColor = UiColor::from_rgba8(V.tooltip_border_top);
+    /// Tooltip frame gradient bottom `rgba(40,0,127,80)`.
+    pub const TOOLTIP_FRAME_BOTTOM: UiColor =
+        UiColor::from_rgba8(V.tooltip_border_bottom);
+    /// Primary light text `#FFFFFF`.
+    pub const TEXT: UiColor = UiColor::from_rgba8(V.text_light);
+    /// Light-text 1px drop shadow `#3F3F3F`.
+    pub const TEXT_SHADOW: UiColor = UiColor::from_rgba8(V.text_shadow);
+    /// Muted/secondary text `#A0A0A0`.
+    pub const TEXT_DIM: UiColor = UiColor::from_rgba8(V.text_muted);
+    /// Focused/hovered control label `#FFFFA0`.
+    pub const TEXT_FOCUSED: UiColor = UiColor::from_rgba8(V.text_focused);
+    /// Container-panel shadowless dark text `#404040`.
+    pub const TEXT_DARK: UiColor = UiColor::from_rgba8(V.text_dark);
+    /// Positive/accept text `#55FF55`.
+    pub const ACCENT: UiColor = UiColor::from_rgba8(V.text_positive);
+    /// Danger/error text `#FF5555`.
+    pub const DANGER: UiColor = UiColor::from_rgba8(V.text_danger);
+    /// Warning text `#FFFF55`.
+    pub const WARNING: UiColor = UiColor::from_rgba8(V.text_warning);
+    /// Header/footer separator tint `rgba(255,255,255,48)`.
+    pub const SEPARATOR: UiColor = UiColor::from_rgba8(V.separator);
+    /// Vanilla heart red (HUD vital, outside the chrome contract).
+    pub const HEALTH: UiColor = UiColor::rgb(234, 42, 36);
+    /// Vanilla absorption-heart gold.
     pub const ABSORPTION: UiColor = UiColor::rgb(235, 190, 60);
+    /// Vanilla armor-slot steel grey.
     pub const ARMOR: UiColor = UiColor::rgb(170, 180, 190);
+    /// Vanilla hunger drumstick brown.
     pub const HUNGER: UiColor = UiColor::rgb(150, 90, 40);
+    /// Vanilla XP-bar green.
     pub const XP: UiColor = UiColor::rgb(125, 220, 45);
+    /// Vanilla air-bubble blue.
     pub const AIR: UiColor = UiColor::rgb(60, 150, 230);
-    pub const SLOT: UiColor = UiColor::rgba(20, 20, 24, 190);
-    pub const OVERLAY_DIM: UiColor = UiColor::rgba(8, 8, 12, 170);
+    /// Menu-blur scrim behind overlays — same token as
+    /// [`BACKGROUND_TOP`].
+    pub const OVERLAY_DIM: UiColor = UiColor::from_rgba8(V.scrim);
 }
 
 /// One recorded draw operation. Text positions are the *top-left* of the
@@ -171,6 +238,15 @@ pub enum UiCommand {
     /// samples the atlas; every other path — and unknown ids — paints the
     /// deterministic swatch + monogram, so a slot is never invisible.
     ItemIcon { rect: UiRect, item_id: String },
+    /// A 9-slice-capable GUI sprite sampled from the [`GuiSpriteAtlas`]
+    /// texture (e.g. vanilla `widget/button`). `sprite` is a canonical
+    /// [`megu_core::ui_contract::SpriteId`]; hosts without vanilla assets
+    /// never emit this command — the widget kit draws pixel-authentic
+    /// vector chrome instead — and a missing atlas entry paints nothing.
+    Sprite {
+        rect: UiRect,
+        sprite: megu_core::ui_contract::SpriteId,
+    },
 }
 
 /// An ordered list of 2D commands; painting is back-to-front.
@@ -278,6 +354,12 @@ impl UiDrawList {
             back,
             border,
         });
+    }
+
+    /// Queue one GUI sprite resolved through the host's
+    /// [`GuiSpriteAtlas`] — see [`UiCommand::Sprite`].
+    pub fn sprite(&mut self, rect: UiRect, sprite: megu_core::ui_contract::SpriteId) {
+        self.push(UiCommand::Sprite { rect, sprite });
     }
 
     /// Item icon slot (see [`UiCommand::ItemIcon`]). `id` is the
@@ -1009,6 +1091,83 @@ impl ItemIconAtlasBuilder {
     }
 }
 
+/// One GUI sprite's placement inside [`GuiSpriteAtlas`]: normalized UVs
+/// of the sprite rect plus its pixel size and effective 9-slice border
+/// (source px, `[left, top, right, bottom]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GuiSpriteEntry {
+    /// `[u_min, v_min]` normalized to atlas dimensions.
+    pub uv_min: [f32; 2],
+    /// `[u_max, v_max]` normalized to atlas dimensions.
+    pub uv_max: [f32; 2],
+    /// Sprite pixel width.
+    pub width: u32,
+    /// Sprite pixel height.
+    pub height: u32,
+    /// 9-slice unstretched border `[left, top, right, bottom]` in source
+    /// px; all zeros when the sprite stretches whole.
+    pub nine_slice_border: [u32; 4],
+}
+
+/// Packed RGBA8 GUI-sprite atlas plus the `SpriteId → entry` lookup the
+/// tessellator resolves [`UiCommand::Sprite`] against. `client-gpu`
+/// builds one from decoded vanilla `widget/*` sprites and uploads
+/// `rgba` once; every other consumer (clean-room, mod manifests, tests)
+/// either reuses it or emits the vector chrome fallback instead.
+#[derive(Clone, Debug, Default)]
+pub struct GuiSpriteAtlas {
+    /// Atlas pixel width.
+    pub width: u32,
+    /// Atlas pixel height.
+    pub height: u32,
+    /// Tightly packed `width*height*4` RGBA8.
+    pub rgba: Vec<u8>,
+    /// `SpriteId` (as `u8`) → placement.
+    entries: std::collections::BTreeMap<u8, GuiSpriteEntry>,
+}
+
+impl GuiSpriteAtlas {
+    /// Atlas entry for `sprite`, if one was packed.
+    pub fn entry(&self, sprite: megu_core::ui_contract::SpriteId) -> Option<&GuiSpriteEntry> {
+        self.entries.get(&(sprite as u8))
+    }
+
+    /// `true` when `sprite` has a packed entry — the check the widget
+    /// kit runs before emitting [`UiCommand::Sprite`] over vector
+    /// chrome.
+    pub fn has(&self, sprite: megu_core::ui_contract::SpriteId) -> bool {
+        self.entries.contains_key(&(sprite as u8))
+    }
+
+    /// Number of packed sprites.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` when nothing was packed (every sprite falls back).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Rebuild the atlas from already-packed `entries` over an existing
+    /// texture image — the shape `client-gpu`'s
+    /// `VanillaGuiAtlas → GuiSpriteAtlas` conversion produces (the RGBA
+    /// moves across so the GPU upload owns the only copy).
+    pub fn from_packed(
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        entries: Vec<(megu_core::ui_contract::SpriteId, GuiSpriteEntry)>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            rgba,
+            entries: entries.into_iter().map(|(id, e)| (id as u8, e)).collect(),
+        }
+    }
+}
+
 /// Deterministic swatch + monogram fallback for an `ItemIcon` with no
 /// atlas entry — identical hashing to `item_color` in `recipe_browser`
 /// so both code paths paint the same color for the same id.
@@ -1086,6 +1245,8 @@ struct VsIn {
     @location(1) uv       : vec2<f32>,
     @location(2) color    : vec4<f32>,
 };
+@group(0) @binding(5) var sprite_tex : texture_2d<f32>;
+
 struct VsOut {
     @builtin(position) clip : vec4<f32>,
     @location(0) uv         : vec2<f32>,
@@ -1107,8 +1268,13 @@ fn vs_main(in : VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
-    // Item-icon quads carry u = icon_u - 2.0 (see UiMesh::icon_quad);
-    // font/fill quads always keep u >= 0.
+    // GUI-sprite quads carry u = sprite_u - 4.0 and item-icon quads
+    // carry u = icon_u - 2.0 (see sprite_quad/icon_quad); font/fill
+    // quads always keep u >= 0.
+    if (in.uv.x < -3.0) {
+        let texel = textureSample(sprite_tex, icon_smp, vec2<f32>(in.uv.x + 4.0, in.uv.y));
+        return in.color * texel;
+    }
     if (in.uv.x < -1.0) {
         let texel = textureSample(icon_tex, icon_smp, vec2<f32>(in.uv.x + 2.0, in.uv.y));
         return in.color * texel;
@@ -1118,69 +1284,198 @@ fn fs_main(in : VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-impl UiMesh {
-    fn quad(&mut self, rect: UiRect, uv: [f32; 4], color: UiColor) {
-        let base = self.vertices.len() as u32;
-        let (l, t) = (rect.x as f32, rect.y as f32);
-        let (r, b) = (rect.right() as f32, rect.bottom() as f32);
-        let c = color.as_f32();
-        // TL, BL, BR, TR — matches the index order below.
-        self.vertices.extend_from_slice(&[
-            UiVertex {
-                position: [l, t],
-                uv: [uv[0], uv[1]],
-                color: c,
-            },
-            UiVertex {
-                position: [l, b],
-                uv: [uv[0], uv[3]],
-                color: c,
-            },
-            UiVertex {
-                position: [r, b],
-                uv: [uv[2], uv[3]],
-                color: c,
-            },
-            UiVertex {
-                position: [r, t],
-                uv: [uv[2], uv[1]],
-                color: c,
-            },
+/// One axis-aligned quad appended to `(vertices, indices)` — TL, BL,
+/// BR, TR vertex order matching the shared index pattern.
+fn push_ui_quad(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    uv: [f32; 4],
+    color: UiColor,
+) {
+    let base = vertices.len() as u32;
+    let (l, t) = (rect.x as f32, rect.y as f32);
+    let (r, b) = (rect.right() as f32, rect.bottom() as f32);
+    let c = color.as_f32();
+    vertices.extend_from_slice(&[
+        UiVertex {
+            position: [l, t],
+            uv: [uv[0], uv[1]],
+            color: c,
+        },
+        UiVertex {
+            position: [l, b],
+            uv: [uv[0], uv[3]],
+            color: c,
+        },
+        UiVertex {
+            position: [r, b],
+            uv: [uv[2], uv[3]],
+            color: c,
+        },
+        UiVertex {
+            position: [r, t],
+            uv: [uv[2], uv[1]],
+            color: c,
+        },
+    ]);
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// A quad sampling the item-icon texture: `u` is biased by `-2.0`
+/// into `[-2.0, -1.0]` — the range real font uvs never reach — so
+/// `fs_main` switches textures per fragment.
+fn push_icon_quad(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    uv: [f32; 4],
+) {
+    push_ui_quad(
+        vertices,
+        indices,
+        rect,
+        [uv[0] - 2.0, uv[1], uv[2] - 2.0, uv[3]],
+        UiColor::rgb(255, 255, 255),
+    );
+}
+
+/// A quad sampling the GUI-sprite atlas texture: `u` is biased by
+/// `-4.0` into `[-4.0, -3.0]`, disjoint from both the font range and
+/// the icon range.
+fn push_sprite_quad(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    uv: [f32; 4],
+) {
+    push_ui_quad(
+        vertices,
+        indices,
+        rect,
+        [uv[0] - 4.0, uv[1], uv[2] - 4.0, uv[3]],
+        UiColor::rgb(255, 255, 255),
+    );
+}
+
+fn push_ui_border(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    color: UiColor,
+    thickness: u32,
+) {
+    let uv = tile_uv(WHITE_TILE_INDEX);
+    let t = thickness.min(rect.w.min(rect.h)) as i32;
+    if t <= 0 {
+        return;
+    }
+    push_ui_quad(vertices, indices, UiRect::new(rect.x, rect.y, rect.w, t as u32), uv, color);
+    push_ui_quad(
+        vertices,
+        indices,
+        UiRect::new(rect.x, rect.bottom() - t, rect.w, t as u32),
+        uv,
+        color,
+    );
+    let inner_h = rect.h.saturating_sub(2 * t as u32);
+    push_ui_quad(
+        vertices,
+        indices,
+        UiRect::new(rect.x, rect.y + t, t as u32, inner_h),
+        uv,
+        color,
+    );
+    push_ui_quad(
+        vertices,
+        indices,
+        UiRect::new(rect.right() - t, rect.y + t, t as u32, inner_h),
+        uv,
+        color,
+    );
+}
+
+/// Emit `entry`'s sprite into `rect`, splitting into up to nine quads
+/// when `entry.nine_slice_border` is nonzero (corners keep their full
+/// source texel span; when `rect` cannot fit both borders of an axis
+/// they shrink uniformly so the quads still tile it exactly). The same
+/// 9-slice math `client-gpu`'s `tessellate_nine_slice` performs,
+/// emitted straight into the retained buffers — zero allocation.
+fn emit_gui_sprite(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    entry: &GuiSpriteEntry,
+) {
+    let [l, t, r, b] = [
+        rect.x as f32,
+        rect.y as f32,
+        rect.right() as f32,
+        rect.bottom() as f32,
+    ];
+    let (w, h) = (r - l, b - t);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    let border = entry.nine_slice_border;
+    if border == [0; 4] {
+        push_sprite_quad(vertices, indices, rect, [
+            entry.uv_min[0],
+            entry.uv_min[1],
+            entry.uv_max[0],
+            entry.uv_max[1],
         ]);
-        self.indices
-            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        return;
     }
-
-    /// A quad sampling the item-icon texture: `u` is biased by `-2.0`
-    /// into `[-2.0, -1.0]` — the range real font uvs never reach — so
-    /// `fs_main` switches textures per fragment.
-    fn icon_quad(&mut self, rect: UiRect, uv: [f32; 4]) {
-        self.quad(
-            rect,
-            [uv[0] - 2.0, uv[1], uv[2] - 2.0, uv[3]],
-            UiColor::rgb(255, 255, 255),
-        );
-    }
-
-    fn border(&mut self, rect: UiRect, color: UiColor, thickness: u32) {
-        let uv = tile_uv(WHITE_TILE_INDEX);
-        let t = thickness.min(rect.w.min(rect.h)) as i32;
-        if t <= 0 {
-            return;
+    let src_w = entry.width.max(1) as f32;
+    let src_h = entry.height.max(1) as f32;
+    let du = entry.uv_max[0] - entry.uv_min[0];
+    let dv = entry.uv_max[1] - entry.uv_min[1];
+    let scale_x = if border[0] + border[2] > 0 {
+        (w / (border[0] + border[2]) as f32).min(1.0)
+    } else {
+        1.0
+    };
+    let scale_y = if border[1] + border[3] > 0 {
+        (h / (border[1] + border[3]) as f32).min(1.0)
+    } else {
+        1.0
+    };
+    let dl = border[0] as f32 * scale_x;
+    let dr = border[2] as f32 * scale_x;
+    let dt = border[1] as f32 * scale_y;
+    let db = border[3] as f32 * scale_y;
+    let px = [l, l + dl, r - dr, r];
+    let py = [t, t + dt, b - db, b];
+    let pu = [
+        entry.uv_min[0],
+        entry.uv_min[0] + du * (border[0] as f32 / src_w),
+        entry.uv_max[0] - du * (border[2] as f32 / src_w),
+        entry.uv_max[0],
+    ];
+    let pv = [
+        entry.uv_min[1],
+        entry.uv_min[1] + dv * (border[1] as f32 / src_h),
+        entry.uv_max[1] - dv * (border[3] as f32 / src_h),
+        entry.uv_max[1],
+    ];
+    for row in 0..3 {
+        let (qy, qh) = (py[row], py[row + 1] - py[row]);
+        if qh <= 0.0 {
+            continue;
         }
-        self.quad(UiRect::new(rect.x, rect.y, rect.w, t as u32), uv, color);
-        self.quad(
-            UiRect::new(rect.x, rect.bottom() - t, rect.w, t as u32),
-            uv,
-            color,
-        );
-        let inner_h = rect.h.saturating_sub(2 * t as u32);
-        self.quad(UiRect::new(rect.x, rect.y + t, t as u32, inner_h), uv, color);
-        self.quad(
-            UiRect::new(rect.right() - t, rect.y + t, t as u32, inner_h),
-            uv,
-            color,
-        );
+        for col in 0..3 {
+            let (qx, qw) = (px[col], px[col + 1] - px[col]);
+            if qw <= 0.0 {
+                continue;
+            }
+            push_sprite_quad(
+                vertices,
+                indices,
+                UiRect::new(qx as i32, qy as i32, qw as u32, qh as u32),
+                [pu[col], pv[row], pu[col + 1], pv[row + 1]],
+            );
+        }
     }
 }
 
@@ -1191,8 +1486,32 @@ impl UiMesh {
 /// [`UiCommand::ItemIcon`] paints its swatch+monogram fallback; hosts
 /// with a JAR-built [`ItemIconAtlas`] call
 /// [`tessellate_draw_list_icons`] for real item sprites.
-pub fn tessellate_draw_list(_width: u32, _height: u32, list: &UiDrawList) -> UiMesh {
-    tessellate_draw_list_icons(_width, _height, list, &ItemIconAtlas::default())
+pub fn tessellate_draw_list(width: u32, height: u32, list: &UiDrawList) -> UiMesh {
+    let mut mesh = UiMesh::default();
+    tessellate_draw_list_into(list, width, height, &mut mesh.vertices, &mut mesh.indices);
+    mesh
+}
+
+/// [`tessellate_draw_list`] filling caller-owned buffers: `vertices`
+/// and `indices` are `.clear()`ed and repopulated, so a host that keeps
+/// them warm performs **zero heap allocations** on steady-state
+/// rebuilds — the retained-cache fast path.
+pub fn tessellate_draw_list_into(
+    list: &UiDrawList,
+    viewport_w: u32,
+    viewport_h: u32,
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+) {
+    tessellate_draw_list_full_into(
+        list,
+        viewport_w,
+        viewport_h,
+        &ItemIconAtlas::default(),
+        &GuiSpriteAtlas::default(),
+        vertices,
+        indices,
+    );
 }
 
 /// [`tessellate_draw_list`] with an [`ItemIconAtlas`]: `ItemIcon`
@@ -1200,24 +1519,93 @@ pub fn tessellate_draw_list(_width: u32, _height: u32, list: &UiDrawList) -> UiM
 /// texture (`uv.x = icon_u - 2.0` sentinel the WGSL branches on);
 /// unknown ids keep the deterministic swatch + monogram fallback.
 pub fn tessellate_draw_list_icons(
-    _width: u32,
-    _height: u32,
+    width: u32,
+    height: u32,
     list: &UiDrawList,
     icons: &ItemIconAtlas,
 ) -> UiMesh {
     let mut mesh = UiMesh::default();
+    tessellate_draw_list_icons_into(
+        list,
+        width,
+        height,
+        icons,
+        &mut mesh.vertices,
+        &mut mesh.indices,
+    );
+    mesh
+}
+
+/// [`tessellate_draw_list_icons`] filling caller-owned buffers (see
+/// [`tessellate_draw_list_into`]).
+pub fn tessellate_draw_list_icons_into(
+    list: &UiDrawList,
+    viewport_w: u32,
+    viewport_h: u32,
+    icons: &ItemIconAtlas,
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+) {
+    tessellate_draw_list_full_into(
+        list,
+        viewport_w,
+        viewport_h,
+        icons,
+        &GuiSpriteAtlas::default(),
+        vertices,
+        indices,
+    );
+}
+
+/// The full-atlas [`tessellate_draw_list`]: `ItemIcon` resolves against
+/// `icons`, `Sprite` against `sprites` (a missing sprite entry emits
+/// nothing — the widget kit guards before queueing it), everything else
+/// matches the atlas-free path.
+pub fn tessellate_draw_list_full(
+    width: u32,
+    height: u32,
+    list: &UiDrawList,
+    icons: &ItemIconAtlas,
+    sprites: &GuiSpriteAtlas,
+) -> UiMesh {
+    let mut mesh = UiMesh::default();
+    tessellate_draw_list_full_into(
+        list,
+        width,
+        height,
+        icons,
+        sprites,
+        &mut mesh.vertices,
+        &mut mesh.indices,
+    );
+    mesh
+}
+
+/// [`tessellate_draw_list_full`] filling caller-owned buffers (see
+/// [`tessellate_draw_list_into`]).
+pub fn tessellate_draw_list_full_into(
+    list: &UiDrawList,
+    _viewport_w: u32,
+    _viewport_h: u32,
+    icons: &ItemIconAtlas,
+    sprites: &GuiSpriteAtlas,
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+) {
+    vertices.clear();
+    indices.clear();
     let white = tile_uv(WHITE_TILE_INDEX);
     for cmd in &list.commands {
         match cmd {
             UiCommand::FillRect { rect, color } => {
-                mesh.quad(*rect, white, *color);
+                push_ui_quad(vertices, indices, *rect, white, *color);
             }
             UiCommand::BorderRect {
                 rect,
                 color,
                 thickness,
             } => {
-                mesh.border(*rect, *color, *thickness);
+                push_ui_border(vertices, indices, *rect, *color, *thickness);
             }
             UiCommand::Text {
                 x,
@@ -1251,7 +1639,7 @@ pub fn tessellate_draw_list_icons(
                                 for (row, bits) in bits.iter().enumerate() {
                                     for col in 0..8u32 {
                                         if (bits & (0x80 >> col)) != 0 {
-                                            mesh.quad(
+                                            push_ui_quad(vertices, indices, 
                                                 UiRect::new(
                                                     cx + col as i32 * *scale as i32,
                                                     cy + row as i32 * *scale as i32,
@@ -1272,7 +1660,7 @@ pub fn tessellate_draw_list_icons(
                             for dy in 0..cell {
                                 for dx in 0..adv {
                                     if scaled_unifont_lit(&g, dx, dy, adv, cell) {
-                                        mesh.quad(
+                                        push_ui_quad(vertices, indices, 
                                             UiRect::new(cx + dx as i32, cy + dy as i32, 1, 1),
                                             white,
                                             *color,
@@ -1289,18 +1677,18 @@ pub fn tessellate_draw_list_icons(
                                 // columns: each 8-px tile paints into half
                                 // the advance so strokes compress, never clip.
                                 let half = adv / 2;
-                                mesh.quad(
+                                push_ui_quad(vertices, indices, 
                                     UiRect::new(cx, cy, half, cell),
                                     tile_uv(base),
                                     *color,
                                 );
-                                mesh.quad(
+                                push_ui_quad(vertices, indices, 
                                     UiRect::new(cx + half as i32, cy, adv - half, cell),
                                     tile_uv(base + 1),
                                     *color,
                                 );
                             } else {
-                                mesh.quad(
+                                push_ui_quad(vertices, indices, 
                                     UiRect::new(cx, cy, cell, cell),
                                     tile_uv(base),
                                     *color,
@@ -1318,37 +1706,48 @@ pub fn tessellate_draw_list_icons(
                 back,
                 border,
             } => {
-                mesh.border(*rect, *border, 1);
+                push_ui_border(vertices, indices, *rect, *border, 1);
                 let inner = inset(*rect, 1);
-                mesh.quad(inner, white, *back);
+                push_ui_quad(vertices, indices, inner, white, *back);
                 let fw = (inner.w as f32 * fraction.clamp(0.0, 1.0)) as u32;
                 if fw > 0 {
-                    mesh.quad(UiRect::new(inner.x, inner.y, fw, inner.h), white, *fill);
+                    push_ui_quad(vertices, indices, UiRect::new(inner.x, inner.y, fw, inner.h), white, *fill);
                 }
             }
             UiCommand::ItemIcon { rect, item_id } => {
                 if let Some(uv) = icons.uv(item_id) {
-                    mesh.icon_quad(*rect, uv);
+                    push_icon_quad(vertices, indices, *rect, uv);
                 } else {
-                    icon_fallback_quads(&mut mesh, *rect, item_id);
+                    icon_fallback_quads(vertices, indices, *rect, item_id);
+                }
+            }
+            UiCommand::Sprite { rect, sprite } => {
+                if let Some(entry) = sprites.entry(*sprite) {
+                    emit_gui_sprite(vertices, indices, *rect, entry);
                 }
             }
         }
     }
-    mesh
 }
 
 /// Swatch + monogram fallback quads for an unmapped `ItemIcon` — the
 /// same look the software rasterizer produces so both paths agree.
-fn icon_fallback_quads(mesh: &mut UiMesh, rect: UiRect, item_id: &str) {
+fn icon_fallback_quads(
+    vertices: &mut Vec<UiVertex>,
+    indices: &mut Vec<u32>,
+    rect: UiRect,
+    item_id: &str,
+) {
     let (color, letter) = icon_fallback(item_id);
-    mesh.quad(rect, tile_uv(WHITE_TILE_INDEX), color);
+    push_ui_quad(vertices, indices, rect, tile_uv(WHITE_TILE_INDEX), color);
     if letter != ' ' {
         let scale = (rect.w.min(rect.h) / GLYPH_SIZE).max(1);
         let cell = GLYPH_SIZE * scale;
         let cx = rect.x + ((rect.w as i32 - cell as i32) / 2).max(0);
         let cy = rect.y + ((rect.h as i32 - cell as i32) / 2).max(0);
-        mesh.quad(
+        push_ui_quad(
+            vertices,
+            indices,
             UiRect::new(cx, cy, cell, cell),
             tile_uv(glyph_index(letter)),
             UiColor::rgb(30, 30, 34),
@@ -1585,6 +1984,11 @@ pub fn rasterize_draw_list(width: u32, height: u32, list: &UiDrawList) -> Vec<u8
                         let cy = rect.y + ((rect.h as i32 - cell) / 2).max(0);
                         frame.text(cx, cy, scale, UiColor::rgb(30, 30, 34), &letter.to_string());
                     }
+                }
+                UiCommand::Sprite { rect, .. } => {
+                    // Software path has no sprite atlas either: the
+                    // panel-face fill keeps the widget's bounds visible.
+                    frame.fill(*rect, palette::PANEL);
                 }
             }
         }

@@ -3727,7 +3727,10 @@ pub struct AudioMixThread {
     telemetry: Arc<AudioMixTelemetry>,
     shutdown: Arc<AtomicBool>,
     /// `Some` in manual mode until `start` moves it onto the OS thread.
-    core: Option<AudioMixCore>,
+    /// Boxed so the ~90 KiB mix state crosses the spawn channel as a
+    /// pointer — a by-value `mpsc::send` would copy the core through
+    /// several nested frames and can overflow a small test-thread stack.
+    core: Option<Box<AudioMixCore>>,
     handle: Option<JoinHandle<()>>,
     sink_label: &'static str,
     period: Duration,
@@ -3753,7 +3756,7 @@ impl AudioMixThread {
             ring: Arc::new(AudioCmdRing::new(AUDIO_CMD_RING_CAPACITY)),
             telemetry: Arc::new(AudioMixTelemetry::default()),
             shutdown: Arc::new(AtomicBool::new(false)),
-            core: Some(AudioMixCore::new(sink, opts)),
+            core: Some(Box::new(AudioMixCore::new(sink, opts))),
             handle: None,
             sink_label,
             period: Duration::from_secs_f64(
@@ -3773,16 +3776,18 @@ impl AudioMixThread {
         let telemetry = self.telemetry.clone();
         let shutdown = self.shutdown.clone();
         let period = self.period;
-        // One-shot handoff: the core reaches the OS thread only after a
-        // successful spawn — a failed spawn keeps it for manual mode.
-        let (tx, rx) = std::sync::mpsc::channel::<AudioMixCore>();
+        // One-shot handoff: the boxed core reaches the OS thread only
+        // after a successful spawn — a failed spawn keeps it for manual
+        // mode. The box keeps the ~90 KiB core off both stacks: only the
+        // pointer traverses the channel.
+        let (tx, rx) = std::sync::mpsc::channel::<Box<AudioMixCore>>();
         match std::thread::Builder::new()
             .name("megu-audio-mix".to_string())
             .spawn(move || {
                 let Ok(mut core) = rx.recv() else {
                     return;
                 };
-                Self::run(&mut core, &ring, &telemetry, &shutdown, period);
+                Self::run(core.as_mut(), &ring, &telemetry, &shutdown, period);
             }) {
             Ok(handle) => {
                 let _ = tx.send(core);

@@ -1883,6 +1883,10 @@ struct CompletedSectionGeometry {
 /// vertices sit in the shared vertex arena plus the section-local opaque
 /// index spans per direction bucket. No index data is retained — the
 /// canonical [`QUAD_INDEX_PATTERN`] stream maps every quad positionally.
+/// `Copy` lets the GPU-indirect repack stage `(coord, slot)` tuples in a
+/// retained scratch `Vec` instead of re-collecting map borrows per miss
+/// (AUDIT-2 H6).
+#[derive(Clone, Copy)]
 struct ArenaSlot {
     /// First vertex of the section inside the arena's vertex buffer.
     vertex_offset: u32,
@@ -2759,6 +2763,37 @@ struct UiBundleKey {
     index_capacity: u64,
 }
 
+/// Unique emitted-section count over one region's bucket records using
+/// the retained `scratch` set (AUDIT-2 H5): cleared in place and reused
+/// across regions and frames so the fallback terrain path allocates no
+/// per-region `HashSet`. Applies the same `(culled, facing-bucket)`
+/// predicate the emit loop uses per record.
+fn emitted_section_count(
+    bucket_records: &[Vec<ArenaDrawRecord>; DIRECTION_BUCKETS],
+    culled_sections: &CullVerdicts,
+    camera_position: [f32; 3],
+    scratch: &mut HashSet<SectionCoord>,
+) -> usize {
+    scratch.clear();
+    for (bucket, records) in bucket_records.iter().enumerate() {
+        for record in records {
+            let coord = &record.coord;
+            if culled_sections.contains(coord) {
+                continue;
+            }
+            let min = [
+                coord.0 as f32 * EDGE as f32,
+                coord.1 as f32 * EDGE as f32,
+                coord.2 as f32 * EDGE as f32,
+            ];
+            if section_draw_mask(min, camera_position) >> bucket & 1 != 0 {
+                scratch.insert(*coord);
+            }
+        }
+    }
+    scratch.len()
+}
+
 /// Encode the opaque-terrain portion of the composed world pass into any
 /// [`wgpu::util::RenderEncoder`] — the live `RenderPass` or a
 /// `RenderBundleEncoder` when the frame's opaque terrain is being cached
@@ -2794,6 +2829,10 @@ fn encode_opaque_terrain<'a>(
     // Packed frame lights — each emitted draw record carries the
     // sphere∩AABB mask for its section/region volume in `params2.xy`.
     lights: &'a VfxLightsGpu,
+    // Retained dedup set for the per-region emitted-section count —
+    // `.clear()`ed per region so no `HashSet` is allocated per frame
+    // (AUDIT-2 H5).
+    emitted_scratch: &mut HashSet<SectionCoord>,
 ) -> (u64, u64, usize, usize) {
     // Bundle-recorded passes start with empty bind-group state, so the
     // environment (group 2) and optional shadow receiver (group 3) the
@@ -2866,7 +2905,6 @@ fn encode_opaque_terrain<'a>(
             let (region_min, region_max) = region_world_aabb(origin);
             let region_mask = draw_light_mask(region_min, region_max, lights);
             let mut bound = false;
-            let mut emitted: HashSet<SectionCoord> = HashSet::new();
             for (bucket, records) in arena.bucket_records.iter().enumerate() {
                 // Merged run of consecutive kept records sharing
                 // one fade value: (start, end, fade_bits).
@@ -2898,7 +2936,6 @@ fn encode_opaque_terrain<'a>(
                         pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
                         bound = true;
                     }
-                    emitted.insert(*coord);
                     let fade = chunk_fades.fade_alpha(coord.0, coord.2);
                     match run {
                         Some((start, end, bits))
@@ -2924,7 +2961,12 @@ fn encode_opaque_terrain<'a>(
                     arena_draws += 1;
                 }
             }
-            arena_sections += emitted.len();
+            arena_sections += emitted_section_count(
+                &arena.bucket_records,
+                culled_sections,
+                camera_position,
+                emitted_scratch,
+            );
             arena_regions += usize::from(bound);
         }
         // Restore the per-section pipeline for the fallback path.
@@ -3002,6 +3044,13 @@ struct UiQuadGpu {
     /// the new texture; branding bind groups bind this view too (they
     /// never emit icon quads, so sampling it is harmless).
     icon_view: wgpu::TextureView,
+    /// The packed vanilla GUI-sprite atlas (`binding 5` in
+    /// `UI_QUAD_WGSL`); starts as a 1×1 transparent placeholder and is
+    /// replaced once by [`GpuRenderer::upload_gui_sprite_atlas`].
+    _sprite_texture: wgpu::Texture,
+    /// View of the sprite atlas — like `icon_view`, shared by every
+    /// bind group on this layout.
+    sprite_view: wgpu::TextureView,
     font_view: wgpu::TextureView,
     font_sampler: wgpu::Sampler,
     vertices: wgpu::Buffer,
@@ -3314,6 +3363,16 @@ pub struct GpuRenderer {
     gpu_indirect_coord_scratch: Vec<SectionCoord>,
     /// Retained scratch for the front-to-back region origin list.
     gpu_indirect_origin_scratch: Vec<[i32; 3]>,
+    /// Retained scratch for the frame's per-region `GpuIndirectRun`
+    /// list — `mem::take`n into each repack, moved into the returned
+    /// [`GpuIndirectFrame`], then handed back once the frame's draws are
+    /// encoded so a camera-crossing miss reuses its capacity verbatim
+    /// (AUDIT-2 H6).
+    gpu_indirect_run_scratch: Vec<GpuIndirectRun>,
+    /// Retained scratch for one region's sorted `(coord, slot)` list —
+    /// cleared and refilled per region inside the repack loop so no
+    /// per-region `Vec` is allocated on miss frames.
+    gpu_indirect_slot_scratch: Vec<(SectionCoord, ArenaSlot)>,
     /// `queue.write_buffer` calls against the indirect
     /// `SectionGpuRecord` buffer, cumulative — one per coalesced dirty
     /// span, zero on frames whose record pack is unchanged.
@@ -4193,6 +4252,11 @@ struct CompositeGpu {
     /// persist at `draw_ubo` offsets `0..len` while the bundle is live so
     /// replays need no re-upload.
     terrain_draw_scratch: Vec<CompositeDrawUniforms>,
+    /// Retained per-region dedup set for [`encode_opaque_terrain`]'s
+    /// `arena_sections` accounting — cleared per region and carried
+    /// across frames so the fallback terrain path never allocates a
+    /// fresh `HashSet` (AUDIT-2 H5).
+    arena_emitted_scratch: HashSet<SectionCoord>,
     env_ubo: wgpu::Buffer,
     lights_ubo: wgpu::Buffer,
     env_bg: wgpu::BindGroup,
@@ -5330,6 +5394,72 @@ struct GpuIndirectFrame {
     args: wgpu::Buffer,
     /// Per-region contiguous runs, front-to-back.
     runs: Vec<GpuIndirectRun>,
+}
+
+/// One region's indirect-pack step (AUDIT-2 H6): collect the
+/// draw-resident slots — staged `pending_writes` excluded — into
+/// `slot_scratch` (cleared in place, capacity retained across regions
+/// and frames), sort them deterministically, and append their
+/// `SectionGpuRecord`s + coords to `records`/`record_coords`. Returns
+/// the region's contiguous [`GpuIndirectRun`], or `None` when no slot is
+/// draw-ready. The `(key, coord)` total-order keys make the unstable
+/// sort bit-identical to the previous stable sort: `slot_scratch`
+/// arrives BTreeMap-ordered by `SectionCoord`, so equal sort keys were
+/// already coord-ordered.
+#[allow(clippy::too_many_arguments)]
+fn pack_region_indirect_records(
+    origin: [i32; 3],
+    arena_slots: &BTreeMap<SectionCoord, ArenaSlot>,
+    pending_writes: &BTreeMap<SectionCoord, (u64, Vec<u8>)>,
+    camera_position: [f32; 3],
+    morton_order_enabled: bool,
+    slot_scratch: &mut Vec<(SectionCoord, ArenaSlot)>,
+    record_coords: &mut Vec<SectionCoord>,
+    records: &mut Vec<SectionGpuRecord>,
+) -> Option<GpuIndirectRun> {
+    slot_scratch.clear();
+    slot_scratch.extend(
+        arena_slots
+            .iter()
+            .filter(|(coord, _)| !pending_writes.contains_key(*coord))
+            .map(|(&coord, &slot)| (coord, slot)),
+    );
+    if slot_scratch.is_empty() {
+        return None;
+    }
+    if morton_order_enabled {
+        slot_scratch.sort_unstable_by_key(|&(coord, _)| {
+            (opaque_section_sort_key(coord, camera_position), coord)
+        });
+    } else {
+        // Deterministic Morton order avoids spurious HashMap-order
+        // diffs when `morton_order_enabled` is off.
+        slot_scratch.sort_unstable_by_key(|&(coord, _)| (section_morton_key(coord), coord));
+    }
+    let edge = EDGE as f32;
+    let first = records.len() as u32;
+    for &(coord, slot) in slot_scratch.iter() {
+        let min = [
+            coord.0 as f32 * edge,
+            coord.1 as f32 * edge,
+            coord.2 as f32 * edge,
+        ];
+        record_coords.push(coord);
+        records.push(SectionGpuRecord {
+            aabb_min: [min[0], min[1], min[2], 0.0],
+            aabb_max: [min[0] + edge, min[1] + edge, min[2] + edge, 0.0],
+            index_count: slot.vertex_count / 4 * 6,
+            first_index: slot.vertex_offset / 4 * 6,
+            base_vertex: 0,
+            first_instance: 0,
+            _pad: [0; 4],
+        });
+    }
+    Some(GpuIndirectRun {
+        origin,
+        first,
+        count: records.len() as u32 - first,
+    })
 }
 
 /// Differential `SectionGpuRecord` upload: bitwise-diff `records`
@@ -6896,6 +7026,16 @@ impl GpuRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 });
         let ui_quad_pipeline_layout =
@@ -7025,6 +7165,43 @@ impl GpuRenderer {
             },
         );
         let ui_icon_view = ui_icon_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // 1×1 transparent placeholder bound until `upload_gui_sprite_atlas`
+        // lands the decoded vanilla `widget/*` atlas — `Sprite` quads then
+        // sample real chrome; the vector bevels never touch this texture.
+        let ui_sprite_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-sprite-atlas-placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ui_sprite_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ui_sprite_view = ui_sprite_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ui_quad_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-quad-bind-group"),
             layout: &ui_quad_layout,
@@ -7049,6 +7226,10 @@ impl GpuRenderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&ui_sprite_view),
+                },
             ],
         });
         let ui_quad_vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -7070,6 +7251,8 @@ impl GpuRenderer {
             _font_texture: ui_font_texture,
             _icon_texture: ui_icon_texture,
             icon_view: ui_icon_view,
+            _sprite_texture: ui_sprite_texture,
+            sprite_view: ui_sprite_view,
             font_view: ui_font_view,
             font_sampler: ui_font_sampler,
             vertices: ui_quad_vertices,
@@ -7331,6 +7514,8 @@ impl GpuRenderer {
             gpu_indirect_record_scratch: Vec::new(),
             gpu_indirect_coord_scratch: Vec::new(),
             gpu_indirect_origin_scratch: Vec::new(),
+            gpu_indirect_run_scratch: Vec::new(),
+            gpu_indirect_slot_scratch: Vec::new(),
             gpu_indirect_record_uploads: 0,
             gpu_indirect_record_bytes_uploaded: 0,
             gpu_indirect_record_uploads_skipped: 0,
@@ -8158,6 +8343,7 @@ impl GpuRenderer {
             draw_capacity,
             draw_scratch: Vec::with_capacity(64),
             terrain_draw_scratch: Vec::with_capacity(64),
+            arena_emitted_scratch: HashSet::new(),
             env_ubo,
             lights_ubo,
             env_bg,
@@ -10558,9 +10744,13 @@ impl GpuRenderer {
                 count,
             );
             self.gpu_indirect_sections_submitted += u64::from(count);
+            // Reuse the retained run scratch for the cached-runs copy so
+            // even the fast-hit path performs no fresh `Vec` alloc.
+            let mut runs = std::mem::take(&mut self.gpu_indirect_run_scratch);
+            runs.clone_from(&buffers.cached_runs);
             return Some(GpuIndirectFrame {
                 args: buffers.args.clone(),
-                runs: buffers.cached_runs.clone(),
+                runs,
             });
         }
         // Retained scratch: `mem::take` moves the capacity out of `self`
@@ -10570,11 +10760,17 @@ impl GpuRenderer {
         let mut records = std::mem::take(&mut self.gpu_indirect_record_scratch);
         let mut record_coords = std::mem::take(&mut self.gpu_indirect_coord_scratch);
         let mut origins = std::mem::take(&mut self.gpu_indirect_origin_scratch);
+        // H6: the run list and the per-region slot list reuse retained
+        // capacity the same way; `runs` comes back from the caller's
+        // finished `GpuIndirectFrame` so a camera-crossing miss costs
+        // zero fresh `Vec` allocations.
+        let mut runs = std::mem::take(&mut self.gpu_indirect_run_scratch);
+        let mut slots = std::mem::take(&mut self.gpu_indirect_slot_scratch);
         records.clear();
         record_coords.clear();
         origins.clear();
+        runs.clear();
         origins.extend(self.region_arenas.keys().copied());
-        let mut runs: Vec<GpuIndirectRun> = Vec::new();
         sort_regions_front_to_back(&mut origins, camera_position);
         for origin in origins.iter().copied() {
             let arena = &self.region_arenas[&origin];
@@ -10583,50 +10779,25 @@ impl GpuRenderer {
             }
             // `pending_vertex_writes` keys are staged but not yet on the
             // GPU — their args would index unwritten vertex memory.
-            let mut slots: Vec<(SectionCoord, &ArenaSlot)> = arena
-                .slots
-                .iter()
-                .filter(|(coord, _)| !arena.pending_vertex_writes.contains_key(coord))
-                .map(|(&coord, slot)| (coord, slot))
-                .collect();
-            if slots.is_empty() {
-                continue;
-            }
-            if self.morton_order_enabled {
-                slots.sort_by_key(|&(coord, _)| opaque_section_sort_key(coord, camera_position));
-            } else {
-                // Deterministic Morton order avoids spurious HashMap-order
-                // diffs when `morton_order_enabled` is off.
-                slots.sort_by_key(|&(coord, _)| section_morton_key(coord));
-            }
-            let first = records.len() as u32;
-            for (coord, slot) in slots {
-                let min = [
-                    coord.0 as f32 * edge,
-                    coord.1 as f32 * edge,
-                    coord.2 as f32 * edge,
-                ];
-                record_coords.push(coord);
-                records.push(SectionGpuRecord {
-                    aabb_min: [min[0], min[1], min[2], 0.0],
-                    aabb_max: [min[0] + edge, min[1] + edge, min[2] + edge, 0.0],
-                    index_count: slot.vertex_count / 4 * 6,
-                    first_index: slot.vertex_offset / 4 * 6,
-                    base_vertex: 0,
-                    first_instance: 0,
-                    _pad: [0; 4],
-                });
-            }
-            runs.push(GpuIndirectRun {
+            if let Some(run) = pack_region_indirect_records(
                 origin,
-                first,
-                count: records.len() as u32 - first,
-            });
+                &arena.slots,
+                &arena.pending_vertex_writes,
+                camera_position,
+                self.morton_order_enabled,
+                &mut slots,
+                &mut record_coords,
+                &mut records,
+            ) {
+                runs.push(run);
+            }
         }
         if records.is_empty() {
             self.gpu_indirect_record_scratch = records;
             self.gpu_indirect_coord_scratch = record_coords;
             self.gpu_indirect_origin_scratch = origins;
+            self.gpu_indirect_run_scratch = runs;
+            self.gpu_indirect_slot_scratch = slots;
             return None;
         }
         let count = records.len() as u32;
@@ -10709,6 +10880,7 @@ impl GpuRenderer {
         self.gpu_indirect_record_scratch = records;
         self.gpu_indirect_coord_scratch = record_coords;
         self.gpu_indirect_origin_scratch = origins;
+        self.gpu_indirect_slot_scratch = slots;
         Some(GpuIndirectFrame {
             args: buffers.args.clone(),
             runs,
@@ -11043,6 +11215,59 @@ impl GpuRenderer {
         );
         self.ui_quad.icon_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.ui_quad._icon_texture = texture;
+        self.rebuild_ui_quad_bind_group();
+    }
+
+    /// Replace the GUI-sprite atlas texture (`binding 5` of the ui_quad
+    /// bind group) with a freshly packed [`megu_ui::draw::GuiSpriteAtlas`]
+    /// — the decoded vanilla `widget/*` chrome — and rebuild the overlay
+    /// bind group around it. Called once after the client JAR lands;
+    /// `is_empty()` atlases keep the transparent placeholder bound.
+    pub fn upload_gui_sprite_atlas(&mut self, atlas: &megu_ui::draw::GuiSpriteAtlas) {
+        if atlas.is_empty() || atlas.width == 0 || atlas.height == 0 {
+            return;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-sprite-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ui_quad.sprite_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ui_quad._sprite_texture = texture;
+        self.rebuild_ui_quad_bind_group();
+    }
+
+    /// Recreate `ui_quad.bind_group` around the current texture views —
+    /// shared by [`upload_item_icon_atlas`] / [`upload_gui_sprite_atlas`].
+    fn rebuild_ui_quad_bind_group(&mut self) {
         self.ui_quad.bind_group = self
             .ctx
             .device
@@ -11070,6 +11295,10 @@ impl GpuRenderer {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.ui_quad.font_sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.sprite_view),
+                    },
                 ],
             });
     }
@@ -11080,17 +11309,31 @@ impl GpuRenderer {
     /// never shrunk). The static font atlas uploaded at construction is
     /// bound every draw. Empty meshes disable the overlay draw.
     pub fn update_ui_mesh(&mut self, width: u32, height: u32, mesh: &UiMesh) {
+        self.update_ui_mesh_parts(width, height, &mesh.vertices, &mesh.indices);
+    }
+
+    /// [`update_ui_mesh`] over borrowed vertex/index slices — the shape
+    /// [`megu_ui::retained_cache::UiRetainedCache::composite`] returns,
+    /// so the retained UI batch uploads without materializing a
+    /// `UiMesh`.
+    pub fn update_ui_mesh_parts(
+        &mut self,
+        width: u32,
+        height: u32,
+        vertices: &[megu_ui::draw::UiVertex],
+        indices: &[u32],
+    ) {
         let uniforms = [width.max(1) as f32, height.max(1) as f32, 0.0, 0.0];
         self.ctx
             .queue
             .write_buffer(&self.ui_quad.uniform, 0, bytemuck::cast_slice(&uniforms));
-        self.ui_quad.index_count = mesh.indices.len() as u32;
+        self.ui_quad.index_count = indices.len() as u32;
         if self.ui_quad.index_count == 0 {
             return;
         }
         self.ui_quad_vertex_scratch.clear();
         self.ui_quad_vertex_scratch
-            .extend(mesh.vertices.iter().map(|v| UiQuadVertex {
+            .extend(vertices.iter().map(|v| UiQuadVertex {
                 position: v.position,
                 uv: v.uv,
                 color: v.color,
@@ -11105,7 +11348,7 @@ impl GpuRenderer {
                 mapped_at_creation: false,
             });
         }
-        let ibytes = (mesh.indices.len() * 4) as u64;
+        let ibytes = (indices.len() * 4) as u64;
         if ibytes > self.ui_quad.index_capacity {
             self.ui_quad.index_capacity = ibytes * 2;
             self.ui_quad.indices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -11123,7 +11366,7 @@ impl GpuRenderer {
         );
         self.ctx
             .queue
-            .write_buffer(&quad.indices, 0, bytemuck::cast_slice(&mesh.indices));
+            .write_buffer(&quad.indices, 0, bytemuck::cast_slice(indices));
     }
 
     /// Draw the UI-quad overlay into `pass`, replaying the pre-recorded
@@ -11244,6 +11487,10 @@ impl GpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.sprite_view),
                     },
                 ],
             });
@@ -13437,6 +13684,7 @@ impl GpuRenderer {
                         &view_proj,
                         true,
                         frame_lights,
+                        &mut gpu.arena_emitted_scratch,
                     );
                     let bundle = bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
                         label: Some("terrain-opaque-bundle"),
@@ -13470,6 +13718,7 @@ impl GpuRenderer {
                         &view_proj,
                         gpu_indirect.is_none(),
                         frame_lights,
+                        &mut gpu.arena_emitted_scratch,
                     )
                 };
                 skipped_buckets += stats.0;
@@ -13780,6 +14029,12 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..*count, 0..1);
             }
+        }
+        // H6: the indirect frame's `runs` buffer goes straight back into
+        // the retained scratch — the next camera-crossing miss refills
+        // the same allocation instead of dropping it and reallocating.
+        if let Some(frame) = gpu_indirect {
+            self.gpu_indirect_run_scratch = frame.runs;
         }
         // GPU Hi-Z: build next frame's occlusion pyramid from this
         // frame's depth in the same encoder — the build's compute
@@ -14196,5 +14451,255 @@ mod tests {
         }
         assert!(!is_cloud_subworld_id(1));
         assert!(!is_cloud_subworld_id(u64::MAX - 3));
+    }
+
+    /// H5: [`emitted_section_count`] yields the same unique-section count
+    /// as the original per-record `HashSet` insert loop — including the
+    /// culled-verdict skip — while the retained set is `.clear()`ed and
+    /// reused, so a second identical region performs zero allocations.
+    /// The only heap target inside the function is that retained set, so
+    /// an unchanged bucket capacity across an identical-output re-run is
+    /// a bit-exact zero-allocation proof (a `HashSet` never relinquishes
+    /// buckets without growing).
+    #[test]
+    fn emitted_section_count_reuses_scratch_set_across_frames() {
+        let camera = [8.0, 40.0, 8.0];
+        // One section reaching two buckets, one reaching only bucket 0,
+        // one fully culled — mirrors a region's merged-record shape.
+        let shared = SectionCoord(1, 2, -1);
+        let single = SectionCoord(0, 2, 0);
+        let culled = SectionCoord(-3, 2, 4);
+        let mut bucket_records: [Vec<ArenaDrawRecord>; DIRECTION_BUCKETS] =
+            std::array::from_fn(|_| Vec::new());
+        bucket_records[0].push(ArenaDrawRecord {
+            coord: shared,
+            start: 0,
+            end: 6,
+        });
+        bucket_records[0].push(ArenaDrawRecord {
+            coord: single,
+            start: 6,
+            end: 12,
+        });
+        bucket_records[0].push(ArenaDrawRecord {
+            coord: culled,
+            start: 12,
+            end: 18,
+        });
+        bucket_records[1].push(ArenaDrawRecord {
+            coord: shared,
+            start: 6,
+            end: 12,
+        });
+        bucket_records[3].push(ArenaDrawRecord {
+            coord: culled,
+            start: 18,
+            end: 24,
+        });
+
+        let mut verdicts = CullVerdicts::default();
+        verdicts.index_of.insert(culled, 0);
+        verdicts.bits = vec![1];
+        verdicts.len = 1;
+
+        // Scalar replay of the pre-fix per-record dedup.
+        let mut reference = HashSet::new();
+        for (bucket, records) in bucket_records.iter().enumerate() {
+            for record in records {
+                let coord = &record.coord;
+                if verdicts.contains(coord) {
+                    continue;
+                }
+                let min = [
+                    coord.0 as f32 * EDGE as f32,
+                    coord.1 as f32 * EDGE as f32,
+                    coord.2 as f32 * EDGE as f32,
+                ];
+                if section_draw_mask(min, camera) >> bucket & 1 != 0 {
+                    reference.insert(*coord);
+                }
+            }
+        }
+
+        let mut scratch = HashSet::new();
+        // Frame 1 warms the scratch's capacity (may allocate once).
+        let first = emitted_section_count(&bucket_records, &verdicts, camera, &mut scratch);
+        assert_eq!(first, reference.len(), "count must match the old loop");
+        let capacity = scratch.capacity();
+        // Frame 2 reuses it — the capacity must not move at all.
+        let second =
+            emitted_section_count(&bucket_records, &verdicts, camera, &mut scratch);
+        assert_eq!(second, first);
+        assert_eq!(scratch.capacity(), capacity, "capacity must persist");
+    }
+
+    /// H6: [`pack_region_indirect_records`] packs identical records/runs
+    /// through the retained scratch `Vec`s — staged `pending_writes`
+    /// stay excluded — and a camera-moving second frame allocates zero
+    /// fresh collections.
+    #[test]
+    fn gpu_indirect_region_pack_reuses_scratch_with_zero_allocs() {
+        let slot = |offset: u32| ArenaSlot {
+            vertex_offset: offset,
+            vertex_count: 8,
+            bucket_ranges: [(0, 12); DIRECTION_BUCKETS],
+        };
+        let mut slots = BTreeMap::new();
+        slots.insert(SectionCoord(0, 0, 0), slot(0));
+        slots.insert(SectionCoord(2, 0, 0), slot(64));
+        slots.insert(SectionCoord(0, 1, 0), slot(128));
+        let mut pending: BTreeMap<SectionCoord, (u64, Vec<u8>)> = BTreeMap::new();
+        pending.insert(SectionCoord(0, 1, 0), (7, vec![0; 8]));
+
+        let mut slot_scratch: Vec<(SectionCoord, ArenaSlot)> = Vec::new();
+        let mut record_coords: Vec<SectionCoord> = Vec::new();
+        let mut records: Vec<SectionGpuRecord> = Vec::new();
+        let origin = [0, 0, 0];
+
+        // Frame 1 (cold scratch — may allocate) packs two resident
+        // slots; the staged section is excluded.
+        let first = pack_region_indirect_records(
+            origin,
+            &slots,
+            &pending,
+            [8.0, 40.0, 8.0],
+            true,
+            &mut slot_scratch,
+            &mut record_coords,
+            &mut records,
+        )
+        .expect("two resident slots must emit a run");
+        assert_eq!(first.origin, origin);
+        assert_eq!(first.first, 0);
+        assert_eq!(first.count, 2, "staged slot must be excluded");
+        assert_eq!(records.len(), 2);
+        // Order-insensitive snapshot: the camera sort may reorder
+        // records between frames, so compare sorted 64-byte blobs.
+        let rec_blob = |records: &[SectionGpuRecord]| -> Vec<Vec<u8>> {
+            let mut blob: Vec<Vec<u8>> = records
+                .iter()
+                .map(|r| bytemuck::bytes_of(r).to_vec())
+                .collect();
+            blob.sort();
+            blob
+        };
+        let baseline_records = rec_blob(&records);
+        let baseline_coords: std::collections::BTreeSet<SectionCoord> =
+            record_coords.iter().copied().collect();
+
+        // Frame 2 with a moved camera (camera-section crossing): the
+        // same pack must reuse every scratch. The only heap targets
+        // inside the function are these three retained `Vec`s, so
+        // unchanged buffers (a `Vec` never reallocates without moving)
+        // plus unchanged capacities prove zero heap traffic.
+        records.clear();
+        record_coords.clear();
+        let buffers = (
+            slot_scratch.as_ptr(),
+            record_coords.as_ptr(),
+            records.as_ptr(),
+        );
+        let capacities = (
+            slot_scratch.capacity(),
+            record_coords.capacity(),
+            records.capacity(),
+        );
+        let second = pack_region_indirect_records(
+            origin,
+            &slots,
+            &pending,
+            [40.0, 40.0, 8.0],
+            true,
+            &mut slot_scratch,
+            &mut record_coords,
+            &mut records,
+        )
+        .expect("run must still emit");
+        assert_eq!(
+            (
+                slot_scratch.as_ptr(),
+                record_coords.as_ptr(),
+                records.as_ptr(),
+            ),
+            buffers,
+            "reused scratch buffers must not move",
+        );
+        assert_eq!(
+            (
+                slot_scratch.capacity(),
+                record_coords.capacity(),
+                records.capacity(),
+            ),
+            capacities,
+            "reused scratch capacities must persist",
+        );
+        assert_eq!(second.origin, origin);
+        assert_eq!(second.first, 0);
+        assert_eq!(second.count, 2);
+        assert_eq!(
+            rec_blob(&records),
+            baseline_records,
+            "repacked records must be identical"
+        );
+        assert_eq!(
+            record_coords.iter().copied().collect::<std::collections::BTreeSet<_>>(),
+            baseline_coords,
+            "repacked coords must be identical",
+        );
+
+        // The Morton-disabled branch is deterministic too: appended
+        // coords stay in strict Morton order.
+        pack_region_indirect_records(
+            origin,
+            &slots,
+            &pending,
+            [8.0, 40.0, 8.0],
+            false,
+            &mut slot_scratch,
+            &mut record_coords,
+            &mut records,
+        )
+        .expect("run must still emit");
+        let tail = &record_coords[record_coords.len() - 2..];
+        let keys: Vec<u64> = tail.iter().map(|&c| section_morton_key(c)).collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort_unstable();
+        assert_eq!(keys, sorted_keys, "morton order must hold");
+    }
+
+    /// H6 edge: a region whose slots are all still staging emits no run
+    /// and appends no records — the same `None` the old loop's
+    /// `slots.is_empty() -> continue` produced.
+    #[test]
+    fn gpu_indirect_region_pack_skips_fully_staged_region() {
+        let mut slots = BTreeMap::new();
+        slots.insert(
+            SectionCoord(0, 0, 0),
+            ArenaSlot {
+                vertex_offset: 0,
+                vertex_count: 4,
+                bucket_ranges: [(0, 6); DIRECTION_BUCKETS],
+            },
+        );
+        let mut pending: BTreeMap<SectionCoord, (u64, Vec<u8>)> = BTreeMap::new();
+        pending.insert(SectionCoord(0, 0, 0), (3, vec![0; 4]));
+        let mut slot_scratch = Vec::new();
+        let mut record_coords = Vec::new();
+        let mut records = Vec::new();
+        assert!(
+            pack_region_indirect_records(
+                [0, 0, 0],
+                &slots,
+                &pending,
+                [0.0, 0.0, 0.0],
+                true,
+                &mut slot_scratch,
+                &mut record_coords,
+                &mut records,
+            )
+            .is_none(),
+            "a fully staged region must emit no run",
+        );
+        assert!(records.is_empty() && record_coords.is_empty());
     }
 }

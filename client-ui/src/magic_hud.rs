@@ -451,6 +451,7 @@ mod tests {
                 UiCommand::FillRect { rect, .. }
                 | UiCommand::BorderRect { rect, .. }
                 | UiCommand::ItemIcon { rect, .. }
+                | UiCommand::Sprite { rect, .. }
                 | UiCommand::ProgressBar { rect, .. } => {
                     assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?}");
                     assert!(rect.right() <= width as i32, "{cmd:?}");

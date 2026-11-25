@@ -118,6 +118,9 @@ EXIT CODES:
 const DEFAULT_BAN_REASON: &str = "Banned by an operator.";
 const DEFAULT_BAN_CREATED: &str = "1970-01-01T00:00:00Z";
 const DEFAULT_BAN_SOURCE: &str = "megu-init";
+/// Optional server-push mod manifest validated by `doctor` — absent by
+/// default, so it is not part of [`ALL_FILES`].
+const MODSYNC_MANIFEST_FILE: &str = "megu_modsync.json";
 
 /// The name this process was invoked as: the executable's basename, so the
 /// `megu-admin` build names itself correctly instead of borrowing the
@@ -990,6 +993,47 @@ fn check_json_list(
     }
 }
 
+/// Optional server-push mod manifest (`megu_modsync.json`): parsed as a
+/// `modrinth_sync::ServerModSyncManifest` and every entry's download URL
+/// is re-proven against the CDN allowlist. A manifest that parses but
+/// carries untrusted links is reported, not silently trusted.
+fn check_modsync_manifest(dir: &Path) -> Check {
+    use crate::modrinth_sync::{validate_download_url, ServerModSyncManifest};
+
+    let path = dir.join(MODSYNC_MANIFEST_FILE);
+    if !path.exists() {
+        return Check::Missing;
+    }
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => return Check::Broken(e.to_string()),
+    };
+    let manifest = match ServerModSyncManifest::parse_manifest(&text) {
+        Ok(manifest) => manifest,
+        Err(e) => return Check::Broken(format!("{e}")),
+    };
+    let untrusted = manifest
+        .entries
+        .iter()
+        .filter(|e| validate_download_url(&e.download_url).is_err())
+        .count();
+    let detail = format!(
+        "{} mod{}, {} untrusted download URL{}",
+        manifest.entries.len(),
+        if manifest.entries.len() == 1 { "" } else { "s" },
+        untrusted,
+        if untrusted == 1 { "" } else { "s" },
+    );
+    Check::Ok {
+        detail,
+        json: jobj(vec![
+            ("status", jstr("ok")),
+            ("entries", jint(manifest.entries.len() as i64)),
+            ("untrusted_urls", jint(untrusted as i64)),
+        ]),
+    }
+}
+
 fn eula_action(dir: &Path, status: EulaStatus) -> String {
     let file = dir.join(EULA_FILE);
     match status {
@@ -1089,6 +1133,7 @@ fn cmd_doctor(dir: &Path, target: TargetVersion, json: bool) -> Result<u8, CliEr
                 UserCache::load_from(p).map(|c| c.len())
             }),
         ),
+        (MODSYNC_MANIFEST_FILE, check_modsync_manifest(dir)),
     ];
 
     let broken: Vec<&str> = checks

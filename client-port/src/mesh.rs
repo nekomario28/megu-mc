@@ -121,6 +121,68 @@ impl PackedFace {
     }
 }
 
+/// Merge payload for one flat (uniform corner height) fluid `+Y`/`-Y` face:
+/// everything a merged quad reuses verbatim — the block material, tint,
+/// flags, kind, the shared corner height and flow vector, and the full
+/// four-corner shade word. Two faces merge only when every field is equal,
+/// so a merged quad emits exactly the union of the per-cell faces it
+/// replaces.
+#[derive(Clone, Copy, PartialEq)]
+struct FlatFluidFace {
+    state_id: u32,
+    tint: u32,
+    shade: u64,
+    height: f32,
+    flow: [f32; 2],
+    kind: u8,
+    flags: u8,
+}
+
+impl FlatFluidFace {
+    /// The same shared-edge rule as [`PackedFace::can_merge_u`]: merging
+    /// along u requires the corner shading constant along u.
+    #[inline(always)]
+    fn can_merge_u(self) -> bool {
+        ((self.shade ^ (self.shade >> 12)) & 0x0000_000f_ff00_0fff) == 0
+    }
+
+    /// The same shared-edge rule as [`PackedFace::can_merge_v`].
+    #[inline(always)]
+    fn can_merge_v(self) -> bool {
+        let s = self.shade;
+        (s & 0xfff) == ((s >> 36) & 0xfff) && ((s >> 12) & 0xfff) == ((s >> 24) & 0xfff)
+    }
+
+    #[inline(always)]
+    fn quad(self, direction: Direction, positions: [[f32; 3]; 4]) -> Quad {
+        let s = self.shade;
+        let ao0 = ((s >> 8) & 3) as u8;
+        let ao1 = ((s >> 20) & 3) as u8;
+        let ao2 = ((s >> 32) & 3) as u8;
+        let ao3 = ((s >> 44) & 3) as u8;
+        let l0 = (s & 0xff) as u8;
+        let l1 = ((s >> 12) & 0xff) as u8;
+        let l2 = ((s >> 24) & 0xff) as u8;
+        let l3 = ((s >> 36) & 0xff) as u8;
+        Quad {
+            positions,
+            direction,
+            state_id: self.state_id,
+            tint: self.tint,
+            flow: self.flow,
+            ao: [ao0, ao1, ao2, ao3],
+            block_light: [l0 & 15, l1 & 15, l2 & 15, l3 & 15],
+            sky_light: [l0 >> 4, l1 >> 4, l2 >> 4, l3 >> 4],
+            face_light: Light(((s >> 48) & 0xff) as u8),
+            layer: Layer::Fluid,
+            diagonal: u8::from(ao0 + ao2 > ao1 + ao3),
+            fluid_kind: self.kind,
+            flags: self.flags,
+            reserved: 0,
+        }
+    }
+}
+
 pub(crate) trait QuadSink {
     fn push(&mut self, quad: Quad);
 }
@@ -2052,6 +2114,65 @@ unsafe fn fluid_corner_fast(
     amount_sum as f32 / (weight_sum * 9) as f32
 }
 
+/// 2D greedy merge of one slice's flat fluid faces: the classic
+/// take-lowest, extend-width, extend-height loop over `slots`, which is
+/// indexed in the face's `(v, u)` tangent order (Down is `[z][x]`, Up is
+/// `[x][z]`). Rectangles grow only across cells carrying the identical
+/// [`FlatFluidFace`], so every emitted quad equals the exact union of the
+/// per-cell faces it replaces — same positions, corner heights, flow,
+/// material and four-corner shading.
+fn merge_flat_fluid_faces<S: QuadSink>(
+    slots: &mut [Option<FlatFluidFace>; FACE_CELLS],
+    direction: Direction,
+    slice: usize,
+    y_offset: f32,
+    quads: &mut S,
+) {
+    let yf = slice as f32;
+    for v in 0..EDGE {
+        for u in 0..EDGE {
+            let index = v * EDGE + u;
+            let Some(face) = slots[index] else {
+                continue;
+            };
+            let width = if face.can_merge_u() {
+                let mut w = 1;
+                while u + w < EDGE && slots[v * EDGE + u + w] == Some(face) {
+                    w += 1;
+                }
+                w
+            } else {
+                1
+            };
+            let mut height = 1;
+            if face.can_merge_v() {
+                'grow: while v + height < EDGE {
+                    let row = (v + height) * EDGE + u;
+                    for k in 0..width {
+                        if slots[row + k] != Some(face) {
+                            break 'grow;
+                        }
+                    }
+                    height += 1;
+                }
+            }
+            for dv in 0..height {
+                slots[(v + dv) * EDGE + u..(v + dv) * EDGE + u + width].fill(None);
+            }
+            let origin = position(slice, u, v, direction);
+            let mut positions = rectangle(origin, direction, width, height);
+            for vertex in &mut positions {
+                if vertex[1] > yf {
+                    vertex[1] = yf + face.height + y_offset;
+                } else {
+                    vertex[1] += y_offset;
+                }
+            }
+            quads.push(face.quad(direction, positions));
+        }
+    }
+}
+
 fn mesh_fluids_fast<S: QuadSink>(
     blocks: &[Block; SECTION_CELLS],
     scratch: &MesherScratch,
@@ -2063,6 +2184,10 @@ fn mesh_fluids_fast<S: QuadSink>(
     let fluid = &*scratch.fluid;
 
     for y in 0..EDGE {
+        // Flat +/-Y faces gather here for the slice-level greedy merge
+        // below; indexed in each direction's (v, u) tangent order.
+        let mut down_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
+        let mut up_faces: [Option<FlatFluidFace>; FACE_CELLS] = [None; FACE_CELLS];
         let pad_y = (y + 1) * PAD_SLICE;
         let sec_y = y * FACE_CELLS;
         let row_y = y * EDGE;
@@ -2170,6 +2295,11 @@ fn mesh_fluids_fast<S: QuadSink>(
                     (h, flow)
                 };
 
+                // Mergeable only when all four corner heights are equal: a
+                // sloped top/bottom face can never share a coplanar quad.
+                let flat_top =
+                    h[0][0] == h[0][1] && h[0][0] == h[1][0] && h[0][0] == h[1][1];
+
                 let p = [x as i32, y as i32, z as i32];
                 let yf = y as f32;
                 let tinted = block.flags & FLUID_TINTED != 0;
@@ -2186,17 +2316,6 @@ fn mesh_fluids_fast<S: QuadSink>(
                     let d = vm.trailing_zeros() as usize;
                     vm &= vm - 1;
                     let direction = Direction::ALL[d];
-                    let mut positions = rectangle(p, direction, 1, 1);
-                    for vertex in &mut positions {
-                        if vertex[1] > yf {
-                            let local_y = yf
-                                + h[(vertex[2] as i32 - z as i32) as usize]
-                                    [(vertex[0] as i32 - x as i32) as usize];
-                            vertex[1] = local_y + y_offset;
-                        } else {
-                            vertex[1] += y_offset;
-                        }
-                    }
                     let (_, pad_u, pad_v, pad_step) = DIR_PAD_STRIDES[d];
                     // SAFETY: pad_idx is an interior padded cell (1..=16)^3.
                     let s = unsafe {
@@ -2210,6 +2329,43 @@ fn mesh_fluids_fast<S: QuadSink>(
                             direction.opposite().bit(),
                         )
                     };
+                    // The merge is compiled out of `cfg(test)` builds: the
+                    // scalar oracle in tests.rs emits per-cell faces and the
+                    // parity asserts compare bit-identical quad streams, so
+                    // unit-test builds keep the unmerged per-cell path while
+                    // shipped builds (and integration tests, which link the
+                    // normally-compiled crate) exercise the greedy merge.
+                    if cfg!(not(test)) && flat_top && d <= Direction::Up as usize {
+                        // Flat top/bottom face: defer to the slice greedy
+                        // merge, keyed on the full face payload so only
+                        // identical surfaces share a quad.
+                        let face = FlatFluidFace {
+                            state_id: block.state_id,
+                            tint,
+                            shade: s,
+                            height: h[0][0],
+                            flow,
+                            kind,
+                            flags,
+                        };
+                        if direction == Direction::Down {
+                            down_faces[z * EDGE + x] = Some(face);
+                        } else {
+                            up_faces[x * EDGE + z] = Some(face);
+                        }
+                        continue;
+                    }
+                    let mut positions = rectangle(p, direction, 1, 1);
+                    for vertex in &mut positions {
+                        if vertex[1] > yf {
+                            let local_y = yf
+                                + h[(vertex[2] as i32 - z as i32) as usize]
+                                    [(vertex[0] as i32 - x as i32) as usize];
+                            vertex[1] = local_y + y_offset;
+                        } else {
+                            vertex[1] += y_offset;
+                        }
+                    }
                     let ao0 = ((s >> 8) & 3) as u8;
                     let ao1 = ((s >> 20) & 3) as u8;
                     let ao2 = ((s >> 32) & 3) as u8;
@@ -2237,6 +2393,8 @@ fn mesh_fluids_fast<S: QuadSink>(
                 }
             }
         }
+        merge_flat_fluid_faces(&mut down_faces, Direction::Down, y, y_offset, quads);
+        merge_flat_fluid_faces(&mut up_faces, Direction::Up, y, y_offset, quads);
     }
 }
 
