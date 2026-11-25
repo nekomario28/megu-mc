@@ -44,6 +44,11 @@
 //!   and [`recipe_search::NearbyChestCraftPlanner`] emitting atomic
 //!   transfer plans that pull from the player inventory and nearby
 //!   chests for 1-click and max-stack shift-crafts.
+//! * [`seamless_ux`] — the seamless-onboarding layer: one-click
+//!   bilingual quality presets + ranked settings search + the
+//!   translucent live-preview settings backdrop, the universal
+//!   drag-and-drop payload classifier with mandatory consent prompts,
+//!   and the secret-denylist-guarded existing-launcher importer.
 //!
 //! Typical frame loop for an embedder:
 //!
@@ -75,6 +80,7 @@ pub mod qol_helpers;
 pub mod recipe_browser;
 pub mod recipe_search;
 pub mod retained_cache;
+pub mod seamless_ux;
 pub mod shader_screen;
 pub mod sign_and_chat;
 pub mod state;
