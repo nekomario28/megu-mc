@@ -438,7 +438,7 @@ fn aabb_in_lava_with(
     update_fluid_height_and_push_with(
         aabb,
         EntityFluidKind::Lava,
-        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+        LAVA_TEMPERATE_MOTION_SCALE,
         false,
         false,
         [0.0; 3],
@@ -681,18 +681,18 @@ const DEG_TO_RAD: f32 = 0.017453292;
 /// `getInputVector` treats an input shorter than `1.0E-7` as zero and normalizes above `1.0`.
 const INPUT_VECTOR_EPSILON: f64 = 1.0e-7;
 
-/// 1.21.1 `DimensionType.ultraWarm()` (`dwy.i()`), read by `Entity.bm()` to pick the lava
-/// push scale. The thread that hosts this server owns the Overworld
-/// (`dimension_type/overworld.json`, `ultra_warm=false`); keeping it as an owner value is what
-/// makes the Nether scale reachable instead of a second copy of the number.
+/// Legacy single-dimension test hook retained for the older travel contract tests.
+/// Production fluid queries are dimension-scoped and use `lava_motion_scale_for_dim`;
+/// this atomic must not override the Nether/custom-dimension `dimension_type` fact.
+#[cfg(all(test, megu_vanilla_data))]
 static LEVEL_ULTRA_WARM: AtomicBool = AtomicBool::new(false);
 
+#[cfg(all(test, megu_vanilla_data))]
 fn level_ultra_warm() -> bool {
     LEVEL_ULTRA_WARM.load(Ordering::Relaxed)
 }
 
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn set_level_ultra_warm(v: bool) {
     LEVEL_ULTRA_WARM.store(v, Ordering::Relaxed);
 }
@@ -710,6 +710,13 @@ fn fluid_push_scale(kind: EntityFluidKind, ultra_warm: bool) -> f64 {
             }
         }
     }
+}
+
+/// Lava's motion scale for the dimension the entity is in. `Entity.bm()` reads
+/// that dimension's `dimensionType().ultraWarm()`, so Nether (and custom
+/// ultrawarm) entities must not inherit the Overworld owner's flag.
+fn lava_motion_scale_for_dim(dim: DimId) -> f64 {
+    fluid_push_scale(EntityFluidKind::Lava, crate::dim_ultrawarm(dim))
 }
 
 /// `Entity.getFluidJumpThreshold()` (`bsr.di()`, offsets 0–19): `eyeHeight < 0.4F ? 0.0 : 0.4`.
@@ -781,7 +788,7 @@ fn fluid_input_vector(input: [f64; 3], amount: f32, yaw_deg: f32) -> [f64; 3] {
 }
 
 /// 1.21.1 `Entity.isFree(double, double, double)` (`bsr.g(DDD)Z`): `Level.noCollision` for the
-/// entity's AABB at that position. Only the block half is modelled — the entity half needs the
+/// entity's current AABB moved by that offset vector. Only the block half is modelled — the entity half needs the
 /// level's entity-AABB query, and this server's mob lacks one (the mob push grid excludes the
 /// querying mob rather than answering obstruction).
 #[allow(dead_code)]
@@ -944,7 +951,7 @@ fn mob_water_state_vel_dim(
     update_fluid_height_and_push_with(
         aabb,
         EntityFluidKind::Water,
-        fluid_push_scale(EntityFluidKind::Water, level_ultra_warm()),
+        WATER_MOTION_SCALE,
         true,
         false,
         vel,
@@ -971,7 +978,7 @@ fn mob_lava_state_vel_dim(
     update_fluid_height_and_push_with(
         aabb,
         EntityFluidKind::Lava,
-        fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+        lava_motion_scale_for_dim(dim),
         true,
         false,
         vel,
@@ -1045,6 +1052,7 @@ fn fluid_sweep_cells(
 /// is materialized only when water is dry, matching what the caller consumed
 /// before (a mob already in water never read the lava push).
 fn fluid_sweep_states(
+    dim: DimId,
     aabb: EntityAabb,
     vel: [f64; 3],
     get_block: &impl Fn(i32, i32, i32) -> u32,
@@ -1055,7 +1063,7 @@ fn fluid_sweep_states(
             cells,
             deflated,
             EntityFluidKind::Water,
-            fluid_push_scale(EntityFluidKind::Water, level_ultra_warm()),
+            WATER_MOTION_SCALE,
             true,
             false,
             vel,
@@ -1065,7 +1073,7 @@ fn fluid_sweep_states(
             cells,
             deflated,
             EntityFluidKind::Lava,
-            fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm()),
+            lava_motion_scale_for_dim(dim),
             !water.in_fluid,
             false,
             vel,
@@ -1089,7 +1097,7 @@ fn mob_fluid_states_vel_dim(
 ) -> (FluidPushResult, FluidPushResult) {
     let (w, h) = mob_dimensions(etype);
     let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
-    fluid_sweep_states(aabb, vel, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
+    fluid_sweep_states(dim, aabb, vel, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
 
 /// One `LivingEntity.travel` fluid tick for a mob.
@@ -1132,14 +1140,28 @@ fn mob_fluid_travel_tick(
         jump_threshold: fluid_jump_threshold(mob_eye_height(m.etype)),
         ..LivingTravelContext::default()
     };
+    let applied_move = std::cell::Cell::new([0.0; 3]);
     let mut move_fn = |delta: [f64; 3]| {
         let aabb = EntityAabb::from_dimensions(pos[0], pos[1], pos[2], w, h);
         // `Attributes.STEP_HEIGHT` (`buw.B`) default `0.6f`; `Entity.move` runs `collide`.
         let res = entity_collide_world_dim(m.dim, aabb, delta, on_ground, 0.6, &[]);
+        applied_move.set(res.delta);
         (res.delta, res.horizontal_collision)
     };
+    // `Entity.isFree(x,y,z)` moves the *post-move* bounding box by an offset vector;
+    // it does not reinterpret that vector as an absolute position.
     let is_free = |p: [f64; 3]| {
-        entity_is_free_blocks_dim(m.dim, EntityAabb::from_dimensions(p[0], p[1], p[2], w, h))
+        let applied = applied_move.get();
+        entity_is_free_blocks_dim(
+            m.dim,
+            EntityAabb::from_dimensions(
+                pos[0] + applied[0] + p[0],
+                pos[1] + applied[1] + p[1],
+                pos[2] + applied[2] + p[2],
+                w,
+                h,
+            ),
+        )
     };
     let out = travel_fluid_step(kind, vel, [0.0; 3], mp.3, ctx, &mut move_fn, &is_free);
     mp.0 += out.moved[0];
@@ -1147,6 +1169,118 @@ fn mob_fluid_travel_tick(
     mp.2 += out.moved[2];
     *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = out.vel;
     Some(out)
+}
+
+#[cfg(test)]
+mod fluid_travel_regression_tests {
+    use super::*;
+
+    fn identity_move(delta: [f64; 3]) -> ([f64; 3], bool) {
+        (delta, false)
+    }
+
+    #[test]
+    fn lava_push_scale_is_selected_by_entity_dimension() {
+        assert_eq!(lava_motion_scale_for_dim(DimId::Nether), 0.007);
+        assert_eq!(
+            lava_motion_scale_for_dim(DimId::Overworld),
+            0.0023333333333333335
+        );
+        assert_eq!(
+            lava_motion_scale_for_dim(DimId::End),
+            0.0023333333333333335
+        );
+        assert_eq!(fluid_push_scale(EntityFluidKind::Water, true), 0.014);
+        assert_eq!(fluid_push_scale(EntityFluidKind::Water, false), 0.014);
+    }
+
+    #[test]
+    fn fluid_travel_water_and_lava_use_vanilla_drag_constants() {
+        let mut water_move = identity_move;
+        let water = travel_fluid_step(
+            EntityFluidKind::Water,
+            [0.1, -0.1, 0.1],
+            [0.0; 3],
+            0.0,
+            LivingTravelContext::default(),
+            &mut water_move,
+            &|_| false,
+        );
+        assert_eq!(water.vel[0], 0.1 * f64::from(WATER_SLOW_DOWN));
+        assert_eq!(water.vel[2], 0.1 * f64::from(WATER_SLOW_DOWN));
+        assert_eq!(
+            water.vel[1],
+            -0.1 * WATER_VERTICAL_DRAG - LIVING_GRAVITY / FLUID_FALLING_DIVISOR
+        );
+
+        let mut shallow_move = identity_move;
+        let shallow_lava = travel_fluid_step(
+            EntityFluidKind::Lava,
+            [0.1, -0.1, 0.1],
+            [0.0; 3],
+            0.0,
+            LivingTravelContext {
+                fluid_height: 0.4,
+                jump_threshold: 0.4,
+                ..LivingTravelContext::default()
+            },
+            &mut shallow_move,
+            &|_| false,
+        );
+        assert_eq!(shallow_lava.vel[0], 0.05);
+        assert_eq!(
+            shallow_lava.vel[1],
+            -0.1 * WATER_VERTICAL_DRAG
+                - LIVING_GRAVITY / FLUID_FALLING_DIVISOR
+                - LIVING_GRAVITY / LAVA_GRAVITY_DIVISOR
+        );
+
+        let mut deep_move = identity_move;
+        let deep_lava = travel_fluid_step(
+            EntityFluidKind::Lava,
+            [0.1, -0.1, 0.1],
+            [0.0; 3],
+            0.0,
+            LivingTravelContext {
+                fluid_height: 0.4000000000000001,
+                jump_threshold: 0.4,
+                ..LivingTravelContext::default()
+            },
+            &mut deep_move,
+            &|_| false,
+        );
+        assert_eq!(deep_lava.vel[0], 0.05);
+        assert_eq!(deep_lava.vel[1], -0.1 * LAVA_DRAG - LIVING_GRAVITY / LAVA_GRAVITY_DIVISOR);
+    }
+
+    #[test]
+    fn fluid_horizontal_collision_escape_probes_offset_space_and_lifts_03() {
+        let seen = std::cell::Cell::new([0.0; 3]);
+        let mut collide_move = |delta: [f64; 3]| ([delta[0], -0.2, delta[2]], true);
+        let is_free = |probe: [f64; 3]| {
+            seen.set(probe);
+            true
+        };
+        let out = travel_fluid_step(
+            EntityFluidKind::Water,
+            [0.1, -0.1, 0.1],
+            [0.0; 3],
+            0.0,
+            LivingTravelContext::default(),
+            &mut collide_move,
+            &is_free,
+        );
+        let dragged_y = -0.1 * WATER_VERTICAL_DRAG - LIVING_GRAVITY / FLUID_FALLING_DIVISOR;
+        assert_eq!(
+            seen.get(),
+            [
+                0.1 * f64::from(WATER_SLOW_DOWN),
+                dragged_y + FLUID_FREE_PROBE - (-0.2),
+                0.1 * f64::from(WATER_SLOW_DOWN),
+            ]
+        );
+        assert_eq!(out.vel[1], FLUID_FREE_LIFT);
+    }
 }
 
 #[cfg(all(test, megu_vanilla_data))]
@@ -1962,14 +2096,14 @@ mod entity_fluid_tests {
                 _ => 0,
             }
         };
-        let water_scale = fluid_push_scale(EntityFluidKind::Water, level_ultra_warm());
-        let lava_scale = fluid_push_scale(EntityFluidKind::Lava, level_ultra_warm());
+        let water_scale = WATER_MOTION_SCALE;
+        let lava_scale = lava_motion_scale_for_dim(DimId::Overworld);
         let aabb = EntityAabb::from_min_max([0.0, 64.0, 0.0], [0.6, 65.8, 0.6]);
         let vel = [0.001, 0.0, 0.002];
 
         // Warm every code path once so lazy registry init lands outside the
         // timed loops.
-        let _ = fluid_sweep_states(aabb, vel, &world);
+        let _ = fluid_sweep_states(DimId::Overworld, aabb, vel, &world);
         let _ = update_fluid_height_and_push_with(
             aabb, EntityFluidKind::Water, water_scale, true, false, vel, &world,
         );
@@ -2000,7 +2134,7 @@ mod entity_fluid_tests {
         let pooled_start = Instant::now();
         for (i, expected) in expected.iter().enumerate().take(500) {
             let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
-            let actual = fluid_sweep_states(probe, vel, &world);
+            let actual = fluid_sweep_states(DimId::Overworld, probe, vel, &world);
             assert_eq!(*expected, actual, "sweep #{i} must be bit-identical");
         }
         let pooled_us = pooled_start.elapsed().as_micros();
@@ -2012,7 +2146,7 @@ mod entity_fluid_tests {
         let before = FLUID_SWEEP_CELLS.with(|cell| cell.borrow().capacity());
         for i in 0..500usize {
             let probe = aabb.offset((i % 5) as f64 * 0.5, 0.0, -((i % 3) as f64) * 0.5);
-            let _ = fluid_sweep_states(probe, vel, &world);
+            let _ = fluid_sweep_states(DimId::Overworld, probe, vel, &world);
         }
         let after = FLUID_SWEEP_CELLS.with(|cell| cell.borrow().capacity());
         assert_eq!(before, after, "fluid sweep cells must not grow after warmup");
@@ -2026,7 +2160,7 @@ mod entity_fluid_tests {
             world(x, y, z)
         };
         let dry = aabb.offset(64.0, 8.0, 64.0);
-        let (water_dry, lava_dry) = fluid_sweep_states(dry, vel, &counting);
+        let (water_dry, lava_dry) = fluid_sweep_states(DimId::Overworld, dry, vel, &counting);
         let scan_calls = calls.get();
         let dry_window = dry.deflate(0.001);
         let expected_scan = ((dry_window.max_x.ceil() as i32) - (dry_window.min_x.floor() as i32))

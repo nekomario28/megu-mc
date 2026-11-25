@@ -56,7 +56,12 @@ fn project(w: &mut impl World,p:[f64;3])->Option<[f64;3]> {
 impl State {
     fn move_by(&mut self,w:&mut impl World,delta:[f64;3]) {
         let (actual,ground)=w.move_cart(self.pos,delta);
-        for i in 0..3 { self.pos[i]+=actual[i];if actual[i]!=delta[i] {self.velocity[i]=0.;} }
+        for i in 0..3 { self.pos[i]+=actual[i]; }
+        // `Entity.move` zeroes only horizontally-colliding components, using
+        // `Mth.equal`'s widened `1.0E-5f` tolerance; vertical velocity is not
+        // cleared merely because the vertical move was clipped.
+        let eps=f64::from(1.0e-5f32);
+        for i in [0,2] { if (actual[i]-delta[i]).abs()>=eps {self.velocity[i]=0.;} }
         self.on_ground=ground;
     }
     /// `cou.applyNaturalSlowdown` uses a *float* comparator-derived coefficient.
@@ -262,5 +267,108 @@ mod live_rail_tick_tests {
         };
         off.tick(&mut scene, false, 0);
         assert!(scene.eject_calls.is_empty());
+    }
+
+    #[test]
+    fn minecart_rail_motion_is_clamped_to_04_and_02_in_water() {
+        for (in_water, cap) in [(false, 0.4), (true, 0.2)] {
+            let mut scene = Scene::new();
+            straight_rails(&mut scene, None, -8..=64);
+            let mut cart = State {
+                velocity: [0.0, 0.0, 0.5],
+                in_water,
+                ..cart_on_rail()
+            };
+            let z0 = cart.pos[2];
+            cart.tick(&mut scene, false, 0);
+            assert!(
+                (cart.pos[2] - z0 - cap).abs() < 1e-12,
+                "in_water={in_water} moved {} rather than {cap}",
+                cart.pos[2] - z0
+            );
+        }
+    }
+
+    struct ClipScene {
+        horizontal_clip: f64,
+    }
+
+    impl World for ClipScene {
+        fn rail(&mut self, _at: Pos) -> Option<Rail> {
+            None
+        }
+        fn conductor(&mut self, _at: Pos) -> bool {
+            false
+        }
+        fn move_cart(&mut self, _pos: [f64; 3], mut delta: [f64; 3]) -> ([f64; 3], bool) {
+            if delta[0] != 0.0 {
+                delta[0] -= delta[0].signum() * self.horizontal_clip;
+            }
+            if delta[1] != 0.0 {
+                delta[1] *= 0.5;
+            }
+            (delta, true)
+        }
+    }
+
+    #[test]
+    fn minecart_collision_zeroing_uses_horizontal_eps_and_preserves_vertical_velocity() {
+        let mut scene = ClipScene {
+            horizontal_clip: 5.0e-6,
+        };
+        let mut horizontal = State {
+            pos: [40.5, 200.5, 40.5],
+            velocity: [0.1, 0.0, 0.0],
+            on_ground: true,
+            in_water: false,
+        };
+        horizontal.tick(&mut scene, false, 0);
+        assert_eq!(horizontal.velocity[0], 0.05);
+
+        let mut vertical = State {
+            pos: [40.5, 200.5, 40.5],
+            velocity: [0.0, -0.04, 0.0],
+            on_ground: true,
+            in_water: false,
+        };
+        vertical.tick(&mut scene, false, 0);
+        assert_eq!(vertical.velocity[1], -0.04);
+    }
+
+    #[test]
+    fn minecart_off_rail_ground_drag_05_and_air_drag_095() {
+        let mut scene = Scene::new();
+        let mut ground = State {
+            pos: [40.5, 200.5, 40.5],
+            velocity: [0.1, 0.0, 0.1],
+            on_ground: true,
+            in_water: false,
+        };
+        ground.tick(&mut scene, false, 0);
+        assert_eq!(ground.velocity[0], 0.05);
+        assert_eq!(ground.velocity[2], 0.05);
+        assert_eq!(ground.velocity[1], -0.02);
+
+        let mut air = State {
+            pos: [40.5, 200.5, 40.5],
+            velocity: [0.1, 0.0, 0.1],
+            on_ground: false,
+            in_water: false,
+        };
+        // `Scene.move_cart` reports ground=true; force the airborne result here
+        // through a world whose move report preserves that state.
+        struct AirScene;
+        impl World for AirScene {
+            fn rail(&mut self, _at: Pos) -> Option<Rail> { None }
+            fn conductor(&mut self, _at: Pos) -> bool { false }
+            fn move_cart(&mut self, _pos: [f64; 3], delta: [f64; 3]) -> ([f64; 3], bool) {
+                (delta, false)
+            }
+        }
+        let mut air_scene = AirScene;
+        air.tick(&mut air_scene, false, 0);
+        assert_eq!(air.velocity[0], 0.095);
+        assert_eq!(air.velocity[2], 0.095);
+        assert_eq!(air.velocity[1], -0.038);
     }
 }
