@@ -93,7 +93,19 @@ class Fixture:
             '/// The fixture the crate cannot compile without.\n'
             'pub const DATA: &str = include_str!("../tests/data/case.tsv");\n')
         (self.root / "tests/data/case.tsv").write_text("a\tb\n1\t2\n")
-        (self.root / "assets/feature_order_1211.json").write_text("{}\n")
+        for name, data in {
+            "block_states_1211.json": b"{}\n",
+            "blocks_1211.json": b"[]\n",
+            "block_predicates_1211.bin": b"p",
+            "block_state_facts_1211.bin": b"f",
+            "collision_shape_full_1211.bin": b"c",
+            "mineshaft_support_1211.bin": b"m",
+            "multiface_support_1211.bin": b"u",
+            "structure_state_transforms_1211.bin": b"s",
+            "template_solid_1211.bin": b"t",
+            "feature_order_1211.json": b"{}\n",
+        }.items():
+            (self.root / "assets" / name).write_bytes(data)
         (self.root / "datapacks/vanilla/pack.mcmeta").write_text('{"pack": {}}\n')
         (self.root / "config_packets.bin").write_bytes(b"packets")
         # The real module is parsed for two literals; it is never imported.
@@ -228,6 +240,13 @@ class DevCheckContract(unittest.TestCase):
         self.assertEqual(statuses["runtime_data"], "MISSING")
         self.assertEqual(statuses["build_inputs"], "OK", "only the removed input is reported")
         self.assertIn("config_packets.bin", output)
+
+    def test_missing_block_registry_asset_turns_the_checkout_red(self):
+        (self.fixture.root / "assets/block_state_facts_1211.bin").unlink()
+        code, output = self.fixture.run()
+        self.assertEqual(code, 1, output)
+        self.assertEqual(self.fixture.statuses(output)["runtime_data"], "MISSING")
+        self.assertIn("assets/block_state_facts_1211.bin", output)
 
     def test_absent_pinned_compiler_is_reported_not_assumed(self):
         env = self.fixture.env(FAKE_TOOLCHAINS="1.91.0-x86_64-unknown-linux-gnu")

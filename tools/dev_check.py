@@ -73,7 +73,16 @@ MIN_PYTHON = (3, 9)
 # Data the crate reads at run time relative to the repository root. This is the
 # coarse existence check: the producers below own the file-level truth.
 RUNTIME_DATA = (
-    "assets",
+    "assets/block_states_1211.json",
+    "assets/blocks_1211.json",
+    "assets/block_predicates_1211.bin",
+    "assets/block_state_facts_1211.bin",
+    "assets/collision_shape_full_1211.bin",
+    "assets/mineshaft_support_1211.bin",
+    "assets/multiface_support_1211.bin",
+    "assets/structure_state_transforms_1211.bin",
+    "assets/template_solid_1211.bin",
+    "assets/feature_order_1211.json",
     "tests/data",
     "datapacks/vanilla",
     "config_packets.bin",
