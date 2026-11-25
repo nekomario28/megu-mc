@@ -1388,9 +1388,10 @@ fn environment_time_tick() {
         // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
         for b in fb.iter_mut() {
-            let dim = env_clients
+            let owner = env_clients
                 .iter()
-                .find(|client| client.eid == b.owner)
+                .find(|client| client.eid == b.owner);
+            let dim = owner
                 .map(|client| *client.dim.lock().unwrap_or_else(|e| e.into_inner()))
                 .unwrap_or(DimId::Overworld);
             if !region.is_hot(b.x as i32, b.z as i32) {
@@ -1418,7 +1419,37 @@ fn environment_time_tick() {
                 b.dx = 0.0;
                 b.dy = 0.0;
                 b.dz = 0.0;
-                if !b.bit && b.age > server_ticks(BOBBER_BITE_GT) as i32 {
+                let (luck, lure) = owner.map_or((0, 0), |client| fishing_enchant_levels(client));
+                let wait_roll = (b.eid.unsigned_abs() as u32).wrapping_mul(2654435761) % 501;
+                let wait = fishing_wait_ticks(lure, wait_roll);
+                let open_water = fishing_open_water(
+                    dim,
+                    b.x.floor() as i32,
+                    b.y.floor() as i32,
+                    b.z.floor() as i32,
+                );
+                let _category_weights = fishing_category_weights(luck, open_water);
+                let rain_bonus = RAINING.load(Ordering::Relaxed) > 0;
+                let sky_blocked = (1..=32).any(|dy| {
+                    breg().is_some_and(|registry| {
+                        !registry.is_air(block_at_dim(
+                            dim,
+                            b.x.floor() as i32,
+                            b.y.floor() as i32 + dy,
+                            b.z.floor() as i32,
+                        ))
+                    })
+                });
+                // Rain advances the bite countdown 25% faster; a blocked sky
+                // advances it at half speed, matching FishingHook's tick checks.
+                let mut countdown = b.age.max(0) as u32;
+                if rain_bonus {
+                    countdown = countdown.saturating_add(countdown / 4);
+                }
+                if sky_blocked {
+                    countdown /= 2;
+                }
+                if !b.bit && countdown >= wait {
                     b.bit = ((b.age as u64).wrapping_mul(2654435761) % 11) < 6;
                     if b.bit {
                         // vanilla FishingHook: on a bite the bobber dips, a

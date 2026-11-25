@@ -10,6 +10,57 @@ pub(crate) enum ContainerKey {
     Block(DimBlockPos),
     Cart([u8; 16]),
 }
+
+#[cfg(test)]
+mod alpha4_fishing_loot_tests {
+    use super::*;
+
+    #[test]
+    fn fishing_formulas_pin_vanilla_category_weights_and_wait() {
+        assert_eq!(fishing_category_weights(0, true), (85, 10, 5));
+        assert_eq!(fishing_category_weights(3, true), (82, 4, 11));
+        assert_eq!(fishing_category_weights(3, false), (82, 4, 0));
+        assert_eq!(fishing_category_weights(100, true), (0, 0, 205));
+        assert_eq!(fishing_wait_ticks(0, 0), 100);
+        assert_eq!(fishing_wait_ticks(0, 500), 600);
+        assert_eq!(fishing_wait_ticks(3, 500), 300);
+        assert_eq!(fishing_wait_ticks(3, 0), 20);
+    }
+
+    #[test]
+    fn open_water_check_checks_all_100_cells_and_rejects_obstructions() {
+        let water = |_x, y, _z| (y <= 0, y > 0, false);
+        assert!(is_open_water_check(water, 0, 0, 0));
+        let obstructed = |x, y, z| (y <= 0, y > 0, x == 2 && y == 1 && z == 0);
+        assert!(!is_open_water_check(obstructed, 0, 0, 0));
+        let mut seen = std::collections::HashSet::new();
+        is_open_water_check(|x, y, z| { seen.insert((x, y, z)); (y <= 10, y > 10, false) }, 4, 10, -3);
+        assert_eq!(seen.len(), 100);
+    }
+
+    #[test]
+    fn empty_datapack_catalogue_fills_vanilla_structure_chests_and_dispenser() {
+        let tables = loot_tables();
+        let mut loaded = tables.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::take(&mut *loaded);
+        drop(loaded);
+        for (name, id) in [
+            ("desert_pyramid", "minecraft:chests/desert_pyramid"),
+            ("jungle_temple", "minecraft:chests/jungle_temple"),
+            ("jungle_temple_dispenser", "minecraft:chests/jungle_temple_dispenser"),
+            ("simple_dungeon", "minecraft:chests/simple_dungeon"),
+            ("trial_chambers_reward", "minecraft:chests/trial_chambers/reward"),
+        ] {
+            let result = roll_loot_container_slots(
+                crate::generation_payload::ContainerKind::Chest,
+                id,
+                Some(4242),
+            );
+            assert!(!result.is_empty(), "{name} should have built-in loot");
+        }
+        *tables.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+    }
+}
 impl ContainerKey {
     /// The Overworld block key every dimension-less caller means until S3 threads a dimension
     /// through it.
@@ -3371,6 +3422,72 @@ fn fuel_ticks(item: i64) -> i32 {
 }
 static CHESTS: Registry<ContainerKey, HashMap<i16, Stack>> = OnceLock::new();
 
+pub(crate) fn fishing_category_weights(luck: i32, open_water: bool) -> (i32, i32, i32) {
+    (
+        (85 - luck).max(0),
+        (10 - 2 * luck).max(0),
+        if open_water { (5 + 2 * luck).max(0) } else { 0 },
+    )
+}
+
+pub(crate) fn fishing_wait_ticks(lure: i32, rng_roll: u32) -> u32 {
+    (100 + rng_roll.min(500))
+        .saturating_sub((lure.max(0) as u32).saturating_mul(100))
+        .max(20)
+}
+
+pub(crate) fn is_open_water_check(
+    mut state_at: impl FnMut(i32, i32, i32) -> (bool, bool, bool),
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            for dy in -2..=1 {
+                let (water_source, air_or_lily, solid) = state_at(x + dx, y + dy, z + dz);
+                if solid || (dy <= 0 && !water_source) || (dy > 0 && !air_or_lily) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn fishing_enchant_levels(client: &Client) -> (i32, i32) {
+    let selected = *client.held.lock().unwrap_or_else(|e| e.into_inner());
+    let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let components = inventory
+        .get(&(36 + selected))
+        .map(|stack| &stack.2);
+    components.map_or((0, 0), |components| {
+        (
+            enchant_level(components, 20).clamp(0, i32::MAX as i64) as i32,
+            enchant_level(components, 21).clamp(0, i32::MAX as i64) as i32,
+        )
+    })
+}
+
+pub(crate) fn fishing_open_water(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let Some(registry) = breg() else { return false };
+    let water = name_to_state("water").unwrap_or(u32::MAX);
+    let lily = name_to_state("lily_pad").unwrap_or(u32::MAX);
+    is_open_water_check(
+        |bx, by, bz| {
+            let state = block_at_dim(dim, bx, by, bz);
+            (
+                state == water,
+                registry.is_air(state) || state == lily,
+                registry.is_solid(state),
+            )
+        },
+        x,
+        y,
+        z,
+    )
+}
+
 fn roll_loot_container_slots(
     kind: crate::generation_payload::ContainerKind,
     loot_table: &str,
@@ -3404,8 +3521,28 @@ fn roll_loot_container_slots(
                 .collect::<Vec<_>>()
         });
         let mut out = HashMap::new();
-        if let Some(pools) = pools {
-            let items = roll_loot_seeded(&pools, seed);
+        let items = if let Some(pools) = pools {
+            roll_loot_seeded(&pools, seed)
+        } else {
+            crate::chest_loot::vanilla_loot_roll(loot_table, seed)
+                .into_iter()
+                .filter_map(|entry| {
+                    let item = name_to_item(entry.item)?;
+                    let mut components = Vec::new();
+                    if let Some((name, level)) = entry.enchantment {
+                        if let Some(id) = enchant_id(name) {
+                            comp_set(
+                                &mut components,
+                                COMP_ENCHANTMENTS,
+                                enchantments_data(&[(id, i64::from(level))], true),
+                            );
+                        }
+                    }
+                    Some((item, entry.count, components))
+                })
+                .collect()
+        };
+        if !items.is_empty() {
             // `LootTable.fill` fills `container.getContainerSize()`
             // slots, so the native menu size bounds the roll.
             let slot_limit = match kind {
@@ -13782,17 +13919,43 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                                 })
                                 .collect()
                         });
-                    let (fish, fcnt, fcomps) = table
-                        .and_then(|p| roll_loot(&p).into_iter().next())
-                        .unwrap_or((
-                            if (b.age as u64).is_multiple_of(5) {
-                                936
-                            } else {
-                                935
-                            },
-                            1,
-                            Vec::new(),
-                        ));
+                    let (luck, _lure) = fishing_enchant_levels(me);
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let open_water = fishing_open_water(
+                        dim,
+                        b.x.floor() as i32,
+                        b.y.floor() as i32,
+                        b.z.floor() as i32,
+                    );
+                    let context = crate::chest_loot::LootContext {
+                        luck: luck as f32,
+                        this_in_open_water: open_water,
+                        ..Default::default()
+                    };
+                    let built_in = crate::chest_loot::vanilla_loot_roll_with_context(
+                        "minecraft:gameplay/fishing",
+                        b.age as i64,
+                        &context,
+                    )
+                    .into_iter()
+                    .find_map(|entry| {
+                        let item = name_to_item(entry.item)?;
+                        let mut components = Vec::new();
+                        if let Some((name, level)) = entry.enchantment {
+                            if let Some(id) = enchant_id(name) {
+                                comp_set(
+                                    &mut components,
+                                    COMP_ENCHANTMENTS,
+                                    enchantments_data(&[(id, i64::from(level))], true),
+                                );
+                            }
+                        }
+                        Some((item, entry.count, components))
+                    });
+                    let catch = table.and_then(|p| roll_loot(&p).into_iter().next()).or(built_in);
+                    let Some((fish, fcnt, fcomps)) = catch else {
+                        return;
+                    };
                     let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
                     inv.insert(slot, (fish, fcnt, fcomps.clone()));
@@ -13801,6 +13964,14 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                    drop(inv);
+                    let xp = (world_rng::next_u64() % 6 + 1) as i32;
+                    let _ = send_player_xp(me, |xp_state| {
+                        let _ = add_player_xp_points(xp_state, xp);
+                        Ok(())
+                    });
+                    damage_held(me);
+                    held_slot_resync(me);
                 }
             } else {
                 let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());

@@ -2055,6 +2055,16 @@ fn catalogue_rng_seed(seed: i64) -> u64 {
 /// over the embedded JSON with an `Lcg` seeded by `seed`.
 #[allow(dead_code)]
 pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
+    vanilla_loot_roll_with_context(id, seed, &LootContext::default())
+}
+
+/// Roll an embedded vanilla table with caller supplied context (fishing luck,
+/// open-water predicates, and other context-sensitive loot conditions).
+pub(crate) fn vanilla_loot_roll_with_context(
+    id: &str,
+    seed: i64,
+    context: &LootContext,
+) -> Vec<LootEntry> {
     let Some(json) = vanilla_loot_table_json(id) else {
         return Vec::new();
     };
@@ -2067,7 +2077,7 @@ pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
         max_damage: &vanilla_loot_max_damage,
     };
     let mut rng = Lcg::new(catalogue_rng_seed(seed));
-    let items = evaluate_loot_table(&table, &LootContext::default(), &mut rng, &resolvers);
+    let items = evaluate_loot_table(&table, context, &mut rng, &resolvers);
     loot_items_to_entries(items, &mut rng)
 }
 
