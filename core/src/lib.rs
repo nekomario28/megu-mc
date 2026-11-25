@@ -226,6 +226,15 @@
 //!   invalidation, [`dep_graph::IncrementalDag::recompute_with_cutoff`]
 //!   early-cutoff verification that rescues untouched downstream
 //!   subgraphs, and zero-alloc topological [`dep_graph::IncrementalDag::dirty_order_into`].
+//! * [`mesh_elision`] — fail-closed vanilla/mod render-trait occlusion
+//!   classification for 100% buried-mesh rebuild elision, shared content-hash
+//!   section meshes through canonical FNV-1a/CRC32 fingerprints, and a
+//!   frame-paced GPU upload ring that bounds per-frame staging bytes without
+//!   starving oversized sections.
+//! * [`dst_oracle`] — TigerStyle deterministic simulation fuzzing with a
+//!   SplitMix64 operation stream, exact item-conservation and dimension-
+//!   membership invariants, canonical LZ4 restart archives, and SHA-256 Merkle
+//!   root equality with exact divergent-chunk pinpointing.
 //! * [`bloom`] — [`bloom::BlockedBloomFilter`], a 64-byte cache-line
 //!   blocked Bloom filter probing exactly one L1 line per lookup via
 //!   Kirsch–Mitzenmacher double hashing over canonical [`hash::fnv1a64`],
@@ -333,6 +342,7 @@ pub mod crowd_physics;
 pub mod crypto;
 pub mod dep_graph;
 pub mod diff_engine;
+pub mod dst_oracle;
 pub mod dye_and_items;
 pub mod fault_isolation;
 pub mod geom;
@@ -350,6 +360,7 @@ pub mod math;
 pub mod math_opt_engine;
 pub mod math_opt_foundation;
 pub mod merkle_cas;
+pub mod mesh_elision;
 pub mod morton;
 pub mod nbt_wire;
 pub mod net_budget;
