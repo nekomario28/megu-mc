@@ -290,10 +290,15 @@ class NeoForgeS3BatchTests(unittest.TestCase):
         (cls.root / "mods").mkdir()
         cls.pack_mod("S3Mod", MOD)
         cls.codec = cls.root / "decode"
+        core_rlib = cls.root / "libmegu_core.rlib"
+        cls.checked("rustc", "--edition=2021", "--crate-type", "rlib",
+                    "--crate-name", "megu_core", ROOT / "core/src/lib.rs",
+                    "-o", core_rlib)
         codec = cls.root / "decode.rs"
         codec.write_text(f'#![allow(dead_code)]\n#[path = "{ROOT / "src/landing_types.rs"}"]\n'
                          f'mod landing_types;\n{DECODER}')
-        cls.checked("rustc", "--edition=2021", "--cfg", 'feature="neoforge-events"', codec, "-o", cls.codec)
+        cls.checked("rustc", "--edition=2021", "--cfg", 'feature="neoforge-events"', codec,
+                    "--extern", f"megu_core={core_rlib}", "-o", cls.codec)
         source = cls.root / "BatchCheck.java"
         source.write_text(BATCH_RUNNER)
         cls.checked(tool_path(JAVA, "javac"), "--release", "21", "-cp", classpath.strip(), "-d", cls.root, source)
