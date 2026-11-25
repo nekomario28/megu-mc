@@ -595,7 +595,7 @@ def expected_declaration(writes, refused=()):
     change to the suite's normalization has to change this too, deliberately.
     """
     payloads = []
-    for index, (wrote, cells) in enumerate(((True, writes), (False, refused))):
+    for _index, (wrote, cells) in enumerate(((True, writes), (False, refused))):
         for x, y, z, sid in cells:
             payloads.append(f"RUNTIME {x} {y} {z} state={sid} wrote={'true' if wrote else 'false'} "
                             f"stack=dcw.a(SourceFile:267) | dcb.a(SourceFile:217) | aqb.a(SourceFile:691)")

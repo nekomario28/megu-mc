@@ -1173,7 +1173,7 @@ def check_client_config(corpus, gated):
                 continue
             for spath in spaths:
                 cp = owner + spath
-                for symbol, cand in direct.items():
+                for _symbol, cand in direct.items():
                     if cand["root"] != side["root"]:
                         continue
                     cpath = cand["path"]
@@ -1249,7 +1249,7 @@ def check_server_config(corpus, gated):
             m = re.search(r"\bLIVE_[A-Z0-9_]+\b", sc_code[bstart:end])
             static = m.group(0) if m else "LIVE_" + name[5:].upper()
             live_candidates[name] = (line_of(sc_raw, start), static)
-        for name, (line, static) in live_candidates.items():
+        for name, (_line, static) in live_candidates.items():
             needle = re.compile(
                 rf"\b(?:{re.escape(name)}|{re.escape(static)})\b")
             live_wired[name] = bool(evidence_sites(

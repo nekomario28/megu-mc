@@ -91,8 +91,10 @@ SPI=$(sample "$SPID")
 kill "$SPID" 2>/dev/null || true
 
 printf '\n%-14s %10s %10s %8s\n' "idle ${SECONDS_WINDOW}s" "cpu(s)" "rss(MiB)" "threads"
-printf '%-14s %10s %10s %8s\n' vanilla   $(echo "$VAN" | awk '{printf "%s %s %s", $1, $2, $3}')
-printf '%-14s %10s %10s %8s\n' megu  $(echo "$SPI" | awk '{printf "%s %s %s", $1, $2, $3}')
+read -r van_cpu van_rss van_threads <<< "$VAN"
+read -r megu_cpu megu_rss megu_threads <<< "$SPI"
+printf '%-14s %10s %10s %8s\n' vanilla "$van_cpu" "$van_rss" "$van_threads"
+printf '%-14s %10s %10s %8s\n' megu "$megu_cpu" "$megu_rss" "$megu_threads"
 echo
 grep -hE '\[wg\]' "$SPINE_DIR/spine.log" || true
 grep -oE 'Done \([0-9.]+s\)' "$VANILLA_DIR/server.log" | tail -1

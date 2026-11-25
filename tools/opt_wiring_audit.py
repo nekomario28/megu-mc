@@ -293,7 +293,7 @@ def target_feature_kernels(raw, code):
         fn_pos = match.end() + fn_match.start()
         # The fn keyword sits a few chars before the name; find the fn range
         # whose head contains this position.
-        for fn_name, start, body_start, end in fn_ranges(code):
+        for fn_name, start, _body_start, end in fn_ranges(code):
             if start <= fn_pos < end and fn_name == name:
                 kernels.append({
                     "name": name,
@@ -369,7 +369,7 @@ def simd_guard_violations(code, raw):
 
     def enclosing_fn(pos):
         best = None
-        for idx, (name, start, _, end) in enumerate(fns):
+        for idx, (_name, start, _, end) in enumerate(fns):
             if start <= pos < end and (best is None or start > fns[best][1]):
                 best = idx
         return best
@@ -383,7 +383,7 @@ def simd_guard_violations(code, raw):
     changed = True
     while changed:
         changed = False
-        for idx, (name, start, _, end) in enumerate(fns):
+        for idx, (name, _start, _, _end) in enumerate(fns):
             if idx in safe:
                 continue
             sites = [pos for pos in call_sites(code, name)

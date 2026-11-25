@@ -17,7 +17,6 @@ inline included), and `support` is the ground the scenes use.
 import argparse
 import json
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / 'datapacks/vanilla/data/minecraft/worldgen'

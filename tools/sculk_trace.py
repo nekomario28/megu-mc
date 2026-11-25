@@ -308,17 +308,6 @@ def sanity_problems(path, required=()):
     # `SDRAW` lines, and every one of them irrelevant to the question being asked. A value check
     # separates the two without hard-coding class names: the raw generator (`next(bits)`) returns
     # full-range values, the modifiers return < a few hundred.
-    def position_like(line):
-        if not line.startswith('SDRAW '):
-            return False
-        parts = line.split()
-        if 'bound' not in parts[1] and 'nextInt' not in parts[1]:
-            return False
-        try:
-            return abs(int(parts[2])) < 1024
-        except ValueError:
-            return False
-
     # The test that distinguishes a usable draw trace from a plausible-looking one, and the
     # structure it relies on (both measured, not assumed):
     #
@@ -348,7 +337,7 @@ def sanity_problems(path, required=()):
     # In-window evidence must be *before* the window's first `SPATCH`: draws that come after it
     # belong to the spreader, which is what made the too-shallow traces look healthy.
     in_window = 0
-    for i, cls in markers:
+    for i, _cls in markers:
         j = i + 1
         hit = False
         while j < len(lines) and not lines[j].startswith('SPLACE '):
@@ -557,18 +546,6 @@ def parse_port_draws(path):
         m = DRAW.search(raw)
         if m:
             out.append((int(m.group(2)), int(m.group(3)), m.group(4).strip(), m.group(5)))
-    return out
-
-
-def native_bounded_draws(path):
-    """[(bound, value)] from an ordered trace's `nextInt(bound)@cls(<bound>) <value>` lines."""
-    out = []
-    for line in trace_lines(path):
-        if not line.startswith('SDRAW '):
-            continue
-        m = re.match(r'SDRAW (\S*bound\S*)?\((\d+)\) (\d+)$', line)
-        if m:
-            out.append((int(m.group(2)), int(m.group(3))))
     return out
 
 
@@ -1070,11 +1047,6 @@ def main():
     s.set_defaults(func=cmd_pop_order)
 
     args = ap.parse_args()
-    positional = ['trace', 'traces', 'native', 'port', 'log']
-    for name in positional:
-        for value in ([getattr(args, name)] if isinstance(getattr(args, name, None), str)
-                      else getattr(args, name, []) or []):
-            pass
     for name in ['trace', 'native']:
         path = getattr(args, name, None)
         if isinstance(path, str) and reads_unordered(path) and args.cmd in (

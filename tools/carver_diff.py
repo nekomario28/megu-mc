@@ -31,7 +31,6 @@ Classifies every differing cell by the layer a worldgen fix would live in:
   feature   a non-air state above the column's vanilla top
 """
 import json
-import os
 import sys
 from collections import Counter
 from pathlib import Path

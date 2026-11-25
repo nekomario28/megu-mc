@@ -26,7 +26,8 @@ from java_toolchain import require_java_home, tool_path  # noqa: E402
 
 sys.path.insert(0, str(ROOT / "tests"))
 from container_wire import stack, wire_stack  # noqa: E402
-from protocol767 import (Client, Reader, AIR_STATES, WIRE_BLOCKS, frame,  # noqa: E402
+from protocol767 import AIR_STATES  # noqa: F401,E402 - re-exported to client parity probes
+from protocol767 import (Client, Reader, WIRE_BLOCKS, frame,  # noqa: E402
                          position, settings, string, vint)
 from wire_smoke import port, rcon_frame, rcon_response, recv_exact, recv_vint  # noqa: E402
 

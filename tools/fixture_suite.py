@@ -242,7 +242,7 @@ def read_boundary(fixture):
             raise Invalid(f"{path} field {key!r} must be a string, got {boundary[key]!r}")
     if boundary["mode"] != "frozen":
         raise Invalid(f"fixture mode is {boundary['mode']!r}, not 'frozen'")
-    runtime_writes = require_int(boundary["runtime_writes"], f"{path} field 'runtime_writes'")
+    require_int(boundary["runtime_writes"], f"{path} field 'runtime_writes'")
     for key in ("min_y", "height", "chunks", "seed"):
         require_int(boundary[key], f"{path} field {key!r}")
     subdir = boundary.get("world_subdirectory")

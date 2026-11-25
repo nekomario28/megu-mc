@@ -107,7 +107,7 @@ def main():
                 continue
             compared += 1
             d = 0
-            for i, (x, y) in enumerate(zip(A, B)):
+            for _i, (x, y) in enumerate(zip(A, B)):
                 if x != y:
                     d += 1
                     pairs[(names.get(x, str(x)), names.get(y, str(y)))] += 1

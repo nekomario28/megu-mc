@@ -671,7 +671,7 @@ def _crate_emissions(root):
     src_dir = Path(root) / "src"
     files = []
     consts = {}
-    for index, path in enumerate(sorted(src_dir.glob("*.rs"))):
+    for _index, path in enumerate(sorted(src_dir.glob("*.rs"))):
         if not path.is_file() or SRC_TEST_FILE.search(path.name):
             continue
         code = rust_code(path.read_text(encoding="utf-8"))
@@ -721,7 +721,7 @@ def _crate_emissions(root):
                         alive.add(callee)
                         queue.append(callee)
     sent = set()
-    for file_index, file in enumerate(files):
+    for _file_index, file in enumerate(files):
         code = file["code"]
         masked = list(code)
         for fn in file["functions"]:

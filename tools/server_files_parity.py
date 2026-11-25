@@ -339,7 +339,7 @@ def rust_string_at(text, pos):
     pos = _skip_space(text, pos)
     if pos >= len(text) or text[pos] != '"':
         return None
-    for start, end, content in string_literals(text[pos:]):
+    for start, _end, content in string_literals(text[pos:]):
         if start == 0:
             return _unescape_key(content)
     return None

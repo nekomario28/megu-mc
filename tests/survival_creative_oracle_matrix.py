@@ -33,12 +33,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools/client_diff"))
 sys.path.insert(0, str(ROOT / "tests"))
 
-from parity_client import (JAVA, JAR, JAR_SHA1, NAME as PROBE_NAME, RCON_PASS,  # noqa: E402
+from parity_client import (JAVA, JAR, JAR_SHA1, RCON_PASS,  # noqa: E402
                            ParityClient, command, offline_uuid, read_for, until)
 from protocol767 import (AIR_STATES, WIRE_BLOCKS, Reader, position,  # noqa: E402
-                         signed, unpack_position, vint, palette, STATE_COUNT)
+                         unpack_position, vint, palette, STATE_COUNT)
 from gp3_gp4_gp5_wire import block_properties  # noqa: E402
-from wire_smoke import port, rcon_frame, rcon_response  # noqa: E402
+from wire_smoke import port  # noqa: E402
 
 CLIENT_NAME = "MatrixProbe"
 SEED = 4242
@@ -849,7 +849,7 @@ def server_session(kind, binary, root, jar=JAR):
                         break
                 except OSError:
                     if time.monotonic() > deadline:
-                        raise TimeoutError(f"{kind} listener not ready")
+                        raise TimeoutError(f"{kind} listener not ready") from None
                     time.sleep(0.25)
             yield game, rcon_port
         finally:
@@ -1497,7 +1497,7 @@ def verify_snapshot(client, rcon_port, name, snap, origin, kind=None):
         skylight = client.has_skylight
         found = None
         encodings = set()
-        for coord, body in client.raw_chunk.items():
+        for _coord, body in client.raw_chunk.items():
             entries, enc = chunk_block_entities(body, biome, scount, lcount, skylight)
             encodings.add(enc)
             for bpos, btype, nbt in entries:

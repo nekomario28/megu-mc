@@ -551,7 +551,7 @@ class Scanner:
         return live
 
     def fn_is_live(self, source, fn):
-        for idx, (src, candidate) in enumerate(self.fn_index):
+        for idx, (_src, candidate) in enumerate(self.fn_index):
             if candidate is fn:
                 return idx in self.live()
         return not fn.dead
@@ -621,7 +621,7 @@ GAMERULE_PLUMBING = re.compile(
 def literal_occurrences(source, names):
     """name -> list of (offset, literal value)."""
     index = {}
-    for start, end, value in source.lits:
+    for start, _end, value in source.lits:
         bare = value.split(":")[-1]
         if bare in names:
             index.setdefault(bare, []).append((start, value))
@@ -874,7 +874,7 @@ def load_waivers(root):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
-        raise SystemExit(f"vanilla-mechanics: unreadable {path}: {error}")
+        raise SystemExit(f"vanilla-mechanics: unreadable {path}: {error}") from error
     if not isinstance(data, dict):
         raise SystemExit(f"vanilla-mechanics: {path} must hold a JSON object")
     return data

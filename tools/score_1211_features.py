@@ -780,7 +780,6 @@ class Evidence:
         # command names + token corpus
         self.command_names: set[str] = set()
         self.command_tokens: set[str] = set()
-        ce = find_file(self.files, "src/commands_execute.rs")
         cmd_files = files_matching(
             self.files,
             "commands_core",
@@ -1080,7 +1079,6 @@ def score_ench(row, ev):
             return PARTIAL, e
         return MISSING, ["no_enchantment_evidence"]
     # effect rows: component/effect-type keys listed in behavior
-    crit = row["behavior"].split("criteria:")[-1]
     keys = [
         k
         for k in re.findall(r"([a-z_]+)\s*:", row["behavior"])

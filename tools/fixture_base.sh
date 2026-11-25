@@ -14,7 +14,6 @@
 # affect world generation are written here, one by one, so the fixture conditions
 # are visible rather than inherited.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIR="${1:-${CARVER_FIXTURE_BASE:-/tmp/carverfresh}}"
 JAR_SHA1="${MEGU_VANILLA_JAR_SHA1:-59353fb40c36d304f2035d51e7d6e6baa98dc05c}"
 SEED="${MEGU_FIXTURE_SEED:-0}"

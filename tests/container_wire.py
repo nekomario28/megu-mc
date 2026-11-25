@@ -497,7 +497,7 @@ def exercise(game, rcon):
         set_creative(client, 36, chest, 3)
         for cell in row:
             place(client, (cell[0], cell[1] - 1, cell[2]))
-            client.until(lambda *_: client.block(*cell) != 0, "row-place")
+            client.until(lambda *_, cell=cell: client.block(*cell) != 0, "row-place")
         # Same split-update race as `place_pair`: the first chest's repair to
         # `left` lands after the second chest's own update.
         client.until(lambda *_: chest_type_at(by_name, client.block(*row[0]))

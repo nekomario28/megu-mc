@@ -350,7 +350,7 @@ class StrictGateTest(unittest.TestCase):
         self.assertLess(report["mode_a"]["parity"]["overall"]["pct"], 101)
 
     def test_min_overall_pct_0_exits_0(self):
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory():
             # run from an empty-ish repo? mode_a needs repo; use real repo.
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):

@@ -13,7 +13,7 @@ Also prints how many coarse clusters each side's cells form (`--clusters`), beca
 """
 import json
 import sys
-from collections import Counter, defaultdict, deque
+from collections import Counter, deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]

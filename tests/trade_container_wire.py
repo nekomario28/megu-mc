@@ -230,6 +230,6 @@ if __name__ == "__main__":
         summary["status"] = "FAIL"
         summary["failure"] = getattr(error, "code", str(error))
         print(json.dumps(summary, sort_keys=True))
-        raise SystemExit(1)
+        raise SystemExit(1) from None
     summary["status"] = "PASS"
     print(json.dumps(summary, sort_keys=True))

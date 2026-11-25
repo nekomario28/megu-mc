@@ -42,7 +42,7 @@ import tempfile
 import time
 import zipfile
 
-from protocol767 import Client, ContractFailure, Reader, ROOT, require, string, vint
+from protocol767 import Client, ContractFailure, Reader, ROOT, require, string
 from wire_smoke import port, status
 
 

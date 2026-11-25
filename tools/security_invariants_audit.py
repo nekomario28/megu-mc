@@ -104,7 +104,7 @@ def audit(root):
             checks[f"no new wall-clock/panic locks: {name}"] = not (known - LEGACY_PLAY_LOCKS)
         else:
             checks[f"no wall-clock/panic locks: {name}"] = not matches
-    for name, error in errors.items():
+    for name, _error in errors.items():
         checks[f"readable: {name}"] = False
     return checks, errors
 

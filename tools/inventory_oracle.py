@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import zipfile
 
-from container_oracle import ROOT, SOURCE, reference as container_reference, require_equal
+from container_oracle import ROOT, reference as container_reference, require_equal
 from vanilla_java import DEFAULT_JAR
 
 FIXTURE = ROOT / "evidence/gameplay/inventory-pickup/vanilla.json"

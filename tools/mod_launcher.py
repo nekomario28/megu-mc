@@ -604,7 +604,7 @@ def _entries_of(source):
                     continue
                 yield name, lambda n=name: archive.read(n)
     except zipfile.BadZipFile as error:
-        raise LauncherError(f"not a readable jar/zip: {source} ({error})")
+        raise LauncherError(f"not a readable jar/zip: {source} ({error})") from error
 
 
 def _read_limited(read, limit=MAX_DATA_ENTRY_BYTES):
@@ -986,7 +986,7 @@ def discover_native_bundles(mods_dir, target):
                     raise ValueError("bundle is not a regular file within the 4 MiB limit")
                 doc = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, ValueError) as error:
-                raise LauncherError(f"invalid native bundle {path}: {error}")
+                raise LauncherError(f"invalid native bundle {path}: {error}") from error
             if not isinstance(doc, dict) or doc.get("schema") != "megu-mod-bundle/1":
                 raise LauncherError(f"invalid native bundle {path}: unsupported schema")
             if set(doc) - allowed:
@@ -1133,13 +1133,13 @@ def run_shimcheck(jars, args):
         try:
             report = json.loads(args.shimcheck_json.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
-            raise LauncherError(f"cannot read --shimcheck-json: {error}")
+            raise LauncherError(f"cannot read --shimcheck-json: {error}") from error
     else:
         command = _shimcheck_command(args, jars)
         try:
             proc = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
         except OSError as error:
-            raise LauncherError(f"shimcheck failed to start: {error}")
+            raise LauncherError(f"shimcheck failed to start: {error}") from error
         if proc.returncode not in (0, 2) or not proc.stdout.strip():
             raise LauncherError(
                 f"shimcheck failed (exit {proc.returncode}): {proc.stderr.strip()}"
@@ -1147,7 +1147,7 @@ def run_shimcheck(jars, args):
         try:
             report = json.loads(proc.stdout)
         except ValueError as error:
-            raise LauncherError(f"shimcheck emitted invalid JSON: {error}")
+            raise LauncherError(f"shimcheck emitted invalid JSON: {error}") from error
     reports = {}
     for item in report.get("jars", []):
         jar = item.get("jar")
@@ -1511,7 +1511,7 @@ def _run_command(argv, env):
     try:
         proc = subprocess.run(argv, cwd=ROOT, env=env, check=False)
     except OSError as error:
-        raise LauncherError(f"failed to launch {argv[0]}: {error}")
+        raise LauncherError(f"failed to launch {argv[0]}: {error}") from error
     return proc.returncode
 
 
@@ -1837,7 +1837,7 @@ def parse_modrinth_manifest(text):
     try:
         root = json.loads(text)
     except ValueError as error:
-        raise ModpackError(f"{ctx}: {error}")
+        raise ModpackError(f"{ctx}: {error}") from error
     if not isinstance(root, dict):
         raise ModpackError(f"{ctx}: root must be an object")
 
@@ -1914,7 +1914,7 @@ def parse_curseforge_manifest(text):
     try:
         root = json.loads(text)
     except ValueError as error:
-        raise ModpackError(f"{ctx}: {error}")
+        raise ModpackError(f"{ctx}: {error}") from error
     if not isinstance(root, dict):
         raise ModpackError(f"{ctx}: root must be an object")
 
@@ -2018,18 +2018,18 @@ def _load_modpack_document(path):
                 except (KeyError, RuntimeError,
                         UnicodeDecodeError) as error:
                     raise ModpackError(
-                        f"{path.name}: cannot read {member} ({error})")
+                        f"{path.name}: cannot read {member} ({error})") from error
         except zipfile.BadZipFile as error:
             raise ModpackError(
-                f"not a readable pack archive: {path} ({error})")
+                f"not a readable pack archive: {path} ({error})") from error
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        raise ModpackError(f"cannot read --modpack {path}: {error}")
+        raise ModpackError(f"cannot read --modpack {path}: {error}") from error
     try:
         doc = json.loads(text)
     except ValueError as error:
-        raise ModpackError(f"{path.name}: invalid JSON ({error})")
+        raise ModpackError(f"{path.name}: invalid JSON ({error})") from error
     if not isinstance(doc, dict):
         raise ModpackError(f"{path.name}: root must be an object")
     if "manifestType" in doc or path.name == "manifest.json":

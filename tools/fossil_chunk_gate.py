@@ -151,7 +151,7 @@ def census_of(rows, cx, cz, min_y, height):
     air = cave = void = 0
     expected = 16 * 16 * height
     seen = set()
-    for (x, y, z), state in rows.items():
+    for (x, y, z), _state in rows.items():
         if not (cx * 16 <= x < (cx + 1) * 16 and cz * 16 <= z < (cz + 1) * 16):
             raise GateError(f"fixture cell ({x},{y},{z}) escapes chunk ({cx},{cz})")
         if not (min_y <= y < min_y + height):

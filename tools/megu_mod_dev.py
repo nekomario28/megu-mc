@@ -588,7 +588,7 @@ class BundleValidator:
         value = obj[key]
         reason = resource_location_error(value)
         if reason:
-            self._fail(target, "bundle.id", f"invalid resource location {value!r}: {reason}", f"use lowercase [a-z0-9_./-] with one optional ':' namespace")
+            self._fail(target, "bundle.id", f"invalid resource location {value!r}: {reason}", "use lowercase [a-z0-9_./-] with one optional ':' namespace")
             return None
         return value
 
@@ -1604,8 +1604,8 @@ def render_neoforge_toml(manifest):
     mod = manifest["mod"]
     return "\n".join(
         [
-            f'modLoader = "javafml"',
-            f'loaderVersion = "[4,)"',
+            'modLoader = "javafml"',
+            'loaderVersion = "[4,)"',
             f"license = {dump_toml_string(mod['license'])}",
             "",
             "[[mods]]",

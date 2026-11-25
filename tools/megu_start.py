@@ -775,7 +775,7 @@ def main(argv=None):
             plan["action_items"].append(diagnose_error(tail.decode("utf-8", errors="replace"), lang))
             return output(plan, args.json, lang, 1)
         return output(plan, args.json, lang, 0)
-    except (OSError, ValueError, UnicodeError) as error:
+    except (OSError, ValueError, UnicodeError):
         # Do not include exception text: it can contain operator credentials.
         plan["action_items"].append("\n".join(MESSAGES["input"][lang]))
         return output(plan, args.json, lang, 1)

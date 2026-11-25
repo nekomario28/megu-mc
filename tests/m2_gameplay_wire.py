@@ -127,7 +127,7 @@ def time_weather(game):
         for text, expected in (("rain", 1), ("thunder", 1), ("clear", 2)):
             before = len(client.weather_events)
             command(client, "weather " + text)
-            client.until(lambda *_: len(client.weather_events) >= before + 2,
+            client.until(lambda *_, before=before: len(client.weather_events) >= before + 2,
                          "weather-transition-0x22-" + text)
             events = client.weather_events[before:]
             require(any(code == expected for code, _ in events),

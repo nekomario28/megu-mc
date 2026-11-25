@@ -2,7 +2,6 @@
 """Recompute the committed nextInt(bound) vectors from the pinned 1.21.1 classes."""
 import argparse
 import hashlib
-import json
 from pathlib import Path
 import sys
 

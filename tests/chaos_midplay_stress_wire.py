@@ -213,7 +213,7 @@ def chaos_server(binary, world, log_name="chaos-server.log", power_cut=False):
             proc.kill()
             proc.wait()
             log.close()
-            raise AssertionError("server did not stop within 5 seconds")
+            raise AssertionError("server did not stop within 5 seconds") from None
         log.flush()
         log.seek(0)
         output = log.read()

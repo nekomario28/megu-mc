@@ -180,7 +180,7 @@ def check_state_asset(root, *, allow_missing=False):
     try:
         asset = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as error:
-        raise Unrunnable(f"{STATE_ASSET}: {error}")
+        raise Unrunnable(f"{STATE_ASSET}: {error}") from error
     failures = []
     got = asset.get("jar_sha1")
     if got != PINNED_JAR_SHA1:
