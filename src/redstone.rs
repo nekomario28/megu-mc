@@ -106,6 +106,17 @@ impl RsDir {
     }
 }
 
+/// Vanilla `CollectingNeighborUpdater.UPDATE_ORDER`; the notification order
+/// determines `subTickOrder` when several neighboring devices schedule work.
+const RS_NEIGHBOR_UPDATE_ORDER: [RsDir; 6] = [
+    RsDir::West,
+    RsDir::East,
+    RsDir::Down,
+    RsDir::Up,
+    RsDir::North,
+    RsDir::South,
+];
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RsPos(i32, i32, i32);
@@ -1634,7 +1645,7 @@ fn rs_observer_neighbor_update(world: &mut impl RedstoneUpdates, pos: RsPos, cha
 /// observer pulses ride the same entry path as every other notification.
 #[cfg_attr(not(test), allow(dead_code))]
 fn rs_notify_block_update(world: &mut impl RedstoneUpdates, changed: RsPos) {
-    for dir in RsDir::ALL {
+    for dir in RS_NEIGHBOR_UPDATE_ORDER {
         rs_observer_neighbor_update(world, changed.relative(dir), changed);
     }
 }
@@ -2365,7 +2376,6 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
                     powered: false,
                 }
             } else {
-                world.schedule(pos, RS_OBSERVER_PULSE_TICKS, RsTickPriority::Normal);
                 RsBlock::Observer {
                     facing,
                     powered: true,
@@ -2376,6 +2386,13 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
     };
     if updated != block {
         world.set_component(pos, updated);
+        // Vanilla `ObserverBlock.tick` first writes POWERED=true, which
+        // notifies observers watching this block, then schedules its own
+        // powered-off tick. Preserve that subTickOrder when both are due at
+        // the same game tick.
+        if matches!(block, RsBlock::Observer { powered: false, .. }) {
+            world.schedule(pos, RS_OBSERVER_PULSE_TICKS, RsTickPriority::Normal);
+        }
     }
 }
 
@@ -5074,6 +5091,90 @@ mod p6c_redstone_parity_tests {
             },
             "two-game-tick pulse, like vanilla"
         );
+    }
+
+    #[test]
+    fn observer_neighbor_notifications_follow_vanilla_update_order() {
+        let mut grid = RedstoneSimGrid::default();
+        let changed = RsPos(0, 0, 0);
+        for dir in RS_NEIGHBOR_UPDATE_ORDER {
+            grid.set_block(
+                changed.relative(dir),
+                RsBlock::Observer {
+                    facing: dir.opposite(),
+                    powered: false,
+                },
+            );
+        }
+
+        // Discard notifications caused while setting up the six observers.
+        grid.ticks.clear();
+        grid.pending.clear();
+        grid.next_sequence = 0;
+        rs_notify_block_update(&mut grid, changed);
+
+        let mut scheduled: Vec<_> = grid
+            .ticks
+            .clone()
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((_, _, sequence, pos))| (sequence, pos))
+            .collect();
+        scheduled.sort_by_key(|(sequence, _)| *sequence);
+        assert_eq!(
+            scheduled
+                .into_iter()
+                .map(|(_, pos)| pos)
+                .collect::<Vec<_>>(),
+            RS_NEIGHBOR_UPDATE_ORDER.map(|dir| changed.relative(dir))
+        );
+    }
+
+    #[test]
+    fn observer_notifies_downstream_before_scheduling_its_off_tick() {
+        let mut grid = RedstoneSimGrid::default();
+        let source = RsPos(0, 0, 0);
+        let downstream = RsPos(1, 0, 0);
+        grid.set_block(
+            source,
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: false,
+            },
+        );
+        grid.set_block(
+            downstream,
+            RsBlock::Observer {
+                facing: RsDir::West,
+                powered: false,
+            },
+        );
+
+        grid.ticks.clear();
+        grid.pending.clear();
+        grid.next_sequence = 0;
+        grid.schedule(source, 1, RsTickPriority::Normal);
+        grid.advance(1);
+
+        assert_eq!(
+            grid.redstone_block(source),
+            RsBlock::Observer {
+                facing: RsDir::East,
+                powered: true,
+            }
+        );
+        assert_eq!(grid.pending.get(&downstream), Some(&1));
+        assert_eq!(grid.pending.get(&source), Some(&2));
+        let mut same_tick_order: Vec<_> = grid
+            .ticks
+            .clone()
+            .into_sorted_vec()
+            .into_iter()
+            .filter(|Reverse((due, _, _, _))| *due == 3)
+            .map(|Reverse((_, _, sequence, pos))| (sequence, pos))
+            .collect();
+        same_tick_order.sort_by_key(|(sequence, _)| *sequence);
+        assert_eq!(same_tick_order, [(1, downstream), (2, source)]);
     }
 
     #[test]
