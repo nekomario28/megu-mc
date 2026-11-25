@@ -31,13 +31,14 @@ Inside the tarball every member lives under the single directory
   <prefix>/tools/megu_mods.py                    public setup/mod management,
                                                 translation and data helpers
 
-The five-binary release suite is `megu` plus `megu-client`,
-`megu-mod-check`, `megu-world-migrate` and `megu-init`. Pass the
-server as `--binary` and each of the other four as `--extra-binary`, for example
-from the same Cargo release directory. Each binary is recorded independently
-in `release-manifest.json` under `files`, with its SHA-256, size and mode.
-The CLI also supports single-binary bundles and other companion binaries,
-including `megu-client-gpu` and `megu-client-gpu.exe`.
+The release matrix does not ship one fixed binary suite. Full desktop lanes
+ship `megu`, `megu-client-gpu` and `megu-installer`; server-only musl,
+FreeBSD and RISC-V lanes ship `megu` plus `megu-installer`; dynamic-musl
+client lanes ship `megu-client-gpu` alone. Pass the primary binary as
+`--binary` and each companion as `--extra-binary`. Each binary is recorded
+independently in `release-manifest.json` under `files`, with its SHA-256,
+size and mode. The CLI also supports single-binary bundles and Windows `.exe`
+companions.
 
 Determinism: members are sorted by name, written to a USTAR archive with
 mtime 0, uid/gid 0, empty uname/gname and modes normalised to 0644/0755, and

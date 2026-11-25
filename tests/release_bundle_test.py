@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the shipped five-binary suite and its real documentation offline."""
+"""Verify target-dependent release binary suites and their real documentation offline."""
 
 import hashlib
 import json
@@ -11,12 +11,17 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASE = ROOT / "tools/release_bundle.py"
-BINARIES = (
+DESKTOP_BINARIES = (
     "megu",
-    "megu-client",
-    "megu-mod-check",
-    "megu-world-migrate",
-    "megu-init",
+    "megu-client-gpu",
+    "megu-installer",
+)
+SERVER_ONLY_BINARIES = (
+    "megu",
+    "megu-installer",
+)
+MUSL_CLIENT_BINARIES = (
+    "megu-client-gpu",
 )
 DOCUMENTS = (
     "LICENSE",
@@ -53,20 +58,20 @@ def run(*args, expect=0):
     return process.stdout
 
 
-def test_five_binary_bundle():
+def test_desktop_three_binary_bundle():
     with tempfile.TemporaryDirectory(prefix="release-bundle-test-") as tmp:
         work = Path(tmp)
         bin_dir = work / "bin"
         bin_dir.mkdir()
         binary_bytes = {}
-        for name in BINARIES:
+        for name in DESKTOP_BINARIES:
             payload = f"\x7fELF self-test {name}\n".encode()
             (bin_dir / name).write_bytes(payload)
             (bin_dir / name).chmod(0o755)
             binary_bytes[name] = payload
 
         def build(out, companions):
-            argv = ["build", "--binary", bin_dir / BINARIES[0]]
+            argv = ["build", "--binary", bin_dir / DESKTOP_BINARIES[0]]
             for name in companions:
                 argv += ["--extra-binary", bin_dir / name]
             argv += ["--out-dir", out, "--version", VERSION,
@@ -75,8 +80,8 @@ def test_five_binary_bundle():
             return run(*argv)
 
         first, second = work / "first", work / "second"
-        build(first, BINARIES[1:])
-        build(second, reversed(BINARIES[1:]))
+        build(first, DESKTOP_BINARIES[1:])
+        build(second, reversed(DESKTOP_BINARIES[1:]))
         bundle_name = f"{PREFIX}.tar.gz"
         for name in (bundle_name, "release-manifest.json", "SHA256SUMS"):
             assert (first / name).read_bytes() == (second / name).read_bytes(), name
@@ -89,7 +94,7 @@ def test_five_binary_bundle():
         manifest = json.loads(manifest_path.read_text())
         assert manifest["license"] == "LGPL-3.0-or-later"
         assert manifest["subcrate_license"] == "LGPL-3.0-or-later"
-        expected = {f"{PREFIX}/{name}" for name in (*BINARIES, *DOCUMENTS, *TOOLS)}
+        expected = {f"{PREFIX}/{name}" for name in (*DESKTOP_BINARIES, *DOCUMENTS, *TOOLS)}
         records = {item["path"]: item for item in manifest["files"]}
         assert set(records) == expected, sorted(set(records) ^ expected)
 
@@ -107,7 +112,7 @@ def test_five_binary_bundle():
                 relative = member.name[len(PREFIX) + 1:]
                 assert "_1211" not in relative
                 assert not relative.endswith((".jar", ".class"))
-                if relative in BINARIES:
+                if relative in DESKTOP_BINARIES:
                     assert payload == binary_bytes[relative]
                     assert item["mode"] == "0755"
                 elif relative in DOCUMENTS:
@@ -125,7 +130,7 @@ def test_five_binary_bundle():
             contaminated = work / name
             contaminated.write_bytes(b"proprietary test input")
             out = work / f"refused-{name}"
-            argv = ["build", "--binary", bin_dir / BINARIES[0],
+            argv = ["build", "--binary", bin_dir / DESKTOP_BINARIES[0],
                     "--extra-binary", contaminated, "--out-dir", out,
                     "--version", VERSION, "--target", TARGET,
                     "--repo-root", ROOT, "--git-sha", GIT_SHA]
@@ -162,11 +167,43 @@ def test_optional_gpu_companion():
                 assert mods_member.mode == 0o755 and mods_member.mtime == 0
 
 
+def test_target_dependent_binary_suites():
+    cases = (
+        ("server-only", SERVER_ONLY_BINARIES),
+        ("musl-client", MUSL_CLIENT_BINARIES),
+    )
+    for label, binaries in cases:
+        with tempfile.TemporaryDirectory(prefix=f"release-{label}-") as tmp:
+            work = Path(tmp)
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            for name in binaries:
+                (bin_dir / name).write_bytes(f"fake {label} {name}\n".encode())
+            argv = ["build", "--binary", bin_dir / binaries[0]]
+            for name in binaries[1:]:
+                argv += ["--extra-binary", bin_dir / name]
+            argv += ["--out-dir", work / "out", "--version", VERSION,
+                     "--target", TARGET, "--repo-root", ROOT,
+                     "--git-sha", GIT_SHA]
+            run(*argv)
+            manifest_path = work / "out" / "release-manifest.json"
+            bundle = work / "out" / f"{PREFIX}.tar.gz"
+            run("verify", "--bundle", bundle, "--manifest", manifest_path,
+                "--sums", work / "out" / "SHA256SUMS")
+            records = {item["path"]: item for item in json.loads(manifest_path.read_text())["files"]}
+            for name in binaries:
+                assert f"{PREFIX}/{name}" in records, (label, name)
+            unexpected = set(DESKTOP_BINARIES) - set(binaries)
+            for name in unexpected:
+                assert f"{PREFIX}/{name}" not in records, (label, name)
+
+
 def main():
     run("--self-test")
-    test_five_binary_bundle()
+    test_desktop_three_binary_bundle()
+    test_target_dependent_binary_suites()
     test_optional_gpu_companion()
-    print("release bundle: self-test, five-binary suite, and optional GPU companions verified")
+    print("release bundle: self-test, target-dependent release suites, and optional GPU companions verified")
 
 
 if __name__ == "__main__":
