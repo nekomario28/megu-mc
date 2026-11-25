@@ -656,6 +656,8 @@ struct SessionRunner {
     /// `system_chat` packets seen this session — retained so a live session
     /// can surface chat/decoded-component coverage in diagnostics.
     system_chats: u64,
+    /// Number of protocol-owned frozen tick grants already consumed here.
+    consumed_ticking_steps: u64,
     last_chunk_at: Option<Instant>,
 }
 
@@ -685,6 +687,8 @@ impl SessionRunner {
                 self.client.send_keep_alive(id)?;
                 self.keep_alives += 1;
             }
+            PlayEvent::Ping(id) => self.client.send_pong(id)?,
+            PlayEvent::CookieRequest(key) => self.client.send_cookie_response(&key)?,
             PlayEvent::Teleport(tp) => {
                 // Apply first so 26.x can echo the resulting pose back in
                 // `accept_teleportation`; on 767 the wire output is identical.
@@ -776,14 +780,18 @@ impl SessionRunner {
             PlayEvent::SystemChat { .. } => {
                 self.system_chats += 1;
             }
+            PlayEvent::TickingState { frozen: false, .. } => {
+                // Grants left over when the server unfreezes no longer gate
+                // ordinary simulation ticks.
+                self.consumed_ticking_steps = self.client.ticking_steps;
+            }
             PlayEvent::Disconnect(reason) => {
                 return Err(format!("server disconnected during play: {reason}"));
             }
             PlayEvent::Other(_) => {}
-            // Extended 767 play families (entities, world, containers, HUD)
-            // decode into typed events; the session runner does not consume
-            // them yet, so they are acknowledged and dropped here.
-            _ => {}
+            // WorldState owns all other decoded world-relevant event families
+            // (including animation, attributes, passengers and block events).
+            _ => self.world.apply_play_event(&event)?,
         }
         Ok(())
     }
@@ -878,6 +886,7 @@ fn run_session_inner(
         death: crate::session::DeathLoopState::default(),
         death_retry: 0,
         system_chats: 0,
+        consumed_ticking_steps: 0,
         last_chunk_at: None,
     };
 
@@ -941,6 +950,21 @@ fn run_session_inner(
         let tick_start = Instant::now();
 
         while runner.poll_once(Duration::from_millis(1))? {}
+
+        // Frozen state and cumulative step grants are recorded by
+        // ProtocolClient. Keep receiving packets while paused so keepalive,
+        // resume and step messages continue to be handled.
+        while runner.client.is_frozen
+            && runner.consumed_ticking_steps >= runner.client.ticking_steps
+        {
+            if shutdown.is_some_and(crate::shutdown::ShutdownFlag::is_requested) {
+                return Err("session shutdown requested".into());
+            }
+            runner.poll_once(Duration::from_millis(10))?;
+        }
+        if runner.client.is_frozen {
+            runner.consumed_ticking_steps = runner.consumed_ticking_steps.saturating_add(1);
+        }
 
         let input = script_input(cfg.script, tick, runner.player.on_ground);
         let outcome = runner.player.step(&runner.world, input)?;

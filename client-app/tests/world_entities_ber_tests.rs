@@ -7,7 +7,7 @@
 
 use megu_client::protocol::{
     DecodedBlockEntity, DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta,
-    EquipmentEntry, PlayEvent,
+    EquipmentEntry, PlayEvent, WireAttribute,
 };
 use megu_client::world::{
     BlockTable, WorldState, MAX_BLOCK_DESTRUCTIONS, MAX_TRACKED_BLOCK_ENTITIES,
@@ -267,6 +267,68 @@ fn entity_spawn_move_teleport_motion_hurt_and_remove() {
     // -- removal --------------------------------------------------------------
     apply(&mut world, PlayEvent::RemoveEntities { eids: vec![42, 999] });
     assert!(world.entities.is_empty());
+}
+
+#[test]
+fn new_entity_and_block_events_are_retained_by_world_state() {
+    let mut world = test_world();
+    apply(&mut world, add_entity(42, 1.0, 2.0, 3.0));
+    apply(
+        &mut world,
+        PlayEvent::Animate {
+            eid: 42,
+            animation: 0,
+        },
+    );
+    apply(
+        &mut world,
+        PlayEvent::UpdateAttributes {
+            eid: 42,
+            attributes: vec![WireAttribute {
+                attribute: 5,
+                base: 20.0,
+                modifiers: Vec::new(),
+            }],
+        },
+    );
+    apply(
+        &mut world,
+        PlayEvent::SetPassengers {
+            vehicle: 42,
+            passengers: vec![7, 8],
+        },
+    );
+    apply(
+        &mut world,
+        PlayEvent::SetEntityLink {
+            source: 42,
+            destination: 7,
+        },
+    );
+    apply(
+        &mut world,
+        PlayEvent::BlockEvent {
+            pos: [1, 2, 3],
+            action: 1,
+            parameter: 2,
+            block_type: 54,
+        },
+    );
+    apply(
+        &mut world,
+        PlayEvent::TakeItemEntity {
+            item_entity: 90,
+            player: 42,
+            amount: 2,
+        },
+    );
+
+    assert_eq!(world.entities.get(&42).unwrap().last_animation, Some(0));
+    assert_eq!(world.entity_attributes[&42][0].base, 20.0);
+    assert_eq!(world.passengers[&42], [7, 8]);
+    assert_eq!(world.entity_links[&42], 7);
+    assert_eq!(world.block_events.back(), Some(&([1, 2, 3], 1, 2, 54)));
+    assert_eq!(world.item_pickups.back(), Some(&(90, 42, 2)));
 }
 
 #[test]
