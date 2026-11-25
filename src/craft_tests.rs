@@ -241,6 +241,30 @@ fn a_shaped_recipe_matches_at_a_non_zero_grid_offset() {
 }
 
 #[test]
+fn vanilla_log_crafting_keeps_each_species_and_four_plank_output() {
+    let _guard = crate::world_guard();
+    for (log, planks) in [
+        ("oak_log", "oak_planks"),
+        ("spruce_log", "spruce_planks"),
+        ("birch_log", "birch_planks"),
+        ("jungle_log", "jungle_planks"),
+        ("acacia_log", "acacia_planks"),
+        ("dark_oak_log", "dark_oak_planks"),
+        ("mangrove_log", "mangrove_planks"),
+        ("cherry_log", "cherry_planks"),
+        ("crimson_stem", "crimson_planks"),
+        ("warped_stem", "warped_planks"),
+    ] {
+        let grid = HashMap::from([(1, (name_to_item(log).unwrap(), 1, Vec::new()))]);
+        assert_eq!(
+            craft_result(&grid),
+            Some((name_to_item(planks).unwrap(), 4, Vec::new())),
+            "one {log} crafts four matching {planks}"
+        );
+    }
+}
+
+#[test]
 fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
     let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
