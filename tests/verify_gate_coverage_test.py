@@ -2,12 +2,12 @@
 """Release-gate coverage: verify.sh must keep up with the workspace it ships.
 
 A crate or feature that lands without a verify.sh stage is a release gate that
-cannot see it, and a crate whose target the EXIT trap does not remove can seed
-the next run's build. This test reads tests/verify.sh against the live tree:
+cannot see it. The verify.sh EXIT handler must preserve generated build outputs
+so the caller can inspect or reuse them. This test reads tests/verify.sh:
 
-* every top-level directory carrying a Cargo.toml is both tested
-  (`cargo test --manifest-path <dir>/Cargo.toml`) and cleaned in
-  `cleanup_verify_artifacts` (`<dir>/target` on the rm -rf line),
+* every top-level directory carrying a Cargo.toml is tested
+  (`cargo test --manifest-path <dir>/Cargo.toml`) and its build output is
+  preserved by the verify.sh EXIT handler,
 * every adapter feature declared in the root [features] table is exercised
   (`--features <name>` somewhere in the script), and
 * every tests/*.py — not just *_test.py, so wire/oracle/live scripts cannot
@@ -89,9 +89,9 @@ def declared_features():
     return set(_FEATURE_KEY.findall(table.group(1)))
 
 
-def cleanup_body(script):
-    match = re.search(r"(?ms)^cleanup_verify_artifacts\(\)\s*\{(.*?)^\}", script)
-    assert match is not None, "verify.sh has no cleanup_verify_artifacts function"
+def artifact_report_body(script):
+    match = re.search(r"(?ms)^report_verify_artifacts\(\)\s*\{(.*?)^\}", script)
+    assert match is not None, "verify.sh has no report_verify_artifacts function"
     return match.group(1)
 
 
@@ -125,13 +125,18 @@ class VerifyGateCoverage(unittest.TestCase):
                     rf"(?m)^cargo test --manifest-path {re.escape(crate)}/Cargo\.toml\b",
                     f"verify.sh does not cargo-test {crate}")
 
-    def test_every_root_crate_target_is_cleaned_on_exit(self):
-        body = cleanup_body(verify_script())
-        self.assertIn("rm -rf", body)
+    def test_exit_handler_preserves_artifacts_without_destructive_cleanup(self):
+        script = verify_script()
+        body = artifact_report_body(script)
+        self.assertRegex(script, r"(?m)^trap report_verify_artifacts EXIT$")
+        self.assertNotRegex(body, r"(?m)\b(?:rm|rmdir|unlink)\b")
         for crate in root_crates():
             with self.subTest(crate=crate):
-                self.assertIn(f"{crate}/target", body,
-                              f"cleanup_verify_artifacts does not remove {crate}/target")
+                self.assertNotIn(f"{crate}/target", body,
+                                 f"EXIT handler must preserve {crate}/target")
+        self.assertIn("preserving build manifest", body)
+        self.assertIn("preserving Cargo target directories", body)
+        self.assertIn("target/companion-e2e", body)
 
     def test_every_adapter_feature_is_checked_in_verify_sh(self):
         script = verify_script()

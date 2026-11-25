@@ -193,6 +193,8 @@ python3 tests/verify_gate_coverage_test.py
 python3 tests/payload_wiring_audit_test.py
 python3 tools/payload_wiring_audit.py --strict
 
+python3 tests/clippy_ratchet_test.py
+
 echo "== module layering"
 python3 tests/layers_gate_test.py
 bash tools/layers_check.sh || exit 1
@@ -201,22 +203,14 @@ echo "== debt ratchet"
 bash tools/debt_ratchet.sh || exit 1
 bash tools/clippy_ratchet.sh || exit 1
 
-# The trap is installed before the first stage that writes a standalone crate's target, so a red
-# standalone crate does not leave its target behind for the next run to build against.
-build_manifest=$(mktemp)
-cleanup_verify_artifacts() {
-  rm -f "$build_manifest"
-  rm -rf client-port/target client-kernel/target client-app/target client-ui/target client-gpu/target mod-offload/target \
-      mod-adapter-core/target create-adapter/target proto/target state-store/target \
-      server-files/target core/target wasm-mod-runtime/target \
-      tools/palette_bench/target tools/storage_bench/target tools/offload_ffi_probe/target
-  # The companion suite only writes repo-local output when CARGO_TARGET_DIR is
-  # unset; a caller-provided target dir is the caller's to keep.
-  if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    rm -rf target/companion-e2e
-  fi
+# Keep the cargo message manifest in TMPDIR and report generated artifacts on exit. Build outputs
+# are preserved so a failed standalone crate remains available for inspection or a later run.
+build_manifest=$(mktemp "$TMPDIR/verify-build-manifest.XXXXXX")
+report_verify_artifacts() {
+  printf 'verify: preserving build manifest at %s\n' "$build_manifest"
+  printf '%s\n' 'verify: preserving Cargo target directories, including standalone crate targets and target/companion-e2e'
 }
-trap cleanup_verify_artifacts EXIT
+trap report_verify_artifacts EXIT
 
 echo "== standalone crates"
 cargo test --manifest-path client-port/Cargo.toml --offline --locked -j 2
