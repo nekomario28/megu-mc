@@ -2462,6 +2462,40 @@ pub struct DecodedEntityMetadataEntry {
     pub value: DecodedEntityMetadataValue,
 }
 
+/// Typed projection of Protocol 767's `level_event` packet effect ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisualLevelEvent {
+    BlockDestroy { block_state: i32 },
+    SplashPotion { rgb: i32, instant: bool },
+    Bonemeal { count: i32 },
+    DragonDeath,
+    WitherSpawn,
+    EndPortalOpen,
+    PortalTravel,
+    Other { event: i32, data: i32 },
+}
+
+/// Map the Protocol 767 `level_event` id and its data payload to a renderer-facing value.
+pub fn visual_level_event(event: i32, data: i32) -> VisualLevelEvent {
+    match event {
+        2001 => VisualLevelEvent::BlockDestroy { block_state: data },
+        2002 => VisualLevelEvent::SplashPotion {
+            rgb: data,
+            instant: false,
+        },
+        2007 => VisualLevelEvent::SplashPotion {
+            rgb: data,
+            instant: true,
+        },
+        2005 => VisualLevelEvent::Bonemeal { count: data },
+        1028 => VisualLevelEvent::DragonDeath,
+        1023 => VisualLevelEvent::WitherSpawn,
+        1038 => VisualLevelEvent::EndPortalOpen,
+        1032 => VisualLevelEvent::PortalTravel,
+        _ => VisualLevelEvent::Other { event, data },
+    }
+}
+
 /// Decode the index/type/value sequence held in `set_entity_data`.
 pub fn decode_entity_metadata(raw: &[u8]) -> Result<Vec<DecodedEntityMetadataEntry>, String> {
     let mut r = WireReader::new(raw);

@@ -7,6 +7,8 @@ use megu_client::protocol::{
     decode_particle_options, pack_position, write_varint, DecodedBossBarAction,
     DecodedEntityMetadataValue, DecodedParticleOptions, PlayEvent, VibrationSource,
 };
+use megu_client::protocol::{visual_level_event, VisualLevelEvent};
+use megu_client::render::project_render_snapshot;
 use megu_client::world::{BlockTable, WorldState};
 
 fn vi(value: i32) -> Vec<u8> {
@@ -21,6 +23,639 @@ fn f32be(value: f32) -> [u8; 4] {
 
 fn test_world() -> WorldState {
     WorldState::new(DimensionMeta::default(), BlockTable::builtin())
+}
+
+fn spawn(world: &mut WorldState, eid: i32, entity_type: i32) {
+    world
+        .apply_play_event(&PlayEvent::AddEntity {
+            eid,
+            uuid: [eid as u8; 16],
+            entity_type,
+            x: f64::from(eid),
+            y: 64.0,
+            z: -2.0,
+            pitch: 0.0,
+            yaw: 90.0,
+            head_yaw: 90.0,
+            data: 0,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+        })
+        .unwrap();
+}
+
+fn metadata(index: u8, kind: u8, payload: &[u8], out: &mut Vec<u8>) {
+    out.push(index);
+    out.extend(vi(i32::from(kind)));
+    out.extend_from_slice(payload);
+}
+
+fn nbt_string(name: &str, value: &str) -> Vec<u8> {
+    let mut out = vec![8];
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+fn nbt_int(name: &str, value: i32) -> Vec<u8> {
+    let mut out = vec![3];
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&value.to_be_bytes());
+    out
+}
+
+fn nbt_empty_list(name: &str) -> Vec<u8> {
+    let mut out = vec![9];
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend([0, 0, 0, 0, 0]);
+    out
+}
+
+fn nbt_string_list(name: &str, values: &[&str]) -> Vec<u8> {
+    let mut out = vec![9];
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.push(8);
+    out.extend_from_slice(&(values.len() as i32).to_be_bytes());
+    for value in values {
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value.as_bytes());
+    }
+    out
+}
+
+fn nbt_named_compound(name: &str, fields: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut out = vec![10];
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name.as_bytes());
+    for field in fields {
+        out.extend(field);
+    }
+    out.push(0);
+    out
+}
+
+fn nbt_compound(fields: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut out = vec![10];
+    for field in fields {
+        out.extend(field);
+    }
+    out.push(0);
+    out
+}
+
+#[test]
+fn typed_entity_visual_accessors_cover_shared_and_mob_metadata() {
+    let mut world = test_world();
+    for (eid, entity_type) in [
+        (1, 87),
+        (2, 87),
+        (3, 23),
+        (4, 113),
+        (5, 88),
+        (6, 119),
+        (7, 116),
+        (8, 33),
+    ] {
+        spawn(&mut world, eid, entity_type);
+    }
+
+    let mut shared = Vec::new();
+    metadata(0, 0, &[0x7b], &mut shared); // all six shared visual flags
+    metadata(6, 20, &vi(5), &mut shared);
+    metadata(9, 3, &f32be(17.5), &mut shared);
+    metadata(16, 8, &[1], &mut shared); // ageable baby flag
+    shared.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 1,
+            raw_entries: shared,
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::Animate {
+            eid: 1,
+            animation: 0,
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::HurtAnimation { eid: 1, yaw: 0.0 })
+        .unwrap();
+    let visual = world.entity_visual_state(1).unwrap();
+    assert!(
+        visual.on_fire
+            && visual.crouching
+            && visual.sprinting
+            && visual.swimming
+            && visual.invisible
+            && visual.glowing
+    );
+    assert!(visual.is_baby);
+    assert_eq!(
+        (
+            visual.health,
+            visual.pose,
+            visual.hurt_ticks,
+            visual.swing_ticks
+        ),
+        (Some(17.5), Some(5), 10, 6)
+    );
+
+    let mut sheep = Vec::new();
+    metadata(17, 0, &[0x13], &mut sheep);
+    sheep.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 2,
+            raw_entries: sheep,
+        })
+        .unwrap();
+    assert_eq!(
+        (
+            world.entity_visual_state(2).unwrap().sheep_color,
+            world.entity_visual_state(2).unwrap().sheep_sheared
+        ),
+        (Some(3), Some(true))
+    );
+
+    let mut creeper = Vec::new();
+    metadata(16, 1, &vi(2), &mut creeper);
+    metadata(17, 8, &[1], &mut creeper);
+    creeper.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 3,
+            raw_entries: creeper,
+        })
+        .unwrap();
+    let visual = world.entity_visual_state(3).unwrap();
+    assert_eq!(
+        (visual.creeper_state, visual.creeper_charged),
+        (Some(2), Some(true))
+    );
+
+    let mut villager = vec![17];
+    villager.extend(vi(18));
+    villager.extend(vi(2));
+    villager.extend(vi(5));
+    villager.extend(vi(3));
+    villager.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 4,
+            raw_entries: villager,
+        })
+        .unwrap();
+    assert_eq!(
+        world.entity_visual_state(4).unwrap().villager_data,
+        Some((2, 5, 3))
+    );
+
+    let mut shulker = Vec::new();
+    metadata(18, 0, &[7], &mut shulker);
+    shulker.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 5,
+            raw_entries: shulker,
+        })
+        .unwrap();
+    assert_eq!(world.entity_visual_state(5).unwrap().shulker_peek, Some(7));
+    for (eid, index, expected) in [(6, 16, 20), (7, 16, 90)] {
+        let mut raw = Vec::new();
+        metadata(index, 1, &vi(expected), &mut raw);
+        raw.push(0xff);
+        world
+            .apply_play_event(&PlayEvent::SetEntityData {
+                eid,
+                raw_entries: raw,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        world.entity_visual_state(6).unwrap().wither_invul_ticks,
+        Some(20)
+    );
+    assert_eq!(world.entity_visual_state(7).unwrap().warden_anger, Some(90));
+    let mut enderman = Vec::new();
+    let mut carried = vec![1];
+    carried.extend(vi(123));
+    metadata(16, 15, &carried, &mut enderman);
+    enderman.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 8,
+            raw_entries: enderman,
+        })
+        .unwrap();
+    assert_eq!(
+        world.entity_visual_state(8).unwrap().enderman_carried_block,
+        Some(123)
+    );
+
+    spawn(&mut world, 9, 58);
+    let mut item = Vec::new();
+    metadata(8, 7, &[0], &mut item);
+    item.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 9,
+            raw_entries: item,
+        })
+        .unwrap();
+    assert_eq!(
+        world.entity_visual_state(9).unwrap().dropped_item_stack,
+        Some(vec![0])
+    );
+    spawn(&mut world, 10, 1); // area-effect cloud also uses entity-specific metadata indexes
+    let mut unrelated = Vec::new();
+    metadata(16, 1, &vi(2), &mut unrelated);
+    metadata(17, 8, &[1], &mut unrelated);
+    unrelated.push(0xff);
+    world
+        .apply_play_event(&PlayEvent::SetEntityData {
+            eid: 10,
+            raw_entries: unrelated,
+        })
+        .unwrap();
+    let visual = world.entity_visual_state(10).unwrap();
+    assert_eq!((visual.creeper_state, visual.creeper_charged), (None, None));
+}
+
+#[test]
+fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
+    let mut world = test_world();
+    let pos = [4, 70, -3];
+    let raw = nbt_compound(vec![nbt_string("id", "minecraft:trapped_chest")]);
+    world
+        .apply_play_event(&PlayEvent::BlockEntityData {
+            pos,
+            kind: 1,
+            nbt_bytes: raw,
+        })
+        .unwrap();
+    assert_eq!(
+        world.block_entity_visual_state(pos),
+        Some(megu_client::world::BlockEntityVisualState::Chest {
+            open_count: 0,
+            trapped: true,
+            ender: false
+        })
+    );
+    let event_pos = megu_client::protocol::pack_position(pos)
+        .to_be_bytes()
+        .to_vec();
+    let mut body = event_pos;
+    body.extend([1, 3]);
+    body.extend(vi(0));
+    let event = decode_extended_play_event("block_event", &body)
+        .unwrap()
+        .unwrap();
+    world.apply_play_event(&event).unwrap();
+    assert_eq!(
+        world.block_entity_visual_state(pos),
+        Some(megu_client::world::BlockEntityVisualState::Chest {
+            open_count: 3,
+            trapped: true,
+            ender: false
+        })
+    );
+    let ender_pos = [6, 70, -3];
+    world
+        .apply_play_event(&PlayEvent::BlockEntityData {
+            pos: ender_pos,
+            kind: 1,
+            nbt_bytes: nbt_compound(vec![nbt_string("id", "minecraft:ender_chest")]),
+        })
+        .unwrap();
+    assert_eq!(
+        world.block_entity_visual_state(ender_pos),
+        Some(megu_client::world::BlockEntityVisualState::Chest {
+            open_count: 0,
+            trapped: false,
+            ender: true,
+        })
+    );
+
+    let sign_pos = [5, 70, -3];
+    let sign = nbt_compound(vec![
+        nbt_string("id", "minecraft:sign"),
+        nbt_named_compound(
+            "front_text",
+            vec![nbt_string_list(
+                "messages",
+                &["line one", "line two", "", ""],
+            )],
+        ),
+        nbt_named_compound(
+            "back_text",
+            vec![nbt_string_list("messages", &["back", "", "", ""])],
+        ),
+        vec![
+            1, 0, 15, 105, 115, 95, 103, 108, 111, 119, 105, 110, 103, 95, 116, 101, 120, 116, 1,
+        ],
+    ]);
+    world
+        .apply_play_event(&PlayEvent::BlockEntityData {
+            pos: sign_pos,
+            kind: 2,
+            nbt_bytes: sign,
+        })
+        .unwrap();
+    assert_eq!(
+        world.block_entity_visual_state(sign_pos),
+        Some(megu_client::world::BlockEntityVisualState::Sign {
+            front_lines: [
+                "line one".into(),
+                "line two".into(),
+                String::new(),
+                String::new()
+            ],
+            back_lines: ["back".into(), String::new(), String::new(), String::new()],
+            glowing: true,
+        })
+    );
+
+    let cases = [
+        (
+            [10, 70, 0],
+            "minecraft:shulker_box",
+            vec![nbt_int("Color", 4), nbt_int("Peek", 9)],
+            "shulker",
+        ),
+        (
+            [11, 70, 0],
+            "minecraft:bell",
+            vec![nbt_int("ticks", 8)],
+            "bell",
+        ),
+        (
+            [12, 70, 0],
+            "minecraft:banner",
+            vec![nbt_int("Base", 5), nbt_empty_list("Patterns")],
+            "banner",
+        ),
+        (
+            [13, 70, 0],
+            "minecraft:beacon",
+            vec![
+                nbt_int("Levels", 4),
+                nbt_int("Primary", 1),
+                nbt_int("Secondary", 2),
+            ],
+            "beacon",
+        ),
+        ([14, 70, 0], "minecraft:enchanting_table", vec![], "enchant"),
+        (
+            [15, 70, 0],
+            "minecraft:campfire",
+            vec![nbt_empty_list("Items")],
+            "campfire",
+        ),
+        (
+            [16, 70, 0],
+            "minecraft:trial_spawner",
+            vec![nbt_int("ominous", 1), nbt_string("state", "active")],
+            "trial",
+        ),
+        (
+            [17, 70, 0],
+            "minecraft:vault",
+            vec![nbt_int("ominous", 1), nbt_string("state", "EJECTING")],
+            "vault",
+        ),
+    ];
+    for (pos, id, mut fields, _) in cases {
+        fields.push(nbt_string("id", id));
+        world
+            .apply_play_event(&PlayEvent::BlockEntityData {
+                pos,
+                kind: 1,
+                nbt_bytes: nbt_compound(fields),
+            })
+            .unwrap();
+    }
+    use megu_client::world::BlockEntityVisualState as B;
+    assert_eq!(
+        world.block_entity_visual_state([10, 70, 0]),
+        Some(B::ShulkerBox {
+            open_count: 9,
+            color: 4
+        })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([11, 70, 0]),
+        Some(B::Bell {
+            ring_dir: 0,
+            ringing_ticks: 8
+        })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([12, 70, 0]),
+        Some(B::Banner {
+            base_color: 5,
+            pattern_count: 0
+        })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([13, 70, 0]),
+        Some(B::Beacon {
+            level: 4,
+            primary_effect: 1,
+            secondary_effect: 2
+        })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([14, 70, 0]),
+        Some(B::EnchantingTable { book_open: false })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([15, 70, 0]),
+        Some(B::Campfire { item_count: 0 })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([16, 70, 0]),
+        Some(B::TrialSpawner {
+            ominous: true,
+            active: true
+        })
+    );
+    assert_eq!(
+        world.block_entity_visual_state([17, 70, 0]),
+        Some(B::Vault {
+            ominous: true,
+            state: 3
+        })
+    );
+
+    let blocks = BlockTable::from_json_bytes(
+        br#"{"blocks":[["minecraft:piston",0,1]],"flags":[0],"full_sides":[0],"shapes":[{}],"collision_shapes":[[]]}"#,
+    )
+    .unwrap();
+    let mut piston_world = WorldState::new(DimensionMeta::default(), blocks);
+    let piston_pos = [18, 70, 0];
+    piston_world
+        .apply_play_event(&PlayEvent::BlockEvent {
+            pos: piston_pos,
+            action: 0,
+            parameter: 2,
+            block_type: 0,
+        })
+        .unwrap();
+    assert_eq!(
+        piston_world.block_entity_visual_state(piston_pos),
+        Some(B::Piston {
+            extending: true,
+            facing: 2
+        })
+    );
+    let generic_pos = [19, 70, 0];
+    piston_world
+        .apply_play_event(&PlayEvent::BlockEntityData {
+            pos: generic_pos,
+            kind: 1,
+            nbt_bytes: nbt_compound(vec![nbt_string("id", "minecraft:unknown")]),
+        })
+        .unwrap();
+    assert_eq!(
+        piston_world.block_entity_visual_state(generic_pos),
+        Some(B::Generic)
+    );
+}
+
+#[test]
+fn visual_level_event_mapping_and_render_snapshot_projection() {
+    assert_eq!(
+        visual_level_event(2001, 42),
+        VisualLevelEvent::BlockDestroy { block_state: 42 }
+    );
+    assert_eq!(
+        visual_level_event(2002, 0x123456),
+        VisualLevelEvent::SplashPotion {
+            rgb: 0x123456,
+            instant: false
+        }
+    );
+    assert_eq!(
+        visual_level_event(2007, 0x123456),
+        VisualLevelEvent::SplashPotion {
+            rgb: 0x123456,
+            instant: true
+        }
+    );
+    assert_eq!(
+        visual_level_event(2005, 6),
+        VisualLevelEvent::Bonemeal { count: 6 }
+    );
+    assert_eq!(visual_level_event(1028, 0), VisualLevelEvent::DragonDeath);
+    assert_eq!(visual_level_event(1023, 0), VisualLevelEvent::WitherSpawn);
+    assert_eq!(visual_level_event(1038, 0), VisualLevelEvent::EndPortalOpen);
+    assert_eq!(visual_level_event(1032, 0), VisualLevelEvent::PortalTravel);
+    assert_eq!(
+        visual_level_event(777, 12),
+        VisualLevelEvent::Other {
+            event: 777,
+            data: 12
+        }
+    );
+
+    let mut world = test_world();
+    spawn(&mut world, 42, 3);
+    world
+        .apply_play_event(&PlayEvent::LevelEvent {
+            event: 2001,
+            pos: [1, 2, 3],
+            data: 42,
+            disable_relative_volume: true,
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::LevelParticles {
+            particle_id: 36,
+            long_distance: false,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            offset_z: 0.0,
+            max_speed: 1.0,
+            count: 1,
+            particle_data: f32be(0.5).to_vec(),
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::SetTime {
+            world_age: 99,
+            time_of_day: 18000,
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::BlockEntityData {
+            pos: [4, 70, 0],
+            kind: 1,
+            nbt_bytes: nbt_compound(vec![nbt_string("id", "minecraft:chest")]),
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::GameEvent {
+            event: 8,
+            value: 0.75,
+        })
+        .unwrap();
+    world
+        .apply_play_event(&PlayEvent::GameEvent {
+            event: 7,
+            value: 0.25,
+        })
+        .unwrap();
+    world.boss_bars.insert(
+        [7; 16],
+        megu_client::world::TrackedBossBar {
+            name_nbt: Vec::new(),
+            progress: 0.5,
+            color: 1,
+            divisions: 0,
+            flags: 0,
+        },
+    );
+    let snapshot = project_render_snapshot(&world);
+    assert_eq!(snapshot.entities.len(), 1);
+    assert_eq!(snapshot.entities[0].position, [42.0, 64.0, -2.0]);
+    assert_eq!(snapshot.pending_particles.len(), 1);
+    assert_eq!(snapshot.boss_bars.len(), 1);
+    assert_eq!(
+        snapshot.block_entities,
+        vec![(
+            [4, 70, 0],
+            megu_client::world::BlockEntityVisualState::Chest {
+                open_count: 0,
+                trapped: false,
+                ender: false
+            }
+        )]
+    );
+    assert_eq!(
+        (
+            snapshot.world_age,
+            snapshot.time_of_day,
+            snapshot.thunder_level
+        ),
+        (99, 18000, 0.75)
+    );
+    assert_eq!(snapshot.rain_level, 0.25);
+    assert_eq!(
+        snapshot.level_events,
+        vec![(
+            VisualLevelEvent::BlockDestroy { block_state: 42 },
+            [1, 2, 3]
+        )]
+    );
 }
 
 #[test]

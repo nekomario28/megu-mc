@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use megu_core::coords::CoordMap;
@@ -32,9 +33,10 @@ use megu_kernel::{
 
 use crate::protocol::{
     bitset_get, decode_boss_bar_action, decode_entity_metadata, decode_paletted_container,
-    decode_particle_options, ChunkBiomeData, DecodedBlockEntity, DecodedBossBarAction,
-    DecodedChunk, DecodedEntityMetadataEntry, DecodedLightData, DecodedParticleOptions,
-    DimensionMeta, NbtValue, PlayEvent, WireAttribute, WireReader,
+    decode_particle_options, visual_level_event, ChunkBiomeData, DecodedBlockEntity,
+    DecodedBossBarAction, DecodedChunk, DecodedEntityMetadataEntry, DecodedLightData,
+    DecodedParticleOptions, DimensionMeta, NbtValue, PlayEvent, VisualLevelEvent, WireAttribute,
+    WireReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -1303,7 +1305,7 @@ pub struct BlockBreakProgress {
 
 /// One `level_particles` spawn request — the vanilla particle emitter
 /// parameters (drained by the particle stage, capped at 256 records).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LevelParticleSpawn {
     /// Palette particle id.
     pub particle_id: i32,
@@ -1333,6 +1335,130 @@ pub struct TrackedMobEffect {
     pub amplifier: i32,
     pub duration: i32,
     pub flags: u8,
+}
+
+/// Renderer-facing entity fields projected from Protocol 767 metadata and timers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EntityVisualState {
+    pub on_fire: bool,
+    pub crouching: bool,
+    pub sprinting: bool,
+    pub swimming: bool,
+    pub invisible: bool,
+    pub glowing: bool,
+    pub is_baby: bool,
+    pub health: Option<f32>,
+    pub pose: Option<i32>,
+    pub hurt_ticks: u8,
+    pub swing_ticks: u8,
+    pub sheep_color: Option<u8>,
+    pub sheep_sheared: Option<bool>,
+    pub creeper_state: Option<i32>,
+    pub creeper_charged: Option<bool>,
+    pub villager_data: Option<(i32, i32, i32)>,
+    pub shulker_peek: Option<u8>,
+    pub wither_invul_ticks: Option<i32>,
+    pub warden_anger: Option<i32>,
+    pub enderman_carried_block: Option<i32>,
+    pub dropped_item_stack: Option<Vec<u8>>,
+}
+
+/// Decoded visual state for a tracked block entity or its latest `0x55` event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockEntityVisualState {
+    Chest {
+        open_count: u8,
+        trapped: bool,
+        ender: bool,
+    },
+    ShulkerBox {
+        open_count: u8,
+        color: u8,
+    },
+    Bell {
+        ring_dir: u8,
+        ringing_ticks: u16,
+    },
+    Sign {
+        front_lines: [String; 4],
+        back_lines: [String; 4],
+        glowing: bool,
+    },
+    Banner {
+        base_color: u8,
+        pattern_count: u8,
+    },
+    Beacon {
+        level: i32,
+        primary_effect: i32,
+        secondary_effect: i32,
+    },
+    EnchantingTable {
+        book_open: bool,
+    },
+    Campfire {
+        item_count: u8,
+    },
+    TrialSpawner {
+        ominous: bool,
+        active: bool,
+    },
+    Vault {
+        ominous: bool,
+        state: u8,
+    },
+    Piston {
+        extending: bool,
+        facing: u8,
+    },
+    Generic,
+}
+
+fn nbt_field<'a>(value: &'a NbtValue, key: &str) -> Option<&'a NbtValue> {
+    match value {
+        NbtValue::Compound(fields) => fields.get(key),
+        _ => None,
+    }
+}
+
+fn nbt_i32(value: &NbtValue, key: &str) -> Option<i32> {
+    nbt_field(value, key).and_then(NbtValue::as_i32)
+}
+
+fn nbt_string<'a>(value: &'a NbtValue, key: &str) -> Option<&'a str> {
+    match nbt_field(value, key)? {
+        NbtValue::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn nbt_bool(value: &NbtValue, key: &str) -> bool {
+    nbt_i32(value, key).is_some_and(|value| value != 0)
+}
+
+fn nbt_text_lines(value: &NbtValue, key: &str) -> [String; 4] {
+    let lines = nbt_field(value, key)
+        .and_then(|field| nbt_field(field, "messages"))
+        .and_then(|field| match field {
+            NbtValue::List(lines) => Some(lines),
+            _ => None,
+        });
+    std::array::from_fn(|index| {
+        lines
+            .and_then(|items| items.get(index))
+            .and_then(|line| match line {
+                NbtValue::String(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    })
+}
+
+fn protocol_767_entity_name(entity_type: i32) -> Option<&'static str> {
+    static TABLE: OnceLock<megu_proto::ProtocolTable> = OnceLock::new();
+    TABLE
+        .get_or_init(megu_proto::ProtocolTable::v767_builtin)
+        .registry_name("minecraft:entity_type", u32::try_from(entity_type).ok()?)
 }
 
 #[derive(Clone, Debug)]
@@ -2502,6 +2628,347 @@ impl WorldState {
         self.get_block_state(x, y, z)
             .map(|s| self.blocks.fluid_cell(s))
             .unwrap_or_default()
+    }
+
+    /// Return the typed visual projection of one tracked entity.
+    pub fn entity_visual_state(&self, eid: i32) -> Option<EntityVisualState> {
+        let entity = self.entities.get(&eid)?;
+        let metadata = self.entity_metadata.get(&eid);
+        let value = |index: u8| {
+            metadata
+                .and_then(|entries| entries.iter().find(|entry| entry.index == index))
+                .map(|entry| &entry.value)
+        };
+        let flags = match value(0) {
+            Some(crate::protocol::DecodedEntityMetadataValue::Byte(bits)) => *bits as u8,
+            _ => 0,
+        };
+        let as_varint = |index| match value(index) {
+            Some(crate::protocol::DecodedEntityMetadataValue::VarInt(value)) => Some(*value),
+            _ => None,
+        };
+        let as_bool = |index| match value(index) {
+            Some(crate::protocol::DecodedEntityMetadataValue::Bool(value)) => Some(*value),
+            _ => None,
+        };
+        let entity_name = protocol_767_entity_name(entity.entity_type).unwrap_or("");
+        let mut visual = EntityVisualState {
+            on_fire: flags & 0x01 != 0,
+            crouching: flags & 0x02 != 0,
+            sprinting: flags & 0x08 != 0,
+            swimming: flags & 0x10 != 0,
+            invisible: flags & 0x20 != 0,
+            glowing: flags & 0x40 != 0,
+            is_baby: matches!(
+                entity_name,
+                "minecraft:armadillo"
+                    | "minecraft:axolotl"
+                    | "minecraft:camel"
+                    | "minecraft:cat"
+                    | "minecraft:chicken"
+                    | "minecraft:cow"
+                    | "minecraft:donkey"
+                    | "minecraft:fox"
+                    | "minecraft:frog"
+                    | "minecraft:goat"
+                    | "minecraft:hoglin"
+                    | "minecraft:horse"
+                    | "minecraft:llama"
+                    | "minecraft:mooshroom"
+                    | "minecraft:mule"
+                    | "minecraft:ocelot"
+                    | "minecraft:panda"
+                    | "minecraft:pig"
+                    | "minecraft:polar_bear"
+                    | "minecraft:rabbit"
+                    | "minecraft:sheep"
+                    | "minecraft:sniffer"
+                    | "minecraft:strider"
+                    | "minecraft:tadpole"
+                    | "minecraft:trader_llama"
+                    | "minecraft:turtle"
+                    | "minecraft:villager"
+                    | "minecraft:wandering_trader"
+                    | "minecraft:wolf"
+                    | "minecraft:zoglin"
+                    | "minecraft:zombie"
+                    | "minecraft:zombie_horse"
+                    | "minecraft:zombie_villager"
+            ) && as_bool(16).unwrap_or(false),
+            health: match value(9) {
+                Some(crate::protocol::DecodedEntityMetadataValue::Float(health))
+                    if health.is_finite() =>
+                {
+                    Some(*health)
+                }
+                _ => None,
+            },
+            pose: self.entity_poses.get(&eid).copied(),
+            hurt_ticks: entity.hurt_ticks,
+            swing_ticks: self.entity_animation_ticks.get(&eid).copied().unwrap_or(0),
+            ..EntityVisualState::default()
+        };
+        if entity_name == "minecraft:sheep" {
+            if let Some(crate::protocol::DecodedEntityMetadataValue::Byte(color)) = value(17) {
+                visual.sheep_color = Some((*color as u8) & 0x0f);
+                visual.sheep_sheared = Some((*color as u8) & 0x10 != 0);
+            }
+        }
+        if entity_name == "minecraft:creeper" {
+            visual.creeper_state = as_varint(16);
+            visual.creeper_charged = as_bool(17);
+        }
+        visual.villager_data = if entity_name == "minecraft:villager" {
+            match value(17) {
+                Some(crate::protocol::DecodedEntityMetadataValue::VillagerData {
+                    kind,
+                    profession,
+                    level,
+                }) => Some((*kind, *profession, *level)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        visual.shulker_peek = if entity_name == "minecraft:shulker" {
+            match value(18) {
+                Some(crate::protocol::DecodedEntityMetadataValue::Byte(peek)) => Some(*peek as u8),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        visual.wither_invul_ticks = if entity_name == "minecraft:wither" {
+            as_varint(16)
+        } else {
+            None
+        };
+        visual.warden_anger = if entity_name == "minecraft:warden" {
+            as_varint(16)
+        } else {
+            None
+        };
+        visual.enderman_carried_block = if entity_name == "minecraft:enderman" {
+            match value(16) {
+                Some(crate::protocol::DecodedEntityMetadataValue::BlockState(state)) => {
+                    Some(*state)
+                }
+                Some(crate::protocol::DecodedEntityMetadataValue::OptionalBlockState(state)) => {
+                    *state
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        visual.dropped_item_stack = if entity_name == "minecraft:item" {
+            match value(8) {
+                Some(crate::protocol::DecodedEntityMetadataValue::ItemStack(stack)) => {
+                    Some(stack.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Some(visual)
+    }
+
+    /// Return typed block-entity state, combining parsed NBT with the newest matching block event.
+    pub fn block_entity_visual_state(&self, pos: [i32; 3]) -> Option<BlockEntityVisualState> {
+        let is_tracked = self.block_entities.contains_key(&pos);
+        let nbt = self.block_entity_visual_nbt.get(&pos);
+        let id = nbt
+            .and_then(|value| nbt_field(value, "id"))
+            .and_then(|value| match value {
+                NbtValue::String(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let event = self
+            .block_events
+            .iter()
+            .rev()
+            .find(|(event_pos, _, _, _)| *event_pos == pos);
+        let action = event.map(|(_, action, _, _)| *action);
+        let parameter = event.map(|(_, _, parameter, _)| *parameter).unwrap_or(0);
+        let block_name = self
+            .get_block_state(pos[0], pos[1], pos[2])
+            .and_then(|state| self.blocks.state_name(state))
+            .or_else(|| {
+                event
+                    .and_then(|(_, _, _, block_type)| u32::try_from(*block_type).ok())
+                    .and_then(|state| self.blocks.state_name(state))
+            })
+            .unwrap_or("");
+        if !is_tracked {
+            return block_name
+                .contains("piston")
+                .then(|| BlockEntityVisualState::Piston {
+                    extending: action == Some(0),
+                    facing: parameter,
+                });
+        }
+        let id_tail = id.rsplit(':').next().unwrap_or("");
+        let state = match id_tail {
+            "chest" | "trapped_chest" | "ender_chest" => BlockEntityVisualState::Chest {
+                open_count: if action == Some(1) {
+                    parameter
+                } else {
+                    nbt.and_then(|value| nbt_i32(value, "open"))
+                        .and_then(|value| u8::try_from(value).ok())
+                        .unwrap_or(0)
+                },
+                trapped: id_tail == "trapped_chest" || block_name.ends_with("trapped_chest"),
+                ender: id_tail == "ender_chest" || block_name.ends_with("ender_chest"),
+            },
+            "shulker_box"
+            | "white_shulker_box"
+            | "orange_shulker_box"
+            | "magenta_shulker_box"
+            | "light_blue_shulker_box"
+            | "yellow_shulker_box"
+            | "lime_shulker_box"
+            | "pink_shulker_box"
+            | "gray_shulker_box"
+            | "light_gray_shulker_box"
+            | "cyan_shulker_box"
+            | "purple_shulker_box"
+            | "blue_shulker_box"
+            | "brown_shulker_box"
+            | "green_shulker_box"
+            | "red_shulker_box"
+            | "black_shulker_box" => BlockEntityVisualState::ShulkerBox {
+                open_count: if action == Some(1) {
+                    parameter
+                } else {
+                    nbt.and_then(|value| nbt_i32(value, "Peek").or_else(|| nbt_i32(value, "peek")))
+                        .and_then(|value| u8::try_from(value).ok())
+                        .unwrap_or(0)
+                },
+                color: nbt
+                    .and_then(|value| nbt_i32(value, "Color"))
+                    .and_then(|value| u8::try_from(value).ok())
+                    .or_else(|| {
+                        let color = block_name
+                            .rsplit(':')
+                            .next()?
+                            .strip_suffix("_shulker_box")?;
+                        Some(match color {
+                            "white" => 0,
+                            "orange" => 1,
+                            "magenta" => 2,
+                            "light_blue" => 3,
+                            "yellow" => 4,
+                            "lime" => 5,
+                            "pink" => 6,
+                            "gray" => 7,
+                            "light_gray" => 8,
+                            "cyan" => 9,
+                            "purple" => 10,
+                            "blue" => 11,
+                            "brown" => 12,
+                            "green" => 13,
+                            "red" => 14,
+                            "black" => 15,
+                            _ => return None,
+                        })
+                    })
+                    .unwrap_or(10),
+            },
+            "bell" => BlockEntityVisualState::Bell {
+                ring_dir: parameter,
+                ringing_ticks: if action == Some(1) {
+                    50
+                } else {
+                    nbt.and_then(|value| nbt_i32(value, "ticks"))
+                        .and_then(|value| u16::try_from(value).ok())
+                        .unwrap_or(0)
+                },
+            },
+            "sign" | "hanging_sign" => BlockEntityVisualState::Sign {
+                front_lines: nbt
+                    .map(|value| nbt_text_lines(value, "front_text"))
+                    .unwrap_or_default(),
+                back_lines: nbt
+                    .map(|value| nbt_text_lines(value, "back_text"))
+                    .unwrap_or_default(),
+                glowing: nbt.is_some_and(|value| nbt_bool(value, "is_glowing_text")),
+            },
+            "banner" | "wall_banner" => BlockEntityVisualState::Banner {
+                base_color: nbt
+                    .and_then(|value| nbt_i32(value, "Base"))
+                    .and_then(|value| u8::try_from(value).ok())
+                    .unwrap_or(0),
+                pattern_count: nbt
+                    .and_then(|value| nbt_field(value, "Patterns"))
+                    .and_then(|value| match value {
+                        NbtValue::List(items) => u8::try_from(items.len()).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            },
+            "beacon" => BlockEntityVisualState::Beacon {
+                level: nbt.and_then(|value| nbt_i32(value, "Levels")).unwrap_or(0),
+                primary_effect: nbt.and_then(|value| nbt_i32(value, "Primary")).unwrap_or(0),
+                secondary_effect: nbt
+                    .and_then(|value| nbt_i32(value, "Secondary"))
+                    .unwrap_or(0),
+            },
+            "enchanting_table" => BlockEntityVisualState::EnchantingTable {
+                book_open: nbt.is_some_and(|value| nbt_bool(value, "BookOpen")),
+            },
+            "campfire" | "soul_campfire" => BlockEntityVisualState::Campfire {
+                item_count: nbt
+                    .and_then(|value| nbt_field(value, "Items"))
+                    .and_then(|value| match value {
+                        NbtValue::List(items) => u8::try_from(items.len()).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            },
+            "trial_spawner" => BlockEntityVisualState::TrialSpawner {
+                ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
+                active: nbt.is_some_and(|value| {
+                    nbt_bool(value, "is_active")
+                        || nbt_string(value, "state")
+                            .is_some_and(|state| state.eq_ignore_ascii_case("active"))
+                }),
+            },
+            "vault" => BlockEntityVisualState::Vault {
+                ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
+                state: nbt
+                    .and_then(|value| {
+                        nbt_i32(value, "state")
+                            .and_then(|state| u8::try_from(state).ok())
+                            .or_else(|| {
+                                nbt_string(value, "state").and_then(|state| {
+                                    match state.to_ascii_uppercase().as_str() {
+                                        "INACTIVE" => Some(0),
+                                        "ACTIVE" => Some(1),
+                                        "UNLOCKING" => Some(2),
+                                        "EJECTING" => Some(3),
+                                        _ => None,
+                                    }
+                                })
+                            })
+                    })
+                    .unwrap_or(0),
+            },
+            _ if block_name.contains("piston") => BlockEntityVisualState::Piston {
+                extending: action == Some(0),
+                facing: parameter,
+            },
+            _ => BlockEntityVisualState::Generic,
+        };
+        Some(state)
+    }
+
+    /// Project a retained `level_event` into the typed visual enum.
+    pub fn visual_level_events(&self) -> impl Iterator<Item = (VisualLevelEvent, [i32; 3])> + '_ {
+        self.level_events
+            .iter()
+            .map(|(event, pos, data)| (visual_level_event(*event, *data), *pos))
     }
 
     /// Unified ingestion for decoded Protocol 767 play events: routes every
