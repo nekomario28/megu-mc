@@ -6,7 +6,13 @@ use megu_client_ui::container_screen::{
 use megu_client_ui::draw::{text_height, text_width, UiCommand, UiDrawList, UiRect};
 use megu_client_ui::hud_widgets::{HudAuxiliaryState, HudSnapshot, HudWidgetsRenderer};
 
-const RESOLUTIONS: [(u32, u32); 4] = [(854, 480), (1280, 720), (1920, 1080), (3840, 2160)];
+const RESOLUTIONS: [(u32, u32); 5] = [
+    (854, 480),
+    (1280, 720),
+    (1920, 1080),
+    (2560, 1440),
+    (3840, 2160),
+];
 
 fn overlaps(a: UiRect, b: UiRect) -> bool {
     a.intersects(b)
@@ -342,6 +348,194 @@ fn merchant_sidebar_scrolls_selects_and_renders_discount_and_stock_state() {
     assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::Text { text, color, .. } if text == "X" && *color == megu_client_ui::draw::palette::DANGER)));
 }
 
+fn click_button(
+    state: &mut ContainerScreenState,
+    id: i32,
+    width: f32,
+    height: f32,
+) -> Option<WorkstationAction> {
+    let rect = state
+        .layout(width, height)
+        .buttons
+        .into_iter()
+        .find(|b| b.id == id)?
+        .rect;
+    state.click_at(
+        rect.x + rect.w as i32 / 2,
+        rect.y + rect.h as i32 / 2,
+        width,
+        height,
+    )
+}
+
+#[test]
+fn enchanting_rows_are_tier_gated_and_render_clues() {
+    let mut state = ContainerScreenState::new(menu_schema(13).unwrap(), 1, 1, "Enchanting");
+    for tier in 0..3 {
+        state.set_property(tier, (tier + 1) * 3);
+    }
+    state.set_property(4, 7);
+    state.set_property(7, 2);
+    let layout = state.layout(1280.0, 720.0);
+    assert_eq!(layout.buttons.len(), 3);
+    assert_eq!(layout.buttons[0].rect.w, 108);
+    for tier in 0..3 {
+        assert_eq!(
+            click_button(&mut state, tier, 1280.0, 720.0),
+            Some(WorkstationAction::ClickButton(tier))
+        );
+    }
+    state.set_property(1, 0);
+    assert_eq!(click_button(&mut state, 1, 1280.0, 720.0), None);
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw
+        .commands
+        .iter()
+        .any(|c| matches!(c, UiCommand::Text { text, .. } if text.contains("7 2"))));
+}
+
+#[test]
+fn crafter_empty_slots_toggle_and_nonempty_slots_reject() {
+    let mut state = ContainerScreenState::new(menu_schema(7).unwrap(), 1, 1, "Crafter");
+    let panel = state.panel_rect(1280.0, 720.0);
+    let click_slot = |state: &mut ContainerScreenState, slot: usize| {
+        let def = state
+            .schema()
+            .container_slots
+            .iter()
+            .find(|s| s.index == slot as i16)
+            .unwrap();
+        state.click_at(
+            panel.x + 4 + def.x + 8,
+            panel.y + 4 + def.y + 8,
+            1280.0,
+            720.0,
+        )
+    };
+    assert_eq!(
+        click_slot(&mut state, 4),
+        Some(WorkstationAction::ToggleCrafterSlot {
+            slot: 4,
+            disabled: true
+        })
+    );
+    assert!(state.is_crafter_slot_disabled(4));
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::FillRect { color, .. } if *color == megu_client_ui::draw::palette::DANGER)));
+    state.set_slot(5, megu_client_ui::container_screen::UiItemStack::new(1, 1));
+    assert_eq!(click_slot(&mut state, 5), None);
+    state.set_property(9, 1);
+    let mut triggered = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut triggered);
+    assert!(triggered
+        .commands
+        .iter()
+        .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "TRIGGERED")));
+}
+
+#[test]
+fn loom_grid_scrolls_selects_and_previews_banner() {
+    let mut state = ContainerScreenState::new(menu_schema(18).unwrap(), 1, 1, "Loom");
+    state.set_loom_patterns((0..25).map(|i| format!("minecraft:pattern_{i}")).collect());
+    assert_eq!(
+        click_button(&mut state, 0, 1280.0, 720.0),
+        Some(WorkstationAction::ClickButton(0))
+    );
+    state.scroll_loom(1);
+    assert_eq!(state.loom_scroll_row, 1);
+    assert_eq!(
+        click_button(&mut state, 4, 1280.0, 720.0),
+        Some(WorkstationAction::ClickButton(4))
+    );
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw.commands.iter().any(
+        |c| matches!(c, UiCommand::ItemIcon { item_id, .. } if item_id == "minecraft:white_banner")
+    ));
+}
+
+#[test]
+fn stonecutter_grid_scrolls_selects_and_draws_recipe_icons() {
+    let mut state = ContainerScreenState::new(menu_schema(24).unwrap(), 1, 1, "Stonecutter");
+    state.set_stonecutter_recipes(
+        (0..21)
+            .map(|i| format!("minecraft:stone_variant_{i}"))
+            .collect(),
+    );
+    assert_eq!(
+        click_button(&mut state, 0, 1280.0, 720.0),
+        Some(WorkstationAction::ClickButton(0))
+    );
+    state.scroll_stonecutter(1);
+    assert_eq!(state.stonecutter_scroll_row, 1);
+    assert_eq!(
+        click_button(&mut state, 4, 1280.0, 720.0),
+        Some(WorkstationAction::ClickButton(4))
+    );
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::ItemIcon { item_id, .. } if item_id == "minecraft:stone_variant_4")));
+}
+
+#[test]
+fn smithing_preview_and_invalid_arrow_are_visible() {
+    let mut state = ContainerScreenState::new(menu_schema(21).unwrap(), 1, 1, "Smithing");
+    state.set_slot(
+        1,
+        megu_client_ui::container_screen::UiItemStack::new(1, 1)
+            .with_namespaced_id("minecraft:diamond_chestplate"),
+    );
+    state.set_slot(
+        2,
+        megu_client_ui::container_screen::UiItemStack::new(2, 1)
+            .with_namespaced_id("minecraft:netherite_ingot"),
+    );
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::ItemIcon { item_id, .. } if item_id == "minecraft:diamond_chestplate")));
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::Text { text, color, .. } if text == "X" && *color == megu_client_ui::draw::palette::DANGER)));
+}
+
+#[test]
+fn lectern_buttons_emit_clicks_and_display_page_number() {
+    let mut state = ContainerScreenState::new(menu_schema(17).unwrap(), 1, 1, "Lectern");
+    state.set_property(0, 4);
+    for id in [1, 2, 3] {
+        assert_eq!(
+            click_button(&mut state, id, 1280.0, 720.0),
+            Some(WorkstationAction::ClickButton(id))
+        );
+    }
+    let mut draw = UiDrawList::new();
+    state.render(1280.0, 720.0, &mut draw);
+    assert!(draw
+        .commands
+        .iter()
+        .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "Page 5")));
+}
+
+#[test]
+fn scaled_workstation_clicks_use_scaled_layout_coordinates() {
+    for scale in 1..=4 {
+        let mut state = ContainerScreenState::new(menu_schema(13).unwrap(), 1, 1, "Enchanting");
+        state.set_property(2, 5);
+        let layout = state.layout_scaled(1920.0, 1080.0, scale as f32);
+        let rect = layout.buttons.iter().find(|b| b.id == 2).unwrap().rect;
+        assert_eq!(
+            state.click_at_scaled(
+                rect.x + rect.w as i32 / 2,
+                rect.y + rect.h as i32 / 2,
+                1920.0,
+                1080.0,
+                scale as f32
+            ),
+            Some(WorkstationAction::ClickButton(2))
+        );
+    }
+}
+
 #[test]
 fn all_menus_fit_and_keep_hitboxes_disjoint_at_all_requested_scales() {
     for schema in &ALL_VANILLA_MENUS {
@@ -362,6 +556,10 @@ fn all_menus_fit_and_keep_hitboxes_disjoint_at_all_requested_scales() {
                                 out_of_stock: false,
                             })
                             .collect(),
+                    );
+                } else if schema.menu_id == 24 {
+                    state.set_stonecutter_recipes(
+                        (0..29).map(|i| format!("minecraft:cut_{i}")).collect(),
                     );
                 }
                 let logical_w = (width as f32 / scale as f32).ceil() as i32;
@@ -402,6 +600,16 @@ fn all_menus_fit_and_keep_hitboxes_disjoint_at_all_requested_scales() {
                     assert!(
                         !layout.slots.iter().any(|s| overlaps(s.rect, button.rect)),
                         "{} button {} overlaps slot at scale {}",
+                        schema.name,
+                        button.id,
+                        scale
+                    );
+                    assert!(
+                        button.rect.x >= layout.panel.x
+                            && button.rect.y >= layout.panel.y
+                            && button.rect.right() <= layout.panel.right()
+                            && button.rect.bottom() <= layout.panel.bottom(),
+                        "{} button {} escapes panel at scale {}",
                         schema.name,
                         button.id,
                         scale

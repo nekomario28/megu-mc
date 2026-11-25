@@ -253,17 +253,17 @@ static CARTOGRAPHY_SLOTS: [SlotDef; 3] = slots([
 const NO_BUTTONS: &[MenuButtonDef] = &[];
 const NO_BARS: &[PropertyBarDef] = &[];
 const ENCHANT_BUTTONS: &[MenuButtonDef] = &[
-    MenuButtonDef::new(0, 52, 74, 30, 10, "I"),
-    MenuButtonDef::new(1, 86, 74, 30, 10, "II"),
-    MenuButtonDef::new(2, 120, 74, 30, 10, "III"),
+    MenuButtonDef::new(0, 60, 14, 108, 19, "I"),
+    MenuButtonDef::new(1, 60, 33, 108, 19, "II"),
+    MenuButtonDef::new(2, 60, 52, 108, 19, "III"),
 ];
 const LECTERN_BUTTONS: &[MenuButtonDef] = &[
     MenuButtonDef::new(1, 8, 28, 22, 12, "<"),
     MenuButtonDef::new(2, 34, 28, 22, 12, ">"),
     MenuButtonDef::new(3, 8, 44, 48, 12, "take"),
 ];
-const LOOM_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::dynamic(8, 68, 120, 12, "pattern")];
-const STONECUTTER_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::dynamic(8, 58, 160, 12, "recipe")];
+const LOOM_BUTTONS: &[MenuButtonDef] = &[];
+const STONECUTTER_BUTTONS: &[MenuButtonDef] = &[];
 const CRAFTER_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::new(0, 134, 54, 24, 12, "auto")];
 const BEACON_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::new(0, 158, 72, 30, 14, "Confirm")];
 const FURNACE_BARS: &[PropertyBarDef] = &[
@@ -310,39 +310,6 @@ const BREWING_BARS: &[PropertyBarDef] = &[
         label: "fuel",
     },
 ];
-const ENCHANT_BARS: &[PropertyBarDef] = &[
-    PropertyBarDef {
-        property: 0,
-        secondary_property: 0,
-        kind: PropertyBarKind::Costs,
-        x: 60,
-        y: 58,
-        w: 8,
-        h: 8,
-        label: "cost",
-    },
-    PropertyBarDef {
-        property: 1,
-        secondary_property: 0,
-        kind: PropertyBarKind::Costs,
-        x: 102,
-        y: 58,
-        w: 8,
-        h: 8,
-        label: "cost",
-    },
-    PropertyBarDef {
-        property: 2,
-        secondary_property: 0,
-        kind: PropertyBarKind::Costs,
-        x: 60,
-        y: 66,
-        w: 8,
-        h: 8,
-        label: "cost",
-    },
-];
-
 const fn chest_schema(
     menu_id: u32,
     name: &'static str,
@@ -475,7 +442,7 @@ pub static ALL_VANILLA_MENUS: [MenuScreenSchema; VANILLA_MENU_COUNT] = [
             38,
         );
         s.buttons = ENCHANT_BUTTONS;
-        s.property_bars = ENCHANT_BARS;
+        s.property_bars = NO_BARS;
         s
     },
     {
@@ -764,6 +731,11 @@ pub enum WorkstationAction {
         secondary: Option<i32>,
     },
     SelectTrade(i32),
+    ClickButton(i32),
+    ToggleCrafterSlot {
+        slot: i32,
+        disabled: bool,
+    },
 }
 
 /// One visible merchant trade row.
@@ -803,6 +775,13 @@ pub struct ContainerScreenState {
     pub merchant_offers: Vec<MerchantOfferView>,
     pub merchant_scroll_offset: usize,
     pub selected_trade_index: Option<usize>,
+    pub selected_enchant_tier: Option<usize>,
+    pub loom_patterns: Vec<String>,
+    pub loom_scroll_row: usize,
+    pub selected_loom_pattern: Option<usize>,
+    pub stonecutter_recipes: Vec<String>,
+    pub stonecutter_scroll_row: usize,
+    pub selected_stonecutter_recipe: Option<usize>,
 }
 
 impl ContainerScreenState {
@@ -830,6 +809,13 @@ impl ContainerScreenState {
             merchant_offers: Vec::new(),
             merchant_scroll_offset: 0,
             selected_trade_index: None,
+            selected_enchant_tier: None,
+            loom_patterns: default_loom_patterns(),
+            loom_scroll_row: 0,
+            selected_loom_pattern: None,
+            stonecutter_recipes: Vec::new(),
+            stonecutter_scroll_row: 0,
+            selected_stonecutter_recipe: None,
         }
     }
 
@@ -861,6 +847,72 @@ impl ContainerScreenState {
 
     pub fn property(&self, property: i16) -> i16 {
         self.properties.get(&property).copied().unwrap_or(0)
+    }
+
+    pub fn is_crafter_slot_disabled(&self, slot: usize) -> bool {
+        self.schema.menu_id == 7 && slot < 9 && self.property(slot as i16) != 0
+    }
+
+    pub fn toggle_crafter_slot(&mut self, slot: usize) -> Option<WorkstationAction> {
+        if self.schema.menu_id != 7 || slot >= 9 || !self.slots.get(slot)?.is_empty() {
+            return None;
+        }
+        let disabled = !self.is_crafter_slot_disabled(slot);
+        self.set_property(slot as i16, i16::from(disabled));
+        Some(WorkstationAction::ToggleCrafterSlot {
+            slot: slot as i32,
+            disabled,
+        })
+    }
+
+    pub fn set_loom_patterns(&mut self, patterns: Vec<String>) {
+        if self.schema.menu_id != 18 {
+            return;
+        }
+        self.loom_patterns = patterns;
+        self.loom_scroll_row = self
+            .loom_scroll_row
+            .min((self.loom_patterns.len().div_ceil(4)).saturating_sub(4));
+        if self
+            .selected_loom_pattern
+            .is_some_and(|i| i >= self.loom_patterns.len())
+        {
+            self.selected_loom_pattern = None;
+        }
+    }
+
+    pub fn scroll_loom(&mut self, rows: i32) {
+        if self.schema.menu_id != 18 {
+            return;
+        }
+        let max_row = (self.loom_patterns.len().div_ceil(4)).saturating_sub(4);
+        self.loom_scroll_row =
+            (self.loom_scroll_row as i64 + i64::from(rows)).clamp(0, max_row as i64) as usize;
+    }
+
+    pub fn set_stonecutter_recipes(&mut self, recipes: Vec<String>) {
+        if self.schema.menu_id != 24 {
+            return;
+        }
+        self.stonecutter_recipes = recipes;
+        self.stonecutter_scroll_row = self
+            .stonecutter_scroll_row
+            .min((self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3));
+        if self
+            .selected_stonecutter_recipe
+            .is_some_and(|i| i >= self.stonecutter_recipes.len())
+        {
+            self.selected_stonecutter_recipe = None;
+        }
+    }
+
+    pub fn scroll_stonecutter(&mut self, rows: i32) {
+        if self.schema.menu_id != 24 {
+            return;
+        }
+        let max_row = (self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3);
+        self.stonecutter_scroll_row = (self.stonecutter_scroll_row as i64 + i64::from(rows))
+            .clamp(0, max_row as i64) as usize;
     }
 
     pub fn hover(&mut self, slot: Option<usize>) {
@@ -998,6 +1050,56 @@ impl ContainerScreenState {
             if (8..104).contains(&local_x) && (18..130).contains(&local_y) {
                 let row = ((local_y - 18) / 16) as usize;
                 return self.select_merchant_trade(self.merchant_scroll_offset + row);
+            }
+        }
+        let panel = self.panel_rect(viewport_w, viewport_h);
+        let local_x = x - panel.x - CONTENT_PAD;
+        let local_y = y - panel.y - CONTENT_PAD;
+        if self.schema.menu_id == 7 {
+            for (slot, def) in CRAFTER_GRID.iter().enumerate() {
+                if UiRect::new(def.x, def.y, SLOT_SIZE as u32, SLOT_SIZE as u32)
+                    .contains(local_x, local_y)
+                {
+                    return self.toggle_crafter_slot(slot);
+                }
+            }
+        }
+        if self.schema.menu_id == 18 && (60..116).contains(&local_x) && (13..69).contains(&local_y)
+        {
+            let col = ((local_x - 60) / 14) as usize;
+            let row = ((local_y - 13) / 14) as usize;
+            let index = self.loom_scroll_row * 4 + row * 4 + col;
+            if index < self.loom_patterns.len() {
+                self.selected_loom_pattern = Some(index);
+                return Some(WorkstationAction::ClickButton(index as i32));
+            }
+        }
+        if self.schema.menu_id == 24 && (52..116).contains(&local_x) && (14..68).contains(&local_y)
+        {
+            let col = ((local_x - 52) / 16) as usize;
+            let row = ((local_y - 14) / 18) as usize;
+            let index = self.stonecutter_scroll_row * 4 + row * 4 + col;
+            if index < self.stonecutter_recipes.len() {
+                self.selected_stonecutter_recipe = Some(index);
+                return Some(WorkstationAction::ClickButton(index as i32));
+            }
+        }
+        if matches!(self.schema.menu_id, 13 | 17) {
+            if let Some(button) = self
+                .layout(viewport_w, viewport_h)
+                .buttons
+                .iter()
+                .find(|b| b.rect.contains(x, y))
+            {
+                if self.schema.menu_id == 13 {
+                    let tier = button.id as usize;
+                    if tier < 3 && self.property(tier as i16) > 0 {
+                        self.selected_enchant_tier = Some(tier);
+                        return Some(WorkstationAction::ClickButton(button.id));
+                    }
+                } else {
+                    return Some(WorkstationAction::ClickButton(button.id));
+                }
             }
         }
         None
@@ -1139,6 +1241,43 @@ impl ContainerScreenState {
                 label: b.label,
             })
             .collect();
+        if self.schema.menu_id == 18 {
+            for row in 0..4 {
+                for col in 0..4 {
+                    let index = self.loom_scroll_row * 4 + row * 4 + col;
+                    if index < self.loom_patterns.len() {
+                        buttons.push(UiButtonRect {
+                            id: index as i32,
+                            rect: UiRect::new(
+                                panel.x + CONTENT_PAD + 60 + col as i32 * 14,
+                                panel.y + CONTENT_PAD + 13 + row as i32 * 14,
+                                14,
+                                14,
+                            ),
+                            label: "pattern",
+                        });
+                    }
+                }
+            }
+        } else if self.schema.menu_id == 24 {
+            for row in 0..3 {
+                for col in 0..4 {
+                    let index = self.stonecutter_scroll_row * 4 + row * 4 + col;
+                    if index < self.stonecutter_recipes.len() {
+                        buttons.push(UiButtonRect {
+                            id: index as i32,
+                            rect: UiRect::new(
+                                panel.x + CONTENT_PAD + 52 + col as i32 * 16,
+                                panel.y + CONTENT_PAD + 14 + row as i32 * 18,
+                                16,
+                                18,
+                            ),
+                            label: "recipe",
+                        });
+                    }
+                }
+            }
+        }
         if self.schema.menu_id == 8 {
             buttons.push(UiButtonRect {
                 id: -8,
@@ -1270,6 +1409,30 @@ impl ContainerScreenState {
             Self::scale_rect(rect, factor, cx, cy, tx, ty);
         }
         layout
+    }
+
+    /// Click using logical coordinates returned by `layout_scaled`.
+    pub fn click_at_scaled(
+        &mut self,
+        x: i32,
+        y: i32,
+        viewport_w: f32,
+        viewport_h: f32,
+        gui_scale: f32,
+    ) -> Option<WorkstationAction> {
+        let scale = if gui_scale.is_finite() {
+            gui_scale.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        let factor = self
+            .scale_factor(viewport_w, viewport_h, scale)
+            .max(f32::EPSILON);
+        let native_x =
+            (viewport_w * 0.5 + (x as f32 - viewport_w / scale * 0.5) / factor).round() as i32;
+        let native_y =
+            (viewport_h * 0.5 + (y as f32 - viewport_h / scale * 0.5) / factor).round() as i32;
+        self.click_at(native_x, native_y, viewport_w, viewport_h)
     }
 
     fn bar_fraction(&self, bar: &PropertyBarDef) -> f32 {
@@ -1413,8 +1576,20 @@ impl ContainerScreenState {
                 if let Some(ghost) = ghost_item(self.schema.menu_id, slot.index) {
                     draw_vanilla_ghost_item(out, slot.rect, ghost);
                 }
-                if self.schema.menu_id == 7 && self.property(slot.index) != 0 && slot.index < 9 {
-                    out.text_str(slot.rect.x + 5, slot.rect.y + 4, 1, palette::DANGER, "X");
+                if self.schema.menu_id == 7 && self.is_crafter_slot_disabled(slot.index as usize) {
+                    out.fill_rect(
+                        UiRect::new(slot.rect.x + 3, slot.rect.y + 8, 12, 2),
+                        palette::DANGER,
+                    );
+                    out.fill_rect(
+                        UiRect::new(slot.rect.x + 8, slot.rect.y + 3, 2, 12),
+                        palette::DANGER,
+                    );
+                    out.border_rect(
+                        UiRect::new(slot.rect.x + 4, slot.rect.y + 4, 10, 10),
+                        palette::DANGER,
+                        1,
+                    );
                 }
                 continue;
             }
@@ -1457,15 +1632,96 @@ impl ContainerScreenState {
             );
         }
         for button in &layout.buttons {
-            out.fill_rect(button.rect, palette::BUTTON);
-            out.border_rect(button.rect, palette::BUTTON_BORDER, 1);
-            out.text(
-                button.rect.x + 3,
-                button.rect.y + 2,
-                1,
-                palette::TEXT,
-                button.label,
-            );
+            if self.schema.menu_id == 13 {
+                let tier = button.id as usize;
+                let enabled = self.property(tier as i16) > 0;
+                let selected = self.selected_enchant_tier == Some(tier);
+                out.fill_rect(
+                    button.rect,
+                    if enabled {
+                        palette::BUTTON
+                    } else {
+                        palette::BUTTON_DISABLED
+                    },
+                );
+                out.border_rect(
+                    button.rect,
+                    if selected {
+                        palette::BUTTON_BORDER_HOVER
+                    } else {
+                        palette::BUTTON_BORDER
+                    },
+                    if selected { 2 } else { 1 },
+                );
+                out.text_str(
+                    button.rect.x + 3,
+                    button.rect.y + 5,
+                    1,
+                    if enabled {
+                        palette::WARNING
+                    } else {
+                        palette::BUTTON_DISABLED_TEXT
+                    },
+                    ["I", "II", "III"][tier],
+                );
+            } else if matches!(self.schema.menu_id, 18 | 24) {
+                let selected = if self.schema.menu_id == 18 {
+                    self.selected_loom_pattern == Some(button.id as usize)
+                } else {
+                    self.selected_stonecutter_recipe == Some(button.id as usize)
+                };
+                out.fill_rect(
+                    button.rect,
+                    if selected {
+                        palette::SLOT_HOVER
+                    } else {
+                        palette::BUTTON
+                    },
+                );
+                out.border_rect(
+                    button.rect,
+                    if selected {
+                        palette::BUTTON_BORDER_HOVER
+                    } else {
+                        palette::BUTTON_BORDER
+                    },
+                    if selected { 2 } else { 1 },
+                );
+                if self.schema.menu_id == 18 {
+                    let pattern = &self.loom_patterns[button.id as usize];
+                    let mark = pattern
+                        .rsplit(':')
+                        .next()
+                        .unwrap_or("?")
+                        .chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_ascii_uppercase()
+                        .to_string();
+                    out.text(
+                        button.rect.x + 4,
+                        button.rect.y + 3,
+                        1,
+                        palette::TEXT_DARK,
+                        mark,
+                    );
+                } else if let Some(recipe) = self.stonecutter_recipes.get(button.id as usize) {
+                    out.item_icon_str(
+                        UiRect::new(button.rect.x + 1, button.rect.y + 1, 14, 14),
+                        recipe,
+                    );
+                }
+            } else {
+                out.fill_rect(button.rect, palette::BUTTON);
+                out.border_rect(button.rect, palette::BUTTON_BORDER, 1);
+                out.text(
+                    button.rect.x + 3,
+                    button.rect.y + 2,
+                    1,
+                    palette::TEXT,
+                    button.label,
+                );
+            }
         }
         self.draw_station_chrome(panel, out);
         self.draw_workstation_controls(panel, out);
@@ -1473,8 +1729,7 @@ impl ContainerScreenState {
         // two or more recipes conflict; a quiet grid emits nothing.
         if self.conflict.is_active() {
             if let Some(anchor) = self.output_slot_rect(viewport_w, viewport_h) {
-                self.conflict
-                    .render(anchor, 1, vw as u32, vh as u32, out);
+                self.conflict.render(anchor, 1, vw as u32, vh as u32, out);
             }
         }
         if let Some(cursor) = self.cursor.clone().filter(|s| !s.is_empty()) {
@@ -1482,10 +1737,7 @@ impl ContainerScreenState {
             out.fill_rect(rect, palette::SLOT);
             out.border_rect(rect, palette::BUTTON_BORDER_HOVER, 1);
             if cursor.namespaced_id.is_empty() {
-                out.fill_rect(
-                    UiRect::new(rect.x + 3, rect.y + 3, 14, 14),
-                    palette::ACCENT,
-                );
+                out.fill_rect(UiRect::new(rect.x + 3, rect.y + 3, 14, 14), palette::ACCENT);
             } else {
                 out.item_icon_str(
                     UiRect::new(rect.x + 2, rect.y + 2, 16, 16),
@@ -1762,13 +2014,25 @@ impl ContainerScreenState {
             }
             7 => {
                 out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "CRAFTER");
-                draw_vanilla_arrow(out, UiRect::new(px + 104, py + 31, 20, 18), self.property(0) == 0);
+                let arrow = UiRect::new(px + 104, py + 31, 20, 18);
+                draw_vanilla_arrow(out, arrow, self.property(9) != 0);
+                if self.property(9) != 0 {
+                    out.border_rect(arrow, palette::BUTTON_BORDER_HOVER, 1);
+                }
                 out.text_str(
-                    px + 120,
+                    px + 108,
                     py + 50,
                     1,
-                    if self.property(0) == 0 { palette::ACCENT } else { palette::DANGER },
-                    if self.property(0) == 0 { "ON" } else { "OFF" },
+                    if self.property(9) != 0 {
+                        palette::ACCENT
+                    } else {
+                        palette::TEXT_DIM
+                    },
+                    if self.property(9) != 0 {
+                        "TRIGGERED"
+                    } else {
+                        "IDLE"
+                    },
                 );
             }
             8 => {
@@ -1790,29 +2054,100 @@ impl ContainerScreenState {
                 out.text_str(px + 91, py + 46, 1, palette::TEXT_DIM, "CRAFT");
             }
             13 => {
-                out.text_str(px + 53, py + 15, 1, palette::TEXT_DARK, "Select Enchantment");
+                out.text_str(px + 66, py + 4, 1, palette::TEXT_DARK, "Enchantments");
+                out.fill_rect(UiRect::new(px + 17, py + 20, 22, 18), palette::BUTTON);
+                out.border_rect(
+                    UiRect::new(px + 17, py + 20, 22, 18),
+                    palette::PANEL_BORDER,
+                    1,
+                );
+                out.text_str(px + 22, py + 25, 1, palette::WARNING, "BOOK");
                 for i in 0..3 {
-                    let y = py + 71 + i * 12;
-                    out.text_str(px + 57, y, 1, palette::WARNING, "ᚠᚢᚦ");
+                    let y = py + 14 + i * 19;
+                    let clue = self.property((4 + i) as i16);
+                    let level = self.property((7 + i) as i16);
+                    let glyphs = ["ᚠᚢᚦ", "ᚷᚺᚾ", "ᛁᛃᛇ"];
+                    let label = if clue >= 0 {
+                        format!("Ench {clue} {level}")
+                    } else {
+                        glyphs[i as usize].to_owned()
+                    };
+                    out.text(px + 69, y + 5, 1, palette::TEXT, label);
                     let cost = self.property(i as i16);
                     out.text(
-                        px + 119,
-                        y,
+                        px + 146,
+                        y + 5,
                         1,
-                        if cost > 0 { palette::ACCENT } else { palette::DANGER },
+                        if cost > 0 {
+                            palette::ACCENT
+                        } else {
+                            palette::DANGER
+                        },
                         cost.to_string(),
                     );
+                    out.fill_rect(UiRect::new(px + 62, y + 5, 7, 8), palette::ACCENT);
+                    out.text(px + 64, y + 5, 1, palette::TEXT_DARK, (i + 1).to_string());
                 }
             }
             15 => draw_vanilla_arrow(out, UiRect::new(px + 77, py + 26, 34, 24), false),
             16 => out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "HOPPER"),
             17 => {
                 out.text_str(px + 61, py + 13, 1, palette::TEXT_DARK, "Lectern");
-                out.text_str(px + 63, py + 51, 1, palette::TEXT_DIM, "Book Page");
+                out.text(
+                    px + 64,
+                    py + 61,
+                    1,
+                    palette::TEXT_DIM,
+                    format!("Page {}", self.property(0).max(0) + 1),
+                );
             }
             18 => {
-                out.text_str(px + 74, py + 15, 1, palette::TEXT_DARK, "Banner Pattern");
-                out.text_str(px + 75, py + 43, 1, palette::ACCENT, "PREVIEW");
+                out.text_str(px + 60, py + 2, 1, palette::TEXT_DARK, "Pattern");
+                out.border_rect(
+                    UiRect::new(px + 119, py + 13, 3, 56),
+                    palette::PANEL_BORDER,
+                    1,
+                );
+                if self.loom_patterns.len() > 16 {
+                    let max = (self.loom_patterns.len().div_ceil(4)).saturating_sub(4);
+                    let thumb_y = py + 14 + (self.loom_scroll_row * 40 / max.max(1)) as i32;
+                    out.fill_rect(UiRect::new(px + 120, thumb_y, 1, 12), palette::ACCENT);
+                }
+                let card = UiRect::new(px + 137, py + 4, 20, 40);
+                out.fill_rect(card, palette::PANEL);
+                out.border_rect(card, palette::PANEL_BORDER, 1);
+                let banner = self
+                    .slots
+                    .first()
+                    .filter(|s| !s.is_empty() && !s.namespaced_id.is_empty())
+                    .map(|s| s.namespaced_id.as_str())
+                    .unwrap_or("minecraft:white_banner");
+                out.item_icon_str(UiRect::new(card.x + 2, card.y + 3, 16, 20), banner);
+                if let Some(index) = self.selected_loom_pattern {
+                    let mark = self
+                        .loom_patterns
+                        .get(index)
+                        .and_then(|p| p.rsplit(':').next())
+                        .and_then(|p| p.chars().next())
+                        .unwrap_or('?')
+                        .to_ascii_uppercase()
+                        .to_string();
+                    out.fill_rect(UiRect::new(card.x + 8, card.y + 9, 5, 7), palette::ACCENT);
+                    out.text(card.x + 8, card.y + 8, 1, palette::TEXT_DARK, mark);
+                    out.text(
+                        card.x + 2,
+                        card.y + 27,
+                        1,
+                        palette::ACCENT,
+                        clip_text(
+                            self.loom_patterns
+                                .get(index)
+                                .map(String::as_str)
+                                .unwrap_or(""),
+                            16,
+                        ),
+                    );
+                }
             }
             19 => {
                 out.text_str(px + 108, py + 4, 1, palette::TEXT_DARK, "Villager Trades");
@@ -1827,6 +2162,36 @@ impl ContainerScreenState {
                     clip_text("TEMPLATE  BASE  ADDITION", (panel.w as i32 - 20).max(1)),
                 );
                 draw_vanilla_arrow(out, UiRect::new(px + 61, py + 41, 21, 18), true);
+                let frame = UiRect::new(px + 118, py + 10, 44, 62);
+                out.fill_rect(frame, palette::SLOT);
+                out.border_rect(frame, palette::PANEL_BORDER, 1);
+                let base = self.slots.get(1).filter(|s| !s.is_empty());
+                if let Some(item) = base {
+                    if !item.namespaced_id.is_empty() {
+                        out.item_icon_str(
+                            UiRect::new(frame.x + 12, frame.y + 12, 18, 18),
+                            &item.namespaced_id,
+                        );
+                    }
+                    if let Some(material) = self.slots.get(2).filter(|s| !s.is_empty()) {
+                        if !material.namespaced_id.is_empty() {
+                            out.item_icon_str(
+                                UiRect::new(frame.x + 12, frame.y + 36, 18, 18),
+                                &material.namespaced_id,
+                            );
+                        }
+                        out.fill_rect(
+                            UiRect::new(frame.x + 8, frame.bottom() - 5, 28, 2),
+                            palette::ACCENT,
+                        );
+                    }
+                }
+                if (self.slots.first().is_some_and(|s| !s.is_empty())
+                    || self.slots.get(1).is_some_and(|s| !s.is_empty()))
+                    && self.slots.get(3).is_some_and(UiItemStack::is_empty)
+                {
+                    out.text_str(px + 68, py + 45, 2, palette::DANGER, "X");
+                }
             }
             23 => {
                 out.text_str(px + 93, py + 20, 1, palette::TEXT_DARK, "MAP PREVIEW");
@@ -1837,10 +2202,71 @@ impl ContainerScreenState {
                 );
                 out.text_str(px + 104, py + 48, 1, palette::ACCENT, "MAP");
             }
-            24 => out.text_str(px + 8, py + 44, 1, palette::TEXT_DARK, "STONECUTTER"),
+            24 => {
+                out.text_str(px + 52, py + 2, 1, palette::TEXT_DARK, "Stonecutting");
+                out.border_rect(
+                    UiRect::new(px + 118, py + 14, 3, 54),
+                    palette::PANEL_BORDER,
+                    1,
+                );
+                if self.stonecutter_recipes.len() > 12 {
+                    let max = (self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3);
+                    let thumb_y = py + 15 + (self.stonecutter_scroll_row * 38 / max.max(1)) as i32;
+                    out.fill_rect(UiRect::new(px + 119, thumb_y, 1, 12), palette::ACCENT);
+                }
+            }
             _ => {}
         }
     }
+}
+
+fn default_loom_patterns() -> Vec<String> {
+    [
+        "base",
+        "square_bottom_left",
+        "square_bottom_right",
+        "square_top_left",
+        "square_top_right",
+        "stripe_bottom",
+        "stripe_top",
+        "stripe_left",
+        "stripe_right",
+        "stripe_center",
+        "stripe_middle",
+        "stripe_downright",
+        "stripe_downleft",
+        "small_stripes",
+        "cross",
+        "straight_cross",
+        "triangle_bottom",
+        "triangle_top",
+        "triangles_bottom",
+        "triangles_top",
+        "diagonal_left",
+        "diagonal_up_right",
+        "circle",
+        "rhombus",
+        "half_vertical",
+        "half_horizontal",
+        "half_vertical_right",
+        "half_horizontal_bottom",
+        "border",
+        "curly_border",
+        "gradient",
+        "gradient_up",
+        "bricks",
+        "skull",
+        "flower",
+        "creeper",
+        "mojang",
+        "globe",
+        "piglin",
+        "flow",
+        "guster",
+    ]
+    .into_iter()
+    .map(|pattern| format!("minecraft:{pattern}"))
+    .collect()
 }
 
 fn ghost_item(menu_id: u32, slot: i16) -> Option<&'static str> {
