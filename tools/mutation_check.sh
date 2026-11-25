@@ -1038,8 +1038,10 @@ check "surface-relative placement keeps its configured heightmap" \
                 out.push(pos);' \
   feature::generation_contract_tests::surface_relative_filter_keeps_its_heightmap_and_long_bounds
 check "dungeon loot uses the wrapped nextLong method" \
-  src/feature.rs '                            let _loot_seed = rng.next_i64();' \
-  '                            let _loot_seed = rng.next_long();' \
+  src/feature.rs '                        if reg.block_id_of(ctx.get(cx, pos.1, cz)) == Some(ft.chest_bid) {
+                            let loot_seed = rng.next_i64();' \
+  '                        if reg.block_id_of(ctx.get(cx, pos.1, cz)) == Some(ft.chest_bid) {
+                            let loot_seed = rng.next_long();' \
   feature::generation_contract_tests::monster_room_cells_and_rng_match_native
 check "simple double plants write both halves" \
   src/feature.rs '                    for (dy, half) in [(0, "lower"), (1, "upper")] {' \
@@ -2073,7 +2075,7 @@ check "a sign message that is not a string component is refused" \
   unsupported_sign_components_are_refused
 
 check "staged signs reach the sign store" \
-  src/main.rs '                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 1), lines);' '                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 0), lines);' \
+  src/main.rs '                    .insert((dim, pos.0, pos.1, pos.2, 1), lines);' '                    .insert((dim, pos.0, pos.1, pos.2, 0), lines);' \
   template_sign_text_matches_native_and_reaches_the_sign_store
 
 check "a furnace is staged as a furnace, not a chest" \
@@ -2747,14 +2749,14 @@ check "generated spawner handoff preserves a user air edit" \
                         .lock()
                         .unwrap()
                         .spawners
-                        .entry(pos)
+                        .entry((dim, pos))
                         .or_insert_with(|| generated_content::spawner_nbt(pos));' '                    .and_modify(|v| *v=state).or_insert(state);
                 if actual == state {
                     generated_content()
                         .lock()
                         .unwrap()
                         .spawners
-                        .entry(pos)
+                        .entry((dim, pos))
                         .or_insert_with(|| generated_content::spawner_nbt(pos));' \
   mineshaft::tests::queued_generation_payloads_never_take_the_save_lock_on_a_cell_read
 
@@ -2805,7 +2807,7 @@ check "breaking a spawner block removes its owned NBT entry" \
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .remove(&(x, y, z));
+            .remove(&(dim, (x, y, z)));
     }' \
   '    if Some(st) != name_to_state("spawner") {
         let _ = (x, y, z);
@@ -3067,8 +3069,10 @@ check "bonus chest reads the support cell below each torch, not two below" \
   feature::generation_contract_tests::bonus_chest_places_chest_loot_seed_and_supported_torches
 
 check "bonus chest spends one nextLong on the spawn-bonus loot seed" \
-  src/feature.rs '            let loot_seed = rng.next_i64();' \
-  '            let loot_seed = 0;' \
+  src/feature.rs '            ctx.set(x, y, z, chest);
+            let loot_seed = rng.next_i64();' \
+  '            ctx.set(x, y, z, chest);
+            let loot_seed = 0;' \
   feature::generation_contract_tests::bonus_chest_places_chest_loot_seed_and_supported_torches
 
 check "bonus chest refuses a chest outside the build height" \
@@ -3384,23 +3388,29 @@ check "a suggestion answer keeps start and length in their own fields" \
 # against a verbatim copy of the full pairwise scan, and a bucket that quietly loses a
 # neighbour - or that keeps the wrong one of two equally old orbs - must go red there.
 check "an xp orb merge searches the whole 26-cell neighbourhood, not just upward" \
-  src/combat_and_health.rs '        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    let key = (
-                        cx.checked_add(dx),' \
-  '        for dx in 0..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    let key = (
-                        cx.checked_add(dx),' \
+  core/src/zero_change_sim.rs '            let pi = xl[i].pos();
+            let (cx, cy, cz) = (
+                pi[0].floor() as i32,
+                pi[1].floor() as i32,
+                pi[2].floor() as i32,
+            );
+            candidates.clear();
+            for dx in -1..=1i32 {' \
+  '            let pi = xl[i].pos();
+            let (cx, cy, cz) = (
+                pi[0].floor() as i32,
+                pi[1].floor() as i32,
+                pi[2].floor() as i32,
+            );
+            candidates.clear();
+            for dx in 0..=1i32 {' \
   merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
 
 check "two equally old xp orbs keep the lower index" \
-  src/combat_and_health.rs '                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
-  '                let (keep, eat) = if aage < bage { (i, j) } else { (j, i) };
-                xl[keep].val = xl[keep].val.saturating_add(xl[eat].val);' \
+  core/src/zero_change_sim.rs '                    let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
+                    let sum = xl[keep].value().saturating_add(xl[eat].value());' \
+  '                    let (keep, eat) = if aage < bage { (i, j) } else { (j, i) };
+                    let sum = xl[keep].value().saturating_add(xl[eat].value());' \
   merge_tests::xp_merge_absorbs_exactly_what_the_full_pairwise_scan_absorbs
 
 # hasPostProcess lane: `LevelChunk.postProcessGeneration` has two halves in this port and one
@@ -3710,7 +3720,7 @@ check "chest_contract_3d_block_loot_lazy_defers_materialization" \
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(
-                        ow_block(pos),
+                        (dim, pos.0, pos.1, pos.2),
                         PendingBlockLoot {
                             kind,
                             loot_table,
@@ -3718,7 +3728,7 @@ check "chest_contract_3d_block_loot_lazy_defers_materialization" \
                         },
                     );' \
   '                let rolled = roll_loot_container_slots(kind, &loot_table, loot_seed);
-                chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block(ow_block(pos)), rolled);' \
+                chests().lock().unwrap_or_else(|e| e.into_inner()).insert(ContainerKey::Block((dim, pos.0, pos.1, pos.2)), rolled);' \
   tick_tests::chest_contract_3d_block_loot_stays_lazy_until_first_open
 
 check "chest_contract_3d_block_loot_spectator_gate_unpacks_for_viewers" \
