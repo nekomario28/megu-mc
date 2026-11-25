@@ -3,7 +3,7 @@
 use megu_state_store::chunk_packet_cache::{ChunkPacketCache, ChunkPacketKey};
 use std::sync::Arc;
 
-fn key(dim: u8, cx: i32, cz: i32, compression_threshold: i32) -> ChunkPacketKey {
+fn key(dim: u32, cx: i32, cz: i32, compression_threshold: i32) -> ChunkPacketKey {
     ChunkPacketKey {
         dim,
         cx,
@@ -13,7 +13,7 @@ fn key(dim: u8, cx: i32, cz: i32, compression_threshold: i32) -> ChunkPacketKey 
 }
 
 fn populate(cache: &mut ChunkPacketCache, key: ChunkPacketKey, bytes: usize) {
-    let (frame, hit) = cache.get_or_encode(key, || vec![key.dim; bytes]);
+    let (frame, hit) = cache.get_or_encode(key, || vec![key.dim as u8; bytes]);
     assert!(!hit);
     assert_eq!(frame.len(), bytes);
 }
@@ -155,4 +155,22 @@ fn explicit_chunk_bump_covers_block_entities_and_lighting() {
     assert_eq!(cache.bump_chunk(2, 3, 4), 2);
     let (_, second_hit) = cache.get_or_encode(key(2, 3, 4, 64), || vec![0x28]);
     assert!(!second_hit);
+}
+
+#[test]
+fn encode_once_backing_reuses_uncompressed_frame_after_outer_lru_eviction() {
+    let mut cache = ChunkPacketCache::new(1, 1024);
+    let a = key(0, 0, 0, -1);
+    let b = key(0, 1, 0, -1);
+    let (first, hit) = cache.get_or_encode(a, || vec![0x27; 8]);
+    assert!(!hit);
+    populate(&mut cache, b, 8);
+    assert_eq!(cache.len(), 1, "the one-entry outer LRU must evict A");
+
+    let (reused, hit) = cache.get_or_encode(a, || -> Vec<u8> {
+        panic!("encode-once backing must supply the revision-fresh frame")
+    });
+    assert!(!hit, "this is still an outer-cache miss even though encoding was avoided");
+    assert!(Arc::ptr_eq(&first, &reused));
+    assert_eq!(reused.as_ref(), [0x27; 8]);
 }

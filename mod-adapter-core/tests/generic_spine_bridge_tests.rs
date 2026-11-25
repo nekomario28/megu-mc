@@ -9,13 +9,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use megu_core::coords::{BlockPos, ChunkKey, DimIndex, SectionKey};
 use megu_core::section_rev::SharedSectionRevTable;
 
 use mod_adapter_core::spine_bridge::{
     decode_mod_state_lz4, encode_mod_state_lz4, ModDimRegistry, ModEventSink,
-    ModSpineHost, ModStateError, ModWatch, FIRST_MODDED_DIM,
+    ModBridgeCommand, ModSpineHost, ModStateError, ModWatch, FIRST_MODDED_DIM,
 };
 
 const OW: DimIndex = DimIndex::OVERWORLD;
@@ -63,6 +64,33 @@ fn registry_rejects_malformed_names_without_registering() {
     assert_eq!(r.index_of("a:b:c"), None);
     assert_eq!(r.registered_count(), 3);
     assert!(!r.is_registered("mod:../escape"));
+}
+
+#[test]
+fn embedded_local_transport_carries_wakes_and_commands_zero_copy() {
+    let mut host = ModSpineHost::new();
+    let bridge = host
+        .take_local_bridge_endpoint()
+        .expect("bridge endpoint is handed out once");
+    assert!(host.take_local_bridge_endpoint().is_none());
+
+    let key = chk(OW, 0, 0);
+    host.subscribe_chunk("embedded:bridge", key);
+    host.notify_block_changed(OW, BlockPos::new(8, 70, 8));
+
+    let event = bridge.try_recv().expect("wake event crosses the loopback");
+    assert_eq!(event.mod_id, "embedded:bridge");
+    assert_eq!(event.watch, ModWatch::Chunk(key));
+    assert_eq!(host.local_transport_stats().sent, 1);
+
+    bridge
+        .try_send(Arc::new(ModBridgeCommand::DrainWakes))
+        .expect("host endpoint is connected");
+    let commands = host.drain_local_bridge_commands();
+    assert_eq!(commands.len(), 1);
+    assert_eq!(*commands[0], ModBridgeCommand::DrainWakes);
+    assert_eq!(host.local_transport_stats().received, 1);
+    assert!(host.local_transport_stats().bytes_saved_estimate > 0);
 }
 
 // ---------------------------------------------------------------------------

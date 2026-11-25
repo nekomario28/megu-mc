@@ -10,15 +10,19 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
+use megu_core::bounded::{BoundedMap, MustConsume};
+use megu_core::coords::{ChunkKey as WireChunkKey, DimIndex};
+use megu_core::net_budget::EncodeOnceFrameCache;
+
 pub const DEFAULT_MAX_ENTRIES: usize = 2048;
 pub const DEFAULT_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-type ChunkId = (u8, i32, i32);
+type ChunkId = (u32, i32, i32);
 
 /// One dimension, chunk position, and negotiated packet compression threshold.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChunkPacketKey {
-    pub dim: u8,
+    pub dim: u32,
     pub cx: i32,
     pub cz: i32,
     pub compression_threshold: i32,
@@ -63,7 +67,8 @@ pub struct ChunkPacketCache {
     max_bytes: usize,
     entries: HashMap<ChunkPacketKey, Entry>,
     keys_by_chunk: HashMap<ChunkId, HashSet<ChunkPacketKey>>,
-    generations: HashMap<ChunkId, u64>,
+    generations: BoundedMap<ChunkId, u64, 16_384>,
+    encode_once: EncodeOnceFrameCache<4_096>,
     lru: BTreeSet<(u64, ChunkPacketKey)>,
     touch_counter: u64,
     stats: ChunkPacketCacheStats,
@@ -82,7 +87,8 @@ impl ChunkPacketCache {
             max_bytes,
             entries: HashMap::new(),
             keys_by_chunk: HashMap::new(),
-            generations: HashMap::new(),
+            generations: BoundedMap::new(),
+            encode_once: EncodeOnceFrameCache::new(),
             lru: BTreeSet::new(),
             touch_counter: 0,
             stats: ChunkPacketCacheStats::default(),
@@ -107,13 +113,18 @@ impl ChunkPacketCache {
 
     /// Increment this chunk's generation and discard every cached threshold
     /// variant. Call for block-entity edits and light edits as well as blocks.
-    pub fn bump_chunk(&mut self, dim: u8, cx: i32, cz: i32) -> u64 {
+    pub fn bump_chunk(&mut self, dim: u32, cx: i32, cz: i32) -> u64 {
         let chunk = (dim, cx, cz);
-        let generation = self.generations.entry(chunk).or_default();
-        *generation = generation
+        let result = self
+            .generations
+            .get(&chunk)
+            .copied()
+            .unwrap_or(0)
             .checked_add(1)
             .expect("chunk generation counter exhausted");
-        let result = *generation;
+        if let Some((evicted_chunk, _)) = self.generations.insert(chunk, result) {
+            self.remove_chunk_entries(evicted_chunk).consume();
+        }
 
         if let Some(keys) = self.keys_by_chunk.get(&chunk).cloned() {
             for key in keys {
@@ -128,7 +139,7 @@ impl ChunkPacketCache {
     /// Invalidate the edited block's chunk. At a seam, invalidate the
     /// neighboring chunk as well; a corner also touches its diagonal neighbor.
     /// Euclidean division handles negative world coordinates correctly.
-    pub fn bump_block(&mut self, dim: u8, block_x: i32, block_z: i32) -> u64 {
+    pub fn bump_block(&mut self, dim: u32, block_x: i32, block_z: i32) -> u64 {
         let cx = block_x.div_euclid(16);
         let cz = block_z.div_euclid(16);
         let x_offset = match block_x.rem_euclid(16) {
@@ -183,7 +194,22 @@ impl ChunkPacketCache {
         }
 
         self.stats.misses += 1;
-        let frame: Arc<[u8]> = encode_fn().into();
+        let frame: Arc<[u8]> = if key.compression_threshold == -1 {
+            let wire_key = WireChunkKey {
+                dim: DimIndex(key.dim),
+                cx: key.cx,
+                cz: key.cz,
+            };
+            if let Some(frame) = self.encode_once.get_rev(wire_key, generation) {
+                Arc::clone(&frame.bytes)
+            } else {
+                let frame: Arc<[u8]> = encode_fn().into();
+                self.encode_once.store(wire_key, generation, Arc::clone(&frame));
+                frame
+            }
+        } else {
+            encode_fn().into()
+        };
         let frame_len = frame.len();
         if self.max_entries == 0 || frame_len > self.max_bytes {
             return (frame, false);
@@ -215,6 +241,18 @@ impl ChunkPacketCache {
         self.lru.insert((touch, key));
         self.stats.bytes_used += frame_len;
         (frame, false)
+    }
+
+    /// Remove every packet entry belonging to `chunk`. The returned token makes
+    /// the eviction cascade impossible to drop accidentally at a call site.
+    fn remove_chunk_entries(&mut self, chunk: ChunkId) -> MustConsume<usize> {
+        let mut removed = 0usize;
+        if let Some(keys) = self.keys_by_chunk.get(&chunk).cloned() {
+            for key in keys {
+                removed += usize::from(self.remove(key));
+            }
+        }
+        MustConsume::new(removed)
     }
 
     fn remove(&mut self, key: ChunkPacketKey) -> bool {

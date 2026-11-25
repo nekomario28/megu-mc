@@ -112,6 +112,30 @@ def assert_copy_contents(journal, *, refusal=False):
         assert not journal, f"a refused run must not reach cargo: {journal}"
 
 
+
+def _source_rs_files(root):
+    files = list((root / "src").glob("*.rs"))
+    core_src = root / "core/src"
+    if core_src.is_dir():
+        files.extend(core_src.glob("*.rs"))
+    return files
+
+
+def _source_hashes(root):
+    return {
+        p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).digest()
+        for p in _source_rs_files(root)
+    }
+
+
+def _mutation_backups(root):
+    backups = list((root / "src").glob("*.mutation-backup"))
+    core_src = root / "core/src"
+    if core_src.is_dir():
+        backups.extend(core_src.glob("*.mutation-backup"))
+    return backups
+
+
 def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, symlink_input=False,
                   script=None):
     script = Path(script or SCRIPT)
@@ -129,6 +153,10 @@ def build_fixture(root, *, dirty=False, leftover=False, missing_anchor=False, sy
         shutil.copy2(script.parent / name, root / "tools" / name)
     for source in (ROOT / "src").glob("*.rs"):
         shutil.copy2(source, root / "src" / source.name)
+    if (ROOT / "core/src").is_dir():
+        (root / "core/src").mkdir(parents=True, exist_ok=True)
+        for source in (ROOT / "core/src").glob("*.rs"):
+            shutil.copy2(source, root / "core/src" / source.name)
     if dirty:
         with open(root / "src/main.rs", "a") as handle:
             handle.write("\n" + DIRTY + "\n")
@@ -186,7 +214,7 @@ if resolved != config.resolve() or root.resolve() not in resolved.parents:
 print("wire config: PASS", got)
 if {wire_error!r}:
     print("FileNotFoundError: broken harness"); sys.exit(1)
-if not list(Path("src").glob("*.mutation-backup")):
+if not (list(Path("src").glob("*.mutation-backup")) + list(Path("core/src").glob("*.mutation-backup"))):
     print({passed!r}); sys.exit(0)
 if "test result: FAILED" in {cargo_output!r}:
     print("gameplay wire: FAIL unrelated-assertion" if {wrong_failure!r} else "\\n".join({markers!r}))
@@ -214,7 +242,7 @@ def sha(path):
     return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
 
 probe = [line for line in Path({str(probe)!r}).read_text().splitlines() if line]
-backups = list(Path("src").glob("*.mutation-backup"))
+backups = list(Path("src").glob("*.mutation-backup")) + list(Path("core/src").glob("*.mutation-backup"))
 assert len(backups) <= 1, backups
 mutation = backups[0].with_suffix("") if backups else None
 mutated = mutation is not None
@@ -233,7 +261,7 @@ if os.environ.get("GATE_JOURNAL"):
             "cwd": os.getcwd(),
             "mutated": mutated,
             "target": os.environ.get("CARGO_TARGET_DIR"),
-            "mutation_file": mutation.name if mutated else None,
+            "mutation_file": mutation.as_posix() if mutated else None,
             "mutation_sha": sha(mutation) if mutated else None,
             "dirty_marker": ({DIRTY!r} in main.read_text()) if main.exists() else None,
             "probe": {{p: Path(p).exists() for p in probe}},
@@ -313,7 +341,7 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
             anchor = 'python3 "$filter" "$executable"'
             assert text.count(anchor) == 1
             script_path.write_text(text.replace(anchor, 'python3 "$filter" target/debug/megu'))
-        before = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (root / "src").glob("*.rs")}
+        before = _source_hashes(root)
         write_cargo(root, artifact, cargo_output=cargo_output, cargo_status=cargo_status,
                     empty_artifact=empty_artifact, baseline_error=baseline_error,
                     restored_error=restored_error, repeat_output=repeat_output,
@@ -362,16 +390,15 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
             os.killpg(proc.pid, signal.SIGKILL)
             out, err = proc.communicate(timeout=30)
             log = out + err
-            after = {p.name: hashlib.sha256(p.read_bytes()).digest()
-                     for p in (root / "src").glob("*.rs")}
+            after = _source_hashes(root)
             assert before == after, "a killed run must not change the source tree"
-            assert not list((root / "src").glob("*.mutation-backup"))
+            assert not _mutation_backups(root)
             kept = sorted(snapshot_parent.glob("run.*"))
             assert kept, "no private snapshot was retained to inspect"
-            residues = list((kept[0] / "src").glob("*.mutation-backup"))
+            residues = _mutation_backups(kept[0])
             assert len(residues) == 1, f"the killed run should leave its residue here: {kept[0]}"
             mutant = residues[0].with_suffix("")
-            assert mutant.read_bytes() != (root / "src" / mutant.name).read_bytes(), \
+            assert mutant.read_bytes() != (root / mutant.relative_to(kept[0])).read_bytes(), \
                 "the retained copy should hold the mutant"
             return proc.returncode, log, journal_entries(journal)
 
@@ -380,11 +407,11 @@ def run_case(cargo_output, cargo_status, *, script=None, missing_anchor=False, l
         log = result.stdout + result.stderr
         if keep_logs:
             log += "".join(p.read_text() for p in sorted((root / "mutation-logs").glob("*")))
-        after = {p.name: hashlib.sha256(p.read_bytes()).digest() for p in (root / "src").glob("*.rs")}
+        after = _source_hashes(root)
         if not race_copy:
             assert before == after, "source bytes must be restored on every outcome"
         if not leftover:
-            assert not list((root / "src").glob("*.mutation-backup")), "no mutation residue"
+            assert not _mutation_backups(root), "no mutation residue"
         left = sorted(p.name for p in snapshot_parent.glob("run.*"))
         assert not left, f"the snapshot was left behind by a completed run: {left}"
         if snapshot_parent_alias:

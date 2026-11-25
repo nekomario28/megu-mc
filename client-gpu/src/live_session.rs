@@ -4137,6 +4137,9 @@ impl LiveSession {
         if let Some(received_at) = self.subworld_sync_received_at {
             let alpha = (received_at.elapsed().as_secs_f32() / 0.05).clamp(0.0, 1.0);
             self.subworlds.interpolate_poses(alpha);
+            if let Some(first_id) = self.subworlds.entries().next().map(|entry| entry.id) {
+                let _ = self.live_contraption_interpolated_transform(first_id, alpha);
+            }
         }
         // Synchronous pump only when no dedicated mix thread owns the
         // sink — `pump` would write to the null sink otherwise.
