@@ -8,23 +8,8 @@
       "date": "2026-11-23"
     },
     {
-      "module": "proto/src/resolver.rs",
-      "reason": "Session resolver staged for the friend-relay path; no live consumer yet",
-      "date": "2026-11-23"
-    },
-    {
       "module": "proto/src/session.rs",
       "reason": "Relay session state staged alongside resolver; no live consumer yet",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "proto/src/voice_relay.rs",
-      "reason": "Voice relay protocol staged for the friend-relay binary; not yet driven",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "state-store/src/audit_log.rs",
-      "reason": "Append-only audit log consumed by the world_migrate bin (audit-excluded src/bin path) and staged for the live server block-mutation tap; no lib consumer yet",
       "date": "2026-11-23"
     },
     {
@@ -33,23 +18,8 @@
       "date": "2026-11-23"
     },
     {
-      "module": "server-files/src/admin_cli.rs",
-      "reason": "Admin CLI is consumed by the production megu-init/server_init binaries under src/bin, which the module-consumer audit excludes by design; no additional lib consumer is needed",
-      "date": "2026-11-25"
-    },
-    {
-      "module": "mod-offload/src/ffi.rs",
-      "reason": "C ABI boundary consumed via include/megu_mod_offload.h by non-Rust callers \u2014 invisible to the Rust consumer graph by design",
-      "date": "2026-11-23"
-    },
-    {
       "module": "client-port/src/world.rs",
       "reason": "WorldState facade staged for the embedding-friendly client split; client-app uses its own world module today",
-      "date": "2026-11-23"
-    },
-    {
-      "module": "client-kernel/src/ffi.rs",
-      "reason": "C ABI boundary consumed via the public header by non-Rust callers \u2014 invisible to the Rust consumer graph by design",
       "date": "2026-11-23"
     }
   ]

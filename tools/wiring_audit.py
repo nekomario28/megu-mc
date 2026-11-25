@@ -195,6 +195,29 @@ def source_paths(root):
             yield path.relative_to(root).as_posix(), crate
 
 
+def consumer_source_paths(root):
+    """Production Rust files allowed to establish module consumer edges.
+
+    Binary entrypoints and tools are consumers, but are not additional audited
+    module owners: their small glue modules would otherwise be reported as
+    unwired libraries themselves.
+    """
+    paths = set()
+    for crate in CRATES:
+        source_dir = root / ("src" if crate == "." else f"{crate}/src")
+        if source_dir.is_dir():
+            paths.update(path.relative_to(root).as_posix()
+                         for path in source_dir.rglob("bin/**/*.rs"))
+    tools_dir = root / "tools"
+    if tools_dir.is_dir():
+        for path in tools_dir.rglob("src/**/*.rs"):
+            relative = path.relative_to(root)
+            if is_av_test_path(relative.as_posix()):
+                continue
+            paths.add(relative.as_posix())
+    return paths
+
+
 def package_names(root):
     aliases = {}
     for crate in CRATES:
@@ -206,14 +229,60 @@ def package_names(root):
     return aliases
 
 
+def cdylib_crates(root):
+    """Return audited crates whose library is explicitly built as a cdylib."""
+    crates = set()
+    for crate in CRATES:
+        manifest = root / ("Cargo.toml" if crate == "." else f"{crate}/Cargo.toml")
+        if not manifest.is_file():
+            continue
+        text = manifest.read_text(encoding="utf-8")
+        lib = re.search(r"(?ms)^\[lib\]\s*(.*?)(?=^\[|\Z)", text)
+        if lib and re.search(r'crate-type\s*=\s*\[[^]]*"cdylib"', lib.group(1)):
+            crates.add(crate)
+    return crates
+
+
+def reexport_aliases(root, raw_sources):
+    """Map public root reexport aliases back to their defining module."""
+    aliases = defaultdict(set)
+    for crate in CRATES:
+        path = "src/lib.rs" if crate == "." else f"{crate}/src/lib.rs"
+        code = production_code(raw_sources.get(path, ""))
+        for match in re.finditer(
+                r"\bpub\s+use\s+([A-Za-z_]\w*)::\{([^}]+)\}\s*;", code):
+            module, members = match.groups()
+            for member in members.split(","):
+                member = member.strip()
+                if not member:
+                    continue
+                item_alias = re.fullmatch(
+                    r"[A-Za-z_]\w*\s+as\s+([A-Za-z_]\w*)", member)
+                if item_alias:
+                    aliases[(crate, module)].add(item_alias.group(1))
+    return aliases
+
+
+def exported_c_abi(code):
+    """Whether a source defines a symbol explicitly exported across a C ABI."""
+    pattern = re.compile(
+        r"#\s*\[\s*(?:unsafe\s*\(\s*)?no_mangle\s*\)?\s*\]\s*"
+        r"(?:pub\s+)?(?:unsafe\s+)?extern\s+fn\b")
+    clean = production_code(code)
+    return any(re.search(r'extern\s+"C"\s+fn\b', code[match.start():match.end()])
+               for match in pattern.finditer(clean))
+
+
 def _module_path(path, crate):
     prefix = "src/" if crate == "." else f"{crate}/src/"
     return path[len(prefix):-3].replace("/", "::")
 
 
 def audit(root):
+    owner_paths = list(source_paths(root))
+    consumer_paths = consumer_source_paths(root)
     raw_sources = {path: (root / path).read_text(encoding="utf-8")
-                   for path, _ in source_paths(root)}
+                   for path in ({path for path, _ in owner_paths} | consumer_paths)}
     test_only_paths = set()
     for path, raw in raw_sources.items():
         for match in re.finditer(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+(\w+)\s*;", raw):
@@ -223,7 +292,7 @@ def audit(root):
     modules = []
     exports_by_name = Counter()
     included_by = defaultdict(set)
-    for path, crate in source_paths(root):
+    for path, crate in owner_paths:
         if path in test_only_paths:
             continue
         code = production_code(raw_sources[path])
@@ -245,7 +314,13 @@ def audit(root):
         })
         exports_by_name.update(exports)
 
+    for path in consumer_paths:
+        if path not in sources and path not in test_only_paths:
+            sources[path] = remove_surface_declarations(production_code(raw_sources[path]))
+
     aliases = package_names(root)
+    reexports = reexport_aliases(root, raw_sources)
+    cdylibs = cdylib_crates(root)
     # Precompute source identifiers once. A filename or declaration alone
     # cannot produce an edge. This also keeps the audit fast on large crates.
     identifiers = {path: set(IDENT.findall(code)) for path, code in sources.items()}
@@ -259,6 +334,7 @@ def audit(root):
         path = module["path"]
         crate = module["crate"]
         alias = aliases.get(crate, "")
+        reexported_symbols = reexports.get((crate, name), set())
         candidates = set(by_identifier.get(name, ()))
         # Distinctive public symbols detect use after an import or a reexport.
         # Bare PAGE_SIZE, read_slice, or update are common unrelated identifiers.
@@ -270,19 +346,40 @@ def audit(root):
                             symbol.islower()))]
         for symbol in unique_exports:
             candidates.update(by_identifier.get(symbol, ()))
+        for symbol in reexported_symbols:
+            candidates.update(by_identifier.get(symbol, ()))
 
         hits = set(included_by.get(path, ()))
+        # A public no_mangle C function in a cdylib is itself a real external
+        # boundary, even when no Rust caller is present in the workspace.
+        if crate in cdylibs and exported_c_abi(raw_sources[path]):
+            hits.add(path)
         qualified = re.compile(r"\b" + re.escape(name) + r"\s*::")
         imported = re.compile(r"\buse\b[^;]*\b" + re.escape(name) + r"\b")
         cross_crate = re.compile(r"\b" + re.escape(alias) + r"\s*::\s*" + re.escape(name) + r"\b") if alias else None
+        reexport_qualified = re.compile(
+            r"\b" + re.escape(alias) + r"\s*::\s*"
+            + r"(?:" + "|".join(map(re.escape, sorted(reexported_symbols)))
+            + r")\b") if alias and reexported_symbols else None
+        reexport_import = re.compile(
+            r"\buse\s+" + re.escape(alias) + r"\s*::[^;]*\b(?:"
+            + "|".join(map(re.escape, sorted(reexported_symbols)))
+            + r")\b") if alias and reexported_symbols else None
         for candidate in sorted(candidates):
             if candidate == path:
                 continue
             code = sources[candidate]
             same_crate = candidate.startswith("src/") if crate == "." else candidate.startswith(f"{crate}/src/")
             symbol_ref = any(symbol in identifiers[candidate] for symbol in unique_exports)
+            reexport_ref = bool(reexport_qualified and reexport_qualified.search(code))
+            active_code = strip_imports(code)
+            reexport_import_ref = bool(
+                reexport_import and reexport_import.search(code)
+                and any(symbol in IDENT.findall(active_code)
+                        for symbol in reexported_symbols))
             module_ref = bool((same_crate and (qualified.search(code) or imported.search(code)))
-                              or (cross_crate and cross_crate.search(code)))
+                              or (cross_crate and cross_crate.search(code))
+                              or reexport_ref or reexport_import_ref)
             if symbol_ref or module_ref:
                 hits.add(candidate)
         return sorted(hits)

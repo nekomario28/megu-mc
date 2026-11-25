@@ -111,6 +111,55 @@ class WiringAuditTests(unittest.TestCase):
             self.assertIn("UNWIRED module src/foo.rs", result.stdout)
             self.assertNotIn("UNWIRED module src/other.rs", result.stdout)
 
+    def test_public_reexport_alias_wires_its_defining_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            put(root, "src/main.rs", "fn main() {}\n")
+            put(root, "proto/Cargo.toml", '[package]\nname = "megu-proto"\n')
+            put(root, "proto/src/lib.rs", "pub mod resolver;\npub use resolver::{resolve as resolve_server_address};\n")
+            put(root, "proto/src/resolver.rs", "pub fn resolve() {}\n")
+            put(root, "client-app/Cargo.toml", '[package]\nname = "client-app"\n')
+            put(root, "client-app/src/lib.rs", "pub mod protocol;\n")
+            put(root, "client-app/src/protocol.rs", "pub fn run() { megu_proto::resolve_server_address(); }\n")
+            put(root, "client-app/src/main.rs", "fn main() { crate::protocol::run(); }\n")
+            result = run(root, "--format", "json", "--strict")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            modules = {item["module"]: item for item in json.loads(result.stdout)["modules"]}
+            self.assertIn("client-app/src/protocol.rs", modules["proto/src/resolver.rs"]["referenced_by"])
+
+    def test_binary_and_tools_are_consumer_sources_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            put(root, "src/main.rs", "fn main() {}\n")
+            put(root, "server-files/Cargo.toml", '[package]\nname = "megu-server-files"\n')
+            put(root, "server-files/src/lib.rs", "pub mod admin_cli;\n")
+            put(root, "server-files/src/admin_cli.rs", "pub fn run() {}\n")
+            put(root, "server-files/src/bin/admin.rs", "fn main() { megu_server_files::admin_cli::run(); }\n")
+            put(root, "mod-offload/Cargo.toml", '[package]\nname = "mod-offload"\n')
+            put(root, "mod-offload/src/lib.rs", "pub mod ffi;\n")
+            put(root, "mod-offload/src/ffi.rs", 'pub unsafe extern "C" fn mso_region_create() {}\n')
+            put(root, "tools/offload_probe/Cargo.toml", '[package]\nname = "offload-probe"\n')
+            put(root, "tools/offload_probe/src/main.rs", "use mod_offload::ffi::*;\nfn main() { unsafe { mso_region_create(); } }\n")
+            result = run(root, "--format", "json", "--strict")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            modules = {item["module"]: item for item in json.loads(result.stdout)["modules"]}
+            self.assertIn("server-files/src/bin/admin.rs", modules["server-files/src/admin_cli.rs"]["referenced_by"])
+            self.assertIn("tools/offload_probe/src/main.rs", modules["mod-offload/src/ffi.rs"]["referenced_by"])
+            self.assertNotIn("server-files/src/bin/admin.rs", modules)
+
+    def test_cdylib_exported_c_abi_is_a_boundary_consumer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            put(root, "src/main.rs", "fn main() {}\n")
+            put(root, "client-kernel/Cargo.toml", '[package]\nname = "megu-kernel"\n[lib]\ncrate-type = ["rlib", "cdylib"]\n')
+            put(root, "client-kernel/src/lib.rs", "mod ffi;\n")
+            put(root, "client-kernel/src/ffi.rs", '#[no_mangle]\npub extern "C" fn megu_kernel_abi_version() -> u32 { 1 }\n')
+            result = run(root, "--format", "json", "--strict")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            modules = {item["module"]: item for item in json.loads(result.stdout)["modules"]}
+            self.assertEqual(modules["client-kernel/src/ffi.rs"]["referenced_by"],
+                             ["client-kernel/src/ffi.rs"])
+
     def test_contract_requires_declared_live_consumer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
