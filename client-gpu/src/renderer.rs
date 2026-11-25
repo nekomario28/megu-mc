@@ -3738,10 +3738,13 @@ pub struct GpuRenderer {
     pub notice: Option<String>,
     first_person_viewmodel: FirstPersonViewmodel,
     gameplay_screen_overlay: GameplayScreenOverlay,
+    gameplay_overlay_gpu: GameplayOverlayGpu,
     biome_tint: [f32; 3],
     biome_tint_strength: f32,
     entity_atlas_texture: wgpu::Texture,
     particle_atlas_texture: wgpu::Texture,
+    entity_env_bg: wgpu::BindGroup,
+    particle_env_bg: wgpu::BindGroup,
     destroy_stage_textures: Vec<wgpu::Texture>,
     world_env_textures: BTreeMap<VanillaEnvTexture, wgpu::Texture>,
     world_overlay_textures: BTreeMap<VanillaMiscOverlay, wgpu::Texture>,
@@ -3808,6 +3811,54 @@ pub struct GameplayScreenOverlay {
     pub vignette_alpha: f32,
     pub time_secs: f32,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GameplayOverlayUniform {
+    effects: [f32; 4],
+    extra: [f32; 4],
+    target: [f32; 4],
+}
+
+struct GameplayOverlayGpu {
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+pub const GAMEPLAY_OVERLAY_WGSL: &str = r#"
+struct OverlayUniform { effects: vec4<f32>, extra: vec4<f32>, screen: vec4<f32> };
+@group(0) @binding(0) var<uniform> overlay: OverlayUniform;
+struct Out { @builtin(position) position: vec4<f32> };
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> Out {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var o: Out; o.position = vec4<f32>(p[i], 0.0, 1.0); return o;
+}
+@fragment fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = frag.xy / max(overlay.screen.xy, vec2<f32>(1.0));
+    let p = uv * 2.0 - 1.0;
+    let edge = max(abs(p.x), abs(p.y));
+    let t = overlay.extra.w;
+    var color = vec3<f32>(0.0); var alpha = 0.0;
+    let hurt = overlay.effects.x * smoothstep(0.42, 1.30, edge);
+    color = mix(color, vec3<f32>(0.85, 0.015, 0.01), hurt); alpha = max(alpha, hurt * 0.62);
+    let water = overlay.effects.z * (0.24 + 0.035 * sin(uv.x * 31.0 + sin(uv.y * 17.0 + t) * 2.0));
+    color = mix(color, vec3<f32>(0.02, 0.33, 0.48), water); alpha = max(alpha, water * 0.58);
+    let fire_edge = (1.0 - smoothstep(0.03, 0.50, uv.y)) * (0.72 + 0.28 * sin(uv.x * 43.0 + t * 4.0 + sin(uv.x * 15.0)));
+    let fire = overlay.effects.y * fire_edge * 0.72;
+    color = mix(color, vec3<f32>(1.0, 0.27 + 0.35 * fire_edge, 0.015), fire); alpha = max(alpha, fire);
+    let radius = length(p); let angle = atan2(p.y, p.x);
+    let portal = overlay.effects.w * (0.22 + 0.12 * sin(radius * 19.0 - angle * 4.0 + t * 1.7));
+    color = mix(color, vec3<f32>(0.40, 0.055, 0.62), portal); alpha = max(alpha, portal * 0.55);
+    let frost = overlay.extra.x * smoothstep(0.52, 1.16, edge) * 0.48;
+    color = mix(color, vec3<f32>(0.53, 0.91, 1.0), frost); alpha = max(alpha, frost);
+    let pumpkin = overlay.extra.y * smoothstep(0.50, 0.92, edge);
+    color = mix(color, vec3<f32>(0.035, 0.018, 0.008), pumpkin); alpha = max(alpha, pumpkin * 0.88);
+    let vignette = overlay.extra.z * smoothstep(0.28, 1.35, radius) * 0.50;
+    color = mix(color, vec3<f32>(0.0), vignette); alpha = max(alpha, vignette);
+    return vec4<f32>(color, clamp(alpha, 0.0, 0.92));
+}
+"#;
 
 /// Twelve edges of a block selection AABB, expanded slightly to avoid
 /// z-fighting with the selected block's faces.
@@ -4226,6 +4277,10 @@ pub struct EntityBerGeometry {
     pub indices: Vec<u32>,
 }
 
+/// One staged entity/BER mesh plus its optional normalized atlas UV window.
+pub type TexturedEntityBerMesh<'a> =
+    (&'a ExtrudedMesh, [f32; 3], [f32; 3], Option<[f32; 4]>);
+
 /// Pack articulated-entity and block-entity meshes into the two renderer
 /// vertex formats without creating a GPU device. Use
 /// [`build_entity_ber_geometry_into`] when the caller needs retained scratch.
@@ -4248,11 +4303,25 @@ pub fn build_entity_ber_geometry_into(
     sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
     daylight_factor: f32,
 ) {
+    build_entity_ber_geometry_mapped_into(
+        out,
+        meshes.iter().map(|&(mesh, origin, tint)| (mesh, origin, tint, None)),
+        sample_light,
+        daylight_factor,
+    );
+}
+
+fn build_entity_ber_geometry_mapped_into<'a>(
+    out: &mut EntityBerGeometry,
+    meshes: impl IntoIterator<Item = (&'a ExtrudedMesh, [f32; 3], [f32; 3], Option<[f32; 4]>)>,
+    sample_light: &mut impl FnMut(f32, f32, f32) -> (u8, u8),
+    daylight_factor: f32,
+) {
     out.lit_vertices.clear();
     out.lit_indices.clear();
     out.vertices.clear();
     out.indices.clear();
-    'meshes: for &(mesh, origin, tint) in meshes {
+    'meshes: for (mesh, origin, tint, uv_rect) in meshes {
         if !origin.iter().chain(tint.iter()).all(|v| v.is_finite()) {
             continue;
         }
@@ -4302,14 +4371,22 @@ pub fn build_entity_ber_geometry_into(
                 ]);
             }
             let brightness = vanilla_light_brightness(block_light, sky_light, daylight_factor);
-            append_dynamic_quad(
+            let uv = uv_rect.map_or(quad.uv, |[u0, v0, u1, v1]| {
+                quad.uv.map(|[u, v]| [u0 + (u1 - u0) * u, v0 + (v1 - v0) * v])
+            });
+            let appended = append_dynamic_quad(
                 &mut out.vertices,
                 &mut out.indices,
                 positions,
                 quad.normal,
-                quad.uv,
+                uv,
                 tint.map(|v| v * brightness),
             );
+            if appended && uv_rect.is_some() {
+                for vertex in out.vertices.iter_mut().rev().take(4) {
+                    vertex.set_material_flags(2);
+                }
+            }
         }
     }
 }
@@ -4391,8 +4468,9 @@ fn entity_quad_tint(tint_index: i32, base_tint: [f32; 3]) -> [f32; 3] {
 #[cfg(test)]
 mod entity_lighting_tests {
     use super::{
-        build_entity_ber_geometry, build_lit_entity_ber_geometry, entity_quad_tint,
-        lit_subworld_mesh, vanilla_light_brightness,
+        build_entity_ber_geometry, build_entity_ber_geometry_mapped_into,
+        build_lit_entity_ber_geometry, entity_quad_tint, lit_subworld_mesh,
+        vanilla_light_brightness, EntityBerGeometry,
     };
     use crate::subworld_render::{box_mesh, SubWorldTransform};
     use megu_client_mesh::vanilla_plus_3d::{ExtrudedMesh, ExtrudedQuad};
@@ -4434,6 +4512,24 @@ mod entity_lighting_tests {
             .all(|v| v.light_attr == ((14 << 5) | (15 << 9))));
         assert!(vertices[..4].iter().all(|v| v.normal == [1.0, 0.0, 0.0]));
         assert!(vertices[4..].iter().all(|v| v.normal == [0.0, 0.0, -1.0]));
+    }
+
+    #[test]
+    fn textured_entity_uvs_remap_into_atlas_rect_without_losing_material_flag() {
+        let mut source = quad(0.0, [0.0, 1.0, 0.0], -1);
+        source.uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mesh = ExtrudedMesh { quads: vec![source] };
+        let mut geometry = EntityBerGeometry::default();
+        build_entity_ber_geometry_mapped_into(
+            &mut geometry,
+            [(&mesh, [0.0; 3], [1.0; 3], Some([0.2, 0.3, 0.6, 0.9]))],
+            &mut |_, _, _| (0, 15),
+            1.0,
+        );
+        assert_eq!(geometry.vertices[0].uv, [0.2, 0.3]);
+        assert_eq!(geometry.vertices[1].uv, [0.6, 0.3]);
+        assert_eq!(geometry.vertices[2].uv, [0.6, 0.9]);
+        assert!(geometry.vertices.iter().all(|vertex| vertex.material_flags() == 2));
     }
 
     #[test]
@@ -4692,6 +4788,26 @@ impl AtlasGpu {
             ],
         })
     }
+}
+
+fn visual_env_bind_group(
+    device: &wgpu::Device,
+    composite: &CompositeGpu,
+    texture: &wgpu::Texture,
+) -> wgpu::BindGroup {
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("composite-visual-texture-bind-group"),
+        layout: &composite.env_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: composite.env_ubo.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: composite.lights_ubo.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&composite.atlas.sampler) },
+            wgpu::BindGroupEntry { binding: 4, resource: composite.atlas.rects.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: composite.atlas.state_sprites.as_entire_binding() },
+        ],
+    })
 }
 
 /// Shadow resources exist only while a nonzero-cascade preset is active.
@@ -7712,6 +7828,7 @@ impl GpuRenderer {
             vertex_scratch: Vec::new(),
         };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
+        let gameplay_overlay_gpu = GameplayOverlayGpu::new(&ctx.device, target_format);
         let particle_instancing = composite.billboard.is_some();
         // Shared stand-in uniform + bind group for sections the composed
         // pass never draws directly (arena-resident opaque with no
@@ -7842,6 +7959,8 @@ impl GpuRenderer {
             upload_rgba_texture(&ctx, "entity-texture-fallback-white", 1, 1, &[255; 4]);
         let particle_fallback =
             upload_rgba_texture(&ctx, "particle-texture-fallback-white", 1, 1, &[255; 4]);
+        let entity_env_bg = visual_env_bind_group(&ctx.device, &composite, &entity_fallback);
+        let particle_env_bg = visual_env_bind_group(&ctx.device, &composite, &particle_fallback);
         Self {
             ctx,
             target_format,
@@ -8060,10 +8179,13 @@ impl GpuRenderer {
             notice: None,
             first_person_viewmodel: FirstPersonViewmodel::default(),
             gameplay_screen_overlay: GameplayScreenOverlay::default(),
+            gameplay_overlay_gpu,
             biome_tint: [1.0; 3],
             biome_tint_strength: 0.0,
             entity_atlas_texture: entity_fallback,
             particle_atlas_texture: particle_fallback,
+            entity_env_bg,
+            particle_env_bg,
             destroy_stage_textures: Vec::new(),
             world_env_textures: BTreeMap::new(),
             world_overlay_textures: BTreeMap::new(),
@@ -8133,6 +8255,46 @@ impl GpuRenderer {
         self.gameplay_screen_overlay
     }
 
+    fn encode_gameplay_screen_overlay(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
+        let o = self.gameplay_screen_overlay;
+        let alpha = |value: f32| if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
+        let uniform = GameplayOverlayUniform {
+            effects: [alpha(o.hurt_alpha), alpha(o.fire_alpha), alpha(o.underwater_alpha), alpha(o.portal_alpha)],
+            extra: [alpha(o.freezing_alpha), alpha(o.pumpkin_alpha), alpha(o.vignette_alpha), if o.time_secs.is_finite() { o.time_secs } else { 0.0 }],
+            target: [width as f32, height as f32, 0.0, 0.0],
+        };
+        if uniform.effects.iter().chain(uniform.extra[..3].iter()).all(|&v| v <= 0.0) {
+            return;
+        }
+        self.ctx.queue.write_buffer(
+            &self.gameplay_overlay_gpu.uniform,
+            0,
+            bytemuck::bytes_of(&uniform),
+        );
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("gameplay-screen-overlays"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.gameplay_overlay_gpu.pipeline);
+        pass.set_bind_group(0, &self.gameplay_overlay_gpu.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Configure section tint consumed by the terrain section uniforms.
     pub fn set_biome_tint(&mut self, rgb: [f32; 3], strength: f32) {
         self.biome_tint = rgb.map(|v| {
@@ -8171,6 +8333,11 @@ impl GpuRenderer {
                 atlas.height,
                 &atlas.rgba,
             );
+            self.entity_env_bg = visual_env_bind_group(
+                &self.ctx.device,
+                &self.composite,
+                &self.entity_atlas_texture,
+            );
         }
     }
 
@@ -8186,6 +8353,11 @@ impl GpuRenderer {
                 atlas.width,
                 atlas.height,
                 &atlas.rgba,
+            );
+            self.particle_env_bg = visual_env_bind_group(
+                &self.ctx.device,
+                &self.composite,
+                &self.particle_atlas_texture,
             );
         }
     }
@@ -8296,6 +8468,35 @@ impl GpuRenderer {
             self.lit_terrain = None;
         }
 
+        let (allocs, reuses) = stage_dynamic_geometry(
+            &self.ctx,
+            &mut self.entity_ber,
+            &geometry.vertices,
+            &geometry.indices,
+        );
+        self.dynamic_buffer_allocs += allocs;
+        self.dynamic_ring_reuses += reuses;
+        self.entity_ber_scratch = geometry;
+    }
+
+    /// Stage entity and block-entity meshes with per-mesh atlas UV windows.
+    /// Each quad's local UVs are remapped into its optional normalized atlas
+    /// rectangle; `None` leaves the local UVs untouched for the white
+    /// fallback path. The owned input vector is consumed directly, and the
+    /// renderer reuses its preallocated geometry scratch.
+    pub fn set_entity_and_ber_meshes_textured(
+        &mut self,
+        meshes: Vec<TexturedEntityBerMesh<'_>>,
+        light_at: impl Fn(f32, f32, f32) -> (u8, u8),
+    ) {
+        let mut geometry = std::mem::take(&mut self.entity_ber_scratch);
+        build_entity_ber_geometry_mapped_into(
+            &mut geometry,
+            meshes,
+            &mut |x, y, z| light_at(x, y, z),
+            self.entity_light_daylight,
+        );
+        self.lit_terrain = None;
         let (allocs, reuses) = stage_dynamic_geometry(
             &self.ctx,
             &mut self.entity_ber,
@@ -14393,6 +14594,8 @@ impl GpuRenderer {
         let debug_lines = &self.debug_lines;
         let debug_line_pipeline = &self.debug_line_pipeline;
         let frame_bind_group = &self.frame_bind_group;
+        let entity_env_bg = &self.entity_env_bg;
+        let particle_env_bg = &self.particle_env_bg;
         let depth_view = self.depth_view.as_ref().expect("depth ensured");
         let sky = &self.sky;
         let water = &self.water;
@@ -14638,13 +14841,13 @@ impl GpuRenderer {
             let scratch = &mut gpu.draw_scratch;
             // `world_light` is the packed sub-world light word
             // (`pack_subworld_light`/`0`) carried in `params2.z`.
-            let mut slot = |model: Mat4, fade: f32, alpha: f32, world_light: u32| -> u32 {
+            let mut slot = |model: Mat4, fade: f32, alpha: f32, world_light: u32, visual: f32| -> u32 {
                 let index = scratch.len();
                 scratch.push(CompositeDrawUniforms {
                     mvp: mat4_mul(&view_proj, &model),
                     model,
                     params: [fade, alpha, 0.0, 0.0],
-                    params2: [0.0, 0.0, f32::from_bits(world_light), 0.0],
+                    params2: [0.0, 0.0, f32::from_bits(world_light), visual],
                     _stride_pad: [0.0; 24],
                 });
                 index as u32 * DRAW_UNIFORM_STRIDE
@@ -14678,7 +14881,7 @@ impl GpuRenderer {
                     drew_opaque_subworld = true;
                 }
                 let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha, entry.world_light);
+                let off = slot(model, 1.0, entry.alpha, entry.world_light, 0.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
@@ -14697,7 +14900,7 @@ impl GpuRenderer {
                     drew_instanced = true;
                 }
                 let model = batch.transform.model_matrix();
-                let off = slot(model, 1.0, 1.0, 0);
+                let off = slot(model, 1.0, 1.0, 0, 0.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
                 pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
@@ -14713,11 +14916,13 @@ impl GpuRenderer {
                 if let Some(mesh) = entity_ber {
                     pass.set_pipeline(&lit_opaque_pipeline);
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    let off = slot(identity, 1.0, 1.0, 0);
+                    pass.set_bind_group(2, entity_env_bg, &[]);
+                    let off = slot(identity, 1.0, 1.0, 0, 0.0);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.set_bind_group(2, &gpu.env_bg, &[]);
                 }
             }
 
@@ -14735,7 +14940,7 @@ impl GpuRenderer {
             }
             if let Some(scene) = scene {
                 if scene.translucent_index_count > 0 {
-                    let off = slot(identity, 1.0, 1.0, 0);
+                    let off = slot(identity, 1.0, 1.0, 0, 0.0);
                     pass.set_bind_group(0, frame_bind_group, &[]);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
@@ -14754,7 +14959,7 @@ impl GpuRenderer {
                         continue;
                     }
                     let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                    let off = slot(identity, fade, 1.0, 0);
+                    let off = slot(identity, fade, 1.0, 0, 0.0);
                     pass.set_bind_group(0, &section.bind_group, &[]);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
@@ -14811,7 +15016,7 @@ impl GpuRenderer {
                     drew_alpha = true;
                 }
                 let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha, entry.world_light);
+                let off = slot(model, 1.0, entry.alpha, entry.world_light, 0.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
@@ -14832,7 +15037,8 @@ impl GpuRenderer {
                                 .unwrap_or(&billboards.pipeline),
                         );
                         pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                        let off = slot(identity, 1.0, 1.0, 0);
+                        pass.set_bind_group(2, particle_env_bg, &[]);
+                        let off = slot(identity, 1.0, 1.0, 0, 2.0);
                         pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                         pass.set_vertex_buffer(0, billboards.quad_vertices.slice(..));
                         pass.set_vertex_buffer(1, ring.buffer.slice(..));
@@ -14841,19 +15047,22 @@ impl GpuRenderer {
                             wgpu::IndexFormat::Uint32,
                         );
                         pass.draw_indexed(0..6, 0, 0..ring.count);
+                        pass.set_bind_group(2, &gpu.env_bg, &[]);
                     }
                 }
             }
             if let Some(mesh) = particles {
                 pass.set_pipeline(&lit_alpha_pipeline);
                 pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                pass.set_bind_group(2, particle_env_bg, &[]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 for (i, &alpha) in particle_alphas.iter().enumerate() {
-                    let off = slot(identity, 1.0, alpha, 0);
+                    let off = slot(identity, 1.0, alpha, 0, 2.0);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                     pass.draw_indexed((i as u32 * 6)..((i as u32 + 1) * 6), 0, 0..1);
                 }
+                pass.set_bind_group(2, &gpu.env_bg, &[]);
             }
 
             if let Some((buffer, count)) = debug_lines {
@@ -15015,6 +15224,7 @@ impl GpuRenderer {
                 },
             );
         }
+        self.encode_gameplay_screen_overlay(&mut encoder, &native_view, width, height);
         // UI overlay at native resolution: tessellated GPU quads when
         // `update_ui_mesh` installed a mesh, else the legacy CPU-blit.
         // The `MEGU EDITION` title branding draws in the same pass.
@@ -15112,6 +15322,64 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             min_binding_size: None,
         },
         count: None,
+    }
+}
+
+impl GameplayOverlayGpu {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gameplay-overlay-layout"),
+            entries: &[uniform_entry(0)],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gameplay-overlay-shader"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GAMEPLAY_OVERLAY_WGSL)),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("gameplay-overlay-pipeline-layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gameplay-overlay-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(ALPHA_BLEND),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gameplay-overlay-uniform"),
+            size: std::mem::size_of::<GameplayOverlayUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gameplay-overlay-bind-group"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        Self { pipeline, uniform, bind_group }
     }
 }
 
