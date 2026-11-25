@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# Contributor: nekomario28 <206304251+nekomario28@users.noreply.github.com>
+# Maintainer: nekomario28 <206304251+nekomario28@users.noreply.github.com>
+pkgname=megu
+# Upstream tags are v<ver>-alpha.<n>; apkver spells the pre-release _alpha<n>.
+_upstream_ver=0.1.0-alpha.3
+pkgver=0.1.0_alpha3
+pkgrel=0
+pkgdesc="Clean-room Minecraft-compatible server and native GPU client"
+url="https://github.com/nekomario28/megu-mc"
+# Dynamic-musl GPU client and static-musl server both build on the two
+# architectures the release matrix ships for linux-musl.
+arch="x86_64 aarch64"
+license="LGPL-3.0-or-later"
+makedepends="
+	alsa-lib-dev
+	cargo
+	libxkbcommon-dev
+	pkgconf
+	rust
+	vulkan-headers
+	vulkan-loader-dev
+	wayland-dev
+	wayland-protocols
+	"
+subpackages="$pkgname-server $pkgname-client-gpu"
+source="megu-mc-$_upstream_ver.tar.gz::https://github.com/nekomario28/megu-mc/archive/v$_upstream_ver.tar.gz"
+builddir="$srcdir/megu-mc-$_upstream_ver"
+
+# Alpine's rustc already defaults musl targets to dynamic linking; pin the
+# flag on the client build anyway so the GPU client can always dlopen
+# Vulkan/Wayland/X11 drivers even if the toolchain default ever changes.
+build() {
+	cargo build --release --locked \
+		--features mod-suite,create-offload \
+		--bin megu
+	cargo build --release --locked \
+		--manifest-path server-files/Cargo.toml \
+		--bin megu-installer
+	RUSTFLAGS="-C target-feature=-crt-static ${RUSTFLAGS:-}" \
+		cargo build --release --locked \
+		--manifest-path client-gpu/Cargo.toml \
+		--bin megu-client-gpu
+}
+
+check() {
+	./target/release/megu --help >/dev/null
+	./client-gpu/target/release/megu-client-gpu --help >/dev/null
+}
+
+package() {
+	install -Dm0755 target/release/megu "$pkgdir"/usr/bin/megu
+	install -Dm0755 server-files/target/release/megu-installer \
+		"$pkgdir"/usr/bin/megu-installer
+	install -Dm0755 client-gpu/target/release/megu-client-gpu \
+		"$pkgdir"/usr/bin/megu-client-gpu
+	install -Dm0644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+	install -Dm0644 LICENSING.md \
+		"$pkgdir"/usr/share/licenses/$pkgname/LICENSING.md
+	install -Dm0644 NOTICE "$pkgdir"/usr/share/licenses/$pkgname/NOTICE
+}
+
+server() {
+	pkgdesc="megu dedicated server"
+	amove usr/bin/megu
+	amove usr/bin/megu-installer
+}
+
+client_gpu() {
+	pkgdesc="megu native GPU game client (Vulkan / Wayland / X11)"
+	depends="vulkan-loader wayland-libs-client libxkbcommon alsa-lib"
+	amove usr/bin/megu-client-gpu
+}
+
+sha512sums="
+SKIP  megu-mc-$_upstream_ver.tar.gz
+"

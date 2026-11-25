@@ -83,21 +83,36 @@ else
     esac
 fi
 
+CLIENT_TARGET=""
+CLIENT_ARCHIVE=""
+case "$TARGET" in
+    *-musl-client)
+        die "MEGU_TARGET must be the server target (linux-*-musl), not the client-only target ($TARGET); the installer downloads both halves itself"
+        ;;
+    *-musl)
+        CLIENT_TARGET="${TARGET}-client"
+        ;;
+esac
+
 if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
     die "neither curl nor wget found; install one to download the release (e.g. apk add wget on Alpine)"
 fi
 need_cmd tar
+need_cmd awk
 need_cmd sha256sum
 need_cmd mktemp
 
 ARCHIVE="megu-${VERSION}-${TARGET}.tar.gz"
+if [ -n "$CLIENT_TARGET" ]; then
+    CLIENT_ARCHIVE="megu-${VERSION}-${CLIENT_TARGET}.tar.gz"
+fi
 JAR="megu-bootstrapper.jar"
 SUMS="SHA256SUMS-all.txt"
 BASE_URL="${MEGU_RELEASE_BASE_URL:-https://github.com/${REPO}/releases/download/${VERSION}}"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/megu-install.XXXXXXXX")"
 cleanup() {
-    rm -f "$WORK/$ARCHIVE" "$WORK/$JAR" "$WORK/$SUMS" "$WORK/check.sums" 2>/dev/null || true
+    rm -f "$WORK/$ARCHIVE" "$WORK/$CLIENT_ARCHIVE" "$WORK/$JAR" "$WORK/$SUMS" "$WORK/check.sums" 2>/dev/null || true
     rmdir "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -105,11 +120,18 @@ trap cleanup EXIT INT TERM
 say "Downloading Megu ${VERSION} (${TARGET}) from ${BASE_URL} ..."
 http_get "${BASE_URL}/${SUMS}" "${WORK}/${SUMS}" || die "download failed: ${BASE_URL}/${SUMS}"
 http_get "${BASE_URL}/${ARCHIVE}" "${WORK}/${ARCHIVE}" || die "download failed: ${BASE_URL}/${ARCHIVE}"
+if [ -n "$CLIENT_ARCHIVE" ]; then
+    http_get "${BASE_URL}/${CLIENT_ARCHIVE}" "${WORK}/${CLIENT_ARCHIVE}" || die "download failed: ${BASE_URL}/${CLIENT_ARCHIVE}"
+fi
 http_get "${BASE_URL}/${JAR}" "${WORK}/${JAR}" || die "download failed: ${BASE_URL}/${JAR}"
 
 say "Verifying SHA-256 checksums ..."
-grep -E "  (${ARCHIVE}|${JAR})\$" "${WORK}/${SUMS}" > "${WORK}/check.sums" \
-    || die "checksums for ${ARCHIVE} / ${JAR} not found in ${SUMS}"
+: > "${WORK}/check.sums"
+for file in "$ARCHIVE" ${CLIENT_ARCHIVE:+"$CLIENT_ARCHIVE"} "$JAR"; do
+    awk -v file="$file" '$2 == file { print; count++ } END { if (count != 1) exit 1 }' \
+        "${WORK}/${SUMS}" >> "${WORK}/check.sums" \
+        || die "exactly one checksum for ${file} not found in ${SUMS}"
+done
 (cd "$WORK" && sha256sum -c check.sums >/dev/null) \
     || die "SHA-256 verification failed"
 
@@ -117,9 +139,16 @@ mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 tar -xzf "${WORK}/${ARCHIVE}" -C "$INSTALL_ROOT"
 BUNDLE_DIR="${INSTALL_ROOT}/megu-${VERSION}-${TARGET}"
 [ -d "$BUNDLE_DIR" ] || die "expected extracted directory ${BUNDLE_DIR} not found"
+if [ -n "$CLIENT_ARCHIVE" ]; then
+    tar -xzf "${WORK}/${CLIENT_ARCHIVE}" -C "$INSTALL_ROOT"
+    CLIENT_BUNDLE_DIR="${INSTALL_ROOT}/megu-${VERSION}-${CLIENT_TARGET}"
+    [ -f "${CLIENT_BUNDLE_DIR}/megu-client-gpu" ] \
+        || die "expected dynamic musl client ${CLIENT_BUNDLE_DIR}/megu-client-gpu not found"
+    cp -f "${CLIENT_BUNDLE_DIR}/megu-client-gpu" "${BUNDLE_DIR}/megu-client-gpu"
+fi
 cp -f "${WORK}/${JAR}" "${BUNDLE_DIR}/${JAR}"
 
-for bin in megu megu-client megu-client-gpu megu-installer megu-mod-check megu-world-migrate megu-init megu-admin; do
+for bin in megu megu-client-gpu megu-installer; do
     if [ -f "${BUNDLE_DIR}/${bin}" ]; then
         chmod 0755 "${BUNDLE_DIR}/${bin}"
         ln -sf "${BUNDLE_DIR}/${bin}" "${BIN_DIR}/${bin}"

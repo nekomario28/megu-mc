@@ -1,0 +1,97 @@
+# syntax=docker/dockerfile:1
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# Reproducible dynamically-linked musl build of the megu GPU client.
+#
+# Rust's *-unknown-linux-musl targets default to +crt-static, which yields a
+# fully static binary — useless for a GPU client because Vulkan, Wayland and
+# X11 drivers only exist as shared objects that must be dlopen'ed from the
+# host system. This image builds megu-client-gpu inside Alpine Linux with
+# -C target-feature=-crt-static so the artifact dynamically links musl
+# (ld-musl-*.so.1) and resolves its GPU/windowing libraries on the target
+# system, exactly like the glibc client resolves libc.so.6.
+#
+# The static `megu` + `megu-installer` musl bundles (kind: musl in
+# .github/workflows/release.yml) are unaffected: they keep +crt-static for
+# `FROM scratch` containers. This image builds only the client.
+#
+# Hermetic inputs: a version-pinned Alpine base, checksum-verified
+# rustup-init, the pinned 1.98.0 toolchain (rust-toolchain.toml) and a
+# --locked Cargo build.
+
+ARG ALPINE_VERSION=3.21
+FROM alpine:${ALPINE_VERSION} AS builder
+
+ARG RUST_TARGET=x86_64-unknown-linux-musl
+ARG RUST_VERSION=1.98.0
+
+# Native-arch container: RUST_TARGET must equal the host's musl triple
+# (x86_64 on amd64 runners, aarch64 on arm64 runners). apk deps cover every
+# library winit/wgpu links at build time; Vulkan itself is dlopen'ed by ash
+# at run time, so the loader dev package documents the runtime contract.
+RUN apk add --no-cache \
+        alsa-lib-dev \
+        build-base \
+        ca-certificates \
+        curl \
+        libxkbcommon-dev \
+        pkgconf \
+        vulkan-headers \
+        vulkan-loader-dev \
+        wayland-dev \
+        wayland-protocols
+
+# Checksum-verified rustup-init -> pinned toolchain, minimal profile. The
+# published .sha256 is checked before the installer ever executes.
+RUN arch="$(uname -m)"; triple="${arch}-unknown-linux-musl"; \
+    base="https://static.rust-lang.org/rustup/dist/${triple}"; \
+    curl -fsSLo /tmp/rustup-init "${base}/rustup-init"; \
+    curl -fsSLo /tmp/rustup-init.sha256 "${base}/rustup-init.sha256"; \
+    awk '{print $1 "  /tmp/rustup-init"}' /tmp/rustup-init.sha256 \
+        | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --profile minimal \
+        --default-toolchain "${RUST_VERSION}" --target "${RUST_TARGET}"; \
+    rm -f /tmp/rustup-init /tmp/rustup-init.sha256
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Flip off the musl default so the client can dlopen the system's
+# Vulkan/Wayland/X11 drivers; the binary records NEEDED libc.musl-*.so.1.
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+WORKDIR /build
+# client-kernel/build.rs projects code out of the server crate's src/, so the
+# root src/ tree is part of the client build context even though `megu`
+# itself is not a dependency.
+COPY src ./src
+COPY core/Cargo.toml core/Cargo.lock core/
+COPY core/src core/src
+COPY proto/Cargo.toml proto/Cargo.lock proto/
+COPY proto/src proto/src
+COPY client-kernel/Cargo.toml client-kernel/Cargo.lock client-kernel/
+COPY client-kernel/build.rs client-kernel/build.rs
+COPY client-kernel/include client-kernel/include
+COPY client-kernel/src client-kernel/src
+COPY client-port/Cargo.toml client-port/Cargo.lock client-port/
+COPY client-port/include client-port/include
+COPY client-port/src client-port/src
+COPY client-app/Cargo.toml client-app/Cargo.lock client-app/
+COPY client-app/src client-app/src
+COPY client-ui/Cargo.toml client-ui/Cargo.lock client-ui/
+COPY client-ui/src client-ui/src
+COPY client-gpu/Cargo.toml client-gpu/Cargo.lock client-gpu/
+COPY client-gpu/src client-gpu/src
+
+RUN mkdir -p /out \
+    && cargo build --release --locked \
+        --manifest-path client-gpu/Cargo.toml \
+        --bin megu-client-gpu --target "${RUST_TARGET}" \
+    && cp "client-gpu/target/${RUST_TARGET}/release/megu-client-gpu" \
+        /out/megu-client-gpu \
+    # Fail closed: a +crt-static artifact cannot load GPU/windowing drivers
+    # on the target system, so refuse it here rather than in the release job.
+    && readelf -l /out/megu-client-gpu | grep -q 'ld-musl' \
+    && readelf -d /out/megu-client-gpu | grep -q 'NEEDED.*libc\.musl'
+
+FROM scratch AS export
+COPY --from=builder /out/megu-client-gpu /megu-client-gpu

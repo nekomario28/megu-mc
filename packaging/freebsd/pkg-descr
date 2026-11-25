@@ -1,0 +1,6 @@
+megu is a clean-room, Minecraft-compatible dedicated server written in Rust
+with an optional native GPU game client (wgpu/winit; Vulkan on FreeBSD).
+
+The server handles the vanilla 1.21.1 protocol surface plus datapacks, mod
+offload and world tooling; the client renders the game without any Mojang
+code. All components ship under LGPL-3.0-or-later.

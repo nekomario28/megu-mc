@@ -77,6 +77,9 @@
 //!   `flush_all` for `/save-all` and shutdown, plus the
 //!   [`incremental_save::PersistedFingerprints`] content-hash cache that lets
 //!   an unchanged payload skip its disk write entirely.
+//! * [`lz4_region`] — the compact `MLZ4` chunk-region container backed by
+//!   canonical `megu_core` LZ4/CRC32 primitives, with per-chunk and aggregate
+//!   128 MiB decompression budgets plus atomic saves.
 //! * [`namespace_guard`] — the unknown-namespace preservation router
 //!   ([`namespace_guard::NamespaceTombstoneSidecar`]): when a mod is removed
 //!   or disabled, its `modid:block`/`modid:item`/`modid:entity` payloads are
@@ -92,6 +95,7 @@ pub mod audit_log;
 pub mod chunk_packet_cache;
 pub mod datafix;
 pub mod incremental_save;
+pub mod lz4_region;
 pub mod migrate;
 pub mod namespace_guard;
 pub mod pregen;

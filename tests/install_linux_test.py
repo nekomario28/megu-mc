@@ -20,7 +20,7 @@ VERSION = "v0.1.0-alpha.3"
 # Real tools the script may invoke before it dies on the (failing) fake
 # download; resolved from the usual binary directories at probe time.
 REAL_TOOLS = (
-    "sh", "env", "grep", "mktemp", "tar", "sha256sum", "mkdir", "cp", "ln",
+    "sh", "env", "grep", "mktemp", "tar", "awk", "sha256sum", "mkdir", "cp", "ln",
     "chmod", "rm", "rmdir", "cat", "tr", "sed", "dirname", "sleep", "test",
     "date",
 )
@@ -180,6 +180,18 @@ class InstallLinuxArchitectureTest(unittest.TestCase):
                 else []
             )
             return result, curl_requests, wget_requests
+
+    def test_installer_links_only_the_three_slim_release_binaries(self):
+        text = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("for bin in megu megu-client-gpu megu-installer; do", text)
+        for dropped in (
+            "megu-client ",
+            "megu-mod-check",
+            "megu-world-migrate",
+            "megu-init",
+            "megu-admin",
+        ):
+            self.assertNotIn(dropped, text)
 
     def test_supported_linux_architectures_select_release_assets(self):
         for uname_m, libc, target in (
