@@ -338,11 +338,149 @@ impl SubWorldTransform {
         }
     }
 
+    /// Finite, positive-scale, normalized view of this transform used by
+    /// interpolation and point transforms. Invalid fields fail closed to
+    /// origin/identity/unit scale rather than propagating NaN.
+    fn sanitized(self) -> Self {
+        let position = if self.position.iter().all(|v| v.is_finite()) {
+            self.position
+        } else {
+            [0.0; 3]
+        };
+        let scale = if self.scale.is_finite() && self.scale > 1.0e-6 {
+            self.scale
+        } else {
+            1.0
+        };
+        Self {
+            position,
+            quaternion: self.normalized_quaternion(),
+            scale,
+        }
+    }
+
+    /// Render-rate interpolation between two rigid-body poses. Rotation uses
+    /// shortest-arc quaternion SLERP (hemisphere flip on negative dot, linear
+    /// normalized fallback above 0.9995); position and uniform scale lerp.
+    /// Non-finite `alpha` fails closed to the previous pose and invalid input
+    /// fields sanitize exactly like [`SubWorldTransform::model_matrix`].
+    pub fn lerp_slerp(prev: &Self, curr: &Self, alpha: f32) -> Self {
+        let t = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let a = (*prev).sanitized();
+        let b = (*curr).sanitized();
+        let mut position = [0.0; 3];
+        for i in 0..3 {
+            position[i] = a.position[i] + (b.position[i] - a.position[i]) * t;
+        }
+        let scale = a.scale + (b.scale - a.scale) * t;
+        let qa = a.quaternion;
+        let mut qb = b.quaternion;
+        let mut dot: f32 = qa.iter().zip(qb.iter()).map(|(x, y)| x * y).sum();
+        if dot < 0.0 {
+            dot = -dot;
+            for value in &mut qb {
+                *value = -*value;
+            }
+        }
+        let quaternion = if dot > 0.9995 {
+            let mut q = [0.0; 4];
+            for i in 0..4 {
+                q[i] = qa[i] + (qb[i] - qa[i]) * t;
+            }
+            normalize_quat_or_identity(q)
+        } else {
+            let theta = dot.clamp(-1.0, 1.0).acos();
+            let sin_theta = theta.sin();
+            if sin_theta <= 1.0e-7 || !sin_theta.is_finite() {
+                qa
+            } else {
+                let wa = ((1.0 - t) * theta).sin() / sin_theta;
+                let wb = (t * theta).sin() / sin_theta;
+                let mut q = [0.0; 4];
+                for i in 0..4 {
+                    q[i] = qa[i] * wa + qb[i] * wb;
+                }
+                normalize_quat_or_identity(q)
+            }
+        };
+        Self {
+            position,
+            quaternion,
+            scale: if scale.is_finite() && scale > 1.0e-6 {
+                scale
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// Transform a model-space point into world space:
+    /// `position + rotate(quaternion, local * scale)`. Invalid input fails
+    /// closed to the transform origin.
+    pub fn transform_point(&self, local: [f32; 3]) -> [f32; 3] {
+        let transform = (*self).sanitized();
+        if !local.iter().all(|v| v.is_finite()) {
+            return transform.position;
+        }
+        let scaled = [
+            local[0] * transform.scale,
+            local[1] * transform.scale,
+            local[2] * transform.scale,
+        ];
+        let rotated = rotate_unit_quaternion(transform.quaternion, scaled);
+        let world = [
+            transform.position[0] + rotated[0],
+            transform.position[1] + rotated[1],
+            transform.position[2] + rotated[2],
+        ];
+        if world.iter().all(|v| v.is_finite()) {
+            world
+        } else {
+            transform.position
+        }
+    }
+
+    /// Inverse of [`SubWorldTransform::transform_point`] for rider-camera
+    /// local locking. Invalid input or a degenerate scale fails closed to
+    /// the model origin.
+    pub fn inverse_transform_point(&self, world: [f32; 3]) -> [f32; 3] {
+        let transform = (*self).sanitized();
+        if !world.iter().all(|v| v.is_finite()) {
+            return [0.0; 3];
+        }
+        let delta = [
+            world[0] - transform.position[0],
+            world[1] - transform.position[1],
+            world[2] - transform.position[2],
+        ];
+        let inverse = [
+            -transform.quaternion[0],
+            -transform.quaternion[1],
+            -transform.quaternion[2],
+            transform.quaternion[3],
+        ];
+        let unrotated = rotate_unit_quaternion(inverse, delta);
+        let local = [
+            unrotated[0] / transform.scale,
+            unrotated[1] / transform.scale,
+            unrotated[2] / transform.scale,
+        ];
+        if local.iter().all(|v| v.is_finite()) {
+            local
+        } else {
+            [0.0; 3]
+        }
+    }
+
     /// Column-major `mat4x4<f32>` model matrix:
     /// `translate(position) * rotate(quaternion) * scale(scale)`.
     pub fn model_matrix(&self) -> Mat4 {
         let [x, y, z, w] = self.normalized_quaternion();
-        let s = if self.scale.is_finite() && self.scale != 0.0 {
+        let s = if self.scale.is_finite() && self.scale > 0.0 {
             self.scale
         } else {
             1.0
@@ -376,6 +514,34 @@ impl Default for SubWorldTransform {
     }
 }
 
+fn normalize_quat_or_identity(q: [f32; 4]) -> [f32; 4] {
+    let len2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if len2.is_finite() && len2 > 1.0e-12 {
+        let inv = len2.sqrt().recip();
+        [q[0] * inv, q[1] * inv, q[2] * inv, q[3] * inv]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+fn rotate_unit_quaternion(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let qv = [q[0], q[1], q[2]];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    let uv = cross(qv, v);
+    let uuv = cross(qv, uv);
+    [
+        v[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        v[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        v[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
 /// Axis-angle constructor (radians) for ergonomic test/demo authoring.
 /// `axis` need not be normalized; zero/NaN yields identity rotation.
 pub fn quat_from_axis_angle(axis: [f32; 3], radians: f32) -> [f32; 4] {
@@ -406,6 +572,14 @@ pub struct SubWorldRenderEntry {
     pub id: u64,
     /// 6-DOF placement for the next frame.
     pub transform: SubWorldTransform,
+    /// Placement before the latest tick update. Render-rate consumers use
+    /// [`SubWorldRenderEntry::interpolated_transform`] instead of stepping
+    /// directly from this pose to `transform`.
+    pub prev_transform: SubWorldTransform,
+    /// Conservative non-negative model-space expansion applied by culling
+    /// for geometry protruding outside its nominal bounds (oversized Create
+    /// wheels, modded blocks). Negative or non-finite values read as zero.
+    pub protrusion_margin: f32,
     /// Model-space lit vertices.
     pub vertices: Vec<TerrainVertex>,
     /// `u32` index buffer into `vertices`.
@@ -454,11 +628,29 @@ impl SubWorldRenderEntry {
         Self {
             id,
             transform,
+            prev_transform: transform,
+            protrusion_margin: 0.0,
             vertices,
             indices,
             alpha: 1.0,
             world_light: 0,
             dirty: true,
+        }
+    }
+
+    /// Interpolated pose for the current render frame. The bank keeps tick
+    /// endpoints in `prev_transform`/`transform`; callers vary `alpha` at
+    /// display rate so 20 TPS contraptions remain smooth at high Hz.
+    pub fn interpolated_transform(&self, alpha: f32) -> SubWorldTransform {
+        SubWorldTransform::lerp_slerp(&self.prev_transform, &self.transform, alpha)
+    }
+
+    /// Fail-closed culling expansion: only finite, non-negative margins count.
+    pub fn effective_protrusion_margin(&self) -> f32 {
+        if self.protrusion_margin.is_finite() && self.protrusion_margin >= 0.0 {
+            self.protrusion_margin
+        } else {
+            0.0
         }
     }
 }
@@ -799,7 +991,23 @@ impl SubWorldRenderBank {
                 SubWorldRenderEntry::new(pose.subworld_id, transform, Vec::new(), Vec::new())
             });
             if let Some(entry) = self.entries.get_mut(&pose.subworld_id) {
+                let jump = entry
+                    .transform
+                    .position
+                    .iter()
+                    .zip(transform.position.iter())
+                    .map(|(a, b)| f64::from(b - a))
+                    .map(|d| d * d)
+                    .sum::<f64>()
+                    .sqrt()
+                    > 32.0;
+                if jump {
+                    entry.prev_transform = transform;
                 entry.transform = transform;
+                } else {
+                    entry.prev_transform = entry.transform;
+                    entry.transform = transform;
+                }
             }
         }
     }
@@ -850,6 +1058,7 @@ impl SubWorldRenderBank {
         };
         match self.entries.get_mut(&id) {
             Some(entry) => {
+                entry.prev_transform = entry.transform;
                 entry.transform = transform;
                 if entry.vertices != blocks_mesh.0 || entry.indices != blocks_mesh.1 {
                     entry.vertices = blocks_mesh.0.clone();
@@ -876,7 +1085,41 @@ impl SubWorldRenderBank {
     pub fn set_transform(&mut self, id: u64, transform: SubWorldTransform) -> bool {
         match self.entries.get_mut(&id) {
             Some(entry) => {
+                entry.prev_transform = entry.transform;
                 entry.transform = transform;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Snap directly to `transform` with no interpolation smear. Teleports
+    /// and large server corrections use this instead of [`Self::set_transform`].
+    pub fn snap_transform(&mut self, id: u64, transform: SubWorldTransform) -> bool {
+        match self.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.prev_transform = transform;
+                entry.transform = transform;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Render-rate interpolated transform for `id`, if present.
+    pub fn interpolated_transform(&self, id: u64, alpha: f32) -> Option<SubWorldTransform> {
+        self.entries
+            .get(&id)
+            .map(|entry| entry.interpolated_transform(alpha))
+    }
+
+    /// Set the conservative culling protrusion margin for modded oversized
+    /// geometry. Values are stored verbatim but non-finite/negative values
+    /// fail closed to zero when read. Returns `false` for an unknown id.
+    pub fn set_protrusion_margin(&mut self, id: u64, margin: f32) -> bool {
+        match self.entries.get_mut(&id) {
+            Some(entry) => {
+                entry.protrusion_margin = margin;
                 true
             }
             None => false,
@@ -1050,15 +1293,102 @@ mod subworld_sync_tests {
         assert!(entry.dirty);
         // A pitch-black cave sample stays enabled — `0` is not a disable.
         assert!(bank.set_subworld_light(7, 0, 0));
-        assert_eq!(unpack_subworld_light(bank.get(7).unwrap().world_light), Some((0, 0)));
+        assert_eq!(
+            unpack_subworld_light(bank.get(7).unwrap().world_light),
+            Some((0, 0))
+        );
         assert!(bank.clear_subworld_light(7));
-        assert_eq!(unpack_subworld_light(bank.get(7).unwrap().world_light), None);
+        assert_eq!(
+            unpack_subworld_light(bank.get(7).unwrap().world_light),
+            None
+        );
         assert!(!bank.clear_subworld_light(99));
         // Entries minted through the sync path default to env-only shading.
         bank.apply_sync_frame(&SubWorldSyncFrame {
             poses: vec![pose(11, 0.0, [0.0, 0.0, 0.0, 1.0])],
         });
-        assert_eq!(unpack_subworld_light(bank.get(11).unwrap().world_light), None);
+        assert_eq!(
+            unpack_subworld_light(bank.get(11).unwrap().world_light),
+            None
+        );
+    }
+
+    #[test]
+    fn transform_lerp_slerp_uses_shortest_arc_and_is_nan_safe() {
+        let prev = SubWorldTransform::IDENTITY;
+        let mut curr = SubWorldTransform::IDENTITY;
+        curr.quaternion = quat_from_axis_angle([0.0, 1.0, 0.0], 350.0f32.to_radians());
+        curr.position = [10.0, 2.0, -4.0];
+        curr.scale = 2.0;
+        let mid = SubWorldTransform::lerp_slerp(&prev, &curr, 0.5);
+        assert_eq!(mid.position, [5.0, 1.0, -2.0]);
+        assert!((mid.scale - 1.5).abs() < 1e-6);
+        assert!(
+            mid.quaternion[1] < 0.0,
+            "350 degrees must interpolate as -10 degrees, not the long way: {:?}",
+            mid.quaternion
+        );
+        assert!((mid.quaternion.iter().map(|v| v * v).sum::<f32>() - 1.0).abs() < 1e-5);
+
+        let at_prev = SubWorldTransform::lerp_slerp(&prev, &curr, f32::NAN);
+        assert_eq!(at_prev.position, prev.position);
+        let mut bad = curr;
+        bad.position[0] = f32::NAN;
+        bad.quaternion = [f32::NAN; 4];
+        bad.scale = -1.0;
+        let sanitized = SubWorldTransform::lerp_slerp(&prev, &bad, 0.5);
+        assert!(sanitized.position.iter().all(|v| v.is_finite()));
+        assert!(sanitized.quaternion.iter().all(|v| v.is_finite()));
+        assert!(sanitized.scale.is_finite() && sanitized.scale > 0.0);
+    }
+
+    #[test]
+    fn rider_local_lock_point_round_trip() {
+        let transform = SubWorldTransform {
+            position: [12.5, 70.0, -8.25],
+            quaternion: quat_from_axis_angle([0.3, 1.0, -0.2], 67.0f32.to_radians()),
+            scale: 1.75,
+        };
+        let local = [1.25, -0.5, 3.0];
+        let world = transform.transform_point(local);
+        let round_trip = transform.inverse_transform_point(world);
+        for index in 0..3 {
+            assert!(
+                (round_trip[index] - local[index]).abs() < 2.0e-5,
+                "axis {index}: {round_trip:?} != {local:?}"
+            );
+        }
+        assert_eq!(transform.transform_point([f32::NAN; 3]), transform.position);
+        assert_eq!(transform.inverse_transform_point([f32::NAN; 3]), [0.0; 3]);
+    }
+
+    #[test]
+    fn bank_preserves_tick_endpoints_interpolates_and_snaps_teleports() {
+        let mut bank = SubWorldRenderBank::new();
+        let mesh = box_mesh([0.0; 3], [1.0; 3], [1.0; 3]);
+        bank.upsert_contraption_subworld(9, [0.0; 3], [0.0, 1.0, 0.0], 0.0, &mesh);
+        let mut target = SubWorldTransform::IDENTITY;
+        target.position = [10.0, 0.0, 0.0];
+        assert!(bank.set_transform(9, target));
+        let mid = bank.interpolated_transform(9, 0.5).unwrap();
+        assert_eq!(mid.position, [5.0, 0.0, 0.0]);
+        assert_eq!(bank.get(9).unwrap().prev_transform.position, [0.0; 3]);
+
+        let teleport = SubWorldTransform {
+            position: [80.0, 0.0, 0.0],
+            ..SubWorldTransform::IDENTITY
+        };
+        assert!(bank.snap_transform(9, teleport));
+        let entry = bank.get(9).unwrap();
+        assert_eq!(entry.prev_transform.position, [80.0, 0.0, 0.0]);
+        assert_eq!(entry.interpolated_transform(0.0).position, [80.0, 0.0, 0.0]);
+
+        assert!(bank.set_protrusion_margin(9, 2.5));
+        assert_eq!(bank.get(9).unwrap().effective_protrusion_margin(), 2.5);
+        assert!(bank.set_protrusion_margin(9, f32::NAN));
+        assert_eq!(bank.get(9).unwrap().effective_protrusion_margin(), 0.0);
+        assert!(bank.set_protrusion_margin(9, -1.0));
+        assert_eq!(bank.get(9).unwrap().effective_protrusion_margin(), 0.0);
     }
 }
 
@@ -1077,6 +1407,8 @@ pub struct GpuSubWorldEntry {
     pub alpha: f32,
     /// Packed world-light word mirrored from the bank (`0` = disabled).
     pub world_light: u32,
+    /// Conservative culling expansion mirrored from the bank.
+    pub protrusion_margin: f32,
     /// Index count in `indices`.
     pub index_count: u32,
     vertices: wgpu::Buffer,
@@ -1317,6 +1649,7 @@ impl SubWorldGpuCache {
                         transform: entry.transform,
                         alpha: entry.alpha,
                         world_light: entry.world_light,
+                        protrusion_margin: entry.effective_protrusion_margin(),
                         index_count: entry.indices.len() as u32,
                         vertices,
                         indices,
@@ -1329,6 +1662,7 @@ impl SubWorldGpuCache {
             gpu.transform = entry.transform;
             gpu.alpha = entry.alpha;
             gpu.world_light = entry.world_light;
+            gpu.protrusion_margin = entry.effective_protrusion_margin();
             gpu.index_count = entry.indices.len() as u32;
             entry.dirty = false;
             self.entries.insert(entry.id, gpu);

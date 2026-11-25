@@ -134,6 +134,50 @@ const OFFTHREAD_SUBMIT_MAX: usize = 8;
 const PREFETCH_VIEW_DISTANCE: u32 = 8;
 const PREFETCH_MAX_CHUNKS: usize = 16;
 
+/// Horizontal displacement in one movement update that is treated as a
+/// teleport/jump rather than a velocity sample for the forward cone.
+const PREFETCH_TELEPORT_JUMP_BLOCKS: f64 = 32.0;
+const PREFETCH_MIN_VIEW_DISTANCE: u32 = 2;
+const PREFETCH_MIN_CHUNKS: usize = 4;
+
+/// Smoothly scale the speculative cone with horizontal speed while never
+/// exceeding the memory/DMA caps baked into `PREFETCH_VIEW_DISTANCE` and
+/// `PREFETCH_MAX_CHUNKS`. `last_motion_delta` is blocks per client update;
+/// at 60 Hz roughly 0.07 is walking, 0.1 sprinting, 0.5+ ice-boat/elytra,
+/// and 1.0 is treated as full lookahead.
+fn velocity_scaled_prefetch_budget(vel_xz: [f64; 2]) -> (u32, usize) {
+    let speed = vel_xz[0].hypot(vel_xz[1]);
+    if !speed.is_finite() || speed <= 0.0 {
+        return (PREFETCH_MIN_VIEW_DISTANCE, PREFETCH_MIN_CHUNKS);
+    }
+    let scale = (speed / 1.0).clamp(0.0, 1.0).sqrt();
+    let view_span = PREFETCH_VIEW_DISTANCE - PREFETCH_MIN_VIEW_DISTANCE;
+    let chunk_span = PREFETCH_MAX_CHUNKS - PREFETCH_MIN_CHUNKS;
+    let view_distance = PREFETCH_MIN_VIEW_DISTANCE + (view_span as f64 * scale).round() as u32;
+    let max_chunks = PREFETCH_MIN_CHUNKS + (chunk_span as f64 * scale).round() as usize;
+    (
+        view_distance.min(PREFETCH_VIEW_DISTANCE),
+        max_chunks.min(PREFETCH_MAX_CHUNKS),
+    )
+}
+
+fn horizontal_teleport_jump(delta: [f64; 2]) -> bool {
+    delta[0].is_finite()
+        && delta[1].is_finite()
+        && delta[0].hypot(delta[1]) > PREFETCH_TELEPORT_JUMP_BLOCKS
+}
+
+fn transform_position_jump(prev: SubWorldTransform, curr: SubWorldTransform) -> bool {
+    prev.position
+        .iter()
+        .zip(curr.position.iter())
+        .map(|(a, b)| f64::from(b - a))
+        .map(|d| d * d)
+        .sum::<f64>()
+        .sqrt()
+        > PREFETCH_TELEPORT_JUMP_BLOCKS
+}
+
 /// Camera-distance subtraction (in blocks) applied per prefetcher
 /// priority rank when the off-thread dirty-section drain orders
 /// candidates: the best forward-cone bet (rank 0) reads `4 * 16 = 64`
@@ -2249,6 +2293,12 @@ pub struct LiveSession {
     /// the next `step_tactile_frame` camera-dip step.
     tactile_landing_impulse: f32,
     last_motion_delta: [f64; 2],
+    /// One-refresh 360-degree prefetch boost ring emitted at a teleport
+    /// arrival anchor before velocity-cone lookahead resumes.
+    prefetch_arrival_ring: BTreeMap<(i32, i32), f32>,
+    /// Jump delta already consumed as a teleport, so repeated refreshes of
+    /// the same movement sample do not keep resetting the forward cone.
+    prefetch_last_jump_delta: Option<[f64; 2]>,
     last_vfx_tick: Instant,
     last_animation_tick: Instant,
     /// Client-side wall-clock seconds driving `.mcmeta` sprite animation.
@@ -2751,6 +2801,8 @@ impl LiveSession {
             tactile_last_pose: None,
             tactile_landing_impulse: 0.0,
             last_motion_delta: [0.0; 2],
+            prefetch_arrival_ring: BTreeMap::new(),
+            prefetch_last_jump_delta: None,
             last_vfx_tick: Instant::now(),
             last_animation_tick: Instant::now(),
             atlas_anim_clock: 0.0,
@@ -5130,14 +5182,50 @@ impl LiveSession {
             .view_center_chunk
             .map(|(cx, cz)| (f64::from(cx) * 16.0 + 8.0, f64::from(cz) * 16.0 + 8.0))
             .unwrap_or((pose.feet[0], pose.feet[2]));
+        self.prefetch_arrival_ring.clear();
+        let delta = self.last_motion_delta;
+        let jump = horizontal_teleport_jump(delta);
+        let fresh_jump = jump && self.prefetch_last_jump_delta != Some(delta);
+        if fresh_jump {
+            // A teleport invalidates every forward-cone bet in one step. Emit
+            // a full 360-degree arrival ring for this refresh only; subsequent
+            // refreshes resume the speed-scaled directional lookahead below.
+            self.prefetcher = SpeculativeChunkPrefetcher::new();
+            self.prefetch_last_jump_delta = Some(delta);
+            let base_cx = (anchor_x / 16.0)
+                .floor()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            let base_cz = (anchor_z / 16.0)
+                .floor()
+                .clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            let boost = PREFETCH_MAX_CHUNKS as f32 * PREFETCH_BOOST_BLOCKS_PER_RANK;
+            let columns = &self.world.columns;
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    if dx == 0 && dz == 0 {
+                        continue;
+                    }
+                    let cx = base_cx.saturating_add(dx);
+                    let cz = base_cz.saturating_add(dz);
+                    if !columns.contains_key(&(cx, cz)) {
+                        self.prefetch_arrival_ring.insert((cx, cz), boost);
+                    }
+                }
+            }
+            return;
+        }
+        if !jump {
+            self.prefetch_last_jump_delta = None;
+        }
+        let (view_distance, max_chunks) = velocity_scaled_prefetch_budget(delta);
         let columns = &self.world.columns;
         self.prefetcher.update(
             anchor_x,
             anchor_z,
-            self.last_motion_delta[0],
-            self.last_motion_delta[1],
-            PREFETCH_VIEW_DISTANCE,
-            PREFETCH_MAX_CHUNKS,
+            delta[0],
+            delta[1],
+            view_distance,
+            max_chunks,
             |cx, cz| columns.contains_key(&(cx, cz)),
         );
     }
@@ -5185,6 +5273,12 @@ impl LiveSession {
             let boost = (PREFETCH_MAX_CHUNKS - rank) as f32 * PREFETCH_BOOST_BLOCKS_PER_RANK;
             boosts
                 .entry((entry.cx, entry.cz))
+                .and_modify(|b| *b = b.max(boost))
+                .or_insert(boost);
+        }
+        for (&coord, &boost) in &self.prefetch_arrival_ring {
+            boosts
+                .entry(coord)
                 .and_modify(|b| *b = b.max(boost))
                 .or_insert(boost);
         }
@@ -5878,12 +5972,12 @@ impl LiveSession {
     ) {
         match self.subworlds.get(contraption_id) {
             Some(existing) if existing.vertices == vertices && existing.indices == indices => {
-                self.subworlds.set_transform(contraption_id, transform);
+                self.set_live_contraption_transform(contraption_id, transform);
             }
             Some(_) => {
                 self.subworlds
                     .set_geometry(contraption_id, vertices, indices);
-                self.subworlds.set_transform(contraption_id, transform);
+                self.set_live_contraption_transform(contraption_id, transform);
             }
             None => self.subworlds.upsert(SubWorldRenderEntry::new(
                 contraption_id,
@@ -5891,6 +5985,27 @@ impl LiveSession {
                 vertices,
                 indices,
             )),
+        }
+    }
+
+    /// Pose-only contraption update with tick-endpoint tracking. Ordinary
+    /// motion preserves `prev_transform` for high-Hz interpolation; jumps
+    /// over 32 blocks snap both endpoints so teleports never smear across
+    /// the world. `false` for an unknown `contraption_id`.
+    pub fn set_live_contraption_transform(
+        &mut self,
+        contraption_id: u64,
+        transform: SubWorldTransform,
+    ) -> bool {
+        let teleport = self
+            .subworlds
+            .get(contraption_id)
+            .map(|entry| transform_position_jump(entry.transform, transform))
+            .unwrap_or(false);
+        if teleport {
+            self.subworlds.snap_transform(contraption_id, transform)
+        } else {
+            self.subworlds.set_transform(contraption_id, transform)
         }
     }
 
@@ -5902,7 +6017,17 @@ impl LiveSession {
         contraption_id: u64,
         transform: SubWorldTransform,
     ) -> bool {
-        self.subworlds.set_transform(contraption_id, transform)
+        self.set_live_contraption_transform(contraption_id, transform)
+    }
+
+    /// High-display-rate transform for a live contraption, interpolated
+    /// between the tick endpoints retained by `set_live_contraption_transform`.
+    pub fn live_contraption_interpolated_transform(
+        &self,
+        contraption_id: u64,
+        alpha: f32,
+    ) -> Option<SubWorldTransform> {
+        self.subworlds.interpolated_transform(contraption_id, alpha)
     }
 
     /// Per-poll dirty-mesh rebuild budget: the base slice scaled by the
@@ -6399,11 +6524,19 @@ impl LiveSession {
             }
             PlayEvent::Respawn { .. } => self.reset_dimension(),
             PlayEvent::Teleport(teleport) => {
+                let previous = self.pose;
                 let pose = PlayerPose::from_teleport(&teleport, self.pose);
+                if let Some(previous) = previous {
+                    self.last_motion_delta = [
+                        pose.feet[0] - previous.feet[0],
+                        pose.feet[2] - previous.feet[2],
+                    ];
+                }
                 self.pose = Some(pose);
                 self.camera_sync = Some(pose);
                 self.physics_state.pos = pose.feet;
                 self.update_audio_listener();
+                self.refresh_prefetcher();
             }
             PlayEvent::ChunkData(chunk) => {
                 let (cx, cz) = (chunk.cx, chunk.cz);
@@ -7455,6 +7588,8 @@ impl LiveSession {
         self.placed_light_scan.get_mut().valid = false;
         self.pose = None;
         self.last_motion_delta = [0.0; 2];
+        self.prefetch_arrival_ring.clear();
+        self.prefetch_last_jump_delta = None;
         self.chunk_fades = ChunkFadeTracker::new();
         self.prefetcher = SpeculativeChunkPrefetcher::new();
         // Interaction bookkeeping is dimension-scoped: acks for the old
@@ -11264,6 +11399,98 @@ mod tests {
         assert!(
             boosted.keys().all(|&(cx, _)| cx < 0),
             "after reversal every boost must point -X: {boosted:?}"
+        );
+    }
+
+    #[test]
+    fn teleport_flushes_stale_prefetch_and_boosts_arrival_ring_once() {
+        let (mut live, _tx) = session();
+        live.pose = Some(PlayerPose {
+            feet: [0.0, 70.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.last_motion_delta = [4.0, 0.0];
+        live.refresh_prefetcher();
+        assert!(live.prefetcher.pending_count() > 0);
+
+        live.pose = Some(PlayerPose {
+            feet: [100.0, 70.0, 0.0],
+            yaw: 0.0,
+            pitch: 0.0,
+        });
+        live.last_motion_delta = [40.0, 0.0];
+        live.refresh_prefetcher();
+        assert_eq!(
+            live.prefetcher.pending_count(),
+            0,
+            "teleport must flush every stale directional bet immediately"
+        );
+        let ring = live.prefetch_boost_map();
+        assert_eq!(ring.len(), 8);
+        let base = ((100.0f64 / 16.0).floor() as i32, 0);
+        assert!(ring
+            .keys()
+            .all(|&(cx, cz)| { (cx - base.0).abs().max((cz - base.1).abs()) == 1 }));
+        assert!(ring.keys().any(|&(cx, _)| cx < base.0));
+        assert!(ring.keys().any(|&(cx, _)| cx > base.0));
+        assert!(ring.keys().any(|&(_, cz)| cz < base.1));
+        assert!(ring.keys().any(|&(_, cz)| cz > base.1));
+
+        // Refreshing the same sample again does not retrigger the teleport:
+        // the ring is consumed and velocity-scaled +X lookahead resumes.
+        live.refresh_prefetcher();
+        let resumed = live.prefetch_boost_map();
+        assert!(!resumed.is_empty());
+        assert!(
+            resumed.keys().all(|&(cx, _)| cx > base.0),
+            "lookahead resumes in the movement direction: {resumed:?}"
+        );
+    }
+
+    #[test]
+    fn velocity_scaled_prefetch_budget_is_smooth_and_capped() {
+        let walking = velocity_scaled_prefetch_budget([0.07, 0.0]);
+        let sprinting = velocity_scaled_prefetch_budget([0.10, 0.0]);
+        let ice_boat = velocity_scaled_prefetch_budget([0.67, 0.0]);
+        let elytra = velocity_scaled_prefetch_budget([1.0, 0.0]);
+        assert!(walking.0 >= PREFETCH_MIN_VIEW_DISTANCE);
+        assert!(sprinting.1 >= walking.1);
+        assert!(ice_boat.0 > sprinting.0 || ice_boat.1 > sprinting.1);
+        assert_eq!(elytra, (PREFETCH_VIEW_DISTANCE, PREFETCH_MAX_CHUNKS));
+        assert!(elytra.0 <= PREFETCH_VIEW_DISTANCE && elytra.1 <= PREFETCH_MAX_CHUNKS);
+        assert_eq!(
+            velocity_scaled_prefetch_budget([f64::NAN, 0.0]),
+            (PREFETCH_MIN_VIEW_DISTANCE, PREFETCH_MIN_CHUNKS)
+        );
+    }
+
+    #[test]
+    fn live_contraption_transform_interpolates_and_teleport_snaps() {
+        let (mut live, _tx) = session();
+        live.upsert_live_contraption_subworld(
+            42,
+            SubWorldTransform::IDENTITY,
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut target = SubWorldTransform::IDENTITY;
+        target.position = [2.0, 0.0, 0.0];
+        assert!(live.set_live_contraption_transform(42, target));
+        let mid = live
+            .live_contraption_interpolated_transform(42, 0.5)
+            .unwrap();
+        assert_eq!(mid.position, [1.0, 0.0, 0.0]);
+
+        target.position = [40.0, 0.0, 0.0];
+        assert!(live.set_live_contraption_transform(42, target));
+        let snapped = live
+            .live_contraption_interpolated_transform(42, 0.0)
+            .unwrap();
+        assert_eq!(
+            snapped.position,
+            [40.0, 0.0, 0.0],
+            "large corrections snap both endpoints instead of smearing"
         );
     }
 

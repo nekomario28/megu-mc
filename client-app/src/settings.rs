@@ -724,6 +724,7 @@ impl ClientSettings {
             fine_lod_radius: (full + coarse) / 2,
             coarse_lod_radius: coarse,
             max_memory_bytes: LOD_MEMORY_BUDGET_BYTES,
+            ..LodConfig::default()
         })
     }
 
