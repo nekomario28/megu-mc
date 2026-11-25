@@ -32,7 +32,7 @@ use megu_kernel::debug_chords::DebugLine;
 
 use crate::audio_qol::ZoomState;
 use crate::lod::LodConfig;
-use crate::protocol::zlib_compress_stored;
+use crate::protocol::{zlib_compress_stored, DecodedParticleOptions, VisualLevelEvent};
 use crate::render_graph::{
     plan_frame, plan_frame_with_shaderpack, plan_frame_with_vfx_tier,
     vfx_tier_for_pipeline, FramePlanInput, GpuPipelineKind, RenderGraphPlan,
@@ -41,7 +41,9 @@ use crate::settings::{ClientSettings, CloudMode, ParticleLevel};
 use crate::shaderpack_runtime::{
     activate_shaderpack, ActiveShaderSession, ShaderActivationOutcome, ShaderActivationRequest,
 };
-use crate::world::WorldState;
+use crate::world::{
+    BlockEntityVisualState, EntityVisualState, LevelParticleSpawn, TrackedBossBar, WorldState,
+};
 
 const NEAR_Z: f64 = 0.08;
 const FAR_Z: f64 = 1024.0;
@@ -166,6 +168,90 @@ impl Default for RenderConfig {
             shader_pack: None,
             shader_profile: None,
         }
+    }
+}
+
+/// Read-only entity data consumed by a visual render pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderEntitySnapshot {
+    pub eid: i32,
+    pub entity_type: i32,
+    pub position: [f64; 3],
+    pub visual: EntityVisualState,
+}
+
+/// Particle request and its decoded particle-specific options.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderParticleSnapshot {
+    pub spawn: LevelParticleSpawn,
+    pub options: Option<DecodedParticleOptions>,
+}
+
+/// Read-only projection of live world visual state for a frontend render frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderWorldSnapshot {
+    pub entities: Vec<RenderEntitySnapshot>,
+    pub pending_particles: Vec<RenderParticleSnapshot>,
+    pub block_entities: Vec<([i32; 3], BlockEntityVisualState)>,
+    pub boss_bars: Vec<([u8; 16], TrackedBossBar)>,
+    pub rain_level: f32,
+    pub thunder_level: f32,
+    pub world_age: i64,
+    pub time_of_day: i64,
+    pub level_events: Vec<(VisualLevelEvent, [i32; 3])>,
+}
+
+/// Build an owned, stable snapshot without mutating or draining the live world queues.
+pub fn project_render_snapshot(world: &WorldState) -> RenderWorldSnapshot {
+    let entities = world
+        .entities
+        .values()
+        .filter_map(|entity| {
+            world
+                .entity_visual_state(entity.eid)
+                .map(|visual| RenderEntitySnapshot {
+                    eid: entity.eid,
+                    entity_type: entity.entity_type,
+                    position: entity.pos,
+                    visual,
+                })
+        })
+        .collect();
+    let pending_particles = world
+        .level_particles
+        .iter()
+        .enumerate()
+        .map(|(index, spawn)| RenderParticleSnapshot {
+            spawn: *spawn,
+            options: world
+                .level_particle_options
+                .get(index)
+                .map(|(_, options)| options.clone()),
+        })
+        .collect();
+    let block_entities = world
+        .block_entities
+        .keys()
+        .filter_map(|pos| {
+            world
+                .block_entity_visual_state(*pos)
+                .map(|visual| (*pos, visual))
+        })
+        .collect();
+    RenderWorldSnapshot {
+        entities,
+        pending_particles,
+        block_entities,
+        boss_bars: world
+            .boss_bars
+            .iter()
+            .map(|(uuid, bar)| (*uuid, bar.clone()))
+            .collect(),
+        rain_level: world.rain_level,
+        thunder_level: world.thunder_level,
+        world_age: world.world_age,
+        time_of_day: world.time_of_day,
+        level_events: world.visual_level_events().collect(),
     }
 }
 

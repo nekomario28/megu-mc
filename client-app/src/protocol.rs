@@ -523,14 +523,13 @@ impl<'a> WireReader<'a> {
     /// (final byte `& 0xf0` rejected, five bytes max); the `String` error
     /// surface this module's callers use is kept.
     pub fn read_varint(&mut self) -> Result<i32, String> {
-        let (value, len) = megu_core::varint::read_varint_i32(self.rest()).map_err(|e| {
-            match e {
+        let (value, len) =
+            megu_core::varint::read_varint_i32(self.rest()).map_err(|e| match e {
                 megu_core::varint::VarIntError::UnexpectedEof => {
                     "truncated wire: need 1 byte(s), 0 left".to_string()
                 }
                 other => other.to_string(),
-            }
-        })?;
+            })?;
         self.pos += len;
         Ok(value)
     }
@@ -538,14 +537,13 @@ impl<'a> WireReader<'a> {
     /// Delegated to `megu_core`'s canonical reader — identical bounds
     /// (final byte `& 0xfe` rejected, ten bytes max).
     pub fn read_varlong(&mut self) -> Result<i64, String> {
-        let (value, len) = megu_core::varint::read_varlong_i64(self.rest()).map_err(|e| {
-            match e {
+        let (value, len) =
+            megu_core::varint::read_varlong_i64(self.rest()).map_err(|e| match e {
                 megu_core::varint::VarIntError::UnexpectedEof => {
                     "truncated wire: need 1 byte(s), 0 left".to_string()
                 }
                 other => other.to_string(),
-            }
-        })?;
+            })?;
         self.pos += len;
         Ok(value)
     }
@@ -858,7 +856,6 @@ pub fn zlib_decompress(input: &[u8], budget: usize) -> Result<Vec<u8>, String> {
     megu_core::zip_archive::zlib_decompress_capped(input, budget).map_err(|e| e.to_string())
 }
 
-
 // ---------------------------------------------------------------------------
 // Packet framing (uncompressed and compressed)
 // ---------------------------------------------------------------------------
@@ -959,7 +956,10 @@ fn decode_paletted_container_into(
     out: &mut [u32],
 ) -> Result<(), String> {
     if out.len() != entry_count {
-        return Err(format!("palette output length {} != {entry_count}", out.len()));
+        return Err(format!(
+            "palette output length {} != {entry_count}",
+            out.len()
+        ));
     }
     let bits = reader.read_u8()?;
     if bits == 0 {
@@ -1987,17 +1987,43 @@ pub enum PlayEvent {
     CustomReportDetails(Vec<(String, String)>),
     ServerLinks(Vec<WireServerLink>),
     BlockChangedAck(i32),
-    ChangeDifficulty { difficulty: u8, locked: bool },
+    ChangeDifficulty {
+        difficulty: u8,
+        locked: bool,
+    },
     ClearTitles,
-    Cooldown { item: i32, ticks: i32 },
-    PlayerAbilities { flags: u8, flying_speed: f32, walking_speed: f32 },
-    PlayerCombatEnd { duration: i32 },
+    Cooldown {
+        item: i32,
+        ticks: i32,
+    },
+    PlayerAbilities {
+        flags: u8,
+        flying_speed: f32,
+        walking_speed: f32,
+    },
+    PlayerCombatEnd {
+        duration: i32,
+    },
     PlayerCombatEnter,
-    PlayerCombatKill { player_id: i32, message_nbt: Vec<u8> },
-    ResourcePackPop { uuid: Option<[u8; 16]> },
-    ResourcePackPush { uuid: [u8; 16], url: String, hash: String, forced: bool, prompt_nbt: Option<Vec<u8>> },
+    PlayerCombatKill {
+        player_id: i32,
+        message_nbt: Vec<u8>,
+    },
+    ResourcePackPop {
+        uuid: Option<[u8; 16]>,
+    },
+    ResourcePackPush {
+        uuid: [u8; 16],
+        url: String,
+        hash: String,
+        forced: bool,
+        prompt_nbt: Option<Vec<u8>>,
+    },
     SetCarriedItem(i16),
-    StoreCookie { key: String, payload: Vec<u8> },
+    StoreCookie {
+        key: String,
+        payload: Vec<u8>,
+    },
     ResetChat,
     DeleteChat {
         message_index: Option<i32>,
@@ -2247,6 +2273,303 @@ pub struct PlayerInfoUpdateEntry {
 pub struct EquipmentEntry {
     pub slot: u8,
     pub item_wire: Vec<u8>,
+}
+
+/// Typed payload carried after the particle id in Protocol 767
+/// `level_particles`. Unknown particle ids retain their bytes so a newer
+/// registry entry cannot desynchronize the packet stream.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedParticleOptions {
+    Empty,
+    BlockState(i32),
+    Dust {
+        red: f32,
+        green: f32,
+        blue: f32,
+        scale: f32,
+    },
+    DustColorTransition {
+        from: [f32; 3],
+        scale: f32,
+        to: [f32; 3],
+    },
+    SculkCharge {
+        roll: f32,
+    },
+    Item {
+        slot_wire: Vec<u8>,
+    },
+    Vibration {
+        source: VibrationSource,
+        arrival_ticks: i32,
+    },
+    Shriek {
+        delay: i32,
+    },
+    EntityEffect {
+        argb: i32,
+    },
+    Unknown(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum VibrationSource {
+    Block([i32; 3]),
+    Entity { entity_id: i32, eye_height: f32 },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedBossBarAction {
+    Add {
+        name_nbt: Vec<u8>,
+        progress: f32,
+        color: i32,
+        divisions: i32,
+        flags: u8,
+    },
+    Remove,
+    UpdateProgress(f32),
+    UpdateName(Vec<u8>),
+    UpdateStyle {
+        color: i32,
+        divisions: i32,
+    },
+    UpdateFlags(u8),
+}
+
+/// Decode one action-dependent `boss_event` payload on the 767 wire.
+pub fn decode_boss_bar_action(action: i32, raw: &[u8]) -> Result<DecodedBossBarAction, String> {
+    let mut r = WireReader::new(raw);
+    let decoded = match action {
+        0 => DecodedBossBarAction::Add {
+            name_nbt: read_nbt_raw(&mut r)?.to_vec(),
+            progress: r.read_f32()?,
+            color: r.read_varint()?,
+            divisions: r.read_varint()?,
+            flags: r.read_u8()?,
+        },
+        1 => DecodedBossBarAction::Remove,
+        2 => DecodedBossBarAction::UpdateProgress(r.read_f32()?),
+        3 => DecodedBossBarAction::UpdateName(read_nbt_raw(&mut r)?.to_vec()),
+        4 => DecodedBossBarAction::UpdateStyle {
+            color: r.read_varint()?,
+            divisions: r.read_varint()?,
+        },
+        5 => DecodedBossBarAction::UpdateFlags(r.read_u8()?),
+        _ => return Err(format!("unknown boss bar action {action}")),
+    };
+    if r.remaining() != 0 {
+        return Err("trailing bytes in boss bar action".to_string());
+    }
+    Ok(decoded)
+}
+
+/// Decode the Protocol 767 particle-specific suffix. Particle registry ids
+/// are from the vanilla 1.21.1 registry; payload-free and unrecognized ids
+/// remain lossless.
+pub fn decode_particle_options(
+    particle_id: i32,
+    payload: &[u8],
+) -> Result<DecodedParticleOptions, String> {
+    let mut r = WireReader::new(payload);
+    let decoded = match particle_id {
+        2 | 3 | 29 | 104 => DecodedParticleOptions::BlockState(r.read_varint()?),
+        14 => DecodedParticleOptions::Dust {
+            red: r.read_f32()?,
+            green: r.read_f32()?,
+            blue: r.read_f32()?,
+            scale: r.read_f32()?,
+        },
+        15 => DecodedParticleOptions::DustColorTransition {
+            from: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
+            scale: r.read_f32()?,
+            to: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
+        },
+        21 => DecodedParticleOptions::EntityEffect {
+            argb: r.read_i32()?,
+        },
+        36 => DecodedParticleOptions::SculkCharge {
+            roll: r.read_f32()?,
+        },
+        45 => {
+            let end = slot_skip_extent(payload, 0)
+                .ok_or_else(|| "malformed item particle slot".to_string())?;
+            r.take(end)?;
+            DecodedParticleOptions::Item {
+                slot_wire: payload[..end].to_vec(),
+            }
+        }
+        46 => {
+            let source = match r.read_varint()? {
+                0 => VibrationSource::Block(r.read_position()?),
+                1 => VibrationSource::Entity {
+                    entity_id: r.read_varint()?,
+                    eye_height: r.read_f32()?,
+                },
+                kind => return Err(format!("invalid vibration position source {kind}")),
+            };
+            DecodedParticleOptions::Vibration {
+                source,
+                arrival_ticks: r.read_varint()?,
+            }
+        }
+        98 => DecodedParticleOptions::Shriek {
+            delay: r.read_varint()?,
+        },
+        _ if payload.is_empty() => DecodedParticleOptions::Empty,
+        _ => DecodedParticleOptions::Unknown(payload.to_vec()),
+    };
+    if !matches!(decoded, DecodedParticleOptions::Unknown(_)) && r.remaining() != 0 {
+        return Err("trailing bytes in particle options".to_string());
+    }
+    Ok(decoded)
+}
+
+/// Protocol 767 entity metadata value. The metadata index is retained
+/// separately so entity-specific fields (sheep color, creeper charge, etc.)
+/// can be interpreted using that entity's metadata layout.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DecodedEntityMetadataValue {
+    Byte(i8),
+    VarInt(i32),
+    Float(f32),
+    String(String),
+    Component(Vec<u8>),
+    OptionalComponent(Option<Vec<u8>>),
+    ItemStack(Vec<u8>),
+    Bool(bool),
+    Rotations([f32; 3]),
+    Position([i32; 3]),
+    OptionalPosition(Option<[i32; 3]>),
+    Direction(i32),
+    OptionalUuid(Option<[u8; 16]>),
+    BlockState(i32),
+    OptionalBlockState(Option<i32>),
+    Nbt(Vec<u8>),
+    VillagerData {
+        kind: i32,
+        profession: i32,
+        level: i32,
+    },
+    OptionalVarInt(Option<i32>),
+    Pose(i32),
+    Raw(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedEntityMetadataEntry {
+    pub index: u8,
+    pub value: DecodedEntityMetadataValue,
+}
+
+/// Typed projection of Protocol 767's `level_event` packet effect ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VisualLevelEvent {
+    BlockDestroy { block_state: i32 },
+    SplashPotion { rgb: i32, instant: bool },
+    Bonemeal { count: i32 },
+    DragonDeath,
+    WitherSpawn,
+    EndPortalOpen,
+    PortalTravel,
+    Other { event: i32, data: i32 },
+}
+
+/// Map the Protocol 767 `level_event` id and its data payload to a renderer-facing value.
+pub fn visual_level_event(event: i32, data: i32) -> VisualLevelEvent {
+    match event {
+        2001 => VisualLevelEvent::BlockDestroy { block_state: data },
+        2002 => VisualLevelEvent::SplashPotion {
+            rgb: data,
+            instant: false,
+        },
+        2007 => VisualLevelEvent::SplashPotion {
+            rgb: data,
+            instant: true,
+        },
+        2005 => VisualLevelEvent::Bonemeal { count: data },
+        1028 => VisualLevelEvent::DragonDeath,
+        1023 => VisualLevelEvent::WitherSpawn,
+        1038 => VisualLevelEvent::EndPortalOpen,
+        1032 => VisualLevelEvent::PortalTravel,
+        _ => VisualLevelEvent::Other { event, data },
+    }
+}
+
+/// Decode the index/type/value sequence held in `set_entity_data`.
+pub fn decode_entity_metadata(raw: &[u8]) -> Result<Vec<DecodedEntityMetadataEntry>, String> {
+    let mut r = WireReader::new(raw);
+    let mut entries = Vec::new();
+    loop {
+        let index = r.read_u8()?;
+        if index == 0xff {
+            break;
+        }
+        if entries.len() >= 256 {
+            return Err("entity metadata entry count exceeds bound".to_string());
+        }
+        let kind = r.read_varint()?;
+        let value = match kind {
+            0 => DecodedEntityMetadataValue::Byte(r.read_i8()?),
+            1 => DecodedEntityMetadataValue::VarInt(r.read_varint()?),
+            2 => DecodedEntityMetadataValue::Raw(r.read_varlong()?.to_be_bytes().to_vec()),
+            3 => DecodedEntityMetadataValue::Float(r.read_f32()?),
+            4 => DecodedEntityMetadataValue::String(r.read_string(32767)?),
+            5 => DecodedEntityMetadataValue::Component(read_nbt_raw(&mut r)?.to_vec()),
+            6 => DecodedEntityMetadataValue::OptionalComponent(if r.read_bool()? {
+                Some(read_nbt_raw(&mut r)?.to_vec())
+            } else {
+                None
+            }),
+            7 => {
+                let start = raw.len() - r.remaining();
+                let end = slot_skip_extent(raw, start)
+                    .ok_or_else(|| "malformed entity metadata item slot".to_string())?;
+                r.take(end - start)?;
+                DecodedEntityMetadataValue::ItemStack(raw[start..end].to_vec())
+            }
+            8 => DecodedEntityMetadataValue::Bool(r.read_bool()?),
+            9 => {
+                DecodedEntityMetadataValue::Rotations([r.read_f32()?, r.read_f32()?, r.read_f32()?])
+            }
+            10 => DecodedEntityMetadataValue::Position(r.read_position()?),
+            11 => DecodedEntityMetadataValue::OptionalPosition(if r.read_bool()? {
+                Some(r.read_position()?)
+            } else {
+                None
+            }),
+            12 => DecodedEntityMetadataValue::Direction(r.read_varint()?),
+            13 => DecodedEntityMetadataValue::OptionalUuid(if r.read_bool()? {
+                Some(r.read_uuid()?)
+            } else {
+                None
+            }),
+            14 => DecodedEntityMetadataValue::BlockState(r.read_varint()?),
+            15 => DecodedEntityMetadataValue::OptionalBlockState(if r.read_bool()? {
+                Some(r.read_varint()?)
+            } else {
+                None
+            }),
+            16 => DecodedEntityMetadataValue::Nbt(read_nbt_raw(&mut r)?.to_vec()),
+            18 => DecodedEntityMetadataValue::VillagerData {
+                kind: r.read_varint()?,
+                profession: r.read_varint()?,
+                level: r.read_varint()?,
+            },
+            19 => DecodedEntityMetadataValue::OptionalVarInt(if r.read_bool()? {
+                Some(r.read_varint()?)
+            } else {
+                None
+            }),
+            20 => DecodedEntityMetadataValue::Pose(r.read_varint()?),
+            kind => return Err(format!("unsupported entity metadata type {kind}")),
+        };
+        entries.push(DecodedEntityMetadataEntry { index, value });
+    }
+    if r.remaining() != 0 {
+        return Err("trailing bytes after entity metadata terminator".to_string());
+    }
+    Ok(entries)
 }
 
 /// Opt-in play receiver result with decoded clientbound custom payloads.
@@ -2898,8 +3221,7 @@ pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
             }
             // varint
             1 => {
-                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok())
-                else {
+                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
                     break;
                 };
                 EntityMetaValue::VarInt(v)
@@ -2913,18 +3235,21 @@ pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
             }
             // float
             3 => {
-                let Some(bytes) = raw.get(p..p + 4) else { break };
+                let Some(bytes) = raw.get(p..p + 4) else {
+                    break;
+                };
                 p += 4;
                 EntityMetaValue::Float(f32::from_be_bytes(bytes.try_into().unwrap_or_default()))
             }
             // string
             4 => {
-                let Some(len) =
-                    slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
+                let Some(len) = slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
                 else {
                     break;
                 };
-                let Some(bytes) = raw.get(p..p + len) else { break };
+                let Some(bytes) = raw.get(p..p + len) else {
+                    break;
+                };
                 let text = String::from_utf8_lossy(bytes).into_owned();
                 p += len;
                 EntityMetaValue::Text(text)
@@ -2961,7 +3286,9 @@ pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
             }
             // item stack (Slot)
             7 => {
-                let Some(end) = slot_skip_extent(raw, p) else { break };
+                let Some(end) = slot_skip_extent(raw, p) else {
+                    break;
+                };
                 let bytes = raw[p..end].to_vec();
                 p = end;
                 EntityMetaValue::Slot(bytes)
@@ -3003,8 +3330,7 @@ pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
             // direction / optional-unsigned-int / pose / variant ids —
             // all plain VarInts
             12 | 14 | 15 | 20 | 21 | 22 | 23 | 24 | 26 | 27 | 28 => {
-                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok())
-                else {
+                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
                     break;
                 };
                 EntityMetaValue::VarInt(v)
@@ -3033,8 +3359,7 @@ pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
                 let Some(&present) = raw.get(p) else { break };
                 p += 1;
                 if present != 0 {
-                    let Some(len) =
-                        slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
+                    let Some(len) = slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
                     else {
                         break;
                     };
@@ -4069,37 +4394,58 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             PlayEvent::ServerLinks(links)
         }
         "block_changed_ack" => PlayEvent::BlockChangedAck(r.read_varint()?),
-        "change_difficulty" => PlayEvent::ChangeDifficulty { difficulty: r.read_u8()?, locked: r.read_bool()? },
+        "change_difficulty" => PlayEvent::ChangeDifficulty {
+            difficulty: r.read_u8()?,
+            locked: r.read_bool()?,
+        },
         "clear_titles" => PlayEvent::ClearTitles,
-        "cooldown" => PlayEvent::Cooldown { item: r.read_varint()?, ticks: r.read_varint()? },
+        "cooldown" => PlayEvent::Cooldown {
+            item: r.read_varint()?,
+            ticks: r.read_varint()?,
+        },
         "player_abilities" => PlayEvent::PlayerAbilities {
             flags: r.read_u8()?,
             flying_speed: r.read_f32()?,
             walking_speed: r.read_f32()?,
         },
-        "player_combat_end" => PlayEvent::PlayerCombatEnd { duration: r.read_varint()? },
+        "player_combat_end" => PlayEvent::PlayerCombatEnd {
+            duration: r.read_varint()?,
+        },
         "player_combat_enter" => PlayEvent::PlayerCombatEnter,
         "player_combat_kill" => PlayEvent::PlayerCombatKill {
             player_id: r.read_varint()?,
             message_nbt: read_nbt_raw(&mut r)?.to_vec(),
         },
         "resource_pack_pop" => PlayEvent::ResourcePackPop {
-            uuid: if r.read_bool()? { Some(r.read_uuid()?) } else { None },
+            uuid: if r.read_bool()? {
+                Some(r.read_uuid()?)
+            } else {
+                None
+            },
         },
         "resource_pack_push" => PlayEvent::ResourcePackPush {
             uuid: r.read_uuid()?,
             url: r.read_string(32767)?,
             hash: r.read_string(40)?,
             forced: r.read_bool()?,
-            prompt_nbt: if r.read_bool()? { Some(read_nbt_raw(&mut r)?.to_vec()) } else { None },
+            prompt_nbt: if r.read_bool()? {
+                Some(read_nbt_raw(&mut r)?.to_vec())
+            } else {
+                None
+            },
         },
         "set_carried_item" => PlayEvent::SetCarriedItem(i16::from(r.read_i8()?)),
         "store_cookie" => {
             let key = r.read_string(32767)?;
             let len = usize::try_from(r.read_varint()?)
                 .map_err(|_| "negative cookie payload length".to_string())?;
-            if len > 5120 { return Err("cookie payload exceeds 5 KiB".into()); }
-            PlayEvent::StoreCookie { key, payload: r.take(len)?.to_vec() }
+            if len > 5120 {
+                return Err("cookie payload exceeds 5 KiB".into());
+            }
+            PlayEvent::StoreCookie {
+                key,
+                payload: r.take(len)?.to_vec(),
+            }
         }
         "custom_chat_completions" => {
             let action = r.read_varint()?;
@@ -6141,14 +6487,20 @@ impl ProtocolClient {
                 self.latest_command_suggestions = Some(event.clone());
             }
             PlayEvent::StoreCookie { key, payload } => {
-                if payload.len() <= 5120 && (self.cookies.contains_key(key) || self.cookies.len() < 256) {
+                if payload.len() <= 5120
+                    && (self.cookies.contains_key(key) || self.cookies.len() < 256)
+                {
                     self.cookies.insert(key.clone(), payload.clone());
                 }
             }
             PlayEvent::ChangeDifficulty { difficulty, locked } => {
                 self.difficulty = Some((*difficulty, *locked));
             }
-            PlayEvent::PlayerAbilities { flags, flying_speed, walking_speed } => {
+            PlayEvent::PlayerAbilities {
+                flags,
+                flying_speed,
+                walking_speed,
+            } => {
                 self.player_abilities = Some((*flags, *flying_speed, *walking_speed));
             }
             PlayEvent::SetCarriedItem(slot) => self.selected_hotbar_slot = Some(*slot),
@@ -7068,7 +7420,7 @@ mod tests {
         write_varint(&mut body, 1); // block_interaction: destroy
         write_varint(&mut body, 33); // small ParticleOptions id
         write_varint(&mut body, 37); // large ParticleOptions id
-        // Inline sound holder (id 0) + name + no fixed range.
+                                     // Inline sound holder (id 0) + name + no fixed range.
         write_varint(&mut body, 0);
         write_varint(&mut body, "minecraft:entity.generic.explode".len() as i32);
         body.extend_from_slice(b"minecraft:entity.generic.explode");
