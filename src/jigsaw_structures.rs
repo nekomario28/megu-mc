@@ -2865,7 +2865,22 @@ fn place_single_or_legacy<D: JigsawData>(
             let loot_seed = is_randomizable_container_be(bname).then(|| rng.next_i64_legacy());
             let loot_table = nbt_str(nbt, "LootTable");
             if let Some(ctx) = target.live_ctx() {
-                if let Some(table) = loot_table {
+                let brushable_loot = matches!(
+                    bname,
+                    "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
+                ) && loot_table.is_some();
+                if brushable_loot {
+                    match Template::staged_payload(nbt, placed, reg) {
+                        Ok(payload) => {
+                            ctx.payloads.push((p, payload));
+                        }
+                        Err(reason) => {
+                            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                                eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} refused: {reason}");
+                            }
+                        }
+                    }
+                } else if let Some(table) = loot_table {
                     let table = ns_name(&table);
                     // The store is decided BEFORE anything can refuse the state: a
                     // furnace/blast_furnace/smoker carries its loot in `furnaces()`, so it must
@@ -2974,20 +2989,19 @@ fn place_single_or_legacy<D: JigsawData>(
             }
         }
 
-        for info in &tpl.entities {
-            let btp = transform_block(info.block_pos, Mirror::None, rot, (0, 0, 0));
-            let block_pos = (
-                btp.0.wrapping_add(piece_pos.0),
-                btp.1.wrapping_add(piece_pos.1),
-                btp.2.wrapping_add(piece_pos.2),
-            );
+        let placement = crate::structure_template::Placement {
+            origin: piece_pos,
+            pivot: (0, 0, 0),
+            mirror: Mirror::None,
+            rotation: rot,
+        };
+        let placed_entities = tpl.transformed_entities(placement)?;
+        for (info, placed_entity) in tpl.entities.iter().zip(placed_entities) {
+            let block_pos = placed_entity.block_pos;
             if !bb_contains_pos(clip, block_pos) {
                 continue;
             }
-            let Some(id) = nbt_str(&info.nbt, "id") else {
-                continue;
-            };
-            let id = ns_name(&id);
+            let id = ns_name(&placed_entity.id);
             if id == "minecraft:item_frame" || id == "minecraft:glow_item_frame" {
                 // A hanging entity owns no free position: it hangs in the block the
                 // template names, faced by its own `Facing` rotated with the piece.
@@ -3015,13 +3029,7 @@ fn place_single_or_legacy<D: JigsawData>(
                 }
                 continue;
             }
-            let tp = crate::structure_transform::entity(info.pos, Mirror::None, rot, (0, 0, 0));
-            let pos = [
-                tp[0] + f64::from(piece_pos.0),
-                tp[1] + f64::from(piece_pos.1),
-                tp[2] + f64::from(piece_pos.2),
-            ];
-            ctx.push_entity(&id, pos, 0.0);
+            ctx.push_entity(&id, placed_entity.pos, placed_entity.yaw);
         }
     }
 
@@ -3342,6 +3350,148 @@ pub(crate) mod jigsaw_structures {
             processor_lists: HashMap::from([("minecraft:empty".to_owned(), Vec::new())]),
             templates: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn jigsaw_append_loot_suspicious_gravel_stages_brushable_payload() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut repo = empty_repo();
+        repo.templates.insert(
+            ns_name("spinetest:trail_gravel"),
+            std::sync::Arc::new(Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0),
+                    state: reg.state_of("minecraft:gravel", None),
+                    nbt: None,
+                }]],
+                entities: Vec::new(),
+            }),
+        );
+        let processors = ProcessorRef::Inline(vec![Processor::Rules(vec![BlockRule {
+            input: RuleTest::Always,
+            location: RuleTest::Always,
+            position: PosRuleTest::Always,
+            output: reg.state_of("minecraft:suspicious_gravel", None),
+            output_nbt: None,
+            modifier: BlockEntityModifier::AppendLoot(
+                "minecraft:archaeology/trail_ruins_common".to_owned(),
+            ),
+        }])]);
+
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(17);
+        let piece_pos = (0, 70, 0);
+        let clip: BBox = [-1, 69, -1, 1, 71, 1];
+        let mut target = JigsawTarget::Live(&mut ctx);
+        place_single_or_legacy(
+            &mut repo,
+            "spinetest:trail_gravel",
+            &processors,
+            Projection::Rigid,
+            None,
+            false,
+            piece_pos,
+            piece_pos,
+            Rotation::None,
+            clip,
+            LiquidSettings::IgnoreWaterlogging,
+            7,
+            &mut target,
+            &mut rng,
+            reg,
+        )
+        .expect("trail gravel piece places");
+
+        assert_eq!(
+            reg.name_of(ctx.get(0, 70, 0)),
+            "minecraft:suspicious_gravel"
+        );
+        let expected_seed = Lcg::new(hash_block_pos(0, 70, 0) as u64).next_i64();
+        assert_eq!(
+            ctx.payloads,
+            vec![(
+                (0, 70, 0),
+                GenerationPayload::Brushable {
+                    loot_table: "minecraft:archaeology/trail_ruins_common".to_owned(),
+                    loot_seed: Some(expected_seed),
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn jigsaw_template_entity_payload_preserves_nbt_yaw_and_piece_rotation() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = breg().expect("block registry");
+        let mut g = crate::worldgen::Gen::load(0, crate::name_to_state).expect("gen");
+        let mut repo = empty_repo();
+        let entity_nbt = Tag::Compound(BTreeMap::from([
+            (
+                crate::nbt::NbtString::text("id"),
+                Tag::String(crate::nbt::NbtString::text("minecraft:villager")),
+            ),
+            (
+                crate::nbt::NbtString::text("Rotation"),
+                Tag::List(5, vec![Tag::Float(20.0f32.to_bits()), Tag::Float(0.0f32.to_bits())]),
+            ),
+        ]));
+        repo.templates.insert(
+            ns_name("spinetest:villager_piece"),
+            std::sync::Arc::new(Template {
+                size: (1, 1, 1),
+                palettes: vec![vec![BlockInfo {
+                    pos: (0, 0, 0),
+                    state: reg.state_of("minecraft:dirt", None),
+                    nbt: None,
+                }]],
+                entities: vec![crate::structure_template::EntityInfo {
+                    pos: [0.25, 0.5, 0.75],
+                    block_pos: (0, 0, 0),
+                    nbt: entity_nbt,
+                }],
+            }),
+        );
+
+        let mut ctx = FC::new(&mut g);
+        ctx.test_default_air = true;
+        let mut rng = Xor::seed_worldgen(19);
+        let piece_pos = (10, 70, 10);
+        let clip: BBox = [9, 69, 9, 11, 71, 11];
+        let mut target = JigsawTarget::Live(&mut ctx);
+        place_single_or_legacy(
+            &mut repo,
+            "spinetest:villager_piece",
+            &ProcessorRef::Named("minecraft:empty".to_owned()),
+            Projection::Rigid,
+            None,
+            false,
+            piece_pos,
+            piece_pos,
+            Rotation::Clockwise90,
+            clip,
+            LiquidSettings::IgnoreWaterlogging,
+            7,
+            &mut target,
+            &mut rng,
+            reg,
+        )
+        .expect("entity piece places");
+
+        assert_eq!(
+            ctx.payloads,
+            vec![(
+                (10, 70, 10),
+                GenerationPayload::Entity {
+                    id: "minecraft:villager".to_owned(),
+                    pos: [10.25, 70.5, 10.25],
+                    yaw: 110.0,
+                }
+            )]
+        );
     }
 
     /// The container admission, read from the placed state: a piece's loot table reaches the

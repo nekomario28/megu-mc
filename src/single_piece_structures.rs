@@ -1562,16 +1562,10 @@ impl DesertPyramidStructure {
         result.loots = loots.into_values().collect();
         for loot in &result.loots {
             match loot.kind {
-                LootKind::Chest => ctx.push_loot_container(
-                    loot.pos,
-                    crate::generation_payload::ContainerKind::Chest,
-                    loot.table.to_owned(),
-                    Some(loot.seed),
-                ),
+                LootKind::Chest | LootKind::Dispenser => {}
                 LootKind::Brushable => {
                     ctx.push_brushable(loot.pos, loot.table, Some(loot.seed));
                 }
-                LootKind::Dispenser => {}
             }
         }
     }
