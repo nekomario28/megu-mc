@@ -19,20 +19,22 @@ use megu_client_mesh::{
     SectionCoord, SectionGraph, ALL_FACES, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID,
     OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
+use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::skeletal_anim::{
     decode_animation_trigger, parse_animation_json, parse_geometry_json, parse_jem_model,
     parse_jpm_model, AnimationClip, AnimationController, AnimationError, BoneMask, LoopMode,
     SkeletonRig, MAX_CLIPS,
 };
-use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::{
     Aabb, FluidCell, FluidKind, LightEngine, LightFact, LightUpdateMultiWord, PalettedSection,
     Registry, STATE_COUNT,
 };
 
 use crate::protocol::{
-    bitset_get, decode_paletted_container, ChunkBiomeData, DecodedBlockEntity, DecodedChunk,
-    DecodedLightData, DimensionMeta, PlayEvent, WireAttribute, WireReader,
+    bitset_get, decode_boss_bar_action, decode_entity_metadata, decode_paletted_container,
+    decode_particle_options, ChunkBiomeData, DecodedBlockEntity, DecodedBossBarAction,
+    DecodedChunk, DecodedEntityMetadataEntry, DecodedLightData, DecodedParticleOptions,
+    DimensionMeta, NbtValue, PlayEvent, WireAttribute, WireReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -607,9 +609,8 @@ fn parse_state_block_rows(
     let items = json_array(value, "blocks")?;
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
-        let row = json_array(item, "blocks row").map_err(|_| {
-            format!("block_states_1211.json: malformed blocks row {i}")
-        })?;
+        let row = json_array(item, "blocks row")
+            .map_err(|_| format!("block_states_1211.json: malformed blocks row {i}"))?;
         if row.len() != 3 {
             return Err(format!(
                 "block_states_1211.json: blocks row {i} is not a 3-tuple"
@@ -636,9 +637,7 @@ fn parse_u8_list(value: &megu_core::json::JsonValue, what: &str) -> Result<Vec<u
         .collect()
 }
 
-fn parse_shape_list(
-    value: &megu_core::json::JsonValue,
-) -> Result<Vec<LocalBox>, String> {
+fn parse_shape_list(value: &megu_core::json::JsonValue) -> Result<Vec<LocalBox>, String> {
     let items = json_array(value, "shapes")?;
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
@@ -680,24 +679,18 @@ fn shape_axis(
     Ok(out)
 }
 
-fn parse_collision_shapes(
-    value: &megu_core::json::JsonValue,
-) -> Result<Vec<Vec<u16>>, String> {
+fn parse_collision_shapes(value: &megu_core::json::JsonValue) -> Result<Vec<Vec<u16>>, String> {
     let items = json_array(value, "collision_shapes")?;
     let mut out = Vec::with_capacity(items.len());
     for (i, item) in items.iter().enumerate() {
-        let indices = json_array(item, "collision_shapes row").map_err(|_| {
-            format!("block_states_1211.json: malformed collision_shapes row {i}")
-        })?;
+        let indices = json_array(item, "collision_shapes row")
+            .map_err(|_| format!("block_states_1211.json: malformed collision_shapes row {i}"))?;
         let mut list = Vec::with_capacity(indices.len());
         for (j, index) in indices.iter().enumerate() {
             list.push(
-                json_u64(index, "collision_shapes index")
-                    .map_err(|_| {
-                        format!(
-                            "block_states_1211.json: bad collision_shapes[{i}][{j}]"
-                        )
-                    })? as u16,
+                json_u64(index, "collision_shapes index").map_err(|_| {
+                    format!("block_states_1211.json: bad collision_shapes[{i}][{j}]")
+                })? as u16,
             );
         }
         out.push(list);
@@ -1326,6 +1319,31 @@ pub struct LevelParticleSpawn {
     pub count: i32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackedBossBar {
+    pub name_nbt: Vec<u8>,
+    pub progress: f32,
+    pub color: i32,
+    pub divisions: i32,
+    pub flags: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackedMobEffect {
+    pub amplifier: i32,
+    pub duration: i32,
+    pub flags: u8,
+}
+
+#[derive(Clone, Debug)]
+pub struct MerchantPanelState {
+    pub offers: Vec<crate::protocol::MerchantOfferEntry>,
+    pub villager_level: i32,
+    pub villager_xp: i32,
+    pub show_progress: bool,
+    pub can_restock: bool,
+}
+
 pub struct WorldState {
     pub dimension: DimensionMeta,
     pub blocks: BlockTable,
@@ -1368,8 +1386,7 @@ pub struct WorldState {
     /// camera-driven re-sort of a released section re-derive a valid
     /// `translucent_order` over the VRAM-resident mesh without the deleted
     /// full CPU copy.
-    released_translucent_slots:
-        CoordMap<SectionCoord, HashMap<TranslucentSlotKey, u32>>,
+    released_translucent_slots: CoordMap<SectionCoord, HashMap<TranslucentSlotKey, u32>>,
     quad_counts: CoordMap<SectionCoord, usize>,
     /// Per-section 6x6 face-to-face visibility graph (including uniform-air
     /// sections) plus the renderable flag fed to `GraphCuller`.
@@ -1390,6 +1407,16 @@ pub struct WorldState {
     /// Live entities tracked from S2C entity packets, bounded by
     /// [`MAX_TRACKED_ENTITIES`].
     pub entities: BTreeMap<i32, TrackedEntity>,
+    /// Last decoded metadata values by entity and metadata index.
+    pub entity_metadata: BTreeMap<i32, Vec<DecodedEntityMetadataEntry>>,
+    /// Raw item-slot payloads keyed by (entity id, vanilla equipment slot).
+    pub entity_equipment: BTreeMap<(i32, u8), Vec<u8>>,
+    /// Current entity pose value from the shared metadata pose field.
+    pub entity_poses: BTreeMap<i32, i32>,
+    /// Remaining swing/animation ticks by entity id.
+    pub entity_animation_ticks: BTreeMap<i32, u8>,
+    /// Active potion effects keyed by (entity id, registry effect id).
+    pub mob_effects: BTreeMap<(i32, i32), TrackedMobEffect>,
     /// Last server-synced attributes per tracked entity.
     pub entity_attributes: BTreeMap<i32, Vec<WireAttribute>>,
     /// Vehicle-to-passenger relationships from `set_passengers`.
@@ -1405,12 +1432,24 @@ pub struct WorldState {
     /// Recent `level_particles` spawn records kept bounded the
     /// same way; the particle stage drains them when it lands.
     pub level_particles: VecDeque<LevelParticleSpawn>,
+    /// Parsed particle options aligned with the arrival order in
+    /// `level_particles`; unknown options preserve their original bytes.
+    pub level_particle_options: VecDeque<(i32, DecodedParticleOptions)>,
     /// Recent item pickup animations retained for a future entity animation system.
     pub item_pickups: VecDeque<(i32, i32, i32)>,
     /// Block entities retained from chunk payloads and `block_entity_data`
     /// updates, keyed by world `[x, y, z]`, bounded by
     /// [`MAX_TRACKED_BLOCK_ENTITIES`].
     pub block_entities: BTreeMap<[i32; 3], TrackedBlockEntity>,
+    /// Parsed anonymous NBT for block entities, including sign sides, item
+    /// lists, workstation properties, and trial-spawner/vault state.
+    pub block_entity_visual_nbt: BTreeMap<[i32; 3], NbtValue>,
+    /// Boss-bar rows keyed by server UUID.
+    pub boss_bars: BTreeMap<[u8; 16], TrackedBossBar>,
+    /// Workstation/container property values keyed by (window, property).
+    pub container_properties: BTreeMap<(u8, i16), i16>,
+    /// Merchant UI state keyed by container window id.
+    pub merchant_panels: BTreeMap<u8, MerchantPanelState>,
     /// World age in game ticks (`set_time`).
     pub world_age: i64,
     /// Time of day in game ticks (`set_time`); consumers reduce mod 24000.
@@ -1419,6 +1458,8 @@ pub struct WorldState {
     pub rain_level: f32,
     /// Thunder level `0.0..=1.0` driven by weather `game_event`s.
     pub thunder_level: f32,
+    /// Current game mode from the game-state-change event, when received.
+    pub game_mode: Option<u8>,
     /// Block-break crack overlays keyed by breaker entity id, bounded by
     /// [`MAX_BLOCK_DESTRUCTIONS`].
     pub block_destructions: BTreeMap<i32, BlockBreakProgress>,
@@ -1536,18 +1577,29 @@ impl WorldState {
             metrics: MeshMetrics::default(),
             animations: WorldAnimationHost::new(),
             entities: BTreeMap::new(),
+            entity_metadata: BTreeMap::new(),
+            entity_equipment: BTreeMap::new(),
+            entity_poses: BTreeMap::new(),
+            entity_animation_ticks: BTreeMap::new(),
+            mob_effects: BTreeMap::new(),
             entity_attributes: BTreeMap::new(),
             passengers: BTreeMap::new(),
             entity_links: BTreeMap::new(),
             block_events: VecDeque::new(),
             level_events: VecDeque::new(),
             level_particles: VecDeque::new(),
+            level_particle_options: VecDeque::new(),
             item_pickups: VecDeque::new(),
             block_entities: BTreeMap::new(),
+            block_entity_visual_nbt: BTreeMap::new(),
+            boss_bars: BTreeMap::new(),
+            container_properties: BTreeMap::new(),
+            merchant_panels: BTreeMap::new(),
             world_age: 0,
             time_of_day: 0,
             rain_level: 0.0,
             thunder_level: 0.0,
+            game_mode: None,
             block_destructions: BTreeMap::new(),
         }
     }
@@ -1559,14 +1611,21 @@ impl WorldState {
         // block-break state; the world clock (age/time/weather) persists
         // across respawns exactly like vanilla's shared `ClientLevel` data.
         self.entities.clear();
+        self.entity_metadata.clear();
+        self.entity_equipment.clear();
+        self.entity_poses.clear();
+        self.entity_animation_ticks.clear();
+        self.mob_effects.clear();
         self.entity_attributes.clear();
         self.passengers.clear();
         self.entity_links.clear();
         self.block_events.clear();
         self.level_events.clear();
         self.level_particles.clear();
+        self.level_particle_options.clear();
         self.item_pickups.clear();
         self.block_entities.clear();
+        self.block_entity_visual_nbt.clear();
         self.block_destructions.clear();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         // A dimension change discards any edits queued against the old
@@ -1655,12 +1714,8 @@ impl WorldState {
         let mut sky_cursor = usize::from(bitset_get(&decoded.light.sky_mask, 0));
         let mut block_cursor = usize::from(bitset_get(&decoded.light.block_mask, 0));
         for (idx, sec) in decoded.sections.iter().enumerate() {
-            let (sky_update, block_update) = section_light_updates(
-                &decoded.light,
-                idx + 1,
-                &mut sky_cursor,
-                &mut block_cursor,
-            );
+            let (sky_update, block_update) =
+                section_light_updates(&decoded.light, idx + 1, &mut sky_cursor, &mut block_cursor);
             let sky = sky_update.unwrap_or(default_sky);
             let blk = block_update.unwrap_or([0u8; LIGHT_BYTES]);
             let mut stored =
@@ -1743,12 +1798,7 @@ impl WorldState {
             .as_ref()
             .is_some_and(|registry| registry.facts(state_id).is_ok())
         {
-            self.light_queue.push(QueuedLightEdit {
-                x,
-                y,
-                z,
-                state_id,
-            });
+            self.light_queue.push(QueuedLightEdit { x, y, z, state_id });
         }
     }
 
@@ -1965,8 +2015,8 @@ impl WorldState {
         let ly = (y64 - min_y).rem_euclid(16) as usize;
         let lz = z.rem_euclid(16) as usize;
         let cell_idx = section_index(lx, ly, lz);
-        let clamped = state_id
-            .min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX));
+        let clamped =
+            state_id.min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX));
         let previous = sec.palette.get(cell_idx).ok();
         sec.palette
             .set(cell_idx, clamped)
@@ -2066,18 +2116,15 @@ impl WorldState {
     pub fn forget_chunk(&mut self, cx: i32, cz: i32) {
         self.block_entities
             .retain(|pos, _| pos[0].div_euclid(16) != cx || pos[2].div_euclid(16) != cz);
+        self.block_entity_visual_nbt
+            .retain(|pos, _| pos[0].div_euclid(16) != cx || pos[2].div_euclid(16) != cz);
     }
 
     /// Replace the tracked block-entity set of column `(cx, cz)` with the
     /// records carried by a freshly applied chunk payload. The wire format
     /// packs chunk-local X/Z into one byte (`x = packed >> 4`,
     /// `z = packed & 0x0f`) and carries absolute world Y as `i16`.
-    fn refresh_chunk_block_entities(
-        &mut self,
-        cx: i32,
-        cz: i32,
-        entities: &[DecodedBlockEntity],
-    ) {
+    fn refresh_chunk_block_entities(&mut self, cx: i32, cz: i32, entities: &[DecodedBlockEntity]) {
         self.forget_chunk(cx, cz);
         for be in entities {
             if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES {
@@ -2092,8 +2139,17 @@ impl WorldState {
             let z = cz
                 .saturating_mul(16)
                 .saturating_add(i32::from(be.packed_xz & 0x0f));
+            let pos = [x, i32::from(be.y), z];
+            if !be.nbt_bytes.is_empty() {
+                let mut reader = WireReader::new(&be.nbt_bytes);
+                if let Ok(nbt) = reader.read_nbt() {
+                    if reader.remaining() == 0 {
+                        self.block_entity_visual_nbt.insert(pos, nbt);
+                    }
+                }
+            }
             self.block_entities.insert(
-                [x, i32::from(be.y), z],
+                pos,
                 TrackedBlockEntity {
                     kind: be.kind,
                     nbt_bytes: be.nbt_bytes.clone(),
@@ -2402,9 +2458,7 @@ impl WorldState {
             self.packed_mesh_digests.remove(&coord);
             self.packed_meshes
                 .remove(&coord)
-                .map_or(0, |verts| {
-                    verts.len() * std::mem::size_of::<PackedVertex>()
-                })
+                .map_or(0, |verts| verts.len() * std::mem::size_of::<PackedVertex>())
         } else {
             0
         };
@@ -2489,9 +2543,7 @@ impl WorldState {
             } => {
                 // Bounded: a full table ignores excess spawns; re-spawning a
                 // tracked id replaces its row without growing the map.
-                if self.entities.contains_key(eid)
-                    || self.entities.len() < MAX_TRACKED_ENTITIES
-                {
+                if self.entities.contains_key(eid) || self.entities.len() < MAX_TRACKED_ENTITIES {
                     let pos = [clean_f64(*x), clean_f64(*y), clean_f64(*z)];
                     self.entities.insert(
                         *eid,
@@ -2516,6 +2568,12 @@ impl WorldState {
             PlayEvent::RemoveEntities { eids } => {
                 for &eid in eids {
                     self.entities.remove(&eid);
+                    self.entity_metadata.remove(&eid);
+                    self.entity_poses.remove(&eid);
+                    self.entity_animation_ticks.remove(&eid);
+                    self.entity_equipment
+                        .retain(|(entity, _), _| *entity != eid);
+                    self.mob_effects.retain(|(entity, _), _| *entity != eid);
                     self.entity_attributes.remove(&eid);
                     self.passengers.remove(&eid);
                     self.entity_links.remove(&eid);
@@ -2541,12 +2599,7 @@ impl WorldState {
                 yaw,
                 pitch,
                 on_ground,
-            } => self.move_tracked_entity(
-                *eid,
-                [*dx, *dy, *dz],
-                Some((*yaw, *pitch)),
-                *on_ground,
-            ),
+            } => self.move_tracked_entity(*eid, [*dx, *dy, *dz], Some((*yaw, *pitch)), *on_ground),
             PlayEvent::MoveEntityRot {
                 eid,
                 yaw,
@@ -2593,6 +2646,46 @@ impl WorldState {
             PlayEvent::Animate { eid, animation } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
                     entity.last_animation = Some(*animation);
+                }
+                if self.entity_animation_ticks.len() < MAX_TRACKED_ENTITIES
+                    || self.entity_animation_ticks.contains_key(eid)
+                {
+                    self.entity_animation_ticks.insert(
+                        *eid,
+                        if *animation == 0 || *animation == 3 {
+                            6
+                        } else {
+                            5
+                        },
+                    );
+                }
+            }
+            PlayEvent::SetEntityData { eid, raw_entries } => {
+                let entries = decode_entity_metadata(raw_entries)?;
+                if self.entity_metadata.contains_key(eid)
+                    || self.entity_metadata.len() < MAX_TRACKED_ENTITIES
+                {
+                    if let Some(pose) = entries
+                        .iter()
+                        .find_map(|entry| (entry.index == 6).then_some(&entry.value))
+                        .and_then(|value| match value {
+                            crate::protocol::DecodedEntityMetadataValue::Pose(pose) => Some(*pose),
+                            _ => None,
+                        })
+                    {
+                        self.entity_poses.insert(*eid, pose);
+                    }
+                    let current = self.entity_metadata.entry(*eid).or_default();
+                    for update in entries {
+                        if let Some(existing) =
+                            current.iter_mut().find(|entry| entry.index == update.index)
+                        {
+                            *existing = update;
+                        } else {
+                            current.push(update);
+                        }
+                    }
+                    current.sort_by_key(|entry| entry.index);
                 }
             }
             PlayEvent::UpdateAttributes { eid, attributes } => {
@@ -2651,7 +2744,124 @@ impl WorldState {
                         if entry.slot < 8 {
                             entity.equipment_slots |= 1u8 << entry.slot;
                         }
+                        if entry.slot < 6
+                            && (self.entity_equipment.len() < 4096
+                                || self.entity_equipment.contains_key(&(*eid, entry.slot)))
+                        {
+                            self.entity_equipment
+                                .insert((*eid, entry.slot), entry.item_wire.clone());
+                        }
                     }
+                }
+            }
+            PlayEvent::UpdateMobEffect {
+                eid,
+                effect_id,
+                amplifier,
+                duration,
+                flags,
+            } => {
+                if self.mob_effects.len() < 4096
+                    || self.mob_effects.contains_key(&(*eid, *effect_id))
+                {
+                    self.mob_effects.insert(
+                        (*eid, *effect_id),
+                        TrackedMobEffect {
+                            amplifier: *amplifier,
+                            duration: *duration,
+                            flags: *flags,
+                        },
+                    );
+                }
+            }
+            PlayEvent::RemoveMobEffect { eid, effect_id } => {
+                self.mob_effects.remove(&(*eid, *effect_id));
+            }
+            PlayEvent::ContainerSetData {
+                window_id,
+                property,
+                value,
+            } => {
+                if self.container_properties.len() < 1024
+                    || self
+                        .container_properties
+                        .contains_key(&(*window_id, *property))
+                {
+                    self.container_properties
+                        .insert((*window_id, *property), *value);
+                }
+            }
+            PlayEvent::BossEvent {
+                uuid,
+                action,
+                raw_payload,
+            } => match decode_boss_bar_action(*action, raw_payload)? {
+                DecodedBossBarAction::Add {
+                    name_nbt,
+                    progress,
+                    color,
+                    divisions,
+                    flags,
+                } => {
+                    if self.boss_bars.len() < 128 || self.boss_bars.contains_key(uuid) {
+                        self.boss_bars.insert(
+                            *uuid,
+                            TrackedBossBar {
+                                name_nbt,
+                                progress,
+                                color,
+                                divisions,
+                                flags,
+                            },
+                        );
+                    }
+                }
+                DecodedBossBarAction::Remove => {
+                    self.boss_bars.remove(uuid);
+                }
+                DecodedBossBarAction::UpdateProgress(progress) => {
+                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                        bar.progress = progress;
+                    }
+                }
+                DecodedBossBarAction::UpdateName(name_nbt) => {
+                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                        bar.name_nbt = name_nbt;
+                    }
+                }
+                DecodedBossBarAction::UpdateStyle { color, divisions } => {
+                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                        bar.color = color;
+                        bar.divisions = divisions;
+                    }
+                }
+                DecodedBossBarAction::UpdateFlags(flags) => {
+                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                        bar.flags = flags;
+                    }
+                }
+            },
+            PlayEvent::MerchantOffers {
+                window_id,
+                offers,
+                villager_level,
+                villager_xp,
+                show_progress,
+                can_restock,
+            } => {
+                if self.merchant_panels.len() < 32
+                    || self.merchant_panels.contains_key(&(*window_id as u8))
+                {
+                    self.merchant_panels.insert(
+                        *window_id as u8,
+                        MerchantPanelState {
+                            offers: offers.clone(),
+                            villager_level: *villager_level,
+                            villager_xp: *villager_xp,
+                            show_progress: *show_progress,
+                            can_restock: *can_restock,
+                        },
+                    );
                 }
             }
             PlayEvent::SetTime {
@@ -2696,10 +2906,12 @@ impl WorldState {
                 offset_z,
                 max_speed,
                 count,
-                ..
+                particle_data,
             } => {
+                let options = decode_particle_options(*particle_id, particle_data)?;
                 if self.level_particles.len() == 256 {
                     self.level_particles.pop_front();
+                    self.level_particle_options.pop_front();
                 }
                 self.level_particles.push_back(LevelParticleSpawn {
                     particle_id: *particle_id,
@@ -2709,6 +2921,8 @@ impl WorldState {
                     max_speed: *max_speed,
                     count: *count,
                 });
+                self.level_particle_options
+                    .push_back((*particle_id, options));
             }
             // `chunks_biomes` — per-column biome paletted containers
             // patched into the stored sections; columns that left the
@@ -2738,8 +2952,7 @@ impl WorldState {
                 if reader.remaining() == 0 {
                     break;
                 }
-                let Ok(biomes) =
-                    decode_paletted_container(&mut reader, 64, 3, 1, direct_bits)
+                let Ok(biomes) = decode_paletted_container(&mut reader, 64, 3, 1, direct_bits)
                 else {
                     break;
                 };
@@ -2814,6 +3027,9 @@ impl WorldState {
             GAME_EVENT_STOP_RAINING => self.rain_level = 0.0,
             GAME_EVENT_RAIN_LEVEL_CHANGE => self.rain_level = clean_weather_level(value),
             GAME_EVENT_THUNDER_LEVEL_CHANGE => self.thunder_level = clean_weather_level(value),
+            3 if value.is_finite() && (0.0..=3.0).contains(&value) => {
+                self.game_mode = Some(value as u8);
+            }
             _ => {}
         }
     }
@@ -2855,11 +3071,7 @@ impl WorldState {
         if records.is_empty() {
             return Ok(());
         }
-        let base = [
-            x.floor() as i32,
-            y.floor() as i32,
-            z.floor() as i32,
-        ];
+        let base = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
         let updates: Vec<([i32; 3], u32)> = records
             .iter()
             .map(|r| {
@@ -2881,6 +3093,23 @@ impl WorldState {
     /// chunk-payload population in [`Self::refresh_chunk_block_entities`].
     /// Bounded by [`MAX_TRACKED_BLOCK_ENTITIES`].
     fn apply_block_entity_data(&mut self, pos: [i32; 3], kind: i32, nbt_bytes: &[u8]) {
+        if nbt_bytes.is_empty() {
+            self.block_entity_visual_nbt.remove(&pos);
+        } else {
+            let mut reader = WireReader::new(nbt_bytes);
+            match reader.read_nbt() {
+                Ok(nbt) if reader.remaining() == 0 => {
+                    self.block_entity_visual_nbt.insert(pos, nbt);
+                }
+                _ => {
+                    // `PlayEvent` is a public decoded-event API and existing
+                    // callers may provide only the opaque payload. The wire
+                    // decoder already validates protocol NBT; leave those
+                    // externally supplied payloads lossless and unparsed.
+                    self.block_entity_visual_nbt.remove(&pos);
+                }
+            }
+        }
         match self.block_entities.get_mut(&pos) {
             Some(entry) => {
                 entry.kind = kind;
@@ -2908,6 +3137,16 @@ impl WorldState {
         for entity in self.entities.values_mut() {
             entity.hurt_ticks = entity.hurt_ticks.saturating_sub(1);
         }
+        self.entity_animation_ticks.retain(|_, ticks| {
+            *ticks = ticks.saturating_sub(1);
+            *ticks != 0
+        });
+        self.mob_effects.retain(|_, effect| {
+            if effect.duration > 0 {
+                effect.duration -= 1;
+            }
+            effect.duration != 0
+        });
     }
 }
 
