@@ -367,7 +367,7 @@ fn container_quick_move_merges_before_empty_slots_and_keeps_full_target_remainde
         .collect::<HashMap<_, _>>();
     full.insert(0, (stone, 7, vec![]));
     let mut all = HashMap::from([(chest, full)]);
-    let inv_before = (9..=44)
+    let inv_before: HashMap<i16, Stack> = (9..=44)
         .map(|slot| (slot, (name_to_item("dirt").unwrap(), 64, vec![])))
         .collect();
     let mut inv = inv_before;

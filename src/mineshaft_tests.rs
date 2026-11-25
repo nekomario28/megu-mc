@@ -1,5 +1,6 @@
 use super::*;
 use crate::block_registry::{breg, HeightmapKind};
+use crate::worldgen::DimId;
 
 #[cfg(megu_vanilla_data)]
 fn fixture() -> J {
@@ -577,7 +578,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .spawners
-        .contains_key(&(7, 20, 7)));
+        .contains_key(&(DimId::Overworld, (7, 20, 7))));
     let p = (8, 20, 7);
     crate::world()
         .write(&(crate::worldgen::DimId::Overworld, 0, 0))
@@ -593,7 +594,7 @@ fn queued_generation_payloads_never_take_the_save_lock_on_a_cell_read() {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .contains_key(&p),
+            .contains_key(&(DimId::Overworld, p)),
         "handoff overwrote a user air edit"
     );
     assert_eq!(crate::block_at(p.0, p.1, p.2), 0);
@@ -700,8 +701,9 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
             );
         });
         assert_eq!(*crate::generated_content().lock().unwrap_or_else(|e| e.into_inner()), before);
-        let p = *before.spawners.keys().next().unwrap();
-        let entities = crate::generated_spawner_chunk_entities(p.0 >> 4, p.2 >> 4);
+        let &(dim, (x, y, z)) = before.spawners.keys().next().unwrap();
+        assert_eq!(dim, DimId::Overworld);
+        let entities = crate::generated_spawner_chunk_entities(dim, x >> 4, z >> 4);
         assert_eq!(entities.len(), 1);
         let meta = jparse(include_bytes!("../tests/data/mineshaft_data_1211.json")).unwrap();
         assert_eq!(
@@ -712,14 +714,14 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         named.extend_from_slice(&entities[0].2[1..]);
         assert_eq!(
             crate::nbt::read_named(&named).unwrap().1,
-            before.spawners[&(crate::worldgen::DimId::Overworld, p)]
+            before.spawners[&(dim, (x, y, z))]
         );
         assert_eq!(
-            crate::block_at(p.0, p.1, p.2),
+            crate::block_at_dim(dim, x, y, z),
             crate::name_to_state("spawner").unwrap()
         );
         // Breaking the block removes its NBT and an explicit air overlay survives.
-        crate::set_block(p.0, p.1, p.2, 0);
+        crate::set_block_dim(dim, x, y, z, 0);
         assert!(crate::generated_content()
             .lock()
             .unwrap_or_else(|e| e.into_inner())

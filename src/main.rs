@@ -25015,7 +25015,7 @@ mod mineshaft_runtime_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .insert((0, -20, 0), sp_nbt);
+            .insert((DimId::Overworld, (0, -20, 0)), sp_nbt);
 
         let (client, mut receiver) = effect_tests::client_pair();
         *client.pos.lock().unwrap_or_else(|e| e.into_inner()) = (6.5, -20.0, 0.5, 0.0, 0.0, true);
@@ -25063,7 +25063,7 @@ mod mineshaft_runtime_tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .spawners
-                .get_mut(&(0, -20, 0))
+                .get_mut(&(DimId::Overworld, (0, -20, 0)))
                 .unwrap()
             {
                 if !spawned {
@@ -25180,7 +25180,7 @@ mod mineshaft_runtime_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .get_mut(&(0, -20, 0))
+            .get_mut(&(DimId::Overworld, (0, -20, 0)))
             .unwrap()
         {
             f.insert(
@@ -25233,7 +25233,7 @@ mod mineshaft_runtime_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .get_mut(&(0, -20, 0))
+            .get_mut(&(DimId::Overworld, (0, -20, 0)))
             .unwrap()
         {
             f.insert(
@@ -25261,7 +25261,7 @@ mod mineshaft_runtime_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .contains_key(&(0, -20, 0)));
+            .contains_key(&(DimId::Overworld, (0, -20, 0))));
     }
 
     #[test]
@@ -25924,7 +25924,7 @@ mod mineshaft_runtime_tests {
             ] {
                 let tag = gen
                     .spawners
-                    .get_mut(&pos)
+                    .get_mut(&(DimId::Overworld, pos))
                     .expect("materialized spawner NBT");
                 let spawn_id = tag
                     .get("SpawnData")
@@ -26691,13 +26691,7 @@ mod p8a_parity_tests {
             )
         };
         let prev_ow = p8a_lock(chests()).insert(key_ow, HashMap::new());
-        let mut state = LiveRedstoneState {
-            comparator_outputs: BTreeMap::new(),
-            torches: BTreeMap::new(),
-            ticks: BinaryHeap::new(),
-            pending: BTreeMap::new(),
-            sequence: 0,
-        };
+        let mut state = LiveRedstoneState::default();
         // Three full stacks in 27 slots: floor(14 * (3 / 27)) + 1 = 2.
         let nether_signal = {
             let world = LiveRedstoneWorld {
@@ -26892,7 +26886,7 @@ mod p8a_parity_tests {
 #[cfg(all(test, megu_vanilla_data))]
 mod w3_live_wire_tests {
     use super::*;
-    use std::collections::{BTreeMap, BinaryHeap};
+    use std::collections::BTreeMap;
     use std::env;
 
     /// Records an overlay block write so the original cell (set or absent)
@@ -26952,13 +26946,7 @@ mod w3_live_wire_tests {
     }
 
     fn empty_redstone_state() -> LiveRedstoneState {
-        LiveRedstoneState {
-            comparator_outputs: BTreeMap::new(),
-            torches: BTreeMap::new(),
-            ticks: BinaryHeap::new(),
-            pending: BTreeMap::new(),
-            sequence: 0,
-        }
+        LiveRedstoneState::default()
     }
 
     /// Runs one `game_tick` but only the named stage — proof the stage is

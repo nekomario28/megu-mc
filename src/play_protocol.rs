@@ -22790,7 +22790,7 @@ mod p5c_live_tests {
         fn mining_client(
             name: &str,
             eid: i32,
-            gm: i64,
+            gm: u8,
             item: i64,
             comps: Vec<(i64, Vec<u8>)>,
         ) -> (Arc<Client>, std::net::TcpStream) {
