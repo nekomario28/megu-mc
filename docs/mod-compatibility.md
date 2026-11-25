@@ -11,6 +11,66 @@ promise that any given mod runs. The tier model (`Native` / `Data+Bundle` /
 [mod-author-guide.md](mod-author-guide.md); this page covers the mechanics
 underneath them.
 
+## Compatibility tier taxonomy (L0–L5)
+
+The six rungs below are the **capability ladder** this project classifies,
+reports and reasons about; they sit underneath the per-mod verdicts that
+`megu-mod-check` emits. Every subsystem in this tree occupies exactly one
+rung **today** — the status column is the honest current state, not a
+roadmap promise.
+
+| Tier | Name | What it means | Status today |
+|---|---|---|---|
+| `L0` | Metadata Discovery | Reading a mod without executing anything: loader manifests, dependency and version ranges, Jar-in-Jar nesting, Mixin site inventory, modpack files (`.mrpack` / CurseForge manifest). | **Shipped.** [`class_mixin_scanner`](../mod-adapter-core/src/class_mixin_scanner.rs), [`loader_extensions`](../mod-adapter-core/src/loader_extensions.rs), [`dep_resolver`](../mod-adapter-core/src/dep_resolver.rs) and [`modpack`](../mod-adapter-core/src/modpack.rs) parse JAR/modpack metadata with fail-closed bounds (§1). |
+| `L1` | Data / Asset / Recipe / Tag Parity | Declarative documents a mod ships are read and applied natively: recipes, tags, loot modifiers, dimensions, worldgen JSON on the server; blockstates, models, textures, recipe docs on the client. | **Shipped for standard data forms.** [`unified_tags`](../mod-adapter-core/src/unified_tags.rs) (§2), [`data_loader`](../mod-adapter-core/src/data_loader.rs), [`recipe_conflict_unify`](../mod-adapter-core/src/recipe_conflict_unify.rs), and the client-side [`recipe_ingest`](../client-gpu/src/recipe_ingest.rs) / [`vanilla_jar`](../client-gpu/src/vanilla_jar.rs) asset layers. Unknown data documents are preserved (§5) but not interpreted. |
+| `L2` | Native Rust Adapter Parity | A dedicated Rust adapter reproduces a mod's runtime behaviour without any JVM — the flagship is Create (kinetics, contraptions, addon profiles, Aeronautics sub-worlds). | **Shipped for the Create family and authored adapters.** [`create-adapter`](../create-adapter/src/lib.rs) + [`addon_profile`](../create-adapter/src/addon_profile.rs), declarative `megu-mod-bundle/1` bundles, and the culinary/Farmer's-Delight-style adapters. Arbitrary mods need an authored adapter or bundle; nothing is automatic. |
+| `L3` | Java/NeoForge Event & Capability API Parity | The event and capability surface a JVM mod codes against is re-implemented in Rust: item/fluid/energy transfer capabilities, NeoForge event batches, lifting supported `@Inject` sites to native events. | **Partial.** [`capability_bus`](../mod-adapter-core/src/capability_bus.rs) (§3) models the transfer APIs end to end; [`neoforge_wire`](../mod-adapter-core/src/neoforge_wire.rs) and [`mixin_lifter`](../mod-adapter-core/src/mixin_lifter.rs) lift the supported injection subset. Everything else classifies down — never emulated. |
+| `L4` | Bytecode / Mixin Runtime Compatibility | Executing mod bytecode itself: clean-room `.class` parsing, an allowlisted subset VM, and a quarantined WASM/native mod runtime with rollback. | **Partial by design.** [`class_mixin_scanner`](../mod-adapter-core/src/class_mixin_scanner.rs) parses JVMS §4, [`bytecode_subset_vm`](../mod-adapter-core/src/bytecode_subset_vm.rs) executes only the statically verified allowlist with a fuel cap, [`mod_isolation`](../mod-adapter-core/src/mod_isolation.rs) quarantines faults per mod. `@Redirect` / `@Overwrite`, reflection, access transformers and arbitrary bytecode are hard rejections. |
+| `L5` | Multi-Modpack Composition & Save Round-Trip | Many mods and whole modpacks at once, and a world that safely survives adding / removing / updating them: namespace tombstones, verbatim NBT preservation, verified snapshots before mutation, hashed mod sync, per-server isolation. | **Shipped for preservation** (§4, §5); full behavioural composition of an arbitrary modpack is not promised — each mod still has to satisfy its own tier. |
+
+Tier mapping to `megu-mod-check`: `L0`–`L1` are the input analysis behind
+Tier 0/1 verdicts, `L2` is what a Tier 0 adapter or Tier 1 bundle runs on,
+`L3` is the Tier 2 lifted-shim surface, `L4` is the Tier 2 ↔ Tier 3
+boundary (what the subset VM may execute vs. what must be delegated), and
+`L5` is the cross-tier guarantee every path above leans on.
+
+## Fail-closed unsupported-mod contract
+
+When a mod needs something this tree does not implement — an un-liftable
+Mixin, `@Redirect` / `@Overwrite`, an access transformer, an unknown
+capability type, arbitrary bytecode — Megu **refuses or quarantines; it
+never silently skips.**
+
+Why skipping is worse than refusing: the world format is shared with real
+NeoForge/Fabric servers. If Megu pretended an unsupported mod loaded while
+not running its hooks, every write to that mod's blocks, entities and
+attachments would silently drop or mis-handle state — items would behave
+wrong, block entities would save garbage, and a world handed back to a real
+server would be inconsistent. A crash is recoverable; a world that is
+silently corrupt but looks fine is not. So the contract is:
+
+1. **Classify first.** Pre-flight reports the exact reason a mod cannot run
+   (`megu-mod-check` exit `2` = `tier3_fallback_required`), never a vague
+   failure.
+2. **Refuse to start without it.** The server / modpack pre-flight fails
+   with the reason instead of booting with the mod missing.
+3. **No partial execution.** A mod either runs inside a tier it fully
+   satisfies, or its whole activation is blocked — no half-applied Mixin
+   sets.
+4. **Quarantine at runtime.** A running mod that traps, exhausts its WASM
+   fuel, exceeds its memory cap, makes a disallowed host call, or misses
+   its tick deadline is quarantined alone
+   ([`ModQuarantineSupervisor`](../mod-adapter-core/src/mod_isolation.rs))
+   while the world and every healthy mod keep running, with a
+   content-addressed rollback snapshot
+   ([`WorldTimeMachine`](../mod-adapter-core/src/mod_isolation.rs)).
+5. **Mutations stay reversible.** The world's bytes are never touched by an
+   un-verified mod: preservation primitives (§5) plus verified snapshots
+   before every mutation make each change undoable.
+
+The trade-off is explicit: fewer mods run than a loader that skips and
+hopes, but none of them can corrupt a world.
+
 ## 1. Recursive Jar-in-Jar
 
 Mods that embed other mods (Create addons, libraries, loader shims) declare
@@ -211,6 +271,27 @@ is normally one-way data loss. Megu keeps the bytes:
 - The capability bus models item/fluid/energy transfer. Mods that depend on
   other Forge capability types need those reached through data or a dedicated
   adapter.
+
+## Build features (root `Cargo.toml`)
+
+The root `megu` package gates mod interop behind opt-in Cargo features; the
+default build keeps the vanilla-only dependency graph. Every feature is
+listed here because `tools/docs_sync_audit.py --strict` proves this section
+never goes stale: each `[features]` entry in the root
+[`Cargo.toml`](../Cargo.toml) must appear on this page.
+
+| feature | enables | pulls in |
+|---|---|---|
+| `native-oracle` | CI-only Java fixtures: the pinned clean-room probes that run the 1.21.1 jar (`tools/structure-oracle/`, the `p1-native-oracle` workflow). Tests hard-fail without the native files. | nothing extra |
+| `java-compat` | JNI bridge to one pinned JVM owner ([`src/java_compat.rs`](../src/java_compat.rs)) for the guarded Fabric/NeoForge probes (`src/landing.rs`). | optional `jni` dependency |
+| `fabric-probe` | Fabric-flavoured Java-side probe set used by compat validation (`cargo check --locked --features fabric-probe` in CI). | `java-compat` |
+| `neoforge-events` | NeoForge event-surface batches (S3/S4 payload codecs in [`src/play_protocol.rs`](../src/play_protocol.rs) and [`src/java_compat.rs`](../src/java_compat.rs)) that back the Tier-2 lift validation. | `java-compat` |
+| `create-offload` | Production bridge to the mod adapters ([`src/mod_offload_bridge.rs`](../src/mod_offload_bridge.rs), `include!`d behind this cfg). | optional path deps `mod-adapter-core`, `create-adapter` |
+| `mod-suite` | Full live root integration ([`src/live_mod_bridge.rs`](../src/live_mod_bridge.rs), every symbol inside `#[cfg]`-gated). | all four optional path deps: `mod-adapter-core`, `create-adapter`, `mod-offload`, `megu-state-store` |
+
+`java-compat`, `fabric-probe`, `neoforge-events` and `native-oracle` are
+opt-in Java-side paths; production servers ship without a JVM unless the
+operator enables one of them.
 
 ## See also
 

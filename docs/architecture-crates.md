@@ -65,6 +65,72 @@ megu (root)          → megu-core, megu-server-files,
 `?` denotes an optional dependency. `create-offload` enables the two adapter
 crates; `mod-suite` enables all four optional in-tree dependencies.
 
+## Root-crate modularization & state-ownership roadmap (A09/A10)
+
+The root `megu` package's two largest files — `src/main.rs`
+(1,141,882 bytes, 28,334 lines) and `src/play_protocol.rs` (1,098,607
+bytes, 25,750 lines), measured at `origin/main` 1e820ca9 — each exceed
+1 MB and hold startup, ticking, packet dispatch, simulation and gameplay
+together. The plan is a **staged boundary decomposition, never a
+big-bang rewrite**: behaviour stays byte-for-byte identical at every
+stage, and a stage ships only when every gate
+(`bash tests/verify.sh`, `bash tools/layers_check.sh`,
+`bash tools/debt_ratchet.sh`) is green.
+
+### Target domains
+
+Twelve strict-visibility domains, each with a single state owner:
+
+| domain | owns (today's homes) | destination |
+|---|---|---|
+| `core` | canonical version constants, validated `ResourceLocation`, Java-exact RNG, `Mth` math | `core/` (already standalone) |
+| `protocol` | protocol IR, versioned packet tables, the 767 codec | `proto/` (already standalone); the root packet-dispatch glue joins it |
+| `network` | socket ingress, connection limits, compression, chunk ack, disconnect bookkeeping | new domain, extracted from `src/main.rs` / `src/play_protocol.rs` |
+| `world` | block registry, chunk state, dimension state, block-entity lookup | `state-store` + a new `world` domain |
+| `simulation` | tick scheduling, due machines, entity/block tick drivers | new domain, extracted from `src/main.rs` / `src/tick_queue.rs` |
+| `worldgen` | density functions, noise, carvers, features, structure templates | already one `policy.json` layer; becomes a `worldgen` crate |
+| `gameplay` | menus, items, combat, fishing, redstone, raids, villager logic | new domain |
+| `persistence` | Anvil I/O, NBT, Save v2, tick persistence, snapshots | `state-store` + a new `persistence` domain |
+| `mod-runtime` | `java_compat`, `landing`, the live mod bridge, capability-bus wiring | new domain |
+| `client-ui` | draw lists, screens, layout | `client-ui/` (already standalone) |
+| `client-render` | meshing, GPU pipeline, shaderpacks | `client-port/` + `client-gpu/` (already standalone) |
+| `server-app` | `main`, CLI, orchestration; no domain logic of its own | thin composition root at `src/main.rs` |
+
+### Enforcement, today and at each stage
+
+`tools/layers_check.sh` reads
+[`evidence/foundation/module-layers/policy.json`](../evidence/foundation/module-layers/policy.json)
+as the single source of truth for allowed dependency directions — its 11
+layers already pin the source-level module graph of `src/`
+(fail-closed, expansion-projected; see
+[docs/development.md](development.md) 「ソースの歩き方」). The roadmap moves
+those layers from flat `src/` files into domain crates one stage at a time:
+
+1. **Stage 0 — freeze current boundaries.** `policy.json` stays the only
+   accepted dependency model; a new cross-layer edge fails `layers_check.sh`
+   before review.
+2. **Stage 1 — visibility slicing.** Tighten `pub(crate)` /
+   `pub(in crate::…)` inside `src/` so the policy layers become enforced
+   *visibility* boundaries, not just an audit table. No file moves.
+3. **Stage 2 — leaf-domain extraction.** Move pure leaf domains
+   (`worldgen`, `simulation`, `persistence`) into crates once their imports
+   are already one-directional per `policy.json`. `include!` may stay as an
+   interim bridge, with a hard rule: an `include!`d file may not import
+   from outside its target domain.
+4. **Stage 3 — protocol/network split.** `src/play_protocol.rs` splits into
+   packet dispatch (protocol) and connection/ingress (network); state
+   ownership moves with the code, one function at a time.
+5. **Stage 4 — composition root.** `src/main.rs` shrinks to the `server-app`
+   wiring layer; every domain crate is a strict-visibility package and the
+   `policy.json` DAG is enforced structurally by the compiler, with
+   `layers_check.sh` still auditing the edges.
+
+State-ownership rule for every stage: a domain owns its state types,
+mutation goes through the owning domain's API, and cross-domain reads are
+snapshot/handle-based. The ratchets stay the acceptance test — a stage that
+changes any behaviour number, save-format byte, or packet byte is rejected,
+not shipped.
+
 ## Standalone crates, not a workspace
 
 There is deliberately no `[workspace]` table. Each crate is an
