@@ -3918,10 +3918,8 @@ mod anvil_io_transaction_tests {
     use super::*;
 
     fn anvil_tmp_dir(tag: &str) -> std::path::PathBuf {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after Unix epoch")
-            .as_nanos();
+        static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "megu-anvil-{tag}-{}-{nonce}",
             std::process::id()
