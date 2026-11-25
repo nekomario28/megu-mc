@@ -1909,9 +1909,19 @@ fn gen_desert_well(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
         (p.0, p.1, p.2 - 1),
     ];
     let i1 = rng.next_bound(shaft.len() as i32) as usize;
-    ctx.set(shaft[i1].0, shaft[i1].1 + 1, shaft[i1].2, suspicious);
+    let first = (shaft[i1].0, shaft[i1].1 + 1, shaft[i1].2);
+    ctx.set(first.0, first.1, first.2, suspicious);
+    ctx.push_brushable(first, "minecraft:archaeology/desert_well", Some(feature_block_pos_as_long(first)));
     let i2 = rng.next_bound(shaft.len() as i32) as usize;
-    ctx.set(shaft[i2].0, shaft[i2].1 + 2, shaft[i2].2, suspicious);
+    let second = (shaft[i2].0, shaft[i2].1 + 2, shaft[i2].2);
+    ctx.set(second.0, second.1, second.2, suspicious);
+    ctx.push_brushable(second, "minecraft:archaeology/desert_well", Some(feature_block_pos_as_long(second)));
+}
+
+fn feature_block_pos_as_long((x, y, z): (i32, i32, i32)) -> i64 {
+    ((i64::from(x) & 0x3FF_FFFF) << 38)
+        | ((i64::from(z) & 0x3FF_FFFF) << 12)
+        | (i64::from(y) & 0xFFF)
 }
 
 /// `minecraft:root_system` (`edg`). Obfuscated letters resolved in the official
@@ -9347,7 +9357,13 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                         // RandomizableContainer.setBlockEntityLootTable consumes
                         // nextLong only if the chest block entity exists.
                         if reg.block_id_of(ctx.get(cx, pos.1, cz)) == Some(ft.chest_bid) {
-                            let _loot_seed = rng.next_i64();
+                            let loot_seed = rng.next_i64();
+                            ctx.push_loot_container(
+                                (cx, pos.1, cz),
+                                crate::generation_payload::ContainerKind::Chest,
+                                "minecraft:chests/simple_dungeon".to_owned(),
+                                Some(loot_seed),
+                            );
                         }
                         break;
                     }
@@ -9358,7 +9374,14 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             // MonsterRoomFeature.randomEntityId is called only with a spawner
             // entity present. A protected centre must not consume this draw.
             if reg.block_id_of(ctx.get(pos.0, pos.1, pos.2)) == Some(ft.spawner_bid) {
-                let _mob = rng.next_bound(4);
+                let mob = rng.next_bound(4) as usize;
+                let mob_id = [
+                    "minecraft:skeleton",
+                    "minecraft:zombie",
+                    "minecraft:zombie",
+                    "minecraft:spider",
+                ][mob];
+                ctx.push_spawner(pos, mob_id);
             }
         }
         Cf::Fallen { trunk } => {

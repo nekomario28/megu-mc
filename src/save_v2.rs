@@ -2219,10 +2219,19 @@ fn save_world_into(f: &mut Vec<u8>) {
 fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompanionSlots>) {
     let world_spawn = saved_value(&WORLD_SPAWN);
     let spawn_pitch = saved_value(&WORLD_SPAWN_PITCH);
-    let (pending, sources, spider_flags) = worldgen::with_gen(|g| (
-        g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
-    )).unwrap_or_default();
-    materialize_generation_payloads_inner(pending);
+    let mut sources = HashSet::new();
+    let mut spider_flags = HashSet::new();
+    for dim in DimId::ALL {
+        if let Some((pending, dim_sources, dim_flags)) = worldgen::with_gen_dim(dim, |g| (
+            g.take_staged_payloads(), g.payload_sources.clone(), g.mineshaft_spawners.clone()
+        )) {
+            materialize_generation_payloads_for_dim(dim, pending);
+            if dim == DimId::Overworld {
+                sources = dim_sources;
+                spider_flags = dim_flags;
+            }
+        }
+    }
     let mut content = generated_content().lock().unwrap_or_else(|e| e.into_inner()).clone();
     {
         let ch = chests().lock().unwrap_or_else(|e| e.into_inner());

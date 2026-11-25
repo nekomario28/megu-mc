@@ -7174,13 +7174,16 @@ fn frame_meta_pkt(frame: &generated_content::Frame) -> Vec<u8> {
     p.push(0xff);
     p
 }
-fn generated_spawner_chunk_entities(cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
+fn generated_spawner_chunk_entities(dim: DimId, cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
     generated_content()
         .lock()
         .unwrap()
         .spawners
         .iter()
-        .filter_map(|(&pos, tag)| {
+        .filter_map(|(&(spawner_dim, pos), tag)| {
+            if spawner_dim != dim {
+                return None;
+            }
             if pos.0 >> 4 != cx || pos.2 >> 4 != cz {
                 return None;
             }
@@ -7195,8 +7198,11 @@ fn generated_spawner_chunk_entities(cx: i32, cz: i32) -> Vec<ChunkBlockEntity> {
 /// runtime, never take SAVE_LOCK from a block read holding a mob/player lock.
 fn materialize_pending_generation() {
     with_save_guard(|| {
-        let pending = worldgen::with_gen(|g| g.take_staged_payloads()).unwrap_or_default();
-        materialize_generation_payloads_inner(pending);
+        for dim in DimId::ALL {
+            let pending = worldgen::with_gen_dim(dim, |g| g.take_staged_payloads())
+                .unwrap_or_default();
+            materialize_generation_payloads_for_dim(dim, pending);
+        }
     });
 }
 fn generated_content() -> &'static Mutex<generated_content::Content> {
@@ -7222,6 +7228,15 @@ fn materialize_generation_payloads_inner(
         crate::generation_payload::GenerationPayload,
     )>,
 ) {
+    materialize_generation_payloads_for_dim(DimId::Overworld, staged);
+}
+fn materialize_generation_payloads_for_dim(
+    dim: DimId,
+    staged: Vec<(
+        (i32, i32, i32),
+        crate::generation_payload::GenerationPayload,
+    )>,
+) {
     for (pos, payload) in staged {
         match payload {
             crate::generation_payload::GenerationPayload::LootContainer {
@@ -7236,7 +7251,7 @@ fn materialize_generation_payloads_inner(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(
-                        ow_block(pos),
+                        (dim, pos.0, pos.1, pos.2),
                         PendingBlockLoot {
                             kind,
                             loot_table,
@@ -7268,14 +7283,14 @@ fn materialize_generation_payloads_inner(
                 match kind {
                     ContainerKind::Chest | ContainerKind::BlockContainer(_) => {
                         let mut store = chests().lock().unwrap_or_else(|e| e.into_inner());
-                        let entry = store.entry(ContainerKey::ow(pos)).or_default();
+                        let entry = store.entry(ContainerKey::at(dim, pos)).or_default();
                         for (slot, stack) in container_slots {
                             entry.insert(slot, stack);
                         }
                     }
                     ContainerKind::Furnace => {
                         let mut store = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                        let furnace = store.entry(ow_block(pos)).or_insert(Furnace {
+                        let furnace = store.entry((dim, pos.0, pos.1, pos.2)).or_insert(Furnace {
                             input: (0, 0, Vec::new()),
                             fuel: (0, 0, Vec::new()),
                             output: (0, 0, Vec::new()),
@@ -7295,7 +7310,7 @@ fn materialize_generation_payloads_inner(
                             }
                         }
                         furnace.dirty = true;
-                        wake_furnace_at(DimId::Overworld, pos.0, pos.1, pos.2);
+                        wake_furnace_at(dim, pos.0, pos.1, pos.2);
                     }
                 }
             }
@@ -7303,7 +7318,7 @@ fn materialize_generation_payloads_inner(
                 // The one-shot flag cannot reconstruct this block after cache
                 // eviction. Preserve it in the world, but never undo a user edit.
                 let state = name_to_state("spawner").unwrap();
-                let key = (DimId::Overworld, pos.0 >> 4, pos.2 >> 4);
+                let key = (dim, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
                     .write(&key)
                     .entry(key)
@@ -7315,13 +7330,13 @@ fn materialize_generation_payloads_inner(
                         .lock()
                         .unwrap()
                         .spawners
-                        .entry(pos)
+                        .entry((dim, pos))
                         .or_insert_with(|| generated_content::spawner_nbt(pos));
                 }
             }
             crate::generation_payload::GenerationPayload::SpawnerEntity(entity_id) => {
                 let state = name_to_state("spawner").unwrap();
-                let key = (DimId::Overworld, pos.0 >> 4, pos.2 >> 4);
+                let key = (dim, pos.0 >> 4, pos.2 >> 4);
                 let actual = *world()
                     .write(&key)
                     .entry(key)
@@ -7333,7 +7348,7 @@ fn materialize_generation_payloads_inner(
                         .lock()
                         .unwrap()
                         .spawners
-                        .entry(pos)
+                        .entry((dim, pos))
                         .or_insert_with(|| generated_content::spawner_nbt_for(pos, &entity_id));
                 }
             }
@@ -7350,7 +7365,7 @@ fn materialize_generation_payloads_inner(
                         uuid[6] = (uuid[6] & 15) | 64;
                         uuid[8] = (uuid[8] & 63) | 128;
                         ms.push(Arc::new(Mob {
-                            dim: DimId::Overworld,
+                            dim,
                             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
                             uuid,
                             etype,
@@ -7384,7 +7399,7 @@ fn materialize_generation_payloads_inner(
                     .lock()
                     .unwrap()
                     .carts
-                    .push(generated_content::Cart::new(eid, uuid, pos, loot_seed));
+                    .push(generated_content::Cart::new_in_dim(eid, uuid, pos, loot_seed, dim));
             }
             crate::generation_payload::GenerationPayload::ItemFrame { glow, facing, item } => {
                 // A hanging entity is not a mob: `Mob` carries hit points, air and a
@@ -7402,13 +7417,14 @@ fn materialize_generation_payloads_inner(
                 uuid[6] = (uuid[6] & 15) | 64;
                 uuid[8] = (uuid[8] & 63) | 128;
                 let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                gen.frames.push(generated_content::Frame::new(
+                gen.frames.push(generated_content::Frame::new_in_dim(
                     eid,
                     uuid,
                     pos,
                     glow,
                     facing,
                     item.as_ref().map(|(id, count)| (id.as_str(), *count)),
+                    dim,
                 ));
             }
             crate::generation_payload::GenerationPayload::Sign(lines) => {
@@ -7416,7 +7432,10 @@ fn materialize_generation_payloads_inner(
                 signs()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert((DimId::Overworld, pos.0, pos.1, pos.2, 1), lines);
+                    .insert((dim, pos.0, pos.1, pos.2, 1), lines);
+            }
+            crate::generation_payload::GenerationPayload::Brushable { loot_table, loot_seed } => {
+                materialize_generated_brushable(dim, pos, &loot_table, loot_seed);
             }
         }
     }
@@ -8007,7 +8026,10 @@ fn spawner_tick() {
             .unwrap_or_else(|e| e.into_inner());
         gen.spawners
             .iter()
-            .filter(|(pos, tag)| {
+            .filter(|((spawner_dim, pos), tag)| {
+                if *spawner_dim != DimId::Overworld {
+                    return false;
+                }
                 if !region.is_hot(pos.0, pos.2) {
                     return false;
                 }
@@ -8032,7 +8054,7 @@ fn spawner_tick() {
                         <= range_sq
                 })
             })
-            .map(|(pos, tag)| (*pos, tag.clone()))
+            .map(|((_, pos), tag)| (*pos, tag.clone()))
             .collect()
     };
     if spawners_snap.is_empty() {
@@ -8055,7 +8077,7 @@ fn spawner_tick() {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for (origin, tag) in spawners_snap {
-            if let Some(slot) = gen.spawners.get_mut(&origin) {
+            if let Some(slot) = gen.spawners.get_mut(&(DimId::Overworld, origin)) {
                 *slot = tag;
             }
         }
@@ -11265,7 +11287,7 @@ fn set_block_if_inner_dim(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .spawners
-            .remove(&(x, y, z));
+            .remove(&(dim, (x, y, z)));
     }
     // The band is a write-through view of the chunk, not an invalidated one: a leaf tick
     // writes every tick, so invalidating would rebuild a whole band per write (14 ms).
@@ -17556,7 +17578,7 @@ fn heightmaps_nbt_dim(tops: &[i32; 256], ws_tops: &[i32; 256], min_y: i32) -> Ve
 /// and validated against:
 /// 1. the 3x3 `chunk_version_dim` tuple (catches block/torch/lava edits in the chunk or
 ///    any of its 8 neighbors),
-/// 2. `map_chunk_sig(dim, cx, cz, gen)` (catches sign text edits, Overworld spawner
+/// 2. `map_chunk_sig(dim, cx, cz, gen)` (catches sign text edits, dimension-keyed spawner
 ///    changes, and differing neighbor generated-emitter sets in `gen`).
 ///
 /// The entry also retains the chunk's own generated emitters (`own_emitters`) so a cache
@@ -17626,7 +17648,7 @@ fn chunk_versions_3x3(dim: DimId, cx: i32, cz: i32) -> [u64; 9] {
 }
 
 /// Order-independent FNV-1a signature of the chunk's non-versioned payload inputs:
-/// signs in the chunk, Overworld generated spawners (pos + NBT), the settled
+/// signs and dimension-keyed generated spawners (position + NBT), the settled
 /// light revision — or, while light is unsettled, the 8 neighbor chunks'
 /// generated emitters in `gen`, which the fallback light arrays still read.
 fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
@@ -17651,19 +17673,17 @@ fn map_chunk_sig(dim: DimId, cx: i32, cz: i32, gen: &GenSources) -> u64 {
     }
     let mut spawner_acc = 0u64;
     let mut spawner_count = 0u64;
-    if dim == DimId::Overworld {
-        for ((px, py, pz), ty, nbt) in generated_spawner_chunk_entities(cx, cz) {
-            let mut h = OFFSET;
-            for v in [px, py, pz] {
-                h = (h ^ v as u64).wrapping_mul(PRIME);
-            }
-            h = (h ^ ty as u64).wrapping_mul(PRIME);
-            for &b in &nbt {
-                h = (h ^ b as u64).wrapping_mul(PRIME);
-            }
-            spawner_acc = spawner_acc.wrapping_add(h);
-            spawner_count += 1;
+    for ((px, py, pz), ty, nbt) in generated_spawner_chunk_entities(dim, cx, cz) {
+        let mut h = OFFSET;
+        for v in [px, py, pz] {
+            h = (h ^ v as u64).wrapping_mul(PRIME);
         }
+        h = (h ^ ty as u64).wrapping_mul(PRIME);
+        for &b in &nbt {
+            h = (h ^ b as u64).wrapping_mul(PRIME);
+        }
+        spawner_acc = spawner_acc.wrapping_add(h);
+        spawner_count += 1;
     }
     let mut h = OFFSET;
     let settled = settled_live_light(dim, cx, cz);
@@ -17929,17 +17949,12 @@ fn build_map_chunk_lane(
             ((x, y, z), 7i64, n)
         })
         .collect();
-    // The spawner table holds Overworld positions only. Filing a Nether/End chunk with an
-    // Overworld spawner at the same coordinates would send a block entity the client cannot
-    // place there.
-    if dim == DimId::Overworld {
-        let hide_buried = anti_xray_enabled();
-        be.extend(
-            generated_spawner_chunk_entities(cx, cz)
-                .into_iter()
-                .filter(|&((x, y, z), _, _)| !hide_buried || block_exposed_dim(dim, x, y, z)),
-        );
-    }
+    let hide_buried = anti_xray_enabled();
+    be.extend(
+        generated_spawner_chunk_entities(dim, cx, cz)
+            .into_iter()
+            .filter(|&((x, y, z), _, _)| !hide_buried || block_exposed_dim(dim, x, y, z)),
+    );
     // Occluded lane: stronghold chests, spawners and buried bases must not leak
     // through block-entity NBT either — everything under the ceiling is dropped.
     if let Some(ceil) = occlude_ceil_y {
@@ -24470,7 +24485,7 @@ mod mineshaft_runtime_tests {
             generated_content()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .spawners[&(0, -20, 0)]
+                .spawners[&(DimId::Overworld, (0, -20, 0))]
                 .get("Delay")
                 .and_then(|t| match t {
                     crate::nbt::Tag::Short(v) => Some(*v),
@@ -24485,7 +24500,7 @@ mod mineshaft_runtime_tests {
             generated_content()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .spawners[&(0, -20, 0)]
+                .spawners[&(DimId::Overworld, (0, -20, 0))]
                 .get("Delay")
                 .and_then(|t| match t {
                     crate::nbt::Tag::Short(v) => Some(*v),
@@ -24537,7 +24552,7 @@ mod mineshaft_runtime_tests {
         let reset_delay = generated_content()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .spawners[&(0, -20, 0)]
+            .spawners[&(DimId::Overworld, (0, -20, 0))]
             .get("Delay")
             .and_then(|t| match t {
                 crate::nbt::Tag::Short(v) => Some(*v),
@@ -24592,7 +24607,7 @@ mod mineshaft_runtime_tests {
             generated_content()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .spawners[&(0, -20, 0)]
+                .spawners[&(DimId::Overworld, (0, -20, 0))]
                 .get("Delay")
                 .and_then(|t| match t {
                     crate::nbt::Tag::Short(v) => Some(*v),
@@ -24635,7 +24650,7 @@ mod mineshaft_runtime_tests {
             generated_content()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .spawners[&(0, -20, 0)]
+                .spawners[&(DimId::Overworld, (0, -20, 0))]
                 .get("Delay")
                 .and_then(|t| match t {
                     crate::nbt::Tag::Short(v) => Some(*v),
@@ -24684,7 +24699,7 @@ mod mineshaft_runtime_tests {
         let cap_delay = generated_content()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .spawners[&(0, -20, 0)]
+            .spawners[&(DimId::Overworld, (0, -20, 0))]
             .get("Delay")
             .and_then(|t| match t {
                 crate::nbt::Tag::Short(v) => Some(*v),
@@ -25090,6 +25105,148 @@ mod mineshaft_runtime_tests {
             reloaded[1].uuid().unwrap(),
             "two frames keep distinct identities"
         );
+    }
+
+    #[test]
+    fn generated_payloads_materialize_in_their_dimension() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        let chest = crate::generation_payload::GenerationPayload::LootContainer {
+            kind: crate::generation_payload::ContainerKind::Chest,
+            loot_table: "minecraft:chests/nether_bridge".to_owned(),
+            loot_seed: Some(31),
+        };
+        let blaze = crate::generation_payload::GenerationPayload::SpawnerEntity(
+            "minecraft:blaze".to_owned(),
+        );
+        materialize_generation_payloads_for_dim(
+            DimId::Nether,
+            vec![((0, 64, 0), chest), ((1, 64, 0), blaze)],
+        );
+        materialize_generation_payloads_for_dim(
+            DimId::Overworld,
+            vec![(
+                (3, 64, 0),
+                crate::generation_payload::GenerationPayload::SpawnerEntity(
+                    "minecraft:zombie".to_owned(),
+                ),
+            )],
+        );
+        let end_payloads = vec![
+            (
+                (0, 64, 0),
+                crate::generation_payload::GenerationPayload::LootContainer {
+                    kind: crate::generation_payload::ContainerKind::Chest,
+                    loot_table: "minecraft:chests/end_city_treasure".to_owned(),
+                    loot_seed: Some(32),
+                },
+            ),
+            (
+                (1, 64, 0),
+                crate::generation_payload::GenerationPayload::Entity {
+                    id: "minecraft:shulker".to_owned(),
+                    pos: [1.5, 64.5, 0.5],
+                    yaw: 0.0,
+                },
+            ),
+            (
+                (4, 64, 0),
+                crate::generation_payload::GenerationPayload::SpawnerEntity(
+                    "minecraft:shulker".to_owned(),
+                ),
+            ),
+            (
+                (2, 64, 0),
+                crate::generation_payload::GenerationPayload::ItemFrame {
+                    glow: false,
+                    facing: 4,
+                    item: Some(("minecraft:elytra".to_owned(), 1)),
+                },
+            ),
+        ];
+        materialize_generation_payloads_for_dim(DimId::End, end_payloads);
+
+        let loot = pending_block_loot().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(loot.contains_key(&(DimId::Nether, 0, 64, 0)));
+        assert!(loot.contains_key(&(DimId::End, 0, 64, 0)));
+        assert!(!loot.contains_key(&(DimId::Overworld, 0, 64, 0)));
+        drop(loot);
+        let inventories = chests().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(inventories.contains_key(&ContainerKey::at(DimId::Nether, (0, 64, 0))));
+        assert!(inventories.contains_key(&ContainerKey::at(DimId::End, (0, 64, 0))));
+        assert!(!inventories.contains_key(&ContainerKey::ow((0, 64, 0))));
+        drop(inventories);
+        let generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(generated.spawners.contains_key(&(DimId::Nether, (1, 64, 0))));
+        assert!(generated.spawners.contains_key(&(DimId::Overworld, (3, 64, 0))));
+        assert!(generated.spawners.contains_key(&(DimId::End, (4, 64, 0))));
+        assert!(!generated.spawners.contains_key(&(DimId::Overworld, (1, 64, 0))));
+        assert_eq!(generated.frames.len(), 1);
+        assert_eq!(generated.frames[0].dim(), DimId::End);
+        drop(generated);
+        assert!(generated_spawner_chunk_entities(DimId::Nether, 0, 0)
+            .iter()
+            .any(|(pos, _, _)| *pos == (1, 64, 0)));
+        assert!(generated_spawner_chunk_entities(DimId::End, 0, 0)
+            .iter()
+            .any(|(pos, _, _)| *pos == (4, 64, 0)));
+        assert!(!generated_spawner_chunk_entities(DimId::Overworld, 0, 0)
+            .iter()
+            .any(|(pos, _, _)| *pos == (1, 64, 0)));
+        assert!(mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+            mob.dim == DimId::End && mob.etype == name_to_etype("shulker").unwrap()
+        }));
+        let brushable_pos = (6, 64, 0);
+        materialize_generation_payloads_for_dim(
+            DimId::End,
+            vec![(brushable_pos, crate::generation_payload::GenerationPayload::Brushable {
+                loot_table: "minecraft:archaeology/trail_ruins_rare".to_owned(),
+                loot_seed: Some(903),
+            })],
+        );
+
+        let mut saved = Vec::new();
+        save_world_into(&mut saved);
+        *generated_content().lock().unwrap_or_else(|e| e.into_inner()) =
+            generated_content::Content::default();
+        live_block_entities().lock().unwrap_or_else(|e| e.into_inner()).entries.clear();
+        load_world_from(&saved).expect("generated payload save reload");
+        let generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        for key in [
+            (DimId::Overworld, (3, 64, 0)),
+            (DimId::Nether, (1, 64, 0)),
+            (DimId::End, (4, 64, 0)),
+        ] {
+            assert!(generated.spawners.contains_key(&key), "spawner {key:?} survives reload");
+        }
+        assert!(generated.frames.iter().any(|frame| frame.dim() == DimId::End));
+        drop(generated);
+        assert_eq!(
+            generated_brushable_loot_table(DimId::End, brushable_pos).as_deref(),
+            Some("minecraft:archaeology/trail_ruins_rare")
+        );
+    }
+
+    #[test]
+    fn generated_brushable_payload_is_live_and_not_container_loot() {
+        let _guard = world_guard();
+        let _snap = RuntimeSnapshot::take();
+        let pos = (23, 70, -9);
+        materialize_generation_payloads_for_dim(
+            DimId::End,
+            vec![(pos, crate::generation_payload::GenerationPayload::Brushable {
+                loot_table: "minecraft:archaeology/ocean_ruin_cold".to_owned(),
+                loot_seed: Some(77),
+            })],
+        );
+        assert_eq!(
+            generated_brushable_loot_table(DimId::End, pos).as_deref(),
+            Some("minecraft:archaeology/ocean_ruin_cold")
+        );
+        assert!(!chests().lock().unwrap_or_else(|e| e.into_inner())
+            .contains_key(&ContainerKey::at(DimId::End, pos)));
+        assert!(!pending_block_loot().lock().unwrap_or_else(|e| e.into_inner())
+            .contains_key(&(DimId::End, pos.0, pos.1, pos.2)));
     }
 
     #[test]

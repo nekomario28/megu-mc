@@ -180,6 +180,8 @@ python3 website/check_site.py
 python3 tools/license_spdx_audit.py
 python3 tests/license_spdx_audit_test.py
 python3 tests/verify_gate_coverage_test.py
+python3 tests/payload_wiring_audit_test.py
+python3 tools/payload_wiring_audit.py --strict
 
 echo "== module layering"
 python3 tests/layers_gate_test.py

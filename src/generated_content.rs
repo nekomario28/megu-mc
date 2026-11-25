@@ -61,6 +61,9 @@ pub(crate) struct Cart {
 }
 impl Cart {
     pub fn new(eid: i32, uuid: [u8; 16], p: Pos, seed: i64) -> Self {
+        Self::new_in_dim(eid, uuid, p, seed, crate::worldgen::DimId::Overworld)
+    }
+    pub fn new_in_dim(eid: i32, uuid: [u8; 16], p: Pos, seed: i64, dim: crate::worldgen::DimId) -> Self {
         let Tag::Compound(mut data) = cart_loot_nbt(seed) else {
             unreachable!()
         };
@@ -86,10 +89,17 @@ impl Cart {
         ] {
             data.insert(NbtString::text(k), v);
         }
+        data.insert(NbtString::text("MeguDimension"), string(dim.dimension_id()));
         Self {
             eid,
             data: Tag::Compound(data),
         }
+    }
+    pub fn dim(&self) -> crate::worldgen::DimId {
+        self.data.get("MeguDimension").and_then(Tag::string)
+            .and_then(|name| name.to_utf8().ok())
+            .and_then(|name| crate::worldgen::DimId::parse_dimension_id(&name))
+            .unwrap_or(crate::worldgen::DimId::Overworld)
     }
     pub fn uuid(&self) -> Result<[u8; 16], &'static str> {
         let Some(Tag::IntArray(v)) = self.data.get("UUID") else {
@@ -205,6 +215,17 @@ impl Frame {
         facing: u8,
         item: Option<(&str, u8)>,
     ) -> Self {
+        Self::new_in_dim(eid, uuid, p, glow, facing, item, crate::worldgen::DimId::Overworld)
+    }
+    pub fn new_in_dim(
+        eid: i32,
+        uuid: [u8; 16],
+        p: Pos,
+        glow: bool,
+        facing: u8,
+        item: Option<(&str, u8)>,
+        dim: crate::worldgen::DimId,
+    ) -> Self {
         let mut values = vec![
             (
                 "id",
@@ -240,10 +261,20 @@ impl Frame {
                 compound([("id", string(name)), ("count", Tag::Int(i32::from(count)))]),
             ));
         }
+        let mut values_tag = compound(values);
+        if let Tag::Compound(fields) = &mut values_tag {
+            fields.insert(NbtString::text("MeguDimension"), string(dim.dimension_id()));
+        }
         Self {
             eid,
-            data: compound(values),
+            data: values_tag,
         }
+    }
+    pub fn dim(&self) -> crate::worldgen::DimId {
+        self.data.get("MeguDimension").and_then(Tag::string)
+            .and_then(|name| name.to_utf8().ok())
+            .and_then(|name| crate::worldgen::DimId::parse_dimension_id(&name))
+            .unwrap_or(crate::worldgen::DimId::Overworld)
     }
     pub fn uuid(&self) -> Result<[u8; 16], &'static str> {
         let Some(Tag::IntArray(v)) = self.data.get("UUID") else {
@@ -305,7 +336,7 @@ impl Frame {
 }
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Content {
-    pub spawners: BTreeMap<Pos, Tag>,
+    pub spawners: BTreeMap<(crate::worldgen::DimId, Pos), Tag>,
     pub carts: Vec<Cart>,
     pub frames: Vec<Frame>,
 }
@@ -338,7 +369,13 @@ impl Snapshot {
         let root = compound([
             (
                 "spawners",
-                Tag::List(10, self.content.spawners.values().cloned().collect()),
+                Tag::List(10, self.content.spawners.iter().map(|(&(dim, _), tag)| {
+                    let mut tag = tag.clone();
+                    if let Tag::Compound(fields) = &mut tag {
+                        fields.insert(NbtString::text("MeguDimension"), string(dim.dimension_id()));
+                    }
+                    tag
+                }).collect()),
             ),
             (
                 "carts",
@@ -403,10 +440,18 @@ impl Snapshot {
             if !is_id(tag, "minecraft:mob_spawner") {
                 return Err("invalid generated spawner id");
             }
+            let dim = tag.get("MeguDimension").and_then(Tag::string)
+                .and_then(|name| name.to_utf8().ok())
+                .and_then(|name| crate::worldgen::DimId::parse_dimension_id(&name))
+                .unwrap_or(crate::worldgen::DimId::Overworld);
+            let mut saved_tag = tag.clone();
+            if let Tag::Compound(fields) = &mut saved_tag {
+                fields.remove(&NbtString::text("MeguDimension"));
+            }
             if out
                 .content
                 .spawners
-                .insert(position(tag)?, tag.clone())
+                .insert((dim, position(tag)?), saved_tag)
                 .is_some()
             {
                 return Err("duplicate generated spawner");
@@ -488,7 +533,10 @@ mod tests {
         if let Tag::Compound(v) = &mut tag {
             v.insert(NbtString::text("Delay"), Tag::Short(137));
         }
-        state.content.spawners.insert((7, 24, -19), tag);
+        state.content.spawners.insert(
+            (crate::worldgen::DimId::Overworld, (7, 24, -19)),
+            tag,
+        );
         state
             .content
             .carts

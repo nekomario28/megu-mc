@@ -2678,6 +2678,19 @@ fn monster_room_cells_and_rng_match_native() {
             Xor::seed(seed)
         };
         gen_cf(&Cf::MonsterRoom, freg(), &mut ctx, &mut rng, (0, 16, 0));
+        let staged_loot = ctx.payloads.iter().filter(|(_, payload)| matches!(
+            payload,
+            crate::generation_payload::GenerationPayload::LootContainer {
+                loot_table, loot_seed: Some(_), ..
+            } if loot_table == "minecraft:chests/simple_dungeon"
+        )).count();
+        let staged_spawners = ctx.payloads.iter().filter(|(_, payload)| matches!(
+            payload,
+            crate::generation_payload::GenerationPayload::SpawnerEntity(id)
+                if ["minecraft:skeleton", "minecraft:zombie", "minecraft:spider"].contains(&id.as_str())
+        )).count();
+        assert_eq!(staged_loot, ctx.wr.values().filter(|&&state| reg.name_of(state) == "minecraft:chest").count());
+        assert_eq!(staged_spawners, 1, "dungeon mob choice is staged without an extra RNG draw");
         let mut cells = Vec::new();
         let mut chests = 0;
         for (&(x, y, z), &st) in &ctx.wr {
@@ -5282,6 +5295,14 @@ fn desert_well_builds_its_shape_on_sand() {
         2,
         "exactly two suspicious-sand blocks"
     );
+    assert_eq!(ctx.payloads.len(), 2);
+    assert!(ctx.payloads.iter().all(|(_, payload)| matches!(
+        payload,
+        crate::generation_payload::GenerationPayload::Brushable {
+            loot_table,
+            loot_seed: Some(_),
+        } if loot_table == "minecraft:archaeology/desert_well"
+    )));
 }
 
 /// The sand gate is the first thing after the walk-down and precedes the feature's
@@ -5309,6 +5330,7 @@ fn desert_well_needs_sand_and_draws_nothing_otherwise() {
         Xor::seed(9).next_bound(1 << 30),
         "and draws nothing"
     );
+    assert!(ctx.payloads.is_empty());
 }
 
 /// `minecraft:iceberg` (`ecr`), config `{state}`. The shape parameters all come from

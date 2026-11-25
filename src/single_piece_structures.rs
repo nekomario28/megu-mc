@@ -1560,6 +1560,20 @@ impl DesertPyramidStructure {
         }
 
         result.loots = loots.into_values().collect();
+        for loot in &result.loots {
+            match loot.kind {
+                LootKind::Chest => ctx.push_loot_container(
+                    loot.pos,
+                    crate::generation_payload::ContainerKind::Chest,
+                    loot.table.to_owned(),
+                    Some(loot.seed),
+                ),
+                LootKind::Brushable => {
+                    ctx.push_brushable(loot.pos, loot.table, Some(loot.seed));
+                }
+                LootKind::Dispenser => {}
+            }
+        }
     }
 }
 
@@ -2354,13 +2368,9 @@ mod single_piece_tests {
         }
     }
 
-    /// The container loot a single-piece piece writes is staged into the generation payload
-    /// store, and the archaeology it also writes is not: this runtime has no brushing store, so
-    /// the `LootKind::Brushable` record has nowhere to go. Putting that table in the item store
-    /// would make a broken suspicious-sand block spill loot native never yields, which is why
-    /// the record stays unstaged (the same named gap `feature.rs` carries for `desert_well`).
+    /// Container contents and archaeology tables are staged to their respective stores.
     #[test]
-    fn single_piece_container_loot_is_staged_and_archaeology_is_not() {
+    fn single_piece_container_loot_and_archaeology_are_staged_separately() {
         let reg = breg().expect("block registry initialized");
         let dirt = reg.state_of("minecraft:dirt", None);
         let sand = reg.state_of("minecraft:sand", None);
@@ -2413,7 +2423,7 @@ mod single_piece_tests {
             );
         }
 
-        // Desert pyramid: four chests staged, and no payload for any suspicious-sand cell.
+        // Desert pyramid: four chests and brushable archaeology payloads.
         {
             let mut gen = crate::worldgen::Gen::load(303, crate::name_to_state).unwrap();
             let mut ctx = FC::new(&mut gen);
@@ -2445,19 +2455,15 @@ mod single_piece_tests {
             );
             let chests = res.loots.iter().filter(|l| l.kind == LootKind::Chest).count();
             assert_eq!(chests, 4, "four pyramid chests");
-            assert_eq!(ctx.payloads.len(), chests, "every payload is a chest");
+            assert_eq!(ctx.payloads.len(), chests + brushable.len());
             for (pos, payload) in &ctx.payloads {
-                assert!(
-                    !brushable.contains(pos),
-                    "{pos:?} is suspicious sand: archaeology has no store, so it must not be staged"
-                );
-                assert!(matches!(
-                    payload,
-                    GenerationPayload::LootContainer {
-                        kind: ContainerKind::Chest,
-                        ..
-                    }
-                ));
+                if brushable.contains(pos) {
+                    assert!(matches!(payload, GenerationPayload::Brushable { .. }));
+                } else {
+                    assert!(matches!(payload, GenerationPayload::LootContainer {
+                        kind: ContainerKind::Chest, ..
+                    }));
+                }
             }
         }
     }
