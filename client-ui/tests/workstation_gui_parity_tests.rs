@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
-use megu_client_ui::container_screen::{menu_schema, ContainerScreenState, ALL_VANILLA_MENUS};
+use megu_client_ui::container_screen::{
+    menu_schema, ContainerScreenState, MerchantOfferView, WorkstationAction, ALL_VANILLA_MENUS,
+};
 use megu_client_ui::draw::{text_height, text_width, UiCommand, UiDrawList, UiRect};
 use megu_client_ui::hud_widgets::{HudAuxiliaryState, HudSnapshot, HudWidgetsRenderer};
 
@@ -238,6 +240,207 @@ fn mount_jump_and_attack_indicators_fit_every_gui_scale() {
                         a.name,
                         b.name
                     );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn anvil_rename_focus_typing_and_backspace_emit_typed_actions() {
+    let schema = menu_schema(8).unwrap();
+    let mut state = ContainerScreenState::new(schema, 2, 3, "Anvil");
+    let field = state.rename_input_rect(854.0, 480.0).unwrap();
+    assert_eq!(state.click_at(field.x + 2, field.y + 2, 854.0, 480.0), None);
+    assert!(state.rename_focused);
+    assert_eq!(
+        state.handle_rename_char('S'),
+        Some(WorkstationAction::RenameItem("S".into()))
+    );
+    assert_eq!(
+        state.handle_rename_char('w'),
+        Some(WorkstationAction::RenameItem("Sw".into()))
+    );
+    assert_eq!(
+        state.handle_rename_backspace(),
+        Some(WorkstationAction::RenameItem("S".into()))
+    );
+    assert_eq!(
+        state.set_rename_text("Sword"),
+        Some(WorkstationAction::RenameItem("Sword".into()))
+    );
+    let mut draw = UiDrawList::new();
+    state.render(854.0, 480.0, &mut draw);
+    assert!(draw
+        .commands
+        .iter()
+        .any(|c| matches!(c, UiCommand::Text { text, .. } if text.starts_with("Sword"))));
+}
+
+#[test]
+fn beacon_selection_is_tier_gated_and_confirm_emits_selection() {
+    let schema = menu_schema(9).unwrap();
+    let mut state = ContainerScreenState::new(schema, 2, 3, "Beacon");
+    let p = state.panel_rect(854.0, 480.0);
+    let point = |x: i32, y: i32| (p.x + 4 + x + 2, p.y + 4 + y + 2);
+    let (x, y) = point(24, 54);
+    state.click_at(x, y, 854.0, 480.0);
+    assert_eq!(
+        state.beacon_primary, None,
+        "tier 1 must remain locked at pyramid level 0"
+    );
+    state.set_property(0, 3);
+    state.click_at(x, y, 854.0, 480.0);
+    assert_eq!(state.beacon_primary, Some(1));
+    let (x, y) = point(24, 108);
+    state.click_at(x, y, 854.0, 480.0);
+    assert_eq!(
+        state.beacon_secondary, None,
+        "tier 4 regeneration must remain locked at level 3"
+    );
+    state.set_property(0, 4);
+    state.click_at(x, y, 854.0, 480.0);
+    assert_eq!(state.beacon_secondary, Some(10));
+    let (x, y) = point(158, 72);
+    assert_eq!(
+        state.click_at(x, y, 854.0, 480.0),
+        Some(WorkstationAction::SetBeacon {
+            primary: Some(1),
+            secondary: Some(10)
+        })
+    );
+}
+
+#[test]
+fn merchant_sidebar_scrolls_selects_and_renders_discount_and_stock_state() {
+    let schema = menu_schema(19).unwrap();
+    let mut state = ContainerScreenState::new(schema, 2, 3, "Merchant");
+    let offers: Vec<_> = (0..10)
+        .map(|i| MerchantOfferView {
+            input1: "minecraft:emerald".into(),
+            input2: Some("minecraft:book".into()),
+            output: "minecraft:enchanted_book".into(),
+            original_cost: 20,
+            effective_cost: if i == 3 { 12 } else { 20 },
+            uses: 0,
+            max_uses: 12,
+            out_of_stock: i == 3,
+        })
+        .collect();
+    state.set_merchant_offers(offers);
+    state.scroll_merchant(3);
+    assert_eq!(state.merchant_scroll_offset, 3);
+    let p = state.panel_rect(854.0, 480.0);
+    assert_eq!(
+        state.click_at(p.x + 4 + 10, p.y + 4 + 20, 854.0, 480.0),
+        Some(WorkstationAction::SelectTrade(3))
+    );
+    assert_eq!(state.selected_trade_index, Some(3));
+    let mut draw = UiDrawList::new();
+    state.render(854.0, 480.0, &mut draw);
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::Text { text, color, .. } if text == "20>12" && *color == megu_client_ui::draw::palette::ACCENT)));
+    assert!(draw.commands.iter().any(|c| matches!(c, UiCommand::Text { text, color, .. } if text == "X" && *color == megu_client_ui::draw::palette::DANGER)));
+}
+
+#[test]
+fn all_menus_fit_and_keep_hitboxes_disjoint_at_all_requested_scales() {
+    for schema in &ALL_VANILLA_MENUS {
+        for (width, height) in RESOLUTIONS {
+            for scale in 1..=4 {
+                let mut state = ContainerScreenState::new(schema, 7, 19, schema.name);
+                if schema.menu_id == 19 {
+                    state.set_merchant_offers(
+                        (0..9)
+                            .map(|_| MerchantOfferView {
+                                input1: "minecraft:emerald".into(),
+                                input2: None,
+                                output: "minecraft:bread".into(),
+                                original_cost: 1,
+                                effective_cost: 1,
+                                uses: 0,
+                                max_uses: 12,
+                                out_of_stock: false,
+                            })
+                            .collect(),
+                    );
+                }
+                let logical_w = (width as f32 / scale as f32).ceil() as i32;
+                let logical_h = (height as f32 / scale as f32).ceil() as i32;
+                let layout = state.layout_scaled(width as f32, height as f32, scale as f32);
+                assert!(
+                    layout.panel.x >= 0
+                        && layout.panel.y >= 0
+                        && layout.panel.right() <= logical_w
+                        && layout.panel.bottom() <= logical_h,
+                    "{} panel at {}x{} scale {}",
+                    schema.name,
+                    width,
+                    height,
+                    scale
+                );
+                for slot in &layout.slots {
+                    assert!(
+                        slot.rect.x >= 0
+                            && slot.rect.y >= 0
+                            && slot.rect.right() <= logical_w
+                            && slot.rect.bottom() <= logical_h,
+                        "{} slot at scale {}",
+                        schema.name,
+                        scale
+                    );
+                }
+                for button in &layout.buttons {
+                    assert!(
+                        button.rect.x >= 0
+                            && button.rect.y >= 0
+                            && button.rect.right() <= logical_w
+                            && button.rect.bottom() <= logical_h,
+                        "{} button at scale {}",
+                        schema.name,
+                        scale
+                    );
+                    assert!(
+                        !layout.slots.iter().any(|s| overlaps(s.rect, button.rect)),
+                        "{} button {} overlaps slot at scale {}",
+                        schema.name,
+                        button.id,
+                        scale
+                    );
+                }
+                for (i, a) in layout.slots.iter().enumerate() {
+                    for b in layout.slots.iter().skip(i + 1) {
+                        assert!(
+                            !overlaps(a.rect, b.rect),
+                            "{} slots overlap at scale {}",
+                            schema.name,
+                            scale
+                        );
+                    }
+                }
+                for (i, a) in layout.buttons.iter().enumerate() {
+                    for b in layout.buttons.iter().skip(i + 1) {
+                        assert!(
+                            !overlaps(a.rect, b.rect),
+                            "{} buttons overlap at scale {}",
+                            schema.name,
+                            scale
+                        );
+                    }
+                }
+                let mut draw = UiDrawList::new();
+                state.render_scaled(width as f32, height as f32, scale as f32, &mut draw);
+                for command in &draw.commands {
+                    if let Some(rect) = command_rect(command) {
+                        assert!(
+                            rect.x >= 0
+                                && rect.y >= 0
+                                && rect.right() <= logical_w
+                                && rect.bottom() <= logical_h,
+                            "{} draw command outside at scale {}: {command:?}",
+                            schema.name,
+                            scale
+                        );
+                    }
                 }
             }
         }

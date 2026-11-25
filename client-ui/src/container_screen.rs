@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::conflict_widget::ConflictWidget;
-use crate::draw::{palette, text_height, text_width, UiColor, UiDrawList, UiRect};
+use crate::draw::{palette, text_height, text_width, UiColor, UiCommand, UiDrawList, UiRect};
 use crate::vanilla_widgets::{draw_vanilla_arrow, draw_vanilla_ghost_item};
 
 pub const VANILLA_MENU_COUNT: usize = 25;
@@ -265,7 +265,7 @@ const LECTERN_BUTTONS: &[MenuButtonDef] = &[
 const LOOM_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::dynamic(8, 68, 120, 12, "pattern")];
 const STONECUTTER_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::dynamic(8, 58, 160, 12, "recipe")];
 const CRAFTER_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::new(0, 134, 54, 24, 12, "auto")];
-const BEACON_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::new(0, 136, 80, 24, 12, "ok")];
+const BEACON_BUTTONS: &[MenuButtonDef] = &[MenuButtonDef::new(0, 158, 72, 30, 14, "Confirm")];
 const FURNACE_BARS: &[PropertyBarDef] = &[
     PropertyBarDef {
         property: 0,
@@ -755,6 +755,30 @@ pub struct ContainerLayout {
     pub tooltip: Option<UiRect>,
 }
 
+/// Typed interaction emitted by workstation-specific controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkstationAction {
+    RenameItem(String),
+    SetBeacon {
+        primary: Option<i32>,
+        secondary: Option<i32>,
+    },
+    SelectTrade(i32),
+}
+
+/// One visible merchant trade row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerchantOfferView {
+    pub input1: String,
+    pub input2: Option<String>,
+    pub output: String,
+    pub original_cost: u32,
+    pub effective_cost: u32,
+    pub uses: u32,
+    pub max_uses: u32,
+    pub out_of_stock: bool,
+}
+
 /// Deterministic container screen state and click controller.
 #[derive(Clone, Debug)]
 pub struct ContainerScreenState {
@@ -772,6 +796,13 @@ pub struct ContainerScreenState {
     /// inputs change; with fewer than two candidates it draws and
     /// accepts nothing, so a conflict-free screen is pixel-identical.
     pub conflict: ConflictWidget,
+    pub rename_text: String,
+    pub rename_focused: bool,
+    pub beacon_primary: Option<i32>,
+    pub beacon_secondary: Option<i32>,
+    pub merchant_offers: Vec<MerchantOfferView>,
+    pub merchant_scroll_offset: usize,
+    pub selected_trade_index: Option<usize>,
 }
 
 impl ContainerScreenState {
@@ -792,6 +823,13 @@ impl ContainerScreenState {
             drag_mode: None,
             hovered_slot: None,
             conflict: ConflictWidget::new(),
+            rename_text: String::new(),
+            rename_focused: false,
+            beacon_primary: None,
+            beacon_secondary: None,
+            merchant_offers: Vec::new(),
+            merchant_scroll_offset: 0,
+            selected_trade_index: None,
         }
     }
 
@@ -827,6 +865,142 @@ impl ContainerScreenState {
 
     pub fn hover(&mut self, slot: Option<usize>) {
         self.hovered_slot = slot.filter(|&s| s < self.slots.len());
+    }
+
+    pub fn set_rename_text(&mut self, text: impl Into<String>) -> Option<WorkstationAction> {
+        if self.schema.menu_id != 8 {
+            return None;
+        }
+        self.rename_text = text.into();
+        Some(WorkstationAction::RenameItem(self.rename_text.clone()))
+    }
+
+    pub fn handle_rename_char(&mut self, ch: char) -> Option<WorkstationAction> {
+        if self.schema.menu_id != 8 || !self.rename_focused || ch.is_control() {
+            return None;
+        }
+        self.rename_text.push(ch);
+        Some(WorkstationAction::RenameItem(self.rename_text.clone()))
+    }
+
+    pub fn handle_rename_backspace(&mut self) -> Option<WorkstationAction> {
+        if self.schema.menu_id != 8 || !self.rename_focused {
+            return None;
+        }
+        self.rename_text.pop();
+        Some(WorkstationAction::RenameItem(self.rename_text.clone()))
+    }
+
+    pub fn rename_input_rect(&self, viewport_w: f32, viewport_h: f32) -> Option<UiRect> {
+        (self.schema.menu_id == 8).then(|| {
+            let p = self.panel_rect(viewport_w, viewport_h);
+            UiRect::new(p.x + CONTENT_PAD + 29, p.y + CONTENT_PAD + 27, 96, 12)
+        })
+    }
+
+    pub fn set_merchant_offers(&mut self, offers: Vec<MerchantOfferView>) {
+        self.merchant_offers = offers;
+        self.merchant_scroll_offset = self
+            .merchant_scroll_offset
+            .min(self.merchant_offers.len().saturating_sub(7));
+        if self
+            .selected_trade_index
+            .is_some_and(|i| i >= self.merchant_offers.len())
+        {
+            self.selected_trade_index = None;
+        }
+    }
+
+    pub fn select_merchant_trade(&mut self, index: usize) -> Option<WorkstationAction> {
+        if self.schema.menu_id != 19 || index >= self.merchant_offers.len() {
+            return None;
+        }
+        self.selected_trade_index = Some(index);
+        Some(WorkstationAction::SelectTrade(index as i32))
+    }
+
+    pub fn scroll_merchant(&mut self, rows: i32) {
+        if self.schema.menu_id != 19 {
+            return;
+        }
+        let max_offset = self.merchant_offers.len().saturating_sub(7);
+        self.merchant_scroll_offset = (self.merchant_scroll_offset as i64 + i64::from(rows))
+            .clamp(0, max_offset as i64) as usize;
+    }
+
+    /// Route a workstation click in the coordinate space produced by `layout`.
+    pub fn click_at(
+        &mut self,
+        x: i32,
+        y: i32,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Option<WorkstationAction> {
+        if self.schema.menu_id == 8 {
+            let r = self.rename_input_rect(viewport_w, viewport_h)?;
+            if r.contains(x, y) {
+                self.rename_focused = true;
+                return None;
+            }
+            self.rename_focused = false;
+        }
+        if self.schema.menu_id == 9 {
+            let panel = self.panel_rect(viewport_w, viewport_h);
+            let lx = x - panel.x - CONTENT_PAD;
+            let ly = y - panel.y - CONTENT_PAD;
+            let level = self.property(0).clamp(0, 4);
+            let choices: &[(i32, i32, i32, i32, i32)] = &[
+                (1, 24, 54, 44, 14),
+                (3, 72, 54, 44, 14),
+                (11, 24, 72, 44, 14),
+                (8, 72, 72, 44, 14),
+                (5, 24, 90, 44, 14),
+                (10, 24, 108, 44, 14),
+                (0, 72, 108, 44, 14),
+            ];
+            for &(id, bx, by, bw, bh) in choices {
+                let tier = if id == 1 || id == 3 {
+                    1
+                } else if id == 11 || id == 8 {
+                    2
+                } else if id == 5 {
+                    3
+                } else {
+                    4
+                };
+                if level >= tier && UiRect::new(bx, by, bw as u32, bh as u32).contains(lx, ly) {
+                    if id == 0 {
+                        self.beacon_secondary = self.beacon_primary;
+                    } else if id == 10 {
+                        self.beacon_secondary = Some(10);
+                    } else {
+                        self.beacon_primary = Some(id);
+                    }
+                    return None;
+                }
+            }
+            if UiRect::new(158, 72, 30, 14).contains(lx, ly) {
+                return Some(WorkstationAction::SetBeacon {
+                    primary: self.beacon_primary,
+                    secondary: self.beacon_secondary,
+                });
+            }
+            if UiRect::new(158, 90, 30, 14).contains(lx, ly) {
+                self.beacon_primary = None;
+                self.beacon_secondary = None;
+                return None;
+            }
+        }
+        if self.schema.menu_id == 19 {
+            let panel = self.panel_rect(viewport_w, viewport_h);
+            let local_x = x - panel.x - CONTENT_PAD;
+            let local_y = y - panel.y - CONTENT_PAD;
+            if (8..104).contains(&local_x) && (18..130).contains(&local_y) {
+                let row = ((local_y - 18) / 16) as usize;
+                return self.select_merchant_trade(self.merchant_scroll_offset + row);
+            }
+        }
+        None
     }
 
     pub fn is_player_slot(&self, index: i16) -> bool {
@@ -950,7 +1124,7 @@ impl ContainerScreenState {
                 });
             }
         }
-        let buttons = self
+        let mut buttons: Vec<UiButtonRect> = self
             .schema
             .buttons
             .iter()
@@ -965,6 +1139,48 @@ impl ContainerScreenState {
                 label: b.label,
             })
             .collect();
+        if self.schema.menu_id == 8 {
+            buttons.push(UiButtonRect {
+                id: -8,
+                rect: self.rename_input_rect(viewport_w, viewport_h).unwrap(),
+                label: "rename",
+            });
+        } else if self.schema.menu_id == 9 {
+            for (id, x, y, label) in [
+                (101, 24, 54, "Speed"),
+                (103, 72, 54, "Haste"),
+                (111, 24, 72, "Resist"),
+                (108, 72, 72, "Jump"),
+                (105, 24, 90, "Strength"),
+                (110, 24, 108, "Regen"),
+                (100, 72, 108, "Secondary"),
+                (-9, 158, 90, "Cancel"),
+            ] {
+                buttons.push(UiButtonRect {
+                    id,
+                    rect: UiRect::new(
+                        panel.x + CONTENT_PAD + x,
+                        panel.y + CONTENT_PAD + y,
+                        if id == -9 { 30 } else { 44 },
+                        14,
+                    ),
+                    label,
+                });
+            }
+        } else if self.schema.menu_id == 19 {
+            for row in 0..self.merchant_offers.len().min(7) {
+                buttons.push(UiButtonRect {
+                    id: 1000 + row as i32,
+                    rect: UiRect::new(
+                        panel.x + CONTENT_PAD + 8,
+                        panel.y + CONTENT_PAD + 18 + row as i32 * 16,
+                        96,
+                        16,
+                    ),
+                    label: "trade",
+                });
+            }
+        }
         let bars = self
             .schema
             .property_bars
@@ -989,6 +1205,71 @@ impl ContainerScreenState {
             bars,
             tooltip,
         }
+    }
+
+    fn scale_factor(&self, viewport_w: f32, viewport_h: f32, gui_scale: f32) -> f32 {
+        let scale = if gui_scale.is_finite() {
+            gui_scale.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        let logical_w = (viewport_w.max(1.0) / scale).max(1.0);
+        let logical_h = (viewport_h.max(1.0) / scale).max(1.0);
+        (logical_w / self.schema.panel_w.max(1.0))
+            .min(logical_h / self.schema.panel_h.max(1.0))
+            .min(1.0)
+    }
+
+    fn scale_rect(
+        rect: &mut UiRect,
+        factor: f32,
+        cx: f32,
+        cy: f32,
+        target_cx: f32,
+        target_cy: f32,
+    ) {
+        let left = (target_cx + (rect.x as f32 - cx) * factor).round() as i32;
+        let top = (target_cy + (rect.y as f32 - cy) * factor).round() as i32;
+        let right = (target_cx + (rect.right() as f32 - cx) * factor).round() as i32;
+        let bottom = (target_cy + (rect.bottom() as f32 - cy) * factor).round() as i32;
+        rect.x = left;
+        rect.y = top;
+        rect.w = right.saturating_sub(left).max(1) as u32;
+        rect.h = bottom.saturating_sub(top).max(1) as u32;
+    }
+
+    /// Layout in logical GUI pixels after applying a GUI scale from 1 to 4.
+    pub fn layout_scaled(
+        &self,
+        viewport_w: f32,
+        viewport_h: f32,
+        gui_scale: f32,
+    ) -> ContainerLayout {
+        let mut layout = self.layout(viewport_w, viewport_h);
+        let scale = if gui_scale.is_finite() {
+            gui_scale.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        let logical_w = viewport_w.max(1.0) / scale;
+        let logical_h = viewport_h.max(1.0) / scale;
+        let factor = self.scale_factor(viewport_w, viewport_h, scale);
+        let (cx, cy) = (viewport_w * 0.5, viewport_h * 0.5);
+        let (tx, ty) = (logical_w * 0.5, logical_h * 0.5);
+        Self::scale_rect(&mut layout.panel, factor, cx, cy, tx, ty);
+        for slot in &mut layout.slots {
+            Self::scale_rect(&mut slot.rect, factor, cx, cy, tx, ty);
+        }
+        for button in &mut layout.buttons {
+            Self::scale_rect(&mut button.rect, factor, cx, cy, tx, ty);
+        }
+        for bar in &mut layout.bars {
+            Self::scale_rect(&mut bar.rect, factor, cx, cy, tx, ty);
+        }
+        if let Some(rect) = &mut layout.tooltip {
+            Self::scale_rect(rect, factor, cx, cy, tx, ty);
+        }
+        layout
     }
 
     fn bar_fraction(&self, bar: &PropertyBarDef) -> f32 {
@@ -1187,6 +1468,7 @@ impl ContainerScreenState {
             );
         }
         self.draw_station_chrome(panel, out);
+        self.draw_workstation_controls(panel, out);
         // Polymorph strip beside the station's output slot — only while
         // two or more recipes conflict; a quiet grid emits nothing.
         if self.conflict.is_active() {
@@ -1232,9 +1514,236 @@ impl ContainerScreenState {
             }
         }
     }
+
+    /// Render into logical GUI pixels. The physical viewport is first rendered
+    /// at native menu geometry, then uniformly fitted to the scaled viewport.
+    pub fn render_scaled(
+        &self,
+        viewport_w: f32,
+        viewport_h: f32,
+        gui_scale: f32,
+        out: &mut UiDrawList,
+    ) {
+        if !viewport_w.is_finite()
+            || !viewport_h.is_finite()
+            || viewport_w <= 0.0
+            || viewport_h <= 0.0
+        {
+            return;
+        }
+        let mut native = UiDrawList::new();
+        self.render(viewport_w, viewport_h, &mut native);
+        let scale = if gui_scale.is_finite() {
+            gui_scale.clamp(1.0, 4.0)
+        } else {
+            1.0
+        };
+        let logical_w = (viewport_w / scale).max(1.0);
+        let logical_h = (viewport_h / scale).max(1.0);
+        let factor = self.scale_factor(viewport_w, viewport_h, scale);
+        let (cx, cy, tx, ty) = (
+            viewport_w * 0.5,
+            viewport_h * 0.5,
+            logical_w * 0.5,
+            logical_h * 0.5,
+        );
+        for (index, mut command) in native.commands.into_iter().enumerate() {
+            match &mut command {
+                UiCommand::FillRect { rect, .. }
+                | UiCommand::BorderRect { rect, .. }
+                | UiCommand::ProgressBar { rect, .. }
+                | UiCommand::ItemIcon { rect, .. }
+                | UiCommand::Sprite { rect, .. } => Self::scale_rect(rect, factor, cx, cy, tx, ty),
+                UiCommand::Text {
+                    x,
+                    y,
+                    scale: text_scale,
+                    text,
+                    ..
+                } => {
+                    *x = (tx + (*x as f32 - cx) * factor).round() as i32;
+                    *y = (ty + (*y as f32 - cy) * factor).round() as i32;
+                    *text_scale = ((*text_scale as f32 * factor).round() as u32).max(1);
+                    let available = (logical_w as i32 - *x).max(0);
+                    *text = clip_text(text, available);
+                }
+            }
+            if index == 0 {
+                if let UiCommand::FillRect { rect, .. } = &mut command {
+                    *rect = UiRect::new(0, 0, logical_w.ceil() as u32, logical_h.ceil() as u32);
+                }
+            }
+            out.push(command);
+        }
+    }
 }
 
 impl ContainerScreenState {
+    fn draw_workstation_controls(&self, panel: UiRect, out: &mut UiDrawList) {
+        let px = panel.x + CONTENT_PAD;
+        let py = panel.y + CONTENT_PAD;
+        match self.schema.menu_id {
+            8 => {
+                let field = UiRect::new(px + 29, py + 27, 96, 12);
+                out.fill_rect(field, palette::TOOLTIP_BG);
+                out.border_rect(
+                    field,
+                    if self.rename_focused {
+                        palette::TEXT_FOCUSED
+                    } else {
+                        palette::TEXT_DIM
+                    },
+                    1,
+                );
+                let mut text = clip_text(&self.rename_text, field.w.saturating_sub(6) as i32);
+                if self.rename_focused && text_width(&text, 1) + 8 <= field.w {
+                    text.push('|');
+                }
+                out.text(field.x + 3, field.y + 2, 1, palette::TEXT, text);
+                let cost = self.property(0);
+                let footer = if cost > 0 {
+                    format!("Enchantment Cost: {cost}")
+                } else {
+                    "Too Expensive!".to_owned()
+                };
+                out.text(
+                    px + 8,
+                    py + 76,
+                    1,
+                    if cost > 0 {
+                        palette::ACCENT
+                    } else {
+                        palette::DANGER
+                    },
+                    clip_text(&footer, panel.w as i32 - 20),
+                );
+            }
+            9 => {
+                let controls = [
+                    (1, 24, 54, "Speed", 1),
+                    (3, 72, 54, "Haste", 1),
+                    (11, 24, 72, "Resist", 2),
+                    (8, 72, 72, "Jump", 2),
+                    (5, 24, 90, "Strength", 3),
+                    (10, 24, 108, "Regen", 4),
+                    (0, 72, 108, "Secondary", 4),
+                ];
+                let level = self.property(0).clamp(0, 4);
+                for (id, x, y, label, tier) in controls {
+                    let rect = UiRect::new(px + x, py + y, 44, 14);
+                    let enabled = level >= tier;
+                    let selected = if id == 0 {
+                        self.beacon_secondary.is_some()
+                    } else {
+                        self.beacon_primary == Some(id)
+                    };
+                    out.fill_rect(
+                        rect,
+                        if enabled {
+                            palette::BUTTON
+                        } else {
+                            palette::BUTTON_DISABLED
+                        },
+                    );
+                    out.border_rect(
+                        rect,
+                        if selected {
+                            palette::BUTTON_BORDER_HOVER
+                        } else {
+                            palette::BUTTON_BORDER
+                        },
+                        if selected { 2 } else { 1 },
+                    );
+                    out.text(
+                        rect.x + 2,
+                        rect.y + 3,
+                        1,
+                        if enabled {
+                            palette::TEXT_DARK
+                        } else {
+                            palette::BUTTON_DISABLED_TEXT
+                        },
+                        label,
+                    );
+                }
+                for (y, label, color) in [
+                    (72, "Confirm", palette::ACCENT),
+                    (90, "Cancel", palette::DANGER),
+                ] {
+                    let rect = UiRect::new(px + 158, py + y, 30, 14);
+                    out.fill_rect(rect, palette::BUTTON);
+                    out.border_rect(rect, palette::BUTTON_BORDER, 1);
+                    out.text(rect.x + 2, rect.y + 3, 1, color, label);
+                }
+            }
+            19 => {
+                let first = self.merchant_scroll_offset.min(self.merchant_offers.len());
+                for row in 0..7 {
+                    let index = first + row;
+                    let Some(offer) = self.merchant_offers.get(index) else {
+                        continue;
+                    };
+                    let rect = UiRect::new(px + 8, py + 18 + row as i32 * 16, 96, 16);
+                    if self.selected_trade_index == Some(index) {
+                        out.fill_rect(rect, palette::SLOT_HOVER);
+                    }
+                    out.border_rect(
+                        rect,
+                        if self.selected_trade_index == Some(index) {
+                            palette::BUTTON_BORDER_HOVER
+                        } else {
+                            palette::SEPARATOR
+                        },
+                        1,
+                    );
+                    out.item_icon_str(UiRect::new(rect.x + 2, rect.y + 2, 11, 11), &offer.input1);
+                    if let Some(input2) = &offer.input2 {
+                        out.item_icon_str(UiRect::new(rect.x + 17, rect.y + 2, 11, 11), input2);
+                    }
+                    out.text_str(rect.x + 30, rect.y + 3, 1, palette::TEXT_DARK, "→");
+                    out.item_icon_str(UiRect::new(rect.x + 41, rect.y + 2, 11, 11), &offer.output);
+                    let cost = if offer.effective_cost < offer.original_cost {
+                        format!("{}>{}", offer.original_cost, offer.effective_cost)
+                    } else {
+                        offer.effective_cost.to_string()
+                    };
+                    let cost_color = if offer.effective_cost < offer.original_cost {
+                        palette::ACCENT
+                    } else {
+                        palette::TEXT_DARK
+                    };
+                    out.text(rect.x + 55, rect.y + 8, 1, cost_color, clip_text(&cost, 40));
+                    if offer.effective_cost < offer.original_cost {
+                        let old = offer.original_cost.to_string();
+                        let line_w = text_width(&old, 1).min(20);
+                        out.fill_rect(
+                            UiRect::new(rect.x + 55, rect.y + 11, line_w, 1),
+                            palette::DANGER,
+                        );
+                    }
+                    if offer.out_of_stock {
+                        out.text_str(rect.right() - 8, rect.y + 3, 1, palette::DANGER, "X");
+                    }
+                }
+                out.text(
+                    px + 108,
+                    py + 14,
+                    1,
+                    palette::TEXT_DARK,
+                    format!("Level {}", self.property(1).clamp(1, 5)),
+                );
+                out.progress_bar(
+                    UiRect::new(px + 108, py + 26, 96, 5),
+                    f32::from(self.property(2)).clamp(0.0, 1.0),
+                    palette::XP,
+                    palette::BUTTON_DISABLED,
+                    palette::PANEL_BORDER,
+                );
+            }
+            _ => {}
+        }
+    }
+
     fn draw_station_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
         let px = panel.x + CONTENT_PAD;
         let py = panel.y + CONTENT_PAD;
@@ -1263,29 +1772,9 @@ impl ContainerScreenState {
                 );
             }
             8 => {
-                let field = UiRect::new(px + 29, py + 27, 96, 12);
-                out.fill_rect(field, palette::TOOLTIP_BG);
-                out.border_rect(field, palette::TEXT_DIM, 1);
-                let name = clip_text(&self.title, (field.w as i32 - 6).max(1));
-                out.text(px + 32, py + 29, 1, palette::TEXT, name);
                 draw_vanilla_arrow(out, UiRect::new(px + 104, py + 43, 20, 18), true);
-                let cost = self.property(0);
-                let footer = if cost > 0 {
-                    format!("Enchantment Cost: {cost}")
-                } else {
-                    "Too Expensive!".to_owned()
-                };
-                out.text(
-                    px + 8,
-                    py + 76,
-                    1,
-                    if cost > 0 { palette::ACCENT } else { palette::DANGER },
-                    clip_text(&footer, (panel.w as i32 - 20).max(1)),
-                );
             }
             9 => {
-                out.text_str(px + 67, py + 30, 1, palette::TEXT_DARK, "Beacon Powers");
-                out.text_str(px + 76, py + 54, 1, palette::ACCENT, "I  II  III  IV");
                 out.text_str(px + 58, py + 103, 1, palette::TEXT_DIM, "Payment");
             }
             10 | 14 | 22 => {
@@ -1326,14 +1815,7 @@ impl ContainerScreenState {
                 out.text_str(px + 75, py + 43, 1, palette::ACCENT, "PREVIEW");
             }
             19 => {
-                out.text_str(px + 109, py + 14, 1, palette::TEXT_DARK, "Villager Trades");
-                out.progress_bar(
-                    UiRect::new(px + 108, py + 26, 96, 5),
-                    f32::from(self.property(2)).clamp(0.0, 1.0),
-                    palette::ACCENT,
-                    palette::BUTTON_DISABLED,
-                    palette::PANEL_BORDER,
-                );
+                out.text_str(px + 108, py + 4, 1, palette::TEXT_DARK, "Villager Trades");
             }
             20 => out.text_str(px + 100, py + 5, 1, palette::TEXT_DARK, "SHULKER BOX"),
             21 => {
