@@ -4163,3 +4163,70 @@ mod end_city_mansion_tests {
         assert!(!world.writes.contains_key(&(0, 63, 0)));
     }
 }
+
+#[cfg(test)]
+mod end_city_mansion_signature_tests {
+    use super::*;
+
+    #[test]
+    fn end_city_chest_marker_assigns_treasure_loot_to_a_live_chest() {
+        let pos = (4, 71, -9);
+        let mut out = PlacementOut {
+            be_events: vec![BeEvent::Set(BlockEntityRecord {
+                pos,
+                id: "minecraft:chest",
+                loot_table: None,
+                loot_seed: None,
+                items: None,
+                spawner_entity: None,
+            })],
+            ..PlacementOut::default()
+        };
+        let mut rng = crate::generation_math::Xor::seed_worldgen(4242);
+        end_city_chest_loot(&mut out, pos, &mut rng);
+        let Some(BeEvent::Set(record)) = out.be_events.last() else {
+            panic!("chest block entity event");
+        };
+        assert_eq!(record.loot_table.as_deref(), Some(END_CITY_TREASURE));
+        assert!(record.loot_seed.is_some());
+
+        let mut empty = PlacementOut::default();
+        let before = crate::generation_math::Xor::seed_worldgen(4242).state128();
+        let mut untouched = crate::generation_math::Xor::seed_worldgen(4242);
+        end_city_chest_loot(&mut empty, pos, &mut untouched);
+        assert!(empty.be_events.is_empty());
+        assert_eq!(untouched.state128(), before, "no live chest means no loot-seed draw");
+    }
+
+    #[test]
+    fn end_ship_elytra_frame_uses_rotation_applied_to_south() {
+        let cases = [
+            (Rotation::None, Dir::South),
+            (Rotation::Clockwise90, Dir::West),
+            (Rotation::Clockwise180, Dir::North),
+            (Rotation::Counterclockwise90, Dir::East),
+        ];
+        for (rotation, direction) in cases {
+            assert_eq!(rotate_direction(rotation, Dir::South), direction);
+        }
+        assert_eq!(Dir::South.data_3d(), 3);
+        assert_eq!(rotate_direction(Rotation::Clockwise90, Dir::South).data_3d(), 4);
+    }
+
+    #[test]
+    fn mansion_room_tables_include_secret_obsidian_allay_and_chest_rooms() {
+        let mut saw = std::collections::HashSet::new();
+        for seed in 0..64 {
+            let mut rng = Lcg::new(seed);
+            saw.insert(MansionFloor::First.one_by_one_secret(&mut rng));
+            saw.insert(MansionFloor::First.one_by_two_secret(&mut rng));
+            saw.insert(MansionFloor::Second.one_by_two_secret(&mut rng));
+            saw.insert(MansionFloor::First.two_by_two(&mut rng));
+        }
+        for wanted in ["1x1_as3", "1x2_s1", "1x2_se1", "2x2_a1"] {
+            assert!(saw.contains(wanted), "mansion room table missing {wanted}: {saw:?}");
+        }
+        let mut rng = Lcg::new(0);
+        assert_eq!(MansionFloor::First.two_by_two_secret(&mut rng), "2x2_s1");
+    }
+}
