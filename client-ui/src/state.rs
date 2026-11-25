@@ -5506,6 +5506,7 @@ mod sign_editor_overlay_tests {
                     crate::draw::UiCommand::FillRect { rect, .. }
                     | crate::draw::UiCommand::BorderRect { rect, .. }
                     | crate::draw::UiCommand::ItemIcon { rect, .. }
+                    | crate::draw::UiCommand::Sprite { rect, .. }
                     | crate::draw::UiCommand::ProgressBar { rect, .. } => {
                         assert!(rect.x >= 0 && rect.y >= 0, "{cmd:?} left/top overflow @{w}x{h}");
                         assert!(

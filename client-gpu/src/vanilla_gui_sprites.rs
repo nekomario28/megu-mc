@@ -266,6 +266,29 @@ impl VanillaGuiSpriteId {
         }
     }
 
+    /// The canonical `megu_core::ui_contract::SpriteId` this sprite
+    /// skins, when one exists. Only the widget chrome the contract
+    /// enumerates maps — HUD sprites, slider hover twins and panorama
+    /// faces stay `None` (the tessellator falls back to vector chrome
+    /// for unmapped `SpriteId`s).
+    #[must_use]
+    pub const fn to_ui_contract(self) -> Option<megu_core::ui_contract::SpriteId> {
+        use megu_core::ui_contract::SpriteId as S;
+        match self {
+            Self::Button => Some(S::Button),
+            Self::ButtonHighlighted => Some(S::ButtonHighlighted),
+            Self::ButtonDisabled => Some(S::ButtonDisabled),
+            // The slider trough skins the scrollbar track; the handle
+            // skins the thumb — the contract's closest widgets.
+            Self::Slider => Some(S::ScrollerBackground),
+            Self::SliderHandle => Some(S::Scroller),
+            Self::MenuBackground => Some(S::Panel),
+            Self::HeaderSeparator => Some(S::HeaderSeparator),
+            Self::FooterSeparator => Some(S::FooterSeparator),
+            _ => None,
+        }
+    }
+
     /// `true` when `name` is a catalogued GUI texture or its `.mcmeta`
     /// sidecar anywhere under `assets/minecraft/textures/gui/`.
     fn is_catalog_entry(name: &str) -> bool {
@@ -720,6 +743,50 @@ impl VanillaGuiAtlas {
             .iter()
             .find(|(k, _)| *k == id)
             .map(|(_, e)| e)
+    }
+
+    /// Re-key the packed atlas to [`megu_ui::draw::GuiSpriteAtlas`] — the
+    /// `SpriteId` table `client-ui`'s tessellator and `vanilla_widgets`
+    /// resolve [`UiCommand::Sprite`](megu_ui::draw::UiCommand::Sprite)
+    /// against. Widget sprites without a contract counterpart (HUD
+    /// pieces, highlighted slider twins, panorama faces) are dropped —
+    /// their `SpriteId`s keep the vector-chrome fallback.
+    ///
+    /// The RGBA moves across unchanged, so the texture
+    /// [`GpuRenderer::upload_gui_sprite_atlas`] uploads is byte-for-byte
+    /// the atlas these UVs were normalized against.
+    #[must_use]
+    pub fn to_gui_sprite_atlas(&self) -> megu_ui::draw::GuiSpriteAtlas {
+        let entries = self
+            .entries
+            .iter()
+            .filter_map(|(id, e)| {
+                id.to_ui_contract().map(|sprite| {
+                    let border = e.nine_slice_border.unwrap_or_default();
+                    (
+                        sprite,
+                        megu_ui::draw::GuiSpriteEntry {
+                            uv_min: e.uv_min,
+                            uv_max: e.uv_max,
+                            width: e.width,
+                            height: e.height,
+                            nine_slice_border: [
+                                border.left,
+                                border.top,
+                                border.right,
+                                border.bottom,
+                            ],
+                        },
+                    )
+                })
+            })
+            .collect();
+        megu_ui::draw::GuiSpriteAtlas::from_packed(
+            self.width,
+            self.height,
+            self.rgba.clone(),
+            entries,
+        )
     }
 }
 

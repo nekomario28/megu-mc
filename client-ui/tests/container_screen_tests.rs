@@ -30,6 +30,7 @@ fn assert_draws_within_viewport(list: &UiDrawList, w: u32, h: u32) {
             UiCommand::FillRect { rect, .. }
             | UiCommand::BorderRect { rect, .. }
             | UiCommand::ItemIcon { rect, .. }
+            | UiCommand::Sprite { rect, .. }
             | UiCommand::ProgressBar { rect, .. } => {
                 assert!(
                     rect.x >= 0

@@ -60,7 +60,7 @@ use megu_ui::container_screen::{
     ContainerScreenState, DragState, InventorySortState, MenuScreenSchema, SlotDef, SlotKind,
     UiItemStack, menu_schema,
 };
-use megu_ui::draw::{tessellate_draw_list, tessellate_draw_list_icons};
+use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{UiColor, UiCommand, UiDrawList, UiRect, text_width};
 use megu_ui::gui_bridge::{GuiBridgeBatch, lower_bridge_batch_to_draw_cmds};
 use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
@@ -975,7 +975,33 @@ pub struct GpuApp {
     /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
     title_tick_accum: f32,
     ui: UiState,
-    ui_cache: UiUploadCache,
+    /// Revision bus feeding the retained UI cache: the window bumps a
+    /// `UiLayer` only when that layer's draw-list fingerprint moved, so
+    /// a chat tick never re-tessellates the container layer.
+    ui_layer_bus: megu_core::rev::UiLayerBus,
+    /// Per-layer retained tessellation cache — replaces the old
+    /// fingerprint-gated whole-list re-tessellate. See
+    /// [`UiRetainedCache`](megu_ui::retained_cache::UiRetainedCache) for
+    /// the zero-alloc/zero-upload contract.
+    ui_retained: megu_ui::retained_cache::UiRetainedCache,
+    /// Last fingerprint per `UiLayer` index — the host-side change
+    /// detector that drives `ui_layer_bus` bumps.
+    ui_layer_fps: [u64; 7],
+    /// Retained layer lists composited beside `ui_draw_list` each frame:
+    /// mod HUD (goggles, magic HUD, hotbar glint), vanilla overlay
+    /// (container, JEI sidebar, advancements, container glint) and the
+    /// mod-GUI bridge batch.
+    ui_modhud_list: UiDrawList,
+    ui_overlay_list: UiDrawList,
+    ui_modoverlay_list: UiDrawList,
+    /// Decoded vanilla `widget/*` sprite atlas re-keyed to the contract
+    /// `SpriteId` table — empty on clean-room installs (the
+    /// `vanilla_widgets` vector chrome then draws everything). Uploaded
+    /// to GPU `ui_quad` binding 5 once per JAR arrival.
+    gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas,
+    /// `true` once the JAR scan for `gui_sprite_atlas` ran — bootstrap
+    /// completion re-arms it.
+    gui_sprites_loaded: bool,
     render_config: RenderConfig,
     policy: DisplayPresentationPolicy,
     governor: FrameBudgetGovernor,
@@ -1343,7 +1369,14 @@ impl GpuApp {
             title_seen_rev: 0,
             title_tick_accum: 0.0,
             ui,
-            ui_cache: UiUploadCache::default(),
+            ui_layer_bus: megu_core::rev::UiLayerBus::new(),
+            ui_retained: megu_ui::retained_cache::UiRetainedCache::new(),
+            ui_layer_fps: [0; 7],
+            ui_modhud_list: UiDrawList::new(),
+            ui_overlay_list: UiDrawList::new(),
+            ui_modoverlay_list: UiDrawList::new(),
+            gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas::default(),
+            gui_sprites_loaded: false,
             render_config,
             policy,
             governor,
@@ -1439,6 +1472,31 @@ impl GpuApp {
             app.maybe_start_friend_share();
         }
         app
+    }
+
+    /// Decode the local client JAR's `widget/*` GUI sprites into
+    /// `gui_sprite_atlas` (re-keyed to the `SpriteId` contract) and push
+    /// the texture to `ui_quad` binding 5 when a renderer is live.
+    /// Clean-room hosts keep the empty atlas — `UiCommand::Sprite` then
+    /// never emits and `vanilla_widgets` draws the vector bevel chrome.
+    /// Runs once per JAR arrival (`gui_sprites_loaded` gates rescans).
+    fn load_gui_sprite_atlas(&mut self) {
+        let (jar, _mod_jars) = title_branding_sources(&self.session_paths);
+        self.gui_sprites_loaded = true;
+        let Some(jar) = jar else {
+            return;
+        };
+        let assets = crate::vanilla_gui_sprites::load_vanilla_gui_from_path(&jar, &[]);
+        let atlas = assets.build_atlas().to_gui_sprite_atlas();
+        if atlas.is_empty() {
+            return;
+        }
+        self.gui_sprite_atlas = atlas;
+        if let Some(active) = self.active.as_mut() {
+            active
+                .renderer
+                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+        }
     }
 
     /// One-shot local-Minecraft font probe: installs the shared
@@ -1579,6 +1637,10 @@ impl GpuApp {
                 // The downloaded JAR + assets may now satisfy the font
                 // probe (it stays silent while nothing local exists).
                 self.maybe_load_vanilla_fonts();
+                // …and the `widget/*` GUI sprites: decode + upload the
+                // chrome atlas now that a real JAR exists.
+                self.gui_sprites_loaded = false;
+                self.load_gui_sprite_atlas();
                 if self.ui.title_status.as_deref() == self.bootstrap_banner.as_deref() {
                     self.ui.title_status = None;
                 }
@@ -4047,6 +4109,17 @@ impl GpuApp {
         // authentic vanilla font when the host has 1.21.1 installed.
         // Silent no-op on offline hosts / CI.
         self.maybe_load_vanilla_fonts();
+        // The same JAR feeds the GUI-sprite atlas (`widget/*` chrome →
+        // `ui_quad` binding 5). First call decodes; later `init_gpu`s
+        // just re-upload the resident atlas after device/surface loss.
+        if !self.gui_sprites_loaded {
+            self.load_gui_sprite_atlas();
+        }
+        if !self.gui_sprite_atlas.is_empty() {
+            active
+                .renderer
+                .upload_gui_sprite_atlas(&self.gui_sprite_atlas);
+        }
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
         // stay resident in `title_branding` for a later surface loss.
@@ -5500,6 +5573,12 @@ impl GpuApp {
         // fingerprint below feeds the same dirty-check either way.
         self.ui.render_into(w, h, &mut self.ui_draw_list);
         let draw_list = &mut self.ui_draw_list;
+        // Per-layer overlay lists: rebuilt every frame, fingerprinted
+        // below so only layers whose content actually moved bump their
+        // `UiLayer` revision (and re-tessellate).
+        self.ui_modhud_list.clear();
+        self.ui_overlay_list.clear();
+        self.ui_modoverlay_list.clear();
         // Runtime `MEGU EDITION` title branding: with the local JAR's
         // wordmark + patched edition strip GPU-resident, the banner
         // replaces the built-in wordmark text commands and the session's
@@ -5540,7 +5619,7 @@ impl GpuApp {
         );
         if let Some(live) = &self.live {
             if !live.magic.is_empty() {
-                draw_list
+                self.ui_modhud_list
                     .commands
                     .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
             }
@@ -5549,7 +5628,7 @@ impl GpuApp {
         // in-game HUD only (hidden behind menus/containers by the
         // `Screen::InGameHud` gate where `goggles_draw` was produced).
         if let Some(goggles) = goggles_draw {
-            draw_list.commands.extend(goggles.commands);
+            self.ui_modhud_list.commands.extend(goggles.commands);
         }
         // Enchantment glint shimmer over enchanted 2D slots: the same
         // `enchantment_glint_rgb` the 3D path runs, composited as a
@@ -5575,15 +5654,16 @@ impl GpuApp {
                         if let Some(cmd) =
                             enchant_glint_overlay_cmd(true, stack, rect, w, h, glint_elapsed)
                         {
-                            draw_list.commands.push(cmd);
+                            self.ui_modhud_list.commands.push(cmd);
                         }
                     }
                 }
             }
         }
-        // Server-driven container screen draws above the HUD.
+        // Server-driven container screen draws above the HUD — the
+        // `Overlay` layer in the retained cache.
         if let Some(screen) = &self.container_screen {
-            screen.render(w as f32, h as f32, draw_list);
+            screen.render(w as f32, h as f32, &mut self.ui_overlay_list);
             // JEI/EMI side overlay: bookmark column left, search+grid
             // right — only when the QoL toggle is on and both columns
             // fit without overlapping the container panel.
@@ -5591,7 +5671,7 @@ impl GpuApp {
                 let panel = screen.panel_rect(w as f32, h as f32);
                 if let Some((overlay, regions)) = self.ui.recipe_browser.render_overlay(w, h, panel)
                 {
-                    draw_list.commands.extend(overlay.commands);
+                    self.ui_overlay_list.commands.extend(overlay.commands);
                     self.recipe_overlay_regions = regions;
                 } else {
                     self.recipe_overlay_regions.clear();
@@ -5629,7 +5709,7 @@ impl GpuApp {
                                 h,
                                 glint_elapsed,
                             ) {
-                                draw_list.commands.push(cmd);
+                                self.ui_overlay_list.commands.push(cmd);
                             }
                         }
                     }
@@ -5637,24 +5717,64 @@ impl GpuApp {
             }
         }
         if self.advancements_open {
-            Self::render_advancements_overlay(self.live.as_ref(), w as i32, h as i32, draw_list);
+            Self::render_advancements_overlay(
+                self.live.as_ref(),
+                w as i32,
+                h as i32,
+                &mut self.ui_overlay_list,
+            );
         }
         // Tier-2 mod GUI bridge: the active batch lowers straight into
-        // the native list (scissor-safe inside the frame's clip), zero
-        // cost while no mod recorded ops this frame.
+        // the mod-overlay layer list (scissor-safe inside the frame's
+        // clip), zero cost while no mod recorded ops this frame.
         if !self.gui_bridge_batch.ops.is_empty() {
-            draw_list
+            self.ui_modoverlay_list
                 .commands
                 .extend(lower_bridge_batch_to_draw_cmds(&self.gui_bridge_batch, w, h));
         }
-        // Dirty-only upload: unchanged HUD frames skip even the quad
-        // tessellation; changed frames upload only the small dynamic
-        // vertex/index buffers — never a `w*h*4` CPU raster + texture
-        // write (`renderer.ui_cpu_raster_uploads` stays at zero).
-        let fingerprint = fingerprint_draw_list(w, h, draw_list);
-        if self.ui_cache.should_upload(w, h, fingerprint) {
-            let mesh = tessellate_draw_list_icons(w, h, draw_list, &self.item_icon_atlas);
-            active.renderer.update_ui_mesh(w, h, &mesh);
+        // Retained per-layer upload: fingerprint each layer's list and
+        // bump its `UiLayer` revision only when content moved — the
+        // retained cache then re-tessellates just the dirty layers into
+        // warm buffers and uploads the single merged batch only when the
+        // composite actually differs (`renderer.ui_cpu_raster_uploads`
+        // stays at zero either way).
+        {
+            let layer_lists: [(megu_core::rev::UiLayer, &UiDrawList); 4] = [
+                (megu_core::rev::UiLayer::Screen, &self.ui_draw_list),
+                (megu_core::rev::UiLayer::ModHud, &self.ui_modhud_list),
+                (megu_core::rev::UiLayer::Overlay, &self.ui_overlay_list),
+                (megu_core::rev::UiLayer::ModOverlay, &self.ui_modoverlay_list),
+            ];
+            for (layer, list) in &layer_lists {
+                let fp = fingerprint_draw_list(w, h, list);
+                if self.ui_layer_fps[layer.index()] != fp {
+                    self.ui_layer_fps[layer.index()] = fp;
+                    layer.bump(&mut self.ui_layer_bus);
+                }
+            }
+            let dirty = self.ui_retained.begin_frame(&self.ui_layer_bus);
+            for index in dirty.iter() {
+                let Some((layer, list)) = layer_lists
+                    .iter()
+                    .find(|(layer, _)| layer.index() == index)
+                else {
+                    continue;
+                };
+                self.ui_retained.update_layer(
+                    *layer,
+                    list,
+                    w,
+                    h,
+                    &self.item_icon_atlas,
+                    &self.gui_sprite_atlas,
+                );
+            }
+            let _ = self.ui_retained.composite();
+            if self.ui_retained.gpu_upload_needed() {
+                let (vertices, indices) = self.ui_retained.composite();
+                active.renderer.update_ui_mesh_parts(w, h, vertices, indices);
+                self.ui_retained.mark_uploaded();
+            }
         }
         let mut render_camera = self.camera_controller.view_camera(&self.camera);
         // Tactile micro-motion: transient turn-roll + landing dip from

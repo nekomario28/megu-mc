@@ -1125,6 +1125,11 @@ pub fn fingerprint_draw_list(width: u32, height: u32, list: &UiDrawList) -> u64 
                 fnv1a_color(&mut hash, back);
                 fnv1a_color(&mut hash, border);
             }
+            UiCommand::Sprite { rect, sprite } => {
+                hash.update_u8(5);
+                fnv1a_rect(&mut hash, rect);
+                hash.update_u8(*sprite as u8);
+            }
             UiCommand::ItemIcon { rect, item_id } => {
                 hash.update_u8(4);
                 fnv1a_rect(&mut hash, rect);

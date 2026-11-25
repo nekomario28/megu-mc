@@ -40,6 +40,7 @@ fn assert_commands_in_viewport(list: &UiDrawList, w: u32, h: u32) {
             UiCommand::FillRect { rect, .. }
             | UiCommand::BorderRect { rect, .. }
             | UiCommand::ItemIcon { rect, .. }
+            | UiCommand::Sprite { rect, .. }
             | UiCommand::ProgressBar { rect, .. } => {
                 assert!(rect.x >= 0 && rect.y >= 0, "negative rect origin: {rect:?}");
                 assert!(rect.w > 0 && rect.h > 0, "empty rect: {rect:?}");

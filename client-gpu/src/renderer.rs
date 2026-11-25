@@ -3044,6 +3044,13 @@ struct UiQuadGpu {
     /// the new texture; branding bind groups bind this view too (they
     /// never emit icon quads, so sampling it is harmless).
     icon_view: wgpu::TextureView,
+    /// The packed vanilla GUI-sprite atlas (`binding 5` in
+    /// `UI_QUAD_WGSL`); starts as a 1×1 transparent placeholder and is
+    /// replaced once by [`GpuRenderer::upload_gui_sprite_atlas`].
+    _sprite_texture: wgpu::Texture,
+    /// View of the sprite atlas — like `icon_view`, shared by every
+    /// bind group on this layout.
+    sprite_view: wgpu::TextureView,
     font_view: wgpu::TextureView,
     font_sampler: wgpu::Sampler,
     vertices: wgpu::Buffer,
@@ -7019,6 +7026,16 @@ impl GpuRenderer {
                             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
                     ],
                 });
         let ui_quad_pipeline_layout =
@@ -7148,6 +7165,43 @@ impl GpuRenderer {
             },
         );
         let ui_icon_view = ui_icon_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // 1×1 transparent placeholder bound until `upload_gui_sprite_atlas`
+        // lands the decoded vanilla `widget/*` atlas — `Sprite` quads then
+        // sample real chrome; the vector bevels never touch this texture.
+        let ui_sprite_texture = ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-sprite-atlas-placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &ui_sprite_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[0u8; 4],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        let ui_sprite_view = ui_sprite_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ui_quad_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-quad-bind-group"),
             layout: &ui_quad_layout,
@@ -7172,6 +7226,10 @@ impl GpuRenderer {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&ui_font_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&ui_sprite_view),
+                },
             ],
         });
         let ui_quad_vertices = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -7193,6 +7251,8 @@ impl GpuRenderer {
             _font_texture: ui_font_texture,
             _icon_texture: ui_icon_texture,
             icon_view: ui_icon_view,
+            _sprite_texture: ui_sprite_texture,
+            sprite_view: ui_sprite_view,
             font_view: ui_font_view,
             font_sampler: ui_font_sampler,
             vertices: ui_quad_vertices,
@@ -11155,6 +11215,59 @@ impl GpuRenderer {
         );
         self.ui_quad.icon_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.ui_quad._icon_texture = texture;
+        self.rebuild_ui_quad_bind_group();
+    }
+
+    /// Replace the GUI-sprite atlas texture (`binding 5` of the ui_quad
+    /// bind group) with a freshly packed [`megu_ui::draw::GuiSpriteAtlas`]
+    /// — the decoded vanilla `widget/*` chrome — and rebuild the overlay
+    /// bind group around it. Called once after the client JAR lands;
+    /// `is_empty()` atlases keep the transparent placeholder bound.
+    pub fn upload_gui_sprite_atlas(&mut self, atlas: &megu_ui::draw::GuiSpriteAtlas) {
+        if atlas.is_empty() || atlas.width == 0 || atlas.height == 0 {
+            return;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-sprite-atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.ctx.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width * 4),
+                rows_per_image: Some(atlas.height),
+            },
+            wgpu::Extent3d {
+                width: atlas.width,
+                height: atlas.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.ui_quad.sprite_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.ui_quad._sprite_texture = texture;
+        self.rebuild_ui_quad_bind_group();
+    }
+
+    /// Recreate `ui_quad.bind_group` around the current texture views —
+    /// shared by [`upload_item_icon_atlas`] / [`upload_gui_sprite_atlas`].
+    fn rebuild_ui_quad_bind_group(&mut self) {
         self.ui_quad.bind_group = self
             .ctx
             .device
@@ -11182,6 +11295,10 @@ impl GpuRenderer {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.ui_quad.font_sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.sprite_view),
+                    },
                 ],
             });
     }
@@ -11192,17 +11309,31 @@ impl GpuRenderer {
     /// never shrunk). The static font atlas uploaded at construction is
     /// bound every draw. Empty meshes disable the overlay draw.
     pub fn update_ui_mesh(&mut self, width: u32, height: u32, mesh: &UiMesh) {
+        self.update_ui_mesh_parts(width, height, &mesh.vertices, &mesh.indices);
+    }
+
+    /// [`update_ui_mesh`] over borrowed vertex/index slices — the shape
+    /// [`megu_ui::retained_cache::UiRetainedCache::composite`] returns,
+    /// so the retained UI batch uploads without materializing a
+    /// `UiMesh`.
+    pub fn update_ui_mesh_parts(
+        &mut self,
+        width: u32,
+        height: u32,
+        vertices: &[megu_ui::draw::UiVertex],
+        indices: &[u32],
+    ) {
         let uniforms = [width.max(1) as f32, height.max(1) as f32, 0.0, 0.0];
         self.ctx
             .queue
             .write_buffer(&self.ui_quad.uniform, 0, bytemuck::cast_slice(&uniforms));
-        self.ui_quad.index_count = mesh.indices.len() as u32;
+        self.ui_quad.index_count = indices.len() as u32;
         if self.ui_quad.index_count == 0 {
             return;
         }
         self.ui_quad_vertex_scratch.clear();
         self.ui_quad_vertex_scratch
-            .extend(mesh.vertices.iter().map(|v| UiQuadVertex {
+            .extend(vertices.iter().map(|v| UiQuadVertex {
                 position: v.position,
                 uv: v.uv,
                 color: v.color,
@@ -11217,7 +11348,7 @@ impl GpuRenderer {
                 mapped_at_creation: false,
             });
         }
-        let ibytes = (mesh.indices.len() * 4) as u64;
+        let ibytes = (indices.len() * 4) as u64;
         if ibytes > self.ui_quad.index_capacity {
             self.ui_quad.index_capacity = ibytes * 2;
             self.ui_quad.indices = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -11235,7 +11366,7 @@ impl GpuRenderer {
         );
         self.ctx
             .queue
-            .write_buffer(&quad.indices, 0, bytemuck::cast_slice(&mesh.indices));
+            .write_buffer(&quad.indices, 0, bytemuck::cast_slice(indices));
     }
 
     /// Draw the UI-quad overlay into `pass`, replaying the pre-recorded
@@ -11356,6 +11487,10 @@ impl GpuRenderer {
                     wgpu::BindGroupEntry {
                         binding: 4,
                         resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.ui_quad.sprite_view),
                     },
                 ],
             });
