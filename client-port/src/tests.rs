@@ -95,6 +95,29 @@ fn uniform_cube_reduces_to_six_outward_quads() {
 }
 
 #[test]
+fn non_cube_shapes_emit_geometry_without_changing_cube_mesh() {
+    let mut section = air();
+    section.blocks[0] = Block::opaque_cube(21).with_shape(BlockShape::SlabBottom);
+    let slab = mesh_section(&section.view());
+    assert_eq!(slab.len(), 6);
+    assert!(slab.iter().flat_map(|q| q.positions).all(|p| p[1] <= 0.5));
+    assert!(slab.iter().any(|q| q.direction == Direction::Up));
+
+    section.blocks[0] = Block {
+        state_id: 22,
+        flags: CUTOUT,
+        ..Block::AIR
+    }
+    .with_shape(BlockShape::CrossPlant);
+    let plant = mesh_section(&section.view());
+    assert_eq!(plant.len(), 4);
+    assert!(plant.iter().all(|q| q.layer == Layer::Cutout));
+
+    let cubes = Section::filled(STONE, DARK);
+    assert_eq!(mesh_section(&cubes.view()).len(), 6);
+}
+
+#[test]
 fn uniform_boundary_fast_path_matches_scalar_oracle_for_neighbor_patterns() {
     let section = Section::filled(STONE, DARK);
     let water = Block {

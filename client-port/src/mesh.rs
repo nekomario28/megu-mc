@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use crate::section::{
-    Block, Direction, Light, MissingNeighbor, Sample, SectionView, ALL_FACES, CUTOUT, EDGE,
-    FACE_CELLS, FLUID_TINTED, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS,
+    Block, BlockShape, Direction, Light, MissingNeighbor, Sample, SectionView, ALL_FACES, CUTOUT,
+    EDGE, FACE_CELLS, FLUID_TINTED, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS,
     TINTED, TRANSLUCENT, WATERLOGGED,
 };
 
@@ -274,7 +274,7 @@ pub(crate) fn encode_occ(block: Block) -> u8 {
     } else {
         0
     };
-    let cube = if block.flags & CUBE_FLAGS != 0 {
+    let cube = if block.shape() == BlockShape::Cube && block.flags & CUBE_FLAGS != 0 {
         CUBE_BIT
     } else {
         0
@@ -530,6 +530,7 @@ fn border_lane4(occ: &[u8; PAD_CELLS], base: usize, step: usize, bit: u8) -> u64
 pub(crate) struct InteriorScan {
     pub any_cube: bool,
     pub any_fluid: bool,
+    pub any_shape: bool,
     pub any_same_state_cull: bool,
     pub any_partial_occ: bool,
     pub uniform: Option<Block>,
@@ -557,6 +558,7 @@ fn load_interior_uniform(
     let occ = encode_occ(block);
     let any_cube = occ & CUBE_BIT != 0;
     let any_fluid = block.fluid() != NO_FLUID;
+    let any_shape = block.shape() != BlockShape::Cube;
     let any_same_state_cull = occ & SAME_STATE_CULL != 0;
     let any_partial_occ = {
         let bits = occ & ALL_FACES;
@@ -579,6 +581,7 @@ fn load_interior_uniform(
         return InteriorScan {
             any_cube,
             any_fluid,
+            any_shape,
             any_same_state_cull,
             any_partial_occ,
             uniform: Some(block),
@@ -629,6 +632,7 @@ fn load_interior_uniform(
     InteriorScan {
         any_cube,
         any_fluid,
+        any_shape,
         any_same_state_cull,
         any_partial_occ,
         uniform: Some(block),
@@ -646,6 +650,7 @@ pub(crate) fn load_interior(
     }
     let mut any_cube_bits = 0u16;
     let mut any_fluid_bits = 0u16;
+    let mut any_shape = false;
     let mut any_same_state_cull = false;
     let mut any_partial_occ = false;
 
@@ -666,7 +671,13 @@ pub(crate) fn load_interior(
 
             for x in 0..EDGE {
                 let b = row_blocks[x];
-                if b.flags == OPAQUE && b.occlusion == ALL_FACES && b.fluid_kind == NO_FLUID {
+                let is_shape = b.shape() != BlockShape::Cube;
+                any_shape |= is_shape;
+                if !is_shape
+                    && b.flags == OPAQUE
+                    && b.occlusion == ALL_FACES
+                    && b.fluid_kind == NO_FLUID
+                {
                     let bit = 1u16 << x;
                     cube_m |= bit;
                     occ_all_m |= bit;
@@ -675,12 +686,12 @@ pub(crate) fn load_interior(
                     occ_dst[x] = 0;
                 } else {
                     let bit = 1u16 << x;
-                    let occ = if b.flags & OPAQUE != 0 {
+                    let occ = if !is_shape && b.flags & OPAQUE != 0 {
                         b.occlusion & ALL_FACES
                     } else {
                         0
                     };
-                    let is_cube = (b.flags & CUBE_FLAGS) != 0;
+                    let is_cube = !is_shape && (b.flags & CUBE_FLAGS) != 0;
                     if is_cube {
                         cube_m |= bit;
                     }
@@ -689,7 +700,7 @@ pub(crate) fn load_interior(
                     } else if occ != 0 {
                         has_partial = true;
                     }
-                    if b.flags & SAME_STATE_CULL != 0 {
+                    if !is_shape && b.flags & SAME_STATE_CULL != 0 {
                         any_same_state_cull = true;
                     }
                     if b.fluid() != NO_FLUID {
@@ -757,6 +768,7 @@ pub(crate) fn load_interior(
         return InteriorScan {
             any_cube,
             any_fluid,
+            any_shape,
             any_same_state_cull,
             any_partial_occ,
             uniform: None,
@@ -790,6 +802,7 @@ pub(crate) fn load_interior(
     InteriorScan {
         any_cube,
         any_fluid,
+        any_shape,
         any_same_state_cull,
         any_partial_occ,
         uniform: None,
@@ -2421,6 +2434,186 @@ pub(crate) fn mesh_loaded_section<B: BorderStates, S: QuadSink>(
     }
 }
 
+fn shape_quad(
+    block: Block,
+    direction: Direction,
+    points: [[f32; 3]; 4],
+    light: Light,
+    quads: &mut impl QuadSink,
+) {
+    let layer = if block.flags & OPAQUE != 0 {
+        Layer::Opaque
+    } else if block.flags & CUTOUT != 0 {
+        Layer::Cutout
+    } else {
+        Layer::Translucent
+    };
+    let tinted = block.flags & TINTED != 0;
+    quads.push(Quad {
+        positions: points,
+        state_id: block.state_id,
+        tint: if tinted { block.tint } else { 0 },
+        flow: [0.0; 2],
+        ao: [3; 4],
+        block_light: [light.block(); 4],
+        sky_light: [light.sky(); 4],
+        face_light: light,
+        direction,
+        layer,
+        diagonal: 0,
+        fluid_kind: NO_FLUID,
+        flags: if tinted { QUAD_TINTED } else { 0 },
+        reserved: 0,
+    });
+}
+
+fn shape_box(
+    block: Block,
+    cell: [f32; 3],
+    min: [f32; 3],
+    max: [f32; 3],
+    light: Light,
+    quads: &mut impl QuadSink,
+) {
+    for direction in Direction::ALL {
+        let axis = direction.axis();
+        let (u_axis, v_axis) = direction.tangents();
+        let plane = if direction.step() < 0 {
+            min[axis]
+        } else {
+            max[axis]
+        };
+        let points = CORNERS.map(|(cu, cv)| {
+            let mut p = cell;
+            p[axis] += plane;
+            p[u_axis] += if cu == 0 { min[u_axis] } else { max[u_axis] };
+            p[v_axis] += if cv == 0 { min[v_axis] } else { max[v_axis] };
+            p
+        });
+        shape_quad(block, direction, points, light, quads);
+    }
+}
+
+/// Emit the small set of non-cube state shapes separately. Ordinary cubes
+/// still use the unchanged greedy face path above.
+fn mesh_non_cube_shapes<S: QuadSink>(
+    blocks: &[Block; SECTION_CELLS],
+    block_light: &[u8; LIGHT_BYTES],
+    sky_light: &[u8; LIGHT_BYTES],
+    y_offset: f32,
+    quads: &mut S,
+) {
+    for (index, &block) in blocks.iter().enumerate() {
+        let shape = block.shape();
+        if shape == BlockShape::Cube {
+            continue;
+        }
+        let y = index / FACE_CELLS;
+        let z = (index % FACE_CELLS) / EDGE;
+        let x = index % EDGE;
+        let cell = [x as f32, y as f32 + y_offset, z as f32];
+        let packed = index / 2;
+        let light = Light::new(
+            if index & 1 == 0 {
+                block_light[packed] & 15
+            } else {
+                block_light[packed] >> 4
+            },
+            if index & 1 == 0 {
+                sky_light[packed] & 15
+            } else {
+                sky_light[packed] >> 4
+            },
+        );
+        match shape {
+            BlockShape::Cube => unreachable!(),
+            BlockShape::CrossPlant => {
+                let a = [
+                    [cell[0], cell[1], cell[2]],
+                    [cell[0] + 1.0, cell[1], cell[2] + 1.0],
+                    [cell[0] + 1.0, cell[1] + 1.0, cell[2] + 1.0],
+                    [cell[0], cell[1] + 1.0, cell[2]],
+                ];
+                let b = [
+                    [cell[0] + 1.0, cell[1], cell[2]],
+                    [cell[0], cell[1], cell[2] + 1.0],
+                    [cell[0], cell[1] + 1.0, cell[2] + 1.0],
+                    [cell[0] + 1.0, cell[1] + 1.0, cell[2]],
+                ];
+                shape_quad(block, Direction::South, a, light, quads);
+                shape_quad(
+                    block,
+                    Direction::North,
+                    [a[3], a[2], a[1], a[0]],
+                    light,
+                    quads,
+                );
+                shape_quad(block, Direction::South, b, light, quads);
+                shape_quad(
+                    block,
+                    Direction::North,
+                    [b[3], b[2], b[1], b[0]],
+                    light,
+                    quads,
+                );
+            }
+            BlockShape::SlabBottom => {
+                shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 0.5, 1.0], light, quads)
+            }
+            BlockShape::SlabTop => {
+                shape_box(block, cell, [0.0, 0.5, 0.0], [1.0, 1.0, 1.0], light, quads)
+            }
+            BlockShape::Stair => {
+                shape_box(block, cell, [0.0, 0.0, 0.0], [1.0, 0.5, 1.0], light, quads);
+                shape_box(block, cell, [0.5, 0.5, 0.0], [1.0, 1.0, 1.0], light, quads);
+            }
+            BlockShape::Torch => shape_box(
+                block,
+                cell,
+                [0.4375, 0.0, 0.4375],
+                [0.5625, 0.625, 0.5625],
+                light,
+                quads,
+            ),
+            BlockShape::FencePost => shape_box(
+                block,
+                cell,
+                [0.375, 0.0, 0.375],
+                [0.625, 1.0, 0.625],
+                light,
+                quads,
+            ),
+            BlockShape::DoorPanel => shape_box(
+                block,
+                cell,
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 0.1875],
+                light,
+                quads,
+            ),
+            BlockShape::ThinLayer => {
+                let layer = f32::from(block.shape_parameter().clamp(1, 2)) / 16.0;
+                shape_box(
+                    block,
+                    cell,
+                    [0.0, 0.0, 0.0],
+                    [1.0, layer, 1.0],
+                    light,
+                    quads,
+                );
+            }
+            BlockShape::BedHalf => shape_box(
+                block,
+                cell,
+                [0.0, 0.0, 0.0],
+                [1.0, 0.5625, 1.0],
+                light,
+                quads,
+            ),
+        }
+    }
+}
+
 pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
     view: &SectionView<'_>,
     scratch: &mut MesherScratch,
@@ -2450,6 +2643,15 @@ pub(crate) fn mesh_section_with_scratch<S: QuadSink>(
         return;
     }
     let scan = load_interior(view.blocks, view.block_light, view.sky_light, scratch);
+    if scan.any_shape {
+        mesh_non_cube_shapes(
+            view.blocks,
+            view.block_light,
+            view.sky_light,
+            y_offset,
+            quads,
+        );
+    }
     if !scan.any_cube && !scan.any_fluid {
         return;
     }
@@ -2574,7 +2776,13 @@ mod tests {
     }
 
     #[inline(always)]
-    fn shade_corner_unpacked(base: CornerBase, a: SideSample, b: SideSample, od: u8, ld: u8) -> u64 {
+    fn shade_corner_unpacked(
+        base: CornerBase,
+        a: SideSample,
+        b: SideSample,
+        od: u8,
+        ld: u8,
+    ) -> u64 {
         let both = a.occ & b.occ;
         let ao = if both != 0 { 0 } else { 3 - a.occ - b.occ - od };
         let (d_bl, d_sk) = if both != 0 {

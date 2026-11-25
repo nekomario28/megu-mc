@@ -129,6 +129,12 @@ pub struct CliConfig {
     pub audio_sink: AudioSinkKind,
     pub ticks: u32,
     pub view_distance: i8,
+    /// Optional singleplayer server defaults supplied by `--gamemode` and
+    /// `--difficulty`.
+    pub game_mode: Option<String>,
+    pub difficulty: Option<String>,
+    /// `--hardcore`: request a hardcore singleplayer world.
+    pub hardcore: bool,
     pub assets_json: Option<PathBuf>,
     pub script: ScriptMode,
     pub json_summary: bool,
@@ -257,6 +263,9 @@ impl Default for CliConfig {
             audio_sink: AudioSinkKind::Auto,
             ticks: 40,
             view_distance: 2,
+            game_mode: None,
+            difficulty: None,
+            hardcore: false,
             assets_json: None,
             script: ScriptMode::Idle,
             json_summary: false,
@@ -339,6 +348,9 @@ impl fmt::Debug for CliConfig {
             .field("audio_sink", &self.audio_sink)
             .field("ticks", &self.ticks)
             .field("view_distance", &self.view_distance)
+            .field("game_mode", &self.game_mode)
+            .field("difficulty", &self.difficulty)
+            .field("hardcore", &self.hardcore)
             .field("assets_json", &self.assets_json)
             .field("script", &self.script)
             .field("json_summary", &self.json_summary)
@@ -874,6 +886,24 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 cfg.quick_play_singleplayer = Some(take_val(flag, &mut i)?);
             }
             "--server" => cfg.server = Some(take_val(flag, &mut i)?),
+            "--gamemode" => {
+                let value = take_val(flag, &mut i)?.to_ascii_lowercase();
+                if !matches!(
+                    value.as_str(),
+                    "survival" | "creative" | "adventure" | "spectator"
+                ) {
+                    return Err(format!("invalid --gamemode '{value}'"));
+                }
+                cfg.game_mode = Some(value);
+            }
+            "--difficulty" => {
+                let value = take_val(flag, &mut i)?.to_ascii_lowercase();
+                if !matches!(value.as_str(), "peaceful" | "easy" | "normal" | "hard") {
+                    return Err(format!("invalid --difficulty '{value}'"));
+                }
+                cfg.difficulty = Some(value);
+            }
+            "--hardcore" => cfg.hardcore = true,
             "--join-code" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.join_code = Some(
@@ -1207,6 +1237,9 @@ LAUNCHER COMPATIBILITY FLAGS:
   --port <port>                      Server port (default: 25565)
   --server-bin <path>                megu server binary for --quickPlaySingleplayer
   --seed <seed>                      World seed for a new --quickPlaySingleplayer world
+  --gamemode <mode>                  Singleplayer default: survival, creative, adventure, spectator
+  --difficulty <level>               Singleplayer difficulty: peaceful, easy, normal, hard
+  --hardcore                          Request a hardcore singleplayer world
 
 NATIVE CLIENT FLAGS:
   --mc-version <ver>                 Client protocol: 1.21.1|26.3 or 767|777 (default: 1.21.1)
@@ -1336,6 +1369,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn parses_singleplayer_gamemode_difficulty_and_hardcore_defaults() {
+        let defaults = CliConfig::default();
+        assert_eq!(defaults.game_mode, None);
+        assert_eq!(defaults.difficulty, None);
+        assert!(!defaults.hardcore);
+
+        let cfg =
+            parse_args(&["--gamemode=creative", "--difficulty", "hard", "--hardcore"]).unwrap();
+        assert_eq!(cfg.game_mode.as_deref(), Some("creative"));
+        assert_eq!(cfg.difficulty.as_deref(), Some("hard"));
+        assert!(cfg.hardcore);
+        assert!(parse_args(&["--gamemode", "hardcore"]).is_err());
+        assert!(parse_args(&["--difficulty", "extreme"]).is_err());
     }
 
     fn write_file(dir: &Path, name: &str, text: &str) -> PathBuf {

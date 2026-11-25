@@ -93,6 +93,25 @@ pub const NO_FLUID: u8 = 0;
 pub const WATER: u8 = 1;
 pub const LAVA: u8 = 2;
 
+/// Compact render geometry class. The value is packed into `fluid_level` for
+/// non-fluid blocks so the stable `Block` layout and existing struct literals
+/// remain unchanged.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BlockShape {
+    #[default]
+    Cube = 0,
+    CrossPlant = 1,
+    SlabBottom = 2,
+    SlabTop = 3,
+    Stair = 4,
+    Torch = 5,
+    FencePost = 6,
+    DoorPanel = 7,
+    ThinLayer = 8,
+    BedHalf = 9,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Block {
@@ -125,6 +144,44 @@ impl Block {
         }
     }
 
+    pub const fn with_shape(mut self, shape: BlockShape) -> Self {
+        if self.fluid_kind == NO_FLUID && self.flags & WATERLOGGED == 0 {
+            self.fluid_level = shape as u8;
+        }
+        self
+    }
+
+    pub const fn shape(self) -> BlockShape {
+        if self.fluid() != NO_FLUID || self.flags & WATERLOGGED != 0 {
+            return BlockShape::Cube;
+        }
+        match self.fluid_level & 0x0f {
+            1 => BlockShape::CrossPlant,
+            2 => BlockShape::SlabBottom,
+            3 => BlockShape::SlabTop,
+            4 => BlockShape::Stair,
+            5 => BlockShape::Torch,
+            6 => BlockShape::FencePost,
+            7 => BlockShape::DoorPanel,
+            8 => BlockShape::ThinLayer,
+            9 => BlockShape::BedHalf,
+            _ => BlockShape::Cube,
+        }
+    }
+
+    /// Pack a small shape-specific parameter in the spare high nibble.
+    pub const fn with_shape_parameter(mut self, parameter: u8) -> Self {
+        if self.fluid_kind == NO_FLUID && self.flags & WATERLOGGED == 0 {
+            let parameter = if parameter > 15 { 15 } else { parameter };
+            self.fluid_level = (self.fluid_level & 0x0f) | (parameter << 4);
+        }
+        self
+    }
+
+    pub const fn shape_parameter(self) -> u8 {
+        self.fluid_level >> 4
+    }
+
     pub(crate) fn occludes(self, side: Direction) -> bool {
         self.flags & OPAQUE != 0 && self.occlusion & side.bit() != 0
     }
@@ -134,7 +191,7 @@ impl Block {
         self.flags & (OPAQUE | CUTOUT | TRANSLUCENT) != 0 || self.fluid() != NO_FLUID
     }
 
-    pub(crate) fn fluid(self) -> u8 {
+    pub(crate) const fn fluid(self) -> u8 {
         if self.flags & WATERLOGGED != 0 {
             return WATER;
         }
