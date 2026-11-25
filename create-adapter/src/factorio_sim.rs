@@ -26,6 +26,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::create_compat::CREATE_MAX_RPM;
+
 // ===========================================================================
 // 1. O(1) gap-encoded Create mechanical belt transport line
 // ===========================================================================
@@ -191,10 +193,16 @@ impl CreateBeltLine {
     /// the steady-state path.
     pub fn set_rpm(&mut self, rpm: i32) {
         let step = rpm_to_belt_step(rpm);
-        let forward = step >= 0;
-        if forward != self.forward {
+        // Zero RPM is a stop, not a direction flip. Create belts preserve
+        // their geometric orientation while halted; treating the stop as
+        // "forward" mirrored a reversed line in place and scrambled the
+        // deterministic extraction order without moving a single item.
+        if rpm > 0 && !self.forward {
             self.reverse_items();
-            self.forward = forward;
+            self.forward = true;
+        } else if rpm < 0 && self.forward {
+            self.reverse_items();
+            self.forward = false;
         }
         self.step = step.unsigned_abs();
     }
@@ -345,6 +353,14 @@ pub const RPM_FP_ONE: i64 = 1 << 16;
 /// Whole RPM → fixed-point.
 pub fn rpm_fp(rpm: i64) -> i64 {
     rpm * RPM_FP_ONE
+}
+
+/// Create's default hard rotation-speed ceiling in fixed-point RPM.
+pub const CREATE_MAX_RPM_FP: i64 = CREATE_MAX_RPM * RPM_FP_ONE;
+
+/// Clamp a signed fixed-point RPM to Create's symmetric ±256 RPM ceiling.
+pub fn clamp_create_rpm_fp(rpm: i64) -> i64 {
+    rpm.clamp(-CREATE_MAX_RPM_FP, CREATE_MAX_RPM_FP)
 }
 
 /// `num/den` gear ratio → signed fixed-point (negative flips direction).
@@ -862,14 +878,31 @@ impl KineticNetworkPool {
             capacity += self.capacity[mi];
             impact += self.impact[mi];
             if self.drive_rpm[mi] != 0 {
-                let base = (i128::from(self.drive_rpm[mi]) * i128::from(RPM_FP_ONE)
-                    / i128::from(self.scales[mi])) as i64;
-                match drive_base {
-                    None => drive_base = Some(base),
-                    Some(prev) => conflict |= prev != base,
+                if self.scales[mi] == 0 {
+                    // Deep fixed-point gear chains can underflow a passive
+                    // scale to zero. That topology has no representable
+                    // downstream speed; flag a jam instead of dividing by
+                    // zero or silently inventing motion.
+                    conflict = true;
+                } else {
+                    let base = (i128::from(self.drive_rpm[mi]) * i128::from(RPM_FP_ONE)
+                        / i128::from(self.scales[mi])) as i64;
+                    match drive_base {
+                        None => drive_base = Some(base),
+                        Some(prev) => conflict |= prev != base,
+                    }
                 }
             }
         }
+        // A zero scale anywhere in a driven component means the fixed-point
+        // topology lost a gear ratio entirely. Even when the zero-scale node
+        // is passive, publishing `Running` at 0 RPM would silently invent a
+        // stopped machine; fail closed as a jam instead.
+        conflict |= drive_base.is_some_and(|base| base != 0)
+            && self
+                .members
+                .iter()
+                .any(|&member| self.scales[member as usize] == 0);
         let status = if conflict {
             KineticStatus::Conflict
         } else if drive_base.is_none() {
@@ -886,7 +919,9 @@ impl KineticNetworkPool {
         for &m in &self.members {
             let mi = m as usize;
             self.rpm[mi] = if status == KineticStatus::Running {
-                ((i128::from(base_rpm) * i128::from(self.scales[mi])) >> 16) as i64
+                clamp_create_rpm_fp(
+                    ((i128::from(base_rpm) * i128::from(self.scales[mi])) >> 16) as i64,
+                )
             } else {
                 0
             };
