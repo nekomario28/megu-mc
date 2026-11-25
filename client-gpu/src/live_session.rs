@@ -5547,6 +5547,37 @@ impl LiveSession {
                 self.set_beacon(*primary, *secondary)
             }
             WorkstationAction::SelectTrade(index) => self.select_trade(*index),
+            WorkstationAction::ClickButton(button_id) => {
+                let Some(window_id) = self
+                    .open_screen
+                    .as_ref()
+                    .and_then(|screen| u8::try_from(screen.window_id).ok())
+                else {
+                    return false;
+                };
+                self.outgoing
+                    .try_send(WorkerCommand::ContainerButtonClick {
+                        window_id,
+                        button_id: *button_id,
+                    })
+                    .is_ok()
+            }
+            WorkstationAction::ToggleCrafterSlot { slot, disabled } => {
+                if !(0..9).contains(slot) {
+                    return false;
+                }
+                let Some(window_id) = self.open_screen.as_ref().map(|screen| screen.window_id)
+                else {
+                    return false;
+                };
+                self.outgoing
+                    .try_send(WorkerCommand::ContainerSlotStateChanged {
+                        slot_id: *slot,
+                        window_id,
+                        state: *disabled,
+                    })
+                    .is_ok()
+            }
         }
     }
 
