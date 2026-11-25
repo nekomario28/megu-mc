@@ -10,6 +10,57 @@ pub(crate) enum ContainerKey {
     Block(DimBlockPos),
     Cart([u8; 16]),
 }
+
+#[cfg(test)]
+mod alpha4_fishing_loot_tests {
+    use super::*;
+
+    #[test]
+    fn fishing_formulas_pin_vanilla_category_weights_and_wait() {
+        assert_eq!(fishing_category_weights(0, true), (85, 10, 5));
+        assert_eq!(fishing_category_weights(3, true), (82, 4, 11));
+        assert_eq!(fishing_category_weights(3, false), (82, 4, 0));
+        assert_eq!(fishing_category_weights(100, true), (0, 0, 205));
+        assert_eq!(fishing_wait_ticks(0, 0), 100);
+        assert_eq!(fishing_wait_ticks(0, 500), 600);
+        assert_eq!(fishing_wait_ticks(3, 500), 300);
+        assert_eq!(fishing_wait_ticks(3, 0), 20);
+    }
+
+    #[test]
+    fn open_water_check_checks_all_100_cells_and_rejects_obstructions() {
+        let water = |_x, y, _z| (y <= 0, y > 0, false);
+        assert!(is_open_water_check(water, 0, 0, 0));
+        let obstructed = |x, y, z| (y <= 0, y > 0, x == 2 && y == 1 && z == 0);
+        assert!(!is_open_water_check(obstructed, 0, 0, 0));
+        let mut seen = std::collections::HashSet::new();
+        is_open_water_check(|x, y, z| { seen.insert((x, y, z)); (y <= 10, y > 10, false) }, 4, 10, -3);
+        assert_eq!(seen.len(), 100);
+    }
+
+    #[test]
+    fn empty_datapack_catalogue_fills_vanilla_structure_chests_and_dispenser() {
+        let tables = loot_tables();
+        let mut loaded = tables.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::take(&mut *loaded);
+        drop(loaded);
+        for (name, id) in [
+            ("desert_pyramid", "minecraft:chests/desert_pyramid"),
+            ("jungle_temple", "minecraft:chests/jungle_temple"),
+            ("jungle_temple_dispenser", "minecraft:chests/jungle_temple_dispenser"),
+            ("simple_dungeon", "minecraft:chests/simple_dungeon"),
+            ("trial_chambers_reward", "minecraft:chests/trial_chambers/reward"),
+        ] {
+            let result = roll_loot_container_slots(
+                crate::generation_payload::ContainerKind::Chest,
+                id,
+                Some(4242),
+            );
+            assert!(!result.is_empty(), "{name} should have built-in loot");
+        }
+        *tables.lock().unwrap_or_else(|e| e.into_inner()) = previous;
+    }
+}
 impl ContainerKey {
     /// The Overworld block key every dimension-less caller means until S3 threads a dimension
     /// through it.
@@ -667,6 +718,32 @@ struct Drop {
     target: Option<[u8; 16]>,
     thrower: Option<[u8; 16]>,
 }
+/// The `SimItem` view lets the `megu_core::zero_change_sim` merge kernels run
+/// the live drop pool — `same_stack` is the exact vanilla mergeability test
+/// (item id, pickup target, component blob; `thrower` deliberately absent).
+impl megu_core::zero_change_sim::SimItem for Drop {
+    fn eid(&self) -> i32 {
+        self.eid
+    }
+    fn pos(&self) -> [f64; 3] {
+        [self.x, self.y, self.z]
+    }
+    fn age(&self) -> i32 {
+        self.age
+    }
+    fn count(&self) -> u32 {
+        u32::from(self.cnt)
+    }
+    fn set_count(&mut self, cnt: u32) {
+        self.cnt = cnt.min(u32::from(u8::MAX)) as u8;
+    }
+    fn stack_cap(&self) -> u32 {
+        item_stack_max(self.item, &self.comps).max(1) as u32
+    }
+    fn same_stack(&self, other: &Self) -> bool {
+        self.item == other.item && self.target == other.target && self.comps == other.comps
+    }
+}
 impl Drop {
     /// Vanilla keeps an ItemEntity out of reach for its pickup delay. Both collectors of a
     /// drop ask this one question: the fake-actor absorb and the real client's take. The
@@ -860,133 +937,6 @@ fn collect_pkt(drop_eid: i32, collector: i32, count: u8) -> Vec<u8> {
     p
 }
 
-/// The cell -> member index both merge scans use, sized once from the item count.
-///
-/// A `HashMap` is the wrong shape for this: there are no removals, the key is three
-/// integers, every bucket is a short list, and the scan probes the own cell plus its
-/// 26 neighbours for every item (16,200 probes for 600 entities). Measured on the
-/// entity-heavy fixture, the SipHash probe was the whole cost of the merge - 84 us of
-/// walking the neighbourhood plus 25 us of building the map, in a 127 us `drops` stage,
-/// and 105 us of a 135 us `environment` stage - while the distance test it guards is
-/// under a nanosecond. This is a chained table over pre-sized arrays: no
-/// resizing, no per-cell allocation, a probe that is three multiplies and a mask, and
-/// an exact key comparison so a collision changes speed and nothing else.
-struct CellBuckets {
-    cell: Vec<(i32, i32, i32)>,
-    used: Vec<bool>,
-    head: Vec<u32>,
-    next: Vec<u32>,
-    mask: usize,
-}
-
-const NO_MEMBER: u32 = u32::MAX;
-
-impl CellBuckets {
-    /// The empty index a thread-local scratch slot starts from; `reset` grows
-    /// it on first use.
-    const EMPTY: CellBuckets = CellBuckets {
-        cell: Vec::new(),
-        used: Vec::new(),
-        head: Vec::new(),
-        next: Vec::new(),
-        mask: 0,
-    };
-
-    fn new(items: usize) -> Self {
-        // At most `items` distinct cells, and a load factor of at most one half.
-        let cap = (items.max(4) * 2).next_power_of_two();
-        CellBuckets {
-            cell: vec![(0, 0, 0); cap],
-            used: vec![false; cap],
-            head: vec![NO_MEMBER; cap],
-            next: vec![NO_MEMBER; items],
-            mask: cap - 1,
-        }
-    }
-
-    /// Rebuild for `items` reusing the existing allocation when the table
-    /// size matches — `cell` needs no clearing because every read is gated
-    /// by `used`.
-    fn reset(&mut self, items: usize) {
-        let cap = (items.max(4) * 2).next_power_of_two();
-        if self.cell.len() != cap {
-            *self = CellBuckets::new(items);
-            return;
-        }
-        self.used.fill(false);
-        self.head.fill(NO_MEMBER);
-        self.next.clear();
-        self.next.resize(items, NO_MEMBER);
-    }
-
-    /// Rough heap footprint of the table, for the scratch cap.
-    fn byte_capacity(&self) -> usize {
-        self.cell.capacity() * std::mem::size_of::<(i32, i32, i32)>()
-            + self.used.capacity()
-            + (self.head.capacity() + self.next.capacity()) * std::mem::size_of::<u32>()
-    }
-
-    #[inline]
-    fn slot(&self, cell: (i32, i32, i32)) -> usize {
-        let h = (cell.0 as u32)
-            .wrapping_mul(0x9E37_79B1)
-            .wrapping_add((cell.1 as u32).wrapping_mul(0x85EB_CA77))
-            .wrapping_add((cell.2 as u32).wrapping_mul(0xC2B2_AE3D));
-        // xorshift mix: the multiply chain alone leaves low-bit structure that a mask
-        // and a linear probe would turn into long clusters.
-        let h = h ^ (h >> 15) ^ (h >> 7);
-        (h as usize) & self.mask
-    }
-
-    /// Link `idx` into `cell`'s bucket. The chain runs newest first, so a bucket is
-    /// walked in descending index order; both callers sort their candidates before
-    /// comparing, because the merge contract is ascending index order.
-    fn push(&mut self, cell: (i32, i32, i32), idx: u32) {
-        let mut at = self.slot(cell);
-        while self.used[at] && self.cell[at] != cell {
-            at = (at + 1) & self.mask;
-        }
-        if !self.used[at] {
-            self.used[at] = true;
-            self.cell[at] = cell;
-        }
-        self.next[idx as usize] = self.head[at];
-        self.head[at] = idx;
-    }
-
-    /// The members of `cell`, in no particular order; `None` when no item is there.
-    #[inline]
-    fn members(&self, cell: (i32, i32, i32)) -> Option<u32> {
-        let mut at = self.slot(cell);
-        while self.used[at] {
-            if self.cell[at] == cell {
-                return Some(self.head[at]);
-            }
-            at = (at + 1) & self.mask;
-        }
-        None
-    }
-}
-
-/// Walk one cell's members into `out`, keeping only indices past `after`.
-fn collect_members(
-    buckets: &CellBuckets,
-    cell: (i32, i32, i32),
-    after: usize,
-    out: &mut Vec<usize>,
-) {
-    let Some(mut member) = buckets.members(cell) else {
-        return;
-    };
-    while member != NO_MEMBER {
-        let idx = member as usize;
-        if idx > after {
-            out.push(idx);
-        }
-        member = buckets.next[idx];
-    }
-}
-
 /// Vanilla merges same-item drops within ~0.5 blocks into one stack (fits <=64); the
 /// merged entity keeps the fresher age.
 ///
@@ -1005,76 +955,14 @@ fn merge_drops(dp: &mut [Drop]) -> Vec<i32> {
     }
     let __prof = tickprof::enabled();
     let mut __t = __prof.then(std::time::Instant::now);
-    let mut buckets =
-        MERGE_CELL_SCRATCH.with(|s| std::mem::replace(&mut *s.borrow_mut(), CellBuckets::EMPTY));
-    buckets.reset(dp.len());
-    for (idx, d) in dp.iter().enumerate() {
-        buckets.push(
-            (d.x.floor() as i32, d.y.floor() as i32, d.z.floor() as i32),
-            idx as u32,
-        );
-    }
-    if let Some(t) = __t {
-        tickprof::add("drops/merge_cells", t.elapsed());
-    }
-    __t = __prof.then(std::time::Instant::now);
-    let mut merged: Vec<i32> = Vec::new();
-    let mut candidates = MERGE_CAND_SCRATCH.with(scratch_take);
-    for i in 0..dp.len() {
-        let (cx, cy, cz) = (
-            dp[i].x.floor() as i32,
-            dp[i].y.floor() as i32,
-            dp[i].z.floor() as i32,
-        );
-        candidates.clear();
-        // checked arithmetic: a drop whose cell is at the i32 limit has no neighbour
-        // there, and wrapping would invent a cell that aliases.
-        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    let key = (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz));
-                    if let (Some(kx), Some(ky), Some(kz)) = key {
-                        collect_members(&buckets, (kx, ky, kz), i, &mut candidates);
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable();
-        for &j in candidates.iter() {
-            let (ax, ay, az, ait, acnt, aage) = {
-                let a = &dp[i];
-                (a.x, a.y, a.z, a.item, a.cnt, a.age)
-            };
-            let (bx, by, bz, bit, bcnt, bage) = {
-                let b = &dp[j];
-                (b.x, b.y, b.z, b.item, b.cnt, b.age)
-            };
-            // Cheap integer and distance tests first; the component blobs are a Vec
-            // comparison, so they run only for a real candidate.
-            if ait == bit
-                && dp[i].target == dp[j].target
-                && (ax - bx).powi(2) + (ay - by).powi(2) + (az - bz).powi(2) < 0.25
-                && dp[i].comps == dp[j].comps
-                && acnt as u16 + bcnt as u16 <= item_stack_max(ait, &dp[i].comps) as u16
-            {
-                let (keep, eat) = if aage <= bage { (i, j) } else { (j, i) };
-                dp[keep].cnt = dp[keep].cnt.saturating_add(dp[eat].cnt);
-                merged.push(dp[eat].eid);
-                break;
-            }
-        }
-    }
+    // `ReusableCellMerger::merge_items` reproduces this scan bit-identically —
+    // integer cell buckets, ascending-index candidates, the exact same-stack
+    // test, `dist^2 < 0.25`, older-keeps order — while bucketing and scanning
+    // inside its own retained scratch instead of the MERGE_*_SCRATCH pair.
+    let merged = XP_DROP_MERGER.with(|m| m.borrow_mut().merge_items(dp).to_vec());
     if let Some(t) = __t {
         tickprof::add("drops/merge_scan", t.elapsed());
     }
-    MERGE_CAND_SCRATCH.with(|s| scratch_return(s, candidates));
-    MERGE_CELL_SCRATCH.with(|s| {
-        *s.borrow_mut() = if buckets.byte_capacity() <= SCRATCH_CAP_BYTES {
-            buckets
-        } else {
-            CellBuckets::EMPTY
-        };
-    });
     merged
 }
 
@@ -1185,149 +1073,26 @@ fn drop_spawn_scattered(
     eid
 }
 
-/// Stable FNV-1a over a drop's merge key (component blob + pickup target):
-/// the `component_hash` `merge_item_stacks` partitions by under `mod-suite`.
-/// `thrower` does not join the key — `merge_drops` does not compare it.
-#[cfg(feature = "mod-suite")]
-fn drop_merge_hash(comps: &Comps, target: &Option<[u8; 16]>) -> u64 {
-    let mut h = megu_core::hash::Fnv1a64::new();
-    for (ty, data) in comps {
-        h.update(&ty.to_be_bytes());
-        h.update(data);
-    }
-    match target {
-        Some(t) => h.update(t),
-        None => h.update_u8(0xff),
-    }
-    h.finish()
-}
-
-/// The merge kernel over one partitioned pool (keepers first, donors after,
-/// both in `drops` order, parallel `cnts`/`maxes`). Under `mod-suite` this is
-/// `mod_offload::entity_spatial::merge_item_stacks` directly; the local build
-/// runs the same cell-bucketed scan — cell size 2.0, radius 0.5, same
-/// item+key, bounded by both stack sizes — so both builds agree.
-#[cfg(feature = "mod-suite")]
-fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
-    let mut items: Vec<mod_offload::entity_spatial::DroppedItem> = pool
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| mod_offload::entity_spatial::DroppedItem {
-            id: k as u32,
-            pos: [dp[i].x, dp[i].y, dp[i].z],
-            vel: [0.0; 3],
-            item_id: dp[i].item.max(0) as u32,
-            component_hash: drop_merge_hash(&dp[i].comps, &dp[i].target),
-            count: cnts[k],
-            max_stack_size: maxes[k],
-        })
-        .collect();
-    mod_offload::entity_spatial::merge_item_stacks(&mut items);
-    for d in &items {
-        cnts[d.id as usize] = d.count;
-    }
-}
-
-#[cfg(not(feature = "mod-suite"))]
-fn drop_merge_run(pool: &[usize], dp: &[Drop], cnts: &mut [u32], maxes: &[u32]) {
-    const CELL: f64 = 2.0;
-    let mut cells: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::with_capacity(cnts.len());
-    let mut candidates: Vec<usize> = Vec::new();
-    for i in 0..cnts.len() {
-        if cnts[i] == 0 {
-            continue;
-        }
-        let (px, py, pz) = (dp[pool[i]].x, dp[pool[i]].y, dp[pool[i]].z);
-        let (cx, cy, cz) = (
-            (px / CELL).floor() as i32,
-            (py / CELL).floor() as i32,
-            (pz / CELL).floor() as i32,
-        );
-        candidates.clear();
-        for dx in -1..=1i32 {
-            for dy in -1..=1i32 {
-                for dz in -1..=1i32 {
-                    if let (Some(kx), Some(ky), Some(kz)) = (
-                        cx.checked_add(dx),
-                        cy.checked_add(dy),
-                        cz.checked_add(dz),
-                    ) {
-                        if let Some(list) = cells.get(&(kx, ky, kz)) {
-                            candidates.extend_from_slice(list);
-                        }
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable();
-        let mut alive = true;
-        for &j in &candidates {
-            let (qx, qy, qz) = (dp[pool[j]].x, dp[pool[j]].y, dp[pool[j]].z);
-            let a = &dp[pool[i]];
-            let b = &dp[pool[j]];
-            if a.item == b.item
-                && a.target == b.target
-                && a.comps == b.comps
-                && (px - qx).powi(2) + (py - qy).powi(2) + (pz - qz).powi(2) <= 0.25
-            {
-                let max = maxes[j].min(maxes[i]);
-                let transfer = cnts[i].min(max.saturating_sub(cnts[j]));
-                cnts[j] += transfer;
-                cnts[i] -= transfer;
-                if cnts[i] == 0 {
-                    alive = false;
-                    break;
-                }
-            }
-        }
-        if alive {
-            cells.entry((cx, cy, cz)).or_default().push(i);
-        }
-    }
-}
-
 /// Merge `pending` donor eids into the locked drop pool. Keepers (pre-existing
 /// drops) precede donors in the pool, so a fresh drop feeds the earliest
 /// compatible neighbour within 0.5 up to `item_stack_max`; tombstoned drops
 /// are removed in one `retain` pass. Returns the absorbed eids in merge order.
 fn drop_merge_pending_locked(dp: &mut Vec<Drop>, pending: &HashSet<i32>) -> Vec<i32> {
-    let mut pool: Vec<usize> = Vec::with_capacity(dp.len());
-    pool.extend(
-        dp.iter()
-            .enumerate()
-            .filter(|(_, d)| !pending.contains(&d.eid) && d.cnt > 0)
-            .map(|(i, _)| i),
-    );
-    pool.extend(
-        dp.iter()
-            .enumerate()
-            .filter(|(_, d)| pending.contains(&d.eid) && d.cnt > 0)
-            .map(|(i, _)| i),
-    );
-    if pool.len() < 2 {
-        return Vec::new();
-    }
-    let mut cnts: Vec<u32> = pool.iter().map(|&i| u32::from(dp[i].cnt)).collect();
-    let maxes: Vec<u32> = pool
-        .iter()
-        .map(|&i| item_stack_max(dp[i].item, &dp[i].comps).max(1) as u32)
-        .collect();
-    drop_merge_run(&pool, dp, &mut cnts, &maxes);
-    let mut eaten = HashSet::new();
-    let mut order = Vec::new();
-    for (k, &i) in pool.iter().enumerate() {
-        if cnts[k] == 0 {
-            if eaten.insert(dp[i].eid) {
-                order.push(dp[i].eid);
-            }
-        } else {
-            dp[i].cnt = cnts[k].min(u32::from(u8::MAX)) as u8;
-        }
-    }
+    // `ReusableCellMerger::merge_pending_items` is the same keeper/donor
+    // kernel both builds used to pick between — 2.0 cells, the exact
+    // same-stack compare, `cnt`/`max` transfer bound, `u8::MAX` clamp on
+    // survivors — so `mod-suite` and local runs share one engine instead of
+    // mirroring `merge_item_stacks`.
+    let eaten = XP_DROP_MERGER.with(|m| {
+        m.borrow_mut()
+            .merge_pending_items(dp, |eid| pending.contains(&eid))
+            .to_vec()
+    });
     if !eaten.is_empty() {
-        dp.retain(|d| !eaten.contains(&d.eid));
+        let gone: HashSet<i32> = eaten.iter().copied().collect();
+        dp.retain(|d| !gone.contains(&d.eid));
     }
-    order
+    eaten
 }
 
 /// Collapse freshly spawned drops into their older neighbours — the merge the
@@ -1932,11 +1697,11 @@ thread_local! {
     /// `chest_viewer_tick_on`'s per-viewer slot-diff batch.
     static CHEST_SYNC_SCRATCH: std::cell::RefCell<Vec<(i16, i32, Stack)>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// `merge_drops`' cell index and candidate list.
-    static MERGE_CELL_SCRATCH: std::cell::RefCell<CellBuckets> =
-        const { std::cell::RefCell::new(CellBuckets::EMPTY) };
-    static MERGE_CAND_SCRATCH: std::cell::RefCell<Vec<usize>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// `merge_drops`/`merge_xp_orbs`/`drop_merge_pending_locked`'s shared
+    /// merge engine: cell index, candidates and output all retained across
+    /// calls, replacing the per-pass `CellBuckets`/`Vec` scratch pair.
+    static XP_DROP_MERGER: std::cell::RefCell<megu_core::zero_change_sim::ReusableCellMerger> =
+        std::cell::RefCell::new(megu_core::zero_change_sim::ReusableCellMerger::new());
     /// `drop_tick`'s despawn eid list.
     static DROP_DESPAWN_SCRATCH: std::cell::RefCell<Vec<i32>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -3094,11 +2859,10 @@ fn drop_tick() {
             }
             DROP_DESPAWN_SCRATCH.with(|s| scratch_return(s, burned));
         }
-        while dp.len() > DROP_CAP {
-            let d = dp.remove(0);
+        evict_oldest_front(&mut dp, DROP_CAP, |d| {
             death_slot_hint_forget(d.eid);
             broadcast_seen_destroy(d.eid);
-        }
+        });
         if let Some(t) = __t {
             tickprof::add("drops/despawn", t.elapsed());
         }
@@ -3371,6 +3135,72 @@ fn fuel_ticks(item: i64) -> i32 {
 }
 static CHESTS: Registry<ContainerKey, HashMap<i16, Stack>> = OnceLock::new();
 
+pub(crate) fn fishing_category_weights(luck: i32, open_water: bool) -> (i32, i32, i32) {
+    (
+        (85 - luck).max(0),
+        (10 - 2 * luck).max(0),
+        if open_water { (5 + 2 * luck).max(0) } else { 0 },
+    )
+}
+
+pub(crate) fn fishing_wait_ticks(lure: i32, rng_roll: u32) -> u32 {
+    (100 + rng_roll.min(500))
+        .saturating_sub((lure.max(0) as u32).saturating_mul(100))
+        .max(20)
+}
+
+pub(crate) fn is_open_water_check(
+    mut state_at: impl FnMut(i32, i32, i32) -> (bool, bool, bool),
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
+    for dx in -2..=2 {
+        for dz in -2..=2 {
+            for dy in -2..=1 {
+                let (water_source, air_or_lily, solid) = state_at(x + dx, y + dy, z + dz);
+                if solid || (dy <= 0 && !water_source) || (dy > 0 && !air_or_lily) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+pub(crate) fn fishing_enchant_levels(client: &Client) -> (i32, i32) {
+    let selected = *client.held.lock().unwrap_or_else(|e| e.into_inner());
+    let inventory = client.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let components = inventory
+        .get(&(36 + selected))
+        .map(|stack| &stack.2);
+    components.map_or((0, 0), |components| {
+        (
+            enchant_level(components, 20).clamp(0, i32::MAX as i64) as i32,
+            enchant_level(components, 21).clamp(0, i32::MAX as i64) as i32,
+        )
+    })
+}
+
+pub(crate) fn fishing_open_water(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let Some(registry) = breg() else { return false };
+    let water = name_to_state("water").unwrap_or(u32::MAX);
+    let lily = name_to_state("lily_pad").unwrap_or(u32::MAX);
+    is_open_water_check(
+        |bx, by, bz| {
+            let state = block_at_dim(dim, bx, by, bz);
+            (
+                state == water,
+                registry.is_air(state) || state == lily,
+                registry.is_solid(state),
+            )
+        },
+        x,
+        y,
+        z,
+    )
+}
+
 fn roll_loot_container_slots(
     kind: crate::generation_payload::ContainerKind,
     loot_table: &str,
@@ -3404,8 +3234,28 @@ fn roll_loot_container_slots(
                 .collect::<Vec<_>>()
         });
         let mut out = HashMap::new();
-        if let Some(pools) = pools {
-            let items = roll_loot_seeded(&pools, seed);
+        let items = if let Some(pools) = pools {
+            roll_loot_seeded(&pools, seed)
+        } else {
+            crate::chest_loot::vanilla_loot_roll(loot_table, seed)
+                .into_iter()
+                .filter_map(|entry| {
+                    let item = name_to_item(entry.item)?;
+                    let mut components = Vec::new();
+                    if let Some((name, level)) = entry.enchantment {
+                        if let Some(id) = enchant_id(name) {
+                            comp_set(
+                                &mut components,
+                                COMP_ENCHANTMENTS,
+                                enchantments_data(&[(id, i64::from(level))], true),
+                            );
+                        }
+                    }
+                    Some((item, entry.count, components))
+                })
+                .collect()
+        };
+        if !items.is_empty() {
             // `LootTable.fill` fills `container.getContainerSize()`
             // slots, so the native menu size bounds the roll.
             let slot_limit = match kind {
@@ -8541,9 +8391,7 @@ impl Vault {
         self.total_ejections_needed = items.len() as i32;
         self.items_to_eject = items;
         self.rewarded_players.push(player);
-        if self.rewarded_players.len() > 128 {
-            self.rewarded_players.remove(0);
-        }
+        evict_oldest_front(&mut self.rewarded_players, 128, |_| {});
         self.connected_players
             .retain(|&connected| connected != player);
         self.phase = VaultPhase::Unlocking;
@@ -13665,6 +13513,92 @@ fn json_smelts() -> &'static Mutex<Vec<SmeltRecipe>> {
     R.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// `ItemCooldowns` entry for `chorus_fruit`: vanilla arms a 20-tick (1 s)
+/// cooldown on every eat — `ChorusFruitItem.finishUsingItem` ends with
+/// `player.getItemCooldowns().addCooldown` — so a use inside it fails.
+static CHORUS_CD: Registry<i32, Instant> = OnceLock::new();
+fn chorus_cd() -> &'static Mutex<HashMap<i32, Instant>> {
+    CHORUS_CD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Entries die with the 1 s cooldown; the cap only binds pathological
+/// reconnect storms that never let the expiry sweep run.
+const MAX_CHORUS_CD_ENTRIES: usize = 4096;
+
+/// Whether `eid`'s chorus cooldown is still running server-side.
+fn chorus_on_cooldown(eid: i32) -> bool {
+    chorus_cd()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&eid)
+        .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+}
+
+/// Arm the cooldown and send `SetCooldown` (0x17) so the client greys the icon
+/// for 20 game ticks — the same wire shape the ender-pearl cooldown uses.
+fn chorus_cooldown_start(me: &Client, item: i64) {
+    {
+        let mut cds = chorus_cd().lock().unwrap_or_else(|e| e.into_inner());
+        // An entry is dead weight once the cooldown elapses; sweeping here
+        // keeps the map bounded by concurrent cooldowns, not lifetime eats.
+        cds.retain(|_, t| t.elapsed() < Duration::from_secs(1));
+        if cds.len() >= MAX_CHORUS_CD_ENTRIES && !cds.contains_key(&me.eid) {
+            if let Some(&oldest) = cds.keys().min() {
+                cds.remove(&oldest);
+            }
+        }
+        cds.insert(me.eid, Instant::now());
+    }
+    let mut cp = Vec::new();
+    write_varint(&mut cp, item);
+    write_varint(&mut cp, 20);
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x17, cp);
+}
+
+/// One `LivingEntity.randomTeleport` roll in the player's own dimension, as
+/// `ChorusFruitItem.finishUsingItem` drives it: `x`/`z` scatter ±8 blocks and
+/// `y` rolls ±8 clamped into `dim`'s build window; then the vanilla downward
+/// scan lands the player on the first motion-blocking floor, committing only
+/// when the feet and head cells are collision- and fluid-free. `None` is a
+/// failed roll — a void column or a landing inside a block — which the caller
+/// may re-roll up to sixteen times.
+fn find_chorus_teleport_spot_dim(
+    dim: DimId,
+    (px, py, pz): (f64, f64, f64),
+    (roll_x, roll_y, roll_z): (f64, i32, f64),
+) -> Option<(f64, f64, f64)> {
+    let reg = crate::block_registry::breg()?;
+    let nx = px + (roll_x - 0.5) * 16.0;
+    // `ChorusFruitItem` rolls `getY() + nextInt(16) - 8` as a double and clamps
+    // into `min_y ..= min_y + height - 2`; the scan's `containing` floors it.
+    let rolled_y = (py + roll_y as f64)
+        .clamp(dim.min_y() as f64, (dim.min_y() + dim.height() - 2) as f64);
+    let ny = rolled_y.floor() as i32;
+    let nz = pz + (roll_z - 0.5) * 16.0;
+    let (bx, bz) = (nx.floor() as i32, nz.floor() as i32);
+    // `randomTeleport` only descends: step down while the cell below does not
+    // stop motion; reaching the floor of the world unfounded fails the roll.
+    let mut y = ny;
+    while y > dim.min_y() && !reg.blocks_motion(block_at_dim(dim, bx, y - 1, bz)) {
+        y -= 1;
+    }
+    if y <= dim.min_y() {
+        return None;
+    }
+    // The standing box must be free of collisions and fluid before commit.
+    let feet = block_at_dim(dim, bx, y, bz);
+    let head = block_at_dim(dim, bx, y + 1, bz);
+    if reg.blocks_motion(feet)
+        || reg.blocks_motion(head)
+        || reg.is_liquid(feet)
+        || reg.is_liquid(head)
+    {
+        return None;
+    }
+    // `randomTeleport` decrements the rolled double y by whole steps, so the
+    // landing keeps the fraction the rolled y carried into the block.
+    Some((nx, y as f64 + (rolled_y - rolled_y.floor()), nz))
+}
+
 // air-use of the held item — shared by use_item (0x39) and the 1.21+
 // block_place form ({-1,255,-1}, face -1) that the protocol emits when a
 // usable item is activated in the air (bow draw, crossbow load, throws,
@@ -13707,17 +13641,53 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                                 })
                                 .collect()
                         });
-                    let (fish, fcnt, fcomps) = table
-                        .and_then(|p| roll_loot(&p).into_iter().next())
-                        .unwrap_or((
-                            if (b.age as u64).is_multiple_of(5) {
-                                936
-                            } else {
-                                935
-                            },
-                            1,
-                            Vec::new(),
-                        ));
+                    // Luck of the Sea: `apply_fishing_enchants` parked this
+                    // bobber's re-weighted catch table under the owner's eid
+                    // (`treasure = 5 + 2*luck` encodes the level exactly), so
+                    // the reel reads that store; the enchant scan is the
+                    // fallback for a bobber the movement tick never visited.
+                    let luck = fishing_luck()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&me.eid)
+                        .map(|w| (w.treasure - FISHING_BASE_WEIGHTS.treasure) / 2)
+                        .unwrap_or_else(|| fishing_enchant_levels(me).0);
+                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                    let open_water = fishing_open_water(
+                        dim,
+                        b.x.floor() as i32,
+                        b.y.floor() as i32,
+                        b.z.floor() as i32,
+                    );
+                    let context = crate::chest_loot::LootContext {
+                        luck: luck as f32,
+                        this_in_open_water: open_water,
+                        ..Default::default()
+                    };
+                    let built_in = crate::chest_loot::vanilla_loot_roll_with_context(
+                        "minecraft:gameplay/fishing",
+                        b.age as i64,
+                        &context,
+                    )
+                    .into_iter()
+                    .find_map(|entry| {
+                        let item = name_to_item(entry.item)?;
+                        let mut components = Vec::new();
+                        if let Some((name, level)) = entry.enchantment {
+                            if let Some(id) = enchant_id(name) {
+                                comp_set(
+                                    &mut components,
+                                    COMP_ENCHANTMENTS,
+                                    enchantments_data(&[(id, i64::from(level))], true),
+                                );
+                            }
+                        }
+                        Some((item, entry.count, components))
+                    });
+                    let catch = table.and_then(|p| roll_loot(&p).into_iter().next()).or(built_in);
+                    let Some((fish, fcnt, fcomps)) = catch else {
+                        return;
+                    };
                     let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
                     inv.insert(slot, (fish, fcnt, fcomps.clone()));
@@ -13726,6 +13696,14 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     p.extend_from_slice(&slot.to_be_bytes());
                     p.extend_from_slice(&slot_wire(&(fish, fcnt, fcomps)));
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                    drop(inv);
+                    let xp = (world_rng::next_u64() % 6 + 1) as i32;
+                    let _ = send_player_xp(me, |xp_state| {
+                        let _ = add_player_xp_points(xp_state, xp);
+                        Ok(())
+                    });
+                    damage_held(me);
+                    held_slot_resync(me);
                 }
             } else {
                 let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -13969,9 +13947,14 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
         };
         let cur_food = *me.food.lock().unwrap_or_else(|e| e.into_inner());
-        let edible = fc
-            .as_ref()
-            .is_some_and(|fc| cur_food < 20 || fc.can_always_eat);
+        // `ItemCooldowns.isOnCooldown` fails the use outright: a cooling-down
+        // chorus fruit never starts the eat.
+        let chorus_cd_hit =
+            it == name_to_item("chorus_fruit").unwrap_or(-9) && chorus_on_cooldown(me.eid);
+        let edible = !chorus_cd_hit
+            && fc
+                .as_ref()
+                .is_some_and(|fc| cur_food < 20 || fc.can_always_eat);
         if edible && !eat_release {
             // vanilla: eating holds use for 32 ticks; nothing consumed yet
             *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -14065,26 +14048,41 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                     broadcast_seen(me.eid, |_c| (0x43, pk.clone()));
                 }
             }
-            // chorus fruit: random teleport within +-8 blocks
+            // chorus fruit: `ChorusFruitItem.finishUsingItem` — up to sixteen
+            // `LivingEntity.randomTeleport` rolls inside the player's own
+            // dimension, then the vanilla 20-tick item cooldown whether a roll
+            // landed or not.
             if it == name_to_item("chorus_fruit").unwrap_or(-9) {
-                let (px, py, pz, ..) = {
-                    let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    *p
-                };
+                // `finishUsingItem` dismounts a rider before its first roll.
+                player_dismount(me, false);
+                let (px, py, pz, yaw, pitch, _) =
+                    *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                let mut landing = None;
                 for _ in 0..16 {
-                    let nx = px + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
-                    let nz = pz + ((world_rng::next_u64() % 1600) as f64 / 100.0) - 8.0;
-                    let ny = surface_y(nx.round() as i32, nz.round() as i32);
-                    if (ny - py).abs() < 8.0 {
-                        let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        teleport_in_dimension(
-                            me,
-                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                            (nx, ny, nz, yaw, pitch),
-                        );
+                    let roll = (
+                        (world_rng::next_u64() % 1000) as f64 / 1000.0,
+                        (world_rng::next_u64() % 16) as i32 - 8,
+                        (world_rng::next_u64() % 1000) as f64 / 1000.0,
+                    );
+                    if let Some(spot) = find_chorus_teleport_spot_dim(dim, (px, py, pz), roll) {
+                        landing = Some(spot);
                         break;
                     }
                 }
+                if let Some((nx, ny, nz)) = landing {
+                    {
+                        let mut w = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+                        teleport_in_dimension(me, &mut w, (nx, ny, nz, yaw, pitch));
+                    }
+                    // `randomTeleport` zeroes the fall distance: the meter
+                    // re-bases at the landing so the hop arrives clean.
+                    *me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = ny;
+                    // `entity.chorus_fruit.teleport` rides the entity for the
+                    // trackers watching it.
+                    broadcast_entity_sound(me.eid, "minecraft:entity.chorus_fruit.teleport", 7);
+                }
+                chorus_cooldown_start(me, it);
             }
         }
     }
@@ -20141,5 +20139,185 @@ mod xmod1_hopper_cap_tests {
         let decoded = hopper_cap_comps_decode(&fake);
         assert_eq!(decoded, vec![(HOPPER_CAP_FOREIGN_COMP, fake.clone())]);
         assert_eq!(hopper_cap_comps_encode(&decoded), fake);
+    }
+}
+
+/// `find_chorus_teleport_spot_dim` — `LivingEntity.randomTeleport` as
+/// `ChorusFruitItem.finishUsingItem` drives it, in the player's own dimension.
+#[cfg(all(test, megu_vanilla_data))]
+mod chorus_dim_tests {
+    use super::*;
+
+    /// Restores every dimensioned cell a fixture wrote, in reverse order.
+    struct DimCells(Vec<(DimId, i32, i32, i32, u32)>);
+    impl DimCells {
+        fn new() -> Self {
+            DimCells(Vec::new())
+        }
+        fn set(&mut self, dim: DimId, x: i32, y: i32, z: i32, st: u32) {
+            self.0.push((dim, x, y, z, block_at_dim(dim, x, y, z)));
+            set_block_dim(dim, x, y, z, st);
+        }
+    }
+    impl std::ops::Drop for DimCells {
+        fn drop(&mut self) {
+            for (dim, x, y, z, st) in self.0.drain(..).rev() {
+                set_block_dim(dim, x, y, z, st);
+            }
+        }
+    }
+
+    /// Writes air through `y0..=y1` at `(x,z)` in `dim` so generated terrain
+    /// cannot leak into a landing check.
+    fn clear_column(cells: &mut DimCells, dim: DimId, x: i32, y0: i32, y1: i32, z: i32) {
+        for y in y0..=y1 {
+            cells.set(dim, x, y, z, 0);
+        }
+    }
+
+    /// An End-stone island in the void: the roll commits on top of it, a roll
+    /// inside the floor fails, and a void column fails instead of dropping the
+    /// player into the void.
+    #[test]
+    fn chorus_end_roll_lands_on_island_and_refuses_void() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut cells = DimCells::new();
+        let end_stone = name_to_state("end_stone").unwrap();
+        // A lone column: void below, end_stone at y=60, air above.
+        clear_column(&mut cells, DimId::End, 10, 0, 72, 10);
+        cells.set(DimId::End, 10, 60, 10, end_stone);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::End, (10.5, 62.0, 10.5), (0.5, 0, 0.5)),
+            Some((10.5, 61.0, 10.5)),
+            "the roll descends onto the island and stands on its top"
+        );
+        // A second storey: the feet cell inside end_stone rejects the landing.
+        cells.set(DimId::End, 10, 61, 10, end_stone);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::End, (10.5, 62.0, 10.5), (0.5, -1, 0.5)),
+            None,
+            "a roll landing inside the floor fails instead of embedding the player"
+        );
+        // A truly void column is a failed roll, never a void landing.
+        let mut cells2 = DimCells::new();
+        clear_column(&mut cells2, DimId::End, 20, 0, 72, 20);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::End, (20.5, 62.0, 20.5), (0.5, 0, 0.5)),
+            None,
+            "no floor below the roll means no teleport"
+        );
+    }
+
+    /// In the Nether the roll lands under the bedrock roof: the y roll stays
+    /// inside the dimension's own window and the downward scan stops at the
+    /// cave floor — for a player below the roof there is no path onto it.
+    #[test]
+    fn chorus_nether_roll_lands_under_the_roof() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut cells = DimCells::new();
+        let stone = name_to_state("stone").unwrap();
+        let bedrock = name_to_state("bedrock").unwrap();
+        clear_column(&mut cells, DimId::Nether, 5, 61, 125, 5);
+        cells.set(DimId::Nether, 5, 60, 5, stone);
+        cells.set(DimId::Nether, 5, 126, 5, bedrock);
+        cells.set(DimId::Nether, 5, 127, 5, bedrock);
+        // The largest upward roll still resolves below the roof.
+        let spot = find_chorus_teleport_spot_dim(DimId::Nether, (5.5, 64.0, 5.5), (0.5, 7, 0.5));
+        assert_eq!(spot, Some((5.5, 61.0, 5.5)), "the roll lands on the cave floor");
+        assert!(
+            spot.is_some_and(|(_, y, _)| y < 126.0),
+            "a player below the roof never lands on top of it"
+        );
+        // `randomTeleport` only checks the cell below the cursor: a roll that
+        // lands the cursor in the roof's lower bedrock cell sees air below and
+        // walks down out of the roof to the cave floor.
+        let under = find_chorus_teleport_spot_dim(DimId::Nether, (5.5, 120.0, 5.5), (0.5, 6, 0.5));
+        assert_eq!(
+            under,
+            Some((5.5, 61.0, 5.5)),
+            "a roll into the roof's lower cell still comes out under it"
+        );
+        // But a roll onto y=127 stops there — the cell below is bedrock — and
+        // the standing box collides, so the roll is wasted exactly as vanilla
+        // wastes it (`randomTeleport` returns false for that attempt).
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::Nether, (5.5, 120.0, 5.5), (0.5, 7, 0.5)),
+            None,
+            "a roll whose scan stops inside the roof fails that attempt"
+        );
+    }
+
+    /// Overworld cave and surface: the roll descends into a pocket and stands
+    /// on its floor, needs two clear cells above the floor, and on open ground
+    /// lands on the top block.
+    #[test]
+    fn chorus_overworld_roll_lands_in_cave_and_on_surface() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut cells = DimCells::new();
+        let stone = name_to_state("stone").unwrap();
+        // A pocket: stone floor at 200, air 201..=202, stone cap 203..=204.
+        cells.set(DimId::Overworld, 3, 200, 3, stone);
+        cells.set(DimId::Overworld, 3, 201, 3, 0);
+        cells.set(DimId::Overworld, 3, 202, 3, 0);
+        cells.set(DimId::Overworld, 3, 203, 3, stone);
+        cells.set(DimId::Overworld, 3, 204, 3, stone);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::Overworld, (3.5, 202.0, 3.5), (0.5, 0, 0.5)),
+            Some((3.5, 201.0, 3.5)),
+            "the roll descends into the pocket and stands on its floor"
+        );
+        // One block of headroom is not enough: the standing box needs two
+        // clear cells above the floor.
+        cells.set(DimId::Overworld, 3, 202, 3, stone);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::Overworld, (3.5, 202.0, 3.5), (0.5, 0, 0.5)),
+            None,
+            "a one-cell pocket rejects the landing"
+        );
+        // Open ground: the roll stands on the top block.
+        let mut cells2 = DimCells::new();
+        cells2.set(DimId::Overworld, 8, 300, 8, stone);
+        cells2.set(DimId::Overworld, 8, 301, 8, 0);
+        cells2.set(DimId::Overworld, 8, 302, 8, 0);
+        cells2.set(DimId::Overworld, 8, 303, 8, 0);
+        assert_eq!(
+            find_chorus_teleport_spot_dim(DimId::Overworld, (8.5, 302.0, 8.5), (0.5, 0, 0.5)),
+            Some((8.5, 301.0, 8.5)),
+            "the roll stands on the surface block"
+        );
+    }
+
+    /// The horizontal roll stays inside vanilla's +-8 box around the player.
+    #[test]
+    fn chorus_roll_box_stays_within_eight_blocks() {
+        crate::test_support::require_vanilla_data();
+        let _guard = world_guard();
+        let mut cells = DimCells::new();
+        let stone = name_to_state("stone").unwrap();
+        for x in 20..=38 {
+            for z in 20..=38 {
+                cells.set(DimId::Overworld, x, 250, z, stone);
+                cells.set(DimId::Overworld, x, 251, z, 0);
+                cells.set(DimId::Overworld, x, 252, z, 0);
+                cells.set(DimId::Overworld, x, 253, z, 0);
+            }
+        }
+        for roll in [0.0f64, 0.25, 0.5, 0.75, 0.999] {
+            let Some((nx, _, nz)) = find_chorus_teleport_spot_dim(
+                DimId::Overworld,
+                (29.5, 252.0, 29.5),
+                (roll, 0, 0.5),
+            ) else {
+                panic!("a floored roll must land (roll={roll})");
+            };
+            assert!(
+                (29.5 - 8.0..=29.5 + 8.0).contains(&nx),
+                "x scatter stays inside +-8, got {nx} for roll {roll}"
+            );
+            assert_eq!(nz, 29.5, "z follows the neutral roll");
+        }
     }
 }

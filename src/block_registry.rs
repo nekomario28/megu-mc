@@ -906,6 +906,11 @@ impl BReg {
             let first = create.default_state(&def.id).unwrap_or(0);
             self.dfl.push(first);
             self.st_lo.push(first);
+            // The flag LUT classifies modded ids by vanilla vocabulary (the
+            // namespace is ignored, so `mymod:sand` still reads as sand): its
+            // replaceable/gravity verdicts feed the `st_fl` and `behaviour`
+            // columns the pinned table never shipped for these ids.
+            let lut_word = megu_core::block_flags_lut::classify_name(&def.id);
             let mut n = 0u32;
             for entry in create.states().iter().filter(|e| e.block_index == ci) {
                 let st = entry.state_id as usize;
@@ -913,6 +918,9 @@ impl BReg {
                 self.hardness[st] = 1.0;
                 self.drops[st] = live_create_block_item_id(&def.id);
                 self.stack_size[st] = 64;
+                if lut_word & megu_core::block_flags_lut::FLAG_REPLACEABLE != 0 {
+                    self.st_fl[st] |= FL_REPLACEABLE;
+                }
                 let facts = derive_mod_block_facts(&def.id, &entry.properties);
                 self.pred[st] = facts.pred;
                 self.light[st] = facts.light;
@@ -937,7 +945,13 @@ impl BReg {
             self.n_states.push(n);
             self.htools.push(Vec::new());
             self.tool_kind.push(2); // pickaxe family
-            self.behaviour.push(B_NONE);
+            self.behaviour.push(
+                if lut_word & megu_core::block_flags_lut::FLAG_GRAVITY_AFFECTED != 0 {
+                    B_FALLING
+                } else {
+                    B_NONE
+                },
+            );
         }
         // The tag bitsets were sized for the vanilla block list before this
         // extension ran; grow each to cover the appended indices, then tag
@@ -2133,6 +2147,14 @@ fn mod_block_tag_names(path: &str, shape: ModShape) -> Vec<&'static str> {
     }
     if path.ends_with("_rail") {
         tags.push("minecraft:rails");
+    }
+    // The flag LUT's climbable table (ladders, vines, scaffolding) names the
+    // modded ids that belong on the vanilla climbable tag.
+    if megu_core::block_flags_lut::classify_name(path)
+        & megu_core::block_flags_lut::FLAG_CLIMBABLE
+        != 0
+    {
+        tags.push("minecraft:climbable");
     }
     let woody =
         path.contains("plank") || path.ends_with("_log") || path.contains("wood");

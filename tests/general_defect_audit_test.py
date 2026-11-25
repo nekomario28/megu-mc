@@ -229,18 +229,18 @@ class DecompressionCapGuardTest(FixtureCase):
 
 
 class RemoveZeroAndCodecGuardTest(FixtureCase):
-    def test_ninth_vec_remove_zero_fails(self):
-        body = "".join("    values.remove(0);\n" for _ in range(9))
+    def test_sixth_vec_remove_zero_fails(self):
+        body = "".join("    values.remove(0);\n" for _ in range(6))
         report = self.audit_files({"src/queue.rs": "fn drain(mut values: Vec<i32>) {\n" + body + "}\n"})
         self.assert_guard_fails(report, "hotloop-remove-zero-codec-ratchet")
 
     def test_baseline_quantity_of_vec_remove_zero_passes(self):
-        body = "".join("    values.remove(0);\n" for _ in range(8))
+        body = "".join("    values.remove(0);\n" for _ in range(5))
         report = self.audit_files({"src/queue.rs": "fn drain(mut values: Vec<i32>) {\n" + body + "}\n"})
         self.assert_guard_passes(report, "hotloop-remove-zero-codec-ratchet")
 
     def test_remove_zero_inside_comment_does_not_count(self):
-        body = "".join("    values.remove(0);\n" for _ in range(8))
+        body = "".join("    values.remove(0);\n" for _ in range(5))
         report = self.audit_files({
             "src/queue.rs": "// values.remove(0); in a comment\nfn drain(mut values: Vec<i32>) {\n" + body + "}\n",
         })

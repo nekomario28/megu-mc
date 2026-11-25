@@ -52,6 +52,7 @@ GATES = (
     "tests/megu_port_mod_test.py",
     "tests/xplat_packaging_test.py",
     "tests/install_linux_test.py",
+    "tests/startup_bench_test.py",
 )
 
 

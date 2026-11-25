@@ -38,7 +38,7 @@
   "vec_remove_zero": {
     "src/feature.rs": 0,
     "src/jigsaw_structures.rs": 0,
-    "src/main.rs": 1,
+    "src/main.rs": 0,
     "src/play_protocol.rs": 0,
     "src/worldgen.rs": 0
   }

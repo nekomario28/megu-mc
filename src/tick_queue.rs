@@ -10,6 +10,7 @@
 //! Indexing the queue by delay makes the per-tick cost proportional to the cells
 //! that come due, and the dedup map means a cell can be waiting only once.
 
+use megu_core::coords::CoordMap;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::Hash;
@@ -143,7 +144,7 @@ impl<K: Eq + Hash + Ord + Copy> DueMachineQueue<K> {
 pub(crate) struct TickQueue {
     buckets: Vec<Vec<(i32, i32, i32)>>,
     /// Where a waiting cell sits, so it can be moved or removed without a scan.
-    waiting: HashMap<(i32, i32, i32), usize>,
+    waiting: CoordMap<(i32, i32, i32), usize>,
     cursor: usize,
 }
 
@@ -151,7 +152,7 @@ impl TickQueue {
     pub(crate) fn new() -> Self {
         Self {
             buckets: (0..MAX_DELAY).map(|_| Vec::new()).collect(),
-            waiting: HashMap::new(),
+            waiting: CoordMap::default(),
             cursor: 0,
         }
     }

@@ -7,10 +7,29 @@
 //   net.minecraft.world.level.GameRules       -> dcs (RULE_MAX_ENTITY_CRAMMING -> dcs.u, default 24)
 //   net.minecraft.util.Mth                    -> ayo (absMax -> ayo.a(DD)D)
 
-const ENTITY_PUSH_MIN_ABS_MAX: f64 = 0.009999999776482582; // 0.01F as f64
-const ENTITY_PUSH_STRENGTH: f64 = 0.05000000074505806; // 0.05F as f64
-const ENTITY_CRAMMING_DAMAGE: f32 = 6.0f32;
+// `Entity.push` impulse constants are owned by `megu_core::crowd_physics`
+// (the same values, one definition): the dense-push solver there and this
+// per-entity pass cannot drift apart.
+use megu_core::crowd_physics::{ENTITY_PUSH_MIN_ABS_MAX, ENTITY_PUSH_STRENGTH};
+/// `GameRules.RULE_MAX_ENTITY_CRAMMING` (`dcs.u`) default — the pile size
+/// that starts dealing cramming damage.
 const ENTITY_CRAMMING_DEFAULT: i32 = 24;
+/// `LivingEntity.pushEntities`'s cramming hit strength: `hurt(cramming(), 6.0F)`.
+const ENTITY_CRAMMING_DAMAGE: f32 = 6.0;
+// Compile-time drift guard: the two cramming pins must stay identical to the
+// table `megu_core::crowd_physics` ships for `DensePushSolver`, or the audit
+// values here and the solver's silently diverge.
+const _: () = {
+    assert!(
+        ENTITY_CRAMMING_DEFAULT == megu_core::crowd_physics::DEFAULT_MAX_ENTITY_CRAMMING,
+        "cramming default drifted from crowd_physics"
+    );
+    assert!(
+        ENTITY_CRAMMING_DAMAGE.to_bits()
+            == megu_core::crowd_physics::ENTITY_CRAMMING_DAMAGE.to_bits(),
+        "cramming damage drifted from crowd_physics"
+    );
+};
 /// `LivingEntity.hurt`'s invulnerability window, in ticks.
 ///
 /// `pushEntities()` does not damage directly: it calls `this.hurt(cramming(), 6.0F)`

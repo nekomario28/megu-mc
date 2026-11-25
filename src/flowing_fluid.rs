@@ -8,7 +8,7 @@
 //! `!state.blocksMotion()` for every block outside its sign/door/ladder/sugar-cane/bubble-column
 //! and portal/structure-void families, so the fluid enters and `spreadTo` destroys the block
 //! before writing itself.
-use std::collections::HashMap;
+use megu_core::coords::CoordMap;
 
 pub(crate) type Pos = (i32, i32, i32);
 
@@ -135,7 +135,7 @@ fn opposite(d: Pos) -> Pos {
 
 struct Context<'a, W> {
     world: &'a mut W,
-    overlay: HashMap<Pos, Cell>,
+    overlay: CoordMap<Pos, Cell>,
     writes: Vec<(Pos, Cell)>,
     solidifications: Vec<(Pos, Solidification)>,
     kind: Kind,
@@ -336,7 +336,7 @@ pub(crate) fn tick_in_dim<W: Reader>(
     };
     let mut cx = Context {
         world,
-        overlay: HashMap::new(),
+        overlay: CoordMap::default(),
         writes: Vec::new(),
         solidifications: Vec::new(),
         kind,
@@ -446,6 +446,7 @@ pub(crate) fn tick_in_dim<W: Reader>(
 #[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     struct Fixture(HashMap<Pos, Option<Cell>>);
     impl Reader for Fixture {
         type Error = Pos;

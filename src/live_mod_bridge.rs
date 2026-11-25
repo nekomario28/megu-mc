@@ -4147,7 +4147,16 @@ impl LiveCreateRuntime {
                 .kinetic_solution(pos)
                 .map(|sol| sol.speed.abs())
                 .unwrap_or(0.0);
-            (64.0 / rpm.max(8.0)).round().clamp(1.0, 64.0) as u64
+            // The fixed-point belt kernel: one block of travel is
+            // `SUB_UNITS_PER_BLOCK` at `rpm_to_belt_step(rpm)` per tick, so
+            // the delay is `256 / step == 64 / rpm` computed in integers —
+            // the same conversion `CreateBeltLine` runs at runtime.
+            let step = create_adapter::factorio_sim::rpm_to_belt_step(
+                rpm.max(8.0).round() as i32,
+            )
+            .max(1) as u64;
+            let units = u64::from(create_adapter::factorio_sim::SUB_UNITS_PER_BLOCK);
+            ((units * 2 + step) / (step * 2)).clamp(1, 64)
         } else {
             2
         };

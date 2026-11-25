@@ -196,7 +196,7 @@ class PerfAntipatternTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             written = json.loads(
                 (root / 'audit/perf_antipattern_baseline.json').read_text(encoding='utf-8'))
-            self.assertEqual(written['vec_remove_zero']['src/main.rs'], 1)
+            self.assertEqual(written['vec_remove_zero']['src/main.rs'], 0)
             # Baselines ratchet downward only: a hand-raised ceiling is pulled
             # back to the real count, never silently kept.
             written['vec_remove_zero']['src/main.rs'] = 99
@@ -206,7 +206,7 @@ class PerfAntipatternTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             written = json.loads(
                 (root / 'audit/perf_antipattern_baseline.json').read_text(encoding='utf-8'))
-            self.assertEqual(written['vec_remove_zero']['src/main.rs'], 1)
+            self.assertEqual(written['vec_remove_zero']['src/main.rs'], 0)
 
     def test_ci_calls_both_gates(self):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
