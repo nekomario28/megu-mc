@@ -838,6 +838,70 @@ fn canonical_blocks_asset_valid(path: &Path) -> bool {
     }) && total == 26_684
 }
 
+fn file_has_nonzero_byte(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => return false,
+            Ok(n) if buf[..n].iter().any(|byte| *byte != 0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+fn feature_order_asset_valid(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(order) = megu_server_files::json::parse(&text) else {
+        return false;
+    };
+    let Some(top) = order.as_object() else {
+        return false;
+    };
+    let expected = [("overworld", 53, 11), ("nether", 5, 10), ("end", 5, 11)];
+    if top.len() != expected.len() {
+        return false;
+    }
+    expected.iter().all(|(dimension, biome_count, step_count)| {
+        let Some(section) = order.get(dimension) else {
+            return false;
+        };
+        let biomes_valid = section
+            .get("biomes")
+            .and_then(Json::as_array)
+            .is_some_and(|biomes| {
+                biomes.len() == *biome_count
+                    && biomes.iter().all(|biome| {
+                        biome
+                            .as_str()
+                            .is_some_and(|name| name.starts_with("minecraft:"))
+                    })
+            });
+        let steps_valid = section
+            .get("steps")
+            .and_then(Json::as_array)
+            .is_some_and(|steps| {
+                steps.len() == *step_count
+                    && steps.iter().all(|step| {
+                        step.as_array().is_some_and(|features| {
+                            features.iter().all(|feature| {
+                                feature
+                                    .as_str()
+                                    .is_some_and(|name| name.starts_with("minecraft:"))
+                            })
+                        })
+                    })
+            });
+        biomes_valid && steps_valid
+    })
+}
+
 fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -848,6 +912,9 @@ fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
     if rel == "assets/blocks_1211.json" {
         return canonical_blocks_asset_valid(path);
     }
+    if rel == "assets/feature_order_1211.json" {
+        return feature_order_asset_valid(path);
+    }
     let expected = match rel {
         "assets/block_predicates_1211.bin"
         | "assets/collision_shape_full_1211.bin"
@@ -856,10 +923,9 @@ fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
         | "assets/template_solid_1211.bin" => 26_684,
         "assets/block_state_facts_1211.bin" => 26_684 * 6,
         "assets/structure_state_transforms_1211.bin" => 26_684 * 12 * 4,
-        "assets/feature_order_1211.json" => return meta.len() > 2,
         _ => return true,
     };
-    meta.len() == expected
+    meta.len() == expected && file_has_nonzero_byte(path)
 }
 
 fn config_packets_valid(path: &Path) -> bool {
@@ -1152,6 +1218,33 @@ fn run_python_script(script: &Path, args: &[&str]) -> io::Result<()> {
     )))
 }
 
+fn create_runtime_parent_dir(root: &Path, parent: &Path) -> io::Result<()> {
+    let relative = parent.strip_prefix(root).map_err(|_| {
+        invalid_runtime(format!(
+            "runtime-data parent {} escapes install root {}",
+            parent.display(),
+            root.display()
+        ))
+    })?;
+    let mut cursor = root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(invalid_runtime(format!(
+                    "{} has an unsafe or incompatible file type",
+                    cursor.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        }
+    }
+    std::fs::create_dir_all(parent)?;
+    ensure_real_directory(parent)
+}
+
 fn move_runtime_output(stage: &Path, root: &Path) -> io::Result<()> {
     let mappings = [
         ("datapacks/vanilla", "datapacks/vanilla"),
@@ -1189,7 +1282,7 @@ fn move_runtime_output(stage: &Path, root: &Path) -> io::Result<()> {
             )));
         }
         if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
+            create_runtime_parent_dir(root, parent)?;
         }
         std::fs::rename(&from, &to)?;
     }
@@ -2076,9 +2169,22 @@ mod tests {
             ("structure_state_transforms_1211.bin", 26_684 * 12 * 4),
             ("template_solid_1211.bin", 26_684),
         ] {
-            std::fs::write(root.join("assets").join(name), vec![0u8; len]).unwrap();
+            let mut bytes = vec![0u8; len];
+            bytes[0] = 1;
+            std::fs::write(root.join("assets").join(name), bytes).unwrap();
         }
-        std::fs::write(root.join("assets/feature_order_1211.json"), br#"{"overworld":{}}"#).unwrap();
+        let names = |count: usize| {
+            (0..count)
+                .map(|index| format!("\"minecraft:test_biome_{index}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let steps = |count: usize| vec!["[]"; count].join(",");
+        let feature_order = format!(
+            "{{\"overworld\":{{\"biomes\":[{}],\"steps\":[{}]}},\"nether\":{{\"biomes\":[{}],\"steps\":[{}]}},\"end\":{{\"biomes\":[{}],\"steps\":[{}]}}}}",
+            names(53), steps(11), names(5), steps(10), names(5), steps(11)
+        );
+        std::fs::write(root.join("assets/feature_order_1211.json"), feature_order).unwrap();
         std::fs::write(
             root.join("datapacks/vanilla/pack.mcmeta"),
             br#"{"pack":{"pack_format":48,"description":"test"}}"#,
@@ -2117,6 +2223,27 @@ mod tests {
         assert_eq!(
             missing_runtime_data(&root),
             vec!["assets/block_states_1211.json"]
+        );
+    }
+
+    #[test]
+    fn runtime_data_detection_rejects_zeroed_tables_and_shapeless_feature_order() {
+        let root = scratch_dir("semantic");
+        write_minimal_runtime_tree(&root);
+        assert!(missing_runtime_data(&root).is_empty());
+
+        let table = root.join("assets/block_predicates_1211.bin");
+        std::fs::write(&table, vec![0u8; 26_684]).unwrap();
+        assert_eq!(
+            missing_runtime_data(&root),
+            vec!["assets/block_predicates_1211.bin"]
+        );
+
+        write_minimal_runtime_tree(&root);
+        std::fs::write(root.join("assets/feature_order_1211.json"), br#"{"overworld":{}}"#).unwrap();
+        assert_eq!(
+            missing_runtime_data(&root),
+            vec!["assets/feature_order_1211.json"]
         );
     }
 
@@ -2177,6 +2304,23 @@ mod tests {
         write_minimal_runtime_tree(&stage);
         let err = move_runtime_output(&stage, &root).expect_err("existing target must win");
         assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_output_move_rejects_symlinked_intermediate_parent() {
+        let base = scratch_dir("move-symlink");
+        let stage = base.join("stage");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        write_minimal_runtime_tree(&stage);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("assets")).unwrap();
+
+        let err = move_runtime_output(&stage, &root).expect_err("symlinked parent must fail");
+        assert!(err.to_string().contains("unsafe or incompatible"), "{err}");
+        assert!(!outside.join("blocks_1211.json").exists());
     }
 
     #[test]
