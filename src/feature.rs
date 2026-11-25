@@ -445,8 +445,7 @@ enum Cf {
     /// explicit edge connections when `guarded`, consumes one crystal-yaw `next_f32()`
     /// draw, and sets `bedrock` at `height` and default `fire` at `height + 1`.
     EndSpike(EndSpikeCfg),
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     Ore {
         size: i32,
         discard: f32,

@@ -6414,9 +6414,9 @@ fn stream_chunk_frames_async(
                     cached_chunk_frame(compression, gen, dim, *cx, *cz, occluded)
                 }
                 FrameSlot::Pending(ticket) => match ticket.wait().as_deref() {
-                    Some(&FrameOutcome::Uncached {
-                        ref packet,
-                        ref own_emitters,
+                    Some(FrameOutcome::Uncached {
+                        packet,
+                        own_emitters,
                     }) => {
                         gen.insert((*cx, *cz), own_emitters.clone());
                         connection_limits::ChunkPacketCache::frame_uncached(packet, compression)

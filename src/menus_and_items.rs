@@ -7826,8 +7826,7 @@ impl SkullProfile {
         Tag::Compound(fields)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub(crate) fn needs_resolution(&self) -> bool {
         self.properties.is_empty() && self.name.is_some() != self.id.is_some()
     }

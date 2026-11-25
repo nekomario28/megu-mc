@@ -1042,8 +1042,7 @@ struct WindChargeProfile {
     /// `AdvancedExplosionDamageCalculator.getKnockbackMultiplier`.
     knockback_multiplier: f64,
     /// `onHitEntity` damage.
-        #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     direct_hit_damage: f32,
 }
 

@@ -146,15 +146,13 @@ pub struct WorldgenParseReport {
 
 impl WorldgenParseReport {
     /// No recorded failures.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub fn is_clean(&self) -> bool {
         self.errors.is_empty()
     }
 
     /// The recorded failures of one datapack family, in load order.
-    #[cfg_attr(not(test), allow(dead_code))]
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
     pub fn of_kind<'a>(
         &'a self,
         kind: &'a str,
