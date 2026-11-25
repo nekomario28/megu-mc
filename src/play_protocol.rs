@@ -4467,6 +4467,86 @@ fn click_carried_stack(tail: &[u8]) -> Option<Stack> {
     slot_read_wire(&buf).map(|(_, st)| st)
 }
 
+fn hotbar_swap_slot(button: i8) -> Option<i16> {
+    (0..=8).contains(&button).then_some(36 + i16::from(button))
+}
+
+fn crafting_remainder(item: i64) -> Option<Stack> {
+    let name = item_to_name(item)?;
+    if name.ends_with("_bucket") && name != "bucket" {
+        Some((name_to_item("bucket")?, 1, Vec::new()))
+    } else {
+        None
+    }
+}
+
+fn consume_crafting_grid(
+    grid: &mut HashMap<i16, Stack>,
+    slots: std::ops::RangeInclusive<i16>,
+) -> Vec<Stack> {
+    let mut overflow = Vec::new();
+    for slot in slots {
+        let Some((item, count, comps)) = grid.get(&slot).cloned() else {
+            continue;
+        };
+        if count == 0 {
+            continue;
+        }
+        let remainder = crafting_remainder(item);
+        if count == 1 {
+            if let Some(remainder) = remainder {
+                grid.insert(slot, remainder);
+            } else {
+                grid.remove(&slot);
+            }
+        } else {
+            grid.insert(slot, (item, count - 1, comps));
+            if let Some(remainder) = remainder {
+                overflow.push(remainder);
+            }
+        }
+    }
+    overflow
+}
+
+fn return_crafting_grid_to_inventory(
+    inv: &mut HashMap<i16, Stack>,
+    grid: &mut HashMap<i16, Stack>,
+) -> Vec<Stack> {
+    let mut overflow = Vec::new();
+    for stack in std::mem::take(grid).into_values() {
+        let remainder = move_to_slots(inv, 9..=44, stack);
+        if remainder.1 > 0 {
+            overflow.push(remainder);
+        }
+    }
+    overflow
+}
+
+fn quick_move_crafting_result(
+    inv: &mut HashMap<i16, Stack>,
+    grid: &mut HashMap<i16, Stack>,
+    slots: std::ops::RangeInclusive<i16>,
+    result: fn(&HashMap<i16, Stack>) -> Option<Stack>,
+) -> Vec<Stack> {
+    let mut overflow = Vec::new();
+    for _ in 0..64 {
+        let Some(output) = result(grid) else { break };
+        let mut trial = inv.clone();
+        if move_to_slots(&mut trial, 9..=44, output).1 > 0 {
+            break;
+        }
+        *inv = trial;
+        for remainder in consume_crafting_grid(grid, slots.clone()) {
+            let remainder = move_to_slots(inv, 9..=44, remainder);
+            if remainder.1 > 0 {
+                overflow.push(remainder);
+            }
+        }
+    }
+    overflow
+}
+
 /// Hurt Animation (`0x24`): entity id + the hurt direction yaw vanilla computes
 /// in `ServerPlayer.indicateDamage` (`getHurtDir`).
 fn hurt_anim_yaw(eid: i32, yaw: f32) -> Vec<u8> {
@@ -15009,15 +15089,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     sync_chest_openers_dim(&audience, &before);
                 }
-                let had_container = chest_window.is_some()
-                    || me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-                    || *me.open_table.lock().unwrap_or_else(|e| e.into_inner());
                 *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = false;
                 beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
-                if had_container {
+                {
                     // vanilla containerMenu.removed: the carried stack is
                     // thrown into the world, crafting grid goes back to inv
                     let cur =
@@ -15037,16 +15114,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             thrower: None,
                         });
                     }
-                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    for g in [&me.craft, &me.craft9] {
-                        for (_, st) in std::mem::take(&mut *g.lock().unwrap_or_else(|e| e.into_inner())) {
-                            if st.1 > 0 {
-                                let slot = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                                inv.insert(slot, st);
-                            }
+                    let mut leftovers = Vec::new();
+                    {
+                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        for g in [&me.craft, &me.craft9] {
+                            leftovers.extend(return_crafting_grid_to_inventory(
+                                &mut inv,
+                                &mut g.lock().unwrap_or_else(|e| e.into_inner()),
+                            ));
                         }
                     }
-                    drop(inv);
+                    return_live_inputs(&me, leftovers);
                     *me.drag.lock().unwrap_or_else(|e| e.into_inner()) = (-1, Vec::new());
                 }
             }
@@ -15382,13 +15460,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                                 && cur.2 == _rc
                                                 && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
                                         {
-                                            for i in 1..=9i16 {
-                                                if let Some((it, c, _cc)) = grid.get(&i).cloned() {
-                                                    if c <= 1 {
-                                                        grid.remove(&i);
-                                                    } else {
-                                                        grid.insert(i, (it, c - 1, _cc));
-                                                    }
+                                            let overflow = consume_crafting_grid(&mut grid, 1..=9);
+                                            let (px, py, pz, ..) =
+                                                *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                            for remainder in overflow {
+                                                let remainder = move_to_slots(&mut inv, 9..=44, remainder);
+                                                if remainder.1 > 0 {
+                                                    drop_live_stack((px, py + 1.3, pz), remainder);
                                                 }
                                             }
                                             *cur = (ri, cur.1 + rc, _rc.clone());
@@ -15411,6 +15489,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     (0, 0, Vec::new())
                                 };
                                 let out = craft3_result(&grid).unwrap_or((0, 0, Vec::new()));
+                                let grid_snapshot = (slot == 0).then(|| grid.clone());
                                 drop(grid);
                                 drop(inv);
                                 drop(cur);
@@ -15426,6 +15505,21 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 p0.extend_from_slice(&0i16.to_be_bytes());
                                 p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
                                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p0);
+                                if let Some(grid) = grid_snapshot {
+                                    for grid_slot in 1..=9i16 {
+                                        let mut p = vec![3u8];
+                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
+                                        p.extend_from_slice(&grid_slot.to_be_bytes());
+                                        p.extend_from_slice(&slot_wire(
+                                            &grid.get(&grid_slot).cloned().unwrap_or_default(),
+                                        ));
+                                        let _ = send_packet(
+                                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                                            0x15,
+                                            p,
+                                        );
+                                    }
+                                }
                                 continue;
                             }
                             // Window 0 (player inventory + 2x2 craft grid). Vanilla's
@@ -15477,15 +15571,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             && cur.2 == _rc
                                             && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
                                     {
-                                        for i in 1..=4i16 {
-                                            if let Some((it, c, _cc)) = grid.get(&i).cloned() {
-                                                if c <= 1 {
-                                                    grid.remove(&i);
-                                                } else {
-                                                    grid.insert(i, (it, c - 1, _cc));
-                                                }
-                                            }
-                                        }
+                                        let overflow = consume_crafting_grid(&mut grid, 1..=4);
+                                        drop(grid);
+                                        return_live_inputs(&me, overflow);
                                         *cur = (ri, cur.1 + rc, _rc.clone());
                                     }
                                 }
@@ -15612,8 +15700,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             }
                         } else if mode == 2 {
                             // number-key swap: hovered slot <-> hotbar slot btn (0-8)
-                            let hb = 36 + btn as i16;
-                            if (0..=8).contains(&btn) {
+                            if let Some(hb) = hotbar_swap_slot(btn as i8) {
                                 let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some((cp, cp2)) = chest_pos {
                                     if !window_live_for(&me, (cp, cp2)) {
@@ -16137,6 +16224,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         slot,
                                         &inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
                                     );
+                                } else if slot == 0 {
+                                    let overflow = if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
+                                        let mut grid9 = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
+                                        quick_move_crafting_result(&mut inv, &mut grid9, 1..=9, craft3_result)
+                                    } else {
+                                        quick_move_crafting_result(&mut inv, &mut grid, 1..=4, craft_result)
+                                    };
+                                    let (px, py, pz, ..) =
+                                        *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                    for remainder in overflow {
+                                        drop_live_stack((px, py + 1.3, pz), remainder);
+                                    }
                                 } else if (9..=35).contains(&slot) {
                                     // shift from main inv: armor equips, else -> hotbar
                                     if let Some(st) = inv.get(&slot).cloned() {
@@ -16187,10 +16286,50 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
                                 drop(grid);
                                 drop(inv);
-                                resync_slot(&me, 0, slot, &{
-                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
-                                });
+                                if slot == 0 {
+                                    if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
+                                        resend_container_content(&me, 3);
+                                        let grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                        resync_slot(
+                                            &me,
+                                            3,
+                                            0,
+                                            &craft3_result(&grid).unwrap_or_default(),
+                                        );
+                                    } else {
+                                        let grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                        resync_slot(
+                                            &me,
+                                            0,
+                                            0,
+                                            &craft_result(&grid).unwrap_or_default(),
+                                        );
+                                        for craft_slot in 1..=4i16 {
+                                            resync_slot(
+                                                &me,
+                                                0,
+                                                craft_slot,
+                                                &grid.get(&craft_slot).cloned().unwrap_or_default(),
+                                            );
+                                        }
+                                        let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                        for inventory_slot in 5..=45i16 {
+                                            resync_slot(
+                                                &me,
+                                                0,
+                                                inventory_slot,
+                                                &inventory.get(&inventory_slot).cloned().unwrap_or_default(),
+                                            );
+                                        }
+                                        let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                        resync_slot(&me, 0, -1, &cursor);
+                                    }
+                                } else {
+                                    resync_slot(&me, 0, slot, &{
+                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                        i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
+                                    });
+                                }
                                 // armor/offhand moves need armor slot echo too
                                 if (5..=8).contains(&slot) || slot == 45 || mode == 1 {
                                     for asl in 5..=8i16 {

@@ -265,6 +265,86 @@ fn vanilla_log_crafting_keeps_each_species_and_four_plank_output() {
 }
 
 #[test]
+fn crafting_consumption_returns_bucket_remainders_and_preserves_stacked_inputs() {
+    let _guard = crate::world_guard();
+    let milk_bucket = name_to_item("milk_bucket").unwrap();
+    let bucket = name_to_item("bucket").unwrap();
+    let mut single = HashMap::from([(1, (milk_bucket, 1, Vec::new()))]);
+
+    let overflow = consume_crafting_grid(&mut single, 1..=4);
+
+    assert!(overflow.is_empty());
+    assert_eq!(single.get(&1), Some(&(bucket, 1, Vec::new())));
+
+    let mut stacked = HashMap::from([(1, (milk_bucket, 2, Vec::new()))]);
+    let overflow = consume_crafting_grid(&mut stacked, 1..=4);
+
+    assert_eq!(stacked.get(&1), Some(&(milk_bucket, 1, Vec::new())));
+    assert_eq!(overflow, vec![(bucket, 1, Vec::new())]);
+}
+
+#[test]
+fn crafting_shift_click_moves_each_available_result_and_consumes_inputs() {
+    let _guard = crate::world_guard();
+    let log = name_to_item("oak_log").unwrap();
+    let planks = name_to_item("oak_planks").unwrap();
+    let mut grid = HashMap::from([(1, (log, 2, Vec::new()))]);
+    let mut inv = HashMap::new();
+
+    let overflow = quick_move_crafting_result(&mut inv, &mut grid, 1..=4, craft_result);
+
+    assert!(overflow.is_empty());
+    assert_eq!(inv.get(&9), Some(&(planks, 8, Vec::new())));
+    assert!(grid.is_empty());
+}
+
+#[test]
+fn inventory_menu_rejects_offhand_button_40_as_a_hotbar_index() {
+    assert_eq!(hotbar_swap_slot(0), Some(36));
+    assert_eq!(hotbar_swap_slot(8), Some(44));
+    assert_eq!(hotbar_swap_slot(40), None);
+    assert_eq!(hotbar_swap_slot(-1), None);
+}
+
+#[test]
+fn container_close_overflow_preserves_items_when_inventory_is_full() {
+    let stone = name_to_item("stone").unwrap();
+    let dirt = name_to_item("dirt").unwrap();
+    let mut inv = (9..=44)
+        .map(|slot| (slot, (stone, 64, vec![])))
+        .collect::<HashMap<_, _>>();
+    let mut grid = HashMap::from([(1, (stone, 3, Vec::new())), (2, (dirt, 2, Vec::new()))]);
+
+    let overflow = return_crafting_grid_to_inventory(&mut inv, &mut grid);
+
+    assert!(grid.is_empty());
+    assert_eq!(inv.len(), 36);
+    assert_eq!(
+        inv.values()
+            .filter(|stack| stack.0 == stone)
+            .map(|stack| stack.1 as u16)
+            .sum::<u16>(),
+        36 * 64
+    );
+    assert_eq!(
+        overflow
+            .iter()
+            .filter(|stack| stack.0 == stone)
+            .map(|stack| stack.1 as u16)
+            .sum::<u16>(),
+        3
+    );
+    assert_eq!(
+        overflow
+            .iter()
+            .filter(|stack| stack.0 == dirt)
+            .map(|stack| stack.1 as u16)
+            .sum::<u16>(),
+        2
+    );
+}
+
+#[test]
 fn vanilla_stonecutting_json_parses_ingredient_and_result_count() {
     let _guard = crate::world_guard();
     let _advs = AdvancementRegistrySnapshot::take();
