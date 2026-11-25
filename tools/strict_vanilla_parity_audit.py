@@ -100,6 +100,7 @@ AUDIT_FILES = (
     "chest_loot.rs",
     "combat_and_health.rs",
     "entity_push.rs",
+    "feature.rs",
     "generated_content.rs",
     "main.rs",
     "menus_and_items.rs",

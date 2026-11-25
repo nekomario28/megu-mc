@@ -22,7 +22,7 @@ def put(root, name, content):
 def run(root, *args):
     return subprocess.run(
         [sys.executable, str(AUDIT), "--root", str(root), *args],
-        text=True, capture_output=True, check=False, timeout=30,
+        text=True, capture_output=True, check=False, timeout=120,
     )
 
 

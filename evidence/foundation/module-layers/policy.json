@@ -99,112 +99,16 @@
   ],
   "allowed_edges": [
     [
-      "main",
-      "async_chunk_delivery"
+      "block_registry",
+      "json"
     ],
     [
       "brigadier_wire",
       "brigadier"
     ],
     [
-      "main",
-      "brigadier"
-    ],
-    [
-      "main",
-      "brigadier_wire"
-    ],
-    [
-      "main",
-      "stream_gen"
-    ],
-    [
-      "stream_gen",
-      "feature"
-    ],
-    [
-      "stream_gen",
-      "worldgen"
-    ],
-    [
-      "main",
-      "tick_workers"
-    ],
-    [
-      "tick_workers",
-      "block_registry"
-    ],
-    [
-      "tick_workers",
-      "worldgen"
-    ],
-    [
-      "main",
-      "mineshaft"
-    ],
-    [
-      "main",
-      "mineshaft_piece"
-    ],
-    [
-      "scheduled_ticks",
+      "chest_loot",
       "generation_math"
-    ],
-    [
-      "feature",
-      "mineshaft"
-    ],
-    [
-      "mineshaft",
-      "generation_context"
-    ],
-    [
-      "mineshaft",
-      "generation_math"
-    ],
-    [
-      "mineshaft",
-      "json"
-    ],
-    [
-      "mineshaft",
-      "mineshaft_layout"
-    ],
-    [
-      "mineshaft",
-      "mineshaft_piece"
-    ],
-    [
-      "mineshaft",
-      "structure_placement"
-    ],
-    [
-      "mineshaft",
-      "worldgen"
-    ],
-    [
-      "mineshaft_piece",
-      "block_registry"
-    ],
-    [
-      "mineshaft_piece",
-      "generation_context"
-    ],
-    [
-      "mineshaft_piece",
-      "generation_math"
-    ],
-    [
-      "mineshaft_piece",
-      "mineshaft_layout"
-    ],
-    [
-      "mineshaft_piece",
-      "structure_transform"
-    ],
-    [
-      "block_registry",
-      "json"
     ],
     [
       "effects",
@@ -224,11 +128,19 @@
     ],
     [
       "feature",
+      "generation_payload"
+    ],
+    [
+      "feature",
       "generation_providers"
     ],
     [
       "feature",
       "json"
+    ],
+    [
+      "feature",
+      "mineshaft"
     ],
     [
       "feature",
@@ -252,6 +164,14 @@
     ],
     [
       "feature",
+      "worldgen"
+    ],
+    [
+      "generated_content",
+      "nbt"
+    ],
+    [
+      "generated_content",
       "worldgen"
     ],
     [
@@ -304,11 +224,27 @@
     ],
     [
       "main",
+      "async_chunk_delivery"
+    ],
+    [
+      "main",
       "block_registry"
     ],
     [
       "main",
+      "brigadier"
+    ],
+    [
+      "main",
+      "brigadier_wire"
+    ],
+    [
+      "main",
       "cached_lookup"
+    ],
+    [
+      "main",
+      "chest_loot"
     ],
     [
       "main",
@@ -336,6 +272,10 @@
     ],
     [
       "main",
+      "generated_content"
+    ],
+    [
+      "main",
       "generation_context"
     ],
     [
@@ -345,6 +285,10 @@
     [
       "main",
       "generation_math"
+    ],
+    [
+      "main",
+      "generation_payload"
     ],
     [
       "main",
@@ -380,7 +324,19 @@
     ],
     [
       "main",
+      "minecart"
+    ],
+    [
+      "main",
+      "mineshaft"
+    ],
+    [
+      "main",
       "mineshaft_layout"
+    ],
+    [
+      "main",
+      "mineshaft_piece"
     ],
     [
       "main",
@@ -392,7 +348,15 @@
     ],
     [
       "main",
-      "generation_payload"
+      "seamless_portal"
+    ],
+    [
+      "main",
+      "spawner"
+    ],
+    [
+      "main",
+      "stream_gen"
     ],
     [
       "main",
@@ -420,6 +384,10 @@
     ],
     [
       "main",
+      "tick_workers"
+    ],
+    [
+      "main",
       "tickprof"
     ],
     [
@@ -436,6 +404,10 @@
     ],
     [
       "main",
+      "wire"
+    ],
+    [
+      "main",
       "world_rng"
     ],
     [
@@ -443,8 +415,84 @@
       "worldgen"
     ],
     [
+      "mineshaft",
+      "generation_context"
+    ],
+    [
+      "mineshaft",
+      "generation_math"
+    ],
+    [
+      "mineshaft",
+      "json"
+    ],
+    [
+      "mineshaft",
+      "mineshaft_layout"
+    ],
+    [
+      "mineshaft",
+      "mineshaft_piece"
+    ],
+    [
+      "mineshaft",
+      "structure_placement"
+    ],
+    [
+      "mineshaft",
+      "worldgen"
+    ],
+    [
       "mineshaft_layout",
       "generation_math"
+    ],
+    [
+      "mineshaft_piece",
+      "block_registry"
+    ],
+    [
+      "mineshaft_piece",
+      "generation_context"
+    ],
+    [
+      "mineshaft_piece",
+      "generation_math"
+    ],
+    [
+      "mineshaft_piece",
+      "generation_payload"
+    ],
+    [
+      "mineshaft_piece",
+      "mineshaft_layout"
+    ],
+    [
+      "mineshaft_piece",
+      "structure_transform"
+    ],
+    [
+      "scheduled_ticks",
+      "generation_math"
+    ],
+    [
+      "seamless_portal",
+      "wire"
+    ],
+    [
+      "spawner",
+      "generation_math"
+    ],
+    [
+      "spawner",
+      "nbt"
+    ],
+    [
+      "stream_gen",
+      "feature"
+    ],
+    [
+      "stream_gen",
+      "worldgen"
     ],
     [
       "structure_placement",
@@ -464,15 +512,15 @@
     ],
     [
       "structure_template",
+      "generation_payload"
+    ],
+    [
+      "structure_template",
       "json"
     ],
     [
       "structure_template",
       "nbt"
-    ],
-    [
-      "structure_template",
-      "generation_payload"
     ],
     [
       "structure_template",
@@ -485,6 +533,14 @@
     [
       "tick_persistence",
       "scheduled_ticks"
+    ],
+    [
+      "tick_workers",
+      "block_registry"
+    ],
+    [
+      "tick_workers",
+      "worldgen"
     ],
     [
       "tree",
@@ -524,63 +580,15 @@
     ],
     [
       "worldgen",
+      "generation_payload"
+    ],
+    [
+      "worldgen",
       "json"
     ],
     [
       "worldgen",
-      "generation_payload"
-    ],
-    [
-      "worldgen",
       "trace_env"
-    ],
-    [
-      "main",
-      "generated_content"
-    ],
-    [
-      "generated_content",
-      "nbt"
-    ],
-    [
-      "mineshaft_piece",
-      "generation_payload"
-    ],
-    [
-      "main",
-      "chest_loot"
-    ],
-    [
-      "main",
-      "minecart"
-    ],
-    [
-      "main",
-      "spawner"
-    ],
-    [
-      "chest_loot",
-      "generation_math"
-    ],
-    [
-      "spawner",
-      "generation_math"
-    ],
-    [
-      "spawner",
-      "nbt"
-    ],
-    [
-      "main",
-      "seamless_portal"
-    ],
-    [
-      "main",
-      "wire"
-    ],
-    [
-      "seamless_portal",
-      "wire"
     ]
   ],
   "accepted_errors": []
