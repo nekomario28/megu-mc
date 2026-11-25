@@ -1424,17 +1424,15 @@ fn execute_storage() -> &'static LockedMap<String, ExecTag> {
 }
 
 fn execute_block_data(dim: DimId, (x, y, z): BlockPos) -> Option<ExecTag> {
-    if dim == DimId::Overworld {
-        let generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(tag) = generated.spawners.get(&(x, y, z)) {
-            let mut tag = tag.clone();
-            if let ExecTag::Compound(fields) = &mut tag {
-                for key in ["x", "y", "z"] {
-                    fields.remove(&NbtString::text(key));
-                }
+    let generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tag) = generated.spawners.get(&(dim, (x, y, z))) {
+        let mut tag = tag.clone();
+        if let ExecTag::Compound(fields) = &mut tag {
+            for key in ["x", "y", "z"] {
+                fields.remove(&NbtString::text(key));
             }
-            return Some(tag);
         }
+        return Some(tag);
     }
     let key = (dim, x, y, z);
     if let Some(furnace) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
@@ -1858,16 +1856,14 @@ fn execute_write_block_data(
         if matches!(key.as_str(), "id" | "x" | "y" | "z") {
             return Err(unsupported());
         }
-        if dim == DimId::Overworld {
-            let mut generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(data) = generated.spawners.get_mut(&pos) {
-                let mut updated = data.clone();
-                if !path.set(&mut updated, value) {
-                    return Err(unsupported());
-                }
-                *data = updated;
-                return Ok(());
+        let mut generated = generated_content().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(data) = generated.spawners.get_mut(&(dim, pos)) {
+            let mut updated = data.clone();
+            if !path.set(&mut updated, value) {
+                return Err(unsupported());
             }
+            *data = updated;
+            return Ok(());
         }
         let (x, y, z) = pos;
         if let Some(furnace) = furnaces().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(dim, x, y, z)) {

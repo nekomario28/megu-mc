@@ -1272,6 +1272,28 @@ impl Template {
         if reg.name_of(state) == "minecraft:spawner" {
             return Self::spawner_payload(tag);
         }
+        if matches!(reg.name_of(state), "minecraft:suspicious_sand" | "minecraft:suspicious_gravel")
+            && tag.get("LootTable").is_some()
+        {
+            let Tag::Compound(values) = tag else {
+                return Err("template block NBT must be a compound");
+            };
+            for key in values.keys() {
+                let key = key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
+                if !matches!(key.as_str(), "id" | "LootTable" | "LootTableSeed") {
+                    return Err("unsupported brushable block NBT field");
+                }
+            }
+            let loot_table = tag.get("LootTable").and_then(Tag::string)
+                .ok_or("LootTable must be a string")?.to_utf8()
+                .map_err(|_| "LootTable is not UTF-8")?;
+            let loot_seed = match tag.get("LootTableSeed") {
+                None => None,
+                Some(Tag::Long(seed)) => Some(*seed),
+                Some(_) => return Err("LootTableSeed must be a long"),
+            };
+            return Ok(GenerationPayload::Brushable { loot_table, loot_seed });
+        }
         let kind = match ContainerKind::for_block(reg.name_of(state)) {
             Some(kind) => kind,
             None => {
@@ -4139,6 +4161,31 @@ mod tests {
                 loot_seed: None,
             })
         );
+    }
+
+    #[test]
+    fn suspicious_template_blocks_stage_brushable_archaeology() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = crate::block_registry::breg().unwrap();
+        for (name, table) in [
+            ("minecraft:suspicious_gravel", "minecraft:archaeology/ocean_ruin_cold"),
+            ("minecraft:suspicious_sand", "minecraft:archaeology/ocean_ruin_warm"),
+        ] {
+            let state = reg.state_of(name, None);
+            let tag = Tag::Compound(BTreeMap::from([
+                (NbtString::text("id"), Tag::String(NbtString::text("minecraft:brushable_block"))),
+                (NbtString::text("LootTable"), Tag::String(NbtString::text(table))),
+                (NbtString::text("LootTableSeed"), Tag::Long(91)),
+            ]));
+            assert!(!Template::is_passthrough_block_entity(state, &tag, reg));
+            assert_eq!(
+                Template::staged_payload(&tag, state, reg),
+                Ok(GenerationPayload::Brushable {
+                    loot_table: table.to_owned(),
+                    loot_seed: Some(91),
+                })
+            );
+        }
     }
 
     /// `SpawnData.entity.id` is the one spawner field the runtime model keeps;

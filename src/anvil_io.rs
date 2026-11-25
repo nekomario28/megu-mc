@@ -2320,13 +2320,10 @@ fn anvil_export_block_entities(
             by_pos.insert((x, y, z), tag.clone());
         }
     }
-    // Spawners are Overworld-only generated content; their stored tag is
-    // already the full entity compound including x/y/z.
-    if dim == DimId::Overworld {
-        for (&(x, y, z), tag) in generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.iter() {
-            if in_chunk(x, z) {
-                by_pos.insert((x, y, z), tag.clone());
-            }
+    // Generated spawners are keyed by dimension and carry full entity NBT.
+    for (&(spawner_dim, (x, y, z)), tag) in generated_content().lock().unwrap_or_else(|e| e.into_inner()).spawners.iter() {
+        if spawner_dim == dim && in_chunk(x, z) {
+            by_pos.insert((x, y, z), tag.clone());
         }
     }
     for ((sdim, x, y, z, front), lines) in signs_in_chunk(dim, cx, cz) {

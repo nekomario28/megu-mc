@@ -712,7 +712,7 @@ fn generated_entities_and_mutated_spawner_nbt_resume_in_a_new_process_once() {
         named.extend_from_slice(&entities[0].2[1..]);
         assert_eq!(
             crate::nbt::read_named(&named).unwrap().1,
-            before.spawners[&p]
+            before.spawners[&(crate::worldgen::DimId::Overworld, p)]
         );
         assert_eq!(
             crate::block_at(p.0, p.1, p.2),

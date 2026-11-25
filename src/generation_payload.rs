@@ -106,4 +106,9 @@ pub(crate) enum GenerationPayload {
     },
     /// Entity position is the supplied block anchor plus (0.5, 0.5, 0.5).
     ChestMinecart { loot_seed: i64 },
+    /// Archaeology loot held by a suspicious sand/gravel block until brushing.
+    Brushable {
+        loot_table: String,
+        loot_seed: Option<i64>,
+    },
 }

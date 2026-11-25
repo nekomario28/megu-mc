@@ -648,6 +648,20 @@ impl<'a> FC<'a> {
             },
         ));
     }
+    pub(crate) fn push_brushable(
+        &mut self,
+        pos: (i32, i32, i32),
+        loot_table: &str,
+        loot_seed: Option<i64>,
+    ) {
+        self.payloads.push((
+            pos,
+            crate::generation_payload::GenerationPayload::Brushable {
+                loot_table: loot_table.to_owned(),
+                loot_seed,
+            },
+        ));
+    }
     pub(crate) fn push_spawner(&mut self, pos: (i32, i32, i32), entity_id: &str) {
         self.payloads.push((
             pos,

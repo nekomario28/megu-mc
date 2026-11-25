@@ -8574,6 +8574,51 @@ fn live_block_entities() -> &'static Mutex<LiveBlockEntityStore> {
     STORE.get_or_init(Mutex::default)
 }
 
+pub(crate) fn materialize_generated_brushable(
+    dim: DimId,
+    pos: (i32, i32, i32),
+    loot_table: &str,
+    loot_seed: Option<i64>,
+) {
+    let Some(reg) = breg() else { return };
+    let key = (dim, pos.0 >> 4, pos.2 >> 4);
+    let state = world()
+        .read(&key)
+        .get(&key)
+        .and_then(|chunk| chunk.get(&local_idx(pos.0, pos.1, pos.2)))
+        .copied()
+        .unwrap_or_else(|| {
+            let block = if loot_table.ends_with("ocean_ruin_cold")
+                || loot_table.starts_with("minecraft:archaeology/trail_ruins")
+            {
+                "suspicious_gravel"
+            } else {
+                "suspicious_sand"
+            };
+            name_to_state(block).unwrap()
+        });
+    let mut fields = BlockEntityNbtFields::new();
+    block_entity_put(&mut fields, "LootTable", block_entity_string(loot_table));
+    if let Some(seed) = loot_seed {
+        block_entity_put(&mut fields, "LootTableSeed", Tag::Long(seed));
+    }
+    let entity = LiveBlockEntity::Brushable(Brushable::from_nbt(&Tag::Compound(fields)));
+    if let Some(block) = reg.block_id_of(state) {
+        live_block_entities()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert_entry((dim, pos.0, pos.1, pos.2), (block, entity));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn generated_brushable_loot_table(dim: DimId, pos: (i32, i32, i32)) -> Option<String> {
+    let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
+    let (_, entity) = store.entries.get(&(dim, pos.0, pos.1, pos.2))?;
+    let LiveBlockEntity::Brushable(brushable) = entity else { return None };
+    brushable.loot_table.as_ref().map(|table| table.id.to_string())
+}
+
 impl LiveBlockEntityStore {
     /// The chunk an entry position falls in. `div_euclid` matches the region
     /// format for negative coordinates: x = -1 is chunk -1, not chunk 0.

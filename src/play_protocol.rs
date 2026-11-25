@@ -2936,7 +2936,7 @@ fn interest_tick() {
         let cart = cart.clone();
         let pos = cart.pos().expect("validated generated cart");
         queue(
-            DimId::Overworld,
+            cart.dim(),
             name_to_etype("chest_minecart").unwrap(),
             cart.eid,
             pos[0],
@@ -2948,7 +2948,7 @@ fn interest_tick() {
         let frame = frame.clone();
         let pos = frame.pos().expect("validated generated frame");
         queue(
-            DimId::Overworld,
+            frame.dim(),
             name_to_etype(if frame.glow() {
                 "glow_item_frame"
             } else {
@@ -5874,7 +5874,7 @@ fn chunk_packet_mix(h: u64, v: u64) -> u64 {
 /// The revision a shared `0x27` frame is gated on: every input the sent bytes
 /// can carry. The 3x3 `chunk_versions` tuple moves on any `set_block*` write in
 /// the chunk or a neighbour (block edits and the light updates they cause),
-/// `map_chunk_sig` covers signs, Overworld spawners, the neighbour generated
+/// `map_chunk_sig` covers signs, dimension-keyed spawners, the neighbour generated
 /// emitters in `gen` and the settled light revision, and the fingerprint
 /// covers the live block entities `splice_chunk_block_entities` merges in.
 fn chunk_packet_revision(
