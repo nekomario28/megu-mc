@@ -374,6 +374,10 @@ pub(crate) struct AiPath {
 pub(crate) struct WalkNodeEvaluator {
     pub mob_height: f64,
     pub max_fall_distance: i32,
+    /// Villagers/vindicators open, and hard-mode zombies break, wooden doors;
+    /// those mobs path through the leaf while their door interaction goal owns
+    /// the actual world mutation.
+    pub can_pass_closed_wooden_doors: bool,
 }
 
 impl Default for WalkNodeEvaluator {
@@ -381,6 +385,7 @@ impl Default for WalkNodeEvaluator {
         Self {
             mob_height: 1.8,
             max_fall_distance: 3,
+            can_pass_closed_wooden_doors: false,
         }
     }
 }
@@ -403,7 +408,10 @@ impl WalkNodeEvaluator {
         for block_y in y..=top {
             let path_type = world.path_type(x, block_y, z);
             // Ground navigation can pass the swung panel of an open door.
-            if path_type == BlockPathType::DoorOpen {
+            if path_type == BlockPathType::DoorOpen
+                || (self.can_pass_closed_wooden_doors
+                    && path_type == BlockPathType::DoorWoodClosed)
+            {
                 continue;
             }
             if default_malus(path_type) < 0.0
@@ -918,6 +926,8 @@ pub(crate) struct GoalOutput {
     pub arms_raised: Option<bool>,
     /// RestrictSunGoal's navigation sun-avoidance restriction.
     pub restrict_sun: Option<bool>,
+    /// Closed wooden door cell an OpenDoorGoal wants toggled open.
+    pub open_door: Option<(i32, i32, i32)>,
 }
 
 impl GoalOutput {
@@ -938,6 +948,7 @@ impl GoalOutput {
         self.door_break_progress = self.door_break_progress.or(next.door_break_progress);
         self.arms_raised = self.arms_raised.or(next.arms_raised);
         self.restrict_sun = self.restrict_sun.or(next.restrict_sun);
+        self.open_door = self.open_door.or(next.open_door);
     }
 }
 
@@ -2898,6 +2909,384 @@ pub(crate) fn build_target_selector_for_etype(etype: i64) -> TargetSelector {
     selector
 }
 
+
+/// Vanilla `DoorInteractGoal` as used by villagers and vindicators: a closed
+/// wooden door in reach is a navigation obstacle the mob may open rather than
+/// break. The caller owns the block-state write; the goal emits the cell and
+/// steers through it.
+#[derive(Debug)]
+pub(crate) struct OpenDoorGoal {
+    pub priority: i32,
+    door: Option<(i32, i32, i32)>,
+}
+
+impl OpenDoorGoal {
+    pub fn new(priority: i32) -> Self {
+        Self { priority, door: None }
+    }
+
+    fn find_door(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
+        let world = ctx.world?;
+        let (cx, cy, cz) = (
+            ctx.position.0.floor() as i32,
+            ctx.position.1.floor() as i32,
+            ctx.position.2.floor() as i32,
+        );
+        let mut best: Option<((i32, i32, i32), i32)> = None;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let pos = (cx + dx, cy + dy, cz + dz);
+                    if world.path_type(pos.0, pos.1, pos.2) != BlockPathType::DoorWoodClosed {
+                        continue;
+                    }
+                    let dist = dx * dx + dy * dy + dz * dz;
+                    if best.is_none_or(|(_, old)| dist < old) {
+                        best = Some((pos, dist));
+                    }
+                }
+            }
+        }
+        best.map(|(pos, _)| pos)
+    }
+}
+
+impl Goal for OpenDoorGoal {
+    fn priority(&self) -> i32 { self.priority }
+    fn flags(&self) -> u8 { GoalFlags::MOVE | GoalFlags::LOOK }
+    fn can_use(&self, ctx: &GoalContext<'_>) -> bool { self.find_door(ctx).is_some() }
+    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
+        self.door.is_some_and(|(x, y, z)| {
+            entity_distance_sq(
+                ctx.position,
+                (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
+            ) <= 9.0
+        })
+    }
+    fn start(&mut self, ctx: &GoalContext<'_>) { self.door = self.find_door(ctx); }
+    fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
+        let (x, y, z) = self.door?;
+        Some(GoalOutput {
+            open_door: Some((x, y, z)),
+            move_target: Some((f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5)),
+            look_target: Some((f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5)),
+            ..GoalOutput::default()
+        })
+    }
+    fn stop(&mut self, _: &GoalContext<'_>) { self.door = None; }
+}
+
+
+/// A climb impulse for spiders and other `minecraft:climbable` users. Wall
+/// climbing suppresses horizontal deflection and adds upward motion while the
+/// mob is colliding horizontally; vines/ladders use the same vertical rule.
+pub fn ai_climb_velocity(horizontal: (f64, f64), ascending: bool) -> (f64, f64, f64) {
+    (
+        horizontal.0 * 0.2,
+        if ascending { 0.2 } else { 0.0 },
+        horizontal.1 * 0.2,
+    )
+}
+
+/// Amphibious/swimming navigation follows the target through the water column
+/// instead of projecting the path onto the floor. Buoyancy and gravity remain
+/// owned by entity physics.
+pub fn ai_swim_velocity(
+    position: (f64, f64, f64),
+    target: (f64, f64, f64),
+    speed: f64,
+) -> (f64, f64, f64) {
+    let delta = (target.0 - position.0, target.1 - position.1, target.2 - position.2);
+    let len = (delta.0 * delta.0 + delta.1 * delta.1 + delta.2 * delta.2).sqrt();
+    if len <= 1.0e-9 {
+        (0.0, 0.0, 0.0)
+    } else {
+        (delta.0 / len * speed, delta.1 / len * speed, delta.2 / len * speed)
+    }
+}
+
+/// 1.21.1 charged-creeper head drops. Ordinary explosions never set this loot
+/// flag; the piglin head is part of the same vanilla rule in 1.21.1.
+pub fn ai_charged_creeper_head_drop(
+    victim: &str,
+    killed_by_charged_creeper: bool,
+) -> Option<&'static str> {
+    if !killed_by_charged_creeper {
+        return None;
+    }
+    match victim.strip_prefix("minecraft:").unwrap_or(victim) {
+        "creeper" => Some("minecraft:creeper_head"),
+        "piglin" => Some("minecraft:piglin_head"),
+        "skeleton" => Some("minecraft:skeleton_skull"),
+        "wither_skeleton" => Some("minecraft:wither_skeleton_skull"),
+        "zombie" => Some("minecraft:zombie_head"),
+        _ => None,
+    }
+}
+
+/// Creeper fuse state. `swelling` is the goal's target-in-radius/LOS result.
+/// Flint-and-steel ignition is irrevocable, and charged creepers double power.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiCreeperFuse {
+    pub fuse_ticks: i32,
+    pub flint_ignited: bool,
+    pub charged: bool,
+}
+
+impl AiCreeperFuse {
+    pub const FUSE_TICKS: i32 = 30;
+
+    pub const fn new(charged: bool) -> Self {
+        Self { fuse_ticks: 0, flint_ignited: false, charged }
+    }
+
+    pub fn ignite_flint_and_steel(&mut self) {
+        self.flint_ignited = true;
+        self.fuse_ticks = self.fuse_ticks.max(0);
+    }
+
+    /// Returns explosion power on the detonating tick.
+    pub fn tick(&mut self, swelling: bool) -> Option<f32> {
+        if swelling || self.flint_ignited {
+            self.fuse_ticks = self.fuse_ticks.saturating_add(1);
+        } else {
+            self.fuse_ticks = self.fuse_ticks.saturating_sub(1).max(0);
+        }
+        (self.fuse_ticks >= Self::FUSE_TICKS).then_some(if self.charged { 6.0 } else { 3.0 })
+    }
+}
+
+/// Enderman block carrying is controlled by `minecraft:enderman_holdable` and
+/// `mobGriefing`; placement additionally needs a replaceable destination over
+/// a supporting full block. Registry lookups stay outside this pure rule.
+pub fn ai_enderman_can_pick_block(mob_griefing: bool, block_is_enderman_holdable: bool) -> bool {
+    mob_griefing && block_is_enderman_holdable
+}
+
+pub fn ai_enderman_can_place_block(
+    mob_griefing: bool,
+    carried_is_enderman_holdable: bool,
+    destination_replaceable: bool,
+    support_is_full_block: bool,
+) -> bool {
+    mob_griefing && carried_is_enderman_holdable && destination_replaceable && support_is_full_block
+}
+
+/// Vanilla projectile inaccuracy `14 - difficulty * 4`: Easy 10, Normal 6,
+/// Hard 2. Peaceful never reaches the attack.
+pub fn ai_projectile_inaccuracy(difficulty: u8) -> i32 {
+    14 - i32::from(difficulty.min(3)) * 4
+}
+
+/// Pillager/crossbow charge state. `RangedCrossbowAttackGoal` charges the
+/// crossbow for its 25-tick use duration and fires as soon as the charge
+/// completes; the vanilla 20..40 tick random range is a pathfinding delay,
+/// not a post-shot attack cooldown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AiCrossbowAttack {
+    charge_ticks: u8,
+}
+
+impl Default for AiCrossbowAttack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AiCrossbowAttack {
+    pub const CHARGE_TICKS: u8 = 25;
+
+    pub const fn new() -> Self {
+        Self { charge_ticks: 0 }
+    }
+
+    /// Returns true on the tick the bolt is released. Losing the target or
+    /// line of sight drops an incomplete charge, while a latched charge
+    /// releases after the full use duration.
+    pub fn tick(&mut self, has_target_and_sight: bool) -> bool {
+        if !has_target_and_sight {
+            self.charge_ticks = 0;
+            return false;
+        }
+        self.charge_ticks += 1;
+        if self.charge_ticks < Self::CHARGE_TICKS {
+            return false;
+        }
+        self.charge_ticks = 0;
+        true
+    }
+}
+
+/// Slime/magma-cube mitosis. One draw in `0..3` makes 2–4 children; sizes
+/// halve 4→2→1 and size-one cubes do not split.
+pub fn ai_slime_split_children(size: u8, roll_0_to_2: u8) -> Option<(u8, u8)> {
+    let child = match size {
+        4 => 2,
+        2 => 1,
+        _ => return None,
+    };
+    Some((child, 2 + roll_0_to_2.min(2)))
+}
+
+/// Phantom targeting uses the victim's `time_since_rest` statistic: insomnia
+/// starts at 72,000 ticks (three full in-game days).
+pub const AI_PHANTOM_INSOMNIA_TICKS: u32 = 72_000;
+
+pub fn ai_phantom_can_target_insomniac(time_since_rest: u32) -> bool {
+    time_since_rest >= AI_PHANTOM_INSOMNIA_TICKS
+}
+
+/// Wolf variant selection by 1.21.1 spawn biome. Unlisted biomes produce the
+/// classic pale wolf.
+pub fn ai_wolf_variant_for_biome(biome: &str) -> &'static str {
+    match biome.strip_prefix("minecraft:").unwrap_or(biome) {
+        "forest" => "minecraft:woods",
+        "snowy_taiga" => "minecraft:ashen",
+        "old_growth_pine_taiga" => "minecraft:black",
+        "old_growth_spruce_taiga" => "minecraft:chestnut",
+        "jungle" | "sparse_jungle" | "bamboo_jungle" => "minecraft:rusty",
+        "savanna" | "savanna_plateau" | "windswept_savanna" => "minecraft:spotted",
+        "badlands" | "eroded_badlands" | "wooded_badlands" => "minecraft:striped",
+        "grove" => "minecraft:snowy",
+        _ => "minecraft:pale",
+    }
+}
+
+/// Vanilla wolf pack alerts scan a 32-block radius. A tame wolf joins only
+/// when its owner was attacked; wild pack members join a wild packmate.
+pub fn ai_wolf_pack_member_joins_anger(
+    horizontal_distance_sq: f64,
+    member_tamed: bool,
+    attacker_is_member_owner: bool,
+) -> bool {
+    horizontal_distance_sq <= 32.0 * 32.0 && (!member_tamed || attacker_is_member_owner)
+}
+
+/// Wolf armor absorbs damage types outside vanilla's `bypasses_wolf_armor`
+/// tag; the armor item, not the wolf health pool, pays that absorbed damage.
+pub fn ai_wolf_armor_absorbs(damage_bypasses_wolf_armor: bool, armor_present: bool) -> bool {
+    armor_present && !damage_bypasses_wolf_armor
+}
+
+/// Armadillo threat roll-up. Recent damage (including a close attacker),
+/// undead mobs, and sprinting or mounted players inside the seven-block
+/// horizontal threat radius roll it up. Vanilla suppresses roll-up while the
+/// armadillo is fleeing, airborne, leashed, in water, or on fire; the caller
+/// folds those states into `movement_suppressed`.
+pub fn ai_armadillo_should_roll_up(
+    recently_hurt_or_attacker_near: bool,
+    undead_horizontal_distance_sq: Option<f64>,
+    player_horizontal_distance_sq: Option<f64>,
+    player_sprinting_or_mounted: bool,
+    movement_suppressed: bool,
+) -> bool {
+    if movement_suppressed {
+        return false;
+    }
+    let undead_threat = undead_horizontal_distance_sq.is_some_and(|dist| dist <= 7.0 * 7.0);
+    let player_threat = player_sprinting_or_mounted
+        && player_horizontal_distance_sq.is_some_and(|dist| dist <= 7.0 * 7.0);
+    recently_hurt_or_attacker_near || undead_threat || player_threat
+}
+
+/// Brushing an adult armadillo yields exactly one armadillo scute.
+pub fn ai_armadillo_brush_drop(adult: bool) -> Option<&'static str> {
+    adult.then_some("minecraft:armadillo_scute")
+}
+
+/// Frog tongue prey and froglight conversion. Only size-one slime or magma
+/// cubes fit; magma cubes convert by frog variant.
+pub fn ai_frog_tongue_prey(entity: &str, size: u8) -> bool {
+    size == 1 && matches!(entity.strip_prefix("minecraft:").unwrap_or(entity), "slime" | "magma_cube")
+}
+
+pub fn ai_froglight_for_variant(variant: &str) -> &'static str {
+    match variant.strip_prefix("minecraft:").unwrap_or(variant) {
+        "warm" => "minecraft:pearlescent_froglight",
+        "cold" => "minecraft:verdant_froglight",
+        _ => "minecraft:ochre_froglight",
+    }
+}
+
+/// A hive/nest gains one honey level when a nectar-carrying bee completes the
+/// 2400-tick interior stay; honey is capped at level 5.
+pub fn ai_bee_honey_level_on_exit(
+    current_level: u8,
+    carried_nectar: bool,
+    ticks_inside: u32,
+    bonus_roll_0_to_99: u8,
+) -> u8 {
+    if carried_nectar && ticks_inside >= 2_400 {
+        // Vanilla normally increments by one and has a 1% chance to increment
+        // by a second level on the same exit.
+        (current_level + 1 + u8::from(bonus_roll_0_to_99 == 0)).min(5)
+    } else {
+        current_level.min(5)
+    }
+}
+
+/// Bee colony persistent anger lasts 400 ticks. Campfire smoke suppresses the
+/// harvest provocation but never a direct attack.
+pub fn ai_bee_colony_anger_ticks(
+    direct_attack: bool,
+    harvested: bool,
+    campfire_below: bool,
+    roll_0_to_380: u16,
+) -> u32 {
+    if direct_attack || (harvested && !campfire_below) {
+        // `PERSISTENT_ANGER_TIME` is uniform in 20..39 seconds, inclusive.
+        400 + u32::from(roll_0_to_380.min(380))
+    } else {
+        0
+    }
+}
+
+/// Allay note-block affinity: the last heard note block remains its delivery
+/// target for 600 ticks.
+pub fn ai_allay_note_block_target(heard_at_tick: u64, now_tick: u64) -> bool {
+    now_tick.saturating_sub(heard_at_tick) < 600
+}
+
+/// Allays collect only matching, untargeted ground items within 32 blocks.
+pub fn ai_allay_can_collect_item(
+    same_item_and_components: bool,
+    targeted_by_player_uuid: bool,
+    pickup_delay_elapsed: bool,
+    distance_sq: f64,
+) -> bool {
+    same_item_and_components && !targeted_by_player_uuid && pickup_delay_elapsed && distance_sq <= 32.0 * 32.0
+}
+
+/// Sniffer ancient-seed digging: the two-entry vanilla loot table is uniform.
+pub fn ai_sniffer_dug_seed(roll_0_or_1: u8) -> &'static str {
+    if roll_0_or_1 == 0 { "minecraft:torchflower_seeds" } else { "minecraft:pitcher_pod" }
+}
+
+/// Camel dash state: two riders may mount, but sitting camels cannot dash and
+/// a dash cannot restart inside the 55-tick cooldown.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AiCamelDash {
+    pub last_dash_tick: Option<u64>,
+}
+
+impl AiCamelDash {
+    pub const COOLDOWN_TICKS: u64 = 55;
+    pub const MAX_PASSENGERS: usize = 2;
+
+    /// Returns the horizontal dash impulse; entity physics owns gravity and
+    /// the upward component.
+    pub fn try_dash(&mut self, now_tick: u64, sitting: bool, yaw_degrees: f32) -> Option<(f64, f64)> {
+        if sitting
+            || self.last_dash_tick.is_some_and(|last| now_tick.saturating_sub(last) < Self::COOLDOWN_TICKS)
+        {
+            return None;
+        }
+        self.last_dash_tick = Some(now_tick);
+        let yaw = yaw_degrees.to_radians();
+        Some((-yaw.sin() as f64 * 1.15, yaw.cos() as f64 * 1.15))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum MobGoalKind {
     Float,
@@ -2923,6 +3312,7 @@ pub(crate) enum MobGoalKind {
     MoveThroughVillage {
         can_break_doors: bool,
     },
+    OpenDoor,
 }
 
 /// Vanilla `AvoidEntityGoal` constants (maxDist 6.0, walk 1.0, sprint 1.2).
@@ -3091,6 +3481,25 @@ impl MobGoalPlan {
                 // `build_target_selector_for_etype`.
                 &[],
             ),
+            "minecraft:villager" => (
+                vec![
+                    (1, OpenDoor),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (7, RandomLookAround),
+                ],
+                &[],
+            ),
+            "minecraft:vindicator" => (
+                vec![
+                    (1, OpenDoor),
+                    (2, MeleeAttack),
+                    (5, WaterAvoidingRandomStroll),
+                    (6, LookAtPlayer),
+                    (7, RandomLookAround),
+                ],
+                &[],
+            ),
             _ => return None,
         };
         if ZOMBIE_FAMILY.contains(&entity.name) && settings.zombie_can_break_doors {
@@ -3143,6 +3552,7 @@ impl MobGoalPlan {
                 MobGoalKind::MoveThroughVillage { can_break_doors } => Box::new(
                     MoveThroughVillageGoal::new(priority, can_break_doors, seed),
                 ),
+                MobGoalKind::OpenDoor => Box::new(OpenDoorGoal::new(priority)),
             };
             selector.add_goal(goal);
         }
@@ -3274,6 +3684,8 @@ pub(crate) struct MobAiStepResult {
     pub arms_raised: Option<bool>,
     /// `RestrictSunGoal`'s navigation sun-avoidance restriction.
     pub restrict_sun: Option<bool>,
+    /// Closed wooden door cell the AI wants opened this tick.
+    pub open_door: Option<(i32, i32, i32)>,
     /// `maxEntityCramming` damage evaluated for this tick; the live push
     /// engine applies it through its own hurt path.
     pub cramming_damage: f32,
@@ -3336,6 +3748,7 @@ pub(crate) fn tick_mob_ai_step(
             let finder = PathFinder {
                 evaluator: WalkNodeEvaluator {
                     mob_height: ctx.height,
+                    can_pass_closed_wooden_doors: matches!(profile.etype, 113 | 114 | 124 | 54 | 27 | 126 | 127),
                     ..WalkNodeEvaluator::default()
                 },
                 ..PathFinder::default()
@@ -3434,6 +3847,7 @@ pub(crate) fn tick_mob_ai_step(
         door_break_progress: goal.door_break_progress,
         arms_raised: goal.arms_raised,
         restrict_sun: goal.restrict_sun,
+        open_door: goal.open_door,
         cramming_damage,
     }
 }
@@ -5324,4 +5738,181 @@ mod mob_ai_tests {
         let no_target = GoalContext::default();
         assert!(!goal.can_use(&no_target));
     }
+
+
+    #[test]
+    fn alpha5_open_door_goal_and_door_capable_navigation_reach_through_wooden_door() {
+        let mut world = GridWorld::default();
+        world.set(1, 1, 0, BlockPathType::DoorWoodClosed);
+        world.set(1, 2, 0, BlockPathType::DoorWoodClosed);
+        let ctx = GoalContext {
+            position: (0.5, 1.0, 0.5),
+            world: Some(&world),
+            ..GoalContext::default()
+        };
+        let mut goal = OpenDoorGoal::new(1);
+        assert!(goal.can_use(&ctx));
+        goal.start(&ctx);
+        let out = goal.tick(&ctx).expect("door goal output");
+        assert_eq!(out.open_door, Some((1, 1, 0)));
+        assert_eq!(out.move_target, Some((1.5, 1.0, 0.5)));
+
+        // Door interaction changes the navigation contract only for mobs that
+        // can operate the door: ordinary walkers still see it as blocked.
+        let evaluator = WalkNodeEvaluator {
+            can_pass_closed_wooden_doors: true,
+            ..WalkNodeEvaluator::default()
+        };
+        assert!(evaluator.standable(&world, (1, 1, 0)));
+        assert!(!WalkNodeEvaluator::default().standable(&world, (1, 1, 0)));
+    }
+
+    #[test]
+    fn alpha5_creeper_fuse_flint_charge_cancel_and_charged_head_rules() {
+        let mut fuse = AiCreeperFuse::new(false);
+        for _ in 0..29 {
+            assert_eq!(fuse.tick(true), None);
+        }
+        assert_eq!(fuse.tick(true), Some(3.0));
+
+        let mut cancel = AiCreeperFuse::new(false);
+        for _ in 0..10 {
+            cancel.tick(true);
+        }
+        for _ in 0..30 {
+            assert_eq!(cancel.tick(false), None);
+        }
+        assert_eq!(cancel.fuse_ticks, 0, "leaving the seven-block goal radius unwinds the fuse");
+
+        let mut charged = AiCreeperFuse::new(true);
+        charged.ignite_flint_and_steel();
+        for _ in 0..10 {
+            charged.tick(false);
+        }
+        assert_eq!(charged.fuse_ticks, 10, "flint ignition cannot be cancelled by losing the target");
+        for _ in 10..29 {
+            assert_eq!(charged.tick(false), None);
+        }
+        assert_eq!(charged.tick(false), Some(6.0));
+        assert_eq!(
+            ai_charged_creeper_head_drop("minecraft:wither_skeleton", true),
+            Some("minecraft:wither_skeleton_skull")
+        );
+        assert_eq!(ai_charged_creeper_head_drop("minecraft:piglin", true), Some("minecraft:piglin_head"));
+        assert_eq!(ai_charged_creeper_head_drop("minecraft:zombie", false), None);
+        assert_eq!(ai_charged_creeper_head_drop("minecraft:cow", true), None);
+    }
+
+    #[test]
+    fn alpha5_ranged_crossbow_accuracy_charge_and_projectile_helpers() {
+        assert_eq!(ai_projectile_inaccuracy(1), 10);
+        assert_eq!(ai_projectile_inaccuracy(2), 6);
+        assert_eq!(ai_projectile_inaccuracy(3), 2);
+        let mut crossbow = AiCrossbowAttack::new();
+        for _ in 0..24 {
+            assert!(!crossbow.tick(true));
+        }
+        assert!(crossbow.tick(true));
+        for tick in 1..25 {
+            assert!(!crossbow.tick(true), "redraw tick {tick}");
+        }
+        assert!(crossbow.tick(true), "a visible target produces the next bolt after another 25-tick charge");
+        let mut reset = AiCrossbowAttack::new();
+        for _ in 0..10 {
+            reset.tick(true);
+        }
+        assert!(!reset.tick(false));
+        for _ in 0..24 {
+            assert!(!reset.tick(true), "losing sight resets the draw");
+        }
+        assert!(reset.tick(true), "the reset draw needs the full 25 ticks again");
+    }
+
+    #[test]
+    fn alpha5_nether_and_overworld_ecology_rules_are_deterministic() {
+        assert_eq!(ai_slime_split_children(4, 0), Some((2, 2)));
+        assert_eq!(ai_slime_split_children(4, 2), Some((2, 4)));
+        assert_eq!(ai_slime_split_children(2, 1), Some((1, 3)));
+        assert_eq!(ai_slime_split_children(1, 2), None);
+
+        assert!(ai_enderman_can_pick_block(true, true));
+        assert!(!ai_enderman_can_pick_block(true, false));
+        assert!(!ai_enderman_can_pick_block(false, true));
+        assert!(ai_enderman_can_place_block(true, true, true, true));
+        assert!(!ai_enderman_can_place_block(true, true, false, true));
+        assert!(!ai_enderman_can_place_block(true, true, true, false));
+
+        assert!(ai_phantom_can_target_insomniac(72_000));
+        assert!(!ai_phantom_can_target_insomniac(71_999));
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:old_growth_pine_taiga"), "minecraft:black");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:sparse_jungle"), "minecraft:rusty");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:savanna_plateau"), "minecraft:spotted");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:wooded_badlands"), "minecraft:striped");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:grove"), "minecraft:snowy");
+        assert_eq!(ai_wolf_variant_for_biome("minecraft:plains"), "minecraft:pale");
+        assert!(ai_wolf_pack_member_joins_anger(32.0_f64.powi(2), false, false));
+        assert!(!ai_wolf_pack_member_joins_anger(32.1_f64.powi(2), false, false));
+        assert!(!ai_wolf_pack_member_joins_anger(1.0, true, false));
+        assert!(ai_wolf_pack_member_joins_anger(1.0, true, true));
+        assert!(ai_wolf_armor_absorbs(false, true));
+        assert!(!ai_wolf_armor_absorbs(true, true));
+    }
+
+    #[test]
+    fn alpha5_passive_ecology_allay_sniffer_camel_bee_frog_and_armadillo_rules() {
+        assert_eq!(ai_bee_honey_level_on_exit(2, true, 2_400, 1), 3);
+        assert_eq!(ai_bee_honey_level_on_exit(5, true, 2_400, 1), 5);
+        assert_eq!(ai_bee_honey_level_on_exit(2, true, 2_399, 0), 2);
+        assert_eq!(ai_bee_honey_level_on_exit(2, false, 2_400, 0), 2);
+        assert_eq!(ai_bee_colony_anger_ticks(true, false, true, 0), 400);
+        assert_eq!(ai_bee_colony_anger_ticks(false, true, false, 0), 400);
+        assert_eq!(ai_bee_colony_anger_ticks(false, true, true, 380), 0);
+        assert_eq!(ai_bee_colony_anger_ticks(false, true, false, 380), 780);
+        assert_eq!(ai_bee_honey_level_on_exit(3, true, 2_400, 0), 5);
+
+        assert!(ai_armadillo_should_roll_up(true, None, None, false, false));
+        assert!(ai_armadillo_should_roll_up(false, Some(49.0), None, false, false));
+        assert!(!ai_armadillo_should_roll_up(false, Some(49.1), None, false, false));
+        assert!(ai_armadillo_should_roll_up(false, None, Some(49.0), true, false));
+        assert!(!ai_armadillo_should_roll_up(false, None, Some(49.0), false, false));
+        assert!(!ai_armadillo_should_roll_up(true, Some(1.0), Some(1.0), true, true));
+        assert_eq!(ai_armadillo_brush_drop(true), Some("minecraft:armadillo_scute"));
+        assert_eq!(ai_armadillo_brush_drop(false), None);
+
+        assert!(ai_frog_tongue_prey("minecraft:magma_cube", 1));
+        assert!(ai_frog_tongue_prey("minecraft:slime", 1));
+        assert!(!ai_frog_tongue_prey("minecraft:magma_cube", 2));
+        assert_eq!(ai_froglight_for_variant("warm"), "minecraft:pearlescent_froglight");
+        assert_eq!(ai_froglight_for_variant("cold"), "minecraft:verdant_froglight");
+        assert_eq!(ai_froglight_for_variant("temperate"), "minecraft:ochre_froglight");
+
+        assert!(ai_allay_note_block_target(100, 699));
+        assert!(!ai_allay_note_block_target(100, 700));
+        assert!(ai_allay_can_collect_item(true, false, true, 32.0_f64.powi(2)));
+        assert!(!ai_allay_can_collect_item(true, false, true, 32.1_f64.powi(2)));
+        assert!(!ai_allay_can_collect_item(false, false, true, 1.0));
+        assert_eq!(ai_sniffer_dug_seed(0), "minecraft:torchflower_seeds");
+        assert_eq!(ai_sniffer_dug_seed(1), "minecraft:pitcher_pod");
+
+        assert_eq!(AiCamelDash::MAX_PASSENGERS, 2);
+        let mut camel = AiCamelDash { last_dash_tick: None };
+        let (x, z) = camel.try_dash(1_000, false, 0.0).expect("first dash");
+        assert!((x - 0.0).abs() < 1e-9 && (z - 1.15).abs() < 1e-9);
+        assert_eq!(camel.try_dash(1_054, false, 0.0), None);
+        assert!(camel.try_dash(1_055, false, 0.0).is_some());
+        let mut sitting = AiCamelDash { last_dash_tick: None };
+        assert_eq!(sitting.try_dash(2_000, true, 0.0), None);
+    }
+
+    #[test]
+    fn alpha5_climb_and_swim_navigation_vectors_are_bounded() {
+        assert_eq!(ai_climb_velocity((1.0, -1.0), true), (0.2, 0.2, -0.2));
+        assert_eq!(ai_climb_velocity((1.0, -1.0), false), (0.2, 0.0, -0.2));
+        let (x, y, z) = ai_swim_velocity((0.0, 0.0, 0.0), (3.0, 0.0, 4.0), 0.5);
+        assert!((x - 0.3).abs() < 1e-9);
+        assert_eq!(y, 0.0);
+        assert!((z - 0.4).abs() < 1e-9);
+        assert_eq!(ai_swim_velocity((1.0, 1.0, 1.0), (1.0, 1.0, 1.0), 0.5), (0.0, 0.0, 0.0));
+    }
+
 }

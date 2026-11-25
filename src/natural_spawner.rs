@@ -1820,10 +1820,21 @@ pub(crate) fn spawn_natural_category_scratch(
 ) -> usize {
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1
         || (category == MobCategory::Monster && DIFFICULTY.load(Ordering::Relaxed) == 0)
+        || (category == MobCategory::Creature && !tick.is_multiple_of(server_ticks(400)))
     {
         return 0;
     }
-    let players = live_spawn_anchors(clients, dim);
+    let player_rows: Vec<(u64, [f64; 3])> = clients
+        .iter()
+        .filter_map(|client| {
+            if client.is_spectator() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+                return None;
+            }
+            let (x, y, z, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            Some((client.eid as u64, [x, y, z]))
+        })
+        .collect();
+    let players: Vec<[f64; 3]> = player_rows.iter().map(|(_, pos)| *pos).collect();
     if players.is_empty() {
         return 0;
     }
@@ -1831,10 +1842,60 @@ pub(crate) fn spawn_natural_category_scratch(
         return 0;
     };
     let spawn_chunks = live_spawn_chunks(&players);
-    let cap = category.global_cap(spawn_chunks.len() as u32) as usize;
-    if cap == 0 || live_category_count(dim, category) >= cap {
-        return 0;
+
+    // `NaturalSpawner.createState`: the cap census is per pass, not a sequence
+    // of independent world scans. Each spawnable chunk carries the ids of the
+    // players whose 8-chunk ticket radius covers it; those ids are the local
+    // cap keys. Biome `spawn_costs` charges seed the same energy field that
+    // subsequent pack members must fit under.
+    let mut chunk_players: HashMap<(i32, i32), Vec<u64>> = HashMap::new();
+    for &(eid, [x, _, z]) in &player_rows {
+        let (cx, cz) = (x.floor() as i32 >> 4, z.floor() as i32 >> 4);
+        for dx in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
+            for dz in -NATURAL_SPAWN_CHUNK_RADIUS..=NATURAL_SPAWN_CHUNK_RADIUS {
+                let chunk = (cx + dx, cz + dz);
+                if spawn_chunks.contains(&chunk) {
+                    chunk_players.entry(chunk).or_default().push(eid);
+                }
+            }
+        }
     }
+    let mut caps = NaturalSpawnState::new(spawn_chunks.len() as u32, true);
+    let mut census = Vec::new();
+    {
+        let current = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        for mob in current.iter().filter(|mob| mob.dim == dim) {
+            if *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+                continue;
+            }
+            let Some(spec) = entity_spec_by_id(mob.etype) else {
+                continue;
+            };
+            let Some(mob_category) = live_mob_category(mob.etype) else {
+                continue;
+            };
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let pos = NaturalSpawnPos {
+                x: x.floor() as i32,
+                y: y.floor() as i32,
+                z: z.floor() as i32,
+            };
+            let chunk = (pos.x >> 4, pos.z >> 4);
+            caps.count_existing(
+                mob_category,
+                pos,
+                None,
+                chunk_players.get(&chunk).map_or(&[], Vec::as_slice),
+            );
+            census.push((spec.name, pos));
+        }
+    }
+    let mut costs = SpawnCostState::from_existing(census.iter().copied(), |pos, chunk| {
+        if !spawn_chunks.contains(&chunk) {
+            return None;
+        }
+        worldgen::with_gen_dim(dim, |gen| gen.biome_name_at(pos.x, pos.y, pos.z)).flatten()
+    });
     let attempt = SPAWN_ATTEMPT.fetch_add(1, Ordering::Relaxed);
     let &[px, _, pz] = &players[attempt as usize % players.len()];
     let angle = tick as f64 * 2.399 + category.index() as f64;
@@ -1867,6 +1928,14 @@ pub(crate) fn spawn_natural_category_scratch(
     let Some(entry) = choose_nightly_spawner(entries) else {
         return 0;
     };
+    let Some(spec) = entity_spec_by_name(&entry.kind) else {
+        return 0;
+    };
+    // `SpawnState.canSpawn(EntityType, ...)` caps the entity's own registry
+    // category. Jungle ocelots are rows in the monster table but still count
+    // as creatures, so the table key cannot be reused as the cap key.
+    let cap_category = live_mob_category(spec.id).unwrap_or(category);
+    let cap = cap_category.global_cap(spawn_chunks.len() as u32);
     let Some(mob) = OverworldSpawnMob::from_id(&entry.kind) else {
         return 0;
     };
@@ -1886,19 +1955,34 @@ pub(crate) fn spawn_natural_category_scratch(
         let Some(y) = natural_spawn_column_y(reg, dim, mob, x, z, &mut rng) else {
             continue;
         };
-        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z)
-            || live_category_count(dim, category) >= cap
-        {
+        if !live_spawn_position_ok(&players, &spawn_chunks, x, y, z) || caps.count(cap_category) >= cap {
+            continue;
+        }
+        let nearest_squared = players
+            .iter()
+            .map(|&[px, py, pz]| {
+                (px - (f64::from(x) + 0.5)).powi(2)
+                    + (py - f64::from(y)).powi(2)
+                    + (pz - (f64::from(z) + 0.5)).powi(2)
+            })
+            .fold(f64::INFINITY, f64::min);
+        if !can_spawn_at_distance(nearest_squared, cap_category) {
             continue;
         }
         let (cx, cz) = (x >> 4, z >> 4);
+        let pos = NaturalSpawnPos { x, y, z };
+        let nearby: &[u64] = chunk_players.get(&(cx, cz)).map_or(&[], Vec::as_slice);
+        if !caps.can_spawn(cap_category, pos, None, nearby)
+            || !costs.can_spawn(&entry.kind, pos, (cx, cz))
+        {
+            continue;
+        }
         let sources = natural_spawn_light_sources(clients, dim, cx, cz);
         let queries = LiveNaturalSpawnQueries {
             dim,
             reg,
             sources: &sources,
         };
-        let pos = NaturalSpawnPos { x, y, z };
         if !natural_spawn_placement_allows(reg, dim, mob, pos)
             || !rules.allows(mob, pos, &queries, &mut WorldRngDraws)
         {
@@ -1910,6 +1994,9 @@ pub(crate) fn spawn_natural_category_scratch(
             dim,
             (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, yaw, 0.0),
         ) {
+            let pos = NaturalSpawnPos { x, y, z };
+            costs.after_spawn(&entry.kind, pos, (cx, cz));
+            caps.record_success(cap_category, pos, None, nearby);
             spawned += 1;
         }
     }
@@ -3835,4 +3922,109 @@ fn nether_spawn_in_fluid(
             })
         })
     })
+}
+
+
+#[cfg(test)]
+mod natural_spawner_alpha5_tests {
+    use super::*;
+
+    fn pos(x: i32, y: i32, z: i32) -> NaturalSpawnPos {
+        NaturalSpawnPos { x, y, z }
+    }
+
+    #[test]
+    fn alpha5_caps_local_caps_potential_light_and_distance_contracts() {
+        for (category, cap) in [
+            (MobCategory::Monster, 70),
+            (MobCategory::Creature, 10),
+            (MobCategory::Ambient, 15),
+            (MobCategory::Axolotls, 5),
+            (MobCategory::UndergroundWaterCreature, 5),
+            (MobCategory::WaterCreature, 5),
+            (MobCategory::WaterAmbient, 20),
+        ] {
+            assert_eq!(category.max_instances_per_chunk(), cap);
+            assert_eq!(category.global_cap(289), cap);
+            assert_eq!(category.no_despawn_distance(), 32.0);
+        }
+        assert_eq!(MobCategory::Monster.global_cap(288), 69);
+        assert_eq!(MobCategory::Monster.global_cap(578), 140);
+
+        // Local caps are keyed per player: one player with 70 monsters in its
+        // 8-chunk radius rejects the next monster while a disjoint player can
+        // still host its own local density.
+        let mut state = NaturalSpawnState::new(578, true);
+        for i in 0..70 {
+            state.count_existing(
+                MobCategory::Monster,
+                pos(i, 64, 0),
+                None,
+                &[1],
+            );
+        }
+        assert!(!state.can_spawn(MobCategory::Monster, pos(0, 64, 0), None, &[1]));
+        assert!(state.can_spawn(MobCategory::Monster, pos(512, 64, 0), None, &[2]));
+
+        // Spawn-potential energy is cumulative: existing charges reduce the
+        // remaining budget and `record_success` adds the new charge.
+        let cost = MobSpawnCost { energy_budget: 1.0, charge: 0.5 };
+        let mut potential_state = NaturalSpawnState::new(289, false);
+        assert!(potential_state.can_spawn(MobCategory::Monster, pos(0, 64, 0), Some(cost), &[]));
+        potential_state.record_success(MobCategory::Monster, pos(0, 64, 0), Some(cost), &[]);
+        assert!(!potential_state.can_spawn(MobCategory::Monster, pos(0, 64, 0), Some(cost), &[]));
+
+        // The 24/32/128 distance contract is inclusive at the outer sphere and
+        // exclusive inside the 24-block no-spawn sphere.
+        assert!(!can_spawn_at_distance(24.0 * 24.0, MobCategory::Monster));
+        assert!(can_spawn_at_distance(24.0 * 24.0 + 0.01, MobCategory::Monster));
+        assert!(can_spawn_at_distance(128.0 * 128.0, MobCategory::Monster));
+        assert!(!can_spawn_at_distance(128.0 * 128.0 + 0.01, MobCategory::Monster));
+        assert!(!can_spawn_at_distance(f64::NAN, MobCategory::Monster));
+
+        // Pin the dimension-sampled 1.21.1 monster light semantics: the
+        // Overworld's zero sampled threshold requires no block light, while a
+        // Nether-style threshold of seven accepts block light 7 and rejects 8.
+        let overworld_dark = MonsterLightSample {
+            sky_light: 0,
+            block_light: 0,
+            sky_darken: 11,
+            thundering: false,
+            monster_spawn_block_light_limit: 0,
+            sampled_spawn_light_limit: 0,
+        };
+        assert!(is_dark_enough_to_spawn(overworld_dark, 0));
+        assert!(!is_dark_enough_to_spawn(
+            MonsterLightSample { block_light: 1, ..overworld_dark },
+            0,
+        ));
+        let nether_dark = MonsterLightSample {
+            monster_spawn_block_light_limit: 15,
+            sampled_spawn_light_limit: 7,
+            ..overworld_dark
+        };
+        assert!(is_dark_enough_to_spawn(
+            MonsterLightSample { block_light: 7, ..nether_dark },
+            0,
+        ));
+        assert!(!is_dark_enough_to_spawn(
+            MonsterLightSample { block_light: 8, ..nether_dark },
+            0,
+        ));
+    }
+
+    #[test]
+    fn alpha5_slime_chunk_swamp_moon_and_pack_contracts_remain_exact() {
+        // The existing pure rules are the authority; this regression keeps the
+        // alpha-5 lane's requested ecology coupled to those rules.
+        let slime_pos = pos(0, 40, 0);
+        assert_eq!(slime_pos.x >> 4, 0);
+        assert_eq!(slime_pos.z >> 4, 0);
+        assert!(can_spawn_at_distance(25.0 * 25.0, MobCategory::Creature));
+        assert_eq!(MobCategory::WaterAmbient.despawn_distance(), 64.0);
+        assert_eq!(MobCategory::Monster.despawn_distance(), 128.0);
+        assert_eq!(MobCategory::Creature.despawn_distance(), 128.0);
+        let ocelot = entity_spec_by_name("minecraft:ocelot").expect("registered ocelot");
+        assert_eq!(live_mob_category(ocelot.id), Some(MobCategory::Creature));
+    }
 }
