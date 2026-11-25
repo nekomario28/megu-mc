@@ -704,6 +704,31 @@ fn invalid_runtime(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+const BLOCK_COUNT: usize = 1_060;
+const BLOCK_STATE_COUNT: usize = 26_684;
+
+fn json_u64(value: &Json) -> Option<u64> {
+    let n = value.as_f64()?;
+    (n.is_finite() && n.fract() == 0.0 && n >= 0.0 && n <= u64::MAX as f64)
+        .then_some(n as u64)
+}
+
+fn json_number(value: &Json) -> Option<f64> {
+    value.as_f64().filter(|n| n.is_finite())
+}
+
+fn valid_minecraft_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+        })
+}
+
+fn valid_namespaced_name(name: &str) -> bool {
+    name.strip_prefix("minecraft:").is_some_and(valid_minecraft_name)
+}
+
 fn canonical_block_state_asset_valid(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -805,6 +830,120 @@ fn sha256_file(path: &Path) -> io::Result<String> {
     Ok(hasher.finalize_hex())
 }
 
+fn canonical_blocks_asset_semantics_valid(blocks: &[Json]) -> bool {
+    if blocks.len() != BLOCK_COUNT {
+        return false;
+    }
+    let mut expected_state = 0u64;
+    let mut names = std::collections::HashSet::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let required = [
+            "id",
+            "name",
+            "hardness",
+            "resistance",
+            "stackSize",
+            "defaultState",
+            "minStateId",
+            "maxStateId",
+            "states",
+            "drops",
+        ];
+        if required.iter().any(|key| block.get(key).is_none()) {
+            return false;
+        }
+        if block.get("id").and_then(json_u64) != Some(index as u64) {
+            return false;
+        }
+        let Some(name) = block.get("name").and_then(Json::as_str) else {
+            return false;
+        };
+        if !valid_minecraft_name(name) || !names.insert(name.to_owned()) {
+            return false;
+        }
+        if block.get("hardness").and_then(json_number).is_none()
+            || block.get("resistance").and_then(json_number).is_none()
+            || !matches!(block.get("stackSize").and_then(json_u64), Some(1 | 16 | 64))
+        {
+            return false;
+        }
+        let (Some(lo), Some(hi), Some(default)) = (
+            block.get("minStateId").and_then(json_u64),
+            block.get("maxStateId").and_then(json_u64),
+            block.get("defaultState").and_then(json_u64),
+        ) else {
+            return false;
+        };
+        if lo != expected_state || hi < lo || default < lo || default > hi {
+            return false;
+        }
+        let range_len = hi - lo + 1;
+        let Some(states) = block.get("states").and_then(Json::as_array) else {
+            return false;
+        };
+        let mut cardinality = 1u64;
+        for property in states {
+            let Some(prop_name) = property.get("name").and_then(Json::as_str) else {
+                return false;
+            };
+            if !valid_minecraft_name(prop_name) {
+                return false;
+            }
+            let values_len = match property.get("values").and_then(Json::as_array) {
+                Some(values) => {
+                    if values.is_empty()
+                        || values.len() > 64
+                        || !values.iter().all(|v| {
+                            v.as_str().is_some_and(|value| valid_minecraft_name(value))
+                        })
+                    {
+                        return false;
+                    }
+                    values.len() as u64
+                }
+                None => 2,
+            };
+            if let Some(num_values) = property.get("num_values").and_then(json_u64) {
+                if num_values != values_len {
+                    return false;
+                }
+            }
+            cardinality = cardinality.saturating_mul(values_len);
+        }
+        if cardinality != range_len {
+            return false;
+        }
+        if !block.get("drops").and_then(Json::as_array).is_some_and(|drops| {
+            drops
+                .iter()
+                .all(|drop| json_u64(drop).is_some())
+        }) {
+            return false;
+        }
+        expected_state = hi + 1;
+    }
+    if expected_state != BLOCK_STATE_COUNT as u64 {
+        return false;
+    }
+    // Registry anchors reject the vacuous synthetic block0..block1059 shape
+    // even when its ranges and property arithmetic are internally consistent.
+    blocks
+        .first()
+        .and_then(|block| block.get("name"))
+        .and_then(Json::as_str)
+        == Some("air")
+        && blocks
+            .get(1)
+            .and_then(|block| block.get("name"))
+            .and_then(Json::as_str)
+            == Some("stone")
+        && blocks
+            .last()
+            .and_then(|block| block.get("name"))
+            .and_then(Json::as_str)
+            == Some("heavy_core")
+}
+
 fn canonical_blocks_asset_valid(path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
@@ -815,43 +954,7 @@ fn canonical_blocks_asset_valid(path: &Path) -> bool {
     let Some(blocks) = blocks.as_array() else {
         return false;
     };
-    if blocks.len() != 1060 {
-        return false;
-    }
-    let mut total = 0u64;
-    blocks.iter().all(|block| {
-        let required = ["id", "name", "hardness", "resistance", "stackSize", "defaultState", "minStateId", "maxStateId", "states", "drops"];
-        if required.iter().any(|key| block.get(key).is_none()) {
-            return false;
-        }
-        let Some(lo) = block.get("minStateId").and_then(Json::as_f64) else {
-            return false;
-        };
-        let Some(hi) = block.get("maxStateId").and_then(Json::as_f64) else {
-            return false;
-        };
-        if lo < 0.0 || hi < lo {
-            return false;
-        }
-        total += (hi - lo + 1.0) as u64;
-        true
-    }) && total == 26_684
-}
-
-fn file_has_nonzero_byte(path: &Path) -> bool {
-    use std::io::Read;
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        match file.read(&mut buf) {
-            Ok(0) => return false,
-            Ok(n) if buf[..n].iter().any(|byte| *byte != 0) => return true,
-            Ok(_) => {}
-            Err(_) => return false,
-        }
-    }
+    canonical_blocks_asset_semantics_valid(blocks)
 }
 
 fn feature_order_asset_valid(path: &Path) -> bool {
@@ -861,71 +964,127 @@ fn feature_order_asset_valid(path: &Path) -> bool {
     let Ok(order) = megu_server_files::json::parse(&text) else {
         return false;
     };
-    let Some(top) = order.as_object() else {
-        return false;
-    };
-    let expected = [("overworld", 53, 11), ("nether", 5, 10), ("end", 5, 11)];
-    if top.len() != expected.len() {
-        return false;
-    }
-    expected.iter().all(|(dimension, biome_count, step_count)| {
-        let Some(section) = order.get(dimension) else {
+    for (dimension, biome_count, step_count, feature_count) in [
+        ("overworld", 53usize, 11usize, 151usize),
+        ("nether", 5, 10, 37),
+        ("end", 5, 11, 5),
+    ] {
+        let Some(dim) = order.get(dimension) else {
             return false;
         };
-        let biomes_valid = section
-            .get("biomes")
-            .and_then(Json::as_array)
-            .is_some_and(|biomes| {
-                biomes.len() == *biome_count
-                    && biomes.iter().all(|biome| {
-                        biome
-                            .as_str()
-                            .is_some_and(|name| name.starts_with("minecraft:"))
-                    })
-            });
-        let steps_valid = section
-            .get("steps")
-            .and_then(Json::as_array)
-            .is_some_and(|steps| {
-                steps.len() == *step_count
-                    && steps.iter().all(|step| {
-                        step.as_array().is_some_and(|features| {
-                            features.iter().all(|feature| {
-                                feature
-                                    .as_str()
-                                    .is_some_and(|name| name.starts_with("minecraft:"))
-                            })
-                        })
-                    })
-            });
-        biomes_valid && steps_valid
-    })
+        let Some(biomes) = dim.get("biomes").and_then(Json::as_array) else {
+            return false;
+        };
+        if biomes.len() != biome_count
+            || !biomes.iter().all(|biome| {
+                biome.as_str().is_some_and(valid_namespaced_name)
+            })
+        {
+            return false;
+        }
+        let mut unique_biomes = std::collections::HashSet::new();
+        if !biomes.iter().all(|biome| {
+            unique_biomes.insert(biome.as_str().unwrap_or_default())
+        }) {
+            return false;
+        }
+        let Some(steps) = dim.get("steps").and_then(Json::as_array) else {
+            return false;
+        };
+        if steps.len() != step_count {
+            return false;
+        }
+        let mut features = std::collections::HashSet::new();
+        for step in steps {
+            let Some(list) = step.as_array() else {
+                return false;
+            };
+            for feature in list {
+                let Some(name) = feature.as_str() else {
+                    return false;
+                };
+                if !valid_namespaced_name(name) || !features.insert(name) {
+                    return false;
+                }
+            }
+        }
+        if features.len() != feature_count {
+            return false;
+        }
+        if dimension == "overworld"
+            && biomes.first().and_then(Json::as_str) != Some("minecraft:mushroom_fields")
+        {
+            return false;
+        }
+        if dimension == "end"
+            && !features.contains("minecraft:end_island_decorated")
+        {
+            return false;
+        }
+    }
+    true
 }
 
-fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
+fn binary_runtime_asset_valid(path: &Path, rel: &str) -> bool {
+    let Ok(data) = std::fs::read(path) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
-    if rel == "assets/blocks_1211.json" {
-        return canonical_blocks_asset_valid(path);
-    }
-    if rel == "assets/feature_order_1211.json" {
-        return feature_order_asset_valid(path);
-    }
     let expected = match rel {
         "assets/block_predicates_1211.bin"
         | "assets/collision_shape_full_1211.bin"
         | "assets/mineshaft_support_1211.bin"
         | "assets/multiface_support_1211.bin"
-        | "assets/template_solid_1211.bin" => 26_684,
-        "assets/block_state_facts_1211.bin" => 26_684 * 6,
-        "assets/structure_state_transforms_1211.bin" => 26_684 * 12 * 4,
-        _ => return true,
+        | "assets/template_solid_1211.bin" => BLOCK_STATE_COUNT,
+        "assets/block_state_facts_1211.bin" => BLOCK_STATE_COUNT * 6,
+        "assets/structure_state_transforms_1211.bin" => BLOCK_STATE_COUNT * 12 * 4,
+        _ => return false,
     };
-    meta.len() == expected && file_has_nonzero_byte(path)
+    if data.len() != expected || data.len() < 2 {
+        return false;
+    }
+    let distinct = data.iter().copied().collect::<std::collections::BTreeSet<_>>().len();
+    match rel {
+        "assets/block_predicates_1211.bin" => {
+            data[0] == 0 && data[1] == 31 && distinct > 2
+        }
+        "assets/multiface_support_1211.bin" => {
+            data.iter().all(|byte| *byte < 64) && data[0] == 0 && data[1] == 63 && distinct > 1
+        }
+        "assets/mineshaft_support_1211.bin" => data[0] == 0 && data[1] == 127 && distinct > 2,
+        "assets/collision_shape_full_1211.bin" | "assets/template_solid_1211.bin" => {
+            data.iter().all(|byte| matches!(*byte, 0 | 1))
+                && data[0] == 0
+                && data[1] == 1
+                && distinct == 2
+        }
+        "assets/block_state_facts_1211.bin" => {
+            data[0..6] == [161, 0, 0, 0, 0, 0]
+                && data[6..12] == [220, 15, 255, 255, 3, 0]
+                && distinct > 8
+        }
+        "assets/structure_state_transforms_1211.bin" => {
+            data[..48].iter().all(|byte| *byte == 0)
+                && data[48..96]
+                    .chunks_exact(4)
+                    .all(|word| word == [0, 0, 0, 1])
+                && distinct > 8
+        }
+        _ => false,
+    }
+}
+
+fn runtime_asset_file_valid(path: &Path, rel: &str) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return false;
+    }
+    match rel {
+        "assets/blocks_1211.json" => canonical_blocks_asset_valid(path),
+        "assets/feature_order_1211.json" => feature_order_asset_valid(path),
+        _ => binary_runtime_asset_valid(path, rel),
+    }
 }
 
 fn config_packets_valid(path: &Path) -> bool {
@@ -1218,73 +1377,276 @@ fn run_python_script(script: &Path, args: &[&str]) -> io::Result<()> {
     )))
 }
 
-fn create_runtime_parent_dir(root: &Path, parent: &Path) -> io::Result<()> {
-    let relative = parent.strip_prefix(root).map_err(|_| {
-        invalid_runtime(format!(
-            "runtime-data parent {} escapes install root {}",
-            parent.display(),
-            root.display()
-        ))
-    })?;
-    let mut cursor = root.to_path_buf();
-    for component in relative.components() {
-        cursor.push(component.as_os_str());
-        match std::fs::symlink_metadata(&cursor) {
-            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
-                return Err(invalid_runtime(format!(
-                    "{} has an unsafe or incompatible file type",
-                    cursor.display()
-                )));
+const RUNTIME_OUTPUT_MAPPINGS: [(&str, &str); 12] = [
+    ("datapacks/vanilla", "datapacks/vanilla"),
+    (
+        "assets/block_states_1211.json",
+        "assets/block_states_1211.json",
+    ),
+    ("config_packets.bin", "config_packets.bin"),
+    ("assets/blocks_1211.json", "assets/blocks_1211.json"),
+    ("assets/block_predicates_1211.bin", "assets/block_predicates_1211.bin"),
+    ("assets/block_state_facts_1211.bin", "assets/block_state_facts_1211.bin"),
+    ("assets/collision_shape_full_1211.bin", "assets/collision_shape_full_1211.bin"),
+    ("assets/mineshaft_support_1211.bin", "assets/mineshaft_support_1211.bin"),
+    ("assets/multiface_support_1211.bin", "assets/multiface_support_1211.bin"),
+    (
+        "assets/structure_state_transforms_1211.bin",
+        "assets/structure_state_transforms_1211.bin",
+    ),
+    ("assets/template_solid_1211.bin", "assets/template_solid_1211.bin"),
+    ("assets/feature_order_1211.json", "assets/feature_order_1211.json"),
+];
+
+fn unsafe_runtime_path(path: &Path) -> io::Error {
+    invalid_runtime(format!(
+        "{} has an unsafe or incompatible file type",
+        path.display()
+    ))
+}
+
+/// Validate every existing component below the runtime root with lstat
+/// semantics. In particular, a pre-existing `datapacks -> outside` symlink is
+/// rejected before generation starts and again before any output is moved.
+fn validate_existing_components_below_root(root: &Path, rel: &str) -> io::Result<()> {
+    let parts = Path::new(rel)
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(part) => Ok(part.to_owned()),
+            _ => Err(invalid_runtime(format!(
+                "runtime-data path {} is not a safe relative path",
+                rel
+            ))),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut current = root.to_path_buf();
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(unsafe_runtime_path(&current)),
+            Ok(meta) if index + 1 < parts.len() && !meta.is_dir() => {
+                return Err(unsafe_runtime_path(&current));
             }
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => break,
             Err(err) => return Err(err),
         }
     }
-    std::fs::create_dir_all(parent)?;
-    ensure_real_directory(parent)
+    Ok(())
+}
+
+fn validate_runtime_output_components(root: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(root) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(unsafe_runtime_path(root));
+        }
+        Ok(_) => {}
+        Err(err) => return Err(err),
+    }
+    for (_, rel) in RUNTIME_OUTPUT_MAPPINGS {
+        validate_existing_components_below_root(root, rel)?;
+    }
+    Ok(())
+}
+
+/// Create `rel` below `root` one component at a time without ever using
+/// create_dir_all through an unchecked intermediate. Concurrent creation of the
+/// same real directory is fine; a symlink or non-directory never is.
+fn ensure_real_directory_below_root(root: &Path, rel: &Path) -> io::Result<()> {
+    let mut current = root.to_path_buf();
+    for component in rel.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(invalid_runtime(format!(
+                "runtime-data directory {} is not a safe relative path",
+                rel.display()
+            )));
+        };
+        current.push(part);
+        loop {
+            match std::fs::symlink_metadata(&current) {
+                Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                    return Err(unsafe_runtime_path(&current));
+                }
+                Ok(_) => break,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    match std::fs::create_dir(&current) {
+                        Ok(()) => break,
+                        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(())
+}
+
+struct RuntimeOutputLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl RuntimeOutputLock {
+    fn acquire(runtime_cache: &Path) -> io::Result<Self> {
+        let path = runtime_cache.join("runtime-output.lock");
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(invalid_runtime(format!(
+                    "another runtime-data move holds {}; refusing to race it",
+                    path.display()
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        use std::io::Write;
+        let _ = writeln!(file, "pid {}", std::process::id());
+        Ok(Self { path, _file: file })
+    }
+}
+
+impl Drop for RuntimeOutputLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn move_file_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(from)? {
+        meta if meta.file_type().is_symlink() || !meta.is_file() => {
+            return Err(unsafe_runtime_path(from));
+        }
+        _ => {}
+    }
+    match std::fs::hard_link(from, to) {
+        Ok(()) => return std::fs::remove_file(from),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(invalid_runtime(format!(
+                "refusing to overwrite existing runtime-data path {}",
+                to.display()
+            )));
+        }
+        Err(_) => {}
+    }
+    // Some target filesystems do not support hard links. Exclusive creation
+    // still provides the required no-replace kernel check; the source remains
+    // in the installer-owned stage if a partial copy fails closed.
+    let mut input = std::fs::File::open(from)?;
+    let mut output = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(invalid_runtime(format!(
+                "refusing to overwrite existing runtime-data path {}",
+                to.display()
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    io::copy(&mut input, &mut output)?;
+    drop(output);
+    std::fs::remove_file(from)
+}
+
+fn move_directory_no_replace(source: &Path, target: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(source)? {
+        meta if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(unsafe_runtime_path(source));
+        }
+        _ => {}
+    }
+    match std::fs::create_dir(target) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(invalid_runtime(format!(
+                "refusing to overwrite existing runtime-data path {}",
+                target.display()
+            )));
+        }
+        Err(err) => return Err(err),
+    }
+    let mut pending = vec![(source.to_path_buf(), target.to_path_buf())];
+    while let Some((src_dir, dst_dir)) = pending.pop() {
+        let mut entries = std::fs::read_dir(&src_dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let src = entry.path();
+            let dst = dst_dir.join(entry.file_name());
+            let meta = std::fs::symlink_metadata(&src)?;
+            if meta.file_type().is_symlink() {
+                return Err(unsafe_runtime_path(&src));
+            }
+            if meta.is_dir() {
+                match std::fs::create_dir(&dst) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(invalid_runtime(format!(
+                            "refusing to overwrite existing runtime-data path {}",
+                            dst.display()
+                        )));
+                    }
+                    Err(err) => return Err(err),
+                }
+                pending.push((src, dst));
+            } else if meta.is_file() {
+                move_file_no_replace(&src, &dst)?;
+            } else {
+                return Err(unsafe_runtime_path(&src));
+            }
+        }
+    }
+    std::fs::remove_dir_all(source)
 }
 
 fn move_runtime_output(stage: &Path, root: &Path) -> io::Result<()> {
-    let mappings = [
-        ("datapacks/vanilla", "datapacks/vanilla"),
-        (
-            "assets/block_states_1211.json",
-            "assets/block_states_1211.json",
-        ),
-        ("config_packets.bin", "config_packets.bin"),
-        ("assets/blocks_1211.json", "assets/blocks_1211.json"),
-        ("assets/block_predicates_1211.bin", "assets/block_predicates_1211.bin"),
-        ("assets/block_state_facts_1211.bin", "assets/block_state_facts_1211.bin"),
-        ("assets/collision_shape_full_1211.bin", "assets/collision_shape_full_1211.bin"),
-        ("assets/mineshaft_support_1211.bin", "assets/mineshaft_support_1211.bin"),
-        ("assets/multiface_support_1211.bin", "assets/multiface_support_1211.bin"),
-        (
-            "assets/structure_state_transforms_1211.bin",
-            "assets/structure_state_transforms_1211.bin",
-        ),
-        ("assets/template_solid_1211.bin", "assets/template_solid_1211.bin"),
-        ("assets/feature_order_1211.json", "assets/feature_order_1211.json"),
-    ];
-    for (from_rel, to_rel) in mappings {
+    let runtime_cache = root.join("megu-runtime");
+    let _lock = RuntimeOutputLock::acquire(&runtime_cache)?;
+    validate_runtime_output_components(root)?;
+    for (from_rel, to_rel) in RUNTIME_OUTPUT_MAPPINGS {
         let from = stage.join(from_rel);
         let to = root.join(to_rel);
-        if !from.exists() {
+        if std::fs::symlink_metadata(&from).is_err() {
             return Err(invalid_runtime(format!(
                 "generator did not produce required runtime-data path {}",
                 from_rel
             )));
         }
-        if to.exists() || std::fs::symlink_metadata(&to).is_ok() {
+        if std::fs::symlink_metadata(&to).is_ok() {
             return Err(invalid_runtime(format!(
                 "refusing to overwrite existing runtime-data path {}",
                 to.display()
             )));
         }
         if let Some(parent) = to.parent() {
-            create_runtime_parent_dir(root, parent)?;
+            let parent_rel = parent.strip_prefix(root).map_err(|_| {
+                invalid_runtime(format!(
+                    "runtime-data parent {} escapes {}",
+                    parent.display(),
+                    root.display()
+                ))
+            })?;
+            ensure_real_directory_below_root(root, parent_rel)?;
         }
-        std::fs::rename(&from, &to)?;
+        // Parent creation can be concurrent with another writer even when that
+        // writer does not cooperate with the lock, so re-lstat this output path
+        // immediately before the no-replace creation.
+        validate_existing_components_below_root(root, to_rel)?;
+        let meta = std::fs::symlink_metadata(&from)?;
+        if meta.is_dir() {
+            move_directory_no_replace(&from, &to)?;
+        } else if meta.is_file() {
+            move_file_no_replace(&from, &to)?;
+        } else {
+            return Err(unsafe_runtime_path(&from));
+        }
     }
     Ok(())
 }
@@ -1293,6 +1655,7 @@ fn generate_runtime_data(cli: &Cli, root: &Path) -> io::Result<()> {
     prepare_runtime_root(root)?;
     let runtime_cache = root.join("megu-runtime");
     ensure_real_directory(&runtime_cache)?;
+    validate_runtime_output_components(root)?;
     let tools_dir = runtime_cache.join("generator");
     let stage = runtime_cache.join(format!("data-stage-{}", std::process::id()));
     if stage.exists() || std::fs::symlink_metadata(&stage).is_ok() {
@@ -2111,6 +2474,195 @@ mod tests {
         dir
     }
 
+    fn values_json(prefix: &str, count: usize) -> String {
+        format!(
+            "[{}]",
+            (0..count)
+                .map(|index| format!("\"{prefix}{index}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+
+    fn runtime_blocks_json(synthetic_names: bool) -> String {
+        let mut blocks = String::from("[");
+        let mut first = 0u32;
+        for id in 0..1_060u32 {
+            let count = if id == 0 { 25_625 } else { 1 };
+            if id != 0 {
+                blocks.push(',');
+            }
+            let name = if synthetic_names {
+                format!("block{id}")
+            } else {
+                match id {
+                    0 => "air".to_owned(),
+                    1 => "stone".to_owned(),
+                    1059 => "heavy_core".to_owned(),
+                    _ => format!("block{id}"),
+                }
+            };
+            let states = if id == 0 {
+                format!(
+                    "[{{\"name\":\"p41\",\"type\":\"enum\",\"num_values\":41,\"values\":{p41}}},{{\"name\":\"p5a\",\"type\":\"enum\",\"num_values\":5,\"values\":{p5}}},{{\"name\":\"p5b\",\"type\":\"enum\",\"num_values\":5,\"values\":{p5}}},{{\"name\":\"p5c\",\"type\":\"enum\",\"num_values\":5,\"values\":{p5}}},{{\"name\":\"p5d\",\"type\":\"enum\",\"num_values\":5,\"values\":{p5}}}]",
+                    p41 = values_json("v", 41),
+                    p5 = values_json("w", 5),
+                )
+            } else {
+                "[]".to_owned()
+            };
+            blocks.push_str(&format!(
+                "{{\"id\":{id},\"name\":\"{name}\",\"hardness\":1.0,\"resistance\":1.0,\"stackSize\":64,\"defaultState\":{first},\"minStateId\":{first},\"maxStateId\":{},\"states\":{states},\"drops\":[]}}",
+                first + count - 1
+            ));
+            first += count;
+        }
+        blocks.push(']');
+        blocks
+    }
+
+    fn write_block_states_asset(path: &Path) {
+        let mut rows = String::new();
+        let mut start = 0u32;
+        for id in 0..1_060u32 {
+            let count = match id {
+                0 | 1 => 1,
+                2 => 25_624,
+                1_059 => 2,
+                _ => 1,
+            };
+            if id != 0 {
+                rows.push(',');
+            }
+            let name = match id {
+                0 => "minecraft:air".to_owned(),
+                1 => "minecraft:stone".to_owned(),
+                1_059 => "minecraft:heavy_core".to_owned(),
+                _ => format!("minecraft:block{id}"),
+            };
+            rows.push_str(&format!("[\"{name}\",{start},{count}]"));
+            start += count;
+        }
+        assert_eq!(start, 26_684);
+        let mut flags = vec![8u32; 26_684];
+        flags[0] = 3;
+        let mut luminance = vec![0u32; 26_684];
+        luminance[1] = 1;
+        let mut light_block = vec![0u32; 26_684];
+        light_block[1] = 1;
+        let full_sides = vec![63u32; 26_684];
+        let mut collision = vec!["[0]".to_owned(); 26_684];
+        collision[0] = "[]".to_owned();
+        let join = |values: &[u32]| {
+            values
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let asset = format!(
+            "{{\"format\":1,\"minecraft\":\"1.21.1\",\"jar_sha1\":\"{VANILLA_SERVER_SHA1}\",\"blocks\":[{rows}],\"luminance\":[{}],\"light_block\":[{}],\"flags\":[{}],\"full_sides\":[{}],\"shapes\":[{{\"min\":[0.0,0.0,0.0],\"max\":[1.0,1.0,1.0]}}],\"collision_shapes\":[{}]}}",
+            join(&luminance),
+            join(&light_block),
+            join(&flags),
+            join(&full_sides),
+            collision.join(",")
+        );
+        std::fs::write(path, asset).unwrap();
+    }
+
+    fn feature_order_json() -> String {
+        let mut out = String::from("{");
+        for (dim_index, (dimension, biome_count, step_count, feature_count)) in [
+            ("overworld", 53usize, 11usize, 151usize),
+            ("nether", 5, 10, 37),
+            ("end", 5, 11, 5),
+        ]
+        .iter()
+        .enumerate()
+        {
+            if dim_index != 0 {
+                out.push(',');
+            }
+            let mut biomes = Vec::new();
+            for index in 0..*biome_count {
+                let name = if dimension == &"overworld" && index == 0 {
+                    "minecraft:mushroom_fields".to_owned()
+                } else {
+                    format!("minecraft:{dimension}_biome{index}")
+                };
+                biomes.push(format!("\"{name}\""));
+            }
+            let mut features = Vec::new();
+            for index in 0..*feature_count {
+                let name = if dimension == &"end" && index == 0 {
+                    "minecraft:end_island_decorated".to_owned()
+                } else {
+                    format!("minecraft:{dimension}_feature{index}")
+                };
+                features.push(format!("\"{name}\""));
+            }
+            let mut steps = vec![Vec::new(); *step_count];
+            for (index, feature) in features.iter().enumerate() {
+                steps[index % *step_count].push(feature.clone());
+            }
+            let steps_json = steps
+                .iter()
+                .map(|step| format!("[{}]", step.join(",")))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!(
+                "\"{dimension}\":{{\"biomes\":[{}],\"steps\":[{steps_json}]}}",
+                biomes.join(",")
+            ));
+        }
+        out.push('}');
+        out
+    }
+
+    fn write_valid_binary_assets(root: &Path) {
+        let assets = root.join("assets");
+        let mut predicates = vec![31u8; 26_684];
+        predicates[0] = 0;
+        predicates[2] = 30;
+        std::fs::write(assets.join("block_predicates_1211.bin"), predicates).unwrap();
+
+        let mut facts = vec![0u8; 26_684 * 6];
+        for (index, byte) in facts.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        facts[0..6].copy_from_slice(&[161, 0, 0, 0, 0, 0]);
+        facts[6..12].copy_from_slice(&[220, 15, 255, 255, 3, 0]);
+        std::fs::write(assets.join("block_state_facts_1211.bin"), facts).unwrap();
+
+        let mut collision = vec![1u8; 26_684];
+        collision[0] = 0;
+        std::fs::write(assets.join("collision_shape_full_1211.bin"), collision).unwrap();
+        let mut mineshaft = vec![127u8; 26_684];
+        mineshaft[0] = 0;
+        mineshaft[2] = 1;
+        std::fs::write(assets.join("mineshaft_support_1211.bin"), mineshaft).unwrap();
+        let mut multiface = vec![63u8; 26_684];
+        multiface[0] = 0;
+        multiface[2] = 1;
+        std::fs::write(assets.join("multiface_support_1211.bin"), multiface).unwrap();
+        let mut transforms = vec![0u8; 26_684 * 12 * 4];
+        for (index, byte) in transforms.iter_mut().enumerate().skip(96) {
+            *byte = (index % 251) as u8;
+        }
+        for offset in (48..96).step_by(4) {
+            transforms[offset..offset + 4].copy_from_slice(&[0, 0, 0, 1]);
+        }
+        std::fs::write(
+            assets.join("structure_state_transforms_1211.bin"),
+            transforms,
+        )
+        .unwrap();
+        let mut template = vec![1u8; 26_684];
+        template[0] = 0;
+        std::fs::write(assets.join("template_solid_1211.bin"), template).unwrap();
+    }
+
     fn write_minimal_runtime_tree(root: &Path) {
         std::fs::create_dir_all(root.join("assets")).unwrap();
         std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/worldgen/biome"))
@@ -2121,7 +2673,7 @@ mod tests {
         std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/tags/worldgen"))
             .unwrap();
         std::fs::create_dir_all(root.join("datapacks/vanilla/data/minecraft/structure")).unwrap();
-        std::fs::write(root.join("config_packets.bin"), vec![0u8; 1024]).unwrap();
+        std::fs::write(root.join("config_packets.bin"), vec![1u8; 1024]).unwrap();
         std::fs::write(
             root.join("datapacks/vanilla/multi_noise_biome_tree.json"),
             br#"{"overworld":{"_type":"leaf","biome":"minecraft:plains","parameters":[]},"nether":{"_type":"leaf","biome":"minecraft:nether_wastes","parameters":[]}}"#,
@@ -2132,59 +2684,18 @@ mod tests {
             br#"{"minecraft":"1.21.1"}"#,
         )
         .unwrap();
+        write_block_states_asset(&root.join("assets/block_states_1211.json"));
         std::fs::write(
-            root.join("assets/block_states_1211.json"),
-            br#"{
-              "blocks":[["minecraft:stone",1,1]],
-              "flags":[8],
-              "luminance":[0],
-              "light_block":[15],
-              "full_sides":[63],
-              "shapes":[{"min":[0.0,0.0,0.0],"max":[1.0,1.0,1.0]}],
-              "collision_shapes":[[0]]
-            }"#,
+            root.join("assets/blocks_1211.json"),
+            runtime_blocks_json(false),
         )
         .unwrap();
-        let mut blocks = String::from("[");
-        let mut first = 0u32;
-        for id in 0..1060u32 {
-            let count = if id == 0 { 25_625 } else { 1 };
-            if id != 0 {
-                blocks.push(',');
-            }
-            blocks.push_str(&format!(
-                "{{\"id\":{id},\"name\":\"block{id}\",\"hardness\":1.0,\"resistance\":1.0,\"stackSize\":64,\"defaultState\":{first},\"minStateId\":{first},\"maxStateId\":{},\"states\":[],\"drops\":[]}}",
-                first + count - 1
-            ));
-            first += count;
-        }
-        blocks.push(']');
-        std::fs::write(root.join("assets/blocks_1211.json"), blocks).unwrap();
-        for (name, len) in [
-            ("block_predicates_1211.bin", 26_684usize),
-            ("block_state_facts_1211.bin", 26_684 * 6),
-            ("collision_shape_full_1211.bin", 26_684),
-            ("mineshaft_support_1211.bin", 26_684),
-            ("multiface_support_1211.bin", 26_684),
-            ("structure_state_transforms_1211.bin", 26_684 * 12 * 4),
-            ("template_solid_1211.bin", 26_684),
-        ] {
-            let mut bytes = vec![0u8; len];
-            bytes[0] = 1;
-            std::fs::write(root.join("assets").join(name), bytes).unwrap();
-        }
-        let names = |count: usize| {
-            (0..count)
-                .map(|index| format!("\"minecraft:test_biome_{index}\""))
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let steps = |count: usize| vec!["[]"; count].join(",");
-        let feature_order = format!(
-            "{{\"overworld\":{{\"biomes\":[{}],\"steps\":[{}]}},\"nether\":{{\"biomes\":[{}],\"steps\":[{}]}},\"end\":{{\"biomes\":[{}],\"steps\":[{}]}}}}",
-            names(53), steps(11), names(5), steps(10), names(5), steps(11)
-        );
-        std::fs::write(root.join("assets/feature_order_1211.json"), feature_order).unwrap();
+        write_valid_binary_assets(root);
+        std::fs::write(
+            root.join("assets/feature_order_1211.json"),
+            feature_order_json(),
+        )
+        .unwrap();
         std::fs::write(
             root.join("datapacks/vanilla/pack.mcmeta"),
             br#"{"pack":{"pack_format":48,"description":"test"}}"#,
@@ -2197,7 +2708,7 @@ mod tests {
         let root = scratch_dir("detect");
         assert_eq!(missing_runtime_data(&root), RUNTIME_REQUIRED.to_vec());
         write_minimal_runtime_tree(&root);
-        assert!(missing_runtime_data(&root).is_empty());
+        assert!(missing_runtime_data(&root).is_empty(), "missing {:?}", missing_runtime_data(&root));
 
         // A directory with the right file name is not a usable packet capture or asset.
         std::fs::remove_file(root.join("config_packets.bin")).unwrap();
@@ -2209,7 +2720,7 @@ mod tests {
     fn report_only_block_state_index_is_not_accepted_as_runtime_data() {
         let root = scratch_dir("schema");
         write_minimal_runtime_tree(&root);
-        assert!(missing_runtime_data(&root).is_empty());
+        assert!(missing_runtime_data(&root).is_empty(), "missing {:?}", missing_runtime_data(&root));
         std::fs::write(
             root.join("assets/block_states_1211.json"),
             br#"{
@@ -2230,7 +2741,7 @@ mod tests {
     fn runtime_data_detection_rejects_zeroed_tables_and_shapeless_feature_order() {
         let root = scratch_dir("semantic");
         write_minimal_runtime_tree(&root);
-        assert!(missing_runtime_data(&root).is_empty());
+        assert!(missing_runtime_data(&root).is_empty(), "missing {:?}", missing_runtime_data(&root));
 
         let table = root.join("assets/block_predicates_1211.bin");
         std::fs::write(&table, vec![0u8; 26_684]).unwrap();
@@ -2244,6 +2755,38 @@ mod tests {
         assert_eq!(
             missing_runtime_data(&root),
             vec!["assets/feature_order_1211.json"]
+        );
+    }
+
+    #[test]
+    fn runtime_data_detection_rejects_synthetic_or_inconsistent_block_registry() {
+        let root = scratch_dir("block-semantics");
+        write_minimal_runtime_tree(&root);
+        assert!(
+            missing_runtime_data(&root).is_empty(),
+            "missing {:?}",
+            missing_runtime_data(&root)
+        );
+
+        std::fs::write(
+            root.join("assets/blocks_1211.json"),
+            runtime_blocks_json(true),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_runtime_data(&root),
+            vec!["assets/blocks_1211.json"]
+        );
+
+        let inconsistent = runtime_blocks_json(false).replacen(
+            "\"num_values\":5",
+            "\"num_values\":4",
+            1,
+        );
+        std::fs::write(root.join("assets/blocks_1211.json"), inconsistent).unwrap();
+        assert_eq!(
+            missing_runtime_data(&root),
+            vec!["assets/blocks_1211.json"]
         );
     }
 
@@ -2295,6 +2838,7 @@ mod tests {
         let stage = base.join("stage");
         let root = base.join("root");
         write_minimal_runtime_tree(&stage);
+        std::fs::create_dir_all(root.join("megu-runtime")).unwrap();
         move_runtime_output(&stage, &root).unwrap();
         assert!(root.join("config_packets.bin").is_file());
         assert!(root.join("assets/block_states_1211.json").is_file());
@@ -2314,7 +2858,7 @@ mod tests {
         let root = base.join("root");
         let outside = base.join("outside");
         write_minimal_runtime_tree(&stage);
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("megu-runtime")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("assets")).unwrap();
 
