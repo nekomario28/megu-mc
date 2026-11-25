@@ -193,10 +193,20 @@
 //!   `(block_pos, section_rev)`, waking on the precise tick a floor
 //!   breaks, fluid arrives or an impulse lands while age/despawn/pickup
 //!   ticks keep running untouched.
+//! * [`block_flags_lut`] — hot-loop lookup structures that replace
+//!   per-tick string comparisons with direct-indexed tables: a
+//!   [`block_flags_lut::BlockFlagsLut`] `state_id → u64` flag table (18
+//!   block flags plus packed 4-bit emission/opacity nibbles, so
+//!   `reg.name_of(state) == "minecraft:fire"` collapses to
+//!   `(flags & MASK) != 0`), and a
+//!   [`block_flags_lut::SectionBitTree4096`] 520-byte hierarchical bit
+//!   index that iterates a section's sparse predicates in ascending order
+//!   while skipping empty sections in O(1).
 
 #![deny(unsafe_code)]
 
 pub mod bits;
+pub mod block_flags_lut;
 pub mod coords;
 pub mod crash_report;
 pub mod crowd_physics;
