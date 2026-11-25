@@ -30,6 +30,8 @@ JAR_SHA1 = "59353fb40c36d304f2035d51e7d6e6baa98dc05c"
 DATAGEN = {
     "dimension_type": 4,
     "tags/block": 184,
+    "tags/worldgen/flat_level_generator_preset": 1,
+    "tags/worldgen/world_preset": 2,
     "worldgen/biome": 64,
     "worldgen/configured_carver": 4,
     "worldgen/configured_feature": 196,
