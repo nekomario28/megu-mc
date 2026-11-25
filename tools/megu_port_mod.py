@@ -135,7 +135,7 @@ def _read_member_bytes(archive, info, display):
         with archive.open(info) as handle:
             payload = handle.read(MAX_MEMBER_BYTES + 1)
     except (OSError, zipfile.BadZipFile, RuntimeError, EOFError, zlib.error) as error:
-        raise RejectedMember(f"cannot decompress: {error}")
+        raise RejectedMember(f"cannot decompress: {error}") from error
     if len(payload) > MAX_MEMBER_BYTES:
         raise RejectedMember(f"member exceeds {MAX_MEMBER_BYTES} bytes while reading")
     return payload
@@ -153,7 +153,7 @@ def read_archive(payload, display):
         archive = zipfile.ZipFile(io.BytesIO(payload))
         infos = archive.infolist()
     except zipfile.BadZipFile as error:
-        raise PortError(f"{display}: not a readable zip archive: {error}")
+        raise PortError(f"{display}: not a readable zip archive: {error}") from error
     if len(infos) > MAX_MEMBERS:
         raise PortError(f"{display}: {len(infos)} members exceeds {MAX_MEMBERS}")
     members = {}
@@ -167,7 +167,7 @@ def read_archive(payload, display):
         try:
             body = _read_member_bytes(archive, info, display)
         except RejectedMember as rejected:
-            raise PortError(f"{display}: member {info.filename!r} rejected: {rejected}")
+            raise PortError(f"{display}: member {info.filename!r} rejected: {rejected}") from rejected
         total += len(body)
         if total > MAX_TOTAL_BYTES:
             raise PortError(
@@ -204,11 +204,11 @@ def read_directory(root):
                 try:
                     path.resolve().relative_to(resolved_root)
                 except ValueError:
-                    raise PortError(f"{rel}: symlink resolves outside the mod directory")
+                    raise PortError(f"{rel}: symlink resolves outside the mod directory") from None
             try:
                 size = path.stat().st_size
             except OSError as error:
-                raise PortError(f"{rel}: cannot stat: {error}")
+                raise PortError(f"{rel}: cannot stat: {error}") from error
             if size > MAX_MEMBER_BYTES:
                 raise PortError(f"{rel}: {size} bytes exceeds {MAX_MEMBER_BYTES}")
             total += size
@@ -217,7 +217,7 @@ def read_directory(root):
             try:
                 members[rel] = path.read_bytes()
             except OSError as error:
-                raise PortError(f"{rel}: cannot read: {error}")
+                raise PortError(f"{rel}: cannot read: {error}") from error
     return members
 
 
@@ -759,13 +759,13 @@ def inspect_archive_path(path):
     try:
         size = path.stat().st_size
     except OSError as error:
-        raise PortError(f"{path}: cannot stat: {error}")
+        raise PortError(f"{path}: cannot stat: {error}") from error
     if size > MAX_SOURCE_BYTES:
         raise PortError(f"{path}: {size} bytes exceeds {MAX_SOURCE_BYTES}")
     try:
         payload = path.read_bytes()
     except OSError as error:
-        raise PortError(f"{path}: cannot read: {error}")
+        raise PortError(f"{path}: cannot read: {error}") from error
     members = read_archive(payload, str(path))
     inspection = Inspection(str(path))
     names = {name.lower() for name in members}

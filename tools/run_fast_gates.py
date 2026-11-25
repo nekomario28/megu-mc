@@ -46,6 +46,10 @@ GATES = (
     "tests/security_invariants_test.py",
     "tools/license_spdx_audit.py",
     "tests/license_spdx_audit_test.py",
+    "tests/general_defect_audit_test.py",
+    "tools/general_defect_audit.py --strict",
+    "tests/strict_vanilla_parity_audit_test.py",
+    "tests/megu_port_mod_test.py",
 )
 
 

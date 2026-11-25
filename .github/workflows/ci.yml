@@ -123,7 +123,7 @@ jobs:
           fi
       - name: Standalone crates (12 crates, locked + Clippy -D warnings)
         run: |
-          for d in core proto state-store server-files mod-offload mod-adapter-core create-adapter client-kernel client-port client-ui client-app; do
+          for d in core proto state-store server-files mod-offload mod-adapter-core create-adapter wasm-mod-runtime client-kernel client-port client-ui client-app; do
             echo "=== $d ==="
             cargo clippy --manifest-path "$d/Cargo.toml" --all-targets --locked -- -D warnings
             cargo test --manifest-path "$d/Cargo.toml" --locked

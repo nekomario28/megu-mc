@@ -545,6 +545,24 @@ impl ModQuarantineSupervisor {
         }
     }
 
+    /// Execute one mod step under quarantine supervision: a clean step
+    /// calls [`Self::record_healthy_tick`] to decay transient strikes, while
+    /// a fault routes through [`Self::record_fault`].
+    pub fn run_mod_guarded<T>(
+        &mut self,
+        mod_id: &str,
+        tick: u64,
+        f: impl FnOnce() -> Result<T, (ModFaultKind, String)>,
+    ) -> Result<T, Box<FaultOutcome>> {
+        match f() {
+            Ok(value) => {
+                self.record_healthy_tick(mod_id, tick);
+                Ok(value)
+            }
+            Err((kind, detail)) => Err(Box::new(self.record_fault(mod_id, kind, tick, &detail))),
+        }
+    }
+
     /// Bring a quarantined or user-disabled mod back to `Active` (toast
     /// choice handling, or an operator's explicit re-enable). Re-enabling a
     /// `Degraded` mod clears its strikes; re-enabling `Active` is a no-op.

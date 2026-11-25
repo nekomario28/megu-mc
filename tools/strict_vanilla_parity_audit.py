@@ -134,7 +134,7 @@ def load_texts(root):
         try:
             raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            raise AuditError(f"unreadable {path}: {exc}")
+            raise AuditError(f"unreadable {path}: {exc}") from exc
         live, tests = vpa.mask_test_regions(
             vpa.live_text(raw), vpa.code_skeleton(raw)
         )

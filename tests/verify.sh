@@ -94,6 +94,8 @@ python3 tests/megu_start_test.py
 python3 tests/megu_mods_test.py
 python3 tests/megu_mod_dev_test.py
 python3 tests/megu_port_mod_test.py
+python3 tests/general_defect_audit_test.py
+python3 tests/strict_vanilla_parity_audit_test.py
 python3 tests/megu_tui_test.py
 python3 tests/megu_shell_test.py
 python3 tests/load_client_test.py
@@ -197,7 +199,7 @@ cleanup_verify_artifacts() {
   rm -f "$build_manifest"
   rm -rf client-port/target client-kernel/target client-app/target client-ui/target client-gpu/target mod-offload/target \
       mod-adapter-core/target create-adapter/target proto/target state-store/target \
-      server-files/target core/target \
+      server-files/target core/target wasm-mod-runtime/target \
       tools/palette_bench/target tools/storage_bench/target tools/offload_ffi_probe/target
   # The companion suite only writes repo-local output when CARGO_TARGET_DIR is
   # unset; a caller-provided target dir is the caller's to keep.
@@ -217,6 +219,7 @@ cargo test --manifest-path mod-offload/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path mod-adapter-core/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path create-adapter/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path proto/Cargo.toml --offline --locked -j 2
+cargo test --manifest-path wasm-mod-runtime/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path state-store/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path server-files/Cargo.toml --offline --locked -j 2
 cargo test --manifest-path core/Cargo.toml --offline --locked -j 2

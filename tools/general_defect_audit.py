@@ -122,7 +122,8 @@ UNSAFE_EXPLICIT_ALLOWLIST = {
 }
 
 REMOVE_ZERO_BASELINE_COUNT = 8
-CODEC_BASELINE_COUNTS = {"sha256": 6, "crc32": 9, "lz4": 0}
+CODEC_BASELINE_COUNTS = {"sha256": 6, "crc32": 8, "lz4": 0}
+CANONICAL_CODEC_FILES = {"lz4": "core/src/lz4.rs", "crc32": "core/src/hash.rs"}
 HOT_LOOP_ALLOC_BASELINE = {
     "client-gpu/src/renderer.rs": 1,
     "client-gpu/src/window.rs": 0,
@@ -919,7 +920,7 @@ def guard_unsafe(root, files):
                 ))
             continue
         allowed = rel in UNSAFE_EXPLICIT_ALLOWLIST
-        for position, line in occurrences:
+        for _position, line in occurrences:
             if not allowed:
                 findings.append(finding(
                     "unsafe-safety-ratchet",
@@ -1069,6 +1070,8 @@ def guard_remove_zero_and_codecs(root, files):
             if candidates:
                 code = strip_cfg_test_items(text)
                 for codec in candidates:
+                    if rel == CANONICAL_CODEC_FILES.get(codec):
+                        continue
                     pattern = codec_patterns[codec]
                     for match in pattern.finditer(code):
                         codec_counts[codec] += 1
