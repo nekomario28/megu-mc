@@ -10,6 +10,13 @@ publish = false
 megu_core = { package = "megu-core", path = "../core" }
 mod-offload = { path = "../mod-offload" }
 
+# Dev-only: the cross-mod spine interop tests drive a real `.wasm` guest
+# through `SpineRevHost` so Fabric/NeoForge/mod-offload/WASM provably
+# share one ModSpineHost. Path-local, zero crates.io deps, no cycle:
+# wasm-mod-runtime depends only on megu-core.
+[dev-dependencies]
+megu-wasm-mod-runtime = { path = "../wasm-mod-runtime" }
+
 [[bin]]
 name = "megu-mod-check"
 path = "src/bin/mod_check.rs"

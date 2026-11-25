@@ -7,10 +7,18 @@ name = "megu-core"
 version = "0.1.0"
 
 [[package]]
+name = "megu-wasm-mod-runtime"
+version = "0.1.0"
+dependencies = [
+ "megu-core",
+]
+
+[[package]]
 name = "mod-adapter-core"
 version = "0.1.0"
 dependencies = [
  "megu-core",
+ "megu-wasm-mod-runtime",
  "mod-offload",
 ]
 

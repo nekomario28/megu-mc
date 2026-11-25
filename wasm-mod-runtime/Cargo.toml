@@ -1,0 +1,13 @@
+[package]
+name = "megu-wasm-mod-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "LGPL-3.0-or-later"
+description = "Sandboxed, fuel-metered WebAssembly MVP runtime for Megu native mods (megu_v1 ABI): validated stack-machine interpreter, capability-gated host imports, .mmod/.jar archive loader"
+
+# Zero crates.io dependencies by contract: the only edge is the path-local
+# `megu-core` primitives crate, reused for its bounded in-memory ZIP reader
+# (`ZipSliceIndex`) and `crc32_ieee`, mirroring `sdk/megu-mod-sdk`.
+[dependencies]
+megu_core = { package = "megu-core", path = "../core" }

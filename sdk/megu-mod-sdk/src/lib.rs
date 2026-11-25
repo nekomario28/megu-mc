@@ -62,6 +62,7 @@ use std::fmt;
 
 pub mod builders;
 pub mod jar_packer;
+pub mod native_abi;
 pub mod test_harness;
 
 pub use builders::{

@@ -1,0 +1,21 @@
+# Package manifest for the wasm-native counter mod. The runtime reads the
+# [capabilities] table out of this file when it is placed at the archive
+# root next to META-INF/megu/mod.wasm — undeclared host calls fail closed.
+schema = "megu-mod/1"
+
+[mod]
+id = "counter_mod"
+name = "Counter Mod (wasm)"
+version = "0.1.0"
+mc_version_range = "[1.21.1,)"
+authors = ["Megu Examples"]
+license = "LGPL-3.0-or-later"
+description = "Example megu_v1 wasm guest: ticks a counter, toggles a block every 20 ticks, chats on interact."
+
+[bundle]
+file = "megu-mod-bundle.json"
+
+[capabilities]
+read_blocks = true
+write_blocks = true
+chat_broadcast = true

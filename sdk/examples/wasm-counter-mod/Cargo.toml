@@ -1,0 +1,13 @@
+[package]
+name = "wasm-counter-mod"
+version = "0.1.0"
+edition = "2021"
+description = "Example Megu native mod (Rust -> wasm32, megu_v1 ABI)"
+license = "LGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+megu-mod-sdk = { path = "../../megu-mod-sdk" }
