@@ -327,6 +327,12 @@ version** (`1.21.1`, `26.3`, …) onto **one canonical Rust runtime boundary**
    stream (`GuiGraphics` / `PoseStack` / `VertexConsumer` → batched `wgpu` draw
    commands) so custom client mod HUDs, screens, and block-entity renderers work
    generically without OpenGL.
+6. **Versionless Native `.mmod` / `.mplugin` Contract (Write Once, Run Across MC Versions):**
+   Native `.mmod` / `.mplugin` manifests target a stable `megu_api` generation
+   plus capability / feature requirements (rather than pinning a brittle
+   Minecraft version like `1.21.1`). All vanilla references use namespaced IDs
+   and tags, and `VersionPack` + `IdRemapper` + `DataFixer` translate across
+   `1.21.1`, `26.3`, and future targets automatically without author rewrites.
 
 ## Build features (root `Cargo.toml`)
 

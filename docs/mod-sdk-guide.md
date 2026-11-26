@@ -38,6 +38,8 @@ python3 tools/megu_mod_dev.py watch ruby-starter --mods-dir ./mods --once
 `init` generates the native tree above. Java-loader manifests are emitted only
 with an explicit `--compat-jar`, so the default project stays pure data.
 
+> **バージョン非依存（Versionless `.mmod`）方針:** ネイティブ `.mmod` / `.mplugin` は将来にわたり特定の Minecraft バージョン番号の固定を必須にしない方向を採ります（`megu_api` 世代と必要ケイパビリティ／バニラ機能要求のみを宣言し、ID・コンポーネント形式差はランタイムの `VersionPack` / `IdRemapper` が吸収する。`--mc-version` は `--compat-jar` 出力や明示制限が必要な場合のみ指定）。
+
 | コマンド / command | 用途 / purpose |
 | --- | --- |
 | `init <mod_id> --out <dir> [--template ...] [--mc-version 1.21.1] [--compat-jar]` | 雛形生成。不正 ID・`..` は exit 2 で拒否 / fail-closed scaffold |
