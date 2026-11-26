@@ -2264,9 +2264,14 @@ fn snapshot_member_relpath(generation: u64, role: SnapshotMemberRole) -> String 
 }
 
 fn sync_directory(path: &std::path::Path) -> Result<(), String> {
-    std::fs::File::open(path)
+    let dir = if path.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        path
+    };
+    std::fs::File::open(dir)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("cannot sync save directory {}: {error}", path.display()))
+        .map_err(|error| format!("cannot sync save directory {}: {error}", dir.display()))
 }
 
 /// Write one file completely, fsync it, atomically rename it, and fsync the
@@ -10980,6 +10985,14 @@ mod dim_fluid_persistence_tests {
             payload, base,
             "an Overworld-only save emits no FLD2 bytes, preserving legacy layout"
         );
+    }
+
+    #[test]
+    fn sync_directory_maps_empty_path_to_current_directory() {
+        // `world_save_dir()` returns an empty `PathBuf` for bare relative file
+        // names such as `world.bin`; syncing it must target `.` rather than
+        // failing with ENOENT on `""`.
+        sync_directory(std::path::Path::new("")).expect("empty relative dir should sync `.`");
     }
 }
 
