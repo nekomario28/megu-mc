@@ -1397,6 +1397,47 @@ mod entity_registry_tests {
     }
 
     #[test]
+    fn vanilla_fire_immunity_is_the_complete_entitytype_builder_set() {
+        let expected = [1, 8, 30, 31, 45, 67, 88, 103, 106, 112, 116, 119, 120, 123, 127];
+        let actual: Vec<i64> = ENTITY_REGISTRY_1211
+            .iter()
+            .filter(|entry| entry.fire_immune)
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(actual, expected);
+        for id in expected {
+            assert!(entity_is_fire_immune_1211(id), "id {id}");
+        }
+    }
+
+    #[test]
+    fn eye_heights_include_vanilla_explicit_and_derived_dimensions() {
+        for (name, expected) in [
+            ("cat", 0.35),
+            ("cave_spider", 0.45),
+            ("chicken", 0.644),
+            ("cow", 1.3),
+            ("enderman", 2.55),
+            ("glow_squid", 0.4),
+            ("sheep", 1.235),
+            ("spider", 0.65),
+            ("villager", 1.62),
+            ("witch", 1.62),
+            ("wolf", 0.68),
+            ("zombie", 1.74),
+        ] {
+            let entry = spec(name);
+            assert_eq!(entry.eye_height, expected, "{name}");
+            assert_eq!(entity_eye_height_1211(entry.id), expected, "{name}");
+        }
+        for (name, height) in [("blaze", 1.8), ("pig", 0.9)] {
+            let entry = spec(name);
+            assert_eq!(entry.height, height, "{name}");
+            assert_eq!(entry.eye_height, height * 0.85, "{name}");
+        }
+    }
+
+    #[test]
     fn version_remap_tracks_an_inserted_entity_shifting_later_wire_ids() {
         // A 1.21.4-shaped wire table: `minecraft:creaking` sorts right after
         // `minecraft:cow`, so every canonical id from `creeper` (23) on shifts

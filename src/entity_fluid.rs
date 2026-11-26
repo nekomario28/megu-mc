@@ -481,17 +481,50 @@ fn aabb_in_lava_dim(dim: DimId, aabb: EntityAabb) -> bool {
     aabb_in_lava_with(aabb, &|bx, by, bz| block_at_cached_dim(dim, bx, by, bz))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlayerEyePose {
+    Standing,
+    Crouching,
+    Swimming,
+    Sleeping,
+    FallFlying,
+}
+
 /// 1.21.1 `Player.<clinit>` (`cmx`) pose eye heights:
-/// standing `1.62f`, crouching `1.27f`, and `0.4f` for every `0.6`-high
-/// pose — fall-flying, swimming, and the 1x1 trapdoor crawl share it.
-fn player_eye_height(sneaking: bool, fall_fly: bool) -> f32 {
-    if fall_fly {
-        0.4
-    } else if sneaking {
-        1.27
-    } else {
-        1.62
+/// standing `1.62f`, crouching `1.27f`, sleeping `0.2f`, and `0.4f` for every
+/// `0.6`-high pose — fall-flying, swimming, and the 1x1 trapdoor crawl share it.
+fn player_eye_height_for_pose(pose: PlayerEyePose) -> f32 {
+    match pose {
+        PlayerEyePose::Standing => 1.62,
+        PlayerEyePose::Crouching => 1.27,
+        PlayerEyePose::Swimming | PlayerEyePose::FallFlying => 0.4,
+        PlayerEyePose::Sleeping => 0.2,
     }
+}
+
+fn player_eye_pose_from_flags(
+    sneaking: bool,
+    fall_fly: bool,
+    swimming: bool,
+    sleeping: bool,
+) -> PlayerEyePose {
+    if sleeping {
+        PlayerEyePose::Sleeping
+    } else if fall_fly {
+        PlayerEyePose::FallFlying
+    } else if swimming {
+        PlayerEyePose::Swimming
+    } else if sneaking {
+        PlayerEyePose::Crouching
+    } else {
+        PlayerEyePose::Standing
+    }
+}
+
+fn player_eye_height(sneaking: bool, fall_fly: bool) -> f32 {
+    player_eye_height_for_pose(player_eye_pose_from_flags(
+        sneaking, fall_fly, false, false,
+    ))
 }
 
 /// Whether a player box `0.6 x height` fits at `(x, y, z)`, checked against
@@ -507,11 +540,10 @@ fn player_pose_fits(dim: DimId, x: f64, y: f64, z: f64, height: f64) -> bool {
     )
 }
 
-/// The one canonical pose-aware eye height: the tallest pose the client can
-/// legitimately occupy at `(x, y, z)` — `0.4` for fall-flying, swimming or
-/// the forced 1x1 crawl under a ceiling/trapdoor, `1.27` when the client
-/// reports sneaking or a 1.8 standing box cannot fit, `1.62` otherwise.
-/// Dig reach, place reach, attack reach and every `+ 1.62` hack share it.
+/// The collision-aware pose resolver used by dig reach, place reach, attack
+/// reach and underwater checks. It chooses the tallest pose the client can
+/// legitimately occupy at `(x, y, z)`; `player_eye_height_for_pose` owns the
+/// vanilla height for that pose.
 fn player_eye_height_at(
     dim: DimId,
     x: f64,
@@ -521,17 +553,18 @@ fn player_eye_height_at(
     fall_fly: bool,
     swimming: bool,
 ) -> f32 {
-    if fall_fly || swimming {
-        0.4
+    let pose = if fall_fly || swimming {
+        player_eye_pose_from_flags(sneaking, fall_fly, swimming, false)
     } else if sneaking && player_pose_fits(dim, x, y, z, 1.5) {
-        1.27
+        PlayerEyePose::Crouching
     } else if player_pose_fits(dim, x, y, z, 1.8) {
-        1.62
+        PlayerEyePose::Standing
     } else if player_pose_fits(dim, x, y, z, 1.5) {
-        1.27
+        PlayerEyePose::Crouching
     } else {
-        0.4
-    }
+        PlayerEyePose::Swimming
+    };
+    player_eye_height_for_pose(pose)
 }
 
 fn player_bounding_box(x: f64, y: f64, z: f64, sneaking: bool, fall_fly: bool) -> EntityAabb {
@@ -569,28 +602,12 @@ fn player_in_lava(dim: DimId, x: f64, y: f64, z: f64, sneaking: bool, fall_fly: 
 
 /// 1.21.1 `EntityType.<clinit>` (`bsx.javap`) & `EntityDimensions.defaultEyeHeight` (`height * 0.85f`).
 fn mob_eye_height(etype: i64) -> f32 {
-    match etype {
-        15 => 0.35,   // cat
-        16 => 0.45,   // cave_spider
-        19 => 0.644,  // chicken
-        22 => 1.3,    // cow
-        27 | 54 | 91 | 102 | 124 | 126 => 1.74, // drowned, husk, skeleton, stray, zombie, zombie_villager
-        33 => 2.55,   // enderman
-        48 | 101 => 0.4, // glow_squid, squid
-        87 => 1.235,  // sheep
-        100 => 0.65,  // spider
-        113 | 118 => 1.62, // villager, witch
-        122 => 0.68,  // wolf
-        _ => mob_dimensions(etype).1 * 0.85,
-    }
+    entity_spec_by_id(etype).map_or(1.53, |spec| spec.eye_height)
 }
 
 /// 1.21.1 `EntityType$Builder.fireImmune()` (`bsx$a.c`).
 fn mob_fire_immune(etype: i64) -> bool {
-    matches!(
-        etype,
-        8 | 31 | 45 | 67 | 88 | 103 | 112 | 116 | 119 | 120 | 123 | 127
-    )
+    entity_spec_by_id(etype).is_some_and(|spec| spec.fire_immune)
 }
 
 #[allow(dead_code)]
@@ -1169,6 +1186,80 @@ fn mob_fluid_travel_tick(
     mp.2 += out.moved[2];
     *m.vel.lock().unwrap_or_else(|e| e.into_inner()) = out.vel;
     Some(out)
+}
+
+#[cfg(test)]
+mod entity_fluid_single_source_tests {
+    use super::*;
+
+    #[test]
+    fn player_pose_eye_heights_match_vanilla_1211() {
+        for (pose, expected) in [
+            (PlayerEyePose::Standing, 1.62),
+            (PlayerEyePose::Crouching, 1.27),
+            (PlayerEyePose::Swimming, 0.40),
+            (PlayerEyePose::Sleeping, 0.20),
+            (PlayerEyePose::FallFlying, 0.40),
+        ] {
+            assert_eq!(player_eye_height_for_pose(pose), expected, "{pose:?}");
+        }
+        assert_eq!(player_eye_height(false, false), 1.62);
+        assert_eq!(player_eye_height(true, false), 1.27);
+        assert_eq!(player_eye_height(false, true), 0.40);
+        assert_eq!(
+            player_eye_height_for_pose(player_eye_pose_from_flags(false, false, false, true)),
+            0.20
+        );
+    }
+
+    #[test]
+    fn registry_lookup_covers_every_entity_type() {
+        assert_eq!(ENTITY_REGISTRY_1211.len(), 130);
+        for id in 0i64..130 {
+            let spec = entity_spec_by_id(id).expect("every protocol id in 0..130 is dense");
+            assert_eq!(spec.id, id);
+            assert_eq!(mob_eye_height(id), spec.eye_height, "eye height id {id}");
+            assert_eq!(mob_fire_immune(id), spec.fire_immune, "fire immunity id {id}");
+        }
+        assert_eq!(mob_eye_height(-1), 1.53);
+    }
+
+    #[test]
+    fn former_eye_height_override_ids_keep_exact_vanilla_values() {
+        for (id, expected) in [
+            (15, 0.35),   // cat
+            (16, 0.45),   // cave_spider
+            (19, 0.644),  // chicken
+            (22, 1.3),    // cow
+            (27, 1.74),   // drowned
+            (33, 2.55),   // enderman
+            (48, 0.4),    // glow_squid
+            (54, 1.74),   // husk
+            (87, 1.235),  // sheep
+            (91, 1.74),   // skeleton
+            (100, 0.65),  // spider
+            (101, 0.4),   // squid
+            (102, 1.74),  // stray
+            (113, 1.62),  // villager
+            (118, 1.62),  // witch
+            (122, 0.68),  // wolf
+            (124, 1.74),  // zombie
+            (126, 1.74),  // zombie_villager
+        ] {
+            assert_eq!(mob_eye_height(id), expected, "id {id}");
+        }
+    }
+
+    #[test]
+    fn former_fire_immune_mob_ids_match_the_registry() {
+        for id in [8, 31, 45, 67, 88, 103, 112, 116, 119, 120, 123, 127] {
+            assert!(mob_fire_immune(id), "id {id}");
+        }
+        for id in [19, 22, 27, 78, 91, 100, 124, 126] {
+            assert!(!mob_fire_immune(id), "id {id}");
+        }
+        assert!(!mob_fire_immune(-1));
+    }
 }
 
 #[cfg(test)]
