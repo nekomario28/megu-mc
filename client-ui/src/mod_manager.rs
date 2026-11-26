@@ -794,6 +794,38 @@ enum CatalogMeta<'a> {
     Curated(&'a CuratedModrinthQolMod),
 }
 
+/// Stable ordering and labels of Megu's settings-backed built-in modules.
+/// Index 4 intentionally mirrors the PLaMo translator pack toggle.
+pub const BUILTIN_MODULE_COUNT: usize = 5;
+pub const BUILTIN_MODULE_NAMES_EN: [&str; BUILTIN_MODULE_COUNT] = [
+    "Recipe Overlay",
+    "Inventory Drag Controls",
+    "Compact Debug HUD",
+    "Quick Stack & Auto-Replenish",
+    "PLaMo 3 Auto-Translation Pack",
+];
+pub const BUILTIN_MODULE_NAMES_JA: [&str; BUILTIN_MODULE_COUNT] = [
+    "レシピオーバーレイ",
+    "インベントリドラッグ操作",
+    "コンパクトデバッグHUD",
+    "クイックスタック＆自動補充",
+    "PLaMo 3 自動翻訳パック",
+];
+pub const BUILTIN_MODULE_DESCRIPTIONS_EN: [&str; BUILTIN_MODULE_COUNT] = [
+    "Recipe side panels beside container screens.",
+    "Vanilla-plus inventory drag painting and batch moves.",
+    "Small opt-in FPS/coordinates debug overlay.",
+    "Quick-stack to chests and refill the hotbar from inventory.",
+    "Generated Japanese pack translated locally by PLaMo 3.",
+];
+pub const BUILTIN_MODULE_DESCRIPTIONS_JA: [&str; BUILTIN_MODULE_COUNT] = [
+    "コンテナ画面の横にレシピ側面パネルを表示します。",
+    "ドラッグ操作と一括移動をインベントリへ追加します。",
+    "FPS・座標などの小型デバッグHUDを表示します。",
+    "近くのチェストへ素早く収納し、ホットバーを自動補充します。",
+    "PLaMo 3 がローカル翻訳した日本語パックを適用します。",
+];
+
 // ---------------------------------------------------------------------------
 // Filters, sort, widget ids, actions
 // ---------------------------------------------------------------------------
@@ -818,6 +850,9 @@ pub enum ModManagerFilter {
     /// [`build_modrinth_search_url`]. Still strictly separate from the
     /// installed list.
     Browse,
+    /// Megu's mod-like built-in modules, exposed with the same stone-button
+    /// affordance as external mods while remaining settings-backed.
+    BuiltinModules,
 }
 
 /// The clickable sort toggle.
@@ -1004,6 +1039,8 @@ pub enum ModManagerWidgetId {
     FilterEnabled,
     FilterIssues,
     FilterNative,
+    /// Settings-backed built-in modules section.
+    FilterBuiltinModules,
     FilterRecommendedQol,
     /// `[+ Browse / Search]` entry point into the unified catalog view.
     FilterBrowse,
@@ -1057,6 +1094,10 @@ pub enum ModManagerWidgetId {
     CancelPlamo,
     /// Instant `megu_auto_ja_jp` resource-pack toggle.
     ToggleAutoTranslationPack,
+    /// Built-in module row ON/OFF button (`builtin_module_index` order).
+    BuiltinToggle(usize),
+    /// Built-in module Configure shortcut into the backing settings tab.
+    BuiltinOpenSettings(usize),
     /// Consent: auto-fetch exact missing dependencies and soft reload.
     ConsentApproveAutoFetch,
     /// Consent: isolate unsatisfied mods and continue.
@@ -1307,6 +1348,10 @@ pub struct ModManagerState {
     pub plamo_panel: PlamoTranslatorPanel,
     /// Structured missing-dependency consent plan awaiting a decision.
     pub missing_dependency_consent: Option<MissingDependencyConsentUiState>,
+    /// Live ON/OFF mirrors for the five settings-backed built-in modules,
+    /// in [`BUILTIN_MODULE_NAMES_EN`] order. `UiState` refreshes these every
+    /// frame; standalone use toggles them locally.
+    pub builtin_enabled: [bool; BUILTIN_MODULE_COUNT],
 }
 
 /// Build the Browse catalog: all community entries first, then the
@@ -1361,6 +1406,7 @@ impl Default for ModManagerState {
             pending: BTreeMap::new(),
             plamo_panel: PlamoTranslatorPanel::default(),
             missing_dependency_consent: None,
+            builtin_enabled: [false, true, false, false, false],
         }
     }
 }
@@ -1386,6 +1432,30 @@ impl ModManagerState {
     /// Whether the search field currently receives typed characters.
     pub fn search_focused(&self) -> bool {
         self.search_focused
+    }
+
+    /// Refresh the built-in module mirrors from the authoritative settings
+    /// owner (`UiState` in the integrated client).
+    pub fn sync_builtin_modules(
+        &mut self,
+        recipe_overlay: bool,
+        inventory_drag_controls: bool,
+        compact_debug_hud: bool,
+        quick_stack_auto_replenish: bool,
+        plamo_auto_translation_pack: bool,
+    ) {
+        self.builtin_enabled = [
+            recipe_overlay,
+            inventory_drag_controls,
+            compact_debug_hud,
+            quick_stack_auto_replenish,
+            plamo_auto_translation_pack,
+        ];
+    }
+
+    /// Live ON/OFF state for a built-in module row.
+    pub fn builtin_module_enabled(&self, index: usize) -> bool {
+        self.builtin_enabled.get(index).copied().unwrap_or(false)
     }
 
     /// Selected row as an index into [`visible_indices`](Self::visible_indices).
@@ -1631,6 +1701,7 @@ impl ModManagerState {
                 ModManagerFilter::Issues => entry.has_issue(),
                 ModManagerFilter::Native => entry.tier == ModAdaptationBadge::Tier1Native,
                 ModManagerFilter::RecommendedQol | ModManagerFilter::Browse => true,
+                ModManagerFilter::BuiltinModules => false,
             };
             if !passes_pill {
                 continue;
@@ -1810,6 +1881,7 @@ impl ModManagerState {
             ModManagerWidgetId::FilterEnabled => self.set_filter(ModManagerFilter::Enabled),
             ModManagerWidgetId::FilterIssues => self.set_filter(ModManagerFilter::Issues),
             ModManagerWidgetId::FilterNative => self.set_filter(ModManagerFilter::Native),
+            ModManagerWidgetId::FilterBuiltinModules => self.set_filter(ModManagerFilter::BuiltinModules),
             ModManagerWidgetId::FilterRecommendedQol => {
                 if self.filter == ModManagerFilter::RecommendedQol {
                     self.recommended_category = None;
@@ -1859,7 +1931,11 @@ impl ModManagerState {
                 self.scroll = self.scroll.saturating_sub(1);
             }
             ModManagerWidgetId::ListScrollDown => {
-                let len = self.visible_indices().len();
+                let len = if self.filter == ModManagerFilter::BuiltinModules {
+                    BUILTIN_MODULE_COUNT
+                } else {
+                    self.visible_indices().len()
+                };
                 self.scroll = (self.scroll + 1).min(len.saturating_sub(1));
             }
             ModManagerWidgetId::ModRow(row) => {
@@ -1963,6 +2039,16 @@ impl ModManagerState {
                 if let Some(action) = self.apply() {
                     return vec![action];
                 }
+            }
+            ModManagerWidgetId::BuiltinToggle(index) => {
+                if index < BUILTIN_MODULE_COUNT {
+                    self.builtin_enabled[index] = !self.builtin_enabled[index];
+                }
+            }
+            ModManagerWidgetId::BuiltinOpenSettings(_) => {
+                // Integrated `UiState` intercepts this widget and opens the
+                // backing settings tab. Standalone ModManagerState has no
+                // settings owner, so activation is intentionally inert.
             }
             ModManagerWidgetId::Done => return vec![ModManagerAction::Close],
         }
@@ -2101,9 +2187,8 @@ impl ModManagerState {
     pub fn render(&self, width: u32, height: u32) -> (UiDrawList, Vec<ModManagerHitRegion>) {
         let mut lay = Lay::new(self, width, height);
         let mut hits = Vec::new();
-        if lay.w < 220 || lay.h < 150 {
-            lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
-            return (lay.finish(), hits);
+        if lay.h < 110 {
+            return self.render_ultracompact(lay, hits);
         }
         lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
         lay.fill(
@@ -2130,8 +2215,103 @@ impl ModManagerState {
 
         self.render_header(&mut lay, &mut hits);
         self.render_filter_row(&mut lay, &mut hits);
-        self.render_panes(&mut lay, &mut hits);
+        if self.filter == ModManagerFilter::BuiltinModules {
+            self.render_builtin_modules(&mut lay, &mut hits);
+        } else {
+            self.render_panes(&mut lay, &mut hits);
+        }
         self.render_footer(&mut lay, &mut hits);
+        (lay.finish(), hits)
+    }
+
+    /// Ultra-short fallback surface (below ~110 logical px): the full
+    /// two-pane manager cannot physically fit, so collapse to the vanilla
+    /// essentials — title, a full-width mod list, optional scroll arrows,
+    /// and a guaranteed clickable Done. No chrome is allowed to overlap.
+    fn render_ultracompact(
+        &self,
+        mut lay: Lay,
+        mut hits: Vec<ModManagerHitRegion>,
+    ) -> (UiDrawList, Vec<ModManagerHitRegion>) {
+        lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
+        lay.fill(0, lay.h / 2, lay.w, lay.h - lay.h / 2, palette::BACKGROUND_BOTTOM);
+        let outer = UiRect::new(
+            MARGIN,
+            MARGIN,
+            (lay.w - 2 * MARGIN).max(8) as u32,
+            (lay.h - 2 * MARGIN).max(8) as u32,
+        );
+        lay.fill_rect(outer, palette::PANEL);
+        lay.border_rect(outer, palette::PANEL_BORDER);
+        let title = tr(self.lang, "Mods & Packs", "Modとパック");
+        lay.text_fit(MARGIN + 5, MARGIN + 3, 1, palette::TEXT, title, ((lay.w - 16) / 8).max(1) as usize);
+
+        let done_label = tr(self.lang, "Done", "完了");
+        let done_w = (crate::draw::text_width(done_label, 1) as i32 + 20)
+            .min(lay.w - 2 * MARGIN - 8)
+            .max(24);
+        let done_y = lay.h - MARGIN - 16;
+        let done = UiRect::new(lay.w - MARGIN - 4 - done_w, done_y, done_w as u32, 16);
+        let top = MARGIN + 13;
+        let bottom = (done_y - 4).max(top + 8);
+        let x = MARGIN + 4;
+        let w = (lay.w - 2 * (MARGIN + 4)).max(24);
+        let list = UiRect::new(x, top, w as u32, (bottom - top).max(1) as u32);
+        lay.fill_rect(list, DETAIL_BG);
+        lay.border_rect(list, palette::PANEL_BORDER);
+
+        let visible = self.visible_indices();
+        let pitch = 20;
+        let page = ((bottom - top - 3) / pitch).max(0) as usize;
+        let max_scroll = visible.len().saturating_sub(page.max(1));
+        let scroll = self.scroll.min(max_scroll);
+        let scrollable = visible.len() > page && page > 0;
+        let rows_w = w - 4 - if scrollable { 11 } else { 0 };
+        if visible.is_empty() && page > 0 {
+            lay.text_fit(
+                x + 5,
+                top + 4,
+                1,
+                palette::TEXT_DIM,
+                tr(self.lang, "No mods installed", "Modがインストールされていません"),
+                ((rows_w - 10) / 8).max(1) as usize,
+            );
+        }
+        for (row_slot, &entry_index) in visible.iter().enumerate().skip(scroll).take(page) {
+            let y = top + 2 + (row_slot - scroll) as i32 * pitch;
+            let row = UiRect::new(x + 2, y, rows_w.max(12) as u32, (pitch - 3) as u32);
+            let entry = &self.browsed_entries()[entry_index];
+            lay.fill_rect(row, if row_slot == self.selected { palette::BUTTON_HOVER } else { palette::SLOT });
+            lay.text_fit(
+                row.x + 4,
+                row.y + 4,
+                1,
+                if entry.enabled { palette::TEXT } else { palette::TEXT_DIM },
+                &entry.name,
+                ((rows_w - 8) / 8).max(1) as usize,
+            );
+            lay.region(&mut hits, ModManagerWidgetId::ModRow(row_slot), row);
+        }
+        if scrollable {
+            let sb_x = x + w - 12;
+            let up = UiRect::new(sb_x, top + 1, 10, 10);
+            let down = UiRect::new(sb_x, bottom - 11, 10, 10);
+            if up.bottom() <= down.y {
+                for (rect, id, glyph) in [
+                    (up, ModManagerWidgetId::ListScrollUp, "^"),
+                    (down, ModManagerWidgetId::ListScrollDown, "v"),
+                ] {
+                    lay.fill_rect(rect, palette::BUTTON);
+                    lay.ctext_in(rect, 1, palette::TEXT, glyph);
+                    lay.region(&mut hits, id, rect);
+                }
+            }
+        }
+
+        lay.fill_rect(done, if self.hover == Some(ModManagerWidgetId::Done) { palette::BUTTON_HOVER } else { palette::BUTTON });
+        lay.border_rect(done, palette::BUTTON_BORDER);
+        lay.ctext_in(done, 1, palette::TEXT, done_label);
+        lay.region(&mut hits, ModManagerWidgetId::Done, done);
         (lay.finish(), hits)
     }
 
@@ -2160,7 +2340,10 @@ impl ModManagerState {
 
         // Search row: [search field][x][Sort: <mode>]
         let sort_label = format!("{}: {}", tr(lang, "Sort", "並び"), self.sort.label(lang));
-        let sort_w = 12 * 8 + 12; // "Sort: Status" is the widest label.
+        // At narrow logical widths the sort cycle shares the row with a
+        // usable search field and the clear chip; shrink the cycle button
+        // instead of letting the three hitboxes overlap.
+        let sort_w = (12 * 8 + 12).min(lay.w - 70).max(44); // "Sort: Status" is the widest label.
         let clear_w = 18;
         let field_x = MARGIN + 4;
         let field_w = lay.w - field_x - MARGIN - 4 - clear_w - 4 - sort_w - MARGIN;
@@ -2240,7 +2423,12 @@ impl ModManagerState {
         };
         lay.fill_rect(sort, sort_bg);
         lay.border_rect(sort, palette::BUTTON_BORDER);
-        lay.ctext_in(sort, 1, palette::TEXT, &fit_text(&sort_label, 12));
+        lay.ctext_in(
+            sort,
+            1,
+            palette::TEXT,
+            &fit_text(&sort_label, ((sort_w - 8) / 8).max(1) as usize),
+        );
         lay.region(hits, ModManagerWidgetId::SortMode, sort);
     }
 
@@ -2322,6 +2510,11 @@ impl ModManagerState {
                         self.filter == ModManagerFilter::All,
                     ),
                     (
+                        tr(lang, "Built-in", "内蔵").to_owned(),
+                        ModManagerWidgetId::FilterBuiltinModules,
+                        self.filter == ModManagerFilter::BuiltinModules,
+                    ),
+                    (
                         tr(lang, "Enabled", "有効").to_owned(),
                         ModManagerWidgetId::FilterEnabled,
                         self.filter == ModManagerFilter::Enabled,
@@ -2389,11 +2582,139 @@ impl ModManagerState {
         }
     }
 
+    fn render_builtin_modules(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
+        let lang = self.lang;
+        let x = MARGIN + 4;
+        let top = LIST_TOP;
+        let bottom = lay.h - 4 - LIST_BOTTOM_OFF;
+        let w = lay.w - 2 * (MARGIN + 4);
+        let pane = UiRect::new(x, top, w.max(24) as u32, (bottom - top).max(1) as u32);
+        lay.fill_rect(pane, DETAIL_BG);
+        lay.border_rect(pane, palette::PANEL_BORDER);
+        let cells = ((w - 12) / 8).max(1) as usize;
+        lay.text_fit(
+            x + 6,
+            top + 5,
+            1,
+            palette::ACCENT,
+            tr(lang, "Built-in Modules", "内蔵モジュール"),
+            cells,
+        );
+
+        let row_pitch = if lay.w < 320 { 31 } else { 34 };
+        let first_y = top + 17;
+        let visible_rows = ((bottom - first_y - 16) / row_pitch).max(0) as usize;
+        let max_scroll = BUILTIN_MODULE_COUNT.saturating_sub(visible_rows.max(1));
+        let scroll = self.scroll.min(max_scroll);
+        for index in scroll..BUILTIN_MODULE_COUNT.min(scroll + visible_rows) {
+            let y = first_y + (index - scroll) as i32 * row_pitch;
+            let row = UiRect::new(x + 3, y, (w - 6).max(20) as u32, (row_pitch - 3) as u32);
+            lay.fill_rect(row, palette::SLOT);
+            if index == self.selected {
+                lay.border_rect(row, palette::ACCENT);
+            }
+            let name = if lang == UiLang::Ja {
+                BUILTIN_MODULE_NAMES_JA[index]
+            } else {
+                BUILTIN_MODULE_NAMES_EN[index]
+            };
+            let desc = if lang == UiLang::Ja {
+                BUILTIN_MODULE_DESCRIPTIONS_JA[index]
+            } else {
+                BUILTIN_MODULE_DESCRIPTIONS_EN[index]
+            };
+            let enabled = self.builtin_module_enabled(index);
+            let compact = lay.w < 360;
+            let toggle_label = if enabled {
+                tr(lang, "ON", "ON")
+            } else {
+                tr(lang, "OFF", "OFF")
+            };
+            let toggle_w = if compact { 42 } else { 54 };
+            let config_w = if compact { 58 } else { 82 };
+            let button_y = row.y + if compact { 5 } else { 7 };
+            let toggle = UiRect::new(row.right() - toggle_w - 4, button_y, toggle_w as u32, 16);
+            let config = UiRect::new(toggle.x - config_w - 4, button_y, config_w as u32, 16);
+            let text_right = if compact { config.x - 6 } else { row.right() - toggle_w - config_w - 16 };
+            lay.text_fit(
+                row.x + 5,
+                row.y + 3,
+                1,
+                palette::TEXT,
+                name,
+                ((text_right - row.x - 5) / 8).max(1) as usize,
+            );
+            lay.text_fit(
+                row.x + 5,
+                row.y + if compact { 14 } else { 17 },
+                1,
+                palette::TEXT_DIM,
+                desc,
+                ((text_right - row.x - 5) / 8).max(1) as usize,
+            );
+            for (rect, id, label, accent) in [
+                (
+                    config,
+                    ModManagerWidgetId::BuiltinOpenSettings(index),
+                    tr(lang, "Configure", "設定"),
+                    false,
+                ),
+                (
+                    toggle,
+                    ModManagerWidgetId::BuiltinToggle(index),
+                    toggle_label,
+                    enabled,
+                ),
+            ] {
+                let bg = if self.hover == Some(id) {
+                    palette::BUTTON_HOVER
+                } else if accent {
+                    palette::ACCENT
+                } else {
+                    palette::BUTTON
+                };
+                lay.fill_rect(rect, bg);
+                lay.border_rect(rect, palette::BUTTON_BORDER);
+                lay.ctext_in(
+                    rect,
+                    1,
+                    if accent { palette::TEXT_DARK } else { palette::TEXT },
+                    label,
+                );
+                lay.region(hits, id, rect);
+            }
+        }
+        if max_scroll > 0 {
+            let sb_x = x + w - 14;
+            let up = UiRect::new(sb_x, top + 2, 10, 12);
+            let down = UiRect::new(sb_x, bottom - 14, 10, 12);
+            lay.fill_rect(up, palette::BUTTON);
+            lay.fill_rect(down, palette::BUTTON);
+            lay.ctext_in(up, 1, palette::TEXT, "^");
+            lay.ctext_in(down, 1, palette::TEXT, "v");
+            lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
+            lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
+        }
+    }
+
     fn render_panes(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let inner_w = lay.w - 2 * MARGIN - 8;
+        // Below the width where two useful panes can coexist, Mods & Packs
+        // becomes vanilla-compact: one full-width list column. Detail and
+        // per-mod actions are intentionally omitted rather than squeezed
+        // into overlapping hitboxes; Done and list scrolling stay live.
+        let compact_single_column = inner_w < 300;
         // Keep at least a sliver of detail pane at minimum-width windows.
-        let min_list_w = 140.min((inner_w - PANE_GAP - 40).max(30));
-        let list_w = ((inner_w - PANE_GAP) * 2 / 5).clamp(min_list_w, 420);
+        let min_list_w = if compact_single_column {
+            30
+        } else {
+            140.min((inner_w - PANE_GAP - 40).max(30))
+        };
+        let list_w = if compact_single_column {
+            inner_w.max(30)
+        } else {
+            ((inner_w - PANE_GAP) * 2 / 5).clamp(min_list_w, 420)
+        };
         let list_x = MARGIN + 4;
         let list_right = list_x + list_w;
         let detail_x = list_right + PANE_GAP;
@@ -2541,6 +2862,10 @@ impl ModManagerState {
             }
             lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
             lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
+        }
+
+        if compact_single_column {
+            return;
         }
 
         // ---- right pane: selected mod details --------------------------

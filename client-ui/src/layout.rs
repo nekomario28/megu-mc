@@ -24,7 +24,7 @@ use crate::magic_hud::MagicHudState;
 use crate::sign_and_chat::SIGN_LINE_COUNT;
 use crate::state::{
     FPS_CAP_STEPS, HitRegion, HudState, HudSubtitle, CompactDebugHudPreset, ModSyncChange, Screen,
-    SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
+    HeartStyle, SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
 };
 use crate::subtitle_hud::SubtitleHudState;
 
@@ -113,6 +113,7 @@ fn build_ctx<'a>(
         state,
         gui_atlas,
         band_top: i32::MAX,
+        clip_top: 0,
     };
     match state.screen {
         Screen::Title => title(&mut ctx),
@@ -177,6 +178,10 @@ struct Ctx<'a> {
     /// it are dropped entirely so they can never collide with footer
     /// chrome. `i32::MAX` disables the band.
     band_top: i32,
+    /// Top edge of a scrolling content viewport. Interactive widgets
+    /// above it are dropped so scrolled content cannot collide with the
+    /// fixed tab/header strip. Zero disables the extra clipping.
+    clip_top: i32,
 }
 
 /// Logical-px rect shorthand for widget call sites.
@@ -248,7 +253,7 @@ impl Ctx<'_> {
     }
 
     fn text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, s: &str) {
-        if x < 0 || x >= self.w || y < 0 || y + 8 * mult as i32 > self.h {
+        if x < 0 || x >= self.w || y < self.clip_top || y + 8 * mult as i32 > self.h {
             return;
         }
         // Clip to whatever width remains in the viewport so a long label
@@ -262,7 +267,7 @@ impl Ctx<'_> {
     /// Centered text: `cx` is the logical center x. Strings wider than
     /// the viewport are clipped so they still fit.
     fn ctext(&mut self, cx: i32, y: i32, mult: u32, color: UiColor, s: &str) {
-        if y < 0 || y + 8 * mult as i32 > self.h {
+        if y < self.clip_top || y + 8 * mult as i32 > self.h {
             return;
         }
         let budget = ((self.w - 8) / mult as i32).max(0) as usize;
@@ -315,6 +320,29 @@ impl Ctx<'_> {
         (cx - w / 2 / self.s, ty)
     }
 
+    /// Vanilla-style tighter caption advance for half-width glyphs. Megu's
+    /// bitmap cell is 8 logical px, while vanilla's menu captions sit much
+    /// closer together; emitting per-glyph 6px advances lets the exact
+    /// vanilla 98px pause buttons carry their full labels without clipping.
+    fn condensed_width(text: &str) -> i32 {
+        text.chars()
+            .map(|c| {
+                let advance = crate::draw::glyph_advance(c) as i32;
+                if advance <= 8 { 6 } else { advance }
+            })
+            .sum()
+    }
+
+    fn condensed_text(&mut self, x: i32, y: i32, color: UiColor, text: &str) {
+        let mut cx = x;
+        for ch in text.chars() {
+            let mut buf = [0u8; 4];
+            self.text(cx, y, 1, color, ch.encode_utf8(&mut buf));
+            let advance = crate::draw::glyph_advance(ch) as i32;
+            cx += if advance <= 8 { 6 } else { advance };
+        }
+    }
+
     fn hovered(&self, id: WidgetId) -> bool {
         self.state.hover == Some(id) || self.state.focused() == Some(id)
     }
@@ -341,7 +369,7 @@ impl Ctx<'_> {
     /// A clickable button with label; `r` is in logical px. Buttons
     /// crossing the reserved band (settings footer) are not emitted.
     fn button(&mut self, id: WidgetId, r: UiRect, label: &str, enabled: bool) {
-        if r.bottom() > self.band_top {
+        if r.y < self.clip_top || r.bottom() > self.band_top {
             return;
         }
         self.button_unchecked(id, r, label, enabled);
@@ -358,60 +386,87 @@ impl Ctx<'_> {
         }
         let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
         let hot = enabled && self.hovered(id);
-        let bg = if !enabled {
-            pal::BUTTON_DISABLED
+        let sprite = if !enabled {
+            megu_core::ui_contract::SpriteId::ButtonDisabled
         } else if hot {
-            pal::BUTTON_HOVER
+            megu_core::ui_contract::SpriteId::ButtonHighlighted
         } else {
-            pal::BUTTON
+            megu_core::ui_contract::SpriteId::Button
         };
-        self.fill(x, y, w, h, bg);
-        let edge = if hot {
-            pal::BUTTON_BORDER_HOVER
+        let textured = self.gui_atlas.is_some_and(|atlas| atlas.has(sprite));
+        if textured {
+            self.list.sprite(self.phys(lr(x, y, w, h)), sprite);
         } else {
-            pal::BUTTON_BORDER
-        };
-        self.border(x, y, w, h, edge);
-        if enabled && w >= 4 && h >= 4 {
-            // Subtle 3D bevel: light inner top/left edge, dark inner
-            // bottom/right edge — crisp tactile depth on every button.
-            let hi = if hot {
-                UiColor::rgba(255, 255, 255, 64)
+            let bg = if !enabled {
+                pal::BUTTON_DISABLED
+            } else if hot {
+                pal::BUTTON_HOVER
             } else {
-                UiColor::rgba(255, 255, 255, 34)
+                pal::BUTTON
             };
-            self.fill(x + 1, y + 1, w - 2, 1, hi);
-            self.fill(x + 1, y + 1, 1, h - 2, hi);
-            let lo = UiColor::rgba(0, 0, 0, 75);
-            self.fill(x + 1, y + h - 2, w - 2, 1, lo);
-            self.fill(x + w - 2, y + 1, 1, h - 2, lo);
-            // At-a-glance ON/OFF accent bar on the left inner edge so a
-            // toggle's state scans without reading the caption.
-            let toggle = if label.ends_with(": ON") {
-                Some(true)
-            } else if label.ends_with(": OFF") {
-                Some(false)
+            self.fill(x, y, w, h, bg);
+            let edge = if hot {
+                pal::BUTTON_BORDER_HOVER
             } else {
-                None
+                pal::BUTTON_BORDER
             };
-            if let Some(on) = toggle {
-                let bar = if on {
-                    pal::ACCENT
+            self.border(x, y, w, h, edge);
+            if enabled && w >= 4 && h >= 4 {
+                // Subtle 3D bevel: light inner top/left edge, dark inner
+                // bottom/right edge — crisp tactile depth on every button.
+                let hi = if hot {
+                    UiColor::rgba(255, 255, 255, 64)
                 } else {
-                    UiColor::rgba(160, 165, 178, 90)
+                    UiColor::rgba(255, 255, 255, 34)
                 };
-                self.fill(x + 2, y + 2, 3, h - 4, bar);
+                self.fill(x + 1, y + 1, w - 2, 1, hi);
+                self.fill(x + 1, y + 1, 1, h - 2, hi);
+                let lo = UiColor::rgba(0, 0, 0, 75);
+                self.fill(x + 1, y + h - 2, w - 2, 1, lo);
+                self.fill(x + w - 2, y + 1, 1, h - 2, lo);
+                // At-a-glance ON/OFF accent bar on the left inner edge so a
+                // toggle's state scans without reading the caption.
+                let toggle = if label.ends_with(": ON") {
+                    Some(true)
+                } else if label.ends_with(": OFF") {
+                    Some(false)
+                } else {
+                    None
+                };
+                if let Some(on) = toggle {
+                    let bar = if on {
+                        pal::ACCENT
+                    } else {
+                        UiColor::rgba(160, 165, 178, 90)
+                    };
+                    self.fill(x + 2, y + 2, 3, h - 4, bar);
+                }
             }
         }
         let fg = if enabled { pal::TEXT } else { pal::TEXT_DIM };
-        let clipped = crate::draw::first_px(label, (w - 8).max(0) as usize);
+        let normal_width = text_width(label, 1) as i32;
+        let condensed_width = Self::condensed_width(label);
+        let budget = w - 8;
+        let use_condensed = normal_width > budget && condensed_width <= budget;
+        let clipped = if use_condensed {
+            label
+        } else {
+            crate::draw::first_px(label, budget.max(0) as usize)
+        };
         if clipped.len() != label.len() {
             self.truncated.push(format!("{id:?}: {label}"));
         }
-        let (tx, ty) = self.centered_in(x + w / 2, y, h, clipped, 1);
-        // 1-px drop shadow behind the caption for legibility.
-        self.text(tx + 1, ty + 1, 1, UiColor::rgba(0, 0, 0, 140), clipped);
-        self.text(tx, ty, 1, fg, clipped);
+        let ty = y + (h - 8) / 2;
+        if use_condensed {
+            let tx = x + (w - condensed_width) / 2;
+            self.condensed_text(tx + 1, ty + 1, UiColor::rgba(0, 0, 0, 140), clipped);
+            self.condensed_text(tx, ty, fg, clipped);
+        } else {
+            let (tx, ty) = self.centered_in(x + w / 2, y, h, clipped, 1);
+            // 1-px drop shadow behind the caption for legibility.
+            self.text(tx + 1, ty + 1, 1, UiColor::rgba(0, 0, 0, 140), clipped);
+            self.text(tx, ty, 1, fg, clipped);
+        }
         if enabled {
             self.region(id, r);
         }
@@ -425,7 +480,7 @@ impl Ctx<'_> {
     /// Horizontal slider with a draggable thumb knob and a centered
     /// "Label: value" caption.
     fn slider(&mut self, id: WidgetId, r: UiRect, frac: f32, label: &str) {
-        if r.bottom() > self.band_top {
+        if r.y < self.clip_top || r.bottom() > self.band_top {
             return;
         }
         let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
@@ -482,7 +537,7 @@ impl Ctx<'_> {
         focused: bool,
         placeholder: &str,
     ) {
-        if r.bottom() > self.band_top {
+        if r.y < self.clip_top || r.bottom() > self.band_top {
             return;
         }
         let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
@@ -734,9 +789,15 @@ fn singleplayer(ctx: &mut Ctx) {
     // The create block anchors to the footer: label + name field + seed
     // field + button = 78 logical px. The world list owns what remains.
     let create_h = 100;
-    let create_top = (ctx.band_top - 4 - create_h).max(36);
+    let create_anchor = (ctx.band_top - 4 - create_h).max(36);
     let list_top = 34;
-    let list_bottom = create_top - 4;
+    let list_bottom = create_anchor - 4;
+    let create_scroll = ctx
+        .state
+        .menu_scroll
+        .singleplayer_create
+        .min(ctx.state.active_menu_scroll_limit(ctx.w, ctx.h)) as i32;
+    let create_top = create_anchor - create_scroll;
 
     // --- Saved worlds ------------------------------------------------
     let worlds = &ctx.state.singleplayer.worlds;
@@ -796,6 +857,10 @@ fn singleplayer(ctx: &mut Ctx) {
     }
 
     // --- Create New World --------------------------------------------
+    // Compact viewports scroll the create form beneath the fixed world
+    // list/header. Widgets that cross the footer remain dropped until a
+    // scroll step brings them fully into the safe band.
+    ctx.clip_top = 30;
     ctx.ctext(
         cx,
         create_top,
@@ -817,15 +882,33 @@ fn singleplayer(ctx: &mut Ctx) {
         ctx.state.world_seed_field_active(),
         tr(lang, "Seed (optional)", "シード（オプション）"),
     );
-    let mode = match ctx.state.singleplayer.game_mode { crate::state::SingleplayerGameMode::Survival => "Survival", crate::state::SingleplayerGameMode::Creative => "Creative", crate::state::SingleplayerGameMode::Hardcore => "Hardcore" };
-    let difficulty = match ctx.state.singleplayer.difficulty { crate::state::SingleplayerDifficulty::Peaceful => "Peaceful", crate::state::SingleplayerDifficulty::Easy => "Easy", crate::state::SingleplayerDifficulty::Normal => "Normal", crate::state::SingleplayerDifficulty::Hard => "Hard" };
-    ctx.btn(WidgetId::SingleplayerGameMode, lr(px, create_top + 56, pw / 2 - 2, 18), &format!("Game Mode: {mode}"));
-    ctx.btn(WidgetId::SingleplayerDifficulty, lr(px + pw / 2 + 2, create_top + 56, pw / 2 - 2, 18), &format!("Difficulty: {difficulty}"));
+    let mode = match ctx.state.singleplayer.game_mode {
+        crate::state::SingleplayerGameMode::Survival => tr(lang, "Survival", "サバイバル"),
+        crate::state::SingleplayerGameMode::Creative => tr(lang, "Creative", "クリエイティブ"),
+        crate::state::SingleplayerGameMode::Hardcore => tr(lang, "Hardcore", "ハードコア"),
+    };
+    let difficulty = match ctx.state.singleplayer.difficulty {
+        crate::state::SingleplayerDifficulty::Peaceful => tr(lang, "Peaceful", "ピースフル"),
+        crate::state::SingleplayerDifficulty::Easy => tr(lang, "Easy", "イージー"),
+        crate::state::SingleplayerDifficulty::Normal => tr(lang, "Normal", "ノーマル"),
+        crate::state::SingleplayerDifficulty::Hard => tr(lang, "Hard", "ハード"),
+    };
+    ctx.btn(
+        WidgetId::SingleplayerGameMode,
+        lr(px, create_top + 56, pw / 2 - 2, 18),
+        &format!("{}: {mode}", tr(lang, "Game Mode", "ゲームモード")),
+    );
+    ctx.btn(
+        WidgetId::SingleplayerDifficulty,
+        lr(px + pw / 2 + 2, create_top + 56, pw / 2 - 2, 18),
+        &format!("{}: {difficulty}", tr(lang, "Difficulty", "難易度")),
+    );
     ctx.btn(
         WidgetId::SingleplayerCreate,
         lr(px, create_top + 78, pw, 18),
         tr(lang, "Create & Play", "作成してプレイ"),
     );
+    ctx.clip_top = 0;
     ctx.band_top = i32::MAX;
 
     // Status/errors (failed launches, validation rejections) render
@@ -1226,11 +1309,24 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
     // Reserve the footer strip: any tab content that would reach it is
     // dropped by the widget helpers rather than painted under Done.
     ctx.band_top = ctx.h - 32;
-    let y0 = if modern {
+    let base_y0 = if modern {
         if ctx.h < 300 { 76 } else { 82 }
     } else {
         56
     };
+    let scroll = match active {
+        SettingsTab::Video => ctx.state.menu_scroll.settings_video,
+        SettingsTab::Audio => ctx.state.menu_scroll.settings_audio,
+        SettingsTab::Shaders => ctx.state.menu_scroll.settings_shaders,
+        SettingsTab::Qol => ctx.state.menu_scroll.settings_qol,
+        SettingsTab::FairPlay => ctx.state.menu_scroll.settings_fairplay,
+        SettingsTab::Language => ctx.state.menu_scroll.settings_language,
+        SettingsTab::Controls => ctx.state.menu_scroll.settings_controls,
+    }
+    .min(ctx.state.active_menu_scroll_limit(ctx.w, ctx.h)) as i32;
+    let content_top = if modern { 58 } else { tab_y.map(|y| y + 20).unwrap_or(34) };
+    ctx.clip_top = content_top;
+    let y0 = base_y0 - scroll;
     match active {
         SettingsTab::Video => video_tab(ctx, y0),
         SettingsTab::Audio => audio_tab(ctx, y0),
@@ -1239,6 +1335,25 @@ fn settings(ctx: &mut Ctx, active: SettingsTab) {
         SettingsTab::FairPlay => fairplay_tab(ctx, y0),
         SettingsTab::Language => language_tab(ctx, y0),
         SettingsTab::Controls => controls_tab(ctx, y0),
+    }
+    ctx.clip_top = 0;
+
+    // Vanilla-style scrollbar chrome for the scrollable content viewport.
+    // It is passive (wheel/keyboard owns scrolling) but gives the player
+    // the same spatial cue as vanilla's settings lists.
+    let max_scroll = ctx.state.active_menu_scroll_limit(ctx.w, ctx.h) as i32;
+    if max_scroll > 0 {
+        let track_x = ctx.w - 7;
+        let track_y = content_top + 2;
+        let track_h = (ctx.band_top - 4 - track_y).max(0);
+        if track_h >= 18 {
+            ctx.fill(track_x, track_y, 4, track_h, UiColor::rgba(0, 0, 0, 110));
+            ctx.border(track_x, track_y, 4, track_h, pal::PANEL_BORDER);
+            let thumb_h = ((track_h * track_h) / (track_h + max_scroll)).clamp(8, track_h);
+            let travel = (track_h - thumb_h).max(1);
+            let thumb_y = track_y + scroll * travel / max_scroll.max(1);
+            ctx.fill(track_x + 1, thumb_y, 2, thumb_h, pal::TEXT_DIM);
+        }
     }
     ctx.band_top = i32::MAX;
 
@@ -1363,42 +1478,65 @@ fn about_megu(ctx: &mut Ctx) {
         tr(lang, "License: LGPL-3.0-or-later", "ライセンス: LGPL-3.0-or-later"),
     );
 
-    // The two link rows need the Back button at h-30 to clear them;
-    // below ~216 logical px the screen collapses to text + Back only.
-    let show_links = ctx.h >= 216;
-    let left = cx - 144;
-    let right = cx + 8;
-    if show_links && !ctx.state.website_url.is_empty() {
-        ctx.btn(
-            WidgetId::WebsiteLink,
-            lr(left, 160, 136, 20),
-            tr(lang, "Website", "公式サイト"),
-        );
-    }
-    if show_links && !ctx.state.support_url.is_empty() {
-        ctx.btn(
-            WidgetId::SupportLink,
-            lr(right, 160, 136, 20),
-            tr(lang, "Support", "支援する"),
-        );
-    }
-    if show_links && !ctx.state.contribute_url.is_empty() {
-        ctx.btn(
-            WidgetId::ContributeLink,
-            lr(left, 186, 136, 20),
-            tr(lang, "Contribute", "貢献する"),
-        );
-    }
-    if show_links && !ctx.state.report_url.is_empty() {
-        ctx.btn(
-            WidgetId::ReportLink,
-            lr(right, 186, 136, 20),
-            tr(lang, "Report Bug", "バグ報告"),
-        );
+    // Link hitboxes are admitted only when their painted bottom clears
+    // the Back footer (`by..by+20`). Wide screens use vanilla-style
+    // 136+8+136 rows; compact logical widths stack one link per row and
+    // drop the lowest rows rather than letting them collide with Back.
+    let by = ctx.h - 30;
+    let links = [
+        (WidgetId::WebsiteLink, tr(lang, "Website", "公式サイト"), !ctx.state.website_url.is_empty()),
+        (WidgetId::SupportLink, tr(lang, "Support", "支援する"), !ctx.state.support_url.is_empty()),
+        (WidgetId::ContributeLink, tr(lang, "Contribute", "貢献する"), !ctx.state.contribute_url.is_empty()),
+        (WidgetId::ReportLink, tr(lang, "Report Bug", "バグ報告"), !ctx.state.report_url.is_empty()),
+    ];
+    if ctx.w >= 292 {
+        let left = cx - 144;
+        let right = cx + 8;
+        // Two rows of 20px buttons plus a 6px gap need 46px. The rows
+        // may slide upward, never downward into the footer.
+        let latest_start = by - 2 - 46;
+        let start = 136.min(latest_start);
+        if start >= 122 {
+            for (col, row, index) in [(0, 0, 0), (1, 0, 1), (0, 1, 2), (1, 1, 3)] {
+                let (id, label, enabled) = links[index];
+                if enabled {
+                    ctx.btn(
+                        id,
+                        lr(if col == 0 { left } else { right }, start + row * 26, 136, 20),
+                        label,
+                    );
+                }
+            }
+        } else {
+            // Extremely short viewport: keep at most the primary pair on
+            // one footer-clearing row and omit the second row entirely.
+            let y = by - 24;
+            if y >= 122 {
+                for (col, index) in [(0, 0), (1, 3)] {
+                    let (id, label, enabled) = links[index];
+                    if enabled {
+                        ctx.btn(id, lr(if col == 0 { left } else { right }, y, 136, 20), label);
+                    }
+                }
+            }
+        }
+    } else {
+        let bw = 168.min(ctx.w - 8).max(24);
+        let mut y = 124;
+        for (id, label, enabled) in links {
+            if !enabled {
+                continue;
+            }
+            if y + 20 > by - 2 {
+                break;
+            }
+            ctx.btn(id, lr(cx - bw / 2, y, bw, 20), label);
+            y += 24;
+        }
     }
     ctx.btn(
         WidgetId::AboutBack,
-        lr(cx - 50, ctx.h - 30, 100, 20),
+        lr(cx - 50, by, 100, 20),
         tr(lang, "Back", "戻る"),
     );
     // 150 keeps the badge right of the optional link buttons (cx+144)
@@ -1433,6 +1571,35 @@ fn write_hud_str(text: &str, limit: usize, out: &mut String) {
             .map(|c| if c.is_control() { ' ' } else { c })
             .take(limit),
     );
+}
+
+/// Visible chat-input window plus caret x in logical px, measured with
+/// real glyph advances (CJK = 12px, ASCII = 8px at scale 1). The window
+/// scrolls just enough to keep the caret inside the box, then admits as
+/// much text after the caret as fits.
+fn chat_input_window(text: &str, cursor_chars: usize, avail_px: usize) -> (String, i32) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor_chars.min(chars.len());
+    let width = |slice: &[char]| -> usize {
+        slice.iter().map(|&c| crate::draw::glyph_advance(c) as usize).sum()
+    };
+    let mut start = 0usize;
+    while start < cursor && width(&chars[start..cursor]) > avail_px.saturating_sub(1) {
+        start += 1;
+    }
+    let mut end = cursor;
+    while end < chars.len() && width(&chars[start..=end]) <= avail_px {
+        end += 1;
+    }
+    // If the caret is before the tail, prefer filling unused room with
+    // earlier text too; this keeps editing in the middle stable.
+    while start > 0 && width(&chars[start - 1..end]) <= avail_px {
+        start -= 1;
+    }
+    (
+        chars[start..end].iter().collect(),
+        width(&chars[start..cursor]) as i32,
+    )
 }
 
 fn shaders_tab(ctx: &mut Ctx, y0: i32) {
@@ -3096,6 +3263,68 @@ fn embedded_recipe_browser(ctx: &mut Ctx) {
 // In-game HUD (display only — zero interactive hit regions)
 // ---------------------------------------------------------------------------
 
+/// Shared hold-Tab player-list geometry. Vanilla fills wide overlays in
+/// columns (up to twenty rows per column); keeping the calculation here
+/// lets the painter and [`hud_occupied_rects`] collision mirror agree
+/// exactly at every viewport size.
+#[derive(Clone, Copy, Debug)]
+struct PlayerListGeometry {
+    panel_x: i32,
+    panel_y: i32,
+    panel_w: i32,
+    panel_h: i32,
+    col_w: i32,
+    rows_used: usize,
+    shown: usize,
+    extra: usize,
+}
+
+fn player_list_geometry(
+    player_count: usize,
+    max_name_w: i32,
+    w: i32,
+    h: i32,
+    boss_bottom: i32,
+) -> PlayerListGeometry {
+    let py = boss_bottom + 4;
+    let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
+    let rows_per_col = rows_avail.min(20);
+    let fit_col_w = (w - 20).max(40);
+    let col_w = (max_name_w + 58).clamp(70, 150).min(fit_col_w);
+    let max_cols = ((w - 8 - 12 + 4) / (col_w + 4)).max(1) as usize;
+    let needed_cols = if rows_per_col == 0 {
+        1
+    } else {
+        player_count.div_ceil(rows_per_col).max(1)
+    };
+    let cols = needed_cols.clamp(1, 8).min(max_cols);
+    let capacity = cols * rows_per_col;
+    let (shown, extra) = if rows_per_col == 0 || player_count <= capacity {
+        (if rows_per_col == 0 { 0 } else { player_count }, 0)
+    } else {
+        let shown = capacity.saturating_sub(1);
+        (shown, player_count - shown)
+    };
+    let occupied_slots = shown + usize::from(extra > 0);
+    let rows_used = if occupied_slots == 0 {
+        0
+    } else {
+        occupied_slots.div_ceil(cols).min(rows_per_col.max(1))
+    };
+    let panel_w = cols as i32 * col_w + (cols as i32 - 1) * 4 + 12;
+    let panel_h = 14 + rows_used as i32 * 11;
+    PlayerListGeometry {
+        panel_x: w / 2 - panel_w / 2,
+        panel_y: py,
+        panel_w,
+        panel_h: panel_h.max(14),
+        col_w,
+        rows_used,
+        shown,
+        extra,
+    }
+}
+
 fn hud(ctx: &mut Ctx) {
     let hud: &HudState = &ctx.state.hud;
     if hud.hud_hidden { return; }
@@ -3141,18 +3370,46 @@ fn hud(ctx: &mut Ctx) {
     };
 
     // Bossbars, stacked from the top (host names: sanitized + clipped).
+    // Vanilla colors drive both the textured `boss_bar/*` sprites (when the
+    // host atlas binds them) and the procedural fallback tint.
     let boss_count = hud.bossbars.len().min(3) as i32;
     for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
         let y = 6 + i as i32 * 16;
-        let bw = (w - 40).clamp(8, 200);
+        let bw = (w - 40).clamp(8, 182);
+        let frac = frac.clamp(0.0, 1.0);
+        let color = hud.bossbar_colors.get(i).copied().unwrap_or_default();
         ctx.hud_ctext(cx, y, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
-        ctx.progress(
-            lr(cx - bw / 2, y + 9, bw, 5),
-            frac.clamp(0.0, 1.0),
-            UiColor::rgb(170, 60, 200),
-            UiColor::rgb(30, 20, 34),
-            pal::BUTTON_BORDER,
-        );
+        let bar_x = cx - bw / 2;
+        let bg_key = format!("boss_bar/{}_background", color.name());
+        let fill_key = format!("boss_bar/{}_progress", color.name());
+        let textured = ctx.gui_atlas.and_then(|atlas| {
+            Some((atlas.named_sprite(&bg_key)?, atlas.named_sprite(&fill_key)?))
+        });
+        if let Some((bg, fill)) = textured {
+            ctx.hud_sprite_entry(bg, bar_x, y + 9, bw, 5);
+            let src_w = (fill.width as f32 * frac).round() as u32;
+            let dst_w = ((bw as f32) * frac).round() as i32;
+            if src_w > 0 && dst_w > 0 {
+                ctx.hud_sprite_entry(fill.subrect(0, 0, src_w, fill.height), bar_x, y + 9, dst_w, 5);
+            }
+        } else {
+            let tint = match color {
+                crate::state::BossBarColor::Pink => UiColor::rgb(226, 76, 156),
+                crate::state::BossBarColor::Blue => UiColor::rgb(74, 122, 226),
+                crate::state::BossBarColor::Red => UiColor::rgb(210, 62, 62),
+                crate::state::BossBarColor::Green => UiColor::rgb(86, 184, 82),
+                crate::state::BossBarColor::Yellow => UiColor::rgb(232, 190, 62),
+                crate::state::BossBarColor::Purple => UiColor::rgb(170, 60, 200),
+                crate::state::BossBarColor::White => UiColor::rgb(226, 226, 226),
+            };
+            ctx.progress(
+                lr(bar_x, y + 9, bw, 5),
+                frac,
+                tint,
+                UiColor::rgb(30, 20, 34),
+                pal::BUTTON_BORDER,
+            );
+        }
     }
     // Bottom edge of the bossbar stack (empty stack => just the top margin).
     let boss_bottom = if boss_count == 0 {
@@ -3205,22 +3462,73 @@ fn hud(ctx: &mut Ctx) {
     let vy = hy - 12;
     let rx = hx0 + hw;
     if show_vitals {
+        // Dynamic max-health rows: each vanilla row carries at most twenty
+        // half-heart units and additional rows stack upward. Status effects
+        // and hardcore swap only the fill sprites; the backing container row
+        // remains shared exactly like vanilla.
+        let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
+            hud.max_health
+        } else {
+            20.0
+        };
+        let health_rows = (max_health / 20.0).ceil() as i32;
+        let mut style = if hud.hardcore {
+            HeartStyle::Hardcore
+        } else {
+            hud.heart_style
+        };
+        if style == HeartStyle::Normal {
+            if hud
+                .status_effects
+                .iter()
+                .any(|effect| effect.name.to_ascii_lowercase().contains("wither"))
+            {
+                style = HeartStyle::Withered;
+            } else if hud
+                .status_effects
+                .iter()
+                .any(|effect| effect.name.to_ascii_lowercase().contains("poison"))
+            {
+                style = HeartStyle::Poisoned;
+            } else if hud.screen_overlay.freezing_alpha > 0.0 {
+                style = HeartStyle::Frozen;
+            }
+        }
+        let (heart_full, heart_half) = match style {
+            HeartStyle::Normal => (hud_sprite_ids::HEART_FULL, hud_sprite_ids::HEART_HALF),
+            HeartStyle::Poisoned => ("hud/heart/poisoned_full", "hud/heart/poisoned_half"),
+            HeartStyle::Withered => ("hud/heart/withered_full", "hud/heart/withered_half"),
+            HeartStyle::Frozen => ("hud/heart/frozen_full", "hud/heart/frozen_half"),
+            HeartStyle::Hardcore => ("hud/heart/hardcore_full", "hud/heart/hardcore_half"),
+        };
+        let heart_color = match style {
+            HeartStyle::Normal | HeartStyle::Hardcore => pal::HEALTH,
+            HeartStyle::Poisoned => UiColor::rgb(92, 150, 62),
+            HeartStyle::Withered => UiColor::rgb(52, 48, 48),
+            HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
+        };
+        for row in 0..health_rows {
+            let base = row as f32 * 20.0;
+            let row_value = (hud.health - base).clamp(0.0, 20.0);
+            let row_max = (max_health - base).clamp(0.0, 20.0).max(1.0);
+            sprite_icon_row(
+                ctx,
+                hx0,
+                vy - row * 10,
+                false,
+                row_value,
+                row_max,
+                heart_color,
+                hud_sprite_ids::HEART_CONTAINER,
+                heart_full,
+                heart_half,
+            );
+        }
+        let armor_y = vy - health_rows * 10;
         sprite_icon_row(
             ctx,
             hx0,
-            vy,
-            false,
-            hud.health,
-            20.0,
-            pal::HEALTH,
-            hud_sprite_ids::HEART_CONTAINER,
-            hud_sprite_ids::HEART_FULL,
-            hud_sprite_ids::HEART_HALF,
-        );
-        sprite_icon_row(
-            ctx,
-            hx0,
-            vy - 10,
+            armor_y,
             false,
             hud.armor as f32,
             20.0,
@@ -3233,14 +3541,14 @@ fn hud(ctx: &mut Ctx) {
             sprite_icon_row(
                 ctx,
                 hx0,
-                vy - 20,
+                armor_y - 10,
                 false,
                 hud.absorption,
                 20.0,
                 pal::ABSORPTION,
                 hud_sprite_ids::HEART_CONTAINER,
-                hud_sprite_ids::HEART_FULL,
-                hud_sprite_ids::HEART_HALF,
+                "hud/heart/absorbing_full",
+                "hud/heart/absorbing_half",
             );
         }
         sprite_icon_row(
@@ -3271,14 +3579,18 @@ fn hud(ctx: &mut Ctx) {
                     row_max,
                     pal::HEALTH,
                     hud_sprite_ids::HEART_CONTAINER,
-                    hud_sprite_ids::HEART_FULL,
-                    hud_sprite_ids::HEART_HALF,
+                    "hud/heart/vehicle_full",
+                    "hud/heart/vehicle_half",
                 );
                 right_row_y -= 10;
             }
         }
         if hud.air < 300 {
-            icon_row_r(ctx, rx, right_row_y, hud.air as f32 / 30.0, 10.0, pal::AIR);
+            // Vanilla air bubbles are discrete sprites rather than empty
+            // containers; one bubble is thirty supply units.
+            if !air_bubble_sprites(ctx, rx, right_row_y, hud.air) {
+                icon_row_r(ctx, rx, right_row_y, hud.air as f32 / 15.0, 20.0, pal::AIR);
+            }
         }
 
         // XP bar + level. The textured bar crops its fill in source
@@ -3330,8 +3642,18 @@ fn hud(ctx: &mut Ctx) {
     } else {
         (0..0, 0..0)
     };
-    let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
-    let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
+    let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
+        hud.max_health
+    } else {
+        20.0
+    };
+    let health_rows = (max_health / 20.0).ceil() as i32;
+    let vtop_l = vy - health_rows * 10 - if hud.absorption > 0.0 { 10 } else { 0 };
+    let mount_rows = hud
+        .mount_health
+        .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
+        .unwrap_or(0);
+    let vtop_r = vy - mount_rows * 10 - if hud.air < 300 { 10 } else { 0 };
 
     // Actionbar: one centered line in the band directly above the vitals.
     let abar = if hud.actionbar.is_empty() {
@@ -3520,15 +3842,20 @@ fn hud(ctx: &mut Ctx) {
     // popup stacked above it listing `completions` with the applied
     // candidate highlighted.
     if hud.chat_input.open {
-        let box_w = ((w * 3) / 5).clamp(80, w - 8);
+        // Clamp bounds in safe order: at ultra-narrow logical widths the
+        // maximum can be below the preferred 80px minimum, and reversing
+        // those operands panics in `clamp`.
+        let max_w = (w - 8).max(16);
+        let min_w = 80.min(max_w);
+        let box_w = ((w * 3) / 5).clamp(min_w, max_w);
         let box_y = h - 13;
         ctx.fill(2, box_y, box_w, 11, UiColor::rgba(0, 0, 0, 160));
         ctx.border(2, box_y, box_w, 11, pal::PANEL_BORDER);
-        let cells = ((box_w - 8) / 8).max(0) as usize;
-        let text = hud_str(&hud.chat_input.text, cells);
+        let avail_px = (box_w - 8).max(0) as usize;
+        let full = hud_str(&hud.chat_input.text, crate::hud_widgets::MAX_CHAT_INPUT_CELLS);
+        let (text, caret_px) = chat_input_window(&full, hud.chat_input.cursor(), avail_px);
         ctx.text(4, box_y + 2, 1, pal::TEXT, &text);
-        let caret = hud.chat_input.cursor().min(cells);
-        let caret_x = (4 + caret as i32 * 8).min(2 + box_w - 3);
+        let caret_x = (4 + caret_px).min(2 + box_w - 3);
         ctx.fill(caret_x, box_y + 2, 1, 7, pal::TEXT);
         let rows = hud.chat_input.completions.len().min(10);
         if rows > 0 {
@@ -3563,22 +3890,20 @@ fn hud(ctx: &mut Ctx) {
         }
     }
 
-    // Player list overlay (hold-Tab): stacked below the bossbars and
-    // height-capped to the viewport with a "+N more" tail.
+    // Player list overlay (hold-Tab): vanilla-style column-major rows
+    // below the bossbars, height-capped to the viewport with a "+N more"
+    // tail only when even the widest fitting column set cannot show all.
     if hud.show_player_list {
-        let pw = 200.min(w - 8).max(70);
-        let px = cx - pw / 2;
-        let py = boss_bottom + 4;
-        let name_cells = ((pw - 60) / 8).max(1) as usize;
-        let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
-        let (shown, extra) = if hud.players.len() <= rows_avail {
-            (hud.players.len(), 0usize)
-        } else {
-            let s = rows_avail.saturating_sub(1);
-            (s, hud.players.len() - s)
-        };
-        let ph = 14 + (shown + usize::from(extra > 0)) as i32 * 11;
-        ctx.panel(px, py, pw, ph.max(14));
+        let max_name_w = hud
+            .players
+            .iter()
+            .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
+            .max()
+            .unwrap_or(0);
+        let geo = player_list_geometry(hud.players.len(), max_name_w, w, h, boss_bottom);
+        let (px, py, pw, ph) = (geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
+        let name_cells = ((geo.col_w - 58) / 8).max(1) as usize;
+        ctx.panel(px, py, pw, ph);
         ctx.ctext(
             cx,
             py + 4,
@@ -3590,19 +3915,25 @@ fn hud(ctx: &mut Ctx) {
                 hud.players.len()
             ),
         );
-        for (i, (name, ping)) in hud.players.iter().take(shown).enumerate() {
-            let y = py + 14 + i as i32 * 11;
-            ctx.hud_text(px + 6, y, 1, pal::TEXT, name, name_cells);
-            ping_bars(ctx, px + pw - 30, y, *ping);
-            ctx.text(px + pw - 52, y, 1, pal::TEXT_DIM, &format!("{ping}ms"));
+        let rows_per_col = geo.rows_used.max(1);
+        for (i, (name, ping)) in hud.players.iter().take(geo.shown).enumerate() {
+            let col = i / rows_per_col;
+            let row = i % rows_per_col;
+            let x = px + 6 + col as i32 * (geo.col_w + 4);
+            let y = py + 14 + row as i32 * 11;
+            ctx.hud_text(x, y, 1, pal::TEXT, name, name_cells);
+            ping_bars(ctx, x + geo.col_w - 24, y, *ping);
         }
-        if extra > 0 {
+        if geo.extra > 0 {
+            let slot = geo.shown;
+            let col = slot / rows_per_col;
+            let row = slot % rows_per_col;
             ctx.text(
-                px + 6,
-                py + 14 + shown as i32 * 11,
+                px + 6 + col as i32 * (geo.col_w + 4),
+                py + 14 + row as i32 * 11,
                 1,
                 pal::TEXT_DIM,
-                &format!("+{extra} more"),
+                &format!("+{} more", geo.extra),
             );
         }
     }
@@ -4047,14 +4378,36 @@ pub fn layout_looking_at(state: &UiState, width: u32, height: u32, out: &mut UiD
 /// cursor), and a `[Done]` hint. Returns `false` while no session is
 /// open; panel geometry is clamped into the viewport so nothing draws
 /// outside `width`×`height` at any size.
+/// Append the server-driven sign-edit overlay. This compatibility
+/// wrapper preserves the original draw-only API; integrated rendering
+/// uses [`layout_sign_editor_region`] so `[Done]` also owns a hit region.
 pub fn layout_sign_editor(
     state: &UiState,
     width: u32,
     height: u32,
     out: &mut UiDrawList,
 ) -> bool {
+    layout_sign_editor_impl(state, width, height, out).is_some()
+}
+
+/// Draw the sign editor and return the physical `[Done]` hit rect.
+pub(crate) fn layout_sign_editor_region(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> Option<UiRect> {
+    layout_sign_editor_impl(state, width, height, out)
+}
+
+fn layout_sign_editor_impl(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+) -> Option<UiRect> {
     let Some(editor) = &state.sign_editor else {
-        return false;
+        return None;
     };
     // Same auto GUI scale the other HUD overlays use so panels agree.
     let ms = ((height as f32 / 360.0).floor() as u32)
@@ -4072,7 +4425,7 @@ pub fn layout_sign_editor(
     let panel_w = (lw - 2 * EDGE).clamp(0, 300);
     let panel_h = (lh - 2 * EDGE).clamp(0, TITLE_H + rows_h + HINT_H + 2 * PAD);
     if panel_w < 32 || panel_h < 32 {
-        return false;
+        return None;
     }
     let px_l = ((lw - panel_w) / 2).max(EDGE.min(lw - panel_w));
     let py_l = ((lh - panel_h) / 2).max(EDGE.min(lh - panel_h));
@@ -4146,15 +4499,37 @@ pub fn layout_sign_editor(
         }
     }
 
-    // Bottom hint row.
-    let hint = tr(state.lang(), "[Done]", "[完了]");
-    let hint = crate::draw::first_px(hint, inner_w.max(0) as usize);
-    let hint_w = text_width(hint, ms) as i32;
-    let hint_y = (py_l + panel_h - PAD - (HINT_H + 8) / 2) * ms as i32;
-    if hint_y >= title_y + 8 * ms as i32 {
-        out.text_str(px + (pw as i32 - hint_w) / 2, hint_y, ms, INK, hint);
-    }
-    true
+    // Bottom Done control: vanilla stone-button colors/bevels and a real
+    // hit region. The rows above already reserve HINT_H, so the button
+    // can never overlap the editable text slots.
+    let done_w = 98.min(inner_w).max(24);
+    let done_h = HINT_H;
+    let done_x_l = px_l + PAD + (inner_w - done_w) / 2;
+    let done_y_l = py_l + panel_h - PAD - HINT_H;
+    let done = UiRect::new(
+        done_x_l * ms as i32,
+        done_y_l * ms as i32,
+        (done_w * ms as i32) as u32,
+        (done_h * ms as i32) as u32,
+    );
+    out.fill_rect(done, pal::BUTTON);
+    out.border_rect(done, pal::BUTTON_BORDER, ms.max(1));
+    let ms_i = ms as i32;
+    out.fill_rect(
+        UiRect::new(done.x + ms_i, done.y + ms_i, done.w.saturating_sub(2 * ms), ms),
+        UiColor::rgba(255, 255, 255, 42),
+    );
+    out.fill_rect(
+        UiRect::new(done.x + ms_i, done.bottom() - 2 * ms_i, done.w.saturating_sub(2 * ms), ms),
+        UiColor::rgba(0, 0, 0, 82),
+    );
+    let label = tr(state.lang(), "Done", "完了");
+    let label = crate::draw::first_px(label, (done_w - 8).max(0) as usize);
+    let label_w = text_width(label, ms) as i32;
+    let label_y = done.y + ((done.h as i32 - 8 * ms_i) / 2).max(0);
+    out.text_str(done.x + (done.w as i32 - label_w) / 2 + ms_i, label_y + ms_i, ms, UiColor::rgba(0, 0, 0, 140), label);
+    out.text_str(done.x + (done.w as i32 - label_w) / 2, label_y, ms, pal::TEXT, label);
+    Some(done)
 }
 
 /// Append the toast-notification stack (`state.toasts`) to the draw
@@ -4345,8 +4720,18 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
         } else {
             (0..0, 0..0)
         };
-        let vtop_l = vy - if hud.absorption > 0.0 { 20 } else { 10 };
-        let vtop_r = vy - if hud.air < 300 { 10 } else { 0 };
+        let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
+            hud.max_health
+        } else {
+            20.0
+        };
+        let health_rows = (max_health / 20.0).ceil() as i32;
+        let vtop_l = vy - health_rows * 10 - if hud.absorption > 0.0 { 10 } else { 0 };
+        let mount_rows = hud
+            .mount_health
+            .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
+            .unwrap_or(0);
+        let vtop_r = vy - mount_rows * 10 - if hud.air < 300 { 10 } else { 0 };
         if show_hotbar {
             add(hx, hy, slot + 4 + hw, slot);
         }
@@ -4516,7 +4901,7 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
         };
         for (i, (name, _)) in hud.bossbars.iter().take(3).enumerate() {
             let y = 6 + i as i32 * 16;
-            let bw = (w - 40).clamp(8, 200);
+            let bw = (w - 40).clamp(8, 182);
             let clipped = hud_str(name, ((w - 8) / 8).max(0) as usize);
             let nw = text_width(&clipped, 1) as i32;
             let row_w = bw.max(nw);
@@ -4525,18 +4910,14 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
 
         // Player-list overlay panel.
         if hud.show_player_list {
-            let pw = 200.min(w - 8).max(70);
-            let px = cx - pw / 2;
-            let py = boss_bottom + 4;
-            let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
-            let (shown, extra) = if hud.players.len() <= rows_avail {
-                (hud.players.len(), 0usize)
-            } else {
-                let s = rows_avail.saturating_sub(1);
-                (s, hud.players.len() - s)
-            };
-            let ph = 14 + (shown + usize::from(extra > 0)) as i32 * 11;
-            add(px, py, pw, ph.max(14));
+            let max_name_w = hud
+                .players
+                .iter()
+                .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
+                .max()
+                .unwrap_or(0);
+            let geo = player_list_geometry(hud.players.len(), max_name_w, w, h, boss_bottom);
+            add(geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
         }
 
         // MagicHUD bottom bars + top-right status column (same frame the
@@ -4614,6 +4995,37 @@ fn slot_cooldown_wipe(ctx: &mut Ctx, x: i32, y: i32, frac: f32) {
     );
 }
 
+/// Vanilla air bubbles: ten discrete 9×9 sprites, right-aligned, with no
+/// container row. `air` uses vanilla supply units (300 = ten bubbles of
+/// 30). Returns `false` when the host atlas has no bubble sprite so the
+/// caller can keep its procedural fallback.
+fn air_bubble_sprites(ctx: &mut Ctx, right: i32, y: i32, air: u16) -> bool {
+    if !ctx
+        .gui_atlas
+        .is_some_and(|atlas| atlas.has_named_sprite(hud_sprite_ids::AIR))
+    {
+        return false;
+    }
+    let air = i32::from(air).clamp(0, 300);
+    for i in 0..10 {
+        let remaining = air - i * 30;
+        if remaining <= 0 {
+            continue;
+        }
+        let key = if remaining < 30
+            && ctx
+                .gui_atlas
+                .is_some_and(|atlas| atlas.has_named_sprite("hud/air_bursting"))
+        {
+            "hud/air_bursting"
+        } else {
+            hud_sprite_ids::AIR
+        };
+        ctx.hud_sprite(key, right - 8 - i * 8, y, 9, 9);
+    }
+    true
+}
+
 /// Sprite-backed icon row with the procedural swatch row as fallback.
 /// Vanilla HUD icons are 9×9 on an 8 px pitch, so neighboring transparent
 /// edges overlap exactly like the original renderer.
@@ -4629,7 +5041,7 @@ fn sprite_icon_row(
     empty: &str,
     full: &str,
     half: &str,
-) {
+) -> bool {
     let available = ctx.gui_atlas.is_some_and(|atlas| {
         atlas.has_named_sprite(empty) && atlas.has_named_sprite(full) && atlas.has_named_sprite(half)
     });
@@ -4639,7 +5051,7 @@ fn sprite_icon_row(
         } else {
             icon_row(ctx, x, y, value, max, color);
         }
-        return;
+        return false;
     }
     let icons = ((max / 2.0).ceil() as i32).clamp(0, 10);
     for i in 0..icons {
@@ -4652,6 +5064,7 @@ fn sprite_icon_row(
             ctx.hud_sprite(half, cx, y, 9, 9);
         }
     }
+    true
 }
 
 /// `count`-icon row of 8px cells (half-unit granularity like vanilla
@@ -4707,70 +5120,81 @@ fn ping_bars(ctx: &mut Ctx, x: i32, y: i32, ping_ms: u16) {
 // ---------------------------------------------------------------------------
 
 fn pause(ctx: &mut Ctx) {
-    ctx.fill(0, 0, ctx.w, ctx.h, pal::OVERLAY_DIM);
+    // Pause uses the live blurred world rather than the panoramic menu
+    // background: a translucent vanilla-style dimming veil.
+    ctx.fill(0, 0, ctx.w, ctx.h, UiColor::rgba(10, 12, 16, 148));
+
     let lang = ctx.lang;
     let cx = ctx.w / 2;
 
-    ctx.ctext(cx, 40, 2, pal::TEXT, tr(lang, "Game Paused", "一時停止中"));
-
-    let bw = 200.min(ctx.w - 8).max(24);
+    // Vanilla 1.21.1's exact pause-menu silhouette: one 204px column,
+    // half rows split as 98 + 8 + 98, all rows 20px tall with 4px gaps.
+    // On narrower logical viewports the whole grid scales down uniformly
+    // while preserving the same 2-column rhythm.
+    let bw = 204.min(ctx.w - 8).max(48) & !1;
+    let gap = 8;
+    let half = (bw - gap) / 2;
     let x = cx - bw / 2;
-    // Seven buttons must clear the Report-Bug corner link at h-26; when
-    // the window is too short the stack hugs the top and the link hides.
-    let wants_report = !ctx.state.report_url.is_empty();
-    let reserve = if wants_report { 28 } else { 2 };
-    let step = 24.min((ctx.h - reserve - 20 - 84) / 6).max(4);
-    let bh = 20.min(step);
-    let mut y = 76.min(ctx.h - reserve - 6 * step - bh).max(2);
+    let xr = x + half + gap;
+    let bh = 20;
+    let vgap = 4;
+    let rows = 5;
+    let total = rows * bh + (rows - 1) * vgap;
+    let y0 = ((ctx.h - total) / 2).max(4);
+    let y = |row: i32| y0 + row * (bh + vgap);
+
     ctx.btn(
         WidgetId::PauseBackToGame,
-        lr(x, y, bw, bh),
-        ctx.state.translate("menu.returnToGame", tr(lang, "Back to Game", "ゲームに戻る")),
+        lr(x, y(0), bw, bh),
+        ctx.state.translate(
+            "menu.returnToGame",
+            tr(lang, "Back to Game", "ゲームに戻る"),
+        ),
     );
-    y += step;
     ctx.btn(
-        WidgetId::PauseSettings,
-        lr(x, y, bw, bh),
-        tr(lang, "Settings", "設定"),
+        WidgetId::PauseAdvancements,
+        lr(x, y(1), half, bh),
+        ctx.state.translate("gui.advancements", tr(lang, "Advancements", "進捗")),
     );
-    y += step;
     ctx.btn(
         WidgetId::PauseStatistics,
-        lr(x, y, bw, bh),
-        tr(lang, "Statistics", "統計"),
+        lr(xr, y(1), half, bh),
+        ctx.state.translate("gui.stats", tr(lang, "Statistics", "統計")),
     );
-    y += step;
     ctx.btn(
-        WidgetId::PauseRecipeBrowser,
-        lr(x, y, bw, bh),
-        tr(lang, "Recipe Browser", "レシピブラウザ"),
+        WidgetId::PauseSettings,
+        lr(x, y(2), half, bh),
+        ctx.state.translate("menu.options", tr(lang, "Options...", "設定...")),
     );
-    y += step;
     ctx.btn(
         WidgetId::PauseInvite,
-        lr(x, y, bw, bh),
+        lr(xr, y(2), half, bh),
         tr(lang, "Invite Friend", "フレンドを招待"),
     );
-    y += step;
+    ctx.btn(
+        WidgetId::PauseRecipeBrowser,
+        lr(x, y(3), half, bh),
+        tr(lang, "Recipe Browser", "レシピブラウザ"),
+    );
     ctx.btn(
         WidgetId::PauseSaveReplay,
-        lr(x, y, bw, bh),
-        tr(lang, "Save 60s Instant Replay", "60sリプレイを保存"),
+        lr(xr, y(3), half, bh),
+        tr(lang, "Save Replay", "リプレイ保存"),
     );
-    y += step;
     ctx.btn(
         WidgetId::PauseSaveQuit,
-        lr(x, y, bw, bh),
+        lr(x, y(4), bw, bh),
         tr(lang, "Save & Quit to Title", "保存してタイトルへ"),
     );
-    // The corner link draws only when the button stack leaves it room —
-    // an overlapping link is worse than a hidden one.
-    let stack_bottom = y + bh;
-    if wants_report && ctx.h - 26 >= stack_bottom + 2 {
+
+    // Megu's support shortcut is deliberately secondary chrome and appears
+    // only when the fixed vanilla grid leaves a disjoint footer strip.
+    let report_y = y0 + total + 6;
+    if !ctx.state.report_url.is_empty() && report_y + 14 <= ctx.h - 4 {
         ctx.btn(
             WidgetId::PauseReportBug,
-            lr(ctx.w - 96, ctx.h - 26, 92, 18),
-            tr(lang, "Report Bug", "バグ報告"),
+            lr(ctx.w - 88, report_y, 80, 14),
+            tr(lang, "Report Bug", "不具合を報告"),
         );
     }
 }
