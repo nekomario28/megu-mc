@@ -1507,3 +1507,41 @@ fn parse_entity_metadata_fail_closed_on_truncation() {
     assert!(parse_entity_metadata(&[]).is_empty());
     assert!(parse_entity_metadata(&[0xFF]).is_empty());
 }
+
+#[test]
+fn outgoing_click_preserves_added_and_removed_components_after_count_change() {
+    use megu_client::protocol::{decode_item_stack_components, encode_item_stack_components};
+
+    let mut wire = slot_named(5, 3, "Pick");
+    wire[3] = 1; // removed count
+    wire.push(18); // remove the prototype glint override
+    let (mut stack, used) = decode_item_stack_components(&wire).unwrap();
+    assert_eq!(used, wire.len());
+    assert_eq!(encode_item_stack_components(&stack).unwrap(), wire);
+    stack.count = 2;
+    let stack_wire = encode_item_stack_components(&stack).unwrap();
+    let (_, body) = encode_container_click(0, 1, 3, 0, 0, &[(3, &stack_wire)], &stack_wire);
+    // One-byte window/state/button/mode/count, plus a two-byte slot.
+    let mut r = WireReader::new(&body[7..]);
+    assert_eq!(r.read_i16().unwrap(), 3);
+    let (changed, used) = decode_item_stack_components(r.rest()).unwrap();
+    assert_eq!(changed, stack);
+    r.take(used).unwrap();
+    let (carried, used) = decode_item_stack_components(r.rest()).unwrap();
+    assert_eq!(carried, stack);
+    assert_eq!(used, r.remaining());
+
+    stack.added[0].data.push(0);
+    assert!(encode_item_stack_components(&stack).is_err());
+}
+
+#[test]
+fn container_click_wire_never_exceeds_128_changed_slots() {
+    let changed: Vec<_> = (0..129).map(|i| (i, &[0][..])).collect();
+    for (slots, expected) in [(&changed[..128], 128), (&changed[..], 0)] {
+        let (_, body) = encode_container_click(0, 0, 0, 0, 0, slots, &[0]);
+        let mut r = WireReader::new(&body[6..]);
+        assert_eq!(r.read_varint().unwrap(), expected);
+        assert_eq!(r.remaining(), expected as usize * 3 + 1);
+    }
+}

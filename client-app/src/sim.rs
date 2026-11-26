@@ -676,10 +676,12 @@ impl SessionRunner {
                 self.entity_id = entity_id;
                 self.play_ok = true;
                 self.world.reset_dimension(dimension);
+                self.world.game_mode = self.client.game_mode;
                 self.acoustics.reset_dimension(&self.world);
             }
             PlayEvent::Respawn { dimension } => {
                 self.world.reset_dimension(dimension);
+                self.world.game_mode = self.client.game_mode;
                 self.acoustics.reset_dimension(&self.world);
                 self.initial_spawn_done = false;
             }

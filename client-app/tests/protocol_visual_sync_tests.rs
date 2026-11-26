@@ -127,7 +127,7 @@ fn typed_entity_visual_accessors_cover_shared_and_mob_metadata() {
 
     let mut shared = Vec::new();
     metadata(0, 0, &[0x7b], &mut shared); // all six shared visual flags
-    metadata(6, 20, &vi(5), &mut shared);
+    metadata(6, 21, &vi(5), &mut shared);
     metadata(9, 3, &f32be(17.5), &mut shared);
     metadata(16, 8, &[1], &mut shared); // ageable baby flag
     shared.push(0xff);
@@ -200,7 +200,7 @@ fn typed_entity_visual_accessors_cover_shared_and_mob_metadata() {
     );
 
     let mut villager = vec![17];
-    villager.extend(vi(18));
+    villager.extend(vi(19));
     villager.extend(vi(2));
     villager.extend(vi(5));
     villager.extend(vi(3));
@@ -243,9 +243,7 @@ fn typed_entity_visual_accessors_cover_shared_and_mob_metadata() {
     );
     assert_eq!(world.entity_visual_state(7).unwrap().warden_anger, Some(90));
     let mut enderman = Vec::new();
-    let mut carried = vec![1];
-    carried.extend(vi(123));
-    metadata(16, 15, &carried, &mut enderman);
+    metadata(16, 15, &vi(123), &mut enderman);
     enderman.push(0xff);
     world
         .apply_play_event(&PlayEvent::SetEntityData {
@@ -295,7 +293,7 @@ fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
     world
         .apply_play_event(&PlayEvent::BlockEntityData {
             pos,
-            kind: 1,
+            kind: 2,
             nbt_bytes: raw,
         })
         .unwrap();
@@ -329,8 +327,8 @@ fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
     world
         .apply_play_event(&PlayEvent::BlockEntityData {
             pos: ender_pos,
-            kind: 1,
-            nbt_bytes: nbt_compound(vec![nbt_string("id", "minecraft:ender_chest")]),
+            kind: 3,
+            nbt_bytes: nbt_compound(vec![]),
         })
         .unwrap();
     assert_eq!(
@@ -344,26 +342,22 @@ fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
 
     let sign_pos = [5, 70, -3];
     let sign = nbt_compound(vec![
-        nbt_string("id", "minecraft:sign"),
         nbt_named_compound(
             "front_text",
-            vec![nbt_string_list(
-                "messages",
-                &["line one", "line two", "", ""],
-            )],
+            vec![
+                nbt_string_list("messages", &["line one", "line two", "", ""]),
+                [&[1, 0, 16][..], b"has_glowing_text", &[1]].concat(),
+            ],
         ),
         nbt_named_compound(
             "back_text",
             vec![nbt_string_list("messages", &["back", "", "", ""])],
         ),
-        vec![
-            1, 0, 15, 105, 115, 95, 103, 108, 111, 119, 105, 110, 103, 95, 116, 101, 120, 116, 1,
-        ],
     ]);
     world
         .apply_play_event(&PlayEvent::BlockEntityData {
             pos: sign_pos,
-            kind: 2,
+            kind: 7,
             nbt_bytes: sign,
         })
         .unwrap();
@@ -377,65 +371,50 @@ fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
                 String::new()
             ],
             back_lines: ["back".into(), String::new(), String::new(), String::new()],
-            glowing: true,
+            front_glowing: true,
+            back_glowing: false,
         })
     );
 
     let cases = [
         (
             [10, 70, 0],
-            "minecraft:shulker_box",
+            23,
             vec![nbt_int("Color", 4), nbt_int("Peek", 9)],
-            "shulker",
         ),
-        (
-            [11, 70, 0],
-            "minecraft:bell",
-            vec![nbt_int("ticks", 8)],
-            "bell",
-        ),
+        ([11, 70, 0], 30, vec![nbt_int("ticks", 8)]),
         (
             [12, 70, 0],
-            "minecraft:banner",
+            19,
             vec![nbt_int("Base", 5), nbt_empty_list("Patterns")],
-            "banner",
         ),
         (
             [13, 70, 0],
-            "minecraft:beacon",
+            14,
             vec![
                 nbt_int("Levels", 4),
                 nbt_int("Primary", 1),
                 nbt_int("Secondary", 2),
             ],
-            "beacon",
         ),
-        ([14, 70, 0], "minecraft:enchanting_table", vec![], "enchant"),
-        (
-            [15, 70, 0],
-            "minecraft:campfire",
-            vec![nbt_empty_list("Items")],
-            "campfire",
-        ),
+        ([14, 70, 0], 12, vec![]),
+        ([15, 70, 0], 32, vec![nbt_empty_list("Items")]),
         (
             [16, 70, 0],
-            "minecraft:trial_spawner",
+            42,
             vec![nbt_int("ominous", 1), nbt_string("state", "active")],
-            "trial",
         ),
         (
             [17, 70, 0],
-            "minecraft:vault",
+            43,
             vec![nbt_int("ominous", 1), nbt_string("state", "EJECTING")],
-            "vault",
         ),
     ];
-    for (pos, id, mut fields, _) in cases {
-        fields.push(nbt_string("id", id));
+    for (pos, kind, fields) in cases {
         world
             .apply_play_event(&PlayEvent::BlockEntityData {
                 pos,
-                kind: 1,
+                kind,
                 nbt_bytes: nbt_compound(fields),
             })
             .unwrap();
@@ -518,7 +497,7 @@ fn block_entity_visual_state_uses_nbt_and_block_event_updates() {
     piston_world
         .apply_play_event(&PlayEvent::BlockEntityData {
             pos: generic_pos,
-            kind: 1,
+            kind: 0,
             nbt_bytes: nbt_compound(vec![nbt_string("id", "minecraft:unknown")]),
         })
         .unwrap();
@@ -549,7 +528,7 @@ fn visual_level_event_mapping_and_render_snapshot_projection() {
         }
     );
     assert_eq!(
-        visual_level_event(2005, 6),
+        visual_level_event(1505, 6),
         VisualLevelEvent::Bonemeal { count: 6 }
     );
     assert_eq!(visual_level_event(1028, 0), VisualLevelEvent::DragonDeath);
@@ -653,7 +632,8 @@ fn visual_level_event_mapping_and_render_snapshot_projection() {
         snapshot.level_events,
         vec![(
             VisualLevelEvent::BlockDestroy { block_state: 42 },
-            [1, 2, 3]
+            [1, 2, 3],
+            true,
         )]
     );
 }
@@ -690,7 +670,7 @@ fn particle_payloads_decode_all_requested_option_shapes() {
         }
     );
     let mut transition = Vec::new();
-    for value in [0.1, 0.2, 0.3, 0.5, 0.7, 0.8, 0.9] {
+    for value in [0.1, 0.2, 0.3, 0.7, 0.8, 0.9, 0.5] {
         transition.extend_from_slice(&f32be(value));
     }
     assert_eq!(
@@ -771,7 +751,7 @@ fn particle_option_ids_match_protocol_767_particle_registry() {
 fn entity_metadata_decodes_shared_flags_pose_and_entity_values() {
     let mut metadata = vec![0, 0]; // index 0, byte type
     metadata.push(0x19); // on fire, sprinting, glowing
-    metadata.extend([6, 20]); // shared pose index, pose type
+    metadata.extend([6, 21]); // shared pose index, pose type
     metadata.extend(vi(5));
     metadata.extend([7, 8, 1]); // baby boolean at an entity-specific index
     metadata.push(0xff);
@@ -802,7 +782,7 @@ fn packet_decode_and_world_updates_keep_visual_state() {
         })
         .unwrap();
 
-    let mut metadata = vec![0, 0, 0x19, 6, 20];
+    let mut metadata = vec![0, 0, 0x19, 6, 21];
     metadata.extend(vi(5));
     metadata.push(0xff);
     let mut body = vi(42);
@@ -999,4 +979,273 @@ fn boss_effect_weather_time_and_container_updates_are_retained() {
         })
         .unwrap();
     assert!(!world.boss_bars.contains_key(&uuid));
+}
+
+#[test]
+fn all_metadata_serializers_keep_the_following_pose_aligned() {
+    use megu_client::protocol::{parse_entity_metadata, DecodedParticle, EntityMetaValue};
+    use DecodedEntityMetadataValue as Value;
+
+    let uuid = [42; 16];
+    let pos = [-30, 64, 3];
+    let packed_position = pack_position(pos).to_be_bytes();
+    let string = [3, b'a', b'b', b'c'];
+    let component = [8, 0, 1, b'x'];
+    let slot = [1, 6, 0, 0];
+    let empty = DecodedParticle {
+        id: 5,
+        options: DecodedParticleOptions::Empty,
+    };
+    let block = DecodedParticle {
+        id: 1,
+        options: DecodedParticleOptions::BlockState(300),
+    };
+    let vector: Vec<_> = [1.0, 2.0, 3.0, 4.0].into_iter().flat_map(f32be).collect();
+    let fixtures = [
+        (0, vec![0xfb], Value::Byte(-5)),
+        (1, vi(250), Value::VarInt(250)),
+        (
+            2,
+            vec![0x80, 0x80, 0x80, 0x80, 0x80, 1],
+            Value::Raw((1i64 << 35).to_be_bytes().to_vec()),
+        ),
+        (3, f32be(1.5).to_vec(), Value::Float(1.5)),
+        (4, string.to_vec(), Value::String("abc".into())),
+        (5, component.to_vec(), Value::Component(component.to_vec())),
+        (
+            6,
+            [&[1][..], &component].concat(),
+            Value::OptionalComponent(Some(component.to_vec())),
+        ),
+        (7, slot.to_vec(), Value::ItemStack(slot.to_vec())),
+        (8, vec![1], Value::Bool(true)),
+        (9, vector[..12].to_vec(), Value::Rotations([1.0, 2.0, 3.0])),
+        (10, packed_position.to_vec(), Value::Position(pos)),
+        (
+            11,
+            [&[1][..], &packed_position].concat(),
+            Value::OptionalPosition(Some(pos)),
+        ),
+        (12, vec![2], Value::Direction(2)),
+        (
+            13,
+            [&[1][..], &uuid].concat(),
+            Value::OptionalUuid(Some(uuid)),
+        ),
+        (14, vi(300), Value::BlockState(300)),
+        (15, vi(300), Value::OptionalBlockState(Some(300))),
+        (15, vi(0), Value::OptionalBlockState(None)),
+        (16, vec![10, 0], Value::Nbt(vec![10, 0])),
+        (
+            17,
+            [&[1][..], &vi(300)].concat(),
+            Value::Particle(block.clone()),
+        ),
+        (
+            18,
+            [&[2, 5, 1][..], &vi(300)].concat(),
+            Value::Particles(vec![empty, block]),
+        ),
+        (
+            19,
+            vec![1, 2, 3],
+            Value::VillagerData {
+                kind: 1,
+                profession: 2,
+                level: 3,
+            },
+        ),
+        (20, vi(300), Value::OptionalVarInt(Some(299))),
+        (20, vi(0), Value::OptionalVarInt(None)),
+        (21, vi(5), Value::Pose(5)),
+        (22, vi(2), Value::CatVariant(2)),
+        (23, vi(3), Value::WolfVariant(3)),
+        (24, vi(1), Value::FrogVariant(1)),
+        (
+            25,
+            [&[1][..], &string, &packed_position].concat(),
+            Value::OptionalGlobalPosition(Some(("abc".into(), pos))),
+        ),
+        (26, vi(2), Value::PaintingVariant(2)),
+        (27, vi(3), Value::SnifferState(3)),
+        (28, vi(1), Value::ArmadilloState(1)),
+        (29, vector[..12].to_vec(), Value::Vector3([1.0, 2.0, 3.0])),
+        (30, vector.clone(), Value::Quaternion([1.0, 2.0, 3.0, 4.0])),
+    ];
+    for (serializer, wire, expected) in fixtures {
+        let raw = [&[3, serializer][..], &wire, &[6, 21, 5, 0xff]].concat();
+        let entries = decode_entity_metadata(&raw).unwrap();
+        assert_eq!(entries.len(), 2, "serializer {serializer}");
+        assert_eq!(entries[0].value, expected, "serializer {serializer}");
+        assert_eq!(entries[1].value, Value::Pose(5), "serializer {serializer}");
+        assert_eq!(
+            parse_entity_metadata(&raw)[1],
+            (6, 21, EntityMetaValue::VarInt(5))
+        );
+    }
+}
+
+#[test]
+fn potion_and_food_slots_keep_particle_equipment_and_offer_boundaries() {
+    // MobEffectInstance with amplifier 2, duration 200 and a hidden effect.
+    let effect = [1, 2, 200, 1, 0, 1, 1, 1, 1, 10, 0, 1, 0, 0];
+    let potion = [&[1, 6, 1, 0, 31, 1, 4, 0, 1][..], &effect].concat();
+    assert_eq!(
+        decode_particle_options(44, &potion).unwrap(),
+        DecodedParticleOptions::Item {
+            slot_wire: potion.clone()
+        },
+    );
+
+    let food_header = [1, 7, 1, 0, 20, 4];
+    let food_fields = [&f32be(0.5)[..], &[0], &f32be(1.6)].concat();
+    let food = [
+        &food_header[..],
+        &food_fields,
+        &[1], // conversion stack present
+        &potion,
+        &[1], // one possible effect
+        &effect,
+        &f32be(0.75),
+    ]
+    .concat();
+    let food_no_conversion = [
+        &food_header[..],
+        &food_fields,
+        &[0, 1], // no conversion, one effect
+        &effect,
+        &f32be(0.25),
+    ]
+    .concat();
+    let equipment = [
+        &[42, 0x80][..],
+        &potion,
+        &[0x81],
+        &food_no_conversion,
+        &[6],
+        &food,
+    ]
+    .concat();
+    let slots = decode_extended_play_event("set_equipment", &equipment)
+        .unwrap()
+        .unwrap();
+    let PlayEvent::SetEquipment { entries, .. } = &slots else {
+        panic!("expected equipment");
+    };
+    assert_eq!(entries[0].item_wire, potion);
+    assert_eq!(entries[1].item_wire, food_no_conversion);
+    assert_eq!(entries[2].item_wire, food);
+    let mut world = test_world();
+    spawn(&mut world, 42, 1);
+    world.apply_play_event(&slots).unwrap();
+    assert_eq!(world.entity_equipment[&(42, 6)], food);
+
+    let merchant_offer = |result: &[u8]| {
+        [
+            &[8, 3, 0][..], // cost item, count, zero component predicates
+            result,
+            &[0, 0], // no secondary cost, offer enabled
+            &[0; 24],
+        ]
+        .concat()
+    };
+    let merchant = [
+        &[5, 2][..],
+        &merchant_offer(&food),
+        &merchant_offer(&potion),
+        &[4, 20, 1, 0], // level, XP, show progress, can restock
+    ]
+    .concat();
+    let event = decode_extended_play_event("merchant_offers", &merchant)
+        .unwrap()
+        .unwrap();
+    let PlayEvent::MerchantOffers {
+        offers,
+        villager_xp,
+        ..
+    } = event
+    else {
+        panic!("expected offers");
+    };
+    assert_eq!(offers[0].result_slot_wire, food);
+    assert_eq!(offers[1].result_slot_wire, potion);
+    assert_eq!(villager_xp, 20);
+}
+
+#[test]
+fn merchant_windows_retire_offers_and_properties_when_closed_or_replaced() {
+    let mut world = test_world();
+    for id in 1..=100 {
+        world
+            .apply_play_event(&PlayEvent::OpenScreen {
+                window_id: i32::from(id),
+                menu_type: 0,
+                title_nbt: vec![],
+            })
+            .unwrap();
+        assert!(!world.container_properties.contains_key(&(id, 0)));
+        world
+            .apply_play_event(&PlayEvent::ContainerSetData {
+                window_id: id,
+                property: 0,
+                value: 1,
+            })
+            .unwrap();
+        world
+            .apply_play_event(&PlayEvent::MerchantOffers {
+                window_id: i32::from(id),
+                offers: vec![],
+                villager_level: i32::from(id),
+                villager_xp: 1,
+                show_progress: true,
+                can_restock: false,
+            })
+            .unwrap();
+        assert_eq!(world.merchant_panels.len(), 1);
+        assert_eq!(world.merchant_panels[&id].villager_level, i32::from(id));
+        if id % 2 == 0 {
+            world
+                .apply_play_event(&PlayEvent::ContainerClose { window_id: id })
+                .unwrap();
+            assert!(world.merchant_panels.is_empty());
+            assert!(!world.container_properties.contains_key(&(id, 0)));
+        }
+    }
+    world
+        .apply_play_event(&PlayEvent::ContainerSetData {
+            window_id: 1,
+            property: 0,
+            value: 1,
+        })
+        .unwrap();
+    world.reset_dimension(DimensionMeta::default());
+    assert!(world.container_properties.is_empty());
+    assert!(world.merchant_panels.is_empty());
+}
+
+#[test]
+fn modified_utf8_preserves_java_nul_and_supplementary_text() {
+    use megu_client::protocol::{parse_entity_metadata, EntityMetaValue, WireReader};
+
+    let tag = [
+        8, 0, 9, b'A', 0xc0, 0x80, 0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80,
+    ];
+    let metadata = [&[2, 6, 1][..], &tag, &[0xff]].concat();
+    assert_eq!(
+        parse_entity_metadata(&metadata)[0].2,
+        EntityMetaValue::OptionalText(Some("A\0😀".into())),
+    );
+    let mut boss_add = tag.to_vec();
+    boss_add.extend([0; 7]); // progress, style, and flags
+    let DecodedBossBarAction::Add { name_nbt, .. } = decode_boss_bar_action(0, &boss_add).unwrap()
+    else {
+        panic!("expected boss bar add");
+    };
+    assert_eq!(
+        WireReader::new(&name_nbt)
+            .read_nbt()
+            .unwrap()
+            .extract_text(),
+        "A\0😀"
+    );
 }

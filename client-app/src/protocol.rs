@@ -611,7 +611,35 @@ impl<'a> WireReader<'a> {
     fn read_nbt_string(&mut self) -> Result<String, String> {
         let len = usize::from(self.read_u16()?);
         let raw = self.take(len)?;
-        Ok(String::from_utf8_lossy(raw).into_owned())
+        if let Ok(text) = std::str::from_utf8(raw) {
+            return Ok(text.to_owned());
+        }
+
+        // Java's DataInput.readUTF encodes UTF-16 units separately, including
+        // surrogate pairs and the two-byte representation of NUL.
+        fn continuation(byte: u8) -> Result<u16, String> {
+            if byte & 0xc0 != 0x80 {
+                return Err("invalid modified UTF-8 continuation".to_string());
+            }
+            Ok(u16::from(byte & 0x3f))
+        }
+        let mut bytes = WireReader::new(raw);
+        let mut units = Vec::with_capacity(raw.len());
+        while bytes.remaining() != 0 {
+            let lead = bytes.read_u8()?;
+            let unit = match lead {
+                0x00..=0x7f => u16::from(lead),
+                0xc0..=0xdf => (u16::from(lead & 0x1f) << 6) | continuation(bytes.read_u8()?)?,
+                0xe0..=0xef => {
+                    (u16::from(lead & 0x0f) << 12)
+                        | (continuation(bytes.read_u8()?)? << 6)
+                        | continuation(bytes.read_u8()?)?
+                }
+                _ => return Err("invalid modified UTF-8 lead byte".to_string()),
+            };
+            units.push(unit);
+        }
+        Ok(String::from_utf16_lossy(&units))
     }
 
     fn consume_nbt_tag_budget(&mut self) -> Result<(), String> {
@@ -2371,8 +2399,29 @@ pub fn decode_particle_options(
     particle_id: i32,
     payload: &[u8],
 ) -> Result<DecodedParticleOptions, String> {
+    if !(0..=108).contains(&particle_id) {
+        return Ok(if payload.is_empty() {
+            DecodedParticleOptions::Empty
+        } else {
+            DecodedParticleOptions::Unknown(payload.to_vec())
+        });
+    }
     let mut r = WireReader::new(payload);
-    let decoded = match particle_id {
+    let decoded = read_particle_options(&mut r, particle_id)?;
+    if matches!(decoded, DecodedParticleOptions::Empty) && !payload.is_empty() {
+        return Ok(DecodedParticleOptions::Unknown(payload.to_vec()));
+    }
+    if r.remaining() != 0 {
+        return Err("trailing bytes in particle options".to_string());
+    }
+    Ok(decoded)
+}
+
+fn read_particle_options(
+    r: &mut WireReader<'_>,
+    particle_id: i32,
+) -> Result<DecodedParticleOptions, String> {
+    Ok(match particle_id {
         1 | 2 | 28 | 105 => DecodedParticleOptions::BlockState(r.read_varint()?),
         13 => DecodedParticleOptions::Dust {
             red: r.read_f32()?,
@@ -2382,8 +2431,8 @@ pub fn decode_particle_options(
         },
         14 => DecodedParticleOptions::DustColorTransition {
             from: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
-            scale: r.read_f32()?,
             to: [r.read_f32()?, r.read_f32()?, r.read_f32()?],
+            scale: r.read_f32()?,
         },
         20 => DecodedParticleOptions::EntityEffect {
             argb: r.read_i32()?,
@@ -2391,14 +2440,9 @@ pub fn decode_particle_options(
         35 => DecodedParticleOptions::SculkCharge {
             roll: r.read_f32()?,
         },
-        44 => {
-            let end = slot_skip_extent(payload, 0)
-                .ok_or_else(|| "malformed item particle slot".to_string())?;
-            r.take(end)?;
-            DecodedParticleOptions::Item {
-                slot_wire: payload[..end].to_vec(),
-            }
-        }
+        44 => DecodedParticleOptions::Item {
+            slot_wire: read_slot_wire(r)?,
+        },
         45 => {
             let source = match r.read_varint()? {
                 0 => VibrationSource::Block(r.read_position()?),
@@ -2416,13 +2460,21 @@ pub fn decode_particle_options(
         99 => DecodedParticleOptions::Shriek {
             delay: r.read_varint()?,
         },
-        _ if payload.is_empty() => DecodedParticleOptions::Empty,
-        _ => DecodedParticleOptions::Unknown(payload.to_vec()),
-    };
-    if !matches!(decoded, DecodedParticleOptions::Unknown(_)) && r.remaining() != 0 {
-        return Err("trailing bytes in particle options".to_string());
-    }
-    Ok(decoded)
+        0..=108 => DecodedParticleOptions::Empty,
+        _ => return Err(format!("unknown Protocol 767 particle {particle_id}")),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedParticle {
+    pub id: i32,
+    pub options: DecodedParticleOptions,
+}
+
+fn read_particle(r: &mut WireReader<'_>) -> Result<DecodedParticle, String> {
+    let id = r.read_varint()?;
+    let options = read_particle_options(r, id)?;
+    Ok(DecodedParticle { id, options })
 }
 
 /// Protocol 767 entity metadata value. The metadata index is retained
@@ -2446,6 +2498,8 @@ pub enum DecodedEntityMetadataValue {
     BlockState(i32),
     OptionalBlockState(Option<i32>),
     Nbt(Vec<u8>),
+    Particle(DecodedParticle),
+    Particles(Vec<DecodedParticle>),
     VillagerData {
         kind: i32,
         profession: i32,
@@ -2453,6 +2507,15 @@ pub enum DecodedEntityMetadataValue {
     },
     OptionalVarInt(Option<i32>),
     Pose(i32),
+    CatVariant(i32),
+    WolfVariant(i32),
+    FrogVariant(i32),
+    OptionalGlobalPosition(Option<(String, [i32; 3])>),
+    PaintingVariant(i32),
+    SnifferState(i32),
+    ArmadilloState(i32),
+    Vector3([f32; 3]),
+    Quaternion([f32; 4]),
     Raw(Vec<u8>),
 }
 
@@ -2487,7 +2550,7 @@ pub fn visual_level_event(event: i32, data: i32) -> VisualLevelEvent {
             rgb: data,
             instant: true,
         },
-        2005 => VisualLevelEvent::Bonemeal { count: data },
+        1505 => VisualLevelEvent::Bonemeal { count: data },
         1028 => VisualLevelEvent::DragonDeath,
         1023 => VisualLevelEvent::WitherSpawn,
         1038 => VisualLevelEvent::EndPortalOpen,
@@ -2500,76 +2563,101 @@ pub fn visual_level_event(event: i32, data: i32) -> VisualLevelEvent {
 pub fn decode_entity_metadata(raw: &[u8]) -> Result<Vec<DecodedEntityMetadataEntry>, String> {
     let mut r = WireReader::new(raw);
     let mut entries = Vec::new();
-    loop {
-        let index = r.read_u8()?;
-        if index == 0xff {
-            break;
-        }
+    while let Some((index, _, value)) = read_entity_metadata_entry(&mut r)? {
         if entries.len() >= 256 {
             return Err("entity metadata entry count exceeds bound".to_string());
         }
-        let kind = r.read_varint()?;
-        let value = match kind {
-            0 => DecodedEntityMetadataValue::Byte(r.read_i8()?),
-            1 => DecodedEntityMetadataValue::VarInt(r.read_varint()?),
-            2 => DecodedEntityMetadataValue::Raw(r.read_varlong()?.to_be_bytes().to_vec()),
-            3 => DecodedEntityMetadataValue::Float(r.read_f32()?),
-            4 => DecodedEntityMetadataValue::String(r.read_string(32767)?),
-            5 => DecodedEntityMetadataValue::Component(read_nbt_raw(&mut r)?.to_vec()),
-            6 => DecodedEntityMetadataValue::OptionalComponent(if r.read_bool()? {
-                Some(read_nbt_raw(&mut r)?.to_vec())
-            } else {
-                None
-            }),
-            7 => {
-                let start = raw.len() - r.remaining();
-                let end = slot_skip_extent(raw, start)
-                    .ok_or_else(|| "malformed entity metadata item slot".to_string())?;
-                r.take(end - start)?;
-                DecodedEntityMetadataValue::ItemStack(raw[start..end].to_vec())
-            }
-            8 => DecodedEntityMetadataValue::Bool(r.read_bool()?),
-            9 => {
-                DecodedEntityMetadataValue::Rotations([r.read_f32()?, r.read_f32()?, r.read_f32()?])
-            }
-            10 => DecodedEntityMetadataValue::Position(r.read_position()?),
-            11 => DecodedEntityMetadataValue::OptionalPosition(if r.read_bool()? {
-                Some(r.read_position()?)
-            } else {
-                None
-            }),
-            12 => DecodedEntityMetadataValue::Direction(r.read_varint()?),
-            13 => DecodedEntityMetadataValue::OptionalUuid(if r.read_bool()? {
-                Some(r.read_uuid()?)
-            } else {
-                None
-            }),
-            14 => DecodedEntityMetadataValue::BlockState(r.read_varint()?),
-            15 => DecodedEntityMetadataValue::OptionalBlockState(if r.read_bool()? {
-                Some(r.read_varint()?)
-            } else {
-                None
-            }),
-            16 => DecodedEntityMetadataValue::Nbt(read_nbt_raw(&mut r)?.to_vec()),
-            18 => DecodedEntityMetadataValue::VillagerData {
-                kind: r.read_varint()?,
-                profession: r.read_varint()?,
-                level: r.read_varint()?,
-            },
-            19 => DecodedEntityMetadataValue::OptionalVarInt(if r.read_bool()? {
-                Some(r.read_varint()?)
-            } else {
-                None
-            }),
-            20 => DecodedEntityMetadataValue::Pose(r.read_varint()?),
-            kind => return Err(format!("unsupported entity metadata type {kind}")),
-        };
         entries.push(DecodedEntityMetadataEntry { index, value });
     }
     if r.remaining() != 0 {
         return Err("trailing bytes after entity metadata terminator".to_string());
     }
     Ok(entries)
+}
+
+fn read_entity_metadata_entry(
+    r: &mut WireReader<'_>,
+) -> Result<Option<(u8, i32, DecodedEntityMetadataValue)>, String> {
+    use DecodedEntityMetadataValue as Value;
+
+    let index = r.read_u8()?;
+    if index == 0xff {
+        return Ok(None);
+    }
+    let kind = r.read_varint()?;
+    // Registration order in vanilla 1.21.1 EntityDataSerializers.
+    let value = match kind {
+        0 => Value::Byte(r.read_i8()?),
+        1 => Value::VarInt(r.read_varint()?),
+        2 => Value::Raw(r.read_varlong()?.to_be_bytes().to_vec()),
+        3 => Value::Float(r.read_f32()?),
+        4 => Value::String(r.read_string(32767 * 3)?),
+        5 => Value::Component(read_nbt_raw(r)?.to_vec()),
+        6 => Value::OptionalComponent(if r.read_bool()? {
+            Some(read_nbt_raw(r)?.to_vec())
+        } else {
+            None
+        }),
+        7 => Value::ItemStack(read_slot_wire(r)?),
+        8 => Value::Bool(r.read_bool()?),
+        9 => Value::Rotations([r.read_f32()?, r.read_f32()?, r.read_f32()?]),
+        10 => Value::Position(r.read_position()?),
+        11 => Value::OptionalPosition(if r.read_bool()? {
+            Some(r.read_position()?)
+        } else {
+            None
+        }),
+        12 => Value::Direction(r.read_varint()?),
+        13 => Value::OptionalUuid(if r.read_bool()? {
+            Some(r.read_uuid()?)
+        } else {
+            None
+        }),
+        14 => Value::BlockState(r.read_varint()?),
+        15 => {
+            let id = r.read_varint()?;
+            Value::OptionalBlockState((id != 0).then_some(id))
+        }
+        16 => Value::Nbt(read_nbt_raw(r)?.to_vec()),
+        17 => Value::Particle(read_particle(r)?),
+        18 => {
+            let count = usize::try_from(r.read_varint()?)
+                .map_err(|_| "negative entity metadata particle count")?;
+            if count > r.remaining() {
+                return Err("entity metadata particle count exceeds remaining bytes".to_string());
+            }
+            Value::Particles(
+                (0..count)
+                    .map(|_| read_particle(r))
+                    .collect::<Result<_, _>>()?,
+            )
+        }
+        19 => Value::VillagerData {
+            kind: r.read_varint()?,
+            profession: r.read_varint()?,
+            level: r.read_varint()?,
+        },
+        20 => {
+            let encoded = r.read_varint()?;
+            Value::OptionalVarInt((encoded != 0).then_some(encoded.wrapping_sub(1)))
+        }
+        21 => Value::Pose(r.read_varint()?),
+        22 => Value::CatVariant(r.read_varint()?),
+        23 => Value::WolfVariant(r.read_varint()?),
+        24 => Value::FrogVariant(r.read_varint()?),
+        25 => Value::OptionalGlobalPosition(if r.read_bool()? {
+            Some((r.read_string(32767 * 3)?, r.read_position()?))
+        } else {
+            None
+        }),
+        26 => Value::PaintingVariant(r.read_varint()?),
+        27 => Value::SnifferState(r.read_varint()?),
+        28 => Value::ArmadilloState(r.read_varint()?),
+        29 => Value::Vector3([r.read_f32()?, r.read_f32()?, r.read_f32()?]),
+        30 => Value::Quaternion([r.read_f32()?, r.read_f32()?, r.read_f32()?, r.read_f32()?]),
+        _ => return Err(format!("unsupported entity metadata type {kind}")),
+    };
+    Ok(Some((index, kind, value)))
 }
 
 /// Opt-in play receiver result with decoded clientbound custom payloads.
@@ -2911,8 +2999,7 @@ fn slot_attr_modifiers(b: &[u8], p: &mut usize) -> Option<()> {
     Some(())
 }
 
-/// Skip one mob-effect detail record inside `potion_contents` (recursive via
-/// the optional nested-effects flag, depth-capped).
+/// Skip the detail part of a mob-effect instance, including hidden effects.
 fn slot_potion_details(b: &[u8], p: &mut usize, depth: usize) -> Option<()> {
     if depth == 16 {
         return None;
@@ -2928,8 +3015,12 @@ fn slot_potion_details(b: &[u8], p: &mut usize, depth: usize) -> Option<()> {
     Some(())
 }
 
-/// `potion_contents` component (type 31): optional potion id varint, optional
-/// custom-color i32, effect list, optional custom name.
+fn slot_mob_effect(b: &[u8], p: &mut usize) -> Option<()> {
+    slot_varint(b, p)?; // effect registry ID
+    slot_potion_details(b, p, 0)
+}
+
+/// 1.21.1 potion contents: optional potion ID, optional color, and effects.
 fn slot_potion_contents(b: &[u8], p: &mut usize) -> Option<()> {
     if slot_bool(b, p)? {
         slot_varint(b, p)?;
@@ -2937,19 +3028,13 @@ fn slot_potion_contents(b: &[u8], p: &mut usize) -> Option<()> {
     if slot_bool(b, p)? {
         slot_bytes(b, p, 4)?;
     }
-    let n = slot_varint(b, p)?;
-    if !(0..=256).contains(&n) {
-        return None;
+    for _ in 0..slot_count(b, p, 256)? {
+        slot_mob_effect(b, p)?;
     }
-    for _ in 0..n {
-        slot_varint(b, p)?;
-        slot_potion_details(b, p, 0)?;
-    }
-    slot_optional_string(b, p)
+    Some(())
 }
 
-/// Skip one data-component payload of type `ty`. Mirrors the server-side
-/// `slot_read_component` match arm-for-arm; every arm only advances `p`.
+/// Advance over a Protocol 767 data-component payload.
 fn slot_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option<()> {
     match ty {
         0 => slot_nbt(b, p)?,
@@ -2991,9 +3076,11 @@ fn slot_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option<()> 
             slot_bytes(b, p, 4)?; // saturation
             slot_bool(b, p)?; // can always eat
             slot_bytes(b, p, 4)?; // eating seconds
-            slot_stack(b, p, depth + 1)?; // conversion item, possibly empty
+            if slot_bool(b, p)? {
+                slot_stack(b, p, depth + 1)?; // conversion item
+            }
             for _ in 0..slot_count(b, p, 256)? {
-                slot_varint(b, p)?;
+                slot_mob_effect(b, p)?;
                 slot_bytes(b, p, 4)?; // probability
             }
         }
@@ -3195,195 +3282,48 @@ pub enum EntityMetaValue {
     Skipped,
 }
 
-/// Walk one `set_entity_data` entry list (`index u8` / `type VarInt` /
-/// value records terminated by `0xFF`) into scalar
-/// [`EntityMetaValue`] triples. Fail-closed like the rest of the wire
-/// layer: a truncated record or a serializer type with an unbounded
-/// payload (particles) ends the walk and returns the entries decoded so
-/// far — partial metadata still beats a full desync.
+/// Project decoded metadata into the legacy HUD scalar view. A malformed
+/// record ends the walk and leaves previously decoded entries available.
 pub fn parse_entity_metadata(raw: &[u8]) -> Vec<(u8, i32, EntityMetaValue)> {
+    use DecodedEntityMetadataValue as Value;
+
+    fn text(nbt: &[u8]) -> String {
+        WireReader::new(nbt)
+            .read_nbt()
+            .map(|v| v.extract_text())
+            .unwrap_or_default()
+    }
+
     let mut out = Vec::new();
-    let mut p = 0usize;
-    while let Some(&index) = raw.get(p) {
-        if index == 0xFF {
-            break;
-        }
-        p += 1;
-        let Some(ty) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
-            break;
+    let mut r = WireReader::new(raw);
+    while let Ok(Some((index, kind, value))) = read_entity_metadata_entry(&mut r) {
+        let value = match value {
+            Value::Byte(byte) => EntityMetaValue::Byte(byte as u8),
+            Value::VarInt(value)
+            | Value::Direction(value)
+            | Value::BlockState(value)
+            | Value::Pose(value)
+            | Value::CatVariant(value)
+            | Value::WolfVariant(value)
+            | Value::FrogVariant(value)
+            | Value::PaintingVariant(value)
+            | Value::SnifferState(value)
+            | Value::ArmadilloState(value) => EntityMetaValue::VarInt(value),
+            Value::OptionalBlockState(value) => EntityMetaValue::VarInt(value.unwrap_or(0)),
+            Value::OptionalVarInt(value) => {
+                EntityMetaValue::VarInt(value.map_or(0, |id| id.wrapping_add(1)))
+            }
+            Value::Float(value) => EntityMetaValue::Float(value),
+            Value::String(value) => EntityMetaValue::Text(value),
+            Value::Component(value) => EntityMetaValue::Text(text(&value)),
+            Value::OptionalComponent(value) => {
+                EntityMetaValue::OptionalText(value.as_deref().map(text))
+            }
+            Value::ItemStack(value) => EntityMetaValue::Slot(value),
+            Value::Bool(value) => EntityMetaValue::Bool(value),
+            _ => EntityMetaValue::Skipped,
         };
-        let value = match ty {
-            // byte
-            0 => {
-                let Some(&b) = raw.get(p) else { break };
-                p += 1;
-                EntityMetaValue::Byte(b)
-            }
-            // varint
-            1 => {
-                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
-                    break;
-                };
-                EntityMetaValue::VarInt(v)
-            }
-            // varlong
-            2 => {
-                if slot_varint(raw, &mut p).is_none() {
-                    break;
-                }
-                EntityMetaValue::Skipped
-            }
-            // float
-            3 => {
-                let Some(bytes) = raw.get(p..p + 4) else {
-                    break;
-                };
-                p += 4;
-                EntityMetaValue::Float(f32::from_be_bytes(bytes.try_into().unwrap_or_default()))
-            }
-            // string
-            4 => {
-                let Some(len) = slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
-                else {
-                    break;
-                };
-                let Some(bytes) = raw.get(p..p + len) else {
-                    break;
-                };
-                let text = String::from_utf8_lossy(bytes).into_owned();
-                p += len;
-                EntityMetaValue::Text(text)
-            }
-            // text component (NBT)
-            5 => {
-                let start = p;
-                if slot_nbt(raw, &mut p).is_none() {
-                    break;
-                }
-                let text = WireReader::new(&raw[start..p])
-                    .read_nbt()
-                    .map(|v| v.extract_text())
-                    .unwrap_or_default();
-                EntityMetaValue::Text(text)
-            }
-            // optional text component (bool + NBT)
-            6 => {
-                let Some(&present) = raw.get(p) else { break };
-                p += 1;
-                if present == 0 {
-                    EntityMetaValue::OptionalText(None)
-                } else {
-                    let start = p;
-                    if slot_nbt(raw, &mut p).is_none() {
-                        break;
-                    }
-                    let text = WireReader::new(&raw[start..p])
-                        .read_nbt()
-                        .map(|v| v.extract_text())
-                        .unwrap_or_default();
-                    EntityMetaValue::OptionalText(Some(text))
-                }
-            }
-            // item stack (Slot)
-            7 => {
-                let Some(end) = slot_skip_extent(raw, p) else {
-                    break;
-                };
-                let bytes = raw[p..end].to_vec();
-                p = end;
-                EntityMetaValue::Slot(bytes)
-            }
-            // boolean
-            8 => {
-                let Some(&b) = raw.get(p) else { break };
-                p += 1;
-                EntityMetaValue::Bool(b != 0)
-            }
-            // rotations (3 x f32)
-            9 => {
-                if raw.get(p..p + 12).is_none() {
-                    break;
-                }
-                p += 12;
-                EntityMetaValue::Skipped
-            }
-            // block position (packed i64)
-            10 => {
-                if raw.get(p..p + 8).is_none() {
-                    break;
-                }
-                p += 8;
-                EntityMetaValue::Skipped
-            }
-            // optional block position (bool + i64)
-            11 => {
-                let Some(&present) = raw.get(p) else { break };
-                p += 1;
-                if present != 0 {
-                    if raw.get(p..p + 8).is_none() {
-                        break;
-                    }
-                    p += 8;
-                }
-                EntityMetaValue::Skipped
-            }
-            // direction / optional-unsigned-int / pose / variant ids —
-            // all plain VarInts
-            12 | 14 | 15 | 20 | 21 | 22 | 23 | 24 | 26 | 27 | 28 => {
-                let Some(v) = slot_varint(raw, &mut p).and_then(|v| i32::try_from(v).ok()) else {
-                    break;
-                };
-                EntityMetaValue::VarInt(v)
-            }
-            // optional living-entity reference (bool + uuid)
-            13 => {
-                let Some(&present) = raw.get(p) else { break };
-                p += 1;
-                if present != 0 {
-                    if raw.get(p..p + 16).is_none() {
-                        break;
-                    }
-                    p += 16;
-                }
-                EntityMetaValue::Skipped
-            }
-            // compound tag (NBT)
-            16 => {
-                if slot_nbt(raw, &mut p).is_none() {
-                    break;
-                }
-                EntityMetaValue::Skipped
-            }
-            // optional global position (bool + string + i64)
-            25 => {
-                let Some(&present) = raw.get(p) else { break };
-                p += 1;
-                if present != 0 {
-                    let Some(len) = slot_varint(raw, &mut p).and_then(|v| usize::try_from(v).ok())
-                    else {
-                        break;
-                    };
-                    if raw.get(p..p + len + 8).is_none() {
-                        break;
-                    }
-                    p += len + 8;
-                }
-                EntityMetaValue::Skipped
-            }
-            // vector3 (3 x f32) / quaternion (4 x f32)
-            29 | 30 => {
-                let len = if ty == 29 { 12 } else { 16 };
-                if raw.get(p..p + len).is_none() {
-                    break;
-                }
-                p += len;
-                EntityMetaValue::Skipped
-            }
-            // particles (17/18) and anything newer carry payloads that
-            // cannot be bounded generically — keep what was decoded.
-            _ => break,
-        };
-        out.push((index, ty, value));
+        out.push((index, kind, value));
     }
     out
 }
@@ -5044,9 +4984,53 @@ pub fn encode_slot_stack(item_id: i32, count: i32) -> Vec<u8> {
     p
 }
 
+/// Encode the exact added and removed component patch for a Protocol 767
+/// stack. A caller may change the count after decoding without dropping the
+/// component payloads or relying on item defaults for removed components.
+pub fn encode_item_stack_components(stack: &ItemStackComponents) -> Result<Vec<u8>, String> {
+    if stack.count == 0 {
+        return Ok(vec![0]);
+    }
+    if !(1..=127).contains(&stack.count) || stack.item_id < 0 {
+        return Err("invalid item stack count or ID".to_string());
+    }
+    if stack.added.len() > 128 || stack.removed.len() > 128 {
+        return Err("item stack component count exceeds 128".to_string());
+    }
+
+    let mut out = Vec::new();
+    write_varint(&mut out, stack.count);
+    write_varint(&mut out, stack.item_id);
+    write_varint(&mut out, stack.added.len() as i32);
+    write_varint(&mut out, stack.removed.len() as i32);
+    for patch in &stack.added {
+        let id = i64::from(patch.type_id);
+        let mut end = 0;
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&id)
+            || slot_component(&patch.data, &mut end, id, 0).is_none()
+            || end != patch.data.len()
+        {
+            return Err(format!("invalid item stack component payload for ID {id}"));
+        }
+        write_varint(&mut out, patch.type_id);
+        out.extend_from_slice(&patch.data);
+    }
+    for &id in &stack.removed {
+        if !(0..SLOT_COMPONENT_TYPE_COUNT).contains(&i64::from(id)) {
+            return Err(format!("invalid removed item stack component ID {id}"));
+        }
+        write_varint(&mut out, id);
+    }
+    Ok(out)
+}
+
+const MAX_CLICK_CHANGED_SLOTS: usize = 128;
+
 /// `container_click` — inventory/menu click. `changed_slots` pairs a window
 /// slot index (i16) with its raw `Slot` wire bytes (see [`encode_slot_stack`]
 /// for simple stacks); `cursor_item` is the carried-item `Slot` payload.
+/// An oversized prediction is omitted in full so the server can reconcile
+/// the changes. The connection-level sender rejects oversized predictions.
 pub fn encode_container_click(
     window_id: u8,
     state_id: i32,
@@ -5056,6 +5040,11 @@ pub fn encode_container_click(
     changed_slots: &[(i16, &[u8])],
     cursor_item: &[u8],
 ) -> (&'static str, Vec<u8>) {
+    let changed_slots = if changed_slots.len() <= MAX_CLICK_CHANGED_SLOTS {
+        changed_slots
+    } else {
+        &[]
+    };
     let mut p = Vec::with_capacity(64);
     p.push(window_id);
     write_varint(&mut p, state_id);
@@ -5166,10 +5155,24 @@ pub fn encode_resource_pack(uuid: [u8; 16], status: i32) -> (&'static str, Vec<u
     ("resource_pack", p)
 }
 
-/// `edit_book` — writable-book page edits. `slot` is the inventory slot
-/// holding the book (vanilla bounds 0..=40); `pages` are capped at 100
-/// entries of 1024 chars; `title` is present only for signed books.
-pub fn encode_edit_book(slot: i32, pages: &[&str], title: Option<&str>) -> (&'static str, Vec<u8>) {
+/// `edit_book` — writable-book page edits with the Protocol 767 codec limits.
+pub fn encode_edit_book(
+    slot: i32,
+    pages: &[&str],
+    title: Option<&str>,
+) -> Result<(&'static str, Vec<u8>), String> {
+    if pages.len() > 200 {
+        return Err("edit_book exceeds 200 pages".to_string());
+    }
+    if pages
+        .iter()
+        .any(|page| page.encode_utf16().take(8193).count() > 8192)
+    {
+        return Err("edit_book page exceeds 8192 UTF-16 units".to_string());
+    }
+    if title.is_some_and(|text| text.encode_utf16().take(129).count() > 128) {
+        return Err("edit_book title exceeds 128 UTF-16 units".to_string());
+    }
     let mut p = Vec::with_capacity(16 + pages.iter().map(|s| s.len() + 5).sum::<usize>());
     write_varint(&mut p, slot);
     write_varint(&mut p, pages.len() as i32);
@@ -5183,7 +5186,7 @@ pub fn encode_edit_book(slot: i32, pages: &[&str], title: Option<&str>) -> (&'st
         }
         None => p.push(0),
     }
-    ("edit_book", p)
+    Ok(("edit_book", p))
 }
 
 /// `set_command_block` — command-block editor update: packed `BlockPos`,
@@ -5220,7 +5223,8 @@ pub fn encode_set_command_minecart(
 }
 
 /// `set_beacon` — beacon effect selection: primary/secondary mob-effect
-/// registry ids, each `None` for "no effect".
+/// zero-based registry IDs, each `None` for "no effect". Menu property
+/// values use a separate registry-ID-plus-one encoding.
 pub fn encode_set_beacon(primary: Option<i32>, secondary: Option<i32>) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(10);
     for effect in [primary, secondary] {
@@ -5282,16 +5286,16 @@ pub fn encode_rename_item(name: &str) -> (&'static str, Vec<u8>) {
 }
 
 /// `container_slot_state_changed` — crafter-grid slot toggle: slot index,
-/// window id, new disabled state (vanilla only honours slots 0..9).
+/// window id, new enabled state (vanilla only honours slots 0..9).
 pub fn encode_container_slot_state_changed(
     slot_id: i32,
     window_id: i32,
-    state: bool,
+    enabled: bool,
 ) -> (&'static str, Vec<u8>) {
     let mut p = Vec::with_capacity(10);
     write_varint(&mut p, slot_id);
     write_varint(&mut p, window_id);
-    p.push(u8::from(state));
+    p.push(u8::from(enabled));
     ("container_slot_state_changed", p)
 }
 
@@ -5349,6 +5353,10 @@ pub struct ProtocolClient {
     /// packs bound the global palette correctly.
     pub block_state_count: usize,
     pub dimension: DimensionMeta,
+    /// Server-authoritative game mode from the latest spawn or mode change.
+    pub game_mode: Option<u8>,
+    /// Whether Vanilla would display a death screen for this player.
+    pub show_death_screen: bool,
     pub biome_count: usize,
     /// The protocol version this client offered in its handshake
     /// (`V1_21_1`/`767` by default, `V26_3`/`777` via `--mc-version`).
@@ -5420,6 +5428,8 @@ impl ProtocolClient {
             dimension_types_by_name: HashMap::new(),
             block_state_count: megu_kernel::STATE_COUNT as usize,
             dimension: DimensionMeta::default(),
+            game_mode: None,
+            show_death_screen: true,
             biome_count: 64,
             protocol_version,
             packets_rx: 0,
@@ -5845,17 +5855,19 @@ impl ProtocolClient {
     /// Shared `login`/`respawn` tail: dimension + seed + game modes + flags
     /// + death location + portal cooldown (+ `sea_level` from 1.21.2). The
     ///   26.x profile switches the two game modes to VarInt enums.
-    fn parse_spawn_info(&self, r: &mut WireReader<'_>) -> Result<(i32, String), String> {
+    fn parse_spawn_info(&self, r: &mut WireReader<'_>) -> Result<(i32, String, u8), String> {
         let dim_type_id = r.read_varint()?;
         let dim_name = r.read_string(256)?;
         let _hashed_seed = r.read_i64()?;
-        if self.wire_26x() {
-            let _game_mode = r.read_varint()?;
+        let game_mode = if self.wire_26x() {
+            let game_mode = u8::try_from(r.read_varint()?).map_err(|_| "invalid game mode")?;
             let _prev_game_mode = r.read_varint()?; // 0 = undefined, else id+1
+            game_mode
         } else {
-            let _game_mode = r.read_u8()?;
+            let game_mode = r.read_u8()?;
             let _prev_game_mode = r.read_u8()?;
-        }
+            game_mode
+        };
         let _is_debug = r.read_bool()?;
         let _is_flat = r.read_bool()?;
         if r.read_bool()? {
@@ -5866,7 +5878,7 @@ impl ProtocolClient {
         if self.codec.capabilities().relative_movement_flags {
             let _sea_level = r.read_varint()?;
         }
-        Ok((dim_type_id, dim_name))
+        Ok((dim_type_id, dim_name, game_mode))
     }
 
     fn resolve_dimension(&self, dim_type_id: i32, dim_name: String) -> DimensionMeta {
@@ -6182,6 +6194,9 @@ impl ProtocolClient {
         changed: &[(i16, &[u8])],
         carried: &[u8],
     ) -> Result<(), String> {
+        if changed.len() > MAX_CLICK_CHANGED_SLOTS {
+            return Err("container_click exceeds 128 changed slots".to_string());
+        }
         let (name, payload) =
             encode_container_click(window_id, state_id, slot, button, mode, changed, carried);
         self.send_named(PacketPhase::Play, name, &payload)
@@ -6339,7 +6354,7 @@ impl ProtocolClient {
         pages: &[&str],
         title: Option<&str>,
     ) -> Result<(), String> {
-        let (name, payload) = encode_edit_book(slot, pages, title);
+        let (name, payload) = encode_edit_book(slot, pages, title)?;
         self.send_named(PacketPhase::Play, name, &payload)
     }
 
@@ -6425,9 +6440,9 @@ impl ProtocolClient {
         &mut self,
         slot_id: i32,
         window_id: i32,
-        state: bool,
+        enabled: bool,
     ) -> Result<(), String> {
-        let (name, payload) = encode_container_slot_state_changed(slot_id, window_id, state);
+        let (name, payload) = encode_container_slot_state_changed(slot_id, window_id, enabled);
         self.send_named(PacketPhase::Play, name, &payload)
     }
 
@@ -6488,6 +6503,12 @@ impl ProtocolClient {
 
     fn record_play_state(&mut self, event: &PlayEvent) {
         match event {
+            PlayEvent::GameEvent { event: 3, value } if matches!(*value, 0.0 | 1.0 | 2.0 | 3.0) => {
+                self.game_mode = Some(*value as u8);
+            }
+            PlayEvent::GameEvent { event: 11, value } => {
+                self.show_death_screen = *value == 0.0;
+            }
             PlayEvent::SystemChat { text, .. } | PlayEvent::DisguisedChat { text, .. } => {
                 if self.chat_log.len() >= 256 {
                     self.chat_log.pop_front();
@@ -6687,15 +6708,17 @@ impl ProtocolClient {
                 let _view_distance = r.read_varint()?;
                 let _sim_distance = r.read_varint()?;
                 let _reduced_debug = r.read_bool()?;
-                let _respawn_screen = r.read_bool()?;
+                let show_death_screen = r.read_bool()?;
                 let _limited_crafting = r.read_bool()?;
-                let (dim_type_id, dim_name) = self.parse_spawn_info(&mut r)?;
+                let (dim_type_id, dim_name, game_mode) = self.parse_spawn_info(&mut r)?;
                 if self.wire_26x() {
                     let _online_mode = r.read_bool()?;
                 }
                 let _enforces_secure_chat = r.read_bool()?;
                 let dimension = self.resolve_dimension(dim_type_id, dim_name);
                 self.dimension = dimension.clone();
+                self.game_mode = Some(game_mode);
+                self.show_death_screen = show_death_screen;
                 Ok(PlayEvent::JoinGame {
                     entity_id,
                     dimension,
@@ -6704,10 +6727,11 @@ impl ProtocolClient {
             }
             Some("respawn") => {
                 let mut r = WireReader::new(body);
-                let (dim_type_id, dim_name) = self.parse_spawn_info(&mut r)?;
+                let (dim_type_id, dim_name, game_mode) = self.parse_spawn_info(&mut r)?;
                 let _data_kept = r.read_u8()?;
                 let dimension = self.resolve_dimension(dim_type_id, dim_name);
                 self.dimension = dimension.clone();
+                self.game_mode = Some(game_mode);
                 Ok(PlayEvent::Respawn { dimension })
             }
             Some("keep_alive") => {
