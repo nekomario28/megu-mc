@@ -20,6 +20,161 @@ pub const VANILLA_MENU_COUNT: usize = 25;
 pub const SLOT_SIZE: i32 = 18;
 const CONTENT_PAD: i32 = 4;
 const EMPTY_SLOT_INDEX: i16 = -999;
+const PLAYER_INVENTORY_COLS: i16 = 9;
+const PLAYER_INVENTORY_ROWS: i16 = 3;
+const PLAYER_INVENTORY_SIZE: i16 = PLAYER_INVENTORY_COLS * PLAYER_INVENTORY_ROWS;
+const PLAYER_HOTBAR_GAP: i32 = 4;
+const PLAYER_HOTBAR_OFFSET: i32 = PLAYER_INVENTORY_ROWS as i32 * SLOT_SIZE + PLAYER_HOTBAR_GAP;
+
+/// Row-major slot-grid geometry in unscaled GUI pixels.
+///
+/// Every cell uses the vanilla 18 px pitch: index `row * cols + col` lands
+/// at `(x0 + 18 * col, y0 + 18 * row)`. Container schemas, player-inventory
+/// slots, hit testing, and rendering all derive from this one formula.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotGridGeometry {
+    pub x0: i32,
+    pub y0: i32,
+    pub cols: usize,
+}
+
+impl SlotGridGeometry {
+    pub const fn new(x0: i32, y0: i32, cols: usize) -> Self {
+        Self { x0, y0, cols }
+    }
+
+    /// GUI-space origin of the cell at `(col, row)`.
+    pub const fn cell_origin(self, col: usize, row: usize) -> (i32, i32) {
+        (
+            self.x0 + col as i32 * SLOT_SIZE,
+            self.y0 + row as i32 * SLOT_SIZE,
+        )
+    }
+
+    /// GUI-space origin of row-major slot `index`.
+    pub const fn slot_origin(self, index: usize) -> (i32, i32) {
+        let cols = if self.cols == 0 { 1 } else { self.cols };
+        self.cell_origin(index % cols, index / cols)
+    }
+
+    /// GUI-space rectangle of row-major slot `index`.
+    pub const fn slot_rect(self, index: usize) -> UiRect {
+        let (x, y) = self.slot_origin(index);
+        UiRect::new(x, y, SLOT_SIZE as u32, SLOT_SIZE as u32)
+    }
+}
+
+/// One textured chest blit: destination rectangle plus source crop in
+/// pixels of the original (possibly high-DPI) `generic_54` sheet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChestSkinBlit {
+    pub dest: UiRect,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_w: u32,
+    pub source_h: u32,
+}
+
+/// Exact vanilla 1.21.1 `generic_54.png` chest-skin crop geometry.
+///
+/// The sheet is 176×222 logical px. A chest with `rows` container rows uses
+/// the top crop `17 + rows * 18`, then the shared 96 px player-inventory
+/// footer beginning at source y=126. Integral high-DPI sheets scale only the
+/// source crop coordinates; destination GUI geometry remains logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChestSkinGeometry {
+    rows: u32,
+    source_scale: u32,
+}
+
+impl ChestSkinGeometry {
+    pub const SHEET_WIDTH: u32 = 176;
+    pub const SHEET_HEIGHT: u32 = 222;
+    pub const TOP_BASE_HEIGHT: u32 = 17;
+    pub const ROW_HEIGHT: u32 = SLOT_SIZE as u32;
+    pub const FOOTER_SOURCE_Y: u32 = 126;
+    pub const FOOTER_HEIGHT: u32 = 96;
+    pub const PANEL_BASE_HEIGHT: u32 = 114;
+    pub const INVENTORY_ORIGIN_BASE_Y: u32 = 31;
+
+    pub const fn new(rows: u32, source_scale: u32) -> Self {
+        Self { rows, source_scale }
+    }
+
+    /// Validate a sheet and construct geometry for `rows` (`1..=6`). The
+    /// scale must be integral and identical in both dimensions, matching the
+    /// packed vanilla high-DPI texture contract.
+    pub const fn from_sheet(rows: u32, sheet_width: u32, sheet_height: u32) -> Option<Self> {
+        let source_scale = Self::source_scale_for_sheet(sheet_width, sheet_height);
+        if rows >= 1 && rows <= 6 && source_scale > 0 {
+            Some(Self::new(rows, source_scale))
+        } else {
+            None
+        }
+    }
+
+    /// Integral scale of a `generic_54` sheet, or zero when the dimensions
+    /// are not the vanilla aspect ratio at an exact integer multiple.
+    pub const fn source_scale_for_sheet(sheet_width: u32, sheet_height: u32) -> u32 {
+        if sheet_width >= Self::SHEET_WIDTH
+            && sheet_height >= Self::SHEET_HEIGHT
+            && sheet_width.is_multiple_of(Self::SHEET_WIDTH)
+            && sheet_height.is_multiple_of(Self::SHEET_HEIGHT)
+            && sheet_width / Self::SHEET_WIDTH == sheet_height / Self::SHEET_HEIGHT
+        {
+            sheet_width / Self::SHEET_WIDTH
+        } else {
+            0
+        }
+    }
+
+    /// Chest schema panel height in GUI px (`114 + rows * 18`).
+    pub const fn panel_height(rows: u32) -> u32 {
+        Self::PANEL_BASE_HEIGHT + rows * Self::ROW_HEIGHT
+    }
+
+    /// Player-inventory origin Y in a chest schema (`31 + rows * 18`).
+    pub const fn inventory_origin_y(rows: u32) -> i16 {
+        (Self::INVENTORY_ORIGIN_BASE_Y + rows * Self::ROW_HEIGHT) as i16
+    }
+
+    /// Logical-pixel height of the chest-top crop (`17 + rows * 18`).
+    pub const fn top_height(self) -> u32 {
+        Self::TOP_BASE_HEIGHT + self.rows * Self::ROW_HEIGHT
+    }
+
+    /// Logical-pixel height of the shared player-inventory footer crop.
+    pub const fn footer_height(self) -> u32 {
+        Self::FOOTER_HEIGHT
+    }
+
+    /// The exact two destination rectangles and scaled source crops.
+    pub const fn blits(self, panel: UiRect) -> [ChestSkinBlit; 2] {
+        let top_h = self.top_height();
+        let source_w = Self::SHEET_WIDTH * self.source_scale;
+        [
+            ChestSkinBlit {
+                dest: UiRect::new(panel.x, panel.y, panel.w, top_h),
+                source_x: 0,
+                source_y: 0,
+                source_w,
+                source_h: top_h * self.source_scale,
+            },
+            ChestSkinBlit {
+                dest: UiRect::new(
+                    panel.x,
+                    panel.y + top_h as i32,
+                    panel.w,
+                    Self::FOOTER_HEIGHT,
+                ),
+                source_x: 0,
+                source_y: Self::FOOTER_SOURCE_Y * self.source_scale,
+                source_w,
+                source_h: Self::FOOTER_HEIGHT * self.source_scale,
+            },
+        ]
+    }
+}
 
 /// Canonical vanilla GUI texture key for each protocol-767 workstation menu.
 /// Generic chest sizes share `container/generic_54`; the window-0 inventory
@@ -175,17 +330,12 @@ pub struct MenuScreenSchema {
 }
 
 const fn grid<const N: usize, const COLS: usize>(x0: i32, y0: i32) -> [SlotDef; N] {
+    let geometry = SlotGridGeometry::new(x0, y0, COLS);
     let mut out = [SlotDef::EMPTY; N];
     let mut i = 0usize;
     while i < N {
-        let row = i / COLS;
-        let col = i % COLS;
-        out[i] = SlotDef::new(
-            i as i16,
-            x0 + col as i32 * SLOT_SIZE,
-            y0 + row as i32 * SLOT_SIZE,
-            SlotKind::Normal,
-        );
+        let (x, y) = geometry.slot_origin(i);
+        out[i] = SlotDef::new(i as i16, x, y, SlotKind::Normal);
         i += 1;
     }
     out
@@ -361,14 +511,14 @@ const fn chest_schema(
     MenuScreenSchema {
         menu_id,
         name,
-        panel_w: 176.0,
-        panel_h: (114 + rows * 18) as f32,
+        panel_w: ChestSkinGeometry::SHEET_WIDTH as f32,
+        panel_h: ChestSkinGeometry::panel_height(rows as u32) as f32,
         container_slots: slots,
         has_player_inventory: true,
         inventory_start: container as i16,
         slot_count: (container + 36) as i16,
         inventory_origin_x: 8,
-        inventory_origin_y: (31 + rows * 18) as i16,
+        inventory_origin_y: ChestSkinGeometry::inventory_origin_y(rows as u32),
         buttons: NO_BUTTONS,
         property_bars: NO_BARS,
     }
@@ -1364,12 +1514,19 @@ impl ContainerScreenState {
             return None;
         }
         let inv = index - self.schema.inventory_start;
-        let col = inv.rem_euclid(9);
-        let (row, hotbar_offset) = if inv < 27 { (inv / 9, 0) } else { (0, 58) };
-        let x = i32::from(self.schema.inventory_origin_x) + i32::from(col) * SLOT_SIZE;
-        let y =
-            i32::from(self.schema.inventory_origin_y) + i32::from(row) * SLOT_SIZE + hotbar_offset;
-        Some((x, y, SlotKind::Normal))
+        let col = inv.rem_euclid(PLAYER_INVENTORY_COLS);
+        let (row, hotbar_offset) = if inv < PLAYER_INVENTORY_SIZE {
+            (inv / PLAYER_INVENTORY_COLS, 0)
+        } else {
+            (0, PLAYER_HOTBAR_OFFSET)
+        };
+        let grid = SlotGridGeometry::new(
+            i32::from(self.schema.inventory_origin_x),
+            i32::from(self.schema.inventory_origin_y),
+            PLAYER_INVENTORY_COLS as usize,
+        );
+        let (x, y) = grid.cell_origin(col as usize, row as usize);
+        Some((x, y + hotbar_offset, SlotKind::Normal))
     }
 
     pub fn slot_rect(&self, index: i16, panel: UiRect) -> Option<UiRect> {
@@ -1783,39 +1940,21 @@ impl ContainerScreenState {
         );
         if let Some(uv) = panel_uv {
             // Vanilla's chests are not the six-row texture scaled vertically.
-            // `generic_54.png` is a 176×222 sheet at 1×: blit the chest top
-            // crop (`17 + rows * 18` px from the top), then blit the shared
-            // 96 px player-inventory footer from source y=126. Menu ids
-            // 0..=5 encode rows 1..=6. Integral high-DPI sheets use the same
-            // logical crop scaled in source pixels.
-            let texture_scale = if uv.width >= 176
-                && uv.height >= 222
-                && uv.width % 176 == 0
-                && uv.height % 222 == 0
-                && uv.width / 176 == uv.height / 222
-            {
-                uv.width / 176
+            // Menu ids 0..=5 encode rows 1..=6; `ChestSkinGeometry` owns the
+            // exact 176×222 sheet validation, top crop, and shared footer
+            // crop (including integral high-DPI source scaling).
+            let chest_skin = if self.schema.menu_id <= 5 {
+                ChestSkinGeometry::from_sheet(self.schema.menu_id + 1, uv.width, uv.height)
             } else {
-                0
+                None
             };
-            if self.schema.menu_id <= 5 && texture_scale > 0 {
-                let rows = self.schema.menu_id + 1;
-                let top_h = 17 + rows * 18;
-                let footer_h = 96;
-                let source_scale = texture_scale;
-                out.texture_uv(
-                    UiRect::new(panel.x, panel.y, panel.w, top_h),
-                    uv.subrect(0, 0, 176 * source_scale, top_h * source_scale),
-                );
-                out.texture_uv(
-                    UiRect::new(panel.x, panel.y + top_h as i32, panel.w, footer_h),
-                    uv.subrect(
-                        0,
-                        126 * source_scale,
-                        176 * source_scale,
-                        footer_h * source_scale,
-                    ),
-                );
+            if let Some(skin) = chest_skin {
+                for blit in skin.blits(panel) {
+                    out.texture_uv(
+                        blit.dest,
+                        uv.subrect(blit.source_x, blit.source_y, blit.source_w, blit.source_h),
+                    );
+                }
             } else {
                 out.texture_uv(panel, uv);
             }
@@ -3507,5 +3646,92 @@ impl InventorySortState {
             None => self.default_sort_range(screen),
         };
         self.sort_container_range(screen, range);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_grid_geometry_uses_vanilla_row_major_pitch() {
+        let grid = SlotGridGeometry::new(8, 18, 9);
+        assert_eq!(grid.slot_origin(0), (8, 18));
+        assert_eq!(grid.slot_origin(8), (8 + 8 * SLOT_SIZE, 18));
+        assert_eq!(grid.slot_origin(9), (8, 18 + SLOT_SIZE));
+        assert_eq!(
+            grid.slot_rect(10),
+            UiRect::new(
+                8 + SLOT_SIZE,
+                18 + SLOT_SIZE,
+                SLOT_SIZE as u32,
+                SLOT_SIZE as u32,
+            )
+        );
+    }
+
+    #[test]
+    fn player_inventory_slots_share_slot_grid_geometry() {
+        let screen = ContainerScreenState::new(menu_schema(2).unwrap(), 1, 0, "Chest");
+        assert_eq!(
+            screen.slot_origin(27),
+            Some((8, 85, SlotKind::Normal)),
+            "first player-inventory row slot",
+        );
+        assert_eq!(
+            screen.slot_origin(53),
+            Some((8 + 8 * SLOT_SIZE, 85 + 2 * SLOT_SIZE, SlotKind::Normal)),
+            "last slot of the third inventory row",
+        );
+        assert_eq!(
+            screen.slot_origin(54),
+            Some((8, 85 + PLAYER_HOTBAR_OFFSET, SlotKind::Normal)),
+            "first hotbar slot keeps the vanilla four-pixel gap",
+        );
+        assert_eq!(
+            screen.slot_origin(62),
+            Some((
+                8 + 8 * SLOT_SIZE,
+                85 + PLAYER_HOTBAR_OFFSET,
+                SlotKind::Normal
+            )),
+            "last hotbar slot",
+        );
+    }
+
+    #[test]
+    fn chest_skin_geometry_computes_exact_two_blit_crops() {
+        let skin = ChestSkinGeometry::from_sheet(3, 352, 444).expect("integral 2x sheet");
+        assert_eq!(skin.top_height(), 17 + 3 * SLOT_SIZE as u32);
+        assert_eq!(skin.footer_height(), 96);
+
+        let panel = UiRect::new(10, 20, 176, 168);
+        let [top, footer] = skin.blits(panel);
+        assert_eq!(top.dest, UiRect::new(10, 20, 176, 71));
+        assert_eq!(
+            (top.source_x, top.source_y, top.source_w, top.source_h),
+            (0, 0, 352, 142)
+        );
+        assert_eq!(footer.dest, UiRect::new(10, 91, 176, 96));
+        assert_eq!(
+            (
+                footer.source_x,
+                footer.source_y,
+                footer.source_w,
+                footer.source_h
+            ),
+            (0, 252, 352, 192),
+        );
+
+        assert!(ChestSkinGeometry::from_sheet(3, 180, 222).is_none());
+        assert!(ChestSkinGeometry::from_sheet(3, 352, 222).is_none());
+    }
+
+    #[test]
+    fn chest_schema_uses_shared_chest_geometry() {
+        let schema = menu_schema(2).expect("generic 9x3 schema");
+        assert_eq!(schema.panel_w, ChestSkinGeometry::SHEET_WIDTH as f32);
+        assert_eq!(schema.panel_h, 168.0);
+        assert_eq!(schema.inventory_origin_y, 85);
     }
 }
