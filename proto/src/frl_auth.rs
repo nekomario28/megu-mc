@@ -26,9 +26,7 @@
 
 /// FIPS 180-4 SHA-256 over `data` — the canonical `megu_core::crypto`
 /// implementation shared by the whole workspace.
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    megu_core::crypto::sha256(data)
-}
+pub use megu_core::crypto::sha256;
 
 /// RFC 2104 HMAC-SHA256.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {

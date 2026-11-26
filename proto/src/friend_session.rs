@@ -107,22 +107,7 @@ pub fn crc16_ccitt(data: &[u8]) -> u16 {
     crc
 }
 
-/// CRC-32/ISO-HDLC ("IEEE"): reflected poly `0xEDB88320`, init/final XOR
-/// `0xFFFF_FFFF`. Backs the `MGR1` `DataChunk` payload trailer.
-pub fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
-}
+pub use megu_core::hash::crc32_ieee;
 
 // ---------- invite code ----------
 

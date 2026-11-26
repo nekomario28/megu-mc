@@ -57,6 +57,7 @@
 
 use crate::datafix::{DataFixError, DataFixReport, DataFixer, DataValue, DV_1_21_1, DV_26_3};
 use crate::migrate::to_data_json;
+use megu_core::hash::crc32_ieee as crc32;
 use megu_core::nbt_wire::{self, NbtWireError, NbtWireLimits};
 use megu_core::version::TargetVersion;
 use std::collections::BTreeMap;
@@ -364,10 +365,6 @@ fn gzip_member_payload(header: &[u8]) -> Result<&[u8], AnvilInspectError> {
         }
     }
     Ok(rest)
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(data)
 }
 
 // ------------------------------------------------------- NBT -> DataValue
