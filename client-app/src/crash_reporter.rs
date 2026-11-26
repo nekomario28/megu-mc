@@ -525,7 +525,7 @@ impl Json {
 
 const JSON_MAX_DEPTH: usize = 64;
 
-fn parse_json(text: &str) -> Result<Json, String> {
+fn decode_report_json(text: &str) -> Result<Json, String> {
     // The canonical reader enforces `depth >= max_depth`; the historical
     // bound here rejected only `depth > JSON_MAX_DEPTH`, so allow one more
     // level to keep identical acceptance.
@@ -576,7 +576,7 @@ pub struct ReportReceipt {
 /// Parse the JSON ack returned by `report.js` (`{"ok":true,...}`). An
 /// `{"ok":false,"error":"..."}` body surfaces the server-provided reason.
 pub fn parse_report_receipt(body: &str) -> Result<ReportReceipt, String> {
-    let value = parse_json(body)?;
+    let value = decode_report_json(body)?;
     if !matches!(value, Json::Obj(_)) {
         return Err("receipt is not a JSON object".to_string());
     }

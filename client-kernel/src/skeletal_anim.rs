@@ -830,7 +830,7 @@ impl JsonValue {
     }
 }
 
-/// Bounds for [`parse_json`]. The canonical reader counts the root value at
+/// Bounds for [`decode_animation_json`]. The canonical reader counts the root value at
 /// depth 0 and rejects a value *at* `max_depth`; `MAX_JSON_DEPTH + 1`
 /// reproduces the retired parser's `depth > MAX_JSON_DEPTH` boundary
 /// exactly. Node and byte ceilings match the historical 100 000 nodes and
@@ -845,7 +845,7 @@ const JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
 /// because [`JsonLimits`] has no string-length axis.
 const MAX_JSON_STRING_BYTES: usize = 65_536;
 
-fn parse_json(input: &str) -> Result<JsonValue, AnimationError> {
+fn decode_animation_json(input: &str) -> Result<JsonValue, AnimationError> {
     if input.len() > MAX_JSON_BYTES {
         return Err(AnimationError::LimitExceeded);
     }
@@ -927,7 +927,7 @@ fn optional_vector3(
 /// Returns all geometry definitions, preserving file order. Each entry's
 /// string identifier comes from `description.identifier` when present.
 pub fn parse_geometry_rigs_json(input: &str) -> Result<Vec<(String, SkeletonRig)>, AnimationError> {
-    let root = parse_json(input)?;
+    let root = decode_animation_json(input)?;
     let geometries = root
         .field("minecraft:geometry")
         .ok_or(AnimationError::InvalidJson)?
@@ -1101,7 +1101,7 @@ fn parse_loop_mode(value: Option<&JsonValue>) -> Result<LoopMode, AnimationError
 /// `pre` and `post` keyframe values are preserved. Unsupported Molang/string
 /// expressions fail closed instead of silently generating an incorrect pose.
 pub fn parse_animation_json(input: &str) -> Result<Vec<AnimationClip>, AnimationError> {
-    let root = parse_json(input)?;
+    let root = decode_animation_json(input)?;
     let animations = root
         .field("animations")
         .ok_or(AnimationError::InvalidJson)?
@@ -1207,7 +1207,7 @@ fn jem_model_bones(
 /// Parse an OptiFine `.jem` (JSON Entity Model) document into a rig: each
 /// `models[]` entry is a part tree whose `id`/`part` names the bone.
 pub fn parse_jem_model(input: &str) -> Result<SkeletonRig, AnimationError> {
-    let root = parse_json(input)?;
+    let root = decode_animation_json(input)?;
     root.object()?;
     let models = root
         .field("models")
@@ -1227,7 +1227,7 @@ pub fn parse_jem_model(input: &str) -> Result<SkeletonRig, AnimationError> {
 /// Parse an OptiFine `.jpm` (JSON Part Model): a single model tree rooted at
 /// the document object, following the same node shape as `.jem` entries.
 pub fn parse_jpm_model(input: &str) -> Result<SkeletonRig, AnimationError> {
-    let root = parse_json(input)?;
+    let root = decode_animation_json(input)?;
     root.object()?;
     let mut bones = Vec::new();
     let mut index = HashMap::new();

@@ -767,7 +767,7 @@ pub fn build_3d_planet_mesh(body: &PlanetSkyBody) -> ExtrudedMesh {
 // ---------------------------------------------------------------------------
 
 /// Minimal JSON value adapted from the canonical `megu_core::json` tree by
-/// [`parse_json`], kept local so this module's accessors stay unchanged.
+/// [`decode_planet_json`], kept local so this module's accessors stay unchanged.
 #[derive(Clone, Debug, PartialEq)]
 enum JVal {
     Null,
@@ -808,7 +808,7 @@ impl JVal {
     }
 }
 
-/// Bounds for [`parse_json`]: the historical [`MAX_JSON_DEPTH`] cap. The
+/// Bounds for [`decode_planet_json`]: the historical [`MAX_JSON_DEPTH`] cap. The
 /// canonical reader counts the root value at depth 0 and rejects any value
 /// at `max_depth`, which is exactly the retired parser's contract here.
 const JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
@@ -817,7 +817,7 @@ const JSON_LIMITS: megu_core::json::JsonLimits = megu_core::json::JsonLimits {
     max_bytes: usize::MAX,
 };
 
-fn parse_json(text: &str) -> Result<JVal, String> {
+fn decode_planet_json(text: &str) -> Result<JVal, String> {
     let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false)
         .map_err(|e| format!("JSON error at byte {}: {}", e.offset, e.message))?;
     jval_from_json(&value)
@@ -1052,7 +1052,7 @@ fn parse_body(v: &JVal, force_below_horizon: bool) -> Result<PlanetSkyBody, Stri
 /// more than [`MAX_SKY_BODIES`] bodies, a missing `dimension_id`, or a
 /// present-but-wrong-typed field all return `Err` rather than a guess.
 pub fn load_planet_meta_json(json_str: &str) -> Result<PlanetDimensionMeta, String> {
-    let v = parse_json(json_str)?;
+    let v = decode_planet_json(json_str)?;
     let obj = v
         .as_obj()
         .ok_or_else(|| "planet metadata must be a JSON object".to_string())?;

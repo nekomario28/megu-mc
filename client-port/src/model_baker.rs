@@ -192,7 +192,7 @@ impl Json {
     }
 }
 
-/// Bounds for [`parse_json`]. `max_depth` is one past [`MAX_JSON_DEPTH`]:
+/// Bounds for [`decode_model_json`]. `max_depth` is one past [`MAX_JSON_DEPTH`]:
 /// the canonical reader counts the root value at depth 0 and rejects any
 /// value *at* `max_depth`, matching the retired parser's "64 containers,
 /// scalars at depth 64 still parse" contract. Node and byte ceilings stay
@@ -203,7 +203,7 @@ const JSON_LIMITS: JsonLimits = JsonLimits {
     max_bytes: usize::MAX,
 };
 
-fn parse_json(text: &str) -> Result<Json, JsonError> {
+fn decode_model_json(text: &str) -> Result<Json, JsonError> {
     let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false).map_err(|e| {
         JsonError {
             offset: e.offset,
@@ -560,7 +560,7 @@ impl RawModelJson {
     /// *raw*: `parent` chains and `#alias` textures resolve through a
     /// [`ResourcePackModelStack`].
     pub fn parse(text: &str) -> Result<Self, ModelError> {
-        let root = parse_json(text).map_err(ModelError::Json)?;
+        let root = decode_model_json(text).map_err(ModelError::Json)?;
         let obj = root
             .as_object()
             .ok_or_else(|| schema_err("model root must be a JSON object"))?;
@@ -1439,7 +1439,7 @@ pub mod blockstate {
         /// Parses a `blockstates/*.json` document. Reuses the bounded JSON
         /// parser (`MAX_JSON_DEPTH`, finite numbers, no trailing bytes).
         pub fn parse(text: &str) -> Result<Self, ModelError> {
-            let root = parse_json(text).map_err(ModelError::Json)?;
+            let root = decode_model_json(text).map_err(ModelError::Json)?;
             let obj = root
                 .as_object()
                 .ok_or_else(|| schema_err("blockstate root must be a JSON object"))?;

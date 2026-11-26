@@ -7368,14 +7368,14 @@ impl JsonValue {
 }
 
 fn parse_status_json(text: &str) -> Result<JsonValue, String> {
-    parse_json(text, MAX_STATUS_JSON_NODES)
+    decode_json_document(text, MAX_STATUS_JSON_NODES)
 }
 
 /// Crate-shared minimal JSON parser (status ping, asset indexes,
 /// `sounds.json`). `max_nodes` bounds parser work on hostile input; parsing
 /// itself is delegated to the canonical `megu_core::json` reader and lowered
 /// into this module's [`JsonValue`] so callers keep their shape.
-pub(crate) fn parse_json(text: &str, max_nodes: usize) -> Result<JsonValue, String> {
+pub(crate) fn decode_json_document(text: &str, max_nodes: usize) -> Result<JsonValue, String> {
     let limits = megu_core::json::JsonLimits {
         max_depth: MAX_STATUS_JSON_DEPTH,
         max_nodes,
@@ -7385,6 +7385,9 @@ pub(crate) fn parse_json(text: &str, max_nodes: usize) -> Result<JsonValue, Stri
         .map(json_value_from_core)
         .map_err(|e| e.to_string())
 }
+
+// Keep the crate-shared parser API used by sound asset loading.
+pub(crate) use decode_json_document as parse_json;
 
 fn json_value_from_core(value: megu_core::json::JsonValue) -> JsonValue {
     match value {
