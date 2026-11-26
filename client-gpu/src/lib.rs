@@ -19,6 +19,7 @@
 
 pub mod atmosphere;
 pub mod clipboard;
+pub mod entity_appearance;
 pub mod gpu_hiz;
 pub mod live_session;
 pub mod linux_desktop;
