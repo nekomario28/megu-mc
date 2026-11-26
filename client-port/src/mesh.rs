@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
+use crate::dir_basis::DIR_BASIS;
 use crate::model_baker::BakedModelQuad;
 use crate::section::{
     Block, BlockShape, Direction, Light, MissingNeighbor, Sample, SectionView, ALL_FACES, CUTOUT,
@@ -1112,32 +1113,32 @@ pub(crate) fn load_sample_border_plane_into(
     }
 }
 
+const fn pad_strides(direction: usize) -> (isize, isize, isize, isize) {
+    DIR_BASIS[direction].grid_strides_for(PAD_EDGE as isize, PAD_EDGE as isize)
+}
+
+const fn sec_strides(direction: usize) -> (usize, usize, usize, isize) {
+    let (slice, u, v, outward) =
+        DIR_BASIS[direction].grid_strides_for(EDGE as isize, EDGE as isize);
+    (slice as usize, u as usize, v as usize, outward)
+}
+
 const DIR_PAD_STRIDES: [(isize, isize, isize, isize); 6] = [
-    (
-        PAD_SLICE as isize,
-        1,
-        PAD_EDGE as isize,
-        -(PAD_SLICE as isize),
-    ),
-    (PAD_SLICE as isize, PAD_EDGE as isize, 1, PAD_SLICE as isize),
-    (
-        PAD_EDGE as isize,
-        PAD_SLICE as isize,
-        1,
-        -(PAD_EDGE as isize),
-    ),
-    (PAD_EDGE as isize, 1, PAD_SLICE as isize, PAD_EDGE as isize),
-    (1, PAD_EDGE as isize, PAD_SLICE as isize, -1),
-    (1, PAD_SLICE as isize, PAD_EDGE as isize, 1),
+    pad_strides(0),
+    pad_strides(1),
+    pad_strides(2),
+    pad_strides(3),
+    pad_strides(4),
+    pad_strides(5),
 ];
 
 const DIR_SEC_STRIDES: [(usize, usize, usize, isize); 6] = [
-    (FACE_CELLS, 1, EDGE, -(FACE_CELLS as isize)),
-    (FACE_CELLS, EDGE, 1, FACE_CELLS as isize),
-    (EDGE, FACE_CELLS, 1, -(EDGE as isize)),
-    (EDGE, 1, FACE_CELLS, EDGE as isize),
-    (1, EDGE, FACE_CELLS, -1),
-    (1, FACE_CELLS, EDGE, 1),
+    sec_strides(0),
+    sec_strides(1),
+    sec_strides(2),
+    sec_strides(3),
+    sec_strides(4),
+    sec_strides(5),
 ];
 
 /// Packed corner shading for one 8-bit neighbour occupancy mask. The low byte
@@ -2887,6 +2888,44 @@ impl DirectionBuckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direction_strides_match_canonical_offsets() {
+        let canonical_pad: [(isize, isize, isize, isize); 6] = [
+            (PAD_SLICE as isize, 1, PAD_EDGE as isize, -(PAD_SLICE as isize)),
+            (PAD_SLICE as isize, PAD_EDGE as isize, 1, PAD_SLICE as isize),
+            (PAD_EDGE as isize, PAD_SLICE as isize, 1, -(PAD_EDGE as isize)),
+            (PAD_EDGE as isize, 1, PAD_SLICE as isize, PAD_EDGE as isize),
+            (1, PAD_EDGE as isize, PAD_SLICE as isize, -1),
+            (1, PAD_SLICE as isize, PAD_EDGE as isize, 1),
+        ];
+        let canonical_sec: [(usize, usize, usize, isize); 6] = [
+            (FACE_CELLS, 1, EDGE, -(FACE_CELLS as isize)),
+            (FACE_CELLS, EDGE, 1, FACE_CELLS as isize),
+            (EDGE, FACE_CELLS, 1, -(EDGE as isize)),
+            (EDGE, 1, FACE_CELLS, EDGE as isize),
+            (1, EDGE, FACE_CELLS, -1),
+            (1, FACE_CELLS, EDGE, 1),
+        ];
+
+        assert_eq!(DIR_PAD_STRIDES, canonical_pad);
+        assert_eq!(DIR_SEC_STRIDES, canonical_sec);
+        for direction in Direction::ALL {
+            let index = direction as usize;
+            assert_eq!(
+                DIR_PAD_STRIDES[index],
+                DIR_BASIS[index].grid_strides_for(PAD_EDGE as isize, PAD_EDGE as isize),
+                "padded strides for {direction:?}"
+            );
+            let (slice, u, v, outward) =
+                DIR_BASIS[index].grid_strides_for(EDGE as isize, EDGE as isize);
+            assert_eq!(
+                DIR_SEC_STRIDES[index],
+                (slice as usize, u as usize, v as usize, outward),
+                "unpadded strides for {direction:?}"
+            );
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct CornerBase {
