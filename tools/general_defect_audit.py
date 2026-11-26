@@ -83,6 +83,9 @@ UNSAFE_BASELINE_COUNTS = {'client-app/src/audio_out.rs': 25,
  'client-app/src/hardware_profile.rs': 2,
  'client-app/src/world.rs': 4,
  'client-gpu/src/lib.rs': 4,
+ # One documented zero-copy cast from the dependency-free mesh crate's
+ # repr(C) quad record; both size and alignment are asserted at compile time.
+ 'client-gpu/src/planar_quad_pulling.rs': 1,
  'client-port/src/bin/lod_bench.rs': 8,
  'client-port/src/bin/mesh_bench.rs': 2,
  'client-port/src/ffi.rs': 46,
@@ -262,6 +265,11 @@ UNWIRED_MODULE_BASELINE = {
     'core/dye_and_items',
     'core/geom',
     'core/os_desktop',
+    # Alpha6 foundations, exercised by crate tests but not wired into the
+    # live runtime yet. Remove each entry when its consumer lands.
+    'core/block_delta',  # Reversible section edits for rollback/editor modules.
+    'core/wire_envelope',  # Checked framing for future wire/save consumers.
+    'server-files/modules_config',  # Opt-in modules manifest for server startup.
 }
 
 HOME_NAME_CHARS = r"[A-Za-z0-9._-]+"

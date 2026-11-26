@@ -1380,8 +1380,14 @@ fn try_uniform_full_slice(
         let sec_row = sec_origin + v * sec_v;
         let pad_row = pad_origin + v as isize * pad_v;
         for u in 0..EDGE {
-            let b = unsafe { *blocks.get_unchecked(sec_row + u * sec_u) };
-            let l = unsafe { *light.get_unchecked((pad_row + u as isize * pad_u) as usize) };
+            // SAFETY: The axis strides map 0..EDGE to one section plane and
+            // its corresponding interior plane in the padded light volume.
+            let (b, l) = unsafe {
+                (
+                    *blocks.get_unchecked(sec_row + u * sec_u),
+                    *light.get_unchecked((pad_row + u as isize * pad_u) as usize),
+                )
+            };
             let btint = tinted_tint(b);
             if b.state_id != b0.state_id
                 || (b.flags & flags_mask) != f0
