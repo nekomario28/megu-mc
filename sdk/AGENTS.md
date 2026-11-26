@@ -62,7 +62,10 @@ schema = "megu-mod/1"          # required, exact
 id = "ruby_starter"            # required; ^[a-z][a-z0-9_.-]{0,63}$; equals the bundle mod_id
 name = "Ruby Starter"          # required, non-empty
 version = "0.1.0"              # required, SemVer MAJOR.MINOR.PATCH
-mc_version_range = "[1.21.1,)" # required; must equal the bundle mc_version_range
+# mc_version_range is optional for native .mmod projects; when present it must
+# equal the bundle mc_version_range. Compatibility manifests inherit it when set.
+requires = ["block_registry", "recipe"] # optional stable names; never add _vN
+optional_features = ["fluid_bus"]       # optional stable capability names
 authors = ["Example Author"]   # required, non-empty array
 license = "MIT"                # required, non-empty
 description = "..."            # required, non-empty
@@ -72,7 +75,10 @@ file = "megu-mod-bundle.json"  # required, exact
 ```
 
 `megu-mod.toml` is read by `tools/megu_mod_dev.py`; the server itself consumes
-`megu-mod-bundle.json`.
+`megu-mod-bundle.json`. The package range may be omitted for a pure native mod;
+the bundle still requires `mc_version_range` and uses `"*"` for an unconstrained
+native package. Capability declarations live only in the package manifest and
+do not add keys to the strict runtime bundle.
 
 ## 4. `megu-mod-bundle.json` — exact contract
 

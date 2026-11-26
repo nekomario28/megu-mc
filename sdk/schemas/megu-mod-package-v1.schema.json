@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://megu.megumin.tech/schemas/megu-mod-package-v1.schema.json",
+  "title": "megu-mod/1 package manifest",
+  "description": "Authoring contract for megu-mod.toml. Capability names are versionless; the bundle remains governed by megu-mod-bundle-v1.schema.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "mod", "bundle"],
+  "properties": {
+    "schema": { "const": "megu-mod/1" },
+    "mod": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "version", "authors", "license", "description"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,63}$" },
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+        "mc_version_range": { "type": "string", "minLength": 1, "description": "Optional for native .mmod projects; copied into compatibility manifests when supplied." },
+        "requires": { "$ref": "#/$defs/capabilityList" },
+        "optional_features": { "$ref": "#/$defs/capabilityList" },
+        "authors": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "license": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file"],
+      "properties": { "file": { "const": "megu-mod-bundle.json" } }
+    }
+  },
+  "$defs": {
+    "capabilityList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$", "description": "Stable capability name without a _vN suffix." }
+    }
+  }
+}

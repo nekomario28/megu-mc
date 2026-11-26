@@ -1,7 +1,7 @@
 {
   "schema": "megu-mod-bundle/1",
   "mod_id": "ruby_starter",
-  "mc_version_range": "[1.21.1,)",
+  "mc_version_range": "*",
   "portals": [],
   "progression_barriers": [],
   "biome_regions": [],

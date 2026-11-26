@@ -76,6 +76,29 @@ class TempProject(unittest.TestCase):
 
 
 class InitTests(TempProject):
+    def test_versionless_native_manifest_capabilities_validate_and_pack(self):
+        project = self.init("capability_mod", extra=("--requires", "block_registry", "--requires", "recipe",
+                                                      "--optional-feature", "fluid_bus"))
+        manifest = (project / "megu-mod.toml").read_text(encoding="utf-8")
+        self.assertNotIn("mc_version_range =", manifest)
+        self.assertIn('requires = ["block_registry", "recipe"]', manifest)
+        self.assertIn('optional_features = ["fluid_bus"]', manifest)
+        bundle = json.loads((project / "megu-mod-bundle.json").read_text(encoding="utf-8"))
+        self.assertEqual(bundle["mc_version_range"], "*")
+        checked = run("validate", str(project), "--json")
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        packed = run("pack", str(project), "--deterministic", "--out", str(self.temp / "capability.mmod"))
+        self.assertEqual(packed.returncode, 0, packed.stdout + packed.stderr)
+        self.assertTrue((self.temp / "capability.mmod").is_file())
+
+    def test_versioned_capability_suffix_warns_without_invalidating_project(self):
+        project = self.init("legacy_cap_mod", extra=("--requires", "recipe_v1"))
+        result, payload = run_json("validate", str(project), "--json")
+        self.assertEqual(result.returncode, 0)
+        warning = [d for d in payload["diagnostics"] if d["code"] == "manifest.versioned_capability"]
+        self.assertEqual(len(warning), 1)
+        self.assertIn("recipe", warning[0]["message"])
+
     def test_init_scaffolds_all_four_templates(self):
         for template in TEMPLATES:
             with self.subTest(template=template):

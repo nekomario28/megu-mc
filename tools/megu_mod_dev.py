@@ -147,6 +147,7 @@ UNSAFE_EXTENSIONS = frozenset(
 )
 SAFE_MOD_ID = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 SEMVER = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+CAPABILITY = re.compile(r"^[a-z][a-z0-9_]*$")
 NAMESPACE = re.compile(r"^[a-z0-9_.-]+$")
 PATH_CHARS = re.compile(r"^[a-z0-9_./-]+$")
 
@@ -1367,6 +1368,7 @@ def validate_project(root, report=None):
     """Validate a native mod project. Returns a `Report`; `report.ok` is the verdict."""
     report = report or Report()
     root = Path(root)
+    report.root = root
     if not root.is_dir():
         report.error("usage.root_missing", str(root), "project directory does not exist", "pass an existing directory")
         return report
@@ -1488,9 +1490,16 @@ def _validate_manifest(manifest, bundle, report):
     if not isinstance(mod, dict):
         report.error("manifest.field", MANIFEST_FILE, "missing [mod] table", "add [mod] with id, name, version, mc_version_range, authors, license, description")
         return
-    for key in ("id", "name", "version", "mc_version_range", "license", "description"):
+    for key in ("id", "name", "version", "license", "description"):
         if not isinstance(mod.get(key), str) or not mod.get(key, "").strip():
             report.error("manifest.field", f"{MANIFEST_FILE}#/mod/{key}", f"'{key}' must be a non-empty string", f"set mod.{key}")
+    declared_range = mod.get("mc_version_range")
+    java_compat = (Path(report.root) / "fabric.mod.json").exists() or (Path(report.root) / "META-INF/neoforge.mods.toml").exists()
+    if declared_range is None:
+        if java_compat:
+            report.error("manifest.field", f"{MANIFEST_FILE}#/mod/mc_version_range", "'mc_version_range' is required when Java-loader manifests are present", "set mod.mc_version_range for --compat-jar projects")
+    elif not isinstance(declared_range, str) or not declared_range.strip():
+        report.error("manifest.field", f"{MANIFEST_FILE}#/mod/mc_version_range", "'mc_version_range' must be a non-empty string when present", "set a version range or omit it for a native versionless .mmod")
     authors = mod.get("authors")
     if not isinstance(authors, list) or not authors or not all(isinstance(author, str) and author.strip() for author in authors):
         report.error("manifest.field", f"{MANIFEST_FILE}#/mod/authors", "'authors' must be a non-empty array of strings", "list at least one author")
@@ -1510,7 +1519,6 @@ def _validate_manifest(manifest, bundle, report):
     version = mod.get("version")
     if isinstance(version, str) and not SEMVER.match(version):
         report.error("manifest.version", f"{MANIFEST_FILE}#/mod/version", f"version {version!r} is not SemVer", "use MAJOR.MINOR.PATCH, e.g. 0.1.0")
-    declared_range = mod.get("mc_version_range")
     if isinstance(declared_range, str):
         reason = version_range_error(declared_range)
         if reason:
@@ -1523,6 +1531,22 @@ def _validate_manifest(manifest, bundle, report):
                     f"manifest range {declared_range!r} != bundle range {bundle['mc_version_range']!r}",
                     "declare the same mc_version_range in both files",
                 )
+    for key in ("requires", "optional_features"):
+        value = mod.get(key, [])
+        pointer = f"{MANIFEST_FILE}#/mod/{key}"
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            report.error("manifest.capabilities", pointer, f"'{key}' must be an array of non-empty capability names", f'use {key} = ["block_registry", "recipe"]')
+            continue
+        seen_capabilities = set()
+        for index, item in enumerate(value):
+            if item in seen_capabilities:
+                report.error("manifest.capability_duplicate", f"{pointer}/{index}", f"duplicate capability {item!r}", "list each capability once")
+                continue
+            seen_capabilities.add(item)
+            if not CAPABILITY.fullmatch(item):
+                report.error("manifest.capability_name", f"{pointer}/{index}", f"{item!r} is not a clean capability name", "use lowercase names with underscores and no version suffix")
+            elif re.search(r"_v[0-9]+$", item):
+                report.warning("manifest.versioned_capability", f"{pointer}/{index}", f"{item!r} hard-pins a capability revision; prefer the versionless name '{re.sub(r'_v[0-9]+$', '', item)}'", "use a clean capability name; contract revisions are managed by the engine")
     bundle_table = manifest.get("bundle")
     if not isinstance(bundle_table, dict):
         report.error("manifest.field", f"{MANIFEST_FILE}#/bundle", "missing [bundle] table", "add [bundle] with file = \"megu-mod-bundle.json\"")
@@ -1540,6 +1564,7 @@ def _validate_manifest(manifest, bundle, report):
 
 
 def pack_mcmeta(mc_version, name):
+    mc_version = mc_version or "1.21.1"
     return {
         "pack": {
             "pack_format": PACK_FORMATS.get(mc_version, 48),
@@ -1552,7 +1577,7 @@ def bundle_document(mod_id, mc_version, creatures=(), channels=()):
     return {
         "schema": BUNDLE_SCHEMA,
         "mod_id": mod_id,
-        "mc_version_range": f"[{mc_version},)",
+        "mc_version_range": f"[{mc_version},)" if mc_version else "*",
         "portals": [],
         "progression_barriers": [],
         "biome_regions": [],
@@ -1561,14 +1586,16 @@ def bundle_document(mod_id, mc_version, creatures=(), channels=()):
     }
 
 
-def manifest_document(mod_id, name, mc_version, description, license_name="MIT", authors=("Example Author",)):
+def manifest_document(mod_id, name, mc_version, description, license_name="MIT", authors=("Example Author",), requires=(), optional_features=()):
     return {
         "schema": PACKAGE_SCHEMA,
         "mod": {
             "id": mod_id,
             "name": name,
             "version": "0.1.0",
-            "mc_version_range": f"[{mc_version},)",
+            **({"mc_version_range": f"[{mc_version},)"} if mc_version else {}),
+            "requires": list(requires),
+            "optional_features": list(optional_features),
             "authors": list(authors),
             "license": license_name,
             "description": description,
@@ -1588,7 +1615,9 @@ def render_manifest_toml(manifest):
         f"id = {dump_toml_string(mod['id'])}",
         f"name = {dump_toml_string(mod['name'])}",
         f"version = {dump_toml_string(mod['version'])}",
-        f"mc_version_range = {dump_toml_string(mod['mc_version_range'])}",
+        *([f"mc_version_range = {dump_toml_string(mod['mc_version_range'])}"] if "mc_version_range" in mod else []),
+        "requires = [" + ", ".join(dump_toml_string(item) for item in mod.get("requires", [])) + "]",
+        "optional_features = [" + ", ".join(dump_toml_string(item) for item in mod.get("optional_features", [])) + "]",
         "authors = [" + ", ".join(dump_toml_string(author) for author in mod["authors"]) + "]",
         f"license = {dump_toml_string(mod['license'])}",
         f"description = {dump_toml_string(mod['description'])}",
@@ -1602,6 +1631,7 @@ def render_manifest_toml(manifest):
 
 def render_neoforge_toml(manifest):
     mod = manifest["mod"]
+    version_range = mod.get("mc_version_range", "*")
     return "\n".join(
         [
             'modLoader = "javafml"',
@@ -1624,7 +1654,7 @@ def render_neoforge_toml(manifest):
             f"[[dependencies.{mod['id']}]]",
             'modId = "minecraft"',
             'type = "required"',
-            f"versionRange = {dump_toml_string(mod['mc_version_range'])}",
+            f"versionRange = {dump_toml_string(version_range)}",
             'ordering = "NONE"',
             'side = "BOTH"',
             "",
@@ -1634,6 +1664,7 @@ def render_neoforge_toml(manifest):
 
 def render_fabric_manifest(manifest):
     mod = manifest["mod"]
+    version_range = mod.get("mc_version_range", "*")
     document = {
         "schemaVersion": 1,
         "id": mod["id"],
@@ -1643,7 +1674,7 @@ def render_fabric_manifest(manifest):
         "license": mod["license"],
         "environment": "*",
         "depends": {
-            "minecraft": mod["mc_version_range"],
+            "minecraft": version_range,
             "fabricloader": ">=0.16.0",
             "java": ">=21",
         },
@@ -1960,6 +1991,10 @@ def cmd_init(args):
         else:
             print(f"error: {message}", file=sys.stderr)
         return 2
+    for capability in [*args.requires, *args.optional_feature]:
+        if not CAPABILITY.fullmatch(capability):
+            print(f"error: invalid capability name {capability!r}; use lowercase names with underscores", file=sys.stderr)
+            return 2
     template = TEMPLATES[args.template]
     out = Path(args.out).expanduser()
     if out.exists() and any(out.iterdir()):
@@ -1974,10 +2009,11 @@ def cmd_init(args):
             return 2
     name = template["name"]
     description = template["description"]
-    manifest = manifest_document(mod_id, name, args.mc_version, description)
+    mc_version = args.mc_version or ("1.21.1" if args.compat_jar else None)
+    manifest = manifest_document(mod_id, name, mc_version, description, requires=args.requires, optional_features=args.optional_feature)
     creatures = [creature_entry(mod_id)] if template["creatures"] else []
     channels = [channel.format(id=mod_id) for channel in template["channels"]]
-    bundle = bundle_document(mod_id, args.mc_version, creatures, channels)
+    bundle = bundle_document(mod_id, mc_version, creatures, channels)
 
     files = {}
     for relative, template_value in template["files"].items():
@@ -1987,7 +2023,7 @@ def cmd_init(args):
         elif target.endswith("lang/ja_jp.json"):
             value = _lang_ja_entries(mod_id, name, template["blocks"], template["entities"], template["items"])
         elif target == "pack.mcmeta":
-            value = pack_mcmeta(args.mc_version, name)
+            value = pack_mcmeta(mc_version, name)
         elif target.endswith("megu-shader.toml"):
             files[target] = shader_pack_toml(mod_id, name)
             continue
@@ -2035,6 +2071,11 @@ def cmd_init(args):
             + "\n",
             encoding="utf-8",
         )
+    package_schema = Path(__file__).resolve().parents[1] / "sdk" / "schemas" / "megu-mod-package-v1.schema.json"
+    if package_schema.is_file():
+        schema_target = out / "schemas" / package_schema.name
+        schema_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(package_schema, schema_target)
 
     report = validate_project(out)
     if args.json:
@@ -2386,7 +2427,9 @@ def build_parser():
     init.add_argument("mod_id", help="lowercase mod id, e.g. ruby_starter")
     init.add_argument("--out", required=True, help="target project directory")
     init.add_argument("--template", choices=sorted(TEMPLATES), default="starter", help="starter|machine|creature|shader")
-    init.add_argument("--mc-version", default="1.21.1", help="Minecraft target version (default 1.21.1)")
+    init.add_argument("--mc-version", help="optional Minecraft target version; omit for a versionless native .mmod")
+    init.add_argument("--requires", action="append", default=[], help="required clean capability name (repeatable)")
+    init.add_argument("--optional-feature", action="append", default=[], help="optional capability name (repeatable)")
     init.add_argument("--compat-jar", action="store_true", help="also emit NeoForge + Fabric Java manifests")
     init.add_argument("--json", action="store_true", help="machine-readable report")
     init.add_argument("--force", action="store_true", help="write into a non-empty directory")
