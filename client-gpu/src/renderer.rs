@@ -436,6 +436,21 @@ pub fn select_depth_store_op(
     }
 }
 
+/// Composed-world depth-store policy with explicit first-frame consumers.
+/// `graph_depth_consumed` is the compiled render-graph answer once a frame
+/// has run; before that, an active Hi-Z build or world-environment pass is
+/// itself proof that depth must be stored. This keeps TBDR from discarding
+/// the depth tile on the first frame before `world_env_pass` samples it.
+pub fn select_composed_depth_store_op(
+    paradigm: GpuComputeParadigm,
+    graph_depth_consumed: Option<bool>,
+    gpu_hiz_active: bool,
+    world_env_active: bool,
+) -> wgpu::StoreOp {
+    let consumed = graph_depth_consumed.unwrap_or(gpu_hiz_active || world_env_active);
+    select_depth_store_op(paradigm, consumed)
+}
+
 // ---------------------------------------------------------------------------
 // Uniform + vertex layouts (mirror shaders.rs / packed.rs field-for-field)
 // ---------------------------------------------------------------------------
@@ -1709,7 +1724,11 @@ fn face_shade_for_normal(normal: [f32; 3], enabled: bool) -> f32 {
     // lighting approximation used by the rest of this renderer.
     let abs = [normal[0].abs(), normal[1].abs(), normal[2].abs()];
     if abs[1] >= abs[0] && abs[1] >= abs[2] {
-        if normal[1] >= 0.0 { 1.0 } else { 0.5 }
+        if normal[1] >= 0.0 {
+            1.0
+        } else {
+            0.5
+        }
     } else if abs[2] >= abs[0] {
         0.8
     } else {
@@ -4992,12 +5011,7 @@ fn shaped_atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec4<f32> {
     // opaque entity/voxel materials. Shaped terrain needs the alpha lane
     // for vanilla cutout holes, so clone the sampler as vec4 locally and
     // leave every other lighting/fog/f16 instruction untouched.
-    let mut shaped = format!(
-        "{}{}{}",
-        &source[..split],
-        ALPHA_SAMPLE,
-        &source[split..]
-    );
+    let mut shaped = format!("{}{}{}", &source[..split], ALPHA_SAMPLE, &source[split..]);
     shaped = shaped.replace(
         TEXEL,
         "var texel = shaped_atlas_sample(in.atlas_index, in.uv);",
@@ -5026,7 +5040,8 @@ mod shaped_cutout_wgsl_tests {
                 "fragment does not use alpha-aware sampler (f16={shader_f16})"
             );
             assert!(
-                !shaped.contains("var texel = vec4<f32>(atlas_sample(in.atlas_index, in.uv), 1.0);"),
+                !shaped
+                    .contains("var texel = vec4<f32>(atlas_sample(in.atlas_index, in.uv), 1.0);"),
                 "alpha-dropping texel assignment survived (f16={shader_f16})"
             );
             assert!(
@@ -14630,10 +14645,12 @@ impl GpuRenderer {
         // GPU Hi-Z pyramid build. `None` (no composed frame compiled
         // yet) falls back to the presence signal, so the answer is never
         // less conservative than the pre-graph check.
-        let depth_consumed = self
-            .graph_depth_consumed
-            .unwrap_or_else(|| self.gpu_hiz.is_some());
-        select_depth_store_op(self.gpu_paradigm, depth_consumed)
+        select_composed_depth_store_op(
+            self.gpu_paradigm,
+            self.graph_depth_consumed,
+            self.gpu_hiz.is_some(),
+            !self.title_panorama_active,
+        )
     }
 
     /// Report the negotiated [`GpuComputeParadigm`] (host detection at
@@ -15375,7 +15392,11 @@ impl GpuRenderer {
             graph.add_pass("gpu-hiz-depth-build", &[frame_depth], &[], true);
         }
         if !self.title_panorama_active {
-            graph.add_pass("textured-celestial-weather", &[frame_depth], &[], true);
+            // `world_env_pass` samples the world depth attachment for
+            // celestial bodies, precipitation and clouds. Registering it as
+            // a reader is mandatory on TBDR: without this edge the first
+            // frame's depth tile may be discarded before the pass runs.
+            graph.add_pass("world-env-pass", &[frame_depth], &[], true);
         }
         match graph.compile() {
             Ok(compiled) => {

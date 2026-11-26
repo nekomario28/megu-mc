@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! One bounded entry point for the local 1.21.1 asset systems.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::vanilla_atlas_extras::VanillaAtlasExtras;
@@ -15,6 +15,12 @@ use crate::vanilla_world_assets::VanillaWorldAssets;
 use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
 
 const MAX_MODEL_BYTES: u64 = 64 * 1024 * 1024;
+/// Shared source-byte admission budget for every optional resource-pack
+/// layer feeding textures, models, colormaps and GUI atlases. The base
+/// client JAR is not optional and is admitted separately; all user packs
+/// compete for this one aggregate budget in highest-to-lowest priority so
+/// a bulky low-priority layer can never starve an overriding pack.
+pub const MAX_SHARED_ASSET_PACK_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Load local runtime assets from the player's game directory and resource packs.
 pub fn load_runtime_assets(
@@ -74,6 +80,69 @@ pub struct VanillaRuntimeAssetsSummary {
     pub locale: String,
 }
 
+fn path_source_bytes(path: &Path) -> Option<u64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.is_file() {
+        return Some(meta.len());
+    }
+    if !meta.is_dir() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            entries += 1;
+            if entries > 50_000 {
+                return None;
+            }
+            let meta = std::fs::symlink_metadata(entry.path()).ok()?;
+            if meta.is_file() {
+                total = total.checked_add(meta.len())?;
+            } else if meta.is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Admit resource packs under the shared aggregate source-byte budget.
+/// Input order is Vanilla's low-to-high priority order and the returned
+/// vector preserves that order. Admission itself walks highest priority
+/// first; oversized or unreadable packs fail closed and are omitted.
+pub fn admit_resource_packs(resource_packs: &[PathBuf]) -> Vec<PathBuf> {
+    admit_resource_packs_with_notes(resource_packs).0
+}
+
+fn admit_resource_packs_with_notes(resource_packs: &[PathBuf]) -> (Vec<PathBuf>, Vec<String>) {
+    let ordered = prioritized_packs(resource_packs);
+    let mut admitted_high_to_low = Vec::new();
+    let mut notes = Vec::new();
+    let mut remaining = MAX_SHARED_ASSET_PACK_SOURCE_BYTES;
+    for path in ordered.iter().rev() {
+        let Some(bytes) = path_source_bytes(path) else {
+            notes.push(format!(
+                "{} ignored: unreadable or unsafe pack layout",
+                path.display()
+            ));
+            continue;
+        };
+        if bytes > remaining {
+            notes.push(format!(
+                "{} ignored: shared asset admission budget exceeded ({bytes} bytes requested, {remaining} remaining)",
+                path.display()
+            ));
+            continue;
+        }
+        remaining -= bytes;
+        admitted_high_to_low.push(path.clone());
+    }
+    admitted_high_to_low.reverse();
+    (admitted_high_to_low, notes)
+}
+
 impl VanillaRuntimeAssets {
     /// Load local runtime assets. Missing inputs use each subsystem's
     /// deterministic fallback and are recorded in `i18n.notes`.
@@ -84,6 +153,8 @@ impl VanillaRuntimeAssets {
         resource_packs: &[PathBuf],
         locale: &str,
     ) -> Self {
+        let (admitted_packs, pack_notes) = admit_resource_packs_with_notes(resource_packs);
+        let resource_packs = admitted_packs.as_slice();
         let (entity_atlas, particle_atlas) =
             load_visual_atlases_from_paths(jar_path, resource_packs);
 
@@ -124,6 +195,7 @@ impl VanillaRuntimeAssets {
             i18n.notes
                 .push("client JAR unavailable; using asset fallbacks".into());
         }
+        i18n.notes.extend(pack_notes);
         i18n.notes.extend(gui_notes);
         let block_models = load_block_model_catalog(jar_path, resource_packs);
 
@@ -167,28 +239,41 @@ fn load_block_model_catalog(
             && name.ends_with(".json")
             && (name.contains("/blockstates/") || name.contains("/models/"))
     };
+    // `sources` is low-to-high resolution order: the base JAR first, then
+    // packs in Vanilla stacking order. Admission walks it backwards so the
+    // winning high-priority document is decoded and charged first; lower
+    // copies of the same resource id are never opened or charged at all.
+    let mut sources = Vec::new();
+    if let Some(path) = jar_path {
+        sources.push((path, false));
+    }
+    for path in prioritized_packs(resource_packs) {
+        sources.push((path.as_path(), true));
+    }
     let mut layers = Vec::new();
+    layers.resize_with(sources.len(), Vec::new);
+    let mut winners = BTreeSet::new();
     let mut remaining = MAX_MODEL_BYTES;
-    for (path, pack) in jar_path.into_iter().map(|path| (path, false)).chain(
-        prioritized_packs(resource_packs)
-            .iter()
-            .map(|path| (path.as_path(), true)),
-    ) {
-        if let Ok((entries, _)) = AssetLayer::open(path, pack, is_block_model_json)
-            .and_then(|layer| layer.collect(remaining))
-        {
-            let docs: Vec<(String, String)> = entries
-                .into_iter()
-                .filter_map(|entry| {
-                    remaining -= entry.bytes.len() as u64;
-                    String::from_utf8(entry.bytes)
-                        .ok()
-                        .map(|text| (entry.name, text))
-                })
-                .collect();
-            if !docs.is_empty() {
-                layers.push(docs);
+    for layer_index in (0..sources.len()).rev() {
+        let (path, pack) = sources[layer_index];
+        let opened = AssetLayer::open(path, pack, |name| {
+            is_block_model_json(name) && !winners.contains(name)
+        })
+        .and_then(|layer| layer.collect(remaining));
+        if let Ok((entries, _)) = opened {
+            let mut docs = Vec::new();
+            for entry in entries {
+                let byte_len = entry.bytes.len() as u64;
+                if byte_len > remaining {
+                    break;
+                }
+                remaining -= byte_len;
+                winners.insert(entry.name.clone());
+                if let Ok(text) = String::from_utf8(entry.bytes) {
+                    docs.push((entry.name, text));
+                }
             }
+            layers[layer_index] = docs;
         }
     }
     VanillaBlockModelCatalog::new(layers)
@@ -247,11 +332,7 @@ fn append_mob_effect_icons(
         return BTreeMap::new();
     }
     let was_empty = atlas.entries.is_empty() && atlas.named_entries.is_empty();
-    let canvas_width = if was_empty {
-        256
-    } else {
-        atlas.width.max(256)
-    };
+    let canvas_width = if was_empty { 256 } else { atlas.width.max(256) };
     let old_width = atlas.width as usize;
     let old_height = if was_empty { 0 } else { atlas.height as usize };
     let new_width = canvas_width as usize;
