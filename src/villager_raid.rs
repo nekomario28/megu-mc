@@ -552,7 +552,9 @@ fn decode_merchant_offers_pkt(mut data: &[u8]) -> Option<MerchantOffersPacket> {
         data = rest;
         let [uses, max_uses, xp_reward, special_price_diff, multiplier, demand] =
             std::array::from_fn(|i| {
-                i32::from_be_bytes(fields[4 * i..4 * (i + 1)].try_into().unwrap())
+                let mut field = [0; 4];
+                field.copy_from_slice(&fields[4 * i..4 * (i + 1)]);
+                i32::from_be_bytes(field)
             });
         offers.push(MerchantOffer {
             cost_a,
@@ -4420,8 +4422,14 @@ fn live_villager_breeding(live: &[VillagerLocation]) {
             } else { (bf, af, beid, aeid) };
             let (donor_points, recipient_points, shared) = villager_share_food(donor.food_points, recipient.food_points);
             if shared {
-                family.get_mut(&donor_eid).unwrap().food_points = donor_points;
-                family.get_mut(&recipient_eid).unwrap().food_points = recipient_points;
+                let Some(donor_state) = family.get_mut(&donor_eid) else {
+                    continue;
+                };
+                donor_state.food_points = donor_points;
+                let Some(recipient_state) = family.get_mut(&recipient_eid) else {
+                    continue;
+                };
+                recipient_state.food_points = recipient_points;
             }
             let willing = [aeid, beid].into_iter()
                 .all(|eid| villager_willing(family[&eid].food_points));

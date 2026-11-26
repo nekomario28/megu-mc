@@ -1505,8 +1505,10 @@ fn p3b_parse_range(args: &[&str]) -> Result<(i32, i32, usize), String> {
         }
         return Ok((min, max, 1));
     }
-    if args.len() >= 2 && args[0].parse::<i32>().is_ok() && args[1].parse::<i32>().is_ok() {
-        let (min, max) = (args[0].parse().unwrap(), args[1].parse().unwrap());
+    if let (Some(min), Some(max)) = (
+        args.first().and_then(|value| value.parse::<i32>().ok()),
+        args.get(1).and_then(|value| value.parse::<i32>().ok()),
+    ) {
         if min > max {
             return Err("Range bounds are reversed".to_owned());
         }
@@ -1976,7 +1978,7 @@ fn teammsg_command(ctx: &CmdCtx, args: &[&str]) -> String {
     let message = args.join(" ");
     let deliveries = match teams()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|error| error.into_inner())
         .teammsg(&sender, &message)
     {
         Ok(d) => d,
@@ -2268,7 +2270,7 @@ fn ride_dismount(target: &ExecuteEntity) -> String {
     }
     let packet = mounts()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|error| error.into_inner())
         .registry
         .encode_set_passengers(vehicle);
     broadcast_seen(vehicle, |_c| (0x5f, packet.clone()));
@@ -2577,7 +2579,7 @@ fn run_profile_command(level: u8, args: &[&str]) -> String {
         [raw] => match raw.parse::<usize>() {
             Ok(n) => profiler
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|error| error.into_inner())
                 .summary(n.clamp(1, 20))
                 .format_human(),
             Err(_) => "usage: /profile [<top_n>|reset]".into(),
@@ -2786,7 +2788,7 @@ fn data_entity_root(entity: &ExecuteEntity) -> ExecTag {
     }
     let mut entity_tags: Vec<ExecTag> = tags()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|error| error.into_inner())
         .get(&entity.tag_key())
         .into_iter()
         .flatten()
@@ -2891,7 +2893,7 @@ fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String
             let key = (*dim, *x, *y, *z);
             let mut root = data_block_overrides()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|error| error.into_inner())
                 .get(&key)
                 .cloned()
                 .or_else(|| execute_block_data(*dim, *pos));
@@ -2911,7 +2913,7 @@ fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String
                 [entity] => Ok((entity.score_holder(), data_entity_root(entity))),
                 [] => actors()
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|error| error.into_inner())
                     .get(selector.as_str())
                     .map(|actor| (actor.name.clone(), data_actor_root(actor)))
                     .ok_or_else(|| "No entity found".to_owned()),
@@ -2920,7 +2922,7 @@ fn data_read_root(source: &ExecuteSource, target: &DataTarget) -> Result<(String
         }
         DataTarget::Storage(id) => execute_storage()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|error| error.into_inner())
             .get(id)
             .cloned()
             .map(|root| (format!("Storage '{id}'"), root))
@@ -3464,7 +3466,7 @@ fn data_sync_block_items(dim: DimId, (x, y, z): BlockPos, root: &ExecTag) {
                 } else {
                     chests()
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|error| error.into_inner())
                         .insert(ContainerKey::Block(key), slots);
                 }
             }
@@ -3498,7 +3500,7 @@ fn data_write_root(
         DataTarget::Block(dim, pos @ (x, y, z)) => {
             data_block_overrides()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|error| error.into_inner())
                 .insert((*dim, *x, *y, *z), root.clone());
             data_sync_block_items(*dim, *pos, root);
             Ok(())
@@ -3534,7 +3536,7 @@ fn data_write_root(
         DataTarget::Storage(id) => {
             execute_storage()
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|error| error.into_inner())
                 .insert(id.clone(), root.clone());
             Ok(())
         }
@@ -3770,7 +3772,7 @@ fn advancement_query_done(tracker: &AdvancementTracker, player: &str, id: &str) 
         Some(definition) => tracker.criteria_complete(player, definition),
         None => adv_done()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|error| error.into_inner())
             .get(player)
             .is_some_and(|earned| earned.contains(id)),
     }
