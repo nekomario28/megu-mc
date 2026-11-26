@@ -103,6 +103,9 @@
 //!   GPU/inventory arrays, the [`diff_engine::SubtileDiffMask`] 64-bit
 //!   `4³` sub-tile locality mask for `16³` voxel sections, and the
 //!   [`diff_engine::FieldDiffBitset`] zero-alloc 64-field dirty tracker.
+//! * [`wire_envelope`] — bounded big-endian framing with schema and CRC-32 checks.
+//! * [`block_delta`] — checked, reversible section edits, rollback on drop,
+//!   and conservation-checked resource transfers.
 //! * [`crowd_physics`] — zero-dependency 3D micro-cell indexing, bounded
 //!   crowd push/sync/sleep policies, floor-support caching, and per-cell
 //!   render/pose budgets for dense entity groups.
@@ -353,6 +356,7 @@ pub mod bits;
 pub mod bloom;
 pub mod bounded;
 pub mod bvh;
+pub mod block_delta;
 pub mod block_flags_lut;
 pub mod break_progress;
 pub mod coords;
@@ -412,6 +416,7 @@ pub mod timing_wheel;
 pub mod union_find;
 pub mod varint;
 pub mod version;
+pub mod wire_envelope;
 pub mod world_view;
 pub mod xp_curve;
 pub mod zero_change_sim;
