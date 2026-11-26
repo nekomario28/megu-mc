@@ -729,7 +729,7 @@ impl Json {
 /// this is hostile/cyclic input and rejected instead of overflowing.
 const JSON_MAX_DEPTH: usize = 48;
 
-/// Bounds for [`parse_json`], matching the retired parser: nesting deeper
+/// Bounds for [`decode_recipe_json`], matching the retired parser: nesting deeper
 /// than [`JSON_MAX_DEPTH`] levels rejected, no node or byte ceiling of its
 /// own — recipe documents are already small and caller-bounded.
 const JSON_LIMITS: JsonLimits = JsonLimits {
@@ -739,7 +739,7 @@ const JSON_LIMITS: JsonLimits = JsonLimits {
 };
 
 /// Parse `src` into a [`Json`] value; `None` on any malformed input.
-fn parse_json(src: &str) -> Option<Json> {
+fn decode_recipe_json(src: &str) -> Option<Json> {
     let value = parse_json_with_limits(src, JSON_LIMITS, false).ok()?;
     Some(json_value_to_json(&value))
 }
@@ -1215,7 +1215,7 @@ impl RecipeIndex {
     /// used for the nested `sequence` steps of sequenced assembly so they
     /// never land in the index themselves.
     fn parse_recipe_json(&self, recipe_id: &str, json_str: &str) -> Option<Recipe> {
-        let root = parse_json(json_str)?;
+        let root = decode_recipe_json(json_str)?;
         let obj = root.as_object()?;
         let ty = obj.get("type").and_then(Json::as_str)?;
         let category = self.category_for_type(ty)?;
