@@ -5422,209 +5422,62 @@ fn damage_attacker_name(eid: &str, cls_snap: &[Arc<Client>]) -> Option<String> {
 /// `death.fell.*` keys (`{v}` victim, `{a}` attacker, `{w}` item). Vanilla has
 /// no solo translation for attacker-sourced types; those get a neutral
 /// article-free line so `/damage` without `by`/`from` still reads cleanly.
+const VANILLA_DEATH_PATTERNS: &[(&str, [&str; 3])] = &[
+    ("arrow", ["{v} was shot", "{v} was shot by {a}", "{v} was shot by {a} using {w}"]),
+    ("bad_respawn_point", ["{v} was killed by [Intentional Game Design]", "{v} was killed by [Intentional Game Design]", "{v} was killed by [Intentional Game Design]"]),
+    ("cactus", ["{v} was pricked to death", "{v} walked into a cactus while trying to escape {a}", "{v} walked into a cactus while trying to escape {a}"]),
+    ("campfire", ["{v} went up in flames", "{v} walked into fire while fighting {a}", "{v} walked into fire while fighting {a}"]),
+    ("in_fire", ["{v} went up in flames", "{v} walked into fire while fighting {a}", "{v} walked into fire while fighting {a}"]),
+    ("cramming", ["{v} was squished too much", "{v} was squashed by {a}", "{v} was squashed by {a}"]),
+    ("dragon_breath", ["{v} was roasted in dragon's breath", "{v} was roasted in dragon's breath by {a}", "{v} was roasted in dragon's breath by {a}"]),
+    ("drown", ["{v} drowned", "{v} drowned while trying to escape {a}", "{v} drowned while trying to escape {a}"]),
+    ("dry_out", ["{v} died from dehydration", "{v} died from dehydration while trying to escape {a}", "{v} died from dehydration while trying to escape {a}"]),
+    ("ender_pearl", ["{v} fell from a high place", "{v} was doomed to fall by {a}", "{v} was doomed to fall by {a} using {w}"]),
+    ("fall", ["{v} fell from a high place", "{v} was doomed to fall by {a}", "{v} was doomed to fall by {a} using {w}"]),
+    ("explosion", ["{v} blew up", "{v} was blown up by {a}", "{v} was blown up by {a} using {w}"]),
+    ("player_explosion", ["{v} blew up", "{v} was blown up by {a}", "{v} was blown up by {a} using {w}"]),
+    ("falling_anvil", ["{v} was squashed by a falling anvil", "{v} was squashed by a falling anvil while fighting {a}", "{v} was squashed by a falling anvil while fighting {a}"]),
+    ("falling_block", ["{v} was squashed by a falling block", "{v} was squashed by a falling block while fighting {a}", "{v} was squashed by a falling block while fighting {a}"]),
+    ("falling_stalactite", ["{v} was skewered by a falling stalactite", "{v} was skewered by a falling stalactite while fighting {a}", "{v} was skewered by a falling stalactite while fighting {a}"]),
+    ("fireball", ["{v} was fireballed", "{v} was fireballed by {a}", "{v} was fireballed by {a} using {w}"]),
+    ("fireworks", ["{v} went off with a bang", "{v} went off with a bang while fighting {a}", "{v} went off with a bang due to a firework fired from {w} by {a}"]),
+    ("fly_into_wall", ["{v} experienced kinetic energy", "{v} experienced kinetic energy while trying to escape {a}", "{v} experienced kinetic energy while trying to escape {a}"]),
+    ("freeze", ["{v} froze to death", "{v} was frozen to death by {a}", "{v} was frozen to death by {a}"]),
+    ("generic", ["{v} died", "{v} died because of {a}", "{v} died because of {a}"]),
+    ("generic_kill", ["{v} was killed", "{v} was killed while fighting {a}", "{v} was killed while fighting {a}"]),
+    ("hot_floor", ["{v} discovered the floor was lava", "{v} walked into the danger zone due to {a}", "{v} walked into the danger zone due to {a}"]),
+    ("in_wall", ["{v} suffocated in a wall", "{v} suffocated in a wall while fighting {a}", "{v} suffocated in a wall while fighting {a}"]),
+    ("indirect_magic", ["{v} was killed by magic", "{v} was killed by {a} using magic", "{v} was killed by {a} using {w}"]),
+    ("lava", ["{v} tried to swim in lava", "{v} tried to swim in lava to escape {a}", "{v} tried to swim in lava to escape {a}"]),
+    ("lightning_bolt", ["{v} was struck by lightning", "{v} was struck by lightning while fighting {a}", "{v} was struck by lightning while fighting {a}"]),
+    ("magic", ["{v} was killed by magic", "{v} was killed by magic while trying to escape {a}", "{v} was killed by magic while trying to escape {a}"]),
+    ("mob_attack", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+    ("mob_attack_no_aggro", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+    ("mob_projectile", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+    ("on_fire", ["{v} burned to death", "{v} was burned to a crisp while fighting {a}", "{v} was burned to a crisp while fighting {a} wielding {w}"]),
+    ("unattributed_fireball", ["{v} burned to death", "{v} was burned to a crisp while fighting {a}", "{v} was burned to a crisp while fighting {a} wielding {w}"]),
+    ("player_attack", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+    ("out_of_world", ["{v} fell out of the world", "{v} didn't want to live in the same world as {a}", "{v} didn't want to live in the same world as {a}"]),
+    ("outside_border", ["{v} left the confines of this world", "{v} left the confines of this world while fighting {a}", "{v} left the confines of this world while fighting {a}"]),
+    ("sonic_boom", ["{v} was obliterated by a sonically-charged shriek", "{v} was obliterated by a sonically-charged shriek while trying to escape {a}", "{v} was obliterated by a sonically-charged shriek while trying to escape {a} wielding {w}"]),
+    ("spit", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+    ("stalagmite", ["{v} was impaled on a stalagmite", "{v} was impaled on a stalagmite while fighting {a}", "{v} was impaled on a stalagmite while fighting {a}"]),
+    ("starve", ["{v} starved to death", "{v} starved to death while fighting {a}", "{v} starved to death while fighting {a}"]),
+    ("sting", ["{v} was stung to death", "{v} was stung to death by {a}", "{v} was stung to death by {a} using {w}"]),
+    ("sweet_berry_bush", ["{v} was poked to death by a sweet berry bush", "{v} was poked to death by a sweet berry bush while trying to escape {a}", "{v} was poked to death by a sweet berry bush while trying to escape {a}"]),
+    ("thorns", ["{v} was killed", "{v} was killed while trying to hurt {a}", "{v} was killed by {w} while trying to hurt {a}"]),
+    ("thrown", ["{v} was pummeled", "{v} was pummeled by {a}", "{v} was pummeled by {a} using {w}"]),
+    ("trident", ["{v} was impaled", "{v} was impaled by {a}", "{v} was impaled by {a} with {w}"]),
+    ("wither", ["{v} withered away", "{v} withered away while fighting {a}", "{v} withered away while fighting {a}"]),
+    ("wither_skull", ["{v} was shot by a skull", "{v} was shot by a skull from {a}", "{v} was shot by a skull from {a} using {w}"]),
+    ("wind_charge", ["{v} was slain", "{v} was slain by {a}", "{v} was slain by {a} using {w}"]),
+];
+
 fn vanilla_death_patterns(ty: &str) -> [&'static str; 3] {
-    match ty {
-        "arrow" => [
-            "{v} was shot",
-            "{v} was shot by {a}",
-            "{v} was shot by {a} using {w}",
-        ],
-        "bad_respawn_point" => ["{v} was killed by [Intentional Game Design]"; 3],
-        "cactus" => [
-            "{v} was pricked to death",
-            "{v} walked into a cactus while trying to escape {a}",
-            "{v} walked into a cactus while trying to escape {a}",
-        ],
-        // `campfire` shares the `inFire` message_id.
-        "campfire" | "in_fire" => [
-            "{v} went up in flames",
-            "{v} walked into fire while fighting {a}",
-            "{v} walked into fire while fighting {a}",
-        ],
-        "cramming" => [
-            "{v} was squished too much",
-            "{v} was squashed by {a}",
-            "{v} was squashed by {a}",
-        ],
-        "dragon_breath" => [
-            "{v} was roasted in dragon's breath",
-            "{v} was roasted in dragon's breath by {a}",
-            "{v} was roasted in dragon's breath by {a}",
-        ],
-        "drown" => [
-            "{v} drowned",
-            "{v} drowned while trying to escape {a}",
-            "{v} drowned while trying to escape {a}",
-        ],
-        "dry_out" => [
-            "{v} died from dehydration",
-            "{v} died from dehydration while trying to escape {a}",
-            "{v} died from dehydration while trying to escape {a}",
-        ],
-        // `fall` and `ender_pearl` carry `death_message_type: fall_variants`.
-        "ender_pearl" | "fall" => [
-            "{v} fell from a high place",
-            "{v} was doomed to fall by {a}",
-            "{v} was doomed to fall by {a} using {w}",
-        ],
-        // `player_explosion` uses the `explosion.player` message_id.
-        "explosion" | "player_explosion" => [
-            "{v} blew up",
-            "{v} was blown up by {a}",
-            "{v} was blown up by {a} using {w}",
-        ],
-        // `falling_anvil` uses the `anvil` message_id.
-        "falling_anvil" => [
-            "{v} was squashed by a falling anvil",
-            "{v} was squashed by a falling anvil while fighting {a}",
-            "{v} was squashed by a falling anvil while fighting {a}",
-        ],
-        "falling_block" => [
-            "{v} was squashed by a falling block",
-            "{v} was squashed by a falling block while fighting {a}",
-            "{v} was squashed by a falling block while fighting {a}",
-        ],
-        "falling_stalactite" => [
-            "{v} was skewered by a falling stalactite",
-            "{v} was skewered by a falling stalactite while fighting {a}",
-            "{v} was skewered by a falling stalactite while fighting {a}",
-        ],
-        "fireball" => [
-            "{v} was fireballed",
-            "{v} was fireballed by {a}",
-            "{v} was fireballed by {a} using {w}",
-        ],
-        "fireworks" => [
-            "{v} went off with a bang",
-            "{v} went off with a bang while fighting {a}",
-            "{v} went off with a bang due to a firework fired from {w} by {a}",
-        ],
-        "fly_into_wall" => [
-            "{v} experienced kinetic energy",
-            "{v} experienced kinetic energy while trying to escape {a}",
-            "{v} experienced kinetic energy while trying to escape {a}",
-        ],
-        "freeze" => [
-            "{v} froze to death",
-            "{v} was frozen to death by {a}",
-            "{v} was frozen to death by {a}",
-        ],
-        "generic" => [
-            "{v} died",
-            "{v} died because of {a}",
-            "{v} died because of {a}",
-        ],
-        "generic_kill" => [
-            "{v} was killed",
-            "{v} was killed while fighting {a}",
-            "{v} was killed while fighting {a}",
-        ],
-        "hot_floor" => [
-            "{v} discovered the floor was lava",
-            "{v} walked into the danger zone due to {a}",
-            "{v} walked into the danger zone due to {a}",
-        ],
-        "in_wall" => [
-            "{v} suffocated in a wall",
-            "{v} suffocated in a wall while fighting {a}",
-            "{v} suffocated in a wall while fighting {a}",
-        ],
-        "indirect_magic" => [
-            "{v} was killed by magic",
-            "{v} was killed by {a} using magic",
-            "{v} was killed by {a} using {w}",
-        ],
-        "lava" => [
-            "{v} tried to swim in lava",
-            "{v} tried to swim in lava to escape {a}",
-            "{v} tried to swim in lava to escape {a}",
-        ],
-        "lightning_bolt" => [
-            "{v} was struck by lightning",
-            "{v} was struck by lightning while fighting {a}",
-            "{v} was struck by lightning while fighting {a}",
-        ],
-        "magic" => [
-            "{v} was killed by magic",
-            "{v} was killed by magic while trying to escape {a}",
-            "{v} was killed by magic while trying to escape {a}",
-        ],
-        // `mob`, the message_id of mob/melee-attack, projectile, spit and
-        // wind-charge sources, and `player` share the slain-by line.
-        "mob_attack" | "mob_attack_no_aggro" | "mob_projectile" | "spit"
-        | "wind_charge" | "player_attack" => [
-            "{v} was slain",
-            "{v} was slain by {a}",
-            "{v} was slain by {a} using {w}",
-        ],
-        // `unattributed_fireball` shares the `onFire` message_id.
-        "on_fire" | "unattributed_fireball" => [
-            "{v} burned to death",
-            "{v} was burned to a crisp while fighting {a}",
-            "{v} was burned to a crisp while fighting {a} wielding {w}",
-        ],
-        "out_of_world" => [
-            "{v} fell out of the world",
-            "{v} didn't want to live in the same world as {a}",
-            "{v} didn't want to live in the same world as {a}",
-        ],
-        "outside_border" => [
-            "{v} left the confines of this world",
-            "{v} left the confines of this world while fighting {a}",
-            "{v} left the confines of this world while fighting {a}",
-        ],
-        "sonic_boom" => [
-            "{v} was obliterated by a sonically-charged shriek",
-            "{v} was obliterated by a sonically-charged shriek while trying to escape {a}",
-            "{v} was obliterated by a sonically-charged shriek while trying to escape {a} wielding {w}",
-        ],
-        "stalagmite" => [
-            "{v} was impaled on a stalagmite",
-            "{v} was impaled on a stalagmite while fighting {a}",
-            "{v} was impaled on a stalagmite while fighting {a}",
-        ],
-        "starve" => [
-            "{v} starved to death",
-            "{v} starved to death while fighting {a}",
-            "{v} starved to death while fighting {a}",
-        ],
-        "sting" => [
-            "{v} was stung to death",
-            "{v} was stung to death by {a}",
-            "{v} was stung to death by {a} using {w}",
-        ],
-        "sweet_berry_bush" => [
-            "{v} was poked to death by a sweet berry bush",
-            "{v} was poked to death by a sweet berry bush while trying to escape {a}",
-            "{v} was poked to death by a sweet berry bush while trying to escape {a}",
-        ],
-        "thorns" => [
-            "{v} was killed",
-            "{v} was killed while trying to hurt {a}",
-            "{v} was killed by {w} while trying to hurt {a}",
-        ],
-        "thrown" => [
-            "{v} was pummeled",
-            "{v} was pummeled by {a}",
-            "{v} was pummeled by {a} using {w}",
-        ],
-        "trident" => [
-            "{v} was impaled",
-            "{v} was impaled by {a}",
-            "{v} was impaled by {a} with {w}",
-        ],
-        "wither" => [
-            "{v} withered away",
-            "{v} withered away while fighting {a}",
-            "{v} withered away while fighting {a}",
-        ],
-        "wither_skull" => [
-            "{v} was shot by a skull",
-            "{v} was shot by a skull from {a}",
-            "{v} was shot by a skull from {a} using {w}",
-        ],
-        _ => vanilla_death_patterns("generic"),
-    }
+    VANILLA_DEATH_PATTERNS
+        .iter()
+        .find(|(name, _)| *name == ty)
+        .map_or_else(|| vanilla_death_patterns("generic"), |(_, patterns)| *patterns)
 }
 
 /// Vanilla 1.21.1 English death message for a registry `damage_type`
