@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -255,6 +256,70 @@ with socket.socket() as listener:
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
 
+    @unittest.skipIf(os.name == "nt", "uses executable shell stubs")
+    def test_prism_discovers_standard_unix_client_before_path(self):
+        root = self.root / "prism-binary-discovery"
+        home = root / "home"
+        game = root / "instance/.minecraft"
+        bindir = root / "path"
+        env = {"MEGU_CLIENT_BIN": "", "MEGU_CLIENT_SHA256": "", "PATH": str(bindir)}
+        java = [shutil.which("java"), "-Djava.io.tmpdir=" + tempfile.gettempdir(),
+                "-XX:-UsePerfData", "-Dos.name=Linux", f"-Duser.home={home}"]
+        command = ["-jar", str(self.jar_dir / "megu-bootstrapper.jar"),
+                   "--gameDir", str(game)]
+        candidates = [game / "bin", home / ".minecraft/bin", home / ".local/share/megu/bin",
+                      home / ".local/bin", bindir]
+        for index, directory in enumerate(candidates):
+            directory.mkdir(parents=True)
+            binary = directory / "megu-client"
+            binary.write_text(f"#!/bin/sh\nexit {10 + index}\n")
+            binary.chmod(0o755)
+
+        self.assertEqual(self.invocation(*java, *command, extra_env=env)[0].returncode, 10)
+        (candidates[0] / "megu-client").unlink()
+        absent = str(root / "absent")
+        for jvm, flags, overrides in (
+                ([], ["--client-bin", absent], {}),
+                ([], [], {"MEGU_CLIENT_BIN": absent}),
+                ([f"-Dmegu.clientBin={absent}"], [], {})):
+            with self.subTest(jvm=jvm, flags=flags, overrides=overrides):
+                result, _ = self.invocation(*java, *jvm, *command, *flags,
+                                            extra_env={**env, **overrides})
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("not found", result.stderr)
+        result, _ = self.invocation(*java, *command, "--client-sha256", "0" * 64, extra_env=env)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+
+        for index, directory in enumerate(candidates[1:], start=11):
+            with self.subTest(directory=directory):
+                result, _ = self.invocation(*java, *command, extra_env=env)
+                self.assertEqual(result.returncode, index, result.stderr)
+                # Standard-directory discovery should skip non-executable files.
+                (directory / "megu-client").chmod(0o644)
+
+    @unittest.skipIf(os.name == "nt", "uses a simulated Windows OS and POSIX file modes")
+    def test_prism_discovers_windows_localappdata_client(self):
+        root = self.root / "prism-windows-discovery"
+        appdata = root / "appdata"
+        env = {"MEGU_CLIENT_BIN": "", "PATH": str(root / "empty-path"),
+               "APPDATA": str(root / "roaming"), "LOCALAPPDATA": str(appdata)}
+        for directory in ("bin", "current"):
+            with self.subTest(directory=directory):
+                installed = appdata / "Megu" / directory / "megu-client-gpu.exe"
+                installed.parent.mkdir(parents=True)
+                installed.write_bytes(b"Windows executable stub")
+                installed.chmod(0o755)
+                # Stop at SHA-256 verification: a Windows binary cannot run on this host.
+                result, _ = self.invocation(
+                    shutil.which("java"), "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+                    "-Dos.name=Windows 11", f"-Duser.home={root / 'home'}",
+                    "-jar", str(self.jar_dir / "megu-bootstrapper.jar"), "--gameDir", str(root / "game"),
+                    "--client-sha256", "0" * 64, extra_env=env)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("SHA-256 mismatch", result.stderr)
+                installed.unlink()
+
     def test_integrated_injects_loopback_and_stops_on_client_exit(self):
         game, world, env = self.integrated_fixture()
         manifest = game / "handoff.json"
@@ -455,8 +520,11 @@ with socket.socket() as listener:
         shutil.copyfile(self.stub, bindir / "megu.exe")
         (bindir / "megu.exe").chmod(0o755)
         env_path = str(bindir) + os.pathsep + os.environ.get("PATH", "")
-        result, log = self.java("--username", "PATHUser",
-                                extra_env={"MEGU_CLIENT_BIN": "", "PATH": env_path})
+        result, log = self.invocation(
+            "java", "-Djava.io.tmpdir=" + tempfile.gettempdir(), "-XX:-UsePerfData",
+            f"-Duser.home={self.root / 'exe-path-home'}",
+            "-jar", str(self.jar_dir / "megu-bootstrapper.jar"), "--username", "PATHUser",
+            extra_env={"MEGU_CLIENT_BIN": "", "PATH": env_path, "APPDATA": "", "LOCALAPPDATA": ""})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(log.read_text()), ["--username", "PATHUser"])
 
@@ -766,28 +834,69 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         self.assertEqual(index["name"], "megu 26.3")
         self.assertIn("26.3", index["summary"])
 
+    def assert_prism_bootstrap(self, pack, patch, mc_version, preceding_components, jvm_args=None):
+        requires = [{"uid": "net.minecraft", "equals": mc_version}]
+        self.assertEqual(pack, {"formatVersion": 1, "components": [
+            *preceding_components,
+            {"uid": "net.megu.bootstrapper", "version": "1.0.0", "cachedName": "Megu",
+             "cachedVersion": "1.0.0", "cachedRequires": requires},
+        ]})
+        expected_patch = {
+            "formatVersion": 1, "uid": "net.megu.bootstrapper", "name": "Megu",
+            "version": "1.0.0", "order": 5, "requires": requires,
+            "mainClass": "net.megu.launcher.Main",
+            "libraries": [{"name": "net.megu:bootstrapper:1.0.0", "MMC-hint": "local",
+                           "MMC-filename": "bootstrapper-1.0.0.jar"}],
+        }
+        if jvm_args is not None:
+            expected_patch["+jvmArgs"] = jvm_args
+        self.assertEqual(patch, expected_patch)
+
+    def test_prism_release_zip_layout_and_reproducibility(self):
+        jar = self.build_bootstrap_jar(self.root / "prism-release-stage")
+        args = ("--format", "prism", "--mc-version", "1.21.1", "--bootstrap-jar", str(jar),
+                "--prism-zip")
+        output = self.root / "prism-release"
+        self.export(output, *args)
+        path = output / "megu-prism-1.21.1.zip"
+        first = path.read_bytes()
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            self.assertFalse([name for name in names if name.lower().endswith(".zip")], names)
+            self.assertIsNone(archive.testzip())
+            self.assertEqual(names, ["instance.cfg", "libraries/bootstrapper-1.0.0.jar",
+                                     "mmc-pack.json", "patches/net.megu.bootstrapper.json"])
+            self.assertEqual(archive.read("libraries/bootstrapper-1.0.0.jar"), jar.read_bytes())
+            self.assert_prism_bootstrap(
+                json.loads(archive.read("mmc-pack.json")),
+                json.loads(archive.read("patches/net.megu.bootstrapper.json")), "1.21.1",
+                [{"uid": "net.minecraft", "version": "1.21.1", "important": True}])
+        # Reusing the output directory must not include the old archive or other root ZIPs.
+        (output / "stale.ZIP").write_bytes(first)
+        self.export(output, *args)
+        self.assertEqual(path.read_bytes(), first)
+        other = self.root / "prism-release-again"
+        self.export(other, *args)
+        self.assertEqual((other / path.name).read_bytes(), first)
+
     def test_prism_bootstrap_jar_native_patch_export(self):
         staging = self.root / "bootstrap-staging"
         jar = self.build_bootstrap_jar(staging)
         output = self.root / "prism bootstrap patch"
         digest = hashlib.sha256(self.native.read_bytes()).hexdigest()
-        self.export(output, "--format", "prism", "--mc-version", "26.3",
-                    "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
-                    "--client-sha256", digest)
+        args = ("--format", "prism", "--mc-version", "26.3", "--loader", "fabric",
+                "--loader-version", "0.16.10", "--integrated-jar", str(self.integrated),
+                "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
+                "--client-sha256", digest)
+        self.export(output, *args)
         patch = json.loads((output / "patches/net.megu.bootstrapper.json").read_text())
-        self.assertEqual(patch["formatVersion"], 1)
-        self.assertEqual(patch["uid"], "net.megu.bootstrapper")
-        self.assertEqual(patch["mainClass"], "net.megu.launcher.Main")
-        self.assertEqual(patch["inheritsFrom"], "26.3")
-        self.assertEqual(patch["libraries"],
-                         [{"name": "net.megu:bootstrapper:1.0.0", "MMC-hint": "local"}])
-        self.assertEqual(patch["+jvmArgs"], [f"-Dmegu.clientSha256={digest}"])
-        library = (output / "libraries/net/megu/bootstrapper/1.0.0/"
-                   "bootstrapper-1.0.0.jar")
-        self.assertEqual(library.read_bytes(), jar.read_bytes())
-        self.assertTrue((output / "mmc-pack.json").is_file())
         pack = json.loads((output / "mmc-pack.json").read_text())
-        self.assertEqual(pack["components"][0]["version"], "26.3")
+        self.assert_prism_bootstrap(pack, patch, "26.3", [
+            {"uid": "net.minecraft", "version": "26.3", "important": True},
+            {"uid": "net.fabricmc.fabric-loader", "version": "0.16.10"},
+        ], [f"-Dmegu.clientSha256={digest}"])
+        self.assertEqual((output / "libraries/bootstrapper-1.0.0.jar").read_bytes(), jar.read_bytes())
+        self.assertFalse((output / "libraries/net").exists())
         config = configparser.ConfigParser(interpolation=None)
         config.read(output / "instance.cfg")
         self.assertNotIn("WrapperCommand", config["General"])
@@ -798,9 +907,7 @@ Path(os.environ['TEST_NATIVE_LOG']).write_text(json.dumps(sys.argv[1:]))
         self.assertFalse((output / "megu-wrapper").exists())
         # Export stays reproducible.
         again = self.root / "prism bootstrap patch again"
-        self.export(again, "--format", "prism", "--mc-version", "26.3",
-                    "--bootstrap-jar", str(jar), "--client-bin", str(self.native),
-                    "--client-sha256", digest)
+        self.export(again, *args)
         self.assertEqual((again / "patches/net.megu.bootstrapper.json").read_bytes(),
                          (output / "patches/net.megu.bootstrapper.json").read_bytes())
 
