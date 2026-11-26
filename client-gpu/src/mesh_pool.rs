@@ -35,15 +35,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use std::collections::HashMap;
 
 use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::vanilla_block_models::{BakedBlockStateCache, VanillaBlockModelCatalog};
 use megu_client_mesh::{
-    build_and_pack_section_mesh, BuiltSectionMesh, DirectionBuckets, HiZPyramid, SectionCoord,
-    SectionMeshInput, DIRECTION_BUCKETS,
+    build_and_pack_section_mesh, build_and_pack_section_mesh_with_baked_models, BakedTerrainFace,
+    BuiltSectionMesh, DirectionBuckets, HiZPyramid, SectionCoord, SectionMeshInput,
+    DIRECTION_BUCKETS,
 };
 
 use crate::renderer::{section_geometry, view_proj_row_major, LiveSectionGeometry};
@@ -79,6 +81,48 @@ pub struct HiZSplatSection {
     /// Buckets the frame's facing cull kept (bit per bucket); masked-out
     /// direction buckets are not drawn and therefore not occluders.
     pub draw_mask: u8,
+}
+
+/// Texture-name to block-atlas sprite lookup used to certify when a baked
+/// full-cube model is compatible with the existing greedy terrain stream.
+pub type BlockAtlasSpriteLookup = Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>;
+
+/// Baked-model terrain emitted beside one worker-built packed section mesh.
+/// The packed stream remains the legacy/representable terrain stream; this
+/// sidecar preserves official model geometry that needs fractional positions,
+/// per-face UVs or a texture different from the state's representative sprite.
+#[derive(Debug)]
+pub struct BakedSectionMeshResult {
+    pub coord: SectionCoord,
+    pub revision: u64,
+    pub faces: Vec<BakedTerrainFace>,
+}
+
+#[derive(Clone)]
+struct SharedBakedModelConfig {
+    epoch: u64,
+    catalog: Arc<VanillaBlockModelCatalog>,
+    state_names: Arc<[String]>,
+    sprite_lookup: Option<BlockAtlasSpriteLookup>,
+}
+
+#[derive(Default)]
+struct BakedWorkerScratch {
+    epoch: u64,
+    cache: Option<BakedBlockStateCache>,
+}
+
+fn new_worker_baked_cache(config: &SharedBakedModelConfig) -> BakedBlockStateCache {
+    let sprite_lookup = config.sprite_lookup.clone();
+    BakedBlockStateCache::new_with_greedy_material_check(
+        (*config.catalog).clone(),
+        config.state_names.to_vec(),
+        move |_state_id, quad| {
+            sprite_lookup
+                .as_ref()
+                .is_none_or(|lookup| lookup(quad.texture.as_str()).is_some())
+        },
+    )
 }
 
 /// A unit of off-thread work.
@@ -135,6 +179,7 @@ pub enum MeshResult {
 pub struct MeshJobPool {
     job_tx: Option<SyncSender<MeshJob>>,
     result_rx: Option<Receiver<MeshResult>>,
+    baked_result_rx: Option<Receiver<BakedSectionMeshResult>>,
     workers: Vec<JoinHandle<()>>,
     threads: usize,
     /// Workers poll this after each `recv`; [`Drop`] and
@@ -142,6 +187,8 @@ pub struct MeshJobPool {
     /// stale job already dequeued from a closing pool skips its expensive
     /// meshing instead of running to completion for nobody.
     shutdown: Arc<AtomicBool>,
+    baked_config: Arc<RwLock<Option<SharedBakedModelConfig>>>,
+    baked_config_epoch: u64,
 }
 
 impl MeshJobPool {
@@ -152,25 +199,33 @@ impl MeshJobPool {
         let threads = (threads.max(1) as usize).min(MAX_WORKERS);
         let (job_tx, job_rx) = sync_channel::<MeshJob>(JOB_QUEUE_BOUND);
         let (result_tx, result_rx) = sync_channel::<MeshResult>(JOB_QUEUE_BOUND * 2);
+        let (baked_tx, baked_result_rx) =
+            sync_channel::<BakedSectionMeshResult>(JOB_QUEUE_BOUND * 2);
         let job_rx = Arc::new(Mutex::new(job_rx));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let baked_config = Arc::new(RwLock::new(None));
         let workers = (0..threads)
             .filter_map(|index| {
                 let rx = Arc::clone(&job_rx);
                 let tx = result_tx.clone();
+                let baked_tx = baked_tx.clone();
                 let shutdown = Arc::clone(&shutdown);
+                let baked_config = Arc::clone(&baked_config);
                 std::thread::Builder::new()
                     .name(format!("mesh-job-{index}"))
-                    .spawn(move || worker_loop(rx, tx, shutdown))
+                    .spawn(move || worker_loop(rx, tx, baked_tx, shutdown, baked_config))
                     .ok()
             })
             .collect();
         Self {
             job_tx: Some(job_tx),
             result_rx: Some(result_rx),
+            baked_result_rx: Some(baked_result_rx),
             workers,
             threads,
             shutdown,
+            baked_config,
+            baked_config_epoch: 0,
         }
     }
 
@@ -185,9 +240,59 @@ impl MeshJobPool {
             .is_some_and(|tx| tx.try_send(job).is_ok())
     }
 
+    /// Attach or clear the official baked block-model catalog used by
+    /// `SectionMesh` workers. `state_names` is indexed by global block-state
+    /// id. Without a sprite lookup, full-unit-cube baked models are treated
+    /// as greedy-compatible; use [`Self::set_block_model_catalog_with_sprite_lookup`]
+    /// when atlas material compatibility must be certified exactly.
+    pub fn set_block_model_catalog(
+        &mut self,
+        catalog: Option<Arc<VanillaBlockModelCatalog>>,
+        state_names: Arc<[String]>,
+    ) {
+        self.set_block_model_catalog_with_sprite_lookup(catalog, state_names, None);
+    }
+
+    /// [`Self::set_block_model_catalog`] with the real texture-atlas lookup.
+    /// Worker threads clone the catalog once per configuration epoch and then
+    /// reuse their own `BakedBlockStateCache`, so state-id resolution and
+    /// multipart baking never share a lock or mutable cache across workers.
+    pub fn set_block_model_catalog_with_sprite_lookup(
+        &mut self,
+        catalog: Option<Arc<VanillaBlockModelCatalog>>,
+        state_names: Arc<[String]>,
+        sprite_lookup: Option<BlockAtlasSpriteLookup>,
+    ) {
+        self.baked_config_epoch = self.baked_config_epoch.wrapping_add(1);
+        let epoch = self.baked_config_epoch;
+        let next = catalog.map(|catalog| SharedBakedModelConfig {
+            epoch,
+            catalog,
+            state_names,
+            sprite_lookup,
+        });
+        *self
+            .baked_config
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = next;
+    }
+
     /// Invoke `f` on every finished result without blocking.
     pub fn drain(&self, mut f: impl FnMut(MeshResult)) {
         if let Some(result_rx) = &self.result_rx {
+            while let Ok(result) = result_rx.try_recv() {
+                f(result);
+            }
+        }
+    }
+
+    /// Invoke `f` on every baked-model sidecar without blocking. Entries are
+    /// emitted only for worker jobs built while a catalog is active and at
+    /// least one baked face survived culling. Drain this alongside
+    /// [`Self::drain`]; an undrained full sidecar buffer drops newest entries
+    /// so shaped geometry cannot back-pressure the primary mesh stream.
+    pub fn drain_baked(&self, mut f: impl FnMut(BakedSectionMeshResult)) {
+        if let Some(result_rx) = &self.baked_result_rx {
             while let Ok(result) = result_rx.try_recv() {
                 f(result);
             }
@@ -203,8 +308,12 @@ impl MeshJobPool {
             // Tear the old generation down BEFORE spawning the new one:
             // its workers are parked in `send` on a possibly-full result
             // buffer, and only the receiver drop wakes them.
+            let baked_config = Arc::clone(&self.baked_config);
+            let baked_config_epoch = self.baked_config_epoch;
             self.shutdown();
             *self = Self::new(threads as u32);
+            self.baked_config = baked_config;
+            self.baked_config_epoch = baked_config_epoch;
         }
     }
 
@@ -216,6 +325,7 @@ impl MeshJobPool {
         self.shutdown.store(true, Ordering::Release);
         drop(self.job_tx.take());
         drop(self.result_rx.take());
+        drop(self.baked_result_rx.take());
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
@@ -231,12 +341,15 @@ impl Drop for MeshJobPool {
 fn worker_loop(
     job_rx: Arc<Mutex<Receiver<MeshJob>>>,
     result_tx: SyncSender<MeshResult>,
+    baked_tx: SyncSender<BakedSectionMeshResult>,
     shutdown: Arc<AtomicBool>,
+    baked_config: Arc<RwLock<Option<SharedBakedModelConfig>>>,
 ) {
     // Retained Hi-Z scratch: the depth grid and compact occluder stream
     // stay allocated across jobs, so steady-state frames never allocate
     // on the worker.
     let mut hiz_scratch = HiZScratch::default();
+    let mut baked_scratch = BakedWorkerScratch::default();
     loop {
         let job = {
             let rx = job_rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -251,17 +364,63 @@ fn worker_loop(
         let Ok(job) = job else {
             return;
         };
-        if result_tx.send(execute(job, &mut hiz_scratch)).is_err() {
+        let (result, baked) = execute(job, &mut hiz_scratch, &mut baked_scratch, &baked_config);
+        if let Some(baked) = baked {
+            // The sidecar must never become a second source of backpressure
+            // for the primary mesh stream: consumers drain it alongside
+            // `drain`, and an undrained full buffer drops the newest sidecar
+            // rather than parking every worker before `result_tx`.
+            let _ = baked_tx.try_send(baked);
+        }
+        if result_tx.send(result).is_err() {
             return;
         }
     }
 }
 
-fn execute(job: MeshJob, hiz_scratch: &mut HiZScratch) -> MeshResult {
+fn execute(
+    job: MeshJob,
+    hiz_scratch: &mut HiZScratch,
+    baked_scratch: &mut BakedWorkerScratch,
+    baked_config: &Arc<RwLock<Option<SharedBakedModelConfig>>>,
+) -> (MeshResult, Option<BakedSectionMeshResult>) {
     match job {
-        MeshJob::SectionMesh { input } => MeshResult::SectionMesh {
-            built: build_and_pack_section_mesh(&input),
-        },
+        MeshJob::SectionMesh { input } => {
+            let config = baked_config
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            if let Some(config) = config {
+                if baked_scratch.epoch != config.epoch || baked_scratch.cache.is_none() {
+                    baked_scratch.cache = Some(new_worker_baked_cache(&config));
+                    baked_scratch.epoch = config.epoch;
+                }
+                if let Some(cache) = baked_scratch.cache.as_mut() {
+                    let (built, faces) =
+                        build_and_pack_section_mesh_with_baked_models(&input, cache);
+                    let baked = (!faces.is_empty()).then_some(BakedSectionMeshResult {
+                        coord: built.coord,
+                        revision: built.revision,
+                        faces,
+                    });
+                    (MeshResult::SectionMesh { built }, baked)
+                } else {
+                    (
+                        MeshResult::SectionMesh {
+                            built: build_and_pack_section_mesh(&input),
+                        },
+                        None,
+                    )
+                }
+            } else {
+                (
+                    MeshResult::SectionMesh {
+                        built: build_and_pack_section_mesh(&input),
+                    },
+                    None,
+                )
+            }
+        }
         MeshJob::SectionGeometry {
             coord,
             packed,
@@ -275,23 +434,29 @@ fn execute(job: MeshJob, hiz_scratch: &mut HiZScratch) -> MeshResult {
             ];
             let geometry = section_geometry(&packed, &order, origin);
             let opaque_bucket_ranges = buckets.map(|b| compute_opaque_bucket_ranges(&packed, b));
-            MeshResult::SectionGeometry {
-                coord,
-                packed,
-                geometry,
-                opaque_bucket_ranges,
-            }
+            (
+                MeshResult::SectionGeometry {
+                    coord,
+                    packed,
+                    geometry,
+                    opaque_bucket_ranges,
+                },
+                None,
+            )
         }
         MeshJob::HiZDepth {
             view_proj,
             mut sections,
-        } => MeshResult::HiZDepth {
-            view_proj,
-            pyramid: build_hiz_pyramid(&view_proj, &mut sections, hiz_scratch),
-            // `extract_splat_quads` drained the list — the emptied buffer
-            // rides back so the render thread reuses its capacity.
-            sections,
-        },
+        } => (
+            MeshResult::HiZDepth {
+                view_proj,
+                pyramid: build_hiz_pyramid(&view_proj, &mut sections, hiz_scratch),
+                // `extract_splat_quads` drained the list — the emptied buffer
+                // rides back so the render thread reuses its capacity.
+                sections,
+            },
+            None,
+        ),
     }
 }
 

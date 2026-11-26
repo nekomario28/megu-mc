@@ -65,9 +65,9 @@ pub use ber_instancing::{
     LOD_SCALE_MAX, LOD_SCALE_MIN,
 };
 pub use cache::{
-    build_and_pack_section_mesh, build_section_mesh_with_unpacked, BuiltSectionMesh, MeshCache,
-    ReleasedMeshMeta, SectionCoord, SectionMeshInput, DEFAULT_RESORT_THRESHOLD,
-    PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
+    build_and_pack_section_mesh, build_and_pack_section_mesh_with_baked_models,
+    build_section_mesh_with_unpacked, BuiltSectionMesh, MeshCache, ReleasedMeshMeta, SectionCoord,
+    SectionMeshInput, DEFAULT_RESORT_THRESHOLD, PRIORITY_ZERO_NEAR_RADIUS_BLOCKS,
 };
 pub use compact_vertex::{
     pack_vertices_compact, try_pack_vertices_compact, CompactVoxelVertex,
