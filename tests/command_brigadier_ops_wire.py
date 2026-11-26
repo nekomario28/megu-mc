@@ -335,7 +335,11 @@ def main(binary, root):
         # Both explicit reloads above resend the command tree to the online OP.
         assert_tree(client.next_tree(), True)
         assert_tree(client.next_tree(), True)
-        assert json.loads((root / "ops.json").read_text()) == [PLAYER.lower()]
+        ops_entries = json.loads((root / "ops.json").read_text())
+        assert [
+            (entry["name"].lower() if isinstance(entry, dict) else str(entry).lower())
+            for entry in ops_entries
+        ] == [PLAYER.lower()]
     with server(binary, root) as (game, rcon), CommandClient(game, PLAYER) as client:
         client.login()
         assert_tree(client.initial_tree, True)

@@ -3635,9 +3635,11 @@ mod redstone_tests {
             rs_wire_connection(&adapter, wire, RsDir::East),
             RsWireConnection::Side
         );
+        // An east-facing observer emits only from its west back face; its east
+        // sensor face (touching `wire` from `wire.relative(West)`) does not connect.
         assert_eq!(
             rs_wire_connection(&adapter, wire, RsDir::West),
-            RsWireConnection::Side
+            RsWireConnection::None
         );
     }
 

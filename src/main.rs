@@ -24988,6 +24988,7 @@ mod mineshaft_runtime_tests {
     }
 
     fn ac_move(sock: &mut TcpStream, (x, y, z): (f64, f64, f64), ground: bool) {
+        TICK.fetch_add(1, Ordering::Relaxed);
         let mut b = Vec::new();
         b.extend_from_slice(&x.to_be_bytes());
         b.extend_from_slice(&y.to_be_bytes());
@@ -26664,6 +26665,9 @@ mod mineshaft_runtime_tests {
         assert!(loot.contains_key(&(DimId::End, 0, 64, 0)));
         assert!(!loot.contains_key(&(DimId::Overworld, 0, 64, 0)));
         drop(loot);
+        // Deferred loot chests materialize lazily on first open/unpack, not eagerly at generation.
+        assert!(unpack_block_loot_if_needed((DimId::Nether, 0, 64, 0)));
+        assert!(unpack_block_loot_if_needed((DimId::End, 0, 64, 0)));
         let inventories = chests().lock().unwrap_or_else(|e| e.into_inner());
         assert!(inventories.contains_key(&ContainerKey::at(DimId::Nether, (0, 64, 0))));
         assert!(inventories.contains_key(&ContainerKey::at(DimId::End, (0, 64, 0))));

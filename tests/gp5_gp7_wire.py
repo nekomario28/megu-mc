@@ -107,17 +107,21 @@ def read_objective(reader, mode):
 def scoreboard(game):
     with GameplayClient(game, "ScoreTester") as client:
         client.login()
-        read_objective(client.command("scoreboard objectives add lane dummy Lane Score",
-                                      "Added objective lane", 0x5E), 0)
-        reader = client.command("scoreboard players set @s lane -7", "ScoreTester has -7 in lane", 0x61)
-        require((reader.string(), reader.string(), signed(reader.varint(), 32)) ==
-                ("ScoreTester", "lane", -7), "score-value")
-        require((reader.number("B"), reader.number("B")) == (0, 0), "score-optional-fields")
-        end(reader, "score")
-
+        # Vanilla ServerScoreboard only tracks (and sends 0x5E/0x61 for)
+        # objectives bound to a display slot (`startTrackingObjective`).
+        client.command("scoreboard objectives add lane dummy Lane Score", "Added objective lane")
+        client.command("scoreboard players set @s lane -7", "ScoreTester has -7 in lane")
+        before_obj = len(client.play[0x5E])
+        before_score = len(client.play[0x61])
         reader = client.command("scoreboard objectives setdisplay sidebar lane", "Displaying lane", 0x57)
         require((reader.varint(), reader.string()) == (1, "lane"), "scoreboard-sidebar")
         end(reader, "scoreboard-sidebar")
+        read_objective(Reader(client.await_packet(0x5E, before_obj)), 0)
+        score_reader = Reader(client.await_packet(0x61, before_score))
+        require((score_reader.string(), score_reader.string(), signed(score_reader.varint(), 32)) ==
+                ("ScoreTester", "lane", -7), "score-value")
+        require((score_reader.number("B"), score_reader.number("B")) == (0, 0), "score-optional-fields")
+        end(score_reader, "score")
         with GameplayClient(game, "ScoreObserver") as observer:
             observer.login()
             read_objective(Reader(observer.await_packet(0x5E)), 0)

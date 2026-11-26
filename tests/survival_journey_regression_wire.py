@@ -142,7 +142,7 @@ def journeys(binary):
                 x, y, z = a.pos
                 for dx in (0.05, 0.10, 0.15):
                     a.move(x + dx, y, z)
-                a.command("megu status", "TPS:")
+                a.command("list", "JourneyAlice")
                 a.chat("survival journey hello")
                 a.send(0x0f, b"\x00")  # close inventory
                 assert a.syncs == 1, "movement rubber-banded"

@@ -7633,6 +7633,7 @@ mod p1a_random_tick_and_gamerule_tests {
         cells.set(0, 150, 0, reg.state_of("minecraft:wheat", None));
         let old_forced = std::mem::take(&mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()));
         forceloaded().lock().unwrap_or_else(|e| e.into_inner()).insert((0, 0));
+        quiescent_chunk_tick();
         for _ in 0..3 {
             random_tick_pass();
         }

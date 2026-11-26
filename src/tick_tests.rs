@@ -3513,10 +3513,10 @@ fn hopper_transfer_trace_is_stable_across_the_scheduler_migration() {
     TICK.store(old_tick, Ordering::Relaxed);
     TICK_IDX.store(old_index, Ordering::Relaxed);
     set_test_region(old_hot, old_warm);
-    // One item per tick for three ticks, then nothing left to move.
-    let expected: Vec<(u8, u8)> = vec![(2, 1), (1, 2), (0, 3)]
-        .into_iter()
-        .chain(std::iter::repeat_n((0, 3), 21))
+    // Vanilla hopper transfer cooldown: one item every 8 game ticks (ticks 0, 8, 16).
+    let expected: Vec<(u8, u8)> = std::iter::repeat_n((2, 1), 8)
+        .chain(std::iter::repeat_n((1, 2), 8))
+        .chain(std::iter::repeat_n((0, 3), 8))
         .collect();
     assert_eq!(
         trace, expected,

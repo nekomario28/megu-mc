@@ -105,7 +105,7 @@ cd ./megu-server && ./megu                 # defaults to port 25565
 
 </details>
 
-## Verified Feature Highlights (upcoming alpha.5)
+## Verified Feature Highlights (v0.1.0-alpha.5)
 
 - **Server:** Vanilla 1.21.1 on port **25565** by default, with 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. Built-in pure-Rust TTY-auto-detect TUI or plain CLI (`--cli`), `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened authentication, DDoS and zero-unwrap ingress, and `.mmod` / `.jar` recognition.
 - **Client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics and three-layer translucent clouds); per-part lit entities, mobs and block entities, mob cascade and contact shadows, universal data-driven dynamic lights (Vanilla, redstone and modded), and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music with a `Loud Sound Limiter` dB display. Installed vs `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and a four-line sign editor are supported.

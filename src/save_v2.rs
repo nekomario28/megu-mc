@@ -2713,11 +2713,11 @@ fn write_world_file(
             path.display()
         )
     })?;
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| format!("cannot sync save directory {}: {e}", parent.display()))
+    sync_directory(parent)
 }
 
 // ---------- multi-file save batches ----------

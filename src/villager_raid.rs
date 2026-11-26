@@ -7714,14 +7714,24 @@ mod villager_raid_tests {
         {
             let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
             let pillager = name_to_etype("pillager").unwrap();
+            let vindicator = name_to_etype("vindicator").unwrap();
+            let mut pillagers = 0usize;
             for &eid in &first_wave {
                 let mob = mob_list
                     .iter()
                     .find(|mob| mob.eid == eid)
                     .expect("tracked raider missing from the live mob list");
-                assert_eq!(mob.etype, pillager, "wave one is four pillagers");
+                assert!(
+                    mob.etype == pillager || mob.etype == vindicator,
+                    "wave one raiders must be pillagers (or normal bonus vindicators), got {}",
+                    mob.etype
+                );
+                if mob.etype == pillager {
+                    pillagers += 1;
+                }
                 assert_eq!(mob.dim, DimId::Overworld);
             }
+            assert!(pillagers >= 4, "wave one must include at least four pillagers, got {pillagers}");
         }
         // Killing every raider counts as defeats; the next countdown then
         // advances the raid to wave two.

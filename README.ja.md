@@ -105,7 +105,7 @@ cd ./megu-server && ./megu                 # 既定のポートは 25565 番
 
 </details>
 
-## 検証済み機能のハイライト（次期 alpha.5）
+## 検証済み機能のハイライト（v0.1.0-alpha.5）
 
 - **サーバー:** Vanilla 1.21.1、既定ポート **25565**。GameRule 51/51、エンチャント 42/42、効果 39/39、バニラの燃料と死亡メッセージに対応。純 Rust 製の TTY 自動判定 TUI / プレーン CLI（`--cli`）、`systemd` `sd_notify`、Hub の `/server`・`/hub`・`/world`、Survival Moderator の `/megu mod`、認証・DDoS 対策・入口での unwrap 排除、`.mmod` / `.jar` 識別。
 - **クライアント:** 純 `wgpu` の目に優しい描画（`comfort_exposure`、`indirect_light_bounce`、Snell の法則による水の屈折、朝夕の大気光学、半透明 3 層雲）。エンティティ・Mob・ブロックエンティティのパーツ別照明、Mob のカスケード影と接触影、バニラ・レッドストーン・Mod の光源に対応するハードコード不要の動的照明、3D/2D エンチャントグリント。初回音量はマスター 50% / 音楽 45%、`Loud Sound Limiter` は dB 表示。Mod Menu は Installed / `[+ Browse]` とプロセス内 Soft Reload に対応。E2EE フレンドと LAN は `127.0.0.1:0` の隔離ホストを使用。OS 言語・クリップボード・日本語 IME・4 行の看板編集に対応。

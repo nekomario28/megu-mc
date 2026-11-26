@@ -300,7 +300,7 @@ def command_cases(rcon, client):
     expect(rcon, "forceload remove 32 32", "(1 chunks)", "forceload-remove")
     expect(rcon, "forceload query", "0 forceloaded", "forceload-empty")
     expect(rcon, "setblock 35 80 35 minecraft:chest", "Set block", "data-block-fixture")
-    expect(rcon, "data get block 35 80 35 Items", "Storage has", "data-block-get")
+    expect(rcon, "data get block 35 80 35 Items", "has the following block data:", "data-block-get")
     expect(rcon, "data remove block 35 80 35 Items", "Removed data", "data-block-remove")
     expect(rcon, "gamerule keepInventory true", "keepInventory", "gamerule-set")
     expect(rcon, "gamerule keepInventory", "keepInventory", "gamerule-readback")

@@ -337,21 +337,22 @@ fn container_quick_move_merges_before_empty_slots_and_keeps_full_target_remainde
         chest,
         HashMap::from([(0, (stone, 60, vec![])), (2, (stone, 63, vec![]))]),
     )]);
-    let mut inv = HashMap::from([(45, (stone, 10, vec![]))]);
+    let mut inv = HashMap::from([(44, (stone, 10, vec![]))]);
     let before = container_item_totals(
         all.values()
             .flat_map(|slots| slots.values().cloned())
             .chain(inv.values().cloned()),
     );
 
-    // Player inventory window slot 63 maps to native inventory key 45.
-    quick_move_chest(&mut all, &mut inv, chest, None, 63);
+    // Player inventory window slot 62 (last hotbar slot of a 27-slot chest menu)
+    // maps to native inventory key 44 (`62 - 27 + 9`).
+    quick_move_chest(&mut all, &mut inv, chest, None, 62);
 
     let moved = &all[&chest];
     assert_eq!(moved[&0], (stone, 64, vec![]));
     assert_eq!(moved[&2], (stone, 64, vec![]));
     assert_eq!(moved[&1], (stone, 5, vec![]));
-    assert!(!inv.contains_key(&45));
+    assert!(!inv.contains_key(&44));
     assert_eq!(
         container_item_totals(
             all.values()

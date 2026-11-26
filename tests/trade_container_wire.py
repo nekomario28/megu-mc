@@ -208,6 +208,8 @@ def run(game, rcon):
     # New protocol client on the same server reads the persisted live container.
     with Client(game, "FreshChestReader") as reader:
         reader.login()
+        if reader.pos is None:
+            reader.until_id(0x40, "fresh-reader-login-teleport")
         reader.move(mob_x + 0.5, ground + 1.0, mob_z + 0.5)
         _, _, slots = opened_container(reader, chest_pos)
         require(slots[0] == (1, 12), "fresh-reader-chest-slot-zero")

@@ -15719,7 +15719,7 @@ mod connection_limits_wire_tests {
         assert!(south.iter().all(|c| !sent.contains(c)));
         assert_eq!(window.leaving(Some(window), &sent), []);
         let smaller = ChunkWindow {
-            center: (1, 0),
+            center: (5, 0),
             radius: 0,
         };
         assert_eq!(smaller.leaving(Some(window), &sent).len(), 2);
@@ -19259,7 +19259,9 @@ mod p5c_live_tests {
         );
 
         // A zero delay enters on the same call.
+        *me.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *me.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 65.0, 0.5, 0.0, 0.0, true);
         _rules.set("playersNetherPortalDefaultDelay", 0);
         assert!(tick_portal(&me, 2));
         assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);

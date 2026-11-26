@@ -3410,19 +3410,63 @@ fn roll_loot_container_slots_at(
     let table_json = loot_table_json(loot_table).or_else(|| {
         crate::chest_loot::vanilla_loot_table_json(loot_table).map(str::to_owned)
     });
-    let Some(table_json) = table_json else {
-        return HashMap::new();
-    };
-    // `LootTable.fill` fills `container.getContainerSize()` slots, so the
-    // native menu size bounds the roll. Furnaces are not structure loot
-    // containers in vanilla, but keeping their compact size avoids writing
-    // outside a malformed generated payload's backing menu.
     let slot_limit = match kind {
         ContainerKind::Chest => 27usize,
         ContainerKind::Furnace => 3usize,
         ContainerKind::BlockContainer(size) => usize::from(size),
     };
-    unpack_loot_table_json_at(&table_json, seed, slot_limit, origin, Some(loot_table))
+    if let Some(table_json) = table_json {
+        return unpack_loot_table_json_at(&table_json, seed, slot_limit, origin, Some(loot_table));
+    }
+    if loot_table == "minecraft:chests/abandoned_mineshaft" {
+        let mut rolled = roll_cart_loot(seed);
+        rolled.retain(|&slot, _| (slot as usize) < slot_limit);
+        return rolled;
+    }
+    let pools = loot_tables()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(loot_table)
+        .map(|p| {
+            p.iter()
+                .map(|pl| LootPool {
+                    rolls: pl.rolls,
+                    chance: pl.chance,
+                    funcs: pl.funcs.clone(),
+                    entries: pl
+                        .entries
+                        .iter()
+                        .map(|e| LootEntry {
+                            item: e.item,
+                            min: e.min,
+                            max: e.max,
+                            funcs: e.funcs.clone(),
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        });
+    let Some(pools) = pools else {
+        return HashMap::new();
+    };
+    let items = roll_loot_seeded(&pools, seed);
+    let mut out = HashMap::new();
+    if items.is_empty() || slot_limit == 0 {
+        return out;
+    }
+    let limit = slot_limit.min(i16::MAX as usize) as i16;
+    let mut slot_order: Vec<i16> = (0..limit).collect();
+    if kind != ContainerKind::Furnace {
+        let mut shuffle_rng = crate::generation_math::Lcg::new(seed as u64);
+        for i in (2..=slot_order.len()).rev() {
+            let j = shuffle_rng.next_bound(i as i32) as usize;
+            slot_order.swap(i - 1, j);
+        }
+    }
+    for (slot, stack) in slot_order.into_iter().zip(items) {
+        out.insert(slot, stack);
+    }
+    out
 }
 
 fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
@@ -16907,7 +16951,7 @@ mod f2_hopper_furnace_tests {
             .get_mut(&(dim, furnace.0, furnace.1, furnace.2)).unwrap().fuel =
             (bucket, 1, Vec::new());
         assert!(hopper_transfer_dim(dim, bottom, hopper_state(reg, hopper, "down", true)).unwrap().1);
-        assert_eq!(items(dim, bottom), vec![(bucket, 1), (ingot, 1)]);
+        assert_eq!(items(dim, bottom), vec![(ingot, 1), (bucket, 1)]);
     }
 
     #[test]

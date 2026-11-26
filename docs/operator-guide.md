@@ -44,7 +44,7 @@ launcher profile; it is **not** required before opening
 `megu-client-gpu`, because the GPU client bootstraps its own Vanilla
 1.21.1 assets (see below).
 
-## Verified alpha.4 feature scope
+## Verified v0.1.0-alpha.5 feature scope
 
 - **Server:** Vanilla 1.21.1, default TCP port **25565**, 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. The built-in pure-Rust console auto-detects a TTY for its TUI; `--cli` selects plain CLI. `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened auth/DDoS/zero-unwrap ingress and `.mmod` / `.jar` recognition are wired. Public binding still requires the security steps below.
 - **Native client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics, three-layer translucent clouds), per-part lit entities/mobs/block entities, mob cascade/contact shadows, data-driven dynamic lights for Vanilla, redstone and modded sources, and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music; `Loud Sound Limiter` displays dB. The Installed / `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and four-line sign editing are supported. No JVM or OpenGL is needed; Settings → Video offers an optional RAM budget with memory-pressure cache eviction instead of Java `-Xmx` tuning.

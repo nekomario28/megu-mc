@@ -18,12 +18,30 @@ fn payload_through_drop_owners_footer(payload: &[u8]) -> Result<&[u8], &'static 
 
 fn full_state_frame(payload: &[u8]) -> std::ops::Range<usize> {
     let (legacy, _) = read_world_seed_footer(payload).unwrap();
+    let (legacy, _) = read_mod_bridge_trailer(legacy, AERONAUTICS_TRAILER_MAGIC).unwrap();
+    let (legacy, _) = read_mod_bridge_trailer(legacy, MOD_OFFLOAD_TRAILER_MAGIC).unwrap();
+    let (legacy, _) = read_player_stats_footer(legacy).unwrap();
+    let (legacy, _) = read_recipe_book_footer(legacy).unwrap();
+    let (legacy, _) = read_team_footer(legacy).unwrap();
+    let (legacy, _) = read_bossbar_footer(legacy).unwrap();
+    let (legacy, _) = read_wbe_footer(legacy).unwrap();
+    let (legacy, _) = read_sign_meta_footer(legacy).unwrap();
+    let (legacy, _) = read_dxt_footer(legacy).unwrap();
     let (legacy, _) = read_mob_dimensions_footer(legacy).unwrap();
-    let legacy = payload_through_drop_owners_footer(legacy).unwrap();
+    let (legacy, _) = read_brewing_footer(legacy).unwrap();
+    let (legacy, _) = read_dim2_footer(legacy).unwrap();
+    let (legacy, _, _) = read_dim_footer(legacy).unwrap();
+    let (legacy, _) = read_block_loot_footer(legacy).unwrap();
     let (legacy, _) = read_drop_owners_footer(legacy).unwrap();
+    let (legacy, _) = read_raid_totals_footer(legacy).unwrap();
+    let (legacy, _) = read_dim_fluid_footer(legacy).unwrap();
     let legacy = tick_persistence::prefix(legacy).unwrap();
     let (legacy, _) = split_save_footer(legacy, b"GEN1").unwrap();
-    let (before, footer) = split_save_footer(legacy, SAVE_STATE_MAGIC).unwrap();
+    let (before, footer) = if legacy.ends_with(SAVE_STATE_V2_MAGIC) {
+        split_save_footer(legacy, SAVE_STATE_V2_MAGIC).unwrap()
+    } else {
+        split_save_footer(legacy, SAVE_STATE_MAGIC).unwrap()
+    };
     assert!(footer.is_some());
     before.len()..legacy.len()
 }

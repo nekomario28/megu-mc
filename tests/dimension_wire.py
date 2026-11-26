@@ -48,7 +48,7 @@ def chunk_of(pos):
     return (math.floor(pos[0] / 16), math.floor(pos[2] / 16))
 
 
-def await_respawn(client, dim_name, center):
+def await_respawn(client, dim_name, center=None):
     """Consume the 0x47, the position sync and the new dimension's whole window."""
     body = client.until(lambda pid, _: pid == 0x47, "respawn-packet")
     dim_type, name = parse_respawn(body)
@@ -57,7 +57,8 @@ def await_respawn(client, dim_name, center):
     require(client.dimension_name == dim_name, f"client-dimension:{client.dimension_name}")
     require(client.section_count == 16 or dim_name == "minecraft:overworld",
             "respawn-section-count")
-    client.until_chunks(square(*chunk_of(center)))
+    target = client.pos if client.pos is not None else center
+    client.until_chunks(square(*chunk_of(target)))
     return dim_type
 
 

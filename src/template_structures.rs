@@ -1803,17 +1803,26 @@ fn update_neighbor_survival_shapes<W: TemplateWorld>(
     // `CarpetBlock.updateShape` (`cyn.a`): `!canSurvive -> AIR` on every
     // direction; `canSurvive` is `!level.isEmptyBlock(below)`, so a liquid floor
     // still counts as occupied.
-    if bare.ends_with("_carpet")
-        && reg.is_air(world.get(pos.0, pos.1.wrapping_sub(1), pos.2))
-    {
-        return Some(air);
+    if bare.ends_with("_carpet") {
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
+        if reg.is_air(below) {
+            return Some(air);
+        }
     }
     // `SnowLayerBlock.updateShape` (`dms.a`): `!canSurvive -> AIR` on every
     // direction; `canSurvive` is `#minecraft:snow_layer_can_survive_on`
     // (honey/soul_sand/mud) below or a FULL sturdy UP face that is not
     // `#minecraft:snow_layer_cannot_survive_on` (ice/packed_ice/barrier).
     if bare == "snow" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         let full_snow_below = reg.name_of(below) == "minecraft:snow"
             && reg.get_prop(below, "layers").as_deref() == Some("8");
         if !reg.in_tag(below, "minecraft:snow_layer_can_survive_on")
@@ -1830,13 +1839,21 @@ fn update_neighbor_survival_shapes<W: TemplateWorld>(
     // never `fire`). `SoulFireBlock.canSurvive` (`dnz.a`) narrows the support
     // to `#minecraft:soul_fire_base_blocks`.
     if bare == "fire" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         if !is_face_sturdy(reg, below, 1) {
             return Some(air);
         }
     }
     if bare == "soul_fire" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         if !reg.in_tag(below, "minecraft:soul_fire_base_blocks") {
             return Some(air);
         }
@@ -1920,9 +1937,9 @@ fn update_neighbor_survival_shapes<W: TemplateWorld>(
     // `canSurvive` in 1.21.1: the native matrix answers T even in the empty
     // context, so support loss must not remove them here.
     // `CocoaBlock.updateShape` (`dgh.a`-family): the pod only survives on
-    // `#minecraft:jungle_logs` at `facing.getOpposite()`.
+    // `#minecraft:jungle_logs` in the `facing` direction (vanilla `CocoaBlock.canSurvive`).
     if bare == "cocoa" {
-        if let Some(attach) = facing_dir(reg, state).map(|f| f ^ 1) {
+        if let Some(attach) = facing_dir(reg, state) {
             if direction == attach && !reg.in_tag(neighbor, "minecraft:jungle_logs") {
                 return Some(air);
             }

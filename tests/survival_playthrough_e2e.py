@@ -97,6 +97,15 @@ class SurvivalClient(Client):
                 self.furnace_properties.append(struct.unpack(">Bhh", body))
         return pid, body
 
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            # Allow the server's socket reader thread to observe EOF and
+            # remove this player name before the next stage reconnects as the
+            # same username.
+            time.sleep(0.15)
+
     def command(self, text):
         self.send(0x04, string(text.lstrip("/")))
         time.sleep(.2)
