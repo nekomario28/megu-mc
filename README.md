@@ -19,7 +19,7 @@
 
 Megu is a free, open-source, clean-room reimplementation of **Minecraft: Java Edition 1.21.1** in Rust — a dedicated server (`megu`) and a pure-`wgpu` native GPU client (`megu-client-gpu`) built for low memory usage, fast startup, and zero OpenGL / JVM dependency.
 
-> **Alpha Status (`v0.1.0-alpha.4`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
+> **Alpha Status (`v0.1.0-alpha.5`)**: Early pre-release. Core 1.21.1 gameplay, native Vulkan/DX12/Metal rendering, and data-driven mods work today, while 100% vanilla worldgen/AI coverage and arbitrary Java Mixin execution remain in progress. See the [Roadmap](specs/ROADMAP.md).
 
 > **Start here:** the **[Operator Guide](docs/operator-guide.md)** explains the clean split between the dedicated server (`megu`) and the native GPU client (`megu-client-gpu`), with first-boot, mods, and admin commands.
 
@@ -52,17 +52,17 @@ Megu is a free, open-source, clean-room reimplementation of **Minecraft: Java Ed
 
 | OS / Launcher | File / Command |
 | :--- | :--- |
-| **Windows (x86_64)** | [`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-installer-windows-x86_64.exe) — standalone installer, `gui` arg for GUI mode |
-| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh` (or [`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-installer-linux-x86_64)) |
-| **macOS (Apple Silicon)** | [`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-installer-macos-arm64) |
-| **Modrinth App / Prism** | [`megu-1.21.1.mrpack`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-1.21.1.mrpack) (drag &amp; drop) or [`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-prism-1.21.1.zip) |
+| **Windows (x86_64)** | [`megu-installer-windows-x86_64.exe`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-windows-x86_64.exe) — standalone installer, `gui` arg for GUI mode |
+| **Linux (x86_64)** | `curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh \| sh` (or [`megu-installer-linux-x86_64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-linux-x86_64)) |
+| **macOS (Apple Silicon)** | [`megu-installer-macos-arm64`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-macos-arm64) |
+| **Prism Launcher** | [`megu-prism-1.21.1.zip`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-prism-1.21.1.zip) (ready-to-use custom-patch instance; requires `megu-client-gpu` from `megu-installer` or an OS archive) or run `megu-installer prism`. Modrinth App instances, worlds, and `mods/` are read directly by `megu-client-gpu`; no `.mrpack` is needed. Optional Fabric/NeoForge bridge mod: [`megu-integrated.jar`](https://github.com/nekomario28/megu-mc/releases/tag/v0.1.0-alpha.5) in Releases. |
 
-The installer stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** launcher profile. On first launch the client reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher or Modrinth App — or fetches and SHA-1-verifies it from Mojang's CDN. No Java, no `-Xmx` tuning: adjust the optional RAM budget slider anytime in **Settings → Video**.
+The installer stages `megu-client-gpu` into `<minecraft_dir>/bin/` and registers the **Megu (1.21.1)** launcher profile. On first launch the client reuses an existing 1.21.1 client JAR from the Official Launcher, PrismLauncher or Modrinth App — or fetches and SHA-1-verifies it from Mojang's CDN. It can read existing launcher installs, worlds, and `mods/` directly. No Java, no `-Xmx` tuning: adjust the optional RAM budget slider anytime in **Settings → Video**.
 
-**Verify a pinned Linux server archive before installing** — the example pins `v0.1.0-alpha.4`; change `TAG` only when intentionally selecting another release. The release publishes `SHA256SUMS-all.txt`; the commands extract the selected archive's entry to `SHA256SUMS.txt` so `sha256sum -c` verifies just the downloaded file:
+**Verify a pinned Linux server archive before installing** — the example pins `v0.1.0-alpha.5`; change `TAG` only when intentionally selecting another release. The release publishes `SHA256SUMS-all.txt`; the commands extract the selected archive's entry to `SHA256SUMS.txt` so `sha256sum -c` verifies just the downloaded file:
 
 ```sh
-TAG=v0.1.0-alpha.4
+TAG=v0.1.0-alpha.5
 TARGET=linux-x86_64
 ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
 BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
@@ -84,28 +84,28 @@ cd ./megu-server && ./megu                 # defaults to port 25565
 ```
 
 <details>
-<summary><strong>All 12 platform archives (v0.1.0-alpha.4)</strong> — desktop archives contain <code>megu</code>, <code>megu-client-gpu</code>, and <code>megu-installer</code>; server-only and musl-client archives differ</summary>
+<summary><strong>All 12 platform archives (v0.1.0-alpha.5)</strong> — desktop archives contain <code>megu</code>, <code>megu-client-gpu</code>, and <code>megu-installer</code>; server-only and musl-client archives differ</summary>
 
 | Target | Full Archive | Included Binaries |
 | :--- | :--- | :--- |
-| **`windows-x86_64`** | **[`megu-v0.1.0-alpha.4-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-windows-x86_64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-installer.exe` |
-| **`windows-arm64`** | **[`megu-v0.1.0-alpha.4-windows-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-windows-arm64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-installer.exe` |
-| **`linux-x86_64`** | **[`megu-v0.1.0-alpha.4-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
-| **`linux-arm64`** | **[`megu-v0.1.0-alpha.4-linux-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
-| **`macos-arm64`** | **[`megu-v0.1.0-alpha.4-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-macos-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
-| **`macos-x86_64`** | **[`megu-v0.1.0-alpha.4-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-macos-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
-| **`linux-x86_64-musl`** | **[`megu-v0.1.0-alpha.4-linux-x86_64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-x86_64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
-| **`linux-arm64-musl`** | **[`megu-v0.1.0-alpha.4-linux-arm64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-arm64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
-| **`freebsd-x86_64`** | **[`megu-v0.1.0-alpha.4-freebsd-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-freebsd-x86_64.tar.gz)** | Server-only: `megu`, `megu-installer` |
-| **`linux-riscv64`** | **[`megu-v0.1.0-alpha.4-linux-riscv64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-riscv64.tar.gz)** | Server-only: `megu`, `megu-installer` |
-| **`linux-x86_64-musl-client`** | **[`megu-v0.1.0-alpha.4-linux-x86_64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-x86_64-musl-client.tar.gz)** | GPU-client-only (dynamic musl): `megu-client-gpu` |
-| **`linux-arm64-musl-client`** | **[`megu-v0.1.0-alpha.4-linux-arm64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.4/megu-v0.1.0-alpha.4-linux-arm64-musl-client.tar.gz)** | GPU-client-only (dynamic musl): `megu-client-gpu` |
+| **`windows-x86_64`** | **[`megu-v0.1.0-alpha.5-windows-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-windows-x86_64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-installer.exe` |
+| **`windows-arm64`** | **[`megu-v0.1.0-alpha.5-windows-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-windows-arm64.tar.gz)** | `megu.exe`, `megu-client-gpu.exe`, `megu-installer.exe` |
+| **`linux-x86_64`** | **[`megu-v0.1.0-alpha.5-linux-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
+| **`linux-arm64`** | **[`megu-v0.1.0-alpha.5-linux-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
+| **`macos-arm64`** | **[`megu-v0.1.0-alpha.5-macos-arm64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-macos-arm64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
+| **`macos-x86_64`** | **[`megu-v0.1.0-alpha.5-macos-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-macos-x86_64.tar.gz)** | `megu`, `megu-client-gpu`, `megu-installer` |
+| **`linux-x86_64-musl`** | **[`megu-v0.1.0-alpha.5-linux-x86_64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-x86_64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
+| **`linux-arm64-musl`** | **[`megu-v0.1.0-alpha.5-linux-arm64-musl.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-arm64-musl.tar.gz)** | Server-only (static): `megu`, `megu-installer` |
+| **`freebsd-x86_64`** | **[`megu-v0.1.0-alpha.5-freebsd-x86_64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-freebsd-x86_64.tar.gz)** | Server-only: `megu`, `megu-installer` |
+| **`linux-riscv64`** | **[`megu-v0.1.0-alpha.5-linux-riscv64.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-riscv64.tar.gz)** | Server-only: `megu`, `megu-installer` |
+| **`linux-x86_64-musl-client`** | **[`megu-v0.1.0-alpha.5-linux-x86_64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-x86_64-musl-client.tar.gz)** | GPU-client-only (dynamic musl): `megu-client-gpu` |
+| **`linux-arm64-musl-client`** | **[`megu-v0.1.0-alpha.5-linux-arm64-musl-client.tar.gz`](https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-arm64-musl-client.tar.gz)** | GPU-client-only (dynamic musl): `megu-client-gpu` |
 
 > **Which binary do I run?** `megu-client-gpu` is the native GPU game client for playing (`megu-client` is the headless/CLI client and status probe); `megu` runs the dedicated server. `megu-client-gpu` obtains Vanilla 1.21.1 assets by itself on first launch, so `megu-installer` is a convenience for staging the binary and launcher profile, never a prerequisite.
 
 </details>
 
-## Verified Feature Highlights (upcoming alpha.4)
+## Verified Feature Highlights (upcoming alpha.5)
 
 - **Server:** Vanilla 1.21.1 on port **25565** by default, with 51/51 GameRules, 42/42 Enchantments, 39/39 Effects, Vanilla fuels and death messages. Built-in pure-Rust TTY-auto-detect TUI or plain CLI (`--cli`), `systemd` `sd_notify`, Hub `/server`/`/hub`/`/world`, Survival Moderator `/megu mod`, hardened authentication, DDoS and zero-unwrap ingress, and `.mmod` / `.jar` recognition.
 - **Client:** Pure `wgpu` eye-comfort optics (`comfort_exposure`, `indirect_light_bounce`, Snell water refraction, dawn/dusk air-mass optics and three-layer translucent clouds); per-part lit entities, mobs and block entities, mob cascade and contact shadows, universal data-driven dynamic lights (Vanilla, redstone and modded), and 3D/2D enchantment glint. First-launch audio defaults to 50% master / 45% music with a `Loud Sound Limiter` dB display. Installed vs `[+ Browse]` Mod Menu supports in-process Soft Reload; E2EE Friends and LAN use isolated `127.0.0.1:0` hosting. OS locale, clipboard, Japanese IME and a four-line sign editor are supported.
