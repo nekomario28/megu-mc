@@ -4,15 +4,15 @@
 //! Images are decoded directly from the user's local client JAR and resource
 //! packs. No archive contents are extracted to disk or included in this crate.
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use megu_client_mesh::png_decode;
-use megu_core::zip_archive::LazyZipIndex;
+use crate::vanilla_jar::{
+    check_png_budget, decode_asset_png, prioritized_packs, AssetLayer, MAX_DECODED_RGBA_BYTES,
+    MAX_PACK_LAYERS,
+};
 
 const MAX_TEXTURE_PNG_BYTES: usize = 8 * 1024 * 1024;
-const MAX_RESOURCE_PACKS: usize = 64;
 
 /// A decoded RGBA8 texture and whether its current pixels came from the
 /// client's Vanilla JAR. Resource-pack overrides and procedural fallbacks
@@ -232,25 +232,18 @@ impl VanillaWorldAssets {
     /// ZIP archives or unpacked resource-pack directories.
     pub fn load_from_jar_and_packs(jar_path: Option<&Path>, resource_packs: &[PathBuf]) -> Self {
         let mut assets = Self::fallback();
+        let mut remaining = MAX_DECODED_RGBA_BYTES;
+        let mut loaded = BTreeSet::new();
+        for path in prioritized_packs(resource_packs).iter().rev() {
+            load_layer(path, false, &mut assets, &mut remaining, &mut loaded);
+        }
         if let Some(path) = jar_path {
-            load_archive_layer(path, true, "client JAR", &mut assets);
+            load_layer(path, true, &mut assets, &mut remaining, &mut loaded);
         }
-        for (index, path) in resource_packs.iter().take(MAX_RESOURCE_PACKS).enumerate() {
-            if path.is_dir() {
-                load_directory_layer(path, index, &mut assets);
-            } else {
-                load_archive_layer(
-                    path,
-                    false,
-                    &format!("resource pack {}", path.display()),
-                    &mut assets,
-                );
-            }
-        }
-        if resource_packs.len() > MAX_RESOURCE_PACKS {
+        if resource_packs.len() > MAX_PACK_LAYERS {
             assets.notes.push(format!(
-                "{} resource packs ignored (limit {MAX_RESOURCE_PACKS})",
-                resource_packs.len() - MAX_RESOURCE_PACKS
+                "{} resource packs ignored (limit {MAX_PACK_LAYERS})",
+                resource_packs.len() - MAX_PACK_LAYERS
             ));
         }
         assets
@@ -409,30 +402,15 @@ fn decode_texture(
     bytes: &[u8],
     from_jar: bool,
     key: AssetKey,
+    remaining: usize,
 ) -> Result<DecodedRgbaTexture, String> {
-    if bytes.len() > MAX_TEXTURE_PNG_BYTES {
-        return Err(format!(
-            "PNG has {} bytes (limit {MAX_TEXTURE_PNG_BYTES})",
-            bytes.len()
-        ));
-    }
-    let (width, height, rgba) =
-        png_decode::decode_png_rgba(bytes).map_err(|error| error.to_string())?;
+    let (width, height) = check_png_budget(bytes, remaining)?;
     if matches!(key, AssetKey::Colormap(_)) && (width, height) != (256, 256) {
         return Err(format!(
             "colormap is {width}x{height}; Vanilla colormaps must be 256x256"
         ));
     }
-    let expected = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or_else(|| "decoded image dimensions overflow".to_owned())?;
-    if rgba.len() != expected {
-        return Err(format!(
-            "decoded PNG has {} RGBA bytes, expected {expected}",
-            rgba.len()
-        ));
-    }
+    let (_, _, rgba) = decode_asset_png(bytes)?;
     Ok(DecodedRgbaTexture {
         width,
         height,
@@ -456,116 +434,43 @@ fn set_texture(assets: &mut VanillaWorldAssets, key: AssetKey, texture: DecodedR
     }
 }
 
-fn load_archive_layer(path: &Path, from_jar: bool, label: &str, assets: &mut VanillaWorldAssets) {
+fn load_layer(
+    path: &Path,
+    from_jar: bool,
+    assets: &mut VanillaWorldAssets,
+    remaining: &mut usize,
+    loaded: &mut BTreeSet<&'static str>,
+) {
     let names: BTreeMap<&str, AssetKey> = ALL_ASSETS
         .into_iter()
         .map(|key| (key.path(), key))
         .collect();
-    let index = match LazyZipIndex::open_filtered(path, |name| names.contains_key(name)) {
-        Ok(index) => index,
+    let mut layer = match AssetLayer::open(path, !from_jar, |name| {
+        names.contains_key(name) && !loaded.contains(name)
+    }) {
+        Ok(layer) => layer,
         Err(error) => {
             assets
                 .notes
-                .push(format!("{label} {} unreadable: {error}", path.display()));
+                .push(format!("{} unreadable: {error}", path.display()));
             return;
         }
     };
-    for meta in index.entries() {
-        let Some(&key) = names.get(meta.name.as_str()) else {
-            continue;
-        };
-        if meta.uncompressed_size > MAX_TEXTURE_PNG_BYTES as u64 {
-            assets
-                .notes
-                .push(format!("{label} {} exceeds the PNG input cap", meta.name));
-            continue;
-        }
-        match index.read_entry(&meta.name, MAX_TEXTURE_PNG_BYTES) {
-            Ok(bytes) => match decode_texture(&bytes, from_jar, key) {
-                Ok(texture) => set_texture(assets, key, texture),
-                Err(error) => assets
-                    .notes
-                    .push(format!("{label} {} rejected: {error}", meta.name)),
-            },
+    for name in layer.names().to_vec() {
+        let key = names[name.as_str()];
+        match layer
+            .read(&name, MAX_TEXTURE_PNG_BYTES)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| decode_texture(&bytes, from_jar, key, *remaining))
+        {
+            Ok(texture) => {
+                *remaining -= texture.rgba.len();
+                set_texture(assets, key, texture);
+                loaded.insert(key.path());
+            }
             Err(error) => assets
                 .notes
-                .push(format!("{label} {} unreadable: {error}", meta.name)),
-        }
-    }
-}
-
-fn load_directory_layer(root: &Path, pack_index: usize, assets: &mut VanillaWorldAssets) {
-    let canonical_root = match fs::canonicalize(root) {
-        Ok(path) => path,
-        Err(error) => {
-            assets.notes.push(format!(
-                "resource pack directory {} unreadable: {error}",
-                root.display()
-            ));
-            return;
-        }
-    };
-    for key in ALL_ASSETS {
-        let path = canonical_root.join(key.path());
-        let canonical_path = match fs::canonicalize(&path) {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                assets.notes.push(format!(
-                    "resource pack[{pack_index}] {} unreadable: {error}",
-                    key.path()
-                ));
-                continue;
-            }
-        };
-        if !canonical_path.starts_with(&canonical_root) {
-            assets.notes.push(format!(
-                "resource pack[{pack_index}] {} rejected: path escapes pack directory",
-                key.path()
-            ));
-            continue;
-        }
-        let metadata = match fs::metadata(&canonical_path) {
-            Ok(metadata) if metadata.is_file() => metadata,
-            Ok(_) => continue,
-            Err(error) => {
-                assets.notes.push(format!(
-                    "resource pack[{pack_index}] {} unreadable: {error}",
-                    key.path()
-                ));
-                continue;
-            }
-        };
-        if metadata.len() > MAX_TEXTURE_PNG_BYTES as u64 {
-            assets.notes.push(format!(
-                "resource pack[{pack_index}] {} exceeds the PNG input cap",
-                key.path()
-            ));
-            continue;
-        }
-        let bytes = match fs::read(&canonical_path) {
-            Ok(bytes) if bytes.len() <= MAX_TEXTURE_PNG_BYTES => bytes,
-            Ok(_) => {
-                assets.notes.push(format!(
-                    "resource pack[{pack_index}] {} grew beyond the PNG input cap",
-                    key.path()
-                ));
-                continue;
-            }
-            Err(error) => {
-                assets.notes.push(format!(
-                    "resource pack[{pack_index}] {} unreadable: {error}",
-                    key.path()
-                ));
-                continue;
-            }
-        };
-        match decode_texture(&bytes, false, key) {
-            Ok(texture) => set_texture(assets, key, texture),
-            Err(error) => assets.notes.push(format!(
-                "resource pack[{pack_index}] {} rejected: {error}",
-                key.path()
-            )),
+                .push(format!("{}:{name} rejected: {error}", path.display())),
         }
     }
 }

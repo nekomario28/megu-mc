@@ -139,9 +139,11 @@ fn sprite_spec(id: VanillaGuiSpriteId) -> (u32, u32, [u8; 4]) {
         HotbarSelection => (24, 24),
         Crosshair => (15, 15),
         XpBarBg | XpBarFill => (182, 5),
-        HeartContainer | HeartFull | HeartHalf | FoodEmpty | FoodFull | ArmorEmpty
-        | ArmorFull => (9, 9),
+        HeartContainer | HeartFull | HeartHalf | FoodEmpty | FoodFull | ArmorEmpty | ArmorFull => {
+            (9, 9)
+        }
         Panorama0 | Panorama1 | Panorama2 | Panorama3 | Panorama4 | Panorama5 => (64, 64),
+        Scroller | ScrollerBackground => (6, 32),
     };
     // Unique bright color per catalog index — never a real texture.
     let idx = ALL_GUI_SPRITES.iter().position(|s| *s == id).unwrap() as u16;
@@ -247,10 +249,8 @@ fn missing_and_garbage_jars_fail_closed() {
         assert!(!assets.notes.is_empty());
     }
     // Nonexistent path twin.
-    let assets = load_vanilla_gui_from_path(
-        &PathBuf::from("/definitely/not/a/real/client.jar"),
-        &[],
-    );
+    let assets =
+        load_vanilla_gui_from_path(&PathBuf::from("/definitely/not/a/real/client.jar"), &[]);
     assert!(assets.sprites.is_empty());
     assert!(!assets.has_widget_skin());
     assert!(!assets.notes.is_empty());
@@ -359,45 +359,32 @@ fn later_pack_overrides_sprite_and_border() {
         ),
     ]);
 
-    // Pack 2 (later, higher priority) replaces only the texture — the
-    // pack-1 mcmeta still applies, like real file-level layering.
+    // A replacement without a sidecar uses the typed default.
     let pack2_btn = solid_png(200, 20, [9, 8, 7, 255]);
-    let pack2 = stored_zip(&[(
-        VanillaGuiSpriteId::Button.jar_entry(),
-        pack2_btn.as_slice(),
-    )]);
-
+    let pack2 = stored_zip(&[(VanillaGuiSpriteId::Button.jar_entry(), pack2_btn.as_slice())]);
     let assets = load_vanilla_gui_from_jar_bytes(&jar, &[&pack1, &pack2]);
     let btn = &assets.sprites[&VanillaGuiSpriteId::Button];
     assert_eq!(first_pixel(btn), [9, 8, 7, 255], "pack2 wins the png");
     assert_eq!(
-        assets.borders[&VanillaGuiSpriteId::Button],
-        NineSliceBorder::uniform(5),
-        "pack1 mcmeta still in force"
+        assets.nine_slice_border(VanillaGuiSpriteId::Button),
+        Some(NineSliceBorder::uniform(3))
     );
+    assert!(!assets.borders.contains_key(&VanillaGuiSpriteId::Button));
 
-    // A valid non-nine_slice pack mcmeta clears an earlier layer's
-    // border entirely (file-level replacement).
+    // An explicit stretch on the winning image suppresses the typed default.
     let pack3 = stored_zip(&[
+        (VanillaGuiSpriteId::Button.jar_entry(), &pack2_btn),
         (
-            VanillaGuiSpriteId::Crosshair.jar_mcmeta_entry().as_str(),
-            mcmeta_scalar(2).as_slice(),
+            VanillaGuiSpriteId::Button.jar_mcmeta_entry().as_str(),
+            &mcmeta_stretch(),
         ),
         (
             VanillaGuiSpriteId::MenuBackground.jar_entry(),
             solid_png(16, 16, [200, 100, 50, 255]).as_slice(),
         ),
     ]);
-    let pack4 = stored_zip(&[(
-        VanillaGuiSpriteId::Crosshair.jar_mcmeta_entry().as_str(),
-        mcmeta_stretch().as_slice(),
-    )]);
-    let assets = load_vanilla_gui_from_jar_bytes(&jar, &[&pack3, &pack4]);
-    assert_eq!(
-        assets.nine_slice_border(VanillaGuiSpriteId::Crosshair),
-        None,
-        "stretch mcmeta clears the border (no vanilla default)"
-    );
+    let assets = load_vanilla_gui_from_jar_bytes(&jar, &[&pack1, &pack3]);
+    assert_eq!(assets.nine_slice_border(VanillaGuiSpriteId::Button), None);
     assert_eq!(
         first_pixel(&assets.sprites[&VanillaGuiSpriteId::MenuBackground]),
         [200, 100, 50, 255]
@@ -616,7 +603,15 @@ fn panorama_yaw_pitch_stays_finite_and_bounded() {
         );
         t += 37.5;
     }
-    for edge in [100_000.0f32, 1.0e9, f32::MAX, f32::INFINITY, f32::NAN, -1.0, -f32::INFINITY] {
+    for edge in [
+        100_000.0f32,
+        1.0e9,
+        f32::MAX,
+        f32::INFINITY,
+        f32::NAN,
+        -1.0,
+        -f32::INFINITY,
+    ] {
         let (yaw, pitch) = panorama_yaw_pitch(edge);
         assert!(yaw.is_finite() && (0.0..360.0).contains(&yaw), "yaw@{edge}");
         assert!(pitch.is_finite() && (-10.0..=10.0).contains(&pitch), "pitch@{edge}");

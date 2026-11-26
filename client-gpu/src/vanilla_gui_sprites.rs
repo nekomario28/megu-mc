@@ -4,7 +4,7 @@
 //!
 //! When the player's *own* local vanilla client JAR is present, this
 //! module reads the 1.21.1 GUI sprites **in memory** through
-//! [`ZipSliceIndex`]/[`LazyZipIndex`] — zero temp files, zero Mojang
+//! bounded ZIP reads — zero temp files, zero Mojang
 //! assets in git — so the renderer can skin buttons, sliders, menu
 //! chrome, the title panorama and HUD widgets with authentic textures:
 //!
@@ -16,22 +16,23 @@
 //!
 //! Resource-pack layers are supported exactly like Minecraft: every
 //! supplied archive after the client JAR is a later pack in priority
-//! order, so a later pack's entry silently overrides earlier ones —
-//! including a pack that replaces a sprite's `.png` but leaves an
-//! earlier layer's `.png.mcmeta` 9-slice metadata in force.
+//! order. A valid replacement image uses its own layer's scaling metadata.
 //!
 //! Everything fails closed: a missing JAR, malformed archive or
 //! undecodable PNG is skipped with a note, never a panic, and
 //! [`VanillaGuiAssets::has_widget_skin`] / [`VanillaGuiAssets::has_panorama`]
 //! report cleanly so callers fall back to Megu's beveled vector UI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use megu_client_mesh::png_decode;
-use megu_core::zip_archive::{LazyZipIndex, ZipError, ZipSliceIndex};
+use megu_core::json::{parse_json, JsonValue};
 
 use crate::title_branding::RgbaImage;
+use crate::vanilla_jar::{
+    check_png_budget, decode_asset_png, prioritized_packs, AssetLayer, JarError,
+    MAX_DECODED_RGBA_BYTES, MAX_VISUAL_ATLAS_DIM,
+};
 use megu_ui::draw::VanillaContainerTextureId;
 
 // ---------------------------------------------------------------------------
@@ -102,6 +103,8 @@ pub enum VanillaGuiSpriteId {
     Panorama4,
     /// `title/background/panorama_5.png` — panorama cube face 5.
     Panorama5,
+    Scroller,
+    ScrollerBackground,
 }
 
 /// Prefix shared by every catalogued GUI texture entry.
@@ -151,7 +154,7 @@ pub const VANILLA_WORKSTATION_SPRITES: &[&str] = &[
     "sprites/container/enchanting_table/enchantment_slot_disabled.png",
     "sprites/container/anvil/text_field.png",
     "sprites/container/anvil/text_field_disabled.png",
-    "sprites/container/anvil/error_arrow.png",
+    "sprites/container/anvil/error.png",
     "sprites/container/beacon/button.png",
     "sprites/container/beacon/button_highlighted.png",
     "sprites/container/beacon/button_selected.png",
@@ -191,7 +194,7 @@ pub const VANILLA_WORKSTATION_SPRITES: &[&str] = &[
 
 /// Every sprite id in deterministic catalog order — the same order
 /// [`VanillaGuiAtlas`] packs shelves, so atlas output is stable.
-pub const ALL_GUI_SPRITES: [VanillaGuiSpriteId; 28] = [
+pub const ALL_GUI_SPRITES: [VanillaGuiSpriteId; 30] = [
     VanillaGuiSpriteId::Button,
     VanillaGuiSpriteId::ButtonHighlighted,
     VanillaGuiSpriteId::ButtonDisabled,
@@ -220,12 +223,18 @@ pub const ALL_GUI_SPRITES: [VanillaGuiSpriteId; 28] = [
     VanillaGuiSpriteId::Panorama3,
     VanillaGuiSpriteId::Panorama4,
     VanillaGuiSpriteId::Panorama5,
+    VanillaGuiSpriteId::Scroller,
+    VanillaGuiSpriteId::ScrollerBackground,
 ];
 
 impl VanillaGuiSpriteId {
     /// Exact JAR member name of this sprite's `.png`.
     pub const fn jar_entry(self) -> &'static str {
         match self {
+            Self::Scroller => "assets/minecraft/textures/gui/sprites/widget/scroller.png",
+            Self::ScrollerBackground => {
+                "assets/minecraft/textures/gui/sprites/widget/scroller_background.png"
+            }
             Self::Button => "assets/minecraft/textures/gui/sprites/widget/button.png",
             Self::ButtonHighlighted => {
                 "assets/minecraft/textures/gui/sprites/widget/button_highlighted.png"
@@ -345,10 +354,8 @@ impl VanillaGuiSpriteId {
             Self::Button => Some(S::Button),
             Self::ButtonHighlighted => Some(S::ButtonHighlighted),
             Self::ButtonDisabled => Some(S::ButtonDisabled),
-            // The slider trough skins the scrollbar track; the handle
-            // skins the thumb — the contract's closest widgets.
-            Self::Slider => Some(S::ScrollerBackground),
-            Self::SliderHandle => Some(S::Scroller),
+            Self::ScrollerBackground => Some(S::ScrollerBackground),
+            Self::Scroller => Some(S::Scroller),
             Self::MenuBackground => Some(S::Panel),
             Self::HeaderSeparator => Some(S::HeaderSeparator),
             Self::FooterSeparator => Some(S::FooterSeparator),
@@ -402,102 +409,43 @@ impl NineSliceBorder {
 /// Find `"key"` followed (after whitespace) by `:` in `text`; returns
 /// the offset just past the colon. This is a forgiving mini-scanner for
 /// the tiny `.mcmeta` shape, not a general JSON parser.
-fn json_key_value_pos(text: &str, key: &str, from: usize) -> Option<usize> {
-    let needle = format!("\"{key}\"");
-    let mut at = from;
-    while let Some(rel) = text[at..].find(&needle) {
-        let after = at + rel + needle.len();
-        let rest = text[after..].trim_start();
-        if rest.starts_with(':') {
-            return Some(after + (text[after..].len() - rest.len()) + 1);
-        }
-        at = after;
-    }
-    None
-}
-
-/// Parse a non-negative integer starting at `pos` (whitespace skipped);
-/// returns `(value, end_pos)`.
-fn parse_uint(text: &str, pos: usize) -> Option<(u32, usize)> {
-    let s = text[pos..].trim_start();
-    let start = pos + (text[pos..].len() - s.len());
-    let digits: usize = s.bytes().take_while(|b| b.is_ascii_digit()).count();
-    if digits == 0 {
-        return None;
-    }
-    let value = s[..digits].parse::<u32>().ok()?;
-    Some((value, start + digits))
-}
-
-/// Outcome of parsing one `.png.mcmeta` sidecar.
 enum McmetaBorder {
-    /// Valid mcmeta whose `gui.scaling` is *not* `nine_slice`
-    /// (`stretch`/`tile`/absent): the sprite stretches whole, and this
-    /// layer's mcmeta clears any earlier layer's border — file-level
-    /// override semantics.
-    NoBorder,
-    /// `nine_slice` scaling with a parseable `border`.
+    Missing,
+    Stretch,
     Border(NineSliceBorder),
-    /// Malformed: not UTF-8, or `nine_slice` declared but `border`
-    /// missing/unparseable. Reported in `notes`; earlier state kept.
-    Invalid,
 }
 
-/// Parse a `.mcmeta` `gui.scaling` block.
-///
-/// Accepts the two vanilla `border` spellings — `"border": 3` and
-/// `"border": {"left": 3, "top": 3, "right": 3, "bottom": 3}` (object
-/// members in any order) — only when the block declares a
-/// `"nine_slice"` scaling type. Missing object sides default to `0`.
-fn parse_nine_slice_border(mcmeta: &[u8]) -> McmetaBorder {
-    let Some(text) = std::str::from_utf8(mcmeta).ok() else {
-        return McmetaBorder::Invalid;
+fn parse_nine_slice_border(mcmeta: &[u8]) -> Option<McmetaBorder> {
+    let value = parse_json(std::str::from_utf8(mcmeta).ok()?).ok()?;
+    let Some(scaling) = value.get("gui").and_then(|gui| gui.get("scaling")) else {
+        return Some(McmetaBorder::Missing);
     };
-    if !text.contains("nine_slice") {
-        return McmetaBorder::NoBorder;
-    }
-    let Some(pos) = json_key_value_pos(text, "border", 0) else {
-        return McmetaBorder::Invalid;
-    };
-    let rest = text[pos..].trim_start();
-    if rest.starts_with('{') {
-        let Some(end) = rest.find('}') else {
-            return McmetaBorder::Invalid;
-        };
-        let inner = &rest[1..end];
-        let mut b = NineSliceBorder::default();
-        for (key, field) in [
-            ("left", &mut b.left),
-            ("top", &mut b.top),
-            ("right", &mut b.right),
-            ("bottom", &mut b.bottom),
-        ] {
-            if let Some(vpos) = json_key_value_pos(inner, key, 0) {
-                if let Some((v, _)) = parse_uint(inner, vpos) {
-                    *field = v;
-                }
+    match scaling.get_str("type")? {
+        "stretch" | "tile" => Some(McmetaBorder::Stretch),
+        "nine_slice" => {
+            let border = scaling.get("border")?;
+            let uint = |number: &JsonValue| {
+                let n = number.as_f64()?;
+                ((0.0..=f64::from(u32::MAX)).contains(&n) && n.fract() == 0.0).then_some(n as u32)
+            };
+            if let Some(px) = uint(border) {
+                return Some(McmetaBorder::Border(NineSliceBorder::uniform(px)));
             }
+            border.as_object()?;
+            let side = |name| border.get(name).map_or(Some(0), uint);
+            Some(McmetaBorder::Border(NineSliceBorder {
+                left: side("left")?,
+                top: side("top")?,
+                right: side("right")?,
+                bottom: side("bottom")?,
+            }))
         }
-        McmetaBorder::Border(b)
-    } else {
-        match parse_uint(text, pos) {
-            Some((v, _)) => McmetaBorder::Border(NineSliceBorder::uniform(v)),
-            None => McmetaBorder::Invalid,
-        }
+        _ => None,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Decoded assets + fail-closed loaders
-// ---------------------------------------------------------------------------
-
-/// Per-entry materialization cap for GUI sprites (a hostile pack cannot
-/// stall boot; the PNG decoder additionally caps at 4096 px).
 const MAX_GUI_SPRITE_BYTES: usize = 32 * 1024 * 1024;
-/// `.mcmeta` sidecar cap — vanilla blocks are a few hundred bytes.
 const MAX_MCMETA_BYTES: usize = 64 * 1024;
-/// Resource-pack archives honored per load, in priority order.
-const MAX_RESOURCE_PACKS: usize = 64;
 
 fn procedural_core_sprites() -> BTreeMap<VanillaGuiSpriteId, RgbaImage> {
     ALL_GUI_SPRITES
@@ -586,6 +534,8 @@ pub struct VanillaGuiAssets {
     /// Call [`VanillaGuiAssets::nine_slice_border`] for the effective
     /// border (metadata, else vanilla defaults).
     pub borders: BTreeMap<VanillaGuiSpriteId, NineSliceBorder>,
+    /// Sprites whose winning image declares non-nine-slice scaling.
+    pub stretch: BTreeSet<VanillaGuiSpriteId>,
     /// The client JAR the sprites came from, when one was read.
     pub source_jar: Option<PathBuf>,
     /// Every skipped/malformed source — a dropped entry can never look
@@ -669,34 +619,30 @@ impl VanillaGuiAssets {
     /// Effective 9-slice border for `id`: `.mcmeta` metadata wins, then
     /// vanilla widget defaults, then `None` (plain stretch sprite).
     pub fn nine_slice_border(&self, id: VanillaGuiSpriteId) -> Option<NineSliceBorder> {
+        if self.stretch.contains(&id) {
+            return None;
+        }
         self.borders
             .get(&id)
             .copied()
             .or_else(|| id.default_nine_slice_border())
     }
 
-    /// Shelf-pack decoded sprites that have a legacy typed ID into the
-    /// backwards-compatible [`VanillaGuiAtlas`].
+    /// Build the GUI atlas used by the window, including container panels.
     pub fn build_atlas(&self) -> VanillaGuiAtlas {
-        let full = pack_gui_atlas(self, false, false);
-        VanillaGuiAtlas {
-            width: full.width,
-            height: full.height,
-            rgba: full.rgba,
-            entries: full.entries,
-        }
+        self.build_full_atlas()
     }
 
     /// Shelf-pack every decoded GUI texture, including named HUD and
     /// workstation resources, into one atlas.
     pub fn build_full_atlas(&self) -> VanillaGuiTextureAtlas {
-        pack_gui_atlas(self, true, false)
+        pack_gui_atlas(self, false)
     }
 
     /// Build a renderable atlas that fills missing typed sprites with the
     /// clean-room pixel-art set while keeping decoded JAR textures preferred.
     pub fn build_atlas_with_fallbacks(&self) -> VanillaGuiTextureAtlas {
-        pack_gui_atlas(self, true, true)
+        pack_gui_atlas(self, true)
     }
 }
 
@@ -712,15 +658,9 @@ pub struct PanoramaCube {
 
 /// Decode one PNG entry into [`RgbaImage`], validating the buffer size
 /// against the header exactly like `title_branding` does.
-fn decode_sprite_png(bytes: &[u8]) -> Result<RgbaImage, String> {
-    let (width, height, rgba) = png_decode::decode_png_rgba(bytes).map_err(|e| e.to_string())?;
-    let expected = width as usize * height as usize * 4;
-    if rgba.len() != expected {
-        return Err(format!(
-            "decoded {width}x{height} PNG gave {} bytes, expected {expected}",
-            rgba.len()
-        ));
-    }
+fn decode_sprite_png(bytes: &[u8], remaining: usize) -> Result<RgbaImage, String> {
+    check_png_budget(bytes, remaining)?;
+    let (width, height, rgba) = decode_asset_png(bytes)?;
     Ok(RgbaImage {
         width,
         height,
@@ -731,7 +671,7 @@ fn decode_sprite_png(bytes: &[u8]) -> Result<RgbaImage, String> {
 /// Crop the upper-left Vanilla panel area, scaling crop coordinates for
 /// high-DPI resource packs. Only integral, uniform scale factors are
 /// accepted; a malformed/truncated sheet fails closed.
-fn crop_container_panel(id: VanillaContainerTextureId, image: &RgbaImage) -> Option<RgbaImage> {
+fn container_panel_dims(id: VanillaContainerTextureId, image: &RgbaImage) -> Option<(u32, u32)> {
     let (panel_w, panel_h) = id.panel_size();
     let (sheet_w, sheet_h) = if id == VanillaContainerTextureId::Villager {
         (512, 256)
@@ -756,6 +696,11 @@ fn crop_container_panel(id: VanillaContainerTextureId, image: &RgbaImage) -> Opt
     if width > image.width || height > image.height {
         return None;
     }
+    Some((width, height))
+}
+
+fn crop_container_panel(id: VanillaContainerTextureId, image: &RgbaImage) -> Option<RgbaImage> {
+    let (width, height) = container_panel_dims(id, image)?;
     let expected = (image.width as usize)
         .checked_mul(image.height as usize)?
         .checked_mul(4)?;
@@ -781,194 +726,138 @@ fn crop_container_panel(id: VanillaContainerTextureId, image: &RgbaImage) -> Opt
     })
 }
 
-/// Fold one archive layer into `out`: for each catalogued sprite, a
-/// present-and-decodable `.png` overwrites any earlier layer's copy,
-/// and a parseable `.png.mcmeta` `nine_slice.border` overwrites any
-/// earlier border — exactly Minecraft's later-pack-wins precedence.
-/// `read` fetches one member by name (fail-closed) and `layer` labels
-/// notes.
-fn fold_archive_layer<F>(read: &mut F, layer: &str, names: &[String], out: &mut VanillaGuiAssets)
-where
-    F: FnMut(&str, usize) -> Result<Vec<u8>, ZipError>,
-{
-    for name in names {
+fn fold_layer(
+    layer: Result<AssetLayer<'_>, JarError>,
+    label: &str,
+    out: &mut VanillaGuiAssets,
+    remaining: &mut usize,
+) {
+    let mut layer = match layer {
+        Ok(layer) => layer,
+        Err(err) => {
+            out.notes.push(format!("{label} unreadable: {err}"));
+            return;
+        }
+    };
+    let names = layer.names().to_vec();
+    for name in names.iter().filter(|name| name.ends_with(".png")) {
         let Some(relative) = name.strip_prefix(GUI_TEX_PREFIX) else {
             continue;
         };
-        if !relative.ends_with(".png") {
+        if out.named_textures.contains_key(relative) {
             continue;
         }
-        match read(name, MAX_GUI_SPRITE_BYTES) {
-            Ok(bytes) => match decode_sprite_png(&bytes) {
-                Ok(image) => {
-                    if let Some(id) = ALL_CONTAINER_TEXTURES
-                        .iter()
-                        .copied()
-                        .find(|id| id.path() == relative)
-                    {
-                        if crop_container_panel(id, &image).is_some() {
-                            out.named_textures.insert(relative.to_owned(), image);
-                        } else {
-                            out.notes.push(format!(
-                                "{layer}:{name}: container panel dimensions invalid for {}",
-                                relative
-                            ));
-                        }
-                    } else {
-                        out.named_textures.insert(relative.to_owned(), image);
+        let typed = ALL_GUI_SPRITES
+            .iter()
+            .copied()
+            .find(|id| id.jar_entry() == name);
+        // Keep both public catalogs, but decode an overlapping PNG once.
+        let copies = if typed.is_some() { 2 } else { 1 };
+        let image = layer
+            .read(name, MAX_GUI_SPRITE_BYTES)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| decode_sprite_png(&bytes, *remaining / copies));
+        let image = match image {
+            Ok(image) => image,
+            Err(error) => {
+                out.notes
+                    .push(format!("{label}:{name}: GUI texture rejected: {error}"));
+                continue;
+            }
+        };
+        if ALL_CONTAINER_TEXTURES
+            .iter()
+            .copied()
+            .find(|id| id.path() == relative)
+            .is_some_and(|id| container_panel_dims(id, &image).is_none())
+        {
+            out.notes.push(format!(
+                "{label}:{name}: container panel dimensions invalid"
+            ));
+            continue;
+        }
+        *remaining -= image.rgba.len() * copies;
+        if let Some(id) = typed {
+            out.sprites.insert(id, image.clone());
+            let meta = id.jar_mcmeta_entry();
+            if names.binary_search(&meta).is_ok() {
+                match layer
+                    .read(&meta, MAX_MCMETA_BYTES)
+                    .ok()
+                    .and_then(|b| parse_nine_slice_border(&b))
+                {
+                    Some(McmetaBorder::Border(border)) => {
+                        out.borders.insert(id, border);
                     }
+                    Some(McmetaBorder::Stretch) => {
+                        out.stretch.insert(id);
+                    }
+                    Some(McmetaBorder::Missing) => {}
+                    None => out
+                        .notes
+                        .push(format!("{label}:{meta}: malformed GUI scaling metadata")),
                 }
-                Err(reason) => out
-                    .notes
-                    .push(format!("{layer}:{name}: GUI texture rejected: {reason}")),
-            },
-            Err(err) => out
-                .notes
-                .push(format!("{layer}:{name}: GUI texture unreadable: {err}")),
+            }
         }
-    }
-    for id in ALL_GUI_SPRITES {
-        match read(id.jar_entry(), MAX_GUI_SPRITE_BYTES) {
-            Ok(bytes) => match decode_sprite_png(&bytes) {
-                Ok(img) => {
-                    out.sprites.insert(id, img);
-                }
-                Err(reason) => out.notes.push(format!(
-                    "{layer}:{}: sprite PNG rejected: {reason}",
-                    id.jar_entry()
-                )),
-            },
-            Err(ZipError::EntryNotFound(_)) => {}
-            Err(err) => out.notes.push(format!(
-                "{layer}:{}: sprite entry unreadable: {err}",
-                id.jar_entry()
-            )),
-        }
-        let mcmeta_name = id.jar_mcmeta_entry();
-        match read(&mcmeta_name, MAX_MCMETA_BYTES) {
-            Ok(bytes) => match parse_nine_slice_border(&bytes) {
-                McmetaBorder::Border(border) => {
-                    out.borders.insert(id, border);
-                }
-                McmetaBorder::NoBorder => {
-                    out.borders.remove(&id);
-                }
-                McmetaBorder::Invalid => out.notes.push(format!(
-                    "{layer}:{mcmeta_name}: malformed nine_slice metadata"
-                )),
-            },
-            Err(ZipError::EntryNotFound(_)) => {}
-            Err(err) => out
-                .notes
-                .push(format!("{layer}:{mcmeta_name}: mcmeta unreadable: {err}")),
-        }
+        out.named_textures.insert(relative.to_owned(), image);
     }
 }
 
-/// Load the vanilla GUI sprite set from in-memory archive bytes.
-///
-/// `jar_bytes` is the player's own local client JAR image;
-/// `resource_pack_layers` are resource-pack ZIP images in ascending
-/// priority order — every later archive's entries silently override
-/// earlier ones, and all packs override the base JAR (Minecraft
-/// semantics). Nothing touches disk; nothing is extracted.
-///
-/// Fail-closed: `None`-equivalent pieces are simply absent from
-/// [`VanillaGuiAssets::sprites`]; `notes` records every rejection.
+/// Load the base JAR and then each pack in increasing priority order.
 pub fn load_vanilla_gui_from_jar_bytes(
     jar_bytes: &[u8],
     resource_pack_layers: &[&[u8]],
 ) -> VanillaGuiAssets {
+    let wanted = VanillaGuiSpriteId::is_catalog_entry;
     let mut out = VanillaGuiAssets::fallback();
-    match ZipSliceIndex::open_filtered(jar_bytes, VanillaGuiSpriteId::is_catalog_entry) {
-        Ok(index) => {
-            let names: Vec<String> = index
-                .entries()
-                .iter()
-                .map(|entry| entry.name.clone())
-                .collect();
-            let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
-            fold_archive_layer(&mut read, "client.jar", &names, &mut out);
-        }
-        Err(err) => out.notes.push(format!(
-            "client JAR bytes unreadable: {err}; using built-in UI"
-        )),
-    }
-    for (pack_no, pack) in resource_pack_layers
+    let mut remaining = MAX_DECODED_RGBA_BYTES;
+    for (i, bytes) in prioritized_packs(resource_pack_layers)
         .iter()
-        .take(MAX_RESOURCE_PACKS)
         .enumerate()
+        .rev()
     {
-        match ZipSliceIndex::open_filtered(pack, VanillaGuiSpriteId::is_catalog_entry) {
-            Ok(index) => {
-                let names: Vec<String> = index
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.name.clone())
-                    .collect();
-                let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
-                fold_archive_layer(&mut read, &format!("pack[{pack_no}]"), &names, &mut out);
-            }
-            Err(err) => out
-                .notes
-                .push(format!("pack[{pack_no}] unreadable: {err}; layer skipped")),
-        }
+        fold_layer(
+            AssetLayer::from_bytes(bytes, true, wanted),
+            &format!("pack[{i}]"),
+            &mut out,
+            &mut remaining,
+        );
     }
+    fold_layer(
+        AssetLayer::from_bytes(jar_bytes, false, wanted),
+        "client.jar",
+        &mut out,
+        &mut remaining,
+    );
     out
 }
 
-/// Load the vanilla GUI sprite set from a client JAR path plus
-/// resource-pack paths — the on-disk twin of
-/// [`load_vanilla_gui_from_jar_bytes`], indexed lazily through
-/// [`LazyZipIndex`] so only the EOCD tail, Central Directory and
-/// selected GUI members are read. Later paths override earlier ones.
+/// Load GUI textures from a local client JAR and a priority-ordered pack stack.
 pub fn load_vanilla_gui_from_path(
     jar_path: &Path,
     resource_pack_paths: &[PathBuf],
 ) -> VanillaGuiAssets {
+    load_gui_stack(Some(jar_path), resource_pack_paths)
+}
+
+pub(crate) fn load_gui_stack(jar: Option<&Path>, packs: &[PathBuf]) -> VanillaGuiAssets {
+    let wanted = VanillaGuiSpriteId::is_catalog_entry;
     let mut out = VanillaGuiAssets::fallback();
-    if !jar_path.is_file() {
-        out.notes.push(format!(
-            "client JAR {} missing; using built-in UI",
-            jar_path.display()
-        ));
-    } else {
-        out.source_jar = Some(jar_path.to_path_buf());
-        match LazyZipIndex::open_filtered(jar_path, VanillaGuiSpriteId::is_catalog_entry) {
-            Ok(index) => {
-                let names: Vec<String> = index
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.name.clone())
-                    .collect();
-                let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
-                fold_archive_layer(&mut read, "client.jar", &names, &mut out);
-            }
-            Err(err) => out.notes.push(format!(
-                "client JAR {} unreadable: {err}; using built-in UI",
-                jar_path.display()
-            )),
-        }
+    let mut remaining = MAX_DECODED_RGBA_BYTES;
+    for path in prioritized_packs(packs).iter().rev() {
+        fold_layer(
+            AssetLayer::open(path, true, wanted),
+            &path.display().to_string(),
+            &mut out,
+            &mut remaining,
+        );
     }
-    for pack in resource_pack_paths.iter().take(MAX_RESOURCE_PACKS) {
-        if !pack.is_file() {
-            continue;
+    if let Some(path) = jar {
+        let layer = AssetLayer::open(path, false, wanted);
+        if layer.is_ok() {
+            out.source_jar = Some(path.to_owned());
         }
-        match LazyZipIndex::open_filtered(pack, VanillaGuiSpriteId::is_catalog_entry) {
-            Ok(index) => {
-                let names: Vec<String> = index
-                    .entries()
-                    .iter()
-                    .map(|entry| entry.name.clone())
-                    .collect();
-                let mut read = |name: &str, cap: usize| index.read_entry(name, cap);
-                fold_archive_layer(&mut read, &pack.display().to_string(), &names, &mut out);
-            }
-            Err(err) => out.notes.push(format!(
-                "pack {} unreadable: {err}; layer skipped",
-                pack.display()
-            )),
-        }
+        fold_layer(layer, &path.display().to_string(), &mut out, &mut remaining);
     }
     out
 }
@@ -995,21 +884,8 @@ pub struct SpriteAtlasEntry {
     pub nine_slice_border: Option<NineSliceBorder>,
 }
 
-/// One RGBA8 atlas texture holding every decoded non-panorama sprite:
-/// power-of-two width, tight height, and a 1 px extruded (edge-pixel
-/// duplicated) gutter around each sprite so bilinear filtering can
-/// never bleed across cells.
-#[derive(Clone, Debug, Default)]
-pub struct VanillaGuiAtlas {
-    /// Atlas width in px (power of two, ≥ 1).
-    pub width: u32,
-    /// Atlas height in px (tight — exactly the used shelf space, ≥ 1).
-    pub height: u32,
-    /// `width * height * 4` RGBA8 bytes.
-    pub rgba: Vec<u8>,
-    /// Sprite placements in catalog order.
-    pub entries: Vec<(VanillaGuiSpriteId, SpriteAtlasEntry)>,
-}
+/// Compatibility name for the complete GUI atlas used by the window.
+pub type VanillaGuiAtlas = VanillaGuiTextureAtlas;
 
 /// Full named GUI atlas used for workstation, HUD and other textures that
 /// do not have a legacy [`VanillaGuiSpriteId`] entry.
@@ -1023,6 +899,14 @@ pub struct VanillaGuiTextureAtlas {
 }
 
 impl VanillaGuiTextureAtlas {
+    /// Look up one typed sprite's placement.
+    pub fn entry(&self, id: VanillaGuiSpriteId) -> Option<&SpriteAtlasEntry> {
+        self.entries
+            .iter()
+            .find(|(key, _)| *key == id)
+            .map(|(_, entry)| entry)
+    }
+
     /// Build the UI bridge with both widget sprites and container panels.
     /// Container menu IDs resolve to the matching cropped background UV;
     /// unavailable textures remain absent and keep the caller's fallback.
@@ -1088,58 +972,7 @@ impl VanillaGuiTextureAtlas {
 const EMPTY_ATLAS_DIM: u32 = 1;
 /// Maximum atlas edge: the PNG decoder's own 4096 px cap bounds every
 /// source sprite, and shelf packing never needs more than 8192.
-const MAX_ATLAS_DIM: u32 = 8192;
-
-impl VanillaGuiAtlas {
-    /// Look up one sprite's placement.
-    pub fn entry(&self, id: VanillaGuiSpriteId) -> Option<&SpriteAtlasEntry> {
-        self.entries.iter().find(|(k, _)| *k == id).map(|(_, e)| e)
-    }
-
-    /// Re-key the packed atlas to [`megu_ui::draw::GuiSpriteAtlas`] — the
-    /// `SpriteId` table `client-ui`'s tessellator and `vanilla_widgets`
-    /// resolve [`UiCommand::Sprite`](megu_ui::draw::UiCommand::Sprite)
-    /// against. Widget sprites without a contract counterpart (HUD
-    /// pieces, highlighted slider twins, panorama faces) are dropped —
-    /// their `SpriteId`s keep the vector-chrome fallback.
-    ///
-    /// The RGBA moves across unchanged, so the texture
-    /// [`GpuRenderer::upload_gui_sprite_atlas`] uploads is byte-for-byte
-    /// the atlas these UVs were normalized against.
-    #[must_use]
-    pub fn to_gui_sprite_atlas(&self) -> megu_ui::draw::GuiSpriteAtlas {
-        let entries = self
-            .entries
-            .iter()
-            .filter_map(|(id, e)| {
-                id.to_ui_contract().map(|sprite| {
-                    let border = e.nine_slice_border.unwrap_or_default();
-                    (
-                        sprite,
-                        megu_ui::draw::GuiSpriteEntry {
-                            uv_min: e.uv_min,
-                            uv_max: e.uv_max,
-                            width: e.width,
-                            height: e.height,
-                            nine_slice_border: [
-                                border.left,
-                                border.top,
-                                border.right,
-                                border.bottom,
-                            ],
-                        },
-                    )
-                })
-            })
-            .collect();
-        megu_ui::draw::GuiSpriteAtlas::from_packed(
-            self.width,
-            self.height,
-            self.rgba.clone(),
-            entries,
-        )
-    }
-}
+const MAX_ATLAS_DIM: u32 = MAX_VISUAL_ATLAS_DIM;
 
 /// Smallest power of two ≥ `v`, clamped to `[1, MAX_ATLAS_DIM]`.
 fn next_pow2_clamped(v: u32) -> u32 {
@@ -1147,11 +980,7 @@ fn next_pow2_clamped(v: u32) -> u32 {
 }
 
 /// Shelf-pack `assets`' non-panorama sprites in catalog order.
-fn pack_gui_atlas(
-    assets: &VanillaGuiAssets,
-    include_named: bool,
-    include_fallbacks: bool,
-) -> VanillaGuiTextureAtlas {
+fn pack_gui_atlas(assets: &VanillaGuiAssets, include_fallbacks: bool) -> VanillaGuiTextureAtlas {
     let container_crops: BTreeMap<String, RgbaImage> = ALL_CONTAINER_TEXTURES
         .iter()
         .filter_map(|id| {
@@ -1175,17 +1004,15 @@ fn pack_gui_atlas(
                     .map(|img| (Some(*id), None, img))
             })
             .collect();
-    if include_named {
-        sprites.extend(assets.named_textures.iter().filter_map(|(name, image)| {
-            let full_name = format!("{GUI_TEX_PREFIX}{name}");
-            let already_typed = ALL_GUI_SPRITES.iter().any(|id| id.jar_entry() == full_name);
-            if already_typed {
-                return None;
-            }
-            let packed_image = container_crops.get(name).unwrap_or(image);
-            Some((None, Some(name.clone()), packed_image))
-        }));
-    }
+    sprites.extend(assets.named_textures.iter().filter_map(|(name, image)| {
+        let full_name = format!("{GUI_TEX_PREFIX}{name}");
+        let already_typed = ALL_GUI_SPRITES.iter().any(|id| id.jar_entry() == full_name);
+        if already_typed {
+            return None;
+        }
+        let packed_image = container_crops.get(name).unwrap_or(image);
+        Some((None, Some(name.clone()), packed_image))
+    }));
     if sprites.is_empty() {
         return VanillaGuiTextureAtlas {
             width: EMPTY_ATLAS_DIM,
@@ -1208,6 +1035,7 @@ fn pack_gui_atlas(
         .unwrap_or(2);
     let side = (cell_area as f64).sqrt().ceil() as u32;
     let atlas_w = next_pow2_clamped(side.max(widest_cell).max(2));
+    let height_limit = MAX_ATLAS_DIM.min((MAX_DECODED_RGBA_BYTES / (atlas_w as usize * 4)) as u32);
 
     // Shelf-pack: deterministic catalog order, new shelf when a cell
     // would cross the right edge.
@@ -1225,11 +1053,18 @@ fn pack_gui_atlas(
     for (id, name, img) in &sprites {
         let cw = img.width + 2;
         let ch = img.height + 2;
-        if x > 0 && x + cw > atlas_w {
-            y += shelf_h;
-            x = 0;
-            shelf_h = 0;
+        if cw > atlas_w || ch > height_limit {
+            continue;
         }
+        let (next_x, next_y, next_shelf) = if x + cw > atlas_w {
+            (0, y + shelf_h, 0)
+        } else {
+            (x, y, shelf_h)
+        };
+        if next_y + next_shelf.max(ch) > height_limit {
+            continue;
+        }
+        (x, y, shelf_h) = (next_x, next_y, next_shelf);
         placed.push(Placed {
             id: *id,
             name: name.clone(),

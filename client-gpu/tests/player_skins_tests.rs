@@ -160,13 +160,12 @@ fn invalid_or_missing_property_falls_back_to_vanilla_uuid_skin() {
 }
 
 fn synthetic_png(width: u32, height: u32, pixel: [u8; 4]) -> Vec<u8> {
-    let mut raw = Vec::with_capacity((width as usize * 4 + 1) * height as usize);
-    for _ in 0..height {
-        raw.push(0); // PNG filter: None
-        for _ in 0..width {
-            raw.extend_from_slice(&pixel);
-        }
+    let mut row = Vec::with_capacity(width as usize * 4 + 1);
+    row.push(0); // PNG filter: None
+    for _ in 0..width {
+        row.extend_from_slice(&pixel);
     }
+    let raw = row.repeat(height as usize);
     let mut zlib = vec![0x78, 0x01];
     let mut remaining = raw.as_slice();
     while !remaining.is_empty() {

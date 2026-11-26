@@ -108,7 +108,7 @@ fn loads_crops_and_bridges_every_container_and_workstation_texture() {
         assert_eq!((texture.width, texture.height), (7, 9), "{path}");
     }
 
-    let atlas = assets.build_full_atlas();
+    let atlas = assets.build_atlas();
     for id in ALL_CONTAINER_TEXTURES {
         let panel = atlas
             .named_entries

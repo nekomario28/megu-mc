@@ -238,7 +238,7 @@ fn zip_assets_and_palette_recolor_are_loaded_in_memory() {
             texture.as_slice(),
         ),
         (
-            "assets/minecraft/textures/trims/models/armor/flow_humanoid.png",
+            "assets/minecraft/textures/trims/models/armor/flow.png",
             trim.as_slice(),
         ),
         (
@@ -270,7 +270,7 @@ fn zip_assets_and_palette_recolor_are_loaded_in_memory() {
             texture.as_slice(),
         ),
         (
-            "assets/minecraft/textures/gui/sprites/container/slot/shield.png",
+            "assets/minecraft/textures/item/empty_armor_slot_shield.png",
             texture.as_slice(),
         ),
     ];
