@@ -6,7 +6,8 @@
 //! One pure-JSON schema onboards an entire dimension/biome/creature/QoL mod
 //! with **zero mod-specific Rust code**: a [`DeclarativeModBundle`] declares
 //! the mod's portals, progression barriers, biome regions, creature specs,
-//! spells, custom statuses, rituals, and custom payload channels; [`UnifiedModRuntime::register_bundle`] folds
+//! spells, custom statuses, rituals, custom payload channels, and optional
+//! structural capability metadata; [`UnifiedModRuntime::register_bundle`] folds
 //! the whole document into one runtime registry that drives the existing
 //! generic primitives ([`PortalRegistry`], [`ProgressionBarrierEngine`],
 //! [`BiomeRegionBlender`], [`CreatureSpec`]) directly.
@@ -48,7 +49,7 @@ pub const BUNDLE_SCHEMA: &str = "megu-mod-bundle/1";
 
 /// Bound on each top-level section (`portals`, `progression_barriers`,
 /// `biome_regions`, `creatures`, `custom_channels`, `spells`,
-/// `custom_statuses`, `rituals`) so a hostile bundle
+/// `custom_statuses`, `rituals`, `requires`, `optional_features`) so a hostile bundle
 /// cannot request unbounded allocations; the 4 MiB parser cap applies first.
 const MAX_SECTION_ENTRIES: usize = 1024;
 /// Bound on nested lists/maps inside a single section entry (tag borders,
@@ -100,6 +101,50 @@ impl fmt::Display for BundleError {
 
 impl std::error::Error for BundleError {}
 
+/// One clean versionless capability requirement declared by a bundle.
+///
+/// The public `name` never carries a version suffix; evolution is expressed
+/// by the internal integer contract floor `min_rev` and negotiated by the
+/// structural compatibility layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleCapabilityRequirement {
+    /// Clean lowercase snake-case capability name (for example `recipe`).
+    pub name: String,
+    /// Minimum supported internal contract revision, if the mod pins one.
+    pub min_rev: Option<u32>,
+    /// Whether the requirement is non-critical metadata. This flag alone is
+    /// not proof of an isolated feature boundary; unscoped gaps still fail closed.
+    pub optional: bool,
+}
+
+/// One explicitly declared optional feature boundary in a bundle.
+///
+/// The booleans are conservative claims by the mod author: the structural
+/// loader may skip the feature only when it is isolated, does not mutate
+/// world generation, and does not affect core gameplay/save state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleOptionalFeature {
+    /// Stable machine-readable feature id.
+    pub id: String,
+    /// Feature family (`recipe`, `cross_mod_integration`, `client_cosmetic`,
+    /// or a bounded custom snake-case family).
+    pub kind: String,
+    /// Capabilities used only by this feature.
+    pub requires: Vec<BundleCapabilityRequirement>,
+    /// Exact resource references used only by this feature.
+    pub references: Vec<String>,
+    /// Author assertion that the feature has no dependency edge into core features.
+    pub isolated: bool,
+    /// Author assertion that the feature mutates world generation.
+    pub affects_worldgen: bool,
+    /// Author assertion that the feature mutates core gameplay/save state.
+    pub affects_core_state: bool,
+    /// Whether this is an optional integration with another mod.
+    pub cross_mod: bool,
+    /// Whether this is purely cosmetic/client-side.
+    pub cosmetic: bool,
+}
+
 /// One declarative mod: everything a dimension/biome/creature/QoL mod needs
 /// to run natively, expressed as plain data.
 ///
@@ -114,6 +159,12 @@ pub struct DeclarativeModBundle {
     pub mod_id: String,
     /// Declared Minecraft compatibility range (Maven or SemVer syntax).
     pub mc_version_range: String,
+    /// Optional versionless structural capability requirements.
+    pub requires: Vec<BundleCapabilityRequirement>,
+    /// Optional explicitly isolated feature boundaries that may be skipped.
+    pub optional_features: Vec<BundleOptionalFeature>,
+    /// Optional pinned world-generation epoch required by this bundle.
+    pub worldgen_epoch: Option<String>,
     /// Portal rules feeding [`PortalRegistry`].
     pub portals: Vec<PortalRule>,
     /// Progression gates feeding [`ProgressionBarrierEngine`].
@@ -205,6 +256,28 @@ impl DeclarativeModBundle {
             ("schema", jstr(BUNDLE_SCHEMA)),
             ("mod_id", jstr(&self.mod_id)),
             ("mc_version_range", jstr(&self.mc_version_range)),
+        ];
+        if !self.requires.is_empty() {
+            fields.push((
+                "requires",
+                JsonValue::Array(self.requires.iter().map(capability_req_ast).collect()),
+            ));
+        }
+        if !self.optional_features.is_empty() {
+            fields.push((
+                "optional_features",
+                JsonValue::Array(
+                    self.optional_features
+                        .iter()
+                        .map(optional_feature_ast)
+                        .collect(),
+                ),
+            ));
+        }
+        if let Some(epoch) = &self.worldgen_epoch {
+            fields.push(("worldgen_epoch", jstr(epoch)));
+        }
+        fields.extend([
             (
                 "portals",
                 JsonValue::Array(self.portals.iter().map(portal_ast).collect()),
@@ -227,7 +300,7 @@ impl DeclarativeModBundle {
                 JsonValue::Array(self.creatures.iter().map(creature_ast).collect()),
             ),
             ("custom_channels", str_arr(&self.custom_channels)),
-        ];
+        ]);
         if !self.spells.is_empty() {
             fields.push((
                 "spells",
@@ -256,6 +329,9 @@ impl DeclarativeModBundle {
             "schema",
             "mod_id",
             "mc_version_range",
+            "requires",
+            "optional_features",
+            "worldgen_epoch",
             "portals",
             "progression_barriers",
             "biome_regions",
@@ -284,6 +360,9 @@ impl DeclarativeModBundle {
         let bundle = Self {
             mod_id,
             mc_version_range: mc_version_range.to_string(),
+            requires: optional_section(top, "requires", parse_capability_requirement)?,
+            optional_features: optional_section(top, "optional_features", parse_optional_feature)?,
+            worldgen_epoch: parse_worldgen_epoch(top)?,
             portals: section(top, "portals", parse_portal)?,
             progression_barriers: section(top, "progression_barriers", parse_progression)?,
             biome_regions: section(top, "biome_regions", parse_region)?,
@@ -325,6 +404,135 @@ impl DeclarativeModBundle {
 // ---------------------------------------------------------------------------
 // Section parsers (fail-closed)
 // ---------------------------------------------------------------------------
+
+fn valid_capability_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 || !name.as_bytes()[0].is_ascii_lowercase() {
+        return false;
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return false;
+    }
+    match name.rsplit_once("_v") {
+        Some((prefix, rev)) => {
+            prefix.is_empty() || rev.is_empty() || !rev.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => true,
+    }
+}
+
+fn valid_feature_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':' )
+        })
+}
+
+fn parse_capability_requirement(v: &JsonValue) -> Result<BundleCapabilityRequirement, BundleError> {
+    const CTX: &str = "requires[]";
+    let (name, min_rev, optional) = if let Some(name) = v.as_str() {
+        (name.to_string(), None, false)
+    } else {
+        let obj = obj_of(v, CTX)?;
+        check_keys(obj, &["name", "min_rev", "optional"], CTX)?;
+        let name = str_field(obj, "name", CTX)?.to_string();
+        let min_rev = match obj.get("min_rev") {
+            None | Some(JsonValue::Null) => None,
+            Some(value) => Some(u32_of(value, CTX)?),
+        };
+        let optional = bool_field(obj, "optional", CTX, false)?;
+        (name, min_rev, optional)
+    };
+    if !valid_capability_name(&name) {
+        return Err(verr(
+            CTX,
+            format!("capability '{name}' is not a clean versionless snake-case name"),
+        ));
+    }
+    Ok(BundleCapabilityRequirement { name, min_rev, optional })
+}
+
+fn parse_optional_feature(v: &JsonValue) -> Result<BundleOptionalFeature, BundleError> {
+    const CTX: &str = "optional_features[]";
+    let obj = obj_of(v, CTX)?;
+    check_keys(
+        obj,
+        &[
+            "id",
+            "kind",
+            "requires",
+            "references",
+            "isolated",
+            "affects_worldgen",
+            "affects_core_state",
+            "cross_mod",
+            "cosmetic",
+        ],
+        CTX,
+    )?;
+    let id = str_field(obj, "id", CTX)?;
+    if !valid_feature_id(id) {
+        return Err(verr(CTX, "id must be non-empty bounded ASCII feature id"));
+    }
+    let kind = str_field(obj, "kind", CTX)?;
+    if !valid_capability_name(kind) {
+        return Err(verr(CTX, "kind must be a bounded lowercase snake-case family"));
+    }
+    let requires = match obj.get("requires") {
+        None => Vec::new(),
+        Some(items) => {
+            let items = items
+                .as_array()
+                .ok_or_else(|| verr(CTX, "requires must be an array"))?;
+            bounded(items.len(), MAX_INNER_ENTRIES, CTX)?;
+            items.iter().map(parse_capability_requirement).collect::<Result<_, _>>()?
+        }
+    };
+    let references = match obj.get("references") {
+        None => Vec::new(),
+        Some(items) => string_list(items, CTX, check_rl)?,
+    };
+    // Unknown safety facts default conservatively: a feature is not isolated,
+    // and may affect worldgen/core state unless the author explicitly asserts
+    // the narrower boundary needed for feature-scoped partial loading.
+    Ok(BundleOptionalFeature {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        requires,
+        references,
+        isolated: bool_field(obj, "isolated", CTX, false)?,
+        affects_worldgen: bool_field(obj, "affects_worldgen", CTX, true)?,
+        affects_core_state: bool_field(obj, "affects_core_state", CTX, true)?,
+        cross_mod: bool_field(obj, "cross_mod", CTX, false)?,
+        cosmetic: bool_field(obj, "cosmetic", CTX, false)?,
+    })
+}
+
+fn parse_worldgen_epoch(
+    top: &BTreeMap<String, JsonValue>,
+) -> Result<Option<String>, BundleError> {
+    match top.get("worldgen_epoch") {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(value) => {
+            let epoch = str_of(value, "bundle.worldgen_epoch")?;
+            if epoch.is_empty()
+                || epoch.len() > 128
+                || !epoch.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' )
+                })
+            {
+                return Err(verr(
+                    "bundle.worldgen_epoch",
+                    "must be 1..=128 bytes of [A-Za-z0-9_.:-]",
+                ));
+            }
+            Ok(Some(epoch.to_string()))
+        }
+    }
+}
 
 fn parse_portal(v: &JsonValue) -> Result<PortalRule, BundleError> {
     const CTX: &str = "portals[]";
@@ -1038,6 +1246,34 @@ fn str_arr(items: &[String]) -> JsonValue {
 
 fn str_arr_set(items: &BTreeSet<String>) -> JsonValue {
     JsonValue::Array(items.iter().map(|s| jstr(s)).collect())
+}
+
+fn capability_req_ast(req: &BundleCapabilityRequirement) -> JsonValue {
+    obj(vec![
+        ("name", jstr(&req.name)),
+        (
+            "min_rev",
+            req.min_rev.map_or(JsonValue::Null, |rev| jnum(f64::from(rev))),
+        ),
+        ("optional", jbool(req.optional)),
+    ])
+}
+
+fn optional_feature_ast(feature: &BundleOptionalFeature) -> JsonValue {
+    obj(vec![
+        ("id", jstr(&feature.id)),
+        ("kind", jstr(&feature.kind)),
+        (
+            "requires",
+            JsonValue::Array(feature.requires.iter().map(capability_req_ast).collect()),
+        ),
+        ("references", str_arr(&feature.references)),
+        ("isolated", jbool(feature.isolated)),
+        ("affects_worldgen", jbool(feature.affects_worldgen)),
+        ("affects_core_state", jbool(feature.affects_core_state)),
+        ("cross_mod", jbool(feature.cross_mod)),
+        ("cosmetic", jbool(feature.cosmetic)),
+    ])
 }
 
 fn portal_ast(rule: &PortalRule) -> JsonValue {
@@ -2113,6 +2349,9 @@ pub fn export_builtin_dimension_bundles() -> Vec<DeclarativeModBundle> {
         .map(|profile| DeclarativeModBundle {
             mod_id: profile.mod_id.to_string(),
             mc_version_range: BUILTIN_BUNDLE_RANGE.to_string(),
+            requires: Vec::new(),
+            optional_features: Vec::new(),
+            worldgen_epoch: None,
             portals: profile.portal_rules,
             progression_barriers: Vec::new(),
             biome_regions: Vec::new(),

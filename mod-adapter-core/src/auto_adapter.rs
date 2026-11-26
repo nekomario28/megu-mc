@@ -1175,6 +1175,9 @@ fn synthesize_bundle(
         let bundle = DeclarativeModBundle {
             mod_id: mod_id.to_string(),
             mc_version_range,
+            requires: Vec::new(),
+            optional_features: Vec::new(),
+            worldgen_epoch: None,
             portals,
             progression_barriers: Vec::new(),
             biome_regions: Vec::new(),
@@ -2142,6 +2145,9 @@ pub fn scaffold_native_bundle(
     let bundle = DeclarativeModBundle {
         mod_id: id.to_string(),
         mc_version_range,
+        requires: Vec::new(),
+        optional_features: Vec::new(),
+        worldgen_epoch: None,
         portals: Vec::new(),
         progression_barriers: Vec::new(),
         biome_regions: Vec::new(),
