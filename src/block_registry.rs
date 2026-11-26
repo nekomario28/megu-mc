@@ -551,42 +551,588 @@ fn state_fact(facts: &[u8], st: u32) -> [u8; STATE_FACT_BYTES] {
     }
 }
 
-impl BReg {
-    fn load() -> Option<BReg> {
-        // Every file in the pack shares one state-id numbering, so a missing
-        // table is a broken pack, not a partial one: any read failure declines
-        // the whole registry rather than mixing versions.
-        let paths = VersionAssetPaths::resolve();
-        let md = jparse(&std::fs::read(&paths.blocks).ok()?)?
-            .as_arr()?
-            .clone();
-        let states = jparse(&std::fs::read(&paths.block_states).ok()?)?;
-        let facts: Box<[u8]> = std::fs::read(&paths.block_state_facts).ok()?.into();
-        let predicates: Box<[u8]> = std::fs::read(&paths.block_predicates).ok()?.into();
-        let mineshaft: Box<[u8]> = std::fs::read(&paths.mineshaft_support).ok()?.into();
-        let multiface: Box<[u8]> = std::fs::read(&paths.multiface_support).ok()?.into();
-        let template_solid: Box<[u8]> = std::fs::read(&paths.template_solid).ok()?.into();
-        let mut shapes = Vec::new();
-        for sh in states.get("shapes").and_then(J::as_arr)? {
-            let min_a = sh.get("min").and_then(J::as_arr)?;
-            let max_a = sh.get("max").and_then(J::as_arr)?;
-            if min_a.len() != 3 || max_a.len() != 3 {
-                return None;
+// The pinned MIT table has dense wire ids and property values in wire order.
+// Check these before allocating synthesized columns or decoding a state id.
+fn validate_synthesized_blocks(blocks: &[J]) -> Option<()> {
+    let mut next = 0;
+    let mut names = HashSet::new();
+    for block in blocks {
+        let name = jstr(block, "name")?;
+        if (next == 0 && name != "air") || !names.insert(name) {
+            return None;
+        }
+        let id = |key| jnum(block, key).filter(|n| (0.0..65536.0).contains(n) && n.fract() == 0.0);
+        let lo = id("minStateId")? as u32;
+        let hi = id("maxStateId")? as u32;
+        let default = if block.get("defaultState").is_some() {
+            id("defaultState")? as u32
+        } else {
+            lo
+        };
+        if lo != next || !(lo..=hi).contains(&default) {
+            return None;
+        }
+        next = hi + 1;
+    }
+    (next > 0).then_some(())
+}
+
+type CollisionBox = ([f64; 3], [f64; 3]);
+// Integer sixteenths of a block: exact dyadic box coordinates and cheap face masks.
+type GridBox = ([u8; 3], [u8; 3]);
+const FULL_BOX: GridBox = ([0; 3], [16; 3]);
+const CARDINAL: [&str; 4] = ["north", "east", "south", "west"];
+
+struct SynthBlock<'a> {
+    name: &'a str,
+    full_bounds: bool,
+    transparent: bool,
+    emission: u8,
+    opacity: u8,
+}
+
+impl<'a> SynthBlock<'a> {
+    fn new(name: &'a str, block: &J) -> Self {
+        let full_bounds = jstr(block, "boundingBox").as_deref() == Some("block");
+        let transparent = jnum(block, "transparent") == Some(1.0);
+        Self {
+            name,
+            full_bounds,
+            transparent,
+            emission: jnum(block, "emitLight").unwrap_or(0.0).clamp(0.0, 15.0) as u8,
+            opacity: jnum(block, "filterLight")
+                .unwrap_or(if full_bounds && !transparent {
+                    15.0
+                } else {
+                    0.0
+                })
+                .clamp(0.0, 15.0) as u8,
+        }
+    }
+
+    fn state(&self, props: &[Prop], index: usize, reg: &mut BReg, st: usize) {
+        let property = |key: &str| {
+            let mut i = index;
+            for prop in props.iter().rev() {
+                let radix = prop.vals.len();
+                if prop.name == key {
+                    return prop.vals[i % radix].as_str();
+                }
+                i /= radix;
             }
-            shapes.push((
-                [min_a[0].num(), min_a[1].num(), min_a[2].num()],
-                [max_a[0].num(), max_a[1].num(), max_a[2].num()],
+            ""
+        };
+        let name = self.name;
+        let air = matches!(name, "air" | "cave_air" | "void_air");
+        let liquid = matches!(name, "water" | "lava" | "bubble_column");
+        let water = property("waterlogged") == "true"
+            || matches!(
+                name,
+                "water" | "kelp" | "kelp_plant" | "seagrass" | "tall_seagrass" | "bubble_column"
+            );
+        let fluid = water || name == "lava";
+        let source =
+            fluid && (!matches!(name, "water" | "lava") || matches!(property("level"), "0" | ""));
+        let boxes = self.collision(&property, air || liquid);
+        let full = boxes.as_slice() == [FULL_BOX];
+        let partial_motion_exception = matches!(
+            name,
+            "ladder"
+                | "lily_pad"
+                | "snow"
+                | "bamboo"
+                | "sea_pickle"
+                | "scaffolding"
+                | "azalea"
+                | "flowering_azalea"
+        ) || name.ends_with("carpet")
+            || name.ends_with("_sign");
+        let motion = (!boxes.is_empty() && !partial_motion_exception)
+            || name.ends_with("_fence_gate")
+            || name.ends_with("_wall")
+            || name.ends_with("_pressure_plate");
+        let occlude = !self.transparent && (self.full_bounds || full) && !air && !liquid;
+        let solid_render = occlude && (full || name == "soul_sand");
+        let double_plant = matches!(
+            name,
+            "sunflower"
+                | "lilac"
+                | "rose_bush"
+                | "peony"
+                | "tall_grass"
+                | "large_fern"
+                | "tall_seagrass"
+                | "pitcher_plant"
+        );
+        let replaceable = air
+            || liquid
+            || matches!(
+                name,
+                "short_grass"
+                    | "tall_grass"
+                    | "fern"
+                    | "large_fern"
+                    | "dead_bush"
+                    | "seagrass"
+                    | "tall_seagrass"
+                    | "fire"
+                    | "soul_fire"
+                    | "snow"
+                    | "vine"
+                    | "glow_lichen"
+                    | "light"
+                    | "structure_void"
+                    | "warped_roots"
+                    | "crimson_roots"
+                    | "nether_sprouts"
+                    | "hanging_roots"
+            );
+        let flag = |set, mask| if set { mask } else { 0u8 };
+        let mut opacity = self.opacity;
+        if solid_render && name.ends_with("_slab") {
+            opacity = 15;
+        }
+        if water {
+            opacity = opacity.max(1);
+        }
+        let faces = if name.ends_with("_leaves") {
+            0
+        } else {
+            grid_support(&boxes)
+        };
+        let packed_faces = faces.to_le_bytes();
+        let fact = [
+            flag(air, FACT_IS_AIR)
+                | flag(liquid, FACT_LIQUID)
+                | flag(motion, FACT_BLOCKS_MOTION)
+                | flag(occlude, FACT_CAN_OCCLUDE)
+                | flag(solid_render, FACT_SOLID_RENDER)
+                | flag(boxes.is_empty(), FACT_COLLISION_EMPTY)
+                | flag(full, FACT_COLLISION_FULL)
+                | flag(!fluid, FACT_FLUID_EMPTY),
+            self.luminance(&property, water) << 4 | opacity,
+            packed_faces[0],
+            packed_faces[1],
+            packed_faces[2],
+            flag(
+                matches!(name, "brown_mushroom" | "red_mushroom" | "magma_block"),
+                FACT_POSTPROCESS,
+            ),
+        ];
+        let at = st * STATE_FACT_BYTES;
+        reg.facts[at..at + STATE_FACT_BYTES].copy_from_slice(&fact);
+        reg.predicates[st] = flag(solid_render, 1)
+            | flag(!air, 2)
+            | flag(motion, 4)
+            | flag(motion || fluid, 8)
+            | flag((motion || fluid) && !name.ends_with("_leaves"), 16)
+            | flag(double_plant, 32)
+            | flag(water, 64)
+            | flag(source, 128);
+        let full_faces = faces as u8 & 63;
+        reg.mineshaft[st] = full_faces
+            | flag(
+                full_faces & 1 != 0 || (name == "chain" && property("axis") == "y"),
+                64,
+            );
+        let collision_faces = if full { 63 } else { full_faces };
+        // Attachment directions ask for the opposite face of the support block.
+        reg.multiface[st] = ((collision_faces & 0x15) << 1) | ((collision_faces & 0x2a) >> 1);
+        reg.template_solid[st] = u8::from(full);
+        reg.st_fl[st] = u16::from(
+            flag(air, 1)
+                | flag(replaceable, FL_REPLACEABLE as u8)
+                | flag(liquid, 4)
+                | flag(motion, FL_LEGACY_SOLID as u8)
+                | flag(fluid, 16),
+        );
+        reg.col_range[st] = (reg.col_idx.len() as u32, boxes.len() as u8);
+        for (lo, hi) in boxes {
+            let shape = (
+                lo.map(|x| f64::from(x) / 16.0),
+                hi.map(|x| f64::from(x) / 16.0),
+            );
+            let id = reg
+                .shapes
+                .iter()
+                .position(|s| *s == shape)
+                .unwrap_or_else(|| {
+                    reg.shapes.push(shape);
+                    reg.shapes.len() - 1
+                });
+            reg.col_idx.push(id as u16);
+        }
+    }
+
+    fn luminance<'p>(&self, property: &impl Fn(&str) -> &'p str, water: bool) -> u8 {
+        let lit = property("lit");
+        match self.name {
+            "light" => property("level")
+                .parse::<u8>()
+                .unwrap_or(self.emission)
+                .min(15),
+            "furnace" | "blast_furnace" | "smoker" if lit == "true" => 13,
+            "redstone_ore" | "deepslate_redstone_ore" if lit == "true" => 9,
+            "redstone_lamp" if lit == "true" => 15,
+            "redstone_torch" | "redstone_wall_torch" if lit == "true" => 7,
+            "cave_vines" | "cave_vines_plant" if property("berries") == "true" => 14,
+            "sea_pickle" if water => {
+                3 * (1 + property("pickles").parse::<u8>().unwrap_or(1).min(4))
+            }
+            "sea_pickle" => 0,
+            n if lit == "true" && n.ends_with("candle") => {
+                3 * property("candles").parse::<u8>().unwrap_or(1).min(4)
+            }
+            n if lit == "true" && n.ends_with("candle_cake") => 3,
+            _ if lit == "false" => 0,
+            _ => self.emission,
+        }
+    }
+
+    /// The MIT `boundingBox` field only distinguishes empty from block. Use
+    /// property-driven shapes for common survival blocks before that coarse
+    /// fallback; this is not a substitute for the context-sensitive oracle.
+    fn collision<'p>(&self, property: &impl Fn(&str) -> &'p str, empty: bool) -> Vec<GridBox> {
+        if empty {
+            return Vec::new();
+        }
+        let name = self.name;
+        let facing = CARDINAL
+            .iter()
+            .position(|&d| d == property("facing"))
+            .unwrap_or(0);
+        let top = property("half") == "top";
+        let open = property("open") == "true";
+        if name.ends_with("_slab") {
+            return vec![match property("type") {
+                "double" => FULL_BOX,
+                "top" => ([0, 8, 0], [16, 16, 16]),
+                _ => ([0, 0, 0], [16, 8, 16]),
+            }];
+        }
+        if name.ends_with("_stairs") {
+            return grid_stairs(facing, top, property("shape"));
+        }
+        if name.ends_with("_door") {
+            let turn = if !open {
+                0
+            } else if property("hinge") == "right" {
+                3
+            } else {
+                1
+            };
+            return vec![rotate_grid_box(
+                ([0, 0, 13], [16, 16, 16]),
+                (facing + turn) % 4,
+            )];
+        }
+        if name.ends_with("_trapdoor") {
+            return vec![if open {
+                rotate_grid_box(([0, 0, 13], [16, 16, 16]), facing)
+            } else if top {
+                ([0, 13, 0], [16, 16, 16])
+            } else {
+                ([0, 0, 0], [16, 3, 16])
+            }];
+        }
+        if name.ends_with("_fence_gate") {
+            return if open {
+                Vec::new()
+            } else {
+                vec![rotate_grid_box(([0, 0, 6], [16, 24, 10]), facing)]
+            };
+        }
+        if name.ends_with("_fence")
+            || name.ends_with("_wall")
+            || name.ends_with("_pane")
+            || name == "iron_bars"
+        {
+            return grid_connected(name, property);
+        }
+        if name.ends_with("_sign")
+            || name.ends_with("_banner")
+            || name.ends_with("_rail")
+            || name == "rail"
+            || name.ends_with("_button")
+            || name.ends_with("_pressure_plate")
+        {
+            return Vec::new();
+        }
+        let height = |y| ([0, 0, 0], [16, y, 16]);
+        let centered = |inset, y| ([inset, 0, inset], [16 - inset, y, 16 - inset]);
+        let shape = match name {
+            "ladder" => rotate_grid_box(([0, 0, 13], [16, 16, 16]), facing),
+            "chest" | "trapped_chest" | "ender_chest" => {
+                let mut shape = centered(1, 14);
+                match property("type") {
+                    "left" => shape.1[0] = 16,
+                    "right" => shape.0[0] = 0,
+                    _ => {}
+                }
+                rotate_grid_box(shape, facing)
+            }
+            "farmland" | "dirt_path" => height(15),
+            "soul_sand" => height(14),
+            "cactus" | "honey_block" => centered(1, 15),
+            "lily_pad" => centered(1, 2),
+            "repeater" | "comparator" => height(2),
+            "snow" => {
+                let layers = property("layers").parse::<u8>().unwrap_or(1).clamp(1, 8);
+                if layers == 1 {
+                    return Vec::new();
+                }
+                height(2 * (layers - 1))
+            }
+            "enchanting_table" => height(12),
+            "end_portal_frame" => height(13),
+            "daylight_detector" => height(6),
+            "mud" => height(14),
+            "bamboo" => centered(7, 16),
+            "chain" => match property("axis") {
+                "x" => ([0, 6, 6], [16, 10, 10]),
+                "z" => ([6, 6, 0], [10, 10, 16]),
+                _ => centered(6, 16),
+            },
+            "sea_pickle" => centered(
+                match property("pickles") {
+                    "2" => 3,
+                    "3" | "4" => 2,
+                    _ => 6,
+                },
+                6,
+            ),
+            "flower_pot" => centered(5, 6),
+            "decorated_pot" => centered(1, 16),
+            "azalea" | "flowering_azalea" => {
+                return vec![centered(6, 8), ([0, 8, 0], [16, 16, 16])];
+            }
+            "hopper" => {
+                return vec![
+                    height(10),
+                    ([0, 10, 0], [16, 16, 2]),
+                    ([0, 10, 14], [16, 16, 16]),
+                    ([0, 10, 2], [2, 16, 14]),
+                    ([14, 10, 2], [16, 16, 14]),
+                ];
+            }
+            n if n.ends_with("cauldron") => {
+                return vec![
+                    height(5),
+                    ([0, 5, 0], [16, 16, 2]),
+                    ([0, 5, 14], [16, 16, 16]),
+                    ([0, 5, 2], [2, 16, 14]),
+                    ([14, 5, 2], [16, 16, 14]),
+                ];
+            }
+            "lantern" | "soul_lantern" => {
+                let y = if property("hanging") == "true" { 1 } else { 0 };
+                return vec![
+                    ([5, y, 5], [11, y + 7, 11]),
+                    ([6, y + 7, 6], [10, y + 9, 10]),
+                ];
+            }
+            n if n.ends_with("_bed") => height(9),
+            n if n.ends_with("carpet") => height(1),
+            n if n.ends_with("campfire") => height(7),
+            n if n.starts_with("potted_") => centered(5, 6),
+            _ if self.full_bounds => FULL_BOX,
+            _ => return Vec::new(),
+        };
+        vec![shape]
+    }
+}
+
+fn rotate_grid_box((mut lo, mut hi): GridBox, turns: usize) -> GridBox {
+    for _ in 0..turns {
+        (lo, hi) = ([16 - hi[2], lo[1], lo[0]], [16 - lo[2], hi[1], hi[0]]);
+    }
+    (lo, hi)
+}
+
+fn grid_stairs(facing: usize, top: bool, shape: &str) -> Vec<GridBox> {
+    let (base, rise) = if top { (8, 0) } else { (0, 8) };
+    let quarter = |x, z| rotate_grid_box(([x, rise, z], [x + 8, rise + 8, z + 8]), facing);
+    let mut boxes = vec![([0, base, 0], [16, base + 8, 16])];
+    match shape {
+        "outer_left" => boxes.push(quarter(0, 0)),
+        "outer_right" => boxes.push(quarter(8, 0)),
+        _ => {
+            boxes.push(rotate_grid_box(([0, rise, 0], [16, rise + 8, 8]), facing));
+            match shape {
+                "inner_left" => boxes.push(quarter(0, 8)),
+                "inner_right" => boxes.push(quarter(8, 8)),
+                _ => {}
+            }
+        }
+    }
+    boxes
+}
+
+fn grid_connected<'a>(name: &str, property: &impl Fn(&str) -> &'a str) -> Vec<GridBox> {
+    let wall = name.ends_with("_wall");
+    let fence = name.ends_with("_fence");
+    let height = if wall || fence { 24 } else { 16 };
+    let (post, arm) = if wall {
+        (4, 3)
+    } else if fence {
+        (2, 2)
+    } else {
+        (1, 1)
+    };
+    let mut boxes = Vec::new();
+    if !wall || property("up") == "true" {
+        boxes.push(([8 - post, 0, 8 - post], [8 + post, height, 8 + post]));
+    }
+    for (turn, dir) in CARDINAL.into_iter().enumerate() {
+        if matches!(property(dir), "true" | "low" | "tall") {
+            boxes.push(rotate_grid_box(
+                ([8 - arm, 0, 0], [8 + arm, height, 8]),
+                turn,
             ));
         }
-        // The per-state columns are indexed by the same state id `blocks_1211.json` names, so a
-        // column shorter than the table is a broken export, not a version to reconcile.
-        let state_flags = states.get("flags").and_then(J::as_arr)?;
-        let collision = states.get("collision_shapes").and_then(J::as_arr)?;
+    }
+    boxes
+}
+
+/// Union the rectangles touching each face; adjacent stair boxes may together
+/// cover a full face. Center is the middle 2×2; rigid asks for the border.
+fn grid_support(boxes: &[GridBox]) -> u32 {
+    if boxes == [FULL_BOX] {
+        return (1 << 18) - 1;
+    }
+    let mut mask = 0;
+    for (face, (axis, high)) in [
+        (1, false),
+        (1, true),
+        (2, false),
+        (2, true),
+        (0, false),
+        (0, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut rows = [0u32; 16];
+        for (lo, hi) in boxes {
+            if (high && hi[axis] < 16) || (!high && lo[axis] != 0) {
+                continue;
+            }
+            let cols = ((1 << hi[u].min(16)) - 1) ^ ((1 << lo[u].min(16)) - 1);
+            for row in &mut rows[usize::from(lo[v].min(16))..usize::from(hi[v].min(16))] {
+                *row |= cols;
+            }
+        }
+        if rows.iter().all(|&row| row == 0xffff) {
+            mask |= 1 << face;
+        }
+        if rows[7..9].iter().all(|row| row & 0x180 == 0x180) {
+            mask |= 1 << (face + 6);
+        }
+        if rows[..2]
+            .iter()
+            .chain(&rows[14..])
+            .all(|&row| row == 0xffff)
+            && rows[2..14].iter().all(|row| row & 0xc003 == 0xc003)
+        {
+            mask |= 1 << (face + 12);
+        }
+    }
+    mask
+}
+
+#[derive(Default)]
+struct BlockFactTables {
+    shapes: Vec<CollisionBox>,
+    facts: Box<[u8]>,
+    predicates: Box<[u8]>,
+    mineshaft: Box<[u8]>,
+    multiface: Box<[u8]>,
+    template_solid: Box<[u8]>,
+}
+
+fn load_oracle_tables(paths: &VersionAssetPaths, states: &J) -> Option<BlockFactTables> {
+    let mut tables = BlockFactTables {
+        facts: std::fs::read(&paths.block_state_facts).ok()?.into(),
+        predicates: std::fs::read(&paths.block_predicates).ok()?.into(),
+        mineshaft: std::fs::read(&paths.mineshaft_support).ok()?.into(),
+        multiface: std::fs::read(&paths.multiface_support).ok()?.into(),
+        template_solid: std::fs::read(&paths.template_solid).ok()?.into(),
+        shapes: Vec::new(),
+    };
+    for sh in states.get("shapes").and_then(J::as_arr)? {
+        let min_a = sh.get("min").and_then(J::as_arr)?;
+        let max_a = sh.get("max").and_then(J::as_arr)?;
+        if min_a.len() != 3 || max_a.len() != 3 {
+            return None;
+        }
+        tables.shapes.push((
+            [min_a[0].num(), min_a[1].num(), min_a[2].num()],
+            [max_a[0].num(), max_a[1].num(), max_a[2].num()],
+        ));
+    }
+    Some(tables)
+}
+
+impl BReg {
+    fn load() -> Option<BReg> {
+        Self::load_paths(&VersionAssetPaths::resolve())
+    }
+
+    fn load_paths(paths: &VersionAssetPaths) -> Option<BReg> {
+        let md = jparse(&std::fs::read(&paths.blocks).ok()?)?;
+        let md = md.as_arr()?;
+        // An incomplete pack uses one synthesized source for all physical
+        // facts, never a mix of oracle and derived columns. A present but
+        // unreadable complete pack still fails as before.
+        let mut synthesize = false;
+        for path in [
+            &paths.block_states,
+            &paths.block_state_facts,
+            &paths.block_predicates,
+            &paths.mineshaft_support,
+            &paths.multiface_support,
+            &paths.template_solid,
+        ] {
+            synthesize |= !path.try_exists().ok()?;
+        }
+        let states = if synthesize {
+            validate_synthesized_blocks(md)?;
+            None
+        } else {
+            Some(jparse(&std::fs::read(&paths.block_states).ok()?)?)
+        };
+        let oracle_states = match &states {
+            Some(states) => Some((
+                states.get("flags").and_then(J::as_arr)?,
+                states.get("collision_shapes").and_then(J::as_arr)?,
+            )),
+            None => None,
+        };
         let state_count = md
             .iter()
             .filter_map(|b| jnum(b, "maxStateId"))
             .fold(0.0, f64::max) as usize
             + 1;
+        let BlockFactTables {
+            shapes,
+            facts,
+            predicates,
+            mineshaft,
+            multiface,
+            template_solid,
+        } = if let Some(states) = &states {
+            load_oracle_tables(paths, states)?
+        } else {
+            BlockFactTables {
+                facts: vec![0; state_count * STATE_FACT_BYTES].into_boxed_slice(),
+                predicates: vec![0; state_count].into_boxed_slice(),
+                mineshaft: vec![0; state_count].into_boxed_slice(),
+                multiface: vec![0; state_count].into_boxed_slice(),
+                template_solid: vec![0; state_count].into_boxed_slice(),
+                ..BlockFactTables::default()
+            }
+        };
         let mut reg = BReg {
             bname: vec![],
             idx: HashMap::new(),
@@ -624,18 +1170,9 @@ impl BReg {
             #[cfg(feature = "mod-suite")]
             create_reg: None,
         };
-        // Copy the pinned per-state fact bytes into dense tables once, so the
-        // hot predicates below are a single indexed load rather than a slice
-        // copy plus shifts on every call.
-        for st in 0..state_count {
-            let fact = state_fact(&reg.facts, st as u32);
-            reg.pred[st] = fact[0];
-            reg.light[st] = fact[1];
-            reg.postproc[st] = fact[5];
-            reg.faces[st] = fact[2] as u32 | (fact[3] as u32) << 8 | (fact[4] as u32) << 16;
-        }
-        for b in &md {
-            let name = format!("minecraft:{}", jstr(b, "name")?);
+        for b in md {
+            let path = jstr(b, "name")?;
+            let name = format!("minecraft:{path}");
             let bi = reg.bname.len() as u32;
             reg.idx.insert(name.clone(), bi);
             reg.bname.push(name.clone());
@@ -658,7 +1195,15 @@ impl BReg {
                     props.push(Prop { name: pn, vals });
                 }
             }
-            reg.props.push(props.into_boxed_slice());
+            if synthesize {
+                let count = props
+                    .iter()
+                    .try_fold(1usize, |n, p| n.checked_mul(p.vals.len()))?;
+                if count != (hi - lo + 1) as usize {
+                    return None;
+                }
+            }
+            let synthesized = synthesize.then(|| SynthBlock::new(&path, b));
             // Destroy time is a property of the block, so it is read here once and
             // held per state rather than re-derived by a hand table. A hand table
             // covered 356 of the 26684 states, which meant mining time was wrong for
@@ -751,6 +1296,10 @@ impl BReg {
                 reg.drops[st] = drop0;
                 reg.drops_second[st] = drop1;
                 reg.stack_size[st] = stack_size;
+                let Some((state_flags, collision)) = oracle_states else {
+                    synthesized.as_ref()?.state(&props, i, &mut reg, st);
+                    continue;
+                };
                 // The collision boxes are indices into the deduplicated `shapes` table the
                 // asset carries; both come from the same state, so no name or property
                 // translation stands between the game's answer and the registry's copy.
@@ -777,6 +1326,19 @@ impl BReg {
                     _ => reg.unpaired.push(format!("{name} state {st}")),
                 }
             }
+            reg.props.push(props.into_boxed_slice());
+        }
+        // Copy the per-state fact bytes into dense tables once, so the hot
+        // predicates are a single indexed load regardless of runtime mode.
+        for st in 0..state_count {
+            let fact = state_fact(&reg.facts, st as u32);
+            reg.pred[st] = fact[0];
+            reg.light[st] = fact[1];
+            reg.postproc[st] = fact[5];
+            reg.faces[st] = u32::from_le_bytes([fact[2], fact[3], fact[4], 0]);
+        }
+        if synthesize {
+            eprintln!("[breg] synthesized block-state facts from blocks_1211.json (zero-Java runtime mode)");
         }
         // block tags: eagerly expand nested #tag refs
         let mut raw: HashMap<String, Vec<String>> = HashMap::new();
@@ -2450,6 +3012,224 @@ mod version_asset_tests {
         assert_eq!(paths.block_predicates, dir.join("block_predicates.bin"));
         assert_eq!(paths.template_solid, dir.join("template_solid.bin"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod synthesized_block_registry_tests {
+    use super::*;
+    use std::fs;
+
+    const BLOCKS: &[u8] = br#"[
+      {"name":"air","minStateId":0,"maxStateId":0,"boundingBox":"empty","transparent":true},
+      {"name":"stone","minStateId":1,"maxStateId":1,"boundingBox":"block","hardness":1.5,"filterLight":15},
+      {"name":"water","minStateId":2,"maxStateId":3,"boundingBox":"empty","transparent":true,"filterLight":1,
+       "states":[{"name":"level","type":"int","values":["0","1"]}]},
+      {"name":"lava","minStateId":4,"maxStateId":5,"boundingBox":"empty","transparent":true,"filterLight":1,"emitLight":15,
+       "states":[{"name":"level","type":"int","values":["0","1"]}]},
+      {"name":"torch","minStateId":6,"maxStateId":6,"boundingBox":"empty","transparent":true,"emitLight":14},
+      {"name":"oak_slab","minStateId":7,"maxStateId":12,"defaultState":10,"boundingBox":"block","filterLight":0,
+       "states":[{"name":"type","type":"enum","values":["top","bottom","double"]},{"name":"waterlogged","type":"bool"}]},
+      {"name":"cave_air","minStateId":13,"maxStateId":13,"boundingBox":"empty","transparent":true},
+      {"name":"void_air","minStateId":14,"maxStateId":14,"boundingBox":"empty","transparent":true},
+      {"name":"kelp","minStateId":15,"maxStateId":15,"boundingBox":"empty","transparent":true,"filterLight":1},
+      {"name":"seagrass","minStateId":16,"maxStateId":16,"boundingBox":"empty","transparent":true,"filterLight":1},
+      {"name":"bubble_column","minStateId":17,"maxStateId":17,"boundingBox":"empty","transparent":true,"filterLight":1},
+      {"name":"glass","minStateId":18,"maxStateId":18,"boundingBox":"block","transparent":true,"filterLight":0}
+    ]"#;
+
+    fn local_pack(label: &str, bytes: &[u8]) -> (PathBuf, VersionAssetPaths) {
+        let dir = std::env::temp_dir().join(format!("megu-breg-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("blocks_1211.json"), bytes).unwrap();
+        let paths = VersionAssetPaths::from_dir(&dir);
+        (dir, paths)
+    }
+
+    #[test]
+    fn blocks_only_derives_survival_facts() {
+        let (dir, paths) = local_pack("blocks-only", BLOCKS);
+        // Partial files must not leak into synthesized facts.
+        fs::write(&paths.block_state_facts, [0; 108]).unwrap();
+        let reg = BReg::load_paths(&paths).unwrap();
+        assert!(reg.unpaired.is_empty());
+        for air in ["air", "cave_air", "void_air"] {
+            let st = reg.state_of(air, None);
+            assert!(reg.is_air(st) && reg.is_replaceable(st));
+            assert!(!reg.blocks_motion(st) && !reg.can_occlude(st) && !reg.is_liquid(st));
+            assert_eq!(reg.fluid_name(st), "minecraft:empty");
+            assert!(!reg.heightmap_counts(st, HeightmapKind::WorldSurface));
+            assert!(reg.is_collision_empty(st));
+            assert_eq!(reg.collision_boxes(st).count(), 0);
+        }
+        for (name, level, fluid, liquid_block) in [
+            ("water", "0", "minecraft:water", true),
+            ("water", "1", "minecraft:flowing_water", true),
+            ("lava", "0", "minecraft:lava", true),
+            ("lava", "1", "minecraft:flowing_lava", true),
+            ("kelp", "0", "minecraft:water", false),
+            ("seagrass", "0", "minecraft:water", false),
+            ("bubble_column", "0", "minecraft:water", true),
+        ] {
+            let st = reg.state_of(name, Some(&mkprops(&[("level", level)])));
+            assert_eq!(reg.fluid_name(st), fluid);
+            assert_eq!(reg.is_liquid_block(st), liquid_block);
+            assert!(reg.is_liquid(st) && reg.is_collision_empty(st));
+            assert!(reg.heightmap_counts(st, HeightmapKind::MotionBlocking));
+            assert!(!reg.heightmap_counts(st, HeightmapKind::OceanFloor));
+            assert_eq!(reg.opacity_of(st), 1);
+        }
+        let stone = reg.state_of("stone", None);
+        assert_eq!(
+            reg.collision_boxes(stone).collect::<Vec<_>>(),
+            [([0.0; 3], [1.0; 3])]
+        );
+        assert_eq!(reg.hardness_of(stone), 1.5);
+        assert!(reg.is_collision_shape_full_block(stone));
+        assert!(reg.blocks_motion(stone) && reg.can_occlude(stone) && reg.is_solid_render(stone));
+        assert_eq!(reg.opacity_of(stone), 15);
+        assert_eq!(reg.is_template_solid(stone), Some(true));
+        assert!(reg.mineshaft_chain_anchor(stone));
+        for face in 0..6 {
+            assert!(reg.is_face_sturdy(stone, face, Support::Full));
+            assert!(reg.is_face_sturdy(stone, face, Support::Center));
+            assert!(reg.is_face_sturdy(stone, face, Support::Rigid));
+            assert!(reg.supports_multiface(stone, face));
+        }
+        for kind in [
+            HeightmapKind::WorldSurface,
+            HeightmapKind::OceanFloor,
+            HeightmapKind::MotionBlocking,
+            HeightmapKind::MotionBlockingNoLeaves,
+        ] {
+            assert!(reg.heightmap_counts(stone, kind));
+        }
+        let torch = reg.state_of("torch", None);
+        assert!(reg.is_collision_empty(torch));
+        assert!(!reg.blocks_motion(torch) && !reg.can_occlude(torch));
+        assert_eq!((reg.luminance_of(torch), reg.opacity_of(torch)), (14, 0));
+        assert_eq!((reg.luminance_of(4), reg.opacity_of(4)), (15, 1));
+        let glass = reg.state_of("glass", None);
+        assert!(reg.is_collision_shape_full_block(glass) && !reg.is_solid_render(glass));
+        assert_eq!(reg.opacity_of(glass), 0);
+
+        let slab = reg.state_of("oak_slab", None);
+        assert_eq!(
+            reg.collision_boxes(slab).collect::<Vec<_>>(),
+            [([0.0; 3], [1.0, 0.5, 1.0])]
+        );
+        assert!(reg.blocks_motion(slab) && !reg.is_solid_render(slab));
+        assert!(!reg.is_liquid(slab));
+        assert_eq!(reg.is_template_solid(slab), Some(false));
+        assert!(reg.supports_multiface(slab, 1)); // bottom face, viewed from below
+        assert!(!reg.supports_multiface(slab, 0));
+        let wet_top = reg.state_of(
+            "oak_slab",
+            Some(&mkprops(&[("type", "top"), ("waterlogged", "true")])),
+        );
+        assert_eq!(
+            reg.collision_boxes(wet_top).collect::<Vec<_>>(),
+            [([0.0, 0.5, 0.0], [1.0; 3])]
+        );
+        assert_eq!(reg.fluid_name(wet_top), "minecraft:water");
+        assert!(!reg.is_liquid_block(wet_top));
+        assert_eq!(reg.opacity_of(wet_top), 1);
+        let double = reg.with_prop(slab, "type", "double");
+        assert!(reg.is_collision_shape_full_block(double) && reg.is_solid_render(double));
+        assert_eq!(reg.opacity_of(double), 15);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn complete_oracle_tables_take_precedence() {
+        let (dir, paths) = local_pack("full-oracle", BLOCKS);
+        let state_count = 19;
+        let json = format!(
+            r#"{{"shapes":[],"flags":{:?},"collision_shapes":{:?}}}"#,
+            vec![0; state_count],
+            vec![Vec::<u8>::new(); state_count]
+        );
+        fs::write(&paths.block_states, json).unwrap();
+        let mut facts = vec![0; state_count * STATE_FACT_BYTES];
+        facts[6 * STATE_FACT_BYTES + 1] = 0x72;
+        fs::write(&paths.block_state_facts, &facts).unwrap();
+        for path in [
+            &paths.block_predicates,
+            &paths.mineshaft_support,
+            &paths.multiface_support,
+            &paths.template_solid,
+        ] {
+            fs::write(path, vec![0; state_count]).unwrap();
+        }
+        let reg = BReg::load_paths(&paths).unwrap();
+        assert_eq!(&*reg.facts, facts);
+        assert_eq!((reg.luminance_of(6), reg.opacity_of(6)), (7, 2));
+        fs::write(&paths.block_states, b"invalid JSON").unwrap();
+        assert!(
+            BReg::load_paths(&paths).is_none(),
+            "do not mask broken full packs"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn pinned_mit_metadata_decodes_every_state_without_oracle_tables() {
+        let bytes = fs::read(VersionAssetPaths::default_pack().blocks).unwrap();
+        let (dir, paths) = local_pack("pinned-mit", &bytes);
+        let reg = BReg::load_paths(&paths).unwrap();
+        assert!(reg.state_count() >= 26_684);
+        assert!(reg.unpaired.is_empty());
+        for name in [
+            "short_grass",
+            "redstone_wire",
+            "poppy",
+            "rail",
+            "oak_sign",
+            "oak_button",
+            "oak_pressure_plate",
+            "vine",
+        ] {
+            assert!(
+                !reg.is_air(reg.state_of(name, None)),
+                "{name} resolved to air"
+            );
+            assert!(
+                reg.is_collision_empty(reg.state_of(name, None)),
+                "{name} obstructed movement"
+            );
+        }
+        for (name, y) in [
+            ("oak_stairs", 1.0),
+            ("oak_fence", 1.5),
+            ("cobblestone_wall", 1.5),
+            ("red_bed", 0.5625),
+            ("chest", 0.875),
+            ("white_carpet", 0.0625),
+        ] {
+            let st = reg.state_of(name, None);
+            assert!(
+                reg.collision_boxes(st).any(|(_, hi)| hi[1] == y),
+                "{name} lacks its support height"
+            );
+            assert!(!reg.is_collision_shape_full_block(st));
+        }
+        let ladder = reg.state_of("ladder", None);
+        assert!(!reg.blocks_motion(ladder) && !reg.is_collision_empty(ladder));
+        let door = reg.state_of("oak_door", None);
+        let opened = reg.with_prop(door, "open", "true");
+        assert_ne!(
+            reg.collision_boxes(door).next(),
+            reg.collision_boxes(opened).next()
+        );
+        let gate = reg.state_of("oak_fence_gate", None);
+        assert!(!reg.is_collision_empty(gate));
+        assert!(reg.is_collision_empty(reg.with_prop(gate, "open", "true")));
+        let furnace = reg.state_of("furnace", None);
+        assert_eq!(reg.luminance_of(furnace), 0);
+        assert_eq!(reg.luminance_of(reg.with_prop(furnace, "lit", "true")), 13);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 

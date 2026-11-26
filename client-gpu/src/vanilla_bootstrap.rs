@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use megu_core::crypto::Sha1;
+use megu_core::crypto::{sha256_hex, Sha1};
 use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
 
 use crate::live_session::{jar_version_ids, SessionPaths};
@@ -874,6 +874,150 @@ pub fn spawn_vanilla_jar_bootstrap(
     dest_game_dir: &Path,
 ) -> Option<VanillaJarBootstrap> {
     spawn_vanilla_jar_bootstrap_with_manifest(version_id, dest_game_dir, VANILLA_MANIFEST_URL)
+}
+
+// ---------------------------------------------------------------------------
+// MIT block metadata for the integrated server's zero-setup runtime
+// ---------------------------------------------------------------------------
+
+// Keep these pins in sync with server-files/src/bin/megu_installer.rs. The
+// installer and the Java-free runtime use the same minecraft-data input.
+const BLOCKS_JSON_URL: &str = "https://raw.githubusercontent.com/PrismarineJS/minecraft-data/d56346a4e32defcd28d9ba6750957c12001e78d6/data/pc/1.21.1/blocks.json";
+const BLOCKS_JSON_SHA256: &str = "7d1d95c4e0255f9f269293e8077c7923c9ec0ff902a9a475ed131da8b26bc654";
+const BLOCKS_JSON_FILE: &str = "blocks_1211.json";
+const BLOCKS_JSON_CAP: u64 = 2 * 1024 * 1024;
+
+fn server_blocks_candidates(game_dir: &Path) -> Vec<PathBuf> {
+    let runtime = game_dir.join("megu-runtime");
+    let mut roots = vec![game_dir.to_path_buf(), runtime.clone()];
+    if let Ok(entries) = fs::read_dir(runtime) {
+        let mut bundles: Vec<_> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        bundles.sort();
+        roots.extend(bundles);
+    }
+    for start in [std::env::current_dir(), std::env::current_exe()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(checkout) = start.ancestors().find(|root| {
+            root.join("server-files/src/bin/megu_installer.rs")
+                .is_file()
+        }) {
+            if !roots.iter().any(|root| root == checkout) {
+                roots.push(checkout.to_path_buf());
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join("assets").join(BLOCKS_JSON_FILE))
+        .collect()
+}
+
+fn read_server_blocks(reader: impl Read, expected: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(BLOCKS_JSON_CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > BLOCKS_JSON_CAP {
+        return Err("blocks_1211.json exceeded the download size limit".to_owned());
+    }
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(format!(
+            "blocks_1211.json SHA-256 mismatch: got {actual}, expected {expected}"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn find_server_blocks(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    expected: &str,
+) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| {
+        open_regular_file(path).is_ok_and(|file| read_server_blocks(file, expected).is_ok())
+    })
+}
+
+/// Discover a verified 1.21.1 block table without accessing the network.
+pub fn discover_local_server_blocks(game_dir: &Path) -> Option<PathBuf> {
+    find_server_blocks(server_blocks_candidates(game_dir), BLOCKS_JSON_SHA256)
+}
+
+fn blocks_url_allowed(url: &str) -> bool {
+    #[cfg(test)]
+    {
+        url.parse::<ureq::http::Uri>().is_ok_and(|uri| {
+            uri.scheme_str() == Some("http")
+                && uri.host() == Some("127.0.0.1")
+                && uri.port().is_some()
+                && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+        })
+    }
+    #[cfg(not(test))]
+    {
+        url == BLOCKS_JSON_URL
+    }
+}
+
+fn download_server_blocks(game_dir: &Path, url: &str, expected: &str) -> Result<PathBuf, String> {
+    if !blocks_url_allowed(url) {
+        return Err(format!("refusing unpinned block metadata URL {url}"));
+    }
+    let mut response = successful_response(&http_agent(), url)?;
+    let bytes = read_server_blocks(response.body_mut().as_reader(), expected)?;
+    let dir = CacheDirectory::open(game_dir)
+        .and_then(|dir| dir.child("megu-runtime"))
+        .and_then(|dir| dir.child("zero-setup"))
+        .and_then(|dir| dir.child("assets"))
+        .map_err(|e| format!("create zero-setup runtime cache: {e}"))?;
+    install_bytes(&dir.file(BLOCKS_JSON_FILE), &bytes)
+        .map_err(|e| format!("install verified blocks_1211.json: {e}"))?;
+    Ok(game_dir
+        .join("megu-runtime/zero-setup/assets")
+        .join(BLOCKS_JSON_FILE))
+}
+
+/// Resolve a local block table or download the pinned MIT table when online.
+/// May block; UI callers should use [`spawn_server_blocks_bootstrap`].
+pub fn discover_or_bootstrap_blocks_json(game_dir: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = discover_local_server_blocks(game_dir) {
+        return Ok(path);
+    }
+    if !auto_fetch_enabled() {
+        return Err("blocks_1211.json was not found locally and auto-fetch is disabled".into());
+    }
+    download_server_blocks(game_dir, BLOCKS_JSON_URL, BLOCKS_JSON_SHA256)
+}
+
+/// Run block table discovery/download off the UI thread. The worker reports
+/// `Ready(blocks_json)` or `Failed(reason)`, including when offline.
+pub fn spawn_server_blocks_bootstrap(game_dir: &Path) -> Option<VanillaJarBootstrap> {
+    let game_dir = game_dir.to_path_buf();
+    let shared = Arc::new(Mutex::new(BootstrapProgress::Downloading {
+        downloaded: 0,
+        total: None,
+    }));
+    let worker_shared = Arc::clone(&shared);
+    std::thread::Builder::new()
+        .name("megu-server-blocks-bootstrap".to_owned())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(|| discover_or_bootstrap_blocks_json(&game_dir));
+            let outcome = match result {
+                Ok(Ok(path)) => BootstrapProgress::Ready(path),
+                Ok(Err(reason)) => BootstrapProgress::Failed(reason),
+                Err(_) => BootstrapProgress::Failed("block metadata worker crashed".to_owned()),
+            };
+            set_progress(&worker_shared, outcome);
+        })
+        .ok()?;
+    Some(VanillaJarBootstrap { shared })
 }
 
 // ---------------------------------------------------------------------------
@@ -1989,6 +2133,90 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("bootstrap did not reach a terminal state")
+    }
+
+    #[test]
+    fn server_blocks_discovery_skips_tampered_candidates() {
+        let dir = test_dir("server-blocks-discovery");
+        let local = dir.join("assets").join(BLOCKS_JSON_FILE);
+        let bundled = dir
+            .join("megu-runtime/some-build/assets")
+            .join(BLOCKS_JSON_FILE);
+        let bytes = b"synthetic block metadata";
+        let digest = sha256_hex(bytes);
+        for (path, data) in [
+            (&local, b"tampered".as_slice()),
+            (&bundled, bytes.as_slice()),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+        assert_eq!(
+            find_server_blocks(server_blocks_candidates(&dir), &digest),
+            Some(bundled.clone())
+        );
+        fs::write(&local, bytes).unwrap();
+        assert_eq!(
+            find_server_blocks(server_blocks_candidates(&dir), &digest),
+            Some(local)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn server_blocks_download_installs_only_verified_bytes() {
+        let dir = test_dir("server-blocks-download");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let bytes = b"[{}]";
+        let digest = sha256_hex(bytes);
+        std::thread::spawn(move || {
+            serve_once(&listener, Duration::ZERO, |path| match path {
+                "/verified" => (200, bytes.to_vec()),
+                "/oversized" => (200, vec![0; BLOCKS_JSON_CAP as usize + 1]),
+                _ => (200, b"tampered".to_vec()),
+            });
+        });
+        let dest = dir
+            .join("megu-runtime/zero-setup/assets")
+            .join(BLOCKS_JSON_FILE);
+        let err = download_server_blocks(&dir, &format!("{base}/tampered"), &digest).unwrap_err();
+        assert!(err.contains("SHA-256 mismatch"));
+        assert!(!dest.exists());
+        let err = download_server_blocks(&dir, &format!("{base}/oversized"), &digest).unwrap_err();
+        assert!(err.contains("size limit"));
+        assert!(!dest.exists());
+        assert_eq!(
+            download_server_blocks(&dir, &format!("{base}/verified"), &digest),
+            Ok(dest.clone())
+        );
+        assert_eq!(fs::read(&dest).unwrap(), bytes);
+        let entries: Vec<_> = fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(entries, [dest]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn server_blocks_tests_cannot_access_the_public_endpoint() {
+        assert!(!blocks_url_allowed(BLOCKS_JSON_URL));
+        assert!(!blocks_url_allowed(
+            "http://127.0.0.1:80@example.com/blocks.json"
+        ));
+        let dir = test_dir("server-blocks-offline");
+        let worker = spawn_server_blocks_bootstrap(&dir).unwrap();
+        match await_terminal(&worker) {
+            BootstrapProgress::Failed(reason) => assert!(reason.contains("auto-fetch is disabled")),
+            BootstrapProgress::Ready(path) => assert_eq!(
+                find_server_blocks([path.clone()], BLOCKS_JSON_SHA256),
+                Some(path),
+                "a pinned repository copy is also usable offline"
+            ),
+            other => panic!("unexpected result: {other:?}"),
+        }
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
