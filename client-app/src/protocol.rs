@@ -548,6 +548,63 @@ impl<'a> WireReader<'a> {
         Ok(value)
     }
 
+    fn read_nonnegative_varint(&mut self, negative_error: &str) -> Result<usize, String> {
+        usize::try_from(self.read_varint()?).map_err(|_| negative_error.to_string())
+    }
+
+    fn read_byte_array(&mut self, negative_error: &str) -> Result<Vec<u8>, String> {
+        let len = self.read_nonnegative_varint(negative_error)?;
+        Ok(self.take(len)?.to_vec())
+    }
+
+    /// A list count whose entries each need at least `min_entry_bytes` on the wire.
+    fn read_count(&mut self, min_entry_bytes: usize, label: &str) -> Result<usize, String> {
+        let count =
+            usize::try_from(self.read_varint()?).map_err(|_| format!("negative {label} count"))?;
+        if count > self.remaining() / min_entry_bytes {
+            return Err(format!("{label} count exceeds remaining input"));
+        }
+        Ok(count)
+    }
+
+    fn read_list<T>(
+        &mut self,
+        count: usize,
+        capacity_limit: usize,
+        mut read: impl FnMut(&mut Self) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
+        let mut list = Vec::with_capacity(count.min(capacity_limit));
+        for _ in 0..count {
+            list.push(read(self)?);
+        }
+        Ok(list)
+    }
+
+    fn read_optional<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<Option<T>, String> {
+        if self.read_bool()? {
+            Ok(Some(read(self)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn read_nbt_bytes(&mut self) -> Result<Vec<u8>, String> {
+        Ok(read_nbt_raw(self)?.to_vec())
+    }
+
+    // Anonymous optional NBT uses a zero tag to indicate absence.
+    fn read_nbt_or_empty(&mut self) -> Result<Vec<u8>, String> {
+        if self.rest().first() == Some(&0) {
+            self.read_u8()?;
+            Ok(Vec::new())
+        } else {
+            self.read_nbt_bytes()
+        }
+    }
+
     pub fn read_string(&mut self, max_bytes: usize) -> Result<String, String> {
         let len = usize::try_from(self.read_varint()?)
             .map_err(|_| "negative string length".to_string())?;
@@ -3444,7 +3501,11 @@ pub fn handle_transfer_packet(host: &str, port: i32) -> Result<TransferTarget, S
 /// Read one `Slot` payload from `r`, returning its raw wire bytes — bounded
 /// by the same fail-closed walker the container decoders use.
 fn read_slot_wire(r: &mut WireReader<'_>) -> Result<Vec<u8>, String> {
-    let end = slot_skip_extent(r.rest(), 0).ok_or("malformed slot payload")?;
+    read_slot_wire_with_error(r, "malformed slot payload")
+}
+
+fn read_slot_wire_with_error(r: &mut WireReader<'_>, malformed: &str) -> Result<Vec<u8>, String> {
+    let end = slot_skip_extent(r.rest(), 0).ok_or(malformed)?;
     Ok(r.take(end)?.to_vec())
 }
 
@@ -3483,8 +3544,8 @@ fn read_merchant_item_cost(r: &mut WireReader<'_>) -> Result<MerchantItemCost, S
 /// Read one `update_advancements` display block (title/description NBT,
 /// icon slot, frame, flags, optional background texture, x/y floats).
 fn read_advancement_display(r: &mut WireReader<'_>) -> Result<WireAdvancementDisplay, String> {
-    let title_nbt = read_nbt_raw(r)?.to_vec();
-    let description_nbt = read_nbt_raw(r)?.to_vec();
+    let title_nbt = r.read_nbt_bytes()?;
+    let description_nbt = r.read_nbt_bytes()?;
     let icon_slot_wire = read_slot_wire(r)?;
     let frame_type = r.read_varint()?;
     let flags = r.read_i32()?;
@@ -3510,32 +3571,13 @@ fn read_advancement_display(r: &mut WireReader<'_>) -> Result<WireAdvancementDis
 /// Read one `update_advancements` tree entry.
 fn read_wire_advancement(r: &mut WireReader<'_>) -> Result<WireAdvancement, String> {
     let key = r.read_string(32767)?;
-    let parent_id = if r.read_bool()? {
-        Some(r.read_string(32767)?)
-    } else {
-        None
-    };
-    let display = if r.read_bool()? {
-        Some(read_advancement_display(r)?)
-    } else {
-        None
-    };
-    let nreq =
-        usize::try_from(r.read_varint()?).map_err(|_| "negative requirement count".to_string())?;
-    if nreq > r.remaining() {
-        return Err("requirement count exceeds remaining input".into());
-    }
+    let parent_id = r.read_optional(|r| r.read_string(32767))?;
+    let display = r.read_optional(read_advancement_display)?;
+    let nreq = r.read_count(1, "requirement")?;
     let mut requirements = Vec::with_capacity(nreq.min(64));
     for _ in 0..nreq {
-        let ncrit = usize::try_from(r.read_varint()?)
-            .map_err(|_| "negative criterion count".to_string())?;
-        if ncrit > r.remaining() {
-            return Err("criterion count exceeds remaining input".into());
-        }
-        let mut group = Vec::with_capacity(ncrit.min(32));
-        for _ in 0..ncrit {
-            group.push(r.read_string(32767)?);
-        }
+        let ncrit = r.read_count(1, "criterion")?;
+        let group = r.read_list(ncrit, 32, |r| r.read_string(32767))?;
         requirements.push(group);
     }
     let sends_telemetry = r.read_bool()?;
@@ -3558,6 +3600,32 @@ fn read_wire_advancement(r: &mut WireReader<'_>) -> Result<WireAdvancement, Stri
 /// `!wire_26x()`.
 pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<PlayEvent>, String> {
     let mut r = WireReader::new(body);
+    // A family only reads from the packet after matching its name.
+    if let Some(event) = decode_entity_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    if let Some(event) = decode_world_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    if let Some(event) = decode_container_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    if let Some(event) = decode_player_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    if let Some(event) = decode_hud_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    if let Some(event) = decode_chat_play_event(name, &mut r)? {
+        return Ok(Some(event));
+    }
+    decode_session_play_event(name, &mut r)
+}
+
+fn decode_entity_play_event(
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<Option<PlayEvent>, String> {
     Ok(Some(match name {
         "add_entity" => {
             let eid = r.read_varint()?;
@@ -3590,8 +3658,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             }
         }
         "remove_entities" => {
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative entity count".to_string())?;
+            let count = r.read_nonnegative_varint("negative entity count")?;
             // Each id is at least one VarInt byte.
             if count > r.remaining() {
                 return Err(format!(
@@ -3599,10 +3666,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                     r.remaining()
                 ));
             }
-            let mut eids = Vec::with_capacity(count);
-            for _ in 0..count {
-                eids.push(r.read_varint()?);
-            }
+            let eids = r.read_list(count, count, WireReader::read_varint)?;
             PlayEvent::RemoveEntities { eids }
         }
         "move_entity_pos" => {
@@ -3685,6 +3749,10 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             let status = r.read_i8()?;
             PlayEvent::EntityEvent { eid, status }
         }
+        "animate" => PlayEvent::Animate {
+            eid: r.read_varint()?,
+            animation: r.read_u8()?,
+        },
         "hurt_animation" => {
             let eid = r.read_varint()?;
             let yaw = r.read_f32()?;
@@ -3721,15 +3789,8 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                 }
                 let byte = r.read_u8()?;
                 let slot = byte & 0x7f;
-                let item_start = body.len() - r.remaining();
-                let item_end = slot_skip_extent(body, item_start)
-                    .ok_or_else(|| "malformed set_equipment slot".to_string())?;
-                // Advance the reader past the skipped slot bytes.
-                r.take(item_end - item_start)?;
-                entries.push(EquipmentEntry {
-                    slot,
-                    item_wire: body[item_start..item_end].to_vec(),
-                });
+                let item_wire = read_slot_wire_with_error(r, "malformed set_equipment slot")?;
+                entries.push(EquipmentEntry { slot, item_wire });
                 if byte & 0x80 == 0 {
                     break;
                 }
@@ -3743,6 +3804,101 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                 raw_entries: r.rest().to_vec(),
             }
         }
+        "update_mob_effect" => {
+            let eid = r.read_varint()?;
+            let effect_id = r.read_varint()?;
+            let amplifier = r.read_varint()?;
+            let duration = r.read_varint()?;
+            let flags = r.read_u8()?;
+            PlayEvent::UpdateMobEffect {
+                eid,
+                effect_id,
+                amplifier,
+                duration,
+                flags,
+            }
+        }
+        "remove_mob_effect" => {
+            let eid = r.read_varint()?;
+            let effect_id = r.read_varint()?;
+            PlayEvent::RemoveMobEffect { eid, effect_id }
+        }
+        "move_vehicle" => PlayEvent::MoveVehicle {
+            x: r.read_f64()?,
+            y: r.read_f64()?,
+            z: r.read_f64()?,
+            yaw: r.read_f32()?,
+            pitch: r.read_f32()?,
+        },
+        "set_passengers" => {
+            let vehicle = r.read_varint()?;
+            let count = r.read_count(1, "passenger")?;
+            let passengers = r.read_list(count, 256, WireReader::read_varint)?;
+            PlayEvent::SetPassengers {
+                vehicle,
+                passengers,
+            }
+        }
+        "set_entity_link" => PlayEvent::SetEntityLink {
+            source: r.read_varint()?,
+            destination: r.read_varint()?,
+        },
+        "take_item_entity" => PlayEvent::TakeItemEntity {
+            item_entity: r.read_varint()?,
+            player: r.read_varint()?,
+            amount: r.read_varint()?,
+        },
+        "update_attributes" => {
+            let eid = r.read_varint()?;
+            let count = r.read_count(9, "attribute")?;
+            let mut attributes = Vec::with_capacity(count.min(128));
+            for _ in 0..count {
+                let attribute = r.read_varint()?;
+                let base = r.read_f64()?;
+                let modifier_count = r.read_count(25, "attribute modifier")?;
+                let mut modifiers = Vec::with_capacity(modifier_count.min(64));
+                for _ in 0..modifier_count {
+                    let uuid = r.read_uuid()?;
+                    let amount = r.read_f64()?;
+                    let operation = r.read_varint()?;
+                    if !(0..=2).contains(&operation) {
+                        return Err("invalid attribute modifier operation".into());
+                    }
+                    modifiers.push(WireAttributeModifier {
+                        uuid,
+                        amount,
+                        operation,
+                    });
+                }
+                attributes.push(WireAttribute {
+                    attribute,
+                    base,
+                    modifiers,
+                });
+            }
+            PlayEvent::UpdateAttributes { eid, attributes }
+        }
+        "set_projectile_power" => PlayEvent::SetProjectilePower {
+            eid: r.read_varint()?,
+            acceleration: r.read_f64()?,
+        },
+        "player_combat_end" => PlayEvent::PlayerCombatEnd {
+            duration: r.read_varint()?,
+        },
+        "player_combat_enter" => PlayEvent::PlayerCombatEnter,
+        "player_combat_kill" => PlayEvent::PlayerCombatKill {
+            player_id: r.read_varint()?,
+            message_nbt: r.read_nbt_bytes()?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_world_play_event(
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
         "set_time" => {
             let world_age = r.read_i64()?;
             let time_of_day = r.read_i64()?;
@@ -3808,8 +3964,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             let y = r.read_f64()?;
             let z = r.read_f64()?;
             let power = r.read_f32()?;
-            let record_count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative explosion record count".to_string())?;
+            let record_count = r.read_nonnegative_varint("negative explosion record count")?;
             if record_count > MAX_EXPLOSION_RECORDS || record_count > r.remaining() / 3 {
                 return Err(format!(
                     "explosion record count {record_count} exceeds {} remaining bytes",
@@ -3827,7 +3982,7 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             // `explosion_emitter`, `gust*`), so each id is a bare varint.
             let small_particle_id = r.read_varint()?;
             let large_particle_id = r.read_varint()?;
-            let (sound_name, sound_id) = decode_explosion_sound(&mut r);
+            let (sound_name, sound_id) = decode_explosion_sound(r);
             PlayEvent::Explosion {
                 x,
                 y,
@@ -3847,22 +4002,104 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             let kind = r.read_varint()?;
             // anonOptionalNbt: a leading 0x00 tag byte means absent; any other
             // byte is the NBT tag type and the value follows.
-            let nbt_bytes = if r.rest().first() == Some(&0) {
-                r.read_u8()?;
-                Vec::new()
-            } else {
-                read_nbt_raw(&mut r)?.to_vec()
-            };
+            let nbt_bytes = r.read_nbt_or_empty()?;
             PlayEvent::BlockEntityData {
                 pos,
                 kind,
                 nbt_bytes,
             }
         }
+        "block_event" => PlayEvent::BlockEvent {
+            pos: r.read_position()?,
+            action: r.read_u8()?,
+            parameter: r.read_u8()?,
+            block_type: r.read_varint()?,
+        },
+        "block_changed_ack" => PlayEvent::BlockChangedAck(r.read_varint()?),
+        "tag_query" => {
+            let transaction_id = r.read_varint()?;
+            let nbt_bytes = r.read_nbt_or_empty()?;
+            PlayEvent::TagQuery {
+                transaction_id,
+                nbt_bytes,
+            }
+        }
+        "set_default_spawn_position" => PlayEvent::SetDefaultSpawnPosition {
+            pos: r.read_position()?,
+            angle: r.read_f32()?,
+        },
+        "initialize_border" => PlayEvent::InitializeBorder {
+            x: r.read_f64()?,
+            z: r.read_f64()?,
+            old_diameter: r.read_f64()?,
+            new_diameter: r.read_f64()?,
+            lerp_ms: r.read_varlong()?,
+            portal_boundary: r.read_varint()?,
+            warning_blocks: r.read_varint()?,
+            warning_time: r.read_varint()?,
+        },
+        "set_border_center" => PlayEvent::SetBorderCenter {
+            x: r.read_f64()?,
+            z: r.read_f64()?,
+        },
+        "set_border_size" => PlayEvent::SetBorderSize {
+            diameter: r.read_f64()?,
+        },
+        "set_border_lerp_size" => PlayEvent::SetBorderLerpSize {
+            old_diameter: r.read_f64()?,
+            new_diameter: r.read_f64()?,
+            lerp_ms: r.read_varlong()?,
+        },
+        "set_border_warning_delay" => PlayEvent::SetBorderWarningDelay {
+            warning_time: r.read_varint()?,
+        },
+        "set_border_warning_distance" => PlayEvent::SetBorderWarningDistance {
+            warning_blocks: r.read_varint()?,
+        },
+        "set_chunk_cache_radius" => PlayEvent::SetChunkCacheRadius(r.read_varint()?),
+        "set_simulation_distance" => PlayEvent::SetSimulationDistance(r.read_varint()?),
+        "ticking_state" => PlayEvent::TickingState {
+            tick_rate: r.read_f32()?,
+            frozen: r.read_bool()?,
+        },
+        "ticking_step" => {
+            let steps = r.read_varint()?;
+            if steps < 0 {
+                return Err("negative ticking step count".into());
+            }
+            PlayEvent::TickingStep { steps }
+        }
+        "change_difficulty" => PlayEvent::ChangeDifficulty {
+            difficulty: r.read_u8()?,
+            locked: r.read_bool()?,
+        },
+        "chunks_biomes" => {
+            // Each entry is at least nine bytes (8-byte packed pos + a
+            // one-byte data length).
+            let count = r.read_count(9, "chunk")?;
+            let mut chunks = Vec::with_capacity(count.min(256));
+            for _ in 0..count {
+                // ChunkPos wire order is Z then X (big-endian i64 layout).
+                let cz = r.read_i32()?;
+                let cx = r.read_i32()?;
+                let data = r.read_byte_array("negative biome data length")?;
+                chunks.push(ChunkBiomeData { cx, cz, data });
+            }
+            PlayEvent::ChunksBiomes { chunks }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_container_play_event(
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
         "open_screen" => {
             let window_id = r.read_varint()?;
             let menu_type = r.read_varint()?;
-            let title_nbt = read_nbt_raw(&mut r)?.to_vec();
+            let title_nbt = r.read_nbt_bytes()?;
             PlayEvent::OpenScreen {
                 window_id,
                 menu_type,
@@ -3905,633 +4142,21 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             let window_id = r.read_u8()?;
             PlayEvent::ContainerClose { window_id }
         }
-        "set_experience" => {
-            let bar = r.read_f32()?;
-            let level = r.read_varint()?;
-            let total = r.read_varint()?;
-            PlayEvent::SetExperience { bar, level, total }
-        }
-        "update_mob_effect" => {
-            let eid = r.read_varint()?;
-            let effect_id = r.read_varint()?;
-            let amplifier = r.read_varint()?;
-            let duration = r.read_varint()?;
-            let flags = r.read_u8()?;
-            PlayEvent::UpdateMobEffect {
-                eid,
-                effect_id,
-                amplifier,
-                duration,
-                flags,
-            }
-        }
-        "remove_mob_effect" => {
-            let eid = r.read_varint()?;
-            let effect_id = r.read_varint()?;
-            PlayEvent::RemoveMobEffect { eid, effect_id }
-        }
-        "set_action_bar_text" => PlayEvent::SetActionBarText {
-            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
-        },
-        "set_title_text" => PlayEvent::SetTitleText {
-            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
-        },
-        "set_subtitle_text" => PlayEvent::SetSubtitleText {
-            nbt_bytes: read_nbt_raw(&mut r)?.to_vec(),
-        },
-        "boss_event" => {
-            let uuid = r.read_uuid()?;
-            let action = r.read_varint()?;
-            PlayEvent::BossEvent {
-                uuid,
-                action,
-                raw_payload: r.rest().to_vec(),
-            }
-        }
-        "player_info_remove" => PlayEvent::PlayerInfoRemove {
-            uuids: read_uuid_list(&mut r)?,
-        },
-        "player_info_update" => {
-            let actions = r.read_u8()?;
-            let count = r.read_varint()?;
-            if !(0..=1024).contains(&count) {
-                return Err(format!(
-                    "player_info_update entry count {count} out of range"
-                ));
-            }
-            let mut entries = Vec::with_capacity(count as usize & 0xff);
-            for _ in 0..count {
-                let uuid = r.read_uuid()?;
-                let mut entry = PlayerInfoUpdateEntry {
-                    uuid,
-                    name: None,
-                    properties: Vec::new(),
-                    chat_session: None,
-                    game_mode: None,
-                    listed: None,
-                    latency: None,
-                    display_name_nbt: None,
-                };
-                if actions & 0x01 != 0 {
-                    entry.name = Some(r.read_string(16)?);
-                    let props = r.read_varint()?;
-                    if !(0..=16).contains(&props) {
-                        return Err(format!("player_info property count {props} out of range"));
-                    }
-                    for _ in 0..props {
-                        let pname = r.read_string(64)?;
-                        let pvalue = r.read_string(32767)?;
-                        let sig = if r.read_bool()? {
-                            Some(r.read_string(1024)?)
-                        } else {
-                            None
-                        };
-                        entry.properties.push((pname, pvalue, sig));
-                    }
-                }
-                if actions & 0x02 != 0 && r.read_bool()? {
-                    // session id (16) + key expiry (8) + two varint-prefixed
-                    // blobs; retain the whole bounded tail for the
-                    // signature verifier rather than re-serializing it.
-                    let start = body.len() - r.rest().len();
-                    let mut tail = r;
-                    tail.read_uuid()?;
-                    tail.read_i64()?;
-                    let key_len = tail.read_varint()?;
-                    if !(0..=4096).contains(&key_len) {
-                        return Err("player_info key blob out of range".into());
-                    }
-                    for _ in 0..key_len {
-                        tail.read_u8()?;
-                    }
-                    let sig_len = tail.read_varint()?;
-                    if !(0..=4096).contains(&sig_len) {
-                        return Err("player_info signature blob out of range".into());
-                    }
-                    for _ in 0..sig_len {
-                        tail.read_u8()?;
-                    }
-                    let end = body.len() - tail.rest().len();
-                    entry.chat_session = Some(body[start..end].to_vec());
-                    r = tail;
-                }
-                if actions & 0x04 != 0 {
-                    entry.game_mode = Some(r.read_varint()?);
-                }
-                if actions & 0x08 != 0 {
-                    entry.listed = Some(r.read_bool()?);
-                }
-                if actions & 0x10 != 0 {
-                    entry.latency = Some(r.read_varint()?);
-                }
-                if actions & 0x20 != 0 && r.read_bool()? {
-                    entry.display_name_nbt = Some(read_nbt_raw(&mut r)?.to_vec());
-                }
-                entries.push(entry);
-            }
-            PlayEvent::PlayerInfo { actions, entries }
-        }
-        "set_objective" => {
-            let objective = r.read_string(16)?;
-            let mode = r.read_i8()?;
-            let (display_name_nbt, render_type, number_format_kind, number_format_nbt) =
-                if mode == 0 || mode == 2 {
-                    let display = read_nbt_raw(&mut r)?.to_vec();
-                    let render = r.read_varint()?;
-                    let (kind, nbt) = if r.read_bool()? {
-                        let kind = r.read_varint()?;
-                        let nbt = if kind == 1 || kind == 2 {
-                            Some(read_nbt_raw(&mut r)?.to_vec())
-                        } else {
-                            None
-                        };
-                        (Some(kind), nbt)
-                    } else {
-                        (None, None)
-                    };
-                    (Some(display), Some(render), kind, nbt)
-                } else {
-                    (None, None, None, None)
-                };
-            PlayEvent::SetObjective {
-                objective,
-                mode,
-                display_name_nbt,
-                render_type,
-                number_format_kind,
-                number_format_nbt,
-            }
-        }
-        "set_score" => {
-            let owner = r.read_string(32767)?;
-            let objective = r.read_string(32767)?;
-            let value = r.read_varint()?;
-            let display_nbt = if r.read_bool()? {
-                Some(read_nbt_raw(&mut r)?.to_vec())
-            } else {
-                None
-            };
-            let number_format_kind = if r.read_bool()? {
-                let kind = r.read_varint()?;
-                if kind == 1 || kind == 2 {
-                    let _ = read_nbt_raw(&mut r)?;
-                }
-                Some(kind)
-            } else {
-                None
-            };
-            PlayEvent::SetScore {
-                owner,
-                objective,
-                value,
-                display_nbt,
-                number_format_kind,
-            }
-        }
-        "set_display_objective" => PlayEvent::SetDisplayObjective {
-            slot: r.read_varint()?,
-            objective: r.read_string(16)?,
-        },
-        "reset_score" => {
-            let owner = r.read_string(32767)?;
-            let objective = if r.read_bool()? {
-                Some(r.read_string(32767)?)
-            } else {
-                None
-            };
-            PlayEvent::ResetScore { owner, objective }
-        }
-        "set_titles_animation" => PlayEvent::SetTitle {
-            fade_in: r.read_i32()?,
-            stay: r.read_i32()?,
-            fade_out: r.read_i32()?,
-        },
-        "pong_response" => PlayEvent::PongResponse { id: r.read_i64()? },
-        "initialize_border" => PlayEvent::InitializeBorder {
-            x: r.read_f64()?,
-            z: r.read_f64()?,
-            old_diameter: r.read_f64()?,
-            new_diameter: r.read_f64()?,
-            lerp_ms: r.read_varlong()?,
-            portal_boundary: r.read_varint()?,
-            warning_blocks: r.read_varint()?,
-            warning_time: r.read_varint()?,
-        },
-        "set_border_center" => PlayEvent::SetBorderCenter {
-            x: r.read_f64()?,
-            z: r.read_f64()?,
-        },
-        "set_border_size" => PlayEvent::SetBorderSize {
-            diameter: r.read_f64()?,
-        },
-        "set_border_lerp_size" => PlayEvent::SetBorderLerpSize {
-            old_diameter: r.read_f64()?,
-            new_diameter: r.read_f64()?,
-            lerp_ms: r.read_varlong()?,
-        },
-        "set_border_warning_delay" => PlayEvent::SetBorderWarningDelay {
-            warning_time: r.read_varint()?,
-        },
-        "set_border_warning_distance" => PlayEvent::SetBorderWarningDistance {
-            warning_blocks: r.read_varint()?,
-        },
-        "animate" => PlayEvent::Animate {
-            eid: r.read_varint()?,
-            animation: r.read_u8()?,
-        },
-        "block_event" => PlayEvent::BlockEvent {
-            pos: r.read_position()?,
-            action: r.read_u8()?,
-            parameter: r.read_u8()?,
-            block_type: r.read_varint()?,
-        },
-        "set_default_spawn_position" => PlayEvent::SetDefaultSpawnPosition {
-            pos: r.read_position()?,
-            angle: r.read_f32()?,
-        },
-        "set_chunk_cache_radius" => PlayEvent::SetChunkCacheRadius(r.read_varint()?),
-        "set_simulation_distance" => PlayEvent::SetSimulationDistance(r.read_varint()?),
-        "ticking_state" => PlayEvent::TickingState {
-            tick_rate: r.read_f32()?,
-            frozen: r.read_bool()?,
-        },
-        "ticking_step" => {
-            let steps = r.read_varint()?;
-            if steps < 0 {
-                return Err("negative ticking step count".into());
-            }
-            PlayEvent::TickingStep { steps }
-        }
-        "move_vehicle" => PlayEvent::MoveVehicle {
-            x: r.read_f64()?,
-            y: r.read_f64()?,
-            z: r.read_f64()?,
-            yaw: r.read_f32()?,
-            pitch: r.read_f32()?,
-        },
-        "set_passengers" => {
-            let vehicle = r.read_varint()?;
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative passenger count".to_string())?;
-            if count > r.remaining() {
-                return Err("passenger count exceeds remaining input".into());
-            }
-            let mut passengers = Vec::with_capacity(count.min(256));
-            for _ in 0..count {
-                passengers.push(r.read_varint()?);
-            }
-            PlayEvent::SetPassengers {
-                vehicle,
-                passengers,
-            }
-        }
-        "set_entity_link" => PlayEvent::SetEntityLink {
-            source: r.read_varint()?,
-            destination: r.read_varint()?,
-        },
-        "take_item_entity" => PlayEvent::TakeItemEntity {
-            item_entity: r.read_varint()?,
-            player: r.read_varint()?,
-            amount: r.read_varint()?,
-        },
-        "set_camera" => PlayEvent::SetCamera {
-            eid: r.read_varint()?,
-        },
-        "open_book" => {
-            let hand = r.read_varint()?;
-            if !(0..=1).contains(&hand) {
-                return Err("invalid hand in open_book".into());
-            }
-            PlayEvent::OpenBook { hand: hand as u8 }
-        }
-        "open_sign_editor" => PlayEvent::OpenSignEditor {
-            pos: r.read_position()?,
-            front_side: r.read_bool()?,
-        },
-        "tab_list" => PlayEvent::TabList {
-            header_nbt: read_nbt_raw(&mut r)?.to_vec(),
-            footer_nbt: read_nbt_raw(&mut r)?.to_vec(),
-        },
-        "update_attributes" => {
-            let eid = r.read_varint()?;
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative attribute count".to_string())?;
-            if count > r.remaining() / 9 {
-                return Err("attribute count exceeds remaining input".into());
-            }
-            let mut attributes = Vec::with_capacity(count.min(128));
-            for _ in 0..count {
-                let attribute = r.read_varint()?;
-                let base = r.read_f64()?;
-                let modifier_count = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative attribute modifier count".to_string())?;
-                if modifier_count > r.remaining() / 25 {
-                    return Err("attribute modifier count exceeds remaining input".into());
-                }
-                let mut modifiers = Vec::with_capacity(modifier_count.min(64));
-                for _ in 0..modifier_count {
-                    let uuid = r.read_uuid()?;
-                    let amount = r.read_f64()?;
-                    let operation = r.read_varint()?;
-                    if !(0..=2).contains(&operation) {
-                        return Err("invalid attribute modifier operation".into());
-                    }
-                    modifiers.push(WireAttributeModifier {
-                        uuid,
-                        amount,
-                        operation,
-                    });
-                }
-                attributes.push(WireAttribute {
-                    attribute,
-                    base,
-                    modifiers,
-                });
-            }
-            PlayEvent::UpdateAttributes { eid, attributes }
-        }
-        "command_suggestions" => {
-            let transaction_id = r.read_varint()?;
-            let start = r.read_varint()?;
-            let length = r.read_varint()?;
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative command suggestion count".to_string())?;
-            if count > r.remaining() / 2 {
-                return Err("command suggestion count exceeds remaining input".into());
-            }
-            let mut matches = Vec::with_capacity(count.min(1024));
-            for _ in 0..count {
-                let text = r.read_string(32767)?;
-                let tooltip_nbt = if r.read_bool()? {
-                    Some(read_nbt_raw(&mut r)?.to_vec())
-                } else {
-                    None
-                };
-                matches.push(WireSuggestion { text, tooltip_nbt });
-            }
-            PlayEvent::CommandSuggestions {
-                transaction_id,
-                start,
-                length,
-                matches,
-            }
-        }
-        "ping" => PlayEvent::Ping(r.read_i32()?),
-        "cookie_request" => PlayEvent::CookieRequest(r.read_string(32767)?),
-        "place_ghost_recipe" => PlayEvent::PlaceGhostRecipe {
+        "horse_screen_open" => PlayEvent::HorseScreenOpen {
             window_id: r.read_u8()?,
-            recipe: r.read_string(32767)?,
+            slots: r.read_varint()?,
+            entity_id: r.read_i32()?,
         },
-        "tag_query" => {
-            let transaction_id = r.read_varint()?;
-            let nbt_bytes = if r.rest().first() == Some(&0) {
-                r.read_u8()?;
-                Vec::new()
-            } else {
-                read_nbt_raw(&mut r)?.to_vec()
-            };
-            PlayEvent::TagQuery {
-                transaction_id,
-                nbt_bytes,
-            }
-        }
-        "set_projectile_power" => PlayEvent::SetProjectilePower {
-            eid: r.read_varint()?,
-            acceleration: r.read_f64()?,
-        },
-        "custom_report_details" => {
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative report detail count".to_string())?;
-            if count > r.remaining() / 2 {
-                return Err("report detail count exceeds remaining input".into());
-            }
-            let mut details = Vec::with_capacity(count.min(64));
-            for _ in 0..count {
-                details.push((r.read_string(64)?, r.read_string(1024)?));
-            }
-            PlayEvent::CustomReportDetails(details)
-        }
-        "server_links" => {
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative server link count".to_string())?;
-            if count > r.remaining() / 2 {
-                return Err("server link count exceeds remaining input".into());
-            }
-            let mut links = Vec::with_capacity(count.min(64));
-            for _ in 0..count {
-                let (label, custom_label_nbt) = match r.read_u8()? {
-                    0 => (None, Some(read_nbt_raw(&mut r)?.to_vec())),
-                    1 => (Some(r.read_varint()?), None),
-                    _ => return Err("invalid server link label kind".into()),
-                };
-                let url = r.read_string(2048)?;
-                links.push(WireServerLink {
-                    label,
-                    custom_label_nbt,
-                    url,
-                });
-            }
-            PlayEvent::ServerLinks(links)
-        }
-        "block_changed_ack" => PlayEvent::BlockChangedAck(r.read_varint()?),
-        "change_difficulty" => PlayEvent::ChangeDifficulty {
-            difficulty: r.read_u8()?,
-            locked: r.read_bool()?,
-        },
-        "clear_titles" => PlayEvent::ClearTitles,
-        "cooldown" => PlayEvent::Cooldown {
-            item: r.read_varint()?,
-            ticks: r.read_varint()?,
-        },
-        "player_abilities" => PlayEvent::PlayerAbilities {
-            flags: r.read_u8()?,
-            flying_speed: r.read_f32()?,
-            walking_speed: r.read_f32()?,
-        },
-        "player_combat_end" => PlayEvent::PlayerCombatEnd {
-            duration: r.read_varint()?,
-        },
-        "player_combat_enter" => PlayEvent::PlayerCombatEnter,
-        "player_combat_kill" => PlayEvent::PlayerCombatKill {
-            player_id: r.read_varint()?,
-            message_nbt: read_nbt_raw(&mut r)?.to_vec(),
-        },
-        "resource_pack_pop" => PlayEvent::ResourcePackPop {
-            uuid: if r.read_bool()? {
-                Some(r.read_uuid()?)
-            } else {
-                None
-            },
-        },
-        "resource_pack_push" => PlayEvent::ResourcePackPush {
-            uuid: r.read_uuid()?,
-            url: r.read_string(32767)?,
-            hash: r.read_string(40)?,
-            forced: r.read_bool()?,
-            prompt_nbt: if r.read_bool()? {
-                Some(read_nbt_raw(&mut r)?.to_vec())
-            } else {
-                None
-            },
-        },
-        "set_carried_item" => PlayEvent::SetCarriedItem(i16::from(r.read_i8()?)),
-        "store_cookie" => {
-            let key = r.read_string(32767)?;
-            let len = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative cookie payload length".to_string())?;
-            if len > 5120 {
-                return Err("cookie payload exceeds 5 KiB".into());
-            }
-            PlayEvent::StoreCookie {
-                key,
-                payload: r.take(len)?.to_vec(),
-            }
-        }
-        "custom_chat_completions" => {
-            let action = r.read_varint()?;
-            if !(0..=2).contains(&action) {
-                return Err("invalid chat completions action".into());
-            }
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative chat completion count".to_string())?;
-            if count > r.remaining() {
-                return Err("chat completion count exceeds remaining input".into());
-            }
-            let mut entries = Vec::with_capacity(count.min(1024));
-            for _ in 0..count {
-                entries.push(r.read_string(32767)?);
-            }
-            PlayEvent::ChatCompletions { action, entries }
-        }
-        "reset_chat" => PlayEvent::ResetChat,
-        "delete_chat" => {
-            let encoded_index = r.read_varint()?;
-            if encoded_index < 0 {
-                return Err("negative delete-chat index".into());
-            }
-            if encoded_index == 0 {
-                let signature = r.take(256)?.try_into().unwrap();
-                PlayEvent::DeleteChat {
-                    message_index: None,
-                    signature: Some(signature),
-                }
-            } else {
-                PlayEvent::DeleteChat {
-                    message_index: Some(encoded_index - 1),
-                    signature: None,
-                }
-            }
-        }
-        "disguised_chat" => {
-            let nbt_bytes = read_nbt_raw(&mut r)?.to_vec();
-            let text = WireReader::new(&nbt_bytes)
-                .read_nbt()
-                .map(|v| v.extract_text())
-                .unwrap_or_default();
-            let _chat_type = r.read_varint()?;
-            let _sender_name = read_nbt_raw(&mut r)?;
-            if r.read_bool()? {
-                let _target_name = read_nbt_raw(&mut r)?;
-            }
-            PlayEvent::DisguisedChat { text, nbt_bytes }
-        }
-        "player_chat" => {
-            let sender = r.read_uuid()?;
-            let index = r.read_varint()?;
-            let signature = if r.read_bool()? {
-                Some(r.take(256)?.try_into().unwrap())
-            } else {
-                None
-            };
-            let message = r.read_string(32767)?;
-            let _timestamp = r.read_i64()?;
-            let _salt = r.read_i64()?;
-            let _last_seen_offset = r.read_varint()?;
-            r.take(3)?; // fixed 20-bit acknowledgement bitset
-            if r.read_bool()? {
-                let _unsigned_content = read_nbt_raw(&mut r)?;
-            }
-            let filter_type = r.read_varint()?;
-            match filter_type {
-                0 | 1 => {}
-                2 => {
-                    let _filter = r.read_bitset(64)?;
-                }
-                _ => return Err("invalid chat filter type".into()),
-            }
-            let _chat_type = r.read_varint()?;
-            let sender_name = read_nbt_raw(&mut r)?;
-            let mut nbt_bytes = sender_name.to_vec();
-            if r.read_bool()? {
-                nbt_bytes.extend_from_slice(read_nbt_raw(&mut r)?);
-            }
-            PlayEvent::PlayerChat {
-                sender,
-                index,
-                signature,
-                text: message,
-                nbt_bytes,
-            }
-        }
-        "set_player_team" => {
-            let name = r.read_string(32767)?;
-            let mode = r.read_u8()?;
-            if mode > 4 {
-                return Err("invalid team mode".into());
-            }
-            let info = if mode == 0 || mode == 2 {
-                Some(Box::new(PlayerTeamInfo {
-                    display_name_nbt: read_nbt_raw(&mut r)?.to_vec(),
-                    friendly_flags: r.read_u8()?,
-                    nametag_visibility: r.read_string(64)?,
-                    collision_rule: r.read_string(64)?,
-                    color: r.read_varint()?,
-                    prefix_nbt: read_nbt_raw(&mut r)?.to_vec(),
-                    suffix_nbt: read_nbt_raw(&mut r)?.to_vec(),
-                }))
-            } else {
-                None
-            };
-            let entities = if matches!(mode, 0 | 3 | 4) {
-                let count = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative entity count".to_string())?;
-                // Each entity entry is at least a one-byte length prefix.
-                if count > r.remaining() {
-                    return Err("entity count exceeds remaining input".into());
-                }
-                let mut list = Vec::with_capacity(count.min(64));
-                for _ in 0..count {
-                    list.push(r.read_string(32767)?);
-                }
-                list
-            } else {
-                Vec::new()
-            };
-            PlayEvent::SetPlayerTeam {
-                name,
-                mode,
-                info,
-                entities,
-            }
-        }
         "merchant_offers" => {
             let window_id = r.read_varint()?;
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative trade count".to_string())?;
             // Each offer needs at least ~30 bytes (two costs + slot + two
             // flags + six i32 fields); reject impossible counts up front.
-            if count > r.remaining() / 30 {
-                return Err("trade count exceeds remaining input".into());
-            }
+            let count = r.read_count(30, "trade")?;
             let mut offers = Vec::with_capacity(count.min(64));
             for _ in 0..count {
-                let cost_a = read_merchant_item_cost(&mut r)?;
-                let result_slot_wire = read_slot_wire(&mut r)?;
-                let cost_b = if r.read_bool()? {
-                    Some(read_merchant_item_cost(&mut r)?)
-                } else {
-                    None
-                };
+                let cost_a = read_merchant_item_cost(r)?;
+                let result_slot_wire = read_slot_wire(r)?;
+                let cost_b = r.read_optional(read_merchant_item_cost)?;
                 let disabled = r.read_bool()?;
                 let uses = r.read_i32()?;
                 let max_uses = r.read_i32()?;
@@ -4565,74 +4190,49 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                 can_restock,
             }
         }
-        "horse_screen_open" => PlayEvent::HorseScreenOpen {
+        "place_ghost_recipe" => PlayEvent::PlaceGhostRecipe {
             window_id: r.read_u8()?,
-            slots: r.read_varint()?,
-            entity_id: r.read_i32()?,
+            recipe: r.read_string(32767)?,
         },
-        "map_item_data" => {
-            let map_id = r.read_varint()?;
-            let scale = r.read_i8()?;
-            let locked = r.read_bool()?;
-            let icons = if r.read_bool()? {
-                let count = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative icon count".to_string())?;
-                // Each icon is at least five bytes (type, x, z, direction,
-                // name flag).
-                if count > r.remaining() / 5 {
-                    return Err("icon count exceeds remaining input".into());
-                }
-                let mut list = Vec::with_capacity(count.min(64));
-                for _ in 0..count {
-                    let kind = r.read_varint()?;
-                    let x = r.read_i8()?;
-                    let z = r.read_i8()?;
-                    let direction = r.read_u8()?;
-                    let name_nbt = if r.read_bool()? {
-                        Some(read_nbt_raw(&mut r)?.to_vec())
-                    } else {
-                        None
-                    };
-                    list.push(MapItemIcon {
-                        kind,
-                        x,
-                        z,
-                        direction,
-                        name_nbt,
-                    });
-                }
-                Some(list)
-            } else {
-                None
-            };
-            let columns = r.read_u8()?;
-            let (rows, x, y, colors) = if columns == 0 {
-                (0, 0, 0, Vec::new())
-            } else {
-                let rows = r.read_u8()?;
-                let x = r.read_u8()?;
-                let y = r.read_u8()?;
-                let len = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative color count".to_string())?;
-                // Vanilla always sends exactly columns * rows pixels.
-                if len != usize::from(columns) * usize::from(rows) {
-                    return Err("map color count mismatch".into());
-                }
-                let colors = r.take(len)?.to_vec();
-                (rows, x, y, colors)
-            };
-            PlayEvent::MapItemData {
-                map_id,
-                scale,
-                locked,
-                icons,
-                columns,
-                rows,
-                x,
-                y,
-                colors,
+        "open_book" => {
+            let hand = r.read_varint()?;
+            if !(0..=1).contains(&hand) {
+                return Err("invalid hand in open_book".into());
             }
+            PlayEvent::OpenBook { hand: hand as u8 }
         }
+        "open_sign_editor" => PlayEvent::OpenSignEditor {
+            pos: r.read_position()?,
+            front_side: r.read_bool()?,
+        },
+        "set_carried_item" => PlayEvent::SetCarriedItem(i16::from(r.read_i8()?)),
+        "cooldown" => PlayEvent::Cooldown {
+            item: r.read_varint()?,
+            ticks: r.read_varint()?,
+        },
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_player_play_event(
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
+        "set_experience" => {
+            let bar = r.read_f32()?;
+            let level = r.read_varint()?;
+            let total = r.read_varint()?;
+            PlayEvent::SetExperience { bar, level, total }
+        }
+        "player_abilities" => PlayEvent::PlayerAbilities {
+            flags: r.read_u8()?,
+            flying_speed: r.read_f32()?,
+            walking_speed: r.read_f32()?,
+        },
+        "set_camera" => PlayEvent::SetCamera {
+            eid: r.read_varint()?,
+        },
         "player_look_at" => {
             let anchor = r.read_varint()?;
             if !(0..=1).contains(&anchor) {
@@ -4655,49 +4255,79 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
                 entity,
             }
         }
+        "player_info_remove" => PlayEvent::PlayerInfoRemove {
+            uuids: read_uuid_list(r)?,
+        },
+        "player_info_update" => {
+            let actions = r.read_u8()?;
+            let count = r.read_varint()?;
+            if !(0..=1024).contains(&count) {
+                return Err(format!(
+                    "player_info_update entry count {count} out of range"
+                ));
+            }
+            let mut entries = Vec::with_capacity(count as usize & 0xff);
+            for _ in 0..count {
+                let uuid = r.read_uuid()?;
+                let mut entry = PlayerInfoUpdateEntry {
+                    uuid,
+                    name: None,
+                    properties: Vec::new(),
+                    chat_session: None,
+                    game_mode: None,
+                    listed: None,
+                    latency: None,
+                    display_name_nbt: None,
+                };
+                if actions & 0x01 != 0 {
+                    entry.name = Some(r.read_string(16)?);
+                    let props = r.read_varint()?;
+                    if !(0..=16).contains(&props) {
+                        return Err(format!("player_info property count {props} out of range"));
+                    }
+                    for _ in 0..props {
+                        let pname = r.read_string(64)?;
+                        let pvalue = r.read_string(32767)?;
+                        let sig = r.read_optional(|r| r.read_string(1024))?;
+                        entry.properties.push((pname, pvalue, sig));
+                    }
+                }
+                if actions & 0x02 != 0 && r.read_bool()? {
+                    entry.chat_session = Some(read_chat_session_wire(r)?);
+                }
+                if actions & 0x04 != 0 {
+                    entry.game_mode = Some(r.read_varint()?);
+                }
+                if actions & 0x08 != 0 {
+                    entry.listed = Some(r.read_bool()?);
+                }
+                if actions & 0x10 != 0 {
+                    entry.latency = Some(r.read_varint()?);
+                }
+                if actions & 0x20 != 0 && r.read_bool()? {
+                    entry.display_name_nbt = Some(r.read_nbt_bytes()?);
+                }
+                entries.push(entry);
+            }
+            PlayEvent::PlayerInfo { actions, entries }
+        }
         "update_advancements" => {
             let reset = r.read_bool()?;
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative advancement count".to_string())?;
             // Each entry needs at least a key string, two option flags, a
             // requirements count and the telemetry byte.
-            if count > r.remaining() / 5 {
-                return Err("advancement count exceeds remaining input".into());
-            }
-            let mut advancements = Vec::with_capacity(count.min(64));
-            for _ in 0..count {
-                advancements.push(read_wire_advancement(&mut r)?);
-            }
-            let nremoved = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative removed count".to_string())?;
-            if nremoved > r.remaining() {
-                return Err("removed count exceeds remaining input".into());
-            }
-            let mut removed = Vec::with_capacity(nremoved.min(64));
-            for _ in 0..nremoved {
-                removed.push(r.read_string(32767)?);
-            }
-            let nprogress = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative progress count".to_string())?;
-            if nprogress > r.remaining() / 2 {
-                return Err("progress count exceeds remaining input".into());
-            }
+            let count = r.read_count(5, "advancement")?;
+            let advancements = r.read_list(count, 64, read_wire_advancement)?;
+            let nremoved = r.read_count(1, "removed")?;
+            let removed = r.read_list(nremoved, 64, |r| r.read_string(32767))?;
+            let nprogress = r.read_count(2, "progress")?;
             let mut progress = Vec::with_capacity(nprogress.min(64));
             for _ in 0..nprogress {
                 let key = r.read_string(32767)?;
-                let ncrit = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative criterion count".to_string())?;
-                if ncrit > r.remaining() {
-                    return Err("criterion count exceeds remaining input".into());
-                }
+                let ncrit = r.read_count(1, "criterion")?;
                 let mut criteria = Vec::with_capacity(ncrit.min(64));
                 for _ in 0..ncrit {
                     let criterion = r.read_string(32767)?;
-                    let achieved = if r.read_bool()? {
-                        Some(r.read_i64()?)
-                    } else {
-                        None
-                    };
+                    let achieved = r.read_optional(WireReader::read_i64)?;
                     criteria.push((criterion, achieved));
                 }
                 progress.push(WireAdvancementProgress { key, criteria });
@@ -4710,19 +4340,11 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             }
         }
         "select_advancements_tab" => PlayEvent::SelectAdvancementsTab {
-            tab: if r.read_bool()? {
-                Some(r.read_string(256)?)
-            } else {
-                None
-            },
+            tab: r.read_optional(|r| r.read_string(256))?,
         },
         "award_stats" => {
-            let count =
-                usize::try_from(r.read_varint()?).map_err(|_| "negative stat count".to_string())?;
             // Each entry is three varints — at least three bytes.
-            if count > r.remaining() / 3 {
-                return Err("stat count exceeds remaining input".into());
-            }
+            let count = r.read_count(3, "stat")?;
             let mut entries = Vec::with_capacity(count.min(256));
             for _ in 0..count {
                 entries.push(AwardStatEntry {
@@ -4733,43 +4355,383 @@ pub fn decode_extended_play_event(name: &str, body: &[u8]) -> Result<Option<Play
             }
             PlayEvent::AwardStats { entries }
         }
-        "server_data" => {
-            let motd_nbt = read_nbt_raw(&mut r)?.to_vec();
-            let icon = if r.read_bool()? {
-                let len = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative icon length".to_string())?;
-                Some(r.take(len)?.to_vec())
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_hud_play_event(name: &str, r: &mut WireReader<'_>) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
+        "set_action_bar_text" => PlayEvent::SetActionBarText {
+            nbt_bytes: r.read_nbt_bytes()?,
+        },
+        "set_title_text" => PlayEvent::SetTitleText {
+            nbt_bytes: r.read_nbt_bytes()?,
+        },
+        "set_subtitle_text" => PlayEvent::SetSubtitleText {
+            nbt_bytes: r.read_nbt_bytes()?,
+        },
+        "set_titles_animation" => PlayEvent::SetTitle {
+            fade_in: r.read_i32()?,
+            stay: r.read_i32()?,
+            fade_out: r.read_i32()?,
+        },
+        "clear_titles" => PlayEvent::ClearTitles,
+        "boss_event" => {
+            let uuid = r.read_uuid()?;
+            let action = r.read_varint()?;
+            PlayEvent::BossEvent {
+                uuid,
+                action,
+                raw_payload: r.rest().to_vec(),
+            }
+        }
+        "tab_list" => PlayEvent::TabList {
+            header_nbt: r.read_nbt_bytes()?,
+            footer_nbt: r.read_nbt_bytes()?,
+        },
+        "set_objective" => {
+            let objective = r.read_string(16)?;
+            let mode = r.read_i8()?;
+            let (display_name_nbt, render_type, number_format_kind, number_format_nbt) =
+                if mode == 0 || mode == 2 {
+                    let display = r.read_nbt_bytes()?;
+                    let render = r.read_varint()?;
+                    let (kind, nbt) = if r.read_bool()? {
+                        let kind = r.read_varint()?;
+                        let nbt = if kind == 1 || kind == 2 {
+                            Some(r.read_nbt_bytes()?)
+                        } else {
+                            None
+                        };
+                        (Some(kind), nbt)
+                    } else {
+                        (None, None)
+                    };
+                    (Some(display), Some(render), kind, nbt)
+                } else {
+                    (None, None, None, None)
+                };
+            PlayEvent::SetObjective {
+                objective,
+                mode,
+                display_name_nbt,
+                render_type,
+                number_format_kind,
+                number_format_nbt,
+            }
+        }
+        "set_score" => {
+            let owner = r.read_string(32767)?;
+            let objective = r.read_string(32767)?;
+            let value = r.read_varint()?;
+            let display_nbt = r.read_optional(WireReader::read_nbt_bytes)?;
+            let number_format_kind = if r.read_bool()? {
+                let kind = r.read_varint()?;
+                if kind == 1 || kind == 2 {
+                    let _ = read_nbt_raw(r)?;
+                }
+                Some(kind)
             } else {
                 None
             };
+            PlayEvent::SetScore {
+                owner,
+                objective,
+                value,
+                display_nbt,
+                number_format_kind,
+            }
+        }
+        "set_display_objective" => PlayEvent::SetDisplayObjective {
+            slot: r.read_varint()?,
+            objective: r.read_string(16)?,
+        },
+        "reset_score" => {
+            let owner = r.read_string(32767)?;
+            let objective = r.read_optional(|r| r.read_string(32767))?;
+            PlayEvent::ResetScore { owner, objective }
+        }
+        "set_player_team" => {
+            let name = r.read_string(32767)?;
+            let mode = r.read_u8()?;
+            if mode > 4 {
+                return Err("invalid team mode".into());
+            }
+            let info = if mode == 0 || mode == 2 {
+                Some(Box::new(PlayerTeamInfo {
+                    display_name_nbt: r.read_nbt_bytes()?,
+                    friendly_flags: r.read_u8()?,
+                    nametag_visibility: r.read_string(64)?,
+                    collision_rule: r.read_string(64)?,
+                    color: r.read_varint()?,
+                    prefix_nbt: r.read_nbt_bytes()?,
+                    suffix_nbt: r.read_nbt_bytes()?,
+                }))
+            } else {
+                None
+            };
+            let entities = if matches!(mode, 0 | 3 | 4) {
+                // Each entity entry is at least a one-byte length prefix.
+                let count = r.read_count(1, "entity")?;
+                r.read_list(count, 64, |r| r.read_string(32767))?
+            } else {
+                Vec::new()
+            };
+            PlayEvent::SetPlayerTeam {
+                name,
+                mode,
+                info,
+                entities,
+            }
+        }
+        "map_item_data" => {
+            let map_id = r.read_varint()?;
+            let scale = r.read_i8()?;
+            let locked = r.read_bool()?;
+            let icons = if r.read_bool()? {
+                // Each icon is at least five bytes (type, x, z, direction,
+                // name flag).
+                let count = r.read_count(5, "icon")?;
+                let mut list = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    let kind = r.read_varint()?;
+                    let x = r.read_i8()?;
+                    let z = r.read_i8()?;
+                    let direction = r.read_u8()?;
+                    let name_nbt = r.read_optional(WireReader::read_nbt_bytes)?;
+                    list.push(MapItemIcon {
+                        kind,
+                        x,
+                        z,
+                        direction,
+                        name_nbt,
+                    });
+                }
+                Some(list)
+            } else {
+                None
+            };
+            let columns = r.read_u8()?;
+            let (rows, x, y, colors) = if columns == 0 {
+                (0, 0, 0, Vec::new())
+            } else {
+                let rows = r.read_u8()?;
+                let x = r.read_u8()?;
+                let y = r.read_u8()?;
+                let len = r.read_nonnegative_varint("negative color count")?;
+                // Vanilla always sends exactly columns * rows pixels.
+                if len != usize::from(columns) * usize::from(rows) {
+                    return Err("map color count mismatch".into());
+                }
+                let colors = r.take(len)?.to_vec();
+                (rows, x, y, colors)
+            };
+            PlayEvent::MapItemData {
+                map_id,
+                scale,
+                locked,
+                icons,
+                columns,
+                rows,
+                x,
+                y,
+                colors,
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_chat_play_event(name: &str, r: &mut WireReader<'_>) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
+        "command_suggestions" => {
+            let transaction_id = r.read_varint()?;
+            let start = r.read_varint()?;
+            let length = r.read_varint()?;
+            let count = r.read_count(2, "command suggestion")?;
+            let mut matches = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                let text = r.read_string(32767)?;
+                let tooltip_nbt = r.read_optional(WireReader::read_nbt_bytes)?;
+                matches.push(WireSuggestion { text, tooltip_nbt });
+            }
+            PlayEvent::CommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches,
+            }
+        }
+        "custom_chat_completions" => {
+            let action = r.read_varint()?;
+            if !(0..=2).contains(&action) {
+                return Err("invalid chat completions action".into());
+            }
+            let count = r.read_count(1, "chat completion")?;
+            let entries = r.read_list(count, 1024, |r| r.read_string(32767))?;
+            PlayEvent::ChatCompletions { action, entries }
+        }
+        "reset_chat" => PlayEvent::ResetChat,
+        "delete_chat" => {
+            let encoded_index = r.read_varint()?;
+            if encoded_index < 0 {
+                return Err("negative delete-chat index".into());
+            }
+            if encoded_index == 0 {
+                let signature = r.take(256)?.try_into().unwrap();
+                PlayEvent::DeleteChat {
+                    message_index: None,
+                    signature: Some(signature),
+                }
+            } else {
+                PlayEvent::DeleteChat {
+                    message_index: Some(encoded_index - 1),
+                    signature: None,
+                }
+            }
+        }
+        "disguised_chat" => {
+            let nbt_bytes = r.read_nbt_bytes()?;
+            let text = WireReader::new(&nbt_bytes)
+                .read_nbt()
+                .map(|v| v.extract_text())
+                .unwrap_or_default();
+            let _chat_type = r.read_varint()?;
+            let _sender_name = read_nbt_raw(r)?;
+            if r.read_bool()? {
+                let _target_name = read_nbt_raw(r)?;
+            }
+            PlayEvent::DisguisedChat { text, nbt_bytes }
+        }
+        "player_chat" => {
+            let sender = r.read_uuid()?;
+            let index = r.read_varint()?;
+            let signature = if r.read_bool()? {
+                Some(r.take(256)?.try_into().unwrap())
+            } else {
+                None
+            };
+            let message = r.read_string(32767)?;
+            let _timestamp = r.read_i64()?;
+            let _salt = r.read_i64()?;
+            let _last_seen_offset = r.read_varint()?;
+            r.take(3)?; // fixed 20-bit acknowledgement bitset
+            if r.read_bool()? {
+                let _unsigned_content = read_nbt_raw(r)?;
+            }
+            let filter_type = r.read_varint()?;
+            match filter_type {
+                0 | 1 => {}
+                2 => {
+                    let _filter = r.read_bitset(64)?;
+                }
+                _ => return Err("invalid chat filter type".into()),
+            }
+            let _chat_type = r.read_varint()?;
+            let sender_name = read_nbt_raw(r)?;
+            let mut nbt_bytes = sender_name.to_vec();
+            if r.read_bool()? {
+                nbt_bytes.extend_from_slice(read_nbt_raw(r)?);
+            }
+            PlayEvent::PlayerChat {
+                sender,
+                index,
+                signature,
+                text: message,
+                nbt_bytes,
+            }
+        }
+        _ => return Ok(None),
+    }))
+}
+
+fn decode_session_play_event(
+    name: &str,
+    r: &mut WireReader<'_>,
+) -> Result<Option<PlayEvent>, String> {
+    Ok(Some(match name {
+        "ping" => PlayEvent::Ping(r.read_i32()?),
+        "pong_response" => PlayEvent::PongResponse { id: r.read_i64()? },
+        "cookie_request" => PlayEvent::CookieRequest(r.read_string(32767)?),
+        "store_cookie" => {
+            let key = r.read_string(32767)?;
+            let len = r.read_nonnegative_varint("negative cookie payload length")?;
+            if len > 5120 {
+                return Err("cookie payload exceeds 5 KiB".into());
+            }
+            PlayEvent::StoreCookie {
+                key,
+                payload: r.take(len)?.to_vec(),
+            }
+        }
+        "custom_report_details" => {
+            let count = r.read_count(2, "report detail")?;
+            let mut details = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                details.push((r.read_string(64)?, r.read_string(1024)?));
+            }
+            PlayEvent::CustomReportDetails(details)
+        }
+        "server_links" => {
+            let count = r.read_count(2, "server link")?;
+            let mut links = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                let (label, custom_label_nbt) = match r.read_u8()? {
+                    0 => (None, Some(r.read_nbt_bytes()?)),
+                    1 => (Some(r.read_varint()?), None),
+                    _ => return Err("invalid server link label kind".into()),
+                };
+                let url = r.read_string(2048)?;
+                links.push(WireServerLink {
+                    label,
+                    custom_label_nbt,
+                    url,
+                });
+            }
+            PlayEvent::ServerLinks(links)
+        }
+        "server_data" => {
+            let motd_nbt = r.read_nbt_bytes()?;
+            let icon = r.read_optional(|r| r.read_byte_array("negative icon length"))?;
             PlayEvent::ServerData { motd_nbt, icon }
         }
-        "chunks_biomes" => {
-            let count = usize::try_from(r.read_varint()?)
-                .map_err(|_| "negative chunk count".to_string())?;
-            // Each entry is at least nine bytes (8-byte packed pos + a
-            // one-byte data length).
-            if count > r.remaining() / 9 {
-                return Err("chunk count exceeds remaining input".into());
-            }
-            let mut chunks = Vec::with_capacity(count.min(256));
-            for _ in 0..count {
-                // ChunkPos wire order is Z then X (big-endian i64 layout).
-                let cz = r.read_i32()?;
-                let cx = r.read_i32()?;
-                let len = usize::try_from(r.read_varint()?)
-                    .map_err(|_| "negative biome data length".to_string())?;
-                let data = r.take(len)?.to_vec();
-                chunks.push(ChunkBiomeData { cx, cz, data });
-            }
-            PlayEvent::ChunksBiomes { chunks }
-        }
+        "resource_pack_pop" => PlayEvent::ResourcePackPop {
+            uuid: r.read_optional(WireReader::read_uuid)?,
+        },
+        "resource_pack_push" => PlayEvent::ResourcePackPush {
+            uuid: r.read_uuid()?,
+            url: r.read_string(32767)?,
+            hash: r.read_string(40)?,
+            forced: r.read_bool()?,
+            prompt_nbt: r.read_optional(WireReader::read_nbt_bytes)?,
+        },
         "transfer" => PlayEvent::Transfer {
             host: r.read_string(255)?,
             port: r.read_varint()?,
         },
         _ => return Ok(None),
     }))
+}
+
+/// Keep the session ID, expiry and both key/signature blobs exactly as sent.
+fn read_chat_session_wire(r: &mut WireReader<'_>) -> Result<Vec<u8>, String> {
+    let start = r.pos;
+    r.read_uuid()?;
+    r.read_i64()?;
+    for length_error in [
+        "player_info key blob out of range",
+        "player_info signature blob out of range",
+    ] {
+        let len = r.read_varint()?;
+        if !(0..=4096).contains(&len) {
+            return Err(length_error.into());
+        }
+        // Preserve the single-byte truncation diagnostic for incomplete blobs.
+        for _ in 0..len {
+            r.read_u8()?;
+        }
+    }
+    Ok(r.data[start..r.pos].to_vec())
 }
 
 // ---------------------------------------------------------------------------
