@@ -142,8 +142,9 @@ ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2348 \
 # ceiling freezes today's duplicates; consolidation lowers it.
 # 4 -> 2: server-files/installer and src/generation_math now re-export core::crypto::Sha256/sha256.
 # 2 -> 1: Wave 3 routed root/crate SHA-256 helpers through megu-core.
+# 1 -> 0: state-store directly re-exports megu_core::crypto::Sha256; duplicates are extinct.
 ratchet_ws "duplicate sha256/Sha256 impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 1 \
+  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 0 \
   "SHA-256 belongs in megu-core; a new copy is a new thing to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 
