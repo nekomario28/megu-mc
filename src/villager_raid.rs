@@ -1698,9 +1698,14 @@ struct Raid {
     countdown: u16,
     ticks_elapsed: u32,
     remaining: HashSet<RaidRaiderId>,
+    // Stable identity is persisted because runtime entity IDs are re-issued
+    // when the world is loaded. The bool records the captain flag for restore.
+    roster: SavedRaidRoster,
     participants: std::collections::BTreeSet<VillageUuid>,
     omen_level: u8,
 }
+
+type SavedRaidRoster = HashMap<RaidRaiderId, ([u8; 16], bool)>;
 
 impl Raid {
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1741,6 +1746,7 @@ impl Raid {
             countdown: RAID_WAVE_COUNTDOWN,
             ticks_elapsed: 0,
             remaining: HashSet::new(),
+            roster: HashMap::new(),
             participants: [player].into(),
             omen_level: omen_level.min(5),
         })
@@ -1751,6 +1757,7 @@ impl Raid {
         if self.state != RaidState::InProgress || !self.remaining.remove(&raider) {
             return false;
         }
+        self.roster.remove(&raider);
         self.participants.extend(killer);
         true
     }
@@ -1759,6 +1766,7 @@ impl Raid {
     fn stop(&mut self) {
         self.state = RaidState::Stopped;
         self.remaining.clear();
+        self.roster.clear();
     }
 
     // Call once per game tick. The caller counts surviving villagers in this village
@@ -1789,6 +1797,7 @@ impl Raid {
             self.state = RaidState::Loss;
             self.countdown = RAID_CELEBRATION_TICKS;
             self.remaining.clear();
+            self.roster.clear();
             return Some(RaidEvent::Loss);
         }
         if !self.remaining.is_empty() {
@@ -4503,7 +4512,7 @@ fn live_raid_spawn_wave(
     center: BlockPos,
     regular_waves: u8,
     mut wave: RaidWave,
-) -> (HashSet<RaidRaiderId>, Option<i32>) {
+) -> (HashSet<RaidRaiderId>, SavedRaidRoster, Option<i32>) {
     let bonus_wave = wave.number > regular_waves;
     let riders = raid_wave_adjustments(
         raid_difficulty(), wave.number, bonus_wave, &mut wave.counts,
@@ -4515,6 +4524,7 @@ fn live_raid_spawn_wave(
     let total = wave.raiders().count().max(1);
     let mut first_raider_eid = None;
     let mut remaining = HashSet::new();
+    let mut roster = HashMap::new();
     let mut captain_spawned = false;
     let cx = center.0 as f64 + 0.5;
     let cz = center.2 as f64 + 0.5;
@@ -4552,6 +4562,7 @@ fn live_raid_spawn_wave(
                 first_raider_eid = Some(mob.eid);
             }
             remaining.insert(raider_id);
+            roster.insert(raider_id, (mob.uuid, wave.captain == Some(raider_id)));
             if !captain_spawned && matches!(kind, RaiderType::Vindicator | RaiderType::Evoker | RaiderType::Pillager) {
                 captain_spawned = true;
                 live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, (dim, center));
@@ -4566,7 +4577,7 @@ fn live_raid_spawn_wave(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert((dim, center), remaining.len() as i32);
-    (remaining, first_raider_eid)
+    (remaining, roster, first_raider_eid)
 }
 
 const RAID_BELL_GLOWING_TICKS: u64 = 60;
@@ -4799,13 +4810,14 @@ fn live_raid_step() {
             let Some(RaidEvent::SpawnWave(wave)) = event else {
                 continue;
             };
-            let (remaining, horn) = live_raid_spawn_wave(*dim, *center, *regular_waves, *wave);
+            let (remaining, roster, horn) = live_raid_spawn_wave(*dim, *center, *regular_waves, *wave);
             *count = remaining.len() as i32;
             let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
             if let Some((_, raid)) = raids.iter_mut().find(|(d, raid)| {
                 *d == *dim && raid.center == *center && raid.waves_spawned == wave.number
             }) {
                 raid.remaining = remaining;
+                raid.roster = roster;
             }
             horns.extend(horn);
         }
