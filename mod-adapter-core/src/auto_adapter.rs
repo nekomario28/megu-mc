@@ -54,14 +54,15 @@ use crate::data_loader::{
     blockstate_properties, parse_json, parse_mod_recipe_json, DataLoadError,
     ItemFluidIdTable, JsonValue, ParsedModRecipe,
 };
-use crate::dep_resolver::{plan_dep_recovery, ReloadRequirement};
+use crate::dep_resolver::{plan_dep_recovery, DepRecoveryEntry, ReloadRequirement};
 use crate::dimension_mod::{
     builtin_dimension_mod_profiles, discover_dimension_mod_entries, DimensionModClassification,
     DimensionModData,
 };
 use crate::ecosystem_compat::{
-    scan_mod_jar_named, DualLoaderPlan, JarScanError, MissingDependency, ModEnvironment,
-    ModJarDescriptor, RUNTIME_PROVIDED_MOD_IDS,
+    scan_mod_jar_named, DependencyConflict, DependencyCycle, DependencyVersionMismatch,
+    DualLoaderPlan, JarScanError, MissingDependency, ModDependencyResolutionReport,
+    ModEnvironment, ModJarDescriptor, ModrinthDependencyCandidate, RUNTIME_PROVIDED_MOD_IDS,
 };
 use crate::fallback::{is_builtin_superseded_mod, REASON_SUPERSEDED};
 use crate::hard_mod_primitives::{classify_perf_or_render_mod_compat, EngineCompatDisposition};
@@ -76,6 +77,7 @@ use crate::mixin_lifter::{
 use crate::mod_router::{
     route_mod_jar, validate_member_name, ModRouteDecision, RouteMatchKind, SecurityThreat,
 };
+use crate::mod_sync::MAX_MOD_JAR_BYTES;
 use crate::modpack::{infer_candidate_mod_id, read_zip_member, zip_member_list};
 use crate::unified_bundle::{DeclarativeModBundle, BUNDLE_SCHEMA};
 use crate::version_compat::{McVersion, VersionRange};
@@ -108,6 +110,32 @@ const MAX_DATA_SCAN_BYTES: u64 = 128 * 1024 * 1024;
 /// cannot turn the media audit into an extraction bomb.
 const MAX_MEDIA_MEMBERS: usize = 4_096;
 const MAX_MEDIA_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Aggregate bytes of top-level `*.jar` files one directory scan may read
+/// into memory. This is deliberately separate from the nested Jar-in-Jar
+/// budget: it bounds the pack itself before any archive member is decoded.
+pub const MAX_MODS_DIR_AGGREGATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Validate that `path` is a regular file and below the single-JAR input
+/// cap *before* any bytes are read into memory. Returns the exact size.
+fn validate_input_jar_file(path: &Path, display: &str) -> Result<u64, String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| format!("{display}: cannot stat JAR before reading: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{display}: JAR path is not a regular file"));
+    }
+    let len = metadata.len();
+    if len == 0 {
+        return Err(format!("{display}: JAR file is empty"));
+    }
+    if len > MAX_MOD_JAR_BYTES {
+        return Err(format!(
+            "{display}: JAR file is {len} bytes, exceeding the {MAX_MOD_JAR_BYTES}-byte input cap"
+        ));
+    }
+    Ok(len)
+}
+
 /// How many rejected media member names one audit note may list.
 const MAX_MEDIA_REJECT_NAMES: usize = 8;
 
@@ -382,6 +410,11 @@ pub struct ModsDirAdaptationReport {
     pub non_jar_entries: usize,
     /// Report-level audit notes (e.g. duplicate declared mod ids).
     pub audit_notes: Vec<String>,
+    /// Structured dependency-solving result ready for startup/UI consumers.
+    pub dependency_resolution: Option<ModDependencyResolutionReport>,
+    /// Per-missing-dependency recovery entries, including exact Modrinth
+    /// query URLs and any verified artifact descriptor supplied to the planner.
+    pub dependency_recovery: Vec<DepRecoveryEntry>,
 }
 
 impl ModsDirAdaptationReport {
@@ -1174,6 +1207,7 @@ fn synthesize_bundle(
 /// never an error.
 pub fn auto_adapt_jar(path: &Path, opts: &AutoAdaptOptions) -> Result<JarAdaptationResult, String> {
     let display = path.display().to_string();
+    validate_input_jar_file(path, &display)?;
     let bytes =
         std::fs::read(path).map_err(|e| format!("{display}: cannot read JAR: {e}"))?;
     auto_adapt_jar_bytes(&bytes, &display, opts)
@@ -1852,8 +1886,18 @@ pub fn auto_adapt_mods_dir(
     let mut jars = Vec::with_capacity(names.len());
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
     let mut report_notes = Vec::new();
+    let mut aggregate_input_bytes = 0u64;
     for name in names {
         let path = dir.join(&name);
+        let file_bytes = validate_input_jar_file(&path, &format!("'{name}'"))?;
+        aggregate_input_bytes = aggregate_input_bytes
+            .checked_add(file_bytes)
+            .ok_or_else(|| format!("'{name}': aggregate mods/ input size overflow"))?;
+        if aggregate_input_bytes > MAX_MODS_DIR_AGGREGATE_BYTES {
+            return Err(format!(
+                "'{name}': mods/ input files exceed the aggregate {MAX_MODS_DIR_AGGREGATE_BYTES}-byte pack budget"
+            ));
+        }
         let bytes = std::fs::read(&path)
             .map_err(|e| format!("'{name}': cannot read JAR: {e}"))?;
         let result = auto_adapt_jar_bytes(&bytes, &name, opts)
@@ -1875,21 +1919,27 @@ pub fn auto_adapt_mods_dir(
     // recovery plan — Modrinth query URLs and the EN/JA operator
     // instructions surface as report-level audit notes, exactly like the
     // duplicate-id notes above.
-    let mut provided: BTreeSet<String> = BTreeSet::new();
+    let mut provided: BTreeMap<String, String> = BTreeMap::new();
     for jar in &jars {
         if let Some(d) = &jar.descriptor {
             for id in &d.declared_mod_ids {
-                provided.insert(id.clone());
+                provided.entry(id.clone()).or_insert_with(|| d.version.clone());
             }
             if !d.mod_id.is_empty() {
-                provided.insert(d.mod_id.clone());
+                provided.entry(d.mod_id.clone()).or_insert_with(|| d.version.clone());
+            }
+            for nested in &d.nested_candidates {
+                for id in &nested.declared_mod_ids {
+                    provided.entry(id.clone()).or_insert_with(|| nested.version.clone());
+                }
             }
         }
         if let Some(id) = jar.mod_id() {
-            provided.insert(id.to_string());
+            provided.entry(id.to_string()).or_default();
         }
     }
     let mut missing: Vec<MissingDependency> = Vec::new();
+    let mut version_mismatches: Vec<DependencyVersionMismatch> = Vec::new();
     for jar in &jars {
         let Some(d) = &jar.descriptor else {
             continue;
@@ -1899,8 +1949,24 @@ pub fn auto_adapt_mods_dir(
                 || RUNTIME_PROVIDED_MOD_IDS
                     .iter()
                     .any(|id| id.eq_ignore_ascii_case(&dep.mod_id))
-                || provided.contains(&dep.mod_id)
             {
+                continue;
+            }
+            if let Some(provider_version) = provided.get(&dep.mod_id) {
+                let satisfies = dep.version_range.as_deref().is_none_or(|range| {
+                    VersionRange::parse(range)
+                        .ok()
+                        .is_some_and(|parsed| parsed.matches_str(provider_version))
+                });
+                if !satisfies {
+                    version_mismatches.push(DependencyVersionMismatch {
+                        mod_id: d.mod_id.clone(),
+                        required_mod_id: dep.mod_id.clone(),
+                        version_range: dep.version_range.clone().unwrap_or_default(),
+                        provider_id: dep.mod_id.clone(),
+                        provider_version: provider_version.clone(),
+                    });
+                }
                 continue;
             }
             missing.push(MissingDependency {
@@ -1911,21 +1977,46 @@ pub fn auto_adapt_mods_dir(
         }
     }
     missing.sort_by(|a, b| (&a.mod_id, &a.required_mod_id).cmp(&(&b.mod_id, &b.required_mod_id)));
-    if !missing.is_empty() {
-        let dual_plan = DualLoaderPlan {
-            missing_dependencies: missing,
-            ..DualLoaderPlan::default()
-        };
-        let recovery = plan_dep_recovery(dir, &dual_plan, &[]);
+    let dual_plan = DualLoaderPlan {
+        missing_dependencies: missing,
+        ..DualLoaderPlan::default()
+    };
+    let recovery = plan_dep_recovery(dir, &dual_plan, &[]);
+    if !dual_plan.missing_dependencies.is_empty() {
         for line in recovery.summary_en.lines() {
             report_notes.push(line.to_string());
         }
     }
+    let admitted = jars
+        .iter()
+        .filter_map(|jar| jar.mod_id().map(str::to_string))
+        .collect();
+    let dependency_resolution = ModDependencyResolutionReport {
+        admitted,
+        isolated_unsatisfied: dual_plan.missing_dependencies.clone(),
+        missing_required: dual_plan.missing_dependencies.clone(),
+        version_mismatches,
+        conflicts: Vec::<DependencyConflict>::new(),
+        cycles: Vec::<DependencyCycle>::new(),
+        client_only_skipped: Vec::new(),
+        modrinth_candidates: dual_plan
+            .missing_dependencies
+            .iter()
+            .map(|dep| ModrinthDependencyCandidate {
+                required_mod_id: dep.required_mod_id.clone(),
+                required_by: dep.mod_id.clone(),
+                version_range: dep.version_range.clone(),
+                query_slug: dep.required_mod_id.clone(),
+            })
+            .collect(),
+    };
     Ok(ModsDirAdaptationReport {
         dir: dir.display().to_string(),
         jars,
         non_jar_entries: non_jar,
         audit_notes: report_notes,
+        dependency_resolution: Some(dependency_resolution),
+        dependency_recovery: recovery.entries,
     })
 }
 
@@ -2756,6 +2847,131 @@ fn mods_dir_report_json(report: &ModsDirAdaptationReport) -> String {
         true,
     );
     jf_str_list(&mut out, 1, "audit_notes", &report.audit_notes, true);
+
+    match &report.dependency_resolution {
+        None => {
+            let _ = writeln!(out, "  \"dependency_resolution\": null,");
+        }
+        Some(resolution) => {
+            let _ = writeln!(out, "  \"dependency_resolution\": {{");
+            jf_str_list(&mut out, 2, "admitted", &resolution.admitted, true);
+            let write_missing_list = |out: &mut String, name: &str, deps: &[MissingDependency]| {
+                use std::fmt::Write as _;
+                if deps.is_empty() {
+                    let _ = writeln!(out, "    \"{name}\": [],");
+                } else {
+                    let _ = writeln!(out, "    \"{name}\": [");
+                    for (i, dep) in deps.iter().enumerate() {
+                        let last = i + 1 == deps.len();
+                        let _ = writeln!(out, "      {{");
+                        jf_str(out, 4, "mod_id", &dep.mod_id, true);
+                        jf_str(out, 4, "required_mod_id", &dep.required_mod_id, true);
+                        jf_opt(out, 4, "version_range", dep.version_range.as_deref(), false);
+                        let _ = writeln!(out, "      }}{}", if last { "" } else { "," });
+                    }
+                    let _ = writeln!(out, "    ],");
+                }
+            };
+            write_missing_list(&mut out, "isolated_unsatisfied", &resolution.isolated_unsatisfied);
+
+            if resolution.version_mismatches.is_empty() {
+                let _ = writeln!(out, "    \"version_mismatches\": [],");
+            } else {
+                let _ = writeln!(out, "    \"version_mismatches\": [");
+                for (i, mismatch) in resolution.version_mismatches.iter().enumerate() {
+                    let last = i + 1 == resolution.version_mismatches.len();
+                    let _ = writeln!(out, "      {{");
+                    jf_str(&mut out, 4, "mod_id", &mismatch.mod_id, true);
+                    jf_str(&mut out, 4, "required_mod_id", &mismatch.required_mod_id, true);
+                    jf_str(&mut out, 4, "version_range", &mismatch.version_range, true);
+                    jf_str(&mut out, 4, "provider_id", &mismatch.provider_id, true);
+                    jf_str(&mut out, 4, "provider_version", &mismatch.provider_version, false);
+                    let _ = writeln!(out, "      }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "    ],");
+            }
+
+            if resolution.conflicts.is_empty() {
+                let _ = writeln!(out, "    \"conflicts\": [],");
+            } else {
+                let _ = writeln!(out, "    \"conflicts\": [");
+                for (i, conflict) in resolution.conflicts.iter().enumerate() {
+                    let last = i + 1 == resolution.conflicts.len();
+                    let _ = writeln!(out, "      {{");
+                    jf_str(&mut out, 4, "mod_id", &conflict.mod_id, true);
+                    jf_str(&mut out, 4, "other_mod_id", &conflict.other_mod_id, true);
+                    jf_str(&mut out, 4, "kind", conflict.kind.as_str(), true);
+                    jf_opt(&mut out, 4, "version_range", conflict.version_range.as_deref(), false);
+                    let _ = writeln!(out, "      }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "    ],");
+            }
+
+            if resolution.cycles.is_empty() {
+                let _ = writeln!(out, "    \"cycles\": [],");
+            } else {
+                let _ = writeln!(out, "    \"cycles\": [");
+                for (i, cycle) in resolution.cycles.iter().enumerate() {
+                    let last = i + 1 == resolution.cycles.len();
+                    let _ = writeln!(out, "      {{");
+                    jf_str_list(&mut out, 4, "members", &cycle.members, false);
+                    let _ = writeln!(out, "      }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "    ],");
+            }
+            jf_str_list(&mut out, 2, "client_only_skipped", &resolution.client_only_skipped, true);
+            write_missing_list(&mut out, "missing_required", &resolution.missing_required);
+            if resolution.modrinth_candidates.is_empty() {
+                let _ = writeln!(out, "    \"modrinth_candidates\": []");
+            } else {
+                let _ = writeln!(out, "    \"modrinth_candidates\": [");
+                for (i, candidate) in resolution.modrinth_candidates.iter().enumerate() {
+                    let last = i + 1 == resolution.modrinth_candidates.len();
+                    let _ = writeln!(out, "      {{");
+                    jf_str(&mut out, 4, "required_mod_id", &candidate.required_mod_id, true);
+                    jf_str(&mut out, 4, "required_by", &candidate.required_by, true);
+                    jf_str(&mut out, 4, "query_slug", &candidate.query_slug, true);
+                    jf_opt(&mut out, 4, "version_range", candidate.version_range.as_deref(), false);
+                    let _ = writeln!(out, "      }}{}", if last { "" } else { "," });
+                }
+                let _ = writeln!(out, "    ]");
+            }
+            let _ = writeln!(out, "  }},");
+        }
+    }
+
+    if report.dependency_recovery.is_empty() {
+        let _ = writeln!(out, "  \"dependency_recovery\": [],");
+    } else {
+        let _ = writeln!(out, "  \"dependency_recovery\": [");
+        for (i, entry) in report.dependency_recovery.iter().enumerate() {
+            let last = i + 1 == report.dependency_recovery.len();
+            let _ = writeln!(out, "    {{");
+            jf_str(&mut out, 3, "requiring_mod_id", &entry.requiring_mod_id, true);
+            jf_str(&mut out, 3, "required_mod_id", &entry.required_mod_id, true);
+            jf_opt(&mut out, 3, "declared_range", entry.declared_range.as_deref(), true);
+            jf_opt(&mut out, 3, "query_url", entry.query_url.as_deref(), true);
+            match &entry.candidate {
+                None => {
+                    let _ = writeln!(out, "      \"candidate\": null,");
+                }
+                Some(candidate) => {
+                    let _ = writeln!(out, "      \"candidate\": {{");
+                    jf_str(&mut out, 4, "project_slug", &candidate.project_slug, true);
+                    jf_str(&mut out, 4, "version_id", &candidate.version_id, true);
+                    jf_str(&mut out, 4, "version_number", &candidate.version_number, true);
+                    jf_str(&mut out, 4, "file_name", &candidate.file_name, true);
+                    jf_str(&mut out, 4, "download_url", &candidate.download_url, true);
+                    jf_u64(&mut out, 4, "size_bytes", candidate.size_bytes, false);
+                    let _ = writeln!(out, "      }},");
+                }
+            }
+            jf_bool(&mut out, 3, "already_on_disk", entry.already_on_disk, true);
+            jf_str(&mut out, 3, "instruction_en", &entry.instruction_en, false);
+            let _ = writeln!(out, "    }}{}", if last { "" } else { "," });
+        }
+        let _ = writeln!(out, "  ],");
+    }
 
     if report.jars.is_empty() {
         let _ = writeln!(out, "  \"jars\": []");
@@ -4260,7 +4476,7 @@ mod tests {
             .expect("bundled jar scans");
         for id in ["aeronautics_bundled", "aeronautics", "offroad", "simulated"] {
             assert!(
-                desc.declared_mod_ids.iter().any(|d| d == id),
+                desc.all_contained_mod_ids().contains(&id),
                 "missing provided mod id {id}: {:?}",
                 desc.declared_mod_ids
             );
@@ -4280,6 +4496,8 @@ mod tests {
             jars: vec![result],
             non_jar_entries: 0,
             audit_notes: Vec::new(),
+            dependency_resolution: None,
+            dependency_recovery: Vec::new(),
         };
         let plan =
             crate::live_registry_bridge::UnifiedModRegistryPlan::from_auto_adapt(1_000, 1_000, &report)
@@ -4359,7 +4577,7 @@ mod tests {
             "fabric_inner_c",
         ] {
             assert!(
-                desc.declared_mod_ids.iter().any(|d| d == id),
+                desc.all_contained_mod_ids().contains(&id),
                 "missing provided mod id {id}: {:?}",
                 desc.declared_mod_ids
             );
@@ -4425,7 +4643,7 @@ mod tests {
         // Depth-2 manifests still register their mod ids.
         let desc = scan_mod_jar_named(&outer, "deep-chain.jar").expect("scan");
         for id in ["outer_mod", "top_mod", "mid_mod"] {
-            assert!(desc.declared_mod_ids.iter().any(|d| d == id), "{id}");
+            assert!(desc.all_contained_mod_ids().contains(&id), "{id}");
         }
     }
 
@@ -4494,4 +4712,21 @@ mod tests {
         );
         assert_eq!(data.embedded_jars.len(), 1, "{:?}", data.embedded_jars);
     }
+
+    #[test]
+    fn input_jar_file_validation_happens_before_any_bytes_are_read() {
+        let dir = tmp_dir("input-file-validation");
+        let directory_shaped_jar = dir.join("shaped.jar");
+        fs::create_dir(&directory_shaped_jar).unwrap();
+        let err = auto_adapt_jar(&directory_shaped_jar, &opts()).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let oversized = dir.join("oversized.jar");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_MOD_JAR_BYTES + 1).unwrap();
+        drop(file);
+        let err = auto_adapt_jar(&oversized, &opts()).unwrap_err();
+        assert!(err.contains("input cap"), "{err}");
+    }
+
 }

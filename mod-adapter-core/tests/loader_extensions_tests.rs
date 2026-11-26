@@ -125,7 +125,9 @@ fn quilt_mod_json_parses_loader_id_version_depends_environment() {
                 {"id": "minecraft", "versions": ">=1.21.1"},
                 {"id": "quilt_loader", "versions": "*"},
                 {"id": "optionalpal", "versions": "^2", "optional": true},
-                {"all": [{"id": "req_a"}, {"id": "req_b"}]}
+                {"all": [{"id": "req_a"}, {"id": "req_b"}]},
+                {"any": [{"id": "alt_a"}, {"id": "alt_b"}]},
+                {"only_if": {"id": "conditional_c"}}
             ]
         },
         "minecraft": {"environment": "dedicated_server"}
@@ -147,7 +149,10 @@ fn quilt_mod_json_parses_loader_id_version_depends_environment() {
     let dep_ids: Vec<&str> = meta.dependencies.iter().map(|d| d.mod_id.as_str()).collect();
     assert_eq!(
         dep_ids,
-        vec!["minecraft", "quilt_loader", "optionalpal", "req_a", "req_b"]
+        vec![
+            "minecraft", "quilt_loader", "optionalpal", "req_a", "req_b",
+            "alt_a", "alt_b", "conditional_c",
+        ]
     );
     let optional = meta
         .dependencies
@@ -165,6 +170,18 @@ fn quilt_mod_json_parses_loader_id_version_depends_environment() {
         provided_loader_artifact("quilt_loader"),
         Some("org.quiltmc:quilt-loader")
     );
+    let alt_a = meta.dependencies.iter().find(|d| d.mod_id == "alt_a").unwrap();
+    let alt_b = meta.dependencies.iter().find(|d| d.mod_id == "alt_b").unwrap();
+    assert!(alt_a.required && alt_b.required);
+    assert!(alt_a.alternative_group.is_some());
+    assert_eq!(alt_a.alternative_group, alt_b.alternative_group);
+    let conditional = meta
+        .dependencies
+        .iter()
+        .find(|d| d.mod_id == "conditional_c")
+        .unwrap();
+    assert!(conditional.condition.as_deref().is_some_and(|c| c.starts_with("only_if:")));
+    assert!(meta.dependencies.iter().all(|d| d.owner_mod_id == "quiltymod"));
 }
 
 #[test]
@@ -225,6 +242,10 @@ fn scan_mod_jar_classifies_quilt_jar_and_collects_extensions() {
 
     let desc = scan_mod_jar(&bytes).expect("quilt JAR scans");
     assert_eq!(desc.loader, ModLoaderKind::Fabric);
+    assert!(desc.loader_manifests.iter().any(|l| matches!(
+        l,
+        mod_adapter_core::ecosystem_compat::ManifestLoaderKind::Quilt
+    )));
     assert_eq!(desc.mod_id, "quiltest");
     assert_eq!(desc.version, "9.9");
     assert_eq!(desc.entrypoints, vec!["com.example.Init"]);

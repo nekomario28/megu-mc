@@ -77,7 +77,22 @@ impl McVersion {
     /// Returns `None` on empty input, non-numeric or missing components, more
     /// than three components, or components outside `u16`.
     pub fn parse(s: &str) -> Option<Self> {
-        parse_numeric_version(s.trim()).ok()
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() > 3 {
+            return None;
+        }
+        let mut n = [0u16; 3];
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            n[i] = part.parse::<u16>().ok()?;
+        }
+        Some(Self::new(n[0], n[1], n[2]))
     }
 }
 
@@ -127,68 +142,372 @@ impl TryFrom<McVersion> for TargetVersion {
     }
 }
 
-/// Total-order key packing a version into one integer so open/closed bounds
-/// become inclusive integer interval math (`key(1.21.65535)+1 == key(1.22.0)`
-/// falls out of the layout, which is exactly what `>1.21.x` should mean).
-fn vkey(v: McVersion) -> u64 {
-    ((v.major as u64) << 32) | ((v.minor as u64) << 16) | v.patch as u64
+/// One semver prerelease identifier. Numeric identifiers order before
+/// alphanumeric identifiers exactly like SemVer; text is ASCII-lowercased so
+/// Maven qualifiers (`-SNAPSHOT`, `-RC.1`) compare case-insensitively.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VersionIdentifier {
+    Numeric(u64),
+    Text(String),
 }
 
-const KEY_MAX: u64 = u64::MAX;
+impl Ord for VersionIdentifier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use VersionIdentifier::{Numeric, Text};
+        match (self, other) {
+            (Numeric(a), Numeric(b)) => a.cmp(b),
+            // SemVer 11.4.4: numeric identifiers have lower precedence than
+            // alphanumeric identifiers.
+            (Numeric(_), Text(_)) => std::cmp::Ordering::Less,
+            (Text(_), Numeric(_)) => std::cmp::Ordering::Greater,
+            (Text(a), Text(b)) => a.cmp(b),
+        }
+    }
+}
 
-/// Numeric-only version parser shared by [`McVersion::parse`] and the Maven
-/// interval path: 1-3 all-digit components, no wildcards.
-fn parse_numeric_version(s: &str) -> Result<McVersion, String> {
+impl PartialOrd for VersionIdentifier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A general mod-version value: one to three dotted numeric components plus
+/// an optional SemVer/Maven prerelease qualifier chain. Build metadata
+/// (`+build`) is accepted and ignored for precedence, matching SemVer.
+///
+/// Precedence covers the qualifier families real Forge/NeoForge and Fabric
+/// artifacts publish: `1.0.0-alpha.1 < 1.0.0-alpha.2 < 1.0.0-beta.1 <
+/// 1.0.0-rc.1 < 1.0.0-SNAPSHOT < 1.0.0` for the usual spellings. Numeric
+/// components are normalized to three positions, so `1.2 == 1.2.0` while
+/// `1.2-alpha < 1.2`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModVersion {
+    numeric: [u64; 3],
+    prerelease: Vec<VersionIdentifier>,
+}
+
+impl ModVersion {
+    /// Parse a concrete version (`1.21.1`, `2.0.0-beta.2`, `1.0-SNAPSHOT`).
+    /// Returns `None` for empty input, wildcards, non-numeric core components,
+    /// more than three core components, empty prerelease identifiers, or bytes
+    /// outside the SemVer identifier alphabet.
+    pub fn parse(input: &str) -> Option<Self> {
+        parse_version_value(input.trim()).ok()
+    }
+
+    /// Whether this version is a prerelease (`-alpha`, `-SNAPSHOT`, …).
+    pub fn is_prerelease(&self) -> bool {
+        !self.prerelease.is_empty()
+    }
+
+    /// Numeric triple with omitted trailing components normalized to zero.
+    pub fn numeric_components(&self) -> [u64; 3] {
+        self.numeric
+    }
+
+    /// Dot-separated prerelease identifiers in their normalized form.
+    pub fn prerelease(&self) -> &[VersionIdentifier] {
+        &self.prerelease
+    }
+}
+
+impl From<McVersion> for ModVersion {
+    fn from(v: McVersion) -> Self {
+        Self {
+            numeric: [v.major as u64, v.minor as u64, v.patch as u64],
+            prerelease: Vec::new(),
+        }
+    }
+}
+
+impl Ord for ModVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.numeric.cmp(&other.numeric).then_with(|| {
+            match (self.prerelease.is_empty(), other.prerelease.is_empty()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                // A release sorts after every prerelease of the same numeric
+                // triple (SemVer 11.3; Maven qualifiers behave the same way).
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => {
+                    let common = self.prerelease.len().min(other.prerelease.len());
+                    for i in 0..common {
+                        let ord = self.prerelease[i].cmp(&other.prerelease[i]);
+                        if ord != std::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    self.prerelease.len().cmp(&other.prerelease.len())
+                }
+            }
+        })
+    }
+}
+
+impl PartialOrd for ModVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for ModVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.numeric[0])?;
+        write!(f, ".{}", self.numeric[1])?;
+        write!(f, ".{}", self.numeric[2])?;
+        if !self.prerelease.is_empty() {
+            f.write_str("-")?;
+            for (i, ident) in self.prerelease.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(".")?;
+                }
+                match ident {
+                    VersionIdentifier::Numeric(n) => write!(f, "{n}")?,
+                    VersionIdentifier::Text(t) => f.write_str(t)?,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_version_value(s: &str) -> Result<ModVersion, String> {
     if s.is_empty() {
         return Err("empty version".to_string());
     }
-    let parts: Vec<&str> = s.split('.').collect();
+    if s.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Err(format!("version '{s}' contains whitespace"));
+    }
+    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    // Build metadata is valid but never participates in precedence.
+    let without_build = s.split('+').next().unwrap_or("");
+    if without_build.is_empty() {
+        return Err(format!("version '{s}' has an empty core"));
+    }
+    let (core, prerelease_text) = match without_build.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (without_build, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
     if parts.len() > 3 {
         return Err(format!("version '{s}' has more than three components"));
     }
-    let mut n = [0u16; 3];
+    let mut numeric = [0u64; 3];
     for (i, part) in parts.iter().enumerate() {
         if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
             return Err(format!("version '{s}' has non-numeric component '{part}'"));
         }
-        n[i] = part
-            .parse::<u16>()
+        numeric[i] = part
+            .parse::<u64>()
             .map_err(|_| format!("version '{s}' component '{part}' out of range"))?;
     }
-    Ok(McVersion::new(n[0], n[1], n[2]))
+    let mut prerelease = Vec::new();
+    if let Some(pre) = prerelease_text {
+        if pre.is_empty() {
+            return Err(format!("version '{s}' has an empty prerelease"));
+        }
+        for ident in pre.split('.') {
+            if ident.is_empty() {
+                return Err(format!("version '{s}' has an empty prerelease identifier"));
+            }
+            if !ident
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(format!(
+                    "version '{s}' has invalid prerelease identifier '{ident}'"
+                ));
+            }
+            if ident.bytes().all(|b| b.is_ascii_digit()) {
+                prerelease.push(VersionIdentifier::Numeric(ident.parse::<u64>().map_err(
+                    |_| format!("version '{s}' prerelease identifier '{ident}' out of range"),
+                )?));
+            } else {
+                // Split simple Maven spellings such as `alpha1`/`rc2` into
+                // text+number so they order consistently with `alpha.1`/`rc.2`.
+                let digit_at = ident
+                    .bytes()
+                    .position(|b| b.is_ascii_digit())
+                    .unwrap_or(ident.len());
+                if digit_at > 0
+                    && digit_at < ident.len()
+                    && ident[..digit_at]
+                        .bytes()
+                        .all(|b| b.is_ascii_alphabetic() || b == b'-')
+                    && ident[digit_at..]
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                {
+                    prerelease.push(VersionIdentifier::Text(
+                        ident[..digit_at].to_ascii_lowercase(),
+                    ));
+                    prerelease.push(VersionIdentifier::Numeric(
+                        ident[digit_at..].parse::<u64>().map_err(|_| {
+                            format!("version '{s}' prerelease identifier '{ident}' out of range")
+                        })?,
+                    ));
+                } else {
+                    prerelease.push(VersionIdentifier::Text(ident.to_ascii_lowercase()));
+                }
+            }
+        }
+    }
+    Ok(ModVersion {
+        numeric,
+        prerelease,
+    })
 }
 
-/// A SemVer-ish version *spec*: dotted components where a trailing `x`/`X`/`*`
-/// wildcard (or an omitted component) widens the match to a whole band.
-/// `specified` counts the leading numeric components: `1.21.x` -> 2,
+/// A version interval endpoint. `inclusive` is the Maven `[`/`]` distinction
+/// and the semantic difference between `<`/`<=` in SemVer ranges.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionEndpoint {
+    version: ModVersion,
+    inclusive: bool,
+}
+
+/// One continuous version interval; the full range is a union of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VersionInterval {
+    lower: Option<VersionEndpoint>,
+    upper: Option<VersionEndpoint>,
+}
+
+impl VersionInterval {
+    fn unbounded() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+        }
+    }
+
+    fn exact(version: ModVersion) -> Self {
+        Self {
+            lower: Some(VersionEndpoint {
+                version: version.clone(),
+                inclusive: true,
+            }),
+            upper: Some(VersionEndpoint {
+                version,
+                inclusive: true,
+            }),
+        }
+    }
+
+    fn contains(&self, version: &ModVersion) -> bool {
+        if let Some(lower) = &self.lower {
+            let ord = version.cmp(&lower.version);
+            if ord == std::cmp::Ordering::Less
+                || (ord == std::cmp::Ordering::Equal && !lower.inclusive)
+            {
+                return false;
+            }
+        }
+        if let Some(upper) = &self.upper {
+            let ord = version.cmp(&upper.version);
+            if ord == std::cmp::Ordering::Greater
+                || (ord == std::cmp::Ordering::Equal && !upper.inclusive)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn endpoint_more_restrictive_lower(
+    a: Option<VersionEndpoint>,
+    b: Option<VersionEndpoint>,
+) -> Option<VersionEndpoint> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => Some(match a.version.cmp(&b.version) {
+            std::cmp::Ordering::Greater => a,
+            std::cmp::Ordering::Less => b,
+            std::cmp::Ordering::Equal => VersionEndpoint {
+                version: a.version,
+                inclusive: a.inclusive && b.inclusive,
+            },
+        }),
+    }
+}
+
+fn endpoint_more_restrictive_upper(
+    a: Option<VersionEndpoint>,
+    b: Option<VersionEndpoint>,
+) -> Option<VersionEndpoint> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(a), Some(b)) => Some(match a.version.cmp(&b.version) {
+            std::cmp::Ordering::Less => a,
+            std::cmp::Ordering::Greater => b,
+            std::cmp::Ordering::Equal => VersionEndpoint {
+                version: a.version,
+                inclusive: a.inclusive && b.inclusive,
+            },
+        }),
+    }
+}
+
+fn intersect_intervals(a: &VersionInterval, b: &VersionInterval) -> VersionInterval {
+    VersionInterval {
+        lower: endpoint_more_restrictive_lower(a.lower.clone(), b.lower.clone()),
+        upper: endpoint_more_restrictive_upper(a.upper.clone(), b.upper.clone()),
+    }
+}
+
+fn upper_reaches_lower(upper: &VersionEndpoint, lower: &VersionEndpoint) -> bool {
+    match upper.version.cmp(&lower.version) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => upper.inclusive && lower.inclusive,
+    }
+}
+
+fn intervals_overlap(a: &VersionInterval, b: &VersionInterval) -> bool {
+    if let (Some(au), Some(bl)) = (&a.upper, &b.lower) {
+        if !upper_reaches_lower(au, bl) {
+            return false;
+        }
+    }
+    if let (Some(bu), Some(al)) = (&b.upper, &a.lower) {
+        if !upper_reaches_lower(bu, al) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A SemVer-ish version *spec*: dotted numeric components where a trailing
+/// `x`/`X`/`*` wildcard (or an omitted component) widens the match to a whole
+/// band. `specified` counts the leading numeric components: `1.21.x` -> 2,
 /// `1.x`/`1` -> 1, `*` -> 0.
 struct VersionSpec {
-    lo: [u64; 3],
+    version: ModVersion,
     specified: usize,
 }
 
 fn parse_spec(s: &str) -> Result<VersionSpec, String> {
-    let s = s.trim();
-    let s = s.strip_prefix(['v', 'V']).unwrap_or(s);
+    let original = s.trim();
+    let s = original.strip_prefix(['v', 'V']).unwrap_or(original);
     let s = s.split('+').next().unwrap_or("");
     if s.is_empty() {
         return Err("empty version spec".to_string());
     }
-    if s.contains('-') {
-        return Err(format!(
-            "prerelease/hyphenated spec '{s}' is unsupported (use an explicit range)"
-        ));
-    }
-    let parts: Vec<&str> = s.split('.').collect();
+    let (core, prerelease_text) = match s.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (s, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
     if parts.len() > 3 {
-        return Err(format!("version spec '{s}' has more than three components"));
+        return Err(format!("version spec '{original}' has more than three components"));
     }
-    let mut lo = [0u64; 3];
+    let mut numeric = [0u64; 3];
     let mut specified = parts.len();
     let mut saw_wildcard = false;
     for (i, part) in parts.iter().enumerate() {
         if part.is_empty() {
-            return Err(format!("version spec '{s}' has an empty component"));
+            return Err(format!("version spec '{original}' has an empty component"));
         }
         if matches!(*part, "x" | "X" | "*") {
             saw_wildcard = true;
@@ -199,46 +518,91 @@ fn parse_spec(s: &str) -> Result<VersionSpec, String> {
         }
         if saw_wildcard {
             return Err(format!(
-                "version spec '{s}' has a numeric component after a wildcard"
+                "version spec '{original}' has a numeric component after a wildcard"
             ));
         }
         if !part.bytes().all(|b| b.is_ascii_digit()) {
             return Err(format!(
-                "version spec '{s}' has non-numeric component '{part}'"
+                "version spec '{original}' has non-numeric component '{part}'"
             ));
         }
-        let n: u64 = part
+        numeric[i] = part
             .parse()
-            .map_err(|_| format!("version spec '{s}' component '{part}' out of range"))?;
-        if n > u16::MAX as u64 {
-            return Err(format!(
-                "version spec '{s}' component '{part}' out of range"
-            ));
-        }
-        lo[i] = n;
+            .map_err(|_| format!("version spec '{original}' component '{part}' out of range"))?;
     }
-    Ok(VersionSpec { lo, specified })
+    if saw_wildcard && prerelease_text.is_some() {
+        return Err(format!(
+            "version spec '{original}' cannot combine a wildcard with a prerelease"
+        ));
+    }
+    if specified < 3 && prerelease_text.is_some() {
+        return Err(format!(
+            "partial version spec '{original}' cannot carry a prerelease"
+        ));
+    }
+    let mut version = ModVersion {
+        numeric,
+        prerelease: Vec::new(),
+    };
+    if prerelease_text.is_some() {
+        version = parse_version_value(s)
+            .map_err(|e| format!("version spec '{original}' is invalid: {e}"))?;
+    }
+    Ok(VersionSpec { version, specified })
 }
 
-fn spec_lo_key(spec: &VersionSpec) -> u64 {
-    (spec.lo[0] << 32) | (spec.lo[1] << 16) | spec.lo[2]
+fn bumped_version(mut v: ModVersion, component: usize) -> ModVersion {
+    v.numeric[component] = v.numeric[component].saturating_add(1);
+    for component in v.numeric.iter_mut().skip(component + 1) {
+        *component = 0;
+    }
+    v.prerelease.clear();
+    v
 }
 
-/// Exclusive upper key of the band the spec covers: `1.21.1` -> `1.21.2`,
+/// Exclusive upper bound of the band the spec covers: `1.21.1` -> `1.21.2`,
 /// `1.21.x` -> `1.22.0`, `1.x` -> `2.0.0`, `*` -> unbounded.
-fn spec_band_hi(spec: &VersionSpec) -> u64 {
+fn spec_band_hi(spec: &VersionSpec) -> Option<ModVersion> {
     match spec.specified {
-        0 => KEY_MAX,
-        1 => (spec.lo[0] + 1) << 32,
-        2 => (spec.lo[0] << 32) | ((spec.lo[1] + 1) << 16),
-        _ => spec_lo_key(spec) + 1,
+        0 => None,
+        1 => Some(bumped_version(spec.version.clone(), 0)),
+        2 => Some(bumped_version(spec.version.clone(), 1)),
+        _ => Some(bumped_version(spec.version.clone(), 2)),
     }
 }
 
-/// One SemVer predicate token -> inclusive `[lo, hi]` key interval.
-fn predicate_interval(tok: &str) -> Result<(u64, u64), String> {
+fn lower_inclusive(version: ModVersion) -> Option<VersionEndpoint> {
+    Some(VersionEndpoint {
+        version,
+        inclusive: true,
+    })
+}
+
+fn lower_exclusive(version: ModVersion) -> Option<VersionEndpoint> {
+    Some(VersionEndpoint {
+        version,
+        inclusive: false,
+    })
+}
+
+fn upper_inclusive(version: ModVersion) -> Option<VersionEndpoint> {
+    Some(VersionEndpoint {
+        version,
+        inclusive: true,
+    })
+}
+
+fn upper_exclusive(version: ModVersion) -> Option<VersionEndpoint> {
+    Some(VersionEndpoint {
+        version,
+        inclusive: false,
+    })
+}
+
+/// One SemVer predicate token -> a continuous interval.
+fn predicate_interval(tok: &str) -> Result<VersionInterval, String> {
     if matches!(tok, "*" | "x" | "X") {
-        return Ok((0, KEY_MAX));
+        return Ok(VersionInterval::unbounded());
     }
     let (op, body) = ["~", "^", ">=", "<=", ">", "<", "="]
         .iter()
@@ -249,65 +613,109 @@ fn predicate_interval(tok: &str) -> Result<(u64, u64), String> {
     }
     let spec = parse_spec(body)?;
     if spec.specified == 0 {
-        // `*`, `~*`, `^*`, `>=1.x` style: wildcard-only spec matches anything.
-        return Ok((0, KEY_MAX));
+        return Ok(VersionInterval::unbounded());
     }
-    let lo = spec_lo_key(&spec);
+    let lo = spec.version.clone();
     let hi_band = spec_band_hi(&spec);
     Ok(match op {
-        ">=" => (lo, KEY_MAX),
-        ">" => (hi_band, KEY_MAX),
+        ">=" => VersionInterval {
+            lower: lower_inclusive(lo),
+            upper: None,
+        },
+        ">" => {
+            if spec.specified == 3 {
+                VersionInterval {
+                    lower: lower_exclusive(lo),
+                    upper: None,
+                }
+            } else {
+                VersionInterval {
+                    lower: hi_band.and_then(lower_inclusive),
+                    upper: None,
+                }
+            }
+        }
         "<=" => {
             if spec.specified == 3 {
-                (0, lo)
+                VersionInterval {
+                    lower: None,
+                    upper: upper_inclusive(lo),
+                }
             } else {
-                (0, hi_band - 1)
+                VersionInterval {
+                    lower: None,
+                    upper: hi_band.and_then(upper_exclusive),
+                }
             }
         }
-        "<" => {
-            if lo == 0 {
-                (1, 0) // `<0.0.0` matches nothing; empty interval marker.
+        "<" => VersionInterval {
+            lower: None,
+            upper: upper_exclusive(lo),
+        },
+        "=" => {
+            if spec.specified == 3 {
+                VersionInterval::exact(lo)
             } else {
-                (0, lo - 1)
+                VersionInterval {
+                    lower: lower_inclusive(lo),
+                    upper: hi_band.and_then(upper_exclusive),
+                }
             }
         }
-        "=" => (lo, hi_band - 1),
         "~" => {
             // Tilde keeps the minor band: `~1.21.1` is `>=1.21.1 <1.22.0`,
             // `~1` is `>=1.0.0 <2.0.0`.
             let hi = if spec.specified >= 2 {
-                (spec.lo[0] << 32) | ((spec.lo[1] + 1) << 16)
+                bumped_version(lo.clone(), 1)
             } else {
-                (spec.lo[0] + 1) << 32
+                bumped_version(lo.clone(), 0)
             };
-            (lo, hi - 1)
+            VersionInterval {
+                lower: lower_inclusive(lo),
+                upper: upper_exclusive(hi),
+            }
         }
         "^" => {
             // Caret allows everything below the leftmost non-zero component's
             // increment: `^1.21.1` <2.0.0, `^0.2.3` <0.3.0, `^0.0.3` <0.0.4,
             // `^0.0` <0.1.0, `^0` <1.0.0.
-            let hi = if spec.lo[0] > 0 {
-                (spec.lo[0] + 1) << 32
-            } else if spec.specified >= 2 && spec.lo[1] > 0 {
-                (spec.lo[1] + 1) << 16
+            let hi = if spec.version.numeric[0] > 0 {
+                bumped_version(lo.clone(), 0)
+            } else if spec.specified >= 2 && spec.version.numeric[1] > 0 {
+                bumped_version(lo.clone(), 1)
             } else if spec.specified == 3 {
-                spec.lo[2] + 1
+                bumped_version(lo.clone(), 2)
             } else if spec.specified == 2 {
-                1 << 16
+                let mut v = lo.clone();
+                v.numeric[1] = 0;
+                v.numeric[2] = 0;
+                bumped_version(v, 1)
             } else {
-                1 << 32
+                bumped_version(lo.clone(), 0)
             };
-            (lo, hi - 1)
+            VersionInterval {
+                lower: lower_inclusive(lo),
+                upper: upper_exclusive(hi),
+            }
         }
         // Bare spec: a full `1.21.1` pins exactly, a partial `1.21`/`1` covers
         // its whole band (`1.21.x`-style), matching SemVer range convention.
-        _ => (lo, hi_band - 1),
+        _ => {
+            if spec.specified == 3 {
+                VersionInterval::exact(lo)
+            } else {
+                VersionInterval {
+                    lower: lower_inclusive(lo),
+                    upper: hi_band.and_then(upper_exclusive),
+                }
+            }
+        }
     })
 }
 
 /// Parse one bracketed Maven interval member starting at `s[i]` (`[` or `(`);
-/// returns `(lo, hi)` inclusive keys and the index just past the closer.
-fn parse_maven_member(s: &str, i: usize) -> Result<(u64, u64, usize), String> {
+/// returns its interval and the index just past the closer.
+fn parse_maven_member(s: &str, i: usize) -> Result<(VersionInterval, usize), String> {
     let bytes = s.as_bytes();
     let open_incl = bytes[i] == b'[';
     let close = s[i + 1..]
@@ -329,33 +737,28 @@ fn parse_maven_member(s: &str, i: usize) -> Result<(u64, u64, usize), String> {
                     "exact pin '{inner}' in '{s}' must use square brackets"
                 ));
             }
-            let k = vkey(parse_numeric_version(v)?);
-            (k, k)
+            VersionInterval::exact(parse_version_value(v)?)
         }
         2 => {
             let lo_s = parts[0].trim();
             let hi_s = parts[1].trim();
-            let lo = if lo_s.is_empty() {
-                0
+            let lower = if lo_s.is_empty() {
+                None
             } else {
-                let k = vkey(parse_numeric_version(lo_s)?);
-                if open_incl {
-                    k
-                } else {
-                    k + 1
-                }
+                Some(VersionEndpoint {
+                    version: parse_version_value(lo_s)?,
+                    inclusive: open_incl,
+                })
             };
-            let hi = if hi_s.is_empty() {
-                KEY_MAX
+            let upper = if hi_s.is_empty() {
+                None
             } else {
-                let k = vkey(parse_numeric_version(hi_s)?);
-                if close_incl {
-                    k
-                } else {
-                    k.saturating_sub(1)
-                }
+                Some(VersionEndpoint {
+                    version: parse_version_value(hi_s)?,
+                    inclusive: close_incl,
+                })
             };
-            (lo, hi)
+            VersionInterval { lower, upper }
         }
         _ => {
             return Err(format!(
@@ -363,12 +766,14 @@ fn parse_maven_member(s: &str, i: usize) -> Result<(u64, u64, usize), String> {
             ))
         }
     };
-    Ok((interval.0, interval.1, close + 1))
+    Ok((interval, close + 1))
 }
 
 /// Maven / NeoForge range: a sequence of bracketed intervals (plus bare
-/// exact pins) separated by commas.
-fn parse_maven_range(s: &str) -> Result<Vec<(u64, u64)>, String> {
+/// exact pins). Real Maven union syntax concatenates bracketed members
+/// (`(,1.20.5],[1.21.1,)`); a comma separator is accepted as a tolerant
+/// extension because some hand-written manifests use it.
+fn parse_maven_range(s: &str) -> Result<Vec<VersionInterval>, String> {
     let bytes = s.as_bytes();
     let mut intervals = Vec::new();
     let mut i = 0usize;
@@ -383,18 +788,23 @@ fn parse_maven_range(s: &str) -> Result<Vec<(u64, u64)>, String> {
             return Err(format!("trailing separator in '{s}'"));
         }
         if matches!(bytes[i], b'[' | b'(') {
-            let (lo, hi, next) = parse_maven_member(s, i)?;
-            intervals.push((lo, hi));
+            let (interval, next) = parse_maven_member(s, i)?;
+            intervals.push(interval);
             i = next;
         } else {
             // Bare member inside the list: exact pin (`(,1.0],1.2` style).
-            let end = s[i..].find(',').map(|o| i + o).unwrap_or(bytes.len());
+            let mut end = bytes.len();
+            for (off, b) in bytes[i..].iter().enumerate() {
+                if matches!(*b, b',' | b'[' | b'(') {
+                    end = i + off;
+                    break;
+                }
+            }
             let tok = s[i..end].trim();
             if tok.is_empty() {
                 return Err(format!("empty list member in '{s}'"));
             }
-            let k = vkey(parse_numeric_version(tok)?);
-            intervals.push((k, k));
+            intervals.push(VersionInterval::exact(parse_version_value(tok)?));
             i = end;
         }
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -403,25 +813,30 @@ fn parse_maven_range(s: &str) -> Result<Vec<(u64, u64)>, String> {
         if i >= bytes.len() {
             break;
         }
+        if matches!(bytes[i], b'[' | b'(') {
+            // Standard adjacent Maven union member.
+            continue;
+        }
         if bytes[i] != b',' {
-            return Err(format!("expected ',' between intervals in '{s}'"));
+            return Err(format!("expected ',' or an interval in '{s}'"));
         }
         i += 1;
+        // A comma may just separate union members; loop validation catches a
+        // trailing comma or an empty member fail-closed.
     }
     Ok(intervals)
 }
 
 /// SemVer range: `||`-separated union arms, each an AND of space-separated
 /// comparator/tilde/caret/wildcard/bare predicates.
-fn parse_semver_range(s: &str) -> Result<Vec<(u64, u64)>, String> {
+fn parse_semver_range(s: &str) -> Result<Vec<VersionInterval>, String> {
     let mut intervals = Vec::new();
     for arm in s.split("||") {
         let arm = arm.trim();
         if arm.is_empty() {
             return Err(format!("empty '||' arm in '{s}'"));
         }
-        let mut lo = 0u64;
-        let mut hi = KEY_MAX;
+        let mut interval = VersionInterval::unbounded();
         let mut tokens = arm.split_whitespace().peekable();
         while let Some(tok) = tokens.next() {
             // Tolerate `>= 1.21.1`: a lone operator binds the next token.
@@ -432,11 +847,10 @@ fn parse_semver_range(s: &str) -> Result<Vec<(u64, u64)>, String> {
             } else {
                 tok.to_string()
             };
-            let (a, b) = predicate_interval(&tok)?;
-            lo = lo.max(a);
-            hi = hi.min(b);
+            let next = predicate_interval(&tok)?;
+            interval = intersect_intervals(&interval, &next);
         }
-        intervals.push((lo, hi));
+        intervals.push(interval);
     }
     Ok(intervals)
 }
@@ -460,12 +874,15 @@ impl fmt::Display for VersionRangeError {
 
 impl std::error::Error for VersionRangeError {}
 
-/// A parsed Minecraft version range: a union of inclusive version intervals
-/// covering both the NeoForge/Forge Maven syntax and the Fabric SemVer syntax.
+/// A parsed mod/Minecraft version range: a union of continuous intervals
+/// covering both the NeoForge/Forge Maven syntax and the Fabric SemVer
+/// syntax. Unlike a name-only or numeric-only solver, endpoint qualifiers are
+/// part of the ordering, so `[1.0-alpha.1,1.0]` really admits
+/// `1.0-beta.2` and rejects `1.0.1-SNAPSHOT` exactly as written.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionRange {
     declared: String,
-    intervals: Vec<(u64, u64)>,
+    intervals: Vec<VersionInterval>,
 }
 
 impl VersionRange {
@@ -496,18 +913,48 @@ impl VersionRange {
 
     /// Whether `v` falls inside the union of declared intervals.
     pub fn contains(&self, v: McVersion) -> bool {
-        let k = vkey(v);
-        self.intervals.iter().any(|&(lo, hi)| lo <= k && k <= hi)
+        let version = ModVersion::from(v);
+        self.contains_version(&version)
+    }
+
+    /// Whether a general parsed mod version falls inside this range.
+    pub fn contains_version(&self, v: &ModVersion) -> bool {
+        self.intervals.iter().any(|interval| interval.contains(v))
+    }
+
+    /// Parse `version` and test it against this range. Invalid concrete
+    /// versions fail closed with an error rather than being coerced.
+    pub fn contains_version_str(&self, version: &str) -> Result<bool, VersionRangeError> {
+        let parsed = ModVersion::parse(version)
+            .ok_or_else(|| VersionRangeError(format!("invalid concrete version '{version}'")))?;
+        Ok(self.contains_version(&parsed))
+    }
+
+    /// Infallible convenience wrapper for callers that treat an unparsable
+    /// candidate as simply not satisfying the range.
+    pub fn matches_str(&self, version: &str) -> bool {
+        ModVersion::parse(version).is_some_and(|v| self.contains_version(&v))
     }
 
     /// Whether the range admits at least one version on `v`'s `major.minor`
     /// line — distinguishes a minor mismatch (same `1.21.x` line, wrong patch
     /// window) from a major one (mod built for another release line).
     fn overlaps_minor_band(&self, v: McVersion) -> bool {
-        let lo = vkey(McVersion::new(v.major, v.minor, 0));
-        let hi = vkey(McVersion::new(v.major, v.minor, u16::MAX));
-        self.intervals.iter().any(|&(a, b)| a <= hi && b >= lo)
+        let band = VersionInterval {
+            lower: lower_inclusive(ModVersion::from(McVersion::new(v.major, v.minor, 0))),
+            upper: upper_inclusive(ModVersion::from(McVersion::new(v.major, v.minor, u16::MAX))),
+        };
+        self.intervals
+            .iter()
+            .any(|interval| intervals_overlap(interval, &band))
     }
+}
+
+/// Convenience predicate used by dependency solvers: parse `declared_range`
+/// and the concrete `version`, then perform real endpoint-aware satisfaction.
+/// Any malformed input is an error — never silently treated as compatible.
+pub fn version_satisfies(declared_range: &str, version: &str) -> Result<bool, VersionRangeError> {
+    VersionRange::parse(declared_range)?.contains_version_str(version)
 }
 
 /// Verdict from checking a mod's declared Minecraft range against the version
@@ -962,7 +1409,6 @@ mod tests {
             "1.21.1 ||",
             "|| 1.21.1",
             "1.21.1 1.21.4 junk",
-            "1.21.1-rc1",
             "<0.0.0 garbage",
             ",",
             "[1.21.1],garbage!",
@@ -974,6 +1420,35 @@ mod tests {
         }
         // `<0.0.0` parses but matches nothing.
         assert!(!range("<0.0.0").contains(v(0, 0, 0)));
+    }
+
+    #[test]
+    fn maven_qualifiers_and_semver_prereleases_order_accurately() {
+        let alpha = ModVersion::parse("1.0.0-alpha.1").unwrap();
+        let alpha2 = ModVersion::parse("1.0.0-alpha.2").unwrap();
+        let beta = ModVersion::parse("1.0.0-beta.2").unwrap();
+        let rc = ModVersion::parse("1.0.0-rc.1").unwrap();
+        let snapshot = ModVersion::parse("1.0.0-SNAPSHOT").unwrap();
+        let release = ModVersion::parse("1.0.0").unwrap();
+        assert!(alpha < alpha2 && alpha2 < beta && beta < rc);
+        assert!(rc < snapshot && snapshot < release);
+        assert_eq!(ModVersion::parse("1.0.0+build.7"), Some(release.clone()));
+
+        // Maven endpoints carry qualifiers instead of truncating them.
+        let r = range("[1.0.0-alpha.1,1.0.0]");
+        assert!(r.contains_version(&alpha));
+        assert!(r.contains_version(&beta));
+        assert!(r.contains_version(&release));
+        assert!(!r.contains_version(&ModVersion::parse("1.0.1-SNAPSHOT").unwrap()));
+
+        // SemVer comparators use the same total ordering.
+        let r = range(">=1.0.0-alpha.1 <1.0.0");
+        assert!(r.matches_str("1.0.0-alpha.1"));
+        assert!(r.matches_str("1.0.0-rc.1"));
+        assert!(r.matches_str("1.0.0-SNAPSHOT"));
+        assert!(!r.matches_str("1.0.0"));
+        assert!(!r.matches_str("1.0.0-alpha.0"));
+        assert!(version_satisfies("[2.0-beta.2,)", "2.0-rc.1").unwrap());
     }
 
     #[test]

@@ -738,9 +738,10 @@ version="9.9.9"
         vec!["fabricharm-1.0.0.jar", "fabricharm-neoforge-9.9.9.jar"]
     );
     // First claimant in sorted order stays in the table.
+    // Dependency-aware deterministic load order puts the provider first.
     assert_eq!(
         plan.unified_mod_ids(),
-        vec!["fabricharm", "mylibrary"]
+        vec!["mylibrary", "fabricharm"]
     );
     // The dependency fabricharm declares is satisfied by the present jar.
     assert!(plan.missing_dependencies.is_empty());
@@ -818,6 +819,200 @@ side="BOTH"
             .iter()
             .any(|id| id == "innerlib")
     );
+}
+
+#[test]
+fn solver_evaluates_version_ranges_against_real_and_nested_provider_versions() {
+    let needing = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"need_version","version":"1.0.0","depends":{"ranged_lib":"[2.0.0-beta.1,3.0.0)"}}"#.as_slice(),
+    )]);
+    let old = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"ranged_lib","version":"1.4.0"}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([
+        ("need.jar", needing.as_slice()),
+        ("old.jar", old.as_slice()),
+    ]);
+    assert!(plan.missing_dependencies.is_empty());
+    assert_eq!(plan.version_mismatches.len(), 1);
+    assert_eq!(plan.version_mismatches[0].provider_version, "1.4.0");
+
+    let good = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"ranged_lib","version":"2.0.0-rc.1"}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([
+        ("need.jar", needing.as_slice()),
+        ("good.jar", good.as_slice()),
+    ]);
+    assert!(plan.missing_dependencies.is_empty());
+    assert!(plan.version_mismatches.is_empty());
+}
+
+#[test]
+fn fabric_arrays_provides_and_breaks_are_preserved_and_solved() {
+    let alias_provider = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"real_lib","version":"2.1.0","provides":["alias_lib"]}"#.as_slice(),
+    )]);
+    let broken = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"bad_lib","version":"1.0.0"}"#.as_slice(),
+    )]);
+    let consumer = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"consumer","version":"1.0.0","depends":{"alias_lib":[">=2.0.0","<3.0.0"]},"suggests":{"cosmetic":"*"},"breaks":{"bad_lib":"*"},"conflicts":{"grumpy":"*"}}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([
+        ("consumer.jar", consumer.as_slice()),
+        ("provider.jar", alias_provider.as_slice()),
+        ("bad.jar", broken.as_slice()),
+    ]);
+    assert!(plan.missing_dependencies.is_empty());
+    assert_eq!(plan.dependency_conflicts.len(), 1);
+    assert_eq!(plan.dependency_conflicts[0].other_mod_id, "bad_lib");
+    let consumer_desc = scan_mod_jar(&consumer).unwrap();
+    assert!(consumer_desc
+        .dependencies
+        .iter()
+        .any(|d| d.mod_id == "cosmetic" && d.kind == mod_adapter_core::ecosystem_compat::ModDependencyKind::Suggested));
+}
+
+#[test]
+fn forge_edge_side_ordering_and_discouraged_are_preserved_and_reported() {
+    let toml = br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="edgeowner"
+version="1.0.0"
+[[dependencies.edgeowner]]
+modId="badcompanion"
+type="discouraged"
+versionRange="[1.0,)"
+side="SERVER"
+ordering="BEFORE"
+[[dependencies.edgeowner]]
+modId="clientonlydep"
+type="required"
+versionRange="[1.0,)"
+side="CLIENT"
+ordering="NONE"
+"#;
+    let owner = jar(&[("META-INF/neoforge.mods.toml", toml.as_slice())]);
+    let desc = scan_mod_jar(&owner).unwrap();
+    let bad_edge = desc
+        .dependencies
+        .iter()
+        .find(|d| d.mod_id == "badcompanion")
+        .unwrap();
+    assert_eq!(bad_edge.kind, mod_adapter_core::ecosystem_compat::ModDependencyKind::Discouraged);
+    assert_eq!(bad_edge.ordering, mod_adapter_core::ecosystem_compat::ModDependencyOrdering::Before);
+    assert_eq!(bad_edge.side, ModEnvironment::Server);
+
+    let bad = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"badcompanion","version":"1.0.0"}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([
+        ("owner.jar", owner.as_slice()),
+        ("bad.jar", bad.as_slice()),
+    ]);
+    assert!(plan.missing_dependencies.is_empty(), "client-side dependency must be filtered on a dedicated server");
+    assert_eq!(plan.dependency_conflicts.len(), 1);
+    assert!(plan
+        .resolution
+        .client_only_skipped
+        .iter()
+        .any(|x| x == "edgeowner:clientonlydep"));
+}
+
+#[test]
+fn dependency_cycles_are_exact_sccs_and_load_order_is_dependency_first() {
+    let a = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"cycle_a","version":"1.0.0","depends":{"cycle_b":"*"}}"#.as_slice(),
+    )]);
+    let b = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"cycle_b","version":"1.0.0","depends":{"cycle_a":"*"}}"#.as_slice(),
+    )]);
+    let downstream = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"downstream","version":"1.0.0","depends":{"cycle_a":"*"}}"#.as_slice(),
+    )]);
+    let free = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"free_mod","version":"1.0.0"}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([
+        ("downstream.jar", downstream.as_slice()),
+        ("cycle-b.jar", b.as_slice()),
+        ("free.jar", free.as_slice()),
+        ("cycle-a.jar", a.as_slice()),
+    ]);
+    assert_eq!(plan.dependency_cycles.len(), 1);
+    assert_eq!(plan.dependency_cycles[0].members, vec!["cycle_a", "cycle_b"]);
+    assert!(!plan.dependency_cycles[0].members.iter().any(|id| id == "downstream"));
+    assert_eq!(plan.unified_mod_ids().first().copied(), Some("free_mod"));
+}
+
+#[test]
+fn neoforge_file_jarversion_resolves_from_manifest_implementation_version() {
+    let toml = br#"modLoader="javafml"
+loaderVersion="[4.0.39]"
+license="MIT"
+[[mods]]
+modId="versioned"
+version="${file.jarVersion}"
+"#;
+    let bytes = jar(&[
+        ("META-INF/neoforge.mods.toml", toml.as_slice()),
+        ("META-INF/MANIFEST.MF", b"Manifest-Version: 1.0\nImplementation-Version: 4.5.6\n".as_slice()),
+    ]);
+    let desc = scan_mod_jar(&bytes).unwrap();
+    assert_eq!(desc.version, "4.5.6");
+}
+
+#[test]
+fn malformed_nested_jar_is_isolated_without_rejecting_outer_or_sibling() {
+    let good_inner = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"goodinner","version":"1.0.0"}"#.as_slice(),
+    )]);
+    let outer_manifest = br#"{"schemaVersion":1,"id":"outer","version":"1.0.0","depends":{"goodinner":">=1.0"}}"#;
+    let outer = jar(&[
+        ("fabric.mod.json", outer_manifest.as_slice()),
+        ("META-INF/jars/goodinner.jar", good_inner.as_slice()),
+        ("META-INF/jars/badinner.jar", b"not a zip".as_slice()),
+    ]);
+    let desc = scan_mod_jar(&outer).expect("outer archive stays healthy");
+    assert!(desc.nested_candidates.iter().any(|c| c.mod_id == "goodinner"));
+    assert!(!desc.isolated_nested_jars.is_empty());
+    let plan = plan_dual_loader_mods_dir([("outer.jar", outer.as_slice())]);
+    assert!(plan.missing_dependencies.is_empty());
+}
+
+#[test]
+fn virtual_provider_table_enforces_exact_capability_versions() {
+    let consumer = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"capconsumer","version":"1.0.0","depends":{"java":">=21","minecraft":"[1.21.1,1.21.2)"}}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([("consumer.jar", consumer.as_slice())]);
+    assert!(plan.missing_dependencies.is_empty());
+    assert!(plan.version_mismatches.is_empty());
+
+    let strict_java = jar(&[(
+        "fabric.mod.json",
+        br#"{"schemaVersion":1,"id":"capconsumer","version":"1.0.0","depends":{"java":">=22"}}"#.as_slice(),
+    )]);
+    let plan = plan_dual_loader_mods_dir([("consumer.jar", strict_java.as_slice())]);
+    assert!(plan.missing_dependencies.is_empty());
+    assert_eq!(plan.version_mismatches.len(), 1);
+    assert_eq!(plan.version_mismatches[0].provider_id, "java");
 }
 
 #[test]
