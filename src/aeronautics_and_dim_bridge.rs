@@ -2026,7 +2026,6 @@ fn aeronautics_client_join_baseline(client_id: u32, dim_id: DimId) -> Vec<Vec<u8
 }
 
 /// Absolute-server-tick entry point ready for `main.rs` tick wiring.
-#[allow(dead_code)]
 fn aeronautics_tick_once_for_server(server_tick: u64) {
     if let Ok(mut bridge) = aeronautics_bridge().lock() {
         bridge.tick_once_for_server(server_tick);
@@ -2091,7 +2090,6 @@ fn aeronautics_bridge_load_bytes(bytes: &[u8]) -> bool {
 /// Whether the aeronautics + dimension-mod bridges hold state Save v2 must
 /// persist: a live airship, or at least one discovered (non-builtin) dimension
 /// environment. Both empty means zero `AER1` bytes — vanilla saves untouched.
-#[allow(dead_code)]
 fn aeronautics_bridge_has_state() -> bool {
     let ships = aeronautics_bridge()
         .lock()
@@ -2109,7 +2107,6 @@ fn aeronautics_bridge_has_state() -> bool {
 /// registrations re-derive from the dimension JARs at boot; what a restart
 /// cannot re-derive — the live fleet and the discovered env overrides — is
 /// what rides the trailer.
-#[allow(dead_code)]
 fn aeronautics_state_save_bytes() -> Vec<u8> {
     let msae = aeronautics_bridge_save_bytes();
     let records = dimension_mod_bridge()
@@ -2134,7 +2131,6 @@ fn aeronautics_state_save_bytes() -> Vec<u8> {
 
 /// Restore `aeronautics_state_save_bytes`; `false` on a corrupt buffer or a
 /// lock failure — the fleet and env tables are left untouched either way.
-#[allow(dead_code)]
 fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
     /// Bound on the embedded `MSAE` blob and the env-record count — real
     /// trailers are nowhere near either.
@@ -2208,7 +2204,6 @@ fn aeronautics_state_load_bytes(bytes: &[u8]) -> bool {
 /// Discover an arbitrary Create addon JAR's profiles and forward its `#c:ores`
 /// /`#c:chests` hidden blocks into anti-xray. Returns the number of state ids
 /// newly hidden.
-#[allow(dead_code)]
 fn aeronautics_bridge_discover_addon_jar<I, S, B>(entries: I) -> Result<usize, String>
 where
     I: IntoIterator<Item = (S, B)>,

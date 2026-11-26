@@ -461,7 +461,6 @@ impl DimId {
     /// The all-ones mask as the little-endian u64 word list the protocol bitset
     /// carries: one word for every dimension the runtime supports today (up to 63
     /// light sections), more for a taller custom `dimension_type`.
-    #[allow(dead_code)]
     pub(crate) fn light_mask_longs(self) -> Vec<u64> {
         let light = self.light_sections();
         let mut words = vec![u64::MAX; light / 64];
@@ -9270,7 +9269,6 @@ pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
 
 /// Drain the generated fluid ticks owned by one dimension's generator. Nether and End
 /// generators keep their own queues even when the Overworld is the active dim-less world.
-#[allow(dead_code)]
 pub fn drain_generated_fluid_ticks_for_dim(dim: DimId) -> Vec<GeneratedTick> {
     let queues = PER_DIM_TICK_QUEUES
         .lock()

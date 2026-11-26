@@ -75,7 +75,6 @@ fn rbs_read_bool(b: &mut &[u8]) -> Option<bool> {
 /// `crj` RecipeBookType order on the wire (C2S 0x28 `bookId` and the 0x41
 /// settings block iterate this order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 enum RecipeBookCategory {
     Crafting = 0,
     Furnace = 1,
@@ -118,7 +117,6 @@ struct RecipeBookPageSettings {
 /// `avt` RecipeBookSettings: one (open, filter) pair per book page, written as
 /// eight booleans in `RecipeBookCategory::ALL` order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct RecipeBookSettings {
     pages: [RecipeBookPageSettings; 4],
 }
@@ -157,7 +155,6 @@ impl RecipeBookSettings {
 /// `displayed` is the set the client highlights as new (INIT `to_highlight`),
 /// cleared when the book sees the recipe.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct PlayerRecipeBook {
     unlocked: std::collections::BTreeSet<String>,
     displayed: std::collections::BTreeSet<String>,
@@ -212,7 +209,6 @@ impl PlayerRecipeBook {
 
 /// `aee$a` ClientboundRecipePacket.State.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum RecipeBookAction {
     Init = 0,
     Add = 1,
@@ -238,7 +234,6 @@ impl RecipeBookAction {
 /// S2C 0x41 `ClientboundRecipePacket` payload (packet id prefix not included;
 /// the send path wraps it as usual).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct UpdateRecipesBook {
     action: RecipeBookAction,
     settings: RecipeBookSettings,
@@ -247,7 +242,6 @@ struct UpdateRecipesBook {
     to_highlight: Vec<String>,
 }
 
-#[allow(dead_code)]
 fn encode_update_recipes_book(p: &UpdateRecipesBook) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, p.action.id() as i64);
@@ -290,7 +284,6 @@ struct RecipeBookChangeSettings {
     filter_active: bool,
 }
 
-#[allow(dead_code)]
 fn decode_recipe_book_change_settings(b: &mut &[u8]) -> Option<RecipeBookChangeSettings> {
     let s = RecipeBookChangeSettings {
         book_type: RecipeBookCategory::from_id(read_protocol_i32(b)?)?,
@@ -313,7 +306,6 @@ fn encode_recipe_book_change_settings(s: &RecipeBookChangeSettings) -> Vec<u8> {
 }
 
 /// C2S 0x29 `ServerboundRecipeBookSeenRecipePacket`: a single ResourceLocation.
-#[allow(dead_code)]
 fn decode_recipe_book_seen_recipe(b: &mut &[u8]) -> Option<String> {
     let id = rbs_read_str(b)?;
     if !b.is_empty() {
@@ -331,14 +323,12 @@ fn encode_recipe_book_seen_recipe(recipe_id: &str) -> Vec<u8> {
 
 /// C2S 0x22 `ServerboundPlaceRecipePacket`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 struct PlaceRecipe {
     window_id: i8,
     recipe_id: String,
     make_all: bool,
 }
 
-#[allow(dead_code)]
 fn decode_place_recipe(b: &mut &[u8]) -> Option<PlaceRecipe> {
     let (&w, tail) = b.split_first()?;
     *b = tail;
@@ -366,7 +356,6 @@ fn encode_place_recipe(p: &PlaceRecipe) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum RecipeCommandVerb {
     Give,
     Take,
@@ -385,7 +374,6 @@ struct RecipeCommandOutcome {
 /// `universe` is every recipe id the server's recipe manager knows; `target` is
 /// a single recipe id or `*`. Returns `None` when a single recipe id is not in
 /// `universe` — vanilla's `/recipe` fails with `commands.recipe.failed` there.
-#[allow(dead_code)]
 fn exec_recipe_command(
     book: &mut PlayerRecipeBook,
     verb: RecipeCommandVerb,
@@ -681,7 +669,6 @@ impl RbsRecipe {
 /// `czb` RecipeHolder on the wire: `id` ResourceLocation, then the serializer
 /// registry id VarInt, then that serializer's payload.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)]
 struct RbsRecipeEntry {
     id: String,
     recipe: RbsRecipe,
@@ -910,7 +897,6 @@ fn rbs_read_ingredient_list(b: &mut &[u8]) -> Option<Vec<RbsIngredient>> {
 }
 
 /// S2C 0x77 `ClientboundUpdateRecipesPacket` payload.
-#[allow(dead_code)]
 fn encode_update_recipes(entries: &[RbsRecipeEntry]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, entries.len() as i64);
@@ -943,7 +929,6 @@ fn decode_update_recipes(b: &mut &[u8]) -> Option<Vec<RbsRecipeEntry>> {
 /// `minecraft:stat_type` registry order for 1.21.1 (`avz` Stats.<clinit>) — the
 /// `categoryId` of each 0x04 entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 enum StatCategory {
     Mined = 0,
     Crafted = 1,
@@ -981,7 +966,6 @@ impl StatCategory {
 /// `awa` StatsCounter, keyed by `(stat_type, stat_id)` registry ids. BTreeMap
 /// keeps iteration deterministic for both the wire codec and persistence.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)]
 struct PlayerStats {
     counts: std::collections::BTreeMap<(StatCategory, i32), i32>,
 }
@@ -1014,7 +998,6 @@ impl PlayerStats {
 
 /// Save v2 snapshot codec: a VarInt entry count, then `(category, stat_id,
 /// value)` VarInt triples in the map's deterministic order.
-#[allow(dead_code)]
 fn encode_stats(stats: &PlayerStats) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, stats.counts.len() as i64);
@@ -1026,7 +1009,6 @@ fn encode_stats(stats: &PlayerStats) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
 fn decode_stats(b: &mut &[u8]) -> Option<PlayerStats> {
     let n = read_protocol_i32(b)?;
     if !(0..=1_000_000).contains(&n) {
@@ -1080,7 +1062,6 @@ fn decode_client_command_action(b: &mut &[u8]) -> Option<i32> {
 
 /// Header and footer as anonymous NBT text components (`{"text":"..."}` via
 /// `chat_nbt`, matching `xb.d` ComponentSerialization on the wire).
-#[allow(dead_code)]
 fn encode_tab_list(header_text: &str, footer_text: &str) -> Vec<u8> {
     let mut out = chat_nbt(header_text);
     out.extend_from_slice(&chat_nbt(footer_text));
