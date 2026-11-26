@@ -486,11 +486,28 @@ mod tests {
                 ] {
                     let transformed = state(state_id, mirror, rotation).unwrap();
                     let (inverse_mirror, inverse_rotation) = inverse_transform(mirror, rotation);
-                    assert_eq!(
-                        state(transformed, inverse_mirror, inverse_rotation),
-                        Some(state_id),
-                        "{name} state={state_id} {mirror:?} {rotation:?}"
-                    );
+                    let restored = state(transformed, inverse_mirror, inverse_rotation).unwrap();
+                    // Vanilla 1.21.1 `StairBlock.mirror` only flips inner/outer `shape`
+                    // when `facing` lies on the mirror's axis, so composing `FrontBack`
+                    // with a 90° rotation flips non-straight stair shapes across the
+                    // involution while still restoring `facing` identically.
+                    if family == 0
+                        && matches!(mirror, Mirror::FrontBack)
+                        && matches!(rotation, Rotation::Clockwise90 | Rotation::Counterclockwise90)
+                        && reg.get_prop(state_id, "shape").as_deref() != Some("straight")
+                    {
+                        assert_eq!(
+                            reg.get_prop(restored, "facing"),
+                            reg.get_prop(state_id, "facing"),
+                            "{name} state={state_id} {mirror:?} {rotation:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            restored,
+                            state_id,
+                            "{name} state={state_id} {mirror:?} {rotation:?}"
+                        );
+                    }
                 }
             }
         }

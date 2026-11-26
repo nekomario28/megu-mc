@@ -2592,9 +2592,18 @@ fn postprocess_bush_shape<W: TemplateWorld>(
     let survives = match bare {
         // `NetherWartBlock.canSurvive` (`dlc.a`): SOUL_SAND only.
         "nether_wart" => Some(below_name == "minecraft:soul_sand"),
-        // `StemBlock`/`AttachedStemBlock.canSurvive` (`dns.a`/`cxs.a`): the
-        // `mayPlaceOn` set is FARMLAND only.
-        "pumpkin_stem" | "melon_stem" | "attached_pumpkin_stem" | "attached_melon_stem" => {
+        // `CropBlock`/`StemBlock`/`AttachedStemBlock.canSurvive`:
+        // the `mayPlaceOn` set is FARMLAND only.
+        "wheat"
+        | "carrots"
+        | "potatoes"
+        | "beetroots"
+        | "torchflower_crop"
+        | "pitcher_crop"
+        | "pumpkin_stem"
+        | "melon_stem"
+        | "attached_pumpkin_stem"
+        | "attached_melon_stem" => {
             Some(below_name == "minecraft:farmland")
         }
         // `DeadBushBlock.mayPlaceOn` (`dhr.a`): sand/red_sand, the `#terracotta`
