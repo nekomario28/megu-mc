@@ -20,7 +20,6 @@
 // ---------- bounds ----------
 
 /// `BoundingBox.orientBox(x, y, z, offX, offY, offZ, width, height, depth, direction)`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn fm_orient_box(
     x: i32,
@@ -75,7 +74,6 @@ fn fm_along_z(dir: Facing) -> bool {
 }
 
 /// `StructurePiece.makeBoundingBox(x, y, z, direction, width, height, depth)`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_make_bounding_box(
     x: i32,
     y: i32,
@@ -93,12 +91,10 @@ fn fm_make_bounding_box(
 }
 
 /// `BoundingBox.intersects(BoundingBox)`: inclusive on all three axes.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_bb_intersects(a: &Bounds, b: &Bounds) -> bool {
     (0..3).all(|i| a[i + 3] >= b[i] && a[i] <= b[i + 3])
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_bb_move(b: &mut Bounds, dx: i32, dy: i32, dz: i32) {
     b[0] += dx;
     b[1] += dy;
@@ -108,7 +104,6 @@ fn fm_bb_move(b: &mut Bounds, dx: i32, dy: i32, dz: i32) {
     b[5] += dz;
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_bb_encapsulate(acc: &mut Bounds, b: &Bounds) {
     for i in 0..3 {
         acc[i] = acc[i].min(b[i]);
@@ -118,7 +113,6 @@ fn fm_bb_encapsulate(acc: &mut Bounds, b: &Bounds) {
 
 /// The RNG surface the piece trees need beyond `StructureRng`: `RandomSource.nextInt()`,
 /// which is `java.util.Random.nextInt()` and not `nextInt(bound)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait FullIntRng {
     fn next_int(&mut self) -> i32;
 }
@@ -137,13 +131,11 @@ impl FullIntRng for Lcg {
 
 // ---------- block states ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_state(reg: &BReg, name: &str) -> u32 {
     reg.state_of(name, None)
 }
 
 /// `Blocks.NETHER_BRICK_FENCE.defaultBlockState().setValue(...)` for the named sides.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_fence(reg: &BReg, north: bool, east: bool, south: bool, west: bool) -> u32 {
     let mut props: Vec<(String, String)> = Vec::new();
     for (name, on) in [
@@ -160,7 +152,6 @@ fn fm_fence(reg: &BReg, north: bool, east: bool, south: bool, west: bool) -> u32
         .expect("nether brick fence state")
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fm_stairs(reg: &BReg, facing: Facing) -> u32 {
     reg.checked_state(
         "minecraft:nether_brick_stairs",
@@ -186,7 +177,6 @@ struct PieceWorld<'a, 'g> {
     loots: &'a mut std::collections::BTreeMap<(i32, i32, i32), SinglePieceLoot>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a, 'g> PieceWorld<'a, 'g> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -412,7 +402,7 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
 }
 
 /// Java's `boolean` spelling in the piece tags.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn piece_bool(v: bool) -> &'static str {
     if v {
         "1"
@@ -423,18 +413,13 @@ fn piece_bool(v: bool) -> &'static str {
 
 // ================= minecraft:fortress =================
 
-#[cfg_attr(not(test), allow(dead_code))]
 const FORTRESS_MAX_DEPTH: i32 = 30;
-#[cfg_attr(not(test), allow(dead_code))]
 const FORTRESS_LOWEST_Y: i32 = 10;
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const FORTRESS_MAGIC_START_Y: i32 = 64;
 /// `BuiltInLootTables.NETHER_BRIDGE`.
-#[cfg_attr(not(test), allow(dead_code))]
 const FORTRESS_LOOT_TABLE: &str = "minecraft:chests/nether_bridge";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum FortressKind {
     Start,
     BridgeCrossing,
@@ -453,12 +438,11 @@ pub(crate) enum FortressKind {
     StairsRoom,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FortressKind {
     /// The 1.21.1 `StructurePieceType` registry id this piece serialises as. The ids are the
     /// game's own (`NeBS` and friends lowercased), so the fixture's piece list is the native
     /// tag's `id` field rather than a name the port invented.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn registry_id(self) -> &'static str {
         match self {
             // `StartPiece` calls `BridgeCrossing(int, int, Direction)`, which hardcodes the
@@ -483,7 +467,6 @@ impl FortressKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 struct PieceWeight {
     kind: FortressKind,
     weight: i32,
@@ -493,7 +476,6 @@ struct PieceWeight {
 
 /// `BRIDGE_PIECE_WEIGHTS` then `CASTLE_PIECE_WEIGHTS`, flattened so one id names a weight.
 /// Ids 0..=5 are the bridge list, 6..=12 the castle list, in their declared order.
-#[cfg_attr(not(test), allow(dead_code))]
 const FORTRESS_WEIGHTS: [PieceWeight; 13] = [
     PieceWeight {
         kind: FortressKind::BridgeStraight,
@@ -575,15 +557,12 @@ const FORTRESS_WEIGHTS: [PieceWeight; 13] = [
     },
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 const BRIDGE_WEIGHT_IDS: [u32; 6] = [0, 1, 2, 3, 4, 5];
-#[cfg_attr(not(test), allow(dead_code))]
 const CASTLE_WEIGHT_IDS: [u32; 7] = [6, 7, 8, 9, 10, 11, 12];
 
 /// One generated `NetherBridgePiece`. Mutable fields are the pieces' own `postProcess` state:
 /// the turn pieces consume `chest_pending` once and the throne consumes `spawner_placed`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FortressPiece {
     pub(crate) kind: FortressKind,
     pub(crate) depth: i32,
@@ -594,9 +573,8 @@ pub(crate) struct FortressPiece {
     pub(crate) spawner_placed: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FortressPiece {
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn canonical(&self) -> String {
         let bb = self
             .bounds
@@ -630,7 +608,6 @@ impl FortressPiece {
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FortressLayout {
     pub(crate) pieces: Vec<FortressPiece>,
     /// Encapsulated piece bounds after `StructurePiecesBuilder.moveInsideHeights`.
@@ -646,7 +623,6 @@ struct FortressBuilder {
     start: Bounds,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FortressBuilder {
     fn new(start: Bounds) -> Self {
         FortressBuilder {
@@ -980,7 +956,6 @@ impl FortressBuilder {
 
 /// `NetherFortressStructure.generatePieces` including the closing
 /// `StructurePiecesBuilder.moveInsideHeights(random, 48, 70)`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn generate_fortress_pieces<R: StructureRng + FullIntRng + ?Sized>(
     rng: &mut R,
     cx: i32,
@@ -1036,7 +1011,6 @@ pub(crate) fn generate_fortress_pieces<R: StructureRng + FullIntRng + ?Sized>(
 
 // ---------- fortress placement ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct FortressStates {
     bricks: u32,
     air: u32,
@@ -1061,7 +1035,6 @@ struct FortressStates {
     plain_fence: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl FortressStates {
     fn new(reg: &BReg) -> Self {
         let f = |n: bool, e: bool, s: bool, w: bool| fm_fence(reg, n, e, s, w);
@@ -1198,7 +1171,6 @@ fn fortress_hall_base(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
 }
 
 /// One fortress piece's `postProcess` against one clip box.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fortress_post_process<R: StructureRng + ?Sized>(
     w: &mut PieceWorld<'_, '_>,
     s: &FortressStates,
@@ -1482,7 +1454,6 @@ fn fortress_stairs_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
     fill_down(w, b, 0..=6, 0..=6);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fortress_monster_throne(
     w: &mut PieceWorld<'_, '_>,
     s: &FortressStates,
@@ -1534,7 +1505,6 @@ fn fortress_monster_throne(
     fill_down(w, b, 0..=6, 0..=6);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn fortress_stalk_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
     fortress_hall_top(w, s, false);
     let b = s.bricks;
@@ -1583,11 +1553,9 @@ fn fortress_stalk_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
 }
 
 /// Live container map for the pieces of one structure, keyed by world position.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) type LootMap = std::collections::BTreeMap<(i32, i32, i32), SinglePieceLoot>;
 
 /// Place one fortress chunk: every piece whose box meets `clip`, in generation order.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn place_fortress_chunk<R: StructureRng + ?Sized>(
     ctx: &mut FC<'_>,
     reg: &'static BReg,
@@ -2061,20 +2029,13 @@ mod fortress_monument_tests {
 // ================= minecraft:monument =================
 
 /// `Direction.values()` order: the 3D data value indexes `connections` and `hasOpening`.
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_DOWN: usize = 0;
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_UP: usize = 1;
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_NORTH: usize = 2;
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_SOUTH: usize = 3;
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_WEST: usize = 4;
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_EAST: usize = 5;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const DIR_STEP: [(i32, i32, i32); 6] = [
     (0, -1, 0),
     (0, 1, 0),
@@ -2084,13 +2045,11 @@ const DIR_STEP: [(i32, i32, i32); 6] = [
     (1, 0, 0),
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn dir_opposite(d: usize) -> usize {
     [DIR_UP, DIR_DOWN, DIR_SOUTH, DIR_NORTH, DIR_EAST, DIR_WEST][d]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum MonumentKind {
     Building,
     Core,
@@ -2106,10 +2065,9 @@ pub(crate) enum MonumentKind {
     Wing,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MonumentKind {
     /// The 1.21.1 `StructurePieceType` registry id, which is what the piece tag carries.
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn registry_id(self) -> &'static str {
         match self {
             Self::Building => "minecraft:omb",
@@ -2130,7 +2088,6 @@ impl MonumentKind {
 
 /// `OceanMonumentPieces.RoomDefinition`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct RoomDefinition {
     pub(crate) index: i32,
     pub(crate) connections: [Option<u32>; 6],
@@ -2140,7 +2097,6 @@ pub(crate) struct RoomDefinition {
     scan_index: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RoomDefinition {
     fn new(index: i32) -> Self {
         RoomDefinition {
@@ -2154,13 +2110,11 @@ impl RoomDefinition {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn room_index(x: i32, y: i32, z: i32) -> usize {
     (y * 25 + z * 5 + x) as usize
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MonumentPiece {
     pub(crate) kind: MonumentKind,
     pub(crate) bounds: Bounds,
@@ -2171,9 +2125,8 @@ pub(crate) struct MonumentPiece {
     pub(crate) main_design: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MonumentPiece {
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg(all(test, megu_vanilla_data))]
     pub(crate) fn canonical(&self, rooms: &[RoomDefinition]) -> String {
         let bb = self
             .bounds
@@ -2198,24 +2151,21 @@ impl MonumentPiece {
 }
 
 #[derive(Clone, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct MonumentLayout {
     /// Index 0 is the `MonumentBuilding`; the rest are its `childPieces` in creation order.
     pub(crate) pieces: Vec<MonumentPiece>,
     pub(crate) rooms: Vec<RoomDefinition>,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) source_room: u32,
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) core_room: u32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct MonumentGraph {
     rooms: Vec<RoomDefinition>,
     by_index: Vec<Option<u32>>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MonumentGraph {
     fn room(&self, id: u32) -> &RoomDefinition {
         &self.rooms[id as usize]
@@ -2263,7 +2213,6 @@ impl MonumentGraph {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_piece_box(room: i32, dir: Facing, xs: i32, ys: i32, zs: i32) -> Bounds {
     let gx = room % 5;
     let gz = room / 5 % 5;
@@ -2279,7 +2228,6 @@ fn monument_piece_box(room: i32, dir: Facing, xs: i32, ys: i32, zs: i32) -> Boun
 }
 
 /// `Util.shuffle`: Fisher-Yates from the end, one `nextInt(i + 1)` per step.
-#[cfg_attr(not(test), allow(dead_code))]
 fn util_shuffle<T, R: StructureRng + ?Sized>(list: &mut [T], rng: &mut R) {
     for i in (1..list.len()).rev() {
         let j = rng.next_bound((i + 1) as i32) as usize;
@@ -2289,7 +2237,6 @@ fn util_shuffle<T, R: StructureRng + ?Sized>(list: &mut [T], rng: &mut R) {
 
 /// Claim the core room's whole east/north/up neighbourhood so the fitters leave the
 /// entrance axis alone.
-#[cfg_attr(not(test), allow(dead_code))]
 fn claim_core_neighborhood(g: &mut MonumentGraph, core_room: u32) {
     let core_east = g.room(core_room).connections[DIR_EAST].expect("core east");
     let core_north = g.room(core_room).connections[DIR_NORTH].expect("core north");
@@ -2313,7 +2260,6 @@ fn claim_core_neighborhood(g: &mut MonumentGraph, core_room: u32) {
 
 /// `MonumentBuilding`'s opening pass: for each room, up to five tries at closing two open
 /// connections while both sides can still reach a source room.
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_opening_thinning<R: StructureRng + ?Sized>(
     g: &mut MonumentGraph,
     list: &[u32],
@@ -2357,7 +2303,6 @@ fn monument_opening_thinning<R: StructureRng + ?Sized>(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_room_graph<R: StructureRng + ?Sized>(
     rng: &mut R,
 ) -> (MonumentGraph, u32, u32, Vec<u32>) {
@@ -2441,7 +2386,6 @@ fn monument_generate_room_graph<R: StructureRng + ?Sized>(
 }
 
 /// `MonumentBuilding`'s fitter list, in the order the constructor adds them.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonumentFitter {
     DoubleXY,
@@ -2453,7 +2397,6 @@ enum MonumentFitter {
     Simple,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_fitter_fits(g: &MonumentGraph, f: MonumentFitter, room: u32) -> bool {
     let r = g.room(room);
     match f {
@@ -2500,7 +2443,6 @@ fn monument_fitter_fits(g: &MonumentGraph, f: MonumentFitter, room: u32) -> bool
 }
 
 /// A child piece at depth 1 covering `xs` x `ys` x `zs` room cells from `room_index`.
-#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn child_piece(
     kind: MonumentKind,
@@ -2522,7 +2464,6 @@ fn child_piece(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_fitter_create<R: StructureRng + ?Sized>(
     g: &mut MonumentGraph,
     f: MonumentFitter,
@@ -2598,7 +2539,6 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
 }
 
 /// A depth-1 piece with no room: the two wings and the penthouse span fixed world boxes.
-#[cfg_attr(not(test), allow(dead_code))]
 fn fixed_piece(kind: MonumentKind, bounds: Bounds, dir: Facing, design: i32) -> MonumentPiece {
     MonumentPiece {
         kind,
@@ -2611,7 +2551,6 @@ fn fixed_piece(kind: MonumentKind, bounds: Bounds, dir: Facing, design: i32) -> 
 }
 
 /// `OceanMonumentStructure.createTopPiece` + `MonumentBuilding`'s constructor.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
     rng: &mut R,
     cx: i32,
@@ -2726,7 +2665,6 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
 
 // ---------- monument placement ----------
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct MonumentStates {
     gray: u32,
     light: u32,
@@ -2739,7 +2677,6 @@ struct MonumentStates {
     ice: [u32; 2],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MonumentStates {
     fn new(reg: &BReg) -> Self {
         MonumentStates {
@@ -2767,7 +2704,6 @@ impl MonumentStates {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<'a, 'g> PieceWorld<'a, 'g> {
     /// `OceanMonumentPiece.generateWaterBox`: fill with water, but above sea level replace a
     /// non-water cell with air, and never touch `FILL_KEEP`.
@@ -2861,7 +2797,6 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
 }
 
 /// `MonumentBuilding.postProcess`, in the order the building writes.
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_building_body(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -2912,7 +2847,6 @@ fn monument_building_body(
 
 /// The RNG surface the monument's room pieces need (`nextBoolean`), kept separate so the
 /// building body can be generic over the caller's generator without threading a type.
-#[cfg_attr(not(test), allow(dead_code))]
 trait MonumentRng {
     fn next_bool(&mut self) -> bool;
     fn next_bound(&mut self, bound: i32) -> i32;
@@ -2927,7 +2861,6 @@ impl<R: StructureRng + ?Sized> MonumentRng for R {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_wing(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3013,7 +2946,6 @@ fn monument_generate_wing(
     w.generate_box(off + 12, 1, 11, off + 12, 7, 13, g, g, false);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_entrance_archs(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3043,7 +2975,6 @@ fn monument_generate_entrance_archs(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_entrance_wall(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3107,7 +3038,6 @@ fn monument_generate_entrance_wall(
     w.generate_water_box(s, 35, 1, 21, 35, 2, 21, sea_level);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_roof_piece(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3151,7 +3081,6 @@ fn monument_generate_roof_piece(
     w.generate_box(30, 21, 28, 30, 21, 29, g, g, false);
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_lower_wall(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3205,7 +3134,6 @@ fn monument_generate_lower_wall(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_middle_wall(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -3270,7 +3198,6 @@ fn monument_generate_middle_wall(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_upper_wall(
     w: &mut PieceWorld<'_, '_>,
     s: &MonumentStates,
@@ -4107,7 +4034,6 @@ fn monument_wing(
 }
 
 /// One monument child piece's `postProcess` against one clip box.
-#[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn monument_piece_post_process(
     w: &mut PieceWorld<'_, '_>,
@@ -4143,7 +4069,6 @@ fn monument_piece_post_process(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn monument_spawn_elder(
     w: &mut PieceWorld<'_, '_>,
     clip: Bounds,
@@ -4160,7 +4085,6 @@ fn monument_spawn_elder(
 
 /// Place one monument chunk. The building writes its own body, then every child whose box
 /// meets the clip, exactly as `MonumentBuilding.postProcess` ends.
-#[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 pub(crate) fn place_monument_chunk<R: StructureRng + FullIntRng>(
     ctx: &mut FC<'_>,
