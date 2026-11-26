@@ -4234,7 +4234,7 @@ mod structure_signature_tests {
 
     #[test]
     fn fortress_layout_bounds_cover_every_piece_without_overlap() {
-        for seed in [1, 7, 4242, 1_21_1] {
+        for seed in [1, 7, 4242, 1211] {
             let mut rng = Xor::seed_worldgen(seed);
             let layout = generate_fortress_pieces(&mut rng, -3, 11);
             assert!(!layout.pieces.is_empty());
@@ -4306,7 +4306,7 @@ mod structure_signature_tests {
 
     #[test]
     fn monument_layout_has_signature_pieces_inside_a_connected_room_graph() {
-        for seed in [1, 7, 4242, 1_21_1] {
+        for seed in [1, 7, 4242, 1211] {
             let mut rng = Xor::seed_worldgen(seed);
             let layout = generate_monument_pieces(&mut rng, 5, -9);
             let count = |kind| {

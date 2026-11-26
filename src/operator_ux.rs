@@ -176,7 +176,7 @@ fn safe_spawn_or_fallback_with_relaxed(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, megu_vanilla_data))]
 fn safe_spawn_or_fallback(
     surface: &dyn Fn(i32, i32) -> i32,
     block: &dyn Fn(i32, i32, i32) -> u32,
