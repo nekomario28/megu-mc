@@ -1449,6 +1449,27 @@ pub fn configured_resource_packs(game_dir: &Path) -> Vec<String> {
         .collect()
 }
 
+const ENTITY_TEXTURE_PATHS: &str = concat!(
+    "allay=assets/minecraft/textures/entity/allay/allay.png;armadillo=assets/minecraft/textures/entity/armadillo.png;armor_stand=assets/minecraft/textures/entity/armorstand/wood.png;arrow=assets/minecraft/textures/entity/projectiles/arrow.png;axolotl=assets/minecraft/textures/entity/axolotl/axolotl_lucy.png;bat=assets/minecraft/textures/entity/bat.png;bee=assets/minecraft/textures/entity/bee/bee.png;blaze=assets/minecraft",
+    "/textures/entity/blaze.png;boat=assets/minecraft/textures/entity/boat/oak.png;bogged=assets/minecraft/textures/entity/skeleton/bogged.png;breeze=assets/minecraft/textures/entity/breeze/breeze.png;breeze_wind_charge=assets/minecraft/textures/entity/projectiles/wind_charge.png;camel=assets/minecraft/textures/entity/camel/camel.png;cat=assets/minecraft/textures/entity/cat/tabby.png;cave_spider=assets/minecraft/textures/",
+    "entity/spider/cave_spider.png;chest_boat=assets/minecraft/textures/entity/chest_boat/oak.png;chest_minecart=assets/minecraft/textures/entity/minecart.png;chicken=assets/minecraft/textures/entity/chicken.png;cod=assets/minecraft/textures/entity/fish/cod.png;command_block_minecart=assets/minecraft/textures/entity/minecart.png;cow=assets/minecraft/textures/entity/cow/cow.png;creeper=assets/minecraft/textures/entity/cree",
+    "per/creeper.png;dolphin=assets/minecraft/textures/entity/dolphin.png;donkey=assets/minecraft/textures/entity/horse/donkey.png;dragon_fireball=assets/minecraft/textures/entity/enderdragon/dragon_fireball.png;drowned=assets/minecraft/textures/entity/zombie/drowned.png;egg=assets/minecraft/textures/item/egg.png;elder_guardian=assets/minecraft/textures/entity/guardian_elder.png;end_crystal=assets/minecraft/textures/entit",
+    "y/end_crystal/end_crystal.png;ender_dragon=assets/minecraft/textures/entity/enderdragon/dragon.png;ender_pearl=assets/minecraft/textures/item/ender_pearl.png;enderman=assets/minecraft/textures/entity/enderman/enderman.png;endermite=assets/minecraft/textures/entity/endermite.png;evoker=assets/minecraft/textures/entity/illager/evoker.png;evoker_fangs=assets/minecraft/textures/entity/illager/evoker_fangs.png;experience_",
+    "bottle=assets/minecraft/textures/item/experience_bottle.png;experience_orb=assets/minecraft/textures/entity/experience_orb.png;eye_of_ender=assets/minecraft/textures/item/ender_eye.png;firework_rocket=assets/minecraft/textures/item/firework_rocket.png;fox=assets/minecraft/textures/entity/fox/fox.png;frog=assets/minecraft/textures/entity/frog/temperate_frog.png;furnace_minecart=assets/minecraft/textures/entity/minecar",
+    "t.png;ghast=assets/minecraft/textures/entity/ghast/ghast.png;giant=assets/minecraft/textures/entity/zombie/zombie.png;glow_item_frame=assets/minecraft/textures/block/glow_item_frame.png;glow_squid=assets/minecraft/textures/entity/squid/glow_squid.png;goat=assets/minecraft/textures/entity/goat/goat.png;guardian=assets/minecraft/textures/entity/guardian.png;hoglin=assets/minecraft/textures/entity/hoglin/hoglin.png;hopp",
+    "er_minecart=assets/minecraft/textures/entity/minecart.png;horse=assets/minecraft/textures/entity/horse/horse_chestnut.png;husk=assets/minecraft/textures/entity/zombie/husk.png;illusioner=assets/minecraft/textures/entity/illager/illusioner.png;iron_golem=assets/minecraft/textures/entity/iron_golem/iron_golem.png;item_frame=assets/minecraft/textures/block/item_frame.png;fireball=assets/minecraft/textures/item/fire_char",
+    "ge.png;leash_knot=assets/minecraft/textures/entity/lead_knot.png;llama=assets/minecraft/textures/entity/llama/creamy.png;llama_spit=assets/minecraft/textures/entity/llama/spit.png;magma_cube=assets/minecraft/textures/entity/slime/magmacube.png;minecart=assets/minecraft/textures/entity/minecart.png;mooshroom=assets/minecraft/textures/entity/cow/red_mooshroom.png;mule=assets/minecraft/textures/entity/horse/mule.png;oce",
+    "lot=assets/minecraft/textures/entity/cat/ocelot.png;painting=assets/minecraft/textures/painting/kebab.png;panda=assets/minecraft/textures/entity/panda/panda.png;parrot=assets/minecraft/textures/entity/parrot/parrot_red_blue.png;phantom=assets/minecraft/textures/entity/phantom.png;pig=assets/minecraft/textures/entity/pig/pig.png;piglin=assets/minecraft/textures/entity/piglin/piglin.png;piglin_brute=assets/minecraft/te",
+    "xtures/entity/piglin/piglin_brute.png;pillager=assets/minecraft/textures/entity/illager/pillager.png;polar_bear=assets/minecraft/textures/entity/bear/polarbear.png;potion=assets/minecraft/textures/item/splash_potion.png;pufferfish=assets/minecraft/textures/entity/fish/pufferfish.png;rabbit=assets/minecraft/textures/entity/rabbit/black.png;ravager=assets/minecraft/textures/entity/illager/ravager.png;salmon=assets/mine",
+    "craft/textures/entity/fish/salmon.png;sheep=assets/minecraft/textures/entity/sheep/sheep.png;shulker=assets/minecraft/textures/entity/shulker/shulker.png;shulker_bullet=assets/minecraft/textures/entity/shulker/spark.png;silverfish=assets/minecraft/textures/entity/silverfish.png;skeleton=assets/minecraft/textures/entity/skeleton/skeleton.png;skeleton_horse=assets/minecraft/textures/entity/horse/horse_skeleton.png;slim",
+    "e=assets/minecraft/textures/entity/slime/slime.png;small_fireball=assets/minecraft/textures/item/fire_charge.png;sniffer=assets/minecraft/textures/entity/sniffer/sniffer.png;snow_golem=assets/minecraft/textures/entity/snow_golem.png;snowball=assets/minecraft/textures/item/snowball.png;spawner_minecart=assets/minecraft/textures/entity/minecart.png;spectral_arrow=assets/minecraft/textures/entity/projectiles/spectral_ar",
+    "row.png;spider=assets/minecraft/textures/entity/spider/spider.png;squid=assets/minecraft/textures/entity/squid/squid.png;stray=assets/minecraft/textures/entity/skeleton/stray.png;strider=assets/minecraft/textures/entity/strider/strider.png;tadpole=assets/minecraft/textures/entity/tadpole/tadpole.png;tnt=assets/minecraft/textures/block/tnt_side.png;tnt_minecart=assets/minecraft/textures/entity/minecart.png;trader_llam",
+    "a=assets/minecraft/textures/entity/llama/creamy.png;trident=assets/minecraft/textures/entity/trident.png;tropical_fish=assets/minecraft/textures/entity/fish/tropical_a.png;turtle=assets/minecraft/textures/entity/turtle/big_sea_turtle.png;vex=assets/minecraft/textures/entity/illager/vex.png;villager=assets/minecraft/textures/entity/villager/villager.png;vindicator=assets/minecraft/textures/entity/illager/vindicator.pn",
+    "g;wandering_trader=assets/minecraft/textures/entity/wandering_trader.png;warden=assets/minecraft/textures/entity/warden/warden.png;wind_charge=assets/minecraft/textures/entity/projectiles/wind_charge.png;witch=assets/minecraft/textures/entity/witch.png;wither=assets/minecraft/textures/entity/wither/wither.png;wither_skeleton=assets/minecraft/textures/entity/skeleton/wither_skeleton.png;wither_skull=assets/minecraft/t",
+    "extures/entity/wither/wither.png;wolf=assets/minecraft/textures/entity/wolf/wolf.png;zoglin=assets/minecraft/textures/entity/hoglin/zoglin.png;zombie=assets/minecraft/textures/entity/zombie/zombie.png;zombie_horse=assets/minecraft/textures/entity/horse/horse_zombie.png;zombie_villager=assets/minecraft/textures/entity/zombie_villager/zombie_villager.png;zombified_piglin=assets/minecraft/textures/entity/piglin/zombifie",
+    "d_piglin.png;player=assets/minecraft/textures/entity/player/wide/steve.png;fishing_bobber=assets/minecraft/textures/entity/fishing_hook.png;",
+);
+
 /// Representative source texture for a protocol-767 entity. Dynamic held
 /// items, display entities and lightning have no fixed atlas source.
 pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
@@ -1456,136 +1477,9 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
     let name = classify_entity_rig(entity_type_id)?
         .name
         .strip_prefix("minecraft:")?;
-    Some(match name {
-        "allay" => "assets/minecraft/textures/entity/allay/allay.png",
-        "area_effect_cloud"
-        | "interaction"
-        | "marker"
-        | "block_display"
-        | "item_display"
-        | "text_display"
-        | "item"
-        | "ominous_item_spawner"
-        | "lightning_bolt" => return None,
-        "armadillo" => "assets/minecraft/textures/entity/armadillo.png",
-        "armor_stand" => "assets/minecraft/textures/entity/armorstand/wood.png",
-        "arrow" => "assets/minecraft/textures/entity/projectiles/arrow.png",
-        "spectral_arrow" => "assets/minecraft/textures/entity/projectiles/spectral_arrow.png",
-        "axolotl" => "assets/minecraft/textures/entity/axolotl/axolotl_lucy.png",
-        "bat" => "assets/minecraft/textures/entity/bat.png",
-        "bee" => "assets/minecraft/textures/entity/bee/bee.png",
-        "blaze" => "assets/minecraft/textures/entity/blaze.png",
-        "boat" => "assets/minecraft/textures/entity/boat/oak.png",
-        "chest_boat" => "assets/minecraft/textures/entity/chest_boat/oak.png",
-        "bogged" => "assets/minecraft/textures/entity/skeleton/bogged.png",
-        "breeze" => "assets/minecraft/textures/entity/breeze/breeze.png",
-        "breeze_wind_charge" | "wind_charge" => {
-            "assets/minecraft/textures/entity/projectiles/wind_charge.png"
-        }
-        "camel" => "assets/minecraft/textures/entity/camel/camel.png",
-        "cat" => "assets/minecraft/textures/entity/cat/tabby.png",
-        "ocelot" => "assets/minecraft/textures/entity/cat/ocelot.png",
-        "cave_spider" => "assets/minecraft/textures/entity/spider/cave_spider.png",
-        "chest_minecart"
-        | "command_block_minecart"
-        | "furnace_minecart"
-        | "hopper_minecart"
-        | "minecart"
-        | "spawner_minecart"
-        | "tnt_minecart" => "assets/minecraft/textures/entity/minecart.png",
-        "chicken" => "assets/minecraft/textures/entity/chicken.png",
-        "cod" => "assets/minecraft/textures/entity/fish/cod.png",
-        "cow" => "assets/minecraft/textures/entity/cow/cow.png",
-        "creeper" => "assets/minecraft/textures/entity/creeper/creeper.png",
-        "falling_block" => return None,
-        "tnt" => "assets/minecraft/textures/block/tnt_side.png",
-        "dolphin" => "assets/minecraft/textures/entity/dolphin.png",
-        "donkey" => "assets/minecraft/textures/entity/horse/donkey.png",
-        "mule" => "assets/minecraft/textures/entity/horse/mule.png",
-        "dragon_fireball" => "assets/minecraft/textures/entity/enderdragon/dragon_fireball.png",
-        "fireball" | "small_fireball" => "assets/minecraft/textures/item/fire_charge.png",
-        "zombie" | "giant" => "assets/minecraft/textures/entity/zombie/zombie.png",
-        "drowned" => "assets/minecraft/textures/entity/zombie/drowned.png",
-        "husk" => "assets/minecraft/textures/entity/zombie/husk.png",
-        "zombie_villager" => "assets/minecraft/textures/entity/zombie_villager/zombie_villager.png",
-        "egg" => "assets/minecraft/textures/item/egg.png",
-        "elder_guardian" => "assets/minecraft/textures/entity/guardian_elder.png",
-        "end_crystal" => "assets/minecraft/textures/entity/end_crystal/end_crystal.png",
-        "ender_dragon" => "assets/minecraft/textures/entity/enderdragon/dragon.png",
-        "ender_pearl" => "assets/minecraft/textures/item/ender_pearl.png",
-        "enderman" => "assets/minecraft/textures/entity/enderman/enderman.png",
-        "endermite" => "assets/minecraft/textures/entity/endermite.png",
-        "evoker" => "assets/minecraft/textures/entity/illager/evoker.png",
-        "illusioner" => "assets/minecraft/textures/entity/illager/illusioner.png",
-        "pillager" => "assets/minecraft/textures/entity/illager/pillager.png",
-        "vindicator" => "assets/minecraft/textures/entity/illager/vindicator.png",
-        "evoker_fangs" => "assets/minecraft/textures/entity/illager/evoker_fangs.png",
-        "experience_bottle" => "assets/minecraft/textures/item/experience_bottle.png",
-        "experience_orb" => "assets/minecraft/textures/entity/experience_orb.png",
-        "eye_of_ender" => "assets/minecraft/textures/item/ender_eye.png",
-        "firework_rocket" => "assets/minecraft/textures/item/firework_rocket.png",
-        "fox" => "assets/minecraft/textures/entity/fox/fox.png",
-        "frog" => "assets/minecraft/textures/entity/frog/temperate_frog.png",
-        "ghast" => "assets/minecraft/textures/entity/ghast/ghast.png",
-        "item_frame" => "assets/minecraft/textures/block/item_frame.png",
-        "glow_item_frame" => "assets/minecraft/textures/block/glow_item_frame.png",
-        "glow_squid" => "assets/minecraft/textures/entity/squid/glow_squid.png",
-        "goat" => "assets/minecraft/textures/entity/goat/goat.png",
-        "guardian" => "assets/minecraft/textures/entity/guardian.png",
-        "hoglin" => "assets/minecraft/textures/entity/hoglin/hoglin.png",
-        "horse" => "assets/minecraft/textures/entity/horse/horse_chestnut.png",
-        "iron_golem" => "assets/minecraft/textures/entity/iron_golem/iron_golem.png",
-        "leash_knot" => "assets/minecraft/textures/entity/lead_knot.png",
-        "llama" | "trader_llama" => "assets/minecraft/textures/entity/llama/creamy.png",
-        "llama_spit" => "assets/minecraft/textures/entity/llama/spit.png",
-        "magma_cube" => "assets/minecraft/textures/entity/slime/magmacube.png",
-        "mooshroom" => "assets/minecraft/textures/entity/cow/red_mooshroom.png",
-        "painting" => "assets/minecraft/textures/painting/kebab.png",
-        "panda" => "assets/minecraft/textures/entity/panda/panda.png",
-        "parrot" => "assets/minecraft/textures/entity/parrot/parrot_red_blue.png",
-        "phantom" => "assets/minecraft/textures/entity/phantom.png",
-        "pig" => "assets/minecraft/textures/entity/pig/pig.png",
-        "piglin" => "assets/minecraft/textures/entity/piglin/piglin.png",
-        "piglin_brute" => "assets/minecraft/textures/entity/piglin/piglin_brute.png",
-        "zombified_piglin" => "assets/minecraft/textures/entity/piglin/zombified_piglin.png",
-        "polar_bear" => "assets/minecraft/textures/entity/bear/polarbear.png",
-        "potion" => "assets/minecraft/textures/item/splash_potion.png",
-        "pufferfish" => "assets/minecraft/textures/entity/fish/pufferfish.png",
-        "rabbit" => "assets/minecraft/textures/entity/rabbit/black.png",
-        "ravager" => "assets/minecraft/textures/entity/illager/ravager.png",
-        "salmon" => "assets/minecraft/textures/entity/fish/salmon.png",
-        "sheep" => "assets/minecraft/textures/entity/sheep/sheep.png",
-        "shulker" => "assets/minecraft/textures/entity/shulker/shulker.png",
-        "shulker_bullet" => "assets/minecraft/textures/entity/shulker/spark.png",
-        "silverfish" => "assets/minecraft/textures/entity/silverfish.png",
-        "skeleton" => "assets/minecraft/textures/entity/skeleton/skeleton.png",
-        "skeleton_horse" => "assets/minecraft/textures/entity/horse/horse_skeleton.png",
-        "slime" => "assets/minecraft/textures/entity/slime/slime.png",
-        "sniffer" => "assets/minecraft/textures/entity/sniffer/sniffer.png",
-        "snow_golem" => "assets/minecraft/textures/entity/snow_golem.png",
-        "snowball" => "assets/minecraft/textures/item/snowball.png",
-        "trident" => "assets/minecraft/textures/entity/trident.png",
-        "tropical_fish" => "assets/minecraft/textures/entity/fish/tropical_a.png",
-        "turtle" => "assets/minecraft/textures/entity/turtle/big_sea_turtle.png",
-        "vex" => "assets/minecraft/textures/entity/illager/vex.png",
-        "villager" => "assets/minecraft/textures/entity/villager/villager.png",
-        "wandering_trader" => "assets/minecraft/textures/entity/wandering_trader.png",
-        "witch" => "assets/minecraft/textures/entity/witch.png",
-        "spider" => "assets/minecraft/textures/entity/spider/spider.png",
-        "squid" => "assets/minecraft/textures/entity/squid/squid.png",
-        "stray" => "assets/minecraft/textures/entity/skeleton/stray.png",
-        "strider" => "assets/minecraft/textures/entity/strider/strider.png",
-        "tadpole" => "assets/minecraft/textures/entity/tadpole/tadpole.png",
-        "wither" => "assets/minecraft/textures/entity/wither/wither.png",
-        "warden" => "assets/minecraft/textures/entity/warden/warden.png",
-        "wither_skeleton" => "assets/minecraft/textures/entity/skeleton/wither_skeleton.png",
-        "wither_skull" => "assets/minecraft/textures/entity/wither/wither.png",
-        "wolf" => "assets/minecraft/textures/entity/wolf/wolf.png",
-        "zoglin" => "assets/minecraft/textures/entity/hoglin/zoglin.png",
-        "zombie_horse" => "assets/minecraft/textures/entity/horse/horse_zombie.png",
-        "player" => "assets/minecraft/textures/entity/player/wide/steve.png",
-        "fishing_bobber" => "assets/minecraft/textures/entity/fishing_hook.png",
-        _ => return None,
+    ENTITY_TEXTURE_PATHS.split(';').find_map(|entry| {
+        let (entity, path) = entry.split_once('=')?;
+        (entity == name).then_some(path)
     })
 }
 
@@ -2416,6 +2310,38 @@ mod tests {
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 112, 90, 112, 225,
         63, 0, 5, 140, 2, 178, 39, 213, 187, 120, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
+
+    #[test]
+    fn entity_texture_paths_match_protocol_767_golden_table() {
+        const EXPECTED: &str = concat!(
+            "assets/minecraft/textures/entity/allay/allay.png;;assets/minecraft/textures/entity/armadillo.png;assets/minecraft/textures/entity/armorstand/wood.png;assets/minecraft/textures/entity/projectiles/arrow.png;assets/minecraft/textures/entity/axolotl/axolotl_lucy.png;assets/minecraft/textures/entity/bat.png;assets/minecraft/textures/entity/bee/bee.png;assets/minecraft/textures/entity/blaze.png;;assets/minecraft/textures/e",
+            "ntity/boat/oak.png;assets/minecraft/textures/entity/skeleton/bogged.png;assets/minecraft/textures/entity/breeze/breeze.png;assets/minecraft/textures/entity/projectiles/wind_charge.png;assets/minecraft/textures/entity/camel/camel.png;assets/minecraft/textures/entity/cat/tabby.png;assets/minecraft/textures/entity/spider/cave_spider.png;assets/minecraft/textures/entity/chest_boat/oak.png;assets/minecraft/textures/entity",
+            "/minecart.png;assets/minecraft/textures/entity/chicken.png;assets/minecraft/textures/entity/fish/cod.png;assets/minecraft/textures/entity/minecart.png;assets/minecraft/textures/entity/cow/cow.png;assets/minecraft/textures/entity/creeper/creeper.png;assets/minecraft/textures/entity/dolphin.png;assets/minecraft/textures/entity/horse/donkey.png;assets/minecraft/textures/entity/enderdragon/dragon_fireball.png;assets/mine",
+            "craft/textures/entity/zombie/drowned.png;assets/minecraft/textures/item/egg.png;assets/minecraft/textures/entity/guardian_elder.png;assets/minecraft/textures/entity/end_crystal/end_crystal.png;assets/minecraft/textures/entity/enderdragon/dragon.png;assets/minecraft/textures/item/ender_pearl.png;assets/minecraft/textures/entity/enderman/enderman.png;assets/minecraft/textures/entity/endermite.png;assets/minecraft/textu",
+            "res/entity/illager/evoker.png;assets/minecraft/textures/entity/illager/evoker_fangs.png;assets/minecraft/textures/item/experience_bottle.png;assets/minecraft/textures/entity/experience_orb.png;assets/minecraft/textures/item/ender_eye.png;;assets/minecraft/textures/item/firework_rocket.png;assets/minecraft/textures/entity/fox/fox.png;assets/minecraft/textures/entity/frog/temperate_frog.png;assets/minecraft/textures/en",
+            "tity/minecart.png;assets/minecraft/textures/entity/ghast/ghast.png;assets/minecraft/textures/entity/zombie/zombie.png;assets/minecraft/textures/block/glow_item_frame.png;assets/minecraft/textures/entity/squid/glow_squid.png;assets/minecraft/textures/entity/goat/goat.png;assets/minecraft/textures/entity/guardian.png;assets/minecraft/textures/entity/hoglin/hoglin.png;assets/minecraft/textures/entity/minecart.png;assets",
+            "/minecraft/textures/entity/horse/horse_chestnut.png;assets/minecraft/textures/entity/zombie/husk.png;assets/minecraft/textures/entity/illager/illusioner.png;;assets/minecraft/textures/entity/iron_golem/iron_golem.png;;;assets/minecraft/textures/block/item_frame.png;;assets/minecraft/textures/item/fire_charge.png;assets/minecraft/textures/entity/lead_knot.png;;assets/minecraft/textures/entity/llama/creamy.png;assets/m",
+            "inecraft/textures/entity/llama/spit.png;assets/minecraft/textures/entity/slime/magmacube.png;;assets/minecraft/textures/entity/minecart.png;assets/minecraft/textures/entity/cow/red_mooshroom.png;assets/minecraft/textures/entity/horse/mule.png;assets/minecraft/textures/entity/cat/ocelot.png;assets/minecraft/textures/painting/kebab.png;assets/minecraft/textures/entity/panda/panda.png;assets/minecraft/textures/entity/pa",
+            "rrot/parrot_red_blue.png;assets/minecraft/textures/entity/phantom.png;assets/minecraft/textures/entity/pig/pig.png;assets/minecraft/textures/entity/piglin/piglin.png;assets/minecraft/textures/entity/piglin/piglin_brute.png;assets/minecraft/textures/entity/illager/pillager.png;assets/minecraft/textures/entity/bear/polarbear.png;assets/minecraft/textures/item/splash_potion.png;assets/minecraft/textures/entity/fish/puff",
+            "erfish.png;assets/minecraft/textures/entity/rabbit/black.png;assets/minecraft/textures/entity/illager/ravager.png;assets/minecraft/textures/entity/fish/salmon.png;assets/minecraft/textures/entity/sheep/sheep.png;assets/minecraft/textures/entity/shulker/shulker.png;assets/minecraft/textures/entity/shulker/spark.png;assets/minecraft/textures/entity/silverfish.png;assets/minecraft/textures/entity/skeleton/skeleton.png;a",
+            "ssets/minecraft/textures/entity/horse/horse_skeleton.png;assets/minecraft/textures/entity/slime/slime.png;assets/minecraft/textures/item/fire_charge.png;assets/minecraft/textures/entity/sniffer/sniffer.png;assets/minecraft/textures/entity/snow_golem.png;assets/minecraft/textures/item/snowball.png;assets/minecraft/textures/entity/minecart.png;assets/minecraft/textures/entity/projectiles/spectral_arrow.png;assets/minec",
+            "raft/textures/entity/spider/spider.png;assets/minecraft/textures/entity/squid/squid.png;assets/minecraft/textures/entity/skeleton/stray.png;assets/minecraft/textures/entity/strider/strider.png;assets/minecraft/textures/entity/tadpole/tadpole.png;;assets/minecraft/textures/block/tnt_side.png;assets/minecraft/textures/entity/minecart.png;assets/minecraft/textures/entity/llama/creamy.png;assets/minecraft/textures/entity",
+            "/trident.png;assets/minecraft/textures/entity/fish/tropical_a.png;assets/minecraft/textures/entity/turtle/big_sea_turtle.png;assets/minecraft/textures/entity/illager/vex.png;assets/minecraft/textures/entity/villager/villager.png;assets/minecraft/textures/entity/illager/vindicator.png;assets/minecraft/textures/entity/wandering_trader.png;assets/minecraft/textures/entity/warden/warden.png;assets/minecraft/textures/enti",
+            "ty/projectiles/wind_charge.png;assets/minecraft/textures/entity/witch.png;assets/minecraft/textures/entity/wither/wither.png;assets/minecraft/textures/entity/skeleton/wither_skeleton.png;assets/minecraft/textures/entity/wither/wither.png;assets/minecraft/textures/entity/wolf/wolf.png;assets/minecraft/textures/entity/hoglin/zoglin.png;assets/minecraft/textures/entity/zombie/zombie.png;assets/minecraft/textures/entity/",
+            "horse/horse_zombie.png;assets/minecraft/textures/entity/zombie_villager/zombie_villager.png;assets/minecraft/textures/entity/piglin/zombified_piglin.png;assets/minecraft/textures/entity/player/wide/steve.png;assets/minecraft/textures/entity/fishing_hook.png;",
+        );
+        let expected: Vec<_> = EXPECTED.split(';').collect();
+        assert_eq!(expected.len(), 131);
+        for (id, path) in expected[..130].iter().enumerate() {
+            assert_eq!(
+                entity_texture_path_for_id(id as u16),
+                (!path.is_empty()).then_some(*path),
+                "entity type id {id}",
+            );
+        }
+        assert_eq!(entity_texture_path_for_id(130), None);
+        assert_eq!(entity_texture_path_for_id(u16::MAX), None);
+    }
 
     fn create_jar(model: &[u8]) -> Vec<u8> {
         stored_zip(&[
