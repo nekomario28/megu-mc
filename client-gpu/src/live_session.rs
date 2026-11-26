@@ -8958,27 +8958,139 @@ impl LiveSession {
             self.request_respawn();
         }
         match event {
+            event @ (PlayEvent::JoinGame { .. }
+            | PlayEvent::Respawn { .. }
+            | PlayEvent::Teleport(..)
+            | PlayEvent::ChunkData(..)
+            | PlayEvent::BlockUpdate { .. }
+            | PlayEvent::SectionBlocksUpdate(..)
+            | PlayEvent::UpdateLight { .. }
+            | PlayEvent::UnloadChunk { .. }
+            | PlayEvent::GameEvent { .. }
+            | PlayEvent::BlockChangedAck(..)
+            | PlayEvent::SetCenterChunk { .. }) => self.apply_play_world_state_event(event),
+            event @ (PlayEvent::AddEntity { .. }
+            | PlayEvent::RemoveEntities { .. }
+            | PlayEvent::MoveEntityPos { .. }
+            | PlayEvent::MoveEntityPosRot { .. }
+            | PlayEvent::MoveEntityRot { .. }
+            | PlayEvent::TeleportEntity { .. }
+            | PlayEvent::SetEquipment { .. }
+            | PlayEvent::SetEntityData { .. }
+            | PlayEvent::UpdateMobEffect { .. }
+            | PlayEvent::RemoveMobEffect { .. }
+            | PlayEvent::HurtAnimation { .. }
+            | PlayEvent::SetPassengers { .. }
+            | PlayEvent::MoveVehicle { .. }
+            | PlayEvent::TakeItemEntity { .. }) => self.apply_play_entity_state_event(event),
+            event @ (PlayEvent::OpenScreen { .. }
+            | PlayEvent::ContainerClose { .. }
+            | PlayEvent::OpenSignEditor { .. }
+            | PlayEvent::OpenBook { .. }
+            | PlayEvent::ContainerSetContent { .. }
+            | PlayEvent::ContainerSetSlot { .. }
+            | PlayEvent::ContainerSetData { .. }
+            | PlayEvent::SetCarriedItem(..)) => self.apply_play_inventory_screen_event(event),
+            event @ (PlayEvent::SetHealth { .. }
+            | PlayEvent::SetExperience { .. }
+            | PlayEvent::SystemChat { .. }
+            | PlayEvent::SetActionBarText { .. }
+            | PlayEvent::PlayerChat { .. }
+            | PlayEvent::DisguisedChat { .. }
+            | PlayEvent::CommandSuggestions { .. }
+            | PlayEvent::ChatCompletions { .. }
+            | PlayEvent::Cooldown { .. }
+            | PlayEvent::DeleteChat { .. }
+            | PlayEvent::ResetChat) => self.apply_play_vitals_chat_event(event),
+            event @ (PlayEvent::UpdateAdvancements { .. }
+            | PlayEvent::SelectAdvancementsTab { .. }) => self.apply_play_progression_event(event),
+            event @ (PlayEvent::SetTitle { .. }
+            | PlayEvent::SetTitleText { .. }
+            | PlayEvent::SetSubtitleText { .. }
+            | PlayEvent::ClearTitles
+            | PlayEvent::BossEvent { .. }
+            | PlayEvent::PlayerInfo { .. }
+            | PlayEvent::PlayerInfoRemove { .. }
+            | PlayEvent::SetObjective { .. }
+            | PlayEvent::SetScore { .. }
+            | PlayEvent::SetDisplayObjective { .. }
+            | PlayEvent::ResetScore { .. }) => self.apply_play_overlay_scoreboard_event(event),
+            event @ (PlayEvent::BlockDestruction { .. }
+            | PlayEvent::Explosion { .. }
+            | PlayEvent::LevelEvent { .. }
+            | PlayEvent::BlockEvent { .. }
+            | PlayEvent::LevelParticles { .. }) => self.apply_play_combat_effect_event(event),
+            event @ (PlayEvent::PlayerCombatKill { .. }
+            | PlayEvent::Transfer { .. }
+            | PlayEvent::Ping(..)
+            | PlayEvent::PlayerAbilities { .. }
+            | PlayEvent::ResourcePackPush { .. }
+            | PlayEvent::ResourcePackPop { .. }
+            | PlayEvent::Disconnect(..)) => self.apply_play_session_service_event(event),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn sync_game_mode_from_world(&mut self) {
+        if let Some(mode) = self.world.game_mode {
+            self.game_mode = i32::from(mode);
+            self.hud.game_mode = i32::from(mode);
+            self.hud_revision = self.hud_revision.wrapping_add(1);
+        }
+    }
+
+    fn bump_hud_revision(&mut self) {
+        self.hud_revision += 1;
+    }
+
+    fn send_resource_pack_response(&mut self, uuid: [u8; 16], status: i32) {
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::ResourcePackResponse { uuid, status });
+    }
+
+    fn bump_title_revisions(&mut self) {
+        self.title_revision += 1;
+        self.bump_hud_revision();
+    }
+
+    fn decode_container_slot_payload(
+        raw_payload: &[u8],
+        slot_count: i32,
+        mut insert_slot: impl FnMut(i32, ItemStackComponents),
+    ) -> Option<ItemStackComponents> {
+        let mut offset = 0usize;
+        for index in 0..slot_count {
+            let tail = &raw_payload[offset.min(raw_payload.len())..];
+            match decode_item_stack_components(tail) {
+                Ok((stack, consumed)) => {
+                    offset += consumed;
+                    insert_slot(index, stack);
+                }
+                Err(_) => break,
+            }
+        }
+        // The carried item follows the slot array.
+        if offset < raw_payload.len() {
+            decode_item_stack_components(&raw_payload[offset..])
+                .ok()
+                .map(|(carried, _)| carried)
+        } else {
+            None
+        }
+    }
+
+    fn apply_play_world_state_event(&mut self, event: PlayEvent) {
+        match event {
             PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
                 self.reset_dimension();
-                if let Some(mode) = self.world.game_mode {
-                    self.game_mode = i32::from(mode);
-                    self.hud.game_mode = i32::from(mode);
-                    self.hud_revision = self.hud_revision.wrapping_add(1);
-                }
-            }
-            PlayEvent::PlayerCombatKill { .. } => {
-                // `death.apply` above already folded the kill into the
-                // death loop (dead + cause + victim id); the UI sync
-                // turns it into `Screen::Death`.
+                self.sync_game_mode_from_world();
             }
             PlayEvent::Respawn { .. } => {
                 self.reset_dimension();
-                if let Some(mode) = self.world.game_mode {
-                    self.game_mode = i32::from(mode);
-                    self.hud.game_mode = i32::from(mode);
-                    self.hud_revision = self.hud_revision.wrapping_add(1);
-                }
+                self.sync_game_mode_from_world();
             }
             PlayEvent::Teleport(teleport) => {
                 let previous = self.pose;
@@ -9062,6 +9174,17 @@ impl LiveSession {
                 self.mark_chunk_column_dirty(cx, cz);
                 self.terrain_dirty = true;
             }
+            PlayEvent::GameEvent { event, value } => {
+                self.apply_game_event(event, value);
+            }
+            PlayEvent::BlockChangedAck(sequence) => self.apply_block_changed_ack(sequence),
+            PlayEvent::SetCenterChunk { cx, cz } => self.apply_set_center_chunk(cx, cz),
+            _ => {}
+        }
+    }
+
+    fn apply_play_entity_state_event(&mut self, event: PlayEvent) {
+        match event {
             PlayEvent::AddEntity {
                 eid,
                 entity_type,
@@ -9111,281 +9234,6 @@ impl LiveSession {
                     }
                 }
             }
-            PlayEvent::OpenScreen {
-                window_id,
-                menu_type,
-                title_nbt,
-            } => {
-                let title_text = nbt_text(&title_nbt);
-                self.open_screen = Some(LiveOpenScreen {
-                    window_id,
-                    menu_type,
-                    title_nbt,
-                    title_text,
-                    state_id: 0,
-                    slots: BTreeMap::new(),
-                    carried: None,
-                    // `container_set_data` may arrive before `open_screen`
-                    // (late opens): the session-level map preserves them
-                    // and this window picks up whatever was recorded.
-                    properties: self
-                        .container_properties
-                        .iter()
-                        .filter(|((id, _), _)| *id == window_id)
-                        .map(|((_, property), value)| (*property, *value))
-                        .collect(),
-                });
-            }
-            PlayEvent::ContainerClose { window_id } => {
-                if self
-                    .open_screen
-                    .as_ref()
-                    .is_some_and(|screen| screen.window_id == i32::from(window_id))
-                {
-                    self.open_screen = None;
-                }
-            }
-            PlayEvent::OpenSignEditor { pos, front_side } => {
-                self.pending_sign_editor = Some(((pos[0], pos[1], pos[2]), front_side));
-            }
-            PlayEvent::OpenBook { hand } => {
-                const PENDING_OPEN_BOOK_CAP: usize = 4;
-                if self.pending_open_book_hands.len() >= PENDING_OPEN_BOOK_CAP {
-                    self.pending_open_book_hands.pop_front();
-                }
-                self.pending_open_book_hands.push_back(hand);
-            }
-            PlayEvent::ContainerSetContent {
-                window_id,
-                state_id,
-                slot_count,
-                raw_payload,
-            } => {
-                if window_id == 0 {
-                    // The player's own inventory: servers sync window 0
-                    // without an `open_screen`, so the `E`-key screen has a
-                    // live slot source of its own.
-                    self.player_inventory_state_id = state_id;
-                    self.hud_revision += 1;
-                    let mut offset = 0usize;
-                    for index in 0..slot_count {
-                        let tail = &raw_payload[offset.min(raw_payload.len())..];
-                        match decode_item_stack_components(tail) {
-                            Ok((stack, consumed)) => {
-                                offset += consumed;
-                                self.player_inventory.insert(index, stack);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    if offset < raw_payload.len() {
-                        if let Ok((carried, _)) =
-                            decode_item_stack_components(&raw_payload[offset..])
-                        {
-                            self.player_carried = Some(carried);
-                        }
-                    }
-                    self.sync_hud_inventory();
-                } else if let Some(screen) = &mut self.open_screen {
-                    if screen.window_id == i32::from(window_id) {
-                        screen.state_id = state_id;
-                        let mut offset = 0usize;
-                        for index in 0..slot_count {
-                            let tail = &raw_payload[offset.min(raw_payload.len())..];
-                            match decode_item_stack_components(tail) {
-                                Ok((stack, consumed)) => {
-                                    offset += consumed;
-                                    screen.slots.insert(index, stack);
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        // The carried item follows the slot array.
-                        if offset < raw_payload.len() {
-                            if let Ok((carried, _)) =
-                                decode_item_stack_components(&raw_payload[offset..])
-                            {
-                                screen.carried = Some(carried);
-                            }
-                        }
-                    }
-                }
-            }
-            PlayEvent::ContainerSetSlot {
-                window_id,
-                state_id,
-                slot,
-                raw_item,
-            } => {
-                if window_id == 0 {
-                    self.player_inventory_state_id = state_id;
-                    self.hud_revision += 1;
-                    match decode_item_stack_components(&raw_item) {
-                        Ok((stack, _)) => {
-                            if slot < 0 {
-                                self.player_carried = Some(stack);
-                            } else {
-                                self.player_inventory.insert(i32::from(slot), stack);
-                            }
-                        }
-                        Err(_) => {
-                            self.player_inventory.remove(&i32::from(slot));
-                        }
-                    }
-                    self.sync_hud_inventory();
-                } else if let Some(screen) = &mut self.open_screen {
-                    if screen.window_id == i32::from(window_id) {
-                        screen.state_id = state_id;
-                        match decode_item_stack_components(&raw_item) {
-                            Ok((stack, _)) => {
-                                if slot < 0 {
-                                    screen.carried = Some(stack);
-                                } else {
-                                    screen.slots.insert(i32::from(slot), stack);
-                                }
-                            }
-                            Err(_) => {
-                                screen.slots.remove(&i32::from(slot));
-                            }
-                        }
-                    }
-                }
-            }
-            PlayEvent::UpdateAdvancements {
-                reset,
-                advancements,
-                removed,
-                progress,
-            } => {
-                if reset {
-                    self.advancements.clear();
-                    self.advancement_progress.clear();
-                }
-                for key in &removed {
-                    self.advancements.remove(key);
-                    self.advancement_progress.remove(key);
-                }
-                for wire in &advancements {
-                    let (title, description, frame_type, hidden, x, y) = match &wire.display {
-                        Some(display) => (
-                            nbt_text(&display.title_nbt).unwrap_or_default(),
-                            nbt_text(&display.description_nbt).unwrap_or_default(),
-                            display.frame_type,
-                            display.flags & 0x04 != 0,
-                            display.x,
-                            display.y,
-                        ),
-                        None => (String::new(), String::new(), 0, false, 0.0, 0.0),
-                    };
-                    self.advancements.insert(
-                        wire.key.clone(),
-                        LiveAdvancement {
-                            key: wire.key.clone(),
-                            parent_id: wire.parent_id.clone(),
-                            title,
-                            description,
-                            frame_type,
-                            hidden,
-                            x,
-                            y,
-                            criteria_total: wire
-                                .requirements
-                                .iter()
-                                .map(|group| group.len().max(1))
-                                .sum(),
-                        },
-                    );
-                }
-                for wire in &progress {
-                    let entry = self
-                        .advancement_progress
-                        .entry(wire.key.clone())
-                        .or_default();
-                    let mut done = 0usize;
-                    for (criterion, achieved) in &wire.criteria {
-                        let got = achieved.is_some();
-                        if got {
-                            done += 1;
-                        }
-                        entry.criteria.push((criterion.clone(), got));
-                    }
-                    entry.done = done;
-                }
-            }
-            PlayEvent::SelectAdvancementsTab { tab } => {
-                self.advancements_tab = tab;
-            }
-            PlayEvent::SetHealth { health, food, .. } => {
-                if health < self.hud.health {
-                    self.hurt_flash_alpha = 1.0;
-                }
-                self.hud.health = health;
-                self.hud.hunger = food.clamp(0, 20) as u8;
-                self.hud_revision += 1;
-            }
-            PlayEvent::SetExperience { bar, level, .. } => {
-                // `total` already fed the death screen's Score line via
-                // `death.apply`; the HUD wants bar progress + level.
-                self.hud.xp_progress = bar.clamp(0.0, 1.0);
-                self.hud.xp_level = level.max(0) as u32;
-                self.hud_revision += 1;
-            }
-            PlayEvent::SystemChat { text, overlay } => {
-                if overlay {
-                    self.hud.actionbar = text.clone();
-                    self.hud_revision += 1;
-                } else {
-                    self.push_chat_line(text.clone());
-                }
-                self.chat_message = Some(text);
-            }
-            PlayEvent::SetActionBarText { nbt_bytes } => {
-                self.hud.actionbar = nbt_text(&nbt_bytes).unwrap_or_default();
-                self.actionbar_nbt = Some(nbt_bytes);
-                self.hud_revision += 1;
-            }
-            PlayEvent::PlayerChat {
-                sender,
-                index,
-                signature,
-                text,
-                ..
-            } => {
-                // Vanilla renders `<sender> message` for the default
-                // chat type; the display name wins when the tab list
-                // has one for this sender UUID.
-                let name = self
-                    .player_info
-                    .get(&sender)
-                    .and_then(|entry| {
-                        entry
-                            .display_name_nbt
-                            .as_deref()
-                            .and_then(nbt_text)
-                            .or_else(|| entry.name.clone())
-                    })
-                    .unwrap_or_else(|| uuid_label(&sender));
-                self.push_chat_line_keyed(
-                    format!("<{name}> {text}"),
-                    Some(ChatMessageKey { index, signature }),
-                );
-                self.chat_message = Some(text);
-            }
-            PlayEvent::DisguisedChat { text, .. } => {
-                // The sender is already baked into the undecorated text
-                // (team/system chat type) — show it verbatim.
-                self.push_chat_line(text.clone());
-                self.chat_message = Some(text);
-            }
-            PlayEvent::SetCarriedItem(slot) => {
-                // Server-forced held-item correction (`set_carried_item`
-                // S2C) — mirror it into the hotbar highlight.
-                let slot = i32::from(slot);
-                if (0..9).contains(&slot) {
-                    self.hud.selected_slot = slot as usize;
-                    self.hud_revision += 1;
-                }
-            }
             PlayEvent::SetEntityData { eid, raw_entries } => {
                 let meta = self.entity_metadata.entry(eid).or_default();
                 for (index, _ty, value) in parse_entity_metadata(&raw_entries) {
@@ -9429,7 +9277,7 @@ impl LiveSession {
                         self.hud.absorption = absorption.max(0.0);
                     }
                 }
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::UpdateMobEffect {
                 eid,
@@ -9499,10 +9347,10 @@ impl LiveSession {
                     || !yaw.is_finite()
                     || !pitch.is_finite()
                 {
-                    return Ok(());
+                    return;
                 }
                 let Some(vehicle) = self.riding_vehicle else {
-                    return Ok(());
+                    return;
                 };
                 self.entity_positions.insert(vehicle, [x, y, z]);
                 if let Some(entity) = self.world.entities.get_mut(&vehicle) {
@@ -9516,41 +9364,363 @@ impl LiveSession {
                     self.physics_state.pos = [x, y, z];
                 }
             }
-            PlayEvent::BlockDestruction {
-                breaker_eid,
-                pos,
-                stage,
+            PlayEvent::TakeItemEntity {
+                item_entity,
+                player,
+                ..
             } => {
-                if (0..=9).contains(&stage)
-                    && (self.remote_block_destruction.len() < 128
-                        || self.remote_block_destruction.contains_key(&breaker_eid))
+                // Vanilla plays `entity.item.pickup` on the PLAYERS
+                // source at the collecting player — the item position
+                // is the closest tracked anchor this client keeps.
+                let pos = self
+                    .entity_positions
+                    .get(&item_entity)
+                    .or_else(|| self.entity_positions.get(&player))
+                    .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                    .unwrap_or([0.0; 3]);
+                self.emit_effect_sound("minecraft:entity.item.pickup", 7, 0.2, 1.0, pos);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_play_inventory_screen_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::OpenScreen {
+                window_id,
+                menu_type,
+                title_nbt,
+            } => {
+                let title_text = nbt_text(&title_nbt);
+                self.open_screen = Some(LiveOpenScreen {
+                    window_id,
+                    menu_type,
+                    title_nbt,
+                    title_text,
+                    state_id: 0,
+                    slots: BTreeMap::new(),
+                    carried: None,
+                    // `container_set_data` may arrive before `open_screen`
+                    // (late opens): the session-level map preserves them
+                    // and this window picks up whatever was recorded.
+                    properties: self
+                        .container_properties
+                        .iter()
+                        .filter(|((id, _), _)| *id == window_id)
+                        .map(|((_, property), value)| (*property, *value))
+                        .collect(),
+                });
+            }
+            PlayEvent::ContainerClose { window_id } => {
+                if self
+                    .open_screen
+                    .as_ref()
+                    .is_some_and(|screen| screen.window_id == i32::from(window_id))
                 {
-                    self.remote_block_destruction
-                        .insert(breaker_eid, (pos, stage as u8));
-                } else {
-                    self.remote_block_destruction.remove(&breaker_eid);
+                    self.open_screen = None;
                 }
             }
+            PlayEvent::OpenSignEditor { pos, front_side } => {
+                self.pending_sign_editor = Some(((pos[0], pos[1], pos[2]), front_side));
+            }
+            PlayEvent::OpenBook { hand } => {
+                const PENDING_OPEN_BOOK_CAP: usize = 4;
+                if self.pending_open_book_hands.len() >= PENDING_OPEN_BOOK_CAP {
+                    self.pending_open_book_hands.pop_front();
+                }
+                self.pending_open_book_hands.push_back(hand);
+            }
+            PlayEvent::ContainerSetContent {
+                window_id,
+                state_id,
+                slot_count,
+                raw_payload,
+            } => {
+                if window_id == 0 {
+                    // The player's own inventory: servers sync window 0
+                    // without an `open_screen`, so the `E`-key screen has a
+                    // live slot source of its own.
+                    self.player_inventory_state_id = state_id;
+                    self.bump_hud_revision();
+                    let carried = Self::decode_container_slot_payload(
+                        &raw_payload,
+                        slot_count,
+                        |index, stack| {
+                            self.player_inventory.insert(index, stack);
+                        },
+                    );
+                    if let Some(carried) = carried {
+                        self.player_carried = Some(carried);
+                    }
+                    self.sync_hud_inventory();
+                } else if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        screen.state_id = state_id;
+                        let carried = Self::decode_container_slot_payload(
+                            &raw_payload,
+                            slot_count,
+                            |index, stack| {
+                                screen.slots.insert(index, stack);
+                            },
+                        );
+                        if let Some(carried) = carried {
+                            screen.carried = Some(carried);
+                        }
+                    }
+                }
+            }
+            PlayEvent::ContainerSetSlot {
+                window_id,
+                state_id,
+                slot,
+                raw_item,
+            } => {
+                if window_id == 0 {
+                    self.player_inventory_state_id = state_id;
+                    self.bump_hud_revision();
+                    match decode_item_stack_components(&raw_item) {
+                        Ok((stack, _)) => {
+                            if slot < 0 {
+                                self.player_carried = Some(stack);
+                            } else {
+                                self.player_inventory.insert(i32::from(slot), stack);
+                            }
+                        }
+                        Err(_) => {
+                            self.player_inventory.remove(&i32::from(slot));
+                        }
+                    }
+                    self.sync_hud_inventory();
+                } else if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        screen.state_id = state_id;
+                        match decode_item_stack_components(&raw_item) {
+                            Ok((stack, _)) => {
+                                if slot < 0 {
+                                    screen.carried = Some(stack);
+                                } else {
+                                    screen.slots.insert(i32::from(slot), stack);
+                                }
+                            }
+                            Err(_) => {
+                                screen.slots.remove(&i32::from(slot));
+                            }
+                        }
+                    }
+                }
+            }
+            PlayEvent::ContainerSetData {
+                window_id,
+                property,
+                value,
+            } => {
+                // Vanilla property indices differ per menu (furnace:
+                // 0 burn-left, 1 burn-max, 2 cook progress, 3 cook max;
+                // brewing: 0 brew time; enchant: 0-2 level hints, 3 seed).
+                // Store the raw pairs — the container UI's schema knows
+                // which index maps to which bar.
+                self.container_properties
+                    .insert((i32::from(window_id), property), value);
+                if self.container_properties.len() > 256 {
+                    self.container_properties.clear();
+                }
+                if let Some(screen) = &mut self.open_screen {
+                    if screen.window_id == i32::from(window_id) {
+                        screen.properties.insert(property, value);
+                    }
+                }
+                self.bump_hud_revision();
+            }
+            PlayEvent::SetCarriedItem(slot) => {
+                // Server-forced held-item correction (`set_carried_item`
+                // S2C) — mirror it into the hotbar highlight.
+                let slot = i32::from(slot);
+                if (0..9).contains(&slot) {
+                    self.hud.selected_slot = slot as usize;
+                    self.bump_hud_revision();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_play_vitals_chat_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::SetHealth { health, food, .. } => {
+                if health < self.hud.health {
+                    self.hurt_flash_alpha = 1.0;
+                }
+                self.hud.health = health;
+                self.hud.hunger = food.clamp(0, 20) as u8;
+                self.bump_hud_revision();
+            }
+            PlayEvent::SetExperience { bar, level, .. } => {
+                // `total` already fed the death screen's Score line via
+                // `death.apply`; the HUD wants bar progress + level.
+                self.hud.xp_progress = bar.clamp(0.0, 1.0);
+                self.hud.xp_level = level.max(0) as u32;
+                self.bump_hud_revision();
+            }
+            PlayEvent::SystemChat { text, overlay } => {
+                if overlay {
+                    self.hud.actionbar = text.clone();
+                    self.bump_hud_revision();
+                } else {
+                    self.push_chat_line(text.clone());
+                }
+                self.chat_message = Some(text);
+            }
+            PlayEvent::SetActionBarText { nbt_bytes } => {
+                self.hud.actionbar = nbt_text(&nbt_bytes).unwrap_or_default();
+                self.actionbar_nbt = Some(nbt_bytes);
+                self.bump_hud_revision();
+            }
+            PlayEvent::PlayerChat {
+                sender,
+                index,
+                signature,
+                text,
+                ..
+            } => {
+                // Vanilla renders `<sender> message` for the default
+                // chat type; the display name wins when the tab list
+                // has one for this sender UUID.
+                let name = self
+                    .player_info
+                    .get(&sender)
+                    .and_then(|entry| {
+                        entry
+                            .display_name_nbt
+                            .as_deref()
+                            .and_then(nbt_text)
+                            .or_else(|| entry.name.clone())
+                    })
+                    .unwrap_or_else(|| uuid_label(&sender));
+                self.push_chat_line_keyed(
+                    format!("<{name}> {text}"),
+                    Some(ChatMessageKey { index, signature }),
+                );
+                self.chat_message = Some(text);
+            }
+            PlayEvent::DisguisedChat { text, .. } => {
+                // The sender is already baked into the undecorated text
+                // (team/system chat type) — show it verbatim.
+                self.push_chat_line(text.clone());
+                self.chat_message = Some(text);
+            }
+            PlayEvent::CommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches,
+            } => self.apply_command_suggestions(ServerCommandSuggestions {
+                transaction_id,
+                start,
+                length,
+                matches: matches.iter().map(|m| m.text.clone()).collect(),
+            }),
+            PlayEvent::ChatCompletions { action, entries } => {
+                self.apply_chat_completions(action, &entries)
+            }
+            PlayEvent::Cooldown { item, ticks } => self.apply_cooldown(item, ticks),
+            PlayEvent::DeleteChat {
+                message_index,
+                signature,
+            } => self.apply_delete_chat(message_index, signature),
+            PlayEvent::ResetChat => self.apply_reset_chat(),
+            _ => {}
+        }
+    }
+
+    fn apply_play_progression_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::UpdateAdvancements {
+                reset,
+                advancements,
+                removed,
+                progress,
+            } => {
+                if reset {
+                    self.advancements.clear();
+                    self.advancement_progress.clear();
+                }
+                for key in &removed {
+                    self.advancements.remove(key);
+                    self.advancement_progress.remove(key);
+                }
+                for wire in &advancements {
+                    let (title, description, frame_type, hidden, x, y) = match &wire.display {
+                        Some(display) => (
+                            nbt_text(&display.title_nbt).unwrap_or_default(),
+                            nbt_text(&display.description_nbt).unwrap_or_default(),
+                            display.frame_type,
+                            display.flags & 0x04 != 0,
+                            display.x,
+                            display.y,
+                        ),
+                        None => (String::new(), String::new(), 0, false, 0.0, 0.0),
+                    };
+                    self.advancements.insert(
+                        wire.key.clone(),
+                        LiveAdvancement {
+                            key: wire.key.clone(),
+                            parent_id: wire.parent_id.clone(),
+                            title,
+                            description,
+                            frame_type,
+                            hidden,
+                            x,
+                            y,
+                            criteria_total: wire
+                                .requirements
+                                .iter()
+                                .map(|group| group.len().max(1))
+                                .sum(),
+                        },
+                    );
+                }
+                for wire in &progress {
+                    let entry = self
+                        .advancement_progress
+                        .entry(wire.key.clone())
+                        .or_default();
+                    let mut done = 0usize;
+                    for (criterion, achieved) in &wire.criteria {
+                        let got = achieved.is_some();
+                        if got {
+                            done += 1;
+                        }
+                        entry.criteria.push((criterion.clone(), got));
+                    }
+                    entry.done = done;
+                }
+            }
+            PlayEvent::SelectAdvancementsTab { tab } => {
+                self.advancements_tab = tab;
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_play_overlay_scoreboard_event(&mut self, event: PlayEvent) {
+        match event {
             PlayEvent::SetTitle {
                 fade_in,
                 stay,
                 fade_out,
             } => {
                 self.title_times = Some([fade_in, stay, fade_out]);
-                self.title_revision += 1;
-                self.hud_revision += 1;
+                self.bump_title_revisions();
             }
             PlayEvent::SetTitleText { nbt_bytes } => {
                 self.title_text = nbt_text(&nbt_bytes);
                 self.title_text_nbt = Some(nbt_bytes);
-                self.title_revision += 1;
-                self.hud_revision += 1;
+                self.bump_title_revisions();
             }
             PlayEvent::SetSubtitleText { nbt_bytes } => {
                 self.subtitle_text = nbt_text(&nbt_bytes);
                 self.subtitle_text_nbt = Some(nbt_bytes);
-                self.title_revision += 1;
-                self.hud_revision += 1;
+                self.bump_title_revisions();
             }
             PlayEvent::ClearTitles => {
                 // `clear_titles` hides the live overlay immediately; the
@@ -9560,11 +9730,7 @@ impl LiveSession {
                 self.subtitle_text = None;
                 self.title_text_nbt = None;
                 self.subtitle_text_nbt = None;
-                self.title_revision += 1;
-                self.hud_revision += 1;
-            }
-            PlayEvent::GameEvent { event, value } => {
-                self.apply_game_event(event, value);
+                self.bump_title_revisions();
             }
             PlayEvent::BossEvent {
                 uuid,
@@ -9588,7 +9754,7 @@ impl LiveSession {
                     bar.raw_payload = raw_payload;
                 }
                 self.sync_hud_bossbars();
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::PlayerInfo { actions, entries } => {
                 for update in &entries {
@@ -9625,14 +9791,14 @@ impl LiveSession {
                     }
                 }
                 self.sync_hud_players();
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::PlayerInfoRemove { uuids } => {
                 for uuid in &uuids {
                     self.player_info.remove(uuid);
                 }
                 self.sync_hud_players();
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::SetObjective {
                 objective,
@@ -9660,7 +9826,7 @@ impl LiveSession {
                         ),
                     );
                 }
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::SetScore {
                 owner,
@@ -9669,11 +9835,11 @@ impl LiveSession {
                 ..
             } => {
                 self.scoreboard.scores.insert((objective, owner), value);
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::SetDisplayObjective { slot, objective } => {
                 self.scoreboard.display_slots.insert(slot, objective);
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
             PlayEvent::ResetScore { owner, objective } => {
                 match objective {
@@ -9683,104 +9849,27 @@ impl LiveSession {
                         .retain(|(obj, who), _| obj != &objective || who != &owner),
                     None => self.scoreboard.scores.retain(|(_, who), _| who != &owner),
                 }
-                self.hud_revision += 1;
+                self.bump_hud_revision();
             }
-            PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
-                Ok(target) => self.pending_transfer = Some(target),
-                Err(reason) => {
-                    self.status = SessionStatus::Disconnected(reason);
-                }
-            },
-            PlayEvent::ContainerSetData {
-                window_id,
-                property,
-                value,
+            _ => {}
+        }
+    }
+
+    fn apply_play_combat_effect_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::BlockDestruction {
+                breaker_eid,
+                pos,
+                stage,
             } => {
-                // Vanilla property indices differ per menu (furnace:
-                // 0 burn-left, 1 burn-max, 2 cook progress, 3 cook max;
-                // brewing: 0 brew time; enchant: 0-2 level hints, 3 seed).
-                // Store the raw pairs — the container UI's schema knows
-                // which index maps to which bar.
-                self.container_properties
-                    .insert((i32::from(window_id), property), value);
-                if self.container_properties.len() > 256 {
-                    self.container_properties.clear();
-                }
-                if let Some(screen) = &mut self.open_screen {
-                    if screen.window_id == i32::from(window_id) {
-                        screen.properties.insert(property, value);
-                    }
-                }
-                self.hud_revision += 1;
-            }
-            PlayEvent::Ping(id) => {
-                // The worker answers the `pong` at read time (never gated
-                // on render-thread drain); this records the probe so the
-                // event is observably consumed session-side too.
-                self.last_server_ping = Some(id);
-            }
-            PlayEvent::PlayerAbilities {
-                flags,
-                flying_speed,
-                walking_speed,
-            } => {
-                // The server is authoritative: a flag sync can grant or
-                // revoke `may_fly` (game-mode change) and force-drop
-                // `flying`, so fold the whole byte in and mirror the
-                // flying bit into the local physics prediction.
-                self.player_abilities = LivePlayerAbilities {
-                    flags,
-                    flying_speed,
-                    walking_speed,
-                };
-                self.physics_state.is_creative_flying =
-                    self.player_abilities.may_fly() && self.player_abilities.flying();
-            }
-            PlayEvent::ResourcePackPush {
-                uuid, forced, url, ..
-            } => {
-                // Track the pushed pack, then answer promptly. The client
-                // never downloads arbitrary remote URLs; acknowledging
-                // with ACCEPTED + SUCCESSFULLY_LOADED keeps required-pack
-                // servers from timing the client out, and the `forced`
-                // flag is surfaced through the recorded stack.
-                if self.server_resource_packs.len() >= 32 {
-                    self.server_resource_packs.pop_front();
-                }
-                self.server_resource_packs.push_back(uuid);
-                let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
-                    uuid,
-                    status: megu_client::protocol::RESOURCE_PACK_ACCEPTED,
-                });
-                let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
-                    uuid,
-                    status: megu_client::protocol::RESOURCE_PACK_SUCCESSFULLY_LOADED,
-                });
-                let _ = (forced, url);
-            }
-            PlayEvent::ResourcePackPop { uuid } => {
-                match uuid {
-                    Some(uuid) => {
-                        // A targeted pop removes just that pack; the
-                        // DISCARDED echo tells the server the pack is
-                        // gone client-side.
-                        self.server_resource_packs.retain(|known| *known != uuid);
-                        let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
-                            uuid,
-                            status: megu_client::protocol::RESOURCE_PACK_DISCARDED,
-                        });
-                    }
-                    None => {
-                        // UUID-less pops clear every server pack (vanilla
-                        // applies the same all-or-nothing rule).
-                        let drained: Vec<[u8; 16]> = self.server_resource_packs.drain(..).collect();
-                        for uuid in drained {
-                            let _ = self.outgoing.try_send(WorkerCommand::ResourcePackResponse {
-                                uuid,
-                                status: megu_client::protocol::RESOURCE_PACK_DISCARDED,
-                            });
-                        }
-                    }
+                if (0..=9).contains(&stage)
+                    && (self.remote_block_destruction.len() < 128
+                        || self.remote_block_destruction.contains_key(&breaker_eid))
+                {
+                    self.remote_block_destruction
+                        .insert(breaker_eid, (pos, stage as u8));
+                } else {
+                    self.remote_block_destruction.remove(&breaker_eid);
                 }
             }
             PlayEvent::Explosion {
@@ -9886,48 +9975,96 @@ impl LiveSession {
                 count,
                 ..
             } => self.apply_level_particles(particle_id, count, [x, y, z]),
-            PlayEvent::TakeItemEntity {
-                item_entity,
-                player,
-                ..
+            _ => {}
+        }
+    }
+
+    fn apply_play_session_service_event(&mut self, event: PlayEvent) {
+        match event {
+            PlayEvent::PlayerCombatKill { .. } => {
+                // `death.apply` above already folded the kill into the
+                // death loop (dead + cause + victim id); the UI sync
+                // turns it into `Screen::Death`.
+            }
+            PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
+                Ok(target) => self.pending_transfer = Some(target),
+                Err(reason) => {
+                    self.status = SessionStatus::Disconnected(reason);
+                }
+            },
+            PlayEvent::Ping(id) => {
+                // The worker answers the `pong` at read time (never gated
+                // on render-thread drain); this records the probe so the
+                // event is observably consumed session-side too.
+                self.last_server_ping = Some(id);
+            }
+            PlayEvent::PlayerAbilities {
+                flags,
+                flying_speed,
+                walking_speed,
             } => {
-                // Vanilla plays `entity.item.pickup` on the PLAYERS
-                // source at the collecting player — the item position
-                // is the closest tracked anchor this client keeps.
-                let pos = self
-                    .entity_positions
-                    .get(&item_entity)
-                    .or_else(|| self.entity_positions.get(&player))
-                    .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-                    .unwrap_or([0.0; 3]);
-                self.emit_effect_sound("minecraft:entity.item.pickup", 7, 0.2, 1.0, pos);
+                // The server is authoritative: a flag sync can grant or
+                // revoke `may_fly` (game-mode change) and force-drop
+                // `flying`, so fold the whole byte in and mirror the
+                // flying bit into the local physics prediction.
+                self.player_abilities = LivePlayerAbilities {
+                    flags,
+                    flying_speed,
+                    walking_speed,
+                };
+                self.physics_state.is_creative_flying =
+                    self.player_abilities.may_fly() && self.player_abilities.flying();
             }
-            PlayEvent::BlockChangedAck(sequence) => self.apply_block_changed_ack(sequence),
-            PlayEvent::SetCenterChunk { cx, cz } => self.apply_set_center_chunk(cx, cz),
-            PlayEvent::CommandSuggestions {
-                transaction_id,
-                start,
-                length,
-                matches,
-            } => self.apply_command_suggestions(ServerCommandSuggestions {
-                transaction_id,
-                start,
-                length,
-                matches: matches.iter().map(|m| m.text.clone()).collect(),
-            }),
-            PlayEvent::ChatCompletions { action, entries } => {
-                self.apply_chat_completions(action, &entries)
+            PlayEvent::ResourcePackPush {
+                uuid, forced, url, ..
+            } => {
+                // Track the pushed pack, then answer promptly. The client
+                // never downloads arbitrary remote URLs; acknowledging
+                // with ACCEPTED + SUCCESSFULLY_LOADED keeps required-pack
+                // servers from timing the client out, and the `forced`
+                // flag is surfaced through the recorded stack.
+                if self.server_resource_packs.len() >= 32 {
+                    self.server_resource_packs.pop_front();
+                }
+                self.server_resource_packs.push_back(uuid);
+                self.send_resource_pack_response(
+                    uuid,
+                    megu_client::protocol::RESOURCE_PACK_ACCEPTED,
+                );
+                self.send_resource_pack_response(
+                    uuid,
+                    megu_client::protocol::RESOURCE_PACK_SUCCESSFULLY_LOADED,
+                );
+                let _ = (forced, url);
             }
-            PlayEvent::Cooldown { item, ticks } => self.apply_cooldown(item, ticks),
-            PlayEvent::DeleteChat {
-                message_index,
-                signature,
-            } => self.apply_delete_chat(message_index, signature),
-            PlayEvent::ResetChat => self.apply_reset_chat(),
+            PlayEvent::ResourcePackPop { uuid } => {
+                match uuid {
+                    Some(uuid) => {
+                        // A targeted pop removes just that pack; the
+                        // DISCARDED echo tells the server the pack is
+                        // gone client-side.
+                        self.server_resource_packs.retain(|known| *known != uuid);
+                        self.send_resource_pack_response(
+                            uuid,
+                            megu_client::protocol::RESOURCE_PACK_DISCARDED,
+                        );
+                    }
+                    None => {
+                        // UUID-less pops clear every server pack (vanilla
+                        // applies the same all-or-nothing rule).
+                        let drained: Vec<[u8; 16]> = self.server_resource_packs.drain(..).collect();
+                        for uuid in drained {
+                            self.send_resource_pack_response(
+                                uuid,
+                                megu_client::protocol::RESOURCE_PACK_DISCARDED,
+                            );
+                        }
+                    }
+                }
+            }
             PlayEvent::Disconnect(reason) => self.status = SessionStatus::Disconnected(reason),
             _ => {}
         }
-        Ok(())
     }
 
     /// Session-side `game_event` handling layered over the world's
