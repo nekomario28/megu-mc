@@ -7,7 +7,6 @@ use std::collections::{BTreeSet as RsBTreeSet, VecDeque};
 
 include!("redstone_world.rs");
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)] // Vanilla face indices.
 enum RsDir {
@@ -55,7 +54,6 @@ const RS_DIR_DESCRIPTORS: [RsDirDescriptor; 6] = [
     RsDirDescriptor::new((1, 0, 0), RsDir::West, RsDir::South, RsDir::North, RsAxis::X),
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RsDir {
     const ALL: [Self; 6] = [
         Self::Down,
@@ -130,11 +128,9 @@ const RS_NEIGHBOR_UPDATE_ORDER: [RsDir; 6] = [
     RsDir::South,
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct RsPos(i32, i32, i32);
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RsPos {
     fn relative(self, dir: RsDir) -> Self {
         let (dx, dy, dz) = dir.offset();
@@ -155,7 +151,6 @@ impl RsPos {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsAxis {
     X,
@@ -163,7 +158,6 @@ enum RsAxis {
     Z,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsWireConnection {
     None,
@@ -190,7 +184,6 @@ impl RsWireConnection {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RedStoneWireBlock {
     power: u8,
@@ -207,7 +200,6 @@ impl Default for RedStoneWireBlock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RedStoneWireBlock {
     fn signal(self, toward: RsDir) -> u8 {
         if toward == RsDir::Down
@@ -252,13 +244,11 @@ impl RedStoneWireBlock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RedstoneTorchBlock {
     lit: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RedstoneWallTorchBlock {
     // Points away from the attachment face.
@@ -266,7 +256,6 @@ struct RedstoneWallTorchBlock {
     lit: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RepeaterBlock {
     // Diode facings here point from the rear input toward the front output.
@@ -276,7 +265,6 @@ struct RepeaterBlock {
     locked: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RepeaterBlock {
     fn delay_ticks(self) -> u64 {
         2 * u64::from(self.delay.clamp(1, 4))
@@ -287,14 +275,12 @@ impl RepeaterBlock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsComparatorMode {
     Compare,
     Subtract,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ComparatorBlock {
     facing: RsDir,
@@ -304,7 +290,6 @@ struct ComparatorBlock {
     output: u8,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ComparatorBlock {
     const DELAY_TICKS: u64 = 2;
 
@@ -334,7 +319,6 @@ impl ComparatorBlock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsMountFace {
     Floor,
@@ -446,7 +430,6 @@ enum RsBlock {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RsBlock {
     fn diode_facing(self) -> Option<RsDir> {
         match self {
@@ -483,20 +466,11 @@ impl RsBlock {
     fn is_signal_source(self) -> bool {
         matches!(
             self,
-            Self::Wire(_)
-                | Self::Torch(_)
-                | Self::WallTorch(_)
-                | Self::Repeater(_)
-                | Self::Comparator(_)
-                | Self::RedstoneBlock
-                | Self::Lever { .. }
-                | Self::Button { .. }
-                | Self::Observer { .. }
-                | Self::Target { .. }
-                | Self::Source { .. }
-                | Self::DaylightDetector { .. }
-                | Self::TripwireHook { .. }
-                | Self::SculkSensor { .. }
+            Self::Wire(_) | Self::Torch(_) | Self::WallTorch(_) | Self::Repeater(_)
+                | Self::Comparator(_) | Self::RedstoneBlock | Self::Lever { .. }
+                | Self::Button { .. } | Self::Observer { .. } | Self::Target { .. }
+                | Self::Source { .. } | Self::DaylightDetector { .. }
+                | Self::TripwireHook { .. } | Self::SculkSensor { .. }
         )
     }
 
@@ -564,7 +538,6 @@ impl RsBlock {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 trait RedstoneWorld {
     fn redstone_block(&self, pos: RsPos) -> RsBlock;
     fn is_redstone_conductor(&self, pos: RsPos) -> bool;
@@ -638,7 +611,6 @@ trait RedstoneWorld {
 
 /// One game event reaching a sculk sensor: the vanilla game-event name, the
 /// Euclidean distance to the source and whether wool blocked the path.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct RsSculkVibration {
     event: String,
@@ -649,7 +621,6 @@ struct RsSculkVibration {
 // These evaluators intentionally take the environmental observations as inputs. The
 // world adapter owns storage and event/entity queries; keeping the math here makes
 // the 1.21.1 state transitions deterministic and independently testable.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_daylight_detector_signal(
     sky_light: u8,
     day_time: i64,
@@ -680,7 +651,6 @@ fn rs_daylight_detector_signal(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsTripwireCell {
     Wire {
@@ -695,7 +665,6 @@ enum RsTripwireCell {
     Other,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsTripwireWireResult {
     attached: bool,
@@ -704,7 +673,6 @@ struct RsTripwireWireResult {
     powered: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RsTripwireResult {
     attached: bool,
@@ -727,10 +695,23 @@ fn rs_tripwire_entity_intersects(wire: RsAabb, entities: &[RsAabb]) -> bool {
     })
 }
 
+/// One `RsTripwireResult` literal; `wire_count` always mirrors `wires.len()`.
+fn rs_tripwire_result(
+    attached: bool,
+    powered: bool,
+    wires: Vec<RsTripwireWireResult>,
+) -> RsTripwireResult {
+    RsTripwireResult {
+        attached,
+        powered,
+        wire_count: wires.len() as u8,
+        wires,
+    }
+}
+
 /// `cells` starts immediately beyond the near hook and advances along its facing.
 /// At most 40 wire blocks may occur before the opposing hook. Each wire input carries
 /// the result of the entity AABB intersection check for that wire.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_tripwire_line(facing: RsDir, cells: &[RsTripwireCell]) -> RsTripwireResult {
     let mut wire_states = Vec::new();
     let mut powered = false;
@@ -756,32 +737,14 @@ fn rs_tripwire_line(facing: RsDir, cells: &[RsTripwireCell]) -> RsTripwireResult
                 for wire in &mut wire_states {
                     wire.attached = connected;
                 }
-                return RsTripwireResult {
-                    attached: connected,
-                    powered: connected && powered,
-                    wire_count: wire_states.len() as u8,
-                    wires: wire_states,
-                };
+                return rs_tripwire_result(connected, connected && powered, wire_states);
             }
-            _ => {
-                return RsTripwireResult {
-                    attached: false,
-                    powered: false,
-                    wire_count: wire_states.len() as u8,
-                    wires: wire_states,
-                };
-            }
+            _ => return rs_tripwire_result(false, false, wire_states),
         }
     }
-    RsTripwireResult {
-        attached: false,
-        powered: false,
-        wire_count: wire_states.len() as u8,
-        wires: wire_states,
-    }
+    rs_tripwire_result(false, false, wire_states)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_sculk_frequency(event: &str) -> Option<u8> {
     Some(match event.strip_prefix("minecraft:").unwrap_or(event) {
         "step" | "swim" | "flap" => 1,
@@ -804,7 +767,6 @@ fn rs_sculk_frequency(event: &str) -> Option<u8> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RsSculkPhase {
     Inactive,
@@ -812,7 +774,6 @@ enum RsSculkPhase {
     Cooldown,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RsSculkEvaluation {
     phase: RsSculkPhase,
@@ -821,7 +782,6 @@ struct RsSculkEvaluation {
 
 /// Compute event power and the elapsed-tick phase. `distance` is Euclidean block
 /// distance; the native listener rejects wool-occluded events before this stage.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_sculk_sensor_evaluate(
     event: &str,
     distance: f64,
@@ -855,7 +815,6 @@ fn rs_sculk_sensor_evaluate(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_signal_source(
     world: &impl RedstoneWorld,
     pos: RsPos,
@@ -873,7 +832,6 @@ fn rs_signal_source(
 }
 
 // Signal directions point from the emitting block toward the receiver.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_signal_from(world: &impl RedstoneWorld, pos: RsPos, toward: RsDir, include_wire: bool) -> u8 {
     let weak = rs_signal_source(world, pos, toward, include_wire).weak_signal(toward);
     if weak == 15 || !world.is_redstone_conductor(pos) {
@@ -894,7 +852,6 @@ fn rs_signal_from(world: &impl RedstoneWorld, pos: RsPos, toward: RsDir, include
     signal
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_neighbor_signal(world: &impl RedstoneWorld, pos: RsPos, include_wire: bool) -> u8 {
     RsDir::ALL
         .into_iter()
@@ -903,7 +860,6 @@ fn rs_neighbor_signal(world: &impl RedstoneWorld, pos: RsPos, include_wire: bool
         .unwrap_or(0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsWireConnection {
     let side = pos.relative(dir);
     let block = world.redstone_block(side);
@@ -938,7 +894,6 @@ fn rs_wire_connection(world: &impl RedstoneWorld, pos: RsPos, dir: RsDir) -> RsW
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_wire_inputs(world: &impl RedstoneWorld, pos: RsPos) -> impl Iterator<Item = RsPos> + '_ {
     let can_step_up = !world.is_redstone_conductor(pos.above());
     RsDir::HORIZONTAL.into_iter().flat_map(move |dir| {
@@ -952,7 +907,6 @@ fn rs_wire_inputs(world: &impl RedstoneWorld, pos: RsPos) -> impl Iterator<Item 
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_diode_rear_input(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> u8 {
     let rear = pos.relative(facing.opposite());
     let signal = rs_signal_from(world, rear, facing, true);
@@ -962,7 +916,6 @@ fn rs_diode_rear_input(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) ->
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_side_input(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir, diodes_only: bool) -> u8 {
     [facing.left(), facing.right()]
         .into_iter()
@@ -986,7 +939,6 @@ fn rs_side_input(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir, diodes_o
         .unwrap_or(0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn container_analog_output_signal(slots: &[(u32, u32)], num_slots: usize) -> u8 {
     if num_slots == 0 {
         return 0;
@@ -1044,7 +996,6 @@ enum RsAnalogSource {
     CommandBlock { success_count: i32 },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_comparator_signal(source: &RsAnalogSource) -> u8 {
     match source {
         RsAnalogSource::Container { slots, num_slots } => {
@@ -1121,7 +1072,6 @@ const RS_TARGET_PULSE_TICKS: u64 = 8;
 /// `d` is the larger of the two perpendicular |frac(coord) - 0.5| offsets.
 /// Arrows and other projectiles get the same signal; the projectile flag only
 /// sets the longer power-off schedule.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_target_block_signal(hit: [f64; 3], face_axis: RsAxis) -> u8 {
     let frac = |v: f64| (v - v.floor()).abs();
     let dx = (frac(hit[0]) - 0.5).abs();
@@ -1138,7 +1088,6 @@ fn rs_target_block_signal(hit: [f64; 3], face_axis: RsAxis) -> u8 {
 
 /// The power-off delay `TargetBlock` schedules: 20 game ticks for arrows
 /// (`instanceof AbstractArrow`), 8 for every other projectile.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_target_pulse_ticks(arrow: bool) -> u64 {
     if arrow {
         RS_TARGET_PROJECTILE_PULSE_TICKS
@@ -1150,7 +1099,6 @@ fn rs_target_pulse_ticks(arrow: bool) -> u64 {
 /// Vanilla `TargetBlock.onProjectileHit`: the radial hit strength is stored on
 /// the block and the power-off tick is queued through the same scheduler every
 /// other device uses. `rs_run_tick` clears the stored power when it fires.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_target_projectile_hit(
     world: &mut impl RedstoneUpdates,
     pos: RsPos,
@@ -1206,7 +1154,6 @@ impl RsSticky {
 }
 
 /// Everything `isPushable` (dsv.a) reads off a block state.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct RsPushBlock {
     air: bool,
@@ -1228,7 +1175,6 @@ struct RsPushBlock {
 
 /// `PistonBaseBlock.isPushable` minus the world-border checks, which the
 /// resolver applies separately via `rs_piston_is_pushable_at`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_is_pushable(
     block: &RsPushBlock,
     allow_destroy: bool,
@@ -1261,17 +1207,15 @@ fn rs_piston_is_pushable(
 /// `PistonStructureResolver.canStickToEachOther` (dsz.a(dtc,dtc)): slime and
 /// honey never stick to each other; otherwise the pair sticks when either side
 /// is sticky — a sticky block also drags plain pushable neighbours.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_can_stick(front: RsSticky, back: RsSticky) -> bool {
-    match (front, back) {
-        (RsSticky::Slime, RsSticky::Honey) | (RsSticky::Honey, RsSticky::Slime) => false,
-        _ => front.sticks() || back.sticks(),
-    }
+    !matches!(
+        (front, back),
+        (RsSticky::Slime, RsSticky::Honey) | (RsSticky::Honey, RsSticky::Slime)
+    ) && (front.sticks() || back.sticks())
 }
 
 /// The block-storage half of `PistonStructureResolver`: a position lookup plus
 /// the vanilla `isPushable` world bounds (build height, world border).
-#[cfg_attr(not(test), allow(dead_code))]
 trait RsPistonWorld {
     fn piston_block(&self, pos: RsPos) -> RsPushBlock;
     fn in_world_border(&self, _pos: RsPos) -> bool {
@@ -1286,7 +1230,6 @@ trait RsPistonWorld {
 
 /// The world-border half of `PistonBaseBlock.isPushable`: out-of-bounds and
 /// build-edge moves are refused before the block itself is examined.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_is_pushable_at(
     world: &impl RsPistonWorld,
     pos: RsPos,
@@ -1316,7 +1259,6 @@ fn rs_piston_is_pushable_at(
 
 /// The resolver outcome: every cell the piston actually moves plus the cells
 /// whose `DESTROY` reaction ends a push line.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RsPistonPlan {
     to_move: Vec<RsPos>,
@@ -1326,7 +1268,6 @@ struct RsPistonPlan {
 /// Faithful port of `PistonStructureResolver` (dsz): extension walks forward
 /// from the piston face, retraction starts two cells out and pulls. `None`
 /// means vanilla `resolve()` returned false — nothing moves.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_resolve(
     world: &impl RsPistonWorld,
     piston_pos: RsPos,
@@ -1349,8 +1290,8 @@ fn rs_piston_resolve(
     if !rs_piston_is_pushable_at(world, start, push_dir, false, piston_facing) {
         return if extending && head.reaction == RsPushReaction::Destroy {
             Some(RsPistonPlan {
-                to_move: Vec::new(),
                 to_destroy: vec![start],
+                ..Default::default()
             })
         } else {
             None
@@ -1374,7 +1315,6 @@ fn rs_piston_resolve(
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 struct RsPistonResolver<'w, W: RsPistonWorld> {
     world: &'w W,
     piston_pos: RsPos,
@@ -1383,7 +1323,6 @@ struct RsPistonResolver<'w, W: RsPistonWorld> {
     to_destroy: Vec<RsPos>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl<W: RsPistonWorld> RsPistonResolver<'_, W> {
     /// `addBlockLine`: walk the line from `pos` along `push_dir`, pulling a
     /// sticky chain behind the anchor first, then walking forward until air,
@@ -1425,12 +1364,13 @@ impl<W: RsPistonWorld> RsPistonResolver<'_, W> {
             }
         }
 
-        let mut added = 0usize;
-        for step in (0..back_count).rev() {
-            self.to_move
-                .push(pos.steps(self.push_dir.opposite(), step as i32));
-            added += 1;
-        }
+        let push_dir = self.push_dir;
+        self.to_move.extend(
+            (0..back_count)
+                .rev()
+                .map(|step| pos.steps(push_dir.opposite(), step as i32)),
+        );
+        let mut added = back_count;
 
         let mut ahead = 1i32;
         loop {
@@ -1492,20 +1432,13 @@ impl<W: RsPistonWorld> RsPistonResolver<'_, W> {
 
 /// `reorderListAtCollision` (dsz.a(int,int)): the newly walked segment is
 /// spliced in right after the cell it collided with.
-#[cfg_attr(not(test), allow(dead_code))]
-fn reorder_list_at_collision(to_move: &mut Vec<RsPos>, added: usize, collision: usize) {
-    let tail_start = to_move.len() - added;
-    let mut reordered = Vec::with_capacity(to_move.len());
-    reordered.extend_from_slice(&to_move[..collision]);
-    reordered.extend_from_slice(&to_move[tail_start..]);
-    reordered.extend_from_slice(&to_move[collision..tail_start]);
-    *to_move = reordered;
+fn reorder_list_at_collision(to_move: &mut [RsPos], added: usize, collision: usize) {
+    to_move[collision..].rotate_left(added);
 }
 
 /// A `moving_piston` block entity still extending when its base retracts.
 /// `progress` is `getProgress(0)` in [0, 1); `last_ticked` is the block
 /// entity's last ticked game time.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 struct RsMovingPiston {
     progress: f32,
@@ -1517,7 +1450,6 @@ struct RsMovingPiston {
 /// `moving_piston` (`progress < 0.5`, same tick, or during tick processing)
 /// fires block-event `2` — it "drops" the pushed block instead of pulling it.
 /// Event `1` is the normal pull-back. This is the 1-tick pulse rule.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_retraction_event(
     sticky: bool,
     moving_extension: Option<RsMovingPiston>,
@@ -1543,7 +1475,6 @@ fn rs_piston_retraction_event(
 /// would read each block the engine models. Block entities never move,
 /// attached components break, unknown registry states keep vanilla's safest
 /// answer — do not move — and the rest are plain movable.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
     match block {
         RsBlock::Air => RsPushBlock {
@@ -1586,7 +1517,6 @@ fn rs_push_block_of(block: RsBlock) -> RsPushBlock {
 /// Every `RedstoneWorld` is also a `PistonStructureResolver` world: pushability
 /// reads straight off `redstone_block`, and vanilla's Overworld build bounds
 /// (`minY = -64`, `height = 384`) apply by default.
-#[cfg_attr(not(test), allow(dead_code))]
 impl<W: RedstoneWorld> RsPistonWorld for W {
     fn piston_block(&self, pos: RsPos) -> RsPushBlock {
         rs_push_block_of(self.redstone_block(pos))
@@ -1603,7 +1533,6 @@ impl<W: RedstoneWorld> RsPistonWorld for W {
 /// block must be dropped instead of pulled. Returns false when the resolve
 /// failed or the host cannot rewrite blocks — the `extended` flag only flips
 /// when the move actually applied.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_piston_apply(
     world: &mut impl RedstoneUpdates,
     pos: RsPos,
@@ -1641,7 +1570,6 @@ const RS_OBSERVER_PULSE_TICKS: u64 = 2;
 /// Vanilla `ObserverBlock.updateShape`: a change at the observed face
 /// schedules the next tick, but only while unpowered — a lit observer ignores
 /// further updates until its pulse ends.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_observer_neighbor_update(world: &mut impl RedstoneUpdates, pos: RsPos, changed: RsPos) {
     let RsBlock::Observer { facing, powered } = world.redstone_block(pos) else {
         return;
@@ -1656,14 +1584,12 @@ fn rs_observer_neighbor_update(world: &mut impl RedstoneUpdates, pos: RsPos, cha
 /// `rs_observer_neighbor_update` checks per candidate position. Hosts call
 /// this wherever a block is replaced; the sim's own writers call it too, so
 /// observer pulses ride the same entry path as every other notification.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_notify_block_update(world: &mut impl RedstoneUpdates, changed: RsPos) {
     for dir in RS_NEIGHBOR_UPDATE_ORDER {
         rs_observer_neighbor_update(world, changed.relative(dir), changed);
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn is_piston_powered(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> bool {
     RsDir::ALL.into_iter().any(|dir| {
         dir != facing && rs_signal_from(world, pos.relative(dir), dir.opposite(), true) != 0
@@ -1674,12 +1600,6 @@ fn is_piston_powered(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> b
         })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn rs_dispenser_input(world: &impl RedstoneWorld, pos: RsPos) -> bool {
-    rs_neighbor_signal(world, pos, true) != 0 || rs_neighbor_signal(world, pos.above(), true) != 0
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(i8)]
 enum RsTickPriority {
@@ -1689,13 +1609,11 @@ enum RsTickPriority {
     Normal = 0,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct RsTorchHistory {
     shutoffs: VecDeque<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl RsTorchHistory {
     const DELAY: u64 = 2;
     const BURNOUT_WINDOW: u64 = 60;
@@ -1724,7 +1642,6 @@ impl RsTorchHistory {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 trait RedstoneUpdates: RedstoneWorld {
     fn set_component(&mut self, pos: RsPos, block: RsBlock);
     fn schedule(&mut self, pos: RsPos, delay: u64, priority: RsTickPriority);
@@ -1784,6 +1701,9 @@ const RS_PISTON_EVENT_TICKS: u64 = 0;
 #[derive(Default)]
 struct RedstoneSimGrid {
     blocks: BTreeMap<RsPos, RsBlock>,
+    // Dust cells currently stored; `settle` skips the wire relaxation pass
+    // in O(1) when this is zero.
+    wire_count: usize,
     now: u64,
     next_sequence: u64,
     ticks: BinaryHeap<RsScheduledTick>,
@@ -1813,19 +1733,13 @@ impl RedstoneWorld for RedstoneSimGrid {
     fn is_redstone_conductor(&self, pos: RsPos) -> bool {
         matches!(
             self.redstone_block(pos),
-            RsBlock::Solid
-                | RsBlock::Lamp { .. }
-                | RsBlock::Dispenser { .. }
-                | RsBlock::Dropper { .. }
+            RsBlock::Solid | RsBlock::Lamp { .. } | RsBlock::Dispenser { .. } | RsBlock::Dropper { .. }
         )
     }
 
     fn is_face_sturdy(&self, pos: RsPos, _face: RsDir) -> bool {
         self.is_redstone_conductor(pos)
-            || matches!(
-                self.redstone_block(pos),
-                RsBlock::Glass | RsBlock::RedstoneBlock
-            )
+            || matches!(self.redstone_block(pos), RsBlock::Glass | RsBlock::RedstoneBlock)
     }
 
     fn analog_source(&self, pos: RsPos) -> Option<RsAnalogSource> {
@@ -1851,6 +1765,19 @@ impl RedstoneWorld for RedstoneSimGrid {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl RedstoneSimGrid {
+    /// The single writer for `blocks`: air removes the cell, anything else
+    /// stores it, and `wire_count` tracks dust for the settle fast path.
+    fn write_block(&mut self, pos: RsPos, block: RsBlock) {
+        let was_wire = matches!(self.blocks.get(&pos), Some(RsBlock::Wire(_)));
+        let is_wire = matches!(block, RsBlock::Wire(_));
+        if block == RsBlock::Air {
+            self.blocks.remove(&pos);
+        } else {
+            self.blocks.insert(pos, block);
+        }
+        self.wire_count = self.wire_count + usize::from(is_wire) - usize::from(was_wire);
+    }
+
     fn set_block(&mut self, pos: RsPos, block: RsBlock) {
         // A new placement is a fresh `neighborChanged` pass: consumed piston
         // events re-arm, exactly like vanilla re-checking `checkIfExtend`.
@@ -1859,11 +1786,7 @@ impl RedstoneSimGrid {
             self.pending.remove(&pos);
             self.torches.remove(&pos);
         }
-        if block == RsBlock::Air {
-            self.blocks.remove(&pos);
-        } else {
-            self.blocks.insert(pos, block);
-        }
+        self.write_block(pos, block);
         rs_notify_block_update(self, pos);
         self.settle();
     }
@@ -1914,7 +1837,10 @@ impl RedstoneSimGrid {
 
     fn settle(&mut self) {
         let positions: Vec<_> = self.blocks.keys().copied().collect();
-        rs_settle_wires(self, positions.iter().copied());
+        // With no dust stored the relaxation pass cannot change anything.
+        if self.wire_count > 0 {
+            rs_settle_wires(self, positions.iter().copied());
+        }
         for pos in positions {
             let block = self.redstone_block(pos);
             rs_update_device(self, pos, block);
@@ -1924,7 +1850,7 @@ impl RedstoneSimGrid {
 
 impl RedstoneUpdates for RedstoneSimGrid {
     fn set_component(&mut self, pos: RsPos, block: RsBlock) {
-        self.blocks.insert(pos, block);
+        self.write_block(pos, block);
         // An engine write is a block update too: observers facing the cell
         // pulse even when the change came from another device's tick.
         rs_notify_block_update(self, pos);
@@ -1982,9 +1908,9 @@ impl RedstoneUpdates for RedstoneSimGrid {
         // The head cell vacates either way: extension leaves `moving_piston`
         // there, retraction removes it. The sim has no head state, so the cell
         // reads as air — a real host writes `piston_head` here.
-        self.blocks.remove(&pos.relative(facing));
+        self.write_block(pos.relative(facing), RsBlock::Air);
         for &cell in &plan.to_destroy {
-            self.blocks.remove(&cell);
+            self.write_block(cell, RsBlock::Air);
         }
         if drop_pulled {
             // Event 2 leaves the pushed block where it landed: the cells stay
@@ -1995,14 +1921,10 @@ impl RedstoneUpdates for RedstoneSimGrid {
             }
         } else {
             for &cell in &plan.to_move {
-                self.blocks.remove(&cell);
+                self.write_block(cell, RsBlock::Air);
             }
             for (dst, block) in moved {
-                if block == RsBlock::Air {
-                    self.blocks.remove(&dst);
-                } else {
-                    self.blocks.insert(dst, block);
-                }
+                self.write_block(dst, block);
                 if extending {
                     // Vanilla moves every pushed cell as a `moving_piston`
                     // block entity: `progress` 0.0 and `last_ticked` now —
@@ -2024,7 +1946,6 @@ impl RedstoneUpdates for RedstoneSimGrid {
 
 // Seed with non-wire power only. Relaxing from zero clears disconnected cycles
 // and computes the final power before writing any wire to the host.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_settle_wires(world: &mut impl RedstoneUpdates, positions: impl IntoIterator<Item = RsPos>) {
     let mut wires = BTreeMap::new();
     let mut downstream: BTreeMap<RsPos, Vec<RsPos>> = BTreeMap::new();
@@ -2068,7 +1989,6 @@ fn rs_settle_wires(world: &mut impl RedstoneUpdates, positions: impl IntoIterato
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_diode_in_front(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> bool {
     world
         .redstone_block(pos.relative(facing))
@@ -2076,64 +1996,152 @@ fn rs_diode_in_front(world: &impl RedstoneWorld, pos: RsPos, facing: RsDir) -> b
         .is_some_and(|other| other != facing.opposite())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// The attachment-face power read shared by torch updates and torch ticks.
+fn rs_torch_input_powered(world: &impl RedstoneWorld, pos: RsPos, attachment: RsDir) -> bool {
+    rs_signal_from(world, pos.relative(attachment), attachment.opposite(), true) != 0
+}
+
+/// The single `SculkSensor` block-state constructor for every phase write.
+fn rs_sculk_block(
+    calibrated: bool,
+    facing: RsDir,
+    phase: RsSculkPhase,
+    power: u8,
+    waterlogged: bool,
+) -> RsBlock {
+    RsBlock::SculkSensor {
+        calibrated,
+        facing,
+        phase,
+        power,
+        waterlogged,
+    }
+}
+
+/// Vibration power for an inactive sensor; `Some` always wakes it active.
+fn rs_sculk_incoming_power(
+    world: &impl RedstoneWorld,
+    pos: RsPos,
+    calibrated: bool,
+    facing: RsDir,
+) -> Option<u8> {
+    let vibration = world.sculk_vibration(pos)?;
+    let range = if calibrated { 16 } else { 8 };
+    // Vanilla getFacingInputSignal: the front block's signal, including
+    // an explicit dust power read when the wire is not pointed back.
+    let filter = calibrated
+        .then(|| {
+            let front = pos.relative(facing);
+            let input = rs_signal_from(world, front, facing.opposite(), true)
+                .max(match world.redstone_block(front) {
+                    RsBlock::Wire(wire) => wire.power,
+                    _ => 0,
+                });
+            (input > 0).then_some(input)
+        })
+        .flatten();
+    let evaluation = rs_sculk_sensor_evaluate(
+        &vibration.event,
+        vibration.distance,
+        range,
+        vibration.wool_occluded,
+        filter,
+        calibrated,
+        Some(0),
+    );
+    (evaluation.power > 0).then_some(evaluation.power)
+}
+
+/// `RepeaterBlock.neighborChanged`: lock + rear-input edge scheduling.
+fn rs_update_repeater(
+    world: &mut impl RedstoneUpdates,
+    pos: RsPos,
+    mut repeater: RepeaterBlock,
+) -> RsBlock {
+    repeater.locked = repeater.is_locked(world, pos);
+    let powered = rs_diode_rear_input(world, pos, repeater.facing) != 0;
+    if !repeater.locked && repeater.powered != powered {
+        let priority = if rs_diode_in_front(world, pos, repeater.facing) {
+            RsTickPriority::ExtremelyHigh
+        } else if repeater.powered {
+            RsTickPriority::VeryHigh
+        } else {
+            RsTickPriority::High
+        };
+        world.schedule(pos, repeater.delay_ticks(), priority);
+    }
+    RsBlock::Repeater(repeater)
+}
+
+/// `ComparatorBlock.neighborChanged`: reschedule on (output, powered) drift.
+fn rs_update_comparator(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
+    let RsBlock::Comparator(comparator) = block else {
+        return block;
+    };
+    if (comparator.output, comparator.powered) != comparator.evaluate(world, pos) {
+        let priority = if rs_diode_in_front(world, pos, comparator.facing) {
+            RsTickPriority::High
+        } else {
+            RsTickPriority::Normal
+        };
+        world.schedule(pos, ComparatorBlock::DELAY_TICKS, priority);
+    }
+    block
+}
+
+/// `RedstoneLampBlock.neighborChanged`: instant on, 4-tick delayed off.
+fn rs_update_lamp(world: &mut impl RedstoneUpdates, pos: RsPos, lit: bool) -> RsBlock {
+    let powered = rs_neighbor_signal(world, pos, true) != 0;
+    if lit && !powered {
+        world.schedule(pos, RS_LAMP_OFF_TICKS, RsTickPriority::Normal);
+    }
+    RsBlock::Lamp { lit: lit || powered }
+}
+
+/// Dispenser/dropper `neighborChanged`: rising-edge tick + `triggered` mirror.
+fn rs_update_dispenser(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
+    let triggered = matches!(
+        block,
+        RsBlock::Dispenser { triggered: true, .. } | RsBlock::Dropper { triggered: true, .. }
+    );
+    let powered = rs_neighbor_signal(world, pos, true) != 0
+        || rs_neighbor_signal(world, pos.above(), true) != 0;
+    if !triggered && powered {
+        world.schedule(pos, RS_DISPENSER_TICKS, RsTickPriority::Normal);
+    }
+    block.with_triggered(powered)
+}
+
+/// Piston `neighborChanged`: queue the block event unless this tick already
+/// consumed a failed one (vanilla's once-per-neighborChanged blockEvent).
+fn rs_update_piston(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
+    let RsBlock::Piston { facing, extended, .. } = block else {
+        return block;
+    };
+    if is_piston_powered(world, pos, facing) != extended && !world.piston_event_consumed(pos) {
+        world.schedule(pos, RS_PISTON_EVENT_TICKS, RsTickPriority::Normal);
+    }
+    block
+}
+
+/// Dispatch one neighbor-change evaluation to its device-family helper.
 fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) {
     if let Some((attachment, lit)) = block.torch_attachment() {
-        let powered =
-            rs_signal_from(world, pos.relative(attachment), attachment.opposite(), true) != 0;
-        if powered == lit {
+        if rs_torch_input_powered(world, pos, attachment) == lit {
             world.schedule(pos, RsTorchHistory::DELAY, RsTickPriority::Normal);
         }
         return;
     }
 
     let updated = match block {
-        RsBlock::Repeater(mut repeater) => {
-            repeater.locked = repeater.is_locked(world, pos);
-            let powered = rs_diode_rear_input(world, pos, repeater.facing) != 0;
-            if !repeater.locked && repeater.powered != powered {
-                let priority = if rs_diode_in_front(world, pos, repeater.facing) {
-                    RsTickPriority::ExtremelyHigh
-                } else if repeater.powered {
-                    RsTickPriority::VeryHigh
-                } else {
-                    RsTickPriority::High
-                };
-                world.schedule(pos, repeater.delay_ticks(), priority);
-            }
-            RsBlock::Repeater(repeater)
-        }
-        RsBlock::Comparator(comparator) => {
-            if (comparator.output, comparator.powered) != comparator.evaluate(world, pos) {
-                let priority = if rs_diode_in_front(world, pos, comparator.facing) {
-                    RsTickPriority::High
-                } else {
-                    RsTickPriority::Normal
-                };
-                world.schedule(pos, ComparatorBlock::DELAY_TICKS, priority);
-            }
-            block
-        }
-        RsBlock::Lamp { lit } => {
-            let powered = rs_neighbor_signal(world, pos, true) != 0;
-            if lit && !powered {
-                world.schedule(pos, RS_LAMP_OFF_TICKS, RsTickPriority::Normal);
-            }
-            RsBlock::Lamp {
-                lit: lit || powered,
-            }
-        }
+        RsBlock::Repeater(repeater) => rs_update_repeater(world, pos, repeater),
+        RsBlock::Comparator(..) => rs_update_comparator(world, pos, block),
+        RsBlock::Lamp { lit } => rs_update_lamp(world, pos, lit),
         RsBlock::Hopper { facing, .. } => RsBlock::Hopper {
             enabled: rs_neighbor_signal(world, pos, true) == 0,
             facing,
         },
-        RsBlock::Dispenser { triggered, .. } | RsBlock::Dropper { triggered, .. } => {
-            let powered = rs_dispenser_input(world, pos);
-            if !triggered && powered {
-                world.schedule(pos, RS_DISPENSER_TICKS, RsTickPriority::Normal);
-            }
-            block.with_triggered(powered)
-        }
+        RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => rs_update_dispenser(world, pos, block),
         RsBlock::DaylightDetector { inverted, .. } => rs_daylight_eval(world, pos, inverted, block),
         RsBlock::TripwireHook { .. } => rs_tripwire_hook_update(world, pos, block),
         RsBlock::SculkSensor {
@@ -2142,70 +2150,19 @@ fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock
             phase: RsSculkPhase::Inactive,
             waterlogged,
             ..
-        } => {
-            let Some(vibration) = world.sculk_vibration(pos) else {
-                return;
-            };
-            let range = if calibrated { 16 } else { 8 };
-            // Vanilla getFacingInputSignal: the front block's signal, including
-            // an explicit dust power read when the wire is not pointed back.
-            let filter = calibrated
-                .then(|| {
-                    let front = pos.relative(facing);
-                    let input = rs_signal_from(world, front, facing.opposite(), true)
-                        .max(match world.redstone_block(front) {
-                            RsBlock::Wire(wire) => wire.power,
-                            _ => 0,
-                        });
-                    (input > 0).then_some(input)
-                })
-                .flatten();
-            let evaluation = rs_sculk_sensor_evaluate(
-                &vibration.event,
-                vibration.distance,
-                range,
-                vibration.wool_occluded,
-                filter,
-                calibrated,
-                Some(0),
-            );
-            if evaluation.power > 0 {
+        } => match rs_sculk_incoming_power(world, pos, calibrated, facing) {
+            Some(power) => {
                 world.schedule(
                     pos,
-                    if calibrated {
-                        RS_SCULK_CALIBRATED_ACTIVE_TICKS
-                    } else {
-                        RS_SCULK_ACTIVE_TICKS
-                    },
+                    [RS_SCULK_ACTIVE_TICKS, RS_SCULK_CALIBRATED_ACTIVE_TICKS]
+                        [usize::from(calibrated)],
                     RsTickPriority::Normal,
                 );
-                RsBlock::SculkSensor {
-                    calibrated,
-                    facing,
-                    phase: evaluation.phase,
-                    power: evaluation.power,
-                    waterlogged,
-                }
-            } else {
-                block
+                rs_sculk_block(calibrated, facing, RsSculkPhase::Active, power, waterlogged)
             }
-        }
-        RsBlock::Piston {
-            facing, extended, ..
-        } => {
-            // Vanilla `PistonBaseBlock.checkIfExtend` — the QC-aware signal read
-            // decides whether the block event runs; `rs_run_tick` performs the
-            // resolve + apply when it fires. An event this tick already
-            // consumed (failed resolve or apply) does not re-arm until the
-            // next update pass, matching vanilla's once-per-neighborChanged
-            // blockEvent.
-            if is_piston_powered(world, pos, facing) != extended
-                && !world.piston_event_consumed(pos)
-            {
-                world.schedule(pos, RS_PISTON_EVENT_TICKS, RsTickPriority::Normal);
-            }
-            block
-        }
+            None => block,
+        },
+        RsBlock::Piston { .. } => rs_update_piston(world, pos, block),
         _ => block,
     };
     if updated != block {
@@ -2215,7 +2172,6 @@ fn rs_update_device(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock
 
 /// Re-read the environment for a daylight detector and reschedule the next
 /// refresh; `None` env keeps the stored `power` like a vanilla unloaded beam.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_daylight_eval(
     world: &mut impl RedstoneUpdates,
     pos: RsPos,
@@ -2234,7 +2190,6 @@ fn rs_daylight_eval(
 
 /// Rescan the line the hook faces, pushing `attached`/`powered` back into the
 /// wire cells before reporting the hook's own flags.
-#[cfg_attr(not(test), allow(dead_code))]
 fn rs_tripwire_hook_update(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
     let RsBlock::TripwireHook { facing, .. } = block else {
         return block;
@@ -2254,38 +2209,101 @@ fn rs_tripwire_hook_update(world: &mut impl RedstoneUpdates, pos: RsPos, block: 
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+/// Torch tick: shutoff recording/burnout, relight when unpowered.
+fn rs_run_torch_tick(
+    world: &mut impl RedstoneUpdates,
+    pos: RsPos,
+    block: RsBlock,
+    attachment: RsDir,
+    lit: bool,
+    now: u64,
+) {
+    let powered = rs_torch_input_powered(world, pos, attachment);
+    if lit && powered {
+        if world
+            .torch_histories()
+            .entry(pos)
+            .or_default()
+            .record_shutoff(now)
+        {
+            world.schedule(pos, RsTorchHistory::COOLDOWN, RsTickPriority::Normal);
+        }
+        world.set_component(pos, block.with_torch_lit(false));
+    } else if !lit
+        && !powered
+        && !world
+            .torch_histories()
+            .get(&pos)
+            .is_some_and(|history| history.is_burned_out(now))
+    {
+        world.set_component(pos, block.with_torch_lit(true));
+    }
+}
+
+/// `RepeaterBlock.tick`: resolve the queued edge against the rear input.
+fn rs_run_repeater_tick(
+    world: &mut impl RedstoneUpdates,
+    pos: RsPos,
+    mut repeater: RepeaterBlock,
+) -> RsBlock {
+    let input = rs_diode_rear_input(world, pos, repeater.facing) != 0;
+    if !repeater.powered && !input {
+        // A queued rising edge still turns on after the input falls.
+        world.schedule(pos, repeater.delay_ticks(), RsTickPriority::VeryHigh);
+    }
+    repeater.powered = !repeater.powered || input;
+    RsBlock::Repeater(repeater)
+}
+
+/// `ComparatorBlock.tick`: refresh output; subtract writes POWERED only on change.
+fn rs_run_comparator_tick(world: &mut impl RedstoneUpdates, pos: RsPos, block: RsBlock) -> RsBlock {
+    let RsBlock::Comparator(mut comparator) = block else {
+        return block;
+    };
+    let (output, powered) = comparator.evaluate(world, pos);
+    if output != comparator.output || comparator.mode == RsComparatorMode::Compare {
+        comparator.powered = powered;
+        comparator.output = output;
+        world.set_component(pos, RsBlock::Comparator(comparator));
+    }
+    block
+}
+
+/// `PistonBaseBlock.triggerEvent`: resolve + apply; failed moves consume
+/// the event so `rs_update_device` cannot re-arm it this tick.
+fn rs_run_piston_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64, block: RsBlock) -> RsBlock {
+    let RsBlock::Piston {
+        facing,
+        sticky,
+        extended,
+    } = block
+    else {
+        return block;
+    };
+    if is_piston_powered(world, pos, facing) == extended {
+        return block;
+    }
+    if rs_piston_apply(world, pos, sticky, facing, !extended, now) {
+        RsBlock::Piston {
+            facing,
+            sticky,
+            extended: !extended,
+        }
+    } else {
+        world.consume_piston_event(pos);
+        block
+    }
+}
+
+/// Dispatch one scheduled tick to its device-family helper.
 fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
     let block = world.redstone_block(pos);
     if let Some((attachment, lit)) = block.torch_attachment() {
-        let powered =
-            rs_signal_from(world, pos.relative(attachment), attachment.opposite(), true) != 0;
-        if lit && powered {
-            if world
-                .torch_histories()
-                .entry(pos)
-                .or_default()
-                .record_shutoff(now)
-            {
-                world.schedule(pos, RsTorchHistory::COOLDOWN, RsTickPriority::Normal);
-            }
-            world.set_component(pos, block.with_torch_lit(false));
-        } else if !lit
-            && !powered
-            && !world
-                .torch_histories()
-                .get(&pos)
-                .is_some_and(|history| history.is_burned_out(now))
-        {
-            world.set_component(pos, block.with_torch_lit(true));
-        }
+        rs_run_torch_tick(world, pos, block, attachment, lit, now);
         return;
     }
 
-    if matches!(
-        block,
-        RsBlock::DaylightDetector { .. } | RsBlock::TripwireHook { .. }
-    ) {
+    if matches!(block, RsBlock::DaylightDetector { .. } | RsBlock::TripwireHook { .. }) {
         // These sensors poll their environment; the scheduled tick is just the
         // next refresh of the same neighbor-change evaluation.
         rs_update_device(world, pos, block);
@@ -2293,57 +2311,30 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
     }
 
     let updated = match block {
-        RsBlock::Repeater(mut repeater) if !repeater.is_locked(world, pos) => {
-            let input = rs_diode_rear_input(world, pos, repeater.facing) != 0;
-            if !repeater.powered && !input {
-                // A queued rising edge still turns on after the input falls.
-                world.schedule(pos, repeater.delay_ticks(), RsTickPriority::VeryHigh);
-            }
-            repeater.powered = !repeater.powered || input;
-            RsBlock::Repeater(repeater)
+        RsBlock::Repeater(repeater) if !repeater.is_locked(world, pos) => {
+            rs_run_repeater_tick(world, pos, repeater)
         }
-        RsBlock::Comparator(mut comparator) => {
-            let (output, powered) = comparator.evaluate(world, pos);
-            // In subtract mode a refresh only updates POWERED if the output changed.
-            if output != comparator.output || comparator.mode == RsComparatorMode::Compare {
-                comparator.powered = powered;
-                comparator.output = output;
-                world.set_component(pos, RsBlock::Comparator(comparator));
-            }
-            return;
-        }
+        RsBlock::Comparator(..) => rs_run_comparator_tick(world, pos, block),
         RsBlock::Lamp { lit: true } if rs_neighbor_signal(world, pos, true) == 0 => {
             RsBlock::Lamp { lit: false }
         }
         RsBlock::SculkSensor {
             calibrated,
             facing,
-            phase: RsSculkPhase::Active,
+            phase,
             waterlogged,
             ..
-        } => {
-            world.schedule(pos, RS_SCULK_COOLDOWN_TICKS, RsTickPriority::Normal);
-            RsBlock::SculkSensor {
-                calibrated,
-                facing,
-                phase: RsSculkPhase::Cooldown,
-                power: 0,
-                waterlogged,
+        } if phase != RsSculkPhase::Inactive => {
+            if phase == RsSculkPhase::Active {
+                world.schedule(pos, RS_SCULK_COOLDOWN_TICKS, RsTickPriority::Normal);
             }
+            let next = if phase == RsSculkPhase::Active {
+                RsSculkPhase::Cooldown
+            } else {
+                RsSculkPhase::Inactive
+            };
+            rs_sculk_block(calibrated, facing, next, 0, waterlogged)
         }
-        RsBlock::SculkSensor {
-            calibrated,
-            facing,
-            phase: RsSculkPhase::Cooldown,
-            waterlogged,
-            ..
-        } => RsBlock::SculkSensor {
-            calibrated,
-            facing,
-            phase: RsSculkPhase::Inactive,
-            power: 0,
-            waterlogged,
-        },
         RsBlock::Dispenser { .. } | RsBlock::Dropper { .. } => {
             world.dispense(pos);
             block
@@ -2351,50 +2342,11 @@ fn rs_run_tick(world: &mut impl RedstoneUpdates, pos: RsPos, now: u64) {
         // Vanilla `TargetBlock.tick`: the pulse scheduled at hit time clears
         // the stored power — `rs_target_projectile_hit` wrote both.
         RsBlock::Target { .. } => RsBlock::Target { power: 0 },
-        // Vanilla `PistonBaseBlock.triggerEvent`: `checkIfExtend` queued this
-        // same-tick event; re-derive power the way the vanilla trigger does,
-        // then resolve + apply the move so `extended` only flips when the
-        // structure actually moved.
-        RsBlock::Piston {
-            facing,
-            sticky,
-            extended,
-        } => {
-            if is_piston_powered(world, pos, facing) != extended {
-                if rs_piston_apply(world, pos, sticky, facing, !extended, now) {
-                    RsBlock::Piston {
-                        facing,
-                        sticky,
-                        extended: !extended,
-                    }
-                } else {
-                    // The event ran and could not move the structure (a line
-                    // over the 12-block cap, an immovable block, or a host
-                    // that cannot rewrite cells): mark it consumed so
-                    // `rs_update_device` cannot re-arm it inside this tick.
-                    world.consume_piston_event(pos);
-                    block
-                }
-            } else {
-                block
-            }
-        }
+        RsBlock::Piston { .. } => rs_run_piston_tick(world, pos, now, block),
         // Vanilla ObserverBlock.tick: a powered observer turns off; an
         // unpowered one turns on and schedules the off-edge 2 ticks out, so
         // each observed change produces a 2-game-tick high pulse.
-        RsBlock::Observer { facing, powered } => {
-            if powered {
-                RsBlock::Observer {
-                    facing,
-                    powered: false,
-                }
-            } else {
-                RsBlock::Observer {
-                    facing,
-                    powered: true,
-                }
-            }
-        }
+        RsBlock::Observer { facing, powered } => RsBlock::Observer { facing, powered: !powered },
         _ => block,
     };
     if updated != block {
