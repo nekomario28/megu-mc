@@ -185,8 +185,10 @@ fn save_v2_advancements_reject_corrupted_footers_before_restoring_grants() {
 fn without_entity_rule_extension(payload: &[u8]) -> Vec<u8> {
     let frame = full_state_frame(payload);
     let body = &payload[frame.start..frame.end - 12];
-    let extension = body.windows(4).rposition(|bytes| bytes == SAVE_ENTITY_RULES_MAGIC)
-        .expect("SVX1 extension");
+    let extension = body
+        .windows(4)
+        .rposition(|bytes| bytes == SAVE_ENTITY_RULES_V2_MAGIC || bytes == SAVE_ENTITY_RULES_MAGIC)
+        .expect("SVX1/SVX2 extension");
     let mut legacy = Vec::new();
     legacy.extend_from_slice(&payload[..frame.start]);
     legacy.extend_from_slice(&body[..extension]);
@@ -2876,13 +2878,10 @@ fn save_v2_live_block_entities_round_trip_all_families() {
 
     let mut payload = Vec::new();
     save_world_into(&mut payload);
-    // The footer rides between the legacy region and SVP1.
+    // The footer rides between the legacy region and SVP1/SVP2 (underneath optional ADV1).
     {
-        let tail = payload_through_drop_owners_footer(&payload).unwrap();
-        let (tail, _) = read_drop_owners_footer(tail).unwrap();
-        let tail = tick_persistence::prefix(tail).unwrap();
-        let (before_generated, _) = split_save_footer(tail, b"GEN1").unwrap();
-        let (state_prefix, _) = split_save_footer(before_generated, SAVE_STATE_MAGIC).unwrap();
+        let state_prefix = &payload[..full_state_frame(&payload).start];
+        let (state_prefix, _) = split_save_footer(state_prefix, ADVANCEMENTS_MAGIC).unwrap();
         assert!(
             state_prefix.ends_with(BLOCK_ENTITIES_MAGIC),
             "save with live block entities must carry the BEN1 footer"

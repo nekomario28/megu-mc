@@ -1387,12 +1387,13 @@ impl SaveState {
                 mob_attributes.push((index, selector_key, entries));
             }
             if ext_v2 {
-                let roster_raid_count = input.var_count(2)?;
+                // Each raid's roster section is at minimum 1 byte (varint 0 when empty).
+                let roster_raid_count = input.var_count(1)?;
                 if roster_raid_count != raids.len() {
                     return Err("saved raid roster count mismatch");
                 }
                 for (_, raid) in &mut raids {
-                    let roster_count = input.var_count(2)?;
+                    let roster_count = input.var_count(19)?;
                     // SVP1 had no UUID association. Permit its active slots to
                     // migrate with an empty roster; all newly spawned waves
                     // are written with the complete realized UUID mapping.

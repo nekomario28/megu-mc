@@ -9256,7 +9256,6 @@ fn slot_read_component(b: &[u8], p: &mut usize, ty: i64, depth: usize) -> Option
                 read_live_potion_effect_details(&mut rest, 0)?;
             }
             *p = b.len() - rest.len();
-            slot_read_optional_string(b, p)?;
         }
         32 => for _ in 0..slot_read_count(b, p, 256)? {
             slot_read_varint(b, p)?;
@@ -15473,7 +15472,7 @@ mod p8b2_parity_component_wire_tests {
             4, 3,
             vec![
                 (COMP_CUSTOM_NAME, named_text()),
-                (16, vec![0x80, 0x00]), // repair_cost
+                (16, vec![0x00]), // repair_cost (canonical VarInt)
                 (SLOT_REMOVED_COMPONENTS, [vi(3), vi(4), vi(12)].concat()),
             ],
         );
@@ -15483,6 +15482,11 @@ mod p8b2_parity_component_wire_tests {
         assert!(creative_inventory_slot(45));
         packet.push(1);
         assert!(slot_read_wire(&packet).is_none(), "trailing data must be rejected");
+        // Overlong/non-canonical VarInt payloads must fail closed.
+        let noncanonical: Stack = (4, 3, vec![(16, vec![0x80, 0x00])]);
+        let mut bad = 45i16.to_be_bytes().to_vec();
+        bad.extend_from_slice(&slot_wire(&noncanonical));
+        assert!(slot_read_wire(&bad).is_none(), "non-canonical VarInt must be rejected");
     }
 
     #[test]

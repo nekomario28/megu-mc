@@ -236,6 +236,8 @@ def brewing_and_redstone(game):
             client.wait_block(repeater, "repeater", delay=str(delay))
         client.place(lamp, "redstone_lamp", lit="false")
         client.place(stand, "brewing_stand", has_bottle_0="false")
+        # Vanilla ObserverBlock faces the player's look direction (west = +90°).
+        client.send(0x1c, struct.pack(">ff?", 90.0, 0.0, True))
         client.place(observer, "observer", facing="west", powered="false")
         client.set_item(36, "redstone_block")
         client.set_item(37, "potion", component=vint(31) + b"\x01\x00\x00\x00")

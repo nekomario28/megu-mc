@@ -111,8 +111,8 @@ def scoreboard(game):
         # objectives bound to a display slot (`startTrackingObjective`).
         client.command("scoreboard objectives add lane dummy Lane Score", "Added objective lane")
         client.command("scoreboard players set @s lane -7", "ScoreTester has -7 in lane")
-        before_obj = len(client.play[0x5E])
-        before_score = len(client.play[0x61])
+        before_obj = len(client.play.get(0x5E, ()))
+        before_score = len(client.play.get(0x61, ()))
         reader = client.command("scoreboard objectives setdisplay sidebar lane", "Displaying lane", 0x57)
         require((reader.varint(), reader.string()) == (1, "lane"), "scoreboard-sidebar")
         end(reader, "scoreboard-sidebar")

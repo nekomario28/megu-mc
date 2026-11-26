@@ -149,6 +149,9 @@ def journeys(binary):
                 print("2/7 chat/command/inventory PASS", flush=True)
                 with JourneyClient(game, "JourneyBob") as b:
                     b.spawn()
+                    # Vanilla spawnRadius can scatter Bob into a neighboring chunk;
+                    # step him into Alice's chunk before checking claim isolation.
+                    b.move(x, y, z)
                     a.command("megu claim here", "Claimed chunk")
                     b.command("megu claim info", "claimed by JourneyAlice")
                     b.command("megu claim here", "already claimed by JourneyAlice")

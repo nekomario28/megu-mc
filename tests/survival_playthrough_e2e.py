@@ -166,8 +166,10 @@ def stage_mining_crafting(game, spawn):
         c.until(lambda *_: c.slot_updates.get((0, 0)) == (PLANKS, 4), "craft-planks-result")
         click(c, 0, 0)
         c.until(lambda *_: c.slot_updates.get((0, 1)) == (0, 0), "craft-consume-log")
-        require(any(value == (PLANKS, 4) for (window, _), value in c.slot_updates.items()
-                    if window == 0), "craft-planks-in-inventory")
+        # Left-clicking the crafting output puts the crafted stack on the
+        # cursor; drop it into hotbar slot 36 so it lands in inventory.
+        click(c, 0, 36)
+        wait_slot(c, 0, 36, (PLANKS, 4), "craft-planks-in-inventory")
         return target
 
 
@@ -179,7 +181,7 @@ def stage_chest_furnace(game, spawn):
         loc = (x + 2, y - 1, z)
         c.command(f"setblock {loc[0]} {loc[1]} {loc[2]} chest")
         c.until(lambda *_: any(p == loc for p, _ in c.updates), "chest-place-update")
-        c.send(0x38, use_on_payload((loc[0], loc[1] - 1, loc[2]), 3))
+        c.send(0x38, use_on_payload(loc, 3))
         r = Reader(c.until_id(0x33, "chest-open"))
         window, menu = r.varint(), r.varint()
         require(menu == 2, "chest-menu-type")
@@ -189,9 +191,9 @@ def stage_chest_furnace(game, spawn):
         wait_slot(c, window, 54, (0, 0), "chest-pickup-player-stack")
         click(c, window, 0)
         wait_slot(c, window, 0, (LOG, 1), "chest-deposit-log")
-        click(c, window, 0, mode=1)  # shift-click chest stack back to inventory
+        click(c, window, 0, mode=1)  # shift-click chest stack back to inventory (reverse hotbar -> slot 62)
         c.until(lambda *_: c.slot_updates.get((window, 0)) == (0, 0), "chest-shift-withdraw")
-        click(c, window, 54)
+        click(c, window, 62)
         click(c, window, 0)
         wait_slot(c, window, 0, (LOG, 1), "chest-return-item")
         c.send(0x0f, bytes([window]))
@@ -200,7 +202,7 @@ def stage_chest_furnace(game, spawn):
         c.until(lambda *_: any(p == furnace for p, _ in c.updates), "furnace-place-update")
         put_creative_stack(c, 36, RAW_IRON, 1)
         put_creative_stack(c, 38, COAL, 1)
-        c.send(0x38, use_on_payload((furnace[0], furnace[1] - 1, furnace[2]), 4))
+        c.send(0x38, use_on_payload(furnace, 4))
         c.until_id(0x33, "furnace-open")
         put_creative_stack(c, 37, COAL, 2)
         return loc, furnace
@@ -246,7 +248,10 @@ def stage_dimensions(game, spawn):
         body = c.until_id(0x47, "overworld-to-end-respawn")
         require(parse_respawn(body)[1] == "minecraft:the_end", "end-dimension")
         c.until(lambda *_: bool(c.chunks), "end-chunks")
-        c.move(100.5, 49, .5)
+        # Step off the arrival cell so the portal arrival guard clears, then
+        # place the exit portal and step into it.
+        c.move(101.5, 49, .5)
+        time.sleep(0.15)
         c.command("setblock 100 49 0 minecraft:end_portal")
         c.move(100.5, 49, .5)
         body = c.until_id(0x47, "end-to-overworld-respawn")
@@ -289,7 +294,7 @@ def run_live(binary, root):
             c.until(lambda *_: (0, 37) in c.slot_updates, "restart-player-inventory-slot")
             require(c.slot_updates[(0, 37)] == (COAL, 2), "restart-player-inventory-persisted")
             require(c.pos is not None, "restart-player-position")
-            c.send(0x38, use_on_payload((chest[0], chest[1] - 1, chest[2]), 5))
+            c.send(0x38, use_on_payload(chest, 5))
             menu = Reader(c.until_id(0x33, "restart-chest-open"))
             window = menu.varint()
             require(menu.varint() == 2, "restart-chest-menu")
