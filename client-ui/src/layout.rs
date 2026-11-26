@@ -28,7 +28,308 @@ use crate::state::{
 };
 use crate::subtitle_hud::SubtitleHudState;
 
-const HUD_HOTBAR_MIN_WIDTH: u32 = 224;
+const HUD_HOTBAR_MIN_WIDTH: u32 = HotbarLayout::TOTAL_WIDTH as u32;
+
+/// Scale one logical-pixel layout rectangle at the physical output boundary.
+///
+/// HUD geometry is authored and intersected in logical pixels; embedding
+/// renderers call this only when converting the final rectangle to physical
+/// pixels so drawing, hit testing, occupancy reservations, and overlay
+/// placement cannot drift through independently scaled intermediates.
+pub fn logical_rect_to_physical(rect: UiRect, scale: i32) -> UiRect {
+    let scale = scale.max(1);
+    UiRect::new(
+        rect.x * scale,
+        rect.y * scale,
+        (rect.w as i32 * scale).max(0) as u32,
+        (rect.h as i32 * scale).max(0) as u32,
+    )
+}
+
+/// Exact logical-pixel geometry of the vanilla-style HUD hotbar.
+///
+/// `panel_rect` is the nine-slot hotbar strip. `occupied_rect` is the full
+/// reserved block (offhand cell, four-pixel gap, and all nine slots). Slot
+/// positions are row-major cells `(x0 + pitch * col, y0)` in logical pixels;
+/// convert with [`logical_rect_to_physical`] only at the output boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HotbarLayout {
+    panel: UiRect,
+    offhand: UiRect,
+}
+
+impl HotbarLayout {
+    /// Hotbar cell pitch and cell edge in logical pixels.
+    pub const SLOT_PITCH: i32 = 22;
+    /// Number of selectable hotbar cells.
+    pub const SLOT_COUNT: usize = 9;
+    /// Gap between the offhand cell and the first hotbar cell.
+    pub const OFFHAND_GAP: i32 = 4;
+    /// Bottom screen margin in logical pixels.
+    pub const BOTTOM_MARGIN: i32 = 4;
+    /// Width of the nine-slot hotbar strip.
+    pub const HOTBAR_WIDTH: i32 = Self::SLOT_PITCH * Self::SLOT_COUNT as i32;
+    /// Width of the complete offhand + gap + hotbar reservation.
+    pub const TOTAL_WIDTH: i32 = Self::HOTBAR_WIDTH + Self::SLOT_PITCH + Self::OFFHAND_GAP;
+
+    /// Center the complete hotbar block in a logical-pixel viewport.
+    pub const fn new(logical_width: i32, logical_height: i32) -> Self {
+        let occupied_x = logical_width / 2 - Self::TOTAL_WIDTH / 2;
+        let y = logical_height - Self::SLOT_PITCH - Self::BOTTOM_MARGIN;
+        let x0 = occupied_x + Self::SLOT_PITCH + Self::OFFHAND_GAP;
+        Self {
+            panel: UiRect::new(x0, y, Self::HOTBAR_WIDTH as u32, Self::SLOT_PITCH as u32),
+            offhand: UiRect::new(
+                occupied_x,
+                y,
+                Self::SLOT_PITCH as u32,
+                Self::SLOT_PITCH as u32,
+            ),
+        }
+    }
+
+    /// Left x of hotbar slot zero (`x0`), in logical pixels.
+    pub const fn x0(self) -> i32 {
+        self.panel.x
+    }
+
+    /// Top y of every hotbar cell (`y0`), in logical pixels.
+    pub const fn y0(self) -> i32 {
+        self.panel.y
+    }
+
+    /// Rectangle of the textured nine-slot hotbar strip, in logical pixels.
+    pub const fn panel_rect(self) -> UiRect {
+        self.panel
+    }
+
+    /// Rectangle of the offhand cell, in logical pixels.
+    pub const fn offhand_rect(self) -> UiRect {
+        self.offhand
+    }
+
+    /// Rectangle of hotbar slot `index`, in logical pixels.
+    pub const fn slot_rect(self, index: usize) -> UiRect {
+        UiRect::new(
+            self.x0() + Self::SLOT_PITCH * index as i32,
+            self.y0(),
+            Self::SLOT_PITCH as u32,
+            Self::SLOT_PITCH as u32,
+        )
+    }
+
+    /// Complete reserved block: offhand cell, gap, and all nine slots.
+    pub const fn occupied_rect(self) -> UiRect {
+        UiRect::new(
+            self.offhand.x,
+            self.offhand.y,
+            Self::TOTAL_WIDTH as u32,
+            Self::SLOT_PITCH as u32,
+        )
+    }
+}
+
+/// Horizontal anchoring for one row of vital icons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VitalRowAlign {
+    /// Icons advance rightwards from `x`.
+    Left,
+    /// Icons advance leftwards from the exclusive right edge `x`.
+    Right,
+}
+
+/// Logical-pixel geometry for one vanilla vital-icon row.
+///
+/// Vanilla sprites are 9×9 pixels on an 8-pixel pitch, so adjacent
+/// transparent edges overlap by one pixel. The procedural fallback occupies
+/// the inner 8×8 cell. Right-aligned rows keep the historical anchor
+/// `right - 8 - index * 8` exactly; changing that anchor would shift the
+/// hunger, mount-health, and air rows by a pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VitalRow {
+    x: i32,
+    y: i32,
+    align: VitalRowAlign,
+}
+
+impl VitalRow {
+    /// Distance between adjacent icon cell origins.
+    pub const ICON_PITCH: i32 = 8;
+    /// Procedural/occupancy cell edge.
+    pub const CELL_SIZE: i32 = 8;
+    /// Textured sprite edge (sprites intentionally overlap by one pixel).
+    pub const SPRITE_SIZE: i32 = 9;
+    /// Maximum vanilla icons in one row.
+    pub const MAX_ICONS: i32 = 10;
+    /// Width reserved for a full row in collision calculations.
+    pub const OCCUPIED_WIDTH: i32 = Self::ICON_PITCH * Self::MAX_ICONS;
+
+    /// Left-anchored row starting at `(x, y)`.
+    pub const fn left(x: i32, y: i32) -> Self {
+        Self {
+            x,
+            y,
+            align: VitalRowAlign::Left,
+        }
+    }
+
+    /// Right-anchored row whose exclusive right edge is `right`.
+    pub const fn right(right: i32, y: i32) -> Self {
+        Self {
+            x: right,
+            y,
+            align: VitalRowAlign::Right,
+        }
+    }
+
+    /// Top y shared by every icon in this row.
+    pub const fn y(self) -> i32 {
+        self.y
+    }
+
+    /// Left x of icon `index` using the row's 8-pixel pitch.
+    pub const fn icon_x(self, index: usize) -> i32 {
+        let i = index as i32;
+        match self.align {
+            VitalRowAlign::Left => self.x + i * Self::ICON_PITCH,
+            VitalRowAlign::Right => self.x - Self::CELL_SIZE - i * Self::ICON_PITCH,
+        }
+    }
+
+    /// Logical sprite rectangle for icon `index` (9×9).
+    pub const fn sprite_rect(self, index: usize) -> UiRect {
+        UiRect::new(
+            self.icon_x(index),
+            self.y,
+            Self::SPRITE_SIZE as u32,
+            Self::SPRITE_SIZE as u32,
+        )
+    }
+
+    /// Logical procedural-cell rectangle for icon `index` (8×8).
+    pub const fn cell_rect(self, index: usize) -> UiRect {
+        UiRect::new(
+            self.icon_x(index),
+            self.y,
+            Self::CELL_SIZE as u32,
+            Self::CELL_SIZE as u32,
+        )
+    }
+
+    /// Whether this row is right-aligned.
+    pub const fn is_right_aligned(self) -> bool {
+        matches!(self.align, VitalRowAlign::Right)
+    }
+}
+
+fn normalized_max_health(max_health: f32) -> f32 {
+    if max_health.is_finite() && max_health > 0.0 {
+        max_health
+    } else {
+        20.0
+    }
+}
+
+/// Shared vital-row layout derived once from the hotbar and HUD state.
+///
+/// Both the painter and the occupied-rectangle mirror consume this geometry;
+/// the painter uses the individual rows while the collision model uses the
+/// conservative full-width column spans and top edges.
+#[derive(Clone, Copy, Debug)]
+struct HudVitalsGeometry {
+    left_x: i32,
+    right_x: i32,
+    base_y: i32,
+    health_rows: i32,
+    mount_rows: i32,
+    has_absorption: bool,
+    has_air: bool,
+}
+
+impl HudVitalsGeometry {
+    const BASE_OFFSET: i32 = 12;
+    const ROW_STEP: i32 = 10;
+
+    fn new(hud: &HudState, hotbar: HotbarLayout) -> Self {
+        let health_rows = (normalized_max_health(hud.max_health) / 20.0).ceil() as i32;
+        let mount_rows = hud
+            .mount_health
+            .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
+            .unwrap_or(0);
+        let left_x = hotbar.x0();
+        Self {
+            left_x,
+            right_x: left_x + HotbarLayout::HOTBAR_WIDTH,
+            base_y: hotbar.y0() - Self::BASE_OFFSET,
+            health_rows,
+            mount_rows,
+            has_absorption: hud.absorption > 0.0,
+            has_air: hud.air < 300,
+        }
+    }
+
+    fn health_row(self, row: i32) -> VitalRow {
+        VitalRow::left(self.left_x, self.base_y - row * Self::ROW_STEP)
+    }
+
+    fn armor_row(self) -> VitalRow {
+        VitalRow::left(self.left_x, self.base_y - self.health_rows * Self::ROW_STEP)
+    }
+
+    fn absorption_row(self) -> Option<VitalRow> {
+        self.has_absorption.then(|| {
+            let armor = self.armor_row();
+            VitalRow::left(self.left_x, armor.y() - Self::ROW_STEP)
+        })
+    }
+
+    fn hunger_row(self) -> VitalRow {
+        VitalRow::right(self.right_x, self.base_y)
+    }
+
+    fn mount_row(self, row: i32) -> VitalRow {
+        VitalRow::right(
+            self.right_x,
+            self.base_y - Self::ROW_STEP - row * Self::ROW_STEP,
+        )
+    }
+
+    fn air_row(self) -> Option<VitalRow> {
+        self.has_air.then(|| {
+            VitalRow::right(
+                self.right_x,
+                self.base_y - Self::ROW_STEP - self.mount_rows * Self::ROW_STEP,
+            )
+        })
+    }
+
+    fn column_ranges(self) -> (std::ops::Range<i32>, std::ops::Range<i32>) {
+        (
+            self.left_x..(self.left_x + VitalRow::OCCUPIED_WIDTH),
+            (self.right_x - VitalRow::OCCUPIED_WIDTH)..self.right_x,
+        )
+    }
+
+    fn left_top(self) -> i32 {
+        self.base_y
+            - self.health_rows * Self::ROW_STEP
+            - if self.has_absorption {
+                Self::ROW_STEP
+            } else {
+                0
+            }
+    }
+
+    fn right_top(self) -> i32 {
+        self.base_y
+            - self.mount_rows * Self::ROW_STEP
+            - if self.has_air { Self::ROW_STEP } else { 0 }
+    }
+
+    fn bottom(self) -> i32 {
+        self.base_y + VitalRow::CELL_SIZE
+    }
+}
 
 /// Build the frame for the current screen: `(draw_list, hit_regions)`.
 /// `width`/`height` are physical pixels.
@@ -197,12 +498,7 @@ const fn lr(x: i32, y: i32, w: i32, h: i32) -> UiRect {
 impl Ctx<'_> {
     /// Scale a logical rect to physical pixels.
     fn phys(&self, r: UiRect) -> UiRect {
-        UiRect::new(
-            r.x * self.s,
-            r.y * self.s,
-            (r.w as i32 * self.s) as u32,
-            (r.h as i32 * self.s) as u32,
-        )
+        logical_rect_to_physical(r, self.s)
     }
 
     /// Intersect a logical rect with the viewport; `None` when nothing
@@ -3434,44 +3730,46 @@ fn hud(ctx: &mut Ctx) {
         if hud.attack_cooldown < 1.0 { ctx.progress(lr(cx-45,h/2+8,90,4),hud.attack_cooldown.clamp(0.0,1.0),pal::TEXT,UiColor::rgb(35,35,35),pal::BUTTON_BORDER); }
     }
 
-    // Hotbar: offhand + 9 slots.
-    let slot = 22;
-    let hw = 9 * slot;
-    let hx = cx - (hw + slot + 4) / 2;
-    let hy = h - slot - 4;
+    // Hotbar: offhand + 9 slots, all positioned from the shared logical
+    // geometry consumed by hit/overlay reservations and downstream renderers.
+    let hotbar_layout = HotbarLayout::new(w, h);
+    let hotbar_panel = hotbar_layout.panel_rect();
+    let hotbar_block = hotbar_layout.occupied_rect();
+    let hx = hotbar_block.x;
+    let hy = hotbar_layout.y0();
     if show_hotbar {
-        let hotbar_x = hx + slot + 4;
-        let _hotbar_skinned = ctx.hud_sprite(hud_sprite_ids::HOTBAR, hotbar_x, hy, hw, slot);
+        let _hotbar_skinned = ctx.hud_sprite(
+            hud_sprite_ids::HOTBAR,
+            hotbar_panel.x,
+            hotbar_panel.y,
+            hotbar_panel.w as i32,
+            hotbar_panel.h as i32,
+        );
+        let offhand = hotbar_layout.offhand_rect();
         if let Some(item) = &hud.offhand {
-            slot_cell(ctx, hx, hy, Some(item), false);
+            slot_cell(ctx, offhand.x, offhand.y, Some(item), false);
             if let Some(frac) = hud.item_cooldowns.get(item) {
-                slot_cooldown_wipe(ctx, hx, hy, *frac);
+                slot_cooldown_wipe(ctx, offhand.x, offhand.y, *frac);
             }
         }
         for (i, item) in hud.hotbar.iter().enumerate() {
-            let sx = hx + slot + 4 + i as i32 * slot;
-            slot_cell(ctx, sx, hy, item.as_ref(), i == hud.selected_slot);
+            let slot = hotbar_layout.slot_rect(i);
+            slot_cell(ctx, slot.x, slot.y, item.as_ref(), i == hud.selected_slot);
             if let Some(frac) = item.as_ref().and_then(|n| hud.item_cooldowns.get(n)) {
-                slot_cooldown_wipe(ctx, sx, hy, *frac);
+                slot_cooldown_wipe(ctx, slot.x, slot.y, *frac);
             }
         }
     }
 
     // Vitals: hearts left, hunger right, above the hotbar.
-    let hx0 = hx + slot + 4;
-    let vy = hy - 12;
-    let rx = hx0 + hw;
+    let vitals = HudVitalsGeometry::new(hud, hotbar_layout);
+    let rx = vitals.right_x;
     if show_vitals {
         // Dynamic max-health rows: each vanilla row carries at most twenty
         // half-heart units and additional rows stack upward. Status effects
         // and hardcore swap only the fill sprites; the backing container row
         // remains shared exactly like vanilla.
-        let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
-            hud.max_health
-        } else {
-            20.0
-        };
-        let health_rows = (max_health / 20.0).ceil() as i32;
+        let max_health = normalized_max_health(hud.max_health);
         let mut style = if hud.hardcore {
             HeartStyle::Hardcore
         } else {
@@ -3507,15 +3805,13 @@ fn hud(ctx: &mut Ctx) {
             HeartStyle::Withered => UiColor::rgb(52, 48, 48),
             HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
         };
-        for row in 0..health_rows {
+        for row in 0..vitals.health_rows {
             let base = row as f32 * 20.0;
             let row_value = (hud.health - base).clamp(0.0, 20.0);
             let row_max = (max_health - base).clamp(0.0, 20.0).max(1.0);
             sprite_icon_row(
                 ctx,
-                hx0,
-                vy - row * 10,
-                false,
+                vitals.health_row(row),
                 row_value,
                 row_max,
                 heart_color,
@@ -3524,12 +3820,9 @@ fn hud(ctx: &mut Ctx) {
                 heart_half,
             );
         }
-        let armor_y = vy - health_rows * 10;
         sprite_icon_row(
             ctx,
-            hx0,
-            armor_y,
-            false,
+            vitals.armor_row(),
             hud.armor as f32,
             20.0,
             pal::ARMOR,
@@ -3537,12 +3830,10 @@ fn hud(ctx: &mut Ctx) {
             hud_sprite_ids::ARMOR_FULL,
             hud_sprite_ids::ARMOR_HALF,
         );
-        if hud.absorption > 0.0 {
+        if let Some(absorption_row) = vitals.absorption_row() {
             sprite_icon_row(
                 ctx,
-                hx0,
-                armor_y - 10,
-                false,
+                absorption_row,
                 hud.absorption,
                 20.0,
                 pal::ABSORPTION,
@@ -3553,9 +3844,7 @@ fn hud(ctx: &mut Ctx) {
         }
         sprite_icon_row(
             ctx,
-            rx,
-            vy,
-            true,
+            vitals.hunger_row(),
             hud.hunger as f32,
             20.0,
             pal::HUNGER,
@@ -3563,18 +3852,14 @@ fn hud(ctx: &mut Ctx) {
             hud_sprite_ids::FOOD_FULL,
             hud_sprite_ids::FOOD_HALF,
         );
-        let mut right_row_y = vy - 10;
         if let Some((health, max)) = hud.mount_health {
             let max_hp = max.max(1.0);
-            let rows = ((max_hp / 20.0).ceil() as i32).clamp(1, 3);
-            for row in 0..rows {
+            for row in 0..vitals.mount_rows {
                 let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
                 let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
                 sprite_icon_row(
                     ctx,
-                    rx,
-                    right_row_y,
-                    true,
+                    vitals.mount_row(row),
                     row_hp,
                     row_max,
                     pal::HEALTH,
@@ -3582,14 +3867,13 @@ fn hud(ctx: &mut Ctx) {
                     "hud/heart/vehicle_full",
                     "hud/heart/vehicle_half",
                 );
-                right_row_y -= 10;
             }
         }
-        if hud.air < 300 {
+        if let Some(air_row) = vitals.air_row() {
             // Vanilla air bubbles are discrete sprites rather than empty
             // containers; one bubble is thirty supply units.
-            if !air_bubble_sprites(ctx, rx, right_row_y, hud.air) {
-                icon_row_r(ctx, rx, right_row_y, hud.air as f32 / 15.0, 20.0, pal::AIR);
+            if !air_bubble_sprites(ctx, air_row, hud.air) {
+                procedural_icon_row(ctx, air_row, hud.air as f32 / 15.0, 20.0, pal::AIR);
             }
         }
 
@@ -3633,27 +3917,18 @@ fn hud(ctx: &mut Ctx) {
     //   * the crafting-conflict button and the Compact Debug HUD box stack above
     //     whatever came before (or drop lines that cannot fit).
     // ------------------------------------------------------------------
-    let hotbar_top = hy - 4;
+    let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
     // Hearts/armor/(absorption) column left, hunger/(air) column right —
     // empty ranges while creative/spectator keeps the rows undrawn so no
     // overlay ever lifts for invisible chrome.
     let (vl, vr) = if show_vitals {
-        (hx0..(hx0 + 80), (rx - 80)..rx)
+        vitals.column_ranges()
     } else {
         (0..0, 0..0)
     };
-    let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
-        hud.max_health
-    } else {
-        20.0
-    };
-    let health_rows = (max_health / 20.0).ceil() as i32;
-    let vtop_l = vy - health_rows * 10 - if hud.absorption > 0.0 { 10 } else { 0 };
-    let mount_rows = hud
-        .mount_health
-        .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
-        .unwrap_or(0);
-    let vtop_r = vy - mount_rows * 10 - if hud.air < 300 { 10 } else { 0 };
+    let vtop_l = vitals.left_top();
+    let vtop_r = vitals.right_top();
+    let vitals_bottom = vitals.bottom();
 
     // Actionbar: one centered line in the band directly above the vitals.
     let abar = if hud.actionbar.is_empty() {
@@ -3706,10 +3981,10 @@ fn hud(ctx: &mut Ctx) {
         // above that column — the label is never cut by an icon.
         for (i, (label, y)) in rows.iter().enumerate() {
             let rw = text_width(label, 1) as i32 + 6;
-            if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
+            if w - 4 - rw < vr.end && *y < vitals_bottom && *y + 10 > vtop_r {
                 sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
             }
-            if w - 4 - rw < vl.end && *y < vy + 8 && *y + 10 > vtop_l {
+            if w - 4 - rw < vl.end && *y < vitals_bottom && *y + 10 > vtop_l {
                 sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
             }
         }
@@ -3800,7 +4075,7 @@ fn hud(ctx: &mut Ctx) {
         let y = hy - 12 - i as i32 * 10;
         let (band_top, band_bot) = (y - 1, y + 9);
         let mut cells = ((w - 14) / 8).max(0) as usize;
-        if band_top < vy + 8 && band_bot > vtop_l {
+        if band_top < vitals_bottom && band_bot > vtop_l {
             cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
         }
         if let Some(ab) = &abar {
@@ -4705,43 +4980,46 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
         // the same creative/spectator gates `hud()` applies to the draw.
         let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
         let show_hotbar = hud.game_mode != 3;
-        let slot = 22;
-        let hw = 9 * slot;
-        let hx = cx - (hw + slot + 4) / 2;
-        let hy = h - slot - 4;
-        let hotbar_top = hy - 4;
-        let hx0 = hx + slot + 4;
-        let vy = hy - 12;
-        let rx = hx0 + hw;
+        let hotbar_layout = HotbarLayout::new(w, h);
+        let hotbar_block = hotbar_layout.occupied_rect();
+        let hy = hotbar_layout.y0();
+        let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
+        let vitals = HudVitalsGeometry::new(hud, hotbar_layout);
         // Empty ranges while the rows are gated off — the lift/clip math
         // below then no-ops exactly like the invisible chrome it models.
         let (vl, vr) = if show_vitals {
-            (hx0..(hx0 + 80), (rx - 80)..rx)
+            vitals.column_ranges()
         } else {
             (0..0, 0..0)
         };
-        let max_health = if hud.max_health.is_finite() && hud.max_health > 0.0 {
-            hud.max_health
-        } else {
-            20.0
-        };
-        let health_rows = (max_health / 20.0).ceil() as i32;
-        let vtop_l = vy - health_rows * 10 - if hud.absorption > 0.0 { 10 } else { 0 };
-        let mount_rows = hud
-            .mount_health
-            .map(|(_, max)| ((max.max(1.0) / 20.0).ceil() as i32).clamp(1, 3))
-            .unwrap_or(0);
-        let vtop_r = vy - mount_rows * 10 - if hud.air < 300 { 10 } else { 0 };
+        let vtop_l = vitals.left_top();
+        let vtop_r = vitals.right_top();
+        let vitals_bottom = vitals.bottom();
         if show_hotbar {
-            add(hx, hy, slot + 4 + hw, slot);
+            add(
+                hotbar_block.x,
+                hotbar_block.y,
+                hotbar_block.w as i32,
+                hotbar_block.h as i32,
+            );
         }
         if show_vitals {
             add(cx - 91, hy - 4, 182, 3);
             if hud.xp_level > 0 {
                 add(cx - 24, hy - 14, 48, 8);
             }
-            add(vl.start, vtop_l, 80, vy + 8 - vtop_l);
-            add(vr.start, vtop_r, 80, vy + 8 - vtop_r);
+            add(
+                vl.start,
+                vtop_l,
+                VitalRow::OCCUPIED_WIDTH,
+                vitals_bottom - vtop_l,
+            );
+            add(
+                vr.start,
+                vtop_r,
+                VitalRow::OCCUPIED_WIDTH,
+                vitals_bottom - vtop_r,
+            );
         }
 
         // Actionbar: centered band directly above the vitals.
@@ -4785,10 +5063,10 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             let mut rows = build_rows(sub_base);
             for (i, (label, y)) in rows.iter().enumerate() {
                 let rw = text_width(label, 1) as i32 + 6;
-                if w - 4 - rw < vr.end && *y < vy + 8 && *y + 10 > vtop_r {
+                if w - 4 - rw < vr.end && *y < vitals_bottom && *y + 10 > vtop_r {
                     sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
                 }
-                if w - 4 - rw < vl.end && *y < vy + 8 && *y + 10 > vtop_l {
+                if w - 4 - rw < vl.end && *y < vitals_bottom && *y + 10 > vtop_l {
                     sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
                 }
             }
@@ -4862,7 +5140,7 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             let y = hy - 12 - i as i32 * 10;
             let (band_top, band_bot) = (y - 1, y + 9);
             let mut cells = ((w - 14) / 8).max(0) as usize;
-            if band_top < vy + 8 && band_bot > vtop_l {
+            if band_top < vitals_bottom && band_bot > vtop_l {
                 cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
             }
             if let Some(ab) = &abar {
@@ -4939,26 +5217,22 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     }
 
     for rect in rects.iter_mut() {
-        *rect = UiRect::new(
-            rect.x * s,
-            rect.y * s,
-            (rect.w as i32 * s).max(0) as u32,
-            (rect.h as i32 * s).max(0) as u32,
-        );
+        *rect = logical_rect_to_physical(*rect, s);
     }
 }
 
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
+    let slot = HotbarLayout::SLOT_PITCH;
     let hotbar_frame = ctx
         .gui_atlas
         .is_some_and(|atlas| atlas.has_named_sprite(hud_sprite_ids::HOTBAR));
     if !hotbar_frame {
-        ctx.fill(x, y, 22, 22, pal::SLOT);
+        ctx.fill(x, y, slot, slot, pal::SLOT);
         ctx.border(
             x,
             y,
-            22,
-            22,
+            slot,
+            slot,
             if selected {
                 pal::BUTTON_BORDER_HOVER
             } else {
@@ -4966,9 +5240,15 @@ fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: boo
             },
         );
     } else if selected
-        && !ctx.hud_sprite(hud_sprite_ids::HOTBAR_SELECTION, x - 1, y - 1, 24, 24)
+        && !ctx.hud_sprite(
+            hud_sprite_ids::HOTBAR_SELECTION,
+            x - 1,
+            y - 1,
+            slot + 2,
+            slot + 2,
+        )
     {
-        ctx.border(x, y, 22, 22, pal::BUTTON_BORDER_HOVER);
+        ctx.border(x, y, slot, slot, pal::BUTTON_BORDER_HOVER);
     }
     if let Some(name) = item {
         // Two cells max: three glyphs would spill into the next slot.
@@ -4999,7 +5279,7 @@ fn slot_cooldown_wipe(ctx: &mut Ctx, x: i32, y: i32, frac: f32) {
 /// container row. `air` uses vanilla supply units (300 = ten bubbles of
 /// 30). Returns `false` when the host atlas has no bubble sprite so the
 /// caller can keep its procedural fallback.
-fn air_bubble_sprites(ctx: &mut Ctx, right: i32, y: i32, air: u16) -> bool {
+fn air_bubble_sprites(ctx: &mut Ctx, row: VitalRow, air: u16) -> bool {
     if !ctx
         .gui_atlas
         .is_some_and(|atlas| atlas.has_named_sprite(hud_sprite_ids::AIR))
@@ -5007,7 +5287,7 @@ fn air_bubble_sprites(ctx: &mut Ctx, right: i32, y: i32, air: u16) -> bool {
         return false;
     }
     let air = i32::from(air).clamp(0, 300);
-    for i in 0..10 {
+    for i in 0..VitalRow::MAX_ICONS {
         let remaining = air - i * 30;
         if remaining <= 0 {
             continue;
@@ -5021,7 +5301,8 @@ fn air_bubble_sprites(ctx: &mut Ctx, right: i32, y: i32, air: u16) -> bool {
         } else {
             hud_sprite_ids::AIR
         };
-        ctx.hud_sprite(key, right - 8 - i * 8, y, 9, 9);
+        let rect = row.sprite_rect(i as usize);
+        ctx.hud_sprite(key, rect.x, rect.y, rect.w as i32, rect.h as i32);
     }
     true
 }
@@ -5032,9 +5313,7 @@ fn air_bubble_sprites(ctx: &mut Ctx, right: i32, y: i32, air: u16) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn sprite_icon_row(
     ctx: &mut Ctx,
-    x: i32,
-    y: i32,
-    right_aligned: bool,
+    row: VitalRow,
     value: f32,
     max: f32,
     color: UiColor,
@@ -5043,59 +5322,51 @@ fn sprite_icon_row(
     half: &str,
 ) -> bool {
     let available = ctx.gui_atlas.is_some_and(|atlas| {
-        atlas.has_named_sprite(empty) && atlas.has_named_sprite(full) && atlas.has_named_sprite(half)
+        atlas.has_named_sprite(empty)
+            && atlas.has_named_sprite(full)
+            && atlas.has_named_sprite(half)
     });
     if !available {
-        if right_aligned {
-            icon_row_r(ctx, x, y, value, max, color);
-        } else {
-            icon_row(ctx, x, y, value, max, color);
-        }
+        procedural_icon_row(ctx, row, value, max, color);
         return false;
     }
-    let icons = ((max / 2.0).ceil() as i32).clamp(0, 10);
+    let icons = ((max / 2.0).ceil() as i32).clamp(0, VitalRow::MAX_ICONS);
     for i in 0..icons {
-        let cx = if right_aligned { x - 8 - i * 8 } else { x + i * 8 };
+        let rect = row.sprite_rect(i as usize);
         let units = (value - i as f32 * 2.0).clamp(0.0, 2.0);
-        ctx.hud_sprite(empty, cx, y, 9, 9);
+        ctx.hud_sprite(empty, rect.x, rect.y, rect.w as i32, rect.h as i32);
         if units >= 2.0 {
-            ctx.hud_sprite(full, cx, y, 9, 9);
+            ctx.hud_sprite(full, rect.x, rect.y, rect.w as i32, rect.h as i32);
         } else if units >= 1.0 {
-            ctx.hud_sprite(half, cx, y, 9, 9);
+            ctx.hud_sprite(half, rect.x, rect.y, rect.w as i32, rect.h as i32);
         }
     }
     true
 }
 
-/// `count`-icon row of 8px cells (half-unit granularity like vanilla
-/// hearts): `value`/`max` in half units.
-fn icon_row(ctx: &mut Ctx, x: i32, y: i32, value: f32, max: f32, color: UiColor) {
-    let icons = ((max / 2.0).ceil() as i32).clamp(0, 10);
+/// Procedural row of 8 px vital cells (half-unit granularity like vanilla
+/// hearts): `value`/`max` in half units. This is the single fallback shared
+/// by health, armor, absorption, hunger, mount health, and air.
+fn procedural_icon_row(ctx: &mut Ctx, row: VitalRow, value: f32, max: f32, color: UiColor) {
+    let icons = ((max / 2.0).ceil() as i32).clamp(0, VitalRow::MAX_ICONS);
     for i in 0..icons {
-        let cx = x + i * 8;
-        ctx.fill(cx, y, 8, 8, UiColor::rgb(26, 26, 30));
+        let cell = row.cell_rect(i as usize);
+        ctx.fill(
+            cell.x,
+            cell.y,
+            cell.w as i32,
+            cell.h as i32,
+            UiColor::rgb(26, 26, 30),
+        );
         let units = (value - i as f32 * 2.0).clamp(0.0, 2.0) / 2.0;
         if units > 0.0 {
-            ctx.fill(cx, y, (8.0 * units) as i32, 8, color);
-        }
-    }
-}
-
-/// Right-aligned variant of [`icon_row`].
-fn icon_row_r(ctx: &mut Ctx, right: i32, y: i32, value: f32, max: f32, color: UiColor) {
-    let icons = ((max / 2.0).ceil() as i32).clamp(0, 10);
-    for i in 0..icons {
-        let cx = right - 8 - i * 8;
-        ctx.fill(cx, y, 8, 8, UiColor::rgb(26, 26, 30));
-        let units = (value - i as f32 * 2.0).clamp(0.0, 2.0) / 2.0;
-        if units > 0.0 {
-            ctx.fill(
-                cx + 8 - (8.0 * units) as i32,
-                y,
-                (8.0 * units) as i32,
-                8,
-                color,
-            );
+            let fill_w = (VitalRow::CELL_SIZE as f32 * units) as i32;
+            let fill_x = if row.is_right_aligned() {
+                cell.x + VitalRow::CELL_SIZE - fill_w
+            } else {
+                cell.x
+            };
+            ctx.fill(fill_x, cell.y, fill_w, VitalRow::CELL_SIZE, color);
         }
     }
 }
@@ -5524,6 +5795,131 @@ mod tests {
             UiCommand::FillRect { rect, .. } | UiCommand::BorderRect { rect, .. } => Some(*rect),
             _ => None,
         }
+    }
+
+    fn hotbar_geometry_state(requested_scale: u8) -> UiState {
+        let mut state = UiState::default();
+        state.screen = Screen::InGameHud;
+        state.ui_scale = requested_scale;
+        state.hud.offhand = Some("Shield".to_string());
+        state
+    }
+
+    #[test]
+    fn hotbar_layout_uses_one_pitch_origin_for_slots_and_offhand() {
+        let layout = HotbarLayout::new(266, 200);
+        assert_eq!(layout.occupied_rect(), UiRect::new(21, 174, 224, 22));
+        assert_eq!(layout.panel_rect(), UiRect::new(47, 174, 198, 22));
+        assert_eq!(layout.offhand_rect(), UiRect::new(21, 174, 22, 22));
+        for index in 0..HotbarLayout::SLOT_COUNT {
+            assert_eq!(
+                layout.slot_rect(index),
+                UiRect::new(
+                    layout.x0() + HotbarLayout::SLOT_PITCH * index as i32,
+                    layout.y0(),
+                    22,
+                    22,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn vital_row_preserves_vanilla_pitch_and_right_anchor() {
+        let left = VitalRow::left(40, 90);
+        assert_eq!(left.cell_rect(0), UiRect::new(40, 90, 8, 8));
+        assert_eq!(left.cell_rect(9), UiRect::new(112, 90, 8, 8));
+        assert_eq!(left.sprite_rect(1), UiRect::new(48, 90, 9, 9));
+
+        let right = VitalRow::right(160, 90);
+        assert_eq!(right.cell_rect(0), UiRect::new(152, 90, 8, 8));
+        assert_eq!(right.cell_rect(9), UiRect::new(80, 90, 8, 8));
+        assert_eq!(right.sprite_rect(1), UiRect::new(144, 90, 9, 9));
+    }
+
+    #[test]
+    fn hotbar_layout_matches_hud_slots_and_occupied_rect_at_all_scales() {
+        for (width, height) in [(1024u32, 768u32), (800, 600)] {
+            for requested_scale in 1..=4u8 {
+                let state = hotbar_geometry_state(requested_scale);
+                let scale = layout_scale(&state, width, height);
+                let logical_w = width as i32 / scale;
+                let logical_h = height as i32 / scale;
+                let layout = HotbarLayout::new(logical_w, logical_h);
+
+                let (draw, _) = layout_screen(&state, width, height);
+                let mut slot_rects: Vec<UiRect> = draw
+                    .commands
+                    .iter()
+                    .filter_map(|cmd| match cmd {
+                        UiCommand::FillRect { rect, color } if *color == pal::SLOT => Some(*rect),
+                        _ => None,
+                    })
+                    .collect();
+                slot_rects.sort_by_key(|rect| (rect.x, rect.y));
+                let expected_slots: Vec<UiRect> = std::iter::once(layout.offhand_rect())
+                    .chain((0..HotbarLayout::SLOT_COUNT).map(|i| layout.slot_rect(i)))
+                    .map(|rect| logical_rect_to_physical(rect, scale))
+                    .collect();
+                assert_eq!(
+                    slot_rects, expected_slots,
+                    "hotbar slots diverged at {width}x{height}, requested scale {requested_scale}, effective scale {scale}",
+                );
+
+                let occupied = hud_occupied_rects(&state, width, height);
+                let expected_block = logical_rect_to_physical(layout.occupied_rect(), scale);
+                assert!(
+                    occupied.contains(&expected_block),
+                    "occupied reservation missing {expected_block:?} at {width}x{height}, requested scale {requested_scale}, effective scale {scale}: {occupied:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hotbar_layout_panel_rect_matches_textured_hud_blit() {
+        let (width, height) = (800u32, 600u32);
+        let state = hotbar_geometry_state(4);
+        let scale = layout_scale(&state, width, height);
+        let logical = HotbarLayout::new(width as i32 / scale, height as i32 / scale);
+        let expected = logical_rect_to_physical(logical.panel_rect(), scale);
+
+        let mut atlas = GuiSpriteAtlas::from_packed(1, 1, vec![0, 0, 0, 255], Vec::new());
+        atlas.insert_named_sprite(
+            hud_sprite_ids::HOTBAR,
+            crate::draw::GuiSpriteEntry {
+                uv_min: [0.0, 0.0],
+                uv_max: [1.0, 1.0],
+                width: HotbarLayout::HOTBAR_WIDTH as u32,
+                height: HotbarLayout::SLOT_PITCH as u32,
+                nine_slice_border: [0, 0, 0, 0],
+            },
+        );
+        let mut draw = UiDrawList::new();
+        let mut regions = Vec::new();
+        layout_screen_into_with_gui_atlas(
+            &state,
+            width,
+            height,
+            &mut draw,
+            &mut regions,
+            Some(&atlas),
+        );
+        let matches = draw
+            .commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    UiCommand::ItemIcon { rect, item_id }
+                        if *rect == expected && item_id.starts_with("@gui_uv:")
+                )
+            })
+            .count();
+        assert_eq!(
+            matches, 1,
+            "textured hotbar panel rect mismatch: {expected:?}"
+        );
     }
 
     #[test]
