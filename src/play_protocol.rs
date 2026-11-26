@@ -5569,10 +5569,13 @@ fn damage_type_wire_ids_from_config(config: &[(i64, Vec<u8>)]) -> HashMap<String
     };
     entries
         .into_iter()
+        .take(MAX_DAMAGE_TYPE_WIRE_IDS)
         .enumerate()
         .map(|(index, (name, _))| (name.to_string(), index as i32))
         .collect()
 }
+
+const MAX_DAMAGE_TYPE_WIRE_IDS: usize = 4096;
 
 fn damage_type_wire_ids() -> &'static HashMap<String, i32> {
     static IDS: OnceLock<HashMap<String, i32>> = OnceLock::new();
