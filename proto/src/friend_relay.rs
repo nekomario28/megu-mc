@@ -188,8 +188,9 @@ impl InviteCode {
 
     fn from_value(value: u64) -> Self {
         debug_assert!(value < (1 << 40));
+        let [_, _, _, a, b, c, d, e] = value.to_be_bytes();
         Self {
-            bytes: (value << 24).to_be_bytes()[..5].try_into().unwrap(),
+            bytes: [a, b, c, d, e],
         }
     }
 
@@ -266,8 +267,8 @@ impl fmt::Display for InviteCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let d = self.digits();
         // The alphabet is pure ASCII, so both halves are valid UTF-8.
-        let hi = std::str::from_utf8(&d[..4]).unwrap();
-        let lo = std::str::from_utf8(&d[4..]).unwrap();
+        let hi = std::str::from_utf8(&d[..4]).map_err(|_| fmt::Error)?;
+        let lo = std::str::from_utf8(&d[4..]).map_err(|_| fmt::Error)?;
         write!(f, "{INVITE_CODE_PREFIX}-{hi}-{lo}")
     }
 }
@@ -536,7 +537,7 @@ pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
     }
     let packet = match r.read_u8()? {
         TAG_RELAY_HELLO => FriendPacket::RelayHello {
-            nonce: r.take(16)?.try_into().unwrap(),
+            nonce: r.read_array()?,
         },
         TAG_HOST_REGISTER => FriendPacket::HostRegister {
             protocol_version: r.read_i32()?,
@@ -545,17 +546,17 @@ pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
             session_key: r.read_uuid()?,
         },
         TAG_HOST_REGISTERED => FriendPacket::HostRegistered {
-            invite_code: InviteCode::from_bytes(r.take(5)?.try_into().unwrap()),
+            invite_code: InviteCode::from_bytes(r.read_array()?),
         },
         TAG_HOST_REVOKE => FriendPacket::HostRevoke {
-            invite_code: InviteCode::from_bytes(r.take(5)?.try_into().unwrap()),
-            mac: r.take(32)?.try_into().unwrap(),
+            invite_code: InviteCode::from_bytes(r.read_array()?),
+            mac: r.read_array()?,
         },
         TAG_HOST_REVOKED => FriendPacket::HostRevoked { ok: r.read_bool()? },
         TAG_GUEST_JOIN => FriendPacket::GuestJoin {
-            key_id: r.take(8)?.try_into().unwrap(),
+            key_id: r.read_array()?,
             guest_name: r.read_string(MAX_FRL2_STRING_CHARS)?,
-            tag: r.take(32)?.try_into().unwrap(),
+            tag: r.read_array()?,
         },
         TAG_GUEST_ACCEPTED => FriendPacket::GuestAccepted {
             stream_id: r.read_u32()?,
@@ -602,10 +603,10 @@ pub fn decode_packet(body: &[u8]) -> Result<FriendPacket, ProtoError> {
 /// an oversized or degenerate prefix is an error immediately — fail closed
 /// on the 4-byte header alone.
 fn next_frame_len(inbuf: &[u8]) -> Result<Option<usize>, ProtoError> {
-    if inbuf.len() < 4 {
+    let Some(prefix) = inbuf.first_chunk() else {
         return Ok(None);
-    }
-    let len = u32::from_be_bytes(inbuf[..4].try_into().unwrap()) as usize;
+    };
+    let len = u32::from_be_bytes(*prefix) as usize;
     if !(MIN_FRL2_BODY_BYTES..=MAX_FRL2_FRAME_BYTES).contains(&len) {
         return Err(ProtoError::FrameTooLarge {
             length: len,

@@ -148,7 +148,7 @@ pub enum ClientCustomChannelEvent {
 }
 
 fn magic_f32(reader: &mut WireReader<'_>) -> Result<f32, String> {
-    let value = f32::from_le_bytes(reader.take(4)?.try_into().unwrap());
+    let value = f32::from_le_bytes(reader.read_array()?);
     if !value.is_finite() {
         return Err("non-finite MAG1 float".to_string());
     }
@@ -264,7 +264,7 @@ pub fn decode_motion_trigger_payload(payload: &[u8]) -> Result<DecodedMotionTrig
     }
     let mut reader = WireReader::new(&payload[4..]);
     let entity_id = reader.read_u64()?;
-    let action_id = u32::from_be_bytes(reader.take(4)?.try_into().unwrap());
+    let action_id = reader.read_u32()?;
     let combo_index = reader.read_u16()?;
     let hand = match reader.read_u8()? {
         0 => DecodedMotionHand::MainHand,
@@ -275,7 +275,7 @@ pub fn decode_motion_trigger_payload(payload: &[u8]) -> Result<DecodedMotionTrig
     if !speed_multiplier.is_finite() || !(0.25..=4.0).contains(&speed_multiplier) {
         return Err("invalid MOT1 speed".to_string());
     }
-    let elapsed_ticks = u32::from_be_bytes(reader.take(4)?.try_into().unwrap());
+    let elapsed_ticks = reader.read_u32()?;
     let phase = match reader.read_u8()? {
         0 => DecodedMotionPhase::Idle,
         1 => DecodedMotionPhase::Anticipation,
@@ -315,8 +315,8 @@ pub fn decode_season_sync_payload(payload: &[u8]) -> Result<SeasonWireSync, Stri
     let progress_in_sub_season = f32::from(reader.read_u16()?) / 65535.0;
     let day_of_season = reader.read_u16()?;
     let daylight_fraction = f32::from(reader.read_u16()?) / 65535.0;
-    let foliage_rgb: [u8; 3] = reader.take(3)?.try_into().unwrap();
-    let grass_rgb: [u8; 3] = reader.take(3)?.try_into().unwrap();
+    let foliage_rgb = reader.read_array()?;
+    let grass_rgb = reader.read_array()?;
     let flags = reader.read_u8()?;
     if flags & !SSN1_FLAG_KNOWN_MASK != 0 {
         return Err("SSN1 unknown flag bits".to_string());
@@ -479,8 +479,20 @@ impl<'a> WireReader<'a> {
         Ok(slice)
     }
 
+    fn read_array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let bytes = self.rest().first_chunk().ok_or_else(|| {
+            format!(
+                "truncated wire field: needed {N} bytes, {} remaining",
+                self.remaining()
+            )
+        })?;
+        self.pos += N;
+        Ok(*bytes)
+    }
+
     pub fn read_u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+        let [byte] = self.read_array()?;
+        Ok(byte)
     }
 
     pub fn read_i8(&mut self) -> Result<i8, String> {
@@ -492,31 +504,35 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_i16(&mut self) -> Result<i16, String> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_i32(&mut self) -> Result<i32, String> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.read_array()?))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_i64(&mut self) -> Result<i64, String> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_f32(&mut self) -> Result<f32, String> {
-        Ok(f32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(f32::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_f64(&mut self) -> Result<f64, String> {
-        Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(f64::from_be_bytes(self.read_array()?))
     }
 
     /// Delegated to `megu_core`'s canonical reader — identical bounds
@@ -618,7 +634,7 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_uuid(&mut self) -> Result<[u8; 16], String> {
-        Ok(self.take(16)?.try_into().unwrap())
+        self.read_array()
     }
 
     pub fn read_position(&mut self) -> Result<[i32; 3], String> {
@@ -4578,7 +4594,7 @@ fn decode_chat_play_event(name: &str, r: &mut WireReader<'_>) -> Result<Option<P
                 return Err("negative delete-chat index".into());
             }
             if encoded_index == 0 {
-                let signature = r.take(256)?.try_into().unwrap();
+                let signature = r.read_array()?;
                 PlayEvent::DeleteChat {
                     message_index: None,
                     signature: Some(signature),
@@ -4607,7 +4623,7 @@ fn decode_chat_play_event(name: &str, r: &mut WireReader<'_>) -> Result<Option<P
             let sender = r.read_uuid()?;
             let index = r.read_varint()?;
             let signature = if r.read_bool()? {
-                Some(r.take(256)?.try_into().unwrap())
+                Some(r.read_array()?)
             } else {
                 None
             };
@@ -7372,6 +7388,18 @@ fn json_value_from_core(value: megu_core::json::JsonValue) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_fixed_width_read_preserves_cursor() {
+        let mut reader = WireReader::new(&[0xff, 0x12, 0x34]);
+        assert_eq!(reader.read_u8().unwrap(), 0xff);
+        assert_eq!(
+            reader.read_uuid().unwrap_err(),
+            "truncated wire field: needed 16 bytes, 2 remaining"
+        );
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.remaining(), 0);
+    }
 
     fn ssn1_frame(sub_season_idx: u8, flags: u8) -> Vec<u8> {
         let mut frame = Vec::with_capacity(SSN1_FRAME_LEN);

@@ -1413,11 +1413,8 @@ impl ClaimsWorld {
         sub: &SubClaimId,
     ) -> &mut ClaimProtectionConfig {
         let key = (player_key(owner_uuid), sub.as_str().to_owned());
-        if !self.configs.contains_key(&key) {
-            let seed = self.effective_config(&key.0, &key.1);
-            self.configs.insert(key.clone(), seed);
-        }
-        self.configs.get_mut(&key).unwrap()
+        let seed = self.effective_config(&key.0, &key.1);
+        self.configs.entry(key).or_insert(seed)
     }
 
     fn effective_config(&self, okey: &str, sub: &str) -> ClaimProtectionConfig {
@@ -1611,7 +1608,7 @@ impl ClaimsWorld {
             }
         }
         let updated = {
-            let claim = self.claims.get_mut(key).unwrap();
+            let claim = self.claims.get_mut(key).ok_or(ClaimsError::NotClaimed)?;
             claim.forceloaded = enabled;
             claim.clone()
         };
@@ -1639,14 +1636,11 @@ impl ClaimsWorld {
             .collect();
         let ekey = format!("expired:{owner_uuid}");
         for key in &targets {
-            let sub = self.claims[key].sub_claim.clone();
-            self.index_remove(&pkey, &sub, key);
-            let updated = {
-                let claim = self.claims.get_mut(key).unwrap();
-                claim.owner = ClaimOwner::Expired(owner_uuid.to_owned());
-                claim.clone()
-            };
-            self.index_insert(&ekey, &sub, key.clone());
+            let claim = self.claims.get_mut(key).ok_or(ClaimsError::NotClaimed)?;
+            claim.owner = ClaimOwner::Expired(owner_uuid.to_owned());
+            let updated = claim.clone();
+            self.index_remove(&pkey, &updated.sub_claim, key);
+            self.index_insert(&ekey, &updated.sub_claim, key.clone());
             self.emit(key.clone(), Some(updated));
         }
         Ok(targets.len())
@@ -1999,7 +1993,7 @@ impl ClaimsWorld {
         if self.member_party.contains_key(target_uuid) {
             return Err(ClaimsError::AlreadyInParty);
         }
-        let party = self.parties.get_mut(&pid).unwrap();
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
         if !party.pending_invites.insert(target_uuid.to_owned()) {
             return Err(ClaimsError::AlreadyInvited);
         }
@@ -2036,8 +2030,10 @@ impl ClaimsWorld {
                 .map(|(id, _)| id.clone())
                 .ok_or(ClaimsError::NotInvited)?,
         };
-        let party = self.parties.get_mut(&pid).unwrap();
-        party.pending_invites.remove(player_uuid);
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        if !party.pending_invites.remove(player_uuid) {
+            return Err(ClaimsError::NotInvited);
+        }
         party
             .members
             .insert(player_uuid.to_owned(), PartyRank::Member);
@@ -2060,30 +2056,25 @@ impl ClaimsWorld {
             .get(player_uuid)
             .cloned()
             .ok_or(ClaimsError::NotInParty)?;
-        let (is_empty, successor) = {
-            let party = self.parties.get_mut(&pid).unwrap();
-            party.members.remove(player_uuid);
-            let successor = if party.owner_uuid == player_uuid && !party.members.is_empty() {
-                party
-                    .members
-                    .iter()
-                    .max_by(|(ua, ra), (ub, rb)| {
-                        ra.level().cmp(&rb.level()).then(ub.cmp(ua))
-                    })
-                    .map(|(u, _)| u.clone())
-            } else {
-                None
-            };
-            (party.members.is_empty(), successor)
-        };
-        self.member_party.remove(player_uuid);
-        if is_empty {
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        party
+            .members
+            .remove(player_uuid)
+            .ok_or(ClaimsError::NotInParty)?;
+        if party.members.is_empty() {
             self.parties.remove(&pid);
-        } else if let Some(next) = successor {
-            let party = self.parties.get_mut(&pid).unwrap();
-            party.owner_uuid = next.clone();
-            party.members.insert(next, PartyRank::Owner);
+        } else if party.owner_uuid == player_uuid {
+            let successor = party
+                .members
+                .iter()
+                .max_by(|(ua, ra), (ub, rb)| ra.level().cmp(&rb.level()).then(ub.cmp(ua)))
+                .map(|(uuid, _)| uuid.clone());
+            if let Some(next) = successor {
+                party.owner_uuid = next.clone();
+                party.members.insert(next, PartyRank::Owner);
+            }
         }
+        self.member_party.remove(player_uuid);
         Ok(())
     }
 
@@ -2094,22 +2085,14 @@ impl ClaimsWorld {
             return Err(ClaimsError::InvalidTarget);
         }
         let pid = self.require_officer(actor_uuid)?;
-        let party = self.parties.get(&pid).unwrap();
-        let (actor_rank, target_rank) = (
-            party.rank_of(actor_uuid).unwrap(),
-            party
-                .rank_of(target_uuid)
-                .ok_or(ClaimsError::InvalidTarget)?,
-        );
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        let actor_rank = party.rank_of(actor_uuid).ok_or(ClaimsError::NotInParty)?;
+        let target_rank = party.rank_of(target_uuid).ok_or(ClaimsError::InvalidTarget)?;
         // Must strictly outrank the target, so the owner is un-kickable.
         if actor_rank.level() <= target_rank.level() {
             return Err(ClaimsError::InsufficientRank);
         }
-        self.parties
-            .get_mut(&pid)
-            .unwrap()
-            .members
-            .remove(target_uuid);
+        party.members.remove(target_uuid);
         self.member_party.remove(target_uuid);
         Ok(())
     }
@@ -2129,7 +2112,7 @@ impl ClaimsWorld {
             .get(actor_uuid)
             .cloned()
             .ok_or(ClaimsError::NotInParty)?;
-        let party = self.parties.get_mut(&pid).unwrap();
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
         if party.rank_of(actor_uuid) != Some(PartyRank::Owner) {
             return Err(ClaimsError::InsufficientRank);
         }
@@ -2152,7 +2135,8 @@ impl ClaimsWorld {
         if other == pid {
             return Err(ClaimsError::InvalidTarget);
         }
-        if !self.parties.get_mut(&pid).unwrap().allies.insert(other) {
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        if !party.allies.insert(other) {
             return Err(ClaimsError::AlreadyAllied);
         }
         Ok(())
@@ -2164,7 +2148,8 @@ impl ClaimsWorld {
         let other = self
             .find_party_id(other_party)
             .ok_or(ClaimsError::PartyNotFound)?;
-        if !self.parties.get_mut(&pid).unwrap().allies.remove(&other) {
+        let party = self.parties.get_mut(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        if !party.allies.remove(&other) {
             return Err(ClaimsError::NotAllied);
         }
         Ok(())
@@ -2200,7 +2185,8 @@ impl ClaimsWorld {
             .get(actor_uuid)
             .cloned()
             .ok_or(ClaimsError::NotInParty)?;
-        let rank = self.parties[&pid].rank_of(actor_uuid).unwrap();
+        let party = self.parties.get(&pid).ok_or(ClaimsError::PartyNotFound)?;
+        let rank = party.rank_of(actor_uuid).ok_or(ClaimsError::NotInParty)?;
         if !rank.at_least(min) {
             return Err(ClaimsError::InsufficientRank);
         }
@@ -3560,6 +3546,31 @@ mod tests {
             w.check_action(&a_home, None, ClaimAction::FluidFrom(b_home)),
             ClaimDecision::Allowed
         );
+    }
+
+    #[test]
+    fn stale_party_membership_cannot_authorize_mutations() {
+        let mut world = ClaimsWorld::new();
+        let (owner, stale_member, target) = (uuid(1), uuid(2), uuid(3));
+        let pid = world.create_party(&owner, "Alpha").unwrap();
+        world.member_party.insert(stale_member.clone(), pid.clone());
+
+        assert_eq!(
+            world.invite_player(&stale_member, &target),
+            Err(ClaimsError::NotInParty)
+        );
+        assert_eq!(
+            world.leave_party(&stale_member),
+            Err(ClaimsError::NotInParty)
+        );
+        assert!(world.parties[&pid].pending_invites.is_empty());
+
+        world.parties.remove(&pid);
+        assert_eq!(
+            world.kick_member(&owner, &target),
+            Err(ClaimsError::PartyNotFound)
+        );
+        assert_eq!(world.leave_party(&owner), Err(ClaimsError::PartyNotFound));
     }
 
     #[test]

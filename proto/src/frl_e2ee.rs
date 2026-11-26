@@ -315,10 +315,11 @@ fn fe_invert(x: &Fe) -> Fe {
 /// Load 32 little-endian bytes into five 51-bit limbs. The caller masks the
 /// top bit for X25519 u-coordinates.
 fn fe_from_bytes(b: &[u8; 32]) -> Fe {
-    let u0 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-    let u1 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-    let u2 = u64::from_le_bytes(b[16..24].try_into().unwrap());
-    let u3 = u64::from_le_bytes(b[24..32].try_into().unwrap());
+    let (words, _) = b.as_chunks::<8>();
+    let u0 = u64::from_le_bytes(words[0]);
+    let u1 = u64::from_le_bytes(words[1]);
+    let u2 = u64::from_le_bytes(words[2]);
+    let u3 = u64::from_le_bytes(words[3]);
     [
         u0 & MASK51,
         ((u0 >> 51) | (u1 << 13)) & MASK51,
@@ -444,12 +445,12 @@ fn chacha_qr(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
 pub(crate) fn chacha20_block(key: &[u8; 32], counter: u32, nonce: &[u8; 12]) -> [u8; 64] {
     let mut s = [0u32; 16];
     s[..4].copy_from_slice(&CHACHA_CONST);
-    for i in 0..8 {
-        s[4 + i] = u32::from_le_bytes(key[i * 4..i * 4 + 4].try_into().unwrap());
+    for (word, bytes) in s[4..12].iter_mut().zip(key.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     s[12] = counter;
-    for i in 0..3 {
-        s[13 + i] = u32::from_le_bytes(nonce[i * 4..i * 4 + 4].try_into().unwrap());
+    for (word, bytes) in s[13..].iter_mut().zip(nonce.as_chunks::<4>().0) {
+        *word = u32::from_le_bytes(*bytes);
     }
     let mut w = s;
     for _ in 0..10 {
@@ -483,16 +484,17 @@ fn chacha20_xor(key: &[u8; 32], counter: u32, nonce: &[u8; 12], data: &[u8]) -> 
 /// Poly1305 one-time authenticator (three 44-bit limbs, donna-64 layout).
 fn poly1305_auth(msg: &[u8], key: &[u8; 32]) -> [u8; 16] {
     const M44: u64 = (1 << 44) - 1;
-    let t0 = u64::from_le_bytes(key[0..8].try_into().unwrap());
-    let t1 = u64::from_le_bytes(key[8..16].try_into().unwrap());
+    let (words, _) = key.as_chunks::<8>();
+    let t0 = u64::from_le_bytes(words[0]);
+    let t1 = u64::from_le_bytes(words[1]);
     let r0 = t0 & 0xffc_0fff_ffff;
     let r1 = ((t0 >> 44) | (t1 << 20)) & 0xfff_ffc0_ffff;
     let r2 = (t1 >> 24) & 0x000f_ffff_fc0f;
     // 2^132 = 4*2^130 ≡ 20 (mod p): the limb-3 wrap factor is 5<<2.
     let s1 = r1 * 20;
     let s2 = r2 * 20;
-    let pad0 = u64::from_le_bytes(key[16..24].try_into().unwrap());
-    let pad1 = u64::from_le_bytes(key[24..32].try_into().unwrap());
+    let pad0 = u64::from_le_bytes(words[2]);
+    let pad1 = u64::from_le_bytes(words[3]);
     let (mut h0, mut h1, mut h2) = (0u64, 0u64, 0u64);
 
     let mut fold = |m0: u64, m1: u64, hibit: u64| {
@@ -524,16 +526,18 @@ fn poly1305_auth(msg: &[u8], key: &[u8; 32]) -> [u8; 16] {
 
     let (blocks, rem) = msg.as_chunks::<16>();
     for block in blocks {
-        let m0 = u64::from_le_bytes(block[0..8].try_into().unwrap());
-        let m1 = u64::from_le_bytes(block[8..16].try_into().unwrap());
+        let (words, _) = block.as_chunks::<8>();
+        let m0 = u64::from_le_bytes(words[0]);
+        let m1 = u64::from_le_bytes(words[1]);
         fold(m0, m1, 1 << 40);
     }
     if !rem.is_empty() {
         let mut block = [0u8; 16];
         block[..rem.len()].copy_from_slice(rem);
         block[rem.len()] = 1;
-        let m0 = u64::from_le_bytes(block[0..8].try_into().unwrap());
-        let m1 = u64::from_le_bytes(block[8..16].try_into().unwrap());
+        let (words, _) = block.as_chunks::<8>();
+        let m0 = u64::from_le_bytes(words[0]);
+        let m1 = u64::from_le_bytes(words[1]);
         fold(m0, m1, 0);
     }
 
@@ -758,8 +762,9 @@ impl Frl3Message {
         }
         let body = &payload[5..];
         let take32 = |i: usize| -> Result<[u8; 32], E2eeError> {
-            body.get(i..i + 32)
-                .map(|s| s.try_into().unwrap())
+            body.get(i..)
+                .and_then(<[u8]>::first_chunk)
+                .copied()
                 .ok_or(E2eeError::Malformed)
         };
         match payload[4] {
@@ -1248,15 +1253,12 @@ pub fn parse_friend_id(text: &str) -> Result<[u8; 32], E2eeError> {
         body = &body[body.len() - rest.len()..];
     }
     let data = b32_decode(body.trim()).ok_or(E2eeError::BadFriendId)?;
-    if data.len() != 36 {
+    let (pk, crc) = data.split_first_chunk().ok_or(E2eeError::BadFriendId)?;
+    let crc = crc.try_into().map_err(|_| E2eeError::BadFriendId)?;
+    if u32::from_be_bytes(crc) != megu_core::hash::crc32_ieee(pk) {
         return Err(E2eeError::BadFriendId);
     }
-    let pk: [u8; 32] = data[..32].try_into().unwrap();
-    let got = u32::from_be_bytes(data[32..].try_into().unwrap());
-    if got != megu_core::hash::crc32_ieee(&pk) {
-        return Err(E2eeError::BadFriendId);
-    }
-    Ok(pk)
+    Ok(*pk)
 }
 
 /// The guest's proof of static-key possession, keyed under `DH(s_g, s_h)`
@@ -1542,7 +1544,8 @@ fn transcript_hash(hello_bytes: &[u8], ack_bytes: &[u8]) -> [u8; 32] {
 /// Six-digit Short Authentication String over a handshake transcript hash —
 /// the optional visual fingerprint for pairing a new friend.
 pub fn sas_code(transcript_hash: &[u8; 32]) -> u32 {
-    u32::from_be_bytes(transcript_hash[..4].try_into().unwrap()) % 1_000_000
+    let &[a, b, c, d, ..] = transcript_hash;
+    u32::from_be_bytes([a, b, c, d]) % 1_000_000
 }
 
 // ===========================================================================
@@ -1655,20 +1658,21 @@ impl Frl3Cipher {
     /// sequence number — so a replayed, reordered, bit-flipped or
     /// cross-direction record can never verify.
     pub fn open(&mut self, record: &[u8]) -> Result<Vec<u8>, E2eeError> {
-        if record.len() < 4 + 16 {
+        let (prefix, sealed) = record.split_first_chunk().ok_or(E2eeError::Malformed)?;
+        if sealed.len() < 16 {
             return Err(E2eeError::Malformed);
         }
-        let ct_len = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
+        let ct_len = u32::from_be_bytes(*prefix) as usize;
         if ct_len > MAX_E2EE_RECORD_BYTES {
             return Err(E2eeError::RecordTooLarge);
         }
-        if record.len() != 4 + ct_len + 16 {
+        if sealed.len() != ct_len + 16 {
             return Err(E2eeError::Malformed);
         }
         let seq = self.recv_seq;
         let nonce = record_nonce(self.recv_dir, seq);
         let aad = record_aad(self.recv_dir, self.stream_id, seq);
-        let pt = aead_open(&self.recv_key, &nonce, &aad, &record[4..])?;
+        let pt = aead_open(&self.recv_key, &nonce, &aad, sealed)?;
         self.recv_seq = seq.checked_add(1).ok_or(E2eeError::CounterExhausted)?;
         Ok(pt)
     }
