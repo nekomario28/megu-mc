@@ -111,6 +111,49 @@ pub struct VanillaScroll {
     pub visible_fraction: f32,
 }
 
+
+/// Wrap text by rendered scale-1 glyph pixel width (CJK-aware), never by
+/// UTF-8 byte length. Whitespace is preserved where possible, but a word or
+/// CJK run longer than the budget is split at a glyph boundary so every
+/// output line is bounded and valid UTF-8.
+pub fn wrap_text_px(text: &str, max_width_px: usize) -> Vec<String> {
+    let budget = max_width_px.max(1);
+    let mut out = Vec::new();
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in source_line.chars() {
+            let ch_width = crate::draw::glyph_advance(ch) as usize;
+            if !current.is_empty() && current_width + ch_width > budget {
+                out.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        if !current.is_empty() {
+            out.push(current);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Maximum whole tooltip rows fitting inside `height` logical px after
+/// vertical padding. A nonzero result is guaranteed for positive height so
+/// callers can still paint a clipped but bounded tooltip.
+pub fn tooltip_row_budget(height: u32, vertical_padding: u32, row_height: u32) -> usize {
+    let row_height = row_height.max(1);
+    let inner = height.saturating_sub(vertical_padding.saturating_mul(2));
+    ((inner / row_height).max(u32::from(height > 0))) as usize
+}
+
 // ---------------------------------------------------------------------------
 // Free-function primitives — the shared kit
 // ---------------------------------------------------------------------------
@@ -332,18 +375,30 @@ pub fn draw_vanilla_tooltip(
     }
     let pad = VanillaThemeTokens::TOOLTIP_PADDING_PX as i32;
     let line_h = 10 * kit.scale as i32;
-    for (i, line) in lines.iter().enumerate() {
-        if line.is_empty() {
-            continue;
+    let logical_width = (w as i32).saturating_sub(pad * 2).max(1) as usize;
+    let row_budget = tooltip_row_budget(
+        h,
+        VanillaThemeTokens::TOOLTIP_PADDING_PX,
+        10,
+    );
+    let mut row = 0usize;
+    for source in lines {
+        for line in wrap_text_px(source, logical_width) {
+            if row >= row_budget {
+                return;
+            }
+            if !line.is_empty() {
+                draw_text_shadowed(
+                    list,
+                    kit,
+                    rect.x + kit.px(pad),
+                    rect.y + kit.px(pad) + row as i32 * line_h,
+                    palette::TEXT,
+                    &line,
+                );
+            }
+            row += 1;
         }
-        draw_text_shadowed(
-            list,
-            kit,
-            rect.x + kit.px(pad),
-            rect.y + kit.px(pad) + i as i32 * line_h,
-            palette::TEXT,
-            line,
-        );
     }
 }
 

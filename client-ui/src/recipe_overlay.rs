@@ -49,6 +49,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::draw::{first_px, text_width, UiColor, UiDrawList, UiRect};
+use crate::vanilla_widgets::{tooltip_row_budget, wrap_text_px};
 
 // ---------------------------------------------------------------------------
 // Classic recipe overlay / vanilla palette
@@ -854,6 +855,25 @@ pub fn render_item_tooltip(
     }
     lines.push((item.mod_name.clone(), MOD_NAME_BLUE));
 
+    // Wrap by measured glyph advance before measuring the frame. CJK text is
+    // two logical cells wide, so byte/character counts are not safe geometry.
+    // `wrap_text_px` works in unscaled logical pixels; convert the physical
+    // frame budget through the GUI scale.
+    let vw = viewport_w.max(0);
+    let vh = viewport_h.max(0);
+    let max_content_logical = ((vw - 8 * s).max(1) / s).clamp(1, 240) as usize;
+    let rows = tooltip_row_budget(vh.max(0) as u32, (2 * s).max(0) as u32, (10 * s).max(1) as u32);
+    let mut wrapped: Vec<(String, UiColor)> = Vec::new();
+    'lines: for (text, color) in lines {
+        for piece in wrap_text_px(&text, max_content_logical) {
+            if wrapped.len() >= rows {
+                break 'lines;
+            }
+            wrapped.push((piece, color));
+        }
+    }
+    let lines = wrapped;
+
     let line_h = 10 * s;
     let w = lines
         .iter()
@@ -862,8 +882,6 @@ pub fn render_item_tooltip(
         .unwrap_or(0)
         + 8 * s;
     let h = lines.len() as i32 * line_h + 4 * s;
-    let vw = viewport_w.max(0);
-    let vh = viewport_h.max(0);
     let w = w.min(vw).max(0);
     let h = h.min(vh).max(0);
     let x = (mouse.0 + 8 * s).min(vw - w).max(0);
@@ -876,6 +894,9 @@ pub fn render_item_tooltip(
     tooltip_gradient_border(list, rect, s);
     let mut ty = rect.y + 2 * s;
     for (text, color) in lines {
+        if ty + 8 * s > rect.bottom() - s {
+            break;
+        }
         list.text_str(rect.x + 4 * s, ty, s as u32, color, &text);
         ty += line_h;
     }

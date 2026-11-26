@@ -5,6 +5,7 @@
 //! drawing cost or visual footprint. All coordinates are physical pixels.
 
 use crate::draw::{palette, UiColor, UiDrawList, UiRect};
+use crate::state::{tr, UiLang};
 
 /// A spell currently being cast or channeled.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -127,6 +128,16 @@ const READY_COLOR: UiColor = UiColor::rgb(105, 176, 187);
 const BAR_BACK: UiColor = UiColor::rgba(12, 17, 28, 225);
 
 /// Return a finite fraction, even for corrupted or incomplete sync values.
+#[cfg(test)]
+fn slot_time_label(ticks: u32, max_cells: usize) -> String {
+    let seconds = ticks.div_ceil(20);
+    if max_cells < 4 && seconds >= 100 {
+        format!("{}m", seconds.div_ceil(60).min(99))
+    } else {
+        ticks_label(ticks)
+    }
+}
+
 fn unit_fraction(value: f32) -> f32 {
     if value.is_nan() {
         0.0
@@ -146,17 +157,29 @@ fn mana_fraction(mana: f32, max_mana: f32) -> f32 {
     unit_fraction(mana / max_mana)
 }
 
-fn ticks_label(ticks: u32) -> String {
-    let seconds = ticks.div_ceil(20);
-    format!("{}s", seconds.min(999))
+fn ticks_label_lang(ticks: u32, lang: UiLang) -> String {
+    let seconds = ticks.div_ceil(20).min(999);
+    match lang {
+        UiLang::En => format!("{seconds}s"),
+        UiLang::Ja => format!("{seconds}秒"),
+    }
 }
 
-fn slot_time_label(ticks: u32, max_cells: usize) -> String {
+#[cfg(test)]
+fn ticks_label(ticks: u32) -> String {
+    ticks_label_lang(ticks, UiLang::En)
+}
+
+fn slot_time_label_lang(ticks: u32, max_cells: usize, lang: UiLang) -> String {
     let seconds = ticks.div_ceil(20);
     if max_cells < 4 && seconds >= 100 {
-        format!("{}m", seconds.div_ceil(60).min(99))
+        let minutes = seconds.div_ceil(60).min(99);
+        match lang {
+            UiLang::En => format!("{minutes}m"),
+            UiLang::Ja => format!("{minutes}分"),
+        }
     } else {
-        ticks_label(ticks)
+        ticks_label_lang(ticks, lang)
     }
 }
 
@@ -222,6 +245,18 @@ pub fn build_magic_hud_draw_list(
     viewport_w: u32,
     viewport_h: u32,
 ) -> UiDrawList {
+    build_magic_hud_draw_list_localized(state, viewport_w, viewport_h, UiLang::En)
+}
+
+/// Localized form of [`build_magic_hud_draw_list`]. The legacy three-argument
+/// entry point intentionally remains English for backward compatibility;
+/// hosts with a resolved UI language call this function.
+pub fn build_magic_hud_draw_list_localized(
+    state: &MagicHudState,
+    viewport_w: u32,
+    viewport_h: u32,
+    lang: UiLang,
+) -> UiDrawList {
     if state.is_empty() || viewport_w < 80 || viewport_h < 140 {
         return UiDrawList::new();
     }
@@ -249,9 +284,9 @@ pub fn build_magic_hud_draw_list(
             } else {
                 state.mana.clamp(0.0, state.max_mana)
             };
-            format!("Mana {amount:.0}/{:.0}", state.max_mana)
+            format!("{} {amount:.0}/{:.0}", tr(lang, "Mana", "マナ"), state.max_mana)
         } else {
-            format!("Mana {:.0}%", fraction * 100.0)
+            format!("{} {:.0}%", tr(lang, "Mana", "マナ"), fraction * 100.0)
         };
         canvas.panel(panel_x, mana_y, panel_w, BAR_HEIGHT);
         canvas.text(
@@ -266,11 +301,11 @@ pub fn build_magic_hud_draw_list(
     if let Some(cast) = &state.active_cast {
         let interrupted = cast.interrupted_flash_ticks > 0;
         let prefix = if interrupted {
-            "Interrupted: "
+            tr(lang, "Interrupted: ", "中断: ")
         } else if cast.channeled {
-            "Channeling: "
+            tr(lang, "Channeling: ", "維持中: ")
         } else {
-            "Casting: "
+            tr(lang, "Casting: ", "詠唱中: ")
         };
         canvas.panel(panel_x, cast_y, panel_w, BAR_HEIGHT);
         canvas.text(
@@ -338,7 +373,7 @@ pub fn build_magic_hud_draw_list(
                 x + 4,
                 cooldown_y + 18,
                 palette::TEXT_DIM,
-                &slot_time_label(cooldown.remaining_ticks, label_cells),
+                &slot_time_label_lang(cooldown.remaining_ticks, label_cells, lang),
             );
         }
     }
@@ -392,7 +427,7 @@ pub fn build_magic_hud_draw_list(
             status_x + status_w - 39,
             y + 4,
             palette::TEXT_DIM,
-            &ticks_label(status.remaining_ticks),
+            &ticks_label_lang(status.remaining_ticks, lang),
         );
     }
 
