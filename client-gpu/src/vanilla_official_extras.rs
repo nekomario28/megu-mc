@@ -8,10 +8,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
+use megu_core::json::{JsonLimits, JsonValue, parse_json_with_limits};
 
 use crate::vanilla_jar::{
-    check_png_budget, decode_asset_png, read_bounded_file, AssetLayer, MAX_DECODED_RGBA_BYTES,
+    AssetLayer, MAX_DECODED_RGBA_BYTES, check_png_budget, decode_asset_png, read_bounded_file,
 };
 
 const MAX_JSON: usize = 8 * 1024 * 1024;
@@ -71,8 +71,10 @@ const SKINS: [&str; 9] = [
 
 /// Vanilla's stable UUID-derived default skin choice and arm model.
 pub fn default_skin_for_uuid(uuid: [u8; 16]) -> (&'static str, bool) {
+    // Vanilla 1.21.1 DefaultPlayerSkin: slots 0..9 are slim alex..zuri,
+    // slots 9..18 are the same nine names in the wide model.
     let n = java_uuid_hash(uuid).rem_euclid(18) as usize;
-    (SKINS[n / 2], n % 2 == 1)
+    (SKINS[n % SKINS.len()], n < SKINS.len())
 }
 
 /// A decoded window icon in the format accepted by `winit::window::Icon::from_rgba`.
@@ -411,7 +413,8 @@ impl VanillaOfficialExtras {
     }
 
     fn load_indexed_assets(&mut self, root: &Path, index_id: &str, remaining: &mut usize) {
-        if !safe_relative(index_id) || index_id.contains('/') {
+        if !safe_relative(index_id) || index_id.contains('/') || index_id == "." || index_id == ".."
+        {
             return;
         }
         let index_path = root.join("indexes").join(format!("{index_id}.json"));
@@ -443,11 +446,26 @@ impl VanillaOfficialExtras {
             if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
+            let Some(size) = nonnegative_u64(meta.get("size")) else {
+                continue;
+            };
+            if size > MAX_OBJECT as u64 {
+                continue;
+            }
             let object = root.join("objects").join(&hash[..2]).join(hash);
+            let Ok(object_meta) = std::fs::symlink_metadata(&object) else {
+                continue;
+            };
+            if !object_meta.is_file() || object_meta.len() != size {
+                continue;
+            }
             if key.starts_with("icons/") {
                 let Some(b) = read_bounded_file(&object, MAX_OBJECT).ok() else {
                     continue;
                 };
+                if b.len() as u64 != size {
+                    continue;
+                }
                 let Some(image) = decode(&b, remaining) else {
                     continue;
                 };
@@ -456,7 +474,7 @@ impl VanillaOfficialExtras {
                     height: image.height,
                     rgba: image.rgba,
                 });
-            } else if object.is_file() {
+            } else {
                 let (id, display_name) = if key.ends_with("programmer_art.zip") {
                     ("programmer_art", "Programmer Art")
                 } else {
@@ -585,7 +603,17 @@ fn parse_credits(value: &JsonValue) -> Vec<CreditSection> {
                         .get_str("name")
                         .or_else(|| d.get_str("discipline"))?
                         .to_owned();
-                    let credits = d.get("credits").map(strings).unwrap_or_default();
+                    let mut credits = d.get("credits").map(strings).unwrap_or_default();
+                    if let Some(titles) = d.get("titles").and_then(JsonValue::as_array) {
+                        for title in titles {
+                            if let Some(name) = title.get_str("title") {
+                                credits.push(name.to_owned());
+                            }
+                            if let Some(names) = title.get("names") {
+                                credits.extend(strings(names));
+                            }
+                        }
+                    }
                     Some(CreditDiscipline {
                         name: discipline,
                         credits,
@@ -652,9 +680,18 @@ fn summarize_data(path: &str, value: &JsonValue) -> VanillaDataSummary {
         asset_id: value.get_str("asset_id").map(str::to_owned),
         width: nonnegative_u64(value.get("width")),
         height: nonnegative_u64(value.get("height")),
-        wild_texture: textures.and_then(|v| v.get_str("wild")).map(str::to_owned),
-        tame_texture: textures.and_then(|v| v.get_str("tame")).map(str::to_owned),
-        angry_texture: textures.and_then(|v| v.get_str("angry")).map(str::to_owned),
+        wild_texture: value
+            .get_str("wild_texture")
+            .or_else(|| textures.and_then(|v| v.get_str("wild")))
+            .map(str::to_owned),
+        tame_texture: value
+            .get_str("tame_texture")
+            .or_else(|| textures.and_then(|v| v.get_str("tame")))
+            .map(str::to_owned),
+        angry_texture: value
+            .get_str("angry_texture")
+            .or_else(|| textures.and_then(|v| v.get_str("angry")))
+            .map(str::to_owned),
         biomes: value.get("biomes").map(strings).unwrap_or_default(),
         translation_key: value.get_str("translation_key").map(str::to_owned),
         asset_name: value.get_str("asset_name").map(str::to_owned),
@@ -746,7 +783,7 @@ fn parse_item_model(catalog: &mut ItemModelCatalog, item: &str, value: &JsonValu
 
 #[cfg(test)]
 mod tests {
-    use super::{json, parse_item_model, ItemModelCatalog, MAX_JSON};
+    use super::{ItemModelCatalog, MAX_JSON, json, parse_item_model};
 
     #[test]
     fn bow_overrides_match_the_complete_predicate_and_choose_the_last_match() {

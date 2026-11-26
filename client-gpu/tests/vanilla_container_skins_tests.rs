@@ -4,9 +4,9 @@
 
 use megu_client_gpu::title_branding::RgbaImage;
 use megu_client_gpu::vanilla_gui_sprites::{
-    load_vanilla_gui_from_jar_bytes, ALL_CONTAINER_TEXTURES, VANILLA_WORKSTATION_SPRITES,
+    ALL_CONTAINER_TEXTURES, VANILLA_WORKSTATION_SPRITES, load_vanilla_gui_from_jar_bytes,
 };
-use megu_ui::draw::{encode_png_rgba, VanillaContainerTextureId};
+use megu_ui::draw::{VanillaContainerTextureId, encode_png_rgba};
 
 fn image(width: u32, height: u32, color: [u8; 4]) -> RgbaImage {
     let mut rgba = vec![0; width as usize * height as usize * 4];
@@ -34,7 +34,8 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&[0; 4]);
-        out.extend_from_slice(&0u32.to_le_bytes());
+        let crc = megu_core::hash::crc32_ieee(data);
+        out.extend_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -46,7 +47,7 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&20u16.to_le_bytes());
         central.extend_from_slice(&20u16.to_le_bytes());
         central.extend_from_slice(&[0; 8]);
-        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -199,15 +200,19 @@ fn invalid_or_missing_backgrounds_fail_closed_and_keep_prior_layer() {
         b"not a png",
     )]);
     let missing = load_vanilla_gui_from_jar_bytes(&corrupt_only, &[]);
-    assert!(missing
-        .named_texture(VanillaContainerTextureId::Furnace.path())
-        .is_none());
+    assert!(
+        missing
+            .named_texture(VanillaContainerTextureId::Furnace.path())
+            .is_none()
+    );
     assert!(!missing.notes.is_empty());
-    assert!(missing
-        .build_full_atlas()
-        .to_gui_sprite_atlas()
-        .container_panel_sprite(14)
-        .is_none());
+    assert!(
+        missing
+            .build_full_atlas()
+            .to_gui_sprite_atlas()
+            .container_panel_sprite(14)
+            .is_none()
+    );
 
     let base = base_archive();
     let corrupt_override = stored_zip(&[(
@@ -215,7 +220,9 @@ fn invalid_or_missing_backgrounds_fail_closed_and_keep_prior_layer() {
         b"bad override",
     )]);
     let layered = load_vanilla_gui_from_jar_bytes(&base, &[&corrupt_override]);
-    assert!(layered
-        .named_texture(VanillaContainerTextureId::Furnace.path())
-        .is_some());
+    assert!(
+        layered
+            .named_texture(VanillaContainerTextureId::Furnace.path())
+            .is_some()
+    );
 }

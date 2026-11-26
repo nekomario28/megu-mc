@@ -11,10 +11,10 @@ use std::sync::Arc;
 
 use crate::model_baker::blockstate::{self, BlockStateDef, VariantGroups};
 use crate::model_baker::{
-    bake_model_with_uvlock, BakedModel, BakedModelQuad, ModelError, RawModelJson,
-    ResourcePackModelStack,
+    BakedModel, BakedModelQuad, ModelError, RawModelJson, ResourcePackModelStack,
+    bake_model_with_uvlock,
 };
-use crate::{Block, BlockShape, Direction, ALL_FACES, CUTOUT, OPAQUE, TINTED, TRANSLUCENT};
+use crate::{ALL_FACES, Block, BlockShape, CUTOUT, Direction, OPAQUE, TINTED, TRANSLUCENT};
 
 /// Maximum UTF-8 JSON document size accepted from one layer entry.
 pub const MAX_BLOCK_MODEL_JSON_BYTES: usize = 1_048_576;
@@ -32,7 +32,9 @@ pub fn parse_block_state_name(state: &str) -> Result<ParsedBlockStateName, Model
     let (identifier, properties) = match state.find('[') {
         Some(open) => {
             if !state.ends_with(']') {
-                return Err(ModelError::BlockState("unterminated state properties".into()));
+                return Err(ModelError::BlockState(
+                    "unterminated state properties".into(),
+                ));
             }
             (&state[..open], Some(&state[open + 1..state.len() - 1]))
         }
@@ -100,10 +102,15 @@ impl VanillaBlockModelCatalog {
         let mut catalog = Self::default();
         let mut total_models = 0;
         let mut total_blockstates = 0;
-        for layer in layers {
-            let mut parsed_models = BTreeMap::new();
+        // Admission walks highest-priority layers first while still storing the
+        // parsed packs in their original low-to-high stacking order. Otherwise
+        // a large low-priority vanilla layer can consume the document budget and
+        // crowd out the high-priority override that should win resolution.
+        let mut parsed_layers = Vec::new();
+        parsed_layers.resize_with(layers.len(), BTreeMap::new);
+        for (layer_index, layer) in layers.iter().enumerate().rev() {
             for (entry, text) in layer {
-                let Some((kind, id)) = asset_entry_id(&entry) else {
+                let Some((kind, id)) = asset_entry_id(entry) else {
                     continue;
                 };
                 if text.len() > MAX_BLOCK_MODEL_JSON_BYTES {
@@ -112,20 +119,22 @@ impl VanillaBlockModelCatalog {
                 match kind {
                     AssetKind::Model if total_models < MAX_BLOCK_MODEL_DOCUMENTS => {
                         total_models += 1;
-                        if let Ok(model) = RawModelJson::parse(&text) {
-                            parsed_models.insert(id, model);
+                        if let Ok(model) = RawModelJson::parse(text) {
+                            parsed_layers[layer_index].insert(id, model);
                             catalog.loaded_models += 1;
                         }
                     }
                     AssetKind::Blockstate if total_blockstates < MAX_BLOCKSTATE_DOCUMENTS => {
                         total_blockstates += 1;
-                        if let Ok(definition) = BlockStateDef::parse(&text) {
+                        if let Ok(definition) = BlockStateDef::parse(text) {
                             catalog.blockstates.insert(id, definition);
                         }
                     }
                     _ => {}
                 }
             }
+        }
+        for parsed_models in parsed_layers {
             catalog.models.push_pack(parsed_models);
         }
         catalog.loaded_blockstates = catalog.blockstates.len();
@@ -245,15 +254,21 @@ impl CachedState {
         if self.groups.iter().any(|group| group.at(pos).is_none()) {
             return None;
         }
+        let first_ambient_occlusion = self
+            .groups
+            .iter()
+            .filter_map(|group| group.at(pos))
+            .next()
+            .is_some_and(|model| model.ambient_occlusion);
         Some(
             self.groups
                 .iter()
                 .filter_map(move |group| group.at(pos))
-                .flat_map(|model| {
+                .flat_map(move |model| {
                     model
                         .quads
                         .iter()
-                        .map(move |quad| (quad, model.ambient_occlusion))
+                        .map(move |quad| (quad, first_ambient_occlusion))
                 }),
         )
     }
@@ -438,9 +453,12 @@ fn is_full_unit_cube(quads: &[BakedModelQuad]) -> bool {
         else {
             return false;
         };
-        if quad.normal.iter().enumerate().any(|(i, component)| {
-            i != axis && component.abs() > 0.0001
-        }) {
+        if quad
+            .normal
+            .iter()
+            .enumerate()
+            .any(|(i, component)| i != axis && component.abs() > 0.0001)
+        {
             return false;
         }
         let sign = quad.normal[axis] > 0.0;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use megu_client_gpu::player_skins::{
-    normalize_skin_to_64x64, parse_textures_property, PlayerSkinCache, SkinSource,
+    PlayerSkinCache, SkinSource, normalize_skin_to_64x64, parse_textures_property,
 };
 
 fn base64(input: &[u8]) -> String {
@@ -31,7 +31,9 @@ fn base64(input: &[u8]) -> String {
 }
 
 fn property(skin_url: &str, cape: Option<&str>, model: &str) -> String {
-    let mut textures = format!("{{\"textures\":{{\"SKIN\":{{\"url\":\"{skin_url}\",\"metadata\":{{\"model\":\"{model}\"}}}}");
+    let mut textures = format!(
+        "{{\"textures\":{{\"SKIN\":{{\"url\":\"{skin_url}\",\"metadata\":{{\"model\":\"{model}\"}}}}"
+    );
     if let Some(cape_url) = cape {
         textures.push_str(&format!(",\"CAPE\":{{\"url\":\"{cape_url}\"}}"));
     }
@@ -103,7 +105,7 @@ fn rejects_untrusted_hosts_schemes_and_malformed_hashes() {
 }
 
 #[test]
-fn upgrades_legacy_layout_with_expected_limb_copies() {
+fn upgrades_legacy_layout_with_vanilla_face_mirroring() {
     let mut legacy = vec![0; 64 * 32 * 4];
     for y in 0..32usize {
         for x in 0..64usize {
@@ -111,13 +113,17 @@ fn upgrades_legacy_layout_with_expected_limb_copies() {
             legacy[at..at + 4].copy_from_slice(&[x as u8, y as u8, 71, 255]);
         }
     }
+    legacy[3] = 0; // transparent base-layer input must become opaque.
     let (width, height, modern) = normalize_skin_to_64x64(64, 32, &legacy).unwrap();
     assert_eq!((width, height), (64, 64));
     let pixel = |x: usize, y: usize| &modern[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
-    assert_eq!(pixel(16, 48), pixel(0, 16));
-    assert_eq!(pixel(31, 63), pixel(15, 31));
-    assert_eq!(pixel(32, 48), pixel(40, 16));
-    assert_eq!(pixel(47, 63), pixel(55, 31));
+    // Every limb rectangle is copied with a horizontal mirror. These samples
+    // distinguish the Vanilla face swap from the former byte-for-byte copy.
+    assert_eq!(pixel(16, 52), &[11, 20, 71, 255]);
+    assert_eq!(pixel(31, 63), &[12, 31, 71, 255]);
+    assert_eq!(pixel(32, 52), &[51, 20, 71, 255]);
+    assert_eq!(pixel(47, 63), &[52, 31, 71, 255]);
+    assert_eq!(pixel(0, 0)[3], 255);
     assert_eq!(pixel(63, 63), &[0, 0, 0, 0]);
 }
 

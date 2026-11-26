@@ -204,11 +204,12 @@ const JSON_LIMITS: JsonLimits = JsonLimits {
 };
 
 fn parse_json(text: &str) -> Result<Json, JsonError> {
-    let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false)
-        .map_err(|e| JsonError {
+    let value = megu_core::json::parse_json_with_limits(text, JSON_LIMITS, false).map_err(|e| {
+        JsonError {
             offset: e.offset,
             message: e.message,
-        })?;
+        }
+    })?;
     json_value_to_json(&value)
 }
 
@@ -767,7 +768,10 @@ impl ResourcePackModelStack {
         let resolved = self.resolve(model_id)?;
         let mut textures = BTreeMap::new();
         for (key, value) in &resolved.textures {
-            textures.insert(key.clone(), Self::resolve_texture(&resolved.textures, value)?);
+            textures.insert(
+                key.clone(),
+                Self::resolve_texture(&resolved.textures, value)?,
+            );
         }
         Ok(textures)
     }
@@ -1051,11 +1055,11 @@ fn rotated_direction(model: Mat3, facing: Direction) -> Direction {
 fn l2g_matrix(direction: Direction) -> Mat3 {
     match direction {
         Direction::South => [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        Direction::East => blockstate_matrix(0, 3),  // rotateY(+90°)
-        Direction::West => blockstate_matrix(0, 1),  // rotateY(-90°)
+        Direction::East => blockstate_matrix(0, 3), // rotateY(+90°)
+        Direction::West => blockstate_matrix(0, 1), // rotateY(-90°)
         Direction::North => blockstate_matrix(0, 2), // rotateY(180°)
-        Direction::Up => blockstate_matrix(1, 0),    // rotateX(-90°)
-        Direction::Down => blockstate_matrix(3, 0),  // rotateX(+90°)
+        Direction::Up => blockstate_matrix(1, 0),   // rotateX(-90°)
+        Direction::Down => blockstate_matrix(3, 0), // rotateX(+90°)
     }
 }
 
@@ -1114,16 +1118,12 @@ fn recompute_uvs(
     // rotation, i.e. the diagonal corners (u0,v0) and (u1,v1).
     let t0 = project(uv_rect[0], uv_rect[1]);
     let t1 = project(uv_rect[2], uv_rect[3]);
-    let (u0_new, u1_new) = if java_signum(uv_rect[2] - uv_rect[0])
-        == java_signum(t1[0] - t0[0])
-    {
+    let (u0_new, u1_new) = if java_signum(uv_rect[2] - uv_rect[0]) == java_signum(t1[0] - t0[0]) {
         (t0[0], t1[0])
     } else {
         (t1[0], t0[0])
     };
-    let (v0_new, v1_new) = if java_signum(uv_rect[3] - uv_rect[1])
-        == java_signum(t1[1] - t0[1])
-    {
+    let (v0_new, v1_new) = if java_signum(uv_rect[3] - uv_rect[1]) == java_signum(t1[1] - t0[1]) {
         (t0[1], t1[1])
     } else {
         (t1[1], t0[1])
@@ -1192,7 +1192,13 @@ pub fn bake_model(
     blockstate_rot_x_deg: i32,
     blockstate_rot_y_deg: i32,
 ) -> Result<BakedModel, ModelError> {
-    bake_model_with_uvlock(stack, model_id, blockstate_rot_x_deg, blockstate_rot_y_deg, false)
+    bake_model_with_uvlock(
+        stack,
+        model_id,
+        blockstate_rot_x_deg,
+        blockstate_rot_y_deg,
+        false,
+    )
 }
 
 /// [`bake_model`] plus the variant `"uvlock"` flag: when `uvlock` is true,
@@ -1311,9 +1317,10 @@ pub fn bake_model_with_uvlock(
 }
 
 /// Selects the item model for a `custom_model_data` value, per Vanilla item
-/// overrides: the highest predicate threshold `<= value` wins; with no
-/// matching override (or no `custom_model_data` on the item) the base model
-/// id is returned unchanged.
+/// overrides: walk the override list in reverse declaration order and use the
+/// first predicate whose threshold is `<= value`; with no matching override
+/// (or no `custom_model_data` on the item) the base model id is returned
+/// unchanged.
 pub fn resolve_item_override(
     stack: &ResourcePackModelStack,
     item_model_id: &str,
@@ -1326,18 +1333,15 @@ pub fn resolve_item_override(
     let Some(value) = custom_model_data else {
         return Ok(base);
     };
-    let mut best: Option<(f64, &ItemModelOverride)> = None;
-    for item_override in &leaf.overrides {
+    for item_override in leaf.overrides.iter().rev() {
         let Some(threshold) = item_override.custom_model_data else {
             continue;
         };
-        // Vanilla matches threshold <= actual; the highest such threshold
-        // wins (the last match in list order when overrides are sorted).
-        if threshold <= f64::from(value) && best.is_none_or(|(b, _)| threshold >= b) {
-            best = Some((threshold, item_override));
+        if threshold <= f64::from(value) {
+            return Ok(normalize_location(&item_override.model));
         }
     }
-    Ok(best.map_or(base, |(_, o)| normalize_location(&o.model)))
+    Ok(base)
 }
 
 // ---------------------------------------------------------------------------
@@ -1465,7 +1469,10 @@ pub mod blockstate {
                     "blockstate defines neither 'variants' nor 'multipart'",
                 ));
             }
-            Ok(Self { variants, multipart })
+            Ok(Self {
+                variants,
+                multipart,
+            })
         }
     }
 
@@ -1808,18 +1815,16 @@ pub mod blockstate {
             .as_object()
             .ok_or_else(|| schema_err(format!("{field} must be an object")))?;
         if obj.is_empty() {
-            return Err(schema_err(format!("{field}: no elements found in selector")));
+            return Err(schema_err(format!(
+                "{field}: no elements found in selector"
+            )));
         }
         if obj.len() == 1 {
             if let Some(items) = obj.get("OR") {
-                return Ok(Condition::AnyOf(parse_condition_list(
-                    items, field, "OR",
-                )?));
+                return Ok(Condition::AnyOf(parse_condition_list(items, field, "OR")?));
             }
             if let Some(items) = obj.get("AND") {
-                return Ok(Condition::All(parse_condition_list(
-                    items, field, "AND",
-                )?));
+                return Ok(Condition::All(parse_condition_list(items, field, "AND")?));
             }
         }
         let mut conditions = Vec::with_capacity(obj.len());
@@ -1850,11 +1855,7 @@ pub mod blockstate {
 
     /// `KeyValueCondition`: `"value"` is `prop`'s value, optionally `!`-
     /// negated, with `|`-separated alternatives (`"low|tall"`).
-    fn parse_key_value(
-        key: &str,
-        value: &Json,
-        field: &str,
-    ) -> Result<Condition, ModelError> {
+    fn parse_key_value(key: &str, value: &Json, field: &str) -> Result<Condition, ModelError> {
         let raw = value
             .as_str()
             .ok_or_else(|| schema_err(format!("{field}.{key} must be a string")))?;
@@ -1945,8 +1946,6 @@ pub mod blockstate {
             }
             draw -= weight;
         }
-        variants
-            .last()
-            .expect("variant list is non-empty")
+        variants.last().expect("variant list is non-empty")
     }
 }

@@ -4,15 +4,16 @@
 //! orientation, input validation and continuous camera-angle progression.
 
 use megu_client_gpu::panorama_pass::{
-    minecraft_panorama_face_flip, reorient_minecraft_panorama_face, validate_panorama_face_data,
-    validate_panorama_overlay_data, vanilla_panorama_angles, TitlePanoramaPass,
-    MINECRAFT_PANORAMA_TO_WGPU_LAYER, TITLE_PANORAMA_WGSL, WGPU_LAYER_TO_MINECRAFT_PANORAMA,
+    MINECRAFT_PANORAMA_TO_WGPU_LAYER, TITLE_PANORAMA_WGSL, TitlePanoramaPass,
+    WGPU_LAYER_TO_MINECRAFT_PANORAMA, minecraft_panorama_face_flip,
+    reorient_minecraft_panorama_face, validate_panorama_face_data, validate_panorama_overlay_data,
+    vanilla_panorama_angles,
 };
-use megu_client_gpu::renderer::{request_gpu_device, OFFSCREEN_FORMAT};
+use megu_client_gpu::renderer::{OFFSCREEN_FORMAT, request_gpu_device};
 use megu_client_mesh::RenderBackendPreference;
+use wgpu::naga::ShaderStage;
 use wgpu::naga::front::wgsl;
 use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
-use wgpu::naga::ShaderStage;
 
 fn compile_and_validate(source: &str) -> wgpu::naga::Module {
     let module = wgsl::parse_str(source)
@@ -107,12 +108,16 @@ fn dimension_validation_rejects_mismatched_or_impossible_payloads() {
     ];
     validate_panorama_face_data(faces, 2, 2).unwrap();
 
-    assert!(validate_panorama_face_data(faces, 0, 2)
-        .unwrap_err()
-        .contains("nonzero"));
-    assert!(validate_panorama_face_data(faces, 3, 2)
-        .unwrap_err()
-        .contains("exceeds"));
+    assert!(
+        validate_panorama_face_data(faces, 0, 2)
+            .unwrap_err()
+            .contains("nonzero")
+    );
+    assert!(
+        validate_panorama_face_data(faces, 3, 2)
+            .unwrap_err()
+            .contains("exceeds")
+    );
 
     let short = [0_u8; 15];
     let bad_faces = [
@@ -128,30 +133,37 @@ fn dimension_validation_rejects_mismatched_or_impossible_payloads() {
     assert!(error.contains("expected 16"), "{error}");
 
     validate_panorama_overlay_data(&good, 2, 2, 2).unwrap();
-    assert!(validate_panorama_overlay_data(&good, 0, 2, 2)
-        .unwrap_err()
-        .contains("nonzero"));
-    assert!(validate_panorama_overlay_data(&good[..15], 2, 2, 2)
-        .unwrap_err()
-        .contains("expected 16"));
-    assert!(reorient_minecraft_panorama_face(&good[..15], 2, 0)
-        .unwrap_err()
-        .contains("expected 16"));
-    assert!(reorient_minecraft_panorama_face(&good, 2, 6)
-        .unwrap_err()
-        .contains("outside"));
+    assert!(
+        validate_panorama_overlay_data(&good, 0, 2, 2)
+            .unwrap_err()
+            .contains("nonzero")
+    );
+    assert!(
+        validate_panorama_overlay_data(&good[..15], 2, 2, 2)
+            .unwrap_err()
+            .contains("expected 16")
+    );
+    assert!(
+        reorient_minecraft_panorama_face(&good[..15], 2, 0)
+            .unwrap_err()
+            .contains("expected 16")
+    );
+    assert!(
+        reorient_minecraft_panorama_face(&good, 2, 6)
+            .unwrap_err()
+            .contains("outside")
+    );
 }
 
 #[test]
 fn vanilla_angles_are_finite_continuous_and_unwrapped() {
     let (yaw0, pitch0) = vanilla_panorama_angles(0.0);
     assert!(yaw0.abs() < 1e-7);
-    assert!((pitch0 - 25.0_f32.to_radians()).abs() < 1e-6);
+    assert!((pitch0 - 10.0_f32.to_radians()).abs() < 1e-6);
 
     let (yaw10, pitch10) = vanilla_panorama_angles(10.0);
     assert!((yaw10 - 30.0_f32.to_radians()).abs() < 1e-5);
-    let expected_pitch10 = ((10.0_f64 * 0.1).sin() * 5.0 + 25.0).to_radians() as f32;
-    assert!((pitch10 - expected_pitch10).abs() < 1e-5);
+    assert!((pitch10 - 10.0_f32.to_radians()).abs() < 1e-6);
 
     // One revolution takes 120 seconds at 3 deg/s. The helper returns a
     // continuous angle rather than wrapping and introducing a 2π jump.
@@ -169,7 +181,7 @@ fn vanilla_angles_are_finite_continuous_and_unwrapped() {
             yaw_delta > 0.0 && yaw_delta < 0.001,
             "yaw jump at {t}: {yaw_delta}"
         );
-        assert!(pitch_delta < 0.0002, "pitch jump at {t}: {pitch_delta}");
+        assert!(pitch_delta == 0.0, "pitch changed at {t}: {pitch_delta}");
         previous = current;
     }
 

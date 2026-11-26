@@ -137,7 +137,8 @@ fn deflate_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         w16(&mut out, 8);
         w16(&mut out, 0);
         w16(&mut out, 0);
-        w32(&mut out, 0);
+        let crc = megu_core::hash::crc32_ieee(plain);
+        w32(&mut out, crc);
         w32(&mut out, stored.len() as u32);
         w32(&mut out, plain.len() as u32);
         w16(&mut out, name.len() as u16);
@@ -152,7 +153,7 @@ fn deflate_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         w16(&mut central, 8);
         w16(&mut central, 0);
         w16(&mut central, 0);
-        w32(&mut central, 0);
+        w32(&mut central, crc);
         w32(&mut central, stored.len() as u32);
         w32(&mut central, plain.len() as u32);
         w16(&mut central, name.len() as u16);
