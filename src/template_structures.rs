@@ -858,8 +858,14 @@ pub(crate) fn place_in_world<W: TemplateWorld>(
                 continue;
             }
         }
-        let state = crate::structure_transform::state(block.state, settings.mirror, settings.rotation)
-            .ok_or("unknown template state transform")?;
+        let state = crate::structure_transform::state_with(
+            block.state,
+            settings.mirror,
+            settings.rotation,
+            |s| reg.properties_of(s),
+            |s, key, value| reg.with_prop(s, key, value),
+        )
+        .ok_or("unknown template state transform")?;
         let state_name = reg.name_of(state).to_owned();
         // `getFluidState` is read before the write, and only when
         // waterlogging is enabled.

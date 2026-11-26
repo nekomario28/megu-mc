@@ -267,23 +267,32 @@ fn transform_direction(direction: &str, mirror: Mirror, rotation: Rotation) -> S
     turn_horizontal(mirror_horizontal(direction, mirror), rotation).to_owned()
 }
 
-/// Derive a state transform from the blockstate properties when the pinned binary table
+/// Derive a state transform from blockstate properties when the pinned binary table
 /// is absent. This covers the dominant directional state contracts (facing/orientation,
 /// horizontal rotation and per-direction connection properties) deterministically; the
 /// binary table remains the exact native oracle when present.
-fn derive_state_transform(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
-    let reg = crate::block_registry::breg()?;
-    let props = reg.properties_of(state)?;
+fn derive_state_transform<FProps, FSet>(
+    state: u32,
+    mirror: Mirror,
+    rotation: Rotation,
+    properties_of: FProps,
+    mut with_prop: FSet,
+) -> Option<u32>
+where
+    FProps: FnOnce(u32) -> Option<Vec<(String, String)>>,
+    FSet: FnMut(u32, &str, &str) -> u32,
+{
+    let props = properties_of(state)?;
     let mut out = state;
     let mut delayed: Vec<(String, String)> = Vec::new();
     for (key, value) in props {
         if key == "facing" || key == "orientation" {
             let mapped = transform_direction(&value, mirror, rotation);
-            out = reg.with_prop(out, &key, &mapped);
+            out = with_prop(out, &key, &mapped);
         } else if key == "rotation" {
             if let Ok(v) = value.parse::<i32>() {
                 let steps = ROTATION_STEPS_16[rotation as usize];
-                out = reg.with_prop(out, &key, &((v + steps).rem_euclid(16)).to_string());
+                out = with_prop(out, &key, &((v + steps).rem_euclid(16)).to_string());
             }
         } else if key == "axis" && ROTATION_SWAPS_HORIZONTAL_AXIS[rotation as usize] {
             let mapped = match value.as_str() {
@@ -291,30 +300,58 @@ fn derive_state_transform(state: u32, mirror: Mirror, rotation: Rotation) -> Opt
                 "z" => "x",
                 _ => value.as_str(),
             };
-            out = reg.with_prop(out, &key, mapped);
+            out = with_prop(out, &key, mapped);
         } else if matches!(key.as_str(), "north" | "east" | "south" | "west") {
             let mapped_key = transform_direction(&key, mirror, rotation);
             delayed.push((mapped_key, value));
         }
     }
     for (key, value) in delayed {
-        out = reg.with_prop(out, &key, &value);
+        out = with_prop(out, &key, &value);
     }
     Some(out)
 }
 
-pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
-    if let Some(table) = transform_table() {
-        let index = (state as usize)
-            .checked_mul(12)?
-            .checked_add(mirror as usize * 4 + rotation as usize)?
-            .checked_mul(4)?;
-        let end = index.checked_add(4)?;
-        if let Some(bytes) = table.get(index..end) {
-            return Some(u32::from_be_bytes(bytes.try_into().unwrap()));
-        }
+fn state_from_table(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
+    let table = transform_table()?;
+    let index = (state as usize)
+        .checked_mul(12)?
+        .checked_add(mirror as usize * 4 + rotation as usize)?
+        .checked_mul(4)?;
+    let end = index.checked_add(4)?;
+    let bytes = table.get(index..end)?;
+    Some(u32::from_be_bytes(bytes.try_into().unwrap()))
+}
+
+pub(crate) fn state_with<FProps, FSet>(
+    state: u32,
+    mirror: Mirror,
+    rotation: Rotation,
+    properties_of: FProps,
+    with_prop: FSet,
+) -> Option<u32>
+where
+    FProps: FnOnce(u32) -> Option<Vec<(String, String)>>,
+    FSet: FnMut(u32, &str, &str) -> u32,
+{
+    if let Some(mapped) = state_from_table(state, mirror, rotation) {
+        return Some(mapped);
     }
-    derive_state_transform(state, mirror, rotation)
+    derive_state_transform(state, mirror, rotation, properties_of, with_prop)
+}
+
+#[cfg(all(test, megu_vanilla_data))]
+pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
+    state_with(
+        state,
+        mirror,
+        rotation,
+        |s| crate::block_registry::breg()?.properties_of(s),
+        |s, key, value| {
+            crate::block_registry::breg()
+                .map_or(s, |reg| reg.with_prop(s, key, value))
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1074,8 +1074,14 @@ fn write_template_block(
     if outside_clip(p, clip) {
         return Ok(());
     }
-    let state = crate::structure_transform::state(block.state, placement.mirror, placement.rotation)
-        .ok_or("unknown template state transform")?;
+    let state = crate::structure_transform::state_with(
+        block.state,
+        placement.mirror,
+        placement.rotation,
+        |s| reg.properties_of(s),
+        |s, key, value| reg.with_prop(s, key, value),
+    )
+    .ok_or("unknown template state transform")?;
     // `WorldGenRegion.setBlock`: the write is refused by the level's build height
     // (`dimension_type`), which is what the clip above uses as well.
     if p.1 < ctx.g.world_min_y || p.1 >= ctx.g.world_min_y + ctx.g.world_height {
@@ -1770,8 +1776,16 @@ impl Template {
             .map(|b| {
                 Ok(BlockInfo {
                     pos: transformed_block_pos(b.pos, mirror, rotation, pivot, origin),
-                    state: crate::structure_transform::state(b.state, mirror, rotation)
-                        .ok_or("unknown template state transform")?,
+                    state: crate::structure_transform::state_with(
+                        b.state,
+                        mirror,
+                        rotation,
+                        |s| crate::block_registry::breg()?.properties_of(s),
+                        |s, key, value| {
+                            crate::block_registry::breg().map_or(s, |reg| reg.with_prop(s, key, value))
+                        },
+                    )
+                    .ok_or("unknown template state transform")?,
                     nbt: b.nbt.clone(),
                 })
             })

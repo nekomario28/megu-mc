@@ -236,7 +236,16 @@ fn transform_state(orient: Option<Facing>, st: u32) -> u32 {
         Some(Facing::East) => (Mirror::None, Rotation::Clockwise90),
         _ => (Mirror::None, Rotation::None),
     };
-    structure_transform::state(st, m, r).expect("single-piece state transform")
+    structure_transform::state_with(
+        st,
+        m,
+        r,
+        |s| crate::block_registry::breg()?.properties_of(s),
+        |s, key, value| {
+            crate::block_registry::breg().map_or(s, |reg| reg.with_prop(s, key, value))
+        },
+    )
+    .expect("single-piece state transform")
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -998,10 +1007,12 @@ impl DesertPyramidPiece {
         let st_s = sp_state(reg, "minecraft:sandstone_stairs", &[("facing", "south")]);
         let st_e = sp_state(reg, "minecraft:sandstone_stairs", &[("facing", "east")]);
         let st_w = sp_state(reg, "minecraft:sandstone_stairs", &[("facing", "west")]);
-        let st_ccw90 = structure_transform::state(
+        let st_ccw90 = structure_transform::state_with(
             reg.state_of("minecraft:sandstone_stairs", None),
             Mirror::None,
             Rotation::Counterclockwise90,
+            |s| reg.properties_of(s),
+            |s, key, value| reg.with_prop(s, key, value),
         )
         .expect("sandstone_stairs ccw90");
 

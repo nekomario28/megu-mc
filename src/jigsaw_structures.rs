@@ -4,7 +4,19 @@
 
 use crate::nbt::Tag;
 use crate::structure_template::{BlockInfo, Template};
-use crate::structure_transform::{block as transform_block, bounds as transform_bounds, state as transform_state, Mirror, Rotation};
+use crate::structure_transform::{block as transform_block, bounds as transform_bounds, Mirror, Rotation};
+
+fn transform_state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
+    crate::structure_transform::state_with(
+        state,
+        mirror,
+        rotation,
+        |s| crate::block_registry::breg()?.properties_of(s),
+        |s, key, value| {
+            crate::block_registry::breg().map_or(s, |reg| reg.with_prop(s, key, value))
+        },
+    )
+}
 use std::collections::{BTreeMap, VecDeque};
 #[cfg(test)]
 use std::path::Path;

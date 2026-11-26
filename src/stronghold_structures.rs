@@ -1041,8 +1041,14 @@ impl StrongholdWriter<'_, '_> {
         if !contains(&self.clip, at) {
             return;
         }
-        let st = structure_transform::state(st, self.transform.0, self.transform.1)
-            .expect("stronghold state transform");
+        let st = structure_transform::state_with(
+            st,
+            self.transform.0,
+            self.transform.1,
+            |s| self.reg.properties_of(s),
+            |s, key, value| self.reg.with_prop(s, key, value),
+        )
+        .expect("stronghold state transform");
         if self.reg.needs_postprocess_shape(st) {
             self.ctx.mark_shape(at.0, at.1, at.2);
         }

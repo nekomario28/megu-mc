@@ -63,7 +63,14 @@ impl Writer<'_, '_> {
     }
     fn transformed(&self, st: u32) -> u32 {
         let (m, r) = facing_transform(self.piece.orientation);
-        structure_transform::state(st, m, r).expect("mineshaft state transform")
+        structure_transform::state_with(
+            st,
+            m,
+            r,
+            |s| self.reg.properties_of(s),
+            |s, key, value| self.reg.with_prop(s, key, value),
+        )
+        .expect("mineshaft state transform")
     }
     fn get(&mut self, p: Pos) -> u32 {
         let p = self.pos(p);
