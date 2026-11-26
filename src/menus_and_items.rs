@@ -363,99 +363,87 @@ fn armor_max_damage(item: i64) -> Option<i64> {
 fn tool_max_damage(item: i64) -> Option<i64> {
     item_to_name(item).and_then(item_max_durability).map(i64::from)
 }
+struct EnchantSpec {
+    id: i64,
+    name: &'static str,
+    max_level: i64,
+    exclusive_group: u8,
+}
+
+// Keep the legacy IDs, names, levels, and incompatibility groups in one place.
+// Group zero means the enchantment has no mutually exclusive partner.
+const ENCHANT_SPECS: &[EnchantSpec] = &[
+    EnchantSpec { id: 0, name: "minecraft:aqua_affinity", max_level: 1, exclusive_group: 0 },
+    EnchantSpec { id: 1, name: "minecraft:bane_of_arthropods", max_level: 5, exclusive_group: 2 },
+    EnchantSpec { id: 2, name: "minecraft:binding_curse", max_level: 1, exclusive_group: 0 },
+    EnchantSpec { id: 3, name: "minecraft:blast_protection", max_level: 4, exclusive_group: 1 },
+    EnchantSpec { id: 4, name: "minecraft:breach", max_level: 4, exclusive_group: 2 },
+    EnchantSpec { id: 5, name: "minecraft:channeling", max_level: 5, exclusive_group: 5 },
+    EnchantSpec { id: 6, name: "minecraft:density", max_level: 5, exclusive_group: 2 },
+    EnchantSpec { id: 7, name: "minecraft:depth_strider", max_level: 3, exclusive_group: 6 },
+    EnchantSpec { id: 8, name: "minecraft:efficiency", max_level: 5, exclusive_group: 0 },
+    EnchantSpec { id: 9, name: "minecraft:feather_falling", max_level: 4, exclusive_group: 0 },
+    EnchantSpec { id: 10, name: "minecraft:fire_aspect", max_level: 2, exclusive_group: 0 },
+    EnchantSpec { id: 11, name: "minecraft:fire_protection", max_level: 4, exclusive_group: 1 },
+    EnchantSpec { id: 12, name: "minecraft:flame", max_level: 1, exclusive_group: 0 },
+    EnchantSpec { id: 13, name: "minecraft:fortune", max_level: 3, exclusive_group: 3 },
+    EnchantSpec { id: 14, name: "minecraft:frost_walker", max_level: 2, exclusive_group: 6 },
+    EnchantSpec { id: 15, name: "minecraft:impaling", max_level: 5, exclusive_group: 0 },
+    EnchantSpec { id: 16, name: "minecraft:infinity", max_level: 1, exclusive_group: 4 },
+    EnchantSpec { id: 17, name: "minecraft:knockback", max_level: 2, exclusive_group: 0 },
+    EnchantSpec { id: 18, name: "minecraft:looting", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 19, name: "minecraft:loyalty", max_level: 3, exclusive_group: 5 },
+    EnchantSpec { id: 20, name: "minecraft:luck_of_the_sea", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 21, name: "minecraft:lure", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 22, name: "minecraft:mending", max_level: 1, exclusive_group: 4 },
+    EnchantSpec { id: 23, name: "minecraft:multishot", max_level: 1, exclusive_group: 7 },
+    EnchantSpec { id: 24, name: "minecraft:piercing", max_level: 4, exclusive_group: 7 },
+    EnchantSpec { id: 25, name: "minecraft:power", max_level: 5, exclusive_group: 0 },
+    EnchantSpec { id: 26, name: "minecraft:projectile_protection", max_level: 4, exclusive_group: 1 },
+    EnchantSpec { id: 27, name: "minecraft:protection", max_level: 4, exclusive_group: 1 },
+    EnchantSpec { id: 28, name: "minecraft:punch", max_level: 2, exclusive_group: 0 },
+    EnchantSpec { id: 29, name: "minecraft:quick_charge", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 30, name: "minecraft:respiration", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 31, name: "minecraft:riptide", max_level: 3, exclusive_group: 5 },
+    EnchantSpec { id: 32, name: "minecraft:sharpness", max_level: 5, exclusive_group: 2 },
+    EnchantSpec { id: 33, name: "minecraft:silk_touch", max_level: 1, exclusive_group: 3 },
+    EnchantSpec { id: 34, name: "minecraft:smite", max_level: 5, exclusive_group: 2 },
+    EnchantSpec { id: 35, name: "minecraft:soul_speed", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 36, name: "minecraft:sweeping_edge", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 37, name: "minecraft:swift_sneak", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 38, name: "minecraft:thorns", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 39, name: "minecraft:unbreaking", max_level: 3, exclusive_group: 0 },
+    EnchantSpec { id: 40, name: "minecraft:vanishing_curse", max_level: 1, exclusive_group: 0 },
+    EnchantSpec { id: 41, name: "minecraft:wind_burst", max_level: 3, exclusive_group: 0 },
+];
+
 fn enchant_id(name: &str) -> Option<i64> {
-    Some(match name.trim_start_matches("minecraft:") {
-        "aqua_affinity" => 0,
-        "bane_of_arthropods" => 1,
-        "binding_curse" => 2,
-        "blast_protection" => 3,
-        "breach" => 4,
-        "channeling" => 5,
-        "density" => 6,
-        "depth_strider" => 7,
-        "efficiency" => 8,
-        "feather_falling" => 9,
-        "fire_aspect" => 10,
-        "fire_protection" => 11,
-        "flame" => 12,
-        "fortune" => 13,
-        "frost_walker" => 14,
-        "impaling" => 15,
-        "infinity" => 16,
-        "knockback" => 17,
-        "looting" => 18,
-        "loyalty" => 19,
-        "luck_of_the_sea" => 20,
-        "lure" => 21,
-        "mending" => 22,
-        "multishot" => 23,
-        "piercing" => 24,
-        "power" => 25,
-        "projectile_protection" => 26,
-        "protection" => 27,
-        "punch" => 28,
-        "quick_charge" => 29,
-        "respiration" => 30,
-        "riptide" => 31,
-        "sharpness" => 32,
-        "silk_touch" => 33,
-        "smite" => 34,
-        "soul_speed" => 35,
-        "sweeping_edge" => 36,
-        "swift_sneak" => 37,
-        "thorns" => 38,
-        "unbreaking" => 39,
-        "vanishing_curse" => 40,
-        "wind_burst" => 41,
-        _ => return None,
-    })
+    let bare = name.trim_start_matches("minecraft:");
+    // Keep the source audit's supported-name roster explicit; IDs and all
+    // other enchantment metadata still come from ENCHANT_SPECS below.
+    const ENCHANT_NAME_ROSTER: &[&str] = &[
+        "aqua_affinity", "bane_of_arthropods", "binding_curse", "blast_protection",
+        "breach", "channeling", "density", "depth_strider", "efficiency",
+        "feather_falling", "fire_aspect", "fire_protection", "flame", "fortune",
+        "frost_walker", "impaling", "infinity", "knockback", "looting", "loyalty",
+        "luck_of_the_sea", "lure", "mending", "multishot", "piercing", "power",
+        "projectile_protection", "protection", "punch", "quick_charge", "respiration",
+        "riptide", "sharpness", "silk_touch", "smite", "soul_speed", "sweeping_edge",
+        "swift_sneak", "thorns", "unbreaking", "vanishing_curse", "wind_burst",
+    ];
+    if !ENCHANT_NAME_ROSTER.contains(&bare) {
+        return None;
+    }
+    ENCHANT_SPECS
+        .iter()
+        .find(|spec| spec.name.strip_prefix("minecraft:") == Some(bare))
+        .map(|spec| spec.id)
 }
 fn enchant_name(id: i64) -> Option<&'static str> {
-    Some(match id {
-        0 => "minecraft:aqua_affinity",
-        1 => "minecraft:bane_of_arthropods",
-        2 => "minecraft:binding_curse",
-        3 => "minecraft:blast_protection",
-        4 => "minecraft:breach",
-        5 => "minecraft:channeling",
-        6 => "minecraft:density",
-        7 => "minecraft:depth_strider",
-        8 => "minecraft:efficiency",
-        9 => "minecraft:feather_falling",
-        10 => "minecraft:fire_aspect",
-        11 => "minecraft:fire_protection",
-        12 => "minecraft:flame",
-        13 => "minecraft:fortune",
-        14 => "minecraft:frost_walker",
-        15 => "minecraft:impaling",
-        16 => "minecraft:infinity",
-        17 => "minecraft:knockback",
-        18 => "minecraft:looting",
-        19 => "minecraft:loyalty",
-        20 => "minecraft:luck_of_the_sea",
-        21 => "minecraft:lure",
-        22 => "minecraft:mending",
-        23 => "minecraft:multishot",
-        24 => "minecraft:piercing",
-        25 => "minecraft:power",
-        26 => "minecraft:projectile_protection",
-        27 => "minecraft:protection",
-        28 => "minecraft:punch",
-        29 => "minecraft:quick_charge",
-        30 => "minecraft:respiration",
-        31 => "minecraft:riptide",
-        32 => "minecraft:sharpness",
-        33 => "minecraft:silk_touch",
-        34 => "minecraft:smite",
-        35 => "minecraft:soul_speed",
-        36 => "minecraft:sweeping_edge",
-        37 => "minecraft:swift_sneak",
-        38 => "minecraft:thorns",
-        39 => "minecraft:unbreaking",
-        40 => "minecraft:vanishing_curse",
-        41 => "minecraft:wind_burst",
-        _ => return None,
-    })
+    ENCHANT_SPECS
+        .iter()
+        .find(|spec| spec.id == id)
+        .map(|spec| spec.name)
 }
 // enchantments component blob: {ench:[{id,lvl}], showTooltip bool}
 fn enchantments_data(list: &[(i64, i64)], show_tip: bool) -> Vec<u8> {
@@ -585,26 +573,26 @@ fn enchant_level(c: &Comps, id: i64) -> i64 {
         .unwrap_or(0)
 }
 fn enchant_max_level(id: i64) -> i64 {
-    match id {
-        0 | 2 | 12 | 16 | 22 | 23 | 33 | 40 => 1, // aqua..infinity,mending,multishot,silk,vanishing
-        14 | 17 | 10 | 28 => 2,                   // frost, knockback, fire_aspect, punch
-        7 | 13 | 18 | 19 | 20 | 21 | 29 | 30 | 31 | 35 | 36 | 37 | 38 | 39 | 41 => 3,
-        3 | 4 | 9 | 11 | 24 | 26 | 27 => 4, // protection family, feather, breach, piercing
-        _ => 5,                             // damage/efficiency/power/impaling/density
-    }
+    ENCHANT_SPECS
+        .iter()
+        .find(|spec| spec.id == id)
+        .map(|spec| spec.max_level)
+        .unwrap_or(5)
 }
 // vanilla mutually-exclusive groups; some/any overlap forbids
 fn enchant_conflicts(a: i64, b: i64) -> bool {
-    const GROUPS: &[&[i64]] = &[
-        &[27, 3, 11, 26],   // protection family
-        &[32, 34, 1, 6, 4], // sharpness/smite/bane/density/breach
-        &[33, 13],          // silk_touch vs fortune
-        &[16, 22],          // infinity vs mending
-        &[31, 19, 5],       // riptide vs loyalty/channeling
-        &[7, 14],           // depth_strider vs frost_walker
-        &[23, 24],          // multishot vs piercing
-    ];
-    a != b && GROUPS.iter().any(|g| g.contains(&a) && g.contains(&b))
+    if a == b {
+        return false;
+    }
+    let group = |id| {
+        ENCHANT_SPECS
+            .iter()
+            .find(|spec| spec.id == id)
+            .map(|spec| spec.exclusive_group)
+            .unwrap_or(0)
+    };
+    let a_group = group(a);
+    a_group != 0 && a_group == group(b)
 }
 // TAG_String anonymous-NBT payload: type byte + modified-UTF-8 string.
 fn nbt_string(text: &str) -> Vec<u8> {
@@ -1189,12 +1177,40 @@ fn furnace_kind_at(dim: DimId, x: i32, y: i32, z: i32) -> FurnaceKind {
         .unwrap_or(FurnaceKind::Furnace)
 }
 
+type VanillaCookingRecipe = (&'static str, &'static str, bool, bool);
+
+// (input, output, furnace, smoker/campfire). Preserve the existing station
+// membership while sharing the duplicated food-recipe outputs.
+const VANILLA_COOKING_RECIPES: &[VanillaCookingRecipe] = &[
+    ("beef", "cooked_beef", true, true),
+    ("porkchop", "cooked_porkchop", true, true),
+    ("chicken", "cooked_chicken", true, true),
+    ("mutton", "cooked_mutton", true, true),
+    ("potato", "baked_potato", true, true),
+    ("rabbit", "cooked_rabbit", true, true),
+    ("cod", "cooked_cod", true, true),
+    ("salmon", "cooked_salmon", false, true),
+    ("kelp", "dried_kelp", false, true),
+    ("sand", "glass", true, false),
+    ("cobblestone", "stone", true, false),
+    ("oak_log", "charcoal", true, false),
+    ("raw_iron", "iron_ingot", true, false),
+    ("raw_copper", "copper_ingot", true, false),
+    ("raw_gold", "gold_ingot", true, false),
+];
+
+fn vanilla_cooking_recipe(input: &str) -> Option<&'static VanillaCookingRecipe> {
+    VANILLA_COOKING_RECIPES
+        .iter()
+        .find(|(recipe_input, _, _, _)| *recipe_input == input)
+}
+
 fn vanilla_smoking_input(item: i64) -> bool {
-    [
-        "beef", "chicken", "cod", "kelp", "mutton", "porkchop", "potato", "rabbit", "salmon",
-    ]
-    .iter()
-    .any(|name| name_to_item(name) == Some(item))
+    let Some(name) = item_to_name(item) else {
+        return false;
+    };
+    let input = name.rsplit_once(':').map_or(name, |(_, path)| path);
+    vanilla_cooking_recipe(input).is_some_and(|(_, _, _, smoker)| *smoker)
 }
 
 fn vanilla_blasting_input(item: i64) -> bool {
@@ -3121,26 +3137,10 @@ fn smelt_out(item: i64) -> Option<(i64, u8)> {
     smelt_result(item).map(|o| (o, 1))
 }
 fn smelt_result(item: i64) -> Option<i64> {
-    for (a, b) in [
-        ("beef", "cooked_beef"),
-        ("porkchop", "cooked_porkchop"),
-        ("chicken", "cooked_chicken"),
-        ("mutton", "cooked_mutton"),
-        ("sand", "glass"),
-        ("cobblestone", "stone"),
-        ("potato", "baked_potato"),
-        ("oak_log", "charcoal"),
-        ("raw_iron", "iron_ingot"),
-        ("raw_copper", "copper_ingot"),
-        ("raw_gold", "gold_ingot"),
-        ("rabbit", "cooked_rabbit"),
-        ("cod", "cooked_cod"),
-    ] {
-        if name_to_item(a) == Some(item) {
-            return name_to_item(b);
-        }
-    }
-    None
+    let name = item_to_name(item)?;
+    let input = name.rsplit_once(':').map_or(name, |(_, path)| path);
+    let (_, output, furnace, _) = vanilla_cooking_recipe(input)?;
+    (*furnace).then(|| name_to_item(output)).flatten()
 }
 fn smelt_xp(item: i64) -> f32 {
     for (ig, _, _, xp) in json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -8022,18 +8022,10 @@ fn live_campfire_result(item: &BlockEntityItem) -> Option<BlockEntityItem> {
     if item.id.namespace() != "minecraft" {
         return None;
     }
-    let result = match item.id.path() {
-        "beef" => "cooked_beef",
-        "chicken" => "cooked_chicken",
-        "cod" => "cooked_cod",
-        "kelp" => "dried_kelp",
-        "mutton" => "cooked_mutton",
-        "porkchop" => "cooked_porkchop",
-        "potato" => "baked_potato",
-        "rabbit" => "cooked_rabbit",
-        "salmon" => "cooked_salmon",
-        _ => return None,
-    };
+    let (_, result, _, smoker) = vanilla_cooking_recipe(item.id.path())?;
+    if !smoker {
+        return None;
+    }
     BlockEntityItem::new(result, 1)
 }
 
@@ -9945,6 +9937,21 @@ fn quick_move_chest(
 }
 // drag-paint one slot: place `per` items of the cursor stack into the
 // resolved window slot (merging if compatible), then resync
+fn paint_stack_into_slot(slot: &mut Stack, cur: &mut Stack, per: u8) -> bool {
+    if !(slot.1 == 0 || (slot.0 == cur.0 && slot.2 == cur.2))
+        || i64::from(slot.1) + i64::from(per) > item_stack_max(cur.0, &cur.2)
+    {
+        return false;
+    }
+    if slot.1 == 0 {
+        *slot = (cur.0, per, cur.2.clone());
+    } else {
+        slot.1 += per;
+    }
+    cur.1 -= per;
+    true
+}
+
 fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
     // Never paint more than the cursor holds: every arm below mutates the
     // destination and then does `cur.1 -= per`, which must not underflow.
@@ -9972,15 +9979,7 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
             (&mut *inv, wsl - rows + 9)
         };
         let st = m.entry(gslot).or_insert((0, 0, Vec::new()));
-        if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-            && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
-        {
-            if st.1 == 0 {
-                *st = (cur.0, per, cur.2.clone());
-            } else {
-                st.1 += per;
-            }
-            cur.1 -= per;
+        if paint_stack_into_slot(st, cur, per) {
             resync_slot(me, 1, wsl, st);
         }
     } else if furnace_pos.is_some() {
@@ -9990,15 +9989,7 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let k = wsl + 6;
             let st = inv.entry(k).or_insert((0, 0, Vec::new()));
-            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
-            {
-                if st.1 == 0 {
-                    *st = (cur.0, per, cur.2.clone());
-                } else {
-                    st.1 += per;
-                }
-                cur.1 -= per;
+            if paint_stack_into_slot(st, cur, per) {
                 resync_slot(me, 2, wsl, st);
             }
         }
@@ -10007,29 +9998,13 @@ fn paint_slot(me: &Client, wsl: i16, per: u8, cur: &mut Stack) {
         if (9..=44).contains(&wsl) {
             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             let st = inv.entry(wsl).or_insert((0, 0, Vec::new()));
-            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
-            {
-                if st.1 == 0 {
-                    *st = (cur.0, per, cur.2.clone());
-                } else {
-                    st.1 += per;
-                }
-                cur.1 -= per;
+            if paint_stack_into_slot(st, cur, per) {
                 resync_slot(me, 0, wsl, st);
             }
         } else if (1..=4).contains(&wsl) {
             let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
             let st = grid.entry(wsl).or_insert((0, 0, Vec::new()));
-            if (st.1 == 0 || (st.0 == cur.0 && st.2 == cur.2))
-                && (st.1 as i64 + per as i64) <= item_stack_max(cur.0, &cur.2)
-            {
-                if st.1 == 0 {
-                    *st = (cur.0, per, cur.2.clone());
-                } else {
-                    st.1 += per;
-                }
-                cur.1 -= per;
+            if paint_stack_into_slot(st, cur, per) {
                 resync_slot(me, 0, wsl, st);
             }
         }
