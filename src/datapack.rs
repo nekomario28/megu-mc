@@ -324,6 +324,79 @@ struct SmithingRecipe {
     result: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum CookingKind {
+    Smelting,
+    Blasting,
+    Smoking,
+    Campfire,
+}
+
+impl CookingKind {
+    fn from_recipe_type(id: &str) -> Option<Self> {
+        match dp_bare_id(id) {
+            "smelting" => Some(Self::Smelting),
+            "blasting" => Some(Self::Blasting),
+            "smoking" => Some(Self::Smoking),
+            "campfire_cooking" => Some(Self::Campfire),
+            _ => None,
+        }
+    }
+
+    /// Default for a missing `cookingtime`, as registered by the 1.21.1
+    /// RecipeSerializer (`cze`). Vanilla campfire JSON explicitly uses 600.
+    fn default_ticks(self) -> u32 {
+        match self {
+            Self::Smelting => 200,
+            Self::Blasting | Self::Smoking | Self::Campfire => 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CookingResult {
+    item: i64,
+    count: u8,
+    game_ticks: u32,
+    experience: f32,
+}
+
+struct CookingRecipe {
+    kind: CookingKind,
+    ingredients: Vec<Ingr>,
+    result: CookingResult,
+}
+
+#[derive(Default)]
+struct CookingRecipes {
+    by_id: std::collections::BTreeMap<String, (u64, CookingRecipe)>,
+    next_priority: u64,
+}
+
+impl CookingRecipes {
+    fn resolve(
+        &self,
+        kind: CookingKind,
+        item: i64,
+        tags: Option<&HashMap<String, Vec<String>>>,
+    ) -> Option<CookingResult> {
+        self.by_id
+            .values()
+            .filter(|(_, recipe)| {
+                recipe.kind == kind
+                    && recipe.ingredients.iter().any(|ingredient| match ingredient {
+                        Ingr::Item(id) => *id == item,
+                        Ingr::Tag(tag) => {
+                            tags.is_some_and(|tags| dp_item_tag_match(tags, tag, item))
+                        }
+                    })
+            })
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, recipe)| recipe.result)
+    }
+}
+
 /// Everything datapack-driven the core loader does not already publish to its
 /// own global: the full tag category set plus the non-crafting recipe indexes.
 /// Swapped atomically by `DatapackContent::publish` under its lock order.
@@ -337,6 +410,7 @@ struct DatapackRegistry {
     smithing_trim: Vec<SmithingRecipe>,
     /// recipe-id → recipe-type for `crafting_special_*` / `crafting_decorated_pot`.
     special_recipes: std::collections::BTreeMap<String, String>,
+    cooking: CookingRecipes,
 }
 
 fn datapack_registry() -> &'static Mutex<DatapackRegistry> {
@@ -351,7 +425,7 @@ fn datapack_registry() -> &'static Mutex<DatapackRegistry> {
 #[allow(dead_code)]
 const DPC1_MAGIC: &[u8; 4] = b"DPC1";
 #[allow(dead_code)]
-const DPC1_VERSION: u32 = 1;
+const DPC1_VERSION: u32 = 2;
 #[allow(dead_code)]
 const DPC1_HEADER_LEN: usize = 4 + 4 + 32 + 8 + 4;
 #[allow(dead_code)]
@@ -687,6 +761,9 @@ impl<'a> Dpc1Reader<'a> {
     fn i64(&mut self) -> Option<i64> {
         Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
     fn len(&mut self) -> Option<usize> {
         let n = self.u32()? as usize;
         (n <= DPC1_MAX_ENTRIES).then_some(n)
@@ -831,6 +908,18 @@ fn dpc1_encode(snapshot: &Dpc1Snapshot) -> Option<Vec<u8>> {
         }
     }
     dpc1_map_into(&mut out, &snapshot.registry.special_recipes);
+    let cooking = &snapshot.registry.cooking.by_id;
+    dpc1_u32_into(&mut out, cooking.len());
+    for (id, (priority, recipe)) in cooking {
+        dpc1_string_into(&mut out, id);
+        out.extend_from_slice(&priority.to_le_bytes());
+        out.push(recipe.kind as u8);
+        dpc1_ingredients_into(&mut out, &recipe.ingredients);
+        out.extend_from_slice(&recipe.result.item.to_le_bytes());
+        out.push(recipe.result.count);
+        out.extend_from_slice(&recipe.result.game_ticks.to_le_bytes());
+        out.extend_from_slice(&recipe.result.experience.to_bits().to_le_bytes());
+    }
     dpc1_u32_into(&mut out, snapshot.pack_verdicts.len());
     for (name, verdict) in &snapshot.pack_verdicts {
         dpc1_string_into(&mut out, name);
@@ -913,6 +1002,42 @@ fn dpc1_decode(bytes: &[u8]) -> Option<Dpc1Snapshot> {
         }
     }
     snapshot.registry.special_recipes = reader.map()?;
+    let cooking = &mut snapshot.registry.cooking;
+    let mut priorities = HashSet::new();
+    for _ in 0..reader.len()? {
+        let id = reader.string()?;
+        let priority = reader.u64()?;
+        if !priorities.insert(priority) {
+            return None;
+        }
+        cooking.next_priority = cooking.next_priority.max(priority.checked_add(1)?);
+        let kind = match reader.byte()? {
+            0 => CookingKind::Smelting,
+            1 => CookingKind::Blasting,
+            2 => CookingKind::Smoking,
+            3 => CookingKind::Campfire,
+            _ => return None,
+        };
+        let ingredients = reader.ingredients()?;
+        let result = CookingResult {
+            item: reader.i64()?,
+            count: reader.byte()?,
+            game_ticks: reader.u32()?,
+            experience: f32::from_bits(reader.u32()?),
+        };
+        if ingredients.is_empty()
+            || !(1..=64).contains(&result.count)
+            || result.game_ticks > i32::MAX as u32
+            || !result.experience.is_finite()
+            || result.experience < 0.0
+        {
+            return None;
+        }
+        let recipe = CookingRecipe { kind, ingredients, result };
+        if cooking.by_id.insert(id, (priority, recipe)).is_some() {
+            return None;
+        }
+    }
     for _ in 0..reader.len()? {
         let name = reader.string()?;
         let verdict = match reader.byte()? {
@@ -1336,7 +1461,7 @@ mod bot_boot_cache_tests {
             assert!(!hit, "truncated cache length {len} passed validation");
         }
         let mut wrong_schema = valid.clone();
-        wrong_schema[4..8].copy_from_slice(&2_u32.to_le_bytes());
+        wrong_schema[4..8].copy_from_slice(&(DPC1_VERSION + 1).to_le_bytes());
         std::fs::write(&path, wrong_schema).unwrap();
         let (_, hit) = dpc1_load_or_build(&root, &names, Some(&f.cache()), || {
             build_from_json(&root, &names)
@@ -1405,14 +1530,82 @@ fn dp_result_item(body: &str) -> Option<i64> {
     name.and_then(|n| name_to_item(dp_bare_id(n)))
 }
 
+fn dp_cooking(kind: CookingKind, json: &J) -> Option<CookingRecipe> {
+    fn ingredient(json: &J) -> Option<Ingr> {
+        if let Some(tag) = json.get("tag").map(J::str).or_else(|| json.str().strip_prefix('#')) {
+            return (!tag.is_empty()).then(|| Ingr::Tag(dp_norm_id(tag)));
+        }
+        let item = json.get("item").map_or_else(|| json.str(), J::str);
+        name_to_item(dp_bare_id(item)).map(Ingr::Item)
+    }
+    fn integer(json: Option<&J>, default: u32, max: u32) -> Option<u32> {
+        match json {
+            Some(J::Num(value)) if value.fract() == 0.0 && (0.0..=f64::from(max)).contains(value) => {
+                Some(*value as u32)
+            }
+            None => Some(default),
+            _ => None,
+        }
+    }
+    let ingredients = match json.get("ingredient")? {
+        J::Arr(values) => values.iter().map(ingredient).collect::<Option<Vec<_>>>()?,
+        single => vec![ingredient(single)?],
+    };
+    if ingredients.is_empty() {
+        return None;
+    }
+    let result = json.get("result")?;
+    let name = result.get("id").or_else(|| result.get("item")).unwrap_or(result).str();
+    let count = integer(result.get("count").or_else(|| json.get("count")), 1, 64)? as u8;
+    if count == 0 {
+        return None;
+    }
+    let experience = match json.get("experience") {
+        Some(J::Num(value)) if *value >= 0.0 && *value <= f64::from(f32::MAX) => *value as f32,
+        None => 0.0,
+        _ => return None,
+    };
+    Some(CookingRecipe {
+        kind,
+        ingredients,
+        result: CookingResult {
+            item: name_to_item(dp_bare_id(name))?,
+            count,
+            game_ticks: integer(json.get("cookingtime"), kind.default_ticks(), i32::MAX as u32)?,
+            experience,
+        },
+    })
+}
+
 impl DatapackContent {
-    /// Recipe types beyond the shaped/shapeless/cooking readers. Returns
-    /// `true` when the type was consumed here (even if a malformed file was
-    /// dropped), `false` to fall through to the legacy readers.
+    /// Returns `true` for a consumed type, even if its file was malformed.
+    /// A higher-priority recipe of any type replaces the lower copy by ID.
     fn read_extended_recipe(&mut self, key: &str, body: &str) -> bool {
-        let rtype = jstr(body, "type")
-            .unwrap_or("")
-            .trim_start_matches("minecraft:");
+        let cooking = &mut self.registry.cooking;
+        cooking.by_id.remove(key);
+        let Some(json) = jparse(body.as_bytes()) else {
+            eprintln!("[spine] skipping invalid recipe JSON {key}");
+            return true;
+        };
+        let rtype = dp_bare_id(json.get("type").map_or("", J::str));
+        if let Some(kind) = CookingKind::from_recipe_type(rtype) {
+            if let Some(recipe) = dp_cooking(kind, &json) {
+                // The legacy reload test observes this store, but live cooking
+                // consumes the typed registry below.
+                #[cfg(test)]
+                if kind == CookingKind::Smelting {
+                    let CookingResult { item, count, experience, .. } = recipe.result;
+                    self.smelts.extend(recipe.ingredients.iter().cloned().map(|ingredient| {
+                        (ingredient, item, count, experience)
+                    }));
+                }
+                cooking.by_id.insert(key.to_owned(), (cooking.next_priority, recipe));
+                cooking.next_priority += 1;
+            } else {
+                eprintln!("[spine] skipping unresolved or invalid {rtype} recipe {key}");
+            }
+            return true;
+        }
         match rtype {
             "stonecutting" => self.registry.stonecutting.extend(dp_stonecutting(body)),
             "smithing_transform" | "smithing" => {
@@ -3029,14 +3222,7 @@ fn loot_eff_weight(node: &LootEntryNode, luck: f32) -> i32 {
 /// `furnace_smelt`: the first smelting recipe whose ingredient matches.
 fn loot_smelt_result(item: &str) -> Option<String> {
     let item_id = name_to_item(dp_bare_id(item))?;
-    json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|(ingr, out, _, _)| {
-        let hit = match ingr {
-            Ingr::Item(id) => *id == item_id,
-            Ingr::Tag(tag) => loot_item_in_tag(tag, item),
-        };
-        hit.then(|| item_to_name(*out).map(dp_norm_id))
-            .flatten()
-    })
+    smelt_out(item_id).and_then(|(output, _)| item_to_name(output)).map(dp_norm_id)
 }
 
 fn loot_apply_func_nodes(drop: &mut LootDrop, nodes: &[LootFuncNode], ctx: &mut LootEvalContext) {
@@ -3349,6 +3535,7 @@ struct DatapackEnchantment {
     raw: String,
     description: String,
     supported_items: Vec<String>,
+    exclusive_set: Vec<String>,
     weight: i64,
     max_level: i64,
     anvil_cost: i64,
@@ -3471,6 +3658,7 @@ fn dyn_enchantment(body: &str, j: &J) -> DatapackEnchantment {
         raw: body.to_owned(),
         description: dyn_jtext(j, "description"),
         supported_items: dyn_jstr_list(j, "supported_items"),
+        exclusive_set: dyn_jstr_list(j, "exclusive_set"),
         weight: dpj_i64(j, "weight"),
         max_level: dpj_i64(j, "max_level"),
         anvil_cost: dpj_i64(j, "anvil_cost"),

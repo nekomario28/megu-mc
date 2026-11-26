@@ -100,7 +100,6 @@ type TestChunkRegion = (HashSet<(i32, i32)>, HashSet<(i32, i32)>);
 type Comps = Vec<(i64, Vec<u8>)>;
 type Stack = (i64, u8, Comps);
 // component type ids (SlotComponentType mapper)
-#[allow(dead_code)]
 const COMP_CUSTOM_DATA: i64 = 0;
 const COMP_MAX_DAMAGE: i64 = 2;
 const COMP_DAMAGE: i64 = 3;
@@ -491,8 +490,7 @@ fn block_hardness(b: i64) -> f32 {
 /// call sites must ask the same question.
 /// Test-only: production goes through item_stack_max, which resolves the item to its
 /// block first.
-#[cfg(test)]
-#[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn stack_size_of(st: u32) -> i64 {
     crate::block_registry::breg()
         .map(|reg| reg.stack_size_of(st))
@@ -572,7 +570,19 @@ fn enchant_level(c: &Comps, id: i64) -> i64 {
         .map(|(_, l)| *l)
         .unwrap_or(0)
 }
+fn loaded_enchantment<T>(id: i64, read: impl FnOnce(&DatapackEnchantment) -> T) -> Option<T> {
+    let name = enchant_name(id)?;
+    let registry = dynamic_registries().lock().unwrap_or_else(|e| e.into_inner());
+    registry.enchantment.get(name).map(read)
+}
+
 fn enchant_max_level(id: i64) -> i64 {
+    if let Some(level) = loaded_enchantment(id, |entry| entry.max_level) {
+        return level;
+    }
+    if vanilla_datapack_loaded() {
+        return 0;
+    }
     ENCHANT_SPECS
         .iter()
         .find(|spec| spec.id == id)
@@ -583,6 +593,19 @@ fn enchant_max_level(id: i64) -> i64 {
 fn enchant_conflicts(a: i64, b: i64) -> bool {
     if a == b {
         return false;
+    }
+    let exclusive_set = |id| loaded_enchantment(id, |entry| entry.exclusive_set.clone());
+    let (a_exclusions, b_exclusions) = (exclusive_set(a), exclusive_set(b));
+    if a_exclusions.is_some() || b_exclusions.is_some() || vanilla_datapack_loaded() {
+        let excludes = |set: Option<Vec<String>>, id| {
+            enchant_name(id).is_some_and(|name| {
+                set.into_iter().flatten().any(|member| match member.strip_prefix('#') {
+                    Some(tag) => datapack_tag_contains("enchantment", &dp_norm_id(tag), name),
+                    None => dp_norm_id(&member) == name,
+                })
+            })
+        };
+        return excludes(a_exclusions, b) || excludes(b_exclusions, a);
     }
     let group = |id| {
         ENCHANT_SPECS
@@ -601,9 +624,23 @@ fn nbt_string(text: &str) -> Vec<u8> {
     d
 }
 
-// vanilla enchantability, approximated: damageable items accept
-// unbreaking/mending always; weapons/tools/armor accept their usual sets.
 fn enchant_applicable(item: i64, eid: i64) -> bool {
+    if let Some(supported) = loaded_enchantment(eid, |entry| entry.supported_items.clone()) {
+        return supported.into_iter().any(|member| match member.strip_prefix('#') {
+            Some(tag) => {
+                let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+                registry.tags.get("item").is_some_and(|tags| {
+                    dp_item_tag_match(tags, &dp_norm_id(tag), item)
+                })
+            }
+            None => name_to_item(dp_bare_id(&member)) == Some(item),
+        });
+    }
+    if vanilla_datapack_loaded() {
+        return false;
+    }
+    // Stripped fallback: damageable items accept unbreaking/mending;
+    // weapons/tools/armor accept their usual families.
     let band = if (818..=847).contains(&item) {
         Some(((item - 818) / 5, (item - 818) % 5))
     } else {
@@ -864,7 +901,7 @@ fn note_drop_dim(eid: i32, dim: DimId) {
 /// The dimension an eid's item entity lives in, `DimId::Overworld` when no
 /// non-Overworld spawn ever registered it. Readers that scan a whole pool
 /// hoist the `drop_dims()` lock instead; single-lookup callers use this.
-#[allow(dead_code)]
+#[cfg(test)]
 fn drop_dim_of(eid: i32) -> DimId {
     drop_dims()
         .lock()
@@ -1154,11 +1191,16 @@ impl FurnaceKind {
         }
     }
 
-    fn cook_game_ticks(self) -> u64 {
+    fn recipe_kind(self) -> CookingKind {
         match self {
-            Self::BlastFurnace | Self::Smoker => 100,
-            Self::Furnace => 200,
+            Self::Furnace => CookingKind::Smelting,
+            Self::BlastFurnace => CookingKind::Blasting,
+            Self::Smoker => CookingKind::Smoking,
         }
+    }
+
+    fn cook_game_ticks(self) -> u32 {
+        self.recipe_kind().default_ticks()
     }
 }
 
@@ -1205,14 +1247,6 @@ fn vanilla_cooking_recipe(input: &str) -> Option<&'static VanillaCookingRecipe> 
         .find(|(recipe_input, _, _, _)| *recipe_input == input)
 }
 
-fn vanilla_smoking_input(item: i64) -> bool {
-    let Some(name) = item_to_name(item) else {
-        return false;
-    };
-    let input = name.rsplit_once(':').map_or(name, |(_, path)| path);
-    vanilla_cooking_recipe(input).is_some_and(|(_, _, _, smoker)| *smoker)
-}
-
 fn vanilla_blasting_input(item: i64) -> bool {
     let Some(name) = item_to_name(item) else { return false };
     let path = name.rsplit_once(':').map_or(name, |(_, path)| path);
@@ -1231,36 +1265,74 @@ fn vanilla_blasting_input(item: i64) -> bool {
         )
 }
 
-fn furnace_recipe_out(kind: FurnaceKind, item: i64) -> Option<(i64, u8)> {
-    // Datapack cooking types are combined by the legacy loader. Built-in vanilla
-    // families are still filtered exactly; unknown datapack entries remain
-    // accepted by every cooking station rather than disappearing outright.
-    let custom = json_smelts()
+fn vanilla_datapack_loaded() -> bool {
+    packs()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
-        .find(|(ingredient, _, _, _)| ingr_match(ingredient, item, 0))
-        .map(|(_, output, count, _)| (*output, *count));
-    if custom.is_some() {
-        let smoking = vanilla_smoking_input(item);
-        let blasting = vanilla_blasting_input(item);
-        // The legacy datapack loader discards the cooking recipe type. Once an
-        // input is outside both vanilla families there is no remaining type
-        // evidence, so keep that datapack recipe available instead of deleting
-        // it from every specialized station.
-        let unknown = !smoking && !blasting;
-        return match kind {
-            FurnaceKind::Furnace => custom,
-            FurnaceKind::Smoker => custom.filter(|_| smoking || unknown),
-            FurnaceKind::BlastFurnace => custom.filter(|_| blasting || unknown),
-        };
+        .any(|pack| matches!(pack.name.as_str(), "vanilla" | "vanilla_jar"))
+}
+
+fn cooking_result(kind: CookingKind, item: i64) -> Option<CookingResult> {
+    let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(result) = registry.cooking.resolve(kind, item, registry.tags.get("item")) {
+        return Some(result);
     }
-    let builtin = smelt_result(item).map(|output| (output, 1))?;
-    match kind {
-        FurnaceKind::Furnace => Some(builtin),
-        FurnaceKind::Smoker => vanilla_smoking_input(item).then_some(builtin),
-        FurnaceKind::BlastFurnace => vanilla_blasting_input(item).then_some(builtin),
+    let vanilla_loaded = vanilla_datapack_loaded();
+    #[cfg(test)]
+    let has_typed_recipes = !registry.cooking.by_id.is_empty();
+    drop(registry);
+    if vanilla_loaded {
+        return None;
     }
+
+    // Older stripped fixtures directly seed the legacy smelting tuple store.
+    #[cfg(test)]
+    if kind == CookingKind::Smelting && !has_typed_recipes {
+        if let Some((_, output, count, experience)) = json_smelts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(ingredient, _, _, _)| ingr_match(ingredient, item, 0))
+        {
+            return Some(CookingResult {
+                item: *output,
+                count: *count,
+                game_ticks: FurnaceKind::Furnace.cook_game_ticks(),
+                experience: *experience,
+            });
+        }
+    }
+    stripped_cooking_result(kind, item)
+}
+
+fn stripped_cooking_result(kind: CookingKind, item: i64) -> Option<CookingResult> {
+    let input = dp_bare_id(item_to_name(item)?);
+    let (_, output, furnace, smoker) = *vanilla_cooking_recipe(input)?;
+    let game_ticks = match kind {
+        CookingKind::Smelting if furnace => FurnaceKind::Furnace.cook_game_ticks(),
+        CookingKind::Blasting if furnace && vanilla_blasting_input(item) => {
+            FurnaceKind::BlastFurnace.cook_game_ticks()
+        }
+        CookingKind::Smoking if furnace && smoker => {
+            FurnaceKind::Smoker.cook_game_ticks()
+        }
+        CookingKind::Campfire if smoker => 600,
+        _ => return None,
+    };
+    let experience = match input {
+        "raw_gold" => 1.0,
+        "raw_iron" | "raw_copper" => 0.7,
+        "beef" | "porkchop" | "chicken" | "mutton" | "rabbit" | "cod" | "salmon" | "potato" | "kelp" => 0.35,
+        "oak_log" => 0.15,
+        _ => 0.1,
+    };
+    Some(CookingResult { item: name_to_item(output)?, count: 1, game_ticks, experience })
+}
+
+#[cfg(test)]
+fn furnace_recipe_out(kind: FurnaceKind, item: i64) -> Option<(i64, u8)> {
+    cooking_result(kind.recipe_kind(), item).map(|r| (r.item, r.count))
 }
 
 fn furnace_xp_award_dim(px: f64, py: f64, pz: f64) -> DimId {
@@ -1334,9 +1406,9 @@ fn furnace_tick() {
             // resolved once per revision instead of scanning every datapack recipe
             // for every furnace on every tick.
             let rev = content_revision();
-            f.recipe_cache
-                .get_or_compute((f.input.0, rev), || {
-                furnace_recipe_out(furnace_kind_at(pos.0, pos.1, pos.2, pos.3), f.input.0)
+            f.recipe_cache.get_or_compute((f.input.0, rev), || {
+                let kind = furnace_kind_at(pos.0, pos.1, pos.2, pos.3).recipe_kind();
+                cooking_result(kind, f.input.0)
             })
         } else {
             None
@@ -1348,9 +1420,9 @@ fn furnace_tick() {
                 .as_ref()
                 .map(|o| {
                     f.output.1 == 0
-                        || (f.output.0 == o.0
+                        || (f.output.0 == o.item
                             && f.output.2.is_empty()
-                            && f.output.1 as i64 + o.1 as i64 <= stack_max_of(&f.output))
+                            && i64::from(f.output.1) + i64::from(o.count) <= stack_max_of(&f.output))
                 })
                 .unwrap_or(false);
         if f.burn_left <= 0 && can_smelt && f.fuel.1 > 0 {
@@ -1366,16 +1438,13 @@ fn furnace_tick() {
                 f.dirty = true;
             }
         }
-        if f.burn_left > 0 && can_smelt {
+        if let Some(recipe) = out.filter(|_| f.burn_left > 0 && can_smelt) {
             f.burn_left -= 1;
             f.progress += 1;
-            if f.progress
-                >= server_ticks(furnace_kind_at(pos.0, pos.1, pos.2, pos.3).cook_game_ticks()) as i32
-            {
+            if f.progress >= server_ticks(u64::from(recipe.game_ticks)) as i32 {
                 f.progress = 0;
-                let r = out.unwrap();
-                f.xp += smelt_xp(f.input.0);
-                f.output = (r.0, f.output.1 + r.1, f.output.2.clone());
+                f.xp += recipe.experience;
+                f.output = (recipe.item, f.output.1 + recipe.count, Vec::new());
                 f.input.1 -= 1;
                 if f.input.1 == 0 {
                     f.input = (0, 0, Vec::new());
@@ -1615,11 +1684,6 @@ fn each_suction_cell(hx: i32, hy: i32, hz: i32, mut f: impl FnMut(i32, i32, i32)
 /// Whether any snap sits in the suction cell — the O(1) idle exit for
 /// `hopper_suck`. A `false` here is only reached after `ensure_drop_cells`
 /// proved the index matches `drops()` membership.
-#[allow(dead_code)] // the Overworld view of `suction_nonempty_in`
-fn suction_nonempty(hx: i32, hy: i32, hz: i32) -> bool {
-    suction_nonempty_in(DimId::Overworld, hx, hy, hz)
-}
-/// `suction_nonempty` restricted to drops spawned in `dim`.
 fn suction_nonempty_in(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
     ensure_drop_cells();
     let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
@@ -1634,11 +1698,6 @@ fn suction_nonempty_in(dim: DimId, hx: i32, hy: i32, hz: i32) -> bool {
 /// eid — the same order `hopper_suck` scans them in. The caller owns `out`
 /// (a reusable scratch buffer in the probe) so an idle visit allocates
 /// nothing.
-#[allow(dead_code)] // the Overworld view of `suction_snaps_into_in`
-fn suction_snaps_into(hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
-    suction_snaps_into_in(DimId::Overworld, hx, hy, hz, out)
-}
-/// `suction_snaps_into` restricted to drops spawned in `dim`.
 fn suction_snaps_into_in(dim: DimId, hx: i32, hy: i32, hz: i32, out: &mut Vec<DropCellSnap>) {
     ensure_drop_cells();
     let dc = drop_cells().lock().unwrap_or_else(|e| e.into_inner());
@@ -3076,7 +3135,7 @@ struct Furnace {
     progress: i32,
     dirty: bool,
     xp: f32,
-    recipe_cache: CachedLookup<(i64, u64), Option<(i64, u8)>>,
+    recipe_cache: CachedLookup<(i64, u64), Option<CookingResult>>,
     fuel_cache: CachedLookup<i64, i32>,
 }
 static FURNACES: Registry<DimBlockPos, Furnace> = OnceLock::new();
@@ -3124,54 +3183,17 @@ fn content_revision() -> u64 {
     CONTENT_REVISION.load(Ordering::Acquire)
 }
 
-/// The smelting result, independent of which furnace is asking. Datapack recipes
-/// and tags are mutable, so a caller that caches this must include
-/// `content_revision()` in the key. The result never carries components, which is
-/// why the cache can hold a plain pair rather than a whole stack.
+/// Ordinary smelting for loot and callers that do not have a station kind.
+/// Caches must include `content_revision()` (recipes and tags reload together).
 fn smelt_out(item: i64) -> Option<(i64, u8)> {
-    for (ig, o, c, _) in json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        if ingr_match(ig, item, 0) {
-            return Some((*o, *c));
-        }
-    }
-    smelt_result(item).map(|o| (o, 1))
+    cooking_result(CookingKind::Smelting, item).map(|r| (r.item, r.count))
 }
 fn smelt_result(item: i64) -> Option<i64> {
-    let name = item_to_name(item)?;
-    let input = name.rsplit_once(':').map_or(name, |(_, path)| path);
-    let (_, output, furnace, _) = vanilla_cooking_recipe(input)?;
-    (*furnace).then(|| name_to_item(output)).flatten()
+    smelt_out(item).map(|(output, _)| output)
 }
+#[cfg(test)]
 fn smelt_xp(item: i64) -> f32 {
-    for (ig, _, _, xp) in json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        if ingr_match(ig, item, 0) {
-            return *xp;
-        }
-    }
-    for (n, x) in [
-        ("raw_gold", 1.0f32),
-        ("raw_iron", 0.7),
-        ("raw_copper", 0.7),
-        ("beef", 0.35),
-        ("porkchop", 0.35),
-        ("chicken", 0.35),
-        ("mutton", 0.35),
-        ("rabbit", 0.35),
-        ("cod", 0.35),
-        ("salmon", 0.35),
-        ("potato", 0.35),
-        ("kelp", 0.35),
-        ("oak_log", 0.15),
-    ] {
-        if name_to_item(n) == Some(item) {
-            return x;
-        }
-    }
-    if smelt_result(item).is_some() {
-        0.1
-    } else {
-        0.0
-    }
+    cooking_result(CookingKind::Smelting, item).map_or(0.0, |r| r.experience)
 }
 // grant accumulated smelting xp: floor + fractional chance (vanilla), as orbs at (px,py,pz)
 fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
@@ -3461,7 +3483,6 @@ fn unpack_window_loot_if_needed(window: (ContainerKey, Option<ContainerKey>)) {
 // evaluated stacks go through the same slot shuffle and count splitting the
 // seeded `abandoned_mineshaft` table uses, then land in `slot_limit` slots.
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     let mut out = Vec::new();
     if depth > 8 {
@@ -3490,7 +3511,6 @@ fn loot_json_tag_items(tag: &str, depth: usize) -> Vec<&'static str> {
     out
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_stack(
     item: &crate::chest_loot::LootItem,
     extra_components: Option<&Comps>,
@@ -3522,7 +3542,6 @@ fn loot_json_stack(
     (count > 0).then_some((id, count as u8, comps))
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32) -> i32 {
     if min >= max {
         min
@@ -3531,7 +3550,6 @@ fn loot_json_next_int(rng: &mut crate::generation_math::Lcg, min: i32, max: i32)
     }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
     for i in (2..=list.len()).rev() {
         let j = rng.next_bound(i as i32) as usize;
@@ -3541,7 +3559,6 @@ fn loot_json_shuffle<T>(list: &mut [T], rng: &mut crate::generation_math::Lcg) {
 
 // The same split vanilla applies when a rolled stack does not fit the free
 // slots: oversized stacks are divided at random, then the survivors shuffle.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn loot_json_split(
     items: Vec<Stack>,
     empty_slots: usize,
@@ -3619,7 +3636,7 @@ fn exploration_map_target(
 
 /// Roll a complete loot-table JSON document into unplaced item stacks. Used
 /// by the live mod GLM engine when a modifier references another table.
-#[cfg_attr(not(feature = "mod-suite"), allow(dead_code))]
+#[cfg(feature = "mod-suite")]
 pub(crate) fn roll_loot_table_stacks(
     table_json: &str,
     seed: i64,
@@ -3664,7 +3681,7 @@ pub(crate) fn roll_loot_table_stacks(
 /// Fill `slot_limit` container slots from a raw loot-table JSON body
 /// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
 /// matching `RandomizableContainer.unpackLootTable`.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn unpack_loot_table_json(
     table_json: &str,
     seed: i64,
@@ -5724,7 +5741,6 @@ pub(crate) struct BeaconPulse {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Beacon {
     levels: i32,
     pub(crate) primary: Option<BeaconEffect>,
@@ -5733,7 +5749,6 @@ pub(crate) struct Beacon {
     pub(crate) lock: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Beacon {
     pub(crate) fn levels(&self) -> i32 {
         self.levels
@@ -5836,6 +5851,7 @@ impl Beacon {
 #[derive(Default)]
 struct BeaconMenu {
     payment: Stack,
+    #[cfg(test)]
     anchor: Option<DimBlockPos>,
     power_level: i16,
 }
@@ -5862,7 +5878,7 @@ fn beacon_effect_wire_id(effect: BeaconEffect) -> i16 {
 /// The pyramid tier that unlocks an effect on the vanilla beacon screen:
 /// tier 1 Speed/Haste, tier 2 Resistance/Jump Boost, tier 3 Strength,
 /// tier 4 Regeneration.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn beacon_effect_tier(effect: BeaconEffect) -> i16 {
     match effect {
         BeaconEffect::Speed | BeaconEffect::Haste => 1,
@@ -5875,7 +5891,7 @@ fn beacon_effect_tier(effect: BeaconEffect) -> i16 {
 /// Vanilla `BeaconScreen`/`BeaconMenu` gating: a primary effect must be
 /// unlocked by the pyramid's level, and a secondary exists only at level 4 —
 /// either Regeneration or the primary again (which vanilla applies as Tier II).
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn beacon_selection_allowed(
     power_level: i16,
     primary: Option<BeaconEffect>,
@@ -5904,7 +5920,7 @@ fn beacon_selection_allowed(
 /// reaching `BeaconBlockEntity`): validates the effects against the pyramid
 /// tiers, consumes one `#minecraft:beacon_payment_items` item from slot 0,
 /// and updates the beacon state. Returns whether the update was applied.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn apply_live_beacon_update(
     menu: &mut BeaconMenu,
     primary_effect: Option<BeaconEffect>,
@@ -5944,14 +5960,12 @@ fn apply_live_beacon_update(
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Campfire {
     pub(crate) slots: [Option<BlockEntityItem>; 4],
     pub(crate) cooking_times: [i32; 4],
     pub(crate) cooking_total_times: [i32; 4],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Campfire {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         fn times(tag: &Tag, key: &str) -> [i32; 4] {
@@ -6027,13 +6041,11 @@ impl Campfire {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Lectern {
     book: Option<BlockEntityItem>,
     page: i32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Lectern {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let mut lectern = Self {
@@ -6120,13 +6132,11 @@ impl Lectern {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ChiseledBookshelf {
     pub(crate) slots: [Option<BlockEntityItem>; 6],
     last_interacted_slot: Option<usize>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl ChiseledBookshelf {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let slot = block_entity_number(tag, "last_interacted_slot").unwrap_or(-1);
@@ -6204,7 +6214,6 @@ impl BlockLootTable {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct DecoratedPot {
     // Back, left, right, front, in the order used by the PotDecorations codec.
     pub(crate) sherds: [Option<ResourceLocation>; 4],
@@ -6212,7 +6221,6 @@ pub(crate) struct DecoratedPot {
     pub(crate) loot_table: Option<BlockLootTable>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl DecoratedPot {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let mut pot = Self {
@@ -6302,7 +6310,6 @@ impl DecoratedPot {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Crafter {
     slots: [Option<BlockEntityItem>; 9],
     disabled: [bool; 9],
@@ -6311,7 +6318,6 @@ pub(crate) struct Crafter {
     pub(crate) loot_table: Option<BlockLootTable>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Crafter {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let loot_table = BlockLootTable::from_nbt(tag);
@@ -6486,13 +6492,11 @@ pub(crate) enum JukeboxTick {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Jukebox {
     record: Option<BlockEntityItem>,
     playback: Option<(i64, JukeboxSong)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Jukebox {
     pub(crate) fn from_nbt(
         tag: &Tag,
@@ -6628,13 +6632,11 @@ pub(crate) struct BannerPattern {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Banner {
     pub(crate) patterns: Vec<BannerPattern>,
     pub(crate) custom_name: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Banner {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let patterns = block_entity_entries(tag, "patterns")
@@ -6797,14 +6799,12 @@ impl SkullProfile {
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Skull {
     pub(crate) note_block_sound: Option<ResourceLocation>,
     pub(crate) profile: Option<SkullProfile>,
     pub(crate) custom_name: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Skull {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         Self {
@@ -6834,7 +6834,6 @@ impl Skull {
 }
 
 #[derive(Debug, Default, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Brushable {
     pub(crate) item: Option<BlockEntityItem>,
     pub(crate) loot_table: Option<BlockLootTable>,
@@ -6857,7 +6856,6 @@ pub(crate) enum BrushResult {
     },
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Brushable {
     // Direction ordinal order in the vanilla client update tag.
     const DIRECTIONS: [Face; 6] = [
@@ -7126,7 +7124,6 @@ fn trial_spawner_fallback_loot_table(ominous: bool, roll: u64) -> ResourceLocati
 }
 
 #[derive(Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TrialSpawner {
     // The normal/ominous configs and SpawnData have their own codecs. Keep their
     // nested settings intact while exposing the counters needed for game ticks.
@@ -7165,7 +7162,6 @@ impl Default for TrialSpawner {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl TrialSpawner {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let defaults = Self::default();
@@ -7431,7 +7427,6 @@ impl VaultConfig {
 }
 
 #[derive(Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Vault {
     // The phase belongs to the blockstate and is supplied when loading the payload.
     pub(crate) phase: VaultPhase,
@@ -7461,7 +7456,6 @@ impl Default for Vault {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Vault {
     pub(crate) fn from_nbt(tag: &Tag, phase: VaultPhase) -> Self {
         let empty = Tag::End;
@@ -7712,7 +7706,6 @@ impl LiveBlockEntity {
     }
 
     // This payload is separate from the block state and scheduled ticks.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn to_nbt(&self) -> Tag {
         match self {
             Self::Beacon(entity) => entity.to_nbt(),
@@ -7951,7 +7944,6 @@ impl LiveBlockEntityStore {
 }
 
 // Snapshot callers keep the block state alongside this vanilla NBT payload.
-#[cfg_attr(not(test), allow(dead_code))]
 fn live_block_entity_snapshot(key @ (dim, x, y, z): DimBlockPos) -> Option<(u32, Tag)> {
     with_save_guard(|| {
         let reg = breg()?;
@@ -7969,7 +7961,6 @@ fn live_block_entity_snapshot(key @ (dim, x, y, z): DimBlockPos) -> Option<(u32,
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn restore_live_block_entity(key @ (dim, x, y, z): DimBlockPos, tag: &Tag) -> bool {
     with_save_guard(|| {
         let Some(reg) = breg() else { return false };
@@ -8016,17 +8007,18 @@ impl BlockEntityItem {
     }
 }
 
-// Built-in campfire recipes from the 1.21.1 server recipe data. The shared
-// smelting table combines recipe types and discards cookingtime.
+fn live_campfire_recipe(item: &BlockEntityItem) -> Option<CookingResult> {
+    let id = if item.id.namespace() == "minecraft" {
+        name_to_item(item.id.path())?
+    } else {
+        name_to_item(&item.id.to_string())?
+    };
+    cooking_result(CookingKind::Campfire, id)
+}
+
 fn live_campfire_result(item: &BlockEntityItem) -> Option<BlockEntityItem> {
-    if item.id.namespace() != "minecraft" {
-        return None;
-    }
-    let (_, result, _, smoker) = vanilla_cooking_recipe(item.id.path())?;
-    if !smoker {
-        return None;
-    }
-    BlockEntityItem::new(result, 1)
+    let recipe = live_campfire_recipe(item)?;
+    BlockEntityItem::new(item_to_name(recipe.item)?, recipe.count)
 }
 
 fn live_jukebox_song(item: &BlockEntityItem) -> Option<JukeboxSong> {
@@ -8207,7 +8199,9 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
                 LiveBlockEntity::Campfire(fire)
                     if reg.get_prop(state, "lit").as_deref() == Some("true") =>
                 {
-                    fire.place(&mut held, |item| live_campfire_result(item).map(|_| 600))
+                    fire.place(&mut held, |item| {
+                        live_campfire_recipe(item).map(|recipe| recipe.game_ticks as i32)
+                    })
                         .is_some()
                 }
                 LiveBlockEntity::Lectern(lectern, _) => {
@@ -9723,7 +9717,6 @@ static DEATH_SLOT_RESTORE: AtomicBool = AtomicBool::new(false);
 fn death_slot_restore_enabled() -> bool {
     DEATH_SLOT_RESTORE.load(Ordering::Relaxed)
 }
-#[cfg_attr(not(test), allow(dead_code))]
 fn set_death_slot_restore(enabled: bool) {
     DEATH_SLOT_RESTORE.store(enabled, Ordering::Relaxed);
 }
@@ -9738,6 +9731,7 @@ struct DeathSlotHint {
 }
 /// Hard bound on live hints so a death-drop flood cannot grow this table
 /// without end; the oldest recorded slot loses its hint first.
+#[cfg(test)]
 const MAX_DEATH_SLOT_HINTS: usize = 4096;
 struct DeathSlotHintTable {
     map: HashMap<i32, DeathSlotHint>,
@@ -9754,7 +9748,7 @@ fn death_slot_hints() -> &'static Mutex<DeathSlotHintTable> {
 }
 /// Record that `drop_eid` was scattered from `original_slot` of `owner_name`'s
 /// inventory. Leaf lock: never held while another lock is taken.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn death_slot_hint_record(drop_eid: i32, owner_name: &str, original_slot: i16) {
     let mut hints = death_slot_hints().lock().unwrap_or_else(|e| e.into_inner());
     if !hints.map.contains_key(&drop_eid) {
@@ -9864,7 +9858,7 @@ fn insert_with_death_slot_restore(
 /// Spawn a drop that carries a death-slot hint: a real item entity whose
 /// pickup may restore it to `original_slot` for `owner_name` while the opt-in
 /// is set. Returns the drop id, or -1 for an empty stack.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn spawn_death_drop(
     (x, y, z): (f64, f64, f64),
     stack: Stack,
@@ -10974,7 +10968,6 @@ fn live_smithing_take(
 /// brewing stand, spawner), then the live block entities menus materialize,
 /// then the classic container fullness for chests, barrels, dispensers,
 /// droppers, hoppers and furnaces.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn live_comparator_signal_at(dim: DimId, x: i32, y: i32, z: i32) -> Option<u8> {
     if let Some(signal) = comparator_signal_at_be(dim, (x, y, z)) {
         return Some(signal);
@@ -11645,6 +11638,7 @@ fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u3
         "minecraft:loom" => LiveMenu::Loom(LoomMenu::default()),
         "minecraft:cartography_table" => LiveMenu::Cartography(CartographyMenu::default()),
         "minecraft:beacon" => LiveMenu::Beacon(BeaconMenu {
+            #[cfg(test)]
             anchor: Some(key),
             ..Default::default()
         }),
@@ -11800,8 +11794,7 @@ fn anvil_hover_name(stack: &Stack) -> String {
 // before banner_patterns at 49.
 const COMP_BANNER_PATTERNS: i64 = 49;
 
-// `minecraft:banner_pattern` registry order from the captured 1.21.1
-// Configuration packet (config_packets.bin): `base` at 0, then alphabetical.
+// Stripped fallback, from 1.21.1 Registry Data: `base` at 0, then alphabetical.
 const BANNER_PATTERN_REGISTRY: &[&str] = &[
     "base",
     "border",
@@ -11848,6 +11841,38 @@ const BANNER_PATTERN_REGISTRY: &[&str] = &[
     "triangles_top",
 ];
 
+/// Holder IDs are sent in Registry Data order, not by asset ID or loom tag.
+/// Captured login streams preserve their numeric IDs on pack overlays;
+/// synthesized streams use the registry builder's order instead.
+fn live_banner_pattern_order() -> Arc<[String]> {
+    type BannerOrder = (u64, Arc<[String]>);
+    static ORDER: OnceLock<Mutex<BannerOrder>> = OnceLock::new();
+    let revision = content_revision();
+    let mut cached = ORDER
+        .get_or_init(|| Mutex::new((u64::MAX, Arc::default())))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cached.0 != revision {
+        let vanilla_loaded = vanilla_datapack_loaded();
+        let packets = if vanilla_loaded || std::path::Path::new("config_packets.bin").is_file() {
+            load_config_packets()
+        } else {
+            Vec::new()
+        };
+        let names = packets.iter()
+            .filter_map(|(_, packet)| config_registry_header(packet))
+            .find(|(id, _)| *id == "minecraft:banner_pattern")
+            .and_then(|(_, body)| registry_wire_entries(body));
+        let order = match names {
+            Some(entries) => entries.into_iter().map(|(name, _)| dp_bare_id(name).to_owned()).collect(),
+            None if !vanilla_loaded => BANNER_PATTERN_REGISTRY.iter().map(|name| (*name).to_owned()).collect(),
+            None => Arc::default(),
+        };
+        *cached = (revision, order);
+    }
+    Arc::clone(&cached.1)
+}
+
 // Read the banner's banner_patterns component into menu layers. Inline
 // (non-registry) pattern definitions keep their asset id as the pattern name,
 // which re-encodes inline.
@@ -11859,6 +11884,7 @@ fn live_banner_layers(stack: &Stack) -> Vec<BannerLayer> {
     let Some(count) = read_protocol_i32(&mut data) else {
         return layers;
     };
+    let order = live_banner_pattern_order();
     for _ in 0..count.clamp(0, 256) {
         let Some(holder) = read_protocol_i32(&mut data) else {
             break;
@@ -11872,10 +11898,10 @@ fn live_banner_layers(stack: &Stack) -> Vec<BannerLayer> {
             };
             asset.to_string()
         } else {
-            let Some(&name) = BANNER_PATTERN_REGISTRY.get((holder - 1) as usize) else {
+            let Some(name) = order.get((holder - 1) as usize) else {
                 break;
             };
-            name.to_string()
+            name.clone()
         };
         let Some(color) = read_protocol_i32(&mut data) else {
             break;
@@ -11894,21 +11920,47 @@ fn live_banner_layers(stack: &Stack) -> Vec<BannerLayer> {
 fn live_banner_patterns_data(layers: &[BannerLayer]) -> Vec<u8> {
     let mut data = Vec::new();
     write_varint(&mut data, layers.len() as i64);
+    let order = live_banner_pattern_order();
+    let definitions = dynamic_registries().lock().unwrap_or_else(|e| e.into_inner());
     for layer in layers {
-        if let Some(id) = BANNER_PATTERN_REGISTRY
-            .iter()
-            .position(|name| *name == layer.pattern)
-        {
+        if let Some(id) = order.iter().position(|name| name == &layer.pattern) {
             // Holder streams reserve zero for inline definitions (COMP_TRIM).
             write_varint(&mut data, id as i64 + 1);
         } else {
             write_varint(&mut data, 0);
-            write_str(&mut data, &layer.pattern);
-            write_str(&mut data, "");
+            if let Some(definition) = definitions.banner_pattern.get(&dp_norm_id(&layer.pattern)) {
+                write_str(&mut data, &definition.asset_id);
+                write_str(&mut data, &definition.translation_key);
+            } else {
+                write_str(&mut data, &layer.pattern);
+                write_str(&mut data, "");
+            }
         }
         write_varint(&mut data, i64::from(layer.color));
     }
     data
+}
+
+fn live_loom_patterns(menu: &LoomMenu) -> Vec<String> {
+    let tag = wm_pattern_item_name(&menu.pattern_item).map_or_else(
+        || "minecraft:no_item_required".to_owned(),
+        |pattern| format!("minecraft:pattern_item/{pattern}"),
+    );
+    let mut members = Vec::new();
+    {
+        let registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
+        let tags = registry.tags.get("banner_pattern").filter(|tags| tags.contains_key(&tag));
+        if let Some(tags) = tags {
+            tag_expand_into(tags, &tag, &mut HashSet::new(), &mut HashSet::new(), &mut members);
+        } else if !vanilla_datapack_loaded() {
+            return menu.selectable_patterns();
+        }
+    }
+    let order = live_banner_pattern_order();
+    members.into_iter()
+        .map(|name| dp_bare_id(&name).to_owned())
+        .filter(|name| order.contains(name))
+        .collect()
 }
 
 // `LoomMenu.slotsChanged`/`updateSelectablePatterns` (1.21.1): the layer list
@@ -11917,7 +11969,7 @@ fn live_banner_patterns_data(layers: &[BannerLayer]) -> Vec<u8> {
 // empties the result but keeps the selection.
 fn live_loom_refresh(menu: &mut LoomMenu) {
     menu.banner_layers = live_banner_layers(&menu.banner);
-    let patterns = menu.selectable_patterns();
+    let patterns = live_loom_patterns(menu);
     let keep = menu
         .selected_pattern
         .as_ref()
@@ -12008,7 +12060,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
         }
         LiveMenu::Brewing => {
             let stands = live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner());
-            let Some(entry) = stands.get(&session.anchor.unwrap()) else {
+            let Some(entry) = session.anchor.as_ref().and_then(|anchor| stands.get(anchor)) else {
                 return;
             };
             properties.extend(brewing_window_properties(&entry.stand));
@@ -12017,7 +12069,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
         LiveMenu::Crafter => {
             let store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
             let Some((_, LiveBlockEntity::Crafter(crafter, _))) =
-                store.entries.get(&session.anchor.unwrap())
+                session.anchor.as_ref().and_then(|anchor| store.entries.get(anchor))
             else {
                 return;
             };
@@ -12044,7 +12096,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             slots
         }
         LiveMenu::Lectern => {
-            let (dim, x, y, z) = session.anchor.unwrap();
+            let Some((dim, x, y, z)) = session.anchor else { return };
             let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
                 return;
             };
@@ -12107,7 +12159,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
                     .selected_pattern
                     .as_deref()
                     .and_then(|selected| {
-                        menu.selectable_patterns()
+                        live_loom_patterns(menu)
                             .iter()
                             .position(|entry| entry == selected)
                     })
@@ -12136,7 +12188,7 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
         LiveMenu::Beacon(menu) => {
             // The beacon block entity is the source of truth for all three
             // `ContainerData` rows (vanilla BeaconBlockEntity.dataAccess).
-            let (dim, x, y, z) = session.anchor.unwrap();
+            let Some((dim, x, y, z)) = session.anchor else { return };
             let (Some(reg), state) = (breg(), block_at_dim(dim, x, y, z)) else {
                 return;
             };
@@ -12317,8 +12369,8 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
         return;
     };
     if matches!(session.menu, LiveMenu::Lectern) {
-        if live_menu_valid(c, session) {
-            live_lectern_button(c, session.anchor.unwrap(), button);
+        if let Some(anchor) = session.anchor.filter(|_| live_menu_valid(c, session)) {
+            live_lectern_button(c, anchor, button);
             sync_live_menu(c, session, false);
         }
         return;
@@ -12332,10 +12384,8 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
                     live_stonecutter_select(menu, button as usize);
                 }
                 LiveMenu::Loom(menu) => {
-                    if let Some(pattern) =
-                        menu.selectable_patterns().get(button as usize).cloned()
-                    {
-                        menu.select_pattern(&pattern);
+                    if let Some(pattern) = live_loom_patterns(menu).get(button as usize) {
+                        menu.selected_pattern = Some(pattern.clone());
                     }
                 }
                 _ => {}
@@ -13797,6 +13847,7 @@ fn builtin_item_tags() -> HashMap<String, Vec<String>> {
 }
 
 // datapack crafting recipes (data/<ns>/recipe/**.json)
+#[derive(Clone)]
 enum Ingr {
     Item(i64),
     Tag(String),
@@ -16992,6 +17043,127 @@ mod xpoll_be_sleep_tests {
         FURNACE_TICK_VISITS.load(Ordering::Relaxed)
     }
 
+    #[test]
+    fn datapack_furnace_and_campfire_use_typed_recipes_on_cold_and_warm_reload() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("megu-cooking-test-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl std::ops::Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let base = root.join("datapacks");
+        let write = |relative: &str, body: &str| {
+            let path = base.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("vanilla/data/minecraft/recipe/iron.json", r#"{
+            "type":"minecraft:smelting","ingredient":{"item":"minecraft:raw_iron"},
+            "result":{"id":"minecraft:iron_ingot"}
+        }"#);
+        write("vanilla/data/minecraft/recipe/salmon.json", r#"{
+            "type":"minecraft:smoking","ingredient":{"item":"minecraft:salmon"},
+            "result":{"id":"minecraft:cooked_salmon"},"cookingtime":100
+        }"#);
+        write("vanilla/data/minecraft/recipe/obsolete.json", r#"{
+            "type":"minecraft:smelting","ingredient":{"item":"minecraft:sand"},
+            "result":{"id":"minecraft:glass"}
+        }"#);
+        write("zzz/data/minecraft/recipe/obsolete.json", r#"{
+            "type":"minecraft:campfire_cooking","ingredient":{"item":"minecraft:salmon"},
+            "result":{"id":"minecraft:bread","count":3},"cookingtime":37
+        }"#);
+        write("zzz/data/minecraft/recipe/iron.json", r#"{
+            "type":"minecraft:smelting","ingredient":[{"item":"minecraft:stick"},{"tag":"test:raw"}],
+            "result":{"id":"minecraft:gold_ingot","count":2},"cookingtime":6,"experience":1.75
+        }"#);
+        write("zzz/data/test/tags/item/raw.json", r#"{"values":["minecraft:raw_iron"]}"#);
+        write("zzz/data/test/recipe/blast.json", r#"{
+            "type":"minecraft:blasting","ingredient":{"item":"minecraft:raw_iron"},
+            "result":{"id":"minecraft:copper_ingot"},"experience":0.5
+        }"#);
+        write("zzz/data/minecraft/enchantment/sharpness.json", r##"{
+            "max_level":9,"supported_items":"#test:enchantable","exclusive_set":"minecraft:unbreaking"
+        }"##);
+        write("zzz/data/test/tags/item/enchantable.json", r#"{"values":["minecraft:stick"]}"#);
+
+        std::env::set_var("MEGU_DATAPACK_CACHE_DIR", root.join("cache"));
+        let item = |name| name_to_item(name).unwrap();
+        for warm in [false, true] {
+            reload_datapacks(&base, None, false).expect("cooking fixture reloads");
+            assert_eq!(DPC1_LAST_RELOAD_WARM.load(Ordering::Relaxed), warm);
+            assert_eq!(smelt_out(item("raw_iron")), Some((item("gold_ingot"), 2)));
+            assert_eq!(smelt_out(item("stick")), Some((item("gold_ingot"), 2)));
+            assert_eq!(smelt_out(item("sand")), None, "a higher recipe ID replaces the old type");
+            assert_eq!(furnace_recipe_out(FurnaceKind::Smoker, item("raw_iron")), None);
+            assert_eq!(furnace_recipe_out(FurnaceKind::Smoker, item("salmon")), Some((item("cooked_salmon"), 1)));
+            assert_eq!(
+                cooking_result(CookingKind::Blasting, item("raw_iron")),
+                Some(CookingResult {
+                    item: item("copper_ingot"), count: 1, game_ticks: 100, experience: 0.5,
+                }),
+            );
+            assert_eq!(furnace_recipe_out(FurnaceKind::Furnace, item("beef")), None, "no stripped fallback when vanilla is loaded");
+            let salmon = BlockEntityItem::new("salmon", 1).unwrap();
+            assert_eq!(live_campfire_recipe(&salmon).unwrap().game_ticks, 37);
+            assert_eq!(live_campfire_result(&salmon), BlockEntityItem::new("bread", 3));
+            let sharpness = enchant_id("sharpness").unwrap();
+            assert_eq!(enchant_max_level(sharpness), 9);
+            assert!(enchant_applicable(item("stick"), sharpness));
+            assert!(!enchant_applicable(item("diamond_sword"), sharpness));
+            assert!(enchant_conflicts(sharpness, enchant_id("unbreaking").unwrap()));
+        }
+
+        let warm = warm_block_range(0, 0, 15, 15);
+        set_test_region(warm.clone(), warm);
+        let key = ow_block((4, 140, 4));
+        let mut furnace = blank_furnace();
+        furnace.input = (item("raw_iron"), 1, Vec::new());
+        furnace.fuel = (item("coal"), 1, Vec::new());
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(key, furnace);
+        rebuild_furnace_due_queue();
+        for _ in 1..server_ticks(6) {
+            furnace_tick();
+        }
+        assert_eq!(furnace_slot_snapshot_dim(DimId::Overworld, (4, 140, 4))[2], Stack::default());
+        furnace_tick();
+        let furnaces = furnaces().lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(furnaces[&key].output, (item("gold_ingot"), 2, Vec::new()));
+        assert_eq!(furnaces[&key].xp, 1.75);
+    }
+
+    #[test]
+    fn datapack_cooking_and_menus_read_real_vanilla_jar() {
+        if std::env::var_os("MEGU_TEST_JAR_COOKING").is_none() {
+            eprintln!("optional real-jar probe: set MEGU_TEST_JAR_COOKING=1 and MEGU_VANILLA_JAR");
+            return;
+        }
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        assert!(std::env::var_os("MEGU_VANILLA_JAR").is_some());
+        reload_datapacks(std::path::Path::new(DATAPACK_DIRECTORY), None, false).unwrap();
+        assert!(packs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|pack| pack.name == "vanilla_jar"));
+        let item = |name| name_to_item(name).unwrap();
+        assert_eq!(smelt_out(item("wet_sponge")), Some((item("sponge"), 1)));
+        assert_eq!(furnace_recipe_out(FurnaceKind::BlastFurnace, item("ancient_debris")), Some((item("netherite_scrap"), 1)));
+        let campfire = live_campfire_recipe(&BlockEntityItem::new("salmon", 1).unwrap()).unwrap();
+        assert_eq!((campfire.item, campfire.game_ticks), (item("cooked_salmon"), 600));
+        assert_eq!(enchant_max_level(enchant_id("channeling").unwrap()), 1);
+        assert!(enchant_applicable(item("shield"), enchant_id("unbreaking").unwrap()));
+        let patterns = live_loom_patterns(&LoomMenu::default());
+        assert_eq!(patterns.first().map(String::as_str), Some("square_bottom_left"));
+        let layers = [BannerLayer { pattern: patterns[0].clone(), color: 3 }];
+        let data = live_banner_patterns_data(&layers);
+        let banner = (item("white_banner"), 1, vec![(COMP_BANNER_PATTERNS, data)]);
+        assert_eq!(live_banner_layers(&banner), layers);
+    }
+
     fn brewing_counters() -> (u64, u64) {
         (
             BREWING_ACTIVE_STEPS.load(Ordering::Relaxed),
@@ -17837,7 +18009,7 @@ fn ominous_bottle_amplifier(st: &Stack) -> Option<i64> {
 /// Whether a `can_break`/`can_place_on` predicate set permits `state`
 /// (adventure-mode predicates; the server applies them to block-break and
 /// block-place decisions like vanilla's `AdventureModePredicate.test`).
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::BReg) -> bool {
     let mut p = 0;
     let Some(n) = slot_read_count(data, &mut p, 256) else {
@@ -17862,7 +18034,7 @@ fn block_predicates_allow(data: &[u8], state: u32, reg: &crate::block_registry::
 
 /// Re-reads one `can_break`/`can_place_on` block predicate
 /// (`{blocks?, properties?, nbt?}`) and tests whether it covers `state`.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn predicate_matches_state(
     data: &[u8],
     p: &mut usize,
@@ -17943,7 +18115,7 @@ fn predicate_matches_state(
     slot_read_optional_nbt(data, p).is_some()
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_BREAK) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -17951,7 +18123,7 @@ fn stack_can_break(st: &Stack, state: u32, reg: &crate::block_registry::BReg) ->
     }
 }
 
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn stack_can_place_on(st: &Stack, state: u32, reg: &crate::block_registry::BReg) -> bool {
     match comp_get(&st.2, COMP_CAN_PLACE_ON) {
         Some(data) => block_predicates_allow(data, state, reg),
@@ -18218,7 +18390,7 @@ fn item_block_entity_data(st: &Stack) -> Option<crate::nbt::Tag> {
 /// `minecraft:block_state`: `{property: value}` overrides applied to the
 /// placed block state, like vanilla `BlockItem.updateCustomBlockEntityTag`'s
 /// state application.
-#[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
+#[cfg(all(test, megu_vanilla_data))]
 fn item_block_state_override(st: &Stack, base: u32) -> u32 {
     let Some(reg) = breg() else { return base };
     let Some(data) = comp_get(&st.2, COMP_BLOCK_STATE) else {
