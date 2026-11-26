@@ -283,13 +283,16 @@ fn load_server_icon_favicon(path: &std::path::Path) -> Result<Option<String>, St
     )))
 }
 
-/// JSON string literal contents: the same escape set the existing status reply
-/// already applies to the motd.
-fn status_json_text(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+/// A complete JSON string literal: quotes plus the same escape set the
+/// existing status reply already applies to the motd.
+fn status_json_string(s: &str) -> String {
+    format!(
+        "\"{}\"",
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+    )
 }
 
 /// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` — the lowercase hyphenated form the
@@ -322,8 +325,8 @@ fn build_status_json_rich(
         .iter()
         .map(|(name, uuid)| {
             format!(
-                "{{\"name\":\"{}\",\"id\":\"{}\"}}",
-                status_json_text(name),
+                "{{\"name\":{},\"id\":\"{}\"}}",
+                status_json_string(name),
                 uuid_text(uuid)
             )
         })
@@ -332,14 +335,14 @@ fn build_status_json_rich(
     let mut json = format!(
         "{{\"version\":{{\"name\":\"1.21.1\",\"protocol\":767}},\
          \"players\":{{\"max\":{max_players},\"online\":{},\"sample\":[{sample_json}]}},\
-         \"description\":{{\"text\":\"{}\"}}}}",
+         \"description\":{{\"text\":{}}}}}",
         online_players.len(),
-        status_json_text(motd)
+        status_json_string(motd)
     );
     if let Some(icon) = favicon {
         json.insert_str(
             json.len() - 1,
-            &format!(",\"favicon\":\"{}\"", status_json_text(icon)),
+            &format!(",\"favicon\":{}", status_json_string(icon)),
         );
     }
     json
@@ -956,6 +959,28 @@ mod operator_ux_tests {
         breg().expect("block registry").state_of(name, None)
     }
 
+    #[cfg(megu_vanilla_data)]
+    fn spawn_test_ocean_block(dirt: u32, water: u32, y: i32) -> u32 {
+        if y <= 40 {
+            dirt
+        } else if y <= 63 {
+            water
+        } else {
+            0
+        }
+    }
+
+    #[cfg(megu_vanilla_data)]
+    fn spawn_test_hazard_block(stone: u32, top: u32, y: i32) -> u32 {
+        if y < 64 {
+            stone
+        } else if y == 64 {
+            top
+        } else {
+            0
+        }
+    }
+
     #[test]
     #[cfg(megu_vanilla_data)]
     fn safe_spawn_finder_avoids_ocean_and_lava_and_finds_dry_land() {
@@ -987,60 +1012,12 @@ mod operator_ux_tests {
         };
         let block = |x: i32, y: i32, z: i32| -> u32 {
             match kinds.get(&(x, z)).copied().unwrap_or(1) {
-                0 => {
-                    if y <= 63 {
-                        stone
-                    } else if y == 64 {
-                        grass
-                    } else {
-                        0
-                    }
-                }
-                1 => {
-                    if y <= 40 {
-                        dirt
-                    } else if y <= 63 {
-                        water
-                    } else {
-                        0
-                    }
-                }
-                2 => {
-                    if y < 64 {
-                        stone
-                    } else if y == 64 {
-                        lava
-                    } else {
-                        0
-                    }
-                }
-                3 => {
-                    if y < 64 {
-                        stone
-                    } else if y == 64 {
-                        cactus
-                    } else {
-                        0
-                    }
-                }
-                4 => {
-                    if y < 64 {
-                        stone
-                    } else if y == 64 {
-                        magma
-                    } else {
-                        0
-                    }
-                }
-                _ => {
-                    if y < 64 {
-                        stone
-                    } else if y == 64 {
-                        powder
-                    } else {
-                        0
-                    }
-                }
+                0 => spawn_test_hazard_block(stone, grass, y),
+                1 => spawn_test_ocean_block(dirt, water, y),
+                2 => spawn_test_hazard_block(stone, lava, y),
+                3 => spawn_test_hazard_block(stone, cactus, y),
+                4 => spawn_test_hazard_block(stone, magma, y),
+                _ => spawn_test_hazard_block(stone, powder, y),
             }
         };
 
@@ -1049,15 +1026,8 @@ mod operator_ux_tests {
 
         // An all-ocean world cannot satisfy the search but still answers fast.
         let ocean_surface = |_x: i32, _z: i32| 40;
-        let ocean_block = |_x: i32, y: i32, _z: i32| {
-            if y <= 40 {
-                dirt
-            } else if y <= 63 {
-                water
-            } else {
-                0
-            }
-        };
+        let ocean_block =
+            |_x: i32, y: i32, _z: i32| spawn_test_ocean_block(dirt, water, y);
         assert_eq!(
             find_safe_spawn_column(&ocean_surface, &ocean_block, 62, 250, 256, 4),
             None
@@ -1335,6 +1305,71 @@ mod operator_ux_tests {
         }
     }
 
+    fn p4a_assert_gs4_dropped(
+        handler: &mut Gs4QueryHandler,
+        ip: std::net::IpAddr,
+        packet: &[u8],
+        now: Instant,
+        snapshot: &dyn Fn() -> Gs4StatusSnapshot,
+        why: &str,
+    ) {
+        assert_eq!(
+            handler.handle_datagram(ip, packet, now, snapshot),
+            None,
+            "{why}"
+        );
+    }
+
+    /// Expiry fails closed in both directions: the dead lease never revives,
+    /// and a post-TTL handshake mints an independent replacement lease.
+    fn p4a_assert_gs4_token_expiry(
+        handler: &mut Gs4QueryHandler,
+        ip: std::net::IpAddr,
+        session_id: i32,
+        token: i32,
+        now: Instant,
+        snapshot: &dyn Fn() -> Gs4StatusSnapshot,
+        no_snapshot: &dyn Fn() -> Gs4StatusSnapshot,
+    ) {
+        p4a_assert_gs4_dropped(
+            handler,
+            ip,
+            &p4a_gs4_stat(session_id, token, false),
+            now + GS4_CHALLENGE_TTL,
+            snapshot,
+            "expired token at the TTL boundary",
+        );
+        let renewed = handler
+            .handle_datagram(
+                ip,
+                &p4a_gs4_handshake(session_id),
+                now + GS4_CHALLENGE_TTL + Duration::from_secs(1),
+                no_snapshot,
+            )
+            .unwrap();
+        let new_token = p4a_gs4_token_of(&renewed);
+        assert_ne!(new_token, token, "expiry mints a fresh token");
+        p4a_assert_gs4_dropped(
+            handler,
+            ip,
+            &p4a_gs4_stat(session_id, token, false),
+            now + GS4_CHALLENGE_TTL + Duration::from_secs(2),
+            snapshot,
+            "the dead token stays dead",
+        );
+        assert!(
+            handler
+                .handle_datagram(
+                    ip,
+                    &p4a_gs4_stat(session_id, new_token, false),
+                    now + GS4_CHALLENGE_TTL + Duration::from_secs(3),
+                    snapshot,
+                )
+                .is_some(),
+            "the renewed lease answers"
+        );
+    }
+
     /// The byte-exact basic-stat body for `p4a_gs4_snapshot` at `session_id`.
     fn p4a_expected_basic(session_id: i32) -> Vec<u8> {
         let mut out = vec![0x00];
@@ -1484,74 +1519,48 @@ mod operator_ux_tests {
         let snap = || snap_value.clone();
         let no_snap = p4a_no_snapshot();
 
-        // Wrong magic, truncation, an unknown type, oversize.
-        assert_eq!(
-            handler.handle_datagram(ip_a, &[0x00, 0x00, 0x09, 0, 0, 0, 1], now, &no_snap),
-            None,
-            "bad magic"
-        );
-        assert_eq!(
-            handler.handle_datagram(ip_a, &[0xFE, 0xFD], now, &no_snap),
-            None,
-            "truncated below the session id"
-        );
-        assert_eq!(
-            handler.handle_datagram(ip_a, &[0xFE, 0xFD, 0x09, 0, 0, 0], now, &no_snap),
-            None,
-            "a 6-byte datagram has no full session id"
-        );
-        assert!(
-            handler.handle_datagram(
-                ip_a,
-                &p4a_gs4_handshake(7),
-                now,
-                &no_snap,
-            )
-            .is_some(),
-            "control: a real handshake answers"
-        );
-        // Re-handshake above consumed the first issuance; mint a stable token
-        // for the stat checks that follow.
+        // Wrong magic, truncation, an unknown type, and oversize all drop.
+        let mut unknown = p4a_gs4_handshake(7);
+        unknown[2] = 0x07;
+        let mut big = p4a_gs4_handshake(7);
+        big.resize(GS4_MAX_DATAGRAM + 1, 0);
+        for (packet, why) in [
+            (vec![0x00, 0x00, 0x09, 0, 0, 0, 1], "bad magic"),
+            (vec![0xFE, 0xFD], "truncated below the session id"),
+            (
+                vec![0xFE, 0xFD, 0x09, 0, 0, 0],
+                "a 6-byte datagram has no full session id",
+            ),
+            (unknown, "unknown packet type"),
+            (big, "oversized datagram"),
+        ] {
+            p4a_assert_gs4_dropped(&mut handler, ip_a, &packet, now, &no_snap, why);
+        }
+
+        // A real handshake answers and mints the lease used below.
         let token = p4a_gs4_token_of(
             &handler
                 .handle_datagram(ip_a, &p4a_gs4_handshake(7), now, &no_snap)
-                .unwrap(),
+                .expect("control: a real handshake answers"),
         );
-        assert_eq!(
-            handler.handle_datagram(ip_a, &p4a_gs4_handshake(7), now, &no_snap)
-                .map(|r| p4a_gs4_token_of(&r)),
-            Some(token),
-            "control: same lease token"
-        );
-        let mut unknown = p4a_gs4_handshake(7);
-        unknown[2] = 0x07;
-        assert_eq!(
-            handler.handle_datagram(ip_a, &unknown, now, &no_snap),
-            None,
-            "unknown packet type"
-        );
-        let mut big = vec![0xFE, 0xFD, 0x09];
-        big.extend_from_slice(&7i32.to_be_bytes());
-        big.resize(GS4_MAX_DATAGRAM + 1, 0);
-        assert_eq!(
-            handler.handle_datagram(ip_a, &big, now, &no_snap),
-            None,
-            "oversized datagram"
-        );
-
-        // Stat requests without a live token: wrong value, no lease at all
-        // (from an address that never handshook), and a stolen-token replay
-        // from a second address.
-        assert_eq!(
-            handler.handle_datagram(ip_a, &p4a_gs4_stat(7, token + 1, false), now, &snap),
-            None,
-            "wrong token value"
-        );
-        assert_eq!(
-            handler.handle_datagram(ip_b, &p4a_gs4_stat(7, token, false), now, &snap),
-            None,
-            "token is bound to the handshaking address, not the value alone"
-        );
+        // Wrong values and cross-address replay fail; only the live binding answers.
+        for (ip, challenge, why) in [
+            (ip_a, token + 1, "wrong token value"),
+            (
+                ip_b,
+                token,
+                "token is bound to the handshaking address, not the value alone",
+            ),
+        ] {
+            p4a_assert_gs4_dropped(
+                &mut handler,
+                ip,
+                &p4a_gs4_stat(7, challenge, false),
+                now,
+                &snap,
+                why,
+            );
+        }
         assert_eq!(
             handler.handle_datagram(ip_a, &p4a_gs4_stat(7, token, false), now, &snap),
             Some(p4a_expected_basic(7)),
@@ -1560,60 +1569,19 @@ mod operator_ux_tests {
 
         // Sizes around the two legal stat bodies are all rejected.
         for len in [8usize, 10, 12, 14, 16, 100] {
-            let mut weird = vec![0xFE, 0xFD, 0x00];
-            weird.extend_from_slice(&7i32.to_be_bytes());
-            weird.extend_from_slice(&token.to_be_bytes());
+            let mut weird = p4a_gs4_stat(7, token, false);
             weird.resize(len, 0);
-            assert_eq!(
-                handler.handle_datagram(ip_a, &weird, now, &snap),
-                None,
-                "stat request of {len} bytes"
+            p4a_assert_gs4_dropped(
+                &mut handler,
+                ip_a,
+                &weird,
+                now,
+                &snap,
+                &format!("stat request of {len} bytes"),
             );
         }
 
-        // At the TTL boundary the lease is dead; past it a new handshake mints
-        // a fresh token and the old one stays dead.
-        assert_eq!(
-            handler.handle_datagram(
-                ip_a,
-                &p4a_gs4_stat(7, token, false),
-                now + GS4_CHALLENGE_TTL,
-                &snap,
-            ),
-            None,
-            "expired token at the TTL boundary"
-        );
-        let renewed = handler
-            .handle_datagram(
-                ip_a,
-                &p4a_gs4_handshake(7),
-                now + GS4_CHALLENGE_TTL + Duration::from_secs(1),
-                &no_snap,
-            )
-            .unwrap();
-        let new_token = p4a_gs4_token_of(&renewed);
-        assert_ne!(new_token, token, "expiry mints a fresh token");
-        assert_eq!(
-            handler.handle_datagram(
-                ip_a,
-                &p4a_gs4_stat(7, token, false),
-                now + GS4_CHALLENGE_TTL + Duration::from_secs(2),
-                &snap,
-            ),
-            None,
-            "the dead token stays dead"
-        );
-        assert!(
-            handler
-                .handle_datagram(
-                    ip_a,
-                    &p4a_gs4_stat(7, new_token, false),
-                    now + GS4_CHALLENGE_TTL + Duration::from_secs(3),
-                    &snap,
-                )
-                .is_some(),
-            "the renewed lease answers"
-        );
+        p4a_assert_gs4_token_expiry(&mut handler, ip_a, 7, token, now, &snap, &no_snap);
     }
 
     #[test]
@@ -1871,9 +1839,9 @@ impl ProfilerReport {
             .iter()
             .map(|spot| {
                 format!(
-                    "{{\"dim\":\"{}\",\"cx\":{},\"cz\":{},\"x\":{},\"z\":{},\
+                    "{{\"dim\":{},\"cx\":{},\"cz\":{},\"x\":{},\"z\":{},\
                      \"total_us\":{},\"ms_per_tick\":{:.2},\"subsystem\":\"{}\"}}",
-                    status_json_text(spot.dim.dimension_id()),
+                    status_json_string(spot.dim.dimension_id()),
                     spot.chunk_x,
                     spot.chunk_z,
                     spot.block_x,
@@ -1967,6 +1935,44 @@ impl ServerHotspotProfiler {
         self.chunks.clear();
     }
 
+    /// Rank the attributed chunks hottest-first and keep at most `top_n`.
+    /// `ticks_recorded` is the denominator for the mean-cost column; ties
+    /// break on coordinates so reports are stable.
+    fn ranked_hotspots(&self, ticks_recorded: usize, top_n: usize) -> Vec<ChunkHotspot> {
+        let mut ranked: Vec<ChunkHotspot> = self
+            .chunks
+            .iter()
+            .map(|(&(dim, cx, cz), ledger)| {
+                let dominant = ProfilerSubsystem::ALL
+                    .iter()
+                    .max_by_key(|sub| ledger.per_subsystem[sub.index()])
+                    .copied()
+                    .unwrap_or(ProfilerSubsystem::Mobs);
+                ChunkHotspot {
+                    dim,
+                    chunk_x: cx,
+                    chunk_z: cz,
+                    block_x: cx.saturating_mul(16).saturating_add(8),
+                    block_z: cz.saturating_mul(16).saturating_add(8),
+                    total_us: ledger.total,
+                    ms_per_tick: if ticks_recorded == 0 {
+                        0.0
+                    } else {
+                        ledger.total as f64 / ticks_recorded as f64 / 1000.0
+                    },
+                    dominant,
+                }
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            b.total_us
+                .cmp(&a.total_us)
+                .then((a.dim, a.chunk_x, a.chunk_z).cmp(&(b.dim, b.chunk_x, b.chunk_z)))
+        });
+        ranked.truncate(top_n);
+        ranked
+    }
+
     /// Snapshot the window. Percentiles are nearest-rank over the recorded
     /// ticks — `p`% of ticks were at or under `pP`. TPS is `1e6 / mean_us`
     /// clamped to the 20 TPS ceiling; an empty or zero-cost window reads 20.
@@ -2010,38 +2016,7 @@ impl ServerHotspotProfiler {
             };
         }
 
-        let mut ranked: Vec<ChunkHotspot> = self
-            .chunks
-            .iter()
-            .map(|(&(dim, cx, cz), ledger)| {
-                let dominant = ProfilerSubsystem::ALL
-                    .iter()
-                    .max_by_key(|sub| ledger.per_subsystem[sub.index()])
-                    .copied()
-                    .unwrap_or(ProfilerSubsystem::Mobs);
-                ChunkHotspot {
-                    dim,
-                    chunk_x: cx,
-                    chunk_z: cz,
-                    block_x: cx.saturating_mul(16).saturating_add(8),
-                    block_z: cz.saturating_mul(16).saturating_add(8),
-                    total_us: ledger.total,
-                    ms_per_tick: if n == 0 {
-                        0.0
-                    } else {
-                        ledger.total as f64 / n as f64 / 1000.0
-                    },
-                    dominant,
-                }
-            })
-            .collect();
-        // Hottest first; ties break on coordinates so reports are stable.
-        ranked.sort_by(|a, b| {
-            b.total_us
-                .cmp(&a.total_us)
-                .then((a.dim, a.chunk_x, a.chunk_z).cmp(&(b.dim, b.chunk_x, b.chunk_z)))
-        });
-        ranked.truncate(top_n);
+        let ranked = self.ranked_hotspots(n, top_n);
 
         ProfilerReport {
             ticks_recorded: n,
@@ -2305,6 +2280,14 @@ impl OperatorMetricsSnapshot {
                 "0".to_string()
             }
         }
+        fn push_gauge(out: &mut String, name: &str, help: &str, value: &str) {
+            use std::fmt::Write as _;
+            writeln!(
+                out,
+                "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}"
+            )
+            .expect("writing to a String cannot fail");
+        }
         let rows: [(&str, &str, String); 9] = [
             (
                 "megu_tps",
@@ -2354,18 +2337,7 @@ impl OperatorMetricsSnapshot {
         ];
         let mut out = String::with_capacity(1024);
         for (name, help, value) in rows {
-            out.push_str("# HELP ");
-            out.push_str(name);
-            out.push(' ');
-            out.push_str(help);
-            out.push('\n');
-            out.push_str("# TYPE ");
-            out.push_str(name);
-            out.push_str(" gauge\n");
-            out.push_str(name);
-            out.push(' ');
-            out.push_str(&value);
-            out.push('\n');
+            push_gauge(&mut out, name, help, &value);
         }
         out
     }
@@ -2527,6 +2499,21 @@ mod perf1_profiler_tests {
 #[cfg(test)]
 mod ops_sre_tests {
     use super::*;
+
+    fn prometheus_gauge_value<'a>(text: &'a str, name: &str) -> &'a str {
+        assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{name} missing TYPE");
+        assert!(text.contains(&format!("# HELP {name} ")), "{name} missing HELP");
+        let sample = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} sample line missing in:\n{text}"));
+        let value = sample.rsplit(' ').next().unwrap();
+        assert!(
+            value.parse::<f64>().is_ok(),
+            "{name} sample is not a number: {value}"
+        );
+        value
+    }
 
     #[test]
     fn ops_sre_tick_watchdog_classifies_healthy_warning_and_critical() {
@@ -2734,17 +2721,7 @@ mod ops_sre_tests {
             "megu_rss_mib",
             "megu_uptime_seconds",
         ] {
-            assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{name} missing TYPE");
-            assert!(text.contains(&format!("# HELP {name} ")), "{name} missing HELP");
-            let sample = text
-                .lines()
-                .find(|line| line.starts_with(&format!("{name} ")))
-                .unwrap_or_else(|| panic!("{name} sample line missing in:\n{text}"));
-            let value = sample.rsplit(' ').next().unwrap();
-            assert!(
-                value.parse::<f64>().is_ok(),
-                "{name} sample is not a number: {value}"
-            );
+            prometheus_gauge_value(&text, name);
         }
         assert!(text.contains("megu_tps 19.98\n"), "{text}");
         assert!(text.contains("megu_players_online 3\n"), "{text}");
@@ -2784,9 +2761,10 @@ mod ops_sre_tests {
             "megu_rss_mib",
             "megu_uptime_seconds",
         ] {
-            assert!(
-                text.contains(&format!("{name} 0\n")),
-                "{name} must scrub to 0:\n{text}"
+            assert_eq!(
+                prometheus_gauge_value(&text, name),
+                "0",
+                "{name} must scrub to 0"
             );
         }
         assert!(text.contains("megu_mspt_p99 0\n"), "{text}");
@@ -2801,6 +2779,13 @@ mod ops_sre_tests {
 // command layer (`teams_and_commands.rs`) owns the permission gates; this
 // section owns the state and the deterministic query/restore mechanics.
 // ---------------------------------------------------------------------------
+
+/// Lock a mutex while recovering the guard from a poisoned lock, exactly as
+/// the operator surfaces already did inline: a poisoned cache must not cascade
+/// into the command path, but no lock invariant is weakened here.
+fn lock_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Bounded ring of live block edits. 8_192 entries covers several minutes of
 /// heavy griefing at ~50 edits/sec while staying under ~1 MiB resident.
@@ -2856,9 +2841,7 @@ fn record_live_block_audit(
         new_state,
         tick,
     };
-    let mut audit = live_block_audit()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut audit = lock_recover(live_block_audit());
     if audit.len() >= LIVE_BLOCK_AUDIT_CAP {
         audit.pop_front();
     }
@@ -2879,9 +2862,7 @@ struct LiveBlockAuditQuery {
 }
 
 fn query_live_block_audit(query: &LiveBlockAuditQuery) -> Vec<LiveBlockAuditEntry> {
-    let audit = live_block_audit()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let audit = lock_recover(live_block_audit());
     let radius_sq = i64::from(query.radius.max(0)) * i64::from(query.radius.max(0));
     audit
         .iter()
@@ -2919,10 +2900,7 @@ fn query_live_block_audit(query: &LiveBlockAuditQuery) -> Vec<LiveBlockAuditEntr
 }
 
 fn live_block_audit_len() -> usize {
-    live_block_audit()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .len()
+    lock_recover(live_block_audit()).len()
 }
 
 /// What one `/megu rollback` pass did, persisted so operators can audit the
@@ -2953,9 +2931,7 @@ fn live_rollback_log() -> &'static Mutex<std::collections::VecDeque<LiveRollback
 }
 
 fn record_live_rollback_summary(summary: LiveRollbackSummary) {
-    let mut log = live_rollback_log()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut log = lock_recover(live_rollback_log());
     if log.len() >= LIVE_ROLLBACK_CAP {
         log.pop_front();
     }
@@ -2964,9 +2940,7 @@ fn record_live_rollback_summary(summary: LiveRollbackSummary) {
 
 #[allow(dead_code)]
 fn live_rollback_summaries() -> Vec<LiveRollbackSummary> {
-    live_rollback_log()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lock_recover(live_rollback_log())
         .iter()
         .cloned()
         .collect()
@@ -3352,9 +3326,7 @@ fn can_player_modify_block(
     }
     let radius = live_spawn_protect_radius();
     if radius > 0 && dim == DimId::Overworld {
-        let spawn = *WORLD_SPAWN
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let spawn = *lock_recover(&WORLD_SPAWN);
         let dx = f64::from(x) - spawn.0;
         let dz = f64::from(z) - spawn.2;
         if dx * dx + dz * dz <= f64::from(radius) * f64::from(radius) {
@@ -3362,9 +3334,7 @@ fn can_player_modify_block(
         }
     }
     let key = claim_chunk_key(dim, x, z);
-    let claims = live_claims()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let claims = lock_recover(live_claims());
     if let Some(record) = claims.get(&key) {
         return record.owner == player_name || record.trusted.contains(player_name);
     }
@@ -3392,9 +3362,7 @@ fn live_claims_player_action(
     if is_op {
         return true;
     }
-    let mut claims = live_claims()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut claims = lock_recover(live_claims());
     if !player_uuid.is_empty() {
         claims.world.record_player_seen(
             player_uuid,
@@ -3470,6 +3438,37 @@ pub(crate) fn can_player_damage_entity(
     )
 }
 
+/// Shared cross-border claim verdict: resolve both chunk keys, fail closed to
+/// "claimed ⇒ denied" when the dimension cannot be named, resolve the actor
+/// through the roster, then let the action-specific constructor ask the world
+/// matrix. This is the one owner of the source/target/actor validation shape.
+fn live_claim_cross_border_action(
+    dim: DimId,
+    src_bx: i32,
+    src_bz: i32,
+    target_bx: i32,
+    target_bz: i32,
+    actor_uuid: Option<&str>,
+    make_action: impl FnOnce(ClaimChunkKey, Option<String>) -> ClaimAction,
+) -> bool {
+    let claims = lock_recover(live_claims());
+    let src_key = claim_chunk_key(dim, src_bx, src_bz);
+    let target_key = claim_chunk_key(dim, target_bx, target_bz);
+    let (Some(source), Some(target)) = (
+        live_claim_world_key(src_key.0, src_key.1, src_key.2),
+        live_claim_world_key(target_key.0, target_key.1, target_key.2),
+    ) else {
+        return claims.get(&target_key).is_none();
+    };
+    let actor = actor_uuid.map(|uuid| claims.actor_name(uuid));
+    let actor_name = actor.as_deref();
+    let action = make_action(source, actor.clone());
+    claims
+        .world
+        .check_action(&target, actor_name, action)
+        .is_allowed()
+}
+
 /// May an explosion whose blast originates at `(src_bx, src_bz)` damage the
 /// block column at `(target_bx, target_bz)`? Same-owner blasts always cross;
 /// a credited actor needs break/damage permission inside the target claim.
@@ -3483,29 +3482,18 @@ pub(crate) fn can_explosion_damage_block(
     target_bz: i32,
     actor_uuid: Option<&str>,
 ) -> bool {
-    let claims = live_claims()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let src_key = claim_chunk_key(dim, src_bx, src_bz);
-    let target_key = claim_chunk_key(dim, target_bx, target_bz);
-    let (Some(source), Some(target)) = (
-        live_claim_world_key(src_key.0, src_key.1, src_key.2),
-        live_claim_world_key(target_key.0, target_key.1, target_key.2),
-    ) else {
-        return claims.get(&target_key).is_none();
-    };
-    let actor = actor_uuid.map(|uuid| claims.actor_name(uuid));
-    claims
-        .world
-        .check_action(
-            &target,
-            actor.as_deref(),
-            ClaimAction::ExplosionFrom {
-                source,
-                actor_uuid: actor.clone(),
-            },
-        )
-        .is_allowed()
+    live_claim_cross_border_action(
+        dim,
+        src_bx,
+        src_bz,
+        target_bx,
+        target_bz,
+        actor_uuid,
+        |source, actor| ClaimAction::ExplosionFrom {
+            source,
+            actor_uuid: actor,
+        },
+    )
 }
 
 /// May `actor_uuid` body-push, knockback-displace or (`is_lure`) tempt/lure
@@ -3517,9 +3505,7 @@ pub(crate) fn can_entity_be_pushed_or_lured(
     actor_uuid: &str,
     is_lure: bool,
 ) -> bool {
-    let claims = live_claims()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let claims = lock_recover(live_claims());
     let actor = claims.actor_name(actor_uuid);
     let action = if is_lure {
         ClaimAction::EntityTemptOrLure
@@ -3540,29 +3526,18 @@ pub(crate) fn can_vehicle_enter_claim(
     target_bz: i32,
     actor_uuid: Option<&str>,
 ) -> bool {
-    let claims = live_claims()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let src_key = claim_chunk_key(dim, src_bx, src_bz);
-    let target_key = claim_chunk_key(dim, target_bx, target_bz);
-    let (Some(source), Some(target)) = (
-        live_claim_world_key(src_key.0, src_key.1, src_key.2),
-        live_claim_world_key(target_key.0, target_key.1, target_key.2),
-    ) else {
-        return claims.get(&target_key).is_none();
-    };
-    let actor = actor_uuid.map(|uuid| claims.actor_name(uuid));
-    claims
-        .world
-        .check_action(
-            &target,
-            actor.as_deref(),
-            ClaimAction::VehicleEnterOrInject {
-                source,
-                actor_uuid: actor.clone(),
-            },
-        )
-        .is_allowed()
+    live_claim_cross_border_action(
+        dim,
+        src_bx,
+        src_bz,
+        target_bx,
+        target_bz,
+        actor_uuid,
+        |source, actor| ClaimAction::VehicleEnterOrInject {
+            source,
+            actor_uuid: actor,
+        },
+    )
 }
 
 /// The live-claims enforcement surface, exercised end to end so every helper
@@ -3638,6 +3613,26 @@ fn backup_volume_free_bytes(_dir: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// One consistent read of the live backup directory for the operator-facing
+/// plan/status reports: names and the next strict sequence. Free space is
+/// measured at each report's original decision point.
+struct BackupDirectoryState {
+    dir: std::path::PathBuf,
+    existing: Vec<String>,
+    next_seq: u64,
+}
+
+fn backup_directory_state() -> BackupDirectoryState {
+    let dir = live_backup_dir();
+    let existing = backup_dir_listing(&dir);
+    let next_seq = backup_next_seq(&existing);
+    BackupDirectoryState {
+        dir,
+        existing,
+        next_seq,
+    }
+}
+
 /// The sequence the next `world-backup-<seq>.tar.gz` would take: one past
 /// the highest well-formed existing name, or 1 for an empty/missing dir.
 fn backup_next_seq(existing: &[String]) -> u64 {
@@ -3675,10 +3670,10 @@ fn backup_rotation_prune(existing: &[String], max_backups: usize) -> Result<Vec<
 /// real backup directory and filesystem, never a guess.
 fn format_backup_plan_report() -> String {
     let policy = RollingBackupPolicy::default();
-    let dir = live_backup_dir();
-    let existing = backup_dir_listing(&dir);
-    let next = backup_next_seq(&existing);
-    let prune = match backup_rotation_prune(&existing, policy.max_backups) {
+    let state = backup_directory_state();
+    let existing = &state.existing;
+    let next = state.next_seq;
+    let prune = match backup_rotation_prune(existing, policy.max_backups) {
         Ok(prune) => prune,
         Err(name) => {
             return format!(
@@ -3686,7 +3681,7 @@ fn format_backup_plan_report() -> String {
             )
         }
     };
-    let free = backup_volume_free_bytes(&dir);
+    let free = backup_volume_free_bytes(&state.dir);
     let mut out = format!(
         "Next backup: world-backup-{next}.tar.gz; existing {} generation(s)\n",
         existing.len()
@@ -3714,12 +3709,12 @@ fn format_backup_plan_report() -> String {
 /// operator sees retention config and reality in one reply.
 fn format_backup_status_report() -> String {
     let policy = RollingBackupPolicy::default();
-    let dir = live_backup_dir();
-    let existing = backup_dir_listing(&dir);
-    let free = backup_volume_free_bytes(&dir);
+    let state = backup_directory_state();
+    let existing = &state.existing;
+    let free = backup_volume_free_bytes(&state.dir);
     let mut out = format!(
         "Backup dir: {}\nRetention: keep at most {} world-backup-*.tar.gz, min free {} bytes\n",
-        dir.display(),
+        state.dir.display(),
         policy.max_backups,
         policy.min_free_bytes
     );
@@ -3736,7 +3731,7 @@ fn format_backup_status_report() -> String {
     }
     out.push_str(&format!(
         "Next sequence: world-backup-{}.tar.gz\n",
-        backup_next_seq(&existing)
+        state.next_seq
     ));
     out
 }
@@ -3745,10 +3740,7 @@ fn format_backup_status_report() -> String {
 /// sources `/status` and `/profile` read: the hotspot profiler's tick
 /// percentiles, the online player list, the hot chunk set and process RSS.
 fn live_operator_metrics_prometheus() -> String {
-    let report = live_hotspot_profiler()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .summary(0);
+    let report = lock_recover(live_hotspot_profiler()).summary(0);
     let health = operator_health_snapshot();
     OperatorMetricsSnapshot {
         tps: report.tps,
@@ -4694,7 +4686,7 @@ impl SurvivalModRegistry {
         let names = self
             .players
             .iter()
-            .map(|n| format!("\"{}\"", status_json_text(n)))
+            .map(|n| status_json_string(n))
             .collect::<Vec<_>>()
             .join(",");
         format!("{{\"players\":[{names}]}}")
@@ -4955,10 +4947,7 @@ struct OperatorStatusSummary {
 /// RSS, worlds, hub servers and the Survival-Mod count. Plain units, no
 /// internal vocabulary.
 fn format_operator_status_summary(s: &OperatorStatusSummary) -> String {
-    let rss = match s.rss_mb {
-        Some(mb) => format!("{mb} MB"),
-        None => "N/A".to_string(),
-    };
+    let rss = memory_line(s.rss_mb);
     format!(
         "TPS: {:.1}   MSPT p50/p95: {:.1}/{:.1} ms\n\
          Players: {}/{}   Chunks: {}   RSS: {}\n\
@@ -5135,48 +5124,21 @@ mod operator_ux_admin_core_tests {
 
     #[test]
     fn restart_command_parses_defaults_actions_delays_and_reasons() {
-        assert_eq!(
-            parse_restart_command("").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 10,
-                reason: None
-            }
-        );
-        assert_eq!(
-            parse_restart_command("now").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 0,
-                reason: None
-            }
-        );
-        assert_eq!(
-            parse_restart_command("0").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 0,
-                reason: None
-            }
-        );
-        assert_eq!(
-            parse_restart_command("30").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 30,
-                reason: None
-            }
-        );
-        assert_eq!(
-            parse_restart_command("60 Maintenance window").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 60,
-                reason: Some("Maintenance window".to_owned())
-            }
-        );
-        assert_eq!(
-            parse_restart_command("now Emergency recovery").unwrap(),
-            RestartCommand::Schedule {
-                delay_secs: 0,
-                reason: Some("Emergency recovery".to_owned())
-            }
-        );
+        let schedule = |args: &str, delay_secs: u64, reason: Option<&str>| {
+            assert_eq!(
+                parse_restart_command(args).unwrap(),
+                RestartCommand::Schedule {
+                    delay_secs,
+                    reason: reason.map(|text| text.to_owned())
+                }
+            );
+        };
+        schedule("", 10, None);
+        schedule("now", 0, None);
+        schedule("0", 0, None);
+        schedule("30", 30, None);
+        schedule("60 Maintenance window", 60, Some("Maintenance window"));
+        schedule("now Emergency recovery", 0, Some("Emergency recovery"));
         assert_eq!(parse_restart_command("cancel").unwrap(), RestartCommand::Cancel);
         assert_eq!(parse_restart_command("STATUS").unwrap(), RestartCommand::Status);
         for bad in ["-1", "86401", "not-a-number", "cancel extra", "status extra"] {
@@ -5334,6 +5296,12 @@ mod operator_ux_admin_core_tests {
             .unwrap_or(0)
     }
 
+    fn remote_post_request(path: &str, token: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\n\r\n"
+        )
+    }
+
     #[test]
     fn remote_control_token_scopes_and_actions() {
         let mut srv = RemoteControlServer::bind(
@@ -5366,7 +5334,7 @@ mod operator_ux_admin_core_tests {
 
         let (reply, actions) = remote_request(
             &mut srv,
-            "POST /api/start HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\nContent-Length: 0\r\n\r\n",
+            &remote_post_request("/api/start", "starter-secret"),
         );
         assert_eq!(http_status(&reply), 200, "{reply}");
         assert_eq!(actions, vec![RemoteAction::Start]);
@@ -5375,9 +5343,7 @@ mod operator_ux_admin_core_tests {
         for path in ["/api/stop", "/api/restart"] {
             let (reply, actions) = remote_request(
                 &mut srv,
-                &format!(
-                    "POST {path} HTTP/1.1\r\nAuthorization: Bearer starter-secret\r\nContent-Length: 0\r\n\r\n"
-                ),
+                &remote_post_request(path, "starter-secret"),
             );
             assert_eq!(http_status(&reply), 403, "{path}: {reply}");
             assert!(actions.is_empty(), "{path}");
@@ -5395,12 +5361,8 @@ mod operator_ux_admin_core_tests {
             ("/api/restart", RemoteAction::Restart),
             ("/api/stop", RemoteAction::Stop),
         ] {
-            let (reply, actions) = remote_request(
-                &mut srv,
-                &format!(
-                    "POST {path} HTTP/1.1\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 0\r\n\r\n"
-                ),
-            );
+            let (reply, actions) =
+                remote_request(&mut srv, &remote_post_request(path, "admin-secret"));
             assert_eq!(http_status(&reply), 200, "{path}: {reply}");
             assert_eq!(actions, vec![action], "{path}");
         }
