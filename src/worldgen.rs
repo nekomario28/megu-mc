@@ -2074,6 +2074,8 @@ struct VeinCfg {
     iron_fill: u32,
 }
 
+type InterpGrids = Vec<Option<Box<[f64]>>>;
+
 #[derive(Clone, Copy)]
 enum InterpKind {
     General(usize),
@@ -3981,145 +3983,93 @@ impl Gen {
         fold_dfs: bool,
     ) -> Option<Gen> {
         let files = Self::df_files();
-        let mut g = Gen {
-            data: std::sync::Arc::new(GenData {
-                preset,
-                dfs: vec![],
-                names: HashMap::default(),
-                noises: vec![],
-                noise_names: HashMap::default(),
-                factory: Xor::seed(seed).splitter(),
-                base: String::new(),
-                final_density: 0,
-                climate: None,
-                depth_split: None,
-                biome_zoom: crate::generation_math::biome_zoom_seed(seed),
-                btree: None,
-                leaf_ps: Vec::new(),
-                biome_names: Vec::new(),
-                biome_ids: Vec::new(),
-                biome_weather: Vec::new(),
-                sea: 63,
-                min_y: -64,
-                height: 384,
-                world_min_y: -64,
-                world_height: 384,
-                noise_cell_h: 8,
-                noise_cell_w: 4,
-                legacy_random_source: false,
-                rules: vec![],
-                conds: vec![],
-                rule_ids: HashMap::default(),
-                cond_ids: HashMap::default(),
-                bleaf: HashMap::default(),
-                surface_rule: None,
-                deep_fast: None,
-                prelim_df: None,
-                surf_ni: None,
-                sec_ni: None,
-                band_off_ni: None,
-                bands: None,
-                ore_split: None,
-                def_st: 1,
-                def_fl: 0,
-                bedrock_st: res("minecraft:bedrock").unwrap_or(1),
-                aq: None,
-                vein: None,
-                is_2d: Vec::new(),
-                df_folded: 0,
-                ram_trimmed: 0,
-                world_seed: seed,
-                interp_nodes: Vec::new(),
-                density_interp_nodes: Vec::new(),
-                vein_interp_nodes: Vec::new(),
-                upper_bound_interp: None,
-                fallback_share: std::sync::Arc::new(TerrainShare::new()),
-                dfprog: None,
-                dfcols: None,
-                vfcols: None,
-            }),
-            aq_chunk: std::array::from_fn(|_| None),
-            aq_chunk_use: [0; AQ_CHUNK_SLOTS],
-            aq_chunk_tick: 0,
-            aq_cell12: AqCell12::empty(),
-            prelim_c: HashMap::default(),
-            chunk_biomes: HashMap::default(),
-            chunk_biomes_ord: std::collections::VecDeque::new(),
-            prelim_ord: std::collections::VecDeque::new(),
-            clim_c: HashMap::default(),
-            clim_ord: std::collections::VecDeque::new(),
-            bioq: HashMap::default(),
-            bioq_ord: std::collections::VecDeque::new(),
-            bioq_none: HashMap::default(),
-            bioq_none_ord: std::collections::VecDeque::new(),
-            base_hm_c: HashMap::default(),
-            base_hm_cc: None,
-            base_hm_memos: None,
-            base_col_lazy: None,
-            col_c: HashMap::default(),
-            col_ord: std::collections::VecDeque::new(),
-            starts_round: None,
-            share_slot: None,
-            base_c: HashMap::default(),
-            base_ord: std::collections::VecDeque::new(),
-            beard_c: HashMap::default(),
-            beard_ord: std::collections::VecDeque::new(),
-            beard_resolver: None,
-            beard_depth: 0,
-            terr_c: HashMap::default(),
-            terr_ord: std::collections::VecDeque::new(),
-            terr_pending: std::collections::BTreeSet::new(),
-            feat_c: HashMap::default(),
-            staged_payloads: Vec::new(),
-            feat_ord: std::collections::VecDeque::new(),
-            deep_c: HashMap::default(),
-            deep_ord: std::collections::VecDeque::new(),
-            pop_done: HashSet::new(),
-            promoted_chunks: HashSet::new(),
-            pop_plan_window: None,
-            shape_marks: HashMap::default(),
-            mark_pool: Vec::new(),
-            mark_src: HashMap::default(),
-            aq_sched: false,
-            aq_calls: 0,
-            terrain_marked: HashSet::default(),
-            pop_active: None,
-            restored_tick_sources: HashSet::new(),
-            suppress_generated_ticks: false,
-            carve_c: HashMap::default(),
-            carve_ord: std::collections::VecDeque::new(),
-            pop_region: std::env::var("MEGU_POP_REGION").ok().and_then(|v| {
-                let p: Vec<i32> = v.split(',').filter_map(|n| n.parse().ok()).collect();
-                if p.len() == 4 {
-                    Some((p[0], p[1], p[2], p[3]))
-                } else {
-                    None
-                }
-            }),
-            a3a_dispatch: None,
-            memo: HashMap::default(),
-            corner_memo: None,
-            dfcol_scratch: None,
-            mineshaft_spawners: HashSet::new(),
-            payload_sources: HashSet::new(),
-            feat_hm: HashMap::default(),
-            rule_diag: None,
-            generated_ticks: GeneratedTickQueues::default(),
-        };
+        let mut g = Self::new_preset(seed, res, preset);
+        let ns = g.load_noise_settings()?;
+        let router = ns.get("noise_router");
+        g.load_world_window();
+        g.load_density_router(&ns, router, &files, res)?;
+        g.load_biomes()?;
+        g.load_surface_rules(&ns, router, &files, res)?;
+        g.load_aquifer(&ns, router, &files, res);
+        g.finish_loading(fold_dfs);
+        Some(g)
+    }
+
+    fn new_preset(seed: u64, res: fn(&str) -> Option<u32>, preset: NoisePreset) -> Self {
+        Self::fresh_scratch(std::sync::Arc::new(GenData {
+            preset,
+            dfs: vec![],
+            names: HashMap::default(),
+            noises: vec![],
+            noise_names: HashMap::default(),
+            factory: Xor::seed(seed).splitter(),
+            base: String::new(),
+            final_density: 0,
+            climate: None,
+            depth_split: None,
+            biome_zoom: crate::generation_math::biome_zoom_seed(seed),
+            btree: None,
+            leaf_ps: Vec::new(),
+            biome_names: Vec::new(),
+            biome_ids: Vec::new(),
+            biome_weather: Vec::new(),
+            sea: 63,
+            min_y: -64,
+            height: 384,
+            world_min_y: -64,
+            world_height: 384,
+            noise_cell_h: 8,
+            noise_cell_w: 4,
+            legacy_random_source: false,
+            rules: vec![],
+            conds: vec![],
+            rule_ids: HashMap::default(),
+            cond_ids: HashMap::default(),
+            bleaf: HashMap::default(),
+            surface_rule: None,
+            deep_fast: None,
+            prelim_df: None,
+            surf_ni: None,
+            sec_ni: None,
+            band_off_ni: None,
+            bands: None,
+            ore_split: None,
+            def_st: 1,
+            def_fl: 0,
+            bedrock_st: res("minecraft:bedrock").unwrap_or(1),
+            aq: None,
+            vein: None,
+            is_2d: Vec::new(),
+            df_folded: 0,
+            ram_trimmed: 0,
+            world_seed: seed,
+            interp_nodes: Vec::new(),
+            density_interp_nodes: Vec::new(),
+            vein_interp_nodes: Vec::new(),
+            upper_bound_interp: None,
+            fallback_share: std::sync::Arc::new(TerrainShare::new()),
+            dfprog: None,
+            dfcols: None,
+            vfcols: None,
+        }))
+    }
+
+    fn load_noise_settings(&mut self) -> Option<J> {
+        let preset = self.preset;
         // noise settings (sea level, bounds, router names)
         let mut ns_json: Option<J> = None;
-        'outer: for p in Gen::packs() {
+        for p in Gen::packs() {
             let f = p.join(format!(
                 "data/minecraft/worldgen/noise_settings/{}.json",
                 preset.name()
             ));
             if let Ok(b) = std::fs::read(&f) {
                 ns_json = jparse(&b);
-                g.base = p.to_string_lossy().to_string();
-                break 'outer;
+                self.base = p.to_string_lossy().to_string();
+                break;
             }
         }
-        if g.base.is_empty() {
+        if self.base.is_empty() {
             ns_json = read_vanilla_jar_resource(&format!(
                 "minecraft/worldgen/noise_settings/{}.json",
                 preset.name()
@@ -4136,23 +4086,27 @@ impl Gen {
                 return None;
             }
         };
-        g.sea = ns.get("sea_level").map(J::num).unwrap_or(63.0) as i32;
-        g.legacy_random_source = jbool(&ns, "legacy_random_source", false);
+        self.sea = ns.get("sea_level").map(J::num).unwrap_or(63.0) as i32;
+        self.legacy_random_source = jbool(&ns, "legacy_random_source", false);
         if let Some(n) = ns.get("noise") {
-            g.min_y = n.get("min_y").map(J::num).unwrap_or(-64.0) as i32;
-            g.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
-            g.noise_cell_h = (n.get("size_vertical").map(J::num).unwrap_or(2.0) as i32 * 4).max(1);
-            g.noise_cell_w = n.get("size_horizontal").map(J::num).unwrap_or(1.0) as i32 * 4;
-            if g.noise_cell_w <= 0
-                || g.height <= 0
-                || 16 % g.noise_cell_w != 0
-                || g.height % g.noise_cell_h != 0
+            self.min_y = n.get("min_y").map(J::num).unwrap_or(-64.0) as i32;
+            self.height = n.get("height").map(J::num).unwrap_or(384.0) as i32;
+            self.noise_cell_h =
+                (n.get("size_vertical").map(J::num).unwrap_or(2.0) as i32 * 4).max(1);
+            self.noise_cell_w = n.get("size_horizontal").map(J::num).unwrap_or(1.0) as i32 * 4;
+            if self.noise_cell_w <= 0
+                || self.height <= 0
+                || 16 % self.noise_cell_w != 0
+                || self.height % self.noise_cell_h != 0
             {
                 Self::load_trace("noise cell sizes do not divide the chunk dimensions");
                 return None;
             }
         }
-        let router = ns.get("noise_router");
+        Some(ns)
+    }
+
+    fn load_world_window(&mut self) {
         // The **world** window: `dimension_type/<dimension>.json`'s `min_y`/`height`.
         // It is a different fact from the noise settings above and 1.21.1 differs by 2x
         // for both non-overworld dimensions (noise 0/128, dimension 0/256). Only the
@@ -4160,51 +4114,58 @@ impl Gen {
         // length, structure/furniture bounds - never the density/aquifer/carver/surface
         // path, which is generator height in vanilla too. Absent or unusable, the world
         // window *is* the generator window, which keeps every pre-split fixture exact.
-        g.world_min_y = g.min_y;
-        g.world_height = g.height;
-        {
-            let file = dimension_type_file(preset);
-            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-            if !g.base.is_empty() {
-                // the pack the noise settings came from answers first, so one pack cannot
-                // contribute a generator and a different pack its world
-                candidates.push(std::path::PathBuf::from(&g.base));
-            }
-            candidates.extend(Gen::packs());
-            let resource = format!("minecraft/dimension_type/{file}.json");
-            let jar = read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec);
-            let (before, after) = if g.base.is_empty() {
-                (jar, None)
-            } else {
-                (None, jar)
-            };
-            let disk = candidates
-                .iter()
-                .filter_map(|p| std::fs::read(p.join("data").join(&resource)).ok());
-            if let Some(b) = before.into_iter().chain(disk).chain(after).next() {
-                let json = jparse(&b);
-                match json
-                    .as_ref()
-                    .and_then(|j| dimension_window(j, g.min_y, g.height))
-                {
-                    Some((min_y, height)) => {
-                        g.world_min_y = min_y;
-                        g.world_height = height;
-                    }
-                    None if json.is_none() => Self::load_trace(&format!(
-                        "dimension_type/{file}.json is not JSON; the world window stays {}/{}",
-                        g.min_y, g.height
-                    )),
-                    // Fail closed: a window that is not whole sections or that does not
-                    // contain the terrain the generator makes would truncate it.
-                    None => Self::load_trace(&format!(
-                        "dimension_type/{file}.json is not a window containing the generator's \
-                         {}/{}",
-                        g.min_y, g.height
-                    )),
+        self.world_min_y = self.min_y;
+        self.world_height = self.height;
+        let file = dimension_type_file(self.preset);
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if !self.base.is_empty() {
+            // the pack the noise settings came from answers first, so one pack cannot
+            // contribute a generator and a different pack its world
+            candidates.push(std::path::PathBuf::from(&self.base));
+        }
+        candidates.extend(Gen::packs());
+        let resource = format!("minecraft/dimension_type/{file}.json");
+        let jar = read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec);
+        let (before, after) = if self.base.is_empty() {
+            (jar, None)
+        } else {
+            (None, jar)
+        };
+        let disk = candidates
+            .iter()
+            .filter_map(|p| std::fs::read(p.join("data").join(&resource)).ok());
+        if let Some(b) = before.into_iter().chain(disk).chain(after).next() {
+            let json = jparse(&b);
+            match json
+                .as_ref()
+                .and_then(|j| dimension_window(j, self.min_y, self.height))
+            {
+                Some((min_y, height)) => {
+                    self.world_min_y = min_y;
+                    self.world_height = height;
                 }
+                None if json.is_none() => Self::load_trace(&format!(
+                    "dimension_type/{file}.json is not JSON; the world window stays {}/{}",
+                    self.min_y, self.height
+                )),
+                // Fail closed: a window that is not whole sections or that does not
+                // contain the terrain the generator makes would truncate it.
+                None => Self::load_trace(&format!(
+                    "dimension_type/{file}.json is not a window containing the generator's \
+                     {}/{}",
+                    self.min_y, self.height
+                )),
             }
         }
+    }
+
+    fn load_density_router(
+        &mut self,
+        ns: &J,
+        router: Option<&J>,
+        files: &HashMap<String, Vec<u8>>,
+        res: fn(&str) -> Option<u32>,
+    ) -> Option<()> {
         // 1.21.1 writes the router entries as inline density functions (the newer
         // dialect writes references), so this has to go through `router_df`, which
         // accepts either.
@@ -4212,7 +4173,7 @@ impl Gen {
             Self::load_trace("noise_settings has no noise_router.final_density");
             return None;
         };
-        let Some(idx) = router_df(&mut g, &files, fd) else {
+        let Some(idx) = router_df(self, files, fd) else {
             Self::load_trace("noise_router.final_density did not resolve");
             return None;
         };
@@ -4221,23 +4182,23 @@ impl Gen {
         // `wrap` substitutes the chunk's `Beardifier` for the marker. The datapack has
         // no such node, so the same edge is added here once, at load.
         let base = idx;
-        let beard = g.dfs.len();
-        g.dfs.push(DF::Beardifier);
-        let sum = g.dfs.len();
-        g.dfs.push(DF::Add(base, beard));
-        g.final_density = sum;
+        let beard = self.dfs.len();
+        self.dfs.push(DF::Beardifier);
+        let sum = self.dfs.len();
+        self.dfs.push(DF::Add(base, beard));
+        self.final_density = sum;
         // 1.21.1 generates ore veins in the noise chunk (`ore_veins_enabled`)
         // from three router functions; 1.21.2+ moved them into a material rule.
-        if jbool(&ns, "ore_veins_enabled", false) {
-            let get = |k: &str| router.and_then(|r| r.get(k)).cloned();
+        if jbool(ns, "ore_veins_enabled", false) {
+            let get = |k: &str| router.and_then(|r| r.get(k));
             if let (Some(a), Some(b), Some(c)) =
                 (get("vein_toggle"), get("vein_ridged"), get("vein_gap"))
             {
                 // the vein functions are *inline* objects in 1.21.1, not names
                 let (ta, tb, tc) = (
-                    router_df(&mut g, &files, &a),
-                    router_df(&mut g, &files, &b),
-                    router_df(&mut g, &files, &c),
+                    router_df(self, files, a),
+                    router_df(self, files, b),
+                    router_df(self, files, c),
                 );
                 if std::env::var("MEGU_VEINDBG").is_ok() {
                     eprintln!("VEINCFG refs a={:?} b={:?} c={:?}", ta, tb, tc);
@@ -4246,7 +4207,7 @@ impl Gen {
                     // the resolver `Gen::load` was handed, not the root binding: a
                     // generation module may not reach `crate::` for names.
                     let st = |n: &str| res(n).unwrap_or(0);
-                    g.vein = Some(VeinCfg {
+                    self.vein = Some(VeinCfg {
                         toggle: ta,
                         ridged: tb,
                         gap: tc,
@@ -4261,49 +4222,52 @@ impl Gen {
             }
         }
         // climate router ids for biome multi-noise sampling
-        {
-            let keys = [
-                "temperature",
-                "vegetation",
-                "continents",
-                "erosion",
-                "depth",
-                "ridges",
-            ];
-            let mut ids = [0usize; 6];
-            let mut ok = true;
-            for (i, k) in keys.iter().enumerate() {
-                match router
-                    .and_then(|r| r.get(k))
-                    .and_then(|j| router_df(&mut g, &files, j))
-                {
-                    Some(v) => ids[i] = v,
-                    None => {
-                        Self::load_trace(&format!("climate router field {k:?} did not resolve"));
-                        ok = false;
-                    }
+        let keys = [
+            "temperature",
+            "vegetation",
+            "continents",
+            "erosion",
+            "depth",
+            "ridges",
+        ];
+        let mut ids = [0usize; 6];
+        let mut ok = true;
+        for (i, k) in keys.iter().enumerate() {
+            match router
+                .and_then(|r| r.get(k))
+                .and_then(|j| router_df(self, files, j))
+            {
+                Some(v) => ids[i] = v,
+                None => {
+                    Self::load_trace(&format!("climate router field {k:?} did not resolve"));
+                    ok = false;
                 }
             }
-            if ok {
-                g.climate = Some(ids);
-                // vanilla depth = grad(y) + offset(x,z): split it so the
-                // expensive offset term can be cached per column.
-                if let DF::Add(a, b) = g.dfs[ids[4]] {
-                    let (gi, oi) = if matches!(g.dfs[a], DF::Grad { .. }) {
-                        (a, b)
-                    } else if matches!(g.dfs[b], DF::Grad { .. }) {
-                        (b, a)
-                    } else {
-                        (usize::MAX, usize::MAX)
-                    };
-                    if gi != usize::MAX {
-                        if let DF::Grad { fc, fv, tc, tv } = g.dfs[gi] {
-                            g.depth_split = Some((fc, fv, tc, tv, oi));
-                        }
+        }
+        if ok {
+            self.climate = Some(ids);
+            // vanilla depth = grad(y) + offset(x,z): split it so the
+            // expensive offset term can be cached per column.
+            if let DF::Add(a, b) = self.dfs[ids[4]] {
+                let (gi, oi) = if matches!(self.dfs[a], DF::Grad { .. }) {
+                    (a, b)
+                } else if matches!(self.dfs[b], DF::Grad { .. }) {
+                    (b, a)
+                } else {
+                    (usize::MAX, usize::MAX)
+                };
+                if gi != usize::MAX {
+                    if let DF::Grad { fc, fv, tc, tv } = self.dfs[gi] {
+                        self.depth_split = Some((fc, fv, tc, tv, oi));
                     }
                 }
             }
         }
+        Some(())
+    }
+
+    fn load_biomes(&mut self) -> Option<()> {
+        let preset = self.preset;
         // Vanilla's built-in climate tree, exported by tools/biome_tree_from_jar.py.
         // The preset JSON only names the builder; it does not contain its intervals.
         if preset == NoisePreset::End {
@@ -4314,15 +4278,15 @@ impl Gen {
                 "minecraft:small_end_islands",
                 "minecraft:end_barrens",
             ] {
-                let leaf = g.biome_names.len() as u16;
-                g.biome_names.push(name.to_string());
-                g.bleaf.insert(name.to_string(), leaf);
+                let leaf = self.biome_names.len() as u16;
+                self.biome_names.push(name.to_string());
+                self.bleaf.insert(name.to_string(), leaf);
             }
         } else {
             let tree_file = "multi_noise_biome_tree.json";
-            let dp_tree = std::path::Path::new(&g.base).join(tree_file);
+            let dp_tree = std::path::Path::new(&self.base).join(tree_file);
             let exported = std::fs::read(&dp_tree).ok().or_else(|| {
-                if !g.base.is_empty() {
+                if !self.base.is_empty() {
                     return None;
                 }
                 let asset_dir = std::env::var_os("MEGU_VERSION_DIR").map_or_else(
@@ -4333,11 +4297,11 @@ impl Gen {
             });
             if let Some(tree) = exported.as_deref().and_then(jparse) {
                 if let Some(branch) = tree.get(preset.name()) {
-                    let d = std::sync::Arc::make_mut(&mut g.data);
+                    let d = std::sync::Arc::make_mut(&mut self.data);
                     d.btree = bt_parse(branch, &mut d.biome_names, &mut d.bleaf, &mut d.leaf_ps);
                 }
             }
-            if g.btree.is_none() {
+            if self.btree.is_none() {
                 Self::load_trace(&format!(
                     "no valid {} biome tree at {}",
                     preset.name(),
@@ -4353,7 +4317,7 @@ impl Gen {
                     preset.name(),
                     names.len()
                 );
-                let d = std::sync::Arc::make_mut(&mut g.data);
+                let d = std::sync::Arc::make_mut(&mut self.data);
                 d.biome_names = names;
                 d.bleaf = ids;
                 d.leaf_ps = leaf_ps;
@@ -4363,8 +4327,8 @@ impl Gen {
         // SurfaceRules.Temperature reads biome weather, not the noise-router
         // temperature coordinate. Bind the settings to the same leaf identities.
         let biome_files = Self::dp_files("biome");
-        for name in g.biome_names.clone() {
-            g.biome_ids.push(biome_id(&name));
+        for name in self.biome_names.clone() {
+            self.biome_ids.push(biome_id(&name));
             let Some(weather) = biome_files
                 .get(&name)
                 .and_then(|b| jparse(b))
@@ -4373,51 +4337,70 @@ impl Gen {
                 Self::load_trace(&format!("biome weather did not parse: {name}"));
                 return None;
             };
-            g.biome_weather.push(weather);
+            self.biome_weather.push(weather);
         }
+        Some(())
+    }
+
+    fn load_surface_rules(
+        &mut self,
+        ns: &J,
+        router: Option<&J>,
+        files: &HashMap<String, Vec<u8>>,
+        res: fn(&str) -> Option<u32>,
+    ) -> Option<()> {
         // vanilla surface rules (material_rule) — needs biome tree loaded first
         // (biome conditions resolve to leaf ids).
-        {
-            let rfiles = Self::dp_files("material_rule");
-            let cfiles = Self::dp_files("material_condition");
-            g.surf_ni = g.noise_id("minecraft:surface");
-            g.sec_ni = g.noise_id("minecraft:surface_secondary");
-            g.band_off_ni = g.noise_id("minecraft:clay_bands_offset");
-            g.ore_split = Some(g.factory.of_str("minecraft:ore").splitter());
-            g.def_st = Self::block_state(ns.get("default_block")?, res)?;
-            g.def_fl = Self::block_state(ns.get("default_fluid")?, res)?;
-            g.bands = create_bands(&mut g.factory.of_str("minecraft:clay_bands"), res);
-            // Vanilla NoiseChunk computes the preliminary surface from
-            // `noise_router.initial_density_without_jaggedness` in code (threshold
-            // 0.390625, quart-aligned column, cell-height steps). Older converted
-            // packs carry an explicit `aquifers.surface_level` find_top_surface or a
-            // `chunk_surface_level` router entry; keep those as legacy fallbacks.
-            let prelim = router
-                .and_then(|r| r.get("initial_density_without_jaggedness"))
-                .or_else(|| ns.get("aquifers").and_then(|a| a.get("surface_level")))
-                .or_else(|| router.and_then(|r| r.get("chunk_surface_level")));
-            if let Some(j) = prelim {
-                g.prelim_df = router_df(&mut g, &files, j);
-                if g.prelim_df.is_none() {
-                    Self::load_trace("preliminary surface density did not resolve");
-                }
-            }
-            if let Some(rule) = ns.get("surface_rule").or_else(|| ns.get("material_rule")) {
-                g.surface_rule = g.rule_node(rule, &files, &rfiles, &cfiles, res);
-                if g.surface_rule.is_none() {
-                    let e = g.surface_rule_load_failure(preset);
-                    Self::load_trace(&format!(
-                        "noise_settings surface_rule/material_rule did not resolve: {e}"
-                    ));
-                    return None;
-                }
-                if let Some(root) = g.surface_rule {
-                    g.deep_fast = compile_deep_fast(&g.rules, &g.conds, root, g.min_y, g.height);
-                }
+        let rfiles = Self::dp_files("material_rule");
+        let cfiles = Self::dp_files("material_condition");
+        self.surf_ni = self.noise_id("minecraft:surface");
+        self.sec_ni = self.noise_id("minecraft:surface_secondary");
+        self.band_off_ni = self.noise_id("minecraft:clay_bands_offset");
+        self.ore_split = Some(self.factory.of_str("minecraft:ore").splitter());
+        self.def_st = Self::block_state(ns.get("default_block")?, res)?;
+        self.def_fl = Self::block_state(ns.get("default_fluid")?, res)?;
+        self.bands = create_bands(&mut self.factory.of_str("minecraft:clay_bands"), res);
+        // Vanilla NoiseChunk computes the preliminary surface from
+        // `noise_router.initial_density_without_jaggedness` in code (threshold
+        // 0.390625, quart-aligned column, cell-height steps). Older converted
+        // packs carry an explicit `aquifers.surface_level` find_top_surface or a
+        // `chunk_surface_level` router entry; keep those as legacy fallbacks.
+        let prelim = router
+            .and_then(|r| r.get("initial_density_without_jaggedness"))
+            .or_else(|| ns.get("aquifers").and_then(|a| a.get("surface_level")))
+            .or_else(|| router.and_then(|r| r.get("chunk_surface_level")));
+        if let Some(j) = prelim {
+            self.prelim_df = router_df(self, files, j);
+            if self.prelim_df.is_none() {
+                Self::load_trace("preliminary surface density did not resolve");
             }
         }
+        if let Some(rule) = ns.get("surface_rule").or_else(|| ns.get("material_rule")) {
+            self.surface_rule = self.rule_node(rule, files, &rfiles, &cfiles, res);
+            if self.surface_rule.is_none() {
+                let e = self.surface_rule_load_failure(self.preset);
+                Self::load_trace(&format!(
+                    "noise_settings surface_rule/material_rule did not resolve: {e}"
+                ));
+                return None;
+            }
+            if let Some(root) = self.surface_rule {
+                self.deep_fast =
+                    compile_deep_fast(&self.rules, &self.conds, root, self.min_y, self.height);
+            }
+        }
+        Some(())
+    }
+
+    fn load_aquifer(
+        &mut self,
+        ns: &J,
+        router: Option<&J>,
+        files: &HashMap<String, Vec<u8>>,
+        res: fn(&str) -> Option<u32>,
+    ) {
         // aquifer config: noise DF ids + positional deriver (minecraft:aquifer)
-        let noaq = std::env::var("MEGU_NOAQ").is_ok() || !jbool(&ns, "aquifers_enabled", true);
+        let noaq = std::env::var("MEGU_NOAQ").is_ok() || !jbool(ns, "aquifers_enabled", true);
         // 1.21.1 has no top-level `aquifers`: the same four functions sit in
         // `noise_router` under their own names. 1.21.1's deep-aquifer test reads
         // `erosion` and `depth` (OverworldBiomeBuilder.isDeepDark; NoiseRouter's
@@ -4438,68 +4421,71 @@ impl Gen {
                         return None;
                     }
                 };
-                router_df(g, &files, j)
+                router_df(g, files, j)
             };
             let (b, f, s, l) = (
-                get(&mut g, "barrier"),
-                get(&mut g, "fluid_level_floodedness"),
-                get(&mut g, "fluid_level_spread"),
-                get(&mut g, "lava"),
+                get(self, "barrier"),
+                get(self, "fluid_level_floodedness"),
+                get(self, "fluid_level_spread"),
+                get(self, "lava"),
             );
             if let (Some(barrier), Some(flood), Some(spread), Some(lava)) = (b, f, s, l) {
-                g.aq = Some(Aqd {
+                self.aq = Some(Aqd {
                     barrier,
                     flood,
                     spread,
                     lava,
-                    split: g.factory.of_str("minecraft:aquifer").splitter(),
+                    split: self.factory.of_str("minecraft:aquifer").splitter(),
                     water: res("minecraft:water").unwrap_or(80),
                     lava_st: res("minecraft:lava").unwrap_or(1),
                 });
             }
         }
+    }
+
+    fn finish_loading(&mut self, fold_dfs: bool) {
         // Exact constant folding over the finished id table, before `is_2d`,
         // the interp classification and the compiled program read it: only
         // position-independent subtrees collapse (see `fold_constant_dfs`), so
         // every evaluator sees the same values with less work per block.
-        g.df_folded = if fold_dfs {
-            fold_constant_dfs(&mut g.dfs)
+        self.df_folded = if fold_dfs {
+            fold_constant_dfs(&mut self.dfs)
         } else {
             0
         };
         // Compile `final_density` once, now that the id table is final.
-        g.is_2d = compute_is_2d(&g.dfs);
-        let density_ids = g.interp_ids_from(&[g.final_density]);
+        self.is_2d = compute_is_2d(&self.dfs);
+        let density_ids = self.interp_ids_from(&[self.final_density]);
         let density_set: HashSet<usize> = density_ids.iter().copied().collect();
-        g.interp_nodes = g
+        self.interp_nodes = self
             .interp_ids()
             .into_iter()
-            .filter_map(|id| match g.dfs[id] {
+            .filter_map(|id| match self.dfs[id] {
                 DF::Interp(inner) => Some((id, inner)),
                 _ => None,
             })
             .collect();
         let mut density_interp_nodes = Vec::new();
         let mut vein_interp_nodes = Vec::new();
-        for &(id, inner) in &g.interp_nodes {
-            let kind = classify_interp_inner(&g.dfs, inner);
+        for &(id, inner) in &self.interp_nodes {
+            let kind = classify_interp_inner(&self.dfs, inner);
             if density_set.contains(&id) {
                 density_interp_nodes.push((id, kind));
             } else {
                 vein_interp_nodes.push((id, kind));
             }
         }
-        g.density_interp_nodes = density_interp_nodes;
-        g.vein_interp_nodes = vein_interp_nodes;
-        g.upper_bound_interp = detect_upper_bound_interp(&g.dfs, g.final_density);
-        g.dfprog = DfProg::compile(&g);
+        self.density_interp_nodes = density_interp_nodes;
+        self.vein_interp_nodes = vein_interp_nodes;
+        self.upper_bound_interp = detect_upper_bound_interp(&self.dfs, self.final_density);
+        self.dfprog = DfProg::compile(self);
         // BOT-DF-BATCH: the `interpolated` inputs compiled for the corner-grid
         // column sweep (a hoisted 2D prefix per column plus a 3D tail per level).
-        g.dfcols = DfCols::compile(&g, &general_roots(&g.density_interp_nodes));
-        g.vfcols = DfCols::compile(&g, &general_roots(&g.vein_interp_nodes));
+        self.dfcols = DfCols::compile(self, &general_roots(&self.density_interp_nodes));
+        self.vfcols = DfCols::compile(self, &general_roots(&self.vein_interp_nodes));
         // Diagnostic counters sized to this generator's node table (WG_COUNT only).
         if std::env::var_os("WG_COUNT").is_some() {
-            g.df_hits_init();
+            self.df_hits_init();
         }
         // Post-load RAM trim. `names`, `noise_names`, `rule_ids` and
         // `cond_ids` exist for JSON loading; their only post-load readers are
@@ -4508,24 +4494,23 @@ impl Gen {
         // runtime lookup. Every Vec below is final here, so its spare capacity
         // is reclaimed once.
         let mut trimmed = 0usize;
-        trimmed += str_map_trim_bytes(&mut g.names);
-        trimmed += str_map_trim_bytes(&mut g.noise_names);
-        trimmed += str_map_trim_bytes(&mut g.rule_ids);
-        trimmed += str_map_trim_bytes(&mut g.cond_ids);
-        trimmed += vec_trim_bytes(&mut g.dfs);
-        trimmed += vec_trim_bytes(&mut g.noises);
-        trimmed += vec_trim_bytes(&mut g.is_2d);
-        trimmed += vec_trim_bytes(&mut g.rules);
-        trimmed += vec_trim_bytes(&mut g.conds);
-        trimmed += vec_trim_bytes(&mut g.leaf_ps);
-        trimmed += vec_trim_bytes(&mut g.biome_names);
-        trimmed += vec_trim_bytes(&mut g.biome_ids);
-        trimmed += vec_trim_bytes(&mut g.biome_weather);
-        trimmed += vec_trim_bytes(&mut g.interp_nodes);
-        trimmed += vec_trim_bytes(&mut g.density_interp_nodes);
-        trimmed += vec_trim_bytes(&mut g.vein_interp_nodes);
-        g.ram_trimmed = trimmed;
-        Some(g)
+        trimmed += str_map_trim_bytes(&mut self.names);
+        trimmed += str_map_trim_bytes(&mut self.noise_names);
+        trimmed += str_map_trim_bytes(&mut self.rule_ids);
+        trimmed += str_map_trim_bytes(&mut self.cond_ids);
+        trimmed += vec_trim_bytes(&mut self.dfs);
+        trimmed += vec_trim_bytes(&mut self.noises);
+        trimmed += vec_trim_bytes(&mut self.is_2d);
+        trimmed += vec_trim_bytes(&mut self.rules);
+        trimmed += vec_trim_bytes(&mut self.conds);
+        trimmed += vec_trim_bytes(&mut self.leaf_ps);
+        trimmed += vec_trim_bytes(&mut self.biome_names);
+        trimmed += vec_trim_bytes(&mut self.biome_ids);
+        trimmed += vec_trim_bytes(&mut self.biome_weather);
+        trimmed += vec_trim_bytes(&mut self.interp_nodes);
+        trimmed += vec_trim_bytes(&mut self.density_interp_nodes);
+        trimmed += vec_trim_bytes(&mut self.vein_interp_nodes);
+        self.ram_trimmed = trimmed;
     }
 
     // ---- material rule parsing ----
@@ -5017,14 +5002,7 @@ impl Gen {
     }
 
     fn parse_df(&mut self, j: &J, files: &HashMap<String, Vec<u8>>) -> Option<DF> {
-        let ty = j.get("type")?.str().strip_prefix("minecraft:")?.to_string();
-        // The loader silently dropping a node looks exactly like a wrong world, so
-        // `LOAD_TRACE=1` names the type it could not build (CV2: print what was skipped).
-        let trace = |ty: &str, ok: bool| {
-            if !ok && std::env::var("LOAD_TRACE").is_ok() {
-                eprintln!("[load] density function type not built: {ty}");
-            }
-        };
+        let ty = j.get("type")?.str().strip_prefix("minecraft:")?;
         let n = |k: &str| j.get(k).map(J::num).unwrap_or(0.0);
         let sub = |g: &mut Gen, k: &str| -> Option<usize> { g.node(j.get(k)?, files) };
         // 1.21.1 names the two operands `argument1`/`argument2`, the newer dialect
@@ -5032,40 +5010,28 @@ impl Gen {
         let either = |g: &mut Gen, k: &str, alt: &str| -> Option<usize> {
             g.node(j.get(k).or_else(|| j.get(alt))?, files)
         };
-        let out = Some(match ty.as_str() {
-            "add" => DF::Add(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "sub" => DF::Sub(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "mul" => DF::Mul(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "min" => DF::Min(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "max" => DF::Max(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "div" => DF::Div(
-                either(self, "left", "argument1")?,
-                either(self, "right", "argument2")?,
-            ),
-            "negate" => DF::Neg(either(self, "input", "argument")?),
-            "abs" => DF::Abs(either(self, "input", "argument")?),
-            "square" => DF::Sq(either(self, "input", "argument")?),
-            "cube" => DF::Cube(either(self, "input", "argument")?),
-            "half_negative" => DF::HNeg(either(self, "input", "argument")?),
-            "quarter_negative" => DF::QNeg(either(self, "input", "argument")?),
-            "squeeze" => DF::Squeeze(either(self, "input", "argument")?),
+        let input = |g: &mut Gen| either(g, "input", "argument");
+        let binary = |g: &mut Gen, build: fn(usize, usize) -> DF| {
+            let left = either(g, "left", "argument1")?;
+            let right = either(g, "right", "argument2")?;
+            Some(build(left, right))
+        };
+        Some(match ty {
+            "add" => binary(self, DF::Add)?,
+            "sub" => binary(self, DF::Sub)?,
+            "mul" => binary(self, DF::Mul)?,
+            "min" => binary(self, DF::Min)?,
+            "max" => binary(self, DF::Max)?,
+            "div" => binary(self, DF::Div)?,
+            "negate" => DF::Neg(input(self)?),
+            "abs" => DF::Abs(input(self)?),
+            "square" => DF::Sq(input(self)?),
+            "cube" => DF::Cube(input(self)?),
+            "half_negative" => DF::HNeg(input(self)?),
+            "quarter_negative" => DF::QNeg(input(self)?),
+            "squeeze" => DF::Squeeze(input(self)?),
             "clamp" => DF::Clamp {
-                i: either(self, "input", "argument")?,
+                i: input(self)?,
                 lo: n("min"),
                 hi: n("max"),
             },
@@ -5087,22 +5053,21 @@ impl Gen {
                 tc: n("to_y"),
                 tv: n("to_value"),
             },
-            "interpolated" => DF::Interp(either(self, "input", "argument")?),
+            "interpolated" => DF::Interp(input(self)?),
             "cache" | "flat_cache" | "cache_2d" | "cache_once" | "cache_all_in_cell" => {
-                DF::Cache(either(self, "input", "argument")?)
+                DF::Cache(input(self)?)
             }
-            "noise" => {
-                let zero = {
+            "noise" | "shifted_noise" => {
+                // Only the converted "noise" form supplies a default for
+                // omitted shifts. Keep its zero node ahead of noise/shift
+                // resolution, and reject any present but invalid shift.
+                let zero = (ty == "noise").then(|| {
                     self.dfs.push(DF::C(0.0));
                     self.dfs.len() - 1
-                };
-                // For this dialect, omitted shifts mean zero, but a present
-                // unparseable shift is not equivalent to an omitted one.
-                let shift = |g: &mut Gen, k: &str| -> Option<usize> {
-                    match j.get(k) {
-                        Some(value) => g.node(value, files),
-                        None => Some(zero),
-                    }
+                });
+                let shift = |g: &mut Gen, k: &str| match j.get(k) {
+                    Some(value) => g.node(value, files),
+                    None => zero,
                 };
                 DF::Noise {
                     ni: self.noise_id(j.get("noise")?.str())?,
@@ -5113,17 +5078,6 @@ impl Gen {
                     ys: n("y_scale"),
                 }
             }
-            // Native 1.21.1 shifted_noise specifies all three density shifts.
-            // Reading shift_y as constant zero was only correct by coincidence
-            // for the currently pinned vanilla data (whose shift_y is zero).
-            "shifted_noise" => DF::Noise {
-                ni: self.noise_id(j.get("noise")?.str())?,
-                sx: self.node(j.get("shift_x")?, files)?,
-                sy: self.node(j.get("shift_y")?, files)?,
-                sz: self.node(j.get("shift_z")?, files)?,
-                xzs: n("xz_scale"),
-                ys: n("y_scale"),
-            },
             // 1.21.1 names it in `argument`, the newer dialect in `noise`; either way it
             // is a *noise* name (`minecraft:offset`), not a density-function reference.
             "shift_a" | "shift_x" => {
@@ -5149,13 +5103,13 @@ impl Gen {
                     None
                 })?;
                 DF::WeirdScaledSampler {
-                    input: either(self, "input", "argument")?,
+                    input: input(self)?,
                     ni,
                     mapper,
                 }
             }
             "range_choice" => DF::RangeChoice {
-                i: either(self, "input", "argument")?,
+                i: input(self)?,
                 mi: n("min_inclusive"),
                 ma: n("max_exclusive"),
                 wr: sub(self, "when_in_range")?,
@@ -5171,7 +5125,7 @@ impl Gen {
                     th.push(t.num());
                 }
                 DF::IntervalSelect {
-                    i: either(self, "input", "argument")?,
+                    i: input(self)?,
                     th,
                     fns,
                 }
@@ -5190,7 +5144,7 @@ impl Gen {
                     BlendedNoise::modern(&mut rng, xzs, ys, xzf, yf, smear)
                 }))
             }
-            "blend_density" => DF::BlendD(either(self, "input", "argument")?),
+            "blend_density" => DF::BlendD(input(self)?),
             "blend_alpha" => DF::C(1.0),
             "end_islands" => DF::EndIslands(Box::new(EndIslands::new(self.world_seed))),
             "beardifier" => DF::Beardifier,
@@ -5208,9 +5162,7 @@ impl Gen {
                 Self::load_trace(&format!("unsupported density function type {ty:?}"));
                 return None;
             }
-        });
-        trace(&ty, out.is_some());
-        out
+        })
     }
 
     pub(crate) fn eval(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut FlatMemo) -> f64 {
@@ -9133,7 +9085,7 @@ pub(crate) struct ChunkCols {
     // Preset-sized horizontal/vertical corner grid per `interpolated` node reachable from
     // final_density, indexed by density-function id. Vanilla interpolates only
     // the input of `interpolated`; squeeze/min/add stay per block.
-    grids: Vec<Option<Box<[f64]>>>,
+    grids: InterpGrids,
     surf: [i16; 256],
     ny: usize, // vertical corner count, including both edges
     cell_w: i32,
@@ -11324,7 +11276,7 @@ impl Gen {
         let dfs_len = self.dfs.len();
         let grid_len = nx * nx * ny;
         let mut lazy = self.base_col_lazy.take().unwrap_or_else(|| {
-            let mut grids: Vec<Option<Box<[f64]>>> = (0..dfs_len).map(|_| None).collect();
+            let mut grids: InterpGrids = (0..dfs_len).map(|_| None).collect();
             for &(iid, _) in &self.density_interp_nodes {
                 grids[iid] = Some(vec![0.0; grid_len].into_boxed_slice());
             }
@@ -11716,13 +11668,12 @@ impl Gen {
     }
 
     fn build_cols_body(&mut self, cx: i32, cz: i32, final_columns: bool) -> Option<ChunkCols> {
-        let g = self;
         // Whether this build asks the aquifer decides what `carve_sched` means: `Some`
         // when a call wrote `aq_sched` during the build (the flag the chunk's own aquifer
         // holds), `None` when the build left the flag the caller already had.
-        let aq0 = g.aq_calls;
-        let ny = ((g.height / g.noise_cell_h) + 1) as usize;
-        let nx = (16 / g.noise_cell_w + 1) as usize;
+        let aq0 = self.aq_calls;
+        let ny = ((self.height / self.noise_cell_h) + 1) as usize;
+        let nx = (16 / self.noise_cell_w + 1) as usize;
         // Resolve the chunk's beardifier before `surf`, `wtop` and `mats`: vanilla's
         // `fillFromNoise` evaluates `final_density` with `Beardifier` active and only
         // then calls `SurfaceSystem.buildSurface`. `preliminarySurfaceLevel` is the
@@ -11730,256 +11681,13 @@ impl Gen {
         // resolution runs with `beard_depth > 0`, gets `None` here, and is therefore
         // excluded from `col_c` (see the cache rule at the end of this function).
         let beard = if final_columns && !wg_count() {
-            g.resolve_beard(cx, cz)
+            self.resolve_beard(cx, cz)
         } else {
             None
         };
-        // One corner grid per `interpolated` node on the final_density path. The
-        // grid holds the node's input; the enclosing operators are evaluated per
-        // block in block_density(). Interpolating final_density itself would
-        // interpolate squeeze(), which is cubic and not vanilla.
-        let mut grids: Vec<Option<Box<[f64]>>>;
-        // `WG_COUNT` counts visits through `eval_c`, so keep the original HashMap path
-        // when diagnostics are on; the flat path has no per-visit counter to update.
-        if wg_count() {
-            grids = (0..g.dfs.len()).map(|_| None).collect();
-            let mut memo: FlatMemo = FlatMemo::default();
-            for &(iid, inner) in &g.interp_nodes {
-                let mut cells = vec![0.0f64; nx * nx * ny];
-                for zi in 0..nx {
-                    for xi in 0..nx {
-                        for yi in 0..ny {
-                            let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                            let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                            let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                            cells[(zi * nx + xi) * ny + yi] = g.eval(inner, bx, by, bz, &mut memo);
-                        }
-                    }
-                }
-                grids[iid] = Some(cells.into_boxed_slice());
-            }
-        } else {
-            let mut reused = g
-                .base_c
-                .get(&(cx, cz))
-                .or_else(|| g.col_c.get(&(cx, cz)))
-                .map(|c| c.grids.clone())
-                .or_else(|| {
-                    let share = g.round_share()?;
-                    let key = g.terrain_share_key(cx, cz);
-                    share
-                        .bases
-                        .peek(&key)
-                        .flatten()
-                        .or_else(|| share.cols.peek(&key).flatten())
-                        .or_else(|| {
-                            let f = g.share_fallback(&share)?;
-                            f.bases
-                                .peek(&key)
-                                .flatten()
-                                .or_else(|| f.cols.peek(&key).flatten())
-                        })
-                        .map(|c| c.grids.clone())
-                });
-            let have_density = reused.is_some();
-            grids = reused
-                .take()
-                .unwrap_or_else(|| (0..g.dfs.len()).map(|_| None).collect());
-            if !have_density {
-                let mut general: Vec<(usize, usize)> =
-                    Vec::with_capacity(g.density_interp_nodes.len());
-                for &(iid, kind) in &g.density_interp_nodes {
-                    match kind {
-                        InterpKind::General(inner) => {
-                            grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
-                            general.push((iid, inner));
-                        }
-                        InterpKind::YNoise { .. } => {
-                            let mut cells = vec![0.0; nx * nx * ny].into_boxed_slice();
-                            g.fill_ynoise_grid(&mut cells, cx, cz, nx, ny, kind);
-                            grids[iid] = Some(cells);
-                        }
-                    }
-                }
-                if !general.is_empty() {
-                    let data = g.data.clone();
-                    if let Some(cols) = data.dfcols.as_deref().filter(|_| !dfcol_flat()) {
-                        let mut sc = g.take_dfcol_scratch(cols);
-                        // Each grid's program resolves once; the column then pays
-                        // the 2D prefix once and `ny` runs of each 3D tail, one
-                        // contiguous run of cells per grid.
-                        let mut resolved: Vec<(usize, &[Op])> = Vec::with_capacity(general.len());
-                        resolved.extend(
-                            general
-                                .iter()
-                                .map(|&(iid, _)| (iid, cols.prog(iid).unwrap())),
-                        );
-                        for zi in 0..nx {
-                            for xi in 0..nx {
-                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                                cols.begin(g, bx, bz, &mut sc);
-                                for &(iid, ops) in &resolved {
-                                    let cells = grids[iid].as_mut().unwrap();
-                                    let base = (zi * nx + xi) * ny;
-                                    let mut yi = 0usize;
-                                    // Four (or eight) levels of the tail at a
-                                    // time on the AVX2 arm; the scalar tail
-                                    // covers the `ny` remainder.
-                                    while yi + DF8 <= ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        let r = cols.eval_y8(
-                                            ops,
-                                            g,
-                                            bx,
-                                            by,
-                                            g.noise_cell_h,
-                                            bz,
-                                            &mut sc,
-                                        );
-                                        cells[base + yi..base + yi + DF8].copy_from_slice(&r);
-                                        yi += DF8;
-                                    }
-                                    while yi + DF4 <= ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        let r = cols.eval_y4(
-                                            ops,
-                                            g,
-                                            bx,
-                                            by,
-                                            g.noise_cell_h,
-                                            bz,
-                                            &mut sc,
-                                        );
-                                        cells[base + yi..base + yi + DF4].copy_from_slice(&r);
-                                        yi += DF4;
-                                    }
-                                    while yi < ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        cells[base + yi] = cols.eval(ops, g, bx, by, bz, &mut sc);
-                                        yi += 1;
-                                    }
-                                }
-                            }
-                        }
-                        g.dfcol_scratch = Some(sc);
-                    } else {
-                        let mut flat = g.take_corner_memo();
-                        for zi in 0..nx {
-                            for xi in 0..nx {
-                                flat.next_2d();
-                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                                for yi in 0..ny {
-                                    flat.next_3d();
-                                    let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                    for &(iid, inner) in &general {
-                                        grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
-                                            g.eval_flat(inner, bx, by, bz, &mut flat);
-                                    }
-                                }
-                            }
-                        }
-                        g.corner_memo = Some(flat);
-                    }
-                }
-            }
-            if final_columns && !g.vein_interp_nodes.is_empty() {
-                let mut general_vein: Vec<(usize, usize)> = Vec::new();
-                for &(iid, kind) in &g.vein_interp_nodes {
-                    if grids[iid].is_some() {
-                        continue;
-                    }
-                    match kind {
-                        InterpKind::General(inner) => {
-                            grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
-                            general_vein.push((iid, inner));
-                        }
-                        InterpKind::YNoise { .. } => {
-                            let mut cells = vec![0.0; nx * nx * ny].into_boxed_slice();
-                            g.fill_ynoise_grid(&mut cells, cx, cz, nx, ny, kind);
-                            grids[iid] = Some(cells);
-                        }
-                    }
-                }
-                if !general_vein.is_empty() {
-                    let data = g.data.clone();
-                    if let Some(cols) = data.vfcols.as_deref().filter(|_| !dfcol_flat()) {
-                        let mut sc = g.take_dfcol_scratch(cols);
-                        let resolved: Vec<(usize, &[Op])> = general_vein
-                            .iter()
-                            .map(|&(iid, _)| (iid, cols.prog(iid).unwrap()))
-                            .collect();
-                        for zi in 0..nx {
-                            for xi in 0..nx {
-                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                                cols.begin(g, bx, bz, &mut sc);
-                                for &(iid, ops) in &resolved {
-                                    let cells = grids[iid].as_mut().unwrap();
-                                    let base = (zi * nx + xi) * ny;
-                                    let mut yi = 0usize;
-                                    while yi + DF8 <= ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        let r = cols.eval_y8(
-                                            ops,
-                                            g,
-                                            bx,
-                                            by,
-                                            g.noise_cell_h,
-                                            bz,
-                                            &mut sc,
-                                        );
-                                        cells[base + yi..base + yi + DF8].copy_from_slice(&r);
-                                        yi += DF8;
-                                    }
-                                    while yi + DF4 <= ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        let r = cols.eval_y4(
-                                            ops,
-                                            g,
-                                            bx,
-                                            by,
-                                            g.noise_cell_h,
-                                            bz,
-                                            &mut sc,
-                                        );
-                                        cells[base + yi..base + yi + DF4].copy_from_slice(&r);
-                                        yi += DF4;
-                                    }
-                                    while yi < ny {
-                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                        cells[base + yi] = cols.eval(ops, g, bx, by, bz, &mut sc);
-                                        yi += 1;
-                                    }
-                                }
-                            }
-                        }
-                        g.dfcol_scratch = Some(sc);
-                    } else {
-                        let mut flat = g.take_corner_memo();
-                        for zi in 0..nx {
-                            for xi in 0..nx {
-                                flat.next_2d();
-                                let bx = cx * 16 + (xi as i32) * g.noise_cell_w;
-                                let bz = cz * 16 + (zi as i32) * g.noise_cell_w;
-                                for yi in 0..ny {
-                                    flat.next_3d();
-                                    let by = g.min_y + (yi as i32) * g.noise_cell_h;
-                                    for &(iid, inner) in &general_vein {
-                                        grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
-                                            g.eval_flat(inner, bx, by, bz, &mut flat);
-                                    }
-                                }
-                            }
-                        }
-                        g.corner_memo = Some(flat);
-                    }
-                }
-            }
-        }
+        let grids = self.build_interp_grids(cx, cz, nx, ny, final_columns);
         let beard = if final_columns && wg_count() {
-            g.resolve_beard(cx, cz)
+            self.resolve_beard(cx, cz)
         } else {
             beard
         };
@@ -11987,9 +11695,9 @@ impl Gen {
             grids,
             surf: [0i16; 256],
             ny,
-            cell_w: g.noise_cell_w,
-            cell_h: g.noise_cell_h,
-            min_y: g.min_y,
+            cell_w: self.noise_cell_w,
+            cell_h: self.noise_cell_h,
+            min_y: self.min_y,
             mats: SurfMatsCell::new(cx, cz),
             rd: [0i16; 256],
             wtop: [0i16; 256],
@@ -12002,7 +11710,194 @@ impl Gen {
         if !final_columns {
             return Some(cc);
         }
-        let top = g.min_y + g.height - 1;
+        self.fill_surface_heights(cx, cz, &mut cc);
+        self.fill_water_heights(cx, cz, &mut cc);
+        // `aq_calls != aq0` means this build asked the aquifer (the `wtop` probe below sea
+        // level, or a structure heightmap inside `resolve_beard`), so `aq_sched` is the flag
+        // this chunk's aquifer holds at carve time — not the caller's leftover.
+        cc.carve_sched = (self.aq_calls != aq0).then_some(self.aq_sched);
+        // Layer A2-b: `mats`/`rd` are built on first material read (`ChunkCols::surface_mats`),
+        // not here. Most columns in a worldgen round are neighbour/heightmap sources and never
+        // read them; the exact in-pipeline scan now lives in `Gen::build_surface_mats`.
+        Some(cc)
+    }
+
+    fn build_interp_grids(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        nx: usize,
+        ny: usize,
+        final_columns: bool,
+    ) -> InterpGrids {
+        // One corner grid per `interpolated` node on the final_density path. The
+        // grid holds the node's input; the enclosing operators are evaluated per
+        // block in block_density(). Interpolating final_density itself would
+        // interpolate squeeze(), which is cubic and not vanilla.
+        // `WG_COUNT` counts visits through `eval_c`, so keep the original HashMap path
+        // when diagnostics are on; the flat path has no per-visit counter to update.
+        if wg_count() {
+            let mut grids = (0..self.dfs.len()).map(|_| None).collect::<InterpGrids>();
+            let mut memo: FlatMemo = FlatMemo::default();
+            for &(iid, inner) in &self.interp_nodes {
+                let mut cells = vec![0.0f64; nx * nx * ny];
+                for zi in 0..nx {
+                    for xi in 0..nx {
+                        for yi in 0..ny {
+                            let bx = cx * 16 + (xi as i32) * self.noise_cell_w;
+                            let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                            let bz = cz * 16 + (zi as i32) * self.noise_cell_w;
+                            cells[(zi * nx + xi) * ny + yi] =
+                                self.eval(inner, bx, by, bz, &mut memo);
+                        }
+                    }
+                }
+                grids[iid] = Some(cells.into_boxed_slice());
+            }
+            return grids;
+        }
+
+        let reused = self
+            .base_c
+            .get(&(cx, cz))
+            .or_else(|| self.col_c.get(&(cx, cz)))
+            .map(|c| c.grids.clone())
+            .or_else(|| {
+                let share = self.round_share()?;
+                let key = self.terrain_share_key(cx, cz);
+                share
+                    .bases
+                    .peek(&key)
+                    .flatten()
+                    .or_else(|| share.cols.peek(&key).flatten())
+                    .or_else(|| {
+                        let f = self.share_fallback(&share)?;
+                        f.bases
+                            .peek(&key)
+                            .flatten()
+                            .or_else(|| f.cols.peek(&key).flatten())
+                    })
+                    .map(|c| c.grids.clone())
+            });
+        let have_density = reused.is_some();
+        let mut grids = reused.unwrap_or_else(|| (0..self.dfs.len()).map(|_| None).collect());
+        let fill_veins = final_columns && !self.vein_interp_nodes.is_empty();
+        if !have_density || fill_veins {
+            let data = self.data.clone();
+            if !have_density {
+                self.fill_interp_grids(
+                    (cx, cz),
+                    (nx, ny),
+                    &mut grids,
+                    &data.density_interp_nodes,
+                    data.dfcols.as_deref(),
+                );
+            }
+            if fill_veins {
+                self.fill_interp_grids(
+                    (cx, cz),
+                    (nx, ny),
+                    &mut grids,
+                    &data.vein_interp_nodes,
+                    data.vfcols.as_deref(),
+                );
+            }
+        }
+        grids
+    }
+
+    fn fill_interp_grids(
+        &mut self,
+        (cx, cz): (i32, i32),
+        (nx, ny): (usize, usize),
+        grids: &mut [Option<Box<[f64]>>],
+        nodes: &[(usize, InterpKind)],
+        cols: Option<&DfCols>,
+    ) {
+        let mut general = Vec::with_capacity(nodes.len());
+        for &(iid, kind) in nodes {
+            if grids[iid].is_some() {
+                continue;
+            }
+            match kind {
+                InterpKind::General(inner) => {
+                    grids[iid] = Some(vec![0.0; nx * nx * ny].into_boxed_slice());
+                    general.push((iid, inner));
+                }
+                InterpKind::YNoise { .. } => {
+                    let mut cells = vec![0.0; nx * nx * ny].into_boxed_slice();
+                    self.fill_ynoise_grid(&mut cells, cx, cz, nx, ny, kind);
+                    grids[iid] = Some(cells);
+                }
+            }
+        }
+        if general.is_empty() {
+            return;
+        }
+        if let Some(cols) = cols.filter(|_| !dfcol_flat()) {
+            let mut sc = self.take_dfcol_scratch(cols);
+            // Resolve each grid's program once, then run the 2D prefix once per
+            // column and the 3D tail for each level of every grid.
+            let resolved: Vec<_> = general
+                .iter()
+                .map(|&(iid, _)| (iid, cols.prog(iid).unwrap()))
+                .collect();
+            for zi in 0..nx {
+                for xi in 0..nx {
+                    let bx = cx * 16 + (xi as i32) * self.noise_cell_w;
+                    let bz = cz * 16 + (zi as i32) * self.noise_cell_w;
+                    cols.begin(self, bx, bz, &mut sc);
+                    for &(iid, ops) in &resolved {
+                        let cells = grids[iid].as_mut().unwrap();
+                        let base = (zi * nx + xi) * ny;
+                        let mut yi = 0usize;
+                        // Four (or eight) levels of the tail at a
+                        // time on the AVX2 arm; the scalar tail
+                        // covers the `ny` remainder.
+                        while yi + DF8 <= ny {
+                            let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                            let r = cols.eval_y8(ops, self, bx, by, self.noise_cell_h, bz, &mut sc);
+                            cells[base + yi..base + yi + DF8].copy_from_slice(&r);
+                            yi += DF8;
+                        }
+                        while yi + DF4 <= ny {
+                            let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                            let r = cols.eval_y4(ops, self, bx, by, self.noise_cell_h, bz, &mut sc);
+                            cells[base + yi..base + yi + DF4].copy_from_slice(&r);
+                            yi += DF4;
+                        }
+                        while yi < ny {
+                            let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                            cells[base + yi] = cols.eval(ops, self, bx, by, bz, &mut sc);
+                            yi += 1;
+                        }
+                    }
+                }
+            }
+            self.dfcol_scratch = Some(sc);
+        } else {
+            let mut flat = self.take_corner_memo();
+            for zi in 0..nx {
+                for xi in 0..nx {
+                    flat.next_2d();
+                    let bx = cx * 16 + (xi as i32) * self.noise_cell_w;
+                    let bz = cz * 16 + (zi as i32) * self.noise_cell_w;
+                    for yi in 0..ny {
+                        flat.next_3d();
+                        let by = self.min_y + (yi as i32) * self.noise_cell_h;
+                        for &(iid, inner) in &general {
+                            grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
+                                self.eval_flat(inner, bx, by, bz, &mut flat);
+                        }
+                    }
+                }
+            }
+            self.corner_memo = Some(flat);
+        }
+    }
+
+    fn fill_surface_heights(&mut self, cx: i32, cz: i32, cc: &mut ChunkCols) {
+        let top = self.min_y + self.height - 1;
         let beard_top = beard_max_y(cc.beard.as_deref());
         // M3 P4 / A2-c: eight columns of one `z` row per pass. Each lane keeps its own answer
         // - the first `y` from the top whose density is positive - so the searches share the
@@ -12015,13 +11910,13 @@ impl Gen {
             let mut xb = 0usize;
             while xb < 16 {
                 let wx = cx * 16 + xb as i32;
-                let mut sy = [g.min_y - 1; DF8];
+                let mut sy = [self.min_y - 1; DF8];
                 let mut live = DF8;
-                let mut yy = g.upper_bound_start_y(&cc, xb, xb + DF8, zi, beard_top, top);
-                while yy >= g.min_y && live > 0 {
-                    let d = g.block_density_x8(&cc, wx, yy, wz);
+                let mut yy = self.upper_bound_start_y(cc, xb, xb + DF8, zi, beard_top, top);
+                while yy >= self.min_y && live > 0 {
+                    let d = self.block_density_x8(cc, wx, yy, wz);
                     for (k, lane) in d.iter().enumerate() {
-                        if sy[k] == g.min_y - 1 && *lane > 0.0 {
+                        if sy[k] == self.min_y - 1 && *lane > 0.0 {
                             sy[k] = yy;
                             live -= 1;
                         }
@@ -12034,21 +11929,23 @@ impl Gen {
                 xb += DF8;
             }
         }
+    }
 
+    fn fill_water_heights(&mut self, cx: i32, cz: i32, cc: &mut ChunkCols) {
         // heightmap basis: topmost solid-or-fluid per column. Columns whose
         // solid top sits below sea level probe the aquifer for water so
         // OCEAN_FLOOR/WORLD_SURFACE_WG land on the water surface.
-        let water_st = g.def_fl;
+        let water_st = self.def_fl;
         for lz in 0..16usize {
             for lx in 0..16usize {
                 let sy = cc.surf[lz * 16 + lx] as i32;
                 let mut wt = sy;
-                if sy < g.sea {
+                if sy < self.sea {
                     let wx = cx * 16 + lx as i32;
                     let wz = cz * 16 + lz as i32;
-                    let mut yy = g.sea;
+                    let mut yy = self.sea;
                     while yy > sy {
-                        if g.aq_state(wx, yy, wz, -1.0) == Some(water_st) {
+                        if self.aq_state(wx, yy, wz, -1.0) == Some(water_st) {
                             wt = yy;
                             break;
                         }
@@ -12058,14 +11955,6 @@ impl Gen {
                 cc.wtop[lz * 16 + lx] = wt as i16;
             }
         }
-        // `aq_calls != aq0` means this build asked the aquifer (the `wtop` probe below sea
-        // level, or a structure heightmap inside `resolve_beard`), so `aq_sched` is the flag
-        // this chunk's aquifer holds at carve time — not the caller's leftover.
-        cc.carve_sched = (g.aq_calls != aq0).then_some(g.aq_sched);
-        // Layer A2-b: `mats`/`rd` are built on first material read (`ChunkCols::surface_mats`),
-        // not here. Most columns in a worldgen round are neighbour/heightmap sources and never
-        // read them; the exact in-pipeline scan now lives in `Gen::build_surface_mats`.
-        Some(cc)
     }
 
     /// The eager `build_cols_body` surface-material scan, now the body of the lazy
@@ -12896,7 +12785,7 @@ impl Gen {
         let dfs_len = self.dfs.len();
         let grid_len = nx * nx * ny;
         let mut scratch_cc = self.base_hm_cc.take().unwrap_or_else(|| {
-            let mut grids: Vec<Option<Box<[f64]>>> = (0..dfs_len).map(|_| None).collect();
+            let mut grids: InterpGrids = (0..dfs_len).map(|_| None).collect();
             for &(iid, _) in &self.density_interp_nodes {
                 grids[iid] = Some(vec![0.0; grid_len].into_boxed_slice());
             }
