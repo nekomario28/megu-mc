@@ -3259,7 +3259,7 @@ fn roll_loot_container_slots_at(
         ContainerKind::Furnace => 3usize,
         ContainerKind::BlockContainer(size) => usize::from(size),
     };
-    unpack_loot_table_json_at(&table_json, seed, slot_limit, origin)
+    unpack_loot_table_json_at(&table_json, seed, slot_limit, origin, Some(loot_table))
 }
 
 fn unpack_block_loot_if_needed(pos: DimBlockPos) -> bool {
@@ -3476,6 +3476,50 @@ fn exploration_map_target(
     (origin.0 + dx, origin.2 + dz)
 }
 
+/// Roll a complete loot-table JSON document into unplaced item stacks. Used
+/// by the live mod GLM engine when a modifier references another table.
+#[cfg_attr(not(feature = "mod-suite"), allow(dead_code))]
+pub(crate) fn roll_loot_table_stacks(
+    table_json: &str,
+    seed: i64,
+    origin: Option<DimBlockPos>,
+) -> Vec<Stack> {
+    let Some(table) = crate::chest_loot::jparse(table_json.as_bytes()) else {
+        return Vec::new();
+    };
+    let tag_items = |tag: &str| loot_json_tag_items(tag, 0);
+    let smelt = |item: &str| {
+        name_to_item(item)
+            .and_then(smelt_result)
+            .and_then(item_to_name)
+    };
+    let max_damage = |item: &str| {
+        i32::try_from(item_max_durability(item.trim_start_matches("minecraft:")).unwrap_or(0))
+            .unwrap_or(0)
+    };
+    let resolvers = crate::chest_loot::LootResolvers {
+        tags: &tag_items,
+        smelt: &smelt,
+        max_damage: &max_damage,
+    };
+    let seed = if seed == 0 { world_rng::next_u64() as i64 } else { seed };
+    let mut rng = crate::generation_math::Lcg::new(crate::chest_loot::catalogue_rng_seed(seed));
+    let items = crate::chest_loot::evaluate_loot_table(
+        &table,
+        &crate::chest_loot::LootContext::default(),
+        &mut rng,
+        &resolvers,
+    );
+    let mut stacks = Vec::new();
+    for item in items.iter() {
+        if let Some(stack) = loot_json_stack(item, None) {
+            stacks.push(stack);
+        }
+    }
+    let _ = origin;
+    stacks
+}
+
 /// Fill `slot_limit` container slots from a raw loot-table JSON body
 /// (`data/<ns>/loot_table/**.json` or a vanilla table). Seed 0 is unseeded,
 /// matching `RandomizableContainer.unpackLootTable`.
@@ -3485,7 +3529,7 @@ pub(crate) fn unpack_loot_table_json(
     seed: i64,
     slot_limit: usize,
 ) -> HashMap<i16, Stack> {
-    unpack_loot_table_json_at(table_json, seed, slot_limit, None)
+    unpack_loot_table_json_at(table_json, seed, slot_limit, None, None)
 }
 
 /// `unpack_loot_table_json` with the container's dimension/origin. Exploration
@@ -3496,6 +3540,7 @@ fn unpack_loot_table_json_at(
     seed: i64,
     slot_limit: usize,
     origin: Option<DimBlockPos>,
+    loot_table_id: Option<&str>,
 ) -> HashMap<i16, Stack> {
     let mut out = HashMap::new();
     let Some(table) = crate::chest_loot::jparse(table_json.as_bytes()) else {
@@ -3563,6 +3608,20 @@ fn unpack_loot_table_json_at(
         if let Some(stack) = loot_json_stack(item, map_components.as_ref()) {
             stacks.push(stack);
         }
+    }
+    if let Some(loot_table_id) = loot_table_id {
+        let (dim, pos) = origin.map_or((DimId::Overworld, None), |(dim, x, y, z)| {
+            (dim, Some((x, y, z)))
+        });
+        stacks = crate::apply_live_mod_loot_modifiers(
+            loot_table_id,
+            dim,
+            pos,
+            false,
+            None,
+            stacks,
+            seed as u64,
+        );
     }
     let slot_limit = slot_limit.min(i16::MAX as usize);
     let mut slots: Vec<i16> = (0..slot_limit as i16).collect();

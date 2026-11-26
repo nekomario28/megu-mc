@@ -137,7 +137,9 @@ fn live_should_tick_crowd_mob_ai(
     } else {
         EntityTickClass::CrowdMob
     };
-    let decision = bridge.crowd.decide(class, entity_id, chunk_x, chunk_z, tick);
+    let decision = bridge
+        .crowd
+        .decide(class, entity_id, chunk_x, chunk_z, tick);
     debug_assert!(decision.run_physics_and_damage());
     decision.run_idle_ai()
 }
@@ -250,30 +252,15 @@ use mod_adapter_core::bytecode_subset_vm::{
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::capability_bus::{
     BlockCapabilityBus, BlockCoord, CapabilityFluidStack, CapabilityItemStack,
-    CookingPotItemAdapter, FaceDirection, ItemTransferHandler, SimpleEnergyBuffer,
-    SimpleFluidTank, SimpleSlotInventory,
+    CookingPotItemAdapter, FaceDirection, ItemTransferHandler, SimpleEnergyBuffer, SimpleFluidTank,
+    SimpleSlotInventory,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::colossal_and_forge::{
     evaluate_breath_cone, BlockProbe, BreathEntity, BreathOutcome, ElementKind,
-    ElementalBreathSpec, ForgeCellExpect, ForgePatternCell, ForgeTickEvents,
-    GrowthStageCurve, MultiBlockForgeRuntime, MultiBlockForgeSpec, MultiPartHitbox,
-    PartHit, PartKind, PartOffsetSpec,
-};
-#[cfg(feature = "mod-suite")]
-use mod_offload::auto_optimizer::{
-    fingerprint_item_slots, pack_machine_key, AdaptivePollBackoff, AutoBulkSectionBatcher,
-    AutoDeltaCoalescer, AutoRecipeMemoizer, BulkSectionBatch, DistanceTier, EmitDecision,
-};
-#[cfg(feature = "mod-suite")]
-use mod_offload::lazy_catchup::{
-    catch_up_furnace, catch_up_growth_stage, catch_up_machine_batch, CatchUpLimits,
-    FurnaceCatchUpReport, FurnaceCatchUpState, HeadlessFactoryNode, HeadlessFactoryRegistry,
-    MachineCatchUpReport, MachineCatchUpState, MILLI_PER_ITEM,
-};
-#[cfg(feature = "mod-suite")]
-use mod_adapter_core::recipe_conflict_unify::{
-    InputSignature, MaterialUnifier, RecipeCandidate, RecipeConflictIndex,
+    ElementalBreathSpec, ForgeCellExpect, ForgePatternCell, ForgeTickEvents, GrowthStageCurve,
+    MultiBlockForgeRuntime, MultiBlockForgeSpec, MultiPartHitbox, PartHit, PartKind,
+    PartOffsetSpec,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::culinary_adapter::{
@@ -283,12 +270,16 @@ use mod_adapter_core::culinary_adapter::{
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::ecosystem_compat::{
     plan_dual_loader_mods_dir, AccessoryError, AccessoryInventory, AccessoryItem, AttributeTotals,
-    DualLoaderPlan,
+    DualLoaderPlan, MissingDependencyPlan, ModDependencyKind, ModEnvironment,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::live_registry_bridge::{
-    DynamicBlockStateEntry, RegistryContentIndex, UnifiedModRegistryPlan,
-    MOD_REGISTRY_SYNC_CHANNEL,
+    DynamicBlockStateEntry, RegistryContentIndex, UnifiedModRegistryPlan, MOD_REGISTRY_SYNC_CHANNEL,
+};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::loot_modifier_engine::{
+    detect_bytecode_loot_hooks, BytecodeLootHookReport, GlobalLootModifierEngine, LootDataEntry,
+    LootDataLayer, LootDropItem, LootLayerKind, LootModifierContext, ModLootOverlayIndex,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::magic_primitives as lmb_magic;
@@ -297,10 +288,17 @@ use mod_adapter_core::mixin_lifter::{LiftedBinding, MixinLiftVerdict, StandardEv
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::mod_sync as lmb_sync;
 #[cfg(feature = "mod-suite")]
+use mod_adapter_core::provenance_diff::{
+    DiffDomain, ProvenanceAction, ProvenanceDiffLedger, ReloadDiffSummary,
+};
+#[cfg(feature = "mod-suite")]
+use mod_adapter_core::recipe_conflict_unify::{
+    InputSignature, MaterialUnifier, RecipeCandidate, RecipeConflictIndex,
+};
+#[cfg(feature = "mod-suite")]
 use mod_adapter_core::season_primitives::{
-    encode_ssn1, seasonal_foliage_tint, seasonal_grass_tint, BiomeClimateClass,
-    BiomeClimateRules, SeasonCalendarConfig, SeasonState, SeasonSyncState, SeasonalTintRules,
-    SSN1_FRAME_LEN,
+    encode_ssn1, seasonal_foliage_tint, seasonal_grass_tint, BiomeClimateClass, BiomeClimateRules,
+    SeasonCalendarConfig, SeasonState, SeasonSyncState, SeasonalTintRules, SSN1_FRAME_LEN,
 };
 #[cfg(feature = "mod-suite")]
 use mod_adapter_core::unified_bundle::{DeclarativeModBundle, UnifiedModRuntime};
@@ -317,6 +315,17 @@ use mod_adapter_core::version_compat::McVersion;
 use mod_adapter_core::world_extensions::{
     AppleSkinDeltaTracker, ProgressionBarrierEngine, ProgressionRule, ProgressionVerdict,
     CHANNEL_APPLESKIN_EXHAUSTION, CHANNEL_APPLESKIN_SATURATION,
+};
+#[cfg(feature = "mod-suite")]
+use mod_offload::auto_optimizer::{
+    fingerprint_item_slots, pack_machine_key, AdaptivePollBackoff, AutoBulkSectionBatcher,
+    AutoDeltaCoalescer, AutoRecipeMemoizer, BulkSectionBatch, DistanceTier, EmitDecision,
+};
+#[cfg(feature = "mod-suite")]
+use mod_offload::lazy_catchup::{
+    catch_up_furnace, catch_up_growth_stage, catch_up_machine_batch, CatchUpLimits,
+    FurnaceCatchUpReport, FurnaceCatchUpState, HeadlessFactoryNode, HeadlessFactoryRegistry,
+    MachineCatchUpReport, MachineCatchUpState, MILLI_PER_ITEM,
 };
 
 // The bridge speaks protocol 767 (Minecraft 1.21.1) exclusively — the release
@@ -368,7 +377,9 @@ mod live_server_perf_bridge_tests {
             .map(|tick| live_should_tick_crowd_mob_ai(entity_id, cx, cz, tick, 40, false))
             .collect();
         assert_eq!(ticks.iter().filter(|&&t| t).count(), 5);
-        assert!(live_should_tick_crowd_mob_ai(entity_id, cx, cz, 0, 40, true));
+        assert!(live_should_tick_crowd_mob_ai(
+            entity_id, cx, cz, 0, 40, true
+        ));
         assert_eq!(
             live_server_perf_bridge()
                 .lock()
@@ -392,8 +403,7 @@ mod live_server_perf_bridge_tests {
         let next_epoch = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 2, 0, || vec![4, 5]);
         assert_eq!(&*next_epoch, &[4, 5]);
         assert_eq!(live_chunk_packet_cache_invalidate(dim, cx, cz), 2);
-        let reencoded =
-            live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || vec![6, 7]);
+        let reencoded = live_chunk_packet_cache_get_or_encode(dim, cx, cz, 1, 0, || vec![6, 7]);
         assert_eq!(&*reencoded, &[6, 7]);
         assert!(!Arc::ptr_eq(&first, &reencoded));
     }
@@ -513,6 +523,24 @@ struct LiveModSuite {
     /// index. Disabled by default for strict Vanilla parity; consulted by
     /// the live recipe lookup surface.
     material_unifier: MaterialUnifier,
+    /// Solver-admitted `mods/` file names. Only these JARs may publish any
+    /// registry, tag, recipe, loot or hook content.
+    admitted_jars: BTreeSet<String>,
+    /// Solver-admitted primary mod ids, in the same admission decision.
+    admitted_mod_ids: BTreeSet<String>,
+    /// Structured dependency-resolution diagnostics surfaced to operators.
+    dependency_resolution: MissingDependencyPlan,
+    /// Winning mod loot-table JSON by canonical table id (world datapacks
+    /// remain a higher overlay layer at publish time).
+    loot_tables_raw: BTreeMap<String, String>,
+    loot_overlay: ModLootOverlayIndex,
+    glm_engine: GlobalLootModifierEngine,
+    loot_provenance: ProvenanceDiffLedger,
+    previous_loot_provenance: ProvenanceDiffLedger,
+    loot_reload_diff: ReloadDiffSummary,
+    loot_diagnostics: Vec<String>,
+    bytecode_loot_hooks: Vec<BytecodeLootHookReport>,
+    addon_unsupported_serializers: BTreeSet<String>,
 }
 
 /// The inputs one `MRS1` frame is a pure function of: the suite's registry
@@ -534,6 +562,518 @@ struct Mrs1FrameKey {
 struct Mrs1FrameCache {
     key: Mrs1FrameKey,
     frame: Option<Arc<[u8]>>,
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_result_verified(result: &JarAdaptationResult) -> bool {
+    matches!(
+        result.tier,
+        AdaptationTier::NativeBundle | AdaptationTier::Tier2LiftedShim
+    )
+}
+
+#[cfg(feature = "mod-suite")]
+fn strict_dependency_admission(
+    plan: &DualLoaderPlan,
+) -> (BTreeSet<String>, BTreeSet<String>, Vec<String>) {
+    let mut blocked = BTreeSet::new();
+    for missing in &plan.missing_dependencies {
+        blocked.insert(missing.mod_id.clone());
+    }
+    for mismatch in &plan.version_mismatches {
+        blocked.insert(mismatch.mod_id.clone());
+    }
+    for conflict in &plan.dependency_conflicts {
+        if conflict.kind == ModDependencyKind::Incompatible {
+            blocked.insert(conflict.mod_id.clone());
+        }
+    }
+    for cycle in &plan.dependency_cycles {
+        blocked.extend(cycle.members.iter().cloned());
+    }
+    loop {
+        let before = blocked.len();
+        for planned in &plan.unified_mods {
+            if blocked.contains(&planned.mod_id) {
+                continue;
+            }
+            let depends_on_blocked = planned.dependencies.iter().any(|dep| {
+                dep.solver_required()
+                    && dep.side != ModEnvironment::Client
+                    && blocked.contains(&dep.mod_id)
+            });
+            if depends_on_blocked {
+                blocked.insert(planned.mod_id.clone());
+            }
+        }
+        if blocked.len() == before {
+            break;
+        }
+    }
+    let mut jars = BTreeSet::new();
+    let mut ids = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+    for planned in &plan.unified_mods {
+        if blocked.contains(&planned.mod_id) {
+            diagnostics.push(format!(
+                "{} ({}) blocked: required dependency closure is incomplete or unsafe",
+                planned.mod_id, planned.jar_name
+            ));
+        } else {
+            jars.insert(planned.jar_name.clone());
+            ids.insert(planned.mod_id.clone());
+        }
+    }
+    (jars, ids, diagnostics)
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_loot_table_id_from_path(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() < 4 || parts[0] != "data" {
+        return None;
+    }
+    if parts[2] != "loot_table" && parts[2] != "loot_tables" {
+        return None;
+    }
+    let stem = parts[3..].join("/");
+    let stem = stem.strip_suffix(".json")?;
+    Some(format!("{}:{stem}", parts[1]))
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_zip_members(
+    jar: &[u8],
+    include: &dyn Fn(&str) -> bool,
+    max_members: usize,
+    max_member_bytes: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<LootDataEntry>, &'static str> {
+    use std::io::Read;
+
+    let u16_at = |p: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(
+            jar.get(p..p.checked_add(2)?)?.try_into().ok()?,
+        ))
+    };
+    let u32_at = |p: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            jar.get(p..p.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    if jar.len() < 22 {
+        return Err("truncated zip footer");
+    }
+    let eocd = (jar.len().saturating_sub(65_557)..=jar.len() - 22)
+        .rev()
+        .find(|&p| {
+            u32_at(p) == Some(0x0605_4b50)
+                && u16_at(p + 20).is_some_and(|len| p + 22 + usize::from(len) == jar.len())
+        })
+        .ok_or("missing zip central directory")?;
+    if u16_at(eocd + 4) != Some(0) || u16_at(eocd + 6) != Some(0) {
+        return Err("multi-disk zip unsupported");
+    }
+    let count = usize::from(u16_at(eocd + 10).ok_or("zip entry count")?);
+    if count != usize::from(u16_at(eocd + 8).ok_or("zip disk entry count")?) || count > 65_000 {
+        return Err("zip entry count mismatch");
+    }
+    let directory = usize::try_from(u32_at(eocd + 16).ok_or("zip directory offset")?)
+        .map_err(|_| "zip offset overflow")?;
+    let directory_len = usize::try_from(u32_at(eocd + 12).ok_or("zip directory size")?)
+        .map_err(|_| "zip length overflow")?;
+    if directory
+        .checked_add(directory_len)
+        .is_none_or(|end| end > eocd)
+    {
+        return Err("zip directory truncated");
+    }
+    let mut cursor = directory;
+    let mut decoded_total = 0usize;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+        if u32_at(cursor) != Some(0x0201_4b50) {
+            return Err("invalid zip central member");
+        }
+        let flags = u16_at(cursor + 8).ok_or("zip flags")?;
+        let method = u16_at(cursor + 10).ok_or("zip method")?;
+        let compressed = usize::try_from(u32_at(cursor + 20).ok_or("zip compressed size")?)
+            .map_err(|_| "zip compressed length overflow")?;
+        let expanded = usize::try_from(u32_at(cursor + 24).ok_or("zip expanded size")?)
+            .map_err(|_| "zip expanded length overflow")?;
+        let name_len = usize::from(u16_at(cursor + 28).ok_or("zip name size")?);
+        let extra_len = usize::from(u16_at(cursor + 30).ok_or("zip extra size")?);
+        let comment_len = usize::from(u16_at(cursor + 32).ok_or("zip comment size")?);
+        let local = usize::try_from(u32_at(cursor + 42).ok_or("zip local offset")?)
+            .map_err(|_| "zip local offset overflow")?;
+        let name_start = cursor.checked_add(46).ok_or("zip header overflow")?;
+        let name_end = name_start
+            .checked_add(name_len)
+            .ok_or("zip name overflow")?;
+        let name_bytes = jar.get(name_start..name_end).ok_or("zip name truncated")?;
+        cursor = name_end
+            .checked_add(extra_len)
+            .and_then(|p| p.checked_add(comment_len))
+            .ok_or("zip member overflow")?;
+        if cursor > directory + directory_len {
+            return Err("zip central member truncated");
+        }
+        let Ok(name) = std::str::from_utf8(name_bytes) else {
+            continue;
+        };
+        if !include(name) {
+            continue;
+        }
+        if entries.len() >= max_members || expanded > max_member_bytes {
+            return Err("loot member count or size bound exceeded");
+        }
+        if flags & 1 != 0 || (method != 0 && method != 8) {
+            return Err("encrypted or unsupported compressed loot member");
+        }
+        if name.starts_with('/') || name.split('/').any(|segment| segment == "..") {
+            return Err("unsafe loot member name");
+        }
+        if u32_at(local) != Some(0x0403_4b50) {
+            return Err("invalid local loot header");
+        }
+        let payload_start = local
+            .checked_add(30)
+            .and_then(|p| p.checked_add(usize::from(u16_at(local + 26)?)))
+            .and_then(|p| p.checked_add(usize::from(u16_at(local + 28)?)))
+            .ok_or("loot payload offset overflow")?;
+        let payload_end = payload_start
+            .checked_add(compressed)
+            .ok_or("loot payload overflow")?;
+        let payload = jar
+            .get(payload_start..payload_end)
+            .ok_or("loot payload truncated")?;
+        let decoded = if method == 0 {
+            payload.to_vec()
+        } else {
+            let mut decoder = flate2::read::DeflateDecoder::new(payload);
+            let mut out = Vec::new();
+            decoder
+                .by_ref()
+                .take((max_member_bytes + 1) as u64)
+                .read_to_end(&mut out)
+                .map_err(|_| "invalid loot deflate stream")?;
+            out
+        };
+        decoded_total = decoded_total
+            .checked_add(decoded.len())
+            .ok_or("loot total size overflow")?;
+        if decoded.len() != expanded || decoded_total > max_total_bytes {
+            return Err("loot expanded size mismatch or total bound exceeded");
+        }
+        entries.push(LootDataEntry::new(name.to_string(), decoded));
+    }
+    if cursor != directory + directory_len {
+        return Err("zip directory size mismatch");
+    }
+    Ok(entries)
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_registry_item_id(name: &str) -> Option<i64> {
+    let canonical = if name.contains(':') {
+        name.to_string()
+    } else {
+        format!("minecraft:{name}")
+    };
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    let plan = suite.registry_plan.as_ref()?;
+    plan.items
+        .iter()
+        .find(|(_, item)| **item == canonical)
+        .map(|(id, _)| i64::from(*id))
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_mod_registry_item_name(item: i64) -> Option<String> {
+    let id = u32::try_from(item).ok()?;
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    suite
+        .registry_plan
+        .as_ref()?
+        .resolve_item(id)
+        .map(str::to_string)
+}
+
+#[cfg(feature = "mod-suite")]
+fn inject_live_mod_loot_underlay(content: &mut DatapackContent, tables: &BTreeMap<String, String>) {
+    for (key, body) in tables {
+        if content.loot_raw.contains_key(key) {
+            continue;
+        }
+        let rel = key.split_once(':').map(|(_, rel)| rel).unwrap_or(key);
+        content.read_loot(key.clone(), rel, body);
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn apply_live_mod_loot_underlay_to_content(content: &mut DatapackContent) {
+    let tables = live_mod_suite()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .loot_tables_raw
+        .clone();
+    inject_live_mod_loot_underlay(content, &tables);
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn apply_live_mod_loot_underlay_to_content(_content: &mut DatapackContent) {}
+
+#[cfg(feature = "mod-suite")]
+fn publish_live_mod_loot_underlay(tables: &BTreeMap<String, String>) {
+    if tables.is_empty() {
+        return;
+    }
+    let mut content = DatapackContent::default();
+    inject_live_mod_loot_underlay(&mut content, tables);
+    let mut loot = loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+    let mut raw = raw_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+    let mut mob = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
+    for (key, body) in content.loot_raw {
+        raw.entry(key).or_insert(body);
+    }
+    for (key, pools) in content.loot {
+        loot.entry(key).or_insert(pools);
+    }
+    for (etype, pools) in content.mob_loot {
+        mob.entry(etype).or_insert(pools);
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_drop_item_name(item: i64) -> Option<String> {
+    item_to_name(item)
+        .map(str::to_string)
+        .or_else(|| live_mod_registry_item_name(item))
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_stacks_to_loot_drops(drops: &[Stack]) -> Vec<(LootDropItem, Comps)> {
+    drops
+        .iter()
+        .filter_map(|(item, count, comps)| {
+            live_drop_item_name(*item)
+                .map(|name| (LootDropItem::new(name, u32::from(*count)), comps.clone()))
+        })
+        .collect()
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_loot_drops_to_stacks(
+    drops: Vec<LootDropItem>,
+    original: &[(LootDropItem, Comps)],
+) -> Vec<Stack> {
+    drops
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, drop)| {
+            let item =
+                name_to_item(&drop.item).or_else(|| live_mod_registry_item_id(&drop.item))?;
+            let count = drop.count.clamp(1, u32::from(u8::MAX)) as u8;
+            let comps = original
+                .get(index)
+                .filter(|(old, _)| old.item == drop.item)
+                .map(|(_, comps)| comps.clone())
+                .unwrap_or_default();
+            Some((item, count, comps))
+        })
+        .collect()
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_loot_seed_with_context(
+    mut seed: u64,
+    dim: DimId,
+    pos: Option<(i32, i32, i32)>,
+    table: &str,
+) -> u64 {
+    for byte in table.as_bytes() {
+        seed = (seed ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3);
+    }
+    seed ^= u64::from(dim.raw()) << 48;
+    if let Some((x, y, z)) = pos {
+        seed ^= (x as i64 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (y as i64 as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9)
+            ^ (z as i64 as u64).wrapping_mul(0x94d0_49bb_1331_11eb);
+    }
+    seed
+}
+
+#[cfg(feature = "mod-suite")]
+fn apply_live_mod_loot_modifiers(
+    loot_table_id: &str,
+    dim: DimId,
+    pos: Option<(i32, i32, i32)>,
+    killer_is_player: bool,
+    held_tool_name: Option<&str>,
+    drops: Vec<Stack>,
+    seed: u64,
+) -> Vec<Stack> {
+    let (mut engine, tables, item_tags) = {
+        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        if !suite.active || suite.glm_engine.active_order().is_empty() {
+            return drops;
+        }
+        (
+            suite.glm_engine.clone(),
+            suite.loot_tables_raw.clone(),
+            suite.unified_tags.export_flat(TagDomain::Item),
+        )
+    };
+    let seed = live_loot_seed_with_context(seed, dim, pos, loot_table_id);
+    let original = live_stacks_to_loot_drops(&drops);
+    let mut glm_drops: Vec<LootDropItem> = original.iter().map(|(drop, _)| drop.clone()).collect();
+    let context = LootModifierContext {
+        held_tool: held_tool_name.map(str::to_string),
+        item_tags,
+        killed_by_player: killer_is_player,
+        enchanted_bonus_level: 0,
+    };
+    let resolver = |table: &str| {
+        tables.get(table).map_or_else(Vec::new, |json| {
+            live_stacks_to_loot_drops(&roll_loot_table_stacks(json, seed as i64, None))
+                .into_iter()
+                .map(|(drop, _)| drop)
+                .collect()
+        })
+    };
+    let report =
+        engine.apply_loot_modifiers(loot_table_id, &context, &mut glm_drops, resolver, seed);
+    if !report.fired_modifiers.is_empty() || !report.diagnostics.is_empty() {
+        let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+        for modifier in &report.fired_modifiers {
+            suite.loot_provenance.record_action(
+                DiffDomain::LootTable,
+                loot_table_id.to_string(),
+                modifier.clone(),
+                ProvenanceAction::ModifiedByGlm,
+                format!("{modifier} modified {loot_table_id}"),
+                None,
+            );
+        }
+        suite.loot_diagnostics.extend(report.diagnostics.clone());
+    }
+    live_loot_drops_to_stacks(glm_drops, &original)
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn apply_live_mod_loot_modifiers(
+    _loot_table_id: &str,
+    _dim: DimId,
+    _pos: Option<(i32, i32, i32)>,
+    _killer_is_player: bool,
+    _held_tool_name: Option<&str>,
+    drops: Vec<Stack>,
+    _seed: u64,
+) -> Vec<Stack> {
+    drops
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_missing_dependency_plan_json(report: &MissingDependencyPlan) -> String {
+    fn strings(values: &[String]) -> String {
+        format!(
+            "[{}]",
+            values
+                .iter()
+                .map(|v| live_json_escape(v))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+    let missing = report
+        .missing_required
+        .iter()
+        .map(|m| {
+            format!(
+                "{{\"mod_id\":{},\"required_mod_id\":{},\"version_range\":{}}}",
+                live_json_escape(&m.mod_id),
+                live_json_escape(&m.required_mod_id),
+                m.version_range
+                    .as_deref()
+                    .map(live_json_escape)
+                    .unwrap_or_else(|| "null".into())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"admitted\":{},\"missing_required\":[{}],\"client_only_skipped\":{},\"modrinth_candidates\":{}}}",
+        strings(&report.admitted),
+        missing,
+        strings(&report.client_only_skipped),
+        report.modrinth_candidates.len()
+    )
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_provenance_diff_json() -> String {
+    let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+    let diff = suite.loot_reload_diff;
+    let hooks = suite
+        .bytecode_loot_hooks
+        .iter()
+        .map(|report| {
+            format!(
+                "{{\"mod_id\":{},\"hooks_detected\":{},\"requires_jvm_offload_for_loot\":{}}}",
+                live_json_escape(&report.mod_id),
+                report.hooks_detected.len(),
+                report.requires_jvm_offload_for_loot
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let diagnostics = suite
+        .loot_diagnostics
+        .iter()
+        .map(|line| live_json_escape(line))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"schema\":\"megu-live-provenance-diff/1\",\"dependency_resolution\":{},\"reload_diff_summary\":{{\"added_recipes\":{},\"overridden_loot_tables\":{},\"active_glm_rules\":{},\"added_tags\":{},\"added_translations\":{},\"conflict_count\":{}}},\"active_glm_modifiers\":{},\"bytecode_loot_hooks\":[{}],\"loot_diagnostics\":[{}],\"provenance\":{}}}",
+        live_missing_dependency_plan_json(&suite.dependency_resolution),
+        diff.added_recipes,
+        diff.overridden_loot_tables,
+        diff.active_glm_rules,
+        diff.added_tags,
+        diff.added_translations,
+        diff.conflict_count,
+        suite.glm_engine.active_order().len(),
+        hooks,
+        diagnostics,
+        suite.loot_provenance.to_json()
+    )
+}
+
+#[cfg(not(feature = "mod-suite"))]
+#[inline(always)]
+fn live_provenance_diff_json() -> String {
+    "{\"schema\":\"megu-live-provenance-diff/1\",\"records\":[],\"conflicts\":[]}".to_string()
 }
 
 #[cfg(feature = "mod-suite")]
@@ -567,6 +1107,18 @@ impl LiveModSuite {
             material_unifier: MaterialUnifier::new(
                 mod_adapter_core::recipe_conflict_unify::MaterialUnifyConfig::default(),
             ),
+            admitted_jars: BTreeSet::new(),
+            admitted_mod_ids: BTreeSet::new(),
+            dependency_resolution: MissingDependencyPlan::default(),
+            loot_tables_raw: BTreeMap::new(),
+            loot_overlay: ModLootOverlayIndex::new(),
+            glm_engine: GlobalLootModifierEngine::new(),
+            loot_provenance: ProvenanceDiffLedger::new(),
+            previous_loot_provenance: ProvenanceDiffLedger::new(),
+            loot_reload_diff: ReloadDiffSummary::default(),
+            loot_diagnostics: Vec::new(),
+            bytecode_loot_hooks: Vec::new(),
+            addon_unsupported_serializers: BTreeSet::new(),
         }
     }
 
@@ -576,9 +1128,9 @@ impl LiveModSuite {
     /// their `#id` spelling, `AnyOf` reduces to its first alternative.
     fn signature_token(&self, matcher: &IngredientMatcher) -> String {
         match matcher {
-            IngredientMatcher::Item(id) => self
-                .material_unifier
-                .unify_item_id(id, &self.unified_tags),
+            IngredientMatcher::Item(id) => {
+                self.material_unifier.unify_item_id(id, &self.unified_tags)
+            }
             IngredientMatcher::Tag(tag) => format!("#{tag}"),
             IngredientMatcher::AnyOf(alts) => alts
                 .first()
@@ -599,8 +1151,7 @@ impl LiveModSuite {
                 .iter()
                 .map(|matcher| self.signature_token(matcher))
                 .collect();
-            let signature =
-                InputSignature::shapeless(tokens.iter().map(|token| token.as_str()));
+            let signature = InputSignature::shapeless(tokens.iter().map(|token| token.as_str()));
             self.recipe_conflicts.register(
                 signature,
                 RecipeCandidate {
@@ -630,11 +1181,7 @@ impl LiveModSuite {
                         .first()
                         .map(|out| out.item.clone())
                         .unwrap_or_default(),
-                    output_count: recipe
-                        .results
-                        .first()
-                        .map(|out| out.count)
-                        .unwrap_or(1),
+                    output_count: recipe.results.first().map(|out| out.count).unwrap_or(1),
                     mod_namespace: recipe
                         .id
                         .split(':')
@@ -681,16 +1228,244 @@ impl LiveModSuite {
         jars
     }
 
-    /// Scan one `mods/` directory. JAR classification is delegated 1:1 to
-    /// [`auto_adapt_mods_dir`] — the single source of truth shared with
-    /// `megu-mod-check --adapt-mods-dir`: filename- and
-    /// manifest-declared superseded-perf-mod skips, loader metadata,
-    /// data/culinary/dimension discovery, `.class` Mixin lifting, and
-    /// `megu-mod-bundle/1` synthesis all happen inside the adapter. The
-    /// bridge folds each [`JarAdaptationResult`] back into the live suite:
-    /// emitted bundles join the unified runtime, culinary stats aggregate
-    /// for the boot report, and fully lifted Tier 2 bindings arm
-    /// `live_mod_dispatch_hook`.
+    fn ingest_admitted_loot_layers(
+        &mut self,
+        bounded_jars: &[(String, Vec<u8>)],
+        adapted: &[(String, Result<JarAdaptationResult, String>)],
+    ) {
+        self.previous_loot_provenance = self.loot_provenance.clone();
+        self.loot_provenance = ProvenanceDiffLedger::new();
+        self.loot_tables_raw.clear();
+        self.loot_diagnostics.clear();
+        self.bytecode_loot_hooks.clear();
+        let mut mod_layers = Vec::new();
+        let mut raw_by_layer_path: BTreeMap<(String, String), String> = BTreeMap::new();
+        let mut loot_ids = BTreeSet::new();
+        for planned in &self.dual_loader.unified_mods {
+            if !self.admitted_jars.contains(&planned.jar_name) {
+                continue;
+            }
+            let Some((_, bytes)) = bounded_jars
+                .iter()
+                .find(|(name, _)| name == &planned.jar_name)
+            else {
+                continue;
+            };
+            let verified = adapted.iter().any(|(name, result)| {
+                name == &planned.jar_name
+                    && result.as_ref().ok().is_some_and(live_mod_result_verified)
+            });
+            if !verified {
+                continue;
+            }
+            let loot_entries = live_mod_zip_members(
+                bytes,
+                &|path| {
+                    path.starts_with("data/")
+                        && path.ends_with(".json")
+                        && (path.contains("/loot_table/")
+                            || path.contains("/loot_tables/")
+                            || path.contains("/loot_modifier/")
+                            || path.contains("/loot_modifiers/"))
+                },
+                4096,
+                2 * 1024 * 1024,
+                32 * 1024 * 1024,
+            );
+            match loot_entries {
+                Ok(entries) => {
+                    if !entries.is_empty() {
+                        for entry in &entries {
+                            if let Some(id) = live_loot_table_id_from_path(&entry.path) {
+                                loot_ids.insert(id);
+                            }
+                            if let Ok(text) = String::from_utf8(entry.bytes.clone()) {
+                                raw_by_layer_path
+                                    .insert((planned.mod_id.clone(), entry.path.clone()), text);
+                            }
+                        }
+                        mod_layers.push(LootDataLayer::new(
+                            planned.mod_id.clone(),
+                            LootLayerKind::Mod,
+                            entries,
+                        ));
+                    }
+                }
+                Err(error) => self.loot_diagnostics.push(format!(
+                    "{}: loot data scan rejected: {error}",
+                    planned.jar_name
+                )),
+            }
+            match live_mod_class_members(bytes) {
+                Ok(classes) => {
+                    let report = detect_bytecode_loot_hooks(&planned.mod_id, &classes);
+                    if report.requires_jvm_offload_for_loot {
+                        self.loot_diagnostics.push(format!(
+                            "{}: Java bytecode loot hooks detected ({}); JSON loot overlay is incomplete and JVM offload is required for exact behavior",
+                            planned.mod_id,
+                            report.hooks_detected.len()
+                        ));
+                        self.loot_provenance.record_action(
+                            DiffDomain::LootModifier,
+                            format!("{}:bytecode_loot_hooks", planned.mod_id),
+                            planned.mod_id.clone(),
+                            ProvenanceAction::ModifiedByGlm,
+                            format!(
+                                "{} uses Java-only loot hooks; not reproduced by the declarative engine",
+                                planned.mod_id
+                            ),
+                            None,
+                        );
+                        self.bytecode_loot_hooks.push(report);
+                    }
+                }
+                Err(error) => self.loot_diagnostics.push(format!(
+                    "{}: bytecode loot hook scan rejected: {error}",
+                    planned.jar_name
+                )),
+            }
+        }
+
+        let mut vanilla_entries = Vec::new();
+        for id in &loot_ids {
+            if let Some(json) = crate::chest_loot::vanilla_loot_table_json(id) {
+                let path = format!(
+                    "data/{}/loot_table/{}.json",
+                    id.split_once(':').map(|(ns, _)| ns).unwrap_or("minecraft"),
+                    id.split_once(':').map(|(_, path)| path).unwrap_or(id)
+                );
+                vanilla_entries.push(LootDataEntry::new(path, json.as_bytes().to_vec()));
+            }
+        }
+        let mut overlay_layers = Vec::new();
+        if !vanilla_entries.is_empty() {
+            overlay_layers.push(LootDataLayer::new(
+                "vanilla",
+                LootLayerKind::Vanilla,
+                vanilla_entries,
+            ));
+        }
+        overlay_layers.extend(mod_layers.iter().cloned());
+
+        match ModLootOverlayIndex::ingest_layers(&overlay_layers) {
+            Ok(index) => {
+                for record in index.provenance().records() {
+                    self.loot_provenance.record(record.clone());
+                }
+                self.loot_diagnostics
+                    .extend(index.diagnostics().iter().cloned());
+                for (id, table) in index.tables() {
+                    let key = (table.source_layer.clone(), table.path.clone());
+                    if let Some(raw) = raw_by_layer_path.get(&key) {
+                        self.loot_tables_raw.insert(id.clone(), raw.clone());
+                    }
+                }
+                self.loot_overlay = index;
+            }
+            Err(error) => {
+                self.loot_overlay = ModLootOverlayIndex::new();
+                self.loot_diagnostics
+                    .push(format!("loot table overlay rejected: {error}"));
+            }
+        }
+        match GlobalLootModifierEngine::ingest_layers(&mod_layers) {
+            Ok(engine) => {
+                for record in engine.provenance().records() {
+                    self.loot_provenance.record(record.clone());
+                }
+                self.loot_diagnostics
+                    .extend(engine.diagnostics().iter().cloned());
+                self.glm_engine = engine;
+            }
+            Err(error) => {
+                self.glm_engine = GlobalLootModifierEngine::new();
+                self.loot_diagnostics
+                    .push(format!("global loot modifier ingest rejected: {error}"));
+            }
+        }
+        for diagnostic in &self.loot_diagnostics {
+            eprintln!("[live-mods] loot: {diagnostic}");
+        }
+        self.loot_reload_diff = self
+            .loot_provenance
+            .diff_summary_against(&self.previous_loot_provenance);
+    }
+
+    fn register_admitted_create_addons(
+        &mut self,
+        bounded_jars: &[(String, Vec<u8>)],
+        adapted: &[(String, Result<JarAdaptationResult, String>)],
+    ) {
+        self.addon_unsupported_serializers.clear();
+        #[cfg(feature = "create-offload")]
+        for planned in &self.dual_loader.unified_mods {
+            if planned.mod_id == "create" || !self.admitted_jars.contains(&planned.jar_name) {
+                continue;
+            }
+            let depends_create = planned
+                .dependencies
+                .iter()
+                .any(|dep| dep.mod_id == "create");
+            let has_create_recipes = adapted.iter().any(|(name, result)| {
+                name == &planned.jar_name
+                    && result.as_ref().ok().is_some_and(|result| {
+                        live_mod_result_verified(result)
+                            && result
+                                .data_bundle
+                                .recipes
+                                .iter()
+                                .any(|recipe| recipe.recipe_type.starts_with("create:"))
+                    })
+            });
+            if !depends_create && !has_create_recipes {
+                continue;
+            }
+            let Some((_, bytes)) = bounded_jars
+                .iter()
+                .find(|(name, _)| name == &planned.jar_name)
+            else {
+                continue;
+            };
+            let before = aeronautics_bridge()
+                .lock()
+                .map(|bridge| bridge.unsupported_addon_serializers.clone())
+                .unwrap_or_default();
+            match aeronautics_bridge_discover_addon_jar([(
+                planned.jar_name.as_str(),
+                bytes.as_slice(),
+            )]) {
+                Ok(hidden) => {
+                    if hidden != 0 {
+                        eprintln!(
+                            "[live-mods] create addon {}: hid {} ore/chest state ids",
+                            planned.mod_id, hidden
+                        );
+                    }
+                }
+                Err(error) => eprintln!(
+                    "[live-mods] create addon {} rejected: {error}",
+                    planned.mod_id
+                ),
+            }
+            let after = aeronautics_bridge()
+                .lock()
+                .map(|bridge| bridge.unsupported_addon_serializers.clone())
+                .unwrap_or_default();
+            for serializer in after.difference(&before) {
+                eprintln!(
+                    "[live-mods] create addon {}: unsupported recipe serializer {}",
+                    planned.mod_id, serializer
+                );
+                self.addon_unsupported_serializers
+                    .insert(serializer.clone());
+            }
+        }
+    }
+
+    /// Scan one `mods/` directory. Dependency admission is solved before any
+    /// JAR publishes content: only solver-admitted, server-side, nonduplicate,
+    /// dependency-complete and verified Native/Tier-2 jars may enter registries,
+    /// tags, recipes, loot overlays, bundles or hooks.
     fn scan_mods_dir(&mut self, dir: &std::path::Path) {
         if !dir.is_dir() {
             eprintln!(
@@ -701,16 +1476,82 @@ impl LiveModSuite {
         }
         self.scan_bundles_dir(dir);
         let jars = Self::jar_listing(dir);
+
+        let mut bounded_jars = Vec::new();
+        let mut aggregate_bytes = 0u64;
+        for (file_name, path) in &jars {
+            let Ok(metadata) = std::fs::metadata(path) else {
+                eprintln!("[live-mods] {file_name}: cannot stat JAR — rejected");
+                continue;
+            };
+            aggregate_bytes = aggregate_bytes.saturating_add(metadata.len());
+            if metadata.len() > lmb_sync::MAX_MOD_JAR_BYTES {
+                eprintln!("[live-mods] {file_name}: exceeds per-JAR byte budget — rejected");
+                continue;
+            }
+            if aggregate_bytes > mod_adapter_core::auto_adapter::MAX_MODS_DIR_AGGREGATE_BYTES {
+                eprintln!(
+                    "[live-mods] {file_name}: aggregate mods/ input exceeds the {}-byte pack budget — rejected",
+                    mod_adapter_core::auto_adapter::MAX_MODS_DIR_AGGREGATE_BYTES
+                );
+                continue;
+            }
+            match std::fs::read(path) {
+                Ok(bytes) => bounded_jars.push((file_name.clone(), bytes)),
+                Err(error) => eprintln!("[live-mods] {file_name}: cannot read JAR: {error}"),
+            }
+        }
+
+        let plan = plan_dual_loader_mods_dir(
+            bounded_jars
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+        );
+        let (admitted_jars, admitted_mod_ids, admission_diagnostics) =
+            strict_dependency_admission(&plan);
+        self.admitted_jars = admitted_jars;
+        self.admitted_mod_ids = admitted_mod_ids;
+        self.dependency_resolution = plan.resolution.clone();
+        for line in &admission_diagnostics {
+            eprintln!("[live-mods] admission: {line}");
+        }
+        eprintln!(
+            "[live-mods] dependency admission: {} admitted, {} client-only, {} superseded, {} rejected, {} duplicate ids, {} missing deps",
+            self.admitted_jars.len(),
+            plan.skipped_client_only.len(),
+            plan.skipped_superseded.len(),
+            plan.rejected_jars.len(),
+            plan.duplicate_conflicts.len(),
+            plan.missing_dependencies.len(),
+        );
+        for rejected in &plan.rejected_jars {
+            eprintln!(
+                "[live-mods] rejected {}: {}",
+                rejected.jar_name, rejected.reason
+            );
+        }
+        for conflict in &plan.duplicate_conflicts {
+            eprintln!(
+                "[live-mods] duplicate id {}: {:?}",
+                conflict.mod_id, conflict.jar_names
+            );
+        }
+        for missing in &plan.missing_dependencies {
+            eprintln!(
+                "[live-mods] {} requires missing {} ({})",
+                missing.mod_id,
+                missing.required_mod_id,
+                missing.version_range.as_deref().unwrap_or("unspecified"),
+            );
+        }
+
         let options = AutoAdaptOptions {
             target: LIVE_MOD_MC_TARGET,
             flagship_mod_ids: live_mod_flagship_ids(),
             ..AutoAdaptOptions::default()
         };
-        // `auto_adapt_mods_dir` is fail-closed over the whole directory: one
-        // hostile or corrupt JAR aborts the pass. Boot must not lose every
-        // other mod to a single bad entry, so on `Err` the same engine runs
-        // per JAR (`auto_adapt_jar`) and failures land as Tier 3 rows —
-        // never silently dropped, never promoted.
+        // Adaptation is diagnostic until admission admits a JAR. The full-directory
+        // pass is fail-closed, so a corrupt member retries per JAR exactly as before.
         let adapted: Vec<(String, Result<JarAdaptationResult, String>)> =
             match auto_adapt_mods_dir(dir, &options) {
                 Ok(report) => {
@@ -735,8 +1576,7 @@ impl LiveModSuite {
                         .collect()
                 }
             };
-        // JARs the adapter culinary-scanned get their content merged into
-        // the live registry below — the report carries stats only.
+
         let culinary_live: BTreeSet<&str> = adapted
             .iter()
             .filter_map(|(name, result)| {
@@ -748,21 +1588,49 @@ impl LiveModSuite {
             })
             .collect();
         for (file_name, result) in &adapted {
+            let solver_admitted = self.admitted_jars.contains(file_name);
             match result {
-                Ok(result) => self.adopt_jar_result(file_name, result),
+                Ok(result) if solver_admitted && live_mod_result_verified(result) => {
+                    self.adopt_jar_result(file_name, result)
+                }
+                Ok(result) => {
+                    let mod_id = result
+                        .mod_id()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| live_mod_file_stem(file_name));
+                    let reason = if !solver_admitted {
+                        "dependency admission rejected this JAR before activation".to_string()
+                    } else {
+                        format!(
+                            "adaptation tier {} is not a verified native/Tier-2 activation",
+                            result.tier.as_str()
+                        )
+                    };
+                    eprintln!("[live-mods] {file_name}: {reason}");
+                    let (classes_scanned, mixin_sites, skipped_client_mixins) = result
+                        .mixin_scan
+                        .as_ref()
+                        .map(|scan| {
+                            (
+                                scan.classes_scanned,
+                                scan.sites.len(),
+                                scan.skipped_client_mixins,
+                            )
+                        })
+                        .unwrap_or_default();
+                    self.reports.push(LiveModJarReport {
+                        file_name: file_name.clone(),
+                        mod_id,
+                        tier: result.tier,
+                        diagnostic: reason,
+                        classes_scanned,
+                        mixin_sites,
+                        skipped_client_mixins,
+                    });
+                }
                 Err(error) => {
                     eprintln!("[live-mods] {file_name}: {error}");
                     let mod_id = live_mod_file_stem(file_name);
-                    self.auto_adapted.push(AutoAdaptedModSummary {
-                        file_name: file_name.clone(),
-                        mod_id: mod_id.clone(),
-                        tier: AdaptationTier::Tier3FallbackRequired,
-                        lifted_hooks: Vec::new(),
-                        cooking_recipes: 0,
-                        cutting_recipes: 0,
-                        tag_files: 0,
-                        tag_values: 0,
-                    });
                     self.reports.push(LiveModJarReport {
                         file_name: file_name.clone(),
                         mod_id,
@@ -775,21 +1643,27 @@ impl LiveModSuite {
                 }
             }
         }
-        // MRS1 (`megu:mod_registry_sync_v1`): fold every successfully adapted
-        // JAR's declared blockstates/items into one deterministic registry
-        // plan so joining clients learn the dynamic ids up front. A plan
-        // rejection (conflicting or oversized content) drops only the generic
-        // entries — Create's own ids are merged per-join instead.
-        let registry_jars: Vec<JarAdaptationResult> = adapted
+
+        let admitted_results: Vec<JarAdaptationResult> = adapted
             .iter()
-            .filter_map(|(_, result)| result.as_ref().ok().cloned())
+            .filter_map(|(name, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .filter(|result| {
+                        self.admitted_jars.contains(name) && live_mod_result_verified(result)
+                    })
+                    .cloned()
+            })
             .collect();
-        if !registry_jars.is_empty() {
+        if !admitted_results.is_empty() {
             let report = ModsDirAdaptationReport {
                 dir: dir.display().to_string(),
-                jars: registry_jars,
+                jars: admitted_results,
                 non_jar_entries: 0,
                 audit_notes: Vec::new(),
+                dependency_resolution: Some(self.dependency_resolution.clone()),
+                dependency_recovery: Vec::new(),
             };
             match UnifiedModRegistryPlan::from_auto_adapt(
                 LIVE_MRS_GENERIC_BLOCK_BASE,
@@ -801,47 +1675,34 @@ impl LiveModSuite {
                     eprintln!("[live-mods] MRS1 registry plan rejected: {error:?}")
                 }
             }
+        } else {
+            self.registry_plan = None;
         }
-        let mut bounded_jars = Vec::new();
-        for (file_name, path) in &jars {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                if metadata.len() <= lmb_sync::MAX_MOD_JAR_BYTES {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        if culinary_live.contains(file_name.as_str()) {
-                            if let Err(error) = self.culinary.load_from_jar_bytes(&bytes) {
-                                eprintln!(
-                                    "[live-mods] {file_name}: culinary scan skipped: {error:?}"
-                                );
-                            }
-                        }
-                        // XMOD1: every bounded JAR feeds the shared tag index
-                        // (Tier 3 diagnostics keep their `data/` tag content
-                        // too), including bounded Jar-in-Jar recursion.
-                        if let Err(error) =
-                            self.unified_tags.ingest_jar_bytes(&bytes, file_name)
-                        {
-                            eprintln!(
-                                "[live-mods] {file_name}: unified tag scan skipped: {error}"
-                            );
-                        }
-                        bounded_jars.push((file_name.clone(), bytes));
-                    }
+
+        for (file_name, bytes) in &bounded_jars {
+            if !self.admitted_jars.contains(file_name) {
+                continue;
+            }
+            let verified = adapted.iter().any(|(name, result)| {
+                name == file_name && result.as_ref().ok().is_some_and(live_mod_result_verified)
+            });
+            if !verified {
+                continue;
+            }
+            if culinary_live.contains(file_name.as_str()) {
+                if let Err(error) = self.culinary.load_from_jar_bytes(bytes) {
+                    eprintln!("[live-mods] {file_name}: culinary scan skipped: {error:?}");
                 }
             }
-        }
-        let plan = plan_dual_loader_mods_dir(
-            bounded_jars
+            if let Err(error) = self.unified_tags.ingest_jar_bytes(bytes, file_name) {
+                eprintln!("[live-mods] {file_name}: unified tag scan skipped: {error}");
+            }
+            if plan
+                .unified_mods
                 .iter()
-                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
-        );
-        let accepted: BTreeSet<&str> = plan
-            .unified_mods
-            .iter()
-            .map(|entry| entry.jar_name.as_str())
-            .collect();
-        for (name, bytes) in &bounded_jars {
-            if accepted.contains(name.as_str()) {
-                self.load_damage_hooks(name, bytes);
+                .any(|entry| entry.jar_name == *file_name)
+            {
+                self.load_damage_hooks(file_name, bytes);
             }
         }
         eprintln!(
@@ -854,40 +1715,20 @@ impl LiveModSuite {
             plan.missing_dependencies.len(),
             self.damage_hooks.len(),
         );
-        for rejected in &plan.rejected_jars {
-            eprintln!(
-                "[live-mods] rejected {}: {}",
-                rejected.jar_name, rejected.reason
-            );
-        }
-        for conflict in &plan.duplicate_conflicts {
-            eprintln!(
-                "[live-mods] duplicate id {}: {:?}",
-                conflict.mod_id, conflict.jar_names
-            );
-        }
-        for missing in &plan.missing_dependencies {
-            eprintln!(
-                "[live-mods] {} requires missing {} ({})",
-                missing.mod_id,
-                missing.required_mod_id,
-                missing.version_range.as_deref().unwrap_or("unspecified"),
-            );
-        }
         self.dual_loader = plan;
-        // XMOD1: fold the merged cross-mod index back into the culinary
-        // registry's flat `TagIndex` — nested `#` chains arrive
-        // pre-expanded and `c:` ids are also exported under their
-        // `forge:`/`neoforge:` spellings, so `tag_contains`-driven
-        // recipe/heat matching hits on either convention.
+        self.ingest_admitted_loot_layers(&bounded_jars, &adapted);
+        self.register_admitted_create_addons(&bounded_jars, &adapted);
+        publish_live_mod_loot_underlay(&self.loot_tables_raw);
+
         for domain in [TagDomain::Item, TagDomain::Block] {
             for (tag_id, members) in self.unified_tags.export_flat(domain) {
-                self.culinary.tags.entry(tag_id).or_default().extend(members);
+                self.culinary
+                    .tags
+                    .entry(tag_id)
+                    .or_default()
+                    .extend(members);
             }
         }
-        // The scan may have changed every MRS1 input — `registry_plan`,
-        // dual-loader content, adapted JAR tables — so the join-frame cache
-        // must rebuild before the next client sees it.
         self.registry_revision = self.registry_revision.wrapping_add(1);
         self.mrs1_cache = None;
         self.rebuild_recipe_conflicts();
@@ -1106,12 +1947,7 @@ impl LiveModSuite {
 
     /// Replace the state of a pot after an inventory/heat/world interaction.
     /// Inserting a sleeping pot adds no deadline to the tick scheduler.
-    fn set_cooking_pot(
-        &mut self,
-        key: (DimId, i32, i32, i32),
-        pot: CookingPotState,
-        tick: u64,
-    ) {
+    fn set_cooking_pot(&mut self, key: (DimId, i32, i32, i32), pot: CookingPotState, tick: u64) {
         if let Some(previous) = self.cooking_pots.get(&key) {
             if let Some(deadline) = previous
                 .lock()
@@ -1614,10 +2450,7 @@ fn live_mod_eval_damage_event(initial_damage: f32) -> (f32, bool) {
     let mut damage = initial_damage;
     let mut cancelled = false;
     for method in &suite.damage_hooks {
-        let mut host = LiveModDamageHost {
-            damage,
-            cancelled,
-        };
+        let mut host = LiveModDamageHost { damage, cancelled };
         match execute_verified_method(method, &[VmValue::Ref(1)], &mut host, DEFAULT_FUEL) {
             Ok(_) => {
                 damage = host.damage;
@@ -1932,10 +2765,7 @@ impl ItemTransferHandler for LiveCookingPotEndpoint {
     }
 
     fn slots(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .slots()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots()
     }
 }
 
@@ -1965,8 +2795,7 @@ fn live_cap_insert_item(
     simulate: bool,
 ) -> u32 {
     let coord = live_cap_coord(dim, x, y, z);
-    let mut stack =
-        CapabilityItemStack::with_components(item_id, count, raw_components.to_vec());
+    let mut stack = CapabilityItemStack::with_components(item_id, count, raw_components.to_vec());
     let pos = FactoryPos::new(dim.raw() as i32, x, y, z);
     if stack.raw_components.is_empty() {
         let is_duct = {
@@ -1984,11 +2813,10 @@ fn live_cap_insert_item(
                     let room = live_create_with(|rt| {
                         let kind = rt.duct_kind_at(pos)?;
                         Some(match kind {
-                            LiveDuctKind::Depot | LiveDuctKind::Basin => {
-                                kind.held_capacity().saturating_sub(
-                                    rt.held.get(&pos).map_or(0, |h| h.items.len()),
-                                ) as u32
-                            }
+                            LiveDuctKind::Depot | LiveDuctKind::Basin => kind
+                                .held_capacity()
+                                .saturating_sub(rt.held.get(&pos).map_or(0, |h| h.items.len()))
+                                as u32,
                             _ => {
                                 let used = rt
                                     .duct_machines
@@ -2016,9 +2844,10 @@ fn live_cap_insert_item(
     }
     let refused = {
         let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
-        bus.item_endpoint_mut(&coord).map_or(stack.count, |endpoint| {
-            endpoint.insert_item(face, &stack, simulate).count
-        })
+        bus.item_endpoint_mut(&coord)
+            .map_or(stack.count, |endpoint| {
+                endpoint.insert_item(face, &stack, simulate).count
+            })
     };
     let accepted = count.saturating_sub(refused);
     if accepted > 0 && !simulate {
@@ -2204,14 +3033,7 @@ fn live_cap_drain_fluid(
 /// accepted FE.
 #[cfg(feature = "mod-suite")]
 #[allow(dead_code)]
-fn live_cap_receive_energy(
-    dim: DimId,
-    x: i32,
-    y: i32,
-    z: i32,
-    max_fe: u64,
-    simulate: bool,
-) -> u64 {
+fn live_cap_receive_energy(dim: DimId, x: i32, y: i32, z: i32, max_fe: u64, simulate: bool) -> u64 {
     live_cap_bus()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2288,7 +3110,9 @@ fn live_cap_profile_endpoints(
 ) -> Option<mod_adapter_core::profile::ProfileCapabilityEndpoints> {
     #[cfg(feature = "create-offload")]
     {
-        let bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+        let bridge = mod_offload_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for profile in &bridge.profiles {
             let endpoints = profile.capability_endpoints_for(block_id);
             if !endpoints.is_empty() {
@@ -2942,18 +3766,13 @@ const LIVE_ENDER_DRAGON_ID: &str = "minecraft:ender_dragon";
 /// wing plates out to the sides and three tail segments trailing back.
 #[cfg(feature = "mod-suite")]
 fn live_ender_dragon_hitbox() -> MultiPartHitbox {
-    let part = |kind: PartKind,
-                lx: f64,
-                uy: f64,
-                fz: f64,
-                hx: f64,
-                hy: f64,
-                hz: f64| PartOffsetSpec {
-        kind,
-        local_offset: [lx, uy, fz],
-        half_extents: [hx, hy, hz],
-        damage_multiplier: None,
-    };
+    let part =
+        |kind: PartKind, lx: f64, uy: f64, fz: f64, hx: f64, hy: f64, hz: f64| PartOffsetSpec {
+            kind,
+            local_offset: [lx, uy, fz],
+            half_extents: [hx, hy, hz],
+            damage_multiplier: None,
+        };
     MultiPartHitbox {
         parts: vec![
             part(PartKind::Head, 0.0, 1.0, 6.0, 0.5, 0.5, 0.5),
@@ -3133,8 +3952,10 @@ fn live_mod_tick() {
     let players = clients().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let connected: HashSet<[u8; 16]> = players.iter().map(|client| client.uuid).collect();
     {
-        let connected_sessions: HashSet<(i32, [u8; 16])> =
-            players.iter().map(|client| (client.eid, client.uuid)).collect();
+        let connected_sessions: HashSet<(i32, [u8; 16])> = players
+            .iter()
+            .map(|client| (client.eid, client.uuid))
+            .collect();
         let mut suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
         suite
             .season_sync
@@ -3507,12 +4328,10 @@ fn live_mod_progression_rules_from_json(bytes: &[u8]) -> Result<Vec<ProgressionR
 //               | u8 overstressed (0|1) ]
 // ===========================================================================
 
-#[cfg(feature = "mod-suite")]
-use crate::block_registry::{
-    live_create_enabled, live_create_item_table, LIVE_CREATE_ITEM_BASE,
-};
 #[cfg(all(test, feature = "mod-suite"))]
 use crate::block_registry::LIVE_CREATE_TEST_GATE;
+#[cfg(feature = "mod-suite")]
+use crate::block_registry::{live_create_enabled, live_create_item_table, LIVE_CREATE_ITEM_BASE};
 
 /// The 1.21.1 `water`/`flowing_water` state-id window the fluid scheduler
 /// already relies on (`register_overworld_scheduled` uses the same range).
@@ -3556,16 +4375,15 @@ fn live_create_item_block_name(item: i64) -> Option<&'static str> {
 /// cached `core_create_registry` — the table is deterministic, so both
 /// agree on every state id.
 #[cfg(feature = "mod-suite")]
-fn live_create_block_registry(
-) -> Option<&'static create_adapter::blockstates::CreateBlockRegistry> {
+fn live_create_block_registry() -> Option<&'static create_adapter::blockstates::CreateBlockRegistry>
+{
     if !live_create_enabled() {
         return None;
     }
     if let Some(reg) = breg().and_then(|reg| reg.create_registry()) {
         return Some(reg);
     }
-    static FALLBACK: OnceLock<create_adapter::blockstates::CreateBlockRegistry> =
-        OnceLock::new();
+    static FALLBACK: OnceLock<create_adapter::blockstates::CreateBlockRegistry> = OnceLock::new();
     Some(FALLBACK.get_or_init(|| {
         create_adapter::blockstates::core_create_registry(
             create_adapter::blockstates::DEFAULT_BASE_STATE_ID,
@@ -3616,10 +4434,7 @@ fn live_mod_name_for_state(st: u32) -> Option<String> {
 #[cfg(feature = "mod-suite")]
 fn live_mod_state_canonical(st: u32) -> Option<String> {
     let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-    let entry = suite
-        .registry_plan
-        .as_ref()?
-        .resolve_block_state(st)?;
+    let entry = suite.registry_plan.as_ref()?.resolve_block_state(st)?;
     Some(mod_adapter_core::blockstates::format_canonical(
         &entry.block_id,
         &entry.properties,
@@ -3669,7 +4484,10 @@ fn live_create_is_water(st: u32) -> bool {
         return true;
     }
     breg().is_some_and(|reg| {
-        matches!(reg.name_of(st), "minecraft:water" | "minecraft:flowing_water")
+        matches!(
+            reg.name_of(st),
+            "minecraft:water" | "minecraft:flowing_water"
+        )
     })
 }
 
@@ -3751,9 +4569,9 @@ fn live_create_recipes(table: &[(&[&str], &str)], id_base: u32) -> Vec<LiveCreat
                 .map(|&name| {
                     let ingredient = match name.strip_prefix('#') {
                         Some(tag) => LiveCreateIngredient::Tag(tag.to_string()),
-                        None => LiveCreateIngredient::Item(
-                            u32::try_from(name_to_item(name)?).ok()?,
-                        ),
+                        None => {
+                            LiveCreateIngredient::Item(u32::try_from(name_to_item(name)?).ok()?)
+                        }
                     };
                     Some((ingredient, 1u32))
                 })
@@ -3921,7 +4739,9 @@ fn live_create_with<R>(f: impl FnOnce(&mut LiveCreateRuntime) -> R) -> Option<R>
     if !live_create_enabled() {
         return None;
     }
-    let mut guard = live_create_state().lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = live_create_state()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = live_create_runtime_init();
     }
@@ -4075,7 +4895,9 @@ impl LiveCreateRuntime {
         // owned; each `sync_cell` below re-registers the restored cells.
         let stale: Vec<FactoryPos> = {
             let mut state = live_cap_state().lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut state.create_cells).into_keys().collect()
+            std::mem::take(&mut state.create_cells)
+                .into_keys()
+                .collect()
         };
         if !stale.is_empty() {
             let mut bus = live_cap_bus().lock().unwrap_or_else(|e| e.into_inner());
@@ -4151,10 +4973,8 @@ impl LiveCreateRuntime {
             // `SUB_UNITS_PER_BLOCK` at `rpm_to_belt_step(rpm)` per tick, so
             // the delay is `256 / step == 64 / rpm` computed in integers —
             // the same conversion `CreateBeltLine` runs at runtime.
-            let step = create_adapter::factorio_sim::rpm_to_belt_step(
-                rpm.max(8.0).round() as i32,
-            )
-            .max(1) as u64;
+            let step = create_adapter::factorio_sim::rpm_to_belt_step(rpm.max(8.0).round() as i32)
+                .max(1) as u64;
             let units = u64::from(create_adapter::factorio_sim::SUB_UNITS_PER_BLOCK);
             ((units * 2 + step) / (step * 2)).clamp(1, 64)
         } else {
@@ -4175,20 +4995,14 @@ impl LiveCreateRuntime {
     /// the target is NOT required to be a duct cell: this is the
     /// capability-bus counterpart, so a chute can feed a cooking pot or a
     /// foreign mod's storage block.
-    fn cap_push_target(
-        &self,
-        pos: FactoryPos,
-        st: u32,
-    ) -> Option<(FactoryPos, (i32, i32, i32))> {
+    fn cap_push_target(&self, pos: FactoryPos, st: u32) -> Option<(FactoryPos, (i32, i32, i32))> {
         let def = self.factory.registry().block_def_for_state(st)?;
         let kind = live_duct_kind(def.id.as_str())?;
         let entry = self.factory.registry().state(st)?;
         if entry.property("powered") == Some("true") {
             return None;
         }
-        let facing = entry
-            .property("facing")
-            .and_then(live_facing_offset);
+        let facing = entry.property("facing").and_then(live_facing_offset);
         let extracting = entry.property("extracting") == Some("true");
         Some(match kind {
             // Belts run items toward their horizontal `facing` direction.
@@ -4304,8 +5118,7 @@ impl LiveCreateRuntime {
                 if self.duct_kind_at(dst).is_none() {
                     let to = live_cap_coord_of(dst);
                     if bus.item_endpoint(&to).is_some() {
-                        let to_face =
-                            live_cap_face_of((-push.0, -push.1, -push.2));
+                        let to_face = live_cap_face_of((-push.0, -push.1, -push.2));
                         let mut moved = 0u32;
                         // (a) Staged transport output first — items that
                         //     entered the duct through
@@ -4329,15 +5142,10 @@ impl LiveCreateRuntime {
                                 let stack = CapabilityItemStack::new(name, 1);
                                 let refused = bus
                                     .item_endpoint_mut(&to)
-                                    .map(|ep| {
-                                        ep.insert_item(Some(to_face), &stack, true)
-                                            .count
-                                    })
+                                    .map(|ep| ep.insert_item(Some(to_face), &stack, true).count)
                                     .unwrap_or(1);
                                 if refused > 0 {
-                                    let _ = self
-                                        .factory
-                                        .insert_belt_item(pos, machine, item);
+                                    let _ = self.factory.insert_belt_item(pos, machine, item);
                                     break;
                                 }
                                 if let Some(ep) = bus.item_endpoint_mut(&to) {
@@ -4508,7 +5316,11 @@ impl LiveCreateRuntime {
             LiveDuctKind::Funnel => {
                 let front = pos.offset(d.0, d.1, d.2);
                 let back = pos.offset(-d.0, -d.1, -d.2);
-                if extracting { (front, back) } else { (back, front) }
+                if extracting {
+                    (front, back)
+                } else {
+                    (back, front)
+                }
             }
             LiveDuctKind::BeltFunnel => {
                 let belt = pos.offset(0, -1, 0);
@@ -4516,7 +5328,11 @@ impl LiveCreateRuntime {
                     return;
                 }
                 let served = pos.offset(d.0, d.1, d.2);
-                if extracting { (belt, served) } else { (served, belt) }
+                if extracting {
+                    (belt, served)
+                } else {
+                    (served, belt)
+                }
             }
             _ => return,
         };
@@ -4537,10 +5353,9 @@ impl LiveCreateRuntime {
         }
         let src_kind = self.duct_kind_at(src);
         let item: Option<i64> = match src_kind {
-            Some(LiveDuctKind::Depot | LiveDuctKind::Basin) => self
-                .held
-                .get_mut(&src)
-                .and_then(|h| h.items.pop()),
+            Some(LiveDuctKind::Depot | LiveDuctKind::Basin) => {
+                self.held.get_mut(&src).and_then(|h| h.items.pop())
+            }
             Some(_) => self
                 .duct_machines
                 .get(&src)
@@ -4701,8 +5516,8 @@ impl LiveCreateRuntime {
             slot.progress = 0.0;
         }
         slot.progress += rpm;
-        let need = f64::from(recipe.base_ticks)
-            * f64::from(mod_offload::recipe_processor::REFERENCE_RPM);
+        let need =
+            f64::from(recipe.base_ticks) * f64::from(mod_offload::recipe_processor::REFERENCE_RPM);
         if slot.progress < need {
             return true;
         }
@@ -4764,8 +5579,7 @@ fn live_create_on_block_set(dim: DimId, x: i32, y: i32, z: i32, old: u32, st: u3
     let base = create_adapter::blockstates::DEFAULT_BASE_STATE_ID;
     let was_mod = old >= base;
     let is_mod = st >= base;
-    let water_edge =
-        !was_mod && !is_mod && live_create_is_water(old) != live_create_is_water(st);
+    let water_edge = !was_mod && !is_mod && live_create_is_water(old) != live_create_is_water(st);
     if !was_mod && !is_mod && !water_edge {
         return;
     }
@@ -4991,7 +5805,12 @@ fn live_create_interact_block(
         if rt.placed.get(&pos).copied() != Some(clicked) {
             return None;
         }
-        let id = rt.factory.registry().block_def_for_state(clicked)?.id.as_str();
+        let id = rt
+            .factory
+            .registry()
+            .block_def_for_state(clicked)?
+            .id
+            .as_str();
         let Some(kind) = live_duct_kind(id) else {
             return None;
         };
@@ -5128,6 +5947,63 @@ fn live_create_duct_insert(dim: DimId, x: i32, y: i32, z: i32, item: i64) -> boo
     .is_some()
 }
 
+#[cfg(feature = "mod-suite")]
+fn schematic_nbt_to_live_tag(value: &create_adapter::schematic::SchematicNbt) -> Option<Tag> {
+    use create_adapter::schematic::SchematicNbt as S;
+    match value {
+        S::Byte(v) => Some(Tag::Byte(*v)),
+        S::Short(v) => Some(Tag::Short(*v)),
+        S::Int(v) => Some(Tag::Int(*v)),
+        S::Long(v) => Some(Tag::Long(*v)),
+        S::Float(v) => Some(Tag::Float(v.to_bits())),
+        S::Double(v) => Some(Tag::Double(v.to_bits())),
+        S::ByteArray(v) => Some(Tag::ByteArray(v.clone())),
+        S::String(v) => Some(Tag::String(nbt::NbtString::text(v))),
+        S::List(values) => {
+            let converted: Vec<Tag> = values
+                .iter()
+                .map(schematic_nbt_to_live_tag)
+                .collect::<Option<_>>()?;
+            let element = converted.first().map(Tag::id).unwrap_or(0);
+            Some(Tag::List(element, converted))
+        }
+        S::Compound(values) => {
+            let mut out = std::collections::BTreeMap::new();
+            for (key, value) in values {
+                out.insert(nbt::NbtString::text(key), schematic_nbt_to_live_tag(value)?);
+            }
+            Some(Tag::Compound(out))
+        }
+        S::IntArray(v) => Some(Tag::IntArray(v.clone())),
+        S::LongArray(v) => Some(Tag::LongArray(v.clone())),
+    }
+}
+
+#[cfg(feature = "mod-suite")]
+fn restore_schematic_block_entity(
+    dim: DimId,
+    pos: [i32; 3],
+    state: u32,
+    value: Option<&create_adapter::schematic::SchematicNbt>,
+) {
+    let Some(value) = value else { return };
+    let Some(mut tag) = schematic_nbt_to_live_tag(value) else {
+        return;
+    };
+    let Some(reg) = breg() else { return };
+    let Some(id) = live_block_entity_id(reg.name_of(state)) else {
+        return;
+    };
+    if let Tag::Compound(mut fields) = tag {
+        for (key, value) in [("x", pos[0]), ("y", pos[1]), ("z", pos[2])] {
+            block_entity_put(&mut fields, key, Tag::Int(value));
+        }
+        block_entity_put(&mut fields, "id", block_entity_string(id));
+        tag = Tag::Compound(fields);
+        let _ = restore_live_block_entity((dim, pos[0], pos[1], pos[2]), &tag);
+    }
+}
+
 /// Place one `.nbt` structure — the format Structure Blocks write and
 /// Create ships for its Ponder/showcase factories — at `origin` inside any
 /// dimension. Each palette entry resolves once through `state_from_arg`
@@ -5144,46 +6020,32 @@ fn live_place_nbt_schematic_in_dim(
     origin: (i32, i32, i32),
     nbt_bytes: &[u8],
 ) -> Result<create_adapter::schematic::SchematicPlacementReport, String> {
-    let structure = create_adapter::schematic::parse_nbt_schematic(nbt_bytes)
-        .map_err(|err| err.to_string())?;
-    let resolved: Vec<Option<u32>> = structure
-        .palette
-        .iter()
-        .map(|entry| state_from_arg(&entry.canonical))
-        .collect();
-    let mut report = create_adapter::schematic::SchematicPlacementReport {
-        unresolved_palette_entries: resolved.iter().filter(|st| st.is_none()).count(),
-        ..Default::default()
-    };
-    let [sx, sy, sz] = structure.size;
+    let structure =
+        create_adapter::schematic::parse_nbt_schematic(nbt_bytes).map_err(|err| err.to_string())?;
+    let plan = create_adapter::schematic::SchematicPlacementPlan::preflight(
+        &structure,
+        [origin.0, origin.1, origin.2],
+        |canonical| state_from_arg(canonical),
+        |[x, y, z]| {
+            if !(-30_000_000..30_000_000).contains(&x)
+                || !(-30_000_000..30_000_000).contains(&z)
+                || !(dim.min_y()..dim.min_y() + dim.height()).contains(&y)
+            {
+                return false;
+            }
+            let existing = block_at_dim(dim, x, y, z);
+            breg().map_or(existing == 0, |reg| reg.is_air(existing))
+        },
+    )
+    .map_err(|err| err.to_string())?;
     let mut placed_positions: Vec<FactoryPos> = Vec::new();
-    for block in &structure.blocks {
-        // Structure-relative cells must stay inside the declared bounds —
-        // an out-of-range `pos` is a malformed file, not a valid placement.
-        let [px, py, pz] = block.pos;
-        if px < 0 || py < 0 || pz < 0 || px >= sx || py >= sy || pz >= sz {
-            report.skipped_blocks += 1;
-            continue;
+    let report = plan.apply(|pos, state, entity_nbt| {
+        if set_block_if_dim(dim, pos[0], pos[1], pos[2], state, None) {
+            restore_schematic_block_entity(dim, pos, state, entity_nbt);
+            placed_positions.push(FactoryPos::new(dim.raw() as i32, pos[0], pos[1], pos[2]));
         }
-        let (Some(wx), Some(wy), Some(wz)) = (
-            origin.0.checked_add(px),
-            origin.1.checked_add(py),
-            origin.2.checked_add(pz),
-        ) else {
-            report.skipped_blocks += 1;
-            continue;
-        };
-        let Some(st) = resolved[block.state] else {
-            report.skipped_blocks += 1;
-            continue;
-        };
-        if set_block_if_dim(dim, wx, wy, wz, st, None) {
-            report.placed_blocks += 1;
-            placed_positions.push(FactoryPos::new(dim.raw() as i32, wx, wy, wz));
-        } else {
-            report.skipped_blocks += 1;
-        }
-    }
+    });
+    let mut report = report;
     report.kinetic_nodes_armed = live_create_with(|rt| {
         placed_positions
             .iter()
@@ -5201,24 +6063,30 @@ fn live_place_nbt_schematic_in_dim(
 #[cfg(feature = "mod-suite")]
 const LIVE_CREATE_REGION_BUDGET_US: u32 = 2_000;
 
-/// The tick-half without the socket write — step the factory once, drain
-/// the coalesced `KineticUpdateTag` batch (only changed nodes; the
-/// fingerprint gate suppresses idle churn), and encode it for the wire.
-/// Factored out so tests observe the exact bytes clients receive.
+/// Legacy single-frame encoding retained for small tests/tools. Runtime
+/// broadcast uses the chunked dimension-scoped frames instead.
 #[cfg(feature = "mod-suite")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn live_create_tick_body() -> Option<Vec<u8>> {
+    live_create_tick_tags().map(|tags| {
+        live_mod_payload_body(
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
+            &create_adapter::neoforge_wire::encode_kinetic_update_batch(&tags),
+        )
+    })
+}
+
+#[cfg(feature = "mod-suite")]
+fn live_create_tick_tags() -> Option<Vec<create_adapter::factory::KineticUpdateTag>> {
     if !live_create_enabled() {
         return None;
     }
     let tick = TICK_IDX.load(Ordering::Relaxed);
     let budget_us = ((f64::from(LIVE_CREATE_REGION_BUDGET_US)
         * f64::from(live_server_budget_scale()))
-        .max(1.0)) as u64;
+    .max(1.0)) as u64;
     live_create_with(|rt| {
         rt.tick_processing();
-        // Item flow: links follow live topology before the transport
-        // advance, then staged outputs settle into depot/basin slots and
-        // funnels pull their next unit.
         rt.relink_ducts();
         let _ = rt.factory.step_tick(tick, 1_024, Some(budget_us));
         rt.drain_ducts();
@@ -5230,10 +6098,7 @@ fn live_create_tick_body() -> Option<Vec<u8>> {
         let tags: Vec<create_adapter::factory::KineticUpdateTag> =
             drained.into_iter().map(|(_, tag)| tag).collect();
         rt.kinetic_batches_emitted += 1;
-        Some(live_mod_payload_body(
-            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
-            &create_adapter::neoforge_wire::encode_kinetic_update_batch(&tags),
-        ))
+        Some(tags)
     })
     .flatten()
 }
@@ -5244,12 +6109,26 @@ fn live_create_tick_body() -> Option<Vec<u8>> {
 /// before any socket is touched.
 #[cfg(feature = "mod-suite")]
 fn live_create_tick() {
-    let Some(body) = live_create_tick_body() else {
+    let Some(tags) = live_create_tick_tags() else {
         return;
     };
+    let generation = TICK_IDX.load(Ordering::Relaxed);
+    let frames = create_adapter::neoforge_wire::encode_kinetic_batches(&tags, generation);
     for client in client_snapshot() {
+        let dim = (*client.dim.lock().unwrap_or_else(|e| e.into_inner())).raw() as i32;
         let mut socket = client.sock.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body.clone());
+        for frame in frames.iter().filter(|frame| {
+            frame
+                .get(5..9)
+                .map(|bytes| i32::from_be_bytes(bytes.try_into().unwrap_or_default()) == dim)
+                .unwrap_or(false)
+        }) {
+            let body = live_mod_payload_body(
+                create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
+                frame,
+            );
+            let _ = send_packet(&mut socket, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body);
+        }
     }
 }
 
@@ -5258,20 +6137,48 @@ fn live_create_tick() {
 /// without waiting for the next delta.
 #[cfg(feature = "mod-suite")]
 fn live_create_sync_on_join(s: &mut TcpStream) {
-    let Some(body) = live_create_with(|rt| {
+    // MRS1 is a strict prerequisite for interpreting dynamic Create state ids
+    // in the kinetic snapshot. `play_protocol` also emits the registry sync in
+    // its ordered join sequence; sending it here as well keeps this helper
+    // safe when tests or future call sites invoke it directly.
+    live_mod_registry_sync_on_join(s);
+    let Some(tags) = live_create_with(|rt| {
         let tags = rt.snapshot_tags();
-        if tags.is_empty() {
-            return None;
-        }
-        Some(live_mod_payload_body(
-            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
-            &create_adapter::neoforge_wire::encode_kinetic_update_batch(&tags),
-        ))
+        (!tags.is_empty()).then_some(tags)
     })
     .flatten() else {
         return;
     };
-    let _ = send_packet(s, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body);
+    let generation = TICK_IDX.load(Ordering::Relaxed);
+    let frames = create_adapter::neoforge_wire::encode_kinetic_batches(&tags, generation);
+    let peer = s.peer_addr().ok();
+    let client_dim = peer.and_then(|peer| {
+        client_snapshot().into_iter().find_map(|client| {
+            let addr = client
+                .sock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peer_addr()
+                .ok()?;
+            (addr == peer)
+                .then(|| (*client.dim.lock().unwrap_or_else(|e| e.into_inner())).raw() as i32)
+        })
+    });
+    for frame in frames {
+        if let Some(dim) = client_dim {
+            let frame_dim = frame
+                .get(5..9)
+                .map(|bytes| i32::from_be_bytes(bytes.try_into().unwrap_or_default()));
+            if frame_dim != Some(dim) {
+                continue;
+            }
+        }
+        let body = live_mod_payload_body(
+            create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC,
+            &frame,
+        );
+        let _ = send_packet(s, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, body);
+    }
 }
 
 // ---- create_factory.bin sidecar ------------------------------------------
@@ -5444,8 +6351,7 @@ fn live_create_decode_sidecar(
                 if !(0..=256).contains(&slen) || rest.len() < slen as usize {
                     return Err(ERR);
                 }
-                let name =
-                    std::str::from_utf8(&rest[..slen as usize]).map_err(|_| ERR)?;
+                let name = std::str::from_utf8(&rest[..slen as usize]).map_err(|_| ERR)?;
                 rest = &rest[slen as usize..];
                 items.push(name_to_item(name).ok_or(ERR)?);
             }
@@ -5586,7 +6492,10 @@ fn live_auto_machine_wake_positions(positions: &[FactoryPos]) {
     if positions.is_empty() {
         return;
     }
-    let keys: Vec<u64> = positions.iter().map(|p| live_auto_machine_key(*p)).collect();
+    let keys: Vec<u64> = positions
+        .iter()
+        .map(|p| live_auto_machine_key(*p))
+        .collect();
     live_auto_optimizer()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -5776,8 +6685,8 @@ fn live_colossal_registry() -> &'static Mutex<LiveColossalAndForgeRegistry> {
 #[cfg(feature = "mod-suite")]
 fn live_block_probe(dim: DimId, pos: [i32; 3]) -> Option<BlockProbe> {
     let st = block_at_dim(dim, pos[0], pos[1], pos[2]);
-    let id = live_mod_name_for_state(st)
-        .or_else(|| breg().map(|reg| reg.name_of(st).to_string()))?;
+    let id =
+        live_mod_name_for_state(st).or_else(|| breg().map(|reg| reg.name_of(st).to_string()))?;
     if id.is_empty() {
         return None;
     }
@@ -5865,13 +6774,9 @@ impl ItemTransferHandler for LiveForgeEndpoint {
     }
 
     fn slots(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .slots()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots()
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // live_opt_wire surface: auto-optimizer, lazy catch-up, colossal + forge
@@ -6217,12 +7122,7 @@ fn live_forge_entry(
 /// Re-run structure validation against the live world; `None` when
 /// no forge is registered there.
 #[cfg(feature = "mod-suite")]
-pub(crate) fn live_forge_revalidate(
-    dim: DimId,
-    x: i32,
-    y: i32,
-    z: i32,
-) -> Option<bool> {
+pub(crate) fn live_forge_revalidate(dim: DimId, x: i32, y: i32, z: i32) -> Option<bool> {
     let (spec, runtime) = live_forge_entry(dim, x, y, z)?;
     let valid = runtime
         .lock()
@@ -6235,12 +7135,7 @@ pub(crate) fn live_forge_revalidate(
 /// and starts the next recipe when inputs and heat allow. `None`
 /// when no forge is registered there.
 #[cfg(feature = "mod-suite")]
-pub(crate) fn live_forge_tick(
-    dim: DimId,
-    x: i32,
-    y: i32,
-    z: i32,
-) -> Option<ForgeTickEvents> {
+pub(crate) fn live_forge_tick(dim: DimId, x: i32, y: i32, z: i32) -> Option<ForgeTickEvents> {
     let (spec, runtime) = live_forge_entry(dim, x, y, z)?;
     let events = runtime
         .lock()
@@ -6604,9 +7499,8 @@ fn live_catchup_on_region_change(
                 if x.div_euclid(16) != cx || z.div_euclid(16) != cz {
                     continue;
                 }
-                let seed = ((x as i64).wrapping_mul(31)
-                    ^ (z as i64).wrapping_mul(37)
-                    ^ (y as i64)) as u64;
+                let seed =
+                    ((x as i64).wrapping_mul(31) ^ (z as i64).wrapping_mul(37) ^ (y as i64)) as u64;
                 let grown = live_mod_lazy_catchup_growth(
                     *age,
                     7,
@@ -6645,8 +7539,7 @@ fn live_catchup_on_region_change(
                 if live_mod_headless_factory_remove(id) {
                     if let Some(node) = node {
                         let ticks_per_cycle =
-                            (MILLI_PER_ITEM / u64::from(node.rate_per_tick_milli).max(1))
-                                .max(1);
+                            (MILLI_PER_ITEM / u64::from(node.rate_per_tick_milli).max(1)).max(1);
                         let report = live_mod_lazy_catchup_machine(
                             &MachineCatchUpState {
                                 input_count: node.input_buffer,
@@ -6656,9 +7549,7 @@ fn live_catchup_on_region_change(
                                 cycle_progress: (node.carry_milli * ticks_per_cycle)
                                     / MILLI_PER_ITEM,
                                 output_count: node.output_buffer,
-                                output_space: node
-                                    .max_buffer
-                                    .saturating_sub(node.output_buffer),
+                                output_space: node.max_buffer.saturating_sub(node.output_buffer),
                             },
                             delta,
                         );
@@ -6739,8 +7630,7 @@ fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
         .filter(|m| m.dim == dim)
         .filter_map(|m| {
             let (x, y, z, _, _) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-            let d2 =
-                (x - pos[0]).powi(2) + (y - pos[1]).powi(2) + (z - pos[2]).powi(2);
+            let d2 = (x - pos[0]).powi(2) + (y - pos[1]).powi(2) + (z - pos[2]).powi(2);
             (d2 <= 20.0 * 20.0).then(|| BreathEntity {
                 entity_id: m.eid as u64,
                 center: [x, y, z],
@@ -6787,19 +7677,11 @@ fn live_dragon_breath_mods(dim: DimId, pos: [f64; 3]) {
             if live_forge_entry(near_dim, coord.x, coord.y, coord.z).is_none() {
                 continue;
             }
-            let _ = live_forge_apply_breath(
-                near_dim,
-                coord.x,
-                coord.y,
-                coord.z,
-                ElementKind::Fire,
-                40,
-            );
+            let _ =
+                live_forge_apply_breath(near_dim, coord.x, coord.y, coord.z, ElementKind::Fire, 40);
         }
     }
 }
-
-
 
 // Default-build stubs for the live_opt_wire surface: same names, no-op
 // bodies, generic parameters where the real signature names a mod-suite
@@ -6869,10 +7751,7 @@ pub(crate) fn live_mod_lazy_catchup_set_enabled(_enabled: bool) {}
 
 #[inline(always)]
 #[cfg(not(feature = "mod-suite"))]
-pub(crate) fn live_mod_lazy_catchup_furnace<S, R>(
-    _state: &S,
-    _delta_ticks: u64,
-) -> Option<R> {
+pub(crate) fn live_mod_lazy_catchup_furnace<S, R>(_state: &S, _delta_ticks: u64) -> Option<R> {
     None
 }
 
@@ -6890,10 +7769,7 @@ pub(crate) fn live_mod_lazy_catchup_growth(
 
 #[inline(always)]
 #[cfg(not(feature = "mod-suite"))]
-pub(crate) fn live_mod_lazy_catchup_machine<S, R>(
-    _state: &S,
-    _delta_ticks: u64,
-) -> Option<R> {
+pub(crate) fn live_mod_lazy_catchup_machine<S, R>(_state: &S, _delta_ticks: u64) -> Option<R> {
     None
 }
 
@@ -6923,13 +7799,7 @@ pub(crate) fn live_mod_headless_factory_step(_ticks: u64) -> u64 {
 
 #[inline(always)]
 #[cfg(not(feature = "mod-suite"))]
-pub(crate) fn live_forge_register<S>(
-    _dim: DimId,
-    _x: i32,
-    _y: i32,
-    _z: i32,
-    _spec: S,
-) -> bool {
+pub(crate) fn live_forge_register<S>(_dim: DimId, _x: i32, _y: i32, _z: i32, _spec: S) -> bool {
     false
 }
 
@@ -7056,16 +7926,8 @@ fn live_colossal_attack_scale(
     _m: &Mob,
 ) -> f32 {
     let _ = live_colossal_stage_at(&(), 0);
-    let _ = live_colossal_hit_test::<u8>(
-        "",
-        ray_origin,
-        0.0,
-        0.0,
-        1.0,
-        ray_origin,
-        ray_dir,
-        max_dist,
-    );
+    let _ =
+        live_colossal_hit_test::<u8>("", ray_origin, 0.0, 0.0, 1.0, ray_origin, ray_dir, max_dist);
     1.0
 }
 
@@ -7407,8 +8269,7 @@ fn live_attach_orbital_passenger(entity_id: i32, ship_id: u64, local_offset: [f6
 /// per-rider `TeleportIntent`s the wire layer executes.
 #[cfg(feature = "create-offload")]
 #[allow(dead_code)]
-fn live_take_orbital_transitions()
--> Vec<create_adapter::orbital::ShipDimensionTransition> {
+fn live_take_orbital_transitions() -> Vec<create_adapter::orbital::ShipDimensionTransition> {
     mod_offload_bridge()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -8478,6 +9339,148 @@ mod wire_mods_tests {
         dir
     }
 
+    fn lmb_loot_glm_jar(dep_manifest: &str) -> Vec<u8> {
+        let loot = br#"{"type":"minecraft:chest","pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:diamond"}]}]}"#;
+        let global = br#"{"replace":false,"entries":["custom_mod:add_emerald"]}"#;
+        let glm = br#"{"type":"neoforge:add_item","item":"minecraft:emerald","count":1}"#;
+        let manifest = format!(
+            r#"{{"schemaVersion":1,"id":"custom_mod","version":"1.0.0","environment":"*"{dep_manifest}}}"#
+        );
+        lmb_test_jar(&[
+            ("fabric.mod.json", manifest.as_bytes()),
+            ("data/minecraft/loot_table/chests/simple_dungeon.json", loot),
+            (
+                "data/neoforge/loot_modifiers/global_loot_modifiers.json",
+                global,
+            ),
+            ("data/custom_mod/loot_modifiers/add_emerald.json", glm),
+            (
+                "data/custom_mod/tags/item/m3c_blocked.json",
+                br#"{"values":["minecraft:emerald"]}"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn m3c_mod_loot_overlay_glm_and_provenance_are_admitted() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("m3c-loot-glm");
+        std::fs::write(dir.join("custom-mod-1.jar"), lmb_loot_glm_jar("")).unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert!(suite.admitted_jars.contains("custom-mod-1.jar"));
+        assert!(suite
+            .loot_tables_raw
+            .contains_key("minecraft:chests/simple_dungeon"));
+        assert!(suite.loot_provenance.records().iter().any(|record| {
+            record.domain == DiffDomain::LootTable
+                && record.resource_id == "minecraft:chests/simple_dungeon"
+                && record.action == ProvenanceAction::Overridden
+                && record.source_layer == "custom_mod"
+                && record.previous_owner.as_deref() == Some("vanilla")
+        }));
+        assert!(suite
+            .glm_engine
+            .active_order()
+            .iter()
+            .any(|id| id == "custom_mod:add_emerald"));
+        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
+        let drops = apply_live_mod_loot_modifiers(
+            "minecraft:chests/simple_dungeon",
+            DimId::Overworld,
+            Some((1, 64, 1)),
+            false,
+            None,
+            Vec::new(),
+            7,
+        );
+        assert!(drops.iter().any(|(item, count, _)| {
+            *count == 1 && matches!(item_to_name(*item), Some("emerald" | "minecraft:emerald"))
+        }));
+        let diff = live_provenance_diff_json();
+        assert!(diff.contains("minecraft:chests/simple_dungeon"));
+        assert!(diff.contains("custom_mod:add_emerald"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn m3c_missing_dependency_blocks_loot_tags_recipes_and_hooks() {
+        let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fresh_suite();
+        let dir = lmb_temp_dir("m3c-missing-dep");
+        std::fs::write(
+            dir.join("custom-mod-1.jar"),
+            lmb_loot_glm_jar(r#","depends":{"missing_lib":">=1.0"}"#),
+        )
+        .unwrap();
+        let mut suite = LiveModSuite::new();
+        suite.scan_mods_dir(&dir);
+        assert!(!suite.admitted_jars.contains("custom-mod-1.jar"));
+        assert!(!suite
+            .loot_tables_raw
+            .contains_key("minecraft:chests/simple_dungeon"));
+        assert!(suite.glm_engine.active_order().is_empty());
+        assert!(suite.damage_hooks.is_empty());
+        assert!(suite.unified_tags.export_flat(TagDomain::Item).is_empty());
+        assert!(!suite.dependency_resolution.missing_required.is_empty());
+        assert!(suite.reports.iter().any(|report| {
+            report.file_name == "custom-mod-1.jar"
+                && report.diagnostic.contains("dependency admission")
+        }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn m3c_kinetic_frames_chunk_and_stay_dimension_scoped() {
+        let mut tags = Vec::new();
+        for index in 0..4_097i32 {
+            tags.push(create_adapter::factory::KineticUpdateTag {
+                pos: FactoryPos::new(0, index, 64, 0),
+                speed_rpm: 16.0,
+                stress_capacity: 1.0,
+                stress_load: 0.5,
+                overstressed: false,
+            });
+        }
+        tags.push(create_adapter::factory::KineticUpdateTag {
+            pos: FactoryPos::new(1, 0, 64, 0),
+            speed_rpm: 16.0,
+            stress_capacity: 1.0,
+            stress_load: 0.5,
+            overstressed: false,
+        });
+        let frames = create_adapter::neoforge_wire::encode_kinetic_batches(&tags, 99);
+        let chunks: Vec<_> = frames
+            .iter()
+            .map(|frame| {
+                create_adapter::neoforge_wire::decode_kinetic_batch_chunk(frame)
+                    .expect("valid kinetic chunk")
+            })
+            .collect();
+        assert!(chunks.iter().all(|chunk| chunk.tags.len() <= 4096));
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.dimension_id == 0)
+                .map(|chunk| chunk.tags.len())
+                .sum::<usize>(),
+            4097
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.dimension_id == 1)
+                .map(|chunk| chunk.tags.len())
+                .sum::<usize>(),
+            1
+        );
+        assert!(chunks
+            .iter()
+            .filter(|chunk| chunk.dimension_id == 0)
+            .all(|chunk| chunk.chunk_total == 2));
+    }
+
     /// A fresh client/server `TcpStream` pair: `send` is the end the server
     /// writes to, `peer` reads exactly those bytes.
     pub(crate) fn lmb_socket_pair() -> (TcpStream, TcpStream) {
@@ -9070,7 +10073,10 @@ mod wire_mods_tests {
 
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()).active = true;
+        live_mod_suite()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active = true;
         let (player_a, mut peer_a) = lmb_client("wire_season_a", 977_201);
         let (player_b, mut peer_b) = lmb_client("wire_season_b", 977_202);
         clients()
@@ -9094,7 +10100,10 @@ mod wire_mods_tests {
         assert!(live_mod_emit_season_sync(977_202, 0, 0.8));
         let (id, body) = lmb_read_frame(&mut peer_b, &mut Vec::new()).unwrap();
         assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
-        assert_eq!(lmb_decode_payload(&body), ("megu:season".into(), payload.clone()));
+        assert_eq!(
+            lmb_decode_payload(&body),
+            ("megu:season".into(), payload.clone())
+        );
         assert!(live_mod_emit_season_sync(977_201, 24_000 * 8, 0.8));
         let (_, body) = lmb_read_frame(&mut peer_a, &mut stash_a).unwrap();
         let (_, changed) = lmb_decode_payload(&body);
@@ -9120,31 +10129,82 @@ mod wire_mods_tests {
             live_mod_roll_halloween_headgear("minecraft:skeleton", 10, 31, 0.1),
             Some(("minecraft:carved_pumpkin", 0.0))
         );
-        assert_eq!(live_mod_roll_halloween_headgear("minecraft:creeper", 10, 31, 0.01), None);
-        assert_eq!(live_mod_roll_halloween_headgear("minecraft:zombie", 10, 30, 0.01), None);
-        assert_eq!(live_mod_roll_halloween_headgear("minecraft:zombie", 13, 31, 0.01), None);
-        assert_eq!(live_mod_chest_holiday_variant("minecraft:chest", 12, 25), "christmas_present");
-        assert_eq!(live_mod_chest_holiday_variant("minecraft:trapped_chest", 12, 24), "christmas_present");
-        assert_eq!(live_mod_chest_holiday_variant("minecraft:ender_chest", 12, 25), "standard");
-        assert_eq!(live_mod_chest_holiday_variant("minecraft:chest", 12, 27), "standard");
+        assert_eq!(
+            live_mod_roll_halloween_headgear("minecraft:creeper", 10, 31, 0.01),
+            None
+        );
+        assert_eq!(
+            live_mod_roll_halloween_headgear("minecraft:zombie", 10, 30, 0.01),
+            None
+        );
+        assert_eq!(
+            live_mod_roll_halloween_headgear("minecraft:zombie", 13, 31, 0.01),
+            None
+        );
+        assert_eq!(
+            live_mod_chest_holiday_variant("minecraft:chest", 12, 25),
+            "christmas_present"
+        );
+        assert_eq!(
+            live_mod_chest_holiday_variant("minecraft:trapped_chest", 12, 24),
+            "christmas_present"
+        );
+        assert_eq!(
+            live_mod_chest_holiday_variant("minecraft:ender_chest", 12, 25),
+            "standard"
+        );
+        assert_eq!(
+            live_mod_chest_holiday_variant("minecraft:chest", 12, 27),
+            "standard"
+        );
         assert_eq!(
             live_mod_try_qol_right_click_harvest(
-                true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
+                true,
+                "minecraft:wheat",
+                7,
+                7,
+                "minecraft:wheat",
+                "minecraft:wheat_seeds",
+                3,
+                2
             ),
             Some((0, 3, 1))
         );
         assert_eq!(
             live_mod_try_qol_right_click_harvest(
-                true, "minecraft:carrots", 7, 7, "minecraft:carrot", "minecraft:carrot", 3, 0
+                true,
+                "minecraft:carrots",
+                7,
+                7,
+                "minecraft:carrot",
+                "minecraft:carrot",
+                3,
+                0
             ),
             Some((0, 2, 0))
         );
         assert!(live_mod_try_qol_right_click_harvest(
-            true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 0
-        ).is_none());
+            true,
+            "minecraft:wheat",
+            7,
+            7,
+            "minecraft:wheat",
+            "minecraft:wheat_seeds",
+            3,
+            0
+        )
+        .is_none());
         assert!(live_mod_try_qol_right_click_harvest(
-            false, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
-        ).is_none());
+            false,
+            "minecraft:wheat",
+            7,
+            7,
+            "minecraft:wheat",
+            "minecraft:wheat_seeds",
+            3,
+            2
+        )
+        .is_none());
     }
 
     // ---------- progression barrier ----------
@@ -9394,10 +10454,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_protocol_table_pins_767() {
-        assert_eq!(
-            megu_core::version::TargetVersion::V1_21_1.protocol(),
-            767
-        );
+        assert_eq!(megu_core::version::TargetVersion::V1_21_1.protocol(), 767);
         assert_eq!(LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID, 0x19);
     }
 
@@ -9570,9 +10627,28 @@ version="3.0.0"
         let ten = asm.cp.float(10.0);
         let half = asm.cp.float(0.5);
         let code = vec![
-            0x2a, 0xb6, (get >> 8) as u8, get as u8, 0x12, ten as u8, 0x95, 0x9e, 0, 14, 0x2a,
-            0x2a, 0xb6, (get >> 8) as u8, get as u8, 0x12, half as u8, 0x6a, 0xb6, (set >> 8)
-            as u8, set as u8, 0xb1,
+            0x2a,
+            0xb6,
+            (get >> 8) as u8,
+            get as u8,
+            0x12,
+            ten as u8,
+            0x95,
+            0x9e,
+            0,
+            14,
+            0x2a,
+            0x2a,
+            0xb6,
+            (get >> 8) as u8,
+            get as u8,
+            0x12,
+            half as u8,
+            0x6a,
+            0xb6,
+            (set >> 8) as u8,
+            set as u8,
+            0xb1,
         ];
         asm.finish(&[MethodSpec::new(
             "onDamage",
@@ -9912,10 +10988,10 @@ version="3.0.0"
 
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) =
-            LiveMagicState::default();
-        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
-            DimensionModRuntimeBridge::new();
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
+        *dimension_mod_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = DimensionModRuntimeBridge::new();
 
         // ---- culinary: a real JAR scan feeds the live dispatchers ----
         let dir = lmb_temp_dir("mega-w3");
@@ -9985,12 +11061,26 @@ version="3.0.0"
         // ---- right-click harvest: seed deducted from the loot, crop replanted ----
         assert_eq!(
             live_mod_try_qol_right_click_harvest(
-                true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 2
+                true,
+                "minecraft:wheat",
+                7,
+                7,
+                "minecraft:wheat",
+                "minecraft:wheat_seeds",
+                3,
+                2
             ),
             Some((0, 3, 1))
         );
         assert!(live_mod_try_qol_right_click_harvest(
-            true, "minecraft:wheat", 7, 7, "minecraft:wheat", "minecraft:wheat_seeds", 3, 0
+            true,
+            "minecraft:wheat",
+            7,
+            7,
+            "minecraft:wheat",
+            "minecraft:wheat_seeds",
+            3,
+            0
         )
         .is_none());
 
@@ -10046,7 +11136,9 @@ version="3.0.0"
         assert!(live_mod_magic_cast(uuid, &instant).is_ok());
         assert!(matches!(
             live_mod_magic_cast(uuid, &instant),
-            Err(LiveMagicError::Cast(lmb_magic::CastError::OnCooldown { .. }))
+            Err(LiveMagicError::Cast(
+                lmb_magic::CastError::OnCooldown { .. }
+            ))
         ));
         let tick = live_mod_magic_tick_player(uuid).unwrap();
         let frame = tick.frame.expect("MAG1 sync frame");
@@ -10054,7 +11146,9 @@ version="3.0.0"
 
         // ---- dimension portal: transition -> intent -> anti-cheat grace ----
         {
-            let mut b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            let mut b = dimension_mod_bridge()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             b.register_portal_rule(dim_mod::PortalRule::new(
                 "megaw3:nether_portal",
                 dim_mod::PortalTrigger::VerticalFrame {
@@ -10084,7 +11178,9 @@ version="3.0.0"
         }
         let source_pos = [4000.5, 70.0, -2000.5];
         let intent = {
-            let b = dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            let b = dimension_mod_bridge()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             b.try_mod_portal_teleport(
                 traveller.eid,
                 DimId::Overworld,
@@ -10100,7 +11196,11 @@ version="3.0.0"
         assert!((intent.target_pos[0] - 500.0625).abs() < 1e-9);
         assert!((intent.target_pos[1] - 70.0).abs() < 1e-9);
         assert!((intent.target_pos[2] - (-250.0625)).abs() < 1e-9);
-        let to = (intent.target_pos[0], intent.target_pos[1], intent.target_pos[2]);
+        let to = (
+            intent.target_pos[0],
+            intent.target_pos[1],
+            intent.target_pos[2],
+        );
         let v = ac_check_move(&traveller, (4000.5, 70.0, -2000.5), to, false);
         assert!(
             matches!(v, AcMoveVerdict::Accept { .. }),
@@ -10113,10 +11213,10 @@ version="3.0.0"
         );
 
         // Leave every global clean for the next test.
-        *dimension_mod_bridge().lock().unwrap_or_else(|e| e.into_inner()) =
-            DimensionModRuntimeBridge::new();
-        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) =
-            LiveMagicState::default();
+        *dimension_mod_bridge()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = DimensionModRuntimeBridge::new();
+        *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
         fresh_suite();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -10139,7 +11239,10 @@ version="3.0.0"
         );
         let (mut send, mut peer) = lmb_socket_pair();
         live_mod_registry_sync_on_join(&mut send);
-        assert!(lmb_silent(&mut peer), "vanilla join must emit no MRS1 packet");
+        assert!(
+            lmb_silent(&mut peer),
+            "vanilla join must emit no MRS1 packet"
+        );
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
     }
 
@@ -10165,10 +11268,7 @@ version="3.0.0"
                 "missing create item {name}"
             );
         }
-        if breg()
-            .and_then(|reg| reg.create_registry())
-            .is_some()
-        {
+        if breg().and_then(|reg| reg.create_registry()).is_some() {
             assert!(
                 synced
                     .block_states
@@ -10176,9 +11276,10 @@ version="3.0.0"
                     .any(|e| e.block_id == "create:shaft"),
                 "armed Create registry must sync its block states"
             );
-            assert!(synced.block_states.iter().all(|e| {
-                e.state_id >= create_adapter::blockstates::DEFAULT_BASE_STATE_ID
-            }));
+            assert!(synced
+                .block_states
+                .iter()
+                .all(|e| { e.state_id >= create_adapter::blockstates::DEFAULT_BASE_STATE_ID }));
         }
         // The join path emits exactly one 0x19 custom_payload on the MRS1
         // channel carrying the identical frame bytes.
@@ -10229,7 +11330,10 @@ version="3.0.0"
             "unchanged inputs must rebuild byte-identical bytes"
         );
         let fourth = live_mod_registry_sync_frame().expect("second post-rescan join");
-        assert!(Arc::ptr_eq(&third, &fourth), "rebuilt frame must cache again");
+        assert!(
+            Arc::ptr_eq(&third, &fourth),
+            "rebuilt frame must cache again"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         fresh_suite();
@@ -10282,7 +11386,10 @@ version="3.0.0"
             "testmod:geode item missing"
         );
         assert!(
-            synced.items.keys().all(|id| *id >= LIVE_MRS_GENERIC_ITEM_BASE),
+            synced
+                .items
+                .keys()
+                .all(|id| *id >= LIVE_MRS_GENERIC_ITEM_BASE),
             "generic item ids must stay in their dedicated range"
         );
 
@@ -10317,11 +11424,9 @@ version="3.0.0"
 
         // Partial-property selectors overlay the default state, exactly
         // like `BReg::checked_state` does for vanilla ids.
-        let rock_y = live_mod_state_for_name(
-            "testmod:rock",
-            &[("axis".to_string(), "y".to_string())],
-        )
-        .expect("testmod:rock y-axis state resolves");
+        let rock_y =
+            live_mod_state_for_name("testmod:rock", &[("axis".to_string(), "y".to_string())])
+                .expect("testmod:rock y-axis state resolves");
         assert!(rock_y >= LIVE_MRS_GENERIC_BLOCK_BASE);
         assert_eq!(
             live_mod_name_for_state(rock_y).as_deref(),
@@ -10338,10 +11443,7 @@ version="3.0.0"
         let rock_default =
             live_mod_state_for_name("testmod:rock", &[]).expect("default rock state");
         assert_eq!(state_from_arg("testmod:rock"), Some(rock_default));
-        assert_eq!(
-            modification_block_state("testmod:rock"),
-            Some(rock_default)
-        );
+        assert_eq!(modification_block_state("testmod:rock"), Some(rock_default));
 
         // Bad properties and unknown blocks still fail closed; vanilla and
         // unnamespaced names never consult the mod tables.
@@ -10368,7 +11470,9 @@ version="3.0.0"
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
 
         // A minimal plan with one custom block — no real JAR needed.
         let mut suite = LiveModSuite::new();
@@ -10395,12 +11499,7 @@ version="3.0.0"
 
         // A tracked cell holding the plan state serializes under the
         // JAR-table canonical name and the decoder returns the same id.
-        let pos = FactoryPos::new(
-            DimId::Overworld.raw() as i32,
-            4_000_001,
-            80,
-            4_000_001,
-        );
+        let pos = FactoryPos::new(DimId::Overworld.raw() as i32, 4_000_001, 80, 4_000_001);
         live_create_with(|rt| {
             rt.placed.insert(pos, LIVE_MRS_GENERIC_BLOCK_BASE + 1);
         });
@@ -10422,11 +11521,16 @@ version="3.0.0"
         let unresolvable = u32::MAX - 7;
         assert!(registry.state(unresolvable).is_none());
         let fallback = live_create_encode_state(&registry, unresolvable);
-        assert_eq!(fallback, format!("megu:unresolved_block_state[{unresolvable}]"));
+        assert_eq!(
+            fallback,
+            format!("megu:unresolved_block_state[{unresolvable}]")
+        );
         assert_eq!(live_create_unresolved_state(&fallback), Some(unresolvable));
 
         fresh_suite();
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
     }
 
@@ -10469,8 +11573,7 @@ version="3.0.0"
                 ("fabric.mod.json", lmb_fabric_manifest("mod_b").as_slice()),
                 (
                     "data/forge/tags/item/ingots/iron.json",
-                    br#"{"values":["mod_b:steel_ingot","minecraft:iron_ingot"]}"#
-                        .as_slice(),
+                    br#"{"values":["mod_b:steel_ingot","minecraft:iron_ingot"]}"#.as_slice(),
                 ),
                 (
                     "data/c/tags/item/plates/brass.json",
@@ -10487,7 +11590,11 @@ version="3.0.0"
 
         // `c:`, `forge:` and `neoforge:` spellings hit the same canonical
         // chain.
-        for tag in ["#c:ingots/iron", "#forge:ingots/iron", "#neoforge:ingots/iron"] {
+        for tag in [
+            "#c:ingots/iron",
+            "#forge:ingots/iron",
+            "#neoforge:ingots/iron",
+        ] {
             assert!(
                 live_unified_tag_matches(TagDomain::Item, tag, "mod_b:steel_ingot"),
                 "{tag} must match the cross-mod member"
@@ -10550,7 +11657,9 @@ version="3.0.0"
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         live_cap_reset();
 
         let reg = live_create_block_registry().expect("armed registry");
@@ -10624,7 +11733,9 @@ version="3.0.0"
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         live_cap_reset();
 
         let dir = lmb_temp_dir("xmod1-pot");
@@ -10717,7 +11828,9 @@ version="3.0.0"
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         live_cap_reset();
         let reg = live_create_block_registry().expect("armed registry");
         let chute_st = reg.default_state("create:chute").expect("create:chute");
@@ -10732,7 +11845,9 @@ version="3.0.0"
             1
         );
         {
-            let guard = live_create_state().lock().unwrap_or_else(|e| e.into_inner());
+            let guard = live_create_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let rt = guard.as_ref().expect("runtime armed");
             let held = rt
                 .held
@@ -10755,8 +11870,9 @@ version="3.0.0"
             1
         );
         live_cap_bus_step();
-        assert!(live_cap_extract_item(dim, x, y + 1, z, Some(FaceDirection::Up), 64, false)
-            .is_none());
+        assert!(
+            live_cap_extract_item(dim, x, y + 1, z, Some(FaceDirection::Up), 64, false).is_none()
+        );
         // Advance the transport clock past the chute's staging delay —
         // the staged output then hops into the foreign endpoint on the
         // next bus step.
@@ -10798,7 +11914,16 @@ version="3.0.0"
         live_cap_register_fluid_tank(dim, ax, ay, az, 8_000);
         live_cap_register_fluid_tank(dim, bx, by, bz, 16_000);
         assert_eq!(
-            live_cap_fill_fluid(dim, ax, ay, az, "mod_a:molten_zinc", 3_000, &[7, 7, 7], false),
+            live_cap_fill_fluid(
+                dim,
+                ax,
+                ay,
+                az,
+                "mod_a:molten_zinc",
+                3_000,
+                &[7, 7, 7],
+                false
+            ),
             3_000
         );
         assert_eq!(
@@ -10851,7 +11976,9 @@ version="3.0.0"
         // Stage the Mekanism-class reference profile on the shared bridge,
         // restoring whatever was loaded after the test.
         let saved = {
-            let mut bridge = mod_offload_bridge().lock().unwrap_or_else(|e| e.into_inner());
+            let mut bridge = mod_offload_bridge()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             std::mem::replace(
                 &mut bridge.profiles,
                 vec![mod_adapter_core::profile::mekanism_class_profile()],
@@ -10880,7 +12007,13 @@ version="3.0.0"
         assert_eq!(drained.fluid_id, "mekanism:water");
         assert_eq!(drained.amount_mb, 16_000);
         // A block id no profile declares registers nothing.
-        assert!(!live_cap_register_profile_block(dim, x, y, z + 1, "mekanism:unknown_block"));
+        assert!(!live_cap_register_profile_block(
+            dim,
+            x,
+            y,
+            z + 1,
+            "mekanism:unknown_block"
+        ));
         live_cap_unregister(dim, x, y, z);
         mod_offload_bridge()
             .lock()
@@ -10888,7 +12021,6 @@ version="3.0.0"
             .profiles = saved;
         fresh_suite();
     }
-
 }
 
 // ===========================================================================
@@ -10903,7 +12035,9 @@ mod live_create_tests {
     /// `world_guard` serializes every test that writes world cells.
     fn arm() {
         LIVE_CREATE_TEST_GATE.store(1, Ordering::Relaxed);
-        *live_create_state().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *live_create_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         // A rebuilt runtime owns no capability endpoints — drop the stale
         // bus state the previous runtime left registered.
         live_cap_reset();
@@ -10982,8 +12116,7 @@ mod live_create_tests {
         // `create:mechanical_belt` item stays accepted as an alias.
         let belt = live_create_resolve_item("create:belt").expect("belt item");
         assert_eq!(live_create_item_block_name(belt), Some("create:belt"));
-        let legacy = live_create_resolve_item("create:mechanical_belt")
-            .expect("legacy belt item");
+        let legacy = live_create_resolve_item("create:mechanical_belt").expect("legacy belt item");
         assert_eq!(live_create_item_block_name(legacy), Some("create:belt"));
         // Processed material items resolve through the same tables but
         // never place a block.
@@ -10996,9 +12129,8 @@ mod live_create_tests {
             "create:brass_ingot",
             "create:zinc_ingot",
         ] {
-            let id = live_create_resolve_item(item).unwrap_or_else(|| {
-                panic!("missing item for {item}")
-            });
+            let id =
+                live_create_resolve_item(item).unwrap_or_else(|| panic!("missing item for {item}"));
             assert_eq!(live_create_item_name(id), Some(item));
             assert_eq!(live_create_item_block_name(id), None);
             assert_eq!(name_to_item(item), Some(id));
@@ -11118,9 +12250,21 @@ mod live_create_tests {
         let shaft_st = state_of("create:shaft", &[("axis", "x")]);
         put(DimId::Overworld, shaft.0, shaft.1, shaft.2, shaft_st);
         let gearbox_st = state_of("create:gearbox", &[("axis", "x")]);
-        put(DimId::Overworld, gearbox.0, gearbox.1, gearbox.2, gearbox_st);
+        put(
+            DimId::Overworld,
+            gearbox.0,
+            gearbox.1,
+            gearbox.2,
+            gearbox_st,
+        );
         let shaft_y_st = state_of("create:shaft", &[("axis", "y")]);
-        put(DimId::Overworld, shaft_y.0, shaft_y.1, shaft_y.2, shaft_y_st);
+        put(
+            DimId::Overworld,
+            shaft_y.0,
+            shaft_y.1,
+            shaft_y.2,
+            shaft_y_st,
+        );
         let press_st = state_of("create:mechanical_press", &[("facing", "east")]);
         put(DimId::Overworld, press.0, press.1, press.2, press_st);
 
@@ -11164,9 +12308,8 @@ mod live_create_tests {
             channel,
             create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
         );
-        let tags =
-            create_adapter::neoforge_wire::decode_kinetic_update_batch(&rest[chan_len..])
-                .expect("batch decodes");
+        let tags = create_adapter::neoforge_wire::decode_kinetic_update_batch(&rest[chan_len..])
+            .expect("batch decodes");
         assert!(tags
             .iter()
             .any(|t| t.pos == pos_of(shaft) && t.speed_rpm.abs() > 1e-6));
@@ -11178,8 +12321,8 @@ mod live_create_tests {
         });
 
         // Wrench on the shaft cycles axis x -> y and re-solves the graph.
-        let rotated = live_create_wrench_rotate(pos_of(shaft), shaft_st)
-            .expect("wrench rotates shaft");
+        let rotated =
+            live_create_wrench_rotate(pos_of(shaft), shaft_st).expect("wrench rotates shaft");
         assert_ne!(rotated, shaft_st);
         assert_eq!(
             registry().encode_canonical(rotated).unwrap(),
@@ -11348,8 +12491,20 @@ mod live_create_tests {
         }
         clear(wx, wy, wz);
         put(DimId::Overworld, water.0, water.1, water.2, TEST_WATER);
-        put(DimId::Overworld, wx, wy, wz, state_of("create:water_wheel", &[("axis", "x")]));
-        put(DimId::Overworld, shaft.0, shaft.1, shaft.2, state_of("create:shaft", &[("axis", "x")]));
+        put(
+            DimId::Overworld,
+            wx,
+            wy,
+            wz,
+            state_of("create:water_wheel", &[("axis", "x")]),
+        );
+        put(
+            DimId::Overworld,
+            shaft.0,
+            shaft.1,
+            shaft.2,
+            state_of("create:shaft", &[("axis", "x")]),
+        );
         put(
             DimId::Overworld,
             press.0,
@@ -11446,10 +12601,7 @@ mod live_create_tests {
         });
 
         // Empty-handed right-click returns the sheet to the inventory.
-        me.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&36);
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&36);
         assert!(live_create_interact_block(
             &me,
             DimId::Overworld,
@@ -11469,10 +12621,7 @@ mod live_create_tests {
         );
         live_create_with(|rt| assert!(rt.held.get(&depot_pos).is_none_or(|h| h.items.is_empty())));
         // Nothing left to take: empty hand on an empty depot is unhandled.
-        me.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&36);
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&36);
         assert!(!live_create_interact_block(
             &me,
             DimId::Overworld,
@@ -11508,7 +12657,15 @@ mod live_create_tests {
             .insert(36, (iron, 2, Vec::new()));
 
         // Insert one ingot onto the belt's transport machine.
-        assert!(live_create_interact_block(&me, DimId::Overworld, bx, by, bz, belt_st, 0));
+        assert!(live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            bx,
+            by,
+            bz,
+            belt_st,
+            0
+        ));
         assert_eq!(
             me.inv
                 .lock()
@@ -11525,16 +12682,22 @@ mod live_create_tests {
             .factory
             .scheduler()
             .region(belt_pos.region_key())
-            .is_some_and(|r| r.transport().machine(machine).is_some_and(
-                |m| m.output_items == 1
-            ))));
+            .is_some_and(|r| r
+                .transport()
+                .machine(machine)
+                .is_some_and(|m| m.output_items == 1))));
 
         // Empty-handed click collects it back into the inventory.
-        me.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&36);
-        assert!(live_create_interact_block(&me, DimId::Overworld, bx, by, bz, belt_st, 0));
+        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&36);
+        assert!(live_create_interact_block(
+            &me,
+            DimId::Overworld,
+            bx,
+            by,
+            bz,
+            belt_st,
+            0
+        ));
         assert_eq!(
             me.inv
                 .lock()
@@ -11585,9 +12748,8 @@ mod live_create_tests {
             channel,
             create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
         );
-        let tags =
-            create_adapter::neoforge_wire::decode_kinetic_update_batch(&frame[chan_len..])
-                .expect("snapshot decodes");
+        let tags = create_adapter::neoforge_wire::decode_kinetic_update_batch(&frame[chan_len..])
+            .expect("snapshot decodes");
         assert!(tags.iter().any(|t| t.pos == pos_of(W4)));
 
         for c in [(wx, wy, wz), (wx + 1, wy, wz), (wx + 2, wy, wz)] {
@@ -11631,10 +12793,7 @@ mod live_create_tests {
         assert!(shaft >= create_adapter::blockstates::DEFAULT_BASE_STATE_ID);
         assert_eq!(reg.name_of(shaft), "create:shaft");
         let rotated = reg.with_prop(shaft, "axis", "y");
-        assert_eq!(
-            reg.get_prop(rotated, "axis").as_deref(),
-            Some("y")
-        );
+        assert_eq!(reg.get_prop(rotated, "axis").as_deref(), Some("y"));
         assert_eq!(
             reg.canonical_state(rotated),
             "create:shaft[axis=y,waterlogged=false]"
@@ -11683,8 +12842,7 @@ mod live_create_tests {
         let _ = live_create_tick_body();
         live_create_with(|rt| {
             assert!(
-                rt.factory.active_regions_last_tick() >= 1
-                    || rt.factory.sleeping_regions() >= 1,
+                rt.factory.active_regions_last_tick() >= 1 || rt.factory.sleeping_regions() >= 1,
                 "step_tick must step or park the placed region"
             );
         });
@@ -11804,10 +12962,7 @@ mod live_create_tests {
         let bl: Vec<Vec<u8>> = blocks
             .iter()
             .map(|(pos, state)| {
-                nbt_compound_payload(vec![
-                    nbt_int3("pos", *pos),
-                    nbt_int("state", *state as i32),
-                ])
+                nbt_compound_payload(vec![nbt_int3("pos", *pos), nbt_int("state", *state as i32)])
             })
             .collect();
         root.extend_from_slice(&nbt_list("blocks", 10, bl));
@@ -11836,6 +12991,29 @@ mod live_create_tests {
         out.extend_from_slice(&megu_core::hash::crc32_ieee(data).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out
+    }
+
+    #[test]
+    fn m3c_schematic_preflight_aborts_before_any_cell_write() {
+        let _g = world_guard();
+        arm();
+        let (ox, oy, oz) = (9_000_000, 80, 1_300);
+        clear(ox, oy, oz);
+        clear(ox + 1, oy, oz);
+        let stone = name_to_state("stone").expect("stone state");
+        put(DimId::Overworld, ox + 1, oy, oz, stone);
+        let nbt = structure_nbt(
+            [2, 1, 1],
+            &[("minecraft:stone", &[])],
+            &[([0, 0, 0], 0), ([1, 0, 0], 0)],
+        );
+        let err = live_place_nbt_schematic_in_dim(DimId::Overworld, (ox, oy, oz), &nbt)
+            .expect_err("obstructed schematic must reject in preflight");
+        assert!(err.contains("obstructed"), "{err}");
+        assert_eq!(block_at_dim(DimId::Overworld, ox, oy, oz), 0);
+        assert_eq!(block_at_dim(DimId::Overworld, ox + 1, oy, oz), stone);
+        clear(ox + 1, oy, oz);
+        LIVE_CREATE_TEST_GATE.store(0, Ordering::Relaxed);
     }
 
     const W9: (i32, i32, i32) = (9_000_000, 80, 1_100);
@@ -11896,12 +13074,9 @@ mod live_create_tests {
                 (cells[9], 8),
             ],
         );
-        let report = live_place_nbt_schematic_in_dim(
-            DimId::Overworld,
-            (ox, oy, oz),
-            &gzip_stored(&nbt),
-        )
-        .expect("schematic must place");
+        let report =
+            live_place_nbt_schematic_in_dim(DimId::Overworld, (ox, oy, oz), &gzip_stored(&nbt))
+                .expect("schematic must place");
         assert_eq!(report.placed_blocks, 10);
         assert_eq!(report.unresolved_palette_entries, 0);
         assert_eq!(report.skipped_blocks, 0);
@@ -11929,7 +13104,13 @@ mod live_create_tests {
 
         // Drop one ingot into the chute and let the duct chain carry it.
         let iron = name_to_item("minecraft:iron_ingot").expect("iron item");
-        assert!(live_create_duct_insert(DimId::Overworld, ox, oy + 1, oz, iron));
+        assert!(live_create_duct_insert(
+            DimId::Overworld,
+            ox,
+            oy + 1,
+            oz,
+            iron
+        ));
         let depot_pos = pos_of((ox + 3, oy, oz));
         let sheet = name_to_item("create:iron_sheet").expect("sheet item");
         assert!(
@@ -12020,8 +13201,9 @@ mod live_create_tests {
     /// leak across cases.
     fn opt_reset() {
         live_auto_optimizer_reset();
-        *live_lazy_catchup_state().lock().unwrap_or_else(|e| e.into_inner()) =
-            LiveLazyCatchUpState::default();
+        *live_lazy_catchup_state()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = LiveLazyCatchUpState::default();
         *live_colossal_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = LiveColossalAndForgeRegistry::default();
@@ -12246,8 +13428,12 @@ mod live_create_tests {
         // Hopper-style pull of the product fires the dirty-event wake —
         // the next poll grants immediately instead of sleeping out the
         // ladder step.
-        let pulled = live_cap_extract_item(DimId::Overworld, depot.0, depot.1, depot.2, None, 1, false);
-        assert_eq!(pulled.map(|s| (s.item_id, s.count)), Some(("create:iron_sheet".to_string(), 1)));
+        let pulled =
+            live_cap_extract_item(DimId::Overworld, depot.0, depot.1, depot.2, None, 1, false);
+        assert_eq!(
+            pulled.map(|s| (s.item_id, s.count)),
+            Some(("create:iron_sheet".to_string(), 1))
+        );
         let next = TICK_IDX.load(Ordering::Relaxed) + 1;
         assert!(
             live_auto_machine_should_tick(depot_pos, next),
@@ -12353,10 +13539,7 @@ mod live_create_tests {
 
         // Growth: a guaranteed random tick advances deterministically to
         // the stage cap; a seeded draw is monotone and bounded.
-        assert_eq!(
-            live_mod_lazy_catchup_growth(2, 7, 1.0, 10, 42),
-            7
-        );
+        assert_eq!(live_mod_lazy_catchup_growth(2, 7, 1.0, 10, 42), 7);
         let seeded = live_mod_lazy_catchup_growth(0, 7, 0.5, 20, 1234);
         assert!(seeded <= 7);
         let seeded_more = live_mod_lazy_catchup_growth(0, 7, 0.5, 40, 1234);
@@ -12458,7 +13641,17 @@ mod live_create_tests {
         // Hopper push: recipe inputs land in the forge buffer; a
         // non-recipe item refuses outright (all-or-nothing).
         assert_eq!(
-            live_cap_insert_item(DimId::Overworld, fx, fy, fz, None, "anyforge:iron", 1, &[], false),
+            live_cap_insert_item(
+                DimId::Overworld,
+                fx,
+                fy,
+                fz,
+                None,
+                "anyforge:iron",
+                1,
+                &[],
+                false
+            ),
             1
         );
         assert_eq!(
@@ -12476,47 +13669,38 @@ mod live_create_tests {
             1
         );
         assert_eq!(
-            live_cap_insert_item(DimId::Overworld, fx, fy, fz, None, "anyforge:junk", 1, &[], false),
+            live_cap_insert_item(
+                DimId::Overworld,
+                fx,
+                fy,
+                fz,
+                None,
+                "anyforge:junk",
+                1,
+                &[],
+                false
+            ),
             0
         );
         // The output buffer is still empty — nothing pulls yet.
-        assert!(
-            live_cap_extract_item(DimId::Overworld, fx, fy, fz, None, 64, false).is_none()
-        );
+        assert!(live_cap_extract_item(DimId::Overworld, fx, fy, fz, None, 64, false).is_none());
 
         // 20 breath ticks * 5.0 = 100 heat >= the 50.0 recipe cost;
         // tick 1 starts the smelt, tick 3 completes it (smelt_ticks=2).
         assert_eq!(
-            live_forge_apply_breath(
-                DimId::Overworld,
-                fx,
-                fy,
-                fz,
-                ElementKind::Fire,
-                20
-            ),
+            live_forge_apply_breath(DimId::Overworld, fx, fy, fz, ElementKind::Fire, 20),
             Some(true)
         );
         // Ice is not in `heat_elements` — refused.
         assert_eq!(
-            live_forge_apply_breath(
-                DimId::Overworld,
-                fx,
-                fy,
-                fz,
-                ElementKind::Ice,
-                20
-            ),
+            live_forge_apply_breath(DimId::Overworld, fx, fy, fz, ElementKind::Ice, 20),
             Some(false)
         );
-        let ev1 = live_forge_tick(DimId::Overworld, fx, fy, fz)
-            .expect("registered forge");
+        let ev1 = live_forge_tick(DimId::Overworld, fx, fy, fz).expect("registered forge");
         assert_eq!(ev1.smelt_started, Some(0));
-        let ev2 = live_forge_tick(DimId::Overworld, fx, fy, fz)
-            .expect("registered forge");
+        let ev2 = live_forge_tick(DimId::Overworld, fx, fy, fz).expect("registered forge");
         assert!(ev2.smelt_completed.is_none());
-        let ev3 = live_forge_tick(DimId::Overworld, fx, fy, fz)
-            .expect("registered forge");
+        let ev3 = live_forge_tick(DimId::Overworld, fx, fy, fz).expect("registered forge");
         assert_eq!(ev3.smelt_completed, Some(0));
 
         // Hopper pull: the smelted product comes out through the same
@@ -12575,37 +13759,31 @@ mod live_create_tests {
         assert_eq!(torso.kind, PartKind::Torso);
         assert!((torso.damage_multiplier - 0.9).abs() < f32::EPSILON);
         // A clean miss and an unknown id both fail closed.
-        assert!(
-            live_colossal_hit_test(
-                "anyforge:wyrm",
-                [0.0, 0.0, 0.0],
-                0.0,
-                0.0,
-                1.0,
-                [9.0, 9.0, 9.0],
-                [1.0, 0.0, 0.0],
-                1.0,
-            )
-            .is_none()
-        );
-        assert!(
-            live_colossal_hit_test(
-                "anyforge:ghost",
-                [0.0, 0.0, 0.0],
-                0.0,
-                0.0,
-                1.0,
-                [0.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0],
-                32.0,
-            )
-            .is_none()
-        );
+        assert!(live_colossal_hit_test(
+            "anyforge:wyrm",
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            [9.0, 9.0, 9.0],
+            [1.0, 0.0, 0.0],
+            1.0,
+        )
+        .is_none());
+        assert!(live_colossal_hit_test(
+            "anyforge:ghost",
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            1.0,
+            [0.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            32.0,
+        )
+        .is_none());
 
         assert!(live_forge_unregister(DimId::Overworld, fx, fy, fz));
-        assert!(
-            live_forge_tick(DimId::Overworld, fx, fy, fz).is_none()
-        );
+        assert!(live_forge_tick(DimId::Overworld, fx, fy, fz).is_none());
     }
 
     /// A registered breath profile evaluates a real cone against live
@@ -12648,23 +13826,25 @@ mod live_create_tests {
         )
         .expect("registered breath");
         assert_eq!(
-            outcome.entity_hits.iter().map(|h| h.entity_id).collect::<Vec<_>>(),
+            outcome
+                .entity_hits
+                .iter()
+                .map(|h| h.entity_id)
+                .collect::<Vec<_>>(),
             vec![11],
             "only the in-cone entity hits, got {:?}",
             outcome.entity_hits
         );
         assert!((outcome.entity_hits[0].damage - 2.0).abs() < f32::EPSILON);
         // Unknown ids fail closed.
-        assert!(
-            live_breath_evaluate(
-                "anyforge:ghost",
-                DimId::Overworld,
-                [0.0, 0.0, 0.0],
-                0.0,
-                0.0,
-                &entities,
-            )
-            .is_none()
-        );
+        assert!(live_breath_evaluate(
+            "anyforge:ghost",
+            DimId::Overworld,
+            [0.0, 0.0, 0.0],
+            0.0,
+            0.0,
+            &entities,
+        )
+        .is_none());
     }
 }
