@@ -11,6 +11,8 @@
 //!   [`version::TargetVersion`] (`1.21.1`/protocol 767 and `26.3`/protocol 777)
 //!   with the [`version::VersionMeta`] constants (data version, pack formats,
 //!   Java major) downstream code keys on instead of scattering literals.
+//! * [`gameplay_facts`] — per-target worldgen epochs, feature flags, and
+//!   vanilla food and furnace fuel defaults.
 //! * [`id`] — [`id::ResourceLocation`], vanilla's `namespace:path` identifier
 //!   with the full character-set validation and fail-closed parsing.
 //! * [`random`] — Java-exact random sources: [`random::LegacyRandom`] (the
@@ -362,6 +364,7 @@ pub mod diff_engine;
 pub mod dst_oracle;
 pub mod dye_and_items;
 pub mod fault_isolation;
+pub mod gameplay_facts;
 pub mod geom;
 pub mod hash;
 pub mod hw_adaptive_engine;
@@ -414,6 +417,10 @@ pub mod xp_curve;
 pub mod zero_change_sim;
 pub mod zip_archive;
 
+pub use gameplay_facts::{
+    worldgen_epoch_id, DimensionBounds, FoodFact, FuelFact, GameplayFactPack, VersionFeature,
+    WorldgenEpochSpec,
+};
 pub use pose_ray::{view_ray, PlayerPoseDimensions, PlayerPoseKind, ReachPolicy, ViewRay};
 pub use slot_coords::{
     HotbarSlot, MenuInventoryLayout, PlayerMenuSlot, PlayerNbtSlot, SlotIndexError,
