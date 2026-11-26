@@ -27,6 +27,7 @@ pub mod live_session;
 pub mod linux_desktop;
 pub mod mesh_pool;
 pub mod mod_sync_auto;
+pub mod mod_translator;
 pub mod panorama_pass;
 pub mod pipeline_cache_store;
 pub mod player_skins;
