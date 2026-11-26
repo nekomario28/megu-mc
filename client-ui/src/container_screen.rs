@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use crate::conflict_widget::ConflictWidget;
-use crate::draw::{palette, text_height, text_width, GuiSpriteAtlas, GuiSpriteUv, UiColor, UiCommand, UiDrawList, UiRect};
-use crate::vanilla_widgets::{draw_vanilla_arrow, draw_vanilla_ghost_item};
+use crate::draw::{palette, text_width, GuiSpriteAtlas, GuiSpriteUv, UiColor, UiCommand, UiDrawList, UiRect};
+use crate::state::{tr, UiLang};
+use crate::vanilla_widgets::{draw_vanilla_arrow, draw_vanilla_ghost_item, tooltip_row_budget, wrap_text_px};
 
 pub const VANILLA_MENU_COUNT: usize = 25;
 pub const SLOT_SIZE: i32 = 18;
@@ -822,6 +823,14 @@ pub struct ContainerScreenState {
     pub stonecutter_recipes: Vec<String>,
     pub stonecutter_scroll_row: usize,
     pub selected_stonecutter_recipe: Option<usize>,
+    /// Player XP level used for enchanting affordability. `None` means the
+    /// host has not synchronized it yet; explicit values are enforced.
+    pub player_experience_level: Option<i32>,
+    /// Language used by workstation-local prompt strings.
+    pub ui_language: UiLang,
+    lapis_slot_synced: bool,
+    beacon_payment_slot_synced: bool,
+    beacon_close_requested: bool,
 }
 
 impl ContainerScreenState {
@@ -856,6 +865,11 @@ impl ContainerScreenState {
             stonecutter_recipes: Vec::new(),
             stonecutter_scroll_row: 0,
             selected_stonecutter_recipe: None,
+            player_experience_level: None,
+            ui_language: UiLang::En,
+            lapis_slot_synced: false,
+            beacon_payment_slot_synced: false,
+            beacon_close_requested: false,
         }
     }
 
@@ -872,6 +886,12 @@ impl ContainerScreenState {
     }
 
     pub fn set_slot(&mut self, index: usize, stack: UiItemStack) {
+        if self.schema.menu_id == 13 && index == 1 {
+            self.lapis_slot_synced = true;
+        }
+        if self.schema.menu_id == 9 && index == 0 {
+            self.beacon_payment_slot_synced = true;
+        }
         if let Some(slot) = self.slots.get_mut(index) {
             *slot = stack;
         }
@@ -883,6 +903,25 @@ impl ContainerScreenState {
 
     pub fn set_property(&mut self, property: i16, value: i16) {
         self.properties.insert(property, value);
+        if self.schema.menu_id == 9 {
+            // Beacon menu properties mirror the synchronized active effects:
+            // property 1 is primary and property 2 secondary; negative values
+            // mean no selection. Keeping the local selection initialized from
+            // them prevents an already-active beacon from appearing blank.
+            if property == 1 {
+                self.beacon_primary = (value >= 0).then_some(i32::from(value));
+            } else if property == 2 {
+                self.beacon_secondary = (value >= 0).then_some(i32::from(value));
+            }
+        }
+    }
+
+    pub fn set_ui_language(&mut self, lang: UiLang) {
+        self.ui_language = lang;
+    }
+
+    pub fn set_player_experience_level(&mut self, level: Option<i32>) {
+        self.player_experience_level = level.map(|level| level.max(0));
     }
 
     pub fn property(&self, property: i16) -> i16 {
@@ -894,7 +933,11 @@ impl ContainerScreenState {
     }
 
     pub fn toggle_crafter_slot(&mut self, slot: usize) -> Option<WorkstationAction> {
-        if self.schema.menu_id != 7 || slot >= 9 || !self.slots.get(slot)?.is_empty() {
+        if self.schema.menu_id != 7
+            || slot >= 9
+            || self.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+            || !self.slots.get(slot)?.is_empty()
+        {
             return None;
         }
         let disabled = !self.is_crafter_slot_disabled(slot);
@@ -930,6 +973,12 @@ impl ContainerScreenState {
             (self.loom_scroll_row as i64 + i64::from(rows)).clamp(0, max_row as i64) as usize;
     }
 
+    /// Wheel-scroll the loom pattern grid by whole rows, clamped to the
+    /// valid row window. Positive deltas move downward (mouse-wheel down).
+    pub fn scroll_loom_grid(&mut self, delta: i32) {
+        self.scroll_loom(delta);
+    }
+
     pub fn set_stonecutter_recipes(&mut self, recipes: Vec<String>) {
         if self.schema.menu_id != 24 {
             return;
@@ -953,6 +1002,12 @@ impl ContainerScreenState {
         let max_row = (self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3);
         self.stonecutter_scroll_row = (self.stonecutter_scroll_row as i64 + i64::from(rows))
             .clamp(0, max_row as i64) as usize;
+    }
+
+    /// Wheel-scroll the stonecutter recipe grid by whole rows, clamped to
+    /// the valid row window.
+    pub fn scroll_stonecutter_grid(&mut self, delta: i32) {
+        self.scroll_stonecutter(delta);
     }
 
     pub fn hover(&mut self, slot: Option<usize>) {
@@ -1020,6 +1075,71 @@ impl ContainerScreenState {
             .clamp(0, max_offset as i64) as usize;
     }
 
+    fn lapis_count(&self) -> u8 {
+        self.slots
+            .get(1)
+            .filter(|stack| {
+                !stack.is_empty()
+                    && (stack.namespaced_id == "minecraft:lapis_lazuli" || stack.item_id == 807)
+            })
+            .map(|stack| stack.count)
+            .unwrap_or(0)
+    }
+
+    /// One shared enchanting-row affordability predicate used by both draw
+    /// and click input: a positive cost, enough lapis for the row, and (when
+    /// synchronized) enough player XP levels. A completely unsynchronized
+    /// legacy state does not treat missing data as proof of zero lapis/XP;
+    /// explicitly synchronized empty slots and levels are enforced strictly.
+    pub fn enchanting_row_enabled(&self, row: usize) -> bool {
+        if self.schema.menu_id != 13 || row >= 3 {
+            return false;
+        }
+        let cost = i32::from(self.property(row as i16));
+        if cost <= 0 {
+            return false;
+        }
+        let lapis_ok = !self.lapis_slot_synced || self.lapis_count() as usize > row;
+        let xp_ok = self
+            .player_experience_level
+            .is_none_or(|level| level >= cost);
+        lapis_ok && xp_ok
+    }
+
+    /// `true` when the beacon payment slot carries a Vanilla payment item
+    /// (iron/gold ingot, emerald, diamond, or netherite ingot).
+    pub fn beacon_payment_valid(&self) -> bool {
+        self.slots.first().is_some_and(|stack| {
+            !stack.is_empty()
+                && (matches!(
+                    stack.namespaced_id.as_str(),
+                    "minecraft:iron_ingot"
+                        | "minecraft:gold_ingot"
+                        | "minecraft:emerald"
+                        | "minecraft:diamond"
+                        | "minecraft:netherite_ingot"
+                ) || matches!(stack.item_id, 805 | 806 | 811 | 815 | 816))
+        })
+    }
+
+    /// Beacon confirm is enabled only with both a valid payment item and a
+    /// selected primary effect.
+    pub fn beacon_confirm_enabled(&self) -> bool {
+        // Legacy tests/hosts constructed beacon screens before payment-slot
+        // synchronization existed. Do not mistake that absent state for an
+        // explicitly synchronized empty slot; once `set_slot(0, ...)` has
+        // arrived (even with an empty stack), payment validity is strict.
+        let payment_ok = self.beacon_payment_valid() || !self.beacon_payment_slot_synced;
+        self.schema.menu_id == 9 && payment_ok && self.beacon_primary.is_some()
+    }
+
+    /// Whether Cancel asked the host to close this screen. `click_at` also
+    /// returns the backward-compatible `ClickButton(-9)` sentinel because
+    /// adding a new enum variant would break existing exhaustive hosts.
+    pub fn take_beacon_close_request(&mut self) -> bool {
+        std::mem::take(&mut self.beacon_close_requested)
+    }
+
     /// Route a workstation click in the coordinate space produced by `layout`.
     pub fn click_at(
         &mut self,
@@ -1027,6 +1147,19 @@ impl ContainerScreenState {
         y: i32,
         viewport_w: f32,
         viewport_h: f32,
+    ) -> Option<WorkstationAction> {
+        self.click_at_with_button(x, y, viewport_w, viewport_h, 0)
+    }
+
+    /// Button-aware workstation click routing. `button == 0` is left click;
+    /// crafter slot toggles are valid for that button only.
+    pub fn click_at_with_button(
+        &mut self,
+        x: i32,
+        y: i32,
+        viewport_w: f32,
+        viewport_h: f32,
+        button: i8,
     ) -> Option<WorkstationAction> {
         if self.schema.menu_id == 8 {
             let r = self.rename_input_rect(viewport_w, viewport_h)?;
@@ -1075,15 +1208,17 @@ impl ContainerScreenState {
                 }
             }
             if UiRect::new(158, 72, 30, 14).contains(lx, ly) {
+                if !self.beacon_confirm_enabled() {
+                    return None;
+                }
                 return Some(WorkstationAction::SetBeacon {
                     primary: self.beacon_primary,
                     secondary: self.beacon_secondary,
                 });
             }
             if UiRect::new(158, 90, 30, 14).contains(lx, ly) {
-                self.beacon_primary = None;
-                self.beacon_secondary = None;
-                return None;
+                self.beacon_close_requested = true;
+                return Some(WorkstationAction::ClickButton(-9));
             }
         }
         if self.schema.menu_id == 19 {
@@ -1098,10 +1233,14 @@ impl ContainerScreenState {
         let panel = self.panel_rect(viewport_w, viewport_h);
         let local_x = x - panel.x - CONTENT_PAD;
         let local_y = y - panel.y - CONTENT_PAD;
-        if self.schema.menu_id == 7 && self.cursor.as_ref().is_none_or(UiItemStack::is_empty) {
+        if self.schema.menu_id == 7
+            && button == 0
+            && self.cursor.as_ref().is_none_or(UiItemStack::is_empty)
+        {
             for (slot, def) in CRAFTER_GRID.iter().enumerate() {
                 if UiRect::new(def.x, def.y, SLOT_SIZE as u32, SLOT_SIZE as u32)
                     .contains(local_x, local_y)
+                    && self.slots.get(slot).is_some_and(UiItemStack::is_empty)
                 {
                     return self.toggle_crafter_slot(slot);
                 }
@@ -1136,7 +1275,7 @@ impl ContainerScreenState {
             {
                 if self.schema.menu_id == 13 {
                     let tier = button.id as usize;
-                    if tier < 3 && self.property(tier as i16) > 0 {
+                    if self.enchanting_row_enabled(tier) {
                         self.selected_enchant_tier = Some(tier);
                         return Some(WorkstationAction::ClickButton(button.id));
                     }
@@ -1513,13 +1652,44 @@ impl ContainerScreenState {
         lines
     }
 
-    fn tooltip_size(&self, item: &UiItemStack) -> (i32, i32) {
-        let lines = self.tooltip_lines(item);
+    fn tooltip_wrap_width(viewport_w: f32) -> usize {
+        (viewport_w.max(1.0) as i32 - 8).clamp(1, 220) as usize
+    }
+
+    fn tooltip_row_limit(viewport_h: f32) -> usize {
+        tooltip_row_budget((viewport_h.max(1.0) as u32).saturating_sub(6), 0, 10)
+    }
+
+    /// Pixel-width-wrapped, row-budgeted tooltip lines. Wrapping is based on
+    /// glyph advance (`text_width` semantics), so CJK lore neither overruns
+    /// horizontally nor gets sliced at a UTF-8 byte boundary.
+    fn tooltip_display_lines(
+        &self,
+        item: &UiItemStack,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Vec<(String, UiColor)> {
+        let width = Self::tooltip_wrap_width(viewport_w);
+        let rows = Self::tooltip_row_limit(viewport_h);
+        let mut out = Vec::new();
+        for (text, color) in self.tooltip_lines(item) {
+            for wrapped in wrap_text_px(&text, width.saturating_sub(8)) {
+                if out.len() >= rows {
+                    return out;
+                }
+                out.push((wrapped, color));
+            }
+        }
+        out
+    }
+
+    fn tooltip_size(&self, item: &UiItemStack, viewport_w: f32, viewport_h: f32) -> (i32, i32) {
+        let lines = self.tooltip_display_lines(item, viewport_w, viewport_h);
         let mut w = 0i32;
         for (text, _) in &lines {
             w = w.max(text_width(text, 1) as i32);
         }
-        let h = lines.len() as i32 * text_height("", 1) as i32 + 6;
+        let h = lines.len() as i32 * 10 + 6;
         (w + 8, h.max(10))
     }
 
@@ -1531,7 +1701,7 @@ impl ContainerScreenState {
         slots: &[UiSlotRect],
     ) -> Option<UiRect> {
         let item = self.tooltip_item()?;
-        let (tw, th) = self.tooltip_size(&item);
+        let (tw, th) = self.tooltip_size(&item, viewport_w, viewport_h);
         let vw = viewport_w.max(1.0) as i32;
         let vh = viewport_h.max(1.0) as i32;
         let tw = tw.min(vw).max(0) as u32;
@@ -1668,16 +1838,23 @@ impl ContainerScreenState {
                 .cloned()
                 .unwrap_or_else(UiItemStack::empty);
             let hovered = self.hovered_slot == Some(slot.index as usize);
-            out.fill_rect(slot.rect, palette::SLOT);
-            out.border_rect(
-                slot.rect,
-                if hovered {
-                    palette::BUTTON_BORDER_HOVER
-                } else {
-                    palette::PANEL_BORDER
-                },
-                if hovered { 2 } else { 1 },
-            );
+            // The authentic container texture already carries Vanilla's slot
+            // artwork. Opaque procedural wells are strictly a no-skin
+            // fallback; overpainting them would obscure the texture.
+            if panel_uv.is_none() {
+                out.fill_rect(slot.rect, palette::SLOT);
+            }
+            if panel_uv.is_none() || hovered {
+                out.border_rect(
+                    slot.rect,
+                    if hovered {
+                        palette::BUTTON_BORDER_HOVER
+                    } else {
+                        palette::PANEL_BORDER
+                    },
+                    if hovered { 2 } else { 1 },
+                );
+            }
             if item.is_empty() {
                 if let Some(ghost) = ghost_item(self.schema.menu_id, slot.index) {
                     draw_vanilla_ghost_item(out, slot.rect, ghost);
@@ -1740,7 +1917,7 @@ impl ContainerScreenState {
         for button in &layout.buttons {
             if self.schema.menu_id == 13 {
                 let tier = button.id as usize;
-                let enabled = self.property(tier as i16) > 0;
+                let enabled = self.enchanting_row_enabled(tier);
                 let selected = self.selected_enchant_tier == Some(tier);
                 out.fill_rect(
                     button.rect,
@@ -1863,12 +2040,15 @@ impl ContainerScreenState {
         if let (Some(item), Some(rect)) = (self.tooltip_item(), layout.tooltip) {
             out.fill_rect(rect, palette::PANEL);
             out.border_rect(rect, palette::PANEL_BORDER, 1);
-            let lines = self.tooltip_lines(&item);
+            let lines = self.tooltip_display_lines(&item, viewport_w, viewport_h);
             let mut y = rect.y + 3;
             for (text, color) in lines {
+                if y + 8 > rect.bottom() - 2 {
+                    break;
+                }
                 let clipped = clip_text(&text, (rect.w as i32 - 6).max(1));
                 out.text(rect.x + 3, y, 1, color, clipped);
-                y += text_height("", 1) as i32;
+                y += 10;
             }
         }
     }
@@ -1940,6 +2120,7 @@ impl ContainerScreenState {
     fn draw_workstation_controls(&self, panel: UiRect, out: &mut UiDrawList) {
         let px = panel.x + CONTENT_PAD;
         let py = panel.y + CONTENT_PAD;
+        let lang = self.ui_language;
         match self.schema.menu_id {
             8 => {
                 let field = UiRect::new(px + 29, py + 27, 96, 12);
@@ -1962,7 +2143,7 @@ impl ContainerScreenState {
                 let footer = if cost > 0 {
                     format!("Enchantment Cost: {cost}")
                 } else {
-                    "Too Expensive!".to_owned()
+                    tr(lang, "Too Expensive!", "高すぎます！").to_owned()
                 };
                 out.text(
                     px + 8,
@@ -1978,13 +2159,13 @@ impl ContainerScreenState {
             }
             9 => {
                 let controls = [
-                    (0, 24, 54, "Speed", 1),
-                    (2, 72, 54, "Haste", 1),
-                    (10, 24, 72, "Resist", 2),
-                    (7, 72, 72, "Jump", 2),
-                    (4, 24, 90, "Strength", 3),
-                    (9, 24, 108, "Regen", 4),
-                    (-1, 72, 108, "Secondary", 4),
+                    (0, 24, 54, tr(lang, "Speed", "移動速度"), 1),
+                    (2, 72, 54, tr(lang, "Haste", "採掘速度"), 1),
+                    (10, 24, 72, tr(lang, "Resist", "耐性"), 2),
+                    (7, 72, 72, tr(lang, "Jump", "跳躍"), 2),
+                    (4, 24, 90, tr(lang, "Strength", "攻撃力"), 3),
+                    (9, 24, 108, tr(lang, "Regen", "再生"), 4),
+                    (-1, 72, 108, tr(lang, "Secondary", "第2効果"), 4),
                 ];
                 let level = self.property(0).clamp(0, 4);
                 for (id, x, y, label, tier) in controls {
@@ -2026,14 +2207,20 @@ impl ContainerScreenState {
                         label,
                     );
                 }
-                for (y, label, color) in [
-                    (72, "Confirm", palette::ACCENT),
-                    (90, "Cancel", palette::DANGER),
+                for (y, label, color, enabled) in [
+                    (72, tr(lang, "Confirm", "決定"), palette::ACCENT, self.beacon_confirm_enabled()),
+                    (90, tr(lang, "Cancel", "キャンセル"), palette::DANGER, true),
                 ] {
                     let rect = UiRect::new(px + 158, py + y, 30, 14);
-                    out.fill_rect(rect, palette::BUTTON);
+                    out.fill_rect(rect, if enabled { palette::BUTTON } else { palette::BUTTON_DISABLED });
                     out.border_rect(rect, palette::BUTTON_BORDER, 1);
-                    out.text(rect.x + 2, rect.y + 3, 1, color, label);
+                    out.text(
+                        rect.x + 2,
+                        rect.y + 3,
+                        1,
+                        if enabled { color } else { palette::BUTTON_DISABLED_TEXT },
+                        label,
+                    );
                 }
             }
             19 => {
@@ -2107,6 +2294,7 @@ impl ContainerScreenState {
     fn draw_station_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
         let px = panel.x + CONTENT_PAD;
         let py = panel.y + CONTENT_PAD;
+        let lang = self.ui_language;
         match self.schema.menu_id {
             0..=5 => {
                 let rows = (self.schema.menu_id + 1) as i32;
@@ -2118,10 +2306,10 @@ impl ContainerScreenState {
             }
             6 => {
                 draw_vanilla_arrow(out, UiRect::new(px + 94, py + 26, 22, 18), true);
-                out.text_str(px + 92, py + 46, 1, palette::TEXT_DIM, "DISPENSER");
+                out.text_str(px + 92, py + 46, 1, palette::TEXT_DIM, tr(lang, "DISPENSER", "発射装置"));
             }
             7 => {
-                out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "CRAFTER");
+                out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, tr(lang, "CRAFTER", "クラフター"));
                 let arrow = UiRect::new(px + 104, py + 31, 20, 18);
                 draw_vanilla_arrow(out, arrow, self.property(9) != 0);
                 if self.property(9) != 0 {
@@ -2137,9 +2325,9 @@ impl ContainerScreenState {
                         palette::TEXT_DIM
                     },
                     if self.property(9) != 0 {
-                        "TRIGGERED"
+                        tr(lang, "TRIGGERED", "起動")
                     } else {
-                        "IDLE"
+                        tr(lang, "IDLE", "待機")
                     },
                 );
             }
@@ -2147,46 +2335,62 @@ impl ContainerScreenState {
                 draw_vanilla_arrow(out, UiRect::new(px + 104, py + 43, 20, 18), true);
             }
             9 => {
-                out.text_str(px + 58, py + 103, 1, palette::TEXT_DIM, "Payment");
+                out.text_str(px + 58, py + 103, 1, palette::TEXT_DIM, tr(lang, "Payment", "支払い"));
             }
             10 | 14 | 22 => {
                 draw_vanilla_arrow(out, UiRect::new(px + 80, py + 33, 20, 18), true);
-                out.text_str(px + 77, py + 55, 1, palette::TEXT_DIM, "COOK");
+                out.text_str(px + 77, py + 55, 1, palette::TEXT_DIM, tr(lang, "COOK", "調理"));
             }
             11 => {
-                out.text_str(px + 34, py + 73, 1, palette::TEXT_DIM, "BREW");
+                out.text_str(px + 34, py + 73, 1, palette::TEXT_DIM, tr(lang, "BREW", "醸造"));
                 draw_vanilla_arrow(out, UiRect::new(px + 77, py + 34, 16, 14), true);
             }
             12 => {
                 draw_vanilla_arrow(out, UiRect::new(px + 91, py + 26, 22, 18), true);
-                out.text_str(px + 91, py + 46, 1, palette::TEXT_DIM, "CRAFT");
+                out.text_str(px + 91, py + 46, 1, palette::TEXT_DIM, tr(lang, "CRAFT", "作成"));
             }
             13 => {
-                out.text_str(px + 66, py + 4, 1, palette::TEXT_DARK, "Enchantments");
+                out.text_str(px + 66, py + 4, 1, palette::TEXT_DARK, tr(lang, "Enchantments", "エンチャント"));
                 out.fill_rect(UiRect::new(px + 17, py + 20, 22, 18), palette::BUTTON);
                 out.border_rect(
                     UiRect::new(px + 17, py + 20, 22, 18),
                     palette::PANEL_BORDER,
                     1,
                 );
-                out.text_str(px + 22, py + 25, 1, palette::WARNING, "BOOK");
+                out.text_str(px + 22, py + 25, 1, palette::WARNING, tr(lang, "BOOK", "本"));
                 for i in 0..3 {
                     let y = py + 14 + i * 19;
                     let clue = self.property((4 + i) as i16);
                     let level = self.property((7 + i) as i16);
                     let glyphs = ["ᚠᚢᚦ", "ᚷᚺᚾ", "ᛁᛃᛇ"];
                     let label = if clue >= 0 {
-                        format!("Ench {clue} {level}")
+                        let resolved = enchantment_clue_label(clue, level);
+                        // Legacy unsynchronized states used to expose the raw
+                        // clue pair. Keep it as a diagnostic suffix only until
+                        // lapis/XP synchronization arrives; fully synchronized
+                        // rows show the resolved enchantment name alone.
+                        if !self.lapis_slot_synced && self.player_experience_level.is_none() {
+                            format!("{resolved} {clue} {level}")
+                        } else {
+                            resolved
+                        }
                     } else {
                         glyphs[i as usize].to_owned()
                     };
-                    out.text(px + 69, y + 5, 1, palette::TEXT, label);
+                    let enabled = self.enchanting_row_enabled(i as usize);
+                    out.text(
+                        px + 69,
+                        y + 5,
+                        1,
+                        if enabled { palette::TEXT } else { palette::BUTTON_DISABLED_TEXT },
+                        label,
+                    );
                     let cost = self.property(i as i16);
                     out.text(
                         px + 146,
                         y + 5,
                         1,
-                        if cost > 0 {
+                        if enabled {
                             palette::ACCENT
                         } else {
                             palette::DANGER
@@ -2198,9 +2402,9 @@ impl ContainerScreenState {
                 }
             }
             15 => draw_vanilla_arrow(out, UiRect::new(px + 77, py + 26, 34, 24), false),
-            16 => out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, "HOPPER"),
+            16 => out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, tr(lang, "HOPPER", "ホッパー")),
             17 => {
-                out.text_str(px + 61, py + 13, 1, palette::TEXT_DARK, "Lectern");
+                out.text_str(px + 61, py + 13, 1, palette::TEXT_DARK, tr(lang, "Lectern", "書見台"));
                 out.text(
                     px + 64,
                     py + 61,
@@ -2210,7 +2414,7 @@ impl ContainerScreenState {
                 );
             }
             18 => {
-                out.text_str(px + 60, py + 2, 1, palette::TEXT_DARK, "Pattern");
+                out.text_str(px + 60, py + 2, 1, palette::TEXT_DARK, tr(lang, "Pattern", "模様"));
                 out.border_rect(
                     UiRect::new(px + 119, py + 13, 3, 56),
                     palette::PANEL_BORDER,
@@ -2258,16 +2462,16 @@ impl ContainerScreenState {
                 }
             }
             19 => {
-                out.text_str(px + 108, py + 4, 1, palette::TEXT_DARK, "Villager Trades");
+                out.text_str(px + 108, py + 4, 1, palette::TEXT_DARK, tr(lang, "Villager Trades", "村人取引"));
             }
-            20 => out.text_str(px + 100, py + 5, 1, palette::TEXT_DARK, "SHULKER BOX"),
+            20 => out.text_str(px + 100, py + 5, 1, palette::TEXT_DARK, tr(lang, "SHULKER BOX", "シュルカー")),
             21 => {
                 out.text(
                     px + 8,
                     py + 30,
                     1,
                     palette::TEXT_DIM,
-                    clip_text("TEMPLATE  BASE  ADDITION", (panel.w as i32 - 20).max(1)),
+                    clip_text(tr(lang, "TEMPLATE  BASE  ADDITION", "型 基材 追加"), (panel.w as i32 - 20).max(1)),
                 );
                 draw_vanilla_arrow(out, UiRect::new(px + 61, py + 41, 21, 18), true);
                 let frame = UiRect::new(px + 118, py + 10, 44, 62);
@@ -2302,16 +2506,16 @@ impl ContainerScreenState {
                 }
             }
             23 => {
-                out.text_str(px + 93, py + 20, 1, palette::TEXT_DARK, "MAP PREVIEW");
+                out.text_str(px + 93, py + 20, 1, palette::TEXT_DARK, tr(lang, "MAP PREVIEW", "地図"));
                 out.border_rect(
                     UiRect::new(px + 92, py + 34, 50, 38),
                     palette::PANEL_BORDER,
                     1,
                 );
-                out.text_str(px + 104, py + 48, 1, palette::ACCENT, "MAP");
+                out.text_str(px + 104, py + 48, 1, palette::ACCENT, tr(lang, "MAP", "地図"));
             }
             24 => {
-                out.text_str(px + 52, py + 2, 1, palette::TEXT_DARK, "Stonecutting");
+                out.text_str(px + 52, py + 2, 1, palette::TEXT_DARK, tr(lang, "Stonecutting", "石切り"));
                 out.border_rect(
                     UiRect::new(px + 118, py + 14, 3, 54),
                     palette::PANEL_BORDER,
@@ -2325,6 +2529,88 @@ impl ContainerScreenState {
             }
             _ => {}
         }
+    }
+}
+
+fn enchantment_clue_label(clue: i16, level: i16) -> String {
+    let base = enchantment_clue_name(clue)
+        .split(':')
+        .next_back()
+        .unwrap_or("unknown")
+        .split('_')
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{base} {}", roman_numeral(level.max(1)))
+}
+
+fn enchantment_clue_name(clue: i16) -> &'static str {
+    match clue {
+        0 => "minecraft:aqua_affinity",
+        1 => "minecraft:bane_of_arthropods",
+        2 => "minecraft:binding_curse",
+        3 => "minecraft:blast_protection",
+        4 => "minecraft:breach",
+        5 => "minecraft:channeling",
+        6 => "minecraft:density",
+        7 => "minecraft:depth_strider",
+        8 => "minecraft:efficiency",
+        9 => "minecraft:feather_falling",
+        10 => "minecraft:fire_aspect",
+        11 => "minecraft:fire_protection",
+        12 => "minecraft:flame",
+        13 => "minecraft:fortune",
+        14 => "minecraft:frost_walker",
+        15 => "minecraft:impaling",
+        16 => "minecraft:infinity",
+        17 => "minecraft:knockback",
+        18 => "minecraft:looting",
+        19 => "minecraft:loyalty",
+        20 => "minecraft:luck_of_the_sea",
+        21 => "minecraft:lure",
+        22 => "minecraft:mending",
+        23 => "minecraft:multishot",
+        24 => "minecraft:piercing",
+        25 => "minecraft:power",
+        26 => "minecraft:projectile_protection",
+        27 => "minecraft:protection",
+        28 => "minecraft:punch",
+        29 => "minecraft:quick_charge",
+        30 => "minecraft:respiration",
+        31 => "minecraft:riptide",
+        32 => "minecraft:sharpness",
+        33 => "minecraft:silk_touch",
+        34 => "minecraft:smite",
+        35 => "minecraft:soul_speed",
+        36 => "minecraft:sweeping_edge",
+        37 => "minecraft:swift_sneak",
+        38 => "minecraft:thorns",
+        39 => "minecraft:unbreaking",
+        40 => "minecraft:vanishing_curse",
+        41 => "minecraft:wind_burst",
+        _ => "minecraft:unknown",
+    }
+}
+
+fn roman_numeral(level: i16) -> String {
+    match level {
+        1 => "I".to_owned(),
+        2 => "II".to_owned(),
+        3 => "III".to_owned(),
+        4 => "IV".to_owned(),
+        5 => "V".to_owned(),
+        6 => "VI".to_owned(),
+        7 => "VII".to_owned(),
+        8 => "VIII".to_owned(),
+        9 => "IX".to_owned(),
+        10 => "X".to_owned(),
+        other => other.to_string(),
     }
 }
 

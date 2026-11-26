@@ -189,11 +189,35 @@ impl ModSyncDiffEntry {
         }
     }
 
-    /// SHA-512 digest display: first 12 hex chars, or `None`.
-    pub fn short_sha512(&self) -> Option<&str> {
+    /// `true` when the declared digest is canonical lowercase/uppercase
+    /// hexadecimal. Validation is deliberately performed at the display-model
+    /// boundary because the field remains host-fillable.
+    pub fn sha512_hex_is_valid(&self) -> bool {
         self.sha512_hex
             .as_deref()
-            .map(|h| &h[..h.len().min(12)])
+            .is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    /// SHA-512 digest display: first 12 *characters*, or `None`. The byte
+    /// boundary is derived from `char_indices`, so CJK or otherwise malformed
+    /// host input can never panic the way byte slicing at `..12` could.
+    pub fn short_sha512(&self) -> Option<&str> {
+        self.sha512_hex.as_deref().map(|h| {
+            let end = h
+                .char_indices()
+                .nth(12)
+                .map(|(index, _)| index)
+                .unwrap_or(h.len());
+            &h[..end]
+        })
+    }
+
+    /// Owned form used by display models that sanitize/validate once and then
+    /// reuse the value. This mirrors `digest.chars().take(12).collect()`.
+    pub fn short_sha512_display(&self) -> Option<String> {
+        self.sha512_hex
+            .as_deref()
+            .map(|digest| digest.chars().take(12).collect::<String>())
     }
 }
 
@@ -983,12 +1007,16 @@ impl ModSyncUiState {
         lay.text_fit_clipped(detail_x, y + 12, 1, palette::TEXT_DIM, &from, text_cells_w, clip);
 
         // SHA-512 verification.
-        let sha_label = match (entry.short_sha512(), entry.sha512_verified) {
-            (Some(short), true) => format!("SHA-512: {}... {}", short, tr(lang, "verified", "確認済み")),
-            (Some(short), false) => {
-                format!("SHA-512: {}... {}", short, tr(lang, "not verified yet", "確認前"))
+        let sha_label = if entry.sha512_hex.is_some() && !entry.sha512_hex_is_valid() {
+            format!("SHA-512: {}", tr(lang, "invalid fingerprint", "不正なハッシュ"))
+        } else {
+            match (entry.short_sha512(), entry.sha512_verified) {
+                (Some(short), true) => format!("SHA-512: {}... {}", short, tr(lang, "verified", "確認済み")),
+                (Some(short), false) => {
+                    format!("SHA-512: {}... {}", short, tr(lang, "not verified yet", "確認前"))
+                }
+                (None, _) => format!("SHA-512: {}", tr(lang, "no fingerprint", "ハッシュなし")),
             }
-            (None, _) => format!("SHA-512: {}", tr(lang, "no fingerprint", "ハッシュなし")),
         };
         let sha_color = if entry.sha512_verified {
             palette::ACCENT

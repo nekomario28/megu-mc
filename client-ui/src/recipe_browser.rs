@@ -3257,6 +3257,10 @@ impl RecipeBrowserState {
     fn grid_cols(&self, w: u32, h: u32) -> usize {
         let s = self.effective_scale(h) as i32;
         let lw = (w.min(i32::MAX as u32) as i32) / s;
+        let lh = (h.min(i32::MAX as u32) as i32) / s;
+        if lw < 220 || lh < 150 {
+            return 1;
+        }
         let main_x = MARGIN + 4 + BOOKMARK_W + PANE_GAP;
         let main_w = lw - MARGIN - 4 - main_x;
         ((main_w - 8) / SLOT_PITCH).max(1) as usize
@@ -3339,7 +3343,7 @@ impl RecipeBrowserState {
         let mut lay = Lay::new(self, width, height);
         let mut hits = Vec::new();
         if lay.w < 220 || lay.h < 150 {
-            lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
+            self.render_compact(&mut lay, &mut hits);
             return (lay.finish(), hits);
         }
         lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
@@ -3758,6 +3762,182 @@ impl RecipeBrowserState {
             false,
             s,
         );
+    }
+
+    /// Compact single-column layout for narrow frames. The regular desktop
+    /// layout needs the bookmarks sidebar plus a detail grid and therefore
+    /// starts at 220 logical px; below that this fallback keeps the search,
+    /// tabs, visible items/detail, scrolling and keyboard selection fully
+    /// interactive down to 160 logical px (and still paints a bounded frame
+    /// below that rather than the old blank screen).
+    fn render_compact(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
+        let lang = self.lang;
+        lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
+        // Below the supported compact floor there is no honest room for even
+        // one row plus its controls. Keep a bounded nonblank backdrop rather
+        // than emitting clipped controls that would overlap the frame edge.
+        if lay.w < 160 || lay.h < 100 {
+            return;
+        }
+        lay.fill(1, 1, lay.w - 2, lay.h - 2, palette::PANEL);
+        lay.border(1, 1, lay.w - 2, lay.h - 2, palette::PANEL_BORDER);
+        lay.text_fit(
+            4,
+            4,
+            1,
+            palette::TEXT,
+            tr(lang, "Recipes", "レシピ"),
+            ((lay.w - 8 - 56) / 8).max(1) as usize,
+        );
+
+        // Search is the primary narrow-screen affordance. Keep the clear
+        // button adjacent and use the same widget ids as the wide layout.
+        let clear_w = 14;
+        // Keep the host shell's 52 logical px Done button corner clear.
+        let field_w = (lay.w - 8 - clear_w - 2 - 56).max(20);
+        let field = UiRect::new(4, 14, field_w as u32, 13);
+        lay.fill_rect(
+            field,
+            if self.search_focused { palette::SLOT } else { palette::BUTTON_DISABLED },
+        );
+        lay.border_rect(
+            field,
+            if self.search_focused { palette::ACCENT } else { palette::BUTTON_BORDER },
+        );
+        let cells = ((field.w as i32 - 8) / 8).max(1) as usize;
+        if self.search.is_empty() && !self.search_focused {
+            lay.text_fit(field.x + 4, field.y + 3, 1, palette::TEXT_DIM, tr(lang, "Search...", "検索..."), cells);
+        } else {
+            let mut shown = self.search.clone();
+            if self.search_focused {
+                shown.push('_');
+            }
+            lay.text_fit(field.x + 4, field.y + 3, 1, palette::TEXT, &shown, cells);
+        }
+        lay.region(hits, RecipeWidgetId::SearchField, field);
+        let clear = UiRect::new(field.right() + 2, 14, clear_w as u32, 13);
+        lay.fill_rect(
+            clear,
+            if self.search.is_empty() { palette::BUTTON_DISABLED } else { palette::BUTTON },
+        );
+        lay.ctext_in(clear, 1, palette::TEXT, "x");
+        if !self.search.is_empty() {
+            lay.region(hits, RecipeWidgetId::SearchClear, clear);
+        }
+
+        // Abbreviated one-row tab strip: the full localized labels cannot fit
+        // honestly at 160px, while these stable targets retain every mode.
+        let tabs = [
+            (BrowserTab::Items, RecipeWidgetId::TabItems, tr(lang, "I", "品")),
+            (BrowserTab::Tree, RecipeWidgetId::TabTree, tr(lang, "T", "ツ")),
+            (BrowserTab::WorldDropsInfo, RecipeWidgetId::TabWorldDropsInfo, tr(lang, "D", "ド")),
+            (BrowserTab::MachineTutorials, RecipeWidgetId::TabMachineTutorials, tr(lang, "M", "機")),
+        ];
+        let tab_w = ((lay.w - 8 - 3 * 2) / 4).clamp(12, 32);
+        for (i, (tab, id, label)) in tabs.iter().enumerate() {
+            let rect = UiRect::new(4 + i as i32 * (tab_w + 2), 30, tab_w as u32, 12);
+            let active = self.tab == *tab;
+            lay.fill_rect(rect, if active { palette::ACCENT } else { palette::BUTTON });
+            lay.border_rect(rect, palette::BUTTON_BORDER);
+            lay.ctext_in(rect, 1, if active { palette::TEXT_DARK } else { palette::TEXT }, label);
+            lay.region(hits, *id, rect);
+        }
+
+        let footer_h = 12;
+        let main = UiRect::new(
+            2,
+            45,
+            (lay.w - 4).max(1) as u32,
+            (lay.h - 45 - footer_h - 2).max(1) as u32,
+        );
+        match self.tab {
+            BrowserTab::Items if self.detail.is_some() => self.render_detail(lay, hits, main),
+            BrowserTab::Items => self.render_compact_items(lay, hits, main),
+            BrowserTab::Tree => self.render_tree(lay, hits, main),
+            BrowserTab::WorldDropsInfo => self.render_world_drops_info(lay, hits, main),
+            BrowserTab::MachineTutorials => self.render_machine_tutorial(lay, hits, main),
+        }
+
+        let y = lay.h - footer_h - 1;
+        let selected = self.selected_item().unwrap_or_else(|| tr(lang, "none", "なし").to_owned());
+        lay.text_fit(
+            5,
+            y + 2,
+            1,
+            palette::TEXT_DIM,
+            &format!("{}: {}", tr(lang, "Sel", "選択"), selected),
+            ((lay.w - 10) / 8).max(1) as usize,
+        );
+    }
+
+    /// Single-column item browser used by [`render_compact`](Self::render_compact).
+    /// Rows expose the same `ItemSlot(visible_index)` hit ids as the wide
+    /// grid, so keyboard/mouse activation does not fork semantically.
+    fn render_compact_items(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
+        lay.fill_rect(main, DETAIL_BG);
+        lay.border_rect(main, palette::PANEL_BORDER);
+        let visible = self.visible_items();
+        if visible.is_empty() {
+            lay.text_fit(
+                main.x + 5,
+                main.y + 6,
+                1,
+                palette::TEXT_DIM,
+                if self.index.items.is_empty() {
+                    tr(self.lang, "No items indexed", "アイテムなし")
+                } else {
+                    tr(self.lang, "No matches", "一致なし")
+                },
+                ((main.w as i32 - 10) / 8).max(1) as usize,
+            );
+            return;
+        }
+        let row_h = 15;
+        let rows = ((main.h as i32 - 6) / row_h).max(1) as usize;
+        let scroll = self.grid_scroll.min(visible.len().saturating_sub(rows));
+        let scrollable = visible.len() > rows;
+        let row_w = main.w.saturating_sub(if scrollable { 16 } else { 4 });
+        for (vi, &item_index) in visible.iter().enumerate().skip(scroll).take(rows) {
+            let slot_row = vi - scroll;
+            let item = &self.index.items[item_index];
+            let rect = UiRect::new(main.x + 2, main.y + 3 + slot_row as i32 * row_h, row_w, 14);
+            let selected = vi == self.selected;
+            let hovered = self.hover == Some(RecipeWidgetId::ItemSlot(vi));
+            lay.fill_rect(
+                rect,
+                if selected {
+                    palette::BUTTON
+                } else if hovered {
+                    palette::BUTTON_HOVER
+                } else {
+                    palette::SLOT
+                },
+            );
+            if selected {
+                lay.border_rect(rect, palette::ACCENT);
+            }
+            lay.icon(UiRect::new(rect.x + 1, rect.y + 1, 12, 12), &item.id);
+            let name = self.index.display_name_for_locale(&item.id, &self.active_locale);
+            lay.text_fit(
+                rect.x + 16,
+                rect.y + 3,
+                1,
+                palette::TEXT,
+                &name,
+                ((rect.w as i32 - 20) / 8).max(1) as usize,
+            );
+            lay.region(hits, RecipeWidgetId::ItemSlot(vi), rect);
+        }
+        if scrollable {
+            let up = UiRect::new(main.right() - 11, main.y + 2, 9, 11);
+            let down = UiRect::new(main.right() - 11, main.bottom() - 13, 9, 11);
+            lay.fill_rect(up, palette::BUTTON);
+            lay.fill_rect(down, palette::BUTTON);
+            lay.ctext_in(up, 1, palette::TEXT, "^");
+            lay.ctext_in(down, 1, palette::TEXT, "v");
+            lay.region(hits, RecipeWidgetId::GridScrollUp, up);
+            lay.region(hits, RecipeWidgetId::GridScrollDown, down);
+        }
     }
 
     fn render_header(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
