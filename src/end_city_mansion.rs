@@ -198,6 +198,27 @@ pub(crate) struct TemplatePiece {
 }
 
 impl TemplatePiece {
+    fn load(
+        templates: &Templates,
+        reg: &BReg,
+        template: String,
+        pos: Pos,
+        rotation: Rotation,
+        mirror: Mirror,
+        ignore_air: bool,
+    ) -> Result<Self, &'static str> {
+        let loaded = templates.get(&template, reg)?;
+        Ok(Self {
+            template,
+            pos,
+            bb: template_bb(&loaded, pos, mirror, rotation, (0, 0, 0)),
+            rotation,
+            mirror,
+            ignore_air,
+            gen_depth: 0,
+        })
+    }
+
     /// `StructurePlaceSettings` for this piece: `setIgnoreEntities(true)`,
     /// the rotation/mirror, and the one `BlockIgnoreProcessor`.
     pub(crate) fn settings(&self) -> Settings {
@@ -213,6 +234,10 @@ impl TemplatePiece {
         }
         settings
     }
+}
+
+fn rotated_offset(pos: Pos, rotation: Rotation, offset: Pos) -> Pos {
+    add_pos(pos, rotate_pos(offset, rotation))
 }
 
 /// `(minX, minZ)` of a chunk, native `ChunkPos.getMinBlockX/Z`.
@@ -267,9 +292,8 @@ pub(crate) type EndCityMansionPieceBuilder =
 // ---------------------------------------------------------------- end city
 
 /// `EndCityPieces.SectionGenerator` — the four section shapes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EndCitySection {
-    HouseTower,
+enum EndCitySection {
+    HouseTower(Pos),
     Tower,
     TowerBridge,
     FatTower,
@@ -304,50 +328,15 @@ fn end_city_piece(
     rotation: Rotation,
     overwrite: bool,
 ) -> Result<TemplatePiece, &'static str> {
-    let template_id = format!("minecraft:end_city/{name}");
-    let template = templates.get(&template_id, reg)?;
-    let bb = template_bb(&template, pos, Mirror::None, rotation, (0, 0, 0));
-    Ok(TemplatePiece {
-        template: template_id,
+    TemplatePiece::load(
+        templates,
+        reg,
+        format!("minecraft:end_city/{name}"),
         pos,
-        bb,
         rotation,
-        mirror: Mirror::None,
-        // `overwrite` selects `BlockIgnoreProcessor.STRUCTURE_BLOCK`; otherwise
-        // `STRUCTURE_AND_AIR` also drops air cells.
-        ignore_air: !overwrite,
-        gen_depth: 0,
-    })
-}
-
-/// `EndCityPieces.addPiece`: the child is placed at
-/// `parent.templatePosition + transform(offset, parentSettings)
-///  - transform(ZERO, childSettings)`.
-///
-/// Both settings are mirror-NONE with the same rotation and a `ZERO` rotation
-/// pivot, so `transform(ZERO, child)` is `(0, 0, 0)` and the delta is the
-/// rotated offset.
-fn end_city_add_piece(
-    templates: &Templates,
-    reg: &BReg,
-    parent: &TemplatePiece,
-    offset: Pos,
-    name: &str,
-    rotation: Rotation,
-    overwrite: bool,
-) -> Result<TemplatePiece, &'static str> {
-    let delta = zero_pos(offset, parent.mirror, parent.rotation, (0, 0, 0));
-    let pos = (
-        parent.pos.0.wrapping_add(delta.0),
-        parent.pos.1.wrapping_add(delta.1),
-        parent.pos.2.wrapping_add(delta.2),
-    );
-    end_city_piece(templates, reg, name, pos, rotation, overwrite)
-}
-
-fn add_helper(list: &mut Vec<TemplatePiece>, piece: TemplatePiece) -> TemplatePiece {
-    list.push(piece.clone());
-    piece
+        Mirror::None,
+        !overwrite, // `STRUCTURE_AND_AIR` also drops air cells.
+    )
 }
 
 /// `BoundingBox.intersects`.
@@ -367,529 +356,236 @@ fn find_collision_piece<'a>(list: &'a [TemplatePiece], bb: &BB) -> Option<&'a Te
     list.iter().find(|piece| bb_overlaps(&piece.bb, bb))
 }
 
-/// `EndCityPieces.recursiveChildren`: generate into a scratch list, stamp every
-/// candidate with one `nextInt()` depth, and accept the batch only when no
-/// candidate collides with an accepted piece of a different depth.
-#[allow(clippy::too_many_arguments)]
-fn end_city_recursive_children(
-    templates: &Templates,
-    reg: &BReg,
-    section: EndCitySection,
-    depth: i32,
-    piece: &TemplatePiece,
-    pos: Option<Pos>,
-    list: &mut Vec<TemplatePiece>,
-    rng: &mut Lcg,
-    ship_created: &mut bool,
-) -> bool {
-    if depth > END_CITY_MAX_GEN_DEPTH {
-        return false;
-    }
-    let mut scratch: Vec<TemplatePiece> = Vec::new();
-    if !end_city_generate(
-        templates,
-        reg,
-        section,
-        depth,
-        piece,
-        pos,
-        &mut scratch,
-        rng,
-        ship_created,
-    ) {
-        return false;
-    }
-    let stamp = rng.next_i32();
-    let mut blocked = false;
-    for candidate in &mut scratch {
-        candidate.gen_depth = stamp;
-        if let Some(existing) = find_collision_piece(list, &candidate.bb) {
-            if existing.gen_depth != piece.gen_depth {
-                blocked = true;
-                break;
-            }
-        }
-    }
-    if blocked {
-        return false;
-    }
-    list.append(&mut scratch);
-    true
+struct EndCityGenerator<'a> {
+    templates: &'a Templates,
+    reg: &'a BReg,
+    rng: &'a mut Lcg,
+    ship_created: bool,
 }
 
-/// `SectionGenerator.generate` for one section shape.
-#[allow(clippy::too_many_arguments)]
-fn end_city_generate(
-    templates: &Templates,
-    reg: &BReg,
-    section: EndCitySection,
-    depth: i32,
-    piece: &TemplatePiece,
-    pos: Option<Pos>,
-    list: &mut Vec<TemplatePiece>,
-    rng: &mut Lcg,
-    ship_created: &mut bool,
-) -> bool {
-    let rotation = piece.settings().rotation;
-    match section {
-        EndCitySection::HouseTower => {
-            if depth > END_CITY_MAX_GEN_DEPTH {
-                return false;
-            }
-            // `HOUSE_TOWER_GENERATOR` is the one section that consumes the
-            // `pos` argument: it is the offset its caller wants the base floor
-            // anchored at (the tower-bridge recursion passes `(-3, j + 1, -11)`).
-            let base_offset = pos.unwrap_or((0, 0, 0));
-            let mut current = add_helper(
-                list,
-                match end_city_add_piece(
-                    templates,
-                    reg,
-                    piece,
-                    base_offset,
-                    "base_floor",
-                    rotation,
-                    true,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                },
-            );
-            let choice = rng.next_bound(3);
-            if choice == 0 {
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 4, -1),
-                    "base_roof",
-                    rotation,
-                    true,
-                ) else {
-                    return false;
-                };
-                add_helper(list, next);
-            } else if choice == 1 {
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 0, -1),
-                    "second_floor_2",
-                    rotation,
-                    false,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 8, -1),
-                    "second_roof",
-                    rotation,
-                    false,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                end_city_recursive_children(
-                    templates,
-                    reg,
-                    EndCitySection::Tower,
-                    depth + 1,
-                    &current,
-                    None,
-                    list,
-                    rng,
-                    ship_created,
-                );
-            } else if choice == 2 {
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 0, -1),
-                    "second_floor_2",
-                    rotation,
-                    false,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 4, -1),
-                    "third_floor_2",
-                    rotation,
-                    false,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-1, 8, -1),
-                    "third_roof",
-                    rotation,
-                    true,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                end_city_recursive_children(
-                    templates,
-                    reg,
-                    EndCitySection::Tower,
-                    depth + 1,
-                    &current,
-                    None,
-                    list,
-                    rng,
-                    ship_created,
-                );
-            }
-            true
+impl EndCityGenerator<'_> {
+    fn attach(
+        &self,
+        list: &mut Vec<TemplatePiece>,
+        parent: &TemplatePiece,
+        offset: Pos,
+        name: &str,
+        overwrite: bool,
+    ) -> Result<TemplatePiece, &'static str> {
+        self.attach_rotated(list, parent, offset, name, Rotation::None, overwrite)
+    }
+
+    /// `EndCityPieces.addPiece`: the child origin is the parent origin plus
+    /// the offset in the parent's frame, even when the child turns.
+    fn attach_rotated(
+        &self,
+        list: &mut Vec<TemplatePiece>,
+        parent: &TemplatePiece,
+        offset: Pos,
+        name: &str,
+        turn: Rotation,
+        overwrite: bool,
+    ) -> Result<TemplatePiece, &'static str> {
+        let delta = zero_pos(offset, parent.mirror, parent.rotation, (0, 0, 0));
+        let pos = add_pos(parent.pos, delta);
+        let rotation = rotate_rotation(parent.rotation, turn);
+        let piece = end_city_piece(self.templates, self.reg, name, pos, rotation, overwrite)?;
+        list.push(piece.clone());
+        Ok(piece)
+    }
+
+    /// Generate into a scratch list, give the batch one `nextInt()` depth,
+    /// and reject it if it collides with an accepted piece of another depth.
+    /// The RNG and ship flag are not rolled back on rejection.
+    fn recursive_children(
+        &mut self,
+        section: EndCitySection,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+    ) -> bool {
+        if depth > END_CITY_MAX_GEN_DEPTH {
+            return false;
         }
-        EndCitySection::Tower => {
-            // `TOWER_GENERATOR.generate` ignores `pos` (it is always null).
-            let _ = pos;
-            let mut current = add_helper(
-                list,
-                match end_city_add_piece(
-                    templates,
-                    reg,
-                    piece,
-                    (3 + rng.next_bound(2), -3, 3 + rng.next_bound(2)),
-                    "tower_base",
-                    rotation,
-                    true,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                },
-            );
-            let Ok(next) = end_city_add_piece(
-                templates,
-                reg,
-                &current,
-                (0, 7, 0),
-                "tower_piece",
-                rotation,
-                true,
-            ) else {
+        let mut scratch = Vec::new();
+        let result = match section {
+            EndCitySection::HouseTower(offset) => {
+                self.house_tower(depth, parent, offset, &mut scratch)
+            }
+            EndCitySection::Tower => self.tower(depth, parent, &mut scratch),
+            EndCitySection::TowerBridge => self.tower_bridge(depth, parent, &mut scratch),
+            EndCitySection::FatTower => self.fat_tower(depth, parent, &mut scratch),
+        };
+        if result.is_err() {
+            return false;
+        }
+        let stamp = self.rng.next_i32();
+        for candidate in &mut scratch {
+            candidate.gen_depth = stamp;
+            if find_collision_piece(list, &candidate.bb)
+                .is_some_and(|existing| existing.gen_depth != parent.gen_depth)
+            {
                 return false;
-            };
-            current = add_helper(list, next);
-            let mut bridge_piece = if rng.next_bound(3) == 0 {
-                Some(current.clone())
+            }
+        }
+        list.append(&mut scratch);
+        true
+    }
+
+    fn house_tower(
+        &mut self,
+        depth: i32,
+        parent: &TemplatePiece,
+        offset: Pos,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        let mut current = self.attach(list, parent, offset, "base_floor", true)?;
+        let choice = self.rng.next_bound(3);
+        if choice == 0 {
+            self.attach(list, &current, (-1, 4, -1), "base_roof", true)?;
+            return Ok(());
+        }
+        current = self.attach(list, &current, (-1, 0, -1), "second_floor_2", false)?;
+        let (roof, overwrite) = if choice == 1 {
+            ("second_roof", false)
+        } else {
+            current = self.attach(list, &current, (-1, 4, -1), "third_floor_2", false)?;
+            ("third_roof", true)
+        };
+        let roof = self.attach(list, &current, (-1, 8, -1), roof, overwrite)?;
+        self.recursive_children(EndCitySection::Tower, depth + 1, &roof, list);
+        Ok(())
+    }
+
+    fn tower(
+        &mut self,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        let offset = (3 + self.rng.next_bound(2), -3, 3 + self.rng.next_bound(2));
+        let base = self.attach(list, parent, offset, "tower_base", true)?;
+        let mut current = self.attach(list, &base, (0, 7, 0), "tower_piece", true)?;
+        let mut bridge = (self.rng.next_bound(3) == 0).then(|| current.clone());
+        let count = 1 + self.rng.next_bound(3);
+        for i in 0..count {
+            current = self.attach(list, &current, (0, 4, 0), "tower_piece", true)?;
+            if i < count - 1 && self.rng.next_bool() {
+                bridge = Some(current.clone());
+            }
+        }
+        if let Some(bridge) = bridge {
+            self.tower_bridges(depth, &bridge, list, &END_CITY_TOWER_BRIDGES)?;
+        } else if depth != 7 {
+            return self.require_child(EndCitySection::FatTower, depth + 1, &current, list);
+        }
+        self.attach(list, &current, (-1, 4, -1), "tower_top", true)?;
+        Ok(())
+    }
+
+    fn tower_bridges(
+        &mut self,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+        bridges: &[(Rotation, Pos)],
+    ) -> Result<(), &'static str> {
+        for &(turn, offset) in bridges {
+            if self.rng.next_bool() {
+                let end = self.attach_rotated(list, parent, offset, "bridge_end", turn, true)?;
+                self.recursive_children(EndCitySection::TowerBridge, depth + 1, &end, list);
+            }
+        }
+        Ok(())
+    }
+
+    fn tower_bridge(
+        &mut self,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        let length = self.rng.next_bound(4) + 1;
+        let mut current = self.attach(list, parent, (0, 0, -4), "bridge_piece", true)?;
+        current.gen_depth = -1;
+        let mut rise = 0;
+        for _ in 0..length {
+            let (name, run, next_rise) = if self.rng.next_bool() {
+                ("bridge_piece", -4, 0)
+            } else if self.rng.next_bool() {
+                ("bridge_steep_stairs", -4, 4)
             } else {
-                None
+                ("bridge_gentle_stairs", -8, 4)
             };
-            let count = 1 + rng.next_bound(3);
-            for i in 0..count {
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (0, 4, 0),
-                    "tower_piece",
-                    rotation,
-                    true,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                if i < count - 1 && rng.next_bool() {
-                    bridge_piece = Some(current.clone());
-                }
-            }
-            match bridge_piece {
-                Some(bridge) => {
-                    for (bridge_rotation, offset) in END_CITY_TOWER_BRIDGES {
-                        if rng.next_bool() {
-                            let Ok(end) = end_city_add_piece(
-                                templates,
-                                reg,
-                                &bridge,
-                                offset,
-                                "bridge_end",
-                                rotate_rotation(rotation, bridge_rotation),
-                                true,
-                            ) else {
-                                return false;
-                            };
-                            let end = add_helper(list, end);
-                            end_city_recursive_children(
-                                templates,
-                                reg,
-                                EndCitySection::TowerBridge,
-                                depth + 1,
-                                &end,
-                                None,
-                                list,
-                                rng,
-                                ship_created,
-                            );
-                        }
-                    }
-                    let top = add_helper(
-                        list,
-                        match end_city_add_piece(
-                            templates,
-                            reg,
-                            &current,
-                            (-1, 4, -1),
-                            "tower_top",
-                            rotation,
-                            true,
-                        ) {
-                            Ok(p) => p,
-                            Err(_) => return false,
-                        },
-                    );
-                    let _ = top;
-                }
-                None => {
-                    if depth == 7 {
-                        add_helper(
-                            list,
-                            match end_city_add_piece(
-                                templates,
-                                reg,
-                                &current,
-                                (-1, 4, -1),
-                                "tower_top",
-                                rotation,
-                                true,
-                            ) {
-                                Ok(p) => p,
-                                Err(_) => return false,
-                            },
-                        );
-                    } else {
-                        return end_city_recursive_children(
-                            templates,
-                            reg,
-                            EndCitySection::FatTower,
-                            depth + 1,
-                            &current,
-                            None,
-                            list,
-                            rng,
-                            ship_created,
-                        );
-                    }
-                }
-            }
-            true
+            current = self.attach(list, &current, (0, rise, run), name, true)?;
+            rise = next_rise;
         }
-        EndCitySection::TowerBridge => {
-            let _ = pos;
-            let length = rng.next_bound(4) + 1;
-            let mut current = add_helper(
-                list,
-                match end_city_add_piece(
-                    templates,
-                    reg,
-                    piece,
-                    (0, 0, -4),
-                    "bridge_piece",
-                    rotation,
-                    true,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                },
-            );
-            current.gen_depth = -1;
-            let mut offset = 0;
-            for _ in 0..length {
-                if rng.next_bool() {
-                    let Ok(next) = end_city_add_piece(
-                        templates,
-                        reg,
-                        &current,
-                        (0, offset, -4),
-                        "bridge_piece",
-                        rotation,
-                        true,
-                    ) else {
-                        return false;
-                    };
-                    current = add_helper(list, next);
-                    offset = 0;
-                } else if rng.next_bool() {
-                    let Ok(next) = end_city_add_piece(
-                        templates,
-                        reg,
-                        &current,
-                        (0, offset, -4),
-                        "bridge_steep_stairs",
-                        rotation,
-                        true,
-                    ) else {
-                        return false;
-                    };
-                    current = add_helper(list, next);
-                    offset = 4;
-                } else {
-                    let Ok(next) = end_city_add_piece(
-                        templates,
-                        reg,
-                        &current,
-                        (0, offset, -8),
-                        "bridge_gentle_stairs",
-                        rotation,
-                        true,
-                    ) else {
-                        return false;
-                    };
-                    current = add_helper(list, next);
-                    offset = 4;
-                }
-            }
-            if !*ship_created && rng.next_bound(10 - depth) == 0 {
-                let dup = rng.next_bound(8);
-                let dz = rng.next_bound(10);
-                let Ok(ship) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (-8 + dup, offset, -70 + dz),
-                    "ship",
-                    rotation,
-                    true,
-                ) else {
-                    return false;
-                };
-                list.push(ship);
-                *ship_created = true;
-            } else if !end_city_recursive_children(
-                templates,
-                reg,
-                EndCitySection::HouseTower,
-                depth + 1,
-                &current,
-                Some((-3, offset + 1, -11)),
-                list,
-                rng,
-                ship_created,
-            ) {
-                return false;
-            }
-            let Ok(end) = end_city_add_piece(
-                templates,
-                reg,
-                &current,
-                (4, offset, 0),
-                "bridge_end",
-                rotate_rotation(rotation, Rotation::Clockwise180),
-                true,
-            ) else {
-                return false;
-            };
-            let end = add_helper(list, end);
-            let _ = end;
-            // `setGenDepth(-1)` on the returned end piece; it is already in the
-            // list, so update the stored copy too.
-            if let Some(last) = list.last_mut() {
-                last.gen_depth = -1;
-            }
-            true
+        if !self.ship_created && self.rng.next_bound(10 - depth) == 0 {
+            self.add_ship(&current, rise, list)?;
+        } else {
+            let landing = EndCitySection::HouseTower((-3, rise + 1, -11));
+            self.require_child(landing, depth + 1, &current, list)?;
         }
-        EndCitySection::FatTower => {
-            let _ = pos;
-            let mut current = add_helper(
-                list,
-                match end_city_add_piece(
-                    templates,
-                    reg,
-                    piece,
-                    (-3, 4, -3),
-                    "fat_tower_base",
-                    rotation,
-                    true,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => return false,
-                },
-            );
-            let Ok(next) = end_city_add_piece(
-                templates,
-                reg,
-                &current,
-                (0, 4, 0),
-                "fat_tower_middle",
-                rotation,
-                true,
-            ) else {
-                return false;
-            };
-            current = add_helper(list, next);
-            for _ in 0..2 {
-                if rng.next_bound(3) == 0 {
-                    break;
-                }
-                let Ok(next) = end_city_add_piece(
-                    templates,
-                    reg,
-                    &current,
-                    (0, 8, 0),
-                    "fat_tower_middle",
-                    rotation,
-                    true,
-                ) else {
-                    return false;
-                };
-                current = add_helper(list, next);
-                for (bridge_rotation, offset) in END_CITY_FAT_TOWER_BRIDGES {
-                    if rng.next_bool() {
-                        let Ok(end) = end_city_add_piece(
-                            templates,
-                            reg,
-                            &current,
-                            offset,
-                            "bridge_end",
-                            rotate_rotation(rotation, bridge_rotation),
-                            true,
-                        ) else {
-                            return false;
-                        };
-                        let end = add_helper(list, end);
-                        end_city_recursive_children(
-                            templates,
-                            reg,
-                            EndCitySection::TowerBridge,
-                            depth + 1,
-                            &end,
-                            None,
-                            list,
-                            rng,
-                            ship_created,
-                        );
-                    }
-                }
-            }
-            let Ok(top) = end_city_add_piece(
-                templates,
-                reg,
-                &current,
-                (-2, 8, -2),
-                "fat_tower_top",
-                rotation,
-                true,
-            ) else {
-                return false;
-            };
-            add_helper(list, top);
-            true
+        self.attach_rotated(
+            list,
+            &current,
+            (4, rise, 0),
+            "bridge_end",
+            Rotation::Clockwise180,
+            true,
+        )?;
+        // The end piece is already stored; update the stored copy.
+        if let Some(end) = list.last_mut() {
+            end.gen_depth = -1;
         }
+        Ok(())
+    }
+
+    fn add_ship(
+        &mut self,
+        parent: &TemplatePiece,
+        rise: i32,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        let offset = (
+            -8 + self.rng.next_bound(8),
+            rise,
+            -70 + self.rng.next_bound(10),
+        );
+        self.attach(list, parent, offset, "ship", true)?;
+        self.ship_created = true;
+        Ok(())
+    }
+
+    fn fat_tower(
+        &mut self,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        let base = self.attach(list, parent, (-3, 4, -3), "fat_tower_base", true)?;
+        let mut current = self.attach(list, &base, (0, 4, 0), "fat_tower_middle", true)?;
+        for _ in 0..2 {
+            if self.rng.next_bound(3) == 0 {
+                break;
+            }
+            current = self.attach(list, &current, (0, 8, 0), "fat_tower_middle", true)?;
+            self.tower_bridges(depth, &current, list, &END_CITY_FAT_TOWER_BRIDGES)?;
+        }
+        self.attach(list, &current, (-2, 8, -2), "fat_tower_top", true)?;
+        Ok(())
+    }
+
+    fn require_child(
+        &mut self,
+        section: EndCitySection,
+        depth: i32,
+        parent: &TemplatePiece,
+        list: &mut Vec<TemplatePiece>,
+    ) -> Result<(), &'static str> {
+        self.recursive_children(section, depth, parent, list)
+            .then_some(())
+            .ok_or("end city child section rejected")
     }
 }
 
@@ -907,56 +603,22 @@ pub(crate) fn start_house_tower(
     list: &mut Vec<TemplatePiece>,
     rng: &mut Lcg,
 ) -> Result<(), &'static str> {
-    let mut ship_created = false;
-    let base = end_city_piece(templates, reg, "base_floor", pos, rotation, true)?;
-    let mut current = add_helper(list, base);
-    current = add_helper(
-        list,
-        end_city_add_piece(
-            templates,
-            reg,
-            &current,
-            (-1, 0, -1),
-            "second_floor_1",
-            rotation,
-            false,
-        )?,
-    );
-    current = add_helper(
-        list,
-        end_city_add_piece(
-            templates,
-            reg,
-            &current,
-            (-1, 4, -1),
-            "third_floor_1",
-            rotation,
-            false,
-        )?,
-    );
-    current = add_helper(
-        list,
-        end_city_add_piece(
-            templates,
-            reg,
-            &current,
-            (-1, 8, -1),
-            "third_roof",
-            rotation,
-            true,
-        )?,
-    );
-    let _ = end_city_recursive_children(
+    let mut generator = EndCityGenerator {
         templates,
         reg,
-        EndCitySection::Tower,
-        1,
-        &current,
-        None,
-        list,
         rng,
-        &mut ship_created,
-    );
+        ship_created: false,
+    };
+    let mut current = end_city_piece(templates, reg, "base_floor", pos, rotation, true)?;
+    list.push(current.clone());
+    for (offset, name, overwrite) in [
+        ((-1, 0, -1), "second_floor_1", false),
+        ((-1, 4, -1), "third_floor_1", false),
+        ((-1, 8, -1), "third_roof", true),
+    ] {
+        current = generator.attach(list, &current, offset, name, overwrite)?;
+    }
+    generator.recursive_children(EndCitySection::Tower, 1, &current, list);
     Ok(())
 }
 
@@ -1040,6 +702,31 @@ impl SimpleGrid {
             || self.get(x, y + 1) == value
             || self.get(x, y - 1) == value
     }
+
+    fn cells(&self) -> impl Iterator<Item = (i32, i32)> {
+        let width = self.width;
+        (0..self.height).flat_map(move |y| (0..width).map(move |x| (x, y)))
+    }
+
+    fn block_all(&mut self) {
+        self.set_box(0, 0, self.width - 1, self.height - 1, GRID_BLOCKED);
+    }
+
+    fn room_id(&self, x: i32, y: i32) -> i32 {
+        self.get(x, y) & ROOM_ID_MASK
+    }
+
+    /// The first horizontal neighbour with the same room id.
+    fn room_direction(&self, cell: (i32, i32), id: i32) -> Option<Dir> {
+        HORIZONTAL.into_iter().find(|&side| {
+            let (x, y) = grid_step(cell, side);
+            self.room_id(x, y) == id
+        })
+    }
+}
+
+fn grid_step((x, y): (i32, i32), side: Dir) -> (i32, i32) {
+    (x + side.step_x(), y + side.step_z())
 }
 
 /// `MansionGrid` cell values.
@@ -1078,96 +765,22 @@ impl MansionGrid {
     pub(crate) fn build(rng: &mut Lcg) -> Self {
         let entrance_x = 7;
         let entrance_y = 4;
-        let mut base_grid = SimpleGrid::new(11, 11, 5);
-        base_grid.set_box(entrance_x, entrance_y, entrance_x + 1, entrance_y + 1, 3);
-        base_grid.set_box(
-            entrance_x - 1,
-            entrance_y,
-            entrance_x - 1,
-            entrance_y + 1,
-            2,
-        );
-        base_grid.set_box(
-            entrance_x + 2,
-            entrance_y - 2,
-            entrance_x + 3,
-            entrance_y + 3,
-            5,
-        );
-        base_grid.set_box(
-            entrance_x + 1,
-            entrance_y - 2,
-            entrance_x + 1,
-            entrance_y - 1,
-            1,
-        );
-        base_grid.set_box(
-            entrance_x + 1,
-            entrance_y + 2,
-            entrance_x + 1,
-            entrance_y + 3,
-            1,
-        );
-        base_grid.set(entrance_x - 1, entrance_y - 1, 1);
-        base_grid.set(entrance_x - 1, entrance_y + 2, 1);
-        base_grid.set_box(0, 0, 11, 1, 5);
-        base_grid.set_box(0, 9, 11, 11, 5);
-        recursive_corridor(
-            &mut base_grid,
-            rng,
-            entrance_x,
-            entrance_y - 2,
-            Dir::West,
-            6,
-        );
-        recursive_corridor(
-            &mut base_grid,
-            rng,
-            entrance_x,
-            entrance_y + 3,
-            Dir::West,
-            6,
-        );
-        recursive_corridor(
-            &mut base_grid,
-            rng,
-            entrance_x - 2,
-            entrance_y - 1,
-            Dir::West,
-            3,
-        );
-        recursive_corridor(
-            &mut base_grid,
-            rng,
-            entrance_x - 2,
-            entrance_y + 2,
-            Dir::West,
-            3,
-        );
-        while clean_edges(&mut base_grid) {}
-
-        let mut floor_rooms = [
-            SimpleGrid::new(11, 11, 5),
-            SimpleGrid::new(11, 11, 5),
-            SimpleGrid::new(11, 11, 5),
-        ];
-        identify_rooms(&base_grid, &mut floor_rooms[0], rng);
-        identify_rooms(&base_grid, &mut floor_rooms[1], rng);
-        floor_rooms[0].set_box(
-            entrance_x + 1,
-            entrance_y,
-            entrance_x + 1,
-            entrance_y + 1,
-            ROOM_CORRIDOR_FLAG,
-        );
-        floor_rooms[1].set_box(
-            entrance_x + 1,
-            entrance_y,
-            entrance_x + 1,
-            entrance_y + 1,
-            ROOM_CORRIDOR_FLAG,
-        );
-        let mut third_floor_grid = SimpleGrid::new(base_grid.width, base_grid.height, 5);
+        let base_grid = mansion_base_grid(rng, entrance_x, entrance_y);
+        let new_grid = || SimpleGrid::new(base_grid.width, base_grid.height, GRID_BLOCKED);
+        let mut floor_rooms = std::array::from_fn(|_| new_grid());
+        for rooms in &mut floor_rooms[..2] {
+            identify_rooms(&base_grid, rooms, rng);
+        }
+        for rooms in &mut floor_rooms[..2] {
+            rooms.set_box(
+                entrance_x + 1,
+                entrance_y,
+                entrance_x + 1,
+                entrance_y + 1,
+                ROOM_CORRIDOR_FLAG,
+            );
+        }
+        let mut third_floor_grid = new_grid();
         setup_third_floor(&mut third_floor_grid, &mut floor_rooms, &base_grid, rng);
         identify_rooms(&third_floor_grid, &mut floor_rooms[2], rng);
         MansionGrid {
@@ -1178,39 +791,29 @@ impl MansionGrid {
             entrance_y,
         }
     }
+}
 
-    /// `MansionGrid.isRoomId`.
-    pub(crate) fn is_room_id(
-        &self,
-        grid: &SimpleGrid,
-        x: i32,
-        y: i32,
-        floor: usize,
-        id: i32,
-    ) -> bool {
-        let _ = grid;
-        (self.floor_rooms[floor].get(x, y) & ROOM_ID_MASK) == id
+/// Seed the entrance and carve its four westward corridors in native order.
+fn mansion_base_grid(rng: &mut Lcg, x: i32, y: i32) -> SimpleGrid {
+    let mut grid = SimpleGrid::new(11, 11, GRID_BLOCKED);
+    for (dx1, dy1, dx2, dy2, cell) in [
+        (0, 0, 1, 1, GRID_START_ROOM),
+        (-1, 0, -1, 1, GRID_ROOM),
+        (2, -2, 3, 3, GRID_BLOCKED),
+        (1, -2, 1, -1, GRID_CORRIDOR),
+        (1, 2, 1, 3, GRID_CORRIDOR),
+        (-1, -1, -1, -1, GRID_CORRIDOR),
+        (-1, 2, -1, 2, GRID_CORRIDOR),
+    ] {
+        grid.set_box(x + dx1, y + dy1, x + dx2, y + dy2, cell);
     }
-
-    /// `MansionGrid.get1x2RoomDirection`: the first horizontal direction whose
-    /// neighbour is the same room id.
-    pub(crate) fn one_by_two_direction(
-        &self,
-        x: i32,
-        y: i32,
-        floor: usize,
-        id: i32,
-    ) -> Option<Dir> {
-        HORIZONTAL.into_iter().find(|direction| {
-            self.is_room_id(
-                &self.base_grid,
-                x + direction.step_x(),
-                y + direction.step_z(),
-                floor,
-                id,
-            )
-        })
+    grid.set_box(0, 0, 11, 1, GRID_BLOCKED);
+    grid.set_box(0, 9, 11, 11, GRID_BLOCKED);
+    for (dx, dy, depth) in [(0, -2, 6), (0, 3, 6), (-2, -1, 3), (-2, 2, 3)] {
+        recursive_corridor(&mut grid, rng, x + dx, y + dy, Dir::West, depth);
     }
+    while clean_edges(&mut grid) {}
+    grid
 }
 
 /// `MansionGrid.recursiveCorridor`.
@@ -1359,32 +962,15 @@ fn setup_third_floor(
         }
     }
     if candidates.is_empty() {
-        third_floor_grid.set_box(
-            0,
-            0,
-            third_floor_grid.width,
-            third_floor_grid.height,
-            GRID_BLOCKED,
-        );
+        third_floor_grid.block_all();
         return;
     }
     let (origin_x, origin_y) = candidates[rng.next_bound(candidates.len() as i32) as usize];
     let value = second_floor.get(origin_x, origin_y);
     floor_rooms[1].set(origin_x, origin_y, value | ROOM_STAIRS_FLAG);
-    // `get1x2RoomDirection(baseGrid, x, y, 1, id)` — the base grid, floor 1.
     let id = value & ROOM_ID_MASK;
-    let Some(direction) = HORIZONTAL.into_iter().find(|direction| {
-        (floor_rooms[1].get(origin_x + direction.step_x(), origin_y + direction.step_z())
-            & ROOM_ID_MASK)
-            == id
-    }) else {
-        third_floor_grid.set_box(
-            0,
-            0,
-            third_floor_grid.width,
-            third_floor_grid.height,
-            GRID_BLOCKED,
-        );
+    let Some(direction) = floor_rooms[1].room_direction((origin_x, origin_y), id) else {
+        third_floor_grid.block_all();
         floor_rooms[1].set(origin_x, origin_y, value);
         return;
     };
@@ -1411,13 +997,7 @@ fn setup_third_floor(
         }
     }
     if directions.is_empty() {
-        third_floor_grid.set_box(
-            0,
-            0,
-            third_floor_grid.width,
-            third_floor_grid.height,
-            GRID_BLOCKED,
-        );
+        third_floor_grid.block_all();
         floor_rooms[1].set(origin_x, origin_y, value);
         return;
     }
@@ -1626,26 +1206,24 @@ impl MansionFloor {
 
 // ---------------------------------------------------------------- mansion placer
 
-/// `relative(pos, direction, n)`.
-pub(crate) fn relative(pos: Pos, direction: Dir, n: i32) -> Pos {
-    (
-        pos.0.wrapping_add(direction.step_x() * n),
-        pos.1,
-        pos.2.wrapping_add(direction.step_z() * n),
-    )
-}
-
 /// `BlockPos.above(n)`.
 pub(crate) fn above(pos: Pos, n: i32) -> Pos {
     (pos.0, pos.1.wrapping_add(n), pos.2)
 }
 
-/// `WoodlandMansionPieces.PlacementData`.
-#[derive(Clone, Debug)]
+use Rotation::{Clockwise180, Clockwise90, Counterclockwise90, None as NoTurn};
+
+/// `WoodlandMansionPieces.PlacementData` tracks the heading of the exterior walk.
 struct MansionPlacement {
     rotation: Rotation,
     pos: Pos,
     wall_type: &'static str,
+}
+
+impl MansionPlacement {
+    fn at(&self, offset: Pos) -> Pos {
+        rotated_offset(self.pos, self.rotation, offset)
+    }
 }
 
 /// `WoodlandMansionPieces.MansionPiecePlacer`.
@@ -1653,662 +1231,550 @@ struct MansionPlacer<'a> {
     templates: &'a Templates,
     reg: &'a BReg,
     rng: &'a mut Lcg,
+    rotation: Rotation,
     start_x: i32,
     start_y: i32,
+    pieces: Vec<TemplatePiece>,
+}
+
+enum RoomEntrance {
+    Side,
+    Front,
+    Secret,
 }
 
 impl MansionPlacer<'_> {
-    fn piece(
-        &mut self,
-        name: &str,
-        pos: Pos,
-        rotation: Rotation,
-        mirror: Mirror,
-    ) -> Result<TemplatePiece, &'static str> {
-        let template_id = format!("minecraft:woodland_mansion/{name}");
-        let template = self.templates.get(&template_id, self.reg)?;
-        let bb = template_bb(&template, pos, mirror, rotation, (0, 0, 0));
-        Ok(TemplatePiece {
-            template: template_id,
-            pos,
-            bb,
-            rotation,
-            mirror,
-            // `WoodlandMansionPiece.makeSettings` always ignores only
-            // `minecraft:structure_block`, so air cells are written.
-            ignore_air: false,
-            gen_depth: 0,
-        })
-    }
-
     fn push(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
         name: &str,
         pos: Pos,
         rotation: Rotation,
         mirror: Mirror,
     ) -> Result<(), &'static str> {
-        let piece = self.piece(name, pos, rotation, mirror)?;
-        list.push(piece);
+        self.pieces.push(TemplatePiece::load(
+            self.templates,
+            self.reg,
+            format!("minecraft:woodland_mansion/{name}"),
+            pos,
+            rotation,
+            mirror,
+            false, // Mansion pieces always write air.
+        )?);
         Ok(())
     }
 
-    /// `entrance`.
-    fn entrance(
+    fn push_local(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
-        data: &mut MansionPlacement,
+        name: &str,
+        anchor: Pos,
+        offset: Pos,
+        turn: Rotation,
     ) -> Result<(), &'static str> {
-        let direction = rotate_direction(data.rotation, Dir::West);
-        let pos = relative(data.pos, direction, 9);
-        let rotation = data.rotation;
-        self.push(list, "entrance", pos, rotation, Mirror::None)?;
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), 16);
-        Ok(())
+        self.push_local_mirrored(name, anchor, offset, turn, Mirror::None)
     }
 
-    /// `traverseWallPiece`.
-    fn traverse_wall_piece(
+    fn push_local_mirrored(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
-        data: &mut MansionPlacement,
+        name: &str,
+        anchor: Pos,
+        offset: Pos,
+        turn: Rotation,
+        mirror: Mirror,
     ) -> Result<(), &'static str> {
-        let pos = relative(data.pos, rotate_direction(data.rotation, Dir::East), 7);
-        let rotation = data.rotation;
-        let wall_type = data.wall_type;
-        self.push(list, wall_type, pos, rotation, Mirror::None)?;
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), 8);
-        Ok(())
+        let pos = rotated_offset(anchor, self.rotation, offset);
+        self.push(name, pos, rotate_rotation(self.rotation, turn), mirror)
     }
 
-    /// `traverseTurn`.
-    fn traverse_turn(
+    /// The origin of an 8x8 grid cell, in the mansion's frame.
+    fn cell_pos(&self, pos: Pos, (x, y): (i32, i32)) -> Pos {
+        rotated_offset(
+            pos,
+            self.rotation,
+            ((x - self.start_x) * 8, 0, 8 + (y - self.start_y) * 8),
+        )
+    }
+
+    fn create_exterior(&mut self, pos: Pos, grid: &MansionGrid) -> Result<(), &'static str> {
+        let mut ground = MansionPlacement {
+            rotation: self.rotation,
+            pos,
+            wall_type: "wall_flat",
+        };
+        self.push(
+            "entrance",
+            ground.at((-9, 0, 0)),
+            ground.rotation,
+            Mirror::None,
+        )?;
+        ground.pos = ground.at((0, 0, 16));
+        let mut windows = MansionPlacement {
+            rotation: ground.rotation,
+            pos: above(ground.pos, 8),
+            wall_type: "wall_window",
+        };
+        let start = (self.start_x, self.start_y);
+        let end = (self.start_x, grid.entrance_y);
+        self.traverse_outer_walls(&mut ground, &grid.base_grid, start, end)?;
+        self.traverse_outer_walls(&mut windows, &grid.base_grid, start, end)?;
+        self.create_upper_walls(&ground, &grid.third_floor_grid)
+    }
+
+    fn create_upper_walls(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
-        data: &mut MansionPlacement,
+        ground: &MansionPlacement,
+        grid: &SimpleGrid,
     ) -> Result<(), &'static str> {
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), -1);
-        let pos = data.pos;
-        let rotation = data.rotation;
-        self.push(list, "wall_corner", pos, rotation, Mirror::None)?;
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), -7);
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::West), -6);
-        data.rotation = rotate_rotation(data.rotation, Rotation::Clockwise90);
+        // The first occupied row, taking its easternmost cell.
+        let start = (0..grid.height)
+            .flat_map(|y| (0..grid.width).rev().map(move |x| (x, y)))
+            .find(|&(x, y)| grid_is_house(grid, x, y));
+        if let Some(start) = start {
+            let mut upper = MansionPlacement {
+                rotation: ground.rotation,
+                pos: self.cell_pos(above(ground.pos, 19), start),
+                wall_type: "wall_window",
+            };
+            self.traverse_wall_piece(&mut upper)?;
+            self.traverse_outer_walls(&mut upper, grid, start, start)?;
+        }
         Ok(())
     }
 
-    /// `traverseInnerTurn`.
-    fn traverse_inner_turn(
-        &mut self,
-        // `traverseInnerTurn` takes the list and never touches it either.
-        _list: &mut Vec<TemplatePiece>,
-        data: &mut MansionPlacement,
-    ) -> Result<(), &'static str> {
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::South), 6);
-        data.pos = relative(data.pos, rotate_direction(data.rotation, Dir::East), 8);
-        data.rotation = rotate_rotation(data.rotation, Rotation::Counterclockwise90);
+    fn traverse_wall_piece(&mut self, data: &mut MansionPlacement) -> Result<(), &'static str> {
+        self.push(
+            data.wall_type,
+            data.at((7, 0, 0)),
+            data.rotation,
+            Mirror::None,
+        )?;
+        data.pos = data.at((0, 0, 8));
         Ok(())
     }
 
-    /// `traverseOuterWalls`: walk the outside of a room cluster, emitting wall
-    /// pieces and turns until the start point and heading come round again.
-    #[allow(clippy::too_many_arguments)]
+    /// `traverseOuterWalls`: follow the edge until the end point and initial heading meet.
     fn traverse_outer_walls(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
         data: &mut MansionPlacement,
         grid: &SimpleGrid,
-        direction: Dir,
-        start_x: i32,
-        start_y: i32,
-        end_x: i32,
-        end_y: i32,
+        (mut x, mut y): (i32, i32),
+        end: (i32, i32),
     ) -> Result<(), &'static str> {
-        let mut x = start_x;
-        let mut y = start_y;
-        let mut heading = direction;
-        let initial = direction;
+        let mut heading = Dir::South;
         loop {
-            if !grid_is_house(grid, x + heading.step_x(), y + heading.step_z()) {
-                self.traverse_turn(list, data)?;
+            let (next_x, next_y) = grid_step((x, y), heading);
+            let emit_wall = if !grid_is_house(grid, next_x, next_y) {
+                data.pos = data.at((0, 0, -1));
+                self.push("wall_corner", data.pos, data.rotation, Mirror::None)?;
+                data.pos = data.at((6, 0, -7));
+                data.rotation = rotate_rotation(data.rotation, Clockwise90);
                 heading = heading.clock_wise();
-                if x == end_x && y == end_y && initial == heading {
-                    return Ok(());
-                }
-                self.traverse_wall_piece(list, data)?;
-            } else if grid_is_house(
-                grid,
-                x + heading.step_x() + heading.counter_clock_wise().step_x(),
-                y + heading.step_z() + heading.counter_clock_wise().step_z(),
-            ) {
-                self.traverse_inner_turn(&mut Vec::new(), data)?;
-                x += heading.step_x();
-                y += heading.step_z();
-                heading = heading.counter_clock_wise();
+                true
             } else {
-                x += heading.step_x();
-                y += heading.step_z();
-                if x == end_x && y == end_y && initial == heading {
-                    return Ok(());
+                (x, y) = (next_x, next_y);
+                let inner = heading.counter_clock_wise();
+                let (inner_x, inner_y) = grid_step((x, y), inner);
+                if grid_is_house(grid, inner_x, inner_y) {
+                    data.pos = data.at((8, 0, 6));
+                    data.rotation = rotate_rotation(data.rotation, Counterclockwise90);
+                    heading = inner;
+                    false
+                } else {
+                    true
                 }
-                self.traverse_wall_piece(list, data)?;
-            }
-            if x == end_x && y == end_y && initial == heading {
+            };
+            if (x, y) == end && heading == Dir::South {
                 return Ok(());
             }
+            if emit_wall {
+                self.traverse_wall_piece(data)?;
+            }
         }
     }
 
-    /// `createRoof`: the flat roof slabs plus the corner trim, for the base
-    /// floors (`third` present) and for the third floor itself (`third` null).
+    /// Keep the native three passes: exposed slabs/fronts, upper-floor trim, then corners.
     fn create_roof(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
-        offset: Pos,
-        rotation: Rotation,
+        pos: Pos,
         grid: &SimpleGrid,
         third: Option<&SimpleGrid>,
     ) -> Result<(), &'static str> {
-        let south = rotate_direction(rotation, Dir::South);
-        let east = rotate_direction(rotation, Dir::East);
-        let west = rotate_direction(rotation, Dir::West);
-        let north = rotate_direction(rotation, Dir::North);
-        for i in 0..grid.height {
-            for j in 0..grid.width {
-                let mut pos = relative(offset, south, 8 + (i - self.start_y) * 8);
-                pos = relative(pos, east, (j - self.start_x) * 8);
-                let covered = third.is_some_and(|third| grid_is_house(third, j, i));
-                if !grid_is_house(grid, j, i) || covered {
-                    continue;
-                }
-                self.push(list, "roof", above(pos, 3), rotation, Mirror::None)?;
-                if !grid_is_house(grid, j + 1, i) {
-                    let p = relative(pos, east, 6);
-                    self.push(list, "roof_front", p, rotation, Mirror::None)?;
-                }
-                if !grid_is_house(grid, j - 1, i) {
-                    let p = relative(pos, south, 7);
-                    self.push(
-                        list,
-                        "roof_front",
-                        p,
-                        rotate_rotation(rotation, Rotation::Clockwise180),
-                        Mirror::None,
-                    )?;
-                }
-                if !grid_is_house(grid, j, i - 1) {
-                    let p = relative(pos, west, 1);
-                    self.push(
-                        list,
-                        "roof_front",
-                        p,
-                        rotate_rotation(rotation, Rotation::Counterclockwise90),
-                        Mirror::None,
-                    )?;
-                }
-                if !grid_is_house(grid, j, i + 1) {
-                    let p = relative(relative(pos, east, 6), south, 6);
-                    self.push(
-                        list,
-                        "roof_front",
-                        p,
-                        rotate_rotation(rotation, Rotation::Clockwise90),
-                        Mirror::None,
-                    )?;
-                }
-            }
+        for cell in roof_cells(grid, third, false) {
+            let anchor = self.cell_pos(pos, cell);
+            self.push_local("roof", anchor, (0, 3, 0), NoTurn)?;
+            self.add_roof_edges(anchor, grid, cell, false)?;
         }
-        let third_option = third;
-        let third = match third {
-            // `createRoof` jumps straight to the corner pass when the third
-            // floor grid is absent, so only the `small_wall` pass is skipped.
-            None => return self.create_roof_corners(list, offset, rotation, grid, None),
-            Some(third) => third,
-        };
-        for i in 0..grid.height {
-            for j in 0..grid.width {
-                let mut pos = relative(offset, south, 8 + (i - self.start_y) * 8);
-                pos = relative(pos, east, (j - self.start_x) * 8);
-                if !grid_is_house(grid, j, i) || !grid_is_house(third, j, i) {
-                    continue;
-                }
-                if !grid_is_house(grid, j + 1, i) {
-                    let p = relative(pos, east, 7);
-                    self.push(list, "small_wall", p, rotation, Mirror::None)?;
-                }
-                if !grid_is_house(grid, j - 1, i) {
-                    let p = relative(relative(pos, west, 1), south, 6);
-                    self.push(
-                        list,
-                        "small_wall",
-                        p,
-                        rotate_rotation(rotation, Rotation::Clockwise180),
-                        Mirror::None,
-                    )?;
-                }
-                if !grid_is_house(grid, j, i - 1) {
-                    // `relative(rotate(WEST), 0)` is a no-op offset, then one
-                    // block north.
-                    let p = relative(pos, north, 1);
-                    self.push(
-                        list,
-                        "small_wall",
-                        p,
-                        rotate_rotation(rotation, Rotation::Counterclockwise90),
-                        Mirror::None,
-                    )?;
-                }
-                if !grid_is_house(grid, j, i + 1) {
-                    let p = relative(relative(pos, east, 6), south, 7);
-                    self.push(
-                        list,
-                        "small_wall",
-                        p,
-                        rotate_rotation(rotation, Rotation::Clockwise90),
-                        Mirror::None,
-                    )?;
-                }
-                if !grid_is_house(grid, j + 1, i) {
-                    if !grid_is_house(grid, j, i - 1) {
-                        let p = relative(relative(pos, east, 7), north, 2);
-                        self.push(list, "small_wall_corner", p, rotation, Mirror::None)?;
-                    }
-                    if !grid_is_house(grid, j, i + 1) {
-                        let p = relative(relative(pos, east, 8), south, 7);
-                        self.push(
-                            list,
-                            "small_wall_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Clockwise90),
-                            Mirror::None,
-                        )?;
-                    }
-                }
-                if !grid_is_house(grid, j - 1, i) {
-                    if !grid_is_house(grid, j, i - 1) {
-                        let p = relative(relative(pos, west, 2), north, 1);
-                        self.push(
-                            list,
-                            "small_wall_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Counterclockwise90),
-                            Mirror::None,
-                        )?;
-                    }
-                    if !grid_is_house(grid, j, i + 1) {
-                        let p = relative(relative(pos, west, 1), south, 8);
-                        self.push(
-                            list,
-                            "small_wall_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Clockwise180),
-                            Mirror::None,
-                        )?;
-                    }
-                }
-            }
+        if let Some(third) = third {
+            self.add_roof_trim(pos, grid, third)?;
         }
-        self.create_roof_corners(list, offset, rotation, grid, third_option)
+        self.create_roof_corners(pos, grid, third)
     }
 
-    /// `createRoof`'s corner pass: `roof_corner` / `roof_inner_corner` around
-    /// every covered cell, skipped where the third floor already covers it.
-    fn create_roof_corners(
+    fn add_roof_edges(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
-        offset: Pos,
-        rotation: Rotation,
+        anchor: Pos,
         grid: &SimpleGrid,
-        third: Option<&SimpleGrid>,
+        cell: (i32, i32),
+        trim: bool,
     ) -> Result<(), &'static str> {
-        let south = rotate_direction(rotation, Dir::South);
-        let east = rotate_direction(rotation, Dir::East);
-        let west = rotate_direction(rotation, Dir::West);
-        let north = rotate_direction(rotation, Dir::North);
-        for i in 0..grid.height {
-            for j in 0..grid.width {
-                let mut pos = relative(offset, south, 8 + (i - self.start_y) * 8);
-                pos = relative(pos, east, (j - self.start_x) * 8);
-                let covered = third.is_some_and(|third| grid_is_house(third, j, i));
-                if !grid_is_house(grid, j, i) || covered {
-                    continue;
-                }
-                if !grid_is_house(grid, j + 1, i) {
-                    let near = relative(pos, east, 6);
-                    if !grid_is_house(grid, j, i + 1) {
-                        let p = relative(near, south, 6);
-                        self.push(list, "roof_corner", p, rotation, Mirror::None)?;
-                    } else if grid_is_house(grid, j + 1, i + 1) {
-                        let p = relative(near, south, 5);
-                        self.push(list, "roof_inner_corner", p, rotation, Mirror::None)?;
-                    }
-                    if !grid_is_house(grid, j, i - 1) {
-                        self.push(
-                            list,
-                            "roof_corner",
-                            near,
-                            rotate_rotation(rotation, Rotation::Counterclockwise90),
-                            Mirror::None,
-                        )?;
-                    } else if grid_is_house(grid, j + 1, i - 1) {
-                        let p = relative(relative(pos, east, 9), north, 2);
-                        self.push(
-                            list,
-                            "roof_inner_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Clockwise90),
-                            Mirror::None,
-                        )?;
-                    }
-                }
-                if !grid_is_house(grid, j - 1, i) {
-                    if !grid_is_house(grid, j, i + 1) {
-                        let p = relative(pos, south, 6);
-                        self.push(
-                            list,
-                            "roof_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Clockwise90),
-                            Mirror::None,
-                        )?;
-                    } else if grid_is_house(grid, j - 1, i + 1) {
-                        let p = relative(relative(pos, south, 8), west, 3);
-                        self.push(
-                            list,
-                            "roof_inner_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Counterclockwise90),
-                            Mirror::None,
-                        )?;
-                    }
-                    if !grid_is_house(grid, j, i - 1) {
-                        self.push(
-                            list,
-                            "roof_corner",
-                            pos,
-                            rotate_rotation(rotation, Rotation::Clockwise180),
-                            Mirror::None,
-                        )?;
-                    } else if grid_is_house(grid, j - 1, i - 1) {
-                        let p = relative(pos, south, 1);
-                        self.push(
-                            list,
-                            "roof_inner_corner",
-                            p,
-                            rotate_rotation(rotation, Rotation::Clockwise180),
-                            Mirror::None,
-                        )?;
-                    }
+        // (edge, roof_front offset, small_wall offset, turn)
+        for (side, front, wall, turn) in [
+            (Dir::East, (6, 0, 0), (7, 0, 0), NoTurn),
+            (Dir::West, (0, 0, 7), (-1, 0, 6), Clockwise180),
+            (Dir::North, (-1, 0, 0), (0, 0, -1), Counterclockwise90),
+            (Dir::South, (6, 0, 6), (6, 0, 7), Clockwise90),
+        ] {
+            let (x, y) = grid_step(cell, side);
+            if !grid_is_house(grid, x, y) {
+                let (name, offset) = if trim {
+                    ("small_wall", wall)
+                } else {
+                    ("roof_front", front)
+                };
+                self.push_local(name, anchor, offset, turn)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn add_roof_trim(
+        &mut self,
+        pos: Pos,
+        grid: &SimpleGrid,
+        third: &SimpleGrid,
+    ) -> Result<(), &'static str> {
+        for cell in roof_cells(grid, Some(third), true) {
+            let anchor = self.cell_pos(pos, cell);
+            self.add_roof_edges(anchor, grid, cell, true)?;
+            for (edge, flank, offset, turn) in [
+                (Dir::East, Dir::North, (7, 0, -2), NoTurn),
+                (Dir::East, Dir::South, (8, 0, 7), Clockwise90),
+                (Dir::West, Dir::North, (-2, 0, -1), Counterclockwise90),
+                (Dir::West, Dir::South, (-1, 0, 8), Clockwise180),
+            ] {
+                let (ex, ey) = grid_step(cell, edge);
+                let (fx, fy) = grid_step(cell, flank);
+                if !grid_is_house(grid, ex, ey) && !grid_is_house(grid, fx, fy) {
+                    self.push_local("small_wall_corner", anchor, offset, turn)?;
                 }
             }
         }
         Ok(())
     }
 
-    /// `addRoom1x1`.
-    fn add_room_1x1(
+    fn create_roof_corners(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
         pos: Pos,
-        rotation: Rotation,
-        direction: Option<Dir>,
-        floor: MansionFloor,
+        grid: &SimpleGrid,
+        third: Option<&SimpleGrid>,
     ) -> Result<(), &'static str> {
-        let mut room_rotation = Rotation::None;
-        let mut name = floor.one_by_one(self.rng);
-        match direction {
-            Some(Dir::East) => {}
-            Some(Dir::North) => {
-                room_rotation = rotate_rotation(room_rotation, Rotation::Counterclockwise90)
+        for cell in roof_cells(grid, third, false) {
+            let anchor = self.cell_pos(pos, cell);
+            // (edge, flank, (outer offset, turn), (inner offset, turn))
+            for (edge, flank, outer, inner) in [
+                (
+                    Dir::East,
+                    Dir::South,
+                    ((6, 0, 6), NoTurn),
+                    ((6, 0, 5), NoTurn),
+                ),
+                (
+                    Dir::East,
+                    Dir::North,
+                    ((6, 0, 0), Counterclockwise90),
+                    ((9, 0, -2), Clockwise90),
+                ),
+                (
+                    Dir::West,
+                    Dir::South,
+                    ((0, 0, 6), Clockwise90),
+                    ((-3, 0, 8), Counterclockwise90),
+                ),
+                (
+                    Dir::West,
+                    Dir::North,
+                    ((0, 0, 0), Clockwise180),
+                    ((0, 0, 1), Clockwise180),
+                ),
+            ] {
+                let edge_cell = grid_step(cell, edge);
+                if grid_is_house(grid, edge_cell.0, edge_cell.1) {
+                    continue;
+                }
+                let (fx, fy) = grid_step(cell, flank);
+                let (dx, dy) = grid_step(edge_cell, flank);
+                if !grid_is_house(grid, fx, fy) {
+                    self.push_local("roof_corner", anchor, outer.0, outer.1)?;
+                } else if grid_is_house(grid, dx, dy) {
+                    self.push_local("roof_inner_corner", anchor, inner.0, inner.1)?;
+                }
             }
-            Some(Dir::West) => {
-                room_rotation = rotate_rotation(room_rotation, Rotation::Clockwise180)
-            }
-            Some(Dir::South) => {
-                room_rotation = rotate_rotation(room_rotation, Rotation::Clockwise90)
-            }
-            _ => name = floor.one_by_one_secret(self.rng),
         }
-        // `StructureTemplate.calculateRelativePosition(new BlockPos(1, 0, 0),
-        // Mirror.NONE, roomRotation, 7, 7)`: a 7x7 room anchored one cell in,
-        // rotated so its door faces `direction`.
-        let p = relative_room_corner((1, 0, 0), room_rotation, 7, 7);
-        room_rotation = rotate_rotation(room_rotation, rotation);
-        let p = rotate_pos(p, rotation);
-        let placed = (pos.0.wrapping_add(p.0), pos.1, pos.2.wrapping_add(p.2));
-        self.push(list, &name, placed, room_rotation, Mirror::None)
+        Ok(())
     }
 
-    /// `addRoom1x2`.
-    #[allow(clippy::too_many_arguments)]
-    fn add_room_1x2(
+    fn create_floor(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
         pos: Pos,
-        rotation: Rotation,
-        room_direction: Option<Dir>,
-        door_direction: Option<Dir>,
+        layout: &MansionGrid,
+        index: usize,
         floor: MansionFloor,
-        stairs: bool,
     ) -> Result<(), &'static str> {
-        let (Some(room_direction), Some(door_direction)) = (room_direction, door_direction) else {
-            return Ok(());
+        let (walk, height) = if floor == MansionFloor::Third {
+            (&layout.third_floor_grid, 19)
+        } else {
+            (&layout.base_grid, 8 * index as i32)
         };
-        let east = rotate_direction(rotation, Dir::East);
-        let south = rotate_direction(rotation, Dir::South);
-        let north = rotate_direction(rotation, Dir::North);
-        let west = rotate_direction(rotation, Dir::West);
-        match (door_direction, room_direction) {
-            (Dir::East, Dir::South) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(pos, east, 1);
-                self.push(list, &name, p, rotation, Mirror::None)
+        let pos = above(pos, height);
+        let rooms = &layout.floor_rooms[index];
+        self.add_corridors(pos, walk, rooms, floor)?;
+        self.add_floor_rooms(pos, walk, rooms, floor)
+    }
+
+    fn add_corridors(
+        &mut self,
+        pos: Pos,
+        walk: &SimpleGrid,
+        rooms: &SimpleGrid,
+        floor: MansionFloor,
+    ) -> Result<(), &'static str> {
+        let (south, west) = if floor == MansionFloor::First {
+            ("carpet_south_1", "carpet_west_1")
+        } else {
+            ("carpet_south_2", "carpet_west_2")
+        };
+        let carpets = [
+            (Dir::North, "carpet_north", (1, 1, 0)),
+            (Dir::East, "carpet_east", (5, 1, 1)),
+            (Dir::South, south, (-1, 0, 5)),
+            (Dir::West, west, (-1, 0, -1)),
+        ];
+        for cell in walk.cells() {
+            if walk.get(cell.0, cell.1) != GRID_CORRIDOR {
+                continue;
             }
-            (Dir::East, Dir::North) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(relative(pos, east, 1), south, 6);
-                self.push(list, &name, p, rotation, Mirror::from_index(1).unwrap())
+            let anchor = self.cell_pos(pos, cell);
+            self.push_local("corridor_floor", anchor, (0, 0, 0), NoTurn)?;
+            for (side, name, offset) in carpets {
+                let (x, y) = grid_step(cell, side);
+                if walk.get(x, y) == GRID_CORRIDOR || rooms.get(x, y) & ROOM_CORRIDOR_FLAG != 0 {
+                    self.push_local(name, anchor, offset, NoTurn)?;
+                }
             }
-            (Dir::West, Dir::North) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(relative(pos, east, 7), south, 6);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise180),
-                    Mirror::None,
-                )
+        }
+        Ok(())
+    }
+
+    fn add_floor_rooms(
+        &mut self,
+        pos: Pos,
+        walk: &SimpleGrid,
+        rooms: &SimpleGrid,
+        floor: MansionFloor,
+    ) -> Result<(), &'static str> {
+        let mut doors = Vec::new();
+        for cell in walk.cells() {
+            let tile = walk.get(cell.0, cell.1);
+            if tile != GRID_ROOM && !(floor == MansionFloor::Third && tile == GRID_START_ROOM) {
+                continue;
             }
-            (Dir::West, Dir::South) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(pos, east, 7);
-                self.push(list, &name, p, rotation, Mirror::from_index(2).unwrap())
+            let record = rooms.get(cell.0, cell.1);
+            doors.clear();
+            if record & ROOM_DOOR_FLAG != 0 {
+                doors.extend(HORIZONTAL.into_iter().filter(|&side| {
+                    let (x, y) = grid_step(cell, side);
+                    walk.get(x, y) == GRID_CORRIDOR
+                }));
             }
-            (Dir::South, Dir::East) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(pos, east, 1);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise90),
-                    Mirror::from_index(1).unwrap(),
-                )
+            let door = if !doors.is_empty() {
+                Some(doors[self.rng.next_bound(doors.len() as i32) as usize])
+            } else if record & ROOM_ORIGIN_FLAG != 0 {
+                Some(Dir::Up)
+            } else {
+                None
+            };
+            let anchor = rotated_offset(self.cell_pos(pos, cell), self.rotation, (-1, 0, 0));
+            self.add_room_walls(anchor, walk, rooms, cell, door, floor)?;
+            self.fill_room(anchor, rooms, cell, door, floor)?;
+        }
+        Ok(())
+    }
+
+    fn add_room_walls(
+        &mut self,
+        anchor: Pos,
+        walk: &SimpleGrid,
+        rooms: &SimpleGrid,
+        cell: (i32, i32),
+        door: Option<Dir>,
+        floor: MansionFloor,
+    ) -> Result<(), &'static str> {
+        let record = rooms.get(cell.0, cell.1);
+        let stair_landing = floor == MansionFloor::Third
+            && walk.get(cell.0, cell.1) == GRID_START_ROOM
+            && record & ROOM_CORRIDOR_FLAG != 0;
+        let (wall_name, door_name) = if floor == MansionFloor::First {
+            ("indoors_wall_1", "indoors_door_1")
+        } else {
+            ("indoors_wall_2", "indoors_door_2")
+        };
+        for (side, offset, turn) in [
+            (Dir::West, (0, 0, 0), NoTurn),
+            (Dir::East, (8, 0, 0), NoTurn),
+            (Dir::South, (7, 0, 7), Clockwise90),
+            (Dir::North, (7, 0, -1), Clockwise90),
+        ] {
+            let (x, y) = grid_step(cell, side);
+            // West/south also bound adjoining rooms. East/north only face corridors.
+            let needs_wall = if matches!(side, Dir::West | Dir::South) {
+                grid_is_house(walk, x, y) && rooms.room_id(x, y) != (record & ROOM_ID_MASK)
+            } else {
+                walk.get(x, y) == GRID_CORRIDOR && !stair_landing
+            };
+            if needs_wall {
+                let name = if door == Some(side) {
+                    door_name
+                } else {
+                    wall_name
+                };
+                self.push_local(name, anchor, offset, turn)?;
             }
-            (Dir::South, Dir::West) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(pos, east, 7);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise90),
-                    Mirror::None,
-                )
+        }
+        Ok(())
+    }
+
+    fn fill_room(
+        &mut self,
+        anchor: Pos,
+        rooms: &SimpleGrid,
+        cell: (i32, i32),
+        door: Option<Dir>,
+        floor: MansionFloor,
+    ) -> Result<(), &'static str> {
+        let record = rooms.get(cell.0, cell.1);
+        match (record & ROOM_TYPE_MASK, door) {
+            (ROOM_1X1, _) => self.add_room_1x1(anchor, door, floor),
+            (ROOM_1X2, Some(door)) => {
+                if let Some(direction) = rooms.room_direction(cell, record & ROOM_ID_MASK) {
+                    self.add_room_1x2(
+                        anchor,
+                        direction,
+                        door,
+                        floor,
+                        record & ROOM_STAIRS_FLAG != 0,
+                    )?;
+                }
+                Ok(())
             }
-            (Dir::North, Dir::West) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(relative(pos, east, 7), south, 6);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise90),
-                    Mirror::from_index(2).unwrap(),
-                )
+            (ROOM_2X2, Some(Dir::Up)) => {
+                let name = floor.two_by_two_secret(self.rng);
+                self.push_local(&name, anchor, (1, 0, 0), NoTurn)
             }
-            (Dir::North, Dir::East) => {
-                let name = floor.one_by_two_side(self.rng, stairs);
-                let p = relative(relative(pos, east, 1), south, 6);
-                // No mirror: the bytecode reaches the four-argument
-                // `WoodlandMansionPiece` constructor here, unlike the other
-                // three side-entrance arms that pass `Mirror.LEFT_RIGHT` or
-                // `Mirror.FRONT_BACK`.
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Counterclockwise90),
-                    Mirror::None,
-                )
-            }
-            // `get1x2FrontEntrance`: the door and the room direction are the
-            // two horizontal axes, which is what makes the entrance face the
-            // corridor the room's origin corner touches.
-            (Dir::South, Dir::North) => {
-                let name = floor.one_by_two_front(self.rng, stairs);
-                let p = relative(relative(pos, east, 1), north, 8);
-                self.push(list, &name, p, rotation, Mirror::None)
-            }
-            (Dir::North, Dir::South) => {
-                let name = floor.one_by_two_front(self.rng, stairs);
-                let p = relative(relative(pos, east, 7), south, 14);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise180),
-                    Mirror::None,
-                )
-            }
-            (Dir::West, Dir::East) => {
-                let name = floor.one_by_two_front(self.rng, stairs);
-                let p = relative(pos, east, 15);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise90),
-                    Mirror::None,
-                )
-            }
-            (Dir::East, Dir::West) => {
-                let name = floor.one_by_two_front(self.rng, stairs);
-                let p = relative(relative(pos, west, 7), south, 6);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Counterclockwise90),
-                    Mirror::None,
-                )
-            }
-            // `get1x2Secret`: the origin flag with no corridor neighbour.
-            (Dir::Up, Dir::East) => {
-                let name = floor.one_by_two_secret(self.rng);
-                let p = relative(pos, east, 15);
-                self.push(
-                    list,
-                    &name,
-                    p,
-                    rotate_rotation(rotation, Rotation::Clockwise90),
-                    Mirror::None,
-                )
-            }
-            (Dir::Up, Dir::South) => {
-                let name = floor.one_by_two_secret(self.rng);
-                let p = relative(relative(pos, east, 1), north, 0);
-                self.push(list, &name, p, rotation, Mirror::None)
+            (ROOM_2X2, Some(door)) => {
+                let direction = door.clock_wise();
+                let (x, y) = grid_step(cell, direction);
+                let direction = if rooms.room_id(x, y) == (record & ROOM_ID_MASK) {
+                    direction
+                } else {
+                    direction.opposite()
+                };
+                self.add_room_2x2(anchor, direction, door, floor)
             }
             _ => Ok(()),
         }
     }
 
-    /// `addRoom2x2`.
-    #[allow(clippy::too_many_arguments)]
-    fn add_room_2x2(
+    fn add_room_1x1(
         &mut self,
-        list: &mut Vec<TemplatePiece>,
         pos: Pos,
-        rotation: Rotation,
-        room_direction: Option<Dir>,
-        door_direction: Option<Dir>,
+        direction: Option<Dir>,
         floor: MansionFloor,
     ) -> Result<(), &'static str> {
-        let (Some(room_direction), Some(door_direction)) = (room_direction, door_direction) else {
-            return Ok(());
+        // Native draws a regular room even when it goes on to choose a secret room.
+        let mut name = floor.one_by_one(self.rng);
+        let turn = match direction {
+            Some(Dir::East) => NoTurn,
+            Some(Dir::North) => Counterclockwise90,
+            Some(Dir::West) => Clockwise180,
+            Some(Dir::South) => Clockwise90,
+            _ => {
+                name = floor.one_by_one_secret(self.rng);
+                NoTurn
+            }
         };
-        // `(east offset, south offset, piece rotation, mirror)` per entrance
-        // pair, straight out of the eight arms of `addRoom2x2`.
-        let (dx, dz, room_rotation, mirror) = match (door_direction, room_direction) {
-            (Dir::East, Dir::South) => (-7, 0, rotation, Mirror::None),
-            (Dir::East, Dir::North) => (-7, 6, rotation, Mirror::from_index(1).unwrap()),
-            (Dir::North, Dir::East) => (
-                1,
-                14,
-                rotate_rotation(rotation, Rotation::Counterclockwise90),
-                Mirror::None,
-            ),
-            (Dir::North, Dir::West) => (
-                7,
-                14,
-                rotate_rotation(rotation, Rotation::Counterclockwise90),
-                Mirror::from_index(1).unwrap(),
-            ),
-            (Dir::South, Dir::West) => (
-                7,
-                -8,
-                rotate_rotation(rotation, Rotation::Clockwise90),
-                Mirror::None,
-            ),
-            (Dir::South, Dir::East) => (
-                1,
-                -8,
-                rotate_rotation(rotation, Rotation::Clockwise90),
-                Mirror::from_index(1).unwrap(),
-            ),
-            (Dir::West, Dir::North) => (
-                15,
-                6,
-                rotate_rotation(rotation, Rotation::Clockwise180),
-                Mirror::None,
-            ),
-            (Dir::West, Dir::South) => (15, 0, rotation, Mirror::from_index(2).unwrap()),
+        let offset = relative_room_corner((1, 0, 0), turn, 7, 7);
+        self.push_local(&name, pos, offset, turn)
+    }
+
+    fn add_room_1x2(
+        &mut self,
+        pos: Pos,
+        room: Dir,
+        door: Dir,
+        floor: MansionFloor,
+        stairs: bool,
+    ) -> Result<(), &'static str> {
+        use Dir::{East, North, South, Up, West};
+        use Mirror::{FrontBack, LeftRight}; // Port variants for native indices 2 and 1.
+        use RoomEntrance::{Front, Secret, Side};
+        let (entrance, offset, turn, mirror) = match (door, room) {
+            (East, South) => (Side, (1, 0, 0), NoTurn, Mirror::None),
+            (East, North) => (Side, (1, 0, 6), NoTurn, LeftRight),
+            (West, North) => (Side, (7, 0, 6), Clockwise180, Mirror::None),
+            (West, South) => (Side, (7, 0, 0), NoTurn, FrontBack),
+            (South, East) => (Side, (1, 0, 0), Clockwise90, LeftRight),
+            (South, West) => (Side, (7, 0, 0), Clockwise90, Mirror::None),
+            (North, West) => (Side, (7, 0, 6), Clockwise90, FrontBack),
+            (North, East) => (Side, (1, 0, 6), Counterclockwise90, Mirror::None),
+            (South, North) => (Front, (1, 0, -8), NoTurn, Mirror::None),
+            (North, South) => (Front, (7, 0, 14), Clockwise180, Mirror::None),
+            (West, East) => (Front, (15, 0, 0), Clockwise90, Mirror::None),
+            (East, West) => (Front, (-7, 0, 6), Counterclockwise90, Mirror::None),
+            (Up, East) => (Secret, (15, 0, 0), Clockwise90, Mirror::None),
+            (Up, South) => (Secret, (1, 0, 0), NoTurn, Mirror::None),
+            _ => return Ok(()),
+        };
+        let name = match entrance {
+            Side => floor.one_by_two_side(self.rng, stairs),
+            Front => floor.one_by_two_front(self.rng, stairs),
+            Secret => floor.one_by_two_secret(self.rng),
+        };
+        self.push_local_mirrored(&name, pos, offset, turn, mirror)
+    }
+
+    fn add_room_2x2(
+        &mut self,
+        pos: Pos,
+        room: Dir,
+        door: Dir,
+        floor: MansionFloor,
+    ) -> Result<(), &'static str> {
+        use Dir::{East, North, South, West};
+        use Mirror::{FrontBack, LeftRight};
+        let (offset, turn, mirror) = match (door, room) {
+            (East, South) => ((-7, 0, 0), NoTurn, Mirror::None),
+            (East, North) => ((-7, 0, 6), NoTurn, LeftRight),
+            (North, East) => ((1, 0, 14), Counterclockwise90, Mirror::None),
+            (North, West) => ((7, 0, 14), Counterclockwise90, LeftRight),
+            (South, West) => ((7, 0, -8), Clockwise90, Mirror::None),
+            (South, East) => ((1, 0, -8), Clockwise90, LeftRight),
+            (West, North) => ((15, 0, 6), Clockwise180, Mirror::None),
+            (West, South) => ((15, 0, 0), NoTurn, FrontBack),
             _ => return Ok(()),
         };
         let name = floor.two_by_two(self.rng);
-        let p = relative(
-            relative(pos, rotate_direction(rotation, Dir::East), dx),
-            rotate_direction(rotation, Dir::South),
-            dz,
-        );
-        self.push(list, &name, p, room_rotation, mirror)
+        self.push_local_mirrored(&name, pos, offset, turn, mirror)
     }
+}
 
-    /// `addRoom2x2Secret`.
-    fn add_room_2x2_secret(
-        &mut self,
-        list: &mut Vec<TemplatePiece>,
-        pos: Pos,
-        rotation: Rotation,
-        floor: MansionFloor,
-    ) -> Result<(), &'static str> {
-        let name = floor.two_by_two_secret(self.rng);
-        let p = relative(pos, rotate_direction(rotation, Dir::East), 1);
-        self.push(list, &name, p, rotation, Mirror::None)
-    }
+fn roof_cells<'a>(
+    grid: &'a SimpleGrid,
+    third: Option<&'a SimpleGrid>,
+    covered: bool,
+) -> impl Iterator<Item = (i32, i32)> + 'a {
+    grid.cells().filter(move |&(x, y)| {
+        grid_is_house(grid, x, y)
+            && third.is_some_and(|third| grid_is_house(third, x, y)) == covered
+    })
 }
 
 /// `StructureTemplate.calculateRelativePosition(pos, mirror, rotation, x, y)`
@@ -2337,314 +1803,29 @@ fn create_mansion(
         templates,
         reg,
         rng,
+        rotation,
         start_x: grid.entrance_x + 1,
         start_y: grid.entrance_y + 1,
+        pieces: Vec::new(),
     };
-    let mut list: Vec<TemplatePiece> = Vec::new();
-    let mut ground = MansionPlacement {
-        rotation,
-        pos,
-        wall_type: "wall_flat",
-    };
-    let mut windows = MansionPlacement {
-        rotation,
-        pos,
-        wall_type: "wall_window",
-    };
-    placer.entrance(&mut list, &mut ground)?;
-    windows.pos = above(ground.pos, 8);
-    windows.rotation = ground.rotation;
-    windows.wall_type = "wall_window";
-    let base = &grid.base_grid;
-    let third = &grid.third_floor_grid;
-    let start_x = placer.start_x;
-    let start_y = placer.start_y;
-    let end_x = grid.entrance_x + 1;
-    let end_y = grid.entrance_y;
-    placer.traverse_outer_walls(
-        &mut list,
-        &mut ground,
-        base,
-        Dir::South,
-        start_x,
-        start_y,
-        end_x,
-        end_y,
+    placer.create_exterior(pos, grid)?;
+    placer.create_roof(
+        above(pos, 16),
+        &grid.base_grid,
+        Some(&grid.third_floor_grid),
     )?;
-    placer.traverse_outer_walls(
-        &mut list,
-        &mut windows,
-        base,
-        Dir::South,
-        start_x,
-        start_y,
-        end_x,
-        end_y,
-    )?;
-    let mut upper = MansionPlacement {
-        rotation: ground.rotation,
-        pos: above(ground.pos, 19),
-        wall_type: "wall_window",
-    };
-    'search: for k in 0..third.height {
-        let mut l = third.width - 1;
-        while l >= 0 {
-            if grid_is_house(third, l, k) {
-                upper.pos = relative(
-                    upper.pos,
-                    rotate_direction(rotation, Dir::South),
-                    8 + (k - placer.start_y) * 8,
-                );
-                upper.pos = relative(
-                    upper.pos,
-                    rotate_direction(rotation, Dir::East),
-                    (l - placer.start_x) * 8,
-                );
-                placer.traverse_wall_piece(&mut list, &mut upper)?;
-                placer.traverse_outer_walls(
-                    &mut list,
-                    &mut upper,
-                    third,
-                    Dir::South,
-                    l,
-                    k,
-                    l,
-                    k,
-                )?;
-                break 'search;
-            }
-            l -= 1;
-        }
+    placer.create_roof(above(pos, 27), &grid.third_floor_grid, None)?;
+    for (index, floor) in [
+        MansionFloor::First,
+        MansionFloor::Second,
+        MansionFloor::Third,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        placer.create_floor(pos, grid, index, floor)?;
     }
-    placer.create_roof(&mut list, above(pos, 16), rotation, base, Some(third))?;
-    placer.create_roof(&mut list, above(pos, 27), rotation, third, None)?;
-
-    for floor_index in 0..3usize {
-        let floor_kind = match floor_index {
-            0 => MansionFloor::First,
-            1 => MansionFloor::Second,
-            _ => MansionFloor::Third,
-        };
-        let floor_pos = above(
-            pos,
-            8 * floor_index as i32 + if floor_index == 2 { 3 } else { 0 },
-        );
-        let room_grid = &grid.floor_rooms[floor_index];
-        let walk_grid = if floor_index == 2 { third } else { base };
-        let carpet_south = if floor_index == 0 {
-            "carpet_south_1"
-        } else {
-            "carpet_south_2"
-        };
-        let carpet_west = if floor_index == 0 {
-            "carpet_west_1"
-        } else {
-            "carpet_west_2"
-        };
-        for n in 0..walk_grid.height {
-            for o in 0..walk_grid.width {
-                if walk_grid.get(o, n) != GRID_CORRIDOR {
-                    continue;
-                }
-                let mut p = relative(
-                    floor_pos,
-                    rotate_direction(rotation, Dir::South),
-                    8 + (n - placer.start_y) * 8,
-                );
-                p = relative(
-                    p,
-                    rotate_direction(rotation, Dir::East),
-                    (o - placer.start_x) * 8,
-                );
-                placer.push(&mut list, "corridor_floor", p, rotation, Mirror::None)?;
-                if walk_grid.get(o, n - 1) == GRID_CORRIDOR
-                    || (room_grid.get(o, n - 1) & ROOM_CORRIDOR_FLAG) == ROOM_CORRIDOR_FLAG
-                {
-                    let carpet = relative(p, rotate_direction(rotation, Dir::East), 1);
-                    placer.push(
-                        &mut list,
-                        "carpet_north",
-                        above(carpet, 1),
-                        rotation,
-                        Mirror::None,
-                    )?;
-                }
-                if walk_grid.get(o + 1, n) == GRID_CORRIDOR
-                    || (room_grid.get(o + 1, n) & ROOM_CORRIDOR_FLAG) == ROOM_CORRIDOR_FLAG
-                {
-                    let mut carpet = relative(p, rotate_direction(rotation, Dir::South), 1);
-                    carpet = relative(carpet, rotate_direction(rotation, Dir::East), 5);
-                    placer.push(
-                        &mut list,
-                        "carpet_east",
-                        above(carpet, 1),
-                        rotation,
-                        Mirror::None,
-                    )?;
-                }
-                if walk_grid.get(o, n + 1) == GRID_CORRIDOR
-                    || (room_grid.get(o, n + 1) & ROOM_CORRIDOR_FLAG) == ROOM_CORRIDOR_FLAG
-                {
-                    let mut carpet = relative(p, rotate_direction(rotation, Dir::South), 5);
-                    carpet = relative(carpet, rotate_direction(rotation, Dir::West), 1);
-                    placer.push(&mut list, carpet_south, carpet, rotation, Mirror::None)?;
-                }
-                if walk_grid.get(o - 1, n) == GRID_CORRIDOR
-                    || (room_grid.get(o - 1, n) & ROOM_CORRIDOR_FLAG) == ROOM_CORRIDOR_FLAG
-                {
-                    let mut carpet = relative(p, rotate_direction(rotation, Dir::West), 1);
-                    carpet = relative(carpet, rotate_direction(rotation, Dir::North), 1);
-                    placer.push(&mut list, carpet_west, carpet, rotation, Mirror::None)?;
-                }
-            }
-        }
-        let indoors_wall = if floor_index == 0 {
-            "indoors_wall_1"
-        } else {
-            "indoors_wall_2"
-        };
-        let indoors_door = if floor_index == 0 {
-            "indoors_door_1"
-        } else {
-            "indoors_door_2"
-        };
-        let mut doors: Vec<Dir> = Vec::new();
-        for p in 0..walk_grid.height {
-            for q in 0..walk_grid.width {
-                let mut stair_landing = floor_index == 2 && walk_grid.get(q, p) == GRID_START_ROOM;
-                if walk_grid.get(q, p) != GRID_ROOM && !stair_landing {
-                    continue;
-                }
-                let record = room_grid.get(q, p);
-                let room_type = record & ROOM_TYPE_MASK;
-                let room_id = record & ROOM_ID_MASK;
-                stair_landing =
-                    stair_landing && (record & ROOM_CORRIDOR_FLAG) == ROOM_CORRIDOR_FLAG;
-                doors.clear();
-                if (record & ROOM_DOOR_FLAG) == ROOM_DOOR_FLAG {
-                    for direction in HORIZONTAL {
-                        if walk_grid.get(q + direction.step_x(), p + direction.step_z())
-                            == GRID_CORRIDOR
-                        {
-                            doors.push(direction);
-                        }
-                    }
-                }
-                let mut door: Option<Dir> = None;
-                if !doors.is_empty() {
-                    door = Some(doors[placer.rng.next_bound(doors.len() as i32) as usize]);
-                } else if (record & ROOM_ORIGIN_FLAG) == ROOM_ORIGIN_FLAG {
-                    door = Some(Dir::Up);
-                }
-                let mut anchor = relative(
-                    floor_pos,
-                    rotate_direction(rotation, Dir::South),
-                    8 + (p - placer.start_y) * 8,
-                );
-                anchor = relative(
-                    anchor,
-                    rotate_direction(rotation, Dir::East),
-                    -1 + (q - placer.start_x) * 8,
-                );
-                if grid_is_house(walk_grid, q - 1, p)
-                    && !grid.is_room_id(walk_grid, q - 1, p, floor_index, room_id)
-                {
-                    let name = if door == Some(Dir::West) {
-                        indoors_door
-                    } else {
-                        indoors_wall
-                    };
-                    placer.push(&mut list, name, anchor, rotation, Mirror::None)?;
-                }
-                if walk_grid.get(q + 1, p) == GRID_CORRIDOR && !stair_landing {
-                    let p5 = relative(anchor, rotate_direction(rotation, Dir::East), 8);
-                    let name = if door == Some(Dir::East) {
-                        indoors_door
-                    } else {
-                        indoors_wall
-                    };
-                    placer.push(&mut list, name, p5, rotation, Mirror::None)?;
-                }
-                if grid_is_house(walk_grid, q, p + 1)
-                    && !grid.is_room_id(walk_grid, q, p + 1, floor_index, room_id)
-                {
-                    let mut p6 = relative(anchor, rotate_direction(rotation, Dir::South), 7);
-                    p6 = relative(p6, rotate_direction(rotation, Dir::East), 7);
-                    let name = if door == Some(Dir::South) {
-                        indoors_door
-                    } else {
-                        indoors_wall
-                    };
-                    placer.push(
-                        &mut list,
-                        name,
-                        p6,
-                        rotate_rotation(rotation, Rotation::Clockwise90),
-                        Mirror::None,
-                    )?;
-                }
-                if walk_grid.get(q, p - 1) == GRID_CORRIDOR && !stair_landing {
-                    let mut p7 = relative(anchor, rotate_direction(rotation, Dir::North), 1);
-                    p7 = relative(p7, rotate_direction(rotation, Dir::East), 7);
-                    let name = if door == Some(Dir::North) {
-                        indoors_door
-                    } else {
-                        indoors_wall
-                    };
-                    placer.push(
-                        &mut list,
-                        name,
-                        p7,
-                        rotate_rotation(rotation, Rotation::Clockwise90),
-                        Mirror::None,
-                    )?;
-                }
-                if room_type == ROOM_1X1 {
-                    placer.add_room_1x1(&mut list, anchor, rotation, door, floor_kind)?;
-                } else if room_type == ROOM_1X2 && door.is_some() {
-                    let room_direction = grid.one_by_two_direction(q, p, floor_index, room_id);
-                    let stairs = (record & ROOM_STAIRS_FLAG) == ROOM_STAIRS_FLAG;
-                    placer.add_room_1x2(
-                        &mut list,
-                        anchor,
-                        rotation,
-                        room_direction,
-                        door,
-                        floor_kind,
-                        stairs,
-                    )?;
-                } else if room_type == ROOM_2X2 {
-                    match door {
-                        Some(Dir::Up) => {
-                            placer.add_room_2x2_secret(&mut list, anchor, rotation, floor_kind)?;
-                        }
-                        Some(direction) => {
-                            let mut room_direction = direction.clock_wise();
-                            if !grid.is_room_id(
-                                walk_grid,
-                                q + room_direction.step_x(),
-                                p + room_direction.step_z(),
-                                floor_index,
-                                room_id,
-                            ) {
-                                room_direction = room_direction.opposite();
-                            }
-                            placer.add_room_2x2(
-                                &mut list,
-                                anchor,
-                                rotation,
-                                Some(room_direction),
-                                door,
-                                floor_kind,
-                            )?;
-                        }
-                        None => {}
-                    }
-                }
-            }
-        }
-    }
-    Ok(list)
+    Ok(placer.pieces)
 }
 
 /// `WoodlandMansionPieces.generateMansion`.
@@ -2801,97 +1982,93 @@ fn handle_data_marker<W: TemplateWorld>(
 ) {
     match flavour {
         StructureFlavour::EndCity => {
-            if metadata.starts_with("Chest") {
-                let below = (pos.0, pos.1 - 1, pos.2);
-                // The marker is only delivered when the cell below is inside the
-                // chunk being placed.
-                if bb_inside(chunk_bb, below) {
-                    end_city_chest_loot(out, below, rng);
-                }
-                return;
-            }
-            if !bb_inside(chunk_bb, pos) {
-                return;
-            }
-            if !in_spawnable_bounds(world, pos) {
-                return;
-            }
-            if metadata.starts_with("Sentry") {
-                out.entities.push(EntitySpawn {
-                    pos,
-                    id: "minecraft:shulker".to_string(),
-                    hanging: None,
-                });
-            } else if metadata.starts_with("Elytra") {
-                // `EndCityPiece.handleDataMarker`: `new ItemFrame(level, pos,
-                // this.placeSettings.getRotation().rotate(Direction.SOUTH))` carrying
-                // `new ItemStack(Items.ELYTRA)`. The constructor consumes no RNG and the
-                // marker is the ship's single treasure-room frame, so the facing is the
-                // piece rotation applied to SOUTH and the stack is one elytra.
-                out.entities.push(EntitySpawn {
-                    pos,
-                    id: "minecraft:item_frame".to_string(),
-                    hanging: Some(HangingSpawn {
-                        facing: rotate_direction(rotation, Dir::South).data_3d(),
-                        item: Some(("minecraft:elytra".to_string(), 1)),
-                    }),
-                });
-            }
+            end_city_marker(world, out, metadata, pos, rotation, chunk_bb, rng)
         }
-        StructureFlavour::Mansion => {
-            if metadata.starts_with("Chest") {
-                let facing = if metadata == "ChestWest" {
-                    rotate_direction(rotation, Dir::West)
-                } else if metadata == "ChestEast" {
-                    rotate_direction(rotation, Dir::East)
-                } else if metadata == "ChestSouth" {
-                    rotate_direction(rotation, Dir::South)
-                } else if metadata == "ChestNorth" {
-                    rotate_direction(rotation, Dir::North)
-                } else {
-                    rotate_direction(rotation, Dir::South)
-                };
-                mansion_create_chest(world, reg, out, chunk_bb, rng, pos, facing);
-                return;
-            }
-
-            let spawned = match metadata {
-                "Mage" => {
-                    out.entities.push(EntitySpawn {
-                        pos,
-                        id: "minecraft:evoker".to_string(),
-                        hanging: None,
-                    });
-                    1
-                }
-                "Warrior" => {
-                    out.entities.push(EntitySpawn {
-                        pos,
-                        id: "minecraft:vindicator".to_string(),
-                        hanging: None,
-                    });
-                    1
-                }
-                "Group of Allays" => {
-                    let count = world.level_next_bound(pos, 3) + 1;
-                    for _ in 0..count {
-                        out.entities.push(EntitySpawn {
-                            pos,
-                            id: "minecraft:allay".to_string(),
-                            hanging: None,
-                        });
-                    }
-                    count
-                }
-                _ => return,
+        StructureFlavour::Mansion if metadata.starts_with("Chest") => {
+            let facing = match metadata {
+                "ChestWest" => Dir::West,
+                "ChestEast" => Dir::East,
+                "ChestNorth" => Dir::North,
+                _ => Dir::South,
             };
-            for _ in 0..spawned {
-                if !world.set(pos.0, pos.1, pos.2, reg.state_of("minecraft:air", None)) {
-                    continue;
-                }
-                out.writes += 1;
-                out.be_events.push(BeEvent::Clear(pos));
-            }
+            mansion_create_chest(
+                world,
+                reg,
+                out,
+                chunk_bb,
+                rng,
+                pos,
+                rotate_direction(rotation, facing),
+            );
+        }
+        StructureFlavour::Mansion => mansion_mob_marker(world, reg, out, metadata, pos),
+    }
+}
+
+fn end_city_marker<W: TemplateWorld>(
+    world: &W,
+    out: &mut PlacementOut,
+    metadata: &str,
+    pos: Pos,
+    rotation: Rotation,
+    chunk_bb: &BB,
+    rng: &mut Xor,
+) {
+    if metadata.starts_with("Chest") {
+        let below = (pos.0, pos.1 - 1, pos.2);
+        if bb_inside(chunk_bb, below) {
+            end_city_chest_loot(out, below, rng);
+        }
+        return;
+    }
+    if !bb_inside(chunk_bb, pos) || !in_spawnable_bounds(world, pos) {
+        return;
+    }
+    let (id, hanging) = if metadata.starts_with("Sentry") {
+        ("minecraft:shulker", None)
+    } else if metadata.starts_with("Elytra") {
+        // The ship's frame carries one elytra and consumes no RNG.
+        (
+            "minecraft:item_frame",
+            Some(HangingSpawn {
+                facing: rotate_direction(rotation, Dir::South).data_3d(),
+                item: Some(("minecraft:elytra".to_string(), 1)),
+            }),
+        )
+    } else {
+        return;
+    };
+    out.entities.push(EntitySpawn {
+        pos,
+        id: id.to_string(),
+        hanging,
+    });
+}
+
+fn mansion_mob_marker<W: TemplateWorld>(
+    world: &mut W,
+    reg: &BReg,
+    out: &mut PlacementOut,
+    metadata: &str,
+    pos: Pos,
+) {
+    let (id, count) = match metadata {
+        "Mage" => ("minecraft:evoker", 1),
+        "Warrior" => ("minecraft:vindicator", 1),
+        "Group of Allays" => ("minecraft:allay", world.level_next_bound(pos, 3) + 1),
+        _ => return,
+    };
+    for _ in 0..count {
+        out.entities.push(EntitySpawn {
+            pos,
+            id: id.to_string(),
+            hanging: None,
+        });
+    }
+    for _ in 0..count {
+        if world.set(pos.0, pos.1, pos.2, reg.state_of("minecraft:air", None)) {
+            out.writes += 1;
+            out.be_events.push(BeEvent::Clear(pos));
         }
     }
 }
