@@ -11,7 +11,33 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from pathlib import Path
+
+
+SYNTHETIC_REGISTRY_ENTRIES = (
+    "data/minecraft/dimension_type/overworld.json",
+    "data/minecraft/worldgen/noise_settings/overworld.json",
+    "data/minecraft/worldgen/biome/plains.json",
+    "data/minecraft/tags/block/mineable/pickaxe.json",
+    "data/minecraft/chat_type/chat.json",
+    "data/minecraft/trim_pattern/sentry.json",
+    "data/minecraft/trim_material/iron.json",
+    "data/minecraft/wolf_variant/pale.json",
+    "data/minecraft/painting_variant/alban.json",
+    "data/minecraft/damage_type/in_fire.json",
+    "data/minecraft/banner_pattern/creeper.json",
+    "data/minecraft/enchantment/sharpness.json",
+    "data/minecraft/jukebox_song/13.json",
+)
+
+
+def write_synthetic_vanilla_jar(path: Path) -> None:
+    """Create a minimal clean-room ZIP carrying empty stubs for the 11 synced registries."""
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as jar:
+        for entry in SYNTHETIC_REGISTRY_ENTRIES:
+            info = zipfile.ZipInfo(entry, date_time=(2020, 1, 1, 0, 0, 0))
+            jar.writestr(info, b"{}")
 
 
 def port():
@@ -102,17 +128,60 @@ def main():
     binary = Path(sys.argv[1]).resolve()
     game, rcon = port(), port()
     assert game != rcon
-    env = os.environ.copy()
-    env.update(MEGU_PORT=str(game), MEGU_RCON_PORT=str(rcon),
-               MEGU_RCON_PASS="local-test-secret", MEGU_WG="old",
-               MEGU_BIND_ADDR="127.0.0.1")
     with tempfile.TemporaryDirectory(prefix="megu-smoke-") as workdir:
-        proc = subprocess.Popen([str(binary)], cwd=workdir, env=env,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        work = Path(workdir)
+        base_env = os.environ.copy()
+        base_env.update(
+            MEGU_PORT=str(game),
+            MEGU_RCON_PORT=str(rcon),
+            MEGU_RCON_PASS="local-test-secret",
+            MEGU_WG="old",
+            MEGU_BIND_ADDR="127.0.0.1",
+        )
+
+        # 1. Fail-closed contract: starting without config_packets.bin or any
+        #    vanilla datapack/JAR must exit 2 before binding the listener.
+        unconfigured_env = base_env.copy()
+        unconfigured_env["MEGU_VANILLA_JAR"] = str(work / "absent.jar")
+        unconfigured = subprocess.run(
+            [str(binary)],
+            cwd=workdir,
+            env=unconfigured_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert unconfigured.returncode == 2, (
+            f"expected fail-closed exit 2 without vanilla data, got {unconfigured.returncode}: "
+            f"{unconfigured.stderr[:400]}"
+        )
+        assert "configuration exchange not ready" in unconfigured.stderr, unconfigured.stderr[:400]
+
+        # 2. Clean-room synthetic registry JAR satisfies pre-bind validation
+        #    so status, malformed handshake, and RCON smoke checks run without
+        #    Mojang assets in the repository.
+        synthetic_jar = work / "synthetic-vanilla.jar"
+        write_synthetic_vanilla_jar(synthetic_jar)
+        env = base_env.copy()
+        env["MEGU_VANILLA_JAR"] = str(synthetic_jar)
+
+        proc = subprocess.Popen(
+            [str(binary)],
+            cwd=workdir,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
         try:
             for _ in range(100):
                 if proc.poll() is not None:
-                    raise AssertionError(f"server exited early: {proc.returncode}")
+                    err = proc.stderr.read() if proc.stderr else ""
+                    raise AssertionError(
+                        f"server exited early: {proc.returncode}\n{err[:600]}"
+                    )
                 try:
                     status(game)
                     break
@@ -123,7 +192,7 @@ def main():
             malformed_handshake(game)
             status(game)  # malformed input did not kill the listener
             check_rcon(rcon)
-            print("wire smoke: status, malformed handshake, RCON rejection/auth PASS")
+            print("wire smoke: fail-closed boot, status, malformed handshake, RCON rejection/auth PASS")
         finally:
             proc.terminate()
             try:
@@ -131,6 +200,8 @@ def main():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
+            if proc.stderr:
+                proc.stderr.close()
 
 
 if __name__ == "__main__":
