@@ -20,9 +20,11 @@ ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 MINECRAFT = "1.21.1"
 MC_VERSIONS = ("1.21.1", "26.3")
 BOOTSTRAP_UID = "net.megu.bootstrapper"
-BOOTSTRAP_LIBRARY = "net.megu:bootstrapper:1.0.0"
-BOOTSTRAP_JAR = Path("net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar")
-BOOTSTRAP_PATCH = "net.megu.bootstrapper.json"
+BOOTSTRAP_NAME = "Megu"
+BOOTSTRAP_VERSION = "1.0.0"
+BOOTSTRAP_LIBRARY = f"net.megu:bootstrapper:{BOOTSTRAP_VERSION}"
+BOOTSTRAP_JAR = f"bootstrapper-{BOOTSTRAP_VERSION}.jar"
+BOOTSTRAP_PATCH = f"{BOOTSTRAP_UID}.json"
 MAX_BOOTSTRAP_JAR = 32 * 1024
 MESH_ABI = 1
 KERNEL_ABI = 1
@@ -91,16 +93,22 @@ def component_list(loader, loader_version, mc_version=MINECRAFT):
     return components
 
 
+def bootstrap_requirements(mc_version):
+    return [{"uid": "net.minecraft", "equals": mc_version}]
+
+
 def bootstrap_patch(mc_version, client_sha256):
     """Prism custom patch: the bootstrapper jar becomes the game mainClass."""
     patch = {
         "formatVersion": 1,
         "uid": BOOTSTRAP_UID,
-        "version": "1.0.0",
-        "name": "megu bootstrapper",
+        "name": BOOTSTRAP_NAME,
+        "version": BOOTSTRAP_VERSION,
+        "order": 5,
+        "requires": bootstrap_requirements(mc_version),
         "mainClass": "net.megu.launcher.Main",
-        "inheritsFrom": mc_version,
-        "libraries": [{"name": BOOTSTRAP_LIBRARY, "MMC-hint": "local"}],
+        "libraries": [{"name": BOOTSTRAP_LIBRARY, "MMC-hint": "local",
+                       "MMC-filename": BOOTSTRAP_JAR}],
     }
     if client_sha256:
         patch["+jvmArgs"] = [f"-Dmegu.clientSha256={client_sha256.lower()}"]
@@ -110,9 +118,17 @@ def bootstrap_patch(mc_version, client_sha256):
 def prism_export(directory, loader, loader_version, name, client_bin, client_sha256,
                  integrated_jar, native_libs, mc_version=MINECRAFT, bootstrap_jar=None):
     directory.mkdir(parents=True, exist_ok=True)
+    components = component_list(loader, loader_version, mc_version)
     if bootstrap_jar is not None:
-        # Zero-shell-wrapper mode: Prism applies patches/*.json itself, so the
-        # bootstrapper JAR is the mainClass on Windows, macOS and Linux alike.
+        # Prism applies the patch listed in mmc-pack and resolves local JARs
+        # directly under libraries/, not under a Maven-style path.
+        components.append({
+            "uid": BOOTSTRAP_UID,
+            "version": BOOTSTRAP_VERSION,
+            "cachedName": BOOTSTRAP_NAME,
+            "cachedVersion": BOOTSTRAP_VERSION,
+            "cachedRequires": bootstrap_requirements(mc_version),
+        })
         library = directory / "libraries" / BOOTSTRAP_JAR
         library.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(bootstrap_jar, library)
@@ -124,13 +140,7 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(client_bin, target)
             target.chmod(0o755)
-        write_text(directory / "mmc-pack.json", json_text({
-            "formatVersion": 1,
-            "components": component_list(loader, loader_version, mc_version),
-        }))
-        write_text(directory / "instance.cfg",
-                   "[General]\nInstanceType=OneSix\n"
-                   f"name={name}\nOverrideCommands=false\n")
+        commands = "OverrideCommands=false\n"
     else:
         # Prism's wrapper command needs a fully resolved executable. Double quotes
         # preserve paths containing spaces in Prism's command-line splitter.
@@ -147,13 +157,13 @@ def prism_export(directory, loader, loader_version, name, client_bin, client_sha
         elif client_sha256:
             wrapper_command += f" --client-sha256 {client_sha256.lower()}"
 
-        write_text(directory / "mmc-pack.json", json_text({
-            "formatVersion": 1,
-            "components": component_list(loader, loader_version, mc_version),
-        }))
-        write_text(directory / "instance.cfg",
-                   "[General]\nInstanceType=OneSix\n"
-                   f"name={name}\nOverrideCommands=true\nWrapperCommand={wrapper_command}\n")
+        commands = f"OverrideCommands=true\nWrapperCommand={wrapper_command}\n"
+
+    write_text(directory / "mmc-pack.json", json_text({
+        "formatVersion": 1,
+        "components": components,
+    }))
+    write_text(directory / "instance.cfg", f"[General]\nInstanceType=OneSix\nname={name}\n{commands}")
     if integrated_jar:
         destination = directory / ".minecraft/mods/megu-integrated.jar"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -175,9 +185,15 @@ def zip_entry(archive, name, data, mode=0o644):
 def prism_zip_export(prism_dir, destination):
     """Package a Prism instance directory into a deterministic importable .zip."""
     destination.parent.mkdir(parents=True, exist_ok=True)
+    archive_path = destination.resolve()
     with zipfile.ZipFile(destination, "w") as archive:
         for path in sorted(prism_dir.rglob("*")):
             if not path.is_file():
+                continue
+            # In Prism-only mode the archive is created at the instance root.
+            # Exclude it and any stale root ZIPs left by previous exports.
+            if ((path.parent == prism_dir and path.suffix.lower() == ".zip")
+                    or path.resolve() == archive_path):
                 continue
             rel = path.relative_to(prism_dir).as_posix()
             mode = 0o755 if (path.stat().st_mode & 0o111) else 0o644

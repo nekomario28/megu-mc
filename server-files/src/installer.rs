@@ -57,10 +57,14 @@ pub use megu_core::crypto::Sha256;
 
 /// Maven coordinate the Official Launcher profile and Prism patch share.
 pub const BOOTSTRAP_LIBRARY_COORD: &str = "net.megu:bootstrapper:1.0.0";
-/// Path of the staged bootstrapper JAR relative to a `libraries/` root.
+/// Maven path of the Official Launcher's bootstrapper JAR relative to `libraries/`.
 pub const BOOTSTRAP_LIBRARY_REL: &str = "net/megu/bootstrapper/1.0.0/bootstrapper-1.0.0.jar";
-/// Directory holding the staged bootstrapper JAR relative to a `libraries/` root.
+/// Maven directory holding the Official Launcher's bootstrapper jar under `libraries/`.
 pub const BOOTSTRAP_LIBRARY_DIR: &str = "net/megu/bootstrapper/1.0.0";
+// Prism's local-library hint resolves a filename directly under `libraries/`.
+const PRISM_BOOTSTRAP_LIBRARY_FILE: &str = "bootstrapper-1.0.0.jar";
+const PRISM_BOOTSTRAP_NAME: &str = "Megu";
+const PRISM_BOOTSTRAP_VERSION: &str = "1.0.0";
 /// The bootstrapper's entry point the launchers run.
 pub const BOOTSTRAP_MAIN_CLASS: &str = "net.megu.launcher.Main";
 /// Prism component `uid` for the local bootstrapper patch.
@@ -998,6 +1002,13 @@ pub fn prism_instance_name(mc_version: TargetVersion) -> String {
     format!("Megu-{}", mc_version.id())
 }
 
+fn bootstrap_requirements(mc_version: TargetVersion) -> Json {
+    Json::Array(vec![Json::Object(vec![
+        ("uid".into(), Json::String("net.minecraft".into())),
+        ("equals".into(), Json::String(mc_version.id().into())),
+    ])])
+}
+
 /// `mmc-pack.json`: the vanilla component plus the local bootstrapper
 /// patch when a JAR is staged.
 fn mmc_pack_json(mc_version: TargetVersion, with_bootstrapper: bool) -> Json {
@@ -1009,7 +1020,10 @@ fn mmc_pack_json(mc_version: TargetVersion, with_bootstrapper: bool) -> Json {
     if with_bootstrapper {
         components.push(Json::Object(vec![
             ("uid".into(), Json::String(BOOTSTRAP_PATCH_UID.into())),
-            ("version".into(), Json::String("1.0.0".into())),
+            ("version".into(), Json::String(PRISM_BOOTSTRAP_VERSION.into())),
+            ("cachedName".into(), Json::String(PRISM_BOOTSTRAP_NAME.into())),
+            ("cachedVersion".into(), Json::String(PRISM_BOOTSTRAP_VERSION.into())),
+            ("cachedRequires".into(), bootstrap_requirements(mc_version)),
         ]));
     }
     Json::Object(vec![
@@ -1024,18 +1038,20 @@ fn bootstrap_patch_json(mc_version: TargetVersion, pin: &ClientPin) -> Json {
     let mut members = vec![
         ("formatVersion".into(), Json::Number(1.0)),
         ("uid".into(), Json::String(BOOTSTRAP_PATCH_UID.into())),
-        ("version".into(), Json::String("1.0.0".into())),
-        ("name".into(), Json::String("megu bootstrapper".into())),
+        ("name".into(), Json::String(PRISM_BOOTSTRAP_NAME.into())),
+        ("version".into(), Json::String(PRISM_BOOTSTRAP_VERSION.into())),
+        ("order".into(), Json::Number(5.0)),
+        ("requires".into(), bootstrap_requirements(mc_version)),
         ("mainClass".into(), Json::String(BOOTSTRAP_MAIN_CLASS.into())),
-        (
-            "inheritsFrom".into(),
-            Json::String(mc_version.id().into()),
-        ),
         (
             "libraries".into(),
             Json::Array(vec![Json::Object(vec![
                 ("name".into(), Json::String(BOOTSTRAP_LIBRARY_COORD.into())),
                 ("MMC-hint".into(), Json::String("local".into())),
+                (
+                    "MMC-filename".into(),
+                    Json::String(PRISM_BOOTSTRAP_LIBRARY_FILE.into()),
+                ),
             ])]),
         ),
     ];
@@ -1102,8 +1118,8 @@ pub fn install_prism(
 
     if let Some(jar) = &options.bootstrap_jar {
         validated_bootstrap_jar(jar)?;
-        ensure_subdir(&instance, &Path::new("libraries").join(BOOTSTRAP_LIBRARY_DIR))?;
-        let dest = instance.join("libraries").join(BOOTSTRAP_LIBRARY_REL);
+        ensure_subdir(&instance, Path::new("libraries"))?;
+        let dest = instance.join("libraries").join(PRISM_BOOTSTRAP_LIBRARY_FILE);
         stage_file(jar, &dest)?;
         actions.push(ReportEntry {
             path: dest,

@@ -336,7 +336,7 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
     let client_sha = installer::sha256_file(&client).unwrap();
 
     let mut options = client_options();
-    options.bootstrap_jar = Some(jar);
+    options.bootstrap_jar = Some(jar.clone());
     options.client_bin = Some(client);
     installer::install_prism(&instances, &options).unwrap();
 
@@ -359,23 +359,37 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
         &Json::String("1.21.1".into())
     );
     assert_eq!(get(&components[0], "important"), &Json::Bool(true));
-    assert_eq!(
-        get(&components[1], "uid"),
-        &Json::String(installer::BOOTSTRAP_PATCH_UID.into())
-    );
+    let component = &components[1];
+    assert_eq!(get(component, "uid").as_str(), Some("net.megu.bootstrapper"));
+    assert_eq!(get(component, "version").as_str(), Some("1.0.0"));
+    assert_eq!(get(component, "cachedName").as_str(), Some("Megu"));
+    assert_eq!(get(component, "cachedVersion").as_str(), Some("1.0.0"));
+    let cached_requires = get(component, "cachedRequires");
+    let requires = cached_requires.as_array().unwrap();
+    assert_eq!(requires.len(), 1);
+    assert_eq!(get(&requires[0], "uid").as_str(), Some("net.minecraft"));
+    assert_eq!(get(&requires[0], "equals").as_str(), Some("1.21.1"));
 
     let patch = read_json(&instance.join("patches").join(BOOTSTRAP_PATCH_FILE));
-    assert_eq!(
-        get(&patch, "mainClass"),
-        &Json::String(installer::BOOTSTRAP_MAIN_CLASS.into())
-    );
-    assert_eq!(get(&patch, "inheritsFrom"), &Json::String("1.21.1".into()));
+    assert_eq!(get(&patch, "formatVersion"), &Json::Number(1.0));
+    assert_eq!(get(&patch, "uid"), get(component, "uid"));
+    assert_eq!(get(&patch, "name"), get(component, "cachedName"));
+    assert_eq!(get(&patch, "version"), get(component, "version"));
+    assert_eq!(get(&patch, "order"), &Json::Number(5.0));
+    assert_eq!(get(&patch, "requires"), cached_requires);
+    assert_eq!(get(&patch, "mainClass").as_str(), Some("net.megu.launcher.Main"));
+    assert!(patch.get("inheritsFrom").is_none());
     let libs = get(&patch, "libraries").as_array().unwrap();
+    assert_eq!(libs.len(), 1);
     assert_eq!(
         get(&libs[0], "name"),
         &Json::String(installer::BOOTSTRAP_LIBRARY_COORD.into())
     );
     assert_eq!(get(&libs[0], "MMC-hint"), &Json::String("local".into()));
+    assert_eq!(
+        get(&libs[0], "MMC-filename").as_str(),
+        Some("bootstrapper-1.0.0.jar")
+    );
     let jvm_args = get(&patch, "+jvmArgs").as_array().unwrap();
     assert!(
         jvm_args
@@ -388,9 +402,10 @@ fn prism_instance_install_creates_valid_cfg_mmc_pack_and_standard_client_folders
             .any(|a| a.as_str().unwrap() == format!("-Dmegu.clientSha256={client_sha}"))
     );
     assert_eq!(
-        std::fs::read(instance.join("libraries").join(BOOTSTRAP_LIBRARY_REL)).unwrap(),
-        b"PK\x03\x04fake-jar"
+        std::fs::read(instance.join("libraries/bootstrapper-1.0.0.jar")).unwrap(),
+        std::fs::read(jar).unwrap()
     );
+    assert!(!instance.join("libraries").join(BOOTSTRAP_LIBRARY_REL).exists());
     assert!(instance.join(".minecraft/bin/megu-client").is_file());
     for folder in CLIENT_STANDARD_FOLDERS {
         assert!(

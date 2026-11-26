@@ -258,8 +258,8 @@ public final class Main {
         Path binary = resolveBinary(gameDir, clientBin);
         if (binary == null) {
             System.err.println("megu launcher: native client not found or not executable "
-                    + "(--client-bin, MEGU_CLIENT_BIN, --gameDir/<name>, "
-                    + "--gameDir/bin/<name>, PATH; Unix and Windows .exe names)");
+                    + "(--client-bin, MEGU_CLIENT_BIN, -Dmegu.clientBin, --gameDir/<name>, "
+                    + "--gameDir/bin/<name>, standard Megu install directories, PATH)");
             return 2;
         }
 
@@ -1162,18 +1162,52 @@ public final class Main {
         return names;
     }
 
+    private static Path findExecutableInDirectory(Path directory, List<String> names) {
+        for (String name : names) {
+            Path found = regularFile(directory.resolve(name).toString());
+            if (found != null && Files.isExecutable(found)) {
+                return found;
+            }
+        }
+        return null;
+    }
+
     private static Path findOnPath(List<String> names) {
         String path = System.getenv("PATH");
         if (path == null) {
             return null;
         }
         for (String dir : path.split(java.util.regex.Pattern.quote(java.io.File.pathSeparator), -1)) {
-            for (String name : names) {
-                Path found = regularFile(Path.of(dir.isEmpty() ? "." : dir, name).toString());
-                if (found != null && Files.isExecutable(found)) {
-                    return found;
-                }
+            Path found = findExecutableInDirectory(Path.of(dir.isEmpty() ? "." : dir), names);
+            if (found != null) {
+                return found;
             }
+        }
+        return null;
+    }
+
+    private static Path findInstalledBinary(List<String> names) {
+        // Prism's gameDir is the instance, not the original Minecraft/Megu install.
+        try {
+            Path found = findExecutableInDirectory(detectMinecraftDir().resolve("bin"), names);
+            if (found != null) {
+                return found;
+            }
+            if (isWindows()) {
+                String localAppData = System.getenv("LOCALAPPDATA");
+                if (localAppData != null && !localAppData.isBlank()) {
+                    Path megu = Path.of(localAppData, "Megu");
+                    found = findExecutableInDirectory(megu.resolve("bin"), names);
+                    // install_windows.ps1 publishes its active binaries under current/.
+                    return found != null ? found : findExecutableInDirectory(megu.resolve("current"), names);
+                }
+            } else {
+                Path home = Path.of(System.getProperty("user.home", "."));
+                found = findExecutableInDirectory(home.resolve(".local/share/megu/bin"), names);
+                return found != null ? found : findExecutableInDirectory(home.resolve(".local/bin"), names);
+            }
+        } catch (InvalidPathException ignored) {
+            // A malformed install directory cannot be used as a native binary path.
         }
         return null;
     }
@@ -1206,7 +1240,8 @@ public final class Main {
                 // A malformed gameDir cannot be used as a native binary path.
             }
         }
-        return findOnPath(names);
+        Path installed = findInstalledBinary(names);
+        return installed != null ? installed : findOnPath(names);
     }
 
     private static void verifySha256(Path binary, String expected) throws IOException {
