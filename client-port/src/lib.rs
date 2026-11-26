@@ -38,6 +38,7 @@ mod region;
 mod section;
 pub mod shaderpack;
 pub mod shaderpack_reflect;
+pub mod shape_templates;
 pub mod space_sky_bridge;
 pub mod tactile_effects;
 pub mod upload_budget;
@@ -132,6 +133,10 @@ pub use shaderpack::{
     ShaderPipelinePlan, ShaderUniformRequirements, ShadowSettings, SsboSpec, MAX_INCLUDE_DEPTH,
     MAX_PACK_FILES, MAX_PACK_UNPACKED_BYTES, MAX_PROPERTIES_BYTES, MAX_SHADER_FILE_BYTES,
     MAX_TOTAL_INCLUDES, MAX_ZIP_FILE_BYTES, MEGU_WGSL_MANIFEST,
+};
+pub use shape_templates::{
+    MaterialBinding, MaterialSlotBinding, ShapeArchetype, ShapeTemplate, ShapeTemplateRegistry,
+    StairShape, TemplateQuad, TemplateSavingsReport, WallSide, InstantiatedQuad,
 };
 pub use upload_budget::{
     ChunkUploadBudget, UploadBudget, UploadBudgetProfile, DEFAULT_MAX_UPLOADS_PER_FRAME,
