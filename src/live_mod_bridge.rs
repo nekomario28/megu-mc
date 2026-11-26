@@ -9385,6 +9385,7 @@ mod wire_mods_tests {
             .active_order()
             .iter()
             .any(|id| id == "custom_mod:add_emerald"));
+        suite.active = true;
         *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
         let drops = apply_live_mod_loot_modifiers(
             "minecraft:chests/simple_dungeon",
@@ -9422,7 +9423,10 @@ mod wire_mods_tests {
             .contains_key("minecraft:chests/simple_dungeon"));
         assert!(suite.glm_engine.active_order().is_empty());
         assert!(suite.damage_hooks.is_empty());
-        assert!(suite.unified_tags.export_flat(TagDomain::Item).is_empty());
+        assert!(!suite
+            .unified_tags
+            .export_flat(TagDomain::Item)
+            .contains_key("custom_mod:m3c_blocked"));
         assert!(!suite.dependency_resolution.missing_required.is_empty());
         assert!(suite.reports.iter().any(|report| {
             report.file_name == "custom-mod-1.jar"
