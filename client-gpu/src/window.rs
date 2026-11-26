@@ -33,8 +33,8 @@ use megu_client::world::{TrackedBlockEntity, TrackedEntity};
 use megu_client::zsh_command_bar::ZshCommandBar;
 use megu_client_mesh::ber_instancing::{
     build_ber_mesh, build_extended_ber_mesh, BerBellMount, BerChestKind, BerDyeColor,
-    VanillaBerExtendedState, VanillaBerFacing, VanillaBerKind,
-    VanillaBerState, VanillaParticlePayload, VanillaParticleQuad, VanillaParticleWorld,
+    VanillaBerExtendedState, VanillaBerFacing, VanillaBerKind, VanillaBerState,
+    VanillaParticlePayload, VanillaParticleQuad, VanillaParticleWorld,
 };
 use megu_client_mesh::builtin_shadow_wgsl::{
     enchantment_glint_rgb, BuiltinShadowQuality, RenderScalePreset,
@@ -65,8 +65,8 @@ use megu_proto::seamless_portal::{
     SEAMLESS_PORTAL_CHANNEL,
 };
 use megu_ui::container_screen::{
-    menu_schema, ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState, MenuScreenSchema,
-    MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction,
+    menu_schema, ContainerScreenState, ContainerSlotHotkey, DragState, InventorySortState,
+    MenuScreenSchema, MerchantOfferView, SlotDef, SlotKind, UiItemStack, WorkstationAction,
 };
 use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
@@ -98,13 +98,20 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowAttributes, Window
 
 use crate::atmosphere::{blend_dimension_crossfade, BiomeAtmosphereBlender, ChunkFadeTracker};
 use crate::clipboard::{ClipboardOutcome, SystemClipboard};
+use crate::entity_appearance::{EntityAppearanceQuery, RuntimeEntityAppearanceAtlas};
+use crate::item_visuals_3d::{
+    build_winit_window_icon, discover_official_builtin_packs, merged_end_credits_lines,
+    upgrade_item_icon_atlas_with_3d_blocks, SpriteRgba,
+};
 use crate::live_session::{
     jar_version_ids, CloudDeckMode, CrosshairPick, EntityContactShadowQuad, LiveSession,
     PlayerMovement, PlayerPose, SessionPaths, SessionStatus, CLOUD_SUBWORLD_ID,
 };
+use crate::panorama_pass::vanilla_panorama_angles;
 use crate::renderer::{request_gpu_device, GpuRenderer};
 use crate::subworld_sync::SubWorldHelmCmd;
 use crate::title_branding::{title_branding_sources, TitleBrandingAssets};
+use crate::vanilla_official_extras::VanillaOfficialExtras;
 use crate::{
     build_demo_scene, detect_display_server_kind, fingerprint_draw_list, preferred_alpha_mode,
     present_mode_for, select_display_presentation_policy, Camera, DisplayPresentationPolicy,
@@ -1080,6 +1087,9 @@ pub struct GpuApp {
     /// Complete decoded local 1.21.1 asset bundle, retained for retries,
     /// translations, player cosmetics and credits text.
     vanilla_runtime_assets: Option<crate::vanilla_assets_bridge::VanillaRuntimeAssets>,
+    vanilla_official_extras: Option<VanillaOfficialExtras>,
+    entity_appearance: Option<RuntimeEntityAppearanceAtlas>,
+    viewmodel_skin_uploaded: Option<([u8; 16], u64)>,
     player_skin_cache: Option<crate::player_skins::PlayerSkinCache>,
     /// `true` once the JAR scan for `gui_sprite_atlas` ran — bootstrap
     /// completion re-arms it.
@@ -1176,6 +1186,8 @@ struct LiveEntityRenderCache {
     /// Pose-fingerprint-keyed rig meshes; rebuilt only when an entity's
     /// spec or pose actually changes.
     entity_meshes: std::collections::HashMap<i32, (u64, ExtrudedMesh)>,
+    entity_visuals:
+        std::collections::HashMap<i32, (u64, crate::entity_appearance::EntityVisualLayers)>,
     entity_interpolation: std::collections::HashMap<i32, EntityInterpolation>,
     dynamic_ber_meshes:
         std::collections::HashMap<[i32; 3], (VanillaBerExtendedState, ExtrudedMesh)>,
@@ -1199,6 +1211,7 @@ impl Default for LiveEntityRenderCache {
     fn default() -> Self {
         Self {
             entity_meshes: std::collections::HashMap::new(),
+            entity_visuals: std::collections::HashMap::new(),
             entity_interpolation: std::collections::HashMap::new(),
             dynamic_ber_meshes: std::collections::HashMap::new(),
             ber_animation_easing: std::collections::HashMap::new(),
@@ -1272,8 +1285,7 @@ fn interpolate_entity(
         sample.head_yaw = interpolate_angle(sample.head_yaw, target.head_yaw, 0.5);
         sample.pitch += (target.pitch - sample.pitch) * 0.5;
         sample.hurt_ticks += (target.hurt_ticks - sample.hurt_ticks) * 0.5;
-        sample.limb_swing_amount +=
-            (target.limb_swing_amount - sample.limb_swing_amount) * 0.5;
+        sample.limb_swing_amount += (target.limb_swing_amount - sample.limb_swing_amount) * 0.5;
     }
     *sample
 }
@@ -1546,6 +1558,9 @@ impl GpuApp {
             ui_modoverlay_list: UiDrawList::new(),
             gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas::default(),
             vanilla_runtime_assets: None,
+            vanilla_official_extras: None,
+            entity_appearance: None,
+            viewmodel_skin_uploaded: None,
             player_skin_cache: None,
             gui_sprites_loaded: false,
             render_config,
@@ -1646,6 +1661,159 @@ impl GpuApp {
         app
     }
 
+    pub fn ensure_vanilla_official_extras(&mut self) -> bool {
+        if self.vanilla_official_extras.is_some() {
+            return true;
+        }
+        let (jar, _) = title_branding_sources(&self.session_paths);
+        let assets_dir = self
+            .session_paths
+            .assets_dir
+            .as_ref()
+            .filter(|path| path.is_dir());
+        let asset_index = self.session_paths.asset_index.as_deref().unwrap_or("17");
+        self.vanilla_official_extras = Some(VanillaOfficialExtras::load(
+            jar.as_deref(),
+            assets_dir.map(std::path::PathBuf::as_path),
+            asset_index,
+        ));
+        true
+    }
+
+    pub fn vanilla_official_extras(&self) -> Option<&VanillaOfficialExtras> {
+        self.vanilla_official_extras.as_ref()
+    }
+
+    pub fn entity_appearance(&self) -> Option<&RuntimeEntityAppearanceAtlas> {
+        self.entity_appearance.as_ref()
+    }
+
+    pub fn official_builtin_resource_packs(&self) -> Vec<(String, String, std::path::PathBuf)> {
+        self.vanilla_official_extras
+            .as_ref()
+            .map(discover_official_builtin_packs)
+            .unwrap_or_default()
+    }
+
+    pub fn upload_title_panorama_visuals(
+        jar: Option<&std::path::Path>,
+        resource_packs: &[std::path::PathBuf],
+        extras: &VanillaOfficialExtras,
+        renderer: &mut GpuRenderer,
+    ) -> bool {
+        let gui_assets = crate::vanilla_gui_sprites::load_gui_stack(jar, resource_packs);
+        renderer.upload_title_panorama(
+            &gui_assets,
+            extras
+                .gui_sprite_rgba("title/background/panorama_overlay.png")
+                .map(|image| (image.rgba.as_slice(), image.width, image.height)),
+        )
+    }
+
+    fn rebuild_entity_appearance(&mut self) {
+        let (Some(runtime), Some(extras)) = (
+            self.vanilla_runtime_assets.as_ref(),
+            self.vanilla_official_extras.as_ref(),
+        ) else {
+            return;
+        };
+        self.entity_appearance = Some(RuntimeEntityAppearanceAtlas::new(
+            &runtime.entity_atlas,
+            extras,
+        ));
+    }
+
+    pub fn upload_entity_appearance_if_dirty(&mut self) -> bool {
+        let Some(active) = self.active.as_mut() else {
+            return false;
+        };
+        let Some(appearance) = self.entity_appearance.as_mut() else {
+            return false;
+        };
+        if !appearance.take_dirty() {
+            return false;
+        }
+        active
+            .renderer
+            .upload_entity_texture_atlas(appearance.atlas());
+        true
+    }
+
+    fn apply_official_window_icon(&mut self) {
+        let Some(extras) = self.vanilla_official_extras.as_ref() else {
+            return;
+        };
+        let Some(icon) = build_winit_window_icon(extras) else {
+            return;
+        };
+        if let Some(active) = self.active.as_ref() {
+            active.window.set_window_icon(Some(icon));
+        }
+    }
+
+    fn configured_builtin_pack_enabled(&self, id: &str) -> bool {
+        let Some(game_dir) = self.session_paths.game_dir.as_deref() else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(game_dir.join("options.txt")) else {
+            return false;
+        };
+        let Some(value) = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+        else {
+            return false;
+        };
+        let Ok(parsed) = megu_core::json::parse_json(value) else {
+            return false;
+        };
+        let megu_core::json::JsonValue::Array(entries) = parsed else {
+            return false;
+        };
+        let namespaced = format!("minecraft:{id}");
+        let zipped = format!("file/{id}.zip");
+        entries
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .any(|entry| entry == id || entry == namespaced || entry == zipped)
+    }
+
+    pub fn sync_official_builtin_pack_menu_entries(&mut self) -> usize {
+        let packs = self.official_builtin_resource_packs();
+        let mut present = 0usize;
+        for (id, display_name, object_path) in packs {
+            let namespaced_id = format!("minecraft:{id}");
+            let file_stem = object_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.trim_end_matches(".zip").to_owned());
+            let enabled = self.configured_builtin_pack_enabled(&id);
+            let existing = self.ui.mod_menu.entries.iter_mut().find(|entry| {
+                entry.mod_id == id
+                    || entry.mod_id == namespaced_id
+                    || entry.name == display_name
+                    || file_stem.as_ref().is_some_and(|stem| entry.mod_id == *stem)
+            });
+            if let Some(entry) = existing {
+                entry.name = display_name.clone();
+                entry.version = "1.21.1".into();
+                entry.enabled |= enabled;
+                entry.summary = "Official built-in Minecraft resource pack".into();
+            } else {
+                let mut entry =
+                    megu_ui::mod_menu::ModMenuEntry::new(&namespaced_id, &display_name, "1.21.1");
+                entry.enabled = enabled;
+                entry.summary = "Official built-in Minecraft resource pack".into();
+                entry.loader = megu_ui::mod_menu::ModLoaderTag::MeguNative;
+                entry.tier = megu_ui::mod_menu::ModAdaptationBadge::Tier1Native;
+                entry.reload_mode = megu_ui::mod_menu::ModReloadBadge::HotReload;
+                self.ui.mod_menu.entries.push(entry);
+            }
+            present += 1;
+        }
+        present
+    }
+
     /// Decode the local client JAR's `widget/*` GUI sprites into
     /// `gui_sprite_atlas` (re-keyed to the `SpriteId` contract) and push
     /// the texture to `ui_quad` binding 5 when a renderer is live.
@@ -1656,6 +1824,7 @@ impl GpuApp {
         if self.vanilla_runtime_assets.is_some() {
             return;
         }
+        self.ensure_vanilla_official_extras();
         let (jar, _) = title_branding_sources(&self.session_paths);
         let assets_dir = self
             .session_paths
@@ -1679,19 +1848,35 @@ impl GpuApp {
         );
         self.gui_sprite_atlas = runtime.gui_atlas.clone();
         self.gui_sprites_loaded = true;
+        self.rebuild_entity_appearance();
+        self.sync_official_builtin_pack_menu_entries();
         if let Some(active) = self.active.as_mut() {
             Self::upload_runtime_assets_to_renderer(&runtime, &mut active.renderer);
+            if let Some(extras) = self.vanilla_official_extras.as_ref() {
+                Self::upload_title_panorama_visuals(
+                    Some(&jar),
+                    &packs,
+                    extras,
+                    &mut active.renderer,
+                );
+            }
         }
+        self.upload_entity_appearance_if_dirty();
+        self.apply_official_window_icon();
         if let Some(live) = self.live.as_mut() {
             live.apply_biome_colormaps(&runtime.world_assets);
         }
-        let skin_dir = assets_dir
-            .clone()
-            .or_else(|| self.session_paths.game_dir.as_ref().map(|p| p.join("assets")));
+        let skin_dir = assets_dir.clone().or_else(|| {
+            self.session_paths
+                .game_dir
+                .as_ref()
+                .map(|p| p.join("assets"))
+        });
         if let Some(skin_dir) = skin_dir {
             self.player_skin_cache = Some(crate::player_skins::PlayerSkinCache::new(skin_dir));
         }
         self.vanilla_runtime_assets = Some(runtime);
+        self.rebuild_entity_appearance();
     }
 
     fn runtime_resource_pack_paths(&self) -> Vec<std::path::PathBuf> {
@@ -1726,7 +1911,9 @@ impl GpuApp {
     pub fn vanilla_runtime_assets_summary(
         &self,
     ) -> Option<crate::vanilla_assets_bridge::VanillaRuntimeAssetsSummary> {
-        self.vanilla_runtime_assets.as_ref().map(|assets| assets.summary())
+        self.vanilla_runtime_assets
+            .as_ref()
+            .map(|assets| assets.summary())
     }
 
     /// Retained local asset bundle for renderer adapters and credits/UI.
@@ -1771,12 +1958,70 @@ impl GpuApp {
                     .collect()
             })
             .unwrap_or_default();
+        let uuids: Vec<[u8; 16]> = entries.iter().map(|(uuid, _)| *uuid).collect();
         if let Some(cache) = self.player_skin_cache.as_mut() {
             for (uuid, textures) in entries {
                 cache.request_skin_for_uuid(uuid, textures.as_deref());
             }
             cache.poll_completed();
         }
+        let mut viewmodel_upload = None;
+        let local_uuid = self.local_player_uuid();
+        if let (Some(cache), Some(appearance)) = (
+            self.player_skin_cache.as_ref(),
+            self.entity_appearance.as_mut(),
+        ) {
+            let mut changed = false;
+            for uuid in uuids {
+                if let Some(skin) = cache.get_skin(uuid) {
+                    changed |= appearance.upsert_player_skin(uuid, skin);
+                }
+            }
+            if changed {
+                let revision = appearance.revision();
+                if let Some(skin) = cache.get_skin(local_uuid) {
+                    if !skin.skin_rgba.is_empty()
+                        && self.viewmodel_skin_uploaded != Some((local_uuid, revision))
+                    {
+                        viewmodel_upload = Some((
+                            local_uuid,
+                            revision,
+                            skin.width,
+                            skin.height,
+                            skin.skin_rgba.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.upload_entity_appearance_if_dirty();
+        if let (Some(active), Some((uuid, revision, width, height, rgba))) =
+            (self.active.as_mut(), viewmodel_upload)
+        {
+            active
+                .renderer
+                .upload_viewmodel_surface_texture(width, height, &rgba);
+            self.viewmodel_skin_uploaded = Some((uuid, revision));
+        }
+    }
+
+    fn local_player_uuid(&self) -> [u8; 16] {
+        if self
+            .config
+            .access_token
+            .as_ref()
+            .is_some_and(|token| token.is_present())
+        {
+            if let Some(uuid) = self
+                .config
+                .uuid
+                .as_deref()
+                .and_then(|raw| megu_client::protocol::parse_uuid(raw).ok())
+            {
+                return uuid;
+            }
+        }
+        megu_client::protocol::offline_uuid(&self.config.username)
     }
 
     /// Non-blocking resolved remote skin lookup for entity render adapters.
@@ -2112,10 +2357,17 @@ impl GpuApp {
             .as_ref()
             .map(|assets| &assets.i18n.texts_and_fonts)
         {
-            credits.load_text(
-                texts.end_text.as_deref().unwrap_or(""),
-                texts.postcredits_text.as_deref().unwrap_or(""),
-            );
+            if let Some(extras) = self.vanilla_official_extras.as_ref() {
+                let merged = merged_end_credits_lines(texts, extras);
+                if !merged.is_empty() {
+                    credits.lines = merged;
+                }
+            } else {
+                credits.load_text(
+                    texts.end_text.as_deref().unwrap_or(""),
+                    texts.postcredits_text.as_deref().unwrap_or(""),
+                );
+            }
         }
         self.credits_screen = Some(credits);
         self.paused = true;
@@ -2266,10 +2518,14 @@ impl GpuApp {
         renderer: &mut GpuRenderer,
         entity_shadows: bool,
         enchantment_glint: bool,
+        appearance: Option<&RuntimeEntityAppearanceAtlas>,
     ) {
         cache.entity_meshes.retain(|eid, _| {
             live.entity_rig(*eid).is_some() || live.world.entities.contains_key(eid)
         });
+        cache
+            .entity_visuals
+            .retain(|eid, _| live.world.entities.contains_key(eid));
         cache
             .entity_interpolation
             .retain(|eid, _| live.world.entities.contains_key(eid));
@@ -2289,6 +2545,7 @@ impl GpuApp {
                 cache,
                 &mut entity_refs,
                 enchantment_glint,
+                appearance,
                 eid,
                 spec,
                 pos,
@@ -2306,6 +2563,7 @@ impl GpuApp {
                 cache,
                 &mut entity_refs,
                 enchantment_glint,
+                appearance,
                 eid,
                 spec,
                 pos,
@@ -2317,22 +2575,27 @@ impl GpuApp {
         // `sample_live_entity_light` closure the rigs use, gated on the
         // `entity_shadows` settings key.
         stage_contact_shadow_quads(live, entity_shadows, &mut cache.contact_shadow_quads);
-        let mut ber_refs: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
-        let mut animated_ber_refs: Vec<([i32; 3], [f32; 3])> = Vec::new();
+        let mut ber_refs: Vec<StaticBerRef> = Vec::new();
+        let mut animated_ber_refs: Vec<AnimatedBerRef> = Vec::new();
         for (block_pos, be) in &live.world.block_entities {
-            if let Some(visual) = live.world.block_entity_visual_state(*block_pos) {
+            let be_visual = live.world.block_entity_visual_state(*block_pos);
+            let classified_kind = classify_tracked_block_entity(be);
+            let be_uv = classified_kind
+                .and_then(|kind| vanilla_ber_appearance_uv(appearance, kind, be_visual.as_ref()));
+            if let Some(visual) = be_visual {
                 if let Some(state) = live_animated_ber_state(live, cache, *block_pos, visual) {
-                    let mesh = cache.dynamic_ber_meshes.entry(*block_pos).or_insert_with(|| {
-                        (state, build_extended_ber_mesh(state.kind(), state))
-                    });
+                    let mesh = cache
+                        .dynamic_ber_meshes
+                        .entry(*block_pos)
+                        .or_insert_with(|| (state, build_extended_ber_mesh(state.kind(), state)));
                     if mesh.0 != state {
                         *mesh = (state, build_extended_ber_mesh(state.kind(), state));
                     }
-                    animated_ber_refs.push((*block_pos, [1.0; 3]));
+                    animated_ber_refs.push((*block_pos, [1.0; 3], be_uv));
                     continue;
                 }
             }
-            let Some(kind) = classify_tracked_block_entity(be) else {
+            let Some(kind) = classified_kind else {
                 continue;
             };
             let slot = ber_kind_slot(kind);
@@ -2348,9 +2611,10 @@ impl GpuApp {
                     block_pos[2] as f32,
                 ],
                 vanilla_ber_base_color_f32(kind),
+                be_uv,
             ));
         }
-        let mut meshes: Vec<(&ExtrudedMesh, [f32; 3], [f32; 3])> = Vec::with_capacity(
+        let mut meshes: Vec<crate::renderer::TexturedEntityBerMesh<'_>> = Vec::with_capacity(
             entity_refs.len()
                 + ber_refs.len()
                 + animated_ber_refs.len()
@@ -2358,31 +2622,39 @@ impl GpuApp {
         );
         for (eid, origin, tint) in entity_refs {
             if let Some((_, mesh)) = cache.entity_meshes.get(&eid) {
-                meshes.push((mesh, origin, tint));
+                let layers = cache.entity_visuals.get(&eid).map(|(_, layers)| layers);
+                let base_uv = layers.and_then(|layers| layers.base_uv);
+                meshes.push((mesh, origin, tint, base_uv));
+                if let Some(layers) = layers {
+                    for overlay in &layers.overlays {
+                        meshes.push((mesh, origin, overlay.tint, Some(overlay.uv)));
+                    }
+                }
             }
         }
         for (shadow_mesh, tint) in &cache.contact_shadow_quads {
             // Positions are already world-space (`floor_top + 0.015`), so
             // the staging origin stays at zero.
-            meshes.push((shadow_mesh, [0.0, 0.0, 0.0], *tint));
+            meshes.push((shadow_mesh, [0.0, 0.0, 0.0], *tint, None));
         }
-        for (slot, origin, tint) in ber_refs {
+        for (slot, origin, tint, uv) in ber_refs {
             if let Some(mesh) = cache.ber_meshes[slot].as_ref() {
-                meshes.push((mesh, origin, tint));
+                meshes.push((mesh, origin, tint, uv));
             }
         }
-        for (pos, tint) in animated_ber_refs {
+        for (pos, tint, uv) in animated_ber_refs {
             if let Some((_, mesh)) = cache.dynamic_ber_meshes.get(&pos) {
                 meshes.push((
                     mesh,
                     [pos[0] as f32, pos[1] as f32, pos[2] as f32],
                     tint,
+                    uv,
                 ));
             }
         }
         if meshes.is_empty() {
             if cache.staged {
-                renderer.set_entity_and_ber_meshes_lit(Vec::new(), |x, y, z| {
+                renderer.set_entity_and_ber_meshes_textured(Vec::new(), |x, y, z| {
                     sample_live_entity_light(live, x, y, z)
                 });
                 cache.staged = false;
@@ -2390,7 +2662,7 @@ impl GpuApp {
             return;
         }
         cache.staged = true;
-        renderer.set_entity_and_ber_meshes_lit(meshes, |x, y, z| {
+        renderer.set_entity_and_ber_meshes_textured(meshes, |x, y, z| {
             sample_live_entity_light(live, x, y, z)
         });
     }
@@ -4592,9 +4864,16 @@ impl GpuApp {
         self.set_cursor_grab(false);
     }
 
-    pub fn dispatch_creative_action(&mut self, action: megu_ui::creative_screen::CreativeInventoryAction) {
+    pub fn dispatch_creative_action(
+        &mut self,
+        action: megu_ui::creative_screen::CreativeInventoryAction,
+    ) {
         match action {
-            megu_ui::creative_screen::CreativeInventoryAction::SetCreativeSlot { slot, item_id, count } => {
+            megu_ui::creative_screen::CreativeInventoryAction::SetCreativeSlot {
+                slot,
+                item_id,
+                count,
+            } => {
                 if let Some(live) = &mut self.live {
                     live.send_creative_mode_slot(slot, item_id, count);
                     live.play_ui_click();
@@ -4614,7 +4893,10 @@ impl GpuApp {
     }
 
     fn creative_mouse_click(&mut self, x: i32, y: i32) -> bool {
-        let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+        let (w, h) = self
+            .active
+            .as_ref()
+            .map_or((0, 0), |a| (a.size.width, a.size.height));
         let (px, py) = ((w as i32 - 194) / 2, (h as i32 - 166) / 2);
         use megu_ui::creative_screen::{CreativeClick, CreativeTab};
         let target = if (py + 6..py + 21).contains(&y) && (px + 8..px + 188).contains(&x) {
@@ -4625,13 +4907,17 @@ impl GpuApp {
             let row = ((y - (py + 24)) / 19).clamp(0, 4) as usize;
             Some(CreativeClick::Item(row * 9 + col))
         } else if (py + 132..py + 150).contains(&y) && (px + 8..px + 179).contains(&x) {
-            Some(CreativeClick::Hotbar(((x - (px + 8)) / 19).clamp(0, 8) as u8))
+            Some(CreativeClick::Hotbar(
+                ((x - (px + 8)) / 19).clamp(0, 8) as u8
+            ))
         } else if (py + 132..py + 150).contains(&y) && (px + 174..px + 192).contains(&x) {
             Some(CreativeClick::Trash)
         } else {
             None
         };
-        let Some(state) = self.creative_inventory.as_mut() else { return false };
+        let Some(state) = self.creative_inventory.as_mut() else {
+            return false;
+        };
         if let Some(target) = target {
             if let Some(action) = state.click(target) {
                 self.dispatch_creative_action(action);
@@ -4664,8 +4950,7 @@ impl GpuApp {
         let Some(stack) = live.player_inventory.get(&slot) else {
             return false;
         };
-        static TABLE: std::sync::OnceLock<megu_proto::ProtocolTable> =
-            std::sync::OnceLock::new();
+        static TABLE: std::sync::OnceLock<megu_proto::ProtocolTable> = std::sync::OnceLock::new();
         let table = TABLE.get_or_init(megu_proto::ProtocolTable::v767_builtin);
         if table.registry_name("minecraft:item", stack.item_id.max(0) as u32)
             != Some("minecraft:writable_book")
@@ -4683,12 +4968,10 @@ impl GpuApp {
             .iter()
             .find(|component| u32::try_from(component.type_id).ok() == Some(content_id))
             .and_then(|component| {
-                megu_proto::item_components::VerifiedComponent::decode(
-                    &megu_proto::RawComponent {
-                        type_id: content_id,
-                        data: component.data.clone(),
-                    },
-                )
+                megu_proto::item_components::VerifiedComponent::decode(&megu_proto::RawComponent {
+                    type_id: content_id,
+                    data: component.data.clone(),
+                })
                 .ok()
             })
             .and_then(|component| match component {
@@ -4840,6 +5123,7 @@ impl GpuApp {
     }
 
     fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
+        self.ensure_vanilla_official_extras();
         let size = PhysicalSize::new(
             self.config.width.unwrap_or(1280).max(1),
             self.config.height.unwrap_or(720).max(1),
@@ -4905,6 +5189,13 @@ impl GpuApp {
             size,
             surface_copy_src_supported: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
         };
+        if let Some(icon) = self
+            .vanilla_official_extras
+            .as_ref()
+            .and_then(build_winit_window_icon)
+        {
+            active.window.set_window_icon(Some(icon));
+        }
         let config = surface_config_for(
             self.render_config.vsync,
             self.render_config.effective_fps_cap(self.focused),
@@ -4984,6 +5275,16 @@ impl GpuApp {
         }
         if let Some(assets) = &self.vanilla_runtime_assets {
             Self::upload_runtime_assets_to_renderer(assets, &mut active.renderer);
+            if let Some(extras) = self.vanilla_official_extras.as_ref() {
+                let (jar, _) = title_branding_sources(&self.session_paths);
+                let packs = self.runtime_resource_pack_paths();
+                Self::upload_title_panorama_visuals(
+                    jar.as_deref(),
+                    &packs,
+                    extras,
+                    &mut active.renderer,
+                );
+            }
         }
         // One-time PCIe upload of the runtime `MEGU EDITION` banner
         // textures (wordmark + patched edition strip); the CPU copies
@@ -5405,7 +5706,9 @@ impl GpuApp {
                         }
                         return true;
                     }
-                    if let Some(action) = screen.click_with_shift(slot_index, button_id, self.keys.down) {
+                    if let Some(action) =
+                        screen.click_with_shift(slot_index, button_id, self.keys.down)
+                    {
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
                         }
@@ -6166,7 +6469,10 @@ impl GpuApp {
                 planes.as_ref().map_or(&[][..], |p| &p[..]),
             );
             live.tick_gameplay_frame(dt);
-            if self.ui.screen == Screen::InGameHud && !self.paused && self.container_screen.is_none() {
+            if self.ui.screen == Screen::InGameHud
+                && !self.paused
+                && self.container_screen.is_none()
+            {
                 if self.left_mouse_held {
                     let target = match live.crosshair_pick() {
                         Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
@@ -6277,7 +6583,10 @@ impl GpuApp {
                     (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
                     -self.camera.pitch_deg,
                 );
-                live.send_paddle_boat(!self.paused && self.keys.left, !self.paused && self.keys.right);
+                live.send_paddle_boat(
+                    !self.paused && self.keys.left,
+                    !self.paused && self.keys.right,
+                );
             }
         }
 
@@ -6309,6 +6618,16 @@ impl GpuApp {
             self.ui.settings.video.comfort_exposure,
             self.ui.settings.video.indirect_light_bounce,
         );
+        let frame_elapsed_secs = frame_begin
+            .saturating_duration_since(self.ui_anim_epoch)
+            .as_secs_f32();
+        let (panorama_yaw, panorama_pitch) = vanilla_panorama_angles(frame_elapsed_secs);
+        active.renderer.set_title_panorama_state(
+            self.ui.screen == Screen::Title && active.renderer.has_title_panorama(),
+            panorama_yaw,
+            panorama_pitch,
+            1.0,
+        );
 
         let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
@@ -6321,11 +6640,63 @@ impl GpuApp {
             active
                 .renderer
                 .set_block_break_overlay(live.active_block_break_overlay());
-            active.renderer.set_gameplay_screen_overlay(live.gameplay_screen_overlay());
-            active.renderer.set_first_person_viewmodel(live.first_person_viewmodel(
-                self.ui.screen == Screen::InGameHud && self.container_screen.is_none() && !self.paused,
+            active
+                .renderer
+                .set_gameplay_screen_overlay(live.gameplay_screen_overlay());
+            let dimension_kind = match live.world.dimension.name.as_str() {
+                "minecraft:the_nether" => 1,
+                "minecraft:the_end" => 2,
+                _ => 0,
+            };
+            let world_time = live.world_time_ticks();
+            let sun_dir = megu_client_mesh::builtin_shadow_wgsl::compute_sun_direction(world_time);
+            let moon_phase = ((live.world.world_age.div_euclid(24_000)).rem_euclid(8)) as u8;
+            active.renderer.set_world_env_frame(
+                dimension_kind,
+                rain_level,
+                live.season_ambience.snow_amount() > 0.5,
+                moon_phase,
+                sun_dir,
+                frame_elapsed_secs,
+            );
+            let vm = live.first_person_viewmodel(
+                self.ui.screen == Screen::InGameHud
+                    && self.container_screen.is_none()
+                    && !self.paused
+                    && self.camera_controller.mode == CameraMode::FirstPerson,
                 (0.0, 0.0),
-            ));
+            );
+            let uv_rect = vm
+                .held_item_name
+                .as_deref()
+                .and_then(|name| self.item_icon_atlas.uv(name));
+            let held_slot = 36 + live.hud.selected_slot.min(8) as i32;
+            let enchanted = live
+                .player_inventory
+                .get(&held_slot)
+                .is_some_and(crate::live_session::item_stack_has_glint);
+            let (block_light, sky_light) = live.sample_block_and_sky_light(
+                self.camera.position[0],
+                self.camera.position[1],
+                self.camera.position[2],
+            );
+            let light = (f32::from(block_light.max(sky_light)) / 15.0).clamp(0.2, 1.0);
+            active.renderer.set_viewmodel_extras(
+                uv_rect,
+                enchanted,
+                [light, light, light],
+                frame_elapsed_secs,
+            );
+            let spyglass_active = vm.visible
+                && self.right_mouse_held
+                && vm
+                    .held_item_name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("spyglass"));
+            active
+                .renderer
+                .set_spyglass_alpha(if spyglass_active { 1.0 } else { 0.0 });
+            active.renderer.set_first_person_viewmodel(vm);
             // Off-thread/priority-0 mesh payloads the session published
             // this poll ride the reconcile below — the renderer treats
             // them as authoritative until the world derives its own. The
@@ -6412,7 +6783,8 @@ impl GpuApp {
                 live.upload_pending_atlas(&mut active.renderer);
             }
             if !self.item_icon_atlas_uploaded {
-                if let Some(atlas) = live.item_icon_atlas.take() {
+                if let Some(mut atlas) = live.item_icon_atlas.take() {
+                    upgrade_ui_item_icon_atlas_with_3d_blocks(&mut atlas);
                     // Same RAM/VRAM split as the block atlas: `rgba`
                     // uploads once, the uv map stays CPU-side for
                     // `UiCommand::ItemIcon` tessellation.
@@ -6481,6 +6853,7 @@ impl GpuApp {
                     // does on the 2D path.
                     self.ui.settings.video.entity_shadows,
                     self.ui.settings.video.enchantment_glint,
+                    self.entity_appearance.as_ref(),
                 );
             }
             // First live frame on the windowed path: hand the sink to the
@@ -6716,11 +7089,7 @@ impl GpuApp {
                 }
             }
         }
-        if self
-            .live
-            .as_ref()
-            .is_some_and(LiveSession::is_sleeping)
-        {
+        if self.live.as_ref().is_some_and(LiveSession::is_sleeping) {
             megu_ui::gameplay_screens::BedSleepOverlay { visible: true }.render(
                 w,
                 h,
@@ -6847,12 +7216,12 @@ impl GpuApp {
                 .filter(|_| night_sky_on)
                 .map(|live| night_sky_drama_lines(live.latest_night_sky_drama(), &render_camera))
                 .unwrap_or_default();
-            if let Some(CrosshairPick::Block(hit)) = self
-                .live
-                .as_ref()
-                .and_then(LiveSession::crosshair_pick)
+            if let Some(CrosshairPick::Block(hit)) =
+                self.live.as_ref().and_then(LiveSession::crosshair_pick)
             {
-                drama_lines.extend(crate::renderer::block_selection_outline_lines(hit.block_pos));
+                drama_lines.extend(crate::renderer::block_selection_outline_lines(
+                    hit.block_pos,
+                ));
             }
             active.renderer.set_debug_lines(&drama_lines);
         }
@@ -7022,7 +7391,11 @@ impl GpuApp {
                 }
                 if self.screenshot_pending {
                     self.screenshot_pending = false;
-                    let game_dir = self.config.game_dir.as_deref().unwrap_or(std::path::Path::new("."));
+                    let game_dir = self
+                        .config
+                        .game_dir
+                        .as_deref()
+                        .unwrap_or(std::path::Path::new("."));
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -7046,8 +7419,7 @@ impl GpuApp {
                         }
                         let bgra = matches!(
                             active.surface_format,
-                            wgpu::TextureFormat::Bgra8Unorm
-                                | wgpu::TextureFormat::Bgra8UnormSrgb
+                            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
                         );
                         if !bgra
                             && !matches!(
@@ -7252,8 +7624,12 @@ impl GpuApp {
                         let action = book.close();
                         self.dispatch_book_action(action);
                     }
-                    KeyCode::ArrowLeft => { book.click(BookEditorClick::Previous); }
-                    KeyCode::ArrowRight => { book.click(BookEditorClick::Next); }
+                    KeyCode::ArrowLeft => {
+                        book.click(BookEditorClick::Previous);
+                    }
+                    KeyCode::ArrowRight => {
+                        book.click(BookEditorClick::Next);
+                    }
                     KeyCode::Backspace => book.backspace(),
                     KeyCode::Enter if book.title_entry => {
                         let action = book.submit_title();
@@ -7261,9 +7637,13 @@ impl GpuApp {
                     }
                     KeyCode::Enter => {
                         let action = book.click(BookEditorClick::Done);
-                        if let Some(action) = action { self.dispatch_book_action(action); }
+                        if let Some(action) = action {
+                            self.dispatch_book_action(action);
+                        }
                     }
-                    KeyCode::KeyS => { book.click(BookEditorClick::SignAndClose); }
+                    KeyCode::KeyS => {
+                        book.click(BookEditorClick::SignAndClose);
+                    }
                     _ => {}
                 }
             }
@@ -7283,7 +7663,10 @@ impl GpuApp {
             self.leave_bed();
             return;
         }
-        if pressed && code == KeyCode::KeyE && self.live.as_ref().is_some_and(|live| live.game_mode == 1) {
+        if pressed
+            && code == KeyCode::KeyE
+            && self.live.as_ref().is_some_and(|live| live.game_mode == 1)
+        {
             if self.creative_inventory.is_some() {
                 self.creative_inventory = None;
                 self.maybe_regrab();
@@ -7293,7 +7676,10 @@ impl GpuApp {
             return;
         }
         if pressed
-            && !self.container_screen.as_ref().is_some_and(|screen| screen.rename_focused)
+            && !self
+                .container_screen
+                .as_ref()
+                .is_some_and(|screen| screen.rename_focused)
         {
             let container_hotkey = match code {
                 KeyCode::Digit1 => Some(ContainerSlotHotkey::HotbarSwap(0)),
@@ -7306,7 +7692,9 @@ impl GpuApp {
                 KeyCode::Digit8 => Some(ContainerSlotHotkey::HotbarSwap(7)),
                 KeyCode::Digit9 => Some(ContainerSlotHotkey::HotbarSwap(8)),
                 KeyCode::KeyF => Some(ContainerSlotHotkey::OffhandSwap),
-                KeyCode::KeyQ if self.modifiers.control_key() => Some(ContainerSlotHotkey::DropStack),
+                KeyCode::KeyQ if self.modifiers.control_key() => {
+                    Some(ContainerSlotHotkey::DropStack)
+                }
                 KeyCode::KeyQ => Some(ContainerSlotHotkey::DropOne),
                 _ => None,
             };
@@ -8260,20 +8648,38 @@ impl ApplicationHandler for GpuApp {
                 if button == MouseButton::Right {
                     self.right_mouse_held = state == ElementState::Pressed;
                 }
-                if self.book_editor.is_some() && button == MouseButton::Left && state == ElementState::Pressed {
-                    let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+                if self.book_editor.is_some()
+                    && button == MouseButton::Left
+                    && state == ElementState::Pressed
+                {
+                    let (w, h) = self
+                        .active
+                        .as_ref()
+                        .map_or((0, 0), |a| (a.size.width, a.size.height));
                     let (x, y) = self.mouse_pos;
                     let rel_x = x - w as i32 / 2;
                     let click = if y > h as i32 / 2 + 70 {
-                        Some(if rel_x < -45 { megu_ui::gameplay_screens::BookEditorClick::Previous }
-                            else if rel_x < 5 { megu_ui::gameplay_screens::BookEditorClick::Next }
-                            else if rel_x < 50 { megu_ui::gameplay_screens::BookEditorClick::Done }
-                            else { megu_ui::gameplay_screens::BookEditorClick::SignAndClose })
-                    } else { None };
+                        Some(if rel_x < -45 {
+                            megu_ui::gameplay_screens::BookEditorClick::Previous
+                        } else if rel_x < 5 {
+                            megu_ui::gameplay_screens::BookEditorClick::Next
+                        } else if rel_x < 50 {
+                            megu_ui::gameplay_screens::BookEditorClick::Done
+                        } else {
+                            megu_ui::gameplay_screens::BookEditorClick::SignAndClose
+                        })
+                    } else {
+                        None
+                    };
                     if let (Some(editor), Some(click)) = (self.book_editor.as_mut(), click) {
-                        if let Some(action) = editor.click(click) { self.dispatch_book_action(action); }
+                        if let Some(action) = editor.click(click) {
+                            self.dispatch_book_action(action);
+                        }
                     }
-                } else if self.creative_inventory.is_some() && button == MouseButton::Left && state == ElementState::Pressed {
+                } else if self.creative_inventory.is_some()
+                    && button == MouseButton::Left
+                    && state == ElementState::Pressed
+                {
                     let (x, y) = self.mouse_pos;
                     self.creative_mouse_click(x, y);
                 } else if state == ElementState::Pressed
@@ -8281,7 +8687,10 @@ impl ApplicationHandler for GpuApp {
                     && self.live.as_ref().is_some_and(LiveSession::is_sleeping)
                 {
                     let (x, y) = self.mouse_pos;
-                    let (w, h) = self.active.as_ref().map_or((0, 0), |a| (a.size.width, a.size.height));
+                    let (w, h) = self
+                        .active
+                        .as_ref()
+                        .map_or((0, 0), |a| (a.size.width, a.size.height));
                     let overlay = megu_ui::gameplay_screens::BedSleepOverlay { visible: true };
                     if overlay.click(x, y, w, h) {
                         self.leave_bed();
@@ -8297,7 +8706,9 @@ impl ApplicationHandler for GpuApp {
                         let (x, y) = self.mouse_pos;
                         let actions = self.ui.handle_input(UiInputEvent::Click { x, y });
                         if !actions.is_empty() {
-                            if let Some(live) = &mut self.live { live.play_ui_click(); }
+                            if let Some(live) = &mut self.live {
+                                live.play_ui_click();
+                            }
                         }
                         for action in actions {
                             self.apply_ui_action(&action, event_loop);
@@ -9060,11 +9471,7 @@ fn vanilla_ber_base_color_f32(kind: VanillaBerKind) -> [f32; 3] {
     ]
 }
 
-fn ease_ber_animation(
-    cache: &mut LiveEntityRenderCache,
-    pos: [i32; 3],
-    target: f32,
-) -> f32 {
+fn ease_ber_animation(cache: &mut LiveEntityRenderCache, pos: [i32; 3], target: f32) -> f32 {
     let current = cache.ber_animation_easing.entry(pos).or_insert(target);
     *current += (target - *current) * 0.35;
     if (*current - target).abs() < 0.001 {
@@ -9080,8 +9487,7 @@ fn live_animated_ber_state(
     visual: megu_client::world::BlockEntityVisualState,
 ) -> Option<VanillaBerExtendedState> {
     let facing = VanillaBerFacing::South;
-    let phase = (live.world.world_age.rem_euclid(24_000) as f32 / 24_000.0)
-        * std::f32::consts::TAU;
+    let phase = (live.world.world_age.rem_euclid(24_000) as f32 / 24_000.0) * std::f32::consts::TAU;
     Some(match visual {
         megu_client::world::BlockEntityVisualState::Chest {
             open_count,
@@ -9298,6 +9704,330 @@ fn entity_rig_pose(live: &LiveSession, eid: i32, tracked: Option<&TrackedEntity>
     pose
 }
 
+fn probable_cube_block_icon(name: &str) -> bool {
+    let short = name.rsplit(':').next().unwrap_or(name);
+    const ITEM_TOKENS: &[&str] = &[
+        "sword",
+        "pickaxe",
+        "axe",
+        "shovel",
+        "hoe",
+        "bow",
+        "crossbow",
+        "trident",
+        "shield",
+        "potion",
+        "apple",
+        "bread",
+        "bucket",
+        "elytra",
+        "stick",
+        "ingot",
+        "nugget",
+        "gem",
+        "diamond",
+        "emerald",
+        "coal",
+        "charcoal",
+        "quartz",
+        "shard",
+        "crystal",
+        "pearl",
+        "eye_of",
+        "book",
+        "paper",
+        "map",
+        "compass",
+        "clock",
+        "torch",
+        "dust",
+        "powder",
+        "egg",
+        "seed",
+        "bean",
+        "berry",
+        "carrot",
+        "potato",
+        "beetroot",
+        "wheat",
+        "sugar",
+        "bone",
+        "feather",
+        "leather",
+        "hide",
+        "meat",
+        "beef",
+        "porkchop",
+        "chicken",
+        "mutton",
+        "rabbit",
+        "cod",
+        "salmon",
+        "fish",
+        "stew",
+        "soup",
+        "pie",
+        "cookie",
+        "melon_slice",
+        "blade",
+        "shell",
+        "star",
+        "saddle",
+        "helmet",
+        "chestplate",
+        "leggings",
+        "boots",
+        "horse_armor",
+        "minecart",
+        "boat",
+        "sign",
+        "bed",
+        "door",
+        "banner",
+        "dye",
+        "arrow",
+        "firework",
+        "music_disc",
+        "disc",
+        "template",
+        "key",
+        "brush",
+        "shears",
+        "flint_and_steel",
+        "rod",
+        "lead",
+        "nametag",
+        "chain",
+        "flower",
+        "sapling",
+        "vine",
+        "lily_pad",
+        "coral_fan",
+        "coral",
+        "seagrass",
+        "kelp",
+        "grass",
+        "fern",
+        "bush",
+        "stem",
+        "roots",
+        "fungus",
+        "mushroom",
+        "candle",
+        "pane",
+        "slab",
+        "stairs",
+        "wall",
+        "fence",
+        "button",
+        "pressure_plate",
+        "rail",
+        "wire",
+        "repeater",
+        "comparator",
+        "ladder",
+        "scaffolding",
+        "azalea",
+        "dripleaf",
+        "lichen",
+        "amethyst_bud",
+    ];
+    !ITEM_TOKENS.iter().any(|token| short.contains(token))
+}
+
+fn extract_item_icon_cell(atlas: &megu_ui::draw::ItemIconAtlas, name: &str) -> Option<Vec<u8>> {
+    let [u0, v0, u1, v1] = atlas.uv(name)?;
+    let x0 = (u0 * atlas.width as f32).floor() as u32;
+    let y0 = (v0 * atlas.height as f32).floor() as u32;
+    let x1 = (u1 * atlas.width as f32).ceil() as u32;
+    let y1 = (v1 * atlas.height as f32).ceil() as u32;
+    if x1 <= x0 || y1 <= y0 || x1 > atlas.width || y1 > atlas.height {
+        return None;
+    }
+    let width = (x1 - x0) as usize;
+    let height = (y1 - y0) as usize;
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in y0..y1 {
+        let start = ((y * atlas.width + x0) * 4) as usize;
+        rgba.extend_from_slice(&atlas.rgba[start..start + width * 4]);
+    }
+    Some(rgba)
+}
+
+pub fn upgrade_ui_item_icon_atlas_with_3d_blocks(
+    atlas: &mut megu_ui::draw::ItemIconAtlas,
+) -> usize {
+    const CELL: u32 = megu_ui::draw::ITEM_ICON_CELL;
+    let mut extracted = Vec::new();
+    for item_id in 0..2048u32 {
+        let name = crate::recipe_ingest::item_name_for_id(item_id);
+        if !probable_cube_block_icon(&name) || !name.contains(':') {
+            continue;
+        }
+        if let Some(rgba) = extract_item_icon_cell(atlas, &name) {
+            if !extracted
+                .iter()
+                .any(|(existing, _): &(String, Vec<u8>)| *existing == name)
+            {
+                extracted.push((name, rgba));
+            }
+        }
+    }
+    let mut inputs = std::collections::BTreeMap::new();
+    for (name, rgba) in &extracted {
+        if rgba.len() == (CELL * CELL * 4) as usize {
+            let sprite = SpriteRgba::new(CELL, CELL, rgba);
+            inputs.insert(name.clone(), (sprite, sprite, None));
+        }
+    }
+    let upgraded = upgrade_item_icon_atlas_with_3d_blocks(&inputs, CELL);
+    let mut replaced = 0usize;
+    for (name, rgba) in &upgraded {
+        let Some([u0, v0, u1, v1]) = atlas.uv(name) else {
+            continue;
+        };
+        let x0 = (u0 * atlas.width as f32).floor() as u32;
+        let y0 = (v0 * atlas.height as f32).floor() as u32;
+        let x1 = (u1 * atlas.width as f32).ceil() as u32;
+        let y1 = (v1 * atlas.height as f32).ceil() as u32;
+        if x1 - x0 != CELL || y1 - y0 != CELL {
+            continue;
+        }
+        for row in 0..CELL {
+            let dst = (((y0 + row) * atlas.width + x0) * 4) as usize;
+            let src = (row * CELL * 4) as usize;
+            atlas.rgba[dst..dst + (CELL * 4) as usize]
+                .copy_from_slice(&rgba[src..src + (CELL * 4) as usize]);
+        }
+        replaced += 1;
+    }
+    replaced
+}
+
+fn vanilla_dye_color_name(color: u8) -> &'static str {
+    [
+        "white",
+        "orange",
+        "magenta",
+        "light_blue",
+        "yellow",
+        "lime",
+        "pink",
+        "gray",
+        "light_gray",
+        "cyan",
+        "purple",
+        "blue",
+        "brown",
+        "green",
+        "red",
+        "black",
+    ][usize::from(color.min(15))]
+}
+
+fn vanilla_villager_biome_name(index: i32) -> Option<&'static str> {
+    [
+        "desert", "jungle", "plains", "savanna", "snow", "swamp", "taiga",
+    ]
+    .get(usize::try_from(index).ok()?)
+    .copied()
+}
+
+fn vanilla_villager_profession_name(index: i32) -> Option<&'static str> {
+    [
+        "none",
+        "armorer",
+        "butcher",
+        "cartographer",
+        "cleric",
+        "farmer",
+        "fisherman",
+        "fletcher",
+        "leatherworker",
+        "librarian",
+        "mason",
+        "nitwit",
+        "shepherd",
+        "toolsmith",
+        "weaponsmith",
+    ]
+    .get(usize::try_from(index).ok()?)
+    .copied()
+}
+
+fn entity_appearance_query<'a>(
+    live: &LiveSession,
+    eid: i32,
+    spec: EntityRigSpec,
+    tracked: Option<&TrackedEntity>,
+) -> EntityAppearanceQuery<'a> {
+    let visual = live.world.entity_visual_state(eid);
+    let villager = visual.as_ref().and_then(|state| state.villager_data);
+    EntityAppearanceQuery {
+        entity_type_id: Some(spec.entity_type_id),
+        entity_name: Some(spec.name),
+        uuid: tracked.map(|entity| entity.uuid),
+        color: visual
+            .as_ref()
+            .and_then(|state| state.sheep_color)
+            .map(vanilla_dye_color_name),
+        sheared: visual
+            .as_ref()
+            .and_then(|state| state.sheep_sheared)
+            .unwrap_or(false),
+        powered: visual
+            .as_ref()
+            .and_then(|state| state.creeper_charged)
+            .unwrap_or(false),
+        angry: visual
+            .as_ref()
+            .and_then(|state| state.warden_anger)
+            .is_some_and(|anger| anger > 0),
+        villager_biome: villager.and_then(|(biome, _, _)| vanilla_villager_biome_name(biome)),
+        villager_profession: villager
+            .and_then(|(_, profession, _)| vanilla_villager_profession_name(profession)),
+        villager_level: villager
+            .map(|(_, _, level)| u8::try_from(level.clamp(0, 5)).unwrap_or(0))
+            .unwrap_or(0),
+        ..EntityAppearanceQuery::default()
+    }
+}
+
+fn entity_appearance_cache_key(
+    live: &LiveSession,
+    eid: i32,
+    spec: EntityRigSpec,
+    tracked: Option<&TrackedEntity>,
+    revision: u64,
+) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    let mut mix = |value: u64| {
+        hash ^= value;
+        hash = hash.wrapping_mul(FNV1A64_PRIME);
+    };
+    mix(revision);
+    mix(u64::from(spec.entity_type_id));
+    if let Some(uuid) = tracked.map(|entity| entity.uuid) {
+        for byte in uuid {
+            mix(u64::from(byte));
+        }
+    }
+    if let Some(visual) = live.world.entity_visual_state(eid) {
+        mix(u64::from(visual.sheep_color.unwrap_or(255)));
+        mix(u64::from(visual.sheep_sheared.unwrap_or(false)));
+        mix(u64::from(visual.creeper_charged.unwrap_or(false)));
+        if let Some((biome, profession, level)) = visual.villager_data {
+            mix((biome as u64) << 32 | (profession as u64) << 8 | level as u64);
+        }
+        mix(visual.warden_anger.unwrap_or(0).max(0) as u64);
+    }
+    if let Some(tracked) = tracked {
+        mix(u64::from(tracked.equipment_slots));
+    }
+    mix(live.entity_mainhand_item_id(eid).unwrap_or(0).max(0) as u64);
+    hash
+}
+
 fn extended_entity_pose_key(mut key: u64, pose: &EntityRigPose) -> u64 {
     for value in [pose.open_amount, pose.swell_amount] {
         key ^= (f64::from(value) * 64.0).round() as i64 as u64;
@@ -9381,6 +10111,7 @@ fn stage_live_entity(
     cache: &mut LiveEntityRenderCache,
     entity_refs: &mut Vec<(i32, [f32; 3], [f32; 3])>,
     glint_on: bool,
+    appearance: Option<&RuntimeEntityAppearanceAtlas>,
     eid: i32,
     spec: EntityRigSpec,
     pos: [f64; 3],
@@ -9414,6 +10145,19 @@ fn stage_live_entity(
             [0.0; 3],
         );
         cache.entity_meshes.insert(eid, (key, mesh));
+    }
+    if let Some(appearance) = appearance {
+        let visual_key =
+            entity_appearance_cache_key(live, eid, spec, tracked, appearance.revision());
+        if cache
+            .entity_visuals
+            .get(&eid)
+            .is_none_or(|(key, _)| *key != visual_key)
+        {
+            let query = entity_appearance_query(live, eid, spec, tracked);
+            let resolved = appearance.resolve_entity(&query);
+            cache.entity_visuals.insert(eid, (visual_key, resolved));
+        }
     }
     let mut tint = live_entity_tint_interpolated(spec, sample.hurt_ticks);
     if glint_on && live.entity_enchanted_item_glint(eid) {
@@ -9457,6 +10201,33 @@ fn unrigged_entity_fallbacks(
             );
             (*eid, spec, tracked.pos, tracked)
         })
+}
+
+type StaticBerRef = (usize, [f32; 3], [f32; 3], Option<[f32; 4]>);
+type AnimatedBerRef = ([i32; 3], [f32; 3], Option<[f32; 4]>);
+
+fn vanilla_ber_appearance_uv(
+    appearance: Option<&RuntimeEntityAppearanceAtlas>,
+    kind: VanillaBerKind,
+    visual: Option<&megu_client::world::BlockEntityVisualState>,
+) -> Option<[f32; 4]> {
+    let appearance = appearance?;
+    let kind_name = match kind {
+        VanillaBerKind::Bed => "bed",
+        VanillaBerKind::Chest => "chest",
+        VanillaBerKind::ShulkerBox => "shulker_box",
+        VanillaBerKind::Sign => "sign",
+        VanillaBerKind::Banner => "banner",
+        _ => return None,
+    };
+    let variant = match visual {
+        Some(megu_client::world::BlockEntityVisualState::ShulkerBox { color, .. })
+        | Some(megu_client::world::BlockEntityVisualState::Banner {
+            base_color: color, ..
+        }) => vanilla_dye_color_name(*color),
+        _ => "",
+    };
+    appearance.resolve_ber(kind_name, variant)
 }
 
 /// The live contact shadows to stage this refresh — the session's
@@ -11945,12 +12716,16 @@ mod tests {
         let pos = [0.0, 64.0, 0.0];
         let mut cache = LiveEntityRenderCache::default();
         let mut refs = Vec::new();
-        stage_live_entity(&live, &mut cache, &mut refs, false, 40, spec, pos, tracked);
+        stage_live_entity(
+            &live, &mut cache, &mut refs, false, None, 40, spec, pos, tracked,
+        );
         let base = refs[0].2;
         assert_eq!(base, live_entity_tint(spec, tracked));
 
         let mut refs = Vec::new();
-        stage_live_entity(&live, &mut cache, &mut refs, true, 40, spec, pos, tracked);
+        stage_live_entity(
+            &live, &mut cache, &mut refs, true, None, 40, spec, pos, tracked,
+        );
         let glinted = refs[0].2;
         assert_ne!(
             glinted, base,
@@ -11966,6 +12741,7 @@ mod tests {
             &mut cache,
             &mut refs,
             true,
+            None,
             41,
             spec41,
             [1.0, 64.0, 0.0],
@@ -12017,6 +12793,7 @@ mod tests {
                 &mut cache,
                 &mut refs,
                 false,
+                None,
                 eid,
                 spec,
                 pos,
