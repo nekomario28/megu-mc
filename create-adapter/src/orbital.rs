@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use mod_adapter_core::dimension_mod as dim_mod;
 use mod_adapter_core::dimension_mod::{DimTypeDescriptor, TeleportIntent};
 
-use crate::aeronautics::{AtmospherePhysics, RigidBodySubWorld};
+use crate::aeronautics::{
+    AtmospherePhysics, BuiltinContactSolver, RigidBodySubWorld, SubLevelPhysicsBackend,
+};
 
 /// Base gravitational acceleration (m/s²) `gravity_scale` multiplies, matching
 /// the value every existing `step(dt, 9.81, ..)` call site passes.
@@ -230,6 +232,21 @@ pub struct ShipDimensionTransition {
     pub passengers: Vec<ShipPassengerTransition>,
 }
 
+/// One atomic ownership hand-off for a completed orbital transfer. Unlike
+/// the richer [`ShipDimensionTransition`] diagnostics record, this commit is
+/// single-owner wire state: exactly one consumer may drain it, after which the
+/// router no longer carries the transfer. `carried_riders` is in entity-id
+/// order and every rider also appears in the drained transition's teleport
+/// intents.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OrbitalTransferCommit {
+    pub ship_id: u64,
+    pub from_dim: u32,
+    pub to_dim: u32,
+    pub target_pos: [f64; 3],
+    pub carried_riders: Vec<i32>,
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -250,8 +267,13 @@ pub struct OrbitalTransitionRouter {
     cooldown_ticks: u64,
     /// `ship_id` -> router tick of its last transition.
     last_transition: BTreeMap<u64, u64>,
-    /// Router clock: one per `step_with_dimension_transitions` call.
+    /// Authoritative server clock used for cooldowns. Legacy callers advance
+    /// it once per routed step; production callers pass the server tick to
+    /// [`Self::step_with_dimension_transitions_at`] so fleet size cannot
+    /// accelerate transfer cooldowns.
     tick: u64,
+    /// Single-owner transfer commits queued until the bridge drains them.
+    pending_commits: Vec<OrbitalTransferCommit>,
     /// Base gravitational acceleration the per-dimension `gravity_scale`
     /// multiplies (`SURFACE_GRAVITY` = 9.81 by default).
     base_gravity: f64,
@@ -270,6 +292,7 @@ impl OrbitalTransitionRouter {
             cooldown_ticks: DEFAULT_TRANSITION_COOLDOWN_TICKS,
             last_transition: BTreeMap::new(),
             tick: 0,
+            pending_commits: Vec::new(),
             base_gravity: SURFACE_GRAVITY,
         };
         router.register_dimension(0, {
@@ -409,24 +432,55 @@ impl OrbitalTransitionRouter {
             .is_some_and(|t| self.tick.saturating_sub(*t) <= self.cooldown_ticks)
     }
 
-    /// Step `ship` one routed tick: install the atmosphere of its current
-    /// dimension, integrate under that profile, then evaluate the rule set
-    /// against the post-step center of mass. A matching rule transfers the
-    /// ship and every attached passenger atomically — `parent_dim`, world
-    /// pose and `AtmospherePhysics` switch, horizontal momentum, orientation
-    /// and mounts ride through — and the emitted
-    /// [`ShipDimensionTransition`] carries one [`TeleportIntent`] per rider
-    /// with the rule's anti-cheat grace.
-    ///
-    /// Ships inside their cooldown window keep stepping normally but no
-    /// rule may fire for them, so a hull parked on a trigger boundary can
-    /// never ping-pong between dimensions.
+    /// Install the authoritative server clock used by cooldown hysteresis.
+    /// Server ticks are expected to be monotonic; a stale value is ignored
+    /// rather than rewinding transfer hysteresis.
+    pub fn set_server_tick(&mut self, server_tick: u64) {
+        self.tick = self.tick.max(server_tick);
+    }
+
+    /// Drain every completed orbital transfer exactly once. The bridge that
+    /// drains the commit owns ship re-parenting and rider teleports; the
+    /// router retains no second copy that could be committed twice.
+    pub fn drain_transfer_commits(&mut self) -> Vec<OrbitalTransferCommit> {
+        std::mem::take(&mut self.pending_commits)
+    }
+
+    /// Legacy compatibility wrapper: advance the router-local clock once.
+    /// New server integrations must call
+    /// [`Self::step_with_dimension_transitions_at`] with the absolute server
+    /// tick; per-ship calls otherwise multiply cooldown progress by fleet size.
     pub fn step_with_dimension_transitions(
         &mut self,
         ship: &mut RigidBodySubWorld,
         dt: f64,
     ) -> Option<ShipDimensionTransition> {
-        self.tick = self.tick.saturating_add(1);
+        let tick = self.tick.saturating_add(1);
+        self.step_with_dimension_transitions_at(ship, dt, tick)
+    }
+
+    /// Step `ship` one routed tick against the authoritative absolute
+    /// `server_tick`: install the atmosphere of its current dimension,
+    /// integrate under that profile, then evaluate the rule set against the
+    /// post-step center of mass. Cooldown progress is a function of server
+    /// time only — stepping ten ships in one server tick advances every
+    /// ship's cooldown by exactly one tick, never ten.
+    ///
+    /// A matching rule transfers the ship and every attached passenger
+    /// atomically — `parent_dim`, world pose and `AtmospherePhysics` switch,
+    /// horizontal momentum, orientation and mounts ride through — and the
+    /// emitted [`ShipDimensionTransition`] carries one [`TeleportIntent`]
+    /// per rider with the rule's anti-cheat grace. Ships inside their
+    /// cooldown window keep stepping normally but no rule may fire for them,
+    /// so a hull parked on a trigger boundary can never ping-pong between
+    /// dimensions.
+    pub fn step_with_dimension_transitions_at(
+        &mut self,
+        ship: &mut RigidBodySubWorld,
+        dt: f64,
+        server_tick: u64,
+    ) -> Option<ShipDimensionTransition> {
+        self.set_server_tick(server_tick);
         // The atmosphere of the dimension the ship currently flies in —
         // also re-derives the profile after a snapshot reload restored only
         // `parent_dim`, keeping AERO2 continuity byte-exact.
@@ -441,6 +495,65 @@ impl OrbitalTransitionRouter {
             .find(|r| r.from_dim == ship.parent_dim && r.trigger.matches(ship.pos))?
             .clone();
         Some(self.execute_transition(ship, &rule))
+    }
+
+    /// Contact-aware routed step using the authoritative server tick. This is
+    /// the production physics path for ships near terrain or peers: the rigid
+    /// body integrates through its substep contact solver rather than the
+    /// legacy contact-free single-step path, then the same atomic transition
+    /// rules evaluate against the committed post-contact pose.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_with_dimension_transitions_contacts_at(
+        &mut self,
+        ship: &mut RigidBodySubWorld,
+        dt: f64,
+        server_tick: u64,
+        backend: &mut dyn SubLevelPhysicsBackend,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+        other_ships: &mut [&mut RigidBodySubWorld],
+    ) -> Option<ShipDimensionTransition> {
+        self.set_server_tick(server_tick);
+        let atmosphere = self.atmosphere_for(ship.parent_dim);
+        ship.set_atmosphere(atmosphere);
+        ship.step_env_with_contacts(
+            dt,
+            self.base_gravity * atmosphere.gravity_scale,
+            atmosphere.air_density,
+            if atmosphere.enable_buoyancy { 1.0 } else { 0.0 },
+            atmosphere.vacuum_damping,
+            backend,
+            terrain_solid,
+            other_ships,
+        );
+        if self.in_cooldown(ship.id) {
+            return None;
+        }
+        let rule = self
+            .rules
+            .iter()
+            .find(|r| r.from_dim == ship.parent_dim && r.trigger.matches(ship.pos))?
+            .clone();
+        Some(self.execute_transition(ship, &rule))
+    }
+
+    /// Convenience contact-aware step with the built-in solver and no peer
+    /// ships. Terrain queries remain explicit caller authority.
+    pub fn step_with_dimension_transitions_terrain_at(
+        &mut self,
+        ship: &mut RigidBodySubWorld,
+        dt: f64,
+        server_tick: u64,
+        terrain_solid: &dyn Fn([i32; 3]) -> bool,
+    ) -> Option<ShipDimensionTransition> {
+        let mut backend = BuiltinContactSolver::default();
+        self.step_with_dimension_transitions_contacts_at(
+            ship,
+            dt,
+            server_tick,
+            &mut backend,
+            terrain_solid,
+            &mut [],
+        )
     }
 
     /// Apply `rule` to `ship`: coordinate-scale the horizontal position,
@@ -472,6 +585,19 @@ impl OrbitalTransitionRouter {
         ship.transfer_to_dimension(rule.dest_dim, new_pos);
         ship.set_atmosphere(dest.atmosphere);
         self.last_transition.insert(ship.id, self.tick);
+        let carried_riders: Vec<i32> = self
+            .passengers
+            .iter()
+            .filter(|(_, att)| att.ship_id == ship.id)
+            .map(|(&entity_id, _)| entity_id)
+            .collect();
+        self.pending_commits.push(OrbitalTransferCommit {
+            ship_id: ship.id,
+            from_dim,
+            to_dim: rule.dest_dim,
+            target_pos: ship.pos,
+            carried_riders,
+        });
 
         let mut passengers = Vec::new();
         for (entity_id, att) in &self.passengers {

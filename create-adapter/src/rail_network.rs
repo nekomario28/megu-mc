@@ -912,6 +912,46 @@ pub enum TransitEvent {
     },
 }
 
+/// Client replication state for one tracked train. Positions are world-space
+/// head poses sampled from the exact spline; `render_mode` tells the client
+/// whether the head chunk is server-loaded (`Loaded`) or the train is being
+/// carried virtually through unloaded chunks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainReplicationPayload {
+    pub train: TrainId,
+    pub dim: DimId,
+    pub pos: [f64; 3],
+    pub tangent: [f64; 3],
+    pub speed: f64,
+    pub render_mode: TrainRenderMode,
+    pub state: TrainRunState,
+}
+
+/// Deterministic replication payload for every tracked train, in train-id
+/// order. Trains whose current edge was removed externally are omitted rather
+/// than emitting a guessed pose.
+pub fn train_replication_payloads(net: &RailNetwork) -> Vec<TrainReplicationPayload> {
+    net.trains
+        .values()
+        .filter_map(|train| {
+            train
+                .head_world_pose(net)
+                .map(|(pos, tangent)| TrainReplicationPayload {
+                    train: train.id,
+                    dim: train.current_dim.clone(),
+                    pos,
+                    tangent,
+                    speed: train.speed,
+                    render_mode: train.render_mode,
+                    state: train.state.clone(),
+                })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// RailNetwork
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // RailNetwork
 // ---------------------------------------------------------------------------

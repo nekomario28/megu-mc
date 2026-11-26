@@ -56,17 +56,44 @@ pub struct SchematicBlockState {
     pub canonical: String,
 }
 
-/// One `blocks` list entry: a structure-relative cell and the palette index
-/// (already bounds-checked) of the state that belongs there.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Parsed block-entity NBT retained from a schematic block entry. This is
+/// the same bounded DOM the reader materializes internally, made public so
+/// placement can carry signs, chests, lecterns, Create inventories and every
+/// other block-entity payload instead of silently dropping them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SchematicNbt {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Long(i64),
+    Float(f32),
+    Double(f64),
+    ByteArray(Vec<u8>),
+    String(String),
+    List(Vec<SchematicNbt>),
+    Compound(Vec<(String, SchematicNbt)>),
+    IntArray(Vec<i32>),
+    LongArray(Vec<i64>),
+}
+
+/// One `blocks` list entry: a structure-relative cell, the palette index
+/// (already bounds-checked) of the state that belongs there, and the
+/// bounded block-entity NBT payload when the structure provides one.
+/// `unsupported_nbt` names NBT shapes the lossless reader could not report
+/// precisely (currently only empty lists, whose element type the NBT list
+/// header carries but this semantic DOM cannot infer); unsupported shapes
+/// are explicit data, never a silent parse failure or drop.
+#[derive(Clone, Debug, PartialEq)]
 pub struct SchematicBlock {
     pub pos: [i32; 3],
     /// Index into [`SchematicStructure::palette`].
     pub state: usize,
+    pub nbt: Option<SchematicNbt>,
+    pub unsupported_nbt: Vec<String>,
 }
 
 /// A decoded `.nbt` structure.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SchematicStructure {
     pub size: [i32; 3],
     pub palette: Vec<SchematicBlockState>,
@@ -84,6 +111,157 @@ pub struct SchematicPlacementReport {
     pub kinetic_nodes_armed: usize,
     pub unresolved_palette_entries: usize,
     pub skipped_blocks: usize,
+}
+
+/// One fully resolved placement operation in a [`SchematicPlacementPlan`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchematicPlacementEntry {
+    /// Absolute world cell to write.
+    pub pos: [i32; 3],
+    /// Palette index of the source blockstate.
+    pub palette_state: usize,
+    /// Canonical `name[k=v]` blockstate.
+    pub canonical: String,
+    /// Runtime state id resolved by the caller's registry.
+    pub state_id: u32,
+    /// Block-entity payload retained for the same cell.
+    pub nbt: Option<SchematicNbt>,
+}
+
+/// Deterministic preflight failure for schematic placement. Construction of
+/// a plan is all-or-nothing: no placement entry is emitted when any cell is
+/// out of bounds, obstructed, protected, or unresolvable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SchematicPlacementError {
+    /// A schematic-local block lies outside the structure's declared size.
+    BlockOutsideStructure { pos: [i32; 3] },
+    /// Adding the origin overflowed the world coordinate range.
+    CoordinateOverflow { pos: [i32; 3] },
+    /// The target cell is occupied or protected.
+    Obstructed { pos: [i32; 3] },
+    /// The caller's registry cannot resolve the palette state.
+    UnresolvedState { canonical: String },
+    /// The same absolute cell is written by two entries.
+    DuplicateTarget { pos: [i32; 3] },
+}
+
+impl fmt::Display for SchematicPlacementError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BlockOutsideStructure { pos } => {
+                write!(f, "schematic block {pos:?} outside declared bounds")
+            }
+            Self::CoordinateOverflow { pos } => {
+                write!(f, "schematic block {pos:?} overflows world coordinates")
+            }
+            Self::Obstructed { pos } => write!(f, "target cell {pos:?} is obstructed"),
+            Self::UnresolvedState { canonical } => {
+                write!(f, "palette state {canonical:?} has no runtime state id")
+            }
+            Self::DuplicateTarget { pos } => {
+                write!(f, "two schematic blocks target cell {pos:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchematicPlacementError {}
+
+/// Transactional placement plan: every bounds, collision, duplicate and
+/// state-resolution check has already passed, so the caller can apply the
+/// entries as one externally synchronized world transaction. Creating the
+/// plan performs no mutation whatsoever.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SchematicPlacementPlan {
+    pub origin: [i32; 3],
+    pub entries: Vec<SchematicPlacementEntry>,
+    /// Explicit unsupported NBT shape paths found while planning.
+    pub unsupported_nbt: Vec<String>,
+}
+
+impl SchematicPlacementPlan {
+    /// Preflight a full placement at `origin`. `resolve_state` maps a
+    /// canonical palette blockstate to a runtime id, while `cell_available`
+    /// answers whether the absolute cell may be overwritten (including the
+    /// server's protection rules). Closures are evaluated deterministically
+    /// in schematic block order; any failure rejects the whole plan before a
+    /// caller can mutate even one block.
+    pub fn preflight(
+        structure: &SchematicStructure,
+        origin: [i32; 3],
+        mut resolve_state: impl FnMut(&str) -> Option<u32>,
+        mut cell_available: impl FnMut([i32; 3]) -> bool,
+    ) -> Result<Self, SchematicPlacementError> {
+        use std::collections::BTreeSet;
+        let mut entries = Vec::with_capacity(structure.blocks.len());
+        let mut seen = BTreeSet::new();
+        let mut unsupported = Vec::new();
+        for block in &structure.blocks {
+            let in_bounds = (0..3).all(|axis| {
+                block.pos[axis] >= 0 && block.pos[axis] < structure.size[axis]
+            });
+            if !in_bounds {
+                return Err(SchematicPlacementError::BlockOutsideStructure { pos: block.pos });
+            }
+            let mut world = [0i32; 3];
+            for axis in 0..3 {
+                world[axis] = origin[axis]
+                    .checked_add(block.pos[axis])
+                    .ok_or(SchematicPlacementError::CoordinateOverflow { pos: block.pos })?;
+            }
+            if !seen.insert(world) {
+                return Err(SchematicPlacementError::DuplicateTarget { pos: world });
+            }
+            let palette = structure
+                .palette
+                .get(block.state)
+                .ok_or(SchematicPlacementError::UnresolvedState {
+                    canonical: format!("<palette {}>", block.state),
+                })?;
+            let state_id = resolve_state(&palette.canonical).ok_or_else(|| {
+                SchematicPlacementError::UnresolvedState {
+                    canonical: palette.canonical.clone(),
+                }
+            })?;
+            if !cell_available(world) {
+                return Err(SchematicPlacementError::Obstructed { pos: world });
+            }
+            unsupported.extend(block.unsupported_nbt.iter().cloned());
+            entries.push(SchematicPlacementEntry {
+                pos: world,
+                palette_state: block.state,
+                canonical: palette.canonical.clone(),
+                state_id,
+                nbt: block.nbt.clone(),
+            });
+        }
+        unsupported.sort();
+        unsupported.dedup();
+        Ok(Self {
+            origin,
+            entries,
+            unsupported_nbt: unsupported,
+        })
+    }
+
+    /// Consume the plan through one caller-supplied transactional writer.
+    /// The writer receives `(absolute_pos, state_id, retained_nbt)` in the
+    /// schematic's canonical order. Because preflight is total, the write
+    /// closure never needs to re-check collision or resolution policy.
+    pub fn apply(
+        &self,
+        mut write: impl FnMut([i32; 3], u32, Option<&SchematicNbt>),
+    ) -> SchematicPlacementReport {
+        for entry in &self.entries {
+            write(entry.pos, entry.state_id, entry.nbt.as_ref());
+        }
+        SchematicPlacementReport {
+            placed_blocks: self.entries.len(),
+            kinetic_nodes_armed: 0,
+            unresolved_palette_entries: 0,
+            skipped_blocks: 0,
+        }
+    }
 }
 
 /// Every deterministic failure of the schematic reader.
@@ -429,6 +607,44 @@ fn int3(tag: &Tag) -> Option<[i32; 3]> {
     }
 }
 
+fn convert_nbt(tag: &Tag, path: &str, unsupported: &mut Vec<String>) -> SchematicNbt {
+    match tag {
+        Tag::Byte(v) => SchematicNbt::Byte(*v),
+        Tag::Short(v) => SchematicNbt::Short(*v),
+        Tag::Int(v) => SchematicNbt::Int(*v),
+        Tag::Long(v) => SchematicNbt::Long(*v),
+        Tag::Float(v) => SchematicNbt::Float(*v),
+        Tag::Double(v) => SchematicNbt::Double(*v),
+        Tag::ByteArray(v) => SchematicNbt::ByteArray(v.clone()),
+        Tag::String(v) => SchematicNbt::String(v.clone()),
+        Tag::List(items) => {
+            if items.is_empty() {
+                unsupported.push(format!("{path}: empty list element type is not recoverable"));
+            }
+            SchematicNbt::List(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| convert_nbt(item, &format!("{path}[{i}]"), unsupported))
+                    .collect(),
+            )
+        }
+        Tag::Compound(entries) => SchematicNbt::Compound(
+            entries
+                .iter()
+                .map(|(name, item)| {
+                    (
+                        name.clone(),
+                        convert_nbt(item, &format!("{path}.{name}"), unsupported),
+                    )
+                })
+                .collect(),
+        ),
+        Tag::IntArray(v) => SchematicNbt::IntArray(v.clone()),
+        Tag::LongArray(v) => SchematicNbt::LongArray(v.clone()),
+    }
+}
+
 /// Decode a `.nbt` structure — gzipped or raw — into a
 /// [`SchematicStructure`]. Fails closed on every malformed or over-cap
 /// input; see the module docs for the bound list.
@@ -515,10 +731,19 @@ pub fn parse_nbt_schematic(input: &[u8]) -> Result<SchematicStructure, Schematic
                 palette: palette.len(),
             });
         }
-        // `nbt` block-entity data, when present, is parsed and bounds
-        // checked like every other tag but intentionally not surfaced:
-        // the live placement path only consumes geometry + state.
-        blocks.push(SchematicBlock { pos, state: index });
+        // `nbt` block-entity data is authoritative placement state too:
+        // retain the already bounds-checked DOM so chests, signs, lecterns
+        // and Create machine inventories survive placement instead of being
+        // silently emptied.
+        let mut unsupported_nbt = Vec::new();
+        let nbt = find(fields, "nbt")
+            .map(|tag| convert_nbt(tag, "nbt", &mut unsupported_nbt));
+        blocks.push(SchematicBlock {
+            pos,
+            state: index,
+            nbt,
+            unsupported_nbt,
+        });
     }
 
     Ok(SchematicStructure {

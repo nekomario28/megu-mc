@@ -36,8 +36,9 @@ use create_adapter::addon_profile::{
     CreateAddonProfile, PropulsionSpec,
 };
 use create_adapter::aeronautics::{
-    decode_aeronautics_snapshot, encode_aeronautics_snapshot, RigidBodySubWorld, SubWorldHelmInput,
-    SubWorldSyncFrame, SubWorldSyncKind, DEFAULT_BLOCK_MASS, SEA_LEVEL_AIR_DENSITY,
+    decode_aeronautics_snapshot, encode_aeronautics_snapshot, BuiltinContactSolver,
+    RigidBodySubWorld, SubWorldHelmInput, SubWorldSyncFrame, SubWorldSyncKind,
+    DEFAULT_BLOCK_MASS, SEA_LEVEL_AIR_DENSITY,
 };
 use create_adapter::orbital::{OrbitalDimension, OrbitalTransitionRouter};
 use mod_adapter_core::data_loader as mod_data;
@@ -108,6 +109,97 @@ fn register_hidden_block_names(names: impl IntoIterator<Item = impl AsRef<str>>)
 // Aeronautics 6-DOF airship runtime bridge
 // ---------------------------------------------------------------------------
 
+/// Authoritative, expiring helm-seat assignment. The lease is deliberately
+/// small and wire-independent: `player_id` is the entity id the helm packet
+/// arrived from, `dim_id` is the raw dimension the seat was granted in, and
+/// `revision` is the ship assembly revision (not the pose revision, which
+/// changes every tick). Reassembly, dimension transfer, timeout, detach, or
+/// disconnect invalidates the lease and neutralizes latched controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HelmSeatLease {
+    player_id: u32,
+    ship_id: u64,
+    dim_id: u32,
+    revision: u32,
+    expires_tick: u64,
+}
+
+/// Rider attachment mode. `Seat` is rigidly fixed to the helm/passenger seat;
+/// `Walking` is still ship-carried but may have its local deck offset updated
+/// by authoritative player movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RiderAttachmentKind {
+    Seat,
+    Walking,
+}
+
+/// World-space cell participating in atomic ship assembly. `pos` is the
+/// source world cell; `local` is derived from `pos - origin` by the transfer
+/// helper. `block_entity` is optional opaque serialized state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShipAssemblyCell {
+    pos: [i32; 3],
+    state_id: u32,
+    block_id: String,
+    block_entity: Option<Vec<u8>>,
+}
+
+/// Collision-checked world write produced by atomic disassembly. Callers
+/// apply all writes in one externally synchronized transaction; because the
+/// plan is produced only after every target passed the occupancy/protection
+/// callback, a rejected plan leaves the ship fully intact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShipDisassemblyWrite {
+    pos: [i32; 3],
+    state_id: u32,
+    block_id: String,
+    block_entity: Option<Vec<u8>>,
+}
+
+/// Result of a committed atomic disassembly: the world writes plus riders
+/// who were detached because their ship ceased to exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShipDisassemblyPlan {
+    ship_id: u64,
+    dim_id: u32,
+    writes: Vec<ShipDisassemblyWrite>,
+    detached_riders: Vec<i32>,
+}
+
+/// Catalog admission summary for Create addons: supported recipes are merged
+/// across every enabled profile while unknown serializers are explicit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AddonCatalogReport {
+    admitted_mods: Vec<String>,
+    recipe_serializers: Vec<String>,
+    unsupported_serializers: Vec<String>,
+    behavior_blocks: Vec<String>,
+}
+
+fn adb_processing_recipe_serializer(
+    recipe: &create_adapter::addon_profile::AddonProcessingRecipe,
+) -> String {
+    use create_adapter::addon_profile::AddonProcessingRecipe as R;
+    match recipe {
+        R::SequencedAssembly(_) => "create:sequenced_assembly".to_string(),
+        R::Pressing { .. } => "create:pressing".to_string(),
+        R::Mixing { .. } => "create:mixing".to_string(),
+        R::Milling { .. } => "create:milling".to_string(),
+        R::Crushing { .. } => "create:crushing".to_string(),
+        R::Cutting { .. } => "create:cutting".to_string(),
+        R::Filling { .. } => "create:filling".to_string(),
+        R::Compacting(recipe) => recipe.recipe_type.clone(),
+        R::Splashing(recipe) => recipe.recipe_type.clone(),
+        R::Haunting(recipe) => recipe.recipe_type.clone(),
+        R::Deploying(recipe) => recipe.recipe_type.clone(),
+        R::Emptying(recipe) => recipe.recipe_type.clone(),
+        R::ItemApplication(recipe) => recipe.recipe_type.clone(),
+        R::SandpaperPolishing(recipe) => recipe.recipe_type.clone(),
+        R::MechanicalCrafting(recipe) => recipe.recipe_type.clone(),
+        R::GenericMachine(recipe) => recipe.recipe_type.clone(),
+    }
+}
+
 /// Everything the aeronautics side of the bridge owns at runtime: the shared
 /// `create:*` + addon block registry every sub-world's embedded
 /// [`CreateFactory`] is built from, the live ship fleet, passenger
@@ -137,6 +229,25 @@ struct AeronauticsRuntimeBridge {
     sync_frames: Vec<(u32, Vec<u8>)>,
     /// Monotonic per-ship revisions for client pose deltas.
     revisions: BTreeMap<u64, u32>,
+    /// Assembly revisions checked by helm leases. Unlike pose revisions,
+    /// these change only when a ship is assembled/reassembled.
+    assembly_revisions: BTreeMap<u64, u32>,
+    /// Absolute server tick clock supplied by `aeronautics_tick_once_for_server`.
+    server_tick: u64,
+    /// Player entity id -> authoritative expiring helm lease.
+    helm_leases: BTreeMap<u32, HelmSeatLease>,
+    /// `(player_id, ship_id)` pairs permitted to execute disassembly.
+    disassembly_permits: BTreeSet<(u32, u64)>,
+    /// Rider attachment modes keyed by entity id.
+    rider_kinds: BTreeMap<i32, RiderAttachmentKind>,
+    /// Last committed start/end rigid poses per ship: `(start_pos,start_quat,end_pos,end_quat)`.
+    committed_poses: BTreeMap<u64, ([f64; 3], [f64; 4], [f64; 3], [f64; 4])>,
+    /// Serialized block-entity payloads riding each ship's local voxels.
+    ship_block_entities: BTreeMap<u64, BTreeMap<[i32; 3], Vec<u8>>>,
+    /// Late-join/dimension-change client tracking: client id -> raw dimension.
+    tracked_clients: BTreeMap<u32, u32>,
+    /// Unsupported addon recipe serializers explicitly reported by catalog admission.
+    unsupported_addon_serializers: BTreeSet<String>,
     /// Per-dimension atmosphere and transition rules for the active fleet.
     orbital_router: OrbitalTransitionRouter,
 }
@@ -154,6 +265,15 @@ impl AeronauticsRuntimeBridge {
             ticks_stepped: 0,
             sync_frames: Vec::new(),
             revisions: BTreeMap::new(),
+            assembly_revisions: BTreeMap::new(),
+            server_tick: 0,
+            helm_leases: BTreeMap::new(),
+            disassembly_permits: BTreeSet::new(),
+            rider_kinds: BTreeMap::new(),
+            committed_poses: BTreeMap::new(),
+            ship_block_entities: BTreeMap::new(),
+            tracked_clients: BTreeMap::new(),
+            unsupported_addon_serializers: BTreeSet::new(),
             orbital_router: OrbitalTransitionRouter::new(),
         }
     }
@@ -181,6 +301,101 @@ impl AeronauticsRuntimeBridge {
         self.registry = None;
     }
 
+    /// Merge every enabled addon's propulsion/control catalog into one
+    /// synthetic profile for ship assembly. Aero metallurgy, power, and custom
+    /// propulsion addons frequently contribute disjoint propeller/lift/helm
+    /// block lists; picking the first profile would silently disable the
+    /// others. Numeric aerodynamic coefficients come from the first declaring
+    /// profile, while block ownership lists are unioned deterministically.
+    fn combined_propulsion_profile(&self) -> Option<CreateAddonProfile> {
+        let mut iter = self.addons.iter().filter(|a| a.propulsion.is_some());
+        let mut combined = iter.next()?.clone();
+        let base = combined.propulsion.as_mut().expect("filtered Some");
+        for addon in iter {
+            let Some(prop) = &addon.propulsion else {
+                continue;
+            };
+            for (src, dst) in [
+                (&prop.propeller_blocks, &mut base.propeller_blocks),
+                (&prop.buoyancy_blocks, &mut base.buoyancy_blocks),
+                (&prop.rudder_blocks, &mut base.rudder_blocks),
+            ] {
+                for id in src {
+                    if !dst.contains(id) {
+                        dst.push(id.clone());
+                    }
+                }
+            }
+        }
+        // Kinetic min-RPM behavior is also additive across profiles.
+        for addon in &self.addons {
+            if addon.mod_id == combined.mod_id {
+                continue;
+            }
+            for spec in &addon.kinetic_consumers {
+                if !combined.kinetic_consumers.iter().any(|s| s.id == spec.id) {
+                    combined.kinetic_consumers.push(spec.clone());
+                }
+            }
+            for spec in &addon.kinetic_sources {
+                if !combined.kinetic_sources.iter().any(|s| s.id == spec.id) {
+                    combined.kinetic_sources.push(spec.clone());
+                }
+            }
+            combined.processing_recipes.extend(addon.processing_recipes.clone());
+        }
+        combined.mod_id = "megu:combined_propulsion".into();
+        Some(combined)
+    }
+
+    /// Admit a catalog of already-discovered addon profiles into this runtime.
+    /// Profiles are merged rather than winner-take-all; their processing
+    /// recipe serializer ids are cataloged and unknown serializers are
+    /// explicitly surfaced as unsupported instead of disappearing.
+    fn register_admitted_addon_catalog(
+        &mut self,
+        profiles: Vec<CreateAddonProfile>,
+    ) -> AddonCatalogReport {
+        let mut report = AddonCatalogReport::default();
+        for profile in profiles {
+            if !report.admitted_mods.iter().any(|id| id == &profile.mod_id) {
+                report.admitted_mods.push(profile.mod_id.clone());
+            }
+            for recipe in &profile.processing_recipes {
+                let serializer = adb_processing_recipe_serializer(recipe);
+                if create_adapter::data_loader::CreateRecipeKind::from_type_str(&serializer)
+                    .is_some()
+                {
+                    if !report.recipe_serializers.contains(&serializer) {
+                        report.recipe_serializers.push(serializer);
+                    }
+                } else if self.unsupported_addon_serializers.insert(serializer.clone())
+                    && !report.unsupported_serializers.contains(&serializer)
+                {
+                    report.unsupported_serializers.push(serializer);
+                }
+            }
+            for id in profile
+                .kinetic_sources
+                .iter()
+                .map(|s| &s.id)
+                .chain(profile.kinetic_consumers.iter().map(|s| &s.id))
+                .chain(profile.connectors.iter().map(|s| &s.id))
+                .chain(profile.assembly_anchors.iter())
+                .chain(profile.decorative_blocks.iter())
+            {
+                if !report.behavior_blocks.contains(id) {
+                    report.behavior_blocks.push(id.clone());
+                }
+            }
+            self.add_addon(profile);
+        }
+        report.recipe_serializers.sort();
+        report.unsupported_serializers.sort();
+        report.behavior_blocks.sort();
+        report
+    }
+
     /// Assemble an airship from sparse local cells (canonical blockstate
     /// strings) under `subworld_id`. `addon_mod_id` picks the propulsion
     /// profile; `None` uses the first loaded profile that ships one
@@ -195,9 +410,14 @@ impl AeronauticsRuntimeBridge {
         block_mass: f64,
     ) -> Result<(), String> {
         self.ensure_registry()?;
+        let combined = self.combined_propulsion_profile();
         let addon = match addon_mod_id {
-            Some(id) => self.addons.iter().find(|a| a.mod_id == id),
-            None => self.addons.iter().find(|a| a.propulsion.is_some()),
+            Some(id) => self
+                .addons
+                .iter()
+                .find(|a| a.mod_id == id)
+                .or(combined.as_ref()),
+            None => combined.as_ref(),
         };
         let sub = RigidBodySubWorld::assemble(
             subworld_id,
@@ -210,6 +430,14 @@ impl AeronauticsRuntimeBridge {
         .map_err(|e| format!("aeronautics assemble {subworld_id}: {e:?}"))?;
         self.add_airship(sub);
         self.revisions.insert(subworld_id, 0);
+        let next_revision = self
+            .assembly_revisions
+            .get(&subworld_id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.assembly_revisions.insert(subworld_id, next_revision);
+        self.ship_block_entities.entry(subworld_id).or_default();
         Ok(())
     }
 
@@ -222,21 +450,75 @@ impl AeronauticsRuntimeBridge {
     /// Attach player `eid` to airship `subworld_id` at local `local_offset`.
     /// Every tick grants the exact rigid-carry delta into anti-cheat.
     fn attach_passenger(&mut self, eid: i32, subworld_id: u64, local_offset: [f64; 3]) -> bool {
-        if !self.airships.contains_key(&subworld_id) {
+        self.attach_rider(eid, subworld_id, local_offset, true)
+    }
+
+    /// Real seat/walking rider attachment. The offset is measured from the
+    /// ship center of mass, must be finite and bounded, and the ship must
+    /// exist. Seated riders are fixed; walking riders use the same rigid
+    /// carry but may update their local offset through `move_walking_rider`.
+    fn attach_rider(
+        &mut self,
+        eid: i32,
+        subworld_id: u64,
+        local_offset: [f64; 3],
+        seated: bool,
+    ) -> bool {
+        if !self.airships.contains_key(&subworld_id)
+            || !local_offset.iter().all(|v| v.is_finite())
+            || local_offset.iter().any(|v| v.abs() > 256.0)
+        {
             return false;
         }
         self.passengers.insert(eid, (subworld_id, local_offset));
+        self.rider_kinds.insert(
+            eid,
+            if seated {
+                RiderAttachmentKind::Seat
+            } else {
+                RiderAttachmentKind::Walking
+            },
+        );
+        true
+    }
+
+    /// Update a walking rider's local deck offset. Seated riders reject the
+    /// move because their authoritative position belongs to the seat.
+    fn move_walking_rider(&mut self, eid: i32, local_offset: [f64; 3]) -> bool {
+        if self.rider_kinds.get(&eid) != Some(&RiderAttachmentKind::Walking)
+            || !local_offset.iter().all(|v| v.is_finite())
+            || local_offset.iter().any(|v| v.abs() > 256.0)
+        {
+            return false;
+        }
+        let Some((_, offset)) = self.passengers.get_mut(&eid) else {
+            return false;
+        };
+        *offset = local_offset;
         true
     }
 
     /// Player left the airship (dismount, disassembly, logout).
     fn detach_passenger(&mut self, eid: i32) -> bool {
+        self.detach_rider(eid)
+    }
+
+    /// Detach a seat or walking rider; helm authority is revoked as well when
+    /// the same entity held it, so a departing pilot cannot retain control.
+    fn detach_rider(&mut self, eid: i32) -> bool {
+        self.rider_kinds.remove(&eid);
+        if let Ok(player) = u32::try_from(eid) {
+            self.detach_helm_player(player);
+        }
         self.passengers.remove(&eid).is_some()
     }
 
     /// The exact world displacement the last step applied to passenger `eid`'s
     /// attached point — the same value `step` just granted to anti-cheat.
     fn passenger_delta(&self, eid: i32, dt: f64) -> Option<[f64; 3]> {
+        if let Some(delta) = self.committed_passenger_delta(eid) {
+            return Some(delta);
+        }
         let (ship, offset) = self.passengers.get(&eid)?;
         Some(self.airships.get(ship)?.passenger_world_delta(*offset, dt))
     }
@@ -250,13 +532,19 @@ impl AeronauticsRuntimeBridge {
 
     /// Advance every airship by `dt` seconds (0.05 at 20 TPS): each
     /// `RigidBodySubWorld` steps its embedded `CreateFactory` kinetic network,
-    /// propeller thrust, buoyancy and Euler dynamics, then every attached
-    /// passenger gets their exact `passenger_world_delta` granted through
-    /// `ac_note_carried_motion`.
+    /// propeller thrust, buoyancy and Euler dynamics. The orbital router uses
+    /// the bridge's absolute server tick, so transfer cooldowns are fleet-size
+    /// independent. Rider motion is derived from committed start/end poses.
     fn step(&mut self, dt: f64, gravity: f64, air_density: f64) {
         self.ticks_stepped += 1;
+        self.expire_helm_leases();
         self.orbital_router.set_base_gravity(gravity);
-        for sub in self.airships.values_mut() {
+        let server_tick = self.server_tick.max(self.ticks_stepped);
+        let ship_ids: Vec<u64> = self.airships.keys().copied().collect();
+        for ship_id in ship_ids {
+            let Some(mut sub) = self.airships.remove(&ship_id) else {
+                continue;
+            };
             if self.orbital_router.dimension(sub.parent_dim).is_none() {
                 self.orbital_router.register_dimension(
                     sub.parent_dim,
@@ -269,32 +557,425 @@ impl AeronauticsRuntimeBridge {
                     ),
                 );
             }
-            let _ = self.orbital_router.step_with_dimension_transitions(sub, dt);
+            let start = (sub.pos, sub.quat);
+            let parent_dim = sub.parent_dim;
+            let terrain = |cell: [i32; 3]| {
+                cell[1] >= MIN_Y
+                    && cell[1] < MIN_Y + 384
+                    && block_at_dim(
+                        DimId::from_raw(parent_dim),
+                        cell[0],
+                        cell[1],
+                        cell[2],
+                    ) != 0
+            };
+            let mut backend = BuiltinContactSolver::default();
+            {
+                let mut peers: Vec<&mut RigidBodySubWorld> =
+                    self.airships.values_mut().collect();
+                let _ = self
+                    .orbital_router
+                    .step_with_dimension_transitions_contacts_at(
+                        &mut sub,
+                        dt,
+                        server_tick,
+                        &mut backend,
+                        &terrain,
+                        &mut peers,
+                    );
+            }
+            self.committed_poses
+                .insert(sub.id, (start.0, start.1, sub.pos, sub.quat));
+            self.airships.insert(sub.id, sub);
         }
+        let mut pose_frames = Vec::new();
         for (id, sub) in &self.airships {
             let revision = self.revisions.entry(*id).or_default();
             *revision = revision.saturating_add(1);
-            let frame = SubWorldSyncFrame {
-                kind: SubWorldSyncKind::PoseDelta,
-                subworld_id: *id,
-                dim_id: DimId::from_raw(sub.parent_dim).dimension_id().to_owned(),
-                pos: sub.pos,
-                quat: sub.quat.map(|v| v as f32),
-                vel: sub.vel.map(|v| v as f32),
-                ang_vel: sub.omega.map(|v| v as f32),
-                revision: *revision,
-                voxels: Vec::new(),
-            };
-            if let Ok(bytes) = frame.encode() {
-                self.sync_frames.push((sub.parent_dim, bytes));
+            if let Ok(record) = adb_ship_sw6d_record(sub, u64::from(*revision), false, None) {
+                if let Ok(bytes) = adb_encode_sw6d_frame(ADB_SW6D_MODE_POSE, &[record]) {
+                    pose_frames.push((sub.parent_dim, bytes));
+                }
             }
         }
+        self.sync_frames.extend(pose_frames);
         for (eid, (ship, offset)) in &self.passengers {
-            let Some(sub) = self.airships.get(ship) else {
+            let Some(&(from_pos, from_quat, to_pos, to_quat)) = self.committed_poses.get(ship)
+            else {
                 continue;
             };
-            ac_note_carried_motion(*eid, sub.passenger_world_delta(*offset, dt));
+            ac_note_carried_motion(
+                *eid,
+                RigidBodySubWorld::passenger_world_delta_exact(
+                    from_pos, from_quat, to_pos, to_quat, *offset,
+                ),
+            );
         }
+    }
+
+    /// Advance the bridge to an authoritative absolute server tick. This is
+    /// the tick entry `main.rs` wiring should call; legacy dt-only callers
+    /// fall back to the local stepped count.
+    fn tick_once_for_server(&mut self, server_tick: u64) {
+        self.server_tick = self.server_tick.max(server_tick);
+        if self.has_work() {
+            self.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
+        } else {
+            self.expire_helm_leases();
+        }
+    }
+
+    /// Grant or refresh an authoritative helm seat for `ttl_ticks`.
+    fn assign_helm_seat(
+        &mut self,
+        player_id: u32,
+        ship_id: u64,
+        ttl_ticks: u64,
+    ) -> Result<HelmSeatLease, String> {
+        let ship = self
+            .airships
+            .get(&ship_id)
+            .ok_or_else(|| "unknown helm ship".to_string())?;
+        if ttl_ticks == 0 {
+            return Err("helm lease ttl must be positive".into());
+        }
+        let lease = HelmSeatLease {
+            player_id,
+            ship_id,
+            dim_id: ship.parent_dim,
+            revision: self.assembly_revisions.get(&ship_id).copied().unwrap_or(0),
+            expires_tick: self.server_tick.saturating_add(ttl_ticks),
+        };
+        self.helm_leases.insert(player_id, lease);
+        Ok(lease)
+    }
+
+    /// Permit one seated player to execute the destructive disassembly path.
+    fn permit_ship_disassembly(&mut self, player_id: u32, ship_id: u64) {
+        self.disassembly_permits.insert((player_id, ship_id));
+    }
+
+    /// Detach/logout cleanup: remove helm authority and immediately zero any
+    /// latched actuator state so a departing player cannot keep flying a ship.
+#[allow(dead_code)]
+    fn detach_helm_player(&mut self, player_id: u32) -> bool {
+        let lease = self.helm_leases.remove(&player_id);
+        if let Some(lease) = lease {
+            self.disassembly_permits.remove(&(player_id, lease.ship_id));
+            self.neutralize_helm(lease.ship_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Zero the helm actuators of `ship_id`, ignoring unknown ships.
+    fn neutralize_helm(&mut self, ship_id: u64) {
+        if let Some(ship) = self.airships.get_mut(&ship_id) {
+            let neutral = SubWorldHelmInput {
+                subworld_id: ship_id,
+                throttle: 0.0,
+                pitch: 0.0,
+                yaw: 0.0,
+                roll: 0.0,
+                buoyancy_delta: 0.0,
+                disassemble: false,
+            };
+            let _ = ship.apply_helm_input(&neutral);
+        }
+    }
+
+    /// Expire timed-out seats and neutralize their ships exactly once.
+    fn expire_helm_leases(&mut self) {
+        let expired: Vec<(u32, u64)> = self
+            .helm_leases
+            .iter()
+            .filter(|(_, lease)| self.server_tick >= lease.expires_tick)
+            .map(|(&player, lease)| (player, lease.ship_id))
+            .collect();
+        for (player, ship) in expired {
+            self.helm_leases.remove(&player);
+            self.disassembly_permits.remove(&(player, ship));
+            self.neutralize_helm(ship);
+        }
+    }
+
+    /// Validate identity, ship, dimension, assembly revision, lease expiry,
+    /// and destructive-command permission before applying one helm packet.
+    fn validate_helm_input(
+        &mut self,
+        player_id: u32,
+        input: &SubWorldHelmInput,
+    ) -> Result<(), String> {
+        let lease = self
+            .helm_leases
+            .get(&player_id)
+            .copied()
+            .ok_or_else(|| "player does not hold the helm seat".to_string())?;
+        if lease.player_id != player_id || lease.ship_id != input.subworld_id {
+            return Err("helm packet identity does not match the seated lease".into());
+        }
+        if self.server_tick >= lease.expires_tick {
+            self.detach_helm_player(player_id);
+            return Err("helm seat lease expired".into());
+        }
+        let ship = self
+            .airships
+            .get(&input.subworld_id)
+            .ok_or_else(|| "unknown subworld".to_string())?;
+        if ship.parent_dim != lease.dim_id {
+            self.detach_helm_player(player_id);
+            return Err("helm ship changed dimension; lease invalid".into());
+        }
+        if self.assembly_revisions.get(&input.subworld_id).copied().unwrap_or(0)
+            != lease.revision
+        {
+            self.detach_helm_player(player_id);
+            return Err("helm ship assembly revision mismatch".into());
+        }
+        if input.disassemble
+            && !self
+                .disassembly_permits
+                .contains(&(player_id, input.subworld_id))
+        {
+            return Err("player is not permitted to disassemble this ship".into());
+        }
+        Ok(())
+    }
+
+    /// Exact rider delta from the last committed start-to-end pose. This
+    /// deliberately avoids post-step forward projection: the granted movement
+    /// is the movement the rigid body actually committed.
+    fn committed_passenger_delta(&self, eid: i32) -> Option<[f64; 3]> {
+        let (ship, offset) = self.passengers.get(&eid)?;
+        let &(from_pos, from_quat, to_pos, to_quat) = self.committed_poses.get(ship)?;
+        Some(RigidBodySubWorld::passenger_world_delta_exact(
+            from_pos, from_quat, to_pos, to_quat, *offset,
+        ))
+    }
+
+    /// Atomically assemble a connected ship hull and every block-entity
+    /// payload. The world-side removals must be committed by the caller as
+    /// part of the same external transaction; this helper is total preflight
+    /// plus subworld construction, so malformed/disconnected input never
+    /// produces a half-assembled ship or dropped block entities.
+    fn assemble_ship_atomic(
+        &mut self,
+        subworld_id: u64,
+        parent_dim: u32,
+        origin: [i32; 3],
+        cells: &[ShipAssemblyCell],
+        addon_mod_id: Option<&str>,
+        block_mass: f64,
+    ) -> Result<(), String> {
+        if cells.is_empty() {
+            return Err("ship assembly must contain at least one block".into());
+        }
+        use std::collections::VecDeque;
+        let mut local_cells = BTreeMap::new();
+        let mut entities = BTreeMap::new();
+        let mut positions = BTreeSet::new();
+        for cell in cells {
+            if !cell.block_id.contains(':') {
+                return Err(format!("invalid ship block id {:?}", cell.block_id));
+            }
+            let local = [
+                cell.pos[0].checked_sub(origin[0]).ok_or("ship local coordinate overflow")?,
+                cell.pos[1].checked_sub(origin[1]).ok_or("ship local coordinate overflow")?,
+                cell.pos[2].checked_sub(origin[2]).ok_or("ship local coordinate overflow")?,
+            ];
+            if local
+                .iter()
+                .any(|v| *v < i32::from(i16::MIN) || *v > i32::from(i16::MAX))
+            {
+                return Err("ship block lies outside the wire coordinate range".into());
+            }
+            if !positions.insert(cell.pos) || local_cells.contains_key(&local) {
+                return Err("duplicate ship assembly cell".into());
+            }
+            local_cells.insert(local, cell.block_id.clone());
+            if let Some(payload) = &cell.block_entity {
+                entities.insert(local, payload.clone());
+            }
+        }
+        // Connectivity preflight: face-connected 6-neighbor flood fill over
+        // local cells. Air pockets are fine; disjoint assemblies are not.
+        let first = *positions.iter().next().expect("nonempty checked");
+        let mut seen = BTreeSet::from([first]);
+        let mut queue = VecDeque::from([first]);
+        while let Some(pos) = queue.pop_front() {
+            for axis in 0..3 {
+                for sign in [-1i32, 1] {
+                    let mut next = pos;
+                    next[axis] = next[axis].saturating_add(sign);
+                    if positions.contains(&next) && seen.insert(next) {
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        if seen.len() != positions.len() {
+            return Err("ship assembly cells are not face-connected".into());
+        }
+        self.assemble_airship(
+            subworld_id,
+            parent_dim,
+            local_cells,
+            addon_mod_id,
+            block_mass,
+        )?;
+        self.ship_block_entities.insert(subworld_id, entities);
+        if let Some(ship) = self.airships.get_mut(&subworld_id) {
+            ship.pos = [
+                f64::from(origin[0]) + ship.center_of_mass[0],
+                f64::from(origin[1]) + ship.center_of_mass[1],
+                f64::from(origin[2]) + ship.center_of_mass[2],
+            ];
+            self.committed_poses
+                .insert(subworld_id, (ship.pos, ship.quat, ship.pos, ship.quat));
+        }
+        Ok(())
+    }
+
+    /// Produce a collision-checked atomic disassembly plan. Every current
+    /// hull cell is transformed by the ship's committed rigid pose (rotation
+    /// snapped to the nearest quarter turn for grid write-back) and every
+    /// carried block entity follows its cell. `cell_available` must encode
+    /// both obstruction and protection policy. If any target fails, the ship,
+    /// riders, leases, and block entities remain untouched; otherwise the
+    /// ship is removed exactly once and the complete write plan returned.
+    fn disassemble_ship_atomic(
+        &mut self,
+        subworld_id: u64,
+        mut cell_available: impl FnMut([i32; 3], &str) -> bool,
+    ) -> Result<ShipDisassemblyPlan, String> {
+        let ship = self
+            .airships
+            .get(&subworld_id)
+            .ok_or_else(|| "unknown subworld".to_string())?;
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| "aeronautics registry unavailable".to_string())?;
+        // Extract yaw for nearest-quarter grid snapping. Roll/pitch-only
+        // components intentionally do not select a different grid rotation.
+        let [qx, qy, qz, qw] = ship.quat;
+        let yaw = (2.0 * (qw * qy + qx * qz))
+            .atan2(1.0 - 2.0 * (qy * qy + qx * qx));
+        let quarter = (yaw.to_degrees() / 90.0).round() as i32;
+        let rot = quarter.rem_euclid(4);
+        let base = [
+            (ship.pos[0] - ship.center_of_mass[0]).round() as i32,
+            (ship.pos[1] - ship.center_of_mass[1]).round() as i32,
+            (ship.pos[2] - ship.center_of_mass[2]).round() as i32,
+        ];
+        let entities = self
+            .ship_block_entities
+            .get(&subworld_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut writes = Vec::with_capacity(ship.blocks.len());
+        let mut targets = BTreeSet::new();
+        for (&[lx, ly, lz], block_id) in &ship.blocks {
+            let (rx, rz) = match rot {
+                0 => (lx, lz),
+                1 => (lz, -lx),
+                2 => (-lx, -lz),
+                3 => (-lz, lx),
+                _ => unreachable!(),
+            };
+            let pos = [
+                base[0].checked_add(rx).ok_or("disassembly target overflow")?,
+                base[1].checked_add(ly).ok_or("disassembly target overflow")?,
+                base[2].checked_add(rz).ok_or("disassembly target overflow")?,
+            ];
+            if !targets.insert(pos) {
+                return Err("rotated disassembly writes overlap".into());
+            }
+            if !cell_available(pos, block_id) {
+                return Err(format!("disassembly target {pos:?} is obstructed or protected"));
+            }
+            let state_id = registry.decode_canonical(block_id).unwrap_or(0);
+            writes.push(ShipDisassemblyWrite {
+                pos,
+                state_id,
+                block_id: block_id.clone(),
+                block_entity: entities.get(&[lx, ly, lz]).cloned(),
+            });
+        }
+
+        // Only after total preflight succeeds do we mutate ownership.
+        let ship = self.airships.remove(&subworld_id).expect("checked above");
+        let detached_riders: Vec<i32> = self
+            .passengers
+            .iter()
+            .filter(|(_, (ship_id, _))| *ship_id == subworld_id)
+            .map(|(&eid, _)| eid)
+            .collect();
+        self.passengers
+            .retain(|_, (ship_id, _)| *ship_id != subworld_id);
+        self.rider_kinds.retain(|eid, _| self.passengers.contains_key(eid));
+        self.helm_leases.retain(|player, lease| {
+            if lease.ship_id == subworld_id {
+                self.disassembly_permits.remove(&(*player, subworld_id));
+                false
+            } else {
+                true
+            }
+        });
+        self.revisions.remove(&subworld_id);
+        self.committed_poses.remove(&subworld_id);
+        self.ship_block_entities.remove(&subworld_id);
+        let frame = SubWorldSyncFrame {
+            kind: SubWorldSyncKind::Despawn,
+            subworld_id,
+            dim_id: DimId::from_raw(ship.parent_dim).dimension_id().to_owned(),
+            pos: ship.pos,
+            quat: ship.quat.map(|v| v as f32),
+            vel: [0.0; 3],
+            ang_vel: [0.0; 3],
+            revision: self.revisions.get(&subworld_id).copied().unwrap_or(0),
+            voxels: Vec::new(),
+        }
+        .encode()?;
+        self.sync_frames.push((ship.parent_dim, frame));
+        Ok(ShipDisassemblyPlan {
+            ship_id: subworld_id,
+            dim_id: ship.parent_dim,
+            writes,
+            detached_riders,
+        })
+    }
+
+    /// Encode a complete revisioned SW6D v2 baseline for every ship in
+    /// `dim` — hull voxels, pivot, numeric dimension id, pose and velocities
+    /// included. `None` means either no ships are present or validation failed
+    /// closed.
+    fn sw6d_baseline_frame(&self, dim: u32) -> Option<Vec<u8>> {
+        let mut records = Vec::new();
+        for ship in self.airships.values().filter(|ship| ship.parent_dim == dim) {
+            let revision = self.revisions.get(&ship.id).copied().unwrap_or(0);
+            records.push(
+                adb_ship_sw6d_record(
+                    ship,
+                    u64::from(revision),
+                    true,
+                    self.registry.as_ref(),
+                )
+                .ok()?,
+            );
+        }
+        if records.is_empty() {
+            return None;
+        }
+        adb_encode_sw6d_frame(ADB_SW6D_MODE_BASELINE, &records).ok()
+    }
+
+    /// Record a client join/dimension change and return the baseline frame
+    /// that must precede any incremental pose delta for that client.
+    fn client_join_baseline(&mut self, client_id: u32, dim: u32) -> Vec<Vec<u8>> {
+        self.tracked_clients.insert(client_id, dim);
+        self.sw6d_baseline_frame(dim).into_iter().collect()
     }
 
     /// Deterministic Save v2 blob: every airship's `AERO` v1 snapshot in
@@ -359,6 +1040,24 @@ impl AeronauticsRuntimeBridge {
             .max(restored.keys().next_back().map(|id| id + 1).unwrap_or(1));
         self.airships = restored;
         self.passengers.clear();
+        self.rider_kinds.clear();
+        self.committed_poses = self
+            .airships
+            .values()
+            .map(|ship| (ship.id, (ship.pos, ship.quat, ship.pos, ship.quat)))
+            .collect();
+        // Restore is a complete fleet re-baseline, not a sequence of pose
+        // deltas: clients must receive full hull+pivot+dimension records first.
+        for dim in self
+            .airships
+            .values()
+            .map(|ship| ship.parent_dim)
+            .collect::<BTreeSet<_>>()
+        {
+            if let Some(frame) = self.sw6d_baseline_frame(dim) {
+                self.sync_frames.push((dim, frame));
+            }
+        }
         Ok(())
     }
 
@@ -404,6 +1103,14 @@ impl AeronauticsRuntimeBridge {
             data.blockstates.extend(bundle.blockstates);
         }
         let mut hidden: BTreeSet<String> = BTreeSet::new();
+        for recipe in &data.recipes {
+            if create_adapter::data_loader::CreateRecipeKind::from_type_str(&recipe.recipe_type)
+                .is_none()
+            {
+                self.unsupported_addon_serializers
+                    .insert(recipe.recipe_type.clone());
+            }
+        }
         let namespaces = adb_addon_namespaces(&data);
         for ns in namespaces {
             let mut profile = discover_create_addon_profile(&ns, &data);
@@ -443,7 +1150,10 @@ impl AeronauticsRuntimeBridge {
                 hidden.insert(ns_rl(name));
                 self.mod_hidden_names.insert(ns_rl(name));
             }
-            self.add_addon(profile);
+            let report = self.register_admitted_addon_catalog(vec![profile]);
+            for serializer in report.unsupported_serializers {
+                self.unsupported_addon_serializers.insert(serializer);
+            }
         }
         Ok(register_hidden_block_names(
             hidden.iter().map(String::as_str),
@@ -956,6 +1666,129 @@ fn adb_r_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
     Some(u32::from_be_bytes(s.try_into().ok()?))
 }
 
+// ---------- canonical SW6D v2 frame encoding ----------
+
+const ADB_SW6D_MAGIC: [u8; 4] = *b"SW6D";
+const ADB_SW6D_VERSION: u8 = 2;
+const ADB_SW6D_MODE_BASELINE: u8 = 0;
+const ADB_SW6D_MODE_SPAWN: u8 = 1;
+const ADB_SW6D_MODE_POSE: u8 = 2;
+const ADB_SW6D_MODE_DESPAWN: u8 = 3;
+
+#[derive(Clone, Debug)]
+struct AdbSw6dRecord {
+    subworld_id: u64,
+    dimension_id: u32,
+    revision: u64,
+    pos: [f64; 3],
+    quat: [f32; 4],
+    vel: [f32; 3],
+    ang_vel: [f32; 3],
+    pivot: [f32; 3],
+    flags: u8,
+    voxels: Vec<([i16; 3], u32)>,
+}
+
+fn adb_encode_sw6d_frame(mode: u8, records: &[AdbSw6dRecord]) -> Result<Vec<u8>, String> {
+    if records.len() > 4096 || records.len() > u16::MAX as usize {
+        return Err("SW6D record count exceeds limit".into());
+    }
+    if mode != ADB_SW6D_MODE_BASELINE && records.len() != 1 {
+        return Err("SW6D delta frames carry exactly one record".into());
+    }
+    let allow_voxels = matches!(mode, ADB_SW6D_MODE_BASELINE | ADB_SW6D_MODE_SPAWN);
+    for record in records {
+        if !allow_voxels && !record.voxels.is_empty() {
+            return Err("SW6D pose/despawn records cannot carry voxels".into());
+        }
+        if record.voxels.len() > create_adapter::aeronautics::MAX_SUBWORLD_VOXELS {
+            return Err("SW6D voxel payload exceeds limit".into());
+        }
+        if !record.pos.iter().all(|v| v.is_finite())
+            || !record.quat.iter().all(|v| v.is_finite())
+            || !record.vel.iter().all(|v| v.is_finite())
+            || !record.ang_vel.iter().all(|v| v.is_finite())
+            || !record.pivot.iter().all(|v| v.is_finite())
+        {
+            return Err("SW6D record contains non-finite pose values".into());
+        }
+    }
+    let voxel_len: usize = records.iter().map(|r| r.voxels.len() * 10).sum();
+    let mut out = Vec::with_capacity(8 + records.len() * 93 + voxel_len);
+    out.extend_from_slice(&ADB_SW6D_MAGIC);
+    out.push(ADB_SW6D_VERSION);
+    out.push(mode);
+    out.extend_from_slice(&(records.len() as u16).to_be_bytes());
+    for record in records {
+        out.extend_from_slice(&record.subworld_id.to_be_bytes());
+        out.extend_from_slice(&record.dimension_id.to_be_bytes());
+        out.extend_from_slice(&record.revision.to_be_bytes());
+        for value in record.pos {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in record.quat {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in record.vel {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in record.ang_vel {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        for value in record.pivot {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out.push(record.flags);
+        out.extend_from_slice(&(record.voxels.len() as u32).to_be_bytes());
+        for (offset, state) in &record.voxels {
+            for value in offset {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            out.extend_from_slice(&state.to_be_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn adb_ship_sw6d_record(
+    ship: &RigidBodySubWorld,
+    revision: u64,
+    include_voxels: bool,
+    registry: Option<&CreateBlockRegistry>,
+) -> Result<AdbSw6dRecord, String> {
+    let mut voxels = Vec::new();
+    if include_voxels {
+        for (&[x, y, z], canonical) in &ship.blocks {
+            if x < i32::from(i16::MIN)
+                || x > i32::from(i16::MAX)
+                || y < i32::from(i16::MIN)
+                || y > i32::from(i16::MAX)
+                || z < i32::from(i16::MIN)
+                || z > i32::from(i16::MAX)
+            {
+                return Err("ship block lies outside the SW6D voxel range".into());
+            }
+            let state = registry
+                .and_then(|reg| reg.decode_canonical(canonical))
+                .unwrap_or(0);
+            voxels.push(([x as i16, y as i16, z as i16], state));
+        }
+    }
+    Ok(AdbSw6dRecord {
+        subworld_id: ship.id,
+        dimension_id: ship.parent_dim,
+        revision,
+        pos: ship.pos,
+        quat: ship.quat.map(|v| v as f32),
+        vel: ship.vel.map(|v| v as f32),
+        ang_vel: ship.omega.map(|v| v as f32),
+        pivot: ship.center_of_mass.map(|v| v as f32),
+        flags: 0,
+        voxels,
+    })
+}
+
+// ---------- global bridges + entry points ----------
 // ---------- global bridges + entry points ----------
 
 /// The process-wide aeronautics bridge.
@@ -1061,23 +1894,29 @@ fn aeronautics_bridge_assemble_ship(
         f64::from(origin[1]) + sub.center_of_mass[1],
         f64::from(origin[2]) + sub.center_of_mass[2],
     ];
-    let frame = SubWorldSyncFrame {
-        kind: SubWorldSyncKind::FullSpawn,
-        subworld_id: id,
-        dim_id: dim.dimension_id().to_owned(),
-        pos: sub.pos,
-        quat: sub.quat.map(|v| v as f32),
-        vel: [0.0; 3],
-        ang_vel: [0.0; 3],
-        revision: 0,
-        voxels,
-    }
-    .encode()?;
+    let frame = adb_encode_sw6d_frame(
+        ADB_SW6D_MODE_SPAWN,
+        &[AdbSw6dRecord {
+            subworld_id: id,
+            dimension_id: dim.raw(),
+            revision: 0,
+            pos: sub.pos,
+            quat: sub.quat.map(|v| v as f32),
+            vel: [0.0; 3],
+            ang_vel: [0.0; 3],
+            pivot: sub.center_of_mass.map(|v| v as f32),
+            flags: 0,
+            voxels,
+        }],
+    )?;
     bridge.sync_frames.push((dim.raw(), frame));
     Ok(id)
 }
 
-/// Apply a player helm packet to the addressed live ship.
+/// Apply a player helm packet to the addressed live ship. Player identity is
+/// authoritative: only an unexpired seated lease in the ship's current
+/// dimension and assembly revision may actuate the helm, and destructive
+/// disassembly requires its separate permission bit.
 fn aeronautics_bridge_apply_helm_input(
     player_eid: u32,
     input: &SubWorldHelmInput,
@@ -1086,41 +1925,129 @@ fn aeronautics_bridge_apply_helm_input(
     let mut bridge = aeronautics_bridge()
         .lock()
         .map_err(|_| "aeronautics bridge lock poisoned".to_string())?;
+    bridge.validate_helm_input(player_eid, input)?;
     if input.disassemble {
-        let sub = bridge
+        let dim_raw = bridge
             .airships
-            .remove(&input.subworld_id)
+            .get(&input.subworld_id)
+            .map(|ship| ship.parent_dim)
             .ok_or_else(|| "unknown subworld".to_string())?;
-        let frame = SubWorldSyncFrame {
-            kind: SubWorldSyncKind::Despawn,
-            subworld_id: input.subworld_id,
-            dim_id: DimId::from_raw(sub.parent_dim).dimension_id().to_owned(),
-            pos: sub.pos,
-            quat: sub.quat.map(|v| v as f32),
-            vel: [0.0; 3],
-            ang_vel: [0.0; 3],
-            revision: bridge
-                .revisions
-                .remove(&input.subworld_id)
-                .unwrap_or(0)
-                .saturating_add(1),
-            voxels: Vec::new(),
+        let plan = bridge.disassemble_ship_atomic(input.subworld_id, |pos, _| {
+            pos[1] >= MIN_Y
+                && pos[1] < MIN_Y + 384
+                && block_at_dim(DimId::from_raw(dim_raw), pos[0], pos[1], pos[2]) == 0
+        })?;
+        let revision = 1u64;
+        let frame = adb_encode_sw6d_frame(
+            ADB_SW6D_MODE_DESPAWN,
+            &[AdbSw6dRecord {
+                subworld_id: input.subworld_id,
+                dimension_id: plan.dim_id,
+                revision,
+                pos: [0.0; 3],
+                quat: [0.0, 0.0, 0.0, 1.0],
+                vel: [0.0; 3],
+                ang_vel: [0.0; 3],
+                pivot: [0.0; 3],
+                flags: 0,
+                voxels: Vec::new(),
+            }],
+        )?;
+        bridge.sync_frames.push((plan.dim_id, frame));
+        drop(bridge);
+        // World mutation happens only after the bridge mutex has been
+        // released; the plan carries every block entity payload so contents
+        // are never silently discarded.
+        for write in &plan.writes {
+            let edit = create_adapter::contraption_adapter::WorldBlockEdit {
+                pos: create_adapter::factory::DimBlockPos::new(
+                    plan.dim_id as i32,
+                    write.pos[0],
+                    write.pos[1],
+                    write.pos[2],
+                ),
+                state_id: Some(write.state_id),
+            };
+            let _ = mob_commit_world_block_edit(&edit);
         }
-        .encode()?;
-        bridge.sync_frames.push((sub.parent_dim, frame));
-        bridge
-            .passengers
-            .retain(|_, (ship, _)| *ship != input.subworld_id);
-        let _ = player_eid;
         return Ok(());
     }
+    let mut governed = *input;
     let sub = bridge
         .airships
         .get_mut(&input.subworld_id)
         .ok_or_else(|| "unknown subworld".to_string())?;
-    sub.apply_helm_input(input)?;
-    let _ = player_eid;
-    Ok(())
+    // Authority follows installed hardware: no propeller mount means no
+    // throttle actuator, and no control/helm/rudder mount means no torque.
+    if sub.propellers.is_empty() {
+        governed.throttle = 0.0;
+    }
+    if sub.rudders.is_empty() {
+        governed.pitch = 0.0;
+        governed.yaw = 0.0;
+        governed.roll = 0.0;
+    }
+    sub.apply_helm_input(&governed)
+}
+
+/// Grant or refresh an authoritative helm seat. Returns the lease revision
+/// and expiry tick for callers that surface seat state to clients.
+#[allow(dead_code)]
+fn aeronautics_bridge_assign_helm_seat(
+    player_eid: u32,
+    ship_id: u64,
+    ttl_ticks: u64,
+) -> Result<(u32, u64), String> {
+    let mut bridge = aeronautics_bridge()
+        .lock()
+        .map_err(|_| "aeronautics bridge lock poisoned".to_string())?;
+    bridge
+        .assign_helm_seat(player_eid, ship_id, ttl_ticks)
+        .map(|lease| (lease.revision, lease.expires_tick))
+}
+
+/// Permit one seated player to execute ship disassembly.
+#[allow(dead_code)]
+fn aeronautics_bridge_permit_ship_disassembly(player_eid: u32, ship_id: u64) -> bool {
+    aeronautics_bridge()
+        .lock()
+        .map(|mut bridge| {
+            if bridge.helm_leases.contains_key(&player_eid) {
+                bridge.permit_ship_disassembly(player_eid, ship_id);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+}
+
+/// Disconnect/dismount cleanup: revoke the helm lease and neutralize any
+/// latched controls on the ship the player used to control.
+#[allow(dead_code)]
+fn detach_helm_player(player_id: u32) -> bool {
+    aeronautics_bridge()
+        .lock()
+        .map(|mut bridge| bridge.detach_helm_player(player_id))
+        .unwrap_or(false)
+}
+
+/// Late-join/dimension-change entry point: record the client's dimension and
+/// return the revisioned full SW6D v2 baseline that must precede pose deltas.
+#[allow(dead_code)]
+fn aeronautics_client_join_baseline(client_id: u32, dim_id: DimId) -> Vec<Vec<u8>> {
+    aeronautics_bridge()
+        .lock()
+        .map(|mut bridge| bridge.client_join_baseline(client_id, dim_id.raw()))
+        .unwrap_or_default()
+}
+
+/// Absolute-server-tick entry point ready for `main.rs` tick wiring.
+#[allow(dead_code)]
+fn aeronautics_tick_once_for_server(server_tick: u64) {
+    if let Ok(mut bridge) = aeronautics_bridge().lock() {
+        bridge.tick_once_for_server(server_tick);
+    }
 }
 
 /// Advance active airships and return queued `(dimension, encoded frame)` S2C updates.
@@ -2097,6 +3024,7 @@ mod aeronautics_and_dim_bridge_tests {
         let blocks = [
             ([10, 100, 10], 1, "aeronautics:andesite_propeller"),
             ([11, 100, 10], 2, "aeronautics:red_envelope"),
+            ([10, 100, 11], 3, "aeronautics:rudder"),
         ];
         let id =
             aeronautics_bridge_assemble_ship(DimId::Overworld, [10, 100, 10], &blocks).unwrap();
@@ -2124,6 +3052,8 @@ mod aeronautics_and_dim_bridge_tests {
             buoyancy_delta: 1.0,
             disassemble: false,
         };
+        assert!(aeronautics_bridge_apply_helm_input(91, &input).is_err());
+        aeronautics_bridge_assign_helm_seat(91, id, 200).unwrap();
         aeronautics_bridge_apply_helm_input(91, &input).unwrap();
         for _ in 0..20 {
             let frames = aeronautics_bridge_step_and_drain_sync_frames(0.05);
@@ -2166,6 +3096,11 @@ mod aeronautics_and_dim_bridge_tests {
             buoyancy_delta: 0.0,
             ..input
         };
+        // The orbital transfer invalidated the original dimension-bound lease;
+        // re-seat the pilot in the destination dimension before permitting
+        // the destructive disassembly command.
+        aeronautics_bridge_assign_helm_seat(91, id, 200).unwrap();
+        assert!(aeronautics_bridge_permit_ship_disassembly(91, id));
         aeronautics_bridge_apply_helm_input(91, &despawn).unwrap();
         let frames = aeronautics_bridge_step_and_drain_sync_frames(0.05);
         assert!(frames
@@ -2220,4 +3155,142 @@ mod aeronautics_and_dim_bridge_tests {
             sub.center_of_mass
         );
     }
+
+    fn audit_cells(pos: [i32; 3], block_entity: bool) -> Vec<ShipAssemblyCell> {
+        vec![
+            ShipAssemblyCell {
+                pos,
+                state_id: 1,
+                block_id: "aeronautics:andesite_propeller".to_string(),
+                block_entity: block_entity.then(|| b"chest-contents".to_vec()),
+            },
+            ShipAssemblyCell {
+                pos: [pos[0] + 1, pos[1], pos[2]],
+                state_id: 2,
+                block_id: "aeronautics:red_envelope".to_string(),
+                block_entity: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn helm_lease_identity_expiry_disconnect_and_disassembly_permission() {
+        let mut bridge = AeronauticsRuntimeBridge::new();
+        bridge
+            .assemble_ship_atomic(42, 0, [0, 64, 0], &audit_cells([0, 64, 0], false), None, 100.0)
+            .unwrap();
+        let input = SubWorldHelmInput {
+            subworld_id: 42,
+            throttle: 1.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
+            buoyancy_delta: 0.0,
+            disassemble: false,
+        };
+        assert!(bridge.validate_helm_input(91, &input).is_err());
+        bridge.assign_helm_seat(91, 42, 10).unwrap();
+        bridge.validate_helm_input(91, &input).unwrap();
+        // Destructive input is separately permission-gated even for the
+        // authorized seated pilot.
+        let mut destructive = input;
+        destructive.disassemble = true;
+        assert!(bridge.validate_helm_input(91, &destructive).is_err());
+        bridge.permit_ship_disassembly(91, 42);
+        bridge.validate_helm_input(91, &destructive).unwrap();
+
+        // Latch thrust, then expire the lease: validation fails and the ship
+        // is neutralized instead of continuing under stale input.
+        bridge
+            .airships
+            .get_mut(&42)
+            .unwrap()
+            .apply_helm_input(&input)
+            .unwrap();
+        bridge.server_tick = 10;
+        assert!(bridge.validate_helm_input(91, &input).is_err());
+        assert!(bridge.helm_leases.is_empty());
+        bridge.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
+        assert_eq!(
+            bridge.airships[&42].vel[0], 0.0,
+            "expiry must neutralize latched throttle before the next step"
+        );
+
+        // Disconnect cleanup has the same revoke-and-neutralize behavior.
+        bridge.assign_helm_seat(91, 42, 100).unwrap();
+        bridge
+            .airships
+            .get_mut(&42)
+            .unwrap()
+            .apply_helm_input(&input)
+            .unwrap();
+        assert!(bridge.detach_helm_player(91));
+        assert!(!bridge.helm_leases.contains_key(&91));
+        bridge.airships.get_mut(&42).unwrap().vel = [0.0; 3];
+        bridge.step(0.05, 9.81, SEA_LEVEL_AIR_DENSITY);
+        assert_eq!(
+            bridge.airships[&42].vel[0], 0.0,
+            "disconnect must neutralize latched throttle before the next step"
+        );
+    }
+
+    #[test]
+    fn atomic_ship_transfer_preserves_block_entities_and_rolls_back_blockage() {
+        let mut bridge = AeronauticsRuntimeBridge::new();
+        let cells = audit_cells([10, 64, 10], true);
+        bridge
+            .assemble_ship_atomic(77, 0, [10, 64, 10], &cells, None, 100.0)
+            .unwrap();
+        assert!(bridge.attach_rider(501, 77, [0.0, 1.0, 0.0], true));
+        bridge.assign_helm_seat(501, 77, 100).unwrap();
+        assert_eq!(
+            bridge.ship_block_entities[&77].get(&[0, 0, 0]).map(Vec::as_slice),
+            Some(b"chest-contents".as_slice())
+        );
+
+        // Total preflight failure mutates nothing: ship, rider, lease, and
+        // payload all remain owned by the subworld for a clean retry.
+        let err = bridge.disassemble_ship_atomic(77, |_, _| false).unwrap_err();
+        assert!(err.contains("obstructed") || err.contains("protected"));
+        assert!(bridge.airships.contains_key(&77));
+        assert!(bridge.passengers.contains_key(&501));
+        assert!(bridge.helm_leases.contains_key(&501));
+        assert!(bridge.ship_block_entities[&77].contains_key(&[0, 0, 0]));
+
+        let plan = bridge
+            .disassemble_ship_atomic(77, |_, _| true)
+            .expect("all targets free");
+        assert_eq!(plan.ship_id, 77);
+        assert_eq!(plan.detached_riders, [501]);
+        assert_eq!(plan.writes.len(), 2);
+        assert!(plan.writes.iter().any(|write| {
+            write.block_id == "aeronautics:andesite_propeller"
+                && write.block_entity.as_deref() == Some(b"chest-contents".as_slice())
+        }));
+        assert!(!bridge.airships.contains_key(&77));
+        assert!(!bridge.passengers.contains_key(&501));
+        assert!(bridge.helm_leases.is_empty());
+        assert!(!bridge.ship_block_entities.contains_key(&77));
+    }
+
+    #[test]
+    fn late_join_baseline_is_revisioned_full_voxel_sw6d_for_dimension() {
+        let mut bridge = AeronauticsRuntimeBridge::new();
+        bridge
+            .assemble_ship_atomic(88, 7, [0, 64, 0], &audit_cells([0, 64, 0], false), None, 100.0)
+            .unwrap();
+        let frames = bridge.client_join_baseline(12, 7);
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        assert_eq!(&frame[..4], b"SW6D");
+        assert_eq!(frame[4], ADB_SW6D_VERSION);
+        assert_eq!(frame[5], ADB_SW6D_MODE_BASELINE);
+        assert_eq!(u16::from_be_bytes([frame[6], frame[7]]), 1);
+        assert_eq!(u64::from_be_bytes(frame[8..16].try_into().unwrap()), 88);
+        assert_eq!(u32::from_be_bytes(frame[16..20].try_into().unwrap()), 7);
+        assert!(frame.len() > 8 + 93, "baseline includes full voxel payload");
+        // Wrong-dimension clients receive no stale baseline from this fleet.
+        assert!(bridge.client_join_baseline(13, 8).is_empty());
+    }
+
 }
