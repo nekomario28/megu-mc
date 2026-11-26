@@ -2396,6 +2396,227 @@ impl DragonRespawnRitual {
     }
 }
 
+
+/// Portal rewards produced when the End-owned dragon fight is completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EndPortalReward {
+    pub exit_portal_base: [i32; 3],
+    pub dragon_egg: Option<[i32; 3]>,
+    pub xp: u32,
+}
+
+/// World-facing effects of the End dragon fight controller. Entity creation is
+/// deliberately left to the End host; the controller owns the vanilla sequence,
+/// crystal positions, healing linkage, and respawn ritual state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EndDragonFightEvent {
+    SpawnDragon { position: [f64; 3], respawned: bool },
+    MaterializeCrystal { position: [f64; 3] },
+    CrystalBeam { crystal: [i32; 3] },
+    CloseExitPortal,
+    BeamAt { crystal: [i32; 3] },
+}
+
+/// End-owned dragon fight state. The ten pillar crystals are keyed by their
+/// integer block position; the values are deterministic fight-local crystal
+/// entity ids used only for healing-link identity inside the controller.
+pub struct EndDragonFightController {
+    world_seed: u64,
+    portal_y: i32,
+    dragon: EnderDragonBehavior,
+    initialized: bool,
+    dragon_alive: bool,
+    kills: u32,
+    ticks: u64,
+    pillar_crystals: std::collections::BTreeMap<[i32; 3], i32>,
+    ritual_placed: std::collections::BTreeSet<[i32; 3]>,
+    respawn_ticks: Option<u16>,
+    next_crystal_entity: i32,
+    linked_crystal: Option<i32>,
+}
+
+impl EndDragonFightController {
+    pub fn new(world_seed: u64, portal_y: i32) -> Self {
+        Self {
+            world_seed,
+            portal_y,
+            dragon: EnderDragonBehavior::new(false),
+            initialized: false,
+            dragon_alive: false,
+            kills: 0,
+            ticks: 0,
+            pillar_crystals: std::collections::BTreeMap::new(),
+            ritual_placed: std::collections::BTreeSet::new(),
+            respawn_ticks: None,
+            next_crystal_entity: 1,
+            linked_crystal: None,
+        }
+    }
+
+    /// Create the initial fight exactly once: the dragon at the vanilla high
+    /// central spawn point plus the ten crystals on this seed's obsidian spikes.
+    pub fn ensure_dragon_fight_initialized(&mut self) -> Vec<EndDragonFightEvent> {
+        if self.initialized {
+            return Vec::new();
+        }
+        self.initialized = true;
+        self.dragon_alive = true;
+        self.dragon = EnderDragonBehavior::new(self.kills > 0);
+        let mut events = vec![EndDragonFightEvent::SpawnDragon {
+            position: [0.0, 128.0, 0.0],
+            respawned: false,
+        }];
+        events.extend(self.materialize_end_pillar_crystals());
+        events
+    }
+
+    /// Materialize every missing spike-top crystal. Positions come from the
+    /// same seed-derived ten-spike layout used by the live dragon behavior.
+    pub fn materialize_end_pillar_crystals(&mut self) -> Vec<EndDragonFightEvent> {
+        let mut events = Vec::new();
+        for pillar in end_crystal_pillars(self.world_seed) {
+            let position = end_crystal_spawn_position(&pillar);
+            let key = position.map(|coordinate| coordinate.floor() as i32);
+            if self.pillar_crystals.contains_key(&key) {
+                continue;
+            }
+            let entity = self.next_crystal_entity;
+            self.next_crystal_entity += 1;
+            self.pillar_crystals.insert(key, entity);
+            events.push(EndDragonFightEvent::MaterializeCrystal { position });
+        }
+        events
+    }
+
+    /// Register a player-placed end crystal. Returns true when the position is
+    /// one of the four vanilla respawn-ritual rim positions and the crystal was
+    /// accepted into that ritual. Completing the quartet starts the ceremony.
+    pub fn on_end_crystal_placed(&mut self, x: i32, y: i32, z: i32) -> bool {
+        if self.dragon_alive || self.respawn_ticks.is_some() {
+            return false;
+        }
+        let pos = [x, y, z];
+        if !dragon_respawn_crystal_positions(self.portal_y).contains(&pos) {
+            return false;
+        }
+        self.ritual_placed.insert(pos);
+        if self.ritual_placed.len() == dragon_respawn_crystal_positions(self.portal_y).len() {
+            self.ritual_placed.clear();
+            self.respawn_ticks = Some(0);
+        }
+        true
+    }
+
+    /// Remove a destroyed crystal. Destroying the crystal currently linked by a
+    /// healing beam deals vanilla's 10 damage to the dragon; destroying an
+    /// unlinked pillar crystal merely removes it. Returns whether a tracked
+    /// fight crystal was consumed.
+    pub fn on_end_crystal_destroyed(&mut self, pos: [i32; 3]) -> bool {
+        if let Some(entity) = self.pillar_crystals.remove(&pos) {
+            if self.linked_crystal == Some(entity) {
+                self.dragon.crystal_destroyed(entity);
+                if self.dragon.hp == 0.0 {
+                    self.dragon_alive = false;
+                }
+            }
+            return true;
+        }
+        self.ritual_placed.remove(&pos)
+    }
+
+    /// Advance healing linkage and, while active, the 100-tick respawn ritual.
+    pub fn tick(&mut self, dragon_position: [f64; 3]) -> Vec<EndDragonFightEvent> {
+        let mut events = Vec::new();
+
+        if let Some(ticks) = self.respawn_ticks {
+            let ticks = ticks.saturating_add(1);
+            self.respawn_ticks = Some(ticks);
+            let ritual_crystals = dragon_respawn_crystal_positions(self.portal_y);
+            if ticks == 1 {
+                events.push(EndDragonFightEvent::CloseExitPortal);
+            }
+            if ticks <= 100 && ticks.is_multiple_of(25) {
+                events.push(EndDragonFightEvent::BeamAt {
+                    crystal: ritual_crystals[(ticks as usize / 25 - 1) % ritual_crystals.len()],
+                });
+            }
+            if ticks == 100 {
+                events.extend(self.materialize_end_pillar_crystals());
+            }
+            if ticks == 101 {
+                self.respawn_ticks = None;
+                self.dragon = EnderDragonBehavior::new(true);
+                self.dragon_alive = true;
+                self.linked_crystal = None;
+                events.push(EndDragonFightEvent::SpawnDragon {
+                    position: [0.0, 128.0, 0.0],
+                    respawned: true,
+                });
+            }
+            return events;
+        }
+
+        if !self.dragon_alive {
+            return events;
+        }
+        self.ticks = self.ticks.saturating_add(1);
+        self.linked_crystal = self
+            .pillar_crystals
+            .iter()
+            .filter_map(|(&block, &entity)| {
+                let center = [
+                    block[0] as f64 + 0.5,
+                    block[1] as f64 + 1.0,
+                    block[2] as f64 + 0.5,
+                ];
+                let delta = mob_behavior_delta(dragon_position, center);
+                delta
+                    .into_iter()
+                    .all(|axis| axis.abs() <= 32.0)
+                    .then_some((mob_behavior_dot(delta, delta), entity, block))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, entity, _)| entity);
+        self.dragon.linked_crystal = self.linked_crystal;
+        if self.ticks.is_multiple_of(10) {
+            if let Some((&crystal, _)) = self
+                .pillar_crystals
+                .iter()
+                .find(|(_, entity)| Some(**entity) == self.linked_crystal)
+            {
+                if self.dragon.hp < 200.0 {
+                    self.dragon.hp = (self.dragon.hp + 1.0).min(200.0);
+                }
+                events.push(EndDragonFightEvent::CrystalBeam { crystal });
+            }
+        }
+        events
+    }
+
+    /// Complete the fight and return the exit-portal reward. The first kill
+    /// awards 12,000 XP and the egg; later kills award 500 XP and no egg.
+    pub fn on_dragon_killed(&mut self) -> EndPortalReward {
+        let first = self.kills == 0;
+        self.kills = self.kills.saturating_add(1);
+        self.dragon_alive = false;
+        self.linked_crystal = None;
+        self.dragon.linked_crystal = None;
+        EndPortalReward {
+            exit_portal_base: [0, self.portal_y, 0],
+            dragon_egg: first.then_some([0, self.portal_y + 4, 0]),
+            xp: if first { 12_000 } else { 500 },
+        }
+    }
+
+    pub fn active_pillar_crystals(&self) -> Vec<[i32; 3]> {
+        self.pillar_crystals.keys().copied().collect()
+    }
+
+    pub fn dragon_hp(&self) -> f32 {
+        self.dragon.hp
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WitherHead {
     Center,
@@ -8411,4 +8632,112 @@ mod vanilla_horse_tests {
             HatchResult::Waiting
         );
     }
+
+    #[test]
+    fn end_dragon_fight_initializes_dragon_and_ten_pillar_crystals() {
+        let mut fight = EndDragonFightController::new(42, 60);
+        let events = fight.ensure_dragon_fight_initialized();
+        let spawns = events
+            .iter()
+            .filter(|e| matches!(e, EndDragonFightEvent::SpawnDragon { respawned: false, .. }))
+            .count();
+        let crystals = events
+            .iter()
+            .filter(|e| matches!(e, EndDragonFightEvent::MaterializeCrystal { .. }))
+            .count();
+        assert_eq!(spawns, 1);
+        assert_eq!(crystals, 10, "exactly ten obsidian spike crystals");
+        assert_eq!(fight.active_pillar_crystals().len(), 10);
+        assert!(
+            fight.ensure_dragon_fight_initialized().is_empty(),
+            "initialization is idempotent"
+        );
+        // Initial crystals exactly match the seed-derived spike tops.
+        for pillar in end_crystal_pillars(42) {
+            let expected = end_crystal_spawn_position(&pillar);
+            assert!(events.iter().any(|e| matches!(
+                e,
+                EndDragonFightEvent::MaterializeCrystal { position } if *position == expected
+            )));
+        }
+    }
+
+    #[test]
+    fn end_dragon_fight_crystal_heals_and_destruction_damages_dragon() {
+        let mut fight = EndDragonFightController::new(42, 60);
+        fight.ensure_dragon_fight_initialized();
+        let crystal = fight.active_pillar_crystals()[0];
+        fight.dragon.hp = 100.0;
+        // Park the dragon directly above the first crystal so it links.
+        let dragon_pos = [
+            crystal[0] as f64 + 0.5,
+            crystal[1] as f64 + 4.0,
+            crystal[2] as f64 + 0.5,
+        ];
+        let mut beamed = false;
+        for _ in 0..10 {
+            if fight
+                .tick(dragon_pos)
+                .iter()
+                .any(|e| matches!(e, EndDragonFightEvent::CrystalBeam { crystal: c } if *c == crystal))
+            {
+                beamed = true;
+            }
+        }
+        assert!(beamed, "dragon linked to a nearby crystal emits a healing beam");
+        assert!(fight.dragon_hp() > 100.0, "healing beam restores 1 hp per beam tick");
+        let hp_before = fight.dragon_hp();
+        assert!(fight.on_end_crystal_destroyed(crystal));
+        assert!(
+            fight.dragon_hp() <= hp_before - 9.0,
+            "destroying the linked crystal deals vanilla's 10 damage"
+        );
+        assert!(!fight.active_pillar_crystals().contains(&crystal));
+        assert!(!fight.on_end_crystal_destroyed(crystal), "unknown crystals are not tracked");
+    }
+
+    #[test]
+    fn end_dragon_fight_four_crystal_respawn_regenerates_pillars_and_dragon() {
+        let mut fight = EndDragonFightController::new(42, 60);
+        fight.ensure_dragon_fight_initialized();
+        let reward = fight.on_dragon_killed();
+        assert_eq!(reward.xp, 12_000);
+        assert!(reward.dragon_egg.is_some());
+        // Non-rim positions are rejected.
+        assert!(!fight.on_end_crystal_placed(5, 61, 5));
+        let rim = dragon_respawn_crystal_positions(60);
+        assert_eq!(rim.len(), 4);
+        assert!(rim.contains(&[3, 61, 0]) || rim.contains(&[3, 60, 0]));
+        for pos in rim {
+            assert!(fight.on_end_crystal_placed(pos[0], pos[1], pos[2]));
+        }
+        // Destroy all ten pillar crystals so respawn must regenerate them.
+        for crystal in fight.active_pillar_crystals() {
+            fight.on_end_crystal_destroyed(crystal);
+        }
+        assert!(fight.active_pillar_crystals().is_empty());
+        let dragon_pos = [0.0, 100.0, 0.0];
+        let mut saw_close = false;
+        let mut saw_beams = 0;
+        let mut saw_respawn = false;
+        for _ in 0..101 {
+            for event in fight.tick(dragon_pos) {
+                match event {
+                    EndDragonFightEvent::CloseExitPortal => saw_close = true,
+                    EndDragonFightEvent::BeamAt { .. } => saw_beams += 1,
+                    EndDragonFightEvent::SpawnDragon { respawned: true, .. } => saw_respawn = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_close, "respawn closes the exit portal");
+        assert_eq!(saw_beams, 4, "beams fire at each of the four rim crystals");
+        assert_eq!(fight.active_pillar_crystals().len(), 10, "pillar crystals regenerate");
+        assert!(saw_respawn, "dragon respawns after the 100-tick ritual");
+        // Second kill gives reduced XP and no egg.
+        let reward2 = fight.on_dragon_killed();
+        assert_eq!(reward2.xp, 500);
+        assert!(reward2.dragon_egg.is_none());
+    }
+
 }
