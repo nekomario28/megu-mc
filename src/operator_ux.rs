@@ -3992,6 +3992,287 @@ impl SupervisorPolicy {
     }
 }
 
+// ------------------------------------------------ restart countdown ----
+
+/// Default delay for a bare `/restart`: long enough for players to read the
+/// announcement, short enough that an operator mistyping it is not punished.
+pub(crate) const RESTART_DEFAULT_DELAY_SECS: u64 = 10;
+/// One day is the longest countdown accepted. Longer values are almost always
+/// a units mistake, and keeping the bound small makes tick arithmetic exact.
+pub(crate) const RESTART_MAX_DELAY_SECS: u64 = 86_400;
+/// Process exit code meaning "the supervisor should start megu again".
+pub(crate) const RESTART_DEFAULT_EXIT_CODE: i32 = MEGU_RESTART_EXIT_CODE;
+
+/// Player-facing countdown milestones, longest first. The mask in the
+/// controller indexes this table directly, so every milestone can fire once
+/// and only once even when a lagging caller skips several ticks.
+const RESTART_MILESTONE_SECS: [u64; 11] = [300, 120, 60, 30, 15, 10, 5, 4, 3, 2, 1];
+
+/// Parsed form of `/restart [seconds|now] [reason…]`, `/restart cancel` and
+/// `/restart status`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RestartCommand {
+    Schedule {
+        delay_secs: u64,
+        reason: Option<String>,
+    },
+    Cancel,
+    Status,
+}
+
+fn restart_reason(text: &str) -> Option<String> {
+    let reason = text.trim();
+    (!reason.is_empty()).then(|| reason.to_owned())
+}
+
+/// Parse the operator-facing restart command. The first whitespace-separated
+/// word is the action/delay; every remaining character is preserved as the
+/// human-readable reason. Parsing is deliberately total: bad input returns an
+/// operator-readable error rather than panicking or guessing a schedule.
+pub(crate) fn parse_restart_command(args: &str) -> Result<RestartCommand, String> {
+    let args = args.trim();
+    if args.is_empty() {
+        return Ok(RestartCommand::Schedule {
+            delay_secs: RESTART_DEFAULT_DELAY_SECS,
+            reason: None,
+        });
+    }
+    let first_end = args.find(char::is_whitespace).unwrap_or(args.len());
+    let first = &args[..first_end];
+    let reason = restart_reason(&args[first_end..]);
+    let lower = first.to_ascii_lowercase();
+    match lower.as_str() {
+        "cancel" => {
+            if reason.is_some() {
+                return Err("restart cancel does not take a reason".to_owned());
+            }
+            Ok(RestartCommand::Cancel)
+        }
+        "status" => {
+            if reason.is_some() {
+                return Err("restart status does not take a reason".to_owned());
+            }
+            Ok(RestartCommand::Status)
+        }
+        "now" => Ok(RestartCommand::Schedule {
+            delay_secs: 0,
+            reason,
+        }),
+        _ => {
+            let delay_secs = first.parse::<u64>().map_err(|_| {
+                format!(
+                    "invalid restart delay '{first}' — use seconds, 'now', 'cancel', or 'status'"
+                )
+            })?;
+            if delay_secs > RESTART_MAX_DELAY_SECS {
+                return Err(format!(
+                    "restart delay must be at most {RESTART_MAX_DELAY_SECS} seconds"
+                ));
+            }
+            Ok(RestartCommand::Schedule {
+                delay_secs,
+                reason,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveRestart {
+    target_tick: u64,
+    delay_secs: u64,
+    reason: Option<String>,
+    announced: bool,
+    /// Bit i corresponds to [`RESTART_MILESTONE_SECS`]`[i]`.
+    warned_mask: u16,
+}
+
+/// What one authoritative server tick decided. Warnings are bundled because a
+/// caller recovering from lag may cross several milestones in one tick; each
+/// text still appears exactly once. Execution carries the supervisor restart
+/// code, never a wall-clock decision made inside this controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RestartTickOutcome {
+    Quiet,
+    Broadcast(Vec<String>),
+    ExecuteRestart {
+        reason: Option<String>,
+        exit_code: i32,
+    },
+}
+
+/// Pure countdown state for `/restart`. `now_tick` is the server's own tick
+/// counter at [`TICKS_PER_SECOND`] ticks per second; the controller never
+/// reads a wall clock and is therefore deterministic under tests and replay.
+#[derive(Clone, Debug)]
+pub(crate) struct RestartCountdownController {
+    active: Option<ActiveRestart>,
+    exit_code: i32,
+}
+
+impl RestartCountdownController {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: None,
+            exit_code: RESTART_DEFAULT_EXIT_CODE,
+        }
+    }
+
+    /// Same controller with a nonstandard supervisor exit code. The default
+    /// is the established Megu/supervisor contract (`42`).
+    pub(crate) fn with_exit_code(exit_code: i32) -> Self {
+        Self {
+            active: None,
+            exit_code,
+        }
+    }
+
+    /// Schedule a countdown. An existing countdown is rejected rather than
+    /// silently overwritten: operators must explicitly cancel first, which
+    /// prevents two clashing broadcast sequences.
+    pub(crate) fn schedule(
+        &mut self,
+        now_tick: u64,
+        delay_secs: u64,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        if self.active.is_some() {
+            return Err("a restart is already scheduled; cancel it first".to_owned());
+        }
+        if delay_secs > RESTART_MAX_DELAY_SECS {
+            return Err(format!(
+                "restart delay must be at most {RESTART_MAX_DELAY_SECS} seconds"
+            ));
+        }
+        let delay_ticks = delay_secs.saturating_mul(u64::from(TICKS_PER_SECOND));
+        self.active = Some(ActiveRestart {
+            target_tick: now_tick.saturating_add(delay_ticks),
+            delay_secs,
+            reason: reason.and_then(|r| restart_reason(&r)),
+            announced: false,
+            warned_mask: 0,
+        });
+        Ok(())
+    }
+
+    /// Cancel the pending countdown. Returns whether one was active.
+    pub(crate) fn cancel(&mut self) -> bool {
+        self.active.take().is_some()
+    }
+
+    fn remaining_ticks(target_tick: u64, now_tick: u64) -> u64 {
+        target_tick.saturating_sub(now_tick)
+    }
+
+    fn ceil_secs(ticks: u64) -> u64 {
+        let tps = u64::from(TICKS_PER_SECOND);
+        ticks / tps + u64::from(ticks % tps != 0)
+    }
+
+    /// Seconds remaining, rounded up to the player-visible whole second.
+    /// `None` means no countdown is active.
+    pub(crate) fn remaining_secs(&self, now_tick: u64) -> Option<u64> {
+        self.active.as_ref().map(|active| {
+            Self::ceil_secs(Self::remaining_ticks(active.target_tick, now_tick))
+        })
+    }
+
+    fn plural(seconds: u64) -> &'static str {
+        if seconds == 1 { "second" } else { "seconds" }
+    }
+
+    fn with_reason(mut text: String, reason: Option<&str>) -> String {
+        if let Some(reason) = reason.filter(|r| !r.is_empty()) {
+            text.push_str(": ");
+            text.push_str(reason);
+        }
+        text
+    }
+
+    fn schedule_text(seconds: u64, reason: Option<&str>) -> String {
+        Self::with_reason(
+            format!(
+                "Server restart scheduled in {seconds} {}",
+                Self::plural(seconds)
+            ),
+            reason,
+        )
+    }
+
+    fn milestone_text(seconds: u64, reason: Option<&str>) -> String {
+        Self::with_reason(
+            format!("Server restarting in {seconds} {}", Self::plural(seconds)),
+            reason,
+        )
+    }
+
+    /// Short operator-readable `/restart status` reply.
+    pub(crate) fn status_summary(&self, now_tick: u64) -> String {
+        let Some(active) = &self.active else {
+            return "No restart scheduled".to_owned();
+        };
+        let remaining = Self::ceil_secs(Self::remaining_ticks(active.target_tick, now_tick));
+        Self::with_reason(
+            format!(
+                "Restart scheduled in {remaining} {}",
+                Self::plural(remaining)
+            ),
+            active.reason.as_deref(),
+        )
+    }
+
+    /// Advance the countdown by one authoritative server tick. The method is
+    /// pure with respect to time: equal `now_tick` inputs are idempotent, and
+    /// a larger jump only emits the milestones actually passed since the last
+    /// observed tick.
+    pub(crate) fn tick(&mut self, now_tick: u64) -> RestartTickOutcome {
+        let Some(mut active) = self.active.take() else {
+            return RestartTickOutcome::Quiet;
+        };
+        if now_tick >= active.target_tick {
+            return RestartTickOutcome::ExecuteRestart {
+                reason: active.reason,
+                exit_code: self.exit_code,
+            };
+        }
+
+        let remaining = Self::ceil_secs(Self::remaining_ticks(active.target_tick, now_tick));
+        let mut messages = Vec::new();
+        if !active.announced {
+            active.announced = true;
+            messages.push(Self::schedule_text(
+                active.delay_secs,
+                active.reason.as_deref(),
+            ));
+        }
+        for (index, milestone) in RESTART_MILESTONE_SECS.iter().copied().enumerate() {
+            let bit = 1u16 << index;
+            if milestone <= active.delay_secs
+                && milestone >= remaining
+                && active.warned_mask & bit == 0
+            {
+                active.warned_mask |= bit;
+                messages.push(Self::milestone_text(
+                    milestone,
+                    active.reason.as_deref(),
+                ));
+            }
+        }
+        self.active = Some(active);
+        if messages.is_empty() {
+            RestartTickOutcome::Quiet
+        } else {
+            RestartTickOutcome::Broadcast(messages)
+        }
+    }
+}
+
+impl Default for RestartCountdownController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ------------------------------------------------ remote control ----
 
 /// Hard cap on one remote-control HTTP request, headers included.
@@ -4849,6 +5130,178 @@ mod operator_ux_admin_core_tests {
                 "crash at +{at}s should delay {secs}s"
             );
         }
+    }
+
+    // --- operator restart countdown ---
+
+    #[test]
+    fn restart_command_parses_defaults_actions_delays_and_reasons() {
+        assert_eq!(
+            parse_restart_command("").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 10,
+                reason: None
+            }
+        );
+        assert_eq!(
+            parse_restart_command("now").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 0,
+                reason: None
+            }
+        );
+        assert_eq!(
+            parse_restart_command("0").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 0,
+                reason: None
+            }
+        );
+        assert_eq!(
+            parse_restart_command("30").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 30,
+                reason: None
+            }
+        );
+        assert_eq!(
+            parse_restart_command("60 Maintenance window").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 60,
+                reason: Some("Maintenance window".to_owned())
+            }
+        );
+        assert_eq!(
+            parse_restart_command("now Emergency recovery").unwrap(),
+            RestartCommand::Schedule {
+                delay_secs: 0,
+                reason: Some("Emergency recovery".to_owned())
+            }
+        );
+        assert_eq!(parse_restart_command("cancel").unwrap(), RestartCommand::Cancel);
+        assert_eq!(parse_restart_command("STATUS").unwrap(), RestartCommand::Status);
+        for bad in ["-1", "86401", "not-a-number", "cancel extra", "status extra"] {
+            assert!(
+                parse_restart_command(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn restart_countdown_announces_and_fires_each_milestone_once() {
+        let start_tick = 1_000u64;
+        let delay_secs = 300u64;
+        let mut ctl = RestartCountdownController::new();
+        ctl.schedule(start_tick, delay_secs, Some("upgrade".to_owned()))
+            .unwrap();
+        let first = ctl.tick(start_tick);
+        let RestartTickOutcome::Broadcast(messages) = first else {
+            panic!("first tick should broadcast the schedule: {first:?}");
+        };
+        assert_eq!(
+            messages,
+            vec![
+                "Server restart scheduled in 300 seconds: upgrade".to_owned(),
+                "Server restarting in 300 seconds: upgrade".to_owned(),
+            ]
+        );
+        assert_eq!(ctl.tick(start_tick), RestartTickOutcome::Quiet);
+
+        for seconds in [120u64, 60, 30, 15, 10, 5, 4, 3, 2, 1] {
+            let at = start_tick + (delay_secs - seconds) * u64::from(TICKS_PER_SECOND);
+            let outcome = ctl.tick(at);
+            assert_eq!(
+                outcome,
+                RestartTickOutcome::Broadcast(vec![format!(
+                    "Server restarting in {seconds} second{}: upgrade",
+                    if seconds == 1 { "" } else { "s" }
+                )]),
+                "milestone at {seconds}s"
+            );
+            assert_eq!(
+                ctl.tick(at),
+                RestartTickOutcome::Quiet,
+                "milestone at {seconds}s must not duplicate"
+            );
+        }
+
+        let target = start_tick + delay_secs * u64::from(TICKS_PER_SECOND);
+        assert_eq!(
+            ctl.tick(target),
+            RestartTickOutcome::ExecuteRestart {
+                reason: Some("upgrade".to_owned()),
+                exit_code: RESTART_DEFAULT_EXIT_CODE,
+            }
+        );
+        assert_eq!(ctl.tick(target + 1), RestartTickOutcome::Quiet);
+    }
+
+    #[test]
+    fn restart_countdown_catches_up_skipped_milestones_without_duplicates() {
+        let start = 0u64;
+        let mut ctl = RestartCountdownController::new();
+        ctl.schedule(start, 30, None).unwrap();
+        assert!(matches!(
+            ctl.tick(start),
+            RestartTickOutcome::Broadcast(_)
+        ));
+        // Jump straight to four seconds remaining: every intermediate
+        // milestone is reported once, in chronological countdown order.
+        let at = start + 26 * u64::from(TICKS_PER_SECOND);
+        assert_eq!(
+            ctl.tick(at),
+            RestartTickOutcome::Broadcast(vec![
+                "Server restarting in 15 seconds".to_owned(),
+                "Server restarting in 10 seconds".to_owned(),
+                "Server restarting in 5 seconds".to_owned(),
+                "Server restarting in 4 seconds".to_owned(),
+            ])
+        );
+        assert_eq!(ctl.tick(at), RestartTickOutcome::Quiet);
+    }
+
+    #[test]
+    fn restart_cancel_before_firing_and_reschedule_guard_are_clean() {
+        let mut ctl = RestartCountdownController::new();
+        ctl.schedule(0, 10, None).unwrap();
+        assert!(ctl.schedule(0, 20, None).is_err());
+        assert!(ctl.cancel());
+        assert!(!ctl.cancel());
+        assert_eq!(ctl.tick(0), RestartTickOutcome::Quiet);
+        assert_eq!(ctl.remaining_secs(0), None);
+        ctl.schedule(0, 20, None).unwrap();
+        assert_eq!(ctl.remaining_secs(0), Some(20));
+    }
+
+    #[test]
+    fn restart_now_executes_immediately_with_configurable_exit_code() {
+        let mut ctl = RestartCountdownController::with_exit_code(77);
+        ctl.schedule(40, 0, Some("now".to_owned())).unwrap();
+        assert_eq!(
+            ctl.tick(40),
+            RestartTickOutcome::ExecuteRestart {
+                reason: Some("now".to_owned()),
+                exit_code: 77,
+            }
+        );
+    }
+
+    #[test]
+    fn restart_status_reports_none_remaining_and_reason() {
+        let mut ctl = RestartCountdownController::new();
+        assert_eq!(ctl.status_summary(0), "No restart scheduled");
+        ctl.schedule(100, 60, Some("Maintenance window".to_owned()))
+            .unwrap();
+        assert_eq!(
+            ctl.status_summary(100),
+            "Restart scheduled in 60 seconds: Maintenance window"
+        );
+        // One tick before the forty-seconds-left boundary rounds up honestly.
+        assert_eq!(
+            ctl.status_summary(100 + 20 * u64::from(TICKS_PER_SECOND) - 1),
+            "Restart scheduled in 41 seconds: Maintenance window"
+        );
     }
 
     // --- remote control over a real loopback listener ---

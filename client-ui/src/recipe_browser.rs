@@ -540,7 +540,8 @@ pub struct MobDropEntry {
     pub item_id: String,
     pub min_count: u32,
     pub max_count: u32,
-    /// Drop chance `0.0..=1.0` (`1.0` = guaranteed common drop).
+    /// Drop chance `0.0..=1.0` (`1.0` = guaranteed common drop); a non-finite
+    /// value means the runtime-dependent probability is honestly unknown.
     pub chance: f32,
     /// Extra items gained per Looting level.
     pub looting_bonus: u32,
@@ -614,7 +615,8 @@ pub struct DungeonLootEntry {
     pub max_count: u32,
     /// Table weight used for the displayed chance.
     pub weight: u32,
-    /// Expected chance `0.0..=1.0` of seeing the item per chest roll.
+    /// Expected chance `0.0..=1.0` of seeing the item per chest roll; a
+    /// non-finite value means the runtime-dependent probability is unknown.
     pub chance: f32,
 }
 
@@ -624,6 +626,39 @@ pub struct EnchantmentCompat {
     pub item_id: String,
     /// `(enchantment id, max level)` pairs.
     pub enchantments: Vec<(String, u32)>,
+}
+
+/// Compare probabilities with unknown/non-finite values grouped after every
+/// finite chance. `NaN` values compare equal to one another so callers can
+/// apply their normal row tie-breakers instead of depending on float bits.
+pub fn compare_loot_chance(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_finite(), b.is_finite()) {
+        (true, true) => a.total_cmp(&b),
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        (false, false) => std::cmp::Ordering::Equal,
+    }
+}
+
+/// Player-facing percentage for a loot probability. Runtime-dependent table
+/// branches are represented as non-finite values by ingestion; displaying
+/// them as `0%` or `NaN%` would invent information, so they render as an
+/// explicit localized unknown instead.
+pub fn format_loot_chance(chance: f32, lang: UiLang) -> String {
+    if chance.is_finite() {
+        format!("{}%", (chance * 100.0).round() as u32)
+    } else {
+        tr(lang, "Unknown", "不明").to_owned()
+    }
+}
+
+/// Compact form used inside the 18px recipe-diagram output badges.
+pub fn format_loot_chance_compact(chance: f32, lang: UiLang) -> String {
+    if chance.is_finite() {
+        format!("{}%", (chance * 100.0).round() as u32)
+    } else {
+        tr(lang, "?", "不明").to_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,7 +1684,7 @@ impl RecipeIndex {
         // Expected chanced rolls (floor of expected value, deterministic)
         // — but the target item itself is never a "byproduct".
         for (id, count, chance) in &recipe.chanced_outputs {
-            if id == item {
+            if id == item || !chance.is_finite() {
                 continue;
             }
             let expected = (f64::from(*count) * f64::from(*chance) * crafts as f64).floor() as u64;
@@ -4661,7 +4696,7 @@ impl RecipeBrowserState {
                 y + 19,
                 1,
                 palette::WARNING,
-                &format!("{}%", (chance * 100.0).round() as u32),
+                &format_loot_chance_compact(*chance, self.lang),
                 4,
             );
             ox += 22;
@@ -4842,7 +4877,7 @@ impl RecipeBrowserState {
                 y + 19,
                 1,
                 palette::WARNING,
-                &format!("{}%", (chance * 100.0).round() as u32),
+                &format_loot_chance_compact(*chance, self.lang),
                 4,
             );
             ox += 22;
@@ -5124,12 +5159,12 @@ impl RecipeBrowserState {
                         format!(" [{}]", e.condition)
                     };
                     let line = format!(
-                        "{} -> {} x{}-{} ({}%){}{}",
+                        "{} -> {} x{}-{} ({}){}{}",
                         e.mob_id,
                         self.index.display_name(&e.item_id),
                         e.min_count,
                         e.max_count,
-                        (e.chance * 100.0).round() as u32,
+                        format_loot_chance(e.chance, lang),
                         if e.looting_bonus > 0 {
                             format!(" +{}/L", e.looting_bonus)
                         } else {
@@ -5243,13 +5278,13 @@ impl RecipeBrowserState {
                 for (ri, e) in self.index.dungeon_loot.iter().enumerate().skip(scroll).take(rows) {
                     let y = list_top + (ri - scroll) as i32 * 12;
                     let line = format!(
-                        "{}: {} x{}-{} w{} ({}%)",
+                        "{}: {} x{}-{} w{} ({})",
                         e.chest,
                         self.index.display_name(&e.item_id),
                         e.min_count,
                         e.max_count,
                         e.weight,
-                        (e.chance * 100.0).round() as u32
+                        format_loot_chance(e.chance, lang)
                     );
                     lay.fill(main.x + 4, y + 1, 10, 10, item_color(&e.item_id));
                     lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
@@ -5676,4 +5711,91 @@ fn fit_text(label: &str, cells: usize) -> String {
     let mut clipped = crate::draw::first_cells(&label, cells - 3).to_owned();
     clipped.push_str("...");
     clipped
+}
+
+#[cfg(test)]
+mod recipe_browser_loot_chance_tests {
+    use super::*;
+
+    fn mob_row(item_id: &str, chance: f32) -> MobDropEntry {
+        MobDropEntry {
+            mob_id: "minecraft:test_mob".to_owned(),
+            item_id: item_id.to_owned(),
+            min_count: 1,
+            max_count: 1,
+            chance,
+            looting_bonus: 0,
+            condition: String::new(),
+        }
+    }
+
+    #[test]
+    fn finite_loot_chance_formats_as_rounded_percent() {
+        assert_eq!(format_loot_chance(0.25, UiLang::En), "25%");
+        assert_eq!(format_loot_chance(0.75, UiLang::Ja), "75%");
+        assert_eq!(format_loot_chance_compact(0.25, UiLang::En), "25%");
+    }
+
+    #[test]
+    fn nonfinite_loot_chance_formats_as_localized_unknown() {
+        for chance in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(format_loot_chance(chance, UiLang::En), "Unknown");
+            assert_eq!(format_loot_chance(chance, UiLang::Ja), "不明");
+            assert_eq!(format_loot_chance_compact(chance, UiLang::En), "?");
+            assert_eq!(format_loot_chance_compact(chance, UiLang::Ja), "不明");
+            for text in [
+                format_loot_chance(chance, UiLang::En),
+                format_loot_chance_compact(chance, UiLang::En),
+            ] {
+                assert_ne!(text, "0%");
+                assert_ne!(text, "NaN%");
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_finite_and_unknown_rows_sort_deterministically() {
+        let fixture = || {
+            vec![
+                mob_row("z_unknown", f32::NAN),
+                mob_row("half", 0.5),
+                mob_row("quarter", 0.25),
+                mob_row("a_unknown", f32::NAN),
+            ]
+        };
+        let sort_rows = |rows: &mut [MobDropEntry]| {
+            rows.sort_by(|a, b| {
+                compare_loot_chance(a.chance, b.chance)
+                    .then_with(|| a.item_id.cmp(&b.item_id))
+                    .then_with(|| a.mob_id.cmp(&b.mob_id))
+            });
+        };
+        let mut rows = fixture();
+        sort_rows(&mut rows);
+        let order: Vec<&str> = rows.iter().map(|row| row.item_id.as_str()).collect();
+        assert_eq!(order, vec!["quarter", "half", "a_unknown", "z_unknown"]);
+
+        let mut reversed = fixture();
+        reversed.reverse();
+        sort_rows(&mut reversed);
+        let reversed_order: Vec<&str> = reversed.iter().map(|row| row.item_id.as_str()).collect();
+        assert_eq!(reversed_order, order);
+    }
+
+    #[test]
+    fn unknown_chanced_output_does_not_become_zero_byproduct_math() {
+        let mut index = RecipeIndex::new();
+        let mut recipe = Recipe::new("test:unknown_byproduct", RecipeCategory::CreateCrushing);
+        recipe.outputs.push(ItemStack {
+            item: "test:target".to_owned(),
+            count: 1,
+        });
+        recipe.chanced_outputs.push(("test:unknown".to_owned(), 4, f32::NAN));
+        recipe.chanced_outputs.push(("test:finite".to_owned(), 4, 0.5));
+        index.add_recipe(recipe);
+
+        let tree = index.recipe_tree("test:target", 1, &BTreeMap::new());
+        assert_eq!(tree.byproducts.get("test:finite"), Some(&2));
+        assert!(!tree.byproducts.contains_key("test:unknown"));
+    }
 }

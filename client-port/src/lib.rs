@@ -18,6 +18,7 @@ pub mod compact_vertex;
 pub mod crop_archetype;
 mod cull;
 mod culler;
+pub mod dir_basis;
 pub mod draw_order;
 pub mod dynamic_light_resolver;
 pub mod entity_rig;
@@ -76,6 +77,7 @@ pub use compact_vertex::{
 };
 pub use cull::{box_facing_mask, box_in_frustum, SectionVis};
 pub use culler::{through_bit, CullResult, GraphCuller, SectionGraph, THROUGH_ALL};
+pub use dir_basis::{CubeOrientation, DirBasis, DIR_BASIS};
 pub use draw_order::{
     aabb_distance_sq, depth_key, DrawOrder, DrawOrderScratch, KeyedDraw, MultidrawScratch,
 };
