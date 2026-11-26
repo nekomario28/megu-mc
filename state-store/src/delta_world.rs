@@ -87,45 +87,48 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 #[derive(Clone, Copy)]
 struct Reader<'a> {
     bytes: &'a [u8],
-    pos: usize,
 }
 
 impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, pos: 0 }
+        Self { bytes }
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], ()> {
-        if self.bytes.len().saturating_sub(self.pos) < len {
-            return Err(());
-        }
-        let out = &self.bytes[self.pos..self.pos + len];
-        self.pos += len;
+        let (out, rest) = self.bytes.split_at_checked(len).ok_or(())?;
+        self.bytes = rest;
         Ok(out)
     }
 
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], ()> {
+        let (out, rest) = self.bytes.split_first_chunk().ok_or(())?;
+        self.bytes = rest;
+        Ok(*out)
+    }
+
     fn u8(&mut self) -> Result<u8, ()> {
-        Ok(self.take(1)?[0])
+        let [byte] = self.array()?;
+        Ok(byte)
     }
 
     fn u16(&mut self) -> Result<u16, ()> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(self.array()?))
     }
 
     fn u32(&mut self) -> Result<u32, ()> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.array()?))
     }
 
     fn i32(&mut self) -> Result<i32, ()> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.array()?))
     }
 
     fn u64(&mut self) -> Result<u64, ()> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.array()?))
     }
 
     fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.pos)
+        self.bytes.len()
     }
 }
 
@@ -680,24 +683,18 @@ pub fn decode_chunk_delta(bytes: &[u8]) -> Result<ChunkDelta, DeltaError> {
             MAX_DELTA_BLOB_BYTES,
         ));
     }
-    let body_len = bytes.len().checked_sub(4).ok_or(DeltaError::Truncated)?;
-    if body_len < CHUNK_DELTA_MAGIC.len() {
-        return Err(DeltaError::Truncated);
-    }
-    let (body, trailer) = bytes.split_at(body_len);
-    if body[..CHUNK_DELTA_MAGIC.len()] != *CHUNK_DELTA_MAGIC {
+    let (body, trailer) = bytes.split_last_chunk().ok_or(DeltaError::Truncated)?;
+    let (magic, body_fields) = body.split_first_chunk().ok_or(DeltaError::Truncated)?;
+    if magic != CHUNK_DELTA_MAGIC {
         return Err(DeltaError::BadMagic);
     }
-    let expected = u32::from_be_bytes(trailer.try_into().unwrap());
+    let expected = u32::from_be_bytes(*trailer);
     let actual = megu_core::hash::crc32_ieee(body);
     if actual != expected {
         return Err(DeltaError::CrcMismatch { expected, actual });
     }
 
-    let mut reader = Reader::new(body);
-    reader
-        .take(CHUNK_DELTA_MAGIC.len())
-        .map_err(|_| DeltaError::Truncated)?;
+    let mut reader = Reader::new(body_fields);
     let schema_version = reader.u16().map_err(|_| DeltaError::Truncated)?;
     if schema_version != DELTA_WORLD_SCHEMA_VERSION {
         return Err(DeltaError::UnsupportedSchemaVersion(schema_version));
@@ -1275,8 +1272,7 @@ fn chunk_merkle_key(dim_id: i32, cx: i32, cz: i32) -> u64 {
     put_i32(&mut preimage, dim_id);
     put_i32(&mut preimage, cx);
     put_i32(&mut preimage, cz);
-    let digest = sha256(&preimage);
-    u64::from_be_bytes(digest[..8].try_into().unwrap())
+    sha256_prefix(&preimage)
 }
 
 fn merkle_root_for_chunks(chunks: &[GenerationChunkRef]) -> Result<Digest32, DeltaStoreError> {
@@ -1355,9 +1351,9 @@ fn generation_preimage(
     out
 }
 
-fn generation_id_for(parts: &[u8]) -> u64 {
-    let digest = sha256(parts);
-    u64::from_be_bytes(digest[..8].try_into().unwrap())
+fn sha256_prefix(parts: &[u8]) -> u64 {
+    let [a, b, c, d, e, f, g, h, ..] = sha256(parts);
+    u64::from_be_bytes([a, b, c, d, e, f, g, h])
 }
 
 fn encode_generation_record(record: &GenerationRecord) -> Vec<u8> {
@@ -1402,28 +1398,23 @@ fn decode_generation_record(
     if bytes.len() > MAX_GENERATION_RECORD_BYTES {
         return Err(malformed("generation record exceeds the 128 MiB cap"));
     }
-    let body_len = bytes
-        .len()
-        .checked_sub(4)
+    let (body, trailer) = bytes
+        .split_last_chunk()
         .ok_or_else(|| malformed("truncated before CRC trailer"))?;
-    if body_len < GENERATION_MAGIC.len() {
-        return Err(malformed("truncated before magic"));
-    }
-    let (body, trailer) = bytes.split_at(body_len);
-    if body[..GENERATION_MAGIC.len()] != *GENERATION_MAGIC {
+    let (magic, body_fields) = body
+        .split_first_chunk()
+        .ok_or_else(|| malformed("truncated before magic"))?;
+    if magic != GENERATION_MAGIC {
         return Err(malformed("bad generation magic"));
     }
-    let expected = u32::from_be_bytes(trailer.try_into().unwrap());
+    let expected = u32::from_be_bytes(*trailer);
     let actual = megu_core::hash::crc32_ieee(body);
     if expected != actual {
         return Err(malformed(&format!(
             "CRC32 mismatch: stored {expected:#010x}, computed {actual:#010x}"
         )));
     }
-    let mut reader = Reader::new(body);
-    reader
-        .take(GENERATION_MAGIC.len())
-        .map_err(|_| malformed("truncated after magic"))?;
+    let mut reader = Reader::new(body_fields);
     let schema = reader.u16().map_err(|_| malformed("truncated schema"))?;
     if schema != DELTA_WORLD_SCHEMA_VERSION {
         return Err(malformed(&format!("unsupported schema version {schema}")));
@@ -1471,10 +1462,8 @@ fn decode_generation_record(
         .map_err(|_| malformed("label is not UTF-8"))?
         .to_string();
     let merkle_root: Digest32 = reader
-        .take(32)
-        .map_err(|_| malformed("truncated merkle root"))?
-        .try_into()
-        .unwrap();
+        .array()
+        .map_err(|_| malformed("truncated merkle root"))?;
     let chunk_count = reader
         .u32()
         .map_err(|_| malformed("truncated chunk count"))? as usize;
@@ -1509,10 +1498,8 @@ fn decode_generation_record(
             .u32()
             .map_err(|_| malformed("truncated blob length"))?;
         let content_hash: Digest32 = reader
-            .take(32)
-            .map_err(|_| malformed("truncated content hash"))?
-            .try_into()
-            .unwrap();
+            .array()
+            .map_err(|_| malformed("truncated content hash"))?;
         match storage {
             ChunkStorage::DeterministicBase => {
                 if encoded_len != 0 || content_hash != empty {
@@ -1556,7 +1543,7 @@ fn decode_generation_record(
         &merkle_root,
         &chunks,
     );
-    let recomputed = generation_id_for(&preimage);
+    let recomputed = sha256_prefix(&preimage);
     if recomputed != gen_id {
         return Err(malformed(&format!(
             "embedded generation id {gen_id:016x} does not match content id {recomputed:016x}"
@@ -1600,28 +1587,23 @@ fn decode_manifest(bytes: &[u8]) -> Result<(Option<u64>, BTreeMap<u64, bool>), D
     if bytes.len() > MAX_MANIFEST_BYTES {
         return Err(malformed("manifest exceeds the 64 MiB cap"));
     }
-    let body_len = bytes
-        .len()
-        .checked_sub(4)
+    let (body, trailer) = bytes
+        .split_last_chunk()
         .ok_or_else(|| malformed("truncated before CRC trailer"))?;
-    if body_len < MANIFEST_MAGIC.len() {
-        return Err(malformed("truncated before magic"));
-    }
-    let (body, trailer) = bytes.split_at(body_len);
-    if body[..MANIFEST_MAGIC.len()] != *MANIFEST_MAGIC {
+    let (magic, body_fields) = body
+        .split_first_chunk()
+        .ok_or_else(|| malformed("truncated before magic"))?;
+    if magic != MANIFEST_MAGIC {
         return Err(malformed("bad manifest magic"));
     }
-    let expected = u32::from_be_bytes(trailer.try_into().unwrap());
+    let expected = u32::from_be_bytes(*trailer);
     let actual = megu_core::hash::crc32_ieee(body);
     if expected != actual {
         return Err(malformed(&format!(
             "CRC32 mismatch: stored {expected:#010x}, computed {actual:#010x}"
         )));
     }
-    let mut reader = Reader::new(body);
-    reader
-        .take(MANIFEST_MAGIC.len())
-        .map_err(|_| malformed("truncated after magic"))?;
+    let mut reader = Reader::new(body_fields);
     let schema = reader.u16().map_err(|_| malformed("truncated schema"))?;
     if schema != DELTA_WORLD_SCHEMA_VERSION {
         return Err(malformed(&format!("unsupported schema version {schema}")));
@@ -1943,7 +1925,7 @@ impl DeltaGenerationStore {
             &merkle_root,
             &refs,
         );
-        let gen_id = generation_id_for(&preimage);
+        let gen_id = sha256_prefix(&preimage);
         let record = GenerationRecord {
             gen_id,
             parent_gen: options.parent_gen,
@@ -2333,10 +2315,8 @@ fn diff_checkouts(
         edit_indexes.extend(edits_b.keys().copied());
         let mut block_diffs = Vec::new();
         for local_idx in edit_indexes {
-            let edit_a = edits_a.get(&local_idx);
-            let edit_b = edits_b.get(&local_idx);
-            if let (Some(a), Some(b)) = (edit_a, edit_b) {
-                if a.base_state != b.base_state {
+            let (state_a, state_b) = match (edits_a.get(&local_idx), edits_b.get(&local_idx)) {
+                (Some(a), Some(b)) if a.base_state != b.base_state => {
                     return Err(DeltaStoreError::InconsistentBaseState {
                         dim_id: key.0,
                         cx: key.1,
@@ -2344,9 +2324,11 @@ fn diff_checkouts(
                         local_idx,
                     });
                 }
-            }
-            let state_a = edit_a.map_or_else(|| edit_b.unwrap().base_state, |edit| edit.new_state);
-            let state_b = edit_b.map_or_else(|| edit_a.unwrap().base_state, |edit| edit.new_state);
+                (Some(a), Some(b)) => (a.new_state, b.new_state),
+                (Some(a), None) => (a.new_state, a.base_state),
+                (None, Some(b)) => (b.base_state, b.new_state),
+                (None, None) => continue, // indexes come from the union of the two maps
+            };
             if state_a != state_b {
                 block_diffs.push(BlockStateDiff {
                     local_idx,

@@ -162,6 +162,17 @@ impl Sha256 {
         out
     }
 
+    /// Return the digest, like [`Self::finalize`].
+    /// Kept for compatibility with the snapshot-store hasher API.
+    pub fn finish(self) -> [u8; 32] {
+        self.finalize()
+    }
+
+    /// One-shot SHA-256 digest of `data`.
+    pub fn digest(data: &[u8]) -> [u8; 32] {
+        sha256(data)
+    }
+
     /// [`finalize`](Self::finalize) rendered as 64 lowercase hex chars.
     pub fn finalize_hex(self) -> String {
         hex_encode(&self.finalize())

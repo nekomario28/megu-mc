@@ -18,8 +18,8 @@
 //!
 //! The design fails closed everywhere a hostile or corrupt path could reach:
 //!
-//! * [`Sha256`] wraps the canonical `megu_core::crypto` FIPS 180-4
-//!   implementation — zero external crates, no wall-clock reads
+//! * [`Sha256`] is re-exported from `megu_core::crypto`, the canonical FIPS
+//!   180-4 implementation — zero external crates, no wall-clock reads
 //!   (`timestamp_secs` is always
 //!   caller-supplied, so the same world at the same timestamp produces the
 //!   same snapshot id).
@@ -46,6 +46,7 @@
 
 use crate::datafix::DataValue;
 use crate::migrate::{parse_data_json, to_data_json, write_file_atomic};
+pub use megu_core::crypto::Sha256;
 use megu_core::crypto::{hex_encode as hex_lower, sha256_hex};
 use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
@@ -74,39 +75,6 @@ const IO_BUF: usize = 65_536;
 /// Unique temp-dir names within one process: PID separates processes, the
 /// counter separates attempts. No clock is involved.
 static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-// --------------------------------------------------------------- SHA-256
-
-/// Streaming FIPS 180-4 SHA-256 — a thin wrapper over the canonical
-/// `megu_core::crypto::Sha256` keeping this crate's historical method names
-/// (`finish`/`digest`) stable for callers.
-#[derive(Clone)]
-pub struct Sha256(megu_core::crypto::Sha256);
-
-impl Sha256 {
-    pub fn new() -> Self {
-        Self(megu_core::crypto::Sha256::new())
-    }
-
-    pub fn update(&mut self, bytes: &[u8]) {
-        self.0.update(bytes);
-    }
-
-    pub fn finish(self) -> [u8; 32] {
-        self.0.finalize()
-    }
-
-    /// One-shot digest of `bytes`.
-    pub fn digest(bytes: &[u8]) -> [u8; 32] {
-        megu_core::crypto::sha256(bytes)
-    }
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ---------------------------------------------------------------- errors
 
@@ -1467,7 +1435,7 @@ mod tests {
             hex_lower(&Sha256::digest(&million_a)),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
-        let mut streamed = Sha256::new();
+        let mut streamed: megu_core::crypto::Sha256 = Sha256::new();
         for chunk in million_a.chunks(7) {
             streamed.update(chunk);
         }

@@ -287,8 +287,8 @@ pub fn gzip_decompress(input: &[u8], budget: usize) -> Result<Vec<u8>, AnvilInsp
                 })?;
         output.extend_from_slice(&member);
         let mut trailer_and_rest = &payload[consumed..];
-        let crc = u32::from_le_bytes(gzip_take(&mut trailer_and_rest, 4)?.try_into().unwrap());
-        let size = u32::from_le_bytes(gzip_take(&mut trailer_and_rest, 4)?.try_into().unwrap());
+        let crc = u32::from_le_bytes(gzip_take_array(&mut trailer_and_rest)?);
+        let size = u32::from_le_bytes(gzip_take_array(&mut trailer_and_rest)?);
         let member = &output[start..];
         if crc != crc32(member) || size != member.len() as u32 {
             return Err(AnvilInspectError::InvalidGzip("CRC32/size mismatch"));
@@ -336,6 +336,14 @@ fn gzip_take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], AnvilInspec
     Ok(taken)
 }
 
+fn gzip_take_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], AnvilInspectError> {
+    let (taken, rest) = input
+        .split_first_chunk()
+        .ok_or(AnvilInspectError::InvalidGzip("truncated member"))?;
+    *input = rest;
+    Ok(*taken)
+}
+
 /// Parse the RFC 1952 member header, returning the deflate payload region.
 fn gzip_member_payload(header: &[u8]) -> Result<&[u8], AnvilInspectError> {
     let mut rest = header;
@@ -345,7 +353,7 @@ fn gzip_member_payload(header: &[u8]) -> Result<&[u8], AnvilInspectError> {
     }
     let flags = fixed[3];
     if flags & 4 != 0 {
-        let length = u16::from_le_bytes(gzip_take(&mut rest, 2)?.try_into().unwrap());
+        let length = u16::from_le_bytes(gzip_take_array(&mut rest)?);
         gzip_take(&mut rest, usize::from(length))?;
     }
     for flag in [8, 16] {
@@ -359,7 +367,7 @@ fn gzip_member_payload(header: &[u8]) -> Result<&[u8], AnvilInspectError> {
     }
     if flags & 2 != 0 {
         let expected = crc32(&header[..header.len() - rest.len()]) as u16;
-        let actual = u16::from_le_bytes(gzip_take(&mut rest, 2)?.try_into().unwrap());
+        let actual = u16::from_le_bytes(gzip_take_array(&mut rest)?);
         if actual != expected {
             return Err(AnvilInspectError::InvalidGzip("header CRC16 mismatch"));
         }
@@ -442,7 +450,13 @@ impl<'a> NbtReader<'a> {
     }
 
     fn number<const N: usize>(&mut self) -> Result<[u8; N], AnvilInspectError> {
-        Ok(self.bytes(N)?.try_into().unwrap())
+        let bytes = self
+            .input
+            .get(self.pos..)
+            .and_then(<[u8]>::first_chunk)
+            .ok_or(AnvilInspectError::TruncatedNbt { offset: self.pos })?;
+        self.pos += N;
+        Ok(*bytes)
     }
 
     /// A collection length is valid only when the remaining input could
@@ -912,18 +926,16 @@ pub struct McaRegionSummary {
 /// run reaching past EOF, or a record length that cannot fit its sectors
 /// are all errors — never silently skipped.
 pub fn inspect_mca_header(bytes: &[u8]) -> Result<McaRegionSummary, AnvilInspectError> {
-    if bytes.len() < MCA_HEADER_BYTES {
-        return Err(AnvilInspectError::TruncatedRegionHeader { len: bytes.len() });
-    }
-    let (locations, timestamps) = bytes.split_at(MCA_SECTOR_BYTES);
+    let header = bytes
+        .get(..MCA_HEADER_BYTES)
+        .ok_or(AnvilInspectError::TruncatedRegionHeader { len: bytes.len() })?;
+    let (locations, timestamps) = header.as_chunks::<4>().0.split_at(MCA_SLOT_COUNT);
     let mut summary = McaRegionSummary {
         file_len: bytes.len(),
         ..McaRegionSummary::default()
     };
-    for slot in 0..MCA_SLOT_COUNT {
-        let entry = &locations[slot * 4..slot * 4 + 4];
-        let offset = (u32::from(entry[0]) << 16) | (u32::from(entry[1]) << 8) | u32::from(entry[2]);
-        let sectors = entry[3];
+    for (slot, (&[a, b, c, sectors], &timestamp)) in locations.iter().zip(timestamps).enumerate() {
+        let offset = u32::from_be_bytes([0, a, b, c]);
         if offset == 0 && sectors == 0 {
             continue;
         }
@@ -939,16 +951,17 @@ pub fn inspect_mca_header(bytes: &[u8]) -> Result<McaRegionSummary, AnvilInspect
         // Sector indices are 24-bit, so `u64` math keeps every product exact.
         let start = u64::from(offset) * MCA_SECTOR_BYTES as u64;
         let end = u64::from(offset + u32::from(sectors)) * MCA_SECTOR_BYTES as u64;
-        if end > bytes.len() as u64 || start + 5 > bytes.len() as u64 {
-            return Err(AnvilInspectError::SectorRunOutOfBounds {
+        let &[a, b, c, d, compression] = bytes
+            .get(start as usize..)
+            .and_then(<[u8]>::first_chunk)
+            .filter(|_| end <= bytes.len() as u64)
+            .ok_or(AnvilInspectError::SectorRunOutOfBounds {
                 slot,
                 offset,
                 sectors,
                 file_len: bytes.len(),
-            });
-        }
-        let start = start as usize;
-        let declared_len = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+            })?;
+        let declared_len = u32::from_be_bytes([a, b, c, d]);
         // The record is 4 length bytes + `declared_len` (1 compression byte +
         // payload), and must live inside the declared sector run.
         if declared_len < 2
@@ -960,7 +973,7 @@ pub fn inspect_mca_header(bytes: &[u8]) -> Result<McaRegionSummary, AnvilInspect
                 sectors,
             });
         }
-        let compression = McaCompression::from_id(bytes[start + 4]);
+        let compression = McaCompression::from_id(compression);
         match compression {
             McaCompression::Gzip => summary.gzip_chunks += 1,
             McaCompression::Zlib => summary.zlib_chunks += 1,
@@ -972,7 +985,7 @@ pub fn inspect_mca_header(bytes: &[u8]) -> Result<McaRegionSummary, AnvilInspect
             slot,
             sector_offset: offset,
             sector_count: sectors,
-            timestamp: u32::from_be_bytes(timestamps[slot * 4..slot * 4 + 4].try_into().unwrap()),
+            timestamp: u32::from_be_bytes(timestamp),
             declared_len,
             compression,
         });
@@ -1552,21 +1565,20 @@ pub fn inspect_anvil_world_dir(dir: &Path) -> Result<AnvilWorldReport, AnvilInsp
         if !region_dir.is_dir() {
             continue;
         }
-        let mut names: Vec<String> = Vec::new();
+        let mut names = Vec::new();
         let entries = std::fs::read_dir(&region_dir).map_err(|e| io_error(&region_dir, e))?;
         for entry in entries {
             let entry = entry.map_err(|e| io_error(&region_dir, e))?;
-            if let Some(name) = entry.file_name().to_str() {
-                if region_file_coords(name).is_some() && entry.path().is_file() {
-                    names.push(name.to_string());
-                }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if let Some(coords) = region_file_coords(name).filter(|_| entry.path().is_file()) {
+                names.push((name.to_owned(), coords));
             }
         }
-        names.sort();
+        names.sort_unstable();
         let mut regions = Vec::new();
         let mut populated_chunks = 0usize;
-        for file_name in names {
-            let (region_x, region_z) = region_file_coords(&file_name).unwrap();
+        for (file_name, (region_x, region_z)) in names {
             let path = region_dir.join(&file_name);
             let bytes = std::fs::read(&path).map_err(|e| io_error(&path, e))?;
             let summary =

@@ -285,8 +285,21 @@ impl<'a> WireReader<'a> {
         Ok(out)
     }
 
+    pub(crate) fn read_array<const N: usize>(&mut self) -> Result<[u8; N], ProtoError> {
+        let bytes = self
+            .rest()
+            .first_chunk()
+            .ok_or_else(|| ProtoError::UnexpectedEof {
+                needed: N,
+                remaining: self.remaining(),
+            })?;
+        self.pos += N;
+        Ok(*bytes)
+    }
+
     pub fn read_u8(&mut self) -> Result<u8, ProtoError> {
-        Ok(self.take(1)?[0])
+        let [byte] = self.read_array()?;
+        Ok(byte)
     }
 
     pub fn read_i8(&mut self) -> Result<i8, ProtoError> {
@@ -309,35 +322,35 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_u16(&mut self) -> Result<u16, ProtoError> {
-        Ok(u16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(u16::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_i16(&mut self) -> Result<i16, ProtoError> {
-        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+        Ok(i16::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_i32(&mut self) -> Result<i32, ProtoError> {
-        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(i32::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_u32(&mut self) -> Result<u32, ProtoError> {
-        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(u32::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_i64(&mut self) -> Result<i64, ProtoError> {
-        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(i64::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_u64(&mut self) -> Result<u64, ProtoError> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(u64::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_f32(&mut self) -> Result<f32, ProtoError> {
-        Ok(f32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+        Ok(f32::from_be_bytes(self.read_array()?))
     }
 
     pub fn read_f64(&mut self) -> Result<f64, ProtoError> {
-        Ok(f64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+        Ok(f64::from_be_bytes(self.read_array()?))
     }
 
     /// Protocol VarInt: up to five bytes of little-endian 7-bit groups decoded
@@ -441,7 +454,7 @@ impl<'a> WireReader<'a> {
     }
 
     pub fn read_uuid(&mut self) -> Result<[u8; 16], ProtoError> {
-        Ok(self.take(16)?.try_into().unwrap())
+        self.read_array()
     }
 
     pub fn read_position(&mut self) -> Result<BlockPos, ProtoError> {
@@ -781,6 +794,22 @@ pub fn read_frame_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_width_read_does_not_advance_on_truncation() {
+        let mut reader = WireReader::new(&[0x12, 0x34, 0x56]);
+        assert!(matches!(
+            reader.read_u32(),
+            Err(ProtoError::UnexpectedEof {
+                needed: 4,
+                remaining: 3
+            })
+        ));
+        assert_eq!(reader.position(), 0);
+        assert_eq!(reader.read_u16().unwrap(), 0x1234);
+        assert_eq!(reader.read_u8().unwrap(), 0x56);
+        assert!(reader.finish().is_ok());
+    }
 
     fn roundtrip_varint(v: i32) {
         let mut w = WireWriter::new();
