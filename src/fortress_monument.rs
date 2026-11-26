@@ -2733,7 +2733,7 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
         orient: dir,
         depth: 1,
         room: None,
-        main_design: (design + 1) & 1,
+        main_design: (design & 1) ^ 1,
     });
     pieces.push(MonumentPiece {
         kind: MonumentKind::Penthouse,

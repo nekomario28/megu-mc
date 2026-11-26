@@ -160,18 +160,48 @@ fn discover_vanilla_jar() -> Option<PathBuf> {
         .next()
 }
 
-#[allow(dead_code)]
-pub(crate) fn vanilla_jar_data_read(rel_path: &str) -> Option<Vec<u8>> {
+fn vanilla_jar_data() -> Option<&'static VanillaJarDataFallback> {
     static FALLBACK: std::sync::OnceLock<Option<VanillaJarDataFallback>> =
         std::sync::OnceLock::new();
     FALLBACK
         .get_or_init(|| {
             let path = discover_vanilla_jar()?;
-            VanillaJarDataFallback::load_from_jar(&path).ok()
+            match VanillaJarDataFallback::load_from_jar(&path) {
+                Ok(data) => {
+                    eprintln!(
+                        "[spine] vanilla datapack data loaded from {} ({:?})",
+                        path.display(),
+                        data.summary()
+                    );
+                    Some(data)
+                }
+                Err(error) => {
+                    eprintln!("[spine] vanilla JAR fallback unavailable: {error}");
+                    None
+                }
+            }
         })
-        .as_ref()?
-        .read_data_entry(rel_path)
-        .map(<[u8]>::to_vec)
+        .as_ref()
+}
+
+fn vanilla_jar_data_read(rel_path: &str) -> Option<&'static [u8]> {
+    if Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+        return None;
+    }
+    vanilla_jar_data()?.read_data_entry(rel_path)
+}
+
+fn vanilla_jar_worldgen_files(prefix: &str) -> Vec<(&'static str, &'static [u8])> {
+    if Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+        return Vec::new();
+    }
+    let Some(data) = vanilla_jar_data() else {
+        return Vec::new();
+    };
+    data.list_prefix(prefix)
+        .into_iter()
+        .filter_map(|path| Some((path.strip_prefix(prefix)?, data.read_data_entry(path)?)))
+        .collect()
 }
 
 fn jar_u16(bytes: &[u8], at: usize) -> Option<usize> {
@@ -478,6 +508,9 @@ mod jar_datapack_tests {
 
     #[test]
     fn absent_directory_uses_jar_in_reload_and_existing_vanilla_directory_wins() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "megu-jar-datapack-{}-{}",
@@ -486,15 +519,40 @@ mod jar_datapack_tests {
         ));
         let base = root.join("datapacks");
         std::fs::create_dir_all(&base).unwrap();
-        let source = fixture_entries();
-        let archive = zip(&source
-            .iter()
-            .map(|(p, b, d)| (*p, *b, *d))
-            .collect::<Vec<_>>());
+        let mut source = fixture_entries();
+        source.extend([
+            (
+                "data/minecraft/worldgen/noise/test.json",
+                b"{}".as_slice(),
+                true,
+            ),
+            (
+                "data/minecraft/structure/test.nbt",
+                b"\x1f\x8btest".as_slice(),
+                true,
+            ),
+            (
+                "data/minecraft/structures/legacy.nbt",
+                b"\x1f\x8blegacy".as_slice(),
+                false,
+            ),
+        ]);
+        let archive = zip(&source);
         let jar = root.join("fallback.jar");
         std::fs::write(&jar, archive).unwrap();
-        let previous = std::env::var_os("MEGU_VANILLA_JAR");
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
         std::env::set_var("MEGU_VANILLA_JAR", &jar);
+        worldgen::register_vanilla_jar_resources(vanilla_jar_data_read, vanilla_jar_worldgen_files);
+        assert_eq!(worldgen::Gen::dp_files("noise")["minecraft:test"], b"{}");
+        assert_eq!(
+            worldgen::Gen::dp_resource("structure", "minecraft:test", "nbt").unwrap(),
+            b"\x1f\x8btest"
+        );
+        assert_eq!(
+            worldgen::Gen::dp_resource("structure", "minecraft:legacy", "nbt").unwrap(),
+            b"\x1f\x8blegacy"
+        );
         assert_eq!(reload_datapacks(&base, None, false).unwrap(), 1);
         assert!(packs()
             .lock()
@@ -525,11 +583,9 @@ mod jar_datapack_tests {
             .tags
             .get("item")
             .is_some_and(|tags| tags.contains_key("minecraft:disk")));
-        if let Some(value) = previous {
-            std::env::set_var("MEGU_VANILLA_JAR", value);
-        } else {
-            std::env::remove_var("MEGU_VANILLA_JAR");
-        }
+        assert!(worldgen::Gen::dp_files("noise").is_empty());
+        assert!(worldgen::Gen::dp_resource("structure", "minecraft:test", "nbt").is_none());
+        std::env::set_current_dir(original_dir).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

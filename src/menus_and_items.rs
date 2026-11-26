@@ -9195,7 +9195,7 @@ fn use_live_block_entity(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u
         if inventory_changed {
             let cursor = c.cursor.lock().unwrap_or_else(|e| e.into_inner());
             let mut sock = c.sock.lock().unwrap_or_else(|e| e.into_inner());
-            send_live_contents(&mut sock, 0, inv_state_next(c), &[], &inv, 0..46, &cursor);
+            send_live_contents(&mut sock, 0, inv_state_next(c), (&[], &[]), &inv, 0..46, &cursor);
         }
         drop(inv);
         if brush_breaks {
@@ -11701,7 +11701,10 @@ impl LiveMenu {
             Self::Crafter => (7, "Crafter"),
             Self::Lectern => (17, "Lectern"),
             Self::Enchanting(_) => (13, "Enchant"),
-            Self::Merchant(..) => (19, "Villager"),
+            Self::Merchant(eid, _) => {
+                let traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+                (19, if traders.contains_key(eid) { "Wandering Trader" } else { "Villager" })
+            }
             Self::Smithing(_) => (21, "Upgrade Gear"),
             Self::Stonecutter(_) => StonecutterMenu::screen(),
             Self::Grindstone(_) => GrindstoneMenu::screen(),
@@ -11803,20 +11806,38 @@ fn merchant_item_prototype(item: i64) -> &'static Comps {
     &prototypes[item_stack_max(item, &Vec::new()) as usize]
 }
 
-fn live_offers_payload(window: u8, merchant: &Villager) -> Vec<u8> {
-    let packet = MerchantOffersPacket {
+fn live_merchant_offers(id: i32, window: u8) -> Option<MerchantOffersPacket> {
+    let traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(trader) = traders.get(&id) {
+        return Some(MerchantOffersPacket {
+            window_id: i32::from(window),
+            offers: trader.offers.clone(),
+            villager_level: 1,
+            villager_xp: 0,
+            show_progress: false,
+            can_restock: false,
+        });
+    }
+    drop(traders);
+    let villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+    let villager = villagers.get(&id)?;
+    Some(MerchantOffersPacket {
         window_id: i32::from(window),
-        offers: merchant.offers.clone(),
-        villager_level: merchant.level() as i32,
-        villager_xp: merchant.villager_xp,
+        offers: villager.offers.clone(),
+        villager_level: villager.level() as i32,
+        villager_xp: villager.villager_xp,
         show_progress: true,
         can_restock: false,
-    };
-    encode_merchant_offers_pkt(&packet)
+    })
 }
 
 fn open_live_merchant(c: &Client, mob: &Mob) {
-    if c.is_spectator() || *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::Overworld {
+    let (dim, x, y, z, ..) = client_dim_pos(c);
+    let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+    if c.is_spectator() || dim != mob.dim
+        || (x - mx).powi(2) + (y - my).powi(2) + (z - mz).powi(2) > 64.0
+        || *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+    {
         return;
     }
     let Some(connection) = live_menu_connection(c) else {
@@ -11827,10 +11848,27 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
     {
         return;
     }
+    if Some(mob.etype) == name_to_etype("wandering_trader") {
+        let mut traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+        let trader = traders.entry(mob.eid).or_insert_with(|| LiveWanderingTrader {
+            despawn_delay: WANDERING_TRADER_DESPAWN_TICKS,
+            offers: wandering_trader_offers(|bound| world_rng::next_below(bound as u32) as usize),
+            customer: None,
+        });
+        if trader.offers.is_empty() || trader.customer.is_some() {
+            return;
+        }
+        trader.customer = Some(c.uuid);
+        drop(traders);
+        open_live_menu(c, None, LiveMenu::Merchant(mob.eid, MerchantMenu::default()));
+        return;
+    }
+    if dim != DimId::Overworld {
+        return;
+    }
     // Bind a nearby workstation before the table opens: claiming it assigns
     // the site profession and its real trade rows. Only a villager with no
     // workstation nearby keeps the historical farmer fallback.
-    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
     {
         let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
         let villager = villagers
@@ -11967,14 +12005,14 @@ fn send_live_contents(
     sock: &mut TcpStream,
     id: u8,
     state_id: i32,
-    slots: &[Stack],
+    (slots, trailing_slots): (&[Stack], &[Stack]),
     inventory: &HashMap<i16, Stack>,
     player_slots: std::ops::Range<i16>,
     cursor: &Stack,
 ) {
     let mut packet = vec![id];
     write_varint(&mut packet, i64::from(state_id));
-    write_varint(&mut packet, (slots.len() + player_slots.len()) as i64);
+    write_varint(&mut packet, (slots.len() + player_slots.len() + trailing_slots.len()) as i64);
     for stack in slots {
         packet.extend_from_slice(&slot_wire(stack));
     }
@@ -11982,8 +12020,40 @@ fn send_live_contents(
     for slot in player_slots {
         packet.extend_from_slice(&slot_wire(inventory.get(&slot).unwrap_or(&empty)));
     }
+    for stack in trailing_slots {
+        packet.extend_from_slice(&slot_wire(stack));
+    }
     packet.extend_from_slice(&slot_wire(cursor));
     let _ = send_packet(sock, 0x13, packet);
+}
+
+#[cfg(test)]
+#[test]
+fn crafter_contents_put_inventory_before_read_only_preview() {
+    let (client, mut receiver) = crate::effect_tests::client_pair();
+    let grid_item = (name_to_item("oak_planks").unwrap(), 1, Vec::new());
+    let inventory_item = (name_to_item("stone").unwrap(), 1, Vec::new());
+    let hotbar_item = (name_to_item("dirt").unwrap(), 1, Vec::new());
+    let output_item = (name_to_item("crafting_table").unwrap(), 1, Vec::new());
+    let mut grid = vec![Stack::default(); CRAFTER_GRID_SLOTS as usize];
+    grid[8] = grid_item.clone();
+    let inv = HashMap::from([(9, inventory_item.clone()), (44, hotbar_item.clone())]);
+    send_live_contents(
+        &mut client.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        1, 1, (&grid, std::slice::from_ref(&output_item)), &inv, 9..45, &Stack::default(),
+    );
+    let (id, body) = read_packet(&mut receiver, Instant::now() + Duration::from_secs(1)).unwrap();
+    assert_eq!(id, 0x13);
+    let mut cursor = 1;
+    assert_eq!(slot_read_varint(&body, &mut cursor), Some(1));
+    assert_eq!(slot_read_varint(&body, &mut cursor), Some(46));
+    let slots: Vec<_> = (0..46).map(|_| slot_read_stack(&body, &mut cursor, 0).unwrap()).collect();
+    assert_eq!(slots[8], grid_item);
+    assert_eq!(slots[9], inventory_item);
+    assert_eq!(slots[44], hotbar_item);
+    assert_eq!(slots[45], output_item);
+    assert_eq!(slot_read_stack(&body, &mut cursor, 0), Some(Stack::default()));
+    assert_eq!(cursor, body.len());
 }
 
 fn anvil_hover_name(stack: &Stack) -> String {
@@ -12277,16 +12347,15 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
             ]
         }
         LiveMenu::Merchant(id, menu) => {
-            let merchants = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
-            let Some(villager) = merchants.get(id) else {
+            let Some(merchant) = live_merchant_offers(*id, session.id) else {
                 return;
             };
             let output = menu
-                .active_offer(&villager.offers, &MerchantItems(&merchant_item_comps))
-                .map(|i| villager.offers[i].result.clone())
+                .active_offer(&merchant.offers, &MerchantItems(&merchant_item_comps))
+                .map(|i| merchant.offers[i].result.clone())
                 .unwrap_or_default();
             if send_offers {
-                offers = Some(live_offers_payload(session.id, villager));
+                offers = Some(encode_merchant_offers_pkt(&merchant));
             }
             vec![menu.payments[0].clone(), menu.payments[1].clone(), output]
         }
@@ -12376,11 +12445,16 @@ fn sync_live_menu(c: &Client, session: &mut LiveMenuSession, send_offers: bool) 
     if let Some(payload) = offers {
         let _ = send_packet(&mut sock, 0x2d, payload);
     }
+    let slots = if matches!(session.menu, LiveMenu::Crafter) {
+        slots.split_at(CRAFTER_GRID_SLOTS as usize)
+    } else {
+        (slots.as_slice(), &[][..])
+    };
     send_live_contents(
         &mut sock,
         session.id,
         session.state_id,
-        &slots,
+        slots,
         &inventory,
         if matches!(session.menu, LiveMenu::Lectern) {
             0..0
@@ -12437,6 +12511,11 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
         return;
     };
     if let LiveMenu::Merchant(id, _) = session.menu {
+        if let Some(trader) = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
+            if trader.customer == Some(c.uuid) {
+                trader.customer = None;
+            }
+        }
         if let Some(villager) = live_villagers().lock().unwrap_or_else(|e| e.into_inner()).get_mut(&id) {
             if villager.trading_player == Some(c.uuid) {
                 villager.stop_trading();
@@ -12459,7 +12538,7 @@ fn close_live_menu_id(c: &Client, id: Option<u8>, send_close: bool, sync: bool) 
         if send_close {
             let _ = send_packet(&mut sock, 0x12, vec![session.id]);
         }
-        send_live_contents(&mut sock, 0, inv_state_next(c), &[], &inventory, 0..46, &Stack::default());
+        send_live_contents(&mut sock, 0, inv_state_next(c), (&[], &[]), &inventory, 0..46, &Stack::default());
     }
 }
 
@@ -12586,10 +12665,10 @@ fn live_select_trade(c: &Client, index: i32) {
     let mut active = connection.active.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(session) = active.as_mut() {
         if let LiveMenu::Merchant(id, menu) = &mut session.menu {
-            if let Some(villager) = live_villagers().lock().unwrap_or_else(|e| e.into_inner()).get(id) {
+            if let Some(merchant) = live_merchant_offers(*id, session.id) {
                 menu.select_trade(
                     index,
-                    &villager.offers,
+                    &merchant.offers,
                     &mut c.inv.lock().unwrap_or_else(|e| e.into_inner()),
                     &MerchantItems(&merchant_item_comps),
                 );
@@ -12653,6 +12732,9 @@ fn click_live_input(target: &mut Stack, cursor: &mut Stack, button: i8, limit: u
     }
 }
 
+const CRAFTER_GRID_SLOTS: i16 = 9;
+const CRAFTER_OUTPUT_SLOT: i16 = CRAFTER_GRID_SLOTS + 36;
+
 fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
     let Some(connection) = live_menu_connection(c) else {
         return;
@@ -12674,7 +12756,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         LiveMenu::Anvil(_) | LiveMenu::Merchant(..) => 3,
         LiveMenu::Enchanting(_) => 2,
         LiveMenu::Brewing => 5,
-        LiveMenu::Crafter => 10,
+        LiveMenu::Crafter => CRAFTER_GRID_SLOTS,
         LiveMenu::Lectern => {
             sync_live_menu(c, session, false);
             return;
@@ -12686,7 +12768,7 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
         LiveMenu::Beacon(_) => 1,
     };
     let output_slot = match session.menu {
-        LiveMenu::Crafter => 9,
+        LiveMenu::Crafter => CRAFTER_OUTPUT_SLOT,
         LiveMenu::Anvil(_)
         | LiveMenu::Merchant(..)
         | LiveMenu::Smithing(_)
@@ -12794,15 +12876,26 @@ fn live_menu_click(c: &Client, window: u8, slot: i16, button: i8, mode: i64) {
                 })
             }
             LiveMenu::Merchant(id, menu) => {
-                let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+                let mut traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
                 let items = MerchantItems(&merchant_item_comps);
-                let result = villagers.get_mut(id).and_then(|villager| {
-                    let index = menu.active_offer(&villager.offers, &items)?;
-                    receive(&villager.offers[index].result).then_some(())?;
-                    villager
-                        .trade(c.uuid, menu, &items)
-                        .map(|trade| trade.result)
-                });
+                let result = if let Some(trader) = traders.get_mut(id) {
+                    menu.active_offer(&trader.offers, &items).and_then(|index| {
+                        let offer = &mut trader.offers[index];
+                        if trader.customer != Some(c.uuid) || !receive(&offer.result) {
+                            return None;
+                        }
+                        offer.take(&mut menu.payments, &items).ok()?;
+                        Some(offer.result.clone())
+                    })
+                } else {
+                    drop(traders);
+                    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+                    villagers.get_mut(id).and_then(|villager| {
+                        let index = menu.active_offer(&villager.offers, &items)?;
+                        receive(&villager.offers[index].result).then_some(())?;
+                        villager.trade(c.uuid, menu, &items).map(|trade| trade.result)
+                    })
+                };
                 offer_changed = result.is_some();
                 result
             }
@@ -13028,14 +13121,15 @@ fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
     let close_to =
         |x: f64, y: f64, z: f64| (px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2) <= 64.0;
     if let LiveMenu::Merchant(eid, _) = session.menu {
-        return dim == DimId::Overworld
-            && mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
-                if mob.eid != eid {
-                    return false;
-                }
-                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                close_to(x, y, z)
-            });
+        return mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+            if mob.eid != eid || mob.dim != dim
+                || *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+            {
+                return false;
+            }
+            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            close_to(x, y, z)
+        });
     }
     let Some((anchor_dim, x, y, z)) = session.anchor else {
         return false;
@@ -14296,7 +14390,6 @@ mod p5a_beacon_tests {
         }
     }
 
-    #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn attach(c: &Client) {
         c.enter_play_wire(None, Default::default());
         player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
@@ -14311,6 +14404,48 @@ mod p5a_beacon_tests {
                 }),
             },
         );
+    }
+
+    #[test]
+    fn wandering_trader_opens_stock_and_releases_customer_on_close() {
+        if crate::test_support::isolated_world_test() {
+            return;
+        }
+        let (client, mut receiver) = crate::effect_tests::client_pair();
+        attach(&client);
+        let trader = live_spawn_named(
+            DimId::Overworld, "wandering_trader", (0.0, 70.0, 0.0, 0.0, 0.0),
+        ).unwrap();
+        let offers = wandering_trader_offers(|_| 0);
+        live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            trader.eid,
+            LiveWanderingTrader {
+                despawn_delay: 10,
+                offers: offers.clone(),
+                customer: None,
+            },
+        );
+
+        open_live_merchant(&client, &trader);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert_eq!(read_packet(&mut receiver, deadline).unwrap().0, 0x33);
+        let (id, payload) = read_packet(&mut receiver, deadline).unwrap();
+        assert_eq!(id, 0x2d);
+        let packet = decode_merchant_offers_pkt(&payload).unwrap();
+        assert_eq!(packet.offers, offers);
+        assert_eq!((packet.villager_level, packet.villager_xp), (1, 0));
+        assert!(!packet.show_progress && !packet.can_restock);
+
+        live_special_spawn_tick(&[]);
+        let status = || {
+            let traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+            let entry = &traders[&trader.eid];
+            (entry.despawn_delay, entry.customer)
+        };
+        assert_eq!(status(), (10, Some(client.uuid)));
+        close_live_menu(&client, false, false);
+        live_special_spawn_tick(&[]);
+        assert_eq!(status(), (9, None));
     }
 
     /// Drain every frame the socket received; `read` hits the fixture's 1s

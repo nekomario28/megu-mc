@@ -14003,14 +14003,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if try_mount_vehicle(&me, target) {
                         continue;
                     }
-                    // interact: villagers open trade UI; wheat breeds animals
-                    let villager = mobs()
+                    // Interact with merchants, or use the held item on an animal.
+                    let merchant_types = [name_to_etype("villager"), name_to_etype("wandering_trader")];
+                    let merchant = mobs()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .iter()
-                        .find(|m| m.eid == target && Some(m.etype) == name_to_etype("villager"))
+                        .find(|m| m.eid == target && merchant_types.contains(&Some(m.etype)))
                         .cloned();
-                    let is_villager = villager.is_some();
+                    let is_merchant = merchant.is_some();
                     let held_it = me
                         .inv
                         .lock()
@@ -14019,7 +14020,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .cloned()
                         .unwrap_or((0, 0, Vec::new()))
                         .0;
-                    if held_it == 983 && !is_villager {
+                    if held_it == 983 && !is_merchant {
                         // shears on sheep -> wool
                         let is_sheep = {
                             let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
@@ -14060,7 +14061,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             continue;
                         }
                     }
-                    if held_it == 908 && !is_villager {
+                    if held_it == 908 && !is_merchant {
                         // bucket on cow/sheep -> milk
                         let milkable = {
                             let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
@@ -14095,7 +14096,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             continue;
                         }
                     }
-                    if matches!(held_it, 853 | 854 | 1097) && !is_villager {
+                    if matches!(held_it, 853 | 854 | 1097) && !is_merchant {
                         // Keep the legacy wheat interaction and accept the GP-1 temptation items.
                         let mut loved = false;
                         {
@@ -14136,8 +14137,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             continue;
                         }
                     }
-                    if let Some(villager) = villager {
-                        open_live_merchant(&me, &villager);
+                    if let Some(merchant) = merchant {
+                        open_live_merchant(&me, &merchant);
                         continue;
                     }
                 }
@@ -14215,6 +14216,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
                                     // attr default 1 = fist; an attribute-set value adds on top
                                     let chg = melee_charge(&me, held.0);
+                                    let mace_fall = mace_attack_fall(&me, held.0);
+                                    let smash_bonus = mace_smash_damage_bonus(
+                                        mace_fall, enchant_level(&held.2, 6) as i32,
+                                    );
                                     let crt = {
                                         let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                                         let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
@@ -14248,8 +14253,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         + strb
                                         + wkb)
                                         .max(0.0)
-                                        * (0.2 + 0.8 * chg * chg)
-                                        * if crt { 1.5 } else { 1.0 };
+                                        * (0.2 + 0.8 * chg * chg);
+                                    let dmg = (dmg + smash_bonus) * if crt { 1.5 } else { 1.0 };
                                     let Some((accepted, starts_hurt_window)) =
                                         damage_after_invulnerability(v, dmg)
                                     else {
@@ -14278,7 +14283,9 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                         - if vb {
                                             0.0
                                         } else {
-                                            hurt_absorb(v, dmg_after(v, dmg, 0))
+                                            hurt_absorb(v, dmg_after_breach(
+                                                v, dmg, 0, enchant_level(&held.2, 4),
+                                            ))
                                         })
                                     .max(0.0);
                                     if *h <= 0.0 {
@@ -14290,6 +14297,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     drop(h);
                                     if !vb {
                                         damage_armor(v, dmg);
+                                        if dmg > 0.0 {
+                                            let (x, y, z, ..) = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
+                                            queue_mace_smash(&me, &held, mace_fall, v.eid, [x, y, z]);
+                                        }
                                     }
                                     if damage_held(&me) {
                                         let (pxx, pyy, pzz, ..) = {
@@ -14465,6 +14476,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 // vanilla attack cooldown: charge<1 scales damage 0.2..1.0
                                 let charge = melee_charge(&me, held.0);
                                 let scale = 0.2 + 0.8 * charge * charge;
+                                let mace_fall = mace_attack_fall(&me, held.0);
+                                let smash_bonus = mace_smash_damage_bonus(
+                                    mace_fall, enchant_level(&held.2, 6) as i32,
+                                );
                                 // Vanilla criticals require a charged attack and exclude
                                 // sprinting, water, climbable blocks, and blindness.
                                 let (px, py, pz, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -14560,11 +14575,15 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     1.0
                                 };
                                 let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                *h -= ((wep + sharp + spec + strb + wkb).max(0.0))
-                                    * scale
-                                    * colossal_scale
-                                    * if crit { 1.5 } else { 1.0 };
+                                let damage = ((wep + sharp + spec + strb + wkb).max(0.0) * scale
+                                    + smash_bonus)
+                                    * colossal_scale * if crit { 1.5 } else { 1.0 };
+                                if *h <= 0.0 || damage <= 0.0 {
+                                    continue;
+                                }
+                                *h -= damage;
                                 drop(h);
+                                queue_mace_smash(&me, &held, mace_fall, m.eid, [mx2, my2, mz2]);
                                 // Vanilla swords sweep even without Sweeping Edge.
                                 if kind == 0 {
                                     let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());

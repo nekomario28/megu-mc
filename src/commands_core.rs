@@ -2265,26 +2265,18 @@ fn reload_datapacks(
     }
     // An extracted vanilla directory remains authoritative whenever present.
     // Otherwise use the official JAR as the base pack before user packs.
-    if !base.join("vanilla").is_dir() {
-        if let Some(jar) = discover_vanilla_jar() {
-            match VanillaJarDataFallback::load_from_jar(&jar) {
-                Ok(data) => {
-                    let entries: Vec<(String, String)> = data.entries.iter()
-                        .filter_map(|(path, body)| std::str::from_utf8(body).ok()
-                            .map(|body| (path.clone(), body.to_owned())))
-                        .collect();
-                    let dim_entries = entries.clone();
-                    dim_sources.insert(0, worldgen::DatapackDimensionSource::Entries(dim_entries));
-                    raw_packs.insert(0, RawDatapack {
-                        name: "vanilla_jar".into(),
-                        mcmeta: Some(r#"{"pack":{"pack_format":48,"description":"Official Minecraft 1.21.1 data"}}"#.into()),
-                        entries,
-                    });
-                    eprintln!("[spine] vanilla datapack data loaded from {} ({:?})", jar.display(), data.summary());
-                }
-                Err(error) => eprintln!("[spine] vanilla JAR fallback unavailable: {error}"),
-            }
-        }
+    if let Some(data) = (!base.join("vanilla").is_dir()).then(vanilla_jar_data).flatten() {
+        let entries: Vec<(String, String)> = data.entries.iter()
+            .filter(|(path, _)| path.ends_with(".json"))
+            .filter_map(|(path, body)| std::str::from_utf8(body).ok()
+                .map(|body| (path.clone(), body.to_owned())))
+            .collect();
+        dim_sources.insert(0, worldgen::DatapackDimensionSource::Entries(entries.clone()));
+        raw_packs.insert(0, RawDatapack {
+            name: "vanilla_jar".into(),
+            mcmeta: Some(r#"{"pack":{"pack_format":48,"description":"Official Minecraft 1.21.1 data"}}"#.into()),
+            entries,
+        });
     }
     let enabled_order: Vec<String> = raw_packs.iter().map(|raw| raw.name.clone()).collect();
     let mut content = DatapackContent::default();

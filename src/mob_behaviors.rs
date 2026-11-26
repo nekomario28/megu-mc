@@ -769,7 +769,7 @@ struct DragonTick<'a> {
     path_complete: bool,
     strafe_target: Option<i32>,
     strafe_aligned: bool,
-    strafe_target_distance: Option<f64>,
+    target_pos: Option<[f64; 3]>,
     crystals: &'a [DragonCrystal],
 }
 
@@ -833,6 +833,8 @@ struct EnderDragonBehavior {
     strafe_target: Option<i32>,
     linked_crystal: Option<i32>,
     flame_count: u8,
+    charge_target: Option<[f64; 3]>,
+    charge_recovery: u8,
     death_landed: bool,
     previously_killed: bool,
 }
@@ -848,6 +850,8 @@ impl EnderDragonBehavior {
             strafe_target: None,
             linked_crystal: None,
             flame_count: 0,
+            charge_target: None,
+            charge_recovery: 0,
             death_landed: false,
             previously_killed,
         }
@@ -856,6 +860,11 @@ impl EnderDragonBehavior {
     fn set_phase(&mut self, phase: DragonPhase) {
         self.phase = phase;
         self.phase_ticks = 0;
+        self.charge_target = None;
+        self.charge_recovery = 0;
+        if phase == DragonPhase::SittingFlaming {
+            self.flame_count = self.flame_count.saturating_add(1);
+        }
     }
 
     fn is_sitting(&self) -> bool {
@@ -868,7 +877,7 @@ impl EnderDragonBehavior {
     }
 
     fn hurt(&mut self, hit: BossHit, damage: f32) -> bool {
-        if self.hp == 0.0 || damage <= 0.0 || (matches!(hit, BossHit::Arrow) && self.is_sitting()) {
+        if self.hp == 0.0 || damage <= 0.0 || (matches!(hit, BossHit::Arrow | BossHit::Trident) && self.is_sitting()) {
             return false;
         }
         self.hp = (self.hp - damage).max(0.0);
@@ -970,7 +979,7 @@ impl EnderDragonBehavior {
                 self.set_phase(DragonPhase::Landing)
             }
             DragonPhase::Landing if near_perch => {
-                self.flame_count = self.flame_count.saturating_add(1);
+                self.flame_count = 0;
                 self.set_phase(DragonPhase::SittingFlaming);
             }
             DragonPhase::SittingFlaming if self.phase_ticks == 10 => {
@@ -985,26 +994,43 @@ impl EnderDragonBehavior {
                     DragonPhase::Takeoff
                 } else {
                     DragonPhase::SittingScanning
-                })
+                });
             }
-            DragonPhase::SittingScanning
-                if self.phase_ticks >= 25 && input.strafe_target.is_some() =>
-            {
-                if input.strafe_target_distance.is_some_and(|distance| distance <= 20.0) {
-                    self.set_phase(DragonPhase::SittingAttacking);
-                    return Some(DragonEvent::PerchAttack);
+            DragonPhase::SittingScanning => {
+                let distance_sq = input.target_pos.map_or(f64::INFINITY, |target| {
+                    let delta = mob_behavior_delta(input.position, target);
+                    mob_behavior_dot(delta, delta)
+                });
+                if distance_sq <= 20.0 * 20.0 {
+                    if self.phase_ticks > 25 {
+                        self.set_phase(DragonPhase::SittingAttacking);
+                        return Some(DragonEvent::PerchAttack);
+                    }
+                } else if self.phase_ticks >= 100 {
+                    self.flame_count = 0;
+                    if distance_sq <= 150.0 * 150.0 {
+                        self.set_phase(DragonPhase::ChargingPlayer);
+                        self.charge_target = input.target_pos;
+                    } else {
+                        self.set_phase(DragonPhase::Takeoff);
+                    }
                 }
-                self.set_phase(DragonPhase::ChargingPlayer);
-            }
-            DragonPhase::SittingScanning if self.phase_ticks >= 100 => {
-                self.flame_count = 0;
-                self.set_phase(DragonPhase::Takeoff)
             }
             DragonPhase::SittingAttacking if self.phase_ticks >= 40 => {
                 self.set_phase(DragonPhase::SittingFlaming)
             }
-            DragonPhase::ChargingPlayer if self.phase_ticks >= 10 => {
-                self.set_phase(DragonPhase::HoldingPattern)
+            DragonPhase::ChargingPlayer => {
+                if let Some(target) = self.charge_target {
+                    let delta = mob_behavior_delta(input.position, target);
+                    let distance_sq = mob_behavior_dot(delta, delta);
+                    if self.charge_recovery >= 10 {
+                        self.set_phase(DragonPhase::HoldingPattern);
+                    } else if self.charge_recovery > 0 || !(100.0..=22_500.0).contains(&distance_sq) {
+                        self.charge_recovery += 1;
+                    }
+                } else {
+                    self.set_phase(DragonPhase::HoldingPattern);
+                }
             }
             DragonPhase::Takeoff if input.path_complete => {
                 self.set_phase(DragonPhase::HoldingPattern)
@@ -1444,6 +1470,7 @@ enum WitherSkull {
 struct WitherBehavior {
     hp: f32,
     spawn_ticks: u16,
+    cage_clear_ticks: u8,
 }
 
 impl WitherBehavior {
@@ -1454,7 +1481,20 @@ impl WitherBehavior {
         Self {
             hp: Self::MAX_HP / 3.0,
             spawn_ticks: 220,
+            cage_clear_ticks: 0,
         }
+    }
+
+    fn observe_health(&mut self, hp: f32) -> bool {
+        if self.spawn_ticks == 0 && self.cage_clear_ticks == 0 && hp < self.hp {
+            self.cage_clear_ticks = 20;
+        }
+        self.hp = hp;
+        if self.cage_clear_ticks == 0 {
+            return false;
+        }
+        self.cage_clear_ticks -= 1;
+        self.cage_clear_ticks == 0
     }
 
     fn has_wither_armor(&self) -> bool {
@@ -1651,7 +1691,7 @@ impl WardenBehavior {
         if self.sonic_charge > 0 {
             self.sonic_charge -= 1;
             if self.sonic_charge == 0 {
-                self.sonic_cooldown = 200;
+                self.sonic_cooldown = 40;
                 return in_range.then_some(WardenEvent::SonicBoom {
                     target,
                     damage: 10.0,
@@ -1773,6 +1813,9 @@ enum MobBehaviorEffect {
         xp: u32,
     },
     WarningSignal,
+    WardenRoar,
+    WardenSonicCharge,
+    WitherCageClear,
     PiglinBarter {
         player_eid: i32,
         loot: PiglinBarterLoot,
@@ -2025,10 +2068,7 @@ impl MobBehaviorState {
                     path_complete,
                     strafe_target: target.map(|target| target.eid),
                     strafe_aligned,
-                    strafe_target_distance: target.map(|target| {
-                        let delta = mob_behavior_delta(ctx.pos, target.pos);
-                        mob_behavior_dot(delta, delta).sqrt()
-                    }),
+                    target_pos: target.map(|target| target.pos),
                     crystals: &anchored,
                 });
                 let healed = dragon.hp.min(ctx.max_hp) - hp_before;
@@ -2104,7 +2144,9 @@ impl MobBehaviorState {
             }
             Self::Wolf(_) | Self::Cat(_) => None, // Pet interactions are event-driven.
             Self::Wither(wither) => {
-                wither.hp = ctx.hp;
+                if wither.observe_health(ctx.hp) {
+                    effects.push(WitherCageClear);
+                }
                 let event = wither.tick();
                 let healed = wither.hp.min(ctx.max_hp) - ctx.hp;
                 if healed > 0.0 {
@@ -2137,9 +2179,8 @@ impl MobBehaviorState {
                     offset: mob_behavior_delta(ctx.pos, target.pos),
                 });
                 match warden.tick(observed) {
-                    Some(WardenEvent::Roar { .. } | WardenEvent::ChargeSonicBoom { .. }) => {
-                        Some(WarningSignal)
-                    }
+                    Some(WardenEvent::Roar { .. }) => Some(WardenRoar),
+                    Some(WardenEvent::ChargeSonicBoom { .. }) => Some(WardenSonicCharge),
                     Some(WardenEvent::SonicBoom { target, damage, .. }) => Some(SonicBoom {
                         target_eid: target,
                         damage,
@@ -4659,13 +4700,13 @@ mod mob_behaviors_tests {
         for _ in 0..5 {
             warden.anger.add_vibration(7);
         }
-        assert_eq!(state.step(&ctx), [WarningSignal]);
+        assert_eq!(state.step(&ctx), [WardenRoar]);
         ctx.nearest_target.as_mut().unwrap().eid = 8;
         assert!(state.step(&ctx).is_empty());
         let target = ctx.nearest_target.as_mut().unwrap();
         target.eid = 7;
         target.visible = false; // The sonic attack can pass through blocks.
-        assert_eq!(state.step(&ctx), [WarningSignal]);
+        assert_eq!(state.step(&ctx), [WardenSonicCharge]);
         for _ in 0..33 {
             assert!(state.step(&ctx).is_empty());
         }
@@ -4676,7 +4717,10 @@ mod mob_behaviors_tests {
                 damage: 10.0
             }]
         );
-        assert!(state.step(&ctx).is_empty());
+        for _ in 0..39 {
+            assert!(state.step(&ctx).is_empty());
+        }
+        assert_eq!(state.step(&ctx), [WardenSonicCharge]);
     }
 
     #[test]
@@ -5219,7 +5263,7 @@ mod mob_behaviors_tests {
             path_complete: false,
             strafe_target: None,
             strafe_aligned: false,
-            strafe_target_distance: None,
+            target_pos: None,
             crystals,
         }
     }
@@ -5419,13 +5463,13 @@ mod mob_behaviors_tests {
         assert_eq!(dragon.tick(dragon_tick(&[])), None);
         assert_eq!(dragon.phase, DragonPhase::SittingScanning);
         assert!(!dragon.hurt(BossHit::Arrow, 30.0));
-        for count in 1..=25 {
+        for count in 1..=26 {
             let mut tick = dragon_tick(&[]);
             tick.strafe_target = Some(12);
-            tick.strafe_target_distance = Some(12.0);
+            tick.target_pos = Some([12.0, 80.0, 0.0]);
             assert_eq!(
                 dragon.tick(tick),
-                (count == 25).then_some(DragonEvent::PerchAttack)
+                (count == 26).then_some(DragonEvent::PerchAttack)
             );
         }
         assert_eq!(dragon.phase, DragonPhase::SittingAttacking);
@@ -5436,7 +5480,25 @@ mod mob_behaviors_tests {
             assert_eq!(dragon.tick(dragon_tick(&[])), None);
         }
         assert_eq!(dragon.phase, DragonPhase::SittingFlaming);
-        dragon.set_phase(DragonPhase::Takeoff);
+        assert_eq!(dragon.flame_count, 2);
+        for _ in 0..2 {
+            for _ in 0..200 {
+                dragon.tick(dragon_tick(&[]));
+            }
+            for _ in 0..26 {
+                let mut tick = dragon_tick(&[]);
+                tick.target_pos = Some([12.0, 80.0, 0.0]);
+                dragon.tick(tick);
+            }
+            for _ in 0..40 {
+                dragon.tick(dragon_tick(&[]));
+            }
+        }
+        assert_eq!(dragon.flame_count, 4);
+        for _ in 0..200 {
+            dragon.tick(dragon_tick(&[]));
+        }
+        assert_eq!(dragon.phase, DragonPhase::Takeoff);
         assert!(dragon.hurt(BossHit::Arrow, 2.0));
         let mut tick = dragon_tick(&[]);
         tick.path_complete = true;
@@ -6271,23 +6333,38 @@ mod mob_behaviors_tests {
     fn dragon_scanning_far_target_enters_charging_player_then_holding() {
         let mut dragon = EnderDragonBehavior::new(false);
         dragon.set_phase(DragonPhase::SittingScanning);
-        for _ in 0..25 {
+        for _ in 0..100 {
             let mut tick = dragon_tick(&[]);
             tick.strafe_target = Some(12);
-            tick.strafe_target_distance = Some(60.0);
+            tick.target_pos = Some([60.0, 80.0, 0.0]);
             assert_eq!(dragon.tick(tick), None);
         }
         assert_eq!(dragon.phase, DragonPhase::ChargingPlayer);
-        assert!(dragon.hurt(BossHit::Other, 20.0));
-        assert!(dragon.hp < 200.0);
-        for _ in 0..10 {
-            assert_eq!(dragon.tick(dragon_tick(&[])), None);
+        assert_eq!(dragon.charge_target, Some([60.0, 80.0, 0.0]));
+        for _ in 0..20 {
+            let mut tick = dragon_tick(&[]);
+            tick.target_pos = Some([100.0, 80.0, 0.0]);
+            assert_eq!(dragon.tick(tick), None);
+        }
+        assert_eq!(dragon.charge_target, Some([60.0, 80.0, 0.0]));
+        assert_eq!(dragon.phase, DragonPhase::ChargingPlayer);
+        for _ in 0..11 {
+            let mut tick = dragon_tick(&[]);
+            tick.position = [55.0, 80.0, 0.0];
+            assert_eq!(dragon.tick(tick), None);
         }
         assert_eq!(dragon.phase, DragonPhase::HoldingPattern);
     }
 
     #[test]
     fn wither_v1211_head_cadence_skull_cage_and_star_rules() {
+        let mut wither = WitherBehavior::new();
+        assert!(!wither.observe_health(99.0));
+        wither.spawn_ticks = 0;
+        for tick in 1..=20 {
+            assert_eq!(wither.observe_health(98.0), tick == 20);
+        }
+        assert!(!wither.observe_health(98.0));
         assert_eq!(wither_head_cadence(WitherHead::Center), 20);
         assert_eq!(wither_head_cadence(WitherHead::Left), 40);
         assert_eq!(wither_head_cadence(WitherHead::Right), 40);

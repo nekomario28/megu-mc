@@ -4420,6 +4420,7 @@ fn live_mob_behavior_step(
     mut ctx: MobBehaviorTickCtx,
     target: Option<&LiveMobPlayer<'_>>,
     crystals: &[DragonCrystal],
+    players: &[LiveMobPlayer<'_>],
 ) -> Vec<MobBehaviorEffect> {
     let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
     let state = states
@@ -4428,6 +4429,21 @@ fn live_mob_behavior_step(
     let Some(behavior) = &mut state.behavior else {
         return Vec::new();
     };
+    if let MobBehaviorState::Warden(warden) = behavior {
+        let locked = warden.target.or_else(|| warden.anger.roar_target());
+        ctx.nearest_target = locked.and_then(|eid| {
+            let player = players.iter().find(|p| p.client.eid == eid && p.dim == ctx.dim && p.attackable)?;
+            Some(MobTargetSnapshot {
+                eid,
+                pos: [player.pos.0, player.pos.1, player.pos.2],
+                hp: *player.client.hp.lock().unwrap_or_else(|e| e.into_inner()),
+                visible: true,
+            })
+        });
+        if let Some(eid) = locked.filter(|_| ctx.nearest_target.is_none()) {
+            warden.forget(eid);
+        }
+    }
     let tick = TICK.load(Ordering::Relaxed);
     state.potions.retain(|&(_, expiry)| expiry > tick);
     let mut block_at = |[x, y, z]: [i32; 3]| {
@@ -4523,6 +4539,7 @@ fn live_mob_behavior_step(
                     let angle = f64::from(dragon.phase_ticks) * 0.035;
                     Some([24.0 * angle.cos(), perch[1] + 16.0, 24.0 * angle.sin()])
                 }
+                DragonPhase::ChargingPlayer => dragon.charge_target,
                 DragonPhase::StrafePlayer => ctx
                     .nearest_target
                     .map(|target| [target.pos[0], target.pos[1] + 8.0, target.pos[2]]),
@@ -4549,6 +4566,42 @@ fn live_dragon_portal_y(dim: DimId) -> i32 {
         surface - 4
     } else {
         surface
+    }
+}
+
+fn live_wither_cage_clear(dim: DimId, pos: [f64; 3]) {
+    if gamerule_live_value("mobGriefing") == 0 {
+        return;
+    }
+    let Some(reg) = breg() else { return };
+    let air = reg.state_of("minecraft:air", None);
+    let center = pos.map(|axis| axis.floor() as i32);
+    for [x, y, z] in wither_cage_clear(center, |_| true) {
+        let state = block_at_dim(dim, x, y, z);
+        if reg.is_air(state) || !wither_skull_breaks_block(true, reg.name_of(state))
+            || block_tag_has("minecraft:wither_immune", state, 0)
+        {
+            continue;
+        }
+        if !set_block_if_dim(dim, x, y, z, air, Some(state)) {
+            continue;
+        }
+        note_block_update_dim(dim, x, y, z, air);
+        if GR_DO_TILE_DROPS.load(Ordering::Relaxed) != 0 {
+            for item in block_drops(state) {
+                drop_spawn_in_dim(dim, DropSpawn {
+                    x: f64::from(x) + 0.5,
+                    y: f64::from(y) + 0.5,
+                    z: f64::from(z) + 0.5,
+                    item,
+                    cnt: 1,
+                    comps: Vec::new(),
+                    age: 0,
+                    target: None,
+                    thrower: None,
+                });
+            }
+        }
     }
 }
 
@@ -4630,6 +4683,7 @@ fn apply_live_mob_effects(
                 }
             }
             Explosion { pos, power } => w1_live_mob_explosion(dim, pos, power, players),
+            WitherCageClear => live_wither_cage_clear(dim, pos),
             Teleport { to: [x, y, z] } => {
                 let (yaw, pitch) = {
                     let mut position = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -4738,19 +4792,21 @@ fn apply_live_mob_effects(
                 });
             }
             OpenEndExitPortal { .. } => {}
-            WarningSignal => {
-                let status = match mob.etype {
-                    116 => Some(62), // Warden sonic charge
-                    _ => None,
-                };
-                if let Some(status) = status {
-                    let mut packet = mob.eid.to_be_bytes().to_vec();
-                    packet.push(status);
-                    broadcast_seen(mob.eid, |_| (0x1f, packet.clone()));
+            WarningSignal | WardenRoar => {
+                let sound = if matches!(effect, WardenRoar) {
+                    "entity.warden.roar"
                 } else {
-                    let packet = sound_pkt_named("entity.ghast.warn", pos[0], pos[1], pos[2]);
-                    broadcast_seen(mob.eid, |_| (0x68, packet.clone()));
-                }
+                    "entity.ghast.warn"
+                };
+                let packet = sound_pkt_named(sound, pos[0], pos[1], pos[2]);
+                broadcast_seen(mob.eid, |_| (0x68, packet.clone()));
+            }
+            WardenSonicCharge => {
+                let mut packet = mob.eid.to_be_bytes().to_vec();
+                packet.push(62);
+                broadcast_seen(mob.eid, |_| (0x1f, packet.clone()));
+                let sound = sound_pkt_named("entity.warden.sonic_charge", pos[0], pos[1], pos[2]);
+                broadcast_seen(mob.eid, |_| (0x68, sound.clone()));
             }
             PiglinBarter { player_eid, loot } => {
                 if let Some(id) = name_to_item(loot.item) {
@@ -6547,6 +6603,7 @@ fn live_mob_tick_dimension(
                 },
                 target,
                 crystals,
+                players,
             );
             let teleported = effects
                 .iter()
@@ -22075,6 +22132,7 @@ fn main() {
     // in `tools/layers_check.sh`, so the edge is a registered function pointer rather
     // than an import.
     feature::register_beard_resolver();
+    worldgen::register_vanilla_jar_resources(vanilla_jar_data_read, vanilla_jar_worldgen_files);
     // The chunk-promotion pass ticks a marked fluid cell (`LevelChunk.postProcessGeneration`),
     // and the fluid machine lives below the pass' layer, so it is registered the same way the
     // beardifier resolver is. Without it the pass would keep skipping marked fluid cells.
@@ -23136,6 +23194,9 @@ fn main() {
         }
     };
     boot_prof.mark("seed-resolve");
+    if !std::path::Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+        let _ = vanilla_jar_data();
+    }
     if std::env::var("MEGU_WG").ok().as_deref() != Some("old") {
         if worldgen::init(wg_seed, name_to_state) {
             // The Nether and the End are generated by the same seed with their own noise
