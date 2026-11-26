@@ -441,6 +441,26 @@ static CARTOGRAPHY_SLOTS: [SlotDef; 3] = slots([
     SlotDef::new(2, 145, 39, SlotKind::Output),
 ]);
 
+/// Beacon effect picker: `(effect id, x, y, pyramid tier, en, ja)`.
+///
+/// `effect` is the 0-based protocol-767 `minecraft:mob_effect` registry id
+/// (Speed=0, Haste=2, Strength=4, Jump=7, Regeneration=9, Resistance=10);
+/// `-1` marks the tier-4 secondary mirror of the chosen primary effect.
+const BEACON_CONTROLS: [(i32, i32, i32, i16, &str, &str); 7] = [
+    (0, 24, 54, 1, "Speed", "移動速度"),
+    (2, 72, 54, 1, "Haste", "採掘速度"),
+    (10, 24, 72, 2, "Resist", "耐性"),
+    (7, 72, 72, 2, "Jump", "跳躍"),
+    (4, 24, 90, 3, "Strength", "攻撃力"),
+    (9, 24, 108, 4, "Regen", "再生"),
+    (-1, 72, 108, 4, "Secondary", "第2効果"),
+];
+const BEACON_CONTROL_W: i32 = 44;
+const BEACON_CONTROL_H: i32 = 14;
+/// Beacon footer buttons in content-box space.
+const BEACON_CONFIRM_RECT: (i32, i32, i32, i32) = (158, 72, 30, 14);
+const BEACON_CANCEL_RECT: (i32, i32, i32, i32) = (158, 90, 30, 14);
+
 const NO_BUTTONS: &[MenuButtonDef] = &[];
 const NO_BARS: &[PropertyBarDef] = &[];
 const ENCHANT_BUTTONS: &[MenuButtonDef] = &[
@@ -1098,29 +1118,34 @@ impl ContainerScreenState {
         })
     }
 
+    /// Clamp a paged selector's scroll row after a `rows` wheel delta: the
+    /// list pages by four columns, `visible` rows at a time.
+    fn scroll_paged_row(row: usize, rows: i32, len: usize, visible: usize) -> usize {
+        let max_row = len.div_ceil(4).saturating_sub(visible);
+        (row as i64 + i64::from(rows)).clamp(0, max_row as i64) as usize
+    }
+
+    /// Keep a selection only while it still addresses an entry.
+    fn clamped_selection(selected: Option<usize>, len: usize) -> Option<usize> {
+        selected.filter(|&index| index < len)
+    }
+
     pub fn set_loom_patterns(&mut self, patterns: Vec<String>) {
         if self.schema.menu_id != 18 {
             return;
         }
         self.loom_patterns = patterns;
-        self.loom_scroll_row = self
-            .loom_scroll_row
-            .min((self.loom_patterns.len().div_ceil(4)).saturating_sub(4));
-        if self
-            .selected_loom_pattern
-            .is_some_and(|i| i >= self.loom_patterns.len())
-        {
-            self.selected_loom_pattern = None;
-        }
+        let len = self.loom_patterns.len();
+        self.loom_scroll_row = Self::scroll_paged_row(self.loom_scroll_row, 0, len, 4);
+        self.selected_loom_pattern = Self::clamped_selection(self.selected_loom_pattern, len);
     }
 
     pub fn scroll_loom(&mut self, rows: i32) {
         if self.schema.menu_id != 18 {
             return;
         }
-        let max_row = (self.loom_patterns.len().div_ceil(4)).saturating_sub(4);
-        self.loom_scroll_row =
-            (self.loom_scroll_row as i64 + i64::from(rows)).clamp(0, max_row as i64) as usize;
+        let len = self.loom_patterns.len();
+        self.loom_scroll_row = Self::scroll_paged_row(self.loom_scroll_row, rows, len, 4);
     }
 
     /// Wheel-scroll the loom pattern grid by whole rows, clamped to the
@@ -1134,24 +1159,18 @@ impl ContainerScreenState {
             return;
         }
         self.stonecutter_recipes = recipes;
-        self.stonecutter_scroll_row = self
-            .stonecutter_scroll_row
-            .min((self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3));
-        if self
-            .selected_stonecutter_recipe
-            .is_some_and(|i| i >= self.stonecutter_recipes.len())
-        {
-            self.selected_stonecutter_recipe = None;
-        }
+        let len = self.stonecutter_recipes.len();
+        self.stonecutter_scroll_row = Self::scroll_paged_row(self.stonecutter_scroll_row, 0, len, 3);
+        self.selected_stonecutter_recipe =
+            Self::clamped_selection(self.selected_stonecutter_recipe, len);
     }
 
     pub fn scroll_stonecutter(&mut self, rows: i32) {
         if self.schema.menu_id != 24 {
             return;
         }
-        let max_row = (self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3);
-        self.stonecutter_scroll_row = (self.stonecutter_scroll_row as i64 + i64::from(rows))
-            .clamp(0, max_row as i64) as usize;
+        let len = self.stonecutter_recipes.len();
+        self.stonecutter_scroll_row = Self::scroll_paged_row(self.stonecutter_scroll_row, rows, len, 3);
     }
 
     /// Wheel-scroll the stonecutter recipe grid by whole rows, clamped to
@@ -1200,12 +1219,7 @@ impl ContainerScreenState {
         self.merchant_scroll_offset = self
             .merchant_scroll_offset
             .min(self.merchant_offers.len().saturating_sub(7));
-        if self
-            .selected_trade_index
-            .is_some_and(|i| i >= self.merchant_offers.len())
-        {
-            self.selected_trade_index = None;
-        }
+        self.selected_trade_index = Self::clamped_selection(self.selected_trade_index, self.merchant_offers.len());
     }
 
     pub fn select_merchant_trade(&mut self, index: usize) -> Option<WorkstationAction> {
@@ -1303,6 +1317,10 @@ impl ContainerScreenState {
 
     /// Button-aware workstation click routing. `button == 0` is left click;
     /// crafter slot toggles are valid for that button only.
+    ///
+    /// Every station branch works in the content-box-local space of
+    /// [`Self::panel_rect`] plus [`CONTENT_PAD`], the same space its chrome
+    /// and [`Self::layout`] rects use.
     pub fn click_at_with_button(
         &mut self,
         x: i32,
@@ -1319,122 +1337,133 @@ impl ContainerScreenState {
             }
             self.rename_focused = false;
         }
-        if self.schema.menu_id == 9 {
-            let panel = self.panel_rect(viewport_w, viewport_h);
-            let lx = x - panel.x - CONTENT_PAD;
-            let ly = y - panel.y - CONTENT_PAD;
-            let level = self.property(0).clamp(0, 4);
-            // Protocol 767 0-based `minecraft:mob_effect` registry IDs:
-            // Speed=0, Haste=2, Strength=4, Jump=7, Regeneration=9, Resistance=10.
-            // `-1` marks the tier-4 secondary mirror of the chosen primary effect.
-            let choices: &[(i32, i32, i32, i32, i32)] = &[
-                (0, 24, 54, 44, 14),
-                (2, 72, 54, 44, 14),
-                (10, 24, 72, 44, 14),
-                (7, 72, 72, 44, 14),
-                (4, 24, 90, 44, 14),
-                (9, 24, 108, 44, 14),
-                (-1, 72, 108, 44, 14),
-            ];
-            for &(id, bx, by, bw, bh) in choices {
-                let tier = if id == 0 || id == 2 {
-                    1
-                } else if id == 10 || id == 7 {
-                    2
-                } else if id == 4 {
-                    3
-                } else {
-                    4
-                };
-                if level >= tier && UiRect::new(bx, by, bw as u32, bh as u32).contains(lx, ly) {
-                    if id == -1 {
-                        self.beacon_secondary = self.beacon_primary;
-                    } else if id == 9 {
-                        self.beacon_secondary = Some(9);
-                    } else {
-                        self.beacon_primary = Some(id);
-                    }
-                    return None;
-                }
+        let panel = self.panel_rect(viewport_w, viewport_h);
+        let (lx, ly) = (x - panel.x - CONTENT_PAD, y - panel.y - CONTENT_PAD);
+        match self.schema.menu_id {
+            7 => self.click_crafter_grid(lx, ly, button),
+            9 => self.click_beacon_picker(lx, ly),
+            13 | 17 => self.click_schema_button(x, y, viewport_w, viewport_h),
+            18 => self.click_recipe_grid(
+                RecipeGrid::LOOM,
+                self.loom_scroll_row,
+                self.loom_patterns.len(),
+                lx,
+                ly,
+            ),
+            19 => self.click_merchant_side(lx, ly),
+            24 => self.click_recipe_grid(
+                RecipeGrid::STONECUTTER,
+                self.stonecutter_scroll_row,
+                self.stonecutter_recipes.len(),
+                lx,
+                ly,
+            ),
+            _ => None,
+        }
+    }
+
+    /// Crafter 3×3 slot toggle: empty slots only, and only for a plain left
+    /// click with nothing on the cursor.
+    fn click_crafter_grid(
+        &mut self,
+        lx: i32,
+        ly: i32,
+        button: i8,
+    ) -> Option<WorkstationAction> {
+        if button != 0 || !self.cursor.as_ref().is_none_or(UiItemStack::is_empty) {
+            return None;
+        }
+        let (slot, _) = CRAFTER_GRID.iter().enumerate().find(|(slot, def)| {
+            local_rect(def.x, def.y, SLOT_SIZE, SLOT_SIZE).contains(lx, ly)
+                && self.slots.get(*slot).is_some_and(UiItemStack::is_empty)
+        })?;
+        self.toggle_crafter_slot(slot)
+    }
+
+    /// Beacon picker: tier-gated effect choice, then confirm/cancel.
+    fn click_beacon_picker(&mut self, lx: i32, ly: i32) -> Option<WorkstationAction> {
+        let level = self.property(0).clamp(0, 4);
+        for &(effect, x, y, tier, ..) in &BEACON_CONTROLS {
+            if level < tier
+                || !local_rect(x, y, BEACON_CONTROL_W, BEACON_CONTROL_H).contains(lx, ly)
+            {
+                continue;
             }
-            if UiRect::new(158, 72, 30, 14).contains(lx, ly) {
-                if !self.beacon_confirm_enabled() {
-                    return None;
-                }
-                return Some(WorkstationAction::SetBeacon {
+            match effect {
+                -1 => self.beacon_secondary = self.beacon_primary,
+                9 => self.beacon_secondary = Some(9),
+                _ => self.beacon_primary = Some(effect),
+            }
+            return None;
+        }
+        let (x, y, w, h) = BEACON_CONFIRM_RECT;
+        if local_rect(x, y, w, h).contains(lx, ly) {
+            return self
+                .beacon_confirm_enabled()
+                .then_some(WorkstationAction::SetBeacon {
                     primary: self.beacon_primary,
                     secondary: self.beacon_secondary,
                 });
-            }
-            if UiRect::new(158, 90, 30, 14).contains(lx, ly) {
-                self.beacon_close_requested = true;
-                return Some(WorkstationAction::ClickButton(-9));
-            }
         }
-        if self.schema.menu_id == 19 {
-            let panel = self.panel_rect(viewport_w, viewport_h);
-            let local_x = x - panel.x - CONTENT_PAD;
-            let local_y = y - panel.y - CONTENT_PAD;
-            if (8..104).contains(&local_x) && (18..130).contains(&local_y) {
-                let row = ((local_y - 18) / 16) as usize;
-                return self.select_merchant_trade(self.merchant_scroll_offset + row);
-            }
-        }
-        let panel = self.panel_rect(viewport_w, viewport_h);
-        let local_x = x - panel.x - CONTENT_PAD;
-        let local_y = y - panel.y - CONTENT_PAD;
-        if self.schema.menu_id == 7
-            && button == 0
-            && self.cursor.as_ref().is_none_or(UiItemStack::is_empty)
-        {
-            for (slot, def) in CRAFTER_GRID.iter().enumerate() {
-                if UiRect::new(def.x, def.y, SLOT_SIZE as u32, SLOT_SIZE as u32)
-                    .contains(local_x, local_y)
-                    && self.slots.get(slot).is_some_and(UiItemStack::is_empty)
-                {
-                    return self.toggle_crafter_slot(slot);
-                }
-            }
-        }
-        if self.schema.menu_id == 18 && (60..116).contains(&local_x) && (13..69).contains(&local_y)
-        {
-            let col = ((local_x - 60) / 14) as usize;
-            let row = ((local_y - 13) / 14) as usize;
-            let index = self.loom_scroll_row * 4 + row * 4 + col;
-            if index < self.loom_patterns.len() {
-                self.selected_loom_pattern = Some(index);
-                return Some(WorkstationAction::ClickButton(index as i32));
-            }
-        }
-        if self.schema.menu_id == 24 && (52..116).contains(&local_x) && (14..68).contains(&local_y)
-        {
-            let col = ((local_x - 52) / 16) as usize;
-            let row = ((local_y - 14) / 18) as usize;
-            let index = self.stonecutter_scroll_row * 4 + row * 4 + col;
-            if index < self.stonecutter_recipes.len() {
-                self.selected_stonecutter_recipe = Some(index);
-                return Some(WorkstationAction::ClickButton(index as i32));
-            }
-        }
-        if matches!(self.schema.menu_id, 13 | 17) {
-            if let Some(button) = self
-                .layout(viewport_w, viewport_h)
-                .buttons
-                .iter()
-                .find(|b| b.rect.contains(x, y))
-            {
-                if self.schema.menu_id == 13 {
-                    let tier = button.id as usize;
-                    if self.enchanting_row_enabled(tier) {
-                        self.selected_enchant_tier = Some(tier);
-                        return Some(WorkstationAction::ClickButton(button.id));
-                    }
-                } else {
-                    return Some(WorkstationAction::ClickButton(button.id));
-                }
-            }
+        let (x, y, w, h) = BEACON_CANCEL_RECT;
+        if local_rect(x, y, w, h).contains(lx, ly) {
+            self.beacon_close_requested = true;
+            return Some(WorkstationAction::ClickButton(-9));
         }
         None
+    }
+
+    /// Villager trade sidebar: pick the row under the pointer.
+    fn click_merchant_side(&mut self, lx: i32, ly: i32) -> Option<WorkstationAction> {
+        if !(8..104).contains(&lx) || !(18..130).contains(&ly) {
+            return None;
+        }
+        let row = ((ly - 18) / 16) as usize;
+        self.select_merchant_trade(self.merchant_scroll_offset + row)
+    }
+
+    /// Select a paged recipe/pattern entry under the pointer.
+    fn click_recipe_grid(
+        &mut self,
+        grid: RecipeGrid,
+        scroll_row: usize,
+        len: usize,
+        lx: i32,
+        ly: i32,
+    ) -> Option<WorkstationAction> {
+        let index = grid.index_at(lx, ly, scroll_row, len)?;
+        if self.schema.menu_id == 18 {
+            self.selected_loom_pattern = Some(index);
+        } else {
+            self.selected_stonecutter_recipe = Some(index);
+        }
+        Some(WorkstationAction::ClickButton(index as i32))
+    }
+
+    /// Schema button hit test: enchantment tiers stay gated by affordability,
+    /// lectern page/button ids are unconditional.
+    fn click_schema_button(
+        &mut self,
+        x: i32,
+        y: i32,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Option<WorkstationAction> {
+        let layout = self.layout(viewport_w, viewport_h);
+        let id = layout
+            .buttons
+            .iter()
+            .find(|button| button.rect.contains(x, y))?
+            .id;
+        if self.schema.menu_id != 13 {
+            return Some(WorkstationAction::ClickButton(id));
+        }
+        let tier = id as usize;
+        if !self.enchanting_row_enabled(tier) {
+            return None;
+        }
+        self.selected_enchant_tier = Some(tier);
+        Some(WorkstationAction::ClickButton(id))
     }
 
     pub fn is_player_slot(&self, index: i16) -> bool {
@@ -1555,110 +1584,26 @@ impl ContainerScreenState {
 
     pub fn layout(&self, viewport_w: f32, viewport_h: f32) -> ContainerLayout {
         let panel = self.panel_rect(viewport_w, viewport_h);
-        let mut slots = Vec::with_capacity(self.slots.len());
-        for index in 0..self.slots.len() as i16 {
-            if let Some(rect) = self.slot_rect(index, panel) {
-                slots.push(UiSlotRect {
+        let slots: Vec<UiSlotRect> = (0..self.slots.len() as i16)
+            .filter_map(|index| {
+                self.slot_rect(index, panel).map(|rect| UiSlotRect {
                     index,
                     rect,
                     kind: self.slot_kind(index).unwrap_or(SlotKind::Normal),
-                });
-            }
-        }
+                })
+            })
+            .collect();
         let mut buttons: Vec<UiButtonRect> = self
             .schema
             .buttons
             .iter()
             .map(|b| UiButtonRect {
                 id: b.id,
-                rect: UiRect::new(
-                    panel.x + CONTENT_PAD + b.x,
-                    panel.y + CONTENT_PAD + b.y,
-                    b.w as u32,
-                    b.h as u32,
-                ),
+                rect: content_rect(panel, b.x, b.y, b.w, b.h),
                 label: b.label,
             })
             .collect();
-        if self.schema.menu_id == 18 {
-            for row in 0..4 {
-                for col in 0..4 {
-                    let index = self.loom_scroll_row * 4 + row * 4 + col;
-                    if index < self.loom_patterns.len() {
-                        buttons.push(UiButtonRect {
-                            id: index as i32,
-                            rect: UiRect::new(
-                                panel.x + CONTENT_PAD + 60 + col as i32 * 14,
-                                panel.y + CONTENT_PAD + 13 + row as i32 * 14,
-                                14,
-                                14,
-                            ),
-                            label: "pattern",
-                        });
-                    }
-                }
-            }
-        } else if self.schema.menu_id == 24 {
-            for row in 0..3 {
-                for col in 0..4 {
-                    let index = self.stonecutter_scroll_row * 4 + row * 4 + col;
-                    if index < self.stonecutter_recipes.len() {
-                        buttons.push(UiButtonRect {
-                            id: index as i32,
-                            rect: UiRect::new(
-                                panel.x + CONTENT_PAD + 52 + col as i32 * 16,
-                                panel.y + CONTENT_PAD + 14 + row as i32 * 18,
-                                16,
-                                18,
-                            ),
-                            label: "recipe",
-                        });
-                    }
-                }
-            }
-        }
-        if self.schema.menu_id == 8 {
-            buttons.push(UiButtonRect {
-                id: -8,
-                rect: self.rename_input_rect(viewport_w, viewport_h).unwrap(),
-                label: "rename",
-            });
-        } else if self.schema.menu_id == 9 {
-            for (id, x, y, label) in [
-                (101, 24, 54, "Speed"),
-                (103, 72, 54, "Haste"),
-                (111, 24, 72, "Resist"),
-                (108, 72, 72, "Jump"),
-                (105, 24, 90, "Strength"),
-                (110, 24, 108, "Regen"),
-                (100, 72, 108, "Secondary"),
-                (-9, 158, 90, "Cancel"),
-            ] {
-                buttons.push(UiButtonRect {
-                    id,
-                    rect: UiRect::new(
-                        panel.x + CONTENT_PAD + x,
-                        panel.y + CONTENT_PAD + y,
-                        if id == -9 { 30 } else { 44 },
-                        14,
-                    ),
-                    label,
-                });
-            }
-        } else if self.schema.menu_id == 19 {
-            for row in 0..self.merchant_offers.len().min(7) {
-                buttons.push(UiButtonRect {
-                    id: 1000 + row as i32,
-                    rect: UiRect::new(
-                        panel.x + CONTENT_PAD + 8,
-                        panel.y + CONTENT_PAD + 18 + row as i32 * 16,
-                        96,
-                        16,
-                    ),
-                    label: "trade",
-                });
-            }
-        }
+        buttons.extend(self.dynamic_buttons(panel, viewport_w, viewport_h));
         let bars = self
             .schema
             .property_bars
@@ -1666,12 +1611,7 @@ impl ContainerScreenState {
             .map(|b| UiBarRect {
                 property: b.property,
                 kind: b.kind,
-                rect: UiRect::new(
-                    panel.x + CONTENT_PAD + b.x,
-                    panel.y + CONTENT_PAD + b.y,
-                    b.w as u32,
-                    b.h as u32,
-                ),
+                rect: content_rect(panel, b.x, b.y, b.w, b.h),
                 fraction: self.bar_fraction(b),
             })
             .collect();
@@ -1685,12 +1625,66 @@ impl ContainerScreenState {
         }
     }
 
+    /// Buttons derived from runtime state: recipe/pattern grids, the rename
+    /// field, the beacon effect picker and villager trade rows.
+    fn dynamic_buttons(
+        &self,
+        panel: UiRect,
+        viewport_w: f32,
+        viewport_h: f32,
+    ) -> Vec<UiButtonRect> {
+        match self.schema.menu_id {
+            8 => self
+                .rename_input_rect(viewport_w, viewport_h)
+                .map(|rect| UiButtonRect {
+                    id: -8,
+                    rect,
+                    label: "rename",
+                })
+                .into_iter()
+                .collect(),
+            9 => {
+                // Layout ids are the historical 1-based effect ids offset by
+                // 100; `-1` is the secondary-effect mirror.
+                let mut buttons: Vec<UiButtonRect> = BEACON_CONTROLS
+                    .iter()
+                    .map(|&(effect, x, y, _, en, _)| UiButtonRect {
+                        id: if effect < 0 { 100 } else { effect + 101 },
+                        rect: content_rect(panel, x, y, BEACON_CONTROL_W, BEACON_CONTROL_H),
+                        label: en,
+                    })
+                    .collect();
+                let (x, y, w, h) = BEACON_CANCEL_RECT;
+                buttons.push(UiButtonRect {
+                    id: -9,
+                    rect: content_rect(panel, x, y, w, h),
+                    label: "Cancel",
+                });
+                buttons
+            }
+            18 => RecipeGrid::LOOM.buttons(
+                panel,
+                self.loom_scroll_row,
+                self.loom_patterns.len(),
+            ),
+            19 => (0..self.merchant_offers.len().min(7))
+                .map(|row| UiButtonRect {
+                    id: 1000 + row as i32,
+                    rect: content_rect(panel, 8, 18 + row as i32 * 16, 96, 16),
+                    label: "trade",
+                })
+                .collect(),
+            24 => RecipeGrid::STONECUTTER.buttons(
+                panel,
+                self.stonecutter_scroll_row,
+                self.stonecutter_recipes.len(),
+            ),
+            _ => Vec::new(),
+        }
+    }
+
     fn scale_factor(&self, viewport_w: f32, viewport_h: f32, gui_scale: f32) -> f32 {
-        let scale = if gui_scale.is_finite() {
-            gui_scale.clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
+        let scale = clamped_gui_scale(gui_scale);
         let logical_w = (viewport_w.max(1.0) / scale).max(1.0);
         let logical_h = (viewport_h.max(1.0) / scale).max(1.0);
         (logical_w / self.schema.panel_w.max(1.0))
@@ -1724,11 +1718,7 @@ impl ContainerScreenState {
         gui_scale: f32,
     ) -> ContainerLayout {
         let mut layout = self.layout(viewport_w, viewport_h);
-        let scale = if gui_scale.is_finite() {
-            gui_scale.clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
+        let scale = clamped_gui_scale(gui_scale);
         let logical_w = viewport_w.max(1.0) / scale;
         let logical_h = viewport_h.max(1.0) / scale;
         let factor = self.scale_factor(viewport_w, viewport_h, scale);
@@ -1759,11 +1749,7 @@ impl ContainerScreenState {
         viewport_h: f32,
         gui_scale: f32,
     ) -> Option<WorkstationAction> {
-        let scale = if gui_scale.is_finite() {
-            gui_scale.clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
+        let scale = clamped_gui_scale(gui_scale);
         let factor = self
             .scale_factor(viewport_w, viewport_h, scale)
             .max(f32::EPSILON);
@@ -1924,58 +1910,81 @@ impl ContainerScreenState {
         panel_uv: Option<GuiSpriteUv>,
         out: &mut UiDrawList,
     ) {
-        if !viewport_w.is_finite()
-            || !viewport_h.is_finite()
-            || viewport_w <= 0.0
-            || viewport_h <= 0.0
-        {
+        let Some((vw, vh)) = viewport_px(viewport_w, viewport_h) else {
+            return;
+        };
+        let panel = self.panel_rect(viewport_w, viewport_h);
+        self.draw_panel_backdrop(panel, panel_uv, vw, vh, out);
+        if viewport_w < self.schema.panel_w || viewport_h < self.schema.panel_h {
             return;
         }
-        let vw = viewport_w as i32;
-        let vh = viewport_h as i32;
-        let panel = self.panel_rect(viewport_w, viewport_h);
-        out.fill_rect(
-            UiRect::new(0, 0, vw as u32, vh as u32),
-            palette::BACKGROUND_BOTTOM,
-        );
-        if let Some(uv) = panel_uv {
-            // Vanilla's chests are not the six-row texture scaled vertically.
-            // Menu ids 0..=5 encode rows 1..=6; `ChestSkinGeometry` owns the
-            // exact 176×222 sheet validation, top crop, and shared footer
-            // crop (including integral high-DPI source scaling).
-            let chest_skin = if self.schema.menu_id <= 5 {
-                ChestSkinGeometry::from_sheet(self.schema.menu_id + 1, uv.width, uv.height)
-            } else {
-                None
-            };
-            if let Some(skin) = chest_skin {
-                for blit in skin.blits(panel) {
-                    out.texture_uv(
-                        blit.dest,
-                        uv.subrect(blit.source_x, blit.source_y, blit.source_w, blit.source_h),
-                    );
-                }
-            } else {
-                out.texture_uv(panel, uv);
+        let layout = self.layout(viewport_w, viewport_h);
+        self.draw_slots(&layout, panel_uv, out);
+        for bar in &layout.bars {
+            let (fill, empty) = (palette::ACCENT, palette::BUTTON_DISABLED);
+            out.progress_bar(bar.rect, bar.fraction, fill, empty, palette::PANEL_BORDER);
+        }
+        self.draw_menu_buttons(&layout, out);
+        self.draw_station_chrome(panel, out);
+        self.draw_workstation_controls(panel, out);
+        // Polymorph strip beside the station's output slot — only while two
+        // or more recipes conflict; a quiet grid emits nothing.
+        if self.conflict.is_active() {
+            if let Some(anchor) = self.output_slot_rect(viewport_w, viewport_h) {
+                self.conflict.render(anchor, 1, vw as u32, vh as u32, out);
             }
-        } else {
-            out.fill_rect(panel, palette::PANEL);
-            out.border_rect(panel, palette::PANEL_BORDER, 1);
+        }
+        self.draw_cursor(vw, vh, out);
+        if let Some(rect) = layout.tooltip {
+            self.draw_tooltip(rect, viewport_w, viewport_h, out);
+        }
+    }
+
+    /// Viewport wash, panel skin and clipped title bar.
+    ///
+    /// Vanilla's chests are not the six-row texture scaled vertically: menu
+    /// ids 0..=5 encode rows 1..=6, and [`ChestSkinGeometry`] owns the exact
+    /// 176×222 sheet validation, top crop, and shared footer crop (including
+    /// integral high-DPI source scaling).
+    fn draw_panel_backdrop(
+        &self,
+        panel: UiRect,
+        panel_uv: Option<GuiSpriteUv>,
+        vw: i32,
+        vh: i32,
+        out: &mut UiDrawList,
+    ) {
+        let background = UiRect::new(0, 0, vw as u32, vh as u32);
+        out.fill_rect(background, palette::BACKGROUND_BOTTOM);
+        let chest = panel_uv.filter(|_| self.schema.menu_id <= 5).and_then(|uv| {
+            ChestSkinGeometry::from_sheet(self.schema.menu_id + 1, uv.width, uv.height)
+        });
+        match (panel_uv, chest) {
+            (Some(uv), Some(skin)) => {
+                for blit in skin.blits(panel) {
+                    let (x, y) = (blit.source_x, blit.source_y);
+                    let (w, h) = (blit.source_w, blit.source_h);
+                    out.texture_uv(blit.dest, uv.subrect(x, y, w, h));
+                }
+            }
+            (Some(uv), None) => out.texture_uv(panel, uv),
+            (None, _) => draw_frame(out, panel, palette::PANEL, palette::PANEL_BORDER),
         }
         if panel.w >= 20 && panel.h >= 12 {
             let clipped = clip_text(&self.title, (panel.w as i32 - 12).max(0));
             out.text(panel.x + 6, panel.y + 4, 1, palette::TEXT, clipped);
         }
-        if viewport_w < self.schema.panel_w || viewport_h < self.schema.panel_h {
-            return;
-        }
-        let layout = self.layout(viewport_w, viewport_h);
+    }
+
+    /// One well per menu slot: well face, hover frame, then its contents.
+    fn draw_slots(
+        &self,
+        layout: &ContainerLayout,
+        panel_uv: Option<GuiSpriteUv>,
+        out: &mut UiDrawList,
+    ) {
         for slot in &layout.slots {
-            let item = self
-                .slots
-                .get(slot.index as usize)
-                .cloned()
-                .unwrap_or_else(UiItemStack::empty);
+            let item = self.slots.get(slot.index as usize).cloned();
             let hovered = self.hovered_slot == Some(slot.index as usize);
             // The authentic container texture already carries Vanilla's slot
             // artwork. Opaque procedural wells are strictly a no-skin
@@ -1984,211 +1993,127 @@ impl ContainerScreenState {
                 out.fill_rect(slot.rect, palette::SLOT);
             }
             if panel_uv.is_none() || hovered {
-                out.border_rect(
-                    slot.rect,
-                    if hovered {
-                        palette::BUTTON_BORDER_HOVER
-                    } else {
-                        palette::PANEL_BORDER
-                    },
-                    if hovered { 2 } else { 1 },
-                );
-            }
-            if item.is_empty() {
-                if let Some(ghost) = ghost_item(self.schema.menu_id, slot.index) {
-                    draw_vanilla_ghost_item(out, slot.rect, ghost);
-                }
-                if self.schema.menu_id == 7 && self.is_crafter_slot_disabled(slot.index as usize) {
-                    out.fill_rect(
-                        UiRect::new(slot.rect.x + 3, slot.rect.y + 8, 12, 2),
-                        palette::DANGER,
-                    );
-                    out.fill_rect(
-                        UiRect::new(slot.rect.x + 8, slot.rect.y + 3, 2, 12),
-                        palette::DANGER,
-                    );
-                    out.border_rect(
-                        UiRect::new(slot.rect.x + 4, slot.rect.y + 4, 10, 10),
-                        palette::DANGER,
-                        1,
-                    );
-                }
-                continue;
-            }
-            let inset = UiRect::new(slot.rect.x + 2, slot.rect.y + 2, 16, 16);
-            if item.namespaced_id.is_empty() {
-                let icon = palette::ACCENT;
-                out.fill_rect(UiRect::new(slot.rect.x + 3, slot.rect.y + 3, 12, 12), icon);
-            } else {
-                out.item_icon_str(inset, &item.namespaced_id);
-            }
-            if item.count > 1 {
-                let label = item.count.to_string();
-                out.text(
-                    slot.rect.right() - 2 - text_width(&label, 1) as i32,
-                    slot.rect.bottom() - 9,
-                    1,
-                    palette::TEXT,
-                    label,
-                );
-            }
-            if item.max_durability > 0 && item.durability >= 0 {
-                let frac = (item.durability as f32 / item.max_durability as f32).clamp(0.0, 1.0);
-                out.progress_bar(
-                    UiRect::new(slot.rect.x + 1, slot.rect.bottom() - 4, 16, 3),
-                    frac,
-                    palette::HEALTH,
-                    palette::SLOT,
-                    palette::PANEL_BORDER,
-                );
-            }
-        }
-
-        for bar in &layout.bars {
-            out.progress_bar(
-                bar.rect,
-                bar.fraction,
-                palette::ACCENT,
-                palette::BUTTON_DISABLED,
-                palette::PANEL_BORDER,
-            );
-        }
-        for button in &layout.buttons {
-            if self.schema.menu_id == 13 {
-                let tier = button.id as usize;
-                let enabled = self.enchanting_row_enabled(tier);
-                let selected = self.selected_enchant_tier == Some(tier);
-                out.fill_rect(
-                    button.rect,
-                    if enabled {
-                        palette::BUTTON
-                    } else {
-                        palette::BUTTON_DISABLED
-                    },
-                );
-                out.border_rect(
-                    button.rect,
-                    if selected {
-                        palette::BUTTON_BORDER_HOVER
-                    } else {
-                        palette::BUTTON_BORDER
-                    },
-                    if selected { 2 } else { 1 },
-                );
-                out.text_str(
-                    button.rect.x + 3,
-                    button.rect.y + 5,
-                    1,
-                    if enabled {
-                        palette::WARNING
-                    } else {
-                        palette::BUTTON_DISABLED_TEXT
-                    },
-                    ["I", "II", "III"][tier],
-                );
-            } else if matches!(self.schema.menu_id, 18 | 24) {
-                let selected = if self.schema.menu_id == 18 {
-                    self.selected_loom_pattern == Some(button.id as usize)
+                let (border, thickness) = if hovered {
+                    (palette::BUTTON_BORDER_HOVER, 2)
                 } else {
-                    self.selected_stonecutter_recipe == Some(button.id as usize)
+                    (palette::PANEL_BORDER, 1)
                 };
-                out.fill_rect(
-                    button.rect,
-                    if selected {
-                        palette::SLOT_HOVER
-                    } else {
-                        palette::BUTTON
-                    },
-                );
-                out.border_rect(
-                    button.rect,
-                    if selected {
-                        palette::BUTTON_BORDER_HOVER
-                    } else {
-                        palette::BUTTON_BORDER
-                    },
-                    if selected { 2 } else { 1 },
-                );
-                if self.schema.menu_id == 18 {
-                    let pattern = &self.loom_patterns[button.id as usize];
-                    let mark = pattern
-                        .rsplit(':')
-                        .next()
-                        .unwrap_or("?")
-                        .chars()
-                        .next()
-                        .unwrap_or('?')
-                        .to_ascii_uppercase()
-                        .to_string();
-                    out.text(
-                        button.rect.x + 4,
-                        button.rect.y + 3,
-                        1,
-                        palette::TEXT_DARK,
-                        mark,
-                    );
-                } else if let Some(recipe) = self.stonecutter_recipes.get(button.id as usize) {
-                    out.item_icon_str(
-                        UiRect::new(button.rect.x + 1, button.rect.y + 1, 14, 14),
-                        recipe,
-                    );
+                out.border_rect(slot.rect, border, thickness);
+            }
+            match item {
+                Some(item) if !item.is_empty() => self.draw_stack(slot.rect, &item, out),
+                _ => self.draw_empty_slot(slot, out),
+            }
+        }
+    }
+
+    /// Ghost preview and crafter disable cross of a slot with no stack.
+    fn draw_empty_slot(&self, slot: &UiSlotRect, out: &mut UiDrawList) {
+        if let Some(ghost) = ghost_item(self.schema.menu_id, slot.index) {
+            draw_vanilla_ghost_item(out, slot.rect, ghost);
+        }
+        let disabled = self.schema.menu_id == 7 && self.is_crafter_slot_disabled(slot.index as usize);
+        if !disabled {
+            return;
+        }
+        let (x, y) = (slot.rect.x, slot.rect.y);
+        out.fill_rect(UiRect::new(x + 3, y + 8, 12, 2), palette::DANGER);
+        out.fill_rect(UiRect::new(x + 8, y + 3, 2, 12), palette::DANGER);
+        out.border_rect(UiRect::new(x + 4, y + 4, 10, 10), palette::DANGER, 1);
+    }
+
+    /// Icon, stack-count label and durability bar of one slot stack.
+    fn draw_stack(&self, rect: UiRect, item: &UiItemStack, out: &mut UiDrawList) {
+        if item.namespaced_id.is_empty() {
+            out.fill_rect(UiRect::new(rect.x + 3, rect.y + 3, 12, 12), palette::ACCENT);
+        } else {
+            let icon = UiRect::new(rect.x + 2, rect.y + 2, 16, 16);
+            out.item_icon_str(icon, &item.namespaced_id);
+        }
+        draw_count_label(out, rect, item.count);
+        if item.max_durability > 0 && item.durability >= 0 {
+            let frac = (item.durability as f32 / item.max_durability as f32).clamp(0.0, 1.0);
+            let bar = UiRect::new(rect.x + 1, rect.bottom() - 4, 16, 3);
+            out.progress_bar(bar, frac, palette::HEALTH, palette::SLOT, palette::PANEL_BORDER);
+        }
+    }
+
+    /// Menu buttons: enchant tiers, loom/stonecutter entry cards, plain labels.
+    fn draw_menu_buttons(&self, layout: &ContainerLayout, out: &mut UiDrawList) {
+        for button in &layout.buttons {
+            match self.schema.menu_id {
+                13 => self.draw_enchant_tier_button(button, out),
+                18 | 24 => self.draw_recipe_button(button, out),
+                _ => {
+                    draw_frame(out, button.rect, palette::BUTTON, palette::BUTTON_BORDER);
+                    out.text(button.rect.x + 3, button.rect.y + 2, 1, palette::TEXT, button.label);
                 }
-            } else {
-                out.fill_rect(button.rect, palette::BUTTON);
-                out.border_rect(button.rect, palette::BUTTON_BORDER, 1);
-                out.text(
-                    button.rect.x + 3,
-                    button.rect.y + 2,
-                    1,
-                    palette::TEXT,
-                    button.label,
-                );
             }
         }
-        self.draw_station_chrome(panel, out);
-        self.draw_workstation_controls(panel, out);
-        // Polymorph strip beside the station's output slot — only while
-        // two or more recipes conflict; a quiet grid emits nothing.
-        if self.conflict.is_active() {
-            if let Some(anchor) = self.output_slot_rect(viewport_w, viewport_h) {
-                self.conflict.render(anchor, 1, vw as u32, vh as u32, out);
+    }
+
+    fn draw_enchant_tier_button(&self, button: &UiButtonRect, out: &mut UiDrawList) {
+        let tier = button.id as usize;
+        let enabled = self.enchanting_row_enabled(tier);
+        let selected = self.selected_enchant_tier == Some(tier);
+        draw_button(out, button.rect, button_face(enabled), selected);
+        let color = if enabled { palette::WARNING } else { palette::BUTTON_DISABLED_TEXT };
+        let label = ["I", "II", "III"][tier];
+        out.text_str(button.rect.x + 3, button.rect.y + 5, 1, color, label);
+    }
+
+    fn draw_recipe_button(&self, button: &UiButtonRect, out: &mut UiDrawList) {
+        let index = button.id as usize;
+        let loom = self.schema.menu_id == 18;
+        let selected = if loom {
+            self.selected_loom_pattern == Some(index)
+        } else {
+            self.selected_stonecutter_recipe == Some(index)
+        };
+        let face = if selected { palette::SLOT_HOVER } else { palette::BUTTON };
+        draw_button(out, button.rect, face, selected);
+        if !loom {
+            if let Some(recipe) = self.stonecutter_recipes.get(index) {
+                let icon = UiRect::new(button.rect.x + 1, button.rect.y + 1, 14, 14);
+                out.item_icon_str(icon, recipe);
             }
+            return;
         }
-        if let Some(cursor) = self.cursor.clone().filter(|s| !s.is_empty()) {
-            let rect = UiRect::new(vw - 24, vh - 24, 20, 20);
-            out.fill_rect(rect, palette::SLOT);
-            out.border_rect(rect, palette::BUTTON_BORDER_HOVER, 1);
-            if cursor.namespaced_id.is_empty() {
-                out.fill_rect(UiRect::new(rect.x + 3, rect.y + 3, 14, 14), palette::ACCENT);
-            } else {
-                out.item_icon_str(
-                    UiRect::new(rect.x + 2, rect.y + 2, 16, 16),
-                    &cursor.namespaced_id,
-                );
-            }
-            if cursor.count > 1 {
-                out.text(
-                    rect.right() - 2 - text_width(&cursor.count.to_string(), 1) as i32,
-                    rect.bottom() - 9,
-                    1,
-                    palette::TEXT,
-                    cursor.count.to_string(),
-                );
-            }
+        let pattern = self.loom_patterns.get(index).map(String::as_str).unwrap_or("");
+        let (x, y) = (button.rect.x + 4, button.rect.y + 3);
+        out.text(x, y, 1, palette::TEXT_DARK, pattern_mark(pattern));
+    }
+
+    /// Carried stack in the bottom-right screen corner.
+    fn draw_cursor(&self, vw: i32, vh: i32, out: &mut UiDrawList) {
+        let Some(cursor) = self.cursor.clone().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let rect = UiRect::new(vw - 24, vh - 24, 20, 20);
+        draw_frame(out, rect, palette::SLOT, palette::BUTTON_BORDER_HOVER);
+        if cursor.namespaced_id.is_empty() {
+            out.fill_rect(UiRect::new(rect.x + 3, rect.y + 3, 14, 14), palette::ACCENT);
+        } else {
+            let icon = UiRect::new(rect.x + 2, rect.y + 2, 16, 16);
+            out.item_icon_str(icon, &cursor.namespaced_id);
         }
-        if let (Some(item), Some(rect)) = (self.tooltip_item(), layout.tooltip) {
-            out.fill_rect(rect, palette::PANEL);
-            out.border_rect(rect, palette::PANEL_BORDER, 1);
-            let lines = self.tooltip_display_lines(&item, viewport_w, viewport_h);
-            let mut y = rect.y + 3;
-            for (text, color) in lines {
-                if y + 8 > rect.bottom() - 2 {
-                    break;
-                }
-                let clipped = clip_text(&text, (rect.w as i32 - 6).max(1));
-                out.text(rect.x + 3, y, 1, color, clipped);
-                y += 10;
+        draw_count_label(out, rect, cursor.count);
+    }
+
+    /// Tooltip frame with pixel-clipped, row-budgeted lines.
+    fn draw_tooltip(&self, rect: UiRect, viewport_w: f32, viewport_h: f32, out: &mut UiDrawList) {
+        let Some(item) = self.tooltip_item() else {
+            return;
+        };
+        draw_frame(out, rect, palette::PANEL, palette::PANEL_BORDER);
+        let mut y = rect.y + 3;
+        for (text, color) in self.tooltip_display_lines(&item, viewport_w, viewport_h) {
+            if y + 8 > rect.bottom() - 2 {
+                break;
             }
+            let clipped = clip_text(&text, (rect.w as i32 - 6).max(1));
+            out.text(rect.x + 3, y, 1, color, clipped);
+            y += 10;
         }
     }
 
@@ -2201,20 +2126,12 @@ impl ContainerScreenState {
         gui_scale: f32,
         out: &mut UiDrawList,
     ) {
-        if !viewport_w.is_finite()
-            || !viewport_h.is_finite()
-            || viewport_w <= 0.0
-            || viewport_h <= 0.0
-        {
+        if viewport_px(viewport_w, viewport_h).is_none() {
             return;
         }
         let mut native = UiDrawList::new();
         self.render(viewport_w, viewport_h, &mut native);
-        let scale = if gui_scale.is_finite() {
-            gui_scale.clamp(1.0, 4.0)
-        } else {
-            1.0
-        };
+        let scale = clamped_gui_scale(gui_scale);
         let logical_w = (viewport_w / scale).max(1.0);
         let logical_h = (viewport_h / scale).max(1.0);
         let factor = self.scale_factor(viewport_w, viewport_h, scale);
@@ -2255,419 +2172,443 @@ impl ContainerScreenState {
     }
 }
 
+/// Physical viewport in whole pixels, or `None` when it is degenerate.
+fn viewport_px(w: f32, h: f32) -> Option<(i32, i32)> {
+    (w.is_finite() && h.is_finite() && w > 0.0 && h > 0.0).then_some((w as i32, h as i32))
+}
+
+/// GUI scale clamped to the supported `1..=4` range (`1.0` when not finite).
+fn clamped_gui_scale(scale: f32) -> f32 {
+    if scale.is_finite() { scale.clamp(1.0, 4.0) } else { 1.0 }
+}
+
+/// Content-box-local rectangle (no panel origin).
+fn local_rect(x: i32, y: i32, w: i32, h: i32) -> UiRect {
+    UiRect::new(x, y, w as u32, h as u32)
+}
+
+/// GUI-space rectangle at `(x, y)` inside a panel's [`CONTENT_PAD`] box.
+fn content_rect(panel: UiRect, x: i32, y: i32, w: i32, h: i32) -> UiRect {
+    let local = local_rect(x, y, w, h);
+    UiRect::new(panel.x + CONTENT_PAD + local.x, panel.y + CONTENT_PAD + local.y, local.w, local.h)
+}
+
+/// Filled rectangle with a 1-px outline — every menu control, well and card.
+fn draw_frame(out: &mut UiDrawList, rect: UiRect, fill: UiColor, border: UiColor) {
+    out.fill_rect(rect, fill);
+    out.border_rect(rect, border, 1);
+}
+
+/// Button face plus its selection ring (2-px highlight when selected).
+fn draw_button(out: &mut UiDrawList, rect: UiRect, face: UiColor, selected: bool) {
+    out.fill_rect(rect, face);
+    let (border, thickness) = if selected {
+        (palette::BUTTON_BORDER_HOVER, 2)
+    } else {
+        (palette::BUTTON_BORDER, 1)
+    };
+    out.border_rect(rect, border, thickness);
+}
+
+/// Enabled/gated button face; `gated` keeps the vanilla disabled grey.
+fn button_face(enabled: bool) -> UiColor {
+    if enabled { palette::BUTTON } else { palette::BUTTON_DISABLED }
+}
+
+/// Bottom-right stack-count label of a slot or cursor stack.
+fn draw_count_label(out: &mut UiDrawList, rect: UiRect, count: u8) {
+    if count < 2 {
+        return;
+    }
+    let label = count.to_string();
+    let x = rect.right() - 2 - text_width(&label, 1) as i32;
+    out.text(x, rect.bottom() - 9, 1, palette::TEXT, label);
+}
+
+/// Single-glyph mark of a namespaced pattern id (`minecraft:base` -> `B`).
+fn pattern_mark(pattern: &str) -> String {
+    pattern
+        .rsplit(':')
+        .next()
+        .and_then(|path| path.chars().next())
+        .unwrap_or('?')
+        .to_ascii_uppercase()
+        .to_string()
+}
+
+/// Vanilla arrow at content-box `(x, y, w, h)`.
+fn draw_station_arrow(out: &mut UiDrawList, panel: UiRect, r: (i32, i32, i32, i32), filled: bool) {
+    draw_vanilla_arrow(out, content_rect(panel, r.0, r.1, r.2, r.3), filled);
+}
+
+/// Content-box station caption, localized through [`tr`].
+fn draw_station_caption(
+    out: &mut UiDrawList,
+    panel: UiRect,
+    (x, y): (i32, i32),
+    lang: UiLang,
+    color: UiColor,
+    en: &'static str,
+    ja: &'static str,
+) {
+    let (px, py) = (panel.x + CONTENT_PAD + x, panel.y + CONTENT_PAD + y);
+    out.text_str(px, py, 1, color, tr(lang, en, ja));
+}
+
+/// Paged recipe/pattern selector grid: `cols × rows` cells at a fixed pitch,
+/// addressed row-major from `scroll_row * cols` so scrolling moves whole rows.
+#[derive(Clone, Copy)]
+struct RecipeGrid {
+    x: i32,
+    y: i32,
+    cell_w: i32,
+    cell_h: i32,
+    cols: usize,
+    rows: usize,
+    label: &'static str,
+}
+
+impl RecipeGrid {
+    const LOOM: Self = Self { x: 60, y: 13, cell_w: 14, cell_h: 14, cols: 4, rows: 4, label: "pattern" };
+    const STONECUTTER: Self =
+        Self { x: 52, y: 14, cell_w: 16, cell_h: 18, cols: 4, rows: 3, label: "recipe" };
+
+    /// Content-box rect of the cell at `(col, row)`.
+    fn cell_rect(self, panel: UiRect, col: usize, row: usize) -> UiRect {
+        let (x, y) = (self.x + col as i32 * self.cell_w, self.y + row as i32 * self.cell_h);
+        content_rect(panel, x, y, self.cell_w, self.cell_h)
+    }
+
+    /// Entry index of the cell under a content-box point, when in range.
+    fn index_at(self, lx: i32, ly: i32, scroll_row: usize, len: usize) -> Option<usize> {
+        let (w, h) = (self.cell_w * self.cols as i32, self.cell_h * self.rows as i32);
+        if !(self.x..self.x + w).contains(&lx) || !(self.y..self.y + h).contains(&ly) {
+            return None;
+        }
+        let (col, row) = ((lx - self.x) / self.cell_w, (ly - self.y) / self.cell_h);
+        let index = scroll_row * self.cols + (row * self.cols as i32 + col) as usize;
+        (index < len).then_some(index)
+    }
+
+    /// Button rects for every visible, in-range entry.
+    fn buttons(self, panel: UiRect, scroll_row: usize, len: usize) -> Vec<UiButtonRect> {
+        let mut buttons = Vec::new();
+        for row in 0..self.rows {
+            for col in 0..self.cols {
+                let index = scroll_row * self.cols + row * self.cols + col;
+                if index < len {
+                    let rect = self.cell_rect(panel, col, row);
+                    buttons.push(UiButtonRect { id: index as i32, rect, label: self.label });
+                }
+            }
+        }
+        buttons
+    }
+
+    /// Scrollbar thumb beside the grid: dormant while one page covers `len`,
+    /// then advanced `travel` px per scrolled row.
+    fn draw_scroll_thumb(
+        self,
+        out: &mut UiDrawList,
+        panel: UiRect,
+        scroll_row: usize,
+        len: usize,
+        (x, y, travel): (i32, i32, i32),
+    ) {
+        if len <= self.cols * self.rows {
+            return;
+        }
+        let max_row = len.div_ceil(self.cols).saturating_sub(self.rows);
+        let thumb_y = y + (scroll_row * travel as usize / max_row.max(1)) as i32;
+        out.fill_rect(content_rect(panel, x, thumb_y, 1, 12), palette::ACCENT);
+    }
+}
+
+
 impl ContainerScreenState {
+    /// Menu-specific interactive controls (rename field, beacon picker,
+    /// villager trade list) drawn above the static station chrome.
     fn draw_workstation_controls(&self, panel: UiRect, out: &mut UiDrawList) {
-        let px = panel.x + CONTENT_PAD;
-        let py = panel.y + CONTENT_PAD;
-        let lang = self.ui_language;
         match self.schema.menu_id {
-            8 => {
-                let field = UiRect::new(px + 29, py + 27, 96, 12);
-                out.fill_rect(field, palette::TOOLTIP_BG);
-                out.border_rect(
-                    field,
-                    if self.rename_focused {
-                        palette::TEXT_FOCUSED
-                    } else {
-                        palette::TEXT_DIM
-                    },
-                    1,
-                );
-                let mut text = clip_text(&self.rename_text, field.w.saturating_sub(6) as i32);
-                if self.rename_focused && text_width(&text, 1) + 8 <= field.w {
-                    text.push('|');
-                }
-                out.text(field.x + 3, field.y + 2, 1, palette::TEXT, text);
-                let cost = self.property(0);
-                let footer = if cost > 0 {
-                    format!("Enchantment Cost: {cost}")
-                } else {
-                    tr(lang, "Too Expensive!", "高すぎます！").to_owned()
-                };
-                out.text(
-                    px + 8,
-                    py + 76,
-                    1,
-                    if cost > 0 {
-                        palette::ACCENT
-                    } else {
-                        palette::DANGER
-                    },
-                    clip_text(&footer, panel.w as i32 - 20),
-                );
-            }
-            9 => {
-                let controls = [
-                    (0, 24, 54, tr(lang, "Speed", "移動速度"), 1),
-                    (2, 72, 54, tr(lang, "Haste", "採掘速度"), 1),
-                    (10, 24, 72, tr(lang, "Resist", "耐性"), 2),
-                    (7, 72, 72, tr(lang, "Jump", "跳躍"), 2),
-                    (4, 24, 90, tr(lang, "Strength", "攻撃力"), 3),
-                    (9, 24, 108, tr(lang, "Regen", "再生"), 4),
-                    (-1, 72, 108, tr(lang, "Secondary", "第2効果"), 4),
-                ];
-                let level = self.property(0).clamp(0, 4);
-                for (id, x, y, label, tier) in controls {
-                    let rect = UiRect::new(px + x, py + y, 44, 14);
-                    let enabled = level >= tier;
-                    let selected = if id == -1 {
-                        self.beacon_secondary.is_some()
-                    } else if id == 9 {
-                        self.beacon_secondary == Some(9)
-                    } else {
-                        self.beacon_primary == Some(id)
-                    };
-                    out.fill_rect(
-                        rect,
-                        if enabled {
-                            palette::BUTTON
-                        } else {
-                            palette::BUTTON_DISABLED
-                        },
-                    );
-                    out.border_rect(
-                        rect,
-                        if selected {
-                            palette::BUTTON_BORDER_HOVER
-                        } else {
-                            palette::BUTTON_BORDER
-                        },
-                        if selected { 2 } else { 1 },
-                    );
-                    out.text(
-                        rect.x + 2,
-                        rect.y + 3,
-                        1,
-                        if enabled {
-                            palette::TEXT_DARK
-                        } else {
-                            palette::BUTTON_DISABLED_TEXT
-                        },
-                        label,
-                    );
-                }
-                for (y, label, color, enabled) in [
-                    (72, tr(lang, "Confirm", "決定"), palette::ACCENT, self.beacon_confirm_enabled()),
-                    (90, tr(lang, "Cancel", "キャンセル"), palette::DANGER, true),
-                ] {
-                    let rect = UiRect::new(px + 158, py + y, 30, 14);
-                    out.fill_rect(rect, if enabled { palette::BUTTON } else { palette::BUTTON_DISABLED });
-                    out.border_rect(rect, palette::BUTTON_BORDER, 1);
-                    out.text(
-                        rect.x + 2,
-                        rect.y + 3,
-                        1,
-                        if enabled { color } else { palette::BUTTON_DISABLED_TEXT },
-                        label,
-                    );
-                }
-            }
-            19 => {
-                let first = self.merchant_scroll_offset.min(self.merchant_offers.len());
-                for row in 0..7 {
-                    let index = first + row;
-                    let Some(offer) = self.merchant_offers.get(index) else {
-                        continue;
-                    };
-                    let rect = UiRect::new(px + 8, py + 18 + row as i32 * 16, 96, 16);
-                    if self.selected_trade_index == Some(index) {
-                        out.fill_rect(rect, palette::SLOT_HOVER);
-                    }
-                    out.border_rect(
-                        rect,
-                        if self.selected_trade_index == Some(index) {
-                            palette::BUTTON_BORDER_HOVER
-                        } else {
-                            palette::SEPARATOR
-                        },
-                        1,
-                    );
-                    out.item_icon_str(UiRect::new(rect.x + 2, rect.y + 2, 11, 11), &offer.input1);
-                    if let Some(input2) = &offer.input2 {
-                        out.item_icon_str(UiRect::new(rect.x + 17, rect.y + 2, 11, 11), input2);
-                    }
-                    out.text_str(rect.x + 30, rect.y + 3, 1, palette::TEXT_DARK, "→");
-                    out.item_icon_str(UiRect::new(rect.x + 41, rect.y + 2, 11, 11), &offer.output);
-                    let cost = if offer.effective_cost < offer.original_cost {
-                        format!("{}>{}", offer.original_cost, offer.effective_cost)
-                    } else {
-                        offer.effective_cost.to_string()
-                    };
-                    let cost_color = if offer.effective_cost < offer.original_cost {
-                        palette::ACCENT
-                    } else {
-                        palette::TEXT_DARK
-                    };
-                    out.text(rect.x + 55, rect.y + 8, 1, cost_color, clip_text(&cost, 40));
-                    if offer.effective_cost < offer.original_cost {
-                        let old = offer.original_cost.to_string();
-                        let line_w = text_width(&old, 1).min(20);
-                        out.fill_rect(
-                            UiRect::new(rect.x + 55, rect.y + 11, line_w, 1),
-                            palette::DANGER,
-                        );
-                    }
-                    if offer.out_of_stock {
-                        out.text_str(rect.right() - 8, rect.y + 3, 1, palette::DANGER, "X");
-                    }
-                }
-                out.text(
-                    px + 108,
-                    py + 14,
-                    1,
-                    palette::TEXT_DARK,
-                    format!("Level {}", self.property(1).clamp(1, 5)),
-                );
-                out.progress_bar(
-                    UiRect::new(px + 108, py + 26, 96, 5),
-                    f32::from(self.property(2)).clamp(0.0, 1.0),
-                    palette::XP,
-                    palette::BUTTON_DISABLED,
-                    palette::PANEL_BORDER,
-                );
-            }
+            8 => self.draw_rename_field(panel, out),
+            9 => self.draw_beacon_picker(panel, out),
+            19 => self.draw_merchant_offers(panel, out),
             _ => {}
         }
     }
 
-    fn draw_station_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
-        let px = panel.x + CONTENT_PAD;
-        let py = panel.y + CONTENT_PAD;
+    /// Anvil rename field, its focus caret and the enchantment cost footer.
+    fn draw_rename_field(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let field = content_rect(panel, 29, 27, 96, 12);
+        let border = if self.rename_focused { palette::TEXT_FOCUSED } else { palette::TEXT_DIM };
+        draw_frame(out, field, palette::TOOLTIP_BG, border);
+        let mut text = clip_text(&self.rename_text, field.w.saturating_sub(6) as i32);
+        if self.rename_focused && text_width(&text, 1) + 8 <= field.w {
+            text.push('|');
+        }
+        out.text(field.x + 3, field.y + 2, 1, palette::TEXT, text);
+        let cost = self.property(0);
+        let (footer, color) = if cost > 0 {
+            (format!("Enchantment Cost: {cost}"), palette::ACCENT)
+        } else {
+            (tr(self.ui_language, "Too Expensive!", "高すぎます！").to_owned(), palette::DANGER)
+        };
+        out.text(px + 8, py + 76, 1, color, clip_text(&footer, panel.w as i32 - 20));
+    }
+
+    /// Whether a beacon picker entry is the current primary/secondary choice.
+    fn beacon_control_selected(&self, effect: i32) -> bool {
+        match effect {
+            -1 => self.beacon_secondary.is_some(),
+            9 => self.beacon_secondary == Some(9),
+            _ => self.beacon_primary == Some(effect),
+        }
+    }
+
+    /// Tier-gated beacon effect picker plus the confirm/cancel footer pair.
+    fn draw_beacon_picker(&self, panel: UiRect, out: &mut UiDrawList) {
         let lang = self.ui_language;
+        let level = self.property(0).clamp(0, 4);
+        for &(effect, x, y, tier, en, ja) in &BEACON_CONTROLS {
+            let enabled = level >= tier;
+            let rect = content_rect(panel, x, y, BEACON_CONTROL_W, BEACON_CONTROL_H);
+            let selected = self.beacon_control_selected(effect);
+            draw_button(out, rect, button_face(enabled), selected);
+            let color = if enabled { palette::TEXT_DARK } else { palette::BUTTON_DISABLED_TEXT };
+            out.text(rect.x + 2, rect.y + 3, 1, color, tr(lang, en, ja));
+        }
+        let confirm = self.beacon_confirm_enabled();
+        let footer = [
+            (BEACON_CONFIRM_RECT, "Confirm", "決定", palette::ACCENT, confirm),
+            (BEACON_CANCEL_RECT, "Cancel", "キャンセル", palette::DANGER, true),
+        ];
+        for ((x, y, w, h), en, ja, color, enabled) in footer {
+            let rect = content_rect(panel, x, y, w, h);
+            draw_button(out, rect, button_face(enabled), false);
+            let color = if enabled { color } else { palette::BUTTON_DISABLED_TEXT };
+            out.text(rect.x + 2, rect.y + 3, 1, color, tr(lang, en, ja));
+        }
+    }
+
+    /// Scrolled villager trade rows, their level chip and XP progress bar.
+    fn draw_merchant_offers(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let first = self.merchant_scroll_offset.min(self.merchant_offers.len());
+        for row in 0..7 {
+            let index = first + row;
+            let Some(offer) = self.merchant_offers.get(index) else {
+                continue;
+            };
+            let rect = content_rect(panel, 8, 18 + row as i32 * 16, 96, 16);
+            let selected = self.selected_trade_index == Some(index);
+            if selected {
+                out.fill_rect(rect, palette::SLOT_HOVER);
+            }
+            let border = if selected { palette::BUTTON_BORDER_HOVER } else { palette::SEPARATOR };
+            out.border_rect(rect, border, 1);
+            let (x, y) = (rect.x, rect.y);
+            out.item_icon_str(UiRect::new(x + 2, y + 2, 11, 11), &offer.input1);
+            if let Some(input2) = &offer.input2 {
+                out.item_icon_str(UiRect::new(x + 17, y + 2, 11, 11), input2);
+            }
+            out.text_str(x + 30, y + 3, 1, palette::TEXT_DARK, "→");
+            out.item_icon_str(UiRect::new(x + 41, y + 2, 11, 11), &offer.output);
+            // A discounted trade shows `original>effective` with the old price
+            // struck through.
+            let discounted = offer.effective_cost < offer.original_cost;
+            let cost = if discounted {
+                format!("{}>{}", offer.original_cost, offer.effective_cost)
+            } else {
+                offer.effective_cost.to_string()
+            };
+            let color = if discounted { palette::ACCENT } else { palette::TEXT_DARK };
+            out.text(x + 55, y + 8, 1, color, clip_text(&cost, 40));
+            if discounted {
+                let line_w = text_width(&offer.original_cost.to_string(), 1).min(20);
+                out.fill_rect(UiRect::new(x + 55, y + 11, line_w, 1), palette::DANGER);
+            }
+            if offer.out_of_stock {
+                out.text_str(rect.right() - 8, y + 3, 1, palette::DANGER, "X");
+            }
+        }
+        out.text(px + 108, py + 14, 1, palette::TEXT_DARK, format!("Level {}", self.property(1).clamp(1, 5)));
+        let bar = content_rect(panel, 108, 26, 96, 5);
+        let frac = f32::from(self.property(2)).clamp(0.0, 1.0);
+        out.progress_bar(bar, frac, palette::XP, palette::BUTTON_DISABLED, palette::PANEL_BORDER);
+    }
+
+    /// Static station artwork: arrows, captions, dividers and station cards.
+    /// Every offset is content-box local.
+    fn draw_station_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let lang = self.ui_language;
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
         match self.schema.menu_id {
             0..=5 => {
-                let rows = (self.schema.menu_id + 1) as i32;
-                let divider_y = py + 29 + rows * SLOT_SIZE;
-                out.fill_rect(
-                    UiRect::new(px + 4, divider_y, panel.w.saturating_sub(16), 1),
-                    palette::SEPARATOR,
-                );
+                let divider_y = py + 29 + (self.schema.menu_id + 1) as i32 * SLOT_SIZE;
+                let width = panel.w.saturating_sub(16);
+                out.fill_rect(UiRect::new(px + 4, divider_y, width, 1), palette::SEPARATOR);
             }
             6 => {
-                draw_vanilla_arrow(out, UiRect::new(px + 94, py + 26, 22, 18), true);
-                out.text_str(px + 92, py + 46, 1, palette::TEXT_DIM, tr(lang, "DISPENSER", "発射装置"));
+                draw_station_arrow(out, panel, (94, 26, 22, 18), true);
+                draw_station_caption(out, panel, (92, 46), lang, palette::TEXT_DIM, "DISPENSER", "発射装置");
             }
-            7 => {
-                out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, tr(lang, "CRAFTER", "クラフター"));
-                let arrow = UiRect::new(px + 104, py + 31, 20, 18);
-                draw_vanilla_arrow(out, arrow, self.property(9) != 0);
-                if self.property(9) != 0 {
-                    out.border_rect(arrow, palette::BUTTON_BORDER_HOVER, 1);
-                }
-                out.text_str(
-                    px + 108,
-                    py + 50,
-                    1,
-                    if self.property(9) != 0 {
-                        palette::ACCENT
-                    } else {
-                        palette::TEXT_DIM
-                    },
-                    if self.property(9) != 0 {
-                        tr(lang, "TRIGGERED", "起動")
-                    } else {
-                        tr(lang, "IDLE", "待機")
-                    },
-                );
-            }
-            8 => {
-                draw_vanilla_arrow(out, UiRect::new(px + 104, py + 43, 20, 18), true);
-            }
-            9 => {
-                out.text_str(px + 58, py + 103, 1, palette::TEXT_DIM, tr(lang, "Payment", "支払い"));
-            }
+            7 => self.draw_crafter_chrome(panel, out),
+            8 => draw_station_arrow(out, panel, (104, 43, 20, 18), true),
+            9 => draw_station_caption(out, panel, (58, 103), lang, palette::TEXT_DIM, "Payment", "支払い"),
             10 | 14 | 22 => {
-                draw_vanilla_arrow(out, UiRect::new(px + 80, py + 33, 20, 18), true);
-                out.text_str(px + 77, py + 55, 1, palette::TEXT_DIM, tr(lang, "COOK", "調理"));
+                draw_station_arrow(out, panel, (80, 33, 20, 18), true);
+                draw_station_caption(out, panel, (77, 55), lang, palette::TEXT_DIM, "COOK", "調理");
             }
             11 => {
-                out.text_str(px + 34, py + 73, 1, palette::TEXT_DIM, tr(lang, "BREW", "醸造"));
-                draw_vanilla_arrow(out, UiRect::new(px + 77, py + 34, 16, 14), true);
+                draw_station_caption(out, panel, (34, 73), lang, palette::TEXT_DIM, "BREW", "醸造");
+                draw_station_arrow(out, panel, (77, 34, 16, 14), true);
             }
             12 => {
-                draw_vanilla_arrow(out, UiRect::new(px + 91, py + 26, 22, 18), true);
-                out.text_str(px + 91, py + 46, 1, palette::TEXT_DIM, tr(lang, "CRAFT", "作成"));
+                draw_station_arrow(out, panel, (91, 26, 22, 18), true);
+                draw_station_caption(out, panel, (91, 46), lang, palette::TEXT_DIM, "CRAFT", "作成");
             }
-            13 => {
-                out.text_str(px + 66, py + 4, 1, palette::TEXT_DARK, tr(lang, "Enchantments", "エンチャント"));
-                out.fill_rect(UiRect::new(px + 17, py + 20, 22, 18), palette::BUTTON);
-                out.border_rect(
-                    UiRect::new(px + 17, py + 20, 22, 18),
-                    palette::PANEL_BORDER,
-                    1,
-                );
-                out.text_str(px + 22, py + 25, 1, palette::WARNING, tr(lang, "BOOK", "本"));
-                for i in 0..3 {
-                    let y = py + 14 + i * 19;
-                    let clue = self.property((4 + i) as i16);
-                    let level = self.property((7 + i) as i16);
-                    let glyphs = ["ᚠᚢᚦ", "ᚷᚺᚾ", "ᛁᛃᛇ"];
-                    let label = if clue >= 0 {
-                        let resolved = enchantment_clue_label(clue, level);
-                        // Legacy unsynchronized states used to expose the raw
-                        // clue pair. Keep it as a diagnostic suffix only until
-                        // lapis/XP synchronization arrives; fully synchronized
-                        // rows show the resolved enchantment name alone.
-                        if !self.lapis_slot_synced && self.player_experience_level.is_none() {
-                            format!("{resolved} {clue} {level}")
-                        } else {
-                            resolved
-                        }
-                    } else {
-                        glyphs[i as usize].to_owned()
-                    };
-                    let enabled = self.enchanting_row_enabled(i as usize);
-                    out.text(
-                        px + 69,
-                        y + 5,
-                        1,
-                        if enabled { palette::TEXT } else { palette::BUTTON_DISABLED_TEXT },
-                        label,
-                    );
-                    let cost = self.property(i as i16);
-                    out.text(
-                        px + 146,
-                        y + 5,
-                        1,
-                        if enabled {
-                            palette::ACCENT
-                        } else {
-                            palette::DANGER
-                        },
-                        cost.to_string(),
-                    );
-                    out.fill_rect(UiRect::new(px + 62, y + 5, 7, 8), palette::ACCENT);
-                    out.text(px + 64, y + 5, 1, palette::TEXT_DARK, (i + 1).to_string());
-                }
-            }
-            15 => draw_vanilla_arrow(out, UiRect::new(px + 77, py + 26, 34, 24), false),
-            16 => out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, tr(lang, "HOPPER", "ホッパー")),
+            13 => self.draw_enchant_chrome(panel, out),
+            15 => draw_station_arrow(out, panel, (77, 26, 34, 24), false),
+            16 => draw_station_caption(out, panel, (8, 5), lang, palette::TEXT_DARK, "HOPPER", "ホッパー"),
             17 => {
-                out.text_str(px + 61, py + 13, 1, palette::TEXT_DARK, tr(lang, "Lectern", "書見台"));
-                out.text(
-                    px + 64,
-                    py + 61,
-                    1,
-                    palette::TEXT_DIM,
-                    format!("Page {}", self.property(0).max(0) + 1),
-                );
+                draw_station_caption(out, panel, (61, 13), lang, palette::TEXT_DARK, "Lectern", "書見台");
+                let page = format!("Page {}", self.property(0).max(0) + 1);
+                out.text(px + 64, py + 61, 1, palette::TEXT_DIM, page);
             }
-            18 => {
-                out.text_str(px + 60, py + 2, 1, palette::TEXT_DARK, tr(lang, "Pattern", "模様"));
-                out.border_rect(
-                    UiRect::new(px + 119, py + 13, 3, 56),
-                    palette::PANEL_BORDER,
-                    1,
-                );
-                if self.loom_patterns.len() > 16 {
-                    let max = (self.loom_patterns.len().div_ceil(4)).saturating_sub(4);
-                    let thumb_y = py + 14 + (self.loom_scroll_row * 40 / max.max(1)) as i32;
-                    out.fill_rect(UiRect::new(px + 120, thumb_y, 1, 12), palette::ACCENT);
-                }
-                let card = UiRect::new(px + 137, py + 4, 20, 40);
-                out.fill_rect(card, palette::PANEL);
-                out.border_rect(card, palette::PANEL_BORDER, 1);
-                let banner = self
-                    .slots
-                    .first()
-                    .filter(|s| !s.is_empty() && !s.namespaced_id.is_empty())
-                    .map(|s| s.namespaced_id.as_str())
-                    .unwrap_or("minecraft:white_banner");
-                out.item_icon_str(UiRect::new(card.x + 2, card.y + 3, 16, 20), banner);
-                if let Some(index) = self.selected_loom_pattern {
-                    let mark = self
-                        .loom_patterns
-                        .get(index)
-                        .and_then(|p| p.rsplit(':').next())
-                        .and_then(|p| p.chars().next())
-                        .unwrap_or('?')
-                        .to_ascii_uppercase()
-                        .to_string();
-                    out.fill_rect(UiRect::new(card.x + 8, card.y + 9, 5, 7), palette::ACCENT);
-                    out.text(card.x + 8, card.y + 8, 1, palette::TEXT_DARK, mark);
-                    out.text(
-                        card.x + 2,
-                        card.y + 27,
-                        1,
-                        palette::ACCENT,
-                        clip_text(
-                            self.loom_patterns
-                                .get(index)
-                                .map(String::as_str)
-                                .unwrap_or(""),
-                            16,
-                        ),
-                    );
-                }
-            }
-            19 => {
-                out.text_str(px + 108, py + 4, 1, palette::TEXT_DARK, tr(lang, "Villager Trades", "村人取引"));
-            }
-            20 => out.text_str(px + 100, py + 5, 1, palette::TEXT_DARK, tr(lang, "SHULKER BOX", "シュルカー")),
-            21 => {
-                out.text(
-                    px + 8,
-                    py + 30,
-                    1,
-                    palette::TEXT_DIM,
-                    clip_text(tr(lang, "TEMPLATE  BASE  ADDITION", "型 基材 追加"), (panel.w as i32 - 20).max(1)),
-                );
-                draw_vanilla_arrow(out, UiRect::new(px + 61, py + 41, 21, 18), true);
-                let frame = UiRect::new(px + 118, py + 10, 44, 62);
-                out.fill_rect(frame, palette::SLOT);
-                out.border_rect(frame, palette::PANEL_BORDER, 1);
-                let base = self.slots.get(1).filter(|s| !s.is_empty());
-                if let Some(item) = base {
-                    if !item.namespaced_id.is_empty() {
-                        out.item_icon_str(
-                            UiRect::new(frame.x + 12, frame.y + 12, 18, 18),
-                            &item.namespaced_id,
-                        );
-                    }
-                    if let Some(material) = self.slots.get(2).filter(|s| !s.is_empty()) {
-                        if !material.namespaced_id.is_empty() {
-                            out.item_icon_str(
-                                UiRect::new(frame.x + 12, frame.y + 36, 18, 18),
-                                &material.namespaced_id,
-                            );
-                        }
-                        out.fill_rect(
-                            UiRect::new(frame.x + 8, frame.bottom() - 5, 28, 2),
-                            palette::ACCENT,
-                        );
-                    }
-                }
-                if (self.slots.first().is_some_and(|s| !s.is_empty())
-                    || self.slots.get(1).is_some_and(|s| !s.is_empty()))
-                    && self.slots.get(3).is_some_and(UiItemStack::is_empty)
-                {
-                    out.text_str(px + 68, py + 45, 2, palette::DANGER, "X");
-                }
-            }
+            18 => self.draw_loom_chrome(panel, out),
+            19 => draw_station_caption(out, panel, (108, 4), lang, palette::TEXT_DARK, "Villager Trades", "村人取引"),
+            20 => draw_station_caption(out, panel, (100, 5), lang, palette::TEXT_DARK, "SHULKER BOX", "シュルカー"),
+            21 => self.draw_smithing_chrome(panel, out),
             23 => {
-                out.text_str(px + 93, py + 20, 1, palette::TEXT_DARK, tr(lang, "MAP PREVIEW", "地図"));
-                out.border_rect(
-                    UiRect::new(px + 92, py + 34, 50, 38),
-                    palette::PANEL_BORDER,
-                    1,
-                );
+                draw_station_caption(out, panel, (93, 20), lang, palette::TEXT_DARK, "MAP PREVIEW", "地図");
+                out.border_rect(content_rect(panel, 92, 34, 50, 38), palette::PANEL_BORDER, 1);
                 out.text_str(px + 104, py + 48, 1, palette::ACCENT, tr(lang, "MAP", "地図"));
             }
-            24 => {
-                out.text_str(px + 52, py + 2, 1, palette::TEXT_DARK, tr(lang, "Stonecutting", "石切り"));
-                out.border_rect(
-                    UiRect::new(px + 118, py + 14, 3, 54),
-                    palette::PANEL_BORDER,
-                    1,
-                );
-                if self.stonecutter_recipes.len() > 12 {
-                    let max = (self.stonecutter_recipes.len().div_ceil(4)).saturating_sub(3);
-                    let thumb_y = py + 15 + (self.stonecutter_scroll_row * 38 / max.max(1)) as i32;
-                    out.fill_rect(UiRect::new(px + 119, thumb_y, 1, 12), palette::ACCENT);
-                }
-            }
+            24 => self.draw_stonecutter_chrome(panel, out),
             _ => {}
         }
+    }
+
+    /// Crafter trigger arrow, its state frame and the TRIGGERED/IDLE caption.
+    fn draw_crafter_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let lang = self.ui_language;
+        let triggered = self.property(9) != 0;
+        out.text_str(px + 8, py + 5, 1, palette::TEXT_DARK, tr(lang, "CRAFTER", "クラフター"));
+        let arrow = content_rect(panel, 104, 31, 20, 18);
+        draw_vanilla_arrow(out, arrow, triggered);
+        if triggered {
+            out.border_rect(arrow, palette::BUTTON_BORDER_HOVER, 1);
+        }
+        let (color, label) = if triggered {
+            (palette::ACCENT, tr(lang, "TRIGGERED", "起動"))
+        } else {
+            (palette::TEXT_DIM, tr(lang, "IDLE", "待機"))
+        };
+        out.text_str(px + 108, py + 50, 1, color, label);
+    }
+
+    /// Enchantment table: book slot and three clue/cost rows with tier pips.
+    fn draw_enchant_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let lang = self.ui_language;
+        out.text_str(px + 66, py + 4, 1, palette::TEXT_DARK, tr(lang, "Enchantments", "エンチャント"));
+        draw_frame(out, content_rect(panel, 17, 20, 22, 18), palette::BUTTON, palette::PANEL_BORDER);
+        out.text_str(px + 22, py + 25, 1, palette::WARNING, tr(lang, "BOOK", "本"));
+        for i in 0..3 {
+            let y = py + 14 + i * 19;
+            let (clue, level) = (self.property((4 + i) as i16), self.property((7 + i) as i16));
+            // Legacy unsynchronized states used to expose the raw clue pair.
+            // Keep it as a diagnostic suffix only until lapis/XP
+            // synchronization arrives; synchronized rows show the name alone.
+            let label = if clue >= 0 {
+                let resolved = enchantment_clue_label(clue, level);
+                if self.lapis_slot_synced || self.player_experience_level.is_some() {
+                    resolved
+                } else {
+                    format!("{resolved} {clue} {level}")
+                }
+            } else {
+                ["ᚠᚢᚦ", "ᚷᚺᚾ", "ᛁᛃᛇ"][i as usize].to_owned()
+            };
+            let enabled = self.enchanting_row_enabled(i as usize);
+            let text_color = if enabled { palette::TEXT } else { palette::BUTTON_DISABLED_TEXT };
+            let cost_color = if enabled { palette::ACCENT } else { palette::DANGER };
+            out.text(px + 69, y + 5, 1, text_color, label);
+            out.text(px + 146, y + 5, 1, cost_color, self.property(i as i16).to_string());
+            out.fill_rect(UiRect::new(px + 62, y + 5, 7, 8), palette::ACCENT);
+            out.text(px + 64, y + 5, 1, palette::TEXT_DARK, (i + 1).to_string());
+        }
+    }
+
+    /// Loom pattern grid frame, its scroll thumb and the banner preview card.
+    fn draw_loom_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let lang = self.ui_language;
+        out.text_str(px + 60, py + 2, 1, palette::TEXT_DARK, tr(lang, "Pattern", "模様"));
+        out.border_rect(content_rect(panel, 119, 13, 3, 56), palette::PANEL_BORDER, 1);
+        let patterns = self.loom_patterns.len();
+        let grid = RecipeGrid::LOOM;
+        grid.draw_scroll_thumb(out, panel, self.loom_scroll_row, patterns, (120, 14, 40));
+        let card = content_rect(panel, 137, 4, 20, 40);
+        draw_frame(out, card, palette::PANEL, palette::PANEL_BORDER);
+        let banner = self
+            .slots
+            .first()
+            .filter(|s| !s.is_empty() && !s.namespaced_id.is_empty())
+            .map(|s| s.namespaced_id.as_str())
+            .unwrap_or("minecraft:white_banner");
+        out.item_icon_str(UiRect::new(card.x + 2, card.y + 3, 16, 20), banner);
+        let Some(index) = self.selected_loom_pattern else {
+            return;
+        };
+        let pattern = self.loom_patterns.get(index).map(String::as_str).unwrap_or("");
+        out.fill_rect(UiRect::new(card.x + 8, card.y + 9, 5, 7), palette::ACCENT);
+        out.text(card.x + 8, card.y + 8, 1, palette::TEXT_DARK, pattern_mark(pattern));
+        out.text(card.x + 2, card.y + 27, 1, palette::ACCENT, clip_text(pattern, 16));
+    }
+
+    /// Smithing template/base/addition strip and the result frame.
+    fn draw_smithing_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let lang = self.ui_language;
+        let caption = tr(lang, "TEMPLATE  BASE  ADDITION", "型 基材 追加");
+        out.text(px + 8, py + 30, 1, palette::TEXT_DIM, clip_text(caption, (panel.w as i32 - 20).max(1)));
+        draw_station_arrow(out, panel, (61, 41, 21, 18), true);
+        let frame = content_rect(panel, 118, 10, 44, 62);
+        draw_frame(out, frame, palette::SLOT, palette::PANEL_BORDER);
+        let base = self.slots.get(1).filter(|s| !s.is_empty());
+        if let Some(item) = base {
+            if !item.namespaced_id.is_empty() {
+                let icon = UiRect::new(frame.x + 12, frame.y + 12, 18, 18);
+                out.item_icon_str(icon, &item.namespaced_id);
+            }
+            if let Some(material) = self.slots.get(2).filter(|s| !s.is_empty()) {
+                if !material.namespaced_id.is_empty() {
+                    let icon = UiRect::new(frame.x + 12, frame.y + 36, 18, 18);
+                    out.item_icon_str(icon, &material.namespaced_id);
+                }
+                let accent = UiRect::new(frame.x + 8, frame.bottom() - 5, 28, 2);
+                out.fill_rect(accent, palette::ACCENT);
+            }
+        }
+        let pending = self.slots.first().is_some_and(|s| !s.is_empty())
+            || self.slots.get(1).is_some_and(|s| !s.is_empty());
+        if pending && self.slots.get(3).is_some_and(UiItemStack::is_empty) {
+            out.text_str(px + 68, py + 45, 2, palette::DANGER, "X");
+        }
+    }
+
+    /// Stonecutting recipe grid frame and its scroll thumb.
+    fn draw_stonecutter_chrome(&self, panel: UiRect, out: &mut UiDrawList) {
+        let (px, py) = (panel.x + CONTENT_PAD, panel.y + CONTENT_PAD);
+        let lang = self.ui_language;
+        out.text_str(px + 52, py + 2, 1, palette::TEXT_DARK, tr(lang, "Stonecutting", "石切り"));
+        out.border_rect(content_rect(panel, 118, 14, 3, 54), palette::PANEL_BORDER, 1);
+        let recipes = self.stonecutter_recipes.len();
+        let grid = RecipeGrid::STONECUTTER;
+        grid.draw_scroll_thumb(out, panel, self.stonecutter_scroll_row, recipes, (119, 15, 38));
     }
 }
 
@@ -2689,116 +2630,88 @@ fn enchantment_clue_label(clue: i16, level: i16) -> String {
     format!("{base} {}", roman_numeral(level.max(1)))
 }
 
+/// Protocol-767 `minecraft:enchantment` registry order used by synced clues.
+const ENCHANTMENT_CLUES: [&str; 42] = [
+    "minecraft:aqua_affinity",
+    "minecraft:bane_of_arthropods",
+    "minecraft:binding_curse",
+    "minecraft:blast_protection",
+    "minecraft:breach",
+    "minecraft:channeling",
+    "minecraft:density",
+    "minecraft:depth_strider",
+    "minecraft:efficiency",
+    "minecraft:feather_falling",
+    "minecraft:fire_aspect",
+    "minecraft:fire_protection",
+    "minecraft:flame",
+    "minecraft:fortune",
+    "minecraft:frost_walker",
+    "minecraft:impaling",
+    "minecraft:infinity",
+    "minecraft:knockback",
+    "minecraft:looting",
+    "minecraft:loyalty",
+    "minecraft:luck_of_the_sea",
+    "minecraft:lure",
+    "minecraft:mending",
+    "minecraft:multishot",
+    "minecraft:piercing",
+    "minecraft:power",
+    "minecraft:projectile_protection",
+    "minecraft:protection",
+    "minecraft:punch",
+    "minecraft:quick_charge",
+    "minecraft:respiration",
+    "minecraft:riptide",
+    "minecraft:sharpness",
+    "minecraft:silk_touch",
+    "minecraft:smite",
+    "minecraft:soul_speed",
+    "minecraft:sweeping_edge",
+    "minecraft:swift_sneak",
+    "minecraft:thorns",
+    "minecraft:unbreaking",
+    "minecraft:vanishing_curse",
+    "minecraft:wind_burst",
+];
+
+/// Resolve a synced enchantment clue id; unknown ids keep the sentinel name.
 fn enchantment_clue_name(clue: i16) -> &'static str {
-    match clue {
-        0 => "minecraft:aqua_affinity",
-        1 => "minecraft:bane_of_arthropods",
-        2 => "minecraft:binding_curse",
-        3 => "minecraft:blast_protection",
-        4 => "minecraft:breach",
-        5 => "minecraft:channeling",
-        6 => "minecraft:density",
-        7 => "minecraft:depth_strider",
-        8 => "minecraft:efficiency",
-        9 => "minecraft:feather_falling",
-        10 => "minecraft:fire_aspect",
-        11 => "minecraft:fire_protection",
-        12 => "minecraft:flame",
-        13 => "minecraft:fortune",
-        14 => "minecraft:frost_walker",
-        15 => "minecraft:impaling",
-        16 => "minecraft:infinity",
-        17 => "minecraft:knockback",
-        18 => "minecraft:looting",
-        19 => "minecraft:loyalty",
-        20 => "minecraft:luck_of_the_sea",
-        21 => "minecraft:lure",
-        22 => "minecraft:mending",
-        23 => "minecraft:multishot",
-        24 => "minecraft:piercing",
-        25 => "minecraft:power",
-        26 => "minecraft:projectile_protection",
-        27 => "minecraft:protection",
-        28 => "minecraft:punch",
-        29 => "minecraft:quick_charge",
-        30 => "minecraft:respiration",
-        31 => "minecraft:riptide",
-        32 => "minecraft:sharpness",
-        33 => "minecraft:silk_touch",
-        34 => "minecraft:smite",
-        35 => "minecraft:soul_speed",
-        36 => "minecraft:sweeping_edge",
-        37 => "minecraft:swift_sneak",
-        38 => "minecraft:thorns",
-        39 => "minecraft:unbreaking",
-        40 => "minecraft:vanishing_curse",
-        41 => "minecraft:wind_burst",
-        _ => "minecraft:unknown",
-    }
+    usize::try_from(clue)
+        .ok()
+        .and_then(|index| ENCHANTMENT_CLUES.get(index))
+        .copied()
+        .unwrap_or("minecraft:unknown")
 }
+
+/// Uppercase Roman numerals for levels `1..=10`; other levels stay decimal.
+const ROMAN_NUMERALS: [&str; 10] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
 
 fn roman_numeral(level: i16) -> String {
-    match level {
-        1 => "I".to_owned(),
-        2 => "II".to_owned(),
-        3 => "III".to_owned(),
-        4 => "IV".to_owned(),
-        5 => "V".to_owned(),
-        6 => "VI".to_owned(),
-        7 => "VII".to_owned(),
-        8 => "VIII".to_owned(),
-        9 => "IX".to_owned(),
-        10 => "X".to_owned(),
-        other => other.to_string(),
-    }
+    usize::try_from(level)
+        .ok()
+        .and_then(|index| index.checked_sub(1))
+        .and_then(|index| ROMAN_NUMERALS.get(index))
+        .map_or_else(|| level.to_string(), |numeral| (*numeral).to_owned())
 }
 
+/// Vanilla loom pattern ids in registry order.
+const LOOM_PATTERNS: [&str; 40] = [
+    "square_bottom_left", "square_bottom_right", "square_top_left", "square_top_right",
+    "stripe_bottom", "stripe_top", "stripe_left", "stripe_right",
+    "stripe_center", "stripe_middle", "stripe_downright", "stripe_downleft",
+    "small_stripes", "cross", "straight_cross", "triangle_bottom",
+    "triangle_top", "triangles_bottom", "triangles_top", "diagonal_left",
+    "diagonal_up_right", "circle", "rhombus", "half_vertical",
+    "half_horizontal", "half_vertical_right", "half_horizontal_bottom", "border",
+    "curly_border", "gradient", "gradient_up", "bricks",
+    "skull", "flower", "creeper", "mojang",
+    "globe", "piglin", "flow", "guster",
+];
+
 fn default_loom_patterns() -> Vec<String> {
-    [
-        "square_bottom_left",
-        "square_bottom_right",
-        "square_top_left",
-        "square_top_right",
-        "stripe_bottom",
-        "stripe_top",
-        "stripe_left",
-        "stripe_right",
-        "stripe_center",
-        "stripe_middle",
-        "stripe_downright",
-        "stripe_downleft",
-        "small_stripes",
-        "cross",
-        "straight_cross",
-        "triangle_bottom",
-        "triangle_top",
-        "triangles_bottom",
-        "triangles_top",
-        "diagonal_left",
-        "diagonal_up_right",
-        "circle",
-        "rhombus",
-        "half_vertical",
-        "half_horizontal",
-        "half_vertical_right",
-        "half_horizontal_bottom",
-        "border",
-        "curly_border",
-        "gradient",
-        "gradient_up",
-        "bricks",
-        "skull",
-        "flower",
-        "creeper",
-        "mojang",
-        "globe",
-        "piglin",
-        "flow",
-        "guster",
-    ]
-    .into_iter()
-    .map(|pattern| format!("minecraft:{pattern}"))
-    .collect()
+    LOOM_PATTERNS.iter().map(|pattern| format!("minecraft:{pattern}")).collect()
 }
 
 fn ghost_item(menu_id: u32, slot: i16) -> Option<&'static str> {
@@ -2867,121 +2780,180 @@ impl ContainerScreenState {
         }
     }
 
+    /// Replace the cursor stack, dropping it once its count reaches zero.
+    fn set_carried(&mut self, stack: UiItemStack) {
+        self.cursor = (stack.count > 0).then_some(stack);
+    }
+
+    /// Replace `slot`'s stack with `stack` at `count`, emptying it at zero.
+    fn set_counted_slot(&mut self, slot: usize, mut stack: UiItemStack, count: u8) {
+        stack.count = count;
+        self.slots[slot] = if count == 0 { UiItemStack::empty() } else { stack };
+    }
+
+    /// Mode-0 click: pickup/place, merge, swap, or release outside the panel.
+    /// Each arm mutates the slot/cursor and records the slot in `changed`; a
+    /// single trailing [`Self::finish_action`] reports the result.
     fn normal_click(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {
+        let mut changed = BTreeSet::new();
         if slot_index == EMPTY_SLOT_INDEX {
-            let changed = BTreeSet::new();
-            if let Some(mut carried) = self.cursor.clone() {
-                if button == 0 {
-                    self.cursor = None;
-                } else if button == 1 {
-                    carried.count = carried.count.saturating_sub(1);
-                    self.cursor = if carried.count == 0 {
-                        None
-                    } else {
-                        Some(carried)
-                    };
-                } else {
-                    return None;
-                }
-                return Some(self.finish_action(slot_index, button, 0, &changed));
-            }
-            return Some(self.finish_action(slot_index, button, 0, &changed));
+            return self.release_cursor(button, &changed);
         }
         let index = usize::try_from(slot_index).ok()?;
         if index >= self.slots.len() || !self.can_take(slot_index) {
             return None;
         }
-        let mut changed = BTreeSet::new();
         let slot_stack = self.slots[index].clone();
         let cursor = self.cursor.clone().filter(|s| !s.is_empty());
-
         match (slot_stack.is_empty(), cursor) {
             (true, None) => {}
-            (true, Some(mut carried)) => {
-                if !self.accepts_placement(slot_index, &carried) {
-                    return Some(self.finish_action(slot_index, button, 0, &changed));
-                }
-                let place = if button == 1 {
-                    1u32
-                } else {
-                    u32::from(carried.count)
-                }
-                .min(u32::from(carried.max_stack));
-                let place = place as u8;
-                let mut placed = carried.clone();
-                placed.count = place;
-                carried.count -= place;
-                self.slots[index] = placed;
-                self.cursor = if carried.count == 0 {
-                    None
-                } else {
-                    Some(carried)
-                };
-                changed.insert(slot_index);
+            (true, Some(carried)) => {
+                self.place_into_empty(slot_index, index, carried, button, &mut changed)
             }
             (false, None) => {
-                let take = if button == 1 {
-                    slot_stack.count.div_ceil(2)
-                } else {
-                    slot_stack.count
-                };
-                let mut taken = slot_stack.clone();
-                taken.count = take;
-                let mut left = slot_stack.clone();
-                left.count = left.count.saturating_sub(take);
-                self.slots[index] = if left.count == 0 {
-                    UiItemStack::empty()
-                } else {
-                    left
-                };
-                self.cursor = Some(taken);
-                changed.insert(slot_index);
+                self.take_from_slot(slot_index, index, slot_stack, button, &mut changed)
             }
-            (false, Some(mut carried)) => {
-                if !self.accepts_placement(slot_index, &carried) {
-                    // Output slot with matching cursor: Vanilla takes the output into cursor if space permits.
-                    if matches!(self.slot_kind(slot_index), Some(SlotKind::Output))
-                        && slot_stack.same_stackable(&carried)
-                        && u32::from(carried.count) + u32::from(slot_stack.count)
-                            <= u32::from(carried.max_stack)
-                    {
-                        carried.count += slot_stack.count;
-                        self.slots[index] = UiItemStack::empty();
-                        self.cursor = Some(carried);
-                        changed.insert(slot_index);
-                    }
-                } else if slot_stack.same_stackable(&carried) {
-                    let capacity =
-                        u32::from(slot_stack.max_stack).saturating_sub(u32::from(slot_stack.count));
-                    let amount = if button == 1 {
-                        1
-                    } else {
-                        u32::from(carried.count)
-                    }
-                    .min(capacity);
-                    if amount == 0 {
-                        return Some(self.finish_action(slot_index, button, 0, &changed));
-                    }
-                    let amount = amount as u8;
-                    let mut slot = slot_stack.clone();
-                    slot.count += amount;
-                    carried.count -= amount;
-                    self.slots[index] = slot;
-                    self.cursor = if carried.count == 0 {
-                        None
-                    } else {
-                        Some(carried)
-                    };
-                    changed.insert(slot_index);
-                } else {
-                    let old_slot = self.slots[index].clone();
-                    self.slots[index] = carried;
-                    self.cursor = Some(old_slot);
-                    changed.insert(slot_index);
-                }
+            (false, Some(carried)) => {
+                self.click_occupied(slot_index, index, slot_stack, carried, button, &mut changed)
             }
         }
         Some(self.finish_action(slot_index, button, 0, &changed))
+    }
+
+    /// Drop (`button == 0`) or decrement (`button == 1`) the carried stack when
+    /// the click lands outside any slot; other buttons are not pickup clicks.
+    fn release_cursor(
+        &mut self,
+        button: i8,
+        changed: &BTreeSet<i16>,
+    ) -> Option<ClickWindowAction> {
+        let Some(mut carried) = self.cursor.clone() else {
+            return Some(self.finish_action(EMPTY_SLOT_INDEX, button, 0, changed));
+        };
+        match button {
+            0 => self.cursor = None,
+            1 => {
+                carried.count = carried.count.saturating_sub(1);
+                self.set_carried(carried);
+            }
+            _ => return None,
+        }
+        Some(self.finish_action(EMPTY_SLOT_INDEX, button, 0, changed))
+    }
+
+    /// Place the carried stack into an empty slot (right click places one).
+    fn place_into_empty(
+        &mut self,
+        slot_index: i16,
+        index: usize,
+        mut carried: UiItemStack,
+        button: i8,
+        changed: &mut BTreeSet<i16>,
+    ) {
+        if !self.accepts_placement(slot_index, &carried) {
+            return;
+        }
+        let wanted = if button == 1 { 1u32 } else { u32::from(carried.count) };
+        let place = wanted.min(u32::from(carried.max_stack)) as u8;
+        let mut placed = carried.clone();
+        placed.count = place;
+        carried.count -= place;
+        self.slots[index] = placed;
+        self.set_carried(carried);
+        changed.insert(slot_index);
+    }
+
+    /// Pick the slot's stack up whole (left) or split it in half (right).
+    fn take_from_slot(
+        &mut self,
+        slot_index: i16,
+        index: usize,
+        slot_stack: UiItemStack,
+        button: i8,
+        changed: &mut BTreeSet<i16>,
+    ) {
+        let take = if button == 1 {
+            slot_stack.count.div_ceil(2)
+        } else {
+            slot_stack.count
+        };
+        let mut taken = slot_stack.clone();
+        taken.count = take;
+        let left = slot_stack.count.saturating_sub(take);
+        self.set_counted_slot(index, slot_stack, left);
+        self.cursor = Some(taken);
+        changed.insert(slot_index);
+    }
+
+    /// Cursor over an occupied slot: output pickup, stack merge, or swap.
+    fn click_occupied(
+        &mut self,
+        slot_index: i16,
+        index: usize,
+        slot_stack: UiItemStack,
+        mut carried: UiItemStack,
+        button: i8,
+        changed: &mut BTreeSet<i16>,
+    ) {
+        if !self.accepts_placement(slot_index, &carried) {
+            // Output slot with a matching cursor: Vanilla takes the output
+            // into the cursor when the merged count still fits.
+            let fits = u32::from(carried.count) + u32::from(slot_stack.count)
+                <= u32::from(carried.max_stack);
+            if matches!(self.slot_kind(slot_index), Some(SlotKind::Output))
+                && slot_stack.same_stackable(&carried)
+                && fits
+            {
+                carried.count += slot_stack.count;
+                self.slots[index] = UiItemStack::empty();
+                self.cursor = Some(carried);
+                changed.insert(slot_index);
+            }
+            return;
+        }
+        if !slot_stack.same_stackable(&carried) {
+            let old_slot = self.slots[index].clone();
+            self.slots[index] = carried;
+            self.cursor = Some(old_slot);
+            changed.insert(slot_index);
+            return;
+        }
+        let wanted = if button == 1 { 1 } else { u32::from(carried.count) };
+        let amount = self.add_to_slot(index, &carried, wanted);
+        if amount == 0 {
+            return;
+        }
+        carried.count -= amount as u8;
+        self.set_carried(carried);
+        changed.insert(slot_index);
+    }
+
+    /// Add up to `amount` of `stack` to `slot`, merging into a compatible
+    /// stack or filling the empty slot. Returns how many items were placed.
+    fn add_to_slot(&mut self, slot: usize, stack: &UiItemStack, amount: u32) -> u32 {
+        let current = &self.slots[slot];
+        if !current.is_empty() && !current.same_stackable(stack) {
+            return 0;
+        }
+        // An empty slot takes the source's own stack limit; a merge fills the
+        // compatible stack's remaining room.
+        let room = if current.is_empty() {
+            u32::from(stack.max_stack)
+        } else {
+            u32::from(current.max_stack).saturating_sub(u32::from(current.count))
+        };
+        let amount = amount.min(room);
+        if amount == 0 {
+            return 0;
+        }
+        if current.is_empty() {
+            let mut placed = stack.clone();
+            placed.count = amount as u8;
+            self.slots[slot] = placed;
+        } else {
+            self.slots[slot].count += amount as u8;
+        }
+        amount
     }
 
     fn transfer_range(&mut self, source: i16, targets: &[i16]) -> Option<BTreeSet<i16>> {
@@ -3000,18 +2972,12 @@ impl ContainerScreenState {
             if t >= self.slots.len() || !self.accepts_placement(target, &stack) {
                 continue;
             }
-            let current = self.slots[t].clone();
-            if !current.is_empty() && current.same_stackable(&stack) {
-                let capacity =
-                    u32::from(current.max_stack).saturating_sub(u32::from(current.count));
-                let amount = u32::from(stack.count).min(capacity);
-                if amount == 0 {
-                    continue;
-                }
-                let mut merged = current;
-                merged.count += amount as u8;
-                stack.count -= amount as u8;
-                self.slots[t] = merged;
+            if self.slots[t].is_empty() || !self.slots[t].same_stackable(&stack) {
+                continue;
+            }
+            let placed = self.add_to_slot(t, &stack, u32::from(stack.count)) as u8;
+            if placed > 0 {
+                stack.count -= placed;
                 changed.insert(target);
             }
         }
@@ -3025,19 +2991,13 @@ impl ContainerScreenState {
                 continue;
             }
             if self.slots[t].is_empty() {
-                let amount = u32::from(stack.count).min(u32::from(stack.max_stack));
-                let mut placed = stack.clone();
-                placed.count = amount as u8;
-                stack.count -= amount as u8;
-                self.slots[t] = placed;
+                let placed = self.add_to_slot(t, &stack, u32::from(stack.count)) as u8;
+                stack.count -= placed;
                 changed.insert(target);
             }
         }
-        self.slots[src] = if stack.count == 0 {
-            UiItemStack::empty()
-        } else {
-            stack
-        };
+        let remaining = stack.count;
+        self.set_counted_slot(src, stack, remaining);
         changed.insert(source);
         Some(changed)
     }
@@ -3070,36 +3030,38 @@ impl ContainerScreenState {
         Some(self.finish_action(slot_index, button, 1, &changed))
     }
 
+    /// Swap two slots when each side accepts what the other holds. Emits no
+    /// action; callers report the touched slots themselves.
+    fn swap_slots(&mut self, a: usize, b: usize) -> bool {
+        let (a_index, b_index) = (a as i16, b as i16);
+        let (a_stack, b_stack) = (self.slots[a].clone(), self.slots[b].clone());
+        let fits = (a_stack.is_empty() || self.accepts_placement(b_index, &a_stack))
+            && (b_stack.is_empty() || self.accepts_placement(a_index, &b_stack));
+        if fits {
+            self.slots[a] = b_stack;
+            self.slots[b] = a_stack;
+        }
+        fits
+    }
+
     fn hotbar_swap(&mut self, slot_index: i16, hotbar_index: i8) -> Option<ClickWindowAction> {
+        let index = usize::try_from(slot_index).ok()?;
+        if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX {
+            return None;
+        }
         if hotbar_index == 40 {
-            let index = usize::try_from(slot_index).ok()?;
-            if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX {
-                return None;
-            }
             let mut changed = BTreeSet::new();
             // Window-0 player inventory carries the offhand at slot 45; predict its swap locally.
-            if self.slots.len() == 46
+            let offhand = self.slots.len() == 46
                 && self.slot_kind(45) == Some(SlotKind::Offhand)
-                && index != 45
-            {
-                let a = self.slots[index].clone();
-                let b = self.slots[45].clone();
-                if (a.is_empty() || self.accepts_placement(45, &a))
-                    && (b.is_empty() || self.accepts_placement(slot_index, &b))
-                {
-                    self.slots[index] = b;
-                    self.slots[45] = a;
-                    changed.insert(slot_index);
-                    changed.insert(45);
-                }
+                && index != 45;
+            if offhand && self.swap_slots(index, 45) {
+                changed.insert(slot_index);
+                changed.insert(45);
             }
             return Some(self.finish_action(slot_index, hotbar_index, 2, &changed));
         }
         if !(0..=8).contains(&hotbar_index) || !self.schema.has_player_inventory {
-            return None;
-        }
-        let index = usize::try_from(slot_index).ok()?;
-        if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX {
             return None;
         }
         let hotbar_slot = self.schema.inventory_start + 27 + i16::from(hotbar_index);
@@ -3107,16 +3069,9 @@ impl ContainerScreenState {
         if hotbar >= self.slots.len() || hotbar == index {
             return None;
         }
-        let a = self.slots[index].clone();
-        let b = self.slots[hotbar].clone();
-        if !a.is_empty() && !self.accepts_placement(hotbar_slot, &a) {
+        if !self.swap_slots(index, hotbar) {
             return None;
         }
-        if !b.is_empty() && !self.accepts_placement(slot_index, &b) {
-            return None;
-        }
-        self.slots[index] = b;
-        self.slots[hotbar] = a;
         let mut changed = BTreeSet::new();
         changed.insert(slot_index);
         changed.insert(hotbar_slot);
@@ -3136,13 +3091,8 @@ impl ContainerScreenState {
             return Some(self.finish_action(slot_index, button, 4, &BTreeSet::new()));
         }
         let amount = if button == 1 { stack.count } else { 1 };
-        let mut left = stack.clone();
-        left.count = left.count.saturating_sub(amount);
-        self.slots[index] = if left.count == 0 {
-            UiItemStack::empty()
-        } else {
-            left
-        };
+        let left = stack.count.saturating_sub(amount);
+        self.set_counted_slot(index, stack, left);
         let mut changed = BTreeSet::new();
         changed.insert(slot_index);
         Some(self.finish_action(slot_index, button, 4, &changed))
@@ -3258,34 +3208,18 @@ impl ContainerScreenState {
                 break;
             }
             let index = usize::try_from(slot_index).ok()?;
-            let current = self.slots[index].clone();
-            if current.is_empty() {
-                let amount = per.min(remaining).min(u32::from(carried.max_stack));
-                if amount == 0 {
-                    continue;
-                }
-                let mut placed = carried.clone();
-                placed.count = amount as u8;
-                self.slots[index] = placed;
-                remaining -= amount;
-                changed.insert(slot_index);
-            } else if current.same_stackable(&carried) {
-                let capacity =
-                    u32::from(current.max_stack).saturating_sub(u32::from(current.count));
-                let amount = per.min(remaining).min(capacity);
-                if amount == 0 {
-                    continue;
-                }
-                let mut merged = current;
-                merged.count += amount as u8;
-                self.slots[index] = merged;
-                remaining -= amount;
-                changed.insert(slot_index);
+            let usable =
+                self.slots[index].is_empty() || self.slots[index].same_stackable(&carried);
+            let amount = if usable { self.add_to_slot(index, &carried, per.min(remaining)) } else { 0 };
+            if amount == 0 {
+                continue;
             }
+            remaining -= amount;
+            changed.insert(slot_index);
         }
         if let Some(mut cursor) = self.cursor.clone() {
             cursor.count = remaining as u8;
-            self.cursor = if remaining == 0 { None } else { Some(cursor) };
+            self.set_carried(cursor);
         }
         Some(self.finish_action(EMPTY_SLOT_INDEX, end_btn, 5, &changed))
     }
@@ -3323,14 +3257,10 @@ impl ContainerScreenState {
                 if amount == 0 {
                     continue;
                 }
-                let mut left = stack.clone();
-                left.count -= amount as u8;
-                self.slots[slot] = if left.count == 0 {
-                    UiItemStack::empty()
-                } else {
-                    left
-                };
+                // The slot keeps whatever the cursor could not absorb.
+                let left = stack.count - amount as u8;
                 cursor.count += amount as u8;
+                self.set_counted_slot(slot, stack, left);
                 changed.insert(index);
             }
         }
@@ -3501,40 +3431,35 @@ impl InventorySortState {
     /// the container region: the span covering all non-player slots whose
     /// [`SlotKind`] accepts placement (i.e. not `Output`/`Locked`), so
     /// result slots are never swept into a sort.
-    pub fn slot_range_for(
-        &self,
-        screen: &ContainerScreenState,
-        index: usize,
-    ) -> Range<usize> {
-        let len = screen.slot_count();
-        let schema = screen.schema();
-        let inv_start = schema.inventory_start.max(0) as usize;
-        let inv_end = if schema.has_player_inventory {
-            (inv_start + 36).min(len)
+    /// Player-inventory slot span, clipped to the screen's slot count and
+    /// empty for schemas without one.
+    fn player_range(screen: &ContainerScreenState) -> Range<usize> {
+        let start = screen.schema().inventory_start.max(0) as usize;
+        if screen.schema().has_player_inventory {
+            start..(start + 36).min(screen.slot_count())
         } else {
-            inv_start
-        };
-        if schema.has_player_inventory && index >= inv_start && index < inv_end {
-            return inv_start..inv_end;
+            start..start
         }
-        self.container_range(screen)
+    }
+
+    pub fn slot_range_for(&self, screen: &ContainerScreenState, index: usize) -> Range<usize> {
+        let player = Self::player_range(screen);
+        if player.contains(&index) {
+            player
+        } else {
+            self.container_range(screen)
+        }
     }
 
     /// The sortable container region (non-player, placement-accepting
     /// slots) as one contiguous span, or `0..0` when none exists.
     pub fn container_range(&self, screen: &ContainerScreenState) -> Range<usize> {
         let len = screen.slot_count();
-        let schema = screen.schema();
-        let inv_start = schema.inventory_start.max(0) as usize;
-        let inv_end = if schema.has_player_inventory {
-            (inv_start + 36).min(len)
-        } else {
-            inv_start
-        };
+        let player = Self::player_range(screen);
         let mut lo = len;
         let mut hi = 0usize;
         for i in 0..len {
-            if schema.has_player_inventory && i >= inv_start && i < inv_end {
+            if player.contains(&i) {
                 continue;
             }
             match screen.slot_kind(i as i16) {
@@ -3550,10 +3475,8 @@ impl InventorySortState {
     /// Region sorted when no slot is hovered: the player inventory when
     /// the schema provides one, otherwise the container region.
     pub fn default_sort_range(&self, screen: &ContainerScreenState) -> Range<usize> {
-        let schema = screen.schema();
-        if schema.has_player_inventory {
-            let inv_start = schema.inventory_start.max(0) as usize;
-            inv_start..(inv_start + 36).min(screen.slot_count())
+        if screen.schema().has_player_inventory {
+            Self::player_range(screen)
         } else {
             self.container_range(screen)
         }
