@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::live_session::LiveHudFeed;
@@ -946,6 +948,439 @@ mod rain_wetness_ramp_tests {
     }
 }
 
+/// Deterministic content counters captured before/after a soft reload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SoftReloadSummary {
+    pub blocks_delta: i64,
+    pub recipes_delta: i64,
+    pub loot_overrides: usize,
+    pub translations_delta: i64,
+    pub generation_id: Option<String>,
+}
+
+/// Result of an in-process mod/pack reload. `window_preserved` is a
+/// contract marker: this path never destroys or recreates the `winit`
+/// window, GPU device, surface, panorama or audio mixer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SoftReloadReport {
+    pub summary: SoftReloadSummary,
+    pub restarted_integrated_server: bool,
+    pub window_preserved: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SoftReloadAssetSnapshot {
+    block_keys: usize,
+    recipes: usize,
+    loot_overrides: usize,
+    translation_keys: usize,
+}
+
+/// Localized one-line Diff UX #4 summary.
+pub fn soft_reload_summary_line(
+    summary: &SoftReloadSummary,
+    lang: megu_ui::state::UiLang,
+) -> String {
+    let signed = |value: i64| {
+        if value >= 0 {
+            format!("+{value}")
+        } else {
+            value.to_string()
+        }
+    };
+    if lang == megu_ui::state::UiLang::Ja {
+        format!(
+            "再読込: {} ブロック / {} レシピ / {} ja_jpキー",
+            signed(summary.blocks_delta),
+            signed(summary.recipes_delta),
+            signed(summary.translations_delta)
+        )
+    } else {
+        format!(
+            "Reloaded: {} blocks / {} recipes / {} ja_jp keys",
+            signed(summary.blocks_delta),
+            signed(summary.recipes_delta),
+            signed(summary.translations_delta)
+        )
+    }
+}
+
+/// Compact transactional profile diff used by rollback/apply toasts.
+pub fn profile_activation_diff_line(
+    diff: &crate::mod_profile_tx::ProfileActivationDiff,
+    lang: megu_ui::state::UiLang,
+) -> String {
+    let added = diff.added_mods.len();
+    let removed = diff.removed_mods.len();
+    let updated = diff.updated_mods.len();
+    let auto = diff.auto_fetched_deps.len();
+    if lang == megu_ui::state::UiLang::Ja {
+        format!("プロファイル差分: +{added} / -{removed} / 更新{updated} / 自動取得{auto}")
+    } else {
+        format!("Profile diff: +{added} / -{removed} / updated {updated} / auto-fetched {auto}")
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlamoWorkKind {
+    Install,
+    Translate,
+}
+
+#[derive(Clone, Debug)]
+enum PlamoWorkOutcome {
+    Installed,
+    Translated(crate::mod_translator::TranslationRunSummary),
+}
+
+struct PlamoWorker {
+    kind: PlamoWorkKind,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<String>>,
+    result: Arc<Mutex<Option<Result<PlamoWorkOutcome, String>>>>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl PlamoWorker {
+    fn spawn(
+        kind: PlamoWorkKind,
+        cache_dir: std::path::PathBuf,
+        mods_dir: std::path::PathBuf,
+        resourcepacks_dir: std::path::PathBuf,
+        preset: crate::mod_translator::Plamo3Preset,
+    ) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(String::new()));
+        let result = Arc::new(Mutex::new(None));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_progress = Arc::clone(&progress);
+        let worker_result = Arc::clone(&result);
+        let thread = thread::spawn(move || {
+            let outcome = match kind {
+                PlamoWorkKind::Install => crate::mod_translator::install_plamo3_model(
+                    &cache_dir,
+                    preset,
+                    &worker_cancel,
+                    |file, done, total| {
+                        if let Ok(mut label) = worker_progress.lock() {
+                            *label = match total {
+                                Some(total) if total > 0 => {
+                                    format!("{file}: {} / {} bytes", done.min(total), total)
+                                }
+                                _ => format!("{file}: {done} bytes"),
+                            };
+                        }
+                    },
+                )
+                .map(|()| PlamoWorkOutcome::Installed),
+                PlamoWorkKind::Translate => crate::mod_translator::translate_mods_with_plamo3(
+                    &cache_dir,
+                    &mods_dir,
+                    &resourcepacks_dir,
+                    preset,
+                    &worker_cancel,
+                    |done, total| {
+                        if let Ok(mut label) = worker_progress.lock() {
+                            *label = format!("translated entries: {done}/{total}");
+                        }
+                    },
+                )
+                .map(PlamoWorkOutcome::Translated),
+            };
+            if let Ok(mut slot) = worker_result.lock() {
+                *slot = Some(outcome);
+            }
+        });
+        Self {
+            kind,
+            cancel,
+            progress,
+            result,
+            thread,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+struct MissingDependencyDownloadWorker {
+    progress: Arc<Mutex<crate::mod_sync_auto::ModSyncProgress>>,
+    result: Arc<Mutex<Option<Result<crate::mod_profile_tx::ProfileActivationDiff, String>>>>,
+    cancel: Arc<AtomicBool>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl MissingDependencyDownloadWorker {
+    fn spawn(
+        requirements: Vec<crate::mod_sync_auto::ExactModRequirement>,
+        profile_root: std::path::PathBuf,
+    ) -> Self {
+        let progress = Arc::new(Mutex::new(crate::mod_sync_auto::ModSyncProgress::Resolving));
+        let result = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_progress = Arc::clone(&progress);
+        let worker_result = Arc::clone(&result);
+        let worker_cancel = Arc::clone(&cancel);
+        let thread = thread::spawn(move || {
+            let outcome = crate::mod_sync_auto::sync_exact_mods(
+                &requirements,
+                &profile_root,
+                &worker_progress,
+                &worker_cancel,
+            );
+            if let Ok(mut slot) = worker_result.lock() {
+                *slot = Some(outcome);
+            }
+        });
+        Self {
+            progress,
+            result,
+            cancel,
+            thread,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+struct MissingDependencyConsentWorker {
+    result: Arc<Mutex<Option<Result<crate::mod_sync_auto::MissingDependencyConsentPlan, String>>>>,
+}
+
+impl MissingDependencyConsentWorker {
+    fn spawn(descriptors: Vec<crate::mod_sync_auto::MissingDependencyDescriptor>) -> Self {
+        let result = Arc::new(Mutex::new(None));
+        let worker_result = Arc::clone(&result);
+        thread::spawn(move || {
+            let plan = crate::mod_sync_auto::build_missing_dep_consent_plan(&descriptors);
+            if let Ok(mut slot) = worker_result.lock() {
+                *slot = Some(plan);
+            }
+        });
+        Self { result }
+    }
+}
+
+/// Delayed asset bootstrap: resolving the per-version metadata URL is itself
+/// network I/O, so a daemon thread performs manifest -> version JSON first
+/// and only then starts `vanilla_bootstrap`'s bounded asset worker.
+struct DeferredVanillaAssetsBootstrap {
+    shared: Arc<Mutex<crate::vanilla_bootstrap::AssetBootstrapProgress>>,
+}
+
+impl DeferredVanillaAssetsBootstrap {
+    fn progress(&self) -> crate::vanilla_bootstrap::AssetBootstrapProgress {
+        self.shared
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    fn spawn(version_id: &str, paths: crate::live_session::SessionPaths) -> Option<Self> {
+        if version_id.is_empty()
+            || version_id.len() > 64
+            || !version_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return None;
+        }
+        let shared = Arc::new(Mutex::new(
+            crate::vanilla_bootstrap::AssetBootstrapProgress::FetchingIndex,
+        ));
+        let worker_shared = Arc::clone(&shared);
+        let version = version_id.to_owned();
+        thread::Builder::new()
+            .name("megu-vanilla-assets-resolve".to_owned())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    deferred_assets_bootstrap_run(&version, &paths, &worker_shared)
+                }));
+                if outcome.is_err() {
+                    set_deferred_asset_progress(
+                        &worker_shared,
+                        crate::vanilla_bootstrap::AssetBootstrapProgress::Failed(
+                            "asset metadata resolver crashed".into(),
+                        ),
+                    );
+                }
+            })
+            .ok()?;
+        Some(Self { shared })
+    }
+}
+
+fn set_deferred_asset_progress(
+    shared: &Mutex<crate::vanilla_bootstrap::AssetBootstrapProgress>,
+    progress: crate::vanilla_bootstrap::AssetBootstrapProgress,
+) {
+    *shared.lock().unwrap_or_else(|err| err.into_inner()) = progress;
+}
+
+fn mojang_metadata_url_allowed(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    matches!(
+        host.as_str(),
+        "piston-meta.mojang.com" | "launchermeta.mojang.com" | "launcher.mojang.com"
+    )
+}
+
+fn fetch_mojang_text(url: &str, cap: usize) -> Result<String, String> {
+    if !mojang_metadata_url_allowed(url) {
+        return Err("refusing non-Mojang metadata URL".into());
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_recv_response(Some(Duration::from_secs(10)))
+        .timeout_recv_body(Some(Duration::from_secs(10)))
+        .max_redirects(0)
+        .build()
+        .into();
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("metadata request failed: {e}"))?;
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(cap as u64)
+        .read_to_vec()
+        .map_err(|e| format!("read metadata: {e}"))?;
+    String::from_utf8(bytes).map_err(|_| "metadata is not UTF-8".into())
+}
+
+fn manifest_version_url_window(manifest_text: &str, version_id: &str) -> Result<String, String> {
+    let json = megu_core::json::parse_json(manifest_text)
+        .map_err(|e| format!("invalid version manifest: {e}"))?;
+    let versions = json
+        .get("versions")
+        .and_then(megu_core::json::JsonValue::as_array)
+        .ok_or_else(|| "version manifest has no versions array".to_owned())?;
+    for entry in versions {
+        if entry.get("id").and_then(megu_core::json::JsonValue::as_str) == Some(version_id) {
+            let url = entry
+                .get("url")
+                .and_then(megu_core::json::JsonValue::as_str)
+                .ok_or_else(|| "version entry has no url".to_owned())?;
+            if !mojang_metadata_url_allowed(url) {
+                return Err("version metadata URL is not allowlisted".into());
+            }
+            return Ok(url.to_owned());
+        }
+    }
+    Err(format!(
+        "version {version_id:?} is absent from the Mojang manifest"
+    ))
+}
+
+fn local_version_json_url(
+    paths: &crate::live_session::SessionPaths,
+    version_id: &str,
+) -> Option<Result<(String, String), String>> {
+    let game_dir = paths.game_dir.as_deref()?;
+    let path = game_dir
+        .join("versions")
+        .join(version_id)
+        .join(format!("{version_id}.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    Some(
+        crate::vanilla_bootstrap::parse_asset_index_ref(&text)
+            .map(|index| (index.id, "local-version-json".to_owned()))
+            .map_err(|err| err.to_string()),
+    )
+}
+
+fn deferred_assets_bootstrap_run(
+    version_id: &str,
+    paths: &crate::live_session::SessionPaths,
+    shared: &Mutex<crate::vanilla_bootstrap::AssetBootstrapProgress>,
+) {
+    let resolved = match local_version_json_url(paths, version_id) {
+        Some(Ok((index_id, version_url))) => Ok((index_id, version_url)),
+        Some(Err(err)) => Err(err),
+        None => {
+            let manifest = fetch_mojang_text(
+                crate::vanilla_bootstrap::VANILLA_MANIFEST_URL,
+                4 * 1024 * 1024,
+            )
+            .and_then(|text| manifest_version_url_window(&text, version_id));
+            manifest.and_then(|version_url| {
+                fetch_mojang_text(&version_url, 1024 * 1024).and_then(|version_text| {
+                    crate::vanilla_bootstrap::parse_asset_index_ref(&version_text)
+                        .map(|index| (index.id, version_url))
+                })
+            })
+        }
+    };
+    let (index_id, version_url) = match resolved {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            set_deferred_asset_progress(
+                shared,
+                crate::vanilla_bootstrap::AssetBootstrapProgress::Failed(err),
+            );
+            return;
+        }
+    };
+    // A local launcher JSON has no remote URL to re-read; the public worker
+    // requires the canonical URL for provenance, so use the manifest chain in
+    // that rare case. Most cache-only installs take the remote path above.
+    let version_url = if version_url == "local-version-json" {
+        match fetch_mojang_text(
+            crate::vanilla_bootstrap::VANILLA_MANIFEST_URL,
+            4 * 1024 * 1024,
+        )
+        .and_then(|text| manifest_version_url_window(&text, version_id))
+        {
+            Ok(url) => url,
+            Err(err) => {
+                set_deferred_asset_progress(
+                    shared,
+                    crate::vanilla_bootstrap::AssetBootstrapProgress::Failed(err),
+                );
+                return;
+            }
+        }
+    } else {
+        version_url
+    };
+    let Some(inner) = crate::vanilla_bootstrap::spawn_vanilla_assets_bootstrap(
+        &index_id,
+        &version_url,
+        paths,
+        crate::vanilla_bootstrap::AssetTierFilter::All,
+    ) else {
+        set_deferred_asset_progress(
+            shared,
+            crate::vanilla_bootstrap::AssetBootstrapProgress::Failed(
+                "asset bootstrap endpoints failed validation".into(),
+            ),
+        );
+        return;
+    };
+    loop {
+        let progress = inner.progress();
+        let terminal = progress.is_terminal();
+        set_deferred_asset_progress(shared, progress);
+        if terminal {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The `ApplicationHandler` `EventLoop::run_app` drives.
 pub struct GpuApp {
     config: GpuCliConfig,
@@ -1049,6 +1484,35 @@ pub struct GpuApp {
     session_paths: SessionPaths,
     /// Confirmed, non-blocking server-scoped Modrinth synchronization.
     mod_sync_worker: Option<crate::mod_sync_auto::ModSyncWorker>,
+    /// Exact-candidate missing-dependency resolver; network resolution is
+    /// always off-thread and only its result fills the consent UI.
+    missing_dep_worker: Option<MissingDependencyConsentWorker>,
+    /// Exact resolved candidates backing the visible consent rows. Kept
+    /// host-side because the UI deliberately receives only display-safe
+    /// fields; approval must reuse these project/version ids rather than
+    /// resolving a second, potentially different Modrinth candidate set.
+    missing_dep_plan: Option<crate::mod_sync_auto::MissingDependencyConsentPlan>,
+    /// Background PLaMo install/translation worker (the model process itself
+    /// remains transient inside `mod_translator`).
+    plamo_worker: Option<PlamoWorker>,
+    /// Foreground transactional download of consent-approved dependencies.
+    missing_dep_download_worker: Option<MissingDependencyDownloadWorker>,
+    /// Explicit resource-pack stack in bottom-to-top order. Entries are file
+    /// names under `resourcepacks/` or official built-in ids; it mirrors
+    /// `options.txt` and lets the generated translation pack flip instantly.
+    resource_pack_selection: Vec<String>,
+    /// Last display locale whose vanilla/lang asset tables were loaded.
+    active_ui_locale: String,
+    /// Content snapshot used to produce Diff UX #4 counters.
+    soft_reload_asset_baseline: Option<SoftReloadAssetSnapshot>,
+    /// Singleplayer world currently hosted by this process, when known.
+    active_singleplayer_world: Option<String>,
+    /// Root fingerprint of the last MSY1 mismatch already surfaced.
+    last_mod_sync_root_fp: Option<u64>,
+    /// Asset-store bootstrap for cache-only vanilla installs (P1.1).
+    vanilla_assets_bootstrap: Option<DeferredVanillaAssetsBootstrap>,
+    /// True after a cache-only asset bootstrap has been requested once.
+    vanilla_assets_bootstrap_attempted: bool,
     last_server_address: Option<String>,
     /// Boot-time recipe-browser ingest report (mod JARs + vanilla client
     /// JAR + datapacks); empty when no `--gameDir` was supplied.
@@ -1405,6 +1869,111 @@ fn host_ram_pressure(
     }
 }
 
+/// Read the complete `resourcePacks` stack, preserving official built-in
+/// ids while normalizing `file/<name>` entries to resourcepack directory
+/// names. Missing or malformed options yield an empty stack (vanilla only).
+pub(crate) fn configured_resource_pack_stack(game_dir: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(game_dir.join("options.txt")) else {
+        return Vec::new();
+    };
+    let Some(value) = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("resourcePacks:"))
+    else {
+        return Vec::new();
+    };
+    let Ok(parsed) = megu_core::json::parse_json(value) else {
+        return Vec::new();
+    };
+    let megu_core::json::JsonValue::Array(entries) = parsed else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for raw in entries.iter().filter_map(|entry| entry.as_str()) {
+        let normalized = raw.strip_prefix("file/").unwrap_or(raw);
+        if normalized == "vanilla"
+            || normalized == "fabric"
+            || normalized.is_empty()
+            || normalized.contains("..")
+            || normalized.contains('\\')
+            || normalized.starts_with('/')
+        {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == normalized) {
+            out.push(normalized.to_owned());
+        }
+    }
+    out
+}
+
+fn json_string_literal(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch < ' ' => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn resource_pack_option_json(selection: &[String]) -> String {
+    let entries = selection
+        .iter()
+        .map(|entry| {
+            if entry == "programmer_art"
+                || entry == "high_contrast"
+                || entry.starts_with("minecraft:")
+            {
+                json_string_literal(entry)
+            } else {
+                json_string_literal(&format!("file/{entry}"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{entries}]")
+}
+
+/// Persist the resource-pack stack atomically while preserving every other
+/// `options.txt` key. This is small, synchronous user configuration rather
+/// than frame-path I/O.
+pub(crate) fn persist_resource_pack_stack(
+    game_dir: &std::path::Path,
+    selection: &[String],
+) -> Result<(), String> {
+    let path = game_dir.join("options.txt");
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let replacement = format!("resourcePacks:{}", resource_pack_option_json(selection));
+    let mut replaced = false;
+    let mut lines = Vec::new();
+    for line in old.lines() {
+        if line.trim_start().starts_with("resourcePacks:") {
+            if !replaced {
+                lines.push(replacement.clone());
+                replaced = true;
+            }
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !replaced {
+        lines.push(replacement);
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    let tmp = game_dir.join(".options.txt.megu-tmp");
+    std::fs::write(&tmp, body.as_bytes()).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("replace {}: {e}", path.display()))
+}
+
 impl GpuApp {
     /// Build the app state (no GPU or window yet — `resumed` does that).
     pub fn new(config: GpuCliConfig) -> Self {
@@ -1516,6 +2085,12 @@ impl GpuApp {
             ..Camera::default()
         };
         let splash_seed = splash_seed_for(&config);
+        let resource_pack_selection = config
+            .game_dir
+            .as_deref()
+            .map(configured_resource_pack_stack)
+            .unwrap_or_default();
+        let active_singleplayer_world = config.quick_play_singleplayer.clone();
         let mut ui = UiState::new();
         apply_megu_default_links(&mut ui);
         apply_client_settings_to_ui(&persisted_settings, &mut ui.settings);
@@ -1582,6 +2157,17 @@ impl GpuApp {
             inventory_sort: InventorySortState::default(),
             session_paths,
             mod_sync_worker: None,
+            missing_dep_worker: None,
+            missing_dep_plan: None,
+            plamo_worker: None,
+            missing_dep_download_worker: None,
+            resource_pack_selection,
+            active_ui_locale: String::new(),
+            soft_reload_asset_baseline: None,
+            active_singleplayer_world,
+            last_mod_sync_root_fp: None,
+            vanilla_assets_bootstrap: None,
+            vanilla_assets_bootstrap_attempted: false,
             last_server_address: None,
             recipe_ingest: crate::recipe_ingest::IngestReport::default(),
             item_icon_atlas: megu_ui::draw::ItemIconAtlas::default(),
@@ -1704,6 +2290,8 @@ impl GpuApp {
         // mixer when a session already attached at boot).
         let boot_settings = app.ui.settings.clone();
         app.apply_settings(&boot_settings);
+        app.active_ui_locale = app.ui.settings.locale.code().to_owned();
+        app.refresh_plamo_panel_status();
         app.refresh_singleplayer_worlds();
         // Quick-play boots straight into a hosted world — only that path
         // loads FRL3 state eagerly so a persisted share mode re-arms
@@ -1856,8 +2444,11 @@ impl GpuApp {
                 entry.enabled |= enabled;
                 entry.summary = "Official built-in Minecraft resource pack".into();
             } else {
-                let mut entry =
-                    megu_ui::mod_manager::ModManagerEntry::new(&namespaced_id, &display_name, "1.21.1");
+                let mut entry = megu_ui::mod_manager::ModManagerEntry::new(
+                    &namespaced_id,
+                    &display_name,
+                    "1.21.1",
+                );
                 entry.enabled = enabled;
                 entry.summary = "Official built-in Minecraft resource pack".into();
                 entry.loader = megu_ui::mod_manager::ModLoaderTag::MeguNative;
@@ -1945,17 +2536,46 @@ impl GpuApp {
             .resource_pack_dir
             .clone()
             .unwrap_or_else(|| game_dir.join("resourcepacks"));
-        crate::vanilla_jar::configured_resource_packs(game_dir)
-            .into_iter()
-            .filter(|name| {
-                !name.is_empty()
-                    && !name.contains("..")
-                    && !name.starts_with('/')
-                    && !name.contains('\\')
+        let builtin_path = |token: &str| -> Option<std::path::PathBuf> {
+            let bare = token
+                .strip_prefix("minecraft:")
+                .unwrap_or(token)
+                .strip_suffix(".zip")
+                .unwrap_or(token.strip_prefix("minecraft:").unwrap_or(token));
+            if bare != "programmer_art" && bare != "high_contrast" {
+                return None;
+            }
+            self.official_builtin_resource_packs()
+                .into_iter()
+                .find(|(id, _, _)| id.strip_prefix("minecraft:").unwrap_or(id) == bare)
+                .map(|(_, _, path)| path)
+        };
+        self.resource_pack_selection
+            .iter()
+            .filter_map(|name| {
+                if name.is_empty()
+                    || name.contains("..")
+                    || name.starts_with('/')
+                    || name.contains('\\')
+                {
+                    return None;
+                }
+                if let Some(path) = builtin_path(name) {
+                    return Some(path);
+                }
+                let path = pack_root.join(name);
+                (path.is_file() || path.is_dir()).then_some(path)
             })
-            .map(|name| pack_root.join(name))
-            .filter(|path| path.is_file() || path.is_dir())
             .collect()
+    }
+
+    /// Force the runtime bundle to re-scan jar/assets/resource-pack layers
+    /// and the active locale on the next load. The window/device/surface are
+    /// deliberately untouched: this is the asset half of soft reload.
+    fn invalidate_vanilla_runtime_assets(&mut self) {
+        self.vanilla_runtime_assets = None;
+        self.entity_appearance = None;
+        self.gui_sprites_loaded = false;
     }
 
     /// Load local vanilla assets without creating a window. This is also the
@@ -2183,6 +2803,126 @@ impl GpuApp {
                 .or_else(|| Some(format!("entity #{entity_id}")));
         }
         overlay
+    }
+
+    fn vanilla_asset_store_complete(&self) -> bool {
+        let index_id = self.session_paths.asset_index.as_deref().unwrap_or("17");
+        let Some(root) =
+            crate::vanilla_bootstrap::discover_local_assets_dir(index_id, &self.session_paths)
+        else {
+            return false;
+        };
+        let index_path = root.join("indexes").join(format!("{index_id}.json"));
+        let Ok(text) = std::fs::read_to_string(index_path) else {
+            return false;
+        };
+        let Ok(json) = megu_core::json::parse_json(&text) else {
+            return false;
+        };
+        let Some(objects) = json
+            .get("objects")
+            .and_then(megu_core::json::JsonValue::as_object)
+        else {
+            return false;
+        };
+        // Small representative completeness probe: fonts/lang/icons/built-in
+        // packs are the object-store-only part a cached client JAR cannot
+        // provide. Each object must exist at its content-addressed path with
+        // the exact declared size; the full bootstrap re-verifies the rest.
+        for key in [
+            "minecraft/lang/en_us.json",
+            "minecraft/font/ascii.png",
+            "icons/icon_16x16.png",
+            "resourcepacks/programmer_art.zip",
+        ] {
+            let Some(object) = objects
+                .iter()
+                .find_map(|(name, value)| (name == key).then_some(value))
+            else {
+                continue;
+            };
+            let Some(hash) = object
+                .get("hash")
+                .and_then(megu_core::json::JsonValue::as_str)
+            else {
+                return false;
+            };
+            let Some(size) = object
+                .get("size")
+                .and_then(megu_core::json::JsonValue::as_u64)
+            else {
+                return false;
+            };
+            let path = root.join("objects").join(&hash[..2]).join(hash);
+            let Ok(meta) = std::fs::symlink_metadata(path) else {
+                return false;
+            };
+            if !meta.is_file() || meta.len() != size {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Cache-only/bootstrapped vanilla installs often have the client JAR
+    /// but no complete Mojang object store. Resolve metadata and fill that
+    /// store off-thread, then reload the runtime bundle in-place (P1.1).
+    fn ensure_vanilla_assets_bootstrap(&mut self) {
+        if self.vanilla_assets_bootstrap.is_some()
+            || self.vanilla_assets_bootstrap_attempted
+            || !crate::vanilla_bootstrap::auto_fetch_enabled()
+            || self.vanilla_asset_store_complete()
+        {
+            return;
+        }
+        if crate::vanilla_bootstrap::discover_local_vanilla_jar(&self.session_paths).is_none() {
+            return;
+        }
+        let Some(version_id) = crate::live_session::jar_version_ids(&self.session_paths)
+            .last()
+            .cloned()
+        else {
+            return;
+        };
+        self.vanilla_assets_bootstrap_attempted = true;
+        if let Some(handle) =
+            DeferredVanillaAssetsBootstrap::spawn(&version_id, self.session_paths.clone())
+        {
+            self.vanilla_assets_bootstrap = Some(handle);
+        }
+    }
+
+    fn poll_vanilla_assets_bootstrap(&mut self) {
+        let Some(progress) = self
+            .vanilla_assets_bootstrap
+            .as_ref()
+            .map(DeferredVanillaAssetsBootstrap::progress)
+        else {
+            return;
+        };
+        use crate::vanilla_bootstrap::AssetBootstrapProgress as P;
+        match progress {
+            P::Ready { assets_dir, .. } => {
+                self.vanilla_assets_bootstrap = None;
+                if self.session_paths.assets_dir.is_none() {
+                    self.session_paths.assets_dir = Some(assets_dir);
+                    if let Some(live) = &mut self.live {
+                        live.session_paths.assets_dir = self.session_paths.assets_dir.clone();
+                    }
+                }
+                self.invalidate_vanilla_runtime_assets();
+                self.load_gui_sprite_atlas();
+                if let Some(live) = &mut self.live {
+                    live.refresh_asset_layers();
+                }
+                self.status_line("Minecraft runtime asset bundle ready");
+            }
+            P::Failed(reason) => {
+                self.vanilla_assets_bootstrap = None;
+                self.status_line(format!("Vanilla asset bundle download: {reason}"));
+            }
+            P::FetchingIndex | P::Downloading { .. } => {}
+        }
     }
 
     /// Non-blocking poll of the background vanilla-JAR bootstrap, called
@@ -2948,6 +3688,7 @@ impl GpuApp {
                     self.persisted_settings.shader_profile = selection.profile;
                 }
                 self.apply_settings(&settings);
+                self.reload_locale_assets_if_changed();
                 self.settings_save_guard.mark_dirty();
                 if let Err(err) = self
                     .settings_save_guard
@@ -3068,6 +3809,7 @@ impl GpuApp {
                 }
             }
             UiAction::LeaveWorld => self.leave_world_for_title(),
+            UiAction::ModManager(action) => self.dispatch_mod_manager_action(action),
             UiAction::RecipeBrowser(action) => self.dispatch_recipe_browser_action(action),
             // Copy buttons on friend rows/guest links — same honest
             // reporting as `CopyInvite`: system store vs in-app buffer,
@@ -3115,6 +3857,202 @@ impl GpuApp {
         self.update_ime();
     }
 
+    fn mod_profile_root(&self) -> std::path::PathBuf {
+        if let Some(server_mods) = self.session_paths.server_mods_dir.as_deref() {
+            if server_mods
+                .parent()
+                .and_then(|generations| generations.parent())
+                .is_some_and(|profile| {
+                    profile.ends_with("server-mods") || profile.join("generations").exists()
+                })
+            {
+                if let Some(profile) = server_mods.parent().and_then(|p| p.parent()) {
+                    return profile.to_path_buf();
+                }
+            }
+        }
+        self.session_paths
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("mod-profiles")
+            .join("default")
+    }
+
+    fn scan_soft_reload_assets(&self) -> SoftReloadAssetSnapshot {
+        let (layers, _, _) = crate::live_session::discover_asset_layers(&self.session_paths);
+        let mut block_keys = std::collections::BTreeSet::new();
+        for layer in &layers {
+            block_keys.extend(layer.blockstates.keys().cloned());
+            block_keys.extend(
+                layer
+                    .models
+                    .keys()
+                    .filter_map(|key| key.strip_prefix("block/").map(|_| key.clone())),
+            );
+        }
+        let translations = self
+            .resourcepacks_root()
+            .and_then(|root| crate::mod_translator::load_auto_translation_pack_ja_jp(&root).ok())
+            .map_or(0, |entries| entries.len());
+        SoftReloadAssetSnapshot {
+            block_keys: block_keys.len(),
+            recipes: self.ui.recipe_browser.index.recipes.len(),
+            loot_overrides: self.ui.recipe_browser.index.dungeon_loot.len()
+                + self.ui.recipe_browser.index.mob_drops.len(),
+            translation_keys: translations,
+        }
+    }
+
+    fn resourcepacks_root(&self) -> Option<std::path::PathBuf> {
+        self.session_paths.resource_pack_dir.clone().or_else(|| {
+            self.session_paths
+                .game_dir
+                .as_ref()
+                .map(|dir| dir.join("resourcepacks"))
+        })
+    }
+
+    fn mods_root(&self) -> std::path::PathBuf {
+        self.session_paths
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("mods")
+    }
+
+    /// Apply generated `ja_jp` translations to the recipe/item catalog when
+    /// the pack is enabled. The base JAR ingest supplies every other locale;
+    /// this overlays only keys the generated pack actually owns.
+    fn apply_auto_translation_overlay(&mut self) -> usize {
+        if self
+            .ui
+            .settings
+            .locale
+            .code()
+            .replace('-', "_")
+            .eq_ignore_ascii_case("ja_jp")
+            || !self
+                .resource_pack_selection
+                .iter()
+                .any(|pack| pack == crate::mod_translator::AUTO_TRANSLATION_PACK_DIR)
+        {
+            return 0;
+        }
+        let Some(root) = self.resourcepacks_root() else {
+            return 0;
+        };
+        let Ok(entries) = crate::mod_translator::load_auto_translation_pack_ja_jp(&root) else {
+            return 0;
+        };
+        let mut applied = 0usize;
+        for item in &mut self.ui.recipe_browser.index.items {
+            let path = item.id.split(':').nth(1).unwrap_or(item.id.as_str());
+            let namespace = item.id.split(':').next().unwrap_or("minecraft");
+            for kind in ["item", "block"] {
+                let key = format!("{kind}.{namespace}.{path}");
+                if let Some(value) = entries.get(&key) {
+                    item.localized_names
+                        .insert("ja_jp".to_owned(), value.clone());
+                    applied += 1;
+                    break;
+                }
+            }
+        }
+        applied
+    }
+
+    fn push_soft_reload_toast(&mut self, summary: &SoftReloadSummary, body: &str) {
+        let title = if self.ui.lang() == megu_ui::state::UiLang::Ja {
+            "再読込が完了しました"
+        } else {
+            "Reload complete"
+        };
+        self.ui.push_toast(
+            megu_ui::qol_helpers::ToastKind::Success,
+            title,
+            &format!(
+                "{}{body}",
+                soft_reload_summary_line(summary, self.ui.lang())
+            ),
+        );
+    }
+
+    /// Zero-window-close soft reload: stop/restart only the integrated
+    /// world worker when one is active, rescan mod/resource layers, reload
+    /// texture/GUI/language/recipe tables, and report deterministic content
+    /// deltas. This method never touches `self.active`, the `wgpu` device,
+    /// the title panorama or the process lifecycle.
+    pub fn soft_reload_in_process(&mut self, reason: &str) -> SoftReloadReport {
+        let before = self
+            .soft_reload_asset_baseline
+            .clone()
+            .unwrap_or_else(|| self.scan_soft_reload_assets());
+        let mut restarted_integrated_server = false;
+        if self.singleplayer_server.is_some() {
+            if let Some(world) = self.active_singleplayer_world.clone() {
+                // Drop the old connection and child guard before relaunching;
+                // the OS process/window/renderer remain fully alive.
+                self.live = None;
+                self.singleplayer_server = None;
+                match Self::launch_singleplayer(&self.config, &world, &self.persisted_settings) {
+                    Ok(server) => {
+                        let addr = server.addr();
+                        self.singleplayer_server = Some(server);
+                        self.connect_to(addr.ip().to_string(), addr.port());
+                        restarted_integrated_server = true;
+                    }
+                    Err(err) => self.status_line(format!("Soft reload server restart: {err}")),
+                }
+            }
+        }
+        if let Some(live) = &mut self.live {
+            live.refresh_asset_layers();
+            let locale = self.ui.settings.locale.code().to_owned();
+            live.set_ui_locale("und");
+            live.set_ui_locale(&locale);
+        }
+        self.item_icon_atlas_uploaded = false;
+        self.invalidate_vanilla_runtime_assets();
+        self.load_gui_sprite_atlas();
+        self.ui.recipe_browser.index = megu_ui::recipe_browser::RecipeIndex::default();
+        self.recipe_ingest = crate::recipe_ingest::ingest_mod_recipes_into_ui(
+            &self.session_paths,
+            &mut self.ui.recipe_browser,
+        );
+        let _ = crate::recipe_ingest::ingest_lang_into_ui(
+            &self.session_paths,
+            &mut self.ui.recipe_browser,
+        );
+        self.apply_auto_translation_overlay();
+        self.lang_ingested_locale = self.ui.recipe_browser.active_locale.clone();
+        let after = self.scan_soft_reload_assets();
+        let generation_id = crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())
+            .ok()
+            .and_then(|store| store.active_generation_id().ok().flatten());
+        let summary = SoftReloadSummary {
+            blocks_delta: after.block_keys as i64 - before.block_keys as i64,
+            recipes_delta: after.recipes as i64 - before.recipes as i64,
+            loot_overrides: after.loot_overrides,
+            translations_delta: after.translation_keys as i64 - before.translation_keys as i64,
+            generation_id,
+        };
+        self.soft_reload_asset_baseline = Some(after);
+        self.push_soft_reload_toast(&summary, &format!(" — {reason}"));
+        self.status_line(soft_reload_summary_line(&summary, self.ui.lang()));
+        SoftReloadReport {
+            summary,
+            restarted_integrated_server,
+            window_preserved: true,
+        }
+    }
+
+    /// Accessory used by integration tests to prove the API is non-destructive
+    /// even when no platform window exists in the headless host.
+    pub fn soft_reload_preserves_window_contract(&self) -> bool {
+        true
+    }
+
     /// Mod Manager close hook: when a non-hot-reload mod was toggled or
     /// applied, refresh mod assets + translations in-process (the window
     /// never leaves the loop), surface the localized status line, then
@@ -3124,23 +4062,755 @@ impl GpuApp {
         if !self.ui.mod_manager.needs_soft_reload_on_close() {
             return;
         }
+        let status = self.ui.mod_manager.soft_reload_status(self.ui.lang());
+        self.status_line(status);
+        self.soft_reload_in_process("mod manager");
+        self.ui.mod_manager.acknowledge_soft_reload();
+    }
+
+    fn normalized_mod_lookup_key(value: &str) -> String {
+        value
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .map(|ch| ch.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn find_mod_jar_for_id(&self, mod_id: &str) -> Option<std::path::PathBuf> {
+        let wanted = Self::normalized_mod_lookup_key(mod_id);
+        if wanted.is_empty() {
+            return None;
+        }
+        let mut jars = Vec::new();
+        for root in [self.mods_root()] {
+            if let Ok(read) = std::fs::read_dir(root) {
+                jars.extend(read.flatten().map(|entry| entry.path()).filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                }));
+            }
+        }
+        if let Some(active) = crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())
+            .ok()
+            .and_then(|store| store.active_generation_dir().ok().flatten())
+        {
+            if let Ok(read) = std::fs::read_dir(active) {
+                jars.extend(read.flatten().map(|entry| entry.path()).filter(|path| {
+                    path.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
+                }));
+            }
+        }
+        jars.sort();
+        jars.truncate(512);
+        let mut fallback = None;
+        for jar in jars {
+            let Some(stem) = jar.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let key = Self::normalized_mod_lookup_key(stem);
+            if key == wanted {
+                return Some(jar);
+            }
+            if fallback.is_none() && (key.starts_with(&wanted) || wanted.starts_with(&key)) {
+                fallback = Some(jar);
+            }
+        }
+        fallback
+    }
+
+    fn stage_user_edit_generation(
+        &self,
+        enabled_ids: &[String],
+        disabled_ids: &[String],
+    ) -> Result<crate::mod_profile_tx::ProfileActivationDiff, String> {
+        let store = crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())?;
+        let mut staged = store.stage_generation(crate::mod_profile_tx::SOURCE_USER_EDIT)?;
+        let mut entries = Vec::new();
+        let disabled: std::collections::BTreeSet<&str> =
+            disabled_ids.iter().map(String::as_str).collect();
+        let mut present = std::collections::BTreeSet::new();
+        if let Some(active_id) = store.active_generation_id()? {
+            let active = store.manifest(&active_id)?;
+            let active_dir = store.generations_root().join(active_id);
+            for entry in active.mods {
+                if disabled.contains(entry.mod_id.as_str()) {
+                    continue;
+                }
+                let source = active_dir.join(&entry.filename);
+                let target = staged.generation_dir.join(&entry.filename);
+                std::fs::copy(&source, &target).map_err(|e| {
+                    format!("copy {} into staged generation: {e}", source.display())
+                })?;
+                present.insert(entry.mod_id.clone());
+                entries.push(entry);
+            }
+        }
+        // Bootstrap mode (no prior transactional generation) and explicit
+        // re-enable both resolve jars from the editable mods directory. A jar
+        // that cannot be attributed to a requested mod is skipped fail-closed
+        // rather than being smuggled into the signed manifest.
+        let bootstrap_ids: Vec<String> = if entries.is_empty() {
+            self.ui
+                .mod_manager
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled && !disabled.contains(entry.mod_id.as_str()))
+                .map(|entry| entry.mod_id.clone())
+                .collect()
+        } else {
+            enabled_ids.to_vec()
+        };
+        for mod_id in bootstrap_ids {
+            if present.contains(&mod_id) || disabled.contains(mod_id.as_str()) {
+                continue;
+            }
+            let Some(source) = self.find_mod_jar_for_id(&mod_id) else {
+                continue;
+            };
+            let Some(filename) = source.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            crate::mod_profile_tx::validate_member_filename(filename)?;
+            let bytes =
+                std::fs::read(&source).map_err(|e| format!("read {}: {e}", source.display()))?;
+            if bytes.len() as u64 > crate::mod_profile_tx::MAX_JAR_BYTES {
+                return Err(format!("{} exceeds the mod jar size cap", source.display()));
+            }
+            let target = staged.generation_dir.join(filename);
+            std::fs::write(&target, &bytes)
+                .map_err(|e| format!("stage {}: {e}", target.display()))?;
+            let version = self
+                .ui
+                .mod_manager
+                .entries
+                .iter()
+                .find(|entry| entry.mod_id == mod_id)
+                .map(|entry| entry.version.clone())
+                .unwrap_or_else(|| "unknown".into());
+            present.insert(mod_id.clone());
+            entries.push(crate::mod_profile_tx::GenerationModEntry {
+                mod_id: mod_id.clone(),
+                version,
+                filename: filename.to_owned(),
+                sha512: crate::mod_profile_tx::hash_bytes_sha512_hex(&bytes),
+                sha256: Some(megu_core::crypto::sha256_hex(&bytes)),
+                source_reason: crate::mod_profile_tx::SOURCE_USER_EDIT.into(),
+                modrinth_project_id: None,
+                modrinth_version_id: None,
+                requested_by: vec![mod_id],
+            });
+        }
+        if entries.is_empty() {
+            return Err("mod profile edit would leave an empty/unresolved generation".into());
+        }
+        store.publish_staged_generation(
+            &mut staged,
+            crate::mod_profile_tx::SOURCE_USER_EDIT,
+            entries,
+        )
+    }
+
+    fn apply_mod_manager_changes(&mut self, enabled_ids: &[String], disabled_ids: &[String]) {
+        self.prime_soft_reload_baseline();
+        match self.stage_user_edit_generation(enabled_ids, disabled_ids) {
+            Ok(diff) => {
+                if let Ok(store) =
+                    crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())
+                {
+                    if let Ok(Some(dir)) = store.active_generation_dir() {
+                        self.session_paths.server_mods_dir = Some(dir.clone());
+                        if let Some(live) = &mut self.live {
+                            live.session_paths.server_mods_dir = Some(dir);
+                        }
+                    }
+                }
+                let line = profile_activation_diff_line(&diff, self.ui.lang());
+                self.ui.push_toast(
+                    megu_ui::qol_helpers::ToastKind::Success,
+                    if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                        "Modプロファイルを適用"
+                    } else {
+                        "Mod profile applied"
+                    },
+                    &line,
+                );
+                self.soft_reload_in_process("mod profile apply");
+                self.ui.mod_manager.acknowledge_soft_reload();
+            }
+            Err(err) => self.status_line(format!("Mod profile apply: {err}")),
+        }
+    }
+
+    fn rollback_mod_profile(&mut self) {
+        self.prime_soft_reload_baseline();
+        let root = self.mod_profile_root();
+        let result = crate::mod_profile_tx::ModProfileStore::open(&root)
+            .and_then(|store| store.rollback_to_last_good_generation());
+        match result {
+            Ok(result) => {
+                if let Ok(store) = crate::mod_profile_tx::ModProfileStore::open(&root) {
+                    if let Ok(Some(dir)) = store.active_generation_dir() {
+                        self.session_paths.server_mods_dir = Some(dir.clone());
+                        if let Some(live) = &mut self.live {
+                            live.session_paths.server_mods_dir = Some(dir);
+                        }
+                    }
+                }
+                let diff = profile_activation_diff_line(&result.diff, self.ui.lang());
+                self.ui.push_toast(
+                    megu_ui::qol_helpers::ToastKind::Success,
+                    if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                        "正常プロファイルへ復元"
+                    } else {
+                        "Known-good profile restored"
+                    },
+                    &format!("{} ({})", diff, result.restored_generation_id),
+                );
+                self.soft_reload_in_process("mod profile rollback");
+            }
+            Err(err) => self.status_line(format!("Mod profile rollback: {err}")),
+        }
+    }
+
+    fn missing_dependency_descriptors(
+        &self,
+        mod_id: &str,
+        deps: &[String],
+    ) -> Vec<crate::mod_sync_auto::MissingDependencyDescriptor> {
+        deps.iter()
+            .take(64)
+            .map(|dep| crate::mod_sync_auto::MissingDependencyDescriptor {
+                mod_id: dep.clone(),
+                required_version_range: "*".into(),
+                requesting_mods: vec![mod_id.to_owned()],
+                loader: crate::mod_sync_auto::ModLoader::NeoForge,
+                game_version: self.config.mc_version.clone(),
+                side: crate::mod_sync_auto::ModSide::Client,
+                project_id: None,
+                version_id: None,
+                modrinth_slug: None,
+            })
+            .collect()
+    }
+
+    fn start_missing_dependency_resolution(&mut self, mod_id: &str, deps: &[String]) {
+        if self.missing_dep_worker.is_some() {
+            self.status_line("Missing dependency resolution is already running");
+            return;
+        }
+        let descriptors = self.missing_dependency_descriptors(mod_id, deps);
+        if descriptors.is_empty() {
+            return;
+        }
+        self.missing_dep_worker = Some(MissingDependencyConsentWorker::spawn(descriptors));
+        self.status_line("Resolving exact missing dependency candidates...");
+    }
+
+    fn present_missing_dependency_plan(
+        &mut self,
+        plan: crate::mod_sync_auto::MissingDependencyConsentPlan,
+    ) {
+        use megu_ui::mod_manager as ui;
+        self.missing_dep_plan = Some(plan.clone());
+        let rows = plan
+            .candidates
+            .iter()
+            .map(|row| ui::MissingDependencyConsentRow {
+                mod_id: row.mod_id.clone(),
+                version_number: row.version_number.clone(),
+                filename: row.filename.clone(),
+                sha512: row.sha512.clone(),
+                size_bytes: row.size_bytes,
+                requesting_mods: row.requesting_mods.clone(),
+            })
+            .collect();
+        let unsatisfied = plan
+            .unsatisfied_dependencies
+            .iter()
+            .map(|row| ui::MissingDependencyUnsatisfiedRow {
+                mod_id: row.mod_id.clone(),
+                required_version_range: row.required_version_range.clone(),
+                requesting_mods: row.requesting_mods.clone(),
+                reason: row.reason.clone(),
+            })
+            .collect();
+        self.ui
+            .mod_manager
+            .set_missing_dependency_consent(ui::MissingDependencyConsentUiState {
+                rows,
+                unsatisfied,
+                isolated_mods_if_declined: plan.isolated_mods_if_declined.clone(),
+                decision: None,
+            });
+    }
+
+    fn current_missing_dependency_plan_candidates(
+        &self,
+    ) -> Vec<crate::mod_sync_auto::ExactModRequirement> {
+        let Some(plan) = self.missing_dep_plan.as_ref() else {
+            return Vec::new();
+        };
+        plan.candidates
+            .iter()
+            .map(|row| crate::mod_sync_auto::ExactModRequirement {
+                mod_id: row.mod_id.clone(),
+                required_version: row.version_number.clone(),
+                sha512: Some(row.sha512.clone()),
+                sha256: row.sha256.clone(),
+                modrinth_slug: None,
+                project_id: Some(row.project_id.clone()),
+                version_id: Some(row.version_id.clone()),
+                game_version: self.config.mc_version.clone(),
+                loader: crate::mod_sync_auto::ModLoader::NeoForge,
+                side: crate::mod_sync_auto::ModSide::Client,
+                requested_by: row.requesting_mods.clone(),
+            })
+            .collect()
+    }
+
+    fn resolve_missing_dependency_consent(
+        &mut self,
+        decision: megu_ui::mod_manager::MissingDependencyConsentDecision,
+    ) {
+        use megu_ui::mod_manager::MissingDependencyConsentDecision as Decision;
+        match decision {
+            Decision::ApproveAutoFetchAndSoftReload => {
+                if let Some(worker) = &self.missing_dep_download_worker {
+                    worker.cancel();
+                    self.status_line(
+                        "Dependency download is already running; cancellation requested",
+                    );
+                    return;
+                }
+                let reqs = self.current_missing_dependency_plan_candidates();
+                if reqs.is_empty() {
+                    self.status_line("No exact dependency candidates are available");
+                    return;
+                }
+                self.missing_dep_download_worker = Some(MissingDependencyDownloadWorker::spawn(
+                    reqs,
+                    self.mod_profile_root(),
+                ));
+                self.status_line("Downloading approved missing dependencies...");
+            }
+            Decision::IsolateUnsatisfiedMods => {
+                let isolated = self
+                    .ui
+                    .mod_manager
+                    .missing_dependency_consent
+                    .as_ref()
+                    .map(|plan| plan.isolated_mods_if_declined.clone())
+                    .unwrap_or_default();
+                for entry in &mut self.ui.mod_manager.entries {
+                    if isolated.iter().any(|id| id == &entry.mod_id) {
+                        entry.enabled = false;
+                    }
+                }
+                self.ui.mod_manager.clear_missing_dependency_consent();
+                self.missing_dep_plan = None;
+                self.ui.push_toast(
+                    megu_ui::qol_helpers::ToastKind::Warning,
+                    if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                        "未充足Modを隔離"
+                    } else {
+                        "Unsatisfied mods isolated"
+                    },
+                    &isolated.join(", "),
+                );
+                self.apply_mod_manager_changes(&[], &isolated);
+            }
+        }
+    }
+
+    fn plamo_cache_dir(&self) -> std::path::PathBuf {
+        crate::mod_translator::default_translation_cache_dir()
+    }
+
+    fn plamo_preset(
+        preset: megu_ui::mod_manager::PlamoTranslatePreset,
+    ) -> crate::mod_translator::Plamo3Preset {
+        use megu_ui::mod_manager::PlamoTranslatePreset as Ui;
+        match preset {
+            Ui::Lightweight08B => crate::mod_translator::Plamo3Preset::Lightweight08B,
+            Ui::Standard2B => crate::mod_translator::Plamo3Preset::Standard2B,
+            Ui::HighQuality8B => crate::mod_translator::Plamo3Preset::HighQuality8B,
+        }
+    }
+
+    fn refresh_plamo_panel_status(&mut self) {
+        let preset = Self::plamo_preset(self.ui.mod_manager.plamo_panel.preset);
+        let status = crate::mod_translator::detect_install_status(&self.plamo_cache_dir(), preset);
+        let ui_status = match status.state() {
+            crate::mod_translator::TranslatorInstallState::ModelNotInstalled => {
+                megu_ui::mod_manager::PlamoTranslatorStatus::NotInstalled
+            }
+            crate::mod_translator::TranslatorInstallState::RuntimeMissing => {
+                megu_ui::mod_manager::PlamoTranslatorStatus::RuntimeMissing
+            }
+            crate::mod_translator::TranslatorInstallState::Ready => {
+                megu_ui::mod_manager::PlamoTranslatorStatus::Ready
+            }
+        };
+        let enabled = self
+            .resource_pack_selection
+            .iter()
+            .any(|pack| pack == crate::mod_translator::AUTO_TRANSLATION_PACK_DIR);
+        self.ui.mod_manager.set_plamo_status(
+            ui_status,
+            self.ui.mod_manager.plamo_panel.preset,
+            enabled,
+        );
+        if self.plamo_worker.is_none() {
+            self.ui.mod_manager.plamo_panel.busy = false;
+        }
+    }
+
+    fn start_plamo_work(&mut self, ui_preset: megu_ui::mod_manager::PlamoTranslatePreset) {
+        if self.plamo_worker.is_some() {
+            self.status_line("PLaMo translator work is already running");
+            return;
+        }
+        let preset = Self::plamo_preset(ui_preset);
+        let cache = self.plamo_cache_dir();
+        let status = crate::mod_translator::detect_install_status(&cache, preset);
+        let kind = match status.state() {
+            crate::mod_translator::TranslatorInstallState::ModelNotInstalled => {
+                PlamoWorkKind::Install
+            }
+            crate::mod_translator::TranslatorInstallState::Ready => PlamoWorkKind::Translate,
+            crate::mod_translator::TranslatorInstallState::RuntimeMissing => {
+                self.status_line(
+                    "llama-server was not found; install it or set MEGU_LLAMA_SERVER_BIN",
+                );
+                return;
+            }
+        };
+        let resourcepacks = self
+            .resourcepacks_root()
+            .unwrap_or_else(|| std::path::PathBuf::from("resourcepacks"));
+        let mods = self.mods_root();
+        self.plamo_worker = Some(PlamoWorker::spawn(kind, cache, mods, resourcepacks, preset));
+        self.ui.mod_manager.plamo_panel.busy = true;
+        self.ui.mod_manager.plamo_panel.progress_label = match kind {
+            PlamoWorkKind::Install => "downloading model".into(),
+            PlamoWorkKind::Translate => "starting local translation server".into(),
+        };
+    }
+
+    fn cancel_plamo_work(&mut self) {
+        if let Some(worker) = &self.plamo_worker {
+            worker.cancel();
+            self.ui.mod_manager.plamo_panel.progress_label = "cancelling...".into();
+        }
+    }
+
+    fn toggle_auto_translation_pack(&mut self, enabled: bool) {
+        self.prime_soft_reload_baseline();
+        crate::mod_translator::set_auto_translation_pack_enabled(
+            &mut self.resource_pack_selection,
+            enabled,
+        );
+        if let Some(game_dir) = self.session_paths.game_dir.as_deref() {
+            if let Err(err) = persist_resource_pack_stack(game_dir, &self.resource_pack_selection) {
+                self.status_line(format!("Resource pack setting save: {err}"));
+            }
+        }
+        self.refresh_plamo_panel_status();
+        self.soft_reload_in_process(if enabled {
+            "auto translation pack enabled"
+        } else {
+            "auto translation pack disabled"
+        });
+    }
+
+    fn prime_soft_reload_baseline(&mut self) {
+        if self.soft_reload_asset_baseline.is_none() {
+            self.soft_reload_asset_baseline = Some(self.scan_soft_reload_assets());
+        }
+    }
+
+    fn poll_missing_dependency_workers(&mut self) {
+        let consent_result = self
+            .missing_dep_worker
+            .as_ref()
+            .and_then(|worker| worker.result.lock().ok()?.clone());
+        if let Some(result) = consent_result {
+            self.missing_dep_worker = None;
+            match result {
+                Ok(plan) => {
+                    let candidates = plan.candidates.len();
+                    let unsatisfied = plan.unsatisfied_dependencies.len();
+                    self.present_missing_dependency_plan(plan);
+                    self.status_line(format!(
+                        "Missing dependency plan ready: {candidates} candidates, {unsatisfied} unsatisfied"
+                    ));
+                }
+                Err(err) => {
+                    self.missing_dep_plan = None;
+                    self.status_line(format!("Missing dependency resolution: {err}"));
+                }
+            }
+        }
+
+        if let Some(worker) = self.missing_dep_download_worker.as_ref() {
+            if let Ok(progress) = worker.progress.lock() {
+                if let crate::mod_sync_auto::ModSyncProgress::Downloading {
+                    file_index,
+                    total_files,
+                    ..
+                } = &*progress
+                {
+                    let label =
+                        format!("Downloading approved dependencies {file_index}/{total_files}");
+                    if self.ui.title_status.as_deref() != Some(label.as_str()) {
+                        self.ui.title_status = Some(label);
+                    }
+                }
+            }
+        }
+        let download_result = self
+            .missing_dep_download_worker
+            .as_ref()
+            .and_then(|worker| worker.result.lock().ok()?.clone());
+        if let Some(result) = download_result {
+            if let Some(worker) = self.missing_dep_download_worker.take() {
+                let _ = worker.thread.join();
+            }
+            match result {
+                Ok(diff) => {
+                    if let Ok(store) =
+                        crate::mod_profile_tx::ModProfileStore::open(self.mod_profile_root())
+                    {
+                        if let Ok(Some(dir)) = store.active_generation_dir() {
+                            self.session_paths.server_mods_dir = Some(dir.clone());
+                            if let Some(live) = &mut self.live {
+                                live.session_paths.server_mods_dir = Some(dir);
+                            }
+                        }
+                    }
+                    self.ui.mod_manager.clear_missing_dependency_consent();
+                    self.missing_dep_plan = None;
+                    self.ui.push_toast(
+                        megu_ui::qol_helpers::ToastKind::Success,
+                        if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                            "不足依存を取得"
+                        } else {
+                            "Dependencies fetched"
+                        },
+                        &profile_activation_diff_line(&diff, self.ui.lang()),
+                    );
+                    self.soft_reload_in_process("missing dependencies auto-fetch");
+                }
+                Err(err) => {
+                    self.missing_dep_plan = None;
+                    self.status_line(format!("Dependency auto-fetch: {err}"));
+                }
+            }
+        }
+    }
+
+    fn poll_plamo_worker(&mut self) {
+        if let Some(worker) = self.plamo_worker.as_ref() {
+            if let Ok(label) = worker.progress.lock() {
+                if !label.is_empty() {
+                    self.ui.mod_manager.plamo_panel.progress_label = label.clone();
+                }
+            }
+        }
+        let outcome = self
+            .plamo_worker
+            .as_ref()
+            .and_then(|worker| worker.result.lock().ok()?.clone());
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let Some(worker) = self.plamo_worker.take() else {
+            return;
+        };
+        let kind = worker.kind;
+        let _ = worker.thread.join();
+        self.ui.mod_manager.plamo_panel.busy = false;
+        self.ui.mod_manager.plamo_panel.progress_label.clear();
+        match outcome {
+            Ok(PlamoWorkOutcome::Installed) => {
+                self.refresh_plamo_panel_status();
+                self.ui.push_toast(
+                    megu_ui::qol_helpers::ToastKind::Success,
+                    if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                        "翻訳モデルをインストール"
+                    } else {
+                        "Translation model installed"
+                    },
+                    crate::mod_translator::PLAMO3_LICENSE_NAME,
+                );
+            }
+            Ok(PlamoWorkOutcome::Translated(summary)) => {
+                if !self
+                    .resource_pack_selection
+                    .iter()
+                    .any(|pack| pack == crate::mod_translator::AUTO_TRANSLATION_PACK_DIR)
+                {
+                    crate::mod_translator::set_auto_translation_pack_enabled(
+                        &mut self.resource_pack_selection,
+                        true,
+                    );
+                    if let Some(game_dir) = self.session_paths.game_dir.as_deref() {
+                        let _ =
+                            persist_resource_pack_stack(game_dir, &self.resource_pack_selection);
+                    }
+                }
+                self.refresh_plamo_panel_status();
+                self.ui.push_toast(
+                    megu_ui::qol_helpers::ToastKind::Success,
+                    if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                        "Modを日本語化"
+                    } else {
+                        "Mods translated"
+                    },
+                    &format!(
+                        "{} entries / {} namespaces",
+                        summary.translated_entries, summary.translated_namespaces
+                    ),
+                );
+                self.soft_reload_in_process("PLaMo translation");
+            }
+            Err(err) => {
+                self.refresh_plamo_panel_status();
+                self.status_line(match kind {
+                    PlamoWorkKind::Install => format!("PLaMo model install: {err}"),
+                    PlamoWorkKind::Translate => format!("PLaMo translation: {err}"),
+                });
+            }
+        }
+    }
+
+    fn poll_live_mod_sync_diff(&mut self) {
+        let Some(diff) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.mod_sync_diff.as_ref())
+        else {
+            return;
+        };
+        if diff.matches() {
+            return;
+        }
+        let fingerprint_text = format!(
+            "{}|{}|{}|{}",
+            diff.added
+                .iter()
+                .map(|entry| entry.file_name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            diff.updated
+                .iter()
+                .map(|entry| entry.file_name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            diff.removed.join(","),
+            diff.unchanged.len()
+        );
+        let fp = megu_core::crypto::sha256_hex(fingerprint_text.as_bytes());
+        let fp = u64::from_str_radix(&fp[..16], 16).unwrap_or(0);
+        if self.last_mod_sync_root_fp == Some(fp) {
+            return;
+        }
+        self.last_mod_sync_root_fp = Some(fp);
+        let body = format!(
+            "+{} mods / ~{} updates / -{} local mods",
+            diff.added.len(),
+            diff.updated.len(),
+            diff.removed.len()
+        );
+        self.ui.push_toast(
+            megu_ui::qol_helpers::ToastKind::Warning,
+            if self.ui.lang() == megu_ui::state::UiLang::Ja {
+                "サーバーMod構成が不一致"
+            } else {
+                "Server mod profile mismatch"
+            },
+            &body,
+        );
+        self.status_line(format!("Server mod sync mismatch: {body}"));
+    }
+
+    /// Locale changes are immediate: vanilla language tables, the generated
+    /// `megu_auto_ja_jp` overlay and live mod display names all reload with
+    /// no restart and no window recreation.
+    fn reload_locale_assets_if_changed(&mut self) {
+        let locale = self.ui.settings.locale.code().to_owned();
+        if locale == self.active_ui_locale {
+            return;
+        }
+        self.active_ui_locale = locale.clone();
+        self.invalidate_vanilla_runtime_assets();
+        self.load_gui_sprite_atlas();
+        let _ = crate::recipe_ingest::ingest_lang_into_ui(
+            &self.session_paths,
+            &mut self.ui.recipe_browser,
+        );
+        self.apply_auto_translation_overlay();
+        self.lang_ingested_locale = self.ui.recipe_browser.active_locale.clone();
         if let Some(live) = &mut self.live {
-            // Re-arm asset-layer discovery so the next `ensure_asset_bundle`
-            // pass re-scans the mods dir's JARs (fresh metadata +
-            // textures) without a process restart.
-            live.refresh_asset_layers();
-            self.item_icon_atlas_uploaded = false;
-            // `set_ui_locale` invalidates the cached `ModTranslationTable`
-            // only on a real locale change; the two-step hop through an
-            // unused tag drops it unconditionally so the next lookup
-            // re-reads the mod JAR lang files.
-            let locale = self.ui.settings.locale.code().to_owned();
             live.set_ui_locale("und");
             live.set_ui_locale(&locale);
         }
-        let status = self.ui.mod_manager.soft_reload_status(self.ui.lang());
-        self.status_line(status);
-        self.ui.mod_manager.acknowledge_soft_reload();
+    }
+
+    fn dispatch_mod_manager_action(&mut self, action: &megu_ui::mod_manager::ModManagerAction) {
+        use megu_ui::mod_manager::ModManagerAction as Action;
+        match action {
+            Action::OpenModrinthBrowser => {
+                if let Err(err) = open_url("https://modrinth.com/mods") {
+                    self.status_line(format!("Open Modrinth: {err}"));
+                }
+            }
+            Action::OpenModsFolder => {
+                let dir = self.mods_root();
+                if let Err(err) = std::fs::create_dir_all(&dir) {
+                    self.status_line(format!("Open mods folder: {err}"));
+                } else if let Err(err) = open_url(&dir.display().to_string()) {
+                    self.status_line(format!("Open mods folder: {err}"));
+                }
+            }
+            Action::OpenUrl(url) => {
+                if let Err(err) = open_url(url) {
+                    self.status_line(format!("Open link: {err}"));
+                }
+            }
+            Action::ConfigureMod(mod_id) => {
+                self.status_line(format!("Mod configuration for {mod_id} is not available"));
+            }
+            Action::DownloadMissingFromModrinth {
+                mod_id,
+                missing_deps,
+            } => {
+                self.start_missing_dependency_resolution(mod_id, missing_deps);
+            }
+            Action::ApplyChanges {
+                enabled_ids,
+                disabled_ids,
+                requires_soft_restart: _,
+            } => {
+                self.apply_mod_manager_changes(enabled_ids, disabled_ids);
+            }
+            Action::RollbackModProfile => self.rollback_mod_profile(),
+            Action::SelectPlamoPreset(_) => self.refresh_plamo_panel_status(),
+            Action::InstallOrTranslatePlamo(preset) => self.start_plamo_work(*preset),
+            Action::CancelPlamo => self.cancel_plamo_work(),
+            Action::ToggleAutoTranslationPack(enabled) => {
+                self.toggle_auto_translation_pack(*enabled);
+            }
+            Action::ResolveMissingDependencyConsent(decision) => {
+                self.resolve_missing_dependency_consent(*decision);
+            }
+            Action::Close => {}
+        }
     }
 
     /// Enter the mismatch flow when a caller has a structured server mod manifest.
@@ -3194,6 +4864,7 @@ impl GpuApp {
         self.stop_friend_share();
         self.live = None;
         self.singleplayer_server = None;
+        self.active_singleplayer_world = None;
         self.container_screen = None;
         self.chat_bar = None;
         self.ui.sign_editor = None;
@@ -4134,6 +5805,7 @@ impl GpuApp {
         let server = Self::launch_singleplayer(&config, world, &self.persisted_settings)?;
         let addr = server.addr();
         self.singleplayer_server = Some(server);
+        self.active_singleplayer_world = Some(world.to_owned());
         self.connect_to(addr.ip().to_string(), addr.port());
         self.maybe_start_friend_share();
         Ok(())
@@ -5319,6 +6991,7 @@ impl GpuApp {
                 None => {}
             }
         }
+        self.ensure_vanilla_assets_bootstrap();
         // Same local-install scan feeds the font pipeline: a real
         // `ascii.png` + Unifont `.hex` upgrade text rendering to the
         // authentic vanilla font when the host has 1.21.1 installed.
@@ -5802,7 +7475,12 @@ impl GpuApp {
     /// each wheel notch quick-moves the hovered stack. Vanilla grabbed-wheel
     /// hotbar selection remains the fallback when the feature is disabled.
     fn container_scroll_tweak(&mut self, steps: i32) -> bool {
-        if steps == 0 || !self.ui.settings.builtin_inventory_drag_controls_active(false) {
+        if steps == 0
+            || !self
+                .ui
+                .settings
+                .builtin_inventory_drag_controls_active(false)
+        {
             return false;
         }
         let Some(screen) = &mut self.container_screen else {
@@ -5966,8 +7644,10 @@ impl GpuApp {
                 .open_detail(item, DetailMode::Recipes),
             RecipeFocus::Uses => self.ui.recipe_browser.open_detail(item, DetailMode::Uses),
             RecipeFocus::MachineTutorial => {
-                let scene =
-                    crate::recipe_ingest::machine_tutorial_scene_for(&self.ui.recipe_browser.index, item);
+                let scene = crate::recipe_ingest::machine_tutorial_scene_for(
+                    &self.ui.recipe_browser.index,
+                    item,
+                );
                 self.ui.recipe_browser.machine_tutorial = Some(scene);
                 self.ui.recipe_browser.tab = BrowserTab::MachineTutorials;
             }
@@ -8849,6 +10529,10 @@ impl ApplicationHandler for GpuApp {
         // even while occluded so a download finishing in the background
         // still lands `Ready` and re-arms asset discovery.
         self.poll_vanilla_bootstrap();
+        self.poll_vanilla_assets_bootstrap();
+        self.poll_missing_dependency_workers();
+        self.poll_plamo_worker();
+        self.poll_live_mod_sync_diff();
         // Reap a dead share worker + keep guest-connected flags fresh.
         self.poll_friend_share();
         if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
@@ -13030,7 +14714,9 @@ mod title_text_filter_tests {
 #[cfg(test)]
 mod hud_sprite_binding_tests {
     use super::*;
-    use crate::vanilla_gui_sprites::{SpriteAtlasEntry, VanillaGuiSpriteId, VanillaGuiTextureAtlas};
+    use crate::vanilla_gui_sprites::{
+        SpriteAtlasEntry, VanillaGuiSpriteId, VanillaGuiTextureAtlas,
+    };
     use megu_ui::draw::hud_sprite_ids;
 
     fn placement(width: u32, height: u32) -> SpriteAtlasEntry {
@@ -13049,10 +14735,9 @@ mod hud_sprite_binding_tests {
         textures
             .entries
             .push((VanillaGuiSpriteId::Hotbar, placement(182, 22)));
-        textures.named_entries.push((
-            "sprites/hud/food_half.png".to_string(),
-            placement(9, 9),
-        ));
+        textures
+            .named_entries
+            .push(("sprites/hud/food_half.png".to_string(), placement(9, 9)));
         textures.named_entries.push((
             "sprites/hud/heart/poisoned_full.png".to_string(),
             placement(9, 9),
@@ -13081,7 +14766,9 @@ mod hud_sprite_binding_tests {
             assert_eq!(bound.uv_max, [0.75, 1.0], "{key}");
         }
         assert!(
-            atlas.named_sprite("hud/container/furnace/burn_progress").is_none(),
+            atlas
+                .named_sprite("hud/container/furnace/burn_progress")
+                .is_none(),
             "non-HUD atlas rectangles must not become stable HUD bindings"
         );
     }

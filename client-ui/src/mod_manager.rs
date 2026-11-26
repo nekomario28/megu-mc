@@ -851,6 +851,143 @@ impl ModManagerSort {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PLaMo 3 Translate + missing-dependency consent state
+// ---------------------------------------------------------------------------
+
+/// User-facing model preset for the on-demand Japanese translator.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlamoTranslatePreset {
+    /// 0.8B — smallest download and lightest CPU runtime.
+    Lightweight08B,
+    /// 2B — recommended balance.
+    #[default]
+    Standard2B,
+    /// 8B — highest quality.
+    HighQuality8B,
+}
+
+impl PlamoTranslatePreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lightweight08B => "0.8B (軽量)",
+            Self::Standard2B => "2B (推奨)",
+            Self::HighQuality8B => "8B (高品質)",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Lightweight08B => Self::Standard2B,
+            Self::Standard2B => Self::HighQuality8B,
+            Self::HighQuality8B => Self::Lightweight08B,
+        }
+    }
+}
+
+/// Host-reported install state of the translator model/runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlamoTranslatorStatus {
+    /// Neither model nor chat template is installed.
+    #[default]
+    NotInstalled,
+    /// Model files exist, but the loopback inference runtime is missing.
+    RuntimeMissing,
+    /// Model and runtime are both available.
+    Ready,
+}
+
+/// Pure UI state for the PLaMo 3 Translate panel. The host performs every
+/// download/inference side effect; this state only drives labels and input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlamoTranslatorPanel {
+    pub preset: PlamoTranslatePreset,
+    pub status: PlamoTranslatorStatus,
+    pub auto_pack_enabled: bool,
+    pub busy: bool,
+    pub progress_label: String,
+}
+
+impl Default for PlamoTranslatorPanel {
+    fn default() -> Self {
+        Self {
+            preset: PlamoTranslatePreset::Standard2B,
+            status: PlamoTranslatorStatus::NotInstalled,
+            auto_pack_enabled: false,
+            busy: false,
+            progress_label: String::new(),
+        }
+    }
+}
+
+impl PlamoTranslatorPanel {
+    /// Exact primary action label for the current install state.
+    pub fn action_label(&self) -> &'static str {
+        match self.status {
+            PlamoTranslatorStatus::NotInstalled => "[翻訳モデルをインストール]",
+            PlamoTranslatorStatus::RuntimeMissing => {
+                "[llama-server を導入してください / インストール]"
+            }
+            PlamoTranslatorStatus::Ready => "[未翻訳 Mod を日本語化]",
+        }
+    }
+
+    pub fn auto_pack_label(&self) -> String {
+        format!(
+            "[自動翻訳パック: {}]",
+            if self.auto_pack_enabled { "ON" } else { "OFF" }
+        )
+    }
+
+    /// The primary button is active only when a translation can actually be
+    /// started; a missing runtime is explanatory rather than a dead download.
+    pub fn action_enabled(&self) -> bool {
+        !self.busy && self.status != PlamoTranslatorStatus::RuntimeMissing
+    }
+}
+
+/// One exact Modrinth download candidate displayed in the consent prompt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingDependencyConsentRow {
+    pub mod_id: String,
+    pub version_number: String,
+    pub filename: String,
+    pub sha512: String,
+    pub size_bytes: u64,
+    pub requesting_mods: Vec<String>,
+}
+
+/// One dependency no exact candidate could satisfy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MissingDependencyUnsatisfiedRow {
+    pub mod_id: String,
+    pub required_version_range: String,
+    pub requesting_mods: Vec<String>,
+    pub reason: String,
+}
+
+/// Structured missing-dependency consent plan displayed by Mod Manager.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissingDependencyConsentUiState {
+    pub rows: Vec<MissingDependencyConsentRow>,
+    pub unsatisfied: Vec<MissingDependencyUnsatisfiedRow>,
+    pub isolated_mods_if_declined: Vec<String>,
+    pub decision: Option<MissingDependencyConsentDecision>,
+}
+
+/// Explicit consent decision emitted as a host action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingDependencyConsentDecision {
+    ApproveAutoFetchAndSoftReload,
+    IsolateUnsatisfiedMods,
+}
+
+impl MissingDependencyConsentUiState {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.unsatisfied.is_empty()
+    }
+}
+
 /// Every interactive element on the screen.
 ///
 /// `ModRow` carries the row's index in the *currently visible* (filtered,
@@ -910,6 +1047,20 @@ pub enum ModManagerWidgetId {
     OpenModsFolder,
     /// Footer "Apply" (batches pending enable/disable changes).
     ApplyChanges,
+    /// Roll back to the last known-good transactional mod profile.
+    RollbackProfile,
+    /// Cycle the PLaMo 3 Translate preset (0.8B/2B/8B).
+    PlamoPreset,
+    /// PLaMo install/translate primary action.
+    PlamoAction,
+    /// Cancel the running model download/translation worker.
+    CancelPlamo,
+    /// Instant `megu_auto_ja_jp` resource-pack toggle.
+    ToggleAutoTranslationPack,
+    /// Consent: auto-fetch exact missing dependencies and soft reload.
+    ConsentApproveAutoFetch,
+    /// Consent: isolate unsatisfied mods and continue.
+    ConsentIsolateMods,
     /// Footer "Done".
     Done,
 }
@@ -956,6 +1107,19 @@ pub enum ModManagerAction {
         disabled_ids: Vec<String>,
         requires_soft_restart: bool,
     },
+    /// Activate the store's last known-good generation, then soft reload.
+    RollbackModProfile,
+    /// Cycle the translator preset; the host reads `plamo_panel.preset`.
+    SelectPlamoPreset(PlamoTranslatePreset),
+    /// Install the model or translate untranslated mods, depending on
+    /// `plamo_panel.status`.
+    InstallOrTranslatePlamo(PlamoTranslatePreset),
+    /// Cancel the running translator download/translation worker.
+    CancelPlamo,
+    /// Flip the generated `megu_auto_ja_jp` language pack instantly.
+    ToggleAutoTranslationPack(bool),
+    /// Exact consent decision for a structured missing-dependency plan.
+    ResolveMissingDependencyConsent(MissingDependencyConsentDecision),
     /// Leave the screen (Done / Escape / gamepad East).
     Close,
 }
@@ -1139,6 +1303,10 @@ pub struct ModManagerState {
     scroll: usize,
     /// Staged enable overrides: `mod_id` → desired enabled state.
     pending: BTreeMap<String, bool>,
+    /// PLaMo 3 Translate panel mirrored from the host's install status.
+    pub plamo_panel: PlamoTranslatorPanel,
+    /// Structured missing-dependency consent plan awaiting a decision.
+    pub missing_dependency_consent: Option<MissingDependencyConsentUiState>,
 }
 
 /// Build the Browse catalog: all community entries first, then the
@@ -1191,6 +1359,8 @@ impl Default for ModManagerState {
             selected: 0,
             scroll: 0,
             pending: BTreeMap::new(),
+            plamo_panel: PlamoTranslatorPanel::default(),
+            missing_dependency_consent: None,
         }
     }
 }
@@ -1277,21 +1447,22 @@ impl ModManagerState {
     /// Metadata backing a catalog row (`None` for installed entries).
     fn catalog_meta(&self, entry_index: usize) -> Option<CatalogMeta<'_>> {
         match self.filter {
-            ModManagerFilter::RecommendedQol => {
-                Some(CatalogMeta::Curated(&CURATED_MODRINTH_QOL_MODS[entry_index]))
+            ModManagerFilter::RecommendedQol => Some(CatalogMeta::Curated(
+                &CURATED_MODRINTH_QOL_MODS[entry_index],
+            )),
+            ModManagerFilter::Browse => {
+                self.browse_sources
+                    .get(entry_index)
+                    .copied()
+                    .map(|source| match source {
+                        BrowseSource::Community(i) => {
+                            CatalogMeta::Community(&RECOMMENDED_COMMUNITY_MODS[i])
+                        }
+                        BrowseSource::Curated(i) => {
+                            CatalogMeta::Curated(&CURATED_MODRINTH_QOL_MODS[i])
+                        }
+                    })
             }
-            ModManagerFilter::Browse => self
-                .browse_sources
-                .get(entry_index)
-                .copied()
-                .map(|source| match source {
-                    BrowseSource::Community(i) => {
-                        CatalogMeta::Community(&RECOMMENDED_COMMUNITY_MODS[i])
-                    }
-                    BrowseSource::Curated(i) => {
-                        CatalogMeta::Curated(&CURATED_MODRINTH_QOL_MODS[i])
-                    }
-                }),
             _ => None,
         }
     }
@@ -1349,6 +1520,28 @@ impl ModManagerState {
             "Applying mod changes (soft reload)...",
             "Mod変更を適用中（内部再読み込み）...",
         )
+    }
+
+    /// Install/replace the structured missing-dependency consent plan.
+    pub fn set_missing_dependency_consent(&mut self, plan: MissingDependencyConsentUiState) {
+        self.missing_dependency_consent = (!plan.is_empty()).then_some(plan);
+    }
+
+    /// Clear the consent plan after the host consumes a decision.
+    pub fn clear_missing_dependency_consent(&mut self) {
+        self.missing_dependency_consent = None;
+    }
+
+    /// Mirror the host-detected translator status/preset into the panel.
+    pub fn set_plamo_status(
+        &mut self,
+        status: PlamoTranslatorStatus,
+        preset: PlamoTranslatePreset,
+        auto_pack_enabled: bool,
+    ) {
+        self.plamo_panel.status = status;
+        self.plamo_panel.preset = preset;
+        self.plamo_panel.auto_pack_enabled = auto_pack_enabled;
     }
 
     /// Deference for the currently enabled installed mods, including staged
@@ -1626,12 +1819,8 @@ impl ModManagerState {
                 }
             }
             ModManagerWidgetId::FilterBrowse => self.set_filter(ModManagerFilter::Browse),
-            ModManagerWidgetId::BrowseQolHud => {
-                self.set_browse_category(BrowseCategory::QolHud)
-            }
-            ModManagerWidgetId::BrowseContent => {
-                self.set_browse_category(BrowseCategory::Content)
-            }
+            ModManagerWidgetId::BrowseQolHud => self.set_browse_category(BrowseCategory::QolHud),
+            ModManagerWidgetId::BrowseContent => self.set_browse_category(BrowseCategory::Content),
             ModManagerWidgetId::BrowsePacks => self.set_browse_category(BrowseCategory::Packs),
             ModManagerWidgetId::BrowseKind => {
                 self.browse_project_kind = self.browse_project_kind.next();
@@ -1646,11 +1835,15 @@ impl ModManagerState {
                     ))];
                 }
             }
-            ModManagerWidgetId::QolHudInfo => self.set_recommended_category(QolSubCategory::HudInfo),
+            ModManagerWidgetId::QolHudInfo => {
+                self.set_recommended_category(QolSubCategory::HudInfo)
+            }
             ModManagerWidgetId::QolInventoryInput => {
                 self.set_recommended_category(QolSubCategory::InventoryInput)
             }
-            ModManagerWidgetId::QolRecipes => self.set_recommended_category(QolSubCategory::Recipes),
+            ModManagerWidgetId::QolRecipes => {
+                self.set_recommended_category(QolSubCategory::Recipes)
+            }
             ModManagerWidgetId::QolVisualsCompat => {
                 self.set_recommended_category(QolSubCategory::VisualsCompat)
             }
@@ -1683,6 +1876,51 @@ impl ModManagerState {
                             missing_deps: entry.missing_deps.clone(),
                         }];
                     }
+                }
+            }
+            ModManagerWidgetId::RollbackProfile => {
+                return vec![ModManagerAction::RollbackModProfile];
+            }
+            ModManagerWidgetId::PlamoPreset => {
+                self.plamo_panel.preset = self.plamo_panel.preset.next();
+                return vec![ModManagerAction::SelectPlamoPreset(self.plamo_panel.preset)];
+            }
+            ModManagerWidgetId::PlamoAction => {
+                if self.plamo_panel.action_enabled() {
+                    self.plamo_panel.busy = true;
+                    return vec![ModManagerAction::InstallOrTranslatePlamo(
+                        self.plamo_panel.preset,
+                    )];
+                }
+            }
+            ModManagerWidgetId::CancelPlamo => {
+                if self.plamo_panel.busy {
+                    self.plamo_panel.progress_label =
+                        tr(self.lang, "Cancelling...", "キャンセルしています...").to_owned();
+                    return vec![ModManagerAction::CancelPlamo];
+                }
+            }
+            ModManagerWidgetId::ToggleAutoTranslationPack => {
+                self.plamo_panel.auto_pack_enabled = !self.plamo_panel.auto_pack_enabled;
+                return vec![ModManagerAction::ToggleAutoTranslationPack(
+                    self.plamo_panel.auto_pack_enabled,
+                )];
+            }
+            ModManagerWidgetId::ConsentApproveAutoFetch => {
+                if let Some(plan) = &mut self.missing_dependency_consent {
+                    plan.decision =
+                        Some(MissingDependencyConsentDecision::ApproveAutoFetchAndSoftReload);
+                    return vec![ModManagerAction::ResolveMissingDependencyConsent(
+                        MissingDependencyConsentDecision::ApproveAutoFetchAndSoftReload,
+                    )];
+                }
+            }
+            ModManagerWidgetId::ConsentIsolateMods => {
+                if let Some(plan) = &mut self.missing_dependency_consent {
+                    plan.decision = Some(MissingDependencyConsentDecision::IsolateUnsatisfiedMods);
+                    return vec![ModManagerAction::ResolveMissingDependencyConsent(
+                        MissingDependencyConsentDecision::IsolateUnsatisfiedMods,
+                    )];
                 }
             }
             ModManagerWidgetId::ConfigureMod => {
@@ -1965,10 +2203,7 @@ impl ModManagerState {
             // Right-align the tail so the newest characters stay visible.
             let char_cells = crate::draw::text_cells(&shown);
             if char_cells > cells {
-                shown = format!(
-                    "...{}",
-                    crate::draw::last_cells(&shown, cells - 3)
-                );
+                shown = format!("...{}", crate::draw::last_cells(&shown, cells - 3));
             }
             lay.text_fit(field.x + 5, field.y + 4, 1, palette::TEXT, &shown, cells);
         }
@@ -2011,118 +2246,118 @@ impl ModManagerState {
 
     fn render_filter_row(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let lang = self.lang;
-        let pills: Vec<(String, ModManagerWidgetId, bool)> = if self.filter == ModManagerFilter::Browse
-        {
-            // Unified browse: Installed keeps the left slot, then the
-            // three shelves and the live-search project kind.
-            vec![
-                (
-                    tr(lang, "Installed", "インストール済").to_owned(),
-                    ModManagerWidgetId::FilterAll,
-                    false,
-                ),
-                (
-                    BrowseCategory::QolHud.label(lang).to_owned(),
-                    ModManagerWidgetId::BrowseQolHud,
-                    self.browse_category == BrowseCategory::QolHud,
-                ),
-                (
-                    BrowseCategory::Content.label(lang).to_owned(),
-                    ModManagerWidgetId::BrowseContent,
-                    self.browse_category == BrowseCategory::Content,
-                ),
-                (
-                    BrowseCategory::Packs.label(lang).to_owned(),
-                    ModManagerWidgetId::BrowsePacks,
-                    self.browse_category == BrowseCategory::Packs,
-                ),
-                (
-                    format!(
-                        "{}: {}",
-                        tr(lang, "Kind", "タイプ"),
-                        self.browse_project_kind.label()
+        let pills: Vec<(String, ModManagerWidgetId, bool)> =
+            if self.filter == ModManagerFilter::Browse {
+                // Unified browse: Installed keeps the left slot, then the
+                // three shelves and the live-search project kind.
+                vec![
+                    (
+                        tr(lang, "Installed", "インストール済").to_owned(),
+                        ModManagerWidgetId::FilterAll,
+                        false,
                     ),
-                    ModManagerWidgetId::BrowseKind,
-                    false,
-                ),
-            ]
-        } else if self.filter == ModManagerFilter::RecommendedQol {
-            vec![
-                (
-                    tr(lang, "Installed", "インストール済").to_owned(),
-                    ModManagerWidgetId::FilterAll,
-                    false,
-                ),
-                (
-                    "Recommended QoL".to_owned(),
-                    ModManagerWidgetId::FilterRecommendedQol,
-                    self.recommended_category.is_none(),
-                ),
-                (
-                    "HUD".to_owned(),
-                    ModManagerWidgetId::QolHudInfo,
-                    self.recommended_category == Some(QolSubCategory::HudInfo),
-                ),
-                (
-                    "Inventory".to_owned(),
-                    ModManagerWidgetId::QolInventoryInput,
-                    self.recommended_category == Some(QolSubCategory::InventoryInput),
-                ),
-                (
-                    "Recipes".to_owned(),
-                    ModManagerWidgetId::QolRecipes,
-                    self.recommended_category == Some(QolSubCategory::Recipes),
-                ),
-                (
-                    "Visuals".to_owned(),
-                    ModManagerWidgetId::QolVisualsCompat,
-                    self.recommended_category == Some(QolSubCategory::VisualsCompat),
-                ),
-            ]
-        } else {
-            vec![
-                (
-                    tr(lang, "All", "すべて").to_owned(),
-                    ModManagerWidgetId::FilterAll,
-                    self.filter == ModManagerFilter::All,
-                ),
-                (
-                    tr(lang, "Enabled", "有効").to_owned(),
-                    ModManagerWidgetId::FilterEnabled,
-                    self.filter == ModManagerFilter::Enabled,
-                ),
-                (
-                    tr(lang, "Issues", "問題あり").to_owned(),
-                    ModManagerWidgetId::FilterIssues,
-                    self.filter == ModManagerFilter::Issues,
-                ),
-                (
-                    tr(lang, "Native", "ネイティブ").to_owned(),
-                    ModManagerWidgetId::FilterNative,
-                    self.filter == ModManagerFilter::Native,
-                ),
-                (
-                    "QoL".to_owned(),
-                    ModManagerWidgetId::FilterRecommendedQol,
-                    false,
-                ),
-                (
-                    tr(lang, "+ Browse", "+ ブラウズ").to_owned(),
-                    ModManagerWidgetId::FilterBrowse,
-                    false,
-                ),
-                (
-                    if self.show_libraries {
-                        tr(lang, "Libs: ON", "ライブラリ: ON")
-                    } else {
-                        tr(lang, "Libs: OFF", "ライブラリ: OFF")
-                    }
-                    .to_owned(),
-                    ModManagerWidgetId::ToggleLibraries,
-                    self.show_libraries,
-                ),
-            ]
-        };
+                    (
+                        BrowseCategory::QolHud.label(lang).to_owned(),
+                        ModManagerWidgetId::BrowseQolHud,
+                        self.browse_category == BrowseCategory::QolHud,
+                    ),
+                    (
+                        BrowseCategory::Content.label(lang).to_owned(),
+                        ModManagerWidgetId::BrowseContent,
+                        self.browse_category == BrowseCategory::Content,
+                    ),
+                    (
+                        BrowseCategory::Packs.label(lang).to_owned(),
+                        ModManagerWidgetId::BrowsePacks,
+                        self.browse_category == BrowseCategory::Packs,
+                    ),
+                    (
+                        format!(
+                            "{}: {}",
+                            tr(lang, "Kind", "タイプ"),
+                            self.browse_project_kind.label()
+                        ),
+                        ModManagerWidgetId::BrowseKind,
+                        false,
+                    ),
+                ]
+            } else if self.filter == ModManagerFilter::RecommendedQol {
+                vec![
+                    (
+                        tr(lang, "Installed", "インストール済").to_owned(),
+                        ModManagerWidgetId::FilterAll,
+                        false,
+                    ),
+                    (
+                        "Recommended QoL".to_owned(),
+                        ModManagerWidgetId::FilterRecommendedQol,
+                        self.recommended_category.is_none(),
+                    ),
+                    (
+                        "HUD".to_owned(),
+                        ModManagerWidgetId::QolHudInfo,
+                        self.recommended_category == Some(QolSubCategory::HudInfo),
+                    ),
+                    (
+                        "Inventory".to_owned(),
+                        ModManagerWidgetId::QolInventoryInput,
+                        self.recommended_category == Some(QolSubCategory::InventoryInput),
+                    ),
+                    (
+                        "Recipes".to_owned(),
+                        ModManagerWidgetId::QolRecipes,
+                        self.recommended_category == Some(QolSubCategory::Recipes),
+                    ),
+                    (
+                        "Visuals".to_owned(),
+                        ModManagerWidgetId::QolVisualsCompat,
+                        self.recommended_category == Some(QolSubCategory::VisualsCompat),
+                    ),
+                ]
+            } else {
+                vec![
+                    (
+                        tr(lang, "All", "すべて").to_owned(),
+                        ModManagerWidgetId::FilterAll,
+                        self.filter == ModManagerFilter::All,
+                    ),
+                    (
+                        tr(lang, "Enabled", "有効").to_owned(),
+                        ModManagerWidgetId::FilterEnabled,
+                        self.filter == ModManagerFilter::Enabled,
+                    ),
+                    (
+                        tr(lang, "Issues", "問題あり").to_owned(),
+                        ModManagerWidgetId::FilterIssues,
+                        self.filter == ModManagerFilter::Issues,
+                    ),
+                    (
+                        tr(lang, "Native", "ネイティブ").to_owned(),
+                        ModManagerWidgetId::FilterNative,
+                        self.filter == ModManagerFilter::Native,
+                    ),
+                    (
+                        "QoL".to_owned(),
+                        ModManagerWidgetId::FilterRecommendedQol,
+                        false,
+                    ),
+                    (
+                        tr(lang, "+ Browse", "+ ブラウズ").to_owned(),
+                        ModManagerWidgetId::FilterBrowse,
+                        false,
+                    ),
+                    (
+                        if self.show_libraries {
+                            tr(lang, "Libs: ON", "ライブラリ: ON")
+                        } else {
+                            tr(lang, "Libs: OFF", "ライブラリ: OFF")
+                        }
+                        .to_owned(),
+                        ModManagerWidgetId::ToggleLibraries,
+                        self.show_libraries,
+                    ),
+                ]
+            };
         let mut x = MARGIN + 4;
         for (label, id, active) in pills {
             let w = crate::draw::text_width(&label, 1) as i32 + 12;
@@ -2433,6 +2668,38 @@ impl ModManagerState {
                 tr(lang, "Configure", "設定").to_owned(),
                 entry.has_config,
             ));
+            buttons.push((
+                ModManagerWidgetId::RollbackProfile,
+                tr(
+                    lang,
+                    "Rollback to Last Known-Good Profile",
+                    "直前の正常プロファイルへ戻す",
+                )
+                .to_owned(),
+                true,
+            ));
+            buttons.push((
+                ModManagerWidgetId::PlamoPreset,
+                self.plamo_panel.preset.label().to_owned(),
+                !self.plamo_panel.busy,
+            ));
+            buttons.push((
+                ModManagerWidgetId::PlamoAction,
+                self.plamo_panel.action_label().to_owned(),
+                self.plamo_panel.action_enabled(),
+            ));
+            buttons.push((
+                ModManagerWidgetId::ToggleAutoTranslationPack,
+                self.plamo_panel.auto_pack_label(),
+                !self.plamo_panel.busy,
+            ));
+            if self.plamo_panel.busy {
+                buttons.push((
+                    ModManagerWidgetId::CancelPlamo,
+                    tr(lang, "Cancel Translation Work", "翻訳処理をキャンセル").to_owned(),
+                    true,
+                ));
+            }
         }
         for (id, url, label) in [
             (
@@ -2565,6 +2832,134 @@ impl ModManagerState {
 
         // ---- header block (name / meta / badges / authors / license) ---
         let mut y = pane.y + 5;
+
+        // Structured exact-candidate consent is more important than the
+        // mod's prose metadata: every version, hash, size and requester is
+        // visible before either destructive-or-network decision is armed.
+        if !catalog {
+            if let Some(plan) = &self.missing_dependency_consent {
+                let row_lines = plan.rows.len().min(4)
+                    + plan.unsatisfied.len().min(2)
+                    + usize::from(plan.rows.len() > 4 || plan.unsatisfied.len() > 2);
+                let box_h = 28 + row_lines as i32 * 10 + 18;
+                if warn_bottom - y >= box_h + 20 {
+                    let consent = UiRect::new(tx, y, tw as u32, box_h as u32);
+                    lay.fill_rect(consent, WARN_BG);
+                    lay.border_rect(consent, palette::WARNING);
+                    let mut cy = y + 4;
+                    lay.text_fit(
+                        tx + 5,
+                        cy,
+                        1,
+                        palette::WARNING,
+                        tr(
+                            lang,
+                            "Missing dependencies — exact Modrinth candidates:",
+                            "不足依存 — Modrinth候補（完全一致）:",
+                        ),
+                        cells.saturating_sub(1),
+                    );
+                    cy += 10;
+                    let mut line_count = 0usize;
+                    for row in plan.rows.iter().take(4) {
+                        let requesters = if row.requesting_mods.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" <- {}", row.requesting_mods.join(","))
+                        };
+                        lay.text_fit(
+                            tx + 8,
+                            cy,
+                            1,
+                            palette::TEXT,
+                            &format!(
+                                "{} {} {} ({} bytes, sha512 {}){}",
+                                row.mod_id,
+                                row.version_number,
+                                row.filename,
+                                row.size_bytes,
+                                crate::draw::first_cells(&row.sha512, 12),
+                                requesters
+                            ),
+                            cells.saturating_sub(2),
+                        );
+                        cy += 10;
+                        line_count += 1;
+                    }
+                    for row in plan.unsatisfied.iter().take(2) {
+                        lay.text_fit(
+                            tx + 8,
+                            cy,
+                            1,
+                            palette::WARNING,
+                            &format!(
+                                "! {} {}: {}",
+                                row.mod_id, row.required_version_range, row.reason
+                            ),
+                            cells.saturating_sub(2),
+                        );
+                        cy += 10;
+                        line_count += 1;
+                    }
+                    if plan.rows.len() + plan.unsatisfied.len() > line_count {
+                        lay.text_fit(
+                            tx + 8,
+                            cy,
+                            1,
+                            palette::TEXT_DIM,
+                            &format!(
+                                "+{} more",
+                                plan.rows.len() + plan.unsatisfied.len() - line_count
+                            ),
+                            cells.saturating_sub(2),
+                        );
+                    }
+                    let approve = tr(
+                        lang,
+                        "不足依存を自動取得して再読込",
+                        "不足依存を自動取得して再読込",
+                    );
+                    let isolate = tr(
+                        lang,
+                        "未充足 Mod を隔離して続行",
+                        "未充足 Mod を隔離して続行",
+                    );
+                    let gap = 4;
+                    let aw = (crate::draw::text_width(approve, 1) as i32 + 10).min((tw - gap) / 2);
+                    let iw = (crate::draw::text_width(isolate, 1) as i32 + 10).min((tw - gap) / 2);
+                    let by = consent.bottom() - 17;
+                    let approve_rect = UiRect::new(tx + 4, by, aw.max(24) as u32, 14);
+                    let isolate_rect = UiRect::new(tx + 4 + aw + gap, by, iw.max(24) as u32, 14);
+                    for (rect, id, label) in [
+                        (
+                            approve_rect,
+                            ModManagerWidgetId::ConsentApproveAutoFetch,
+                            approve,
+                        ),
+                        (
+                            isolate_rect,
+                            ModManagerWidgetId::ConsentIsolateMods,
+                            isolate,
+                        ),
+                    ] {
+                        let hovered = self.hover == Some(id);
+                        lay.fill_rect(
+                            rect,
+                            if hovered {
+                                palette::BUTTON_HOVER
+                            } else {
+                                palette::WARNING
+                            },
+                        );
+                        lay.border_rect(rect, palette::BUTTON_BORDER);
+                        lay.ctext_in(rect, 1, palette::TEXT_DARK, label);
+                        lay.region(hits, id, rect);
+                    }
+                    y += box_h + 4;
+                }
+            }
+        }
+
         let name_scale = if text_width(&entry.name, 2) as i32 <= tw {
             2
         } else {
@@ -2759,6 +3154,45 @@ impl ModManagerState {
         }
         y += 3;
 
+        // PLaMo guidance/license notice is part of the manager surface, not
+        // a hidden terminal prompt: the model is downloaded only after the
+        // explicit button press and the local runtime is transient.
+        if !catalog && warn_bottom - y >= 30 {
+            lay.text_fit(
+                tx,
+                y,
+                1,
+                palette::TEXT_DIM,
+                tr(
+                    lang,
+                    "PLaMo 3 Translate — PLaMo Community License",
+                    "PLaMo 3 Translate — PLaMo Community License",
+                ),
+                cells,
+            );
+            y += 10;
+            let guidance = if lang == UiLang::Ja {
+                "ローカル LLM は翻訳中だけ起動し、終了直後に停止します（プレイ中メモリ不使用）。"
+            } else {
+                "The local LLM runs only while translating and exits immediately afterwards."
+            };
+            for line in wrap_text(guidance, cells).into_iter().take(2) {
+                lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
+                y += 10;
+            }
+            if self.plamo_panel.busy && !self.plamo_panel.progress_label.is_empty() {
+                lay.text_fit(
+                    tx,
+                    y,
+                    1,
+                    palette::WARNING,
+                    &self.plamo_panel.progress_label,
+                    cells,
+                );
+                y += 10;
+            }
+        }
+
         // ---- wrapped summary in the space left above the warning box ---
         let avail = (warn_bottom - y).max(0);
         let max_lines = (avail / 10).max(0) as usize;
@@ -2892,7 +3326,8 @@ impl ModManagerState {
             .max(24);
         let done = UiRect::new(lay.w - MARGIN - done_w, y2, done_w as u32, 16);
         // Apply shrinks to the space left of Done; below ~60px it hides.
-        let apply_w = (crate::draw::text_width(&apply_label, 1) as i32 + 14).min(done.x - 6 - MARGIN);
+        let apply_w =
+            (crate::draw::text_width(&apply_label, 1) as i32 + 14).min(done.x - 6 - MARGIN);
         if apply_w >= 24 {
             let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
             let apply_bg = if !dirty {
@@ -3139,7 +3574,11 @@ mod tests {
             assert!(slugs.insert(entry.slug), "duplicate slug {}", entry.slug);
             assert!(valid_modrinth_slug(entry.slug), "bad slug {}", entry.slug);
             assert!(!entry.name.is_empty(), "empty name for {}", entry.slug);
-            assert!(!entry.author.is_empty(), "missing author for {}", entry.slug);
+            assert!(
+                !entry.author.is_empty(),
+                "missing author for {}",
+                entry.slug
+            );
             assert!(
                 !entry.license_spdx.is_empty()
                     && entry
@@ -3180,10 +3619,7 @@ mod tests {
     fn community_catalog_metadata_stays_metadata_only() {
         // No bundled jars, no embedded binaries: every field is &'static
         // metadata and the catalog never duplicates a QoL entry.
-        let qol_slugs: BTreeSet<&str> = CURATED_MODRINTH_QOL_MODS
-            .iter()
-            .map(|m| m.slug)
-            .collect();
+        let qol_slugs: BTreeSet<&str> = CURATED_MODRINTH_QOL_MODS.iter().map(|m| m.slug).collect();
         for entry in recommended_community_mods() {
             assert!(
                 entry.en_summary.len() <= 96,
@@ -3233,10 +3669,7 @@ mod tests {
             .iter()
             .position(|e| e.mod_id == "jade")
             .unwrap();
-        assert_eq!(
-            menu.browse_sources[jade],
-            BrowseSource::Community(0)
-        );
+        assert_eq!(menu.browse_sources[jade], BrowseSource::Community(0));
         // And community rows carry the attribution into the entry.
         assert_eq!(menu.browse_entries[jade].authors, ["Snownee"]);
         assert_eq!(menu.browse_entries[jade].license, "CC-BY-NC-SA-4.0");
@@ -3290,7 +3723,10 @@ mod tests {
             url.contains("project_type%3Aresourcepack"),
             "kind facet missing: {url}"
         );
-        assert!(url.contains("versions%3A1.21.1"), "version facet missing: {url}");
+        assert!(
+            url.contains("versions%3A1.21.1"),
+            "version facet missing: {url}"
+        );
         // `search` is untouched by Browse-mode typing.
         menu.handle_input(UiInputEvent::KeyPressed(UiKey::Backspace), 1280, 720);
         assert_eq!(menu.browse_query, "create&");
@@ -3352,13 +3788,21 @@ mod tests {
             tr(crate::state::UiLang::Ja, "Kind", "タイプ"),
             menu.soft_reload_status(crate::state::UiLang::En),
             menu.soft_reload_status(crate::state::UiLang::Ja),
-            tr(crate::state::UiLang::Ja, "Search Modrinth", "Modrinthで検索"),
+            tr(
+                crate::state::UiLang::Ja,
+                "Search Modrinth",
+                "Modrinthで検索",
+            ),
             tr(
                 crate::state::UiLang::Ja,
                 "No packs curated - search Modrinth for:",
                 "パックはModrinthで検索",
             ),
-            tr(crate::state::UiLang::Ja, "Search Modrinth...", "Modrinthを検索..."),
+            tr(
+                crate::state::UiLang::Ja,
+                "Search Modrinth...",
+                "Modrinthを検索...",
+            ),
         ] {
             for c in s.chars() {
                 assert!(
@@ -3451,7 +3895,9 @@ mod tests {
         assert!(hits
             .iter()
             .any(|h| h.id == ModManagerWidgetId::ModrinthSearch));
-        assert!(!hits.iter().any(|h| h.id == ModManagerWidgetId::ToggleEnabled));
+        assert!(!hits
+            .iter()
+            .any(|h| h.id == ModManagerWidgetId::ToggleEnabled));
         // The browse pill exists in the installed filter row too.
         let mut menu = ModManagerState::new(vec![]);
         menu.lang = crate::state::UiLang::Ja;
