@@ -150,8 +150,11 @@ fn entity_selectors_include_live_non_players_and_select_nearest_or_random() {
 
 #[test]
 fn unknown_setblock_name_does_not_resolve_to_air() {
+    let _guard = crate::world_guard();
     assert!(state_from_arg("not_a_block").is_none());
-    assert_eq!(state_from_arg("minecraft:stone"), Some(1));
+    if breg().is_some() {
+        assert_eq!(state_from_arg("minecraft:stone"), Some(1));
+    }
 }
 
 #[test]

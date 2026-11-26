@@ -7821,7 +7821,7 @@ mod dim_entity_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         let _w = DimWorld::take();
-        world_rng::seed(0x5eed_d1e);
+        world_rng::seed(0x05ee_dd1e);
         let reg = breg().unwrap();
         let mushroom = reg.state_of("minecraft:red_mushroom", None);
         let at = (500_032, 100, -500_032);
@@ -7859,7 +7859,7 @@ mod dim_entity_tests {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
         let _w = DimWorld::take();
-        world_rng::seed(0x5eed_7a7);
+        world_rng::seed(0x05ee_d7a7);
         let reg = breg().unwrap();
         let mushroom = reg.state_of("minecraft:red_mushroom", None);
         let at = (8, 60, 8);

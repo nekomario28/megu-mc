@@ -10651,8 +10651,8 @@ fn world_overlay_observables() -> Vec<(DimChunkKey, u32, u32)> {
 /// writes, same xp drops, same AI-state map, same RNG position — while
 /// `TICKPAR_COMPUTED` proves the plans really were produced off the tick
 /// thread. Every mob in the fixture exercises a different plan field: the pig
-/// and blaze take fluid travel, the zombie targets (attackable pick + LOS ray
-/// + melee), the enderman exercises the stare scan, the wolf takes the pet
+/// and blaze take fluid travel, the zombie targets (attackable pick + LOS ray +
+/// melee), the enderman exercises the stare scan, the wolf takes the pet
 /// teleport, the sheared sheep reads the block below, and the cow reads the
 /// tempting item off the player's hand.
 #[test]
