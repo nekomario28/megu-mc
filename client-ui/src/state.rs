@@ -1898,6 +1898,40 @@ impl BossBarColor {
     }
 }
 
+/// A held map snapshot. The pixels are row-major RGBA in a 128×128 grid.
+#[derive(Clone, Debug)]
+pub struct HudMap {
+    pub id: i32,
+    pub scale: i8,
+    pub locked: bool,
+    pub pixels: std::sync::Arc<[[u8; 4]]>,
+    pub icons: Vec<HudMapIcon>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HudMapIcon {
+    pub kind: i32,
+    pub x: i8,
+    pub z: i8,
+    pub direction: u8,
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HudCombat {
+    pub in_combat: bool,
+    pub ticks: u32,
+    pub last_attacker_id: Option<i32>,
+}
+
+/// An already projected world-space label, in normalized viewport coordinates.
+#[derive(Clone, Debug)]
+pub struct HudNametag {
+    pub anchor: [f32; 2],
+    pub text: String,
+    pub color: Option<[u8; 3]>,
+}
+
 /// Everything the in-game HUD draws. `health`/`hunger`/`armor` are in
 /// vanilla half-icon units (20 = full bar); `air` is in bubbles×30
 /// (300 = full). Pure data — the game fills it, the HUD draws it.
@@ -1948,6 +1982,13 @@ pub struct HudState {
     pub show_player_list: bool,
     /// `(name, ping_ms)` for the tab list.
     pub players: Vec<(String, u16)>,
+    /// Parallel to `players`; a missing tint uses the standard text color.
+    pub player_colors: Vec<Option<[u8; 3]>>,
+    pub tab_header: String,
+    pub tab_footer: String,
+    pub held_map: Option<std::sync::Arc<HudMap>>,
+    pub combat: HudCombat,
+    pub entity_nametags: Vec<HudNametag>,
     /// Optional mana, casting, cooldown, and custom status overlays.
     pub magic: crate::magic_hud::MagicHudState,
     /// Telemetry snapshot the opt-in Compact Debug HUD overlay reads.
@@ -2231,6 +2272,12 @@ impl Default for HudState {
             chat_lines: Vec::new(),
             show_player_list: false,
             players: Vec::new(),
+            player_colors: Vec::new(),
+            tab_header: String::new(),
+            tab_footer: String::new(),
+            held_map: None,
+            combat: HudCombat::default(),
+            entity_nametags: Vec::new(),
             magic: crate::magic_hud::MagicHudState::default(),
             compact_debug_hud_data: CompactDebugHudData::default(),
             subtitles: Vec::new(),
@@ -2286,6 +2333,12 @@ impl HudState {
                 ("Alex".to_string(), 34),
                 ("Megu".to_string(), 88),
             ],
+            player_colors: Vec::new(),
+            tab_header: String::new(),
+            tab_footer: String::new(),
+            held_map: None,
+            combat: HudCombat::default(),
+            entity_nametags: Vec::new(),
             magic: crate::magic_hud::MagicHudState::default(),
             compact_debug_hud_data: CompactDebugHudData::default(),
             subtitles: Vec::new(),
@@ -2734,6 +2787,7 @@ pub enum WidgetId {
     PauseReportBug,
     // Crash recovery (+ confirmation modal)
     CrashSendReport,
+    CrashCopyReport,
     CrashReturnTitle,
     ModalOk,
     ModalCancel,
@@ -5137,13 +5191,22 @@ impl UiState {
                 self.title_action(UiAction::LeaveWorld)
             }
             WidgetId::CrashSendReport => {
-                if self.crash_sent || self.crash.is_none() {
+                if self.crash_sent
+                    || self.crash.is_none()
+                    || self.settings.qol.crash_report_mode == CrashReportMode::Off
+                {
                     Vec::new()
                 } else {
                     self.modal = Some(UiModal::ConfirmSendCrashReport);
                     Vec::new()
                 }
             }
+            WidgetId::CrashCopyReport => self
+                .crash
+                .as_ref()
+                .map(|crash| UiAction::CopyText(crash.markdown_summary()))
+                .into_iter()
+                .collect(),
             WidgetId::CrashReturnTitle => self.title_action(UiAction::OpenScreen(Screen::Title)),
             WidgetId::DeathRespawn => {
                 // The layout only emits a live region when

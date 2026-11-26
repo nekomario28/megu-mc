@@ -82,7 +82,7 @@ use megu_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserAction, RecipeBrowserState,
 };
 use megu_ui::sign_and_chat::SignEditorState;
-use megu_ui::state::{invite_code_display, tr, ScoreboardState, TitleOverlayState};
+use megu_ui::state::{invite_code_display, tr, HudNametag, ScoreboardState, TitleOverlayState};
 use megu_ui::state::{
     CrashReportMode as UiCrashReportMode, DisconnectedScreenState, FriendListEntry,
     FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
@@ -1455,6 +1455,7 @@ pub struct GpuApp {
     active: Option<ActiveWindow>,
     camera: Camera,
     camera_controller: CameraController,
+    spectator_view: Option<SpectatorView>,
     keys: Keys,
     input_router: WindowInputRouter,
     debug_messages: Vec<String>,
@@ -1837,6 +1838,43 @@ struct EntityInterpolation {
     limb_swing_amount: f32,
 }
 
+/// Render-only pose. A server camera packet must not move the local
+/// simulation, prediction origin, or outbound player pose.
+#[derive(Clone, Copy)]
+struct SpectatorView {
+    entity: (i32, [u8; 16]),
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+}
+
+impl SpectatorView {
+    fn follow(previous: Option<Self>, target: &TrackedEntity, eye_height: f32, dt: f32) -> Self {
+        let mut pose = Self {
+            entity: (target.eid, target.uuid),
+            eye: [
+                target.pos[0],
+                target.pos[1] + f64::from(eye_height),
+                target.pos[2],
+            ],
+            yaw: target.yaw_deg,
+            pitch: (target.pitch_deg + 180.0).rem_euclid(360.0) - 180.0,
+        };
+        if let Some(previous) = previous.filter(|p| p.entity == pose.entity) {
+            let delta = std::array::from_fn::<_, 3, _>(|i| pose.eye[i] - previous.eye[i]);
+            // Disconnects, entity switches and large server teleports cut
+            // immediately. Regular movement eases over a server tick.
+            if delta.iter().map(|v| v * v).sum::<f64>() <= 64.0 {
+                let a = 1.0 - (-dt.clamp(0.0, 0.25) / 0.05).exp();
+                pose.eye = std::array::from_fn(|i| previous.eye[i] + delta[i] * f64::from(a));
+                pose.yaw = interpolate_angle(previous.yaw, pose.yaw, a);
+                pose.pitch = previous.pitch + (pose.pitch - previous.pitch) * a;
+            }
+        }
+        pose
+    }
+}
+
 fn interpolate_angle(current: f32, target: f32, amount: f32) -> f32 {
     let delta = (target - current + 180.0).rem_euclid(360.0) - 180.0;
     (current + delta * amount).rem_euclid(360.0)
@@ -2200,6 +2238,7 @@ impl GpuApp {
             active: None,
             camera,
             camera_controller: CameraController::new(render_config.fov_deg as f32, 1.0, 4.0),
+            spectator_view: None,
             keys: Keys::default(),
             input_router: WindowInputRouter::default(),
             debug_messages: Vec::new(),
@@ -3513,6 +3552,10 @@ impl GpuApp {
                 pos,
                 Some(tracked),
             );
+        }
+        // Do not render the model around its own first-person camera.
+        if let Some(camera_id) = live.world.camera_entity_id {
+            entity_refs.retain(|(eid, _, _)| *eid != camera_id);
         }
         // Grounded contact shadows ride the same lit entity/BER list —
         // each quad samples world light at its centroid through the same
@@ -5131,6 +5174,9 @@ impl GpuApp {
         self.singleplayer_server = None;
         self.active_singleplayer_world = None;
         self.container_screen = None;
+        self.own_inventory_open = false;
+        self.spectator_view = None;
+        self.credits_screen = None;
         self.chat_bar = None;
         self.ui.sign_editor = None;
         self.advancements_open = false;
@@ -5176,7 +5222,10 @@ impl GpuApp {
                 path.display(),
                 report.fingerprint
             )),
-            Err(err) => self.status_line(format!("Crash report save failed: {err}")),
+            Err(err) => {
+                self.ui.crash_sent = false;
+                self.status_line(format!("Crash report save failed: {err}"));
+            }
         }
     }
 
@@ -5223,7 +5272,7 @@ impl GpuApp {
                         SessionStatus::Connecting => {
                             self.status_line(format!("Place recipe {recipe_id}: still connecting"))
                         }
-                        SessionStatus::Disconnected(_) => {
+                        SessionStatus::Disconnected(_) | SessionStatus::Failed(_) => {
                             self.status_line(format!("Place recipe {recipe_id}: not connected"))
                         }
                     },
@@ -8153,31 +8202,54 @@ impl GpuApp {
         true
     }
 
-    /// The six view-frustum planes of the current render camera, in the
-    /// `box_in_frustum` form `LiveSession::poll` orders mesh rebuilds
-    /// with. `None` while no active surface exists (poll then degrades to
-    /// pure distance ordering).
-    fn view_frustum_planes(&self) -> Option<[[f32; 4]; 6]> {
-        Self::frustum_planes_for(
-            &self.camera_controller,
-            &self.camera,
-            self.active.as_ref().map(|a| a.size),
-        )
+    fn update_spectator_view(&mut self, dt: f32) {
+        self.spectator_view = self.live.as_ref().and_then(|live| {
+            let id = live.world.camera_entity_id?;
+            let target = live.world.entities.get(&id)?;
+            let eye_height = live.world.entity_eye_height(id)?;
+            Some(SpectatorView::follow(
+                self.spectator_view,
+                target,
+                eye_height,
+                dt,
+            ))
+        });
     }
 
-    /// [`Self::view_frustum_planes`] over disjoint field borrows so it can
-    /// run inside `&mut self.live` scopes.
+    fn session_view_camera(&self) -> Camera {
+        let Some(view) = self.spectator_view else {
+            return self.camera_controller.view_camera(&self.camera);
+        };
+        Camera {
+            position: view.eye.map(|axis| axis as f32),
+            yaw_deg: (view.yaw + 180.0).rem_euclid(360.0),
+            pitch_deg: (-view.pitch).clamp(-89.9, 89.9),
+            fov_deg: self.camera_controller.effective_fov_deg(),
+            roll_rad: 0.0,
+            ..self.camera
+        }
+    }
+
+    /// Use the same camera for rendering and mesh-priority culling.
     fn frustum_planes_for(
-        camera_controller: &CameraController,
         camera: &Camera,
         size: Option<PhysicalSize<u32>>,
     ) -> Option<[[f32; 4]; 6]> {
         let size = size?;
         let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
-        let camera = camera_controller.view_camera(camera);
         Some(crate::renderer::frustum_planes_from_view_proj(
             &camera.view_projection(aspect),
         ))
+    }
+
+    fn poll_live_in_background(&mut self) {
+        let camera = self.session_view_camera();
+        let planes = Self::frustum_planes_for(&camera, self.active.as_ref().map(|a| a.size));
+        if let Some(live) = &mut self.live {
+            live.poll(camera.position, planes.as_ref().map_or(&[][..], |p| &p[..]));
+        }
+        self.update_spectator_view(0.05);
+        self.sync_disconnected_screen();
     }
 
     /// The hovered container stack's namespaced item id — the numeric
@@ -8746,9 +8818,26 @@ impl GpuApp {
     fn sync_disconnected_screen(&mut self) {
         let reason = match self.live.as_ref().map(|live| &live.status) {
             Some(SessionStatus::Disconnected(reason)) => reason.clone(),
+            Some(SessionStatus::Failed(reason)) => {
+                let context = megu_core::crash_report::CrashContext::new(
+                    "session_error",
+                    "client-gpu",
+                    &self.config.mc_version,
+                    reason,
+                )
+                .redacted();
+                // Abandon the broken simulation before presenting a menu;
+                // the back stack must not reopen it. The GPU stays alive for UI.
+                self.ui.go_title();
+                self.ui.show_crash(context);
+                self.leave_world_for_title();
+                debug_assert_eq!(self.ui.screen, Screen::CrashRecovery);
+                return;
+            }
             _ => return,
         };
         let missing_mods = parse_missing_mod_disconnect(&reason);
+        self.spectator_view = None;
         self.live = None;
         self.singleplayer_server = None;
         self.container_screen = None;
@@ -8931,6 +9020,9 @@ impl GpuApp {
         self.stage_live_scene_assets(frame_begin, dt);
 
         self.sync_frame_hud();
+        let render_camera = self.prepare_frame_camera();
+        self.sync_entity_nametags(viewport, &render_camera);
+        self.sync_held_map_overlay(viewport);
         let font_revision = crate::vanilla_font::font_revision();
         self.build_frame_ui(
             viewport,
@@ -8942,7 +9034,6 @@ impl GpuApp {
         let mod_overlay_rebuilt = self.refresh_mod_overlay(viewport, font_revision);
         self.upload_retained_ui(viewport, font_revision, mod_overlay_rebuilt);
 
-        let render_camera = self.prepare_frame_camera();
         self.submit_surface_frame(viewport, &render_camera, rain_wetness);
         self.observe_frame_budget(frame_begin);
     }
@@ -8967,6 +9058,7 @@ impl GpuApp {
 
         let gameplay_modal_open = self.has_gameplay_modal();
         let seamless_portal_frames = self.poll_live_frame(dt, gameplay_modal_open);
+        self.update_spectator_view(dt);
         self.activate_pending_credits();
         self.tick_end_credits_screen(
             dt,
@@ -9002,7 +9094,8 @@ impl GpuApp {
     }
 
     fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {
-        let planes = self.view_frustum_planes();
+        let camera = self.session_view_camera();
+        let planes = Self::frustum_planes_for(&camera, self.active.as_ref().map(|a| a.size));
         if gameplay_modal_open {
             self.clear_gameplay_controls();
         }
@@ -9010,10 +9103,10 @@ impl GpuApp {
         let Some(live) = &mut self.live else {
             return Vec::new();
         };
-        live.poll(
-            self.camera.position,
-            planes.as_ref().map_or(&[][..], |p| &p[..]),
-        );
+        live.poll(camera.position, planes.as_ref().map_or(&[][..], |p| &p[..]));
+        if matches!(live.status, SessionStatus::Failed(_)) {
+            return Vec::new();
+        }
         live.tick_gameplay_frame(dt);
         if self.ui.screen == Screen::InGameHud && !gameplay_modal_open {
             if self.left_mouse_held {
@@ -9226,7 +9319,8 @@ impl GpuApp {
             self.ui.screen == Screen::InGameHud
                 && self.container_screen.is_none()
                 && !self.paused
-                && self.camera_controller.mode == CameraMode::FirstPerson,
+                && self.camera_controller.mode == CameraMode::FirstPerson
+                && self.spectator_view.is_none(),
             (0.0, 0.0),
         );
         let uv_rect = vm
@@ -9511,6 +9605,7 @@ impl GpuApp {
                 SessionStatus::Playing => ("", live.hud.actionbar.as_str()),
                 SessionStatus::Connecting => ("", "Connecting to server..."),
                 SessionStatus::Disconnected(reason) => ("Disconnected: ", reason.as_str()),
+                SessionStatus::Failed(_) => ("Session error", ""),
             };
             if actionbar.strip_prefix(prefix) != Some(message) {
                 actionbar.clear();
@@ -9882,13 +9977,84 @@ impl GpuApp {
         }
     }
 
+    fn sync_held_map_overlay(&mut self, [w, h]: [u32; 2]) {
+        let overlay = self
+            .ui
+            .hud
+            .held_map
+            .as_ref()
+            .zip(megu_ui::layout::held_map_viewport(&self.ui, w, h));
+        if let Some(active) = &mut self.active {
+            let assets = self
+                .vanilla_runtime_assets
+                .as_ref()
+                .map(|a| &a.atlas_extras)
+                .filter(|atlas| atlas.from_jar_count() > 0);
+            active.renderer.set_held_map_overlay(overlay, assets);
+        }
+    }
+
+    fn sync_entity_nametags(&mut self, [w, h]: [u32; 2], camera: &Camera) {
+        self.ui.hud.entity_nametags.clear();
+        let Some(live) = self
+            .live
+            .as_ref()
+            .filter(|_| self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden)
+        else {
+            return;
+        };
+        let viewer = live
+            .player_info
+            .get(&self.local_player_uuid())
+            .and_then(|p| p.name.as_deref())
+            .unwrap_or(&self.config.username);
+        let matrix = camera.view_projection(w.max(1) as f32 / h.max(1) as f32);
+        let candidates = live.world.entities.iter().filter_map(|(&eid, entity)| {
+            let feet = self
+                .entity_render_cache
+                .entity_interpolation
+                .get(&eid)
+                .map_or(entity.pos, |sample| sample.position);
+            let distance_sq: f64 = feet
+                .iter()
+                .zip(camera.position)
+                .map(|(a, b)| (a - f64::from(b)).powi(2))
+                .sum();
+            let crouched = live.entity_metadata.get(&eid).is_some_and(|meta| {
+                meta.pose == Some(5) || meta.flags.is_some_and(|flags| flags & 0x02 != 0)
+            });
+            let range = if crouched { 32.0 } else { 64.0 };
+            if distance_sq > range * range {
+                return None;
+            }
+            let (text, color) = live.entity_nametag(eid, viewer)?;
+            let y = feet[1] + f64::from(live.world.entity_eye_height(eid)?) + 0.45;
+            let anchor = project_nametag(&matrix, [feet[0] as f32, y as f32, feet[2] as f32])?;
+            Some((
+                distance_sq,
+                HudNametag {
+                    anchor,
+                    text,
+                    color,
+                },
+            ))
+        });
+        let mut tags: Vec<_> = candidates.collect();
+        tags.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // Paint far to near, with a bounded number of labels on crowded servers.
+        self.ui
+            .hud
+            .entity_nametags
+            .extend(tags.into_iter().take(32).rev().map(|(_, tag)| tag));
+    }
+
     fn prepare_frame_camera(&mut self) -> Camera {
-        let mut render_camera = self.camera_controller.view_camera(&self.camera);
+        let mut render_camera = self.session_view_camera();
         // Tactile micro-motion: transient turn-roll + landing dip from
         // the live session's camera sim. The state machine emits an
         // exact zero offset while the setting is off, so this never
         // perturbs the view when disabled.
-        if let Some(live) = &self.live {
+        if let Some(live) = self.live.as_ref().filter(|_| self.spectator_view.is_none()) {
             let micro = live.latest_camera_micro_offset();
             render_camera.roll_rad += micro.roll_rad;
             render_camera.position[1] -= micro.landing_dip_blocks;
@@ -10768,6 +10934,7 @@ impl GpuApp {
                 self.ui.hud.selected_slot = usize::from(slot);
                 if let Some(live) = &mut self.live {
                     live.hud.selected_slot = usize::from(slot);
+                    live.sync_hud_map();
                     live.hud_revision += 1;
                     live.set_carried_item(i32::from(slot));
                 }
@@ -12030,17 +12197,7 @@ impl ApplicationHandler for GpuApp {
         if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
             // Zero-GPU sleep: no redraw requests at all. A slow tick keeps
             // the live session polled until the surface un-occludes.
-            if let Some(live) = &mut self.live {
-                let planes = Self::frustum_planes_for(
-                    &self.camera_controller,
-                    &self.camera,
-                    self.active.as_ref().map(|a| a.size),
-                );
-                live.poll(
-                    self.camera.position,
-                    planes.as_ref().map_or(&[][..], |p| &p[..]),
-                );
-            }
+            self.poll_live_in_background();
             let wake = Instant::now() + OCCLUDED_TICK;
             event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
             return;
@@ -12076,17 +12233,7 @@ impl ApplicationHandler for GpuApp {
         // tick; when callbacks resume, `frame_start` refreshes and Poll
         // pacing returns automatically.
         if self.frame_start.elapsed() > Duration::from_millis(500) {
-            if let Some(live) = &mut self.live {
-                let planes = Self::frustum_planes_for(
-                    &self.camera_controller,
-                    &self.camera,
-                    self.active.as_ref().map(|a| a.size),
-                );
-                live.poll(
-                    self.camera.position,
-                    planes.as_ref().map_or(&[][..], |p| &p[..]),
-                );
-            }
+            self.poll_live_in_background();
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(33),
             ));
@@ -12094,6 +12241,21 @@ impl ApplicationHandler for GpuApp {
             event_loop.set_control_flow(ControlFlow::Poll);
         }
     }
+}
+
+fn project_nametag(matrix: &crate::Mat4, [x, y, z]: [f32; 3]) -> Option<[f32; 2]> {
+    let point = [x, y, z, 1.0];
+    let [x, y, depth, w] = std::array::from_fn::<_, 4, _>(|row| {
+        matrix
+            .iter()
+            .zip(point)
+            .map(|(col, v)| col[row] * v)
+            .sum::<f32>()
+    });
+    if w <= 0.0 || !(0.0..=w).contains(&depth) || !(-w..=w).contains(&x) || !(-w..=w).contains(&y) {
+        return None;
+    }
+    Some([0.5 + x / w * 0.5, 0.5 - y / w * 0.5])
 }
 
 /// World folder names under `<gameDir>/saves/` — the Singleplayer
@@ -14926,6 +15088,106 @@ mod tests {
         app.dispatch_ui_action(&UiAction::DeleteServer { index: 9 });
         assert!(app.ui.multiplayer.status.is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_processing_failure_opens_crash_recovery_and_returns_to_title() {
+        use crate::live_session::WorkerMessage;
+        use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        app.attach_live(LiveSession::with_channels(incoming, outgoing));
+        app.ui.screen = Screen::InGameHud;
+        app.paused = true;
+        tx.send(WorkerMessage::Play(ClientPlayEvent::Play(
+            PlayEvent::MapItemData {
+                map_id: 1,
+                scale: 0,
+                locked: false,
+                icons: None,
+                columns: 2,
+                rows: 1,
+                x: 127,
+                y: 0,
+                colors: vec![0; 2],
+            },
+        )))
+        .unwrap();
+        app.poll_live_in_background();
+        assert_eq!(app.ui.screen, Screen::CrashRecovery);
+        assert!(app.ui.crash_preview().contains("map patch outside"));
+        assert!(app.live.is_none());
+        assert!(!app.paused);
+        app.clipboard = SystemClipboard::in_memory();
+        let mut click = |id| {
+            app.ui.render(850, 480);
+            let rect = app.ui.hit_regions.iter().find(|r| r.id == id).unwrap().rect;
+            for action in app.ui.handle_input(UiInputEvent::Click {
+                x: rect.x + 2,
+                y: rect.y + 2,
+            }) {
+                app.dispatch_ui_action(&action);
+            }
+        };
+        click(megu_ui::state::WidgetId::CrashCopyReport);
+        click(megu_ui::state::WidgetId::CrashReturnTitle);
+        assert!(app
+            .clipboard
+            .get_text()
+            .unwrap()
+            .contains("map patch outside"));
+        assert_eq!(app.ui.screen, Screen::Title);
+    }
+
+    #[test]
+    fn spectator_camera_follows_tracked_eye_without_changing_local_camera() {
+        use megu_client::protocol::{ClientPlayEvent, DimensionMeta, PlayEvent};
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::JoinGame {
+            entity_id: 1,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        }))
+        .unwrap();
+        window_test_add_entity(&mut live, 2, 23, [1.0, 64.0, 3.0]); // creeper
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetCamera { eid: 2 }))
+            .unwrap();
+        app.attach_live(live);
+        let local = app.camera.position;
+        app.update_spectator_view(0.016);
+        let first = app.session_view_camera();
+        assert_eq!(first.position, [1.0, 64.0 + 1.445, 3.0]);
+        assert_eq!(app.camera.position, local);
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::MoveEntityPosRot {
+                eid: 2,
+                dx: 1.0,
+                dy: 0.0,
+                dz: 0.0,
+                yaw: 90.0,
+                pitch: 30.0,
+                on_ground: true,
+            }))
+            .unwrap();
+        app.update_spectator_view(0.035);
+        let second = app.session_view_camera();
+        assert!((1.4..1.6).contains(&second.position[0]));
+        assert!((224.0..226.0).contains(&second.yaw_deg));
+        assert!((-16.0..-14.0).contains(&second.pitch_deg));
+        app.live
+            .as_mut()
+            .unwrap()
+            .apply_event(ClientPlayEvent::Play(PlayEvent::SetCamera { eid: 1 }))
+            .unwrap();
+        app.update_spectator_view(0.016);
+        assert_eq!(app.session_view_camera().position, local);
+        assert!(app.live.as_ref().unwrap().world.camera_entity_id.is_none());
     }
 
     /// `SessionStatus::Disconnected` → `Screen::Disconnected` with the
