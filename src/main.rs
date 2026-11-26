@@ -1413,7 +1413,6 @@ fn environment_time_tick() {
         let mob_scale = current_load_budget().mob_spawn_scale;
         if DIFFICULTY.load(Ordering::Relaxed) != 0
             && t % cycle == cycle / 2
-            && (13000..=23000).contains(&wt)
             && mob_spawn_permitted(0, mob_scale)
         {
             spawn_nightly_hostile(t);
@@ -1421,8 +1420,7 @@ fn environment_time_tick() {
         if t.is_multiple_of(nether_spawn_cycle()) && mob_spawn_permitted(1, mob_scale) {
             spawn_nether_natural(t);
         }
-        if !(13000..=23000).contains(&wt)
-            && t % cycle == cycle / 4
+        if t % cycle == cycle / 4
             && mob_spawn_permitted(2, mob_scale)
         {
             spawn_passive_natural(t);
@@ -2584,17 +2582,19 @@ fn live_chunkgen_run(dim: DimId, cx: i32, cz: i32, probability: Option<f32>) -> 
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) != 1 {
         return false;
     }
-    let biome = worldgen::with_gen_dim(dim, |g| g.biome_name_at(cx * 16 + 8, 64, cz * 16 + 8))
+    let anchor_x = cx * 16 + 8;
+    let anchor_z = cz * 16 + 8;
+    let biome_y = dim.min_y() + dim.height() - 1;
+    let biome = worldgen::with_gen_dim(dim, |g| g.biome_name_at(anchor_x, biome_y, anchor_z))
         .flatten()
         .unwrap_or_else(|| "minecraft:plains".to_string());
     let mut world = LiveChunkGenWorld { dim, added: 0 };
-    // Per-chunk seeded like the decoration random vanilla draws from: the same
-    // chunk replays the same herd under the same seed.
-    let mut rng = generation_math::Lcg::new(
-        WORLD_SEED
-            .load(Ordering::Relaxed)
-            .wrapping_add((cx as u64 & 0xffff_ffff) << 32 ^ (cz as u64 & 0xffff_ffff)),
-    );
+    // Vanilla's spawnOriginalMobs uses the chunk's setDecorationSeed result.
+    let mut rng = generation_math::Lcg::new(chunk_decoration_seed(
+        WORLD_SEED.load(Ordering::Relaxed),
+        cx,
+        cz,
+    ));
     spawner::spawn_mobs_for_chunk_generation(
         cx,
         cz,
@@ -2616,6 +2616,36 @@ fn live_chunkgen_run(dim: DimId, cx: i32, cz: i32, probability: Option<f32>) -> 
         &mut rng,
     );
     true
+}
+
+/// `WorldgenRandom.setDecorationSeed` for a chunk anchor: seed the worldgen
+/// source, take two odd long multipliers, then mix the chunk's block origin.
+fn chunk_decoration_seed(seed: u64, chunk_x: i32, chunk_z: i32) -> u64 {
+    let mut source = generation_math::Xor::seed_worldgen(seed);
+    let x_multiplier = source.next_i64_legacy() | 1;
+    let z_multiplier = source.next_i64_legacy() | 1;
+    let x = chunk_x.wrapping_mul(16);
+    let z = chunk_z.wrapping_mul(16);
+    (i64::from(x)
+        .wrapping_mul(x_multiplier)
+        .wrapping_add(i64::from(z).wrapping_mul(z_multiplier))
+        ^ seed as i64) as u64
+}
+
+#[cfg(test)]
+mod chunk_decoration_seed_tests {
+    use super::chunk_decoration_seed;
+
+    #[test]
+    fn chunk_seed_matches_vanilla_decoration_seed_vectors() {
+        assert_eq!(chunk_decoration_seed(0, -1, 0), 6_716_476_193_438_028_432);
+        assert_eq!(chunk_decoration_seed(0, -2, 1), 13_786_005_028_847_878_064);
+        assert_eq!(
+            chunk_decoration_seed(42, 0, 0),
+            42,
+            "origin chunk must preserve the world seed"
+        );
+    }
 }
 
 /// First-visit creature herds for visible chunks in each vanilla dimension.
@@ -10120,6 +10150,7 @@ mod main_perf_multidim_tests {
 /// of blocks, and a position that holds nothing costs one array lookup. The `randomTickSpeed`
 /// gamerule sets the number of samples per section; `0` skips the pass entirely.
 fn random_tick_pass() {
+    precipitation_snow_pass();
     let speed = gr_random_tick_speed();
     if speed == 0 {
         return;
@@ -10166,6 +10197,114 @@ fn random_tick_pass() {
                 }
             }
         }
+    }
+}
+
+/// Run the chunk precipitation callback independently of `randomTickSpeed`.
+/// Rain chooses one column per ticking chunk, with the same one-in-sixteen
+/// precipitation roll used by `LevelChunk.tickChunk`.
+fn precipitation_snow_pass() {
+    if RAINING.load(Ordering::Relaxed) == 0 || gr_snow_accumulation_height() == 0 {
+        return;
+    }
+    let Some(reg) = crate::block_registry::breg() else {
+        return;
+    };
+    for (dim, cx, cz) in quiescent_random_tick_chunks() {
+        if dim != DimId::Overworld || world_rng::next_below(16) != 0 {
+            continue;
+        }
+        let x = cx * 16 + world_rng::next_below(16) as i32;
+        let z = cz * 16 + world_rng::next_below(16) as i32;
+        let y = height_at_dim(dim, x, z);
+        if !(dim.min_y()..dim.min_y() + dim.height()).contains(&y) {
+            continue;
+        }
+        let state = block_at_cached_dim(dim, x, y, z);
+        if reg.name_of(state) == "minecraft:snow" {
+            snow_random_tick(reg, dim, x, y, z, state);
+            continue;
+        }
+        if !reg.is_air(state) {
+            continue;
+        }
+        let below = block_at_cached_dim(dim, x, y - 1, z);
+        if !reg.is_face_sturdy(below, 1, Support::Full) {
+            continue;
+        }
+        let input = SnowIceTickInput {
+            cold_biome: cold_biome_at(dim, x, y, z),
+            sky_exposed: random_tick_sky_exposed(dim, x, y, z),
+            light: random_tick_block_light(reg, dim, x, y, z),
+            support_is_full_solid: reg.is_face_sturdy(
+                block_at_cached_dim(dim, x, y + 1, z),
+                0,
+                Support::Full,
+            ),
+            water_source: false,
+            random_roll: world_rng::next_below(256) as u8,
+        };
+        if !precipitation_snow_can_place(
+            gr_snow_accumulation_height(),
+            true,
+            reg.is_face_sturdy(below, 1, Support::Full),
+            input,
+        ) {
+            continue;
+        }
+        let snow = reg.with_prop(reg.state_of("minecraft:snow", None), "layers", "1");
+        if !reg.is_air(block_at_cached_dim(dim, x, y, z))
+            || !reg.is_face_sturdy(block_at_cached_dim(dim, x, y - 1, z), 1, Support::Full)
+        {
+            continue;
+        }
+        set_block_dim(dim, x, y, z, snow);
+        note_block_update_dim(dim, x, y, z, snow);
+    }
+}
+
+fn precipitation_snow_can_place(
+    accumulation_height: u8,
+    target_is_air: bool,
+    support_survives: bool,
+    input: SnowIceTickInput,
+) -> bool {
+    accumulation_height > 0
+        && target_is_air
+        && support_survives
+        && eval_snow_accumulation(input) == SnowIceTickResult::AccumulateSnow
+}
+
+#[cfg(test)]
+mod precipitation_snow_tests {
+    use super::*;
+
+    #[test]
+    fn precipitation_places_initial_snow_only_when_enabled_cold_exposed_and_supported() {
+        let input = SnowIceTickInput {
+            cold_biome: true,
+            sky_exposed: true,
+            light: 0,
+            support_is_full_solid: false,
+            water_source: false,
+            random_roll: 16,
+        };
+        assert!(precipitation_snow_can_place(1, true, true, input));
+        assert!(!precipitation_snow_can_place(0, true, true, input));
+        assert!(!precipitation_snow_can_place(1, false, true, input));
+        assert!(!precipitation_snow_can_place(1, true, false, input));
+        assert!(!precipitation_snow_can_place(
+            1,
+            true,
+            true,
+            SnowIceTickInput { cold_biome: false, ..input }
+        ));
+        assert!(!precipitation_snow_can_place(
+            1,
+            true,
+            true,
+            SnowIceTickInput { sky_exposed: false, ..input }
+        ));
     }
 }
 
@@ -23186,7 +23325,24 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let wg_seed = match resolve_world_seed(requested_seed, saved_seed) {
+    let anvil_seed = match anvil_world_dir_from_env() {
+        Some(dir) if dir.join("level.dat").is_file() => {
+            match read_level_dat_path(&dir.join("level.dat")) {
+                Ok(level) => Some(level.seed() as u64),
+                Err(error) => {
+                    eprintln!("[spine] refusing Anvil world seed: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => None,
+    };
+    if matches!((saved_seed, anvil_seed), (Some(saved), Some(anvil)) if saved != anvil) {
+        eprintln!("[spine] refusing world start: save_v2 and Anvil level.dat world seeds disagree");
+        std::process::exit(1);
+    }
+    let authoritative_seed = saved_seed.or(anvil_seed);
+    let wg_seed = match resolve_world_seed(requested_seed, authoritative_seed) {
         Ok(seed) => seed,
         Err(error) => {
             eprintln!("[spine] refusing world start: {error}");
@@ -23194,7 +23350,8 @@ fn main() {
         }
     };
     boot_prof.mark("seed-resolve");
-    if !std::path::Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+    let vanilla_dir = std::path::Path::new(DATAPACK_DIRECTORY).join("vanilla");
+    if !vanilla_dir.join("data/minecraft").is_dir() {
         let _ = vanilla_jar_data();
     }
     if std::env::var("MEGU_WG").ok().as_deref() != Some("old") {
