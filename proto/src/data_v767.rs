@@ -9,6 +9,8 @@
 // minus its `Clientbound`/`Serverbound` prefix; every id megu sends or
 // receives appears here under the same numeric value.
 use crate::table::{PacketDir, PacketPhase};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 /// `(phase, direction, resource_name, protocol_id)` for the builtin 767 table.
 pub(crate) static V767_PACKETS: [(PacketPhase, PacketDir, &str, u32); 226] = [
@@ -588,3 +590,109 @@ pub(crate) static V767_COMPONENTS: [&str; 57] = [
     "minecraft:note_block_sound", "minecraft:banner_patterns", "minecraft:base_color", "minecraft:pot_decorations", "minecraft:container", "minecraft:block_state", "minecraft:bees", "minecraft:lock",
     "minecraft:container_loot",
 ];
+
+/// Protocol-767 item name by dense registry id.
+#[allow(dead_code)]
+pub fn item_name_by_id(id: u32) -> Option<&'static str> {
+    V767_ITEMS.get(usize::try_from(id).ok()?).copied()
+}
+
+/// Protocol-767 item registry id by bare or `minecraft:`-prefixed name.
+#[allow(dead_code)]
+pub fn item_id_by_name(name: &str) -> Option<u32> {
+    static IDS: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    IDS.get_or_init(|| {
+        V767_ITEMS
+            .iter()
+            .enumerate()
+            .map(|(id, full)| (full.strip_prefix("minecraft:").unwrap_or(full), id as u32))
+            .collect()
+    })
+    .get(name)
+    .copied()
+}
+
+/// Protocol-767 data-component name by dense registry id.
+#[allow(dead_code)]
+pub fn component_name_by_id(id: u32) -> Option<&'static str> {
+    V767_COMPONENTS.get(usize::try_from(id).ok()?).copied()
+}
+
+/// Protocol-767 data-component id by bare or `minecraft:`-prefixed name.
+#[allow(dead_code)]
+pub fn component_id_by_name(name: &str) -> Option<u32> {
+    static IDS: OnceLock<HashMap<&'static str, u32>> = OnceLock::new();
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    IDS.get_or_init(|| {
+        V767_COMPONENTS
+            .iter()
+            .enumerate()
+            .map(|(id, full)| (full.strip_prefix("minecraft:").unwrap_or(full), id as u32))
+            .collect()
+    })
+    .get(name)
+    .copied()
+}
+
+/// Numeric protocol-767 ids for `minecraft:data_component_type`.
+#[allow(dead_code)]
+pub mod component_ids {
+    pub const CUSTOM_DATA: u32 = 0;
+    pub const MAX_STACK_SIZE: u32 = 1;
+    pub const MAX_DAMAGE: u32 = 2;
+    pub const DAMAGE: u32 = 3;
+    pub const UNBREAKABLE: u32 = 4;
+    pub const CUSTOM_NAME: u32 = 5;
+    pub const ITEM_NAME: u32 = 6;
+    pub const LORE: u32 = 7;
+    pub const RARITY: u32 = 8;
+    pub const ENCHANTMENTS: u32 = 9;
+    pub const CAN_PLACE_ON: u32 = 10;
+    pub const CAN_BREAK: u32 = 11;
+    pub const ATTRIBUTE_MODIFIERS: u32 = 12;
+    pub const CUSTOM_MODEL_DATA: u32 = 13;
+    pub const HIDE_ADDITIONAL_TOOLTIP: u32 = 14;
+    pub const HIDE_TOOLTIP: u32 = 15;
+    pub const REPAIR_COST: u32 = 16;
+    pub const CREATIVE_SLOT_LOCK: u32 = 17;
+    pub const ENCHANTMENT_GLINT_OVERRIDE: u32 = 18;
+    pub const INTANGIBLE_PROJECTILE: u32 = 19;
+    pub const FOOD: u32 = 20;
+    pub const FIRE_RESISTANT: u32 = 21;
+    pub const TOOL: u32 = 22;
+    pub const STORED_ENCHANTMENTS: u32 = 23;
+    pub const DYED_COLOR: u32 = 24;
+    pub const MAP_COLOR: u32 = 25;
+    pub const MAP_ID: u32 = 26;
+    pub const MAP_DECORATIONS: u32 = 27;
+    pub const MAP_POST_PROCESSING: u32 = 28;
+    pub const CHARGED_PROJECTILES: u32 = 29;
+    pub const BUNDLE_CONTENTS: u32 = 30;
+    pub const POTION_CONTENTS: u32 = 31;
+    pub const SUSPICIOUS_STEW_EFFECTS: u32 = 32;
+    pub const WRITABLE_BOOK_CONTENT: u32 = 33;
+    pub const WRITTEN_BOOK_CONTENT: u32 = 34;
+    pub const TRIM: u32 = 35;
+    pub const DEBUG_STICK_STATE: u32 = 36;
+    pub const ENTITY_DATA: u32 = 37;
+    pub const BUCKET_ENTITY_DATA: u32 = 38;
+    pub const BLOCK_ENTITY_DATA: u32 = 39;
+    pub const INSTRUMENT: u32 = 40;
+    pub const OMINOUS_BOTTLE_AMPLIFIER: u32 = 41;
+    pub const JUKEBOX_PLAYABLE: u32 = 42;
+    pub const RECIPES: u32 = 43;
+    pub const LODESTONE_TRACKER: u32 = 44;
+    pub const FIREWORK_EXPLOSION: u32 = 45;
+    pub const FIREWORKS: u32 = 46;
+    pub const PROFILE: u32 = 47;
+    pub const NOTE_BLOCK_SOUND: u32 = 48;
+    pub const BANNER_PATTERNS: u32 = 49;
+    pub const BASE_COLOR: u32 = 50;
+    pub const POT_DECORATIONS: u32 = 51;
+    pub const CONTAINER: u32 = 52;
+    pub const BLOCK_STATE: u32 = 53;
+    pub const BEES: u32 = 54;
+    pub const LOCK: u32 = 55;
+    pub const CONTAINER_LOOT: u32 = 56;
+}
