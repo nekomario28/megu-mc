@@ -11,7 +11,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::live_session::LiveHudFeed;
 use megu_client::audio_qol::{
     check_tool_durability_warning, ToolDurability, ZoomState, DEFAULT_ZOOM_SMOOTHING_RATE,
 };
@@ -57,11 +56,13 @@ use megu_client_mesh::vanilla_plus_nature::{NatureParticle, NatureParticleKind};
 use megu_client_mesh::vfx_engine::{ParticleDraw, ParticleOrientation, VfxFrameOutput};
 use megu_client_mesh::ChunkUploadBudget;
 use megu_core::hash::{Fnv1a64, FNV1A64_OFFSET_BASIS, FNV1A64_PRIME};
+use megu_core::rev::UiLayer;
 use megu_core::sys_metrics::{sample_host_metrics, CpuSampler, HostMetricsSnapshot};
 use megu_kernel::debug_chords::{
     finish_gamemode_switcher, handle_f3_chord, DebugChordAction, DebugChordContext,
     DebugChordState, DebugLine, DebugTarget, F3Chord, PlayerDebugInfo,
 };
+use megu_kernel::entity_interp::SkyFogOutput;
 use megu_proto::frl_e2ee::{parse_friend_id, FriendAllowlist, Frl3GuestToken, Frl3Identity};
 use megu_proto::seamless_portal::{
     decode_seamless_portal_packet, SeamlessDimTransitionState, SeamlessPortalPacket,
@@ -713,10 +714,11 @@ fn cloud_layers_for_settings(settings: &UiSettings) -> u8 {
 /// shell inside the far plane, and each aurora band draws a short
 /// undulating curtain arc centered on the north horizon, tint lerping
 /// primary→secondary across the ribbon.
-fn night_sky_drama_lines(
+fn append_night_sky_drama_lines(
     drama: &megu_client_mesh::tactile_effects::NightSkyDrama,
     camera: &Camera,
-) -> Vec<DebugLine> {
+    lines: &mut Vec<DebugLine>,
+) {
     let shell = (camera.far * 0.8).clamp(80.0, 480.0);
     let eye = camera.position;
     let at = |dir: [f32; 3]| {
@@ -726,7 +728,6 @@ fn night_sky_drama_lines(
             eye[2] + dir[2] * shell,
         ]
     };
-    let mut lines = Vec::new();
     for star in &drama.shooting_stars {
         let head_t = star.progress.clamp(0.0, 1.0);
         let tail_t = (head_t - 0.15).max(0.0);
@@ -781,7 +782,6 @@ fn night_sky_drama_lines(
             prev = Some(point);
         }
     }
-    lines
 }
 
 /// Vanilla yaw convention: `0` faces south (+Z), `90` west (−X),
@@ -858,6 +858,31 @@ struct ActiveWindow {
     surface_format: wgpu::TextureFormat,
     size: PhysicalSize<u32>,
     surface_copy_src_supported: bool,
+    title_branding_frame: Option<TitleBrandingFrame>,
+    debug_overlay: FrameDebugOverlay,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TitleBrandingFrame {
+    Hidden,
+    Visible {
+        viewport: [u32; 2],
+        font_revision: u64,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FrameDebugOverlay {
+    BlockOutline(Option<[i32; 3]>),
+    NightSky,
+}
+
+#[derive(PartialEq, Eq)]
+struct ModOverlayLayout {
+    viewport: [u32; 2],
+    scale: u32,
+    font_revision: u64,
+    sprites_loaded: bool,
 }
 
 /// Key set for FPS movement.
@@ -1626,6 +1651,10 @@ pub struct GpuApp {
     title_seen_rev: u64,
     /// Fractional-tick accumulator driving `TitleOverlayState::tick` at 20/s.
     title_tick_accum: f32,
+    /// Packet-revision-gated hotbar and boss-bar styling alongside the
+    /// legacy HUD state. Cleared on attach, even if revisions coincide.
+    live_hud_metadata: Option<LiveHudMetadata>,
+    live_ui_locale: Option<megu_core::i18n::BuiltinLocale>,
     ui: UiState,
     /// Revision bus feeding the retained UI cache: the window bumps a
     /// `UiLayer` only when that layer's draw-list fingerprint moved, so
@@ -1646,6 +1675,9 @@ pub struct GpuApp {
     ui_modhud_list: UiDrawList,
     ui_overlay_list: UiDrawList,
     ui_modoverlay_list: UiDrawList,
+    /// Bridge and manifest setters and sprite-atlas reloads invalidate
+    /// the retained ModOverlay command stream.
+    mod_overlay_layout: Option<ModOverlayLayout>,
     /// Decoded vanilla `widget/*` sprite atlas re-keyed to the contract
     /// `SpriteId` table — empty on clean-room installs (the
     /// `vanilla_widgets` vector chrome then draws everything). Uploaded
@@ -1721,6 +1753,8 @@ pub struct GpuApp {
     /// Per-frame live-particle staging scratch (tactile + ambience + VFX1
     /// billboards) — cleared and refilled only while particles exist.
     particle_scratch: Vec<VanillaParticleQuad>,
+    subworld_light_scratch: Vec<(u64, u8, u8)>,
+    debug_line_scratch: Vec<DebugLine>,
     /// `true` while the renderer's particle ring holds a non-empty
     /// upload — an all-clear frame stages `[]` once, then stays free.
     live_particles_staged: bool,
@@ -2251,6 +2285,8 @@ impl GpuApp {
             bootstrap_banner: None,
             title_seen_rev: 0,
             title_tick_accum: 0.0,
+            live_hud_metadata: None,
+            live_ui_locale: None,
             ui,
             ui_layer_bus: megu_core::rev::UiLayerBus::new(),
             ui_retained: megu_ui::retained_cache::UiRetainedCache::new(),
@@ -2258,6 +2294,7 @@ impl GpuApp {
             ui_modhud_list: UiDrawList::new(),
             ui_overlay_list: UiDrawList::new(),
             ui_modoverlay_list: UiDrawList::new(),
+            mod_overlay_layout: None,
             gui_sprite_atlas: megu_ui::draw::GuiSpriteAtlas::default(),
             vanilla_runtime_assets: None,
             vanilla_official_extras: None,
@@ -2286,6 +2323,8 @@ impl GpuApp {
             mod_ui_manifest: None,
             ui_anim_epoch: Instant::now(),
             particle_scratch: Vec::new(),
+            subworld_light_scratch: Vec::new(),
+            debug_line_scratch: Vec::new(),
             live_particles_staged: false,
             entity_render_cache: LiveEntityRenderCache::default(),
             seamless_portal: SeamlessDimTransitionState::new(),
@@ -2534,6 +2573,12 @@ impl GpuApp {
         }
         self.ensure_vanilla_official_extras();
         let (jar, _) = title_branding_sources(&self.session_paths);
+        // A partially bootstrapped `assets/` directory cannot supply the
+        // JAR-backed GUI/entity/particle atlases. Keep retrying each frame
+        // until the requested local version JAR is actually present.
+        let Some(jar) = jar else {
+            return;
+        };
         let assets_dir = self
             .session_paths
             .assets_dir
@@ -2541,12 +2586,6 @@ impl GpuApp {
             .filter(|path| path.is_dir())
             .cloned();
         let packs = self.runtime_resource_pack_paths();
-        // A partially bootstrapped `assets/` directory cannot supply the
-        // JAR-backed GUI/entity/particle atlases. Keep retrying each frame
-        // until the requested local version JAR is actually present.
-        let Some(jar) = jar else {
-            return;
-        };
         let runtime = crate::vanilla_assets_bridge::load_runtime_assets(
             Some(&jar),
             assets_dir.as_deref(),
@@ -2554,6 +2593,7 @@ impl GpuApp {
             &packs,
             self.ui.settings.locale.code(),
         );
+        self.mod_overlay_layout = None;
         self.gui_sprite_atlas = runtime.gui_atlas.clone();
         install_logical_hud_sprite_bindings(&mut self.gui_sprite_atlas, &runtime.gui_textures);
         self.gui_sprites_loaded = true;
@@ -2679,66 +2719,53 @@ impl GpuApp {
     /// Requests and result polling are non-blocking; network and disk work
     /// stay on the cache worker thread.
     fn refresh_player_skin_requests(&mut self) {
-        let entries: Vec<_> = self
-            .live
-            .as_ref()
-            .map(|live| {
-                live.player_info
-                    .values()
-                    .map(|entry| {
-                        let textures = entry
-                            .properties
-                            .iter()
-                            .find(|(name, _, _)| name == "textures")
-                            .map(|(_, value, _)| value.clone());
-                        (entry.uuid, textures)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let uuids: Vec<[u8; 16]> = entries.iter().map(|(uuid, _)| *uuid).collect();
+        let players = self.live.iter().flat_map(|live| live.player_info.values());
         if let Some(cache) = self.player_skin_cache.as_mut() {
-            for (uuid, textures) in entries {
-                cache.request_skin_for_uuid(uuid, textures.as_deref());
+            for entry in players.clone() {
+                let textures = entry
+                    .properties
+                    .iter()
+                    .find(|(name, _, _)| name == "textures")
+                    .map(|(_, value, _)| value.as_str());
+                cache.request_skin_for_uuid(entry.uuid, textures);
             }
             cache.poll_completed();
         }
-        let mut viewmodel_upload = None;
-        let local_uuid = self.local_player_uuid();
+        let mut changed_revision = None;
         if let (Some(cache), Some(appearance)) = (
             self.player_skin_cache.as_ref(),
             self.entity_appearance.as_mut(),
         ) {
             let mut changed = false;
-            for uuid in uuids {
-                if let Some(skin) = cache.get_skin(uuid) {
-                    changed |= appearance.upsert_player_skin(uuid, skin);
+            for entry in players {
+                if let Some(skin) = cache.get_skin(entry.uuid) {
+                    changed |= appearance.upsert_player_skin(entry.uuid, skin);
                 }
             }
             if changed {
-                let revision = appearance.revision();
-                if let Some(skin) = cache.get_skin(local_uuid) {
-                    if !skin.skin_rgba.is_empty()
-                        && self.viewmodel_skin_uploaded != Some((local_uuid, revision))
-                    {
-                        viewmodel_upload = Some((
-                            local_uuid,
-                            revision,
-                            skin.width,
-                            skin.height,
-                            skin.skin_rgba.clone(),
-                        ));
-                    }
-                }
+                changed_revision = Some(appearance.revision());
             }
         }
         self.upload_entity_appearance_if_dirty();
-        if let (Some(active), Some((uuid, revision, width, height, rgba))) =
-            (self.active.as_mut(), viewmodel_upload)
-        {
-            active
-                .renderer
-                .upload_viewmodel_surface_texture(width, height, &rgba);
+
+        let Some(revision) = changed_revision else {
+            return;
+        };
+        let uuid = self.local_player_uuid();
+        if self.viewmodel_skin_uploaded == Some((uuid, revision)) {
+            return;
+        }
+        let skin = self
+            .player_skin_cache
+            .as_ref()
+            .and_then(|cache| cache.get_skin(uuid))
+            .filter(|skin| !skin.skin_rgba.is_empty());
+        if let (Some(active), Some(skin)) = (self.active.as_mut(), skin) {
+            active.renderer.upload_viewmodel_surface_texture(
+                skin.width,
+                skin.height,
+                &skin.skin_rgba,
+            );
             self.viewmodel_skin_uploaded = Some((uuid, revision));
         }
     }
@@ -3009,6 +3036,7 @@ impl GpuApp {
                 self.title_branding =
                     crate::title_branding::load_title_branding_from_jar(&jar, &mod_jars);
                 if let Some(active) = self.active.as_mut() {
+                    active.title_branding_frame = None;
                     if self.title_branding.has_banner() {
                         active.renderer.set_title_branding(
                             self.title_branding.logo.as_ref(),
@@ -3115,15 +3143,17 @@ impl GpuApp {
     /// before touching the draw list.
     pub fn set_gui_bridge_batch(&mut self, batch: GuiBridgeBatch) {
         self.gui_bridge_batch = batch;
+        self.mod_overlay_layout = None;
     }
 
     /// Install (or clear) the declarative mod-UI manifest composited on
-    /// the `ModOverlay` layer each frame. The manifest is re-audited
-    /// every render by `vanilla_widgets::draw_mod_ui_manifest_sprites`
-    /// (title-screen overlay attempts are rejected upstream by
-    /// `audit_manifest`), so the host can hand it straight through.
+    /// the `ModOverlay` layer. The widget kit audits it before drawing
+    /// with the current viewport and scale.
     pub fn set_mod_ui_manifest(&mut self, manifest: Option<megu_core::ui_contract::ModUiManifest>) {
-        self.mod_ui_manifest = manifest;
+        if self.mod_ui_manifest != manifest {
+            self.mod_ui_manifest = manifest;
+            self.mod_overlay_layout = None;
+        }
     }
 
     /// The recipe/resource browser state (recipe overlay/world-drops data/MachineTutorial index, tabs,
@@ -3315,6 +3345,8 @@ impl GpuApp {
     /// `sync_hud_to` replaces `ui.hud.chat_lines` wholesale on every HUD
     /// revision, so the log lives in `live.hud` where the sync carries it.
     fn on_live_attached(&mut self) {
+        self.live_hud_metadata = None;
+        self.live_ui_locale = None;
         self.live_strategy_pending = true;
         let audio_settings = self.ui.settings.audio.clone();
         let world_assets = self
@@ -4163,6 +4195,7 @@ impl GpuApp {
             let locale = self.ui.settings.locale.code().to_owned();
             live.set_ui_locale("und");
             live.set_ui_locale(&locale);
+            self.live_ui_locale = Some(self.ui.settings.locale);
         }
         self.item_icon_atlas_uploaded = false;
         self.invalidate_vanilla_runtime_assets();
@@ -4913,6 +4946,7 @@ impl GpuApp {
         if let Some(live) = &mut self.live {
             live.set_ui_locale("und");
             live.set_ui_locale(&locale);
+            self.live_ui_locale = Some(self.ui.settings.locale);
         }
     }
 
@@ -7418,6 +7452,8 @@ impl GpuApp {
             surface_format,
             size,
             surface_copy_src_supported: caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
+            title_branding_frame: None,
+            debug_overlay: FrameDebugOverlay::BlockOutline(None),
         };
         if let Some(icon) = self
             .vanilla_official_extras
@@ -8737,23 +8773,11 @@ impl GpuApp {
         self.maybe_regrab();
     }
 
-    /// Mirror the live session's server-driven HUD channels into the UI
-    /// tree so `ui.render` composites them: sidebar `ScoreboardState`
-    /// (display slot 1), `TitleOverlayState` (re-armed on `title_revision`
-    /// edges, ticked at 20 TPS), and the Jade-style `LookingAtBlockState`.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_live_hud(
-        ui: &mut UiState,
-        title_seen_rev: &mut u64,
-        title_tick_accum: &mut f32,
-        dt: f32,
-        feed: &LiveHudFeed,
-    ) {
-        let sidebar_objective = feed.scoreboard.display_slots.get(&1);
-        ui.hud.scoreboard = match sidebar_objective {
+    fn sync_live_scoreboard(ui: &mut UiState, live: &LiveSession) {
+        let scoreboard = &live.scoreboard;
+        ui.hud.scoreboard = match scoreboard.display_slots.get(&1) {
             Some(objective) => ScoreboardState {
-                objective_title: feed
-                    .scoreboard
+                objective_title: scoreboard
                     .objectives
                     .get(objective)
                     .and_then(|(nbt, _, _)| nbt.as_ref())
@@ -8763,8 +8787,7 @@ impl GpuApp {
                             .ok()
                             .map(|value| value.extract_text())
                     }),
-                entries: feed
-                    .scoreboard
+                entries: scoreboard
                     .scores
                     .iter()
                     .filter(|((name, _), _)| name == objective)
@@ -8777,14 +8800,22 @@ impl GpuApp {
             },
             None => ScoreboardState::default(),
         };
+    }
 
-        if feed.title_revision != *title_seen_rev {
-            *title_seen_rev = feed.title_revision;
-            let [fade_in, stay, fade_out] = feed.title_times.unwrap_or([10, 70, 20]);
+    fn tick_live_title(
+        ui: &mut UiState,
+        live: &LiveSession,
+        title_seen_rev: &mut u64,
+        title_tick_accum: &mut f32,
+        dt: f32,
+    ) {
+        if live.title_revision != *title_seen_rev {
+            *title_seen_rev = live.title_revision;
+            let [fade_in, stay, fade_out] = live.title_times.unwrap_or([10, 70, 20]);
             let mut overlay = TitleOverlayState::vanilla();
             overlay.show(
-                feed.title_text.clone().unwrap_or_default(),
-                feed.subtitle_text.clone().unwrap_or_default(),
+                live.title_text.clone().unwrap_or_default(),
+                live.subtitle_text.clone().unwrap_or_default(),
                 fade_in.max(0) as u32,
                 stay.max(0) as u32,
                 fade_out.max(0) as u32,
@@ -8797,64 +8828,86 @@ impl GpuApp {
             ui.hud.title_overlay.tick();
             *title_tick_accum -= 0.05;
         }
+    }
 
-        // The legacy `HudState` shape still owns the actual widgets, but the
-        // window refresh is driven by the session's typed feed: component
-        // summaries resolve hotbar/offhand registry stacks, boss rows carry
-        // the authoritative fill order, and effect flags decide icon
-        // visibility before conversion to the renderer's legacy fields.
-        for (slot, stack) in ui.hud.hotbar.iter_mut().zip(feed.hotbar_stacks.iter()) {
-            *slot = stack.as_ref().map(|stack| stack.item_name.clone());
+    fn sync_live_hud_items(ui: &mut UiState, live: &LiveSession) -> LiveHudMetadata {
+        let hotbar = live.live_hotbar_snapshot();
+        let offhand = live.live_offhand_snapshot();
+        let bossbars = live.live_bossbar_snapshot();
+        let overlay_stack = |stack: &crate::live_session::LiveHotbarStack| LiveHotbarOverlayMeta {
+            count: stack.count,
+            damage: stack.damage,
+            max_damage: stack.max_damage,
+        };
+        let metadata = (
+            std::array::from_fn(|i| hotbar[i].as_ref().map(overlay_stack)),
+            offhand.as_ref().map(overlay_stack),
+            std::array::from_fn(|i| {
+                bossbars.get(i).map(|bar| LiveBossBarStyle {
+                    color: bar.color,
+                    divisions: bar.divisions,
+                })
+            }),
+        );
+
+        ui.hud.hotbar = hotbar.map(|stack| stack.map(|stack| stack.item_name));
+        ui.hud.offhand = offhand.map(|stack| stack.item_name);
+        ui.hud.bossbar_colors.clear();
+        ui.hud.bossbars.clear();
+        for bar in bossbars {
+            let colors = megu_ui::state::BossBarColor::ALL;
+            let index = bar.color.clamp(0, (colors.len() - 1) as i32) as usize;
+            ui.hud.bossbar_colors.push(colors[index]);
+            ui.hud
+                .bossbars
+                .push((bar.title, bar.health.clamp(0.0, 1.0)));
         }
-        ui.hud.offhand = feed
-            .offhand_stack
-            .as_ref()
-            .map(|stack| stack.item_name.clone());
-        ui.hud.bossbars = feed
-            .bossbars
-            .iter()
-            .map(|bar| (bar.title.clone(), bar.health.clamp(0.0, 1.0)))
-            .collect();
-        ui.hud.bossbar_colors = feed
-            .bossbars
-            .iter()
-            .map(|bar| {
-                let idx = bar.color.clamp(0, (megu_ui::state::BossBarColor::ALL.len() - 1) as i32)
-                    as usize;
-                megu_ui::state::BossBarColor::ALL[idx]
-            })
-            .collect();
+        metadata
+    }
+
+    fn sync_live_hud_effects(ui: &mut UiState, live: &LiveSession) {
+        let effects = live.live_status_effect_snapshot();
         ui.hud.max_health = ui.hud.max_health.max(ui.hud.health).max(20.0);
-        ui.hud.heart_style = if feed.status_effects.iter().any(|e| e.effect_id == 20) {
+        ui.hud.heart_style = if effects.iter().any(|e| e.effect_id == 20) {
             megu_ui::state::HeartStyle::Withered
-        } else if feed.status_effects.iter().any(|e| e.effect_id == 19) {
+        } else if effects.iter().any(|e| e.effect_id == 19) {
             megu_ui::state::HeartStyle::Poisoned
         } else if ui.hud.hardcore {
             megu_ui::state::HeartStyle::Hardcore
         } else {
             megu_ui::state::HeartStyle::Normal
         };
-        ui.hud.status_effects = feed
-            .status_effects
-            .iter()
-            .filter(|effect| effect.visible_in_hud())
-            .map(|effect| effect.as_hud_state())
-            .collect();
+        ui.hud.status_effects.clear();
+        ui.hud.status_effects.extend(
+            effects
+                .iter()
+                .filter(|effect| effect.visible_in_hud())
+                .map(|effect| effect.as_hud_state()),
+        );
+    }
 
-        ui.hud.looking_at = if ui.settings.builtin_looking_at_hud_active(false) {
-            match &feed.looking_at_block {
-                Some((position, block_id)) => LookingAtBlockState {
+    fn sync_looking_at_hud(ui: &mut UiState, live: &LiveSession) {
+        let looking_at = &mut ui.hud.looking_at;
+        if let Some((position, block_id)) = live
+            .looking_at_block
+            .as_ref()
+            .filter(|_| ui.settings.builtin_looking_at_hud_active(false))
+        {
+            if !looking_at.enabled
+                || looking_at.position != Some(*position)
+                || looking_at.block_id != *block_id
+            {
+                *looking_at = LookingAtBlockState {
                     enabled: true,
                     block_id: block_id.clone(),
                     display_name: block_id.clone(),
                     position: Some(*position),
                     ..Default::default()
-                },
-                None => LookingAtBlockState::default(),
+                };
             }
         } else {
-            LookingAtBlockState::default()
-        };
+            *looking_at = LookingAtBlockState::default();
+        }
     }
 
     fn render_frame(&mut self) {
@@ -8862,6 +8915,39 @@ impl GpuApp {
         self.frame_start = frame_begin;
         let dt = frame_begin.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = frame_begin;
+
+        let (rain_level, rain_wetness) = self.advance_frame(dt);
+        let Some(viewport) = self.render_viewport() else {
+            return;
+        };
+        let elapsed_secs = frame_begin
+            .saturating_duration_since(self.ui_anim_epoch)
+            .as_secs_f32();
+
+        self.update_scene_settings(elapsed_secs);
+        self.sync_live_scene(rain_level, elapsed_secs);
+        let live_hud_metadata = self.sync_live_hud(dt);
+        let goggles_draw = self.build_goggles_overlay(viewport);
+        self.stage_live_scene_assets(frame_begin, dt);
+
+        self.sync_frame_hud();
+        let font_revision = crate::vanilla_font::font_revision();
+        self.build_frame_ui(
+            viewport,
+            elapsed_secs,
+            font_revision,
+            live_hud_metadata.as_ref(),
+            goggles_draw,
+        );
+        let mod_overlay_rebuilt = self.refresh_mod_overlay(viewport, font_revision);
+        self.upload_retained_ui(viewport, font_revision, mod_overlay_rebuilt);
+
+        let render_camera = self.prepare_frame_camera();
+        self.submit_surface_frame(viewport, &render_camera, rain_wetness);
+        self.observe_frame_budget(frame_begin);
+    }
+
+    fn advance_frame(&mut self, dt: f32) -> (f32, f32) {
         if self.vanilla_runtime_assets.is_none() {
             self.load_gui_sprite_atlas();
         }
@@ -8879,59 +8965,8 @@ impl GpuApp {
             );
         }
 
-        let planes = self.view_frustum_planes();
         let gameplay_modal_open = self.has_gameplay_modal();
-        if gameplay_modal_open {
-            self.clear_gameplay_controls();
-        }
-        let mut seamless_portal_frames = Vec::new();
-        if let Some(live) = &mut self.live {
-            live.poll(
-                self.camera.position,
-                planes.as_ref().map_or(&[][..], |p| &p[..]),
-            );
-            live.tick_gameplay_frame(dt);
-            if self.ui.screen == Screen::InGameHud && !gameplay_modal_open {
-                if self.left_mouse_held {
-                    let target = match live.crosshair_pick() {
-                        Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
-                        _ => None,
-                    };
-                    live.tick_mining(dt, target);
-                } else {
-                    live.cancel_mining();
-                }
-                if self.right_mouse_held {
-                    live.tick_item_use(dt);
-                }
-            } else {
-                live.cancel_mining();
-                live.release_item_use();
-            }
-            Self::drain_protocol_particles(live, &mut self.vanilla_particles, dt);
-            // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
-            // session's custom-channel dispatch; applied below once the
-            // `live` borrow ends.
-            seamless_portal_frames = live.drain_seamless_portal_frames();
-            if let Some(pose) = live.camera_sync.take() {
-                self.camera.position = [
-                    pose.feet[0] as f32,
-                    pose.feet[1] as f32 + 1.62,
-                    pose.feet[2] as f32,
-                ];
-                self.camera.yaw_deg = (pose.yaw + 180.0).rem_euclid(360.0);
-                self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
-            }
-            // Phase-1 seamless transfer: the committed crossfade advances
-            // on the monotonic frame delta (Instant — zero SystemTime),
-            // and the state machine's "current" atmosphere stays pinned
-            // to what the biome blender actually shows so the next
-            // commit eases from real sky/fog colors, never stale defaults.
-            self.seamless_portal.advance_ms(dt * 1000.0);
-            let atmo = live.atmosphere_blender.current();
-            self.seamless_portal
-                .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
-        }
+        let seamless_portal_frames = self.poll_live_frame(dt, gameplay_modal_open);
         self.activate_pending_credits();
         self.tick_end_credits_screen(
             dt,
@@ -8961,11 +8996,71 @@ impl GpuApp {
         self.sync_sign_editor();
         self.sync_open_book_events();
 
-        let player_dead = self.live.as_ref().is_some_and(|live| live.is_dead());
-        // Camera movement only applies while unpaused and alive — a dead
-        // player keeps its death pose until the server's respawn teleport
-        // lands via `camera_sync`.
-        if self.live.is_none() && !self.paused && !player_dead {
+        self.advance_frame_movement(dt, gameplay_modal_open);
+        self.sync_recipe_browser_side_state();
+        (rain_level, rain_wetness)
+    }
+
+    fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {
+        let planes = self.view_frustum_planes();
+        if gameplay_modal_open {
+            self.clear_gameplay_controls();
+        }
+
+        let Some(live) = &mut self.live else {
+            return Vec::new();
+        };
+        live.poll(
+            self.camera.position,
+            planes.as_ref().map_or(&[][..], |p| &p[..]),
+        );
+        live.tick_gameplay_frame(dt);
+        if self.ui.screen == Screen::InGameHud && !gameplay_modal_open {
+            if self.left_mouse_held {
+                let target = match live.crosshair_pick() {
+                    Some(CrosshairPick::Block(hit)) => Some((hit.block_pos, hit.face as i8)),
+                    _ => None,
+                };
+                live.tick_mining(dt, target);
+            } else {
+                live.cancel_mining();
+            }
+            if self.right_mouse_held {
+                live.tick_item_use(dt);
+            }
+        } else {
+            live.cancel_mining();
+            live.release_item_use();
+        }
+        Self::drain_protocol_particles(live, &mut self.vanilla_particles, dt);
+        // `megu:portal_seamless_v1` (`MSP1`) frames captured by the
+        // session's custom-channel dispatch; applied below once the
+        // `live` borrow ends.
+        let seamless_portal_frames = live.drain_seamless_portal_frames();
+        if let Some(pose) = live.camera_sync.take() {
+            self.camera.position = [
+                pose.feet[0] as f32,
+                pose.feet[1] as f32 + 1.62,
+                pose.feet[2] as f32,
+            ];
+            self.camera.yaw_deg = (pose.yaw + 180.0).rem_euclid(360.0);
+            self.camera.pitch_deg = (-pose.pitch).clamp(-89.9, 89.9);
+        }
+        // Phase-1 seamless transfer: the committed crossfade advances
+        // on the monotonic frame delta (Instant — zero SystemTime),
+        // and the state machine's "current" atmosphere stays pinned
+        // to what the biome blender actually shows so the next
+        // commit eases from real sky/fog colors, never stale defaults.
+        self.seamless_portal.advance_ms(dt * 1000.0);
+        let atmo = live.atmosphere_blender.current();
+        self.seamless_portal
+            .set_current_atmosphere(atmo.sky_horizon_rgb, atmo.fog_rgb);
+
+        seamless_portal_frames
+    }
+
+    fn advance_frame_movement(&mut self, dt: f32, gameplay_modal_open: bool) {
+        if self.live.is_none() && !self.paused {
             self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
         }
         self.camera_controller
@@ -8973,7 +9068,9 @@ impl GpuApp {
 
         if let Some(live) = &mut self.live {
             let input = self.keys.move_input();
-            if !gameplay_modal_open && !player_dead && live.game_mode != 3 {
+            // Dead players keep the death pose until the respawn teleport.
+            let can_move = !gameplay_modal_open && !live.is_dead();
+            if can_move && live.game_mode != 3 {
                 if let Some(movement) = live.step_local_player_physics(
                     dt,
                     input.forward,
@@ -8991,7 +9088,7 @@ impl GpuApp {
                     ];
                 }
             } else {
-                if !gameplay_modal_open && !player_dead && live.game_mode == 3 {
+                if can_move {
                     self.camera.apply_move(input, dt.min(0.1));
                 }
                 live.send_movement(PlayerMovement {
@@ -9019,7 +9116,7 @@ impl GpuApp {
                 });
             }
             self.ui.hud.hardcore = live.is_hardcore();
-            if !gameplay_modal_open && !player_dead {
+            if can_move {
                 if let Some(vpos) = live.riding_vehicle_position() {
                     let yaw = (self.camera.yaw_deg - 180.0).rem_euclid(360.0);
                     let pitch = -self.camera.pitch_deg;
@@ -9047,17 +9144,16 @@ impl GpuApp {
                 );
             }
         }
+    }
 
-        self.sync_recipe_browser_side_state();
+    fn render_viewport(&self) -> Option<[u32; 2]> {
         // Occluded (minimized / fully covered): zero GPU work. The live
         // session above still polls so the connection stays alive.
         if self.occluded && std::env::var_os("MEGU_DISABLE_OCCLUSION_SLEEP").is_none() {
-            return;
+            return None;
         }
 
-        let Some(active) = self.active.as_mut() else {
-            return;
-        };
+        let active = self.active.as_ref()?;
         // Zero extent means a minimized window (Windows reports `0x0`):
         // acquiring or presenting a zero-sized swapchain panics inside
         // DXGI `ResizeBuffers`/`vkCreateSwapchainKHR`, so the policy skips
@@ -9065,10 +9161,17 @@ impl GpuApp {
         if self.policy.skip_zero_extent_present
             && (active.size.width == 0 || active.size.height == 0)
         {
-            return;
+            return None;
         }
-        let (w, h) = (active.size.width.max(1), active.size.height.max(1));
 
+        Some([active.size.width.max(1), active.size.height.max(1)])
+    }
+
+    fn update_scene_settings(&mut self, elapsed_secs: f32) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
         // Settings -> Video lighting toggles ride the shared shadow
         // uniform's `camera_forward.w` lane; refreshing every frame makes
         // each switch live on the same frame it flips.
@@ -9076,215 +9179,231 @@ impl GpuApp {
             self.ui.settings.video.comfort_exposure,
             self.ui.settings.video.indirect_light_bounce,
         );
-        let frame_elapsed_secs = frame_begin
-            .saturating_duration_since(self.ui_anim_epoch)
-            .as_secs_f32();
-        let (panorama_yaw, panorama_pitch) = vanilla_panorama_angles(frame_elapsed_secs);
+        let (panorama_yaw, panorama_pitch) = vanilla_panorama_angles(elapsed_secs);
+        let panorama_active =
+            title_panorama_is_visible(self.ui.screen, active.renderer.has_title_panorama());
         active.renderer.set_title_panorama_state(
-            self.ui.screen == Screen::Title && active.renderer.has_title_panorama(),
+            panorama_active,
             panorama_yaw,
             panorama_pitch,
             1.0,
         );
-        self.ui.title_panorama_active =
-            title_panorama_is_visible(self.ui.screen, active.renderer.has_title_panorama());
+        self.ui.title_panorama_active = panorama_active;
+    }
 
-        let mut goggles_draw: Option<UiDrawList> = None;
-        let mut live_hud_metadata: Option<LiveHudMetadata> = None;
-        if let Some(live) = &mut self.live {
-            active.renderer.set_player_position(self.camera.position);
-            let block_target = match live.crosshair_pick() {
-                Some(CrosshairPick::Block(hit)) => Some(hit.block_pos),
-                _ => None,
-            };
-            active.renderer.set_block_selection(block_target);
-            active
-                .renderer
-                .set_block_break_overlay(live.active_block_break_overlay());
-            active
-                .renderer
-                .set_gameplay_screen_overlay(live.gameplay_screen_overlay());
-            let dimension_kind = match live.world.dimension.name.as_str() {
-                "minecraft:the_nether" => 1,
-                "minecraft:the_end" => 2,
-                _ => 0,
-            };
-            let world_time = live.world_time_ticks();
-            let sun_dir = megu_client_mesh::builtin_shadow_wgsl::compute_sun_direction(world_time);
-            let moon_phase = ((live.world.world_age.div_euclid(24_000)).rem_euclid(8)) as u8;
-            active.renderer.set_world_env_frame(
-                dimension_kind,
-                rain_level,
-                live.season_ambience.snow_amount() > 0.5,
-                moon_phase,
-                sun_dir,
-                frame_elapsed_secs,
-            );
-            let vm = live.first_person_viewmodel(
-                self.ui.screen == Screen::InGameHud
-                    && self.container_screen.is_none()
-                    && !self.paused
-                    && self.camera_controller.mode == CameraMode::FirstPerson,
-                (0.0, 0.0),
-            );
-            let uv_rect = vm
+    fn sync_live_scene(&mut self, rain_level: f32, elapsed_secs: f32) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        active.renderer.set_player_position(self.camera.position);
+        active
+            .renderer
+            .set_block_break_overlay(live.active_block_break_overlay());
+        active
+            .renderer
+            .set_gameplay_screen_overlay(live.gameplay_screen_overlay());
+        let dimension_kind = match live.world.dimension.name.as_str() {
+            "minecraft:the_nether" => 1,
+            "minecraft:the_end" => 2,
+            _ => 0,
+        };
+        let world_time = live.world_time_ticks();
+        let sun_dir = megu_client_mesh::builtin_shadow_wgsl::compute_sun_direction(world_time);
+        let moon_phase = ((live.world.world_age.div_euclid(24_000)).rem_euclid(8)) as u8;
+        active.renderer.set_world_env_frame(
+            dimension_kind,
+            rain_level,
+            live.season_ambience.snow_amount() > 0.5,
+            moon_phase,
+            sun_dir,
+            elapsed_secs,
+        );
+        let vm = live.first_person_viewmodel(
+            self.ui.screen == Screen::InGameHud
+                && self.container_screen.is_none()
+                && !self.paused
+                && self.camera_controller.mode == CameraMode::FirstPerson,
+            (0.0, 0.0),
+        );
+        let uv_rect = vm
+            .held_item_name
+            .as_deref()
+            .and_then(|name| self.item_icon_atlas.uv(name));
+        let held_slot = 36 + live.hud.selected_slot.min(8) as i32;
+        let enchanted = live
+            .player_inventory
+            .get(&held_slot)
+            .is_some_and(crate::live_session::item_stack_has_glint);
+        let (block_light, sky_light) = live.sample_block_and_sky_light(
+            self.camera.position[0],
+            self.camera.position[1],
+            self.camera.position[2],
+        );
+        let light = (f32::from(block_light.max(sky_light)) / 15.0).clamp(0.2, 1.0);
+        active.renderer.set_viewmodel_extras(
+            uv_rect,
+            enchanted,
+            [light, light, light],
+            elapsed_secs,
+        );
+        let spyglass_active = vm.visible
+            && self.right_mouse_held
+            && vm
                 .held_item_name
                 .as_deref()
-                .and_then(|name| self.item_icon_atlas.uv(name));
-            let held_slot = 36 + live.hud.selected_slot.min(8) as i32;
-            let enchanted = live
-                .player_inventory
-                .get(&held_slot)
-                .is_some_and(crate::live_session::item_stack_has_glint);
-            let (block_light, sky_light) = live.sample_block_and_sky_light(
-                self.camera.position[0],
-                self.camera.position[1],
-                self.camera.position[2],
-            );
-            let light = (f32::from(block_light.max(sky_light)) / 15.0).clamp(0.2, 1.0);
-            active.renderer.set_viewmodel_extras(
-                uv_rect,
-                enchanted,
-                [light, light, light],
-                frame_elapsed_secs,
-            );
-            let spyglass_active = vm.visible
-                && self.right_mouse_held
-                && vm
-                    .held_item_name
-                    .as_deref()
-                    .is_some_and(|name| name.contains("spyglass"));
+                .is_some_and(|name| name.contains("spyglass"));
+        active
+            .renderer
+            .set_spyglass_alpha(if spyglass_active { 1.0 } else { 0.0 });
+        active.renderer.set_first_person_viewmodel(vm);
+        // Off-thread/priority-0 mesh payloads the session published
+        // this poll ride the reconcile below — the renderer treats
+        // them as authoritative until the world derives its own. The
+        // revision-gated delta sync replaces the old full-map clone:
+        // steady frames compare one u64 and apply nothing.
+        active.renderer.sync_external_sections_from(live);
+        if live.terrain_full_sync {
+            // First sync / dimension change: full reconcile once.
+            active.renderer.update_live_terrain(&live.world);
+            live.terrain_full_sync = false;
+            live.dirty_terrain_coords.clear();
+            live.terrain_order_sweep = false;
+            live.terrain_dirty = false;
+        } else if live.terrain_dirty
+            || !live.dirty_terrain_coords.is_empty()
+            || live.terrain_order_sweep
+        {
+            // O(1) steady path: only the coords `LiveSession` marked
+            // per play event plus, when the camera re-sorted the
+            // translucent stream, a resident-order sweep. No
+            // full-world mesh scan.
+            let dirty = std::mem::take(&mut live.dirty_terrain_coords);
+            let order_sweep = std::mem::take(&mut live.terrain_order_sweep);
             active
                 .renderer
-                .set_spyglass_alpha(if spyglass_active { 1.0 } else { 0.0 });
-            active.renderer.set_first_person_viewmodel(vm);
-            // Off-thread/priority-0 mesh payloads the session published
-            // this poll ride the reconcile below — the renderer treats
-            // them as authoritative until the world derives its own. The
-            // revision-gated delta sync replaces the old full-map clone:
-            // steady frames compare one u64 and apply nothing.
-            active.renderer.sync_external_sections_from(live);
-            if live.terrain_full_sync {
-                // First sync / dimension change: full reconcile once.
-                active.renderer.update_live_terrain(&live.world);
-                live.terrain_full_sync = false;
-                live.dirty_terrain_coords.clear();
-                live.terrain_order_sweep = false;
-                live.terrain_dirty = false;
-            } else if live.terrain_dirty
-                || !live.dirty_terrain_coords.is_empty()
-                || live.terrain_order_sweep
-            {
-                // O(1) steady path: only the coords `LiveSession` marked
-                // per play event plus, when the camera re-sorted the
-                // translucent stream, a resident-order sweep. No
-                // full-world mesh scan.
-                let dirty = std::mem::take(&mut live.dirty_terrain_coords);
-                let order_sweep = std::mem::take(&mut live.terrain_order_sweep);
-                active
-                    .renderer
-                    .update_live_terrain_tracked(&live.world, &dirty, order_sweep);
-                live.terrain_dirty = false;
+                .update_live_terrain_tracked(&live.world, &dirty, order_sweep);
+            live.terrain_dirty = false;
+        }
+    }
+
+    fn sync_live_hud(&mut self, dt: f32) -> Option<LiveHudMetadata> {
+        let live = self.live.as_mut()?;
+        // Revision-gated HUD sync: unchanged server state skips the
+        // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
+        let hud_replaced = live.sync_hud_to(&mut self.ui.hud);
+        let compact_debug_hud = &mut self.ui.settings.qol.compact_debug_hud;
+        let compact_debug_hud_segments = self.persisted_settings.compact_debug_hud_segments;
+        compact_debug_hud.enabled = self.persisted_settings.compact_debug_hud_enabled;
+        compact_debug_hud.show_fps = compact_debug_hud_segments & (1 << 0) != 0;
+        compact_debug_hud.show_coords = compact_debug_hud_segments & (1 << 1) != 0;
+        compact_debug_hud.show_biome = compact_debug_hud_segments & (1 << 2) != 0;
+        compact_debug_hud.show_facing = compact_debug_hud_segments & (1 << 3) != 0;
+        compact_debug_hud.show_ping = compact_debug_hud_segments & (1 << 4) != 0;
+        compact_debug_hud.show_mspt_tps = compact_debug_hud_segments & (1 << 5) != 0;
+        compact_debug_hud.show_light_level = compact_debug_hud_segments & (1 << 6) != 0;
+        compact_debug_hud.show_chunks_entities = compact_debug_hud_segments & (1 << 7) != 0;
+        compact_debug_hud.show_ram = compact_debug_hud_segments & (1 << 8) != 0;
+        // Visual-style preset x `Clouds` decides the deck layout
+        // every frame: Vanilla stays one authentic cubic deck, Megu
+        // Natural + Fancy opts into the hybrid parallax set.
+        live.cloud_deck_mode =
+            cloud_deck_mode(self.ui.settings.visual.preset, self.render_config.clouds);
+        live.record_frame_and_refresh_compact_debug_hud(dt, &mut self.ui);
+        let locale = self.ui.settings.locale;
+        if self.live_ui_locale != Some(locale) {
+            live.set_ui_locale(locale.code());
+            self.live_ui_locale = Some(locale);
+        }
+
+        // Inventory, boss-bar and scoreboard packets advance the HUD
+        // revision. Rebuild their projections when the base mirror replaces
+        // them. Titles, effects and crosshair data can change independently.
+        if hud_replaced || self.live_hud_metadata.is_none() {
+            Self::sync_live_scoreboard(&mut self.ui, live);
+            self.live_hud_metadata = Some(Self::sync_live_hud_items(&mut self.ui, live));
+        }
+        Self::tick_live_title(
+            &mut self.ui,
+            live,
+            &mut self.title_seen_rev,
+            &mut self.title_tick_accum,
+            dt,
+        );
+        Self::sync_live_hud_effects(&mut self.ui, live);
+        Self::sync_looking_at_hud(&mut self.ui, live);
+        self.live_hud_metadata
+    }
+
+    fn build_goggles_overlay(&mut self, [w, h]: [u32; 2]) -> Option<UiDrawList> {
+        // Engineer's-Goggles card: when the crosshair rests on a
+        // kinetic-synced Create block, build the live telemetry
+        // panel (RPM, Stress SU, overstressed warning, processing
+        // bar) for compositing into this frame's HUD overlay.
+        if self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden {
+            let live = self.live.as_mut()?;
+            live.looking_at_block
+                .as_ref()
+                .map(|(pos, _)| *pos)
+                .and_then(|pos| live.goggles_telemetry_at((pos[0], pos[1], pos[2])))
+                .map(|telemetry| {
+                    megu_ui::create_goggles_hud::GogglesHudLayout::build(
+                        &telemetry,
+                        w,
+                        h,
+                        self.ui.settings.locale.code(),
+                    )
+                })
+        } else {
+            None
+        }
+    }
+
+    fn stage_live_scene_assets(&mut self, frame_begin: Instant, dt: f32) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        if live.asset_bundle_pending_upload {
+            // Dropping the CPU pixel payloads is part of the upload:
+            // after this call VRAM owns the sole copy of the atlas and
+            // `live.pending_atlas_pixels` is `None` (`atlas_meta`
+            // stays resident).
+            live.upload_pending_atlas(&mut active.renderer);
+        }
+        if !self.item_icon_atlas_uploaded {
+            if let Some(mut atlas) = live.item_icon_atlas.take() {
+                upgrade_ui_item_icon_atlas_with_3d_blocks(&mut atlas);
+                // Same RAM/VRAM split as the block atlas: `rgba`
+                // uploads once, the uv map stays CPU-side for
+                // `UiCommand::ItemIcon` tessellation.
+                active.renderer.upload_item_icon_atlas(&atlas);
+                self.item_icon_atlas = atlas;
+                self.item_icon_atlas.rgba = Vec::new();
+                self.item_icon_atlas_uploaded = true;
             }
-            // Revision-gated HUD sync: unchanged server state skips the
-            // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
-            live.sync_hud_to(&mut self.ui.hud);
-            let compact_debug_hud = &mut self.ui.settings.qol.compact_debug_hud;
-            let compact_debug_hud_segments = self.persisted_settings.compact_debug_hud_segments;
-            compact_debug_hud.enabled = self.persisted_settings.compact_debug_hud_enabled;
-            compact_debug_hud.show_fps = compact_debug_hud_segments & (1 << 0) != 0;
-            compact_debug_hud.show_coords = compact_debug_hud_segments & (1 << 1) != 0;
-            compact_debug_hud.show_biome = compact_debug_hud_segments & (1 << 2) != 0;
-            compact_debug_hud.show_facing = compact_debug_hud_segments & (1 << 3) != 0;
-            compact_debug_hud.show_ping = compact_debug_hud_segments & (1 << 4) != 0;
-            compact_debug_hud.show_mspt_tps = compact_debug_hud_segments & (1 << 5) != 0;
-            compact_debug_hud.show_light_level = compact_debug_hud_segments & (1 << 6) != 0;
-            compact_debug_hud.show_chunks_entities = compact_debug_hud_segments & (1 << 7) != 0;
-            compact_debug_hud.show_ram = compact_debug_hud_segments & (1 << 8) != 0;
-            // Visual-style preset x `Clouds` decides the deck layout
-            // every frame: Vanilla stays one authentic cubic deck, Megu
-            // Natural + Fancy opts into the hybrid parallax set.
-            live.cloud_deck_mode =
-                cloud_deck_mode(self.ui.settings.visual.preset, self.render_config.clouds);
-            live.record_frame_and_refresh_compact_debug_hud(dt, &mut self.ui);
-            live.set_ui_locale(self.ui.settings.locale.code());
-            let feed = live.hud_feed();
-            let overlay_stack =
-                |stack: &crate::live_session::LiveHotbarStack| LiveHotbarOverlayMeta {
-                    count: stack.count,
-                    damage: stack.damage,
-                    max_damage: stack.max_damage,
-                };
-            live_hud_metadata = Some((
-                std::array::from_fn(|index| feed.hotbar_stacks[index].as_ref().map(overlay_stack)),
-                feed.offhand_stack.as_ref().map(overlay_stack),
-                std::array::from_fn(|index| {
-                    feed.bossbars.get(index).map(|bar| LiveBossBarStyle {
-                        color: bar.color,
-                        divisions: bar.divisions,
-                    })
-                }),
-            ));
-            Self::apply_live_hud(
-                &mut self.ui,
-                &mut self.title_seen_rev,
-                &mut self.title_tick_accum,
-                dt,
-                &feed,
-            );
-            // Engineer's-Goggles card: when the crosshair rests on a
-            // kinetic-synced Create block, build the live telemetry
-            // panel (RPM, Stress SU, overstressed warning, processing
-            // bar) for compositing into this frame's HUD overlay.
-            goggles_draw = if self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden {
-                live.looking_at_block
-                    .as_ref()
-                    .map(|(pos, _)| *pos)
-                    .and_then(|pos| live.goggles_telemetry_at((pos[0], pos[1], pos[2])))
-                    .map(|telemetry| {
-                        megu_ui::create_goggles_hud::GogglesHudLayout::build(
-                            &telemetry,
-                            w,
-                            h,
-                            self.ui.settings.locale.code(),
-                        )
-                    })
-            } else {
-                None
-            };
-            if live.asset_bundle_pending_upload {
-                // Dropping the CPU pixel payloads is part of the upload:
-                // after this call VRAM owns the sole copy of the atlas and
-                // `live.pending_atlas_pixels` is `None` (`atlas_meta`
-                // stays resident).
-                live.upload_pending_atlas(&mut active.renderer);
-            }
-            if !self.item_icon_atlas_uploaded {
-                if let Some(mut atlas) = live.item_icon_atlas.take() {
-                    upgrade_ui_item_icon_atlas_with_3d_blocks(&mut atlas);
-                    // Same RAM/VRAM split as the block atlas: `rgba`
-                    // uploads once, the uv map stays CPU-side for
-                    // `UiCommand::ItemIcon` tessellation.
-                    active.renderer.upload_item_icon_atlas(&atlas);
-                    self.item_icon_atlas = atlas;
-                    self.item_icon_atlas.rgba = Vec::new();
-                    self.item_icon_atlas_uploaded = true;
-                }
-            }
-            // `.mcmeta` playback: one `SpriteFrame` rewrite per animated
-            // sprite, and only when the client-side 20 Hz clock advanced
-            // inside `poll` — steady frames cost one compare.
-            active
-                .renderer
-                .tick_atlas_animations(live.atlas_anim_tick());
-            // Moving contraptions and airships shade against the world
-            // they currently occupy: sample the cached chunk light at
-            // each sub-world anchor so cave transits darken and
-            // torch-side or daylight flight brightens the staged mesh.
-            // The reserved voxel-cloud sheet keeps its baked vertex
-            // lighting — a world-light word would double-shade it.
-            let subworld_lights: Vec<(u64, u8, u8)> = live
-                .subworlds
+        }
+        // `.mcmeta` playback: one `SpriteFrame` rewrite per animated
+        // sprite, and only when the client-side 20 Hz clock advanced
+        // inside `poll` — steady frames cost one compare.
+        active
+            .renderer
+            .tick_atlas_animations(live.atlas_anim_tick());
+        // Moving contraptions and airships shade against the world
+        // they currently occupy: sample the cached chunk light at
+        // each sub-world anchor so cave transits darken and
+        // torch-side or daylight flight brightens the staged mesh.
+        // The reserved voxel-cloud sheet keeps its baked vertex
+        // lighting — a world-light word would double-shade it.
+        self.subworld_light_scratch.clear();
+        self.subworld_light_scratch.extend(
+            live.subworlds
                 .entries()
                 .filter(|entry| entry.id != CLOUD_SUBWORLD_ID)
                 .map(|entry| {
@@ -9292,120 +9411,114 @@ impl GpuApp {
                     let (block_light, sky_light) =
                         live.sample_block_and_sky_light(p[0], p[1], p[2]);
                     (entry.id, block_light, sky_light)
-                })
-                .collect();
-            for (id, block_light, sky_light) in subworld_lights {
-                live.subworlds
-                    .set_subworld_light(id, block_light, sky_light);
-            }
-            active.renderer.sync_subworlds(&mut live.subworlds);
-            // First live frame on this renderer (attach order or
-            // surface/device re-creation): push the session's
-            // connect-time `ComputeStrategy`. `apply_compute_strategy`
-            // engages GPU indirect/Hi-Z/MDI only where the adapter
-            // proves indirect+compute support and the unified plan
-            // allows it; everything else fails closed to the
-            // classic/bundle path.
-            Self::ensure_live_compute_strategy(
-                live,
-                &mut self.live_strategy_pending,
-                &mut active.renderer,
-            );
-            // Live entities + block-entity meshes ride the dynamic ring;
-            // re-staged at most at the 20 Hz cadence the server actually
-            // mutates tracked state, skipped outright while nothing is
-            // renderable.
-            if self
-                .entity_render_cache
-                .next_refresh
-                .is_none_or(|t| frame_begin >= t)
-            {
-                self.entity_render_cache.next_refresh = Some(frame_begin + LIVE_ENTITY_REFRESH);
-                Self::refresh_live_entity_and_ber(
-                    live,
-                    &mut self.entity_render_cache,
-                    &mut active.renderer,
-                    // `entity_shadows` is the Video tab `Shadows`
-                    // toggle — read it live like `enchantment_glint`
-                    // does on the 2D path.
-                    self.ui.settings.video.entity_shadows,
-                    self.ui.settings.video.enchantment_glint,
-                    self.entity_appearance.as_ref(),
-                );
-            }
-            // First live frame on the windowed path: hand the sink to the
-            // dedicated real-time `AudioMixThread` so gameplay code
-            // submits `AudioCmd`s non-blocking (headless/test sessions
-            // keep the synchronous `pump()` fallback).
-            if !live.dedicated_audio_mix() {
-                live.enable_dedicated_audio_mix();
-            }
-            // Upload admission finished above: drop the CPU mesh copies
-            // of the sections VRAM now owns (keeps `packed_mesh_count()`
-            // at the working-set bound, V2).
-            live.release_uploaded_cpu_copies(&mut active.renderer);
-            // Tactile weather/touch sim ticks on the render clock.
-            let submerged = live.player_eye_submerged();
-            live.step_tactile_frame(
-                dt,
-                live.world_time_ticks(),
-                live.world.rain_level <= 0.0,
-                submerged,
-                15,
-                0.0,
-                live.world.rain_level > 0.0,
-            );
-            // Chat/debug lines already live in `live.hud` (chat packets,
-            // `status_line`, debug-chord feedback) and `sync_hud_to`
-            // mirrors them into `ui.hud` on revision bumps — re-extending
-            // `debug_messages` here every frame was an unbounded
-            // duplication at render rate.
+                }),
+        );
+        for &(id, block_light, sky_light) in &self.subworld_light_scratch {
+            live.subworlds
+                .set_subworld_light(id, block_light, sky_light);
         }
+        active.renderer.sync_subworlds(&mut live.subworlds);
+        // First live frame on this renderer (attach order or
+        // surface/device re-creation): push the session's
+        // connect-time `ComputeStrategy`. `apply_compute_strategy`
+        // engages GPU indirect/Hi-Z/MDI only where the adapter
+        // proves indirect+compute support and the unified plan
+        // allows it; everything else fails closed to the
+        // classic/bundle path.
+        Self::ensure_live_compute_strategy(
+            live,
+            &mut self.live_strategy_pending,
+            &mut active.renderer,
+        );
+        // Live entities + block-entity meshes ride the dynamic ring;
+        // re-staged at most at the 20 Hz cadence the server actually
+        // mutates tracked state, skipped outright while nothing is
+        // renderable.
+        if self
+            .entity_render_cache
+            .next_refresh
+            .is_none_or(|t| frame_begin >= t)
+        {
+            self.entity_render_cache.next_refresh = Some(frame_begin + LIVE_ENTITY_REFRESH);
+            Self::refresh_live_entity_and_ber(
+                live,
+                &mut self.entity_render_cache,
+                &mut active.renderer,
+                // `entity_shadows` is the Video tab `Shadows`
+                // toggle — read it live like `enchantment_glint`
+                // does on the 2D path.
+                self.ui.settings.video.entity_shadows,
+                self.ui.settings.video.enchantment_glint,
+                self.entity_appearance.as_ref(),
+            );
+        }
+        // First live frame on the windowed path: hand the sink to the
+        // dedicated real-time `AudioMixThread` so gameplay code
+        // submits `AudioCmd`s non-blocking (headless/test sessions
+        // keep the synchronous `pump()` fallback).
+        if !live.dedicated_audio_mix() {
+            live.enable_dedicated_audio_mix();
+        }
+        // Upload admission finished above: drop the CPU mesh copies
+        // of the sections VRAM now owns (keeps `packed_mesh_count()`
+        // at the working-set bound, V2).
+        live.release_uploaded_cpu_copies(&mut active.renderer);
+        // Tactile weather/touch sim ticks on the render clock.
+        let submerged = live.player_eye_submerged();
+        live.step_tactile_frame(
+            dt,
+            live.world_time_ticks(),
+            live.world.rain_level <= 0.0,
+            submerged,
+            15,
+            0.0,
+            live.world.rain_level > 0.0,
+        );
+    }
 
+    fn sync_frame_hud(&mut self) {
         // HUD/diagnostics through the real client-ui state machine. The
         // F3 overlay's DATA refreshes at 10 Hz (`F3_REFRESH`) — steady
         // frames reuse the cached contents, which also keeps the
         // draw-list fingerprint stable so the UI mesh rebuild stays
         // skipped — and the cached overlay is re-mirrored every frame so
         // `sync_hud_to`'s revision-gated wholesale clone can't stomp it.
-        {
-            let stale = self
-                .f3_overlay_built
-                .is_none_or(|built| built.elapsed() >= F3_REFRESH);
-            if stale {
-                self.f3_overlay = Self::build_f3_overlay(
-                    self.live.as_ref(),
-                    &self.governor,
-                    self.user_shadow_quality,
-                    &mut self.f3_metrics_probe,
-                    active,
-                );
-                self.f3_overlay_built = Some(Instant::now());
-            }
-            self.f3_overlay.enabled = self.show_diagnostics;
-            if self.ui.hud.debug_overlay != self.f3_overlay {
-                self.ui.hud.debug_overlay.clone_from(&self.f3_overlay);
-            }
+        let stale = self
+            .f3_overlay_built
+            .is_none_or(|built| built.elapsed() >= F3_REFRESH);
+        if stale {
+            self.f3_overlay = Self::build_f3_overlay(
+                self.live.as_ref(),
+                &self.governor,
+                self.user_shadow_quality,
+                &mut self.f3_metrics_probe,
+                self.active
+                    .as_ref()
+                    .expect("visible frame has an active window"),
+            );
+            self.f3_overlay_built = Some(Instant::now());
+        }
+        self.f3_overlay.enabled = self.show_diagnostics;
+        if self.ui.hud.debug_overlay != self.f3_overlay {
+            self.ui.hud.debug_overlay.clone_from(&self.f3_overlay);
         }
         // Actionbar mirror: always the real game actionbar / connection
         // status — the F3 overlay lives in `hud.debug_overlay` and never
         // hijacks this channel again.
-        match self.live.as_ref().map(|live| &live.status) {
-            Some(SessionStatus::Playing) => {
-                let actionbar = &self.live.as_ref().expect("status read").hud.actionbar;
-                if self.ui.hud.actionbar != *actionbar {
-                    self.ui.hud.actionbar.clone_from(actionbar);
-                }
+        let actionbar = &mut self.ui.hud.actionbar;
+        if let Some(live) = &self.live {
+            let (prefix, message) = match &live.status {
+                SessionStatus::Playing => ("", live.hud.actionbar.as_str()),
+                SessionStatus::Connecting => ("", "Connecting to server..."),
+                SessionStatus::Disconnected(reason) => ("Disconnected: ", reason.as_str()),
+            };
+            if actionbar.strip_prefix(prefix) != Some(message) {
+                actionbar.clear();
+                actionbar.push_str(prefix);
+                actionbar.push_str(message);
             }
-            Some(SessionStatus::Connecting) => {
-                if self.ui.hud.actionbar != "Connecting to server..." {
-                    self.ui.hud.actionbar = "Connecting to server...".to_owned();
-                }
-            }
-            Some(SessionStatus::Disconnected(reason)) => {
-                self.ui.hud.actionbar = format!("Disconnected: {reason}");
-            }
-            None => self.ui.hud.actionbar.clear(),
+        } else {
+            actionbar.clear();
         }
         // Chat-bar mirror lands after `sync_hud_to` (which clones
         // `live.hud` wholesale) and before the draw list rebuild — the
@@ -9415,6 +9528,24 @@ impl GpuApp {
             self.chat_bar.as_ref(),
             self.ui.settings.zsh_command_bar,
         );
+    }
+
+    fn build_frame_ui(
+        &mut self,
+        viewport: [u32; 2],
+        elapsed_secs: f32,
+        font_revision: u64,
+        live_hud_metadata: Option<&LiveHudMetadata>,
+        goggles_draw: Option<UiDrawList>,
+    ) {
+        self.build_screen_ui(viewport, live_hud_metadata);
+        self.update_frame_title_branding(viewport, font_revision);
+        let glint_on = self.ui.settings.video.enchantment_glint && !self.ui.hud.hud_hidden;
+        self.build_mod_hud(viewport, glint_on, elapsed_secs, goggles_draw);
+        self.build_gameplay_overlay(viewport, glint_on, elapsed_secs);
+    }
+
+    fn build_screen_ui(&mut self, [w, h]: [u32; 2], metadata: Option<&LiveHudMetadata>) {
         // Pooled draw list (C4): `render_into` clears + refills
         // `self.ui_draw_list` in place so steady frames allocate
         // nothing (text payloads recycle inside the list). The command
@@ -9427,7 +9558,7 @@ impl GpuApp {
             self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
         );
         if self.ui.screen == Screen::InGameHud && !self.ui.hud.hud_hidden {
-            if let Some((hotbar, offhand, bossbars)) = &live_hud_metadata {
+            if let Some((hotbar, offhand, bossbars)) = metadata {
                 apply_live_hotbar_metadata(
                     w,
                     h,
@@ -9439,51 +9570,73 @@ impl GpuApp {
                 apply_live_bossbar_metadata(w, bossbars, &mut self.ui_draw_list);
             }
         }
-        let draw_list = &mut self.ui_draw_list;
-        // Per-layer overlay lists: rebuilt every frame, fingerprinted
-        // below so only layers whose content actually moved bump their
-        // `UiLayer` revision (and re-tessellate).
-        self.ui_modhud_list.clear();
-        self.ui_overlay_list.clear();
-        self.ui_modoverlay_list.clear();
-        // Runtime `MEGU EDITION` title branding: with the local JAR's
-        // wordmark + patched edition strip GPU-resident, the banner
-        // replaces the built-in wordmark text commands and the session's
-        // yellow splash joins the title screen.
-        let mut brand_logo_rect = None;
-        let mut brand_edition_rect = None;
-        let mut brand_splash_mesh = None;
-        if self.ui.screen == Screen::Title && self.title_branding.has_banner() {
-            draw_list.commands.retain(|c| !is_builtin_title_text(c));
-            if let (Some(logo), Some(edition)) = (
-                self.title_branding.logo.as_ref(),
-                self.title_branding.edition.as_ref(),
-            ) {
-                let layout = crate::title_branding::title_brand_layout(
-                    w,
-                    h,
-                    (logo.width, logo.height),
-                    (edition.width, edition.height),
-                );
-                brand_logo_rect = Some(layout.logo_rect);
-                brand_edition_rect = Some(layout.edition_rect);
-                let splash = self.title_branding.select_splash(self.splash_seed);
-                let mut splash_list = UiDrawList::new();
-                splash_list.text(
-                    layout.splash_anchor_x - text_width(splash, 1) as i32,
-                    layout.splash_y,
-                    1,
-                    UiColor::rgb(255, 255, 0),
-                    splash,
-                );
-                brand_splash_mesh = Some(tessellate_draw_list(w, h, &splash_list));
+    }
+
+    fn update_frame_title_branding(&mut self, viewport: [u32; 2], font_revision: u64) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        let [w, h] = viewport;
+        // The screen list is freshly built, so remove its fallback text
+        // even when the renderer already holds the matching banner mesh.
+        let banner = self
+            .title_branding
+            .logo
+            .as_ref()
+            .zip(self.title_branding.edition.as_ref())
+            .filter(|_| self.ui.screen == Screen::Title);
+        let key = if banner.is_some() {
+            self.ui_draw_list
+                .commands
+                .retain(|c| !is_builtin_title_text(c));
+            TitleBrandingFrame::Visible {
+                viewport,
+                font_revision,
             }
+        } else {
+            TitleBrandingFrame::Hidden
+        };
+        if active.title_branding_frame == Some(key) {
+            return;
         }
-        active.renderer.update_title_branding(
-            brand_logo_rect,
-            brand_edition_rect,
-            brand_splash_mesh.as_ref(),
-        );
+        active.title_branding_frame = Some(key);
+
+        if let Some((logo, edition)) = banner {
+            let layout = crate::title_branding::title_brand_layout(
+                w,
+                h,
+                (logo.width, logo.height),
+                (edition.width, edition.height),
+            );
+            let splash = self.title_branding.select_splash(self.splash_seed);
+            let mut splash_list = UiDrawList::new();
+            splash_list.text(
+                layout.splash_anchor_x - text_width(splash, 1) as i32,
+                layout.splash_y,
+                1,
+                UiColor::rgb(255, 255, 0),
+                splash,
+            );
+            let splash_mesh = tessellate_draw_list(w, h, &splash_list);
+            active.renderer.update_title_branding(
+                Some(layout.logo_rect),
+                Some(layout.edition_rect),
+                Some(&splash_mesh),
+            );
+        } else {
+            active.renderer.update_title_branding(None, None, None);
+        }
+    }
+
+    fn build_mod_hud(
+        &mut self,
+        [w, h]: [u32; 2],
+        glint_on: bool,
+        glint_elapsed: f32,
+        goggles_draw: Option<UiDrawList>,
+    ) {
+        self.ui_modhud_list.clear();
         if !self.ui.hud.hud_hidden {
             if let Some(live) = &self.live {
                 if !live.magic.is_empty() {
@@ -9505,10 +9658,6 @@ impl GpuApp {
         // read window-0 components directly (36..45 = hotbar, 45 =
         // offhand) and only while the bare HUD is up — an open container
         // re-draws every slot through its own overlay pass below.
-        let glint_on = self.ui.settings.video.enchantment_glint && !self.ui.hud.hud_hidden;
-        let glint_elapsed = frame_begin
-            .saturating_duration_since(self.ui_anim_epoch)
-            .as_secs_f32();
         if glint_on
             && self.ui.screen == Screen::InGameHud
             && self.ui.hud.game_mode != 3
@@ -9529,6 +9678,43 @@ impl GpuApp {
                 }
             }
         }
+    }
+
+    fn build_gameplay_overlay(&mut self, viewport: [u32; 2], glint_on: bool, elapsed_secs: f32) {
+        let [w, h] = viewport;
+        self.ui_overlay_list.clear();
+        self.build_container_overlay(viewport, glint_on, elapsed_secs);
+        if self.live.as_ref().is_some_and(LiveSession::is_sleeping) {
+            megu_ui::gameplay_screens::BedSleepOverlay { visible: true }.render(
+                w,
+                h,
+                &mut self.ui_overlay_list,
+            );
+        }
+        if let Some(book) = &self.book_editor {
+            book.render(w, h, &mut self.ui_overlay_list);
+        }
+        if let Some(creative) = &self.creative_inventory {
+            creative.render(w, h, &mut self.ui_overlay_list);
+        }
+        if let Some(credits) = &self.credits_screen {
+            credits.render(w, h, &mut self.ui_overlay_list);
+        }
+        if self.shader_options_open {
+            let (list, _) = self.ui.shader_packs.render(w, h);
+            self.ui_overlay_list.commands.extend(list.commands);
+        }
+        if self.advancements_open {
+            Self::render_advancements_overlay(
+                self.live.as_ref(),
+                w as i32,
+                h as i32,
+                &mut self.ui_overlay_list,
+            );
+        }
+    }
+
+    fn build_container_overlay(&mut self, [w, h]: [u32; 2], glint_on: bool, glint_elapsed: f32) {
         // Server-driven container screen draws above the HUD — the
         // `Overlay` layer in the retained cache.
         if let Some(screen) = self
@@ -9590,43 +9776,32 @@ impl GpuApp {
                 }
             }
         }
-        if self.live.as_ref().is_some_and(LiveSession::is_sleeping) {
-            megu_ui::gameplay_screens::BedSleepOverlay { visible: true }.render(
-                w,
-                h,
-                &mut self.ui_overlay_list,
-            );
+    }
+
+    fn refresh_mod_overlay(&mut self, viewport: [u32; 2], font_revision: u64) -> bool {
+        let [w, h] = viewport;
+        let layout = ModOverlayLayout {
+            viewport,
+            scale: self.ui.effective_scale(h),
+            font_revision,
+            sprites_loaded: self.gui_sprites_loaded,
+        };
+        if self.mod_overlay_layout.as_ref() == Some(&layout) {
+            return false;
         }
-        if let Some(book) = &self.book_editor {
-            book.render(w, h, &mut self.ui_overlay_list);
-        }
-        if let Some(creative) = &self.creative_inventory {
-            creative.render(w, h, &mut self.ui_overlay_list);
-        }
-        if let Some(credits) = &self.credits_screen {
-            credits.render(w, h, &mut self.ui_overlay_list);
-        }
-        if self.shader_options_open {
-            let (list, _) = self.ui.shader_packs.render(w, h);
-            self.ui_overlay_list.commands.extend(list.commands);
-        }
-        if self.advancements_open {
-            Self::render_advancements_overlay(
-                self.live.as_ref(),
-                w as i32,
-                h as i32,
-                &mut self.ui_overlay_list,
-            );
-        }
+
+        self.ui_modoverlay_list.clear();
         // Tier-2 mod GUI bridge: the active batch lowers straight into
         // the mod-overlay layer list (scissor-safe inside the frame's
         // clip), zero cost while no mod recorded ops this frame.
         if !self.gui_bridge_batch.ops.is_empty() {
-            let lowered = lower_bridge_batch_to_draw_list(&self.gui_bridge_batch, w, h);
-            let clips = lowered.command_clips().to_vec();
-            for (index, command) in lowered.commands.into_iter().enumerate() {
+            let mut lowered = lower_bridge_batch_to_draw_list(&self.gui_bridge_batch, w, h);
+            for (index, command) in std::mem::take(&mut lowered.commands)
+                .into_iter()
+                .enumerate()
+            {
                 self.ui_modoverlay_list
-                    .push_with_clip(command, clips.get(index).copied().flatten());
+                    .push_with_clip(command, lowered.command_clip(index));
             }
         }
         // Declarative mod-UI manifest: the shared Vanilla widget kit
@@ -9636,62 +9811,78 @@ impl GpuApp {
             megu_ui::vanilla_widgets::draw_mod_ui_manifest_sprites(
                 &mut self.ui_modoverlay_list,
                 manifest,
-                self.ui.effective_scale(h),
+                layout.scale,
                 UiRect::new(0, 0, w, h),
-                self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
+                layout.sprites_loaded.then_some(&self.gui_sprite_atlas),
             );
         }
+
+        self.mod_overlay_layout = Some(layout);
+        true
+    }
+
+    fn upload_retained_ui(
+        &mut self,
+        [w, h]: [u32; 2],
+        font_revision: u64,
+        mod_overlay_rebuilt: bool,
+    ) {
         // Retained per-layer upload: fingerprint each layer's list and
         // bump its `UiLayer` revision only when content moved — the
         // retained cache then re-tessellates just the dirty layers into
         // warm buffers and uploads the single merged batch only when the
         // composite actually differs (`renderer.ui_cpu_raster_uploads`
         // stays at zero either way).
-        {
-            let layer_lists: [(megu_core::rev::UiLayer, &UiDrawList); 4] = [
-                (megu_core::rev::UiLayer::Screen, &self.ui_draw_list),
-                (megu_core::rev::UiLayer::ModHud, &self.ui_modhud_list),
-                (megu_core::rev::UiLayer::Overlay, &self.ui_overlay_list),
-                (
-                    megu_core::rev::UiLayer::ModOverlay,
-                    &self.ui_modoverlay_list,
-                ),
-            ];
-            for (layer, list) in &layer_lists {
-                let mut fp = fingerprint_draw_list(w, h, list);
-                if *layer == megu_core::rev::UiLayer::Screen {
-                    fp ^= crate::vanilla_font::font_revision().wrapping_mul(FNV1A64_PRIME);
-                }
-                if self.ui_layer_fps[layer.index()] != fp {
-                    self.ui_layer_fps[layer.index()] = fp;
-                    layer.bump(&mut self.ui_layer_bus);
-                }
+        let layer_lists: [(UiLayer, &UiDrawList); 4] = [
+            (UiLayer::Screen, &self.ui_draw_list),
+            (UiLayer::ModHud, &self.ui_modhud_list),
+            (UiLayer::Overlay, &self.ui_overlay_list),
+            (UiLayer::ModOverlay, &self.ui_modoverlay_list),
+        ];
+        for (layer, list) in layer_lists {
+            if layer == UiLayer::ModOverlay && !mod_overlay_rebuilt {
+                continue;
             }
-            let dirty = self.ui_retained.begin_frame(&self.ui_layer_bus);
-            for index in dirty.iter() {
-                let Some((layer, list)) =
-                    layer_lists.iter().find(|(layer, _)| layer.index() == index)
-                else {
-                    continue;
-                };
-                self.ui_retained.update_layer(
-                    *layer,
-                    list,
-                    w,
-                    h,
-                    &self.item_icon_atlas,
-                    &self.gui_sprite_atlas,
-                );
+            let mut fp = fingerprint_draw_list(w, h, list);
+            if layer == UiLayer::Screen {
+                fp ^= font_revision.wrapping_mul(FNV1A64_PRIME);
             }
-            let _ = self.ui_retained.composite();
-            if self.ui_retained.gpu_upload_needed() {
-                let (vertices, indices) = self.ui_retained.composite();
-                active
-                    .renderer
-                    .update_ui_mesh_parts(w, h, vertices, indices);
-                self.ui_retained.mark_uploaded();
+            if self.ui_layer_fps[layer.index()] != fp {
+                self.ui_layer_fps[layer.index()] = fp;
+                layer.bump(&mut self.ui_layer_bus);
             }
         }
+        let dirty = self.ui_retained.begin_frame(&self.ui_layer_bus);
+        if dirty.is_empty() && !self.ui_retained.gpu_upload_needed() {
+            return;
+        }
+        for index in dirty.iter() {
+            let Some((layer, list)) = layer_lists.iter().find(|(layer, _)| layer.index() == index)
+            else {
+                continue;
+            };
+            self.ui_retained.update_layer(
+                *layer,
+                list,
+                w,
+                h,
+                &self.item_icon_atlas,
+                &self.gui_sprite_atlas,
+            );
+        }
+        let _ = self.ui_retained.composite();
+        if self.ui_retained.gpu_upload_needed() {
+            let (vertices, indices) = self.ui_retained.composite();
+            self.active
+                .as_mut()
+                .expect("visible frame has an active window")
+                .renderer
+                .update_ui_mesh_parts(w, h, vertices, indices);
+            self.ui_retained.mark_uploaded();
+        }
+    }
+
+    fn prepare_frame_camera(&mut self) -> Camera {
         let mut render_camera = self.camera_controller.view_camera(&self.camera);
         // Tactile micro-motion: transient turn-roll + landing dip from
         // the live session's camera sim. The state machine emits an
@@ -9710,267 +9901,63 @@ impl GpuApp {
             let submerged = live.latest_audio_hint().underwater_lowpass > 0.3;
             live.set_listener_submerged(submerged);
         }
-        // Night-sky drama: shooting-star streaks and polar aurora
-        // curtains ride the world-space debug-line overlay. Empty while
-        // `world_effects`/`night_sky` is off or by day — the empty push
-        // also clears stale lines from the previous frame.
-        {
-            let night_sky_on = self.ui.settings.visual.world_effects
-                && self.ui.settings.visual.world_effects_detail.night_sky;
-            let mut drama_lines = self
-                .live
-                .as_ref()
-                .filter(|_| night_sky_on)
-                .map(|live| night_sky_drama_lines(live.latest_night_sky_drama(), &render_camera))
-                .unwrap_or_default();
-            if let Some(CrosshairPick::Block(hit)) =
-                self.live.as_ref().and_then(LiveSession::crosshair_pick)
-            {
-                drama_lines.extend(crate::renderer::block_selection_outline_lines(
-                    hit.block_pos,
-                ));
+        self.update_frame_debug_overlay(&render_camera);
+        render_camera
+    }
+
+    fn update_frame_debug_overlay(&mut self, camera: &Camera) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        let night_sky_on = self.ui.settings.visual.world_effects
+            && self.ui.settings.visual.world_effects_detail.night_sky;
+        let drama = self
+            .live
+            .as_ref()
+            .filter(|_| night_sky_on)
+            .map(|live| live.latest_night_sky_drama())
+            .filter(|drama| !drama.is_empty());
+        let block_outline = match self.live.as_ref().and_then(LiveSession::crosshair_pick) {
+            Some(CrosshairPick::Block(hit)) => Some(hit.block_pos),
+            _ => None,
+        };
+
+        if let Some(drama) = drama {
+            self.debug_line_scratch.clear();
+            append_night_sky_drama_lines(drama, camera, &mut self.debug_line_scratch);
+            if let Some(pos) = block_outline {
+                self.debug_line_scratch
+                    .extend(crate::renderer::block_selection_outline_lines(pos));
             }
-            active.renderer.set_debug_lines(&drama_lines);
+            active.renderer.set_debug_lines(&self.debug_line_scratch);
+            active.debug_overlay = FrameDebugOverlay::NightSky;
+        } else {
+            let overlay = FrameDebugOverlay::BlockOutline(block_outline);
+            if active.debug_overlay != overlay {
+                active.renderer.set_block_selection(block_outline);
+                active.debug_overlay = overlay;
+            }
         }
-        let sky = active
-            .renderer
-            .set_camera(&render_camera, w as f32 / h as f32);
+    }
+
+    fn submit_surface_frame(&mut self, viewport: [u32; 2], camera: &Camera, rain_wetness: f32) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+
+        let [w, h] = viewport;
+        let sky = active.renderer.set_camera(camera, w as f32 / h as f32);
         match active.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 let view = frame
                     .texture
                     .create_view(&wgpu::TextureViewDescriptor::default());
-                match &self.live {
-                    Some(live) => {
-                        // One `frame_output` snapshot feeds both the
-                        // light UBO (`dynamic_colored_lights` did the
-                        // same call and discarded the rest) and the
-                        // particle staging below.
-                        let mut vfx_frame = live.vfx.frame_output(render_camera.forward_vector());
-                        // Gameplay dynamic lights (held torches, glowing
-                        // mobs, dropped glow items) share the 64-light
-                        // WGSL UBO with the server VFX1 lights —
-                        // nearest-first, budget-capped inside
-                        // `collect_dynamic_lights`, empty while the
-                        // world-effects setting is Off. The
-                        // `video.dynamic_lights` switch skips the collect
-                        // outright so the toggle kills every gameplay
-                        // light the same frame it flips.
-                        if self.ui.settings.video.dynamic_lights {
-                            vfx_frame
-                                .lights
-                                .extend(live.collect_dynamic_lights(render_camera.position));
-                        }
-                        Self::stage_live_particles(
-                            live,
-                            &self.vanilla_particles,
-                            &vfx_frame,
-                            &render_camera,
-                            &mut self.particle_scratch,
-                            &mut self.live_particles_staged,
-                            &mut active.renderer,
-                        );
-                        // Phase-1 seamless dimension transfer: while the
-                        // committed crossfade is in flight, fold its eased
-                        // sky/fog into this frame's atmosphere so the swap
-                        // glides instead of hard-cutting; while the
-                        // committed dimension's loading screen stays
-                        // suppressed, the per-chunk arrival dissolve is
-                        // swapped for an instantly-settled tracker so
-                        // prefetched terrain pops in with zero black beat.
-                        let portal_atmosphere = self.seamless_portal.blended_sky_and_fog().map(
-                            |(sky_rgb, fog_rgb, progress)| {
-                                let from = live.atmosphere_blender.current();
-                                let mut to = from;
-                                to.sky_zenith_rgb = sky_rgb;
-                                to.sky_horizon_rgb = sky_rgb;
-                                to.fog_rgb = fog_rgb;
-                                BiomeAtmosphereBlender::new(blend_dimension_crossfade(
-                                    &from, &to, progress,
-                                ))
-                            },
-                        );
-                        let atmosphere = portal_atmosphere
-                            .as_ref()
-                            .unwrap_or(&live.atmosphere_blender);
-                        let empty_fades;
-                        let chunk_fades = if self
-                            .seamless_portal
-                            .should_suppress_loading_screen(&live.world.dimension.name)
-                        {
-                            empty_fades = ChunkFadeTracker::new();
-                            &empty_fades
-                        } else {
-                            &live.chunk_fades
-                        };
-                        active.renderer.render_to_view_with_env_and_rain(
-                            &view,
-                            w,
-                            h,
-                            &sky,
-                            atmosphere,
-                            chunk_fades,
-                            live.world_time_ticks(),
-                            &vfx_frame.lights,
-                            rain_wetness,
-                        );
-                    }
-                    None => active.renderer.render_to_view(&view, w, h, &sky),
-                }
-                // Wayland `wl_surface.frame` pacing: notify the compositor
-                // right before present so frame callbacks align with the
-                // actual swap (a no-op everywhere else; the policy gates
-                // it). `--vsync off` skips the notify entirely — an
-                // `Immediate`/`Mailbox` swap must not wait on a frame
-                // callback the compositor only schedules for vsync clients.
-                if self.policy.call_pre_present_notify
-                    && crate::should_call_pre_present_notify(self.config.vsync)
-                {
-                    active.window.pre_present_notify();
-                }
-                // One-shot ground-truth readback for capture debugging:
-                // MEGU_FRAME_DUMP=/path.ppm copies the presented surface into
-                // a CPU buffer on present #30 and writes a binary PPM.
-                if let Ok(path) = std::env::var("MEGU_FRAME_DUMP") {
-                    static DUMPED: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    static PN0: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let pn = PN0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if pn >= 30 && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        let dev = &active.renderer.gpu().device;
-                        let queue = &active.renderer.gpu().queue;
-                        let row = w * 4;
-                        let padded = row.div_ceil(256) * 256;
-                        let buf = dev.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("frame-dump"),
-                            size: (padded * h) as u64,
-                            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                            mapped_at_creation: false,
-                        });
-                        let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("frame-dump"),
-                        });
-                        enc.copy_texture_to_buffer(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &frame.texture,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            wgpu::TexelCopyBufferInfo {
-                                buffer: &buf,
-                                layout: wgpu::TexelCopyBufferLayout {
-                                    offset: 0,
-                                    bytes_per_row: Some(padded),
-                                    rows_per_image: Some(h),
-                                },
-                            },
-                            wgpu::Extent3d {
-                                width: w,
-                                height: h,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        queue.submit([enc.finish()]);
-                        let slice = buf.slice(..);
-                        let (tx2, rx2) = std::sync::mpsc::channel();
-                        slice.map_async(wgpu::MapMode::Read, move |r| {
-                            let _ = tx2.send(r);
-                        });
-                        let _ = dev.poll(wgpu::PollType::Wait {
-                            submission_index: None,
-                            timeout: Some(std::time::Duration::from_secs(10)),
-                        });
-                        if let Ok(Ok(())) = rx2.recv() {
-                            let data = slice.get_mapped_range().unwrap();
-                            let mut img = format!("P6\n{} {}\n255\n", w, h).into_bytes();
-                            for y in 0..h as usize {
-                                let start = y * padded as usize;
-                                img.extend_from_slice(&data[start..start + row as usize]);
-                            }
-                            drop(data);
-                            buf.unmap();
-                            let _ = std::fs::write(&path, &img);
-                            eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
-                        }
-                    }
-                }
-                if self.screenshot_pending {
-                    self.screenshot_pending = false;
-                    let game_dir = self
-                        .config
-                        .game_dir
-                        .as_deref()
-                        .unwrap_or(std::path::Path::new("."));
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let mut sequence = self.screenshot_sequence;
-                    let mut path = crate::renderer::screenshot_output_path(
-                        game_dir,
-                        now.saturating_add(sequence),
-                    );
-                    while path.exists() && sequence < u64::MAX - now {
-                        sequence += 1;
-                        path = crate::renderer::screenshot_output_path(
-                            game_dir,
-                            now.saturating_add(sequence),
-                        );
-                    }
-                    self.screenshot_sequence = sequence.saturating_add(1);
-                    let result = (|| {
-                        if !active.surface_copy_src_supported {
-                            return Err("surface does not support screenshot readback".to_owned());
-                        }
-                        let bgra = matches!(
-                            active.surface_format,
-                            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-                        );
-                        if !bgra
-                            && !matches!(
-                                active.surface_format,
-                                wgpu::TextureFormat::Rgba8Unorm
-                                    | wgpu::TextureFormat::Rgba8UnormSrgb
-                            )
-                        {
-                            return Err(format!(
-                                "unsupported screenshot surface format {:?}",
-                                active.surface_format
-                            ));
-                        }
-                        let mut rgba = active.renderer.read_texture_rgba(&frame.texture, w, h)?;
-                        if bgra {
-                            for pixel in rgba.as_chunks_mut::<4>().0 {
-                                pixel.swap(0, 2);
-                            }
-                        }
-                        crate::renderer::spawn_rgba_png_write(path.clone(), w, h, rgba)
-                    })();
-                    if let Err(error) = result {
-                        eprintln!("[screenshot] failed: {error}");
-                    }
-                }
-                active.renderer.gpu().queue.present(frame);
-                if std::env::var_os("MEGU_FPS_LOG").is_some() {
-                    static FPS: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> =
-                        std::sync::OnceLock::new();
-                    let st =
-                        FPS.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
-                    let mut g = st.lock().unwrap();
-                    g.1 += 1;
-                    let el = g.0.elapsed();
-                    if el >= std::time::Duration::from_secs(5) {
-                        eprintln!(
-                            "[fps] {:.1} fps ({} frames / {:.1}s)",
-                            g.1 as f64 / el.as_secs_f64(),
-                            g.1,
-                            el.as_secs_f64()
-                        );
-                        *g = (std::time::Instant::now(), 0);
-                    }
-                }
+
+                self.draw_surface_frame(viewport, &view, camera, &sky, rain_wetness);
+                self.present_surface_frame(viewport, frame);
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {}
             surface_kind @ (wgpu::CurrentSurfaceTexture::Outdated
@@ -10000,6 +9987,269 @@ impl GpuApp {
                 }
             }
         }
+    }
+
+    fn draw_surface_frame(
+        &mut self,
+        [w, h]: [u32; 2],
+        view: &wgpu::TextureView,
+        render_camera: &Camera,
+        sky: &SkyFogOutput,
+        rain_wetness: f32,
+    ) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        match &self.live {
+            Some(live) => {
+                // One `frame_output` snapshot feeds both the
+                // light UBO (`dynamic_colored_lights` did the
+                // same call and discarded the rest) and the
+                // particle staging below.
+                let mut vfx_frame = live.vfx.frame_output(render_camera.forward_vector());
+                // Gameplay dynamic lights (held torches, glowing
+                // mobs, dropped glow items) share the 64-light
+                // WGSL UBO with the server VFX1 lights —
+                // nearest-first, budget-capped inside
+                // `collect_dynamic_lights`, empty while the
+                // world-effects setting is Off. The
+                // `video.dynamic_lights` switch skips the collect
+                // outright so the toggle kills every gameplay
+                // light the same frame it flips.
+                if self.ui.settings.video.dynamic_lights {
+                    vfx_frame
+                        .lights
+                        .extend(live.collect_dynamic_lights(render_camera.position));
+                }
+                Self::stage_live_particles(
+                    live,
+                    &self.vanilla_particles,
+                    &vfx_frame,
+                    render_camera,
+                    &mut self.particle_scratch,
+                    &mut self.live_particles_staged,
+                    &mut active.renderer,
+                );
+                // Phase-1 seamless dimension transfer: while the
+                // committed crossfade is in flight, fold its eased
+                // sky/fog into this frame's atmosphere so the swap
+                // glides instead of hard-cutting; while the
+                // committed dimension's loading screen stays
+                // suppressed, the per-chunk arrival dissolve is
+                // swapped for an instantly-settled tracker so
+                // prefetched terrain pops in with zero black beat.
+                let portal_atmosphere = self.seamless_portal.blended_sky_and_fog().map(
+                    |(sky_rgb, fog_rgb, progress)| {
+                        let from = live.atmosphere_blender.current();
+                        let mut to = from;
+                        to.sky_zenith_rgb = sky_rgb;
+                        to.sky_horizon_rgb = sky_rgb;
+                        to.fog_rgb = fog_rgb;
+                        BiomeAtmosphereBlender::new(blend_dimension_crossfade(&from, &to, progress))
+                    },
+                );
+                let atmosphere = portal_atmosphere
+                    .as_ref()
+                    .unwrap_or(&live.atmosphere_blender);
+                let empty_fades;
+                let chunk_fades = if self
+                    .seamless_portal
+                    .should_suppress_loading_screen(&live.world.dimension.name)
+                {
+                    empty_fades = ChunkFadeTracker::new();
+                    &empty_fades
+                } else {
+                    &live.chunk_fades
+                };
+                active.renderer.render_to_view_with_env_and_rain(
+                    view,
+                    w,
+                    h,
+                    sky,
+                    atmosphere,
+                    chunk_fades,
+                    live.world_time_ticks(),
+                    &vfx_frame.lights,
+                    rain_wetness,
+                );
+            }
+            None => active.renderer.render_to_view(view, w, h, sky),
+        }
+    }
+
+    fn present_surface_frame(&mut self, viewport: [u32; 2], frame: wgpu::SurfaceTexture) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        // Wayland `wl_surface.frame` pacing: notify the compositor
+        // right before present so frame callbacks align with the
+        // actual swap (a no-op everywhere else; the policy gates
+        // it). `--vsync off` skips the notify entirely — an
+        // `Immediate`/`Mailbox` swap must not wait on a frame
+        // callback the compositor only schedules for vsync clients.
+        if self.policy.call_pre_present_notify
+            && crate::should_call_pre_present_notify(self.config.vsync)
+        {
+            active.window.pre_present_notify();
+        }
+
+        Self::dump_surface_frame(&active.renderer, viewport, &frame.texture);
+        self.save_pending_screenshot(viewport, &frame.texture);
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        active.renderer.gpu().queue.present(frame);
+        if std::env::var_os("MEGU_FPS_LOG").is_some() {
+            static FPS: std::sync::OnceLock<std::sync::Mutex<(std::time::Instant, u32)>> =
+                std::sync::OnceLock::new();
+            let st = FPS.get_or_init(|| std::sync::Mutex::new((std::time::Instant::now(), 0)));
+            let mut g = st.lock().unwrap();
+            g.1 += 1;
+            let el = g.0.elapsed();
+            if el >= std::time::Duration::from_secs(5) {
+                eprintln!(
+                    "[fps] {:.1} fps ({} frames / {:.1}s)",
+                    g.1 as f64 / el.as_secs_f64(),
+                    g.1,
+                    el.as_secs_f64()
+                );
+                *g = (std::time::Instant::now(), 0);
+            }
+        }
+    }
+
+    fn dump_surface_frame(renderer: &GpuRenderer, [w, h]: [u32; 2], texture: &wgpu::Texture) {
+        // One-shot ground-truth readback for capture debugging:
+        // MEGU_FRAME_DUMP=/path.ppm copies the presented surface into
+        // a CPU buffer on present #30 and writes a binary PPM.
+        if let Ok(path) = std::env::var("MEGU_FRAME_DUMP") {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            static PN0: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let pn = PN0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if pn >= 30 && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let dev = &renderer.gpu().device;
+                let queue = &renderer.gpu().queue;
+                let row = w * 4;
+                let padded = row.div_ceil(256) * 256;
+                let buf = dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("frame-dump"),
+                    size: (padded * h) as u64,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("frame-dump"),
+                });
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &buf,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(padded),
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit([enc.finish()]);
+                let slice = buf.slice(..);
+                let (tx2, rx2) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx2.send(r);
+                });
+                let _ = dev.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(10)),
+                });
+                if let Ok(Ok(())) = rx2.recv() {
+                    let data = slice.get_mapped_range().unwrap();
+                    let mut img = format!("P6\n{} {}\n255\n", w, h).into_bytes();
+                    for y in 0..h as usize {
+                        let start = y * padded as usize;
+                        img.extend_from_slice(&data[start..start + row as usize]);
+                    }
+                    drop(data);
+                    buf.unmap();
+                    let _ = std::fs::write(&path, &img);
+                    eprintln!("[dump] wrote {} ({} bytes)", path, img.len());
+                }
+            }
+        }
+    }
+
+    fn save_pending_screenshot(&mut self, [w, h]: [u32; 2], texture: &wgpu::Texture) {
+        let active = self
+            .active
+            .as_mut()
+            .expect("visible frame has an active window");
+        if self.screenshot_pending {
+            self.screenshot_pending = false;
+            let game_dir = self
+                .config
+                .game_dir
+                .as_deref()
+                .unwrap_or(std::path::Path::new("."));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let mut sequence = self.screenshot_sequence;
+            let mut path =
+                crate::renderer::screenshot_output_path(game_dir, now.saturating_add(sequence));
+            while path.exists() && sequence < u64::MAX - now {
+                sequence += 1;
+                path =
+                    crate::renderer::screenshot_output_path(game_dir, now.saturating_add(sequence));
+            }
+            self.screenshot_sequence = sequence.saturating_add(1);
+            let result = (|| {
+                if !active.surface_copy_src_supported {
+                    return Err("surface does not support screenshot readback".to_owned());
+                }
+                let bgra = matches!(
+                    active.surface_format,
+                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+                );
+                if !bgra
+                    && !matches!(
+                        active.surface_format,
+                        wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba8UnormSrgb
+                    )
+                {
+                    return Err(format!(
+                        "unsupported screenshot surface format {:?}",
+                        active.surface_format
+                    ));
+                }
+                let mut rgba = active.renderer.read_texture_rgba(texture, w, h)?;
+                if bgra {
+                    for pixel in rgba.as_chunks_mut::<4>().0 {
+                        pixel.swap(0, 2);
+                    }
+                }
+                crate::renderer::spawn_rgba_png_write(path, w, h, rgba)
+            })();
+            if let Err(error) = result {
+                eprintln!("[screenshot] failed: {error}");
+            }
+        }
+    }
+
+    fn observe_frame_budget(&mut self, frame_begin: Instant) {
         let stage = self.governor.observe_frame(frame_begin.elapsed());
         // Live P95 feedback edge: the session's real measured
         // frame-time window feeds the renderer's adaptive upload-budget
@@ -11880,7 +12130,10 @@ fn sync_chat_input_hud(
     match bar {
         Some(bar) => {
             input.open = true;
-            input.text = bar.text().to_string();
+            if input.text != bar.text() {
+                input.text.clear();
+                input.text.push_str(bar.text());
+            }
             input.cursor = bar.text()[..bar.cursor()].chars().count();
             if !show_suggestions {
                 input.completions.clear();
@@ -11889,11 +12142,12 @@ fn sync_chat_input_hud(
                 input.completions = list;
                 input.completion_index = selected;
             } else {
-                input.completions = bar
-                    .completions()
-                    .iter()
-                    .map(|candidate| candidate.text.clone())
-                    .collect();
+                input.completions.clear();
+                input.completions.extend(
+                    bar.completions()
+                        .into_iter()
+                        .map(|candidate| candidate.text),
+                );
                 input.completion_index = megu_ui::hud_widgets::NO_COMPLETION;
             }
         }
@@ -13514,6 +13768,48 @@ pub fn run(config: GpuCliConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mod_overlay_reuses_commands_until_layout_or_batch_changes() {
+        use megu_ui::gui_bridge::GuiBridgeDrawOp;
+
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        app.set_gui_bridge_batch(GuiBridgeBatch::new(vec![
+            GuiBridgeDrawOp::PushScissor {
+                x: 20,
+                y: 20,
+                w: 120,
+                h: 120,
+            },
+            GuiBridgeDrawOp::FillRect {
+                x: 0,
+                y: 0,
+                w: 256,
+                h: 256,
+                rgba: [255; 4],
+            },
+            GuiBridgeDrawOp::PopScissor,
+        ]));
+
+        assert!(app.refresh_mod_overlay([160, 160], 1));
+        assert_eq!(
+            app.ui_modoverlay_list.command_clip(0),
+            Some(UiRect::new(20, 20, 120, 120))
+        );
+        assert!(!app.refresh_mod_overlay([160, 160], 1));
+
+        assert!(app.refresh_mod_overlay([100, 160], 1));
+        assert_eq!(
+            app.ui_modoverlay_list.command_clip(0),
+            Some(UiRect::new(20, 20, 80, 120))
+        );
+        assert!(app.refresh_mod_overlay([100, 160], 2));
+        assert!(!app.refresh_mod_overlay([100, 160], 2));
+
+        app.set_gui_bridge_batch(GuiBridgeBatch::default());
+        app.refresh_mod_overlay([100, 160], 2);
+        assert!(app.ui_modoverlay_list.commands.is_empty());
+    }
 
     #[test]
     fn entity_interpolation_smooths_pose_locomotion_and_hurt_flash() {
