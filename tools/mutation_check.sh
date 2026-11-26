@@ -2351,12 +2351,17 @@ check "template placement passes decorative block entities through without stagi
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template loot container materialization rolls mineshaft cart loot" \
-  src/menus_and_items.rs '    let Some(table_json) = table_json else {
+  src/menus_and_items.rs '    if let Some(table_json) = table_json {
+        return unpack_loot_table_json_at(&table_json, seed, slot_limit, origin, Some(loot_table));
+    }
+    if loot_table == "minecraft:chests/abandoned_mineshaft" {' \
+  '    if loot_table == "minecraft:chests/abandoned_mineshaft" {
         return HashMap::new();
-    };' \
-  '    let Some(table_json) = table_json.filter(|_| loot_table != "minecraft:chests/abandoned_mineshaft") else {
-        return HashMap::new();
-    };' \
+    }
+    if let Some(table_json) = table_json {
+        return unpack_loot_table_json_at(&table_json, seed, slot_limit, origin, Some(loot_table));
+    }
+    if false {' \
   structure_template::tests::loot_table_chest_and_decorative_block_entities_place_and_materialize
 
 check "template placement updates inside boundary block shapes" \

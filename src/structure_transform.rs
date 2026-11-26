@@ -472,7 +472,10 @@ mod tests {
             }
             let Some(family) = family else { continue };
             if !props.iter().any(|(key, _)| {
-                matches!(key.as_str(), "facing" | "orientation" | "axis" | "rotation")
+                matches!(
+                    key.as_str(),
+                    "facing" | "orientation" | "axis" | "rotation" | "shape"
+                )
             }) {
                 continue;
             }
