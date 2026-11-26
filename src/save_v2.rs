@@ -5284,108 +5284,38 @@ fn load_world_from(payload: &[u8]) -> Result<(), &'static str> {
     persistence_boundary("world load panicked", || decode_world_payload(payload))
 }
 
-fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
-    // The optional VER1 record sits just beneath the seed trailer; read it
-    // before peeling so a save written for another release is rejected rather
-    // than silently parsed under the wrong schema. A file without the record
-    // is a pre-header save and means the 1.21.1 header it always meant — which
-    // is an exact match only while the running target is 1.21.1 itself.
-    let save_version =
-        read_save_version_header(payload)?.unwrap_or_else(SaveVersionHeader::legacy);
-    let running = running_save_version();
-    match classify_save_v2_version(&save_version, running.data_version) {
-        SaveVersionCompat::Exact => {}
-        SaveVersionCompat::OlderUpgradeable { delta } => {
-            eprintln!(
-                "[save] refusing to load a world written for {} (DataVersion {}, {delta} versions behind this build's {} / DataVersion {}); run megu-world-migrate to upgrade it",
-                save_version.mc_version,
-                save_version.data_version,
-                running.mc_version,
-                running.data_version
-            );
-            return Err(
-                "world snapshot was written for an older Minecraft version; run megu-world-migrate to upgrade it",
-            );
-        }
-        SaveVersionCompat::NewerUnknown { file_dv, running_dv } => {
-            eprintln!(
-                "[save] refusing to load a world written for {} (DataVersion {file_dv}), newer than this build's {} / DataVersion {running_dv}; run megu-world-migrate to convert it",
-                save_version.mc_version, running.mc_version
-            );
-            return Err(
-                "world snapshot was written for a newer or unknown Minecraft version; run megu-world-migrate to convert it",
-            );
-        }
+fn read_legacy_string(payload: &[u8], p: &mut usize) -> Option<String> {
+    if *p + 2 > payload.len() {
+        return None;
     }
-    *LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_version);
-    // WBD1 tucks beneath VER1: read it before the peel hides it, and restore
-    // it before the body scan so a BRD1 record in the same save keeps owning
-    // the live transition.
-    let world_border_save = read_world_border_footer(payload)?;
-    // Footers are stripped last-written-first.
-    let (payload, _) = read_world_seed_footer(payload)?;
-    if let Some(border) = world_border_save {
-        apply_saved_world_border(&border);
+    let len = u16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap()) as usize;
+    *p += 2;
+    if *p + len > payload.len() {
+        return None;
     }
-    // MOF1/AER1 tuck between WBE1 and WBD1; footers strip last-written-first.
-    let (payload, aer1) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC)?;
-    let (payload, mof1) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC)?;
-    // STA1/RCP1 tuck between MOF1 and TEM1: strip them last-written-first.
-    let (payload, saved_stats) = read_player_stats_footer(payload)?;
-    let (payload, saved_recipe_books) = read_recipe_book_footer(payload)?;
-    // TEM1/BAR1 tuck between MOF1 and WBE1: strip them last-written-first.
-    let (payload, saved_teams) = read_team_footer(payload)?;
-    let (payload, saved_bossbars) = read_bossbar_footer(payload)?;
-    let (payload, wbe_entries) = read_wbe_footer(payload)?;
-    let (payload, sign_meta_records) = read_sign_meta_footer(payload)?;
-    let (payload, dxt) = read_dxt_footer(payload)?;
-    let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
-    let (payload, mut brewing) = read_brewing_footer(payload)?;
-    // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
-    let (payload, dim2) = read_dim2_footer(payload)?;
-    let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
-    let (payload, block_loot) = read_block_loot_footer(payload)?;
-    let (payload, drop_owners) = read_drop_owners_footer(payload)?;
-    let (payload, raid_totals) = read_raid_totals_footer(payload)?;
-    let (payload, dim_fluids) = read_dim_fluid_footer(payload)?;
-    let tick_state = tick_persistence::TickState::read(payload)?;
-    let before_ticks = tick_persistence::prefix(payload)?;
-    let generated = generated_content::Snapshot::read(before_ticks)?;
-    let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
-    let (payload, body) = if before_generated.ends_with(SAVE_STATE_V2_MAGIC) {
-        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_V2_MAGIC)?;
-        (payload, body)
-    } else {
-        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
-        (payload, body)
-    };
-    let mut state = body.map(SaveState::read).transpose()?;
-    let (payload, advancements) = split_save_footer(payload, ADVANCEMENTS_MAGIC)?;
-    let advancements = advancements.map(read_advancements_body).transpose()?;
-    let (payload, block_entities) = split_save_footer(payload, BLOCK_ENTITIES_MAGIC)?;
-    let mut block_entities = block_entities
-        .map(read_block_entities_body)
-        .transpose()?;
-    if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
-        && worldgen::with_gen(|_| ()).is_none()) {
-        return Err("generated content requires initialized world generator");
-    }
-    if tick_state.as_ref().is_some_and(|s| {
-        (!s.sources.is_empty() || !s.generated_blocks.is_empty() || !s.generated_fluids.is_empty())
-            && worldgen::with_gen(|_| ()).is_none()
-    }) {
-        return Err("tick state requires initialized world generator");
-    }
-    let mut overlay = SaveInput(payload);
-    let chunks = read_dim_overlay(DimId::Overworld, &mut overlay)?;
-    let mut p = payload.len() - overlay.0.len();
+    let value = String::from_utf8_lossy(&payload[*p..*p + len]).to_string();
+    *p += len;
+    Some(value)
+}
+
+struct LegacyMetaSections {
+    offset: usize,
+    mobs: Vec<(i64, f64, f64, f64, f32)>,
+    sheared: Vec<usize>,
+    mob_tags: Vec<(usize, HashSet<String>)>,
+}
+
+fn decode_legacy_meta(
+    payload: &[u8],
+    mut p: usize,
+    has_mob_dimensions: bool,
+    has_meta: bool,
+    mob_dimension_count: usize,
+    state: Option<&SaveState>,
+    drop_owners: &[DropOwnerIndex],
+) -> Result<LegacyMetaSections, &'static str> {
     let b = payload;
     let rv = rv_varint;
-    let has_mob_dimensions = !mob_dimensions.is_empty();
-    let has_meta = matches!(payload.get(p..p + 4), Some(b"MET2" | b"MET3" | b"MET4"));
-    if (has_mob_dimensions || state.is_some()) && !has_meta {
-        return Err("mob dimension count does not match mob records");
-    }
     // A legacy MET4 section can restore completed IDs. Clear previous-world
     // grants before reading it, then replace them with authoritative ADV1 data.
     adv_done().lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5405,7 +5335,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         if mn > MOB_CAP {
             return Err("invalid mob count");
         }
-        if has_mob_dimensions && mn != mob_dimensions.len() {
+        if has_mob_dimensions && mn != mob_dimension_count {
             return Err("mob dimension count does not match mob records");
         }
         for _ in 0..mn {
@@ -5437,16 +5367,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             let pn = rv(payload, &mut p);
             let mut store = inv_store().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..pn {
-                if p + 2 > payload.len() {
+                let Some(name) = read_legacy_string(payload, &mut p) else {
                     break;
-                }
-                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                p += 2;
-                if p + nl > payload.len() {
-                    break;
-                }
-                let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                p += nl;
+                };
                 let en = rv(payload, &mut p);
                 let mut inv = HashMap::new();
                 for _ in 0..en {
@@ -5606,7 +5529,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                     thrower: None,
                 });
             }
-            for &(idx, target, thrower) in &drop_owners {
+            for &(idx, target, thrower) in drop_owners {
                 if let Some(d) = ds.get_mut(idx) {
                     d.target = target;
                     d.thrower = thrower;
@@ -5647,16 +5570,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             let on = rv(payload, &mut p);
             let mut board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
             for _ in 0..on {
-                if p + 2 > payload.len() {
+                let Some(obj) = read_legacy_string(payload, &mut p) else {
                     break;
-                }
-                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                p += 2;
-                if p + nl > payload.len() {
-                    break;
-                }
-                let obj = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                p += nl;
+                };
                 let en = rv(payload, &mut p);
                 let mut entries = HashMap::new();
                 for _ in 0..en {
@@ -5962,16 +5878,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
             let pn = rv(payload, &mut p);
             for _ in 0..pn {
-                if p + 2 > payload.len() {
+                let Some(nm) = read_legacy_string(payload, &mut p) else {
                     break;
-                }
-                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                p += 2;
-                if p + nl > payload.len() {
-                    break;
-                }
-                let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                p += nl;
+                };
                 let tc = rv(payload, &mut p);
                 let mut st = HashSet::new();
                 for _ in 0..tc {
@@ -6018,16 +5927,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 let mut sf = sched_fns().lock().unwrap_or_else(|e| e.into_inner());
                 let t_now = TICK.load(Ordering::Relaxed);
                 for _ in 0..sn {
-                    if p + 2 > payload.len() {
+                    let Some(f2) = read_legacy_string(payload, &mut p) else {
                         break;
-                    }
-                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                    p += 2;
-                    if p + nl > payload.len() {
-                        break;
-                    }
-                    let f2 = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                    p += nl;
+                    };
                     if p + 8 > payload.len() {
                         break;
                     }
@@ -6040,16 +5942,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 let gn = rv(payload, &mut p);
                 let mut ag = adv_done().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..gn {
-                    if p + 2 > payload.len() {
+                    let Some(pn) = read_legacy_string(payload, &mut p) else {
                         break;
-                    }
-                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                    p += 2;
-                    if p + nl > payload.len() {
-                        break;
-                    }
-                    let pn = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                    p += nl;
+                    };
                     let ic = rv(payload, &mut p);
                     let mut ids = HashSet::new();
                     for _ in 0..ic {
@@ -6074,16 +5969,9 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
                 let an = rv(payload, &mut p);
                 let mut at = attrs().lock().unwrap_or_else(|e| e.into_inner());
                 for _ in 0..an {
-                    if p + 2 > payload.len() {
+                    let Some(nm) = read_legacy_string(payload, &mut p) else {
                         break;
-                    }
-                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
-                    p += 2;
-                    if p + nl > payload.len() {
-                        break;
-                    }
-                    let nm = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
-                    p += nl;
+                    };
                     let cnt = rv(payload, &mut p);
                     let mut m = HashMap::new();
                     for _ in 0..cnt {
@@ -6155,6 +6043,231 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             chests().lock().unwrap_or_else(|e| e.into_inner()).len()
         );
     }
+
+    Ok(LegacyMetaSections {
+        offset: p,
+        mobs: restored_mobs,
+        sheared: restored_sheared,
+        mob_tags: restored_mob_tags,
+    })
+}
+
+fn restore_legacy_mobs(
+    restored_mobs: Vec<(i64, f64, f64, f64, f32)>,
+    mob_dimensions: &[DimId],
+    restored_sheared: Vec<usize>,
+    restored_mob_tags: Vec<(usize, HashSet<String>)>,
+    state: &mut Option<SaveState>,
+) {
+    // Entity-scoped attributes belong to the loaded world, including when it
+    // contains no mobs. Old runtime EIDs must not retain stale values.
+    attrs().lock().unwrap_or_else(|e| e.into_inner()).retain(|key, _| !key.starts_with("e:"));
+    // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
+    // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
+    if !restored_mobs.is_empty() {
+        let mob_attributes = state.as_mut()
+            .map(|s| std::mem::take(&mut s.mob_attributes))
+            .unwrap_or_default();
+        let extra = state
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.mobs))
+            .unwrap_or_default();
+        // Live-created mobs derive their UUID from the entity ID. Keep new
+        // spawns from reusing a UUID already present in the loaded world.
+        for mob in &extra {
+            if let [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, a, b, c, d] = mob.uuid {
+                let id = i32::from_be_bytes([a, b, c, d]);
+                if let Some(next) = id.checked_add(1) {
+                    NEXT_EID.fetch_max(next, Ordering::SeqCst);
+                }
+            }
+        }
+        let mut extra = extra.into_iter();
+        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let first = ms.len();
+        for (index, (etype, x, y, z, hp)) in restored_mobs.into_iter().enumerate() {
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+            let mut uuid = [0; 16];
+            uuid[12..].copy_from_slice(&eid.to_be_bytes());
+            let mut rotation = (0.0, 0.0);
+            let mut vel = [0.0; 3];
+            let (mut fuse, mut fire_ticks, mut love) = (0, 0, 0);
+            let mut air = server_ticks(AIR_SUPPLY_GT) as i32;
+            if let Some(mut saved) = extra.next() {
+                uuid = saved.uuid;
+                rotation = (saved.yaw, saved.pitch);
+                vel = saved.vel;
+                (fuse, fire_ticks, love, air) = (saved.fuse, saved.fire_ticks, saved.love, saved.air);
+                let now = TICK.load(Ordering::Relaxed);
+                for (_, until) in &mut saved.state.potions {
+                    *until = now.saturating_add(*until);
+                }
+                if saved.state.behavior.is_some()
+                    || saved.state.blaze_charged
+                    || !saved.state.potions.is_empty()
+                {
+                    live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, saved.state);
+                }
+                if saved.sitting_cat {
+                    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).insert(eid);
+                }
+                if let Some(villager) = saved.villager {
+                    live_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, villager);
+                }
+            }
+            let last_action = Instant::now() - Duration::from_secs(10);
+            ms.push(Arc::new(Mob {
+                dim: mob_dimensions.get(index).copied().unwrap_or(DimId::Overworld),
+                eid,
+                uuid,
+                etype,
+                pos: Mutex::new((x, y, z, rotation.0, rotation.1)),
+                hp: Mutex::new(hp),
+                last_hit: Mutex::new(last_action),
+                hurt_at: Mutex::new(last_action),
+                last_hurt_tick: Mutex::new(None),
+                vel: Mutex::new(vel),
+                fuse: Mutex::new(fuse),
+                fire_ticks: Mutex::new(fire_ticks),
+                love: Mutex::new(love),
+                air: Mutex::new(air),
+            }));
+        }
+        let mut attributes = attrs().lock().unwrap_or_else(|e| e.into_inner());
+        for (index, selector_key, values) in mob_attributes {
+            let prefix = if selector_key { "e:m:" } else { "e:" };
+            attributes.insert(format!("{}{}", prefix, ms[first + index].eid), values);
+        }
+        let mut sh = sheared().lock().unwrap_or_else(|e| e.into_inner());
+        for index in restored_sheared {
+            if let Some(m) = ms.get(first + index) {
+                sh.insert(m.eid);
+            }
+        }
+        drop(sh);
+        let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
+        for (index, state) in restored_mob_tags {
+            if let Some(m) = ms.get(first + index) {
+                tm.insert(format!("e:{}", m.eid), state);
+            }
+        }
+    }
+}
+
+fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
+    // The optional VER1 record sits just beneath the seed trailer; read it
+    // before peeling so a save written for another release is rejected rather
+    // than silently parsed under the wrong schema. A file without the record
+    // is a pre-header save and means the 1.21.1 header it always meant — which
+    // is an exact match only while the running target is 1.21.1 itself.
+    let save_version =
+        read_save_version_header(payload)?.unwrap_or_else(SaveVersionHeader::legacy);
+    let running = running_save_version();
+    match classify_save_v2_version(&save_version, running.data_version) {
+        SaveVersionCompat::Exact => {}
+        SaveVersionCompat::OlderUpgradeable { delta } => {
+            eprintln!(
+                "[save] refusing to load a world written for {} (DataVersion {}, {delta} versions behind this build's {} / DataVersion {}); run megu-world-migrate to upgrade it",
+                save_version.mc_version,
+                save_version.data_version,
+                running.mc_version,
+                running.data_version
+            );
+            return Err(
+                "world snapshot was written for an older Minecraft version; run megu-world-migrate to upgrade it",
+            );
+        }
+        SaveVersionCompat::NewerUnknown { file_dv, running_dv } => {
+            eprintln!(
+                "[save] refusing to load a world written for {} (DataVersion {file_dv}), newer than this build's {} / DataVersion {running_dv}; run megu-world-migrate to convert it",
+                save_version.mc_version, running.mc_version
+            );
+            return Err(
+                "world snapshot was written for a newer or unknown Minecraft version; run megu-world-migrate to convert it",
+            );
+        }
+    }
+    *LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(save_version);
+    // WBD1 tucks beneath VER1: read it before the peel hides it, and restore
+    // it before the body scan so a BRD1 record in the same save keeps owning
+    // the live transition.
+    let world_border_save = read_world_border_footer(payload)?;
+    // Footers are stripped last-written-first.
+    let (payload, _) = read_world_seed_footer(payload)?;
+    if let Some(border) = world_border_save {
+        apply_saved_world_border(&border);
+    }
+    // MOF1/AER1 tuck between WBE1 and WBD1; footers strip last-written-first.
+    let (payload, aer1) = read_mod_bridge_trailer(payload, AERONAUTICS_TRAILER_MAGIC)?;
+    let (payload, mof1) = read_mod_bridge_trailer(payload, MOD_OFFLOAD_TRAILER_MAGIC)?;
+    // STA1/RCP1 tuck between MOF1 and TEM1: strip them last-written-first.
+    let (payload, saved_stats) = read_player_stats_footer(payload)?;
+    let (payload, saved_recipe_books) = read_recipe_book_footer(payload)?;
+    // TEM1/BAR1 tuck between MOF1 and WBE1: strip them last-written-first.
+    let (payload, saved_teams) = read_team_footer(payload)?;
+    let (payload, saved_bossbars) = read_bossbar_footer(payload)?;
+    let (payload, wbe_entries) = read_wbe_footer(payload)?;
+    let (payload, sign_meta_records) = read_sign_meta_footer(payload)?;
+    let (payload, dxt) = read_dxt_footer(payload)?;
+    let (payload, mut mob_dimensions) = read_mob_dimensions_footer(payload)?;
+    let (payload, mut brewing) = read_brewing_footer(payload)?;
+    // A payload with no DIM2 footer is the legacy (or DIM1-only) form and parses exactly as before.
+    let (payload, dim2) = read_dim2_footer(payload)?;
+    let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
+    let (payload, block_loot) = read_block_loot_footer(payload)?;
+    let (payload, drop_owners) = read_drop_owners_footer(payload)?;
+    let (payload, raid_totals) = read_raid_totals_footer(payload)?;
+    let (payload, dim_fluids) = read_dim_fluid_footer(payload)?;
+    let tick_state = tick_persistence::TickState::read(payload)?;
+    let before_ticks = tick_persistence::prefix(payload)?;
+    let generated = generated_content::Snapshot::read(before_ticks)?;
+    let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
+    let (payload, body) = if before_generated.ends_with(SAVE_STATE_V2_MAGIC) {
+        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_V2_MAGIC)?;
+        (payload, body)
+    } else {
+        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
+        (payload, body)
+    };
+    let mut state = body.map(SaveState::read).transpose()?;
+    let (payload, advancements) = split_save_footer(payload, ADVANCEMENTS_MAGIC)?;
+    let advancements = advancements.map(read_advancements_body).transpose()?;
+    let (payload, block_entities) = split_save_footer(payload, BLOCK_ENTITIES_MAGIC)?;
+    let mut block_entities = block_entities
+        .map(read_block_entities_body)
+        .transpose()?;
+    if generated.as_ref().is_some_and(|s| (!s.sources.is_empty() || !s.spider_flags.is_empty())
+        && worldgen::with_gen(|_| ()).is_none()) {
+        return Err("generated content requires initialized world generator");
+    }
+    if tick_state.as_ref().is_some_and(|s| {
+        (!s.sources.is_empty() || !s.generated_blocks.is_empty() || !s.generated_fluids.is_empty())
+            && worldgen::with_gen(|_| ()).is_none()
+    }) {
+        return Err("tick state requires initialized world generator");
+    }
+    let mut overlay = SaveInput(payload);
+    let chunks = read_dim_overlay(DimId::Overworld, &mut overlay)?;
+    let p = payload.len() - overlay.0.len();
+    let rv = rv_varint;
+    let has_mob_dimensions = !mob_dimensions.is_empty();
+    let has_meta = matches!(payload.get(p..p + 4), Some(b"MET2" | b"MET3" | b"MET4"));
+    if (has_mob_dimensions || state.is_some()) && !has_meta {
+        return Err("mob dimension count does not match mob records");
+    }
+    let meta = decode_legacy_meta(
+        payload,
+        p,
+        has_mob_dimensions,
+        has_meta,
+        mob_dimensions.len(),
+        state.as_ref(),
+        &drop_owners,
+    )?;
+    let mut p = meta.offset;
+    let restored_mobs = meta.mobs;
+    let restored_sheared = meta.sheared;
+    let restored_mob_tags = meta.mob_tags;
 
     apply_dim_overlay(chunks);
 
@@ -6394,99 +6507,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             }
         }
     }
-    // Entity-scoped attributes belong to the loaded world, including when it
-    // contains no mobs. Old runtime EIDs must not retain stale values.
-    attrs().lock().unwrap_or_else(|e| e.into_inner()).retain(|key, _| !key.starts_with("e:"));
-    // Persisted drop, projectile, TNT and falling-block IDs must reserve their range
-    // before mobs receive fresh IDs. Keep mob ordinals stable for shearing and tags.
-    if !restored_mobs.is_empty() {
-        let mob_attributes = state.as_mut()
-            .map(|s| std::mem::take(&mut s.mob_attributes))
-            .unwrap_or_default();
-        let extra = state
-            .as_mut()
-            .map(|s| std::mem::take(&mut s.mobs))
-            .unwrap_or_default();
-        // Live-created mobs derive their UUID from the entity ID. Keep new
-        // spawns from reusing a UUID already present in the loaded world.
-        for mob in &extra {
-            if let [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, a, b, c, d] = mob.uuid {
-                let id = i32::from_be_bytes([a, b, c, d]);
-                if let Some(next) = id.checked_add(1) {
-                    NEXT_EID.fetch_max(next, Ordering::SeqCst);
-                }
-            }
-        }
-        let mut extra = extra.into_iter();
-        let mut ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let first = ms.len();
-        for (index, (etype, x, y, z, hp)) in restored_mobs.into_iter().enumerate() {
-            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-            let mut uuid = [0; 16];
-            uuid[12..].copy_from_slice(&eid.to_be_bytes());
-            let mut rotation = (0.0, 0.0);
-            let mut vel = [0.0; 3];
-            let (mut fuse, mut fire_ticks, mut love) = (0, 0, 0);
-            let mut air = server_ticks(AIR_SUPPLY_GT) as i32;
-            if let Some(mut saved) = extra.next() {
-                uuid = saved.uuid;
-                rotation = (saved.yaw, saved.pitch);
-                vel = saved.vel;
-                (fuse, fire_ticks, love, air) = (saved.fuse, saved.fire_ticks, saved.love, saved.air);
-                let now = TICK.load(Ordering::Relaxed);
-                for (_, until) in &mut saved.state.potions {
-                    *until = now.saturating_add(*until);
-                }
-                if saved.state.behavior.is_some()
-                    || saved.state.blaze_charged
-                    || !saved.state.potions.is_empty()
-                {
-                    live_mob_states().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, saved.state);
-                }
-                if saved.sitting_cat {
-                    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).insert(eid);
-                }
-                if let Some(villager) = saved.villager {
-                    live_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, villager);
-                }
-            }
-            let last_action = Instant::now() - Duration::from_secs(10);
-            ms.push(Arc::new(Mob {
-                dim: mob_dimensions.get(index).copied().unwrap_or(DimId::Overworld),
-                eid,
-                uuid,
-                etype,
-                pos: Mutex::new((x, y, z, rotation.0, rotation.1)),
-                hp: Mutex::new(hp),
-                last_hit: Mutex::new(last_action),
-                hurt_at: Mutex::new(last_action),
-                last_hurt_tick: Mutex::new(None),
-                vel: Mutex::new(vel),
-                fuse: Mutex::new(fuse),
-                fire_ticks: Mutex::new(fire_ticks),
-                love: Mutex::new(love),
-                air: Mutex::new(air),
-            }));
-        }
-        let mut attributes = attrs().lock().unwrap_or_else(|e| e.into_inner());
-        for (index, selector_key, values) in mob_attributes {
-            let prefix = if selector_key { "e:m:" } else { "e:" };
-            attributes.insert(format!("{}{}", prefix, ms[first + index].eid), values);
-        }
-        let mut sh = sheared().lock().unwrap_or_else(|e| e.into_inner());
-        for index in restored_sheared {
-            if let Some(m) = ms.get(first + index) {
-                sh.insert(m.eid);
-            }
-        }
-        drop(sh);
-        let mut tm = tags().lock().unwrap_or_else(|e| e.into_inner());
-        for (index, state) in restored_mob_tags {
-            if let Some(m) = ms.get(first + index) {
-                tm.insert(format!("e:{}", m.eid), state);
-            }
-        }
-    }
+    restore_legacy_mobs(
+        restored_mobs,
+        &mob_dimensions,
+        restored_sheared,
+        restored_mob_tags,
+        &mut state,
+    );
     let mut state = state.unwrap_or_default();
     if !dxt.is_empty() {
         let dxt = &dxt;
