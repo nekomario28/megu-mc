@@ -16,7 +16,8 @@ Documented allowlist:
 * `client-ui/src/mod_manager.rs` `slug:`/`name:`/installed-mod-ID rows are
   nominative catalog and compatibility identifiers for third-party mods;
 * lines carrying `trademark-hygiene:allow` are explicit search-alias or
-  compatibility exceptions and must state the reason on the same line;
+  compatibility exceptions and must state the reason; for a rustfmt-split
+  declarative entry the reasoned marker may sit on that entry's closing line;
 * the literal `optifine/cem` resource path is a compatibility lookup key.
 
 Run: python3 tools/trademark_hygiene_audit.py [--strict] [--json] [--root DIR]
@@ -34,6 +35,7 @@ SCAN_FILES = (
     "client-gpu/src/window.rs",
     "client-gpu/src/live_session.rs",
     "client-gpu/src/recipe_ingest.rs",
+    "core/src/sys_metrics.rs",
 )
 
 FORBIDDEN = {
@@ -93,14 +95,69 @@ def strip_line_comment(line: str) -> str:
     return line
 
 
-def allowed(path: str, line: str) -> bool:
-    if "trademark-hygiene:allow" in line:
+ALLOW_MARK = "trademark-hygiene:allow"
+CATALOG_ENTRY_STARTS = ("CuratedModrinthQolMod {", "RecommendedModEntry {")
+
+
+def explicit_allow(line: str) -> bool:
+    """True only when the marker carries a human-readable reason."""
+    index = line.find(ALLOW_MARK)
+    if index < 0:
+        return False
+    reason = line[index + len(ALLOW_MARK):].strip(" \t:-—–")
+    return len(reason) >= 8
+
+
+def inside_mod_catalog_entry(lines: list[str], index: int) -> bool:
+    """Whether `index` is a field row inside the two nominative catalogs.
+
+    The exemption intentionally stops at the catalog row boundary: arbitrary
+    `name:`/`slug:` lines elsewhere in `mod_manager.rs` are UI strings and must
+    be scanned instead of inheriting the catalog's nominative-use exception.
+    """
+    for back in range(index, max(-1, index - 16), -1):
+        text = lines[back]
+        if any(start in text for start in CATALOG_ENTRY_STARTS):
+            return True
+        if back != index and text.strip() in ("},", "};"):
+            return False
+    return False
+
+
+def scoped_entry_allow(lines: list[str], index: int) -> bool:
+    """Whether a rustfmt-split declarative entry closes with a reasoned marker.
+
+    Search-alias arrays often span several lines. Requiring the marker on every
+    literal would drown the actual reason in noise, while a file-scoped marker
+    would be far too broad. The supported form is therefore exact and local:
+    the enclosing entry must close within a few rows on a line carrying
+    `trademark-hygiene:allow <reason>`.
+    """
+    for lookahead in range(index, min(len(lines), index + 20)):
+        stripped = lines[lookahead].strip()
+        if explicit_allow(lines[lookahead]) and stripped.startswith(("),", ");")):
+            return True
+        if stripped.startswith(("),", ");")):
+            return False
+    return False
+
+
+def allowed(path: str, line: str, lines: list[str], index: int) -> bool:
+    if explicit_allow(line) or scoped_entry_allow(lines, index):
         return True
-    # Nominative catalog entries and installed-mod-ID compatibility rows.
-    if path == "client-ui/src/mod_manager.rs" and (
-        "slug:" in line or "name:" in line or "mod_id" in line or "mouse-tweaks" in line
-    ):
-        return True
+    if path == "client-ui/src/mod_manager.rs":
+        stripped = line.strip()
+        # Nominative catalog entries only: upstream project slugs/display
+        # names inside `CURATED_MODRINTH_QOL_MODS` and
+        # `RECOMMENDED_COMMUNITY_MODS`. A synthetic label elsewhere in the
+        # file does not match this narrow structural exemption.
+        if re.match(r"^(?:slug|name):\s*\"", stripped) and inside_mod_catalog_entry(lines, index):
+            return True
+        # Installed-loader ID compatibility tuple: modids often omit the
+        # hyphen used by the canonical project slug. This exact tuple is a
+        # lookup key, not a built-in feature label.
+        if stripped.startswith('("mouse-tweaks", "mousetweaks")'):
+            return True
     # Resource-pack compatibility lookup path, not a feature label.
     if "optifine/cem" in line:
         return True
@@ -181,7 +238,17 @@ def scan_file(root: Path, rel: str) -> list[dict[str, object]]:
             continue
 
         decl = PUBLIC_DECL.search(code)
-        if decl and not allowed(rel, original):
+        # An explicit exception may sit inside a rustfmt-split multi-line
+        # declaration (for example on the first parameter line). It still
+        # has to be a reasoned `trademark-hygiene:allow` marker; unmarked
+        # compatibility names remain findings.
+        decl_explicitly_allowed = decl is not None and any(
+            explicit_allow(lines[lookahead])
+            for lookahead in range(
+                max(0, lineno - 4), min(len(lines), lineno + 3)
+            )
+        )
+        if decl and not (allowed(rel, original, lines, lineno - 1) or decl_explicitly_allowed):
             terms = forbidden_identifier_terms(decl.group(1))
             if terms:
                 findings.append({
@@ -196,7 +263,7 @@ def scan_file(root: Path, rel: str) -> list[dict[str, object]]:
 
         if in_public_enum:
             variant = ENUM_VARIANT.match(code)
-            if variant and enum_open and not allowed(rel, original):
+            if variant and enum_open and not allowed(rel, original, lines, lineno - 1):
                 terms = forbidden_identifier_terms(variant.group(1))
                 if terms:
                     findings.append({
@@ -221,7 +288,7 @@ def scan_file(root: Path, rel: str) -> list[dict[str, object]]:
                 pending_public_enum = False
                 enum_depth = 0
 
-        if allowed(rel, original):
+        if allowed(rel, original, lines, lineno - 1):
             continue
         for literal in STRING_LITERAL.findall(code):
             terms = forbidden_terms(literal)

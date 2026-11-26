@@ -78,6 +78,13 @@ const MAX_TAG_DEPTH: usize = 8;
 pub const MAX_TAG_MEMBERS: usize = 262_144;
 /// Raw member strings kept per tag file.
 const MAX_TAG_VALUES: usize = 16_384;
+/// Honest "cannot be reduced statically" loot probability representation.
+///
+/// `MobDropEntry`/`DungeonLootEntry` expose a plain `f32` owned by the UI
+/// crate, so composite rows whose chance depends on runtime-only branch
+/// predicates carry NaN instead of a fabricated weighted percentage. UI
+/// formatters should treat NaN as "unknown" rather than as zero.
+pub const UNKNOWN_LOOT_PROBABILITY: f32 = f32::NAN;
 /// Per-source failure notes retained (the tail folds into a counter).
 const MAX_NOTES: usize = 128;
 
@@ -924,8 +931,12 @@ impl<'a> IngestWork<'a> {
     }
 
     /// One entity/chest loot table → [`MobDropEntry`] / [`DungeonLootEntry`]
-    /// rows. `pools[].entries` walk flattens `alternatives`/`group`/`sequence`
-    /// children and weights chance by sibling share × average rolls.
+    /// rows. Weighted pool entries share the pool's average rolls, while
+    /// composite entries keep vanilla control flow: `group` emits every
+    /// child, `sequence` emits children until the first failed condition,
+    /// and `alternatives` emits the first successful child. Probabilities
+    /// that depend on runtime-only composite branching are represented by
+    /// NaN rather than a fabricated weighted percentage.
     fn ingest_loot(&mut self, source: &str, mob: &str, chest: Option<&str>, text: &str) {
         let Some(root) = parse_json(text) else {
             self.report.json_failed += 1;
@@ -953,18 +964,11 @@ impl<'a> IngestWork<'a> {
             let total: f64 = entries.iter().map(entry_weight).sum::<f64>().max(1.0);
             for entry in entries.iter().take(512) {
                 let share = entry_weight(entry) / total * rolls;
-                let conditions = merge_conditions(&pool_conditions, &conditions_of(
-                    entry.as_object().and_then(|o| o.get("conditions")),
-                ));
-                self.walk_loot_entry(
-                    source,
-                    mob,
-                    chest,
-                    entry,
-                    share,
-                    &conditions,
-                    0,
+                let conditions = merge_conditions(
+                    &pool_conditions,
+                    &conditions_of(entry.as_object().and_then(|o| o.get("conditions"))),
                 );
+                self.walk_loot_entry(source, mob, chest, entry, share, &conditions, 0);
             }
         }
     }
@@ -1044,12 +1048,12 @@ impl<'a> IngestWork<'a> {
                     );
                 }
             }
-            "alternatives" | "sequence" | "group" => {
+            "group" => {
+                // A group runs every child independently. Child weights do
+                // not redistribute the parent's roll share in vanilla.
                 let Some(children) = obj.get("children").and_then(Json::as_array) else {
                     return;
                 };
-                let child_total: f64 =
-                    children.iter().map(entry_weight).sum::<f64>().max(1.0);
                 for child in children.iter().take(64) {
                     let child_conditions = merge_conditions(
                         conditions,
@@ -1060,13 +1064,101 @@ impl<'a> IngestWork<'a> {
                         mob,
                         chest,
                         child,
-                        share * entry_weight(child) / child_total,
+                        share,
                         &child_conditions,
                         depth + 1,
                     );
                 }
             }
-            _ => {} // loot_table refs / empty / dynamic — no item to emit.
+            "sequence" => {
+                // A sequence runs children in order until the first failure.
+                // The probability of reaching a child is the product of the
+                // success probabilities of its predecessors. Runtime-only
+                // conditions have no static truth value; once one appears,
+                // every later row gets NaN instead of a made-up percentage.
+                let Some(children) = obj.get("children").and_then(Json::as_array) else {
+                    return;
+                };
+                let mut reach = 1.0;
+                let mut reach_unknown = false;
+                for child in children.iter().take(64) {
+                    let own_conditions =
+                        conditions_of(child.as_object().and_then(|o| o.get("conditions")));
+                    let child_conditions = merge_conditions(conditions, &own_conditions);
+                    let own_success = static_condition_success_chance(&own_conditions);
+                    let child_share = if reach_unknown || own_success.is_none() {
+                        f64::NAN
+                    } else {
+                        share * reach
+                    };
+                    if child_share != 0.0 || child_share.is_nan() {
+                        self.walk_loot_entry(
+                            source,
+                            mob,
+                            chest,
+                            child,
+                            child_share,
+                            &child_conditions,
+                            depth + 1,
+                        );
+                    }
+                    match own_success {
+                        Some(success) => reach *= success,
+                        None => reach_unknown = true,
+                    }
+                }
+            }
+            "alternatives" => {
+                // Alternatives pick the first successful child. For random
+                // conditions the fallback probability is the product of all
+                // predecessor failure probabilities; deterministic
+                // unconditional children therefore shadow every later child.
+                let Some(children) = obj.get("children").and_then(Json::as_array) else {
+                    return;
+                };
+                let mut failure_product = 1.0;
+                let mut predecessors_unknown = false;
+                for child in children.iter().take(64) {
+                    let own_conditions =
+                        conditions_of(child.as_object().and_then(|o| o.get("conditions")));
+                    let child_conditions = merge_conditions(conditions, &own_conditions);
+                    let own_success = static_condition_success_chance(&own_conditions);
+                    let child_share = if predecessors_unknown || own_success.is_none() {
+                        f64::NAN
+                    } else {
+                        share * failure_product
+                    };
+                    if child_share != 0.0 || child_share.is_nan() {
+                        self.walk_loot_entry(
+                            source,
+                            mob,
+                            chest,
+                            child,
+                            child_share,
+                            &child_conditions,
+                            depth + 1,
+                        );
+                    }
+                    match own_success {
+                        Some(success) => failure_product *= 1.0 - success,
+                        None => predecessors_unknown = true,
+                    }
+                }
+            }
+            "loot_table" => {
+                // Referenced tables are order-dependent and may be dynamic or
+                // recursive across datapacks. Never redistribute their weight
+                // into sibling item percentages; retain an explicit note so
+                // the omission is auditable instead of a silent clean zero.
+                if let Some(name) = obj.get("name").and_then(Json::as_str) {
+                    self.report.note(
+                        source,
+                        mob,
+                        &format!("loot_table reference {name} has unknown probability"),
+                    );
+                }
+            }
+            _ => {} // empty / dynamic / unsupported leaf — no item to emit.
         }
     }
 
@@ -1116,6 +1208,11 @@ impl<'a> IngestWork<'a> {
         weight: u32,
     ) {
         self.ensure_item(item);
+        let chance = if chance.is_finite() {
+            chance.clamp(0.0, 1.0)
+        } else {
+            f64::from(UNKNOWN_LOOT_PROBABILITY)
+        };
         if let Some(chest) = chest {
             self.index.dungeon_loot.push(DungeonLootEntry {
                 chest: chest.to_owned(),
@@ -1123,7 +1220,7 @@ impl<'a> IngestWork<'a> {
                 min_count: count.0,
                 max_count: count.1,
                 weight,
-                chance: chance.clamp(0.0, 1.0) as f32,
+                chance: chance as f32,
             });
             self.report.dungeon_loot += 1;
         } else {
@@ -1132,7 +1229,7 @@ impl<'a> IngestWork<'a> {
                 item_id: item.to_owned(),
                 min_count: count.0,
                 max_count: count.1,
-                chance: chance.clamp(0.0, 1.0) as f32,
+                chance: chance as f32,
                 looting_bonus: looting,
                 condition: condition.to_owned(),
             });
@@ -1276,6 +1373,19 @@ struct LootConditions {
     chance: f64,
     /// Compact label of gameplay conditions (`"killed_by_player"`).
     label: String,
+}
+
+/// Statically knowable success probability for one entry's own conditions.
+/// Random-chance conditions multiply into a probability, but gameplay
+/// predicates (`killed_by_player`, entity properties, weather, ...) are
+/// runtime booleans, not probabilities; those return `None` so composite
+/// entries can mark downstream percentages unknown instead of inventing them.
+fn static_condition_success_chance(conditions: &LootConditions) -> Option<f64> {
+    if conditions.label.is_empty() {
+        Some(conditions.chance.clamp(0.0, 1.0))
+    } else {
+        None
+    }
 }
 
 fn conditions_of(conditions: Option<&Json>) -> LootConditions {

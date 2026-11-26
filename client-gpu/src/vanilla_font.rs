@@ -7,6 +7,7 @@
 //! and CI never notice the path exists.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use megu_client_mesh::png_decode::decode_png_rgba;
 use megu_ui::font_cjk::GlyphAtlas;
@@ -14,6 +15,71 @@ use megu_ui::font_cjk::GlyphAtlas;
 use crate::live_session::SessionPaths;
 use crate::vanilla_bootstrap::{default_vanilla_cache_dir, discover_local_vanilla_jar};
 use crate::vanilla_jar::{read_bounded_file, read_selected_entries};
+
+const FONT_READY_ASCII: u8 = 1;
+const FONT_READY_UNIFONT: u8 = 2;
+static FONT_READY: AtomicU8 = AtomicU8::new(0);
+static FONT_REVISION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn record_font_component(component: u8) {
+    FONT_READY.fetch_or(component, Ordering::AcqRel);
+    FONT_REVISION_COUNTER.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Monotonic revision of the external font set. Every completed ASCII or
+/// Unifont load/update advances this counter, so mesh caches can compare one
+/// integer instead of hashing glyph data.
+pub fn font_revision() -> u64 {
+    FONT_REVISION_COUNTER.load(Ordering::Acquire)
+}
+
+/// Whether any vanilla `ascii.png` table has completed loading in this process.
+pub fn ascii_loaded() -> bool {
+    FONT_READY.load(Ordering::Acquire) & FONT_READY_ASCII != 0
+}
+
+/// Whether any Unifont pack has completed loading in this process.
+pub fn unifont_loaded() -> bool {
+    FONT_READY.load(Ordering::Acquire) & FONT_READY_UNIFONT != 0
+}
+
+/// Detailed result of one local-font probe. ASCII and Unifont readiness are
+/// deliberately independent: a JAR may provide `ascii.png` before the assets
+/// index/objects for Unifont have finished downloading, and that partial load
+/// must not masquerade as CJK readiness.
+#[derive(Clone, Debug)]
+pub struct VanillaFontLoad {
+    /// Merged glyphs ready for `install_external_font`.
+    pub atlas: GlyphAtlas,
+    /// Vanilla `ascii.png` table loaded on this probe.
+    pub ascii_loaded: bool,
+    /// At least one Unifont `.hex` pack loaded on this probe.
+    pub unifont_loaded: bool,
+    /// Global font revision after this probe's component updates.
+    pub font_revision: u64,
+}
+
+impl VanillaFontLoad {
+    /// ASCII readiness for this probe (independent of Unifont).
+    pub fn ascii_ready(&self) -> bool {
+        self.ascii_loaded
+    }
+
+    /// Unifont/CJK readiness for this probe (independent of ASCII).
+    pub fn unifont_ready(&self) -> bool {
+        self.unifont_loaded
+    }
+
+    /// Revision observed after the probe recorded its component updates.
+    pub fn revision(&self) -> u64 {
+        self.font_revision
+    }
+
+    /// Move the merged glyph atlas out for installation.
+    pub fn into_atlas(self) -> GlyphAtlas {
+        self.atlas
+    }
+}
 
 /// JAR member holding the vanilla 8×8 ASCII bitmap font.
 const ASCII_PNG_ENTRY: &str = "assets/minecraft/textures/font/ascii.png";
@@ -267,19 +333,44 @@ fn load_ascii_bitmap(jar: &Path) -> Option<Box<[[u8; 8]; 128]>> {
 }
 
 /// Load fonts from explicit sources — the testable core of
-/// [`try_load_local_minecraft_fonts`] with discovery already resolved.
-fn try_load_fonts_from(
+/// [`try_load_local_minecraft_fonts_detailed`] with discovery already resolved.
+fn try_load_fonts_from_detailed(
     paths: &SessionPaths,
     assets_roots: &[PathBuf],
     jar: Option<&Path>,
-) -> Option<GlyphAtlas> {
+) -> Option<VanillaFontLoad> {
     let mut atlas = GlyphAtlas::default();
-    let mut any = load_unifont_packs(paths, assets_roots, &mut atlas);
-    if let Some(cells) = jar.and_then(load_ascii_bitmap) {
-        atlas.set_ascii_bitmap(cells);
-        any = true;
+    let unifont_loaded = load_unifont_packs(paths, assets_roots, &mut atlas);
+    if unifont_loaded {
+        record_font_component(FONT_READY_UNIFONT);
     }
-    any.then_some(atlas)
+    let ascii_loaded = if let Some(cells) = jar.and_then(load_ascii_bitmap) {
+        atlas.set_ascii_bitmap(cells);
+        record_font_component(FONT_READY_ASCII);
+        true
+    } else {
+        false
+    };
+    if !ascii_loaded && !unifont_loaded {
+        return None;
+    }
+    Some(VanillaFontLoad {
+        atlas,
+        ascii_loaded,
+        unifont_loaded,
+        font_revision: font_revision(),
+    })
+}
+
+/// Detailed best-effort probe: reports ASCII and Unifont readiness
+/// independently and exposes the monotonic [`font_revision`] invalidation
+/// counter alongside the merged atlas.
+pub fn try_load_local_minecraft_fonts_detailed(paths: &SessionPaths) -> Option<VanillaFontLoad> {
+    try_load_fonts_from_detailed(
+        paths,
+        &candidate_assets_roots(paths),
+        discover_local_vanilla_jar(paths).as_deref(),
+    )
 }
 
 /// Best-effort load of the local Minecraft 1.21.1 font set: the vanilla
@@ -289,11 +380,12 @@ fn try_load_fonts_from(
 /// local Minecraft install yields anything — callers treat `None` as
 /// "keep the built-in fonts", never an error.
 pub fn try_load_local_minecraft_fonts(paths: &SessionPaths) -> Option<GlyphAtlas> {
-    try_load_fonts_from(
+    try_load_fonts_from_detailed(
         paths,
         &candidate_assets_roots(paths),
         discover_local_vanilla_jar(paths).as_deref(),
     )
+    .map(VanillaFontLoad::into_atlas)
 }
 
 #[cfg(test)]
@@ -499,12 +591,13 @@ mod tests {
         std::fs::create_dir_all(&idx_dir).unwrap();
         std::fs::write(idx_dir.join("17.json"), index).unwrap();
 
-        let atlas = try_load_fonts_from(
+        let atlas = try_load_fonts_from_detailed(
             &fake_paths(root),
             &[root.join("assets")],
             Some(&jar_dir.join("1.21.1.jar")),
         )
-        .expect("synthetic install should produce an atlas");
+        .expect("synthetic install should produce an atlas")
+        .into_atlas();
         assert!(atlas.has_ascii_bitmap());
         assert_eq!(atlas.ascii_glyph('0').unwrap()[0], 0xff);
         let g = atlas.unifont_glyph('\u{30ab}').expect("katakana glyph");
@@ -517,6 +610,9 @@ mod tests {
         let tmp = TempDir::new("empty");
         // Scoped to the empty tempdir — the real host's own Minecraft
         // install (when present) must never leak into this check.
-        assert!(try_load_fonts_from(&fake_paths(&tmp.0), &[tmp.0.join("assets")], None).is_none());
+        assert!(
+            try_load_fonts_from_detailed(&fake_paths(&tmp.0), &[tmp.0.join("assets")], None)
+                .is_none()
+        );
     }
 }
