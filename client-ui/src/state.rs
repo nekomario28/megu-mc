@@ -4535,14 +4535,10 @@ impl UiState {
         let name = self.friends.add_name_text.trim();
         let friend_id = self.friends.add_id_text.trim();
         if friend_id.is_empty() {
-            self.friends.add_error = Some(
-                tr(
-                    self.lang(),
-                    "Paste a megu-id: to add",
-                    "追加する megu-id: を貼り付けてください",
-                )
-                .to_string(),
-            );
+            self.friends.add_error = Some(self.status_line(
+                "Paste a megu-id: to add",
+                "追加する megu-id: を貼り付けてください",
+            ));
             return Vec::new();
         }
         let name = if name.is_empty() {
@@ -4604,14 +4600,10 @@ impl UiState {
                     vec![UiAction::JoinServer { address, port }]
                 }
                 None => {
-                    self.multiplayer.status = Some(
-                        tr(
-                            self.lang(),
-                            "Invalid server address",
-                            "サーバーアドレスが無効です",
-                        )
-                        .to_string(),
-                    );
+                    self.multiplayer.status = Some(self.status_line(
+                        "Invalid server address",
+                        "サーバーアドレスが無効です",
+                    ));
                     Vec::new()
                 }
             };
@@ -4629,14 +4621,10 @@ impl UiState {
                 }]
             }
             None => {
-                self.multiplayer.status = Some(
-                    tr(
-                        self.lang(),
-                        "Select a server or enter an address",
-                        "サーバーかアドレスを入力してください",
-                    )
-                    .to_string(),
-                );
+                self.multiplayer.status = Some(self.status_line(
+                    "Select a server or enter an address",
+                    "サーバーかアドレスを入力してください",
+                ));
                 Vec::new()
             }
         }
@@ -4657,14 +4645,10 @@ impl UiState {
                 }]
             }
             None => {
-                self.multiplayer.status = Some(
-                    tr(
-                        self.lang(),
-                        "Invalid server address",
-                        "サーバーアドレスが無効です",
-                    )
-                    .to_string(),
-                );
+                self.multiplayer.status = Some(self.status_line(
+                    "Invalid server address",
+                    "サーバーアドレスが無効です",
+                ));
                 Vec::new()
             }
         }
@@ -4693,12 +4677,7 @@ impl UiState {
                 self.navigate(Screen::Pause);
                 vec![UiAction::OpenScreen(Screen::Pause)]
             }
-            Screen::Pause => {
-                self.back_action()
-            }
-            _ => {
-                self.back_action()
-            }
+            _ => self.back_action(),
         }
     }
 
@@ -4735,29 +4714,109 @@ impl UiState {
         self.activate(region.id, region.rect.x, region.rect.y, region.rect)
     }
 
+    /// Navigate to `screen` and report the transition as an action —
+    /// the dominant activate pattern.
+    fn open_screen(&mut self, screen: Screen) -> Vec<UiAction> {
+        self.navigate(screen);
+        vec![UiAction::OpenScreen(screen)]
+    }
+
+    /// `go_title()` plus one follow-up action (leave-world, cancel, ...).
+    fn title_action(&mut self, action: UiAction) -> Vec<UiAction> {
+        self.go_title();
+        vec![action]
+    }
+
+    /// `url` as an [`UiAction::OpenUrl`], or nothing when the URL is
+    /// empty — and, for `title_gated` links, when the Title-screen QoL
+    /// toggle hides support links.
+    fn link_action(&self, url: &str, title_gated: bool) -> Vec<UiAction> {
+        if url.is_empty()
+            || (title_gated
+                && self.screen == Screen::Title
+                && !self.settings.qol.show_support_links)
+        {
+            Vec::new()
+        } else {
+            vec![UiAction::OpenUrl(url.to_string())]
+        }
+    }
+
+    /// Unfocus every text field, then focus the one `focus` selects.
+    fn focus_field(&mut self, focus: impl FnOnce(&mut UiState)) -> Vec<UiAction> {
+        self.unfocus_fields();
+        focus(self);
+        Vec::new()
+    }
+
+    /// Scroll a menu list up one row.
+    fn scroll_up(scroll: &mut usize) -> Vec<UiAction> {
+        *scroll = scroll.saturating_sub(1);
+        Vec::new()
+    }
+
+    /// Scroll a menu list down one row, clamped to `len` entries.
+    fn scroll_down(scroll: &mut usize, len: usize) -> Vec<UiAction> {
+        *scroll = (*scroll + 1).min(len.saturating_sub(1));
+        Vec::new()
+    }
+
+    /// [`UiAction::CopyText`] for a non-empty clipboard payload.
+    fn copy_text(&self, text: &str) -> Vec<UiAction> {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![UiAction::CopyText(text.to_string())]
+        }
+    }
+
+    /// Localized inline-status line for the Friends/Multiplayer screens.
+    fn status_line(&self, en: &'static str, ja: &'static str) -> String {
+        tr(self.lang(), en, ja).to_string()
+    }
+
     /// Click-activation dispatch: `x`/`y` matter for sliders.
     fn activate(&mut self, id: WidgetId, x: i32, _y: i32, rect: UiRect) -> Vec<UiAction> {
-        match id {
+        if let Some(actions) = self.activate_title(id) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_links(id) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_singleplayer(id) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_multiplayer(id) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_friends(id) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_settings(id, x, rect) {
+            return actions;
+        }
+        if let Some(actions) = self.activate_overlays(id) {
+            return actions;
+        }
+        // Adjustable widgets activate as a "+1" cycle/slider click.
+        self.adjust(id, 1)
+    }
+
+    fn activate_title(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
             WidgetId::TitleSingleplayer => {
                 self.singleplayer.scroll = 0;
-                self.navigate(Screen::Singleplayer);
-                vec![UiAction::OpenScreen(Screen::Singleplayer)]
+                self.open_screen(Screen::Singleplayer)
             }
             WidgetId::TitleMultiplayer => {
                 self.multiplayer.scroll = 0;
                 self.multiplayer.status = None;
-                self.navigate(Screen::Multiplayer);
-                vec![UiAction::OpenScreen(Screen::Multiplayer)]
+                self.open_screen(Screen::Multiplayer)
             }
-            WidgetId::TitleFriends => {
-                self.navigate(Screen::Friends);
-                vec![UiAction::OpenScreen(Screen::Friends)]
-            }
+            WidgetId::TitleFriends => self.open_screen(Screen::Friends),
             WidgetId::TitleMods => self.open_mod_manager(),
             WidgetId::TitleSettings => {
-                let s = Screen::Settings(SettingsTab::Video);
-                self.navigate(s);
-                vec![UiAction::OpenScreen(s)]
+                self.open_screen(Screen::Settings(SettingsTab::Video))
             }
             WidgetId::TitleQuit => vec![UiAction::QuitGame],
             WidgetId::TitleLanguage => {
@@ -4771,11 +4830,27 @@ impl UiState {
                 self.set_locale(next);
                 vec![UiAction::SettingsChanged]
             }
-            WidgetId::TitleAbout => {
-                self.navigate(Screen::AboutMegu);
-                vec![UiAction::OpenScreen(Screen::AboutMegu)]
-            }
+            WidgetId::TitleAbout => self.open_screen(Screen::AboutMegu),
+            _ => return None,
+        })
+    }
 
+    /// External links — they appear on several screens, so they get
+    /// their own group rather than living under Title.
+    fn activate_links(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
+            WidgetId::WebsiteLink => self.link_action(&self.website_url, false),
+            WidgetId::SupportLink => self.link_action(&self.support_url, true),
+            WidgetId::ContributeLink => self.link_action(&self.contribute_url, true),
+            WidgetId::ReportLink | WidgetId::PauseReportBug => {
+                self.link_action(&self.report_url, false)
+            }
+            _ => return None,
+        })
+    }
+
+    fn activate_singleplayer(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
             WidgetId::SingleplayerWorld(i) => match self.singleplayer.worlds.get(i) {
                 Some(name) => vec![UiAction::PlayWorld {
                     name: name.clone(),
@@ -4784,14 +4859,10 @@ impl UiState {
                 None => Vec::new(),
             },
             WidgetId::SingleplayerNameField => {
-                self.unfocus_fields();
-                self.singleplayer.name_focused = true;
-                Vec::new()
+                self.focus_field(|s| s.singleplayer.name_focused = true)
             }
             WidgetId::SingleplayerSeedField => {
-                self.unfocus_fields();
-                self.singleplayer.seed_focused = true;
-                Vec::new()
+                self.focus_field(|s| s.singleplayer.seed_focused = true)
             }
             WidgetId::SingleplayerCreate => self.try_create_world(),
             WidgetId::SingleplayerGameMode => {
@@ -4802,28 +4873,26 @@ impl UiState {
                 self.singleplayer.difficulty = match self.singleplayer.difficulty { SingleplayerDifficulty::Peaceful => SingleplayerDifficulty::Easy, SingleplayerDifficulty::Easy => SingleplayerDifficulty::Normal, SingleplayerDifficulty::Normal => SingleplayerDifficulty::Hard, SingleplayerDifficulty::Hard => SingleplayerDifficulty::Peaceful };
                 Vec::new()
             }
-            WidgetId::SingleplayerBack => {
-                self.back_action()
-            }
-            WidgetId::SingleplayerListUp => {
-                self.singleplayer.scroll = self.singleplayer.scroll.saturating_sub(1);
-                Vec::new()
-            }
-            WidgetId::SingleplayerListDown => {
-                let max_scroll = self.singleplayer.worlds.len().saturating_sub(1);
-                self.singleplayer.scroll = (self.singleplayer.scroll + 1).min(max_scroll);
-                Vec::new()
-            }
+            WidgetId::SingleplayerBack => self.back_action(),
+            WidgetId::SingleplayerListUp => Self::scroll_up(&mut self.singleplayer.scroll),
+            WidgetId::SingleplayerListDown => Self::scroll_down(
+                &mut self.singleplayer.scroll,
+                self.singleplayer.worlds.len(),
+            ),
+            _ => return None,
+        })
+    }
 
+    fn activate_multiplayer(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
             WidgetId::MultiplayerServer(i) => {
-                self.multiplayer.selected = (i < self.multiplayer.servers.len()).then_some(i);
+                self.multiplayer.selected =
+                    (i < self.multiplayer.servers.len()).then_some(i);
                 self.multiplayer.status = None;
                 Vec::new()
             }
             WidgetId::MultiplayerAddressField => {
-                self.unfocus_fields();
-                self.multiplayer.address_focused = true;
-                Vec::new()
+                self.focus_field(|s| s.multiplayer.address_focused = true)
             }
             WidgetId::MultiplayerJoin => self.try_join_server(),
             WidgetId::MultiplayerAdd => self.try_add_server(),
@@ -4832,25 +4901,14 @@ impl UiState {
                     vec![UiAction::DeleteServer { index }]
                 }
                 _ => {
-                    self.multiplayer.status = Some(
-                        tr(
-                            self.lang(),
-                            "Select a server to delete",
-                            "削除するサーバーを選択してください",
-                        )
-                        .to_string(),
-                    );
+                    self.multiplayer.status =
+                        Some(self.status_line("Select a server to delete", "削除するサーバーを選択してください"));
                     Vec::new()
                 }
             },
-            WidgetId::MultiplayerListUp => {
-                self.multiplayer.scroll = self.multiplayer.scroll.saturating_sub(1);
-                Vec::new()
-            }
+            WidgetId::MultiplayerListUp => Self::scroll_up(&mut self.multiplayer.scroll),
             WidgetId::MultiplayerListDown => {
-                let max_scroll = self.multiplayer.servers.len().saturating_sub(1);
-                self.multiplayer.scroll = (self.multiplayer.scroll + 1).min(max_scroll);
-                Vec::new()
+                Self::scroll_down(&mut self.multiplayer.scroll, self.multiplayer.servers.len())
             }
             WidgetId::MultiplayerFriendWorld(index) => {
                 if index < self.multiplayer.friend_worlds.len() {
@@ -4869,73 +4927,113 @@ impl UiState {
                 }
             }
             WidgetId::MultiplayerFriendLanUp => {
-                self.multiplayer.friend_lan_scroll =
-                    self.multiplayer.friend_lan_scroll.saturating_sub(1);
-                Vec::new()
+                Self::scroll_up(&mut self.multiplayer.friend_lan_scroll)
             }
             WidgetId::MultiplayerFriendLanDown => {
                 let total =
                     self.multiplayer.friend_worlds.len() + self.multiplayer.lan_worlds.len();
-                let max_scroll = total.saturating_sub(1);
-                self.multiplayer.friend_lan_scroll =
-                    (self.multiplayer.friend_lan_scroll + 1).min(max_scroll);
+                Self::scroll_down(&mut self.multiplayer.friend_lan_scroll, total)
+            }
+            WidgetId::MultiplayerManageFriends => self.open_screen(Screen::Friends),
+            WidgetId::MultiplayerBack => self.back_action(),
+            _ => return None,
+        })
+    }
+
+    fn activate_friends(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
+            WidgetId::FriendsJoinField => {
+                self.join_field_focused = true;
+                self.fps_field_focused = false;
                 Vec::new()
             }
-            WidgetId::MultiplayerManageFriends => {
-                self.navigate(Screen::Friends);
-                vec![UiAction::OpenScreen(Screen::Friends)]
+            WidgetId::FriendsJoin => self.try_join(),
+            WidgetId::FriendsGenerate => {
+                let v = next_invite_code(&mut self.invite_counter);
+                let v = v ^ self.invite_seed.wrapping_add(0x5f5f_5f5f_5f5f);
+                self.active_invite = Some(v & 0xff_ffff_ffff);
+                vec![UiAction::GenerateInvite]
             }
-            WidgetId::MultiplayerBack => {
-                self.back_action()
-            }
-            WidgetId::DisconnectedBack => {
-                self.go_title();
-                vec![UiAction::OpenScreen(Screen::Title)]
-            }
-            WidgetId::WebsiteLink => {
-                if self.website_url.is_empty() {
-                    Vec::new()
+            WidgetId::FriendsCopy => match self.active_invite {
+                Some(code) => vec![UiAction::CopyInvite(invite_code_display(code))],
+                None => Vec::new(),
+            },
+            WidgetId::FriendsRevoke => {
+                if self.active_invite.take().is_some() {
+                    vec![UiAction::RevokeInvite]
                 } else {
-                    vec![UiAction::OpenUrl(self.website_url.clone())]
+                    Vec::new()
                 }
             }
-            WidgetId::SupportLink => {
-                if (self.screen == Screen::Title && !self.settings.qol.show_support_links)
-                    || self.support_url.is_empty()
-                {
-                    Vec::new()
-                } else {
-                    vec![UiAction::OpenUrl(self.support_url.clone())]
-                }
+            WidgetId::FriendsBack => self.back_action(),
+            WidgetId::FriendsCopyId => self.copy_text(&self.friends.my_friend_id),
+            WidgetId::FriendsAddNameField => {
+                self.focus_field(|s| s.friends.name_focused = true)
             }
-            WidgetId::ContributeLink => {
-                if (self.screen == Screen::Title && !self.settings.qol.show_support_links)
-                    || self.contribute_url.is_empty()
-                {
-                    Vec::new()
-                } else {
-                    vec![UiAction::OpenUrl(self.contribute_url.clone())]
-                }
+            WidgetId::FriendsAddIdField => {
+                self.focus_field(|s| s.friends.id_focused = true)
             }
-            WidgetId::ReportLink | WidgetId::PauseReportBug => {
-                if self.report_url.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![UiAction::OpenUrl(self.report_url.clone())]
-                }
+            WidgetId::FriendsAdd => self.try_add_friend(),
+            WidgetId::FriendRow(index) => {
+                self.friends.selected =
+                    (index < self.friends.friends.len()).then_some(index);
+                Vec::new()
             }
+            WidgetId::FriendRemove(index) => match self.friends.friends.get(index) {
+                Some(entry) => {
+                    let friend_id = entry.friend_id.clone();
+                    if self.friends.selected == Some(index) {
+                        self.friends.selected = None;
+                    }
+                    vec![UiAction::RemoveFriend { friend_id }]
+                }
+                None => Vec::new(),
+            },
+            WidgetId::FriendsRelayField => {
+                self.focus_field(|s| s.friends.relay_focused = true)
+            }
+            WidgetId::FriendsGenerateGuestLink => self.generate_guest_link(),
+            WidgetId::FriendsCopyGuestLink => match self.friends.guest_link.clone() {
+                Some(link) => vec![UiAction::CopyText(link)],
+                None => Vec::new(),
+            },
+            WidgetId::FriendsListUp => Self::scroll_up(&mut self.friends.scroll),
+            WidgetId::FriendsListDown => {
+                Self::scroll_down(&mut self.friends.scroll, self.friends.friends.len())
+            }
+            _ => return None,
+        })
+    }
 
-            WidgetId::SettingsDone => {
-                self.back_action()
+    /// `[Generate Guest Link]`: mint a one-off token for the selected
+    /// friend row; a missing/stale selection surfaces an inline status.
+    fn generate_guest_link(&mut self) -> Vec<UiAction> {
+        let entry = self
+            .friends
+            .selected
+            .and_then(|index| self.friends.friends.get(index));
+        match entry {
+            Some(entry) => vec![UiAction::GenerateGuestLink {
+                friend_id: entry.friend_id.clone(),
+            }],
+            None => {
+                if self.friends.selected.is_some() {
+                    self.friends.selected = None;
+                }
+                self.friends.status = Some(self.status_line(
+                    "Select a friend row first",
+                    "先にフレンド行を選択してください",
+                ));
+                Vec::new()
             }
-            WidgetId::SettingsAboutMegu => {
-                self.navigate(Screen::AboutMegu);
-                vec![UiAction::OpenScreen(Screen::AboutMegu)]
-            }
+        }
+    }
+
+    fn activate_settings(&mut self, id: WidgetId, x: i32, rect: UiRect) -> Option<Vec<UiAction>> {
+        Some(match id {
+            WidgetId::SettingsDone | WidgetId::AboutBack => self.back_action(),
+            WidgetId::SettingsAboutMegu => self.open_screen(Screen::AboutMegu),
             WidgetId::SettingsMods => self.open_mod_manager(),
-            WidgetId::AboutBack => {
-                self.back_action()
-            }
             WidgetId::TabVideo => self.select_tab(SettingsTab::Video),
             WidgetId::TabAudio => self.select_tab(SettingsTab::Audio),
             WidgetId::TabShaders => self.select_tab(SettingsTab::Shaders),
@@ -4948,7 +5046,6 @@ impl UiState {
                 Vec::new()
             }
             WidgetId::ShadersOpenOptions => vec![UiAction::OpenShaderOptions],
-
             WidgetId::SettingsUndo => self.undo_settings(),
             WidgetId::SettingsRedo => self.redo_settings(),
             WidgetId::SettingsDiscard => self.discard_settings_session(),
@@ -4969,7 +5066,6 @@ impl UiState {
                 }
                 Vec::new()
             }
-
             WidgetId::VideoFpsSlider => {
                 // Map click x to the nearest slider stop.
                 let frac = ((x - rect.x) as f32 / rect.w.max(1) as f32).clamp(0.0, 1.0);
@@ -4997,114 +5093,15 @@ impl UiState {
                 self.fps_field_error = false;
                 Vec::new()
             }
-            WidgetId::FriendsJoinField => {
-                self.join_field_focused = true;
-                self.fps_field_focused = false;
-                Vec::new()
-            }
-            WidgetId::FriendsJoin => self.try_join(),
+            _ => return None,
+        })
+    }
 
-            WidgetId::FriendsGenerate => {
-                let v = next_invite_code(&mut self.invite_counter);
-                let v = v ^ self.invite_seed.wrapping_add(0x5f5f_5f5f_5f5f);
-                self.active_invite = Some(v & 0xff_ffff_ffff);
-                vec![UiAction::GenerateInvite]
-            }
-            WidgetId::FriendsCopy => match self.active_invite {
-                Some(code) => vec![UiAction::CopyInvite(invite_code_display(code))],
-                None => Vec::new(),
-            },
-            WidgetId::FriendsRevoke => {
-                if self.active_invite.take().is_some() {
-                    vec![UiAction::RevokeInvite]
-                } else {
-                    Vec::new()
-                }
-            }
-            WidgetId::FriendsBack => {
-                self.back_action()
-            }
-            WidgetId::FriendsCopyId => {
-                if self.friends.my_friend_id.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![UiAction::CopyText(self.friends.my_friend_id.clone())]
-                }
-            }
-            WidgetId::FriendsAddNameField => {
-                self.unfocus_fields();
-                self.friends.name_focused = true;
-                Vec::new()
-            }
-            WidgetId::FriendsAddIdField => {
-                self.unfocus_fields();
-                self.friends.id_focused = true;
-                Vec::new()
-            }
-            WidgetId::FriendsAdd => self.try_add_friend(),
-            WidgetId::FriendRow(index) => {
-                self.friends.selected = (index < self.friends.friends.len()).then_some(index);
-                Vec::new()
-            }
-            WidgetId::FriendRemove(index) => match self.friends.friends.get(index) {
-                Some(entry) => {
-                    let friend_id = entry.friend_id.clone();
-                    if self.friends.selected == Some(index) {
-                        self.friends.selected = None;
-                    }
-                    vec![UiAction::RemoveFriend { friend_id }]
-                }
-                None => Vec::new(),
-            },
-            WidgetId::FriendsRelayField => {
-                self.unfocus_fields();
-                self.friends.relay_focused = true;
-                Vec::new()
-            }
-            WidgetId::FriendsGenerateGuestLink => match self.friends.selected {
-                Some(index) => match self.friends.friends.get(index) {
-                    Some(entry) => vec![UiAction::GenerateGuestLink {
-                        friend_id: entry.friend_id.clone(),
-                    }],
-                    None => {
-                        self.friends.selected = None;
-                        self.friends.status = Some(
-                            tr(
-                                self.lang(),
-                                "Select a friend row first",
-                                "先にフレンド行を選択してください",
-                            )
-                            .to_string(),
-                        );
-                        Vec::new()
-                    }
-                },
-                None => {
-                    self.friends.status = Some(
-                        tr(
-                            self.lang(),
-                            "Select a friend row first",
-                            "先にフレンド行を選択してください",
-                        )
-                        .to_string(),
-                    );
-                    Vec::new()
-                }
-            },
-            WidgetId::FriendsCopyGuestLink => match self.friends.guest_link.clone() {
-                Some(link) => vec![UiAction::CopyText(link)],
-                None => Vec::new(),
-            },
-            WidgetId::FriendsListUp => {
-                self.friends.scroll = self.friends.scroll.saturating_sub(1);
-                Vec::new()
-            }
-            WidgetId::FriendsListDown => {
-                let max_scroll = self.friends.friends.len().saturating_sub(1);
-                self.friends.scroll = (self.friends.scroll + 1).min(max_scroll);
-                Vec::new()
-            }
-
+    /// Session overlays: mod-sync prompt, pause menu, disconnected,
+    /// crash recovery, death screen, sign editor, and modals.
+    fn activate_overlays(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
+        Some(match id {
+            WidgetId::DisconnectedBack => self.title_action(UiAction::OpenScreen(Screen::Title)),
             WidgetId::ModSyncAccept => {
                 self.mod_sync_decision = Some(true);
                 let entries = std::mem::take(&mut self.pending_mod_sync);
@@ -5124,34 +5121,21 @@ impl UiState {
                 }
             }
             WidgetId::ModSyncPromptConfirm => vec![UiAction::ConfirmModSyncDownload],
-            WidgetId::ModSyncPromptCancel => {
-                self.go_title();
-                vec![UiAction::CancelModSync]
-            }
-
-            WidgetId::PauseBackToGame => {
-                self.back_action()
-            }
+            WidgetId::ModSyncPromptCancel => self.title_action(UiAction::CancelModSync),
+            WidgetId::PauseBackToGame | WidgetId::RecipeBrowserDone => self.back_action(),
             WidgetId::PauseSettings => {
-                let s = Screen::Settings(SettingsTab::Video);
-                self.navigate(s);
-                vec![UiAction::OpenScreen(s)]
+                self.open_screen(Screen::Settings(SettingsTab::Video))
             }
             WidgetId::PauseStatistics => vec![UiAction::ShowStatistics],
             WidgetId::PauseRecipeBrowser => self.open_recipe_browser(),
             WidgetId::PauseSaveReplay => vec![UiAction::SaveInstantReplay],
-            WidgetId::PauseInvite => {
-                self.navigate(Screen::Friends);
-                vec![UiAction::OpenScreen(Screen::Friends)]
-            }
+            WidgetId::PauseInvite => self.open_screen(Screen::Friends),
             WidgetId::PauseSaveQuit => {
-                self.go_title();
                 // `LeaveWorld` tears the live session down before the
                 // title screen lands — like `DeathTitleScreen`, leaving
                 // world must drop the connection, not leak it.
-                vec![UiAction::LeaveWorld]
+                self.title_action(UiAction::LeaveWorld)
             }
-
             WidgetId::CrashSendReport => {
                 if self.crash_sent || self.crash.is_none() {
                     Vec::new()
@@ -5160,11 +5144,7 @@ impl UiState {
                     Vec::new()
                 }
             }
-            WidgetId::CrashReturnTitle => {
-                self.go_title();
-                vec![UiAction::OpenScreen(Screen::Title)]
-            }
-
+            WidgetId::CrashReturnTitle => self.title_action(UiAction::OpenScreen(Screen::Title)),
             WidgetId::DeathRespawn => {
                 // The layout only emits a live region when
                 // `can_respawn()` holds; re-check here so a stale focus
@@ -5175,35 +5155,11 @@ impl UiState {
                     Vec::new()
                 }
             }
-            WidgetId::DeathTitleScreen => {
-                self.go_title();
-                vec![UiAction::LeaveWorld]
-            }
-            WidgetId::ModalOk => match self.modal {
-                Some(UiModal::ConfirmSendCrashReport) => {
-                    self.modal = None;
-                    self.crash_sent = true;
-                    vec![UiAction::SubmitCrashReport]
-                }
-                Some(UiModal::ConfirmResetDefaults) => {
-                    self.modal = None;
-                    // Even a confirmed reset stays 1-click Undo-recoverable.
-                    let prior = std::mem::take(&mut self.settings);
-                    self.push_settings_undo(prior);
-                    vec![UiAction::SettingsChanged]
-                }
-                Some(UiModal::StartupTimeline) | None => {
-                    self.modal = None;
-                    Vec::new()
-                }
-            },
+            WidgetId::DeathTitleScreen => self.title_action(UiAction::LeaveWorld),
+            WidgetId::ModalOk => self.modal_confirm(),
             WidgetId::ModalCancel => {
                 self.modal = None;
                 Vec::new()
-            }
-
-            WidgetId::RecipeBrowserDone => {
-                self.back_action()
             }
             WidgetId::SignEditorDone => vec![UiAction::CloseSignEditor],
             WidgetId::CraftConflictNext => {
@@ -5216,9 +5172,30 @@ impl UiState {
                     Vec::new()
                 }
             }
+            _ => return None,
+        })
+    }
 
-            // Adjustable widgets activate as a "+1" cycle/slider click.
-            _ => self.adjust(id, 1),
+    /// `[OK]` on the active modal: confirm-send-report, confirm-reset,
+    /// or plain dismiss for the startup timeline.
+    fn modal_confirm(&mut self) -> Vec<UiAction> {
+        match self.modal {
+            Some(UiModal::ConfirmSendCrashReport) => {
+                self.modal = None;
+                self.crash_sent = true;
+                vec![UiAction::SubmitCrashReport]
+            }
+            Some(UiModal::ConfirmResetDefaults) => {
+                self.modal = None;
+                // Even a confirmed reset stays 1-click Undo-recoverable.
+                let prior = std::mem::take(&mut self.settings);
+                self.push_settings_undo(prior);
+                vec![UiAction::SettingsChanged]
+            }
+            Some(UiModal::StartupTimeline) | None => {
+                self.modal = None;
+                Vec::new()
+            }
         }
     }
 
@@ -5235,20 +5212,55 @@ impl UiState {
             }
             return Vec::new();
         }
+        // The FPS slider manages its own undo snapshot inside
+        // `set_fps_step`, so it must bypass the shared prior-state tail.
+        if id == WidgetId::VideoFpsSlider {
+            let next = {
+                let v = &self.settings.video;
+                let i = v.fps_step_index() as i32;
+                let n = FPS_CAP_STEPS.len() as i32;
+                (i + dir).rem_euclid(n) as usize
+            };
+            return self.set_fps_step(next);
+        }
         // Friends-screen controls own `self.friends`, not `self.settings` —
-        // handle them before the settings-snapshot match below.
+        // handle them before the settings-snapshot helpers below.
+        if let Some(actions) = self.adjust_friends(id, dir) {
+            return actions;
+        }
+        if let Some(actions) = self.adjust_mod_manager(id) {
+            return actions;
+        }
+        let prior = self.settings.clone();
+        let changed = self.adjust_video(id, dir)
+            || self.adjust_audio(id, dir)
+            || self.adjust_visual(id, dir)
+            || self.adjust_qol(id, dir)
+            || self.adjust_fair_play(id, dir);
+        if changed {
+            self.push_settings_undo(prior);
+            vec![UiAction::SettingsChanged]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Friends allowlist/share controls — they mutate `self.friends`,
+    /// not `self.settings`, so they return actions instead of `changed`.
+    fn adjust_friends(&mut self, id: WidgetId, dir: i32) -> Option<Vec<UiAction>> {
         match id {
             WidgetId::FriendsShareMode => {
                 let next = self.friends.share_mode.step(dir);
                 if next == self.friends.share_mode {
-                    return Vec::new();
+                    Some(Vec::new())
+                } else {
+                    self.friends.share_mode = next;
+                    self.friends.status = None;
+                    Some(vec![UiAction::SetFriendShareMode(next)])
                 }
-                self.friends.share_mode = next;
-                self.friends.status = None;
-                return vec![UiAction::SetFriendShareMode(next)];
             }
             WidgetId::FriendSelected(index) => {
-                return match self.friends.friends.get_mut(index) {
+                Some(match self.friends.friends.get_mut(index) {
                     Some(entry) => {
                         entry.selected_for_share = !entry.selected_for_share;
                         vec![UiAction::SetFriendSelected {
@@ -5257,18 +5269,39 @@ impl UiState {
                         }]
                     }
                     None => Vec::new(),
-                };
+                })
             }
-            _ => {}
+            _ => None,
         }
+    }
+
+    /// Built-in mod-manager toggles that alias settings fields plus the
+    /// "open settings" shortcuts into specific tabs.
+    fn adjust_mod_manager(&mut self, id: WidgetId) -> Option<Vec<UiAction>> {
         match id {
-            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(index)) => {
+            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinToggle(
+                index,
+            )) => {
                 let changed = match index {
-                    0 => { self.settings.qol.recipe_overlay_enabled = !self.settings.qol.recipe_overlay_enabled; true }
-                    1 => { self.settings.inventory_drag_controls = !self.settings.inventory_drag_controls; true }
-                    2 => { self.settings.qol.compact_debug_hud.enabled = !self.settings.qol.compact_debug_hud.enabled; true }
+                    0 => {
+                        self.settings.qol.recipe_overlay_enabled =
+                            !self.settings.qol.recipe_overlay_enabled;
+                        true
+                    }
+                    1 => {
+                        self.settings.inventory_drag_controls =
+                            !self.settings.inventory_drag_controls;
+                        true
+                    }
+                    2 => {
+                        self.settings.qol.compact_debug_hud.enabled =
+                            !self.settings.qol.compact_debug_hud.enabled;
+                        true
+                    }
                     3 => {
-                        let enabled = !(self.settings.qol.quick_stack_nearby && self.settings.qol.auto_replenish);
+                        let enabled =
+                            !(self.settings.qol.quick_stack_nearby
+                                && self.settings.qol.auto_replenish);
                         self.settings.qol.quick_stack_nearby = enabled;
                         self.settings.qol.auto_replenish = enabled;
                         true
@@ -5277,16 +5310,26 @@ impl UiState {
                         let enabled = !self.mod_manager.plamo_panel.auto_pack_enabled;
                         self.mod_manager.plamo_panel.auto_pack_enabled = enabled;
                         self.settings.plamo_auto_translation_pack = enabled;
-                        return vec![
-                            UiAction::ModManager(crate::mod_manager::ModManagerAction::ToggleAutoTranslationPack(enabled)),
+                        return Some(vec![
+                            UiAction::ModManager(
+                                crate::mod_manager::ModManagerAction::ToggleAutoTranslationPack(
+                                    enabled,
+                                ),
+                            ),
                             UiAction::SettingsChanged,
-                        ];
+                        ]);
                     }
                     _ => false,
                 };
-                return if changed { vec![UiAction::SettingsChanged] } else { Vec::new() };
+                Some(if changed {
+                    vec![UiAction::SettingsChanged]
+                } else {
+                    Vec::new()
+                })
             }
-            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(index)) => {
+            WidgetId::ModManager(crate::mod_manager::ModManagerWidgetId::BuiltinOpenSettings(
+                index,
+            )) => {
                 let tab = match index {
                     0 | 1 | 3 => SettingsTab::Qol,
                     2 => SettingsTab::Video,
@@ -5295,103 +5338,81 @@ impl UiState {
                 };
                 let screen = Screen::Settings(tab);
                 self.navigate(screen);
-                return vec![UiAction::OpenScreen(screen)];
+                Some(vec![UiAction::OpenScreen(screen)])
             }
-            _ => {}
+            _ => None,
         }
-        let prior = self.settings.clone();
-        let v = &mut self.settings.video;
-        let fullscreen = &mut self.settings.fullscreen;
-        let mouse_invert_y = &mut self.settings.mouse_invert_y;
-        let gamma_pct = &mut self.settings.gamma_pct;
-        let gui_scale = &mut self.settings.gui_scale;
-        let a = &mut self.settings.audio;
-        let q = &mut self.settings.qol;
-        let f = &mut self.settings.fair_play;
-        let s = &mut self.settings.visual;
-        let changed = match id {
+    }
+
+    /// Apply `f` to the video settings, then mark the preset Custom —
+    /// the shared tail of most Video-tab adjust arms.
+    fn edit_video(&mut self, f: impl FnOnce(&mut VideoSettings)) -> bool {
+        f(&mut self.settings.video);
+        self.settings.video.preset = VideoPreset::Custom;
+        true
+    }
+
+    /// Video tab: preset/LOD/backend cycles, toggles, and the display
+    /// widgets (fullscreen, invert-Y, gamma, GUI scale) that live
+    /// directly on [`UiSettings`].
+    fn adjust_video(&mut self, id: WidgetId, dir: i32) -> bool {
+        match id {
+            WidgetId::VideoFullscreen => flip(&mut self.settings.fullscreen),
+            WidgetId::VideoInvertY => flip(&mut self.settings.mouse_invert_y),
+            WidgetId::VideoGamma => {
+                self.settings.gamma_pct =
+                    clamp_i(self.settings.gamma_pct as i32 + 5 * dir, 50, 200) as u16;
+                true
+            }
+            WidgetId::VideoGuiScale => {
+                self.settings.gui_scale = (self.settings.gui_scale % 5 + 1) % 5;
+                true
+            }
             WidgetId::VideoPreset => {
-                v.preset = v.preset.next();
+                self.settings.video.preset = self.settings.video.preset.next();
                 true
             }
             WidgetId::VideoViewDistance => {
+                let v = &mut self.settings.video;
                 let d = v.view_distance as i32 + dir;
-                v.view_distance = d.clamp(MIN_VIEW_DISTANCE as i32, MAX_VIEW_DISTANCE as i32) as u8;
+                v.view_distance =
+                    d.clamp(MIN_VIEW_DISTANCE as i32, MAX_VIEW_DISTANCE as i32) as u8;
                 v.preset = VideoPreset::Custom;
                 true
             }
-            WidgetId::VideoLod => {
-                v.lod = v.lod.next();
-                v.preset = VideoPreset::Custom;
-                true
-            }
-            WidgetId::VideoGpuBackend => {
-                v.gpu_backend = v.gpu_backend.next();
-                v.preset = VideoPreset::Custom;
-                true
-            }
-            WidgetId::VideoFpsSlider => {
-                let i = v.fps_step_index() as i32;
-                let n = FPS_CAP_STEPS.len() as i32;
-                let next = (i + dir).rem_euclid(n) as usize;
-                return self.set_fps_step(next);
-            }
-            WidgetId::VideoBackgroundFps => {
+            WidgetId::VideoLod => self.edit_video(|v| v.lod = v.lod.next()),
+            WidgetId::VideoGpuBackend => self.edit_video(|v| v.gpu_backend = v.gpu_backend.next()),
+            WidgetId::VideoBackgroundFps => self.edit_video(|v| {
                 v.background_fps = if v.background_fps == 15 { 0 } else { 15 };
-                v.preset = VideoPreset::Custom;
-                true
-            }
-            WidgetId::VideoVsync => {
-                v.vsync = !v.vsync;
-                v.preset = VideoPreset::Custom;
-                true
-            }
+            }),
+            WidgetId::VideoVsync => self.edit_video(|v| v.vsync = !v.vsync),
             WidgetId::VideoSmoothLighting => {
-                v.smooth_lighting = !v.smooth_lighting;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.smooth_lighting = !v.smooth_lighting)
             }
-            WidgetId::VideoClouds => {
-                v.clouds = v.clouds.next();
-                v.preset = VideoPreset::Custom;
-                true
-            }
+            WidgetId::VideoClouds => self.edit_video(|v| v.clouds = v.clouds.next()),
             WidgetId::VideoEntityShadows => {
-                v.entity_shadows = !v.entity_shadows;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.entity_shadows = !v.entity_shadows)
             }
             WidgetId::VideoComfortExposure => {
-                v.comfort_exposure = !v.comfort_exposure;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.comfort_exposure = !v.comfort_exposure)
             }
             WidgetId::VideoDynamicLights => {
-                v.dynamic_lights = !v.dynamic_lights;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.dynamic_lights = !v.dynamic_lights)
             }
             WidgetId::VideoEnchantmentGlint => {
-                v.enchantment_glint = !v.enchantment_glint;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.enchantment_glint = !v.enchantment_glint)
             }
             WidgetId::VideoIndirectLightBounce => {
-                v.indirect_light_bounce = !v.indirect_light_bounce;
-                v.preset = VideoPreset::Custom;
-                true
+                self.edit_video(|v| v.indirect_light_bounce = !v.indirect_light_bounce)
             }
-            WidgetId::VideoDirectionalShadowGameplay => {
+            WidgetId::VideoDirectionalShadowGameplay => self.edit_video(|v| {
                 v.directional_shadow_gameplay = !v.directional_shadow_gameplay;
-                v.preset = VideoPreset::Custom;
-                true
-            }
-            WidgetId::VideoLazyCatchupGameplay => {
+            }),
+            WidgetId::VideoLazyCatchupGameplay => self.edit_video(|v| {
                 v.lazy_catchup_gameplay = !v.lazy_catchup_gameplay;
-                v.preset = VideoPreset::Custom;
-                true
-            }
+            }),
             WidgetId::VideoRamBudget => {
+                let v = &mut self.settings.video;
                 let next = v.ram_budget_step(dir);
                 if next == v.ram_budget_mib {
                     false
@@ -5401,46 +5422,69 @@ impl UiState {
                     true
                 }
             }
-            WidgetId::VideoFullscreen => {
-                *fullscreen = !*fullscreen;
+            _ => false,
+        }
+    }
+
+    fn adjust_audio(&mut self, id: WidgetId, dir: i32) -> bool {
+        match id {
+            WidgetId::AudioMaster => pct_step(&mut self.settings.audio.master, dir),
+            WidgetId::AudioMusic => pct_step(&mut self.settings.audio.music, dir),
+            WidgetId::AudioBlocks => pct_step(&mut self.settings.audio.blocks, dir),
+            WidgetId::AudioHostile => pct_step(&mut self.settings.audio.hostile, dir),
+            WidgetId::AudioFriendly => pct_step(&mut self.settings.audio.friendly, dir),
+            WidgetId::AudioMaxVolumeCap => {
+                pct_step(&mut self.settings.audio.max_volume_cap, dir)
+            }
+            WidgetId::AudioMaxConcurrent => {
+                let a = &mut self.settings.audio;
+                a.max_concurrent_same_sound = clamp_i(
+                    a.max_concurrent_same_sound as i32 + dir,
+                    MIN_CONCURRENT_SAME_SOUND as i32,
+                    MAX_CONCURRENT_SAME_SOUND as i32,
+                );
                 true
             }
-            WidgetId::VideoInvertY => {
-                *mouse_invert_y = !*mouse_invert_y;
+            _ => false,
+        }
+    }
+
+    /// Shaders tab plus the visual-style toggles (incl. the audio-tab's
+    /// spatial-audio switch, which lives on [`VisualStyleSettings`]).
+    fn adjust_visual(&mut self, id: WidgetId, dir: i32) -> bool {
+        match id {
+            WidgetId::ShadersEnabled => flip(&mut self.settings.shader_quick.shaders_enabled),
+            WidgetId::VisualPreset => {
+                self.settings.visual.preset = self.settings.visual.preset.step(dir);
                 true
             }
-            WidgetId::VideoGamma => {
-                *gamma_pct = (i32::from(*gamma_pct) + 5 * dir).clamp(50, 200) as u16;
-                true
+            WidgetId::VisualBlocks3d => flip(&mut self.settings.visual.blocks_and_skins_3d),
+            WidgetId::VisualWorldEffects => flip(&mut self.settings.visual.world_effects),
+            WidgetId::VisualCameraMotion => {
+                flip(&mut self.settings.visual.camera_micro_motion)
             }
-            WidgetId::VideoGuiScale => {
-                *gui_scale = (*gui_scale % 5 + 1) % 5;
-                true
+            WidgetId::VisualNightSky => {
+                flip(&mut self.settings.visual.world_effects_detail.night_sky)
             }
+            WidgetId::AudioSpatial3d => flip(&mut self.settings.visual.spatial_audio_3d),
+            _ => false,
+        }
+    }
+
+    fn adjust_qol(&mut self, id: WidgetId, dir: i32) -> bool {
+        match id {
             WidgetId::QolBuiltin(index) => match index {
-                0 => {
-                    self.settings.qol_looking_at_hud = !self.settings.qol_looking_at_hud;
-                    true
-                }
-                1 => {
-                    self.settings.inventory_drag_controls = !self.settings.inventory_drag_controls;
-                    true
-                }
-                2 => {
-                    self.settings.qol_inventory_sort = !self.settings.qol_inventory_sort;
-                    true
-                }
-                3 => {
-                    self.settings.zsh_command_bar = !self.settings.zsh_command_bar;
-                    true
-                }
+                0 => flip(&mut self.settings.qol_looking_at_hud),
+                1 => flip(&mut self.settings.inventory_drag_controls),
+                2 => flip(&mut self.settings.qol_inventory_sort),
+                3 => flip(&mut self.settings.zsh_command_bar),
                 _ => false,
             },
             WidgetId::CompactDebugHudSegment(index) => {
                 if index >= 9 {
                     false
                 } else {
-                    let compact_debug_hud = &mut q.compact_debug_hud;
+                    let compact_debug_hud = &mut self.settings.qol.compact_debug_hud;
                     compact_debug_hud.enabled = true;
                     let enabled = match index {
                         0 => &mut compact_debug_hud.show_fps,
@@ -5457,173 +5501,75 @@ impl UiState {
                     true
                 }
             }
-            WidgetId::ShadersEnabled => {
-                self.settings.shader_quick.shaders_enabled =
-                    !self.settings.shader_quick.shaders_enabled;
-                true
-            }
-            WidgetId::VisualPreset => {
-                s.preset = s.preset.step(dir);
-                true
-            }
-            WidgetId::VisualBlocks3d => {
-                s.blocks_and_skins_3d = !s.blocks_and_skins_3d;
-                true
-            }
-            WidgetId::VisualWorldEffects => {
-                s.world_effects = !s.world_effects;
-                true
-            }
-            WidgetId::VisualCameraMotion => {
-                s.camera_micro_motion = !s.camera_micro_motion;
-                true
-            }
-            WidgetId::VisualNightSky => {
-                s.world_effects_detail.night_sky = !s.world_effects_detail.night_sky;
-                true
-            }
-            WidgetId::AudioSpatial3d => {
-                s.spatial_audio_3d = !s.spatial_audio_3d;
-                true
-            }
-            WidgetId::AudioMaster => {
-                a.master = clamp_i(a.master as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioMusic => {
-                a.music = clamp_i(a.music as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioBlocks => {
-                a.blocks = clamp_i(a.blocks as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioHostile => {
-                a.hostile = clamp_i(a.hostile as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioFriendly => {
-                a.friendly = clamp_i(a.friendly as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioMaxVolumeCap => {
-                a.max_volume_cap = clamp_i(a.max_volume_cap as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::AudioMaxConcurrent => {
-                a.max_concurrent_same_sound = clamp_i(
-                    a.max_concurrent_same_sound as i32 + dir,
-                    MIN_CONCURRENT_SAME_SOUND as i32,
-                    MAX_CONCURRENT_SAME_SOUND as i32,
-                );
-                true
-            }
-            WidgetId::QolSmoothZoom => {
-                q.smooth_zoom = !q.smooth_zoom;
-                true
-            }
-            WidgetId::QolToolWarn => {
-                q.tool_warn_percent = clamp_i(q.tool_warn_percent as i32 + 5 * dir, 0, 100);
-                true
-            }
-            WidgetId::QolPreventBreak => {
-                q.prevent_tool_break = !q.prevent_tool_break;
-                true
-            }
+            WidgetId::QolSmoothZoom => flip(&mut self.settings.qol.smooth_zoom),
+            WidgetId::QolToolWarn => pct_step(&mut self.settings.qol.tool_warn_percent, dir),
+            WidgetId::QolPreventBreak => flip(&mut self.settings.qol.prevent_tool_break),
             WidgetId::QolChatHistory => {
                 let step = if dir >= 0 { 100 } else { -100 };
-                let v0 = q.chat_history_lines as i64 + step;
-                q.chat_history_lines =
+                let v0 = self.settings.qol.chat_history_lines as i64 + step;
+                self.settings.qol.chat_history_lines =
                     (v0.clamp(MIN_CHAT_HISTORY as i64, MAX_CHAT_HISTORY as i64)) as usize;
                 true
             }
-            WidgetId::QolRetainChat => {
-                q.retain_chat_on_reconnect = !q.retain_chat_on_reconnect;
-                true
-            }
+            WidgetId::QolRetainChat => flip(&mut self.settings.qol.retain_chat_on_reconnect),
             WidgetId::QolCrashMode => {
-                q.crash_report_mode = q.crash_report_mode.next();
+                self.settings.qol.crash_report_mode =
+                    self.settings.qol.crash_report_mode.next();
                 true
             }
-            WidgetId::QolShowSupportLinks => {
-                q.show_support_links = !q.show_support_links;
-                true
-            }
+            WidgetId::QolShowSupportLinks => flip(&mut self.settings.qol.show_support_links),
             WidgetId::QolCompactDebugHud => {
-                q.cycle_compact_debug_hud();
+                self.settings.qol.cycle_compact_debug_hud();
                 true
             }
-            WidgetId::QolSubtitles => {
-                q.show_subtitles = !q.show_subtitles;
-                true
-            }
+            WidgetId::QolSubtitles => flip(&mut self.settings.qol.show_subtitles),
             WidgetId::QolAutoReconnect => {
-                q.auto_reconnect = !q.auto_reconnect;
+                self.settings.qol.auto_reconnect = !self.settings.qol.auto_reconnect;
                 // Toggling off mid-countdown cancels any pending redial.
-                self.auto_reconnect.enabled = q.auto_reconnect;
+                self.auto_reconnect.enabled = self.settings.qol.auto_reconnect;
                 true
             }
-            WidgetId::QolAutoReplenish => {
-                q.auto_replenish = !q.auto_replenish;
-                true
-            }
-            WidgetId::QolQuickStack => {
-                q.quick_stack_nearby = !q.quick_stack_nearby;
-                true
-            }
-            WidgetId::QolFoodPreview => {
-                q.food_saturation_preview = !q.food_saturation_preview;
-                true
-            }
-            WidgetId::QolShulkerPeek => {
-                q.shulker_tooltip_peek = !q.shulker_tooltip_peek;
-                true
-            }
+            WidgetId::QolAutoReplenish => flip(&mut self.settings.qol.auto_replenish),
+            WidgetId::QolQuickStack => flip(&mut self.settings.qol.quick_stack_nearby),
+            WidgetId::QolFoodPreview => flip(&mut self.settings.qol.food_saturation_preview),
+            WidgetId::QolShulkerPeek => flip(&mut self.settings.qol.shulker_tooltip_peek),
             WidgetId::QolChatScrollLock => {
-                q.chat_scroll_lock = !q.chat_scroll_lock;
+                self.settings.qol.chat_scroll_lock = !self.settings.qol.chat_scroll_lock;
                 // Disabling the lock drops any stale scroll offset so
                 // chat returns to bottom-pinned immediately.
                 self.chat_scroll.scroll_to_bottom();
                 true
             }
             WidgetId::QolToasts => {
-                q.toast_notifications = !q.toast_notifications;
-                if !q.toast_notifications {
+                self.settings.qol.toast_notifications = !self.settings.qol.toast_notifications;
+                if !self.settings.qol.toast_notifications {
                     self.toasts.clear();
                 }
                 true
             }
-            WidgetId::QolRecipeOverlay => {
-                q.recipe_overlay_enabled = !q.recipe_overlay_enabled;
-                true
-            }
+            WidgetId::QolRecipeOverlay => flip(&mut self.settings.qol.recipe_overlay_enabled),
+            _ => false,
+        }
+    }
+
+    fn adjust_fair_play(&mut self, id: WidgetId, _dir: i32) -> bool {
+        match id {
             WidgetId::FpMinimapMode => {
-                f.minimap_mode = f.minimap_mode.next();
+                self.settings.fair_play.minimap_mode =
+                    self.settings.fair_play.minimap_mode.next();
                 true
             }
-            WidgetId::FpCaveMap => {
-                f.allow_cave_map = !f.allow_cave_map;
-                true
-            }
-            WidgetId::FpMobRadar => {
-                f.allow_mob_radar = !f.allow_mob_radar;
-                true
-            }
+            WidgetId::FpCaveMap => flip(&mut self.settings.fair_play.allow_cave_map),
+            WidgetId::FpMobRadar => flip(&mut self.settings.fair_play.allow_mob_radar),
             WidgetId::FpRadarScope => {
-                f.player_radar_scope = f.player_radar_scope.next();
+                self.settings.fair_play.player_radar_scope =
+                    self.settings.fair_play.player_radar_scope.next();
                 true
             }
             WidgetId::FpWaypointTeleport => {
-                f.allow_waypoint_teleport = !f.allow_waypoint_teleport;
-                true
+                flip(&mut self.settings.fair_play.allow_waypoint_teleport)
             }
             _ => false,
-        };
-        if changed {
-            self.push_settings_undo(prior);
-            vec![UiAction::SettingsChanged]
-        } else {
-            Vec::new()
         }
     }
 
@@ -5650,6 +5596,18 @@ impl UiState {
 
 fn clamp_i(v: i32, lo: i32, hi: i32) -> u8 {
     v.clamp(lo, hi) as u8
+}
+
+/// `!slot` — the adjust helpers' `changed` contract for bool toggles.
+fn flip(slot: &mut bool) -> bool {
+    *slot = !*slot;
+    true
+}
+
+/// `slot += 5 * dir` clamped to `0..=100` — volume/percent sliders.
+fn pct_step(slot: &mut u8, dir: i32) -> bool {
+    *slot = clamp_i(*slot as i32 + 5 * dir, 0, 100);
+    true
 }
 
 /// Re-export for tests/embedders: privacy redaction of free-form text.
