@@ -176,21 +176,29 @@ fn be_fp_mix(a: u64, b: u64) -> (u64, u64) {
 /// `save_v2`'s footer restore rewrites directly, so no mutation hook exists
 /// to hang a version counter on — folding the keys each tick catches every
 /// writer, including ones outside `register_world_block_entity`, while a
-/// steady world pays one hash pass and no `Vec` copy or sort.
-fn be_dim_fingerprint(
-    store: &HashMap<(DimId, i32, i32, i32), VanillaBlockEntity>,
+/// steady world pays one hash pass and no `Vec` copy or sort. The same pass
+/// detects any armed spawner whose delay has expired.
+fn be_dim_tick_state(
+    store: &HashMap<DimBlockPos, VanillaBlockEntity>,
     dim: DimId,
-) -> u128 {
+    players: &[[f64; 3]],
+) -> (u128, bool) {
     let mut lo = 0u64;
     let mut hi = 0u64;
     let mut n = 0u64;
-    for (&(d, x, y, z), entity) in store.iter() {
+    let mut needs_mobs = false;
+    for (&(d, x, y, z), entity) in store {
         if d != dim {
             continue;
         }
         let kind = be_tick_kind(entity);
         if kind == 0 {
             continue;
+        }
+        if !needs_mobs && !players.is_empty() {
+            if let VanillaBlockEntity::MobSpawner(spawner) = entity {
+                needs_mobs = spawner.delay == 0 && spawner_has_player(spawner, (x, y, z), players);
+            }
         }
         n += 1;
         let a = (x as u32 as u64) | ((y as u32 as u64) << 32);
@@ -201,7 +209,21 @@ fn be_dim_fingerprint(
     }
     lo ^= n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     hi ^= n.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-    (u128::from(hi) << 64) | u128::from(lo)
+    ((u128::from(hi) << 64) | u128::from(lo), needs_mobs)
+}
+
+fn spawner_has_player(
+    spawner: &MobSpawnerBlockEntity,
+    (x, y, z): BlockPos,
+    players: &[[f64; 3]],
+) -> bool {
+    players.iter().any(|p| {
+        spawner.player_in_range(
+            p[0] - (f64::from(x) + 0.5),
+            p[1] - (f64::from(y) + 0.5),
+            p[2] - (f64::from(z) + 0.5),
+        )
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3062,6 +3084,21 @@ pub(crate) enum WorldBlockEntityInteraction {
     CrafterPulse,
 }
 
+fn lock_world_block_entities(
+) -> std::sync::MutexGuard<'static, HashMap<DimBlockPos, VanillaBlockEntity>> {
+    world_block_entity_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn vanilla_id_path(id: &str) -> &str {
+    id.strip_prefix("minecraft:").unwrap_or(id)
+}
+
+fn pot_stack_max(item: &str) -> u8 {
+    name_to_item(item).map_or(64, |id| item_stack_max(id, &Vec::new()).clamp(1, 64) as u8)
+}
+
 /// Insert/replace a live payload at the corresponding dimension and block.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn register_world_block_entity(
@@ -3069,10 +3106,7 @@ pub(crate) fn register_world_block_entity(
     pos: BlockPos,
     entity: VanillaBlockEntity,
 ) -> Option<VanillaBlockEntity> {
-    world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((dim, pos.0, pos.1, pos.2), entity)
+    lock_world_block_entities().insert((dim, pos.0, pos.1, pos.2), entity)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3080,19 +3114,14 @@ pub(crate) fn remove_world_block_entity(
     dim: DimId,
     pos: BlockPos,
 ) -> Option<VanillaBlockEntity> {
-    world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(dim, pos.0, pos.1, pos.2))
+    lock_world_block_entities().remove(&(dim, pos.0, pos.1, pos.2))
 }
 
 /// Read the vanilla comparator output of a stored block entity. Families that
 /// have no analog output report 0, while absent positions return None.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
-    let store = world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let store = lock_world_block_entities();
     let Some(be) = store.get(&(dim, pos.0, pos.1, pos.2)) else {
         // Analog-output blocks without a block-entity record read their level
         // or charge straight from the block state (vanilla
@@ -3145,10 +3174,7 @@ pub(crate) fn comparator_signal_at_be(dim: DimId, pos: BlockPos) -> Option<u8> {
         VanillaBlockEntity::Lectern(be) => be.comparator_signal(),
         VanillaBlockEntity::ChiseledBookshelf(be) => be.comparator_signal(),
         VanillaBlockEntity::DecoratedPot(be) => {
-            let max_stack = be.item_id.as_deref()
-                .and_then(name_to_item)
-                .map_or(64, |item| item_stack_max(item, &Vec::new()).clamp(1, 64) as u8);
-            be.comparator_signal(max_stack)
+            be.comparator_signal(be.item_id.as_deref().map_or(64, pot_stack_max))
         }
         VanillaBlockEntity::Beacon(_) => 0,
     })
@@ -3167,14 +3193,12 @@ pub(crate) fn interact_world_block_entity(
     actor_item: Option<&str>,
     slot_hint: Option<usize>,
 ) -> Option<WorldBlockEntityInteraction> {
-    let mut store = world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut store = lock_world_block_entities();
     let be = store.get_mut(&(dim, pos.0, pos.1, pos.2))?;
     match be {
         VanillaBlockEntity::Lectern(lectern) => match actor_item {
             Some(book) if lectern.book_item.is_none() && matches!(
-                book.strip_prefix("minecraft:").unwrap_or(book),
+                vanilla_id_path(book),
                 "writable_book" | "written_book"
             ) => {
                 lectern.book_item = Some(book.to_string());
@@ -3199,7 +3223,7 @@ pub(crate) fn interact_world_block_entity(
             let slot = slot_hint?;
             match actor_item {
                 Some(book) if matches!(
-                    book.strip_prefix("minecraft:").unwrap_or(book),
+                    vanilla_id_path(book),
                     "book" | "writable_book" | "written_book" | "enchanted_book"
                 ) => shelf.insert_book(slot, book)
                     .then_some(WorldBlockEntityInteraction::Changed),
@@ -3209,8 +3233,7 @@ pub(crate) fn interact_world_block_entity(
         }
         VanillaBlockEntity::DecoratedPot(pot) => match actor_item {
             Some(item) if !item.is_empty() => {
-                let stack_max = name_to_item(item)
-                    .map_or(64, |id| item_stack_max(id, &Vec::new()).clamp(1, 64) as u8);
+                let stack_max = pot_stack_max(item);
                 if pot.item_id.as_deref().is_some_and(|stored| stored != item)
                     || pot.item_count >= stack_max
                 {
@@ -3237,13 +3260,9 @@ pub(crate) fn interact_world_block_entity(
                 crafter.set_slot_disabled(slot, !crafter.slot_disabled(slot))
                     .then_some(WorldBlockEntityInteraction::Changed)
             }
-            Some("powered" | "minecraft:powered") => {
-                if crafter.set_powered(true) {
-                    Some(WorldBlockEntityInteraction::CrafterPulse)
-                } else {
-                    None
-                }
-            }
+            Some("powered" | "minecraft:powered") => crafter
+                .set_powered(true)
+                .then_some(WorldBlockEntityInteraction::CrafterPulse),
             Some("unpowered" | "minecraft:unpowered") => {
                 let was_powered = crafter.triggered;
                 crafter.set_powered(false);
@@ -3252,6 +3271,74 @@ pub(crate) fn interact_world_block_entity(
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn cached_be_tick_positions(
+    store: &HashMap<DimBlockPos, VanillaBlockEntity>,
+    dim: DimId,
+    fingerprint: u128,
+    counts: &BeDimCounts,
+) -> Arc<Vec<BlockPos>> {
+    let mut cache = be_tick_positions().lock().unwrap_or_else(|e| e.into_inner());
+    match cache.get(&dim) {
+        Some(entry) if entry.fingerprint == fingerprint => {
+            counts.hits.fetch_add(1, Ordering::Relaxed);
+            entry.positions.clone()
+        }
+        _ => {
+            counts.rebuilds.fetch_add(1, Ordering::Relaxed);
+            let mut positions: Vec<(i32, i32, i32)> = store
+                .iter()
+                .filter(|(&(d, _, _, _), entity)| d == dim && be_tick_kind(entity) != 0)
+                .map(|(&(_, x, y, z), _)| (x, y, z))
+                .collect();
+            // HashMap iteration order is randomized. Sort positions for
+            // deterministic spawner randomness and event order across
+            // runs and insertion histories — only on rebuild now.
+            positions.sort_unstable();
+            let positions = Arc::new(positions);
+            cache.insert(
+                dim,
+                BeTickPositions {
+                    fingerprint,
+                    positions: positions.clone(),
+                },
+            );
+            positions
+        }
+    }
+}
+
+fn tick_campfire(
+    fire: &mut CampfireBlockEntity,
+    lit: bool,
+    pos: BlockPos,
+    events: &mut Vec<WorldBlockEntityEvent>,
+) {
+    let mut timers = [(0, 0); 4];
+    if lit {
+        for (timer, slot) in timers.iter_mut().zip(&fire.slots) {
+            if let Some((_, elapsed, total)) = slot {
+                *timer = (*elapsed, *total);
+            }
+        }
+    } else if fire.slots.iter().flatten().all(|(_, elapsed, _)| *elapsed == 0) {
+        return;
+    }
+    for (slot, input) in fire.tick(lit) {
+        let cooked = BlockEntityItem::new(&input, 1).and_then(|item| live_campfire_result(&item));
+        if let Some(item) = cooked {
+            events.push(WorldBlockEntityEvent::Cooked {
+                pos,
+                slot,
+                item: item.id.to_string(),
+            });
+        } else {
+            // A completed slot can hold a saved item with no current recipe.
+            let (elapsed, total) = timers[slot];
+            fire.slots[slot] = Some((input, elapsed, total));
+        }
     }
 }
 
@@ -3265,69 +3352,38 @@ pub(crate) fn tick_world_block_entities(
     nearby_players: &[[f64; 3]],
     rand_seed: u64,
 ) -> Vec<WorldBlockEntityEvent> {
-    // The mob snapshot and crafter re-poll list ride the bounded
-    // thread-local scratch: taken out for the pass so the `RefCell` is never
-    // held across the registry locks below, and returned bounded for the
-    // next tick.
-    let mut scratch =
-        BE_TICK_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
-    scratch.live_mobs.clear();
-    scratch.crafter_power.clear();
-    // Snapshot live entities before locking the block-entity store. This also
-    // avoids acquiring the mobs registry while the block-entity lock is held.
-    scratch.live_mobs.extend(
-        mobs()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|mob| mob.dim == dim)
-            .map(|mob| {
-                let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                (mob.etype, [pos.0, pos.1, pos.2])
-            }),
-    );
-    let reg = breg();
-    let mut store = world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    // Cached sorted positions: one fingerprint pass over the dimension's
-    // ticking entries decides whether the sorted list is still exact. A hit
-    // costs no `Vec` copy and no sort; a miss rebuilds once, still under the
-    // store lock so the fingerprint and the list can never disagree.
-    let fingerprint = be_dim_fingerprint(&store, dim);
+    let mut store = lock_world_block_entities();
+    if store.is_empty() {
+        return Vec::new();
+    }
+    let (fingerprint, needs_mobs) = be_dim_tick_state(&store, dim, nearby_players);
     let counts = be_counts_for(dim);
-    let positions = {
-        let mut cache = be_tick_positions()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        match cache.get(&dim) {
-            Some(entry) if entry.fingerprint == fingerprint => {
-                counts.hits.fetch_add(1, Ordering::Relaxed);
-                entry.positions.clone()
-            }
-            _ => {
-                counts.rebuilds.fetch_add(1, Ordering::Relaxed);
-                let mut positions: Vec<(i32, i32, i32)> = store
-                    .iter()
-                    .filter(|(&(d, _, _, _), entity)| d == dim && be_tick_kind(entity) != 0)
-                    .map(|(&(_, x, y, z), _)| (x, y, z))
-                    .collect();
-                // HashMap iteration order is randomized. Sort positions for
-                // deterministic spawner randomness and event order across
-                // runs and insertion histories — only on rebuild now.
-                positions.sort_unstable();
-                let positions = Arc::new(positions);
-                cache.insert(
-                    dim,
-                    BeTickPositions {
-                        fingerprint,
-                        positions: positions.clone(),
-                    },
-                );
-                positions
-            }
+    let mut positions = cached_be_tick_positions(&store, dim, fingerprint, &counts);
+    if positions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scratch = BE_TICK_SCRATCH.with(|cell| cell.take());
+    if needs_mobs {
+        // Take the mob snapshot without holding the block-entity registry.
+        drop(store);
+        scratch.live_mobs.extend(
+            mobs().lock().unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|mob| mob.dim == dim)
+                .map(|mob| {
+                    let pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (mob.etype, [pos.0, pos.1, pos.2])
+                }),
+        );
+        store = lock_world_block_entities();
+        // Save restoration or a direct write can change the registry while unlocked.
+        let current = be_dim_tick_state(&store, dim, &[]).0;
+        if current != fingerprint {
+            positions = cached_be_tick_positions(&store, dim, current, &counts);
         }
-    };
+    }
+    let reg = breg();
     let mut rng = WorldMechanismLcg::new(rand_seed ^ world_tick);
     let mut events = Vec::new();
     // Crafters whose last applied powered state the redstone pass may since
@@ -3346,9 +3402,10 @@ pub(crate) fn tick_world_block_entities(
             // `brewing_inert` is exact: `tick` would return `Idle` without
             // touching a field.
             VanillaBlockEntity::BrewingStand(stand) => brewing_inert(stand),
-            // The arm only bumps `ticks_since_song_started` when a record
-            // is loaded.
-            VanillaBlockEntity::Jukebox(jukebox) => jukebox.record_item.is_none(),
+            VanillaBlockEntity::MobSpawner(_) => nearby_players.is_empty(),
+            VanillaBlockEntity::Jukebox(jukebox) => {
+                jukebox.record_item.is_none() || jukebox.ticks_since_song_started == u64::MAX
+            }
             // The beacon only acts on its 80-tick pulse.
             VanillaBlockEntity::Beacon(_) => !world_tick.is_multiple_of(80),
             _ => false,
@@ -3363,37 +3420,7 @@ pub(crate) fn tick_world_block_entities(
                 let lit = reg.is_some_and(|reg| {
                     reg.get_prop(block_at_dim(dim, x, y, z), "lit").as_deref() == Some("true")
                 });
-                // A saved, unknown input must survive a completed timer. The
-                // P5e tick removes completed slots before recipe resolution.
-                let unsupported: Vec<_> = if lit {
-                    fire.slots.iter().enumerate().filter_map(|(slot, entry)| {
-                        let (id, elapsed, total) = entry.as_ref()?;
-                        if elapsed.saturating_add(1) < *total
-                            || BlockEntityItem::new(id, 1)
-                                .and_then(|item| live_campfire_result(&item))
-                                .is_some()
-                        {
-                            return None;
-                        }
-                        Some((slot, (id.clone(), *elapsed, *total)))
-                    }).collect()
-                } else {
-                    Vec::new()
-                };
-                for (slot, input) in fire.tick(lit) {
-                    let cooked = BlockEntityItem::new(&input, 1)
-                        .and_then(|item| live_campfire_result(&item));
-                    if let Some(item) = cooked {
-                        events.push(WorldBlockEntityEvent::Cooked {
-                            pos,
-                            slot,
-                            item: item.id.to_string(),
-                        });
-                    }
-                }
-                for (slot, input) in unsupported {
-                    fire.slots[slot] = Some(input);
-                }
+                tick_campfire(fire, lit, pos, &mut events);
             }
             VanillaBlockEntity::BrewingStand(stand) => {
                 if let BrewingTick::Completed { ejected_glass_bottle } = stand.tick() {
@@ -3401,13 +3428,10 @@ pub(crate) fn tick_world_block_entities(
                 }
             }
             VanillaBlockEntity::MobSpawner(spawner) => {
-                let center = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
-                let armed = nearby_players.iter().any(|p| {
-                    spawner.player_in_range(p[0] - center[0], p[1] - center[1], p[2] - center[2])
-                });
-                if !armed || !spawner.delay_tick() {
+                if !spawner_has_player(spawner, pos, nearby_players) || !spawner.delay_tick() {
                     continue;
                 }
+                let center = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
                 let range = f64::from(spawner.spawn_range);
                 let kind = entity_spec_by_name(&spawner.entity_id)
                     .filter(|spec| spec.max_health > 0.0)
@@ -3441,14 +3465,12 @@ pub(crate) fn tick_world_block_entities(
                 spawner.reset_delay(random);
             }
             VanillaBlockEntity::Jukebox(jukebox) => {
-                if jukebox.record_item.is_some() {
-                    jukebox.ticks_since_song_started = jukebox.ticks_since_song_started.saturating_add(1);
-                }
+                jukebox.ticks_since_song_started += 1;
             }
             VanillaBlockEntity::Crafter(crafter) => {
                 scratch.crafter_power.push((pos, crafter.triggered));
             }
-            VanillaBlockEntity::Beacon(beacon) if world_tick.is_multiple_of(80) => {
+            VanillaBlockEntity::Beacon(beacon) => {
                 let Some(reg) = reg else { continue };
                 beacon.levels = beacon_pyramid_levels(|dx, dy, dz| {
                     let state = block_at_dim(dim, x + dx, y + dy, z + dz);
@@ -3457,7 +3479,7 @@ pub(crate) fn tick_world_block_entities(
                         "minecraft:diamond_block" | "minecraft:emerald_block" |
                         "minecraft:netherite_block")
                 });
-                if beacon.levels == 0 || beacon.primary_effect.is_none() {
+                if beacon.levels == 0 || beacon.primary_effect.is_none() || nearby_players.is_empty() {
                     continue;
                 }
                 let clear = (y + 1..dim.min_y() + dim.height()).all(|above| {
@@ -3509,6 +3531,8 @@ pub(crate) fn tick_world_block_entities(
             interact_world_block_entity(dim, pos, Some(action), None);
         }
     }
+    scratch.live_mobs.clear();
+    scratch.crafter_power.clear();
     bound_vec_scratch(&mut scratch.live_mobs);
     bound_vec_scratch(&mut scratch.crafter_power);
     BE_TICK_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
@@ -3559,6 +3583,26 @@ mod w_be_integration_tests {
             remove(dim, at);
             assert_eq!(comparator_signal_at_be(dim, at), None);
         }
+    }
+
+    #[test]
+    fn w_be_campfire_finishes_recipes_and_preserves_unsupported_timers() {
+        let unsupported = ("minecraft:diamond".into(), u16::MAX, 1);
+        let mut fire = CampfireBlockEntity {
+            slots: [Some(("minecraft:beef".into(), 0, 1)), Some(unsupported.clone()), None, None],
+        };
+        let pos = (0, 64, 0);
+        let mut events = Vec::new();
+        tick_campfire(&mut fire, true, pos, &mut events);
+        assert_eq!(
+            events,
+            [WorldBlockEntityEvent::Cooked {
+                pos,
+                slot: 0,
+                item: "minecraft:cooked_beef".into(),
+            }]
+        );
+        assert_eq!(fire.slots, [None, Some(unsupported), None, None]);
     }
 
     #[test]
@@ -3831,7 +3875,8 @@ mod w_be_integration_tests {
             )
         };
 
-        // First tick builds the (empty) entry; the second is a pure hit.
+        // A dimension with only a lectern has an empty ticking set.
+        place(dim, pos, VanillaBlockEntity::Lectern(LecternBlockEntity::default()));
         tick_world_block_entities(dim, 0, &[], 7);
         let (r0, h0) = rebuild_hits(&counts());
         tick_world_block_entities(dim, 1, &[], 7);
@@ -3840,7 +3885,7 @@ mod w_be_integration_tests {
         assert_eq!(h1, h0 + 1, "unchanged registry must hit the cache");
 
         // A non-ticking entity does not change the ticking set: still a hit.
-        place(dim, pos, VanillaBlockEntity::Lectern(LecternBlockEntity::default()));
+        place(dim, (pos.0 - 1, pos.1, pos.2), VanillaBlockEntity::Lectern(LecternBlockEntity::default()));
         tick_world_block_entities(dim, 2, &[], 7);
         assert_eq!(rebuild_hits(&counts()).0, r0, "a lectern must not invalidate the tick list");
 
@@ -3863,6 +3908,7 @@ mod w_be_integration_tests {
         tick_world_block_entities(dim, 5, &[], 7);
         assert_eq!(rebuild_hits(&counts()).0, r0 + 3, "kind swap must invalidate the cache");
         remove(dim, pos);
+        remove(dim, (pos.0 - 1, pos.1, pos.2));
         tick_world_block_entities(dim, 6, &[], 7);
     }
 
@@ -4470,8 +4516,7 @@ fn bamboo_random_tick(
                 "leaves",
                 BambooLeaves::Small.prop(),
             );
-            set_block_dim(dim, x, y, z, stalk);
-            note_block_update_dim(dim, x, y, z, stalk);
+            set_and_note_world_block(dim, (x, y, z), stalk);
         }
         BambooTickResult::GrowStalk => {
             let top = reg.with_prop(
@@ -4647,21 +4692,9 @@ fn wbe_default_for(name: &str) -> Option<VanillaBlockEntity> {
     })
 }
 
-/// A stable tag for the [`VanillaBlockEntity`] variant, so a stored record
-/// can be compared against the family of the block still occupying its cell.
-#[cfg_attr(not(test), allow(dead_code))]
-fn wbe_family(entity: &VanillaBlockEntity) -> u8 {
-    match entity {
-        VanillaBlockEntity::BrewingStand(_) => 1,
-        VanillaBlockEntity::Crafter(_) => 2,
-        VanillaBlockEntity::Campfire(_) => 3,
-        VanillaBlockEntity::Jukebox(_) => 4,
-        VanillaBlockEntity::MobSpawner(_) => 5,
-        VanillaBlockEntity::Lectern(_) => 6,
-        VanillaBlockEntity::ChiseledBookshelf(_) => 7,
-        VanillaBlockEntity::DecoratedPot(_) => 8,
-        VanillaBlockEntity::Beacon(_) => 9,
-    }
+fn set_and_note_world_block(dim: DimId, (x, y, z): BlockPos, state: u32) {
+    set_block_dim(dim, x, y, z, state);
+    note_block_update_dim(dim, x, y, z, state);
 }
 
 /// `LayeredCauldronBlock.randomTick`: under open sky during rain or snow an
@@ -4695,8 +4728,7 @@ fn cauldron_random_tick(
         return;
     }
     if let Some(next) = filled.to_state(reg) {
-        set_block_dim(dim, x, y, z, next);
-        note_block_update_dim(dim, x, y, z, next);
+        set_and_note_world_block(dim, (x, y, z), next);
     }
 }
 
@@ -4748,8 +4780,7 @@ fn dripstone_random_tick(
         return;
     }
     if let Some(next) = filled.to_state(reg) {
-        set_block_dim(dim, x, cauldron_y, z, next);
-        note_block_update_dim(dim, x, cauldron_y, z, next);
+        set_and_note_world_block(dim, (x, cauldron_y, z), next);
     }
 }
 
@@ -4776,8 +4807,7 @@ fn composter_random_tick(
         return;
     }
     let next = reg.with_prop(st, "level", &matured.to_string());
-    set_block_dim(dim, x, y, z, next);
-    note_block_update_dim(dim, x, y, z, next);
+    set_and_note_world_block(dim, (x, y, z), next);
 }
 
 /// `SpongeBlock` in an ultrawarm dimension: a wet sponge dries out. Vanilla
@@ -4796,8 +4826,7 @@ fn wet_sponge_random_tick(
         return;
     }
     let dry = reg.state_of("minecraft:sponge", None);
-    set_block_dim(dim, x, y, z, dry);
-    note_block_update_dim(dim, x, y, z, dry);
+    set_and_note_world_block(dim, (x, y, z), dry);
 }
 
 /// Lazy registry maintenance for the cell a random tick landed on: create the
@@ -4809,20 +4838,19 @@ fn wbe_reconcile_at(
     pos: BlockPos,
     st: u32,
 ) {
-    let name = reg.name_of(st);
-    let held = world_block_entity_registry()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&(dim, pos.0, pos.1, pos.2))
-        .map(wbe_family);
-    match (held, wbe_default_for(name)) {
-        (None, Some(default)) => {
-            register_world_block_entity(dim, pos, default);
+    use std::collections::hash_map::Entry;
+    use std::mem::discriminant;
+
+    let mut store = lock_world_block_entities();
+    let key = (dim, pos.0, pos.1, pos.2);
+    match (store.entry(key), wbe_default_for(reg.name_of(st))) {
+        (Entry::Vacant(entry), Some(default)) => {
+            entry.insert(default);
         }
-        (Some(family), default)
-            if default.as_ref().is_none_or(|entity| wbe_family(entity) != family) =>
+        (Entry::Occupied(entry), default)
+            if default.as_ref().is_none_or(|entity| discriminant(entity) != discriminant(entry.get())) =>
         {
-            remove_world_block_entity(dim, pos);
+            entry.remove();
         }
         _ => {}
     }
@@ -4970,10 +4998,10 @@ const TRUNCATED_ADVANCEMENT_CRITERIA: &[&str] = &["consume_i", "player_gene", "t
 /// 1.21.1 advancement trigger types the catalogue references.
 #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn advancement_trigger_supported(trigger: &str) -> bool {
-    let bare = trigger.strip_prefix("minecraft:").unwrap_or(trigger);
+    let bare = vanilla_id_path(trigger);
     VANILLA_ADVANCEMENT_TRIGGERS
         .iter()
-        .any(|known| known.strip_prefix("minecraft:").unwrap_or(known) == bare)
+        .any(|known| vanilla_id_path(known) == bare)
 }
 
 // ---- Advancement rewards ----
@@ -7227,6 +7255,77 @@ mod world_mechanisms_tests {
     }
 }
 
+#[cfg(all(test, megu_vanilla_data))]
+fn world_mechanism_test_client(name: &str, eid: i32, uuid: [u8; 16], game_mode: u8) -> Arc<Client> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    let _accepted = listener.accept().unwrap();
+    Arc::new(Client {
+        eid,
+        uuid,
+        name: name.to_string(),
+        player_attack_damage_id: None,
+        pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
+        teleport: Mutex::new(Default::default()),
+        hp: Mutex::new(20.0),
+        sock: Mutex::new(stream),
+        inv: Mutex::new(HashMap::new()),
+        cursor: Mutex::new((0, 0, Vec::new())),
+        drag: Mutex::new((0, Vec::new())),
+        open_chest: Mutex::new(None),
+        chest_sync: Mutex::new(None),
+        open_furnace: Mutex::new(None),
+        craft: Mutex::new(HashMap::new()),
+        craft9: Mutex::new(HashMap::new()),
+        open_table: Mutex::new(false),
+        open_merchant: Mutex::new(false),
+        trade_sel: Mutex::new(0),
+        merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
+        bow_draw: Mutex::new(None),
+        dig: Mutex::new(None),
+        eat_start: Mutex::new(None),
+        blocking: Mutex::new(false),
+        sprinting: Mutex::new(false),
+        sneaking: Mutex::new(false),
+        last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        fall_fly: Mutex::new(false),
+        invulnerable: Mutex::new(0),
+        last_hurt: Mutex::new(0.0),
+        shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        absorb: Mutex::new(0.0),
+        pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
+        xp: Mutex::new(0),
+        skin: Mutex::new(None),
+        seen: Mutex::new(HashSet::new()),
+        chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
+        chunk_ack: Mutex::new(ChunkFeedback::new(1)),
+        gen_sources: Mutex::new(GenSources::default()),
+        gm: Mutex::new(game_mode),
+        fall_from: Mutex::new(65.0),
+        food: Mutex::new(20),
+        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+        armor_pts: Mutex::new(0),
+        sat: Mutex::new(5.0),
+        walk_acc: Mutex::new(0.0),
+        lastp: Mutex::new((0.5, 65.0, 0.5)),
+        spawn_pt: Mutex::new(None),
+        dim: Mutex::new(DimId::Overworld),
+        spawn_dim: Mutex::new(DimId::Overworld),
+        view: Mutex::new(2),
+        in_portal: Mutex::new(false),
+        portal_at: Mutex::new(None),
+        held: Mutex::new(0),
+        effs: Mutex::new(Vec::new()),
+        lod_v1_enabled: AtomicBool::new(false),
+        underground_revealed: AtomicBool::new(false),
+        sleeping: Mutex::new(None),
+        inv_state_id: AtomicI32::new(0),
+        generic_kill_pending: AtomicBool::new(false),
+        use_on_resend: Mutex::new(None),
+    })
+}
+
 /// P1-A live wiring tests: production `on_random_tick` and the live gamerule
 /// atomics, not just the pure evaluators.
 #[cfg(all(test, megu_vanilla_data))]
@@ -7598,76 +7697,8 @@ mod p1a_random_tick_and_gamerule_tests {
             *hurt.hp.lock().unwrap_or_else(|e| e.into_inner())
         );
 
-        // fireDamage + drowningDamage: the live mob tick's environmental arms
-        // honor them. This is the same dummy-client fixture entity_fluid's
-        // mob-tick test uses.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stream = std::net::TcpStream::connect(addr).unwrap();
-        let _accepted = listener.accept().unwrap();
-        let dummy_client = Arc::new(Client {
-            eid: 9999,
-            uuid: [9u8; 16],
-            name: "gamerule_tester".to_string(),
-            player_attack_damage_id: None,
-            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
-            teleport: Mutex::new(Default::default()),
-            hp: Mutex::new(20.0),
-            sock: Mutex::new(stream),
-            inv: Mutex::new(HashMap::new()),
-            cursor: Mutex::new((0, 0, Vec::new())),
-            drag: Mutex::new((0, Vec::new())),
-            open_chest: Mutex::new(None),
-            chest_sync: Mutex::new(None),
-            open_furnace: Mutex::new(None),
-            craft: Mutex::new(HashMap::new()),
-            craft9: Mutex::new(HashMap::new()),
-            open_table: Mutex::new(false),
-            open_merchant: Mutex::new(false),
-            trade_sel: Mutex::new(0),
-            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
-            bow_draw: Mutex::new(None),
-            dig: Mutex::new(None),
-            eat_start: Mutex::new(None),
-            blocking: Mutex::new(false),
-            sprinting: Mutex::new(false),
-            sneaking: Mutex::new(false),
-            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            fall_fly: Mutex::new(false),
-            invulnerable: Mutex::new(0),
-            last_hurt: Mutex::new(0.0),
-            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            absorb: Mutex::new(0.0),
-            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            xp: Mutex::new(0),
-            skin: Mutex::new(None),
-            seen: Mutex::new(HashSet::new()),
-            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
-            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
-            gen_sources: Mutex::new(GenSources::default()),
-            gm: Mutex::new(1),
-            fall_from: Mutex::new(65.0),
-            food: Mutex::new(20),
-            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-            armor_pts: Mutex::new(0),
-            sat: Mutex::new(5.0),
-            walk_acc: Mutex::new(0.0),
-            lastp: Mutex::new((0.5, 65.0, 0.5)),
-            spawn_pt: Mutex::new(None),
-            dim: Mutex::new(DimId::Overworld),
-            spawn_dim: Mutex::new(DimId::Overworld),
-            view: Mutex::new(2),
-            in_portal: Mutex::new(false),
-            portal_at: Mutex::new(None),
-            held: Mutex::new(0),
-            effs: Mutex::new(Vec::new()),
-            lod_v1_enabled: AtomicBool::new(false),
-            underground_revealed: AtomicBool::new(false),
-            sleeping: Mutex::new(None),
-            inv_state_id: AtomicI32::new(0),
-            generic_kill_pending: AtomicBool::new(false),
-            use_on_resend: Mutex::new(None),
-        });
+        // Exercise the live mob tick's fire and drowning damage.
+        let dummy_client = world_mechanism_test_client("gamerule_tester", 9999, [9u8; 16], 1);
         let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
         let old_mobs = std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner()));
         let old_tick = TICK.load(Ordering::Relaxed);
@@ -7753,6 +7784,16 @@ mod p1a_random_tick_and_gamerule_tests {
         );
         assert_eq!(name(0, 150, 4), "minecraft:stone");
 
+        check_source_conversion_rules(reg, &mut cells, &mut sink, gamerule);
+        drop(rules);
+    }
+
+    fn check_source_conversion_rules(
+        reg: &crate::block_registry::BReg,
+        cells: &mut Cells,
+        sink: &mut Option<&Client>,
+        gamerule: impl Fn(&mut Option<&Client>, &str) -> String,
+    ) {
         // Source conversion: a flowing cell flanked by two same-kind sources
         // over solid ground converts to a source only while the rule is on.
         // Ticking the cell itself runs `FlowingFluid.getNewLiquid`, the exact
@@ -7787,8 +7828,8 @@ mod p1a_random_tick_and_gamerule_tests {
         cells.set(53, 150, 0, 81);
         cells.set(53, 151, 0, 0);
         cells.set(54, 150, 0, 80);
-        gamerule(&mut sink, "waterSourceConversion false");
-        run_fluid(&mut cells, (53, 150, 0), flowing_fluid::Kind::Water);
+        gamerule(sink, "waterSourceConversion false");
+        run_fluid(cells, (53, 150, 0), flowing_fluid::Kind::Water);
         assert_ne!(
             block_at(53, 150, 0),
             80,
@@ -7797,8 +7838,8 @@ mod p1a_random_tick_and_gamerule_tests {
         cells.set(52, 150, 0, 80);
         cells.set(53, 150, 0, 81);
         cells.set(54, 150, 0, 80);
-        gamerule(&mut sink, "waterSourceConversion true");
-        run_fluid(&mut cells, (53, 150, 0), flowing_fluid::Kind::Water);
+        gamerule(sink, "waterSourceConversion true");
+        run_fluid(cells, (53, 150, 0), flowing_fluid::Kind::Water);
         assert_eq!(
             block_at(53, 150, 0),
             80,
@@ -7810,7 +7851,7 @@ mod p1a_random_tick_and_gamerule_tests {
         cells.set(59, 150, 0, 100);
         cells.set(59, 151, 0, 0);
         cells.set(60, 150, 0, 96);
-        run_fluid(&mut cells, (59, 150, 0), flowing_fluid::Kind::Lava);
+        run_fluid(cells, (59, 150, 0), flowing_fluid::Kind::Lava);
         assert_ne!(
             block_at(59, 150, 0),
             96,
@@ -7819,15 +7860,13 @@ mod p1a_random_tick_and_gamerule_tests {
         cells.set(58, 150, 0, 96);
         cells.set(59, 150, 0, 100);
         cells.set(60, 150, 0, 96);
-        gamerule(&mut sink, "lavaSourceConversion true");
-        run_fluid(&mut cells, (59, 150, 0), flowing_fluid::Kind::Lava);
+        gamerule(sink, "lavaSourceConversion true");
+        run_fluid(cells, (59, 150, 0), flowing_fluid::Kind::Lava);
         assert_eq!(
             block_at(59, 150, 0),
             96,
             "lavaSourceConversion=true must convert the gap to a source"
         );
-
-        drop(rules);
     }
 
     #[test]
@@ -7950,78 +7989,6 @@ mod p2_parity_world_tests {
 
     fn prop(reg: &crate::block_registry::BReg, st: u32, key: &str) -> Option<String> {
         reg.get_prop(st, key)
-    }
-
-    /// The dummy-client fixture the live tests use elsewhere, trimmed to what
-    /// the reward and gamerule paths touch.
-    fn test_client(name: &str, eid: i32, uuid: [u8; 16]) -> Arc<Client> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let stream = std::net::TcpStream::connect(addr).unwrap();
-        let _accepted = listener.accept().unwrap();
-        Arc::new(Client {
-            eid,
-            uuid,
-            name: name.to_string(),
-            player_attack_damage_id: None,
-            pos: Mutex::new((0.5, 65.0, 0.5, 0.0, 0.0, true)),
-            teleport: Mutex::new(Default::default()),
-            hp: Mutex::new(20.0),
-            sock: Mutex::new(stream),
-            inv: Mutex::new(HashMap::new()),
-            cursor: Mutex::new((0, 0, Vec::new())),
-            drag: Mutex::new((0, Vec::new())),
-            open_chest: Mutex::new(None),
-            chest_sync: Mutex::new(None),
-            open_furnace: Mutex::new(None),
-            craft: Mutex::new(HashMap::new()),
-            craft9: Mutex::new(HashMap::new()),
-            open_table: Mutex::new(false),
-            open_merchant: Mutex::new(false),
-            trade_sel: Mutex::new(0),
-            merchant_in: Mutex::new([(0, 0, Vec::new()), (0, 0, Vec::new())]),
-            bow_draw: Mutex::new(None),
-            dig: Mutex::new(None),
-            eat_start: Mutex::new(None),
-            blocking: Mutex::new(false),
-            sprinting: Mutex::new(false),
-            sneaking: Mutex::new(false),
-            last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            fall_fly: Mutex::new(false),
-            invulnerable: Mutex::new(0),
-            last_hurt: Mutex::new(0.0),
-            shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            absorb: Mutex::new(0.0),
-            pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-            xp: Mutex::new(0),
-            skin: Mutex::new(None),
-            seen: Mutex::new(HashSet::new()),
-            chunks: Mutex::new(HashSet::from([(-1, -1), (-1, 0), (0, -1), (0, 0)])),
-            chunk_ack: Mutex::new(ChunkFeedback::new(1)),
-            gen_sources: Mutex::new(GenSources::default()),
-            gm: Mutex::new(0),
-            fall_from: Mutex::new(65.0),
-            food: Mutex::new(20),
-            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-            armor_pts: Mutex::new(0),
-            sat: Mutex::new(5.0),
-            walk_acc: Mutex::new(0.0),
-            lastp: Mutex::new((0.5, 65.0, 0.5)),
-            spawn_pt: Mutex::new(None),
-            dim: Mutex::new(DimId::Overworld),
-            spawn_dim: Mutex::new(DimId::Overworld),
-            view: Mutex::new(2),
-            in_portal: Mutex::new(false),
-            portal_at: Mutex::new(None),
-            held: Mutex::new(0),
-            effs: Mutex::new(Vec::new()),
-            lod_v1_enabled: AtomicBool::new(false),
-            underground_revealed: AtomicBool::new(false),
-            sleeping: Mutex::new(None),
-            inv_state_id: AtomicI32::new(0),
-            generic_kill_pending: AtomicBool::new(false),
-            use_on_resend: Mutex::new(None),
-        })
     }
 
     #[test]
@@ -8381,7 +8348,7 @@ mod p2_parity_world_tests {
     fn p2_parity_advancement_rewards_execute_on_the_completion_edge() {
         crate::test_support::require_vanilla_data();
         let _guard = world_guard();
-        let client = test_client("reward_tester", 9777, [7u8; 16]);
+        let client = world_mechanism_test_client("reward_tester", 9777, [7u8; 16], 0);
         let uuid = client.uuid;
         {
             clients().lock().unwrap_or_else(|e| e.into_inner()).push(client);
@@ -8444,14 +8411,8 @@ mod p2_parity_world_tests {
 
 // ------------------------------------------------- O(1) sleeping hopper engine
 //
-// PERF-1: the sorting-system lag fix. A hopper whose pull source, push target,
-// own inventory and suction cell are all unchanged since its last empty attempt
-// performs zero slot reads — it sleeps on four revision counters instead of
-// re-scanning every tick. The world bumps a revision through
-// `notify_container_changed` / `notify_item_entered_cell` on any mutation,
-// which wakes only the hoppers watching that position, so a settled array
-// idles at O(1) per hopper while transfers keep vanilla's exact 8-tick
-// cadence and push-then-pull order.
+// Inventory and suction changes wake the hoppers that can see them.
+// A settled array has no awake positions to visit.
 
 /// Vanilla `HopperBlockEntity.setCooldown(8)`: one item per eight ticks.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -8477,92 +8438,36 @@ enum HopperFacing {
 #[cfg_attr(not(test), allow(dead_code))]
 impl HopperFacing {
     /// Unit vector from the hopper toward its push target.
-    fn offset(self) -> (i32, i32, i32) {
+    fn offset(self) -> BlockPos {
+        let [down, _, north, south, west, east] = LEAF_NEIGHBORS;
         match self {
-            Self::Down => (0, -1, 0),
-            Self::North => (0, 0, -1),
-            Self::South => (0, 0, 1),
-            Self::West => (-1, 0, 0),
-            Self::East => (1, 0, 0),
+            Self::Down => down,
+            Self::North => north,
+            Self::South => south,
+            Self::West => west,
+            Self::East => east,
         }
     }
 }
 
-/// Monotonic per-position mutation counters — the whole "has anything changed?"
-/// question a sleeping hopper asks. Every slot write to a container, every
-/// container removal, and every dropped item that lands in a hopper's suction
-/// cell bumps one counter; a sleeping hopper re-reads its four watched counters
-/// (never the slots behind them) to learn whether a rescan can change anything.
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Default)]
-struct ContainerRevisionTracker {
-    /// `(dim, x, y, z) -> u64` for block-entity inventories, including the
-    /// hoppers' own five slots.
-    containers: HashMap<DimBlockPos, u64>,
-    /// `(dim, x, y, z) -> u64` keyed by the *hopper's* position — the cell an
-    /// item entity enters is the block space above that hopper, but keying the
-    /// cell by the hopper keeps it distinct from the container that may also
-    /// sit there.
-    suction: HashMap<DimBlockPos, u64>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-impl ContainerRevisionTracker {
-    fn revision(&self, pos: DimBlockPos) -> u64 {
-        self.containers.get(&pos).copied().unwrap_or(0)
-    }
-
-    fn bump(&mut self, pos: DimBlockPos) -> u64 {
-        let entry = self.containers.entry(pos).or_insert(0);
-        *entry += 1;
-        *entry
-    }
-
-    fn suction_revision(&self, hopper: DimBlockPos) -> u64 {
-        self.suction.get(&hopper).copied().unwrap_or(0)
-    }
-
-    fn bump_suction(&mut self, hopper: DimBlockPos) -> u64 {
-        let entry = self.suction.entry(hopper).or_insert(0);
-        *entry += 1;
-        *entry
-    }
-}
-
-/// One tracked hopper. The four `seen_*` fields are the revisions observed
-/// when the last empty-handed attempt put the hopper to sleep; while all four
-/// still match the tracker, a rescan is guaranteed to find exactly what the
-/// last scan found — nothing — so it is skipped outright.
 #[cfg_attr(not(test), allow(dead_code))]
 struct SleepingHopper {
-    pos: DimBlockPos,
     facing: HopperFacing,
     redstone_locked: bool,
     /// Vanilla `cooldownTime`: decremented every tick, attempts run at <= 0,
     /// reset to [`HOPPER_TRANSFER_COOLDOWN`] on a successful transfer.
     cooldown_ticks: i64,
-    sleeping: bool,
-    seen_self_rev: u64,
-    seen_above_rev: u64,
-    seen_target_rev: u64,
-    seen_suction_rev: u64,
     /// The hopper's own five vanilla inventory slots.
     slots: Vec<Option<Stack>>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl SleepingHopper {
-    fn new(pos: DimBlockPos, facing: HopperFacing) -> Self {
+    fn new(facing: HopperFacing) -> Self {
         Self {
-            pos,
             facing,
             redstone_locked: false,
             cooldown_ticks: 0,
-            sleeping: false,
-            seen_self_rev: 0,
-            seen_above_rev: 0,
-            seen_target_rev: 0,
-            seen_suction_rev: 0,
             slots: vec![None; HOPPER_INVENTORY_SIZE],
         }
     }
@@ -8593,12 +8498,11 @@ struct HopperTickStats {
 /// The scheduler. It owns a world image of the inventories it can touch —
 /// hopper slots live on their [`SleepingHopper`], other block containers in
 /// `containers`, and item entities waiting in suction cells in `suction` — so
-/// every mutation funnels through a revision bump and the sleep invariant is
-/// enforced by construction rather than by caller discipline.
+/// every inventory mutation can wake its dependent hoppers here.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct SleepingHopperEngine {
-    revisions: ContainerRevisionTracker,
+    awake: std::collections::BTreeSet<DimBlockPos>,
     hoppers: BTreeMap<DimBlockPos, SleepingHopper>,
     containers: HashMap<DimBlockPos, Vec<Option<Stack>>>,
     /// Item entities resting in each hopper's suction cell, keyed by hopper pos.
@@ -8613,14 +8517,15 @@ impl SleepingHopperEngine {
     /// Place a hopper. It starts awake at cooldown 0: the world around it may
     /// already hold items, which is exactly what the first tick must look at.
     fn place_hopper(&mut self, pos: DimBlockPos, facing: HopperFacing) {
-        self.hoppers.insert(pos, SleepingHopper::new(pos, facing));
-        // The block now holds a (possibly empty) inventory — neighbours that
-        // were sleeping on the old state of this cell get to re-observe it.
+        self.hoppers.insert(pos, SleepingHopper::new(facing));
+        self.awake.insert(pos);
+        // The new inventory also wakes its neighbours.
         self.notify_container_changed(pos);
     }
 
     fn remove_hopper(&mut self, pos: DimBlockPos) -> bool {
         self.suction.remove(&pos);
+        self.awake.remove(&pos);
         let removed = self.hoppers.remove(&pos).is_some();
         if removed {
             // The block changed for neighbours: a hopper above may have been
@@ -8630,29 +8535,23 @@ impl SleepingHopperEngine {
         removed
     }
 
-    fn hopper(&self, pos: DimBlockPos) -> Option<&SleepingHopper> {
-        self.hoppers.get(&pos)
-    }
-
-    /// Install or replace a non-hopper container's slot array. Replacement is
-    /// a mutation: watchers re-observe through the bumped revision.
+    /// Install or replace a non-hopper container's slot array and wake watchers.
     fn set_container(&mut self, pos: DimBlockPos, slots: Vec<Option<Stack>>) {
         self.containers.insert(pos, slots);
         self.notify_container_changed(pos);
     }
 
     fn remove_container(&mut self, pos: DimBlockPos) -> bool {
-        if self.containers.remove(&pos).is_some() {
+        let removed = self.containers.remove(&pos).is_some();
+        if removed {
             self.notify_container_changed(pos);
-            true
-        } else {
-            false
         }
+        removed
     }
 
     /// Write one inventory slot — container or hopper; `mutate_slots`
     /// resolves the store. This is the world's mutation point — every write
-    /// bumps the revision, which is what makes sleeping safe.
+    /// wakes the hoppers that can see this inventory.
     fn set_slot(&mut self, pos: DimBlockPos, index: usize, stack: Option<Stack>) -> bool {
         self.mutate_slots(pos, |slots| {
             let Some(slot) = slots.get_mut(index) else {
@@ -8682,90 +8581,39 @@ impl SleepingHopperEngine {
         self.slots_of(pos).and_then(|slots| slots.get(index)).and_then(Option::as_ref)
     }
 
-    /// `notify_container_changed`: any mutation of the block-entity inventory
-    /// at `pos` — slot writes, removal, or a hopper pushing into it. Bumps the
-    /// revision and wakes only the sleeping hoppers actually watching `pos`:
-    /// the hopper at `pos` itself, the hopper below it (`above == pos`), and
-    /// the hoppers facing it (`target == pos`).
+    /// Inventory changes wake the hopper here, the one pulling from above,
+    /// and adjacent hoppers pushing toward this position.
     fn notify_container_changed(&mut self, pos: DimBlockPos) {
-        self.revisions.bump(pos);
-        // Candidate hopper positions: self, below (pulls from `pos`), and one
-        // per facing that could target `pos`. Verified against the hopper's
-        // real watched set so no unaffected hopper wakes.
-        let (_, x, y, z) = pos;
-        let candidates = [
-            pos,
-            (pos.0, x, y - 1, z),
-            (pos.0, x, y + 1, z),
-            (pos.0, x, y, z - 1),
-            (pos.0, x, y, z + 1),
-            (pos.0, x - 1, y, z),
-            (pos.0, x + 1, y, z),
-        ];
-        for candidate in candidates {
-            let Some(hopper) = self.hoppers.get_mut(&candidate) else {
-                continue;
-            };
-            if hopper.sleeping
-                && (hopper.pos == pos
-                    || SleepingHopper::above(hopper.pos) == pos
-                    || SleepingHopper::target(hopper.pos, hopper.facing) == pos)
-            {
-                hopper.sleeping = false;
+        let (dim, x, y, z) = pos;
+        let neighbors = LEAF_NEIGHBORS.into_iter().map(|(dx, dy, dz)| (dim, x + dx, y + dy, z + dz));
+        for candidate in std::iter::once(pos).chain(neighbors) {
+            if let Some(hopper) = self.hoppers.get(&candidate) {
+                if candidate == pos
+                    || SleepingHopper::above(candidate) == pos
+                    || SleepingHopper::target(candidate, hopper.facing) == pos
+                {
+                    self.awake.insert(candidate);
+                }
             }
         }
     }
 
-    /// `notify_item_entered_cell`: a dropped item landed in `hopper_pos`'s
-    /// suction cell (the block space above it). The stack joins the pending
-    /// list and the hopper wakes to suck it on its next attempt.
+    /// An item entity entering the suction cell wakes its hopper.
     fn notify_item_entered_cell(&mut self, hopper_pos: DimBlockPos, stack: Stack) {
-        self.revisions.bump_suction(hopper_pos);
         self.suction.entry(hopper_pos).or_default().push(stack);
-        if let Some(hopper) = self.hoppers.get_mut(&hopper_pos) {
-            hopper.sleeping = false;
+        if self.hoppers.contains_key(&hopper_pos) {
+            self.awake.insert(hopper_pos);
         }
     }
 
-    /// `set_redstone_locked`: power applied/removed. Unlocking wakes the
-    /// hopper — vanilla's `ENABLED` gate is re-checked every tick, so an
-    /// unpowered-then-powered hopper resumes on the same cadence a vanilla
-    /// hopper would.
+    /// Unlocking wakes the hopper. Powered hoppers still count down.
     fn set_redstone_locked(&mut self, pos: DimBlockPos, locked: bool) {
         if let Some(hopper) = self.hoppers.get_mut(&pos) {
             hopper.redstone_locked = locked;
             if !locked {
-                hopper.sleeping = false;
+                self.awake.insert(pos);
             }
         }
-    }
-
-    /// The watched revisions all still match — a rescan would repeat the last
-    /// (empty) attempt, so the hopper may stay asleep.
-    fn watched_revisions_unchanged(&self, hopper: &SleepingHopper) -> bool {
-        self.revisions.revision(hopper.pos) == hopper.seen_self_rev
-            && self.revisions.revision(SleepingHopper::above(hopper.pos))
-                == hopper.seen_above_rev
-            && self.revisions
-                .revision(SleepingHopper::target(hopper.pos, hopper.facing))
-                == hopper.seen_target_rev
-            && self.revisions.suction_revision(hopper.pos) == hopper.seen_suction_rev
-    }
-
-    /// Record the current watched revisions and enter sleep.
-    fn sleep(&mut self, pos: DimBlockPos) {
-        let Some(hopper) = self.hoppers.get_mut(&pos) else {
-            return;
-        };
-        hopper.seen_self_rev = self.revisions.revision(pos);
-        hopper.seen_above_rev = self
-            .revisions
-            .revision(SleepingHopper::above(pos));
-        hopper.seen_target_rev = self
-            .revisions
-            .revision(SleepingHopper::target(pos, hopper.facing));
-        hopper.seen_suction_rev = self.revisions.suction_revision(pos);
-        hopper.sleeping = true;
     }
 
     /// One item of `stack` into `slots`: merge onto a same-item partial first
@@ -8786,30 +8634,29 @@ impl SleepingHopperEngine {
         false
     }
 
-    /// Slots at `pos` as mutable, plus the bookkeeping a real change owes:
-    /// `f` reports `(result, changed)` and the revision only bumps — waking
-    /// watchers — when something actually moved. A probe that finds no room is
-    /// not a mutation and must not churn the counters hoppers sleep on.
+    /// Resolve the same inventory as `slots_of` and wake watchers after a write.
     fn mutate_slots<R>(
         &mut self,
         pos: DimBlockPos,
         f: impl FnOnce(&mut Vec<Option<Stack>>) -> (R, bool),
     ) -> Option<R> {
-        if let Some(hopper) = self.hoppers.get_mut(&pos) {
-            let (out, changed) = f(&mut hopper.slots);
-            if changed {
-                self.notify_container_changed(pos);
-            }
-            return Some(out);
+        let slots = match self.hoppers.get_mut(&pos) {
+            Some(hopper) => &mut hopper.slots,
+            None => self.containers.get_mut(&pos)?,
+        };
+        let (out, changed) = f(slots);
+        if changed {
+            self.notify_container_changed(pos);
         }
-        if let Some(slots) = self.containers.get_mut(&pos) {
-            let (out, changed) = f(slots);
-            if changed {
-                self.notify_container_changed(pos);
-            }
-            return Some(out);
-        }
-        None
+        Some(out)
+    }
+
+    fn insert_at(&mut self, pos: DimBlockPos, item: i64, comps: &Comps, max: u8) -> bool {
+        self.mutate_slots(pos, |slots| {
+            let inserted = Self::insert_one(slots, item, comps, max);
+            (inserted, inserted)
+        })
+        .unwrap_or(false)
     }
 
     /// Remove one item from slot `index` at `pos` — a prior read found it
@@ -8838,13 +8685,7 @@ impl SleepingHopperEngine {
                 continue;
             };
             let max = item_stack_max(item, &comps).clamp(1, 255) as u8;
-            let pushed = self
-                .mutate_slots(target, |slots| {
-                    let inserted = Self::insert_one(slots, item, &comps, max);
-                    (inserted, inserted)
-                })
-                .unwrap_or(false);
-            if pushed {
+            if self.insert_at(target, item, &comps, max) {
                 self.take_one(pos, index);
                 return true;
             }
@@ -8885,12 +8726,7 @@ impl SleepingHopperEngine {
             // Room was just verified, so the insert cannot fail — take first,
             // then place, and a bug that breaks that pairing debug-asserts.
             self.take_one(above, index);
-            let inserted = self
-                .mutate_slots(pos, |slots| {
-                    let inserted = Self::insert_one(slots, item, &comps, max);
-                    (inserted, inserted)
-                })
-                .unwrap_or(false);
+            let inserted = self.insert_at(pos, item, &comps, max);
             debug_assert!(inserted, "pull destination lost room between probe and insert");
             return true;
         }
@@ -8926,7 +8762,6 @@ impl SleepingHopperEngine {
             if moved == 0 {
                 continue;
             }
-            self.revisions.bump_suction(pos);
             let items = self.suction.get_mut(&pos).unwrap();
             if count == 0 {
                 items.remove(index);
@@ -8957,52 +8792,33 @@ impl SleepingHopperEngine {
         moved
     }
 
-    /// One game tick over every tracked hopper. Sleeping hoppers whose four
-    /// watched revisions still match cost four map lookups and nothing else —
-    /// no slot reads, no scans.
+    /// Advance awake hoppers in block-position order. A transfer can wake a
+    /// later position for this tick, or an earlier one for the next tick.
     fn tick(&mut self) -> HopperTickStats {
-        let mut stats = HopperTickStats::default();
+        use std::ops::Bound::{Excluded, Unbounded};
+
+        let mut stats = HopperTickStats {
+            sleeping_skipped: self.hoppers.len() as u64,
+            ..HopperTickStats::default()
+        };
         self.slot_reads = 0;
-        // BTreeMap order keeps activations deterministic; positions are copied
-        // out because transfers mutate neighbour hoppers mid-sweep.
-        let positions: Vec<DimBlockPos> = self.hoppers.keys().copied().collect();
-        for pos in positions {
-            let Some(hopper) = self.hoppers.get(&pos) else {
-                continue; // removed by an earlier activation this tick
-            };
-            let (facing, locked, sleeping) =
-                (hopper.facing, hopper.redstone_locked, hopper.sleeping);
-            if sleeping {
-                if self.watched_revisions_unchanged(hopper) {
-                    stats.sleeping_skipped += 1;
-                    continue;
-                }
-                if let Some(hopper) = self.hoppers.get_mut(&pos) {
-                    hopper.sleeping = false;
-                }
-            }
-            // vanilla: `--cooldownTime` every tick, attempt when <= 0; locked
-            // hoppers still run the countdown but never attempt.
-            let cooldown = self
-                .hoppers
-                .get_mut(&pos)
-                .map(|hopper| {
-                    hopper.cooldown_ticks -= 1;
-                    hopper.cooldown_ticks
-                })
-                .unwrap_or(0);
-            if locked || cooldown > 0 {
+        let mut lower = Unbounded;
+        while let Some(pos) = self.awake.range((lower, Unbounded)).next().copied() {
+            lower = Excluded(pos);
+            stats.sleeping_skipped -= 1;
+            let hopper = self.hoppers.get_mut(&pos).expect("awake hopper must exist");
+            hopper.cooldown_ticks -= 1;
+            if hopper.redstone_locked || hopper.cooldown_ticks > 0 {
                 continue;
             }
+            let facing = hopper.facing;
             stats.active_scanned += 1;
             let moved = self.attempt_transfers(pos, facing);
             if moved > 0 {
                 stats.items_transferred += moved;
-                if let Some(hopper) = self.hoppers.get_mut(&pos) {
-                    hopper.cooldown_ticks = HOPPER_TRANSFER_COOLDOWN;
-                }
+                self.hoppers.get_mut(&pos).unwrap().cooldown_ticks = HOPPER_TRANSFER_COOLDOWN;
             } else {
-                self.sleep(pos);
+                self.awake.remove(&pos);
             }
         }
         stats.slot_reads = self.slot_reads;
@@ -9077,6 +8893,27 @@ mod perf1_sleeping_hopper_tests {
             assert_eq!(stats.active_scanned, 0);
             assert_eq!(stats.sleeping_skipped, 1000);
             assert_eq!(stats.slot_reads, 0);
+        }
+    }
+
+    #[test]
+    fn perf1_hopper_wake_during_tick_preserves_position_order() {
+        for (facing, step, moves_on_push_tick) in
+            [(HopperFacing::East, 1, 2), (HopperFacing::West, -1, 1)]
+        {
+            let mut engine = SleepingHopperEngine::default();
+            let (source, next, output) = (pos(0, 64, 0), pos(step, 64, 0), pos(2 * step, 64, 0));
+            engine.place_hopper(source, facing);
+            engine.place_hopper(next, facing);
+            engine.set_container(output, vec![None]);
+            assert_eq!(engine.tick().active_scanned, 2);
+            assert_eq!(engine.tick().sleeping_skipped, 2);
+
+            assert!(engine.set_slot(source, 0, Some(stack(1))));
+            assert_eq!(engine.tick().items_transferred, moves_on_push_tick);
+            assert_eq!(container_item_count(&engine, output), moves_on_push_tick - 1);
+            assert_eq!(engine.tick().items_transferred, 2 - moves_on_push_tick);
+            assert_eq!(container_item_count(&engine, output), 1);
         }
     }
 
@@ -9206,12 +9043,12 @@ mod perf1_sleeping_hopper_tests {
         engine.set_container(output, vec![None; 27]);
         settle(&mut engine, 2);
         assert_eq!(engine.tick().sleeping_skipped, 1);
-        assert!(engine.hopper(hopper).unwrap().sleeping);
+        assert!(!engine.awake.contains(&hopper));
 
         // A drop lands on the hopper: only that hopper wakes, and the entity
         // is sucked into its inventory on the wake tick.
         engine.notify_item_entered_cell(hopper, stack(5));
-        assert!(!engine.hopper(hopper).unwrap().sleeping);
+        assert!(engine.awake.contains(&hopper));
         let stats = engine.tick();
         assert_eq!(stats.items_transferred, 5, "the whole entity stack is sucked");
         assert_eq!(container_item_count(&engine, hopper), 5);
@@ -9408,7 +9245,7 @@ impl NoteBlockInstrument {
 /// is also what wall heads produce (they never register an instrument).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn note_block_instrument_from_below(block_name: &str) -> NoteBlockInstrument {
-    match block_name.strip_prefix("minecraft:").unwrap_or(block_name) {
+    match vanilla_id_path(block_name) {
             "andesite" | "andesite_slab" | "andesite_stairs" | "andesite_wall" | "basalt" | "bedrock" | "black_concrete" | "black_glazed_terracotta" | "black_terracotta" | "blackstone" | "blackstone_slab" | "blackstone_stairs" | "blackstone_wall" | "blast_furnace" | "blue_concrete" | "blue_glazed_terracotta" | "blue_terracotta" | "brain_coral_block" | "brick_slab" | "brick_stairs" | "brick_wall" | "bricks" | "brown_concrete" | "brown_glazed_terracotta" | "brown_terracotta" | "bubble_coral_block" | "calcite" | "chiseled_deepslate" | "chiseled_nether_bricks" | "chiseled_polished_blackstone" | "chiseled_quartz_block" | "chiseled_red_sandstone" | "chiseled_sandstone" | "chiseled_stone_bricks" | "chiseled_tuff" | "chiseled_tuff_bricks" | "coal_block" | "coal_ore" | "cobbled_deepslate" | "cobbled_deepslate_slab" | "cobbled_deepslate_stairs" | "cobbled_deepslate_wall" | "cobblestone" | "cobblestone_slab" | "cobblestone_stairs" | "cobblestone_wall" | "copper_ore" | "cracked_deepslate_bricks" | "cracked_deepslate_tiles" | "cracked_nether_bricks" | "cracked_polished_blackstone_bricks" | "cracked_stone_bricks" | "crimson_nylium" | "crying_obsidian" | "cut_red_sandstone" | "cut_red_sandstone_slab" | "cut_sandstone" | "cut_sandstone_slab" | "cyan_concrete" | "cyan_glazed_terracotta" | "cyan_terracotta" | "dark_prismarine" | "dark_prismarine_slab" | "dark_prismarine_stairs" | "dead_brain_coral" | "dead_brain_coral_block" | "dead_brain_coral_fan" | "dead_brain_coral_wall_fan" | "dead_bubble_coral" | "dead_bubble_coral_block" | "dead_bubble_coral_fan" | "dead_bubble_coral_wall_fan" | "dead_fire_coral" | "dead_fire_coral_block" | "dead_fire_coral_fan" | "dead_fire_coral_wall_fan" | "dead_horn_coral" | "dead_horn_coral_block" | "dead_horn_coral_fan" | "dead_horn_coral_wall_fan" | "dead_tube_coral" | "dead_tube_coral_block" | "dead_tube_coral_fan" | "dead_tube_coral_wall_fan" | "deepslate" | "deepslate_brick_slab" | "deepslate_brick_stairs" | "deepslate_brick_wall" | "deepslate_bricks" | "deepslate_coal_ore" | "deepslate_copper_ore" | "deepslate_diamond_ore" | "deepslate_emerald_ore" | "deepslate_gold_ore" | "deepslate_iron_ore" | "deepslate_lapis_ore" | "deepslate_redstone_ore" | "deepslate_tile_slab" | "deepslate_tile_stairs" | "deepslate_tile_wall" | "deepslate_tiles" | "diamond_ore" | "diorite" | "diorite_slab" | "diorite_stairs" | "diorite_wall" | "dispenser" | "dripstone_block" | "dropper" | "emerald_ore" | "enchanting_table" | "end_portal_frame" | "end_stone" | "end_stone_brick_slab" | "end_stone_brick_stairs" | "end_stone_brick_wall" | "end_stone_bricks" | "ender_chest" | "fire_coral_block" | "furnace" | "gilded_blackstone" | "gold_ore" | "granite" | "granite_slab" | "granite_stairs" | "granite_wall" | "gray_concrete" | "gray_glazed_terracotta" | "gray_terracotta" | "green_concrete" | "green_glazed_terracotta" | "green_terracotta" | "horn_coral_block" | "iron_ore" | "lapis_ore" | "light_blue_concrete" | "light_blue_glazed_terracotta" | "light_blue_terracotta" | "light_gray_concrete" | "light_gray_glazed_terracotta" | "light_gray_terracotta" | "lime_concrete" | "lime_glazed_terracotta" | "lime_terracotta" | "magenta_concrete" | "magenta_glazed_terracotta" | "magenta_terracotta" | "magma_block" | "mossy_cobblestone" | "mossy_cobblestone_slab" | "mossy_cobblestone_stairs" | "mossy_cobblestone_wall" | "mossy_stone_brick_slab" | "mossy_stone_brick_stairs" | "mossy_stone_brick_wall" | "mossy_stone_bricks" | "mud_brick_slab" | "mud_brick_stairs" | "mud_brick_wall" | "mud_bricks" | "nether_brick_fence" | "nether_brick_slab" | "nether_brick_stairs" | "nether_brick_wall" | "nether_bricks" | "nether_gold_ore" | "nether_quartz_ore" | "netherrack" | "observer" | "obsidian" | "orange_concrete" | "orange_glazed_terracotta" | "orange_terracotta" | "petrified_oak_slab" | "pink_concrete" | "pink_glazed_terracotta" | "pink_terracotta" | "pointed_dripstone" | "polished_andesite" | "polished_andesite_slab" | "polished_andesite_stairs" | "polished_basalt" | "polished_blackstone" | "polished_blackstone_brick_slab" | "polished_blackstone_brick_stairs" | "polished_blackstone_brick_wall" | "polished_blackstone_bricks" | "polished_blackstone_pressure_plate" | "polished_blackstone_slab" | "polished_blackstone_stairs" | "polished_blackstone_wall" | "polished_deepslate" | "polished_deepslate_slab" | "polished_deepslate_stairs" | "polished_deepslate_wall" | "polished_diorite" | "polished_diorite_slab" | "polished_diorite_stairs" | "polished_granite" | "polished_granite_slab" | "polished_granite_stairs" | "polished_tuff" | "polished_tuff_slab" | "polished_tuff_stairs" | "polished_tuff_wall" | "prismarine" | "prismarine_brick_slab" | "prismarine_brick_stairs" | "prismarine_bricks" | "prismarine_slab" | "prismarine_stairs" | "prismarine_wall" | "purple_concrete" | "purple_glazed_terracotta" | "purple_terracotta" | "purpur_block" | "purpur_pillar" | "purpur_slab" | "purpur_stairs" | "quartz_block" | "quartz_bricks" | "quartz_pillar" | "quartz_slab" | "quartz_stairs" | "raw_copper_block" | "raw_gold_block" | "raw_iron_block" | "red_concrete" | "red_glazed_terracotta" | "red_nether_brick_slab" | "red_nether_brick_stairs" | "red_nether_brick_wall" | "red_nether_bricks" | "red_sandstone" | "red_sandstone_slab" | "red_sandstone_stairs" | "red_sandstone_wall" | "red_terracotta" | "redstone_ore" | "reinforced_deepslate" | "respawn_anchor" | "sandstone" | "sandstone_slab" | "sandstone_stairs" | "sandstone_wall" | "smoker" | "smooth_basalt" | "smooth_quartz" | "smooth_quartz_slab" | "smooth_quartz_stairs" | "smooth_red_sandstone" | "smooth_red_sandstone_slab" | "smooth_red_sandstone_stairs" | "smooth_sandstone" | "smooth_sandstone_slab" | "smooth_sandstone_stairs" | "smooth_stone" | "smooth_stone_slab" | "spawner" | "stone" | "stone_brick_slab" | "stone_brick_stairs" | "stone_brick_wall" | "stone_bricks" | "stone_pressure_plate" | "stone_slab" | "stone_stairs" | "stonecutter" | "terracotta" | "trial_spawner" | "tube_coral_block" | "tuff" | "tuff_brick_slab" | "tuff_brick_stairs" | "tuff_brick_wall" | "tuff_bricks" | "tuff_slab" | "tuff_stairs" | "tuff_wall" | "vault" | "warped_nylium" | "white_concrete" | "white_glazed_terracotta" | "white_terracotta" | "yellow_concrete" | "yellow_glazed_terracotta" | "yellow_terracotta" => NoteBlockInstrument::Basedrum,
             "acacia_door" | "acacia_fence" | "acacia_fence_gate" | "acacia_hanging_sign" | "acacia_log" | "acacia_planks" | "acacia_pressure_plate" | "acacia_sign" | "acacia_slab" | "acacia_stairs" | "acacia_trapdoor" | "acacia_wall_hanging_sign" | "acacia_wall_sign" | "acacia_wood" | "bamboo_block" | "bamboo_door" | "bamboo_fence" | "bamboo_fence_gate" | "bamboo_hanging_sign" | "bamboo_mosaic" | "bamboo_mosaic_slab" | "bamboo_mosaic_stairs" | "bamboo_planks" | "bamboo_pressure_plate" | "bamboo_sign" | "bamboo_slab" | "bamboo_stairs" | "bamboo_trapdoor" | "bamboo_wall_hanging_sign" | "bamboo_wall_sign" | "barrel" | "bee_nest" | "beehive" | "birch_door" | "birch_fence" | "birch_fence_gate" | "birch_hanging_sign" | "birch_log" | "birch_planks" | "birch_pressure_plate" | "birch_sign" | "birch_slab" | "birch_stairs" | "birch_trapdoor" | "birch_wall_hanging_sign" | "birch_wall_sign" | "birch_wood" | "black_banner" | "black_wall_banner" | "blue_banner" | "blue_wall_banner" | "bookshelf" | "brown_banner" | "brown_mushroom_block" | "brown_wall_banner" | "campfire" | "cartography_table" | "cherry_door" | "cherry_fence" | "cherry_fence_gate" | "cherry_hanging_sign" | "cherry_log" | "cherry_planks" | "cherry_pressure_plate" | "cherry_sign" | "cherry_slab" | "cherry_stairs" | "cherry_trapdoor" | "cherry_wall_hanging_sign" | "cherry_wall_sign" | "cherry_wood" | "chest" | "chiseled_bookshelf" | "composter" | "crafting_table" | "crimson_door" | "crimson_fence" | "crimson_fence_gate" | "crimson_hanging_sign" | "crimson_hyphae" | "crimson_planks" | "crimson_pressure_plate" | "crimson_sign" | "crimson_slab" | "crimson_stairs" | "crimson_stem" | "crimson_trapdoor" | "crimson_wall_hanging_sign" | "crimson_wall_sign" | "cyan_banner" | "cyan_wall_banner" | "dark_oak_door" | "dark_oak_fence" | "dark_oak_fence_gate" | "dark_oak_hanging_sign" | "dark_oak_log" | "dark_oak_planks" | "dark_oak_pressure_plate" | "dark_oak_sign" | "dark_oak_slab" | "dark_oak_stairs" | "dark_oak_trapdoor" | "dark_oak_wall_hanging_sign" | "dark_oak_wall_sign" | "dark_oak_wood" | "daylight_detector" | "fletching_table" | "gray_banner" | "gray_wall_banner" | "green_banner" | "green_wall_banner" | "jukebox" | "jungle_door" | "jungle_fence" | "jungle_fence_gate" | "jungle_hanging_sign" | "jungle_log" | "jungle_planks" | "jungle_pressure_plate" | "jungle_sign" | "jungle_slab" | "jungle_stairs" | "jungle_trapdoor" | "jungle_wall_hanging_sign" | "jungle_wall_sign" | "jungle_wood" | "lectern" | "light_blue_banner" | "light_blue_wall_banner" | "light_gray_banner" | "light_gray_wall_banner" | "lime_banner" | "lime_wall_banner" | "loom" | "magenta_banner" | "magenta_wall_banner" | "mangrove_door" | "mangrove_fence" | "mangrove_fence_gate" | "mangrove_hanging_sign" | "mangrove_log" | "mangrove_planks" | "mangrove_pressure_plate" | "mangrove_roots" | "mangrove_sign" | "mangrove_slab" | "mangrove_stairs" | "mangrove_trapdoor" | "mangrove_wall_hanging_sign" | "mangrove_wall_sign" | "mangrove_wood" | "mushroom_stem" | "note_block" | "oak_door" | "oak_fence" | "oak_fence_gate" | "oak_hanging_sign" | "oak_log" | "oak_planks" | "oak_pressure_plate" | "oak_sign" | "oak_slab" | "oak_stairs" | "oak_trapdoor" | "oak_wall_hanging_sign" | "oak_wall_sign" | "oak_wood" | "orange_banner" | "orange_wall_banner" | "pink_banner" | "pink_wall_banner" | "purple_banner" | "purple_wall_banner" | "red_banner" | "red_mushroom_block" | "red_wall_banner" | "smithing_table" | "soul_campfire" | "spruce_door" | "spruce_fence" | "spruce_fence_gate" | "spruce_hanging_sign" | "spruce_log" | "spruce_planks" | "spruce_pressure_plate" | "spruce_sign" | "spruce_slab" | "spruce_stairs" | "spruce_trapdoor" | "spruce_wall_hanging_sign" | "spruce_wall_sign" | "spruce_wood" | "stripped_acacia_log" | "stripped_acacia_wood" | "stripped_bamboo_block" | "stripped_birch_log" | "stripped_birch_wood" | "stripped_cherry_log" | "stripped_cherry_wood" | "stripped_crimson_hyphae" | "stripped_crimson_stem" | "stripped_dark_oak_log" | "stripped_dark_oak_wood" | "stripped_jungle_log" | "stripped_jungle_wood" | "stripped_mangrove_log" | "stripped_mangrove_wood" | "stripped_oak_log" | "stripped_oak_wood" | "stripped_spruce_log" | "stripped_spruce_wood" | "stripped_warped_hyphae" | "stripped_warped_stem" | "trapped_chest" | "warped_door" | "warped_fence" | "warped_fence_gate" | "warped_hanging_sign" | "warped_hyphae" | "warped_planks" | "warped_pressure_plate" | "warped_sign" | "warped_slab" | "warped_stairs" | "warped_stem" | "warped_trapdoor" | "warped_wall_hanging_sign" | "warped_wall_sign" | "white_banner" | "white_wall_banner" | "yellow_banner" | "yellow_wall_banner" => NoteBlockInstrument::Bass,
             "black_concrete_powder" | "blue_concrete_powder" | "brown_concrete_powder" | "cyan_concrete_powder" | "gravel" | "gray_concrete_powder" | "green_concrete_powder" | "heavy_core" | "light_blue_concrete_powder" | "light_gray_concrete_powder" | "lime_concrete_powder" | "magenta_concrete_powder" | "orange_concrete_powder" | "pink_concrete_powder" | "purple_concrete_powder" | "red_concrete_powder" | "red_sand" | "sand" | "suspicious_gravel" | "suspicious_sand" | "white_concrete_powder" | "yellow_concrete_powder" => NoteBlockInstrument::Snare,
@@ -9485,11 +9322,6 @@ pub(crate) fn note_block_neighbor_update(powered: bool, has_signal: bool) -> (bo
     (has_signal, has_signal && !powered)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn note_block_name(reg: &crate::block_registry::BReg, st: u32) -> &str {
-    reg.name_of(st)
-}
-
 /// Resolve the effective instrument for the note block at `pos`, mirroring
 /// `updateNoteBlockState`: mob head above wins, else the block below.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -9498,8 +9330,8 @@ pub(crate) fn note_block_instrument_at_dim(
     pos: BlockPos,
 ) -> Option<NoteBlockInstrument> {
     let reg = breg()?;
-    let above = note_block_name(reg, block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
-    let below = note_block_name(reg, block_at_dim(dim, pos.0, pos.1 - 1, pos.2));
+    let above = reg.name_of(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
+    let below = reg.name_of(block_at_dim(dim, pos.0, pos.1 - 1, pos.2));
     Some(note_block_update_instrument(above, below))
 }
 
@@ -9520,8 +9352,7 @@ pub(crate) fn note_block_refresh_instrument_dim(
     // Vanilla `updateNoteBlockState` only writes when the recomputed state
     // differs; an unchanged instrument must not rebroadcast a block update.
     if new_st != st {
-        set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
-        note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+        set_and_note_world_block(dim, pos, new_st);
     }
     Some(inst)
 }
@@ -9547,8 +9378,7 @@ pub(crate) fn note_block_use_dim(
         "powered",
         "false",
     );
-    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
-    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    set_and_note_world_block(dim, pos, new_st);
     let above_is_air = reg.is_air(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
     let played = note_block_trigger(inst, above_is_air);
     Some((inst, next, pitch, played))
@@ -9575,8 +9405,7 @@ pub(crate) fn note_block_power_dim(
     }
     let inst = note_block_instrument_at_dim(dim, pos)?;
     let new_st = reg.with_prop(st, "powered", if next_powered { "true" } else { "false" });
-    set_block_dim(dim, pos.0, pos.1, pos.2, new_st);
-    note_block_update_dim(dim, pos.0, pos.1, pos.2, new_st);
+    set_and_note_world_block(dim, pos, new_st);
     let above_is_air = reg.is_air(block_at_dim(dim, pos.0, pos.1 + 1, pos.2));
     let played = rising && note_block_trigger(inst, above_is_air);
     Some((next_powered, played))
@@ -9672,7 +9501,7 @@ pub(crate) struct CauldronOutcome {
 /// Returns None when the interaction is a PASS (state untouched).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn cauldron_use(state: CauldronState, item_name: &str) -> Option<CauldronOutcome> {
-    let item = item_name.strip_prefix("minecraft:").unwrap_or(item_name);
+    let item = vanilla_id_path(item_name);
     let outcome = |new_state, returns: Option<&str>| {
         Some(CauldronOutcome { new_state, returns: returns.map(str::to_owned) })
     };
@@ -9802,7 +9631,7 @@ pub(crate) fn cauldron_extinguish(state: CauldronState) -> CauldronState {
 /// chance table. Returns None for non-compostable items.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn composter_chance(item_name: &str) -> Option<f64> {
-    match item_name.strip_prefix("minecraft:").unwrap_or(item_name) {
+    match vanilla_id_path(item_name) {
         "acacia_leaves" | "acacia_sapling" | "azalea_leaves" | "beetroot_seeds" | "birch_leaves" | "birch_sapling" | "cherry_leaves" | "cherry_sapling" | "dark_oak_leaves" | "dark_oak_sapling" | "dried_kelp" | "glow_berries" | "hanging_roots" | "jungle_leaves" | "jungle_sapling" | "kelp" | "mangrove_leaves" | "mangrove_propagule" | "mangrove_roots" | "melon_seeds" | "moss_carpet" | "oak_leaves" | "oak_sapling" | "pink_petals" | "pitcher_pod" | "pumpkin_seeds" | "seagrass" | "short_grass" | "small_dripleaf" | "spruce_leaves" | "spruce_sapling" | "sweet_berries" | "torchflower_seeds" | "wheat_seeds" => Some(0.3),
         "cactus" | "dried_kelp_block" | "flowering_azalea_leaves" | "glow_lichen" | "melon_slice" | "nether_sprouts" | "sugar_cane" | "tall_grass" | "twisting_vines" | "vine" | "weeping_vines" => Some(0.5),
         "allium" | "apple" | "azalea" | "azure_bluet" | "beetroot" | "big_dripleaf" | "blue_orchid" | "brown_mushroom" | "carrot" | "carved_pumpkin" | "cocoa_beans" | "cornflower" | "crimson_fungus" | "crimson_roots" | "dandelion" | "fern" | "large_fern" | "lilac" | "lily_of_the_valley" | "lily_pad" | "melon" | "moss_block" | "mushroom_stem" | "nether_wart" | "orange_tulip" | "oxeye_daisy" | "peony" | "pink_tulip" | "poppy" | "potato" | "pumpkin" | "red_mushroom" | "red_tulip" | "rose_bush" | "sea_pickle" | "shroomlight" | "spore_blossom" | "sunflower" | "warped_fungus" | "warped_roots" | "wheat" | "white_tulip" | "wither_rose" => Some(0.65),
@@ -9903,7 +9732,7 @@ pub(crate) fn respawn_anchor_use(
     anchors_work: bool,
 ) -> AnchorOutcome {
     let is_glowstone = held_item
-        .map(|i| i.strip_prefix("minecraft:").unwrap_or(i) == "glowstone")
+        .map(|i| vanilla_id_path(i) == "glowstone")
         .unwrap_or(false);
     if is_glowstone {
         return if charges < 4 {
@@ -9987,36 +9816,25 @@ impl LodestoneTracker {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos> {
     let Some(reg) = breg() else { return Vec::new() };
-    let offsets: [(i32, i32, i32); 6] = [
-        (0, -1, 0),
-        (0, 1, 0),
-        (-1, 0, 0),
-        (1, 0, 0),
-        (0, 0, -1),
-        (0, 0, 1),
-    ];
-    // `dno.a(jd,dcw,jd)` predicate: water fluid plus BucketPickup / LiquidBlock
-    // / kelp-family absorption. We model it against the pinned registry:
-    // `has_water` covers waterlogged states; the kelp/seagrass family is
-    // destroyed outright; flowing and source water are `minecraft:water`.
-    let absorbs = |st: u32| -> bool {
+    let [down, up, north, south, west, east] = LEAF_NEIGHBORS;
+    let offsets = [down, up, west, east, north, south];
+    let absorb_at = |(x, y, z): BlockPos, st| {
         if reg.is_air(st) {
             return false;
         }
-        let name = reg.name_of(st);
-        matches!(name, "minecraft:water" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass")
-            || reg.has_water(st)
-    };
-    let absorb_at = |p: BlockPos, st: u32| {
-        let name = reg.name_of(st);
-        if reg.get_prop(st, "waterlogged").as_deref() == Some("true") {
-            set_block_dim(dim, p.0, p.1, p.2, reg.with_prop(st, "waterlogged", "false"));
-        } else if matches!(
-            name,
+        let removable = matches!(
+            reg.name_of(st),
             "minecraft:water" | "minecraft:kelp" | "minecraft:kelp_plant" | "minecraft:seagrass" | "minecraft:tall_seagrass"
-        ) {
-            set_block_dim(dim, p.0, p.1, p.2, reg.state_of("minecraft:air", None));
+        );
+        if !removable && !reg.has_water(st) {
+            return false;
         }
+        if reg.get_prop(st, "waterlogged").as_deref() == Some("true") {
+            set_block_dim(dim, x, y, z, reg.with_prop(st, "waterlogged", "false"));
+        } else if removable {
+            set_block_dim(dim, x, y, z, reg.state_of("minecraft:air", None));
+        }
+        true
     };
 
     // The visited set and frontier ride the bounded thread-local scratch:
@@ -10041,8 +9859,7 @@ pub(crate) fn sponge_absorb_water(dim: DimId, sponge: BlockPos) -> Vec<BlockPos>
             true
         } else {
             let st = block_at_dim(dim, cur.0, cur.1, cur.2);
-            absorbs(st) && {
-                absorb_at(cur, st);
+            absorb_at(cur, st) && {
                 absorbed.push(cur);
                 true
             }
@@ -11166,11 +10983,12 @@ fn quiescent_note_block_mutation(
     // mutation ingress for that reset; removing exact positions keeps the
     // reset precise rather than chunk-coarse.
     let mut backoff = backoff().lock().unwrap_or_else(|e| e.into_inner());
-    backoff.remove(&(dim, x, y, z));
-    for (dx, dy, dz) in LEAF_NEIGHBORS {
-        backoff.remove(&(dim, x + dx, y + dy, z + dz));
+    if !backoff.is_empty() {
+        backoff.remove(&(dim, x, y, z));
+        for (dx, dy, dz) in LEAF_NEIGHBORS {
+            backoff.remove(&(dim, x + dx, y + dy, z + dz));
+        }
     }
-    drop(backoff);
     revs
 }
 
@@ -11195,7 +11013,11 @@ fn quiescent_chunk_tick() {
     use megu_core::quiescent::ActivityMask;
 
     let ticked = ticked_chunks();
-    let dims = DimId::all_registered();
+    let dims = if ticked.is_empty() {
+        Vec::new()
+    } else {
+        DimId::all_registered()
+    };
     let mut wanted = std::collections::HashSet::with_capacity(ticked.len() * dims.len());
     let mut wanted_keys = Vec::with_capacity(ticked.len() * dims.len());
     for dim in &dims {
@@ -11212,6 +11034,10 @@ fn quiescent_chunk_tick() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     scheduler.advance_tick(&mut woken);
+    if wanted.is_empty() && scheduler.active_chunks().is_empty() {
+        // A published random-tick chunk stays active until this pass clears it.
+        return;
+    }
     let current_tick = scheduler.current_tick();
     let active: Vec<_> = scheduler.active_chunks().to_vec();
     for entry in active {
@@ -11238,7 +11064,6 @@ fn quiescent_chunk_tick() {
         })
         .collect();
     snapshot.sort_by_key(|&(dim, cx, cz)| (dim.raw(), cx, cz));
-    drop(scheduler);
     *quiescent_random_snapshot_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = snapshot;
