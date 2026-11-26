@@ -656,6 +656,11 @@ fn classify_render_shape(name: &str, shapes: &[LocalBox], collision_shapes: &[u1
             .filter_map(|&shape_id| shapes.get(usize::from(shape_id)));
         if boxes
             .clone()
+            .any(|shape| shape.min[1] == 0.0 && shape.max[1] == 1.0)
+        {
+            BlockShape::Cube
+        } else if boxes
+            .clone()
             .any(|shape| shape.min[1] >= 0.5 && shape.max[1] > 0.5)
         {
             BlockShape::SlabTop
@@ -1016,14 +1021,17 @@ impl StoredSection {
             let x = index % 16;
             let z = (index / 16) % 16;
             let y = index / 256;
-            let biome_index = (y / 4) * 16 + (z / 4) * 4 + (x / 4);
-            *dst = blocks.mesh_block_for_biome(sid, self.biomes[biome_index]);
+            *dst = blocks.mesh_block_for_biome(sid, self.biome_at(x, y, z));
         }
         Section {
             blocks: mesh_blocks,
             block_light: self.block_light,
             sky_light: self.sky_light,
         }
+    }
+
+    fn biome_at(&self, x: usize, y: usize, z: usize) -> u32 {
+        self.biomes[(y / 4) * 16 + (z / 4) * 4 + x / 4]
     }
 
     /// The meshing snapshot in [`CompressedSection`] form. A single-state
@@ -1505,9 +1513,7 @@ pub struct TrackedEntity {
     /// Most recently received vanilla entity animation id (0 main hand,
     /// 3 off hand, 4 critical, 5 magic critical); consumers can animate it.
     pub last_animation: Option<u8>,
-    /// Bitmask of equipment slot ids seen in `set_equipment` (bits 0..=7;
-    /// vanilla equipment slots are a small fixed enum, higher wire ids are
-    /// not representable and ignored).
+    /// Bitmask of equipment slot IDs seen in `set_equipment` (bits 0..=7).
     pub equipment_slots: u8,
 }
 
@@ -1612,7 +1618,8 @@ pub enum BlockEntityVisualState {
     Sign {
         front_lines: [String; 4],
         back_lines: [String; 4],
-        glowing: bool,
+        front_glowing: bool,
+        back_glowing: bool,
     },
     Banner {
         base_color: u8,
@@ -1676,11 +1683,29 @@ fn nbt_text_lines(value: &NbtValue, key: &str) -> [String; 4] {
     std::array::from_fn(|index| {
         lines
             .and_then(|items| items.get(index))
-            .and_then(|line| match line {
-                NbtValue::String(text) => Some(text.clone()),
-                _ => None,
-            })
+            .map(NbtValue::extract_text)
             .unwrap_or_default()
+    })
+}
+
+/// Visual block-entity types in vanilla 1.21.1 registry order.
+fn protocol_767_visual_block_entity(kind: i32) -> Option<&'static str> {
+    Some(match kind {
+        1 => "chest",
+        2 => "trapped_chest",
+        3 => "ender_chest",
+        7 => "sign",
+        8 => "hanging_sign",
+        10 => "piston",
+        12 => "enchanting_table",
+        14 => "beacon",
+        19 => "banner",
+        23 => "shulker_box",
+        30 => "bell",
+        32 => "campfire",
+        42 => "trial_spawner",
+        43 => "vault",
+        _ => return None,
     })
 }
 
@@ -1781,10 +1806,10 @@ pub struct WorldState {
     pub entity_links: BTreeMap<i32, i32>,
     /// Recent block events retained for a future block-event renderer.
     pub block_events: VecDeque<([i32; 3], u8, u8, i32)>,
-    /// Recent `level_event` records `(event, pos, data)` — the vanilla
+    /// Recent `level_event` records `(event, pos, data, global)` — the vanilla
     /// effect channel (block-break particles 2001, sounds, ...) kept
     /// bounded for the effect renderer like [`Self::block_events`].
-    pub level_events: VecDeque<(i32, [i32; 3], i32)>,
+    pub level_events: VecDeque<(i32, [i32; 3], i32, bool)>,
     /// Recent `level_particles` spawn records kept bounded the
     /// same way; the particle stage drains them when it lands.
     pub level_particles: VecDeque<LevelParticleSpawn>,
@@ -1982,6 +2007,8 @@ impl WorldState {
         self.item_pickups.clear();
         self.block_entities.clear();
         self.block_entity_visual_nbt.clear();
+        self.merchant_panels.clear();
+        self.container_properties.clear();
         self.block_destructions.clear();
         self.light_engine = light_engine_for(&self.dimension, self.registry.is_some());
         // A dimension change discards any edits queued against the old
@@ -2377,15 +2404,19 @@ impl WorldState {
         sec.palette
             .set(cell_idx, clamped)
             .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
-        if previous != Some(clamped) {
-            // A real block-state change retires any block entity anchored at
-            // the cell (chest broken, sign replaced); `block_entity_data`
-            // re-adds it when the server still considers one present.
+        if previous != Some(clamped)
+            && !previous
+                .and_then(|state| self.blocks.state_name(state))
+                .is_some_and(|name| Some(name) == self.blocks.state_name(clamped))
+        {
             self.block_entities.remove(&pos);
+            self.block_entity_visual_nbt.remove(&pos);
         }
 
         let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
-        let mesh_block = self.blocks.mesh_block(clamped);
+        let mesh_block = self
+            .blocks
+            .mesh_block_for_biome(clamped, sec.biome_at(lx, ly, lz));
         let light = Light::new(
             read_nibble(&sec.block_light, cell_idx),
             read_nibble(&sec.sky_light, cell_idx),
@@ -2496,21 +2527,7 @@ impl WorldState {
                 .saturating_mul(16)
                 .saturating_add(i32::from(be.packed_xz & 0x0f));
             let pos = [x, i32::from(be.y), z];
-            if !be.nbt_bytes.is_empty() {
-                let mut reader = WireReader::new(&be.nbt_bytes);
-                if let Ok(nbt) = reader.read_nbt() {
-                    if reader.remaining() == 0 {
-                        self.block_entity_visual_nbt.insert(pos, nbt);
-                    }
-                }
-            }
-            self.block_entities.insert(
-                pos,
-                TrackedBlockEntity {
-                    kind: be.kind,
-                    nbt_bytes: be.nbt_bytes.clone(),
-                },
-            );
+            self.apply_block_entity_data(pos, be.kind, &be.nbt_bytes);
         }
     }
 
@@ -3006,15 +3023,8 @@ impl WorldState {
 
     /// Return typed block-entity state, combining parsed NBT with the newest matching block event.
     pub fn block_entity_visual_state(&self, pos: [i32; 3]) -> Option<BlockEntityVisualState> {
-        let is_tracked = self.block_entities.contains_key(&pos);
+        let tracked = self.block_entities.get(&pos);
         let nbt = self.block_entity_visual_nbt.get(&pos);
-        let id = nbt
-            .and_then(|value| nbt_field(value, "id"))
-            .and_then(|value| match value {
-                NbtValue::String(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
         let event = self
             .block_events
             .iter()
@@ -3031,15 +3041,17 @@ impl WorldState {
                     .and_then(|state| self.blocks.state_name(state))
             })
             .unwrap_or("");
-        if !is_tracked {
+        let Some(tracked) = tracked else {
             return block_name
                 .contains("piston")
                 .then(|| BlockEntityVisualState::Piston {
                     extending: action == Some(0),
                     facing: parameter,
                 });
-        }
-        let id_tail = id.rsplit(':').next().unwrap_or("");
+        };
+        let id_tail = protocol_767_visual_block_entity(tracked.kind)
+            .or_else(|| nbt.and_then(|value| nbt_string(value, "id")?.rsplit(':').next()))
+            .unwrap_or("");
         let state = match id_tail {
             "chest" | "trapped_chest" | "ender_chest" => BlockEntityVisualState::Chest {
                 open_count: if action == Some(1) {
@@ -3123,7 +3135,12 @@ impl WorldState {
                 back_lines: nbt
                     .map(|value| nbt_text_lines(value, "back_text"))
                     .unwrap_or_default(),
-                glowing: nbt.is_some_and(|value| nbt_bool(value, "is_glowing_text")),
+                front_glowing: nbt
+                    .and_then(|value| nbt_field(value, "front_text"))
+                    .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
+                back_glowing: nbt
+                    .and_then(|value| nbt_field(value, "back_text"))
+                    .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
             },
             "banner" | "wall_banner" => BlockEntityVisualState::Banner {
                 base_color: nbt
@@ -3195,10 +3212,12 @@ impl WorldState {
     }
 
     /// Project a retained `level_event` into the typed visual enum.
-    pub fn visual_level_events(&self) -> impl Iterator<Item = (VisualLevelEvent, [i32; 3])> + '_ {
+    pub fn visual_level_events(
+        &self,
+    ) -> impl Iterator<Item = (VisualLevelEvent, [i32; 3], bool)> + '_ {
         self.level_events
             .iter()
-            .map(|(event, pos, data)| (visual_level_event(*event, *data), *pos))
+            .map(|(event, pos, data, global)| (visual_level_event(*event, *data), *pos, *global))
     }
 
     /// Unified ingestion for decoded Protocol 767 play events: routes every
@@ -3441,7 +3460,7 @@ impl WorldState {
                         if entry.slot < 8 {
                             entity.equipment_slots |= 1u8 << entry.slot;
                         }
-                        if entry.slot < 6
+                        if entry.slot <= 6
                             && (self.entity_equipment.len() < 4096
                                 || self.entity_equipment.contains_key(&(*eid, entry.slot)))
                         {
@@ -3473,6 +3492,15 @@ impl WorldState {
             }
             PlayEvent::RemoveMobEffect { eid, effect_id } => {
                 self.mob_effects.remove(&(*eid, *effect_id));
+            }
+            PlayEvent::OpenScreen { .. } | PlayEvent::HorseScreenOpen { .. } => {
+                self.merchant_panels.clear();
+                self.container_properties.retain(|(id, _), _| *id == 0);
+            }
+            PlayEvent::ContainerClose { window_id } => {
+                self.merchant_panels.remove(window_id);
+                self.container_properties
+                    .retain(|(id, _), _| id != window_id);
             }
             PlayEvent::ContainerSetData {
                 window_id,
@@ -3546,11 +3574,10 @@ impl WorldState {
                 show_progress,
                 can_restock,
             } => {
-                if self.merchant_panels.len() < 32
-                    || self.merchant_panels.contains_key(&(*window_id as u8))
-                {
+                if let Ok(window_id) = u8::try_from(*window_id) {
+                    self.merchant_panels.retain(|id, _| *id == window_id);
                     self.merchant_panels.insert(
-                        *window_id as u8,
+                        window_id,
                         MerchantPanelState {
                             offers: offers.clone(),
                             villager_level: *villager_level,
@@ -3585,12 +3612,16 @@ impl WorldState {
                 nbt_bytes,
             } => self.apply_block_entity_data(*pos, *kind, nbt_bytes),
             PlayEvent::LevelEvent {
-                event, pos, data, ..
+                event,
+                pos,
+                data,
+                disable_relative_volume,
             } => {
                 if self.level_events.len() == 64 {
                     self.level_events.pop_front();
                 }
-                self.level_events.push_back((*event, *pos, *data));
+                self.level_events
+                    .push_back((*event, *pos, *data, *disable_relative_volume));
             }
             PlayEvent::LevelParticles {
                 particle_id,
@@ -3645,7 +3676,8 @@ impl WorldState {
                 continue;
             };
             let mut reader = WireReader::new(&chunk.data);
-            for section in &mut column.sections {
+            let min_sy = self.dimension.min_section_y();
+            for (index, section) in column.sections.iter_mut().enumerate() {
                 if reader.remaining() == 0 {
                     break;
                 }
@@ -3653,7 +3685,15 @@ impl WorldState {
                 else {
                     break;
                 };
-                section.biomes.copy_from_slice(&biomes[..64]);
+                if section.biomes == biomes.as_slice() {
+                    continue;
+                }
+                section.biomes.copy_from_slice(&biomes);
+                if section.has_non_air {
+                    let coord = SectionCoord(chunk.cx, min_sy + index as i32, chunk.cz);
+                    self.mesh_cache
+                        .insert_compressed(coord, section.to_compressed_mesh_section(&self.blocks));
+                }
             }
         }
     }
@@ -3790,42 +3830,32 @@ impl WorldState {
     /// chunk-payload population in [`Self::refresh_chunk_block_entities`].
     /// Bounded by [`MAX_TRACKED_BLOCK_ENTITIES`].
     fn apply_block_entity_data(&mut self, pos: [i32; 3], kind: i32, nbt_bytes: &[u8]) {
-        if nbt_bytes.is_empty() {
-            self.block_entity_visual_nbt.remove(&pos);
-        } else {
-            let mut reader = WireReader::new(nbt_bytes);
-            match reader.read_nbt() {
-                Ok(nbt) if reader.remaining() == 0 => {
-                    self.block_entity_visual_nbt.insert(pos, nbt);
-                }
-                _ => {
-                    // `PlayEvent` is a public decoded-event API and existing
-                    // callers may provide only the opaque payload. The wire
-                    // decoder already validates protocol NBT; leave those
-                    // externally supplied payloads lossless and unparsed.
-                    self.block_entity_visual_nbt.remove(&pos);
-                }
+        if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES
+            && !self.block_entities.contains_key(&pos)
+        {
+            return;
+        }
+        let entry = self
+            .block_entities
+            .entry(pos)
+            .or_insert_with(|| TrackedBlockEntity {
+                kind,
+                nbt_bytes: Vec::new(),
+            });
+        entry.kind = kind;
+        entry.nbt_bytes.clear();
+        entry.nbt_bytes.extend_from_slice(nbt_bytes);
+
+        // Direct event callers may supply opaque bytes. Keep them in the
+        // raw record and restrict the visual projection to complete NBT.
+        let mut reader = WireReader::new(nbt_bytes);
+        if let Ok(nbt) = reader.read_nbt() {
+            if reader.remaining() == 0 {
+                self.block_entity_visual_nbt.insert(pos, nbt);
+                return;
             }
         }
-        match self.block_entities.get_mut(&pos) {
-            Some(entry) => {
-                entry.kind = kind;
-                entry.nbt_bytes.clear();
-                entry.nbt_bytes.extend_from_slice(nbt_bytes);
-            }
-            None => {
-                if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES {
-                    return;
-                }
-                self.block_entities.insert(
-                    pos,
-                    TrackedBlockEntity {
-                        kind,
-                        nbt_bytes: nbt_bytes.to_vec(),
-                    },
-                );
-            }
-        }
+        self.block_entity_visual_nbt.remove(&pos);
     }
 
     /// Advance per-tick entity bookkeeping once per client tick: the
@@ -3997,6 +4027,10 @@ mod tests {
                 min: [0.0, 0.5, 0.0],
                 max: [1.0, 1.0, 1.0],
             },
+            LocalBox {
+                min: [0.0; 3],
+                max: [1.0; 3],
+            },
         ];
         assert_eq!(
             classify_render_shape("oak_slab", &boxes, &[0]),
@@ -4005,6 +4039,10 @@ mod tests {
         assert_eq!(
             classify_render_shape("oak_slab", &boxes, &[1]),
             BlockShape::SlabTop
+        );
+        assert_eq!(
+            classify_render_shape("oak_slab", &boxes, &[2]),
+            BlockShape::Cube
         );
         assert_eq!(
             classify_render_shape("poppy", &[], &[]),
@@ -4059,6 +4097,121 @@ mod tests {
         let mesh = stored.to_mesh_section(&blocks);
         assert_eq!(mesh.blocks[0].tint, 0x112233);
         assert_eq!(mesh.blocks[4].tint, 0xaabbcc);
+    }
+
+    #[test]
+    fn biome_messages_and_incremental_edits_refresh_mesh_tints() {
+        let mut blocks = BlockTable::builtin();
+        blocks.mesh_blocks[1] = Block {
+            flags: OPAQUE | FLUID_TINTED,
+            fluid_tint: 0xabcdef,
+            ..Block::opaque_cube(1)
+        };
+        blocks.biome_tints.set_water_color(1, 0x112233);
+        blocks.biome_tints.set_water_color(2, 0x445566);
+        let states = [1; SECTION_CELLS];
+        let mut section = StoredSection::from_states(
+            &states,
+            [0; LIGHT_BYTES],
+            [0; LIGHT_BYTES],
+            &blocks,
+            blocks.state_count(),
+        )
+        .unwrap();
+        section.biomes.fill(1);
+        let mut world = WorldState::new(DimensionMeta::default(), blocks);
+        let coord = SectionCoord(0, world.dimension.min_section_y(), 0);
+        world
+            .mesh_cache
+            .insert_compressed(coord, section.to_compressed_mesh_section(&world.blocks));
+        world.columns.insert(
+            (0, 0),
+            ChunkColumn {
+                cx: 0,
+                cz: 0,
+                sections: vec![section],
+            },
+        );
+        let pos = [1, world.dimension.min_y, 1];
+
+        world.apply_block_update(pos, 0).unwrap();
+        world.apply_block_update(pos, 1).unwrap();
+        let tint = |world: &WorldState| {
+            world
+                .mesh_cache
+                .section(coord)
+                .unwrap()
+                .get(1, 0, 1)
+                .block
+                .fluid_tint
+        };
+        assert_eq!(tint(&world), 0x112233);
+        assert_eq!(world.mesh_cache.rebuild_dirty(1), vec![coord]);
+
+        world
+            .apply_play_event(&PlayEvent::ChunksBiomes {
+                chunks: vec![ChunkBiomeData {
+                    cx: 0,
+                    cz: 0,
+                    data: vec![0, 2, 0],
+                }],
+            })
+            .unwrap();
+        assert_eq!(tint(&world), 0x445566);
+        assert_eq!(world.mesh_cache.rebuild_dirty(1), vec![coord]);
+    }
+
+    #[test]
+    fn block_entity_raw_and_visual_entries_share_lifecycle() {
+        let mut blocks = BlockTable::builtin();
+        blocks
+            .state_names
+            .resize(blocks.state_count(), String::new());
+        blocks.state_names[1] = "minecraft:oak_sign".into();
+        blocks.state_names[2] = "minecraft:oak_sign".into();
+        let mut world = WorldState::new(DimensionMeta::default(), blocks);
+        let states = [1; SECTION_CELLS];
+        let section = StoredSection::from_states(
+            &states,
+            [0; LIGHT_BYTES],
+            [0; LIGHT_BYTES],
+            &world.blocks,
+            world.state_count,
+        )
+        .unwrap();
+        let coord = SectionCoord(0, world.dimension.min_section_y(), 0);
+        world
+            .mesh_cache
+            .insert_compressed(coord, section.to_compressed_mesh_section(&world.blocks));
+        world.columns.insert(
+            (0, 0),
+            ChunkColumn {
+                cx: 0,
+                cz: 0,
+                sections: vec![section],
+            },
+        );
+        let pos = [1, world.dimension.min_y, 1];
+
+        for n in 0..MAX_TRACKED_BLOCK_ENTITIES - 1 {
+            let distant = [16 + n as i32, pos[1], 0];
+            world.apply_block_entity_data(distant, 7, &[10, 0]);
+        }
+        world.apply_block_entity_data(pos, 7, &[10, 0]);
+        world.apply_block_entity_data([0, pos[1], 0], 7, &[10, 0]);
+        assert_eq!(world.block_entities.len(), MAX_TRACKED_BLOCK_ENTITIES);
+        assert_eq!(
+            world.block_entity_visual_nbt.len(),
+            MAX_TRACKED_BLOCK_ENTITIES
+        );
+        assert!(!world.block_entity_visual_nbt.contains_key(&[0, pos[1], 0]));
+
+        world.apply_block_update(pos, 2).unwrap(); // same block, different state
+        assert!(world.block_entities.contains_key(&pos));
+        assert!(world.block_entity_visual_nbt.contains_key(&pos));
+        world.apply_block_update(pos, 0).unwrap(); // removed
+        assert!(!world.block_entities.contains_key(&pos));
+        assert!(!world.block_entity_visual_nbt.contains_key(&pos));
     }
 
     #[test]

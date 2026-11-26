@@ -196,7 +196,7 @@ fn encodes_ping_pong_and_abilities() {
 
 #[test]
 fn encodes_edit_book_layout() {
-    let (n, p) = encode_edit_book(5, &["a", "bc"], Some("title"));
+    let (n, p) = encode_edit_book(5, &["a", "bc"], Some("title")).unwrap();
     assert_eq!(n, "edit_book");
     let mut expect = vi(5);
     expect.extend(vi(2));
@@ -206,7 +206,7 @@ fn encodes_edit_book_layout() {
     expect.extend(s("title"));
     assert_eq!(p, expect);
 
-    let (_, p) = encode_edit_book(0, &[], None);
+    let (_, p) = encode_edit_book(0, &[], None).unwrap();
     assert_eq!(p, cat(&[&vi(0), &vi(0), &[0]]));
 }
 
@@ -922,4 +922,15 @@ fn resource_pack_status_codes_match_vanilla_actions() {
     assert_eq!(RESOURCE_PACK_INVALID_URL, 5);
     assert_eq!(RESOURCE_PACK_FAILED_RELOAD, 6);
     assert_eq!(RESOURCE_PACK_DISCARDED, 7);
+}
+
+#[test]
+fn edit_book_checks_page_count_and_utf16_lengths() {
+    let max_page = "😀".repeat(4096);
+    let max_title = "😀".repeat(64);
+    assert!(encode_edit_book(0, &[""; 200], None).is_ok());
+    assert!(encode_edit_book(0, &[""; 201], None).is_err());
+    assert!(encode_edit_book(0, &[&max_page], Some(&max_title)).is_ok());
+    assert!(encode_edit_book(0, &[&format!("{max_page}x")], None).is_err());
+    assert!(encode_edit_book(0, &[], Some(&format!("{max_title}x"))).is_err());
 }

@@ -198,7 +198,7 @@ pub struct RenderWorldSnapshot {
     pub thunder_level: f32,
     pub world_age: i64,
     pub time_of_day: i64,
-    pub level_events: Vec<(VisualLevelEvent, [i32; 3])>,
+    pub level_events: Vec<(VisualLevelEvent, [i32; 3], bool)>,
 }
 
 /// Build an owned, stable snapshot without mutating or draining the live world queues.

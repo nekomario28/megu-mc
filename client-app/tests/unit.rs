@@ -2351,7 +2351,7 @@ fn protocol767_death_respawn_loop_mock_server() {
         write_varint(&mut jg, 0); // dimension type id
         write_string(&mut jg, "minecraft:overworld");
         jg.extend_from_slice(&0i64.to_be_bytes()); // hashed seed
-        jg.push(0); // game mode: survival
+        jg.push(1); // game mode: creative
         jg.push(0); // previous game mode
         jg.push(0); // debug
         jg.push(0); // flat
@@ -2391,8 +2391,8 @@ fn protocol767_death_respawn_loop_mock_server() {
         write_varint(&mut rs, 0); // dimension type id
         write_string(&mut rs, "minecraft:overworld");
         rs.extend_from_slice(&0i64.to_be_bytes()); // hashed seed
-        rs.push(0); // game mode
-        rs.push(0); // previous game mode
+        rs.push(2); // game mode: adventure
+        rs.push(1); // previous game mode: creative
         rs.push(0); // debug
         rs.push(0); // flat
         rs.push(0); // last death location absent
@@ -2436,6 +2436,11 @@ fn protocol767_death_respawn_loop_mock_server() {
             } => {
                 assert_eq!(entity_id, 11);
                 assert!(!hardcore);
+                assert_eq!(cli.game_mode, Some(1));
+                assert!(!cli.show_death_screen);
+                assert!(cli
+                    .send_container_click(0, 0, 0, 0, 0, &[(0, &[0][..]); 129], &[0])
+                    .is_err());
                 assert!(!death.is_dead());
             }
             PlayEvent::SetExperience { total, .. } => {
@@ -2482,6 +2487,8 @@ fn protocol767_death_respawn_loop_mock_server() {
             }
             PlayEvent::Respawn { .. } => {
                 assert_eq!(phase, 2);
+                assert_eq!(cli.game_mode, Some(2));
+                assert!(!cli.show_death_screen);
                 assert!(!death.is_dead(), "respawn packet clears death");
             }
             other => panic!("unexpected play event: {other:?}"),

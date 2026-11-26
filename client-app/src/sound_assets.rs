@@ -131,23 +131,22 @@ impl SoundEventRegistry {
             })?;
         let mut pairs: Vec<(u32, &str)> = Vec::with_capacity(entries.len());
         for (name, val) in entries {
-            if let Some(id) = val
-                .get("protocol_id")
-                .and_then(JsonValue::as_i64)
-                .and_then(|v| u32::try_from(v).ok())
-            {
-                pairs.push((id, name.as_str()));
-            }
+            let Some(id) = val.get("protocol_id").and_then(JsonValue::as_i64) else {
+                continue;
+            };
+            let id = u16::try_from(id).map_err(|_| {
+                format!(
+                    "{}: sound event {name} has out-of-range protocol_id {id}",
+                    path.display()
+                )
+            })?;
+            pairs.push((u32::from(id), name.as_str()));
         }
         if pairs.is_empty() {
             return Err(format!("{}: empty minecraft:sound_event", path.display()));
         }
         pairs.sort_unstable_by_key(|(id, _)| *id);
-        let max_id = pairs
-            .last()
-            .map(|(id, _)| *id as usize)
-            .unwrap_or(0)
-            .min(65_535);
+        let max_id = pairs.last().map(|(id, _)| *id as usize).unwrap_or(0);
         let mut names = vec![String::new(); max_id + 1];
         for (id, name) in pairs {
             names[id as usize] = name.to_string();
@@ -1306,6 +1305,26 @@ mod tests {
         let idx = root.join("indexes/test.json");
         std::fs::write(&idx, index).unwrap();
         root.to_path_buf()
+    }
+
+    #[test]
+    fn sound_registry_rejects_protocol_ids_past_u16() {
+        let path =
+            std::env::temp_dir().join(format!("megu-sound-registry-{}.json", std::process::id()));
+        let registry = |id| {
+            format!(
+                r#"{{"minecraft:sound_event":{{"entries":{{"minecraft:test":{{"protocol_id":{id}}}}}}}}}"#
+            )
+        };
+        std::fs::write(&path, registry(65535)).unwrap();
+        let valid = SoundEventRegistry::load_registries_json(&path).unwrap();
+        assert_eq!(valid.name(65535), Some("test"));
+        std::fs::write(&path, registry(65536)).unwrap();
+        let invalid = SoundEventRegistry::load_registries_json(&path);
+        std::fs::remove_file(path).unwrap();
+        assert!(invalid
+            .unwrap_err()
+            .contains("out-of-range protocol_id 65536"));
     }
 
     #[test]
