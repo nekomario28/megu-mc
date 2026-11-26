@@ -307,8 +307,7 @@ impl IncrementalSaveQueue {
             }
             let est = front.est_bytes as u64;
             if stats.chunks_flushed > 0
-                && stats.bytes_charged.saturating_add(est)
-                    > self.budget.max_bytes_per_tick as u64
+                && stats.bytes_charged.saturating_add(est) > self.budget.max_bytes_per_tick as u64
             {
                 break;
             }
@@ -317,11 +316,9 @@ impl IncrementalSaveQueue {
                 Ok(outcome) => {
                     self.queued.remove(&item.key());
                     stats.chunks_flushed += 1;
-                    stats.chunks_skipped_unchanged +=
-                        usize::from(outcome.skipped_unchanged);
+                    stats.chunks_skipped_unchanged += usize::from(outcome.skipped_unchanged);
                     stats.bytes_charged = stats.bytes_charged.saturating_add(est);
-                    stats.bytes_flushed =
-                        stats.bytes_flushed.saturating_add(outcome.bytes_written);
+                    stats.bytes_flushed = stats.bytes_flushed.saturating_add(outcome.bytes_written);
                 }
                 Err(e) => {
                     self.pending.push_front(item);
@@ -401,9 +398,8 @@ fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
     let staged = dir.join("level.dat_new");
     if staged.is_file() {
         if live.is_file() {
-            std::fs::remove_file(&staged).map_err(|e| {
-                format!("cannot remove stale {}: {e}", staged.display())
-            })?;
+            std::fs::remove_file(&staged)
+                .map_err(|e| format!("cannot remove stale {}: {e}", staged.display()))?;
         } else {
             std::fs::rename(&staged, &live).map_err(|e| {
                 format!(
@@ -431,9 +427,8 @@ fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
                 .is_some_and(|name| name.ends_with(".tmp"));
             let is_file = entry.file_type().is_ok_and(|t| t.is_file());
             if is_tmp && is_file {
-                std::fs::remove_file(entry.path()).map_err(|e| {
-                    format!("cannot remove stale {}: {e}", entry.path().display())
-                })?;
+                std::fs::remove_file(entry.path())
+                    .map_err(|e| format!("cannot remove stale {}: {e}", entry.path().display()))?;
                 recovered += 1;
             }
         }
@@ -447,6 +442,69 @@ fn anvil_recover_world_staging(dir: &std::path::Path) -> Result<usize, String> {
 /// `Err` carries the same message `read_region_file` would have aborted with.
 type RegionChunkRecord = ((i32, i32), AnvilChunkRecord);
 type RegionFileSelection = (Option<Vec<u8>>, HashMap<(i32, i32), AnvilChunkRecord>);
+
+/// The bounded sidecar path vanilla uses for one oversized chunk. The filename is
+/// generated from integer coordinates, so it cannot carry separators or traversal.
+fn anvil_external_chunk_path(
+    region_path: &std::path::Path,
+    cx: i32,
+    cz: i32,
+) -> std::path::PathBuf {
+    region_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!("c.{cx}.{cz}.mcc"))
+}
+
+fn anvil_read_external_chunk(
+    region_path: &std::path::Path,
+    cx: i32,
+    cz: i32,
+) -> Result<Vec<u8>, String> {
+    let path = anvil_external_chunk_path(region_path, cx, cz);
+    let mut file = std::fs::File::open(&path)
+        .map_err(|e| format!("cannot open external chunk {}: {e}", path.display()))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect external chunk {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        return Err(format!(
+            "external chunk {} is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > ANVIL_CHUNK_NBT_BUDGET as u64 {
+        return Err(format!(
+            "external chunk {} exceeds the compressed-size budget",
+            path.display()
+        ));
+    }
+    let mut out = Vec::new();
+    std::io::Read::take(&mut file, ANVIL_CHUNK_NBT_BUDGET as u64 + 1)
+        .read_to_end(&mut out)
+        .map_err(|e| format!("cannot read external chunk {}: {e}", path.display()))?;
+    if out.len() > ANVIL_CHUNK_NBT_BUDGET {
+        return Err(format!(
+            "external chunk {} exceeds the compressed-size budget",
+            path.display()
+        ));
+    }
+    Ok(out)
+}
+
+fn anvil_write_external_chunk(
+    region_path: &std::path::Path,
+    cx: i32,
+    cz: i32,
+    compressed: &[u8],
+) -> Result<(), String> {
+    if compressed.len() > ANVIL_CHUNK_NBT_BUDGET {
+        return Err(format!(
+            "external chunk ({cx}, {cz}) exceeds the compressed-size budget"
+        ));
+    }
+    anvil_atomic_write(&anvil_external_chunk_path(region_path, cx, cz), compressed)
+}
 
 /// The location-table bounds of one populated slot: `(offset, sectors, byte start)`.
 /// This is the structural half of `anvil_region_slot` — it never touches the
@@ -490,19 +548,31 @@ fn anvil_region_slot(
         return Ok(None);
     };
     let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
-    if len < 2 || 4 + len > sectors * ANVIL_SECTOR {
+    if len < 1 || 4 + len > sectors * ANVIL_SECTOR {
         return Err(format!(
             "invalid chunk payload length {len} in {}",
             path.display()
         ));
     }
     let compression = file[start + 4];
-    let raw = anvil_decompress(compression, &file[start + 5..start + 4 + len])?;
+    let cx = rx * 32 + (slot % 32) as i32;
+    let cz = rz * 32 + (slot / 32) as i32;
+    let raw = if compression & 0x80 != 0 {
+        let base = compression & 0x7f;
+        if len != 1 || !matches!(base, 1..=3) {
+            return Err(format!(
+                "invalid external chunk stub length {len} or compression {compression} in {}",
+                path.display()
+            ));
+        }
+        let payload = anvil_read_external_chunk(path, cx, cz)?;
+        anvil_decompress(base, &payload)?
+    } else {
+        anvil_decompress(compression, &file[start + 5..start + 4 + len])?
+    };
     let (_, nbt) = crate::nbt::read_named(&raw)
         .map_err(|e| format!("invalid chunk NBT in {}: {e}", path.display()))?;
     let timestamp = u32::from_be_bytes(timestamps[slot * 4..slot * 4 + 4].try_into().unwrap());
-    let cx = rx * 32 + (slot % 32) as i32;
-    let cz = rz * 32 + (slot / 32) as i32;
     Ok(Some((
         (cx, cz),
         AnvilChunkRecord {
@@ -580,6 +650,40 @@ fn read_region_file_selected(
     Ok((Some(file), records))
 }
 
+fn rx_chunk_for_slot(path: &std::path::Path, slot: usize) -> Option<(i32, i32)> {
+    let (rx, rz) = anvil_region_coords(path).ok()?;
+    Some((rx * 32 + (slot % 32) as i32, rz * 32 + (slot / 32) as i32))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anvil_write_external_region_record(
+    body: &mut Vec<u8>,
+    locations: &mut [u8; ANVIL_SECTOR],
+    timestamps: &mut [u8; ANVIL_SECTOR],
+    slot: usize,
+    record: &AnvilChunkRecord,
+    compressed: &[u8],
+    cx: i32,
+    cz: i32,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    let compression = match record.compression {
+        1..=3 => record.compression | 0x80,
+        other => return Err(format!("unknown chunk compression type {other}")),
+    };
+    anvil_write_external_chunk(path, cx, cz, compressed)?;
+    let offset = 2 + body.len() / ANVIL_SECTOR;
+    body.extend_from_slice(&1u32.to_be_bytes());
+    body.push(compression);
+    body.resize(body.len().div_ceil(ANVIL_SECTOR) * ANVIL_SECTOR, 0);
+    locations[slot * 4] = ((offset >> 16) & 0xff) as u8;
+    locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
+    locations[slot * 4 + 2] = (offset & 0xff) as u8;
+    locations[slot * 4 + 3] = 1;
+    timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&record.timestamp.to_be_bytes());
+    Ok(())
+}
+
 /// Write one fresh chunk record into the packed body and point its slot at it.
 fn anvil_write_region_record(
     body: &mut Vec<u8>,
@@ -595,8 +699,19 @@ fn anvil_write_region_record(
     let len = compressed.len() + 1;
     let sectors = (4 + len).div_ceil(ANVIL_SECTOR);
     if sectors > 255 {
-        let cx = path.display().to_string();
-        return Err(format!("chunk in {cx} exceeds 255 sectors"));
+        let cx = rx_chunk_for_slot(path, slot).unwrap_or((0, 0)).0;
+        let cz = rx_chunk_for_slot(path, slot).unwrap_or((0, 0)).1;
+        return anvil_write_external_region_record(
+            body,
+            locations,
+            timestamps,
+            slot,
+            record,
+            &compressed,
+            cx,
+            cz,
+            path,
+        );
     }
     let offset = 2 + body.len() / ANVIL_SECTOR;
     body.extend_from_slice(&(len as u32).to_be_bytes());
@@ -607,8 +722,7 @@ fn anvil_write_region_record(
     locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
     locations[slot * 4 + 2] = (offset & 0xff) as u8;
     locations[slot * 4 + 3] = sectors as u8;
-    timestamps[slot * 4..slot * 4 + 4]
-        .copy_from_slice(&record.timestamp.to_be_bytes());
+    timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&record.timestamp.to_be_bytes());
     Ok(())
 }
 
@@ -625,7 +739,7 @@ fn anvil_copy_region_run(
     path: &std::path::Path,
 ) -> Result<(), String> {
     let len = u32::from_be_bytes(file[start..start + 4].try_into().unwrap()) as usize;
-    if len < 2 || 4 + len > sectors * ANVIL_SECTOR {
+    if len < 1 || 4 + len > sectors * ANVIL_SECTOR {
         return Err(format!(
             "invalid chunk payload length {len} in {}",
             path.display()
@@ -708,9 +822,7 @@ fn update_region_file_raw(
     updates: &HashMap<(i32, i32), AnvilChunkRecord>,
 ) -> Result<(), String> {
     let existing = if path.is_file() {
-        Some(
-            std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-        )
+        Some(std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?)
     } else {
         None
     };
@@ -722,9 +834,7 @@ fn update_region_file_raw(
 /// Used by the import path — a merge-write keeps the strict reader, since a
 /// partial file must never be rewritten over itself.
 #[allow(dead_code)]
-fn read_region_file_tolerant(
-    path: &std::path::Path,
-) -> Result<(AnvilRegion, Vec<String>), String> {
+fn read_region_file_tolerant(path: &std::path::Path) -> Result<(AnvilRegion, Vec<String>), String> {
     read_region_file_impl(path, true)
 }
 
@@ -801,7 +911,14 @@ mod region_tests {
     type SlotOut = Result<Option<((i32, i32), AnvilChunkRecord)>, String>;
 
     fn slot_of(file: &[u8], timestamps: &[u8], slot: usize, rx: i32, rz: i32) -> SlotOut {
-        anvil_region_slot(file, timestamps, slot, rx, rz, std::path::Path::new("r.0.0.mca"))
+        anvil_region_slot(
+            file,
+            timestamps,
+            slot,
+            rx,
+            rz,
+            std::path::Path::new("r.0.0.mca"),
+        )
     }
 
     #[test]
@@ -853,7 +970,10 @@ mod region_tests {
         // Tag identity is part of the hash: Int(7) and Long(7) differ.
         let as_int = anvil_obj(&[("v", AnvilNbt::Int(7))]);
         let as_long = anvil_obj(&[("v", AnvilNbt::Long(7))]);
-        assert_ne!(anvil_nbt_fingerprint(&as_int), anvil_nbt_fingerprint(&as_long));
+        assert_ne!(
+            anvil_nbt_fingerprint(&as_int),
+            anvil_nbt_fingerprint(&as_long)
+        );
         // The avalanche decorrelates: sequential integers do not produce
         // sequential fingerprints.
         let f0 = anvil_bytes_fingerprint(&[0u8; 8]);
@@ -869,7 +989,12 @@ mod region_tests {
         let on_disk = chunk_nbt(1, 2);
         let disk_hash = anvil_nbt_fingerprint(&on_disk);
         // Nothing on disk: a write is always required.
-        assert!(!anvil_payload_unchanged(key.clone(), disk_hash, None, &mut hashes));
+        assert!(!anvil_payload_unchanged(
+            key.clone(),
+            disk_hash,
+            None,
+            &mut hashes
+        ));
         assert!(hashes.is_empty(), "a missing record caches nothing");
         // Identical content: skip the write.
         assert!(anvil_payload_unchanged(
@@ -946,7 +1071,10 @@ mod region_tests {
                 })
             })
             .unwrap();
-        assert_eq!(stats.chunks_flushed, 1, "oversized first chunk still flushes");
+        assert_eq!(
+            stats.chunks_flushed, 1,
+            "oversized first chunk still flushes"
+        );
         assert_eq!(stats.chunks_skipped_unchanged, 1);
         assert_eq!(stats.bytes_flushed, 4096);
         assert_eq!(stats.remaining, 1);
@@ -969,7 +1097,11 @@ mod region_tests {
             })
             .unwrap_err();
         assert_eq!(err, "boom");
-        assert_eq!(seen, vec![0, 1, 2], "chunks after the failure are untouched");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2],
+            "chunks after the failure are untouched"
+        );
         assert_eq!(queue.len(), 2, "cx=2 requeued at head, cx=3 still pending");
         let stats = queue
             .drain_budgeted(|item| {
@@ -994,10 +1126,7 @@ mod region_tests {
         };
         // offset == 0 with nonzero sectors, and nonzero offset with zero
         // sectors, are both invalid location entries.
-        for file in [
-            good(0, 0, 4, &payload),
-            good(0, 5, 0, &payload),
-        ] {
+        for file in [good(0, 0, 4, &payload), good(0, 5, 0, &payload)] {
             let (_, timestamps) = file.split_at(ANVIL_SECTOR);
             assert!(slot_of(&file, timestamps, 0, 0, 0).is_err());
         }
@@ -1094,7 +1223,10 @@ mod region_tests {
         let got = read_region_file(&mca).unwrap();
         assert_eq!(got, shrunk);
         let shrunk_bytes = std::fs::read(&mca).unwrap();
-        assert!(shrunk_bytes.len() < first_bytes.len(), "dead sectors reclaimed");
+        assert!(
+            shrunk_bytes.len() < first_bytes.len(),
+            "dead sectors reclaimed"
+        );
         // The surviving chunk's location entry points at offset 2 (first run).
         let slot = 4;
         let off = (usize::from(shrunk_bytes[slot]) << 16)

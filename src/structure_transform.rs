@@ -178,6 +178,7 @@ pub(crate) fn pinned_data_bytes(rel: &str) -> Option<Vec<u8>> {
 
 /// [`pinned_data_bytes`] for a table that must exist: the panic names every
 /// candidate tried so a missing pack is a readable error, not a silent none.
+#[allow(dead_code)]
 pub(crate) fn pinned_data_expect(rel: &str, what: &str) -> Vec<u8> {
     pinned_data_bytes(rel).unwrap_or_else(|| {
         panic!(
@@ -195,26 +196,101 @@ pub(crate) fn pinned_data_expect(rel: &str, what: &str) -> Vec<u8> {
 /// generated from the pinned 1.21.1 jar. `include_bytes!` used to compile it
 /// in; loading it lazily keeps stripped checkouts building while a missing
 /// pack still fails closed on first use.
-fn transform_table() -> &'static [u8] {
-    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+fn transform_table() -> Option<&'static [u8]> {
+    static TABLE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     TABLE
-        .get_or_init(|| {
-            pinned_data_expect(
-                "assets/structure_state_transforms_1211.bin",
-                "structure state transform table",
-            )
-        })
-        .as_slice()
+        .get_or_init(|| pinned_data_bytes("assets/structure_state_transforms_1211.bin"))
+        .as_deref()
+}
+
+fn turn_horizontal(direction: &str, rotation: Rotation) -> &str {
+    const DIRS: [&str; 4] = ["north", "east", "south", "west"];
+    let Some(i) = DIRS.iter().position(|d| *d == direction) else {
+        return direction;
+    };
+    let delta = match rotation {
+        Rotation::None => 0,
+        Rotation::Clockwise90 => 1,
+        Rotation::Clockwise180 => 2,
+        Rotation::Counterclockwise90 => 3,
+    };
+    DIRS[(i + delta) & 3]
+}
+
+fn mirror_horizontal(direction: &str, mirror: Mirror) -> &str {
+    match mirror {
+        Mirror::None => direction,
+        // This enum's FrontBack flips x and LeftRight flips z (see Mirror::from_index).
+        Mirror::FrontBack => match direction {
+            "east" => "west",
+            "west" => "east",
+            _ => direction,
+        },
+        Mirror::LeftRight => match direction {
+            "north" => "south",
+            "south" => "north",
+            _ => direction,
+        },
+    }
+}
+
+fn transform_direction(direction: &str, mirror: Mirror, rotation: Rotation) -> String {
+    turn_horizontal(mirror_horizontal(direction, mirror), rotation).to_owned()
+}
+
+/// Derive a state transform from the blockstate properties when the pinned binary table
+/// is absent. This covers the dominant directional state contracts (facing/orientation,
+/// horizontal rotation and per-direction connection properties) deterministically; the
+/// binary table remains the exact native oracle when present.
+fn derive_state_transform(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
+    let reg = crate::block_registry::breg()?;
+    let props = reg.properties_of(state)?;
+    let mut out = state;
+    let mut delayed: Vec<(String, String)> = Vec::new();
+    for (key, value) in props {
+        if key == "facing" || key == "orientation" {
+            let mapped = transform_direction(&value, mirror, rotation);
+            out = reg.with_prop(out, &key, &mapped);
+        } else if key == "rotation" {
+            if let Ok(v) = value.parse::<i32>() {
+                let quarter = match rotation {
+                    Rotation::None => 0,
+                    Rotation::Clockwise90 => 4,
+                    Rotation::Clockwise180 => 8,
+                    Rotation::Counterclockwise90 => 12,
+                };
+                out = reg.with_prop(out, &key, &((v + quarter).rem_euclid(16)).to_string());
+            }
+        } else if key == "axis" && !matches!(rotation, Rotation::None | Rotation::Clockwise180) {
+            let mapped = match value.as_str() {
+                "x" => "z",
+                "z" => "x",
+                _ => value.as_str(),
+            };
+            out = reg.with_prop(out, &key, mapped);
+        } else if matches!(key.as_str(), "north" | "east" | "south" | "west") {
+            let mapped_key = transform_direction(&key, mirror, rotation);
+            delayed.push((mapped_key, value));
+        }
+    }
+    for (key, value) in delayed {
+        out = reg.with_prop(out, &key, &value);
+    }
+    Some(out)
 }
 
 pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u32> {
-    let index = (state as usize)
-        .checked_mul(12)?
-        .checked_add(mirror as usize * 4 + rotation as usize)?
-        .checked_mul(4)?;
-    let end = index.checked_add(4)?;
-    let bytes = transform_table().get(index..end)?;
-    Some(u32::from_be_bytes(bytes.try_into().unwrap()))
+    if let Some(table) = transform_table() {
+        let index = (state as usize)
+            .checked_mul(12)?
+            .checked_add(mirror as usize * 4 + rotation as usize)?
+            .checked_mul(4)?;
+        let end = index.checked_add(4)?;
+        if let Some(bytes) = table.get(index..end) {
+            return Some(u32::from_be_bytes(bytes.try_into().unwrap()));
+        }
+    }
+    derive_state_transform(state, mirror, rotation)
 }
 
 #[cfg(all(test, megu_vanilla_data))]

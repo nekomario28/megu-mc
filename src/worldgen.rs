@@ -498,7 +498,10 @@ pub(crate) enum CustomGeneratorKind {
     Noise { preset: NoisePreset },
     /// `minecraft:flat`: `(block state id, layer height)` stacked upward from
     /// `min_y`, every cell above the last layer air, every biome quart `biome_id`.
-    Flat { layers: Vec<(u16, u32)>, biome_id: i64 },
+    Flat {
+        layers: Vec<(u16, u32)>,
+        biome_id: i64,
+    },
     /// `minecraft:debug`, an unknown generator type, or a noise/flat settings object
     /// this engine cannot load: every cell air, every biome quart `biome_id`.
     Void { biome_id: i64 },
@@ -561,19 +564,33 @@ const MAX_DIMENSIONS: usize = 255;
 
 /// Total registered slots: the pinned vanilla three plus every custom dimension.
 pub(crate) fn registered_dimension_count() -> usize {
-    DimId::ALL.len() + DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.len()
+    DimId::ALL.len()
+        + DIMENSION_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .specs
+            .len()
 }
 
 /// The spec a custom dimension registered under, cloned. Vanilla dimensions and
 /// unregistered slots answer `None` — their facts live in `GenFacts`.
 pub(crate) fn dimension_spec(dimension: DimId) -> Option<DimensionSpec> {
     let index = dimension.index().checked_sub(DimId::ALL.len())?;
-    DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.get(index).cloned()
+    DIMENSION_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .specs
+        .get(index)
+        .cloned()
 }
 
 /// Every custom dimension, in registration (and therefore slot) order.
 pub(crate) fn custom_dimension_specs() -> Vec<DimensionSpec> {
-    DIMENSION_REGISTRY.read().unwrap_or_else(|e| e.into_inner()).specs.clone()
+    DIMENSION_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .specs
+        .clone()
 }
 
 /// The biome a custom dimension's generator declares for its fills — the
@@ -598,7 +615,9 @@ fn dimension_key(dimension: DimId) -> Option<&'static str> {
 /// Install `spec` under its canonical key. Re-registering an existing key updates it
 /// in place so slots stay stable across a datapack rescan.
 fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
-    let mut registry = DIMENSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    let mut registry = DIMENSION_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     if let Some(&raw) = registry.by_key.get(spec.key) {
         spec.id = DimId(raw);
         registry.specs[raw as usize - DimId::ALL.len()] = spec;
@@ -623,13 +642,27 @@ fn register_dimension_spec(mut spec: DimensionSpec) -> Result<DimId, String> {
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn reset_dimension_registry() {
-    let mut registry = DIMENSION_REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+    let mut registry = DIMENSION_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
     registry.specs.clear();
     registry.by_key.clear();
     drop(registry);
-    PER_DIM.gens.write().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
-    PER_DIM.data.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
-    PER_DIM.facts.lock().unwrap_or_else(|e| e.into_inner()).truncate(DimId::ALL.len());
+    PER_DIM
+        .gens
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .truncate(DimId::ALL.len());
+    PER_DIM
+        .data
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .truncate(DimId::ALL.len());
+    PER_DIM
+        .facts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .truncate(DimId::ALL.len());
 }
 
 /// `j.num()` as an integer, or `None` when the field is absent or not a whole number.
@@ -660,34 +693,78 @@ fn canonical_key(name: &str) -> Option<String> {
     };
     let valid = |part: &str, colon: bool| {
         !part.is_empty()
-            && part
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_-./".contains(c) || (colon && c == ':'))
+            && part.chars().all(|c| {
+                c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || "_-./".contains(c)
+                    || (colon && c == ':')
+            })
     };
-    (valid(namespace, false) && valid(path, true))
-        .then(|| format!("{namespace}:{path}"))
+    (valid(namespace, false) && valid(path, true)).then(|| format!("{namespace}:{path}"))
 }
 
 /// The `dimension_type` values the four vanilla registry names carry. Custom
 /// dimensions may name them; `minecraft:overworld_caves` maps onto the Overworld
 /// window because this port does not distinguish the caves variant.
 fn vanilla_dimension_type(type_key: &str) -> Option<DimensionSpec> {
-    let (min_y, height, skylight, ceiling, ultrawarm, scale, ambient, effects, infiniburn, raids, bed, anchor) =
-        match type_key {
-            "minecraft:overworld" | "minecraft:overworld_caves" => (
-                -64, 384, true, false, false, 1.0, 0.0, "minecraft:overworld",
-                "#minecraft:infiniburn_overworld", true, true, false,
-            ),
-            "minecraft:the_nether" => (
-                0, 256, false, true, true, 8.0, 0.1, "minecraft:the_nether",
-                "#minecraft:infiniburn_nether", false, false, true,
-            ),
-            "minecraft:the_end" => (
-                0, 256, false, false, false, 1.0, 0.0, "minecraft:the_end",
-                "#minecraft:infiniburn_end", false, false, false,
-            ),
-            _ => return None,
-        };
+    let (
+        min_y,
+        height,
+        skylight,
+        ceiling,
+        ultrawarm,
+        scale,
+        ambient,
+        effects,
+        infiniburn,
+        raids,
+        bed,
+        anchor,
+    ) = match type_key {
+        "minecraft:overworld" | "minecraft:overworld_caves" => (
+            -64,
+            384,
+            true,
+            false,
+            false,
+            1.0,
+            0.0,
+            "minecraft:overworld",
+            "#minecraft:infiniburn_overworld",
+            true,
+            true,
+            false,
+        ),
+        "minecraft:the_nether" => (
+            0,
+            256,
+            false,
+            true,
+            true,
+            8.0,
+            0.1,
+            "minecraft:the_nether",
+            "#minecraft:infiniburn_nether",
+            false,
+            false,
+            true,
+        ),
+        "minecraft:the_end" => (
+            0,
+            256,
+            false,
+            false,
+            false,
+            1.0,
+            0.0,
+            "minecraft:the_end",
+            "#minecraft:infiniburn_end",
+            false,
+            false,
+            false,
+        ),
+        _ => return None,
+    };
     Some(DimensionSpec {
         id: DimId::Overworld,
         key: "",
@@ -751,7 +828,9 @@ fn parse_dimension_type(key: &str, j: &J) -> Result<DimensionSpec, String> {
         has_raids: jbool(j, "has_raids", natural),
         bed_works: jbool(j, "bed_works", true),
         respawn_anchor_works: jbool(j, "respawn_anchor_works", false),
-        effects: jstring(j, "effects").unwrap_or("minecraft:overworld").into(),
+        effects: jstring(j, "effects")
+            .unwrap_or("minecraft:overworld")
+            .into(),
         infiniburn: jstring(j, "infiniburn")
             .unwrap_or("#minecraft:infiniburn_overworld")
             .into(),
@@ -759,8 +838,8 @@ fn parse_dimension_type(key: &str, j: &J) -> Result<DimensionSpec, String> {
             .get("monster_spawn_light_level")
             .and_then(|v| jint(&J::Obj(vec![("v".into(), v.clone())]), "v"))
             .unwrap_or(0) as i32,
-        monster_spawn_block_light_limit: jint(j, "monster_spawn_block_light_limit")
-            .unwrap_or(0) as i32,
+        monster_spawn_block_light_limit: jint(j, "monster_spawn_block_light_limit").unwrap_or(0)
+            as i32,
         generator: CustomGeneratorKind::Void { biome_id: 39 },
         default_biome: None,
     })
@@ -826,8 +905,7 @@ fn parse_dimension_generator(
                     if !(height > 0.0 && height.fract() == 0.0 && height <= 4096.0) {
                         return Err(bad("flat layer height must be a positive integer"));
                     }
-                    let Some(state) = res(name).filter(|&id| id <= u32::from(u16::MAX))
-                    else {
+                    let Some(state) = res(name).filter(|&id| id <= u32::from(u16::MAX)) else {
                         return Err(bad(&format!("flat layer block '{name}' is unknown")));
                     };
                     layers.push((state as u16, height as u32));
@@ -899,8 +977,7 @@ pub(crate) fn register_datapack_dimensions(
                                 .ok()
                                 .and_then(|p| p.to_str())
                                 .map(|p| p.replace('\\', "/"));
-                            if let (Some(rel), Ok(body)) = (rel, std::fs::read_to_string(&path))
-                            {
+                            if let (Some(rel), Ok(body)) = (rel, std::fs::read_to_string(&path)) {
                                 files.push((rel, body));
                             }
                         }
@@ -912,8 +989,7 @@ pub(crate) fn register_datapack_dimensions(
         for (rel, body) in files {
             // `data/<ns>/<kind>/<path>.json` — anything else is not a dimension file.
             let mut parts = rel.splitn(3, '/');
-            let (Some("data"), Some(ns), Some(rest)) =
-                (parts.next(), parts.next(), parts.next())
+            let (Some("data"), Some(ns), Some(rest)) = (parts.next(), parts.next(), parts.next())
             else {
                 continue;
             };
@@ -957,19 +1033,16 @@ fn register_dimension_maps(
         ) {
             continue;
         }
-        let Some(type_key) = canonical_key(dim_j.get("type").map(J::str).unwrap_or(""))
-        else {
+        let Some(type_key) = canonical_key(dim_j.get("type").map(J::str).unwrap_or("")) else {
             eprintln!("[spine] dimension {key}: missing or invalid type");
             continue;
         };
         let type_spec = match dim_j.get("type") {
             // An inline type object parses directly; the dimension's own key names it.
-            Some(J::Obj(_)) => {
-                match parse_dimension_type(&key, dim_j.get("type").unwrap()) {
-                    Ok(spec) => Ok(spec),
-                    Err(error) => Err(error),
-                }
-            }
+            Some(J::Obj(_)) => match parse_dimension_type(&key, dim_j.get("type").unwrap()) {
+                Ok(spec) => Ok(spec),
+                Err(error) => Err(error),
+            },
             _ => {
                 let (tns, tpath) = type_key.split_once(':').unwrap();
                 match types.get(&(tns.to_string(), tpath.to_string())) {
@@ -1321,11 +1394,15 @@ static GLOBAL_BEARD_RESOLVER: Mutex<Option<BeardResolver>> = Mutex::new(None);
 
 /// Register the process-wide beardifier resolver (`main.rs` and the structure tests).
 pub(crate) fn register_beard_resolver(resolver: BeardResolver) {
-    *GLOBAL_BEARD_RESOLVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(resolver);
+    *GLOBAL_BEARD_RESOLVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(resolver);
 }
 
 fn global_beard_resolver() -> Option<BeardResolver> {
-    *GLOBAL_BEARD_RESOLVER.lock().unwrap_or_else(|e| e.into_inner())
+    *GLOBAL_BEARD_RESOLVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[derive(Clone)]
@@ -1618,31 +1695,46 @@ fn fold_constant_dfs(dfs: &mut Vec<DF>) -> usize {
             DF::C(v) => Some(*v),
             DF::Zero => Some(0.0),
             DF::Add(a, b) => {
-                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *b, vals, state),
+                ) {
                     (Some(a), Some(b)) => Some(a + b),
                     _ => None,
                 }
             }
             DF::Sub(a, b) => {
-                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *b, vals, state),
+                ) {
                     (Some(a), Some(b)) => Some(a - b),
                     _ => None,
                 }
             }
             DF::Mul(a, b) => {
-                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *b, vals, state),
+                ) {
                     (Some(a), Some(b)) => Some(a * b),
                     _ => None,
                 }
             }
             DF::Min(a, b) => {
-                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *b, vals, state),
+                ) {
                     (Some(a), Some(b)) => Some(df_min(a, b)),
                     _ => None,
                 }
             }
             DF::Max(a, b) => {
-                match (const_at(dfs, *a, vals, state), const_at(dfs, *b, vals, state)) {
+                match (
+                    const_at(dfs, *a, vals, state),
+                    const_at(dfs, *b, vals, state),
+                ) {
                     (Some(a), Some(b)) => Some(df_max(a, b)),
                     _ => None,
                 }
@@ -1656,10 +1748,12 @@ fn fold_constant_dfs(dfs: &mut Vec<DF>) -> usize {
             DF::Abs(a) => const_at(dfs, *a, vals, state).map(|v| v.abs()),
             DF::Sq(a) => const_at(dfs, *a, vals, state).map(|v| v * v),
             DF::Cube(a) => const_at(dfs, *a, vals, state).map(|v| v * v * v),
-            DF::HNeg(a) => const_at(dfs, *a, vals, state)
-                .map(|v| if v > 0.0 { v } else { v * 0.5 }),
-            DF::QNeg(a) => const_at(dfs, *a, vals, state)
-                .map(|v| if v > 0.0 { v } else { v * 0.25 }),
+            DF::HNeg(a) => {
+                const_at(dfs, *a, vals, state).map(|v| if v > 0.0 { v } else { v * 0.5 })
+            }
+            DF::QNeg(a) => {
+                const_at(dfs, *a, vals, state).map(|v| if v > 0.0 { v } else { v * 0.25 })
+            }
             DF::Squeeze(a) => const_at(dfs, *a, vals, state).map(|v| {
                 let v = v.clamp(-1.0, 1.0);
                 v / 2.0 - v * v * v / 24.0
@@ -2114,8 +2208,7 @@ fn detect_upper_bound_interp(dfs: &[DF], final_density: usize) -> Option<usize> 
             DF::Mul(a, b) => (*a, *b),
             _ => return None,
         };
-        let is_pos_c =
-            |n: usize| matches!(dfs.get(n), Some(DF::C(v)) if *v > 0.0 && v.is_finite());
+        let is_pos_c = |n: usize| matches!(dfs.get(n), Some(DF::C(v)) if *v > 0.0 && v.is_finite());
         let interp_id = if is_pos_c(a) {
             b
         } else if is_pos_c(b) {
@@ -2200,7 +2293,9 @@ fn compile_deep_fast(
                 out.push(DeepStep::Block(*st));
                 true
             }
-            Some(Rule::Seq(seq)) => seq.iter().all(|&sub| visit(sub, rules, conds, min_y, top, out)),
+            Some(Rule::Seq(seq)) => seq
+                .iter()
+                .all(|&sub| visit(sub, rules, conds, min_y, top, out)),
             Some(Rule::Cond(ci, ri)) => match conds.get(*ci) {
                 Some(Cond::False | Cond::Prelim) => true,
                 Some(Cond::VGrad {
@@ -2472,11 +2567,18 @@ pub struct Gen {
     /// Generation-owned: they are moved into the runtime container store as soon as
     /// this generator's lock is released (see `block_state`), never kept as a second
     /// live store.
-    staged_payloads: Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
+    staged_payloads: Vec<(
+        (i32, i32, i32),
+        crate::generation_payload::GenerationPayload,
+    )>,
     feat_ord: std::collections::VecDeque<(i32, i32)>,
     deep_c: CoordMap<(i32, i32, i32), u32>,
     deep_ord: std::collections::VecDeque<(i32, i32, i32)>,
     pub(crate) pop_done: HashSet<(i32, i32)>,
+    /// Chunks that crossed `ChunkMap`'s proto -> full promotion boundary. This is
+    /// deliberately independent of `pop_done`: promotion suppresses later feature writes
+    /// while a completed but unpromoted proto chunk remains writable.
+    promoted_chunks: HashSet<(i32, i32)>,
     /// The window a recorded population plan covers (`None` outside a planned run): the
     /// chunks the input decorates. Native decorated three rings around the request and the
     /// plan keeps one (`parse_population_order`), so a chunk outside this box is one native
@@ -2896,14 +2998,16 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightCache<K, V> {
                 // pushes the token so a nested ask inside that build behaves the same way.
                 None => {
                     #[cfg(test)]
-                    self.built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.built
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let _token = FlightToken::push(token);
                     build()
                 }
             },
             Claim::Lead(flight) => {
                 #[cfg(test)]
-                self.built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.built
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut leader = FlightLeader {
                     cache: self,
                     key,
@@ -2964,9 +3068,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> FlightLeader<'_, K, V> {
         let mut inner = self.cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(RoundSlot::InFlight(f)) = inner.map.get(&self.key) {
             if std::sync::Arc::ptr_eq(f, &self.flight) {
-                inner
-                    .map
-                    .insert(self.key.clone(), RoundSlot::Ready(value));
+                inner.map.insert(self.key.clone(), RoundSlot::Ready(value));
                 inner.ord.push_back(self.key.clone());
                 if let Some(bound) = self.cache.bound {
                     while inner.ord.len() > bound {
@@ -3577,7 +3679,9 @@ pub(crate) struct CarveStage {
 fn aq_trace_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AQ_TRACE").is_some() || std::env::var_os("AQ_POS").is_some())
+    *ON.get_or_init(|| {
+        std::env::var_os("AQ_TRACE").is_some() || std::env::var_os("AQ_POS").is_some()
+    })
 }
 
 fn aq_trace_at(x: i32, z: i32) -> bool {
@@ -3746,12 +3850,16 @@ impl Gen {
 
     fn dp_files_one(subdir: &str) -> HashMap<String, Vec<u8>> {
         let prefix = format!("minecraft/worldgen/{subdir}/");
-        let mut m: HashMap<_, _> = VANILLA_JAR_RESOURCES.get()
+        let mut m: HashMap<_, _> = VANILLA_JAR_RESOURCES
+            .get()
             .map(|source| (source.list)(&prefix))
             .unwrap_or_default()
             .into_iter()
             .filter_map(|(path, bytes)| {
-                Some((format!("minecraft:{}", path.strip_suffix(".json")?), bytes.to_vec()))
+                Some((
+                    format!("minecraft:{}", path.strip_suffix(".json")?),
+                    bytes.to_vec(),
+                ))
             })
             .collect();
         {
@@ -3968,6 +4076,7 @@ impl Gen {
             deep_c: HashMap::default(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            promoted_chunks: HashSet::new(),
             pop_plan_window: None,
             shape_marks: HashMap::default(),
             mark_pool: Vec::new(),
@@ -4015,7 +4124,8 @@ impl Gen {
             ns_json = read_vanilla_jar_resource(&format!(
                 "minecraft/worldgen/noise_settings/{}.json",
                 preset.name()
-            )).and_then(jparse);
+            ))
+            .and_then(jparse);
         }
         let ns = match ns_json {
             Some(j) => j,
@@ -4064,11 +4174,20 @@ impl Gen {
             candidates.extend(Gen::packs());
             let resource = format!("minecraft/dimension_type/{file}.json");
             let jar = read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec);
-            let (before, after) = if g.base.is_empty() { (jar, None) } else { (None, jar) };
-            let disk = candidates.iter().filter_map(|p| std::fs::read(p.join("data").join(&resource)).ok());
+            let (before, after) = if g.base.is_empty() {
+                (jar, None)
+            } else {
+                (None, jar)
+            };
+            let disk = candidates
+                .iter()
+                .filter_map(|p| std::fs::read(p.join("data").join(&resource)).ok());
             if let Some(b) = before.into_iter().chain(disk).chain(after).next() {
                 let json = jparse(&b);
-                match json.as_ref().and_then(|j| dimension_window(j, g.min_y, g.height)) {
+                match json
+                    .as_ref()
+                    .and_then(|j| dimension_window(j, g.min_y, g.height))
+                {
                     Some((min_y, height)) => {
                         g.world_min_y = min_y;
                         g.world_height = height;
@@ -4207,8 +4326,10 @@ impl Gen {
                 if !g.base.is_empty() {
                     return None;
                 }
-                let asset_dir = std::env::var_os("MEGU_VERSION_DIR")
-                    .map_or_else(|| std::path::PathBuf::from("assets"), std::path::PathBuf::from);
+                let asset_dir = std::env::var_os("MEGU_VERSION_DIR").map_or_else(
+                    || std::path::PathBuf::from("assets"),
+                    std::path::PathBuf::from,
+                );
                 std::fs::read(asset_dir.join(tree_file)).ok()
             });
             if let Some(tree) = exported.as_deref().and_then(jparse) {
@@ -4223,30 +4344,21 @@ impl Gen {
                     preset.name(),
                     dp_tree.display()
                 ));
-                // The official JAR stores the preset name and biome JSONs, but
-                // builds the interval tree in Java. Use a single biome until an
-                // exported tree is supplied alongside the generated assets.
-                if g.base.is_empty() {
-                    let biome = if preset == NoisePreset::Overworld {
-                        "minecraft:plains"
-                    } else {
-                        "minecraft:nether_wastes"
-                    };
-                    eprintln!("[wg] {} biome tree unavailable; using {biome}", preset.name());
-                    let d = std::sync::Arc::make_mut(&mut g.data);
-                    let bounds = [[i32::MIN, i32::MAX]; 7];
-                    d.biome_names = vec![biome.to_owned()];
-                    d.bleaf = HashMap::from([(biome.to_owned(), 0)]);
-                    d.leaf_ps = vec![bounds];
-                    d.btree = Some(BT {
-                        nodes: vec![BTNode {
-                            bounds,
-                            child_start: 0,
-                            child_len: 0,
-                            off6_sq: 0,
-                        }],
-                    });
-                }
+                // The official JAR stores the preset name and biome JSONs, while Java
+                // builds the interval tree in code. Never collapse the dimension to one
+                // biome: use the deterministic climate anchors until the exported tree is
+                // present. Nether's anchors are the exact vanilla parameter points.
+                let (names, ids, leaf_ps, tree) = fallback_climate_tree(preset);
+                eprintln!(
+                    "[wg] {} biome tree unavailable; using deterministic multi-biome climate fallback ({} biomes)",
+                    preset.name(),
+                    names.len()
+                );
+                let d = std::sync::Arc::make_mut(&mut g.data);
+                d.biome_names = names;
+                d.bleaf = ids;
+                d.leaf_ps = leaf_ps;
+                d.btree = Some(tree);
             }
         }
         // SurfaceRules.Temperature reads biome weather, not the noise-router
@@ -4619,7 +4731,10 @@ impl Gen {
             Self::load_trace(&format!(
                 "surface condition reference {name:?}: did not parse"
             ));
-            self.note_rule_diag(name.to_string(), "surface condition did not parse".to_string());
+            self.note_rule_diag(
+                name.to_string(),
+                "surface condition did not parse".to_string(),
+            );
             return None;
         };
         self.conds[idx] = c;
@@ -4841,9 +4956,13 @@ impl Gen {
         let b = if self.base.is_empty() {
             read_vanilla_jar_resource(&resource)?.to_vec()
         } else {
-            std::fs::read(std::path::Path::new(&self.base).join("data").join(&resource))
-                .ok()
-                .or_else(|| read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec))?
+            std::fs::read(
+                std::path::Path::new(&self.base)
+                    .join("data")
+                    .join(&resource),
+            )
+            .ok()
+            .or_else(|| read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec))?
         };
         let j = jparse(&b)?;
         // 1.21.1 noise files: `firstOctave` + `amplitudes`. The converted pack re-encoded
@@ -5095,14 +5214,7 @@ impl Gen {
         out
     }
 
-     pub(crate) fn eval(
-        &self,
-        id: usize,
-        x: i32,
-        y: i32,
-        z: i32,
-        memo: &mut FlatMemo,
-    ) -> f64 {
+    pub(crate) fn eval(&self, id: usize, x: i32, y: i32, z: i32, memo: &mut FlatMemo) -> f64 {
         self.eval_c(id, x, y, z, memo, None)
     }
 
@@ -5111,7 +5223,7 @@ impl Gen {
     /// grid instead of evaluating its input at block resolution (vanilla
     /// NoiseChunk). While the grids are being filled `cc` is None, which is a
     /// corner sample.
-     fn eval_c(
+    fn eval_c(
         &self,
         id: usize,
         x: i32,
@@ -5233,7 +5345,7 @@ impl Gen {
         self.interp_ids_from(&roots)
     }
 
-     fn eval_spline_c(
+    fn eval_spline_c(
         &self,
         s: &Spl,
         x: i32,
@@ -5273,7 +5385,7 @@ impl Gen {
         (lerp(t, v0, v1) + t * (1.0 - t) * lerp(t, d0t, d1t)) as f64
     }
 
-     fn eval0_c(
+    fn eval0_c(
         &self,
         id: usize,
         x: i32,
@@ -5766,7 +5878,10 @@ enum Op {
     /// `interpolated`: if the chunk column set carries this slot's grid, push its
     /// trilinear value and jump to `join`; otherwise fall through and run the
     /// input's program, which ends at `join`.
-    Interp { slot: u32, join: u32 },
+    Interp {
+        slot: u32,
+        join: u32,
+    },
     /// Evaluate a subtree with the interpreter (splines, `find_top_surface`,
     /// `old_blended_noise`, `end_islands`). The memo handed over is empty: a
     /// `cache` node outside this subtree needs none, and one inside it only ever
@@ -5774,12 +5889,21 @@ enum Op {
     Call(u32),
     /// Peeks at the top slot and jumps when it is outside `[mi, ma)`; otherwise
     /// pops it. `range_choice`.
-    BranchOut { mi: f64, ma: f64, target: u32 },
+    BranchOut {
+        mi: f64,
+        ma: f64,
+        target: u32,
+    },
     /// Pops one value and jumps when it is `< t` (`interval_select`).
-    BranchLt { t: f64, target: u32 },
+    BranchLt {
+        t: f64,
+        target: u32,
+    },
     /// Peeks at the top slot and jumps when it is `0.0` (leaving it in place for
     /// the zero branch to drop), else falls through with it still on top.
-    BranchZero { target: u32 },
+    BranchZero {
+        target: u32,
+    },
     Jump(u32),
     /// Discard the top slot.
     Drop,
@@ -5924,15 +6048,7 @@ impl DfProg {
         }
     }
 
-    fn run(
-        &self,
-        g: &Gen,
-        cc: Option<&ChunkCols>,
-        x: i32,
-        y: i32,
-        z: i32,
-        st: &mut [f64],
-    ) -> f64 {
+    fn run(&self, g: &Gen, cc: Option<&ChunkCols>, x: i32, y: i32, z: i32, st: &mut [f64]) -> f64 {
         df_run(&self.ops, g, cc, x, y, z, st, &mut [], None)
     }
 }
@@ -6062,14 +6178,16 @@ fn df_run(
                     sp += 1;
                     pc += 1;
                 }
-                Op::Interp { slot, join } => match cc.and_then(|cc| cc.interp_slot(slot as usize, x, y, z)) {
-                    Some(v) => {
-                        st[sp] = v;
-                        sp += 1;
-                        pc = join as usize;
+                Op::Interp { slot, join } => {
+                    match cc.and_then(|cc| cc.interp_slot(slot as usize, x, y, z)) {
+                        Some(v) => {
+                            st[sp] = v;
+                            sp += 1;
+                            pc = join as usize;
+                        }
+                        None => pc += 1,
                     }
-                    None => pc += 1,
-                },
+                }
                 Op::Call(id) => {
                     st[sp] = if let Some(m) = cm.as_deref_mut() {
                         // The memo's scope is one `Call`; clearing first makes
@@ -6276,12 +6394,32 @@ impl DfCols {
     fn begin(&self, g: &Gen, x: i32, z: i32, sc: &mut DfColScratch) {
         #[cfg(test)]
         DFCOL_BEGINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        df_run(&self.ops2, g, None, x, 0, z, &mut sc.st, &mut sc.v2, Some(&mut sc.cm));
+        df_run(
+            &self.ops2,
+            g,
+            None,
+            x,
+            0,
+            z,
+            &mut sc.st,
+            &mut sc.v2,
+            Some(&mut sc.cm),
+        );
     }
 
     /// One corner's density: `eval_flat(inner, x, y, z)` compiled.
     fn eval(&self, ops: &[Op], g: &Gen, x: i32, y: i32, z: i32, sc: &mut DfColScratch) -> f64 {
-        df_run(ops, g, None, x, y, z, &mut sc.st, &mut sc.v2, Some(&mut sc.cm))
+        df_run(
+            ops,
+            g,
+            None,
+            x,
+            y,
+            z,
+            &mut sc.st,
+            &mut sc.v2,
+            Some(&mut sc.cm),
+        )
     }
 
     /// Four levels of one column's tail program — `y0, y0+ystep, y0+2*ystep,
@@ -6306,8 +6444,7 @@ impl DfCols {
             if self.slots <= DF4_SLOTS && !df4_disabled() && df4_avx2() {
                 // SAFETY: `df4_avx2` proved the feature is present at runtime,
                 // and `slots <= DF4_SLOTS` bounds the vector stack.
-                if let Some(v) = unsafe { run4y_avx2(ops, &sc.v2, g, None, x, y0, ystep, z) }
-                {
+                if let Some(v) = unsafe { run4y_avx2(ops, &sc.v2, g, None, x, y0, ystep, z) } {
                     return v;
                 }
             }
@@ -6335,8 +6472,7 @@ impl DfCols {
             if self.slots <= DF4_SLOTS && !df8_disabled() && df8_avx512() {
                 // SAFETY: `df8_avx512` proved both features are present at
                 // runtime, and `slots <= DF4_SLOTS` bounds the vector stack.
-                if let Some(v) = unsafe { run8y_avx512(ops, &sc.v2, g, None, x, y0, ystep, z) }
-                {
+                if let Some(v) = unsafe { run8y_avx512(ops, &sc.v2, g, None, x, y0, ystep, z) } {
                     return v;
                 }
             }
@@ -6361,8 +6497,7 @@ fn dfcol_flat() -> bool {
 /// The in-process form of `MEGU_DFCOL=0`, so the parity/bench test holds
 /// the two fill paths to the same bytes without a second binary.
 #[cfg(test)]
-static DFCOL_TEST_FLAT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static DFCOL_TEST_FLAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
@@ -6436,8 +6571,7 @@ fn df4_disabled() -> bool {
 /// arm and without it and compare the two (the env read is cached per process, and an
 /// in-process A/B is what proves the batching, not the environment).
 #[cfg(test)]
-static DF4_TEST_SCALAR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static DF4_TEST_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
@@ -6653,10 +6787,14 @@ fn trilinear_x8(cells: &[f64], cc: &ChunkCols, x: i32, y: i32, z: i32) -> Option
             // both halves start at a cell-aligned run that `trilinear_x4` accepts.
             let a = unsafe { trilinear_x4(cells, cc, x, y, z)? };
             let b = unsafe { trilinear_x4(cells, cc, x + DF4 as i32, y, z)? };
-            return Some(std::array::from_fn(|k| if k < DF4 { a[k] } else { b[k - DF4] }));
+            return Some(std::array::from_fn(
+                |k| if k < DF4 { a[k] } else { b[k - DF4] },
+            ));
         }
     }
-    Some(std::array::from_fn(|k| trilinear(cells, cc, x + k as i32, y, z)))
+    Some(std::array::from_fn(|k| {
+        trilinear(cells, cc, x + k as i32, y, z)
+    }))
 }
 
 /// The four-lane interpreter: `DfProg::run` with `__m256d` slots. `None` means a conditional
@@ -6692,12 +6830,7 @@ unsafe fn run4_avx2(
                 st[$i] = std::mem::MaybeUninit::new($v)
             };
         }
-        let lane_x = [
-            x as f64,
-            (x + 1) as f64,
-            (x + 2) as f64,
-            (x + 3) as f64,
-        ];
+        let lane_x = [x as f64, (x + 1) as f64, (x + 2) as f64, (x + 3) as f64];
         let yv = _mm256_set1_pd(y as f64);
         let mut sp = 0usize;
         let mut pc = 0usize;
@@ -6741,8 +6874,7 @@ unsafe fn run4_avx2(
                 let a = $a;
                 let b = $b;
                 let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_GT_OQ));
-                let r =
-                    _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
                 let r = _mm256_blendv_pd(r, a, _mm256_cmp_pd(b, b, _CMP_UNORD_Q));
                 _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
             }};
@@ -6788,7 +6920,8 @@ unsafe fn run4_avx2(
                 }
                 Op::Abs => {
                     let a = rd!(sp - 1);
-                    let mask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
+                    let mask =
+                        _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
                     wr!(sp - 1, _mm256_and_pd(a, mask));
                     pc += 1;
                 }
@@ -6836,7 +6969,10 @@ unsafe fn run4_avx2(
                     let f = rd!(sp - 2);
                     let a = rd!(sp - 3);
                     sp -= 2;
-                    wr!(sp - 1, _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f))));
+                    wr!(
+                        sp - 1,
+                        _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f)))
+                    );
                     pc += 1;
                 }
                 Op::AddC(c) => {
@@ -6861,10 +6997,7 @@ unsafe fn run4_avx2(
                 }
                 Op::Grad { fc, fv, tc, tv } => {
                     let denom = _mm256_set1_pd(tc - fc);
-                    let t = _mm256_div_pd(
-                        _mm256_sub_pd(yv, _mm256_set1_pd(fc)),
-                        denom,
-                    );
+                    let t = _mm256_div_pd(_mm256_sub_pd(yv, _mm256_set1_pd(fc)), denom);
                     let t = clampv!(t, 0.0, 1.0);
                     wr!(
                         sp,
@@ -7218,7 +7351,10 @@ unsafe fn run8_avx512(
                     let f = rd!(sp - 2);
                     let a = rd!(sp - 3);
                     sp -= 2;
-                    wr!(sp - 1, _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f))));
+                    wr!(
+                        sp - 1,
+                        _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f)))
+                    );
                     pc += 1;
                 }
                 Op::AddC(c) => {
@@ -7243,10 +7379,7 @@ unsafe fn run8_avx512(
                 }
                 Op::Grad { fc, fv, tc, tv } => {
                     let denom = _mm512_set1_pd(tc - fc);
-                    let t = _mm512_div_pd(
-                        _mm512_sub_pd(yv, _mm512_set1_pd(fc)),
-                        denom,
-                    );
+                    let t = _mm512_div_pd(_mm512_sub_pd(yv, _mm512_set1_pd(fc)), denom);
                     let t = clampv!(t, 0.0, 1.0);
                     wr!(
                         sp,
@@ -7310,9 +7443,8 @@ unsafe fn run8_avx512(
                         wr!(sp, _mm512_setzero_pd());
                     } else {
                         let beard = beard.unwrap();
-                        let r: [f64; DF8] = std::array::from_fn(|k| {
-                            compute_beardifier(beard, x + k as i32, y, z)
-                        });
+                        let r: [f64; DF8] =
+                            std::array::from_fn(|k| compute_beardifier(beard, x + k as i32, y, z));
                         wr!(sp, v8_from_arr(r));
                     }
                     sp += 1;
@@ -7502,8 +7634,7 @@ unsafe fn run4y_avx2(
                 let a = $a;
                 let b = $b;
                 let r = _mm256_blendv_pd(b, a, _mm256_cmp_pd(a, b, _CMP_GT_OQ));
-                let r =
-                    _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
+                let r = _mm256_blendv_pd(r, _mm256_and_pd(a, b), _mm256_cmp_pd(a, b, _CMP_EQ_OQ));
                 let r = _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, b, _CMP_UNORD_Q));
                 _mm256_blendv_pd(r, b, _mm256_cmp_pd(a, a, _CMP_UNORD_Q))
             }};
@@ -7557,7 +7688,8 @@ unsafe fn run4y_avx2(
                 }
                 Op::Abs => {
                     let a = rd!(sp - 1);
-                    let mask = _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
+                    let mask =
+                        _mm256_castsi256_pd(_mm256_set1_epi64x(0x7fff_ffff_ffff_ffffu64 as i64));
                     wr!(sp - 1, _mm256_and_pd(a, mask));
                     pc += 1;
                 }
@@ -7605,7 +7737,10 @@ unsafe fn run4y_avx2(
                     let f = rd!(sp - 2);
                     let a = rd!(sp - 3);
                     sp -= 2;
-                    wr!(sp - 1, _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f))));
+                    wr!(
+                        sp - 1,
+                        _mm256_add_pd(f, _mm256_mul_pd(a, _mm256_sub_pd(s, f)))
+                    );
                     pc += 1;
                 }
                 Op::AddC(c) => {
@@ -7630,10 +7765,7 @@ unsafe fn run4y_avx2(
                 }
                 Op::Grad { fc, fv, tc, tv } => {
                     let denom = _mm256_set1_pd(tc - fc);
-                    let t = _mm256_div_pd(
-                        _mm256_sub_pd(yv, _mm256_set1_pd(fc)),
-                        denom,
-                    );
+                    let t = _mm256_div_pd(_mm256_sub_pd(yv, _mm256_set1_pd(fc)), denom);
                     let t = clampv!(t, 0.0, 1.0);
                     wr!(
                         sp,
@@ -7711,13 +7843,7 @@ unsafe fn run4y_avx2(
                         (Some(cells), Some(columns)) => {
                             let mut r = [0.0f64; DF4];
                             for (k, o) in r.iter_mut().enumerate() {
-                                *o = trilinear(
-                                    cells,
-                                    columns,
-                                    x,
-                                    y0 + (k as i32) * ystep,
-                                    z,
-                                );
+                                *o = trilinear(cells, columns, x, y0 + (k as i32) * ystep, z);
                             }
                             wr!(sp, v4_from_arr(r));
                             sp += 1;
@@ -7730,14 +7856,7 @@ unsafe fn run4y_avx2(
                     let mut r = [0.0f64; DF4];
                     for (k, o) in r.iter_mut().enumerate() {
                         let mut memo = HashMap::default();
-                        *o = g.eval_c(
-                            id as usize,
-                            x,
-                            y0 + (k as i32) * ystep,
-                            z,
-                            &mut memo,
-                            cc,
-                        );
+                        *o = g.eval_c(id as usize, x, y0 + (k as i32) * ystep, z, &mut memo, cc);
                     }
                     wr!(sp, v4_from_arr(r));
                     sp += 1;
@@ -8002,7 +8121,10 @@ unsafe fn run8y_avx512(
                     let f = rd!(sp - 2);
                     let a = rd!(sp - 3);
                     sp -= 2;
-                    wr!(sp - 1, _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f))));
+                    wr!(
+                        sp - 1,
+                        _mm512_add_pd(f, _mm512_mul_pd(a, _mm512_sub_pd(s, f)))
+                    );
                     pc += 1;
                 }
                 Op::AddC(c) => {
@@ -8027,10 +8149,7 @@ unsafe fn run8y_avx512(
                 }
                 Op::Grad { fc, fv, tc, tv } => {
                     let denom = _mm512_set1_pd(tc - fc);
-                    let t = _mm512_div_pd(
-                        _mm512_sub_pd(yv, _mm512_set1_pd(fc)),
-                        denom,
-                    );
+                    let t = _mm512_div_pd(_mm512_sub_pd(yv, _mm512_set1_pd(fc)), denom);
                     let t = clampv!(t, 0.0, 1.0);
                     wr!(
                         sp,
@@ -8118,14 +8237,7 @@ unsafe fn run8y_avx512(
                 Op::Call(id) => {
                     let r: [f64; DF8] = std::array::from_fn(|k| {
                         let mut memo = HashMap::default();
-                        g.eval_c(
-                            id as usize,
-                            x,
-                            y0 + (k as i32) * ystep,
-                            z,
-                            &mut memo,
-                            cc,
-                        )
+                        g.eval_c(id as usize, x, y0 + (k as i32) * ystep, z, &mut memo, cc)
                     });
                     wr!(sp, v8_from_arr(r));
                     sp += 1;
@@ -8259,8 +8371,12 @@ impl<'a> DfCompiler<'a> {
             DF::Abs(a) => self.const_value(*a).map(|v| v.abs()),
             DF::Sq(a) => self.const_value(*a).map(|v| v * v),
             DF::Cube(a) => self.const_value(*a).map(|v| v * v * v),
-            DF::HNeg(a) => self.const_value(*a).map(|v| if v > 0.0 { v } else { v * 0.5 }),
-            DF::QNeg(a) => self.const_value(*a).map(|v| if v > 0.0 { v } else { v * 0.25 }),
+            DF::HNeg(a) => self
+                .const_value(*a)
+                .map(|v| if v > 0.0 { v } else { v * 0.5 }),
+            DF::QNeg(a) => self
+                .const_value(*a)
+                .map(|v| if v > 0.0 { v } else { v * 0.25 }),
             DF::Squeeze(a) => self.const_value(*a).map(|v| {
                 let v = v.clamp(-1.0, 1.0);
                 v / 2.0 - v * v * v / 24.0
@@ -8435,7 +8551,10 @@ impl<'a> DfCompiler<'a> {
         let mut ends = Vec::with_capacity(th.len());
         for (k, fn_id) in fns.iter().enumerate().take(th.len()) {
             let at = self.ops.len() as u32;
-            self.ops[tests[k]] = Op::BranchLt { t: th[k], target: at };
+            self.ops[tests[k]] = Op::BranchLt {
+                t: th[k],
+                target: at,
+            };
             self.emit(*fn_id);
             ends.push(self.ops.len());
             self.ops.push(Op::Jump(0));
@@ -8645,7 +8764,10 @@ impl Gen {
         // SurfaceRules.Context uses BiomeManager to select a quart from the
         // already filled biome palettes, including those in adjacent chunks.
         let (qx, qy, qz) = self.fiddled_biome_quart(c.x, c.y, c.z);
-        let qy = qy.clamp(self.world_min_y >> 2, (self.world_min_y + self.world_height - 1) >> 2);
+        let qy = qy.clamp(
+            self.world_min_y >> 2,
+            (self.world_min_y + self.world_height - 1) >> 2,
+        );
         let key = (qx, qy, qz);
         if let Some(&leaf) = self.bioq.get(&key) {
             c.biome = Some((pos, leaf));
@@ -8741,8 +8863,9 @@ impl Gen {
                 let key = self.terrain_share_key(k.0, k.1);
                 if let Some(v) = share.prelims.peek(&key) {
                     v
-                } else if let Some(v) =
-                    self.share_fallback(&share).and_then(|f| f.prelims.peek(&key))
+                } else if let Some(v) = self
+                    .share_fallback(&share)
+                    .and_then(|f| f.prelims.peek(&key))
                 {
                     v
                 } else {
@@ -9026,7 +9149,7 @@ pub(crate) struct ChunkCols {
     /// literals; production reads the lazy value through [`ChunkCols::surface_mats`].
     #[allow(dead_code)]
     rd: [i16; 256],
-    wtop: [i16; 256],           // per-column top of solid-or-fluid (heightmap basis)
+    wtop: [i16; 256], // per-column top of solid-or-fluid (heightmap basis)
     /// The beardifier input of the chunk that owns these columns, resolved by
     /// `Gen::resolve_beard` before `surf`, `wtop` and `mats` are built (vanilla's
     /// `NoiseChunk.fillFromNoise` applies `Beardifier` before
@@ -9105,6 +9228,9 @@ struct GeneratedTickQueues {
 }
 
 static GEN_TICK_QUEUES: Mutex<Option<GeneratedTickQueues>> = Mutex::new(None);
+const MAX_DIMENSION_TICK_QUEUES: usize = 64;
+static PER_DIM_TICK_QUEUES: std::sync::LazyLock<Mutex<HashMap<DimId, GeneratedTickQueues>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedTick> {
     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -9114,7 +9240,10 @@ fn drain_generated_ticks(queue: &Mutex<PendingGeneratedTicks>) -> Vec<GeneratedT
 
 /// Drain the active world's leaf queue without waiting for the worldgen lock.
 pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let queues = GEN_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.leaves))
 }
 
@@ -9122,15 +9251,39 @@ pub fn take_generated_leaf_ticks() -> Vec<GeneratedTick> {
 /// warmup uses this to predict the next drain; the authoritative drain still
 /// happens inside the persistence transaction.
 pub fn peek_generated_leaf_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let queues = GEN_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     queues.map_or_else(Vec::new, |q| {
         q.leaves.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
     })
 }
 
 pub fn take_generated_fluid_ticks() -> Vec<GeneratedTick> {
-    let queues = GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let queues = GEN_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
+}
+
+/// Drain the generated fluid ticks owned by one dimension's generator. Nether and End
+/// generators keep their own queues even when the Overworld is the active dim-less world.
+#[allow(dead_code)]
+pub fn drain_generated_fluid_ticks_for_dim(dim: DimId) -> Vec<GeneratedTick> {
+    let queues = PER_DIM_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dim)
+        .cloned();
+    queues.map_or_else(Vec::new, |q| drain_generated_ticks(&q.fluids))
+}
+
+/// Compatibility alias for the Nether lane's original drain helper name.
+#[allow(dead_code)]
+pub fn take_nether_fluid_ticks() -> Vec<GeneratedTick> {
+    drain_generated_fluid_ticks_for_dim(DimId::Nether)
 }
 
 /// The per-dimension generator registry: one `Gen` per dimension, every one built from the
@@ -9556,9 +9709,23 @@ fn install(dimension: DimId, seed: u64, res: fn(&str) -> Option<u32>, activate: 
         data[slot] = Some(g.data.clone());
     }
     let ticks = g.generated_ticks.clone();
+    PER_DIM_TICK_QUEUES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dimension, ticks.clone());
+    debug_assert!(
+        PER_DIM_TICK_QUEUES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            <= MAX_DIMENSION_TICK_QUEUES
+    );
     *gen_lock_dim(dimension) = Some(g);
     if activate {
-        ACTIVE_DIM.store(dimension.index() as u8, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE_DIM.store(
+            dimension.index() as u8,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // The runtime drains the *active* world's generated ticks through these handles, and
         // the tick thread must not queue behind generation to get them.
         *GEN_TICK_QUEUES.lock().unwrap_or_else(|e| e.into_inner()) = Some(ticks);
@@ -9834,7 +10001,12 @@ fn ensure_dim_generator(dimension: DimId) {
     let Some(res) = *BLOCK_LOOKUP.lock().unwrap_or_else(|e| e.into_inner()) else {
         return;
     };
-    install(dimension, GEN_SEED.load(std::sync::atomic::Ordering::Relaxed), res, false);
+    install(
+        dimension,
+        GEN_SEED.load(std::sync::atomic::Ordering::Relaxed),
+        res,
+        false,
+    );
 }
 
 /// Run a diagnostic against the active dimension's generator — the Overworld for every
@@ -10299,10 +10471,7 @@ pub(crate) fn peek_cols_dim(dimension: DimId, cx: i32, cz: i32) -> PeekCols {
     let Some(guard) = slot.try_lock().ok() else {
         return PeekCols::Contended;
     };
-    match guard
-        .as_ref()
-        .and_then(|g| g.col_c.get(&(cx, cz)).cloned())
-    {
+    match guard.as_ref().and_then(|g| g.col_c.get(&(cx, cz)).cloned()) {
         Some(cols) => PeekCols::Ready(cols),
         None => PeekCols::Absent,
     }
@@ -10320,14 +10489,23 @@ impl Gen {
         if self.suppress_generated_ticks {
             return;
         }
-        let mut q = self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self
+            .generated_ticks
+            .leaves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if q.1.insert((pos, block)) {
             q.0.push((pos, block));
         }
     }
 
     pub(crate) fn generated_leaf_ticks(&self) -> Vec<((i32, i32, i32), u32)> {
-        self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+        self.generated_ticks
+            .leaves
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
     }
 
     /// Queue a generated fluid tick: same reasoning as the leaf queue above — the tick
@@ -10336,7 +10514,11 @@ impl Gen {
         if self.suppress_generated_ticks {
             return;
         }
-        let mut q = self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = self
+            .generated_ticks
+            .fluids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if q.1.insert((pos, fluid)) {
             q.0.push((pos, fluid));
         }
@@ -10344,7 +10526,12 @@ impl Gen {
 
     /// Snapshot pending fluid ticks without transferring ownership, for saves.
     pub(crate) fn generated_fluid_ticks(&self) -> Vec<GeneratedTick> {
-        self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner()).0.clone()
+        self.generated_ticks
+            .fluids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .clone()
     }
 
     pub(crate) fn tick_sources(&self) -> HashSet<(i32, i32)> {
@@ -10365,11 +10552,19 @@ impl Gen {
     ) {
         // Restore only this world's queues, never another generator's pending work.
         {
-            let mut q = self.generated_ticks.leaves.lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = self
+                .generated_ticks
+                .leaves
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             q.1 = blocks.iter().copied().collect();
             q.0 = blocks;
         }
-        let mut fq = self.generated_ticks.fluids.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fq = self
+            .generated_ticks
+            .fluids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         fq.1 = fluids.iter().copied().collect();
         fq.0 = fluids;
     }
@@ -10452,6 +10647,7 @@ impl Gen {
             deep_c: HashMap::default(),
             deep_ord: std::collections::VecDeque::new(),
             pop_done: HashSet::new(),
+            promoted_chunks: HashSet::new(),
             pop_plan_window: None,
             shape_marks: HashMap::default(),
             mark_pool: Vec::new(),
@@ -10503,10 +10699,7 @@ impl Gen {
     /// it on the scratch, and `promote_full_chunks` answers from the same resident sets.
     /// Idempotent: unions already resident are left alone; the eviction bound matches
     /// `chunk_biome_set`.
-    pub(crate) fn merge_chunk_biomes(
-        &mut self,
-        entries: ChunkBiomeEntries,
-    ) {
+    pub(crate) fn merge_chunk_biomes(&mut self, entries: ChunkBiomeEntries) {
         for (key, arc) in entries {
             if self.chunk_biomes.contains_key(&key) {
                 continue;
@@ -10625,8 +10818,8 @@ impl Gen {
                 let z = cz * 16 + lz;
                 // A z-row's 16 cells are contiguous in the section array: write through
                 // the slice once per z rather than re-deriving `(ly|lz|lx)` per cell.
-                let row = &mut arr[((ly << 8) | (lz << 4)) as usize
-                    ..((ly << 8) | (lz << 4) | 15) as usize + 1];
+                let row = &mut arr
+                    [((ly << 8) | (lz << 4)) as usize..((ly << 8) | (lz << 4) | 15) as usize + 1];
                 let mut lx = 0i32;
                 while lx < 16 {
                     let x = cx * 16 + lx;
@@ -10692,10 +10885,7 @@ impl Gen {
         lo: i32,
         hi: i32,
         cols: Option<std::sync::Arc<ChunkCols>>,
-    ) -> Option<(
-        std::sync::Arc<ChunkCols>,
-        Vec<BaseRow>,
-    )> {
+    ) -> Option<(std::sync::Arc<ChunkCols>, Vec<BaseRow>)> {
         let cc = match cols {
             Some(c) => c,
             None => self.cols(cx, cz)?,
@@ -10874,8 +11064,9 @@ impl Gen {
                 let key = self.terrain_share_key(cx, cz);
                 if let Some(v) = share.beards.peek(&key) {
                     v
-                } else if let Some(v) =
-                    self.share_fallback(&share).and_then(|f| f.beards.peek(&key))
+                } else if let Some(v) = self
+                    .share_fallback(&share)
+                    .and_then(|f| f.beards.peek(&key))
                 {
                     v
                 } else {
@@ -11010,8 +11201,7 @@ impl Gen {
                     // `cols hit worker = 0` row of the P1a table, answered.
                     m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
                     v
-                } else if let Some(v) =
-                    self.share_fallback(&share).and_then(|f| f.cols.peek(&key))
+                } else if let Some(v) = self.share_fallback(&share).and_then(|f| f.cols.peek(&key))
                 {
                     m3_inc_split(M3_COLS_HIT_OWNER, M3_COLS_HIT_WORKER);
                     v
@@ -11064,8 +11254,7 @@ impl Gen {
                 let key = self.terrain_share_key(cx, cz);
                 if let Some(v) = share.bases.peek(&key) {
                     v
-                } else if let Some(v) =
-                    self.share_fallback(&share).and_then(|f| f.bases.peek(&key))
+                } else if let Some(v) = self.share_fallback(&share).and_then(|f| f.bases.peek(&key))
                 {
                     v
                 } else {
@@ -11118,8 +11307,7 @@ impl Gen {
     }
 
     fn base_column_state_lazy(&mut self, x: i32, y: i32, z: i32) -> Option<u32> {
-        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0
-        {
+        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0 {
             return None;
         }
         let ub_slot = self.upper_bound_interp?;
@@ -11284,7 +11472,11 @@ impl Gen {
                             let out = y_grad.and_then(|(fc, fv, tc, tv, mi, ma, ov)| {
                                 let t = ((by_lvl as f64) - fc) / (tc - fc);
                                 let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
-                                if gv >= mi && gv < ma { None } else { Some(ov) }
+                                if gv >= mi && gv < ma {
+                                    None
+                                } else {
+                                    Some(ov)
+                                }
                             });
                             for &(dxi, dzi, bx, bz) in &lazy.corners[..n_corners] {
                                 let v = match out {
@@ -11618,8 +11810,7 @@ impl Gen {
                         // Each grid's program resolves once; the column then pays
                         // the 2D prefix once and `ny` runs of each 3D tail, one
                         // contiguous run of cells per grid.
-                        let mut resolved: Vec<(usize, &[Op])> =
-                            Vec::with_capacity(general.len());
+                        let mut resolved: Vec<(usize, &[Op])> = Vec::with_capacity(general.len());
                         resolved.extend(
                             general
                                 .iter()
@@ -11638,8 +11829,7 @@ impl Gen {
                                     // time on the AVX2 arm; the scalar tail
                                     // covers the `ny` remainder.
                                     while yi + DF8 <= ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                         let r = cols.eval_y8(
                                             ops,
                                             g,
@@ -11649,13 +11839,11 @@ impl Gen {
                                             bz,
                                             &mut sc,
                                         );
-                                        cells[base + yi..base + yi + DF8]
-                                            .copy_from_slice(&r);
+                                        cells[base + yi..base + yi + DF8].copy_from_slice(&r);
                                         yi += DF8;
                                     }
                                     while yi + DF4 <= ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                         let r = cols.eval_y4(
                                             ops,
                                             g,
@@ -11665,15 +11853,12 @@ impl Gen {
                                             bz,
                                             &mut sc,
                                         );
-                                        cells[base + yi..base + yi + DF4]
-                                            .copy_from_slice(&r);
+                                        cells[base + yi..base + yi + DF4].copy_from_slice(&r);
                                         yi += DF4;
                                     }
                                     while yi < ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
-                                        cells[base + yi] =
-                                            cols.eval(ops, g, bx, by, bz, &mut sc);
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                        cells[base + yi] = cols.eval(ops, g, bx, by, bz, &mut sc);
                                         yi += 1;
                                     }
                                 }
@@ -11691,8 +11876,7 @@ impl Gen {
                                     flat.next_3d();
                                     let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                     for &(iid, inner) in &general {
-                                        grids[iid].as_mut().unwrap()
-                                            [(zi * nx + xi) * ny + yi] =
+                                        grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
                                             g.eval_flat(inner, bx, by, bz, &mut flat);
                                     }
                                 }
@@ -11738,8 +11922,7 @@ impl Gen {
                                     let base = (zi * nx + xi) * ny;
                                     let mut yi = 0usize;
                                     while yi + DF8 <= ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                         let r = cols.eval_y8(
                                             ops,
                                             g,
@@ -11749,13 +11932,11 @@ impl Gen {
                                             bz,
                                             &mut sc,
                                         );
-                                        cells[base + yi..base + yi + DF8]
-                                            .copy_from_slice(&r);
+                                        cells[base + yi..base + yi + DF8].copy_from_slice(&r);
                                         yi += DF8;
                                     }
                                     while yi + DF4 <= ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                         let r = cols.eval_y4(
                                             ops,
                                             g,
@@ -11765,15 +11946,12 @@ impl Gen {
                                             bz,
                                             &mut sc,
                                         );
-                                        cells[base + yi..base + yi + DF4]
-                                            .copy_from_slice(&r);
+                                        cells[base + yi..base + yi + DF4].copy_from_slice(&r);
                                         yi += DF4;
                                     }
                                     while yi < ny {
-                                        let by =
-                                            g.min_y + (yi as i32) * g.noise_cell_h;
-                                        cells[base + yi] =
-                                            cols.eval(ops, g, bx, by, bz, &mut sc);
+                                        let by = g.min_y + (yi as i32) * g.noise_cell_h;
+                                        cells[base + yi] = cols.eval(ops, g, bx, by, bz, &mut sc);
                                         yi += 1;
                                     }
                                 }
@@ -11791,8 +11969,7 @@ impl Gen {
                                     flat.next_3d();
                                     let by = g.min_y + (yi as i32) * g.noise_cell_h;
                                     for &(iid, inner) in &general_vein {
-                                        grids[iid].as_mut().unwrap()
-                                            [(zi * nx + xi) * ny + yi] =
+                                        grids[iid].as_mut().unwrap()[(zi * nx + xi) * ny + yi] =
                                             g.eval_flat(inner, bx, by, bz, &mut flat);
                                     }
                                 }
@@ -11945,7 +12122,8 @@ impl Gen {
                         let est_min = if is_nether {
                             g.min_y
                         } else {
-                            let est = lerp2(lx as f64 / 16.0, fz, h00, h10, h01, h11).floor() as i32;
+                            let est =
+                                lerp2(lx as f64 / 16.0, fz, h00, h10, h01, h11).floor() as i32;
                             est.wrapping_add(rdv).wrapping_sub(8)
                         };
                         est_mins[k] = est_min;
@@ -11988,8 +12166,9 @@ impl Gen {
                         cells.extend((lo..=scan_top).map(|y| {
                             g.surface_cell_density(dbuf[(y - min_lo) as usize][k], x, y, z)
                         }));
-                        let column =
-                            g.scan_surface_column_lazy(cc, root, &mut c, est_min, lo, &cells, &cc.wtop);
+                        let column = g.scan_surface_column_lazy(
+                            cc, root, &mut c, est_min, lo, &cells, &cc.wtop,
+                        );
                         mats[lz * 16 + lx] = column;
                     }
                     xb += DF8;
@@ -12382,7 +12561,11 @@ impl Gen {
                 };
                 let r3 = r.next_f32();
                 return if (r2 as f64) < richness && gv > -0.3 {
-                    if r3 < 0.02 { raw } else { ore }
+                    if r3 < 0.02 {
+                        raw
+                    } else {
+                        ore
+                    }
                 } else {
                     fill
                 };
@@ -12574,11 +12757,7 @@ impl Gen {
             return (st, 0);
         }
         let aq = self.aq_state(x, y, z, d);
-        let fill_mark = if self.aq_sched {
-            MARK_FILL
-        } else {
-            0
-        };
+        let fill_mark = if self.aq_sched { MARK_FILL } else { 0 };
         if let Some(st) = aq {
             if st == 0 || reg.is_some_and(|r| r.is_air(st)) {
                 return (0, 0);
@@ -12591,12 +12770,7 @@ impl Gen {
         let lz = (z & 15) as usize;
         let surface_top = cc.wtop[lz * 16 + lx] as i32;
         if surface_material_applies(y, surface_top) {
-            if let Some(st) = mat_in(
-                mats.get_or_insert_with(|| cc.surface_mats(self)),
-                lx,
-                lz,
-                y,
-            ) {
+            if let Some(st) = mat_in(mats.get_or_insert_with(|| cc.surface_mats(self)), lx, lz, y) {
                 if st != u32::MAX {
                     let st = self.vein_override(cc, x, y, z, st);
                     // The aquifer answered a barrier here, so this state is the surface
@@ -12682,8 +12856,7 @@ impl Gen {
     /// empty sky cells and stopping at the first positive density cell without building
     /// a full 25-column chunk grid.
     fn compute_base_col_surf_lazy(&mut self, x: i32, z: i32) -> Option<i32> {
-        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0
-        {
+        if wg_count() || self.dfprog.is_none() || self.noise_cell_w <= 0 || self.noise_cell_h <= 0 {
             return None;
         }
         let ub_slot = self.upper_bound_interp?;
@@ -12743,9 +12916,10 @@ impl Gen {
                 carve_sched: None,
             })
         });
-        let mut memos = self.base_hm_memos.take().unwrap_or_else(|| {
-            Box::new(std::array::from_fn(|_| FlatCornerMemo::new(dfs_len)))
-        });
+        let mut memos = self
+            .base_hm_memos
+            .take()
+            .unwrap_or_else(|| Box::new(std::array::from_fn(|_| FlatCornerMemo::new(dfs_len))));
         for memo in memos.iter_mut().take(n_corners) {
             memo.next_2d();
         }
@@ -12829,7 +13003,11 @@ impl Gen {
                                     let out = y_grad.and_then(|(fc, fv, tc, tv, mi, ma, ov)| {
                                         let t = ((by_lvl as f64) - fc) / (tc - fc);
                                         let gv = fv + t.clamp(0.0, 1.0) * (tv - fv);
-                                        if gv >= mi && gv < ma { None } else { Some(ov) }
+                                        if gv >= mi && gv < ma {
+                                            None
+                                        } else {
+                                            Some(ov)
+                                        }
                                     });
                                     for &(dxi, dzi, bx, bz) in &corners[..n_corners] {
                                         let v = match out {
@@ -12841,11 +13019,13 @@ impl Gen {
                                                     bz as f64 * xzs,
                                                 );
                                                 if let Some((mc, left)) = mul {
-                                                    let (lhs, rhs) = if left { (mc, nv) } else { (nv, mc) };
+                                                    let (lhs, rhs) =
+                                                        if left { (mc, nv) } else { (nv, mc) };
                                                     nv = lhs * rhs;
                                                 }
                                                 if let Some((ac, left)) = add {
-                                                    let (lhs, rhs) = if left { (ac, nv) } else { (nv, ac) };
+                                                    let (lhs, rhs) =
+                                                        if left { (ac, nv) } else { (nv, ac) };
                                                     nv = lhs + rhs;
                                                 }
                                                 nv
@@ -12858,7 +13038,8 @@ impl Gen {
                                     for c in 0..n_corners {
                                         let (dxi, dzi, bx, bz) = corners[c];
                                         memos[c].next_3d();
-                                        let v = self.eval_flat(inner, bx, by_lvl, bz, &mut memos[c]);
+                                        let v =
+                                            self.eval_flat(inner, bx, by_lvl, bz, &mut memos[c]);
                                         write_corner(cells, dxi, dzi, lvl, v);
                                     }
                                 }
@@ -13072,10 +13253,11 @@ impl Gen {
 
     /// This generator's resident biome unions as a snapshot: `(chunk, Arc)` pairs, for
     /// the owner to merge after a wave (`Gen::merge_chunk_biomes`). `Arc` clones only.
-    pub(crate) fn chunk_biomes_snapshot(
-        &self,
-    ) -> ChunkBiomeEntries {
-        self.chunk_biomes.iter().map(|(k, v)| (*k, v.clone())).collect()
+    pub(crate) fn chunk_biomes_snapshot(&self) -> ChunkBiomeEntries {
+        self.chunk_biomes
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
     }
 
     /// feature-layer lookup: runs the default population dispatch on demand, then
@@ -13105,9 +13287,7 @@ impl Gen {
             }
             self.populate_in_order([(cx, cz)], &mut populate);
         } else {
-            let nbr = env_str!("MEGU_FEAT_NBR")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+            let nbr = env_str!("MEGU_FEAT_NBR").map(|v| v != "0").unwrap_or(true);
             if !self.pop_done.contains(&(cx, cz)) {
                 if nbr {
                     self.populate_request_box(cx, cz, cx, cz, &mut populate);
@@ -13275,7 +13455,8 @@ impl Gen {
         // The return value is the number of distinct chunks this call decorated: duplicates
         // in `order` claim once (as in the original loop), whether the serial or the A3-a
         // arm ran them.
-        let mut distinct: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::default();
+        let mut distinct: std::collections::HashSet<(i32, i32)> =
+            std::collections::HashSet::default();
         for &(x, z) in &list {
             if !self.pop_done.contains(&(x, z)) {
                 distinct.insert((x, z));
@@ -13303,9 +13484,7 @@ impl Gen {
         // `load_compare.sh`, opening and dropping a round per request rebuilt
         // the whole shared column/start set for every request and cost 3.6x the
         // CPU of the serial arm it replaced.
-        let gate = jobs > 1
-            && self.pop_region.is_none()
-            && is_feature_driver;
+        let gate = jobs > 1 && self.pop_region.is_none() && is_feature_driver;
 
         if gate && list.len() >= 2 {
             let mut pending: Vec<(i32, i32)> = Vec::with_capacity(list.len());
@@ -13440,9 +13619,7 @@ impl Gen {
     /// whole decorated region, so `pop_done` alone answers the question.
     pub(crate) fn promotion_region_contains(&self, cx: i32, cz: i32) -> bool {
         match self.pop_plan_window {
-            Some((x0, z0, x1, z1)) => {
-                x0 - 1 <= cx && cx <= x1 + 1 && z0 - 1 <= cz && cz <= z1 + 1
-            }
+            Some((x0, z0, x1, z1)) => x0 - 1 <= cx && cx <= x1 + 1 && z0 - 1 <= cz && cz <= z1 + 1,
             None => true,
         }
     }
@@ -13457,17 +13634,12 @@ impl Gen {
     /// A target bucket is written by at most one worker of a wave (the wave spacing keeps the
     /// 3x3 write regions disjoint), so appending per bucket in the worker's own mark order is
     /// the serial order.
-    pub(crate) fn take_all_shape_marks(
-        &mut self,
-    ) -> ShapeMarkBuckets {
+    pub(crate) fn take_all_shape_marks(&mut self) -> ShapeMarkBuckets {
         std::mem::take(&mut self.shape_marks).into_iter().collect()
     }
 
     /// Land a worker's direct shape marks on the owner, keeping each bucket's mark order.
-    pub(crate) fn merge_shape_marks(
-        &mut self,
-        marks: ShapeMarkBuckets,
-    ) {
+    pub(crate) fn merge_shape_marks(&mut self, marks: ShapeMarkBuckets) {
         for (chunk, bucket) in marks {
             self.shape_marks.entry(chunk).or_default().extend(bucket);
         }
@@ -13475,10 +13647,7 @@ impl Gen {
 
     /// Merge a wave worker's feature-height maxima into the owner's. Max is associative, so
     /// the order in which disjoint wave windows are merged cannot change the bound.
-    pub(crate) fn merge_feat_hm(
-        &mut self,
-        entries: CoordMap<(i32, i32), (i32, i32)>,
-    ) {
+    pub(crate) fn merge_feat_hm(&mut self, entries: CoordMap<(i32, i32), (i32, i32)>) {
         for (key, (non_air, solid)) in entries {
             let e = self.feat_hm.entry(key).or_insert((i32::MIN, i32::MIN));
             e.0 = e.0.max(non_air);
@@ -13568,6 +13737,18 @@ impl Gen {
     /// already-decorated neighbour that was still a writable proto chunk (blackstone
     /// at (-385,10,304) from pop (-24,19)). The offline generator has no promotion
     /// stage, so modeling that half would refuse writes vanilla kept.
+    /// Record `ChunkMap`'s proto -> full transition for one chunk.
+    pub(crate) fn mark_chunk_promoted(&mut self, cx: i32, cz: i32) {
+        self.promoted_chunks.insert((cx, cz));
+    }
+
+    /// Whether a chunk has crossed the promotion boundary. Exposed for generation tests
+    /// and for the runtime drain that must treat the chunk as a LevelChunk.
+    #[allow(dead_code)]
+    pub(crate) fn chunk_is_promoted(&self, cx: i32, cz: i32) -> bool {
+        self.promoted_chunks.contains(&(cx, cz))
+    }
+
     pub(crate) fn feature_write_allowed(&self, x: i32, z: i32) -> bool {
         let Some((px, pz)) = self.pop_active else {
             // Not inside a FEATURES pass (unit tests, template post-processing):
@@ -13575,6 +13756,9 @@ impl Gen {
             return true;
         };
         let (cx, cz) = (x >> 4, z >> 4);
+        if self.promoted_chunks.contains(&(cx, cz)) {
+            return false;
+        }
         (cx - px).abs() <= 1 && (cz - pz).abs() <= 1
     }
 
@@ -13596,7 +13780,10 @@ impl Gen {
     pub(crate) fn stage_payloads(
         &mut self,
         source: (i32, i32),
-        items: &mut Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)>,
+        items: &mut Vec<(
+            (i32, i32, i32),
+            crate::generation_payload::GenerationPayload,
+        )>,
     ) {
         if self.payload_sources.insert(source) {
             self.staged_payloads.append(items);
@@ -13610,7 +13797,10 @@ impl Gen {
     /// double-apply them.
     pub(crate) fn take_staged_payloads(
         &mut self,
-    ) -> Vec<((i32, i32, i32), crate::generation_payload::GenerationPayload)> {
+    ) -> Vec<(
+        (i32, i32, i32),
+        crate::generation_payload::GenerationPayload,
+    )> {
         std::mem::take(&mut self.staged_payloads)
     }
 
@@ -13911,7 +14101,12 @@ fn df_detail(d: &DF) -> String {
         DF::Noise { ni, xzs, ys, .. } => format!("ni={ni} xzs={xzs} ys={ys}"),
         DF::Spline(s) => format!("coord={} pts={}", s.coord, s.pts.len()),
         DF::Cache(a) | DF::Interp(a) | DF::BlendD(a) => format!("arg={a}"),
-        DF::Add(a, b) | DF::Sub(a, b) | DF::Mul(a, b) | DF::Min(a, b) | DF::Max(a, b) | DF::Div(a, b) => {
+        DF::Add(a, b)
+        | DF::Sub(a, b)
+        | DF::Mul(a, b)
+        | DF::Min(a, b)
+        | DF::Max(a, b)
+        | DF::Div(a, b) => {
             format!("{a},{b}")
         }
         DF::Clamp { i, lo, hi } => format!("{i} [{lo},{hi}]"),
@@ -14827,9 +15022,7 @@ pub fn terrain_section_dim(
     }
     ensure_dim_generator(dimension);
     let mut gg = gen_lock_dim(dimension);
-    gg.as_mut()?
-        .terrain_section_at(cx, sy, cz, populate)
-        .into()
+    gg.as_mut()?.terrain_section_at(cx, sy, cz, populate).into()
 }
 
 impl Gen {
@@ -15290,6 +15483,208 @@ fn biome_id(name: &str) -> i64 {
         .unwrap_or(39) // plains
 }
 
+#[allow(clippy::type_complexity)]
+fn fallback_climate_tree(
+    preset: NoisePreset,
+) -> (Vec<String>, HashMap<String, u16>, Vec<[[i32; 2]; 7]>, BT) {
+    // Deterministic climate fallback used only when neither the exported interval tree
+    // nor generated datapack asset is present. Nether's five vanilla parameter points
+    // are exact; the Overworld rows are broad canonical climate anchors. They preserve
+    // multi-biome spatial variation instead of collapsing a whole dimension to plains.
+    let rows: &[(&str, [[i32; 2]; 7])] = if preset == NoisePreset::Nether {
+        &[
+            (
+                "minecraft:nether_wastes",
+                [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]],
+            ),
+            (
+                "minecraft:crimson_forest",
+                [[4000, 4000], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]],
+            ),
+            (
+                "minecraft:soul_sand_valley",
+                [
+                    [0, 0],
+                    [-5000, -5000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:basalt_deltas",
+                [
+                    [-5000, -5000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [1750, 1750],
+                ],
+            ),
+            (
+                "minecraft:warped_forest",
+                [
+                    [0, 0],
+                    [5000, 5000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                    [3750, 3750],
+                ],
+            ),
+        ]
+    } else {
+        &[
+            (
+                "minecraft:ocean",
+                [
+                    [-1500, 1500],
+                    [-1000, 1000],
+                    [-10000, -1100],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:frozen_ocean",
+                [
+                    [-10000, -4500],
+                    [-1000, 1000],
+                    [-10000, -1100],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:warm_ocean",
+                [
+                    [4500, 10000],
+                    [-1000, 1000],
+                    [-10000, -1100],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:snowy_plains",
+                [
+                    [-10000, -4500],
+                    [-1000, 1000],
+                    [-1000, 10000],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:plains",
+                [
+                    [-4500, 4500],
+                    [-1000, 1000],
+                    [-1000, 10000],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:desert",
+                [
+                    [4500, 10000],
+                    [-10000, -1000],
+                    [-1000, 10000],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:forest",
+                [
+                    [-1500, 4500],
+                    [1000, 10000],
+                    [-1000, 10000],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:jungle",
+                [
+                    [4500, 10000],
+                    [1000, 10000],
+                    [-1000, 10000],
+                    [-1000, 1000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:stony_peaks",
+                [
+                    [-1500, 4500],
+                    [-1000, 1000],
+                    [-1000, 10000],
+                    [-10000, -3500],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+            (
+                "minecraft:swamp",
+                [
+                    [-1000, 4500],
+                    [1000, 10000],
+                    [-1000, 10000],
+                    [1000, 10000],
+                    [0, 0],
+                    [0, 0],
+                    [0, 0],
+                ],
+            ),
+        ]
+    };
+    let mut names = Vec::new();
+    let mut ids = HashMap::new();
+    let mut leaf_ps = Vec::new();
+    let mut nodes = vec![BTNode {
+        bounds: [[i32::MIN / 2, i32::MAX / 2]; 7],
+        child_start: 1,
+        child_len: rows.len() as u16,
+        off6_sq: 0,
+    }];
+    for (i, (name, ps)) in rows.iter().enumerate() {
+        names.push((*name).to_owned());
+        ids.insert((*name).to_owned(), i as u16);
+        leaf_ps.push(*ps);
+        nodes.push(BTNode {
+            bounds: *ps,
+            child_start: i as u32,
+            child_len: 0,
+            off6_sq: 0,
+        });
+    }
+    (names, ids, leaf_ps, BT { nodes })
+}
+
 #[derive(Debug, Clone)]
 struct BTNode {
     bounds: [[i32; 2]; 7],
@@ -15688,7 +16083,11 @@ impl Gen {
         }
         let i = best.0;
         let (px, py, pz) = ((i & 4) == 0, (i & 2) == 0, (i & 1) == 0);
-        (bx + i32::from(!px), by + i32::from(!py), bz + i32::from(!pz))
+        (
+            bx + i32::from(!px),
+            by + i32::from(!py),
+            bz + i32::from(!pz),
+        )
     }
 
     pub(crate) fn biome_quart(
@@ -15850,12 +16249,7 @@ pub fn biome_section(cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
 /// [`biome_section`] for one named dimension. An unset quart keeps the same default the
 /// dim-less form used: 39 (plains) is the protocol-767 default biome and is what a caller
 /// writes when the generator has no answer for that cell.
-pub fn biome_section_dim(
-    dimension: DimId,
-    cx: i32,
-    sy: i32,
-    cz: i32,
-) -> Option<Box<[i64; 64]>> {
+pub fn biome_section_dim(dimension: DimId, cx: i32, sy: i32, cz: i32) -> Option<Box<[i64; 64]>> {
     if let Some(biome) = custom_biome_id(dimension) {
         return Some(Box::new([biome; 64]));
     }
@@ -15909,10 +16303,9 @@ mod wg_tests {
 
         // An unknown rule type: the deepest failure names the type.
         let rule = jparse(br#"{"type":"minecraft:bogus_rule"}"#).unwrap();
-        assert!(
-            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
-                .is_none()
-        );
+        assert!(g
+            .rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+            .is_none());
         let e = g.surface_rule_load_failure(NoisePreset::Overworld);
         assert_eq!(e.kind, "surface_rule");
         assert_eq!(e.id, "minecraft:overworld");
@@ -15926,20 +16319,18 @@ mod wg_tests {
 
         // A dangling material_rule reference names the missing file.
         let rule = J::Str("test:missing_rule".to_string());
-        assert!(
-            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
-                .is_none()
-        );
+        assert!(g
+            .rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+            .is_none());
         let e = g.surface_rule_load_failure(NoisePreset::Overworld);
         assert_eq!(e.id, "test:missing_rule");
         assert_eq!(e.reason, "missing or invalid JSON");
 
         // A node that is neither name nor object is malformed, not skipped.
         let rule = J::Num(1.0);
-        assert!(
-            g.rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
-                .is_none()
-        );
+        assert!(g
+            .rule_node(&rule, &empty, &empty, &empty, crate::name_to_state)
+            .is_none());
         let e = g.surface_rule_load_failure(NoisePreset::Overworld);
         assert_eq!(e.reason, "surface rule node is not a name or object");
     }
@@ -15978,13 +16369,16 @@ mod wg_tests {
         let maybe = g.rules.len();
         g.rules.push(Rule::Cond(hole_cond, second));
         let inner = g.rules.len();
-        g.rules.push(Rule::Seq(vec![never, maybe].into_boxed_slice()));
+        g.rules
+            .push(Rule::Seq(vec![never, maybe].into_boxed_slice()));
         let guarded = g.rules.len();
         g.rules.push(Rule::Cond(prelim_cond, inner));
         let outer = g.rules.len();
-        g.rules.push(Rule::Seq(vec![guarded, fallback].into_boxed_slice()));
+        g.rules
+            .push(Rule::Seq(vec![guarded, fallback].into_boxed_slice()));
         let direct = g.rules.len();
-        g.rules.push(Rule::Seq(vec![first, second].into_boxed_slice()));
+        g.rules
+            .push(Rule::Seq(vec![first, second].into_boxed_slice()));
         let empty = g.rules.len();
         g.rules.push(Rule::Seq(Box::new([])));
 
@@ -16364,9 +16758,9 @@ mod wg_tests {
     fn overworld_chunk_matches_native_capture_state_for_state() {
         use std::io::Read;
         let mut expected_text = String::new();
-        flate2::read::GzDecoder::new(&include_bytes!(
-            "../tests/data/overworld_chunk_0_0_1211.tsv.gz"
-        )[..])
+        flate2::read::GzDecoder::new(
+            &include_bytes!("../tests/data/overworld_chunk_0_0_1211.tsv.gz")[..],
+        )
         .read_to_string(&mut expected_text)
         .unwrap();
         let reg = crate::block_registry::breg().unwrap();
@@ -16387,12 +16781,19 @@ mod wg_tests {
                 f[3].to_owned(),
             );
         }
-        assert_eq!(want.len(), 32_518, "the capture carries its full cell count");
+        assert_eq!(
+            want.len(),
+            32_518,
+            "the capture carries its full cell count"
+        );
 
         // `terrain_section` reads the process-global generator, so hold its lock (the
         // parallel rounds run this beside other world tests) and initialise seed 0.
         let _guard = lock_gen();
-        assert!(init(0, crate::name_to_state), "generator for the captured seed");
+        assert!(
+            init(0, crate::name_to_state),
+            "generator for the captured seed"
+        );
         let (lo, hi) = (min_y(), max_y());
         let mut got: std::collections::HashMap<(i32, i32, i32), String> =
             std::collections::HashMap::default();
@@ -16406,10 +16807,7 @@ mod wg_tests {
                         if st == 0 {
                             continue;
                         }
-                        got.insert(
-                            (lx, sy + ly, lz),
-                            reg.canonical_state(st),
-                        );
+                        got.insert((lx, sy + ly, lz), reg.canonical_state(st));
                     }
                 }
             }
@@ -16472,7 +16870,11 @@ mod wg_tests {
                 f[3].to_owned(),
             );
         }
-        assert_eq!(want.len(), 31_721, "the capture carries its full cell count");
+        assert_eq!(
+            want.len(),
+            31_721,
+            "the capture carries its full cell count"
+        );
 
         let _guard = lock_gen();
         // The generator reaches the structure pipeline's beardifier through a
@@ -16481,7 +16883,10 @@ mod wg_tests {
         // unbearded, which moves the trial chamber's `encapsulate` shell and every block
         // the surface then sees.
         crate::feature::register_beard_resolver();
-        assert!(init(4242, crate::name_to_state), "generator for the captured seed");
+        assert!(
+            init(4242, crate::name_to_state),
+            "generator for the captured seed"
+        );
         let (lo, hi) = (min_y(), max_y());
         let mut got: std::collections::HashMap<(i32, i32, i32), String> =
             std::collections::HashMap::default();
@@ -16655,7 +17060,9 @@ mod wg_tests {
         for seed in [0u64, 42] {
             let mut g = Gen::load(seed, crate::name_to_state).expect("pinned datapack");
             let config = jparse(br#"{"type":"minecraft:end_islands"}"#).unwrap();
-            let index = g.node(&config, &HashMap::default()).expect("End density node");
+            let index = g
+                .node(&config, &HashMap::default())
+                .expect("End density node");
             let mut checked = 0;
             for row in include_str!("../tests/data/end_islands_1211.tsv").lines() {
                 let f: Vec<_> = row.split('\t').collect();
@@ -16733,7 +17140,11 @@ mod wg_tests {
             r#"{"type":"minecraft:shifted_noise","noise":"minecraft:temperature","shift_x":0,"shift_y":{"type":"minecraft:unsupported_density"},"shift_z":0,"xz_scale":1,"y_scale":1}"#,
             r#"{"type":"minecraft:noise","noise":"minecraft:temperature","shift_x":{"type":"minecraft:unsupported_density"},"xz_scale":1,"y_scale":1}"#,
         ] {
-            assert!(g.node(&jparse(invalid.as_bytes()).unwrap(), &empty).is_none(), "{invalid}");
+            assert!(
+                g.node(&jparse(invalid.as_bytes()).unwrap(), &empty)
+                    .is_none(),
+                "{invalid}"
+            );
         }
     }
 
@@ -16765,7 +17176,10 @@ mod wg_tests {
 
         let (state, marked) = g.terrain_cell_marked(&cc, 98, 19, -513);
         assert_eq!(state, water, "the fill writes the aquifer's water here");
-        assert!(g.aq_schedule_fluid_update(), "the aquifer calls this cell settled");
+        assert!(
+            g.aq_schedule_fluid_update(),
+            "the aquifer calls this cell settled"
+        );
         assert_eq!(marked, MARK_FILL, "so the fill files one mark for it");
 
         // Below the fluid the fill wrote stone: no fluid, no mark, whatever the flag says.
@@ -16841,8 +17255,7 @@ mod wg_tests {
                         for lx in 0..16 {
                             let (x, z) = (cx * 16 + lx, cz * 16 + lz);
                             let mut memo = HashMap::default();
-                            let want =
-                                g.eval_c(g.final_density, x, y, z, &mut memo, Some(cc));
+                            let want = g.eval_c(g.final_density, x, y, z, &mut memo, Some(cc));
                             let got = prog.eval(&g, Some(cc), x, y, z);
                             assert_eq!(
                                 want.to_bits(),
@@ -17102,7 +17515,6 @@ mod wg_tests {
         );
     }
 
-
     // ---- M3 P4: the four-lane density evaluator ----
 
     /// The values the four-lane ops are held to: the ones where an IEEE-754 operation on one
@@ -17160,7 +17572,8 @@ mod wg_tests {
         let mut check = |ops: Vec<Op>, what: &str, a: f64, b: f64| {
             let prog = df4_prog(ops);
             for x in [-8, 0, 5] {
-                let want: [f64; DF4] = std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, 7, 3));
+                let want: [f64; DF4] =
+                    std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, 7, 3));
                 let got = prog.eval_x4(&g, None, x, 7, 3);
                 for k in 0..DF4 {
                     // A NaN *result* is the one place the two lowerings are allowed to
@@ -17344,7 +17757,10 @@ mod wg_tests {
     fn df4_columns_match_the_scalar_density_path() {
         let _guard = lock_gen();
         let mut compared = 0usize;
-        for (preset, seed) in [(NoisePreset::Overworld, 0u64), (NoisePreset::Overworld, 4242)] {
+        for (preset, seed) in [
+            (NoisePreset::Overworld, 0u64),
+            (NoisePreset::Overworld, 4242),
+        ] {
             let mut g = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
             if DfProg::compile_inner(&g).is_none() {
                 continue;
@@ -17362,9 +17778,7 @@ mod wg_tests {
                 df4_test_force_scalar(false);
                 assert_eq!(vector.surf, scalar.surf, "{preset:?} surf at ({cx},{cz})");
                 assert_eq!(vector.wtop, scalar.wtop, "{preset:?} wtop at ({cx},{cz})");
-                assert_eq!(
-                    &vector_sm.rd, &scalar_sm.rd, "{preset:?} rd at ({cx},{cz})"
-                );
+                assert_eq!(&vector_sm.rd, &scalar_sm.rd, "{preset:?} rd at ({cx},{cz})");
                 for (i, (a, b)) in vector_sm.mats.iter().zip(scalar_sm.mats.iter()).enumerate() {
                     match (a, b) {
                         (None, None) => {}
@@ -17393,7 +17807,9 @@ mod wg_tests {
                                 compared += 1;
                             }
                         }
-                        _ => panic!("{preset:?} grid {slot}: one arm built a grid and the other did not"),
+                        _ => panic!(
+                            "{preset:?} grid {slot}: one arm built a grid and the other did not"
+                        ),
                     }
                 }
             }
@@ -17449,7 +17865,10 @@ mod wg_tests {
             };
             let mut sorted = marks.clone();
             sorted.sort_by_key(key);
-            assert_eq!(marks, sorted, "section sy={sy} did not file its marks in order");
+            assert_eq!(
+                marks, sorted,
+                "section sy={sy} did not file its marks in order"
+            );
             want_marks.sort_by_key(key);
             assert_eq!(
                 arr.as_ref(),
@@ -19338,7 +19757,10 @@ mod wg_tests {
         for g in [&folded, &raw] {
             assert!(g.names.is_empty() && g.noise_names.is_empty());
             assert!(g.rule_ids.is_empty() && g.cond_ids.is_empty());
-            assert!(!g.bleaf.is_empty(), "biome_leaf_of_name is a runtime lookup");
+            assert!(
+                !g.bleaf.is_empty(),
+                "biome_leaf_of_name is a runtime lookup"
+            );
         }
         assert!(
             folded.ram_trimmed > 0,
@@ -19349,9 +19771,7 @@ mod wg_tests {
             folded.ram_trimmed, raw.ram_trimmed
         );
         let folded_ids: Vec<usize> = (0..raw.dfs.len())
-            .filter(|&i| {
-                matches!(folded.dfs[i], DF::C(_)) && !matches!(raw.dfs[i], DF::C(_))
-            })
+            .filter(|&i| matches!(folded.dfs[i], DF::C(_)) && !matches!(raw.dfs[i], DF::C(_)))
             .collect();
         assert_eq!(folded_ids.len(), folded.df_folded);
         eprintln!(
@@ -19463,7 +19883,12 @@ mod wg_tests {
     fn dimension_type_declares_a_world_window_containing_the_generator() {
         let _guard = lock_gen();
         for (preset, file, gen, world) in [
-            (NoisePreset::Overworld, "overworld.json", (-64, 384), (-64, 384)),
+            (
+                NoisePreset::Overworld,
+                "overworld.json",
+                (-64, 384),
+                (-64, 384),
+            ),
             (NoisePreset::Nether, "the_nether.json", (0, 128), (0, 256)),
             (NoisePreset::End, "the_end.json", (0, 128), (0, 256)),
         ] {
@@ -19492,10 +19917,9 @@ mod wg_tests {
             );
             assert!(f.world_height >= f.height, "{preset:?}");
             // And the numbers are the pack's own, read the way the loader reads them.
-            let path = std::path::Path::new("datapacks/vanilla/data/minecraft/dimension_type")
-                .join(file);
-            let raw = std::fs::read(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let path =
+                std::path::Path::new("datapacks/vanilla/data/minecraft/dimension_type").join(file);
+            let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             let j = jparse(&raw).unwrap_or_else(|| panic!("{}: invalid JSON", path.display()));
             assert_eq!(
                 (
@@ -19557,7 +19981,10 @@ mod wg_tests {
                 256,
                 "{dimension:?}: data snapshot"
             );
-            assert!(!has_skylight(dimension), "{dimension:?}: no sky light layer");
+            assert!(
+                !has_skylight(dimension),
+                "{dimension:?}: no sky light layer"
+            );
         }
 
         // The Overworld is untouched by either install: still the active dimension, still its
@@ -19662,8 +20089,8 @@ mod wg_tests {
             let mut above_gen = 0usize;
             let mut sy = lo;
             while sy <= hi {
-                let arr = terrain_section(0, sy, 0, crate::feature::populate)
-                    .expect("terrain section");
+                let arr =
+                    terrain_section(0, sy, 0, crate::feature::populate).expect("terrain section");
                 cells += arr.len();
                 if sy >= f.min_y + f.height {
                     above_gen += arr
@@ -19952,15 +20379,27 @@ mod wg_tests {
                 .into_iter()
                 .zip(&keys)
                 .map(|(chunk, &key)| {
-                    (key, chunk.unwrap_or_else(|| panic!("{preset:?}: no reference rows for {key:?}")))
+                    (
+                        key,
+                        chunk
+                            .unwrap_or_else(|| panic!("{preset:?}: no reference rows for {key:?}")),
+                    )
                 })
                 .collect();
             let mut fp_gen = Gen::fresh_scratch(data.clone());
             for jobs in [1usize, 5, 8] {
                 let round = crate::feature::starts_round_begin();
                 let cols = prefetch_cols_with(&data, Some(resolver), &keys, jobs, Some(round));
-                let got =
-                    prefetch_terrain(&data, Some(resolver), &keys, &cols, lo, hi, jobs, Some(round));
+                let got = prefetch_terrain(
+                    &data,
+                    Some(resolver),
+                    &keys,
+                    &cols,
+                    lo,
+                    hi,
+                    jobs,
+                    Some(round),
+                );
                 crate::feature::starts_round_end(round);
                 assert_eq!(got.len(), want.len());
                 for (chunk, (key, want_chunk)) in got.into_iter().zip(&want) {
@@ -20031,7 +20470,11 @@ mod wg_tests {
             let flights =
                 crate::feature::round_adapting_flight_counts(round).expect("adapting flights");
             let counts = terrain_share(round).expect("the round's terrain share");
-            let counts = counts.flight_counts().into_iter().flat_map(|(a, b)| [a, b]).collect();
+            let counts = counts
+                .flight_counts()
+                .into_iter()
+                .flat_map(|(a, b)| [a, b])
+                .collect();
             crate::feature::starts_round_end(round);
             (scans, flights, counts)
         };
@@ -20113,8 +20556,13 @@ mod wg_tests {
                     g.starts_round = Some(round);
                     g.set_beard_resolver(resolver);
                     barrier.wait();
-                    let cc = g.cols(raced.0, raced.1).expect("columns for the raced chunk");
-                    fingers.lock().unwrap_or_else(|e| e.into_inner()).push(cols_fingerprint(&mut g, &cc));
+                    let cc = g
+                        .cols(raced.0, raced.1)
+                        .expect("columns for the raced chunk");
+                    fingers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(cols_fingerprint(&mut g, &cc));
                 });
             }
         });
@@ -20123,7 +20571,10 @@ mod wg_tests {
         crate::feature::starts_round_end(round);
         let fingers = fingers.into_inner().unwrap();
         assert_eq!(fingers.len(), 2);
-        assert_eq!(fingers[0], fingers[1], "the two racers got different columns");
+        assert_eq!(
+            fingers[0], fingers[1],
+            "the two racers got different columns"
+        );
         assert_eq!(
             built, 1,
             "two threads of one round built the same chunk's columns ({built} builds)"
@@ -20280,8 +20731,15 @@ mod wg_tests {
         let got = prefetch_terrain(&data, None, &keys, &cols, min_y(), min_y() + 15, jobs, None);
         let (arrived, timed_out) = parallel_probe::disarm();
         let missing = got.iter().filter(|c| c.is_none()).count();
-        assert!(missing == 0, "{missing} of {} keys were left to the serial path", keys.len());
-        assert!(arrived >= 2, "only {arrived} worker(s) entered the fill window");
+        assert!(
+            missing == 0,
+            "{missing} of {} keys were left to the serial path",
+            keys.len()
+        );
+        assert!(
+            arrived >= 2,
+            "only {arrived} worker(s) entered the fill window"
+        );
         assert!(
             !timed_out,
             "the first worker waited for a second and none came: the dispatch is serial"
@@ -20501,9 +20959,19 @@ mod wg_tests {
         for (x0, z0, x1, z1, want) in [(0, 0, 0, 0, 49), (-3, 5, -3, 5, 49), (0, 0, 2, 2, 81)] {
             let requests = request_box(x0, z0, x1, z1);
             let order = population_discipline_order(&requests);
-            assert_eq!(order.len(), want, "decorated count for ({x0},{z0})..({x1},{z1})");
-            let (min_x, max_x) = (order.iter().map(|c| c.0).min(), order.iter().map(|c| c.0).max());
-            let (min_z, max_z) = (order.iter().map(|c| c.1).min(), order.iter().map(|c| c.1).max());
+            assert_eq!(
+                order.len(),
+                want,
+                "decorated count for ({x0},{z0})..({x1},{z1})"
+            );
+            let (min_x, max_x) = (
+                order.iter().map(|c| c.0).min(),
+                order.iter().map(|c| c.0).max(),
+            );
+            let (min_z, max_z) = (
+                order.iter().map(|c| c.1).min(),
+                order.iter().map(|c| c.1).max(),
+            );
             assert_eq!(
                 (min_x, max_x, min_z, max_z),
                 (Some(x0 - 3), Some(x1 + 3), Some(z0 - 3), Some(z1 + 3)),
@@ -20524,12 +20992,22 @@ mod wg_tests {
             let requests = request_box(x0, z0, x1, z1);
             let batches = population_discipline(&requests);
             let first = &batches[0];
-            assert_eq!(first.level, POP_REQUEST_LEVEL, "the first batch is a request chunk");
-            assert_eq!(first.demander, (x0, z0), "the first demander is the min corner");
+            assert_eq!(
+                first.level, POP_REQUEST_LEVEL,
+                "the first batch is a request chunk"
+            );
+            assert_eq!(
+                first.demander,
+                (x0, z0),
+                "the first demander is the min corner"
+            );
             let want: Vec<(i32, i32)> = (x0 - 1..=x0 + 1)
                 .flat_map(|x| (z0 - 1..=z0 + 1).map(move |z| (x, z)))
                 .collect();
-            assert_eq!(first.decorated, want, "first block is the x-then-z 3x3 window");
+            assert_eq!(
+                first.decorated, want,
+                "first block is the x-then-z 3x3 window"
+            );
             assert_eq!(
                 population_discipline_order(&requests)[..9].to_vec(),
                 want,
@@ -20557,7 +21035,11 @@ mod wg_tests {
             for batch in &batches {
                 let ring = requests
                     .iter()
-                    .map(|r| (batch.demander.0 - r.0).abs().max((batch.demander.1 - r.1).abs()))
+                    .map(|r| {
+                        (batch.demander.0 - r.0)
+                            .abs()
+                            .max((batch.demander.1 - r.1).abs())
+                    })
                     .min()
                     .unwrap();
                 assert_eq!(
@@ -20570,7 +21052,10 @@ mod wg_tests {
                     batch.level < POP_DECORATION_LEVEL,
                     "a chunk whose own target is FEATURES never demands"
                 );
-                assert!(!batch.decorated.is_empty(), "a demander decorates its window");
+                assert!(
+                    !batch.decorated.is_empty(),
+                    "a demander decorates its window"
+                );
             }
             // Level-major does not mean the decorated list is level-sorted: the window of a
             // level-31 pop already reaches ring 1.
@@ -20647,7 +21132,10 @@ mod wg_tests {
         assert_eq!(g.feat_state(0, 64, 0, &mut populate), Some(106));
         // Chunk (-1,-1)'s own 3x3 is the first pop's window, so the values are the ones the lazy
         // scan produced; the difference is the 40 chunks the discipline also decorates.
-        assert_eq!(visited, population_discipline_order(&request_box(-1, -1, -1, -1)));
+        assert_eq!(
+            visited,
+            population_discipline_order(&request_box(-1, -1, -1, -1))
+        );
         assert_eq!(visited.len(), 49);
     }
 
@@ -20914,10 +21402,7 @@ mod wg_tests {
         for y in carved_surf + 1..=plain_surf {
             let st = g_carve.terrain_state(4, y, 32);
             let solid = st != 0 && st != g_carve.def_fl;
-            assert!(
-                !solid,
-                "carved cell y={y} must not stay solid (state {st})"
-            );
+            assert!(!solid, "carved cell y={y} must not stay solid (state {st})");
         }
         assert_eq!(g_carve.prelim_min(4, 32), plain_prelim);
     }
@@ -20948,8 +21433,15 @@ mod wg_tests {
     fn shape_marks_wait_for_the_whole_three_by_three_and_are_consumed_once() {
         let mut g = Gen::load(4242, crate::name_to_state).unwrap();
         g.store_shape_mark(-1521, -21, 560);
-        assert_eq!(g.take_shape_marks(-97, 35), Vec::new(), "filed under its own chunk");
-        assert!(!g.promotion_window_ready(-96, 35), "nothing has generated yet");
+        assert_eq!(
+            g.take_shape_marks(-97, 35),
+            Vec::new(),
+            "filed under its own chunk"
+        );
+        assert!(
+            !g.promotion_window_ready(-96, 35),
+            "nothing has generated yet"
+        );
         let mut order: Vec<(i32, i32)> = Vec::new();
         for dx in -1..=1 {
             for dz in -1..=1 {
@@ -20967,7 +21459,10 @@ mod wg_tests {
             );
         }
         assert_eq!(g.populate_in_order([(-96, 35)], |_, _, _| {}), 1);
-        assert!(g.promotion_window_ready(-96, 35), "the whole 3x3 has generated");
+        assert!(
+            g.promotion_window_ready(-96, 35),
+            "the whole 3x3 has generated"
+        );
         assert_eq!(g.take_shape_marks(-96, 35), vec![(-1521, -21, 560)]);
         assert!(g.take_shape_marks(-96, 35).is_empty(), "consumed once");
     }
@@ -20987,9 +21482,16 @@ mod wg_tests {
             .collect();
         let text: String = order.iter().map(|(x, z)| format!("{x}\t{z}\n")).collect();
         let plan = parse_population_order(&text, 0, 0, 1, false).unwrap();
-        assert_eq!(plan.window, (-1, -1, 1, 1), "the (n+2)² halo, not the request");
+        assert_eq!(
+            plan.window,
+            (-1, -1, 1, 1),
+            "the (n+2)² halo, not the request"
+        );
         // The corner of the plan's own 3x3: three of its nine window cells lie outside.
-        assert!(!g.promotion_window_ready(-1, -1), "its own chunk is not decorated");
+        assert!(
+            !g.promotion_window_ready(-1, -1),
+            "its own chunk is not decorated"
+        );
         assert_eq!(g.populate_plan(plan, |_, _, _| {}), 9);
         assert!(
             g.promotion_window_ready(-1, -1),
@@ -21575,7 +22077,9 @@ mod wg_tests {
         }
         // Every subject chunk was written in the last rounds, so all of them are still
         // resident and keep their claim.
-        let subjects: Vec<(i32, i32)> = (0..7).flat_map(|cx| (0..5).map(move |cz| (cx, cz))).collect();
+        let subjects: Vec<(i32, i32)> = (0..7)
+            .flat_map(|cx| (0..5).map(move |cz| (cx, cz)))
+            .collect();
         for &(cx, cz) in &subjects {
             assert!(
                 g.feature_override(cx * 16 + 1, 60, cz * 16 + 1).is_some(),
@@ -21604,7 +22108,9 @@ mod wg_tests {
         let mut g = Gen::load(4242, crate::name_to_state).expect("datapack");
         let mut items = vec![(
             (0, 60, 0),
-            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| String::new())),
+            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| {
+                String::new()
+            })),
         )];
         g.stage_payloads((0, 0), &mut items);
         assert!(items.is_empty(), "the staging call takes the payloads");
@@ -21620,10 +22126,15 @@ mod wg_tests {
         // Recomputing the evicted source must not stage it a second time.
         let mut again = vec![(
             (0, 60, 0),
-            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| String::new())),
+            crate::generation_payload::GenerationPayload::Sign(std::array::from_fn(|_| {
+                String::new()
+            })),
         )];
         g.stage_payloads((0, 0), &mut again);
-        assert!(again.is_empty(), "a regenerated chunk keeps its payload source");
+        assert!(
+            again.is_empty(),
+            "a regenerated chunk keeps its payload source"
+        );
     }
 
     // ---- Layer A1-a: chunk-local aquifer grid (a1a_aq_*) ----
@@ -21771,7 +22282,10 @@ mod wg_tests {
                             for dy in -1..=1 {
                                 for dz in 0..=1 {
                                     let (gx, gy, gz) = (sx + dx, sy + dy, sz + dz);
-                                    assert!(c.contains(gx, gy, gz), "({gx},{gy},{gz}) outside grid");
+                                    assert!(
+                                        c.contains(gx, gy, gz),
+                                        "({gx},{gy},{gz}) outside grid"
+                                    );
                                     assert!(idxs.insert(c.idx(gx, gy, gz)), "flat index collision");
                                 }
                             }
@@ -21786,7 +22300,10 @@ mod wg_tests {
                 for gy in (c.min_gy - 1)..=(c.min_gy + c.ny as i32) {
                     for gz in (c.min_gz - 1)..=(c.min_gz + c.nz as i32) {
                         let (rx, ry, rz) = g.aq_rpos(gx, gy, gz);
-                        assert_eq!((rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16)), (gx, gy, gz));
+                        assert_eq!(
+                            (rx.div_euclid(16), ry.div_euclid(12), rz.div_euclid(16)),
+                            (gx, gy, gz)
+                        );
                     }
                 }
             }
@@ -21804,7 +22321,10 @@ mod wg_tests {
             let data = std::sync::Arc::clone(&local.data);
             let mut cached = Gen::fresh_scratch(data.clone());
             let mut direct = Gen::fresh_scratch(data);
-            let (lo, hi) = (cached.data.min_y, cached.data.min_y + cached.data.height - 1);
+            let (lo, hi) = (
+                cached.data.min_y,
+                cached.data.min_y + cached.data.height - 1,
+            );
             let sea = cached.sea;
             let ys = [lo, -54, 0, sea, hi];
             let mut checked = 0usize;
@@ -21855,7 +22375,8 @@ mod wg_tests {
                             for dz in 0..=1 {
                                 let p = g.aq_rpos(sx + dx, sy + dy, sz + dz);
                                 let (ex, ey, ez) = (p.0 - x, p.1 - y, p.2 - z);
-                                let h = ex as i64 * ex as i64 + ey as i64 * ey as i64
+                                let h = ex as i64 * ex as i64
+                                    + ey as i64 * ey as i64
                                     + ez as i64 * ez as i64;
                                 let e = (p, h);
                                 if four[0].1 >= h {
@@ -21893,7 +22414,10 @@ mod wg_tests {
                 }
             }
         }
-        assert!(checked > 1000 && ties > 0, "sweep must include observable ties: {ties}");
+        assert!(
+            checked > 1000 && ties > 0,
+            "sweep must include observable ties: {ties}"
+        );
     }
 
     /// Layer A2-a: the flat, generation-stamped corner memo must produce exactly the
@@ -22146,7 +22670,10 @@ mod wg_tests {
                 }
             }
         }
-        assert!(compared >= 2 * 2 * 3 * 2 * 3 * DF8, "trilinear cases did not run");
+        assert!(
+            compared >= 2 * 2 * 3 * 2 * 3 * DF8,
+            "trilinear cases did not run"
+        );
         for x in [1, 2, 4, 6, 15] {
             assert!(
                 trilinear_x8(&cells, &columns, x, min_y, 0).is_none(),
@@ -22274,7 +22801,10 @@ mod wg_tests {
         }
         let vec = m3_local().get(M3_DF4_VEC);
         m3_test_force(false);
-        assert!(compared > 1_000, "only {compared} lane values were compared");
+        assert!(
+            compared > 1_000,
+            "only {compared} lane values were compared"
+        );
         assert!(nan_results > 0, "NaN cases stopped being covered");
         if df8_avx512() {
             assert!(vec > 0, "eight-lane vector arm never ran: {vec} groups");
@@ -22294,20 +22824,25 @@ mod wg_tests {
             Op::Push(0.0),
             Op::Push(0.0),
             Op::Push(0.0),
-            Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+            Op::Noise {
+                ni: 0,
+                xzs: 1.0,
+                ys: 0.0,
+            },
             Op::Halt,
         ]);
         let (x, y, z) = (3, 7, -2);
-        let vals: [f64; DF8] =
-            std::array::from_fn(|k| probe.eval(&g, None, x + k as i32, y, z));
+        let vals: [f64; DF8] = std::array::from_fn(|k| probe.eval(&g, None, x + k as i32, y, z));
         let lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
         let hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        assert!(lo < hi, "the probe noise did not vary across the eight lanes");
+        assert!(
+            lo < hi,
+            "the probe noise did not vary across the eight lanes"
+        );
         let mid = lo + (hi - lo) * 0.5;
         let check = |ops: Vec<Op>, what: &str| {
             let prog = df4_prog(ops);
-            let want: [f64; DF8] =
-                std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, y, z));
+            let want: [f64; DF8] = std::array::from_fn(|k| prog.eval(&g, None, x + k as i32, y, z));
             let got = prog.eval_x8(&g, None, x, y, z);
             for k in 0..DF8 {
                 assert_eq!(
@@ -22319,7 +22854,10 @@ mod wg_tests {
             #[cfg(target_arch = "x86_64")]
             if df8_avx512() {
                 let direct = unsafe { run8_avx512(&prog, &g, None, x, y, z) };
-                assert!(direct.is_none(), "{what}: mixed lanes must bail out of run8");
+                assert!(
+                    direct.is_none(),
+                    "{what}: mixed lanes must bail out of run8"
+                );
             }
         };
         // BranchLt with a cut strictly between the lane values.
@@ -22328,7 +22866,11 @@ mod wg_tests {
                 Op::Push(0.0),
                 Op::Push(0.0),
                 Op::Push(0.0),
-                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+                Op::Noise {
+                    ni: 0,
+                    xzs: 1.0,
+                    ys: 0.0,
+                },
                 Op::BranchLt { t: mid, target: 7 },
                 Op::Push(1.0),
                 Op::Halt,
@@ -22343,8 +22885,16 @@ mod wg_tests {
                 Op::Push(0.0),
                 Op::Push(0.0),
                 Op::Push(0.0),
-                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
-                Op::BranchOut { mi: mid, ma: 1.0e9, target: 7 },
+                Op::Noise {
+                    ni: 0,
+                    xzs: 1.0,
+                    ys: 0.0,
+                },
+                Op::BranchOut {
+                    mi: mid,
+                    ma: 1.0e9,
+                    target: 7,
+                },
                 Op::Push(1.0),
                 Op::Halt,
                 Op::Push(0.0),
@@ -22358,7 +22908,11 @@ mod wg_tests {
                 Op::Push(0.0),
                 Op::Push(0.0),
                 Op::Push(0.0),
-                Op::Noise { ni: 0, xzs: 1.0, ys: 0.0 },
+                Op::Noise {
+                    ni: 0,
+                    xzs: 1.0,
+                    ys: 0.0,
+                },
                 Op::AddC(-vals[0]),
                 Op::BranchZero { target: 9 },
                 Op::Drop,
@@ -22376,7 +22930,11 @@ mod wg_tests {
         // answer false for NaN and fall through).
         let nan_branch = df4_prog(vec![
             Op::Push(f64::NAN),
-            Op::BranchOut { mi: -1.0, ma: 1.0, target: 4 },
+            Op::BranchOut {
+                mi: -1.0,
+                ma: 1.0,
+                target: 4,
+            },
             Op::Push(1.0),
             Op::Halt,
             Op::Push(0.0),
@@ -22458,7 +23016,11 @@ mod wg_tests {
     fn a2b_single_column_top_ws_and_top_oc_match_full_cols_bit_for_bit() {
         type TopColCase = (NoisePreset, u64, &'static [(i32, i32)]);
         let cases: [TopColCase; 4] = [
-            (NoisePreset::Overworld, 0, &[(0, 0), (1, 0), (-1, 0), (0, -1)]),
+            (
+                NoisePreset::Overworld,
+                0,
+                &[(0, 0), (1, 0), (-1, 0), (0, -1)],
+            ),
             (NoisePreset::Overworld, 4242, &[(0, 0), (-2, 1)]),
             (NoisePreset::Nether, 4242, &[(0, 0), (-1, 1)]),
             (NoisePreset::End, 0, &[(0, 0), (-1, 0)]),
@@ -22469,7 +23031,10 @@ mod wg_tests {
             let mut single = Gen::load_preset(seed, crate::name_to_state, preset).unwrap();
             full.beard_depth = 1;
             single.beard_depth = 1;
-            assert!(single.col_c.is_empty(), "a nested query must start with no final columns");
+            assert!(
+                single.col_c.is_empty(),
+                "a nested query must start with no final columns"
+            );
             for &(cx, cz) in chunks {
                 let cc = full.build_cols(cx, cz, true).expect("full columns");
                 for lz in 0..16usize {
@@ -22492,7 +23057,10 @@ mod wg_tests {
                 }
             }
         }
-        assert!(compared >= 5_000, "the identity check was too small: {compared}");
+        assert!(
+            compared >= 5_000,
+            "the identity check was too small: {compared}"
+        );
     }
 
     /// Layer A2-b: building a column and answering height queries must leave the
@@ -22540,8 +23108,14 @@ mod wg_tests {
                 _ => panic!("column {i}: one arm produced a window and the other did not"),
             }
         }
-        assert_eq!(&lazy.rd, &eager.rd, "run_depth differs between the lazy and eager scans");
-        assert!(cc.surface_mats_computed(), "the lazy cell was not published");
+        assert_eq!(
+            &lazy.rd, &eager.rd,
+            "run_depth differs between the lazy and eager scans"
+        );
+        assert!(
+            cc.surface_mats_computed(),
+            "the lazy cell was not published"
+        );
     }
 }
 
@@ -22605,7 +23179,6 @@ mod weird_sampler_tests;
 #[cfg(all(test, megu_vanilla_data))]
 #[path = "aquifer_native_tests.rs"]
 mod aquifer_native_tests;
-
 
 #[cfg(test)]
 mod dim_facts_tests {
@@ -22729,5 +23302,19 @@ mod dim_facts_tests {
         }
 
         reset_dimension_registry();
+    }
+}
+
+#[cfg(test)]
+mod audit1_worldgen_tests {
+    use super::*;
+    #[test]
+    fn audit1_fallback_climate_tree_is_multi_biome() {
+        let (names, _, leaf_ps, tree) = fallback_climate_tree(NoisePreset::Overworld);
+        assert!(names.len() > 1);
+        assert_eq!(names.len(), leaf_ps.len());
+        assert!(tree.nodes.len() > names.len());
+        let nether = fallback_climate_tree(NoisePreset::Nether);
+        assert_eq!(nether.0.len(), 5);
     }
 }
