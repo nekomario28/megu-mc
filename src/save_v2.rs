@@ -7913,9 +7913,11 @@ fn append_raid_totals_footer(out: &mut Vec<u8>) {
     out.extend_from_slice(RAID_TOTALS_MAGIC);
 }
 
+type RaidTotalEntry = ((DimId, BlockPos), i32);
+
 fn read_raid_totals_footer(
     payload: &[u8],
-) -> Result<(&[u8], Vec<((DimId, BlockPos), i32)>), &'static str> {
+) -> Result<(&[u8], Vec<RaidTotalEntry>), &'static str> {
     let (payload, body) = split_save_footer(payload, RAID_TOTALS_MAGIC)?;
     let Some(body) = body else {
         return Ok((payload, Vec::new()));

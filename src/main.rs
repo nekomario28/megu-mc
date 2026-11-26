@@ -782,12 +782,13 @@ static DIFFICULTY: AtomicU8 = AtomicU8::new(2);
 static DIFFICULTY_LOCKED: AtomicU8 = AtomicU8::new(0);
 // Pressure plate contacts are dimension-scoped: a Nether plate at (x, y, z)
 // must never read or write the Overworld cell at the same coordinates.
-static POWERED_PLATES: OnceLock<Mutex<HashSet<(DimId, i32, i32, i32)>>> = OnceLock::new();
+type PoweredPlateSet = Mutex<HashSet<(DimId, i32, i32, i32)>>;
+static POWERED_PLATES: OnceLock<PoweredPlateSet> = OnceLock::new();
 /// Hard cap on simultaneously tracked powered plates. Entries leave the set
 /// the tick after their plate depowers, so this only binds against runaway
 /// growth; 65536 concurrent powered plates is far past any real world.
 const MAX_POWERED_PLATES: usize = 65536;
-fn powered_plates() -> &'static Mutex<HashSet<(DimId, i32, i32, i32)>> {
+fn powered_plates() -> &'static PoweredPlateSet {
     POWERED_PLATES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 // plate states: unpowered id is odd, powered = id-1 (vanilla bool order true,false)
@@ -10152,6 +10153,7 @@ fn promotion_fluid_tick(
 /// The legacy Overworld reader: generated fluid ticks were Overworld-only
 /// when this seam was written, and the zero-construction shape is part of the
 /// test harness's vocabulary. Per-dimension ticks use `DimFluidReader`.
+#[allow(dead_code)]
 struct FluidReader;
 impl flowing_fluid::Reader for FluidReader {
     type Error = String;
@@ -11853,6 +11855,7 @@ fn overlay_block_dim(dim: DimId, x: i32, y: i32, z: i32) -> Option<u32> {
         .and_then(|c| c.get(&local_idx(x, y, z)).copied())
 }
 
+#[allow(dead_code)]
 fn overlay_block(x: i32, y: i32, z: i32) -> Option<u32> {
     overlay_block_dim(DimId::Overworld, x, y, z)
 }
@@ -15110,6 +15113,7 @@ fn spawn_fall(px: i32, py: i32, pz: i32, st: u32) {
 /// Place a block and queue its actual state. Falling blocks now remain blocks
 /// during the two-tick booking window; only the scheduled callback may turn
 /// one into an entity, emitting the intervening air update.
+#[allow(dead_code)]
 fn place_block(wx: i32, wy: i32, wz: i32, st: u32) {
     place_block_dim(DimId::Overworld, wx, wy, wz, st)
 }
