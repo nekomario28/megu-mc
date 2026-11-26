@@ -53,6 +53,8 @@ use megu_core::version::TargetVersion;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+pub use megu_core::crypto::Sha256;
+
 /// Maven coordinate the Official Launcher profile and Prism patch share.
 pub const BOOTSTRAP_LIBRARY_COORD: &str = "net.megu:bootstrapper:1.0.0";
 /// Path of the staged bootstrapper JAR relative to a `libraries/` root.
@@ -349,34 +351,6 @@ pub fn iso_utc_now() -> String {
 }
 
 // ------------------------------------------------------------------ SHA-256
-
-/// Incremental FIPS 180-4 SHA-256 — the shared `megu-core` implementation
-/// behind a thin wrapper so `--client-bin` pinning keeps its historic
-/// `new`/`update`/`finish_hex` surface.
-pub struct Sha256(megu_core::crypto::Sha256);
-
-impl Sha256 {
-    /// Fresh hasher.
-    pub fn new() -> Self {
-        Self(megu_core::crypto::Sha256::new())
-    }
-
-    /// Feed more bytes.
-    pub fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    /// Pad, finalize and render the digest as 64 lowercase hex chars.
-    pub fn finish_hex(self) -> String {
-        self.0.finalize_hex()
-    }
-}
-
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// SHA-256 of a byte slice as lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -1290,7 +1264,7 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(&vec![b'a'; 1_000_000]);
         assert_eq!(
-            hasher.finish_hex(),
+            hasher.finalize_hex(),
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
         );
     }
