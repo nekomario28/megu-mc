@@ -27,23 +27,41 @@ struct VanillaJarDataFallback {
 
 impl VanillaJarDataFallback {
     fn load_from_jar(path: &Path) -> Result<Self, String> {
-        let metadata = std::fs::symlink_metadata(path)
+        // One open handle carries both the regular-file verification and the read. Checking
+        // a path then reopening it would be a TOCTOU race; a directory or device is rejected
+        // from `File::metadata()` on the handle actually consumed below.
+        let mut file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let metadata = file
+            .metadata()
             .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(format!(
-                "{} is not a regular non-symlink file",
-                path.display()
-            ));
+        if !metadata.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
         }
         if metadata.len() > VANILLA_JAR_MAX_BYTES {
             return Err(format!("{} exceeds the 256 MiB JAR limit", path.display()));
         }
-        let bytes = std::fs::read(path)
+        let mut bytes = Vec::with_capacity(metadata.len().min(VANILLA_JAR_MAX_BYTES) as usize);
+        std::io::Read::take(&mut file, VANILLA_JAR_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         if bytes.len() as u64 > VANILLA_JAR_MAX_BYTES {
             return Err(format!("{} exceeds the 256 MiB JAR limit", path.display()));
         }
         Self::from_archive(&bytes)
+    }
+
+    fn has_required_vanilla_markers(&self) -> bool {
+        // A tiny client-jar fragment with one accidental `data/` entry is not a usable
+        // vanilla datapack. These registries/resources are the minimum the server's
+        // datapack, worldgen and structure readers rely on.
+        const REQUIRED: &[&str] = &[
+            "data/minecraft/dimension_type/overworld.json",
+            "data/minecraft/worldgen/noise_settings/overworld.json",
+            "data/minecraft/worldgen/biome/plains.json",
+            "data/minecraft/tags/block/mineable/pickaxe.json",
+        ];
+        REQUIRED.iter().all(|name| self.entries.contains_key(*name))
     }
 
     fn from_archive(bytes: &[u8]) -> Result<Self, String> {
@@ -124,75 +142,99 @@ fn safe_data_relative(path: &str) -> Option<&str> {
     Some(path)
 }
 
-fn usable_vanilla_jar(path: &Path) -> Option<PathBuf> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    (!metadata.file_type().is_symlink()
-        && metadata.is_file()
-        && metadata.len() <= VANILLA_JAR_MAX_BYTES)
-        .then(|| path.to_path_buf())
-}
-
-fn discover_vanilla_jar() -> Option<PathBuf> {
-    if let Some(configured) = std::env::var_os("MEGU_VANILLA_JAR") {
-        let path = PathBuf::from(configured);
-        if let Some(path) = usable_vanilla_jar(&path) {
-            return Some(path);
+fn usable_vanilla_jar(path: &Path) -> Option<(PathBuf, VanillaJarDataFallback)> {
+    match VanillaJarDataFallback::load_from_jar(path) {
+        Ok(data) if data.has_required_vanilla_markers() => Some((path.to_path_buf(), data)),
+        Ok(_) => {
+            eprintln!(
+                "[spine] ignoring {} as a vanilla data source: required data/minecraft markers are absent",
+                path.display()
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!(
+                "[spine] ignoring {} as a vanilla data source: {error}",
+                path.display()
+            );
+            None
         }
     }
-    for path in ["1.21.1.jar", "server.jar", "minecraft_server.1.21.1.jar"] {
-        if let Some(path) = usable_vanilla_jar(Path::new(path)) {
-            return Some(path);
-        }
+}
+
+/// Whether an extracted `datapacks/vanilla` directory is a real vanilla data pack.
+/// A merely existing (or empty) directory must not shadow the valid JAR fallback.
+pub(crate) fn is_valid_extracted_vanilla_pack(path: &Path) -> bool {
+    const REQUIRED: &[&str] = &[
+        "data/minecraft/dimension_type/overworld.json",
+        "data/minecraft/worldgen/noise_settings/overworld.json",
+        "data/minecraft/worldgen/biome/plains.json",
+    ];
+    path.is_dir() && REQUIRED.iter().all(|rel| path.join(rel).is_file())
+}
+
+fn extracted_vanilla_pack_is_valid() -> bool {
+    is_valid_extracted_vanilla_pack(&Path::new(DATAPACK_DIRECTORY).join("vanilla"))
+}
+
+fn discover_vanilla_jar() -> Option<(PathBuf, VanillaJarDataFallback)> {
+    if let Some(configured) = std::env::var_os("MEGU_VANILLA_JAR") {
+        // An explicit override is authoritative: report its failure rather than silently
+        // falling through to a different installation the operator did not ask for.
+        return usable_vanilla_jar(&PathBuf::from(configured));
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
-    let candidates = home
+    let local = ["1.21.1.jar", "server.jar", "minecraft_server.1.21.1.jar"]
+        .into_iter()
+        .map(PathBuf::from);
+    let installed = home
         .into_iter()
         .map(|h| h.join(".minecraft/versions/1.21.1/1.21.1.jar"))
         .chain(
             xdg.into_iter()
                 .map(|x| x.join("megu/versions/1.21.1/1.21.1.jar")),
         );
-    candidates
-        .filter_map(|path| usable_vanilla_jar(&path))
-        .next()
+    let mut seen = std::collections::HashSet::new();
+    for path in local.chain(installed) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Some(found) = usable_vanilla_jar(&path) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn vanilla_jar_data() -> Option<&'static VanillaJarDataFallback> {
-    static FALLBACK: std::sync::OnceLock<Option<VanillaJarDataFallback>> =
+    static FALLBACK: std::sync::OnceLock<Option<(PathBuf, VanillaJarDataFallback)>> =
         std::sync::OnceLock::new();
     FALLBACK
         .get_or_init(|| {
-            let path = discover_vanilla_jar()?;
-            match VanillaJarDataFallback::load_from_jar(&path) {
-                Ok(data) => {
-                    eprintln!(
-                        "[spine] vanilla datapack data loaded from {} ({:?})",
-                        path.display(),
-                        data.summary()
-                    );
-                    Some(data)
-                }
-                Err(error) => {
-                    eprintln!("[spine] vanilla JAR fallback unavailable: {error}");
-                    None
-                }
-            }
+            let (path, data) = discover_vanilla_jar()?;
+            eprintln!(
+                "[spine] vanilla datapack data loaded from {} ({:?})",
+                path.display(),
+                data.summary()
+            );
+            Some((path, data))
         })
         .as_ref()
+        .map(|(_, data)| data)
 }
 
 fn vanilla_jar_data_read(rel_path: &str) -> Option<&'static [u8]> {
-    if Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+    if extracted_vanilla_pack_is_valid() {
         return None;
     }
     vanilla_jar_data()?.read_data_entry(rel_path)
 }
 
 fn vanilla_jar_worldgen_files(prefix: &str) -> Vec<(&'static str, &'static [u8])> {
-    if Path::new(DATAPACK_DIRECTORY).join("vanilla").is_dir() {
+    if extracted_vanilla_pack_is_valid() {
         return Vec::new();
     }
     let Some(data) = vanilla_jar_data() else {
@@ -439,6 +481,17 @@ mod jar_datapack_tests {
                 br#"{"min_y":-64}"#,
                 true,
             ),
+            (
+                "data/minecraft/worldgen/noise_settings/overworld.json",
+                br#"{}"#,
+                false,
+            ),
+            ("data/minecraft/worldgen/biome/plains.json", br#"{}"#, false),
+            (
+                "data/minecraft/tags/block/mineable/pickaxe.json",
+                br#"{"values":[]}"#,
+                false,
+            ),
         ]
     }
 
@@ -561,6 +614,24 @@ mod jar_datapack_tests {
             .any(|p| p.name == "vanilla_jar"));
         let vanilla = base.join("vanilla");
         std::fs::create_dir_all(vanilla.join("data/minecraft/tags/item")).unwrap();
+        std::fs::create_dir_all(vanilla.join("data/minecraft/dimension_type")).unwrap();
+        std::fs::create_dir_all(vanilla.join("data/minecraft/worldgen/noise_settings")).unwrap();
+        std::fs::create_dir_all(vanilla.join("data/minecraft/worldgen/biome")).unwrap();
+        std::fs::write(
+            vanilla.join("data/minecraft/dimension_type/overworld.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            vanilla.join("data/minecraft/worldgen/noise_settings/overworld.json"),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            vanilla.join("data/minecraft/worldgen/biome/plains.json"),
+            "{}",
+        )
+        .unwrap();
         std::fs::write(
             vanilla.join("pack.mcmeta"),
             r#"{"pack":{"pack_format":48,"description":"test"}}"#,

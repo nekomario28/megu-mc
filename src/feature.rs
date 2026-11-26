@@ -20,6 +20,51 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// One End crystal an End spike generated but the block feature pipeline cannot
+/// itself materialize (entities live above worldgen). The runtime drains this
+/// queue when the End chunk becomes live.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EndCrystalPlacement {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub yaw: f32,
+    pub guarded: bool,
+}
+
+type EndCrystalQueue = (Vec<EndCrystalPlacement>, HashSet<(i32, i32, i32)>);
+static GENERATED_END_CRYSTALS: std::sync::OnceLock<std::sync::Mutex<EndCrystalQueue>> =
+    std::sync::OnceLock::new();
+
+fn generated_end_crystals() -> &'static std::sync::Mutex<EndCrystalQueue> {
+    GENERATED_END_CRYSTALS.get_or_init(|| std::sync::Mutex::new((Vec::new(), HashSet::new())))
+}
+
+fn stage_end_crystal(placement: EndCrystalPlacement) {
+    let mut queue = generated_end_crystals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if queue.1.insert((placement.x, placement.y, placement.z)) {
+        queue.0.push(placement);
+    }
+}
+
+/// Drain every generated End crystal exactly once, in generation order.
+#[allow(dead_code)]
+pub(crate) fn take_staged_end_crystals() -> Vec<EndCrystalPlacement> {
+    let mut queue = generated_end_crystals()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    queue.1.clear();
+    std::mem::take(&mut queue.0)
+}
+
+/// Alias named for the live-world drain site.
+#[allow(dead_code)]
+pub(crate) fn drain_generated_end_crystals() -> Vec<EndCrystalPlacement> {
+    take_staged_end_crystals()
+}
+
 #[cfg(all(test, megu_vanilla_data))]
 #[path = "generation_contract_tests.rs"]
 mod generation_contract_tests;
@@ -1910,11 +1955,19 @@ fn gen_desert_well(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32)) {
     let i1 = rng.next_bound(shaft.len() as i32) as usize;
     let first = (shaft[i1].0, shaft[i1].1 + 1, shaft[i1].2);
     ctx.set(first.0, first.1, first.2, suspicious);
-    ctx.push_brushable(first, "minecraft:archaeology/desert_well", Some(feature_block_pos_as_long(first)));
+    ctx.push_brushable(
+        first,
+        "minecraft:archaeology/desert_well",
+        Some(feature_block_pos_as_long(first)),
+    );
     let i2 = rng.next_bound(shaft.len() as i32) as usize;
     let second = (shaft[i2].0, shaft[i2].1 + 2, shaft[i2].2);
     ctx.set(second.0, second.1, second.2, suspicious);
-    ctx.push_brushable(second, "minecraft:archaeology/desert_well", Some(feature_block_pos_as_long(second)));
+    ctx.push_brushable(
+        second,
+        "minecraft:archaeology/desert_well",
+        Some(feature_block_pos_as_long(second)),
+    );
 }
 
 fn feature_block_pos_as_long((x, y, z): (i32, i32, i32)) -> i64 {
@@ -2246,13 +2299,22 @@ fn place_end_spike(ctx: &mut FC, rng: &mut Xor, spike: &EndSpike) {
     }
 
     // `EndCrystal` entity creation consumes `random.nextFloat() * 360.0F` for `yRot`.
-    let _crystal_yaw = rng.next_f32() * 360.0;
+    // Blocks are all this feature may write, so the entity spawn crosses the
+    // worldgen boundary as an explicit staged record instead of evaporating.
+    let crystal_yaw = rng.next_f32() * 360.0;
     if !ctx.out_of_h(spike.height) {
         ctx.set(cx, spike.height, cz, bedrock);
     }
     if !ctx.out_of_h(spike.height + 1) {
         ctx.set(cx, spike.height + 1, cz, fire);
     }
+    stage_end_crystal(EndCrystalPlacement {
+        x: cx,
+        y: spike.height + 1,
+        z: cz,
+        yaw: crystal_yaw,
+        guarded: spike.guarded,
+    });
 }
 
 /// `SpikeFeature.place` (`edo.a(ecg)`). See [`Cf::EndSpike`].
@@ -3119,9 +3181,19 @@ mod basalt_sea_tests {
             ctx.wr.values().filter(|&&st| st == basalt).count()
         };
 
-        assert_eq!(placed(31, 40), 0, "lava above Nether sea must reject columns");
-        assert!(placed(31, 28) > 0, "lava below Nether sea must admit columns");
-        assert!(placed(45, 40) > 0, "the generator's sea level controls lava");
+        assert_eq!(
+            placed(31, 40),
+            0,
+            "lava above Nether sea must reject columns"
+        );
+        assert!(
+            placed(31, 28) > 0,
+            "lava below Nether sea must admit columns"
+        );
+        assert!(
+            placed(45, 40) > 0,
+            "the generator's sea level controls lava"
+        );
     }
 }
 
@@ -3990,8 +4062,8 @@ fn spc_can_spread_from(ctx: &mut FC, reg: &BReg, pos: (i32, i32, i32)) -> bool {
     if spc_kind(reg, st) != SpcKind::Other {
         return true;
     }
-    let water_source = reg.name_of(st) == "minecraft:water"
-        && reg.fluid_name(st) == "minecraft:water";
+    let water_source =
+        reg.name_of(st) == "minecraft:water" && reg.fluid_name(st) == "minecraft:water";
     if !reg.is_air(st) && !water_source {
         return false;
     }
@@ -4902,17 +4974,19 @@ fn gen_geode(ctx: &mut FC, rng: &mut Xor, origin: (i32, i32, i32), g: &GeodeCfg)
                             // water block.
                             let ns = ctx.get(np.0, np.1, np.2);
                             let fluid = reg.fluid_name(ns);
-                            if fluid != "minecraft:empty" {
-                                let name = reg.name_of(ns);
-                                let legacy =
-                                    if name == "minecraft:water" || name == "minecraft:lava" {
-                                        ns
-                                    } else if fluid.ends_with("lava") {
-                                        reg.state_of("minecraft:lava", None)
-                                    } else {
-                                        reg.state_of("minecraft:water", None)
-                                    };
-                                ctx.set(np.0, np.1, np.2, legacy);
+                            let fluid_id = match fluid {
+                                "minecraft:water" => Some(0),
+                                "minecraft:flowing_water" => Some(1),
+                                "minecraft:lava" => Some(2),
+                                "minecraft:flowing_lava" => Some(3),
+                                _ => None,
+                            };
+                            if let Some(fluid_id) = fluid_id {
+                                // Vanilla schedules the neighbour's existing fluid for a
+                                // zero-delay tick here. It does not collapse a waterlogged
+                                // solid into a bare liquid block: the solid keeps its shape
+                                // and the scheduled fluid tick computes the real update.
+                                ctx.g.schedule_generated_fluid(np, fluid_id);
                             }
                         }
                     }
@@ -5920,8 +5994,7 @@ fn load_freg_report(
     let mut raw_placed: Vec<(String, Pf)> = Vec::new();
     let mut placed_idx_map: HashMap<String, usize> = HashMap::new();
     for (name, b) in pf_files {
-        if let Err(e) = load_pf_entry(&mut raw_placed, &mut placed_idx_map, name.clone(), b, rep)
-        {
+        if let Err(e) = load_pf_entry(&mut raw_placed, &mut placed_idx_map, name.clone(), b, rep) {
             if strict {
                 return Err(e);
             }
@@ -6064,23 +6137,72 @@ fn load_freg_report(
     // The order source is a runtime read now, so a stripped checkout still
     // compiles: with a populated registry the pinned table is required, and a
     // missing or corrupt one is the same fail-closed panic as before.
-    let sources = jparse(&crate::structure_transform::pinned_data_expect(
-        "assets/feature_order_1211.json",
-        "native biome-source iteration",
-    ))
-    .expect("native biome-source iteration");
+    let order_json =
+        crate::structure_transform::pinned_data_bytes("assets/feature_order_1211.json");
+    if order_json.is_none() {
+        eprintln!(
+            "[spine] feature order table absent; deriving biome iteration from loaded biome feature lists"
+        );
+    }
+    let sources = order_json.as_deref().and_then(jparse);
     for preset in [
         NoisePreset::Overworld,
         NoisePreset::Nether,
         NoisePreset::End,
     ] {
-        let biomes: Vec<_> = sources
-            .get(preset.name())
-            .and_then(|v| jarr(v, "biomes"))
-            .expect("native possible biomes")
-            .iter()
-            .map(J::str)
-            .collect();
+        let biomes: Vec<&str> = if let Some(source) = sources.as_ref() {
+            source
+                .get(preset.name())
+                .and_then(|v| jarr(v, "biomes"))
+                .expect("native possible biomes")
+                .iter()
+                .map(J::str)
+                .collect()
+        } else {
+            // The exported table is an optimization/reproducibility fixture, not extra
+            // information: vanilla computes the possible-biome list from the biome
+            // source and then sorts those biomes' feature lists. Deriving the same input
+            // from the loaded biome JSON keeps a stripped/generated asset checkout on
+            // the real sorter instead of panicking or silently dropping features.
+            let mut names: Vec<&str> = reg
+                .bsteps
+                .keys()
+                .filter(|name| match preset {
+                    NoisePreset::Nether => matches!(
+                        name.as_str(),
+                        "minecraft:nether_wastes"
+                            | "minecraft:crimson_forest"
+                            | "minecraft:warped_forest"
+                            | "minecraft:soul_sand_valley"
+                            | "minecraft:basalt_deltas"
+                    ),
+                    NoisePreset::End => matches!(
+                        name.as_str(),
+                        "minecraft:the_end"
+                            | "minecraft:end_highlands"
+                            | "minecraft:end_midlands"
+                            | "minecraft:small_end_islands"
+                            | "minecraft:end_barrens"
+                    ),
+                    NoisePreset::Overworld => !matches!(
+                        name.as_str(),
+                        "minecraft:nether_wastes"
+                            | "minecraft:crimson_forest"
+                            | "minecraft:warped_forest"
+                            | "minecraft:soul_sand_valley"
+                            | "minecraft:basalt_deltas"
+                            | "minecraft:the_end"
+                            | "minecraft:end_highlands"
+                            | "minecraft:end_midlands"
+                            | "minecraft:small_end_islands"
+                            | "minecraft:end_barrens"
+                    ),
+                })
+                .map(String::as_str)
+                .collect();
+            names.sort();
+            names
+        };
         let max_steps = biomes
             .iter()
             .map(|name| {
@@ -6101,10 +6223,7 @@ fn load_freg_report(
                 let mut mask = 0u128;
                 if bit_ok {
                     for (biome, steps) in reg.bsteps.iter() {
-                        if steps
-                            .get(step)
-                            .is_some_and(|l| l.iter().any(|f| f == name))
-                        {
+                        if steps.get(step).is_some_and(|l| l.iter().any(|f| f == name)) {
                             if let Some(&bi) = reg.biome_bits.get(biome) {
                                 mask |= 1u128 << bi;
                             }
@@ -6119,10 +6238,7 @@ fn load_freg_report(
                     name: name.clone(),
                     step_biome_mask: mask,
                     ball_mask: reg.ball_masks.get(name).copied().unwrap_or(0),
-                    placed_idx: placed_idx
-                        .get(name.as_str())
-                        .copied()
-                        .unwrap_or(usize::MAX),
+                    placed_idx: placed_idx.get(name.as_str()).copied().unwrap_or(usize::MAX),
                 });
             }
             step_entries.push(entries);
@@ -6278,8 +6394,7 @@ mod empty_registry_tests {
                 let _ = std::env::set_current_dir(&self.0);
             }
         }
-        let scratch =
-            std::env::temp_dir().join(format!("spine-freg-empty-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("spine-freg-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir(&scratch);
         std::fs::create_dir(&scratch).unwrap();
         let _cwd = Cwd(std::env::current_dir().unwrap());
@@ -6335,11 +6450,10 @@ fn java_hashset_order(pts: &[(i32, i32, i32)]) -> Vec<(i32, i32, i32)> {
         .iter()
         .enumerate()
         .map(|(i, &p)| {
-            let h = p
-                .1
-                .wrapping_add(p.2.wrapping_mul(31))
-                .wrapping_mul(31)
-                .wrapping_add(p.0);
+            let h =
+                p.1.wrapping_add(p.2.wrapping_mul(31))
+                    .wrapping_mul(31)
+                    .wrapping_add(p.0);
             let spread = (h ^ ((h as u32) >> 16) as i32) as u32;
             ((spread as usize) & (cap - 1), i, p)
         })
@@ -6406,7 +6520,15 @@ thread_local! {
 }
 
 #[inline]
-fn fast_test_pred(pr: &Pr, reg: &BReg, ft: &FeatTables, ctx: &mut FC, x: i32, y: i32, z: i32) -> bool {
+fn fast_test_pred(
+    pr: &Pr,
+    reg: &BReg,
+    ft: &FeatTables,
+    ctx: &mut FC,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> bool {
     match pr {
         Pr::True => true,
         Pr::InsideWB => !ctx.out_of_h(y),
@@ -6772,7 +6894,11 @@ fn mod_positions(
             }
         }
         PM::CountEveryLayer(ip) => count_every_layer_positions(ip, ctx, rng, pos, out),
-        PM::InSquare => out.push((pos.0 + rng.next_bound(16), pos.1, pos.2 + rng.next_bound(16))),
+        PM::InSquare => out.push((
+            pos.0 + rng.next_bound(16),
+            pos.1,
+            pos.2 + rng.next_bound(16),
+        )),
         PM::Offset(xz, ysp) => out.push((
             pos.0 + xz.get(rng),
             pos.1 + ysp.get(rng),
@@ -6788,7 +6914,12 @@ fn mod_positions(
         PM::Fixed => out.push(pos),
         PM::Biome => {
             if let Some(b) = ctx.biome(pos.0, pos.1, pos.2) {
-                if fr.ball.get(&b).map(|s| s.contains(&pf.name)).unwrap_or(false) {
+                if fr
+                    .ball
+                    .get(&b)
+                    .map(|s| s.contains(&pf.name))
+                    .unwrap_or(false)
+                {
                     out.push(pos);
                 }
             }
@@ -7023,7 +7154,10 @@ fn cel_find_y(ctx: &mut FC<'_>, reg: &BReg, x: i32, top: i32, z: i32, layer: i32
     let mut y = top;
     while y > min_y {
         let below = ctx.get(x, y - 1, z);
-        if !cel_empty(reg, below) && cel_empty(reg, cur) && reg.name_of(below) != "minecraft:bedrock" {
+        if !cel_empty(reg, below)
+            && cel_empty(reg, cur)
+            && reg.name_of(below) != "minecraft:bedrock"
+        {
             if found == layer {
                 return Some(y);
             }
@@ -7317,23 +7451,7 @@ fn gen_ore_impl<T>(
                 let trace = env_str!("ORE_CELL_TRACE")
                     .is_some_and(|spec| spec == format!("{},{},{}", pos.0, pos.1, pos.2));
                 gen_vein_impl(
-                    ctx,
-                    rng,
-                    d,
-                    e,
-                    h,
-                    j,
-                    l,
-                    mm,
-                    n,
-                    o,
-                    p,
-                    q,
-                    r2,
-                    size,
-                    discard,
-                    targets,
-                    trace,
+                    ctx, rng, d, e, h, j, l, mm, n, o, p, q, r2, size, discard, targets, trace,
                     matches_rt,
                 );
                 if trace {
@@ -7358,16 +7476,7 @@ fn gen_ore(
     targets: &[(RT, u32)],
     scattered: bool,
 ) {
-    gen_ore_impl(
-        ctx,
-        rng,
-        pos,
-        size,
-        discard,
-        targets,
-        scattered,
-        test_rt,
-    );
+    gen_ore_impl(ctx, rng, pos, size, discard, targets, scattered, test_rt);
 }
 
 fn gen_ore_fast(ctx: &mut FC, rng: &mut Xor, pos: (i32, i32, i32), ore: &FastOre) {
@@ -7464,8 +7573,7 @@ fn perf_ore_parity_and_timing() {
         .map(|v| format!("{v:02x}"))
         .collect::<String>();
     assert_eq!(
-        feature_digest,
-        "d63f366bd84594170be88b2391c4f39bdffc921578cba65b4a2ef114da6c2cfb",
+        feature_digest, "d63f366bd84594170be88b2391c4f39bdffc921578cba65b4a2ef114da6c2cfb",
         "feature population changed from the pre-optimization SHA-256 capture"
     );
     let chunks = g.pop_done.len();
@@ -7491,8 +7599,7 @@ fn perf_ore_parity_and_timing() {
         .map(|v| format!("{v:02x}"))
         .collect::<String>();
     assert_eq!(
-        ore_digest,
-        "683a9109b6089e98b73ba4eafb268cd4b8e79af21f672d7d0dfd04fd2cc50f55",
+        ore_digest, "683a9109b6089e98b73ba4eafb268cd4b8e79af21f672d7d0dfd04fd2cc50f55",
         "native ore geometry changed from the pre-optimization SHA-256 capture"
     );
     eprintln!(
@@ -8780,9 +8887,13 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
                 for x in 0..16usize {
                     for z in 0..16usize {
                         let bp = (anchor.0 + x as i32, anchor.1 + 4, anchor.2 + z as i32);
-                        if let Some(b) = ctx.biome(bp.0, bp.1, bp.2) {
-                            let t = fr.btemp.get(&b).copied().unwrap_or(0.8);
-                            if t < 0.15 {
+                        if let Some(biome) = ctx.biome_leaf(bp.0, bp.1, bp.2) {
+                            // `Biome.shouldFreeze`: positional temperature (including the
+                            // height adjustment/frozen noise) and the block-light check,
+                            // not the biome JSON's unadjusted base temperature.
+                            if ctx.cold_enough_to_snow(biome, bp.0, bp.1, bp.2)
+                                && ctx.block_light(bp.0, bp.1, bp.2) < 10
+                            {
                                 let cur = ctx.get(bp.0, bp.1, bp.2);
                                 if !reg.in_tag(cur, "minecraft:features_cannot_replace")
                                     && is_water_st(reg, cur)
@@ -8959,8 +9070,9 @@ fn gen_cf(cf: &Cf, fr: &'static FReg, ctx: &mut FC, rng: &mut Xor, pos: (i32, i3
             let magma = reg.state_of("minecraft:magma_block", None);
             // `s.is(Blocks.WATER)`: the block, not the fluid, so a waterlogged state is not
             // water here.
-            let is_water_block =
-                |ctx: &mut FC, p: (i32, i32, i32)| reg.name_of(ctx.get(p.0, p.1, p.2)) == "minecraft:water";
+            let is_water_block = |ctx: &mut FC, p: (i32, i32, i32)| {
+                reg.name_of(ctx.get(p.0, p.1, p.2)) == "minecraft:water"
+            };
             if !is_water_block(ctx, pos) {
                 return;
             }
@@ -10014,14 +10126,17 @@ impl OriginGrid {
         let w = (i64::from(max_tx) - i64::from(min_tx) + 17) as usize;
         let h = (i64::from(max_tz) - i64::from(min_tz) + 17) as usize;
         let sparse = order.len() > 1
-            && (w as u64).saturating_mul(h as u64)
-                > (order.len() as u64).saturating_mul(289 * 2);
+            && (w as u64).saturating_mul(h as u64) > (order.len() as u64).saturating_mul(289 * 2);
         Self {
             ox0,
             oz0,
             w,
             h,
-            cells: if sparse { Vec::new() } else { vec![None; w * h] },
+            cells: if sparse {
+                Vec::new()
+            } else {
+                vec![None; w * h]
+            },
             sparse: sparse.then(CoordMap::default),
         }
     }
@@ -10200,8 +10315,7 @@ impl CarveScratch {
         self.out_writes.clear();
         // The write list is committed one bucket at a time; a bucket that ever
         // grew past the idle bound is shrunk so a parked scratch stays tiny.
-        if self.out_writes.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32, i32, u32)>()
-        {
+        if self.out_writes.capacity() > (256 * 1024) / std::mem::size_of::<(i32, i32, i32, u32)>() {
             self.out_writes = Vec::new();
         }
     }
@@ -10694,8 +10808,18 @@ pub(crate) fn precarve_order(g: &mut Gen, pending: &[(i32, i32)], jobs: usize) {
     });
     order.clear();
     seen.clear();
-    order.reserve(pending.len().saturating_mul(9).saturating_sub(order.capacity()));
-    seen.reserve(pending.len().saturating_mul(9).saturating_sub(seen.capacity()));
+    order.reserve(
+        pending
+            .len()
+            .saturating_mul(9)
+            .saturating_sub(order.capacity()),
+    );
+    seen.reserve(
+        pending
+            .len()
+            .saturating_mul(9)
+            .saturating_sub(seen.capacity()),
+    );
     for &(sx, sz) in pending {
         // The chunk itself comes first, then the ring in the same `(dx, dz)` order as
         // `carve_ring`, so the claims (and therefore the commit order) stay identical.
@@ -10898,7 +11022,9 @@ fn populate_worker(
     let t0 = crate::worldgen::m3_start();
     for step in 0..order.len().max(structures.step_count()) {
         structures.place_step(&mut ctx, step, pop, sx, sz);
-        let Some(entries) = order.get(step) else { continue };
+        let Some(entries) = order.get(step) else {
+            continue;
+        };
         let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
         for (ei, (gi, name)) in entries.iter().enumerate() {
             let slot = bit_entries.map(|v| &v[ei]);
@@ -10923,7 +11049,9 @@ fn populate_worker(
                 }
                 &fr.placed_vec[idx]
             } else {
-                let Some(p) = fr.placed.get(name) else { continue };
+                let Some(p) = fr.placed.get(name) else {
+                    continue;
+                };
                 p
             };
             let deco = pop
@@ -11158,10 +11286,7 @@ pub(crate) fn populate_parallel(g: &mut Gen, pending: &[(i32, i32)], jobs: usize
             }
             while let Some(&i) = ready.front() {
                 ready.pop_front();
-                queue
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(i);
+                queue.lock().unwrap_or_else(|e| e.into_inner()).push_back(i);
                 queue_cv.notify_one();
             }
             let Ok((i, res)) = rrx.recv() else { break };
@@ -11391,12 +11516,7 @@ fn compute_carve_chunk(
     out_writes.reserve(run.scratch.out_order.len());
     for &i in &run.scratch.out_order {
         let (lx, y, lz) = run.pos_of(i);
-        out_writes.push((
-            tx * 16 + lx,
-            y,
-            tz * 16 + lz,
-            run.scratch.out[i as usize],
-        ));
+        out_writes.push((tx * 16 + lx, y, tz * 16 + lz, run.scratch.out[i as usize]));
     }
     CarveOutput {
         tx,
@@ -11461,10 +11581,7 @@ fn wg_heightmaps_after_carve_run(
     for (lz, carve_row) in carve_top.iter().enumerate() {
         for (lx, &ct) in carve_row.iter().enumerate() {
             let (wx, wz) = (tx * 16 + lx as i32, tz * 16 + lz as i32);
-            let mut y = cc
-                .wtop(lx, lz)
-                .max(ct)
-                .min(min_y + height - 1);
+            let mut y = cc.wtop(lx, lz).max(ct).min(min_y + height - 1);
             let mut surface = None;
             let mut floor = None;
             while y >= min_y {
@@ -11961,9 +12078,11 @@ impl CarveRun<'_, '_> {
                 // Second site: the restored top material is marked when its own fluid state is
                 // non-empty (no aquifer gate — vanilla asks the restored state only).
                 if !self.probe && has_fluid_state(br, top) {
-                    self.scratch
-                        .shape_marks
-                        .push((self.tx * 16 + (x & 15), y - 1, self.tz * 16 + (z & 15)));
+                    self.scratch.shape_marks.push((
+                        self.tx * 16 + (x & 15),
+                        y - 1,
+                        self.tz * 16 + (z & 15),
+                    ));
                 }
             }
         }
@@ -12171,7 +12290,9 @@ fn populate_body(g: &mut Gen, sx: i32, sz: i32) {
         // Structures have steps even when the biome has no placed features.
         // Their registry slots and RNG streams are independent.
         structures.place_step(&mut ctx, step, pop, sx, sz);
-        let Some(entries) = order.get(step) else { continue };
+        let Some(entries) = order.get(step) else {
+            continue;
+        };
         let bit_entries = fr.step_entries.get(&preset).and_then(|v| v.get(step));
         for (ei, (gi, name)) in entries.iter().enumerate() {
             let slot = bit_entries.map(|v| &v[ei]);
@@ -12345,7 +12466,8 @@ fn mark_above_for_post_processing(ctx: &mut FC<'_>, reg: &BReg, x: i32, y: i32, 
 
 fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
     for (x, y, z) in std::mem::take(&mut ctx.shape_marks) {
-        ctx.g.note_mark_source(x, y, z, crate::worldgen::MarkSrc::Write);
+        ctx.g
+            .note_mark_source(x, y, z, crate::worldgen::MarkSrc::Write);
         ctx.g.store_shape_mark(x, y, z);
     }
     ctx.g.pop_active = None;
@@ -12359,6 +12481,10 @@ fn promote_full_chunks(ctx: &mut FC<'_>, sx: i32, sz: i32) {
             if !ctx.g.promotion_window_ready(cx, cz) {
                 continue;
             }
+            // Promotion is a chunk-status transition even when this chunk carries no
+            // post-processing marks. Record it independently of feature completion so a
+            // later FEATURES pass cannot write through vanilla's imposter proto chunk.
+            ctx.g.mark_chunk_promoted(cx, cz);
             let mut marks = ctx.g.take_shape_marks(cx, cz);
             if marks.is_empty() {
                 continue;
@@ -12563,8 +12689,14 @@ mod mark_above_tests {
                 }
             }
         }
-        assert!(checked_barrier, "expected a lake barrier cell with non-air above");
-        assert!(checked_cave_air, "expected a lake cave_air cell with non-air above");
+        assert!(
+            checked_barrier,
+            "expected a lake barrier cell with non-air above"
+        );
+        assert!(
+            checked_cave_air,
+            "expected a lake cave_air cell with non-air above"
+        );
         let _ = checked_fluid;
     }
 }
@@ -12572,12 +12704,18 @@ mod mark_above_tests {
 #[cfg(all(test, megu_vanilla_data))]
 mod carver_parity_tests {
     use super::{apply_carvers, build_origin_grid, carve_ring_with, resolve_origin, OriginGrid};
-    use crate::worldgen::{lock_gen_for_tests, Gen, ChunkCols};
+    use crate::worldgen::{lock_gen_for_tests, ChunkCols, Gen};
 
     /// Everything the carver stage hands an owner for one chunk: the block writes, both WG
     /// heightmaps over all 256 columns, and the marks in the order they were filed.
     type Snapshot = (Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>);
-    type RingSnapshot = (i32, i32, Vec<((i32, i32, i32), u32)>, Vec<i32>, Vec<(i32, i32, i32)>);
+    type RingSnapshot = (
+        i32,
+        i32,
+        Vec<((i32, i32, i32), u32)>,
+        Vec<i32>,
+        Vec<(i32, i32, i32)>,
+    );
 
     fn snapshot(g: &mut Gen, cx: i32, cz: i32) -> Snapshot {
         let mut writes: Vec<((i32, i32, i32), u32)> = g.feature_bucket_writes(cx, cz).collect();
@@ -12599,11 +12737,7 @@ mod carver_parity_tests {
         (writes, wg, marks)
     }
 
-    fn ring_snapshots(
-        g: &mut Gen,
-        sx: i32,
-        sz: i32,
-    ) -> Vec<RingSnapshot> {
+    fn ring_snapshots(g: &mut Gen, sx: i32, sz: i32) -> Vec<RingSnapshot> {
         let mut out = Vec::with_capacity(9);
         for dz in -1..=1 {
             for dx in -1..=1 {
@@ -12668,11 +12802,7 @@ mod carver_parity_tests {
                 "chunk {},{}: the post-carve WG heightmaps differ",
                 x.0, x.1
             );
-            assert_eq!(
-                x.4, y.4,
-                "chunk {},{}: the mark order differs",
-                x.0, x.1
-            );
+            assert_eq!(x.4, y.4, "chunk {},{}: the mark order differs", x.0, x.1);
         }
     }
 
@@ -12696,9 +12826,11 @@ mod carver_parity_tests {
         // out-of-chunk check to mean anything.
         let keys = [(cx, cz), (cx - 1, cz)];
         let cols: [Option<std::sync::Arc<ChunkCols>>; 2] = [None, None];
-        let rows =
-            crate::worldgen::prefetch_terrain(&data, None, &keys, &cols, lo, hi, 1, None);
-        assert!(rows.iter().all(|r| r.is_some()), "prefetched rows installed");
+        let rows = crate::worldgen::prefetch_terrain(&data, None, &keys, &cols, lo, hi, 1, None);
+        assert!(
+            rows.iter().all(|r| r.is_some()),
+            "prefetched rows installed"
+        );
         g.install_prefetched(rows);
         let cc = g.cols(cx, cz).expect("columns");
         // The level the data gives the overworld cave carver, not a literal: this test is about
@@ -12854,7 +12986,7 @@ mod carver_parity_tests {
             .iter()
             .map(|&(cx, cz)| (cx, cz, snapshot(&mut par, cx, cz)))
             .collect();
-        let writes: usize = a.iter().map(|s| s.2.0.len()).sum();
+        let writes: usize = a.iter().map(|s| s.2 .0.len()).sum();
         assert!(
             writes > 0,
             "the fixture must carve something before its identity means anything"
@@ -12862,20 +12994,16 @@ mod carver_parity_tests {
         for (x, y) in a.iter().zip(&b) {
             assert_eq!((x.0, x.1), (y.0, y.1));
             assert_eq!(
-                x.2.0, y.2.0,
+                x.2 .0, y.2 .0,
                 "chunk {},{}: batch carve writes differ",
                 x.0, x.1
             );
             assert_eq!(
-                x.2.1, y.2.1,
+                x.2 .1, y.2 .1,
                 "chunk {},{}: post-carve WG heightmaps differ",
                 x.0, x.1
             );
-            assert_eq!(
-                x.2.2, y.2.2,
-                "chunk {},{}: mark order differs",
-                x.0, x.1
-            );
+            assert_eq!(x.2 .2, y.2 .2, "chunk {},{}: mark order differs", x.0, x.1);
         }
     }
 
@@ -12895,7 +13023,10 @@ mod carver_parity_tests {
 
         let claims = [(0, 0), (10_000, 10_000)];
         let grid = build_origin_grid(&mut g, &claims, 4);
-        assert!(grid.cells.is_empty(), "distant batches must skip the rectangle");
+        assert!(
+            grid.cells.is_empty(),
+            "distant batches must skip the rectangle"
+        );
         let sparse = grid.sparse.as_ref().expect("sparse origin lookup");
         assert_eq!(sparse.len(), 2 * 17 * 17);
         for &(tx, tz) in &claims {
@@ -12932,7 +13063,10 @@ mod carver_parity_tests {
         scratch.out_order.extend([0, 12345]);
         scratch.shape_marks.push((1, 2, 3));
         scratch.reset_for(384);
-        assert!(scratch.out.iter().all(|&v| v == u32::MAX), "stale cell state");
+        assert!(
+            scratch.out.iter().all(|&v| v == u32::MAX),
+            "stale cell state"
+        );
         assert!(scratch.mask.iter().all(|&v| v == 0), "stale mask bit");
         assert!(scratch.out_order.is_empty(), "stale order entry");
         assert!(scratch.shape_marks.is_empty(), "stale shape mark");
@@ -12968,16 +13102,9 @@ mod a3b_tests {
         for pf in fr.placed_vec.iter() {
             let mask = fr.ball_masks.get(&pf.name).copied().unwrap_or(0);
             for (biome, &b) in fr.biome_bits.iter() {
-                let expected = fr
-                    .ball
-                    .get(biome)
-                    .is_some_and(|s| s.contains(&pf.name));
+                let expected = fr.ball.get(biome).is_some_and(|s| s.contains(&pf.name));
                 let fast = (mask & (1u128 << b)) != 0;
-                assert_eq!(
-                    fast, expected,
-                    "ball mask mismatch for {biome}/{}",
-                    pf.name
-                );
+                assert_eq!(fast, expected, "ball mask mismatch for {biome}/{}", pf.name);
             }
         }
         // Every `ball` member also has a placed feature with that bit set.
@@ -13038,8 +13165,7 @@ mod a3b_tests {
             NoisePreset::Nether,
             NoisePreset::End,
         ] {
-            let mut g =
-                Gen::load_preset(4242, crate::name_to_state, preset).expect("datapack");
+            let mut g = Gen::load_preset(4242, crate::name_to_state, preset).expect("datapack");
             let mut ctx = crate::generation_context::FC::new(&mut g);
             for (x, y, z) in coords {
                 let expected = ctx.biome(x, y, z);
@@ -13117,7 +13243,10 @@ mod a3a_tests {
                 writes.push(((cx, cz), w));
                 heights.push((
                     (cx, cz),
-                    (g.feature_height(cx * 16, cz * 16, 0), g.feature_height(cx * 16, cz * 16, 1)),
+                    (
+                        g.feature_height(cx * 16, cz * 16, 0),
+                        g.feature_height(cx * 16, cz * 16, 1),
+                    ),
                 ));
                 let mut m = g.take_shape_marks(cx, cz);
                 m.sort();
@@ -13155,9 +13284,7 @@ mod a3a_tests {
     /// A deterministic window order with a deliberately non-lexicographic tail: the wave
     /// schedule must respect the caller's dependency order, not sort the chunks itself.
     fn window(n: i32) -> Vec<(i32, i32)> {
-        let mut order: Vec<(i32, i32)> = (0..n)
-            .flat_map(|x| (0..n).map(move |z| (x, z)))
-            .collect();
+        let mut order: Vec<(i32, i32)> = (0..n).flat_map(|x| (0..n).map(move |z| (x, z))).collect();
         order.reverse();
         order
     }
@@ -13179,10 +13306,16 @@ mod a3a_tests {
 
     fn assert_same(a: &State, b: &State, what: &str) {
         assert_eq!(a.wg, b.wg, "{what}: post-carve WG tops differ");
-        assert_eq!(a.heights, b.heights, "{what}: feature heightmap maxima differ");
+        assert_eq!(
+            a.heights, b.heights,
+            "{what}: feature heightmap maxima differ"
+        );
         assert_eq!(a.marks, b.marks, "{what}: promotion marks differ");
         assert_eq!(a.payloads, b.payloads, "{what}: staged payloads differ");
-        assert_eq!(a.writes, b.writes, "{what}: feature/carve write buckets differ");
+        assert_eq!(
+            a.writes, b.writes,
+            "{what}: feature/carve write buckets differ"
+        );
         assert_eq!(a.leaves, b.leaves, "{what}: leaf ticks differ");
         assert_eq!(a.fluids, b.fluids, "{what}: fluid ticks differ");
         assert_eq!(a.done, b.done, "{what}: pop_done differs");
@@ -13195,10 +13328,15 @@ mod a3a_tests {
     fn populate_order_parallel_matches_serial_bit_for_bit() {
         crate::test_support::require_vanilla_data();
         let _guard = lock_gen_for_tests();
-        for preset in [NoisePreset::Overworld, NoisePreset::Nether, NoisePreset::End] {
+        for preset in [
+            NoisePreset::Overworld,
+            NoisePreset::Nether,
+            NoisePreset::End,
+        ] {
             for seed in [0u64, 4242, 12345] {
                 let order = window(5);
-                let mut a = Gen::load_preset(seed, crate::name_to_state, preset).expect("serial gen");
+                let mut a =
+                    Gen::load_preset(seed, crate::name_to_state, preset).expect("serial gen");
                 serial(&mut a, &order);
                 let a = state(&mut a, 0, 0, 5);
                 for jobs in [5usize, 8] {
@@ -13383,8 +13521,7 @@ mod p8b1_issue199_tests {
         assert_eq!(e.id, "test:bad_json");
         assert_eq!(e.reason, "malformed JSON");
 
-        let e = load_cf_entry(&mut reg, "test:no_type", br#"{"config":{}}"#, &mut rep)
-            .unwrap_err();
+        let e = load_cf_entry(&mut reg, "test:no_type", br#"{"config":{}}"#, &mut rep).unwrap_err();
         assert_eq!(e.id, "test:no_type");
         assert_eq!(e.reason, "missing required field \"type\"");
 
@@ -13416,8 +13553,8 @@ mod p8b1_issue199_tests {
         let mut raw: Vec<(String, Pf)> = Vec::new();
         let mut idx: HashMap<String, usize> = HashMap::new();
 
-        let e = load_pf_entry(&mut raw, &mut idx, "test:bad_json".into(), b"{", &mut rep)
-            .unwrap_err();
+        let e =
+            load_pf_entry(&mut raw, &mut idx, "test:bad_json".into(), b"{", &mut rep).unwrap_err();
         assert_eq!(e.kind, "placed_feature");
         assert_eq!(e.id, "test:bad_json");
         assert_eq!(e.reason, "malformed JSON");
@@ -13440,7 +13577,10 @@ mod p8b1_issue199_tests {
             &mut rep,
         )
         .unwrap_err();
-        assert_eq!(e.reason, "unsupported placement modifier \"minecraft:bogus_modifier\"");
+        assert_eq!(
+            e.reason,
+            "unsupported placement modifier \"minecraft:bogus_modifier\""
+        );
 
         assert_eq!(rep.of_kind("placed_feature").count(), 3);
         assert!(raw.is_empty() && idx.is_empty());
@@ -13452,8 +13592,8 @@ mod p8b1_issue199_tests {
         let mut reg = empty_creg();
         let mut by_name = HashMap::new();
 
-        let e = load_carver_entry(&mut reg, &mut by_name, "test:bad_json", b"{", &mut rep)
-            .unwrap_err();
+        let e =
+            load_carver_entry(&mut reg, &mut by_name, "test:bad_json", b"{", &mut rep).unwrap_err();
         assert_eq!(e.kind, "configured_carver");
         assert_eq!(e.id, "test:bad_json");
         assert_eq!(e.reason, "malformed JSON");
@@ -13600,7 +13740,6 @@ mod p8b1_issue199_tests {
     }
 }
 
-
 #[cfg(all(test, megu_vanilla_data))]
 mod biome_decoration_contract_tests {
     use super::*;
@@ -13638,25 +13777,128 @@ mod biome_decoration_contract_tests {
     #[test]
     fn vanilla_1211_biome_families_wire_their_decoration_marker_features() {
         for (biome, markers) in [
-            ("lush_caves", &["minecraft:lush_caves_ceiling_vegetation", "minecraft:cave_vines", "minecraft:lush_caves_clay", "minecraft:lush_caves_vegetation", "minecraft:rooted_azalea_tree", "minecraft:spore_blossom"][..]),
-            ("dripstone_caves", &["minecraft:large_dripstone", "minecraft:dripstone_cluster", "minecraft:pointed_dripstone"][..]),
-            ("deep_dark", &["minecraft:sculk_vein", "minecraft:sculk_patch_deep_dark"][..]),
-            ("warm_ocean", &["minecraft:warm_ocean_vegetation", "minecraft:seagrass_warm", "minecraft:sea_pickle"][..]),
-            ("lukewarm_ocean", &["minecraft:seagrass_warm", "minecraft:kelp_warm"][..]),
-            ("ice_spikes", &["minecraft:ice_spike", "minecraft:ice_patch"][..]),
-            ("frozen_ocean", &["minecraft:iceberg_packed", "minecraft:iceberg_blue", "minecraft:blue_ice"][..]),
-            ("wooded_badlands", &["minecraft:trees_badlands", "minecraft:patch_dead_bush_badlands", "minecraft:patch_cactus_decorated"][..]),
-            ("desert", &["minecraft:patch_dead_bush_2", "minecraft:patch_cactus_desert"][..]),
-            ("savanna", &["minecraft:trees_savanna", "minecraft:patch_grass_savanna"][..]),
-            ("meadow", &["minecraft:flower_meadow", "minecraft:trees_meadow"][..]),
-            ("flower_forest", &["minecraft:flower_forest_flowers", "minecraft:trees_flower_forest", "minecraft:flower_flower_forest"][..]),
-            ("cherry_grove", &["minecraft:flower_cherry", "minecraft:trees_cherry"][..]),
-            ("bamboo_jungle", &["minecraft:bamboo", "minecraft:bamboo_vegetation"][..]),
-            ("basalt_deltas", &["minecraft:delta", "minecraft:small_basalt_columns", "minecraft:large_basalt_columns", "minecraft:basalt_blobs", "minecraft:blackstone_blobs", "minecraft:ore_ancient_debris_large"][..]),
-            ("crimson_forest", &["minecraft:weeping_vines", "minecraft:crimson_fungi", "minecraft:crimson_forest_vegetation"][..]),
-            ("warped_forest", &["minecraft:warped_fungi", "minecraft:warped_forest_vegetation", "minecraft:nether_sprouts", "minecraft:twisting_vines"][..]),
-            ("the_end", &["minecraft:end_spike", "minecraft:end_platform"][..]),
-            ("end_highlands", &["minecraft:end_gateway_return", "minecraft:chorus_plant"][..]),
+            (
+                "lush_caves",
+                &[
+                    "minecraft:lush_caves_ceiling_vegetation",
+                    "minecraft:cave_vines",
+                    "minecraft:lush_caves_clay",
+                    "minecraft:lush_caves_vegetation",
+                    "minecraft:rooted_azalea_tree",
+                    "minecraft:spore_blossom",
+                ][..],
+            ),
+            (
+                "dripstone_caves",
+                &[
+                    "minecraft:large_dripstone",
+                    "minecraft:dripstone_cluster",
+                    "minecraft:pointed_dripstone",
+                ][..],
+            ),
+            (
+                "deep_dark",
+                &["minecraft:sculk_vein", "minecraft:sculk_patch_deep_dark"][..],
+            ),
+            (
+                "warm_ocean",
+                &[
+                    "minecraft:warm_ocean_vegetation",
+                    "minecraft:seagrass_warm",
+                    "minecraft:sea_pickle",
+                ][..],
+            ),
+            (
+                "lukewarm_ocean",
+                &["minecraft:seagrass_warm", "minecraft:kelp_warm"][..],
+            ),
+            (
+                "ice_spikes",
+                &["minecraft:ice_spike", "minecraft:ice_patch"][..],
+            ),
+            (
+                "frozen_ocean",
+                &[
+                    "minecraft:iceberg_packed",
+                    "minecraft:iceberg_blue",
+                    "minecraft:blue_ice",
+                ][..],
+            ),
+            (
+                "wooded_badlands",
+                &[
+                    "minecraft:trees_badlands",
+                    "minecraft:patch_dead_bush_badlands",
+                    "minecraft:patch_cactus_decorated",
+                ][..],
+            ),
+            (
+                "desert",
+                &[
+                    "minecraft:patch_dead_bush_2",
+                    "minecraft:patch_cactus_desert",
+                ][..],
+            ),
+            (
+                "savanna",
+                &["minecraft:trees_savanna", "minecraft:patch_grass_savanna"][..],
+            ),
+            (
+                "meadow",
+                &["minecraft:flower_meadow", "minecraft:trees_meadow"][..],
+            ),
+            (
+                "flower_forest",
+                &[
+                    "minecraft:flower_forest_flowers",
+                    "minecraft:trees_flower_forest",
+                    "minecraft:flower_flower_forest",
+                ][..],
+            ),
+            (
+                "cherry_grove",
+                &["minecraft:flower_cherry", "minecraft:trees_cherry"][..],
+            ),
+            (
+                "bamboo_jungle",
+                &["minecraft:bamboo", "minecraft:bamboo_vegetation"][..],
+            ),
+            (
+                "basalt_deltas",
+                &[
+                    "minecraft:delta",
+                    "minecraft:small_basalt_columns",
+                    "minecraft:large_basalt_columns",
+                    "minecraft:basalt_blobs",
+                    "minecraft:blackstone_blobs",
+                    "minecraft:ore_ancient_debris_large",
+                ][..],
+            ),
+            (
+                "crimson_forest",
+                &[
+                    "minecraft:weeping_vines",
+                    "minecraft:crimson_fungi",
+                    "minecraft:crimson_forest_vegetation",
+                ][..],
+            ),
+            (
+                "warped_forest",
+                &[
+                    "minecraft:warped_fungi",
+                    "minecraft:warped_forest_vegetation",
+                    "minecraft:nether_sprouts",
+                    "minecraft:twisting_vines",
+                ][..],
+            ),
+            (
+                "the_end",
+                &["minecraft:end_spike", "minecraft:end_platform"][..],
+            ),
+            (
+                "end_highlands",
+                &["minecraft:end_gateway_return", "minecraft:chorus_plant"][..],
+            ),
             ("small_end_islands", &["minecraft:end_island_decorated"][..]),
         ] {
             let features = biome_features(biome);
@@ -13675,3 +13917,23 @@ mod biome_decoration_contract_tests {
 // together, and `tools/layers_check.sh` forbids new `mod` edges in production files.
 include!("jigsaw_structures.rs");
 include!("structure_pipeline.rs");
+
+#[cfg(test)]
+mod audit1_feature_tests {
+    use super::*;
+    #[test]
+    fn audit1_end_crystal_queue_drains_once() {
+        let _ = take_staged_end_crystals();
+        let row = EndCrystalPlacement {
+            x: 1,
+            y: 70,
+            z: 2,
+            yaw: 90.0,
+            guarded: true,
+        };
+        stage_end_crystal(row);
+        stage_end_crystal(row);
+        assert_eq!(take_staged_end_crystals(), vec![row]);
+        assert!(drain_generated_end_crystals().is_empty());
+    }
+}

@@ -2,6 +2,42 @@
 // feature-size clipping, decorators, mangrove root placer, and leaf-distance
 // propagation.
 
+/// One bee occupant generated with a beehive. The timers are feature-RNG state;
+/// the live block-entity layer drains them when materializing the nest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct GeneratedBeeOccupant {
+    pub ticks_in_hive: i32,
+    pub min_ticks_in_hive: i32,
+}
+
+/// A bee nest staged by tree decoration plus its vanilla occupant metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct GeneratedBeehive {
+    pub pos: (i32, i32, i32),
+    pub occupants: Vec<GeneratedBeeOccupant>,
+}
+
+static GENERATED_BEEHIVES: std::sync::OnceLock<std::sync::Mutex<Vec<GeneratedBeehive>>> =
+    std::sync::OnceLock::new();
+
+fn stage_generated_beehive(record: GeneratedBeehive) {
+    GENERATED_BEEHIVES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(record);
+}
+
+/// Drain generated beehive occupant records exactly once.
+#[allow(dead_code)]
+pub(crate) fn drain_generated_beehives() -> Vec<GeneratedBeehive> {
+    let mut out = GENERATED_BEEHIVES
+        .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *out)
+}
+
 use crate::block_registry::BReg;
 use crate::generation_leaf_queue::LeafQueue;
 use crate::generation_math::Xor;
@@ -952,14 +988,7 @@ fn fancy_high(h: i32, y: i32) -> bool {
 fn fancy_branch_open(reg: &BReg, cur: u32) -> bool {
     tree_tables(reg).is_replaceable_or_log(reg, cur)
 }
-fn fancy_branch(
-    ctx: &mut FC,
-    a: P3,
-    b: P3,
-    trunk_st: u32,
-    make: bool,
-    logs: &mut Vec<P3>,
-) -> bool {
+fn fancy_branch(ctx: &mut FC, a: P3, b: P3, trunk_st: u32, make: bool, logs: &mut Vec<P3>) -> bool {
     if !make && a == b {
         return true;
     }
@@ -1431,55 +1460,15 @@ impl FP {
             }
             FP::DarkOak => {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
-                gen_square(
-                    self,
-                    out,
-                    ctx,
-                    rng,
-                    pos,
-                    radius + 2,
-                    -1,
-                    node.giant,
-                    fst,
-                );
+                gen_square(self, out, ctx, rng, pos, radius + 2, -1, node.giant, fst);
                 if node.giant {
-                    gen_square(
-                        self,
-                        out,
-                        ctx,
-                        rng,
-                        pos,
-                        radius + 3,
-                        0,
-                        node.giant,
-                        fst,
-                    );
-                    gen_square(
-                        self,
-                        out,
-                        ctx,
-                        rng,
-                        pos,
-                        radius + 2,
-                        1,
-                        node.giant,
-                        fst,
-                    );
+                    gen_square(self, out, ctx, rng, pos, radius + 3, 0, node.giant, fst);
+                    gen_square(self, out, ctx, rng, pos, radius + 2, 1, node.giant, fst);
                     if rng.next_bool() {
                         gen_square(self, out, ctx, rng, pos, radius, 2, node.giant, fst);
                     }
                 } else {
-                    gen_square(
-                        self,
-                        out,
-                        ctx,
-                        rng,
-                        pos,
-                        radius + 1,
-                        0,
-                        node.giant,
-                        fst,
-                    );
+                    gen_square(self, out, ctx, rng, pos, radius + 1, 0, node.giant, fst);
                 }
             }
             FP::RandomSpread { attempts, .. } => {
@@ -1495,28 +1484,8 @@ impl FP {
             FP::Cherry { hang, hang_ext, .. } => {
                 let pos = (node.center.0, node.center.1 + offset, node.center.2);
                 let cr = radius + node.foliage_radius - 1;
-                gen_square(
-                    self,
-                    out,
-                    ctx,
-                    rng,
-                    pos,
-                    cr - 2,
-                    fh - 3,
-                    node.giant,
-                    fst,
-                );
-                gen_square(
-                    self,
-                    out,
-                    ctx,
-                    rng,
-                    pos,
-                    cr - 1,
-                    fh - 4,
-                    node.giant,
-                    fst,
-                );
+                gen_square(self, out, ctx, rng, pos, cr - 2, fh - 3, node.giant, fst);
+                gen_square(self, out, ctx, rng, pos, cr - 1, fh - 4, node.giant, fst);
                 for y in (0..=fh - 5).rev() {
                     gen_square(self, out, ctx, rng, pos, cr, y, node.giant, fst);
                 }
@@ -2504,8 +2473,17 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
                                     places.push((lp.0 + ox, lp.1, lp.2 + oz));
                                 }
                             }
+                            // Vanilla's decorator shuffles candidate positions through a
+                            // separate random source. Cloning here gives that shuffle the
+                            // same deterministic input without consuming the feature RNG
+                            // draws the following decorators/placements own.
+                            let shuffle_seed =
+                                (crate::generation_math::hash_block_pos(dl[0].0, hive_y, dl[0].2)
+                                    as u64)
+                                    ^ 0x9e37_79b9_7f4a_7c15;
+                            let mut shuffle_rng = crate::generation_math::Xor::seed(shuffle_seed);
                             for i in (1..places.len()).rev() {
-                                let j = rng.next_bound(i as i32 + 1) as usize;
+                                let j = shuffle_rng.next_bound(i as i32 + 1) as usize;
                                 places.swap(i, j);
                             }
                             let nest = tables.bee_nest_south;
@@ -2516,6 +2494,18 @@ pub(crate) fn gen_tree(ctx: &mut FC, rng: &mut Xor, pos: P3, t: &TreeExtra) -> b
                                 {
                                     decorations.push(p);
                                     ctx.set(p.0, p.1, p.2, nest);
+                                    // Hive creation draws two or three bee occupants on
+                                    // the feature RNG. Keep their initial occupation timers
+                                    // beside the nest; dropping them would make the placed
+                                    // block a permanently empty hive unlike vanilla.
+                                    let bees = 2 + rng.next_bound(2);
+                                    let occupants = (0..bees)
+                                        .map(|_| GeneratedBeeOccupant {
+                                            ticks_in_hive: rng.next_bound(20),
+                                            min_ticks_in_hive: 20 + rng.next_bound(20),
+                                        })
+                                        .collect();
+                                    stage_generated_beehive(GeneratedBeehive { pos: p, occupants });
                                     break;
                                 }
                             }
@@ -2610,13 +2600,17 @@ struct LeafShape {
 
 impl LeafShape {
     fn positions(&self) -> impl Iterator<Item = P3> + '_ {
-        self.filled.iter().enumerate().filter(|&(_, &filled)| filled).map(|(i, _)| {
-            (
-                self.min.0 + (i / (self.ys * self.zs)) as i32,
-                self.min.1 + (i / self.zs % self.ys) as i32,
-                self.min.2 + (i % self.zs) as i32,
-            )
-        })
+        self.filled
+            .iter()
+            .enumerate()
+            .filter(|&(_, &filled)| filled)
+            .map(|(i, _)| {
+                (
+                    self.min.0 + (i / (self.ys * self.zs)) as i32,
+                    self.min.1 + (i / self.zs % self.ys) as i32,
+                    self.min.2 + (i % self.zs) as i32,
+                )
+            })
     }
 }
 
@@ -3838,7 +3832,15 @@ mod tests {
             for &(x, y, z) in cells {
                 filled[x * ys * zs + y * zs + z] = true;
             }
-            (LeafShape { min, filled, ys, zs }, xs)
+            (
+                LeafShape {
+                    min,
+                    filled,
+                    ys,
+                    zs,
+                },
+                xs,
+            )
         };
         // Single cell, two disjoint cells, a slab touching every face, a box with a cavity,
         // and an L through the corner.
@@ -3863,7 +3865,10 @@ mod tests {
                     })
                     .collect::<Vec<_>>(),
             ),
-            ((3, 3, 3), vec![(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (0, 0, 1)]),
+            (
+                (3, 3, 3),
+                vec![(0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (0, 0, 1)],
+            ),
         ] {
             let (shape, xs) = build((-7, 60, 4), dims, &cells);
             check(&shape, xs);
@@ -3878,7 +3883,11 @@ mod tests {
             seed
         };
         for i in 0..512 {
-            let (xs, ys, zs) = (1 + (next() % 4) as usize, 1 + (next() % 3) as usize, 1 + (next() % 4) as usize);
+            let (xs, ys, zs) = (
+                1 + (next() % 4) as usize,
+                1 + (next() % 3) as usize,
+                1 + (next() % 4) as usize,
+            );
             let mut filled = Vec::with_capacity(xs * ys * zs);
             for _ in 0..xs * ys * zs {
                 filled.push(next() & 3 != 0);
@@ -3886,8 +3895,20 @@ mod tests {
             if i % 64 == 0 {
                 filled.iter_mut().for_each(|v| *v = true);
             }
-            let min = ((next() % 100) as i32 - 50, (next() % 256) as i32 - 32, (next() % 100) as i32 - 50);
-            check(&LeafShape { min, filled, ys, zs }, xs);
+            let min = (
+                (next() % 100) as i32 - 50,
+                (next() % 256) as i32 - 32,
+                (next() % 100) as i32 - 50,
+            );
+            check(
+                &LeafShape {
+                    min,
+                    filled,
+                    ys,
+                    zs,
+                },
+                xs,
+            );
         }
     }
 }
