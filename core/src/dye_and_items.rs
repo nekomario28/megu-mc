@@ -72,26 +72,26 @@ pub enum DyeColor {
     Black = 15,
 }
 
-/// `(name, texture_diffuse_rgb, firework_rgb, text_rgb)` — the literal ints
-/// pushed by `DyeColor.<clinit>` in the pinned 1.21.1 jar. The constructor
-/// stores `FastColor.ARGB32.opaque(diffuse)` i.e. `0xFF000000 | diffuse`.
-const DYE_SPECS: [(&str, u32, u32, u32); 16] = [
-    ("white", 0x00F9_FFFE, 0x00F0_F0F0, 0x00FF_FFFF),
-    ("orange", 0x00F9_801D, 0x00EB_8844, 0x00FF_681F),
-    ("magenta", 0x00C7_4EBD, 0x00C3_54CD, 0x00FF_00FF),
-    ("light_blue", 0x003A_B3DA, 0x0066_89D3, 0x009A_C0CD),
-    ("yellow", 0x00FE_D83D, 0x00DE_CF2A, 0x00FF_FF00),
-    ("lime", 0x0080_C71F, 0x0041_CD34, 0x00BF_FF00),
-    ("pink", 0x00F3_8BAA, 0x00D8_8198, 0x00FF_69B4),
-    ("gray", 0x0047_4F52, 0x0043_4343, 0x0080_8080),
-    ("light_gray", 0x009D_9D97, 0x00AB_ABAB, 0x00D3_D3D3),
-    ("cyan", 0x0016_9C9C, 0x0028_7697, 0x0000_FFFF),
-    ("purple", 0x0089_32B8, 0x007B_2FBE, 0x00A0_20F0),
-    ("blue", 0x003C_44AA, 0x0025_3192, 0x0000_00FF),
-    ("brown", 0x0083_5432, 0x0051_301A, 0x008B_4513),
-    ("green", 0x005E_7C16, 0x003B_511A, 0x0000_FF00),
-    ("red", 0x00B0_2E26, 0x00B3_312C, 0x00FF_0000),
-    ("black", 0x001D_1D21, 0x001E_1B1B, 0x0000_0000),
+/// `(texture_diffuse_rgb, firework_rgb, text_rgb)` — the literal ints pushed
+/// by `DyeColor.<clinit>` in the pinned 1.21.1 jar. The constructor stores
+/// `FastColor.ARGB32.opaque(diffuse)` i.e. `0xFF000000 | diffuse`.
+const DYE_SPECS: [(u32, u32, u32); 16] = [
+    (0x00F9_FFFE, 0x00F0_F0F0, 0x00FF_FFFF),
+    (0x00F9_801D, 0x00EB_8844, 0x00FF_681F),
+    (0x00C7_4EBD, 0x00C3_54CD, 0x00FF_00FF),
+    (0x003A_B3DA, 0x0066_89D3, 0x009A_C0CD),
+    (0x00FE_D83D, 0x00DE_CF2A, 0x00FF_FF00),
+    (0x0080_C71F, 0x0041_CD34, 0x00BF_FF00),
+    (0x00F3_8BAA, 0x00D8_8198, 0x00FF_69B4),
+    (0x0047_4F52, 0x0043_4343, 0x0080_8080),
+    (0x009D_9D97, 0x00AB_ABAB, 0x00D3_D3D3),
+    (0x0016_9C9C, 0x0028_7697, 0x0000_FFFF),
+    (0x0089_32B8, 0x007B_2FBE, 0x00A0_20F0),
+    (0x003C_44AA, 0x0025_3192, 0x0000_00FF),
+    (0x0083_5432, 0x0051_301A, 0x008B_4513),
+    (0x005E_7C16, 0x003B_511A, 0x0000_FF00),
+    (0x00B0_2E26, 0x00B3_312C, 0x00FF_0000),
+    (0x001D_1D21, 0x001E_1B1B, 0x0000_0000),
 ];
 
 impl DyeColor {
@@ -125,7 +125,7 @@ impl DyeColor {
     /// The registry name without namespace (`"light_blue"`).
     #[inline]
     pub const fn name(self) -> &'static str {
-        DYE_SPECS[self.id() as usize].0
+        DYE_NAMES[self.id() as usize]
     }
 
     /// The dye item id (`"minecraft:<name>_dye"`).
@@ -154,7 +154,7 @@ impl DyeColor {
     /// `getTextureDiffuseColor` as `0x00RRGGBB` — the wool/collar/mixing color.
     #[inline]
     pub const fn texture_diffuse_rgb(self) -> u32 {
-        DYE_SPECS[self.id() as usize].1
+        DYE_SPECS[self.id() as usize].0
     }
 
     /// The exact int vanilla stores: `FastColor.ARGB32.opaque(rgb)` =
@@ -167,13 +167,13 @@ impl DyeColor {
     /// `getFireworkColor` as `0x00RRGGBB` — written into firework stars.
     #[inline]
     pub const fn firework_rgb(self) -> u32 {
-        DYE_SPECS[self.id() as usize].2
+        DYE_SPECS[self.id() as usize].1
     }
 
     /// `getTextColor` as `0x00RRGGBB` — sign text and `§`-formatting color.
     #[inline]
     pub const fn text_rgb(self) -> u32 {
-        DYE_SPECS[self.id() as usize].3
+        DYE_SPECS[self.id() as usize].2
     }
 
     /// `DyeColor.byId` — `None` for `id >= 16`.
@@ -250,6 +250,46 @@ pub fn mix_dye_color(base: Option<u32>, dyes: &[DyeColor]) -> u32 {
     }
     for d in dyes {
         add(d.texture_diffuse_argb());
+    }
+    if count == 0 {
+        return 0;
+    }
+    let mut avg_r = r_sum / count;
+    let mut avg_g = g_sum / count;
+    let mut avg_b = b_sum / count;
+    let avg_max = max_sum as f32 / count as f32;
+    let max_avg = avg_r.max(avg_g).max(avg_b) as f32;
+    if max_avg == 0.0 {
+        return 0;
+    }
+    avg_r = (avg_r as f32 * avg_max / max_avg) as u32;
+    avg_g = (avg_g as f32 * avg_max / max_avg) as u32;
+    avg_b = (avg_b as f32 * avg_max / max_avg) as u32;
+    (avg_r << 16) | (avg_g << 8) | avg_b
+}
+
+/// Mix dyes from any iterator without allocating an intermediate collection.
+pub fn mix_dye_colors_iter(base: Option<u32>, dyes: impl IntoIterator<Item = DyeColor>) -> u32 {
+    let mut r_sum: u32 = 0;
+    let mut g_sum: u32 = 0;
+    let mut b_sum: u32 = 0;
+    let mut max_sum: u32 = 0;
+    let mut count: u32 = 0;
+    let mut add = |argb: u32| {
+        let r = (argb >> 16) & 0xFF;
+        let g = (argb >> 8) & 0xFF;
+        let b = argb & 0xFF;
+        max_sum += r.max(g).max(b);
+        r_sum += r;
+        g_sum += g;
+        b_sum += b;
+        count += 1;
+    };
+    if let Some(color) = base {
+        add(color);
+    }
+    for dye in dyes {
+        add(dye.texture_diffuse_argb());
     }
     if count == 0 {
         return 0;
@@ -610,175 +650,114 @@ pub fn craft_dye_recipe(kind: CraftDyeKind) -> CraftDyeRecipe {
     }
 }
 
-/// Build `"<color>_<suffix>"` as a `'static str` without allocation: the 16
-/// color names and the fixed family suffixes are all string literals, so each
-/// combination is emitted as its own table row (16 rows per family).
+/// A colored item family with a color-prefixed vanilla registry name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DyeFamily {
+    Wool,
+    Carpet,
+    Bed,
+    Terracotta,
+    StainedGlass,
+    StainedGlassPane,
+    Candle,
+    ShulkerBox,
+    ConcretePowder,
+}
+
+impl DyeFamily {
+    /// The suffix following `<color>_` in the item path.
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Wool => "wool",
+            Self::Carpet => "carpet",
+            Self::Bed => "bed",
+            Self::Terracotta => "terracotta",
+            Self::StainedGlass => "stained_glass",
+            Self::StainedGlassPane => "stained_glass_pane",
+            Self::Candle => "candle",
+            Self::ShulkerBox => "shulker_box",
+            Self::ConcretePowder => "concrete_powder",
+        }
+    }
+
+    /// Return the unnamespaced item path for this color and family.
+    pub fn item_name(self, color: DyeColor) -> String {
+        format!("{}_{}", color.name(), self.suffix())
+    }
+
+    const ALL: [Self; 9] = [
+        Self::Wool,
+        Self::Carpet,
+        Self::Bed,
+        Self::Terracotta,
+        Self::StainedGlass,
+        Self::StainedGlassPane,
+        Self::Candle,
+        Self::ShulkerBox,
+        Self::ConcretePowder,
+    ];
+}
+
+/// Parse a colored family item path, accepting the optional Minecraft namespace.
+pub fn parse_dye_family_item(name: &str) -> Option<(DyeColor, DyeFamily)> {
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    DyeColor::ALL.iter().copied().find_map(|color| {
+        let suffix = path.strip_prefix(color.name())?.strip_prefix('_')?;
+        let family = DyeFamily::ALL
+            .into_iter()
+            .find(|family| family.suffix() == suffix)?;
+        Some((color, family))
+    })
+}
+
+// This is the single color-name list used to emit every public static family
+// table. Keep the order aligned with DyeColor's registry IDs.
+macro_rules! for_each_dye_name {
+    ($callback:ident, $($args:tt)*) => {
+        $callback!($($args)*; "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray", "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black");
+    };
+}
+
+macro_rules! define_dye_family_items {
+    ($name:ident, $suffix:literal; $($color:literal),+ $(,)?) => {
+        const $name: [&str; 16] = [$(concat!($color, "_", $suffix)),+];
+    };
+}
+
+macro_rules! define_dye_names {
+    ($name:ident; $($color:literal),+ $(,)?) => {
+        const $name: [&str; 16] = [$($color),+];
+    };
+}
+
+for_each_dye_name!(define_dye_names, DYE_NAMES);
+
+/// Build `"<color>_<suffix>"` as a `'static str` without allocation.
 fn craft_colored_name(color: DyeColor, suffix_rows: &'static [&'static str; 16]) -> &'static str {
     suffix_rows[color.id() as usize]
 }
 
-const WOOL_ITEMS: [&str; 16] = [
-    "white_wool",
-    "orange_wool",
-    "magenta_wool",
-    "light_blue_wool",
-    "yellow_wool",
-    "lime_wool",
-    "pink_wool",
-    "gray_wool",
-    "light_gray_wool",
-    "cyan_wool",
-    "purple_wool",
-    "blue_wool",
-    "brown_wool",
-    "green_wool",
-    "red_wool",
-    "black_wool",
-];
-const CARPET_ITEMS: [&str; 16] = [
-    "white_carpet",
-    "orange_carpet",
-    "magenta_carpet",
-    "light_blue_carpet",
-    "yellow_carpet",
-    "lime_carpet",
-    "pink_carpet",
-    "gray_carpet",
-    "light_gray_carpet",
-    "cyan_carpet",
-    "purple_carpet",
-    "blue_carpet",
-    "brown_carpet",
-    "green_carpet",
-    "red_carpet",
-    "black_carpet",
-];
-const BED_ITEMS: [&str; 16] = [
-    "white_bed",
-    "orange_bed",
-    "magenta_bed",
-    "light_blue_bed",
-    "yellow_bed",
-    "lime_bed",
-    "pink_bed",
-    "gray_bed",
-    "light_gray_bed",
-    "cyan_bed",
-    "purple_bed",
-    "blue_bed",
-    "brown_bed",
-    "green_bed",
-    "red_bed",
-    "black_bed",
-];
-const TERRACOTTA_ITEMS: [&str; 16] = [
-    "white_terracotta",
-    "orange_terracotta",
-    "magenta_terracotta",
-    "light_blue_terracotta",
-    "yellow_terracotta",
-    "lime_terracotta",
-    "pink_terracotta",
-    "gray_terracotta",
-    "light_gray_terracotta",
-    "cyan_terracotta",
-    "purple_terracotta",
-    "blue_terracotta",
-    "brown_terracotta",
-    "green_terracotta",
-    "red_terracotta",
-    "black_terracotta",
-];
-const STAINED_GLASS_ITEMS: [&str; 16] = [
-    "white_stained_glass",
-    "orange_stained_glass",
-    "magenta_stained_glass",
-    "light_blue_stained_glass",
-    "yellow_stained_glass",
-    "lime_stained_glass",
-    "pink_stained_glass",
-    "gray_stained_glass",
-    "light_gray_stained_glass",
-    "cyan_stained_glass",
-    "purple_stained_glass",
-    "blue_stained_glass",
-    "brown_stained_glass",
-    "green_stained_glass",
-    "red_stained_glass",
-    "black_stained_glass",
-];
-const STAINED_GLASS_PANE_ITEMS: [&str; 16] = [
-    "white_stained_glass_pane",
-    "orange_stained_glass_pane",
-    "magenta_stained_glass_pane",
-    "light_blue_stained_glass_pane",
-    "yellow_stained_glass_pane",
-    "lime_stained_glass_pane",
-    "pink_stained_glass_pane",
-    "gray_stained_glass_pane",
-    "light_gray_stained_glass_pane",
-    "cyan_stained_glass_pane",
-    "purple_stained_glass_pane",
-    "blue_stained_glass_pane",
-    "brown_stained_glass_pane",
-    "green_stained_glass_pane",
-    "red_stained_glass_pane",
-    "black_stained_glass_pane",
-];
-const CANDLE_ITEMS: [&str; 16] = [
-    "white_candle",
-    "orange_candle",
-    "magenta_candle",
-    "light_blue_candle",
-    "yellow_candle",
-    "lime_candle",
-    "pink_candle",
-    "gray_candle",
-    "light_gray_candle",
-    "cyan_candle",
-    "purple_candle",
-    "blue_candle",
-    "brown_candle",
-    "green_candle",
-    "red_candle",
-    "black_candle",
-];
-const SHULKER_BOX_ITEMS: [&str; 16] = [
-    "white_shulker_box",
-    "orange_shulker_box",
-    "magenta_shulker_box",
-    "light_blue_shulker_box",
-    "yellow_shulker_box",
-    "lime_shulker_box",
-    "pink_shulker_box",
-    "gray_shulker_box",
-    "light_gray_shulker_box",
-    "cyan_shulker_box",
-    "purple_shulker_box",
-    "blue_shulker_box",
-    "brown_shulker_box",
-    "green_shulker_box",
-    "red_shulker_box",
-    "black_shulker_box",
-];
-const CONCRETE_POWDER_ITEMS: [&str; 16] = [
-    "white_concrete_powder",
-    "orange_concrete_powder",
-    "magenta_concrete_powder",
-    "light_blue_concrete_powder",
-    "yellow_concrete_powder",
-    "lime_concrete_powder",
-    "pink_concrete_powder",
-    "gray_concrete_powder",
-    "light_gray_concrete_powder",
-    "cyan_concrete_powder",
-    "purple_concrete_powder",
-    "blue_concrete_powder",
-    "brown_concrete_powder",
-    "green_concrete_powder",
-    "red_concrete_powder",
-    "black_concrete_powder",
-];
+for_each_dye_name!(define_dye_family_items, WOOL_ITEMS, "wool");
+for_each_dye_name!(define_dye_family_items, CARPET_ITEMS, "carpet");
+for_each_dye_name!(define_dye_family_items, BED_ITEMS, "bed");
+for_each_dye_name!(define_dye_family_items, TERRACOTTA_ITEMS, "terracotta");
+for_each_dye_name!(
+    define_dye_family_items,
+    STAINED_GLASS_ITEMS,
+    "stained_glass"
+);
+for_each_dye_name!(
+    define_dye_family_items,
+    STAINED_GLASS_PANE_ITEMS,
+    "stained_glass_pane"
+);
+for_each_dye_name!(define_dye_family_items, CANDLE_ITEMS, "candle");
+for_each_dye_name!(define_dye_family_items, SHULKER_BOX_ITEMS, "shulker_box");
+for_each_dye_name!(
+    define_dye_family_items,
+    CONCRETE_POWDER_ITEMS,
+    "concrete_powder"
+);
 
 /// The resulting item name when a dye is applied to a family member under the
 /// vanilla recipe, or `None` when the recipe does not apply (e.g. a colored
@@ -2142,3 +2121,83 @@ pub fn bucket_content(item: &str) -> Option<BucketContent> {
     })
 }
 
+
+#[cfg(test)]
+mod dye_family_tests {
+    use super::*;
+
+    #[test]
+    fn all_dye_family_names_round_trip() {
+        for color in DyeColor::ALL {
+            for family in DyeFamily::ALL {
+                let path = family.item_name(color);
+                assert_eq!(parse_dye_family_item(&path), Some((color, family)));
+                assert_eq!(
+                    parse_dye_family_item(&format!("minecraft:{path}")),
+                    Some((color, family))
+                );
+            }
+        }
+        assert_eq!(
+            parse_dye_family_item("minecraft:white_glazed_terracotta"),
+            None
+        );
+        assert_eq!(parse_dye_family_item("white_wool_extra"), None);
+        assert_eq!(
+            parse_dye_family_item("minecraft:minecraft:white_wool"),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_craft_tables_match_derived_family_names() {
+        for color in DyeColor::ALL {
+            assert_eq!(
+                concrete_powder_item(color),
+                DyeFamily::ConcretePowder.item_name(color)
+            );
+            for (family, input) in [
+                (DyeFamily::Wool, "white_wool"),
+                (DyeFamily::Carpet, "white_carpet"),
+                (DyeFamily::Bed, "white_bed"),
+                (DyeFamily::Terracotta, "terracotta"),
+                (DyeFamily::StainedGlass, "glass"),
+                (DyeFamily::StainedGlassPane, "glass_pane"),
+                (DyeFamily::Candle, "candle"),
+                (DyeFamily::ShulkerBox, "shulker_box"),
+            ] {
+                let actual = craft_dye_result(input, color).expect("supported initial dye craft");
+                assert_eq!(actual, family.item_name(color));
+            }
+        }
+    }
+
+    #[test]
+    fn iterator_mixer_matches_pinned_single_multi_and_redye_fixtures() {
+        const SINGLE: [DyeColor; 1] = [DyeColor::Red];
+        const MULTI: [DyeColor; 3] = [DyeColor::Blue, DyeColor::Yellow, DyeColor::White];
+        const REDYE: [DyeColor; 2] = [DyeColor::Magenta, DyeColor::Cyan];
+        let fixtures: &[(Option<u32>, &[DyeColor])] = &[
+            (None, &SINGLE),
+            (None, &MULTI),
+            (Some(LEATHER_DEFAULT_RGB), &REDYE),
+            (Some(0x0012_3456), &SINGLE),
+            (Some(0), &MULTI),
+        ];
+        for &(base, dyes) in fixtures {
+            assert_eq!(
+                mix_dye_colors_iter(base, dyes.iter().copied()),
+                mix_dye_color(base, dyes),
+                "base={base:?}, dyes={dyes:?}"
+            );
+        }
+        for color in DyeColor::ALL {
+            let dyes = [color];
+            assert_eq!(
+                mix_dye_colors_iter(None, dyes),
+                mix_dye_color(None, &dyes),
+                "single dye {color:?}"
+            );
+        }
+    }
+}
