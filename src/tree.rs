@@ -3690,31 +3690,31 @@ mod tests {
             ("azalea_tree", "bending", "random_spread"),
         ] {
             let tree = pinned_tree(name);
-            let trunk_ok = match (trunk, &tree.trunk_placer.ty) {
+            let trunk_ok = matches!(
+                (trunk, &tree.trunk_placer.ty),
                 ("straight", TP::Straight)
-                | ("fancy", TP::Fancy)
-                | ("giant", TP::Giant)
-                | ("mega_jungle", TP::MegaJungle)
-                | ("forking", TP::Forking)
-                | ("dark_oak", TP::DarkOak)
-                | ("upwards_branching", TP::UpwardsBranching { .. })
-                | ("cherry", TP::Cherry { .. })
-                | ("bending", TP::Bending { .. }) => true,
-                _ => false,
-            };
-            let foliage_ok = match (foliage, &tree.foliage_placer) {
+                    | ("fancy", TP::Fancy)
+                    | ("giant", TP::Giant)
+                    | ("mega_jungle", TP::MegaJungle)
+                    | ("forking", TP::Forking)
+                    | ("dark_oak", TP::DarkOak)
+                    | ("upwards_branching", TP::UpwardsBranching { .. })
+                    | ("cherry", TP::Cherry { .. })
+                    | ("bending", TP::Bending { .. })
+            );
+            let foliage_ok = matches!(
+                (foliage, &tree.foliage_placer),
                 ("blob", FP::Blob { .. })
-                | ("fancy", FP::Fancy { .. })
-                | ("spruce", FP::Spruce { .. })
-                | ("pine", FP::Pine { .. })
-                | ("mega_pine", FP::MegaPine { .. })
-                | ("jungle", FP::Jungle { .. } | FP::MegaJungle { .. })
-                | ("acacia", FP::Acacia)
-                | ("dark_oak", FP::DarkOak)
-                | ("random_spread", FP::RandomSpread { .. })
-                | ("cherry", FP::Cherry { .. }) => true,
-                _ => false,
-            };
+                    | ("fancy", FP::Fancy { .. })
+                    | ("spruce", FP::Spruce { .. })
+                    | ("pine", FP::Pine { .. })
+                    | ("mega_pine", FP::MegaPine { .. })
+                    | ("jungle", FP::Jungle { .. } | FP::MegaJungle { .. })
+                    | ("acacia", FP::Acacia)
+                    | ("dark_oak", FP::DarkOak)
+                    | ("random_spread", FP::RandomSpread { .. })
+                    | ("cherry", FP::Cherry { .. })
+            );
             assert!(trunk_ok, "{name}: wrong trunk placer");
             assert!(foliage_ok, "{name}: wrong foliage placer");
         }

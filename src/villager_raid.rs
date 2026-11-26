@@ -9282,7 +9282,7 @@ mod villager_raid_interact_dispatch_tests {
                 }
             }).map(|mob| mob.eid)
         }.expect("live invulnerable-stage wither entity");
-        if let Some(mob) = remove_live_mob(spawned) {
+        if let Some((mob, _)) = remove_live_mob(spawned) {
             live_mount_forget(mob.eid);
         }
         for (bx, by, bz, state) in old.into_iter().rev() {
