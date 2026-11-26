@@ -22,11 +22,12 @@ use megu_client::mod_assets_meta::{
 };
 use megu_client::online_auth::OnlineAuthOptions;
 use megu_client::protocol::{
-    decode_item_stack_components, handle_transfer_packet, offline_uuid, pack_position,
-    parse_entity_metadata, parse_uuid, write_string, ClientCustomChannelEvent, ClientPlayEvent,
-    DecodedMagicCastState, DecodedMagicSync, DecodedMotionTrigger, DimensionMeta, EntityMetaValue,
-    ItemStackComponents, PlayEvent, PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync,
-    TeleportSync, TransferTarget, WireReader, WireSoundEvent, WireStopSound,
+    decode_boss_bar_action, decode_item_stack_components, handle_transfer_packet, offline_uuid,
+    pack_position, parse_entity_metadata, parse_uuid, write_string, ClientCustomChannelEvent,
+    ClientPlayEvent, DecodedBossBarAction, DecodedMagicCastState, DecodedMagicSync,
+    DecodedMotionTrigger, DimensionMeta, EntityMetaValue, ItemStackComponents, PlayEvent,
+    PlayerInfoUpdateEntry, ProtocolClient, SeasonWireSync, TeleportSync, TransferTarget,
+    WireReader, WireSoundEvent, WireStopSound,
 };
 use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
@@ -137,6 +138,12 @@ struct MiningState {
     duration: f32,
     cooldown: f32,
     swing_timer: f32,
+    /// `STOP_DESTROY_BLOCK` has been sent; keep the same attempt alive until
+    /// the authoritative block update, retarget, or explicit release.
+    complete: bool,
+    /// Block state id the attempt started against; any authoritative mutation
+    /// closes that attempt even when the coordinates stay the same.
+    state_id: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -319,6 +326,62 @@ pub struct PlayerMovement {
     /// as the dismount flag while riding) and `interact`'s
     /// secondary-action flag.
     pub sneak: bool,
+}
+
+/// One frame of local survival locomotion input for
+/// [`LiveSession::step_live_survival_movement`]. `forward`/`strafe` use the
+/// vanilla sign convention (`forward > 0` walks toward the crosshair).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SurvivalMovementInput {
+    pub forward: f32,
+    pub strafe: f32,
+    pub jump: bool,
+    pub sneak: bool,
+    pub sprint: bool,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+/// HUD-facing component-preserving hotbar/offhand stack summary. The legacy
+/// [`HudState`] hotbar strings stay in place for the current renderer while
+/// this richer feed preserves the authoritative `Slot` component metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LiveHotbarStack {
+    pub item_name: String,
+    pub count: i32,
+    pub damage: Option<i32>,
+    pub max_damage: Option<i32>,
+    pub custom_name: Option<String>,
+    pub lore: Vec<String>,
+    pub enchanted: bool,
+}
+
+/// Typed boss-bar metadata mirrored from `boss_event` add/update actions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveBossBarView {
+    pub title: String,
+    pub health: f32,
+    /// Protocol boss-bar color id (0 pink, 1 blue, 2 red, 3 green, 4 yellow,
+    /// 5 purple, 6 white).
+    pub color: i32,
+    /// Division/overlay id (0 none, 1 six, 2 ten, 3 twelve, 4 twenty).
+    pub divisions: i32,
+    /// Vanilla flags byte: darken screen 0x01, fog 0x02, darken sky 0x04.
+    pub flags: u8,
+}
+
+/// Component-preserving player status effect metadata for HUD consumers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveStatusEffectView {
+    pub effect_id: i32,
+    pub name: String,
+    pub amplifier: i32,
+    /// Remaining ticks; `-1` is the protocol's infinite sentinel.
+    pub duration_ticks: i32,
+    pub ambient: bool,
+    pub show_particles: bool,
+    pub show_icon: bool,
+    pub beneficial: bool,
 }
 
 // `Play` is the hot variant; boxing it would put an allocation on every frame.
@@ -682,7 +745,10 @@ pub struct AssetDiscovery {
 }
 
 pub(crate) enum WorkerCommand {
-    Movement(PlayerMovement),
+    Movement {
+        movement: PlayerMovement,
+        on_ground: bool,
+    },
     /// `chat`/`chat_command` — the worker splits on a leading `/` exactly
     /// like vanilla's chat screen.
     Chat(String),
@@ -856,6 +922,8 @@ pub struct LiveOpenScreen {
     pub menu_type: i32,
     /// Raw anonymous-NBT title (text component) exactly as sent.
     pub title_nbt: Vec<u8>,
+    /// Decoded plain text of the authoritative custom container title.
+    pub title_text: Option<String>,
     /// `container_set_content` `state_id` sequence, echoed back on clicks.
     pub state_id: i32,
     /// Decoded slot patches keyed by window slot index.
@@ -937,6 +1005,12 @@ pub struct LiveBossBar {
     pub title: String,
     /// Fill fraction 0..=1 (actions 0 add / 2 update-health).
     pub health: f32,
+    /// Protocol color id (add/update-style actions).
+    pub color: i32,
+    /// Division/overlay id (add/update-style actions).
+    pub divisions: i32,
+    /// Vanilla boss-bar flags byte (darken screen/fog/sky bits).
+    pub flags: u8,
 }
 
 /// Per-entity scalar metadata surfaced from `set_entity_data` via
@@ -997,6 +1071,12 @@ pub struct LiveHudFeed {
     pub title_text: Option<String>,
     pub subtitle_text: Option<String>,
     pub looking_at_block: Option<([i32; 3], String)>,
+    /// Component-preserving hotbar/offhand metadata parallel to the legacy
+    /// string-only `HudState` feed.
+    pub hotbar_stacks: [Option<LiveHotbarStack>; 9],
+    pub offhand_stack: Option<LiveHotbarStack>,
+    pub bossbars: Vec<LiveBossBarView>,
+    pub status_effects: Vec<LiveStatusEffectView>,
 }
 
 /// Block cell adjacent to `pos` on `face` (vanilla `Direction` ordinals
@@ -2274,6 +2354,14 @@ pub struct EntityContactShadowQuad {
 /// entry list) grants the enchantment glint: `minecraft:enchantments`
 /// (`9`) and `minecraft:stored_enchantments` (`23`, enchanted books).
 const ITEM_GLINT_COMPONENT_IDS: [i32; 2] = [9, 23];
+const COMP_MAX_DAMAGE: i32 = 2;
+const COMP_DAMAGE: i32 = 3;
+const COMP_CUSTOM_NAME: i32 = 5;
+const COMP_LORE: i32 = 7;
+const COMP_ENCHANTMENTS: i32 = 9;
+const COMP_STORED_ENCHANTMENTS: i32 = 23;
+const EFFICIENCY_ENCHANTMENT_ID: i32 = 8;
+const AQUA_AFFINITY_ENCHANTMENT_ID: i32 = 0;
 
 /// `true` when the decoded stack carries an enchantment component with
 /// at least one entry — vanilla's `ItemStack.hasGlint` proxy driving
@@ -2294,6 +2382,12 @@ pub struct LiveSession {
     incoming: Receiver<WorkerMessage>,
     outgoing: SyncSender<WorkerCommand>,
     _offline_sender: Option<SyncSender<WorkerMessage>>,
+    /// Drained on demand in offline fixtures so packet-producing public
+    /// methods obey bounded queue semantics without a socket worker.
+    offline_command_receiver: Option<Receiver<WorkerCommand>>,
+    /// Ground bit attached to the newest accepted movement command. This is
+    /// the same value the worker writes into `move_player_pos_rot` (`0x1b`).
+    pub last_movement_on_ground: Option<bool>,
     pub status: SessionStatus,
     /// Bounded packet history reserved for instant replay capture.
     pub replay_ring: crate::replay_ring::PacketReplayRing,
@@ -3539,10 +3633,11 @@ impl LiveSession {
     /// `--gameDir` JAR discovery reach the session.
     pub fn offline_with_paths(paths: SessionPaths) -> Self {
         let (tx, incoming) = mpsc::sync_channel(256);
-        let (outgoing, _rx) = mpsc::sync_channel(8);
+        let (outgoing, command_rx) = mpsc::sync_channel(8);
         let mut session =
             Self::with_channels_and_sink(incoming, outgoing, AudioSinkKind::Null, paths);
         session._offline_sender = Some(tx);
+        session.offline_command_receiver = Some(command_rx);
         session
     }
 
@@ -3602,6 +3697,8 @@ impl LiveSession {
             incoming,
             outgoing,
             _offline_sender: None,
+            offline_command_receiver: None,
+            last_movement_on_ground: None,
             status: SessionStatus::Connecting,
             replay_ring: crate::replay_ring::PacketReplayRing::default(),
             replay_started: Instant::now(),
@@ -5560,7 +5657,14 @@ impl LiveSession {
         self.terrain_dirty = true;
     }
 
+    fn drain_offline_commands(&mut self) {
+        if let Some(rx) = &self.offline_command_receiver {
+            while rx.try_recv().is_ok() {}
+        }
+    }
+
     pub fn send_movement(&mut self, movement: PlayerMovement) {
+        self.drain_offline_commands();
         if !matches!(self.status, SessionStatus::Playing)
             || self.pose.is_none()
             || self.death.is_dead()
@@ -5577,7 +5681,38 @@ impl LiveSession {
         self.pose = Some(movement.pose);
         self.update_audio_listener();
         self.refresh_prefetcher();
-        let _ = self.outgoing.try_send(WorkerCommand::Movement(movement));
+        let on_ground = self.physics_state.on_ground;
+        if self
+            .outgoing
+            .try_send(WorkerCommand::Movement {
+                movement,
+                on_ground,
+            })
+            .is_ok()
+        {
+            self.last_movement_on_ground = Some(on_ground);
+        }
+    }
+
+    /// Advance one frame of server-authoritative survival movement with the
+    /// canonical 20 Hz physics step. This is the stable API the window/input
+    /// lane drives; creative flight and offline camera motion remain available
+    /// through the existing lower-level methods.
+    pub fn step_live_survival_movement(
+        &mut self,
+        dt_secs: f32,
+        input: SurvivalMovementInput,
+    ) -> Option<LocalPhysicsOutput> {
+        self.step_local_player_physics(
+            dt_secs,
+            input.forward,
+            input.strafe,
+            input.jump,
+            input.sneak,
+            input.sprint,
+            input.yaw,
+            input.pitch,
+        )
     }
 
     /// Advance local walking or creative flight at a capped 20 Hz simulation rate.
@@ -5700,7 +5835,7 @@ impl LiveSession {
         } else {
             1.62
         };
-        self.eye_height += (target_eye - self.eye_height) * (1.0 - (-dt * 12.0).exp());
+        self.eye_height = target_eye;
         self.send_movement(PlayerMovement {
             pose,
             strafe,
@@ -5924,84 +6059,137 @@ impl LiveSession {
     }
 
     pub fn begin_mining(&mut self, pos: [i32; 3], face: i8) {
+        if self.mining.target == Some((pos, face)) && !self.mining.complete {
+            return;
+        }
         self.cancel_mining();
         self.dig_start(pos, face);
-        let name = self.block_name_at(pos);
         if self.hud.game_mode == 1 {
             self.dig_finish(pos, face);
             self.mining.cooldown = 0.25;
             self.trigger_arm_swing();
             return;
         }
-        let block = block_state_base_name(&name)
-            .rsplit(':')
-            .next()
-            .unwrap_or(&name);
-        let base = if block == "bedrock" || block == "barrier" || block == "end_portal_frame" {
-            f32::INFINITY
-        } else if block.contains("obsidian") {
-            10.0
-        } else if block.contains("stone") || block.contains("ore") || block.contains("deepslate") {
-            2.5
-        } else if block.contains("log") || block.contains("wood") || block.contains("planks") {
-            2.0
-        } else if block.contains("dirt") || block.contains("sand") || block.contains("gravel") {
-            0.6
-        } else if block.contains("leaves")
-            || block.contains("grass")
-            || block.contains("flower")
-            || block.contains("torch")
-        {
-            0.18
-        } else {
-            1.5
-        };
+        let name = self.block_name_at(pos);
+        let mining_meta = vanilla_block_mining_meta(&name);
+        let hardness = mining_meta.hardness;
+        if hardness == 0.0 && mining_meta.diggable {
+            // Instantly fragile blocks (torches, flowers, grass) are broken by
+            // the server on START; vanilla does not emit a redundant STOP.
+            self.mining = MiningState {
+                target: Some((pos, face)),
+                progress: 1.0,
+                duration: 0.0,
+                cooldown: 0.0,
+                swing_timer: 0.0,
+                complete: true,
+                state_id: self.world.get_block_state(pos[0], pos[1], pos[2]),
+            };
+            self.trigger_arm_swing();
+            return;
+        }
+        if hardness < 0.0 || !hardness.is_finite() || !mining_meta.diggable {
+            self.mining = MiningState {
+                target: Some((pos, face)),
+                duration: f32::INFINITY,
+                state_id: self.world.get_block_state(pos[0], pos[1], pos[2]),
+                ..MiningState::default()
+            };
+            return;
+        }
         let hotbar_slot = 36 + self.hud.selected_slot as i32;
-        let tool = self
-            .player_inventory
-            .get(&hotbar_slot)
+        let stack = self.player_inventory.get(&hotbar_slot);
+        let tool = stack
             .map(|s| crate::recipe_ingest::item_name_for_id(s.item_id as u32))
             .unwrap_or_default();
-        let suitable =
-            (block.contains("stone") || block.contains("ore") || block.contains("obsidian"))
-                && tool.contains("pickaxe")
-                || (block.contains("log") || block.contains("wood") || block.contains("planks"))
-                    && tool.contains("axe")
-                || (block.contains("dirt") || block.contains("sand") || block.contains("gravel"))
-                    && tool.contains("shovel")
-                || block.contains("leaves") && (tool.contains("shears") || tool.contains("hoe"));
-        let tier = if tool.contains("netherite") {
-            8.0
-        } else if tool.contains("diamond") {
-            7.0
-        } else if tool.contains("iron") {
-            6.0
-        } else if tool.contains("stone") {
-            4.0
-        } else if tool.contains("gold") {
-            12.0
-        } else if tool.contains("wooden") {
-            2.0
+        let (tool_kind, tier_speed) = mining_tool_facts(&tool);
+        let required_tool = mining_meta.preferred_tool;
+        // `mineable/<tool>` controls only the speed multiplier; the progress
+        // divisor uses `hasCorrectToolForDrops`. Vanilla blocks without a
+        // harvestTools set are correct bare-handed; otherwise the exact item
+        // bitset generated from the pinned registry decides.
+        let held_bit = stack
+            .map(|stack| vanilla_tool_harvest_bit(stack.item_id))
+            .unwrap_or(0);
+        let correct_tool =
+            mining_meta.harvest_mask == 0 || mining_meta.harvest_mask & held_bit != 0;
+        let effective_tool = required_tool.is_some_and(|required| tool_kind == Some(required));
+        let can_harvest = correct_tool;
+        let mut speed = mining_item_destroy_speed(
+            &tool,
+            &name,
+            required_tool,
+            tool_kind,
+            tier_speed,
+            effective_tool,
+        );
+        if speed > 1.0 {
+            let efficiency = stack
+                .map(|stack| item_enchantment_level(stack, EFFICIENCY_ENCHANTMENT_ID))
+                .unwrap_or(0);
+            if efficiency > 0 {
+                speed += (efficiency * efficiency + 1) as f32;
+            }
+        }
+        let mut effect_multiplier = 1.0f32;
+        if let Some(eid) = self.player_entity_id {
+            if let Some(effects) = self.mob_effects.get(&eid) {
+                let haste = effects.get(&2).map(|effect| effect.amplifier).unwrap_or(-1);
+                let conduit = effects
+                    .get(&28)
+                    .map(|effect| effect.amplifier)
+                    .unwrap_or(-1);
+                let best_haste = haste.max(conduit);
+                if best_haste >= 0 {
+                    effect_multiplier *= 1.0 + 0.2 * (best_haste + 1) as f32;
+                }
+                if let Some(fatigue) = effects.get(&3) {
+                    effect_multiplier *= [0.3, 0.09, 0.0027, 0.00081]
+                        .get(usize::try_from(fatigue.amplifier).unwrap_or(3).min(3))
+                        .copied()
+                        .unwrap_or(0.00081);
+                }
+            }
+        }
+        speed *= effect_multiplier;
+        if self.physics_state.eye_in_water {
+            let helmet = self.player_inventory.get(&5);
+            let aqua = helmet
+                .map(|stack| item_enchantment_level(stack, AQUA_AFFINITY_ENCHANTMENT_ID))
+                .unwrap_or(0);
+            if aqua == 0 {
+                speed *= 0.2;
+            }
+        }
+        if !self.physics_state.on_ground {
+            speed *= 0.2;
+        }
+        // Vanilla accumulates progress in whole 20 Hz ticks and therefore
+        // rounds fractional break times up (`ceil` in `ticks_to_break`).
+        // Obsidian with a diamond pickaxe is 188 ticks / 9.4 seconds, not
+        // the continuous 187.5-tick ratio.
+        let ticks = megu_core::break_progress::ticks_to_break(hardness, can_harvest, speed);
+        let duration = if ticks == u32::MAX {
+            f32::INFINITY
         } else {
-            1.0
-        };
-        let speed = if suitable { tier } else { 1.0 };
-        let penalty = if self.physics_state.on_ground {
-            1.0
-        } else {
-            5.0
-        } * if self.physics_state.eye_in_water {
-            5.0
-        } else {
-            1.0
+            ticks as f32 / 20.0
         };
         self.mining = MiningState {
             target: Some((pos, face)),
             progress: 0.0,
-            duration: base * penalty / speed,
+            duration,
             cooldown: 0.0,
             swing_timer: 0.0,
+            complete: false,
+            state_id: self.world.get_block_state(pos[0], pos[1], pos[2]),
         };
+        // Vanilla instant-break blocks complete inside the first tick and do
+        // not produce a client STOP packet; the server accepts START as the
+        // break action itself.
+        if megu_core::break_progress::instant_break(speed, hardness, can_harvest) {
+            self.mining.progress = 1.0;
+            self.mining.complete = true;
+        }
     }
 
     pub fn tick_mining(&mut self, dt_secs: f32, current_target: Option<([i32; 3], i8)>) -> bool {
@@ -6014,18 +6202,35 @@ impl LiveSession {
         }
         if let Some(target) = self.mining.target {
             if current_target != Some(target) {
-                self.dig_abort(target.0, target.1);
+                if !self.mining.complete {
+                    self.dig_abort(target.0, target.1);
+                }
                 self.mining = MiningState::default();
                 if let Some((pos, face)) = current_target {
                     self.begin_mining(pos, face);
                 }
                 return false;
             }
+            // Any authoritative block mutation closes this exact attempt, even
+            // when the coordinates stay constant. In particular a completed
+            // dig waits for that mutation instead of restarting early.
+            let state = self
+                .world
+                .get_block_state(target.0[0], target.0[1], target.0[2]);
+            if state != self.mining.state_id || state.is_none() {
+                self.mining = MiningState::default();
+                return false;
+            }
+            if state == Some(0) {
+                self.mining = MiningState::default();
+                return false;
+            }
         } else if let Some((pos, face)) = current_target {
             self.begin_mining(pos, face);
             return false;
         }
-        if self.mining.target.is_none() || !self.mining.duration.is_finite() {
+        if self.mining.target.is_none() || self.mining.complete || !self.mining.duration.is_finite()
+        {
             return false;
         }
         self.mining.progress += dt_secs / self.mining.duration.max(0.05);
@@ -6039,10 +6244,8 @@ impl LiveSession {
                 return false;
             };
             self.dig_finish(pos, face);
-            self.mining = MiningState {
-                cooldown: 0.25,
-                ..MiningState::default()
-            };
+            self.mining.progress = 1.0;
+            self.mining.complete = true;
             return true;
         }
         false
@@ -6050,14 +6253,18 @@ impl LiveSession {
 
     pub fn cancel_mining(&mut self) {
         if let Some((pos, face)) = self.mining.target {
-            self.dig_abort(pos, face);
+            if !self.mining.complete {
+                self.dig_abort(pos, face);
+            }
         }
         self.mining = MiningState::default();
     }
 
     pub fn active_block_break_overlay(&self) -> Option<([i32; 3], u8)> {
         if let Some((pos, _)) = self.mining.target {
-            return Some((pos, (self.mining.progress.clamp(0.0, 0.999) * 10.0) as u8));
+            if !self.mining.complete {
+                return Some((pos, (self.mining.progress.clamp(0.0, 0.999) * 10.0) as u8));
+            }
         }
         self.remote_block_destruction.values().next_back().copied()
     }
@@ -6535,6 +6742,25 @@ impl LiveSession {
         }
     }
 
+    /// End-credits completion: Protocol 767 uses the same `client_command`
+    /// action (`PERFORM_RESPAWN = 0`) as death respawn, but vanilla sends it
+    /// while the player is still alive when the credits close or when the
+    /// server emits `WIN_GAME` with value `0`. It is intentionally independent
+    /// of [`DeathLoopState`]'s death guard and remains retryable.
+    pub fn send_end_credits_complete(&mut self) -> bool {
+        if !matches!(self.status, SessionStatus::Playing) {
+            return false;
+        }
+        let accepted = self
+            .outgoing
+            .try_send(WorkerCommand::ClientCommand { action: 0 })
+            .is_ok();
+        if accepted {
+            self.pending_end_credits = false;
+        }
+        accepted
+    }
+
     /// `container_click` — one window transaction; `changed`/`carried` are
     /// raw `Slot` wire blobs (build simple stacks via
     /// `megu_client::protocol::encode_slot_stack`).
@@ -6911,7 +7137,11 @@ impl LiveSession {
     /// just the id/distance pair.
     fn crosshair_entity_hit(&self) -> Option<EntityRayHit> {
         let pose = self.pose?;
-        let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
+        let eye = [
+            pose.feet[0],
+            pose.feet[1] + f64::from(self.eye_height),
+            pose.feet[2],
+        ];
         let yaw = f64::from(pose.yaw).to_radians();
         let pitch = f64::from(pose.pitch).to_radians();
         let direction = [
@@ -6948,11 +7178,11 @@ impl LiveSession {
         raycast_entities(eye, direction, 4.5, &targets)
     }
 
-    /// Block under the crosshair ray (`raycast_blocks`, vanilla 4.5-block
-    /// reach, no fluid hits) — feeds the looking-at overlay alongside
-    /// `crosshair_entity`. Non-air voxels present a full-cube selection
-    /// shape; the face/distance stay honest while exact per-block outline
-    /// shapes are out of scope.
+    /// Block under the crosshair ray (`raycast_blocks`) using the live pose's
+    /// eye height, per-state selection geometry from the block-shape table,
+    /// and bucket-aware source-fluid clipping. Shaped blocks therefore expose
+    /// their empty space correctly — for example a ray through the empty upper
+    /// half of a bottom slab continues to the block behind it.
     pub fn crosshair_block(&self) -> Option<([i32; 3], f64)> {
         self.crosshair_block_hit()
             .map(|hit| (hit.block_pos, hit.distance))
@@ -6963,7 +7193,11 @@ impl LiveSession {
     /// cursor-in-block detail too.
     fn crosshair_block_hit(&self) -> Option<RayHit> {
         let pose = self.pose?;
-        let eye = [pose.feet[0], pose.feet[1] + 1.62, pose.feet[2]];
+        let eye = [
+            pose.feet[0],
+            pose.feet[1] + f64::from(self.eye_height),
+            pose.feet[2],
+        ];
         let yaw = f64::from(pose.yaw).to_radians();
         let pitch = f64::from(pose.pitch).to_radians();
         let direction = [
@@ -6971,23 +7205,73 @@ impl LiveSession {
             -pitch.sin(),
             yaw.cos() * pitch.cos(),
         ];
-        raycast_blocks(
-            eye,
-            direction,
-            4.5,
-            FluidClipMode::None,
-            |x, y, z| match self.world.get_block_state(x, y, z) {
+        let reach = if self.hud.game_mode == 1 { 5.0 } else { 4.5 };
+        let fluid_mode = self.selection_fluid_clip_mode();
+        raycast_blocks(eye, direction, reach, fluid_mode, |x, y, z| {
+            match self.world.get_block_state(x, y, z) {
                 Some(0) | None => RayBlockShapes::default(),
-                Some(_) => RayBlockShapes {
-                    boxes: vec![Aabb {
-                        min: [0.0; 3],
-                        max: [1.0; 3],
-                    }],
-                    is_fluid: false,
-                    is_fluid_source: false,
-                },
-            },
-        )
+                Some(state) => {
+                    let mut world_boxes = Vec::new();
+                    self.world
+                        .blocks
+                        .push_collision_aabbs(state, x, y, z, &mut world_boxes);
+                    let mut boxes: Vec<Aabb> = world_boxes
+                        .into_iter()
+                        .filter_map(|bounds| {
+                            // Collision bounds can exceed the voxel vertically
+                            // (notably fences/walls). Selection outlines remain
+                            // clipped to the voxel cell even when the collision
+                            // shape extends upward for entity movement.
+                            let min = [
+                                bounds.min[0] - f64::from(x),
+                                bounds.min[1] - f64::from(y),
+                                bounds.min[2] - f64::from(z),
+                            ];
+                            let max = [
+                                bounds.max[0] - f64::from(x),
+                                bounds.max[1] - f64::from(y),
+                                bounds.max[2] - f64::from(z),
+                            ];
+                            let min = min.map(|v| v.clamp(0.0, 1.0));
+                            let max = max.map(|v| v.clamp(0.0, 1.0));
+                            (min[0] < max[0] && min[1] < max[1] && min[2] < max[2])
+                                .then_some(Aabb { min, max })
+                        })
+                        .collect();
+                    if boxes.is_empty() {
+                        boxes = selection_fallback_boxes(
+                            state_block_name(&self.world, self.mod_registry.as_ref(), state)
+                                .unwrap_or(""),
+                        );
+                    }
+                    let fluid = self.world.fluid_cell_at(x, y, z);
+                    RayBlockShapes {
+                        boxes,
+                        is_fluid: fluid.kind.is_some(),
+                        is_fluid_source: fluid.kind.is_some()
+                            && fluid.amount == 8
+                            && !fluid.falling,
+                    }
+                }
+            }
+        })
+    }
+
+    /// Vanilla fluid clipping for the held item: empty buckets target liquid
+    /// source cells; ordinary blocks/tools ignore fluids. Filled buckets and
+    /// milk do not re-pick their liquid.
+    fn selection_fluid_clip_mode(&self) -> FluidClipMode {
+        let hotbar_slot = 36 + self.hud.selected_slot as i32;
+        let Some(stack) = self.player_inventory.get(&hotbar_slot) else {
+            return FluidClipMode::None;
+        };
+        let item = crate::recipe_ingest::item_name_for_id(stack.item_id as u32);
+        let path = item.rsplit(':').next().unwrap_or(&item);
+        if path == "bucket" {
+            FluidClipMode::SourceOnly
+        } else {
+            FluidClipMode::None
+        }
     }
 
     /// Refresh the crosshair targets plus the `qol_gameplay`
@@ -7411,9 +7695,85 @@ impl LiveSession {
         }
     }
 
+    /// Component-preserving hotbar snapshot parallel to the legacy
+    /// string-only [`HudState::hotbar`]. Slots follow window-0 indices 36..45.
+    pub fn live_hotbar_snapshot(&self) -> [Option<LiveHotbarStack>; 9] {
+        std::array::from_fn(|index| {
+            self.player_inventory
+                .get(&(36 + index as i32))
+                .and_then(live_stack_summary)
+        })
+    }
+
+    /// Component-preserving offhand stack summary (window-0 slot 45).
+    pub fn live_offhand_snapshot(&self) -> Option<LiveHotbarStack> {
+        self.player_inventory.get(&45).and_then(live_stack_summary)
+    }
+
+    /// Typed boss-bar rows with title/fill plus color, division and flags.
+    pub fn live_bossbar_snapshot(&self) -> Vec<LiveBossBarView> {
+        self.boss_bars
+            .values()
+            .map(|bar| LiveBossBarView {
+                title: bar.title.clone(),
+                health: bar.health.clamp(0.0, 1.0),
+                color: bar.color,
+                divisions: bar.divisions,
+                flags: bar.flags,
+            })
+            .collect()
+    }
+
+    /// Typed local-player status effects, preserving duration, amplifier,
+    /// ambient/particle/icon flags, and beneficial classification.
+    pub fn live_status_effect_snapshot(&self) -> Vec<LiveStatusEffectView> {
+        let Some(eid) = self.player_entity_id else {
+            return Vec::new();
+        };
+        self.mob_effects
+            .get(&eid)
+            .into_iter()
+            .flat_map(|effects| effects.iter())
+            .map(|(id, effect)| LiveStatusEffectView {
+                effect_id: *id,
+                name: status_effect_name(*id).to_string(),
+                amplifier: effect.amplifier,
+                duration_ticks: effect.duration,
+                ambient: effect.flags & 0x01 != 0,
+                show_particles: effect.flags & 0x02 != 0,
+                show_icon: effect.flags & 0x04 != 0,
+                beneficial: matches!(
+                    *id,
+                    0 | 2
+                        | 4
+                        | 5
+                        | 7
+                        | 9
+                        | 10
+                        | 11
+                        | 12
+                        | 13
+                        | 15
+                        | 20
+                        | 21
+                        | 22
+                        | 25
+                        | 27
+                        | 28
+                        | 29
+                        | 31
+                ),
+            })
+            .collect()
+    }
+
     /// Snapshot the server-driven HUD channels for `GpuApp::sync_live_hud`.
     pub fn hud_feed(&self) -> LiveHudFeed {
         LiveHudFeed {
+            hotbar_stacks: self.live_hotbar_snapshot(),
+            offhand_stack: self.live_offhand_snapshot(),
+            bossbars: self.live_bossbar_snapshot(),
+            status_effects: self.live_status_effect_snapshot(),
             scoreboard: self.scoreboard.clone(),
             title_revision: self.title_revision,
             title_times: self.title_times,
@@ -8699,6 +9059,17 @@ impl LiveSession {
                 self.pose = Some(pose);
                 self.camera_sync = Some(pose);
                 self.physics_state.pos = pose.feet;
+                self.physics_state.vel = [0.0; 3];
+                self.physics_state.on_ground = false;
+                self.physics_state.in_water = false;
+                self.physics_state.in_lava = false;
+                self.physics_state.eye_in_water = false;
+                self.physics_state.swimming = false;
+                self.physics_state.fall_distance = 0.0;
+                self.physics_accumulator = 0.0;
+                self.was_on_ground = false;
+                self.was_submerged = false;
+                self.fall_velocity_y = 0.0;
                 self.update_audio_listener();
                 self.refresh_prefetcher();
             }
@@ -8812,10 +9183,12 @@ impl LiveSession {
                 menu_type,
                 title_nbt,
             } => {
+                let title_text = nbt_text(&title_nbt);
                 self.open_screen = Some(LiveOpenScreen {
                     window_id,
                     menu_type,
                     title_nbt,
+                    title_text,
                     state_id: 0,
                     slots: BTreeMap::new(),
                     carried: None,
@@ -9266,6 +9639,9 @@ impl LiveSession {
                         raw_payload: Vec::new(),
                         title: String::new(),
                         health: 1.0,
+                        color: 0,
+                        divisions: 0,
+                        flags: 0,
                     });
                     bar.action = action;
                     decode_boss_event_payload(bar, &raw_payload);
@@ -9642,7 +10018,7 @@ impl LiveSession {
                 // the End Credits screen (respawn triggers on close/finish).
                 if value == 0.0 {
                     self.pending_end_credits = false;
-                    self.request_respawn();
+                    self.send_end_credits_complete();
                 } else {
                     self.pending_end_credits = true;
                 }
@@ -10365,7 +10741,7 @@ fn run_connection(
     if tx.send(WorkerMessage::Connected).is_err() {
         return Ok(());
     }
-    let mut last_input = None;
+    let mut last_input: Option<(PlayerMovement, bool)> = None;
     let mut last_send = Instant::now();
     // The protocol loop must never block on render-thread backpressure:
     // keep-alive and chunk-batch acknowledgements are written at read time,
@@ -10404,7 +10780,12 @@ fn run_connection(
         }
         loop {
             match rx.try_recv() {
-                Ok(WorkerCommand::Movement(movement)) => last_input = Some(movement),
+                Ok(WorkerCommand::Movement {
+                    movement,
+                    on_ground,
+                }) => {
+                    last_input = Some((movement, on_ground));
+                }
                 Ok(WorkerCommand::Chat(message)) => {
                     client.send_chat_message(&message)?;
                 }
@@ -10565,7 +10946,7 @@ fn run_connection(
             }
         }
         if last_send.elapsed() >= Duration::from_millis(50) {
-            if let Some(input) = last_input {
+            if let Some((input, on_ground)) = last_input {
                 let pose = input.pose;
                 client.send_player_position_rotation(
                     pose.feet[0],
@@ -10573,7 +10954,7 @@ fn run_connection(
                     pose.feet[2],
                     pose.yaw,
                     pose.pitch,
-                    false,
+                    on_ground,
                 )?;
                 client.send_player_input(input.strafe, input.forward, input.jump, input.sneak)?;
             }
@@ -10599,7 +10980,7 @@ fn run_connection(
                 client.send_chunk_batch_received(count.clamp(1, 10) as f32)?;
             }
             Some(ClientPlayEvent::Play(PlayEvent::Teleport(ref teleport))) => {
-                let previous_pose = last_input.map(|movement: PlayerMovement| movement.pose);
+                let previous_pose = last_input.map(|(movement, _)| movement.pose);
                 let pose = PlayerPose::from_teleport(teleport, previous_pose);
                 client.send_accept_teleportation(
                     teleport.teleport_id,
@@ -10614,13 +10995,16 @@ fn run_connection(
                         teleport.clone(),
                     ))),
                 )?;
-                last_input = Some(PlayerMovement {
-                    pose,
-                    strafe: 0.0,
-                    forward: 0.0,
-                    jump: false,
-                    sneak: false,
-                });
+                last_input = Some((
+                    PlayerMovement {
+                        pose,
+                        strafe: 0.0,
+                        forward: 0.0,
+                        jump: false,
+                        sneak: false,
+                    },
+                    last_input.map(|(_, on_ground)| on_ground).unwrap_or(false),
+                ));
             }
             Some(ClientPlayEvent::Play(PlayEvent::Disconnect(reason))) => return Err(reason),
             Some(event) => enqueue(&mut pending, WorkerMessage::Play(event))?,
@@ -11026,33 +11410,41 @@ fn uuid_label(uuid: &[u8; 16]) -> String {
 /// action payload (add = title component + f32 health + color +
 /// division + flags; update-health = f32; update-name = component).
 fn decode_boss_event_payload(bar: &mut LiveBossBar, payload: &[u8]) {
-    let mut r = WireReader::new(payload);
-    match bar.action {
-        0 => {
-            if let Some(title) = r.read_nbt().ok().and_then(|nbt| {
-                let text = nbt.extract_text();
-                (!text.is_empty()).then_some(text)
-            }) {
+    let Ok(decoded) = decode_boss_bar_action(bar.action, payload) else {
+        return;
+    };
+    match decoded {
+        DecodedBossBarAction::Add {
+            name_nbt,
+            progress,
+            color,
+            divisions,
+            flags,
+        } => {
+            if let Some(title) = nbt_text(&name_nbt) {
                 bar.title = title;
             }
-            if let Ok(health) = r.read_f32() {
-                bar.health = health.clamp(0.0, 1.0);
-            }
+            bar.health = progress.clamp(0.0, 1.0);
+            bar.color = color;
+            bar.divisions = divisions;
+            bar.flags = flags;
         }
-        2 => {
-            if let Ok(health) = r.read_f32() {
-                bar.health = health.clamp(0.0, 1.0);
-            }
+        DecodedBossBarAction::Remove => {}
+        DecodedBossBarAction::UpdateProgress(progress) => {
+            bar.health = progress.clamp(0.0, 1.0);
         }
-        3 => {
-            if let Some(title) = r.read_nbt().ok().and_then(|nbt| {
-                let text = nbt.extract_text();
-                (!text.is_empty()).then_some(text)
-            }) {
+        DecodedBossBarAction::UpdateName(name_nbt) => {
+            if let Some(title) = nbt_text(&name_nbt) {
                 bar.title = title;
             }
         }
-        _ => {}
+        DecodedBossBarAction::UpdateStyle { color, divisions } => {
+            bar.color = color;
+            bar.divisions = divisions;
+        }
+        DecodedBossBarAction::UpdateFlags(flags) => {
+            bar.flags = flags;
+        }
     }
 }
 
@@ -11173,6 +11565,1433 @@ const fn ducb_submit_cap(arm: usize) -> usize {
         2 => OFFTHREAD_SUBMIT_MAX * 2,
         _ => OFFTHREAD_SUBMIT_MAX * 4,
     }
+}
+
+/// Selection-only fallback shapes for non-colliding small blocks. Ordinary
+/// solid/shaped blocks use the registry table's geometry; these cover the
+/// plant/torch cases whose collision boxes are intentionally empty.
+fn selection_fallback_boxes(block_path: &str) -> Vec<Aabb> {
+    let path = block_state_base_name(block_path)
+        .rsplit(':')
+        .next()
+        .unwrap_or(block_path);
+    let one = |min: [f64; 3], max: [f64; 3]| Aabb { min, max };
+    if path.contains("torch") {
+        return vec![one(
+            [7.0 / 16.0, 0.0, 7.0 / 16.0],
+            [9.0 / 16.0, 10.0 / 16.0, 9.0 / 16.0],
+        )];
+    }
+    if path.contains("flower")
+        || path.contains("sapling")
+        || path.contains("mushroom")
+        || path.contains("fungus")
+        || path.contains("roots")
+        || path.contains("short_grass")
+        || path == "fern"
+    {
+        return vec![one(
+            [5.0 / 16.0, 0.0, 5.0 / 16.0],
+            [11.0 / 16.0, 10.0 / 16.0, 11.0 / 16.0],
+        )];
+    }
+    Vec::new()
+}
+
+/// Pinned Minecraft 1.21.1 block mining metadata generated from
+/// `assets/blocks_1211.json`: `name|hardness|material|harvest-item-bitmask|diggable`.
+/// Bits 0..29 are vanilla tool item ids 818..847; bit 40 is shears (983).
+const VANILLA_BLOCK_MINING_ROWS: &str = r#"acacia_button|0.5|mineable/axe|0|1
+acacia_door|3|mineable/axe|0|1
+acacia_fence|2|mineable/axe|0|1
+acacia_fence_gate|2|mineable/axe|0|1
+acacia_hanging_sign|1|mineable/axe|0|1
+acacia_leaves|0.2|leaves;mineable/hoe|0|1
+acacia_log|2|mineable/axe|0|1
+acacia_planks|2|mineable/axe|0|1
+acacia_pressure_plate|0.5|mineable/axe|0|1
+acacia_sapling|0|plant;mineable/axe|0|1
+acacia_sign|1|mineable/axe|0|1
+acacia_slab|2|mineable/axe|0|1
+acacia_stairs|2|mineable/axe|0|1
+acacia_trapdoor|3|mineable/axe|0|1
+acacia_wall_hanging_sign|1|mineable/axe|0|1
+acacia_wall_sign|1|mineable/axe|0|1
+acacia_wood|2|mineable/axe|0|1
+activator_rail|0.7|mineable/pickaxe|0|1
+air|0|default|0|0
+allium|0|plant|0|1
+amethyst_block|1.5|mineable/pickaxe|8421084|1
+amethyst_cluster|1.5|mineable/pickaxe|0|1
+ancient_debris|30|incorrect_for_wooden_tool|8400000|1
+andesite|1.5|mineable/pickaxe|8421084|1
+andesite_slab|1.5|mineable/pickaxe|8421084|1
+andesite_stairs|1.5|mineable/pickaxe|8421084|1
+andesite_wall|1.5|mineable/pickaxe|8421084|1
+anvil|5|mineable/pickaxe|8421084|1
+attached_melon_stem|0|plant;mineable/axe|0|1
+attached_pumpkin_stem|0|plant;mineable/axe|0|1
+azalea|0|plant;mineable/axe|0|1
+azalea_leaves|0.2|leaves;mineable/hoe|0|1
+azure_bluet|0|plant|0|1
+bamboo|1|mineable/axe|0|1
+bamboo_block|2|mineable/axe|0|1
+bamboo_button|0.5|mineable/axe|0|1
+bamboo_door|3|mineable/axe|0|1
+bamboo_fence|2|mineable/axe|0|1
+bamboo_fence_gate|2|mineable/axe|0|1
+bamboo_hanging_sign|1|mineable/axe|0|1
+bamboo_mosaic|2|mineable/axe|0|1
+bamboo_mosaic_slab|2|mineable/axe|0|1
+bamboo_mosaic_stairs|2|mineable/axe|0|1
+bamboo_planks|2|mineable/axe|0|1
+bamboo_pressure_plate|0.5|mineable/axe|0|1
+bamboo_sapling|1|default|0|1
+bamboo_sign|1|mineable/axe|0|1
+bamboo_slab|2|mineable/axe|0|1
+bamboo_stairs|2|mineable/axe|0|1
+bamboo_trapdoor|3|mineable/axe|0|1
+bamboo_wall_hanging_sign|1|mineable/axe|0|1
+bamboo_wall_sign|1|mineable/axe|0|1
+barrel|2.5|mineable/axe|0|1
+barrier|-1|default|0|0
+basalt|1.25|mineable/pickaxe|8421084|1
+beacon|3|default|0|1
+bedrock|-1|default|0|0
+bee_nest|0.3|mineable/axe|0|1
+beehive|0.6|mineable/axe|0|1
+beetroots|0|plant;mineable/axe|0|1
+bell|5|mineable/pickaxe|8421084|1
+big_dripleaf|0.1|plant;mineable/axe|0|1
+big_dripleaf_stem|0.1|plant;mineable/axe|0|1
+birch_button|0.5|mineable/axe|0|1
+birch_door|3|mineable/axe|0|1
+birch_fence|2|mineable/axe|0|1
+birch_fence_gate|2|mineable/axe|0|1
+birch_hanging_sign|1|mineable/axe|0|1
+birch_leaves|0.2|leaves;mineable/hoe|0|1
+birch_log|2|mineable/axe|0|1
+birch_planks|2|mineable/axe|0|1
+birch_pressure_plate|0.5|mineable/axe|0|1
+birch_sapling|0|plant;mineable/axe|0|1
+birch_sign|1|mineable/axe|0|1
+birch_slab|2|mineable/axe|0|1
+birch_stairs|2|mineable/axe|0|1
+birch_trapdoor|3|mineable/axe|0|1
+birch_wall_hanging_sign|1|mineable/axe|0|1
+birch_wall_sign|1|mineable/axe|0|1
+birch_wood|2|mineable/axe|0|1
+black_banner|1|mineable/axe|0|1
+black_bed|0.2|default|0|1
+black_candle|0.1|default|0|1
+black_candle_cake|0.5|default|0|1
+black_carpet|0.1|default|0|1
+black_concrete|1.8|mineable/pickaxe|8421084|1
+black_concrete_powder|0.5|mineable/shovel|0|1
+black_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+black_shulker_box|2|mineable/pickaxe|0|1
+black_stained_glass|0.3|default|0|1
+black_stained_glass_pane|0.3|default|0|1
+black_terracotta|1.25|mineable/pickaxe|8421084|1
+black_wall_banner|1|mineable/axe|0|1
+black_wool|0.8|wool|0|1
+blackstone|1.5|mineable/pickaxe|8421084|1
+blackstone_slab|2|mineable/pickaxe|8421084|1
+blackstone_stairs|1.5|mineable/pickaxe|8421084|1
+blackstone_wall|1.5|mineable/pickaxe|8421084|1
+blast_furnace|3.5|mineable/pickaxe|8421084|1
+blue_banner|1|mineable/axe|0|1
+blue_bed|0.2|default|0|1
+blue_candle|0.1|default|0|1
+blue_candle_cake|0.5|default|0|1
+blue_carpet|0.1|default|0|1
+blue_concrete|1.8|mineable/pickaxe|8421084|1
+blue_concrete_powder|0.5|mineable/shovel|0|1
+blue_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+blue_ice|2.8|mineable/pickaxe|0|1
+blue_orchid|0|plant|0|1
+blue_shulker_box|2|mineable/pickaxe|0|1
+blue_stained_glass|0.3|default|0|1
+blue_stained_glass_pane|0.3|default|0|1
+blue_terracotta|1.25|mineable/pickaxe|8421084|1
+blue_wall_banner|1|mineable/axe|0|1
+blue_wool|0.8|wool|0|1
+bone_block|2|mineable/pickaxe|8421084|1
+bookshelf|1.5|mineable/axe|0|1
+brain_coral|0|default|0|1
+brain_coral_block|1.5|mineable/pickaxe|8421084|1
+brain_coral_fan|0|default|0|1
+brain_coral_wall_fan|0|default|0|1
+brewing_stand|0.5|mineable/pickaxe|8421084|1
+brick_slab|2|mineable/pickaxe|8421084|1
+brick_stairs|2|mineable/pickaxe|8421084|1
+brick_wall|2|mineable/pickaxe|8421084|1
+bricks|2|mineable/pickaxe|8421084|1
+brown_banner|1|mineable/axe|0|1
+brown_bed|0.2|default|0|1
+brown_candle|0.1|default|0|1
+brown_candle_cake|0.5|default|0|1
+brown_carpet|0.1|default|0|1
+brown_concrete|1.8|mineable/pickaxe|8421084|1
+brown_concrete_powder|0.5|mineable/shovel|0|1
+brown_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+brown_mushroom|0|plant;mineable/axe|0|1
+brown_mushroom_block|0.2|mineable/axe|0|1
+brown_shulker_box|2|mineable/pickaxe|0|1
+brown_stained_glass|0.3|default|0|1
+brown_stained_glass_pane|0.3|default|0|1
+brown_terracotta|1.25|mineable/pickaxe|8421084|1
+brown_wall_banner|1|mineable/axe|0|1
+brown_wool|0.8|wool|0|1
+bubble_column|0|default|0|1
+bubble_coral|0|default|0|1
+bubble_coral_block|1.5|mineable/pickaxe|8421084|1
+bubble_coral_fan|0|default|0|1
+bubble_coral_wall_fan|0|default|0|1
+budding_amethyst|1.5|mineable/pickaxe|8421084|1
+cactus|0.4|default|0|1
+cake|0.5|default|0|1
+calcite|0.75|mineable/pickaxe|8421084|1
+calibrated_sculk_sensor|1.5|mineable/hoe|0|1
+campfire|2|mineable/axe|0|1
+candle|0.1|default|0|1
+candle_cake|0.5|default|0|1
+carrots|0|plant;mineable/axe|0|1
+cartography_table|2.5|mineable/axe|0|1
+carved_pumpkin|1|plant;mineable/axe|0|1
+cauldron|2|mineable/pickaxe|8421084|1
+cave_air|0|default|0|0
+cave_vines|0|plant;mineable/axe|0|1
+cave_vines_plant|0|plant;mineable/axe|0|1
+chain|5|mineable/pickaxe|8421084|1
+chain_command_block|-1|default|0|0
+cherry_button|0.5|mineable/axe|0|1
+cherry_door|3|mineable/axe|0|1
+cherry_fence|2|mineable/axe|0|1
+cherry_fence_gate|2|mineable/axe|0|1
+cherry_hanging_sign|1|mineable/axe|0|1
+cherry_leaves|0.2|leaves;mineable/hoe|0|1
+cherry_log|2|mineable/axe|0|1
+cherry_planks|2|mineable/axe|0|1
+cherry_pressure_plate|0.5|mineable/axe|0|1
+cherry_sapling|0|plant;mineable/axe|0|1
+cherry_sign|1|mineable/axe|0|1
+cherry_slab|2|mineable/axe|0|1
+cherry_stairs|2|mineable/axe|0|1
+cherry_trapdoor|3|mineable/axe|0|1
+cherry_wall_hanging_sign|1|mineable/axe|0|1
+cherry_wall_sign|1|mineable/axe|0|1
+cherry_wood|2|mineable/axe|0|1
+chest|2.5|mineable/axe|0|1
+chipped_anvil|5|mineable/pickaxe|8421084|1
+chiseled_bookshelf|1.5|mineable/axe|0|1
+chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+chiseled_deepslate|3.5|mineable/pickaxe|8421084|1
+chiseled_nether_bricks|2|mineable/pickaxe|8421084|1
+chiseled_polished_blackstone|1.5|mineable/pickaxe|8421084|1
+chiseled_quartz_block|0.8|mineable/pickaxe|8421084|1
+chiseled_red_sandstone|0.8|mineable/pickaxe|8421084|1
+chiseled_sandstone|0.8|mineable/pickaxe|8421084|1
+chiseled_stone_bricks|1.5|mineable/pickaxe|8421084|1
+chiseled_tuff|1.5|mineable/pickaxe|8421084|1
+chiseled_tuff_bricks|1.5|mineable/pickaxe|8421084|1
+chorus_flower|0.4|plant;mineable/axe|0|1
+chorus_plant|0.4|plant;mineable/axe|0|1
+clay|0.6|mineable/shovel|0|1
+coal_block|5|mineable/pickaxe|8421084|1
+coal_ore|3|mineable/pickaxe|8421084|1
+coarse_dirt|0.5|mineable/shovel|0|1
+cobbled_deepslate|3.5|mineable/pickaxe|8421084|1
+cobbled_deepslate_slab|3.5|mineable/pickaxe|8421084|1
+cobbled_deepslate_stairs|3.5|mineable/pickaxe|8421084|1
+cobbled_deepslate_wall|3.5|mineable/pickaxe|8421084|1
+cobblestone|2|mineable/pickaxe|8421084|1
+cobblestone_slab|2|mineable/pickaxe|8421084|1
+cobblestone_stairs|2|mineable/pickaxe|8421084|1
+cobblestone_wall|2|mineable/pickaxe|8421084|1
+cobweb|4|coweb|10002108421|1
+cocoa|0.2|plant;mineable/axe|0|1
+command_block|-1|default|0|0
+comparator|0|default|0|1
+composter|0.6|mineable/axe|0|1
+conduit|3|mineable/pickaxe|0|1
+copper_block|3|incorrect_for_wooden_tool|8420080|1
+copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+copper_door|3|incorrect_for_wooden_tool|8420080|1
+copper_grate|3|incorrect_for_wooden_tool|8420080|1
+copper_ore|3|incorrect_for_wooden_tool|8420080|1
+copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+cornflower|0|plant|0|1
+cracked_deepslate_bricks|3.5|mineable/pickaxe|8421084|1
+cracked_deepslate_tiles|3.5|mineable/pickaxe|8421084|1
+cracked_nether_bricks|2|mineable/pickaxe|8421084|1
+cracked_polished_blackstone_bricks|1.5|mineable/pickaxe|8421084|1
+cracked_stone_bricks|1.5|mineable/pickaxe|8421084|1
+crafter|1.5|incorrect_for_wooden_tool|0|1
+crafting_table|2.5|mineable/axe|0|1
+creeper_head|1|default|0|1
+creeper_wall_head|1|default|0|1
+crimson_button|0.5|mineable/axe|0|1
+crimson_door|3|mineable/axe|0|1
+crimson_fence|2|mineable/axe|0|1
+crimson_fence_gate|2|mineable/axe|0|1
+crimson_fungus|0|plant;mineable/axe|0|1
+crimson_hanging_sign|1|mineable/axe|0|1
+crimson_hyphae|2|mineable/axe|0|1
+crimson_nylium|0.4|mineable/pickaxe|8421084|1
+crimson_planks|2|mineable/axe|0|1
+crimson_pressure_plate|0.5|mineable/axe|0|1
+crimson_roots|0|plant|0|1
+crimson_sign|1|mineable/axe|0|1
+crimson_slab|2|mineable/axe|0|1
+crimson_stairs|2|mineable/axe|0|1
+crimson_stem|2|mineable/axe|0|1
+crimson_trapdoor|3|mineable/axe|0|1
+crimson_wall_hanging_sign|1|mineable/axe|0|1
+crimson_wall_sign|1|mineable/axe|0|1
+crying_obsidian|50|incorrect_for_wooden_tool|8400000|1
+cut_copper|3|incorrect_for_wooden_tool|8420080|1
+cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+cut_red_sandstone|0.8|mineable/pickaxe|8421084|1
+cut_red_sandstone_slab|2|mineable/pickaxe|8421084|1
+cut_sandstone|0.8|mineable/pickaxe|8421084|1
+cut_sandstone_slab|2|mineable/pickaxe|8421084|1
+cyan_banner|1|mineable/axe|0|1
+cyan_bed|0.2|default|0|1
+cyan_candle|0.1|default|0|1
+cyan_candle_cake|0.5|default|0|1
+cyan_carpet|0.1|default|0|1
+cyan_concrete|1.8|mineable/pickaxe|8421084|1
+cyan_concrete_powder|0.5|mineable/shovel|0|1
+cyan_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+cyan_shulker_box|2|mineable/pickaxe|0|1
+cyan_stained_glass|0.3|default|0|1
+cyan_stained_glass_pane|0.3|default|0|1
+cyan_terracotta|1.25|mineable/pickaxe|8421084|1
+cyan_wall_banner|1|mineable/axe|0|1
+cyan_wool|0.8|wool|0|1
+damaged_anvil|5|mineable/pickaxe|8421084|1
+dandelion|0|plant|0|1
+dark_oak_button|0.5|mineable/axe|0|1
+dark_oak_door|3|mineable/axe|0|1
+dark_oak_fence|2|mineable/axe|0|1
+dark_oak_fence_gate|2|mineable/axe|0|1
+dark_oak_hanging_sign|1|mineable/axe|0|1
+dark_oak_leaves|0.2|leaves;mineable/hoe|0|1
+dark_oak_log|2|mineable/axe|0|1
+dark_oak_planks|2|mineable/axe|0|1
+dark_oak_pressure_plate|0.5|mineable/axe|0|1
+dark_oak_sapling|0|plant;mineable/axe|0|1
+dark_oak_sign|1|mineable/axe|0|1
+dark_oak_slab|2|mineable/axe|0|1
+dark_oak_stairs|2|mineable/axe|0|1
+dark_oak_trapdoor|3|mineable/axe|0|1
+dark_oak_wall_hanging_sign|1|mineable/axe|0|1
+dark_oak_wall_sign|1|mineable/axe|0|1
+dark_oak_wood|2|mineable/axe|0|1
+dark_prismarine|1.5|mineable/pickaxe|8421084|1
+dark_prismarine_slab|1.5|mineable/pickaxe|8421084|1
+dark_prismarine_stairs|1.5|mineable/pickaxe|8421084|1
+daylight_detector|0.2|mineable/axe|0|1
+dead_brain_coral|0|mineable/pickaxe|8421084|1
+dead_brain_coral_block|1.5|mineable/pickaxe|8421084|1
+dead_brain_coral_fan|0|mineable/pickaxe|8421084|1
+dead_brain_coral_wall_fan|0|mineable/pickaxe|8421084|1
+dead_bubble_coral|0|mineable/pickaxe|8421084|1
+dead_bubble_coral_block|1.5|mineable/pickaxe|8421084|1
+dead_bubble_coral_fan|0|mineable/pickaxe|8421084|1
+dead_bubble_coral_wall_fan|0|mineable/pickaxe|8421084|1
+dead_bush|0|plant;mineable/axe|0|1
+dead_fire_coral|0|mineable/pickaxe|8421084|1
+dead_fire_coral_block|1.5|mineable/pickaxe|8421084|1
+dead_fire_coral_fan|0|mineable/pickaxe|8421084|1
+dead_fire_coral_wall_fan|0|mineable/pickaxe|8421084|1
+dead_horn_coral|0|mineable/pickaxe|8421084|1
+dead_horn_coral_block|1.5|mineable/pickaxe|8421084|1
+dead_horn_coral_fan|0|mineable/pickaxe|8421084|1
+dead_horn_coral_wall_fan|0|mineable/pickaxe|8421084|1
+dead_tube_coral|0|mineable/pickaxe|8421084|1
+dead_tube_coral_block|1.5|mineable/pickaxe|8421084|1
+dead_tube_coral_fan|0|mineable/pickaxe|8421084|1
+dead_tube_coral_wall_fan|0|mineable/pickaxe|8421084|1
+decorated_pot|0|default|0|1
+deepslate|3|mineable/pickaxe|8421084|1
+deepslate_brick_slab|3.5|mineable/pickaxe|8421084|1
+deepslate_brick_stairs|3.5|mineable/pickaxe|8421084|1
+deepslate_brick_wall|3.5|mineable/pickaxe|8421084|1
+deepslate_bricks|3.5|mineable/pickaxe|8421084|1
+deepslate_coal_ore|4.5|mineable/pickaxe|8421084|1
+deepslate_copper_ore|4.5|incorrect_for_wooden_tool|8420080|1
+deepslate_diamond_ore|4.5|incorrect_for_wooden_tool|8420000|1
+deepslate_emerald_ore|4.5|incorrect_for_wooden_tool|8420000|1
+deepslate_gold_ore|4.5|incorrect_for_wooden_tool|8420000|1
+deepslate_iron_ore|4.5|incorrect_for_wooden_tool|8420080|1
+deepslate_lapis_ore|4.5|incorrect_for_wooden_tool|8420080|1
+deepslate_redstone_ore|4.5|incorrect_for_wooden_tool|8420000|1
+deepslate_tile_slab|3.5|mineable/pickaxe|8421084|1
+deepslate_tile_stairs|3.5|mineable/pickaxe|8421084|1
+deepslate_tile_wall|3.5|mineable/pickaxe|8421084|1
+deepslate_tiles|3.5|mineable/pickaxe|8421084|1
+detector_rail|0.7|mineable/pickaxe|0|1
+diamond_block|5|incorrect_for_wooden_tool|8420000|1
+diamond_ore|3|incorrect_for_wooden_tool|8420000|1
+diorite|1.5|mineable/pickaxe|8421084|1
+diorite_slab|1.5|mineable/pickaxe|8421084|1
+diorite_stairs|1.5|mineable/pickaxe|8421084|1
+diorite_wall|1.5|mineable/pickaxe|8421084|1
+dirt|0.5|mineable/shovel|0|1
+dirt_path|0.65|mineable/shovel|0|1
+dispenser|3.5|mineable/pickaxe|8421084|1
+dragon_egg|3|default|0|1
+dragon_head|1|default|0|1
+dragon_wall_head|1|default|0|1
+dried_kelp_block|0.5|mineable/hoe|0|1
+dripstone_block|1.5|mineable/pickaxe|8421084|1
+dropper|3.5|mineable/pickaxe|8421084|1
+emerald_block|5|incorrect_for_wooden_tool|8420000|1
+emerald_ore|3|incorrect_for_wooden_tool|8420000|1
+enchanting_table|5|mineable/pickaxe|8421084|1
+end_gateway|-1|default|0|0
+end_portal|-1|default|0|0
+end_portal_frame|-1|default|0|0
+end_rod|0|default|0|1
+end_stone|3|mineable/pickaxe|8421084|1
+end_stone_brick_slab|3|mineable/pickaxe|8421084|1
+end_stone_brick_stairs|3|mineable/pickaxe|8421084|1
+end_stone_brick_wall|3|mineable/pickaxe|8421084|1
+end_stone_bricks|3|mineable/pickaxe|8421084|1
+ender_chest|22.5|mineable/pickaxe|8421084|1
+exposed_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+exposed_copper|3|incorrect_for_wooden_tool|8420080|1
+exposed_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+exposed_copper_door|3|incorrect_for_wooden_tool|8420080|1
+exposed_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+exposed_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+exposed_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+exposed_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+exposed_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+farmland|0.6|mineable/shovel|0|1
+fern|0|plant;mineable/axe|0|1
+fire|0|default|0|1
+fire_coral|0|default|0|1
+fire_coral_block|1.5|mineable/pickaxe|8421084|1
+fire_coral_fan|0|default|0|1
+fire_coral_wall_fan|0|default|0|1
+fletching_table|2.5|mineable/axe|0|1
+flower_pot|0|default|0|1
+flowering_azalea|0|plant;mineable/axe|0|1
+flowering_azalea_leaves|0.2|leaves;mineable/hoe|0|1
+frogspawn|0|default|0|1
+frosted_ice|0.5|default|0|1
+furnace|3.5|mineable/pickaxe|8421084|1
+gilded_blackstone|1.5|mineable/pickaxe|8421084|1
+glass|0.3|default|0|1
+glass_pane|0.3|default|0|1
+glow_lichen|0.2|vine_or_glow_lichen;plant;mineable/axe|0|1
+glowstone|0.3|default|0|1
+gold_block|3|incorrect_for_wooden_tool|8420000|1
+gold_ore|3|incorrect_for_wooden_tool|8420000|1
+granite|1.5|mineable/pickaxe|8421084|1
+granite_slab|1.5|mineable/pickaxe|8421084|1
+granite_stairs|1.5|mineable/pickaxe|8421084|1
+granite_wall|1.5|mineable/pickaxe|8421084|1
+grass_block|0.6|mineable/shovel|0|1
+gravel|0.6|mineable/shovel|0|1
+gray_banner|1|mineable/axe|0|1
+gray_bed|0.2|default|0|1
+gray_candle|0.1|default|0|1
+gray_candle_cake|0.5|default|0|1
+gray_carpet|0.1|default|0|1
+gray_concrete|1.8|mineable/pickaxe|8421084|1
+gray_concrete_powder|0.5|mineable/shovel|0|1
+gray_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+gray_shulker_box|2|mineable/pickaxe|0|1
+gray_stained_glass|0.3|default|0|1
+gray_stained_glass_pane|0.3|default|0|1
+gray_terracotta|1.25|mineable/pickaxe|8421084|1
+gray_wall_banner|1|mineable/axe|0|1
+gray_wool|0.8|wool|0|1
+green_banner|1|mineable/axe|0|1
+green_bed|0.2|default|0|1
+green_candle|0.1|default|0|1
+green_candle_cake|0.5|default|0|1
+green_carpet|0.1|default|0|1
+green_concrete|1.8|mineable/pickaxe|8421084|1
+green_concrete_powder|0.5|mineable/shovel|0|1
+green_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+green_shulker_box|2|mineable/pickaxe|0|1
+green_stained_glass|0.3|default|0|1
+green_stained_glass_pane|0.3|default|0|1
+green_terracotta|1.25|mineable/pickaxe|8421084|1
+green_wall_banner|1|mineable/axe|0|1
+green_wool|0.8|wool|0|1
+grindstone|2|mineable/pickaxe|8421084|1
+hanging_roots|0|plant;mineable/axe|0|1
+hay_block|0.5|mineable/hoe|0|1
+heavy_core|10|mineable/pickaxe|0|1
+heavy_weighted_pressure_plate|0.5|mineable/pickaxe|8421084|1
+honey_block|0|default|0|1
+honeycomb_block|0.6|default|0|1
+hopper|3|mineable/pickaxe|8421084|1
+horn_coral|0|default|0|1
+horn_coral_block|1.5|mineable/pickaxe|8421084|1
+horn_coral_fan|0|default|0|1
+horn_coral_wall_fan|0|default|0|1
+ice|0.5|mineable/pickaxe|0|1
+infested_chiseled_stone_bricks|0.75|mineable/pickaxe|0|1
+infested_cobblestone|1|mineable/pickaxe|0|1
+infested_cracked_stone_bricks|0.75|mineable/pickaxe|0|1
+infested_deepslate|1.5|mineable/pickaxe|0|1
+infested_mossy_stone_bricks|0.75|mineable/pickaxe|0|1
+infested_stone|0.75|mineable/pickaxe|0|1
+infested_stone_bricks|0.75|mineable/pickaxe|0|1
+iron_bars|5|mineable/pickaxe|8421084|1
+iron_block|5|incorrect_for_wooden_tool|8420080|1
+iron_door|5|mineable/pickaxe|8421084|1
+iron_ore|3|incorrect_for_wooden_tool|8420080|1
+iron_trapdoor|5|mineable/pickaxe|8421084|1
+jack_o_lantern|1|gourd;mineable/axe|0|1
+jigsaw|-1|default|0|0
+jukebox|2|mineable/axe|0|1
+jungle_button|0.5|mineable/axe|0|1
+jungle_door|3|mineable/axe|0|1
+jungle_fence|2|mineable/axe|0|1
+jungle_fence_gate|2|mineable/axe|0|1
+jungle_hanging_sign|1|mineable/axe|0|1
+jungle_leaves|0.2|leaves;mineable/hoe|0|1
+jungle_log|2|mineable/axe|0|1
+jungle_planks|2|mineable/axe|0|1
+jungle_pressure_plate|0.5|mineable/axe|0|1
+jungle_sapling|0|plant;mineable/axe|0|1
+jungle_sign|1|mineable/axe|0|1
+jungle_slab|2|mineable/axe|0|1
+jungle_stairs|2|mineable/axe|0|1
+jungle_trapdoor|3|mineable/axe|0|1
+jungle_wall_hanging_sign|1|mineable/axe|0|1
+jungle_wall_sign|1|mineable/axe|0|1
+jungle_wood|2|mineable/axe|0|1
+kelp|0|default|0|1
+kelp_plant|0|default|0|1
+ladder|0.4|mineable/axe|0|1
+lantern|3.5|mineable/pickaxe|8421084|1
+lapis_block|3|incorrect_for_wooden_tool|8420080|1
+lapis_ore|3|incorrect_for_wooden_tool|8420080|1
+large_amethyst_bud|1.5|mineable/pickaxe|0|1
+large_fern|0|plant;mineable/axe|0|1
+lava|100|default|0|1
+lava_cauldron|2|mineable/pickaxe|8421084|1
+lectern|2.5|mineable/axe|0|1
+lever|0.5|default|0|1
+light|-1|default|0|0
+light_blue_banner|1|mineable/axe|0|1
+light_blue_bed|0.2|default|0|1
+light_blue_candle|0.1|default|0|1
+light_blue_candle_cake|0.5|default|0|1
+light_blue_carpet|0.1|default|0|1
+light_blue_concrete|1.8|mineable/pickaxe|8421084|1
+light_blue_concrete_powder|0.5|mineable/shovel|0|1
+light_blue_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+light_blue_shulker_box|2|mineable/pickaxe|0|1
+light_blue_stained_glass|0.3|default|0|1
+light_blue_stained_glass_pane|0.3|default|0|1
+light_blue_terracotta|1.25|mineable/pickaxe|8421084|1
+light_blue_wall_banner|1|mineable/axe|0|1
+light_blue_wool|0.8|wool|0|1
+light_gray_banner|1|mineable/axe|0|1
+light_gray_bed|0.2|default|0|1
+light_gray_candle|0.1|default|0|1
+light_gray_candle_cake|0.5|default|0|1
+light_gray_carpet|0.1|default|0|1
+light_gray_concrete|1.8|mineable/pickaxe|8421084|1
+light_gray_concrete_powder|0.5|mineable/shovel|0|1
+light_gray_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+light_gray_shulker_box|2|mineable/pickaxe|0|1
+light_gray_stained_glass|0.3|default|0|1
+light_gray_stained_glass_pane|0.3|default|0|1
+light_gray_terracotta|1.25|mineable/pickaxe|8421084|1
+light_gray_wall_banner|1|mineable/axe|0|1
+light_gray_wool|0.8|wool|0|1
+light_weighted_pressure_plate|0.5|mineable/pickaxe|8421084|1
+lightning_rod|3|incorrect_for_wooden_tool|8420080|1
+lilac|0|plant|0|1
+lily_of_the_valley|0|plant|0|1
+lily_pad|0|plant;mineable/axe|0|1
+lime_banner|1|mineable/axe|0|1
+lime_bed|0.2|default|0|1
+lime_candle|0.1|default|0|1
+lime_candle_cake|0.5|default|0|1
+lime_carpet|0.1|default|0|1
+lime_concrete|1.8|mineable/pickaxe|8421084|1
+lime_concrete_powder|0.5|mineable/shovel|0|1
+lime_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+lime_shulker_box|2|mineable/pickaxe|0|1
+lime_stained_glass|0.3|default|0|1
+lime_stained_glass_pane|0.3|default|0|1
+lime_terracotta|1.25|mineable/pickaxe|8421084|1
+lime_wall_banner|1|mineable/axe|0|1
+lime_wool|0.8|wool|0|1
+lodestone|3.5|mineable/pickaxe|8421084|1
+loom|2.5|mineable/axe|0|1
+magenta_banner|1|mineable/axe|0|1
+magenta_bed|0.2|default|0|1
+magenta_candle|0.1|default|0|1
+magenta_candle_cake|0.5|default|0|1
+magenta_carpet|0.1|default|0|1
+magenta_concrete|1.8|mineable/pickaxe|8421084|1
+magenta_concrete_powder|0.5|mineable/shovel|0|1
+magenta_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+magenta_shulker_box|2|mineable/pickaxe|0|1
+magenta_stained_glass|0.3|default|0|1
+magenta_stained_glass_pane|0.3|default|0|1
+magenta_terracotta|1.25|mineable/pickaxe|8421084|1
+magenta_wall_banner|1|mineable/axe|0|1
+magenta_wool|0.8|wool|0|1
+magma_block|0.5|mineable/pickaxe|8421084|1
+mangrove_button|0.5|mineable/axe|0|1
+mangrove_door|3|mineable/axe|0|1
+mangrove_fence|2|mineable/axe|0|1
+mangrove_fence_gate|2|mineable/axe|0|1
+mangrove_hanging_sign|1|mineable/axe|0|1
+mangrove_leaves|0.2|leaves;mineable/hoe|0|1
+mangrove_log|2|mineable/axe|0|1
+mangrove_planks|2|mineable/axe|0|1
+mangrove_pressure_plate|0.5|mineable/axe|0|1
+mangrove_propagule|0|plant;mineable/axe|0|1
+mangrove_roots|0.7|mineable/axe|0|1
+mangrove_sign|1|mineable/axe|0|1
+mangrove_slab|2|mineable/axe|0|1
+mangrove_stairs|2|mineable/axe|0|1
+mangrove_trapdoor|3|mineable/axe|0|1
+mangrove_wall_hanging_sign|1|mineable/axe|0|1
+mangrove_wall_sign|1|mineable/axe|0|1
+mangrove_wood|2|mineable/axe|0|1
+medium_amethyst_bud|1.5|mineable/pickaxe|0|1
+melon|1|gourd;mineable/axe|0|1
+melon_stem|0|plant;mineable/axe|0|1
+moss_block|0.1|mineable/hoe|0|1
+moss_carpet|0.1|plant|0|1
+mossy_cobblestone|2|mineable/pickaxe|8421084|1
+mossy_cobblestone_slab|2|mineable/pickaxe|8421084|1
+mossy_cobblestone_stairs|2|mineable/pickaxe|8421084|1
+mossy_cobblestone_wall|2|mineable/pickaxe|8421084|1
+mossy_stone_brick_slab|1.5|mineable/pickaxe|8421084|1
+mossy_stone_brick_stairs|1.5|mineable/pickaxe|8421084|1
+mossy_stone_brick_wall|1.5|mineable/pickaxe|8421084|1
+mossy_stone_bricks|1.5|mineable/pickaxe|8421084|1
+moving_piston|-1|default|0|0
+mud|0.5|mineable/shovel|0|1
+mud_brick_slab|1.5|mineable/pickaxe|8421084|1
+mud_brick_stairs|1.5|mineable/pickaxe|8421084|1
+mud_brick_wall|1.5|mineable/pickaxe|8421084|1
+mud_bricks|1.5|mineable/pickaxe|8421084|1
+muddy_mangrove_roots|0.7|mineable/shovel|0|1
+mushroom_stem|0.2|mineable/axe|0|1
+mycelium|0.6|mineable/shovel|0|1
+nether_brick_fence|2|mineable/pickaxe|8421084|1
+nether_brick_slab|2|mineable/pickaxe|8421084|1
+nether_brick_stairs|2|mineable/pickaxe|8421084|1
+nether_brick_wall|2|mineable/pickaxe|8421084|1
+nether_bricks|2|mineable/pickaxe|8421084|1
+nether_gold_ore|3|mineable/pickaxe|8421084|1
+nether_portal|-1|default|0|0
+nether_quartz_ore|3|mineable/pickaxe|8421084|1
+nether_sprouts|0|plant|0|1
+nether_wart|0|plant;mineable/axe|0|1
+nether_wart_block|1|mineable/hoe|0|1
+netherite_block|50|incorrect_for_wooden_tool|8400000|1
+netherrack|0.4|mineable/pickaxe|8421084|1
+note_block|0.8|mineable/axe|0|1
+oak_button|0.5|mineable/axe|0|1
+oak_door|3|mineable/axe|0|1
+oak_fence|2|mineable/axe|0|1
+oak_fence_gate|2|mineable/axe|0|1
+oak_hanging_sign|1|mineable/axe|0|1
+oak_leaves|0.2|leaves;mineable/hoe|0|1
+oak_log|2|mineable/axe|0|1
+oak_planks|2|mineable/axe|0|1
+oak_pressure_plate|0.5|mineable/axe|0|1
+oak_sapling|0|plant;mineable/axe|0|1
+oak_sign|1|mineable/axe|0|1
+oak_slab|2|mineable/axe|0|1
+oak_stairs|2|mineable/axe|0|1
+oak_trapdoor|3|mineable/axe|0|1
+oak_wall_hanging_sign|1|mineable/axe|0|1
+oak_wall_sign|1|mineable/axe|0|1
+oak_wood|2|mineable/axe|0|1
+observer|3|mineable/pickaxe|8421084|1
+obsidian|50|incorrect_for_wooden_tool|8400000|1
+ochre_froglight|0.3|default|0|1
+orange_banner|1|mineable/axe|0|1
+orange_bed|0.2|default|0|1
+orange_candle|0.1|default|0|1
+orange_candle_cake|0.5|default|0|1
+orange_carpet|0.1|default|0|1
+orange_concrete|1.8|mineable/pickaxe|8421084|1
+orange_concrete_powder|0.5|mineable/shovel|0|1
+orange_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+orange_shulker_box|2|mineable/pickaxe|0|1
+orange_stained_glass|0.3|default|0|1
+orange_stained_glass_pane|0.3|default|0|1
+orange_terracotta|1.25|mineable/pickaxe|8421084|1
+orange_tulip|0|plant|0|1
+orange_wall_banner|1|mineable/axe|0|1
+orange_wool|0.8|wool|0|1
+oxeye_daisy|0|plant|0|1
+oxidized_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+oxidized_copper|3|incorrect_for_wooden_tool|8420080|1
+oxidized_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+oxidized_copper_door|3|incorrect_for_wooden_tool|8420080|1
+oxidized_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+oxidized_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+oxidized_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+oxidized_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+oxidized_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+packed_ice|0.5|mineable/pickaxe|0|1
+packed_mud|1|mineable/pickaxe|0|1
+pearlescent_froglight|0.3|default|0|1
+peony|0|plant|0|1
+petrified_oak_slab|2|mineable/pickaxe|8421084|1
+piglin_head|1|default|0|1
+piglin_wall_head|1|default|0|1
+pink_banner|1|mineable/axe|0|1
+pink_bed|0.2|default|0|1
+pink_candle|0.1|default|0|1
+pink_candle_cake|0.5|default|0|1
+pink_carpet|0.1|default|0|1
+pink_concrete|1.8|mineable/pickaxe|8421084|1
+pink_concrete_powder|0.5|mineable/shovel|0|1
+pink_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+pink_petals|0|plant|0|1
+pink_shulker_box|2|mineable/pickaxe|0|1
+pink_stained_glass|0.3|default|0|1
+pink_stained_glass_pane|0.3|default|0|1
+pink_terracotta|1.25|mineable/pickaxe|8421084|1
+pink_tulip|0|plant|0|1
+pink_wall_banner|1|mineable/axe|0|1
+pink_wool|0.8|wool|0|1
+piston|1.5|mineable/pickaxe|0|1
+piston_head|1.5|mineable/pickaxe|0|1
+pitcher_crop|0|plant|0|1
+pitcher_plant|0|plant|0|1
+player_head|1|default|0|1
+player_wall_head|1|default|0|1
+podzol|0.5|mineable/shovel|0|1
+pointed_dripstone|1.5|mineable/pickaxe|0|1
+polished_andesite|1.5|mineable/pickaxe|8421084|1
+polished_andesite_slab|1.5|mineable/pickaxe|8421084|1
+polished_andesite_stairs|1.5|mineable/pickaxe|8421084|1
+polished_basalt|1.25|mineable/pickaxe|8421084|1
+polished_blackstone|2|mineable/pickaxe|8421084|1
+polished_blackstone_brick_slab|2|mineable/pickaxe|8421084|1
+polished_blackstone_brick_stairs|1.5|mineable/pickaxe|8421084|1
+polished_blackstone_brick_wall|1.5|mineable/pickaxe|8421084|1
+polished_blackstone_bricks|1.5|mineable/pickaxe|8421084|1
+polished_blackstone_button|0.5|mineable/pickaxe|0|1
+polished_blackstone_pressure_plate|0.5|mineable/pickaxe|8421084|1
+polished_blackstone_slab|2|mineable/pickaxe|8421084|1
+polished_blackstone_stairs|2|mineable/pickaxe|8421084|1
+polished_blackstone_wall|2|mineable/pickaxe|8421084|1
+polished_deepslate|3.5|mineable/pickaxe|8421084|1
+polished_deepslate_slab|3.5|mineable/pickaxe|8421084|1
+polished_deepslate_stairs|3.5|mineable/pickaxe|8421084|1
+polished_deepslate_wall|3.5|mineable/pickaxe|8421084|1
+polished_diorite|1.5|mineable/pickaxe|8421084|1
+polished_diorite_slab|1.5|mineable/pickaxe|8421084|1
+polished_diorite_stairs|1.5|mineable/pickaxe|8421084|1
+polished_granite|1.5|mineable/pickaxe|8421084|1
+polished_granite_slab|1.5|mineable/pickaxe|8421084|1
+polished_granite_stairs|1.5|mineable/pickaxe|8421084|1
+polished_tuff|1.5|mineable/pickaxe|8421084|1
+polished_tuff_slab|1.5|mineable/pickaxe|8421084|1
+polished_tuff_stairs|1.5|mineable/pickaxe|8421084|1
+polished_tuff_wall|1.5|mineable/pickaxe|8421084|1
+poppy|0|plant|0|1
+potatoes|0|plant;mineable/axe|0|1
+potted_acacia_sapling|0|default|0|1
+potted_allium|0|default|0|1
+potted_azalea_bush|0|default|0|1
+potted_azure_bluet|0|default|0|1
+potted_bamboo|0|default|0|1
+potted_birch_sapling|0|default|0|1
+potted_blue_orchid|0|default|0|1
+potted_brown_mushroom|0|default|0|1
+potted_cactus|0|default|0|1
+potted_cherry_sapling|0|default|0|1
+potted_cornflower|0|default|0|1
+potted_crimson_fungus|0|default|0|1
+potted_crimson_roots|0|default|0|1
+potted_dandelion|0|default|0|1
+potted_dark_oak_sapling|0|default|0|1
+potted_dead_bush|0|default|0|1
+potted_fern|0|default|0|1
+potted_flowering_azalea_bush|0|default|0|1
+potted_jungle_sapling|0|default|0|1
+potted_lily_of_the_valley|0|default|0|1
+potted_mangrove_propagule|0|default|0|1
+potted_oak_sapling|0|default|0|1
+potted_orange_tulip|0|default|0|1
+potted_oxeye_daisy|0|default|0|1
+potted_pink_tulip|0|default|0|1
+potted_poppy|0|default|0|1
+potted_red_mushroom|0|default|0|1
+potted_red_tulip|0|default|0|1
+potted_spruce_sapling|0|default|0|1
+potted_torchflower|0|default|0|1
+potted_warped_fungus|0|default|0|1
+potted_warped_roots|0|default|0|1
+potted_white_tulip|0|default|0|1
+potted_wither_rose|0|default|0|1
+powder_snow|0.25|default|0|1
+powder_snow_cauldron|2|mineable/pickaxe|8421084|1
+powered_rail|0.7|mineable/pickaxe|0|1
+prismarine|1.5|mineable/pickaxe|8421084|1
+prismarine_brick_slab|1.5|mineable/pickaxe|8421084|1
+prismarine_brick_stairs|1.5|mineable/pickaxe|8421084|1
+prismarine_bricks|1.5|mineable/pickaxe|8421084|1
+prismarine_slab|1.5|mineable/pickaxe|8421084|1
+prismarine_stairs|1.5|mineable/pickaxe|8421084|1
+prismarine_wall|1.5|mineable/pickaxe|8421084|1
+pumpkin|1|gourd;mineable/axe|0|1
+pumpkin_stem|0|plant;mineable/axe|0|1
+purple_banner|1|mineable/axe|0|1
+purple_bed|0.2|default|0|1
+purple_candle|0.1|default|0|1
+purple_candle_cake|0.5|default|0|1
+purple_carpet|0.1|default|0|1
+purple_concrete|1.8|mineable/pickaxe|8421084|1
+purple_concrete_powder|0.5|mineable/shovel|0|1
+purple_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+purple_shulker_box|2|mineable/pickaxe|0|1
+purple_stained_glass|0.3|default|0|1
+purple_stained_glass_pane|0.3|default|0|1
+purple_terracotta|1.25|mineable/pickaxe|8421084|1
+purple_wall_banner|1|mineable/axe|0|1
+purple_wool|0.8|wool|0|1
+purpur_block|1.5|mineable/pickaxe|8421084|1
+purpur_pillar|1.5|mineable/pickaxe|8421084|1
+purpur_slab|2|mineable/pickaxe|8421084|1
+purpur_stairs|1.5|mineable/pickaxe|8421084|1
+quartz_block|0.8|mineable/pickaxe|8421084|1
+quartz_bricks|0.8|mineable/pickaxe|8421084|1
+quartz_pillar|0.8|mineable/pickaxe|8421084|1
+quartz_slab|2|mineable/pickaxe|8421084|1
+quartz_stairs|0.8|mineable/pickaxe|8421084|1
+rail|0.7|mineable/pickaxe|0|1
+raw_copper_block|5|incorrect_for_wooden_tool|8420080|1
+raw_gold_block|5|incorrect_for_wooden_tool|8420000|1
+raw_iron_block|5|incorrect_for_wooden_tool|8420080|1
+red_banner|1|mineable/axe|0|1
+red_bed|0.2|default|0|1
+red_candle|0.1|default|0|1
+red_candle_cake|0.5|default|0|1
+red_carpet|0.1|default|0|1
+red_concrete|1.8|mineable/pickaxe|8421084|1
+red_concrete_powder|0.5|mineable/shovel|0|1
+red_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+red_mushroom|0|plant;mineable/axe|0|1
+red_mushroom_block|0.2|mineable/axe|0|1
+red_nether_brick_slab|2|mineable/pickaxe|8421084|1
+red_nether_brick_stairs|2|mineable/pickaxe|8421084|1
+red_nether_brick_wall|2|mineable/pickaxe|8421084|1
+red_nether_bricks|2|mineable/pickaxe|8421084|1
+red_sand|0.5|mineable/shovel|0|1
+red_sandstone|0.8|mineable/pickaxe|8421084|1
+red_sandstone_slab|2|mineable/pickaxe|8421084|1
+red_sandstone_stairs|0.8|mineable/pickaxe|8421084|1
+red_sandstone_wall|0.8|mineable/pickaxe|8421084|1
+red_shulker_box|2|mineable/pickaxe|0|1
+red_stained_glass|0.3|default|0|1
+red_stained_glass_pane|0.3|default|0|1
+red_terracotta|1.25|mineable/pickaxe|8421084|1
+red_tulip|0|plant|0|1
+red_wall_banner|1|mineable/axe|0|1
+red_wool|0.8|wool|0|1
+redstone_block|5|mineable/pickaxe|8421084|1
+redstone_lamp|0.3|default|0|1
+redstone_ore|3|incorrect_for_wooden_tool|8420000|1
+redstone_torch|0|default|0|1
+redstone_wall_torch|0|default|0|1
+redstone_wire|0|default|0|1
+reinforced_deepslate|55|default|0|1
+repeater|0|default|0|1
+repeating_command_block|-1|default|0|0
+respawn_anchor|50|incorrect_for_wooden_tool|8400000|1
+rooted_dirt|0.5|mineable/shovel|0|1
+rose_bush|0|plant|0|1
+sand|0.5|mineable/shovel|0|1
+sandstone|0.8|mineable/pickaxe|8421084|1
+sandstone_slab|2|mineable/pickaxe|8421084|1
+sandstone_stairs|0.8|mineable/pickaxe|8421084|1
+sandstone_wall|0.8|mineable/pickaxe|8421084|1
+scaffolding|0|mineable/axe|0|1
+sculk|0.2|mineable/hoe|0|1
+sculk_catalyst|3|mineable/hoe|0|1
+sculk_sensor|1.5|mineable/hoe|0|1
+sculk_shrieker|3|mineable/hoe|0|1
+sculk_vein|0.2|mineable/hoe|0|1
+sea_lantern|0.3|default|0|1
+sea_pickle|0|default|0|1
+seagrass|0|default|0|1
+short_grass|0|plant;mineable/axe|0|1
+shroomlight|1|mineable/hoe|0|1
+shulker_box|2|mineable/pickaxe|0|1
+skeleton_skull|1|default|0|1
+skeleton_wall_skull|1|default|0|1
+slime_block|0|default|0|1
+small_amethyst_bud|1.5|mineable/pickaxe|0|1
+small_dripleaf|0|plant;mineable/axe|0|1
+smithing_table|2.5|mineable/axe|0|1
+smoker|3.5|mineable/pickaxe|8421084|1
+smooth_basalt|1.25|mineable/pickaxe|8421084|1
+smooth_quartz|2|mineable/pickaxe|8421084|1
+smooth_quartz_slab|2|mineable/pickaxe|8421084|1
+smooth_quartz_stairs|2|mineable/pickaxe|8421084|1
+smooth_red_sandstone|2|mineable/pickaxe|8421084|1
+smooth_red_sandstone_slab|2|mineable/pickaxe|8421084|1
+smooth_red_sandstone_stairs|2|mineable/pickaxe|8421084|1
+smooth_sandstone|2|mineable/pickaxe|8421084|1
+smooth_sandstone_slab|2|mineable/pickaxe|8421084|1
+smooth_sandstone_stairs|2|mineable/pickaxe|8421084|1
+smooth_stone|2|mineable/pickaxe|8421084|1
+smooth_stone_slab|2|mineable/pickaxe|8421084|1
+sniffer_egg|0.5|default|0|1
+snow|0.1|mineable/shovel|4210842|1
+snow_block|0.2|mineable/shovel|4210842|1
+soul_campfire|2|mineable/axe|0|1
+soul_fire|0|default|0|1
+soul_lantern|3.5|mineable/pickaxe|8421084|1
+soul_sand|0.5|mineable/shovel|0|1
+soul_soil|0.5|mineable/shovel|0|1
+soul_torch|0|default|0|1
+soul_wall_torch|0|default|0|1
+spawner|5|mineable/pickaxe|8421084|1
+sponge|0.6|mineable/hoe|0|1
+spore_blossom|0|plant;mineable/axe|0|1
+spruce_button|0.5|mineable/axe|0|1
+spruce_door|3|mineable/axe|0|1
+spruce_fence|2|mineable/axe|0|1
+spruce_fence_gate|2|mineable/axe|0|1
+spruce_hanging_sign|1|mineable/axe|0|1
+spruce_leaves|0.2|leaves;mineable/hoe|0|1
+spruce_log|2|mineable/axe|0|1
+spruce_planks|2|mineable/axe|0|1
+spruce_pressure_plate|0.5|mineable/axe|0|1
+spruce_sapling|0|plant;mineable/axe|0|1
+spruce_sign|1|mineable/axe|0|1
+spruce_slab|2|mineable/axe|0|1
+spruce_stairs|2|mineable/axe|0|1
+spruce_trapdoor|3|mineable/axe|0|1
+spruce_wall_hanging_sign|1|mineable/axe|0|1
+spruce_wall_sign|1|mineable/axe|0|1
+spruce_wood|2|mineable/axe|0|1
+sticky_piston|1.5|mineable/pickaxe|0|1
+stone|1.5|mineable/pickaxe|8421084|1
+stone_brick_slab|2|mineable/pickaxe|8421084|1
+stone_brick_stairs|1.5|mineable/pickaxe|8421084|1
+stone_brick_wall|1.5|mineable/pickaxe|8421084|1
+stone_bricks|1.5|mineable/pickaxe|8421084|1
+stone_button|0.5|mineable/pickaxe|0|1
+stone_pressure_plate|0.5|mineable/pickaxe|8421084|1
+stone_slab|2|mineable/pickaxe|8421084|1
+stone_stairs|1.5|mineable/pickaxe|8421084|1
+stonecutter|3.5|mineable/pickaxe|8421084|1
+stripped_acacia_log|2|mineable/axe|0|1
+stripped_acacia_wood|2|mineable/axe|0|1
+stripped_bamboo_block|2|mineable/axe|0|1
+stripped_birch_log|2|mineable/axe|0|1
+stripped_birch_wood|2|mineable/axe|0|1
+stripped_cherry_log|2|mineable/axe|0|1
+stripped_cherry_wood|2|mineable/axe|0|1
+stripped_crimson_hyphae|2|mineable/axe|0|1
+stripped_crimson_stem|2|mineable/axe|0|1
+stripped_dark_oak_log|2|mineable/axe|0|1
+stripped_dark_oak_wood|2|mineable/axe|0|1
+stripped_jungle_log|2|mineable/axe|0|1
+stripped_jungle_wood|2|mineable/axe|0|1
+stripped_mangrove_log|2|mineable/axe|0|1
+stripped_mangrove_wood|2|mineable/axe|0|1
+stripped_oak_log|2|mineable/axe|0|1
+stripped_oak_wood|2|mineable/axe|0|1
+stripped_spruce_log|2|mineable/axe|0|1
+stripped_spruce_wood|2|mineable/axe|0|1
+stripped_warped_hyphae|2|mineable/axe|0|1
+stripped_warped_stem|2|mineable/axe|0|1
+structure_block|-1|default|0|0
+structure_void|0|default|0|1
+sugar_cane|0|plant;mineable/axe|0|1
+sunflower|0|plant|0|1
+suspicious_gravel|0.25|mineable/shovel|0|1
+suspicious_sand|0.25|mineable/shovel|0|1
+sweet_berry_bush|0|plant;mineable/axe|0|1
+tall_grass|0|plant;mineable/axe|0|1
+tall_seagrass|0|default|0|1
+target|0.5|mineable/hoe|0|1
+terracotta|1.25|mineable/pickaxe|8421084|1
+tinted_glass|0.3|default|0|1
+tnt|0|default|0|1
+torch|0|default|0|1
+torchflower|0|plant|0|1
+torchflower_crop|0|plant|0|1
+trapped_chest|2.5|mineable/axe|0|1
+trial_spawner|50|default|0|1
+tripwire|0|default|0|1
+tripwire_hook|0|default|0|1
+tube_coral|0|default|0|1
+tube_coral_block|1.5|mineable/pickaxe|8421084|1
+tube_coral_fan|0|default|0|1
+tube_coral_wall_fan|0|default|0|1
+tuff|1.5|mineable/pickaxe|8421084|1
+tuff_brick_slab|1.5|mineable/pickaxe|8421084|1
+tuff_brick_stairs|1.5|mineable/pickaxe|8421084|1
+tuff_brick_wall|1.5|mineable/pickaxe|8421084|1
+tuff_bricks|1.5|mineable/pickaxe|8421084|1
+tuff_slab|1.5|mineable/pickaxe|8421084|1
+tuff_stairs|1.5|mineable/pickaxe|8421084|1
+tuff_wall|1.5|mineable/pickaxe|8421084|1
+turtle_egg|0.5|default|0|1
+twisting_vines|0|plant;mineable/axe|0|1
+twisting_vines_plant|0|plant;mineable/axe|0|1
+vault|50|default|0|1
+verdant_froglight|0.3|default|0|1
+vine|0.2|vine_or_glow_lichen;plant;mineable/axe|0|1
+void_air|0|default|0|0
+wall_torch|0|default|0|1
+warped_button|0.5|mineable/axe|0|1
+warped_door|3|mineable/axe|0|1
+warped_fence|2|mineable/axe|0|1
+warped_fence_gate|2|mineable/axe|0|1
+warped_fungus|0|plant;mineable/axe|0|1
+warped_hanging_sign|1|mineable/axe|0|1
+warped_hyphae|2|mineable/axe|0|1
+warped_nylium|0.4|mineable/pickaxe|8421084|1
+warped_planks|2|mineable/axe|0|1
+warped_pressure_plate|0.5|mineable/axe|0|1
+warped_roots|0|plant|0|1
+warped_sign|1|mineable/axe|0|1
+warped_slab|2|mineable/axe|0|1
+warped_stairs|2|mineable/axe|0|1
+warped_stem|2|mineable/axe|0|1
+warped_trapdoor|3|mineable/axe|0|1
+warped_wall_hanging_sign|1|mineable/axe|0|1
+warped_wall_sign|1|mineable/axe|0|1
+warped_wart_block|1|mineable/hoe|0|1
+water|100|default|0|1
+water_cauldron|2|mineable/pickaxe|8421084|1
+waxed_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_copper_block|3|incorrect_for_wooden_tool|8420080|1
+waxed_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+waxed_copper_door|3|incorrect_for_wooden_tool|8420080|1
+waxed_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+waxed_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+waxed_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+waxed_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_copper_door|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+waxed_exposed_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_copper_door|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+waxed_oxidized_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_copper_door|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+waxed_weathered_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+weathered_chiseled_copper|3|incorrect_for_wooden_tool|8420080|1
+weathered_copper|3|incorrect_for_wooden_tool|8420080|1
+weathered_copper_bulb|3|incorrect_for_wooden_tool|8420080|1
+weathered_copper_door|3|incorrect_for_wooden_tool|8420080|1
+weathered_copper_grate|3|incorrect_for_wooden_tool|8420080|1
+weathered_copper_trapdoor|3|incorrect_for_wooden_tool|8420080|1
+weathered_cut_copper|3|incorrect_for_wooden_tool|8420080|1
+weathered_cut_copper_slab|3|incorrect_for_wooden_tool|8420080|1
+weathered_cut_copper_stairs|3|incorrect_for_wooden_tool|8420080|1
+weeping_vines|0|plant;mineable/axe|0|1
+weeping_vines_plant|0|plant;mineable/axe|0|1
+wet_sponge|0.6|mineable/hoe|0|1
+wheat|0|plant;mineable/axe|0|1
+white_banner|1|mineable/axe|0|1
+white_bed|0.2|default|0|1
+white_candle|0.1|default|0|1
+white_candle_cake|0.5|default|0|1
+white_carpet|0.1|default|0|1
+white_concrete|1.8|mineable/pickaxe|8421084|1
+white_concrete_powder|0.5|mineable/shovel|0|1
+white_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+white_shulker_box|2|mineable/pickaxe|0|1
+white_stained_glass|0.3|default|0|1
+white_stained_glass_pane|0.3|default|0|1
+white_terracotta|1.25|mineable/pickaxe|8421084|1
+white_tulip|0|plant|0|1
+white_wall_banner|1|mineable/axe|0|1
+white_wool|0.8|wool|0|1
+wither_rose|0|plant|0|1
+wither_skeleton_skull|1|default|0|1
+wither_skeleton_wall_skull|1|default|0|1
+yellow_banner|1|mineable/axe|0|1
+yellow_bed|0.2|default|0|1
+yellow_candle|0.1|default|0|1
+yellow_candle_cake|0.5|default|0|1
+yellow_carpet|0.1|default|0|1
+yellow_concrete|1.8|mineable/pickaxe|8421084|1
+yellow_concrete_powder|0.5|mineable/shovel|0|1
+yellow_glazed_terracotta|1.4|mineable/pickaxe|8421084|1
+yellow_shulker_box|2|mineable/pickaxe|0|1
+yellow_stained_glass|0.3|default|0|1
+yellow_stained_glass_pane|0.3|default|0|1
+yellow_terracotta|1.25|mineable/pickaxe|8421084|1
+yellow_wall_banner|1|mineable/axe|0|1
+yellow_wool|0.8|wool|0|1
+zombie_head|1|default|0|1
+zombie_wall_head|1|default|0|1"#;
+
+#[derive(Clone, Copy, Debug)]
+struct VanillaBlockMiningMeta {
+    hardness: f32,
+    preferred_tool: Option<HarvestTool>,
+    harvest_mask: u64,
+    diggable: bool,
+}
+
+fn vanilla_mining_material_tool(material: &str) -> Option<HarvestTool> {
+    if material == "incorrect_for_wooden_tool" || material.contains("mineable/pickaxe") {
+        Some(HarvestTool::Pickaxe)
+    } else if material.contains("mineable/axe") {
+        Some(HarvestTool::Axe)
+    } else if material.contains("mineable/shovel") {
+        Some(HarvestTool::Shovel)
+    } else if material.contains("mineable/hoe") {
+        Some(HarvestTool::Hoe)
+    } else {
+        None
+    }
+}
+
+/// Exact 1.21.1 hardness, preferred tool family, correct-tool item set and
+/// diggability for a vanilla block; unknown modded blocks use the conservative
+/// generic 1.5-second hand-mining fallback.
+fn vanilla_block_mining_meta(block_id: &str) -> VanillaBlockMiningMeta {
+    let path = canonical_block_path(block_id);
+    for row in VANILLA_BLOCK_MINING_ROWS.split('\n') {
+        let mut parts = row.split('|');
+        if parts.next() != Some(path) {
+            continue;
+        }
+        let hardness = parts
+            .next()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(1.5);
+        let material = parts.next().unwrap_or("default");
+        let harvest_mask = parts
+            .next()
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .unwrap_or(0);
+        let diggable = parts.next() == Some("1");
+        return VanillaBlockMiningMeta {
+            hardness,
+            preferred_tool: vanilla_mining_material_tool(material),
+            harvest_mask,
+            diggable,
+        };
+    }
+    VanillaBlockMiningMeta {
+        hardness: 1.5,
+        preferred_tool: preferred_harvest_tool(block_id),
+        harvest_mask: 0,
+        diggable: true,
+    }
+}
+
+fn vanilla_tool_harvest_bit(item_id: i32) -> u64 {
+    if (818..=847).contains(&item_id) {
+        1u64 << (item_id - 818)
+    } else if item_id == 983 {
+        1u64 << 40
+    } else {
+        0
+    }
+}
+
+fn canonical_block_path(block_id: &str) -> &str {
+    block_state_base_name(block_id)
+        .rsplit(':')
+        .next()
+        .unwrap_or(block_id)
+}
+
+/// `(tool family, vanilla speed)` for a held tiered tool.
+fn mining_tool_facts(item_name: &str) -> (Option<HarvestTool>, f32) {
+    let path = item_name.rsplit(':').next().unwrap_or(item_name);
+    let kind = if path.ends_with("_pickaxe") {
+        Some(HarvestTool::Pickaxe)
+    } else if path.ends_with("_axe") {
+        Some(HarvestTool::Axe)
+    } else if path.ends_with("_shovel") {
+        Some(HarvestTool::Shovel)
+    } else if path.ends_with("_hoe") {
+        Some(HarvestTool::Hoe)
+    } else {
+        None
+    };
+    let speed = if path.starts_with("netherite_") {
+        9.0
+    } else if path.starts_with("diamond_") {
+        8.0
+    } else if path.starts_with("iron_") {
+        6.0
+    } else if path.starts_with("stone_") {
+        4.0
+    } else if path.starts_with("golden_") {
+        12.0
+    } else if path.starts_with("wooden_") || path == "shears" {
+        2.0
+    } else {
+        1.0
+    };
+    (
+        kind,
+        if kind.is_some() || path == "shears" {
+            speed
+        } else {
+            1.0
+        },
+    )
+}
+
+fn sword_efficient_block(block_id: &str) -> bool {
+    let path = canonical_block_path(block_id);
+    path.ends_with("_leaves")
+        || matches!(
+            path,
+            "vine"
+                | "glow_lichen"
+                | "pumpkin"
+                | "carved_pumpkin"
+                | "jack_o_lantern"
+                | "melon"
+                | "cocoa"
+                | "big_dripleaf"
+                | "big_dripleaf_stem"
+                | "chorus_plant"
+                | "chorus_flower"
+        )
+}
+
+/// The `minecraft:tool` component half of vanilla `Player.getDestroySpeed`:
+/// shears and swords carry block-specific rules, while tiered tools use their
+/// material speed only against the block's preferred tool family.
+fn mining_item_destroy_speed(
+    item_name: &str,
+    block_id: &str,
+    required_tool: Option<HarvestTool>,
+    tool_kind: Option<HarvestTool>,
+    tier_speed: f32,
+    effective_tool: bool,
+) -> f32 {
+    let item = item_name.rsplit(':').next().unwrap_or(item_name);
+    let block = canonical_block_path(block_id);
+    if item == "shears" {
+        return if block == "cobweb" || block.ends_with("_leaves") {
+            15.0
+        } else if block.ends_with("_wool") {
+            5.0
+        } else if matches!(block, "vine" | "glow_lichen") {
+            2.0
+        } else {
+            1.0
+        };
+    }
+    if item.ends_with("_sword") {
+        return if block == "cobweb" {
+            15.0
+        } else if matches!(block, "bamboo" | "bamboo_sapling") {
+            f32::MAX
+        } else if sword_efficient_block(block_id) {
+            1.5
+        } else {
+            1.0
+        };
+    }
+    if tool_kind.is_some() && required_tool.is_some() && effective_tool {
+        tier_speed
+    } else {
+        1.0
+    }
+}
+
+fn component_varint(data: &[u8], pos: &mut usize) -> Option<i32> {
+    let (value, len) = megu_core::varint::read_varint_i32(data.get(*pos..)?).ok()?;
+    *pos += len;
+    Some(value)
+}
+
+/// Decode an enchantment level from the component-preserving stack patches.
+/// Protocol 767 enchantment registry ids are alphabetical; efficiency is 8
+/// and aqua_affinity is 0.
+fn item_enchantment_level(stack: &ItemStackComponents, enchantment_id: i32) -> i32 {
+    for patch in &stack.added {
+        if patch.type_id != COMP_ENCHANTMENTS && patch.type_id != COMP_STORED_ENCHANTMENTS {
+            continue;
+        }
+        let mut pos = 0usize;
+        let Some(count) = component_varint(&patch.data, &mut pos) else {
+            continue;
+        };
+        for _ in 0..count.clamp(0, 256) {
+            let (Some(id), Some(level)) = (
+                component_varint(&patch.data, &mut pos),
+                component_varint(&patch.data, &mut pos),
+            ) else {
+                break;
+            };
+            if id == enchantment_id {
+                return level.max(0);
+            }
+        }
+    }
+    0
+}
+
+fn component_patch(stack: &ItemStackComponents, type_id: i32) -> Option<&[u8]> {
+    if stack.removed.contains(&type_id) {
+        return None;
+    }
+    stack
+        .added
+        .iter()
+        .find(|patch| patch.type_id == type_id)
+        .map(|patch| patch.data.as_slice())
+}
+
+fn component_varint_value(stack: &ItemStackComponents, type_id: i32) -> Option<i32> {
+    let data = component_patch(stack, type_id)?;
+    let mut pos = 0usize;
+    component_varint(data, &mut pos)
+}
+
+fn component_text_value(stack: &ItemStackComponents, type_id: i32) -> Option<String> {
+    nbt_text(component_patch(stack, type_id)?)
+}
+
+fn component_lore_values(stack: &ItemStackComponents) -> Vec<String> {
+    let Some(data) = component_patch(stack, COMP_LORE) else {
+        return Vec::new();
+    };
+    let mut reader = WireReader::new(data);
+    let Ok(count) = reader.read_varint() else {
+        return Vec::new();
+    };
+    let mut lore = Vec::new();
+    for _ in 0..count.clamp(0, 256) {
+        let before = reader.remaining();
+        if before == 0 {
+            break;
+        }
+        // Entries are optional anonymous NBT payloads: a zero byte denotes
+        // absent; otherwise decode one component and use the reader's cursor
+        // movement to reach the next entry.
+        if reader.rest().first() == Some(&0) {
+            let _ = reader.take(1);
+            continue;
+        }
+        let Ok(value) = reader.read_nbt() else {
+            break;
+        };
+        let text = value.extract_text();
+        if !text.is_empty() {
+            lore.push(text);
+        }
+    }
+    lore
+}
+
+fn item_prototype_max_damage(item_name: &str) -> Option<i32> {
+    let path = item_name.rsplit(':').next().unwrap_or(item_name);
+    for (tier, durability) in [
+        ("netherite", 2031),
+        ("diamond", 1561),
+        ("iron", 250),
+        ("stone", 131),
+        ("golden", 32),
+        ("wooden", 59),
+    ] {
+        if path.starts_with(&format!("{tier}_"))
+            && ["sword", "pickaxe", "axe", "shovel", "hoe"]
+                .iter()
+                .any(|kind| path.ends_with(kind))
+        {
+            return Some(durability);
+        }
+    }
+    for piece in ["helmet", "chestplate", "leggings", "boots"] {
+        let Some(material) = path.strip_suffix(&format!("_{piece}")) else {
+            continue;
+        };
+        let multiplier = match material {
+            "leather" => 5,
+            "chainmail" | "iron" => 15,
+            "golden" => 7,
+            "diamond" => 33,
+            "netherite" => 37,
+            _ => return None,
+        };
+        let base = match piece {
+            "helmet" => 11,
+            "chestplate" => 16,
+            "leggings" => 15,
+            _ => 13,
+        };
+        return Some(multiplier * base);
+    }
+    let value = match path {
+        "shears" => 238,
+        "flint_and_steel" | "fishing_rod" | "brush" | "wolf_armor" => 64,
+        "carrot_on_a_stick" => 25,
+        "warped_fungus_on_a_stick" => 100,
+        "bow" => 384,
+        "crossbow" => 465,
+        "trident" => 250,
+        "mace" => 500,
+        "elytra" => 432,
+        "shield" => 336,
+        "turtle_shell" => 275,
+        _ => return None,
+    };
+    Some(value)
+}
+
+fn live_stack_summary(stack: &ItemStackComponents) -> Option<LiveHotbarStack> {
+    if stack.item_id <= 0 || stack.count <= 0 {
+        return None;
+    }
+    let item_name = crate::recipe_ingest::item_name_for_id(stack.item_id as u32);
+    Some(LiveHotbarStack {
+        max_damage: component_varint_value(stack, COMP_MAX_DAMAGE)
+            .or_else(|| item_prototype_max_damage(&item_name)),
+        damage: component_varint_value(stack, COMP_DAMAGE),
+        custom_name: component_text_value(stack, COMP_CUSTOM_NAME),
+        lore: component_lore_values(stack),
+        enchanted: item_stack_has_glint(stack),
+        count: stack.count,
+        item_name,
+    })
 }
 
 /// Best-effort harvest-tool family from a registry block id — the
@@ -13289,7 +15108,7 @@ mod tests {
             sneak: true,
         });
         assert!(live.sneaking);
-        let Ok(WorkerCommand::Movement(m)) = rx.try_recv() else {
+        let Ok(WorkerCommand::Movement { movement: m, .. }) = rx.try_recv() else {
             panic!("expected Movement command");
         };
         assert!(m.sneak);
@@ -13632,7 +15451,7 @@ mod tests {
 
         // Alive: movement reaches the worker queue.
         live.send_movement(move_cmd([1.0, 64.0, 2.0]));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement(_)));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement { .. }));
 
         // Zero health without a kill packet: the fallback marks death.
         live.apply_event(ClientPlayEvent::Play(PlayEvent::SetHealth {
@@ -13697,7 +15516,7 @@ mod tests {
             pitch: -10.0,
         });
         live.send_movement(move_cmd([1.0, 64.0, 4.0]));
-        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement(_)));
+        assert!(matches!(rx.recv().unwrap(), WorkerCommand::Movement { .. }));
     }
 
     /// A `JoinGame` with `hardcore` set makes the death screen
