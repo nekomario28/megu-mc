@@ -260,154 +260,109 @@ const QOL_LOADERS: &[ModLoaderTag] = &[ModLoaderTag::Fabric, ModLoaderTag::NeoFo
 /// No jars or mod binaries are bundled with this catalog.
 pub const CURATED_MODRINTH_QOL_MODS: [CuratedModrinthQolMod; 15] = [
     CuratedModrinthQolMod {
-        slug: "jade",
-        name: "Jade",
+        slug: "jade", name: "Jade",
         summary_en: "Shows block, entity, and fluid information in a HUD.",
         summary_ja: "ブロックやエンティティの情報をHUDに表示。",
-        category: QolSubCategory::HudInfo,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::HudInfo, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::LookingAtHud),
     },
     CuratedModrinthQolMod {
-        slug: "mouse-tweaks",
-        name: "Mouse Tweaks",
+        slug: "mouse-tweaks", name: "Mouse Tweaks",
         summary_en: "Faster inventory dragging and item transfers.",
         summary_ja: "インベントリのドラッグ操作と移動を改善。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::InventoryDragControls),
     },
     CuratedModrinthQolMod {
-        slug: "inventory-profiles-next",
-        name: "Inventory Profiles Next",
+        slug: "inventory-profiles-next", name: "Inventory Profiles Next",
         summary_en: "Inventory sorting and configurable item management.",
         summary_ja: "インベントリの整理とアイテム管理。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::InventorySort),
     },
     CuratedModrinthQolMod {
-        slug: "inventory-essentials",
-        name: "Inventory Essentials",
+        slug: "inventory-essentials", name: "Inventory Essentials",
         summary_en: "Convenient inventory and item movement shortcuts.",
         summary_ja: "インベントリ操作とアイテム移動の補助。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::InventorySort),
     },
     CuratedModrinthQolMod {
-        slug: "appleskin",
-        name: "AppleSkin",
+        slug: "appleskin", name: "AppleSkin",
         summary_en: "Previews food, hunger, and saturation values.",
         summary_ja: "食料の回復量や隠し満腹度を表示。",
-        category: QolSubCategory::HudInfo,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::HudInfo, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::HungerSaturationPreview),
     },
     CuratedModrinthQolMod {
-        slug: "shulkerboxtooltip",
-        name: "ShulkerBoxTooltip",
+        slug: "shulkerboxtooltip", name: "ShulkerBoxTooltip",
         summary_en: "Previews contents of shulker boxes in tooltips.",
         summary_ja: "シュルカーボックスの中身をツールチップで確認。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::ContainerTooltipPreview),
     },
     CuratedModrinthQolMod {
-        slug: "emi",
-        name: "EMI",
+        slug: "emi", name: "EMI",
         summary_en: "Searchable recipe and item browser.",
         summary_ja: "レシピとアイテムの検索ブラウザ。",
-        category: QolSubCategory::Recipes,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::Recipes, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::RecipeBrowser),
     },
     CuratedModrinthQolMod {
-        slug: "jei",
-        name: "Just Enough Items (JEI)",
+        slug: "jei", name: "Just Enough Items (JEI)",
         summary_en: "Displays item lists and crafting recipes.",
         summary_ja: "アイテム一覧とクラフトレシピを表示。",
-        category: QolSubCategory::Recipes,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::Recipes, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::RecipeBrowser),
     },
     CuratedModrinthQolMod {
-        slug: "controlling",
-        name: "Controlling",
+        slug: "controlling", name: "Controlling",
         summary_en: "Finds key bindings and their conflicts.",
         summary_ja: "キー割り当てと競合を検索。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: None,
     },
     CuratedModrinthQolMod {
-        slug: "searchables",
-        name: "Searchables",
+        slug: "searchables", name: "Searchables",
         summary_en: "Shared search utilities for modded interfaces.",
         summary_ja: "Modの検索UIを支える共通ライブラリ。",
-        category: QolSubCategory::InventoryInput,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::InventoryInput, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: None,
     },
     CuratedModrinthQolMod {
-        slug: "betterf3",
-        name: "BetterF3",
+        slug: "betterf3", name: "BetterF3",
         summary_en: "Customizable, readable debug HUD.",
         summary_ja: "デバッグHUDの表示を整理・カスタマイズ。",
-        category: QolSubCategory::HudInfo,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::HudInfo, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: None,
     },
     CuratedModrinthQolMod {
-        slug: "continuity",
-        name: "Continuity",
+        slug: "continuity", name: "Continuity",
         summary_en: "Connected textures for compatible resource packs.",
         summary_ja: "対応リソースパックの連結テクスチャ。",
-        category: QolSubCategory::VisualsCompat,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::VisualsCompat, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::ConnectedTextures),
     },
     CuratedModrinthQolMod {
-        slug: "entity-model-features",
-        name: "Entity Model Features (EMF)",
+        slug: "entity-model-features", name: "Entity Model Features (EMF)",
         summary_en: "Custom entity models from compatible resource packs.",
         summary_ja: "対応パックのカスタムエンティティモデル。",
-        category: QolSubCategory::VisualsCompat,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::VisualsCompat, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::EmfModels),
     },
     CuratedModrinthQolMod {
         // Modrinth's canonical project slug has no hyphens.
-        slug: "entitytexturefeatures",
-        name: "Entity Texture Features (ETF)",
+        slug: "entitytexturefeatures", name: "Entity Texture Features (ETF)",
         summary_en: "Custom entity textures from compatible resource packs.",
         summary_ja: "対応パックのカスタムエンティティテクスチャ。",
-        category: QolSubCategory::VisualsCompat,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::VisualsCompat, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: Some(BuiltinQolFeature::EtfTextures),
     },
     CuratedModrinthQolMod {
-        slug: "chat-heads",
-        name: "Chat Heads",
+        slug: "chat-heads", name: "Chat Heads",
         summary_en: "Displays player avatars next to chat messages.",
         summary_ja: "チャットにプレイヤーアイコンを表示。",
-        category: QolSubCategory::VisualsCompat,
-        loaders: QOL_LOADERS,
-        target_version: "1.21.1",
+        category: QolSubCategory::VisualsCompat, loaders: QOL_LOADERS, target_version: "1.21.1",
         yields_builtin_qol: None,
     },
 ];
@@ -475,14 +430,32 @@ pub fn active_builtin_qol_overrides(installed_mod_ids: &[&str]) -> BuiltinQolDef
     deference
 }
 
-fn curated_entry(mod_info: &CuratedModrinthQolMod) -> ModManagerEntry {
-    let mut entry = ModManagerEntry::new(mod_info.slug, mod_info.name, "MC 1.21.1");
-    entry.summary = mod_info.summary_en.to_owned();
+/// Shared metadata-only catalog row: MC 1.21.1, disabled, client-only,
+/// pointing at the official Modrinth project page.
+fn catalog_entry(
+    slug: &str,
+    name: &str,
+    summary: &str,
+    loader: ModLoaderTag,
+    modrinth_url: String,
+) -> ModManagerEntry {
+    let mut entry = ModManagerEntry::new(slug, name, "MC 1.21.1");
+    entry.summary = summary.to_owned();
     entry.enabled = false;
-    entry.loader = mod_info.loaders[0];
+    entry.loader = loader;
     entry.tier = ModAdaptationBadge::ClientOnly;
-    entry.modrinth_url = modrinth_project_url(mod_info.slug).unwrap_or_default();
+    entry.modrinth_url = modrinth_url;
     entry
+}
+
+fn curated_entry(mod_info: &CuratedModrinthQolMod) -> ModManagerEntry {
+    catalog_entry(
+        mod_info.slug,
+        mod_info.name,
+        mod_info.summary_en,
+        mod_info.loaders[0],
+        modrinth_project_url(mod_info.slug).unwrap_or_default(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -563,81 +536,54 @@ const NEOFORGE_ONLY: &[ModLoaderTag] = &[ModLoaderTag::NeoForge];
 /// jars or assets are ever bundled with this list.
 pub const RECOMMENDED_COMMUNITY_MODS: [RecommendedModEntry; 7] = [
     RecommendedModEntry {
-        slug: "jade",
-        name: "Jade",
-        author: "Snownee",
-        license_spdx: "CC-BY-NC-SA-4.0",
+        slug: "jade", name: "Jade", author: "Snownee", license_spdx: "CC-BY-NC-SA-4.0",
         category: RecommendedModCategory::HudInfo,
         en_summary: "Shows information about the block or entity you look at.",
         ja_summary: "見ている物の情報をHUDに表示。",
-        needs_gui_bridge: true,
-        loaders: FABRIC_AND_NEOFORGE,
+        needs_gui_bridge: true, loaders: FABRIC_AND_NEOFORGE,
     },
     RecommendedModEntry {
-        slug: "appleskin",
-        name: "AppleSkin",
-        author: "squeek502",
-        license_spdx: "Unlicense",
+        slug: "appleskin", name: "AppleSkin", author: "squeek502", license_spdx: "Unlicense",
         category: RecommendedModCategory::HudInfo,
         en_summary: "Previews food, hunger, and saturation values.",
         ja_summary: "食料の回復量や隠し満腹度を表示。",
-        needs_gui_bridge: true,
-        loaders: FABRIC_AND_NEOFORGE,
+        needs_gui_bridge: true, loaders: FABRIC_AND_NEOFORGE,
     },
     RecommendedModEntry {
-        slug: "mouse-tweaks",
-        name: "Mouse Tweaks",
-        author: "YaLTeR",
-        license_spdx: "BSD-3-Clause",
+        slug: "mouse-tweaks", name: "Mouse Tweaks", author: "YaLTeR", license_spdx: "BSD-3-Clause",
         category: RecommendedModCategory::Inventory,
         en_summary: "Faster inventory dragging and item transfers.",
         ja_summary: "インベントリのドラッグ操作と移動を改善。",
-        needs_gui_bridge: false,
-        loaders: FABRIC_AND_NEOFORGE,
+        needs_gui_bridge: false, loaders: FABRIC_AND_NEOFORGE,
     },
     RecommendedModEntry {
-        slug: "shulkerboxtooltip",
-        name: "ShulkerBoxTooltip",
-        author: "MisterPeModder",
-        license_spdx: "MIT",
-        category: RecommendedModCategory::Inventory,
+        slug: "shulkerboxtooltip", name: "ShulkerBoxTooltip", author: "MisterPeModder",
+        license_spdx: "MIT", category: RecommendedModCategory::Inventory,
         en_summary: "Previews contents of shulker boxes in tooltips.",
         ja_summary: "シュルカーボックスの中身をツールチップで確認。",
-        needs_gui_bridge: true,
-        loaders: FABRIC_AND_NEOFORGE,
+        needs_gui_bridge: true, loaders: FABRIC_AND_NEOFORGE,
     },
     RecommendedModEntry {
-        slug: "create",
-        name: "Create",
-        author: "simibubi",
-        license_spdx: "MIT",
+        slug: "create", name: "Create", author: "simibubi", license_spdx: "MIT",
         category: RecommendedModCategory::Content,
         en_summary: "Rotational machinery, contraptions, and automation.",
         ja_summary: "回転する機械でいろいろな物を作るコンテンツMod。",
-        needs_gui_bridge: true,
-        loaders: NEOFORGE_ONLY,
+        needs_gui_bridge: true, loaders: NEOFORGE_ONLY,
     },
     RecommendedModEntry {
-        slug: "farmers-delight-refabricated",
-        name: "Farmer's Delight (Refabricated)",
-        author: "MehVahdJukaar, Cassian, vectorwing",
-        license_spdx: "MIT",
+        slug: "farmers-delight-refabricated", name: "Farmer's Delight (Refabricated)",
+        author: "MehVahdJukaar, Cassian, vectorwing", license_spdx: "MIT",
         category: RecommendedModCategory::Content,
         en_summary: "Cozy farming and cooking expansion (Fabric port).",
         ja_summary: "新しい作物と料理で食べ物あそびがふえるMod。",
-        needs_gui_bridge: false,
-        loaders: FABRIC_ONLY,
+        needs_gui_bridge: false, loaders: FABRIC_ONLY,
     },
     RecommendedModEntry {
-        slug: "tectonic",
-        name: "Tectonic",
-        author: "Apollo",
-        license_spdx: "MIT",
+        slug: "tectonic", name: "Tectonic", author: "Apollo", license_spdx: "MIT",
         category: RecommendedModCategory::World,
         en_summary: "Grander, more varied terrain generation.",
         ja_summary: "ワールドの形を作りかえる生成Mod。",
-        needs_gui_bridge: false,
-        loaders: FABRIC_AND_NEOFORGE,
+        needs_gui_bridge: false, loaders: FABRIC_AND_NEOFORGE,
     },
 ];
 
@@ -647,14 +593,15 @@ pub fn recommended_community_mods() -> &'static [RecommendedModEntry] {
 }
 
 fn community_entry(info: &RecommendedModEntry) -> ModManagerEntry {
-    let mut entry = ModManagerEntry::new(info.slug, info.name, "MC 1.21.1");
-    entry.summary = info.en_summary.to_owned();
+    let mut entry = catalog_entry(
+        info.slug,
+        info.name,
+        info.en_summary,
+        info.loaders[0],
+        info.modrinth_url().unwrap_or_default(),
+    );
     entry.authors = vec![info.author.to_owned()];
     entry.license = info.license_spdx.to_owned();
-    entry.enabled = false;
-    entry.loader = info.loaders[0];
-    entry.tier = ModAdaptationBadge::ClientOnly;
-    entry.modrinth_url = info.modrinth_url().unwrap_or_default();
     entry
 }
 
@@ -1286,6 +1233,32 @@ fn tag_matches(tag: Tag, entry: &ModManagerEntry, enabled: bool) -> bool {
     }
 }
 
+/// `(pill text, bg, fg)` for an adaptation tier (list pill + detail badge).
+fn tier_pill_colors(tier: ModAdaptationBadge) -> (&'static str, UiColor, UiColor) {
+    match tier {
+        ModAdaptationBadge::Tier1Native => ("NATIVE", palette::ACCENT, palette::TEXT_DARK),
+        ModAdaptationBadge::Tier2Shim => ("SHIM", palette::WARNING, palette::TEXT_DARK),
+        ModAdaptationBadge::Tier3Fallback => ("FALLBACK", palette::DANGER, palette::TEXT),
+        ModAdaptationBadge::Superseded => ("SUPER", palette::BUTTON_DISABLED, palette::TEXT_DIM),
+        ModAdaptationBadge::ClientOnly => ("CLIENT", palette::AIR, palette::TEXT_DARK),
+    }
+}
+
+/// Score one query token: `Some(score)` on match, `None` when it excludes.
+fn query_token_score(token: &QueryToken, entry: &ModManagerEntry, enabled: bool) -> Option<u32> {
+    match token {
+        QueryToken::Text(text) if !text.is_empty() => text_token_score(entry, text),
+        QueryToken::Text(_) => Some(0),
+        QueryToken::Author(author) => entry
+            .authors
+            .iter()
+            .any(|a| a.to_lowercase().contains(author.as_str()))
+            .then_some(0),
+        QueryToken::Tag(Some(tag)) => tag_matches(*tag, entry, enabled).then_some(0),
+        QueryToken::Tag(None) => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Screen state
 // ---------------------------------------------------------------------------
@@ -1585,11 +1558,7 @@ impl ModManagerState {
 
     /// Status line the host can show while the soft reload runs.
     pub fn soft_reload_status(&self, lang: UiLang) -> &'static str {
-        tr(
-            lang,
-            "Applying mod changes (soft reload)...",
-            "Mod変更を適用中（内部再読み込み）...",
-        )
+        tr(lang, "Applying mod changes (soft reload)...", "Mod変更を適用中（内部再読み込み）...")
     }
 
     /// Install/replace the structured missing-dependency consent plan.
@@ -1621,12 +1590,7 @@ impl ModManagerState {
         let ids: Vec<&str> = self
             .entries
             .iter()
-            .filter(|entry| {
-                self.pending
-                    .get(&entry.mod_id)
-                    .copied()
-                    .unwrap_or(entry.enabled)
-            })
+            .filter(|entry| self.staged_enabled(entry))
             .map(|entry| entry.mod_id.as_str())
             .collect();
         active_builtin_qol_overrides(&ids)
@@ -1642,21 +1606,39 @@ impl ModManagerState {
         self.pending.get(mod_id).copied()
     }
 
+    /// Enabled state after staged overrides for `entry`.
+    fn staged_enabled(&self, entry: &ModManagerEntry) -> bool {
+        self.pending
+            .get(&entry.mod_id)
+            .copied()
+            .unwrap_or(entry.enabled)
+    }
+
     /// Enabled state after staged overrides (what the UI actually shows).
     pub fn effective_enabled(&self, mod_id: &str) -> Option<bool> {
-        let entry = self.entries.iter().find(|e| e.mod_id == mod_id)?;
-        Some(self.pending.get(mod_id).copied().unwrap_or(entry.enabled))
+        self.entries
+            .iter()
+            .find(|e| e.mod_id == mod_id)
+            .map(|e| self.staged_enabled(e))
+    }
+
+    /// `(bg, fg)` for a stone button: hover highlight over `base`.
+    fn btn_colors(&self, id: ModManagerWidgetId, base: UiColor, fg: UiColor) -> (UiColor, UiColor) {
+        (
+            if self.hover == Some(id) {
+                palette::BUTTON_HOVER
+            } else {
+                base
+            },
+            fg,
+        )
     }
 
     fn enabled_at(&self, index: usize) -> bool {
         if self.browsing_catalog() {
             return false;
         }
-        let entry = &self.entries[index];
-        self.pending
-            .get(&entry.mod_id)
-            .copied()
-            .unwrap_or(entry.enabled)
+        self.staged_enabled(&self.entries[index])
     }
 
     /// Indices into the active entries slice (`entries` when installed,
@@ -1709,34 +1691,9 @@ impl ModManagerState {
             let mut score = 0u32;
             let mut ok = true;
             for token in &tokens {
-                match token {
-                    QueryToken::Text(text) if !text.is_empty() => {
-                        match text_token_score(entry, text) {
-                            Some(s) => score += s,
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        }
-                    }
-                    QueryToken::Text(_) => {}
-                    QueryToken::Author(author) => {
-                        if !entry
-                            .authors
-                            .iter()
-                            .any(|a| a.to_lowercase().contains(author.as_str()))
-                        {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    QueryToken::Tag(Some(tag)) => {
-                        if !tag_matches(*tag, entry, enabled) {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    QueryToken::Tag(None) => {
+                match query_token_score(token, entry, enabled) {
+                    Some(s) => score += s,
+                    None => {
                         ok = false;
                         break;
                     }
@@ -1813,11 +1770,7 @@ impl ModManagerState {
             return;
         };
         let entry = &self.entries[index];
-        let want = !self
-            .pending
-            .get(&entry.mod_id)
-            .copied()
-            .unwrap_or(entry.enabled);
+        let want = !self.staged_enabled(entry);
         if want == entry.enabled {
             self.pending.remove(&entry.mod_id);
         } else {
@@ -1869,6 +1822,17 @@ impl ModManagerState {
     /// outward actions the host must perform — usually empty, one element
     /// for buttons.
     pub fn activate(&mut self, id: ModManagerWidgetId) -> Vec<ModManagerAction> {
+        for handler in [
+            Self::activate_catalog_view,
+            Self::activate_entry,
+            Self::activate_plamo,
+            Self::activate_consent,
+            Self::activate_links,
+        ] {
+            if let Some(actions) = handler(self, id) {
+                return actions;
+            }
+        }
         match id {
             ModManagerWidgetId::SearchField => self.search_focused = true,
             ModManagerWidgetId::SearchClear => {
@@ -1882,43 +1846,6 @@ impl ModManagerState {
             ModManagerWidgetId::FilterIssues => self.set_filter(ModManagerFilter::Issues),
             ModManagerWidgetId::FilterNative => self.set_filter(ModManagerFilter::Native),
             ModManagerWidgetId::FilterBuiltinModules => self.set_filter(ModManagerFilter::BuiltinModules),
-            ModManagerWidgetId::FilterRecommendedQol => {
-                if self.filter == ModManagerFilter::RecommendedQol {
-                    self.recommended_category = None;
-                    self.after_view_change();
-                } else {
-                    self.set_filter(ModManagerFilter::RecommendedQol);
-                }
-            }
-            ModManagerWidgetId::FilterBrowse => self.set_filter(ModManagerFilter::Browse),
-            ModManagerWidgetId::BrowseQolHud => self.set_browse_category(BrowseCategory::QolHud),
-            ModManagerWidgetId::BrowseContent => self.set_browse_category(BrowseCategory::Content),
-            ModManagerWidgetId::BrowsePacks => self.set_browse_category(BrowseCategory::Packs),
-            ModManagerWidgetId::BrowseKind => {
-                self.browse_project_kind = self.browse_project_kind.next();
-                self.after_view_change();
-            }
-            ModManagerWidgetId::ModrinthSearch => {
-                if self.filter == ModManagerFilter::Browse {
-                    return vec![ModManagerAction::OpenUrl(build_modrinth_search_url(
-                        &self.browse_query,
-                        self.browse_project_kind,
-                        RECOMMENDED_MC_VERSION,
-                    ))];
-                }
-            }
-            ModManagerWidgetId::QolHudInfo => {
-                self.set_recommended_category(QolSubCategory::HudInfo)
-            }
-            ModManagerWidgetId::QolInventoryInput => {
-                self.set_recommended_category(QolSubCategory::InventoryInput)
-            }
-            ModManagerWidgetId::QolRecipes => {
-                self.set_recommended_category(QolSubCategory::Recipes)
-            }
-            ModManagerWidgetId::QolVisualsCompat => {
-                self.set_recommended_category(QolSubCategory::VisualsCompat)
-            }
             ModManagerWidgetId::ToggleLibraries => {
                 self.show_libraries = !self.show_libraries;
                 self.after_view_change();
@@ -1944,91 +1871,6 @@ impl ModManagerState {
                 }
             }
             ModManagerWidgetId::ToggleEnabled => self.toggle_selected(),
-            ModManagerWidgetId::DownloadMissingDeps => {
-                if let Some(entry) = self.selected_entry() {
-                    if !entry.missing_deps.is_empty() {
-                        return vec![ModManagerAction::DownloadMissingFromModrinth {
-                            mod_id: entry.mod_id.clone(),
-                            missing_deps: entry.missing_deps.clone(),
-                        }];
-                    }
-                }
-            }
-            ModManagerWidgetId::RollbackProfile => {
-                return vec![ModManagerAction::RollbackModProfile];
-            }
-            ModManagerWidgetId::PlamoPreset => {
-                self.plamo_panel.preset = self.plamo_panel.preset.next();
-                return vec![ModManagerAction::SelectPlamoPreset(self.plamo_panel.preset)];
-            }
-            ModManagerWidgetId::PlamoAction => {
-                if self.plamo_panel.action_enabled() {
-                    self.plamo_panel.busy = true;
-                    return vec![ModManagerAction::InstallOrTranslatePlamo(
-                        self.plamo_panel.preset,
-                    )];
-                }
-            }
-            ModManagerWidgetId::CancelPlamo => {
-                if self.plamo_panel.busy {
-                    self.plamo_panel.progress_label =
-                        tr(self.lang, "Cancelling...", "キャンセルしています...").to_owned();
-                    return vec![ModManagerAction::CancelPlamo];
-                }
-            }
-            ModManagerWidgetId::ToggleAutoTranslationPack => {
-                self.plamo_panel.auto_pack_enabled = !self.plamo_panel.auto_pack_enabled;
-                return vec![ModManagerAction::ToggleAutoTranslationPack(
-                    self.plamo_panel.auto_pack_enabled,
-                )];
-            }
-            ModManagerWidgetId::ConsentApproveAutoFetch => {
-                if let Some(plan) = &mut self.missing_dependency_consent {
-                    plan.decision =
-                        Some(MissingDependencyConsentDecision::ApproveAutoFetchAndSoftReload);
-                    return vec![ModManagerAction::ResolveMissingDependencyConsent(
-                        MissingDependencyConsentDecision::ApproveAutoFetchAndSoftReload,
-                    )];
-                }
-            }
-            ModManagerWidgetId::ConsentIsolateMods => {
-                if let Some(plan) = &mut self.missing_dependency_consent {
-                    plan.decision = Some(MissingDependencyConsentDecision::IsolateUnsatisfiedMods);
-                    return vec![ModManagerAction::ResolveMissingDependencyConsent(
-                        MissingDependencyConsentDecision::IsolateUnsatisfiedMods,
-                    )];
-                }
-            }
-            ModManagerWidgetId::ConfigureMod => {
-                if let Some(entry) = self.selected_entry() {
-                    if entry.has_config {
-                        return vec![ModManagerAction::ConfigureMod(entry.mod_id.clone())];
-                    }
-                }
-            }
-            ModManagerWidgetId::LinkWebsite
-            | ModManagerWidgetId::LinkIssues
-            | ModManagerWidgetId::LinkSource
-            | ModManagerWidgetId::LinkModrinth => {
-                if let Some(entry) = self.selected_entry() {
-                    let url = match id {
-                        ModManagerWidgetId::LinkWebsite => &entry.website_url,
-                        ModManagerWidgetId::LinkIssues => &entry.issues_url,
-                        ModManagerWidgetId::LinkSource => &entry.source_url,
-                        _ => &entry.modrinth_url,
-                    };
-                    if !url.is_empty() {
-                        return vec![ModManagerAction::OpenUrl(url.clone())];
-                    }
-                }
-            }
-            ModManagerWidgetId::InstallRecommended => {
-                if self.browsing_catalog() {
-                    if let Some(entry) = self.selected_entry() {
-                        return vec![ModManagerAction::OpenUrl(entry.modrinth_url.clone())];
-                    }
-                }
-            }
             ModManagerWidgetId::AddFromModrinth => {
                 return vec![ModManagerAction::OpenModrinthBrowser];
             }
@@ -2051,8 +1893,172 @@ impl ModManagerState {
                 // settings owner, so activation is intentionally inert.
             }
             ModManagerWidgetId::Done => return vec![ModManagerAction::Close],
+            _ => {}
         }
         Vec::new()
+    }
+
+    /// Catalog-view widgets (filters, shelf pills, kind cycler, Modrinth
+    /// search, install). `None` when `id` belongs to another group.
+    fn activate_catalog_view(&mut self, id: ModManagerWidgetId) -> Option<Vec<ModManagerAction>> {
+        match id {
+            ModManagerWidgetId::FilterRecommendedQol => {
+                if self.filter == ModManagerFilter::RecommendedQol {
+                    self.recommended_category = None;
+                    self.after_view_change();
+                } else {
+                    self.set_filter(ModManagerFilter::RecommendedQol);
+                }
+            }
+            ModManagerWidgetId::FilterBrowse => self.set_filter(ModManagerFilter::Browse),
+            ModManagerWidgetId::BrowseQolHud => self.set_browse_category(BrowseCategory::QolHud),
+            ModManagerWidgetId::BrowseContent => self.set_browse_category(BrowseCategory::Content),
+            ModManagerWidgetId::BrowsePacks => self.set_browse_category(BrowseCategory::Packs),
+            ModManagerWidgetId::BrowseKind => {
+                self.browse_project_kind = self.browse_project_kind.next();
+                self.after_view_change();
+            }
+            ModManagerWidgetId::ModrinthSearch => {
+                if self.filter == ModManagerFilter::Browse {
+                    return Some(vec![ModManagerAction::OpenUrl(build_modrinth_search_url(
+                        &self.browse_query,
+                        self.browse_project_kind,
+                        RECOMMENDED_MC_VERSION,
+                    ))]);
+                }
+            }
+            ModManagerWidgetId::QolHudInfo => {
+                self.set_recommended_category(QolSubCategory::HudInfo)
+            }
+            ModManagerWidgetId::QolInventoryInput => {
+                self.set_recommended_category(QolSubCategory::InventoryInput)
+            }
+            ModManagerWidgetId::QolRecipes => {
+                self.set_recommended_category(QolSubCategory::Recipes)
+            }
+            ModManagerWidgetId::QolVisualsCompat => {
+                self.set_recommended_category(QolSubCategory::VisualsCompat)
+            }
+            ModManagerWidgetId::InstallRecommended => {
+                if self.browsing_catalog() {
+                    if let Some(entry) = self.selected_entry() {
+                        return Some(vec![ModManagerAction::OpenUrl(
+                            entry.modrinth_url.clone(),
+                        )]);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    /// Detail-pane actions for the selected installed entry. `None` when
+    /// `id` belongs to another group.
+    fn activate_entry(&mut self, id: ModManagerWidgetId) -> Option<Vec<ModManagerAction>> {
+        match id {
+            ModManagerWidgetId::DownloadMissingDeps => {
+                if let Some(entry) = self.selected_entry() {
+                    if !entry.missing_deps.is_empty() {
+                        return Some(vec![ModManagerAction::DownloadMissingFromModrinth {
+                            mod_id: entry.mod_id.clone(),
+                            missing_deps: entry.missing_deps.clone(),
+                        }]);
+                    }
+                }
+            }
+            ModManagerWidgetId::RollbackProfile => {
+                return Some(vec![ModManagerAction::RollbackModProfile]);
+            }
+            ModManagerWidgetId::ConfigureMod => {
+                if let Some(entry) = self.selected_entry() {
+                    if entry.has_config {
+                        return Some(vec![ModManagerAction::ConfigureMod(entry.mod_id.clone())]);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    /// PLaMo translator panel widgets. `None` when `id` is foreign.
+    fn activate_plamo(&mut self, id: ModManagerWidgetId) -> Option<Vec<ModManagerAction>> {
+        match id {
+            ModManagerWidgetId::PlamoPreset => {
+                self.plamo_panel.preset = self.plamo_panel.preset.next();
+                return Some(vec![ModManagerAction::SelectPlamoPreset(self.plamo_panel.preset)]);
+            }
+            ModManagerWidgetId::PlamoAction => {
+                if self.plamo_panel.action_enabled() {
+                    self.plamo_panel.busy = true;
+                    return Some(vec![ModManagerAction::InstallOrTranslatePlamo(
+                        self.plamo_panel.preset,
+                    )]);
+                }
+            }
+            ModManagerWidgetId::CancelPlamo => {
+                if self.plamo_panel.busy {
+                    self.plamo_panel.progress_label =
+                        tr(self.lang, "Cancelling...", "キャンセルしています...").to_owned();
+                    return Some(vec![ModManagerAction::CancelPlamo]);
+                }
+            }
+            ModManagerWidgetId::ToggleAutoTranslationPack => {
+                self.plamo_panel.auto_pack_enabled = !self.plamo_panel.auto_pack_enabled;
+                return Some(vec![ModManagerAction::ToggleAutoTranslationPack(
+                    self.plamo_panel.auto_pack_enabled,
+                )]);
+            }
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    /// Missing-dependency consent decision buttons. `None` when foreign.
+    fn activate_consent(&mut self, id: ModManagerWidgetId) -> Option<Vec<ModManagerAction>> {
+        let decision = match id {
+            ModManagerWidgetId::ConsentApproveAutoFetch => {
+                MissingDependencyConsentDecision::ApproveAutoFetchAndSoftReload
+            }
+            ModManagerWidgetId::ConsentIsolateMods => {
+                MissingDependencyConsentDecision::IsolateUnsatisfiedMods
+            }
+            _ => return None,
+        };
+        if let Some(plan) = &mut self.missing_dependency_consent {
+            plan.decision = Some(decision);
+            return Some(vec![ModManagerAction::ResolveMissingDependencyConsent(
+                decision,
+            )]);
+        }
+        Some(Vec::new())
+    }
+
+    /// Detail-pane link buttons for the selected entry's non-empty URLs.
+    /// `None` when `id` is foreign.
+    fn activate_links(&mut self, id: ModManagerWidgetId) -> Option<Vec<ModManagerAction>> {
+        if !matches!(
+            id,
+            ModManagerWidgetId::LinkWebsite
+                | ModManagerWidgetId::LinkIssues
+                | ModManagerWidgetId::LinkSource
+                | ModManagerWidgetId::LinkModrinth
+        ) {
+            return None;
+        }
+        if let Some(entry) = self.selected_entry() {
+            let url = match id {
+                ModManagerWidgetId::LinkWebsite => &entry.website_url,
+                ModManagerWidgetId::LinkIssues => &entry.issues_url,
+                ModManagerWidgetId::LinkSource => &entry.source_url,
+                _ => &entry.modrinth_url,
+            };
+            if !url.is_empty() {
+                return Some(vec![ModManagerAction::OpenUrl(url.clone())]);
+            }
+        }
+        Some(Vec::new())
     }
 
     fn set_filter(&mut self, filter: ModManagerFilter) {
@@ -2269,10 +2275,7 @@ impl ModManagerState {
         let rows_w = w - 4 - if scrollable { 11 } else { 0 };
         if visible.is_empty() && page > 0 {
             lay.text_fit(
-                x + 5,
-                top + 4,
-                1,
-                palette::TEXT_DIM,
+                x + 5, top + 4, 1, palette::TEXT_DIM,
                 tr(self.lang, "No mods installed", "Modがインストールされていません"),
                 ((rows_w - 10) / 8).max(1) as usize,
             );
@@ -2283,12 +2286,9 @@ impl ModManagerState {
             let entry = &self.browsed_entries()[entry_index];
             lay.fill_rect(row, if row_slot == self.selected { palette::BUTTON_HOVER } else { palette::SLOT });
             lay.text_fit(
-                row.x + 4,
-                row.y + 4,
-                1,
+                row.x + 4, row.y + 4, 1,
                 if entry.enabled { palette::TEXT } else { palette::TEXT_DIM },
-                &entry.name,
-                ((rows_w - 8) / 8).max(1) as usize,
+                &entry.name, ((rows_w - 8) / 8).max(1) as usize,
             );
             lay.region(&mut hits, ModManagerWidgetId::ModRow(row_slot), row);
         }
@@ -2308,10 +2308,14 @@ impl ModManagerState {
             }
         }
 
-        lay.fill_rect(done, if self.hover == Some(ModManagerWidgetId::Done) { palette::BUTTON_HOVER } else { palette::BUTTON });
-        lay.border_rect(done, palette::BUTTON_BORDER);
-        lay.ctext_in(done, 1, palette::TEXT, done_label);
-        lay.region(&mut hits, ModManagerWidgetId::Done, done);
+        lay.button(
+            &mut hits,
+            done,
+            ModManagerWidgetId::Done,
+            self.btn_colors(ModManagerWidgetId::Done, palette::BUTTON, palette::TEXT),
+            done_label,
+            true,
+        );
         (lay.finish(), hits)
     }
 
@@ -2330,11 +2334,7 @@ impl ModManagerState {
             total
         );
         lay.text_fit(
-            MARGIN + 4,
-            MARGIN + 4,
-            2,
-            palette::TEXT,
-            &title,
+            MARGIN + 4, MARGIN + 4, 2, palette::TEXT, &title,
             ((lay.w - 2 * MARGIN - 8) / 16).max(1) as usize,
         );
 
@@ -2371,12 +2371,7 @@ impl ModManagerState {
                 tr(lang, "Search mods...", "Modを検索...")
             };
             lay.text_fit(
-                field.x + 5,
-                field.y + 4,
-                1,
-                palette::TEXT_DIM,
-                placeholder,
-                cells,
+                field.x + 5, field.y + 4, 1, palette::TEXT_DIM, placeholder, cells,
             );
         } else {
             let mut shown = query.to_owned();
@@ -2416,170 +2411,96 @@ impl ModManagerState {
         }
 
         let sort = UiRect::new(lay.w - MARGIN - sort_w, SEARCH_Y, sort_w as u32, 16);
-        let sort_bg = if self.hover == Some(ModManagerWidgetId::SortMode) {
-            palette::BUTTON_HOVER
-        } else {
-            palette::BUTTON
-        };
-        lay.fill_rect(sort, sort_bg);
-        lay.border_rect(sort, palette::BUTTON_BORDER);
-        lay.ctext_in(
+        lay.button(
+            hits,
             sort,
-            1,
-            palette::TEXT,
+            ModManagerWidgetId::SortMode,
+            self.btn_colors(ModManagerWidgetId::SortMode, palette::BUTTON, palette::TEXT),
             &fit_text(&sort_label, ((sort_w - 8) / 8).max(1) as usize),
+            true,
         );
-        lay.region(hits, ModManagerWidgetId::SortMode, sort);
     }
 
     fn render_filter_row(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
-        let lang = self.lang;
-        let pills: Vec<(String, ModManagerWidgetId, bool)> =
-            if self.filter == ModManagerFilter::Browse {
-                // Unified browse: Installed keeps the left slot, then the
-                // three shelves and the live-search project kind.
-                vec![
-                    (
-                        tr(lang, "Installed", "インストール済").to_owned(),
-                        ModManagerWidgetId::FilterAll,
-                        false,
-                    ),
-                    (
-                        BrowseCategory::QolHud.label(lang).to_owned(),
-                        ModManagerWidgetId::BrowseQolHud,
-                        self.browse_category == BrowseCategory::QolHud,
-                    ),
-                    (
-                        BrowseCategory::Content.label(lang).to_owned(),
-                        ModManagerWidgetId::BrowseContent,
-                        self.browse_category == BrowseCategory::Content,
-                    ),
-                    (
-                        BrowseCategory::Packs.label(lang).to_owned(),
-                        ModManagerWidgetId::BrowsePacks,
-                        self.browse_category == BrowseCategory::Packs,
-                    ),
-                    (
-                        format!(
-                            "{}: {}",
-                            tr(lang, "Kind", "タイプ"),
-                            self.browse_project_kind.label()
-                        ),
-                        ModManagerWidgetId::BrowseKind,
-                        false,
-                    ),
-                ]
-            } else if self.filter == ModManagerFilter::RecommendedQol {
-                vec![
-                    (
-                        tr(lang, "Installed", "インストール済").to_owned(),
-                        ModManagerWidgetId::FilterAll,
-                        false,
-                    ),
-                    (
-                        "Recommended QoL".to_owned(),
-                        ModManagerWidgetId::FilterRecommendedQol,
-                        self.recommended_category.is_none(),
-                    ),
-                    (
-                        "HUD".to_owned(),
-                        ModManagerWidgetId::QolHudInfo,
-                        self.recommended_category == Some(QolSubCategory::HudInfo),
-                    ),
-                    (
-                        "Inventory".to_owned(),
-                        ModManagerWidgetId::QolInventoryInput,
-                        self.recommended_category == Some(QolSubCategory::InventoryInput),
-                    ),
-                    (
-                        "Recipes".to_owned(),
-                        ModManagerWidgetId::QolRecipes,
-                        self.recommended_category == Some(QolSubCategory::Recipes),
-                    ),
-                    (
-                        "Visuals".to_owned(),
-                        ModManagerWidgetId::QolVisualsCompat,
-                        self.recommended_category == Some(QolSubCategory::VisualsCompat),
-                    ),
-                ]
-            } else {
-                vec![
-                    (
-                        tr(lang, "All", "すべて").to_owned(),
-                        ModManagerWidgetId::FilterAll,
-                        self.filter == ModManagerFilter::All,
-                    ),
-                    (
-                        tr(lang, "Built-in", "内蔵").to_owned(),
-                        ModManagerWidgetId::FilterBuiltinModules,
-                        self.filter == ModManagerFilter::BuiltinModules,
-                    ),
-                    (
-                        tr(lang, "Enabled", "有効").to_owned(),
-                        ModManagerWidgetId::FilterEnabled,
-                        self.filter == ModManagerFilter::Enabled,
-                    ),
-                    (
-                        tr(lang, "Issues", "問題あり").to_owned(),
-                        ModManagerWidgetId::FilterIssues,
-                        self.filter == ModManagerFilter::Issues,
-                    ),
-                    (
-                        tr(lang, "Native", "ネイティブ").to_owned(),
-                        ModManagerWidgetId::FilterNative,
-                        self.filter == ModManagerFilter::Native,
-                    ),
-                    (
-                        "QoL".to_owned(),
-                        ModManagerWidgetId::FilterRecommendedQol,
-                        false,
-                    ),
-                    (
-                        tr(lang, "+ Browse", "+ ブラウズ").to_owned(),
-                        ModManagerWidgetId::FilterBrowse,
-                        false,
-                    ),
-                    (
-                        if self.show_libraries {
-                            tr(lang, "Libs: ON", "ライブラリ: ON")
-                        } else {
-                            tr(lang, "Libs: OFF", "ライブラリ: OFF")
-                        }
-                        .to_owned(),
-                        ModManagerWidgetId::ToggleLibraries,
-                        self.show_libraries,
-                    ),
-                ]
-            };
         let mut x = MARGIN + 4;
-        for (label, id, active) in pills {
+        for (label, id, active) in self.filter_pills() {
             let w = crate::draw::text_width(&label, 1) as i32 + 12;
             if x + w > lay.w - MARGIN {
                 break;
             }
             let rect = UiRect::new(x, FILTER_Y, w as u32, 14);
-            let bg = if active {
-                palette::ACCENT
-            } else if self.hover == Some(id) {
-                palette::BUTTON_HOVER
+            let colors = if active {
+                (palette::ACCENT, palette::TEXT_DARK)
             } else {
-                palette::BUTTON
+                self.btn_colors(id, palette::BUTTON, palette::TEXT)
             };
-            lay.fill_rect(rect, bg);
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(
-                rect,
-                1,
-                if active {
-                    palette::TEXT_DARK
-                } else {
-                    palette::TEXT
-                },
-                &label,
-            );
-            lay.region(hits, id, rect);
+            lay.button(hits, rect, id, colors, &label, true);
             x += w + 4;
         }
+    }
+
+    /// `(label, widget, active)` triples painted by [`render_filter_row`].
+    fn filter_pills(&self) -> Vec<(String, ModManagerWidgetId, bool)> {
+        match self.filter {
+            ModManagerFilter::Browse => self.browse_pills(),
+            ModManagerFilter::RecommendedQol => self.recommended_pills(),
+            _ => self.installed_pills(),
+        }
+    }
+
+    /// Unified browse pills: Installed, then the three shelves and kind.
+    fn browse_pills(&self) -> Vec<(String, ModManagerWidgetId, bool)> {
+        let lang = self.lang;
+        let c = self.browse_category;
+        vec![
+            pill(tr(lang, "Installed", "インストール済"), ModManagerWidgetId::FilterAll, false),
+            pill(BrowseCategory::QolHud.label(lang), ModManagerWidgetId::BrowseQolHud, c == BrowseCategory::QolHud),
+            pill(BrowseCategory::Content.label(lang), ModManagerWidgetId::BrowseContent, c == BrowseCategory::Content),
+            pill(BrowseCategory::Packs.label(lang), ModManagerWidgetId::BrowsePacks, c == BrowseCategory::Packs),
+            pill(
+                format!("{}: {}", tr(lang, "Kind", "タイプ"), self.browse_project_kind.label()),
+                ModManagerWidgetId::BrowseKind,
+                false,
+            ),
+        ]
+    }
+
+    /// Recommended-QoL pills: catalog root plus its four sub-categories.
+    fn recommended_pills(&self) -> Vec<(String, ModManagerWidgetId, bool)> {
+        let cat = self.recommended_category;
+        let active = |sub| cat == Some(sub);
+        vec![
+            pill("Installed", ModManagerWidgetId::FilterAll, false),
+            pill("Recommended QoL", ModManagerWidgetId::FilterRecommendedQol, cat.is_none()),
+            pill("HUD", ModManagerWidgetId::QolHudInfo, active(QolSubCategory::HudInfo)),
+            pill("Inventory", ModManagerWidgetId::QolInventoryInput, active(QolSubCategory::InventoryInput)),
+            pill("Recipes", ModManagerWidgetId::QolRecipes, active(QolSubCategory::Recipes)),
+            pill("Visuals", ModManagerWidgetId::QolVisualsCompat, active(QolSubCategory::VisualsCompat)),
+        ]
+    }
+
+    /// Installed-list pills: status filters, catalog entry points, libs.
+    fn installed_pills(&self) -> Vec<(String, ModManagerWidgetId, bool)> {
+        let lang = self.lang;
+        let f = self.filter;
+        vec![
+            pill(tr(lang, "All", "すべて"), ModManagerWidgetId::FilterAll, f == ModManagerFilter::All),
+            pill(tr(lang, "Built-in", "内蔵"), ModManagerWidgetId::FilterBuiltinModules, f == ModManagerFilter::BuiltinModules),
+            pill(tr(lang, "Enabled", "有効"), ModManagerWidgetId::FilterEnabled, f == ModManagerFilter::Enabled),
+            pill(tr(lang, "Issues", "問題あり"), ModManagerWidgetId::FilterIssues, f == ModManagerFilter::Issues),
+            pill(tr(lang, "Native", "ネイティブ"), ModManagerWidgetId::FilterNative, f == ModManagerFilter::Native),
+            pill("QoL", ModManagerWidgetId::FilterRecommendedQol, false),
+            pill(tr(lang, "+ Browse", "+ ブラウズ"), ModManagerWidgetId::FilterBrowse, false),
+            pill(
+                if self.show_libraries {
+                    tr(lang, "Libs: ON", "ライブラリ: ON")
+                } else {
+                    tr(lang, "Libs: OFF", "ライブラリ: OFF")
+                },
+                ModManagerWidgetId::ToggleLibraries,
+                self.show_libraries,
+            ),
+        ]
     }
 
     fn render_builtin_modules(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
@@ -2593,12 +2514,8 @@ impl ModManagerState {
         lay.border_rect(pane, palette::PANEL_BORDER);
         let cells = ((w - 12) / 8).max(1) as usize;
         lay.text_fit(
-            x + 6,
-            top + 5,
-            1,
-            palette::ACCENT,
-            tr(lang, "Built-in Modules", "内蔵モジュール"),
-            cells,
+            x + 6, top + 5, 1, palette::ACCENT,
+            tr(lang, "Built-in Modules", "内蔵モジュール"), cells,
         );
 
         let row_pitch = if lay.w < 320 { 31 } else { 34 };
@@ -2613,23 +2530,16 @@ impl ModManagerState {
             if index == self.selected {
                 lay.border_rect(row, palette::ACCENT);
             }
-            let name = if lang == UiLang::Ja {
-                BUILTIN_MODULE_NAMES_JA[index]
+            let (names, descs) = if lang == UiLang::Ja {
+                (BUILTIN_MODULE_NAMES_JA, BUILTIN_MODULE_DESCRIPTIONS_JA)
             } else {
-                BUILTIN_MODULE_NAMES_EN[index]
+                (BUILTIN_MODULE_NAMES_EN, BUILTIN_MODULE_DESCRIPTIONS_EN)
             };
-            let desc = if lang == UiLang::Ja {
-                BUILTIN_MODULE_DESCRIPTIONS_JA[index]
-            } else {
-                BUILTIN_MODULE_DESCRIPTIONS_EN[index]
-            };
+            let name = names[index];
+            let desc = descs[index];
             let enabled = self.builtin_module_enabled(index);
             let compact = lay.w < 360;
-            let toggle_label = if enabled {
-                tr(lang, "ON", "ON")
-            } else {
-                tr(lang, "OFF", "OFF")
-            };
+            let toggle_label = if enabled { "ON" } else { "OFF" };
             let toggle_w = if compact { 42 } else { 54 };
             let config_w = if compact { 58 } else { 82 };
             let button_y = row.y + if compact { 5 } else { 7 };
@@ -2637,19 +2547,11 @@ impl ModManagerState {
             let config = UiRect::new(toggle.x - config_w - 4, button_y, config_w as u32, 16);
             let text_right = if compact { config.x - 6 } else { row.right() - toggle_w - config_w - 16 };
             lay.text_fit(
-                row.x + 5,
-                row.y + 3,
-                1,
-                palette::TEXT,
-                name,
+                row.x + 5, row.y + 3, 1, palette::TEXT, name,
                 ((text_right - row.x - 5) / 8).max(1) as usize,
             );
             lay.text_fit(
-                row.x + 5,
-                row.y + if compact { 14 } else { 17 },
-                1,
-                palette::TEXT_DIM,
-                desc,
+                row.x + 5, row.y + if compact { 14 } else { 17 }, 1, palette::TEXT_DIM, desc,
                 ((text_right - row.x - 5) / 8).max(1) as usize,
             );
             for (rect, id, label, accent) in [
@@ -2673,44 +2575,38 @@ impl ModManagerState {
                 } else {
                     palette::BUTTON
                 };
-                lay.fill_rect(rect, bg);
-                lay.border_rect(rect, palette::BUTTON_BORDER);
-                lay.ctext_in(
-                    rect,
-                    1,
-                    if accent { palette::TEXT_DARK } else { palette::TEXT },
-                    label,
-                );
-                lay.region(hits, id, rect);
+                let fg = if accent { palette::TEXT_DARK } else { palette::TEXT };
+                lay.button(hits, rect, id, (bg, fg), label, true);
             }
         }
         if max_scroll > 0 {
-            let sb_x = x + w - 14;
-            let up = UiRect::new(sb_x, top + 2, 10, 12);
-            let down = UiRect::new(sb_x, bottom - 14, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
-            lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
+            let (up, down) = scroll_arrow_buttons(lay, x + w - 14, top, bottom);
+            scroll_arrow_regions(lay, hits, up, down);
         }
     }
 
     fn render_panes(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
+        let g = self.pane_layout(lay);
+        let visible = self.visible_indices();
+        self.render_list_pane(lay, hits, &g, &visible);
+        if g.compact {
+            return;
+        }
+        self.render_detail_pane(lay, hits, &g, &visible);
+    }
+
+    /// Two-pane geometry in logical px; `compact` collapses to one
+    /// full-width list column when two useful panes cannot coexist.
+    fn pane_layout(&self, lay: &Lay) -> PaneGeom {
         let inner_w = lay.w - 2 * MARGIN - 8;
-        // Below the width where two useful panes can coexist, Mods & Packs
-        // becomes vanilla-compact: one full-width list column. Detail and
-        // per-mod actions are intentionally omitted rather than squeezed
-        // into overlapping hitboxes; Done and list scrolling stay live.
-        let compact_single_column = inner_w < 300;
+        let compact = inner_w < 300;
         // Keep at least a sliver of detail pane at minimum-width windows.
-        let min_list_w = if compact_single_column {
+        let min_list_w = if compact {
             30
         } else {
             140.min((inner_w - PANE_GAP - 40).max(30))
         };
-        let list_w = if compact_single_column {
+        let list_w = if compact {
             inner_w.max(30)
         } else {
             ((inner_w - PANE_GAP) * 2 / 5).clamp(min_list_w, 420)
@@ -2719,17 +2615,31 @@ impl ModManagerState {
         let list_right = list_x + list_w;
         let detail_x = list_right + PANE_GAP;
         let detail_w = MARGIN + 4 + inner_w - detail_x;
-        let top = LIST_TOP;
-        let bottom = lay.h - 4 - LIST_BOTTOM_OFF;
+        PaneGeom {
+            list_x,
+            list_w,
+            list_right,
+            detail_x,
+            detail_w,
+            top: LIST_TOP,
+            bottom: lay.h - 4 - LIST_BOTTOM_OFF,
+            compact,
+        }
+    }
 
-        // ---- left pane: scrollable list -------------------------------
-        let list_rect = UiRect::new(list_x, top, list_w as u32, (bottom - top) as u32);
+    /// Left pane: scrollable mod list, empty-state message, scrollbar.
+    fn render_list_pane(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        g: &PaneGeom,
+        visible: &[usize],
+    ) {
+        let list_rect = UiRect::new(g.list_x, g.top, g.list_w as u32, (g.bottom - g.top) as u32);
         lay.fill_rect(list_rect, DETAIL_BG);
         lay.border_rect(list_rect, palette::PANEL_BORDER);
 
-        let visible = self.visible_indices();
-        let catalog = self.browsing_catalog();
-        let page = ((bottom - top - 4) / ROW_PITCH).max(0) as usize;
+        let page = ((g.bottom - g.top - 4) / ROW_PITCH).max(0) as usize;
         let max_scroll = visible.len().saturating_sub(page);
         let scroll = self.scroll.min(max_scroll);
         // Keep the keyboard selection inside the viewport.
@@ -2743,133 +2653,146 @@ impl ModManagerState {
 
         let scrollable = visible.len() > page && page > 0;
         let scrollbar_w = if scrollable { 12 } else { 0 };
-        let rows_w = list_w - 4 - scrollbar_w;
+        let rows_w = g.list_w - 4 - scrollbar_w;
 
         if visible.is_empty() {
             let msg = if self.browsed_entries().is_empty() {
-                tr(
-                    self.lang,
-                    "No mods installed",
-                    "Modがインストールされていません",
-                )
+                tr(self.lang, "No mods installed", "Modがインストールされていません")
             } else {
                 tr(self.lang, "No matches", "一致するModがありません")
             };
             lay.text_fit(
-                list_x + 6,
-                top + 8,
-                1,
-                palette::TEXT_DIM,
-                msg,
-                ((list_w - 12) / 8).max(1) as usize,
+                g.list_x + 6, g.top + 8, 1, palette::TEXT_DIM, msg,
+                ((g.list_w - 12) / 8).max(1) as usize,
             );
         }
 
         for (row_slot, &entry_index) in visible.iter().enumerate().skip(scroll).take(page) {
-            let y = top + 2 + (row_slot - scroll) as i32 * ROW_PITCH;
-            let row = UiRect::new(list_x + 2, y, rows_w as u32, ROW_H as u32);
-            let entry = &self.browsed_entries()[entry_index];
-            let enabled = self.enabled_at(entry_index);
-            let is_sel = row_slot == self.selected;
-            let is_hover = self.hover == Some(ModManagerWidgetId::ModRow(row_slot));
-            lay.fill_rect(
-                row,
-                if is_sel {
-                    palette::BUTTON_HOVER
-                } else if is_hover {
-                    palette::BUTTON
-                } else {
-                    palette::SLOT
-                },
-            );
-            if self.pending.contains_key(&entry.mod_id) {
-                lay.fill(row.x, row.y, 2, row.h as i32, palette::ACCENT);
-            }
-            // Status pill (right-aligned on the name line).
-            let (pill_text, pill_bg, pill_fg) = if catalog {
-                ("GET", palette::AIR, palette::TEXT_DARK)
-            } else if !entry.missing_deps.is_empty() {
-                ("MISSING", palette::DANGER, palette::TEXT)
-            } else if !enabled {
-                ("OFF", palette::BUTTON_DISABLED, palette::TEXT_DIM)
-            } else {
-                match entry.tier {
-                    ModAdaptationBadge::Tier1Native => {
-                        ("NATIVE", palette::ACCENT, palette::TEXT_DARK)
-                    }
-                    ModAdaptationBadge::Tier2Shim => ("SHIM", palette::WARNING, palette::TEXT_DARK),
-                    ModAdaptationBadge::Tier3Fallback => {
-                        ("FALLBACK", palette::DANGER, palette::TEXT)
-                    }
-                    ModAdaptationBadge::Superseded => {
-                        ("SUPER", palette::BUTTON_DISABLED, palette::TEXT_DIM)
-                    }
-                    ModAdaptationBadge::ClientOnly => ("CLIENT", palette::AIR, palette::TEXT_DARK),
-                }
-            };
-            let pill_w = pill_text.len() as i32 * 8 + 8;
-            let pill = UiRect::new(row.right() - pill_w - 3, y + 3, pill_w as u32, 11);
-            lay.fill_rect(pill, pill_bg);
-            lay.ctext_in(pill, 1, pill_fg, pill_text);
-            let name_cells = ((rows_w - pill_w - 14) / 8).max(1) as usize;
-            let name_color = if enabled {
-                palette::TEXT
-            } else {
-                palette::TEXT_DIM
-            };
-            lay.text_fit(row.x + 5, y + 3, 1, name_color, &entry.name, name_cells);
-            // Community rows lead with author + SPDX license (installing
-            // from the original authors is the point of the catalog);
-            // curated rows show their QoL sub-category.
-            let sub = match self.catalog_meta(entry_index) {
-                Some(CatalogMeta::Community(info)) => {
-                    format!("{} · {}", info.author, info.license_spdx)
-                }
-                Some(CatalogMeta::Curated(info)) => {
-                    format!("{} · {}", entry.version, info.category.label())
-                }
-                None => format!("{} · {}", entry.version, entry.loader.label()),
-            };
-            lay.text_fit(
-                row.x + 5,
-                y + 13,
-                1,
-                palette::TEXT_DIM,
-                &fit_text(&sub, ((rows_w - 10) / 8).max(1) as usize),
-                ((rows_w - 10) / 8).max(1) as usize,
-            );
-            lay.region(hits, ModManagerWidgetId::ModRow(row_slot), row);
+            let y = g.top + 2 + (row_slot - scroll) as i32 * ROW_PITCH;
+            let row = UiRect::new(g.list_x + 2, y, rows_w as u32, ROW_H as u32);
+            self.render_mod_row(lay, hits, row, row_slot, entry_index, rows_w);
         }
 
         if scrollable {
-            let sb_x = list_right - 12;
-            let up = UiRect::new(sb_x, top + 2, 10, 12);
-            let down = UiRect::new(sb_x, bottom - 14, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            // Passive track + thumb (visual only).
-            let track = UiRect::new(sb_x, top + 16, 10, (bottom - top - 32).max(0) as u32);
-            lay.fill_rect(track, palette::SLOT);
-            if !visible.is_empty() {
-                let thumb_h = ((page as i64 * track.h as i64) / visible.len() as i64)
-                    .clamp(8, track.h as i64) as u32;
-                let travel = (track.h - thumb_h).max(1) as i64;
-                let thumb_y =
-                    track.y + ((scroll as i64 * travel) / max_scroll.max(1) as i64) as i32;
-                lay.fill_rect(UiRect::new(sb_x, thumb_y, 10, thumb_h), palette::TEXT_DIM);
+            let s = ListScroll {
+                visible_len: visible.len(),
+                page,
+                scroll,
+                max_scroll,
+            };
+            self.render_list_scrollbar(lay, hits, g, &s);
+        }
+    }
+
+    /// One list row: fill, pending accent bar, status pill, name, sub-line.
+    fn render_mod_row(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        row: UiRect,
+        row_slot: usize,
+        entry_index: usize,
+        rows_w: i32,
+    ) {
+        let entry = &self.browsed_entries()[entry_index];
+        let enabled = self.enabled_at(entry_index);
+        let catalog = self.browsing_catalog();
+        let y = row.y;
+        lay.fill_rect(
+            row,
+            if row_slot == self.selected {
+                palette::BUTTON_HOVER
+            } else if self.hover == Some(ModManagerWidgetId::ModRow(row_slot)) {
+                palette::BUTTON
+            } else {
+                palette::SLOT
+            },
+        );
+        if self.pending.contains_key(&entry.mod_id) {
+            lay.fill(row.x, row.y, 2, row.h as i32, palette::ACCENT);
+        }
+        let pill = self.row_status_pill(entry, enabled, catalog);
+        let pill_w = pill.0.len() as i32 * 8 + 8;
+        let pill_rect = UiRect::new(row.right() - pill_w - 3, y + 3, pill_w as u32, 11);
+        lay.fill_rect(pill_rect, pill.1);
+        lay.ctext_in(pill_rect, 1, pill.2, pill.0);
+        let name_cells = ((rows_w - pill_w - 14) / 8).max(1) as usize;
+        lay.text_fit(
+            row.x + 5, y + 3, 1,
+            if enabled { palette::TEXT } else { palette::TEXT_DIM },
+            &entry.name, name_cells,
+        );
+        // Community rows lead with author + SPDX license (installing
+        // from the original authors is the point of the catalog);
+        // curated rows show their QoL sub-category.
+        let sub = match self.catalog_meta(entry_index) {
+            Some(CatalogMeta::Community(info)) => {
+                format!("{} · {}", info.author, info.license_spdx)
             }
-            lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
-            lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
-        }
+            Some(CatalogMeta::Curated(info)) => {
+                format!("{} · {}", entry.version, info.category.label())
+            }
+            None => format!("{} · {}", entry.version, entry.loader.label()),
+        };
+        let sub_cells = ((rows_w - 10) / 8).max(1) as usize;
+        lay.text_fit(
+            row.x + 5, y + 13, 1, palette::TEXT_DIM, &fit_text(&sub, sub_cells), sub_cells,
+        );
+        lay.region(hits, ModManagerWidgetId::ModRow(row_slot), row);
+    }
 
-        if compact_single_column {
-            return;
+    /// `(text, bg, fg)` for a list row's right-aligned status pill.
+    fn row_status_pill(
+        &self,
+        entry: &ModManagerEntry,
+        enabled: bool,
+        catalog: bool,
+    ) -> (&'static str, UiColor, UiColor) {
+        if catalog {
+            return ("GET", palette::AIR, palette::TEXT_DARK);
         }
+        if !entry.missing_deps.is_empty() {
+            return ("MISSING", palette::DANGER, palette::TEXT);
+        }
+        if !enabled {
+            return ("OFF", palette::BUTTON_DISABLED, palette::TEXT_DIM);
+        }
+        tier_pill_colors(entry.tier)
+    }
 
-        // ---- right pane: selected mod details --------------------------
-        let detail = UiRect::new(detail_x, top, detail_w.max(1) as u32, (bottom - top) as u32);
+    /// Scrollbar track, thumb, and arrow buttons for the list pane.
+    fn render_list_scrollbar(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        g: &PaneGeom,
+        s: &ListScroll,
+    ) {
+        let sb_x = g.list_right - 12;
+        let (up, down) = scroll_arrow_buttons(lay, sb_x, g.top, g.bottom);
+        // Passive track + thumb (visual only).
+        let track = UiRect::new(sb_x, g.top + 16, 10, (g.bottom - g.top - 32).max(0) as u32);
+        lay.fill_rect(track, palette::SLOT);
+        if s.visible_len > 0 {
+            let thumb_h = ((s.page as i64 * track.h as i64) / s.visible_len as i64)
+                .clamp(8, track.h as i64) as u32;
+            let travel = (track.h - thumb_h).max(1) as i64;
+            let thumb_y =
+                track.y + ((s.scroll as i64 * travel) / s.max_scroll.max(1) as i64) as i32;
+            lay.fill_rect(UiRect::new(sb_x, thumb_y, 10, thumb_h), palette::TEXT_DIM);
+        }
+        scroll_arrow_regions(lay, hits, up, down);
+    }
+
+    /// Right pane: selected-mod detail or an empty-state prompt.
+    fn render_detail_pane(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        g: &PaneGeom,
+        visible: &[usize],
+    ) {
+        let detail = UiRect::new(g.detail_x, g.top, g.detail_w.max(1) as u32, (g.bottom - g.top) as u32);
         lay.fill_rect(detail, DETAIL_BG);
         lay.border_rect(detail, palette::PANEL_BORDER);
         let Some(&sel_index) = visible.get(self.selected) else {
@@ -2879,69 +2802,53 @@ impl ModManagerState {
             if self.filter == ModManagerFilter::Browse
                 && self.browse_category == BrowseCategory::Packs
             {
-                let cells = ((detail_w - 12) / 8).max(1) as usize;
-                lay.text_fit(
-                    detail_x + 6,
-                    top + 8,
-                    1,
-                    palette::TEXT_DIM,
-                    tr(
-                        self.lang,
-                        "No packs curated - search Modrinth for:",
-                        "パックはModrinthで検索",
-                    ),
-                    cells,
-                );
-                // The kind cycles in place — the pill-row Kind button can
-                // be squeezed out at narrow logical widths, so the packs
-                // pane always keeps a working one.
-                let kind_label = format!(
-                    "{}: {} (MC {})",
-                    tr(self.lang, "Kind", "タイプ"),
-                    self.browse_project_kind.label(),
-                    RECOMMENDED_MC_VERSION
-                );
-                let kind_w =
-                    (crate::draw::text_width(&kind_label, 1) as i32 + 12).min(detail_w - 12);
-                let kind_btn = UiRect::new(detail_x + 6, top + 16, kind_w.max(24) as u32, 14);
-                lay.fill_rect(
-                    kind_btn,
-                    if self.hover == Some(ModManagerWidgetId::BrowseKind) {
-                        palette::BUTTON_HOVER
-                    } else {
-                        palette::BUTTON
-                    },
-                );
-                lay.border_rect(kind_btn, palette::BUTTON_BORDER);
-                lay.ctext_in(kind_btn, 1, palette::TEXT, &kind_label);
-                lay.region(hits, ModManagerWidgetId::BrowseKind, kind_btn);
-                let label = tr(self.lang, "Search Modrinth", "Modrinthで検索");
-                let btn_w = (crate::draw::text_width(label, 1) as i32 + 12).min(detail_w - 12);
-                let btn = UiRect::new(detail_x + 6, top + 34, btn_w.max(24) as u32, 14);
-                lay.fill_rect(
-                    btn,
-                    if self.hover == Some(ModManagerWidgetId::ModrinthSearch) {
-                        palette::BUTTON_HOVER
-                    } else {
-                        palette::BUTTON
-                    },
-                );
-                lay.border_rect(btn, palette::BUTTON_BORDER);
-                lay.ctext_in(btn, 1, palette::TEXT, label);
-                lay.region(hits, ModManagerWidgetId::ModrinthSearch, btn);
+                self.render_packs_empty(lay, hits, g);
                 return;
             }
             lay.text_fit(
-                detail_x + 6,
-                top + 8,
-                1,
-                palette::TEXT_DIM,
+                g.detail_x + 6, g.top + 8, 1, palette::TEXT_DIM,
                 tr(self.lang, "Select a mod", "Modを選択"),
-                ((detail_w - 12) / 8).max(1) as usize,
+                ((g.detail_w - 12) / 8).max(1) as usize,
             );
             return;
         };
         self.render_detail(lay, hits, detail, sel_index);
+    }
+
+    /// Packs-shelf empty state: hint plus kind cycler and Modrinth search.
+    fn render_packs_empty(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>, g: &PaneGeom) {
+        let cells = ((g.detail_w - 12) / 8).max(1) as usize;
+        lay.text_fit(
+            g.detail_x + 6, g.top + 8, 1, palette::TEXT_DIM,
+            tr(self.lang, "No packs curated - search Modrinth for:", "パックはModrinthで検索"), cells,
+        );
+        let kind_label = format!(
+            "{}: {} (MC {})",
+            tr(self.lang, "Kind", "タイプ"),
+            self.browse_project_kind.label(),
+            RECOMMENDED_MC_VERSION
+        );
+        let kind_w = (crate::draw::text_width(&kind_label, 1) as i32 + 12).min(g.detail_w - 12);
+        let kind_btn = UiRect::new(g.detail_x + 6, g.top + 16, kind_w.max(24) as u32, 14);
+        lay.button(
+            hits,
+            kind_btn,
+            ModManagerWidgetId::BrowseKind,
+            self.btn_colors(ModManagerWidgetId::BrowseKind, palette::BUTTON, palette::TEXT),
+            &kind_label,
+            true,
+        );
+        let label = tr(self.lang, "Search Modrinth", "Modrinthで検索");
+        let btn_w = (crate::draw::text_width(label, 1) as i32 + 12).min(g.detail_w - 12);
+        let btn = UiRect::new(g.detail_x + 6, g.top + 34, btn_w.max(24) as u32, 14);
+        lay.button(
+            hits,
+            btn,
+            ModManagerWidgetId::ModrinthSearch,
+            self.btn_colors(ModManagerWidgetId::ModrinthSearch, palette::BUTTON, palette::TEXT),
+            label,
+            true,
+        );
     }
 
     fn render_detail(
@@ -2951,210 +2858,33 @@ impl ModManagerState {
         pane: UiRect,
         entry_index: usize,
     ) {
-        let lang = self.lang;
         let entry = &self.browsed_entries()[entry_index];
         let meta_info = self.catalog_meta(entry_index);
         let catalog = meta_info.is_some();
         let browse = self.filter == ModManagerFilter::Browse;
         let enabled = self.enabled_at(entry_index);
-        let tx = pane.x + 6;
         let tw = (pane.w as i32 - 12).max(8);
-        let cells = (tw / 8).max(1) as usize;
+        let dg = DetailGeom {
+            tx: pane.x + 6,
+            tw,
+            cells: (tw / 8).max(1) as usize,
+        };
+        let tx = dg.tx;
+        let cells = dg.cells;
 
         // ---- action row geometry (anchored to the pane bottom) ---------
         // Buttons: Enable/Disable + Configure + optional links.
-        let mut buttons: Vec<(ModManagerWidgetId, String, bool)> = Vec::new();
-        let toggle_label = if enabled {
-            tr(lang, "Disable", "無効化")
-        } else {
-            tr(lang, "Enable", "有効化")
-        };
-        if catalog {
-            buttons.push((
-                ModManagerWidgetId::InstallRecommended,
-                tr(lang, "Get on Modrinth", "Modrinthで入手").to_owned(),
-                true,
-            ));
-            if browse {
-                buttons.push((
-                    ModManagerWidgetId::ModrinthSearch,
-                    tr(lang, "Search Modrinth", "Modrinthで検索").to_owned(),
-                    true,
-                ));
-            }
-        } else {
-            buttons.push((
-                ModManagerWidgetId::ToggleEnabled,
-                toggle_label.to_owned(),
-                true,
-            ));
-            buttons.push((
-                ModManagerWidgetId::ConfigureMod,
-                tr(lang, "Configure", "設定").to_owned(),
-                entry.has_config,
-            ));
-            buttons.push((
-                ModManagerWidgetId::RollbackProfile,
-                tr(
-                    lang,
-                    "Rollback to Last Known-Good Profile",
-                    "直前の正常プロファイルへ戻す",
-                )
-                .to_owned(),
-                true,
-            ));
-            buttons.push((
-                ModManagerWidgetId::PlamoPreset,
-                self.plamo_panel.preset.label().to_owned(),
-                !self.plamo_panel.busy,
-            ));
-            buttons.push((
-                ModManagerWidgetId::PlamoAction,
-                self.plamo_panel.action_label().to_owned(),
-                self.plamo_panel.action_enabled(),
-            ));
-            buttons.push((
-                ModManagerWidgetId::ToggleAutoTranslationPack,
-                self.plamo_panel.auto_pack_label(),
-                !self.plamo_panel.busy,
-            ));
-            if self.plamo_panel.busy {
-                buttons.push((
-                    ModManagerWidgetId::CancelPlamo,
-                    tr(lang, "Cancel Translation Work", "翻訳処理をキャンセル").to_owned(),
-                    true,
-                ));
-            }
-        }
-        for (id, url, label) in [
-            (
-                ModManagerWidgetId::LinkWebsite,
-                &entry.website_url,
-                tr(lang, "Website", "サイト"),
-            ),
-            (
-                ModManagerWidgetId::LinkIssues,
-                &entry.issues_url,
-                tr(lang, "Issues", "課題"),
-            ),
-            (
-                ModManagerWidgetId::LinkSource,
-                &entry.source_url,
-                tr(lang, "Source", "ソース"),
-            ),
-            (
-                ModManagerWidgetId::LinkModrinth,
-                &entry.modrinth_url,
-                "Modrinth",
-            ),
-        ] {
-            if !catalog && !url.is_empty() {
-                buttons.push((id, label.to_owned(), true));
-            }
-        }
-        // Flow-wrap buttons into rows anchored at the pane bottom.
-        let btn_h = 14;
-        let btn_gap = 4;
-        let mut rows: Vec<Vec<(ModManagerWidgetId, String, bool, i32)>> = vec![Vec::new()];
-        let mut row_w = 0;
-        for (id, label, live) in buttons {
-            let w = (crate::draw::text_width(&label, 1) as i32 + 12).min(tw);
-            if row_w > 0 && row_w + btn_gap + w > tw {
-                rows.push(Vec::new());
-                row_w = 0;
-            }
-            row_w += if row_w > 0 { btn_gap + w } else { w };
-            rows.last_mut()
-                .expect("one row always exists")
-                .push((id, label, live, w));
-        }
-        let actions_h = rows.len() as i32 * (btn_h + btn_gap) - btn_gap;
-        let mut actions_top = pane.bottom() - 6 - actions_h;
+        let buttons = self.detail_buttons(entry, catalog, browse, enabled);
+        let rows = flow_wrap_buttons(buttons, tw);
+        let actions_h = rows.len() as i32 * (ACTION_BTN_H + ACTION_BTN_GAP) - ACTION_BTN_GAP;
+        let actions_top = pane.bottom() - 6 - actions_h;
 
         // ---- missing-dependencies warning box above the actions --------
         // The box has a 36px fixed cost (header + button + padding); dep
         // lines cost 10px each. It shrinks to the space left above the
         // action rows and collapses to a bare button below 36px so it
         // never paints over the pane header or the list above.
-        let mut warn_bottom = actions_top - 4;
-        let warn_avail = (actions_top - 4 - (pane.y + 4)).max(0);
-        let missing_label = tr(
-            lang,
-            "Download Missing (Modrinth)",
-            "不足分を入手 (Modrinth)",
-        );
-        if !entry.missing_deps.is_empty() && warn_avail >= 18 {
-            let line_budget = ((warn_avail - 36) / 10).max(0) as usize;
-            let shown = entry.missing_deps.len().min(3).min(line_budget);
-            // Reserve one line for "+N more" when the budget cut deps off.
-            let (shown, extra) = if entry.missing_deps.len() > shown && line_budget > 0 {
-                (shown.saturating_sub(1), true)
-            } else {
-                (shown, entry.missing_deps.len() > shown)
-            };
-            let extra = extra && line_budget > shown;
-            let content_lines = shown + usize::from(extra);
-            let full_box = warn_avail >= 36;
-            let warn_h = if full_box {
-                8 + 10 + content_lines as i32 * 10 + 16 + 6
-            } else {
-                18
-            };
-            let warn = UiRect::new(tx, actions_top - 4 - warn_h, tw as u32, warn_h as u32);
-            lay.fill_rect(warn, WARN_BG);
-            lay.border_rect(warn, palette::WARNING);
-            let mut wy = warn.y + 4;
-            if full_box {
-                lay.text_fit(
-                    warn.x + 5,
-                    wy,
-                    1,
-                    palette::WARNING,
-                    tr(lang, "Missing dependencies:", "不足している依存関係:"),
-                    cells.saturating_sub(1),
-                );
-                wy += 10;
-                for dep in entry.missing_deps.iter().take(shown) {
-                    lay.text_fit(
-                        warn.x + 9,
-                        wy,
-                        1,
-                        palette::TEXT,
-                        &format!("- {dep}"),
-                        cells.saturating_sub(2),
-                    );
-                    wy += 10;
-                }
-                if extra {
-                    lay.text_fit(
-                        warn.x + 9,
-                        wy,
-                        1,
-                        palette::TEXT_DIM,
-                        &format!("+{} more", entry.missing_deps.len() - shown),
-                        cells.saturating_sub(2),
-                    );
-                }
-            }
-            let btn_w = (crate::draw::text_width(missing_label, 1) as i32 + 12).min(tw - 8);
-            let btn = UiRect::new(warn.x + 4, warn.bottom() - 16, btn_w.max(0) as u32, 14);
-            let bg = if self.hover == Some(ModManagerWidgetId::DownloadMissingDeps) {
-                palette::BUTTON_HOVER
-            } else {
-                palette::WARNING
-            };
-            lay.fill_rect(btn, bg);
-            lay.border_rect(btn, palette::BUTTON_BORDER);
-            lay.ctext_in(
-                btn,
-                1,
-                palette::TEXT_DARK,
-                &fit_text(missing_label, ((btn_w - 8) / 8).max(1) as usize),
-            );
-            lay.region(hits, ModManagerWidgetId::DownloadMissingDeps, btn);
-            warn_bottom = warn.y - 4;
-        }
-
+        let warn_bottom = self.render_missing_deps_box(lay, hits, pane, entry, &dg, actions_top);
         // ---- header block (name / meta / badges / authors / license) ---
         let mut y = pane.y + 5;
 
@@ -3162,127 +2892,7 @@ impl ModManagerState {
         // mod's prose metadata: every version, hash, size and requester is
         // visible before either destructive-or-network decision is armed.
         if !catalog {
-            if let Some(plan) = &self.missing_dependency_consent {
-                let row_lines = plan.rows.len().min(4)
-                    + plan.unsatisfied.len().min(2)
-                    + usize::from(plan.rows.len() > 4 || plan.unsatisfied.len() > 2);
-                let box_h = 28 + row_lines as i32 * 10 + 18;
-                if warn_bottom - y >= box_h + 20 {
-                    let consent = UiRect::new(tx, y, tw as u32, box_h as u32);
-                    lay.fill_rect(consent, WARN_BG);
-                    lay.border_rect(consent, palette::WARNING);
-                    let mut cy = y + 4;
-                    lay.text_fit(
-                        tx + 5,
-                        cy,
-                        1,
-                        palette::WARNING,
-                        tr(
-                            lang,
-                            "Missing dependencies — exact Modrinth candidates:",
-                            "不足依存 — Modrinth候補（完全一致）:",
-                        ),
-                        cells.saturating_sub(1),
-                    );
-                    cy += 10;
-                    let mut line_count = 0usize;
-                    for row in plan.rows.iter().take(4) {
-                        let requesters = if row.requesting_mods.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" <- {}", row.requesting_mods.join(","))
-                        };
-                        lay.text_fit(
-                            tx + 8,
-                            cy,
-                            1,
-                            palette::TEXT,
-                            &format!(
-                                "{} {} {} ({} bytes, sha512 {}){}",
-                                row.mod_id,
-                                row.version_number,
-                                row.filename,
-                                row.size_bytes,
-                                crate::draw::first_cells(&row.sha512, 12),
-                                requesters
-                            ),
-                            cells.saturating_sub(2),
-                        );
-                        cy += 10;
-                        line_count += 1;
-                    }
-                    for row in plan.unsatisfied.iter().take(2) {
-                        lay.text_fit(
-                            tx + 8,
-                            cy,
-                            1,
-                            palette::WARNING,
-                            &format!(
-                                "! {} {}: {}",
-                                row.mod_id, row.required_version_range, row.reason
-                            ),
-                            cells.saturating_sub(2),
-                        );
-                        cy += 10;
-                        line_count += 1;
-                    }
-                    if plan.rows.len() + plan.unsatisfied.len() > line_count {
-                        lay.text_fit(
-                            tx + 8,
-                            cy,
-                            1,
-                            palette::TEXT_DIM,
-                            &format!(
-                                "+{} more",
-                                plan.rows.len() + plan.unsatisfied.len() - line_count
-                            ),
-                            cells.saturating_sub(2),
-                        );
-                    }
-                    let approve = tr(
-                        lang,
-                        "不足依存を自動取得して再読込",
-                        "不足依存を自動取得して再読込",
-                    );
-                    let isolate = tr(
-                        lang,
-                        "未充足 Mod を隔離して続行",
-                        "未充足 Mod を隔離して続行",
-                    );
-                    let gap = 4;
-                    let aw = (crate::draw::text_width(approve, 1) as i32 + 10).min((tw - gap) / 2);
-                    let iw = (crate::draw::text_width(isolate, 1) as i32 + 10).min((tw - gap) / 2);
-                    let by = consent.bottom() - 17;
-                    let approve_rect = UiRect::new(tx + 4, by, aw.max(24) as u32, 14);
-                    let isolate_rect = UiRect::new(tx + 4 + aw + gap, by, iw.max(24) as u32, 14);
-                    for (rect, id, label) in [
-                        (
-                            approve_rect,
-                            ModManagerWidgetId::ConsentApproveAutoFetch,
-                            approve,
-                        ),
-                        (
-                            isolate_rect,
-                            ModManagerWidgetId::ConsentIsolateMods,
-                            isolate,
-                        ),
-                    ] {
-                        let hovered = self.hover == Some(id);
-                        lay.fill_rect(
-                            rect,
-                            if hovered {
-                                palette::BUTTON_HOVER
-                            } else {
-                                palette::WARNING
-                            },
-                        );
-                        lay.border_rect(rect, palette::BUTTON_BORDER);
-                        lay.ctext_in(rect, 1, palette::TEXT_DARK, label);
-                        lay.region(hits, id, rect);
-                    }
-                    y += box_h + 4;
-                }
-            }
+            y = self.render_consent_box(lay, hits, y, &dg, warn_bottom);
         }
 
         let name_scale = if text_width(&entry.name, 2) as i32 <= tw {
@@ -3291,11 +2901,7 @@ impl ModManagerState {
             1
         };
         lay.text_fit(
-            tx,
-            y,
-            name_scale,
-            palette::TEXT,
-            &entry.name,
+            tx, y, name_scale, palette::TEXT, &entry.name,
             (tw / (8 * name_scale as i32)).max(1) as usize,
         );
         y += 8 * name_scale as i32 + 3;
@@ -3308,7 +2914,272 @@ impl ModManagerState {
         // explicit author + license attribution, the summary, and the
         // Modrinth install button — never an enable toggle.
         if let Some(meta) = meta_info {
-            if let CatalogMeta::Community(info) = meta {
+            self.render_catalog_detail(lay, &dg, y, warn_bottom, meta);
+            self.paint_action_rows(lay, hits, tx, &rows, actions_top, true);
+            return;
+        }
+        self.render_installed_detail(lay, &dg, y, warn_bottom, entry);
+        self.paint_action_rows(lay, hits, tx, &rows, actions_top, false);
+    }
+
+    /// `(widget, label, live)` buttons for the detail pane's action rows.
+    fn detail_buttons(
+        &self,
+        entry: &ModManagerEntry,
+        catalog: bool,
+        browse: bool,
+        enabled: bool,
+    ) -> Vec<(ModManagerWidgetId, String, bool)> {
+        let lang = self.lang;
+        let mut buttons: Vec<(ModManagerWidgetId, String, bool)> = Vec::new();
+        let mut push = |id: ModManagerWidgetId, label: &str, live: bool| {
+            buttons.push((id, label.to_owned(), live));
+        };
+        if catalog {
+            push(
+                ModManagerWidgetId::InstallRecommended,
+                tr(lang, "Get on Modrinth", "Modrinthで入手"),
+                true,
+            );
+            if browse {
+                push(
+                    ModManagerWidgetId::ModrinthSearch,
+                    tr(lang, "Search Modrinth", "Modrinthで検索"),
+                    true,
+                );
+            }
+        } else {
+            let toggle_label = if enabled {
+                tr(lang, "Disable", "無効化")
+            } else {
+                tr(lang, "Enable", "有効化")
+            };
+            push(ModManagerWidgetId::ToggleEnabled, toggle_label, true);
+            push(
+                ModManagerWidgetId::ConfigureMod,
+                tr(lang, "Configure", "設定"),
+                entry.has_config,
+            );
+            push(
+                ModManagerWidgetId::RollbackProfile,
+                tr(lang, "Rollback to Last Known-Good Profile", "直前の正常プロファイルへ戻す"),
+                true,
+            );
+            push(
+                ModManagerWidgetId::PlamoPreset,
+                self.plamo_panel.preset.label(),
+                !self.plamo_panel.busy,
+            );
+            push(
+                ModManagerWidgetId::PlamoAction,
+                self.plamo_panel.action_label(),
+                self.plamo_panel.action_enabled(),
+            );
+            push(
+                ModManagerWidgetId::ToggleAutoTranslationPack,
+                &self.plamo_panel.auto_pack_label(),
+                !self.plamo_panel.busy,
+            );
+            if self.plamo_panel.busy {
+                push(
+                    ModManagerWidgetId::CancelPlamo,
+                    tr(lang, "Cancel Translation Work", "翻訳処理をキャンセル"),
+                    true,
+                );
+            }
+        }
+        for (id, url, label) in [
+            (ModManagerWidgetId::LinkWebsite, &entry.website_url, tr(lang, "Website", "サイト")),
+            (ModManagerWidgetId::LinkIssues, &entry.issues_url, tr(lang, "Issues", "課題")),
+            (ModManagerWidgetId::LinkSource, &entry.source_url, tr(lang, "Source", "ソース")),
+            (ModManagerWidgetId::LinkModrinth, &entry.modrinth_url, "Modrinth"),
+        ] {
+            if !catalog && !url.is_empty() {
+                buttons.push((id, label.to_owned(), true));
+            }
+        }
+        buttons
+    }
+
+    /// Missing-deps warning box above the action rows. Returns the y-limit
+    /// the header block must stay above.
+    fn render_missing_deps_box(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        pane: UiRect,
+        entry: &ModManagerEntry,
+        dg: &DetailGeom,
+        actions_top: i32,
+    ) -> i32 {
+        let warn_bottom = actions_top - 4;
+        let warn_avail = (actions_top - 4 - (pane.y + 4)).max(0);
+        if entry.missing_deps.is_empty() || warn_avail < 18 {
+            return warn_bottom;
+        }
+        let (tx, tw, cells) = (dg.tx, dg.tw, dg.cells);
+        let lang = self.lang;
+        let line_budget = ((warn_avail - 36) / 10).max(0) as usize;
+        let shown = entry.missing_deps.len().min(3).min(line_budget);
+        // Reserve one line for "+N more" when the budget cut deps off.
+        let (shown, extra) = if entry.missing_deps.len() > shown && line_budget > 0 {
+            (shown.saturating_sub(1), true)
+        } else {
+            (shown, entry.missing_deps.len() > shown)
+        };
+        let extra = extra && line_budget > shown;
+        let content_lines = shown + usize::from(extra);
+        let full_box = warn_avail >= 36;
+        let warn_h = if full_box {
+            8 + 10 + content_lines as i32 * 10 + 16 + 6
+        } else {
+            18
+        };
+        let warn = UiRect::new(tx, actions_top - 4 - warn_h, tw as u32, warn_h as u32);
+        lay.fill_rect(warn, WARN_BG);
+        lay.border_rect(warn, palette::WARNING);
+        let mut wy = warn.y + 4;
+        if full_box {
+            lay.text_fit(
+                warn.x + 5, wy, 1, palette::WARNING,
+                tr(lang, "Missing dependencies:", "不足している依存関係:"),
+                cells.saturating_sub(1),
+            );
+            wy += 10;
+            for dep in entry.missing_deps.iter().take(shown) {
+                lay.text_fit(
+                    warn.x + 9, wy, 1, palette::TEXT, &format!("- {dep}"),
+                    cells.saturating_sub(2),
+                );
+                wy += 10;
+            }
+            if extra {
+                lay.text_fit(
+                    warn.x + 9, wy, 1, palette::TEXT_DIM,
+                    &format!("+{} more", entry.missing_deps.len() - shown),
+                    cells.saturating_sub(2),
+                );
+            }
+        }
+        let missing_label = tr(lang, "Download Missing (Modrinth)", "不足分を入手 (Modrinth)");
+        let btn_w = (crate::draw::text_width(missing_label, 1) as i32 + 12).min(tw - 8);
+        let btn = UiRect::new(warn.x + 4, warn.bottom() - 16, btn_w.max(0) as u32, 14);
+        lay.button(
+            hits,
+            btn,
+            ModManagerWidgetId::DownloadMissingDeps,
+            self.btn_colors(ModManagerWidgetId::DownloadMissingDeps, palette::WARNING, palette::TEXT_DARK),
+            &fit_text(missing_label, ((btn_w - 8) / 8).max(1) as usize),
+            true,
+        );
+        warn.y - 4
+    }
+
+    /// Structured missing-dependency consent box; returns the advanced `y`.
+    fn render_consent_box(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        y: i32,
+        dg: &DetailGeom,
+        warn_bottom: i32,
+    ) -> i32 {
+        let Some(plan) = &self.missing_dependency_consent else {
+            return y;
+        };
+        let (tx, tw, cells) = (dg.tx, dg.tw, dg.cells);
+        let row_lines = plan.rows.len().min(4)
+            + plan.unsatisfied.len().min(2)
+            + usize::from(plan.rows.len() > 4 || plan.unsatisfied.len() > 2);
+        let box_h = 28 + row_lines as i32 * 10 + 18;
+        if warn_bottom - y < box_h + 20 {
+            return y;
+        }
+        let lang = self.lang;
+        let consent = UiRect::new(tx, y, tw as u32, box_h as u32);
+        lay.fill_rect(consent, WARN_BG);
+        lay.border_rect(consent, palette::WARNING);
+        let mut cy = y + 4;
+        lay.text_fit(
+            tx + 5, cy, 1, palette::WARNING,
+            tr(lang, "Missing dependencies — exact Modrinth candidates:", "不足依存 — Modrinth候補（完全一致）:"),
+            cells.saturating_sub(1),
+        );
+        cy += 10;
+        let mut line_count = 0usize;
+        for row in plan.rows.iter().take(4) {
+            lay.text_fit(
+                tx + 8, cy, 1, palette::TEXT, &consent_candidate_line(row),
+                cells.saturating_sub(2),
+            );
+            cy += 10;
+            line_count += 1;
+        }
+        for row in plan.unsatisfied.iter().take(2) {
+            lay.text_fit(
+                tx + 8, cy, 1, palette::WARNING, &consent_unsatisfied_line(row),
+                cells.saturating_sub(2),
+            );
+            cy += 10;
+            line_count += 1;
+        }
+        if plan.rows.len() + plan.unsatisfied.len() > line_count {
+            lay.text_fit(
+                tx + 8, cy, 1, palette::TEXT_DIM,
+                &format!("+{} more", plan.rows.len() + plan.unsatisfied.len() - line_count),
+                cells.saturating_sub(2),
+            );
+        }
+        self.paint_consent_buttons(lay, hits, consent, dg);
+        y + box_h + 4
+    }
+
+    /// Approve / isolate buttons pinned to the consent box bottom.
+    fn paint_consent_buttons(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        consent: UiRect,
+        dg: &DetailGeom,
+    ) {
+        let (tx, tw) = (dg.tx, dg.tw);
+        let approve = "不足依存を自動取得して再読込";
+        let isolate = "未充足 Mod を隔離して続行";
+        let gap = 4;
+        let aw = (crate::draw::text_width(approve, 1) as i32 + 10).min((tw - gap) / 2);
+        let iw = (crate::draw::text_width(isolate, 1) as i32 + 10).min((tw - gap) / 2);
+        let by = consent.bottom() - 17;
+        let approve_rect = UiRect::new(tx + 4, by, aw.max(24) as u32, 14);
+        let isolate_rect = UiRect::new(tx + 4 + aw + gap, by, iw.max(24) as u32, 14);
+        for (rect, id, label) in [
+            (approve_rect, ModManagerWidgetId::ConsentApproveAutoFetch, approve),
+            (isolate_rect, ModManagerWidgetId::ConsentIsolateMods, isolate),
+        ] {
+            lay.button(
+                hits,
+                rect,
+                id,
+                self.btn_colors(id, palette::WARNING, palette::TEXT_DARK),
+                label,
+                true,
+            );
+        }
+    }
+
+    /// Catalog detail body: community rows get badges, loaders, author,
+    /// license and summary; curated rows get the category line and summary.
+    fn render_catalog_detail(
+        &self,
+        lay: &mut Lay,
+        dg: &DetailGeom,
+        mut y: i32,
+        warn_bottom: i32,
+        meta: CatalogMeta<'_>,
+    ) {
+        let (tx, tw, cells) = (dg.tx, dg.tw, dg.cells);
+        let lang = self.lang;
+        match meta {
+            CatalogMeta::Community(info) => {
                 // Badge row: category, SPDX license, GUI-bridge marker.
                 let badge_right = tx + tw;
                 let mut bx = tx;
@@ -3355,25 +3226,12 @@ impl ModManagerState {
                 } else {
                     info.en_summary
                 };
-                let avail = (warn_bottom - y).max(0);
-                for line in wrap_text(summary, cells)
-                    .into_iter()
-                    .take((avail / 10).max(0) as usize)
-                {
-                    lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
-                    y += 10;
-                }
-            } else {
-                let CatalogMeta::Curated(mod_info) = meta else {
-                    unreachable!("CatalogMeta has only two variants");
-                };
+                paint_wrapped_dim(lay, tx, y, cells, warn_bottom, summary);
+            }
+            CatalogMeta::Curated(mod_info) => {
                 lay.text_fit(
-                    tx,
-                    y,
-                    1,
-                    palette::TEXT_DIM,
-                    &format!("Fabric / NeoForge · {}", mod_info.category.label()),
-                    cells,
+                    tx, y, 1, palette::TEXT_DIM,
+                    &format!("Fabric / NeoForge · {}", mod_info.category.label()), cells,
                 );
                 y += 17;
                 let summary = if lang == UiLang::Ja {
@@ -3381,38 +3239,64 @@ impl ModManagerState {
                 } else {
                     mod_info.summary_en
                 };
-                let avail = (warn_bottom - y).max(0);
-                for line in wrap_text(summary, cells)
-                    .into_iter()
-                    .take((avail / 10).max(0) as usize)
-                {
-                    lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
-                    y += 10;
-                }
+                paint_wrapped_dim(lay, tx, y, cells, warn_bottom, summary);
             }
-            for row in &rows {
-                let mut bx = tx;
-                for (id, label, live, w) in row {
-                    let rect = UiRect::new(bx, actions_top, *w as u32, btn_h as u32);
-                    lay.fill_rect(
-                        rect,
-                        if self.hover == Some(*id) {
-                            palette::BUTTON_HOVER
-                        } else {
-                            palette::BUTTON
-                        },
-                    );
-                    lay.border_rect(rect, palette::BUTTON_BORDER);
-                    lay.ctext_in(rect, 1, palette::TEXT, label);
-                    if *live {
-                        lay.region(hits, *id, rect);
-                    }
-                    bx += w + btn_gap;
-                }
-                actions_top += btn_h + btn_gap;
-            }
-            return;
         }
+    }
+
+    /// Installed-entry detail body: loader/tier/reload badges, authors,
+    /// license, library tag, the PLaMo notice, and the wrapped summary.
+    fn render_installed_detail(
+        &self,
+        lay: &mut Lay,
+        dg: &DetailGeom,
+        mut y: i32,
+        warn_bottom: i32,
+        entry: &ModManagerEntry,
+    ) {
+        let (tx, cells) = (dg.tx, dg.cells);
+        let lang = self.lang;
+        self.paint_entry_badges(lay, tx, y, dg.tw, entry);
+        y += 15;
+
+        if !entry.authors.is_empty() {
+            let authors = format!(
+                "{}: {}",
+                tr(lang, "Authors", "作者"),
+                entry.authors.join(", ")
+            );
+            lay.text_fit(tx, y, 1, palette::TEXT_DIM, &authors, cells);
+            y += 10;
+        }
+        if !entry.license.is_empty() {
+            let license = format!("{}: {}", tr(lang, "License", "ライセンス"), entry.license);
+            lay.text_fit(tx, y, 1, palette::TEXT_DIM, &license, cells);
+            y += 10;
+        }
+        if entry.is_library {
+            lay.text_fit(
+                tx, y, 1, palette::TEXT_DIM, tr(lang, "Shared library", "共有ライブラリ"), cells,
+            );
+            y += 10;
+        }
+        y += 3;
+        y = self.paint_plamo_notice(lay, tx, y, cells, warn_bottom);
+
+        // ---- wrapped summary in the space left above the warning box ---
+        paint_wrapped_dim(lay, tx, y, cells, warn_bottom, &entry.summary);
+    }
+
+    /// Loader, adaptation-tier, and reload-mode badges for an installed
+    /// entry, left-packed from `tx`.
+    fn paint_entry_badges(
+        &self,
+        lay: &mut Lay,
+        tx: i32,
+        y: i32,
+        tw: i32,
+        entry: &ModManagerEntry,
+    ) {
+        let lang = self.lang;
         let badge_right = tx + tw;
         let mut bx = tx;
         let loader_bg = match entry.loader {
@@ -3422,13 +3306,7 @@ impl ModManagerState {
             _ => palette::BUTTON,
         };
         bx += self.badge(lay, bx, y, entry.loader.label(), loader_bg, badge_right);
-        let (tier_bg, tier_fg) = match entry.tier {
-            ModAdaptationBadge::Tier1Native => (palette::ACCENT, palette::TEXT_DARK),
-            ModAdaptationBadge::Tier2Shim => (palette::WARNING, palette::TEXT_DARK),
-            ModAdaptationBadge::Tier3Fallback => (palette::DANGER, palette::TEXT),
-            ModAdaptationBadge::Superseded => (palette::BUTTON_DISABLED, palette::TEXT_DIM),
-            ModAdaptationBadge::ClientOnly => (palette::AIR, palette::TEXT_DARK),
-        };
+        let (_, tier_bg, tier_fg) = tier_pill_colors(entry.tier);
         bx += self.badge_fg(
             lay,
             bx,
@@ -3450,115 +3328,76 @@ impl ModManagerState {
             (reload_bg, reload_fg),
             badge_right,
         );
-        y += 15;
+    }
 
-        if !entry.authors.is_empty() {
-            let authors = format!(
-                "{}: {}",
-                tr(lang, "Authors", "作者"),
-                entry.authors.join(", ")
-            );
-            lay.text_fit(tx, y, 1, palette::TEXT_DIM, &authors, cells);
-            y += 10;
-        }
-        if !entry.license.is_empty() {
-            let license = format!("{}: {}", tr(lang, "License", "ライセンス"), entry.license);
-            lay.text_fit(tx, y, 1, palette::TEXT_DIM, &license, cells);
-            y += 10;
-        }
-        if entry.is_library {
-            lay.text_fit(
-                tx,
-                y,
-                1,
-                palette::TEXT_DIM,
-                tr(lang, "Shared library", "共有ライブラリ"),
-                cells,
-            );
-            y += 10;
-        }
-        y += 3;
-
+    /// PLaMo guidance/license notice plus live progress label. Returns the
+    /// advanced `y` (unchanged when the notice does not fit).
+    fn paint_plamo_notice(
+        &self,
+        lay: &mut Lay,
+        tx: i32,
+        mut y: i32,
+        cells: usize,
+        warn_bottom: i32,
+    ) -> i32 {
         // PLaMo guidance/license notice is part of the manager surface, not
         // a hidden terminal prompt: the model is downloaded only after the
         // explicit button press and the local runtime is transient.
-        if !catalog && warn_bottom - y >= 30 {
+        if warn_bottom - y < 30 {
+            return y;
+        }
+        let lang = self.lang;
+        lay.text_fit(
+            tx, y, 1, palette::TEXT_DIM, "PLaMo 3 Translate — PLaMo Community License", cells,
+        );
+        y += 10;
+        let guidance = if lang == UiLang::Ja {
+            "ローカル LLM は翻訳中だけ起動し、終了直後に停止します（プレイ中メモリ不使用）。"
+        } else {
+            "The local LLM runs only while translating and exits immediately afterwards."
+        };
+        for line in wrap_text(guidance, cells).into_iter().take(2) {
+            lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
+            y += 10;
+        }
+        if self.plamo_panel.busy && !self.plamo_panel.progress_label.is_empty() {
             lay.text_fit(
-                tx,
-                y,
-                1,
-                palette::TEXT_DIM,
-                tr(
-                    lang,
-                    "PLaMo 3 Translate — PLaMo Community License",
-                    "PLaMo 3 Translate — PLaMo Community License",
-                ),
-                cells,
+                tx, y, 1, palette::WARNING, &self.plamo_panel.progress_label, cells,
             );
             y += 10;
-            let guidance = if lang == UiLang::Ja {
-                "ローカル LLM は翻訳中だけ起動し、終了直後に停止します（プレイ中メモリ不使用）。"
-            } else {
-                "The local LLM runs only while translating and exits immediately afterwards."
-            };
-            for line in wrap_text(guidance, cells).into_iter().take(2) {
-                lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
-                y += 10;
-            }
-            if self.plamo_panel.busy && !self.plamo_panel.progress_label.is_empty() {
-                lay.text_fit(
-                    tx,
-                    y,
-                    1,
-                    palette::WARNING,
-                    &self.plamo_panel.progress_label,
-                    cells,
-                );
-                y += 10;
-            }
         }
+        y
+    }
 
-        // ---- wrapped summary in the space left above the warning box ---
-        let avail = (warn_bottom - y).max(0);
-        let max_lines = (avail / 10).max(0) as usize;
-        if max_lines > 0 && !entry.summary.is_empty() {
-            for line in wrap_text(&entry.summary, cells).into_iter().take(max_lines) {
-                lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
-                y += 10;
-            }
-        }
-
-        // ---- paint the anchored action rows ----------------------------
-        for row in &rows {
+    /// Paint flow-wrapped action rows anchored at `top`; `catalog_style`
+    /// skips elision and dims nothing.
+    fn paint_action_rows(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<ModManagerHitRegion>,
+        tx: i32,
+        rows: &[Vec<(ModManagerWidgetId, String, bool, i32)>],
+        mut top: i32,
+        catalog_style: bool,
+    ) {
+        for row in rows {
             let mut bx = tx;
             for (id, label, live, w) in row {
-                let rect = UiRect::new(bx, actions_top, *w as u32, btn_h as u32);
-                let hovered = self.hover == Some(*id);
-                let bg = if !*live {
-                    palette::BUTTON_DISABLED
-                } else if hovered {
-                    palette::BUTTON_HOVER
+                let rect = UiRect::new(bx, top, *w as u32, ACTION_BTN_H as u32);
+                let colors = if !catalog_style && !*live {
+                    (palette::BUTTON_DISABLED, palette::TEXT_DIM)
                 } else {
-                    palette::BUTTON
+                    self.btn_colors(*id, palette::BUTTON, palette::TEXT)
                 };
-                lay.fill_rect(rect, bg);
-                lay.border_rect(rect, palette::BUTTON_BORDER);
-                lay.ctext_in(
-                    rect,
-                    1,
-                    if *live {
-                        palette::TEXT
-                    } else {
-                        palette::TEXT_DIM
-                    },
-                    &fit_text(label, ((*w - 8) / 8).max(1) as usize),
-                );
-                if *live {
-                    lay.region(hits, *id, rect);
-                }
-                bx += w + btn_gap;
+                let text = if catalog_style {
+                    label.clone()
+                } else {
+                    fit_text(label, ((*w - 8) / 8).max(1) as usize)
+                };
+                lay.button(hits, rect, *id, colors, &text, *live);
+                bx += w + ACTION_BTN_GAP;
             }
-            actions_top += btn_h + btn_gap;
+            top += ACTION_BTN_H + ACTION_BTN_GAP;
         }
     }
 
@@ -3615,15 +3454,14 @@ impl ModManagerState {
                 break;
             }
             let rect = UiRect::new(x, y1, w as u32, 16);
-            let bg = if self.hover == Some(id) {
-                palette::BUTTON_HOVER
-            } else {
-                palette::BUTTON
-            };
-            lay.fill_rect(rect, bg);
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(rect, 1, palette::TEXT, label);
-            lay.region(hits, id, rect);
+            lay.button(
+                hits,
+                rect,
+                id,
+                self.btn_colors(id, palette::BUTTON, palette::TEXT),
+                label,
+                true,
+            );
             x += w + 6;
         }
 
@@ -3632,18 +3470,10 @@ impl ModManagerState {
         let dirty = self.is_dirty();
         let apply_label = if !dirty {
             tr(lang, "Apply Changes", "変更を適用").to_owned()
+        } else if self.pending_requires_soft_reload() {
+            tr(lang, "Apply (Soft Reload)", "適用 (ソフト再読込)").to_owned()
         } else {
-            let soft = self.pending.iter().any(|(id, _)| {
-                self.entries
-                    .iter()
-                    .find(|e| &e.mod_id == id)
-                    .is_some_and(|e| e.reload_mode != ModReloadBadge::HotReload)
-            });
-            if soft {
-                tr(lang, "Apply (Soft Reload)", "適用 (ソフト再読込)").to_owned()
-            } else {
-                tr(lang, "Apply (No Restart)", "適用 (再起動不要)").to_owned()
-            }
+            tr(lang, "Apply (No Restart)", "適用 (再起動不要)").to_owned()
         };
         let done_label = tr(lang, "Done", "完了");
         let done_w = (crate::draw::text_width(done_label, 1) as i32 + 20)
@@ -3662,32 +3492,31 @@ impl ModManagerState {
             } else {
                 palette::ACCENT
             };
-            lay.fill_rect(apply, apply_bg);
-            lay.border_rect(apply, palette::BUTTON_BORDER);
-            lay.ctext_in(
+            lay.button(
+                hits,
                 apply,
-                1,
-                if dirty {
-                    palette::TEXT_DARK
-                } else {
-                    palette::TEXT_DIM
-                },
+                ModManagerWidgetId::ApplyChanges,
+                (
+                    apply_bg,
+                    if dirty {
+                        palette::TEXT_DARK
+                    } else {
+                        palette::TEXT_DIM
+                    },
+                ),
                 &apply_label,
+                dirty,
             );
-            if dirty {
-                lay.region(hits, ModManagerWidgetId::ApplyChanges, apply);
-            }
         }
 
-        let done_bg = if self.hover == Some(ModManagerWidgetId::Done) {
-            palette::BUTTON_HOVER
-        } else {
-            palette::BUTTON
-        };
-        lay.fill_rect(done, done_bg);
-        lay.border_rect(done, palette::BUTTON_BORDER);
-        lay.ctext_in(done, 1, palette::TEXT, done_label);
-        lay.region(hits, ModManagerWidgetId::Done, done);
+        lay.button(
+            hits,
+            done,
+            ModManagerWidgetId::Done,
+            self.btn_colors(ModManagerWidgetId::Done, palette::BUTTON, palette::TEXT),
+            done_label,
+            true,
+        );
     }
 }
 
@@ -3708,6 +3537,37 @@ const ROW_PITCH: i32 = 24;
 const DETAIL_BG: UiColor = UiColor::rgba(26, 29, 38, 235);
 /// Missing-dependencies warning box fill.
 const WARN_BG: UiColor = UiColor::rgba(85, 60, 23, 235);
+/// Detail-pane action button height / gap (logical px).
+const ACTION_BTN_H: i32 = 14;
+const ACTION_BTN_GAP: i32 = 4;
+
+/// Two-pane layout in logical px, shared by the list and detail renderers.
+struct PaneGeom {
+    list_x: i32,
+    list_w: i32,
+    list_right: i32,
+    detail_x: i32,
+    detail_w: i32,
+    top: i32,
+    bottom: i32,
+    /// Single full-width list column (no detail pane).
+    compact: bool,
+}
+
+/// Scroll viewport state shared by the list pane and its scrollbar.
+struct ListScroll {
+    visible_len: usize,
+    page: usize,
+    scroll: usize,
+    max_scroll: usize,
+}
+
+/// Text-column geometry inside the detail pane (logical px).
+struct DetailGeom {
+    tx: i32,
+    tw: i32,
+    cells: usize,
+}
 
 /// Scales logical-pixel geometry to physical pixels on emit so visuals and
 /// hit regions never diverge.
@@ -3790,6 +3650,24 @@ impl Lay {
             .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
+    /// Stone-button chrome plus optional hit region (`live` gates it).
+    fn button(
+        &mut self,
+        hits: &mut Vec<ModManagerHitRegion>,
+        r: UiRect,
+        id: ModManagerWidgetId,
+        colors: (UiColor, UiColor),
+        label: &str,
+        live: bool,
+    ) {
+        self.fill_rect(r, colors.0);
+        self.border_rect(r, palette::BUTTON_BORDER);
+        self.ctext_in(r, 1, colors.1, label);
+        if live {
+            self.region(hits, id, r);
+        }
+    }
+
     fn region(&self, hits: &mut Vec<ModManagerHitRegion>, id: ModManagerWidgetId, r: UiRect) {
         let p = self.phys(r);
         let (x0, y0) = (p.x.max(0), p.y.max(0));
@@ -3805,6 +3683,100 @@ impl Lay {
             id,
         });
     }
+}
+
+/// Flow-wrap `(widget, label, live)` buttons into rows ≤ `tw` wide.
+fn flow_wrap_buttons(
+    buttons: Vec<(ModManagerWidgetId, String, bool)>,
+    tw: i32,
+) -> Vec<Vec<(ModManagerWidgetId, String, bool, i32)>> {
+    let btn_gap = ACTION_BTN_GAP;
+    let mut rows: Vec<Vec<(ModManagerWidgetId, String, bool, i32)>> = vec![Vec::new()];
+    let mut row_w = 0;
+    for (id, label, live) in buttons {
+        let w = (crate::draw::text_width(&label, 1) as i32 + 12).min(tw);
+        if row_w > 0 && row_w + btn_gap + w > tw {
+            rows.push(Vec::new());
+            row_w = 0;
+        }
+        row_w += if row_w > 0 { btn_gap + w } else { w };
+        rows.last_mut()
+            .expect("one row always exists")
+            .push((id, label, live, w));
+    }
+    rows
+}
+
+/// Paint `text` word-wrapped to `cells` in dim ink until `bottom_limit`.
+fn paint_wrapped_dim(
+    lay: &mut Lay,
+    tx: i32,
+    mut y: i32,
+    cells: usize,
+    bottom_limit: i32,
+    text: &str,
+) -> i32 {
+    let avail = (bottom_limit - y).max(0);
+    for line in wrap_text(text, cells)
+        .into_iter()
+        .take((avail / 10).max(0) as usize)
+    {
+        lay.text_fit(tx, y, 1, palette::TEXT_DIM, &line, cells);
+        y += 10;
+    }
+    y
+}
+
+/// One consent-box candidate line: id, version, size, sha512, requesters.
+fn consent_candidate_line(row: &MissingDependencyConsentRow) -> String {
+    let requesters = if row.requesting_mods.is_empty() {
+        String::new()
+    } else {
+        format!(" <- {}", row.requesting_mods.join(","))
+    };
+    format!(
+        "{} {} {} ({} bytes, sha512 {}){}",
+        row.mod_id,
+        row.version_number,
+        row.filename,
+        row.size_bytes,
+        crate::draw::first_cells(&row.sha512, 12),
+        requesters
+    )
+}
+
+/// One consent-box unsatisfied-dependency line.
+fn consent_unsatisfied_line(row: &MissingDependencyUnsatisfiedRow) -> String {
+    format!(
+        "! {} {}: {}",
+        row.mod_id, row.required_version_range, row.reason
+    )
+}
+
+/// Paint `^`/`v` scroll arrows; returns rects for hit registration.
+fn scroll_arrow_buttons(lay: &mut Lay, sb_x: i32, top: i32, bottom: i32) -> (UiRect, UiRect) {
+    let up = UiRect::new(sb_x, top + 2, 10, 12);
+    let down = UiRect::new(sb_x, bottom - 14, 10, 12);
+    lay.fill_rect(up, palette::BUTTON);
+    lay.fill_rect(down, palette::BUTTON);
+    lay.ctext_in(up, 1, palette::TEXT, "^");
+    lay.ctext_in(down, 1, palette::TEXT, "v");
+    (up, down)
+}
+
+/// Register the scroll-arrow hit regions (up first, then down).
+fn scroll_arrow_regions(lay: &Lay, hits: &mut Vec<ModManagerHitRegion>, up: UiRect, down: UiRect) {
+    lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
+    lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
+}
+
+/// One filter-pill row entry: `(label, widget, active)`.
+fn pill(
+    label: impl Into<String>,
+    id: ModManagerWidgetId,
+    active: bool,
+) -> (String, ModManagerWidgetId, bool) {
+    (label.into(), id, active)
 }
 
 /// Elide a label to `cells` glyph cells so text never overflows its
@@ -4113,21 +4085,9 @@ mod tests {
             tr(crate::state::UiLang::Ja, "Kind", "タイプ"),
             menu.soft_reload_status(crate::state::UiLang::En),
             menu.soft_reload_status(crate::state::UiLang::Ja),
-            tr(
-                crate::state::UiLang::Ja,
-                "Search Modrinth",
-                "Modrinthで検索",
-            ),
-            tr(
-                crate::state::UiLang::Ja,
-                "No packs curated - search Modrinth for:",
-                "パックはModrinthで検索",
-            ),
-            tr(
-                crate::state::UiLang::Ja,
-                "Search Modrinth...",
-                "Modrinthを検索...",
-            ),
+            tr(crate::state::UiLang::Ja, "Search Modrinth", "Modrinthで検索"),
+            tr(crate::state::UiLang::Ja, "No packs curated - search Modrinth for:", "パックはModrinthで検索"),
+            tr(crate::state::UiLang::Ja, "Search Modrinth...", "Modrinthを検索..."),
         ] {
             for c in s.chars() {
                 assert!(
