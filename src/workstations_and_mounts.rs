@@ -778,6 +778,7 @@ impl LoomMenu {
         WM_LOOM_PATTERNS.iter().map(|p| p.to_string()).collect()
     }
 
+    #[cfg(test)]
     fn select_pattern(&mut self, pattern: &str) -> bool {
         if self.selectable_patterns().iter().any(|p| p == pattern) {
             self.selected_pattern = Some(pattern.to_string());
