@@ -19,6 +19,42 @@ enum RsDir {
     East,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RsDirDescriptor {
+    offset: (i32, i32, i32),
+    opposite: RsDir,
+    horizontal_cw: RsDir,
+    horizontal_ccw: RsDir,
+    axis: RsAxis,
+}
+
+impl RsDirDescriptor {
+    const fn new(
+        offset: (i32, i32, i32),
+        opposite: RsDir,
+        horizontal_cw: RsDir,
+        horizontal_ccw: RsDir,
+        axis: RsAxis,
+    ) -> Self {
+        Self {
+            offset,
+            opposite,
+            horizontal_cw,
+            horizontal_ccw,
+            axis,
+        }
+    }
+}
+
+const RS_DIR_DESCRIPTORS: [RsDirDescriptor; 6] = [
+    RsDirDescriptor::new((0, -1, 0), RsDir::Up, RsDir::Down, RsDir::Down, RsAxis::Y),
+    RsDirDescriptor::new((0, 1, 0), RsDir::Down, RsDir::Up, RsDir::Up, RsAxis::Y),
+    RsDirDescriptor::new((0, 0, -1), RsDir::South, RsDir::East, RsDir::West, RsAxis::Z),
+    RsDirDescriptor::new((0, 0, 1), RsDir::North, RsDir::West, RsDir::East, RsAxis::Z),
+    RsDirDescriptor::new((-1, 0, 0), RsDir::East, RsDir::North, RsDir::South, RsAxis::X),
+    RsDirDescriptor::new((1, 0, 0), RsDir::West, RsDir::South, RsDir::North, RsAxis::X),
+];
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl RsDir {
     const ALL: [Self; 6] = [
@@ -31,43 +67,24 @@ impl RsDir {
     ];
     const HORIZONTAL: [Self; 4] = [Self::North, Self::South, Self::West, Self::East];
 
+    fn descriptor(self) -> &'static RsDirDescriptor {
+        &RS_DIR_DESCRIPTORS[self as usize]
+    }
+
     fn offset(self) -> (i32, i32, i32) {
-        match self {
-            Self::Down => (0, -1, 0),
-            Self::Up => (0, 1, 0),
-            Self::North => (0, 0, -1),
-            Self::South => (0, 0, 1),
-            Self::West => (-1, 0, 0),
-            Self::East => (1, 0, 0),
-        }
+        self.descriptor().offset
     }
 
     fn opposite(self) -> Self {
-        match self {
-            Self::Down => Self::Up,
-            Self::Up => Self::Down,
-            Self::North => Self::South,
-            Self::South => Self::North,
-            Self::West => Self::East,
-            Self::East => Self::West,
-        }
+        self.descriptor().opposite
     }
 
     fn left(self) -> Self {
-        match self {
-            Self::North => Self::West,
-            Self::South => Self::East,
-            Self::West => Self::South,
-            Self::East => Self::North,
-            Self::Down | Self::Up => self,
-        }
+        self.descriptor().horizontal_ccw
     }
 
     fn right(self) -> Self {
-        match self {
-            Self::Down | Self::Up => self,
-            _ => self.left().opposite(),
-        }
+        self.descriptor().horizontal_cw
     }
 
     fn horizontal_index(self) -> Option<usize> {
@@ -75,11 +92,7 @@ impl RsDir {
     }
 
     fn axis(self) -> RsAxis {
-        match self {
-            Self::West | Self::East => RsAxis::X,
-            Self::Down | Self::Up => RsAxis::Y,
-            Self::North | Self::South => RsAxis::Z,
-        }
+        self.descriptor().axis
     }
 
     fn from_property(value: &str) -> Option<Self> {
@@ -2403,6 +2416,38 @@ mod redstone_tests {
     use crate::json::jparse;
 
     const ORIGIN: RsPos = RsPos(0, 0, 0);
+
+    #[test]
+    fn direction_table_pins_offsets_opposites_rotations_and_axes() {
+        let expected = [
+            (RsDir::Down, (0, -1, 0), RsDir::Down, RsDir::Down, RsAxis::Y),
+            (RsDir::Up, (0, 1, 0), RsDir::Up, RsDir::Up, RsAxis::Y),
+            (RsDir::North, (0, 0, -1), RsDir::East, RsDir::West, RsAxis::Z),
+            (RsDir::South, (0, 0, 1), RsDir::West, RsDir::East, RsAxis::Z),
+            (RsDir::West, (-1, 0, 0), RsDir::North, RsDir::South, RsAxis::X),
+            (RsDir::East, (1, 0, 0), RsDir::South, RsDir::North, RsAxis::X),
+        ];
+        assert_eq!(RsDir::ALL.len(), expected.len());
+        for (dir, offset, clockwise, counterclockwise, axis) in expected {
+            assert_eq!(dir.offset(), offset, "{dir:?} offset");
+            assert_eq!(dir.opposite().opposite(), dir, "{dir:?} opposite closure");
+            assert_eq!(dir.right(), clockwise, "{dir:?} clockwise");
+            assert_eq!(
+                dir.left(),
+                counterclockwise,
+                "{dir:?} counterclockwise"
+            );
+            assert_eq!(dir.axis(), axis, "{dir:?} axis");
+            let mut cw = dir;
+            let mut ccw = dir;
+            for _ in 0..4 {
+                cw = cw.right();
+                ccw = ccw.left();
+            }
+            assert_eq!(cw, dir, "{dir:?} 4x clockwise closure");
+            assert_eq!(ccw, dir, "{dir:?} 4x counterclockwise closure");
+        }
+    }
 
     #[cfg_attr(not(megu_vanilla_data), allow(dead_code))]
     fn registered(reg: &BReg, name: &str, properties: &[(&str, &str)]) -> u32 {

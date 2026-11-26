@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 use bytemuck::{Pod, Zeroable};
 use megu_client_mesh::ber_instancing::VanillaParticleQuad;
 use megu_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
-use megu_client_mesh::BerInstanceData;
+use megu_client_mesh::dir_basis::DIR_BASIS;
+use megu_client_mesh::{BerInstanceData, Direction};
 use megu_proto::subworld_wire::{
     pivot_adjusted_position, SubworldFrameMode, SubworldPoseRecord,
     SubworldSyncFrame as WireSubworldSyncFrame,
@@ -2065,39 +2066,36 @@ impl From<&VfxLightUniforms> for VfxLightsGpu {
 // Geometry helpers
 // ---------------------------------------------------------------------------
 
+const BOX_FACE_CORNER_STEPS: [(usize, usize); 4] = [(0, 0), (1, 0), (1, 1), (0, 1)];
+const BOX_FACE_BASIS_ROTATIONS: [(usize, usize); 6] = [
+    (Direction::East as usize, 0),
+    (Direction::West as usize, 1),
+    (Direction::Up as usize, 0),
+    (Direction::Down as usize, 3),
+    (Direction::South as usize, 0),
+    (Direction::North as usize, 3),
+];
+
 /// Face table for one axis-aligned box: `(outward normal, four corners)`
 /// per face in `+X, -X, +Y, -Y, +Z, -Z` order — the same order
 /// `vanilla_plus_nature`'s `FACE_POS_X..FACE_NEG_Z` bit flags enumerate.
 /// Corners wind counter-clockwise seen from outside.
 pub(crate) fn box_face_corners(min: [f32; 3], max: [f32; 3]) -> [([f32; 3], [[f32; 3]; 4]); 6] {
-    let (x0, y0, z0) = (min[0], min[1], min[2]);
-    let (x1, y1, z1) = (max[0], max[1], max[2]);
-    [
-        (
-            [1.0, 0.0, 0.0],
-            [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
-        ),
-        (
-            [-1.0, 0.0, 0.0],
-            [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
-        ),
-        (
-            [0.0, 1.0, 0.0],
-            [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
-        ),
-        (
-            [0.0, -1.0, 0.0],
-            [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
-        ),
-        (
-            [0.0, 0.0, 1.0],
-            [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
-        ),
-        (
-            [0.0, 0.0, -1.0],
-            [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
-        ),
-    ]
+    std::array::from_fn(|face| {
+        let (basis_index, rotation) = BOX_FACE_BASIS_ROTATIONS[face];
+        let basis = &DIR_BASIS[basis_index];
+        let corners = std::array::from_fn(|corner| {
+            let (u, v) = BOX_FACE_CORNER_STEPS[(corner + rotation) % BOX_FACE_CORNER_STEPS.len()];
+            std::array::from_fn(|axis| {
+                let unit = basis.origin[axis] as i8
+                    + u as i8 * basis.u_axis[axis]
+                    + v as i8 * basis.v_axis[axis];
+                debug_assert!(matches!(unit, 0 | 1));
+                if unit == 1 { max[axis] } else { min[axis] }
+            })
+        });
+        (basis.n.map(|n| n as f32), corners)
+    })
 }
 
 /// Emit one axis-aligned box as a [`TerrainVertex`] mesh (positions in
@@ -3404,6 +3402,81 @@ mod voxel_hull_tests {
         }
         put(6, 6, 4, CABIN);
         cells
+    }
+
+    #[test]
+    fn box_mesh_derived_faces_pin_positions_normals_uvs_and_winding() {
+        let (x0, y0, z0) = (2.0f32, -3.0, 7.0);
+        let (x1, y1, z1) = (5.0f32, 4.0, 11.0);
+        let min = [x0, y0, z0];
+        let max = [x1, y1, z1];
+        let expected: [([f32; 3], [[f32; 3]; 4]); 6] = [
+            (
+                [1.0, 0.0, 0.0],
+                [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]],
+            ),
+            (
+                [-1.0, 0.0, 0.0],
+                [[x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [x0, y0, z0]],
+            ),
+            (
+                [0.0, 1.0, 0.0],
+                [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]],
+            ),
+            (
+                [0.0, -1.0, 0.0],
+                [[x0, y0, z1], [x0, y0, z0], [x1, y0, z0], [x1, y0, z1]],
+            ),
+            (
+                [0.0, 0.0, 1.0],
+                [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]],
+            ),
+            (
+                [0.0, 0.0, -1.0],
+                [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]],
+            ),
+        ];
+        let (vertices, indices) = box_mesh(min, max, [1.0; 3]);
+        assert_eq!(vertices.len(), 24);
+        assert_eq!(indices.len(), 36);
+        for (face, (normal, positions)) in expected.into_iter().enumerate() {
+            let base = (face * 4) as u32;
+            assert_eq!(
+                indices[face * 6..face * 6 + 6],
+                [base, base + 1, base + 2, base, base + 2, base + 3]
+            );
+            for (corner, position) in positions.into_iter().enumerate() {
+                let vertex = vertices[face * 4 + corner];
+                assert_eq!(vertex.position, position, "face {face} corner {corner}");
+                assert_eq!(
+                    vertex.packed_normal,
+                    pack_normal_octahedral(normal),
+                    "face {face} normal"
+                );
+                assert_eq!(
+                    vertex.uv,
+                    [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]][corner],
+                    "face {face} uv {corner}"
+                );
+            }
+            let edge0 = [
+                positions[1][0] - positions[0][0],
+                positions[1][1] - positions[0][1],
+                positions[1][2] - positions[0][2],
+            ];
+            let edge1 = [
+                positions[2][0] - positions[0][0],
+                positions[2][1] - positions[0][1],
+                positions[2][2] - positions[0][2],
+            ];
+            let cross = [
+                edge0[1] * edge1[2] - edge0[2] * edge1[1],
+                edge0[2] * edge1[0] - edge0[0] * edge1[2],
+                edge0[0] * edge1[1] - edge0[1] * edge1[0],
+            ];
+            let parity = cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2];
+            assert!(parity > 0.0, "face {face} winding is inward");
+        }
     }
 
     #[test]
