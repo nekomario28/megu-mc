@@ -2,7 +2,7 @@
 # Install or update Megu: irm https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_windows.ps1 | iex
 [CmdletBinding()]
 param(
-    [string]$Version = 'v0.1.0-alpha.3',
+    [string]$Version = 'v0.1.0-alpha.5',
     [switch]$Rollback,
     [switch]$Uninstall
 )
