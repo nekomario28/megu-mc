@@ -1313,51 +1313,10 @@ fn update_shape<W: TemplateWorld>(
             }
         }
     }
-    if name.ends_with("_stairs") && matches!(direction, 2..=5) {
-        if let Some(next) = reg.stair_after_neighbors(state, pos, |cell| {
-            world.get(cell.0, cell.1, cell.2)
-        }) {
-            return next;
-        }
+    if let Some(next) = update_connection_shapes(reg, state, direction, neighbor, world, pos) {
+        return next;
     }
     let bare = name.strip_prefix("minecraft:").unwrap_or(name);
-    // `WallBlock.updateShape`: both `UP` (direction 1) and horizontal sides
-    // recompute `low`/`tall` against `above.getCollisionShape().getFaceShape(DOWN)`
-    // and recompute `up` (`shouldRaisePost`).
-    if bare.ends_with("_wall") || reg.in_tag(state, "minecraft:walls") {
-        return wall_update_shape(reg, state, direction, neighbor, world, pos);
-    }
-    if bare.ends_with("_fence") && matches!(direction, 2..=5) {
-        let key = match direction {
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
-        let connected = fence_connects(reg, state, neighbor, direction);
-        let want = if connected { "true" } else { "false" };
-        if reg.get_prop(state, key).as_deref() != Some(want) {
-            return reg.with_prop(state, key, want);
-        }
-    }
-    // `IronBarsBlock.updateShape` (glass panes and iron bars).
-    if (bare.ends_with("_pane") || bare == "iron_bars") && matches!(direction, 2..=5) {
-        let key = match direction {
-            2 => "north",
-            3 => "south",
-            4 => "west",
-            _ => "east",
-        };
-        let sturdy = is_face_sturdy(reg, neighbor, direction ^ 1);
-        let same = reg.name_of(neighbor).ends_with("_pane") || reg.name_of(neighbor) == "minecraft:iron_bars";
-        let connected = (!is_exception_for_connection(reg, neighbor) && sturdy)
-            || same
-            || reg.in_tag(neighbor, "minecraft:walls");
-        let want = if connected { "true" } else { "false" };
-        if reg.get_prop(state, key).as_deref() != Some(want) {
-            return reg.with_prop(state, key, want);
-        }
-    }
     // `TallSeagrassBlock` inherits `DoublePlantBlock.updateShape` (`dig.a`):
     // when the neighbouring half changes, a mismatched vertical partner is
     // replaced by air. A template's edge-shape pass can expose an upper half
@@ -2013,6 +1972,64 @@ fn update_shape<W: TemplateWorld>(
     }
     state
 }
+
+fn update_connection_shapes<W: TemplateWorld>(
+    reg: &BReg,
+    state: u32,
+    direction: u8,
+    neighbor: u32,
+    world: &mut W,
+    pos: Pos,
+) -> Option<u32> {
+    let name = reg.name_of(state);
+    if name.ends_with("_stairs") && matches!(direction, 2..=5) {
+        if let Some(next) = reg.stair_after_neighbors(state, pos, |cell| {
+            world.get(cell.0, cell.1, cell.2)
+        }) {
+            return Some(next);
+        }
+    }
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    // `WallBlock.updateShape`: both `UP` (direction 1) and horizontal sides
+    // recompute `low`/`tall` against `above.getCollisionShape().getFaceShape(DOWN)`
+    // and recompute `up` (`shouldRaisePost`).
+    if bare.ends_with("_wall") || reg.in_tag(state, "minecraft:walls") {
+        return Some(wall_update_shape(reg, state, direction, neighbor, world, pos));
+    }
+    if bare.ends_with("_fence") && matches!(direction, 2..=5) {
+        let key = match direction {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            _ => "east",
+        };
+        let connected = fence_connects(reg, state, neighbor, direction);
+        let want = if connected { "true" } else { "false" };
+        if reg.get_prop(state, key).as_deref() != Some(want) {
+            return Some(reg.with_prop(state, key, want));
+        }
+    }
+    // `IronBarsBlock.updateShape` (glass panes and iron bars).
+    if (bare.ends_with("_pane") || bare == "iron_bars") && matches!(direction, 2..=5) {
+        let key = match direction {
+            2 => "north",
+            3 => "south",
+            4 => "west",
+            _ => "east",
+        };
+        let sturdy = is_face_sturdy(reg, neighbor, direction ^ 1);
+        let same = reg.name_of(neighbor).ends_with("_pane") || reg.name_of(neighbor) == "minecraft:iron_bars";
+        let connected = (!is_exception_for_connection(reg, neighbor) && sturdy)
+            || same
+            || reg.in_tag(neighbor, "minecraft:walls");
+        let want = if connected { "true" } else { "false" };
+        if reg.get_prop(state, key).as_deref() != Some(want) {
+            return Some(reg.with_prop(state, key, want));
+        }
+    }
+    None
+}
+
 fn facing_dir(reg: &BReg, state: u32) -> Option<u8> {
     match reg.get_prop(state, "facing").as_deref() {
         Some("down") => Some(0),
