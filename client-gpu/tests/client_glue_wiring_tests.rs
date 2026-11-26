@@ -173,3 +173,46 @@ fn server_open_book_routes_written_book_to_read_only_viewer() {
     assert_eq!(viewer.author, "Author");
     assert_eq!(viewer.pages, vec!["Written page"]);
 }
+
+#[test]
+fn mixed_create_and_generic_mrs1_frame_installs_both_sparse_bands_live() {
+    let registry = megu_proto::mod_wire::Mrs1Registry {
+        base_block_state_id: 26_684,
+        base_item_id: 1_000_000,
+        block_states: vec![
+            megu_proto::mod_wire::Mrs1BlockStateEntry {
+                state_id: 26_684,
+                block_id: "create:shaft".into(),
+                properties: Vec::new(),
+            },
+            megu_proto::mod_wire::Mrs1BlockStateEntry {
+                state_id: 1_000_000,
+                block_id: "examplemod:machine".into(),
+                properties: Vec::new(),
+            },
+        ],
+        items: Default::default(),
+    };
+    let frame = megu_proto::mod_wire::encode_mrs1_frame_v2(&registry).expect("encode MRS1 v2");
+
+    let mut live = playing_session();
+    live.ingest_custom_channel_payload_for_test("megu:mod_registry_sync_v1", &frame);
+
+    assert_eq!(live.mod_registry_rejected, 0);
+    assert_eq!(
+        live.world.blocks.state_name(26_684),
+        Some("create:shaft"),
+        "the Create band must remain installed"
+    );
+    assert_eq!(
+        live.world.blocks.state_name(1_000_000),
+        Some("examplemod:machine"),
+        "the generic mod band beyond the old dense probe window must install"
+    );
+    let synced = live.mod_registry.as_ref().expect("MRS1 registry retained");
+    assert_eq!(synced.block_state_name(26_684), Some("create:shaft"));
+    assert_eq!(
+        synced.block_state_name(1_000_000),
+        Some("examplemod:machine")
+    );
+}
