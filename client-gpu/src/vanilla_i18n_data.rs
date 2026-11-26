@@ -5,9 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::vanilla_jar::{prioritized_packs, read_bounded_file, AssetLayer, MAX_PACK_LAYERS};
+use crate::vanilla_jar::{AssetLayer, MAX_PACK_LAYERS, prioritized_packs, read_bounded_file};
 use megu_core::crypto::sha1_hex;
-use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
+use megu_core::json::{JsonLimits, JsonValue, parse_json_with_limits};
 
 const MAX_ENTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
@@ -342,6 +342,7 @@ impl VanillaLanguageTable {
     }
     pub fn item_display_name(&self, id: &str) -> String {
         self.translate(&format!("item.{}.{}", ns(id), path(id)))
+            .or_else(|| self.translate(&format!("block.{}.{}", ns(id), path(id))))
             .map(str::to_owned)
             .unwrap_or_else(|| Self::human_fallback(id))
     }
@@ -520,7 +521,29 @@ fn parse_recipe(id: String, b: &[u8]) -> Option<VanillaRecipeEntry> {
     if let Some(arr) = v.get("ingredients").and_then(JsonValue::as_array) {
         ingredients.extend(arr.iter().map(ingredient));
     }
-    if let Some(obj) = v.get("key").and_then(JsonValue::as_object) {
+    let recipe_kind = kind(&ty);
+    if recipe_kind == VanillaRecipeKind::CraftingShaped {
+        if let (Some(pattern), Some(key_map)) = (
+            v.get("pattern").and_then(JsonValue::as_array),
+            v.get("key").and_then(JsonValue::as_object),
+        ) {
+            for row in pattern.iter().filter_map(JsonValue::as_str) {
+                for symbol in row.chars() {
+                    if symbol.is_whitespace() {
+                        continue;
+                    }
+                    let mut symbol_key = [0u8; 4];
+                    let symbol = symbol.encode_utf8(&mut symbol_key).as_bytes();
+                    let Ok(symbol) = std::str::from_utf8(symbol) else {
+                        continue;
+                    };
+                    if let Some((_, x)) = key_map.iter().find(|(key, _)| key == symbol) {
+                        ingredients.push(ingredient(x));
+                    }
+                }
+            }
+        }
+    } else if let Some(obj) = v.get("key").and_then(JsonValue::as_object) {
         for (_, x) in obj {
             ingredients.push(ingredient(x));
         }
@@ -547,7 +570,7 @@ fn parse_recipe(id: String, b: &[u8]) -> Option<VanillaRecipeEntry> {
     });
     Some(VanillaRecipeEntry {
         id,
-        kind: kind(&ty),
+        kind: recipe_kind,
         recipe_type: ty,
         group: v.get_str("group").map(str::to_owned),
         category: v.get_str("category").map(str::to_owned),
@@ -605,8 +628,8 @@ impl VanillaJarDataCatalog {
                 .strip_prefix("recipe/")
                 .or_else(|| tail.strip_prefix("recipes/"))
             {
-                if !file.contains('/') {
-                    let stem = file.strip_suffix(".json").unwrap_or(file);
+                let stem = file.strip_suffix(".json").unwrap_or(file);
+                if safe_rel(stem) {
                     let id = format!("{namespace}:{stem}");
                     if let Some(r) = parse_recipe(id.clone(), &bytes) {
                         self.recipes.insert(id, r);
@@ -675,23 +698,45 @@ impl VanillaJarDataCatalog {
     }
 }
 
+fn normalize_tag_entry_id(id: &str) -> Option<String> {
+    let (negative, rest) = id
+        .strip_prefix('!')
+        .map_or((false, id), |rest| (true, rest));
+    let (tag, rest) = rest
+        .strip_prefix('#')
+        .map_or((false, rest), |rest| (true, rest));
+    if !valid_id(rest) {
+        return None;
+    }
+    let normalized = if rest.contains(':') {
+        rest.to_owned()
+    } else {
+        format!("minecraft:{rest}")
+    };
+    Some(format!(
+        "{}{}{}",
+        if negative { "!" } else { "" },
+        if tag { "#" } else { "" },
+        normalized
+    ))
+}
+
 fn parse_tag(bytes: &[u8]) -> Option<(bool, Vec<String>)> {
     let v = parse_bounded_json(bytes)?;
     let replace = v.get_bool("replace", false);
     let vals = v.get("values")?.as_array()?;
     let mut out = Vec::new();
     for x in vals {
-        let (id, required) = match x {
-            JsonValue::String(s) => (s.as_str(), true),
-            JsonValue::Object(_) => (x.get_str("id")?, x.get_bool("required", true)),
+        let id = match x {
+            JsonValue::String(s) => s.as_str(),
+            JsonValue::Object(_) => x.get_str("id")?,
             _ => return None,
         };
-        if !required {
-            continue;
-        }
-        let checked = id.strip_prefix('!').unwrap_or(id);
-        if valid_id(checked.trim_start_matches('#')) {
-            out.push(id.to_owned());
+        // `required:false` controls whether a missing optional reference is
+        // tolerated; it is not permission to erase a present entry. Preserve
+        // every syntactically valid entry and canonicalize namespaceless ids.
+        if let Some(normalized) = normalize_tag_entry_id(id) {
+            out.push(normalized);
         }
     }
     Some((replace, out))

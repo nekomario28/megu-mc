@@ -19,10 +19,10 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use megu_client_mesh::asset_pipeline::{animation_from_mcmeta, ResourcePackLayer};
+use megu_client_mesh::asset_pipeline::{ResourcePackLayer, animation_from_mcmeta};
 use megu_client_mesh::png_decode;
 use megu_core::hash::crc32_ieee;
-use megu_core::zip_archive::{inflate_raw_rfc1951_with_consumed, ZipError};
+use megu_core::zip_archive::{ZipError, inflate_raw_rfc1951_with_consumed};
 
 /// Total on-disk bytes the archive itself may occupy.
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -351,7 +351,7 @@ impl<'a> AssetLayer<'a> {
 }
 
 pub(crate) fn read_bounded_file(path: &Path, cap: usize) -> std::io::Result<Vec<u8>> {
-    let meta = std::fs::metadata(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
     if !meta.is_file() || meta.len() > cap as u64 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -482,7 +482,9 @@ fn valid_mod_namespace(ns: &str) -> bool {
     !ns.is_empty()
         && ns != "."
         && ns != ".."
-        && ns.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && ns
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 fn is_mod_asset(name: &str) -> bool {
@@ -582,6 +584,7 @@ fn read_at<R: Read + Seek>(reader: &mut R, offset: u64, buf: &mut [u8]) -> Resul
 struct ZipMember {
     name: String,
     method: u16,
+    crc32: u32,
     compressed_size: u64,
     uncompressed_size: u64,
     local_offset: u64,
@@ -753,6 +756,7 @@ fn index_zip<R: Read + Seek>(
             });
         }
         let method = u16_at(&fixed, 10);
+        let crc32 = u32_at(&fixed, 16);
         let mut compressed_size = u64::from(u32_at(&fixed, 20));
         let mut uncompressed_size = u64::from(u32_at(&fixed, 24));
         let name_len = u64::from(u16_at(&fixed, 28));
@@ -824,6 +828,7 @@ fn index_zip<R: Read + Seek>(
         members.push(ZipMember {
             name,
             method,
+            crc32,
             compressed_size,
             uncompressed_size,
             local_offset,
@@ -852,7 +857,7 @@ fn read_zip_member<R: Read + Seek>(
         other => {
             return Err(JarError::Unsupported {
                 reason: format!("compression method {other}"),
-            })
+            });
         }
     }
     if member.uncompressed_size > max_bytes {
@@ -863,11 +868,7 @@ fn read_zip_member<R: Read + Seek>(
             ),
         });
     }
-    if member.compressed_size
-        > max_bytes
-            .saturating_mul(2)
-            .saturating_add(1024 * 1024)
-    {
+    if member.compressed_size > max_bytes.saturating_mul(2).saturating_add(1024 * 1024) {
         return Err(JarError::BudgetExceeded {
             reason: format!(
                 "entry compressed size {} exceeds sane bound",
@@ -882,10 +883,33 @@ fn read_zip_member<R: Read + Seek>(
             reason: "bad local file header signature".to_owned(),
         });
     }
-    let data_offset = member
+    if u16_at(&header, 8) != member.method {
+        return Err(JarError::Malformed {
+            reason: "local/central compression method mismatch".to_owned(),
+        });
+    }
+    let local_name_len = u16_at(&header, 26) as u64;
+    let local_extra_len = u16_at(&header, 28) as u64;
+    if local_name_len > 4096 {
+        return Err(JarError::Malformed {
+            reason: "local entry name is unreasonably long".to_owned(),
+        });
+    }
+    let local_name_offset = member
         .local_offset
         .checked_add(JIJ_LFH_FIXED as u64)
-        .and_then(|off| off.checked_add(u16_at(&header, 26) as u64 + u16_at(&header, 28) as u64))
+        .ok_or_else(|| JarError::Malformed {
+            reason: "local data offset overflow".to_owned(),
+        })?;
+    let mut local_name = vec![0u8; local_name_len as usize];
+    read_at(reader, local_name_offset, &mut local_name)?;
+    if local_name != member.name.as_bytes() {
+        return Err(JarError::Malformed {
+            reason: "local/central entry name mismatch".to_owned(),
+        });
+    }
+    let data_offset = local_name_offset
+        .checked_add(local_name_len + local_extra_len)
         .ok_or_else(|| JarError::Malformed {
             reason: "local data offset overflow".to_owned(),
         })?;
@@ -904,7 +928,7 @@ fn read_zip_member<R: Read + Seek>(
                     reason: "stored entry size mismatch".to_owned(),
                 });
             }
-            Ok(compressed)
+            check_member_crc(member, compressed)
         }
         _ => {
             let (out, consumed) =
@@ -924,9 +948,18 @@ fn read_zip_member<R: Read + Seek>(
                     reason: "inflated size mismatch".to_owned(),
                 });
             }
-            Ok(out)
+            check_member_crc(member, out)
         }
     }
+}
+
+fn check_member_crc(member: &ZipMember, bytes: Vec<u8>) -> Result<Vec<u8>, JarError> {
+    if crc32_ieee(&bytes) != member.crc32 {
+        return Err(JarError::Malformed {
+            reason: format!("CRC-32 mismatch in {}", member.name),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Per-outer-JAR collection state: budget left, deterministic layer order
@@ -1034,7 +1067,8 @@ fn collect_zip_assets<R: Read + Seek>(
             if strict {
                 read_report.skipped.push((member.name.clone(), reason));
             } else {
-                ctx.skipped.push(format!("{label}: {}: {reason}", member.name));
+                ctx.skipped
+                    .push(format!("{label}: {}: {reason}", member.name));
             }
             continue;
         }
@@ -1441,7 +1475,8 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
         "bat" => "assets/minecraft/textures/entity/bat.png",
         "bee" => "assets/minecraft/textures/entity/bee/bee.png",
         "blaze" => "assets/minecraft/textures/entity/blaze.png",
-        "boat" | "chest_boat" => "assets/minecraft/textures/entity/boat/oak.png",
+        "boat" => "assets/minecraft/textures/entity/boat/oak.png",
+        "chest_boat" => "assets/minecraft/textures/entity/chest_boat/oak.png",
         "bogged" => "assets/minecraft/textures/entity/skeleton/bogged.png",
         "breeze" => "assets/minecraft/textures/entity/breeze/breeze.png",
         "breeze_wind_charge" | "wind_charge" => {
@@ -1465,7 +1500,8 @@ pub fn entity_texture_path_for_id(entity_type_id: u16) -> Option<&'static str> {
         "falling_block" => return None,
         "tnt" => "assets/minecraft/textures/block/tnt_side.png",
         "dolphin" => "assets/minecraft/textures/entity/dolphin.png",
-        "donkey" | "mule" => "assets/minecraft/textures/entity/horse/donkey.png",
+        "donkey" => "assets/minecraft/textures/entity/horse/donkey.png",
+        "mule" => "assets/minecraft/textures/entity/horse/mule.png",
         "dragon_fireball" => "assets/minecraft/textures/entity/enderdragon/dragon_fireball.png",
         "fireball" | "small_fireball" => "assets/minecraft/textures/item/fire_charge.png",
         "zombie" | "giant" => "assets/minecraft/textures/entity/zombie/zombie.png",
@@ -1933,11 +1969,7 @@ fn procedural_pixels(path: &str, particle: bool) -> (u32, u32, Vec<u8>) {
             let spark_mask =
                 dx.abs() <= 1.25 || dy.abs() <= 1.25 || (dx.abs() - dy.abs()).abs() <= 1.1;
             let alpha = if particle && spark {
-                if spark_mask && d <= 8.0 {
-                    255
-                } else {
-                    0
-                }
+                if spark_mask && d <= 8.0 { 255 } else { 0 }
             } else if particle {
                 ((8.0 - d).clamp(0.0, 1.0) * 255.0) as u8
             } else {
@@ -2380,11 +2412,9 @@ mod tests {
 
     // One valid 1x1 RGBA PNG with the non-fallback pixel [66,160,208,255].
     const CREATE_PNG: [u8; 70] = [
-        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82,
-        0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196,
-        137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 112, 90, 112,
-        225, 63, 0, 5, 140, 2, 178, 39, 213, 187, 120, 0, 0, 0,
-        0, 73, 69, 78, 68, 174, 66, 96, 130,
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6,
+        0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 112, 90, 112, 225,
+        63, 0, 5, 140, 2, 178, 39, 213, 187, 120, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
 
     fn create_jar(model: &[u8]) -> Vec<u8> {
@@ -2432,11 +2462,19 @@ mod tests {
         let bundle = CompiledAssetBundle::build(&[vanilla, layers[0].clone(), layers[1].clone()])
             .expect("mod and vanilla bundle");
         assert!(bundle.atlas.placement("minecraft:block/stone").is_some());
-        let quads = bundle.bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0])
+        let quads = bundle
+            .bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0])
             .expect("Create loader fallback geometry");
         assert_eq!(quads.len(), 6);
-        assert!(quads.iter().all(|quad| quad.texture == "create:block/andesite_casing"));
-        let p = bundle.atlas.placement("create:block/andesite_casing").unwrap();
+        assert!(
+            quads
+                .iter()
+                .all(|quad| quad.texture == "create:block/andesite_casing")
+        );
+        let p = bundle
+            .atlas
+            .placement("create:block/andesite_casing")
+            .unwrap();
         let offset = ((p.y * bundle.atlas.width + p.x) * 4) as usize;
         assert_eq!(&bundle.atlas.rgba[offset..offset + 4], &[66, 160, 208, 255]);
         // Later user resource packs retain priority over the mod's texture.
@@ -2446,9 +2484,15 @@ mod tests {
             (1, 1, vec![10, 20, 30, 255]),
         );
         let overridden = CompiledAssetBundle::build(&[layers[1].clone(), override_layer]).unwrap();
-        let p = overridden.atlas.placement("create:block/andesite_casing").unwrap();
+        let p = overridden
+            .atlas
+            .placement("create:block/andesite_casing")
+            .unwrap();
         let offset = ((p.y * overridden.atlas.width + p.x) * 4) as usize;
-        assert_eq!(&overridden.atlas.rgba[offset..offset + 4], &[10, 20, 30, 255]);
+        assert_eq!(
+            &overridden.atlas.rgba[offset..offset + 4],
+            &[10, 20, 30, 255]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2469,9 +2513,15 @@ mod tests {
         let (mods, report) = load_mod_jar_layers(&mods);
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
         let bundle = CompiledAssetBundle::build(&[vanilla, mods[0].clone()]).unwrap();
-        let quads = bundle.bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0]).unwrap();
+        let quads = bundle
+            .bake_block_with_uvs("create:andesite_casing", &[], [0, 0, 0])
+            .unwrap();
         assert_eq!(quads.len(), 6);
-        assert!(quads.iter().all(|quad| quad.texture == "create:block/andesite_casing"));
+        assert!(
+            quads
+                .iter()
+                .all(|quad| quad.texture == "create:block/andesite_casing")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2508,7 +2558,12 @@ mod tests {
         );
         let bundle = CompiledAssetBundle::build(&[vanilla, layers[0].clone()]).unwrap();
         assert!(bundle.atlas.placement("minecraft:block/stone").is_some());
-        assert!(bundle.atlas.placement("create:block/andesite_casing").is_some());
+        assert!(
+            bundle
+                .atlas
+                .placement("create:block/andesite_casing")
+                .is_some()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2532,7 +2587,11 @@ mod tests {
         };
         let mut out = Vec::with_capacity(data.len() + blocks.len() * 5);
         for (index, chunk) in blocks.iter().enumerate() {
-            out.push(if index + 1 == blocks.len() { 0x01 } else { 0x00 });
+            out.push(if index + 1 == blocks.len() {
+                0x01
+            } else {
+                0x00
+            });
             let len = chunk.len() as u16;
             out.extend_from_slice(&len.to_le_bytes());
             out.extend_from_slice(&(!len).to_le_bytes());
@@ -2562,7 +2621,8 @@ mod tests {
             out.extend_from_slice(&method.to_le_bytes());
             out.extend_from_slice(&0u16.to_le_bytes()); // time
             out.extend_from_slice(&0u16.to_le_bytes()); // date
-            out.extend_from_slice(&0u32.to_le_bytes()); // crc
+            let crc = crc32_ieee(data);
+            out.extend_from_slice(&crc.to_le_bytes());
             out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -2577,7 +2637,7 @@ mod tests {
             central.extend_from_slice(&method.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
             central.extend_from_slice(&0u16.to_le_bytes());
-            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&crc.to_le_bytes());
             central.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             central.extend_from_slice(&(data.len() as u32).to_le_bytes());
             central.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -2633,9 +2693,7 @@ mod tests {
     /// `ns:<block>` (blockstate + model + texture + lang), the same shape a
     /// real NeoForge/Fabric library JAR carries.
     fn namespace_jar(ns: &str, block: &str, png: &[u8]) -> Vec<u8> {
-        let blockstate = format!(
-            "{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}"
-        );
+        let blockstate = format!("{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}");
         let model = format!(
             "{{\"textures\":{{\"all\":\"{ns}:block/{block}\"}},\"elements\":[{{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{{\"down\":{{\"texture\":\"#all\"}},\"up\":{{\"texture\":\"#all\"}},\"north\":{{\"texture\":\"#all\"}},\"south\":{{\"texture\":\"#all\"}},\"west\":{{\"texture\":\"#all\"}},\"east\":{{\"texture\":\"#all\"}}}}}}]}}"
         );
@@ -2817,10 +2875,18 @@ mod tests {
                 .bake_block_with_uvs(&id, &[], [0, 0, 0])
                 .unwrap_or_else(|err| panic!("{id} should bake: {err}"));
             assert!(!quads.is_empty(), "{id} produced no quads");
-            assert!(bundle.atlas.placement(&format!("{ns}:block/{block}")).is_some());
+            assert!(
+                bundle
+                    .atlas
+                    .placement(&format!("{ns}:block/{block}"))
+                    .is_some()
+            );
         }
         // The deflated `offroad` nested JAR decoded to its own texel.
-        assert_eq!(atlas_texel(&bundle, "offroad:block/wheel"), [200, 30, 30, 255]);
+        assert_eq!(
+            atlas_texel(&bundle, "offroad:block/wheel"),
+            [200, 30, 30, 255]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2863,7 +2929,12 @@ mod tests {
         assert!(report.rejected.is_empty(), "{:?}", report.rejected);
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert_eq!(report.loaded.len(), 1);
-        assert_eq!(layers.len(), 2, "{:?}", layers.iter().map(|l| &l.name).collect::<Vec<_>>());
+        assert_eq!(
+            layers.len(),
+            2,
+            "{:?}",
+            layers.iter().map(|l| &l.name).collect::<Vec<_>>()
+        );
         assert_eq!(layers[0].name, "META-INF/jars/fibers-lib.jar");
         assert_eq!(layers[1].name, "fibers-bundled.jar");
 
@@ -2874,7 +2945,10 @@ mod tests {
             .bake_block_with_uvs("fibers:strand", &[], [0, 0, 0])
             .expect("inner strand bakes");
         assert!(!quads.is_empty());
-        assert_eq!(atlas_texel(&bundle, "fibers:block/strand"), [90, 80, 70, 255]);
+        assert_eq!(
+            atlas_texel(&bundle, "fibers:block/strand"),
+            [90, 80, 70, 255]
+        );
         let bolt = bundle
             .bake_block_with_uvs("fibers:bolt", &[], [0, 0, 0])
             .expect("outer bolt bakes");
@@ -2885,9 +2959,7 @@ mod tests {
     /// `(name, contents, deflate)` entries of [`namespace_jar`] without the
     /// trailing manifest, for merging into a hand-built wrapper JAR.
     fn namespace_jar_entries(ns: &str, block: &str, png: &[u8]) -> Vec<(String, Vec<u8>, bool)> {
-        let blockstate = format!(
-            "{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}"
-        );
+        let blockstate = format!("{{\"variants\":{{\"\":{{\"model\":\"{ns}:block/{block}\"}}}}}}");
         let model = format!(
             "{{\"textures\":{{\"all\":\"{ns}:block/{block}\"}},\"elements\":[{{\"from\":[0,0,0],\"to\":[16,16,16],\"faces\":{{\"down\":{{\"texture\":\"#all\"}},\"up\":{{\"texture\":\"#all\"}},\"north\":{{\"texture\":\"#all\"}},\"south\":{{\"texture\":\"#all\"}},\"west\":{{\"texture\":\"#all\"}},\"east\":{{\"texture\":\"#all\"}}}}}}]}}"
         );
@@ -2969,12 +3041,18 @@ mod tests {
             report.skipped
         );
         assert!(
-            report.skipped.iter().any(|note| note.contains("traversal.jar")),
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("traversal.jar")),
             "{:?}",
             report.skipped
         );
         assert!(
-            report.skipped.iter().any(|note| note.contains("broken.jar")),
+            report
+                .skipped
+                .iter()
+                .any(|note| note.contains("broken.jar")),
             "{:?}",
             report.skipped
         );

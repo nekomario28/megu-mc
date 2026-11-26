@@ -155,9 +155,9 @@ pub fn panorama_overlay_from_extras(extras: &VanillaOfficialExtras) -> Option<(&
 /// Continuous title-panorama camera angles in radians `(yaw, pitch)`.
 ///
 /// The yaw is deliberately unwrapped (a continuous `3 deg/s` progression),
-/// while pitch follows the requested gentle `sin(t * 0.1) * 5 deg + 25 deg`
-/// sway. Non-finite input falls back to the `t = 0` pose rather than
-/// contaminating a uniform buffer with NaN.
+/// while pitch is Vanilla's fixed 10 degree downward title-camera pitch.
+/// Non-finite input falls back to the `t = 0` pose rather than contaminating
+/// a uniform buffer with NaN.
 pub fn vanilla_panorama_angles(elapsed_secs: f32) -> (f32, f32) {
     let t = if elapsed_secs.is_finite() {
         f64::from(elapsed_secs)
@@ -165,8 +165,7 @@ pub fn vanilla_panorama_angles(elapsed_secs: f32) -> (f32, f32) {
         0.0
     };
     let yaw_rad = t * 3.0_f64.to_radians();
-    let pitch_deg = (t * 0.1).sin() * 5.0 + 25.0;
-    (yaw_rad as f32, pitch_deg.to_radians() as f32)
+    (yaw_rad as f32, 10_f32.to_radians())
 }
 
 /// WGSL for the one-draw panorama pass. Bindings are intentionally stable:
@@ -250,7 +249,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     overlay = vec4<f32>(overlay.rgb, overlay.a * panorama.params.z);
     color = mix(color, overlay.rgb, clamp(overlay.a, 0.0, 1.0));
 
-    return vec4<f32>(color, clamp(panorama.resolution.w, 0.0, 1.0));
+    let fade = clamp(panorama.resolution.w, 0.0, 1.0);
+    return vec4<f32>(color * fade, fade);
 }
 "#;
 
@@ -263,11 +263,7 @@ struct TitlePanoramaUniform {
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
-    if value.is_finite() {
-        value
-    } else {
-        fallback
-    }
+    if value.is_finite() { value } else { fallback }
 }
 
 fn create_cubemap_texture(device: &wgpu::Device, face_size: u32) -> wgpu::Texture {

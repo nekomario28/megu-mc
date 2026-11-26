@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use megu_client_gpu::title_branding::RgbaImage;
 use megu_client_gpu::vanilla_gui_sprites::{
+    ALL_GUI_SPRITES, NineSliceBorder, SpriteAtlasEntry, VanillaGuiAtlas, VanillaGuiSpriteId,
     load_vanilla_gui_from_jar_bytes, load_vanilla_gui_from_path, panorama_yaw_pitch,
-    tessellate_nine_slice, NineSliceBorder, SpriteAtlasEntry, VanillaGuiAtlas,
-    VanillaGuiSpriteId, ALL_GUI_SPRITES,
+    tessellate_nine_slice,
 };
 use megu_ui::draw::encode_png_rgba;
 
@@ -53,7 +53,8 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        let crc = megu_core::hash::crc32_ieee(data);
+        out.extend_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -68,7 +69,7 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -118,7 +119,7 @@ fn mcmeta_scalar(border: u32) -> Vec<u8> {
 
 /// Synthetic `.mcmeta` nine_slice block (object border spelling).
 fn mcmeta_object(l: u32, t: u32, r: u32, b: u32) -> Vec<u8> {
-    format!("{{\"gui\":{{\"scaling\":{{\"type\":\"nine_slice\",\"border\":{{\"left\":{l},\"top\":{t},\"right\":{r},\"bottom\":{b}}}}}}}}}").into_bytes()
+    format!("{{\"gui\":{{\"scaling\":{{\"type\":\"nine_slice\",\"width\":200,\"height\":20,\"border\":{{\"left\":{l},\"top\":{t},\"right\":{r},\"bottom\":{b}}}}}}}}}").into_bytes()
 }
 
 /// Synthetic `.mcmeta` non-nine_slice (stretch) scaling.
@@ -208,7 +209,11 @@ fn full_in_memory_jar_loads_every_sprite_and_panorama() {
     // mcmeta-declared borders parsed (scalar + object spellings).
     assert_eq!(
         assets.borders[&VanillaGuiSpriteId::Button],
-        NineSliceBorder::uniform(3)
+        NineSliceBorder {
+            logical_width: 200,
+            logical_height: 20,
+            ..NineSliceBorder::uniform(3)
+        }
     );
     assert_eq!(
         assets.borders[&VanillaGuiSpriteId::Slider],
@@ -216,7 +221,9 @@ fn full_in_memory_jar_loads_every_sprite_and_panorama() {
             left: 2,
             top: 4,
             right: 6,
-            bottom: 8
+            bottom: 8,
+            logical_width: 200,
+            logical_height: 20,
         }
     );
     // Effective border falls back to vanilla widget defaults.
@@ -422,8 +429,14 @@ fn atlas_packs_all_sprites_no_overlap_padded_uvs() {
         assert!(!id.is_panorama_face());
         // UVs strictly inside (0, 1): the 1 px gutter keeps every
         // sprite's inner rect off the atlas edge.
-        assert!(entry.uv_min[0] > 0.0 && entry.uv_min[1] > 0.0, "{id:?} uv_min");
-        assert!(entry.uv_max[0] < 1.0 && entry.uv_max[1] < 1.0, "{id:?} uv_max");
+        assert!(
+            entry.uv_min[0] > 0.0 && entry.uv_min[1] > 0.0,
+            "{id:?} uv_min"
+        );
+        assert!(
+            entry.uv_max[0] < 1.0 && entry.uv_max[1] < 1.0,
+            "{id:?} uv_max"
+        );
         assert!(entry.uv_min[0] < entry.uv_max[0]);
         assert!(entry.uv_min[1] < entry.uv_max[1]);
     }
@@ -568,6 +581,8 @@ fn nine_slice_asymmetric_borders_and_stretch_sprite() {
         top: 4,
         right: 6,
         bottom: 8,
+        logical_width: 0,
+        logical_height: 0,
     });
     let quads = tessellate_nine_slice([0.0, 0.0, 100.0, 50.0], &e);
     assert_eq!(quads.len(), 9);
@@ -596,7 +611,10 @@ fn panorama_yaw_pitch_stays_finite_and_bounded() {
     let mut t = 0.0f32;
     while t < 100_000.0 {
         let (yaw, pitch) = panorama_yaw_pitch(t);
-        assert!(yaw.is_finite() && (0.0..360.0).contains(&yaw), "yaw@{t}={yaw}");
+        assert!(
+            yaw.is_finite() && (0.0..360.0).contains(&yaw),
+            "yaw@{t}={yaw}"
+        );
         assert!(
             pitch.is_finite() && (-10.0..=10.0).contains(&pitch),
             "pitch@{t}={pitch}"
@@ -614,7 +632,10 @@ fn panorama_yaw_pitch_stays_finite_and_bounded() {
     ] {
         let (yaw, pitch) = panorama_yaw_pitch(edge);
         assert!(yaw.is_finite() && (0.0..360.0).contains(&yaw), "yaw@{edge}");
-        assert!(pitch.is_finite() && (-10.0..=10.0).contains(&pitch), "pitch@{edge}");
+        assert!(
+            pitch.is_finite() && (-10.0..=10.0).contains(&pitch),
+            "pitch@{edge}"
+        );
     }
     // Gentle drift: yaw advances with time, pitch oscillates.
     let (y0, _) = panorama_yaw_pitch(10.0);

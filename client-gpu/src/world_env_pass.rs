@@ -8,12 +8,12 @@
 use bytemuck::{Pod, Zeroable};
 use megu_client_mesh::builtin_shadow_wgsl::compute_sun_direction;
 
+use crate::Camera;
 use crate::renderer::GameplayScreenOverlay;
 use crate::vanilla_world_assets::{
-    moon_phase_uv_rect, DecodedRgbaTexture, VanillaEnvTexture, VanillaMiscOverlay,
-    VanillaWorldAssets,
+    DecodedRgbaTexture, VanillaEnvTexture, VanillaMiscOverlay, VanillaWorldAssets,
+    moon_phase_uv_rect,
 };
-use crate::Camera;
 
 /// Depth format expected by [`TexturedCelestialWeatherPass`].
 pub const WORLD_ENV_PASS_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -173,13 +173,13 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let pumpkin = textureSample(pumpkin_texture, overlay_sampler, uv);
     let powder_snow = textureSample(powder_snow_texture, overlay_sampler, uv);
     let vignette = textureSample(vignette_texture, overlay_sampler, uv);
-    let spyglass = textureSample(spyglass_texture, overlay_sampler, uv);
 
-    let radius = length(centered);
-    let angle = atan2(centered.y, centered.x);
-    let swirl_radius = radius * (0.88 + 0.08 * sin(time * 0.7));
-    let swirl_angle = angle + radius * 4.0 - time * 0.9;
-    let portal_uv = vec2<f32>(cos(swirl_angle), sin(swirl_angle)) * swirl_radius * 0.5 + vec2<f32>(0.5);
+    // Vanilla scales the confusion/portal overlay about the screen center
+    // rather than applying a procedural swirl. The green channel carries the
+    // confusion texture's luminance and is weighted into all three channels.
+    let portal_amount = clamp(overlay.effects_a.w, 0.0, 1.0);
+    let portal_scale = max(1.0 - portal_amount * 0.35, 0.05);
+    let portal_uv = centered * portal_scale * 0.5 + vec2<f32>(0.5);
     let nausea = textureSample(nausea_texture, overlay_sampler, portal_uv);
 
     var color = vec4<f32>(0.0);
@@ -205,10 +205,10 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
         fire_mask * 0.86,
     );
 
-    color = overlay_mix(
-        color,
-        nausea.rgb * vec3<f32>(0.72, 0.42, 1.0),
-        nausea.a * overlay.effects_a.w * 0.76,
+    let portal_rgb = vec3<f32>(0.2, 0.4, 0.2) * nausea.g * portal_amount;
+    color = vec4<f32>(
+        color.rgb + portal_rgb * (1.0 - color.a),
+        max(color.a, nausea.a * portal_amount),
     );
     color = overlay_mix(
         color,
@@ -225,16 +225,28 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let hurt_mask = smoothstep(0.68, 0.73, edge) * overlay.effects_a.x;
     color = overlay_mix(color, vec3<f32>(0.92, 0.015, 0.005), hurt_mask * 0.72);
 
-    let scope_radius = length(vec2<f32>(centered.x * aspect, centered.y));
-    let matte = smoothstep(0.82, 0.87, scope_radius) * overlay.effects_b.w;
-    color = overlay_mix(color, vec3<f32>(0.0), matte);
-    color = overlay_mix(
-        color,
-        spyglass.rgb,
-        spyglass.a * overlay.effects_b.w,
-    );
+    // Fit the square spyglass texture into the largest centered square that
+    // fits the viewport. Everything outside that square is an opaque black
+    // bar; there is intentionally no global alpha cap on the final overlay.
+    let square_half = vec2<f32>(
+        min(overlay.screen.y, overlay.screen.x) / max(overlay.screen.x, 1.0),
+        min(overlay.screen.y, overlay.screen.x) / max(overlay.screen.y, 1.0),
+    ) * 0.5;
+    let inside_square = abs(centered.x) <= square_half.x * 2.0
+        && abs(centered.y) <= square_half.y * 2.0;
+    let scope_active = overlay.effects_b.w > 0.0;
+    if scope_active && !inside_square {
+        color = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    } else if scope_active {
+        let scope_uv = vec2<f32>(
+            centered.x / max(square_half.x * 2.0, 0.0001) * 0.5 + 0.5,
+            centered.y / max(square_half.y * 2.0, 0.0001) * 0.5 + 0.5,
+        );
+        let scoped = textureSample(spyglass_texture, overlay_sampler, scope_uv);
+        color = overlay_mix(color, scoped.rgb, scoped.a * overlay.effects_b.w);
+    }
 
-    return vec4<f32>(color.rgb, clamp(color.a, 0.0, 0.95));
+    return vec4<f32>(color.rgb, clamp(color.a, 0.0, 1.0));
 }
 "#;
 
@@ -366,11 +378,7 @@ pub fn overlay_effects_active(overlay: &GameplayScreenOverlay, spyglass_alpha: f
 }
 
 fn finite_or_zero(value: f32) -> f32 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 fn clean_alpha(value: f32) -> f32 {

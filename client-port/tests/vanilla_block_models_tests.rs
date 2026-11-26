@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 
 use megu_client_mesh::vanilla_block_models::{
-    parse_block_state_name, BakedBlockStateCache, VanillaBlockModelCatalog,
+    BakedBlockStateCache, VanillaBlockModelCatalog, parse_block_state_name,
 };
 use megu_client_mesh::{
-    mesh_section_with_baked_models, Block, BlockShape, Direction, Layer, Light, Section, CUTOUT,
-    TINTED, WATER, WATERLOGGED,
+    Block, BlockShape, CUTOUT, Direction, Layer, Light, Section, TINTED, WATER, WATERLOGGED,
+    mesh_section_with_baked_models,
 };
 
 fn entry(path: &str, json: &str) -> (String, String) {
@@ -68,10 +68,12 @@ fn variants_match_property_subsets_and_bake_parent_and_rotations() {
     assert_eq!(mesh.quads.len(), 1);
     assert_eq!(mesh.quads[0].texture, "minecraft:block/oak_stairs");
     assert!(!mesh.is_full_opaque_cube);
-    assert!(mesh.quads[0]
-        .positions
-        .iter()
-        .any(|position| (position[0] - 0.5).abs() > 0.01 || (position[1] - 0.5).abs() > 0.01));
+    assert!(
+        mesh.quads[0]
+            .positions
+            .iter()
+            .any(|position| (position[0] - 0.5).abs() > 0.01 || (position[1] - 0.5).abs() > 0.01)
+    );
 }
 
 #[test]
@@ -115,19 +117,18 @@ fn cross_plant_keeps_tint_and_bakes_forty_five_degree_element_rotation() {
             r##"{"textures":{"cross":"minecraft:block/short_grass"},"elements":[{"from":[6,0,7],"to":[10,16,9],"rotation":{"origin":[8,8,8],"axis":"y","angle":45},"faces":{"north":{"texture":"#cross","tintindex":0},"south":{"texture":"#cross","tintindex":0}}}]}"##,
         ),
     ]]);
-    let mut cache = BakedBlockStateCache::new(
-        catalog,
-        vec!["minecraft:dandelion".into()],
-    );
+    let mut cache = BakedBlockStateCache::new(catalog, vec!["minecraft:dandelion".into()]);
     let mesh = cache.get_or_bake(0).unwrap();
     assert_eq!(mesh.quads.len(), 2);
     assert!(mesh.uses_tint);
     assert_eq!(mesh.quads[0].tintindex, 0);
     assert_eq!(mesh.textures, vec!["minecraft:block/short_grass"]);
-    assert!(mesh.quads[0]
-        .positions
-        .iter()
-        .any(|position| (position[0] - 0.5).abs() > 0.02));
+    assert!(
+        mesh.quads[0]
+            .positions
+            .iter()
+            .any(|position| (position[0] - 0.5).abs() > 0.02)
+    );
 }
 
 #[test]
@@ -138,7 +139,10 @@ fn higher_priority_resource_pack_model_replaces_vanilla_cleanly() {
                 "assets/minecraft/blockstates/stone.json",
                 r##"{"variants":{"":{"model":"minecraft:block/stone"}}}"##,
             ),
-            entry("assets/minecraft/models/block/stone.json", &cube_model("minecraft:block/stone")),
+            entry(
+                "assets/minecraft/models/block/stone.json",
+                &cube_model("minecraft:block/stone"),
+            ),
         ],
         vec![entry(
             "assets/minecraft/models/block/stone.json",
@@ -228,7 +232,7 @@ fn section_bakes_position_weighted_faces_and_preserves_water_and_face_tint() {
         ),
         entry(
             "assets/minecraft/models/block/untinted.json",
-                r##"{"ambientocclusion":false,"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"up":{"texture":"minecraft:block/dirt"}}}]}"##,
+            r##"{"ambientocclusion":false,"elements":[{"from":[0,0,0],"to":[16,8,16],"faces":{"up":{"texture":"minecraft:block/dirt"}}}]}"##,
         ),
     ]]);
     let mut cache = BakedBlockStateCache::new(catalog, vec!["test[waterlogged=true]".into()]);
@@ -260,7 +264,9 @@ fn section_bakes_position_weighted_faces_and_preserves_water_and_face_tint() {
         assert_eq!(baked[0].quad.texture, "minecraft:block/grass");
         directions.insert(baked[0].quad.cullface.unwrap());
         assert_eq!(baked[1].biome_tint, None);
-        assert!(!baked[1].ambient_occlusion);
+        // Multipart ambient occlusion follows the first matching selector's
+        // model rather than varying per concatenated part.
+        assert!(baked[1].ambient_occlusion);
         assert_eq!(baked[1].quad.texture, "minecraft:block/dirt");
         assert!(baked[1].quad.positions.iter().all(|point| point[1] == 4.5));
     }

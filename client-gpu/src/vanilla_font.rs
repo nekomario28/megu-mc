@@ -13,7 +13,7 @@ use megu_ui::font_cjk::GlyphAtlas;
 
 use crate::live_session::SessionPaths;
 use crate::vanilla_bootstrap::{default_vanilla_cache_dir, discover_local_vanilla_jar};
-use crate::vanilla_jar::read_selected_entries;
+use crate::vanilla_jar::{read_bounded_file, read_selected_entries};
 
 /// JAR member holding the vanilla 8×8 ASCII bitmap font.
 const ASCII_PNG_ENTRY: &str = "assets/minecraft/textures/font/ascii.png";
@@ -22,7 +22,19 @@ const ASCII_PNG_ENTRY: &str = "assets/minecraft/textures/font/ascii.png";
 const MAX_INDEX_JSON_BYTES: u64 = 32 * 1024 * 1024;
 /// Bound on a single `.hex` object read — the real Unifont packs are
 /// well under 8 MiB (which `GlyphAtlas::load_unifont_hex` re-checks).
-const MAX_HEX_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HEX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INDEX_CANDIDATES: usize = 64;
+
+fn safe_index_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && !id.contains(['/', '\\', '\0'])
+        && id != "."
+        && id != ".."
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
 
 /// Assets-store roots scanned for `indexes/` + `objects/`, in priority
 /// order: the explicit `--assetsDir`, then the game dir's own `assets/`
@@ -109,9 +121,11 @@ fn index_files(root: &Path, paths: &SessionPaths) -> Vec<PathBuf> {
     let dir = root.join("indexes");
     let mut out = Vec::new();
     if let Some(id) = &paths.asset_index {
-        let f = dir.join(format!("{id}.json"));
-        if f.is_file() {
-            out.push(f);
+        if safe_index_id(id) {
+            let f = dir.join(format!("{id}.json"));
+            if f.is_file() {
+                out.push(f);
+            }
         }
     }
     let mut rest: Vec<(u64, PathBuf)> = std::fs::read_dir(&dir)
@@ -128,8 +142,12 @@ fn index_files(root: &Path, paths: &SessionPaths) -> Vec<PathBuf> {
                 .unwrap_or(0);
             (id, p)
         })
+        // Bound directory admission before sorting, then keep the newest
+        // numeric candidates rather than whichever names readdir returned first.
+        .take(MAX_INDEX_CANDIDATES * 16)
         .collect();
     rest.sort_by_key(|a| std::cmp::Reverse(a.0));
+    rest.truncate(MAX_INDEX_CANDIDATES);
     for (_, p) in rest {
         if !out.contains(&p) {
             out.push(p);
@@ -147,11 +165,8 @@ fn read_hex_object(path: &Path, is_zip: bool) -> Option<String> {
         let entry = entries.into_iter().next()?;
         String::from_utf8(entry.bytes).ok()
     } else {
-        let meta = std::fs::metadata(path).ok()?;
-        if meta.len() > MAX_HEX_OBJECT_BYTES {
-            return None;
-        }
-        String::from_utf8(std::fs::read(path).ok()?).ok()
+        let bytes = read_bounded_file(path, MAX_HEX_OBJECT_BYTES).ok()?;
+        String::from_utf8(bytes).ok()
     }
 }
 
@@ -177,13 +192,7 @@ fn load_unifont_packs(
     let mut loaded_any = false;
     for root in assets_roots {
         for index in index_files(root, paths) {
-            let Ok(meta) = std::fs::metadata(&index) else {
-                continue;
-            };
-            if meta.len() > MAX_INDEX_JSON_BYTES {
-                continue;
-            }
-            let Ok(json) = std::fs::read(&index) else {
+            let Ok(json) = read_bounded_file(&index, MAX_INDEX_JSON_BYTES as usize) else {
                 continue;
             };
             let mut entries = font_asset_hashes(&json);
@@ -508,8 +517,6 @@ mod tests {
         let tmp = TempDir::new("empty");
         // Scoped to the empty tempdir — the real host's own Minecraft
         // install (when present) must never leak into this check.
-        assert!(
-            try_load_fonts_from(&fake_paths(&tmp.0), &[tmp.0.join("assets")], None).is_none()
-        );
+        assert!(try_load_fonts_from(&fake_paths(&tmp.0), &[tmp.0.join("assets")], None).is_none());
     }
 }

@@ -12,12 +12,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use megu_client_mesh::entity_rig::classify_entity_rig;
 use megu_core::hash::crc32_ieee;
 
-use crate::player_skins::{normalize_skin_to_64x64, ResolvedPlayerSkin};
+use crate::player_skins::{ResolvedPlayerSkin, normalize_skin_to_64x64};
 use crate::vanilla_jar::{
-    ber_texture_path_for_name, entity_texture_path_for_id,
-    load_vanilla_entity_atlas_from_jar_bytes, VanillaEntityTextureAtlas,
+    VanillaEntityTextureAtlas, ber_texture_path_for_name, entity_texture_path_for_id,
+    load_vanilla_entity_atlas_from_jar_bytes,
 };
-use crate::vanilla_official_extras::{default_skin_for_uuid, VanillaOfficialExtras};
+use crate::vanilla_official_extras::{VanillaOfficialExtras, default_skin_for_uuid};
 
 const TEXTURE_PREFIX: &str = "assets/minecraft/textures/";
 const COMPOSITE_NOMINAL_WIDTH: u32 = 1024;
@@ -941,7 +941,12 @@ fn variant_base_key(query: &EntityAppearanceQuery<'_>, name: &str) -> Option<Str
             } else {
                 variant
             };
-            format!("entity/boat/{wood}.png")
+            let directory = if name == "chest_boat" {
+                "chest_boat"
+            } else {
+                "boat"
+            };
+            format!("entity/{directory}/{wood}.png")
         }
         _ => return None,
     };
@@ -964,11 +969,7 @@ fn armor_material(item_name: &str) -> Option<String> {
 }
 
 fn armor_inflation(layer: u8) -> f32 {
-    if layer == 2 {
-        0.08
-    } else {
-        0.06
-    }
+    if layer == 2 { 0.08 } else { 0.06 }
 }
 
 fn dye_color(color: &str) -> [f32; 3] {
@@ -1266,10 +1267,12 @@ fn entity_catalog_keys() -> Vec<String> {
     }
     for wood in WOODS {
         keys.push(format!("boat/{wood}.png"));
+        keys.push(format!("chest_boat/{wood}.png"));
         keys.push(format!("signs/{wood}.png"));
         keys.push(format!("signs/hanging/{wood}.png"));
     }
     keys.push("boat/pale_oak.png".to_owned());
+    keys.push("chest_boat/pale_oak.png".to_owned());
     keys.sort();
     keys.dedup();
     keys

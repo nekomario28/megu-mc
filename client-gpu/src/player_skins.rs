@@ -7,11 +7,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use megu_core::json::{parse_json_with_limits, JsonLimits, JsonValue};
+use megu_core::json::{JsonLimits, JsonValue, parse_json_with_limits};
 
-use crate::vanilla_bootstrap::{open_regular_file, CacheDirectory, StagedFile};
+use crate::vanilla_bootstrap::{CacheDirectory, StagedFile, open_regular_file};
 use crate::vanilla_jar::{decode_asset_png, png_dimensions};
 
 const MAX_DISK_BYTES: u64 = 64 * 1024 * 1024;
@@ -19,6 +19,9 @@ const MAX_DISK_ENTRIES: usize = 16_384;
 const MAX_JSON: usize = 64 * 1024;
 const MAX_PNG: usize = 256 * 1024;
 const MAX_SKINS: usize = 256;
+const MAX_TEXTURES_RGBA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INFLIGHT_TEXTURE_SLOTS: usize = 7;
+const MAX_FAILURE_BACKOFF_SECS: u64 = 300;
 const MAX_TEXTURE_DIMENSION: u32 = 512;
 const JSON_LIMITS: JsonLimits = JsonLimits {
     max_depth: 24,
@@ -63,7 +66,7 @@ pub fn parse_textures_property(input: &str) -> Result<ParsedPlayerTextures, Stri
     }
     let property = if input.trim_start().starts_with('{') {
         let profile = parse_skin_json(input)?;
-        profile
+        let value = profile
             .get("properties")
             .and_then(JsonValue::as_array)
             .and_then(|properties| {
@@ -72,8 +75,12 @@ pub fn parse_textures_property(input: &str) -> Result<ParsedPlayerTextures, Stri
                     .find(|property| property.get_str("name") == Some("textures"))
             })
             .and_then(|property| property.get_str("value"))
-            .ok_or_else(|| "profile has no textures property".to_owned())?
-            .to_owned()
+            .ok_or_else(|| "profile has no textures property".to_owned())?;
+        if value.len() > MAX_JSON * 2 {
+            return Err("textures property exceeds size limit".into());
+        }
+        // The one copy happens only after the exact base64 budget is known.
+        value.to_owned()
     } else {
         input.to_owned()
     };
@@ -234,12 +241,14 @@ pub fn normalize_skin_to_64x64(
     if width == 64 && height == 32 {
         let mut out = vec![0; 64 * 64 * 4];
         out[..rgba.len()].copy_from_slice(rgba);
-        copy_legacy_limb(&mut out, rgba, 0, 16);
-        copy_legacy_limb(&mut out, rgba, 40, 32);
+        copy_legacy_limbs(&mut out);
+        sanitize_skin_alpha(&mut out, true);
         return Ok((64, 64, out));
     }
     if valid_skin_geometry(width, height) {
-        return Ok((width, height, rgba.to_vec()));
+        let mut out = rgba.to_vec();
+        sanitize_skin_alpha(&mut out, false);
+        return Ok((width, height, out));
     }
     Err("unsupported skin dimensions".into())
 }
@@ -250,22 +259,120 @@ fn valid_skin_geometry(width: u32, height: u32) -> bool {
         && (height == width || height == width / 2)
 }
 
-fn copy_legacy_limb(dst: &mut [u8], src: &[u8], source_x: usize, target_x: usize) {
-    for row in 0..16 {
-        let source = ((16 + row) * 64 + source_x) * 4;
-        let target = ((48 + row) * 64 + target_x) * 4;
-        dst[target..target + 64].copy_from_slice(&src[source..source + 64]);
+fn put_pixel(dst: &mut [u8], x: usize, y: usize, pixel: [u8; 4]) {
+    let offset = (y * 64 + x) * 4;
+    dst[offset..offset + 4].copy_from_slice(&pixel);
+}
+
+fn pixel(src: &[u8], x: usize, y: usize) -> [u8; 4] {
+    let offset = (y * 64 + x) * 4;
+    src[offset..offset + 4].try_into().unwrap_or([0; 4])
+}
+
+/// Vanilla `HttpTexture.processLegacySkin` copy sequence. The first two
+/// coordinates identify the legacy right-limb source rectangle; the next two
+/// are the target origin in the modern left-limb half. Every rectangle is
+/// horizontally flipped, swapping inner/outer limb faces without rotating
+/// the front/back faces into the wrong positions.
+fn copy_rect_flipped_x(
+    image: &mut [u8],
+    src_x: usize,
+    src_y: usize,
+    dst_x: usize,
+    dst_y: usize,
+    width: usize,
+    height: usize,
+) {
+    let mut rows = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let px = pixel(image, src_x + x, src_y + y);
+            let offset = (y * width + x) * 4;
+            rows[offset..offset + 4].copy_from_slice(&px);
+        }
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let source = (y * width + (width - 1 - x)) * 4;
+            let px: [u8; 4] = rows[source..source + 4].try_into().unwrap_or([0; 4]);
+            put_pixel(image, dst_x + x, dst_y + y, px);
+        }
     }
 }
 
+fn copy_legacy_limbs(image: &mut [u8]) {
+    // Right leg (x 0..16, y 16..32) -> left leg (x 16..32, y 48..64).
+    for (sx, sy, dx, dy, w, h) in [
+        (4, 16, 20, 48, 4, 4),
+        (8, 16, 24, 48, 4, 4),
+        (0, 20, 24, 52, 4, 12),
+        (4, 20, 20, 52, 4, 12),
+        (8, 20, 16, 52, 4, 12),
+        (12, 20, 28, 52, 4, 12),
+        // Right arm (x 40..56, y 16..32) -> left arm (x 32..48, y 48..64).
+        (44, 16, 36, 48, 4, 4),
+        (48, 16, 40, 48, 4, 4),
+        (40, 20, 40, 52, 4, 12),
+        (44, 20, 36, 52, 4, 12),
+        (48, 20, 32, 52, 4, 12),
+        (52, 20, 44, 52, 4, 12),
+    ] {
+        copy_rect_flipped_x(image, sx, sy, dx, dy, w, h);
+    }
+}
+
+fn set_no_alpha(image: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize) {
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let offset = (y * 64 + x) * 4;
+            image[offset + 3] = 255;
+        }
+    }
+}
+
+fn notch_transparency_hack(image: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize) {
+    let fully_opaque = (x0..x1).all(|x| {
+        (y0..y1).all(|y| {
+            let offset = (y * 64 + x) * 4;
+            image[offset + 3] >= 128
+        })
+    });
+    if !fully_opaque {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let offset = (y * 64 + x) * 4;
+            image[offset + 3] = 0;
+        }
+    }
+}
+
+fn sanitize_skin_alpha(image: &mut [u8], legacy: bool) {
+    set_no_alpha(image, 0, 0, 32, 16);
+    if legacy {
+        notch_transparency_hack(image, 32, 0, 64, 32);
+    }
+    set_no_alpha(image, 0, 16, 64, 32);
+    set_no_alpha(image, 16, 48, 48, 64);
+}
+
+type SkinCacheKey = ([u8; 16], String);
+
 struct SkinRequest {
     uuid: [u8; 16],
+    key: SkinCacheKey,
     textures_property: Option<String>,
 }
 
 struct SkinCompletion {
-    uuid: [u8; 16],
+    key: SkinCacheKey,
+    succeeded: bool,
     skin: ResolvedPlayerSkin,
+}
+
+fn skin_bytes(skin: &ResolvedPlayerSkin) -> usize {
+    skin.skin_rgba.len() + skin.cape_rgba.as_ref().map_or(0, |(_, _, rgba)| rgba.len())
 }
 
 /// Asynchronous official texture lookup with bounded completed-memory storage.
@@ -274,16 +381,21 @@ pub struct PlayerSkinCache {
     assets_dir: PathBuf,
     request_tx: SyncSender<SkinRequest>,
     completion_rx: Receiver<SkinCompletion>,
-    resolved: HashMap<[u8; 16], ResolvedPlayerSkin>,
-    order: VecDeque<[u8; 16]>,
-    pending: HashSet<[u8; 16]>,
+    resolved: HashMap<SkinCacheKey, ResolvedPlayerSkin>,
+    latest: HashMap<[u8; 16], SkinCacheKey>,
+    failure_backoff: HashMap<SkinCacheKey, (u32, Instant)>,
+    order: VecDeque<SkinCacheKey>,
+    pending: HashSet<SkinCacheKey>,
+    cached_rgba_bytes: usize,
 }
 
 impl PlayerSkinCache {
     pub fn new(assets_dir: impl Into<PathBuf>) -> Self {
         let assets_dir = assets_dir.into();
-        let (request_tx, request_rx) = mpsc::sync_channel::<SkinRequest>(MAX_SKINS);
-        let (completion_tx, completion_rx) = mpsc::sync_channel::<SkinCompletion>(MAX_SKINS);
+        let (request_tx, request_rx) =
+            mpsc::sync_channel::<SkinRequest>(MAX_INFLIGHT_TEXTURE_SLOTS);
+        let (completion_tx, completion_rx) =
+            mpsc::sync_channel::<SkinCompletion>(MAX_INFLIGHT_TEXTURE_SLOTS);
         let worker_assets = assets_dir.clone();
         let _ = thread::Builder::new()
             .name("megu-player-skins".into())
@@ -293,37 +405,58 @@ impl PlayerSkinCache {
             request_tx,
             completion_rx,
             resolved: HashMap::new(),
+            latest: HashMap::new(),
+            failure_backoff: HashMap::new(),
             order: VecDeque::new(),
             pending: HashSet::new(),
+            cached_rgba_bytes: 0,
         }
     }
 
     /// Queue a lookup. If a textures property is provided it is used directly;
     /// otherwise the worker performs the official UUID profile lookup.
     pub fn request_skin_for_uuid(&mut self, uuid: [u8; 16], textures_property: Option<&str>) {
-        if self.resolved.contains_key(&uuid) || !self.pending.insert(uuid) {
+        let parsed_url = textures_property.and_then(|property| {
+            (property.len() <= MAX_JSON * 2)
+                .then(|| parse_textures_property(property).ok().map(|p| p.skin_url))
+                .flatten()
+        });
+        let key = (uuid, parsed_url.unwrap_or_default());
+        if self.latest.get(&uuid) == Some(&key) || !self.pending.insert(key.clone()) {
             return;
+        }
+        if let Some((failures, next_retry)) = self.failure_backoff.get(&key) {
+            if Instant::now() < *next_retry {
+                self.pending.remove(&key);
+                return;
+            }
+            if *failures >= 8 {
+                self.pending.remove(&key);
+                return;
+            }
         }
         let request = SkinRequest {
             uuid,
+            key: key.clone(),
             textures_property: textures_property.map(str::to_owned),
         };
         if self.request_tx.try_send(request).is_err() {
-            self.pending.remove(&uuid);
-            self.insert(fallback_skin(uuid));
+            self.pending.remove(&key);
+            self.insert_with_result(key, fallback_skin(uuid), false);
         }
     }
 
     /// Drain ready worker results without blocking.
     pub fn poll_completed(&mut self) {
         while let Ok(completion) = self.completion_rx.try_recv() {
-            self.pending.remove(&completion.uuid);
-            self.insert(completion.skin);
+            self.pending.remove(&completion.key);
+            self.insert_with_result(completion.key, completion.skin, completion.succeeded);
         }
     }
 
     pub fn get_skin(&self, uuid: [u8; 16]) -> Option<&ResolvedPlayerSkin> {
-        self.resolved.get(&uuid)
+        let key = self.latest.get(&uuid)?;
+        self.resolved.get(key)
     }
 
     /// The validated on-disk location for a texture URL, useful for cache
@@ -333,16 +466,38 @@ impl PlayerSkinCache {
         Ok(self.assets_dir.join("skins").join(&hash[..2]).join(hash))
     }
 
-    fn insert(&mut self, skin: ResolvedPlayerSkin) {
+    fn insert_with_result(&mut self, key: SkinCacheKey, skin: ResolvedPlayerSkin, succeeded: bool) {
         let uuid = skin.uuid;
-        if self.resolved.contains_key(&uuid) {
-            self.order.retain(|item| *item != uuid);
+        if !succeeded {
+            let failures = self.failure_backoff.get(&key).map_or(1, |(n, _)| n + 1);
+            let delay =
+                Duration::from_secs((1u64 << failures.min(8)).min(MAX_FAILURE_BACKOFF_SECS));
+            self.failure_backoff
+                .insert(key.clone(), (failures, Instant::now() + delay));
+        } else {
+            self.failure_backoff.remove(&key);
         }
-        self.resolved.insert(uuid, skin);
-        self.order.push_back(uuid);
-        while self.resolved.len() > MAX_SKINS {
-            if let Some(oldest) = self.order.pop_front() {
-                self.resolved.remove(&oldest);
+        let bytes = skin_bytes(&skin);
+        if bytes > MAX_TEXTURES_RGBA_BYTES {
+            return;
+        }
+        if let Some(old) = self.resolved.get(&key) {
+            self.cached_rgba_bytes = self.cached_rgba_bytes.saturating_sub(skin_bytes(old));
+            self.order.retain(|item| *item != key);
+        }
+        self.cached_rgba_bytes = self.cached_rgba_bytes.saturating_add(bytes);
+        self.resolved.insert(key.clone(), skin);
+        self.order.push_back(key.clone());
+        self.latest.insert(uuid, key);
+        while self.resolved.len() > MAX_SKINS || self.cached_rgba_bytes > MAX_TEXTURES_RGBA_BYTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = self.resolved.remove(&oldest) {
+                self.cached_rgba_bytes = self.cached_rgba_bytes.saturating_sub(skin_bytes(&old));
+                if self.latest.get(&old.uuid) == Some(&oldest) {
+                    self.latest.remove(&old.uuid);
+                }
             }
         }
     }
@@ -361,11 +516,14 @@ fn skin_worker(
         .build()
         .into();
     while let Ok(request) = request_rx.recv() {
-        let skin = resolve_request(assets_dir, &agent, &request)
-            .unwrap_or_else(|_| fallback_skin(request.uuid));
+        let (skin, succeeded) = match resolve_request(assets_dir, &agent, &request) {
+            Ok(skin) => (skin, true),
+            Err(_) => (fallback_skin(request.uuid), false),
+        };
         if completion_tx
             .send(SkinCompletion {
-                uuid: request.uuid,
+                key: request.key.clone(),
+                succeeded,
                 skin,
             })
             .is_err()
@@ -419,7 +577,9 @@ fn resolve_request(
             })
             .map(|(image, _)| image)
         })
-        .transpose()?;
+        .transpose()
+        .ok()
+        .flatten();
     Ok(ResolvedPlayerSkin {
         uuid: request.uuid,
         skin_rgba,

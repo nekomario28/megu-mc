@@ -2,8 +2,8 @@
 
 use std::collections::BTreeMap;
 
-use megu_client_mesh::model_baker::*;
 use megu_client_mesh::Direction;
+use megu_client_mesh::model_baker::*;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -142,10 +142,12 @@ fn parent_chain_merges_textures_and_inherits_elements() {
     let baked = bake_model(&chained_stack(), "block/leaf", 0, 0).unwrap();
     assert_eq!(baked.quads.len(), 6);
     // #key -> #side -> #all -> minecraft:block/stone across the merged map.
-    assert!(baked
-        .quads
-        .iter()
-        .all(|q| q.texture == "minecraft:block/stone"));
+    assert!(
+        baked
+            .quads
+            .iter()
+            .all(|q| q.texture == "minecraft:block/stone")
+    );
     // ambientocclusion came from the root, the only model defining it.
     assert!(!baked.ambient_occlusion);
     // The leaf defines no elements: the root cube is inherited wholesale.
@@ -421,17 +423,18 @@ fn override_stack() -> ResourcePackModelStack {
 }
 
 #[test]
-fn custom_model_data_picks_highest_threshold() {
+fn custom_model_data_walks_reverse_declaration_order() {
     let stack = override_stack();
-    // Overrides are deliberately unsorted: the pick must be the highest
-    // predicate <= value, not positional.
+    // Overrides are deliberately unsorted: Vanilla walks the declaration in
+    // reverse order and takes the first matching predicate, so position can
+    // outrank the numerically highest threshold.
     assert_eq!(
         resolve_item_override(&stack, "item/wand", Some(5)).unwrap(),
-        "mypack:item/wand_b"
+        "minecraft:item/wand_c"
     );
     assert_eq!(
         resolve_item_override(&stack, "item/wand", Some(4)).unwrap(),
-        "mypack:item/wand_b"
+        "minecraft:item/wand_c"
     );
     assert_eq!(
         resolve_item_override(&stack, "item/wand", Some(3)).unwrap(),

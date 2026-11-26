@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::title_branding::RgbaImage;
 use crate::vanilla_jar::{
-    check_png_budget, decode_asset_png, prioritized_packs, AssetLayer, MAX_DECODED_RGBA_BYTES,
+    AssetLayer, MAX_DECODED_RGBA_BYTES, check_png_budget, decode_asset_png, prioritized_packs,
 };
 
 const ASSET_PREFIX: &str = "assets/minecraft/textures/";
@@ -63,12 +63,16 @@ const EFFECTS: &[&str] = &[
 const TRIM_MATERIALS: &[&str] = &[
     "quartz",
     "iron",
+    "iron_darker",
     "netherite",
+    "netherite_darker",
     "redstone",
     "copper",
     "gold",
+    "gold_darker",
     "emerald",
     "diamond",
+    "diamond_darker",
     "lapis",
     "amethyst",
 ];
@@ -573,9 +577,9 @@ fn procedural(seed: &str) -> RgbaImage {
     }
 }
 
-/// Replaces each trim pixel with the closest of eight source palette stops,
-/// then selects the material palette color at that same stop. This preserves
-/// the trim's alpha mask while applying Vanilla's eight-stop permutation.
+/// Replaces each trim pixel exactly matching one of the eight source palette
+/// stops with the material color at that stop. Unmatched pixels are preserved
+/// byte-for-byte rather than warped to the nearest stop.
 pub fn recolor_armor_trim(
     trim_rgba: &[u8],
     base_palette: &[u8],
@@ -591,16 +595,15 @@ pub fn recolor_armor_trim(
             out.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
-        let stop = (0..8).min_by_key(|stop| {
+        // Vanilla trim permutation is an exact palette replacement, not a
+        // nearest-color remap. Unknown/custom pixels survive unchanged.
+        let Some(stop) = (0..8).find(|stop| {
             let offset = stop * 4;
-            (0..3)
-                .map(|channel| {
-                    let delta =
-                        i32::from(pixel[channel]) - i32::from(base_palette[offset + channel]);
-                    (delta * delta) as u32
-                })
-                .sum::<u32>()
-        })?;
+            pixel[..3] == base_palette[offset..offset + 3]
+        }) else {
+            out.extend_from_slice(pixel);
+            continue;
+        };
         let offset = stop * 4;
         let material = &material_palette[offset..offset + 4];
         let alpha = u16::from(pixel[3]);

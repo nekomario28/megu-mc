@@ -43,7 +43,8 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        let crc = megu_core::hash::crc32_ieee(data);
+        out.extend_from_slice(&crc.to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(data.len() as u32).to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -58,7 +59,7 @@ fn stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
         central.extend_from_slice(&0u16.to_le_bytes());
-        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&crc.to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(data.len() as u32).to_le_bytes());
         central.extend_from_slice(&(name.len() as u16).to_le_bytes());

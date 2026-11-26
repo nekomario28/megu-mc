@@ -26,12 +26,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use megu_core::json::{parse_json, JsonValue};
+use megu_core::json::{JsonValue, parse_json};
 
 use crate::title_branding::RgbaImage;
 use crate::vanilla_jar::{
-    check_png_budget, decode_asset_png, prioritized_packs, AssetLayer, JarError,
-    MAX_DECODED_RGBA_BYTES, MAX_VISUAL_ATLAS_DIM,
+    AssetLayer, JarError, MAX_DECODED_RGBA_BYTES, MAX_VISUAL_ATLAS_DIM, check_png_budget,
+    decode_asset_png, prioritized_packs,
 };
 use megu_ui::draw::VanillaContainerTextureId;
 
@@ -387,6 +387,10 @@ pub struct NineSliceBorder {
     pub right: u32,
     /// Unstretched bottom row height in px.
     pub bottom: u32,
+    /// Logical sprite width declared by `.mcmeta` (`0` for vanilla defaults).
+    pub logical_width: u32,
+    /// Logical sprite height declared by `.mcmeta` (`0` for vanilla defaults).
+    pub logical_height: u32,
 }
 
 impl NineSliceBorder {
@@ -397,7 +401,48 @@ impl NineSliceBorder {
             top: px,
             right: px,
             bottom: px,
+            logical_width: 0,
+            logical_height: 0,
         }
+    }
+
+    /// Checked horizontal/vertical border sums fitting inside `width`/`height`.
+    fn fits_within(&self, width: u32, height: u32) -> bool {
+        self.left
+            .checked_add(self.right)
+            .is_some_and(|sum| sum <= width)
+            && self
+                .top
+                .checked_add(self.bottom)
+                .is_some_and(|sum| sum <= height)
+    }
+
+    /// Scale logical `.mcmeta` borders into source pixels for high-resolution
+    /// packs while retaining the declared logical dimensions for consumers.
+    fn scaled_to_source(&self, image_width: u32, image_height: u32) -> Option<Self> {
+        if self.logical_width == 0 || self.logical_height == 0 {
+            return self.fits_within(image_width, image_height).then_some(*self);
+        }
+        if image_width < self.logical_width
+            || image_height < self.logical_height
+            || !image_width.is_multiple_of(self.logical_width)
+            || !image_height.is_multiple_of(self.logical_height)
+        {
+            return None;
+        }
+        let sx = image_width / self.logical_width;
+        let sy = image_height / self.logical_height;
+        let scaled = Self {
+            left: self.left.checked_mul(sx)?,
+            right: self.right.checked_mul(sx)?,
+            top: self.top.checked_mul(sy)?,
+            bottom: self.bottom.checked_mul(sy)?,
+            logical_width: self.logical_width,
+            logical_height: self.logical_height,
+        };
+        scaled
+            .fits_within(image_width, image_height)
+            .then_some(scaled)
     }
 
     /// `true` when no side stretches — the sprite draws as one quad.
@@ -428,17 +473,31 @@ fn parse_nine_slice_border(mcmeta: &[u8]) -> Option<McmetaBorder> {
                 let n = number.as_f64()?;
                 ((0.0..=f64::from(u32::MAX)).contains(&n) && n.fract() == 0.0).then_some(n as u32)
             };
-            if let Some(px) = uint(border) {
-                return Some(McmetaBorder::Border(NineSliceBorder::uniform(px)));
+            let logical_width = scaling.get("width").and_then(uint)?;
+            let logical_height = scaling.get("height").and_then(uint)?;
+            if logical_width == 0 || logical_height == 0 {
+                return None;
             }
-            border.as_object()?;
-            let side = |name| border.get(name).map_or(Some(0), uint);
-            Some(McmetaBorder::Border(NineSliceBorder {
-                left: side("left")?,
-                top: side("top")?,
-                right: side("right")?,
-                bottom: side("bottom")?,
-            }))
+            let mut parsed = if let Some(px) = uint(border) {
+                NineSliceBorder::uniform(px)
+            } else {
+                border.as_object()?;
+                let side = |name| border.get(name).map_or(Some(0), uint);
+                NineSliceBorder {
+                    left: side("left")?,
+                    top: side("top")?,
+                    right: side("right")?,
+                    bottom: side("bottom")?,
+                    logical_width: 0,
+                    logical_height: 0,
+                }
+            };
+            parsed.logical_width = logical_width;
+            parsed.logical_height = logical_height;
+            if !parsed.fits_within(logical_width, logical_height) {
+                return None;
+            }
+            Some(McmetaBorder::Border(parsed))
         }
         _ => None,
     }
@@ -787,7 +846,13 @@ fn fold_layer(
                     .and_then(|b| parse_nine_slice_border(&b))
                 {
                     Some(McmetaBorder::Border(border)) => {
-                        out.borders.insert(id, border);
+                        if let Some(scaled) = border.scaled_to_source(image.width, image.height) {
+                            out.borders.insert(id, scaled);
+                        } else {
+                            out.notes.push(format!(
+                                "{label}:{meta}: nine-slice borders do not fit sprite dimensions"
+                            ));
+                        }
                     }
                     Some(McmetaBorder::Stretch) => {
                         out.stretch.insert(id);

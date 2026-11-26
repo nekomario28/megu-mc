@@ -89,7 +89,7 @@ fn iso_face_uv(x: f32, y: f32) -> Option<(IsoFace, f32, f32)> {
         return Some((IsoFace::Left, left_u, left_v));
     }
 
-    let right_u = 2.0 * (1.0 - x);
+    let right_u = 2.0 * x - 1.0;
     let right_v = 2.0 * y + x - 1.5;
     if in_unit_range(right_u) && in_unit_range(right_v) {
         return Some((IsoFace::Right, right_u, right_v));
@@ -194,6 +194,70 @@ pub fn upgrade_item_icon_atlas_with_3d_blocks<'a>(
             (!rgba.is_empty()).then(|| (name.clone(), rgba))
         })
         .collect()
+}
+
+/// Top, left, right, optional side-overlay sprite, and optional top tint for
+/// one distinct-face isometric block icon.
+pub type IsometricFaceSprites<'a> = (
+    SpriteRgba<'a>,
+    SpriteRgba<'a>,
+    SpriteRgba<'a>,
+    Option<SpriteRgba<'a>>,
+    Option<[u8; 3]>,
+);
+
+/// Generate isometric icons when the two visible vertical faces have distinct
+/// sprites. `side_overlay` is alpha-composited over both vertical faces before
+/// lighting, matching side-overlay block sprites such as grass while keeping
+/// the legacy single-side entry point intact.
+pub fn upgrade_item_icon_atlas_with_3d_block_faces<'a>(
+    block_sprites: &BTreeMap<String, IsometricFaceSprites<'a>>,
+    out_size: u32,
+) -> BTreeMap<String, Vec<u8>> {
+    block_sprites
+        .iter()
+        .filter_map(|(name, (top, left, right, side_overlay, top_tint))| {
+            let rgba = if let Some(overlay) = side_overlay {
+                let left_composited = composite_sprite_overlay_rgba(left, overlay);
+                let right_composited = composite_sprite_overlay_rgba(right, overlay);
+                let left_sprite = SpriteRgba::new(left.width, left.height, &left_composited);
+                let right_sprite = SpriteRgba::new(right.width, right.height, &right_composited);
+                render_isometric_block_icon_rgba(
+                    top,
+                    &left_sprite,
+                    &right_sprite,
+                    out_size,
+                    *top_tint,
+                )
+            } else {
+                render_isometric_block_icon_rgba(top, left, right, out_size, *top_tint)
+            };
+            (!rgba.is_empty()).then(|| (name.clone(), rgba))
+        })
+        .collect()
+}
+
+fn composite_sprite_overlay_rgba(base: &SpriteRgba<'_>, overlay: &SpriteRgba<'_>) -> Vec<u8> {
+    if !base.is_valid() || !overlay.is_valid() {
+        return base.rgba.to_vec();
+    }
+    let mut out = base.rgba.to_vec();
+    for y in 0..base.height {
+        for x in 0..base.width {
+            let u = (x as f32 + 0.5) / base.width as f32;
+            let v = (y as f32 + 0.5) / base.height as f32;
+            let over = sample_nearest(overlay, u, v);
+            let index = (y as usize * base.width as usize + x as usize) * 4;
+            let alpha = f32::from(over[3]) / 255.0;
+            for channel in 0..3 {
+                out[index + channel] = (f32::from(over[channel]) * alpha
+                    + f32::from(out[index + channel]) * (1.0 - alpha))
+                    .round() as u8;
+            }
+            out[index + 3] = out[index + 3].max(over[3]);
+        }
+    }
+    out
 }
 
 /// Vanilla-style enchanted-glint UV translation and rotation.
