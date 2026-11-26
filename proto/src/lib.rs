@@ -80,6 +80,7 @@ pub mod codec;
 pub mod item_components;
 pub mod mod_wire;
 pub mod channel_router;
+pub mod chunk_hash_sync;
 mod data_v767;
 mod data_v777;
 pub mod friend_relay;
@@ -110,6 +111,13 @@ pub use channel_router::{
     ChannelHandlerKind, ChannelNameError, DropReason, FirewallDisconnectReason, FirewallVerdict,
     OperatorRuleError, RegisterPayloadError, ThrottleReason, MAX_BULK_PAYLOAD_BYTES,
     MAX_CHANNEL_NAME_BYTES, MAX_REGISTERED_CHANNELS_PER_PEER, MAX_REGISTER_PAYLOAD_BYTES,
+};
+pub use chunk_hash_sync::{
+    apply_verified_chunk_delta, chunk_merkle_hash, decode_ckh1, encode_ckh1, plan_chunk_sync,
+    section_state_hash, ChunkBlockDelta, ChunkDeltaProvider, ChunkHashEntry,
+    ChunkHashSyncPacket, Ckh1Error, FullSyncReason, ServerChunk, CHUNK_HASH_SYNC_CHANNEL,
+    CKH1_MAGIC, CKH1_SCHEMA_VERSION, MAX_CKH1_FRAME_BYTES, MAX_CHUNKS_PER_HASH_FRAME,
+    MAX_DELTA_EDITS_PER_CHUNK, MAX_EPOCH_LEN,
 };
 pub use friend_relay::{
     ExpiredHost, FriendPacket, FriendRelayConfig, FriendRelayMetrics, FriendRelayRouter,
