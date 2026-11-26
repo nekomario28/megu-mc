@@ -1014,6 +1014,69 @@ fn outsider_floor(c: &ClaimProtectionConfig) -> ClaimPermissionSet {
     }
 }
 
+/// What every action rule needs to know about the claim under test —
+/// resolved once per [`ClaimsWorld::check_action`] call, so helpers take one
+/// borrowed context instead of three parallel arguments.
+struct ClaimCtx<'a> {
+    okey: &'a str,
+    sub: &'a str,
+    cfg: &'a ClaimProtectionConfig,
+}
+
+/// The permission row an action maps to, plus the master flag and deny
+/// wording that describe it.
+#[derive(Clone, Copy)]
+struct SlotRule {
+    slot: PermSlot,
+    protected: bool,
+    reason: DenyReason,
+}
+
+/// The permission row `action` needs. Border and whole-claim variants never
+/// reach here: [`ClaimsWorld::claim_wide_action`] decides them first.
+fn slot_rule(action: &ClaimAction, cfg: &ClaimProtectionConfig) -> SlotRule {
+    let (slot, protected, reason) = match action {
+        ClaimAction::BlockBreak => (
+            PermSlot::BlockBreak, cfg.protect_blocks, DenyReason::BlocksProtected,
+        ),
+        ClaimAction::BlockPlace => (
+            PermSlot::BlockPlace, cfg.protect_blocks, DenyReason::BlocksProtected,
+        ),
+        ClaimAction::ContainerInteract => (
+            PermSlot::Containers, cfg.protect_containers, DenyReason::ContainersProtected,
+        ),
+        ClaimAction::EntityAttack => (
+            PermSlot::EntityDamage, cfg.protect_entities, DenyReason::EntitiesProtected,
+        ),
+        ClaimAction::EntityInteract => (
+            PermSlot::EntityInteract,
+            cfg.protect_entity_interact,
+            DenyReason::EntityInteractProtected,
+        ),
+        ClaimAction::RedstoneOrDoorInteract => (
+            PermSlot::RedstoneAndDoors, cfg.protect_blocks, DenyReason::RedstoneOrDoorProtected,
+        ),
+        ClaimAction::EntityPushOrDisplace => (
+            PermSlot::EntityPush, cfg.protect_entity_push, DenyReason::EntityPushProtected,
+        ),
+        ClaimAction::EntityTemptOrLure => (
+            PermSlot::EntityInteract, cfg.protect_entity_lure, DenyReason::EntityLureProtected,
+        ),
+        _ => unreachable!("border actions are decided before the permission matrix"),
+    };
+    SlotRule { slot, protected, reason }
+}
+
+/// `Denied(reason)` while `protected`, otherwise `Allowed` — the shared shape
+/// of every master flag and explicit permission row.
+fn flag_decision(protected: bool, reason: DenyReason) -> ClaimDecision {
+    if protected {
+        ClaimDecision::Denied(reason)
+    } else {
+        ClaimDecision::Allowed
+    }
+}
+
 /// The dimensions [`ClaimsWorld::new_survival_default`] opens to player
 /// claims: Overworld only, so Nether fortresses, End islands and mod
 /// dimensions cannot be monopolized.
@@ -1622,191 +1685,131 @@ impl ClaimsWorld {
         actor_uuid: Option<&str>,
         action: ClaimAction,
     ) -> ClaimDecision {
+        // Zero-allocation fast path: an empty store, or no claim at `key`,
+        // is wilderness — `Allowed` before any owner key, config clone or
+        // permission set is built.
+        if self.claims.is_empty() {
+            return ClaimDecision::Allowed;
+        }
         let Some(claim) = self.claims.get(key) else {
             return ClaimDecision::Allowed;
         };
         let okey = owner_key(&claim.owner);
         let cfg = self.effective_config(&okey, &claim.sub_claim);
-        match &action {
-            ClaimAction::PistonFrom(src) => {
-                return self.border_decision(
-                    &okey,
-                    src,
-                    cfg.protect_piston_border,
-                    DenyReason::PistonBorderProtected,
-                );
+        let ctx = ClaimCtx {
+            okey: &okey,
+            sub: &claim.sub_claim,
+            cfg: &cfg,
+        };
+        if let Some(decision) = self.claim_wide_action(&ctx, &action) {
+            return decision;
+        }
+        let rule = slot_rule(&action, &cfg);
+        let actor = actor_uuid.unwrap_or("");
+        let is_admin = self.admins.contains(actor);
+        match &claim.owner {
+            ClaimOwner::Player(owner) => self.player_action(&ctx, owner, actor, rule),
+            ClaimOwner::Server | ClaimOwner::Expired(_) => {
+                if !rule.protected || cfg.everyone_else.allows(rule.slot) {
+                    return ClaimDecision::Allowed;
+                }
+                let reason = if matches!(&claim.owner, ClaimOwner::Server) {
+                    DenyReason::ServerClaim
+                } else {
+                    DenyReason::ExpiredClaim
+                };
+                if is_admin {
+                    ClaimDecision::Allowed
+                } else {
+                    ClaimDecision::Denied(reason)
+                }
             }
-            ClaimAction::FluidFrom(src) => {
-                return self.border_decision(
-                    &okey,
-                    src,
-                    cfg.protect_fluid_border,
-                    DenyReason::FluidBorderProtected,
-                );
-            }
-            ClaimAction::FireSpreadFrom(src) | ClaimAction::LightningFrom(src) => {
-                return self.border_decision(
-                    &okey,
-                    src,
-                    cfg.protect_fire_and_lightning,
-                    DenyReason::FireAndLightningProtected,
-                );
-            }
-            ClaimAction::DispenserOrHopperFrom(src) => {
-                return self.border_decision(
-                    &okey,
-                    src,
-                    cfg.protect_dispenser_hopper_border,
-                    DenyReason::DispenserHopperBorderProtected,
-                );
-            }
-            ClaimAction::ContraptionOrMachineFrom { source, owner_uuid } => {
-                return self.contraption_decision(&okey, &cfg, source, owner_uuid.as_deref());
-            }
-            ClaimAction::ProjectileFrom {
-                source,
-                shooter_uuid,
-            } => {
-                return self.projectile_decision(
-                    &okey,
-                    &claim.sub_claim,
-                    &cfg,
-                    source,
-                    shooter_uuid.as_deref(),
-                );
-            }
-            ClaimAction::ExplosionFrom {
-                source,
-                actor_uuid: cause,
-            } => {
-                return self.explosion_decision(
-                    &okey,
-                    &claim.sub_claim,
-                    &cfg,
-                    source,
-                    cause.as_deref(),
-                );
-            }
-            ClaimAction::VehicleEnterOrInject {
-                source,
-                actor_uuid: driver,
-            } => {
-                return self.vehicle_decision(
-                    &okey,
-                    &claim.sub_claim,
-                    &cfg,
-                    source,
-                    driver.as_deref(),
-                );
-            }
+        }
+    }
+
+    /// The cross-border and whole-claim grief rules, decided before the
+    /// permission matrix; `None` means the matrix decides.
+    fn claim_wide_action(&self, ctx: &ClaimCtx, action: &ClaimAction) -> Option<ClaimDecision> {
+        let (src, protected, reason) = match action {
+            ClaimAction::PistonFrom(src) => (
+                src, ctx.cfg.protect_piston_border, DenyReason::PistonBorderProtected,
+            ),
+            ClaimAction::FluidFrom(src) => (
+                src, ctx.cfg.protect_fluid_border, DenyReason::FluidBorderProtected,
+            ),
+            ClaimAction::FireSpreadFrom(src) | ClaimAction::LightningFrom(src) => (
+                src, ctx.cfg.protect_fire_and_lightning, DenyReason::FireAndLightningProtected,
+            ),
+            ClaimAction::DispenserOrHopperFrom(src) => (
+                src,
+                ctx.cfg.protect_dispenser_hopper_border,
+                DenyReason::DispenserHopperBorderProtected,
+            ),
             ClaimAction::MobOrBossGrief { .. } => {
                 // Mobs carry no player rights — the `source` chunk is
                 // provenance for reporting, not a trust grant, so a boss
                 // already inside the claim is covered too.
-                return if cfg.protect_mob_and_boss_grief {
-                    ClaimDecision::Denied(DenyReason::MobOrBossGriefProtected)
-                } else {
-                    ClaimDecision::Allowed
-                };
+                return Some(flag_decision(
+                    ctx.cfg.protect_mob_and_boss_grief,
+                    DenyReason::MobOrBossGriefProtected,
+                ));
             }
             ClaimAction::Explosion => {
-                return if cfg.protect_explosions {
-                    ClaimDecision::Denied(DenyReason::ExplosionsProtected)
-                } else {
-                    ClaimDecision::Allowed
-                };
+                return Some(flag_decision(
+                    ctx.cfg.protect_explosions,
+                    DenyReason::ExplosionsProtected,
+                ));
             }
-            _ => {}
-        }
-        let (slot, protected, reason) = match action {
-            ClaimAction::BlockBreak => {
-                (PermSlot::BlockBreak, cfg.protect_blocks, DenyReason::BlocksProtected)
+            ClaimAction::ContraptionOrMachineFrom { source, owner_uuid } => {
+                let owner = owner_uuid.as_deref();
+                return Some(self.contraption_decision(ctx.okey, ctx.cfg, source, owner));
             }
-            ClaimAction::BlockPlace => {
-                (PermSlot::BlockPlace, cfg.protect_blocks, DenyReason::BlocksProtected)
+            ClaimAction::ProjectileFrom { source, shooter_uuid } => {
+                return Some(self.projectile_decision(ctx, source, shooter_uuid.as_deref()));
             }
-            ClaimAction::ContainerInteract => (
-                PermSlot::Containers,
-                cfg.protect_containers,
-                DenyReason::ContainersProtected,
-            ),
-            ClaimAction::EntityAttack => (
-                PermSlot::EntityDamage,
-                cfg.protect_entities,
-                DenyReason::EntitiesProtected,
-            ),
-            ClaimAction::EntityInteract => (
-                PermSlot::EntityInteract,
-                cfg.protect_entity_interact,
-                DenyReason::EntityInteractProtected,
-            ),
-            ClaimAction::RedstoneOrDoorInteract => (
-                PermSlot::RedstoneAndDoors,
-                cfg.protect_blocks,
-                DenyReason::RedstoneOrDoorProtected,
-            ),
-            ClaimAction::EntityPushOrDisplace => (
-                PermSlot::EntityPush,
-                cfg.protect_entity_push,
-                DenyReason::EntityPushProtected,
-            ),
-            ClaimAction::EntityTemptOrLure => (
-                PermSlot::EntityInteract,
-                cfg.protect_entity_lure,
-                DenyReason::EntityLureProtected,
-            ),
-            _ => unreachable!(),
+            ClaimAction::ExplosionFrom {
+                source,
+                actor_uuid: cause,
+            } => return Some(self.explosion_decision(ctx, source, cause.as_deref())),
+            ClaimAction::VehicleEnterOrInject {
+                source,
+                actor_uuid: driver,
+            } => return Some(self.vehicle_decision(ctx, source, driver.as_deref())),
+            _ => return None,
         };
-        let actor = actor_uuid.unwrap_or("");
-        let is_admin = self.admins.contains(actor);
-        if let ClaimOwner::Player(owner) = &claim.owner {
-            if actor == owner || is_admin {
-                return ClaimDecision::Allowed;
-            }
-            // An explicit per-player override beats every other rule, so a
-            // blocked party member stays blocked and a trusted friend keeps
-            // access even where `everyone_else` is denied.
-            if let Some(perms) = cfg.player_overrides.get(actor) {
-                return if perms.allows(slot) {
-                    ClaimDecision::Allowed
-                } else {
-                    ClaimDecision::Denied(reason)
-                };
-            }
-            let trusted = (cfg.allow_party_members && self.shares_party(owner, actor))
-                || (cfg.allow_allies && self.allied(owner, actor));
-            if trusted && self.index_count(&okey, &claim.sub_claim) > cfg.max_claims {
-                // Over-limit: trusted access is suspended; outsiders take
-                // the everyone_else/flag path below.
-                return ClaimDecision::Denied(DenyReason::OwnerOverLimit);
-            }
-            if trusted || !protected || cfg.everyone_else.allows(slot) {
-                ClaimDecision::Allowed
-            } else {
-                ClaimDecision::Denied(reason)
-            }
-        } else {
-            if !protected || cfg.everyone_else.allows(slot) {
-                return ClaimDecision::Allowed;
-            }
-            match &claim.owner {
-                ClaimOwner::Server => {
-                    if is_admin {
-                        ClaimDecision::Allowed
-                    } else {
-                        ClaimDecision::Denied(DenyReason::ServerClaim)
-                    }
-                }
-                ClaimOwner::Expired(_) => {
-                    if is_admin {
-                        ClaimDecision::Allowed
-                    } else {
-                        ClaimDecision::Denied(DenyReason::ExpiredClaim)
-                    }
-                }
-                ClaimOwner::Player(_) => unreachable!(),
-            }
+        Some(self.border_decision(ctx.okey, src, protected, reason))
+    }
+
+    /// The permission-matrix decision for a player-owned claim: owner/admin
+    /// first, then an explicit override, then party/ally trust (suspended
+    /// while the owner is over quota), then `everyone_else`/the master flag.
+    fn player_action(
+        &self,
+        ctx: &ClaimCtx,
+        owner: &str,
+        actor: &str,
+        rule: SlotRule,
+    ) -> ClaimDecision {
+        if actor == owner || self.admins.contains(actor) {
+            return ClaimDecision::Allowed;
         }
+        // An explicit per-player override beats every other rule, so a
+        // blocked party member stays blocked and a trusted friend keeps
+        // access even where `everyone_else` is denied.
+        if let Some(perms) = ctx.cfg.player_overrides.get(actor) {
+            return flag_decision(!perms.allows(rule.slot), rule.reason);
+        }
+        let trusted = (ctx.cfg.allow_party_members && self.shares_party(owner, actor))
+            || (ctx.cfg.allow_allies && self.allied(owner, actor));
+        if trusted && self.index_count(ctx.okey, ctx.sub) > ctx.cfg.max_claims {
+            // Over-limit: trusted access is suspended; outsiders take the
+            // everyone_else/flag path below.
+            return ClaimDecision::Denied(DenyReason::OwnerOverLimit);
+        }
+        flag_decision(
+            !trusted && rule.protected && !ctx.cfg.everyone_else.allows(rule.slot),
+            rule.reason,
+        )
     }
 
     /// The permission set `actor` effectively holds inside `okey`'s `sub`
@@ -1896,17 +1899,15 @@ impl ClaimsWorld {
     /// holds.
     fn projectile_decision(
         &self,
-        target_okey: &str,
-        sub: &str,
-        cfg: &ClaimProtectionConfig,
+        ctx: &ClaimCtx,
         src: &ClaimChunkKey,
         shooter_uuid: Option<&str>,
     ) -> ClaimDecision {
-        if self.source_same_owner(target_okey, src) || !cfg.protect_projectiles_border {
+        if self.source_same_owner(ctx.okey, src) || !ctx.cfg.protect_projectiles_border {
             return ClaimDecision::Allowed;
         }
         if let Some(shooter) = shooter_uuid {
-            let perms = self.perm_set_for(target_okey, sub, cfg, shooter);
+            let perms = self.perm_set_for(ctx.okey, ctx.sub, ctx.cfg, shooter);
             if perms.entity_damage || perms.block_break {
                 return ClaimDecision::Allowed;
             }
@@ -1920,17 +1921,15 @@ impl ClaimsWorld {
     /// is blocked while `protect_explosions` holds.
     fn explosion_decision(
         &self,
-        target_okey: &str,
-        sub: &str,
-        cfg: &ClaimProtectionConfig,
+        ctx: &ClaimCtx,
         src: &ClaimChunkKey,
         actor_uuid: Option<&str>,
     ) -> ClaimDecision {
-        if self.source_same_owner(target_okey, src) || !cfg.protect_explosions {
+        if self.source_same_owner(ctx.okey, src) || !ctx.cfg.protect_explosions {
             return ClaimDecision::Allowed;
         }
         if let Some(actor) = actor_uuid {
-            let perms = self.perm_set_for(target_okey, sub, cfg, actor);
+            let perms = self.perm_set_for(ctx.okey, ctx.sub, ctx.cfg, actor);
             if perms.entity_damage || perms.block_break {
                 return ClaimDecision::Allowed;
             }
@@ -1945,20 +1944,15 @@ impl ClaimsWorld {
     /// `protect_vehicle_border` holds.
     fn vehicle_decision(
         &self,
-        target_okey: &str,
-        sub: &str,
-        cfg: &ClaimProtectionConfig,
+        ctx: &ClaimCtx,
         src: &ClaimChunkKey,
         actor_uuid: Option<&str>,
     ) -> ClaimDecision {
-        if self.source_same_owner(target_okey, src) || !cfg.protect_vehicle_border {
+        if self.source_same_owner(ctx.okey, src) || !ctx.cfg.protect_vehicle_border {
             return ClaimDecision::Allowed;
         }
         if let Some(actor) = actor_uuid {
-            if self
-                .perm_set_for(target_okey, sub, cfg, actor)
-                .entity_interact
-            {
+            if self.perm_set_for(ctx.okey, ctx.sub, ctx.cfg, actor).entity_interact {
                 return ClaimDecision::Allowed;
             }
         }
@@ -2347,13 +2341,13 @@ impl ClaimsWorld {
             .iter()
             .map(|(k, c)| {
                 Json::Object(vec![
-                    ("dim".to_owned(), Json::String(k.dimension.clone())),
-                    ("cx".to_owned(), Json::Number(f64::from(k.cx))),
-                    ("cz".to_owned(), Json::Number(f64::from(k.cz))),
+                    str_json("dim", &k.dimension),
+                    num_json("cx", f64::from(k.cx)),
+                    num_json("cz", f64::from(k.cz)),
                     ("owner".to_owned(), owner_to_json(&c.owner)),
-                    ("sub".to_owned(), Json::String(c.sub_claim.clone())),
-                    ("forceloaded".to_owned(), Json::Bool(c.forceloaded)),
-                    ("color".to_owned(), Json::Number(f64::from(c.color_rgb))),
+                    str_json("sub", &c.sub_claim),
+                    bool_json("forceloaded", c.forceloaded),
+                    num_json("color", f64::from(c.color_rgb)),
                 ])
             })
             .collect();
@@ -2362,46 +2356,30 @@ impl ClaimsWorld {
             .iter()
             .map(|((okey, sub), cfg)| {
                 Json::Object(vec![
-                    ("owner".to_owned(), Json::String(okey.clone())),
-                    ("sub".to_owned(), Json::String(sub.clone())),
+                    str_json("owner", okey),
+                    str_json("sub", sub),
                     ("config".to_owned(), config_to_json(cfg)),
                 ])
             })
             .collect();
-        let admins: Vec<Json> = self
-            .admins
-            .iter()
-            .map(|a| Json::String(a.clone()))
-            .collect();
+        let admins = self.admins.iter().map(|a| Json::String(a.clone())).collect();
         let known_players: Vec<Json> = self
             .known_players
             .iter()
             .map(|(u, r)| {
                 Json::Object(vec![
-                    ("uuid".to_owned(), Json::String(u.clone())),
-                    ("name".to_owned(), Json::String(r.name.clone())),
-                    (
-                        "firstSeenTick".to_owned(),
-                        Json::Number(r.first_seen_tick as f64),
-                    ),
-                    (
-                        "lastSeenTick".to_owned(),
-                        Json::Number(r.last_seen_tick as f64),
-                    ),
+                    str_json("uuid", u),
+                    str_json("name", &r.name),
+                    num_json("firstSeenTick", r.first_seen_tick as f64),
+                    num_json("lastSeenTick", r.last_seen_tick as f64),
                 ])
             })
             .collect();
         let mut doc = vec![
-            ("revision".to_owned(), Json::Number(self.revision as f64)),
-            (
-                "nextPartyId".to_owned(),
-                Json::Number(self.next_party_id as f64),
-            ),
+            num_json("revision", self.revision as f64),
+            num_json("nextPartyId", self.next_party_id as f64),
             ("admins".to_owned(), Json::Array(admins)),
-            (
-                "claimCostMode".to_owned(),
-                Json::String(self.claim_cost_mode.as_str().to_owned()),
-            ),
+            str_json("claimCostMode", self.claim_cost_mode.as_str()),
             (
                 "defaultConfig".to_owned(),
                 config_to_json(&self.default_config),
@@ -2411,10 +2389,8 @@ impl ClaimsWorld {
             ("knownPlayers".to_owned(), Json::Array(known_players)),
         ];
         if let Some(dims) = &self.allowed_claim_dimensions {
-            doc.push((
-                "allowedClaimDimensions".to_owned(),
-                Json::Array(dims.iter().map(|d| Json::String(d.clone())).collect()),
-            ));
+            let dims = Json::Array(dims.iter().map(|d| Json::String(d.clone())).collect());
+            doc.push(("allowedClaimDimensions".to_owned(), dims));
         }
         Json::Object(doc).to_json_string()
     }
@@ -2425,9 +2401,9 @@ impl ClaimsWorld {
             .values()
             .map(|p| {
                 Json::Object(vec![
-                    ("id".to_owned(), Json::String(p.id.clone())),
-                    ("name".to_owned(), Json::String(p.name.clone())),
-                    ("ownerUuid".to_owned(), Json::String(p.owner_uuid.clone())),
+                    str_json("id", &p.id),
+                    str_json("name", &p.name),
+                    str_json("ownerUuid", &p.owner_uuid),
                     (
                         "members".to_owned(),
                         Json::Object(
@@ -2450,7 +2426,7 @@ impl ClaimsWorld {
                                 .collect(),
                         ),
                     ),
-                    ("color".to_owned(), Json::Number(f64::from(p.color_rgb))),
+                    num_json("color", f64::from(p.color_rgb)),
                 ])
             })
             .collect();
@@ -2463,8 +2439,19 @@ impl ClaimsWorld {
         let Json::Object(_) = doc else {
             return Err(inv(ctx, "expected a JSON object"));
         };
-        self.revision = j_u64(&doc, "revision", ctx)?.unwrap_or(0);
-        self.next_party_id = j_u64(&doc, "nextPartyId", ctx)?.unwrap_or(1).max(1);
+        self.read_claims_header(&doc, ctx)?;
+        self.read_known_players_json(&doc, ctx)?;
+        self.admins
+            .extend(json_str_set(&doc, "admins", ctx, "\"admins\"")?);
+        self.read_configs_json(&doc, ctx)?;
+        self.read_claim_entries_json(&doc, ctx)
+    }
+
+    /// Store-wide scalars and policies: revision, party counter, default
+    /// config, cost mode and the claimable-dimension allowlist.
+    fn read_claims_header(&mut self, doc: &Json, ctx: &str) -> io::Result<()> {
+        self.revision = j_u64(doc, "revision", ctx)?.unwrap_or(0);
+        self.next_party_id = j_u64(doc, "nextPartyId", ctx)?.unwrap_or(1).max(1);
         if let Some(d) = doc.get("defaultConfig") {
             self.default_config = config_from_json(d, ctx)?;
         }
@@ -2479,44 +2466,34 @@ impl ClaimsWorld {
         match doc.get("allowedClaimDimensions") {
             None | Some(Json::Null) => {}
             Some(Json::Array(items)) => {
-                let mut dims = BTreeSet::new();
-                for item in items {
-                    let Json::String(d) = item else {
-                        return Err(inv(ctx, "\"allowedClaimDimensions\" must hold strings"));
-                    };
-                    let dim = ResourceLocation::parse(d)
-                        .map_err(|e| inv(ctx, e.to_string()))?;
-                    dims.insert(dim.to_string());
-                }
-                self.allowed_claim_dimensions = Some(dims);
+                self.allowed_claim_dimensions = Some(parse_claim_dimensions(items, ctx)?);
             }
-            Some(_) => {
-                return Err(inv(ctx, "\"allowedClaimDimensions\" must be an array"));
-            }
+            Some(_) => return Err(inv(ctx, "\"allowedClaimDimensions\" must be an array")),
         }
-        if let Some(items) = j_arr(&doc, "knownPlayers", ctx)? {
-            for item in items {
-                let uuid = j_str(item, "uuid", ctx)?.to_owned();
-                let name = j_str(item, "name", ctx)?.to_owned();
-                let rec = KnownPlayerRecord {
-                    name,
-                    first_seen_tick: j_u64(item, "firstSeenTick", ctx)?.unwrap_or(0),
-                    last_seen_tick: j_u64(item, "lastSeenTick", ctx)?.unwrap_or(0),
-                };
-                self.known_players.insert(uuid, rec);
-            }
-        }
-        for admin in j_arr(&doc, "admins", ctx)?.unwrap_or(&[]) {
-            let Json::String(a) = admin else {
-                return Err(inv(ctx, "\"admins\" must hold strings"));
+        Ok(())
+    }
+
+    /// The roster of every player the server has ever seen.
+    fn read_known_players_json(&mut self, doc: &Json, ctx: &str) -> io::Result<()> {
+        for item in j_arr(doc, "knownPlayers", ctx)?.unwrap_or(&[]) {
+            let uuid = j_str(item, "uuid", ctx)?.to_owned();
+            let name = j_str(item, "name", ctx)?.to_owned();
+            let rec = KnownPlayerRecord {
+                name,
+                first_seen_tick: j_u64(item, "firstSeenTick", ctx)?.unwrap_or(0),
+                last_seen_tick: j_u64(item, "lastSeenTick", ctx)?.unwrap_or(0),
             };
-            self.admins.insert(a.clone());
+            self.known_players.insert(uuid, rec);
         }
-        for entry in j_arr(&doc, "configs", ctx)?.unwrap_or(&[]) {
+        Ok(())
+    }
+
+    /// Per-`(owner, sub-claim)` policies; the owner key is validated before
+    /// anything else so a typo cannot silently seed a config under it.
+    fn read_configs_json(&mut self, doc: &Json, ctx: &str) -> io::Result<()> {
+        for entry in j_arr(doc, "configs", ctx)?.unwrap_or(&[]) {
             let okey = j_str(entry, "owner", ctx)?;
-            let ok =
-                okey == "server" || okey.starts_with("player:") || okey.starts_with("expired:");
-            if !ok {
+            if !is_owner_key(okey) {
                 return Err(inv(ctx, format!("bad config owner key {okey:?}")));
             }
             let sub = SubClaimId::parse(j_str(entry, "sub", ctx)?)
@@ -2530,7 +2507,13 @@ impl ClaimsWorld {
             self.configs
                 .insert((okey.to_owned(), sub.as_str().to_owned()), cfg);
         }
-        for item in j_arr(&doc, "claims", ctx)?.unwrap_or(&[]) {
+        Ok(())
+    }
+
+    /// The claimed chunks themselves; a duplicate key is structural damage
+    /// (one of the two rows would silently win), so it fails closed.
+    fn read_claim_entries_json(&mut self, doc: &Json, ctx: &str) -> io::Result<()> {
+        for item in j_arr(doc, "claims", ctx)?.unwrap_or(&[]) {
             let key = ClaimChunkKey::new(
                 j_str(item, "dim", ctx)?,
                 j_i32(item, "cx", ctx)?,
@@ -2549,19 +2532,13 @@ impl ClaimsWorld {
             if color > 0x00ff_ffff {
                 return Err(inv(ctx, "claim \"color\" out of range"));
             }
-            if self
-                .claims
-                .insert(
-                    key.clone(),
-                    ChunkClaim {
-                        owner,
-                        sub_claim: sub.as_str().to_owned(),
-                        forceloaded,
-                        color_rgb: color as u32,
-                    },
-                )
-                .is_some()
-            {
+            let claim = ChunkClaim {
+                owner,
+                sub_claim: sub.as_str().to_owned(),
+                forceloaded,
+                color_rgb: color as u32,
+            };
+            if self.claims.insert(key.clone(), claim).is_some() {
                 return Err(inv(ctx, format!("duplicate claim at {key}")));
             }
         }
@@ -2575,60 +2552,8 @@ impl ClaimsWorld {
             return Err(inv(ctx, "expected a JSON object"));
         };
         for item in j_arr(&doc, "parties", ctx)?.unwrap_or(&[]) {
-            let id = j_str(item, "id", ctx)?.to_owned();
-            let name = j_str(item, "name", ctx)?.to_owned();
-            if name.trim().is_empty() || name.len() > 48 {
-                return Err(inv(ctx, format!("party {id:?} has a bad name")));
-            }
-            let owner_uuid = j_str(item, "ownerUuid", ctx)?.to_owned();
-            let mut members = BTreeMap::new();
-            let Some(Json::Object(mj)) = item.get("members") else {
-                return Err(inv(ctx, format!("party {id:?} lacks \"members\"")));
-            };
-            for (uuid, rank_json) in mj {
-                let Json::String(rs) = rank_json else {
-                    return Err(inv(
-                        ctx,
-                        format!("party {id:?} member rank is not a string"),
-                    ));
-                };
-                let rank = PartyRank::parse(rs)
-                    .ok_or_else(|| inv(ctx, format!("party {id:?} bad rank {rs:?}")))?;
-                members.insert(uuid.clone(), rank);
-            }
-            if members.get(&owner_uuid) != Some(&PartyRank::Owner) {
-                return Err(inv(
-                    ctx,
-                    format!("party {id:?} ownerUuid is not its Owner member"),
-                ));
-            }
-            let mut allies = BTreeSet::new();
-            for a in j_arr(item, "allies", ctx)?.unwrap_or(&[]) {
-                let Json::String(a) = a else {
-                    return Err(inv(ctx, format!("party {id:?} allies must hold strings")));
-                };
-                allies.insert(a.clone());
-            }
-            let mut pending_invites = BTreeSet::new();
-            for a in j_arr(item, "invites", ctx)?.unwrap_or(&[]) {
-                let Json::String(a) = a else {
-                    return Err(inv(ctx, format!("party {id:?} invites must hold strings")));
-                };
-                pending_invites.insert(a.clone());
-            }
-            let color = j_u64(item, "color", ctx)?.unwrap_or(0);
-            if color > 0x00ff_ffff {
-                return Err(inv(ctx, format!("party {id:?} color out of range")));
-            }
-            let party = Party {
-                id: id.clone(),
-                name,
-                owner_uuid,
-                members,
-                allies,
-                pending_invites,
-                color_rgb: color as u32,
-            };
+            let party = party_from_json(item, ctx)?;
+            let id = party.id.clone();
             if self.parties.insert(id.clone(), party).is_some() {
                 return Err(inv(ctx, format!("duplicate party id {id:?}")));
             }
@@ -2787,11 +2712,7 @@ fn cmd_parties(
 ) -> Result<String, String> {
     let mut t = rest.split_whitespace();
     let sub = t.next().unwrap_or("info").to_ascii_lowercase();
-    let tail = rest
-        .split_whitespace()
-        .skip(1)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let tail = t.clone().collect::<Vec<_>>().join(" ");
     let fail = |e: ClaimsError| e.to_string();
     match sub.as_str() {
         "create" => {
@@ -2842,24 +2763,15 @@ fn cmd_parties(
                 .iter()
                 .map(|(u, r)| format!("{u}={}", r.as_str()))
                 .collect();
-            let allies: Vec<&String> = p.allies.iter().collect();
-            let invites: Vec<&String> = p.pending_invites.iter().collect();
+            let list = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(",");
             Ok(format!(
                 "party {} \"{}\" color=#{:06x}: members=[{}] allies=[{}] invites=[{}]",
                 p.id,
                 p.name,
                 p.color_rgb,
                 members.join(","),
-                allies
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                invites
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
+                list(&p.allies),
+                list(&p.pending_invites),
             ))
         }
         other => Err(format!(
@@ -2930,19 +2842,14 @@ fn cmd_opm(
     let party = world
         .party_of(actor_uuid)
         .ok_or_else(|| "not in a party".to_owned())?;
-    let recipients: Vec<&String> = party
+    let recipients = party
         .members
         .keys()
         .filter(|u| u.as_str() != actor_uuid)
-        .collect();
-    Ok(format!(
-        "[party] {actor_name}: {rest} (recipients: {})",
-        recipients
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<Vec<_>>()
-            .join(",")
-    ))
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(format!("[party] {actor_name}: {rest} (recipients: {recipients})"))
 }
 
 /// `key=value` dump, in declaration order.
@@ -3024,10 +2931,87 @@ fn config_set(cfg: &mut ClaimProtectionConfig, key: &str, value: &str) -> Result
     Ok(())
 }
 
+/// One party row: ranks, the owning member and the color are all validated,
+/// because a half-valid party is a privilege bug, not a repair.
+fn party_from_json(item: &Json, ctx: &str) -> io::Result<Party> {
+    let id = j_str(item, "id", ctx)?.to_owned();
+    let name = j_str(item, "name", ctx)?.to_owned();
+    if name.trim().is_empty() || name.len() > 48 {
+        return Err(inv(ctx, format!("party {id:?} has a bad name")));
+    }
+    let owner_uuid = j_str(item, "ownerUuid", ctx)?.to_owned();
+    let mut members = BTreeMap::new();
+    let Some(Json::Object(rows)) = item.get("members") else {
+        return Err(inv(ctx, format!("party {id:?} lacks \"members\"")));
+    };
+    for (uuid, rank_json) in rows {
+        let Json::String(rs) = rank_json else {
+            return Err(inv(ctx, format!("party {id:?} member rank is not a string")));
+        };
+        let rank = PartyRank::parse(rs)
+            .ok_or_else(|| inv(ctx, format!("party {id:?} bad rank {rs:?}")))?;
+        members.insert(uuid.clone(), rank);
+    }
+    if members.get(&owner_uuid) != Some(&PartyRank::Owner) {
+        return Err(inv(ctx, format!("party {id:?} ownerUuid is not its Owner member")));
+    }
+    let allies = json_str_set(item, "allies", ctx, &format!("party {id:?} allies"))?;
+    let pending_invites = json_str_set(item, "invites", ctx, &format!("party {id:?} invites"))?;
+    let color = j_u64(item, "color", ctx)?.unwrap_or(0);
+    if color > 0x00ff_ffff {
+        return Err(inv(ctx, format!("party {id:?} color out of range")));
+    }
+    Ok(Party {
+        id,
+        name,
+        owner_uuid,
+        members,
+        allies,
+        pending_invites,
+        color_rgb: color as u32,
+    })
+}
+
 // ------------------------------------------------------------ JSON helpers
 
 fn inv(ctx: &str, msg: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{ctx}: {msg}"))
+}
+
+/// `server`, `player:<uuid>` or `expired:<uuid>` — the owner-key spellings
+/// the config table accepts.
+fn is_owner_key(key: &str) -> bool {
+    key == "server" || key.starts_with("player:") || key.starts_with("expired:")
+}
+
+/// An optional JSON array of strings as a set: a non-array or a non-string
+/// member is an error, an absent array is empty. `label` names the field in
+/// the error so each caller keeps its own wording.
+fn json_str_set(v: &Json, key: &str, ctx: &str, label: &str) -> io::Result<BTreeSet<String>> {
+    let mut set = BTreeSet::new();
+    for item in j_arr(v, key, ctx)?.unwrap_or(&[]) {
+        let Json::String(s) = item else {
+            return Err(inv(ctx, format!("{label} must hold strings")));
+        };
+        set.insert(s.clone());
+    }
+    Ok(set)
+}
+
+/// Dimension ids from `allowedClaimDimensions`, each validated through
+/// [`ResourceLocation`] so a malformed id fails the load.
+fn parse_claim_dimensions(items: &[Json], ctx: &str) -> io::Result<BTreeSet<String>> {
+    items
+        .iter()
+        .map(|item| {
+            let Json::String(d) = item else {
+                return Err(inv(ctx, "\"allowedClaimDimensions\" must hold strings"));
+            };
+            ResourceLocation::parse(d)
+                .map(|dim| dim.to_string())
+                .map_err(|e| inv(ctx, e.to_string()))
+        })
+        .collect()
 }
 
 fn parse_doc(text: &str, ctx: &str) -> io::Result<Json> {
@@ -3067,6 +3051,31 @@ fn j_bool(v: &Json, key: &str, ctx: &str) -> io::Result<Option<bool>> {
     }
 }
 
+/// Strict-type, lenient-presence bool assignment: a present value must be a
+/// bool, an absent one leaves `dst` unchanged.
+fn take_bool(v: &Json, key: &str, ctx: &str, dst: &mut bool) -> io::Result<()> {
+    if let Some(b) = j_bool(v, key, ctx)? {
+        *dst = b;
+    }
+    Ok(())
+}
+
+/// One `"key": "value"` object member.
+fn str_json(key: &str, value: &str) -> (String, Json) {
+    (key.to_owned(), Json::String(value.to_owned()))
+}
+
+/// One `"key": <number>` object member.
+fn num_json(key: &str, value: f64) -> (String, Json) {
+    (key.to_owned(), Json::Number(value))
+}
+
+/// One `"key": true|false` object member — the shared shape of the config
+/// and permission-set encoders.
+fn bool_json(key: &str, value: bool) -> (String, Json) {
+    (key.to_owned(), Json::Bool(value))
+}
+
 fn j_arr<'a>(v: &'a Json, key: &str, ctx: &str) -> io::Result<Option<&'a [Json]>> {
     match v.get(key) {
         Some(Json::Array(a)) => Ok(Some(a)),
@@ -3102,74 +3111,29 @@ fn owner_from_json(v: &Json, ctx: &str) -> io::Result<ClaimOwner> {
 
 fn config_to_json(c: &ClaimProtectionConfig) -> Json {
     let mut pairs = vec![
-        ("protectBlocks".to_owned(), Json::Bool(c.protect_blocks)),
-        (
-            "protectContainers".to_owned(),
-            Json::Bool(c.protect_containers),
+        bool_json("protectBlocks", c.protect_blocks),
+        bool_json("protectContainers", c.protect_containers),
+        bool_json("protectEntities", c.protect_entities),
+        bool_json("protectExplosions", c.protect_explosions),
+        bool_json("protectPistonBorder", c.protect_piston_border),
+        bool_json("protectFluidBorder", c.protect_fluid_border),
+        bool_json("protectEntityInteract", c.protect_entity_interact),
+        bool_json("protectProjectilesBorder", c.protect_projectiles_border),
+        bool_json("protectFireAndLightning", c.protect_fire_and_lightning),
+        bool_json("protectMobAndBossGrief", c.protect_mob_and_boss_grief),
+        bool_json("protectContraptionBorder", c.protect_contraption_border),
+        bool_json(
+            "protectDispenserHopperBorder",
+            c.protect_dispenser_hopper_border,
         ),
-        ("protectEntities".to_owned(), Json::Bool(c.protect_entities)),
-        (
-            "protectExplosions".to_owned(),
-            Json::Bool(c.protect_explosions),
-        ),
-        (
-            "protectPistonBorder".to_owned(),
-            Json::Bool(c.protect_piston_border),
-        ),
-        (
-            "protectFluidBorder".to_owned(),
-            Json::Bool(c.protect_fluid_border),
-        ),
-        (
-            "protectEntityInteract".to_owned(),
-            Json::Bool(c.protect_entity_interact),
-        ),
-        (
-            "protectProjectilesBorder".to_owned(),
-            Json::Bool(c.protect_projectiles_border),
-        ),
-        (
-            "protectFireAndLightning".to_owned(),
-            Json::Bool(c.protect_fire_and_lightning),
-        ),
-        (
-            "protectMobAndBossGrief".to_owned(),
-            Json::Bool(c.protect_mob_and_boss_grief),
-        ),
-        (
-            "protectContraptionBorder".to_owned(),
-            Json::Bool(c.protect_contraption_border),
-        ),
-        (
-            "protectDispenserHopperBorder".to_owned(),
-            Json::Bool(c.protect_dispenser_hopper_border),
-        ),
-        (
-            "protectVehicleBorder".to_owned(),
-            Json::Bool(c.protect_vehicle_border),
-        ),
-        (
-            "protectEntityPush".to_owned(),
-            Json::Bool(c.protect_entity_push),
-        ),
-        (
-            "protectEntityLure".to_owned(),
-            Json::Bool(c.protect_entity_lure),
-        ),
-        (
-            "allowPartyMembers".to_owned(),
-            Json::Bool(c.allow_party_members),
-        ),
-        ("allowAllies".to_owned(), Json::Bool(c.allow_allies)),
-        (
-            "offlineForceload".to_owned(),
-            Json::Bool(c.offline_forceload),
-        ),
-        ("maxClaims".to_owned(), Json::Number(c.max_claims as f64)),
-        (
-            "maxForceloads".to_owned(),
-            Json::Number(c.max_forceloads as f64),
-        ),
+        bool_json("protectVehicleBorder", c.protect_vehicle_border),
+        bool_json("protectEntityPush", c.protect_entity_push),
+        bool_json("protectEntityLure", c.protect_entity_lure),
+        bool_json("allowPartyMembers", c.allow_party_members),
+        bool_json("allowAllies", c.allow_allies),
+        bool_json("offlineForceload", c.offline_forceload),
+        num_json("maxClaims", c.max_claims as f64),
+        num_json("maxForceloads", c.max_forceloads as f64),
         (
             "everyoneElse".to_owned(),
             perm_set_to_json(&c.everyone_else),
@@ -3183,10 +3147,7 @@ fn config_to_json(c: &ClaimProtectionConfig) -> Json {
                     .collect(),
             ),
         ),
-        (
-            "displayColorRgb".to_owned(),
-            Json::Number(f64::from(c.display_color_rgb)),
-        ),
+        num_json("displayColorRgb", f64::from(c.display_color_rgb)),
     ];
     if let Some(label) = &c.display_label {
         pairs.push(("displayLabel".to_owned(), Json::String(label.clone())));
@@ -3196,17 +3157,14 @@ fn config_to_json(c: &ClaimProtectionConfig) -> Json {
 
 fn perm_set_to_json(p: &ClaimPermissionSet) -> Json {
     Json::Object(vec![
-        ("blockBreak".to_owned(), Json::Bool(p.block_break)),
-        ("blockPlace".to_owned(), Json::Bool(p.block_place)),
-        ("containers".to_owned(), Json::Bool(p.containers)),
-        (
-            "redstoneAndDoors".to_owned(),
-            Json::Bool(p.redstone_and_doors),
-        ),
-        ("entityInteract".to_owned(), Json::Bool(p.entity_interact)),
-        ("entityDamage".to_owned(), Json::Bool(p.entity_damage)),
-        ("itemPickupDrop".to_owned(), Json::Bool(p.item_pickup_drop)),
-        ("teleportIn".to_owned(), Json::Bool(p.teleport_in)),
+        bool_json("blockBreak", p.block_break),
+        bool_json("blockPlace", p.block_place),
+        bool_json("containers", p.containers),
+        bool_json("redstoneAndDoors", p.redstone_and_doors),
+        bool_json("entityInteract", p.entity_interact),
+        bool_json("entityDamage", p.entity_damage),
+        bool_json("itemPickupDrop", p.item_pickup_drop),
+        bool_json("teleportIn", p.teleport_in),
     ])
 }
 
@@ -3217,30 +3175,14 @@ fn perm_set_from_json(v: &Json, ctx: &str) -> io::Result<ClaimPermissionSet> {
         return Err(inv(ctx, "permission set must be a JSON object"));
     };
     let mut p = ClaimPermissionSet::denied_all();
-    if let Some(b) = j_bool(v, "blockBreak", ctx)? {
-        p.block_break = b;
-    }
-    if let Some(b) = j_bool(v, "blockPlace", ctx)? {
-        p.block_place = b;
-    }
-    if let Some(b) = j_bool(v, "containers", ctx)? {
-        p.containers = b;
-    }
-    if let Some(b) = j_bool(v, "redstoneAndDoors", ctx)? {
-        p.redstone_and_doors = b;
-    }
-    if let Some(b) = j_bool(v, "entityInteract", ctx)? {
-        p.entity_interact = b;
-    }
-    if let Some(b) = j_bool(v, "entityDamage", ctx)? {
-        p.entity_damage = b;
-    }
-    if let Some(b) = j_bool(v, "itemPickupDrop", ctx)? {
-        p.item_pickup_drop = b;
-    }
-    if let Some(b) = j_bool(v, "teleportIn", ctx)? {
-        p.teleport_in = b;
-    }
+    take_bool(v, "blockBreak", ctx, &mut p.block_break)?;
+    take_bool(v, "blockPlace", ctx, &mut p.block_place)?;
+    take_bool(v, "containers", ctx, &mut p.containers)?;
+    take_bool(v, "redstoneAndDoors", ctx, &mut p.redstone_and_doors)?;
+    take_bool(v, "entityInteract", ctx, &mut p.entity_interact)?;
+    take_bool(v, "entityDamage", ctx, &mut p.entity_damage)?;
+    take_bool(v, "itemPickupDrop", ctx, &mut p.item_pickup_drop)?;
+    take_bool(v, "teleportIn", ctx, &mut p.teleport_in)?;
     Ok(p)
 }
 
@@ -3251,60 +3193,59 @@ fn config_from_json(v: &Json, ctx: &str) -> io::Result<ClaimProtectionConfig> {
         return Err(inv(ctx, "config must be a JSON object"));
     };
     let mut c = ClaimProtectionConfig::default();
-    if let Some(b) = j_bool(v, "protectBlocks", ctx)? {
-        c.protect_blocks = b;
-    }
-    if let Some(b) = j_bool(v, "protectContainers", ctx)? {
-        c.protect_containers = b;
-    }
-    if let Some(b) = j_bool(v, "protectEntities", ctx)? {
-        c.protect_entities = b;
-    }
-    if let Some(b) = j_bool(v, "protectExplosions", ctx)? {
-        c.protect_explosions = b;
-    }
-    if let Some(b) = j_bool(v, "protectPistonBorder", ctx)? {
-        c.protect_piston_border = b;
-    }
-    if let Some(b) = j_bool(v, "protectFluidBorder", ctx)? {
-        c.protect_fluid_border = b;
-    }
-    if let Some(b) = j_bool(v, "allowPartyMembers", ctx)? {
-        c.allow_party_members = b;
-    }
-    if let Some(b) = j_bool(v, "allowAllies", ctx)? {
-        c.allow_allies = b;
-    }
-    if let Some(b) = j_bool(v, "offlineForceload", ctx)? {
-        c.offline_forceload = b;
-    }
-    if let Some(b) = j_bool(v, "protectEntityInteract", ctx)? {
-        c.protect_entity_interact = b;
-    }
-    if let Some(b) = j_bool(v, "protectProjectilesBorder", ctx)? {
-        c.protect_projectiles_border = b;
-    }
-    if let Some(b) = j_bool(v, "protectFireAndLightning", ctx)? {
-        c.protect_fire_and_lightning = b;
-    }
-    if let Some(b) = j_bool(v, "protectMobAndBossGrief", ctx)? {
-        c.protect_mob_and_boss_grief = b;
-    }
-    if let Some(b) = j_bool(v, "protectContraptionBorder", ctx)? {
-        c.protect_contraption_border = b;
-    }
-    if let Some(b) = j_bool(v, "protectDispenserHopperBorder", ctx)? {
-        c.protect_dispenser_hopper_border = b;
-    }
-    if let Some(b) = j_bool(v, "protectVehicleBorder", ctx)? {
-        c.protect_vehicle_border = b;
-    }
-    if let Some(b) = j_bool(v, "protectEntityPush", ctx)? {
-        c.protect_entity_push = b;
-    }
-    if let Some(b) = j_bool(v, "protectEntityLure", ctx)? {
-        c.protect_entity_lure = b;
-    }
+    take_bool(v, "protectBlocks", ctx, &mut c.protect_blocks)?;
+    take_bool(v, "protectContainers", ctx, &mut c.protect_containers)?;
+    take_bool(v, "protectEntities", ctx, &mut c.protect_entities)?;
+    take_bool(v, "protectExplosions", ctx, &mut c.protect_explosions)?;
+    take_bool(v, "protectPistonBorder", ctx, &mut c.protect_piston_border)?;
+    take_bool(v, "protectFluidBorder", ctx, &mut c.protect_fluid_border)?;
+    take_bool(v, "allowPartyMembers", ctx, &mut c.allow_party_members)?;
+    take_bool(v, "allowAllies", ctx, &mut c.allow_allies)?;
+    take_bool(v, "offlineForceload", ctx, &mut c.offline_forceload)?;
+    take_bool(
+        v,
+        "protectEntityInteract",
+        ctx,
+        &mut c.protect_entity_interact,
+    )?;
+    take_bool(
+        v,
+        "protectProjectilesBorder",
+        ctx,
+        &mut c.protect_projectiles_border,
+    )?;
+    take_bool(
+        v,
+        "protectFireAndLightning",
+        ctx,
+        &mut c.protect_fire_and_lightning,
+    )?;
+    take_bool(
+        v,
+        "protectMobAndBossGrief",
+        ctx,
+        &mut c.protect_mob_and_boss_grief,
+    )?;
+    take_bool(
+        v,
+        "protectContraptionBorder",
+        ctx,
+        &mut c.protect_contraption_border,
+    )?;
+    take_bool(
+        v,
+        "protectDispenserHopperBorder",
+        ctx,
+        &mut c.protect_dispenser_hopper_border,
+    )?;
+    take_bool(
+        v,
+        "protectVehicleBorder",
+        ctx,
+        &mut c.protect_vehicle_border,
+    )?;
+    take_bool(v, "protectEntityPush", ctx, &mut c.protect_entity_push)?;
+    take_bool(v, "protectEntityLure", ctx, &mut c.protect_entity_lure)?;
     if let Some(n) = j_u64(v, "maxClaims", ctx)? {
         c.max_claims = usize::try_from(n).map_err(|_| inv(ctx, "maxClaims too large"))?;
     }
