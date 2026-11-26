@@ -73,11 +73,60 @@ pub(crate) struct PromoLight {
 /// block state is `u32::MAX`; a write that literally arrives with it is routed
 /// to the overflow so the sentinel keeps a single meaning.
 const WR_EMPTY: u32 = u32::MAX;
-/// Dense `y` band: 24 16-block sections covering `[-64, 320)`, the union of the
-/// 1.21.1 generators' build windows. Writes above or below it land in the
-/// overflow, which is what keeps tall custom dimensions equivalent.
-const WR_MIN_Y: i32 = -64;
-const WR_Y_SECTIONS: usize = 24;
+/// A half-open vertical interval with section-aware coordinate conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerticalBand {
+    min_y: i32,
+    height: u32,
+}
+
+impl VerticalBand {
+    const fn max_y_exclusive(self) -> i32 {
+        self.min_y + self.height as i32
+    }
+
+    const fn contains_y(self, y: i32) -> bool {
+        y >= self.min_y && y < self.max_y_exclusive()
+    }
+
+    const fn y_offset(self, y: i32) -> Option<usize> {
+        if self.contains_y(y) {
+            Some((y - self.min_y) as usize)
+        } else {
+            None
+        }
+    }
+
+    const fn section_index(y: i32) -> i32 {
+        y.div_euclid(16)
+    }
+}
+
+// These names make the distinct dimension bounds explicit even where their
+// numeric ranges happen to agree. Noise generation and block storage have
+// different Nether heights in the pinned 1.21.1 data.
+const OVERWORLD_BUILD_BOUNDS: VerticalBand = VerticalBand {
+    min_y: -64,
+    height: 384,
+};
+#[cfg(test)]
+const NETHER_NOISE_BOUNDS: VerticalBand = VerticalBand {
+    min_y: 0,
+    height: 128,
+};
+#[cfg(test)]
+const NETHER_STORAGE_BOUNDS: VerticalBand = VerticalBand {
+    min_y: 0,
+    height: 256,
+};
+#[cfg(test)]
+const END_BUILD_BOUNDS: VerticalBand = VerticalBand {
+    min_y: 0,
+    height: 256,
+};
+/// Dense writes cover the union of 1.21.1 generator build windows. Writes
+/// outside it land in overflow, preserving tall custom-dimension behavior.
+const WR_Y_SECTIONS: usize = (OVERWORLD_BUILD_BOUNDS.height / 16) as usize;
 /// 3x3 chunks times the `y` sections: the full dense index space.
 const WR_SECTIONS: usize = 9 * WR_Y_SECTIONS;
 
@@ -144,16 +193,16 @@ impl FlatChunkWriteMap {
     #[inline]
     fn slot(&self, x: i32, y: i32, z: i32) -> Option<(usize, usize)> {
         let (ax, az) = self.anchor?;
-        if y < WR_MIN_Y || y >= WR_MIN_Y + 16 * WR_Y_SECTIONS as i32 {
-            return None;
-        }
+        let y_offset = OVERWORLD_BUILD_BOUNDS.y_offset(y)?;
         let (dx, dz) = ((x >> 4) - ax, (z >> 4) - az);
         if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dz) {
             return None;
         }
         let chunk = (dx + 1) as usize + (dz + 1) as usize * 3;
-        let section = chunk * WR_Y_SECTIONS + ((y - WR_MIN_Y) >> 4) as usize;
-        let cell = (((y & 15) as usize) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize;
+        let section = chunk * WR_Y_SECTIONS
+            + (VerticalBand::section_index(y)
+                - VerticalBand::section_index(OVERWORLD_BUILD_BOUNDS.min_y)) as usize;
+        let cell = ((y_offset & 15) << 8) | (((z & 15) as usize) << 4) | (x & 15) as usize;
         Some((section, cell))
     }
 
@@ -1306,6 +1355,35 @@ pub(crate) fn heightmap_dump(path: &str, n: i32, ox: i32, oz: i32, terrain_only:
 
 // ---------- PERF-2a tests: FlatChunkWriteMap parity and cost ----------
 
+#[cfg(test)]
+#[test]
+fn vertical_bands_cover_dimension_bounds_and_euclidean_sections() {
+    assert_eq!(OVERWORLD_BUILD_BOUNDS.max_y_exclusive(), 320);
+    assert!(OVERWORLD_BUILD_BOUNDS.contains_y(-64));
+    assert!(OVERWORLD_BUILD_BOUNDS.contains_y(319));
+    assert!(!OVERWORLD_BUILD_BOUNDS.contains_y(-65));
+    assert!(!OVERWORLD_BUILD_BOUNDS.contains_y(320));
+    assert_eq!(OVERWORLD_BUILD_BOUNDS.y_offset(-64), Some(0));
+    assert_eq!(OVERWORLD_BUILD_BOUNDS.y_offset(319), Some(383));
+    assert_eq!(OVERWORLD_BUILD_BOUNDS.y_offset(320), None);
+
+    assert_eq!(NETHER_NOISE_BOUNDS.max_y_exclusive(), 128);
+    assert_eq!(NETHER_STORAGE_BOUNDS.max_y_exclusive(), 256);
+    assert_eq!(END_BUILD_BOUNDS.max_y_exclusive(), 256);
+    for band in [NETHER_NOISE_BOUNDS, NETHER_STORAGE_BOUNDS, END_BUILD_BOUNDS] {
+        assert_eq!(band.y_offset(band.min_y), Some(0));
+        assert_eq!(
+            band.y_offset(band.max_y_exclusive() - 1),
+            Some(band.height as usize - 1)
+        );
+        assert_eq!(band.y_offset(band.max_y_exclusive()), None);
+    }
+
+    for (y, section) in [(-1, -1), (-16, -1), (-17, -2), (-64, -4), (0, 0), (16, 1)] {
+        assert_eq!(VerticalBand::section_index(y), section, "y={y}");
+    }
+}
+
 /// Deterministic xorshift64 for the parity driver and the bench workload.
 #[cfg(test)]
 fn perf2a_rng(seed: u64) -> impl FnMut() -> u64 {
@@ -1328,7 +1406,7 @@ fn perf2a_rng(seed: u64) -> impl FnMut() -> u64 {
 fn perf2a_flat_wr_differential_parity() {
     let mut rng = perf2a_rng(0x9E37_79B9_7F4A_7C15);
     let mut flat = FlatChunkWriteMap::new();
-    // Anchor on chunk (0,0): in-window x,z in -16..=31, y in -64..=319.
+    // Anchor on chunk (0,0): in-window x,z in -16..=31, within the build band.
     flat.anchor_window(0, 0);
     let mut map: HashMap<(i32, i32, i32), u32> = HashMap::new();
 
@@ -1339,22 +1417,26 @@ fn perf2a_flat_wr_differential_parity() {
         let (x, y, z) = match r % 100 {
             0..=63 => (
                 ((r >> 8) % 48) as i32 - 16,
-                -64 + ((r >> 16) % 384) as i32,
+                OVERWORLD_BUILD_BOUNDS.min_y
+                    + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
                 ((r >> 32) % 48) as i32 - 16,
             ),
             64..=71 => (
                 (((r >> 8) % 3) as i32 - 1) * 16 + ((r >> 16) % 16) as i32,
-                -64 + ((r >> 32) % 384) as i32,
+                OVERWORLD_BUILD_BOUNDS.min_y
+                    + ((r >> 32) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
                 (((r >> 40) % 3) as i32 - 1) * 16 + ((r >> 48) % 16) as i32,
             ),
             72..=79 => (
                 -(((r >> 8) % 32) as i32),
-                -64 + ((r >> 16) % 384) as i32,
+                OVERWORLD_BUILD_BOUNDS.min_y
+                    + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
                 -(((r >> 32) % 32) as i32),
             ),
             80..=89 => (
                 ((r >> 8) % 2000) as i32 - 1000,
-                -64 + ((r >> 16) % 384) as i32,
+                OVERWORLD_BUILD_BOUNDS.min_y
+                    + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
                 ((r >> 32) % 2000) as i32 - 1000,
             ),
             90..=94 => (
@@ -1364,7 +1446,8 @@ fn perf2a_flat_wr_differential_parity() {
             ),
             _ => (
                 -(((r >> 8) % 4000) as i32),
-                -64 + ((r >> 16) % 384) as i32,
+                OVERWORLD_BUILD_BOUNDS.min_y
+                    + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
                 -(((r >> 32) % 4000) as i32),
             ),
         };
@@ -1460,7 +1543,8 @@ fn perf2a_flat_wr_view_stays_authoritative() {
         let r = rng();
         let k = (
             ((r >> 8) % 48) as i32 - 16,
-            -64 + ((r >> 16) % 384) as i32,
+            OVERWORLD_BUILD_BOUNDS.min_y
+                + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
             ((r >> 32) % 48) as i32 - 16,
         );
         flat.insert(k, (r % 4096) as u32);
@@ -1475,7 +1559,8 @@ fn perf2a_flat_wr_view_stays_authoritative() {
         let r = rng();
         let k = (
             ((r >> 8) % 64) as i32 - 32,
-            -64 + ((r >> 16) % 384) as i32,
+            OVERWORLD_BUILD_BOUNDS.min_y
+                + ((r >> 16) % OVERWORLD_BUILD_BOUNDS.height as u64) as i32,
             ((r >> 32) % 64) as i32 - 32,
         );
         if r.is_multiple_of(11) {
