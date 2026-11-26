@@ -274,6 +274,20 @@ impl<'a, 'g> PieceWorld<'a, 'g> {
         }
     }
 
+    /// `generateBox` with one state on edge and fill, for each `[x0, y0, z0, x1, y1, z1]`.
+    fn fill_boxes(&mut self, st: u32, boxes: &[[i32; 6]]) {
+        for b in boxes {
+            self.generate_box(b[0], b[1], b[2], b[3], b[4], b[5], st, st, false);
+        }
+    }
+
+    /// Same, with the state paired to each box (edge == fill == state).
+    fn fill_boxes_st(&mut self, boxes: &[([i32; 6], u32)]) {
+        for (b, st) in boxes {
+            self.generate_box(b[0], b[1], b[2], b[3], b[4], b[5], *st, *st, false);
+        }
+    }
+
     fn is_replaceable_by_structures(&self, st: u32) -> bool {
         if self.reg.is_air(st) || self.reg.is_liquid(st) {
             return true;
@@ -1077,6 +1091,112 @@ impl FortressStates {
     }
 }
 
+/// `fillColumnDown` over every column of a local X/Z rectangle at y = -1.
+fn fill_down(
+    w: &mut PieceWorld<'_, '_>,
+    st: u32,
+    xs: std::ops::RangeInclusive<i32>,
+    zs: std::ops::RangeInclusive<i32>,
+) {
+    for x in xs {
+        for z in zs.clone() {
+            w.fill_column_down(st, x, -1, z);
+        }
+    }
+}
+
+/// The shared shell of the 5x5 small corridors: floor, air volume, roof and the column
+/// fills. The caller writes its walls afterwards - they sit inside the air volume, so the
+/// shell must run first, and the roof and fills occupy cells disjoint from the walls.
+fn small_corridor_shell(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(0, 0, 0, 4, 1, 4, b, b, false);
+    w.generate_box(0, 2, 0, 4, 5, 4, s.air, s.air, false);
+    w.generate_box(0, 6, 0, 4, 6, 4, b, b, false);
+    fill_down(w, b, 0..=4, 0..=4);
+}
+
+/// The turn pieces' `Chest` flag: the loot chest is placed on the first clip that sees it.
+fn corridor_chest<R: StructureRng + ?Sized>(
+    w: &mut PieceWorld<'_, '_>,
+    piece: &mut FortressPiece,
+    rng: &mut R,
+    clip: Bounds,
+    x: i32,
+    z: i32,
+) {
+    if piece.chest_pending && sp_contains(&clip, w.world_pos(x, 2, z)) {
+        piece.chest_pending = false;
+        w.create_chest(rng, x, 2, z, FORTRESS_LOOT_TABLE);
+    }
+}
+
+/// The hall shared by `CastleEntrance` and `CastleStalkRoom`: the wall boxes, the parapet
+/// fence ring and the two wall-post sweeps. `plain_fence` is the entrance's extra gallery
+/// strip the stalk room does not have.
+fn fortress_hall_top(w: &mut PieceWorld<'_, '_>, s: &FortressStates, plain_fence: bool) {
+    let b = s.bricks;
+    let we = s.fence_we;
+    let ns = s.fence_ns;
+    w.generate_box(0, 3, 0, 12, 4, 12, b, b, false);
+    w.generate_box(0, 5, 0, 12, 13, 12, s.air, s.air, false);
+    w.generate_box(0, 5, 0, 1, 12, 12, b, b, false);
+    w.generate_box(11, 5, 0, 12, 12, 12, b, b, false);
+    w.generate_box(2, 5, 11, 4, 12, 12, b, b, false);
+    w.generate_box(8, 5, 11, 10, 12, 12, b, b, false);
+    w.generate_box(5, 9, 11, 7, 12, 12, b, b, false);
+    w.generate_box(2, 5, 0, 4, 12, 1, b, b, false);
+    w.generate_box(8, 5, 0, 10, 12, 1, b, b, false);
+    w.generate_box(5, 9, 0, 7, 12, 1, b, b, false);
+    w.generate_box(2, 11, 2, 10, 12, 10, b, b, false);
+    if plain_fence {
+        w.generate_box(5, 8, 0, 7, 8, 0, s.plain_fence, s.plain_fence, false);
+    }
+    let mut i = 1;
+    while i <= 11 {
+        w.generate_box(i, 10, 0, i, 11, 0, we, we, false);
+        w.generate_box(i, 10, 12, i, 11, 12, we, we, false);
+        w.generate_box(0, 10, i, 0, 11, i, ns, ns, false);
+        w.generate_box(12, 10, i, 12, 11, i, ns, ns, false);
+        w.place(b, i, 13, 0);
+        w.place(b, i, 13, 12);
+        w.place(b, 0, 13, i);
+        w.place(b, 12, 13, i);
+        if i != 11 {
+            w.place(we, i + 1, 13, 0);
+            w.place(we, i + 1, 13, 12);
+            w.place(ns, 0, 13, i + 1);
+            w.place(ns, 12, 13, i + 1);
+        }
+        i += 2;
+    }
+    w.place(s.fence_ne, 0, 13, 0);
+    w.place(s.fence_se, 0, 13, 12);
+    w.place(s.fence_sw, 12, 13, 12);
+    w.place(s.fence_nw, 12, 13, 0);
+    let mut k = 3;
+    while k <= 9 {
+        w.generate_box(1, 7, k, 1, 8, k, s.fence_ns_w, s.fence_ns_w, false);
+        w.generate_box(11, 7, k, 11, 8, k, s.fence_ns_e, s.fence_ns_e, false);
+        k += 2;
+    }
+}
+
+/// The hall's ground slab and support columns, shared by the entrance and the stalk room.
+fn fortress_hall_base(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(4, 2, 0, 8, 2, 12, b, b, false);
+    w.generate_box(0, 2, 4, 12, 2, 8, b, b, false);
+    w.generate_box(4, 0, 0, 8, 1, 3, b, b, false);
+    w.generate_box(4, 0, 9, 8, 1, 12, b, b, false);
+    w.generate_box(0, 0, 4, 3, 1, 8, b, b, false);
+    w.generate_box(9, 0, 4, 12, 1, 8, b, b, false);
+    fill_down(w, b, 4..=8, 0..=2);
+    fill_down(w, b, 4..=8, 10..=12);
+    fill_down(w, b, 0..=2, 4..=8);
+    fill_down(w, b, 10..=12, 4..=8);
+}
+
 /// One fortress piece's `postProcess` against one clip box.
 #[cfg_attr(not(test), allow(dead_code))]
 fn fortress_post_process<R: StructureRng + ?Sized>(
@@ -1087,357 +1207,279 @@ fn fortress_post_process<R: StructureRng + ?Sized>(
     clip: Bounds,
 ) {
     match piece.kind {
-        FortressKind::Start | FortressKind::BridgeCrossing => {
-            let b = s.bricks;
-            w.generate_box(7, 3, 0, 11, 4, 18, b, b, false);
-            w.generate_box(0, 3, 7, 18, 4, 11, b, b, false);
-            w.generate_box(8, 5, 0, 10, 7, 18, s.air, s.air, false);
-            w.generate_box(0, 5, 8, 18, 7, 10, s.air, s.air, false);
-            w.generate_box(7, 5, 0, 7, 5, 7, b, b, false);
-            w.generate_box(7, 5, 11, 7, 5, 18, b, b, false);
-            w.generate_box(11, 5, 0, 11, 5, 7, b, b, false);
-            w.generate_box(11, 5, 11, 11, 5, 18, b, b, false);
-            w.generate_box(0, 5, 7, 7, 5, 7, b, b, false);
-            w.generate_box(11, 5, 7, 18, 5, 7, b, b, false);
-            w.generate_box(0, 5, 11, 7, 5, 11, b, b, false);
-            w.generate_box(11, 5, 11, 18, 5, 11, b, b, false);
-            w.generate_box(7, 2, 0, 11, 2, 5, b, b, false);
-            w.generate_box(7, 2, 13, 11, 2, 18, b, b, false);
-            w.generate_box(7, 0, 0, 11, 1, 3, b, b, false);
-            w.generate_box(7, 0, 15, 11, 1, 18, b, b, false);
-            for i in 7..=11 {
-                for j in 0..=2 {
-                    w.fill_column_down(b, i, -1, j);
-                    w.fill_column_down(b, i, -1, 18 - j);
-                }
-            }
-            w.generate_box(0, 2, 7, 5, 2, 11, b, b, false);
-            w.generate_box(13, 2, 7, 18, 2, 11, b, b, false);
-            w.generate_box(0, 0, 7, 3, 1, 11, b, b, false);
-            w.generate_box(15, 0, 7, 18, 1, 11, b, b, false);
-            for i in 0..=2 {
-                for j in 7..=11 {
-                    w.fill_column_down(b, i, -1, j);
-                    w.fill_column_down(b, 18 - i, -1, j);
-                }
-            }
-        }
-        FortressKind::BridgeEndFiller => {
-            let mut r = Lcg::new(piece.self_seed as u64);
-            let b = s.bricks;
-            for i in 0..=4 {
-                for j in 3..=4 {
-                    let d = r.next_bound(8);
-                    w.generate_box(i, j, 0, i, j, d, b, b, false);
-                }
-            }
-            let mut d = r.next_bound(8);
-            w.generate_box(0, 5, 0, 0, 5, d, b, b, false);
-            d = r.next_bound(8);
-            w.generate_box(4, 5, 0, 4, 5, d, b, b, false);
-            for i in 0..=4 {
-                let d = r.next_bound(5);
-                w.generate_box(i, 2, 0, i, 2, d, b, b, false);
-            }
-            for i in 0..=4 {
-                for j in 0..=1 {
-                    let d = r.next_bound(3);
-                    w.generate_box(i, j, 0, i, j, d, b, b, false);
-                }
-            }
-        }
-        FortressKind::BridgeStraight => {
-            let b = s.bricks;
-            w.generate_box(0, 3, 0, 4, 4, 18, b, b, false);
-            w.generate_box(1, 5, 0, 3, 7, 18, s.air, s.air, false);
-            w.generate_box(0, 5, 0, 0, 5, 18, b, b, false);
-            w.generate_box(4, 5, 0, 4, 5, 18, b, b, false);
-            w.generate_box(0, 2, 0, 4, 2, 5, b, b, false);
-            w.generate_box(0, 2, 13, 4, 2, 18, b, b, false);
-            w.generate_box(0, 0, 0, 4, 1, 3, b, b, false);
-            w.generate_box(0, 0, 15, 4, 1, 18, b, b, false);
-            for i in 0..=4 {
-                for j in 0..=2 {
-                    w.fill_column_down(b, i, -1, j);
-                    w.fill_column_down(b, i, -1, 18 - j);
-                }
-            }
-            let ns_e = s.fence_ns_e;
-            let ns_w = s.fence_ns_w;
-            w.generate_box(0, 1, 1, 0, 4, 1, ns_e, ns_e, false);
-            w.generate_box(0, 3, 4, 0, 4, 4, ns_e, ns_e, false);
-            w.generate_box(0, 3, 14, 0, 4, 14, ns_e, ns_e, false);
-            w.generate_box(0, 1, 17, 0, 4, 17, ns_e, ns_e, false);
-            w.generate_box(4, 1, 1, 4, 4, 1, ns_w, ns_w, false);
-            w.generate_box(4, 3, 4, 4, 4, 4, ns_w, ns_w, false);
-            w.generate_box(4, 3, 14, 4, 4, 14, ns_w, ns_w, false);
-            w.generate_box(4, 1, 17, 4, 4, 17, ns_w, ns_w, false);
-        }
-        FortressKind::CastleCorridorStairs => {
-            let stair = s.stairs_s;
-            let fence = s.fence_ns;
-            let b = s.bricks;
-            for i in 0..=9 {
-                let lo = (7 - i).max(1);
-                let hi = (lo + 5).max(14 - i).min(13);
-                w.generate_box(0, 0, i, 4, lo, i, b, b, false);
-                w.generate_box(1, lo + 1, i, 3, hi - 1, i, s.air, s.air, false);
-                if i <= 6 {
-                    w.place(stair, 1, lo + 1, i);
-                    w.place(stair, 2, lo + 1, i);
-                    w.place(stair, 3, lo + 1, i);
-                }
-                w.generate_box(0, hi, i, 4, hi, i, b, b, false);
-                w.generate_box(0, lo + 1, i, 0, hi - 1, i, b, b, false);
-                w.generate_box(4, lo + 1, i, 4, hi - 1, i, b, b, false);
-                if i & 1 == 0 {
-                    w.generate_box(0, lo + 2, i, 0, lo + 3, i, fence, fence, false);
-                    w.generate_box(4, lo + 2, i, 4, lo + 3, i, fence, fence, false);
-                }
-                for j in 0..=4 {
-                    w.fill_column_down(b, j, -1, i);
-                }
-            }
-        }
-        FortressKind::CastleCorridorTBalcony => {
-            let b = s.bricks;
-            let ns = s.fence_ns;
-            let we = s.fence_we;
-            w.generate_box(0, 0, 0, 8, 1, 8, b, b, false);
-            w.generate_box(0, 2, 0, 8, 5, 8, s.air, s.air, false);
-            w.generate_box(0, 6, 0, 8, 6, 5, b, b, false);
-            w.generate_box(0, 2, 0, 2, 5, 0, b, b, false);
-            w.generate_box(6, 2, 0, 8, 5, 0, b, b, false);
-            w.generate_box(1, 3, 0, 1, 4, 0, we, we, false);
-            w.generate_box(7, 3, 0, 7, 4, 0, we, we, false);
-            w.generate_box(0, 2, 4, 8, 2, 8, b, b, false);
-            w.generate_box(1, 1, 4, 2, 2, 4, s.air, s.air, false);
-            w.generate_box(6, 1, 4, 7, 2, 4, s.air, s.air, false);
-            w.generate_box(1, 3, 8, 7, 3, 8, we, we, false);
-            w.place(s.fence_se, 0, 3, 8);
-            w.place(s.fence_sw, 8, 3, 8);
-            w.generate_box(0, 3, 6, 0, 3, 7, ns, ns, false);
-            w.generate_box(8, 3, 6, 8, 3, 7, ns, ns, false);
-            w.generate_box(0, 3, 4, 0, 5, 5, b, b, false);
-            w.generate_box(8, 3, 4, 8, 5, 5, b, b, false);
-            w.generate_box(1, 3, 5, 2, 5, 5, b, b, false);
-            w.generate_box(6, 3, 5, 7, 5, 5, b, b, false);
-            w.generate_box(1, 4, 5, 1, 5, 5, we, we, false);
-            w.generate_box(7, 4, 5, 7, 5, 5, we, we, false);
-            for i in 0..=5 {
-                for j in 0..=8 {
-                    w.fill_column_down(b, j, -1, i);
-                }
-            }
-        }
-        FortressKind::CastleEntrance => {
-            let b = s.bricks;
-            let we = s.fence_we;
-            let ns = s.fence_ns;
-            w.generate_box(0, 3, 0, 12, 4, 12, b, b, false);
-            w.generate_box(0, 5, 0, 12, 13, 12, s.air, s.air, false);
-            w.generate_box(0, 5, 0, 1, 12, 12, b, b, false);
-            w.generate_box(11, 5, 0, 12, 12, 12, b, b, false);
-            w.generate_box(2, 5, 11, 4, 12, 12, b, b, false);
-            w.generate_box(8, 5, 11, 10, 12, 12, b, b, false);
-            w.generate_box(5, 9, 11, 7, 12, 12, b, b, false);
-            w.generate_box(2, 5, 0, 4, 12, 1, b, b, false);
-            w.generate_box(8, 5, 0, 10, 12, 1, b, b, false);
-            w.generate_box(5, 9, 0, 7, 12, 1, b, b, false);
-            w.generate_box(2, 11, 2, 10, 12, 10, b, b, false);
-            w.generate_box(5, 8, 0, 7, 8, 0, s.plain_fence, s.plain_fence, false);
-            let mut i = 1;
-            while i <= 11 {
-                w.generate_box(i, 10, 0, i, 11, 0, we, we, false);
-                w.generate_box(i, 10, 12, i, 11, 12, we, we, false);
-                w.generate_box(0, 10, i, 0, 11, i, ns, ns, false);
-                w.generate_box(12, 10, i, 12, 11, i, ns, ns, false);
-                w.place(b, i, 13, 0);
-                w.place(b, i, 13, 12);
-                w.place(b, 0, 13, i);
-                w.place(b, 12, 13, i);
-                if i != 11 {
-                    w.place(we, i + 1, 13, 0);
-                    w.place(we, i + 1, 13, 12);
-                    w.place(ns, 0, 13, i + 1);
-                    w.place(ns, 12, 13, i + 1);
-                }
-                i += 2;
-            }
-            w.place(s.fence_ne, 0, 13, 0);
-            w.place(s.fence_se, 0, 13, 12);
-            w.place(s.fence_sw, 12, 13, 12);
-            w.place(s.fence_nw, 12, 13, 0);
-            let mut k = 3;
-            while k <= 9 {
-                w.generate_box(1, 7, k, 1, 8, k, s.fence_ns_w, s.fence_ns_w, false);
-                w.generate_box(11, 7, k, 11, 8, k, s.fence_ns_e, s.fence_ns_e, false);
-                k += 2;
-            }
-            w.generate_box(4, 2, 0, 8, 2, 12, b, b, false);
-            w.generate_box(0, 2, 4, 12, 2, 8, b, b, false);
-            w.generate_box(4, 0, 0, 8, 1, 3, b, b, false);
-            w.generate_box(4, 0, 9, 8, 1, 12, b, b, false);
-            w.generate_box(0, 0, 4, 3, 1, 8, b, b, false);
-            w.generate_box(9, 0, 4, 12, 1, 8, b, b, false);
-            for i in 4..=8 {
-                for j in 0..=2 {
-                    w.fill_column_down(b, i, -1, j);
-                    w.fill_column_down(b, i, -1, 12 - j);
-                }
-            }
-            for i in 0..=2 {
-                for j in 4..=8 {
-                    w.fill_column_down(b, i, -1, j);
-                    w.fill_column_down(b, 12 - i, -1, j);
-                }
-            }
-            w.generate_box(5, 5, 5, 7, 5, 7, b, b, false);
-            w.generate_box(6, 1, 6, 6, 4, 6, s.air, s.air, false);
-            w.place(b, 6, 0, 6);
-            w.place(s.lava, 6, 5, 6);
-        }
-        FortressKind::CastleSmallCorridorCrossing => {
-            let b = s.bricks;
-            w.generate_box(0, 0, 0, 4, 1, 4, b, b, false);
-            w.generate_box(0, 2, 0, 4, 5, 4, s.air, s.air, false);
-            w.generate_box(0, 2, 0, 0, 5, 0, b, b, false);
-            w.generate_box(4, 2, 0, 4, 5, 0, b, b, false);
-            w.generate_box(0, 2, 4, 0, 5, 4, b, b, false);
-            w.generate_box(4, 2, 4, 4, 5, 4, b, b, false);
-            w.generate_box(0, 6, 0, 4, 6, 4, b, b, false);
-            for i in 0..=4 {
-                for j in 0..=4 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
-        }
+        FortressKind::Start | FortressKind::BridgeCrossing => fortress_bridge_crossing(w, s),
+        FortressKind::BridgeEndFiller => fortress_end_filler(w, s, piece),
+        FortressKind::BridgeStraight => fortress_bridge_straight(w, s),
+        FortressKind::CastleCorridorStairs => fortress_corridor_stairs(w, s),
+        FortressKind::CastleCorridorTBalcony => fortress_t_balcony(w, s),
+        FortressKind::CastleEntrance => fortress_entrance(w, s),
+        FortressKind::CastleSmallCorridorCrossing => fortress_small_crossing(w, s),
         FortressKind::CastleSmallCorridorLeftTurn => {
-            let b = s.bricks;
-            let we = s.fence_we;
-            let ns = s.fence_ns;
-            w.generate_box(0, 0, 0, 4, 1, 4, b, b, false);
-            w.generate_box(0, 2, 0, 4, 5, 4, s.air, s.air, false);
-            w.generate_box(4, 2, 0, 4, 5, 4, b, b, false);
-            w.generate_box(4, 3, 1, 4, 4, 1, ns, ns, false);
-            w.generate_box(4, 3, 3, 4, 4, 3, ns, ns, false);
-            w.generate_box(0, 2, 0, 0, 5, 0, b, b, false);
-            w.generate_box(0, 2, 4, 3, 5, 4, b, b, false);
-            w.generate_box(1, 3, 4, 1, 4, 4, we, we, false);
-            w.generate_box(3, 3, 4, 3, 4, 4, we, we, false);
-            if piece.chest_pending && sp_contains(&clip, w.world_pos(3, 2, 3)) {
-                piece.chest_pending = false;
-                w.create_chest(rng, 3, 2, 3, FORTRESS_LOOT_TABLE);
-            }
-            w.generate_box(0, 6, 0, 4, 6, 4, b, b, false);
-            for i in 0..=4 {
-                for j in 0..=4 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
+            fortress_left_turn(w, s, piece, rng, clip)
         }
         FortressKind::CastleSmallCorridorRightTurn => {
-            let b = s.bricks;
-            let we = s.fence_we;
-            let ns = s.fence_ns;
-            w.generate_box(0, 0, 0, 4, 1, 4, b, b, false);
-            w.generate_box(0, 2, 0, 4, 5, 4, s.air, s.air, false);
-            w.generate_box(0, 2, 0, 0, 5, 4, b, b, false);
-            w.generate_box(0, 3, 1, 0, 4, 1, ns, ns, false);
-            w.generate_box(0, 3, 3, 0, 4, 3, ns, ns, false);
-            w.generate_box(4, 2, 0, 4, 5, 0, b, b, false);
-            w.generate_box(1, 2, 4, 4, 5, 4, b, b, false);
-            w.generate_box(1, 3, 4, 1, 4, 4, we, we, false);
-            w.generate_box(3, 3, 4, 3, 4, 4, we, we, false);
-            if piece.chest_pending && sp_contains(&clip, w.world_pos(1, 2, 3)) {
-                piece.chest_pending = false;
-                w.create_chest(rng, 1, 2, 3, FORTRESS_LOOT_TABLE);
-            }
-            w.generate_box(0, 6, 0, 4, 6, 4, b, b, false);
-            for i in 0..=4 {
-                for j in 0..=4 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
+            fortress_right_turn(w, s, piece, rng, clip)
         }
-        FortressKind::CastleSmallCorridor => {
-            let b = s.bricks;
-            let ns = s.fence_ns;
-            w.generate_box(0, 0, 0, 4, 1, 4, b, b, false);
-            w.generate_box(0, 2, 0, 4, 5, 4, s.air, s.air, false);
-            w.generate_box(0, 2, 0, 0, 5, 4, b, b, false);
-            w.generate_box(4, 2, 0, 4, 5, 4, b, b, false);
-            w.generate_box(0, 3, 1, 0, 4, 1, ns, ns, false);
-            w.generate_box(0, 3, 3, 0, 4, 3, ns, ns, false);
-            w.generate_box(4, 3, 1, 4, 4, 1, ns, ns, false);
-            w.generate_box(4, 3, 3, 4, 4, 3, ns, ns, false);
-            w.generate_box(0, 6, 0, 4, 6, 4, b, b, false);
-            for i in 0..=4 {
-                for j in 0..=4 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
-        }
+        FortressKind::CastleSmallCorridor => fortress_small_corridor(w, s),
         FortressKind::CastleStalkRoom => fortress_stalk_room(w, s),
         FortressKind::MonsterThrone => fortress_monster_throne(w, s, piece),
-        FortressKind::RoomCrossing => {
-            let b = s.bricks;
-            w.generate_box(0, 0, 0, 6, 1, 6, b, b, false);
-            w.generate_box(0, 2, 0, 6, 7, 6, s.air, s.air, false);
-            w.generate_box(0, 2, 0, 1, 6, 0, b, b, false);
-            w.generate_box(0, 2, 6, 1, 6, 6, b, b, false);
-            w.generate_box(5, 2, 0, 6, 6, 0, b, b, false);
-            w.generate_box(5, 2, 6, 6, 6, 6, b, b, false);
-            w.generate_box(0, 2, 0, 0, 6, 1, b, b, false);
-            w.generate_box(0, 2, 5, 0, 6, 6, b, b, false);
-            w.generate_box(6, 2, 0, 6, 6, 1, b, b, false);
-            w.generate_box(6, 2, 5, 6, 6, 6, b, b, false);
-            let we = s.fence_we;
-            let ns = s.fence_ns;
-            w.generate_box(2, 6, 0, 4, 6, 0, b, b, false);
-            w.generate_box(2, 5, 0, 4, 5, 0, we, we, false);
-            w.generate_box(2, 6, 6, 4, 6, 6, b, b, false);
-            w.generate_box(2, 5, 6, 4, 5, 6, we, we, false);
-            w.generate_box(0, 6, 2, 0, 6, 4, b, b, false);
-            w.generate_box(0, 5, 2, 0, 5, 4, ns, ns, false);
-            w.generate_box(6, 6, 2, 6, 6, 4, b, b, false);
-            w.generate_box(6, 5, 2, 6, 5, 4, ns, ns, false);
-            for i in 0..=6 {
-                for j in 0..=6 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
-        }
-        FortressKind::StairsRoom => {
-            let b = s.bricks;
-            w.generate_box(0, 0, 0, 6, 1, 6, b, b, false);
-            w.generate_box(0, 2, 0, 6, 10, 6, s.air, s.air, false);
-            w.generate_box(0, 2, 0, 1, 8, 0, b, b, false);
-            w.generate_box(5, 2, 0, 6, 8, 0, b, b, false);
-            w.generate_box(0, 2, 1, 0, 8, 6, b, b, false);
-            w.generate_box(6, 2, 1, 6, 8, 6, b, b, false);
-            w.generate_box(1, 2, 6, 5, 8, 6, b, b, false);
-            let we = s.fence_we;
-            let ns = s.fence_ns;
-            w.generate_box(0, 3, 2, 0, 5, 4, ns, ns, false);
-            w.generate_box(6, 3, 2, 6, 5, 2, ns, ns, false);
-            w.generate_box(6, 3, 4, 6, 5, 4, ns, ns, false);
-            w.place(b, 5, 2, 5);
-            w.generate_box(4, 2, 5, 4, 3, 5, b, b, false);
-            w.generate_box(3, 2, 5, 3, 4, 5, b, b, false);
-            w.generate_box(2, 2, 5, 2, 5, 5, b, b, false);
-            w.generate_box(1, 2, 5, 1, 6, 5, b, b, false);
-            w.generate_box(1, 7, 1, 5, 7, 4, b, b, false);
-            w.generate_box(6, 8, 2, 6, 8, 4, s.air, s.air, false);
-            w.generate_box(2, 6, 0, 4, 8, 0, b, b, false);
-            w.generate_box(2, 5, 0, 4, 5, 0, we, we, false);
-            for i in 0..=6 {
-                for j in 0..=6 {
-                    w.fill_column_down(b, i, -1, j);
-                }
-            }
+        FortressKind::RoomCrossing => fortress_room_crossing(w, s),
+        FortressKind::StairsRoom => fortress_stairs_room(w, s),
+    }
+}
+
+fn fortress_bridge_crossing(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(7, 3, 0, 11, 4, 18, b, b, false);
+    w.generate_box(0, 3, 7, 18, 4, 11, b, b, false);
+    w.generate_box(8, 5, 0, 10, 7, 18, s.air, s.air, false);
+    w.generate_box(0, 5, 8, 18, 7, 10, s.air, s.air, false);
+    w.generate_box(7, 5, 0, 7, 5, 7, b, b, false);
+    w.generate_box(7, 5, 11, 7, 5, 18, b, b, false);
+    w.generate_box(11, 5, 0, 11, 5, 7, b, b, false);
+    w.generate_box(11, 5, 11, 11, 5, 18, b, b, false);
+    w.generate_box(0, 5, 7, 7, 5, 7, b, b, false);
+    w.generate_box(11, 5, 7, 18, 5, 7, b, b, false);
+    w.generate_box(0, 5, 11, 7, 5, 11, b, b, false);
+    w.generate_box(11, 5, 11, 18, 5, 11, b, b, false);
+    w.generate_box(7, 2, 0, 11, 2, 5, b, b, false);
+    w.generate_box(7, 2, 13, 11, 2, 18, b, b, false);
+    w.generate_box(7, 0, 0, 11, 1, 3, b, b, false);
+    w.generate_box(7, 0, 15, 11, 1, 18, b, b, false);
+    fill_down(w, b, 7..=11, 0..=2);
+    fill_down(w, b, 7..=11, 16..=18);
+    w.generate_box(0, 2, 7, 5, 2, 11, b, b, false);
+    w.generate_box(13, 2, 7, 18, 2, 11, b, b, false);
+    w.generate_box(0, 0, 7, 3, 1, 11, b, b, false);
+    w.generate_box(15, 0, 7, 18, 1, 11, b, b, false);
+    fill_down(w, b, 0..=2, 7..=11);
+    fill_down(w, b, 16..=18, 7..=11);
+}
+
+fn fortress_end_filler(w: &mut PieceWorld<'_, '_>, s: &FortressStates, piece: &FortressPiece) {
+    let mut r = Lcg::new(piece.self_seed as u64);
+    let b = s.bricks;
+    for i in 0..=4 {
+        for j in 3..=4 {
+            let d = r.next_bound(8);
+            w.generate_box(i, j, 0, i, j, d, b, b, false);
         }
     }
+    let mut d = r.next_bound(8);
+    w.generate_box(0, 5, 0, 0, 5, d, b, b, false);
+    d = r.next_bound(8);
+    w.generate_box(4, 5, 0, 4, 5, d, b, b, false);
+    for i in 0..=4 {
+        let d = r.next_bound(5);
+        w.generate_box(i, 2, 0, i, 2, d, b, b, false);
+    }
+    for i in 0..=4 {
+        for j in 0..=1 {
+            let d = r.next_bound(3);
+            w.generate_box(i, j, 0, i, j, d, b, b, false);
+        }
+    }
+}
+
+fn fortress_bridge_straight(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(0, 3, 0, 4, 4, 18, b, b, false);
+    w.generate_box(1, 5, 0, 3, 7, 18, s.air, s.air, false);
+    w.generate_box(0, 5, 0, 0, 5, 18, b, b, false);
+    w.generate_box(4, 5, 0, 4, 5, 18, b, b, false);
+    w.generate_box(0, 2, 0, 4, 2, 5, b, b, false);
+    w.generate_box(0, 2, 13, 4, 2, 18, b, b, false);
+    w.generate_box(0, 0, 0, 4, 1, 3, b, b, false);
+    w.generate_box(0, 0, 15, 4, 1, 18, b, b, false);
+    fill_down(w, b, 0..=4, 0..=2);
+    fill_down(w, b, 0..=4, 16..=18);
+    let ns_e = s.fence_ns_e;
+    let ns_w = s.fence_ns_w;
+    w.generate_box(0, 1, 1, 0, 4, 1, ns_e, ns_e, false);
+    w.generate_box(0, 3, 4, 0, 4, 4, ns_e, ns_e, false);
+    w.generate_box(0, 3, 14, 0, 4, 14, ns_e, ns_e, false);
+    w.generate_box(0, 1, 17, 0, 4, 17, ns_e, ns_e, false);
+    w.generate_box(4, 1, 1, 4, 4, 1, ns_w, ns_w, false);
+    w.generate_box(4, 3, 4, 4, 4, 4, ns_w, ns_w, false);
+    w.generate_box(4, 3, 14, 4, 4, 14, ns_w, ns_w, false);
+    w.generate_box(4, 1, 17, 4, 4, 17, ns_w, ns_w, false);
+}
+
+fn fortress_corridor_stairs(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let stair = s.stairs_s;
+    let fence = s.fence_ns;
+    let b = s.bricks;
+    for i in 0..=9 {
+        let lo = (7 - i).max(1);
+        let hi = (lo + 5).max(14 - i).min(13);
+        w.generate_box(0, 0, i, 4, lo, i, b, b, false);
+        w.generate_box(1, lo + 1, i, 3, hi - 1, i, s.air, s.air, false);
+        if i <= 6 {
+            w.place(stair, 1, lo + 1, i);
+            w.place(stair, 2, lo + 1, i);
+            w.place(stair, 3, lo + 1, i);
+        }
+        w.generate_box(0, hi, i, 4, hi, i, b, b, false);
+        w.generate_box(0, lo + 1, i, 0, hi - 1, i, b, b, false);
+        w.generate_box(4, lo + 1, i, 4, hi - 1, i, b, b, false);
+        if i & 1 == 0 {
+            w.generate_box(0, lo + 2, i, 0, lo + 3, i, fence, fence, false);
+            w.generate_box(4, lo + 2, i, 4, lo + 3, i, fence, fence, false);
+        }
+    }
+    fill_down(w, b, 0..=4, 0..=9);
+}
+
+fn fortress_t_balcony(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    let ns = s.fence_ns;
+    let we = s.fence_we;
+    w.generate_box(0, 0, 0, 8, 1, 8, b, b, false);
+    w.generate_box(0, 2, 0, 8, 5, 8, s.air, s.air, false);
+    w.generate_box(0, 6, 0, 8, 6, 5, b, b, false);
+    w.generate_box(0, 2, 0, 2, 5, 0, b, b, false);
+    w.generate_box(6, 2, 0, 8, 5, 0, b, b, false);
+    w.generate_box(1, 3, 0, 1, 4, 0, we, we, false);
+    w.generate_box(7, 3, 0, 7, 4, 0, we, we, false);
+    w.generate_box(0, 2, 4, 8, 2, 8, b, b, false);
+    w.generate_box(1, 1, 4, 2, 2, 4, s.air, s.air, false);
+    w.generate_box(6, 1, 4, 7, 2, 4, s.air, s.air, false);
+    w.generate_box(1, 3, 8, 7, 3, 8, we, we, false);
+    w.place(s.fence_se, 0, 3, 8);
+    w.place(s.fence_sw, 8, 3, 8);
+    w.generate_box(0, 3, 6, 0, 3, 7, ns, ns, false);
+    w.generate_box(8, 3, 6, 8, 3, 7, ns, ns, false);
+    w.generate_box(0, 3, 4, 0, 5, 5, b, b, false);
+    w.generate_box(8, 3, 4, 8, 5, 5, b, b, false);
+    w.generate_box(1, 3, 5, 2, 5, 5, b, b, false);
+    w.generate_box(6, 3, 5, 7, 5, 5, b, b, false);
+    w.generate_box(1, 4, 5, 1, 5, 5, we, we, false);
+    w.generate_box(7, 4, 5, 7, 5, 5, we, we, false);
+    fill_down(w, b, 0..=8, 0..=5);
+}
+
+fn fortress_entrance(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    fortress_hall_top(w, s, true);
+    fortress_hall_base(w, s);
+    w.generate_box(5, 5, 5, 7, 5, 7, b, b, false);
+    w.generate_box(6, 1, 6, 6, 4, 6, s.air, s.air, false);
+    w.place(b, 6, 0, 6);
+    w.place(s.lava, 6, 5, 6);
+}
+
+fn fortress_small_crossing(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    small_corridor_shell(w, s);
+    let b = s.bricks;
+    w.generate_box(0, 2, 0, 0, 5, 0, b, b, false);
+    w.generate_box(4, 2, 0, 4, 5, 0, b, b, false);
+    w.generate_box(0, 2, 4, 0, 5, 4, b, b, false);
+    w.generate_box(4, 2, 4, 4, 5, 4, b, b, false);
+}
+
+fn fortress_left_turn<R: StructureRng + ?Sized>(
+    w: &mut PieceWorld<'_, '_>,
+    s: &FortressStates,
+    piece: &mut FortressPiece,
+    rng: &mut R,
+    clip: Bounds,
+) {
+    small_corridor_shell(w, s);
+    let b = s.bricks;
+    let we = s.fence_we;
+    let ns = s.fence_ns;
+    w.generate_box(4, 2, 0, 4, 5, 4, b, b, false);
+    w.generate_box(4, 3, 1, 4, 4, 1, ns, ns, false);
+    w.generate_box(4, 3, 3, 4, 4, 3, ns, ns, false);
+    w.generate_box(0, 2, 0, 0, 5, 0, b, b, false);
+    w.generate_box(0, 2, 4, 3, 5, 4, b, b, false);
+    w.generate_box(1, 3, 4, 1, 4, 4, we, we, false);
+    w.generate_box(3, 3, 4, 3, 4, 4, we, we, false);
+    corridor_chest(w, piece, rng, clip, 3, 3);
+}
+
+fn fortress_right_turn<R: StructureRng + ?Sized>(
+    w: &mut PieceWorld<'_, '_>,
+    s: &FortressStates,
+    piece: &mut FortressPiece,
+    rng: &mut R,
+    clip: Bounds,
+) {
+    small_corridor_shell(w, s);
+    let b = s.bricks;
+    let we = s.fence_we;
+    let ns = s.fence_ns;
+    w.generate_box(0, 2, 0, 0, 5, 4, b, b, false);
+    w.generate_box(0, 3, 1, 0, 4, 1, ns, ns, false);
+    w.generate_box(0, 3, 3, 0, 4, 3, ns, ns, false);
+    w.generate_box(4, 2, 0, 4, 5, 0, b, b, false);
+    w.generate_box(1, 2, 4, 4, 5, 4, b, b, false);
+    w.generate_box(1, 3, 4, 1, 4, 4, we, we, false);
+    w.generate_box(3, 3, 4, 3, 4, 4, we, we, false);
+    corridor_chest(w, piece, rng, clip, 1, 3);
+}
+
+fn fortress_small_corridor(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    small_corridor_shell(w, s);
+    let b = s.bricks;
+    let ns = s.fence_ns;
+    w.generate_box(0, 2, 0, 0, 5, 4, b, b, false);
+    w.generate_box(4, 2, 0, 4, 5, 4, b, b, false);
+    w.generate_box(0, 3, 1, 0, 4, 1, ns, ns, false);
+    w.generate_box(0, 3, 3, 0, 4, 3, ns, ns, false);
+    w.generate_box(4, 3, 1, 4, 4, 1, ns, ns, false);
+    w.generate_box(4, 3, 3, 4, 4, 3, ns, ns, false);
+}
+
+fn fortress_room_crossing(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(0, 0, 0, 6, 1, 6, b, b, false);
+    w.generate_box(0, 2, 0, 6, 7, 6, s.air, s.air, false);
+    w.generate_box(0, 2, 0, 1, 6, 0, b, b, false);
+    w.generate_box(0, 2, 6, 1, 6, 6, b, b, false);
+    w.generate_box(5, 2, 0, 6, 6, 0, b, b, false);
+    w.generate_box(5, 2, 6, 6, 6, 6, b, b, false);
+    w.generate_box(0, 2, 0, 0, 6, 1, b, b, false);
+    w.generate_box(0, 2, 5, 0, 6, 6, b, b, false);
+    w.generate_box(6, 2, 0, 6, 6, 1, b, b, false);
+    w.generate_box(6, 2, 5, 6, 6, 6, b, b, false);
+    let we = s.fence_we;
+    let ns = s.fence_ns;
+    w.generate_box(2, 6, 0, 4, 6, 0, b, b, false);
+    w.generate_box(2, 5, 0, 4, 5, 0, we, we, false);
+    w.generate_box(2, 6, 6, 4, 6, 6, b, b, false);
+    w.generate_box(2, 5, 6, 4, 5, 6, we, we, false);
+    w.generate_box(0, 6, 2, 0, 6, 4, b, b, false);
+    w.generate_box(0, 5, 2, 0, 5, 4, ns, ns, false);
+    w.generate_box(6, 6, 2, 6, 6, 4, b, b, false);
+    w.generate_box(6, 5, 2, 6, 5, 4, ns, ns, false);
+    fill_down(w, b, 0..=6, 0..=6);
+}
+
+fn fortress_stairs_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    let b = s.bricks;
+    w.generate_box(0, 0, 0, 6, 1, 6, b, b, false);
+    w.generate_box(0, 2, 0, 6, 10, 6, s.air, s.air, false);
+    w.generate_box(0, 2, 0, 1, 8, 0, b, b, false);
+    w.generate_box(5, 2, 0, 6, 8, 0, b, b, false);
+    w.generate_box(0, 2, 1, 0, 8, 6, b, b, false);
+    w.generate_box(6, 2, 1, 6, 8, 6, b, b, false);
+    w.generate_box(1, 2, 6, 5, 8, 6, b, b, false);
+    let we = s.fence_we;
+    let ns = s.fence_ns;
+    w.generate_box(0, 3, 2, 0, 5, 4, ns, ns, false);
+    w.generate_box(6, 3, 2, 6, 5, 2, ns, ns, false);
+    w.generate_box(6, 3, 4, 6, 5, 4, ns, ns, false);
+    w.place(b, 5, 2, 5);
+    w.generate_box(4, 2, 5, 4, 3, 5, b, b, false);
+    w.generate_box(3, 2, 5, 3, 4, 5, b, b, false);
+    w.generate_box(2, 2, 5, 2, 5, 5, b, b, false);
+    w.generate_box(1, 2, 5, 1, 6, 5, b, b, false);
+    w.generate_box(1, 7, 1, 5, 7, 4, b, b, false);
+    w.generate_box(6, 8, 2, 6, 8, 4, s.air, s.air, false);
+    w.generate_box(2, 6, 0, 4, 8, 0, b, b, false);
+    w.generate_box(2, 5, 0, 4, 5, 0, we, we, false);
+    fill_down(w, b, 0..=6, 0..=6);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1489,59 +1531,15 @@ fn fortress_monster_throne(
             ));
         }
     }
-    for i in 0..=6 {
-        for j in 0..=6 {
-            w.fill_column_down(b, i, -1, j);
-        }
-    }
+    fill_down(w, b, 0..=6, 0..=6);
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn fortress_stalk_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
+    fortress_hall_top(w, s, false);
     let b = s.bricks;
-    let we = s.fence_we;
-    let ns = s.fence_ns;
-    let ns_w = s.fence_ns_w;
     let ns_e = s.fence_ns_e;
-    w.generate_box(0, 3, 0, 12, 4, 12, b, b, false);
-    w.generate_box(0, 5, 0, 12, 13, 12, s.air, s.air, false);
-    w.generate_box(0, 5, 0, 1, 12, 12, b, b, false);
-    w.generate_box(11, 5, 0, 12, 12, 12, b, b, false);
-    w.generate_box(2, 5, 11, 4, 12, 12, b, b, false);
-    w.generate_box(8, 5, 11, 10, 12, 12, b, b, false);
-    w.generate_box(5, 9, 11, 7, 12, 12, b, b, false);
-    w.generate_box(2, 5, 0, 4, 12, 1, b, b, false);
-    w.generate_box(8, 5, 0, 10, 12, 1, b, b, false);
-    w.generate_box(5, 9, 0, 7, 12, 1, b, b, false);
-    w.generate_box(2, 11, 2, 10, 12, 10, b, b, false);
-    let mut i = 1;
-    while i <= 11 {
-        w.generate_box(i, 10, 0, i, 11, 0, we, we, false);
-        w.generate_box(i, 10, 12, i, 11, 12, we, we, false);
-        w.generate_box(0, 10, i, 0, 11, i, ns, ns, false);
-        w.generate_box(12, 10, i, 12, 11, i, ns, ns, false);
-        w.place(b, i, 13, 0);
-        w.place(b, i, 13, 12);
-        w.place(b, 0, 13, i);
-        w.place(b, 12, 13, i);
-        if i != 11 {
-            w.place(we, i + 1, 13, 0);
-            w.place(we, i + 1, 13, 12);
-            w.place(ns, 0, 13, i + 1);
-            w.place(ns, 12, 13, i + 1);
-        }
-        i += 2;
-    }
-    w.place(s.fence_ne, 0, 13, 0);
-    w.place(s.fence_se, 0, 13, 12);
-    w.place(s.fence_sw, 12, 13, 12);
-    w.place(s.fence_nw, 12, 13, 0);
-    let mut k = 3;
-    while k <= 9 {
-        w.generate_box(1, 7, k, 1, 8, k, ns_w, ns_w, false);
-        w.generate_box(11, 7, k, 11, 8, k, ns_e, ns_e, false);
-        k += 2;
-    }
+    let ns_w = s.fence_ns_w;
     let stair_n = s.stairs_n;
     for i in 0..=6 {
         let z = i + 4;
@@ -1571,36 +1569,17 @@ fn fortress_stalk_room(w: &mut PieceWorld<'_, '_>, s: &FortressStates) {
     w.generate_box(10, 5, 4, 10, 5, 8, b, b, false);
     let stair_e = s.stairs_e;
     let stair_w = s.stairs_w;
-    w.place(stair_w, 4, 5, 2);
-    w.place(stair_w, 4, 5, 3);
-    w.place(stair_w, 4, 5, 9);
-    w.place(stair_w, 4, 5, 10);
-    w.place(stair_e, 8, 5, 2);
-    w.place(stair_e, 8, 5, 3);
-    w.place(stair_e, 8, 5, 9);
-    w.place(stair_e, 8, 5, 10);
+    for (x, z) in [(4, 2), (4, 3), (4, 9), (4, 10)] {
+        w.place(stair_w, x, 5, z);
+    }
+    for (x, z) in [(8, 2), (8, 3), (8, 9), (8, 10)] {
+        w.place(stair_e, x, 5, z);
+    }
     w.generate_box(3, 4, 4, 4, 4, 8, s.soul_sand, s.soul_sand, false);
     w.generate_box(8, 4, 4, 9, 4, 8, s.soul_sand, s.soul_sand, false);
     w.generate_box(3, 5, 4, 4, 5, 8, s.nether_wart, s.nether_wart, false);
     w.generate_box(8, 5, 4, 9, 5, 8, s.nether_wart, s.nether_wart, false);
-    w.generate_box(4, 2, 0, 8, 2, 12, b, b, false);
-    w.generate_box(0, 2, 4, 12, 2, 8, b, b, false);
-    w.generate_box(4, 0, 0, 8, 1, 3, b, b, false);
-    w.generate_box(4, 0, 9, 8, 1, 12, b, b, false);
-    w.generate_box(0, 0, 4, 3, 1, 8, b, b, false);
-    w.generate_box(9, 0, 4, 12, 1, 8, b, b, false);
-    for i in 4..=8 {
-        for j in 0..=2 {
-            w.fill_column_down(b, i, -1, j);
-            w.fill_column_down(b, i, -1, 12 - j);
-        }
-    }
-    for i in 0..=2 {
-        for j in 4..=8 {
-            w.fill_column_down(b, i, -1, j);
-            w.fill_column_down(b, 12 - i, -1, j);
-        }
-    }
+    fortress_hall_base(w, s);
 }
 
 /// Live container map for the pieces of one structure, keyed by world position.
@@ -2308,6 +2287,76 @@ fn util_shuffle<T, R: StructureRng + ?Sized>(list: &mut [T], rng: &mut R) {
     }
 }
 
+/// Claim the core room's whole east/north/up neighbourhood so the fitters leave the
+/// entrance axis alone.
+#[cfg_attr(not(test), allow(dead_code))]
+fn claim_core_neighborhood(g: &mut MonumentGraph, core_room: u32) {
+    let core_east = g.room(core_room).connections[DIR_EAST].expect("core east");
+    let core_north = g.room(core_room).connections[DIR_NORTH].expect("core north");
+    let core_up = g.room(core_room).connections[DIR_UP].expect("core up");
+    let core_east_north = g.room(core_east).connections[DIR_NORTH].expect("core east/north");
+    let core_east_up = g.room(core_east).connections[DIR_UP].expect("core east/up");
+    let core_north_up = g.room(core_north).connections[DIR_UP].expect("core north/up");
+    let core_east_north_up = g.room(core_east_north).connections[DIR_UP].expect("core east/north/up");
+    for id in [
+        core_east,
+        core_north,
+        core_east_north,
+        core_up,
+        core_east_up,
+        core_north_up,
+        core_east_north_up,
+    ] {
+        g.room_mut(id).claimed = true;
+    }
+}
+
+/// `MonumentBuilding`'s opening pass: for each room, up to five tries at closing two open
+/// connections while both sides can still reach a source room.
+#[cfg_attr(not(test), allow(dead_code))]
+fn monument_opening_thinning<R: StructureRng + ?Sized>(
+    g: &mut MonumentGraph,
+    list: &[u32],
+    rng: &mut R,
+) {
+    let mut n = 1;
+    for &room in list {
+        let mut found = 0;
+        let mut tries = 0;
+        while found < 2 && tries < 5 {
+            tries += 1;
+            let d = rng.next_bound(6) as usize;
+            if !g.room(room).has_opening[d] {
+                continue;
+            }
+            let other = g.room(room).connections[d].expect("open connection");
+            let back = dir_opposite(d);
+            g.room_mut(room).has_opening[d] = false;
+            g.room_mut(other).has_opening[back] = false;
+            // `room.findSource(n++) && other.findSource(n++)`: the first increment always
+            // happens, the second only when the first probe succeeded.
+            let first = {
+                let probe = n;
+                n += 1;
+                g.find_source(room, probe)
+            };
+            let second = if first {
+                let probe = n;
+                n += 1;
+                g.find_source(other, probe)
+            } else {
+                false
+            };
+            if first && second {
+                found += 1;
+            } else {
+                g.room_mut(room).has_opening[d] = true;
+                g.room_mut(other).has_opening[back] = true;
+            }
+        }
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn monument_generate_room_graph<R: StructureRng + ?Sized>(
     rng: &mut R,
@@ -2316,22 +2365,12 @@ fn monument_generate_room_graph<R: StructureRng + ?Sized>(
         rooms: Vec::new(),
         by_index: vec![None; 75],
     };
-    for x in 0..5 {
-        for z in 0..4 {
-            let i = room_index(x, 0, z);
-            g.by_index[i] = Some(g.push(i as i32));
-        }
-    }
-    for x in 0..5 {
-        for z in 0..4 {
-            let i = room_index(x, 1, z);
-            g.by_index[i] = Some(g.push(i as i32));
-        }
-    }
-    for x in 1..4 {
-        for z in 0..2 {
-            let i = room_index(x, 2, z);
-            g.by_index[i] = Some(g.push(i as i32));
+    for &(x0, x1, z0, z1, y) in &[(0, 5, 0, 4, 0), (0, 5, 0, 4, 1), (1, 4, 0, 2, 2)] {
+        for x in x0..x1 {
+            for z in z0..z1 {
+                let i = room_index(x, y, z);
+                g.by_index[i] = Some(g.push(i as i32));
+            }
         }
     }
     let source = g.by_index[room_index(2, 0, 0)].expect("source room");
@@ -2380,24 +2419,7 @@ fn monument_generate_room_graph<R: StructureRng + ?Sized>(
     g.room_mut(core_room).claimed = true;
 
     // The core's neighbourhood is claimed so the fitters leave the entrance axis alone.
-    let core_east = g.room(core_room).connections[DIR_EAST].expect("core east");
-    let core_north = g.room(core_room).connections[DIR_NORTH].expect("core north");
-    let core_up = g.room(core_room).connections[DIR_UP].expect("core up");
-    let core_east_north = g.room(core_east).connections[DIR_NORTH].expect("core east/north");
-    let core_east_up = g.room(core_east).connections[DIR_UP].expect("core east/up");
-    let core_north_up = g.room(core_north).connections[DIR_UP].expect("core north/up");
-    let core_east_north_up = g.room(core_east_north).connections[DIR_UP].expect("core east/north/up");
-    for id in [
-        core_east,
-        core_north,
-        core_east_north,
-        core_up,
-        core_east_up,
-        core_north_up,
-        core_east_north_up,
-    ] {
-        g.room_mut(id).claimed = true;
-    }
+    claim_core_neighborhood(&mut g, core_room);
 
     let mut list: Vec<u32> = Vec::new();
     for slot in 0..75 {
@@ -2409,42 +2431,7 @@ fn monument_generate_room_graph<R: StructureRng + ?Sized>(
     g.update_openings(penthouse_room);
     util_shuffle(&mut list, rng);
 
-    let mut n = 1;
-    for room in list.clone() {
-        let mut found = 0;
-        let mut tries = 0;
-        while found < 2 && tries < 5 {
-            tries += 1;
-            let d = rng.next_bound(6) as usize;
-            if !g.room(room).has_opening[d] {
-                continue;
-            }
-            let other = g.room(room).connections[d].expect("open connection");
-            let back = dir_opposite(d);
-            g.room_mut(room).has_opening[d] = false;
-            g.room_mut(other).has_opening[back] = false;
-            // `room.findSource(n++) && other.findSource(n++)`: the first increment always
-            // happens, the second only when the first probe succeeded.
-            let first = {
-                let probe = n;
-                n += 1;
-                g.find_source(room, probe)
-            };
-            let second = if first {
-                let probe = n;
-                n += 1;
-                g.find_source(other, probe)
-            } else {
-                false
-            };
-            if first && second {
-                found += 1;
-            } else {
-                g.room_mut(room).has_opening[d] = true;
-                g.room_mut(other).has_opening[back] = true;
-            }
-        }
-    }
+    monument_opening_thinning(&mut g, &list, rng);
     list.push(penthouse_room);
     list.push(left_wing);
     list.push(right_wing);
@@ -2512,6 +2499,29 @@ fn monument_fitter_fits(g: &MonumentGraph, f: MonumentFitter, room: u32) -> bool
     }
 }
 
+/// A child piece at depth 1 covering `xs` x `ys` x `zs` room cells from `room_index`.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+fn child_piece(
+    kind: MonumentKind,
+    room_index: i32,
+    dir: Facing,
+    xs: i32,
+    ys: i32,
+    zs: i32,
+    room: u32,
+    design: i32,
+) -> MonumentPiece {
+    MonumentPiece {
+        kind,
+        bounds: monument_piece_box(room_index, dir, xs, ys, zs),
+        orient: dir,
+        depth: 1,
+        room: Some(room),
+        main_design: design,
+    }
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn monument_fitter_create<R: StructureRng + ?Sized>(
     g: &mut MonumentGraph,
@@ -2526,27 +2536,13 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
             let east = g.room(room).connections[DIR_EAST].unwrap();
             g.room_mut(room).claimed = true;
             g.room_mut(east).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::DoubleX,
-                bounds: monument_piece_box(room_index, dir, 2, 1, 1),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: 0,
-            }
+            child_piece(MonumentKind::DoubleX, room_index, dir, 2, 1, 1, room, 0)
         }
         MonumentFitter::DoubleY => {
             let up = g.room(room).connections[DIR_UP].unwrap();
             g.room_mut(room).claimed = true;
             g.room_mut(up).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::DoubleY,
-                bounds: monument_piece_box(room_index, dir, 1, 2, 1),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: 0,
-            }
+            child_piece(MonumentKind::DoubleY, room_index, dir, 1, 2, 1, room, 0)
         }
         MonumentFitter::DoubleZ => {
             let mut target = room;
@@ -2558,14 +2554,16 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
             let north = g.room(target).connections[DIR_NORTH].unwrap();
             g.room_mut(target).claimed = true;
             g.room_mut(north).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::DoubleZ,
-                bounds: monument_piece_box(g.room(target).index, dir, 1, 1, 2),
-                orient: dir,
-                depth: 1,
-                room: Some(target),
-                main_design: 0,
-            }
+            child_piece(
+                MonumentKind::DoubleZ,
+                g.room(target).index,
+                dir,
+                1,
+                1,
+                2,
+                target,
+                0,
+            )
         }
         MonumentFitter::DoubleXY => {
             let east = g.room(room).connections[DIR_EAST].unwrap();
@@ -2575,14 +2573,7 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
             g.room_mut(east).claimed = true;
             g.room_mut(up).claimed = true;
             g.room_mut(east_up).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::DoubleXY,
-                bounds: monument_piece_box(room_index, dir, 2, 2, 1),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: 0,
-            }
+            child_piece(MonumentKind::DoubleXY, room_index, dir, 2, 2, 1, room, 0)
         }
         MonumentFitter::DoubleYZ => {
             let north = g.room(room).connections[DIR_NORTH].unwrap();
@@ -2592,38 +2583,30 @@ fn monument_fitter_create<R: StructureRng + ?Sized>(
             g.room_mut(north).claimed = true;
             g.room_mut(up).claimed = true;
             g.room_mut(north_up).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::DoubleYZ,
-                bounds: monument_piece_box(room_index, dir, 1, 2, 2),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: 0,
-            }
+            child_piece(MonumentKind::DoubleYZ, room_index, dir, 1, 2, 2, room, 0)
         }
         MonumentFitter::SimpleTop => {
             g.room_mut(room).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::SimpleTop,
-                bounds: monument_piece_box(room_index, dir, 1, 1, 1),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: 0,
-            }
+            child_piece(MonumentKind::SimpleTop, room_index, dir, 1, 1, 1, room, 0)
         }
         MonumentFitter::Simple => {
             let design = rng.next_bound(3);
             g.room_mut(room).claimed = true;
-            MonumentPiece {
-                kind: MonumentKind::Simple,
-                bounds: monument_piece_box(room_index, dir, 1, 1, 1),
-                orient: dir,
-                depth: 1,
-                room: Some(room),
-                main_design: design,
-            }
+            child_piece(MonumentKind::Simple, room_index, dir, 1, 1, 1, room, design)
         }
+    }
+}
+
+/// A depth-1 piece with no room: the two wings and the penthouse span fixed world boxes.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fixed_piece(kind: MonumentKind, bounds: Bounds, dir: Facing, design: i32) -> MonumentPiece {
+    MonumentPiece {
+        kind,
+        bounds,
+        orient: dir,
+        depth: 1,
+        room: None,
+        main_design: design,
     }
 }
 
@@ -2647,22 +2630,26 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
     let (mut g, source_room, core_room, order_of_rooms) = monument_generate_room_graph(rng);
 
     let mut pieces: Vec<MonumentPiece> = Vec::new();
-    pieces.push(MonumentPiece {
-        kind: MonumentKind::Entry,
-        bounds: monument_piece_box(g.room(source_room).index, dir, 1, 1, 1),
-        orient: dir,
-        depth: 1,
-        room: Some(source_room),
-        main_design: 0,
-    });
-    pieces.push(MonumentPiece {
-        kind: MonumentKind::Core,
-        bounds: monument_piece_box(g.room(core_room).index, dir, 2, 2, 2),
-        orient: dir,
-        depth: 1,
-        room: Some(core_room),
-        main_design: 0,
-    });
+    pieces.push(child_piece(
+        MonumentKind::Entry,
+        g.room(source_room).index,
+        dir,
+        1,
+        1,
+        1,
+        source_room,
+        0,
+    ));
+    pieces.push(child_piece(
+        MonumentKind::Core,
+        g.room(core_room).index,
+        dir,
+        2,
+        2,
+        2,
+        core_room,
+        0,
+    ));
 
     let order = [
         MonumentFitter::DoubleXY,
@@ -2694,55 +2681,37 @@ pub(crate) fn generate_monument_pieces<R: StructureRng + FullIntRng + ?Sized>(
         fm_bb_move(&mut p.bounds, shift.0, shift.1, shift.2);
     }
 
-    let c1 = world_pos(&building.bounds, Some(dir), (1, 1, 1));
-    let c2 = world_pos(&building.bounds, Some(dir), (23, 8, 21));
-    let c3 = world_pos(&building.bounds, Some(dir), (34, 1, 1));
-    let c4 = world_pos(&building.bounds, Some(dir), (56, 8, 21));
-    let c5 = world_pos(&building.bounds, Some(dir), (22, 13, 22));
-    let c6 = world_pos(&building.bounds, Some(dir), (35, 17, 35));
-    let mut wing_a = [0; 6];
-    let mut wing_b = [0; 6];
-    let mut penthouse = [0; 6];
-    for (i, (a, b)) in [(c1, c2), (c3, c4), (c5, c6)].into_iter().enumerate() {
-        let bb = [
+    let corner = |p: (i32, i32, i32)| world_pos(&building.bounds, Some(dir), p);
+    let span = |a: (i32, i32, i32), b: (i32, i32, i32)| {
+        let (a, b) = (corner(a), corner(b));
+        [
             a.0.min(b.0),
             a.1.min(b.1),
             a.2.min(b.2),
             a.0.max(b.0),
             a.1.max(b.1),
             a.2.max(b.2),
-        ];
-        match i {
-            0 => wing_a = bb,
-            1 => wing_b = bb,
-            _ => penthouse = bb,
-        }
-    }
+        ]
+    };
     let design = rng.next_int();
-    pieces.push(MonumentPiece {
-        kind: MonumentKind::Wing,
-        bounds: wing_a,
-        orient: dir,
-        depth: 1,
-        room: None,
-        main_design: design & 1,
-    });
-    pieces.push(MonumentPiece {
-        kind: MonumentKind::Wing,
-        bounds: wing_b,
-        orient: dir,
-        depth: 1,
-        room: None,
-        main_design: (design & 1) ^ 1,
-    });
-    pieces.push(MonumentPiece {
-        kind: MonumentKind::Penthouse,
-        bounds: penthouse,
-        orient: dir,
-        depth: 1,
-        room: None,
-        main_design: 0,
-    });
+    pieces.push(fixed_piece(
+        MonumentKind::Wing,
+        span((1, 1, 1), (23, 8, 21)),
+        dir,
+        design & 1,
+    ));
+    pieces.push(fixed_piece(
+        MonumentKind::Wing,
+        span((34, 1, 1), (56, 8, 21)),
+        dir,
+        (design & 1) ^ 1,
+    ));
+    pieces.push(fixed_piece(
+        MonumentKind::Penthouse,
+        span((22, 13, 22), (35, 17, 35)),
+        dir,
+        0,
+    ));
 
     let mut all = Vec::with_capacity(pieces.len() + 1);
     all.push(building);
@@ -3387,39 +3356,757 @@ fn monument_post_process_core(w: &mut PieceWorld<'_, '_>, s: &MonumentStates) {
             w.place(m, j, i, 9);
         }
     }
-    for (a, b, c, d, e, f) in [
-        (5, 1, 6, 5, 2, 6),
-        (5, 1, 9, 5, 2, 9),
-        (10, 1, 6, 10, 2, 6),
-        (10, 1, 9, 10, 2, 9),
-        (6, 1, 5, 6, 2, 5),
-        (9, 1, 5, 9, 2, 5),
-        (6, 1, 10, 6, 2, 10),
-        (9, 1, 10, 9, 2, 10),
-        (5, 2, 5, 5, 6, 5),
-        (5, 2, 10, 5, 6, 10),
-        (10, 2, 5, 10, 6, 5),
-        (10, 2, 10, 10, 6, 10),
-        (5, 7, 1, 5, 7, 6),
-        (10, 7, 1, 10, 7, 6),
-        (5, 7, 9, 5, 7, 14),
-        (10, 7, 9, 10, 7, 14),
-        (1, 7, 5, 6, 7, 5),
-        (1, 7, 10, 6, 7, 10),
-        (9, 7, 5, 14, 7, 5),
-        (9, 7, 10, 14, 7, 10),
-        (2, 1, 2, 2, 1, 3),
-        (3, 1, 2, 3, 1, 2),
-        (13, 1, 2, 13, 1, 3),
-        (12, 1, 2, 12, 1, 2),
-        (2, 1, 12, 2, 1, 13),
-        (3, 1, 13, 3, 1, 13),
-        (13, 1, 12, 13, 1, 13),
-        (12, 1, 13, 12, 1, 13),
-    ] {
-        w.generate_box(a, b, c, d, e, f, l, l, false);
+    w.fill_boxes(
+        l,
+        &[
+        [5, 1, 6, 5, 2, 6],
+        [5, 1, 9, 5, 2, 9],
+        [10, 1, 6, 10, 2, 6],
+        [10, 1, 9, 10, 2, 9],
+        [6, 1, 5, 6, 2, 5],
+        [9, 1, 5, 9, 2, 5],
+        [6, 1, 10, 6, 2, 10],
+        [9, 1, 10, 9, 2, 10],
+        [5, 2, 5, 5, 6, 5],
+        [5, 2, 10, 5, 6, 10],
+        [10, 2, 5, 10, 6, 5],
+        [10, 2, 10, 10, 6, 10],
+        [5, 7, 1, 5, 7, 6],
+        [10, 7, 1, 10, 7, 6],
+        [5, 7, 9, 5, 7, 14],
+        [10, 7, 9, 10, 7, 14],
+        [1, 7, 5, 6, 7, 5],
+        [1, 7, 10, 6, 7, 10],
+        [9, 7, 5, 14, 7, 5],
+        [9, 7, 10, 14, 7, 10],
+        [2, 1, 2, 2, 1, 3],
+        [3, 1, 2, 3, 1, 2],
+        [13, 1, 2, 13, 1, 3],
+        [12, 1, 2, 12, 1, 2],
+        [2, 1, 12, 2, 1, 13],
+        [3, 1, 13, 3, 1, 13],
+        [13, 1, 12, 13, 1, 13],
+        [12, 1, 13, 12, 1, 13],
+        ],
+    );
+}
+
+/// The connected room on side `d` of `room`; the pieces assume every queried link exists.
+fn room_conn(rooms: &[RoomDefinition], room: &RoomDefinition, d: usize) -> RoomDefinition {
+    rooms[room.connections[d].expect("room connection") as usize].clone()
+}
+
+/// `if hasOpening[d] { generateWaterBox(...) }`, the shape every room piece repeats per side.
+fn water_opening(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    sea_level: i32,
+    open: bool,
+    b: [i32; 6],
+) {
+    if open {
+        w.generate_water_box(s, b[0], b[1], b[2], b[3], b[4], b[5], sea_level);
     }
 }
+
+/// `generateDefaultFloor`, only for rooms above the ground floor (`room.index / 25 > 0`).
+fn floor_above(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room_index: i32,
+    x0: i32,
+    z0: i32,
+    open: bool,
+) {
+    if room_index / 25 > 0 {
+        w.generate_default_floor(s, x0, z0, open);
+    }
+}
+
+/// `generateBoxOnFillOnly` ceiling slab, only when `link` (a room's upward connection) is absent.
+fn ceiling_fill(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    link: Option<u32>,
+    b: [i32; 6],
+) {
+    if link.is_none() {
+        w.generate_box_on_fill(s, b[0], b[1], b[2], b[3], b[4], b[5], s.gray);
+    }
+}
+
+fn monument_double_x(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    rooms: &[RoomDefinition],
+    sea_level: i32,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let m = s.lamp;
+    let east = room_conn(rooms, room, DIR_EAST);
+    floor_above(w, s, room.index, 8, 0, east.has_opening[DIR_DOWN]);
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, room.connections[DIR_UP], [1, 4, 1, 7, 4, 6]);
+    ceiling_fill(w, s, east.connections[DIR_UP], [8, 4, 1, 14, 4, 6]);
+    w.generate_box(0, 3, 0, 0, 3, 7, l, l, false);
+    w.generate_box(15, 3, 0, 15, 3, 7, l, l, false);
+    w.generate_box(1, 3, 0, 15, 3, 0, l, l, false);
+    w.generate_box(1, 3, 7, 14, 3, 7, l, l, false);
+    w.generate_box(0, 2, 0, 0, 2, 7, g, g, false);
+    w.generate_box(15, 2, 0, 15, 2, 7, g, g, false);
+    w.generate_box(1, 2, 0, 15, 2, 0, g, g, false);
+    w.generate_box(1, 2, 7, 14, 2, 7, g, g, false);
+    w.generate_box(0, 1, 0, 0, 1, 7, l, l, false);
+    w.generate_box(15, 1, 0, 15, 1, 7, l, l, false);
+    w.generate_box(1, 1, 0, 15, 1, 0, l, l, false);
+    w.generate_box(1, 1, 7, 14, 1, 7, l, l, false);
+    w.generate_box(5, 1, 0, 10, 1, 4, l, l, false);
+    w.generate_box(6, 2, 0, 9, 2, 3, g, g, false);
+    w.generate_box(5, 3, 0, 10, 3, 4, l, l, false);
+    w.place(m, 6, 2, 3);
+    w.place(m, 9, 2, 3);
+    water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_NORTH], [3, 1, 7, 4, 2, 7]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 0, 2, 4]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_SOUTH], [11, 1, 0, 12, 2, 0]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_NORTH], [11, 1, 7, 12, 2, 7]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_EAST], [15, 1, 3, 15, 2, 4]);
+}
+
+fn monument_double_xy(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    rooms: &[RoomDefinition],
+    sea_level: i32,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let m = s.lamp;
+    let east = room_conn(rooms, room, DIR_EAST);
+    let up = room_conn(rooms, room, DIR_UP);
+    let east_up = room_conn(rooms, &east, DIR_UP);
+    floor_above(w, s, room.index, 8, 0, east.has_opening[DIR_DOWN]);
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, up.connections[DIR_UP], [1, 8, 1, 7, 8, 6]);
+    ceiling_fill(w, s, east_up.connections[DIR_UP], [8, 8, 1, 14, 8, 6]);
+    for i in 1..=7 {
+        let bs = if i == 2 || i == 6 { g } else { l };
+        w.generate_box(0, i, 0, 0, i, 7, bs, bs, false);
+        w.generate_box(15, i, 0, 15, i, 7, bs, bs, false);
+        w.generate_box(1, i, 0, 15, i, 0, bs, bs, false);
+        w.generate_box(1, i, 7, 14, i, 7, bs, bs, false);
+    }
+    w.fill_boxes(
+        l,
+        &[
+            [2, 1, 3, 2, 7, 4],
+            [3, 1, 2, 4, 7, 2],
+            [3, 1, 5, 4, 7, 5],
+            [13, 1, 3, 13, 7, 4],
+            [11, 1, 2, 12, 7, 2],
+            [11, 1, 5, 12, 7, 5],
+            [5, 1, 3, 5, 3, 4],
+            [10, 1, 3, 10, 3, 4],
+            [5, 7, 2, 10, 7, 5],
+            [5, 5, 2, 5, 7, 2],
+            [10, 5, 2, 10, 7, 2],
+            [5, 5, 5, 5, 7, 5],
+            [10, 5, 5, 10, 7, 5],
+        ],
+    );
+    w.place(l, 6, 6, 2);
+    w.place(l, 9, 6, 2);
+    w.place(l, 6, 6, 5);
+    w.place(l, 9, 6, 5);
+    w.generate_box(5, 4, 3, 6, 4, 4, l, l, false);
+    w.generate_box(9, 4, 3, 10, 4, 4, l, l, false);
+    w.place(m, 5, 4, 2);
+    w.place(m, 5, 4, 5);
+    w.place(m, 10, 4, 2);
+    w.place(m, 10, 4, 5);
+    // The lower half's four openings, then the upper half's, each side in the order
+    // the piece declares them.
+    water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_NORTH], [3, 1, 7, 4, 2, 7]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 0, 2, 4]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_SOUTH], [11, 1, 0, 12, 2, 0]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_NORTH], [11, 1, 7, 12, 2, 7]);
+    water_opening(w, s, sea_level, east.has_opening[DIR_EAST], [15, 1, 3, 15, 2, 4]);
+    water_opening(w, s, sea_level, up.has_opening[DIR_SOUTH], [3, 5, 0, 4, 6, 0]);
+    water_opening(w, s, sea_level, up.has_opening[DIR_NORTH], [3, 5, 7, 4, 6, 7]);
+    water_opening(w, s, sea_level, up.has_opening[DIR_WEST], [0, 5, 3, 0, 6, 4]);
+    water_opening(w, s, sea_level, east_up.has_opening[DIR_SOUTH], [11, 5, 0, 12, 6, 0]);
+    water_opening(w, s, sea_level, east_up.has_opening[DIR_NORTH], [11, 5, 7, 12, 6, 7]);
+    water_opening(w, s, sea_level, east_up.has_opening[DIR_EAST], [15, 5, 3, 15, 6, 4]);
+}
+
+fn monument_double_y(w: &mut PieceWorld<'_, '_>, s: &MonumentStates, room: &RoomDefinition, rooms: &[RoomDefinition]) {
+    let g = s.gray;
+    let l = s.light;
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    let up = room_conn(rooms, room, DIR_UP);
+    ceiling_fill(w, s, up.connections[DIR_UP], [1, 8, 1, 6, 8, 6]);
+    w.fill_boxes(
+        l,
+        &[
+            [0, 4, 0, 0, 4, 7],
+            [7, 4, 0, 7, 4, 7],
+            [1, 4, 0, 6, 4, 0],
+            [1, 4, 7, 6, 4, 7],
+            [2, 4, 1, 2, 4, 2],
+            [1, 4, 2, 1, 4, 2],
+            [5, 4, 1, 5, 4, 2],
+            [6, 4, 2, 6, 4, 2],
+            [2, 4, 5, 2, 4, 6],
+            [1, 4, 5, 1, 4, 5],
+            [5, 4, 5, 5, 4, 6],
+            [6, 4, 5, 6, 4, 5],
+        ],
+    );
+    let mut cur = (*room).clone();
+    for i in [1, 5] {
+        let z = 0;
+        if cur.has_opening[DIR_SOUTH] {
+            w.generate_box(2, i, z, 2, i + 2, z, l, l, false);
+            w.generate_box(5, i, z, 5, i + 2, z, l, l, false);
+            w.generate_box(3, i + 2, z, 4, i + 2, z, l, l, false);
+        } else {
+            w.generate_box(0, i, z, 7, i + 2, z, l, l, false);
+            w.generate_box(0, i + 1, z, 7, i + 1, z, g, g, false);
+        }
+        let zz = 7;
+        if cur.has_opening[DIR_NORTH] {
+            w.generate_box(2, i, zz, 2, i + 2, zz, l, l, false);
+            w.generate_box(5, i, zz, 5, i + 2, zz, l, l, false);
+            w.generate_box(3, i + 2, zz, 4, i + 2, zz, l, l, false);
+        } else {
+            w.generate_box(0, i, zz, 7, i + 2, zz, l, l, false);
+            w.generate_box(0, i + 1, zz, 7, i + 1, zz, g, g, false);
+        }
+        let x = 0;
+        if cur.has_opening[DIR_WEST] {
+            w.generate_box(x, i, 2, x, i + 2, 2, l, l, false);
+            w.generate_box(x, i, 5, x, i + 2, 5, l, l, false);
+            w.generate_box(x, i + 2, 3, x, i + 2, 4, l, l, false);
+        } else {
+            w.generate_box(x, i, 0, x, i + 2, 7, l, l, false);
+            w.generate_box(x, i + 1, 0, x, i + 1, 7, g, g, false);
+        }
+        let xx = 7;
+        if cur.has_opening[DIR_EAST] {
+            w.generate_box(xx, i, 2, xx, i + 2, 2, l, l, false);
+            w.generate_box(xx, i, 5, xx, i + 2, 5, l, l, false);
+            w.generate_box(xx, i + 2, 3, xx, i + 2, 4, l, l, false);
+        } else {
+            w.generate_box(xx, i, 0, xx, i + 2, 7, l, l, false);
+            w.generate_box(xx, i + 1, 0, xx, i + 1, 7, g, g, false);
+        }
+        cur = up.clone();
+    }
+}
+
+fn monument_double_yz(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    rooms: &[RoomDefinition],
+    sea_level: i32,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let k = s.black;
+    let m = s.lamp;
+    let north = room_conn(rooms, room, DIR_NORTH);
+    let up_north = room_conn(rooms, &north, DIR_UP);
+    let up = room_conn(rooms, room, DIR_UP);
+    floor_above(w, s, room.index, 0, 8, north.has_opening[DIR_DOWN]);
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, up.connections[DIR_UP], [1, 8, 1, 6, 8, 7]);
+    ceiling_fill(w, s, up_north.connections[DIR_UP], [1, 8, 8, 6, 8, 14]);
+    for i in 1..=7 {
+        let bs = if i == 2 || i == 6 { g } else { l };
+        w.generate_box(0, i, 0, 0, i, 15, bs, bs, false);
+        w.generate_box(7, i, 0, 7, i, 15, bs, bs, false);
+        w.generate_box(1, i, 0, 6, i, 0, bs, bs, false);
+        w.generate_box(1, i, 15, 6, i, 15, bs, bs, false);
+    }
+    for i in 1..=7 {
+        let bs = if i == 2 || i == 6 { m } else { k };
+        w.generate_box(3, i, 7, 4, i, 8, bs, bs, false);
+    }
+    water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_EAST], [7, 1, 3, 7, 2, 4]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 0, 2, 4]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_NORTH], [3, 1, 15, 4, 2, 15]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_WEST], [0, 1, 11, 0, 2, 12]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_EAST], [7, 1, 11, 7, 2, 12]);
+    water_opening(w, s, sea_level, up.has_opening[DIR_SOUTH], [3, 5, 0, 4, 6, 0]);
+    if up.has_opening[DIR_EAST] {
+        w.generate_water_box(s, 7, 5, 3, 7, 6, 4, sea_level);
+        w.generate_box(5, 4, 2, 6, 4, 5, l, l, false);
+        w.generate_box(6, 1, 2, 6, 3, 2, l, l, false);
+        w.generate_box(6, 1, 5, 6, 3, 5, l, l, false);
+    }
+    water_opening(w, s, sea_level, up.has_opening[DIR_WEST], [0, 5, 3, 0, 6, 4]);
+    if up.has_opening[DIR_WEST] {
+        w.generate_box(1, 4, 2, 2, 4, 5, l, l, false);
+        w.generate_box(1, 1, 2, 1, 3, 2, l, l, false);
+        w.generate_box(1, 1, 5, 1, 3, 5, l, l, false);
+    }
+    water_opening(w, s, sea_level, up_north.has_opening[DIR_NORTH], [3, 5, 15, 4, 6, 15]);
+    if up_north.has_opening[DIR_WEST] {
+        w.generate_water_box(s, 0, 5, 11, 0, 6, 12, sea_level);
+        w.generate_box(1, 4, 10, 2, 4, 13, l, l, false);
+        w.generate_box(1, 1, 10, 1, 3, 10, l, l, false);
+        w.generate_box(1, 1, 13, 1, 3, 13, l, l, false);
+    }
+    if up_north.has_opening[DIR_EAST] {
+        w.generate_water_box(s, 7, 5, 11, 7, 6, 12, sea_level);
+        w.generate_box(5, 4, 10, 6, 4, 13, l, l, false);
+        w.generate_box(6, 1, 10, 6, 3, 10, l, l, false);
+        w.generate_box(6, 1, 13, 6, 3, 13, l, l, false);
+    }
+}
+
+fn monument_double_z(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    rooms: &[RoomDefinition],
+    sea_level: i32,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let m = s.lamp;
+    let north = room_conn(rooms, room, DIR_NORTH);
+    floor_above(w, s, room.index, 0, 8, north.has_opening[DIR_DOWN]);
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, room.connections[DIR_UP], [1, 4, 1, 6, 4, 7]);
+    ceiling_fill(w, s, north.connections[DIR_UP], [1, 4, 8, 6, 4, 14]);
+    w.fill_boxes_st(&[
+        ([0, 3, 0, 0, 3, 15], l),
+        ([7, 3, 0, 7, 3, 15], l),
+        ([1, 3, 0, 7, 3, 0], l),
+        ([1, 3, 15, 6, 3, 15], l),
+        ([0, 2, 0, 0, 2, 15], g),
+        ([7, 2, 0, 7, 2, 15], g),
+        ([1, 2, 0, 7, 2, 0], g),
+        ([1, 2, 15, 6, 2, 15], g),
+        ([0, 1, 0, 0, 1, 15], l),
+        ([7, 1, 0, 7, 1, 15], l),
+        ([1, 1, 0, 7, 1, 0], l),
+        ([1, 1, 15, 6, 1, 15], l),
+        ([1, 1, 1, 1, 1, 2], l),
+        ([6, 1, 1, 6, 1, 2], l),
+        ([1, 3, 1, 1, 3, 2], l),
+        ([6, 3, 1, 6, 3, 2], l),
+        ([1, 1, 13, 1, 1, 14], l),
+        ([6, 1, 13, 6, 1, 14], l),
+        ([1, 3, 13, 1, 3, 14], l),
+        ([6, 3, 13, 6, 3, 14], l),
+        ([2, 1, 6, 2, 3, 6], l),
+        ([5, 1, 6, 5, 3, 6], l),
+        ([2, 1, 9, 2, 3, 9], l),
+        ([5, 1, 9, 5, 3, 9], l),
+        ([3, 2, 6, 4, 2, 6], l),
+        ([3, 2, 9, 4, 2, 9], l),
+        ([2, 2, 7, 2, 2, 8], l),
+        ([5, 2, 7, 5, 2, 8], l),
+    ]);
+    w.place(m, 2, 2, 5);
+    w.place(m, 5, 2, 5);
+    w.place(m, 2, 2, 10);
+    w.place(m, 5, 2, 10);
+    w.place(l, 2, 3, 5);
+    w.place(l, 5, 3, 5);
+    w.place(l, 2, 3, 10);
+    w.place(l, 5, 3, 10);
+    water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_EAST], [7, 1, 3, 7, 2, 4]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 0, 2, 4]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_NORTH], [3, 1, 15, 4, 2, 15]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_WEST], [0, 1, 11, 0, 2, 12]);
+    water_opening(w, s, sea_level, north.has_opening[DIR_EAST], [7, 1, 11, 7, 2, 12]);
+}
+
+fn monument_entry(w: &mut PieceWorld<'_, '_>, s: &MonumentStates, room: &RoomDefinition, sea_level: i32) {
+    let l = s.light;
+    w.fill_boxes(
+        l,
+        &[
+            [0, 3, 0, 2, 3, 7],
+            [5, 3, 0, 7, 3, 7],
+            [0, 2, 0, 1, 2, 7],
+            [6, 2, 0, 7, 2, 7],
+            [0, 1, 0, 0, 1, 7],
+            [7, 1, 0, 7, 1, 7],
+            [0, 1, 7, 7, 3, 7],
+            [1, 1, 0, 2, 3, 0],
+            [5, 1, 0, 6, 3, 0],
+        ],
+    );
+    water_opening(w, s, sea_level, room.has_opening[DIR_NORTH], [3, 1, 7, 4, 2, 7]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 1, 2, 4]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_EAST], [6, 1, 3, 7, 2, 4]);
+}
+
+fn monument_penthouse(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    clip: Bounds,
+    sea_level: i32,
+    elders: &mut Vec<((i32, i32, i32), &'static str)>,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let k = s.black;
+    let m = s.lamp;
+    w.fill_boxes_st(&[
+        ([2, -1, 2, 11, -1, 11], l),
+        ([0, -1, 0, 1, -1, 11], g),
+        ([12, -1, 0, 13, -1, 11], g),
+        ([2, -1, 0, 11, -1, 1], g),
+        ([2, -1, 12, 11, -1, 13], g),
+        ([0, 0, 0, 0, 0, 13], l),
+        ([13, 0, 0, 13, 0, 13], l),
+        ([1, 0, 0, 12, 0, 0], l),
+        ([1, 0, 13, 12, 0, 13], l),
+    ]);
+    let mut z = 2;
+    while z <= 11 {
+        w.place(m, 0, 0, z);
+        w.place(m, 13, 0, z);
+        w.place(m, z, 0, 0);
+        z += 3;
+    }
+    w.fill_boxes_st(&[
+        ([2, 0, 3, 4, 0, 9], l),
+        ([9, 0, 3, 11, 0, 9], l),
+        ([4, 0, 9, 9, 0, 11], l),
+        ([3, 0, 3, 3, 0, 7], k),
+        ([10, 0, 3, 10, 0, 7], k),
+        ([6, 0, 10, 7, 0, 10], k),
+    ]);
+    w.place(l, 5, 0, 8);
+    w.place(l, 8, 0, 8);
+    w.place(l, 10, 0, 10);
+    w.place(l, 3, 0, 10);
+    for x in [3, 10] {
+        let mut zz = 2;
+        while zz <= 8 {
+            w.generate_box(x, 0, zz, x, 2, zz, l, l, false);
+            zz += 3;
+        }
+    }
+    w.generate_box(5, 0, 10, 5, 2, 10, l, l, false);
+    w.generate_box(8, 0, 10, 8, 2, 10, l, l, false);
+    w.generate_box(6, -1, 7, 7, -1, 8, k, k, false);
+    w.generate_water_box(s, 6, -1, 3, 7, -1, 4, sea_level);
+    monument_spawn_elder(w, clip, 6, 1, 6, elders);
+}
+
+fn monument_simple(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    rng: &mut dyn MonumentRng,
+    sea_level: i32,
+    design: i32,
+) {
+    let g = s.gray;
+    let l = s.light;
+    let k = s.black;
+    let m = s.lamp;
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, room.connections[DIR_UP], [1, 4, 1, 6, 4, 6]);
+    // `boolean` short-circuit: `nextBoolean` is drawn only for a non-zero design.
+    let mut decorated = false;
+    if design != 0 {
+        decorated = rng.next_bool()
+            && !room.has_opening[DIR_DOWN]
+            && !room.has_opening[DIR_UP]
+            && room.has_opening.iter().filter(|v| **v).count() > 1;
+    }
+    match design {
+        0 => {
+            w.fill_boxes_st(&[
+                ([0, 1, 0, 2, 1, 2], l),
+                ([0, 3, 0, 2, 3, 2], l),
+                ([0, 2, 0, 0, 2, 2], g),
+                ([1, 2, 0, 2, 2, 0], g),
+                ([5, 1, 0, 7, 1, 2], l),
+                ([5, 3, 0, 7, 3, 2], l),
+                ([7, 2, 0, 7, 2, 2], g),
+                ([5, 2, 0, 6, 2, 0], g),
+                ([0, 1, 5, 2, 1, 7], l),
+                ([0, 3, 5, 2, 3, 7], l),
+                ([0, 2, 5, 0, 2, 7], g),
+                ([1, 2, 7, 2, 2, 7], g),
+                ([5, 1, 5, 7, 1, 7], l),
+                ([5, 3, 5, 7, 3, 7], l),
+                ([7, 2, 5, 7, 2, 7], g),
+                ([5, 2, 7, 6, 2, 7], g),
+            ]);
+            w.place(m, 1, 2, 1);
+            w.place(m, 6, 2, 1);
+            w.place(m, 1, 2, 6);
+            w.place(m, 6, 2, 6);
+            if room.has_opening[DIR_SOUTH] {
+                w.generate_box(3, 3, 0, 4, 3, 0, l, l, false);
+            } else {
+                w.generate_box(3, 3, 0, 4, 3, 1, l, l, false);
+                w.generate_box(3, 2, 0, 4, 2, 0, g, g, false);
+                w.generate_box(3, 1, 0, 4, 1, 1, l, l, false);
+            }
+            if room.has_opening[DIR_NORTH] {
+                w.generate_box(3, 3, 7, 4, 3, 7, l, l, false);
+            } else {
+                w.generate_box(3, 3, 6, 4, 3, 7, l, l, false);
+                w.generate_box(3, 2, 7, 4, 2, 7, g, g, false);
+                w.generate_box(3, 1, 6, 4, 1, 7, l, l, false);
+            }
+            if room.has_opening[DIR_WEST] {
+                w.generate_box(0, 3, 3, 0, 3, 4, l, l, false);
+            } else {
+                w.generate_box(0, 3, 3, 1, 3, 4, l, l, false);
+                w.generate_box(0, 2, 3, 0, 2, 4, g, g, false);
+                w.generate_box(0, 1, 3, 1, 1, 4, l, l, false);
+            }
+            if room.has_opening[DIR_EAST] {
+                w.generate_box(7, 3, 3, 7, 3, 4, l, l, false);
+            } else {
+                w.generate_box(6, 3, 3, 7, 3, 4, l, l, false);
+                w.generate_box(7, 2, 3, 7, 2, 4, g, g, false);
+                w.generate_box(6, 1, 3, 7, 1, 4, l, l, false);
+            }
+        }
+        1 => {
+            w.fill_boxes(
+                l,
+                &[
+                    [2, 1, 2, 2, 3, 2],
+                    [2, 1, 5, 2, 3, 5],
+                    [5, 1, 5, 5, 3, 5],
+                    [5, 1, 2, 5, 3, 2],
+                    [0, 1, 0, 1, 3, 0],
+                    [0, 1, 1, 0, 3, 1],
+                    [0, 1, 7, 1, 3, 7],
+                    [0, 1, 6, 0, 3, 6],
+                    [6, 1, 7, 7, 3, 7],
+                    [7, 1, 6, 7, 3, 6],
+                    [6, 1, 0, 7, 3, 0],
+                    [7, 1, 1, 7, 3, 1],
+                ],
+            );
+            w.place(m, 2, 2, 2);
+            w.place(m, 2, 2, 5);
+            w.place(m, 5, 2, 5);
+            w.place(m, 5, 2, 2);
+            for (a, b, c) in [
+                (1, 2, 0),
+                (0, 2, 1),
+                (1, 2, 7),
+                (0, 2, 6),
+                (6, 2, 7),
+                (7, 2, 6),
+                (6, 2, 0),
+                (7, 2, 1),
+            ] {
+                w.place(g, a, b, c);
+            }
+            if !room.has_opening[DIR_SOUTH] {
+                w.generate_box(1, 3, 0, 6, 3, 0, l, l, false);
+                w.generate_box(1, 2, 0, 6, 2, 0, g, g, false);
+                w.generate_box(1, 1, 0, 6, 1, 0, l, l, false);
+            }
+            if !room.has_opening[DIR_NORTH] {
+                w.generate_box(1, 3, 7, 6, 3, 7, l, l, false);
+                w.generate_box(1, 2, 7, 6, 2, 7, g, g, false);
+                w.generate_box(1, 1, 7, 6, 1, 7, l, l, false);
+            }
+            if !room.has_opening[DIR_WEST] {
+                w.generate_box(0, 3, 1, 0, 3, 6, l, l, false);
+                w.generate_box(0, 2, 1, 0, 2, 6, g, g, false);
+                w.generate_box(0, 1, 1, 0, 1, 6, l, l, false);
+            }
+            if !room.has_opening[DIR_EAST] {
+                w.generate_box(7, 3, 1, 7, 3, 6, l, l, false);
+                w.generate_box(7, 2, 1, 7, 2, 6, g, g, false);
+                w.generate_box(7, 1, 1, 7, 1, 6, l, l, false);
+            }
+        }
+        _ => {
+            w.fill_boxes_st(&[
+                ([0, 1, 0, 0, 1, 7], l),
+                ([7, 1, 0, 7, 1, 7], l),
+                ([1, 1, 0, 6, 1, 0], l),
+                ([1, 1, 7, 6, 1, 7], l),
+                ([0, 2, 0, 0, 2, 7], k),
+                ([7, 2, 0, 7, 2, 7], k),
+                ([1, 2, 0, 6, 2, 0], k),
+                ([1, 2, 7, 6, 2, 7], k),
+                ([0, 3, 0, 0, 3, 7], l),
+                ([7, 3, 0, 7, 3, 7], l),
+                ([1, 3, 0, 6, 3, 0], l),
+                ([1, 3, 7, 6, 3, 7], l),
+                ([0, 1, 3, 0, 2, 4], k),
+                ([7, 1, 3, 7, 2, 4], k),
+                ([3, 1, 0, 4, 2, 0], k),
+                ([3, 1, 7, 4, 2, 7], k),
+            ]);
+            water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+            water_opening(w, s, sea_level, room.has_opening[DIR_NORTH], [3, 1, 7, 4, 2, 7]);
+            water_opening(w, s, sea_level, room.has_opening[DIR_WEST], [0, 1, 3, 0, 2, 4]);
+            water_opening(w, s, sea_level, room.has_opening[DIR_EAST], [7, 1, 3, 7, 2, 4]);
+        }
+    }
+    if decorated {
+        w.generate_box(3, 1, 3, 4, 1, 4, l, l, false);
+        w.generate_box(3, 2, 3, 4, 2, 4, g, g, false);
+        w.generate_box(3, 3, 3, 4, 3, 4, l, l, false);
+    }
+}
+
+fn monument_simple_top(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    room: &RoomDefinition,
+    sea_level: i32,
+    rng: &mut dyn MonumentRng,
+) {
+    let l = s.light;
+    let k = s.black;
+    floor_above(w, s, room.index, 0, 0, room.has_opening[DIR_DOWN]);
+    ceiling_fill(w, s, room.connections[DIR_UP], [1, 4, 1, 6, 4, 6]);
+    for x in 1..=6 {
+        for z in 1..=6 {
+            if rng.next_bound(3) != 0 {
+                let y = 2 + i32::from(rng.next_bound(4) != 0);
+                w.generate_box(x, y, z, x, 3, z, s.sponge, s.sponge, false);
+            }
+        }
+    }
+    w.fill_boxes_st(&[
+        ([0, 1, 0, 0, 1, 7], l),
+        ([7, 1, 0, 7, 1, 7], l),
+        ([1, 1, 0, 6, 1, 0], l),
+        ([1, 1, 7, 6, 1, 7], l),
+        ([0, 2, 0, 0, 2, 7], k),
+        ([7, 2, 0, 7, 2, 7], k),
+        ([1, 2, 0, 6, 2, 0], k),
+        ([1, 2, 7, 6, 2, 7], k),
+        ([0, 3, 0, 0, 3, 7], l),
+        ([7, 3, 0, 7, 3, 7], l),
+        ([1, 3, 0, 6, 3, 0], l),
+        ([1, 3, 7, 6, 3, 7], l),
+        ([0, 1, 3, 0, 2, 4], k),
+        ([7, 1, 3, 7, 2, 4], k),
+        ([3, 1, 0, 4, 2, 0], k),
+        ([3, 1, 7, 4, 2, 7], k),
+    ]);
+    water_opening(w, s, sea_level, room.has_opening[DIR_SOUTH], [3, 1, 0, 4, 2, 0]);
+}
+
+fn monument_wing(
+    w: &mut PieceWorld<'_, '_>,
+    s: &MonumentStates,
+    clip: Bounds,
+    design: i32,
+    elders: &mut Vec<((i32, i32, i32), &'static str)>,
+) {
+    let l = s.light;
+    let k = s.black;
+    let m = s.lamp;
+    if design == 0 {
+        for k in 0..4 {
+            w.generate_box(10 - k, 3 - k, 20 - k, 12 + k, 3 - k, 20, l, l, false);
+        }
+        w.fill_boxes_st(&[
+            ([7, 0, 6, 15, 0, 16], l),
+            ([6, 0, 6, 6, 3, 20], l),
+            ([16, 0, 6, 16, 3, 20], l),
+            ([7, 1, 7, 7, 1, 20], l),
+            ([15, 1, 7, 15, 1, 20], l),
+            ([7, 1, 6, 9, 3, 6], l),
+            ([13, 1, 6, 15, 3, 6], l),
+            ([8, 1, 7, 9, 1, 7], l),
+            ([13, 1, 7, 14, 1, 7], l),
+            ([9, 0, 5, 13, 0, 5], l),
+            ([10, 0, 7, 12, 0, 7], k),
+            ([8, 0, 10, 8, 0, 12], k),
+            ([14, 0, 10, 14, 0, 12], k),
+            ([6, 0, 21, 7, 4, 21], l),
+            ([15, 0, 21, 16, 4, 21], l),
+        ]);
+        let mut z = 18;
+        while z >= 7 {
+            w.place(m, 6, 3, z);
+            w.place(m, 16, 3, z);
+            z -= 3;
+        }
+        for (x, y, z) in [
+            (10, 0, 10),
+            (12, 0, 10),
+            (10, 0, 12),
+            (12, 0, 12),
+            (8, 3, 6),
+            (14, 3, 6),
+        ] {
+            w.place(m, x, y, z);
+        }
+        for (x, y, z, st) in [
+            (4, 2, 4, l),
+            (4, 1, 4, m),
+            (4, 0, 4, l),
+            (18, 2, 4, l),
+            (18, 1, 4, m),
+            (18, 0, 4, l),
+            (4, 2, 18, l),
+            (4, 1, 18, m),
+            (4, 0, 18, l),
+            (18, 2, 18, l),
+            (18, 1, 18, m),
+            (18, 0, 18, l),
+            (9, 7, 20, l),
+            (13, 7, 20, l),
+        ] {
+            w.place(st, x, y, z);
+        }
+        monument_spawn_elder(w, clip, 11, 2, 16, elders);
+    } else {
+        w.fill_boxes_st(&[
+            ([9, 3, 18, 13, 3, 20], l),
+            ([9, 0, 18, 9, 2, 18], l),
+            ([13, 0, 18, 13, 2, 18], l),
+            ([7, 3, 7, 15, 3, 14], l),
+        ]);
+        for x in [9, 13] {
+            w.place(l, x, 6, 20);
+            w.place(m, x, 5, 20);
+            w.place(l, x, 4, 20);
+        }
+        for x in [10, 12] {
+            w.generate_box(x, 0, 10, x, 6, 10, l, l, false);
+            w.generate_box(x, 0, 12, x, 6, 12, l, l, false);
+            w.place(m, x, 0, 10);
+            w.place(m, x, 0, 12);
+            w.place(m, x, 4, 10);
+            w.place(m, x, 4, 12);
+        }
+        for x in [8, 14] {
+            w.generate_box(x, 0, 7, x, 2, 7, l, l, false);
+            w.generate_box(x, 0, 14, x, 2, 14, l, l, false);
+        }
+        w.generate_box(8, 3, 8, 8, 3, 13, k, k, false);
+        w.generate_box(14, 3, 8, 14, 3, 13, k, k, false);
+        monument_spawn_elder(w, clip, 11, 5, 13, elders);
+    }
+}
+
+/// One monument child piece's `postProcess` against one clip box.
 #[cfg_attr(not(test), allow(dead_code))]
 #[expect(clippy::too_many_arguments, reason = "preserve the established placement and simulation call signature")]
 fn monument_piece_post_process(
@@ -3432,739 +4119,27 @@ fn monument_piece_post_process(
     sea_level: i32,
     elders: &mut Vec<((i32, i32, i32), &'static str)>,
 ) {
-    let g = s.gray;
-    let l = s.light;
-    let k = s.black;
-    let m = s.lamp;
     // The wing rooms and the penthouse carry no `roomDefinition`; they never read it, so a
     // placeholder with `index = -1` stands in rather than making every arm optional.
     let room = match piece.room {
         Some(id) => rooms[id as usize].clone(),
         None => RoomDefinition::new(-1),
     };
-    let conn = |d: usize| rooms[room.connections[d].expect("room connection") as usize].clone();
     match piece.kind {
         MonumentKind::Building => unreachable!("the building body is written separately"),
         MonumentKind::Core => monument_post_process_core(w, s),
-        MonumentKind::DoubleX => {
-            let east = conn(DIR_EAST);
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 8, 0, east.has_opening[DIR_DOWN]);
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if room.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 4, 1, 7, 4, 6, g);
-            }
-            if east.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 8, 4, 1, 14, 4, 6, g);
-            }
-            w.generate_box(0, 3, 0, 0, 3, 7, l, l, false);
-            w.generate_box(15, 3, 0, 15, 3, 7, l, l, false);
-            w.generate_box(1, 3, 0, 15, 3, 0, l, l, false);
-            w.generate_box(1, 3, 7, 14, 3, 7, l, l, false);
-            w.generate_box(0, 2, 0, 0, 2, 7, g, g, false);
-            w.generate_box(15, 2, 0, 15, 2, 7, g, g, false);
-            w.generate_box(1, 2, 0, 15, 2, 0, g, g, false);
-            w.generate_box(1, 2, 7, 14, 2, 7, g, g, false);
-            w.generate_box(0, 1, 0, 0, 1, 7, l, l, false);
-            w.generate_box(15, 1, 0, 15, 1, 7, l, l, false);
-            w.generate_box(1, 1, 0, 15, 1, 0, l, l, false);
-            w.generate_box(1, 1, 7, 14, 1, 7, l, l, false);
-            w.generate_box(5, 1, 0, 10, 1, 4, l, l, false);
-            w.generate_box(6, 2, 0, 9, 2, 3, g, g, false);
-            w.generate_box(5, 3, 0, 10, 3, 4, l, l, false);
-            w.place(m, 6, 2, 3);
-            w.place(m, 9, 2, 3);
-            if room.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-            }
-            if room.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 1, 7, 4, 2, 7, sea_level);
-            }
-            if room.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 3, 0, 2, 4, sea_level);
-            }
-            if east.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 11, 1, 0, 12, 2, 0, sea_level);
-            }
-            if east.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 11, 1, 7, 12, 2, 7, sea_level);
-            }
-            if east.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 15, 1, 3, 15, 2, 4, sea_level);
-            }
-        }
-        MonumentKind::DoubleXY => {
-            let east = conn(DIR_EAST);
-            let up = conn(DIR_UP);
-            let east_up = rooms[east.connections[DIR_UP].expect("east up") as usize].clone();
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 8, 0, east.has_opening[DIR_DOWN]);
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if up.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 8, 1, 7, 8, 6, g);
-            }
-            if east_up.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 8, 8, 1, 14, 8, 6, g);
-            }
-            for i in 1..=7 {
-                let bs = if i == 2 || i == 6 { g } else { l };
-                w.generate_box(0, i, 0, 0, i, 7, bs, bs, false);
-                w.generate_box(15, i, 0, 15, i, 7, bs, bs, false);
-                w.generate_box(1, i, 0, 15, i, 0, bs, bs, false);
-                w.generate_box(1, i, 7, 14, i, 7, bs, bs, false);
-            }
-            for (a, b, c, d, e, f) in [
-                (2, 1, 3, 2, 7, 4),
-                (3, 1, 2, 4, 7, 2),
-                (3, 1, 5, 4, 7, 5),
-                (13, 1, 3, 13, 7, 4),
-                (11, 1, 2, 12, 7, 2),
-                (11, 1, 5, 12, 7, 5),
-                (5, 1, 3, 5, 3, 4),
-                (10, 1, 3, 10, 3, 4),
-                (5, 7, 2, 10, 7, 5),
-                (5, 5, 2, 5, 7, 2),
-                (10, 5, 2, 10, 7, 2),
-                (5, 5, 5, 5, 7, 5),
-                (10, 5, 5, 10, 7, 5),
-            ] {
-                w.generate_box(a, b, c, d, e, f, l, l, false);
-            }
-            w.place(l, 6, 6, 2);
-            w.place(l, 9, 6, 2);
-            w.place(l, 6, 6, 5);
-            w.place(l, 9, 6, 5);
-            w.generate_box(5, 4, 3, 6, 4, 4, l, l, false);
-            w.generate_box(9, 4, 3, 10, 4, 4, l, l, false);
-            w.place(m, 5, 4, 2);
-            w.place(m, 5, 4, 5);
-            w.place(m, 10, 4, 2);
-            w.place(m, 10, 4, 5);
-            // The lower half's four openings, then the upper half's, each side in the order
-            // the piece declares them.
-            if room.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-            }
-            if room.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 1, 7, 4, 2, 7, sea_level);
-            }
-            if room.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 3, 0, 2, 4, sea_level);
-            }
-            if east.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 11, 1, 0, 12, 2, 0, sea_level);
-            }
-            if east.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 11, 1, 7, 12, 2, 7, sea_level);
-            }
-            if east.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 15, 1, 3, 15, 2, 4, sea_level);
-            }
-            if up.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 5, 0, 4, 6, 0, sea_level);
-            }
-            if up.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 5, 7, 4, 6, 7, sea_level);
-            }
-            if up.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 5, 3, 0, 6, 4, sea_level);
-            }
-            if east_up.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 11, 5, 0, 12, 6, 0, sea_level);
-            }
-            if east_up.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 11, 5, 7, 12, 6, 7, sea_level);
-            }
-            if east_up.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 15, 5, 3, 15, 6, 4, sea_level);
-            }
-        }
-        MonumentKind::DoubleY => {
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            let up = conn(DIR_UP);
-            if up.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 8, 1, 6, 8, 6, g);
-            }
-            for (a, b, c, d, e, f) in [
-                (0, 4, 0, 0, 4, 7),
-                (7, 4, 0, 7, 4, 7),
-                (1, 4, 0, 6, 4, 0),
-                (1, 4, 7, 6, 4, 7),
-                (2, 4, 1, 2, 4, 2),
-                (1, 4, 2, 1, 4, 2),
-                (5, 4, 1, 5, 4, 2),
-                (6, 4, 2, 6, 4, 2),
-                (2, 4, 5, 2, 4, 6),
-                (1, 4, 5, 1, 4, 5),
-                (5, 4, 5, 5, 4, 6),
-                (6, 4, 5, 6, 4, 5),
-            ] {
-                w.generate_box(a, b, c, d, e, f, l, l, false);
-            }
-            let mut cur = room.clone();
-            for i in [1, 5] {
-                let z = 0;
-                if cur.has_opening[DIR_SOUTH] {
-                    w.generate_box(2, i, z, 2, i + 2, z, l, l, false);
-                    w.generate_box(5, i, z, 5, i + 2, z, l, l, false);
-                    w.generate_box(3, i + 2, z, 4, i + 2, z, l, l, false);
-                } else {
-                    w.generate_box(0, i, z, 7, i + 2, z, l, l, false);
-                    w.generate_box(0, i + 1, z, 7, i + 1, z, g, g, false);
-                }
-                let zz = 7;
-                if cur.has_opening[DIR_NORTH] {
-                    w.generate_box(2, i, zz, 2, i + 2, zz, l, l, false);
-                    w.generate_box(5, i, zz, 5, i + 2, zz, l, l, false);
-                    w.generate_box(3, i + 2, zz, 4, i + 2, zz, l, l, false);
-                } else {
-                    w.generate_box(0, i, zz, 7, i + 2, zz, l, l, false);
-                    w.generate_box(0, i + 1, zz, 7, i + 1, zz, g, g, false);
-                }
-                let x = 0;
-                if cur.has_opening[DIR_WEST] {
-                    w.generate_box(x, i, 2, x, i + 2, 2, l, l, false);
-                    w.generate_box(x, i, 5, x, i + 2, 5, l, l, false);
-                    w.generate_box(x, i + 2, 3, x, i + 2, 4, l, l, false);
-                } else {
-                    w.generate_box(x, i, 0, x, i + 2, 7, l, l, false);
-                    w.generate_box(x, i + 1, 0, x, i + 1, 7, g, g, false);
-                }
-                let xx = 7;
-                if cur.has_opening[DIR_EAST] {
-                    w.generate_box(xx, i, 2, xx, i + 2, 2, l, l, false);
-                    w.generate_box(xx, i, 5, xx, i + 2, 5, l, l, false);
-                    w.generate_box(xx, i + 2, 3, xx, i + 2, 4, l, l, false);
-                } else {
-                    w.generate_box(xx, i, 0, xx, i + 2, 7, l, l, false);
-                    w.generate_box(xx, i + 1, 0, xx, i + 1, 7, g, g, false);
-                }
-                cur = up.clone();
-            }
-        }
-        MonumentKind::DoubleYZ => {
-            let north = conn(DIR_NORTH);
-            let up_north = rooms[north.connections[DIR_UP].expect("north up") as usize].clone();
-            let up = conn(DIR_UP);
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 0, 8, north.has_opening[DIR_DOWN]);
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if up.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 8, 1, 6, 8, 7, g);
-            }
-            if up_north.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 8, 8, 6, 8, 14, g);
-            }
-            for i in 1..=7 {
-                let bs = if i == 2 || i == 6 { g } else { l };
-                w.generate_box(0, i, 0, 0, i, 15, bs, bs, false);
-                w.generate_box(7, i, 0, 7, i, 15, bs, bs, false);
-                w.generate_box(1, i, 0, 6, i, 0, bs, bs, false);
-                w.generate_box(1, i, 15, 6, i, 15, bs, bs, false);
-            }
-            for i in 1..=7 {
-                let bs = if i == 2 || i == 6 { m } else { k };
-                w.generate_box(3, i, 7, 4, i, 8, bs, bs, false);
-            }
-            if room.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-            }
-            if room.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 1, 3, 7, 2, 4, sea_level);
-            }
-            if room.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 3, 0, 2, 4, sea_level);
-            }
-            if north.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 1, 15, 4, 2, 15, sea_level);
-            }
-            if north.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 11, 0, 2, 12, sea_level);
-            }
-            if north.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 1, 11, 7, 2, 12, sea_level);
-            }
-            if up.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 5, 0, 4, 6, 0, sea_level);
-            }
-            if up.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 5, 3, 7, 6, 4, sea_level);
-                w.generate_box(5, 4, 2, 6, 4, 5, l, l, false);
-                w.generate_box(6, 1, 2, 6, 3, 2, l, l, false);
-                w.generate_box(6, 1, 5, 6, 3, 5, l, l, false);
-            }
-            if up.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 5, 3, 0, 6, 4, sea_level);
-                w.generate_box(1, 4, 2, 2, 4, 5, l, l, false);
-                w.generate_box(1, 1, 2, 1, 3, 2, l, l, false);
-                w.generate_box(1, 1, 5, 1, 3, 5, l, l, false);
-            }
-            if up_north.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 5, 15, 4, 6, 15, sea_level);
-            }
-            if up_north.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 5, 11, 0, 6, 12, sea_level);
-                w.generate_box(1, 4, 10, 2, 4, 13, l, l, false);
-                w.generate_box(1, 1, 10, 1, 3, 10, l, l, false);
-                w.generate_box(1, 1, 13, 1, 3, 13, l, l, false);
-            }
-            if up_north.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 5, 11, 7, 6, 12, sea_level);
-                w.generate_box(5, 4, 10, 6, 4, 13, l, l, false);
-                w.generate_box(6, 1, 10, 6, 3, 10, l, l, false);
-                w.generate_box(6, 1, 13, 6, 3, 13, l, l, false);
-            }
-        }
-        MonumentKind::DoubleZ => {
-            let north = conn(DIR_NORTH);
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 0, 8, north.has_opening[DIR_DOWN]);
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if room.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 4, 1, 6, 4, 7, g);
-            }
-            if north.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 4, 8, 6, 4, 14, g);
-            }
-            for (a, b, c, d, e, f, st) in [
-                (0, 3, 0, 0, 3, 15, l),
-                (7, 3, 0, 7, 3, 15, l),
-                (1, 3, 0, 7, 3, 0, l),
-                (1, 3, 15, 6, 3, 15, l),
-                (0, 2, 0, 0, 2, 15, g),
-                (7, 2, 0, 7, 2, 15, g),
-                (1, 2, 0, 7, 2, 0, g),
-                (1, 2, 15, 6, 2, 15, g),
-                (0, 1, 0, 0, 1, 15, l),
-                (7, 1, 0, 7, 1, 15, l),
-                (1, 1, 0, 7, 1, 0, l),
-                (1, 1, 15, 6, 1, 15, l),
-                (1, 1, 1, 1, 1, 2, l),
-                (6, 1, 1, 6, 1, 2, l),
-                (1, 3, 1, 1, 3, 2, l),
-                (6, 3, 1, 6, 3, 2, l),
-                (1, 1, 13, 1, 1, 14, l),
-                (6, 1, 13, 6, 1, 14, l),
-                (1, 3, 13, 1, 3, 14, l),
-                (6, 3, 13, 6, 3, 14, l),
-                (2, 1, 6, 2, 3, 6, l),
-                (5, 1, 6, 5, 3, 6, l),
-                (2, 1, 9, 2, 3, 9, l),
-                (5, 1, 9, 5, 3, 9, l),
-                (3, 2, 6, 4, 2, 6, l),
-                (3, 2, 9, 4, 2, 9, l),
-                (2, 2, 7, 2, 2, 8, l),
-                (5, 2, 7, 5, 2, 8, l),
-            ] {
-                w.generate_box(a, b, c, d, e, f, st, st, false);
-            }
-            w.place(m, 2, 2, 5);
-            w.place(m, 5, 2, 5);
-            w.place(m, 2, 2, 10);
-            w.place(m, 5, 2, 10);
-            w.place(l, 2, 3, 5);
-            w.place(l, 5, 3, 5);
-            w.place(l, 2, 3, 10);
-            w.place(l, 5, 3, 10);
-            if room.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-            }
-            if room.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 1, 3, 7, 2, 4, sea_level);
-            }
-            if room.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 3, 0, 2, 4, sea_level);
-            }
-            if north.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 1, 15, 4, 2, 15, sea_level);
-            }
-            if north.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 11, 0, 2, 12, sea_level);
-            }
-            if north.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 7, 1, 11, 7, 2, 12, sea_level);
-            }
-        }
-        MonumentKind::Entry => {
-            for (a, b, c, d, e, f) in [
-                (0, 3, 0, 2, 3, 7),
-                (5, 3, 0, 7, 3, 7),
-                (0, 2, 0, 1, 2, 7),
-                (6, 2, 0, 7, 2, 7),
-                (0, 1, 0, 0, 1, 7),
-                (7, 1, 0, 7, 1, 7),
-                (0, 1, 7, 7, 3, 7),
-                (1, 1, 0, 2, 3, 0),
-                (5, 1, 0, 6, 3, 0),
-            ] {
-                w.generate_box(a, b, c, d, e, f, l, l, false);
-            }
-            if room.has_opening[DIR_NORTH] {
-                w.generate_water_box(s, 3, 1, 7, 4, 2, 7, sea_level);
-            }
-            if room.has_opening[DIR_WEST] {
-                w.generate_water_box(s, 0, 1, 3, 1, 2, 4, sea_level);
-            }
-            if room.has_opening[DIR_EAST] {
-                w.generate_water_box(s, 6, 1, 3, 7, 2, 4, sea_level);
-            }
-        }
-        MonumentKind::Penthouse => {
-            for (a, b, c, d, e, f, st) in [
-                (2, -1, 2, 11, -1, 11, l),
-                (0, -1, 0, 1, -1, 11, g),
-                (12, -1, 0, 13, -1, 11, g),
-                (2, -1, 0, 11, -1, 1, g),
-                (2, -1, 12, 11, -1, 13, g),
-                (0, 0, 0, 0, 0, 13, l),
-                (13, 0, 0, 13, 0, 13, l),
-                (1, 0, 0, 12, 0, 0, l),
-                (1, 0, 13, 12, 0, 13, l),
-            ] {
-                w.generate_box(a, b, c, d, e, f, st, st, false);
-            }
-            let mut z = 2;
-            while z <= 11 {
-                w.place(m, 0, 0, z);
-                w.place(m, 13, 0, z);
-                w.place(m, z, 0, 0);
-                z += 3;
-            }
-            for (a, b, c, d, e, f, st) in [
-                (2, 0, 3, 4, 0, 9, l),
-                (9, 0, 3, 11, 0, 9, l),
-                (4, 0, 9, 9, 0, 11, l),
-                (3, 0, 3, 3, 0, 7, k),
-                (10, 0, 3, 10, 0, 7, k),
-                (6, 0, 10, 7, 0, 10, k),
-            ] {
-                w.generate_box(a, b, c, d, e, f, st, st, false);
-            }
-            w.place(l, 5, 0, 8);
-            w.place(l, 8, 0, 8);
-            w.place(l, 10, 0, 10);
-            w.place(l, 3, 0, 10);
-            let mut x = 3;
-            for _ in 0..2 {
-                let mut zz = 2;
-                while zz <= 8 {
-                    w.generate_box(x, 0, zz, x, 2, zz, l, l, false);
-                    zz += 3;
-                }
-                x = 10;
-            }
-            w.generate_box(5, 0, 10, 5, 2, 10, l, l, false);
-            w.generate_box(8, 0, 10, 8, 2, 10, l, l, false);
-            w.generate_box(6, -1, 7, 7, -1, 8, k, k, false);
-            w.generate_water_box(s, 6, -1, 3, 7, -1, 4, sea_level);
-            monument_spawn_elder(w, clip, 6, 1, 6, elders);
-        }
+        MonumentKind::DoubleX => monument_double_x(w, s, &room, rooms, sea_level),
+        MonumentKind::DoubleXY => monument_double_xy(w, s, &room, rooms, sea_level),
+        MonumentKind::DoubleY => monument_double_y(w, s, &room, rooms),
+        MonumentKind::DoubleYZ => monument_double_yz(w, s, &room, rooms, sea_level),
+        MonumentKind::DoubleZ => monument_double_z(w, s, &room, rooms, sea_level),
+        MonumentKind::Entry => monument_entry(w, s, &room, sea_level),
+        MonumentKind::Penthouse => monument_penthouse(w, s, clip, sea_level, elders),
         MonumentKind::Simple => {
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if room.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 4, 1, 6, 4, 6, g);
-            }
-            // `boolean` short-circuit: `nextBoolean` is drawn only for a non-zero design.
-            let mut decorated = false;
-            if piece.main_design != 0 {
-                decorated = rng.next_bool()
-                    && !room.has_opening[DIR_DOWN]
-                    && !room.has_opening[DIR_UP]
-                    && room.has_opening.iter().filter(|v| **v).count() > 1;
-            }
-            match piece.main_design {
-                0 => {
-                    for (a, b, c, d, e, f, st) in [
-                        (0, 1, 0, 2, 1, 2, l),
-                        (0, 3, 0, 2, 3, 2, l),
-                        (0, 2, 0, 0, 2, 2, g),
-                        (1, 2, 0, 2, 2, 0, g),
-                        (5, 1, 0, 7, 1, 2, l),
-                        (5, 3, 0, 7, 3, 2, l),
-                        (7, 2, 0, 7, 2, 2, g),
-                        (5, 2, 0, 6, 2, 0, g),
-                        (0, 1, 5, 2, 1, 7, l),
-                        (0, 3, 5, 2, 3, 7, l),
-                        (0, 2, 5, 0, 2, 7, g),
-                        (1, 2, 7, 2, 2, 7, g),
-                        (5, 1, 5, 7, 1, 7, l),
-                        (5, 3, 5, 7, 3, 7, l),
-                        (7, 2, 5, 7, 2, 7, g),
-                        (5, 2, 7, 6, 2, 7, g),
-                    ] {
-                        w.generate_box(a, b, c, d, e, f, st, st, false);
-                    }
-                    w.place(m, 1, 2, 1);
-                    w.place(m, 6, 2, 1);
-                    w.place(m, 1, 2, 6);
-                    w.place(m, 6, 2, 6);
-                    if room.has_opening[DIR_SOUTH] {
-                        w.generate_box(3, 3, 0, 4, 3, 0, l, l, false);
-                    } else {
-                        w.generate_box(3, 3, 0, 4, 3, 1, l, l, false);
-                        w.generate_box(3, 2, 0, 4, 2, 0, g, g, false);
-                        w.generate_box(3, 1, 0, 4, 1, 1, l, l, false);
-                    }
-                    if room.has_opening[DIR_NORTH] {
-                        w.generate_box(3, 3, 7, 4, 3, 7, l, l, false);
-                    } else {
-                        w.generate_box(3, 3, 6, 4, 3, 7, l, l, false);
-                        w.generate_box(3, 2, 7, 4, 2, 7, g, g, false);
-                        w.generate_box(3, 1, 6, 4, 1, 7, l, l, false);
-                    }
-                    if room.has_opening[DIR_WEST] {
-                        w.generate_box(0, 3, 3, 0, 3, 4, l, l, false);
-                    } else {
-                        w.generate_box(0, 3, 3, 1, 3, 4, l, l, false);
-                        w.generate_box(0, 2, 3, 0, 2, 4, g, g, false);
-                        w.generate_box(0, 1, 3, 1, 1, 4, l, l, false);
-                    }
-                    if room.has_opening[DIR_EAST] {
-                        w.generate_box(7, 3, 3, 7, 3, 4, l, l, false);
-                    } else {
-                        w.generate_box(6, 3, 3, 7, 3, 4, l, l, false);
-                        w.generate_box(7, 2, 3, 7, 2, 4, g, g, false);
-                        w.generate_box(6, 1, 3, 7, 1, 4, l, l, false);
-                    }
-                }
-                1 => {
-                    for (a, b, c, d, e, f, st) in [
-                        (2, 1, 2, 2, 3, 2, l),
-                        (2, 1, 5, 2, 3, 5, l),
-                        (5, 1, 5, 5, 3, 5, l),
-                        (5, 1, 2, 5, 3, 2, l),
-                        (0, 1, 0, 1, 3, 0, l),
-                        (0, 1, 1, 0, 3, 1, l),
-                        (0, 1, 7, 1, 3, 7, l),
-                        (0, 1, 6, 0, 3, 6, l),
-                        (6, 1, 7, 7, 3, 7, l),
-                        (7, 1, 6, 7, 3, 6, l),
-                        (6, 1, 0, 7, 3, 0, l),
-                        (7, 1, 1, 7, 3, 1, l),
-                    ] {
-                        w.generate_box(a, b, c, d, e, f, st, st, false);
-                    }
-                    w.place(m, 2, 2, 2);
-                    w.place(m, 2, 2, 5);
-                    w.place(m, 5, 2, 5);
-                    w.place(m, 5, 2, 2);
-                    for (a, b, c) in [
-                        (1, 2, 0),
-                        (0, 2, 1),
-                        (1, 2, 7),
-                        (0, 2, 6),
-                        (6, 2, 7),
-                        (7, 2, 6),
-                        (6, 2, 0),
-                        (7, 2, 1),
-                    ] {
-                        w.place(g, a, b, c);
-                    }
-                    if !room.has_opening[DIR_SOUTH] {
-                        w.generate_box(1, 3, 0, 6, 3, 0, l, l, false);
-                        w.generate_box(1, 2, 0, 6, 2, 0, g, g, false);
-                        w.generate_box(1, 1, 0, 6, 1, 0, l, l, false);
-                    }
-                    if !room.has_opening[DIR_NORTH] {
-                        w.generate_box(1, 3, 7, 6, 3, 7, l, l, false);
-                        w.generate_box(1, 2, 7, 6, 2, 7, g, g, false);
-                        w.generate_box(1, 1, 7, 6, 1, 7, l, l, false);
-                    }
-                    if !room.has_opening[DIR_WEST] {
-                        w.generate_box(0, 3, 1, 0, 3, 6, l, l, false);
-                        w.generate_box(0, 2, 1, 0, 2, 6, g, g, false);
-                        w.generate_box(0, 1, 1, 0, 1, 6, l, l, false);
-                    }
-                    if !room.has_opening[DIR_EAST] {
-                        w.generate_box(7, 3, 1, 7, 3, 6, l, l, false);
-                        w.generate_box(7, 2, 1, 7, 2, 6, g, g, false);
-                        w.generate_box(7, 1, 1, 7, 1, 6, l, l, false);
-                    }
-                }
-                _ => {
-                    for (a, b, c, d, e, f, st) in [
-                        (0, 1, 0, 0, 1, 7, l),
-                        (7, 1, 0, 7, 1, 7, l),
-                        (1, 1, 0, 6, 1, 0, l),
-                        (1, 1, 7, 6, 1, 7, l),
-                        (0, 2, 0, 0, 2, 7, k),
-                        (7, 2, 0, 7, 2, 7, k),
-                        (1, 2, 0, 6, 2, 0, k),
-                        (1, 2, 7, 6, 2, 7, k),
-                        (0, 3, 0, 0, 3, 7, l),
-                        (7, 3, 0, 7, 3, 7, l),
-                        (1, 3, 0, 6, 3, 0, l),
-                        (1, 3, 7, 6, 3, 7, l),
-                        (0, 1, 3, 0, 2, 4, k),
-                        (7, 1, 3, 7, 2, 4, k),
-                        (3, 1, 0, 4, 2, 0, k),
-                        (3, 1, 7, 4, 2, 7, k),
-                    ] {
-                        w.generate_box(a, b, c, d, e, f, st, st, false);
-                    }
-                    if room.has_opening[DIR_SOUTH] {
-                        w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-                    }
-                    if room.has_opening[DIR_NORTH] {
-                        w.generate_water_box(s, 3, 1, 7, 4, 2, 7, sea_level);
-                    }
-                    if room.has_opening[DIR_WEST] {
-                        w.generate_water_box(s, 0, 1, 3, 0, 2, 4, sea_level);
-                    }
-                    if room.has_opening[DIR_EAST] {
-                        w.generate_water_box(s, 7, 1, 3, 7, 2, 4, sea_level);
-                    }
-                }
-            }
-            if decorated {
-                w.generate_box(3, 1, 3, 4, 1, 4, l, l, false);
-                w.generate_box(3, 2, 3, 4, 2, 4, g, g, false);
-                w.generate_box(3, 3, 3, 4, 3, 4, l, l, false);
-            }
+            monument_simple(w, s, &room, rng, sea_level, piece.main_design)
         }
-        MonumentKind::SimpleTop => {
-            if room.index / 25 > 0 {
-                w.generate_default_floor(s, 0, 0, room.has_opening[DIR_DOWN]);
-            }
-            if room.connections[DIR_UP].is_none() {
-                w.generate_box_on_fill(s, 1, 4, 1, 6, 4, 6, g);
-            }
-            for x in 1..=6 {
-                for z in 1..=6 {
-                    if rng.next_bound(3) != 0 {
-                        let y = 2 + i32::from(rng.next_bound(4) != 0);
-                        w.generate_box(x, y, z, x, 3, z, s.sponge, s.sponge, false);
-                    }
-                }
-            }
-            for (a, b, c, d, e, f, st) in [
-                (0, 1, 0, 0, 1, 7, l),
-                (7, 1, 0, 7, 1, 7, l),
-                (1, 1, 0, 6, 1, 0, l),
-                (1, 1, 7, 6, 1, 7, l),
-                (0, 2, 0, 0, 2, 7, k),
-                (7, 2, 0, 7, 2, 7, k),
-                (1, 2, 0, 6, 2, 0, k),
-                (1, 2, 7, 6, 2, 7, k),
-                (0, 3, 0, 0, 3, 7, l),
-                (7, 3, 0, 7, 3, 7, l),
-                (1, 3, 0, 6, 3, 0, l),
-                (1, 3, 7, 6, 3, 7, l),
-                (0, 1, 3, 0, 2, 4, k),
-                (7, 1, 3, 7, 2, 4, k),
-                (3, 1, 0, 4, 2, 0, k),
-                (3, 1, 7, 4, 2, 7, k),
-            ] {
-                w.generate_box(a, b, c, d, e, f, st, st, false);
-            }
-            if room.has_opening[DIR_SOUTH] {
-                w.generate_water_box(s, 3, 1, 0, 4, 2, 0, sea_level);
-            }
-        }
-        MonumentKind::Wing => {
-            if piece.main_design == 0 {
-                for k in 0..4 {
-                    w.generate_box(10 - k, 3 - k, 20 - k, 12 + k, 3 - k, 20, l, l, false);
-                }
-                for (a, b, c, d, e, f, st) in [
-                    (7, 0, 6, 15, 0, 16, l),
-                    (6, 0, 6, 6, 3, 20, l),
-                    (16, 0, 6, 16, 3, 20, l),
-                    (7, 1, 7, 7, 1, 20, l),
-                    (15, 1, 7, 15, 1, 20, l),
-                    (7, 1, 6, 9, 3, 6, l),
-                    (13, 1, 6, 15, 3, 6, l),
-                    (8, 1, 7, 9, 1, 7, l),
-                    (13, 1, 7, 14, 1, 7, l),
-                    (9, 0, 5, 13, 0, 5, l),
-                    (10, 0, 7, 12, 0, 7, k),
-                    (8, 0, 10, 8, 0, 12, k),
-                    (14, 0, 10, 14, 0, 12, k),
-                    (6, 0, 21, 7, 4, 21, l),
-                    (15, 0, 21, 16, 4, 21, l),
-                ] {
-                    w.generate_box(a, b, c, d, e, f, st, st, false);
-                }
-                let mut z = 18;
-                while z >= 7 {
-                    w.place(m, 6, 3, z);
-                    w.place(m, 16, 3, z);
-                    z -= 3;
-                }
-                for (x, y, z) in [
-                    (10, 0, 10),
-                    (12, 0, 10),
-                    (10, 0, 12),
-                    (12, 0, 12),
-                    (8, 3, 6),
-                    (14, 3, 6),
-                ] {
-                    w.place(m, x, y, z);
-                }
-                for (x, y, z, st) in [
-                    (4, 2, 4, l),
-                    (4, 1, 4, m),
-                    (4, 0, 4, l),
-                    (18, 2, 4, l),
-                    (18, 1, 4, m),
-                    (18, 0, 4, l),
-                    (4, 2, 18, l),
-                    (4, 1, 18, m),
-                    (4, 0, 18, l),
-                    (18, 2, 18, l),
-                    (18, 1, 18, m),
-                    (18, 0, 18, l),
-                    (9, 7, 20, l),
-                    (13, 7, 20, l),
-                ] {
-                    w.place(st, x, y, z);
-                }
-                monument_spawn_elder(w, clip, 11, 2, 16, elders);
-            } else {
-                for (a, b, c, d, e, f, st) in [
-                    (9, 3, 18, 13, 3, 20, l),
-                    (9, 0, 18, 9, 2, 18, l),
-                    (13, 0, 18, 13, 2, 18, l),
-                    (7, 3, 7, 15, 3, 14, l),
-                ] {
-                    w.generate_box(a, b, c, d, e, f, st, st, false);
-                }
-                let mut x = 9;
-                for _ in 0..2 {
-                    w.place(l, x, 6, 20);
-                    w.place(m, x, 5, 20);
-                    w.place(l, x, 4, 20);
-                    x = 13;
-                }
-                let mut x = 10;
-                for _ in 0..2 {
-                    w.generate_box(x, 0, 10, x, 6, 10, l, l, false);
-                    w.generate_box(x, 0, 12, x, 6, 12, l, l, false);
-                    w.place(m, x, 0, 10);
-                    w.place(m, x, 0, 12);
-                    w.place(m, x, 4, 10);
-                    w.place(m, x, 4, 12);
-                    x = 12;
-                }
-                let mut x = 8;
-                for _ in 0..2 {
-                    w.generate_box(x, 0, 7, x, 2, 7, l, l, false);
-                    w.generate_box(x, 0, 14, x, 2, 14, l, l, false);
-                    x = 14;
-                }
-                w.generate_box(8, 3, 8, 8, 3, 13, k, k, false);
-                w.generate_box(14, 3, 8, 14, 3, 13, k, k, false);
-                monument_spawn_elder(w, clip, 11, 5, 13, elders);
-            }
-        }
+        MonumentKind::SimpleTop => monument_simple_top(w, s, &room, sea_level, rng),
+        MonumentKind::Wing => monument_wing(w, s, clip, piece.main_design, elders),
     }
 }
 
