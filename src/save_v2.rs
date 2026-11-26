@@ -446,7 +446,7 @@ fn write_saved_potion(out: &mut Vec<u8>, potion: WitchPotion) {
     let index = SAVED_WITCH_POTIONS
         .iter()
         .position(|&p| p == potion)
-        .unwrap();
+        .unwrap_or(SAVED_WITCH_POTIONS.len());
     out.push(index as u8);
 }
 
@@ -707,7 +707,7 @@ fn write_saved_villager(out: &mut Vec<u8>, villager: &Villager) {
     let profession = SAVED_PROFESSIONS
         .iter()
         .position(|&p| p == villager.profession)
-        .unwrap();
+        .unwrap_or(SAVED_PROFESSIONS.len());
     out.push(profession as u8);
     // The level is derived from XP in the live merchant.
     save_numbers!(out, villager.villager_xp);
@@ -858,7 +858,7 @@ fn write_saved_raid(out: &mut Vec<u8>, dim: DimId, raid: &Raid) {
     let state = SAVED_RAID_STATES
         .iter()
         .position(|&s| s == raid.state)
-        .unwrap();
+        .unwrap_or(SAVED_RAID_STATES.len());
     out.extend([
         state as u8,
         raid.regular_waves,
@@ -1001,7 +1001,7 @@ fn split_save_footer<'a>(
         .checked_sub(12)
         .ok_or("truncated save footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid save footer size")?;
     let start = end.checked_sub(size).ok_or("invalid save footer size")?;
@@ -1648,7 +1648,7 @@ fn dim_bound_overlay_value(
 /// There is deliberately one writer for both the legacy file's leading table and a companion
 /// file, and one reader for both, so "the Overworld's table" and "the same format for another
 /// dimension" cannot drift into two formats.
-#[allow(dead_code)]
+#[cfg(all(test, megu_vanilla_data))]
 fn save_dim_overlay_into(dim: DimId, f: &mut Vec<u8>) -> usize {
     let mut tables = WorldChunkTables::capture(&[dim]);
     let (count, bytes) = dim_bound_overlay_value(tables.take(dim), dim);
@@ -1722,7 +1722,7 @@ fn read_comps(b: &[u8], p: &mut usize) -> Comps {
         if b.len().saturating_sub(*p) < 2 {
             break;
         }
-        let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap()) as usize;
+        let l = u16::from_be_bytes(b[*p..*p + 2].try_into().unwrap_or_default()) as usize;
         *p += 2;
         if b.len().saturating_sub(*p) < l {
             break;
@@ -1753,7 +1753,7 @@ fn read_stack_table(payload: &[u8], p: &mut usize, has_comps: bool) -> HashMap<i
         if p.saturating_add(3) > payload.len() {
             break;
         }
-        let slot = i16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap());
+        let slot = i16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap_or_default());
         *p += 2;
         let item = rv_varint(payload, p);
         if *p >= payload.len() {
@@ -1823,12 +1823,12 @@ fn read_furnace_state(
         return None;
     }
     let burn_left = legacy_tick_count(
-        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap()) as u64,
+        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap_or_default()) as u64,
         legacy_ms_ages,
     ) as i32;
     *p += 4;
     let progress = legacy_tick_count(
-        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap()) as u64,
+        i32::from_be_bytes(payload[*p..*p + 4].try_into().unwrap_or_default()) as u64,
         legacy_ms_ages,
     ) as i32;
     *p += 4;
@@ -1883,7 +1883,7 @@ impl<'a> SaveInput<'a> {
     }
 
     fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
-        Ok(self.bytes(N)?.try_into().unwrap())
+        self.bytes(N)?.try_into().map_err(|_| "truncated save data")
     }
 
     fn byte(&mut self) -> Result<u8, &'static str> {
@@ -2011,7 +2011,7 @@ fn unwrap_world_payload(raw: Vec<u8>) -> Result<Vec<u8>, &'static str> {
         if raw.len() < 32 {
             return Err("truncated save header");
         }
-        let len = u64::from_be_bytes(raw[4..12].try_into().unwrap());
+        let len = u64::from_be_bytes(raw[4..12].try_into().unwrap_or_default());
         if len != (raw.len() - 32) as u64 {
             return Err("save length mismatch");
         }
@@ -2180,8 +2180,8 @@ impl SnapshotMemberRole {
     fn canonical_file(self) -> &'static str {
         match self {
             Self::Overworld => WORLD_FILE,
-            Self::Nether => dim_overlay_name(DimId::Nether).unwrap(),
-            Self::End => dim_overlay_name(DimId::End).unwrap(),
+            Self::Nether => dim_overlay_name(DimId::Nether).unwrap_or(WORLD_FILE),
+            Self::End => dim_overlay_name(DimId::End).unwrap_or(WORLD_FILE),
             Self::CreateFactory => "create_factory.bin",
         }
     }
@@ -2739,7 +2739,6 @@ struct SaveBatchWorker {
     next_seq: AtomicU64,
 }
 
-#[allow(dead_code)]
 impl SaveBatchWorker {
     fn spawn() -> Self {
         let state = std::sync::Arc::new((
@@ -2778,7 +2777,7 @@ impl SaveBatchWorker {
                     if g.closing {
                         return;
                     }
-                    g = cv.wait(g).unwrap();
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 }
             };
             let interval = connection_limits::backup_interval();
@@ -2839,7 +2838,7 @@ impl SaveBatchWorker {
         let (lock, cv) = &*self.state;
         let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
         while g.last_done < target {
-            g = cv.wait(g).unwrap();
+            g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
         match g.last_error.take() {
             Some(message) => Err(std::io::Error::other(message)),
@@ -2865,7 +2864,7 @@ impl AsyncSaveWorker {
     /// Queue `(path, bytes)` writes as one coalesced batch. Each file still gets
     /// the `write_world_file` treatment on the worker: fsync, `.bak` rotation
     /// and atomic rename — just not on the tick thread.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn submit_batch(&self, files: Vec<(std::path::PathBuf, Vec<u8>)>) -> u64 {
         save_batch_worker().submit_ops(
             files
@@ -3810,7 +3809,7 @@ fn classify_save_v2_version(
 /// The version record of the most recently decoded snapshot, for diagnostics.
 static LOADED_SAVE_VERSION: Mutex<Option<SaveVersionHeader>> = Mutex::new(None);
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn loaded_save_version_header() -> Option<SaveVersionHeader> {
     LOADED_SAVE_VERSION.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
@@ -4055,7 +4054,7 @@ fn read_mob_dimensions_footer(payload: &[u8]) -> Result<(&[u8], Vec<DimId>), &'s
         .checked_sub(12)
         .ok_or("truncated mob dimension footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid mob dimension footer size")?;
     if !(1..=MOB_CAP).contains(&size) {
@@ -4122,7 +4121,7 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
         .checked_sub(DIM_FOOTER_LEN)
         .ok_or("truncated dimension footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid dimension footer size")?;
     // Two u32 counts are the smallest possible body.
@@ -4141,7 +4140,7 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
             .get(..4)
             .ok_or("truncated dimension sign count")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     input = &input[4..];
     // Each sign has at least 1 dim + 13 position/front + 4 * 2 empty line lengths = 22 bytes.
@@ -4152,9 +4151,9 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
     for _ in 0..n {
         let dim = read_dim(&mut input)?;
         let pos = input.get(..13).ok_or("truncated dimension sign position")?;
-        let x = i32::from_be_bytes(pos[..4].try_into().unwrap());
-        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap());
-        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap());
+        let x = i32::from_be_bytes(pos[..4].try_into().unwrap_or_default());
+        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap_or_default());
+        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap_or_default());
         let front = pos[12];
         input = &input[13..];
         let mut lines: [String; 4] = Default::default();
@@ -4164,7 +4163,7 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
                     .get(..2)
                     .ok_or("truncated dimension sign line length")?
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or_default(),
             ) as usize;
             input = &input[2..];
             if input.len() < nl {
@@ -4180,7 +4179,7 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
             .get(..4)
             .ok_or("truncated dimension player count")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     input = &input[4..];
     // Each player has at least 1 dim + 2 name length + 0 name bytes = 3 bytes.
@@ -4195,7 +4194,7 @@ fn read_dim_footer(payload: &[u8]) -> Result<DimFooterRecords<'_>, &'static str>
                 .get(..2)
                 .ok_or("truncated dimension player name length")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         input = &input[2..];
         if input.len() < nl {
@@ -4307,9 +4306,9 @@ fn read_dim2_pos(body: &[u8], p: &mut usize) -> Result<DimBlockPos, &'static str
     *p += 12;
     Ok((
         dim,
-        i32::from_be_bytes(raw[0..4].try_into().unwrap()),
-        i32::from_be_bytes(raw[4..8].try_into().unwrap()),
-        i32::from_be_bytes(raw[8..12].try_into().unwrap()),
+        i32::from_be_bytes(raw[0..4].try_into().unwrap_or_default()),
+        i32::from_be_bytes(raw[4..8].try_into().unwrap_or_default()),
+        i32::from_be_bytes(raw[8..12].try_into().unwrap_or_default()),
     ))
 }
 fn read_dim2_count(body: &[u8], p: &mut usize, min_entry: usize) -> Result<usize, &'static str> {
@@ -4317,7 +4316,7 @@ fn read_dim2_count(body: &[u8], p: &mut usize, min_entry: usize) -> Result<usize
         body.get(*p..*p + 4)
             .ok_or("truncated DIM2 count")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     *p += 4;
     if n > body.len().saturating_sub(*p) / min_entry {
@@ -4335,7 +4334,7 @@ fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str
         .checked_sub(DIM2_FOOTER_LEN)
         .ok_or("truncated DIM2 footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid DIM2 footer size")?;
     if size < 16 {
@@ -4386,7 +4385,7 @@ fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str
                 body.get(p..p + 2)
                     .ok_or("truncated DIM2 loot table length")?
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or_default(),
             ) as usize;
             p += 2;
             let table = body.get(p..p + tlen).ok_or("truncated DIM2 loot table")?;
@@ -4401,7 +4400,7 @@ fn read_dim2_footer(payload: &[u8]) -> Result<(&[u8], Dim2Entries), &'static str
                         body.get(p..p + 8)
                             .ok_or("truncated DIM2 loot seed")?
                             .try_into()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     );
                     p += 8;
                     Some(s)
@@ -4530,7 +4529,7 @@ fn read_dxt_key<'a>(body: &'a [u8], p: &mut usize) -> Result<&'a str, &'static s
         body.get(*p..*p + 2)
             .ok_or("truncated DXT key length")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     *p += 2;
     let key = body.get(*p..*p + len).ok_or("truncated DXT key")?;
@@ -4554,9 +4553,9 @@ fn read_dxt_pos<'a>(
     *p += 12;
     Ok((
         key,
-        i32::from_be_bytes(raw[0..4].try_into().unwrap()),
-        i32::from_be_bytes(raw[4..8].try_into().unwrap()),
-        i32::from_be_bytes(raw[8..12].try_into().unwrap()),
+        i32::from_be_bytes(raw[0..4].try_into().unwrap_or_default()),
+        i32::from_be_bytes(raw[4..8].try_into().unwrap_or_default()),
+        i32::from_be_bytes(raw[8..12].try_into().unwrap_or_default()),
     ))
 }
 
@@ -4677,7 +4676,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
         .checked_sub(12)
         .ok_or("truncated DXT footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid DXT footer size")?;
     let start = end.checked_sub(size).ok_or("invalid DXT footer size")?;
@@ -4698,7 +4697,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
             body.get(p..p + 4)
                 .ok_or("truncated DXT overlay table length")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         p += 4;
         let table = body
@@ -4716,7 +4715,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
             body.get(p..p + 2)
                 .ok_or("truncated DXT player name")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         p += 2;
         let name = body
@@ -4737,7 +4736,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
             .get(p..p + 16)
             .ok_or("truncated DXT saved player")?
             .try_into()
-            .unwrap();
+            .unwrap_or_default();
         p += 16;
         let flags = *body.get(p).ok_or("truncated DXT saved player")?;
         p += 1;
@@ -4773,7 +4772,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
                 body.get(p..p + 2)
                     .ok_or("truncated DXT sign line")?
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or_default(),
             ) as usize;
             p += 2;
             let text = body.get(p..p + llen).ok_or("truncated DXT sign line")?;
@@ -4823,7 +4822,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
                 body.get(p..p + 2)
                     .ok_or("truncated DXT loot table length")?
                     .try_into()
-                    .unwrap(),
+                    .unwrap_or_default(),
             ) as usize;
             p += 2;
             let table = body.get(p..p + tlen).ok_or("truncated DXT loot table")?;
@@ -4838,7 +4837,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
                         body.get(p..p + 8)
                             .ok_or("truncated DXT loot seed")?
                             .try_into()
-                            .unwrap(),
+                            .unwrap_or_default(),
                     );
                     p += 8;
                     Some(s)
@@ -4865,7 +4864,7 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
         let timers = body.get(p..p + 5).ok_or("truncated DXT brewing stand")?;
         p += timers.len();
         let fuel = timers[0];
-        let brew_time = u32::from_be_bytes(timers[1..5].try_into().unwrap());
+        let brew_time = u32::from_be_bytes(timers[1..5].try_into().unwrap_or_default());
         if fuel > BREW_FUEL_PER_POWDER || brew_time > u32::from(BREW_TIME_TICKS) {
             return Err("invalid DXT brewing stand timers");
         }
@@ -4886,14 +4885,14 @@ fn read_dxt_footer(payload: &[u8]) -> Result<(&[u8], DxtEntries), &'static str> 
             body.get(p..p + 4)
                 .ok_or("truncated DXT block entity")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         );
         p += 4;
         let len = u32::from_be_bytes(
             body.get(p..p + 4)
                 .ok_or("truncated DXT block entity NBT")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         p += 4;
         let data = body.get(p..p + len).ok_or("truncated DXT block entity NBT")?;
@@ -4953,7 +4952,7 @@ fn read_block_loot_footer(
         .checked_sub(BLOCK_LOOT_FOOTER_LEN)
         .ok_or("truncated block loot footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid block loot footer size")?;
     if size == 0 {
@@ -4966,7 +4965,7 @@ fn read_block_loot_footer(
     if input.len() < 4 {
         return Err("truncated block loot count");
     }
-    let count = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(input[..4].try_into().unwrap_or_default()) as usize;
     input = &input[4..];
     if count > input.len() / 16 {
         return Err("invalid block loot count");
@@ -4976,9 +4975,9 @@ fn read_block_loot_footer(
         if input.len() < 13 {
             return Err("truncated block loot entry");
         }
-        let x = i32::from_be_bytes(input[..4].try_into().unwrap());
-        let y = i32::from_be_bytes(input[4..8].try_into().unwrap());
-        let z = i32::from_be_bytes(input[8..12].try_into().unwrap());
+        let x = i32::from_be_bytes(input[..4].try_into().unwrap_or_default());
+        let y = i32::from_be_bytes(input[4..8].try_into().unwrap_or_default());
+        let z = i32::from_be_bytes(input[8..12].try_into().unwrap_or_default());
         let tag = input[12];
         input = &input[13..];
         let kind = match tag {
@@ -4997,7 +4996,7 @@ fn read_block_loot_footer(
         if input.len() < 2 {
             return Err("truncated block loot table length");
         }
-        let tlen = u16::from_be_bytes(input[..2].try_into().unwrap()) as usize;
+        let tlen = u16::from_be_bytes(input[..2].try_into().unwrap_or_default()) as usize;
         input = &input[2..];
         if input.len() < tlen + 1 {
             return Err("truncated block loot table");
@@ -5012,7 +5011,7 @@ fn read_block_loot_footer(
                 if input.len() < 8 {
                     return Err("truncated block loot seed");
                 }
-                let s = i64::from_be_bytes(input[..8].try_into().unwrap());
+                let s = i64::from_be_bytes(input[..8].try_into().unwrap_or_default());
                 input = &input[8..];
                 Some(s)
             }
@@ -5068,7 +5067,7 @@ fn read_drop_owners_footer(
         .checked_sub(DROP_OWNERS_FOOTER_LEN)
         .ok_or("truncated drop owners footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid drop owners size")?;
     if size == 0 {
@@ -5079,7 +5078,7 @@ fn read_drop_owners_footer(
     if input.len() < 4 {
         return Err("truncated drop owners count");
     }
-    let count = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(input[..4].try_into().unwrap_or_default()) as usize;
     input = &input[4..];
     if count > input.len() / 5 {
         return Err("invalid drop owners count");
@@ -5089,7 +5088,7 @@ fn read_drop_owners_footer(
         if input.len() < 5 {
             return Err("truncated drop owner entry");
         }
-        let idx = u32::from_be_bytes(input[..4].try_into().unwrap()) as usize;
+        let idx = u32::from_be_bytes(input[..4].try_into().unwrap_or_default()) as usize;
         let flags = input[4];
         input = &input[5..];
         if flags == 0 || (flags & !0b11) != 0 {
@@ -5099,7 +5098,7 @@ fn read_drop_owners_footer(
             if input.len() < 16 {
                 return Err("truncated drop target uuid");
             }
-            let u: [u8; 16] = input[..16].try_into().unwrap();
+            let u: [u8; 16] = input[..16].try_into().unwrap_or_default();
             input = &input[16..];
             Some(u)
         } else {
@@ -5109,7 +5108,7 @@ fn read_drop_owners_footer(
             if input.len() < 16 {
                 return Err("truncated drop thrower uuid");
             }
-            let u: [u8; 16] = input[..16].try_into().unwrap();
+            let u: [u8; 16] = input[..16].try_into().unwrap_or_default();
             input = &input[16..];
             Some(u)
         } else {
@@ -5288,7 +5287,7 @@ fn read_legacy_string(payload: &[u8], p: &mut usize) -> Option<String> {
     if *p + 2 > payload.len() {
         return None;
     }
-    let len = u16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap()) as usize;
+    let len = u16::from_be_bytes(payload[*p..*p + 2].try_into().unwrap_or_default()) as usize;
     *p += 2;
     if *p + len > payload.len() {
         return None;
@@ -5358,7 +5357,7 @@ fn decode_legacy_meta(
         }
         if p + 8 <= payload.len() {
             WORLD_TIME.store(
-                u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                u64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default()),
                 Ordering::Relaxed,
             );
             p += 8;
@@ -5376,7 +5375,7 @@ fn decode_legacy_meta(
                     if p + 3 > payload.len() {
                         break;
                     }
-                    let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                    let slot = i16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default());
                     p += 2;
                     let item = rv(payload, &mut p);
                     if p >= payload.len() {
@@ -5401,11 +5400,11 @@ fn decode_legacy_meta(
                 if p + 12 > payload.len() {
                     break;
                 }
-                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 let slots = read_stack_table(payload, &mut p, has_comps);
                 // The legacy chest section has no dimension byte: every entry in it is Overworld.
@@ -5419,11 +5418,11 @@ fn decode_legacy_meta(
                 if p + 13 > payload.len() {
                     break;
                 }
-                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 let front = b[p];
                 p += 1;
@@ -5432,7 +5431,7 @@ fn decode_legacy_meta(
                     if p + 2 > payload.len() {
                         break;
                     }
-                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                     p += 2;
                     if p + nl > payload.len() {
                         break;
@@ -5451,9 +5450,9 @@ fn decode_legacy_meta(
                 if p + 8 > payload.len() {
                     break;
                 }
-                let cx = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let cx = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let cz = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 fl.insert((cx, cz));
             }
@@ -5465,22 +5464,22 @@ fn decode_legacy_meta(
                 if p + 2 > payload.len() {
                     break;
                 }
-                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                let nl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                 p += 2;
                 if p + nl + 28 > payload.len() {
                     break;
                 }
                 let name = String::from_utf8_lossy(&payload[p..p + nl]).to_string();
                 p += nl;
-                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let yaw = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let yaw = f32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let pitch = f32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let pitch = f32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 // The legacy position section has no dimension byte: every player defaulted to
                 // the Overworld; a footer entry below corrects the few who logged out elsewhere.
@@ -5494,13 +5493,13 @@ fn decode_legacy_meta(
                 if p + 30 > payload.len() {
                     break;
                 }
-                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
                 let item = rv(payload, &mut p);
                 if p >= payload.len() {
@@ -5543,11 +5542,11 @@ fn decode_legacy_meta(
                 if p + 12 > payload.len() {
                     break;
                 }
-                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let x = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let y = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let z = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 let Some(fr) = read_furnace_state(payload, &mut p, has_comps, legacy_ms_ages)
                 else {
@@ -5579,14 +5578,14 @@ fn decode_legacy_meta(
                     if p + 2 > payload.len() {
                         break;
                     }
-                    let el = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    let el = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                     p += 2;
                     if p + el + 8 > payload.len() {
                         break;
                     }
                     let entry = String::from_utf8_lossy(&payload[p..p + el]).to_string();
                     p += el;
-                    let val = i64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                    let val = i64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                     p += 8;
                     entries.insert(entry, ScoreboardScore {
                         value: val.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
@@ -5611,17 +5610,17 @@ fn decode_legacy_meta(
                 if p + 34 > payload.len() {
                     break;
                 }
-                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let eid = i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
-                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let x = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let y = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                let z = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                 p += 8;
-                let val = i16::from_be_bytes(b[p..p + 2].try_into().unwrap());
+                let val = i16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default());
                 p += 2;
-                let ams = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let ams = u32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 let age = legacy_ticks(u64::from(ams), legacy_ms_ages);
                 xs.push(Xp {
@@ -5650,7 +5649,7 @@ fn decode_legacy_meta(
                 if p + 4 > payload.len() {
                     break;
                 }
-                let raw = u32::from_be_bytes(b[p..p + 4].try_into().unwrap());
+                let raw = u32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default());
                 p += 4;
                 let aticks = legacy_ticks(u64::from(raw), legacy_ms_ages);
                 // Reinterpret as signed so a negative pickup-delay marker survives
@@ -5660,12 +5659,12 @@ fn decode_legacy_meta(
         }
         if p < payload.len() {
             let rf3 = |b: &[u8], p: &mut usize| -> f64 {
-                let v = f64::from_be_bytes(b[*p..*p + 8].try_into().unwrap());
+                let v = f64::from_be_bytes(b[*p..*p + 8].try_into().unwrap_or_default());
                 *p += 8;
                 v
             };
             let ri4 = |b: &[u8], p: &mut usize| -> i32 {
-                let v = i32::from_be_bytes(b[*p..*p + 4].try_into().unwrap());
+                let v = i32::from_be_bytes(b[*p..*p + 4].try_into().unwrap_or_default());
                 *p += 4;
                 v
             };
@@ -5817,7 +5816,7 @@ fn decode_legacy_meta(
                         rf3(payload, &mut p),
                     );
                     let left = legacy_tick_count(
-                        i32::from_be_bytes(b[p..p + 4].try_into().unwrap()) as u64,
+                        i32::from_be_bytes(b[p..p + 4].try_into().unwrap_or_default()) as u64,
                         legacy_ms_ages,
                     ) as i32;
                     p += 4;
@@ -5832,7 +5831,7 @@ fn decode_legacy_meta(
         if p + 8 <= payload.len() {
             RAINING.store(
                 legacy_tick_count(
-                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default()),
                     legacy_ms_ages,
                 ),
                 Ordering::Relaxed,
@@ -5842,7 +5841,7 @@ fn decode_legacy_meta(
         if p + 8 <= payload.len() {
             THUNDERING.store(
                 legacy_tick_count(
-                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
+                    u64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default()),
                     legacy_ms_ages,
                 ),
                 Ordering::Relaxed,
@@ -5865,9 +5864,9 @@ fn decode_legacy_meta(
         }
         if p + 25 <= payload.len() {
             let (x, y, z) = (
-                f64::from_be_bytes(b[p..p + 8].try_into().unwrap()),
-                f64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap()),
-                f64::from_be_bytes(b[p + 16..p + 24].try_into().unwrap()),
+                f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default()),
+                f64::from_be_bytes(b[p + 8..p + 16].try_into().unwrap_or_default()),
+                f64::from_be_bytes(b[p + 16..p + 24].try_into().unwrap_or_default()),
             );
             *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (x, y, z, 0.0);
             p += 24;
@@ -5887,7 +5886,7 @@ fn decode_legacy_meta(
                     if p + 2 > payload.len() {
                         break;
                     }
-                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                     p += 2;
                     if p + tl > payload.len() {
                         break;
@@ -5909,7 +5908,7 @@ fn decode_legacy_meta(
                     if p + 2 > payload.len() {
                         break;
                     }
-                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                    let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                     p += 2;
                     if p + tl > payload.len() {
                         break;
@@ -5933,7 +5932,7 @@ fn decode_legacy_meta(
                     if p + 8 > payload.len() {
                         break;
                     }
-                    let rem = u64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                    let rem = u64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                     p += 8;
                     sf.push((f2, t_now + rem));
                 }
@@ -5951,7 +5950,7 @@ fn decode_legacy_meta(
                         if p + 2 > payload.len() {
                             break;
                         }
-                        let il = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        let il = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                         p += 2;
                         if p + il > payload.len() {
                             break;
@@ -5978,14 +5977,14 @@ fn decode_legacy_meta(
                         if p + 2 > payload.len() {
                             break;
                         }
-                        let kl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        let kl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                         p += 2;
                         if p + kl + 8 > payload.len() {
                             break;
                         }
                         let kn = String::from_utf8_lossy(&payload[p..p + kl]).to_string();
                         p += kl;
-                        let v = f64::from_be_bytes(b[p..p + 8].try_into().unwrap());
+                        let v = f64::from_be_bytes(b[p..p + 8].try_into().unwrap_or_default());
                         p += 8;
                         m.insert(kn, v);
                     }
@@ -6001,14 +6000,14 @@ fn decode_legacy_meta(
                         if p + 2 > payload.len() {
                             break;
                         }
-                        let ol = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        let ol = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                         p += 2;
                         if p + ol + 2 > payload.len() {
                             break;
                         }
                         let on = String::from_utf8_lossy(&payload[p..p + ol]).to_string();
                         p += ol;
-                        let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        let tl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                         p += 2;
                         if p + tl > payload.len() {
                             break;
@@ -6025,7 +6024,7 @@ fn decode_legacy_meta(
                         p += tl;
                     }
                     if p + 2 <= payload.len() {
-                        let sl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap()) as usize;
+                        let sl = u16::from_be_bytes(b[p..p + 2].try_into().unwrap_or_default()) as usize;
                         p += 2;
                         if p + sl <= payload.len() && sl > 0 {
                             let obj = String::from_utf8_lossy(&payload[p..p + sl]);
@@ -6298,19 +6297,19 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             if p + 44 > payload.len() {
                 break;
             }
-            let eid = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let eid = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
-            let x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            let x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default());
             p += 8;
-            let y = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            let y = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default());
             p += 8;
-            let z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            let z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default());
             p += 8;
-            let dy = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap());
+            let dy = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default());
             p += 8;
-            let state = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let state = u32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
-            let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let time = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
             NEXT_EID.fetch_max(eid + 1, Ordering::SeqCst);
             falling().lock().unwrap_or_else(|e| e.into_inner()).push(Fall {
@@ -6332,11 +6331,11 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
             if p + 12 > payload.len() {
                 break;
             }
-            let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let fx = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
-            let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let fy = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
-            let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let fz = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
             let st = block_at(fx, fy, fz);
             if st == 0 {
@@ -6377,7 +6376,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         p += 4;
         if p + 4 <= payload.len() {
             GR_MAX_ENTITY_CRAMMING.store(
-                i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()),
+                i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default()),
                 Ordering::Relaxed,
             );
             p += 4;
@@ -6387,16 +6386,16 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         p += 4;
         const BORDER_SAVE_LEN: usize = 8 * 7 + 4 * 3;
         if p + BORDER_SAVE_LEN <= payload.len() {
-            let center_x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let center_z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let old_size = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let new_size = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let duration = i64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let damage_per_block = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let damage_safe_zone = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap()); p += 8;
-            let warning_blocks = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let warning_time_secs = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap()); p += 4;
-            let absolute_max_size = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap());
+            let center_x = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let center_z = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let old_size = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let new_size = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let duration = i64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let damage_per_block = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let damage_safe_zone = f64::from_be_bytes(payload[p..p + 8].try_into().unwrap_or_default()); p += 8;
+            let warning_blocks = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default()); p += 4;
+            let warning_time_secs = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default()); p += 4;
+            let absolute_max_size = i32::from_be_bytes(payload[p..p + 4].try_into().unwrap_or_default());
             p += 4;
             if [center_x, center_z, old_size, new_size, damage_per_block, damage_safe_zone]
                 .iter().all(|value| value.is_finite())
@@ -6412,7 +6411,7 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         }
     }
     if let Some(bytes) = payload.get(p..p + 8).filter(|bytes| &bytes[..4] == b"SPA1") {
-        let angle = f32::from_be_bytes(bytes[4..].try_into().unwrap());
+        let angle = f32::from_be_bytes(bytes[4..].try_into().unwrap_or_default());
         if angle.is_finite() {
             WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()).3 = angle;
         }
@@ -6797,7 +6796,7 @@ fn read_brewing_footer(
         .checked_sub(12)
         .ok_or("truncated brewing footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid brewing footer size")?;
     let start = end.checked_sub(size).ok_or("invalid brewing footer size")?;
@@ -6810,7 +6809,7 @@ fn read_brewing_footer(
             .ok_or("truncated brewing stand position")?;
         p += header.len();
         let dim = DimId::from_index(header[0] as usize).ok_or("invalid brewing dimension")?;
-        let coordinate = |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap());
+        let coordinate = |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap_or_default());
         let key = (dim, coordinate(1), coordinate(5), coordinate(9));
         let slots = read_stack_table(body, &mut p, true);
         let timers = body.get(p..p + 3).ok_or("truncated brewing stand timers")?;
@@ -6824,7 +6823,7 @@ fn read_brewing_footer(
                 .ok_or("invalid brewing slot")? = stack;
         }
         entry.stand.fuel = timers[0];
-        entry.stand.brew_time = u16::from_be_bytes(timers[1..3].try_into().unwrap());
+        entry.stand.brew_time = u16::from_be_bytes(timers[1..3].try_into().unwrap_or_default());
         if entry.stand.fuel > BREW_FUEL_PER_POWDER || entry.stand.brew_time > BREW_TIME_TICKS {
             return Err("invalid brewing stand timers");
         }
@@ -6932,7 +6931,7 @@ fn read_sign_side_meta(body: &[u8], p: &mut usize) -> Result<SignSideMeta, &'sta
         body.get(*p..*p + 2)
             .ok_or("truncated sign colour length")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     *p += 2;
     let bytes = body.get(*p..*p + len).ok_or("truncated sign colour")?;
@@ -6969,7 +6968,7 @@ fn read_sign_meta_footer(payload: &[u8]) -> Result<(&[u8], Vec<SignMetaRecord>),
         .checked_sub(SIGN_META_FOOTER_LEN)
         .ok_or("truncated sign meta footer")?;
     let size = usize::try_from(u64::from_be_bytes(
-        payload[end..end + 8].try_into().unwrap(),
+        payload[end..end + 8].try_into().unwrap_or_default(),
     ))
     .map_err(|_| "invalid sign meta footer size")?;
     let start = end.checked_sub(size).ok_or("invalid sign meta footer size")?;
@@ -6983,7 +6982,7 @@ fn read_sign_meta_footer(payload: &[u8]) -> Result<(&[u8], Vec<SignMetaRecord>),
         body.get(p..p + 4)
             .ok_or("truncated sign meta count")?
             .try_into()
-            .unwrap(),
+            .unwrap_or_default(),
     ) as usize;
     p += 4;
     // The smallest legal entry is an empty dim key (2 length bytes), 12
@@ -6999,9 +6998,9 @@ fn read_sign_meta_footer(payload: &[u8]) -> Result<(&[u8], Vec<SignMetaRecord>),
             .get(p..p + 12)
             .ok_or("truncated sign meta position")?;
         p += 12;
-        let x = i32::from_be_bytes(pos[..4].try_into().unwrap());
-        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap());
-        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap());
+        let x = i32::from_be_bytes(pos[..4].try_into().unwrap_or_default());
+        let y = i32::from_be_bytes(pos[4..8].try_into().unwrap_or_default());
+        let z = i32::from_be_bytes(pos[8..12].try_into().unwrap_or_default());
         let front = read_sign_side_meta(body, &mut p)?;
         let back = read_sign_side_meta(body, &mut p)?;
         let is_waxed = match body.get(p) {
@@ -7805,7 +7804,7 @@ fn append_mod_bridge_trailers(out: &mut Vec<u8>) {
 /// Frame `inner` as one mod trailer: schema + declared length + CRC32 of the
 /// inner bytes, then the `[body][u64 body size][magic]` wrapper every optional
 /// footer uses.
-#[allow(dead_code)]
+#[cfg(feature = "create-offload")]
 fn append_mod_bridge_trailer(out: &mut Vec<u8>, magic: &[u8; 4], inner: &[u8]) {
     let start = out.len();
     out.push(MOD_TRAILER_SCHEMA);
@@ -7949,8 +7948,8 @@ fn read_raid_totals_footer(
         let entry = body.get(p..p + 17).ok_or("truncated raid total")?;
         p += entry.len();
         let dim = DimId::from_index(entry[0] as usize).ok_or("invalid raid total dimension")?;
-        let coordinate = |i| i32::from_be_bytes(entry[i..i + 4].try_into().unwrap());
-        let total = i32::from_be_bytes(entry[13..17].try_into().unwrap());
+        let coordinate = |i| i32::from_be_bytes(entry[i..i + 4].try_into().unwrap_or_default());
+        let total = i32::from_be_bytes(entry[13..17].try_into().unwrap_or_default());
         if total <= 0 {
             return Err("invalid raid wave total");
         }
@@ -8022,7 +8021,7 @@ fn read_dim_fluid_footer(
         if dim == DimId::Overworld {
             return Err("dim fluid owner must not be the Overworld");
         }
-        let fluid_order = i64::from_be_bytes(header[1..9].try_into().unwrap());
+        let fluid_order = i64::from_be_bytes(header[1..9].try_into().unwrap_or_default());
         let mut input = body.get(p..).ok_or("truncated dim fluid queue")?;
         let queue = scheduled_ticks::ScheduledTicks::decode(&mut input)?;
         let consumed = body.len() - p - input.len();
@@ -8031,7 +8030,7 @@ fn read_dim_fluid_footer(
             body.get(p..p + 4)
                 .ok_or("truncated dim fluid owned count")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         p += 4;
         let mut owned = HashSet::new();
@@ -8039,7 +8038,7 @@ fn read_dim_fluid_footer(
             let cell = body.get(p..p + 12).ok_or("truncated dim fluid owned cell")?;
             p += cell.len();
             let coordinate =
-                |i| i32::from_be_bytes(cell[i..i + 4].try_into().unwrap());
+                |i| i32::from_be_bytes(cell[i..i + 4].try_into().unwrap_or_default());
             owned.insert((coordinate(0), coordinate(4), coordinate(8)));
         }
         entries.push((dim, fluid_order, queue, owned));
@@ -8102,14 +8101,14 @@ fn read_block_entities_body(
         let dim =
             DimId::from_index(header[0] as usize).ok_or("invalid block entity dimension")?;
         let coordinate =
-            |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap());
+            |i| i32::from_be_bytes(header[i..i + 4].try_into().unwrap_or_default());
         let key @ (_, x, y, z) = (dim, coordinate(1), coordinate(5), coordinate(9));
-        let state = u32::from_be_bytes(header[13..17].try_into().unwrap());
+        let state = u32::from_be_bytes(header[13..17].try_into().unwrap_or_default());
         let len = u32::from_be_bytes(
             body.get(p..p + 4)
                 .ok_or("truncated block entity NBT length")?
                 .try_into()
-                .unwrap(),
+                .unwrap_or_default(),
         ) as usize;
         p += 4;
         let data = body.get(p..p + len).ok_or("truncated block entity NBT")?;
@@ -8908,17 +8907,16 @@ struct LiveUnloadSummary {
 /// connected client's view, the spawn ring, or the forceload set. The sweep
 /// stamps the covered chunks it sees; a resident chunk whose stamp is more
 /// than `grace_ticks` old has lost its ticket and may be evicted.
-#[allow(dead_code)]
-static LIVE_CHUNK_TICKETS: Registry<DimChunkKey, u64> = OnceLock::new();
 fn live_chunk_tickets() -> &'static LockedMap<DimChunkKey, u64> {
-    LIVE_CHUNK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
+    chunk_residency()
+        .tickets
+        .get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// One mob drained out of the live stores for a parked chunk: the mob itself
 /// plus every eid-keyed side record, so `rehydrate_evicted_chunk` puts a tamed
 /// pet's owner, sitting flag, collar color and behavior back exactly as the
 /// unload left them.
-#[allow(dead_code)]
 struct ParkedMob {
     mob: Arc<Mob>,
     live_state: Option<LiveMobState>,
@@ -8949,7 +8947,6 @@ struct EvictedChunkArchive {
     drops: Vec<Drop>,
 }
 
-#[allow(dead_code)]
 impl EvictedChunkArchive {
     /// Whether the drain carried anything at all — an archive with no records
     /// is not parked.
@@ -8984,19 +8981,36 @@ impl EvictedChunkArchive {
 /// The parked state of one region: chunk coordinates to its archive.
 type EvictedRegionArchive = std::collections::BTreeMap<(i32, i32), EvictedChunkArchive>;
 
-/// The compact per-region archive an unload parks its state in when no Anvil
-/// directory is asked for: region coordinates key the map so "what did region
-/// `(rx, rz)` lose" answers the way the `.mca` merge answers it on disk.
-#[allow(dead_code)]
-static EVICTED_REGIONS: Registry<(DimId, i32, i32), EvictedRegionArchive> = OnceLock::new();
+/// Chunk-residency runtime state: the sweep stamps that keep resident chunks
+/// ticketed, and the per-region archives an unload parks state in. One static
+/// so the two halves of "what may evict / what was evicted" cannot drift into
+/// separate lifecycles.
+struct ChunkResidency {
+    tickets: Registry<DimChunkKey, u64>,
+    /// The compact per-region archive an unload parks its state in when no
+    /// Anvil directory is asked for: region coordinates key the map so "what
+    /// did region `(rx, rz)` lose" answers the way the `.mca` merge answers
+    /// it on disk.
+    evicted: Registry<(DimId, i32, i32), EvictedRegionArchive>,
+}
+
+static CHUNK_RESIDENCY: OnceLock<ChunkResidency> = OnceLock::new();
+fn chunk_residency() -> &'static ChunkResidency {
+    CHUNK_RESIDENCY.get_or_init(|| ChunkResidency {
+        tickets: OnceLock::new(),
+        evicted: OnceLock::new(),
+    })
+}
+
 fn evicted_regions() -> &'static LockedMap<(DimId, i32, i32), EvictedRegionArchive> {
-    EVICTED_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
+    chunk_residency()
+        .evicted
+        .get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The spawn ring in the Overworld — the `spawnChunkRadius` gamerule's window
 /// around the world-spawn chunk, the set vanilla keeps entity-ticking at all
 /// times. Only the Overworld carries a world spawn.
-#[allow(dead_code)]
 fn live_spawn_ticket_chunks() -> HashSet<DimChunkKey> {
     let (sx, _, sz, _) = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
     let radius = command_gamerules()
@@ -9046,7 +9060,6 @@ fn live_client_view_chunks() -> HashSet<DimChunkKey> {
 /// connected client's held window, the spawn ring, or the forceload set —
 /// must never reach eviction, so `unload_unticketed_chunk_overlays` verifies
 /// it itself rather than trusting every caller's covered set to be complete.
-#[allow(dead_code)]
 fn live_chunk_is_ticketed(dim: DimId, cx: i32, cz: i32) -> bool {
     live_spawn_ticket_chunks().contains(&(dim, cx, cz))
         || forceloaded()
@@ -9060,7 +9073,6 @@ fn live_chunk_is_ticketed(dim: DimId, cx: i32, cz: i32) -> bool {
 /// containers, furnaces, stands, signs, store entries, imported tags or a
 /// pending loot roll? An empty answer with an empty overlay means the chunk
 /// has nothing worth writing.
-#[allow(dead_code)]
 fn live_chunk_has_records(dim: DimId, cx: i32, cz: i32) -> bool {
     let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let block_in_chunk = |&(d, x, _, z): &DimBlockPos| d == dim && in_chunk(x, z);
@@ -9104,7 +9116,6 @@ fn live_chunk_has_records(dim: DimId, cx: i32, cz: i32) -> bool {
 
 /// Every chunk holding unloadable live state: overlay edits, any block-entity
 /// store record, and the entities parked in it.
-#[allow(dead_code)]
 fn live_resident_chunks() -> HashSet<DimChunkKey> {
     let mut out: HashSet<DimChunkKey> = world().keys().into_iter().collect();
     let block_chunk = |&(d, x, _, z): &DimBlockPos| (d, x >> 4, z >> 4);
@@ -9197,7 +9208,6 @@ fn live_resident_chunks() -> HashSet<DimChunkKey> {
 /// "unloaded" means. Derived per-chunk caches (`op_bands`, `section_store`,
 /// `chunk_versions`) are dropped too: they rebuild on demand and their memory
 /// is the exploration memory this unloader exists to reclaim.
-#[allow(dead_code)]
 fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
     let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let mut archive = EvictedChunkArchive {
@@ -9340,7 +9350,6 @@ fn park_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> EvictedChunkArchive {
 /// caller so a park keeps them instead of losing them outright; each mob's
 /// eid-keyed side records (behavior state, sitting flag, villager data,
 /// shearing, tags, attributes) travel with it.
-#[allow(dead_code)]
 fn drain_chunk_entities(dim: DimId, cx: i32, cz: i32) -> (usize, Vec<ParkedMob>, Vec<Drop>) {
     let mut parked_mobs = Vec::new();
     {
@@ -9429,7 +9438,6 @@ fn drain_chunk_entities(dim: DimId, cx: i32, cz: i32) -> (usize, Vec<ParkedMob>,
 /// removed, so a failed write aborts the unload, the chunk stays resident and
 /// no edit is ever lost. A chunk still covered by a player window, the spawn
 /// ring or `/forceload` is refused outright.
-#[allow(dead_code)]
 fn unload_unticketed_chunk_overlays(
     dim: DimId,
     cx: i32,
@@ -9556,6 +9564,7 @@ fn sweep_unticketed_regions(
 /// Re-hydrate a chunk parked in `evicted_regions`: the parked overlay and
 /// every drained store record returns to the live world exactly as the unload
 /// left it, with the derived caches left to rebuild on demand.
+#[cfg_attr(not(test), allow(dead_code))]
 fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
     let archive = {
         let mut regions = evicted_regions()
@@ -9688,7 +9697,7 @@ fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
 /// Re-hydrate a chunk the unloader evicted: with a `flush_dir` the merged
 /// `.mca` record answers, without one the parked `evicted_regions` archive
 /// does — either way edited blocks and containers come back byte-for-byte.
-#[allow(dead_code)]
+#[cfg(test)]
 fn reload_unticketed_chunk_overlay(
     dim: DimId,
     cx: i32,

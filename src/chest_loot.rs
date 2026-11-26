@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 // the private `J` shape below. It accepts the subset vanilla loot tables use:
 // objects, arrays, strings (with basic escapes), numbers and the
 // true/false/null literals.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) enum J {
     Null,
@@ -76,7 +75,6 @@ fn lower_json(value: megu_core::json::JsonValue) -> J {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn jparse(bytes: &[u8]) -> Option<J> {
     let text = std::str::from_utf8(bytes).ok()?;
     megu_core::json::parse_json_with_limits(text, LOOT_JSON_LIMITS, false)
@@ -575,7 +573,6 @@ impl LootContext {
 }
 
 /// One stack produced by the generic evaluator.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LootItem {
     pub item: String,
@@ -1341,7 +1338,6 @@ fn roll_loot_pools(
 /// Evaluate a whole loot table: each passing pool rolls `rolls` times plus
 /// `floor(bonus_rolls * luck)`, picks an entry by effective weight, expands it,
 /// then applies the pool's functions to every produced stack.
-#[allow(dead_code)]
 pub(crate) fn evaluate_loot_table(
     table: &J,
     ctx: &LootContext,
@@ -1362,11 +1358,12 @@ pub(crate) fn evaluate_loot_table(
 // per-table generators below give each table base a dedicated producer and
 // feed the `vanilla_loot_generate` dispatch. Tables that reference other
 // tables (`loot_table` entries, e.g. `entities/sheep/<color>` ->
-// `entities/sheep`) resolve through the same catalogue. Not yet wired into a
-// live container path, hence the dead-code allowances on the generated items.
+// `entities/sheep`) resolve through the same catalogue. The named generators
+// stay live through `#[used]` on `VANILLA_LOOT_GENERATORS`, which the
+// strict vanilla-parity audit reads as the built-in-table catalogue; only
+// the `vanilla_loot_generate` dispatch itself awaits its first caller.
 
 /// `(loot table id, minified vanilla table JSON)` pairs, sorted by id.
-#[allow(dead_code)]
 pub(crate) static VANILLA_LOOT_TABLES: &[(&str, &str)] = &[
     ("minecraft:archaeology/desert_pyramid", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:archer_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:miner_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:prize_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:skull_pottery_sherd"},{"type":"minecraft:item","name":"minecraft:diamond"},{"type":"minecraft:item","name":"minecraft:tnt"},{"type":"minecraft:item","name":"minecraft:gunpowder"},{"type":"minecraft:item","name":"minecraft:emerald"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/desert_pyramid"}"##),
     ("minecraft:archaeology/desert_well", r##"{"type":"minecraft:archaeology","pools":[{"bonus_rolls":0.0,"entries":[{"type":"minecraft:item","name":"minecraft:arms_up_pottery_sherd","weight":2},{"type":"minecraft:item","name":"minecraft:brewer_pottery_sherd","weight":2},{"type":"minecraft:item","name":"minecraft:brick"},{"type":"minecraft:item","name":"minecraft:emerald"},{"type":"minecraft:item","name":"minecraft:stick"},{"type":"minecraft:item","functions":[{"effects":[{"type":"minecraft:night_vision","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:jump_boost","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}},{"type":"minecraft:weakness","duration":{"type":"minecraft:uniform","max":8.0,"min":6.0}},{"type":"minecraft:blindness","duration":{"type":"minecraft:uniform","max":7.0,"min":5.0}},{"type":"minecraft:poison","duration":{"type":"minecraft:uniform","max":20.0,"min":10.0}},{"type":"minecraft:saturation","duration":{"type":"minecraft:uniform","max":10.0,"min":7.0}}],"function":"minecraft:set_stew_effect"}],"name":"minecraft:suspicious_stew"}],"rolls":1.0}],"random_sequence":"minecraft:archaeology/desert_well"}"##),
@@ -1566,7 +1563,6 @@ pub(crate) static VANILLA_LOOT_TABLES: &[(&str, &str)] = &[
 ];
 
 /// Look up a vanilla catalogue table body by `minecraft:`-prefixed id.
-#[allow(dead_code)]
 pub(crate) fn vanilla_loot_table_json(id: &str) -> Option<&'static str> {
     VANILLA_LOOT_TABLES
         .binary_search_by_key(&id, |(table, _)| *table)
@@ -1578,7 +1574,6 @@ pub(crate) fn vanilla_loot_table_json(id: &str) -> Option<&'static str> {
 /// Every item id the catalogue can emit (entry `name`s, tag expansions and
 /// function-produced items), sorted for binary-search interning into the
 /// `&'static str` `LootEntry.item` field.
-#[allow(dead_code)]
 static VANILLA_LOOT_ITEMS: &[&str] = &[
     "minecraft:acacia_log",
     "minecraft:acacia_planks",
@@ -1927,7 +1922,6 @@ static VANILLA_LOOT_ITEMS: &[&str] = &[
     "minecraft:yellow_wool",
 ];
 
-#[allow(dead_code)]
 fn vanilla_loot_item(name: &str) -> Option<&'static str> {
     VANILLA_LOOT_ITEMS
         .binary_search(&name)
@@ -1938,7 +1932,6 @@ fn vanilla_loot_item(name: &str) -> Option<&'static str> {
 
 /// Enchantment ids the catalogue can record, sorted for interning into
 /// `LootEntry.enchantment`.
-#[allow(dead_code)]
 static VANILLA_ENCHANTMENT_IDS: &[&str] = &[
     "minecraft:aqua_affinity",
     "minecraft:bane_of_arthropods",
@@ -1984,7 +1977,6 @@ static VANILLA_ENCHANTMENT_IDS: &[&str] = &[
     "minecraft:wind_burst",
 ];
 
-#[allow(dead_code)]
 fn vanilla_loot_enchantment(name: &str) -> Option<&'static str> {
     VANILLA_ENCHANTMENT_IDS
         .binary_search(&name)
@@ -1995,7 +1987,6 @@ fn vanilla_loot_enchantment(name: &str) -> Option<&'static str> {
 
 /// `#minecraft:creeper_drop_music_discs` item-tag expansion (the only
 /// `minecraft:tag` loot entry in the 1.21.1 tables).
-#[allow(dead_code)]
 const CREEPER_DROP_MUSIC_DISCS: &[&str] = &[
     "minecraft:music_disc_11",
     "minecraft:music_disc_13",
@@ -2013,7 +2004,6 @@ const CREEPER_DROP_MUSIC_DISCS: &[&str] = &[
 
 /// Tag resolver for catalogue rolls: item tags only; unknown tags expand to
 /// nothing, matching a missing tag in vanilla.
-#[allow(dead_code)]
 fn vanilla_loot_tags(tag: &str) -> Vec<&'static str> {
     match tag {
         "minecraft:creeper_drop_music_discs" => CREEPER_DROP_MUSIC_DISCS.to_vec(),
@@ -2023,7 +2013,6 @@ fn vanilla_loot_tags(tag: &str) -> Vec<&'static str> {
 
 /// `furnace_smelt` results for the raw items the 1.21.1 tables actually smelt
 /// (meat/fish/potato/rabbit drops and kelp).
-#[allow(dead_code)]
 fn vanilla_loot_smelt(item: &str) -> Option<&'static str> {
     Some(match item {
         "minecraft:beef" => "minecraft:cooked_beef",
@@ -2041,7 +2030,6 @@ fn vanilla_loot_smelt(item: &str) -> Option<&'static str> {
 
 /// `set_damage` maximum durability for the items the 1.21.1 tables damage.
 /// Items not listed return 0, which makes `set_damage` a no-op for them.
-#[allow(dead_code)]
 fn vanilla_loot_max_damage(item: &str) -> i32 {
     match item {
         "minecraft:bow" => 384,
@@ -2070,7 +2058,6 @@ fn vanilla_loot_max_damage(item: &str) -> i32 {
 /// Fisher-Yates scatter over the 27 container slots, mirroring the chest-fill
 /// path. Unknown item or enchantment ids drop out rather than producing
 /// unregistered names.
-#[allow(dead_code)]
 fn loot_items_to_entries(items: Vec<LootItem>, rng: &mut Lcg) -> Vec<LootEntry> {
     loot_items_to_container_entries(items, rng, false)
 }
@@ -2165,7 +2152,6 @@ pub(crate) fn catalogue_rng_seed(seed: i64) -> u64 {
 
 /// Deterministically roll a vanilla catalogue table: `evaluate_loot_table`
 /// over the embedded JSON with an `Lcg` seeded by `seed`.
-#[allow(dead_code)]
 pub(crate) fn vanilla_loot_roll(id: &str, seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll_with_context(id, seed, &LootContext::default())
 }
@@ -2199,958 +2185,772 @@ pub(crate) fn vanilla_loot_roll_with_context(
 // the function rolls the alphabetically-first table id; `vanilla_loot_roll`
 // reaches every id exactly.
 
-#[allow(dead_code)]
 fn allay(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/allay", seed)
 }
 
-#[allow(dead_code)]
 fn ancient_city(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/ancient_city", seed)
 }
 
-#[allow(dead_code)]
 fn ancient_city_ice_box(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/ancient_city_ice_box", seed)
 }
 
-#[allow(dead_code)]
 fn armadillo(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/armadillo", seed)
 }
 
-#[allow(dead_code)]
 fn armor_stand(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/armor_stand", seed)
 }
 
-#[allow(dead_code)]
 fn armorer_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/armorer_gift", seed)
 }
 
-#[allow(dead_code)]
 fn axolotl(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/axolotl", seed)
 }
 
-#[allow(dead_code)]
 fn bastion_bridge(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/bastion_bridge", seed)
 }
 
-#[allow(dead_code)]
 fn bastion_hoglin_stable(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/bastion_hoglin_stable", seed)
 }
 
-#[allow(dead_code)]
 fn bastion_other(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/bastion_other", seed)
 }
 
-#[allow(dead_code)]
 fn bastion_treasure(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/bastion_treasure", seed)
 }
 
-#[allow(dead_code)]
 fn bat(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/bat", seed)
 }
 
-#[allow(dead_code)]
 fn bee(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/bee", seed)
 }
 
-#[allow(dead_code)]
 fn black(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/black", seed)
 }
 
-#[allow(dead_code)]
 fn blaze(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/blaze", seed)
 }
 
-#[allow(dead_code)]
 fn blue(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/blue", seed)
 }
 
-#[allow(dead_code)]
 fn bogged(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/bogged", seed)
 }
 
-#[allow(dead_code)]
 fn breeze(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/breeze", seed)
 }
 
-#[allow(dead_code)]
 fn brown(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/brown", seed)
 }
 
-#[allow(dead_code)]
 fn buried_treasure(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/buried_treasure", seed)
 }
 
-#[allow(dead_code)]
 fn butcher_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/butcher_gift", seed)
 }
 
-#[allow(dead_code)]
 fn camel(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/camel", seed)
 }
 
-#[allow(dead_code)]
 fn cartographer_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/cartographer_gift", seed)
 }
 
-#[allow(dead_code)]
 fn cat(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/cat", seed)
 }
 
-#[allow(dead_code)]
 fn cat_morning_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/cat_morning_gift", seed)
 }
 
-#[allow(dead_code)]
 fn cave_spider(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/cave_spider", seed)
 }
 
-#[allow(dead_code)]
 fn chamber(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:dispensers/trial_chambers/chamber", seed)
 }
 
-#[allow(dead_code)]
 fn chicken(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/chicken", seed)
 }
 
-#[allow(dead_code)]
 fn cleric_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/cleric_gift", seed)
 }
 
-#[allow(dead_code)]
 fn cod(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/cod", seed)
 }
 
-#[allow(dead_code)]
 fn consumables(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:spawners/ominous/trial_chamber/consumables", seed)
 }
 
-#[allow(dead_code)]
 fn corridor(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/corridor", seed)
 }
 
-#[allow(dead_code)]
 fn cow(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/cow", seed)
 }
 
-#[allow(dead_code)]
 fn creeper(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/creeper", seed)
 }
 
-#[allow(dead_code)]
 fn cyan(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/cyan", seed)
 }
 
-#[allow(dead_code)]
 fn desert_pyramid(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/desert_pyramid", seed)
 }
 
-#[allow(dead_code)]
 fn desert_well(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/desert_well", seed)
 }
 
-#[allow(dead_code)]
 fn dolphin(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/dolphin", seed)
 }
 
-#[allow(dead_code)]
 fn donkey(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/donkey", seed)
 }
 
-#[allow(dead_code)]
 fn drowned(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/drowned", seed)
 }
 
-#[allow(dead_code)]
 fn elder_guardian(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/elder_guardian", seed)
 }
 
-#[allow(dead_code)]
 fn end_city_treasure(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/end_city_treasure", seed)
 }
 
-#[allow(dead_code)]
 fn ender_dragon(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/ender_dragon", seed)
 }
 
-#[allow(dead_code)]
 fn enderman(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/enderman", seed)
 }
 
-#[allow(dead_code)]
 fn endermite(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/endermite", seed)
 }
 
-#[allow(dead_code)]
 fn entrance(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/entrance", seed)
 }
 
-#[allow(dead_code)]
 fn evoker(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/evoker", seed)
 }
 
-#[allow(dead_code)]
 fn farmer_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/farmer_gift", seed)
 }
 
-#[allow(dead_code)]
 fn fish(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/fishing/fish", seed)
 }
 
-#[allow(dead_code)]
 fn fisherman_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/fisherman_gift", seed)
 }
 
-#[allow(dead_code)]
 fn fishing(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/fishing", seed)
 }
 
-#[allow(dead_code)]
 fn fletcher_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/fletcher_gift", seed)
 }
 
-#[allow(dead_code)]
 fn fox(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/fox", seed)
 }
 
-#[allow(dead_code)]
 fn frog(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/frog", seed)
 }
 
-#[allow(dead_code)]
 fn ghast(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/ghast", seed)
 }
 
-#[allow(dead_code)]
 fn giant(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/giant", seed)
 }
 
-#[allow(dead_code)]
 fn glow_squid(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/glow_squid", seed)
 }
 
-#[allow(dead_code)]
 fn goat(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/goat", seed)
 }
 
-#[allow(dead_code)]
 fn gray(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/gray", seed)
 }
 
-#[allow(dead_code)]
 fn green(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/green", seed)
 }
 
-#[allow(dead_code)]
 fn guardian(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/guardian", seed)
 }
 
-#[allow(dead_code)]
 fn hoglin(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/hoglin", seed)
 }
 
-#[allow(dead_code)]
 fn horse(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/horse", seed)
 }
 
-#[allow(dead_code)]
 fn husk(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/husk", seed)
 }
 
-#[allow(dead_code)]
 fn igloo_chest(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/igloo_chest", seed)
 }
 
-#[allow(dead_code)]
 fn illusioner(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/illusioner", seed)
 }
 
-#[allow(dead_code)]
 fn intersection(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/intersection", seed)
 }
 
-#[allow(dead_code)]
 fn intersection_barrel(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/intersection_barrel", seed)
 }
 
-#[allow(dead_code)]
 fn iron_golem(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/iron_golem", seed)
 }
 
-#[allow(dead_code)]
 fn items_to_drop_when_ominous(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:spawners/trial_chamber/items_to_drop_when_ominous", seed)
 }
 
-#[allow(dead_code)]
 fn jungle_temple(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/jungle_temple", seed)
 }
 
-#[allow(dead_code)]
 fn jungle_temple_dispenser(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/jungle_temple_dispenser", seed)
 }
 
-#[allow(dead_code)]
 fn junk(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/fishing/junk", seed)
 }
 
-#[allow(dead_code)]
 fn key(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:spawners/ominous/trial_chamber/key", seed)
 }
 
-#[allow(dead_code)]
 fn leatherworker_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/leatherworker_gift", seed)
 }
 
-#[allow(dead_code)]
 fn librarian_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/librarian_gift", seed)
 }
 
-#[allow(dead_code)]
 fn light_blue(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/light_blue", seed)
 }
 
-#[allow(dead_code)]
 fn light_gray(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/light_gray", seed)
 }
 
-#[allow(dead_code)]
 fn lime(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/lime", seed)
 }
 
-#[allow(dead_code)]
 fn llama(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/llama", seed)
 }
 
-#[allow(dead_code)]
 fn magenta(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/magenta", seed)
 }
 
-#[allow(dead_code)]
 fn magma_cube(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/magma_cube", seed)
 }
 
-#[allow(dead_code)]
 fn mason_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/mason_gift", seed)
 }
 
-#[allow(dead_code)]
 fn mooshroom(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/mooshroom", seed)
 }
 
-#[allow(dead_code)]
 fn mule(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/mule", seed)
 }
 
-#[allow(dead_code)]
 fn nether_bridge(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/nether_bridge", seed)
 }
 
-#[allow(dead_code)]
 fn ocean_ruin_cold(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/ocean_ruin_cold", seed)
 }
 
-#[allow(dead_code)]
 fn ocean_ruin_warm(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/ocean_ruin_warm", seed)
 }
 
-#[allow(dead_code)]
 fn ocelot(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/ocelot", seed)
 }
 
-#[allow(dead_code)]
 fn orange(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/orange", seed)
 }
 
-#[allow(dead_code)]
 fn panda(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/panda", seed)
 }
 
-#[allow(dead_code)]
 fn panda_sneeze(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/panda_sneeze", seed)
 }
 
-#[allow(dead_code)]
 fn parrot(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/parrot", seed)
 }
 
-#[allow(dead_code)]
 fn phantom(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/phantom", seed)
 }
 
-#[allow(dead_code)]
 fn pig(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/pig", seed)
 }
 
-#[allow(dead_code)]
 fn piglin(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/piglin", seed)
 }
 
-#[allow(dead_code)]
 fn piglin_bartering(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/piglin_bartering", seed)
 }
 
-#[allow(dead_code)]
 fn piglin_brute(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/piglin_brute", seed)
 }
 
-#[allow(dead_code)]
 fn pillager(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/pillager", seed)
 }
 
-#[allow(dead_code)]
 fn pillager_outpost(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/pillager_outpost", seed)
 }
 
-#[allow(dead_code)]
 fn pink(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/pink", seed)
 }
 
-#[allow(dead_code)]
 fn player(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/player", seed)
 }
 
-#[allow(dead_code)]
 fn polar_bear(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/polar_bear", seed)
 }
 
-#[allow(dead_code)]
 fn pufferfish(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/pufferfish", seed)
 }
 
-#[allow(dead_code)]
 fn purple(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/purple", seed)
 }
 
-#[allow(dead_code)]
 fn rabbit(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/rabbit", seed)
 }
 
-#[allow(dead_code)]
 fn ravager(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/ravager", seed)
 }
 
-#[allow(dead_code)]
 fn red(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/red", seed)
 }
 
-#[allow(dead_code)]
 fn reward(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward", seed)
 }
 
-#[allow(dead_code)]
 fn reward_common(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_common", seed)
 }
 
-#[allow(dead_code)]
 fn reward_ominous(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous", seed)
 }
 
-#[allow(dead_code)]
 fn reward_ominous_common(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_common", seed)
 }
 
-#[allow(dead_code)]
 fn reward_ominous_rare(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_rare", seed)
 }
 
-#[allow(dead_code)]
 fn reward_ominous_unique(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_ominous_unique", seed)
 }
 
-#[allow(dead_code)]
 fn reward_rare(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_rare", seed)
 }
 
-#[allow(dead_code)]
 fn reward_unique(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/reward_unique", seed)
 }
 
-#[allow(dead_code)]
 fn ruined_portal(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/ruined_portal", seed)
 }
 
-#[allow(dead_code)]
 fn salmon(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/salmon", seed)
 }
 
-#[allow(dead_code)]
 fn sheep(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep", seed)
 }
 
-#[allow(dead_code)]
 fn shepherd_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/shepherd_gift", seed)
 }
 
-#[allow(dead_code)]
 fn shipwreck_map(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/shipwreck_map", seed)
 }
 
-#[allow(dead_code)]
 fn shipwreck_supply(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/shipwreck_supply", seed)
 }
 
-#[allow(dead_code)]
 fn shipwreck_treasure(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/shipwreck_treasure", seed)
 }
 
-#[allow(dead_code)]
 fn shulker(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/shulker", seed)
 }
 
-#[allow(dead_code)]
 fn silverfish(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/silverfish", seed)
 }
 
-#[allow(dead_code)]
 fn simple_dungeon(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/simple_dungeon", seed)
 }
 
-#[allow(dead_code)]
 fn skeleton(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/skeleton", seed)
 }
 
-#[allow(dead_code)]
 fn skeleton_horse(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/skeleton_horse", seed)
 }
 
-#[allow(dead_code)]
 fn slime(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/slime", seed)
 }
 
-#[allow(dead_code)]
 fn sniffer(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sniffer", seed)
 }
 
-#[allow(dead_code)]
 fn sniffer_digging(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/sniffer_digging", seed)
 }
 
-#[allow(dead_code)]
 fn snow_golem(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/snow_golem", seed)
 }
 
-#[allow(dead_code)]
 fn spawn_bonus_chest(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/spawn_bonus_chest", seed)
 }
 
-#[allow(dead_code)]
 fn spider(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/spider", seed)
 }
 
-#[allow(dead_code)]
 fn squid(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/squid", seed)
 }
 
-#[allow(dead_code)]
 fn stray(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/stray", seed)
 }
 
-#[allow(dead_code)]
 fn strider(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/strider", seed)
 }
 
-#[allow(dead_code)]
 fn stronghold_corridor(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/stronghold_corridor", seed)
 }
 
-#[allow(dead_code)]
 fn stronghold_crossing(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/stronghold_crossing", seed)
 }
 
-#[allow(dead_code)]
 fn stronghold_library(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/stronghold_library", seed)
 }
 
-#[allow(dead_code)]
 fn supply(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/trial_chambers/supply", seed)
 }
 
-#[allow(dead_code)]
 fn tadpole(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/tadpole", seed)
 }
 
-#[allow(dead_code)]
 fn toolsmith_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/toolsmith_gift", seed)
 }
 
-#[allow(dead_code)]
 fn trader_llama(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/trader_llama", seed)
 }
 
-#[allow(dead_code)]
 fn trail_ruins_common(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/trail_ruins_common", seed)
 }
 
-#[allow(dead_code)]
 fn trail_ruins_rare(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:archaeology/trail_ruins_rare", seed)
 }
 
-#[allow(dead_code)]
 fn treasure(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/fishing/treasure", seed)
 }
 
-#[allow(dead_code)]
 fn trial_chamber(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:equipment/trial_chamber", seed)
 }
 
-#[allow(dead_code)]
 fn trial_chamber_melee(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:equipment/trial_chamber_melee", seed)
 }
 
-#[allow(dead_code)]
 fn trial_chamber_ranged(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:equipment/trial_chamber_ranged", seed)
 }
 
-#[allow(dead_code)]
 fn tropical_fish(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/tropical_fish", seed)
 }
 
-#[allow(dead_code)]
 fn turtle(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/turtle", seed)
 }
 
-#[allow(dead_code)]
 fn underwater_ruin_big(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/underwater_ruin_big", seed)
 }
 
-#[allow(dead_code)]
 fn underwater_ruin_small(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/underwater_ruin_small", seed)
 }
 
-#[allow(dead_code)]
 fn vex(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/vex", seed)
 }
 
-#[allow(dead_code)]
 fn village_armorer(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_armorer", seed)
 }
 
-#[allow(dead_code)]
 fn village_butcher(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_butcher", seed)
 }
 
-#[allow(dead_code)]
 fn village_cartographer(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_cartographer", seed)
 }
 
-#[allow(dead_code)]
 fn village_desert_house(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_desert_house", seed)
 }
 
-#[allow(dead_code)]
 fn village_fisher(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_fisher", seed)
 }
 
-#[allow(dead_code)]
 fn village_fletcher(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_fletcher", seed)
 }
 
-#[allow(dead_code)]
 fn village_mason(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_mason", seed)
 }
 
-#[allow(dead_code)]
 fn village_plains_house(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_plains_house", seed)
 }
 
-#[allow(dead_code)]
 fn village_savanna_house(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_savanna_house", seed)
 }
 
-#[allow(dead_code)]
 fn village_shepherd(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_shepherd", seed)
 }
 
-#[allow(dead_code)]
 fn village_snowy_house(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_snowy_house", seed)
 }
 
-#[allow(dead_code)]
 fn village_taiga_house(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_taiga_house", seed)
 }
 
-#[allow(dead_code)]
 fn village_tannery(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_tannery", seed)
 }
 
-#[allow(dead_code)]
 fn village_temple(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_temple", seed)
 }
 
-#[allow(dead_code)]
 fn village_toolsmith(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_toolsmith", seed)
 }
 
-#[allow(dead_code)]
 fn village_weaponsmith(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/village/village_weaponsmith", seed)
 }
 
-#[allow(dead_code)]
 fn villager(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/villager", seed)
 }
 
-#[allow(dead_code)]
 fn vindicator(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/vindicator", seed)
 }
 
-#[allow(dead_code)]
 fn wandering_trader(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/wandering_trader", seed)
 }
 
-#[allow(dead_code)]
 fn warden(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/warden", seed)
 }
 
-#[allow(dead_code)]
 fn water(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:dispensers/trial_chambers/water", seed)
 }
 
-#[allow(dead_code)]
 fn weaponsmith_gift(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:gameplay/hero_of_the_village/weaponsmith_gift", seed)
 }
 
-#[allow(dead_code)]
 fn white(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/white", seed)
 }
 
-#[allow(dead_code)]
 fn witch(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/witch", seed)
 }
 
-#[allow(dead_code)]
 fn wither(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/wither", seed)
 }
 
-#[allow(dead_code)]
 fn wither_skeleton(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/wither_skeleton", seed)
 }
 
-#[allow(dead_code)]
 fn wolf(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/wolf", seed)
 }
 
-#[allow(dead_code)]
 fn woodland_mansion(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:chests/woodland_mansion", seed)
 }
 
-#[allow(dead_code)]
 fn yellow(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/sheep/yellow", seed)
 }
 
-#[allow(dead_code)]
 fn zoglin(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/zoglin", seed)
 }
 
-#[allow(dead_code)]
 fn zombie(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/zombie", seed)
 }
 
-#[allow(dead_code)]
 fn zombie_horse(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/zombie_horse", seed)
 }
 
-#[allow(dead_code)]
 fn zombie_villager(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/zombie_villager", seed)
 }
 
-#[allow(dead_code)]
 fn zombified_piglin(seed: i64) -> Vec<LootEntry> {
     vanilla_loot_roll("minecraft:entities/zombified_piglin", seed)
 }
 
 
 /// `(canonical vanilla table id, dedicated generator)` pair.
-#[allow(dead_code)]
 type VanillaLootGenerator = (&'static str, fn(i64) -> Vec<LootEntry>);
 
 /// `(canonical vanilla table id, dedicated generator)` registry.
-#[allow(dead_code)]
+/// `#[used]` keeps the registry — and every generator it references — live:
+/// the strict vanilla-parity audit reads this table as the built-in-table
+/// catalogue, so it must stay reachable even before `vanilla_loot_generate`
+/// finds its first production caller.
+#[used]
 pub(crate) static VANILLA_LOOT_GENERATORS: &[VanillaLootGenerator] = &[
     ("minecraft:archaeology/desert_pyramid", desert_pyramid),
     ("minecraft:archaeology/desert_well", desert_well),

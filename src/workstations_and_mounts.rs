@@ -8,30 +8,22 @@
 // ---------- menu type ids ----------
 // 1.21.1 `MenuType` registry order: crafter_3x3 occupies index 7, so the tail of
 // the registry is smoker 22 / cartography_table 23 / stonecutter 24.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_MENU_GRINDSTONE: i64 = 15;
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_MENU_LOOM: i64 = 18;
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_MENU_CARTOGRAPHY: i64 = 23;
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_MENU_STONECUTTER: i64 = 24;
 // `minecraft:repair_cost` on the 1.21.1 component wire (same numbering as
 // COMP_PRIOR_WORK); the grindstone result drops it.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_COMP_REPAIR_COST: i64 = 16;
 // `minecraft:map_id` component id on the 1.21.1 component wire.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_COMP_MAP_ID: i64 = 26;
 
 // ---------- shared enchant helpers ----------
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_is_curse(enchant: i64) -> bool {
     // Vanilla EnchantmentTags.CURSE: binding_curse + vanishing_curse.
     matches!(enchant, 2 | 40)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_stored_enchantments_get(c: &Comps) -> Vec<(i64, i64)> {
     let mut out = Vec::new();
     if let Some(d) = comp_get(c, COMP_STORED_ENCHANTMENTS) {
@@ -52,7 +44,6 @@ fn wm_stored_enchantments_get(c: &Comps) -> Vec<(i64, i64)> {
 // Vanilla `Enchantment.Cost` = base + perLevelAboveFirst * (level - 1), the
 // min_cost half of each vanilla enchantment definition (1.21.1 Enchantments
 // bootstrap). Datapack enchants fall back to the 1 + 10*(level-1) default shape.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_enchant_min_cost(enchant: i64, level: i64) -> i64 {
     let lv = level.max(1);
     let (base, per_level) = match enchant {
@@ -103,21 +94,18 @@ fn wm_enchant_min_cost(enchant: i64, level: i64) -> i64 {
     base + per_level * (lv - 1)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_stack_max_damage(st: &Stack) -> Option<i64> {
     comp_varint(&st.2, COMP_MAX_DAMAGE)
         .or_else(|| item_to_name(st.0).and_then(item_max_durability).map(i64::from))
         .filter(|max| *max > 0)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_stack_enchanted(st: &Stack) -> bool {
     !enchantments_get(&st.2).is_empty() || !wm_stored_enchantments_get(&st.2).is_empty()
 }
 
 // Merge a curse list into `keep`, holding the higher level per id (vanilla
 // ItemEnchantments.merge semantics on the grindstone's curse-preserving path).
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_merge_curse_levels(keep: &mut Vec<(i64, i64)>, extra: &[(i64, i64)]) {
     for &(id, lv) in extra.iter().filter(|(id, _)| wm_is_curse(*id)) {
         if let Some(e) = keep.iter_mut().find(|(k, _)| *k == id) {
@@ -130,7 +118,6 @@ fn wm_merge_curse_levels(keep: &mut Vec<(i64, i64)>, extra: &[(i64, i64)]) {
 
 // Rewrite a stack keeping only curse enchantments (regular + stored), and drop
 // repair_cost. Shared by the grindstone's single-item and merge paths.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_keep_only_curses(st: &Stack) -> Stack {
     let mut out = st.clone();
     let curses: Vec<(i64, i64)> = enchantments_get(&out.2)
@@ -163,7 +150,6 @@ fn wm_keep_only_curses(st: &Stack) -> Stack {
 // Built-in vanilla stonecutting table (1.21.1 recipe set; input -> outputs with
 // counts). Slab outputs are 2 per block; copper derivatives are 4/8 per block,
 // matching vanilla's `*_from_*_stonecutting` recipe counts.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_STONECUT: &[(&str, &[(&str, u8)])] = &[
     (
         "stone",
@@ -423,7 +409,6 @@ const WM_STONECUT: &[(&str, &[(&str, u8)])] = &[
 
 // Copper family: each {plain,exposed,weathered,oxidized} + waxed mirror variant
 // stonecuts into its chiseled/cut derivatives at the vanilla 4x multiplier.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_COPPER_PREFIXES: &[&str] = &[
     "",
     "exposed_",
@@ -438,7 +423,6 @@ const WM_COPPER_PREFIXES: &[&str] = &[
 // Resolved-once recipe map (input name -> sorted (item id, count) list). The
 // copper family shares one shape per weather/wax prefix; everything else comes
 // from WM_STONECUT.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_stonecut_recipes(input: &str) -> Vec<(i64, u8)> {
     static RECIPES: OnceLock<HashMap<String, Vec<(i64, u8)>>> = OnceLock::new();
     let map = RECIPES.get_or_init(|| {
@@ -482,19 +466,18 @@ fn wm_stonecut_recipes(input: &str) -> Vec<(i64, u8)> {
     recipes
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct StonecutterMenu {
     input: Stack,
     selected_recipe: Option<usize>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl StonecutterMenu {
     fn screen() -> (i64, &'static str) {
         (WM_MENU_STONECUTTER, "Stonecutter")
     }
 
+    #[cfg(test)]
     fn set_input(&mut self, st: Stack) {
         self.input = st;
         self.selected_recipe = None;
@@ -502,6 +485,7 @@ impl StonecutterMenu {
 
     // Deterministic order: vanilla sends the client a sorted recipe list;
     // output item id is a stable order across recipe-table edits.
+    #[cfg(test)]
     fn available_recipes(&self) -> Vec<(i64, u8)> {
         if self.input.1 == 0 {
             return Vec::new();
@@ -512,6 +496,7 @@ impl StonecutterMenu {
     }
 
     // Serverbound `ContainerButtonClick` (0x09) with the recipe index.
+    #[cfg(test)]
     fn select_button(&mut self, index: usize) -> bool {
         if index < self.available_recipes().len() {
             self.selected_recipe = Some(index);
@@ -522,6 +507,7 @@ impl StonecutterMenu {
         }
     }
 
+    #[cfg(test)]
     fn result(&self) -> Stack {
         self.selected_recipe
             .and_then(|i| self.available_recipes().get(i).copied())
@@ -529,6 +515,7 @@ impl StonecutterMenu {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     fn take_result(&mut self) -> Option<Stack> {
         let out = self.result();
         if out.1 == 0 || self.input.1 == 0 {
@@ -544,7 +531,6 @@ impl StonecutterMenu {
 }
 
 // ---------- grindstone ----------
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct GrindstoneMenu {
     top: Stack,
@@ -553,7 +539,6 @@ struct GrindstoneMenu {
 
 // Vanilla `GrindstoneMenu.getExperienceFromItem`: the sum of `getMinCost` over
 // every non-curse enchantment (stored enchantments count for enchanted books).
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_grind_xp_base(st: &Stack) -> i64 {
     if st.1 == 0 {
         return 0;
@@ -572,12 +557,12 @@ fn wm_grind_xp_base(st: &Stack) -> i64 {
     total
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl GrindstoneMenu {
     fn screen() -> (i64, &'static str) {
         (WM_MENU_GRINDSTONE, "Repair & Disenchant")
     }
 
+    #[cfg(test)]
     fn set_slots(&mut self, top: Stack, bottom: Stack) {
         self.top = top;
         self.bottom = bottom;
@@ -656,7 +641,6 @@ impl GrindstoneMenu {
 }
 
 // ---------- loom ----------
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_DYE_COLORS: &[&str] = &[
     "white",
     "orange",
@@ -678,7 +662,6 @@ const WM_DYE_COLORS: &[&str] = &[
 
 // Vanilla `#minecraft:no_item_required` banner patterns in registry order — the
 // 33 shapes a loom offers without a banner-pattern item.
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_LOOM_PATTERNS: &[&str] = &[
     "square_bottom_left",
     "square_bottom_right",
@@ -716,17 +699,14 @@ const WM_LOOM_PATTERNS: &[&str] = &[
     "bricks",
 ];
 
-#[cfg_attr(not(test), allow(dead_code))]
 const WM_MAX_BANNER_LAYERS: usize = 6;
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BannerLayer {
     pattern: String,
     color: u8, // DyeColor index 0..=15
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct LoomMenu {
     banner: Stack,
@@ -736,7 +716,6 @@ struct LoomMenu {
     selected_pattern: Option<String>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_banner_name(st: &Stack) -> Option<&'static str> {
     item_to_name(st.0).and_then(|n| {
         WM_DYE_COLORS
@@ -746,7 +725,6 @@ fn wm_banner_name(st: &Stack) -> Option<&'static str> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_dye_color_index(st: &Stack) -> Option<u8> {
     item_to_name(st.0).and_then(|n| {
         WM_DYE_COLORS
@@ -756,7 +734,6 @@ fn wm_dye_color_index(st: &Stack) -> Option<u8> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_pattern_item_name(st: &Stack) -> Option<&'static str> {
     item_to_name(st.0).and_then(|n| match n {
         "flower_banner_pattern" => Some("flower"),
@@ -771,12 +748,12 @@ fn wm_pattern_item_name(st: &Stack) -> Option<&'static str> {
     })
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl LoomMenu {
     fn screen() -> (i64, &'static str) {
         (WM_MENU_LOOM, "Loom")
     }
 
+    #[cfg(test)]
     fn set_slots(&mut self, banner: Stack, dye: Stack, pattern_item: Stack) {
         self.set_banner(banner, Vec::new());
         self.dye = dye;
@@ -785,6 +762,7 @@ impl LoomMenu {
     }
 
     // `layers` comes from the banner's banner_patterns component at wiring time.
+    #[cfg(test)]
     fn set_banner(&mut self, banner: Stack, layers: Vec<BannerLayer>) {
         self.banner = banner;
         self.banner_layers = layers;
@@ -860,7 +838,6 @@ impl LoomMenu {
 }
 
 // ---------- cartography table ----------
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MapState {
     map_id: i64,
@@ -868,7 +845,6 @@ struct MapState {
     locked: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct CartographyMenu {
     map: Stack,
@@ -876,17 +852,18 @@ struct CartographyMenu {
     map_state: Option<MapState>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl CartographyMenu {
     fn screen() -> (i64, &'static str) {
         (WM_MENU_CARTOGRAPHY, "Cartography Table")
     }
 
+    #[cfg(test)]
     fn set_map(&mut self, st: Stack, state: Option<MapState>) {
         self.map = st;
         self.map_state = state;
     }
 
+    #[cfg(test)]
     fn set_addition(&mut self, st: Stack) {
         self.addition = st;
     }
@@ -940,7 +917,6 @@ impl CartographyMenu {
 }
 
 // ---------- entity equipment (S2C 0x5b SetEquipment) ----------
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 enum EquipmentSlot {
@@ -952,14 +928,12 @@ enum EquipmentSlot {
     Head = 5,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct EntityEquipment {
     // Indexed by EquipmentSlot discriminant.
     slots: [Stack; 6],
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl EntityEquipment {
     fn set(&mut self, slot: EquipmentSlot, st: Stack) {
         self.slots[slot as usize] = st;
@@ -973,7 +947,7 @@ impl EntityEquipment {
 // Streaming form of `slot_read_wire` for stacks embedded mid-packet (SetEquipment
 // entries are back-to-back, so the decoder must report how many bytes a stack
 // consumed). The component-boundary table mirrors slot_read_wire exactly.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
     let mut p = 0usize;
     let cnt = slot_read_varint(b, &mut p)?;
@@ -1009,7 +983,7 @@ fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
             }
             5 => {
                 if p + 3 <= b.len() && b[p] == 8 {
-                    let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                    let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap_or_default()) as usize;
                     p += 3;
                     p = p.checked_add(l).filter(|end| *end <= b.len())?;
                 } else {
@@ -1023,7 +997,7 @@ fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
                 }
                 for _ in 0..n {
                     if p + 3 <= b.len() && b[p] == 8 {
-                        let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap()) as usize;
+                        let l = u16::from_be_bytes(b[p + 1..p + 3].try_into().unwrap_or_default()) as usize;
                         p += 3;
                         p = p.checked_add(l).filter(|end| *end <= b.len())?;
                     } else {
@@ -1089,7 +1063,6 @@ fn wm_stack_decode(b: &[u8]) -> Option<(Stack, usize)> {
 
 // `ClientboundSetEquipmentPacket` body: VarInt entity id, then one or more
 // (slot byte, ItemStack) entries; bit 0x80 marks every entry except the last.
-#[cfg_attr(not(test), allow(dead_code))]
 fn encode_set_equipment(eid: i32, eq: &EntityEquipment) -> Vec<u8> {
     let entries: Vec<(u8, &Stack)> = eq
         .slots
@@ -1107,7 +1080,7 @@ fn encode_set_equipment(eid: i32, eq: &EntityEquipment) -> Vec<u8> {
     p
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn decode_set_equipment(b: &[u8]) -> Option<(i32, Vec<(u8, Stack)>)> {
     let mut rest = b;
     let eid = read_protocol_i32(&mut rest)?;
@@ -1132,7 +1105,6 @@ fn decode_set_equipment(b: &[u8]) -> Option<(i32, Vec<(u8, Stack)>)> {
 // Vanilla `Mob.finalizeSpawn` equipment picks (weapon-only core; armor rolls are
 // a P2-C follow-up). `roll` bits: low byte drives the drowned weapon chance,
 // bits 8..16 the piglin sword/crossbow pick.
-#[cfg_attr(not(test), allow(dead_code))]
 fn default_mob_equipment(entity_name: &str, difficulty: u8, roll: u64) -> EntityEquipment {
     let _ = difficulty;
     let mut eq = EntityEquipment::default();
@@ -1171,7 +1143,6 @@ fn default_mob_equipment(entity_name: &str, difficulty: u8, roll: u64) -> Entity
 }
 
 // ---------- mount / passenger graph (S2C 0x5f SetPassengers + C2S vehicles) ----------
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VehicleKind {
     Boat,
@@ -1186,7 +1157,6 @@ enum VehicleKind {
     Llama,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct VehicleEnv {
     on_water: bool,
@@ -1197,7 +1167,6 @@ struct VehicleEnv {
     move_speed: f64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum MountError {
     Full,
@@ -1206,7 +1175,6 @@ enum MountError {
     UnknownVehicle,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl VehicleKind {
     fn max_passengers(self) -> usize {
         match self {
@@ -1288,11 +1256,11 @@ impl VehicleKind {
 
 /// `Boat.Status` (cov$a): the hull's relation to its support, re-evaluated
 /// every tick before `floatBoat` picks friction and buoyancy terms.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WmBoatStatus {
     InWater,
     UnderFlowingWater,
+    #[cfg_attr(not(test), allow(dead_code))]
     UnderWater,
     OnLand,
     InAir,
@@ -1307,7 +1275,6 @@ const WM_BOAT_SUBMERGED_LIFT: f64 = 0.01;
 
 /// Vanilla block `getFriction` (BlockBehaviour.Properties#friction): the
 /// support-block value an ON_LAND boat slides on.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_support_friction(block: &str) -> f64 {
     match block {
         "ice" | "packed_ice" | "frosted_ice" => 0.98,
@@ -1321,7 +1288,6 @@ fn wm_support_friction(block: &str) -> f64 {
 /// `floatBoat` (cov.I) `invFriction` per status. ON_LAND uses the support
 /// block's friction; vanilla's `landFriction /= 2` for a steering player is a
 /// dead write — `getStatus` recomputes the field before it is read again.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boat_friction(status: WmBoatStatus, land_friction: f64) -> f64 {
     match status {
         WmBoatStatus::InWater | WmBoatStatus::UnderFlowingWater | WmBoatStatus::InAir => {
@@ -1334,14 +1300,12 @@ fn wm_boat_friction(status: WmBoatStatus, land_friction: f64) -> f64 {
 
 /// Steady-state horizontal speed of a paddled boat: thrust per tick divided by
 /// the fraction of velocity lost to friction (`v*0.04 = v*(1-f)`).
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boat_terminal_speed(friction: f64) -> f64 {
     WM_BOAT_FORWARD_THRUST / (1.0 - friction)
 }
 
 /// The vanilla `d1` buoyancy term: hull submersion fraction on the surface,
 /// a fixed 0.01 while UNDER_WATER, 0 otherwise.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boat_lift(status: WmBoatStatus, submerged_fraction: f64) -> f64 {
     match status {
         WmBoatStatus::InWater => submerged_fraction,
@@ -1353,7 +1317,6 @@ fn wm_boat_lift(status: WmBoatStatus, submerged_fraction: f64) -> f64 {
 /// One `floatBoat` step (cov.I): `v = (vx*f, vy + buoyTerm, vz*f)` and
 /// `deltaRotation *= f`; when `lift > 0` the y term is rescaled by 0.75 after
 /// the buoyancy kick. Returns `(velocity, damped_delta_rotation)`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boat_float_tick(
     status: WmBoatStatus,
     land_friction: f64,
@@ -1377,7 +1340,6 @@ fn wm_boat_float_tick(
 }
 
 /// Paddle flags from `ServerboundPaddleBoatPacket` / steering input.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct WmBoatInput {
     left: bool,
@@ -1395,7 +1357,6 @@ const WM_BOAT_REVERSE_THRUST: f64 = 0.005;
 /// by 1 degree/tick, one-sided paddling without row input drifts at 0.005,
 /// `up` rows forward at 0.04, `down` backpaddles at 0.005. The thrust vector
 /// uses the yaw *after* the rotation step. Returns `(yaw, delta_rot, vel)`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boat_control_tick(
     input: WmBoatInput,
     yaw: f64,
@@ -1434,14 +1395,12 @@ fn wm_boat_control_tick(
 
 /// `AbstractMinecart.getMaxSpeed` (cot.p): `(inWater ? 4.0 : 8.0) / 20` per
 /// tick — the vanilla 8 m/s rail cap, halved under water.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_minecart_max_speed(in_water: bool) -> f64 {
     (if in_water { 4.0 } else { 8.0 }) / 20.0
 }
 
 /// `applyNaturalSlowdown` (cot.t): `v *= (d, 0, d)` with `d = 0.997` when a
 /// passenger rides, else `0.96`; under water every axis takes a further 0.95.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_minecart_slowdown(has_passenger: bool, in_water: bool, vel: [f64; 3]) -> [f64; 3] {
     let damp = if has_passenger { 0.997 } else { 0.96 };
     let mut next = [vel[0] * damp, 0.0, vel[2] * damp];
@@ -1451,16 +1410,16 @@ fn wm_minecart_slowdown(has_passenger: bool, in_water: bool, vel: [f64; 3]) -> [
     next
 }
 
+#[cfg(test)]
 const WM_MINECART_SLOPE_BOOST: f64 = 0.0078125;
 
 /// Acceleration applied along ascending rail shapes each tick; 0.2x in water.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wm_minecart_slope_boost(in_water: bool) -> f64 {
     WM_MINECART_SLOPE_BOOST * if in_water { 0.2 } else { 1.0 }
 }
 
 /// The straight `RailShape`s that can give the powered-rail static kick.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WmRailShape {
     NorthSouth,
@@ -1471,7 +1430,6 @@ enum WmRailShape {
 /// Powered-rail tail of `moveAlongTrack` (cot.c): at speed above 0.01 the cart
 /// gains 0.06 along its own direction; a standing cart is kicked 0.02 away
 /// from a redstone-conductor wall along the rail axis.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_minecart_powered_boost(
     vx: f64,
     vz: f64,
@@ -1511,7 +1469,6 @@ fn wm_minecart_powered_boost(
 
 /// An unpowered powered-rail brakes the cart (`$$7` in cot.c): below 0.03
 /// blocks/tick it stops dead, otherwise half the horizontal speed is shed.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_minecart_rail_brake(vx: f64, vz: f64) -> (f64, f64) {
     if vx.hypot(vz) < 0.03 {
         (0.0, 0.0)
@@ -1522,7 +1479,6 @@ fn wm_minecart_rail_brake(vx: f64, vz: f64) -> (f64, f64) {
 
 /// `moveAlongTrack`'s move call: horizontal velocity (0.75x while ridden) is
 /// clamped to the per-tick max speed; y is carried by the rail, not velocity.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_minecart_rail_move(
     vx: f64,
     vz: f64,
@@ -1538,7 +1494,6 @@ fn wm_minecart_rail_move(
 }
 
 /// `DetectorRailBlock`: emits 15 while a minecart stands on it.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_detector_rail_signal(occupied: bool) -> u8 {
     if occupied {
         15
@@ -1550,14 +1505,13 @@ fn wm_detector_rail_signal(occupied: bool) -> u8 {
 /// `ItemBasedSteering` (cjp/cjq) shared by pig and strider boosts: the total
 /// boost is `nextInt(841) + 140` ticks and the multiplier sweeps
 /// `1 + 1.15 * sin(pi * t / total)`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wm_boost_total_ticks(roll_0_840: u32) -> u32 {
     140 + roll_0_840
 }
 
 const WM_BOOST_MAX: f64 = 1.0 + 1.15;
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_boost_multiplier(elapsed: u32, total: u32) -> f64 {
     if total == 0 {
         return 0.0;
@@ -1570,7 +1524,6 @@ fn wm_boost_multiplier(elapsed: u32, total: u32) -> f64 {
 const WM_PIG_BASE_SPEED: f64 = 0.25;
 const WM_PIG_RIDE_FACTOR: f64 = 0.225;
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_pig_ride_speed(movement_speed: f64, boost_multiplier: f64) -> f64 {
     movement_speed * WM_PIG_RIDE_FACTOR * boost_multiplier
 }
@@ -1582,14 +1535,12 @@ const WM_STRIDER_BASE_SPEED: f64 = 0.175;
 const WM_STRIDER_COLD_FACTOR: f64 = 0.35;
 const WM_STRIDER_WARM_FACTOR: f64 = 0.55;
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_strider_ride_speed(movement_speed: f64, cold: bool, boost_multiplier: f64) -> f64 {
     movement_speed * if cold { WM_STRIDER_COLD_FACTOR } else { WM_STRIDER_WARM_FACTOR }
         * boost_multiplier
 }
 
 /// Strider lava buoyancy (ckq): inside lava `v *= 0.5` then +0.05 to y.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_strider_lava_buoyancy(vel: [f64; 3]) -> [f64; 3] {
     [vel[0] * 0.5, vel[1] * 0.5 + 0.05, vel[2] * 0.5]
 }
@@ -1597,7 +1548,6 @@ fn wm_strider_lava_buoyancy(vel: [f64; 3]) -> [f64; 3] {
 /// `AbstractHorse.handleStartJump` (chi.b(int)): the client's 0..=100 jump
 /// meter clamps negatives to 0, maps <90 onto 0.4..0.8 and >=90 to 1.0.
 /// Shared by every AbstractHorse descendant (horses, donkeys, mules, camels).
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_horse_jump_scale(charge: i32) -> f64 {
     let charge = charge.max(0);
     if charge >= 90 {
@@ -1609,7 +1559,6 @@ fn wm_horse_jump_scale(charge: i32) -> f64 {
 
 /// `executeRidersJump` vertical term: `getCustomJump() * scale *
 /// getBlockJumpFactor() + getJumpBoostPower()`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_horse_jump_velocity(
     jump_strength: f64,
     scale: f64,
@@ -1621,14 +1570,12 @@ fn wm_horse_jump_velocity(
 
 /// `LivingEntity.getJumpBoostPower`: `0.1 * (amplifier + 1)` while the jump
 /// boost effect is active.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_jump_boost_power(amplifier: Option<i32>) -> f64 {
     amplifier.map_or(0.0, |amp| 0.1 * (amp as f64 + 1.0))
 }
 
 /// The horizontal kick `executeRidersJump` adds while the rider steers forward
 /// (`vec3.z > 0`): `(-0.4 * sin(yaw) * scale, 0, 0.4 * cos(yaw) * scale)`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn wm_horse_jump_horizontal(yaw: f64, scale: f64) -> (f64, f64) {
     let rad = yaw.to_radians();
     (-0.4 * rad.sin() * scale, 0.4 * rad.cos() * scale)
@@ -1636,17 +1583,16 @@ fn wm_horse_jump_horizontal(yaw: f64, scale: f64) -> (f64, f64) {
 
 /// Spawn attribute rolls (chi.a/chi.b): JUMP_STRENGTH = `0.4 + 0.2 * (r1+r2+r3)`
 /// and MOVEMENT_SPEED = `(0.45 + 0.3 * (r1+r2+r3)) * 0.25`.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wm_horse_spawn_jump_strength(rolls: [f64; 3]) -> f64 {
     0.4 + 0.2 * rolls.iter().sum::<f64>()
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn wm_horse_spawn_movement_speed(rolls: [f64; 3]) -> f64 {
     (0.45 + 0.3 * rolls.iter().sum::<f64>()) * 0.25
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 struct MountRegistry {
     kinds: HashMap<i32, VehicleKind>,
@@ -1655,7 +1601,6 @@ struct MountRegistry {
     vehicle_of: HashMap<i32, i32>,      // passenger eid -> vehicle eid
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl MountRegistry {
     fn register_vehicle(&mut self, eid: i32, kind: VehicleKind, pos: [f64; 3]) {
         self.kinds.insert(eid, kind);
@@ -1774,14 +1719,12 @@ impl MountRegistry {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum VehicleReject {
     UnknownVehicle,
     TooQuickly,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct VehicleMoveStep {
     carry_delta: (f64, f64, f64),
@@ -1791,7 +1734,6 @@ struct VehicleMoveStep {
 
 // `ServerboundMoveVehiclePacket` (C2S 0x1e): x,y,z f64 + yaw,pitch f32.
 // Non-finite coordinates are the vanilla invalid_vehicle_movement disconnect.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MoveVehiclePacket {
     x: f64,
@@ -1801,31 +1743,28 @@ struct MoveVehiclePacket {
     pitch: f32,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn decode_move_vehicle(b: &[u8]) -> Option<MoveVehiclePacket> {
     if b.len() != 32 {
         return None;
     }
     let pkt = MoveVehiclePacket {
-        x: f64::from_be_bytes(b[0..8].try_into().unwrap()),
-        y: f64::from_be_bytes(b[8..16].try_into().unwrap()),
-        z: f64::from_be_bytes(b[16..24].try_into().unwrap()),
-        yaw: f32::from_be_bytes(b[24..28].try_into().unwrap()),
-        pitch: f32::from_be_bytes(b[28..32].try_into().unwrap()),
+        x: f64::from_be_bytes(b[0..8].try_into().unwrap_or_default()),
+        y: f64::from_be_bytes(b[8..16].try_into().unwrap_or_default()),
+        z: f64::from_be_bytes(b[16..24].try_into().unwrap_or_default()),
+        yaw: f32::from_be_bytes(b[24..28].try_into().unwrap_or_default()),
+        pitch: f32::from_be_bytes(b[28..32].try_into().unwrap_or_default()),
     };
     (pkt.x.is_finite() && pkt.y.is_finite() && pkt.z.is_finite() && pkt.yaw.is_finite() && pkt.pitch.is_finite())
         .then_some(pkt)
 }
 
 // `ServerboundPaddleBoatPacket` (C2S 0x1f): two bools.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PaddleBoatPacket {
     left: bool,
     right: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn decode_paddle_boat(b: &[u8]) -> Option<PaddleBoatPacket> {
     (b.len() == 2).then(|| PaddleBoatPacket {
         left: b[0] != 0,
@@ -1835,7 +1774,6 @@ fn decode_paddle_boat(b: &[u8]) -> Option<PaddleBoatPacket> {
 
 // `ServerboundPlayerInputPacket` (C2S 0x26): f32 sideways, f32 forward, u8
 // flags — bit0 jump, bit1 unmount/shift.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlayerInputPacket {
     sideways: f32,
@@ -1844,11 +1782,10 @@ struct PlayerInputPacket {
     unmount: bool,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn decode_player_input(b: &[u8]) -> Option<PlayerInputPacket> {
     (b.len() == 9).then(|| {
-        let sideways = f32::from_be_bytes(b[0..4].try_into().unwrap());
-        let forward = f32::from_be_bytes(b[4..8].try_into().unwrap());
+        let sideways = f32::from_be_bytes(b[0..4].try_into().unwrap_or_default());
+        let forward = f32::from_be_bytes(b[4..8].try_into().unwrap_or_default());
         PlayerInputPacket {
             sideways,
             forward,
@@ -1859,7 +1796,7 @@ fn decode_player_input(b: &[u8]) -> Option<PlayerInputPacket> {
     .filter(|p| p.sideways.is_finite() && p.forward.is_finite())
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 fn decode_set_passengers(b: &[u8]) -> Option<(i32, Vec<i32>)> {
     let mut rest = b;
     let vehicle = read_protocol_i32(&mut rest)?;
