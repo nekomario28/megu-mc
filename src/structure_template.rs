@@ -4977,6 +4977,7 @@ mod tests {
         let mut ctx = FC::new(&mut g);
         ctx.test_no_terrain = true;
         ctx.test_default_air = true;
+        ctx.test_base_cell((8, 71, 9), reg.state_of("minecraft:stone", None));
         let mut rng = Xor::seed_worldgen(17);
         template
             .place_blocks(
@@ -5039,6 +5040,7 @@ mod tests {
         let mut ctx = FC::new(&mut g);
         ctx.test_no_terrain = true;
         ctx.test_default_air = true;
+        ctx.test_base_cell((8, 71, 9), reg.state_of("minecraft:stone", None));
         let mut rng = Xor::seed_worldgen(17);
         assert!(
             jukebox

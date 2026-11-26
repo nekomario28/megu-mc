@@ -3706,17 +3706,30 @@ mod pipeline_tests {
             other => panic!("a buried treasure chest stages a loot container, got {other:?}"),
         }
 
-        // `minecraft:desert_pyramid`: the four chests are staged, and the archaeology is not:
-        // this runtime has no brushing store, and the item store cannot hold that table without
-        // making a broken suspicious-sand block spill loot native never yields.
+        // `minecraft:desert_pyramid`: the four treasure chests and the
+        // archaeology suspicious-sand brushables stage their own payloads.
         let pyramid = payloads_at(
             &mut ow,
             d.structures["minecraft:desert_pyramid"].step,
             -573,
             -555,
         );
-        assert_eq!(pyramid.len(), 4, "four pyramid chests in this chunk");
-        for (pos, payload) in &pyramid {
+        let pyramid_chests: Vec<_> = pyramid
+            .iter()
+            .filter(|(_, p)| matches!(p, GenerationPayload::LootContainer { .. }))
+            .collect();
+        let pyramid_brushables: Vec<_> = pyramid
+            .iter()
+            .filter(|(_, p)| matches!(p, GenerationPayload::Brushable { .. }))
+            .collect();
+        assert_eq!(pyramid_chests.len(), 4, "four pyramid chests in this chunk");
+        assert!(!pyramid_brushables.is_empty(), "pyramid archaeology brushables stage in this chunk");
+        assert_eq!(
+            pyramid_chests.len() + pyramid_brushables.len(),
+            pyramid.len(),
+            "only chests and brushables stage in the desert pyramid"
+        );
+        for (pos, payload) in &pyramid_chests {
             assert_eq!(
                 payload,
                 &GenerationPayload::LootContainer {

@@ -26694,6 +26694,13 @@ mod mineshaft_runtime_tests {
             mob.dim == DimId::End && mob.etype == name_to_etype("shulker").unwrap()
         }));
         let brushable_pos = (6, 64, 0);
+        set_block_dim(
+            DimId::End,
+            brushable_pos.0,
+            brushable_pos.1,
+            brushable_pos.2,
+            name_to_state("suspicious_gravel").unwrap(),
+        );
         materialize_generation_payloads_for_dim(
             DimId::End,
             vec![(brushable_pos, crate::generation_payload::GenerationPayload::Brushable {

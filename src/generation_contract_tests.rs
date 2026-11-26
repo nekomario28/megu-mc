@@ -4679,7 +4679,7 @@ fn geode_crack_resets_only_neighbours_that_hold_a_fluid() {
         "true",
     );
     let water = reg.state_of("minecraft:water", None);
-    let run = |extra: Option<(i32, i32, i32)>| -> Vec<((i32, i32, i32), u32)> {
+    let run = |extra: Option<(i32, i32, i32)>| -> (Vec<((i32, i32, i32), u32)>, Vec<((i32, i32, i32), u32)>) {
         let cf = super::p_cf(&jparse(json.as_bytes()).expect("json"))
             .expect("the geode config must parse");
         let mut g = Gen::load(0, crate::name_to_state).expect("datapack");
@@ -4703,15 +4703,17 @@ fn geode_crack_resets_only_neighbours_that_hold_a_fluid() {
         if let Some(at) = extra {
             assert_eq!(
                 ctx.get(at.0, at.1, at.2),
-                water,
-                "a waterlogged neighbour holds source water, so the crack step writes \
-                 the fluid's legacy block there (`WaterFluid.Source.createLegacyBlock`)"
+                slab,
+                "vanilla schedules a fluid tick without collapsing the waterlogged solid"
             );
         }
-        writes
+        let ticks = ctx.g.generated_fluid_ticks();
+        (writes, ticks)
     };
-    let dry = run(None);
+    let (dry, dry_ticks) = run(None);
     assert!(!dry.is_empty(), "the fixture must carve something");
+    assert!(dry_ticks.is_empty(), "dry neighbours must schedule no fluid ticks");
+    let _ = water;
     // The crack carves cells; every cell it writes must be one the walk reached, so a
     // neighbour write at a cell the walk never reached is the old bug's signature.
     let dry_at: std::collections::HashSet<(i32, i32, i32)> = dry.iter().map(|&(p, _)| p).collect();
@@ -4746,16 +4748,14 @@ fn geode_crack_resets_only_neighbours_that_hold_a_fluid() {
         }
     }
     let cand = cand.expect("the fixture must carve a cell with an unwritten neighbour");
-    let wet = run(Some(cand));
-    let touched: Vec<_> = wet.iter().filter(|&&(p, _)| p == cand).cloned().collect();
+    let (wet, wet_ticks) = run(Some(cand));
     assert!(
-        !touched.is_empty() && touched.iter().all(|&(_, st)| st == water),
-        "the crack step writes the fluid neighbour at {cand:?}: {touched:?}"
+        wet_ticks.iter().any(|&(p, _)| p == cand),
+        "the crack step schedules a zero-delay fluid tick for the waterlogged neighbour at {cand:?}: {wet_ticks:?}"
     );
-    let rest: Vec<_> = wet.iter().filter(|&&(p, _)| p != cand).cloned().collect();
     assert_eq!(
-        rest, dry,
-        "the crack step may only re-write the fluid neighbour, at {cand:?}"
+        wet, dry,
+        "the crack step must not overwrite the waterlogged neighbour block at {cand:?}"
     );
 }
 

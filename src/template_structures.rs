@@ -1576,16 +1576,29 @@ fn update_shape<W: TemplateWorld>(
     // direction - `#minecraft:sand` or another cactus below and no solid or
     // lava-bearing cell beside it.
     if bare == "cactus" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         let base_ok =
             reg.name_of(below) == "minecraft:cactus" || reg.in_tag(below, "minecraft:sand");
-        let blocked = [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)]
+        let blocked = [(2u8, 0i32, -1i32), (3, 0, 1), (4, -1, 0), (5, 1, 0)]
             .iter()
-            .any(|&(dx, dz)| {
-                let s = world.get(pos.0 + dx, pos.1, pos.2 + dz);
+            .any(|&(d, dx, dz)| {
+                let s = if direction == d {
+                    neighbor
+                } else {
+                    world.get(pos.0 + dx, pos.1, pos.2 + dz)
+                };
                 reg.is_legacy_solid(s) || reg.fluid_name(s).ends_with("lava")
             });
-        let above_wet = reg.is_liquid_block(world.get(pos.0, pos.1.wrapping_add(1), pos.2));
+        let above = if direction == 1 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_add(1), pos.2)
+        };
+        let above_wet = reg.is_liquid_block(above);
         if !base_ok || blocked || above_wet {
             return air;
         }
@@ -1622,7 +1635,11 @@ fn update_shape<W: TemplateWorld>(
                 return reg.with_prop(state, "leaves", &leaves);
             }
         }
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         if !reg.in_tag(below, "minecraft:bamboo_plantable_on") {
             return air;
         }
@@ -1729,7 +1746,11 @@ fn update_shape<W: TemplateWorld>(
     // state; the tick's outcome is removal, so this pass emits AIR directly.
     // (The tick itself exists to let the whole plant collapse as one wave.)
     if bare == "chorus_plant" || bare == "chorus_flower" {
-        let below = world.get(pos.0, pos.1.wrapping_sub(1), pos.2);
+        let below = if direction == 0 {
+            neighbor
+        } else {
+            world.get(pos.0, pos.1.wrapping_sub(1), pos.2)
+        };
         let below_name = reg.name_of(below);
         let mut survives = matches!(
             below_name,
@@ -1912,7 +1933,7 @@ fn update_neighbor_survival_shapes<W: TemplateWorld>(
     // Cake and candle cake use the legacy solid predicate; candles use
     // `canSupportCenter`; a conduit also uses legacy solid. Sea pickles accept
     // a non-empty collision face as well as a FULL sturdy face.
-    if (bare == "cake" || bare.ends_with("_candle_cake"))
+    if (bare == "cake" || bare == "candle_cake" || bare.ends_with("_candle_cake"))
         && direction == 0
         && !reg.is_legacy_solid(neighbor)
     {
@@ -6427,16 +6448,16 @@ mod template_structures_tests {
         ] {
             let behind_st = reg.state_of(behind, None);
             // `facing=north` means attached to the block at z-1, which is
-            // direction 2 (NORTH) from the torch.
-            let out = shape_case(reg, wall, (0, 100, 0), 2, behind_st, &[]);
+            // Wall torch `facing=north` attaches to the block SOUTH (dir 3).
+            let out = shape_case(reg, wall, (0, 100, 0), 3, behind_st, &[]);
             assert_eq!(
                 out == wall,
                 keeps,
                 "wall_torch attached to {behind}: survival answer differs"
             );
             assert!(out == wall || out == air);
-            // A change anywhere else (e.g. the block in front) never drops it.
-            let front = shape_case(reg, wall, (0, 100, 0), 3, air, &[]);
+            // A change anywhere else (e.g. the block in front, NORTH dir 2) never drops it.
+            let front = shape_case(reg, wall, (0, 100, 0), 2, air, &[]);
             assert_eq!(front, wall, "wall_torch dropped by a front-side change");
         }
         // Lanterns: standing asks CENTER UP, hanging asks CENTER DOWN.
@@ -6499,18 +6520,18 @@ mod template_structures_tests {
                 assert_eq!(out == floor, keeps, "{name} floor on {below}");
                 assert!(out == floor || out == air);
             }
-            // face=wall attached to the north block; face=ceiling reads UP.
+            // face=wall facing=north attaches to the SOUTH block (dir 3); face=ceiling reads UP.
             let wallf = reg.with_prop(reg.state_of(name, None), "face", "wall");
             let wallf = reg.with_prop(wallf, "facing", "north");
             let glass = reg.state_of("minecraft:glass", None);
             let leaves = reg.state_of("minecraft:oak_leaves", None);
             assert_eq!(
-                shape_case(reg, wallf, pos, 2, glass, &[]),
+                shape_case(reg, wallf, pos, 3, glass, &[]),
                 wallf,
                 "{name} on glass wall (sturdy full face)"
             );
             assert_eq!(
-                shape_case(reg, wallf, pos, 2, leaves, &[]),
+                shape_case(reg, wallf, pos, 3, leaves, &[]),
                 air,
                 "{name} drops off leaves (no full face)"
             );
@@ -6530,16 +6551,17 @@ mod template_structures_tests {
         let reg = breg().unwrap();
         let air = reg.state_of("minecraft:air", None);
         let ladder = reg.with_prop(reg.state_of("minecraft:ladder", None), "facing", "east");
-        // facing=east attaches to the block EAST (dir 5).
+        // facing=east attaches to the block WEST (dir 4 = facing.getOpposite()).
+        // Vanilla 1.21.1 LadderBlock.canAttachTo asks `isFaceSturdy(FULL)` on the support.
         for (behind, keeps) in [
             ("minecraft:stone", true),
             ("minecraft:glowstone", true),
-            ("minecraft:glass", false),
+            ("minecraft:glass", true),
             ("minecraft:oak_leaves", false),
             ("minecraft:air", false),
         ] {
             let st = reg.state_of(behind, None);
-            let out = shape_case(reg, ladder, (0, 100, 0), 5, st, &[]);
+            let out = shape_case(reg, ladder, (0, 100, 0), 4, st, &[]);
             assert_eq!(out == ladder, keeps, "ladder against {behind}");
             assert!(out == ladder || out == air);
         }
@@ -6769,7 +6791,7 @@ mod template_structures_tests {
         let world_cells = &[];
         let above = shape_case(reg, tip, pos, 1, tip, &world_cells[..]);
         assert_eq!(above, tip, "chained pointed_dripstone holds");
-        // Tripwire hook needs a redstone conductor on facing's opposite side.
+        // Tripwire hook needs a FULL sturdy face on facing.getOpposite() (facing=south -> NORTH dir 2).
         let hook = reg.with_prop(
             reg.state_of("minecraft:tripwire_hook", None),
             "facing",
@@ -6777,12 +6799,12 @@ mod template_structures_tests {
         );
         for (behind, keeps) in [
             ("minecraft:stone", true),
-            ("minecraft:glass", false),
+            ("minecraft:glass", true),
             ("minecraft:oak_leaves", false),
             ("minecraft:air", false),
         ] {
             let st = reg.state_of(behind, None);
-            let out = shape_case(reg, hook, pos, 3, st, &[]);
+            let out = shape_case(reg, hook, pos, 2, st, &[]);
             assert_eq!(out == hook, keeps, "tripwire_hook on {behind}");
             assert!(out == hook || out == air);
         }
@@ -6876,9 +6898,11 @@ mod template_structures_tests {
         assert_eq!(shape_case(reg, ceil_bell, pos, 1, air, &[]), air);
         assert_eq!(shape_case(reg, wall_bell, pos, 2, stone, &[]), wall_bell);
         assert_eq!(shape_case(reg, wall_bell, pos, 2, air, &[]), air);
-        // double_wall reads the two side faces: with facing=north those are
-        // west(4)/east(5) - losing one drops it, losing a front/back does not.
-        assert_eq!(shape_case(reg, dwall_bell, pos, 4, air, &[]), air);
+        // double_wall reads facing and facing.getOpposite(): with facing=north those are
+        // north(2) and south(3) - losing one drops it, losing west(4)/east(5) does not.
+        assert_eq!(shape_case(reg, dwall_bell, pos, 2, air, &[]), air);
+        assert_eq!(shape_case(reg, dwall_bell, pos, 3, air, &[]), air);
+        assert_eq!(shape_case(reg, dwall_bell, pos, 4, air, &[]), dwall_bell);
         // Scaffolding's shape callback does not rewrite `bottom`; it returns
         // the state unchanged and schedules the distance recompute tick.
         let scaf = reg.state_of("minecraft:scaffolding", None);
@@ -6917,23 +6941,19 @@ mod template_structures_tests {
         let floor_banner = reg.state_of("minecraft:white_banner", None);
         assert_eq!(shape_case(reg, floor_banner, pos, 0, fence, &[]), floor_banner);
         assert_eq!(shape_case(reg, floor_banner, pos, 0, air, &[]), air);
-        // Hanging signs: ceiling variants need a sturdy DOWN face above; wall
-        // variants attach like wall signs. A chain rides a sturdy face above,
-        // another chain, or a lantern-like hanging parent; below alone is air.
+        // Chains do not override `canSurvive` in Vanilla 1.21.1 and survive in air.
         let chain = reg.state_of("minecraft:chain", None);
         assert_eq!(shape_case(reg, chain, pos, 1, stone, &[]), chain);
         assert_eq!(shape_case(reg, chain, pos, 1, chain, &[]), chain);
-        assert_eq!(shape_case(reg, chain, pos, 1, air, &[]), air);
-        // A horizontal chain (axis=x) hangs from east/west neighbours.
+        assert_eq!(shape_case(reg, chain, pos, 1, air, &[]), chain);
         let hchain = reg.with_prop(chain, "axis", "x");
         assert_eq!(shape_case(reg, hchain, pos, 5, chain, &[]), hchain);
-        assert_eq!(shape_case(reg, hchain, pos, 5, air, &[]), air);
-        // Multiface blocks (glow lichen, sculk vein, moss, resin) stay while
-        // any claimed face has sturdy backing; they vanish when the last one
-        // goes. A lichen claiming only `down` reads the block above.
+        assert_eq!(shape_case(reg, hchain, pos, 5, air, &[]), hchain);
+        // Multiface blocks (glow lichen, sculk vein) stay while any claimed face
+        // has sturdy backing; a lichen claiming `down` reads the block BELOW (dir 0).
         let lichen = reg.with_prop(reg.state_of("minecraft:glow_lichen", None), "down", "true");
-        assert_eq!(shape_case(reg, lichen, pos, 1, stone, &[]), lichen);
-        assert_eq!(shape_case(reg, lichen, pos, 1, air, &[]), air);
+        assert_eq!(shape_case(reg, lichen, pos, 0, stone, &[]), lichen);
+        assert_eq!(shape_case(reg, lichen, pos, 0, air, &[]), air);
         // Tripwire itself updates its attachment props; only hooks have a
         // support question. A wire with no hooks keeps a state.
         let wire = reg.state_of("minecraft:tripwire", None);
@@ -6974,6 +6994,7 @@ mod template_structures_tests {
             ("minecraft:mangrove_propagule", "minecraft:mud", true),
             ("minecraft:mangrove_propagule", "minecraft:stone", false),
         ];
+        let air = reg.state_of("minecraft:air", None);
         for &(name, below, keeps) in cases {
             let st = reg.state_of(name, None);
             let below_st = reg.state_of(below, None);
@@ -6981,18 +7002,19 @@ mod template_structures_tests {
             world.set(pos.0, pos.1 - 1, pos.2, below_st);
             let out = postprocess_bush_shape(reg, st, &mut world, pos);
             assert_eq!(
-                out.is_none(),
+                out == Some(st),
                 keeps,
-                "{name} over {below}: postprocess answer differs"
+                "{name} over {below}: postprocess answer differs (got {out:?})"
             );
+            assert!(out == Some(st) || out == Some(air));
         }
         // Hanging roots need a FULL sturdy DOWN face above.
         let roots = reg.state_of("minecraft:hanging_roots", None);
         world.set(pos.0, pos.1, pos.2, roots);
         world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:stone", None));
-        assert!(postprocess_bush_shape(reg, roots, &mut world, pos).is_none());
+        assert_eq!(postprocess_bush_shape(reg, roots, &mut world, pos), Some(roots));
         world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:oak_fence", None));
-        assert!(postprocess_bush_shape(reg, roots, &mut world, pos).is_some());
+        assert_eq!(postprocess_bush_shape(reg, roots, &mut world, pos), Some(air));
         // A hanging propagule ignores the floor and reads the block above.
         let prop = reg.with_prop(
             reg.state_of("minecraft:mangrove_propagule", None),
@@ -7000,41 +7022,43 @@ mod template_structures_tests {
             "true",
         );
         world.set(pos.0, pos.1, pos.2, prop);
-        world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:air", None));
+        world.set(pos.0, pos.1 - 1, pos.2, air);
         world.set(
             pos.0,
             pos.1 + 1,
             pos.2,
             reg.state_of("minecraft:mangrove_leaves", None),
         );
-        assert!(postprocess_bush_shape(reg, prop, &mut world, pos).is_none());
-        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:air", None));
-        assert!(postprocess_bush_shape(reg, prop, &mut world, pos).is_some());
+        assert_eq!(postprocess_bush_shape(reg, prop, &mut world, pos), Some(prop));
+        world.set(pos.0, pos.1 + 1, pos.2, air);
+        assert_eq!(postprocess_bush_shape(reg, prop, &mut world, pos), Some(air));
         // Small dripleaf lower half: `#small_dripleaf_placeable` (clay, and
-        // moss under water) or `#dirt` while submerged.
+        // moss under water) or `#dirt` while waterlogged.
         let small = reg.state_of("minecraft:small_dripleaf", None);
         world.set(pos.0, pos.1, pos.2, small);
         world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:clay", None));
-        assert!(postprocess_bush_shape(reg, small, &mut world, pos).is_none());
+        assert_eq!(postprocess_bush_shape(reg, small, &mut world, pos), Some(small));
         world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:dirt", None));
-        assert!(
-            postprocess_bush_shape(reg, small, &mut world, pos).is_some(),
+        assert_eq!(
+            postprocess_bush_shape(reg, small, &mut world, pos),
+            Some(air),
             "small_dripleaf over dry dirt dies"
         );
-        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:water", None));
-        assert!(
-            postprocess_bush_shape(reg, small, &mut world, pos).is_none(),
-            "small_dripleaf over dirt under water stays"
+        let wet_small = reg.with_prop(small, "waterlogged", "true");
+        world.set(pos.0, pos.1, pos.2, wet_small);
+        assert_eq!(
+            postprocess_bush_shape(reg, wet_small, &mut world, pos),
+            Some(wet_small),
+            "waterlogged small_dripleaf over dirt stays"
         );
-        world.set(pos.0, pos.1 + 1, pos.2, reg.state_of("minecraft:air", None));
         // Upper half reads the lower half.
         let upper = reg.with_prop(small, "half", "upper");
         let lower = reg.with_prop(small, "half", "lower");
         world.set(pos.0, pos.1, pos.2, upper);
         world.set(pos.0, pos.1 - 1, pos.2, lower);
-        assert!(postprocess_bush_shape(reg, upper, &mut world, pos).is_none());
+        assert_eq!(postprocess_bush_shape(reg, upper, &mut world, pos), Some(upper));
         world.set(pos.0, pos.1 - 1, pos.2, reg.state_of("minecraft:stone", None));
-        assert!(postprocess_bush_shape(reg, upper, &mut world, pos).is_some());
+        assert_eq!(postprocess_bush_shape(reg, upper, &mut world, pos), Some(air));
     }
 }
 

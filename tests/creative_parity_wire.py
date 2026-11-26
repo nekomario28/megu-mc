@@ -65,8 +65,7 @@ def parity_components():
     lore = vi(1) + nbt_text("lore line")
     dyed_color = bytes([0x11, 0x22, 0x33, 0x44, 1])
     potion = (b"\x01" + vi(2) + b"\x01" + bytes([0x00, 0x33, 0x55, 0x77]) + vi(1)
-              + vi(3) + vi(1) + vi(60) + bytes([0, 1, 1, 0]) + b"\x01"
-              + slot_string("custom"))
+              + vi(3) + vi(1) + vi(60) + bytes([0, 1, 1, 0]))
     firework_explosion = (vi(2) + vi(1) + bytes([1, 2, 3, 4]) + vi(1)
                           + bytes([5, 6, 7, 8]) + bytes([1, 0]))
     fireworks = vi(2) + vi(1) + firework_explosion

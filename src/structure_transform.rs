@@ -363,7 +363,7 @@ fn inverse_transform(mirror: Mirror, rotation: Rotation) -> (Mirror, Rotation) {
                 [DIRECTION_MIRRORS[mirror as usize][direction as usize] as usize]
         })
         .collect();
-    for candidate_mirror in [Mirror::None, Mirror::LeftRight, Mirror::FrontBack] {
+    for candidate_mirror in [mirror, Mirror::None, Mirror::LeftRight, Mirror::FrontBack] {
         for candidate_rotation in [
             Rotation::None,
             Rotation::Clockwise90,

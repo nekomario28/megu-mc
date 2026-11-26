@@ -443,6 +443,8 @@ def anvil(game):
     with WireClient(game, "AnvilTester") as client:
         x, y, z = boot(client, "anvil")
         pos = x + 1, y, z
+        client.command(f"fill {x - 1} {y - 1} {z - 1} {x + 2} {y - 1} {z + 1} stone", "Filled")
+        client.wait_block((x + 1, y - 1, z), "stone")
         client.place(pos, "anvil")
         client.set_item(37, "diamond_sword")
         client.set_item(38, "iron_ingot", 2)
@@ -476,6 +478,8 @@ def enchanting(game):
         x, y, z = boot(client, "enchanting")
         pos = x, y, z - 2
         _, _, cz = pos
+        client.command(f"fill {x - 2} {y - 1} {cz - 2} {x + 2} {y - 1} {cz + 2} stone", "Filled")
+        client.wait_block((x, y - 1, cz), "stone")
         client.place(pos, "enchanting_table")
         for xa, za, xb, zb in ((x - 2, cz - 2, x + 2, cz - 2), (x - 2, cz + 2, x + 2, cz + 2),
                                 (x - 2, cz - 1, x - 2, cz + 1), (x + 2, cz - 1, x + 2, cz + 1)):
@@ -508,6 +512,8 @@ def smithing(game):
     with WireClient(game, "SmithTester") as client:
         x, y, z = boot(client, "smithing")
         pos = x - 1, y, z
+        client.command(f"fill {x - 2} {y - 1} {z - 1} {x + 1} {y - 1} {z + 1} stone", "Filled")
+        client.wait_block((x - 1, y - 1, z), "stone")
         client.place(pos, "smithing_table")
         inputs = ("netherite_upgrade_smithing_template", "diamond_sword", "netherite_ingot",
                   "sentry_armor_trim_smithing_template", "diamond_chestplate", "iron_ingot")

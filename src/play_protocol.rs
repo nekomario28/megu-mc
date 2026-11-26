@@ -14233,6 +14233,9 @@ fn disconnect_cleanup_with_login(
     cls.retain(|c| c.eid != me_cleanup.eid);
     let last_client_left = cls.is_empty();
     drop(cls);
+    // Flush any queued Disconnect frame and close the TCP socket immediately
+    // so peers observe EOF right away instead of waiting for world autosave.
+    me_cleanup.close_play_writer();
     // The sent-chunk set is only meaningful while the connection is live:
     // drop it explicitly so a lingering `Client` Arc in a reader's snapshot
     // cannot retain the bounding-box of chunk keys past disconnect.
@@ -14356,9 +14359,11 @@ fn disconnect_cleanup_with_login(
         // the lock for the whole body, and the body locks it again to clear it.
         if let Some((open, anchor)) = client_open_window_and_anchor(me_cleanup) {
             let audience = client_snapshot();
+            let mut before_audience = audience.clone();
+            before_audience.push(Arc::clone(me_cleanup));
             let cdim = *me_cleanup.dim.lock().unwrap_or_else(|e| e.into_inner());
             let halves = client_window_halves_dim(open, anchor, cdim);
-            let before = chest_opener_snapshot_dim(&audience, &halves);
+            let before = chest_opener_snapshot_dim(&before_audience, &halves);
             *me_cleanup.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *me_cleanup.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
             sync_chest_openers_dim(&audience, &before);

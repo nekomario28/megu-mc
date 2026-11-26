@@ -239,17 +239,12 @@ fn play_c2s_client_command(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPack
             match point {
                 Some(point) => (*sdim, point),
                 None => {
-                    // `spawnRadius`: a bedless respawn scatters
-                    // inside the radius square around world spawn.
+                    // `spawnRadius`: a bedless respawn scatters onto safe
+                    // ground inside the radius square around world spawn.
                     let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-                    let [bx, by, bz] = resolve_world_spawn_pos(
-                        [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
-                        spawn_radius_blocks(),
-                        world_rng::next_u64(),
-                    );
                     (
                         DimId::Overworld,
-                        (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, w.3),
+                        resolve_safe_world_spawn_pos(DimId::Overworld, w),
                     )
                 }
             }

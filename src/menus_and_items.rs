@@ -15355,7 +15355,7 @@ mod p8b2_parity_component_wire_tests {
         ].concat();
         let potion = [
             vec![1], vi(2), vec![1], vec![0x00, 0x33, 0x55, 0x77], vi(1),
-            vi(3), vi(1), vi(60), vec![0, 1, 1, 0], vec![1], string("custom"),
+            vi(3), vi(1), vi(60), vec![0, 1, 1, 0],
         ].concat();
         let trim_material = [
             string("minecraft:gold"), vi(1), vi(1), vi(2),
@@ -18978,10 +18978,7 @@ fn apply_item_component_behavior(ty: i64, data: &[u8]) -> Option<ComponentEffect
                 read_protocol_i32(&mut rest)?;
                 read_live_potion_effect_details(&mut rest, 0)?;
             }
-            let consumed = data.len() - rest.len();
-            let mut p = consumed;
-            slot_read_optional_string(data, &mut p)?;
-            (p == data.len()).then_some(ComponentEffect::Marker)
+            rest.is_empty().then_some(ComponentEffect::Marker)
         }
         COMP_SUSPICIOUS_STEW_EFFECTS => {
             decode_suspicious_stew_effects(data).map(ComponentEffect::StewEffects)

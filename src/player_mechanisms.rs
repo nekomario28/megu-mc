@@ -3029,6 +3029,40 @@ pub(crate) fn resolve_world_spawn_pos(
     ]
 }
 
+/// Resolve a safe join/respawn coordinate around `world_spawn` in `dim`.
+/// Legacy/flat worlds (`!worldgen::enabled()`) keep their exact fixed spawn;
+/// Vanilla worlds scatter inside `spawnRadius` while probing each candidate
+/// column's real ground height (`safe_feet_y`) so players never spawn over
+/// water, lava, or inside solid terrain.
+pub(crate) fn resolve_safe_world_spawn_pos(
+    dim: DimId,
+    world_spawn: (f64, f64, f64, f32),
+) -> (f64, f64, f64, f32) {
+    if !worldgen::enabled() {
+        return world_spawn;
+    }
+    let radius = spawn_radius_blocks();
+    if radius <= 0 {
+        return world_spawn;
+    }
+    let anchor = [
+        world_spawn.0.floor() as i32,
+        world_spawn.1.floor() as i32,
+        world_spawn.2.floor() as i32,
+    ];
+    let min_feet_y = dim.min_y() + 1;
+    let max_feet_y = dim.min_y() + dim.height() - 2;
+    let surface = |x: i32, z: i32| height_at_dim(dim, x, z);
+    let block = |x: i32, y: i32, z: i32| block_at_dim(dim, x, y, z);
+    for _ in 0..16 {
+        let [bx, _, bz] = resolve_world_spawn_pos(anchor, radius, world_rng::next_u64());
+        if let Some(feet) = safe_feet_y(&surface, &block, bx, bz, min_feet_y, max_feet_y) {
+            return (bx as f64 + 0.5, feet as f64, bz as f64 + 0.5, world_spawn.3);
+        }
+    }
+    world_spawn
+}
+
 /// `playersNetherPortalDefaultDelay` / `playersNetherPortalCreativeDelay`:
 /// game ticks a player stands inside a portal before the dimension change —
 /// 80 in survival, 1 in creative by default.

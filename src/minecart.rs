@@ -59,11 +59,13 @@ impl State {
         for (i, displacement) in actual.iter().enumerate() {
             self.pos[i] += displacement;
         }
-        // `Entity.move` zeroes only horizontally-colliding components, using
-        // `Mth.equal`'s widened `1.0E-5f` tolerance; vertical velocity is not
-        // cleared merely because the vertical move was clipped.
+        // `Entity.move` zeroes horizontally-colliding components using
+        // `Mth.equal`'s widened `1.0E-5f` tolerance, and calls
+        // `Block.updateEntityAfterFallOn` when vertical motion was clipped,
+        // zeroing `velocity[1]` on landing.
         let eps=f64::from(1.0e-5f32);
         for i in [0,2] { if (actual[i]-delta[i]).abs()>=eps {self.velocity[i]=0.;} }
+        if actual[1]!=delta[1] {self.velocity[1]=0.;}
         self.on_ground=ground;
     }
     /// `cou.applyNaturalSlowdown` uses a *float* comparator-derived coefficient.
@@ -334,7 +336,7 @@ mod live_rail_tick_tests {
             in_water: false,
         };
         vertical.tick(&mut scene, false, 0);
-        assert_eq!(vertical.velocity[1], -0.04);
+        assert_eq!(vertical.velocity[1], 0.0);
     }
 
     #[test]

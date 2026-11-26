@@ -1351,10 +1351,19 @@ mod block_entity_helpers {
         assert_eq!(spawner.total_mobs_spawned, 0);
         assert_eq!(spawner.registered_players, [player]);
         assert_eq!(TrialSpawner::from_nbt(&saved(&spawner.to_nbt())), spawner);
-        assert_eq!(
-            TrialSpawner::from_nbt(&compound([])),
-            TrialSpawner::default()
-        );
+        let empty = TrialSpawner::from_nbt(&compound([]));
+        let defaults = TrialSpawner::default();
+        assert!(empty.spawn_data.is_some());
+        assert_eq!(empty.normal_config, defaults.normal_config);
+        assert_eq!(empty.ominous_config, defaults.ominous_config);
+        assert_eq!(empty.ejecting_loot_table, defaults.ejecting_loot_table);
+        assert_eq!(empty.registered_players, defaults.registered_players);
+        assert_eq!(empty.current_mobs, defaults.current_mobs);
+        assert_eq!(empty.cooldown_ends_at, defaults.cooldown_ends_at);
+        assert_eq!(empty.next_mob_spawns_at, defaults.next_mob_spawns_at);
+        assert_eq!(empty.total_mobs_spawned, defaults.total_mobs_spawned);
+        assert_eq!(empty.target_cooldown_length, defaults.target_cooldown_length);
+        assert_eq!(empty.required_player_range, defaults.required_player_range);
     }
 
     #[test]

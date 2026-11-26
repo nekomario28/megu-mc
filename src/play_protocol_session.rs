@@ -308,21 +308,8 @@ fn enter_play_session(preplay: PreplaySession, live_eid: Arc<AtomicI32>) -> Opti
         })
         .unwrap_or_else(|| {
             let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-            // `spawnRadius`: a first join scatters inside the radius square
-            // around world spawn instead of landing on the exact point.
-            let [bx, by, bz] = resolve_world_spawn_pos(
-                [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
-                spawn_radius_blocks(),
-                world_rng::next_u64(),
-            );
-            (
-                DimId::Overworld,
-                bx as f64 + 0.5,
-                by as f64,
-                bz as f64 + 0.5,
-                w.3,
-                0.0,
-            )
+            let (x, y, z, yaw) = resolve_safe_world_spawn_pos(DimId::Overworld, w);
+            (DimId::Overworld, x, y, z, yaw, 0.0)
         });
     let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
     let initial_gm = saved_player.as_ref().map_or_else(
@@ -1091,6 +1078,10 @@ fn run_play_session(session: PlaySession) {
         // visibility and every float-to-int conversion behind them.
         if !ingress_guard::valid_movement_frame(pid, &b) {
             eprintln!("[spine] {} disconnected: malformed movement frame", me.name);
+            play_disconnect(
+                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                "Invalid move player packet received",
+            );
             break 'conn;
         }
 

@@ -178,7 +178,7 @@ def stage_chest_furnace(game, spawn):
         enter(c)
         c.command("gamemode creative")
         x, y, z = (math.floor(v) for v in spawn)
-        loc = (x + 2, y - 1, z)
+        loc = (x + 2, y - 1, z + 2)
         c.command(f"setblock {loc[0]} {loc[1]} {loc[2]} chest")
         c.until(lambda *_: any(p == loc for p, _ in c.updates), "chest-place-update")
         c.send(0x38, use_on_payload(loc, 3))
@@ -220,7 +220,7 @@ def stage_combat_respawn(game, spawn):
         c.send(0x36, vint(0) + bytes([0]))
         c.until(lambda *_: bool(c.health), "post-eating-health-state")
         c.command("setblock %d %d %d red_bed[facing=north,part=foot,occupied=false]" %
-                  (math.floor(spawn[0]) + 2, math.floor(spawn[1]) - 1, math.floor(spawn[2])))
+                  (math.floor(spawn[0]) - 2, math.floor(spawn[1]) - 1, math.floor(spawn[2])))
         c.command(f"kill {c.name}")
         c.until(lambda *_: any(hp <= 0 for hp, _, _ in c.health), "death-health-zero")
         c.send(0x09, vint(0))
@@ -234,8 +234,8 @@ def stage_dimensions(game, spawn):
         enter(c)
         c.command("gamemode creative")
         x, y, z = (math.floor(v) for v in spawn)
-        c.command(f"setblock {x} {y} {z} minecraft:nether_portal")
-        c.move(*spawn)
+        c.command(f"setblock {x} {y} {z - 2} minecraft:nether_portal")
+        c.move(x + 0.5, y, z - 1.5)
         body = c.until_id(0x47, "overworld-to-nether-respawn")
         dtype, name = parse_respawn(body)
         require(name == "minecraft:the_nether" and dtype == 3, "nether-dimension-type")
@@ -258,6 +258,9 @@ def stage_dimensions(game, spawn):
         require(parse_respawn(body)[1] == "minecraft:overworld", "final-overworld")
         old_pos = c.pos
         c.until(lambda *_: c.pos is not None and c.pos != old_pos, "final-overworld-position")
+        # Stage 4 killed the player in survival (clearing pre-death inventory),
+        # so place a stack here to verify cold-restart player inventory persistence.
+        put_creative_stack(c, 37, COAL, 2)
         return c.pos
 
 
