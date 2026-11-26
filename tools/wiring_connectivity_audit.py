@@ -275,6 +275,8 @@ def production_code(text, keep_strings=False):
 # Rust item helpers (operate on masked code)
 # ---------------------------------------------------------------------------
 
+IDENTIFIER = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])")
+
 FN_HEAD = re.compile(
     r"\b(pub(?:\s*\([^)]*\))?)?\s*"
     r"(?:async\s+|unsafe\s+|const\s+|extern\s+\"[A-Za-z]+\"\s+)*"
@@ -452,12 +454,18 @@ def build_corpus(root):
             raw = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
+        code = production_code(raw)
         corpus[rel] = {
             "raw": raw,
-            "code": production_code(raw),
+            "code": code,
             "str_code": production_code(raw, keep_strings=True),
             "side": file_side(rel),
+            # One identifier pass replaces repeatedly regex-scanning every
+            # source file for each candidate function name.
+            "identifiers": {},
         }
+        for match in IDENTIFIER.finditer(code):
+            corpus[rel]["identifiers"].setdefault(match.group(0), []).append(match.start())
     return corpus
 
 
@@ -469,14 +477,10 @@ def reference_count(corpus, name, own_rel, own_start, own_end):
     not a `fn name` definition head, so a trait declaration or a sibling
     dead definition can never launder an unwired entrypoint.
     """
-    needle = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])")
     hits = 0
     for rel, entry in corpus.items():
         code = entry["code"]
-        if name not in code:
-            continue
-        for match in needle.finditer(code):
-            pos = match.start()
+        for pos in entry["identifiers"].get(name, ()):
             if rel == own_rel and own_start <= pos < own_end:
                 continue
             if _is_fn_head(code, pos):
