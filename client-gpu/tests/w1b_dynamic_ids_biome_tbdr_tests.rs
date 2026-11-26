@@ -4,12 +4,13 @@ use megu_client::protocol::{DecodedChunk, DecodedLightData, DecodedSection, Dime
 use megu_client::world::{
     BiomeClimateEntry, BiomeTintKind, BiomeTintResolver, BlockTable, WorldState,
 };
-use megu_client_gpu::renderer::select_composed_depth_store_op;
+use megu_client_gpu::renderer::{select_composed_depth_store_op, stage_compact_verts};
 use megu_client_gpu::subworld_render::{SubWorldRenderBank, SubworldOwner};
 use megu_client_gpu::vanilla_assets_bridge::{
     admit_resource_packs, MAX_SHARED_ASSET_PACK_SOURCE_BYTES,
 };
-use megu_client_mesh::{SectionCoord, OPAQUE};
+use megu_client_mesh::ffi::PackedVertex;
+use megu_client_mesh::{CompactVoxelVertex, SectionCoord, OPAQUE};
 use megu_core::hw_adaptive_engine::GpuComputeParadigm;
 use megu_core::render_cs::{RenderGraph, ResourceDesc};
 use megu_proto::subworld_wire::{
@@ -321,4 +322,82 @@ fn subworld_pivot_normalized_asymmetric_hull_and_pose_delta_preserves_geometry()
         "pose delta must not empty geometry"
     );
     assert!((entry.transform.position[0] - 20.5).abs() < 1.0e-4);
+}
+
+#[test]
+fn dynamic_mod_quads_route_to_unpacked_terrain_instead_of_degenerating() {
+    let dynamic_id = 1_000_042u32;
+    assert!(
+        dynamic_id > megu_client_mesh::COMPACT_VERTEX_MAX_STATE_ID,
+        "test requires the dynamic id to exceed the compact vertex domain"
+    );
+
+    // Negative control: the compact stream genuinely cannot represent this
+    // state id, so a packed quad carrying it would degenerate to four zeroed
+    // vertices without the routing.
+    let unrepresentable = PackedVertex {
+        position: 0,
+        state_id: dynamic_id,
+        attributes: 0,
+        tint: 0,
+    };
+    assert!(!CompactVoxelVertex::is_representable(&unrepresentable));
+    let mut scratch = Vec::new();
+    let bad = stage_compact_verts(&mut scratch, &[unrepresentable; 4]);
+    assert_eq!(bad, 1, "unrouted dynamic quads degenerate in compact stream");
+    assert!(scratch.iter().all(|&byte| byte == 0));
+
+    // Positive path: a full-cube dynamic mod block meshed in a real world
+    // routes every emitted quad into the general unpacked terrain stream.
+    let facts_byte = (14u8 << 4) | 15;
+    let mut world = WorldState::new(DimensionMeta::default(), test_block_table());
+    world.install_dynamic_mod_registry_states(&[(
+        dynamic_id,
+        "examplemod:emissive_lamp".to_string(),
+        facts_byte,
+    )]);
+    world
+        .apply_chunk(chunk_with_edits(39, &[(cell_index(1, 0, 1), dynamic_id)]))
+        .expect("dynamic chunk applies");
+    let coord = SectionCoord(0, 0, 0);
+    world
+        .rebuild_dirty_bounded(usize::MAX, [8.0, 8.0, 8.0])
+        .expect("mesh rebuild");
+
+    let unpacked = world
+        .unpacked_terrain_quads(coord)
+        .expect("dynamic quads must route to the unpacked terrain stream");
+    let dynamic_quads: Vec<_> = unpacked
+        .iter()
+        .filter(|quad| quad.state_id == dynamic_id)
+        .collect();
+    assert!(
+        !dynamic_quads.is_empty(),
+        "dynamic block emits rendered quads, not zeroed vertices"
+    );
+    for quad in dynamic_quads {
+        let area_span: f32 = (0..3)
+            .map(|axis| {
+                let mut min = f32::MAX;
+                let mut max = f32::MIN;
+                for position in quad.positions {
+                    min = min.min(position[axis]);
+                    max = max.max(position[axis]);
+                }
+                max - min
+            })
+            .sum();
+        assert!(area_span > 0.5, "quad geometry is non-degenerate");
+    }
+
+    // Nothing carrying the dynamic id remains in the packed stream, so the
+    // compact staging path reports zero degenerate quads for the section.
+    if let Some(packed) = world.packed_mesh(coord) {
+        assert!(
+            packed.iter().all(|vertex| vertex.state_id != dynamic_id),
+            "packed stream must not carry compact-unrepresentable state ids"
+        );
+        let mut scratch = Vec::new();
+        assert_eq!(stage_compact_verts(&mut scratch, packed), 0);
+    }
 }

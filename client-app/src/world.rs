@@ -18,9 +18,9 @@ use megu_client_mesh::vanilla_block_models::{BakedBlockStateCache, VanillaBlockM
 use megu_client_mesh::{
     section_index, BakedTerrainFace, Block, BlockShape, CompressedSection, DirectionBuckets,
     FaceVisibility, Layer, Light, MeshCache, MissingNeighbor, Quad, ReleasedMeshMeta,
-    RenderRegions, Section, SectionBlocks, SectionCoord, SectionGraph, ALL_FACES, CUTOUT,
-    FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TINTED,
-    TRANSLUCENT, WATER,
+    RenderRegions, Section, SectionBlocks, SectionCoord, SectionGraph, ALL_FACES,
+    COMPACT_VERTEX_MAX_STATE_ID, CUTOUT, FLUID_TINTED, LAVA, LIGHT_BYTES, NO_FLUID, OPAQUE,
+    SAME_STATE_CULL, SECTION_CELLS, TINTED, TRANSLUCENT, WATER,
 };
 use megu_kernel::occlusion_table::{CoalescedLightQueue, QueuedLightEdit};
 use megu_kernel::skeletal_anim::{
@@ -3549,7 +3549,14 @@ impl WorldState {
             let mut packable = Vec::with_capacity(quads.len());
             let mut unpacked = Vec::new();
             for &quad in quads {
-                if quad.needs_unpacked_terrain() {
+                // `PackedVertex` carries full u32 state ids, but the
+                // renderer's 12-byte `CompactVoxelVertex` stream caps them at
+                // 19 bits. Quads past that cap (every dynamic mod block state
+                // id >= 1_000_000) would degenerate into four zeroed
+                // invisible vertices there, so they take the general
+                // `TerrainVertex` unpacked stream exactly like shaped
+                // non-cube geometry does.
+                if quad.needs_unpacked_terrain() || quad.state_id > COMPACT_VERTEX_MAX_STATE_ID {
                     unpacked.push(quad);
                 } else {
                     packable.push(quad);
