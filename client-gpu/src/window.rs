@@ -21,7 +21,8 @@ use megu_client::friends_store::{
 };
 use megu_client::integrated;
 use megu_client::protocol::{
-    encode_slot_stack, ItemComponentPatch, ItemStackComponents, NbtValue, WireReader,
+    decode_item_stack_components, encode_slot_stack, ItemComponentPatch, ItemStackComponents,
+    NbtValue, WireReader,
 };
 use megu_client::render::{FrameBudgetGovernor, RenderConfig, ThrottleStage};
 use megu_client::server_list::{ServerEntry, ServerListStore};
@@ -235,16 +236,9 @@ fn merchant_offer_views(
                 .floor()
                 .max(1.0)
                 .min(u32::MAX as f32) as u32;
-            let output = (|| {
-                let mut reader = WireReader::new(&offer.result_slot_wire);
-                if !reader.read_bool().ok()? {
-                    return None;
-                }
-                let item = reader.read_varint().ok()?;
-                let count = reader.read_i8().ok()?;
-                (count > 0).then(|| item_name(i64::from(item)))
-            })()
-            .unwrap_or_else(|| "minecraft:air".to_owned());
+            let output = decode_merchant_result_slot(&offer.result_slot_wire)
+                .map(|(item, _count)| item_name(i64::from(item)))
+                .unwrap_or_else(|| "minecraft:air".to_owned());
             MerchantOfferView {
                 input1: item_name(offer.cost_a.item),
                 input2: offer.cost_b.as_ref().map(|cost| item_name(cost.item)),
@@ -257,6 +251,30 @@ fn merchant_offer_views(
             }
         })
         .collect()
+}
+
+/// Decode the Protocol 767 result `Slot` from one merchant offer.
+pub fn decode_merchant_result_slot(wire: &[u8]) -> Option<(i32, i32)> {
+    let (stack, used) = decode_item_stack_components(wire).ok()?;
+    (used == wire.len() && stack.count > 0).then_some((stack.item_id, stack.count))
+}
+
+/// Convert the window-0 inventory hotbar menu slot to `edit_book`'s
+/// Protocol 767 hotbar index.
+pub fn book_hotbar_slot(menu_slot: i16) -> Option<i32> {
+    (36..=44)
+        .contains(&menu_slot)
+        .then(|| i32::from(menu_slot - 36))
+}
+
+/// An explicit sign Done action sends an update; Escape is a discard path.
+pub fn should_send_sign_update(done: bool) -> bool {
+    done
+}
+
+/// Whether the title UI should reveal the active panorama behind its overlay.
+pub fn title_panorama_is_visible(screen: Screen, panorama_active: bool) -> bool {
+    screen == Screen::Title && panorama_active
 }
 
 fn merchant_signature(offers: &[megu_client::protocol::MerchantOfferEntry]) -> u64 {
@@ -2031,7 +2049,14 @@ impl GpuApp {
         let mut singleplayer_server = None;
         if !config.offline_demo {
             if let Some(world) = &config.quick_play_singleplayer {
-                match Self::launch_singleplayer(&config, world, &persisted_settings) {
+                match Self::launch_singleplayer(
+                    &config,
+                    world,
+                    &persisted_settings,
+                    None,
+                    None,
+                    false,
+                ) {
                     Ok(server) => singleplayer_server = Some(server),
                     Err(err) => {
                         startup_status.push(format!("Singleplayer {world:?}: {err}"));
@@ -3669,8 +3694,12 @@ impl GpuApp {
                 self.ui.navigate(*screen);
             }
             UiAction::Back => {
-                self.ui
-                    .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
+                if self.live.is_some() {
+                    self.paused = self.ui.screen != Screen::InGameHud;
+                    if !self.paused {
+                        self.maybe_regrab();
+                    }
+                }
                 // Mod Manager Done/Back lands here (`ModManagerAction::Close`
                 // flattens to `Back`); a staged or applied
                 // non-hot-reload toggle kicks the in-process reload.
@@ -3995,7 +4024,27 @@ impl GpuApp {
                 // the OS process/window/renderer remain fully alive.
                 self.live = None;
                 self.singleplayer_server = None;
-                match Self::launch_singleplayer(&self.config, &world, &self.persisted_settings) {
+                let game_mode = match self.ui.singleplayer.game_mode {
+                    megu_ui::state::SingleplayerGameMode::Survival => "survival",
+                    megu_ui::state::SingleplayerGameMode::Creative => "creative",
+                    megu_ui::state::SingleplayerGameMode::Hardcore => "survival",
+                };
+                let difficulty = match self.ui.singleplayer.difficulty {
+                    megu_ui::state::SingleplayerDifficulty::Peaceful => "peaceful",
+                    megu_ui::state::SingleplayerDifficulty::Easy => "easy",
+                    megu_ui::state::SingleplayerDifficulty::Normal => "normal",
+                    megu_ui::state::SingleplayerDifficulty::Hard => "hard",
+                };
+                let hardcore = self.ui.singleplayer.game_mode
+                    == megu_ui::state::SingleplayerGameMode::Hardcore;
+                match Self::launch_singleplayer(
+                    &self.config,
+                    &world,
+                    &self.persisted_settings,
+                    Some(game_mode),
+                    Some(difficulty),
+                    hardcore,
+                ) {
                     Ok(server) => {
                         let addr = server.addr();
                         self.singleplayer_server = Some(server);
@@ -5756,12 +5805,18 @@ impl GpuApp {
         config: &GpuCliConfig,
         world: &str,
         settings: &ClientSettings,
+        game_mode: Option<&str>,
+        difficulty: Option<&str>,
+        hardcore: bool,
     ) -> Result<integrated::SingleplayerServer, String> {
         let mut cli = megu_client::cli::CliConfig::default();
         cli.quick_play_singleplayer = Some(world.to_owned());
         cli.server_bin = config.server_bin.clone();
         cli.game_dir = config.game_dir.clone();
         cli.seed = config.seed;
+        cli.game_mode = game_mode.map(str::to_owned);
+        cli.difficulty = difficulty.map(str::to_owned);
+        cli.hardcore = hardcore;
         cli.client_settings = settings.clone();
         // The child server reads `MEGU_DIRECTIONAL_SHADOW_LIGHT` at boot
         // ([server] `directional_shadow_light` in server.toml fills the
@@ -5802,7 +5857,27 @@ impl GpuApp {
     fn start_singleplayer_world(&mut self, world: &str, seed: Option<i64>) -> Result<(), String> {
         let mut config = self.config.clone();
         config.seed = seed.or(config.seed);
-        let server = Self::launch_singleplayer(&config, world, &self.persisted_settings)?;
+        let game_mode = match self.ui.singleplayer.game_mode {
+            megu_ui::state::SingleplayerGameMode::Survival => "survival",
+            megu_ui::state::SingleplayerGameMode::Creative => "creative",
+            megu_ui::state::SingleplayerGameMode::Hardcore => "survival",
+        };
+        let difficulty = match self.ui.singleplayer.difficulty {
+            megu_ui::state::SingleplayerDifficulty::Peaceful => "peaceful",
+            megu_ui::state::SingleplayerDifficulty::Easy => "easy",
+            megu_ui::state::SingleplayerDifficulty::Normal => "normal",
+            megu_ui::state::SingleplayerDifficulty::Hard => "hard",
+        };
+        let hardcore =
+            self.ui.singleplayer.game_mode == megu_ui::state::SingleplayerGameMode::Hardcore;
+        let server = Self::launch_singleplayer(
+            &config,
+            world,
+            &self.persisted_settings,
+            Some(game_mode),
+            Some(difficulty),
+            hardcore,
+        )?;
         let addr = server.addr();
         self.singleplayer_server = Some(server);
         self.active_singleplayer_world = Some(world.to_owned());
@@ -6717,11 +6792,25 @@ impl GpuApp {
     pub fn dispatch_book_action(&mut self, action: megu_ui::gameplay_screens::BookEditorAction) {
         match action {
             megu_ui::gameplay_screens::BookEditorAction::Save { slot, pages, title } => {
-                if let Some(live) = &mut self.live {
-                    live.send_edit_book(i32::from(slot), pages, title);
+                let Some(live) = &mut self.live else {
+                    self.status_line("Book save failed: not connected".to_owned());
+                    return;
+                };
+                if !matches!(live.status, SessionStatus::Playing) {
+                    self.status_line("Book save failed: session is not playing".to_owned());
+                    return;
                 }
-                self.book_editor = None;
-                self.maybe_regrab();
+                // Inventory menu slots 36..=44 map to Protocol 767's
+                // hotbar slot indices 0..=8 in edit_book.
+                let Some(hotbar_slot) = book_hotbar_slot(slot) else {
+                    self.status_line("Book save failed: invalid hotbar slot".to_owned());
+                    return;
+                };
+                live.send_edit_book(hotbar_slot, pages, title);
+                self.status_line(
+                    "Book save submitted; draft retained because queue status is unavailable"
+                        .to_owned(),
+                );
             }
             megu_ui::gameplay_screens::BookEditorAction::Close => {
                 self.book_editor = None;
@@ -7934,7 +8023,17 @@ impl GpuApp {
         if let Some(event) = self.input_router.release_held_keys() {
             self.apply_window_input(event);
         }
-        self.ui.sign_editor = Some(SignEditorState::new(pos, is_front, Default::default()));
+        let initial = self
+            .live
+            .as_ref()
+            .and_then(|live| live.world.block_entities.get(&[pos.0, pos.1, pos.2]))
+            .and_then(|entity| WireReader::new(&entity.nbt_bytes).read_nbt().ok())
+            .and_then(|nbt| sign_face_lines(&nbt, is_front));
+        self.ui.sign_editor = Some(SignEditorState::new(
+            pos,
+            is_front,
+            initial.unwrap_or_default(),
+        ));
         self.set_cursor_grab(false);
         self.update_ime();
     }
@@ -7965,11 +8064,13 @@ impl GpuApp {
             }
         }
         let mut close = false;
+        let mut save = false;
         match event.physical_key {
             PhysicalKey::Code(KeyCode::Escape) => close = true,
             PhysicalKey::Code(KeyCode::Enter) | PhysicalKey::Code(KeyCode::NumpadEnter) => {
                 if let Some(editor) = &mut self.ui.sign_editor {
                     close = editor.enter();
+                    save = close;
                 }
             }
             PhysicalKey::Code(KeyCode::Backspace) => {
@@ -8010,7 +8111,7 @@ impl GpuApp {
             }
         }
         if close {
-            self.finish_sign_editor();
+            self.finish_sign_editor(save);
         }
     }
 
@@ -8018,12 +8119,14 @@ impl GpuApp {
     /// sends `sign_update` on every exit path (Done, Enter on the last
     /// line and Escape alike), then the pointer + IME return to gameplay
     /// state.
-    fn finish_sign_editor(&mut self) {
+    fn finish_sign_editor(&mut self, save: bool) {
         let Some(editor) = self.ui.sign_editor.take() else {
             return;
         };
-        if let Some(live) = &mut self.live {
-            live.send_update_sign(editor.pos, editor.is_front, editor.lines().clone());
+        if should_send_sign_update(save) {
+            if let Some(live) = &mut self.live {
+                live.send_update_sign(editor.pos, editor.is_front, editor.lines().clone());
+            }
         }
         self.update_ime();
         self.maybe_regrab();
@@ -8281,7 +8384,7 @@ impl GpuApp {
         // Camera movement only applies while unpaused and alive — a dead
         // player keeps its death pose until the server's respawn teleport
         // lands via `camera_sync`.
-        if !self.paused && !player_dead {
+        if self.live.is_none() && !self.paused && !player_dead {
             self.camera.apply_move(self.keys.move_input(), dt.min(0.1));
         }
         self.camera_controller
@@ -8289,21 +8392,43 @@ impl GpuApp {
 
         if let Some(live) = &mut self.live {
             let input = self.keys.move_input();
-            live.send_movement(PlayerMovement {
-                pose: PlayerPose {
-                    feet: [
-                        self.camera.position[0] as f64,
-                        (self.camera.position[1] - 1.62) as f64,
-                        self.camera.position[2] as f64,
-                    ],
-                    yaw: (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
-                    pitch: -self.camera.pitch_deg,
-                },
-                strafe: if self.paused { 0.0 } else { input.strafe },
-                forward: if self.paused { 0.0 } else { input.forward },
-                jump: !self.paused && input.vertical > 0.0,
-                sneak: !self.paused && self.keys.down,
-            });
+            if !self.paused && !player_dead && live.game_mode != 3 {
+                if let Some(movement) = live.step_local_player_physics(
+                    dt,
+                    input.forward,
+                    input.strafe,
+                    input.vertical > 0.0,
+                    self.keys.down,
+                    self.keys.sprint,
+                    (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
+                    -self.camera.pitch_deg,
+                ) {
+                    self.camera.position = [
+                        movement.pose.feet[0] as f32,
+                        movement.pose.feet[1] as f32 + movement.eye_height,
+                        movement.pose.feet[2] as f32,
+                    ];
+                }
+            } else {
+                if !self.paused && !player_dead && live.game_mode == 3 {
+                    self.camera.apply_move(input, dt.min(0.1));
+                }
+                live.send_movement(PlayerMovement {
+                    pose: PlayerPose {
+                        feet: [
+                            self.camera.position[0] as f64,
+                            (self.camera.position[1] - 1.62) as f64,
+                            self.camera.position[2] as f64,
+                        ],
+                        yaw: (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
+                        pitch: -self.camera.pitch_deg,
+                    },
+                    strafe: if self.paused { 0.0 } else { input.strafe },
+                    forward: if self.paused { 0.0 } else { input.forward },
+                    jump: !self.paused && input.vertical > 0.0,
+                    sneak: !self.paused && self.keys.down,
+                });
+            }
             // Aeronautics helm: while an SW6D snapshot binds the player
             // to a sub-world, the same movement keys steer it.
             let helm = live
@@ -8311,15 +8436,8 @@ impl GpuApp {
                 .map(|id| subworld_helm_cmd(id, input, self.paused));
             dispatch_subworld_helm(live, helm, &mut self.last_subworld_helm);
             if live.riding_vehicle_id().is_some() {
-                let forward = if self.paused { 0.0 } else { input.forward };
-                let strafe = if self.paused { 0.0 } else { input.strafe };
-                live.send_move_vehicle(
-                    f64::from(strafe),
-                    0.0,
-                    f64::from(forward),
-                    (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
-                    -self.camera.pitch_deg,
-                );
+                // `move_vehicle` carries an absolute world pose. The
+                // movement axes must never be sent in its XYZ fields.
                 live.send_paddle_boat(
                     !self.paused && self.keys.left,
                     !self.paused && self.keys.right,
@@ -8365,6 +8483,8 @@ impl GpuApp {
             panorama_pitch,
             1.0,
         );
+        self.ui.title_panorama_active =
+            title_panorama_is_visible(self.ui.screen, active.renderer.has_title_panorama());
 
         let mut goggles_draw: Option<UiDrawList> = None;
         if let Some(live) = &mut self.live {
@@ -9342,10 +9462,6 @@ impl GpuApp {
 
     fn handle_key(&mut self, code: KeyCode, state: ElementState, event_loop: &ActiveEventLoop) {
         let pressed = state == ElementState::Pressed;
-        if pressed && code == KeyCode::F8 {
-            self.save_instant_replay();
-            return;
-        }
         if let Some(index) = self.ui.capturing_key_binding {
             if pressed {
                 if code == KeyCode::Escape {
@@ -9357,6 +9473,11 @@ impl GpuApp {
             }
             return;
         }
+        if pressed && code == KeyCode::F8 {
+            self.save_instant_replay();
+            return;
+        }
+        let physical_code = code;
         let code = remap_bound_key(code, &self.ui.settings.keys);
         if let Some(book) = self.book_editor.as_mut() {
             if pressed {
@@ -9407,6 +9528,7 @@ impl GpuApp {
         }
         if pressed
             && code == KeyCode::KeyE
+            && inventory_key_matches(physical_code, &self.ui.settings.keys)
             && self.live.as_ref().is_some_and(|live| live.game_mode == 1)
         {
             if self.creative_inventory.is_some() {
@@ -9783,6 +9905,53 @@ impl GpuApp {
             .surface
             .configure(&active.renderer.gpu().device, &cfg);
     }
+}
+
+pub fn sign_face_lines(nbt: &NbtValue, is_front: bool) -> Option<[String; 4]> {
+    fn flatten(value: &megu_core::json::JsonValue, out: &mut String) {
+        use megu_core::json::JsonValue;
+        match value {
+            JsonValue::String(text) => out.push_str(text),
+            JsonValue::Array(values) => {
+                for value in values {
+                    flatten(value, out);
+                }
+            }
+            JsonValue::Object(fields) => {
+                if let Some((_, JsonValue::String(text))) =
+                    fields.iter().find(|(key, _)| key == "text")
+                {
+                    out.push_str(text);
+                }
+                if let Some((_, extra)) = fields.iter().find(|(key, _)| key == "extra") {
+                    flatten(extra, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let NbtValue::Compound(root) = nbt else {
+        return None;
+    };
+    let face_name = if is_front { "front_text" } else { "back_text" };
+    let NbtValue::Compound(face) = root.get(face_name)? else {
+        return None;
+    };
+    let NbtValue::List(messages) = face.get("messages")? else {
+        return None;
+    };
+    let mut lines = [String::new(), String::new(), String::new(), String::new()];
+    for (line, message) in lines.iter_mut().zip(messages.iter()) {
+        let NbtValue::String(json) = message else {
+            continue;
+        };
+        if let Ok(value) = megu_core::json::parse_json(json) {
+            flatten(&value, line);
+        } else {
+            *line = json.clone();
+        }
+    }
+    Some(lines)
 }
 
 /// The friend-share pump. `recv_event` returns once per relay packet or
@@ -10164,6 +10333,12 @@ fn remap_bound_key(code: KeyCode, bindings: &megu_ui::state::KeyBindings) -> Key
     .unwrap_or(code)
 }
 
+/// Check the physical key selected for the Inventory action without a legacy
+/// hard-coded `E` fallback.
+pub fn inventory_key_matches(code: KeyCode, bindings: &megu_ui::state::KeyBindings) -> bool {
+    bindings.inventory == format!("{code:?}")
+}
+
 fn toggle_fullscreen_setting(settings: &mut UiSettings) {
     settings.fullscreen = !settings.fullscreen;
 }
@@ -10390,7 +10565,24 @@ impl ApplicationHandler for GpuApp {
                 if button == MouseButton::Right {
                     self.right_mouse_held = state == ElementState::Pressed;
                 }
-                if self.book_editor.is_some()
+                if self.ui.sign_editor.is_some()
+                    && button == MouseButton::Left
+                    && state == ElementState::Pressed
+                {
+                    let (w, h) = self
+                        .active
+                        .as_ref()
+                        .map_or((0, 0), |a| (a.size.width, a.size.height));
+                    let scale = ((h as f32 / 360.0).floor() as i32)
+                        .clamp(1, 4)
+                        .min(((w as f32 / 320.0).floor() as i32).max(1));
+                    let done_x = (self.mouse_pos.0 - w as i32 / 2).abs() <= 28 * scale;
+                    let done_y = self.mouse_pos.1 >= h as i32 / 2 + 15 * scale
+                        && self.mouse_pos.1 <= h as i32 / 2 + 33 * scale;
+                    if done_x && done_y {
+                        self.finish_sign_editor(true);
+                    }
+                } else if self.book_editor.is_some()
                     && button == MouseButton::Left
                     && state == ElementState::Pressed
                 {
@@ -14129,7 +14321,7 @@ mod tests {
             assert_eq!(editor.lines()[3], "24h");
         }
 
-        app.finish_sign_editor();
+        app.finish_sign_editor(true);
         assert!(app.ui.sign_editor.is_none());
         assert!(!app.text_input_active());
         match rx.try_recv() {
