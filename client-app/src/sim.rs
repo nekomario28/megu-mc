@@ -34,6 +34,10 @@ pub struct TickInput {
     pub pitch_delta: f32,
     pub sneak: bool,
     pub sprint: bool,
+    /// Vanilla elytra deploy: the caller sets this on a jump press while
+    /// airborne with an elytra equipped (the kernel has no inventory, so
+    /// the equipment gate stays with the input producer).
+    pub start_elytra: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,7 +80,13 @@ fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
         Some("minecraft:soul_sand") => SurfaceKind::SoulSand,
         Some("minecraft:cobweb") => SurfaceKind::Cobweb,
         Some("minecraft:ladder") => SurfaceKind::Ladder,
-        Some("minecraft:vine") => SurfaceKind::Vine,
+        Some("minecraft:vine")
+        | Some("minecraft:weeping_vines")
+        | Some("minecraft:weeping_vines_plant")
+        | Some("minecraft:twisting_vines")
+        | Some("minecraft:twisting_vines_plant")
+        | Some("minecraft:cave_vines")
+        | Some("minecraft:cave_vines_plant") => SurfaceKind::Vine,
         Some("minecraft:scaffolding") => SurfaceKind::Scaffolding,
         Some("minecraft:powder_snow") => SurfaceKind::PowderSnow,
         _ => match state_id {
@@ -91,6 +101,11 @@ fn surface_kind(world: &WorldState, pos: [i32; 3]) -> SurfaceKind {
             2004 => SurfaceKind::Cobweb,
             4654..=4661 => SurfaceKind::Ladder,
             6837..=6868 => SurfaceKind::Vine,
+            // weeping_vines(18611..=18636) + plant(18637),
+            // twisting_vines(18638..=18663) + plant(18664).
+            18611..=18664 => SurfaceKind::Vine,
+            // cave_vines(24769..=24820) + plant(24821..=24822).
+            24769..=24822 => SurfaceKind::Vine,
             18372..=18403 => SurfaceKind::Scaffolding,
             22318 => SurfaceKind::PowderSnow,
             _ => name.map(modded_surface_kind).unwrap_or(SurfaceKind::Normal),
@@ -120,6 +135,11 @@ fn modded_surface_kind(name: &str) -> SurfaceKind {
         SurfaceKind::SoulSand
     } else if path.contains("ladder") {
         SurfaceKind::Ladder
+    } else if path.split(['_', ':']).any(|seg| seg == "vine" || seg == "vines") {
+        // Every vanilla `minecraft:climbable` vine family (vine,
+        // weeping/twisting/cave vines and their plant tips) climbs the
+        // same way; segment matching keeps `divine_*`-style names out.
+        SurfaceKind::Vine
     } else if path.contains("scaffold") {
         SurfaceKind::Scaffolding
     } else if path.contains("cobweb") || path.ends_with("_web") {
@@ -276,9 +296,9 @@ impl PlayerPhysics {
                 jump: input.jump,
                 sneak: input.sneak,
                 sprint: input.sprint,
+                start_elytra: input.start_elytra,
                 yaw_deg: self.yaw,
                 pitch_deg: self.pitch,
-                ..PlayerInputState::default()
             },
             surface,
             &shapes,
@@ -1179,5 +1199,261 @@ mod tests {
         ] {
             assert_eq!(modded_surface_kind(name), SurfaceKind::Normal, "{name}");
         }
+    }
+
+    #[test]
+    fn modded_vine_family_names_classify_as_climbable() {
+        for name in [
+            "mymod:climbing_vine",
+            "mymod:weeping_vines",
+            "mymod:twisting_vines_plant",
+            "mymod:cave_vines",
+            "other:glow_vine",
+        ] {
+            assert_eq!(modded_surface_kind(name), SurfaceKind::Vine, "{name}");
+        }
+        // Segment matching must not mistake `divine`-style names for vines.
+        for name in ["mymod:divine", "mymod:divine_block", "mymod:vined_wood"] {
+            assert_eq!(modded_surface_kind(name), SurfaceKind::Normal, "{name}");
+        }
+    }
+
+    use crate::protocol::{DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta};
+    use megu_client_mesh::section_index;
+
+    fn physics_test_world(
+        blocks: impl IntoIterator<Item = ([i32; 3], u32)>,
+    ) -> WorldState {
+        let dimension = DimensionMeta {
+            min_y: 0,
+            height: 16,
+            has_skylight: false,
+            ..DimensionMeta::default()
+        };
+        let mut states = Box::new([0u32; 4096]);
+        let mut non_air = 0i16;
+        for ([x, y, z], state) in blocks {
+            let index = section_index(x as usize, y as usize, z as usize);
+            if states[index] == 0 && state != 0 {
+                non_air += 1;
+            }
+            states[index] = state;
+        }
+        let mut world = WorldState::new(dimension, BlockTable::builtin());
+        world
+            .apply_chunk(DecodedChunk {
+                cx: 0,
+                cz: 0,
+                sections: vec![DecodedSection {
+                    non_air,
+                    states,
+                    biomes: [0; 64],
+                }],
+                light: DecodedLightData {
+                    sky_mask: vec![],
+                    block_mask: vec![],
+                    empty_sky_mask: vec![],
+                    empty_block_mask: vec![],
+                    sky_arrays: vec![],
+                    block_arrays: vec![],
+                },
+                block_entities: vec![],
+            })
+            .unwrap();
+        world
+    }
+
+    fn stone_floor_world() -> WorldState {
+        physics_test_world((0..16).flat_map(|x| (0..16).map(move |z| ([x, 0, z], 1))))
+    }
+
+    fn fall_ticks(player: &mut PlayerPhysics, world: &WorldState, ticks: u32) {
+        for _ in 0..ticks {
+            player.step(world, TickInput::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn sneak_edge_clamp_holds_player_on_supported_side() {
+        // Floor only spans x 0..=5; walking +x with sneak must stop at the
+        // edge instead of walking off into the air.
+        let world = physics_test_world((0..6).flat_map(|x| (0..16).map(move |z| ([x, 0, z], 1))));
+        let mut player = PlayerPhysics::new([5.25, 1.0, 7.5], -90.0, 0.0);
+        player.on_ground = true;
+        for _ in 0..100 {
+            player
+                .step(
+                    &world,
+                    TickInput {
+                        forward: 1.0,
+                        sneak: true,
+                        ..TickInput::default()
+                    },
+                )
+                .unwrap();
+            assert!(player.on_ground, "fell off at x={}", player.pos[0]);
+            assert!((player.pos[1] - 1.0).abs() < 1e-8);
+        }
+        assert!(player.pos[0] > 5.25);
+        assert!(player.pos[0] <= 6.31, "sneak edge x={}", player.pos[0]);
+    }
+
+    #[test]
+    fn climbable_vine_families_classify_as_vine_surface() {
+        // Canonical 1.21.1 state ids: weeping_vines(+plant), twisting_vines(+plant),
+        // cave_vines(+plant), plus ladder/vine controls.
+        let cases: [([i32; 3], u32, SurfaceKind); 8] = [
+            ([0, 1, 8], 4654, SurfaceKind::Ladder),
+            ([1, 1, 8], 6837, SurfaceKind::Vine),
+            ([2, 1, 8], 18611, SurfaceKind::Vine), // weeping_vines
+            ([3, 1, 8], 18637, SurfaceKind::Vine), // weeping_vines_plant
+            ([4, 1, 8], 18638, SurfaceKind::Vine), // twisting_vines
+            ([5, 1, 8], 18664, SurfaceKind::Vine), // twisting_vines_plant
+            ([6, 1, 8], 24769, SurfaceKind::Vine), // cave_vines
+            ([7, 1, 8], 24822, SurfaceKind::Vine), // cave_vines_plant
+        ];
+        let world = physics_test_world(cases.iter().map(|(pos, id, _)| (*pos, *id)));
+        for (pos, _, expected) in cases {
+            assert_eq!(surface_kind(&world, pos), expected, "pos={pos:?}");
+        }
+    }
+
+    #[test]
+    fn ladder_surface_sneak_holds_position_and_jump_climbs() {
+        // A lone ladder block at (8,1,8); the player stands on its top face so
+        // the surface probe below the feet resolves it as climbable.
+        let world = physics_test_world(std::iter::once(([8, 1, 8], 4654u32)));
+        let mut player = PlayerPhysics::new([8.5, 2.0, 8.5], 0.0, 0.0);
+        player.on_ground = true;
+        fall_ticks(&mut player, &world, 3);
+        let base_y = player.pos[1];
+
+        for _ in 0..10 {
+            player
+                .step(
+                    &world,
+                    TickInput {
+                        sneak: true,
+                        ..TickInput::default()
+                    },
+                )
+                .unwrap();
+        }
+        assert!(
+            (player.pos[1] - base_y).abs() < 0.05,
+            "sneak on ladder drifted: y={} base={base_y}",
+            player.pos[1]
+        );
+        assert_eq!(player.kernel_state.fall_distance, 0.0);
+
+        for _ in 0..3 {
+            player
+                .step(
+                    &world,
+                    TickInput {
+                        jump: true,
+                        ..TickInput::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                player.kernel_state.fall_distance, 0.0,
+                "climbing must reset fall distance"
+            );
+        }
+        assert!(
+            player.pos[1] > base_y + 0.25,
+            "jump did not climb ladder: y={} base={base_y}",
+            player.pos[1]
+        );
+    }
+
+    #[test]
+    fn swimmer_exits_water_onto_one_block_ledge() {
+        // Stone floor at y=0, a 1-deep water channel at y=1 for x 4..=10,
+        // and a one-block ledge (top y=2) at x=11. Swimming +x with jump
+        // held must mount the ledge like vanilla's water-jump exit.
+        let mut blocks: Vec<([i32; 3], u32)> =
+            (0..16).flat_map(|x| (0..16).map(move |z| ([x, 0, z], 1))).collect();
+        for x in 4..=10 {
+            for z in 4..=12 {
+                blocks.push(([x, 1, z], 80)); // water source
+            }
+        }
+        for z in 4..=12 {
+            blocks.push(([11, 1, z], 1));
+        }
+        let world = physics_test_world(blocks);
+        let mut player = PlayerPhysics::new([7.5, 1.2, 8.5], -90.0, 0.0);
+        player.on_ground = true;
+
+        let mut exited = false;
+        for _ in 0..240 {
+            player
+                .step(
+                    &world,
+                    TickInput {
+                        forward: 1.0,
+                        jump: true,
+                        ..TickInput::default()
+                    },
+                )
+                .unwrap();
+            if player.pos[0] > 11.3 && player.pos[1] > 1.9 {
+                exited = true;
+                break;
+            }
+        }
+        assert!(
+            exited,
+            "never mounted ledge: pos={:?} on_ground={} in_water={}",
+            player.pos,
+            player.on_ground,
+            player.in_water
+        );
+    }
+
+    #[test]
+    fn start_elytra_glides_only_when_airborne() {
+        let world = stone_floor_world();
+        let mut glider = PlayerPhysics::new([7.5, 10.0, 7.5], 0.0, 0.0);
+        let mut control = PlayerPhysics::new([7.5, 10.0, 7.5], 0.0, 0.0);
+        for _ in 0..5 {
+            glider.step(&world, TickInput::default()).unwrap();
+            control.step(&world, TickInput::default()).unwrap();
+        }
+        assert!(!glider.on_ground && !control.on_ground);
+
+        glider
+            .step(
+                &world,
+                TickInput {
+                    start_elytra: true,
+                    ..TickInput::default()
+                },
+            )
+            .unwrap();
+        control.step(&world, TickInput::default()).unwrap();
+        assert!(glider.kernel_state.elytra_flying);
+        assert!(
+            glider.vel[1] > control.vel[1],
+            "elytra should soften the fall: glider={:?} control={:?}",
+            glider.vel,
+            control.vel
+        );
+
+        // Grounded or wet players must not deploy.
+        let mut grounded = PlayerPhysics::new([7.5, 1.0, 7.5], 0.0, 0.0);
+        grounded.on_ground = true;
+        grounded
+            .step(
+                &world,
+                TickInput {
+                    start_elytra: true,
+                    ..TickInput::default()
+                },
+            )
+            .unwrap();
+        assert!(!grounded.kernel_state.elytra_flying);
     }
 }

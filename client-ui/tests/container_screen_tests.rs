@@ -178,10 +178,17 @@ fn drag_split_conserves_items() {
     let mut screen = state(0);
     screen.set_cursor(Some(stack(6, 8)));
     let before = screen.total_count();
-    screen.click_mode(20, 0, 5).expect("drag begin");
-    screen.click_mode(21, 0, 5).expect("drag add");
+    // Vanilla QUICK_CRAFT: START (-999), one ADD_SLOT per collected slot,
+    // then END (-999). The press slot itself is only collected once the
+    // pointer is observed over it.
+    let start = screen.click_mode(-999, 0, 5).expect("drag start");
+    assert_eq!((start.slot, start.button, start.mode), (-999, 0, 5));
+    let add20 = screen.click_mode(20, 0, 5).expect("drag add 20");
+    assert_eq!((add20.slot, add20.button, add20.mode), (20, 1, 5));
+    let add21 = screen.click_mode(21, 0, 5).expect("drag add 21");
+    assert_eq!((add21.slot, add21.button, add21.mode), (21, 1, 5));
     let end = screen.click_mode(-999, 0, 5).expect("drag end");
-    assert_eq!(end.mode, 5);
+    assert_eq!((end.slot, end.button, end.mode), (-999, 2, 5));
     assert_eq!(screen.slot(20).unwrap().count, 4);
     assert_eq!(screen.slot(21).unwrap().count, 4);
     assert!(screen.cursor.is_none());

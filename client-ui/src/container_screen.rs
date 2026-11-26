@@ -868,12 +868,19 @@ impl UiItemStack {
     }
 }
 
-/// Drag-distribute state for click mode `5`.
+/// Drag-distribute state for click mode `5` (QUICK_CRAFT).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DragState {
-    /// `0` = even split, `1` = one item per slot.
+    /// Distribution kind: `0` = even split (left drag), `1` = one item per
+    /// slot (right drag), `2` = creative clone (middle drag). Maps to the
+    /// protocol button groups `0/1/2`, `4/5/6`, `8/9/10`.
     pub button: u8,
+    /// Unique admittable slots collected so far, in hover order.
     pub slots: Vec<i16>,
+    /// Slot under the pointer when the drag began (`-999` = outside).
+    pub press_slot: i16,
+    /// Mouse button that began the drag (`0` left, `1` right, `2` middle).
+    pub press_button: i8,
 }
 
 /// One changed slot inside a [`ClickWindowAction`].
@@ -2004,6 +2011,53 @@ impl ContainerScreenState {
                 Some(item) if !item.is_empty() => self.draw_stack(slot.rect, &item, out),
                 _ => self.draw_empty_slot(slot, out),
             }
+            self.draw_drag_ghost(slot, out);
+        }
+    }
+
+    /// Live QUICK_CRAFT ghost: every collected drag slot previews the total
+    /// vanilla would deposit there — `getQuickCraftPlaceCount` (even split,
+    /// one-per-slot, or full clone) plus the stack already present, capped
+    /// at `min(carried max, slot max)`. The vanilla translucent item ghost
+    /// has no alpha-capable primitive here, so an accent frame plus the
+    /// predicted count carries the preview.
+    fn draw_drag_ghost(&self, slot: &UiSlotRect, out: &mut UiDrawList) {
+        let Some(drag) = self.drag_mode.as_ref() else {
+            return;
+        };
+        if !drag.slots.contains(&slot.index) {
+            return;
+        }
+        let Some(carried) = self.cursor.as_ref().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let total = drag.slots.len().max(1) as u32;
+        let place = match drag.button {
+            0 => u32::from(carried.count) / total,
+            1 => 1,
+            _ => u32::from(carried.max_stack),
+        };
+        let existing = self.slots.get(slot.index as usize);
+        let carry = existing.map_or(0, |s| u32::from(s.count));
+        let max = existing.map_or_else(
+            || u32::from(carried.max_stack),
+            |s| u32::from(s.max_stack).min(u32::from(carried.max_stack)),
+        );
+        let ghost = (place + carry).min(max);
+        if ghost == 0 {
+            return;
+        }
+        let inner = UiRect::new(
+            slot.rect.x + 1,
+            slot.rect.y + 1,
+            slot.rect.w.saturating_sub(2),
+            slot.rect.h.saturating_sub(2),
+        );
+        out.border_rect(inner, palette::ACCENT, 1);
+        if ghost >= 2 {
+            let label = ghost.to_string();
+            let x = slot.rect.right() - 2 - text_width(&label, 1) as i32;
+            out.text(x, slot.rect.bottom() - 9, 1, palette::ACCENT, label);
         }
     }
 
@@ -2805,6 +2859,13 @@ impl ContainerScreenState {
         }
         let slot_stack = self.slots[index].clone();
         let cursor = self.cursor.clone().filter(|s| !s.is_empty());
+        if button == 2 && !slot_stack.is_empty() {
+            // Creative clone pickup (middle click / single-slot clone drag):
+            // the cursor receives a copy of the slot stack; the slot and
+            // its count are untouched.
+            self.cursor = Some(slot_stack);
+            return Some(self.finish_action(slot_index, button, 0, &changed));
+        }
         match (slot_stack.is_empty(), cursor) {
             (true, None) => {}
             (true, Some(carried)) => {
@@ -3098,6 +3159,10 @@ impl ContainerScreenState {
         Some(self.finish_action(slot_index, button, 4, &changed))
     }
 
+    /// Whether `slot_index` can receive `carried` in a drag distribution:
+    /// in range, placement-accepting (never `Output`/`Locked`), and either
+    /// empty or holding a fully stack-compatible stack — the local mirror
+    /// of vanilla `canItemQuickReplace` + `mayPlace` + `canDragTo`.
     fn drag_can_admit(&self, slot_index: i16, carried: &UiItemStack) -> bool {
         let Ok(index) = usize::try_from(slot_index) else {
             return false;
@@ -3109,19 +3174,46 @@ impl ContainerScreenState {
             && (existing.is_empty() || existing.same_stackable(carried))
     }
 
+    /// Map a mouse button to its QUICK_CRAFT distribution kind:
+    /// `0` even split, `1` one-per-slot, `2` creative clone.
+    fn drag_kind(button: i8) -> Option<u8> {
+        match button {
+            0 => Some(0),
+            1 => Some(1),
+            2 => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Protocol-767 mode-5 button for `(kind, stage)`: kinds map to the
+    /// `0/4/8` bases and stages to `start`/`add_slot`/`end` offsets.
+    const fn drag_wire_button(kind: u8, stage: u8) -> i8 {
+        (kind as i8) * 4 + stage as i8
+    }
+
+    /// Mode-5 gesture entry point shared by [`Self::drag_start`],
+    /// [`Self::drag_over`] and [`Self::click_mode`]. With no active drag it
+    /// arms the gesture and emits the START packet; with one it collects
+    /// `slot_index` and emits its ADD_SLOT packet. `-999` ends the drag.
     fn drag_click(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {
+        let kind = Self::drag_kind(button)?;
+        if self.drag_mode.is_none() {
+            // Vanilla only quick-crafts while the cursor carries items.
+            self.cursor.as_ref().filter(|s| !s.is_empty())?;
+            self.drag_mode = Some(DragState {
+                button: kind,
+                slots: Vec::new(),
+                press_slot: slot_index,
+                press_button: button,
+            });
+            return Some(self.finish_action(
+                EMPTY_SLOT_INDEX,
+                Self::drag_wire_button(kind, 0),
+                5,
+                &BTreeSet::new(),
+            ));
+        }
         if slot_index == EMPTY_SLOT_INDEX {
-            if self.drag_mode.is_none() {
-                let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
-                let mouse_button = if button == 1 || button == 4 { 1u8 } else { 0u8 };
-                self.drag_mode = Some(DragState {
-                    button: mouse_button,
-                    slots: Vec::new(),
-                });
-                let start_btn = if mouse_button == 0 { 0i8 } else { 4i8 };
-                let _ = carried;
-                return Some(self.finish_action(EMPTY_SLOT_INDEX, start_btn, 5, &BTreeSet::new()));
-            }
             return self.drag_end();
         }
         let index = usize::try_from(slot_index).ok()?;
@@ -3129,38 +3221,40 @@ impl ContainerScreenState {
             return None;
         }
         let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
-        if self.drag_mode.is_none() {
-            if !self.drag_can_admit(slot_index, &carried) {
-                return None;
-            }
-            let mouse_button = if button == 1 || button == 4 || button == 5 {
-                1u8
-            } else {
-                0u8
-            };
-            self.drag_mode = Some(DragState {
-                button: mouse_button,
-                slots: vec![slot_index],
-            });
-            let add_btn = if mouse_button == 0 { 1i8 } else { 5i8 };
-            return Some(self.finish_action(slot_index, add_btn, 5, &BTreeSet::new()));
+        let drag_kind = self.drag_mode.as_ref()?.button;
+        if !self.drag_can_admit(slot_index, &carried) {
+            return None;
         }
-        let admits = self.drag_can_admit(slot_index, &carried);
-        let max_slots = usize::from(carried.count);
         let drag = self.drag_mode.as_mut()?;
-        let add_btn = if drag.button == 0 { 1i8 } else { 5i8 };
-        if admits && !drag.slots.contains(&slot_index) && drag.slots.len() < max_slots {
-            drag.slots.push(slot_index);
-            drag.slots.sort_unstable();
+        if drag.slots.contains(&slot_index) {
+            return None;
         }
-        Some(self.finish_action(slot_index, add_btn, 5, &BTreeSet::new()))
+        // Vanilla stops collecting once every carried item has a slot;
+        // the creative clone drag is exempt from the cap.
+        let cap = if drag_kind == 2 {
+            usize::MAX
+        } else {
+            usize::from(carried.count)
+        };
+        if drag.slots.len() >= cap {
+            return None;
+        }
+        drag.slots.push(slot_index);
+        Some(self.finish_action(
+            slot_index,
+            Self::drag_wire_button(drag_kind, 1),
+            5,
+            &BTreeSet::new(),
+        ))
     }
 
-    /// Begin or extend a protocol-mode-5 distribution gesture at `slot`.
-    /// Button `0` evenly splits the carried stack; button `1` distributes
-    /// one item per eligible slot.
+    /// Begin a protocol-mode-5 distribution gesture. Button `0` evenly
+    /// splits the carried stack, `1` places one item per slot, `2` clones
+    /// the carried stack into every collected slot (creative).
     pub fn drag_start(&mut self, slot: i16, button: i8) -> Option<ClickWindowAction> {
-        if self.drag_mode.is_some() { return None; }
+        if self.drag_mode.is_some() {
+            return None;
+        }
         self.drag_click(slot, button)
     }
 
@@ -3170,58 +3264,78 @@ impl ContainerScreenState {
         self.drag_click(slot, button)
     }
 
+    /// Finish a drag. Fewer than two collected slots falls back to the
+    /// vanilla normal click (pickup with the drag kind as click type);
+    /// two or more distribute `floor(carried / slots)` (kind 0), `1`
+    /// (kind 1) or a full-stack clone (kind 2) into each collected slot,
+    /// leaving the indivisible remainder on the cursor.
     pub fn drag_end(&mut self) -> Option<ClickWindowAction> {
         let drag = self.drag_mode.take()?;
-        let end_btn = if drag.button == 0 { 2i8 } else { 6i8 };
-        let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
-        let slots: Vec<i16> = drag
-            .slots
-            .iter()
-            .copied()
-            .filter(|&s| self.drag_can_admit(s, &carried))
-            .collect();
-        if slots.is_empty() {
-            return Some(self.finish_action(
-                EMPTY_SLOT_INDEX,
-                end_btn,
-                5,
-                &BTreeSet::new(),
-            ));
-        }
-        let mut remaining = u32::from(carried.count);
-        let per = if drag.button == 0 {
-            remaining / slots.len() as u32
-        } else {
-            1
-        };
-        if per == 0 {
-            return Some(self.finish_action(
-                EMPTY_SLOT_INDEX,
-                end_btn,
-                5,
-                &BTreeSet::new(),
-            ));
-        }
-        let mut changed = BTreeSet::new();
-        for &slot_index in &slots {
-            if remaining == 0 {
-                break;
+        match drag.slots.len() {
+            0 => return self.normal_click(drag.press_slot, drag.press_button),
+            1 => {
+                let slot = drag.slots[0];
+                let button = match drag.button {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                return self.normal_click(slot, button);
             }
-            let index = usize::try_from(slot_index).ok()?;
-            let usable =
-                self.slots[index].is_empty() || self.slots[index].same_stackable(&carried);
-            let amount = if usable { self.add_to_slot(index, &carried, per.min(remaining)) } else { 0 };
-            if amount == 0 {
+            _ => {}
+        }
+        let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
+        let slot_total = drag.slots.len() as u32;
+        // Vanilla `getQuickCraftPlaceCount`: uniform per-slot amount computed
+        // from the original carried count, before any slot is touched.
+        let place = match drag.button {
+            0 => u32::from(carried.count) / slot_total,
+            1 => 1,
+            _ => u32::from(carried.max_stack),
+        };
+        let mut remaining = u32::from(carried.count);
+        let mut changed = BTreeSet::new();
+        for &slot_index in &drag.slots {
+            let Ok(index) = usize::try_from(slot_index) else {
+                continue;
+            };
+            if index >= self.slots.len() || !self.drag_can_admit(slot_index, &carried) {
                 continue;
             }
-            remaining -= amount;
+            let existing = &self.slots[index];
+            let carry = u32::from(existing.count);
+            // Vanilla caps at min(source max, slot max); an empty slot
+            // takes the carried stack's own limit.
+            let slot_max = if existing.is_empty() {
+                u32::from(carried.max_stack)
+            } else {
+                u32::from(existing.max_stack)
+            };
+            let room = slot_max.min(u32::from(carried.max_stack)).saturating_sub(carry);
+            let added = place.min(room);
+            if added == 0 {
+                continue;
+            }
+            let placed = self.add_to_slot(index, &carried, added);
+            if placed == 0 {
+                continue;
+            }
+            remaining = remaining.saturating_sub(placed);
             changed.insert(slot_index);
         }
-        if let Some(mut cursor) = self.cursor.clone() {
-            cursor.count = remaining as u8;
-            self.set_carried(cursor);
+        if drag.button != 2 {
+            // The creative clone drag does not consume the carried stack.
+            if let Some(mut cursor) = self.cursor.clone() {
+                cursor.count = remaining.min(u32::from(cursor.count)) as u8;
+                self.set_carried(cursor);
+            }
         }
-        Some(self.finish_action(EMPTY_SLOT_INDEX, end_btn, 5, &changed))
+        Some(self.finish_action(
+            EMPTY_SLOT_INDEX,
+            Self::drag_wire_button(drag.button, 2),
+            5,
+            &changed,
+        ))
     }
 
     fn collect_to_cursor(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {
@@ -3656,5 +3770,226 @@ mod tests {
         assert_eq!(schema.panel_w, ChestSkinGeometry::SHEET_WIDTH as f32);
         assert_eq!(schema.panel_h, 168.0);
         assert_eq!(schema.inventory_origin_y, 85);
+    }
+
+    fn test_state(menu_id: u32) -> ContainerScreenState {
+        ContainerScreenState::new(menu_schema(menu_id).unwrap(), 1, 0, "test")
+    }
+
+    fn items(item_id: u32, count: u8) -> UiItemStack {
+        UiItemStack::new(item_id, count).with_name(format!("item {item_id}"))
+    }
+
+    #[test]
+    fn left_drag_emits_start_add_end_and_splits_evenly() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(6, 9)));
+        let start = screen.drag_start(-999, 0).expect("start");
+        assert_eq!((start.slot, start.button, start.mode), (-999, 0, 5));
+        let add_a = screen.drag_over(20, 0).expect("add a");
+        assert_eq!((add_a.slot, add_a.button, add_a.mode), (20, 1, 5));
+        let add_b = screen.drag_over(21, 0).expect("add b");
+        assert_eq!((add_b.slot, add_b.button, add_b.mode), (21, 1, 5));
+        // Re-hovering a collected slot must not emit a duplicate ADD_SLOT.
+        assert!(screen.drag_over(20, 0).is_none());
+        let end = screen.drag_end().expect("end");
+        assert_eq!((end.slot, end.button, end.mode), (-999, 2, 5));
+        // floor(9 / 2) = 4 per slot; the indivisible remainder stays.
+        assert_eq!(screen.slot(20).unwrap().count, 4);
+        assert_eq!(screen.slot(21).unwrap().count, 4);
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 1);
+    }
+
+    #[test]
+    fn right_drag_places_one_item_per_slot() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(7, 5)));
+        let start = screen.drag_start(10, 1).expect("start");
+        assert_eq!((start.slot, start.button), (-999, 4));
+        // The press slot is collected once the pointer is observed over it.
+        let add = screen.drag_over(10, 1).expect("add press slot");
+        assert_eq!((add.slot, add.button), (10, 5));
+        screen.drag_over(11, 1).expect("add second");
+        screen.drag_over(12, 1).expect("add third");
+        let end = screen.drag_end().expect("end");
+        assert_eq!((end.slot, end.button), (-999, 6));
+        assert_eq!(screen.slot(10).unwrap().count, 1);
+        assert_eq!(screen.slot(11).unwrap().count, 1);
+        assert_eq!(screen.slot(12).unwrap().count, 1);
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 2);
+    }
+
+    #[test]
+    fn middle_drag_clones_full_stack_without_consuming_cursor() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(8, 3)));
+        let start = screen.drag_start(-999, 2).expect("start");
+        assert_eq!((start.slot, start.button), (-999, 8));
+        screen.drag_over(20, 2).expect("add a");
+        screen.drag_over(21, 2).expect("add b");
+        let add = screen.drag_over(22, 2).expect("add c");
+        assert_eq!(add.button, 9);
+        let end = screen.drag_end().expect("end");
+        assert_eq!(end.button, 10);
+        for slot in [20, 21, 22] {
+            assert_eq!(screen.slot(slot).unwrap().count, 64);
+            assert_eq!(screen.slot(slot).unwrap().item_id, 8);
+        }
+        // Creative clone never consumes the carried stack.
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 3);
+    }
+
+    #[test]
+    fn single_slot_drag_falls_back_to_normal_click() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(9, 6)));
+        screen.drag_start(20, 0).expect("start");
+        screen.drag_over(20, 0).expect("collect press slot");
+        let end = screen.drag_end().expect("single-slot end");
+        // Vanilla converts a one-slot quick-craft into a normal pickup.
+        assert_eq!(end.mode, 0);
+        assert_eq!(end.slot, 20);
+        assert!(screen.cursor.is_none());
+        assert_eq!(screen.slot(20).unwrap().count, 6);
+    }
+
+    #[test]
+    fn drag_without_collected_slots_falls_back_to_click_outside() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(10, 4)));
+        screen.drag_start(-999, 0).expect("start outside");
+        // Release without ever hovering an admittable slot: normal click at
+        // the press point (-999) drops the carried stack like vanilla.
+        let end = screen.drag_end().expect("fallback");
+        assert_eq!(end.mode, 0);
+        assert_eq!(end.slot, -999);
+        assert!(screen.cursor.is_none());
+    }
+
+    #[test]
+    fn drag_never_targets_output_or_incompatible_slots() {
+        let mut screen = test_state(14); // furnace: 0 input, 1 fuel, 2 output
+        screen.set_slot(0, items(11, 2));
+        screen.set_cursor(Some(items(12, 8)));
+        screen.drag_start(-999, 0).expect("start");
+        // Output slot rejects placement; a different item also rejects.
+        assert!(screen.drag_over(2, 0).is_none());
+        assert!(screen.drag_over(0, 0).is_none());
+        screen.drag_over(1, 0).expect("fuel slot admits");
+        let end = screen.drag_end().expect("end");
+        assert_eq!(end.mode, 0, "one collected slot falls back to pickup");
+        assert_eq!(end.slot, 1);
+        assert!(screen.slot(2).unwrap().is_empty());
+        assert_eq!(screen.slot(0).unwrap().item_id, 11);
+    }
+
+    #[test]
+    fn drag_requires_carried_items() {
+        let mut screen = test_state(0);
+        assert!(screen.drag_start(20, 0).is_none());
+        assert!(screen.drag_start(-999, 0).is_none());
+        assert!(screen.drag_end().is_none());
+    }
+
+    #[test]
+    fn drag_ghost_preview_marks_collected_slots() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(13, 8)));
+        screen.drag_start(-999, 0).expect("start");
+        screen.drag_over(20, 0).expect("add");
+        screen.drag_over(21, 0).expect("add");
+        let mut draw = crate::draw::UiDrawList::new();
+        screen.render(800.0, 600.0, &mut draw);
+        // Two collected slots of 8 -> ghost count 4 painted in accent.
+        let accent_counts = draw
+            .commands
+            .iter()
+            .filter(|cmd| {
+                matches!(cmd, UiCommand::Text { color, text, .. }
+                    if *color == palette::ACCENT && text == "4")
+            })
+            .count();
+        assert_eq!(accent_counts, 2, "each collected slot previews count 4");
+    }
+
+    #[test]
+    fn double_click_gathers_matching_stacks_to_cursor() {
+        let mut screen = test_state(0);
+        screen.set_cursor(Some(items(14, 2)));
+        screen.set_slot(10, items(14, 30));
+        screen.set_slot(20, items(14, 20));
+        screen.set_slot(30, items(15, 64));
+        let action = screen.click_mode(30, 0, 6).expect("collect");
+        assert_eq!(action.mode, 6);
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 52);
+        assert!(screen.slot(10).unwrap().is_empty());
+        assert!(screen.slot(20).unwrap().is_empty());
+        assert_eq!(screen.slot(30).unwrap().count, 64);
+    }
+
+    #[test]
+    fn double_click_skips_output_slots() {
+        let mut screen = test_state(14);
+        screen.set_slot(2, items(16, 1)); // furnace output
+        screen.set_slot(3, items(16, 5)); // player inventory
+        screen.set_cursor(Some(items(16, 1)));
+        screen.click_mode(3, 0, 6).expect("collect");
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 6);
+        assert_eq!(screen.slot(2).unwrap().count, 1, "output untouched");
+        assert!(screen.slot(3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shift_click_hotbar_offhand_and_drop_shortcuts() {
+        let mut screen = test_state(0);
+        screen.set_slot(0, items(17, 10)); // container slot
+        let quick = screen.click_with_shift(0, 0, true).expect("shift click");
+        assert_eq!(quick.mode, 1);
+        assert!(screen.slot(0).unwrap().is_empty());
+        assert_eq!(screen.slot(9).unwrap().count, 10);
+
+        screen.set_cursor(None);
+        let swap = screen.click_mode(9, 3, 2).expect("hotbar swap");
+        assert_eq!(swap.mode, 2);
+        assert_eq!(swap.button, 3);
+        assert!(screen.slot(9).unwrap().is_empty());
+        let hotbar = (9 + 27 + 3) as i16;
+        assert_eq!(screen.slot(hotbar as usize).unwrap().item_id, 17);
+        assert_eq!(screen.slot(hotbar as usize).unwrap().count, 10);
+
+        let drop_one = screen.click_mode(hotbar, 0, 4).expect("drop one");
+        assert_eq!(drop_one.mode, 4);
+        assert_eq!(screen.slot(hotbar as usize).unwrap().count, 9);
+        let drop_all = screen.click_mode(hotbar, 1, 4).expect("drop stack");
+        assert_eq!(drop_all.button, 1);
+        assert!(screen.slot(hotbar as usize).unwrap().is_empty());
+    }
+
+    #[test]
+    fn anvil_rename_accepts_letter_e_without_closing() {
+        let mut screen = test_state(8);
+        screen.rename_focused = true;
+        // Typing 'e'/'E' in the rename field produces rename actions; the
+        // screen state offers no close path, so the anvil stays open.
+        let lower = screen.handle_rename_char('e').expect("rename 'e'");
+        assert_eq!(lower, WorkstationAction::RenameItem("e".to_string()));
+        let upper = screen.handle_rename_char('E').expect("rename 'E'");
+        assert_eq!(upper, WorkstationAction::RenameItem("eE".to_string()));
+        assert!(screen.rename_focused);
+        assert_eq!(screen.rename_text, "eE");
+        // Unfocused screens ignore rename input entirely.
+        screen.rename_focused = false;
+        assert!(screen.handle_rename_char('e').is_none());
+    }
+
+    #[test]
+    fn creative_clone_pickup_copies_slot_without_removing() {
+        let mut screen = test_state(0);
+        screen.set_slot(10, items(18, 12));
+        let action = screen.click(10, 2).expect("middle click clone");
+        assert_eq!(action.mode, 0);
+        assert_eq!(action.button, 2);
+        assert_eq!(screen.cursor.as_ref().unwrap().count, 12);
+        assert_eq!(screen.slot(10).unwrap().count, 12);
     }
 }
