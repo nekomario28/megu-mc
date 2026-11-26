@@ -2374,7 +2374,77 @@ fn cooked_drop(item: i64) -> Option<i64> {
     }
     None
 }
+const MAX_MOB_LOOT_ATTACKER_TYPES: usize = 256;
+type MobLootAttackers = HashMap<i64, (i32, String, u64)>;
+static MOB_LOOT_ATTACKERS: OnceLock<Mutex<MobLootAttackers>> = OnceLock::new();
+fn mob_loot_attackers() -> &'static Mutex<MobLootAttackers> {
+    MOB_LOOT_ATTACKERS.get_or_init(|| Mutex::new(MobLootAttackers::new()))
+}
+fn record_mob_loot_attacker(etype: i64, source: i32) {
+    if source <= 0 {
+        return;
+    }
+    let Some(client) = clients()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|client| client.eid == source)
+        .cloned()
+    else {
+        return;
+    };
+    let held_slot = *client.held.lock().unwrap_or_else(|e| e.into_inner());
+    let held_item = client
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(36 + held_slot))
+        .map(|(item, _, _)| *item);
+    let held_name = held_item.and_then(|item| item_to_name(item).map(str::to_string));
+    let mut attackers = mob_loot_attackers().lock().unwrap_or_else(|e| e.into_inner());
+    if attackers.len() >= MAX_MOB_LOOT_ATTACKER_TYPES && !attackers.contains_key(&etype) {
+        attackers.clear();
+    }
+    attackers.insert(
+        etype,
+        (source, held_name.unwrap_or_default(), TICK_IDX.load(Ordering::Relaxed)),
+    );
+}
+
+fn mob_loot_table_id(etype: i64) -> String {
+    ENTITY_REGISTRY_1211
+        .get(usize::try_from(etype).unwrap_or(usize::MAX))
+        .map(|spec| format!("minecraft:entities/{}", spec.name))
+        .unwrap_or_else(|| format!("minecraft:entities/{etype}"))
+}
+
 fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
+    let drops = mob_loot_base(etype, burning);
+    let attacker = mob_loot_attackers()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&etype)
+        .cloned();
+    let now = TICK_IDX.load(Ordering::Relaxed);
+    let killed_by_player = attacker.as_ref().is_some_and(|(source, _, tick)| {
+        *source > 0 && now.saturating_sub(*tick) <= 100
+    });
+    let held_tool = attacker
+        .filter(|(_, _, tick)| now.saturating_sub(*tick) <= 100)
+        .map(|(_, held, _)| held)
+        .filter(|held| !held.is_empty());
+    crate::apply_live_mod_loot_modifiers(
+        &mob_loot_table_id(etype),
+        DimId::Overworld,
+        None,
+        killed_by_player,
+        held_tool.as_deref(),
+        drops,
+        now,
+    )
+}
+
+fn mob_loot_base(etype: i64, burning: bool) -> Vec<Stack> {
     if let Some(pools) = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(&etype).map(|p| {
         p.iter()
             .map(|pl| LootPool {
@@ -4234,6 +4304,7 @@ fn primed_tick() {
 }
 
 fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
+    record_mob_loot_attacker(mob.etype, source);
     if !matches!(mob.etype, 31 | 88 | 116 | 119) {
         return true;
     }

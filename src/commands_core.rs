@@ -1356,6 +1356,7 @@ struct DatapackContent {
 impl DatapackContent {
     fn publish(mut self) {
         self.resolve_optional_tags();
+        apply_live_mod_loot_underlay_to_content(&mut self);
         // `block`/`item` mirror into the legacy globals consumed elsewhere.
         let block_map = self
             .registry
@@ -5936,7 +5937,7 @@ fn command_usage(name: &str) -> String {
         "locate" => "/locate structure|biome|poi <id>",
         "loot" => "/loot spawn|give|insert|replace <target> <source>",
         "me" => "/me <action>",
-        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart|shadowlight [on|off|status]|lazycatchup [on|off|status]",
+        "megu" => "/megu policy list|get <key>|set <key> <value>|reset|audit [player] [radius]|rollback <player> <radius> [max_blocks]|claim here|unclaim|trust <player>|untrust <player>|info|admin-unclaim|spawn-radius <n>|backup plan|status|metrics|mod add|remove|list|snapshot|restart|diff|shadowlight [on|off|status]|lazycatchup [on|off|status]",
         "msg" | "tell" | "w" => "/msg <player> <message>",
         "op" => "/op <player>",
         "pardon" => "/pardon <player>",
@@ -7935,7 +7936,17 @@ fn loot_roll_source(
         "loot" => {
             let [id] = rest else { return Err(USAGE.into()) };
             loot_table_pools(id)
-                .map(|pools| roll_loot(&pools))
+                .map(|pools| {
+                    apply_live_mod_loot_modifiers(
+                        id,
+                        cmd_dim(ctx),
+                        Some((ctx.x as i32, ctx.y as i32, ctx.z as i32)),
+                        false,
+                        None,
+                        roll_loot(&pools),
+                        TICK_IDX.load(Ordering::Relaxed),
+                    )
+                })
                 .ok_or_else(|| format!("Unknown loot table '{id}'"))
         }
         "kill" => {
@@ -7996,7 +8007,17 @@ fn loot_roll_source(
                 }
             }
             loot_table_pools(id)
-                .map(|pools| roll_loot(&pools))
+                .map(|pools| {
+                    apply_live_mod_loot_modifiers(
+                        id,
+                        cmd_dim(ctx),
+                        Some((ctx.x as i32, ctx.y as i32, ctx.z as i32)),
+                        false,
+                        None,
+                        roll_loot(&pools),
+                        TICK_IDX.load(Ordering::Relaxed),
+                    )
+                })
                 .ok_or_else(|| format!("Unknown loot table '{id}'"))
         }
         _ => Err(USAGE.into()),
@@ -8738,6 +8759,13 @@ fn run_megu_command_admin_wired(
     }
     match args.first().copied() {
         Some("mod") => run_megu_mod_command(level, &args[1..]),
+        Some("diff") => {
+            if level < 4 {
+                P8C_DENIED.into()
+            } else {
+                crate::live_provenance_diff_json()
+            }
+        }
         Some("shadowlight") => {
             if level < 4 {
                 return P8C_DENIED.into();
