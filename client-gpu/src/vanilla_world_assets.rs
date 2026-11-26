@@ -274,10 +274,7 @@ impl VanillaWorldAssets {
 
 /// Normalized UV rectangle for a phase in the 4 by 2 moon sheet.
 pub fn moon_phase_uv_rect(phase: u8) -> [f32; 4] {
-    let cell = phase % 8;
-    let u = f32::from(cell % 4) * 0.25;
-    let v = f32::from(cell / 4) * 0.5;
-    [u, v, u + 0.25, v + 0.5]
+    megu_core::xp_curve::moon_atlas_uv(phase)
 }
 
 /// Sample the Vanilla grass or foliage colormap at temperature/downfall.

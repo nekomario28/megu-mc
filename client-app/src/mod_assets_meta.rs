@@ -9,11 +9,9 @@ const MAX_ARCHIVES: usize = 256;
 const MAX_LANG_BYTES: usize = 1024 * 1024;
 const MAX_ICON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_INDEXED_ASSETS: usize = 65_535;
-const MAX_MRS_BYTES: usize = 8 * 1024 * 1024;
-const MAX_MRS_ROWS: usize = 131_072;
 
 /// Play S2C custom-payload channel carrying the `MRS1` dynamic registry frame.
-pub const CHANNEL_MOD_REGISTRY_SYNC: &str = "megu:mod_registry_sync_v1";
+pub const CHANNEL_MOD_REGISTRY_SYNC: &str = megu_proto::mod_wire::MOD_REGISTRY_SYNC_CHANNEL;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ModMetaReport {
@@ -230,143 +228,12 @@ pub struct ModBlockState {
     pub facts_byte: u8,
 }
 
-// The following shape/luminance/opacity rules mirror
-// `mod_adapter_core::live_registry_bridge` exactly. MRS1 v1 does not carry the
-// byte on the wire, so mixed-version clients and servers must derive the same
-// value rather than treating every modded block as opaque.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModShape {
-    Empty,
-    Thin,
-    Partial,
-    Leaves,
-    Liquid,
-    Full,
-}
-
-fn mod_block_shape(path: &str) -> ModShape {
-    if path == "block" || path.ends_with("_block") {
-        return ModShape::Full;
-    }
-    if ["water", "lava", "fluid", "liquid"]
-        .iter()
-        .any(|k| path.ends_with(k))
-    {
-        return ModShape::Liquid;
-    }
-    if path.contains("leaves") {
-        return ModShape::Leaves;
-    }
-    const EMPTY: &[&str] = &[
-        "torch", "rail", "flower", "sapling", "crop", "vine", "wire", "button", "lever", "sign",
-        "banner", "candle", "mushroom", "fern", "coral", "reed", "lichen", "grass", "plant",
-        "seed",
-    ];
-    if EMPTY.iter().any(|k| path.contains(k)) {
-        return ModShape::Empty;
-    }
-    const THIN: &[&str] = &[
-        "glass",
-        "pane",
-        "grate",
-        "bars",
-        "chain",
-        "lantern",
-        "pipe",
-        "shaft",
-        "belt",
-        "cogwheel",
-        "wheel",
-        "funnel",
-        "chute",
-        "spout",
-        "depot",
-        "basin",
-        "pump",
-        "bearing",
-        "ladder",
-        "scaffold",
-        "frame",
-        "pressure_plate",
-        "door",
-        "trapdoor",
-        "hopper",
-        "cauldron",
-        "anvil",
-        "conduit",
-    ];
-    if THIN.iter().any(|k| path.contains(k)) {
-        return ModShape::Thin;
-    }
-    const PARTIAL: &[&str] = &[
-        "slab", "stair", "fence", "wall", "carpet", "snow", "path", "farmland",
-    ];
-    if PARTIAL.iter().any(|k| path.contains(k)) || path.ends_with("_bed") {
-        return ModShape::Partial;
-    }
-    ModShape::Full
-}
-
-fn mod_state_luminance(path: &str, properties: &BTreeMap<String, String>) -> u8 {
-    let base = if path.contains("magma") {
-        7
-    } else if [
-        "lamp",
-        "lantern",
-        "torch",
-        "glow",
-        "blaze_burner",
-        "light",
-        "crystal",
-        "luminous",
-        "forge",
-    ]
-    .iter()
-    .any(|k| path.contains(k))
-    {
-        14
-    } else {
-        0
-    };
-    let mut luminance = base;
-    for (key, value) in properties {
-        match (key.as_str(), value.as_str()) {
-            ("lit", "true") => luminance = 15,
-            ("lit", _) => luminance = 0,
-            ("blaze", level) => {
-                luminance = match level {
-                    "seething" => 15,
-                    "kindled" => 11,
-                    "smouldering" => 7,
-                    _ => 0,
-                }
-            }
-            ("powered", "true") if base > 0 => luminance = 15,
-            _ => {}
-        }
-    }
-    luminance.min(15)
-}
-
-fn mod_state_opacity(path: &str, properties: &BTreeMap<String, String>) -> u8 {
-    let mut opacity = match mod_block_shape(path) {
-        ModShape::Empty | ModShape::Thin => 0,
-        ModShape::Partial | ModShape::Leaves | ModShape::Liquid => 1,
-        ModShape::Full => 15,
-    };
-    if opacity == 0
-        && properties
-            .iter()
-            .any(|(k, v)| k == "waterlogged" && v == "true")
-    {
-        opacity = 1;
-    }
-    opacity
-}
-
 pub fn derive_block_facts_byte(block_id: &str, properties: &BTreeMap<String, String>) -> u8 {
-    let path = block_id.rsplit(':').next().unwrap_or(block_id);
-    (mod_state_luminance(path, properties) << 4) | mod_state_opacity(path, properties)
+    let properties: Vec<_> = properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    megu_proto::mod_wire::derive_mrs1_facts_byte(block_id, &properties)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -377,9 +244,8 @@ pub struct ClientModRegistry {
     items: BTreeMap<u32, String>,
 }
 
-
 impl ClientModRegistry {
-    /// Decode MRS1 matching `mod_adapter_core::live_registry_bridge` byte-for-byte:
+    /// Decode MRS1 through the canonical shared wire codec:
     /// magic (`MRS1`), version `u16` (1 or 2), `base_block_state_id` (`u32`),
     /// `base_item_id` (`u32`), block count (`u32`), then each block as monotonic
     /// `state_id` (`u32`), UTF-8 `block_id`, `u16` property count and UTF-8
@@ -389,87 +255,29 @@ impl ClientModRegistry {
     /// trailing IEEE CRC32 (`u32`, big-endian). All integers are big-endian and
     /// strings use `u16` byte lengths.
     pub fn decode_mrs1_frame(frame: &[u8]) -> Result<Self, String> {
-        if frame.len() > MAX_MRS_BYTES {
-            return Err("MRS1 frame exceeds byte budget".into());
-        }
-        if frame.len() < 4 + 2 + 4 + 4 + 4 + 4 + 4 {
-            return Err("truncated MRS1 frame".into());
-        }
-        let payload_len = frame.len() - 4;
-        let expected_crc = u32::from_be_bytes(
-            frame[payload_len..]
-                .try_into()
-                .map_err(|_| "truncated MRS1 crc32")?,
-        );
-        if megu_core::hash::crc32_ieee(&frame[..payload_len]) != expected_crc {
-            return Err("MRS1 crc32 mismatch".into());
-        }
-        let mut r = Reader {
-            bytes: &frame[..payload_len],
-            pos: 0,
-        };
-        if r.take(4)? != b"MRS1" {
-            return Err("invalid MRS1 magic".into());
-        }
-        let version = r.u16()?;
-        if version != 1 && version != 2 {
-            return Err("unsupported MRS1 version".into());
-        }
-        let has_wire_facts = version == 2;
-        let base_block_state_id = r.u32()?;
-        let base_item_id = r.u32()?;
-        let block_count = r.count()?;
-        let mut blocks = BTreeMap::new();
-        let mut prev_state_id = None;
-        for _ in 0..block_count {
-            let state_id = r.u32()?;
-            if state_id < base_block_state_id
-                || prev_state_id.is_some_and(|prev| state_id <= prev)
-            {
-                return Err("non-monotonic MRS1 block state id".into());
-            }
-            prev_state_id = Some(state_id);
-            let name = r.string()?;
-            let property_count = usize::from(r.u16()?);
-            if property_count > 4096 {
-                return Err("MRS1 property budget exceeded".into());
-            }
-            let mut properties = BTreeMap::new();
-            for _ in 0..property_count {
-                let k = r.string()?;
-                let v = r.string()?;
-                if properties.insert(k, v).is_some() {
-                    return Err("duplicate MRS1 property".into());
-                }
-            }
-            let facts_byte = if has_wire_facts {
-                r.take(1)?[0]
-            } else {
-                derive_block_facts_byte(&name, &properties)
-            };
-            blocks.insert(
-                state_id,
-                ModBlockState {
-                    name,
-                    properties,
-                    facts_byte,
-                },
-            );
-        }
-        let item_count = r.count()?;
-        let mut items = BTreeMap::new();
-        let mut prev_item_id = None;
-        for _ in 0..item_count {
-            let item_id = r.u32()?;
-            if item_id < base_item_id || prev_item_id.is_some_and(|prev| item_id <= prev) {
-                return Err("non-monotonic MRS1 item id".into());
-            }
-            prev_item_id = Some(item_id);
-            items.insert(item_id, r.string()?);
-        }
-        if r.pos != payload_len {
-            return Err("trailing bytes in MRS1 frame".into());
-        }
+        let decoded = megu_proto::mod_wire::decode_mrs1_frame(frame)?;
+        let megu_proto::mod_wire::DecodedMrs1Registry {
+            base_block_state_id,
+            base_item_id,
+            block_states: entries,
+            facts_bytes,
+            items,
+            ..
+        } = decoded;
+        let blocks = entries
+            .into_iter()
+            .zip(facts_bytes)
+            .map(|(entry, facts_byte)| {
+                (
+                    entry.state_id,
+                    ModBlockState {
+                        name: entry.block_id,
+                        properties: entry.properties.into_iter().collect(),
+                        facts_byte,
+                    },
+                )
+            })
+            .collect();
         Ok(Self {
             base_block_state_id,
             base_item_id,
@@ -498,47 +306,6 @@ impl ClientModRegistry {
 
 pub fn decode_mrs1_frame(frame: &[u8]) -> Result<ClientModRegistry, String> {
     ClientModRegistry::decode_mrs1_frame(frame)
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.pos.checked_add(n).ok_or("MRS1 offset overflow")?;
-        let out = self
-            .bytes
-            .get(self.pos..end)
-            .ok_or("truncated MRS1 frame")?;
-        self.pos = end;
-        Ok(out)
-    }
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.try_into().map_err(|_| "truncated u16")?,
-        ))
-    }
-    fn u32(&mut self) -> Result<u32, String> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?.try_into().map_err(|_| "truncated u32")?,
-        ))
-    }
-    fn count(&mut self) -> Result<usize, String> {
-        let n = self.u32()? as usize;
-        if n > MAX_MRS_ROWS {
-            return Err("MRS1 row budget exceeded".into());
-        }
-        Ok(n)
-    }
-    fn string(&mut self) -> Result<String, String> {
-        let n = usize::from(self.u16()?);
-        let s = std::str::from_utf8(self.take(n)?).map_err(|_| "invalid MRS1 UTF-8")?;
-        if s.is_empty() || s.len() > 512 {
-            return Err("invalid MRS1 string length".into());
-        }
-        Ok(s.to_owned())
-    }
 }
 
 fn parse_flat_json(bytes: &[u8]) -> Result<BTreeMap<String, String>, &'static str> {
