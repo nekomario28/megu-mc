@@ -329,6 +329,7 @@ fn runtime_root_candidates(server_bin: &Path, game_dir: &Path) -> Vec<PathBuf> {
     push_runtime_root_candidate(&mut candidates, game_dir.clone());
 
     let runtime_dir = game_dir.join("megu-runtime");
+    push_runtime_root_candidate(&mut candidates, runtime_dir.clone());
     if let Ok(entries) = fs::read_dir(&runtime_dir) {
         let mut bundles: Vec<PathBuf> = entries
             .filter_map(|entry| entry.ok())
@@ -349,6 +350,122 @@ fn find_runtime_root(server_bin: &Path, game_dir: &Path) -> Option<PathBuf> {
     runtime_root_candidates(server_bin, game_dir)
         .into_iter()
         .find(|dir| missing_runtime_root_parts(dir).is_empty())
+}
+
+/// Whether an installed oracle pack can launch without zero-setup assets.
+pub fn has_complete_runtime(cfg: &CliConfig) -> bool {
+    let game_dir = cfg.game_dir.as_deref().unwrap_or_else(|| Path::new("."));
+    resolve_server_bin(cfg.server_bin.as_deref())
+        .ok()
+        .is_some_and(|bin| find_runtime_root(&bin, game_dir).is_some())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ZeroSetupRuntime {
+    blocks_json: PathBuf,
+    vanilla_jar: PathBuf,
+}
+
+const BLOCKS_JSON: &str = "blocks_1211.json";
+const ZERO_SETUP_MARKER: &str = ".megu-zero-setup";
+
+fn local_vanilla_jar_candidates(game_dir: &Path) -> Vec<PathBuf> {
+    const VERSION_JAR: &str = "versions/1.21.1/1.21.1.jar";
+    const PRISM_JAR: &str =
+        "PrismLauncher/libraries/com/mojang/minecraft/1.21.1/minecraft-1.21.1-client.jar";
+    let mut jars = vec![game_dir.join(VERSION_JAR), game_dir.join("1.21.1.jar")];
+    let get = |key| env::var_os(key).map(PathBuf::from);
+    let home = get("HOME").or_else(|| get("USERPROFILE"));
+    let (launcher, data, cache) = if cfg!(target_os = "windows") {
+        let roaming = get("APPDATA").or_else(|| home.as_ref().map(|h| h.join("AppData/Roaming")));
+        let local = get("LOCALAPPDATA").or_else(|| home.as_ref().map(|h| h.join("AppData/Local")));
+        (
+            roaming.as_ref().map(|r| r.join(".minecraft")),
+            roaming,
+            local,
+        )
+    } else if cfg!(target_os = "macos") {
+        let app = home.as_ref().map(|h| h.join("Library/Application Support"));
+        (
+            app.as_ref().map(|a| a.join("minecraft")),
+            app,
+            home.as_ref().map(|h| h.join("Library/Caches")),
+        )
+    } else {
+        let data = get("XDG_DATA_HOME").or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+        let cache = get("XDG_CACHE_HOME").or_else(|| home.as_ref().map(|h| h.join(".cache")));
+        if let Some(h) = &home {
+            jars.push(
+                h.join(".var/app/com.mojang.Minecraft/.minecraft")
+                    .join(VERSION_JAR),
+            );
+            jars.push(
+                h.join(".var/app/org.prismlauncher.PrismLauncher/data")
+                    .join(PRISM_JAR),
+            );
+        }
+        (home.map(|h| h.join(".minecraft")), data, cache)
+    };
+    if let Some(launcher) = launcher {
+        jars.push(launcher.join(VERSION_JAR));
+    }
+    if let Some(data) = data {
+        jars.push(data.join(PRISM_JAR));
+        jars.push(data.join("ModrinthApp/meta").join(VERSION_JAR));
+    }
+    if let Some(cache) = cache {
+        jars.push(cache.join("megu").join(VERSION_JAR));
+    }
+    jars
+}
+
+fn has_vanilla_jar_data(path: &Path) -> bool {
+    // Match the server JAR fallback's required data markers. Inspect the
+    // central directory, not the compressed contents; the server owns parsing.
+    const MARKERS: [&str; 4] = [
+        "data/minecraft/dimension_type/overworld.json",
+        "data/minecraft/worldgen/noise_settings/overworld.json",
+        "data/minecraft/worldgen/biome/plains.json",
+        "data/minecraft/tags/block/mineable/pickaxe.json",
+    ];
+    const BUNDLER: &str = "META-INF/versions/1.21.1/server-1.21.1.jar";
+    fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() <= 256 * 1024 * 1024)
+        && megu_core::zip_archive::LazyZipIndex::open_filtered(path, |name| {
+            name == BUNDLER || MARKERS.contains(&name)
+        })
+        .is_ok_and(|jar| {
+            let has = |name| jar.entries().iter().any(|entry| entry.name == name);
+            has(BUNDLER) || MARKERS.into_iter().all(has)
+        })
+}
+
+fn find_zero_setup_runtime(
+    server_bin: &Path,
+    game_dir: &Path,
+    vanilla_jar: Option<&Path>,
+    blocks_json: Option<&Path>,
+) -> Option<ZeroSetupRuntime> {
+    let blocks_json = if let Some(path) = blocks_json {
+        path.is_file().then(|| path.to_path_buf())?
+    } else {
+        runtime_root_candidates(server_bin, game_dir)
+            .into_iter()
+            .map(|root| root.join("assets").join(BLOCKS_JSON))
+            .find(|p| p.is_file())?
+    };
+    let explicit_jar = vanilla_jar
+        .map(Path::to_path_buf)
+        .or_else(|| env::var_os("MEGU_VANILLA_JAR").map(PathBuf::from));
+    let vanilla_jar = match explicit_jar {
+        Some(path) => has_vanilla_jar_data(&path).then_some(path)?,
+        None => local_vanilla_jar_candidates(game_dir)
+            .into_iter()
+            .find(|path| has_vanilla_jar_data(path))?,
+    };
+    Some(ZeroSetupRuntime {
+        blocks_json: absolute_path_best_effort(&blocks_json),
+        vanilla_jar: absolute_path_best_effort(&vanilla_jar),
+    })
 }
 
 fn runtime_root_error(server_bin: &Path, game_dir: &Path) -> String {
@@ -439,6 +556,22 @@ fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String
     let runtime_root = canonicalize_best_effort(runtime_root.to_path_buf());
     fs::create_dir_all(world_dir)
         .map_err(|e| format!("cannot create world dir {}: {e}", world_dir.display()))?;
+    let assets = world_dir.join("assets");
+    let marker = assets.join(ZERO_SETUP_MARKER);
+    if assets.symlink_metadata().is_ok_and(|m| m.is_dir()) && marker.is_file() {
+        // Upgrade an existing zero-setup world without replacing its save or
+        // modifying a shared asset symlink. Reuse the staged directory.
+        for name in REQUIRED_RUNTIME_ASSETS {
+            let dst = assets.join(name);
+            if name == BLOCKS_JSON && dst.symlink_metadata().is_ok() {
+                fs::remove_file(&dst)
+                    .map_err(|e| format!("cannot replace {}: {e}", dst.display()))?;
+            }
+            link_or_copy(&runtime_root.join("assets").join(name), &dst)
+                .map_err(|e| format!("cannot install {}: {e}", dst.display()))?;
+        }
+        fs::remove_file(&marker).map_err(|e| format!("cannot remove {}: {e}", marker.display()))?;
+    }
     for name in ["assets", "config_packets.bin"] {
         link_or_copy(&runtime_root.join(name), &world_dir.join(name))
             .map_err(|e| format!("cannot link {} into {}: {e}", name, world_dir.display()))?;
@@ -472,6 +605,54 @@ fn prepare_world_dir(world_dir: &Path, runtime_root: &Path) -> Result<(), String
             .map_err(|e| format!("cannot link datapacks into {}: {e}", world_dir.display()))?;
     }
     Ok(())
+}
+
+impl ZeroSetupRuntime {
+    fn prepare_world_dir(&self, world_dir: &Path) -> Result<PathBuf, String> {
+        let assets = world_dir.join("assets");
+        let dst = assets.join(BLOCKS_JSON);
+        let prepare = || -> io::Result<()> {
+            fs::create_dir_all(world_dir)?;
+            match assets.symlink_metadata() {
+                Ok(meta) if meta.is_dir() => {}
+                // Never seed an existing asset symlink by writing through it.
+                Ok(meta) if meta.file_type().is_symlink() && assets.is_dir() && dst.is_file() => {
+                    return Ok(())
+                }
+                Ok(meta) if meta.file_type().is_symlink() && !assets.exists() => {
+                    fs::remove_file(&assets)?;
+                    fs::create_dir(&assets)?;
+                    fs::write(assets.join(ZERO_SETUP_MARKER), [])?;
+                }
+                Ok(_) => return Err(io::Error::other("assets is not a writable world directory")),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    fs::create_dir(&assets)?;
+                    fs::write(assets.join(ZERO_SETUP_MARKER), [])?;
+                }
+                Err(e) => return Err(e),
+            }
+            link_or_copy(&self.blocks_json, &dst)?;
+            if dst.is_file() {
+                Ok(())
+            } else {
+                Err(io::Error::other("staged block table is not a file"))
+            }
+        };
+        prepare().map_err(|e| {
+            format!(
+                "cannot stage zero-setup block table in {}: {e}",
+                world_dir.display()
+            )
+        })?;
+        // The child changes directory, so pass an absolute version-pack path.
+        Ok(absolute_path_best_effort(&assets))
+    }
+
+    fn apply_env(&self, command: &mut Command, assets: &Path) {
+        command
+            .env("MEGU_VANILLA_JAR", &self.vanilla_jar)
+            .env("MEGU_VERSION_DIR", assets);
+    }
 }
 
 /// Resolve `<gameDir>/mods` for the integrated singleplayer server when that
@@ -588,6 +769,16 @@ impl IntegratedServerConfig {
 /// Launch the integrated server for `--quickPlaySingleplayer`. On success the
 /// returned guard keeps the child alive until dropped.
 pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
+    launch_with_runtime_assets(cfg, None, None)
+}
+
+/// Launch with optional locally bootstrapped 1.21.1 files. A complete oracle
+/// runtime always takes precedence; missing paths fall back to local discovery.
+pub fn launch_with_runtime_assets(
+    cfg: &CliConfig,
+    vanilla_jar: Option<&Path>,
+    blocks_json: Option<&Path>,
+) -> Result<SingleplayerServer, String> {
     let world = cfg
         .quick_play_singleplayer
         .as_deref()
@@ -596,16 +787,22 @@ pub fn launch(cfg: &CliConfig) -> Result<SingleplayerServer, String> {
 
     let game_dir = cfg.game_dir.clone().unwrap_or_else(|| PathBuf::from("."));
     let server_bin = resolve_server_bin(cfg.server_bin.as_deref())?;
-    let runtime_root = find_runtime_root(&server_bin, &game_dir)
-        .ok_or_else(|| runtime_root_error(&server_bin, &game_dir))?;
-
     let world_dir = world_save_dir(&game_dir, world)?;
-    prepare_world_dir(&world_dir, &runtime_root)?;
+    let mut command = Command::new(&server_bin);
+    if let Some(runtime_root) = find_runtime_root(&server_bin, &game_dir) {
+        prepare_world_dir(&world_dir, &runtime_root)?;
+    } else if let Some(runtime) =
+        find_zero_setup_runtime(&server_bin, &game_dir, vanilla_jar, blocks_json)
+    {
+        let assets = runtime.prepare_world_dir(&world_dir)?;
+        runtime.apply_env(&mut command, &assets);
+    } else {
+        return Err(runtime_root_error(&server_bin, &game_dir));
+    }
 
     // Ephemeral loopback port: bind :0, read the assigned port, release.
     let port = allocate_loopback_port()?;
 
-    let mut command = Command::new(&server_bin);
     command
         .current_dir(&world_dir)
         .env("MEGU_BIND_ADDR", INTEGRATED_BIND_IP.to_string())
@@ -722,6 +919,120 @@ mod tests {
             b"{}",
         )
         .unwrap();
+    }
+
+    // A plain stored ZIP with synthetic datapack markers; no Minecraft data.
+    fn write_test_jar(path: &Path, names: &[&str]) {
+        let mut bytes = Vec::new();
+        let mut directory = Vec::new();
+        for name in names {
+            let offset = bytes.len() as u32;
+            let mut local = [0; 30];
+            local[..4].copy_from_slice(b"PK\x03\x04");
+            local[4..6].copy_from_slice(&20u16.to_le_bytes());
+            local[26..28].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            bytes.extend_from_slice(&local);
+            bytes.extend_from_slice(name.as_bytes());
+            let mut central = [0; 46];
+            central[..4].copy_from_slice(b"PK\x01\x02");
+            central[4..6].copy_from_slice(&20u16.to_le_bytes());
+            central[6..8].copy_from_slice(&20u16.to_le_bytes());
+            central[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            central[42..46].copy_from_slice(&offset.to_le_bytes());
+            directory.extend_from_slice(&central);
+            directory.extend_from_slice(name.as_bytes());
+        }
+        let mut end = [0; 22];
+        end[..4].copy_from_slice(b"PK\x05\x06");
+        end[8..10].copy_from_slice(&(names.len() as u16).to_le_bytes());
+        end[10..12].copy_from_slice(&(names.len() as u16).to_le_bytes());
+        end[12..16].copy_from_slice(&(directory.len() as u32).to_le_bytes());
+        end[16..20].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        bytes.extend(directory);
+        bytes.extend(end);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn zero_setup_stages_only_blocks_and_sets_absolute_child_env() {
+        let game = synthetic_root("zero-setup");
+        let blocks = game
+            .join("megu-runtime/zero-setup/assets")
+            .join(BLOCKS_JSON);
+        fs::create_dir_all(blocks.parent().unwrap()).unwrap();
+        fs::write(&blocks, b"synthetic block metadata").unwrap();
+        let jar = game.join("versions/1.21.1/1.21.1.jar");
+        write_test_jar(
+            &jar,
+            &[
+                "data/minecraft/dimension_type/overworld.json",
+                "data/minecraft/worldgen/noise_settings/overworld.json",
+                "data/minecraft/worldgen/biome/plains.json",
+                "data/minecraft/tags/block/mineable/pickaxe.json",
+            ],
+        );
+        let bin = game.join("bin/megu");
+        assert!(find_runtime_root(&bin, &game).is_none());
+        assert!(local_vanilla_jar_candidates(&game)
+            .iter()
+            .any(|p| p == &jar && has_vanilla_jar_data(p)));
+        let runtime = find_zero_setup_runtime(&bin, &game, Some(&jar), None).unwrap();
+        assert_eq!(runtime.blocks_json, absolute_path_best_effort(&blocks));
+        assert_eq!(runtime.vanilla_jar, absolute_path_best_effort(&jar));
+        let world = world_save_dir(&game, "new-world").unwrap();
+        let assets = runtime.prepare_world_dir(&world).unwrap();
+        assert_eq!(
+            fs::read(world.join("assets").join(BLOCKS_JSON)).unwrap(),
+            b"synthetic block metadata"
+        );
+        assert!(!world.join("config_packets.bin").exists());
+        assert!(!world.join("datapacks").exists());
+        let mut child = Command::new(&bin);
+        child.current_dir(&world);
+        runtime.apply_env(&mut child, &assets);
+        let envs: std::collections::HashMap<_, _> = child.get_envs().collect();
+        assert_eq!(
+            envs[std::ffi::OsStr::new("MEGU_VANILLA_JAR")],
+            Some(runtime.vanilla_jar.as_os_str())
+        );
+        assert_eq!(
+            envs[std::ffi::OsStr::new("MEGU_VERSION_DIR")],
+            Some(assets.as_os_str())
+        );
+
+        // A later full install must work on this same world and use its own
+        // files, without touching source metadata or the player's save.
+        fs::write(world.join("player-save"), b"player").unwrap();
+        let full = game.join("megu-runtime/full");
+        write_complete_runtime(&full);
+        let root = find_runtime_root(&bin, &game).unwrap();
+        assert_eq!(root, absolute_path_best_effort(&full));
+        prepare_world_dir(&world, &root).unwrap();
+        for name in REQUIRED_RUNTIME_ASSETS {
+            assert_eq!(fs::read(world.join("assets").join(name)).unwrap(), b"{}");
+        }
+        assert_eq!(fs::read(world.join("config_packets.bin")).unwrap(), b"cfg");
+        assert_eq!(
+            fs::read(world.join("datapacks/vanilla/pack.mcmeta")).unwrap(),
+            b"{}"
+        );
+        assert_eq!(fs::read(&blocks).unwrap(), b"synthetic block metadata");
+        assert_eq!(fs::read(world.join("player-save")).unwrap(), b"player");
+        fs::remove_dir_all(game).unwrap();
+    }
+
+    #[test]
+    fn zero_setup_requires_jar_data_not_just_a_jar_filename() {
+        let game = synthetic_root("zero-setup-invalid-jar");
+        let blocks = game.join("assets").join(BLOCKS_JSON);
+        fs::create_dir_all(blocks.parent().unwrap()).unwrap();
+        fs::write(&blocks, b"[]").unwrap();
+        let jar = game.join("1.21.1.jar");
+        write_test_jar(&jar, &["assets/minecraft/textures/placeholder.png"]);
+        assert!(find_zero_setup_runtime(&game.join("megu"), &game, Some(&jar), None).is_none());
+        assert!(!game.join("saves").exists());
+        fs::remove_dir_all(game).unwrap();
     }
 
     #[test]
