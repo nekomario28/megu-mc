@@ -127,9 +127,15 @@ those layers from flat `src/` files into domain crates one stage at a time:
 
 State-ownership rule for every stage: a domain owns its state types,
 mutation goes through the owning domain's API, and cross-domain reads are
-snapshot/handle-based. The ratchets stay the acceptance test — a stage that
-changes any behaviour number, save-format byte, or packet byte is rejected,
-not shipped.
+snapshot/handle-based. This decomposition aligns directly with
+[DESIGN.md](../DESIGN.md) — **Rust-core strictness inside** (typed
+coordinate/slot domains, single ownership, pure simulation functions in
+`megu-core`, single-source generated tables and bit schemas) paired with
+**Go-shell simplicity outside** (message-passing boundaries, minimal input
+contracts, explicit cancellation/budgets) and the Tier A/B de-hardcoding
+blueprint (`A1`–`A8`, `B1`–`B6`). The ratchets stay the acceptance test — a
+stage that changes any behaviour number, save-format byte, or packet byte is
+rejected, not shipped.
 
 ## Standalone crates, not a workspace
 

@@ -243,23 +243,22 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 
 ## Alpha 5 — 1.21.1 ビジュアル・Mod 互換・監査収束 & 直感 Diff UX
 
-`alpha5/integration` にて、バニラ 1.21.1 のビジュアルパリティ（一人称ビューモデル・破壊クラック・360°パノラマ・公式テクスチャ空/天候/オーバーレイ・実ベイクモデル・エンティティ外見アトラス・3Dアイコン）、Codex 独立監査（Audit 1〜3）の全 P0/P1 閉鎖、および実用 Mod 運用基盤を3波構成で収束させる：
+`alpha5/integration` にて、バニラ 1.21.1 のビジュアルパリティ（一人称ビューモデル・破壊クラック・360°パノラマ・公式テクスチャ空/天候/オーバーレイ・実ベイクモデル・エンティティ外見アトラス・3Dアイコン）、Codex 独立監査（Audit 1〜5＋脱ハードコード監査）の P0/P1 閉鎖、および実用 Mod 運用基盤を3波構成で収束させる：
 
-1. **Wave 1（並列実装中）**:
+1. **Wave 1〜2（`alpha5/integration` へ統合済）**:
    - クライアント実描画統合（`blocks_1211.json` 由来カノニカル状態名・ベイク済地形 GPU 描画・`window.rs` 公式エクストラ配線）および Audit 2 アセット/UV/フォント/スキン修正。
    - サーバー Audit 1 修正（P0 襲撃セーブ再起動不能バグ・原子的マルチファイル世代スナップショット＋親ディレクトリ `fsync`・Anvil シード先読み・`.mcc`/`entities/*.mca`・JAR 検証＆Protocol 767 構成交換・PortalForcer・ベッド爆発/再検証・エンドラ戦＆4クリスタル再召喚・ウィザー召喚・ウォーデン振動化・構造物ルート重み/ロール数/単一 RNG・特殊レシピ＆クラフター・村人取引コンポーネント・昼洞窟湧き）。
    - Mod ワイヤ＆依存基盤（P0 `SW6D`/`SHLM` 共有コーデック・P0 `MRS1` v2 デコーダ・キネティック次元分離＆分割・汎用 NeoForge/Fabric/Quilt/Jar-in-Jar 依存ソルバ＆Modrinth 推移取得）。
-   - **PLaMo 3 Translate オンデマンド Mod 日本語自動翻訳バックエンド**（翻訳時のみローカル `llama-server` を一時起動し終了即破棄、0.8B/2B推奨/8B プリセット、PLaMo コミュニティライセンス明記＋同意後 HF 取得、プレースホルダ保護、`resourcepacks/megu_auto_ja_jp/` 標準パック出力＆差分キャッシュ）。
-2. **Wave 2（Wave 1 マージ直後に並列投入）**:
-   - **商標衛生一括中立化＋自動スキャンゲート（T1）**: ビルトイン機能名・UI ラベルの第三者 Mod 名を中立化し、`tools/trademark_hygiene_audit.py` を高速ゲートへ常設。
-   - **不足依存自動取得＋ウィンドウ維持インプロセス再起動＋Diff UX（W1）**: 欠落依存の Modrinth API 同意付き自動取得、ウィンドウ/パノラマ維持のインプロセス再起動、変更サマリー Diff トースト（増減ブロック/レシピ/チェスト改変/翻訳キー数）、Mod プロファイルの1クリック巻戻し（トランザクション履歴）、PLaMo 3 インストール/翻訳ボタン＆`megu_auto_ja_jp` 即時 ON/OFF トグル、残りクライアント P1 修正。
-   - **Create / Sable / Aeronautics サーバー権限＋Mod ルートチェスト/GLM ライブ配線＋Provenance Diff（M3）**: サーバー側 Aeronautics/Create 残件閉鎖に加え、全 Mod JAR の `data/<ns>/loot_table(s)/**` オーバーレイ・NeoForge/Forge Global Loot Modifiers（`global_loot_modifiers.json`）汎用評価をライブチェスト・Mob・ブロック・`/loot` へ接続し、バニラ→Mod の上書き履歴（Provenance Diff）を追跡・可視化（Java コード直書き系フックはインスペクタで明示）。
-3. **Wave 3（最終検証・出口）**:
-   - 最終独立監査（Audit 4: Live GPU / Visuals / Controls / Protocol 767 / Zero-Alloc）および同一 SHA での全クレート clippy/test・`perf_antipattern_audit`・`general_defect_audit --strict`・`playblocker_guard_audit`・`trademark_hygiene_audit`・`docs_sync_audit --strict`・`--dst-check`・`alpha_release_smoke`（7/7）・`live_playability_e2e`（5/5）・`export_public_branch.sh --verify` を通過させる。
+   - **PLaMo 3 Translate オンデマンド Mod 日本語自動翻訳バックエンド＆UI**（翻訳時のみローカル `llama-server` を一時起動し終了即破棄、0.8B/2B推奨/8B プリセット、PLaMo コミュニティライセンス明記＋同意後 HF 取得、プレースホルダ保護、`resourcepacks/megu_auto_ja_jp/` 標準パック出力＆即時 ON/OFF トグル）。
+   - **商標衛生中立化＋自動スキャンゲート（T1）**、**不足依存自動取得＋ウィンドウ維持インプロセス再起動＋Diff トースト＆1クリック巻戻し（W1A/W1B/W1C）**、**Create / Sable / Aeronautics サーバー権限＋Mod ルートチェスト/GLM ライブ配線＋Provenance Diff（M3A/M3B/M3C）**。
+2. **Wave 3（収束・最終検証・出口）**:
+   - **All-UI 監査（Audit 4）＋6幕サバイバル E2E 監査（Audit 5）の全 P0/P1 修正レーン**（バニラ 1.21.1 味 UI・内蔵モジュール切替・ネイティブ 20Hz サバイバル物理・本/看板/エンドクレジット/チャット P0・ボス/トライアル/ウォーデン実配線）および脱ハードコード監査の最優先バグ **A1**（Create＋汎用 Mod 混載 `MRS1` の全件反復インストール）を統合。
+   - 同一 SHA での全クレート clippy/test・`perf_antipattern_audit`・`general_defect_audit --strict`・`playblocker_guard_audit`・`trademark_hygiene_audit --strict`・`docs_sync_audit --strict`・`--dst-check`・`alpha_release_smoke`（7/7）・`live_playability_e2e`（5/5）・`export_public_branch.sh --verify` を通過させる。
 
-## Alpha 6 — Diff 駆動ワールド＆超省 VRAM 描画アーキテクチャ（次期計画）
+## Alpha 6 — 脱ハードコード基盤・Diff 駆動ワールド＆超省 VRAM 描画アーキテクチャ（次期計画）
 
-Alpha 5 の安定化後に着手する中核拡張：
+Alpha 5 の安定化と回帰ゲート確立後に着手する中核拡張：
+- **冒頭ウェーブ · 大規模脱ハードコード・単一生成・分岐削減（[DESIGN.md](../DESIGN.md) Tier A2〜A8 → Tier B1〜B6）**: Alpha 5 の回帰ゲートを安全網に、1,333 アイテム／57 コンポーネント三重重複の単一生成（A2）、スロット／姿勢／HUD 幾何の型・数式統一（A3〜A5）、染料・境界・XP 閉形式（A6〜A8）、クライアント／サーバー共有採掘＆物理核（B1）、1.21.1／26.3 バージョン別ゲームプレイ事実パック抽出（B2）、`MRS1`/`MSY1` 単一ワイヤー契約＆`WorkstationSpec`（B3）、`DirBasis`＋GPU ビットスキーマ生成（B4）、Worldgen 命令融合（B5）、Aeronautics 材質キャッシュ（B6）と [architecture-crates.md](../docs/architecture-crates.md) のドメイン分離を連動させてコード量・分岐・ドリフトを大幅圧縮する。
 - **決定論 Delta ワールド保存＆タイムトラベルスナップショット**: シードから決定論再現できる未変更チャンクを 0 バイト化し、変更チャンクのみベース地形からのブロック差分（Delta）＋世代マニフェストで保存。ワールド容量を劇減させ、Mod 導入前／ボス戦前／建築ミス前への高速ロールバック・分岐試遊を実現する。
 - **マルチプレイヤー チャンクハッシュ差分同期**: クライアントのローカルチャンク Merkle ハッシュを照合し、再接続・再訪・ポータル移動時に変更ブロック差分だけ送信して帯域と待ち時間を削減する。
 - **ワールド内ゴースト Diff プレビュー＆1クリック Undo**: Create / Sable の船体組立てやクリエイティブ範囲編集の確定前に変更ブロックを半透明ゴーストで重ね表示し、確認・取り消しを直感化する。

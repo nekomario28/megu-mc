@@ -130,7 +130,7 @@ These highlights describe wired capabilities, not a promise of full Vanilla worl
 
 ## Architecture
 
-13 standalone crates plus the root server — no workspace, each manifest is its own source of truth. Full map: **[Crate Architecture](docs/architecture-crates.md)**.
+13 standalone crates plus the root server — no workspace, each manifest is its own source of truth. Full map: **[Crate Architecture](docs/architecture-crates.md)** · **[Design Principles & De-Hardcoding Blueprint (DESIGN.md)](DESIGN.md)**.
 
 | Crate | Owns |
 | :--- | :--- |

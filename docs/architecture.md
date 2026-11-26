@@ -2,22 +2,30 @@
 
 `megu` is the canonical server package and executable. Its standalone
 crates and dependency edges are indexed in
-[architecture-crates.md](architecture-crates.md). The capabilities below
-refer to modules present in this tree.
+[architecture-crates.md](architecture-crates.md), and the guiding design
+principles (Rust-core / Go-shell split, typed domain boundaries, single-source
+generation, unified transactions, and the Tier A/B de-hardcoding blueprint)
+live in [DESIGN.md](../DESIGN.md). The capabilities below refer to modules
+present in this tree.
 
 ## Crate capabilities
 
 - **`mod-adapter-core`** — Zero-JVM JAR and bytecode Mixin inspection
   ([`class_mixin_scanner`](../mod-adapter-core/src/class_mixin_scanner.rs)),
-  including safe `@Inject` Tier 2 event lifting; generic Farmer's Delight
-  recipes and compatible addon discovery
+  including safe `@Inject` Tier 2 event lifting; generic culinary recipes and
+  compatible addon discovery
   ([`culinary_adapter`](../mod-adapter-core/src/culinary_adapter.rs));
   progression barriers, multi-part bosses, `CGD1` chunk-generation and
-  `EAD1` entity-AI delegates, AppleSkin saturation and Inventory Sorter
-  quality-of-life support, and TerraBlender-style region blending
+  `EAD1` entity-AI delegates, saturation/inventory QoL support, and
+  region-blending hooks
   ([`world_extensions`](../mod-adapter-core/src/world_extensions.rs));
-  validated Server Mod Sync ([`mod_sync`](../mod-adapter-core/src/mod_sync.rs))
-  and generic creature behavior primitives
+  universal NeoForge/Fabric/Quilt/Jar-in-Jar dependency resolution & validated
+  Server Mod Sync ([`mod_sync`](../mod-adapter-core/src/mod_sync.rs)), live
+  mod JAR loot-table overlay + NeoForge/Forge Global Loot Modifier evaluation
+  ([`loot_modifier_engine`](../mod-adapter-core/src/loot_modifier_engine.rs)),
+  vanilla-to-mod overwrite provenance diff tracking
+  ([`provenance_diff`](../mod-adapter-core/src/provenance_diff.rs)), and
+  generic creature behavior primitives
   ([`creature_primitives`](../mod-adapter-core/src/creature_primitives.rs)).
   [`bytecode_subset_vm`](../mod-adapter-core/src/bytecode_subset_vm.rs) verifies
   and executes an allowlisted, fuel-bounded `.class` method subset without a
@@ -40,19 +48,32 @@ refer to modules present in this tree.
 - **`client-app`** — WGSL shader definitions and validation
   ([`shaders`](../client-app/src/shaders.rs)), RenderGraph
   ([`render_graph`](../client-app/src/render_graph.rs)), streaming frame budgets
-  ([`frame_pacer`](../client-app/src/frame_pacer.rs)), and bounded audio/QoL
-  helpers ([`audio_qol`](../client-app/src/audio_qol.rs)). The
-  [software rasterizer](../client-app/src/render.rs) is headless; a real
-  `winit` + `wgpu` window loop is a post-Alpha milestone.
-- **`client-ui`** — Pure-Rust UI draw lists, layout, screen state and a
-  headless RGBA rasterizer ([`src`](../client-ui/src/lib.rs)); GPU-ready
-  draw geometry and WGSL are present without a live window backend.
-- **`core`** — Redacted deterministic crash fingerprints and readable
-  summaries ([`crash_report`](../core/src/crash_report.rs)).
-- **`create-adapter`** — Rail topology and network operations
-  ([`rail_network`](../create-adapter/src/rail_network.rs)).
-- **`proto`** — `FRL2` friend invite relay
-  ([`friend_relay`](../proto/src/friend_relay.rs)) and `VCR1` proximity
+  ([`frame_pacer`](../client-app/src/frame_pacer.rs)), integrated server
+  harness ([`integrated`](../client-app/src/integrated.rs)), headless
+  [software rasterizer](../client-app/src/render.rs), and bounded audio/QoL
+  helpers ([`audio_qol`](../client-app/src/audio_qol.rs)).
+- **`client-ui`** — Pure-Rust UI draw lists, layout, screen state, trademark-neutral
+  built-in modules (`mod_manager`, `recipe_overlay`, `recipe_browser`), and a
+  headless RGBA rasterizer ([`src`](../client-ui/src/lib.rs)) consumed live
+  by `client-gpu`.
+- **`client-gpu`** — Isolated windowed `winit` + `wgpu` native GPU client
+  ([`window`](../client-gpu/src/window.rs),
+  [`renderer`](../client-gpu/src/renderer.rs),
+  [`live_session`](../client-gpu/src/live_session.rs)) with zero-window-close
+  in-process soft reload, transactional mod profile staging & rollback
+  ([`mod_profile_tx`](../client-gpu/src/mod_profile_tx.rs)), and opt-in
+  on-demand local Japanese resource-pack generation via transient `llama-server`
+  ([`mod_translator`](../client-gpu/src/mod_translator.rs)).
+- **`core`** — Shared pure-Rust domain primitives, canonical `1.21.1`/`26.3`
+  version constants, compact debug HUD metrics, and redacted deterministic
+  crash fingerprints ([`crash_report`](../core/src/crash_report.rs)).
+- **`create-adapter`** — Rail topology, contraption kinematics, and 6-DOF
+  aeronautics sub-world operations
+  ([`rail_network`](../create-adapter/src/rail_network.rs),
+  [`aeronautics`](../create-adapter/src/aeronautics.rs)).
+- **`proto`** — Canonical shared wire codecs including `SW6D`/`SHLM`
+  ([`subworld_wire`](../proto/src/subworld_wire.rs)), `FRL2` friend invite
+  relay ([`friend_relay`](../proto/src/friend_relay.rs)), and `VCR1` proximity
   voice relay ([`voice_relay`](../proto/src/voice_relay.rs)).
   `ServerSession` and the version router provide protocol 767/777
   session/codec paths ([`session`](../proto/src/session.rs),
