@@ -55,13 +55,69 @@ pub(crate) fn live_create_enabled() -> bool {
             return false;
         };
         rd.filter_map(|e| e.ok())
-            .filter_map(|e| e.file_name().into_string().ok())
-            .any(|n| {
-                n.len() > 4
-                    && n[n.len() - 4..].eq_ignore_ascii_case(".jar")
-                    && n.to_ascii_lowercase().contains("create")
+            .map(|e| e.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jar"))
             })
+            .any(|path| jar_manifest_declares_create(&path))
     })
+}
+
+/// The manifest-gated Create probe: a JAR arms the adapter only when its own
+/// mod metadata declares the mod id the flagship adapter catalog handles
+/// (`create`). The filename is operator-controlled noise — `recreate-maps.jar`
+/// is not Create and `create-0.5.1.jar` renamed to `bin.jar` still is — so the
+/// archived manifest, not the file name, decides. Fabric/Quilt declare
+/// `fabric.mod.json`'s `id`; Forge/NeoForge declare `modId` inside a
+/// `[[mods]]` table of the TOML under `META-INF`.
+#[cfg(feature = "mod-suite")]
+fn jar_manifest_declares_create(path: &Path) -> bool {
+    let Ok(index) = megu_core::zip_archive::LazyZipIndex::open_all(path) else {
+        return false;
+    };
+    if let Ok(json) = index.read_entry("fabric.mod.json", 1 << 20) {
+        if let Some(parsed) = jparse(&json) {
+            if parsed.get("id").is_some_and(|id| id.str() == "create") {
+                return true;
+            }
+        }
+    }
+    for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        if let Ok(toml) = index.read_entry(name, 1 << 20) {
+            if toml_declares_create_mod_id(&toml) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Scan a Forge/NeoForge `mods.toml` for a `[[mods]]` table whose `modId` is
+/// `create`. Dependency tables also name `modId="create"` (as a requirement,
+/// not the mod itself), so only the first `modId` after a `[[mods]]` header
+/// counts as the declaration.
+#[cfg(feature = "mod-suite")]
+fn toml_declares_create_mod_id(toml: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(toml) else {
+        return false;
+    };
+    let mut in_mods = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_mods = line == "[[mods]]";
+            continue;
+        }
+        if in_mods && line.starts_with("modId") {
+            let Some((_, value)) = line.split_once('=') else {
+                continue;
+            };
+            let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            return value == "create";
+        }
+    }
+    false
 }
 
 /// The `create:*` item table: `(item_name, Option<block_id>)` sorted by name

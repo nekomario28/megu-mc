@@ -215,16 +215,34 @@ impl PlayerSave {
                 // The live client only tracks the destination. When a bed or
                 // respawn anchor record was already saved for this exact point,
                 // the autosave's recapture keeps that record instead of
-                // flattening the kind back to Legacy.
+                // flattening the kind back to Legacy. A respawn resolves the
+                // bed/anchor to an adjacent standing coordinate and writes THAT
+                // back over the live point, so the typed record must also
+                // survive while the live point stays inside the bed/anchor's
+                // stand-resolution neighborhood — otherwise one death loses
+                // the anchor the next respawn would have resolved from.
                 saved_players()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&client.uuid)
                     .and_then(|save| save.respawn)
                     .filter(|saved| {
-                        saved.dim == live.dim
-                            && saved.position == live.position
-                            && saved.angle == live.angle
+                        if saved.dim != live.dim || saved.angle != live.angle {
+                            return false;
+                        }
+                        if saved.position == live.position {
+                            return true;
+                        }
+                        if matches!(saved.kind, SpawnTargetKind::Legacy) {
+                            return false;
+                        }
+                        // Vanilla's bed/anchor stand scan reaches at most two
+                        // blocks horizontally from the anchor block; three
+                        // covers the scan with room for the center offsets.
+                        let dx = (saved.position.0 - live.position.0).abs();
+                        let dy = (saved.position.1 - live.position.1).abs();
+                        let dz = (saved.position.2 - live.position.2).abs();
+                        dx <= 3.0 && dy <= 2.0 && dz <= 3.0
                     })
                     .unwrap_or(live)
             })
@@ -3548,6 +3566,8 @@ fn save_world_into_impl(f: &mut Vec<u8>, companion_sink: Option<&mut WorldCompan
         generated_fluids,
     }
     .append(f);
+    append_dim_fluid_footer(f);
+    append_raid_totals_footer(f);
     if !drop_owners.is_empty() {
         append_drop_owners_footer(f, &drop_owners);
     }
@@ -5333,6 +5353,8 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     let (payload, dim_signs, dim_players) = read_dim_footer(payload)?;
     let (payload, block_loot) = read_block_loot_footer(payload)?;
     let (payload, drop_owners) = read_drop_owners_footer(payload)?;
+    let (payload, raid_totals) = read_raid_totals_footer(payload)?;
+    let (payload, dim_fluids) = read_dim_fluid_footer(payload)?;
     let tick_state = tick_persistence::TickState::read(payload)?;
     let before_ticks = tick_persistence::prefix(payload)?;
     let generated = generated_content::Snapshot::read(before_ticks)?;
@@ -6293,14 +6315,25 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
         TICK_IDX.store(state.now, Ordering::Relaxed);
         BLOCK_TICK_ORDER.store(state.block_order, Ordering::Relaxed);
         *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = state.blocks;
+        // The legacy tick footer is the Overworld owner: it keeps the legacy
+        // static and the byte-identical save position it always had.
         let mut owner = GeneratedFluidOwner::new();
         owner.queue = state.fluids;
         owner.next_order = state.fluid_order;
         owner.owned = state.owned;
-        *GENERATED_FLUID_OWNER
-            .get_or_init(|| Mutex::new(GeneratedFluidOwner::new()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = owner;
+        *generated_fluid_owner().lock().unwrap_or_else(|e| e.into_inner()) = owner;
+        // FLD2's per-dimension owners join the non-Overworld map; a legacy
+        // save has no such footer and restores nothing here.
+        if !dim_fluids.is_empty() {
+            let mut owners = dim_fluid_owners().lock().unwrap_or_else(|e| e.into_inner());
+            for (dim, fluid_order, queue, owned) in dim_fluids {
+                let mut owner = GeneratedFluidOwner::new_dim(dim);
+                owner.next_order = fluid_order;
+                owner.queue = queue;
+                owner.owned = owned;
+                owners.insert(dim, owner);
+            }
+        }
         worldgen::with_gen(|g| {
             g.restore_tick_sources(state.sources);
             g.restore_generated_ticks(state.generated_blocks, state.generated_fluids);
@@ -6622,6 +6655,18 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     }
     *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()) = restored_raiders;
     *live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()) = restored_captains;
+    // The wave-starting raider totals restore with their raids: without them
+    // the boss bar's denominator defaults to the survivors, pinning progress
+    // at 100% until the wave is fully defeated. A legacy save has no RDT1
+    // footer and keeps that degraded fallback.
+    if !raid_totals.is_empty() {
+        let mut totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
+        for ((dim, center), total) in raid_totals {
+            if raids.iter().any(|(d, raid)| *d == dim && raid.center == center) {
+                totals.insert((dim, center), total);
+            }
+        }
+    }
     *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = raids;
     *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
     restore_wbe_entries(wbe_entries);
@@ -7820,6 +7865,166 @@ fn apply_mod_bridge_trailers(
 // between the legacy region and SVP1 so a save with no block entities keeps
 // every legacy byte — and every other footer's position — exactly where it was.
 const BLOCK_ENTITIES_MAGIC: &[u8; 4] = b"BEN1";
+
+/// Per-dimension pending fluid ticks (#32): every non-Overworld fluid owner,
+/// framed `[body][body size u64][FLD2]` like the other save-state footers. It
+/// is written immediately after the legacy tick state, so a save with no
+/// non-Overworld fluids keeps every legacy byte — and every other footer's
+/// position — exactly where it was, and a legacy save without the footer
+/// loads unchanged. The Overworld owner stays in the legacy tick state.
+const DIM_FLUID_MAGIC: &[u8; 4] = b"FLD2";
+
+/// Raid wave-starting raider totals, keyed like the raids themselves
+/// `(dim, center)`. Written after FLD2 in the same `[body][size u64][RDT1]`
+/// framing, so a save with no active raid — or a legacy save with none of
+/// this — round-trips byte-identically and old raids simply keep the
+/// degraded boss-bar denominator they always had.
+const RAID_TOTALS_MAGIC: &[u8; 4] = b"RDT1";
+
+fn append_raid_totals_footer(out: &mut Vec<u8>) {
+    let raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+    if raids.is_empty() {
+        return;
+    }
+    let totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries: Vec<(DimId, BlockPos, i32)> = raids
+        .iter()
+        .filter_map(|(dim, raid)| {
+            totals
+                .get(&(*dim, raid.center))
+                .copied()
+                .map(|total| (*dim, raid.center, total))
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|&(dim, center, _)| (dim.index(), center));
+    let start = out.len();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (dim, (x, y, z), total) in entries {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&x.to_be_bytes());
+        out.extend_from_slice(&y.to_be_bytes());
+        out.extend_from_slice(&z.to_be_bytes());
+        out.extend_from_slice(&total.to_be_bytes());
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(RAID_TOTALS_MAGIC);
+}
+
+fn read_raid_totals_footer(
+    payload: &[u8],
+) -> Result<(&[u8], Vec<((DimId, BlockPos), i32)>), &'static str> {
+    let (payload, body) = split_save_footer(payload, RAID_TOTALS_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut entries = Vec::new();
+    let mut p = 0;
+    let count = read_dim2_count(body, &mut p, 17).map_err(|_| "invalid raid totals count")?;
+    for _ in 0..count {
+        let entry = body.get(p..p + 17).ok_or("truncated raid total")?;
+        p += entry.len();
+        let dim = DimId::from_index(entry[0] as usize).ok_or("invalid raid total dimension")?;
+        let coordinate = |i| i32::from_be_bytes(entry[i..i + 4].try_into().unwrap());
+        let total = i32::from_be_bytes(entry[13..17].try_into().unwrap());
+        if total <= 0 {
+            return Err("invalid raid wave total");
+        }
+        entries.push(((dim, (coordinate(1), coordinate(5), coordinate(9))), total));
+    }
+    Ok((payload, entries))
+}
+
+
+fn append_dim_fluid_footer(out: &mut Vec<u8>) {
+    let Some(owners) = DIM_GENERATED_FLUID_OWNERS.get() else {
+        return;
+    };
+    let owners = owners.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries: Vec<(&DimId, &GeneratedFluidOwner)> = owners
+        .iter()
+        .filter(|(&dim, _)| dim != DimId::Overworld)
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    entries.sort_by_key(|(&dim, _)| dim.index());
+    let start = out.len();
+    out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+    for (&dim, owner) in entries {
+        out.push(dim.index() as u8);
+        out.extend_from_slice(&owner.next_order.to_be_bytes());
+        owner.queue.encode(out);
+        out.extend_from_slice(&(owner.owned.len() as u32).to_be_bytes());
+        let mut cells: Vec<BlockPos> = owner.owned.iter().copied().collect();
+        cells.sort_unstable();
+        for (x, y, z) in cells {
+            out.extend_from_slice(&x.to_be_bytes());
+            out.extend_from_slice(&y.to_be_bytes());
+            out.extend_from_slice(&z.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&((out.len() - start) as u64).to_be_bytes());
+    out.extend_from_slice(DIM_FLUID_MAGIC);
+}
+
+#[allow(clippy::type_complexity)]
+fn read_dim_fluid_footer(
+    payload: &[u8],
+) -> Result<
+    (
+        &[u8],
+        Vec<(
+            DimId,
+            i64,
+            scheduled_ticks::ScheduledTicks,
+            HashSet<BlockPos>,
+        )>,
+    ),
+    &'static str,
+> {
+    let (payload, body) = split_save_footer(payload, DIM_FLUID_MAGIC)?;
+    let Some(body) = body else {
+        return Ok((payload, Vec::new()));
+    };
+    let mut entries = Vec::new();
+    let mut p = 0;
+    let count = read_dim2_count(body, &mut p, 4).map_err(|_| "invalid dim fluid count")?;
+    for _ in 0..count {
+        let header = body.get(p..p + 9).ok_or("truncated dim fluid owner")?;
+        p += header.len();
+        let dim =
+            DimId::from_index(header[0] as usize).ok_or("invalid dim fluid dimension")?;
+        if dim == DimId::Overworld {
+            return Err("dim fluid owner must not be the Overworld");
+        }
+        let fluid_order = i64::from_be_bytes(header[1..9].try_into().unwrap());
+        let mut input = body.get(p..).ok_or("truncated dim fluid queue")?;
+        let queue = scheduled_ticks::ScheduledTicks::decode(&mut input)?;
+        let consumed = body.len() - p - input.len();
+        p += consumed;
+        let owned_count = u32::from_be_bytes(
+            body.get(p..p + 4)
+                .ok_or("truncated dim fluid owned count")?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        p += 4;
+        let mut owned = HashSet::new();
+        for _ in 0..owned_count {
+            let cell = body.get(p..p + 12).ok_or("truncated dim fluid owned cell")?;
+            p += cell.len();
+            let coordinate =
+                |i| i32::from_be_bytes(cell[i..i + 4].try_into().unwrap());
+            owned.insert((coordinate(0), coordinate(4), coordinate(8)));
+        }
+        entries.push((dim, fluid_order, queue, owned));
+    }
+    Ok((payload, entries))
+}
+
 
 fn append_block_entities_footer(out: &mut Vec<u8>, dxt: &mut DxtEntries) {
     let Some(reg) = breg() else { return };
@@ -10681,3 +10886,98 @@ mod player_dragon_persistence_tests {
         set_end_dragon_fight_save(old_dragon);
     }
 }
+
+
+/// SURV-1B: the FLD2 footer carries per-dimension generated fluid owners —
+/// Nether lava springs must still flow after a save/reload cycle, and a legacy
+/// save without the footer must read as empty rather than corrupt.
+#[cfg(test)]
+mod dim_fluid_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn dim_fluid_footer_roundtrips_nether_and_end_owners() {
+        let _guard = crate::test_support::global_world_test_guard();
+        let snapshot: Vec<(DimId, i64, HashSet<BlockPos>)> = {
+            let owners = dim_fluid_owners().lock().unwrap_or_else(|e| e.into_inner());
+            owners
+                .iter()
+                .map(|(&dim, owner)| (dim, owner.next_order, owner.owned.clone()))
+                .collect()
+        };
+        // Replace the map with a controlled fixture: a Nether owner with two
+        // owned cells and an End owner with one.
+        {
+            let mut owners = dim_fluid_owners().lock().unwrap_or_else(|e| e.into_inner());
+            owners.clear();
+            let mut nether = GeneratedFluidOwner::new_dim(DimId::Nether);
+            nether.next_order = 7;
+            nether.owned.insert((100, 40, 100));
+            nether.owned.insert((104, 40, 100));
+            let mut end = GeneratedFluidOwner::new_dim(DimId::End);
+            end.next_order = 3;
+            end.owned.insert((-50, 60, -50));
+            owners.insert(DimId::Nether, nether);
+            owners.insert(DimId::End, end);
+        }
+        let mut payload = b"base".to_vec();
+        append_dim_fluid_footer(&mut payload);
+        let read = read_dim_fluid_footer(&payload);
+        // Restore the original owners before asserting, so a failure leaves
+        // no residue for the next fixture.
+        {
+            let mut owners = dim_fluid_owners().lock().unwrap_or_else(|e| e.into_inner());
+            owners.clear();
+            for (dim, order, owned) in snapshot {
+                let mut owner = GeneratedFluidOwner::new_dim(dim);
+                owner.next_order = order;
+                owner.owned = owned;
+                owners.insert(dim, owner);
+            }
+        }
+        let (rest, entries) = read.expect("the footer must decode");
+        assert_eq!(rest, b"base");
+        assert_eq!(entries.len(), 2);
+        let nether = entries
+            .iter()
+            .find(|(dim, _, _, _)| *dim == DimId::Nether)
+            .expect("the Nether owner round-trips");
+        assert_eq!(nether.1, 7);
+        assert!(nether.3.contains(&(100, 40, 100)));
+        assert!(nether.3.contains(&(104, 40, 100)));
+        let end = entries
+            .iter()
+            .find(|(dim, _, _, _)| *dim == DimId::End)
+            .expect("the End owner round-trips");
+        assert_eq!(end.1, 3);
+        assert!(end.3.contains(&(-50, 60, -50)));
+    }
+
+    #[test]
+    fn legacy_save_without_dim_fluid_footer_reads_empty() {
+        let legacy = b"legacy payload";
+        let (rest, entries) =
+            read_dim_fluid_footer(legacy).expect("a legacy payload is not an error");
+        assert_eq!(rest, legacy);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn overworld_only_owner_set_writes_no_footer() {
+        let _guard = crate::test_support::global_world_test_guard();
+        {
+            dim_fluid_owners()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+        let base = b"base".to_vec();
+        let mut payload = base.clone();
+        append_dim_fluid_footer(&mut payload);
+        assert_eq!(
+            payload, base,
+            "an Overworld-only save emits no FLD2 bytes, preserving legacy layout"
+        );
+    }
+}
+

@@ -1217,8 +1217,6 @@ impl Template {
             name,
             "minecraft:jigsaw"
                 | "minecraft:structure_block"
-                | "minecraft:trial_spawner"
-                | "minecraft:vault"
                 | "minecraft:suspicious_sand"
                 | "minecraft:suspicious_gravel"
                 | "minecraft:brewing_stand"
@@ -1271,6 +1269,9 @@ impl Template {
         }
         if reg.name_of(state) == "minecraft:spawner" {
             return Self::spawner_payload(tag);
+        }
+        if matches!(reg.name_of(state), "minecraft:trial_spawner" | "minecraft:vault") {
+            return Self::verbatim_block_entity_payload(tag);
         }
         if matches!(reg.name_of(state), "minecraft:suspicious_sand" | "minecraft:suspicious_gravel")
             && tag.get("LootTable").is_some()
@@ -1422,6 +1423,28 @@ impl Template {
             .to_utf8()
             .map_err(|_| "spawner entity id is not UTF-8")?;
         Ok(crate::generation_payload::GenerationPayload::SpawnerEntity(id))
+    }
+
+    /// A trial spawner's or vault's block-entity NBT, carried verbatim. These
+    /// block entities are configured by open-ended, data-driven compounds —
+    /// the trial spawner's `normal_config`/`ominous_config`/`spawn_potentials`
+    /// (which name the breeze/zombie/bogged a trial chamber spawns) and the
+    /// vault's `config`/`shared_data` — so flattening them into payload fields
+    /// would drop exactly the content the template ships. The tag is validated
+    /// as a string-keyed compound and serialized once; the runtime handoff
+    /// re-parses the bytes into the live block-entity store.
+    fn verbatim_block_entity_payload(
+        tag: &Tag,
+    ) -> Result<crate::generation_payload::GenerationPayload, &'static str> {
+        let Tag::Compound(values) = tag else {
+            return Err("template block NBT must be a compound");
+        };
+        for key in values.keys() {
+            key.to_utf8().map_err(|_| "template NBT key is not UTF-8")?;
+        }
+        let bytes = crate::nbt::write_named(&NbtString::text(""), tag)
+            .map_err(|_| "template block entity NBT must encode")?;
+        Ok(crate::generation_payload::GenerationPayload::BlockEntityNbt(bytes))
     }
 
     /// The general template contract: no template entities yet, and NBT limited to
@@ -4185,6 +4208,104 @@ mod tests {
                     loot_seed: Some(91),
                 })
             );
+        }
+    }
+
+    /// A trial spawner's `normal_config`/`ominous_config`/`spawn_potentials` and
+    /// a vault's `config`/`shared_data` are data-driven configuration the payload
+    /// seam must carry verbatim: dropping them is what made generated trial
+    /// chambers inert. Neither block may pass through, and the staged payload
+    /// round-trips every byte of the template NBT.
+    #[test]
+    fn trial_spawner_and_vault_nbt_stage_verbatim() {
+        use crate::generation_payload::GenerationPayload;
+        let reg = crate::block_registry::breg().unwrap();
+        let tag = |entries: Vec<(&str, Tag)>| {
+            Tag::Compound(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (NbtString::text(k), v))
+                    .collect(),
+            )
+        };
+        let trial = reg.state_of("minecraft:trial_spawner", None);
+        let trial_tag = tag(vec![
+            ("id", Tag::String(NbtString::text("minecraft:trial_spawner"))),
+            ("normal_config", tag(vec![
+                ("spawn_range", Tag::Int(4)),
+                ("total_mobs", Tag::Int(6)),
+                ("simultaneous_mobs", Tag::Int(2)),
+                ("spawn_potentials", Tag::List(10, vec![tag(vec![
+                    ("weight", Tag::Int(1)),
+                    ("data", tag(vec![(
+                        "entity",
+                        tag(vec![("id", Tag::String(NbtString::text("minecraft:breeze")))]),
+                    )])),
+                ])])),
+            ])),
+            ("ominous_config", tag(vec![
+                ("total_mobs", Tag::Int(8)),
+                ("spawn_potentials", Tag::List(10, vec![tag(vec![
+                    ("weight", Tag::Int(1)),
+                    ("data", tag(vec![(
+                        "entity",
+                        tag(vec![("id", Tag::String(NbtString::text("minecraft:bogged")))]),
+                    )])),
+                ])])),
+            ])),
+            ("spawn_potentials", Tag::List(10, vec![tag(vec![
+                ("weight", Tag::Int(1)),
+                ("data", tag(vec![(
+                    "entity",
+                    tag(vec![("id", Tag::String(NbtString::text("minecraft:zombie")))]),
+                )])),
+            ])])),
+        ]);
+        assert!(
+            !Template::is_passthrough_block_entity(trial, &trial_tag, reg),
+            "a configured trial spawner must not pass through"
+        );
+        let vault = reg.state_of("minecraft:vault", None);
+        let vault_tag = tag(vec![
+            ("id", Tag::String(NbtString::text("minecraft:vault"))),
+            ("config", tag(vec![
+                ("loot_table", Tag::String(NbtString::text(
+                    "minecraft:chests/trial_chambers/reward",
+                ))),
+                ("activation_range", Tag::Int(4)),
+            ])),
+            ("shared_data", tag(vec![
+                ("connected_players", Tag::List(11, vec![])),
+                ("honor_roll", Tag::List(11, vec![])),
+            ])),
+        ]);
+        assert!(
+            !Template::is_passthrough_block_entity(vault, &vault_tag, reg),
+            "a configured vault must not pass through"
+        );
+        for (state, block_tag, needle) in [
+            (trial, &trial_tag, "minecraft:breeze"),
+            (vault, &vault_tag, "minecraft:chests/trial_chambers/reward"),
+        ] {
+            let payload = Template::staged_payload(block_tag, state, reg)
+                .expect("trial spawner/vault NBT stages");
+            let GenerationPayload::BlockEntityNbt(bytes) = payload else {
+                panic!("trial spawner/vault stage a verbatim NBT payload");
+            };
+            let (name, restored) =
+                crate::nbt::read_named(&bytes).expect("staged NBT parses back");
+            assert!(name.0.is_empty());
+            // The codec is canonical: an empty list's declared element type
+            // normalizes away, so byte-verbatim means "everything the canonical
+            // codec preserves" — the round-trip of the fixture itself.
+            let encoded = crate::nbt::write_named(&NbtString::text(""), block_tag).unwrap();
+            let (_, canonical) = crate::nbt::read_named(&encoded).unwrap();
+            assert_eq!(
+                &restored, &canonical,
+                "the payload carries everything the canonical codec preserves"
+            );
+            let haystack = String::from_utf8_lossy(&encoded);
+            assert!(haystack.contains(needle), "the configured content survives");
         }
     }
 

@@ -2869,7 +2869,23 @@ fn place_single_or_legacy<D: JigsawData>(
                     bname,
                     "minecraft:suspicious_sand" | "minecraft:suspicious_gravel"
                 ) && loot_table.is_some();
-                if brushable_loot {
+                if matches!(bname, "minecraft:trial_spawner" | "minecraft:vault") {
+                    // Trial spawner / vault NBT is data-driven configuration
+                    // (`normal_config`/`ominous_config`/`spawn_potentials`,
+                    // `config`/`shared_data`): carry it verbatim so a generated
+                    // trial chamber spawns its configured mobs instead of an
+                    // inert default block entity.
+                    match Template::staged_payload(nbt, placed, reg) {
+                        Ok(payload) => {
+                            ctx.payloads.push((p, payload));
+                        }
+                        Err(reason) => {
+                            if crate::trace_env::env_flag!("SPIPE_PAYLOAD") {
+                                eprintln!("SPIPE_PAYLOAD jigsaw {bname} @ {p:?} refused: {reason}");
+                            }
+                        }
+                    }
+                } else if brushable_loot {
                     match Template::staged_payload(nbt, placed, reg) {
                         Ok(payload) => {
                             ctx.payloads.push((p, payload));

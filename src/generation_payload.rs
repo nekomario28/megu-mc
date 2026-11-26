@@ -111,4 +111,12 @@ pub(crate) enum GenerationPayload {
         loot_table: String,
         loot_seed: Option<i64>,
     },
+    /// A trial spawner's or vault's full block-entity NBT, carried verbatim as
+    /// the serialized unnamed root compound (`nbt::write_named` bytes). These
+    /// block entities are configured almost entirely by data-driven fields
+    /// (`normal_config`/`ominous_config`/`spawn_potentials`, `config`/
+    /// `shared_data`) that no flat payload field can enumerate, so the runtime
+    /// handoff re-parses the bytes into the live block-entity store instead of
+    /// dropping the configuration on the floor.
+    BlockEntityNbt(Vec<u8>),
 }

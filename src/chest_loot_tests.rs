@@ -80,6 +80,7 @@ fn item(name: &str, count: i32) -> LootItem {
         enchantment: None,
         damage: 0,
         potion: None,
+        exploration_map: None,
     }
 }
 
