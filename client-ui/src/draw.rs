@@ -361,6 +361,18 @@ impl UiDrawList {
         self.push(UiCommand::Sprite { rect, sprite });
     }
 
+    /// Queue a quad using the supplied normalized GUI-atlas UV rectangle.
+    pub fn texture_uv(&mut self, rect: UiRect, uv: GuiSpriteUv) {
+        let encoded = format!(
+            "@gui_uv:{:08x}:{:08x}:{:08x}:{:08x}",
+            uv.uv_min[0].to_bits(),
+            uv.uv_min[1].to_bits(),
+            uv.uv_max[0].to_bits(),
+            uv.uv_max[1].to_bits(),
+        );
+        self.push(UiCommand::ItemIcon { rect, item_id: encoded });
+    }
+
     /// Item icon slot (see [`UiCommand::ItemIcon`]). `id` is the
     /// namespaced item id (`"minecraft:iron_ingot"`).
     pub fn item_icon(&mut self, rect: UiRect, id: &str) {
@@ -1873,7 +1885,9 @@ pub fn tessellate_draw_list_full_into(
                 }
             }
             UiCommand::ItemIcon { rect, item_id } => {
-                if let Some(uv) = icons.uv(item_id) {
+                if let Some(uv) = decode_gui_uv(item_id) {
+                    push_sprite_quad(vertices, indices, *rect, uv);
+                } else if let Some(uv) = icons.uv(item_id) {
                     push_icon_quad(vertices, indices, *rect, uv);
                 } else {
                     icon_fallback_quads(vertices, indices, *rect, item_id);
@@ -1886,6 +1900,21 @@ pub fn tessellate_draw_list_full_into(
             }
         }
     }
+}
+
+fn decode_gui_uv(item_id: &str) -> Option<[f32; 4]> {
+    let mut parts = item_id.strip_prefix("@gui_uv:")?.split(':');
+    let mut values = [0.0; 4];
+    for value in &mut values {
+        *value = f32::from_bits(u32::from_str_radix(parts.next()?, 16).ok()?);
+        if !value.is_finite() || !(0.0..=1.0).contains(value) {
+            return None;
+        }
+    }
+    if parts.next().is_some() || values[0] >= values[2] || values[1] >= values[3] {
+        return None;
+    }
+    Some(values)
 }
 
 /// Swatch + monogram fallback quads for an unmapped `ItemIcon` — the

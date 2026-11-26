@@ -7129,6 +7129,73 @@ pub struct ComposedFrame<'a> {
 }
 
 impl GpuRenderer {
+    /// Read an RGBA8 render target into tightly packed CPU pixels. Used by
+    /// the F2 screenshot path after the current frame has been rendered.
+    pub fn read_texture_rgba(
+        &self,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        if width == 0 || height == 0 {
+            return Err("screenshot dimensions must be nonzero".into());
+        }
+        let row = width.checked_mul(4).ok_or("screenshot row overflow")?;
+        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let size = u64::from(padded)
+            .checked_mul(u64::from(height))
+            .ok_or("screenshot buffer overflow")?;
+        let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("f2-screenshot-readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("f2-screenshot-readback"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.ctx.queue.submit([encoder.finish()]);
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
+        self.ctx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(10)),
+        }).map_err(|error| error.to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let data = slice
+            .get_mapped_range()
+            .map_err(|error| error.to_string())?;
+        let mut rgba = Vec::with_capacity(row as usize * height as usize);
+        for y in 0..height as usize {
+            let start = y * padded as usize;
+            rgba.extend_from_slice(&data[start..start + row as usize]);
+        }
+        drop(data);
+        buffer.unmap();
+        Ok(rgba)
+    }
+
     /// Device accessor for embedders.
     pub fn gpu(&self) -> &GpuDevice {
         &self.ctx
