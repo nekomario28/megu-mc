@@ -88,6 +88,7 @@ pub mod frl_e2ee;
 pub mod resolver;
 pub mod router;
 pub mod seamless_portal;
+pub mod subworld_wire;
 pub mod session;
 pub mod table;
 pub mod version;

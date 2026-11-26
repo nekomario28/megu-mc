@@ -1,27 +1,33 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Create Aeronautics sub-world synchronization payloads.
 //!
-//! SW6D v1 uses canonical big-endian fields in this order:
-//! `SW6D | u8 version | u16 count | records`, where each record is
-//! `u64 id | 3*f64 position | 4*f32 quaternion (x,y,z,w) | 3*f32 velocity |
-//! 3*f32 angular velocity | u8 flags`. A frame is a complete snapshot; ids
-//! absent from it are removed. SHLM v1 is `SHLM | u8 version | u64 id |
-//! 4*f32 controls | u8 flags`.
+//! The wire codec is the canonical implementation in
+//! `megu_proto::subworld_wire`: `SW6D` v2 carries counted baselines and
+//! single-record spawn/pose/despawn deltas with dimension, revision, pivot
+//! and voxel-hull metadata, while `SHLM` v2 carries the versioned helm
+//! command. This module keeps the GPU client's small public compatibility
+//! surface and converts canonical records into render-ready poses.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use megu_proto::subworld_wire::{
+    decode_shlm_command, decode_sw6d_frame, encode_shlm_command, pivot_adjusted_position,
+    sanitize_shlm_command, SubworldFrameMode, SubworldHelmCommand,
+    SHLM_MAGIC as CANONICAL_SHLM_MAGIC, SW6D_MAGIC as CANONICAL_SW6D_MAGIC,
+};
 
 pub const SUBWORLD_SYNC_CHANNEL: &str = "megu:subworld_sync_v1";
 pub const SUBWORLD_HELM_CHANNEL: &str = "megu:subworld_helm_v1";
-pub const SUBWORLD_SYNC_MAGIC: [u8; 4] = *b"SW6D";
-pub const SUBWORLD_HELM_MAGIC: [u8; 4] = *b"SHLM";
-const VERSION: u8 = 1;
-const HEADER_LEN: usize = 7;
-const RECORD_LEN: usize = 73;
-const MAX_RECORDS: usize = 4096;
+pub const SUBWORLD_SYNC_MAGIC: [u8; 4] = CANONICAL_SW6D_MAGIC;
+pub const SUBWORLD_HELM_MAGIC: [u8; 4] = CANONICAL_SHLM_MAGIC;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SubWorldPose {
     pub subworld_id: u64,
+    /// Render-origin position (`center of mass - rotated pivot`). This is the
+    /// translation the voxel-grid model matrix needs; the center-of-mass
+    /// position itself remains available through [`decode_sync_frame_detailed`].
     pub pos: [f64; 3],
     pub quat: [f32; 4],
     pub vel: [f32; 3],
@@ -44,129 +50,73 @@ pub struct SubWorldHelmCmd {
     pub flags: u8,
 }
 
-fn read<const N: usize>(bytes: &[u8], offset: &mut usize) -> Result<[u8; N], String> {
-    let end = offset.checked_add(N).ok_or("SW6D offset overflow")?;
-    let slice = bytes
-        .get(*offset..end)
-        .ok_or("truncated sub-world payload")?;
-    *offset = end;
-    Ok(slice.try_into().expect("slice length checked"))
+static HELM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Decode the canonical wire frame without discarding its mode, dimension,
+/// revision, pivot or voxel-hull payload.
+pub fn decode_sync_frame_detailed(
+    bytes: &[u8],
+) -> Result<megu_proto::subworld_wire::SubworldSyncFrame, String> {
+    decode_sw6d_frame(bytes)
 }
 
-fn finite_unit_quaternion(q: [f32; 4]) -> bool {
-    if !q.iter().all(|v| v.is_finite()) {
-        return false;
+fn render_pose(record: &megu_proto::subworld_wire::SubworldPoseRecord) -> SubWorldPose {
+    SubWorldPose {
+        subworld_id: record.subworld_id,
+        pos: pivot_adjusted_position(record.pos, record.quat, record.pivot),
+        quat: record.quat,
+        vel: record.vel,
+        ang_vel: record.ang_vel,
+        flags: record.flags,
     }
-    let norm2: f32 = q.iter().map(|v| v * v).sum();
-    norm2.is_finite() && (norm2.sqrt() - 1.0).abs() <= 1.0e-3
 }
 
-/// Decode a complete, strictly bounded SW6D v1 snapshot.
+/// Decode one `SW6D` frame into render-ready poses. Complete baselines,
+/// spawns and pose deltas decode through the same canonical wire contract;
+/// despawn deltas intentionally produce no live pose. Legacy v1 counted
+/// snapshots remain accepted by the shared decoder.
 pub fn decode_sync_frame(bytes: &[u8]) -> Result<SubWorldSyncFrame, String> {
-    if bytes.len() < HEADER_LEN || bytes.get(..4) != Some(&SUBWORLD_SYNC_MAGIC) {
-        return Err("invalid SW6D header".into());
+    let frame = decode_sync_frame_detailed(bytes)?;
+    if frame.mode == SubworldFrameMode::Despawn {
+        return Ok(SubWorldSyncFrame { poses: Vec::new() });
     }
-    if bytes[4] != VERSION {
-        return Err(format!("unsupported SW6D version {}", bytes[4]));
-    }
-    let count = u16::from_be_bytes(bytes[5..7].try_into().expect("header length checked")) as usize;
-    if count > MAX_RECORDS {
-        return Err("SW6D record count exceeds limit".into());
-    }
-    let expected = HEADER_LEN
-        .checked_add(count.checked_mul(RECORD_LEN).ok_or("SW6D size overflow")?)
-        .ok_or("SW6D size overflow")?;
-    if bytes.len() != expected {
-        return Err("SW6D length does not match record count".into());
-    }
-    let mut offset = HEADER_LEN;
-    let mut poses = Vec::with_capacity(count);
-    let mut ids = std::collections::BTreeSet::new();
-    for _ in 0..count {
-        let subworld_id = u64::from_be_bytes(read(bytes, &mut offset)?);
-        if !ids.insert(subworld_id) {
-            return Err("duplicate SW6D subworld id".into());
-        }
-        let mut pos = [0.0; 3];
-        for value in &mut pos {
-            *value = f64::from_be_bytes(read(bytes, &mut offset)?);
-        }
-        let mut quat = [0.0; 4];
-        for value in &mut quat {
-            *value = f32::from_be_bytes(read(bytes, &mut offset)?);
-        }
-        let mut vel = [0.0; 3];
-        for value in &mut vel {
-            *value = f32::from_be_bytes(read(bytes, &mut offset)?);
-        }
-        let mut ang_vel = [0.0; 3];
-        for value in &mut ang_vel {
-            *value = f32::from_be_bytes(read(bytes, &mut offset)?);
-        }
-        let flags = read::<1>(bytes, &mut offset)?[0];
-        if !pos.iter().all(|v| v.is_finite() && (*v as f32).is_finite())
-            || !vel.iter().chain(ang_vel.iter()).all(|v| v.is_finite())
-            || !finite_unit_quaternion(quat)
-        {
-            return Err("SW6D contains non-finite or invalid pose values".into());
-        }
-        poses.push(SubWorldPose {
-            subworld_id,
-            pos,
-            quat,
-            vel,
-            ang_vel,
-            flags,
-        });
-    }
-    Ok(SubWorldSyncFrame { poses })
+    Ok(SubWorldSyncFrame {
+        poses: frame.records.iter().map(render_pose).collect(),
+    })
 }
 
-/// Encode a canonical big-endian SHLM v1 command. Control values are finite
-/// and clamped to `[-1, 1]`; non-finite values become zero.
+/// Encode a canonical big-endian `SHLM` v2 command. Control values are finite
+/// and clamped to `[-1, 1]`; non-finite values become zero. The compatibility
+/// struct predates explicit pitch/roll separation and sequence numbers, so
+/// roll is neutral and a process-local monotonically increasing sequence is
+/// stamped on every frame.
 pub fn encode_helm_cmd(cmd: &SubWorldHelmCmd) -> Vec<u8> {
-    let mut out = Vec::with_capacity(30);
-    out.extend_from_slice(&SUBWORLD_HELM_MAGIC);
-    out.push(VERSION);
-    out.extend_from_slice(&cmd.subworld_id.to_be_bytes());
-    for value in [
-        cmd.throttle,
-        cmd.yaw_rate,
-        cmd.pitch_rate,
-        cmd.altitude_delta,
-    ] {
-        let value = if value.is_finite() {
-            value.clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
-        out.extend_from_slice(&value.to_be_bytes());
-    }
-    out.push(cmd.flags);
-    out
+    let canonical = sanitize_shlm_command(SubworldHelmCommand {
+        subworld_id: cmd.subworld_id,
+        seq: HELM_SEQ.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+        throttle: cmd.throttle,
+        yaw: cmd.yaw_rate,
+        pitch: cmd.pitch_rate,
+        roll: 0.0,
+        vertical: cmd.altitude_delta,
+        flags: cmd.flags,
+    });
+    encode_shlm_command(&canonical).unwrap_or_default()
 }
 
-/// Decode a strictly-sized SHLM v1 command (useful for tests and adapters).
+/// Decode a canonical `SHLM` v2 command into the GPU client's compatibility
+/// control shape (useful for tests and adapters). The wire sequence number is
+/// validated as part of the frame but intentionally not exposed by this old
+/// struct.
 pub fn decode_helm_cmd(bytes: &[u8]) -> Result<SubWorldHelmCmd, String> {
-    if bytes.len() != 30 || bytes.get(..4) != Some(&SUBWORLD_HELM_MAGIC) || bytes[4] != VERSION {
-        return Err("invalid SHLM payload".into());
-    }
-    let subworld_id = u64::from_be_bytes(bytes[5..13].try_into().expect("length checked"));
-    let mut controls = [0.0; 4];
-    for (index, value) in controls.iter_mut().enumerate() {
-        let start = 13 + index * 4;
-        *value = f32::from_be_bytes(bytes[start..start + 4].try_into().expect("length checked"));
-        if !value.is_finite() || !(-1.0..=1.0).contains(value) {
-            return Err("SHLM control is not finite or clamped".into());
-        }
-    }
+    let cmd = decode_shlm_command(bytes)?;
     Ok(SubWorldHelmCmd {
-        subworld_id,
-        throttle: controls[0],
-        yaw_rate: controls[1],
-        pitch_rate: controls[2],
-        altitude_delta: controls[3],
-        flags: bytes[29],
+        subworld_id: cmd.subworld_id,
+        throttle: cmd.throttle,
+        yaw_rate: cmd.yaw,
+        pitch_rate: cmd.pitch,
+        altitude_delta: cmd.vertical,
+        flags: cmd.flags,
     })
 }
 
@@ -261,11 +211,37 @@ fn slerp(a: [f32; 4], mut b: [f32; 4], t: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use megu_proto::subworld_wire::{
+        encode_sw6d_frame, SubworldPoseRecord, SubworldSyncFrame as WireFrame,
+    };
 
-    fn frame_bytes(poses: &[SubWorldPose]) -> Vec<u8> {
+    fn wire_frame_bytes(poses: &[SubWorldPose]) -> Vec<u8> {
+        let records = poses
+            .iter()
+            .map(|pose| SubworldPoseRecord {
+                subworld_id: pose.subworld_id,
+                dimension_id: 0,
+                revision: 1,
+                pos: pose.pos,
+                quat: pose.quat,
+                vel: pose.vel,
+                ang_vel: pose.ang_vel,
+                pivot: [0.0; 3],
+                flags: pose.flags,
+                voxels: Vec::new(),
+            })
+            .collect();
+        encode_sw6d_frame(&WireFrame {
+            mode: SubworldFrameMode::Baseline,
+            records,
+        })
+        .expect("test frame encodes")
+    }
+
+    fn legacy_v1_frame_bytes(poses: &[SubWorldPose]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&SUBWORLD_SYNC_MAGIC);
-        out.push(VERSION);
+        out.push(1);
         out.extend_from_slice(&(poses.len() as u16).to_be_bytes());
         for pose in poses {
             out.extend_from_slice(&pose.subworld_id.to_be_bytes());
@@ -299,18 +275,27 @@ mod tests {
 
     #[test]
     fn sw6d_roundtrip_and_fail_closed_inputs() {
-        let source = frame_bytes(&[pose(7, 4.5, [0.0, 0.0, 0.0, 1.0])]);
+        let source = wire_frame_bytes(&[pose(7, 4.5, [0.0, 0.0, 0.0, 1.0])]);
         assert_eq!(decode_sync_frame(&source).unwrap().poses[0].subworld_id, 7);
         assert!(decode_sync_frame(&source[..source.len() - 1]).is_err());
         let mut corrupt = source.clone();
         corrupt[0] ^= 1;
         assert!(decode_sync_frame(&corrupt).is_err());
         let mut nan = source.clone();
-        nan[15..23].copy_from_slice(&f64::NAN.to_be_bytes());
+        // First f64 position component in the v2 record.
+        nan[28..36].copy_from_slice(&f64::NAN.to_be_bytes());
         assert!(decode_sync_frame(&nan).is_err());
         let mut non_unit = source;
-        non_unit[39..43].copy_from_slice(&2.0f32.to_be_bytes());
+        // First quaternion x component after id/dimension/revision/position.
+        non_unit[60..64].copy_from_slice(&2.0f32.to_be_bytes());
         assert!(decode_sync_frame(&non_unit).is_err());
+    }
+
+    #[test]
+    fn legacy_counted_sw6d_v1_snapshot_still_decodes() {
+        let source = legacy_v1_frame_bytes(&[pose(8, 6.5, [0.0, 0.0, 0.0, 1.0])]);
+        let decoded = decode_sync_frame(&source).expect("legacy v1 snapshot");
+        assert_eq!(decoded.poses[0].pos[0], 6.5);
     }
 
     #[test]

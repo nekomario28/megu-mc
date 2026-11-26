@@ -41,31 +41,29 @@ pub fn encode_kinetic_update_batch(tags: &[KineticUpdateTag]) -> Vec<u8> {
     out
 }
 
-/// Decode a batch written by [`encode_kinetic_update_batch`].
-pub fn decode_kinetic_update_batch(bytes: &[u8]) -> Option<Vec<KineticUpdateTag>> {
-    let mut cursor = 0usize;
-    let count = read_varint(bytes, &mut cursor)? as usize;
-    if count > 4096 {
-        return None;
-    }
+fn decode_kinetic_records(
+    bytes: &[u8],
+    cursor: &mut usize,
+    count: usize,
+) -> Option<Vec<KineticUpdateTag>> {
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        if cursor + 29 > bytes.len() {
+        if cursor.checked_add(29)? > bytes.len() {
             return None;
         }
-        let dim = i32::from_be_bytes(bytes[cursor..cursor + 4].try_into().ok()?);
-        let x = i32::from_be_bytes(bytes[cursor + 4..cursor + 8].try_into().ok()?);
-        let y = i32::from_be_bytes(bytes[cursor + 8..cursor + 12].try_into().ok()?);
-        let z = i32::from_be_bytes(bytes[cursor + 12..cursor + 16].try_into().ok()?);
-        let speed = f32::from_be_bytes(bytes[cursor + 16..cursor + 20].try_into().ok()?);
-        let cap = f32::from_be_bytes(bytes[cursor + 20..cursor + 24].try_into().ok()?);
-        let load = f32::from_be_bytes(bytes[cursor + 24..cursor + 28].try_into().ok()?);
-        let overstressed = match bytes[cursor + 28] {
+        let dim = i32::from_be_bytes(bytes[*cursor..*cursor + 4].try_into().ok()?);
+        let x = i32::from_be_bytes(bytes[*cursor + 4..*cursor + 8].try_into().ok()?);
+        let y = i32::from_be_bytes(bytes[*cursor + 8..*cursor + 12].try_into().ok()?);
+        let z = i32::from_be_bytes(bytes[*cursor + 12..*cursor + 16].try_into().ok()?);
+        let speed = f32::from_be_bytes(bytes[*cursor + 16..*cursor + 20].try_into().ok()?);
+        let cap = f32::from_be_bytes(bytes[*cursor + 20..*cursor + 24].try_into().ok()?);
+        let load = f32::from_be_bytes(bytes[*cursor + 24..*cursor + 28].try_into().ok()?);
+        let overstressed = match bytes[*cursor + 28] {
             0 => false,
             1 => true,
             _ => return None,
         };
-        cursor += 29;
+        *cursor += 29;
         out.push(KineticUpdateTag {
             pos: DimBlockPos::new(dim, x, y, z),
             speed_rpm: f64::from(speed),
@@ -74,7 +72,138 @@ pub fn decode_kinetic_update_batch(bytes: &[u8]) -> Option<Vec<KineticUpdateTag>
             overstressed,
         });
     }
+    Some(out)
+}
+
+/// Decode a batch written by [`encode_kinetic_update_batch`].
+pub fn decode_kinetic_update_batch(bytes: &[u8]) -> Option<Vec<KineticUpdateTag>> {
+    let mut cursor = 0usize;
+    let count = read_varint(bytes, &mut cursor)? as usize;
+    if count > MAX_KINETIC_BATCH_RECORDS {
+        return None;
+    }
+    let out = decode_kinetic_records(bytes, &mut cursor, count)?;
     (cursor == bytes.len()).then_some(out)
+}
+
+/// Maximum records in either the legacy single batch or one chunked frame.
+pub const MAX_KINETIC_BATCH_RECORDS: usize = 4096;
+/// Magic for the dimension-scoped chunked snapshot frame (`KNT1`).
+pub const KINETIC_BATCH_MAGIC: [u8; 4] = *b"KNT1";
+pub const KINETIC_BATCH_VERSION: u8 = 1;
+const KINETIC_BATCH_HEADER_LEN: usize = 4 + 1 + 4 + 8 + 4 + 4;
+
+/// Metadata carried by one chunked kinetic snapshot frame. `chunk_index` and
+/// `chunk_total` are scoped to `(snapshot_generation, dimension_id)`, so a
+/// client can reassemble every dimension independently.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KineticBatchChunk {
+    pub dimension_id: i32,
+    pub snapshot_generation: u64,
+    pub chunk_index: u32,
+    pub chunk_total: u32,
+    pub tags: Vec<KineticUpdateTag>,
+}
+
+fn encode_kinetic_chunk(
+    dimension_id: i32,
+    snapshot_generation: u64,
+    chunk_index: u32,
+    chunk_total: u32,
+    tags: &[KineticUpdateTag],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(KINETIC_BATCH_HEADER_LEN + 4 + tags.len() * 29);
+    out.extend_from_slice(&KINETIC_BATCH_MAGIC);
+    out.push(KINETIC_BATCH_VERSION);
+    out.extend_from_slice(&dimension_id.to_be_bytes());
+    out.extend_from_slice(&snapshot_generation.to_be_bytes());
+    out.extend_from_slice(&chunk_index.to_be_bytes());
+    out.extend_from_slice(&chunk_total.to_be_bytes());
+    write_varint(&mut out, tags.len() as u32);
+    for tag in tags {
+        out.extend_from_slice(&tag.pos.dim.to_be_bytes());
+        out.extend_from_slice(&tag.pos.x.to_be_bytes());
+        out.extend_from_slice(&tag.pos.y.to_be_bytes());
+        out.extend_from_slice(&tag.pos.z.to_be_bytes());
+        out.extend_from_slice(&(tag.speed_rpm as f32).to_be_bytes());
+        out.extend_from_slice(&(tag.stress_capacity as f32).to_be_bytes());
+        out.extend_from_slice(&(tag.stress_load as f32).to_be_bytes());
+        out.push(u8::from(tag.overstressed));
+    }
+    out
+}
+
+/// Encode one snapshot as dimension-scoped chunks of at most
+/// [`MAX_KINETIC_BATCH_RECORDS`] records. The legacy
+/// [`encode_kinetic_update_batch`] helper is unchanged for small in-flight
+/// delta users; this chunked form is what joining clients use when a large
+/// factory snapshot cannot fit in one 4,096-record frame.
+pub fn encode_kinetic_batches(tags: &[KineticUpdateTag], snapshot_generation: u64) -> Vec<Vec<u8>> {
+    let mut by_dimension: std::collections::BTreeMap<i32, Vec<KineticUpdateTag>> =
+        std::collections::BTreeMap::new();
+    for tag in tags {
+        by_dimension.entry(tag.pos.dim).or_default().push(*tag);
+    }
+    let mut out = Vec::new();
+    for (dimension_id, dimension_tags) in by_dimension {
+        let chunk_total = dimension_tags.len().div_ceil(MAX_KINETIC_BATCH_RECORDS) as u32;
+        for (chunk_index, chunk) in dimension_tags.chunks(MAX_KINETIC_BATCH_RECORDS).enumerate() {
+            out.push(encode_kinetic_chunk(
+                dimension_id,
+                snapshot_generation,
+                chunk_index as u32,
+                chunk_total,
+                chunk,
+            ));
+        }
+    }
+    out
+}
+
+fn be_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let value = u32::from_be_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+/// Decode one dimension-scoped chunked frame written by
+/// [`encode_kinetic_batches`], rejecting truncation, malformed record flags,
+/// inconsistent chunk indexes and trailing bytes.
+pub fn decode_kinetic_batch_chunk(bytes: &[u8]) -> Option<KineticBatchChunk> {
+    let mut cursor = 0usize;
+    if bytes.get(..4) != Some(&KINETIC_BATCH_MAGIC) {
+        return None;
+    }
+    cursor += 4;
+    if *bytes.get(cursor)? != KINETIC_BATCH_VERSION {
+        return None;
+    }
+    cursor += 1;
+    let dimension_id = i32::from_be_bytes(bytes.get(cursor..cursor + 4)?.try_into().ok()?);
+    cursor += 4;
+    let snapshot_generation = u64::from_be_bytes(bytes.get(cursor..cursor + 8)?.try_into().ok()?);
+    cursor += 8;
+    let chunk_index = be_u32(bytes, &mut cursor)?;
+    let chunk_total = be_u32(bytes, &mut cursor)?;
+    if chunk_total == 0 || chunk_index >= chunk_total || chunk_total > 4096 {
+        return None;
+    }
+    let count = read_varint(bytes, &mut cursor)? as usize;
+    if count > MAX_KINETIC_BATCH_RECORDS {
+        return None;
+    }
+    let tags = decode_kinetic_records(bytes, &mut cursor, count)?;
+    if cursor != bytes.len() || tags.iter().any(|tag| tag.pos.dim != dimension_id) {
+        return None;
+    }
+    Some(KineticBatchChunk {
+        dimension_id,
+        snapshot_generation,
+        chunk_index,
+        chunk_total,
+        tags,
+    })
 }
 
 #[cfg(test)]
@@ -124,6 +253,36 @@ mod tests {
         let encoded = encode_kinetic_update_batch(&tags);
         assert_eq!(decode_kinetic_update_batch(&encoded), Some(tags));
         assert!(decode_kinetic_update_batch(&encoded[..encoded.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn kinetic_batches_chunk_4096_records_per_dimension_and_round_trip() {
+        let tag = |dim, index| KineticUpdateTag {
+            pos: DimBlockPos::new(dim, index, 64, -7),
+            speed_rpm: 32.0,
+            stress_capacity: 512.0,
+            stress_load: 128.0,
+            overstressed: index % 2 == 0,
+        };
+        let mut tags: Vec<_> = (0..4097).map(|index| tag(0, index)).collect();
+        tags.extend([tag(3, 0), tag(3, 1)]);
+        let frames = encode_kinetic_batches(&tags, 77);
+        assert_eq!(frames.len(), 3);
+        let chunks: Vec<_> = frames
+            .iter()
+            .map(|frame| decode_kinetic_batch_chunk(frame).expect("valid chunk"))
+            .collect();
+        assert_eq!(chunks[0].dimension_id, 0);
+        assert_eq!(chunks[0].snapshot_generation, 77);
+        assert_eq!(chunks[0].chunk_total, 2);
+        assert_eq!(chunks[0].tags.len(), MAX_KINETIC_BATCH_RECORDS);
+        assert_eq!(chunks[1].chunk_index, 1);
+        assert_eq!(chunks[1].tags.len(), 1);
+        assert_eq!(chunks[2].dimension_id, 3);
+        assert_eq!(chunks[2].chunk_total, 1);
+        assert_eq!(chunks[2].tags.len(), 2);
+        let recovered: Vec<_> = chunks.into_iter().flat_map(|chunk| chunk.tags).collect();
+        assert_eq!(recovered, tags);
     }
 
     /// End-to-end multi-mod compatibility harness: 4-tier startup planning,

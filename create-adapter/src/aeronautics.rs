@@ -19,6 +19,14 @@ use crate::addon_profile::{CreateAddonProfile, PropulsionSpec};
 use crate::blockstates::CreateBlockRegistry;
 use crate::factory::{Axis, CreateFactory, DimBlockPos};
 
+// The canonical codec lives in `proto`, but this crate intentionally has no
+// proto dependency in the alpha5 lane ownership contract. Compiling the same
+// dependency-free source here keeps server and client byte-for-byte identical
+// without copying the implementation.
+#[allow(dead_code)]
+#[path = "../../proto/src/subworld_wire.rs"]
+mod subworld_wire;
+
 /// Deterministic binary snapshot magic (`"AERO"`).
 pub const AERO_MAGIC: [u8; 4] = *b"AERO";
 /// Snapshot format version.
@@ -53,8 +61,6 @@ pub const SUBWORLD_SYNC_CHANNEL: &str = "megu:subworld_sync_v1";
 pub const SUBWORLD_HELM_CHANNEL: &str = "megu:subworld_helm_v1";
 /// Maximum voxel records in one complete sub-world spawn frame.
 pub const MAX_SUBWORLD_VOXELS: usize = 65_536;
-const SUBWORLD_SYNC_MAGIC: [u8; 4] = *b"SW6D";
-const SUBWORLD_SYNC_VERSION: u8 = 1;
 
 /// Kind of update carried by [`SubWorldSyncFrame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,191 +84,146 @@ pub struct SubWorldSyncFrame {
     pub voxels: Vec<([i16; 3], u32)>,
 }
 
+fn subworld_pivot_cache() -> &'static std::sync::Mutex<BTreeMap<u64, [f32; 3]>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u64, [f32; 3]>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+fn subworld_dimension_cache() -> &'static std::sync::Mutex<BTreeMap<u32, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<BTreeMap<u32, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Compatibility pivot derivation for the legacy public frame shape, which
+/// predates the explicit pivot field. Uniform-mass hulls get their exact
+/// geometric COM; mixed-material hulls still use the canonical explicit pivot
+/// when produced through `proto::subworld_wire` directly. The spawn encoder
+/// caches this value by subworld id so the following pose deltas carry the
+/// same pivot even though their delta records contain no voxel list.
+fn legacy_uniform_pivot(voxels: &[([i16; 3], u32)]) -> [f32; 3] {
+    if voxels.is_empty() {
+        return [0.0; 3];
+    }
+    let mut sum = [0.0f64; 3];
+    for (offset, _) in voxels {
+        for axis in 0..3 {
+            sum[axis] += f64::from(offset[axis]) + 0.5;
+        }
+    }
+    sum.map(|v| (v / voxels.len() as f64) as f32)
+}
+
+fn cache_dimension_name(dim_numeric: u32, dim_id: &str) {
+    subworld_dimension_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(dim_numeric, dim_id.to_owned());
+}
+
+fn dimension_name(dim_numeric: u32) -> String {
+    match dim_numeric {
+        0 => return "minecraft:overworld".to_owned(),
+        1 => return "minecraft:the_nether".to_owned(),
+        2 => return "minecraft:the_end".to_owned(),
+        _ => {}
+    }
+    subworld_dimension_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&dim_numeric)
+        .cloned()
+        .unwrap_or_else(|| format!("unknown:dimension_{dim_numeric}"))
+}
+
 impl SubWorldSyncFrame {
-    /// Encode the bounded `SW6D` v1 frame, rejecting invalid poses and oversized data.
+    /// Encode this legacy single-record frame through the canonical `SW6D`
+    /// v2 delta codec shared with the GPU client. The public shape remains
+    /// source-compatible for the live server bridge; numeric dimension and
+    /// pivot metadata are derived through the compatibility cache described
+    /// on [`legacy_uniform_pivot`].
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         if self.dim_id.is_empty() || self.dim_id.len() > u16::MAX as usize {
             return Err("invalid subworld dimension id length".into());
         }
-        if self.pos.iter().any(|v| !v.is_finite())
-            || self.vel.iter().chain(&self.ang_vel).any(|v| !v.is_finite())
-        {
-            return Err("non-finite subworld pose".into());
+        let mode = match self.kind {
+            SubWorldSyncKind::FullSpawn => subworld_wire::SubworldFrameMode::Spawn,
+            SubWorldSyncKind::PoseDelta => subworld_wire::SubworldFrameMode::Pose,
+            SubWorldSyncKind::Despawn => subworld_wire::SubworldFrameMode::Despawn,
+        };
+        let dimension_id = subworld_wire::legacy_dimension_id(&self.dim_id);
+        cache_dimension_name(dimension_id, &self.dim_id);
+        let pivot = if self.kind == SubWorldSyncKind::FullSpawn {
+            let pivot = legacy_uniform_pivot(&self.voxels);
+            subworld_pivot_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(self.subworld_id, pivot);
+            pivot
+        } else {
+            subworld_pivot_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&self.subworld_id)
+                .copied()
+                .unwrap_or([0.0; 3])
+        };
+        let record = subworld_wire::SubworldPoseRecord {
+            subworld_id: self.subworld_id,
+            dimension_id,
+            revision: u64::from(self.revision),
+            pos: self.pos,
+            quat: self.quat,
+            vel: self.vel,
+            ang_vel: self.ang_vel,
+            pivot,
+            flags: 0,
+            voxels: self.voxels.clone(),
+        };
+        let frame = subworld_wire::SubworldSyncFrame {
+            mode,
+            records: vec![record],
+        };
+        let encoded = subworld_wire::encode_sw6d_frame(&frame)?;
+        if self.kind == SubWorldSyncKind::Despawn {
+            subworld_pivot_cache()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.subworld_id);
         }
-        let qnorm = self
-            .quat
-            .iter()
-            .map(|v| f64::from(*v) * f64::from(*v))
-            .sum::<f64>();
-        if self.quat.iter().any(|v| !v.is_finite()) || (qnorm - 1.0).abs() > 1.0e-3 {
-            return Err("subworld quaternion must be a normalized unit quaternion".into());
-        }
-        if (self.kind == SubWorldSyncKind::FullSpawn && self.voxels.len() > MAX_SUBWORLD_VOXELS)
-            || (self.kind != SubWorldSyncKind::FullSpawn && !self.voxels.is_empty())
-        {
-            return Err("invalid subworld voxel list".into());
-        }
-        let mut out = Vec::with_capacity(100 + self.dim_id.len() + self.voxels.len() * 10);
-        out.extend_from_slice(&SUBWORLD_SYNC_MAGIC);
-        out.push(SUBWORLD_SYNC_VERSION);
-        out.push(match self.kind {
-            SubWorldSyncKind::FullSpawn => 0,
-            SubWorldSyncKind::PoseDelta => 1,
-            SubWorldSyncKind::Despawn => 2,
-        });
-        out.extend_from_slice(&self.subworld_id.to_be_bytes());
-        out.extend_from_slice(&(self.dim_id.len() as u16).to_be_bytes());
-        out.extend_from_slice(self.dim_id.as_bytes());
-        for v in self.pos {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        for v in self.quat {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        for v in self.vel {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        for v in self.ang_vel {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        out.extend_from_slice(&self.revision.to_be_bytes());
-        if self.kind == SubWorldSyncKind::FullSpawn {
-            out.extend_from_slice(&(self.voxels.len() as u32).to_be_bytes());
-            for (offset, state) in &self.voxels {
-                for v in offset {
-                    out.extend_from_slice(&v.to_be_bytes());
-                }
-                out.extend_from_slice(&state.to_be_bytes());
-            }
-        }
-        Ok(out)
+        Ok(encoded)
     }
 
-    /// Decode one complete v1 frame. Trailing and truncated bytes are rejected.
+    /// Decode one canonical single-record `SW6D` v2 delta. Complete baselines
+    /// are client-side frames and are rejected here; trailing and truncated
+    /// bytes fail in the shared canonical decoder.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        const BASE_LEN: usize = 4 + 1 + 1 + 8 + 2 + 3 * 8 + 4 * 4 + 3 * 4 + 3 * 4 + 4;
-        if bytes.len() < BASE_LEN {
-            return Err("truncated subworld sync frame".into());
-        }
-        let mut c = 0usize;
-        let take = |c: &mut usize, n: usize| -> Result<&[u8], String> {
-            let end = c
-                .checked_add(n)
-                .ok_or_else(|| "subworld frame length overflow".to_string())?;
-            let value = bytes
-                .get(*c..end)
-                .ok_or_else(|| "truncated subworld sync frame".to_string())?;
-            *c = end;
-            Ok(value)
-        };
-        if take(&mut c, 4)? != SUBWORLD_SYNC_MAGIC {
-            return Err("bad subworld sync magic".into());
-        }
-        if take(&mut c, 1)?[0] != SUBWORLD_SYNC_VERSION {
-            return Err("unsupported subworld sync version".into());
-        }
-        let kind = match take(&mut c, 1)?[0] {
-            0 => SubWorldSyncKind::FullSpawn,
-            1 => SubWorldSyncKind::PoseDelta,
-            2 => SubWorldSyncKind::Despawn,
-            _ => return Err("unknown subworld sync kind".into()),
-        };
-        let subworld_id = u64::from_be_bytes(
-            take(&mut c, 8)?
-                .try_into()
-                .map_err(|_| "truncated subworld id")?,
-        );
-        let dim_len = usize::from(u16::from_be_bytes(
-            take(&mut c, 2)?
-                .try_into()
-                .map_err(|_| "truncated dimension length")?,
-        ));
-        if dim_len == 0 {
-            return Err("empty subworld dimension id".into());
-        }
-        let dim_id = std::str::from_utf8(take(&mut c, dim_len)?)
-            .map_err(|_| "invalid subworld dimension UTF-8")?
-            .to_owned();
-        let read_f64 = |c: &mut usize| -> Result<f64, String> {
-            Ok(f64::from_be_bytes(
-                take(c, 8)?.try_into().map_err(|_| "truncated f64")?,
-            ))
-        };
-        let read_f32 = |c: &mut usize| -> Result<f32, String> {
-            Ok(f32::from_be_bytes(
-                take(c, 4)?.try_into().map_err(|_| "truncated f32")?,
-            ))
-        };
-        let mut pos = [0.0; 3];
-        for v in &mut pos {
-            *v = read_f64(&mut c)?;
-        }
-        let mut quat = [0.0; 4];
-        for v in &mut quat {
-            *v = read_f32(&mut c)?;
-        }
-        let mut vel = [0.0; 3];
-        for v in &mut vel {
-            *v = read_f32(&mut c)?;
-        }
-        let mut ang_vel = [0.0; 3];
-        for v in &mut ang_vel {
-            *v = read_f32(&mut c)?;
-        }
-        let revision = u32::from_be_bytes(
-            take(&mut c, 4)?
-                .try_into()
-                .map_err(|_| "truncated revision")?,
-        );
-        let mut voxels = Vec::new();
-        if kind == SubWorldSyncKind::FullSpawn {
-            let count = u32::from_be_bytes(
-                take(&mut c, 4)?
-                    .try_into()
-                    .map_err(|_| "truncated voxel count")?,
-            ) as usize;
-            if count > MAX_SUBWORLD_VOXELS
-                || count
-                    .checked_mul(10)
-                    .is_none_or(|n| n > bytes.len().saturating_sub(c))
-            {
-                return Err("invalid or oversized subworld voxel count".into());
+        let decoded = subworld_wire::decode_sw6d_frame(bytes)?;
+        let kind = match decoded.mode {
+            subworld_wire::SubworldFrameMode::Spawn => SubWorldSyncKind::FullSpawn,
+            subworld_wire::SubworldFrameMode::Pose => SubWorldSyncKind::PoseDelta,
+            subworld_wire::SubworldFrameMode::Despawn => SubWorldSyncKind::Despawn,
+            subworld_wire::SubworldFrameMode::Baseline => {
+                return Err("baseline SW6D frame is not a single subworld delta".into())
             }
-            voxels.reserve(count);
-            for _ in 0..count {
-                let mut offset = [0i16; 3];
-                for v in &mut offset {
-                    *v = i16::from_be_bytes(
-                        take(&mut c, 2)?
-                            .try_into()
-                            .map_err(|_| "truncated voxel offset")?,
-                    );
-                }
-                let state = u32::from_be_bytes(
-                    take(&mut c, 4)?
-                        .try_into()
-                        .map_err(|_| "truncated voxel state")?,
-                );
-                voxels.push((offset, state));
-            }
+        };
+        if decoded.records.len() != 1 {
+            return Err("SW6D delta frame must carry one record".into());
         }
-        if c != bytes.len() {
-            return Err("trailing subworld sync bytes".into());
-        }
-        let frame = Self {
+        let record = decoded.records.into_iter().next().expect("length checked");
+        Ok(Self {
             kind,
-            subworld_id,
-            dim_id,
-            pos,
-            quat,
-            vel,
-            ang_vel,
-            revision,
-            voxels,
-        };
-        // Reuse the encoder's finite and quaternion validation.
-        frame.encode()?;
-        Ok(frame)
+            subworld_id: record.subworld_id,
+            dim_id: dimension_name(record.dimension_id),
+            pos: record.pos,
+            quat: record.quat,
+            vel: record.vel,
+            ang_vel: record.ang_vel,
+            revision: u32::try_from(record.revision)
+                .map_err(|_| "subworld revision exceeds legacy u32 API".to_string())?,
+            voxels: record.voxels,
+        })
     }
 }
 
@@ -280,57 +241,33 @@ pub struct SubWorldHelmInput {
 
 impl SubWorldHelmInput {
     pub fn encode(&self) -> Result<Vec<u8>, String> {
-        let values = [
-            self.throttle,
-            self.pitch,
-            self.yaw,
-            self.roll,
-            self.buoyancy_delta,
-        ];
-        if values
-            .iter()
-            .any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v))
-        {
-            return Err("helm controls must be finite and within -1..=1".into());
-        }
-        let mut out = Vec::with_capacity(29);
-        out.extend_from_slice(&self.subworld_id.to_be_bytes());
-        for v in values {
-            out.extend_from_slice(&v.to_be_bytes());
-        }
-        out.push(u8::from(self.disassemble));
-        Ok(out)
+        subworld_wire::encode_shlm_command(&subworld_wire::SubworldHelmCommand {
+            subworld_id: self.subworld_id,
+            seq: 0,
+            throttle: self.throttle,
+            yaw: self.yaw,
+            pitch: self.pitch,
+            roll: self.roll,
+            vertical: self.buoyancy_delta,
+            flags: if self.disassemble {
+                subworld_wire::SHLM_FLAG_DISASSEMBLE
+            } else {
+                0
+            },
+        })
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != 29 {
-            return Err("invalid helm frame length".into());
-        }
-        let subworld_id =
-            u64::from_be_bytes(bytes[..8].try_into().map_err(|_| "truncated helm id")?);
-        let mut values = [0.0f32; 5];
-        for (i, value) in values.iter_mut().enumerate() {
-            let start = 8 + i * 4;
-            *value = f32::from_be_bytes(
-                bytes[start..start + 4]
-                    .try_into()
-                    .map_err(|_| "truncated helm value")?,
-            );
-        }
-        if bytes[28] > 1 {
-            return Err("invalid helm disassemble flag".into());
-        }
-        let frame = Self {
-            subworld_id,
-            throttle: values[0],
-            pitch: values[1],
-            yaw: values[2],
-            roll: values[3],
-            buoyancy_delta: values[4],
-            disassemble: bytes[28] != 0,
-        };
-        frame.encode()?;
-        Ok(frame)
+        let cmd = subworld_wire::decode_shlm_command(bytes)?;
+        Ok(Self {
+            subworld_id: cmd.subworld_id,
+            throttle: cmd.throttle,
+            pitch: cmd.pitch,
+            yaw: cmd.yaw,
+            roll: cmd.roll,
+            buoyancy_delta: cmd.vertical,
+            disassemble: cmd.flags & subworld_wire::SHLM_FLAG_DISASSEMBLE != 0,
+        })
     }
 }
 
@@ -2505,7 +2442,7 @@ mod tests {
         assert_eq!(SubWorldSyncFrame::decode(&bytes).unwrap(), frame);
         assert!(SubWorldSyncFrame::decode(&bytes[..bytes.len() - 1]).is_err());
         let mut oversized = bytes.clone();
-        let count_at = 84 + frame.dim_id.len();
+        let count_at = 105;
         oversized[count_at..count_at + 4]
             .copy_from_slice(&((MAX_SUBWORLD_VOXELS as u32) + 1).to_be_bytes());
         assert!(SubWorldSyncFrame::decode(&oversized).is_err());
@@ -2536,7 +2473,7 @@ mod tests {
         assert_eq!(SubWorldHelmInput::decode(&bytes).unwrap(), input);
         assert!(SubWorldHelmInput::decode(&bytes[..28]).is_err());
         let mut nan = bytes;
-        nan[8..12].copy_from_slice(&f32::NAN.to_be_bytes());
+        nan[21..25].copy_from_slice(&f32::NAN.to_be_bytes());
         assert!(SubWorldHelmInput::decode(&nan).is_err());
         let invalid = SubWorldHelmInput {
             throttle: f32::INFINITY,
