@@ -11,6 +11,10 @@ const VILLAGER_RESTOCK_COOLDOWN: u64 = 2_000;
 #[cfg_attr(not(test), allow(dead_code))]
 const VILLAGER_GOSSIP_COOLDOWN: u64 = 1_200;
 
+fn villager_raid_vanilla_name(name: &str) -> &str {
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum VillagerProfession {
@@ -35,7 +39,7 @@ enum VillagerProfession {
 impl VillagerProfession {
     #[cfg_attr(not(test), allow(dead_code))]
     fn from_job_site(block_name: &str) -> Option<Self> {
-        let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
+        let name = villager_raid_vanilla_name(block_name);
         Some(match name {
             "blast_furnace" => Self::Armorer,
             "smoker" => Self::Butcher,
@@ -67,34 +71,12 @@ enum PoiKind {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn poi_kind_from_block_name(block_name: &str) -> Option<PoiKind> {
-    let name = block_name.strip_prefix("minecraft:").unwrap_or(block_name);
-    if matches!(name, "bell") {
-        return Some(PoiKind::Bell);
+    let name = villager_raid_vanilla_name(block_name);
+    match name {
+        "bell" => Some(PoiKind::Bell),
+        name if name.ends_with("_bed") && BED_COLORS.contains(&name) => Some(PoiKind::Bed),
+        _ => VillagerProfession::from_job_site(block_name).map(PoiKind::JobSite),
     }
-    if name.strip_suffix("_bed").is_some_and(|color| {
-        matches!(
-            color,
-            "white"
-                | "orange"
-                | "magenta"
-                | "light_blue"
-                | "yellow"
-                | "lime"
-                | "pink"
-                | "gray"
-                | "light_gray"
-                | "cyan"
-                | "purple"
-                | "blue"
-                | "brown"
-                | "green"
-                | "red"
-                | "black"
-        )
-    }) {
-        return Some(PoiKind::Bed);
-    }
-    VillagerProfession::from_job_site(block_name).map(PoiKind::JobSite)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -931,6 +913,9 @@ impl VillagerGossip {
 
     #[cfg_attr(not(test), allow(dead_code))]
     fn decay(&mut self, days: u64) {
+        if self.by_player.is_empty() {
+            return;
+        }
         // Even the largest entry expires within 25 days if it decays at all.
         let days = days.min(25) as i32;
         self.by_player.retain(|_, values| {
@@ -1900,23 +1885,20 @@ struct WitherPatternMatch {
     up: [i32; 3],
 }
 
-fn wither_pattern_name(name: &str) -> &str {
-    name.strip_prefix("minecraft:").unwrap_or(name)
-}
 
 fn wither_pattern_soul_base(name: &str) -> bool {
-    matches!(wither_pattern_name(name), "soul_sand" | "soul_soil")
+    matches!(villager_raid_vanilla_name(name), "soul_sand" | "soul_soil")
 }
 
 fn wither_pattern_skull(name: &str) -> bool {
     matches!(
-        wither_pattern_name(name),
+        villager_raid_vanilla_name(name),
         "wither_skeleton_skull" | "wither_skeleton_wall_skull"
     )
 }
 
 fn wither_pattern_air(name: &str) -> bool {
-    matches!(wither_pattern_name(name), "air" | "cave_air" | "void_air")
+    matches!(villager_raid_vanilla_name(name), "air" | "cave_air" | "void_air")
 }
 
 fn wither_vec_mul(v: [i32; 3], n: i32) -> [i32; 3] {
@@ -2444,12 +2426,12 @@ pub(crate) fn villager_raid_interact_mob(
     held_item: &str,
     player_eid: i32,
 ) -> Option<MobInteractOutcome> {
-    let kind = mob_kind.strip_prefix("minecraft:").unwrap_or(mob_kind);
+    let kind = villager_raid_vanilla_name(mob_kind);
     let mob = live_native_mob(mob_eid, kind)?;
     if mob.dim != dim {
         return None;
     }
-    let item = held_item.strip_prefix("minecraft:").unwrap_or(held_item);
+    let item = villager_raid_vanilla_name(held_item);
     match kind {
         "iron_golem" if item == "iron_ingot" => {
             live_iron_golem_repair(mob_eid, true).then(|| MobInteractOutcome::IronGolemRepaired {
@@ -3288,13 +3270,13 @@ fn live_village_golem_tick(tick: u64) {
     if !tick.is_multiple_of(200) || GR_MOB_SPAWNING.load(Ordering::Relaxed) == 0 {
         return;
     }
+    if village_lock(live_villagers()).is_empty() {
+        return;
+    }
     let world_time = WORLD_TIME.load(Ordering::Relaxed);
     let snapshots: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner())
-        .iter().filter(|mob| *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
-        .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (mob.eid, mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32), mob.etype)
-        }).collect();
+        .iter().filter(|mob| village_mob_alive(mob))
+        .map(|mob| (mob.eid, mob.dim, village_mob_block_pos(mob), mob.etype)).collect();
     let villager_type = name_to_etype("villager");
     let golem_type = name_to_etype("iron_golem");
     let positions: HashMap<i32, (DimId, BlockPos)> = snapshots.iter()
@@ -3337,6 +3319,9 @@ fn live_village_golem_tick(tick: u64) {
         (recent.len() >= 3).then_some((dim, recent))
     }).collect();
     drop(villagers);
+    if eligible.is_empty() {
+        return;
+    }
 
     let Some(reg) = crate::block_registry::breg() else { return };
     let Some(spec) = entity_spec_by_name("iron_golem") else { return };
@@ -3548,7 +3533,7 @@ fn live_utility_mob_tick(tick: u64) {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_pois() -> &'static LockedMap<DimId, PoiRegistry> {
     static POIS: Registry<DimId, PoiRegistry> = OnceLock::new();
-    POIS.get_or_init(|| Mutex::new(HashMap::new()))
+    POIS.get_or_init(Mutex::default)
 }
 
 /// Horizontal POI discovery range around a villager. Vanilla villagers notice
@@ -3566,7 +3551,7 @@ const LIVE_POI_RESCAN_GT: u64 = 400;
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_omens() -> &'static LockedMap<VillageUuid, RaidOmen> {
     static OMENS: Registry<VillageUuid, RaidOmen> = OnceLock::new();
-    OMENS.get_or_init(|| Mutex::new(HashMap::new()))
+    OMENS.get_or_init(Mutex::default)
 }
 
 /// The village position where each active Raid Omen countdown was triggered.
@@ -3578,7 +3563,7 @@ const MAX_RAID_OMEN_ORIGINS: usize = 4096;
 
 fn live_raid_omen_origins() -> &'static LockedMap<VillageUuid, (DimId, BlockPos)> {
     static ORIGINS: Registry<VillageUuid, (DimId, BlockPos)> = OnceLock::new();
-    ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+    ORIGINS.get_or_init(Mutex::default)
 }
 
 /// Live raider entity id -> (dimension, raid center, wave slot). A raider
@@ -3586,7 +3571,7 @@ fn live_raid_omen_origins() -> &'static LockedMap<VillageUuid, (DimId, BlockPos)
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_mobs() -> &'static LockedMap<i32, (DimId, BlockPos, RaidRaiderId)> {
     static RAIDERS: Registry<i32, (DimId, BlockPos, RaidRaiderId)> = OnceLock::new();
-    RAIDERS.get_or_init(|| Mutex::new(HashMap::new()))
+    RAIDERS.get_or_init(Mutex::default)
 }
 
 /// Raider count of the wave currently in flight per (dimension, raid center),
@@ -3594,7 +3579,7 @@ fn live_raid_mobs() -> &'static LockedMap<i32, (DimId, BlockPos, RaidRaiderId)> 
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_wave_totals() -> &'static LockedMap<(DimId, BlockPos), i32> {
     static TOTALS: Registry<(DimId, BlockPos), i32> = OnceLock::new();
-    TOTALS.get_or_init(|| Mutex::new(HashMap::new()))
+    TOTALS.get_or_init(Mutex::default)
 }
 
 /// Reconcile one dimension's POI registry against the loaded box around
@@ -3606,7 +3591,7 @@ fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
     };
     let min_y = (center.1 - LIVE_POI_SCAN_RADIUS).max(dim.min_y());
     let max_y = (center.1 + LIVE_POI_SCAN_RADIUS).min(dim.min_y() + dim.height() - 1);
-    let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+    let mut registries = village_lock(live_pois());
     scan_poi_box(
         registries.entry(dim).or_default(),
         reg,
@@ -3628,9 +3613,7 @@ fn live_poi_scan(dim: DimId, center: BlockPos) -> usize {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TradeBlueprintKind {
-    Buy,
-    Sell,
-    Process,
+    Plain,
     EnchantedTool,
     EnchantedBook,
     Map,
@@ -3642,42 +3625,43 @@ enum TradeBlueprintKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TradeBlueprint {
     kind: TradeBlueprintKind,
-    item: &'static str,
-    count: i32,
-    price: i32,
-    result: &'static str,
-    result_count: i32,
+    cost_a: (&'static str, i32),
+    cost_b: Option<(&'static str, i32)>,
+    result: (&'static str, i32),
     max_uses: i32,
     xp: i32,
     multiplier: f32,
 }
 
-fn tb_buy(item: &'static str, count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::Buy, item, count, price: 1, result: "emerald", result_count: 1, max_uses, xp, multiplier: 0.05 }
+const fn tb_buy(item: &'static str, count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { cost_a: (item, count), ..tb_sell("emerald", 1, 1, max_uses, xp, 0.05) }
 }
-fn tb_sell(item: &'static str, price: i32, count: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::Sell, item: "emerald", count: price, price, result: item, result_count: count, max_uses, xp, multiplier }
+const fn tb_sell(item: &'static str, price: i32, count: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
+    TradeBlueprint {
+        kind: TradeBlueprintKind::Plain, cost_a: ("emerald", price), cost_b: None,
+        result: (item, count), max_uses, xp, multiplier,
+    }
 }
-fn tb_process(input: &'static str, count: i32, price: i32, output: &'static str, out_count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::Process, item: input, count, price, result: output, result_count: out_count, max_uses, xp, multiplier: 0.05 }
+const fn tb_process(input: &'static str, count: i32, price: i32, output: &'static str, out_count: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { cost_b: Some((input, count)), ..tb_sell(output, price, out_count, max_uses, xp, 0.05) }
 }
-fn tb_enchanted(item: &'static str, base_price: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::EnchantedTool, item: "emerald", count: base_price, price: base_price, result: item, result_count: 1, max_uses, xp, multiplier }
+const fn tb_enchanted(item: &'static str, price: i32, max_uses: i32, xp: i32, multiplier: f32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::EnchantedTool, ..tb_sell(item, price, 1, max_uses, xp, multiplier) }
 }
-fn tb_book(xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::EnchantedBook, item: "emerald", count: 1, price: 1, result: "enchanted_book", result_count: 1, max_uses: 12, xp, multiplier: 0.2 }
+const fn tb_book(xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::EnchantedBook, cost_b: Some(("book", 1)), ..tb_sell("enchanted_book", 1, 1, 12, xp, 0.2) }
 }
-fn tb_map(price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::Map, item: "emerald", count: price, price, result: "filled_map", result_count: 1, max_uses, xp, multiplier: 0.2 }
+const fn tb_map(price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::Map, cost_b: Some(("compass", 1)), ..tb_sell("filled_map", price, 1, max_uses, xp, 0.2) }
 }
-fn tb_stew(xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::SuspiciousStew, item: "emerald", count: 1, price: 1, result: "suspicious_stew", result_count: 1, max_uses: 12, xp, multiplier: 0.05 }
+const fn tb_stew(xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::SuspiciousStew, ..tb_sell("suspicious_stew", 1, 1, 12, xp, 0.05) }
 }
-fn tb_dyed(item: &'static str, price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::DyedArmor, item: "emerald", count: price, price, result: item, result_count: 1, max_uses, xp, multiplier: 0.2 }
+const fn tb_dyed(item: &'static str, price: i32, max_uses: i32, xp: i32) -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::DyedArmor, ..tb_sell(item, price, 1, max_uses, xp, 0.2) }
 }
-fn tb_tipped_arrow() -> TradeBlueprint {
-    TradeBlueprint { kind: TradeBlueprintKind::TippedArrow, item: "arrow", count: 5, price: 2, result: "tipped_arrow", result_count: 5, max_uses: 12, xp: 30, multiplier: 0.05 }
+const fn tb_tipped_arrow() -> TradeBlueprint {
+    TradeBlueprint { kind: TradeBlueprintKind::TippedArrow, ..tb_process("arrow", 5, 2, "tipped_arrow", 5, 12, 30) }
 }
 
 fn trade_cost(item_name: &str, count: i32) -> Option<ItemCost> {
@@ -3832,44 +3816,28 @@ fn trade_map_components(price: i32) -> Comps {
 /// owned by the item/component system; this preserves the exact item skeleton,
 /// stock, XP, multiplier, second cost, and Java price roll.
 fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<MerchantOffer> {
-    let emerald = name_to_item("emerald")?;
-    let (cost_a_item, mut cost_a_count, second, result_name, result_count) = match bp.kind {
-        TradeBlueprintKind::Buy => (bp.item, bp.count, None, "emerald", bp.price),
-        TradeBlueprintKind::Sell | TradeBlueprintKind::DyedArmor | TradeBlueprintKind::SuspiciousStew => {
-            ("emerald", bp.price, None, bp.result, bp.result_count)
-        }
-        TradeBlueprintKind::Process => ("emerald", bp.price, Some((bp.item, bp.count)), bp.result, bp.result_count),
-        TradeBlueprintKind::EnchantedTool => {
-            let enchantment_cost = 5 + (roll % 15) as i32;
-            ("emerald", (bp.price + enchantment_cost).min(64), None, bp.result, 1)
-        }
-        TradeBlueprintKind::EnchantedBook => {
-            let (enchantment, level) = trade_book_enchantment(roll);
-            let mut price = 2 + ((roll / 5) as i32 % (5 + level as i32 * 10)) + 3 * level as i32;
-            if trade_enchantment_double_price(enchantment) {
-                price *= 2;
-            }
-            ("emerald", price.min(64), Some(("book", 1)), "enchanted_book", 1)
-        }
-        TradeBlueprintKind::Map => ("emerald", bp.price, Some(("compass", 1)), bp.result, 1),
-        TradeBlueprintKind::TippedArrow => ("emerald", bp.price, Some(("arrow", 5)), "tipped_arrow", 5),
-    };
-    if matches!(bp.kind, TradeBlueprintKind::Buy) {
-        cost_a_count = bp.count;
-    }
+    let (cost_a_item, mut cost_a_count) = bp.cost_a;
+    let (result_name, result_count) = bp.result;
+    // As with the original factories, all offers require emeralds in the registry.
+    name_to_item("emerald")?;
     let result_item = if result_name == "filled_map" {
         name_to_item("filled_map").or_else(|| name_to_item("map"))?
     } else {
         name_to_item(result_name)?
     };
-    let _ = emerald;
     let components = match bp.kind {
         TradeBlueprintKind::EnchantedTool => {
+            cost_a_count = (cost_a_count + 5 + (roll % 15) as i32).min(64);
             let (id, level) = trade_tool_enchantment(result_item, roll)?;
             vec![(COMP_ENCHANTMENTS, enchantments_data(&[(id, level)], true))]
         }
         TradeBlueprintKind::EnchantedBook => {
             let (id, level) = trade_book_enchantment(roll);
+            let mut price = 2 + ((roll / 5) as i32 % (5 + level as i32 * 10)) + 3 * level as i32;
+            if trade_enchantment_double_price(id) {
+                price *= 2;
+            }
+            cost_a_count = price.min(64);
             vec![(COMP_STORED_ENCHANTMENTS, enchantments_data(&[(id, level)], true))]
         }
         TradeBlueprintKind::DyedArmor => vec![(COMP_DYED_COLOR, trade_dyed_color_data(roll))],
@@ -3877,12 +3845,12 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
             vec![(COMP_SUSPICIOUS_STEW_EFFECTS, trade_stew_effects_data(roll))]
         }
         TradeBlueprintKind::TippedArrow => vec![(COMP_POTION_CONTENTS, trade_potion_contents_data(roll)?)],
-        TradeBlueprintKind::Map => trade_map_components(bp.price),
-        TradeBlueprintKind::Buy | TradeBlueprintKind::Sell | TradeBlueprintKind::Process => Vec::new(),
+        TradeBlueprintKind::Map => trade_map_components(cost_a_count),
+        TradeBlueprintKind::Plain => Vec::new(),
     };
     Some(MerchantOffer {
         cost_a: trade_cost(cost_a_item, cost_a_count)?,
-        cost_b: second.and_then(|(name, count)| trade_cost(name, count)),
+        cost_b: bp.cost_b.and_then(|(name, count)| trade_cost(name, count)),
         result: (result_item, result_count.clamp(1, 255) as u8, components),
         uses: 0,
         max_uses: bp.max_uses,
@@ -3893,98 +3861,153 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
     })
 }
 
-fn sell_each(items: &[&'static str], price: i32, count: i32, max_uses: i32, xp: i32, multiplier: f32) -> Vec<TradeBlueprint> {
-    items.iter().map(|&item| tb_sell(item, price, count, max_uses, xp, multiplier)).collect()
+const fn sell_each<const N: usize>(items: [&'static str; N], price: i32, count: i32, max_uses: i32, xp: i32) -> [TradeBlueprint; N] {
+    let mut offers = [tb_sell("", price, count, max_uses, xp, 0.05); N];
+    let mut i = 0;
+    while i < N {
+        offers[i].result.0 = items[i];
+        i += 1;
+    }
+    offers
 }
 
-const WOOL_COLORS: [&str; 16] = ["white_wool","orange_wool","magenta_wool","light_blue_wool","yellow_wool","lime_wool","pink_wool","gray_wool","light_gray_wool","cyan_wool","purple_wool","blue_wool","brown_wool","green_wool","red_wool","black_wool"];
-const CARPET_COLORS: [&str; 16] = ["white_carpet","orange_carpet","magenta_carpet","light_blue_carpet","yellow_carpet","lime_carpet","pink_carpet","gray_carpet","light_gray_carpet","cyan_carpet","purple_carpet","blue_carpet","brown_carpet","green_carpet","red_carpet","black_carpet"];
-const BED_COLORS: [&str; 16] = ["white_bed","orange_bed","magenta_bed","light_blue_bed","yellow_bed","lime_bed","pink_bed","gray_bed","light_gray_bed","cyan_bed","purple_bed","blue_bed","brown_bed","green_bed","red_bed","black_bed"];
-const BANNER_COLORS: [&str; 16] = ["white_banner","orange_banner","magenta_banner","light_blue_banner","yellow_banner","lime_banner","pink_banner","gray_banner","light_gray_banner","cyan_banner","purple_banner","blue_banner","brown_banner","green_banner","red_banner","black_banner"];
-const TERRACOTTA_COLORS: [&str; 16] = ["white_terracotta","orange_terracotta","magenta_terracotta","light_blue_terracotta","yellow_terracotta","lime_terracotta","pink_terracotta","gray_terracotta","light_gray_terracotta","cyan_terracotta","purple_terracotta","blue_terracotta","brown_terracotta","green_terracotta","red_terracotta","black_terracotta"];
-const GLAZED_TERRACOTTA_COLORS: [&str; 16] = ["white_glazed_terracotta","orange_glazed_terracotta","magenta_glazed_terracotta","light_blue_glazed_terracotta","yellow_glazed_terracotta","lime_glazed_terracotta","pink_glazed_terracotta","gray_glazed_terracotta","light_gray_glazed_terracotta","cyan_glazed_terracotta","purple_glazed_terracotta","blue_glazed_terracotta","brown_glazed_terracotta","green_glazed_terracotta","red_glazed_terracotta","black_glazed_terracotta"];
+const fn buy_dyes<const N: usize>(items: [&'static str; N], xp: i32) -> [TradeBlueprint; N] {
+    let mut offers = [tb_buy("", 12, 16, xp); N];
+    let mut i = 0;
+    while i < N {
+        offers[i].cost_a.0 = items[i];
+        i += 1;
+    }
+    offers
+}
+
+macro_rules! villager_colored_items {
+    ($suffix:literal) => {
+        [concat!("white", $suffix), concat!("orange", $suffix), concat!("magenta", $suffix),
+         concat!("light_blue", $suffix), concat!("yellow", $suffix), concat!("lime", $suffix),
+         concat!("pink", $suffix), concat!("gray", $suffix), concat!("light_gray", $suffix),
+         concat!("cyan", $suffix), concat!("purple", $suffix), concat!("blue", $suffix),
+         concat!("brown", $suffix), concat!("green", $suffix), concat!("red", $suffix),
+         concat!("black", $suffix)]
+    };
+}
+
+const WOOL_COLORS: [&str; 16] = villager_colored_items!("_wool");
+const BED_COLORS: [&str; 16] = villager_colored_items!("_bed");
+const BANNER_TRADES: [TradeBlueprint; 16] = sell_each(villager_colored_items!("_banner"), 3, 1, 12, 15);
 
 /// The complete non-experimental Java 1.21.1 `VillagerTrades.TRADES` pools.
 /// Vanilla randomly chooses up to two entries from the level pool when the
 /// level is unlocked; this table intentionally contains every candidate.
-fn vanilla_trade_pool(profession: VillagerProfession, level: VillagerLevel) -> Vec<TradeBlueprint> {
+fn vanilla_trade_pool(profession: VillagerProfession, level: VillagerLevel) -> [&'static [TradeBlueprint]; 3] {
     use VillagerLevel::*;
     use VillagerProfession::*;
-    let mut v: Vec<TradeBlueprint> = Vec::new();
-    match (profession, level) {
-        (Farmer, Novice) => v.extend([tb_buy("wheat",20,16,2),tb_buy("potato",26,16,2),tb_buy("carrot",22,16,2),tb_buy("beetroot",15,16,2),tb_sell("bread",1,6,16,1,0.05)]),
-        (Farmer, Apprentice) => v.extend([tb_buy("pumpkin",6,12,10),tb_sell("pumpkin_pie",1,4,12,5,0.05),tb_sell("apple",1,4,16,5,0.05)]),
-        (Farmer, Journeyman) => v.extend([tb_sell("cookie",3,18,12,10,0.05),tb_buy("melon",4,12,20)]),
-        (Farmer, Expert) => { v.push(tb_sell("cake",1,1,12,15,0.05)); v.extend([100,160,140,120,280,7].map(|_| tb_stew(15))); },
-        (Farmer, Master) => v.extend([tb_sell("golden_carrot",3,3,12,30,0.05),tb_sell("glistering_melon_slice",4,3,12,30,0.05)]),
-        (Fisherman, Novice) => v.extend([tb_buy("string",20,16,2),tb_buy("coal",10,16,2),tb_process("cod",6,1,"cooked_cod",6,16,1),tb_sell("cod_bucket",3,1,16,1,0.05)]),
-        (Fisherman, Apprentice) => v.extend([tb_buy("cod",15,16,10),tb_process("salmon",6,1,"cooked_salmon",6,16,5),tb_sell("campfire",2,1,12,5,0.05)]),
-        (Fisherman, Journeyman) => v.extend([tb_buy("salmon",13,16,20),tb_enchanted("fishing_rod",3,3,10,0.2)]),
-        (Fisherman, Expert) => v.push(tb_buy("tropical_fish",6,12,30)),
-        (Fisherman, Master) => v.extend([tb_buy("pufferfish",4,12,30),tb_buy("oak_boat",1,12,30)]),
-        (Shepherd, Novice) => v.extend([tb_buy("white_wool",18,16,2),tb_buy("brown_wool",18,16,2),tb_buy("black_wool",18,16,2),tb_buy("gray_wool",18,16,2),tb_sell("shears",2,1,12,1,0.05)]),
-        (Shepherd, Apprentice) => { v.extend(["white_dye","gray_dye","black_dye","light_blue_dye","lime_dye"].map(|x| tb_buy(x,12,16,10))); v.extend(sell_each(&WOOL_COLORS,1,1,16,5,0.05)); v.extend(sell_each(&CARPET_COLORS,1,4,16,5,0.05)); },
-        (Shepherd, Journeyman) => { v.extend(["yellow_dye","light_gray_dye","orange_dye","red_dye","pink_dye"].map(|x| tb_buy(x,12,16,20))); v.extend(sell_each(&BED_COLORS,3,1,12,10,0.05)); },
-        (Shepherd, Expert) => { v.extend(["brown_dye","purple_dye","blue_dye","green_dye","magenta_dye","cyan_dye"].map(|x| tb_buy(x,12,16,30))); v.extend(sell_each(&BANNER_COLORS,3,1,12,15,0.05)); },
-        (Shepherd, Master) => v.push(tb_sell("painting",2,3,12,30,0.05)),
-        (Fletcher, Novice) => v.extend([tb_buy("stick",32,16,2),tb_sell("arrow",1,16,12,1,0.05),tb_process("gravel",10,1,"flint",10,12,1)]),
-        (Fletcher, Apprentice) => v.extend([tb_buy("flint",26,12,10),tb_sell("bow",2,1,12,5,0.05)]),
-        (Fletcher, Journeyman) => v.extend([tb_buy("string",14,16,20),tb_sell("crossbow",3,1,12,10,0.05)]),
-        (Fletcher, Expert) => v.extend([tb_buy("feather",24,16,30),tb_enchanted("bow",2,3,15,0.05)]),
-        (Fletcher, Master) => v.extend([tb_buy("tripwire_hook",8,12,30),tb_enchanted("crossbow",3,3,15,0.05),tb_tipped_arrow()]),
-        (Librarian, Novice) => v.extend([tb_buy("paper",24,16,2),tb_book(1),tb_sell("bookshelf",9,1,12,1,0.05)]),
-        (Librarian, Apprentice) => v.extend([tb_buy("book",4,12,10),tb_book(5),tb_sell("lantern",1,1,12,5,0.05)]),
-        (Librarian, Journeyman) => v.extend([tb_buy("ink_sac",5,12,20),tb_book(10),tb_sell("glass",1,4,12,10,0.05)]),
-        (Librarian, Expert) => v.extend([tb_buy("writable_book",2,12,30),tb_book(15),tb_sell("clock",5,1,12,15,0.05),tb_sell("compass",4,1,12,15,0.05)]),
-        (Librarian, Master) => v.push(tb_sell("name_tag",20,1,12,30,0.05)),
-        (Cartographer, Novice) => v.extend([tb_buy("paper",24,16,2),tb_sell("map",7,1,12,1,0.05)]),
-        (Cartographer, Apprentice) => v.extend([tb_buy("glass_pane",11,16,10),tb_map(13,12,5)]),
-        (Cartographer, Journeyman) => v.extend([tb_buy("compass",1,12,20),tb_map(14,12,10),tb_map(12,12,10)]),
-        (Cartographer, Expert) => { v.push(tb_sell("item_frame",7,1,12,15,0.05)); v.extend(sell_each(&BANNER_COLORS,3,1,12,15,0.05)); },
-        (Cartographer, Master) => v.push(tb_sell("globe_banner_pattern",8,1,12,30,0.05)),
-        (Cleric, Novice) => v.extend([tb_buy("rotten_flesh",32,16,2),tb_sell("redstone",1,2,12,1,0.05)]),
-        (Cleric, Apprentice) => v.extend([tb_buy("gold_ingot",3,12,10),tb_sell("lapis_lazuli",1,1,12,5,0.05)]),
-        (Cleric, Journeyman) => v.extend([tb_buy("rabbit_foot",2,12,20),tb_sell("glowstone",4,1,12,10,0.05)]),
-        (Cleric, Expert) => v.extend([tb_buy("turtle_scute",4,12,30),tb_buy("glass_bottle",9,12,30),tb_sell("ender_pearl",5,1,12,15,0.05)]),
-        (Cleric, Master) => v.extend([tb_buy("nether_wart",22,12,30),tb_sell("experience_bottle",3,1,12,30,0.05)]),
-        (Armorer, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("iron_leggings",7,1,12,1,0.2),tb_sell("iron_boots",4,1,12,1,0.2),tb_sell("iron_helmet",5,1,12,1,0.2),tb_sell("iron_chestplate",9,1,12,1,0.2)]),
-        (Armorer, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2),tb_sell("chainmail_boots",1,1,12,5,0.2),tb_sell("chainmail_leggings",3,1,12,5,0.2)]),
-        (Armorer, Journeyman) => v.extend([tb_buy("lava_bucket",1,12,20),tb_buy("diamond",1,12,20),tb_sell("chainmail_helmet",1,1,12,10,0.2),tb_sell("chainmail_chestplate",4,1,12,10,0.2),tb_sell("shield",5,1,12,10,0.2)]),
-        (Armorer, Expert) => v.extend([tb_enchanted("diamond_leggings",14,3,15,0.2),tb_enchanted("diamond_boots",8,3,15,0.2)]),
-        (Armorer, Master) => v.extend([tb_enchanted("diamond_helmet",8,3,30,0.2),tb_enchanted("diamond_chestplate",16,3,30,0.2)]),
-        (Weaponsmith, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("iron_axe",3,1,12,1,0.2),tb_enchanted("iron_sword",2,3,1,0.05)]),
-        (Weaponsmith, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2)]),
-        (Weaponsmith, Journeyman) => v.push(tb_buy("flint",24,12,20)),
-        (Weaponsmith, Expert) => v.extend([tb_buy("diamond",1,12,30),tb_enchanted("diamond_axe",12,3,15,0.2)]),
-        (Weaponsmith, Master) => v.push(tb_enchanted("diamond_sword",8,3,30,0.2)),
-        (Toolsmith, Novice) => v.extend([tb_buy("coal",15,16,2),tb_sell("stone_axe",1,1,12,1,0.2),tb_sell("stone_shovel",1,1,12,1,0.2),tb_sell("stone_pickaxe",1,1,12,1,0.2),tb_sell("stone_hoe",1,1,12,1,0.2)]),
-        (Toolsmith, Apprentice) => v.extend([tb_buy("iron_ingot",4,12,10),tb_sell("bell",36,1,12,5,0.2)]),
-        (Toolsmith, Journeyman) => v.extend([tb_buy("flint",30,12,20),tb_enchanted("iron_axe",1,3,10,0.2),tb_enchanted("iron_shovel",2,3,10,0.2),tb_enchanted("iron_pickaxe",3,3,10,0.2),tb_sell("diamond_hoe",4,1,3,10,0.2)]),
-        (Toolsmith, Expert) => v.extend([tb_buy("diamond",1,12,30),tb_enchanted("diamond_axe",12,3,15,0.2),tb_enchanted("diamond_shovel",5,3,15,0.2)]),
-        (Toolsmith, Master) => v.push(tb_enchanted("diamond_pickaxe",13,3,30,0.2)),
-        (Butcher, Novice) => v.extend([tb_buy("chicken",14,16,2),tb_buy("porkchop",7,16,2),tb_buy("rabbit",4,16,2),tb_sell("rabbit_stew",1,1,12,1,0.05)]),
-        (Butcher, Apprentice) => v.extend([tb_buy("coal",15,16,2),tb_sell("cooked_porkchop",1,5,16,5,0.05),tb_sell("cooked_chicken",1,8,16,5,0.05)]),
-        (Butcher, Journeyman) => v.extend([tb_buy("mutton",7,16,20),tb_buy("beef",10,16,20)]),
-        (Butcher, Expert) => v.push(tb_buy("dried_kelp_block",10,12,30)),
-        (Butcher, Master) => v.push(tb_buy("sweet_berries",10,12,30)),
-        (Leatherworker, Novice) => v.extend([tb_buy("leather",6,16,2),tb_dyed("leather_leggings",3,12,1),tb_dyed("leather_chestplate",7,12,1)]),
-        (Leatherworker, Apprentice) => v.extend([tb_buy("flint",26,12,10),tb_dyed("leather_helmet",5,12,5),tb_dyed("leather_boots",4,12,5)]),
-        (Leatherworker, Journeyman) => v.extend([tb_buy("rabbit_hide",9,12,20),tb_dyed("leather_chestplate",7,12,10)]),
-        (Leatherworker, Expert) => v.extend([tb_buy("turtle_scute",4,12,30),tb_dyed("leather_horse_armor",6,12,15)]),
-        (Leatherworker, Master) => v.extend([tb_sell("saddle",6,1,12,30,0.2),tb_dyed("leather_helmet",5,12,30)]),
-        (Mason, Novice) => v.extend([tb_buy("clay_ball",10,16,2),tb_sell("brick",1,10,16,1,0.05)]),
-        (Mason, Apprentice) => v.extend([tb_buy("stone",20,16,10),tb_sell("chiseled_stone_bricks",1,4,16,5,0.05)]),
-        (Mason, Journeyman) => v.extend([tb_buy("granite",16,16,20),tb_buy("andesite",16,16,20),tb_buy("diorite",16,16,20),tb_sell("dripstone_block",1,4,16,10,0.05),tb_sell("polished_andesite",1,4,16,10,0.05),tb_sell("polished_diorite",1,4,16,10,0.05),tb_sell("polished_granite",1,4,16,10,0.05)]),
-        (Mason, Expert) => { v.push(tb_buy("quartz",12,12,30)); v.extend(sell_each(&TERRACOTTA_COLORS,1,1,12,15,0.05)); v.extend(sell_each(&GLAZED_TERRACOTTA_COLORS,1,1,12,15,0.05)); },
-        (Mason, Master) => v.extend([tb_sell("quartz_pillar",1,1,12,30,0.05),tb_sell("quartz_block",1,1,12,30,0.05)]),
-        (None | Nitwit, _) => {},
-    }
-    v
+    let offers: &'static [TradeBlueprint] = match (profession, level) {
+        (Farmer, Novice) => const { &[tb_buy("wheat", 20, 16, 2), tb_buy("potato", 26, 16, 2), tb_buy("carrot", 22, 16, 2), tb_buy("beetroot", 15, 16, 2), tb_sell("bread", 1, 6, 16, 1, 0.05)] },
+        (Farmer, Apprentice) => const { &[tb_buy("pumpkin", 6, 12, 10), tb_sell("pumpkin_pie", 1, 4, 12, 5, 0.05), tb_sell("apple", 1, 4, 16, 5, 0.05)] },
+        (Farmer, Journeyman) => const { &[tb_sell("cookie", 3, 18, 12, 10, 0.05), tb_buy("melon", 4, 12, 20)] },
+        (Farmer, Expert) => const { &[tb_sell("cake", 1, 1, 12, 15, 0.05), tb_stew(15), tb_stew(15), tb_stew(15), tb_stew(15), tb_stew(15), tb_stew(15)] },
+        (Farmer, Master) => const { &[tb_sell("golden_carrot", 3, 3, 12, 30, 0.05), tb_sell("glistering_melon_slice", 4, 3, 12, 30, 0.05)] },
+        (Fisherman, Novice) => const { &[tb_buy("string", 20, 16, 2), tb_buy("coal", 10, 16, 2), tb_process("cod", 6, 1, "cooked_cod", 6, 16, 1), tb_sell("cod_bucket", 3, 1, 16, 1, 0.05)] },
+        (Fisherman, Apprentice) => const { &[tb_buy("cod", 15, 16, 10), tb_process("salmon", 6, 1, "cooked_salmon", 6, 16, 5), tb_sell("campfire", 2, 1, 12, 5, 0.05)] },
+        (Fisherman, Journeyman) => const { &[tb_buy("salmon", 13, 16, 20), tb_enchanted("fishing_rod", 3, 3, 10, 0.2)] },
+        (Fisherman, Expert) => const { &[tb_buy("tropical_fish", 6, 12, 30)] },
+        (Fisherman, Master) => const { &[tb_buy("pufferfish", 4, 12, 30), tb_buy("oak_boat", 1, 12, 30)] },
+        (Shepherd, Novice) => const { &[
+            tb_buy("white_wool", 18, 16, 2), tb_buy("brown_wool", 18, 16, 2), tb_buy("black_wool", 18, 16, 2),
+            tb_buy("gray_wool", 18, 16, 2), tb_sell("shears", 2, 1, 12, 1, 0.05),
+        ] },
+        (Shepherd, Apprentice) => return const { [
+            &buy_dyes(["white_dye", "gray_dye", "black_dye", "light_blue_dye", "lime_dye"], 10),
+            &sell_each(WOOL_COLORS, 1, 1, 16, 5), &sell_each(villager_colored_items!("_carpet"), 1, 4, 16, 5),
+        ] },
+        (Shepherd, Journeyman) => return const { [
+            &buy_dyes(["yellow_dye", "light_gray_dye", "orange_dye", "red_dye", "pink_dye"], 20),
+            &sell_each(BED_COLORS, 3, 1, 12, 10), &[],
+        ] },
+        (Shepherd, Expert) => return const { [&buy_dyes(["brown_dye", "purple_dye", "blue_dye", "green_dye", "magenta_dye", "cyan_dye"], 30), &BANNER_TRADES, &[]] },
+        (Shepherd, Master) => const { &[tb_sell("painting", 2, 3, 12, 30, 0.05)] },
+        (Fletcher, Novice) => const { &[tb_buy("stick", 32, 16, 2), tb_sell("arrow", 1, 16, 12, 1, 0.05), tb_process("gravel", 10, 1, "flint", 10, 12, 1)] },
+        (Fletcher, Apprentice) => const { &[tb_buy("flint", 26, 12, 10), tb_sell("bow", 2, 1, 12, 5, 0.05)] },
+        (Fletcher, Journeyman) => const { &[tb_buy("string", 14, 16, 20), tb_sell("crossbow", 3, 1, 12, 10, 0.05)] },
+        (Fletcher, Expert) => const { &[tb_buy("feather", 24, 16, 30), tb_enchanted("bow", 2, 3, 15, 0.05)] },
+        (Fletcher, Master) => const { &[tb_buy("tripwire_hook", 8, 12, 30), tb_enchanted("crossbow", 3, 3, 15, 0.05), tb_tipped_arrow()] },
+        (Librarian, Novice) => const { &[tb_buy("paper", 24, 16, 2), tb_book(1), tb_sell("bookshelf", 9, 1, 12, 1, 0.05)] },
+        (Librarian, Apprentice) => const { &[tb_buy("book", 4, 12, 10), tb_book(5), tb_sell("lantern", 1, 1, 12, 5, 0.05)] },
+        (Librarian, Journeyman) => const { &[tb_buy("ink_sac", 5, 12, 20), tb_book(10), tb_sell("glass", 1, 4, 12, 10, 0.05)] },
+        (Librarian, Expert) => const { &[tb_buy("writable_book", 2, 12, 30), tb_book(15), tb_sell("clock", 5, 1, 12, 15, 0.05), tb_sell("compass", 4, 1, 12, 15, 0.05)] },
+        (Librarian, Master) => const { &[tb_sell("name_tag", 20, 1, 12, 30, 0.05)] },
+        (Cartographer, Novice) => const { &[tb_buy("paper", 24, 16, 2), tb_sell("map", 7, 1, 12, 1, 0.05)] },
+        (Cartographer, Apprentice) => const { &[tb_buy("glass_pane", 11, 16, 10), tb_map(13, 12, 5)] },
+        (Cartographer, Journeyman) => const { &[tb_buy("compass", 1, 12, 20), tb_map(14, 12, 10), tb_map(12, 12, 10)] },
+        (Cartographer, Expert) => return const { [&[tb_sell("item_frame", 7, 1, 12, 15, 0.05)], &BANNER_TRADES, &[]] },
+        (Cartographer, Master) => const { &[tb_sell("globe_banner_pattern", 8, 1, 12, 30, 0.05)] },
+        (Cleric, Novice) => const { &[tb_buy("rotten_flesh", 32, 16, 2), tb_sell("redstone", 1, 2, 12, 1, 0.05)] },
+        (Cleric, Apprentice) => const { &[tb_buy("gold_ingot", 3, 12, 10), tb_sell("lapis_lazuli", 1, 1, 12, 5, 0.05)] },
+        (Cleric, Journeyman) => const { &[tb_buy("rabbit_foot", 2, 12, 20), tb_sell("glowstone", 4, 1, 12, 10, 0.05)] },
+        (Cleric, Expert) => const { &[tb_buy("turtle_scute", 4, 12, 30), tb_buy("glass_bottle", 9, 12, 30), tb_sell("ender_pearl", 5, 1, 12, 15, 0.05)] },
+        (Cleric, Master) => const { &[tb_buy("nether_wart", 22, 12, 30), tb_sell("experience_bottle", 3, 1, 12, 30, 0.05)] },
+        (Armorer, Novice) => const { &[
+            tb_buy("coal", 15, 16, 2), tb_sell("iron_leggings", 7, 1, 12, 1, 0.2), tb_sell("iron_boots", 4, 1, 12, 1, 0.2),
+            tb_sell("iron_helmet", 5, 1, 12, 1, 0.2), tb_sell("iron_chestplate", 9, 1, 12, 1, 0.2),
+        ] },
+        (Armorer, Apprentice) => const { &[
+            tb_buy("iron_ingot", 4, 12, 10), tb_sell("bell", 36, 1, 12, 5, 0.2), tb_sell("chainmail_boots", 1, 1, 12, 5, 0.2),
+            tb_sell("chainmail_leggings", 3, 1, 12, 5, 0.2),
+        ] },
+        (Armorer, Journeyman) => const { &[
+            tb_buy("lava_bucket", 1, 12, 20), tb_buy("diamond", 1, 12, 20), tb_sell("chainmail_helmet", 1, 1, 12, 10, 0.2),
+            tb_sell("chainmail_chestplate", 4, 1, 12, 10, 0.2), tb_sell("shield", 5, 1, 12, 10, 0.2),
+        ] },
+        (Armorer, Expert) => const { &[tb_enchanted("diamond_leggings", 14, 3, 15, 0.2), tb_enchanted("diamond_boots", 8, 3, 15, 0.2)] },
+        (Armorer, Master) => const { &[tb_enchanted("diamond_helmet", 8, 3, 30, 0.2), tb_enchanted("diamond_chestplate", 16, 3, 30, 0.2)] },
+        (Weaponsmith, Novice) => const { &[tb_buy("coal", 15, 16, 2), tb_sell("iron_axe", 3, 1, 12, 1, 0.2), tb_enchanted("iron_sword", 2, 3, 1, 0.05)] },
+        (Weaponsmith | Toolsmith, Apprentice) => const { &[tb_buy("iron_ingot", 4, 12, 10), tb_sell("bell", 36, 1, 12, 5, 0.2)] },
+        (Weaponsmith, Journeyman) => const { &[tb_buy("flint", 24, 12, 20)] },
+        (Weaponsmith, Expert) => const { &[tb_buy("diamond", 1, 12, 30), tb_enchanted("diamond_axe", 12, 3, 15, 0.2)] },
+        (Weaponsmith, Master) => const { &[tb_enchanted("diamond_sword", 8, 3, 30, 0.2)] },
+        (Toolsmith, Novice) => const { &[
+            tb_buy("coal", 15, 16, 2), tb_sell("stone_axe", 1, 1, 12, 1, 0.2), tb_sell("stone_shovel", 1, 1, 12, 1, 0.2),
+            tb_sell("stone_pickaxe", 1, 1, 12, 1, 0.2), tb_sell("stone_hoe", 1, 1, 12, 1, 0.2),
+        ] },
+        (Toolsmith, Journeyman) => const { &[
+            tb_buy("flint", 30, 12, 20), tb_enchanted("iron_axe", 1, 3, 10, 0.2), tb_enchanted("iron_shovel", 2, 3, 10, 0.2),
+            tb_enchanted("iron_pickaxe", 3, 3, 10, 0.2), tb_sell("diamond_hoe", 4, 1, 3, 10, 0.2),
+        ] },
+        (Toolsmith, Expert) => const { &[tb_buy("diamond", 1, 12, 30), tb_enchanted("diamond_axe", 12, 3, 15, 0.2), tb_enchanted("diamond_shovel", 5, 3, 15, 0.2)] },
+        (Toolsmith, Master) => const { &[tb_enchanted("diamond_pickaxe", 13, 3, 30, 0.2)] },
+        (Butcher, Novice) => const { &[tb_buy("chicken", 14, 16, 2), tb_buy("porkchop", 7, 16, 2), tb_buy("rabbit", 4, 16, 2), tb_sell("rabbit_stew", 1, 1, 12, 1, 0.05)] },
+        (Butcher, Apprentice) => const { &[tb_buy("coal", 15, 16, 2), tb_sell("cooked_porkchop", 1, 5, 16, 5, 0.05), tb_sell("cooked_chicken", 1, 8, 16, 5, 0.05)] },
+        (Butcher, Journeyman) => const { &[tb_buy("mutton", 7, 16, 20), tb_buy("beef", 10, 16, 20)] },
+        (Butcher, Expert) => const { &[tb_buy("dried_kelp_block", 10, 12, 30)] },
+        (Butcher, Master) => const { &[tb_buy("sweet_berries", 10, 12, 30)] },
+        (Leatherworker, Novice) => const { &[tb_buy("leather", 6, 16, 2), tb_dyed("leather_leggings", 3, 12, 1), tb_dyed("leather_chestplate", 7, 12, 1)] },
+        (Leatherworker, Apprentice) => const { &[tb_buy("flint", 26, 12, 10), tb_dyed("leather_helmet", 5, 12, 5), tb_dyed("leather_boots", 4, 12, 5)] },
+        (Leatherworker, Journeyman) => const { &[tb_buy("rabbit_hide", 9, 12, 20), tb_dyed("leather_chestplate", 7, 12, 10)] },
+        (Leatherworker, Expert) => const { &[tb_buy("turtle_scute", 4, 12, 30), tb_dyed("leather_horse_armor", 6, 12, 15)] },
+        (Leatherworker, Master) => const { &[tb_sell("saddle", 6, 1, 12, 30, 0.2), tb_dyed("leather_helmet", 5, 12, 30)] },
+        (Mason, Novice) => const { &[tb_buy("clay_ball", 10, 16, 2), tb_sell("brick", 1, 10, 16, 1, 0.05)] },
+        (Mason, Apprentice) => const { &[tb_buy("stone", 20, 16, 10), tb_sell("chiseled_stone_bricks", 1, 4, 16, 5, 0.05)] },
+        (Mason, Journeyman) => const { &[
+            tb_buy("granite", 16, 16, 20), tb_buy("andesite", 16, 16, 20), tb_buy("diorite", 16, 16, 20),
+            tb_sell("dripstone_block", 1, 4, 16, 10, 0.05), tb_sell("polished_andesite", 1, 4, 16, 10, 0.05),
+            tb_sell("polished_diorite", 1, 4, 16, 10, 0.05), tb_sell("polished_granite", 1, 4, 16, 10, 0.05),
+        ] },
+        (Mason, Expert) => return const { [
+            &[tb_buy("quartz", 12, 12, 30)], &sell_each(villager_colored_items!("_terracotta"), 1, 1, 12, 15),
+            &sell_each(villager_colored_items!("_glazed_terracotta"), 1, 1, 12, 15),
+        ] },
+        (Mason, Master) => const { &[tb_sell("quartz_pillar", 1, 1, 12, 30, 0.05), tb_sell("quartz_block", 1, 1, 12, 30, 0.05)] },
+        (None | Nitwit, _) => &[],
+    };
+    [offers, &[], &[]]
 }
 
 fn instantiate_trade_pool(profession: VillagerProfession, level: VillagerLevel, mut roll: impl FnMut() -> u32) -> Vec<MerchantOffer> {
     vanilla_trade_pool(profession, level)
         .into_iter()
+        .flatten()
+        .copied()
         .filter_map(|bp| instantiate_trade_blueprint(bp, roll()))
         .collect()
 }
@@ -3996,60 +4019,47 @@ fn profession_offers(profession: VillagerProfession) -> Vec<MerchantOffer> {
 }
 
 fn unlock_villager_trade_level(villager: &mut Villager, level: VillagerLevel) {
-    if matches!(villager.profession, VillagerProfession::None | VillagerProfession::Nitwit) {
-        return;
-    }
     villager.offers.extend(instantiate_trade_pool(villager.profession, level, || {
         world_rng::next_below(u32::MAX)
     }));
 }
 
-/// Wandering trader pools: five common entries plus one rare entry in vanilla.
-/// The rare pool is encoded after the separator comment in `wandering_trader_pool`.
-fn wandering_trader_pool(rare: bool) -> Vec<TradeBlueprint> {
-    if rare {
-        return vec![
-            tb_sell("tropical_fish_bucket",5,1,4,1,0.05),tb_sell("pufferfish_bucket",5,1,4,1,0.05),
-            tb_sell("packed_ice",3,1,6,1,0.05),tb_sell("blue_ice",6,1,6,1,0.05),
-            tb_sell("gunpowder",1,1,8,1,0.05),tb_sell("podzol",3,3,6,1,0.05),
-        ];
-    }
-    let mut v = vec![
-        tb_sell("sea_pickle",2,1,5,1,0.05),tb_sell("slime_ball",4,1,5,1,0.05),tb_sell("glowstone",2,1,5,1,0.05),
-        tb_sell("nautilus_shell",5,1,5,1,0.05),tb_sell("fern",1,1,12,1,0.05),tb_sell("sugar_cane",1,1,8,1,0.05),
-        tb_sell("pumpkin",1,1,4,1,0.05),tb_sell("kelp",3,1,12,1,0.05),tb_sell("cactus",3,1,8,1,0.05),
-        tb_sell("dandelion",1,1,12,1,0.05),tb_sell("poppy",1,1,12,1,0.05),tb_sell("blue_orchid",1,1,8,1,0.05),
-        tb_sell("allium",1,1,12,1,0.05),tb_sell("azure_bluet",1,1,12,1,0.05),tb_sell("red_tulip",1,1,12,1,0.05),
-        tb_sell("orange_tulip",1,1,12,1,0.05),tb_sell("white_tulip",1,1,12,1,0.05),tb_sell("pink_tulip",1,1,12,1,0.05),
-        tb_sell("oxeye_daisy",1,1,12,1,0.05),tb_sell("cornflower",1,1,12,1,0.05),tb_sell("lily_of_the_valley",1,1,7,1,0.05),
-        tb_sell("wheat_seeds",1,1,12,1,0.05),tb_sell("beetroot_seeds",1,1,12,1,0.05),tb_sell("pumpkin_seeds",1,1,12,1,0.05),
-        tb_sell("melon_seeds",1,1,12,1,0.05),tb_sell("acacia_sapling",5,1,8,1,0.05),tb_sell("birch_sapling",5,1,8,1,0.05),
-        tb_sell("dark_oak_sapling",5,1,8,1,0.05),tb_sell("jungle_sapling",5,1,8,1,0.05),tb_sell("oak_sapling",5,1,8,1,0.05),
-        tb_sell("spruce_sapling",5,1,8,1,0.05),tb_sell("cherry_sapling",5,1,8,1,0.05),tb_sell("mangrove_propagule",5,1,8,1,0.05),
-    ];
-    v.extend(sell_each(&["red_dye","white_dye","blue_dye","pink_dye","black_dye","green_dye","light_gray_dye","magenta_dye","yellow_dye","gray_dye","purple_dye","light_blue_dye","lime_dye","orange_dye","brown_dye","cyan_dye"],1,3,12,1,0.05));
-    v.extend(sell_each(&["brain_coral_block","bubble_coral_block","fire_coral_block","horn_coral_block","tube_coral_block"],3,1,8,1,0.05));
-    v.extend(sell_each(&["vine","brown_mushroom","red_mushroom"],1,1,12,1,0.05));
-    v.extend([tb_sell("lily_pad",1,2,5,1,0.05),tb_sell("small_dripleaf",1,2,5,1,0.05),tb_sell("sand",1,8,8,1,0.05),tb_sell("red_sand",1,4,6,1,0.05),tb_sell("pointed_dripstone",1,2,5,1,0.05),tb_sell("rooted_dirt",1,2,5,1,0.05),tb_sell("moss_block",1,2,5,1,0.05)]);
-    v
-}
+/// Wandering traders sample five common entries without replacement, then one rare entry.
+const WANDERING_TRADER_RARE: &[TradeBlueprint] = &[
+    tb_sell("tropical_fish_bucket", 5, 1, 4, 1, 0.05), tb_sell("pufferfish_bucket", 5, 1, 4, 1, 0.05),
+    tb_sell("packed_ice", 3, 1, 6, 1, 0.05), tb_sell("blue_ice", 6, 1, 6, 1, 0.05),
+    tb_sell("gunpowder", 1, 1, 8, 1, 0.05), tb_sell("podzol", 3, 3, 6, 1, 0.05),
+];
+
+const WANDERING_TRADER_COMMON: [&[TradeBlueprint]; 5] = [
+    &[
+        tb_sell("sea_pickle", 2, 1, 5, 1, 0.05), tb_sell("slime_ball", 4, 1, 5, 1, 0.05), tb_sell("glowstone", 2, 1, 5, 1, 0.05),
+        tb_sell("nautilus_shell", 5, 1, 5, 1, 0.05), tb_sell("fern", 1, 1, 12, 1, 0.05), tb_sell("sugar_cane", 1, 1, 8, 1, 0.05),
+        tb_sell("pumpkin", 1, 1, 4, 1, 0.05), tb_sell("kelp", 3, 1, 12, 1, 0.05), tb_sell("cactus", 3, 1, 8, 1, 0.05),
+        tb_sell("dandelion", 1, 1, 12, 1, 0.05), tb_sell("poppy", 1, 1, 12, 1, 0.05), tb_sell("blue_orchid", 1, 1, 8, 1, 0.05),
+        tb_sell("allium", 1, 1, 12, 1, 0.05), tb_sell("azure_bluet", 1, 1, 12, 1, 0.05), tb_sell("red_tulip", 1, 1, 12, 1, 0.05),
+        tb_sell("orange_tulip", 1, 1, 12, 1, 0.05), tb_sell("white_tulip", 1, 1, 12, 1, 0.05), tb_sell("pink_tulip", 1, 1, 12, 1, 0.05),
+        tb_sell("oxeye_daisy", 1, 1, 12, 1, 0.05), tb_sell("cornflower", 1, 1, 12, 1, 0.05), tb_sell("lily_of_the_valley", 1, 1, 7, 1, 0.05),
+        tb_sell("wheat_seeds", 1, 1, 12, 1, 0.05), tb_sell("beetroot_seeds", 1, 1, 12, 1, 0.05), tb_sell("pumpkin_seeds", 1, 1, 12, 1, 0.05),
+        tb_sell("melon_seeds", 1, 1, 12, 1, 0.05), tb_sell("acacia_sapling", 5, 1, 8, 1, 0.05), tb_sell("birch_sapling", 5, 1, 8, 1, 0.05),
+        tb_sell("dark_oak_sapling", 5, 1, 8, 1, 0.05), tb_sell("jungle_sapling", 5, 1, 8, 1, 0.05), tb_sell("oak_sapling", 5, 1, 8, 1, 0.05),
+        tb_sell("spruce_sapling", 5, 1, 8, 1, 0.05), tb_sell("cherry_sapling", 5, 1, 8, 1, 0.05), tb_sell("mangrove_propagule", 5, 1, 8, 1, 0.05),
+    ],
+    &sell_each(["red_dye", "white_dye", "blue_dye", "pink_dye", "black_dye", "green_dye", "light_gray_dye", "magenta_dye", "yellow_dye", "gray_dye", "purple_dye", "light_blue_dye", "lime_dye", "orange_dye", "brown_dye", "cyan_dye"], 1, 3, 12, 1),
+    &sell_each(["brain_coral_block", "bubble_coral_block", "fire_coral_block", "horn_coral_block", "tube_coral_block"], 3, 1, 8, 1),
+    &sell_each(["vine", "brown_mushroom", "red_mushroom"], 1, 1, 12, 1),
+    &[tb_sell("lily_pad", 1, 2, 5, 1, 0.05), tb_sell("small_dripleaf", 1, 2, 5, 1, 0.05), tb_sell("sand", 1, 8, 8, 1, 0.05), tb_sell("red_sand", 1, 4, 6, 1, 0.05), tb_sell("pointed_dripstone", 1, 2, 5, 1, 0.05), tb_sell("rooted_dirt", 1, 2, 5, 1, 0.05), tb_sell("moss_block", 1, 2, 5, 1, 0.05)],
+];
 
 fn wandering_trader_offers(mut roll: impl FnMut(usize) -> usize) -> Vec<MerchantOffer> {
-    let mut common = wandering_trader_pool(false);
-    let mut picked = Vec::new();
+    let mut common: Vec<_> = WANDERING_TRADER_COMMON.into_iter().flatten().copied().collect();
+    let mut picked = Vec::with_capacity(6);
     for _ in 0..5.min(common.len()) {
-        if common.is_empty() { break; }
         let index = roll(common.len());
-        if let Some(bp) = common.get(index).copied() {
-            if let Some(offer) = instantiate_trade_blueprint(bp, index as u32) { picked.push(offer); }
-        }
-        common.remove(index);
+        picked.extend(instantiate_trade_blueprint(common.remove(index), index as u32));
     }
-    let rare = wandering_trader_pool(true);
-    if !rare.is_empty() {
-        let index = roll(rare.len());
-        if let Some(offer) = instantiate_trade_blueprint(rare[index], index as u32) { picked.push(offer); }
-    }
+    let index = roll(WANDERING_TRADER_RARE.len());
+    picked.extend(instantiate_trade_blueprint(WANDERING_TRADER_RARE[index], index as u32));
     picked
 }
 
@@ -4060,7 +4070,7 @@ fn wandering_trader_offers(mut roll: impl FnMut(usize) -> usize) -> Vec<Merchant
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villager) {
     live_poi_scan(dim, position);
-    let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+    let mut registries = village_lock(live_pois());
     let pois = registries.entry(dim).or_default();
     let mut nearby: Vec<(BlockPos, PoiKind)> = pois
         .records
@@ -4073,19 +4083,13 @@ fn live_villager_bind_pois(dim: DimId, position: BlockPos, villager: &mut Villag
         dx * dx + dy * dy + dz * dz
     });
     for (pos, kind) in nearby {
-        match kind {
-            PoiKind::JobSite(_) => {
-                if villager.job_site.is_none() {
-                    villager.claim_poi(pois, pos);
-                }
-            }
-            PoiKind::Bed if villager.home.is_none() => {
-                villager.claim_poi(pois, pos);
-            }
-            PoiKind::Bell if villager.meeting_point.is_none() => {
-                villager.claim_poi(pois, pos);
-            }
-            _ => {}
+        let claimed = match kind {
+            PoiKind::JobSite(_) => villager.job_site,
+            PoiKind::Bed => villager.home,
+            PoiKind::Bell => villager.meeting_point,
+        };
+        if claimed.is_none() {
+            villager.claim_poi(pois, pos);
         }
     }
     villager.refresh_pois(pois);
@@ -4111,23 +4115,23 @@ const MAX_LIVE_VILLAGER_REGISTRY_ENTRIES: usize = 4_096;
 
 fn live_villager_family_states() -> &'static LockedMap<i32, VillagerFamilyState> {
     static STATES: Registry<i32, VillagerFamilyState> = OnceLock::new();
-    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+    STATES.get_or_init(Mutex::default)
 }
 
 fn live_zombie_villager_cures() -> &'static LockedMap<i32, ZombieVillagerCure> {
     static CURES: Registry<i32, ZombieVillagerCure> = OnceLock::new();
-    CURES.get_or_init(|| Mutex::new(HashMap::new()))
+    CURES.get_or_init(Mutex::default)
 }
 
 
 fn live_wandering_traders() -> &'static LockedMap<i32, LiveWanderingTrader> {
     static TRADERS: Registry<i32, LiveWanderingTrader> = OnceLock::new();
-    TRADERS.get_or_init(|| Mutex::new(HashMap::new()))
+    TRADERS.get_or_init(Mutex::default)
 }
 
 fn live_zombie_villager_data() -> &'static LockedMap<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> {
     static DATA: Registry<i32, (VillagerProfession, i32, Vec<MerchantOffer>)> = OnceLock::new();
-    DATA.get_or_init(|| Mutex::new(HashMap::new()))
+    DATA.get_or_init(Mutex::default)
 }
 
 fn live_converted_villagers() -> &'static Mutex<HashSet<i32>> {
@@ -4137,7 +4141,7 @@ fn live_converted_villagers() -> &'static Mutex<HashSet<i32>> {
 
 fn live_raid_captains() -> &'static LockedMap<i32, (DimId, BlockPos)> {
     static CAPTAINS: Registry<i32, (DimId, BlockPos)> = OnceLock::new();
-    CAPTAINS.get_or_init(|| Mutex::new(HashMap::new()))
+    CAPTAINS.get_or_init(Mutex::default)
 }
 
 /// Emergency bound for entity-keyed lane registries. Normal lifecycle code
@@ -4153,7 +4157,7 @@ fn evict_live_villager_registry_overflow<V>(map: &mut HashMap<i32, V>) {
 
 fn live_raid_glowing() -> &'static LockedMap<i32, u64> {
     static GLOWING: Registry<i32, u64> = OnceLock::new();
-    GLOWING.get_or_init(|| Mutex::new(HashMap::new()))
+    GLOWING.get_or_init(Mutex::default)
 }
 
 
@@ -4198,96 +4202,107 @@ fn hero_gift_cooldown(roll: u32) -> u32 {
     600 + roll % 6_001
 }
 
-/// Villager schedule work: prune records whose mob died, re-scan POI bindings
-/// on the slow cadence, and advance each villager's activity/restock tick.
-/// Called once per game tick from [`villager_raid_tick`].
-#[cfg_attr(not(test), allow(dead_code))]
-fn live_villager_tick(tick: u64) {
-    let villager_etype = name_to_etype("villager");
-    let live: Vec<(i32, [u8; 16], DimId, BlockPos)> = mobs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|mob| {
-            Some(mob.etype) == villager_etype && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
-        })
-        .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (
-                mob.eid,
-                mob.uuid,
-                mob.dim,
-                (x.floor() as i32, y.floor() as i32, z.floor() as i32),
-            )
-        })
-        .collect();
+fn village_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
+}
 
-    // A villager killed by a zombie zombifies at the difficulty-dependent
-    // vanilla rate. Preserve its profession, XP and offers for the later cure.
-    let zombie_etype = name_to_etype("zombie");
-    let zombie_villager_etype = name_to_etype("zombie_villager");
-    let mob_snapshots: Vec<(i32, i64, DimId, BlockPos, bool)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (mob.eid, mob.etype, mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32), *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
-        }).collect();
-    for &(eid, etype, dim, position, alive) in &mob_snapshots {
-        if alive || Some(etype) != villager_etype || live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner()).contains(&eid) {
-            continue;
-        }
-        live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(eid);
-        let killer_nearby = mob_snapshots.iter().any(|&(_, ztype, zdim, zpos, zalive)| {
-            zalive && Some(ztype) == zombie_etype && zdim == dim && villager_within(zpos, position, 2)
-        });
-        if !killer_nearby {
+fn village_mob_alive(mob: &Mob) -> bool {
+    *village_lock(&mob.hp) > 0.0
+}
+
+fn village_mob_block_pos(mob: &Mob) -> BlockPos {
+    let (x, y, z, ..) = *village_lock(&mob.pos);
+    (x.floor() as i32, y.floor() as i32, z.floor() as i32)
+}
+
+fn with_village_pois<T>(dim: DimId, f: impl FnOnce(&PoiRegistry) -> T) -> T {
+    let registries = village_lock(live_pois());
+    match registries.get(&dim) {
+        Some(pois) => f(pois),
+        None => f(&PoiRegistry::default()),
+    }
+}
+
+type VillagerLocation = (i32, VillageUuid, DimId, BlockPos);
+
+/// Process dead villagers in mob-list order before advancing living brains.
+fn convert_dead_villagers(dead: &[(i32, DimId, BlockPos)], zombies: &[(DimId, BlockPos)]) {
+    let can_spawn = name_to_etype("zombie_villager").is_some();
+    for &(eid, dim, position) in dead {
+        if !village_lock(live_converted_villagers()).insert(eid)
+            || !zombies.iter().any(|&(zdim, zpos)| zdim == dim && villager_within(zpos, position, 2))
+        {
             continue;
         }
         let percent = zombie_villager_conversion_percent(raid_difficulty());
-        if percent == 0 || world_rng::next_below(100) >= u32::from(percent) {
+        if percent == 0 || world_rng::next_below(100) >= u32::from(percent) || !can_spawn {
             continue;
         }
-        let (profession, xp, offers) = live_villagers()
-            .lock().unwrap_or_else(|e| e.into_inner()).get(&eid)
+        let data = village_lock(live_villagers()).get(&eid)
             .map(|villager| (villager.profession, villager.villager_xp, villager.offers.clone()))
-            .unwrap_or((VillagerProfession::None, 0, Vec::new()));
-        if zombie_villager_etype.is_some() {
-            if let Some(zombie) = live_spawn_named(dim, "zombie_villager", (
-                position.0 as f64 + 0.5, position.1 as f64, position.2 as f64 + 0.5, 0.0, 0.0,
-            )) {
-                live_zombie_villager_data().lock().unwrap_or_else(|e| e.into_inner()).insert(zombie.eid, (profession, xp, offers));
-            }
+            .unwrap_or_default();
+        let (x, y, z) = position;
+        if let Some(zombie) = live_spawn_named(dim, "zombie_villager", (
+            f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5, 0.0, 0.0,
+        )) {
+            village_lock(live_zombie_villager_data()).insert(zombie.eid, data);
         }
     }
+}
 
-    let observed_eids: HashSet<i32> = mob_snapshots.iter().map(|&(eid, ..)| eid).collect();
-    {
-        let mut converted = live_converted_villagers().lock().unwrap_or_else(|e| e.into_inner());
-        converted.retain(|eid| observed_eids.contains(eid));
-        if converted.len() > MAX_LIVE_VILLAGER_REGISTRY_ENTRIES {
-            converted.clear();
+fn live_villager_locations() -> Vec<VillagerLocation> {
+    let villager_type = name_to_etype("villager");
+    let mut live = Vec::new();
+    let mut dead = Vec::new();
+    let mobs = village_lock(mobs());
+    for mob in mobs.iter().filter(|mob| Some(mob.etype) == villager_type) {
+        let position = village_mob_block_pos(mob);
+        if village_mob_alive(mob) {
+            live.push((mob.eid, mob.uuid, mob.dim, position));
+        } else {
+            dead.push((mob.eid, mob.dim, position));
         }
     }
+    if dead.is_empty() && village_lock(live_converted_villagers()).is_empty() {
+        return live;
+    }
 
-    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut zombies = Vec::new();
+    if !dead.is_empty() {
+        let zombie_type = name_to_etype("zombie");
+        zombies.extend(mobs.iter()
+            .filter(|mob| Some(mob.etype) == zombie_type && village_mob_alive(mob))
+            .map(|mob| (mob.dim, village_mob_block_pos(mob))));
+    }
+    let observed_eids: HashSet<_> = mobs.iter().map(|mob| mob.eid).collect();
+    drop(mobs);
+    convert_dead_villagers(&dead, &zombies);
+    let mut converted = village_lock(live_converted_villagers());
+    converted.retain(|eid| observed_eids.contains(eid));
+    if converted.len() > MAX_LIVE_VILLAGER_REGISTRY_ENTRIES {
+        converted.clear();
+    }
+    live
+}
+
+/// Reconcile POI claims before advancing villager schedules and restocks.
+fn live_villager_tick(tick: u64) {
+    let live = live_villager_locations();
+    let mut villagers = village_lock(live_villagers());
+    if live.is_empty() && villagers.is_empty() {
+        return;
+    }
     let live_eids: HashSet<i32> = live.iter().map(|&(eid, ..)| eid).collect();
     // A removed or dead villager releases its POI claims before its record
     // goes; without this a village stays claimed by ghosts.
-    let retired_eids: Vec<i32> = villagers
-        .keys()
-        .filter(|eid| !live_eids.contains(*eid))
-        .copied()
-        .collect();
-    if !retired_eids.is_empty() {
-        let mut registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-        for eid in retired_eids {
-            let Some(mut villager) = villagers.remove(&eid) else {
-                continue;
-            };
-            for pois in registries.values_mut() {
-                villager.release_pois(pois);
-            }
+    let mut registries = None;
+    for (_, mut villager) in villagers.extract_if(|eid, _| !live_eids.contains(eid)) {
+        let registries = registries.get_or_insert_with(|| village_lock(live_pois()));
+        for pois in registries.values_mut() {
+            villager.release_pois(pois);
         }
     }
+    drop(registries);
     if live.is_empty() {
         return;
     }
@@ -4295,7 +4310,7 @@ fn live_villager_tick(tick: u64) {
     let rescan = tick.is_multiple_of(server_ticks(LIVE_POI_RESCAN_GT));
     let clients = client_snapshot();
     let hero_effect = live_effect_id("hero_of_the_village");
-    let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
+    let mut family = village_lock(live_villager_family_states());
     family.retain(|eid, _| live_eids.contains(eid));
     let mut farmer_jobs = Vec::new();
     for &(eid, uuid, dim, position) in &live {
@@ -4305,64 +4320,33 @@ fn live_villager_tick(tick: u64) {
         if rescan {
             live_villager_bind_pois(dim, position, villager);
         }
-        let state = family.entry(eid).or_insert(VillagerFamilyState { age_ticks: 0, food_points: 0, gift_cooldown: 0 });
+        let state = family.entry(eid).or_default();
         let baby = if state.age_ticks < 0 {
             let (age, baby) = villager_baby_age_tick(state.age_ticks);
             state.age_ticks = age;
             baby
         } else { false };
-        let panicking = saved_raids().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(rdim, raid)| {
+        let panicking = village_lock(saved_raids()).iter().any(|(rdim, raid)| {
             *rdim == dim && raid.state == RaidState::InProgress && villager_within(position, raid.center, 64)
         });
+        let (activity, _) = with_village_pois(dim, |pois| {
+            villager.tick_brain(pois, position, world_time, baby, panicking)
+        });
+        if activity == VillagerActivity::Work
+            && villager.profession == VillagerProfession::Farmer
         {
-            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-            let empty = PoiRegistry::default();
-            let pois = registries.get(&dim).unwrap_or(&empty);
-            let (activity, _) = villager.tick_brain(pois, position, world_time, baby, panicking);
-            if activity == VillagerActivity::Work
-                && villager.profession == VillagerProfession::Farmer
-            {
-                if let Some(site) = villager.job_site {
-                    farmer_jobs.push((eid, dim, position, site));
-                }
+            if let Some(site) = villager.job_site {
+                farmer_jobs.push((eid, dim, position, site));
             }
-
-            state.gift_cooldown = state.gift_cooldown.saturating_sub(1);
-            if state.gift_cooldown == 0
-                && !matches!(activity, VillagerActivity::Rest | VillagerActivity::Panic)
-                && hero_effect.is_some()
-            {
-                let hero = clients.iter().filter(|client| !client.is_spectator()).find(|client| {
-                    let (cdim, x, y, z, ..) = client_dim_pos(client);
-                    if cdim != dim {
-                        return false;
-                    }
-                    let close = (x - position.0 as f64).powi(2)
-                        + (y - position.1 as f64).powi(2)
-                        + (z - position.2 as f64).powi(2) <= 25.0;
-                    close && client.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|eff| Some(eff.id) == hero_effect)
-                });
-                if let Some(hero) = hero {
-                    let roll = world_rng::next_below(u32::MAX);
-                    if let Some(item_name) = hero_gift_item(villager.profession, baby, roll) {
-                        if let Some(item) = name_to_item(item_name) {
-                            drop_spawn_in_dim(dim, DropSpawn {
-                                x: position.0 as f64 + 0.5,
-                                y: position.1 as f64 + 1.0,
-                                z: position.2 as f64 + 0.5,
-                                item,
-                                cnt: 1,
-                                comps: Vec::new(),
-                                age: 0,
-                                target: Some(hero.uuid),
-                                thrower: Some(uuid),
-                            });
-                            state.gift_cooldown = hero_gift_cooldown(roll);
-                        }
-                    } else {
-                        state.gift_cooldown = hero_gift_cooldown(roll);
-                    }
-                }
+        }
+        state.gift_cooldown = state.gift_cooldown.saturating_sub(1);
+        if state.gift_cooldown == 0
+            && !matches!(activity, VillagerActivity::Rest | VillagerActivity::Panic)
+        {
+            if let Some(effect) = hero_effect {
+                state.gift_cooldown = live_villager_hero_gift(
+                    &clients, effect, (eid, uuid, dim, position), villager.profession, baby,
+                );
             }
         }
     }
@@ -4371,12 +4355,11 @@ fn live_villager_tick(tick: u64) {
     // visiting the villager registry.
     drop(family);
     drop(villagers);
-    if gamerule_live_value("mobGriefing") != 0 {
+    if !farmer_jobs.is_empty() && gamerule_live_value("mobGriefing") != 0 {
         if let Some(reg) = breg() {
             for (eid, dim, position, site) in farmer_jobs {
                 if let Some(points) = farmer_harvest_replant_nearby_crop(reg, dim, position, site) {
-                    if let Some(state) = live_villager_family_states()
-                        .lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid)
+                    if let Some(state) = village_lock(live_villager_family_states()).get_mut(&eid)
                     {
                         state.food_points = (state.food_points + points).min(24);
                     }
@@ -4386,89 +4369,118 @@ fn live_villager_tick(tick: u64) {
         }
     }
 
-    // Food sharing and breeding run on the vanilla once-per-second brain tick.
-    if tick.is_multiple_of(20) {
-        let mut breeding = Vec::new();
-        let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
-        for i in 0..live.len() {
-            for j in i + 1..live.len() {
-                let (aeid, _, adim, apos) = live[i];
-                let (beid, _, bdim, bpos) = live[j];
-                if adim != bdim || !villager_within(apos, bpos, 3) { continue; }
-                let (af, bf) = match (family.get(&aeid).copied(), family.get(&beid).copied()) {
-                    (Some(a), Some(b)) if a.age_ticks >= 0 && b.age_ticks >= 0 => (a, b),
-                    _ => continue,
-                };
-                let (donor, recipient, donor_eid, recipient_eid) = if af.food_points >= bf.food_points {
-                    (af, bf, aeid, beid)
-                } else { (bf, af, beid, aeid) };
-                let (donor_points, recipient_points, shared) = villager_share_food(donor.food_points, recipient.food_points);
-                if shared {
-                    family.get_mut(&donor_eid).unwrap().food_points = donor_points;
-                    family.get_mut(&recipient_eid).unwrap().food_points = recipient_points;
-                }
-                let willing = [aeid, beid].into_iter()
-                    .all(|eid| villager_willing(family[&eid].food_points));
-                if !willing { continue; }
-                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-                if !registries.get(&adim).is_some_and(|pois| villager_can_breed(pois, apos, 48, 2)) {
-                    continue;
-                }
-                breeding.push((aeid, beid, adim, apos, bpos));
-                break;
+    if tick.is_multiple_of(20) && live.len() >= 2 {
+        live_villager_breeding(&live);
+    }
+}
+
+fn live_villager_hero_gift(
+    clients: &[Arc<Client>],
+    effect: i32,
+    (_, uuid, dim, position): VillagerLocation,
+    profession: VillagerProfession,
+    baby: bool,
+) -> u32 {
+    let hero = clients.iter().filter(|client| !client.is_spectator()).find(|client| {
+        let (cdim, x, y, z, ..) = client_dim_pos(client);
+        cdim == dim && (x - f64::from(position.0)).powi(2)
+            + (y - f64::from(position.1)).powi(2)
+            + (z - f64::from(position.2)).powi(2) <= 25.0
+            && village_lock(&client.effs).iter().any(|eff| eff.id == effect)
+    });
+    let Some(hero) = hero else { return 0 };
+    let roll = world_rng::next_below(u32::MAX);
+    if let Some(name) = hero_gift_item(profession, baby, roll) {
+        let Some(item) = name_to_item(name) else { return 0 };
+        drop_spawn_in_dim(dim, DropSpawn {
+            x: f64::from(position.0) + 0.5,
+            y: f64::from(position.1) + 1.0,
+            z: f64::from(position.2) + 0.5,
+            item, cnt: 1, comps: Vec::new(), age: 0,
+            target: Some(hero.uuid),
+            thrower: Some(uuid),
+        });
+    }
+    hero_gift_cooldown(roll)
+}
+
+/// Food sharing and breeding run on the once-per-second brain tick.
+fn live_villager_breeding(live: &[VillagerLocation]) {
+    let mut breeding = Vec::new();
+    let mut family = village_lock(live_villager_family_states());
+    for (i, &(aeid, _, adim, apos)) in live.iter().enumerate() {
+        for &(beid, _, bdim, bpos) in &live[i + 1..] {
+            if adim != bdim || !villager_within(apos, bpos, 3) { continue; }
+            let (af, bf) = match (family.get(&aeid).copied(), family.get(&beid).copied()) {
+                (Some(a), Some(b)) if a.age_ticks >= 0 && b.age_ticks >= 0 => (a, b),
+                _ => continue,
+            };
+            let (donor, recipient, donor_eid, recipient_eid) = if af.food_points >= bf.food_points {
+                (af, bf, aeid, beid)
+            } else { (bf, af, beid, aeid) };
+            let (donor_points, recipient_points, shared) = villager_share_food(donor.food_points, recipient.food_points);
+            if shared {
+                family.get_mut(&donor_eid).unwrap().food_points = donor_points;
+                family.get_mut(&recipient_eid).unwrap().food_points = recipient_points;
             }
+            let willing = [aeid, beid].into_iter()
+                .all(|eid| villager_willing(family[&eid].food_points));
+            if !willing { continue; }
+            let registries = village_lock(live_pois());
+            if !registries.get(&adim).is_some_and(|pois| villager_can_breed(pois, apos, 48, 2)) {
+                continue;
+            }
+            breeding.push((aeid, beid, adim, apos, bpos));
+            break;
         }
-        drop(family);
-        for (aeid, beid, dim, apos, bpos) in breeding {
-            with_save_guard(|| {
-                let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
-                if ![aeid, beid].into_iter().all(|eid| family.get(&eid)
-                    .is_some_and(|state| villager_willing(state.food_points)))
-                {
-                    return;
-                }
-                let both_alive = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
-                    .filter(|mob| [aeid, beid].contains(&mob.eid)
-                        && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
-                    .count() == 2;
-                if !both_alive {
-                    return;
-                }
-                if let Some(child) = live_spawn_named(dim, "villager", (
-                    (f64::from(apos.0) + f64::from(bpos.0)) / 2.0 + 0.5,
-                    f64::from(apos.1),
-                    (f64::from(apos.2) + f64::from(bpos.2)) / 2.0 + 0.5,
-                    0.0, 0.0,
-                )) {
-                    family.insert(child.eid, VillagerFamilyState {
-                        age_ticks: -VILLAGER_BABY_GROWTH_TICKS,
-                        ..VillagerFamilyState::default()
-                    });
-                    for parent in [aeid, beid] {
-                        if let Some(state) = family.get_mut(&parent) {
-                            state.food_points = 0;
-                        }
+    }
+    drop(family);
+    for (aeid, beid, dim, apos, bpos) in breeding {
+        with_save_guard(|| {
+            let mut family = village_lock(live_villager_family_states());
+            if ![aeid, beid].into_iter().all(|eid| family.get(&eid)
+                .is_some_and(|state| villager_willing(state.food_points)))
+            {
+                return;
+            }
+            let both_alive = village_lock(mobs()).iter()
+                .filter(|mob| [aeid, beid].contains(&mob.eid)
+                    && village_mob_alive(mob))
+                .count() == 2;
+            if !both_alive {
+                return;
+            }
+            if let Some(child) = live_spawn_named(dim, "villager", (
+                (f64::from(apos.0) + f64::from(bpos.0)) / 2.0 + 0.5,
+                f64::from(apos.1),
+                (f64::from(apos.2) + f64::from(bpos.2)) / 2.0 + 0.5,
+                0.0, 0.0,
+            )) {
+                family.insert(child.eid, VillagerFamilyState {
+                    age_ticks: -VILLAGER_BABY_GROWTH_TICKS,
+                    ..VillagerFamilyState::default()
+                });
+                for parent in [aeid, beid] {
+                    if let Some(state) = family.get_mut(&parent) {
+                        state.food_points = 0;
                     }
                 }
-            });
-        }
+            }
+        });
     }
 }
 
 /// Advance zombie-villager curing timers. Completion respawns the villager,
 /// restores profession/XP/offers, and records the curer gossip discount.
 fn live_zombie_villager_cure_tick() {
-    let mut cures = live_zombie_villager_cures().lock().unwrap_or_else(|e| e.into_inner());
+    let mut cures = village_lock(live_zombie_villager_cures());
     if cures.is_empty() { return; }
-    let positions: HashMap<i32, (DimId, BlockPos)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .map(|mob| {
-            let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-            (mob.eid, (mob.dim, (x.floor() as i32, y.floor() as i32, z.floor() as i32)))
-        }).collect();
+    let positions: HashMap<_, _> = village_lock(mobs()).iter()
+        .map(|mob| (mob.eid, (mob.dim, village_mob_block_pos(mob)))).collect();
     evict_live_villager_registry_overflow(&mut cures);
     cures.retain(|eid, _| positions.contains_key(eid));
     {
-        let mut data = live_zombie_villager_data().lock().unwrap_or_else(|e| e.into_inner());
+        let mut data = village_lock(live_zombie_villager_data());
         evict_live_villager_registry_overflow(&mut data);
         data.retain(|eid, _| positions.contains_key(eid));
     }
@@ -4492,7 +4504,7 @@ fn live_zombie_villager_cure_tick() {
     for (eid, dim, pos) in finished {
         let Some(cure) = cures.remove(&eid) else { continue };
         let (curer, profession, xp, offers) = cure.finish();
-        if let Some(zombie) = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid) {
+        if let Some(zombie) = village_lock(mobs()).iter().find(|mob| mob.eid == eid) {
             *zombie.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         }
         if let Some(mob) = live_spawn_named(dim, "villager", (
@@ -4502,7 +4514,7 @@ fn live_zombie_villager_cure_tick() {
             villager.villager_xp = xp;
             villager.offers = offers;
             villager.gossip.cure(curer);
-            live_villagers().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, villager);
+            village_lock(live_villagers()).insert(mob.eid, villager);
         }
     }
 }
@@ -4553,21 +4565,49 @@ fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u
     }
 }
 
-/// Harvest one mature crop near a farmer's composter and replant it at age
-/// zero. The return value is abstract villager food points: wheat is treated
-/// as bread after the farmer's vanilla crafting step.
-fn farmer_crop_food_points(name: &str) -> i32 {
-    match name.strip_prefix("minecraft:").unwrap_or(name) {
-        "wheat" => villager_food_points(1, 0, 0, 0),
-        "carrots" => villager_food_points(0, 2, 0, 0),
-        "potatoes" => villager_food_points(0, 0, 2, 0),
-        "beetroots" => villager_food_points(0, 0, 0, 1),
-        _ => 0,
+/// Crop maturity and food gained after harvesting (and crafting wheat into bread).
+fn farmer_crop(name: &str) -> Option<(u8, i32)> {
+    match name {
+        "minecraft:wheat" => Some((7, villager_food_points(1, 0, 0, 0))),
+        "minecraft:carrots" | "minecraft:potatoes" => Some((7, 2)),
+        "minecraft:beetroots" => Some((3, 1)),
+        _ => None,
     }
 }
 
-fn farmer_crop_max_age(name: &str) -> u8 {
-    if name.strip_prefix("minecraft:").unwrap_or(name) == "beetroots" { 3 } else { 7 }
+/// Update the first eligible crop in composter search order. Retry the next
+/// crop if the block changed between the read and the attempted write.
+fn farmer_update_crop(
+    reg: &crate::block_registry::BReg,
+    dim: DimId,
+    site: BlockPos,
+    in_reach: impl Fn(BlockPos) -> bool,
+    new_age: impl Fn(u8, u8) -> Option<&'static str>,
+) -> Option<i32> {
+    for dy in -1..=1 {
+        for dx in -2..=2 {
+            for dz in -2..=2 {
+                let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
+                if !in_reach(pos) {
+                    continue;
+                }
+                let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+                let Some((max_age, food)) = farmer_crop(reg.name_of(state)) else {
+                    continue;
+                };
+                let age = reg.get_prop(state, "age").and_then(|value| value.parse().ok()).unwrap_or(0);
+                let Some(age) = new_age(age, max_age) else {
+                    continue;
+                };
+                let updated = reg.with_prop(state, "age", age);
+                if set_block_if_dim(dim, pos.0, pos.1, pos.2, updated, Some(state)) {
+                    note_block_update_dim(dim, pos.0, pos.1, pos.2, updated);
+                    return Some(food);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn farmer_harvest_replant_nearby_crop(
@@ -4576,71 +4616,18 @@ fn farmer_harvest_replant_nearby_crop(
     position: BlockPos,
     site: BlockPos,
 ) -> Option<i32> {
-    for dy in -1..=1 {
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
-                if !villager_within(position, pos, 2) {
-                    continue;
-                }
-                let st = block_at_dim(dim, pos.0, pos.1, pos.2);
-                let name = reg.name_of(st);
-                if !matches!(name, "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots") {
-                    continue;
-                }
-                let age: u8 = reg.get_prop(st, "age").and_then(|value| value.parse().ok()).unwrap_or(0);
-                if age < farmer_crop_max_age(name) {
-                    continue;
-                }
-                let replanted = reg.with_prop(st, "age", "0");
-                if set_block_if_dim(dim, pos.0, pos.1, pos.2, replanted, Some(st)) {
-                    note_block_update_dim(dim, pos.0, pos.1, pos.2, replanted);
-                    return Some(farmer_crop_food_points(name));
-                }
-            }
-        }
-    }
-    None
+    farmer_update_crop(
+        reg, dim, site, |pos| villager_within(position, pos, 2),
+        |age, max_age| (age >= max_age).then_some("0"),
+    )
 }
 
-/// The farmer spends the harvested bone meal on the first growing crop within
-/// reach of the composter — the vanilla `UseBonemeal` arm of the farming task.
-#[cfg_attr(not(test), allow(dead_code))]
-fn farmer_bonemeal_nearby_crop(
-    reg: &crate::block_registry::BReg,
-    dim: DimId,
-    site: BlockPos,
-) {
-    for dy in -1..=1 {
-        for dx in -2..=2 {
-            for dz in -2..=2 {
-                let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
-                let st = block_at_dim(dim, pos.0, pos.1, pos.2);
-                if !matches!(
-                    reg.name_of(st),
-                    "minecraft:wheat"
-                        | "minecraft:carrots"
-                        | "minecraft:potatoes"
-                        | "minecraft:beetroots"
-                ) {
-                    continue;
-                }
-                let age: u8 = reg
-                    .get_prop(st, "age")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let max_age = farmer_crop_max_age(reg.name_of(st));
-                if age >= max_age {
-                    continue;
-                }
-                let grown = reg.with_prop(st, "age", &(age + 2).min(max_age).to_string());
-                if set_block_if_dim(dim, pos.0, pos.1, pos.2, grown, Some(st)) {
-                    note_block_update_dim(dim, pos.0, pos.1, pos.2, grown);
-                    return;
-                }
-            }
-        }
-    }
+/// Spend the harvested bone meal on the first growing crop near the composter.
+fn farmer_bonemeal_nearby_crop(reg: &crate::block_registry::BReg, dim: DimId, site: BlockPos) {
+    const AGES: [&str; 8] = ["0", "1", "2", "3", "4", "5", "6", "7"];
+    farmer_update_crop(reg, dim, site, |_| true, |age, max_age| {
+        (age < max_age).then(|| AGES[usize::from((age + 2).min(max_age))])
+    });
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4701,7 +4688,7 @@ fn live_raid_omen_tick() {
     let bad_omen = live_effect_id("bad_omen");
     let raid_omen = live_effect_id("raid_omen");
     let difficulty = raid_difficulty();
-    let mut omens = live_raid_omens().lock().unwrap_or_else(|e| e.into_inner());
+    let mut omens = village_lock(live_raid_omens());
     for client in clients.iter().filter(|client| !client.is_spectator()) {
         let (dim, x, y, z, ..) = client_dim_pos(client);
         let position = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
@@ -4713,33 +4700,31 @@ fn live_raid_omen_tick() {
             });
             if !effect_active {
                 omens.remove(&client.uuid);
-                live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner()).remove(&client.uuid);
+                village_lock(live_raid_omen_origins()).remove(&client.uuid);
                 continue;
             }
             if !omen.tick() {
                 continue;
             }
             let mut omen = Some(*omen);
-            let (origin_dim, origin_pos) = live_raid_omen_origins()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            let (origin_dim, origin_pos) = village_lock(live_raid_omen_origins())
                 .get(&client.uuid)
                 .copied()
                 .unwrap_or((dim, position));
             let raid = {
-                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+                let registries = village_lock(live_pois());
                 registries.get(&origin_dim).and_then(|pois| {
                     Raid::try_start(pois, origin_pos, client.uuid, &mut omen, difficulty)
                 })
             };
             omens.remove(&client.uuid);
-            live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner()).remove(&client.uuid);
+            village_lock(live_raid_omen_origins()).remove(&client.uuid);
             if let Some(raid_omen) = raid_omen {
                 live_remove_effect(client, raid_omen);
             }
             if let Some(raid) = raid {
                 live_raid_bossbar_write(origin_dim, raid.center, 0, 0, &clients);
-                saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((origin_dim, raid));
+                village_lock(saved_raids()).push((origin_dim, raid));
             }
             continue;
         }
@@ -4753,7 +4738,7 @@ fn live_raid_omen_tick() {
             continue;
         };
         let in_village = {
-            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+            let registries = village_lock(live_pois());
             registries.get(&dim).is_some_and(|pois| {
                 pois.claimed_near(position)
                     .any(|(_, kind)| matches!(kind, PoiKind::Bed | PoiKind::Bell))
@@ -4771,7 +4756,7 @@ fn live_raid_omen_tick() {
             }
             .enter_village(),
         );
-        let mut origins = live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner());
+        let mut origins = village_lock(live_raid_omen_origins());
         if origins.len() >= MAX_RAID_OMEN_ORIGINS && !origins.contains_key(&client.uuid) {
             if let Some(stale) = origins.keys().next().copied() {
                 origins.remove(&stale);
@@ -4845,9 +4830,7 @@ fn live_raid_bossbar_write(
         }
         return;
     }
-    let total = live_raid_wave_totals()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let total = village_lock(live_raid_wave_totals())
         .get(&(dim, center))
         .copied()
         .unwrap_or(1)
@@ -4953,7 +4936,7 @@ fn live_raid_spawn_wave(
         };
         let yaw = world_rng::next_below(360) as f32;
         let spawned = with_save_guard(|| {
-            let mut current = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut current = village_lock(mobs());
             if current.len() >= MOB_CAP {
                 return None;
             }
@@ -4975,17 +4958,13 @@ fn live_raid_spawn_wave(
             roster.insert(raider_id, (mob.uuid, wave.captain == Some(raider_id)));
             if !captain_spawned && matches!(kind, RaiderType::Vindicator | RaiderType::Evoker | RaiderType::Pillager) {
                 captain_spawned = true;
-                live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, (dim, center));
+                village_lock(live_raid_captains()).insert(mob.eid, (dim, center));
             }
-            live_raid_mobs()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            village_lock(live_raid_mobs())
                 .insert(mob.eid, (dim, center, raider_id));
         }
     }
-    live_raid_wave_totals()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    village_lock(live_raid_wave_totals())
         .insert((dim, center), remaining.len() as i32);
     (remaining, roster, first_raider_eid)
 }
@@ -5006,9 +4985,7 @@ fn bell_glowing_range_contains(bell: BlockPos, pos: BlockPos) -> bool {
 /// glowing aura.
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
-    let positions: Vec<BlockPos> = live_pois()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let positions: Vec<BlockPos> = village_lock(live_pois())
         .get(&dim)
         .map(|pois| {
             pois.records
@@ -5037,17 +5014,15 @@ fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_apply_bell_glowing(dim: DimId, bell: BlockPos, tick: u64) {
-    let raiders: Vec<i32> = live_raid_mobs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let raiders: Vec<i32> = village_lock(live_raid_mobs())
         .iter()
         .filter_map(|(&eid, &(rdim, _, _))| (rdim == dim).then_some(eid))
         .collect();
     if raiders.is_empty() {
         return;
     }
-    let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
-    let mut glowing = live_raid_glowing().lock().unwrap_or_else(|e| e.into_inner());
+    let mob_list = village_lock(mobs());
+    let mut glowing = village_lock(live_raid_glowing());
     for eid in raiders {
         let in_range = mob_list.iter().find(|mob| mob.eid == eid).is_some_and(|mob| {
             let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -5089,22 +5064,13 @@ fn live_raid_nearest_player(
 #[cfg_attr(not(test), allow(dead_code))]
 fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
     let villager_etype = name_to_etype("villager");
-    mobs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    village_lock(mobs())
         .iter()
         .filter(|mob| {
             mob.dim == dim
                 && Some(mob.etype) == villager_etype
-                && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
-                && {
-                    let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    villager_within(
-                        (x.floor() as i32, y.floor() as i32, z.floor() as i32),
-                        center,
-                        64,
-                    )
-                }
+                && village_mob_alive(mob)
+                && villager_within(village_mob_block_pos(mob), center, 64)
         })
         .count()
 }
@@ -5114,27 +5080,25 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
 /// bossbar mirroring the raid.
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_step() {
-    let clients = client_snapshot();
-    let raid_dims: HashSet<DimId> = saved_raids().lock().unwrap_or_else(|e| e.into_inner())
-        .iter().map(|(dim, _)| *dim).collect();
-    if raid_dims.is_empty() {
-        live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let raid_dims = {
+        let raids = village_lock(saved_raids());
+        (!raids.is_empty()).then(|| raids.iter().map(|(dim, _)| *dim).collect::<HashSet<_>>())
+    };
+    if raid_dims.is_none() {
+        village_lock(live_raid_mobs()).clear();
+        village_lock(live_raid_captains()).clear();
+        village_lock(live_raid_wave_totals()).clear();
     }
     let now = TICK.load(Ordering::Relaxed);
     {
-        let mut glowing = live_raid_glowing().lock().unwrap_or_else(|e| e.into_inner());
+        let mut glowing = village_lock(live_raid_glowing());
         evict_live_villager_registry_overflow(&mut glowing);
-        let expired: Vec<i32> = glowing.iter().filter_map(|(&eid, &until)| (until <= now).then_some(eid)).collect();
-        for eid in &expired {
-            glowing.remove(eid);
-            broadcast_seen(*eid, |_| (0x58, live_mob_metadata(*eid, 0, 0, 0)));
+        for (eid, _) in glowing.extract_if(|_, until| *until <= now) {
+            broadcast_seen(eid, |_| (0x58, live_mob_metadata(eid, 0, 0, 0)));
         }
     }
-    if raid_dims.is_empty() {
-        return;
-    }
+    let Some(raid_dims) = raid_dims else { return };
+    let clients = client_snapshot();
     for dim in raid_dims {
         for bell in live_consume_powered_bells(dim) {
             live_apply_bell_glowing(dim, bell, now);
@@ -5144,8 +5108,8 @@ fn live_raid_step() {
     // the closest player inside 64 blocks is recorded as the killer.
     let mut defeated = Vec::new();
     {
-        let tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        let tracked = village_lock(live_raid_mobs());
+        let mob_list = village_lock(mobs());
         for (&eid, &(dim, center, raider)) in tracked.iter() {
             let mob = mob_list.iter().find(|mob| mob.eid == eid);
             let dead = mob.is_none_or(|mob| *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0);
@@ -5161,15 +5125,15 @@ fn live_raid_step() {
     // Keep the raid advance and its actual mobs in the same save transaction,
     // but release the raid registry before any spawn or network update.
     let (events, horns, ended) = with_save_guard(|| {
-        let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+        let mut raids = village_lock(saved_raids());
         let mut events = Vec::new();
         if !defeated.is_empty() {
-            let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracked = village_lock(live_raid_mobs());
             for (eid, dim, center, raider, killer) in defeated {
                 tracked.remove(&eid);
-                if live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid).is_some() {
+                if village_lock(live_raid_captains()).remove(&eid).is_some() {
                     if let Some(banner) = name_to_item("ominous_banner") {
-                        let pos = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid)
+                        let pos = village_lock(mobs()).iter().find(|mob| mob.eid == eid)
                             .map(|mob| *mob.pos.lock().unwrap_or_else(|e| e.into_inner()));
                         if let Some((x, y, z, ..)) = pos {
                             drop_spawn_in_dim(dim, DropSpawn {
@@ -5190,24 +5154,18 @@ fn live_raid_step() {
             // A raid restored from save_v2 has its roster but not the volatile
             // wave-start denominator. Rebuild it once from the wave table so
             // the bossbar drains against the original total rather than 1.
-            let wave_total = if raid.waves_spawned > 0 {
-                let row = usize::from(raid.waves_spawned.min(raid.regular_waves).saturating_sub(1));
-                RAID_BASE_WAVES.get(row).map(|counts| counts.iter().map(|&n| i32::from(n)).sum::<i32>()).unwrap_or(1)
-            } else {
-                raid.remaining.len().max(1) as i32
-            };
-            live_raid_wave_totals()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry((*dim, raid.center))
-                .or_insert(wave_total.max(1));
+            village_lock(live_raid_wave_totals()).entry((*dim, raid.center)).or_insert_with(|| {
+                let total = if raid.waves_spawned > 0 {
+                    let row = raid.waves_spawned.min(raid.regular_waves).saturating_sub(1);
+                    RAID_BASE_WAVES.get(usize::from(row))
+                        .map_or(1, |counts| counts.iter().copied().map(i32::from).sum())
+                } else {
+                    raid.remaining.len() as i32
+                };
+                total.max(1)
+            });
             let living = living_villagers_near(*dim, raid.center);
-            let event = {
-                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-                let empty = PoiRegistry::default();
-                let pois = registries.get(dim).unwrap_or(&empty);
-                raid.tick(pois, living)
-            };
+            let event = with_village_pois(*dim, |pois| raid.tick(pois, living));
             if raid.state != RaidState::Stopped {
                 events.push((*dim, raid.center, raid.regular_waves, raid.remaining.len() as i32, event));
             }
@@ -5218,9 +5176,9 @@ fn live_raid_step() {
             .map(|(dim, raid)| (*dim, raid.center))
             .collect();
         if !ended.is_empty() {
-            let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
-            let mut totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
-            let mut captains = live_raid_captains().lock().unwrap_or_else(|e| e.into_inner());
+            let mut tracked = village_lock(live_raid_mobs());
+            let mut totals = village_lock(live_raid_wave_totals());
+            let mut captains = village_lock(live_raid_captains());
             for (dim, center) in &ended {
                 captains.retain(|_, raid| *raid != (*dim, *center));
                 tracked.retain(|_, (d, c, _)| !(*d == *dim && *c == *center));
@@ -5236,7 +5194,7 @@ fn live_raid_step() {
             };
             let (remaining, roster, horn) = live_raid_spawn_wave(*dim, *center, *regular_waves, *wave);
             *count = remaining.len() as i32;
-            let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+            let mut raids = village_lock(saved_raids());
             if let Some((_, raid)) = raids.iter_mut().find(|(d, raid)| {
                 *d == *dim && raid.center == *center && raid.waves_spawned == wave.number
             }) {
@@ -5270,7 +5228,7 @@ fn live_raid_step() {
                     .and_then(|uuid| clients.iter().find(|client| client.uuid == *uuid))
                     .map(|client| client.eid)
                     .unwrap_or(0);
-                let positions: Vec<(f64, f64, f64)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+                let positions: Vec<(f64, f64, f64)> = village_lock(mobs()).iter()
                     .filter(|mob| mob.dim == dim && Some(mob.etype) == villager_etype)
                     .filter_map(|mob| {
                         let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -7597,7 +7555,7 @@ mod villager_raid_tests {
                 VillagerLevel::Novice, VillagerLevel::Apprentice, VillagerLevel::Journeyman,
                 VillagerLevel::Expert, VillagerLevel::Master,
             ] {
-                assert!(!vanilla_trade_pool(profession, level).is_empty(), "{profession:?} {level:?}");
+                assert!(vanilla_trade_pool(profession, level).iter().any(|pool| !pool.is_empty()), "{profession:?} {level:?}");
             }
         }
         let novice = instantiate_trade_pool(VillagerProfession::Librarian, VillagerLevel::Novice, || 0);
@@ -7608,8 +7566,8 @@ mod villager_raid_tests {
         assert_eq!(master[0].cost_a.count, 18); // base 13 + minimum enchantment roll 5
         assert_eq!(wandering_trader_despawn_tick(WANDERING_TRADER_DESPAWN_TICKS), (47_999, false));
         assert_eq!(wandering_trader_despawn_tick(1), (0, true));
-        assert_eq!(wandering_trader_pool(false).len(), 64);
-        assert_eq!(wandering_trader_pool(true).len(), 6);
+        assert_eq!(WANDERING_TRADER_COMMON.iter().map(|pool| pool.len()).sum::<usize>(), 64);
+        assert_eq!(WANDERING_TRADER_RARE.len(), 6);
     }
 
     #[test]
@@ -7627,13 +7585,11 @@ mod villager_raid_tests {
 
     #[test]
     fn farmer_crop_harvest_and_replant_model_follows_vanilla_food_points() {
-        assert_eq!(farmer_crop_max_age("minecraft:wheat"), 7);
-        assert_eq!(farmer_crop_max_age("minecraft:beetroots"), 3);
-        assert_eq!(farmer_crop_food_points("minecraft:wheat"), 4);
-        assert_eq!(farmer_crop_food_points("minecraft:carrots"), 2);
-        assert_eq!(farmer_crop_food_points("minecraft:potatoes"), 2);
-        assert_eq!(farmer_crop_food_points("minecraft:beetroots"), 1);
-        assert_eq!(farmer_crop_food_points("minecraft:oak_log"), 0);
+        assert_eq!(farmer_crop("minecraft:wheat"), Some((7, 4)));
+        assert_eq!(farmer_crop("minecraft:carrots"), Some((7, 2)));
+        assert_eq!(farmer_crop("minecraft:potatoes"), Some((7, 2)));
+        assert_eq!(farmer_crop("minecraft:beetroots"), Some((3, 1)));
+        assert_eq!(farmer_crop("other:wheat"), None);
     }
 
     #[test]
@@ -7741,9 +7697,11 @@ mod villager_raid_tests {
             villager_raid_tick();
         }
         let first_wave: Vec<i32> = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
-        assert!(
-            !first_wave.is_empty(),
-            "the first raid wave should spawn live raider mobs"
+        assert!(!first_wave.is_empty(), "the first wave should spawn live raiders");
+        assert_eq!(
+            village_lock(live_raid_wave_totals()).values().copied().next(),
+            Some(first_wave.len() as i32),
+            "the bossbar total should include every spawned raider"
         );
         {
             let mob_list = mobs().lock().unwrap_or_else(|e| e.into_inner());
@@ -8128,9 +8086,7 @@ const VILLAGER_LOD_THREAT_RADIUS: u16 = 12;
 #[cfg_attr(not(test), allow(dead_code))]
 fn is_villager_lod_threat(etype_name: &str) -> bool {
     matches!(
-        etype_name
-            .strip_prefix("minecraft:")
-            .unwrap_or(etype_name),
+        villager_raid_vanilla_name(etype_name),
         "zombie" | "pillager" | "vex" | "ravager"
     )
 }
