@@ -4,18 +4,18 @@
 
 use std::collections::BTreeSet;
 
-use megu_client_ui::mod_menu::{
+use megu_client_ui::mod_manager::{
     active_builtin_qol_overrides, modrinth_project_url, modrinth_version_lookup_url,
-    valid_modrinth_slug, BuiltinQolFeature, BuiltinQolResolution, ModLoaderTag, ModMenuAction,
-    ModMenuEntry, ModMenuFilter, ModMenuHitRegion, ModMenuState, ModMenuWidgetId, QolSubCategory,
+    valid_modrinth_slug, BuiltinQolFeature, BuiltinQolResolution, ModLoaderTag, ModManagerAction,
+    ModManagerEntry, ModManagerFilter, ModManagerHitRegion, ModManagerState, ModManagerWidgetId, QolSubCategory,
     CURATED_MODRINTH_QOL_MODS,
 };
 use megu_client_ui::state::{UiInputEvent, UiKey, UiLang};
 
-fn recommended_ids(state: &mut ModMenuState) -> Vec<String> {
+fn recommended_ids(state: &mut ModManagerState) -> Vec<String> {
     (0..state.visible_indices().len())
         .map(|index| {
-            state.activate(ModMenuWidgetId::ModRow(index));
+            state.activate(ModManagerWidgetId::ModRow(index));
             state
                 .selected_entry()
                 .expect("visible catalog row")
@@ -96,10 +96,10 @@ fn version_lookup_rejects_non_slug_characters() {
 
 #[test]
 fn installed_aliases_yield_to_mods_and_unknown_mods_leave_builtins_active() {
-    use BuiltinQolFeature::{InventorySort, LookingAtHud, MouseTweaksGestures};
+    use BuiltinQolFeature::{InventorySort, LookingAtHud, InventoryDragControls};
 
     let disabled = active_builtin_qol_overrides(&[]);
-    for feature in [LookingAtHud, MouseTweaksGestures, InventorySort] {
+    for feature in [LookingAtHud, InventoryDragControls, InventorySort] {
         assert_eq!(
             disabled.resolution(feature),
             BuiltinQolResolution::UseBuiltin
@@ -110,7 +110,7 @@ fn installed_aliases_yield_to_mods_and_unknown_mods_leave_builtins_active() {
     let active = active_builtin_qol_overrides(&["jade", "mousetweaks", "inventoryprofilesnext"]);
     for (feature, mod_id) in [
         (LookingAtHud, "jade"),
-        (MouseTweaksGestures, "mousetweaks"),
+        (InventoryDragControls, "mousetweaks"),
         (InventorySort, "inventoryprofilesnext"),
     ] {
         assert_eq!(
@@ -162,26 +162,26 @@ fn all_yielding_catalog_mods_and_aliases_are_resolved() {
 #[test]
 fn menu_deference_tracks_enabled_and_staged_changes() {
     use BuiltinQolFeature::LookingAtHud;
-    let mut jade = ModMenuEntry::new("jade", "Jade", "1.0");
+    let mut jade = ModManagerEntry::new("jade", "Jade", "1.0");
     jade.enabled = false;
-    let mut menu = ModMenuState::new(vec![jade]);
+    let mut menu = ModManagerState::new(vec![jade]);
     assert!(menu
         .active_builtin_qol_deference()
         .use_builtin(LookingAtHud));
 
-    menu.activate(ModMenuWidgetId::ToggleEnabled);
+    menu.activate(ModManagerWidgetId::ToggleEnabled);
     assert_eq!(
         menu.active_builtin_qol_deference().resolution(LookingAtHud),
         BuiltinQolResolution::DeferToInstalledMod {
             mod_id: "jade".into(),
         }
     );
-    menu.activate(ModMenuWidgetId::ApplyChanges);
+    menu.activate(ModManagerWidgetId::ApplyChanges);
     assert!(!menu
         .active_builtin_qol_deference()
         .use_builtin(LookingAtHud));
 
-    menu.activate(ModMenuWidgetId::ToggleEnabled);
+    menu.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(menu
         .active_builtin_qol_deference()
         .use_builtin(LookingAtHud));
@@ -189,11 +189,11 @@ fn menu_deference_tracks_enabled_and_staged_changes() {
 
 #[test]
 fn recommended_catalog_is_searchable_and_category_filterable_without_installing() {
-    let mut menu = ModMenuState::new(vec![ModMenuEntry::new("my-mod", "My Mod", "1.0")]);
+    let mut menu = ModManagerState::new(vec![ModManagerEntry::new("my-mod", "My Mod", "1.0")]);
     assert_eq!(menu.entries.len(), 1);
     assert_eq!(menu.visible_indices().len(), 1);
-    menu.activate(ModMenuWidgetId::FilterRecommendedQol);
-    assert_eq!(menu.filter, ModMenuFilter::RecommendedQol);
+    menu.activate(ModManagerWidgetId::FilterRecommendedQol);
+    assert_eq!(menu.filter, ModManagerFilter::RecommendedQol);
     assert_eq!(menu.visible_indices().len(), 15);
 
     for slug in ["jade", "mouse-tweaks", "inventory-profiles-next"] {
@@ -201,7 +201,7 @@ fn recommended_catalog_is_searchable_and_category_filterable_without_installing(
         assert_eq!(recommended_ids(&mut menu), [slug]);
     }
     menu.search.clear();
-    menu.activate(ModMenuWidgetId::QolInventoryInput);
+    menu.activate(ModManagerWidgetId::QolInventoryInput);
     assert_eq!(
         menu.recommended_category,
         Some(QolSubCategory::InventoryInput)
@@ -211,22 +211,22 @@ fn recommended_catalog_is_searchable_and_category_filterable_without_installing(
     assert!(inventory.contains(&"inventory-profiles-next".to_owned()));
     assert!(!inventory.contains(&"jade".to_owned()));
 
-    menu.activate(ModMenuWidgetId::QolRecipes);
+    menu.activate(ModManagerWidgetId::QolRecipes);
     assert_eq!(recommended_ids(&mut menu), ["emi", "jei"]);
-    menu.activate(ModMenuWidgetId::FilterRecommendedQol);
+    menu.activate(ModManagerWidgetId::FilterRecommendedQol);
     assert_eq!(menu.visible_indices().len(), 15);
 
     menu.search = "jade".into();
-    let result = menu.activate(ModMenuWidgetId::InstallRecommended);
+    let result = menu.activate(ModManagerWidgetId::InstallRecommended);
     assert_eq!(
         result,
-        [ModMenuAction::OpenUrl(
+        [ModManagerAction::OpenUrl(
             "https://modrinth.com/mod/jade".into()
         )]
     );
     assert!(!menu.is_dirty());
-    assert!(menu.activate(ModMenuWidgetId::ToggleEnabled).is_empty());
-    menu.activate(ModMenuWidgetId::FilterAll);
+    assert!(menu.activate(ModManagerWidgetId::ToggleEnabled).is_empty());
+    menu.activate(ModManagerWidgetId::FilterAll);
     assert_eq!(menu.entries.len(), 1);
     menu.search.clear();
     assert_eq!(recommended_ids(&mut menu), ["my-mod"]);
@@ -234,21 +234,21 @@ fn recommended_catalog_is_searchable_and_category_filterable_without_installing(
 
 #[test]
 fn recommended_filter_and_install_button_have_visible_hit_regions() {
-    let mut menu = ModMenuState::new(vec![]);
+    let mut menu = ModManagerState::new(vec![]);
     for lang in [UiLang::En, UiLang::Ja] {
         menu.lang = lang;
         let (_, hits) = menu.render(640, 360);
         assert!(hits
             .iter()
-            .any(|hit| hit.id == ModMenuWidgetId::FilterRecommendedQol));
-        menu.activate(ModMenuWidgetId::FilterRecommendedQol);
+            .any(|hit| hit.id == ModManagerWidgetId::FilterRecommendedQol));
+        menu.activate(ModManagerWidgetId::FilterRecommendedQol);
         let (_, hits) = menu.render(640, 360);
         for button in [
-            ModMenuWidgetId::QolHudInfo,
-            ModMenuWidgetId::QolInventoryInput,
-            ModMenuWidgetId::QolRecipes,
-            ModMenuWidgetId::QolVisualsCompat,
-            ModMenuWidgetId::InstallRecommended,
+            ModManagerWidgetId::QolHudInfo,
+            ModManagerWidgetId::QolInventoryInput,
+            ModManagerWidgetId::QolRecipes,
+            ModManagerWidgetId::QolVisualsCompat,
+            ModManagerWidgetId::InstallRecommended,
         ] {
             assert!(
                 hits.iter().any(|hit| hit.id == button),
@@ -257,17 +257,17 @@ fn recommended_filter_and_install_button_have_visible_hit_regions() {
         }
         assert!(!hits
             .iter()
-            .any(|hit| hit.id == ModMenuWidgetId::ToggleEnabled));
-        menu.activate(ModMenuWidgetId::FilterAll);
+            .any(|hit| hit.id == ModManagerWidgetId::ToggleEnabled));
+        menu.activate(ModManagerWidgetId::FilterAll);
     }
 }
 
 fn click(
-    menu: &mut ModMenuState,
+    menu: &mut ModManagerState,
     width: u32,
     height: u32,
-    id: ModMenuWidgetId,
-) -> Vec<ModMenuAction> {
+    id: ModManagerWidgetId,
+) -> Vec<ModManagerAction> {
     let (_, hits) = menu.render(width, height);
     let rect = hits
         .iter()
@@ -284,7 +284,7 @@ fn click(
     )
 }
 
-fn assert_no_overlapping_hits(hits: &[ModMenuHitRegion]) {
+fn assert_no_overlapping_hits(hits: &[ModManagerHitRegion]) {
     for (index, a) in hits.iter().enumerate() {
         for b in hits.iter().skip(index + 1) {
             assert!(
@@ -299,42 +299,42 @@ fn assert_no_overlapping_hits(hits: &[ModMenuHitRegion]) {
 fn recommendation_buttons_are_clickable_and_hit_regions_do_not_overlap() {
     for lang in [UiLang::En, UiLang::Ja] {
         for (width, height) in [(640, 360), (1280, 720), (1920, 1080)] {
-            let mut menu = ModMenuState::new(vec![]);
+            let mut menu = ModManagerState::new(vec![]);
             menu.lang = lang;
             assert_no_overlapping_hits(&menu.render(width, height).1);
             assert!(click(
                 &mut menu,
                 width,
                 height,
-                ModMenuWidgetId::FilterRecommendedQol
+                ModManagerWidgetId::FilterRecommendedQol
             )
             .is_empty());
-            assert_eq!(menu.filter, ModMenuFilter::RecommendedQol);
+            assert_eq!(menu.filter, ModManagerFilter::RecommendedQol);
             assert_no_overlapping_hits(&menu.render(width, height).1);
             assert_eq!(
                 click(
                     &mut menu,
                     width,
                     height,
-                    ModMenuWidgetId::InstallRecommended,
+                    ModManagerWidgetId::InstallRecommended,
                 ),
-                [ModMenuAction::OpenUrl(
+                [ModManagerAction::OpenUrl(
                     "https://modrinth.com/mod/appleskin".into()
                 )]
             );
-            click(&mut menu, width, height, ModMenuWidgetId::QolRecipes);
+            click(&mut menu, width, height, ModManagerWidgetId::QolRecipes);
             assert_eq!(menu.recommended_category, Some(QolSubCategory::Recipes));
             assert_no_overlapping_hits(&menu.render(width, height).1);
-            click(&mut menu, width, height, ModMenuWidgetId::FilterAll);
-            assert_eq!(menu.filter, ModMenuFilter::All);
+            click(&mut menu, width, height, ModManagerWidgetId::FilterAll);
+            assert_eq!(menu.filter, ModManagerFilter::All);
         }
     }
 }
 
 #[test]
 fn recommended_keyboard_activation_opens_selected_modrinth_page() {
-    let mut menu = ModMenuState::new(vec![]);
-    menu.activate(ModMenuWidgetId::FilterRecommendedQol);
+    let mut menu = ModManagerState::new(vec![]);
+    menu.activate(ModManagerWidgetId::FilterRecommendedQol);
     menu.search = "jade".into();
     assert!(menu.search_focused());
     assert!(menu
@@ -343,7 +343,7 @@ fn recommended_keyboard_activation_opens_selected_modrinth_page() {
     assert!(!menu.search_focused());
     assert_eq!(
         menu.handle_input(UiInputEvent::KeyPressed(UiKey::Enter), 640, 360),
-        [ModMenuAction::OpenUrl(
+        [ModManagerAction::OpenUrl(
             "https://modrinth.com/mod/jade".into()
         )]
     );

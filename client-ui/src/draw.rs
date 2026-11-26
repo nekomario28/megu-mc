@@ -1123,6 +1123,36 @@ pub struct GuiSpriteEntry {
 /// UV rectangle and source pixel dimensions for a GUI sprite.
 pub type GuiSpriteUv = GuiSpriteEntry;
 
+impl GuiSpriteEntry {
+    /// Return the normalized UVs for a pixel-space sub-rectangle of this
+    /// sprite. Coordinates are expressed in the source sprite's logical
+    /// pixels, so callers can reproduce Vanilla's multi-blit GUI crops
+    /// without knowing where the sprite landed in the packed atlas.
+    pub fn subrect(&self, x: u32, y: u32, width: u32, height: u32) -> Self {
+        let src_w = self.width.max(1) as f32;
+        let src_h = self.height.max(1) as f32;
+        let du = self.uv_max[0] - self.uv_min[0];
+        let dv = self.uv_max[1] - self.uv_min[1];
+        let x1 = x.saturating_add(width).min(self.width);
+        let y1 = y.saturating_add(height).min(self.height);
+        let x0 = x.min(x1);
+        let y0 = y.min(y1);
+        Self {
+            uv_min: [
+                self.uv_min[0] + du * (x0 as f32 / src_w),
+                self.uv_min[1] + dv * (y0 as f32 / src_h),
+            ],
+            uv_max: [
+                self.uv_min[0] + du * (x1 as f32 / src_w),
+                self.uv_min[1] + dv * (y1 as f32 / src_h),
+            ],
+            width: x1 - x0,
+            height: y1 - y0,
+            nine_slice_border: [0, 0, 0, 0],
+        }
+    }
+}
+
 /// Vanilla 1.21.1 container background texture catalog.
 ///
 /// The path is relative to `assets/minecraft/textures/gui/`. Background
@@ -1224,6 +1254,29 @@ impl VanillaContainerTextureId {
     }
 }
 
+/// Stable logical HUD sprite keys. These are deliberately namespaced like
+/// Vanilla's `textures/gui/sprites/hud/` tree but do not expose file paths:
+/// hosts bind whichever atlas rectangles are available and every consumer
+/// keeps its procedural fallback when a key is absent.
+pub mod hud_sprite_ids {
+    pub const HOTBAR: &str = "hud/hotbar";
+    pub const HOTBAR_SELECTION: &str = "hud/hotbar_selection";
+    pub const CROSSHAIR: &str = "hud/crosshair";
+    pub const EXPERIENCE_BAR_BACKGROUND: &str = "hud/experience_bar_background";
+    pub const EXPERIENCE_BAR_PROGRESS: &str = "hud/experience_bar_progress";
+    pub const HEART_CONTAINER: &str = "hud/heart/container";
+    pub const HEART_FULL: &str = "hud/heart/full";
+    pub const HEART_HALF: &str = "hud/heart/half";
+    pub const FOOD_EMPTY: &str = "hud/food_empty";
+    pub const FOOD_FULL: &str = "hud/food_full";
+    pub const FOOD_HALF: &str = "hud/food_half";
+    pub const ARMOR_EMPTY: &str = "hud/armor_empty";
+    pub const ARMOR_FULL: &str = "hud/armor_full";
+    pub const ARMOR_HALF: &str = "hud/armor_half";
+    pub const AIR: &str = "hud/air";
+    pub const MOB_EFFECT_PREFIX: &str = "mob_effect/";
+}
+
 /// Packed RGBA8 GUI-sprite atlas plus the `SpriteId → entry` lookup the
 /// tessellator resolves [`UiCommand::Sprite`] against. `client-gpu`
 /// builds one from decoded vanilla `widget/*` sprites and uploads
@@ -1241,6 +1294,8 @@ pub struct GuiSpriteAtlas {
     entries: std::collections::BTreeMap<u8, GuiSpriteEntry>,
     /// Container menu ID → background texture placement.
     container_panels: std::collections::BTreeMap<u32, GuiSpriteUv>,
+    /// Stable logical sprite key (`hud/…`, `mob_effect/…`) → placement.
+    named_entries: std::collections::BTreeMap<String, GuiSpriteUv>,
 }
 
 impl GuiSpriteAtlas {
@@ -1254,6 +1309,23 @@ impl GuiSpriteAtlas {
     /// panel fallback.
     pub fn container_panel_sprite(&self, menu_id: u32) -> Option<GuiSpriteUv> {
         self.container_panels.get(&menu_id).copied()
+    }
+
+    /// Atlas entry bound to a stable logical HUD/effect sprite key.
+    pub fn named_sprite(&self, key: &str) -> Option<GuiSpriteUv> {
+        self.named_entries.get(key).copied()
+    }
+
+    /// Install or replace one stable logical sprite binding. This is used
+    /// by `client-gpu` when local Vanilla HUD rectangles are present; UI
+    /// code continues to fall back procedurally whenever they are absent.
+    pub fn insert_named_sprite(&mut self, key: impl Into<String>, entry: GuiSpriteUv) {
+        self.named_entries.insert(key.into(), entry);
+    }
+
+    /// `true` when a stable logical sprite key is packed.
+    pub fn has_named_sprite(&self, key: &str) -> bool {
+        self.named_entries.contains_key(key)
     }
 
     /// `true` when `sprite` has a packed entry — the check the widget
@@ -1289,6 +1361,7 @@ impl GuiSpriteAtlas {
             rgba,
             entries: entries.into_iter().map(|(id, e)| (id as u8, e)).collect(),
             container_panels: std::collections::BTreeMap::new(),
+            named_entries: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1307,6 +1380,7 @@ impl GuiSpriteAtlas {
             rgba,
             entries: entries.into_iter().map(|(id, e)| (id as u8, e)).collect(),
             container_panels: container_panels.into_iter().collect(),
+            named_entries: std::collections::BTreeMap::new(),
         }
     }
 }

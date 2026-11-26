@@ -2,7 +2,7 @@
 //! Exhaustive pre-release layout audit for `megu-client-ui`.
 //!
 //! Every screen, every settings tab, every modal, every embedded
-//! sub-screen, and the fully-populated in-game HUD (MiniHUD at every
+//! sub-screen, and the fully-populated in-game HUD (Compact Debug HUD at every
 //! anchor + MagicHUD + subtitles + crafting-conflict switcher + chat +
 //! actionbar + player list + bossbars) must satisfy, at every supported
 //! resolution and in both UI languages:
@@ -23,7 +23,7 @@ use megu_client_ui::draw::{
 use megu_client_ui::magic_hud::{
     CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState,
 };
-use megu_client_ui::mod_menu::{ModMenuEntry, ModMenuState};
+use megu_client_ui::mod_manager::{ModManagerEntry, ModManagerState};
 use megu_client_ui::recipe_browser::{
     BrowserTab, DetailMode, ItemEntry, RecipeBrowserState, RecipeIndex,
 };
@@ -33,7 +33,7 @@ use megu_client_ui::state::{
     Screen, SettingsTab, SubtitleDirection, UiInputEvent, UiLang, UiModal, UiState, WidgetId,
 };
 use megu_core::crash_report::CrashContext;
-use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
+use megu_client_ui::state::{CompactDebugHudAnchor, CompactDebugHudConfig, CompactDebugHudData};
 
 /// Required ship resolutions: compact, vanilla default, 720p/Deck,
 /// 1080p, 1440p, 4K HiDPI.
@@ -60,11 +60,11 @@ const PATHOLOGICAL: [(u32, u32); 8] = [
 
 const LANGS: [LanguageSetting; 2] = [LanguageSetting::English, LanguageSetting::Japanese];
 
-const ANCHORS: [MiniHudAnchor; 4] = [
-    MiniHudAnchor::TopLeft,
-    MiniHudAnchor::TopRight,
-    MiniHudAnchor::BottomLeft,
-    MiniHudAnchor::BottomRight,
+const ANCHORS: [CompactDebugHudAnchor; 4] = [
+    CompactDebugHudAnchor::TopLeft,
+    CompactDebugHudAnchor::TopRight,
+    CompactDebugHudAnchor::BottomLeft,
+    CompactDebugHudAnchor::BottomRight,
 ];
 
 const MODALS: [UiModal; 3] = [
@@ -144,10 +144,10 @@ fn assert_draws_within_viewport(list: &UiDrawList, w: u32, h: u32, context: &str
 // Populated fixture data (hostile where it matters)
 // ---------------------------------------------------------------------------
 
-/// MiniHUD data with every field set so Basic *and* Advanced presets
+/// Compact Debug HUD data with every field set so Basic *and* Advanced presets
 /// emit their full line sets.
-fn populated_mini_hud_data() -> MiniHudData {
-    MiniHudData {
+fn populated_compact_debug_hud_data() -> CompactDebugHudData {
+    CompactDebugHudData {
         fps: Some(60.0),
         fps_one_percent_low: Some(9.0),
         mspt: Some(4.2),
@@ -172,9 +172,9 @@ fn populated_mini_hud_data() -> MiniHudData {
     }
 }
 
-/// MiniHUD config with every segment on (the Advanced preset).
-fn all_minihud_segments(anchor: MiniHudAnchor) -> MiniHudConfig {
-    MiniHudConfig {
+/// Compact Debug HUD config with every segment on (the Advanced preset).
+fn all_compact_debug_hud_segments(anchor: CompactDebugHudAnchor) -> CompactDebugHudConfig {
+    CompactDebugHudConfig {
         enabled: true,
         anchor,
         show_one_percent_low: true,
@@ -186,7 +186,7 @@ fn all_minihud_segments(anchor: MiniHudAnchor) -> MiniHudConfig {
         show_chunks_entities: true,
         show_light_level: true,
         show_shader_audio_status: true,
-        ..MiniHudConfig::default()
+        ..CompactDebugHudConfig::default()
     }
 }
 
@@ -227,7 +227,7 @@ fn hostile_hud(_subtitles_on: bool) -> HudState {
     hud.players = (0..24)
         .map(|i| (format!("PlayerNameNumber{i:02}"), 10 + i as u16 * 7))
         .collect();
-    hud.mini_hud_data = populated_mini_hud_data();
+    hud.compact_debug_hud_data = populated_compact_debug_hud_data();
     hud.subtitles = vec![
         HudSubtitle {
             label: "Zombie groans with an unusually long descriptive label".into(),
@@ -302,11 +302,11 @@ fn populated_magic() -> MagicHudState {
     }
 }
 
-fn demo_mod_menu() -> ModMenuState {
+fn demo_mod_manager() -> ModManagerState {
     let mut entries = vec![
-        ModMenuEntry::new("create", "Create", "0.5.1f"),
-        ModMenuEntry::new("jei", "Just Enough Items", "15.3.0"),
-        ModMenuEntry::new(
+        ModManagerEntry::new("create", "Create", "0.5.1f"),
+        ModManagerEntry::new("jei", "Just Enough Items", "15.3.0"),
+        ModManagerEntry::new(
             "longmodid",
             "A Mod With A Really Quite Long Display Name That Should Clip",
             "1.0.0",
@@ -314,11 +314,11 @@ fn demo_mod_menu() -> ModMenuState {
     ];
     entries[0].missing_deps = vec![
         "flywheel".into(),
-        "ponder".into(),
+        "machine_tutorial".into(),
         "registrate".into(),
         "extra-dep".into(),
     ];
-    ModMenuState::new(entries)
+    ModManagerState::new(entries)
 }
 
 fn demo_recipe_browser() -> RecipeBrowserState {
@@ -365,7 +365,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         "1.21.1",
         "contraption NPE at /home/alice/mods/x.jar — Bearer sekret",
     ));
-    ui.mod_menu = demo_mod_menu();
+    ui.mod_manager = demo_mod_manager();
     ui.recipe_browser = demo_recipe_browser();
     ui.website_url = "https://example.invalid".into();
     ui.support_url = "https://example.invalid/support".into();
@@ -388,7 +388,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,
-        Screen::ModMenu,
+        Screen::ModManager,
         Screen::RecipeBrowser,
         Screen::InGameHud,
         Screen::Death,
@@ -459,10 +459,10 @@ fn every_modal_clean_at_all_resolutions() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. HUD overlay matrix: MiniHUD anchors x all overlays x resolutions
+// 3. HUD overlay matrix: Compact Debug HUD anchors x all overlays x resolutions
 // ---------------------------------------------------------------------------
 
-/// The translucent HUD backings (chat lines, subtitle rows, MiniHUD box)
+/// The translucent HUD backings (chat lines, subtitle rows, Compact Debug HUD box)
 /// share one exact color — collect their rects and assert none overlap
 /// each other or the vitals icon band.
 fn translucent_fills(list: &UiDrawList) -> Vec<UiRect> {
@@ -503,7 +503,7 @@ fn hud_overlay_matrix_no_collisions() {
                         let mut ui = UiState::new();
                         ui.settings.language = lang;
                         ui.settings.qol.show_subtitles = subtitles;
-                        ui.settings.qol.mini_hud = all_minihud_segments(anchor);
+                        ui.settings.qol.compact_debug_hud = all_compact_debug_hud_segments(anchor);
                         ui.screen = Screen::InGameHud;
                         ui.hud = hostile_hud(subtitles);
                         if !magic_on {
@@ -517,7 +517,7 @@ fn hud_overlay_matrix_no_collisions() {
                         assert_draws_within_viewport(&list, w, h, &ctx);
 
                         // Translucent backings must never stack on top of
-                        // each other (chat vs subtitles vs MiniHUD).
+                        // each other (chat vs subtitles vs Compact Debug HUD).
                         let fills = translucent_fills(&list);
                         for (i, a) in fills.iter().enumerate() {
                             for b in fills.iter().skip(i + 1) {
@@ -551,7 +551,7 @@ fn hud_overlay_matrix_no_collisions() {
                                 );
                             }
                         }
-                        // And the MiniHUD box (a translucent fill) must
+                        // And the Compact Debug HUD box (a translucent fill) must
                         // clear the vitals icons too.
                         for fill in &fills {
                             for cell in &icons {
@@ -568,19 +568,19 @@ fn hud_overlay_matrix_no_collisions() {
     }
 }
 
-/// Same matrix, but with an empty (default) HUD: MiniHUD alone must
+/// Same matrix, but with an empty (default) HUD: Compact Debug HUD alone must
 /// still stay in bounds at every anchor.
 #[test]
-fn minihud_alone_at_every_anchor_and_resolution() {
+fn compact_debug_hud_alone_at_every_anchor_and_resolution() {
     for &(w, h) in &SIZES {
         for anchor in ANCHORS {
             let mut ui = UiState::new();
-            ui.settings.qol.mini_hud = all_minihud_segments(anchor);
+            ui.settings.qol.compact_debug_hud = all_compact_debug_hud_segments(anchor);
             ui.screen = Screen::InGameHud;
             ui.hud = HudState::default();
-            ui.hud.mini_hud_data = populated_mini_hud_data();
+            ui.hud.compact_debug_hud_data = populated_compact_debug_hud_data();
             let list = ui.render(w, h);
-            let ctx = format!("miniHUD-only anchor={anchor:?} @{w}x{h}");
+            let ctx = format!("compact debug HUD-only anchor={anchor:?} @{w}x{h}");
             assert_draws_within_viewport(&list, w, h, &ctx);
         }
     }
@@ -591,14 +591,14 @@ fn minihud_alone_at_every_anchor_and_resolution() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn embedded_mod_menu_standalone_bounds() {
+fn embedded_mod_manager_standalone_bounds() {
     for lang in [UiLang::En, UiLang::Ja] {
         for &(w, h) in &SIZES {
-            let mut menu = demo_mod_menu();
+            let mut menu = demo_mod_manager();
             menu.lang = lang;
             // Selection shows the detail pane + missing-deps warning box.
             let (list, hits) = menu.render(w, h);
-            let ctx = format!("ModMenu @{w}x{h} lang={lang:?}");
+            let ctx = format!("ModManager @{w}x{h} lang={lang:?}");
             for region in &hits {
                 assert!(
                     region.rect.x >= 0
@@ -625,8 +625,8 @@ fn embedded_recipe_browser_standalone_bounds() {
             for tab in [
                 BrowserTab::Items,
                 BrowserTab::Tree,
-                BrowserTab::Jer,
-                BrowserTab::Ponder,
+                BrowserTab::WorldDropsInfo,
+                BrowserTab::MachineTutorials,
             ] {
                 let mut rb = demo_recipe_browser();
                 rb.lang = lang;
@@ -737,12 +737,12 @@ fn pathological_viewports_never_panic() {
 #[test]
 fn pathological_embedded_screens_never_panic() {
     for &(w, h) in &PATHOLOGICAL {
-        let menu = demo_mod_menu();
+        let menu = demo_mod_manager();
         let (list, hits) = menu.render(w, h);
         for r in &hits {
             assert!(
                 r.rect.x >= 0 && r.rect.y >= 0 && r.rect.right() <= w as i32,
-                "ModMenu region outside {w}x{h}: {r:?}"
+                "ModManager region outside {w}x{h}: {r:?}"
             );
         }
         let _ = rasterize_draw_list(w, h, &list);
@@ -787,7 +787,7 @@ fn every_screen_escapes_to_a_safe_place() {
         Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,
-        Screen::ModMenu,
+        Screen::ModManager,
         Screen::RecipeBrowser,
         Screen::InGameHud,
         Screen::Death,
@@ -855,15 +855,15 @@ fn every_screen_has_back_or_close_widget() {
             );
         }
     }
-    // ModMenu and RecipeBrowser expose their own Done widgets.
+    // ModManager and RecipeBrowser expose their own Done widgets.
     for &(w, h) in &SIZES {
-        ui.screen = Screen::ModMenu;
+        ui.screen = Screen::ModManager;
         ui.render(w, h);
         let has_done = ui.hit_regions.iter().any(|r| match r.id {
-            WidgetId::ModMenu(id) => format!("{id:?}").contains("Done"),
+            WidgetId::ModManager(id) => format!("{id:?}").contains("Done"),
             _ => false,
         });
-        assert!(has_done, "ModMenu @{w}x{h}: no Done region");
+        assert!(has_done, "ModManager @{w}x{h}: no Done region");
         ui.screen = Screen::RecipeBrowser;
         ui.render(w, h);
         assert!(
@@ -909,7 +909,7 @@ fn every_settings_tab_reachable_via_click() {
 /// Japanese caption (`公式サイ`, `オーディ`, `フルスクリーン: OF`, ...)
 /// down to a fragment. `truncated_widget_labels` reports each clipped
 /// caption; the list must stay empty on every player-facing screen in
-/// both languages, MiniHUD off *and* on (the chip grid is the widest
+/// both languages, Compact Debug HUD off *and* on (the chip grid is the widest
 /// QoL layout).
 #[test]
 fn no_button_or_tab_label_truncates_at_1280x720() {
@@ -928,7 +928,7 @@ fn no_button_or_tab_label_truncates_at_1280x720() {
                     Screen::Disconnected,
                 ]);
                 if mini_on {
-                    ui.settings.qol.mini_hud = all_minihud_segments(MiniHudAnchor::TopLeft);
+                    ui.settings.qol.compact_debug_hud = all_compact_debug_hud_segments(CompactDebugHudAnchor::TopLeft);
                 }
                 for screen in screens {
                     ui.screen = screen;

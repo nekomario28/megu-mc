@@ -433,7 +433,7 @@ fn live_session_feeds_kernel_autotuner_and_upload_budget_p95_feedback() {
     );
     // Frame-time feedback feeds the autotuner too.
     let mut ui = UiState::new();
-    live.record_frame_and_refresh_minihud(0.008, &mut ui);
+    live.record_frame_and_refresh_compact_debug_hud(0.008, &mut ui);
     assert!(
         live.autotuner_samples() >= 2,
         "frame-time sample must feed observe_sample, got {}",

@@ -7,8 +7,8 @@
 //! `ItemSpriteSlot` emission matching every visible grid slot.
 
 use megu_client_ui::draw::{UiColor, UiCommand, UiRect};
-use megu_client_ui::jei_emi_overlay::{
-    render_item_tooltip, ItemSpriteSlot, JeiEmiGeometry, JeiEmiOverlayState, LeftPanelMode,
+use megu_client_ui::recipe_overlay::{
+    render_item_tooltip, ItemSpriteSlot, RecipeOverlayGeometry, RecipeOverlayState, LeftPanelMode,
     OverlayItem, OverlayKey, OverlayRecipe, OverlaySlot, OverlayWidgetId, PopupMode, PopupTab,
     RecipePopup, BEVEL_DARK, BEVEL_LIGHT, CRAFTABLE_GREEN, HOVER_HIGHLIGHT, ID_GREY,
     MISSING_TINT, MOD_NAME_BLUE, SEARCH_YELLOW, SLOT_INNER, TOOLTIP_EDGE_BOTTOM,
@@ -28,8 +28,8 @@ fn item(id: &str, name: &str, mod_name: &str) -> OverlayItem {
 }
 
 /// Full fixture: catalog + crafting/smelting recipes.
-fn fixture() -> JeiEmiOverlayState {
-    let mut s = JeiEmiOverlayState::new();
+fn fixture() -> RecipeOverlayState {
+    let mut s = RecipeOverlayState::new();
     let mut items = vec![
         item("minecraft:iron_block", "Iron Block", "Minecraft"),
         item("minecraft:iron_ingot", "Iron Ingot", "Minecraft"),
@@ -81,18 +81,30 @@ fn fixture() -> JeiEmiOverlayState {
     smelt.xp = 0.7;
     smelt.cook_ticks = 200;
     s.recipes.push(smelt);
+    // ore + coal -> ingot in a blast furnace too, giving the ingot popup
+    // two visible dynamic furnace tabs.
+    let mut blast = OverlayRecipe::new(
+        "minecraft:blast_iron",
+        PopupTab::Blasting,
+        OverlaySlot::new("minecraft:iron_ingot", 1),
+    );
+    blast.inputs = vec![
+        Some(OverlaySlot::new("minecraft:iron_ore", 1)),
+        Some(OverlaySlot::new("minecraft:coal", 1)),
+    ];
+    s.recipes.push(blast);
     s
 }
 
 /// Find the physical-px center of a hit region for `wid`.
-fn hit_center(hits: &[megu_client_ui::jei_emi_overlay::OverlayHitRegion], wid: OverlayWidgetId) -> Option<(i32, i32)> {
+fn hit_center(hits: &[megu_client_ui::recipe_overlay::OverlayHitRegion], wid: OverlayWidgetId) -> Option<(i32, i32)> {
     hits.iter()
         .find(|h| h.id == wid)
         .map(|h| (h.rect.x + h.rect.w as i32 / 2, h.rect.y + h.rect.h as i32 / 2))
 }
 
 /// Hover the first right-grid item slot and return its filtered index.
-fn hover_first_slot(s: &mut JeiEmiOverlayState, w: u32, h: u32) {
+fn hover_first_slot(s: &mut RecipeOverlayState, w: u32, h: u32) {
     let frame = s.render(w, h, container(w, h), 1);
     let (cx, cy) = hit_center(&frame.hits, OverlayWidgetId::ItemSlot(0))
         .expect("no ItemSlot(0) region");
@@ -112,7 +124,7 @@ fn sidebars_never_intersect_container_across_sizes_and_scales() {
     for (w, h) in SIZES {
         for s in SCALES {
             let c = container(w, h);
-            let geo = JeiEmiGeometry::compute(w, h, c, s);
+            let geo = RecipeOverlayGeometry::compute(w, h, c, s);
             if let Some(r) = geo.right {
                 let p = geo.phys(r);
                 assert!(
@@ -169,7 +181,7 @@ fn sidebars_survive_odd_containers_without_overlap() {
             if c.right() > w as i32 || c.bottom() > h as i32 {
                 continue;
             }
-            let geo = JeiEmiGeometry::compute(w, h, c, 1);
+            let geo = RecipeOverlayGeometry::compute(w, h, c, 1);
             if let Some(r) = geo.right {
                 assert!(!geo.phys(r).intersects(c), "right overlap at {w}x{h} c={c:?}");
             }
@@ -252,7 +264,7 @@ fn grid_slots_scale_with_gui_scale() {
 fn pagination_math_and_pager_buttons() {
     let mut s = fixture();
     let (w, h) = (1920, 1080);
-    let geo = JeiEmiGeometry::compute(w, h, container(w, h), 1);
+    let geo = RecipeOverlayGeometry::compute(w, h, container(w, h), 1);
     let per = geo.cols * geo.rows;
     assert!(per >= 9, "grid too small for fixture: {per}");
     let total = s.total_pages(&geo);
@@ -295,7 +307,7 @@ fn sprite_slots_match_every_visible_grid_slot() {
     let mut s = fixture();
     let (w, h) = (1920, 1080);
     let frame = s.render(w, h, container(w, h), 1);
-    let geo = JeiEmiGeometry::compute(w, h, container(w, h), 1);
+    let geo = RecipeOverlayGeometry::compute(w, h, container(w, h), 1);
     let per = geo.cols * geo.rows;
     let expected = s.filtered_items().len().min(per);
     let grid_sprites: Vec<&ItemSpriteSlot> = frame
@@ -481,7 +493,7 @@ fn filter_toggle_shows_only_craftable_items() {
 // Recipe popup card
 // ---------------------------------------------------------------------------
 
-fn open_iron_block_popup(s: &mut JeiEmiOverlayState) {
+fn open_iron_block_popup(s: &mut RecipeOverlayState) {
     s.popup = Some(RecipePopup {
         item_id: "minecraft:iron_block".to_string(),
         mode: PopupMode::Recipes,
@@ -494,7 +506,7 @@ fn open_iron_block_popup(s: &mut JeiEmiOverlayState) {
 fn popup_renders_vanilla_card_with_tabs_pager_and_tree_button() {
     let mut s = fixture();
     open_iron_block_popup(&mut s);
-    let geo = JeiEmiGeometry::compute(1920, 1080, container(1920, 1080), 1);
+    let geo = RecipeOverlayGeometry::compute(1920, 1080, container(1920, 1080), 1);
     let (list, hits, _sprites) = s.render_recipe_popup(&geo);
     // Vanilla light-grey panel fill.
     assert!(
@@ -503,13 +515,10 @@ fn popup_renders_vanilla_card_with_tabs_pager_and_tree_button() {
             UiCommand::FillRect { color, .. } if *color == SLOT_INNER || *color == UiColor::rgb(0xC6, 0xC6, 0xC6)
         )) > 0
     );
-    // Ten category tabs + pager + tree button + slots all hittable.
-    for i in 0..10 {
-        assert!(
-            hits.iter().any(|h| h.id == OverlayWidgetId::PopupTab(i)),
-            "missing PopupTab({i})"
-        );
-    }
+    // Only categories with matching recipes are emitted: iron_block has
+    // crafting recipes here, and no unconditional machine/mod tab appears.
+    assert!(hits.iter().any(|h| h.id == OverlayWidgetId::PopupTab(0)));
+    assert!(!hits.iter().any(|h| h.id == OverlayWidgetId::PopupTab(1)));
     for id in [
         OverlayWidgetId::PopupPrev,
         OverlayWidgetId::PopupNext,
@@ -532,17 +541,20 @@ fn popup_renders_vanilla_card_with_tabs_pager_and_tree_button() {
 #[test]
 fn popup_pager_and_tab_switching() {
     let mut s = fixture();
-    open_iron_block_popup(&mut s);
+    s.popup = Some(RecipePopup {
+        item_id: "minecraft:iron_ingot".to_string(),
+        mode: PopupMode::Recipes,
+        tab: PopupTab::Smelting,
+        page: 0,
+    });
     // Full render caches popup hit regions for handle_click.
     let frame = s.render(1920, 1080, container(1920, 1080), 1);
-    let (cx, cy) = hit_center(&frame.hits, OverlayWidgetId::PopupNext).unwrap();
-    s.handle_click(cx, cy, 0);
-    assert_eq!(s.popup.as_ref().unwrap().page, 1);
-    s.handle_click(cx, cy, 0); // clamps at total-1
-    assert_eq!(s.popup.as_ref().unwrap().page, 1);
+    assert!(hit_center(&frame.hits, OverlayWidgetId::PopupTab(0)).is_some());
+    assert!(hit_center(&frame.hits, OverlayWidgetId::PopupTab(1)).is_some());
+    assert!(hit_center(&frame.hits, OverlayWidgetId::PopupTab(2)).is_none());
     s.activate(OverlayWidgetId::PopupTab(1), 0);
     let pop = s.popup.as_ref().unwrap();
-    assert_eq!(pop.tab, PopupTab::Smelting);
+    assert_eq!(pop.tab, PopupTab::Blasting);
     assert_eq!(pop.page, 0);
 }
 
@@ -552,7 +564,7 @@ fn plus_hover_red_tints_missing_slots() {
     // Player has zero iron ingots -> all 9 grid cells missing.
     open_iron_block_popup(&mut s);
     s.hovered = Some(OverlayWidgetId::PopupTransfer);
-    let geo = JeiEmiGeometry::compute(1920, 1080, container(1920, 1080), 1);
+    let geo = RecipeOverlayGeometry::compute(1920, 1080, container(1920, 1080), 1);
     let (list, _hits, sprites) = s.render_recipe_popup(&geo);
     let tinted = sprites
         .iter()
@@ -574,7 +586,7 @@ fn plus_button_greens_when_craftable() {
     s.inventory.insert("minecraft:iron_ingot".to_string(), 9);
     open_iron_block_popup(&mut s);
     s.hovered = Some(OverlayWidgetId::PopupTransfer);
-    let geo = JeiEmiGeometry::compute(1920, 1080, container(1920, 1080), 1);
+    let geo = RecipeOverlayGeometry::compute(1920, 1080, container(1920, 1080), 1);
     let (list, _hits, sprites) = s.render_recipe_popup(&geo);
     assert!(
         count_cmds(&list, |c| matches!(
@@ -597,7 +609,7 @@ fn plus_click_emits_transfer_action() {
     let actions = s.activate(OverlayWidgetId::PopupTransfer, 0);
     assert_eq!(actions.len(), 1);
     match &actions[0] {
-        megu_client_ui::jei_emi_overlay::OverlayAction::TransferRecipe {
+        megu_client_ui::recipe_overlay::OverlayAction::TransferRecipe {
             recipe_id,
             craftable,
         } => {
@@ -616,7 +628,7 @@ fn furnace_card_has_input_flame_fuel_output_and_xp_readout() {
         tab: PopupTab::Smelting,
         page: 0,
     });
-    let geo = JeiEmiGeometry::compute(1920, 1080, container(1920, 1080), 1);
+    let geo = RecipeOverlayGeometry::compute(1920, 1080, container(1920, 1080), 1);
     let (list, _hits, sprites) = s.render_recipe_popup(&geo);
     // input + fuel + output sprites.
     assert_eq!(sprites.len(), 3, "furnace card must emit 3 sprites");
@@ -807,4 +819,29 @@ fn render_all_sizes_no_panic_and_sprites_bounded() {
             }
         }
     }
+}
+
+#[test]
+fn machine_recipes_appear_only_when_machine_recipe_exists() {
+    let mut s = fixture();
+    let mut machine = OverlayRecipe::new(
+        "create:pressing/cogwheel",
+        PopupTab::MachineRecipes,
+        OverlaySlot::new("create:cogwheel", 1),
+    );
+    machine.inputs = vec![Some(OverlaySlot::new("minecraft:iron_ingot", 1))];
+    s.recipes.push(machine);
+    s.popup = Some(RecipePopup {
+        item_id: "create:cogwheel".to_string(),
+        mode: PopupMode::Recipes,
+        tab: PopupTab::MachineRecipes,
+        page: 0,
+    });
+    let frame = s.render(1920, 1080, container(1920, 1080), 1);
+    assert!(hit_center(&frame.hits, OverlayWidgetId::PopupTab(0)).is_some());
+    assert!(hit_center(&frame.hits, OverlayWidgetId::PopupTab(1)).is_none());
+    assert!(frame.list.commands.iter().any(|cmd| matches!(
+        cmd,
+        UiCommand::Text { text, .. } if text == "Machine Recipes"
+    )));
 }

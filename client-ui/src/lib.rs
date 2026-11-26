@@ -29,15 +29,14 @@
 //!   `GuiGraphics -> DrawCmd` draw ops, the read-only HUD snapshot mods
 //!   see, fair-play-capped container slot actions, the fail-closed
 //!   `GGB1` wire codec, and the lowering pass into the native draw list.
-//! * [`jei_emi_overlay`] — the JEI/EMI-style *native* side-by-side
-//!   container overlay: non-overlapping left (bookmarks + EMI craft
-//!   tree) and right (paginated 18×18 item grid + search with the
+//! * [`recipe_overlay`] — the native side-by-side container recipe
+//!   overlay: non-overlapping left (bookmarks + craft tree) and right (paginated 18×18 item grid + search with the
 //!   double-click yellow highlight mode) sidebars around any centered
 //!   container GUI, the classic `#C6C6C6` recipe popup card, the
 //!   purple-gradient item tooltip, and parallel `ItemSpriteSlot`
 //!   emission for runtime `client-gpu` item sprites.
-//! * [`recipe_search`] — the pure-logic core a JEI/EMI-style overlay
-//!   wires in: a Japanese-aware kana/romaji normalizer
+//! * [`recipe_search`] — the pure-logic core the recipe overlay wires in:
+//!   a Japanese-aware kana/romaji normalizer
 //!   (`daia`/`だいあ`/`ダイア` all reach `ダイヤモンド`), an inverted
 //!   [`recipe_search::RecipeSearchIndex`] with `@mod`/`#tag`/text
 //!   tokens plus `R`/`U` lookups and Polymorph-style conflict groups,
@@ -80,11 +79,11 @@ pub mod gamepad;
 pub mod gameplay_screens;
 pub mod gui_bridge;
 pub mod hud_widgets;
-pub mod jei_emi_overlay;
+pub mod recipe_overlay;
 pub mod layout;
 pub mod magic_hud;
 pub mod mod_i18n;
-pub mod mod_menu;
+pub mod mod_manager;
 pub mod mod_sync_ui;
 pub mod qol_helpers;
 pub mod recipe_browser;

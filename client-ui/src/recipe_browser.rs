@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Unified recipe & resource browser for the client UI — a clean-room
-//! engine covering the feature surface JEI, EMI, REI, JER and Create's
-//! Ponder viewer share:
+//! engine covering searchable recipes, craft-tree analysis, world resource
+//! reference data, and machine-tutorial visualization:
 //!
 //! * **Universal recipe index** — a data-driven [`RecipeIndex`] of
 //!   [`ItemEntry`]s and [`Recipe`]s whose [`RecipeCategory`] covers every
@@ -12,25 +12,25 @@
 //!   [`RecipeIndex::load_recipe_json`] ingests standard datapack/mod recipe
 //!   JSON fail-closed (malformed input is rejected, never panics).
 //! * **Instant multi-filter search** — `plain text`, `@mod`, `#tag` and
-//!   `$category` tokens with AND semantics, a JEI-style item grid, a left
+//!   `$category` tokens with AND semantics, a searchable item grid, a left
 //!   bookmarks panel, `R`/`U` recipes-vs-uses navigation and a `+` button
 //!   that emits [`RecipeBrowserAction::TransferToCraftingGrid`].
-//! * **EMI recipe trees** — [`RecipeIndex::recipe_tree`] recursively
+//! * **Recursive craft trees** — [`RecipeIndex::recipe_tree`] recursively
 //!   expands intermediate crafts (including looped sequenced assembly)
 //!   into a [`RecipeTree`] of [`TreeNode`]s with hard cycle detection and
 //!   a node budget, and totals raw base materials, fluids, byproducts and
 //!   the remaining amounts a player inventory still lacks.
-//! * **JER resources** — [`MobDropEntry`], [`OreDistribution`] (with a
+//! * **World resource reference data** — [`MobDropEntry`], [`OreDistribution`] (with a
 //!   deterministic per-Y histogram rendered as a bar chart),
 //!   [`VillagerTradeEntry`], [`DungeonLootEntry`] and
 //!   [`EnchantmentCompat`] tabs.
-//! * **Create Ponder** — [`PonderScene`], a pure-data 3D voxel scene with
+//! * **Machine tutorials** — [`MachineTutorialScene`], a pure-data 3D voxel scene with
 //!   step captions and animated parts, rendered through a deterministic
 //!   isometric projection rasterized into plain `FillRect` scanlines, so
 //!   it works identically on the software rasterizer and the GPU quad
 //!   pipeline with zero extra shader work.
 //!
-//! Like [`crate::mod_menu`], rendering produces a deterministic
+//! Like [`crate::mod_manager`], rendering produces a deterministic
 //! [`UiDrawList`] plus a parallel `Vec<`[`RecipeHitRegion`]`>`; input
 //! arrives as device-agnostic [`UiInputEvent`]s and returns
 //! [`RecipeBrowserAction`]s the embedding application performs. Pure
@@ -44,7 +44,7 @@ use megu_core::math::Mth;
 use megu_core::search_index::{SearchDocId, SearchHit, TrigramIndex};
 
 use crate::draw::{palette, text_width, UiColor, UiDrawList, UiRect};
-use crate::jei_emi_overlay;
+use crate::recipe_overlay;
 use crate::recipe_search;
 use crate::state::{tr, GamepadButton, UiInputEvent, UiKey, UiLang};
 
@@ -529,7 +529,7 @@ impl Recipe {
 }
 
 // ---------------------------------------------------------------------------
-// JER (Just Enough Resources) data
+// World drops and resource reference data
 // ---------------------------------------------------------------------------
 
 /// One mob-drop table row.
@@ -548,7 +548,7 @@ pub struct MobDropEntry {
     pub condition: String,
 }
 
-/// JER-style ore generation profile for one block in one dimension.
+/// Ore generation profile for one block in one dimension.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OreDistribution {
     pub block_id: String,
@@ -566,8 +566,8 @@ pub struct OreDistribution {
 
 impl OreDistribution {
     /// Weight at one Y level: a deterministic triangle ramping from
-    /// `min_y` up to `peak_y` and back down to `max_y` — the classic JER
-    /// trapezoid rendered as a bar chart.
+    /// `min_y` up to `peak_y` and back down to `max_y` — the classic triangular
+    /// distribution rendered as a bar chart.
     pub fn weight_at(&self, y: i32) -> u32 {
         if y < self.min_y || y > self.max_y || self.vein_size == 0 {
             return 0;
@@ -730,13 +730,13 @@ fn json_value_to_json(value: &JsonValue) -> Json {
 }
 
 // ---------------------------------------------------------------------------
-// Recipe index: catalog, recipes, JER data, custom categories
+// Recipe index: catalog, recipes, world resource data, custom categories
 // ---------------------------------------------------------------------------
 
 /// The universal data-driven item + recipe + resource index the browser
 /// renders. The host (datapack loader, mod adapter) fills it; the UI only
 /// reads it.
-/// One furnace fuel row (JER "Fuels" tab): `burn_ticks` is the
+/// One furnace fuel row (the world-resource "Fuels" tab): `burn_ticks` is the
 /// NeoForge `furnace_fuels` data-map `burn_time`; vanilla smelts one
 /// item per 200 ticks.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1038,7 +1038,7 @@ impl RecipeIndex {
 
     /// Like [`resolve_ingredient`](Self::resolve_ingredient) but cycles
     /// tag slots through their members — `tick/20` picks the shown item
-    /// (~1 Hz at 20 tps), matching JEI/EMI tag cycling.
+    /// (~1 Hz at 20 tps), matching recipe overlay tag cycling.
     pub fn resolve_ingredient_cycled(&self, ing: &RecipeIngredient, tick: u64) -> String {
         match ing {
             RecipeIngredient::Item { id, .. } => id.clone(),
@@ -1450,7 +1450,7 @@ fn parse_ingredient_value(v: &Json) -> Option<RecipeIngredient> {
             None
         }
         // Vanilla allows an array of alternatives; the deterministic
-        // pick is the first one (matching JEI's default slot cycling).
+        // pick is the first one (matching recipe browser's default slot cycling).
         Json::Arr(a) => a.first().and_then(parse_ingredient_value),
         _ => None,
     }
@@ -1475,7 +1475,7 @@ fn parse_fluid_value(v: &Json) -> Option<FluidStack> {
 }
 
 // ---------------------------------------------------------------------------
-// EMI-style recursive recipe tree + raw material calculator
+// Recursive craft tree + raw material calculator
 // ---------------------------------------------------------------------------
 
 /// One node of a [`RecipeTree`]: `needed` units of `item`, produced by
@@ -1697,19 +1697,19 @@ impl RecipeIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Create-style 3D Ponder scene + deterministic isometric renderer
+// Machine-tutorial 3D scene + deterministic isometric renderer
 // ---------------------------------------------------------------------------
 
-/// One solid voxel in a [`PonderScene`] (`x`,`z` horizontal, `y` up).
+/// One solid voxel in a [`MachineTutorialScene`] (`x`,`z` horizontal, `y` up).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PonderVoxel {
+pub struct MachineTutorialVoxel {
     pub x: i32,
     pub y: i32,
     pub z: i32,
     pub color: UiColor,
 }
 
-impl PonderVoxel {
+impl MachineTutorialVoxel {
     pub fn new(x: i32, y: i32, z: i32, color: UiColor) -> Self {
         Self { x, y, z, color }
     }
@@ -1717,7 +1717,7 @@ impl PonderVoxel {
 
 /// Axis for animated-part transforms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PonderAxis {
+pub enum MachineTutorialAxis {
     X,
     Y,
     Z,
@@ -1725,40 +1725,40 @@ pub enum PonderAxis {
 
 /// Motion applied to the voxel at an [`AnimatedPart`] position.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum PonderAnim {
+pub enum MachineTutorialAnimation {
     /// Continuous rotation about `axis` (cogwheel, millstone, press cam).
-    Spin { axis: PonderAxis, rpm: f32 },
+    Spin { axis: MachineTutorialAxis, rpm: f32 },
     /// Back-and-forth translation along `axis` (deployer arm, belt item).
     Oscillate {
-        axis: PonderAxis,
+        axis: MachineTutorialAxis,
         amplitude: f32,
         period_ticks: u32,
     },
 }
 
-/// The voxel position an animation applies to. When no [`PonderVoxel`]
+/// The voxel position an animation applies to. When no [`MachineTutorialVoxel`]
 /// sits at `pos`, a small marker cube is drawn instead (a moving arm or
 /// item gliding along a belt).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimatedPart {
     pub pos: (i32, i32, i32),
-    pub anim: PonderAnim,
+    pub anim: MachineTutorialAnimation,
 }
 
-/// One narrated step of a [`PonderScene`].
+/// One narrated step of a [`MachineTutorialScene`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct PonderStep {
+pub struct MachineTutorialStep {
     pub caption_en: String,
     pub caption_ja: String,
     /// Voxel position outlined in the highlight color this step.
     pub highlight: Option<(i32, i32, i32)>,
     /// Animations active during this step.
     pub animated_parts: Vec<AnimatedPart>,
-    /// Step length in ticks (Create ponders run at ~20 tps).
+    /// Step length in ticks (machine tutorials run at ~20 tps).
     pub duration_ticks: u32,
 }
 
-impl PonderStep {
+impl MachineTutorialStep {
     pub fn new(caption_en: &str, caption_ja: &str, duration_ticks: u32) -> Self {
         Self {
             caption_en: caption_en.to_owned(),
@@ -1778,10 +1778,10 @@ impl PonderStep {
 /// `steps`, the browser renders it through a deterministic isometric
 /// projection and steps it with [`advance_tick`](Self::advance_tick).
 #[derive(Clone, Debug)]
-pub struct PonderScene {
+pub struct MachineTutorialScene {
     pub title: String,
-    pub blocks: Vec<PonderVoxel>,
-    pub steps: Vec<PonderStep>,
+    pub blocks: Vec<MachineTutorialVoxel>,
+    pub steps: Vec<MachineTutorialStep>,
     /// Camera yaw around the vertical axis, degrees.
     pub yaw_deg: f32,
     /// Camera pitch (down-tilt), degrees.
@@ -1796,7 +1796,7 @@ pub struct PonderScene {
     pub step_ticks: u32,
 }
 
-impl Default for PonderScene {
+impl Default for MachineTutorialScene {
     fn default() -> Self {
         Self {
             title: String::new(),
@@ -1812,7 +1812,7 @@ impl Default for PonderScene {
     }
 }
 
-impl PonderScene {
+impl MachineTutorialScene {
     pub fn new(title: &str) -> Self {
         Self {
             title: title.to_owned(),
@@ -1821,16 +1821,16 @@ impl PonderScene {
     }
 
     pub fn add_block(&mut self, x: i32, y: i32, z: i32, color: UiColor) {
-        self.blocks.push(PonderVoxel::new(x, y, z, color));
+        self.blocks.push(MachineTutorialVoxel::new(x, y, z, color));
     }
 
     /// The currently narrated step, if any.
-    pub fn current_step(&self) -> Option<&PonderStep> {
+    pub fn current_step(&self) -> Option<&MachineTutorialStep> {
         self.steps.get(self.step_index)
     }
 
     /// Advance the animation/step clock by one tick (no-op while paused).
-    /// Steps wrap around like a looping Create ponder.
+    /// Steps wrap around like a looping Create machine tutorial.
     pub fn advance_tick(&mut self) {
         if !self.playing {
             return;
@@ -1872,7 +1872,7 @@ impl PonderScene {
     }
 
     /// The active animation for `pos` during the current step.
-    fn anim_at(&self, pos: (i32, i32, i32)) -> Option<PonderAnim> {
+    fn anim_at(&self, pos: (i32, i32, i32)) -> Option<MachineTutorialAnimation> {
         self.current_step().and_then(|s| {
             s.animated_parts
                 .iter()
@@ -1890,7 +1890,7 @@ impl PonderScene {
 /// depth-sorted (painter's algorithm, far → near) and rasterized as 1px
 /// scanline `FillRect`s, so the whole thing rides the existing
 /// software/wgpu quad pipeline with no extra primitives.
-pub fn draw_ponder_scene(list: &mut UiDrawList, vp: UiRect, scene: &PonderScene) {
+pub fn draw_machine_tutorial_scene(list: &mut UiDrawList, vp: UiRect, scene: &MachineTutorialScene) {
     if vp.w < 8 || vp.h < 8 || scene.blocks.is_empty() {
         return;
     }
@@ -1951,7 +1951,7 @@ pub fn draw_ponder_scene(list: &mut UiDrawList, vp: UiRect, scene: &PonderScene)
 
     // Collect one cube's faces: `corner(i)` yields local offsets in
     // {0,1}³; `half` shrinks marker cubes (0.5 = full voxel).
-    let mut collect = |bx: f32, by: f32, bz: f32, half: f32, anim: Option<PonderAnim>, base: UiColor| {
+    let mut collect = |bx: f32, by: f32, bz: f32, half: f32, anim: Option<MachineTutorialAnimation>, base: UiColor| {
         let lo = 0.5 - half;
         let hi = 0.5 + half;
         let mut pts = [(0.0f32, 0.0f32, 0.0f32); 8];
@@ -1960,26 +1960,26 @@ pub fn draw_ponder_scene(list: &mut UiDrawList, vp: UiRect, scene: &PonderScene)
             let mut ly = if i & 2 == 0 { lo } else { hi };
             let mut lz = if i & 4 == 0 { lo } else { hi };
             match anim {
-                Some(PonderAnim::Spin { axis, rpm }) => {
+                Some(MachineTutorialAnimation::Spin { axis, rpm }) => {
                     let ang = scene.tick as f32 * rpm * std::f32::consts::TAU / 1200.0;
                     let (s, c) = (Mth::sin(ang), Mth::cos(ang));
                     let (mx, my, mz) = (lx - 0.5, ly - 0.5, lz - 0.5);
                     match axis {
-                        PonderAxis::X => {
+                        MachineTutorialAxis::X => {
                             ly = 0.5 + my * c - mz * s;
                             lz = 0.5 + my * s + mz * c;
                         }
-                        PonderAxis::Y => {
+                        MachineTutorialAxis::Y => {
                             lx = 0.5 + mx * c - mz * s;
                             lz = 0.5 + mx * s + mz * c;
                         }
-                        PonderAxis::Z => {
+                        MachineTutorialAxis::Z => {
                             lx = 0.5 + mx * c - my * s;
                             ly = 0.5 + mx * s + my * c;
                         }
                     }
                 }
-                Some(PonderAnim::Oscillate {
+                Some(MachineTutorialAnimation::Oscillate {
                     axis,
                     amplitude,
                     period_ticks,
@@ -1988,9 +1988,9 @@ pub fn draw_ponder_scene(list: &mut UiDrawList, vp: UiRect, scene: &PonderScene)
                         / period_ticks.max(1) as f32;
                     let off = amplitude * Mth::sin(phase);
                     match axis {
-                        PonderAxis::X => lx += off,
-                        PonderAxis::Y => ly += off,
-                        PonderAxis::Z => lz += off,
+                        MachineTutorialAxis::X => lx += off,
+                        MachineTutorialAxis::Y => ly += off,
+                        MachineTutorialAxis::Z => lz += off,
                     }
                 }
                 None => {}
@@ -2080,7 +2080,7 @@ pub fn draw_ponder_scene(list: &mut UiDrawList, vp: UiRect, scene: &PonderScene)
     }
 }
 
-fn bounds_axis(blocks: &[PonderVoxel], f: impl Fn(&PonderVoxel) -> i32) -> (i32, i32) {
+fn bounds_axis(blocks: &[MachineTutorialVoxel], f: impl Fn(&MachineTutorialVoxel) -> i32) -> (i32, i32) {
     let mut lo = i32::MAX;
     let mut hi = i32::MIN;
     for b in blocks {
@@ -2158,33 +2158,33 @@ fn rasterize_line(list: &mut UiDrawList, vp: UiRect, a: (f32, f32), b: (f32, f32
 // Browser state: tabs, views, widget ids, actions
 // ---------------------------------------------------------------------------
 
-/// The top-level browser tab (JEI item grid, EMI tree, JER resources,
-/// Create Ponder).
+/// The top-level browser tab (item grid, craft tree, world resources,
+/// machine tutorials).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserTab {
     #[default]
     Items,
     Tree,
-    Jer,
-    Ponder,
+    WorldDropsInfo,
+    MachineTutorials,
 }
 
 impl BrowserTab {
-    pub const ALL: [Self; 4] = [Self::Items, Self::Tree, Self::Jer, Self::Ponder];
+    pub const ALL: [Self; 4] = [Self::Items, Self::Tree, Self::WorldDropsInfo, Self::MachineTutorials];
 
     fn label(self, lang: UiLang) -> &'static str {
         match self {
             Self::Items => tr(lang, "Items", "アイテム"),
             Self::Tree => tr(lang, "Tree", "ツリー"),
-            Self::Jer => tr(lang, "JER", "JER"),
-            Self::Ponder => tr(lang, "Ponder", "ポンダー"),
+            Self::WorldDropsInfo => tr(lang, "Drops & World Info", "ドロップとワールド情報"),
+            Self::MachineTutorials => tr(lang, "Machine Tutorials", "機械チュートリアル"),
         }
     }
 }
 
-/// JER sub-tab.
+/// World resource sub-tab.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum JerTab {
+pub enum WorldDropsTab {
     #[default]
     MobDrops,
     OreGen,
@@ -2194,7 +2194,7 @@ pub enum JerTab {
     Fuels,
 }
 
-impl JerTab {
+impl WorldDropsTab {
     pub const ALL: [Self; 6] = [
         Self::MobDrops,
         Self::OreGen,
@@ -2241,8 +2241,8 @@ pub enum RecipeWidgetId {
     SearchClear,
     TabItems,
     TabTree,
-    TabJer,
-    TabPonder,
+    TabWorldDropsInfo,
+    TabMachineTutorials,
     /// Breadcrumb back from a recipes/uses detail to the item grid.
     DetailBack,
     /// A grid slot; payload is the index into the *visible* item list.
@@ -2257,12 +2257,12 @@ pub enum RecipeWidgetId {
     BookmarkRemove,
     /// A recipe row in the detail list; payload is the row index.
     RecipeRow(usize),
-    /// The row's `+` transfer button (JEI "fill crafting grid").
+    /// The row's `+` transfer button (recipe browser "fill crafting grid").
     TransferRecipe(usize),
     /// An item slot inside a recipe diagram; `n` indexes the recipe's
     /// `inputs ++ outputs` order.
     DetailSlot(usize),
-    /// EMI "craftable only" filter toggle (grid + overlay).
+    /// Craftable-only filter toggle (grid + overlay).
     CraftableOnlyToggle,
     DetailScrollUp,
     DetailScrollDown,
@@ -2277,19 +2277,19 @@ pub enum RecipeWidgetId {
     TreePin,
     /// A pinned-tree row in the bookmarks panel.
     PinnedTreeRow(usize),
-    JerTabMobs,
-    JerTabOres,
-    JerTabTrades,
-    JerTabLoot,
-    JerTabEnchants,
-    JerTabFuels,
-    JerScrollUp,
-    JerScrollDown,
-    PonderPrev,
-    PonderPlay,
-    PonderNext,
-    PonderRotateLeft,
-    PonderRotateRight,
+    WorldDropsTabMobs,
+    WorldDropsTabOres,
+    WorldDropsTabTrades,
+    WorldDropsTabLoot,
+    WorldDropsTabEnchants,
+    WorldDropsTabFuels,
+    WorldDropsScrollUp,
+    WorldDropsScrollDown,
+    MachineTutorialPrev,
+    MachineTutorialPlay,
+    MachineTutorialNext,
+    MachineTutorialRotateLeft,
+    MachineTutorialRotateRight,
 }
 
 /// A clickable rectangle emitted alongside the draw list.
@@ -2309,7 +2309,7 @@ impl RecipeHitRegion {
 /// What the embedding application must perform after an interaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeBrowserAction {
-    /// JEI-style `+` button: fill the player's crafting grid with this
+    /// recipe-browser-style `+` button: fill the player's crafting grid with this
     /// recipe. `max_craft` is how many times the recipe can run on the
     /// host-supplied `inventory` (or `64` when none was supplied).
     TransferToCraftingGrid { recipe_id: String, max_craft: u32 },
@@ -2348,7 +2348,7 @@ fn query_token(body: &str) -> QueryToken {
     }
 }
 
-/// EMI/JEI query syntax: the search line splits into `|`-separated OR
+/// recipe-overlay query syntax: the search line splits into `|`-separated OR
 /// clauses; each clause is a whitespace-separated AND of tokens where
 /// `-token` negates. `a | b c` = `(a) OR (b AND c)`.
 fn parse_query(search: &str) -> Vec<Vec<QueryToken>> {
@@ -2408,7 +2408,7 @@ fn field_rank(token: &str, field: &str) -> Option<u32> {
 /// Interactive state of the recipe & resource browser.
 #[derive(Clone, Debug)]
 pub struct RecipeBrowserState {
-    /// Host-supplied item/recipe/JER data.
+    /// Host-supplied item, recipe, and world-resource data.
     pub index: RecipeIndex,
     /// UI language for chrome labels.
     pub lang: UiLang,
@@ -2430,10 +2430,10 @@ pub struct RecipeBrowserState {
     pub inventory: BTreeMap<String, u64>,
     /// Per-item recipe override for tree building (`item_id → recipe_id`).
     pub recipe_selections: BTreeMap<String, String>,
-    /// Active JER sub-tab.
-    pub jer_tab: JerTab,
-    /// The loaded Ponder scene, if the host supplied one.
-    pub ponder: Option<PonderScene>,
+    /// Active world resource sub-tab.
+    pub world_drops_tab: WorldDropsTab,
+    /// The loaded machine-tutorial scene, if the host supplied one.
+    pub machine_tutorial: Option<MachineTutorialScene>,
     /// Widget under the mouse cursor (hover highlight).
     pub hover: Option<RecipeWidgetId>,
     search_focused: bool,
@@ -2447,12 +2447,12 @@ pub struct RecipeBrowserState {
     /// The expanded recipe tree (`Tree` tab target), when built.
     pub tree: Option<RecipeTree>,
     tree_scroll: usize,
-    jer_scroll: usize,
+    world_drops_scroll: usize,
     /// Minecraft locale the UI currently displays (`"en_us"`, `"ja_jp"`,
     /// `"fr_fr"`, ...) — resolves localized item names and is matched by
     /// search; the host syncs it from `settings.locale`.
     pub active_locale: String,
-    /// EMI "craftable only" grid filter (player inventory driven).
+    /// Craftable-only grid filter (player inventory driven).
     pub craftable_only: bool,
     /// Detail navigation stack — `Backspace`/`< Back` pops it.
     history: Vec<(String, DetailMode)>,
@@ -2477,8 +2477,8 @@ impl Default for RecipeBrowserState {
             pinned_trees: Vec::new(),
             inventory: BTreeMap::new(),
             recipe_selections: BTreeMap::new(),
-            jer_tab: JerTab::MobDrops,
-            ponder: None,
+            world_drops_tab: WorldDropsTab::MobDrops,
+            machine_tutorial: None,
             hover: None,
             search_focused: true,
             selected: 0,
@@ -2487,7 +2487,7 @@ impl Default for RecipeBrowserState {
             detail_scroll: 0,
             tree: None,
             tree_scroll: 0,
-            jer_scroll: 0,
+            world_drops_scroll: 0,
             active_locale: "en_us".to_owned(),
             craftable_only: false,
             history: Vec::new(),
@@ -2605,7 +2605,7 @@ impl RecipeBrowserState {
                 .any(|r| self.index.max_craft(r, &self.inventory) > 0)
     }
 
-    /// Item indices passing the EMI query — `|`-separated OR clauses of
+    /// Item indices passing the recipe tree query — `|`-separated OR clauses of
     /// AND'd tokens (`-token` negates) — then optionally the
     /// `craftable_only` inventory filter, scored by text relevance then
     /// alphabetical display order.
@@ -2833,12 +2833,12 @@ impl RecipeBrowserState {
             RecipeWidgetId::TabTree => {
                 self.tab = BrowserTab::Tree;
             }
-            RecipeWidgetId::TabJer => {
-                self.tab = BrowserTab::Jer;
-                self.jer_scroll = 0;
+            RecipeWidgetId::TabWorldDropsInfo => {
+                self.tab = BrowserTab::WorldDropsInfo;
+                self.world_drops_scroll = 0;
             }
-            RecipeWidgetId::TabPonder => {
-                self.tab = BrowserTab::Ponder;
+            RecipeWidgetId::TabMachineTutorials => {
+                self.tab = BrowserTab::MachineTutorials;
             }
             RecipeWidgetId::DetailBack => {
                 return self.back_or_close();
@@ -2920,40 +2920,40 @@ impl RecipeBrowserState {
                     self.open_tree(&item, count);
                 }
             }
-            RecipeWidgetId::JerTabMobs => self.set_jer_tab(JerTab::MobDrops),
-            RecipeWidgetId::JerTabOres => self.set_jer_tab(JerTab::OreGen),
-            RecipeWidgetId::JerTabTrades => self.set_jer_tab(JerTab::Trades),
-            RecipeWidgetId::JerTabLoot => self.set_jer_tab(JerTab::Loot),
-            RecipeWidgetId::JerTabEnchants => self.set_jer_tab(JerTab::Enchants),
-            RecipeWidgetId::JerTabFuels => self.set_jer_tab(JerTab::Fuels),
-            RecipeWidgetId::JerScrollUp => {
-                self.jer_scroll = self.jer_scroll.saturating_sub(1);
+            RecipeWidgetId::WorldDropsTabMobs => self.set_world_drops_tab(WorldDropsTab::MobDrops),
+            RecipeWidgetId::WorldDropsTabOres => self.set_world_drops_tab(WorldDropsTab::OreGen),
+            RecipeWidgetId::WorldDropsTabTrades => self.set_world_drops_tab(WorldDropsTab::Trades),
+            RecipeWidgetId::WorldDropsTabLoot => self.set_world_drops_tab(WorldDropsTab::Loot),
+            RecipeWidgetId::WorldDropsTabEnchants => self.set_world_drops_tab(WorldDropsTab::Enchants),
+            RecipeWidgetId::WorldDropsTabFuels => self.set_world_drops_tab(WorldDropsTab::Fuels),
+            RecipeWidgetId::WorldDropsScrollUp => {
+                self.world_drops_scroll = self.world_drops_scroll.saturating_sub(1);
             }
-            RecipeWidgetId::JerScrollDown => {
-                self.jer_scroll += 1;
+            RecipeWidgetId::WorldDropsScrollDown => {
+                self.world_drops_scroll += 1;
             }
-            RecipeWidgetId::PonderPrev => {
-                if let Some(p) = &mut self.ponder {
+            RecipeWidgetId::MachineTutorialPrev => {
+                if let Some(p) = &mut self.machine_tutorial {
                     p.prev_step();
                 }
             }
-            RecipeWidgetId::PonderNext => {
-                if let Some(p) = &mut self.ponder {
+            RecipeWidgetId::MachineTutorialNext => {
+                if let Some(p) = &mut self.machine_tutorial {
                     p.next_step();
                 }
             }
-            RecipeWidgetId::PonderPlay => {
-                if let Some(p) = &mut self.ponder {
+            RecipeWidgetId::MachineTutorialPlay => {
+                if let Some(p) = &mut self.machine_tutorial {
                     p.playing = !p.playing;
                 }
             }
-            RecipeWidgetId::PonderRotateLeft => {
-                if let Some(p) = &mut self.ponder {
+            RecipeWidgetId::MachineTutorialRotateLeft => {
+                if let Some(p) = &mut self.machine_tutorial {
                     p.rotate(-15.0);
                 }
             }
-            RecipeWidgetId::PonderRotateRight => {
-                if let Some(p) = &mut self.ponder {
+            RecipeWidgetId::MachineTutorialRotateRight => {
+                if let Some(p) = &mut self.machine_tutorial {
                     p.rotate(15.0);
                 }
             }
@@ -2961,10 +2961,10 @@ impl RecipeBrowserState {
         Vec::new()
     }
 
-    fn set_jer_tab(&mut self, tab: JerTab) {
-        if self.jer_tab != tab {
-            self.jer_tab = tab;
-            self.jer_scroll = 0;
+    fn set_world_drops_tab(&mut self, tab: WorldDropsTab) {
+        if self.world_drops_tab != tab {
+            self.world_drops_tab = tab;
+            self.world_drops_scroll = 0;
         }
     }
 
@@ -3032,13 +3032,13 @@ impl RecipeBrowserState {
     /// host must perform. `width`/`height` are the frame's physical
     /// pixels for pointer hit-testing and grid-column math.
     ///
-    /// Keyboard/gamepad semantics (JEI-style):
+    /// Keyboard/gamepad semantics (recipe-browser-style):
     ///
     /// * typing into a focused search edits it; with the search unfocused,
     ///   `R` opens recipes, `U` uses, `A`/`B` toggles a bookmark, `T`
-    ///   builds the recipe tree, `P` jumps to Ponder, `+` transfers;
+    ///   builds the recipe tree, `P` jumps to Machine Tutorials, `+` transfers;
     /// * `Tab` toggles search focus; arrows navigate grid/list/columns,
-    ///   `Left`/`Right` rotate the Ponder camera, `Up`/`Down` step it;
+    ///   `Left`/`Right` rotate the tutorial camera, `Up`/`Down` step it;
     /// * `Enter`/`Space` activate; `Escape` backs out or closes;
     /// * gamepad `South` mirrors `Enter`, D-pad mirrors arrows,
     ///   `East`/`Start` backs out or closes.
@@ -3091,7 +3091,7 @@ impl RecipeBrowserState {
                                 self.open_tree(&item, 1);
                             }
                         }
-                        'p' | 'P' => self.tab = BrowserTab::Ponder,
+                        'p' | 'P' => self.tab = BrowserTab::MachineTutorials,
                         '+' => return self.transfer_selected_recipe(),
                         c if (' '..='~').contains(&c) => {
                             self.search_focused = true;
@@ -3180,11 +3180,11 @@ impl RecipeBrowserState {
                     BrowserTab::Tree => {
                         self.tree_scroll = (self.tree_scroll as i64 + dir).max(0) as usize;
                     }
-                    BrowserTab::Jer => {
-                        self.jer_scroll = (self.jer_scroll as i64 + dir).max(0) as usize;
+                    BrowserTab::WorldDropsInfo => {
+                        self.world_drops_scroll = (self.world_drops_scroll as i64 + dir).max(0) as usize;
                     }
-                    BrowserTab::Ponder => {
-                        if let Some(p) = &mut self.ponder {
+                    BrowserTab::MachineTutorials => {
+                        if let Some(p) = &mut self.machine_tutorial {
                             if dir < 0 {
                                 p.prev_step();
                             } else {
@@ -3205,8 +3205,8 @@ impl RecipeBrowserState {
                             self.move_selection(dir, false);
                         }
                     }
-                    BrowserTab::Ponder => {
-                        if let Some(p) = &mut self.ponder {
+                    BrowserTab::MachineTutorials => {
+                        if let Some(p) = &mut self.machine_tutorial {
                             p.rotate(if dir < 0 { -15.0 } else { 15.0 });
                         }
                     }
@@ -3214,8 +3214,8 @@ impl RecipeBrowserState {
                         let page = 10i64;
                         self.tree_scroll = (self.tree_scroll as i64 + dir * page).max(0) as usize;
                     }
-                    BrowserTab::Jer => {
-                        self.jer_scroll = (self.jer_scroll as i64 + dir * 5).max(0) as usize;
+                    BrowserTab::WorldDropsInfo => {
+                        self.world_drops_scroll = (self.world_drops_scroll as i64 + dir * 5).max(0) as usize;
                     }
                 }
             }
@@ -3229,15 +3229,15 @@ impl RecipeBrowserState {
                         self.open_detail(&item, DetailMode::Recipes);
                     }
                 }
-                BrowserTab::Ponder => {
-                    if let Some(p) = &mut self.ponder {
+                BrowserTab::MachineTutorials => {
+                    if let Some(p) = &mut self.machine_tutorial {
                         p.playing = !p.playing;
                     }
                 }
                 _ => {}
             },
             UiKey::Backspace => {
-                // Search text edits first (refocusing like JEI); an empty
+                // Search text edits first (refocusing like recipe browser); an empty
                 // search walks the recipe-viewing history back one entry.
                 if !self.search.is_empty() {
                     self.search.pop();
@@ -3373,7 +3373,7 @@ impl RecipeBrowserState {
         (lay.finish(), hits)
     }
 
-    /// JEI/EMI side-panel overlay for an open container screen. `panel`
+    /// recipe overlay side-panel overlay for an open container screen. `panel`
     /// is the container's physical-pixel rect; the browser draws a
     /// bookmarks/pinned-trees column to its left and a search + item
     /// grid (or recipe detail) column to its right. Returns `None` when
@@ -3397,7 +3397,7 @@ impl RecipeBrowserState {
             panel.h / (s.max(1)) as u32,
         );
         // Preferred widths at scale 1-2; when the UI scale leaves less
-        // room the panels shrink (JEI-style) down to a floor — only then
+        // room the panels shrink (recipe-browser-style) down to a floor — only then
         // does the overlay hide.
         const LEFT_W: i32 = 148;
         const RIGHT_W: i32 = 196;
@@ -3544,7 +3544,7 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Right overlay column: search row + `x` clear + EMI craftable-only
+    /// Right overlay column: search row + `x` clear + craftable-only
     /// toggle, then either the recipe-detail card or the item grid.
     fn render_overlay_right(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, panel: UiRect) {
         let lang = self.lang;
@@ -3612,7 +3612,7 @@ impl RecipeBrowserState {
             lay.region(hits, RecipeWidgetId::SearchClear, clear);
         }
 
-        // EMI craftable-only toggle: [x] Craftable.
+        // Craftable-only toggle: [x] Craftable.
         let tog = UiRect::new(panel.x + 3, panel.y + 19, panel.w - 6, 12);
         let on = self.craftable_only;
         lay.fill_rect(
@@ -3653,7 +3653,7 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Icon-only item grid inside the right overlay column (JEI sidebar
+    /// Icon-only item grid inside the right overlay column (recipe browser sidebar
     /// semantics: `ItemSlot` regions, scroll buttons at the bottom).
     fn render_overlay_grid(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, body: UiRect) {
         let cols = ((body.w as i32) / SLOT_PITCH).max(1) as usize;
@@ -3706,7 +3706,7 @@ impl RecipeBrowserState {
         }
     }
 
-    /// JEI-style hover card for whichever item the pointer rests on:
+    /// recipe-browser-style hover card for whichever item the pointer rests on:
     /// localized name, English name when it differs, `@mod`, `#tags`
     /// (abbreviated), inventory count, and the `R`/`U`/`A` hint row.
     fn render_overlay_tooltip(&self, lay: &mut Lay) {
@@ -3722,10 +3722,10 @@ impl RecipeBrowserState {
         let local_name = self
             .index
             .display_name_for_locale(&item_id, &self.active_locale);
-        // The classic purple-bordered JEI tooltip — shared verbatim with
-        // `jei_emi_overlay` so an item hover looks identical on the full
+        // The classic purple-bordered recipe browser tooltip — shared verbatim with
+        // `recipe_overlay` so an item hover looks identical on the full
         // browser and the native container overlay.
-        let mut item = jei_emi_overlay::OverlayItem::new(
+        let mut item = recipe_overlay::OverlayItem::new(
             &item_id,
             &local_name,
             entry.map(|e| e.mod_id.as_str()).unwrap_or("minecraft"),
@@ -3749,7 +3749,7 @@ impl RecipeBrowserState {
             )
             .to_owned(),
         );
-        jei_emi_overlay::render_item_tooltip(
+        recipe_overlay::render_item_tooltip(
             &mut lay.list,
             lay.w * s,
             lay.h * s,
@@ -3844,8 +3844,8 @@ impl RecipeBrowserState {
         let tabs = [
             (BrowserTab::Items, RecipeWidgetId::TabItems),
             (BrowserTab::Tree, RecipeWidgetId::TabTree),
-            (BrowserTab::Jer, RecipeWidgetId::TabJer),
-            (BrowserTab::Ponder, RecipeWidgetId::TabPonder),
+            (BrowserTab::WorldDropsInfo, RecipeWidgetId::TabWorldDropsInfo),
+            (BrowserTab::MachineTutorials, RecipeWidgetId::TabMachineTutorials),
         ];
         let mut x = MARGIN + 4;
         for (tab, id) in tabs {
@@ -4016,12 +4016,12 @@ impl RecipeBrowserState {
                 }
             }
             BrowserTab::Tree => self.render_tree(lay, hits, main),
-            BrowserTab::Jer => self.render_jer(lay, hits, main),
-            BrowserTab::Ponder => self.render_ponder(lay, hits, main),
+            BrowserTab::WorldDropsInfo => self.render_world_drops_info(lay, hits, main),
+            BrowserTab::MachineTutorials => self.render_machine_tutorial(lay, hits, main),
         }
     }
 
-    /// JEI item grid: 18px slots, deterministic swatch + initial letter.
+    /// recipe browser item grid: 18px slots, deterministic swatch + initial letter.
     fn render_grid(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         lay.fill_rect(main, DETAIL_BG);
         lay.border_rect(main, palette::PANEL_BORDER);
@@ -4167,7 +4167,7 @@ impl RecipeBrowserState {
             );
             // Transfer "+" button occupies the right column; the row hit
             // region stops before it so regions never overlap. The
-            // button is craftability-colored like JEI: green = fully
+            // button is craftability-colored like recipe browser: green = fully
             // craftable now, amber = some inputs on hand, dim = missing.
             let plus = UiRect::new(row.right() - 20, y + 4, 16, 16);
             let max_craft = self.index.max_craft(recipe, &self.inventory);
@@ -4415,7 +4415,7 @@ impl RecipeBrowserState {
         if let Some(ing) = recipe.inputs.first() {
             self.diagram_ing(lay, hits, area.x, area.y, ing, 0);
         }
-        // Flame under the input (JEI-style indicator).
+        // Flame under the input (recipe-browser-style indicator).
         let fx = area.x + 3;
         let fy = area.y + 24;
         lay.fill(fx, fy + 4, 12, 6, UiColor::rgb(196, 92, 32));
@@ -4669,7 +4669,7 @@ impl RecipeBrowserState {
         }
     }
 
-    /// EMI tree view: indented node list left, totals right.
+    /// Craft-tree view: indented node list left, totals right.
     fn render_tree(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
         lay.fill_rect(main, DETAIL_BG);
@@ -4885,19 +4885,19 @@ impl RecipeBrowserState {
         }
     }
 
-    /// JER tabs: mob drops, ore histograms, trades, loot, enchants.
-    fn render_jer(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
+    /// World resource tabs: mob drops, ore histograms, trades, loot, enchants.
+    fn render_world_drops_info(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
         lay.fill_rect(main, DETAIL_BG);
         lay.border_rect(main, palette::PANEL_BORDER);
         // Sub-tab pills.
         let subs = [
-            (JerTab::MobDrops, RecipeWidgetId::JerTabMobs),
-            (JerTab::OreGen, RecipeWidgetId::JerTabOres),
-            (JerTab::Trades, RecipeWidgetId::JerTabTrades),
-            (JerTab::Loot, RecipeWidgetId::JerTabLoot),
-            (JerTab::Enchants, RecipeWidgetId::JerTabEnchants),
-            (JerTab::Fuels, RecipeWidgetId::JerTabFuels),
+            (WorldDropsTab::MobDrops, RecipeWidgetId::WorldDropsTabMobs),
+            (WorldDropsTab::OreGen, RecipeWidgetId::WorldDropsTabOres),
+            (WorldDropsTab::Trades, RecipeWidgetId::WorldDropsTabTrades),
+            (WorldDropsTab::Loot, RecipeWidgetId::WorldDropsTabLoot),
+            (WorldDropsTab::Enchants, RecipeWidgetId::WorldDropsTabEnchants),
+            (WorldDropsTab::Fuels, RecipeWidgetId::WorldDropsTabFuels),
         ];
         let mut x = main.x + 4;
         for (tab, id) in subs {
@@ -4907,7 +4907,7 @@ impl RecipeBrowserState {
                 break;
             }
             let rect = UiRect::new(x, main.y + 4, w as u32, 13);
-            let active = self.jer_tab == tab;
+            let active = self.world_drops_tab == tab;
             lay.fill_rect(
                 rect,
                 if active {
@@ -4932,10 +4932,10 @@ impl RecipeBrowserState {
         let list_top = main.y + 22;
         let list_bottom = main.bottom() - 4;
         let cells = ((main.w as i32 - 30) / 8).max(1) as usize;
-        match self.jer_tab {
-            JerTab::MobDrops => {
+        match self.world_drops_tab {
+            WorldDropsTab::MobDrops => {
                 let rows = ((list_bottom - list_top) / 12).max(0) as usize;
-                let scroll = self.jer_scroll.min(self.index.mob_drops.len().saturating_sub(rows));
+                let scroll = self.world_drops_scroll.min(self.index.mob_drops.len().saturating_sub(rows));
                 for (ri, e) in self.index.mob_drops.iter().enumerate().skip(scroll).take(rows) {
                     let y = list_top + (ri - scroll) as i32 * 12;
                     let cond = if e.condition.is_empty() {
@@ -4961,11 +4961,11 @@ impl RecipeBrowserState {
                     lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
                 }
             }
-            JerTab::OreGen => {
+            WorldDropsTab::OreGen => {
                 let row_h = 44;
                 let rows = ((list_bottom - list_top) / row_h).max(0) as usize;
                 let scroll = self
-                    .jer_scroll
+                    .world_drops_scroll
                     .min(self.index.ore_distributions.len().saturating_sub(rows));
                 for (ri, e) in self
                     .index
@@ -5021,10 +5021,10 @@ impl RecipeBrowserState {
                     }
                 }
             }
-            JerTab::Trades => {
+            WorldDropsTab::Trades => {
                 let rows = ((list_bottom - list_top) / 12).max(0) as usize;
                 let scroll = self
-                    .jer_scroll
+                    .world_drops_scroll
                     .min(self.index.villager_trades.len().saturating_sub(rows));
                 for (ri, e) in self
                     .index
@@ -5055,10 +5055,10 @@ impl RecipeBrowserState {
                     lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
                 }
             }
-            JerTab::Loot => {
+            WorldDropsTab::Loot => {
                 let rows = ((list_bottom - list_top) / 12).max(0) as usize;
                 let scroll = self
-                    .jer_scroll
+                    .world_drops_scroll
                     .min(self.index.dungeon_loot.len().saturating_sub(rows));
                 for (ri, e) in self.index.dungeon_loot.iter().enumerate().skip(scroll).take(rows) {
                     let y = list_top + (ri - scroll) as i32 * 12;
@@ -5075,10 +5075,10 @@ impl RecipeBrowserState {
                     lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
                 }
             }
-            JerTab::Enchants => {
+            WorldDropsTab::Enchants => {
                 let rows = ((list_bottom - list_top) / 12).max(0) as usize;
                 let scroll = self
-                    .jer_scroll
+                    .world_drops_scroll
                     .min(self.index.enchant_compat.len().saturating_sub(rows));
                 for (ri, e) in self.index.enchant_compat.iter().enumerate().skip(scroll).take(rows) {
                     let y = list_top + (ri - scroll) as i32 * 12;
@@ -5095,12 +5095,12 @@ impl RecipeBrowserState {
                     lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
                 }
             }
-            JerTab::Fuels => {
-                // JER furnace fuels: icon + name + burn ticks + a live
+            WorldDropsTab::Fuels => {
+                // Furnace fuels: icon + name + burn ticks + a live
                 // burn bar proportional to the hottest fuel in the list.
                 let rows = ((list_bottom - list_top) / 14).max(0) as usize;
                 let scroll = self
-                    .jer_scroll
+                    .world_drops_scroll
                     .min(self.index.fuels.len().saturating_sub(rows));
                 let max_burn = self
                     .index
@@ -5161,13 +5161,13 @@ impl RecipeBrowserState {
             }
         }
         // Shared scroll buttons.
-        let count = match self.jer_tab {
-            JerTab::MobDrops => self.index.mob_drops.len(),
-            JerTab::OreGen => self.index.ore_distributions.len(),
-            JerTab::Trades => self.index.villager_trades.len(),
-            JerTab::Loot => self.index.dungeon_loot.len(),
-            JerTab::Enchants => self.index.enchant_compat.len(),
-            JerTab::Fuels => self.index.fuels.len(),
+        let count = match self.world_drops_tab {
+            WorldDropsTab::MobDrops => self.index.mob_drops.len(),
+            WorldDropsTab::OreGen => self.index.ore_distributions.len(),
+            WorldDropsTab::Trades => self.index.villager_trades.len(),
+            WorldDropsTab::Loot => self.index.dungeon_loot.len(),
+            WorldDropsTab::Enchants => self.index.enchant_compat.len(),
+            WorldDropsTab::Fuels => self.index.fuels.len(),
         };
         if count > 0 {
             let sb_x = main.right() - 12;
@@ -5177,23 +5177,23 @@ impl RecipeBrowserState {
             lay.fill_rect(down, palette::BUTTON);
             lay.ctext_in(up, 1, palette::TEXT, "^");
             lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, RecipeWidgetId::JerScrollUp, up);
-            lay.region(hits, RecipeWidgetId::JerScrollDown, down);
+            lay.region(hits, RecipeWidgetId::WorldDropsScrollUp, up);
+            lay.region(hits, RecipeWidgetId::WorldDropsScrollDown, down);
         }
     }
 
-    /// Create Ponder tab: 3D viewport + transport controls + caption.
-    fn render_ponder(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
+    /// Machine Tutorials tab: 3D viewport + transport controls + caption.
+    fn render_machine_tutorial(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
         lay.fill_rect(main, DETAIL_BG);
         lay.border_rect(main, palette::PANEL_BORDER);
-        let Some(scene) = &self.ponder else {
+        let Some(scene) = &self.machine_tutorial else {
             lay.text_fit(
                 main.x + 6,
                 main.y + 8,
                 1,
                 palette::TEXT_DIM,
-                tr(lang, "No Ponder scene loaded", "ポンダーシーンなし"),
+                tr(lang, "No machine tutorial loaded", "機械チュートリアルなし"),
                 ((main.w as i32 - 12) / 8).max(1) as usize,
             );
             return;
@@ -5201,14 +5201,14 @@ impl RecipeBrowserState {
 
         // Control row: [|<] [play/pause] [>|] [rot<] [rot>] step i/n.
         let controls = [
-            (RecipeWidgetId::PonderPrev, "|<"),
+            (RecipeWidgetId::MachineTutorialPrev, "|<"),
             (
-                RecipeWidgetId::PonderPlay,
+                RecipeWidgetId::MachineTutorialPlay,
                 if scene.playing { "||" } else { "|>" },
             ),
-            (RecipeWidgetId::PonderNext, ">|"),
-            (RecipeWidgetId::PonderRotateLeft, "<-"),
-            (RecipeWidgetId::PonderRotateRight, "->"),
+            (RecipeWidgetId::MachineTutorialNext, ">|"),
+            (RecipeWidgetId::MachineTutorialRotateLeft, "<-"),
+            (RecipeWidgetId::MachineTutorialRotateRight, "->"),
         ];
         let mut x = main.x + 4;
         for (id, label) in controls {
@@ -5252,7 +5252,7 @@ impl RecipeBrowserState {
             (main.h as i32 - 22 - caption_h - 4).max(8) as u32,
         );
         lay.fill_rect(vp, palette::SLOT);
-        lay.ponder(vp, scene);
+        lay.machine_tutorial(vp, scene);
         if let Some(step) = scene.current_step() {
             let bar = UiRect::new(vp.x, vp.bottom() + 2, vp.w, 14);
             lay.fill_rect(bar, palette::BUTTON_DISABLED);
@@ -5415,10 +5415,10 @@ impl Lay {
             .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
-    /// Ponder scene rasterized directly in physical pixels inside `r`.
-    fn ponder(&mut self, r: UiRect, scene: &PonderScene) {
+    /// MachineTutorial scene rasterized directly in physical pixels inside `r`.
+    fn machine_tutorial(&mut self, r: UiRect, scene: &MachineTutorialScene) {
         let vp = self.phys(r);
-        draw_ponder_scene(&mut self.list, vp, scene);
+        draw_machine_tutorial_scene(&mut self.list, vp, scene);
     }
 
     /// Emit an `ItemIcon` inside logical rect `r` — the GPU paints the

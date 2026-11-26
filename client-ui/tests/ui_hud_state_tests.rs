@@ -426,3 +426,99 @@ fn features_do_not_render_off_the_ingame_hud_screen() {
         assert!(!has_text(&list, marker), "{marker} on title screen");
     }
 }
+
+#[test]
+fn hud_sprite_bindings_are_used_with_atlas_and_fall_back_without_it() {
+    use megu_client_ui::draw::{hud_sprite_ids, GuiSpriteAtlas, GuiSpriteEntry};
+
+    let entry = |width, height, uv_min, uv_max| GuiSpriteEntry {
+        uv_min,
+        uv_max,
+        width,
+        height,
+        nine_slice_border: [0, 0, 0, 0],
+    };
+    let mut atlas = GuiSpriteAtlas::default();
+    for (key, width, height) in [
+        (hud_sprite_ids::HOTBAR, 182, 22),
+        (hud_sprite_ids::HOTBAR_SELECTION, 24, 24),
+        (hud_sprite_ids::EXPERIENCE_BAR_BACKGROUND, 182, 5),
+        (hud_sprite_ids::EXPERIENCE_BAR_PROGRESS, 182, 5),
+        (hud_sprite_ids::HEART_CONTAINER, 9, 9),
+        (hud_sprite_ids::HEART_FULL, 9, 9),
+        (hud_sprite_ids::HEART_HALF, 9, 9),
+        (hud_sprite_ids::FOOD_EMPTY, 9, 9),
+        (hud_sprite_ids::FOOD_FULL, 9, 9),
+        (hud_sprite_ids::FOOD_HALF, 9, 9),
+        (hud_sprite_ids::ARMOR_EMPTY, 9, 9),
+        (hud_sprite_ids::ARMOR_FULL, 9, 9),
+        (hud_sprite_ids::ARMOR_HALF, 9, 9),
+    ] {
+        atlas.insert_named_sprite(key, entry(width, height, [0.125, 0.25], [0.625, 0.75]));
+    }
+    atlas.insert_named_sprite(
+        hud_sprite_ids::CROSSHAIR,
+        entry(15, 15, [0.03125, 0.0625], [0.21875, 0.3125]),
+    );
+    atlas.insert_named_sprite(
+        "mob_effect/speed",
+        entry(18, 18, [0.5, 0.125], [0.875, 0.625]),
+    );
+
+    let mut ui = hud_ui();
+    ui.hud.health = 20.0;
+    ui.hud.armor = 10;
+    ui.hud.hunger = 20;
+    ui.hud.xp_progress = 0.5;
+    ui.hud.xp_level = 3;
+    ui.hud.status_effects.push(megu_client_ui::state::LiveStatusEffect {
+        effect_id: 0,
+        name: "speed".to_string(),
+        amplifier: 0,
+        duration_ticks: 200,
+        beneficial: true,
+    });
+    let mut with_atlas = UiDrawList::new();
+    ui.render_into_with_gui_atlas(VIEW.0, VIEW.1, &mut with_atlas, Some(&atlas));
+    let bound_sprites = with_atlas
+        .commands
+        .iter()
+        .filter(|cmd| matches!(cmd, UiCommand::ItemIcon { item_id, .. } if item_id.starts_with("@gui_uv:")))
+        .count();
+    assert!(
+        bound_sprites >= 30,
+        "hotbar+crosshair+vitals+XP should bind many atlas quads, got {bound_sprites}"
+    );
+    let encoded = |uv_min: [f32; 2], uv_max: [f32; 2]| {
+        format!(
+            "@gui_uv:{:08x}:{:08x}:{:08x}:{:08x}",
+            uv_min[0].to_bits(),
+            uv_min[1].to_bits(),
+            uv_max[0].to_bits(),
+            uv_max[1].to_bits()
+        )
+    };
+    for expected in [
+        encoded([0.03125, 0.0625], [0.21875, 0.3125]),
+        encoded([0.5, 0.125], [0.875, 0.625]),
+    ] {
+        assert!(
+            with_atlas.commands.iter().any(|cmd| matches!(
+                cmd,
+                UiCommand::ItemIcon { item_id, .. } if *item_id == expected
+            )),
+            "missing exact HUD sprite UV binding {expected}"
+        );
+    }
+
+    let mut fallback = UiDrawList::new();
+    ui.render_into_with_gui_atlas(VIEW.0, VIEW.1, &mut fallback, None);
+    assert!(
+        !fallback.commands.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::ItemIcon { item_id, .. } if item_id.starts_with("@gui_uv:")
+        )),
+        "missing atlas must keep procedural fallback rather than invisible sprites"
+    );
+    assert!(fill_count(&fallback) > 0);
+}

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! Lane GPU-JEI-PONDER-WIRE: clean-room verification that real mod-JAR
-//! datapack content (recipes, item tags, JER loot) flows into
+//! Lane GPU-RECIPE-TUTORIAL-WIRE: clean-room verification that real mod-JAR
+//! datapack content (recipes, item tags, world-drops loot) flows into
 //! `RecipeBrowserState.index` with zero disk extraction, and that the
 //! window layer dispatches `TransferToCraftingGrid` plus the `R`/`U`/`W`
 //! hover hotkeys.
@@ -32,7 +32,7 @@ struct TempDir(PathBuf);
 impl TempDir {
     fn new(tag: &str) -> Self {
         let dir =
-            std::env::temp_dir().join(format!("megu-jeiwire-{tag}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("megu-recipewire-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)
@@ -178,11 +178,11 @@ fn deflate_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Test 1 — Deflate mod JAR → categories, tags, JER loot, EMI tree, no temps
+// Test 1 — Deflate mod JAR → categories, tags, world-drops loot, craft tree, no temps
 // ---------------------------------------------------------------------------
 
 #[test]
-fn jei_ingest_loads_deflate_mod_jar_custom_categories_tags_and_jer_loot_zero_temp_files()
+fn recipe_ingest_loads_deflate_mod_jar_custom_categories_tags_and_world_drops_loot_zero_temp_files()
  {
     let tmp = TempDir::new("jar");
     let jar = tmp.0.join("my_factory-1.0.0.jar");
@@ -311,7 +311,7 @@ fn jei_ingest_loads_deflate_mod_jar_custom_categories_tags_and_jer_loot_zero_tem
     );
     assert!(index.ingredient_accepts(&grind.inputs[0], "my_factory:ingot_b"));
 
-    // JER tables populated from the Deflate loot documents.
+    // world-drops tables populated from the Deflate loot documents.
     let golem = index
         .mob_drops
         .iter()
@@ -329,7 +329,7 @@ fn jei_ingest_loads_deflate_mod_jar_custom_categories_tags_and_jer_loot_zero_tem
         .iter()
         .any(|d| d.chest == "my_factory:chests/factory" && d.item_id == "my_factory:dust"));
 
-    // EMI tree: dust ← grinding(#ingots → ingot_a) ← smelting(raw_ore).
+    // Craft tree: dust ← grinding(#ingots → ingot_a) ← smelting(raw_ore).
     let tree = index.recipe_tree("my_factory:dust", 2, &Default::default());
     let root = tree.root.as_ref().expect("tree root");
     assert_eq!(root.item, "my_factory:dust");
@@ -346,7 +346,7 @@ fn jei_ingest_loads_deflate_mod_jar_custom_categories_tags_and_jer_loot_zero_tem
 }
 
 #[test]
-fn jei_ingest_boot_scans_game_dir_mods_in_deterministic_order() {
+fn recipe_ingest_boot_scans_game_dir_mods_in_deterministic_order() {
     let tmp = TempDir::new("boot");
     let mods = tmp.0.join("game").join("mods");
     std::fs::create_dir_all(&mods).unwrap();
@@ -421,7 +421,7 @@ fn app_with_inventory() -> (GpuApp, TempDir) {
 }
 
 #[test]
-fn jei_plus_autofill_and_r_u_w_hotkeys_dispatch_in_window_state() {
+fn recipe_plus_autofill_and_r_u_w_hotkeys_dispatch_in_window_state() {
     let (mut app, _game) = app_with_inventory();
     assert_eq!(app.container_slot_count(), Some(46));
 
@@ -479,12 +479,12 @@ fn jei_plus_autofill_and_r_u_w_hotkeys_dispatch_in_window_state() {
         Some(("minecraft:stone".to_owned(), DetailMode::Uses))
     );
 
-    app.dispatch_input(WindowInputEvent::RecipeBrowserFocus(RecipeFocus::Ponder));
+    app.dispatch_input(WindowInputEvent::RecipeBrowserFocus(RecipeFocus::MachineTutorial));
     assert_eq!(app.screen(), Screen::RecipeBrowser);
-    assert_eq!(app.recipe_browser().tab, BrowserTab::Ponder);
+    assert_eq!(app.recipe_browser().tab, BrowserTab::MachineTutorials);
     assert!(
-        app.recipe_browser().ponder.is_some(),
-        "W must build a Ponder scene for the hovered item"
+        app.recipe_browser().machine_tutorial.is_some(),
+        "W must build a MachineTutorial scene for the hovered item"
     );
 
     // An empty hovered slot is a no-op — the key falls back to its normal
@@ -505,7 +505,7 @@ fn jei_plus_autofill_and_r_u_w_hotkeys_dispatch_in_window_state() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn jei_ingest_reads_loose_datapack_dir_and_plural_layouts() {
+fn recipe_ingest_reads_loose_datapack_dir_and_plural_layouts() {
     let tmp = TempDir::new("pack");
     // A datapack dir under saves/world/datapacks/ using the *plural*
     // `loot_tables/` + `tags/items/` layout (pre-1.21 naming).
