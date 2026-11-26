@@ -122,7 +122,6 @@ fn mutate_player_extra_save(uuid: [u8; 16], mutate: impl FnOnce(&mut PlayerExtra
     mutate(extras.entry(uuid).or_default());
 }
 
-#[allow(dead_code)]
 fn saved_player_seen_credits(uuid: &[u8; 16]) -> bool {
     player_extra_saves()
         .lock()
@@ -131,12 +130,10 @@ fn saved_player_seen_credits(uuid: &[u8; 16]) -> bool {
         .is_some_and(|extra| extra.seen_credits)
 }
 
-#[allow(dead_code)]
 fn set_saved_player_seen_credits(uuid: [u8; 16], seen: bool) {
     mutate_player_extra_save(uuid, |extra| extra.seen_credits = seen);
 }
 
-#[allow(dead_code)]
 fn saved_player_enchantment_seed(uuid: &[u8; 16]) -> Option<i32> {
     player_extra_saves()
         .lock()
@@ -145,7 +142,6 @@ fn saved_player_enchantment_seed(uuid: &[u8; 16]) -> Option<i32> {
         .and_then(|extra| extra.enchantment_seed)
 }
 
-#[allow(dead_code)]
 fn set_saved_player_enchantment_seed(uuid: [u8; 16], seed: Option<i32>) {
     mutate_player_extra_save(uuid, |extra| extra.enchantment_seed = seed);
 }
@@ -2715,7 +2711,6 @@ fn write_world_file(
 // `(path, bytes)` set. `submit_batch`/`submit_all` are the OPT-S4 wiring
 // surface; `submit`/`flush` keep their existing single-file meaning.
 
-#[allow(dead_code)]
 enum SaveBatchOp {
     Write { path: std::path::PathBuf, bytes: Vec<u8> },
     Remove(std::path::PathBuf),
@@ -2725,13 +2720,11 @@ enum SaveBatchOp {
     },
 }
 
-#[allow(dead_code)]
 struct SaveBatchJob {
     ops: Vec<SaveBatchOp>,
     seq: u64,
 }
 
-#[allow(dead_code)]
 struct SaveBatchState {
     pending: Option<SaveBatchJob>,
     closing: bool,
@@ -2741,7 +2734,6 @@ struct SaveBatchState {
     last_error: Option<String>,
 }
 
-#[allow(dead_code)]
 struct SaveBatchWorker {
     state: std::sync::Arc<(Mutex<SaveBatchState>, std::sync::Condvar)>,
     next_seq: AtomicU64,
@@ -2863,10 +2855,8 @@ impl SaveBatchWorker {
     }
 }
 
-#[allow(dead_code)]
 static SAVE_BATCH_WORKER: OnceLock<SaveBatchWorker> = OnceLock::new();
 
-#[allow(dead_code)]
 fn save_batch_worker() -> &'static SaveBatchWorker {
     SAVE_BATCH_WORKER.get_or_init(SaveBatchWorker::spawn)
 }
@@ -2888,7 +2878,6 @@ impl AsyncSaveWorker {
     /// Queue a whole `WorldSaveSnapshot` — Overworld, companion overlays (or
     /// their removals) and the Create sidecar — as one batch. Returns the batch
     /// sequence for `flush_all`.
-    #[allow(dead_code)]
     pub(crate) fn submit_all(&self, dir: &std::path::Path, snapshot: WorldSaveSnapshot) -> u64 {
         let mut ops = Vec::with_capacity(5);
         let mut members = Vec::with_capacity(SnapshotMemberRole::ALL.len());
@@ -2940,7 +2929,6 @@ impl AsyncSaveWorker {
     }
 
     /// Wait for both the single-file queue and the batch queue to drain.
-    #[allow(dead_code)]
     pub(crate) fn flush_all(&self) -> std::io::Result<()> {
         self.flush()?;
         save_batch_worker().flush()
@@ -8872,7 +8860,6 @@ mod p5b_parity_world_border_tests {
 /// how many ticks a chunk keeps its residency after it was last covered by a
 /// player view window, the spawn ring, or a `/forceload` ticket.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)]
 struct LiveChunkUnloadPolicy {
     max_unticketed_chunks: usize,
     grace_ticks: u64,
@@ -8883,7 +8870,6 @@ struct LiveChunkUnloadPolicy {
 /// `block_entities_unloaded` counts reclaimed container/sign/store records;
 /// `entities_unloaded` counts the non-player mobs and item drops reclaimed.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[allow(dead_code)]
 struct LiveUnloadSummary {
     chunks_unloaded: usize,
     blocks_flushed: usize,
@@ -8897,7 +8883,6 @@ struct LiveUnloadSummary {
 /// than `grace_ticks` old has lost its ticket and may be evicted.
 #[allow(dead_code)]
 static LIVE_CHUNK_TICKETS: Registry<DimChunkKey, u64> = OnceLock::new();
-#[allow(dead_code)]
 fn live_chunk_tickets() -> &'static LockedMap<DimChunkKey, u64> {
     LIVE_CHUNK_TICKETS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -8923,7 +8908,6 @@ struct ParkedMob {
 /// block, container, block entity and parked entity back exactly as the unload
 /// left it.
 #[derive(Default)]
-#[allow(dead_code)]
 struct EvictedChunkArchive {
     edits: HashMap<u32, u32>,
     chests: Vec<(DimBlockPos, HashMap<i16, Stack>)>,
@@ -8978,7 +8962,6 @@ type EvictedRegionArchive = std::collections::BTreeMap<(i32, i32), EvictedChunkA
 /// `(rx, rz)` lose" answers the way the `.mca` merge answers it on disk.
 #[allow(dead_code)]
 static EVICTED_REGIONS: Registry<(DimId, i32, i32), EvictedRegionArchive> = OnceLock::new();
-#[allow(dead_code)]
 fn evicted_regions() -> &'static LockedMap<(DimId, i32, i32), EvictedRegionArchive> {
     EVICTED_REGIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -9014,7 +8997,6 @@ fn live_spawn_ticket_chunks() -> HashSet<DimChunkKey> {
 /// The union of every connected client's held chunk window, tagged with the
 /// dimension that client is in — the live answer to "which chunks is a player
 /// looking at right now".
-#[allow(dead_code)]
 fn live_client_view_chunks() -> HashSet<DimChunkKey> {
     clients()
         .lock()
@@ -9489,7 +9471,6 @@ fn unload_unticketed_chunk_overlays(
 /// unloaded up to `max_unticketed_chunks` per call. Each unload preserves its
 /// blocks to `flush_dir` (or `evicted_regions`) before reclaiming, so a failed
 /// write aborts that chunk's eviction rather than losing an edit.
-#[allow(dead_code)]
 fn sweep_unticketed_regions(
     active_player_chunks: &HashSet<DimChunkKey>,
     forceloaded_chunks: &HashSet<(i32, i32)>,
@@ -9548,7 +9529,6 @@ fn sweep_unticketed_regions(
 /// Re-hydrate a chunk parked in `evicted_regions`: the parked overlay and
 /// every drained store record returns to the live world exactly as the unload
 /// left it, with the derived caches left to rebuild on demand.
-#[allow(dead_code)]
 fn rehydrate_evicted_chunk(dim: DimId, cx: i32, cz: i32) -> bool {
     let archive = {
         let mut regions = evicted_regions()

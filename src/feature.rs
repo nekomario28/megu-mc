@@ -50,7 +50,6 @@ fn stage_end_crystal(placement: EndCrystalPlacement) {
 }
 
 /// Drain every generated End crystal exactly once, in generation order.
-#[allow(dead_code)]
 pub(crate) fn take_staged_end_crystals() -> Vec<EndCrystalPlacement> {
     let mut queue = generated_end_crystals()
         .lock()
@@ -60,7 +59,6 @@ pub(crate) fn take_staged_end_crystals() -> Vec<EndCrystalPlacement> {
 }
 
 /// Alias named for the live-world drain site.
-#[allow(dead_code)]
 pub(crate) fn drain_generated_end_crystals() -> Vec<EndCrystalPlacement> {
     take_staged_end_crystals()
 }

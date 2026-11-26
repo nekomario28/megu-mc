@@ -728,7 +728,6 @@ fn gr_snow_accumulation_height() -> u8 {
     (GR_SNOW_ACCUMULATION_HEIGHT.load(Ordering::Relaxed)).clamp(0, 8) as u8
 }
 /// Ready for the raid lane (P1-B): raids do not start while the rule is set.
-#[allow(dead_code)]
 fn gr_disable_raids() -> bool {
     GR_DISABLE_RAIDS.load(Ordering::Relaxed) != 0
 }
