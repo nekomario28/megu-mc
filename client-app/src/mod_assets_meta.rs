@@ -483,6 +483,14 @@ impl ClientModRegistry {
     pub fn block_state(&self, id: u32) -> Option<&ModBlockState> {
         self.blocks.get(&id)
     }
+    /// Iterate every decoded sparse block-state row in ascending global state-id
+    /// order. The rows are already fully sparse: callers must consume this
+    /// iterator directly rather than probing a dense span derived from
+    /// `base_block_state_id`, since one MRS1 frame may contain both the Create
+    /// band (`26_684..`) and the generic mod band (`1_000_000..`).
+    pub fn block_states(&self) -> impl Iterator<Item = (u32, &ModBlockState)> {
+        self.blocks.iter().map(|(&id, state)| (id, state))
+    }
     pub fn item_name(&self, id: u32) -> Option<&str> {
         self.items.get(&id).map(String::as_str)
     }

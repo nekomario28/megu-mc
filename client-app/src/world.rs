@@ -189,8 +189,9 @@ pub struct BlockTable {
     state_names: Vec<String>,
     biome_tints: BiomeTintResolver,
     /// Sparse registry for modded dynamic states. Dynamic ids start at
-    /// 1_000_000 on the mod protocol, so extending the dense per-state arrays
-    /// to the maximum id would waste tens of megabytes per table.
+    /// `STATE_COUNT` (`26_684`) on the mod protocol, with Create-band rows
+    /// directly above vanilla and generic mod rows at `1_000_000+`; extending
+    /// the dense per-state arrays to the maximum id would waste memory.
     dynamic_states: BTreeMap<u32, DynamicBlockState>,
     /// Exclusive state bound including installed dynamic ids.
     dynamic_state_limit: usize,
@@ -836,7 +837,13 @@ impl BlockTable {
     pub fn install_dynamic_mod_states(&mut self, states: &[(u32, String, u8)]) -> usize {
         let mut accepted = 0;
         for &(state_id, ref name, facts_byte) in states {
-            if state_id < 1_000_000 || name.is_empty() || name.len() > 512 {
+            // Vanilla rows (`0..STATE_COUNT`) are owned by the dense vanilla
+            // table and must never be overwritten by a dynamic registry frame.
+            // Every id at or above `STATE_COUNT` is mod-owned: Create-band
+            // rows start immediately at `26_684`, while generic mod rows use
+            // the sparse `1_000_000+` band. Accepting the full non-vanilla
+            // space also keeps mixed-band MRS1 frames lossless.
+            if state_id < STATE_COUNT || name.is_empty() || name.len() > 512 {
                 continue;
             }
             self.dynamic_states.insert(
@@ -2415,9 +2422,10 @@ pub struct WorldState {
     pub mesh_cache: MeshCache,
     /// Sparse full-resolution block states that cannot survive the kernel
     /// palette's 15-bit direct encoding, keyed by section then cell index.
-    /// Mod dynamic ids are u32 and start at 1_000_000; keeping them in this
-    /// side table prevents silent truncation while `StoredSection` retains
-    /// its stable public field layout for test helpers across the workspace.
+    /// Mod dynamic ids are u32 and start at `STATE_COUNT`; keeping the ones
+    /// that exceed the kernel palette's direct encoding in this side table
+    /// prevents silent truncation while `StoredSection` retains its stable
+    /// public field layout for test helpers across the workspace.
     section_dynamic_states: CoordMap<SectionCoord, BTreeMap<usize, u32>>,
     /// Official vanilla block-model catalog attached for exact shaped-block
     /// terrain meshing. `None` keeps the legacy greedy fast path untouched.
