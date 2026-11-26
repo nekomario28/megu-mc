@@ -2750,11 +2750,11 @@
   }
 
   // Pick the best download asset for this visitor's OS and architecture. The cross-platform
-  // bootstrapper JAR and Prism/mrpack packs are the graceful fallback when
-  // no native installer exists; URLs are re-validated against the GitHub
+  // bootstrapper JAR and Prism bundle are the graceful fallback when no
+  // native installer exists; URLs are re-validated against the GitHub
   // origin even though /api/latest already fails closed. The static hrefs in
-  // index.html stay pinned to site-config.js's releaseTag, so a failed fetch
-  // or a prerelease-only channel never leaves a dead "latest/download" link.
+  // index.html stay pinned to a known release tag, so a failed fetch or a
+  // prerelease-only channel never leaves a dead "latest/download" link.
   function pickReleaseAsset(assets, target) {
     var exact = exactTargetAsset(assets, target);
     if (exact) {
@@ -2765,7 +2765,7 @@
     }
     // A coarse OS-only kind can be the wrong CPU architecture. If the exact
     // target asset is absent, use only architecture-neutral fallbacks.
-    var kinds = ["installer_jar", "prism_zip", "mrpack"];
+    var kinds = ["installer_jar", "prism_zip"];
     for (var k = 0; k < kinds.length; k++) {
       for (var i = 0; i < assets.length; i++) {
         var a = assets[i];

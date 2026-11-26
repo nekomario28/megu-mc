@@ -17,8 +17,8 @@ Checks, all fail-closed:
      assembled below without writing them contiguously, so this script
      does not flag itself).
   4. website/site-config.js declares every required SITE_CONFIG key, and
-     every static download href is pinned to its `releaseTag`. GitHub's
-     /releases/latest redirect only points at a *stable* release, so while
+     every static download href plus verification example uses a pinned
+     release tag. GitHub's /releases/latest redirect only points at a *stable* release, so while
      only prereleases exist that URL (and each asset below it) answers
      404 — this check makes the pinned-vs-latest regression fail closed.
   5. When `node` is on PATH, a unit harness exercises the modpack checker,
@@ -251,8 +251,16 @@ def check_forbidden_names():
 
 
 def pinned_release_tag(config_text):
-    """Return the release tag site-config.js pins static downloads to."""
+    """Return the release tag declared by site-config.js."""
     match = re.search(r'\breleaseTag\s*:\s*"([^"]+)"', config_text)
+    return match.group(1) if match else ""
+
+
+def static_download_release_tag(markup):
+    """Return the tag used by the page's pinned static download fallbacks."""
+    match = re.search(
+        r'https://github\.com/nekomario28/megu-mc/releases/download/'
+        r'(v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?)/', markup)
     return match.group(1) if match else ""
 
 
@@ -289,8 +297,12 @@ def check_site_config_keys():
     for key in sorted(referenced - keys):
         findings.append(f"index.html is missing JA copy for '{key}'")
 
+    fallback_tag = static_download_release_tag(markup)
+    if not fallback_tag:
+        findings.append("index.html does not declare pinned static release downloads")
+        fallback_tag = release_tag
     base = (f"https://github.com/nekomario28/megu-mc/releases/download/"
-            f"{release_tag}/")
+            f"{fallback_tag}/")
     client_start = markup.find('id="panel-client"')
     client_end = markup.find('id="panel-server"')
     dev_start = markup.find('id="panel-dev"')
@@ -299,12 +311,15 @@ def check_site_config_keys():
     else:
         client_panel = markup[client_start:client_end]
         for filename in (*RELEASE_TARGETS.values(),
-                         "megu-1.21.1.mrpack",
                          "megu-prism-1.21.1.zip"):
             if f'href="{base}{filename}"' not in client_panel:
                 findings.append(
                     f"player downloads must link {filename} from the pinned "
-                    f"{release_tag} release")
+                    f"{fallback_tag} release")
+        if 'id="dl-mrpack-btn"' in client_panel:
+            findings.append("player client downloads must not offer a Modrinth mrpack")
+        if 'id="dl-prism-btn"' not in client_panel:
+            findings.append("player downloads must include the Prism Launcher bundle")
         for target, filename in RELEASE_TARGETS.items():
             expected = (f'href="{base}{filename}" data-release-target="{target}"')
             if expected not in client_panel:
@@ -345,7 +360,7 @@ def check_site_config_keys():
     else:
         server_panel = markup[client_end:dev_start]
         for target in RELEASE_TARGETS:
-            archive = f"megu-{release_tag}-{target}.tar.gz"
+            archive = f"megu-{fallback_tag}-{target}.tar.gz"
             expected = (f'href="{base}{archive}" '
                         f'data-server-archive="{target}"')
             if expected not in server_panel:
@@ -395,8 +410,8 @@ def check_site_config_keys():
 def check_release_sync_invariants():
     """Check pinned verification guidance and exact-tag dynamic targets."""
     findings = []
-    tag = pinned_release_tag(
-        (WEBSITE / "site-config.js").read_text(encoding="utf-8"))
+    tag = static_download_release_tag(
+        (WEBSITE / "index.html").read_text(encoding="utf-8"))
     for relpath in ("README.md", "README.ja.md", "website/index.html"):
         path = ROOT / relpath
         text = path.read_text(encoding="utf-8") if path.is_file() else ""

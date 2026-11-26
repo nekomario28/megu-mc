@@ -239,11 +239,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
         for target in ("macos-x86_64", "windows-arm64"):
             self.assertIn(target, publish)
 
-    def test_publish_release_includes_bootstrapper_bundles_and_sbom(self):
+    def test_publish_release_includes_bootstrapper_prism_integrated_mod_and_sbom(self):
         job = self.jobs["publish-release"]
         self.assertIn("tools/client_launcher/gen_launcher_profile.py", job)
         self.assertIn("--build-jar", job)
         self.assertIn("tools/client_launcher/export_launcher_bundle.py", job)
+        self.assertIn("tools/client_launcher/build_integrated_mod.py", job)
+        self.assertIn("dist/launcher-bundles/integrated/megu-integrated.jar", job)
+        self.assertIn("dist/publish/megu-integrated.jar", job)
+        self.assertNotIn("--format mrpack", job)
         self.assertIn("CycloneDX", job)
         self.assertIn("sbom.cdx.json", job)
 
