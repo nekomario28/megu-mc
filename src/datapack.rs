@@ -69,6 +69,72 @@ fn jelems(arr: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared JSON accessors — the tag, recipe, dynamic-registry, loot and
+// pack.mcmeta readers all read the same handful of `J` field shapes and all
+// need the same resource-location normalization.
+// ---------------------------------------------------------------------------
+
+/// `ns:path` normalization: a bare path reads as `minecraft:<path>`.
+fn dp_norm_id(id: &str) -> String {
+    if id.contains(':') {
+        id.to_owned()
+    } else {
+        format!("minecraft:{id}")
+    }
+}
+
+/// An id with its `minecraft:` namespace stripped; other namespaces stay.
+fn dp_bare_id(id: &str) -> &str {
+    id.strip_prefix("minecraft:").unwrap_or(id)
+}
+
+/// `key` as a string, or `default` when absent/non-string.
+fn dpj_str_or(j: &J, key: &str, default: &str) -> String {
+    j.get(key)
+        .map_or_else(|| default.to_owned(), |v| v.str().to_owned())
+}
+
+/// `key` as a string (`""` when absent/non-string).
+fn dpj_str(j: &J, key: &str) -> String {
+    dpj_str_or(j, key, "")
+}
+
+/// `key` as a namespace-stripped id string (`""` when absent).
+fn dpj_ns_id(j: &J, key: &str) -> String {
+    dp_bare_id(&dpj_str(j, key)).to_owned()
+}
+
+/// Numeric `key` (`0.0` when absent/non-numeric, matching `J::num`).
+fn dpj_f64(j: &J, key: &str) -> f64 {
+    j.get(key).map_or(0.0, J::num)
+}
+
+/// Integral `key`.
+fn dpj_i64(j: &J, key: &str) -> i64 {
+    dpj_f64(j, key) as i64
+}
+
+/// 32-bit integral `key`.
+fn dpj_i32(j: &J, key: &str) -> i32 {
+    dpj_f64(j, key) as i32
+}
+
+/// The array at `key` mapped through `f` (`[]` when absent or not an array).
+fn dpj_map<T>(j: &J, key: &str, f: impl FnMut(&J) -> T) -> Vec<T> {
+    j.get(key)
+        .and_then(J::as_arr)
+        .map_or(&[][..], |a| a.as_slice())
+        .iter()
+        .map(f)
+        .collect()
+}
+
+/// The optional node as an array (`[]` when absent or not an array).
+fn dpj_opt_arr(j: Option<&J>) -> &[J] {
+    j.and_then(J::as_arr).map_or(&[], |a| a.as_slice())
+}
+
+// ---------------------------------------------------------------------------
 // DatapackContent impl — tag loading + optional-entry resolution.
 // ---------------------------------------------------------------------------
 
@@ -99,17 +165,9 @@ impl DatapackContent {
             if id.is_empty() {
                 continue;
             }
-            let member = if let Some(reference) = id.strip_prefix('#') {
-                let r = reference.trim();
-                if r.contains(':') {
-                    format!("#{r}")
-                } else {
-                    format!("#minecraft:{r}")
-                }
-            } else if id.contains(':') {
-                id.to_owned()
-            } else {
-                format!("minecraft:{id}")
+            let member = match id.strip_prefix('#') {
+                Some(reference) => format!("#{}", dp_norm_id(reference.trim())),
+                None => dp_norm_id(id),
             };
             if required {
                 entry.push(member);
@@ -152,7 +210,7 @@ impl DatapackContent {
 /// through the palette (`checked_state` namespaces `minecraft:` itself);
 /// `item`/`entity_type`/`biome` have name lookup helpers.
 fn tag_member_resolvable(category: &str, member: &str) -> bool {
-    let bare = member.strip_prefix("minecraft:").unwrap_or(member);
+    let bare = dp_bare_id(member);
     match category {
         "block" => breg().is_some_and(|reg| reg.checked_state(member, &[]).is_some()),
         "item" => name_to_item(bare).is_some(),
@@ -1313,18 +1371,13 @@ mod bot_boot_cache_tests {
 /// One `{"item"|"tag": ...}` slot or a bare `"ns:id"` member.
 fn dp_ingredient(spec: &str) -> Option<Ingr> {
     if let Some(t) = jstr(spec, "tag") {
-        let t = t.trim_start_matches('#');
-        return Some(Ingr::Tag(if t.contains(':') {
-            t.to_owned()
-        } else {
-            format!("minecraft:{t}")
-        }));
+        return Some(Ingr::Tag(dp_norm_id(t.trim_start_matches('#'))));
     }
     let bare = jstr(spec, "item").unwrap_or_else(|| spec.trim().trim_matches('"'));
     if bare.is_empty() || bare.starts_with(['{', '[', '}', ']']) {
         return None;
     }
-    name_to_item(bare.trim_start_matches("minecraft:")).map(Ingr::Item)
+    name_to_item(dp_bare_id(bare)).map(Ingr::Item)
 }
 
 /// An `Ingredient` JSON field: `{"item"|"tag": ...}`, a bare `"ns:id"`, or an
@@ -1337,7 +1390,7 @@ fn dp_ingredients(body: &str, key: &str) -> Vec<Ingr> {
     } else {
         jstr(body, key)
             .map(|s| s.trim_matches('"'))
-            .and_then(|s| name_to_item(s.trim_start_matches("minecraft:")).map(Ingr::Item))
+            .and_then(|s| name_to_item(dp_bare_id(s)).map(Ingr::Item))
             .into_iter()
             .collect()
     }
@@ -1349,7 +1402,7 @@ fn dp_result_item(body: &str) -> Option<i64> {
     let name = jblock(body, "result")
         .and_then(|b| jstr(b, "id").or_else(|| jstr(b, "item")))
         .or_else(|| jstr(body, "result").map(|s| s.trim_matches('"')));
-    name.and_then(|n| name_to_item(n.trim_start_matches("minecraft:")))
+    name.and_then(|n| name_to_item(dp_bare_id(n)))
 }
 
 impl DatapackContent {
@@ -1361,56 +1414,12 @@ impl DatapackContent {
             .unwrap_or("")
             .trim_start_matches("minecraft:");
         match rtype {
-            "stonecutting" => {
-                let ingredients = dp_ingredients(body, "ingredient");
-                let Some(result) = dp_result_item(body) else {
-                    return true; // no resolvable result: drop, fail closed
-                };
-                if ingredients.is_empty() {
-                    return true;
-                }
-                let count = jblock(body, "result")
-                    .and_then(|b| jnum(b, "count"))
-                    .or_else(|| jnum(body, "count"))
-                    .unwrap_or(1)
-                    .clamp(1, 64) as u8;
-                self.registry.stonecutting.push(StonecuttingRecipe {
-                    ingredients,
-                    result,
-                    count,
-                });
-            }
+            "stonecutting" => self.registry.stonecutting.extend(dp_stonecutting(body)),
             "smithing_transform" | "smithing" => {
-                let (template, base, addition) = (
-                    dp_ingredients(body, "template"),
-                    dp_ingredients(body, "base"),
-                    dp_ingredients(body, "addition"),
-                );
-                if base.is_empty() {
-                    return true;
-                }
-                self.registry.smithing_transform.push(SmithingRecipe {
-                    template,
-                    base,
-                    addition,
-                    result: dp_result_item(body),
-                });
+                self.registry.smithing_transform.extend(dp_smithing(body, true));
             }
             "smithing_trim" => {
-                let (template, base, addition) = (
-                    dp_ingredients(body, "template"),
-                    dp_ingredients(body, "base"),
-                    dp_ingredients(body, "addition"),
-                );
-                if base.is_empty() {
-                    return true;
-                }
-                self.registry.smithing_trim.push(SmithingRecipe {
-                    template,
-                    base,
-                    addition,
-                    result: None,
-                });
+                self.registry.smithing_trim.extend(dp_smithing(body, false));
             }
             t if t.starts_with("crafting_special_") || t == "crafting_decorated_pot" => {
                 self.registry
@@ -1421,6 +1430,50 @@ impl DatapackContent {
         }
         true
     }
+}
+
+/// One `minecraft:stonecutting` recipe. Files with no resolvable result item or
+/// an empty ingredient list are dropped (fail closed), which is why this is
+/// fallible rather than a partially-filled recipe.
+fn dp_stonecutting(body: &str) -> Option<StonecuttingRecipe> {
+    let ingredients = dp_ingredients(body, "ingredient");
+    let result = dp_result_item(body)?;
+    if ingredients.is_empty() {
+        return None;
+    }
+    Some(StonecuttingRecipe {
+        ingredients,
+        result,
+        count: jblock(body, "result")
+            .and_then(|b| jnum(b, "count"))
+            .or_else(|| jnum(body, "count"))
+            .unwrap_or(1)
+            .clamp(1, 64) as u8,
+    })
+}
+
+/// One `smithing_transform` / `smithing_trim` recipe: template + base +
+/// addition slots, dropped when the base slot is unresolvable. Only
+/// `smithing_transform` carries a result item (`smithing_trim` keeps the base).
+fn dp_smithing(body: &str, with_result: bool) -> Option<SmithingRecipe> {
+    let (template, base, addition) = (
+        dp_ingredients(body, "template"),
+        dp_ingredients(body, "base"),
+        dp_ingredients(body, "addition"),
+    );
+    if base.is_empty() {
+        return None;
+    }
+    Some(SmithingRecipe {
+        template,
+        base,
+        addition,
+        result: if with_result {
+            dp_result_item(body)
+        } else {
+            None
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1766,14 +1819,8 @@ impl PackMcmeta {
         {
             for rule in block {
                 // An absent key compiles to vanilla's match-everything `.*`.
-                let ns = rule
-                    .get("namespace")
-                    .map(|v| v.str().to_owned())
-                    .unwrap_or_else(|| ".*".to_owned());
-                let path = rule
-                    .get("path")
-                    .map(|v| v.str().to_owned())
-                    .unwrap_or_else(|| ".*".to_owned());
+                let ns = dpj_str_or(rule, "namespace", ".*");
+                let path = dpj_str_or(rule, "path", ".*");
                 if mc_re_compile(&ns).is_none() || mc_re_compile(&path).is_none() {
                     m.valid = false;
                     continue;
@@ -1808,32 +1855,29 @@ fn parse_and_check_pack_mcmeta(
     if !m.valid {
         return Ok(PackFormatVerdict::Invalid);
     }
-    if m.min_format.is_some() || m.max_format.is_some() {
-        // 26.3: both halves are mandatory; one alone is malformed.
+    // The 26.3 tuple scheme wins when the pack declares it: both halves are
+    // mandatory, so one alone is malformed. Otherwise the scalar range is
+    // checked, where a bare `pack_format` is its own single-version range.
+    let (target, min, max) = if m.min_format.is_some() || m.max_format.is_some() {
         let (Some(min), Some(max)) = (m.min_format, m.max_format) else {
             return Ok(PackFormatVerdict::Invalid);
         };
-        let target = PackVersion(target_tuple.0, target_tuple.1);
-        return Ok(if target > max {
-            PackFormatVerdict::TooOld { max_supported: max }
-        } else if target < min {
-            PackFormatVerdict::TooNew { min_supported: min }
-        } else {
-            PackFormatVerdict::Compatible
-        });
-    }
-    let Some(pack_format) = m.pack_format else {
-        return Ok(PackFormatVerdict::Invalid);
+        (PackVersion(target_tuple.0, target_tuple.1), min, max)
+    } else {
+        let Some(pack_format) = m.pack_format else {
+            return Ok(PackFormatVerdict::Invalid);
+        };
+        let (lo, hi) = m.supported.unwrap_or((pack_format, pack_format));
+        (
+            PackVersion(target_pack_format, 0),
+            PackVersion(lo, 0),
+            PackVersion(hi, 0),
+        )
     };
-    let (lo, hi) = m.supported.unwrap_or((pack_format, pack_format));
-    Ok(if target_pack_format > hi {
-        PackFormatVerdict::TooOld {
-            max_supported: PackVersion(hi, 0),
-        }
-    } else if target_pack_format < lo {
-        PackFormatVerdict::TooNew {
-            min_supported: PackVersion(lo, 0),
-        }
+    Ok(if target > max {
+        PackFormatVerdict::TooOld { max_supported: max }
+    } else if target < min {
+        PackFormatVerdict::TooNew { min_supported: min }
     } else {
         PackFormatVerdict::Compatible
     })
@@ -2412,13 +2456,8 @@ fn loot_num(j: Option<&J>, default: LootNum) -> LootNum {
     match j {
         J::Num(n) => LootNum::Constant(*n),
         J::Obj(_) => {
-            let bare = |k: &str| j.get(k).map(|v| v.num()).unwrap_or(0.0);
-            match j
-                .get("type")
-                .map(|v| v.str().trim_start_matches("minecraft:").to_owned())
-                .unwrap_or_default()
-                .as_str()
-            {
+            let bare = |k: &str| dpj_f64(j, k);
+            match dpj_ns_id(j, "type").as_str() {
                 "uniform" => LootNum::Uniform(bare("min"), bare("max")),
                 "constant" => LootNum::Constant(bare("value")),
                 "linear" => LootNum::Linear {
@@ -2522,34 +2561,29 @@ fn loot_item_matchers(j: Option<&J>) -> Option<Vec<LootItemMatcher>> {
 /// `{"enchantments": id|[ids], "levels": n|{"min","max"}}` entries.
 fn loot_match_tool_enchants(j: Option<&J>) -> Vec<MatchToolEnchant> {
     let mut out = Vec::new();
-    let Some(list) = j.and_then(J::as_arr) else {
-        return out;
-    };
-    for e in list {
-        let mut ids = Vec::new();
-        match e.get("enchantments").or_else(|| e.get("enchantment")) {
-            Some(J::Str(s)) => ids.push(s.clone()),
-            Some(J::Arr(a)) => {
-                ids.extend(a.iter().map(|v| v.str().to_owned()))
-            }
-            _ => {}
-        }
+    for e in dpj_opt_arr(j) {
+        // Exact parity with the original reader: only bare strings count, and
+        // an array element that is not a string contributes `""` (kept, so a
+        // non-empty list still yields an entry).
+        let ids: Vec<String> = match e.get("enchantments").or_else(|| e.get("enchantment")) {
+            Some(J::Str(s)) => vec![s.clone()],
+            Some(J::Arr(a)) => a.iter().map(|v| v.str().to_owned()).collect(),
+            _ => Vec::new(),
+        };
         if ids.is_empty() {
             continue;
         }
         let (mut min, mut max) = (None, None);
         match e.get("levels") {
             Some(J::Num(n)) => {
-                let n = *n as i32;
-                min = Some(n);
-                max = Some(n);
+                min = Some(*n as i32);
+                max = Some(*n as i32);
             }
-            Some(J::Obj(_)) => {
-                let lv = e.get("levels").unwrap();
-                min = lv.get("min").map(|v| v.num() as i32);
-                max = lv.get("max").map(|v| v.num() as i32);
+            Some(levels) => {
+                min = levels.get("min").map(|v| v.num() as i32);
+                max = levels.get("max").map(|v| v.num() as i32);
             }
-            _ => {}
+            None => {}
         }
         out.push(MatchToolEnchant { ids, min, max });
     }
@@ -2557,48 +2591,39 @@ fn loot_match_tool_enchants(j: Option<&J>) -> Vec<MatchToolEnchant> {
 }
 
 fn loot_condition(j: &J) -> LootCondition {
-    let id = j
-        .get("condition")
-        .map(|v| v.str().trim_start_matches("minecraft:").to_owned())
-        .unwrap_or_default();
+    let id = dpj_ns_id(j, "condition");
     match id.as_str() {
         "survives_explosion" => LootCondition::SurvivesExplosion,
         "random_chance" => {
             LootCondition::RandomChance(loot_num(j.get("chance"), LootNum::Unsupported))
         }
         "random_chance_with_enchanted_bonus" => LootCondition::RandomChanceEnchantedBonus {
-            enchantment: j
-                .get("enchantment")
-                .map(|v| v.str().to_owned())
-                .unwrap_or_default(),
+            enchantment: dpj_str(j, "enchantment"),
             unenchanted: j
                 .get("unenchanted_chance")
                 .or_else(|| j.get("base_chance"))
-                .map(|v| v.num() as f32)
-                .unwrap_or(0.0),
+                .map_or(0.0, J::num) as f32,
             enchanted: loot_num(j.get("enchanted_chance"), LootNum::Unsupported),
         },
         "killed_by_player" => LootCondition::KilledByPlayer,
-        "inverted" => j
-            .get("term")
-            .map(|t| LootCondition::Inverted(Box::new(loot_condition(t))))
-            .unwrap_or(LootCondition::Unsupported),
-        "any_of" => j
-            .get("terms")
-            .and_then(J::as_arr)
-            .map(|ts| LootCondition::AnyOf(ts.iter().map(loot_condition).collect()))
-            .unwrap_or(LootCondition::Unsupported),
-        "all_of" => j
-            .get("terms")
-            .and_then(J::as_arr)
-            .map(|ts| LootCondition::AllOf(ts.iter().map(loot_condition).collect()))
-            .unwrap_or(LootCondition::Unsupported),
+        "inverted" => j.get("term").map_or(LootCondition::Unsupported, |t| {
+            LootCondition::Inverted(Box::new(loot_condition(t)))
+        }),
+        "any_of" | "all_of" => {
+            let Some(terms) = j.get("terms").and_then(J::as_arr) else {
+                return LootCondition::Unsupported;
+            };
+            let terms = terms.iter().map(loot_condition).collect::<Vec<_>>();
+            if id == "any_of" {
+                LootCondition::AnyOf(terms)
+            } else {
+                LootCondition::AllOf(terms)
+            }
+        }
         "match_tool" => {
             let pred = j.get("predicate").cloned().unwrap_or(J::Obj(Vec::new()));
             LootCondition::MatchTool {
-                items: loot_item_matchers(
-                    pred.get("items").or_else(|| pred.get("item")),
-                ),
+                items: loot_item_matchers(pred.get("items").or_else(|| pred.get("item"))),
                 enchantments: loot_match_tool_enchants(pred.get("enchantments")),
             }
         }
@@ -2607,9 +2632,7 @@ fn loot_condition(j: &J) -> LootCondition {
 }
 
 fn loot_conditions(j: Option<&J>) -> Vec<LootCondition> {
-    j.and_then(J::as_arr)
-        .map(|list| list.iter().map(loot_condition).collect())
-        .unwrap_or_default()
+    dpj_opt_arr(j).iter().map(loot_condition).collect()
 }
 
 /// `apply_bonus` formula id + parameters.
@@ -2646,10 +2669,7 @@ struct LootFuncNode {
 }
 
 fn loot_function(j: &J) -> LootFunction {
-    let id = j
-        .get("function")
-        .map(|v| v.str().trim_start_matches("minecraft:").to_owned())
-        .unwrap_or_default();
+    let id = dpj_ns_id(j, "function");
     match id.as_str() {
         "set_count" => LootFunction::SetCount {
             provider: loot_num(j.get("count"), LootNum::Constant(0.0)),
@@ -2657,36 +2677,19 @@ fn loot_function(j: &J) -> LootFunction {
         },
         "apply_bonus" => {
             let params = j.get("parameters");
-            let formula = match j
-                .get("formula")
-                .map(|v| v.str().trim_start_matches("minecraft:").to_owned())
-                .unwrap_or_default()
-                .as_str()
-            {
+            let formula = match dpj_ns_id(j, "formula").as_str() {
                 "ore_drops" => ApplyBonusFormula::OreDrops,
                 "uniform_bonus_count" => ApplyBonusFormula::UniformBonusCount {
-                    bonus_multiplier: params
-                        .and_then(|p| p.get("bonusMultiplier"))
-                        .map(|v| v.num() as i32)
-                        .unwrap_or(0),
+                    bonus_multiplier: params.map_or(0, |p| dpj_i32(p, "bonusMultiplier")),
                 },
                 "binomial_with_bonus_count" => ApplyBonusFormula::BinomialWithBonusCount {
-                    extra: params
-                        .and_then(|p| p.get("extra"))
-                        .map(|v| v.num() as i32)
-                        .unwrap_or(0),
-                    probability: params
-                        .and_then(|p| p.get("probability"))
-                        .map(|v| v.num() as f32)
-                        .unwrap_or(0.0),
+                    extra: params.map_or(0, |p| dpj_i32(p, "extra")),
+                    probability: params.map_or(0.0, |p| dpj_f64(p, "probability")) as f32,
                 },
                 _ => return LootFunction::Unsupported,
             };
             LootFunction::ApplyBonus {
-                enchantment: j
-                    .get("enchantment")
-                    .map(|v| v.str().to_owned())
-                    .unwrap_or_default(),
+                enchantment: dpj_str(j, "enchantment"),
                 formula,
             }
         }
@@ -2700,12 +2703,15 @@ fn loot_function(j: &J) -> LootFunction {
                     min = Some(v.clone());
                     max = Some(v);
                 }
-                Some(J::Obj(_)) => {
-                    let limit = j.get("limit").unwrap();
-                    min = limit.get("min").map(|v| loot_num(Some(v), LootNum::Unsupported));
-                    max = limit.get("max").map(|v| loot_num(Some(v), LootNum::Unsupported));
+                Some(limit) => {
+                    min = limit
+                        .get("min")
+                        .map(|v| loot_num(Some(v), LootNum::Unsupported));
+                    max = limit
+                        .get("max")
+                        .map(|v| loot_num(Some(v), LootNum::Unsupported));
                 }
-                _ => {}
+                None => {}
             }
             LootFunction::LimitCount { min, max }
         }
@@ -2719,16 +2725,13 @@ fn loot_function(j: &J) -> LootFunction {
 }
 
 fn loot_func_nodes(j: Option<&J>) -> Vec<LootFuncNode> {
-    j.and_then(J::as_arr)
-        .map(|list| {
-            list.iter()
-                .map(|f| LootFuncNode {
-                    func: loot_function(f),
-                    conditions: loot_conditions(f.get("conditions")),
-                })
-                .collect()
+    dpj_opt_arr(j)
+        .iter()
+        .map(|f| LootFuncNode {
+            func: loot_function(f),
+            conditions: loot_conditions(f.get("conditions")),
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// `esf` LootPoolEntries: every kind a pool or composite child can be.
@@ -2762,11 +2765,7 @@ struct LootEntryNode {
 }
 
 fn loot_entry_node(j: &J) -> LootEntryNode {
-    let ty = j
-        .get("type")
-        .map(|v| v.str().trim_start_matches("minecraft:").to_owned())
-        .unwrap_or_default();
-    let kind = match ty.as_str() {
+    let kind = match dpj_ns_id(j, "type").as_str() {
         "item" => LootEntryKind::Item,
         "tag" => LootEntryKind::Tag {
             expand: loot_jbool(j, "expand"),
@@ -2780,19 +2779,12 @@ fn loot_entry_node(j: &J) -> LootEntryNode {
     };
     LootEntryNode {
         kind,
-        name: j
-            .get("name")
-            .map(|v| v.str().to_owned())
-            .unwrap_or_default(),
-        weight: j.get("weight").map(|v| v.num() as i32).unwrap_or(1),
-        quality: j.get("quality").map(|v| v.num() as i32).unwrap_or(0),
+        name: dpj_str(j, "name"),
+        weight: j.get("weight").map_or(1, |v| v.num() as i32),
+        quality: dpj_i32(j, "quality"),
         conditions: loot_conditions(j.get("conditions")),
         functions: loot_func_nodes(j.get("functions")),
-        children: j
-            .get("children")
-            .and_then(J::as_arr)
-            .map(|list| list.iter().map(loot_entry_node).collect())
-            .unwrap_or_default(),
+        children: dpj_map(j, "children", loot_entry_node),
     }
 }
 
@@ -2811,25 +2803,13 @@ struct LootTableDef {
 
 fn loot_table_def(j: &J) -> LootTableDef {
     LootTableDef {
-        pools: j
-            .get("pools")
-            .and_then(J::as_arr)
-            .map(|list| {
-                list.iter()
-                    .map(|p| LootPoolDef {
-                        rolls: loot_num(p.get("rolls"), LootNum::Constant(1.0)),
-                        bonus_rolls: loot_num(p.get("bonus_rolls"), LootNum::Constant(0.0)),
-                        conditions: loot_conditions(p.get("conditions")),
-                        entries: p
-                            .get("entries")
-                            .and_then(J::as_arr)
-                            .map(|list| list.iter().map(loot_entry_node).collect())
-                            .unwrap_or_default(),
-                        functions: loot_func_nodes(p.get("functions")),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        pools: dpj_map(j, "pools", |p| LootPoolDef {
+            rolls: loot_num(p.get("rolls"), LootNum::Constant(1.0)),
+            bonus_rolls: loot_num(p.get("bonus_rolls"), LootNum::Constant(0.0)),
+            conditions: loot_conditions(p.get("conditions")),
+            entries: dpj_map(p, "entries", loot_entry_node),
+            functions: loot_func_nodes(p.get("functions")),
+        }),
         functions: loot_func_nodes(j.get("functions")),
     }
 }
@@ -2893,7 +2873,7 @@ impl LootEvalContext {
         let Some(tool) = &self.tool else {
             return 0;
         };
-        let bare = id.strip_prefix("minecraft:").unwrap_or(id);
+        let bare = dp_bare_id(id);
         tool.enchantments
             .get(id)
             .or_else(|| tool.enchantments.get(bare))
@@ -2902,33 +2882,22 @@ impl LootEvalContext {
     }
 }
 
-/// `ns:name` normalization: a bare path reads as `minecraft:`.
-fn loot_norm_id(id: &str) -> String {
-    if id.contains(':') {
-        id.to_owned()
-    } else {
-        format!("minecraft:{id}")
-    }
-}
-
 /// Expanded member list of an item tag via the datapack registry, normalized
 /// to namespaced ids.
 fn loot_item_tag_members(tag: &str) -> Vec<String> {
-    datapack_tag_members("item", &loot_norm_id(tag))
+    datapack_tag_members("item", &dp_norm_id(tag))
         .into_iter()
-        .map(|m| loot_norm_id(&m))
+        .map(|m| dp_norm_id(&m))
         .collect()
 }
 
 /// `#tag` membership test that accepts both the builtin bare members and the
 /// datapack-loaded namespaced ones.
 fn loot_item_in_tag(tag: &str, item: &str) -> bool {
-    let tag = loot_norm_id(tag);
-    let item = loot_norm_id(item);
+    let tag = dp_norm_id(tag);
+    let item = dp_norm_id(item);
     datapack_tag_contains("item", &tag, &item)
-        || item
-            .strip_prefix("minecraft:")
-            .is_some_and(|bare| datapack_tag_contains("item", &tag, bare))
+        || datapack_tag_contains("item", &tag, dp_bare_id(&item))
 }
 
 fn loot_match_tool(items: &Option<Vec<LootItemMatcher>>, enchants: &[MatchToolEnchant], ctx: &LootEvalContext) -> bool {
@@ -2938,9 +2907,9 @@ fn loot_match_tool(items: &Option<Vec<LootItemMatcher>>, enchants: &[MatchToolEn
         return false;
     };
     if let Some(matchers) = items {
-        let tool_item = loot_norm_id(&tool.item);
+        let tool_item = dp_norm_id(&tool.item);
         if !matchers.iter().any(|m| match m {
-            LootItemMatcher::Id(id) => loot_norm_id(id) == tool_item,
+            LootItemMatcher::Id(id) => dp_norm_id(id) == tool_item,
             LootItemMatcher::Tag(tag) => loot_item_in_tag(tag, &tool_item),
         }) {
             return false;
@@ -3014,14 +2983,10 @@ fn loot_expand_entry<'a>(
         return false;
     }
     match &node.kind {
-        LootEntryKind::Empty | LootEntryKind::Item | LootEntryKind::Table => {
-            out.push(LootCandidate {
-                node,
-                member: None,
-            });
-            true
-        }
-        LootEntryKind::Tag { expand: false } => {
+        LootEntryKind::Empty
+        | LootEntryKind::Item
+        | LootEntryKind::Table
+        | LootEntryKind::Tag { expand: false } => {
             out.push(LootCandidate {
                 node,
                 member: None,
@@ -3063,14 +3028,13 @@ fn loot_eff_weight(node: &LootEntryNode, luck: f32) -> i32 {
 
 /// `furnace_smelt`: the first smelting recipe whose ingredient matches.
 fn loot_smelt_result(item: &str) -> Option<String> {
-    let bare = item.strip_prefix("minecraft:").unwrap_or(item);
-    let item_id = name_to_item(bare)?;
+    let item_id = name_to_item(dp_bare_id(item))?;
     json_smelts().lock().unwrap_or_else(|e| e.into_inner()).iter().find_map(|(ingr, out, _, _)| {
         let hit = match ingr {
             Ingr::Item(id) => *id == item_id,
             Ingr::Tag(tag) => loot_item_in_tag(tag, item),
         };
-        hit.then(|| item_to_name(*out).map(loot_norm_id))
+        hit.then(|| item_to_name(*out).map(dp_norm_id))
             .flatten()
     })
 }
@@ -3163,7 +3127,21 @@ fn loot_apply_function(drop: &mut LootDrop, func: &LootFunction, ctx: &mut LootE
     }
 }
 
-/// `esj$1.a`: the picked candidate emits stacks through the entry's composed
+/// `esj$1`: one emitted stack — the entry's composed functions run on it and a
+/// non-positive count drops it. Shared by every candidate source below.
+fn loot_emit(
+    mut drop: LootDrop,
+    node: &LootEntryNode,
+    ctx: &mut LootEvalContext,
+    out: &mut Vec<LootDrop>,
+) {
+    loot_apply_func_nodes(&mut drop, &node.functions, ctx);
+    if drop.count > 0 {
+        out.push(drop);
+    }
+}
+
+/// `esj$c.a(F)`: the picked candidate emits stacks through the entry's composed
 /// functions (except expanded tag members, which skip them).
 fn loot_candidate_generate(
     candidate: &LootCandidate,
@@ -3179,38 +3157,21 @@ fn loot_candidate_generate(
         return;
     }
     let node = candidate.node;
+    let stack = |item: String| LootDrop {
+        item,
+        count: 1,
+        damage: 0,
+    };
     match &node.kind {
-        LootEntryKind::Item => {
-            let mut drop = LootDrop {
-                item: loot_norm_id(&node.name),
-                count: 1,
-                damage: 0,
-            };
-            loot_apply_func_nodes(&mut drop, &node.functions, ctx);
-            if drop.count > 0 {
-                out.push(drop);
-            }
-        }
+        LootEntryKind::Item => loot_emit(stack(dp_norm_id(&node.name)), node, ctx, out),
         LootEntryKind::Tag { expand: false } => {
             for member in loot_item_tag_members(&node.name) {
-                let mut drop = LootDrop {
-                    item: member,
-                    count: 1,
-                    damage: 0,
-                };
-                loot_apply_func_nodes(&mut drop, &node.functions, ctx);
-                if drop.count > 0 {
-                    out.push(drop);
-                }
+                loot_emit(stack(member), node, ctx, out);
             }
         }
         LootEntryKind::Table => {
             for drop in evaluate_loot_table(&node.name, ctx) {
-                let mut drop = drop;
-                loot_apply_func_nodes(&mut drop, &node.functions, ctx);
-                if drop.count > 0 {
-                    out.push(drop);
-                }
+                loot_emit(drop, node, ctx, out);
             }
         }
         _ => {}
@@ -3284,7 +3245,7 @@ const LOOT_EVAL_MAX_DEPTH: usize = 64;
 /// cyclic references evaluate to nothing — never panics.
 #[allow(dead_code)]
 fn evaluate_loot_table(id: &str, ctx: &mut LootEvalContext) -> Vec<LootDrop> {
-    let id = loot_norm_id(id);
+    let id = dp_norm_id(id);
     if ctx.depth >= LOOT_EVAL_MAX_DEPTH || !ctx.visiting.insert(id.clone()) {
         return Vec::new();
     }
@@ -3332,17 +3293,26 @@ fn dyn_registry_kind(dir: &str) -> Option<&'static str> {
     })
 }
 
+/// `data/<ns>/<registry>/<path>.json` → (`registry`, `ns:path`) for a file the
+/// dynamic-registry reader owns; `None` for anything else (fail closed).
+fn dyn_entry_id(path: &str) -> Option<(&'static str, String)> {
+    let (ns, rest) = path.strip_prefix("data/")?.split_once('/')?;
+    let (dir, rel) = rest.split_once('/')?;
+    let rel = rel.strip_suffix(".json")?;
+    if rel.is_empty() {
+        return None;
+    }
+    Some((dyn_registry_kind(dir)?, format!("{ns}:{rel}")))
+}
+
 /// A text component: `{text}` / `{translate}` object or a bare string.
 fn dyn_jtext(j: &J, key: &str) -> String {
     match j.get(key) {
-        Some(J::Obj(_)) => j
-            .get(key)
-            .and_then(|d| {
-                d.get("text")
-                    .or_else(|| d.get("translate"))
-                    .map(|v| v.str().to_owned())
-            })
-            .unwrap_or_default(),
+        Some(d @ J::Obj(_)) => {
+            d.get("text")
+                .or_else(|| d.get("translate"))
+                .map_or_else(String::new, |v| v.str().to_owned())
+        }
         Some(v) => v.str().to_owned(),
         None => String::new(),
     }
@@ -3356,12 +3326,8 @@ fn dyn_jstr_list(j: &J, key: &str) -> Vec<String> {
         Some(J::Arr(a)) => a
             .iter()
             .map(|v| match v {
-                J::Str(s) => s.clone(),
-                J::Obj(_) => v
-                    .get("id")
-                    .map(|i| i.str().to_owned())
-                    .unwrap_or_default(),
-                _ => String::new(),
+                J::Obj(_) => dpj_str(v, "id"),
+                other => other.str().to_owned(),
             })
             .filter(|s| !s.is_empty())
             .collect(),
@@ -3459,154 +3425,118 @@ struct DynamicDataRegistries {
 
 impl DynamicDataRegistries {
     /// Parse one `data/<ns>/<registry>/<path>.json` body into the right map.
-    /// Files that do not parse as objects are dropped (fail closed), like the
-    /// tag/recipe readers.
+    /// Files outside a known registry or that do not parse as objects are
+    /// dropped (fail closed), like the tag/recipe readers.
     #[cfg_attr(not(test), allow(dead_code))]
     fn read_entry(&mut self, path: &str, body: &str) {
-        let Some(("data", path)) = path.split_once('/') else {
+        let Some((kind, id)) = dyn_entry_id(path) else {
             return;
         };
-        let Some((ns, path)) = path.split_once('/') else {
-            return;
-        };
-        let Some((kind, rel)) = path.split_once('/') else {
-            return;
-        };
-        let Some(kind) = dyn_registry_kind(kind) else {
-            return;
-        };
-        let Some(rel) = rel.strip_suffix(".json") else {
-            return;
-        };
-        if rel.is_empty() {
-            return;
-        }
-        let id = format!("{ns}:{rel}");
         let Some(j) = jparse(body.as_bytes()) else {
             return;
         };
         match kind {
             "enchantment" => {
-                self.enchantment.insert(
-                    id,
-                    DatapackEnchantment {
-                        raw: body.to_owned(),
-                        description: dyn_jtext(&j, "description"),
-                        supported_items: dyn_jstr_list(&j, "supported_items"),
-                        weight: j.get("weight").map(|v| v.num() as i64).unwrap_or(0),
-                        max_level: j.get("max_level").map(|v| v.num() as i64).unwrap_or(0),
-                        anvil_cost: j.get("anvil_cost").map(|v| v.num() as i64).unwrap_or(0),
-                        slots: dyn_jstr_list(&j, "slots"),
-                    },
-                );
+                self.enchantment.insert(id, dyn_enchantment(body, &j));
             }
             "damage_type" => {
-                self.damage_type.insert(
-                    id,
-                    DatapackDamageType {
-                        raw: body.to_owned(),
-                        message_id: j
-                            .get("message_id")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                        exhaustion: j.get("exhaustion").map(|v| v.num()).unwrap_or(0.0),
-                        scaling: j
-                            .get("scaling")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_else(|| "when_caused_by_living_non_player".to_owned()),
-                        effects: j.get("effects").map(|v| v.str().to_owned()),
-                    },
-                );
+                self.damage_type.insert(id, dyn_damage_type(body, &j));
             }
             "chat_type" => {
-                let deco = |key: &str| {
-                    j.get(key).map(|d| ChatDecoration {
-                        translation_key: d
-                            .get("translation_key")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                        parameters: dyn_jstr_list(d, "parameters"),
-                    })
-                };
-                self.chat_type.insert(
-                    id,
-                    DatapackChatType {
-                        raw: body.to_owned(),
-                        chat: deco("chat"),
-                        narration: deco("narration"),
-                    },
-                );
+                self.chat_type.insert(id, dyn_chat_type(body, &j));
             }
             "wolf_variant" => {
-                let tex = |key: &str| {
-                    j.get(key)
-                        .map(|v| v.str().to_owned())
-                        .unwrap_or_default()
-                };
-                self.wolf_variant.insert(
-                    id,
-                    DatapackWolfVariant {
-                        raw: body.to_owned(),
-                        wild_texture: tex("wild_texture"),
-                        tame_texture: tex("tame_texture"),
-                        angry_texture: tex("angry_texture"),
-                        biomes: dyn_jstr_list(&j, "biomes"),
-                    },
-                );
+                self.wolf_variant.insert(id, dyn_wolf_variant(body, &j));
             }
             "painting_variant" => {
-                self.painting_variant.insert(
-                    id,
-                    DatapackPaintingVariant {
-                        raw: body.to_owned(),
-                        asset_id: j
-                            .get("asset_id")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                        width: j.get("width").map(|v| v.num() as i64).unwrap_or(0),
-                        height: j.get("height").map(|v| v.num() as i64).unwrap_or(0),
-                    },
-                );
+                self.painting_variant.insert(id, dyn_painting_variant(body, &j));
             }
             "banner_pattern" => {
-                self.banner_pattern.insert(
-                    id,
-                    DatapackBannerPattern {
-                        raw: body.to_owned(),
-                        asset_id: j
-                            .get("asset_id")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                        translation_key: j
-                            .get("translation_key")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                    },
-                );
+                self.banner_pattern.insert(id, dyn_banner_pattern(body, &j));
             }
             "jukebox_song" => {
-                self.jukebox_song.insert(
-                    id,
-                    DatapackJukeboxSong {
-                        raw: body.to_owned(),
-                        sound_event: j
-                            .get("sound_event")
-                            .map(|v| v.str().to_owned())
-                            .unwrap_or_default(),
-                        description: dyn_jtext(&j, "description"),
-                        length_in_seconds: j
-                            .get("length_in_seconds")
-                            .map(|v| v.num())
-                            .unwrap_or(0.0),
-                        comparator_output: j
-                            .get("comparator_output")
-                            .map(|v| v.num() as i64)
-                            .unwrap_or(0),
-                    },
-                );
+                self.jukebox_song.insert(id, dyn_jukebox_song(body, &j));
             }
             _ => {}
         }
+    }
+}
+
+/// The per-registry field readers. Every one keeps the file body verbatim in
+/// `raw` so a later RegistryData-sync lane can emit byte-faithful entries
+/// instead of reserializing typed fields. Missing fields keep the same
+/// zero/empty defaults the inline reader used.
+fn dyn_enchantment(body: &str, j: &J) -> DatapackEnchantment {
+    DatapackEnchantment {
+        raw: body.to_owned(),
+        description: dyn_jtext(j, "description"),
+        supported_items: dyn_jstr_list(j, "supported_items"),
+        weight: dpj_i64(j, "weight"),
+        max_level: dpj_i64(j, "max_level"),
+        anvil_cost: dpj_i64(j, "anvil_cost"),
+        slots: dyn_jstr_list(j, "slots"),
+    }
+}
+
+fn dyn_damage_type(body: &str, j: &J) -> DatapackDamageType {
+    DatapackDamageType {
+        raw: body.to_owned(),
+        message_id: dpj_str(j, "message_id"),
+        exhaustion: dpj_f64(j, "exhaustion"),
+        scaling: dpj_str_or(j, "scaling", "when_caused_by_living_non_player"),
+        effects: j.get("effects").map(|v| v.str().to_owned()),
+    }
+}
+
+fn dyn_decoration(j: &J, key: &str) -> Option<ChatDecoration> {
+    j.get(key).map(|d| ChatDecoration {
+        translation_key: dpj_str(d, "translation_key"),
+        parameters: dyn_jstr_list(d, "parameters"),
+    })
+}
+
+fn dyn_chat_type(body: &str, j: &J) -> DatapackChatType {
+    DatapackChatType {
+        raw: body.to_owned(),
+        chat: dyn_decoration(j, "chat"),
+        narration: dyn_decoration(j, "narration"),
+    }
+}
+
+fn dyn_wolf_variant(body: &str, j: &J) -> DatapackWolfVariant {
+    DatapackWolfVariant {
+        raw: body.to_owned(),
+        wild_texture: dpj_str(j, "wild_texture"),
+        tame_texture: dpj_str(j, "tame_texture"),
+        angry_texture: dpj_str(j, "angry_texture"),
+        biomes: dyn_jstr_list(j, "biomes"),
+    }
+}
+
+fn dyn_painting_variant(body: &str, j: &J) -> DatapackPaintingVariant {
+    DatapackPaintingVariant {
+        raw: body.to_owned(),
+        asset_id: dpj_str(j, "asset_id"),
+        width: dpj_i64(j, "width"),
+        height: dpj_i64(j, "height"),
+    }
+}
+
+fn dyn_banner_pattern(body: &str, j: &J) -> DatapackBannerPattern {
+    DatapackBannerPattern {
+        raw: body.to_owned(),
+        asset_id: dpj_str(j, "asset_id"),
+        translation_key: dpj_str(j, "translation_key"),
+    }
+}
+
+fn dyn_jukebox_song(body: &str, j: &J) -> DatapackJukeboxSong {
+    DatapackJukeboxSong {
+        raw: body.to_owned(),
+        sound_event: dpj_str(j, "sound_event"),
+        description: dyn_jtext(j, "description"),
+        length_in_seconds: dpj_f64(j, "length_in_seconds"),
+        comparator_output: dpj_i64(j, "comparator_output"),
     }
 }
 
@@ -3622,58 +3552,66 @@ fn load_dynamic_registries(base: &std::path::Path) -> DynamicDataRegistries {
         if disabled.contains(&name) {
             continue;
         }
-        if zip {
-            let mut bytes = Vec::new();
-            let entries = std::fs::File::open(&path)
-                .and_then(|file| {
-                    file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes)
-                })
-                .ok()
-                .filter(|&len| len <= ZIP_MAX_BYTES)
-                .and_then(|_| zip_datapack_entries(&bytes));
-            let Some(entries) = entries else {
-                continue;
-            };
-            for (path, body) in entries {
-                if let Ok(body) = std::str::from_utf8(&body) {
-                    regs.read_entry(&path, body);
-                }
-            }
+        let entries = if zip {
+            dyn_zip_entries(&path)
         } else {
-            let mut dirs = vec![path.join("data")];
-            let mut files = Vec::new();
-            while let Some(dir) = dirs.pop() {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let Ok(kind) = entry.file_type() else {
-                        continue;
-                    };
-                    let path = entry.path();
-                    if kind.is_dir() {
-                        dirs.push(path);
-                    } else if kind.is_file()
-                        && path.extension().is_some_and(|ext| ext == "json")
-                    {
-                        files.push(path);
-                    }
-                }
-            }
-            files.sort_unstable();
-            for file in files {
-                let Ok(path) = file.strip_prefix(&path) else {
-                    continue;
-                };
-                if let (Some(path), Ok(body)) =
-                    (path.to_str(), std::fs::read_to_string(&file))
-                {
-                    regs.read_entry(&path.replace('\\', "/"), &body);
-                }
-            }
+            dyn_dir_entries(&path)
+        };
+        for (path, body) in entries {
+            regs.read_entry(&path, &body);
         }
     }
     regs
+}
+
+/// One enabled `.zip` pack's `(path, body)` entries, bounded by
+/// `ZIP_MAX_BYTES`. An unreadable or oversized archive contributes nothing.
+fn dyn_zip_entries(path: &std::path::Path) -> Vec<(String, String)> {
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(ZIP_MAX_BYTES as u64 + 1).read_to_end(&mut bytes))
+        .ok()
+        .filter(|&len| len <= ZIP_MAX_BYTES)
+        .and_then(|_| zip_datapack_entries(&bytes))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(path, body)| {
+            let body = std::str::from_utf8(&body).ok()?.to_owned();
+            Some((path, body))
+        })
+        .collect()
+}
+
+/// One enabled directory pack's `(path, body)` entries under its `data/`
+/// subtree, sorted so the merge order is path-deterministic.
+fn dyn_dir_entries(pack: &std::path::Path) -> Vec<(String, String)> {
+    let mut dirs = vec![pack.join("data")];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_unstable();
+    files
+        .into_iter()
+        .filter_map(|file| {
+            let path = file.strip_prefix(pack).ok()?.to_str()?;
+            let body = std::fs::read_to_string(&file).ok()?;
+            Some((path.replace('\\', "/"), body))
+        })
+        .collect()
 }
 
 /// Published dynamic-registry snapshot for later configuration-sync lanes,
