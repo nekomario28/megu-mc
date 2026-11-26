@@ -19,6 +19,7 @@
 
 pub mod atmosphere;
 pub mod clipboard;
+pub mod crack_overlay_pass;
 pub mod gpu_hiz;
 pub mod live_session;
 pub mod linux_desktop;
