@@ -383,6 +383,7 @@ pub mod nbt_wire;
 pub mod net_budget;
 pub mod os_desktop;
 pub mod perf_kit;
+pub mod pose_ray;
 pub mod quiescent;
 pub mod random;
 pub mod render_cs;
@@ -397,6 +398,7 @@ pub mod section_rev;
 pub mod server_perf_governors;
 pub mod sim_graph;
 pub mod simd_voxel;
+pub mod slot_coords;
 pub mod sparse_set;
 pub(crate) mod stats;
 pub mod sys_metrics;
@@ -408,5 +410,14 @@ pub mod union_find;
 pub mod varint;
 pub mod version;
 pub mod world_view;
+pub mod xp_curve;
 pub mod zero_change_sim;
 pub mod zip_archive;
+
+pub use pose_ray::{view_ray, PlayerPoseDimensions, PlayerPoseKind, ReachPolicy, ViewRay};
+pub use slot_coords::{
+    HotbarSlot, MenuInventoryLayout, PlayerMenuSlot, PlayerNbtSlot, SlotIndexError,
+};
+pub use xp_curve::{
+    moon_atlas_uv, moon_phase_from_day_time, total_xp_for_level, xp_for_next_level,
+};
