@@ -1,2 +1,2 @@
 # Warning count from Rust 1.98.0: cargo clippy --all-targets --locked
-39
+0

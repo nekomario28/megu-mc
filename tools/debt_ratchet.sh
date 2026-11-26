@@ -133,15 +133,17 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # 2439 -> 2436: the branch-mining helpers went live through the canonical
 # break-progress model and shed their silencers.
 # 2436 -> 2420: removed 49 stale dead_code allowances across src/.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2420 \
+# 2420 -> 2348: Wave 3 monolith decompositions removed 72 stale dead_code allowances.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2348 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
 # server-files, state-store, root) instead of shared through megu-core. The
 # ceiling freezes today's duplicates; consolidation lowers it.
 # 4 -> 2: server-files/installer and src/generation_math now re-export core::crypto::Sha256/sha256.
+# 2 -> 1: Wave 3 routed root/crate SHA-256 helpers through megu-core.
 ratchet_ws "duplicate sha256/Sha256 impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 2 \
+  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 1 \
   "SHA-256 belongs in megu-core; a new copy is a new thing to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 
@@ -155,8 +157,9 @@ ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
 # CRC32 (IEEE) likewise: the canonical table lives in core/src/hash.rs; every
 # other top-level copy is a duplicate. Test modules are excluded by the
 # column-0 anchor and the */tests/* path filter.
+# 3 -> 2: Wave 3 routed root CRC32 loops to megu_core::hash::crc32.
 ratchet_ws "duplicate crc32 impls outside core/src/hash.rs" \
-  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 3 \
+  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 2 \
   "CRC32 belongs in core/src/hash.rs; a new copy is a new table to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/hash.rs'
 

@@ -2231,8 +2231,8 @@ check "solid template clipping retains the upper window face" \
   feature::generation_contract_tests::fossil_window_clipping_matches_native
 
 check "solid template states rotate at placement" \
-  src/structure_template.rs '    let state = crate::structure_transform::state(block.state, placement.mirror, placement.rotation)' \
-  '    let state = crate::structure_transform::state(block.state, placement.mirror, crate::structure_transform::Rotation::None)' \
+  src/structure_template.rs $'    let state = crate::structure_transform::state_with(\n        block.state,\n        placement.mirror,\n        placement.rotation,' \
+  $'    let state = crate::structure_transform::state_with(\n        block.state,\n        placement.mirror,\n        crate::structure_transform::Rotation::None,' \
   feature::generation_contract_tests::fossil_feature_matches_actual_native_placement
 
 check "solid template boundary schedules source water" \
