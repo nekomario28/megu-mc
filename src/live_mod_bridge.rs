@@ -2783,6 +2783,7 @@ impl ItemTransferHandler for LiveCookingPotEndpoint {
 /// item ids skip the duct and land in the endpoint's slot store where
 /// their bytes and ids survive losslessly.
 #[cfg(feature = "mod-suite")]
+#[allow(clippy::too_many_arguments)]
 fn live_cap_insert_item(
     dim: DimId,
     x: i32,
@@ -2992,7 +2993,7 @@ fn live_cap_transfer_energy(
 /// Fill the fluid endpoint at `(dim, x, y, z)` with `fluid_id`
 /// (component bytes preserved); returns accepted mB.
 #[cfg(feature = "mod-suite")]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 fn live_cap_fill_fluid(
     dim: DimId,
     x: i32,
@@ -3942,7 +3943,7 @@ fn live_mod_tick() {
     }
     // Periodic optimizer diagnostic — every five minutes at 20 tps.
     let tick = TICK_IDX.load(Ordering::Relaxed);
-    if tick % 6000 == 0 {
+    if tick.is_multiple_of(6000) {
         eprintln!(
             "[live-mods] auto-optimizer: {} headless endpoints, stats {:?}",
             live_mod_headless_factory_len(),
@@ -4923,8 +4924,10 @@ impl LiveCreateRuntime {
                 Some("create:basin") => 9,
                 _ => continue,
             };
-            let mut held = LiveCreateHeld::default();
-            held.items = items.into_iter().take(cap).collect();
+            let held = LiveCreateHeld {
+                items: items.into_iter().take(cap).collect(),
+                ..Default::default()
+            };
             self.held.insert(pos, held);
             // AUTO-OPT: a restored machine starts awake — its inputs just
             // (re)appeared, so the recipe scan runs next poll.
@@ -5811,9 +5814,7 @@ fn live_create_interact_block(
             .block_def_for_state(clicked)?
             .id
             .as_str();
-        let Some(kind) = live_duct_kind(id) else {
-            return None;
-        };
+        let kind = live_duct_kind(id)?;
         let slot_kind = matches!(kind, LiveDuctKind::Depot | LiveDuctKind::Basin);
         if held_item != 0 && !sneaking {
             if slot_kind {
@@ -6025,7 +6026,7 @@ fn live_place_nbt_schematic_in_dim(
     let plan = create_adapter::schematic::SchematicPlacementPlan::preflight(
         &structure,
         [origin.0, origin.1, origin.2],
-        |canonical| state_from_arg(canonical),
+        state_from_arg,
         |[x, y, z]| {
             if !(-30_000_000..30_000_000).contains(&x)
                 || !(-30_000_000..30_000_000).contains(&z)
@@ -6293,9 +6294,12 @@ fn live_create_serialize() -> Option<Vec<u8>> {
 /// unknown canonical or item name, impossible count — is `Err` so
 /// `load_world_in` fails closed.
 #[cfg(feature = "mod-suite")]
+type LiveCreateSidecarEntry = (FactoryPos, u32, Vec<i64>);
+
+#[cfg(feature = "mod-suite")]
 fn live_create_decode_sidecar(
     raw: &[u8],
-) -> Result<Vec<(FactoryPos, u32, Vec<i64>)>, &'static str> {
+) -> Result<Vec<LiveCreateSidecarEntry>, &'static str> {
     const ERR: &str = "corrupt create factory save";
     let v2 = raw.len() >= 4 && raw[..4] == *LIVE_CREATE_SIDECAR_MAGIC;
     if raw.len() < 9 || !(v2 || raw[..4] == *LIVE_CREATE_SIDECAR_MAGIC_V1) {

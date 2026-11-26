@@ -20742,6 +20742,100 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(Ordering::Acquire)
 }
+
+static RESTART_CONTROLLER: OnceLock<Mutex<RestartCountdownController>> = OnceLock::new();
+fn restart_controller() -> &'static Mutex<RestartCountdownController> {
+    RESTART_CONTROLLER.get_or_init(|| {
+        let exit_code = std::env::var("MEGU_RESTART_EXIT_CODE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+            .filter(|code| (1..=255).contains(code))
+            .unwrap_or(RESTART_DEFAULT_EXIT_CODE);
+        Mutex::new(RestartCountdownController::with_exit_code(exit_code))
+    })
+}
+
+fn run_restart_command(args: &[&str]) -> String {
+    let joined = args.join(" ");
+    let parsed = match parse_restart_command(&joined) {
+        Ok(cmd) => cmd,
+        Err(err) => return err,
+    };
+    let now_tick = TICK_IDX.load(Ordering::Relaxed);
+    let mut ctrl = restart_controller()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match parsed {
+        RestartCommand::Cancel => {
+            if ctrl.cancel() {
+                let msg = "[Server] Scheduled server restart cancelled.";
+                let payload = system_chat(msg);
+                broadcast_packet(-1, 0x6c, &payload);
+                "Scheduled server restart cancelled".into()
+            } else {
+                "No restart scheduled".into()
+            }
+        }
+        RestartCommand::Status => ctrl.status_summary(now_tick),
+        RestartCommand::Schedule { delay_secs, reason } => {
+            if let Err(err) = ctrl.schedule(now_tick, delay_secs, reason) {
+                return err;
+            }
+            let summary = ctrl.status_summary(now_tick);
+            if delay_secs == 0 {
+                let outcome = ctrl.tick(now_tick);
+                drop(ctrl);
+                handle_restart_tick_outcome(outcome);
+                return "Restarting the server now".into();
+            }
+            summary
+        }
+    }
+}
+
+fn handle_restart_tick_outcome(outcome: RestartTickOutcome) {
+    match outcome {
+        RestartTickOutcome::Quiet => {}
+        RestartTickOutcome::Broadcast(messages) => {
+            for msg in messages {
+                let line = format!("[Server] {msg}");
+                let payload = system_chat(&line);
+                broadcast_packet(-1, 0x6c, &payload);
+            }
+        }
+        RestartTickOutcome::ExecuteRestart { reason, exit_code } => {
+            SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+            let disconnect_msg = match reason {
+                Some(r) if !r.is_empty() => format!("Server restarting: {r}"),
+                _ => "Server restarting".to_owned(),
+            };
+            shutdown_world_save();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                restore_tui_terminal();
+                transfer_all_to_fallback();
+                stop_lan_announcer();
+                stop_gs4_query();
+                disconnect_all_clients(&disconnect_msg);
+                std::thread::sleep(Duration::from_millis(100));
+                #[cfg(feature = "neoforge-events")]
+                if let Some(runtime) = java_compat::NEOFORGE.get() {
+                    runtime.cleanup_staged_mods();
+                }
+                std::process::exit(exit_code);
+            });
+        }
+    }
+}
+
+fn restart_countdown_tick() {
+    let now_tick = TICK_IDX.load(Ordering::Relaxed);
+    let outcome = restart_controller()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .tick(now_tick);
+    handle_restart_tick_outcome(outcome);
+}
 /// Highest dirty epoch a completed save is known to cover.
 static LAST_SAVED_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// Highest dirty epoch handed to the async save worker and not yet confirmed.
@@ -21967,6 +22061,7 @@ fn game_tick(mut step: impl FnMut(&'static str, fn())) {
     };
     run("environment", environment_time_tick);
     TICK_IDX.fetch_add(1, Ordering::Relaxed);
+    run("restart_countdown", restart_countdown_tick);
     run("hot_regions", refresh_hot);
     run("quiescent_chunks", quiescent_chunk_tick);
     // Vanilla 1.21.1 `ServerLevel.tick` phase order: scheduled block ticks,

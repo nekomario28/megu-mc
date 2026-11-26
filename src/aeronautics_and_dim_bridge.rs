@@ -241,6 +241,7 @@ struct AeronauticsRuntimeBridge {
     /// Rider attachment modes keyed by entity id.
     rider_kinds: BTreeMap<i32, RiderAttachmentKind>,
     /// Last committed start/end rigid poses per ship: `(start_pos,start_quat,end_pos,end_quat)`.
+    #[allow(clippy::type_complexity)]
     committed_poses: BTreeMap<u64, ([f64; 3], [f64; 4], [f64; 3], [f64; 4])>,
     /// Serialized block-entity payloads riding each ship's local voxels.
     ship_block_entities: BTreeMap<u64, BTreeMap<[i32; 3], Vec<u8>>>,

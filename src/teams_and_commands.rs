@@ -6388,7 +6388,7 @@ const COMMAND_BLOCK_OP_LEVEL: u8 = 2;
 /// the spec'd refuse-list is already refused by the level-2 gate and is kept
 /// here as defence in depth.
 const COMMAND_BLOCK_ROOT_DENY: &[&str] = &[
-    "stop", "op", "deop", "ban", "ban-ip", "banlist", "pardon", "pardon-ip",
+    "stop", "restart", "op", "deop", "ban", "ban-ip", "banlist", "pardon", "pardon-ip",
     "kick", "whitelist", "setidletimeout", "tick", "save", "save-all",
     "save-on", "save-off", "reload", "debug", "jfr", "perf", "publish",
     "transfer", "profile", "megu",

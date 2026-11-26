@@ -5886,7 +5886,7 @@ fn command_allowed_for_player(cmd: &str, args: &[&str]) -> bool {
 /// the dispatch/advertise boundary instead of falling through to the default
 /// level-2 gate.
 fn required_permission_level_for_source(cmd: &str) -> u8 {
-    if cmd == "megu" {
+    if cmd == "megu" || cmd == "restart" {
         4
     } else {
         required_permission_level(cmd)
@@ -5969,6 +5969,7 @@ fn command_usage(name: &str) -> String {
         "spectate" => "/spectate [<target>] [<player>]",
         "spreadplayers" => "/spreadplayers <x> <z> <spreadDistance> <maxRange> [under <maxHeight>] <respectTeams> <targets>",
         "stop" => "no arguments; stop the server",
+        "restart" => "/restart [seconds|now|cancel|status] [reason]",
         "stopsound" => "/stopsound [<target>] [<source>] [<sound>]",
         "summon" => "/summon <entity> [<x> <y> <z>] [<nbt>]",
         "tag" => "/tag <target> add|remove <tag> | list",
@@ -6599,7 +6600,9 @@ fn native_command_dispatcher(
         "?",
         literal("?").executes(|_| Ok(0)).then(completion_argument("command", word(), None)),
     );
-    for name in ["counts", "reload", "save", "save-all", "save-on", "save-off", "seed", "stop"] {
+    for name in [
+        "counts", "reload", "restart", "save", "save-all", "save-on", "save-off", "seed", "stop",
+    ] {
         register_at_level(name, done(name));
     }
     register_at_level(
@@ -9492,6 +9495,7 @@ fn run_command_ctx(ctx: &CmdCtx, msg: &str, s: &mut Option<&Client>) -> String {
             });
             "Stopping the server".into()
         }
+        "restart" => run_restart_command(&args),
         "clear" => run_clear_command_parity(&args, me),
         "effect" => run_effect_command_parity(&args, me),
         "xp" | "experience" => run_experience_command(&args, me),

@@ -842,7 +842,7 @@ impl ModOffloadBridge {
                 out.actor_edit_groups.push(world_edits.clone());
             }
             for edit in world_edits.iter().flatten() {
-                out.world_block_edits.push(edit.clone());
+                out.world_block_edits.push(*edit);
             }
         }
 
@@ -1168,7 +1168,7 @@ fn mob_commit_world_block_edit(edit: &WorldBlockEdit) -> bool {
     };
     let dim = DimId::from_raw(raw);
     let (x, y, z) = (edit.pos.x, edit.pos.y, edit.pos.z);
-    if y < MIN_Y || y >= MIN_Y + 384 {
+    if !(MIN_Y..MIN_Y + 384).contains(&y) {
         return false;
     }
     let target = edit.state_id.unwrap_or(0);

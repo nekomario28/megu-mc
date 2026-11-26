@@ -45,7 +45,9 @@ def audit(root, baseline):
     parsed = {}
     needed = set(HOTPATHS)
     canonical_subworld = 'proto/src/subworld_wire.rs'
+    canonical_mod_wire = 'proto/src/mod_wire.rs'
     needed.add(canonical_subworld)
+    needed.add(canonical_mod_wire)
     for _channel, _magic, owner, peer in WIRES:
         needed.update((owner, peer))
     for path in sorted(needed):
@@ -76,8 +78,10 @@ def audit(root, baseline):
             findings.append(f'{peer}: missing {channel} peer channel')
         if not channel.startswith('megu:subworld_') and f'b"{magic}"' not in owner_visible:
             findings.append(f'{owner}: missing {magic} wire magic')
-        if channel == 'megu:mod_registry_sync_v1' and f'b"{magic}"' not in peer_visible:
-            findings.append(f'{peer}: missing {magic} decoder')
+        if channel == 'megu:mod_registry_sync_v1' and (
+                f'b"{magic}"' not in peer_visible
+                and 'megu_proto::mod_wire::decode_mrs1_frame' not in peer_syntax):
+            findings.append(f'{peer}: missing {magic} decoder or canonical mod_wire delegation')
         # SW6D/SHLM are canonicalized in proto/src/subworld_wire.rs. Their
         # endpoint sharing and binary layout are checked by the dedicated
         # contract assertions below rather than by copied per-endpoint magic.
@@ -157,16 +161,26 @@ def audit(root, baseline):
     if 'pivot_adjusted_position' not in client_syntax:
         findings.append(f'{client_path}: client does not apply SW6D pivot semantics')
 
-    # MRS1 v2 acceptance is part of the wire contract: the client must not be
-    # a v1-only decoder and must preserve the per-state lighting facts byte
-    # instead of discarding the tail added by the server's default encoder.
+    # MRS1 v2 acceptance is part of the wire contract: the client must delegate
+    # to the canonical proto/src/mod_wire.rs decoder (which accepts both v1 and
+    # v2 and preserves/derives lighting facts) rather than a v1-only parser.
     registry_peer = 'client-app/src/mod_assets_meta.rs'
     registry_syntax, _ = parsed[registry_peer]
-    if not re.search(r'version\s*!=\s*1\s*&&\s*version\s*!=\s*2', registry_syntax):
-        findings.append(f'{registry_peer}: MRS1 decoder does not accept both versions 1 and 2')
-    for token in ('has_wire_facts', 'facts_byte', 'derive_block_facts_byte'):
-        if token not in registry_syntax:
-            findings.append(f'{registry_peer}: MRS1 decoder does not preserve/derive lighting facts')
+    mod_wire_syntax, mod_wire_visible = parsed[canonical_mod_wire]
+    if 'megu_proto::mod_wire::decode_mrs1_frame' not in registry_syntax:
+        findings.append(f'{registry_peer}: client does not delegate MRS1 decoding to canonical proto/src/mod_wire.rs')
+    if 'facts_byte' not in registry_syntax or 'derive_mrs1_facts_byte' not in registry_syntax:
+        findings.append(f'{registry_peer}: MRS1 client wrapper does not preserve/derive lighting facts')
+    for pattern, message in (
+        (r'pub\s+const\s+MRS1_MAGIC\s*:\s*\[u8\s*;\s*4\]\s*=\s*\*?\s*b"MRS1"', 'missing canonical MRS1 magic'),
+        (r'pub\s+const\s+MRS1_VERSION_V1\s*:\s*u16\s*=\s*1\s*;', 'missing canonical MRS1 v1 constant'),
+        (r'pub\s+const\s+MRS1_VERSION_V2\s*:\s*u16\s*=\s*2\s*;', 'missing canonical MRS1 v2 constant'),
+    ):
+        if not re.search(pattern, mod_wire_visible):
+            findings.append(f'{canonical_mod_wire}: {message}')
+    for token in ('decode_mrs1_frame', 'derive_mrs1_facts_byte', 'facts_bytes'):
+        if token not in mod_wire_syntax:
+            findings.append(f'{canonical_mod_wire}: MRS1 canonical codec missing {token}')
     return counts, findings
 
 
