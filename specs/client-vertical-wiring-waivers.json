@@ -58,12 +58,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::MapItemData",
-      "priority": "P1",
-      "reason": "map_item_data drops \u2014 map items render blank"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::Other",
       "priority": "P2",
       "reason": "catch-all variant for undecoded packet ids \u2014 intentionally unhandled"
@@ -73,18 +67,6 @@
       "id": "PlayEvent::PlaceGhostRecipe",
       "priority": "P2",
       "reason": "place_ghost_recipe drops \u2014 recipe-book ghost grid unimplemented"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerCombatEnd",
-      "priority": "P1",
-      "reason": "player_combat_end drops \u2014 combat-window end ignored"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::PlayerCombatEnter",
-      "priority": "P1",
-      "reason": "player_combat_enter drops \u2014 combat-window start ignored"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -142,12 +124,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetCamera",
-      "priority": "P1",
-      "reason": "set_camera drops \u2014 spectator/mob camera switching dead"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::SetChunkCacheRadius",
       "priority": "P2",
       "reason": "set_chunk_cache_radius drops \u2014 view-radius hint unused"
@@ -157,12 +133,6 @@
       "id": "PlayEvent::SetDefaultSpawnPosition",
       "priority": "P2",
       "reason": "set_default_spawn_position drops \u2014 compass spawn target unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::SetPlayerTeam",
-      "priority": "P1",
-      "reason": "set_player_team drops \u2014 teams, nametag colours and collision rules ignored"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -181,12 +151,6 @@
       "id": "PlayEvent::StoreCookie",
       "priority": "P2",
       "reason": "store_cookie drops \u2014 server cookie store unused"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::TabList",
-      "priority": "P1",
-      "reason": "tab_list drops \u2014 tab-list header/footer never update"
     },
     {
       "check": "s2c_play_event_consumption",
@@ -211,12 +175,6 @@
       "id": "Screen::AboutMegu",
       "priority": "P2",
       "reason": "reached only via client-ui-internal UiAction::OpenScreen (title AboutMegu button); never named by the host"
-    },
-    {
-      "check": "screen_state_reachability",
-      "id": "Screen::CrashRecovery",
-      "priority": "P1",
-      "reason": "unreachable \u2014 UiState::show_crash is never invoked from client-gpu, so the recovery screen can never appear"
     }
   ]
 }

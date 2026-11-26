@@ -83,7 +83,9 @@ use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
-use megu_ui::state::{CompactDebugHudData, CompactDebugHudPreset, HudState, UiState};
+use megu_ui::state::{
+    CompactDebugHudData, CompactDebugHudPreset, HudCombat, HudMap, HudMapIcon, HudState, UiState,
+};
 use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
 // Re-exported so embedders and tests keep the historical
@@ -276,6 +278,8 @@ pub enum SessionStatus {
     Connecting,
     Playing,
     Disconnected(String),
+    /// Unrecoverable local world/session processing error, not a server kick.
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -5120,6 +5124,9 @@ impl LiveSession {
     /// dirty-mesh drain so visible nearby sections mesh first — an empty
     /// slice degrades to pure distance ordering.
     pub fn poll(&mut self, camera_position: [f32; 3], frustum_planes: &[[f32; 4]]) {
+        if matches!(self.status, SessionStatus::Failed(_)) {
+            return;
+        }
         // Arm the adaptive dispatch decisions before any timed work this
         // poll: the D-UCB bandit picks the background drain profile it
         // will be scored on, and the probe cadence may dispatch the
@@ -5132,8 +5139,8 @@ impl LiveSession {
                 Ok(WorkerMessage::Connected) => self.status = SessionStatus::Playing,
                 Ok(WorkerMessage::Play(event)) => {
                     if let Err(error) = self.apply_event(event) {
-                        self.status = SessionStatus::Disconnected(error);
-                        break;
+                        self.status = SessionStatus::Failed(format!("play event: {error}"));
+                        return;
                     }
                 }
                 Ok(WorkerMessage::Sound(event)) => self.ingest_sound_event(event),
@@ -5192,7 +5199,8 @@ impl LiveSession {
         ) {
             Ok(rebuilt) => self.priority_zero_meshes += rebuilt as u64,
             Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
-                self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
+                self.status = SessionStatus::Failed(format!("mesh: {error}"));
+                return;
             }
             Err(_) => {}
         }
@@ -5223,7 +5231,8 @@ impl LiveSession {
                 }
             }
             Err(error) if !matches!(self.status, SessionStatus::Disconnected(_)) => {
-                self.status = SessionStatus::Disconnected(format!("mesh: {error}"));
+                self.status = SessionStatus::Failed(format!("mesh: {error}"));
+                return;
             }
             Err(_) => {}
         }
@@ -5234,7 +5243,10 @@ impl LiveSession {
         self.submit_offthread_sections(camera_position, frustum_planes);
         if !matches!(self.status, SessionStatus::Disconnected(_)) {
             let now = Instant::now();
-            let elapsed_ticks = (now.duration_since(self.last_vfx_tick).as_millis() / 50).min(4);
+            let elapsed_ticks = now.duration_since(self.last_vfx_tick).as_millis() as u64 / 50;
+            // Preserve sub-tick time at high frame rates. Cap expensive sim
+            // catch-up separately from the elapsed combat clock.
+            self.last_vfx_tick += Duration::from_millis(elapsed_ticks * 50);
             self.nature_env.origin = camera_position;
             // Idle-sim gating: with the ambience/tactile presets off and no
             // live particles left to age out, the 20 Hz sim steps do nothing
@@ -5246,7 +5258,7 @@ impl LiveSession {
                 || !self.nature_ambience.particles().is_empty();
             let tactile_active =
                 self.tactile_sim.config().preset.is_active() || !self.tactile_sim.is_empty();
-            for _ in 0..elapsed_ticks {
+            for _ in 0..elapsed_ticks.min(4) {
                 // Time each client sim-tick step so the Compact Debug HUD's MSPT/TPS
                 // segments get a live reading — `FrameTimingStats::push_tick`
                 // is the only producer of the tick ring it samples.
@@ -5261,11 +5273,14 @@ impl LiveSession {
                 self.world.tick_entities();
                 self.frame_timings.push_tick(tick_start.elapsed());
             }
-            self.last_vfx_tick = now;
+            self.world
+                .combat
+                .advance_ticks(elapsed_ticks.saturating_sub(4).min(u64::from(u32::MAX)) as u32);
+            self.sync_hud_combat();
             let animation_dt = now.duration_since(self.last_animation_tick).as_secs_f32();
             self.last_animation_tick = now;
             if let Err(error) = self.world.advance_animations(animation_dt.min(0.1)) {
-                self.status = SessionStatus::Disconnected(format!("animation: {error:?}"));
+                self.status = SessionStatus::Failed(format!("animation: {error:?}"));
             }
             self.atlas_anim_clock += now.duration_since(self.last_atlas_anim_tick).as_secs_f64();
             self.last_atlas_anim_tick = now;
@@ -6564,25 +6579,99 @@ impl LiveSession {
     /// the hold-Tab overlay renders; `listed = false` entries hide like
     /// vanilla).
     fn sync_hud_players(&mut self) {
-        let mut players: Vec<(String, u16)> = self
+        let mut players: Vec<_> = self
             .player_info
             .values()
             .filter(|entry| entry.listed != Some(false))
             .map(|entry| {
-                let name = entry
-                    .display_name_nbt
-                    .as_deref()
-                    .and_then(nbt_text)
-                    .or_else(|| entry.name.clone())
-                    .unwrap_or_else(|| uuid_label(&entry.uuid));
+                let (label, color) =
+                    if let Some(label) = entry.display_name_nbt.as_deref().and_then(nbt_text) {
+                        // A server-supplied display name overrides the team-formatted profile name.
+                        (label, None)
+                    } else if let Some(name) = entry.name.as_deref() {
+                        self.team_label(name, name)
+                    } else {
+                        (uuid_label(&entry.uuid), None)
+                    };
                 (
-                    name,
-                    entry.latency.unwrap_or(0).clamp(0, i32::from(u16::MAX)) as u16,
+                    (
+                        label,
+                        entry.latency.unwrap_or(0).clamp(0, i32::from(u16::MAX)) as u16,
+                    ),
+                    color,
                 )
             })
             .collect();
-        players.sort_by_key(|a| a.0.to_lowercase());
-        self.hud.players = players;
+        players.sort_by_cached_key(|((label, _), _)| label.to_lowercase());
+        let (rows, colors) = players.into_iter().unzip();
+        self.hud.players = rows;
+        self.hud.player_colors = colors;
+    }
+
+    fn sync_hud_tab_list(&mut self) {
+        self.hud.tab_header.clone_from(&self.world.tab_header);
+        self.hud.tab_footer.clone_from(&self.world.tab_footer);
+    }
+
+    fn sync_hud_combat(&mut self) {
+        let combat = HudCombat {
+            in_combat: self.world.combat.in_combat,
+            ticks: self.world.combat.ticks,
+            last_attacker_id: self.world.combat.last_attacker_id,
+        };
+        if self.hud.combat != combat {
+            self.hud.combat = combat;
+            self.bump_hud_revision();
+        }
+    }
+
+    fn team_label(&self, member: &str, label: &str) -> (String, Option<[u8; 3]>) {
+        let Some(team) = self.world.team_for_member(member) else {
+            return (label.to_owned(), None);
+        };
+        let prefix = nbt_text(&team.info.prefix_nbt).unwrap_or_default();
+        let suffix = nbt_text(&team.info.suffix_nbt).unwrap_or_default();
+        let color = u32::try_from(team.info.color)
+            .ok()
+            .and_then(vanilla_team_color);
+        (format!("{prefix}{label}{suffix}"), color)
+    }
+
+    /// Resolve the team and display metadata for a remote, visible entity.
+    pub fn entity_nametag(&self, eid: i32, viewer: &str) -> Option<(String, Option<[u8; 3]>)> {
+        if Some(eid) == self.player_entity_id || self.world.camera_entity_id == Some(eid) {
+            return None;
+        }
+        let entity = self.world.entities.get(&eid)?;
+        let meta = self.entity_metadata.get(&eid);
+        let player = self
+            .player_info
+            .get(&entity.uuid)
+            .and_then(|p| p.name.as_deref());
+        let custom = meta
+            .filter(|m| m.name_visible == Some(true))
+            .and_then(|m| m.custom_name.as_deref());
+        let label = player.or(custom)?;
+        let uuid;
+        let member = if let Some(player) = player {
+            player
+        } else {
+            uuid = scoreboard_uuid(entity.uuid);
+            &uuid
+        };
+        let invisible = meta
+            .and_then(|m| m.flags)
+            .is_some_and(|flags| flags & 0x20 != 0);
+        if invisible
+            && !self
+                .world
+                .team_allows_seeing_invisible_member(member, viewer)
+        {
+            return None;
+        }
+        self.world
+            .team_shows_nametag(member, viewer)
+            .then(|| self.team_label(member, label))
     }
 
     /// Mirror the decoded boss bars into `hud.bossbars` (`(title,
@@ -6615,6 +6704,57 @@ impl LiveSession {
         self.hud.hotbar = hotbar;
         self.hud.offhand = offhand;
         self.hud.armor = armor;
+        self.sync_hud_map();
+    }
+
+    fn held_map_id(&self) -> Option<i32> {
+        const COMP_MAP_ID: i32 = 26;
+        [36 + self.hud.selected_slot.min(8) as i32, 45]
+            .into_iter()
+            .filter_map(|slot| self.player_inventory.get(&slot))
+            .filter(|stack| stack.count > 0 && stack.item_id > 0)
+            .filter(|stack| {
+                crate::recipe_ingest::item_name_for_id(stack.item_id as u32)
+                    == "minecraft:filled_map"
+            })
+            .find_map(|stack| component_varint_value(stack, COMP_MAP_ID))
+    }
+
+    pub fn sync_hud_map(&mut self) {
+        let Some((id, map)) = self
+            .held_map_id()
+            .and_then(|id| Some((id, self.world.maps.get(&id)?)))
+        else {
+            self.hud.held_map = None;
+            return;
+        };
+        let icons = map
+            .icons
+            .iter()
+            .map(|icon| HudMapIcon {
+                kind: icon.kind,
+                x: icon.x,
+                z: icon.z,
+                direction: icon.direction,
+                label: icon.name_nbt.as_deref().and_then(nbt_text),
+            })
+            .collect();
+        if self.hud.held_map.as_ref().is_some_and(|old| {
+            old.id == id
+                && old.scale == map.scale
+                && old.locked == map.locked
+                && Arc::ptr_eq(&old.pixels, &map.pixels)
+                && old.icons == icons
+        }) {
+            return;
+        }
+        self.hud.held_map = Some(Arc::new(HudMap {
+            id,
+            scale: map.scale,
+            locked: map.locked,
+            pixels: map.pixels.clone(),
+            icons,
+        }));
     }
 
     /// The vanilla crosshair pick — entity hits win only when strictly
@@ -6648,7 +6788,15 @@ impl LiveSession {
     /// from the [`DeathLoopState`].
     pub fn death_screen_state(&self) -> Option<DeathScreenState> {
         self.death.is_dead().then(|| DeathScreenState {
-            cause_message: self.death.cause_message().map(str::to_owned),
+            cause_message: self.death.cause_message().map(str::to_owned).or_else(|| {
+                let eid = self.world.combat.last_attacker_id?;
+                let attacker = self.world.entities.get(&eid)?;
+                self.player_info
+                    .get(&attacker.uuid)
+                    .and_then(|entry| entry.name.as_ref())
+                    .or_else(|| self.entity_metadata.get(&eid)?.custom_name.as_ref())
+                    .map(|name| format!("Last attacker: {name}"))
+            }),
             score: self.death.score(),
             hardcore: self.death.hardcore(),
             // The server does not gate respawn; the tracker's own
@@ -8958,6 +9106,29 @@ impl LiveSession {
             self.request_respawn();
         }
         match event {
+            PlayEvent::TabList { .. } => {
+                self.sync_hud_tab_list();
+                self.bump_hud_revision();
+            }
+            PlayEvent::SetPlayerTeam { .. } => {
+                self.sync_hud_players();
+                self.bump_hud_revision();
+            }
+            PlayEvent::MapItemData { map_id, .. } => {
+                if self.held_map_id() == Some(map_id)
+                    || self
+                        .hud
+                        .held_map
+                        .as_ref()
+                        .is_some_and(|map| !self.world.maps.contains_key(&map.id))
+                {
+                    self.sync_hud_map();
+                    self.bump_hud_revision();
+                }
+            }
+            PlayEvent::PlayerCombatEnter
+            | PlayEvent::PlayerCombatEnd { .. }
+            | PlayEvent::DamageEvent { .. } => self.sync_hud_combat(),
             event @ (PlayEvent::JoinGame { .. }
             | PlayEvent::Respawn { .. }
             | PlayEvent::Teleport(..)
@@ -9085,6 +9256,11 @@ impl LiveSession {
         match event {
             PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
+                self.player_info.clear();
+                self.sync_hud_tab_list();
+                self.sync_hud_players();
+                self.sync_hud_map();
+                self.bump_hud_revision();
                 self.reset_dimension();
                 self.sync_game_mode_from_world();
             }
@@ -9537,6 +9713,7 @@ impl LiveSession {
                 let slot = i32::from(slot);
                 if (0..9).contains(&slot) {
                     self.hud.selected_slot = slot as usize;
+                    self.sync_hud_map();
                     self.bump_hud_revision();
                 }
             }
@@ -9985,6 +10162,7 @@ impl LiveSession {
                 // `death.apply` above already folded the kill into the
                 // death loop (dead + cause + victim id); the UI sync
                 // turns it into `Screen::Death`.
+                self.sync_hud_combat();
             }
             PlayEvent::Transfer { host, port } => match handle_transfer_packet(&host, port) {
                 Ok(target) => self.pending_transfer = Some(target),
@@ -10410,6 +10588,7 @@ impl LiveSession {
     }
 
     fn reset_dimension(&mut self) {
+        self.sync_hud_combat();
         self.acoustic_world.reset_dimension(&self.world);
         self.audio.mixer.refresh_acoustics();
         self.pending_end_credits = false;
@@ -11464,6 +11643,21 @@ pub fn discover_asset_layers(
 fn nbt_text(nbt_bytes: &[u8]) -> Option<String> {
     let text = WireReader::new(nbt_bytes).read_nbt().ok()?.extract_text();
     (!text.is_empty()).then_some(text)
+}
+
+/// Only ChatFormatting IDs 0–15 tint names; styles and RESET do not.
+fn vanilla_team_color(id: u32) -> Option<[u8; 3]> {
+    const COLORS: [u32; 16] = [
+        0x000000, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xffaa00, 0xaaaaaa, 0x555555,
+        0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
+    ];
+    let rgb = *COLORS.get(id as usize)?;
+    Some([(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8])
+}
+
+fn scoreboard_uuid(uuid: [u8; 16]) -> String {
+    let [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p] = uuid;
+    format!("{a:02x}{b:02x}{c:02x}{d:02x}-{e:02x}{f:02x}-{g:02x}{h:02x}-{i:02x}{j:02x}-{k:02x}{l:02x}{m:02x}{n:02x}{o:02x}{p:02x}")
 }
 
 /// Short stable label for a player-info entry that arrived without a
@@ -15070,6 +15264,141 @@ mod tests {
         }))
         .unwrap();
         assert!(live.mob_effects[&11].is_empty());
+    }
+
+    #[test]
+    fn held_map_snapshot_resolves_inventory_component_and_live_patches() {
+        let (mut live, _tx) = session();
+        let patch = |map_id, color| {
+            ClientPlayEvent::Play(PlayEvent::MapItemData {
+                map_id,
+                scale: 2,
+                locked: false,
+                icons: None,
+                columns: 1,
+                rows: 1,
+                x: 0,
+                y: 0,
+                colors: vec![color],
+            })
+        };
+        live.apply_event(patch(19, 18)).unwrap();
+        assert!(live.hud.held_map.is_none());
+        let id = megu_proto::ProtocolTable::v767_builtin()
+            .registry_id("minecraft:item", "minecraft:filled_map")
+            .unwrap();
+        let mut stack = vec![1];
+        write_varint(&mut stack, id as i32);
+        stack.extend([1, 0, 26, 19]); // added=1, removed=0, map_id=19
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::ContainerSetSlot {
+            window_id: 0,
+            state_id: 1,
+            slot: 36,
+            raw_item: stack,
+        }))
+        .unwrap();
+        let first = live.hud.held_map.clone().unwrap();
+        assert_eq!(first.id, 19);
+        assert_eq!(first.pixels[0], [255, 0, 0, 255]);
+        live.apply_event(patch(21, 6)).unwrap();
+        assert!(Arc::ptr_eq(live.hud.held_map.as_ref().unwrap(), &first));
+        live.apply_event(patch(19, 6)).unwrap();
+        assert_eq!(
+            live.hud.held_map.as_ref().unwrap().pixels[0],
+            [127, 178, 56, 255]
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::SetCarriedItem(1)))
+            .unwrap();
+        assert!(live.hud.held_map.is_none());
+    }
+
+    #[test]
+    fn live_tab_team_and_combat_packets_update_the_hud_and_death_fallback() {
+        let (_tx, incoming) = mpsc::sync_channel(8);
+        let (outgoing, _rx) = mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        let mut apply = |event| live.apply_event(ClientPlayEvent::Play(event)).unwrap();
+        apply(PlayEvent::JoinGame {
+            entity_id: 11,
+            dimension: DimensionMeta::default(),
+            hardcore: false,
+        });
+        apply(PlayEvent::TabList {
+            header_nbt: death_message_nbt("Lobby"),
+            footer_nbt: death_message_nbt("Server 1"),
+        });
+        apply(PlayEvent::PlayerInfo {
+            actions: 0x19,
+            entries: vec![PlayerInfoUpdateEntry {
+                uuid: [88; 16],
+                name: Some("Alex".into()),
+                properties: vec![],
+                chat_session: None,
+                game_mode: None,
+                listed: Some(true),
+                latency: Some(40),
+                display_name_nbt: None,
+            }],
+        });
+        apply(PlayEvent::SetPlayerTeam {
+            name: "red".into(),
+            mode: 0,
+            info: Some(Box::new(megu_client::protocol::PlayerTeamInfo {
+                display_name_nbt: death_message_nbt("Red"),
+                friendly_flags: 0,
+                nametag_visibility: "always".into(),
+                collision_rule: "never".into(),
+                color: 12,
+                prefix_nbt: death_message_nbt("["),
+                suffix_nbt: death_message_nbt("]"),
+            })),
+            entities: vec!["Alex".into()],
+        });
+        apply(PlayEvent::PlayerCombatEnter);
+        assert_eq!(live.hud.tab_header, "Lobby");
+        assert_eq!(live.hud.tab_footer, "Server 1");
+        assert_eq!(live.hud.players, vec![("[Alex]".into(), 40)]);
+        assert_eq!(live.hud.player_colors, vec![Some([255, 85, 85])]);
+        add_entity(&mut live, 88, 128, [0.0, 64.0, 8.0]);
+        assert_eq!(
+            live.entity_nametag(88, "Steve"),
+            Some(("[Alex]".into(), Some([255, 85, 85])))
+        );
+        assert!(live.hud.combat.in_combat);
+        live.last_vfx_tick = Instant::now() - Duration::from_millis(150);
+        live.poll([0.0; 3], &[]);
+        assert!(live.hud.combat.ticks >= 3);
+        let mut apply = |event| live.apply_event(ClientPlayEvent::Play(event)).unwrap();
+        apply(PlayEvent::DamageEvent {
+            eid: 11,
+            source_type: 0,
+            source_cause: 89,
+            source_direct: 89,
+            source_position: None,
+        });
+        apply(PlayEvent::PlayerCombatEnd { duration: 42 });
+        apply(PlayEvent::SetHealth {
+            health: 0.0,
+            food: 20,
+            saturation: 0.0,
+        });
+        assert!(!live.hud.combat.in_combat);
+        assert_eq!(live.hud.combat.ticks, 42);
+        assert_eq!(live.hud.combat.last_attacker_id, Some(88));
+        assert_eq!(
+            live.death_screen_state().unwrap().cause_message.as_deref(),
+            Some("Last attacker: Alex")
+        );
+        live.apply_event(ClientPlayEvent::Play(PlayEvent::Respawn {
+            dimension: DimensionMeta::default(),
+        }))
+        .unwrap();
+        assert_eq!(live.hud.combat, HudCombat::default());
+        assert_eq!(
+            live.hud.tab_header, "Lobby",
+            "tab list persists across dimension changes"
+        );
     }
 
     /// Every gameplay `LiveSession` producer must enqueue its

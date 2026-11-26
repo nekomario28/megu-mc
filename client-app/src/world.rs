@@ -37,8 +37,8 @@ use crate::protocol::{
     bitset_get, decode_boss_bar_action, decode_entity_metadata, decode_paletted_container,
     decode_particle_options, visual_level_event, ChunkBiomeData, DecodedBlockEntity,
     DecodedBossBarAction, DecodedChunk, DecodedEntityMetadataEntry, DecodedLightData,
-    DecodedParticleOptions, DimensionMeta, NbtValue, PlayEvent, VisualLevelEvent, WireAttribute,
-    WireReader,
+    DecodedParticleOptions, DimensionMeta, MapItemIcon, NbtValue, PlayEvent, PlayerTeamInfo,
+    VisualLevelEvent, WireAttribute, WireReader,
 };
 
 /// Texture-name to block-atlas sprite lookup used to certify when a baked
@@ -2152,6 +2152,70 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, cap: usize) {
     queue.push_back(value);
 }
 
+pub const MAP_SIDE: usize = 128;
+const MAX_TRACKED_MAPS: usize = 128;
+const MAX_TRACKED_TEAMS: usize = 1024;
+const MAX_TEAM_MEMBERS: usize = 16_384;
+
+/// The 1.21.1 map palette (`MapColor` IDs, then `Brightness` IDs). Map
+/// pixels are not block registry IDs. Both unused IDs and NONE are transparent.
+fn map_pixel(packed: u8) -> [u8; 4] {
+    const COLORS: [u32; 62] = [
+        0, 8368696, 16247203, 13092807, 16711680, 10526975, 10987431, 31744, 16777215, 10791096,
+        9923917, 7368816, 4210943, 9402184, 16776437, 14188339, 11685080, 6724056, 15066419,
+        8375321, 15892389, 5000268, 10066329, 5013401, 8339378, 3361970, 6704179, 6717235,
+        10040115, 1644825, 16445005, 6085589, 4882687, 55610, 8476209, 7340544, 13742497, 10441252,
+        9787244, 7367818, 12223780, 6780213, 10505550, 3746083, 8874850, 5725276, 8014168, 4996700,
+        4993571, 5001770, 9321518, 2430480, 12398641, 9715553, 6035741, 1474182, 3837580, 5647422,
+        1356933, 6579300, 14200723, 8365974,
+    ];
+    let rgb = COLORS.get(usize::from(packed >> 2)).copied().unwrap_or(0);
+    if rgb == 0 {
+        return [0; 4];
+    }
+    let shade = [180, 220, 255, 135][usize::from(packed & 3)];
+    let channel = |shift: u32| (((rgb >> shift) & 255) * shade / 255) as u8;
+    [channel(16), channel(8), channel(0), 255]
+}
+
+#[derive(Clone, Debug)]
+pub struct TrackedMap {
+    pub scale: i8,
+    pub locked: bool,
+    pub pixels: Arc<[[u8; 4]]>,
+    pub icons: Arc<[MapItemIcon]>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScoreboardTeam {
+    pub info: PlayerTeamInfo,
+    pub members: BTreeSet<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CombatState {
+    pub in_combat: bool,
+    /// Elapsed client ticks while active, or the server duration after End.
+    pub ticks: u32,
+    /// Last causing entity from `damage_event`, not the victim ID from Kill.
+    pub last_attacker_id: Option<i32>,
+}
+
+impl CombatState {
+    pub fn advance_ticks(&mut self, elapsed: u32) {
+        if self.in_combat {
+            self.ticks = self.ticks.saturating_add(elapsed);
+        }
+    }
+}
+
+fn component_text(bytes: &[u8]) -> String {
+    WireReader::new(bytes)
+        .read_nbt()
+        .map(|v| v.extract_text())
+        .unwrap_or_default()
+}
+
 /// One live entity tracked from the Protocol 767 S2C entity packets
 /// (`add_entity`, the `move_entity_*` family, `teleport_entity`,
 /// `rotate_head`, `set_entity_motion`, `hurt_animation`, `entity_event`,
@@ -2648,6 +2712,15 @@ pub struct WorldState {
     /// Live entities tracked from S2C entity packets, bounded by
     /// [`MAX_TRACKED_ENTITIES`].
     pub entities: BTreeMap<i32, TrackedEntity>,
+    pub local_player_entity_id: Option<i32>,
+    pub camera_entity_id: Option<i32>,
+    pub combat: CombatState,
+    pub tab_header: String,
+    pub tab_footer: String,
+    pub maps: BTreeMap<i32, TrackedMap>,
+    map_recency: VecDeque<i32>,
+    pub teams: BTreeMap<String, ScoreboardTeam>,
+    member_teams: BTreeMap<String, String>,
     /// Last decoded metadata values by entity and metadata index.
     pub entity_metadata: BTreeMap<i32, Vec<DecodedEntityMetadataEntry>>,
     /// Raw item-slot payloads keyed by (entity id, vanilla equipment slot).
@@ -2918,6 +2991,15 @@ impl WorldState {
             metrics: MeshMetrics::default(),
             animations: WorldAnimationHost::new(),
             entities: BTreeMap::new(),
+            local_player_entity_id: None,
+            camera_entity_id: None,
+            combat: CombatState::default(),
+            tab_header: String::new(),
+            tab_footer: String::new(),
+            maps: BTreeMap::new(),
+            map_recency: VecDeque::new(),
+            teams: BTreeMap::new(),
+            member_teams: BTreeMap::new(),
             entity_metadata: BTreeMap::new(),
             entity_equipment: BTreeMap::new(),
             entity_poses: BTreeMap::new(),
@@ -2996,6 +3078,8 @@ impl WorldState {
         // block-break state; the world clock (age/time/weather) persists
         // across respawns exactly like vanilla's shared `ClientLevel` data.
         self.entities.clear();
+        self.camera_entity_id = None;
+        self.combat = CombatState::default();
         self.entity_metadata.clear();
         self.entity_equipment.clear();
         self.entity_poses.clear();
@@ -4009,6 +4093,51 @@ impl WorldState {
             .unwrap_or_default()
     }
 
+    /// Standing eye height in Protocol 767 registry order (the same vanilla
+    /// dimensions as `src/entity_registry.rs`), adjusted for tracked poses.
+    pub fn entity_eye_height(&self, eid: i32) -> Option<f32> {
+        const EYES: [f32; 130] = [
+            0.36, 0.425, 0.26, 1.7775, 0.13, 0.2751, 0.45, 0.3, 1.53, 0.0, 0.5625, 1.74, 1.3452,
+            0.0, 2.275, 0.35, 0.45, 0.5625, 0.595, 0.644, 0.195, 0.595, 1.3, 1.445, 0.3, 1.425,
+            0.85, 1.74, 0.2125, 0.99875, 1.7, 6.8, 0.2125, 2.55, 0.13, 1.6575, 0.68, 0.2125, 0.425,
+            0.2125, 0.83300006, 0.2125, 0.4, 0.425, 0.595, 2.6, 10.44, 0.0, 0.4, 1.105, 0.425,
+            1.19, 0.595, 1.52, 1.74, 1.6575, 0.0, 2.295, 0.2125, 0.0, 0.0, 0.2125, 0.85, 0.0625,
+            0.0, 1.7765, 0.2125, 0.325, 0.0, 0.595, 1.3, 1.52, 0.595, 0.425, 1.0625, 0.54, 0.175,
+            0.765, 1.79, 1.79, 1.6575, 1.19, 0.2125, 0.455, 0.425, 1.8700001, 0.26, 1.235, 0.5,
+            0.265625, 0.13, 1.74, 1.52, 0.325, 0.265625, 1.05, 1.7, 0.2125, 0.595, 0.13, 0.65, 0.4,
+            1.74, 1.445, 0.19500001, 0.0, 0.15, 0.595, 1.7765, 0.13, 0.26, 0.34, 0.51875, 1.62,
+            1.6575, 1.62, 2.4650001, 0.0, 1.62, 2.9750001, 2.1, 0.265625, 0.68, 1.19, 1.74, 1.52,
+            1.74, 1.79, 1.62, 0.2125,
+        ];
+        let entity = self.entities.get(&eid)?;
+        if protocol_767_entity_name(entity.entity_type) == Some("minecraft:player") {
+            use megu_core::pose_ray::PlayerPoseKind;
+            let pose = match self.entity_poses.get(&eid) {
+                Some(1) => PlayerPoseKind::FallFlying,
+                Some(2) => PlayerPoseKind::Sleeping,
+                Some(3) => PlayerPoseKind::Swimming,
+                Some(4) => PlayerPoseKind::SpinAttack,
+                Some(5) => PlayerPoseKind::Crouching,
+                Some(7) => PlayerPoseKind::Dying,
+                _ => PlayerPoseKind::Standing,
+            };
+            return Some(pose.dimensions().eye_height);
+        }
+        let height = EYES
+            .get(entity.entity_type as usize)
+            .copied()
+            .unwrap_or(1.53);
+        let scale = if self
+            .entity_visual_state(eid)
+            .is_some_and(|visual| visual.is_baby)
+        {
+            0.5
+        } else {
+            1.0
+        };
+        Some(height * scale)
+    }
+
     /// Return the typed visual projection of one tracked entity.
     pub fn entity_visual_state(&self, eid: i32) -> Option<EntityVisualState> {
         let entity = self.entities.get(&eid)?;
@@ -4175,7 +4304,8 @@ impl WorldState {
             || self.apply_entity_play_event(event)?
             || self.apply_container_play_event(event)?
             || self.apply_world_play_event(event)?
-            || self.apply_combat_play_event(event)?;
+            || self.apply_combat_play_event(event)?
+            || self.apply_map_and_scoreboard_event(event)?;
         Ok(())
     }
 
@@ -4225,6 +4355,10 @@ impl WorldState {
                     };
                     self.entities.insert(*eid, entity);
                 }
+            }
+            PlayEvent::SetCamera { eid } => {
+                self.camera_entity_id =
+                    Some(*eid).filter(|id| Some(*id) != self.local_player_entity_id);
             }
             PlayEvent::RemoveEntities { eids } => {
                 for &eid in eids {
@@ -4329,9 +4463,21 @@ impl WorldState {
     /// block-entity data, block events/destruction and level effects.
     fn apply_world_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
         match event {
-            PlayEvent::JoinGame { dimension, .. } | PlayEvent::Respawn { dimension } => {
+            PlayEvent::JoinGame {
+                dimension,
+                entity_id,
+                ..
+            } => {
                 self.reset_dimension(dimension.clone());
+                self.local_player_entity_id = Some(*entity_id);
+                self.tab_header.clear();
+                self.tab_footer.clear();
+                self.maps.clear();
+                self.map_recency.clear();
+                self.teams.clear();
+                self.member_teams.clear();
             }
+            PlayEvent::Respawn { dimension } => self.reset_dimension(dimension.clone()),
             PlayEvent::SetTime { world_age, time_of_day } => {
                 // Idle no-op: a repeated time sync mutates nothing.
                 if self.world_age != *world_age || self.time_of_day != *time_of_day {
@@ -4396,8 +4542,28 @@ impl WorldState {
             PlayEvent::EntityEvent { .. } => {}
             // `damage_event` (1.19.4+) reports the same hurt the legacy
             // `hurt_animation` carried — flash the victim identically.
-            PlayEvent::HurtAnimation { eid, .. } | PlayEvent::DamageEvent { eid, .. } => {
+            PlayEvent::HurtAnimation { eid, .. } => self.flash_hurt(*eid),
+            PlayEvent::DamageEvent {
+                eid, source_cause, ..
+            } => {
                 self.flash_hurt(*eid);
+                if Some(*eid) == self.local_player_entity_id {
+                    // Protocol 767 encodes optional damage-source IDs as ID + 1, or 0.
+                    self.combat.last_attacker_id = (*source_cause > 0).then(|| source_cause - 1);
+                }
+            }
+            PlayEvent::PlayerCombatEnter => {
+                self.combat.in_combat = true;
+                self.combat.ticks = 0;
+            }
+            PlayEvent::PlayerCombatEnd { duration } => {
+                self.combat.in_combat = false;
+                self.combat.ticks = (*duration).max(0) as u32;
+            }
+            PlayEvent::PlayerCombatKill { player_id, .. }
+                if Some(*player_id) == self.local_player_entity_id =>
+            {
+                self.combat.in_combat = false;
             }
             PlayEvent::Animate { eid, animation } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
@@ -4457,8 +4623,196 @@ impl WorldState {
         Ok(true)
     }
 
+    fn apply_map_and_scoreboard_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
+        match event {
+            PlayEvent::TabList {
+                header_nbt,
+                footer_nbt,
+            } => {
+                self.tab_header = component_text(header_nbt);
+                self.tab_footer = component_text(footer_nbt);
+            }
+            PlayEvent::SetPlayerTeam {
+                name,
+                mode,
+                info,
+                entities,
+            } => {
+                self.apply_team(name, *mode, info.as_deref(), entities);
+            }
+            PlayEvent::MapItemData {
+                map_id,
+                scale,
+                locked,
+                icons,
+                columns,
+                rows,
+                x,
+                y,
+                colors,
+            } => {
+                let [width, height, x, z] = [*columns, *rows, *x, *y].map(usize::from);
+                if width != 0
+                    && (height == 0
+                        || x + width > MAP_SIDE
+                        || z + height > MAP_SIDE
+                        || colors.len() != width * height)
+                {
+                    return Err("map patch outside 128x128 bounds".into());
+                }
+                self.map_recency.retain(|id| id != map_id);
+                if self.map_recency.len() == MAX_TRACKED_MAPS {
+                    if let Some(oldest) = self.map_recency.pop_front() {
+                        self.maps.remove(&oldest);
+                    }
+                }
+                self.map_recency.push_back(*map_id);
+                let map = self.maps.entry(*map_id).or_insert_with(|| TrackedMap {
+                    scale: *scale,
+                    locked: *locked,
+                    pixels: vec![[0; 4]; MAP_SIDE * MAP_SIDE].into(),
+                    icons: Arc::default(),
+                });
+                map.scale = *scale;
+                map.locked = *locked;
+                if let Some(icons) = icons {
+                    map.icons = icons.iter().take(256).cloned().collect();
+                }
+                if width != 0 {
+                    let pixels = Arc::make_mut(&mut map.pixels);
+                    for (row, colors) in colors.chunks_exact(width).enumerate() {
+                        let start = (z + row) * MAP_SIDE + x;
+                        for (pixel, &color) in pixels[start..start + width].iter_mut().zip(colors) {
+                            *pixel = map_pixel(color);
+                        }
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_team(
+        &mut self,
+        name: &str,
+        mode: u8,
+        info: Option<&PlayerTeamInfo>,
+        members: &[String],
+    ) {
+        match mode {
+            0 => {
+                let Some(info) = info else { return };
+                if !self.teams.contains_key(name) && self.teams.len() >= MAX_TRACKED_TEAMS {
+                    return;
+                }
+                self.remove_team(name);
+                self.teams.insert(
+                    name.to_owned(),
+                    ScoreboardTeam {
+                        info: info.clone(),
+                        members: BTreeSet::new(),
+                    },
+                );
+            }
+            1 => self.remove_team(name),
+            2 => {
+                if let (Some(team), Some(info)) = (self.teams.get_mut(name), info) {
+                    team.info = info.clone();
+                }
+            }
+            3 | 4 => {}
+            _ => return,
+        }
+        if !self.teams.contains_key(name) {
+            return;
+        }
+        for member in members {
+            match mode {
+                0 | 3 if has_capacity(&self.member_teams, member, MAX_TEAM_MEMBERS) => {
+                    if let Some(old) = self.member_teams.insert(member.clone(), name.to_owned()) {
+                        if let Some(team) = self.teams.get_mut(&old) {
+                            team.members.remove(member);
+                        }
+                    }
+                    self.teams
+                        .get_mut(name)
+                        .expect("team checked above")
+                        .members
+                        .insert(member.clone());
+                }
+                4 if self
+                    .member_teams
+                    .get(member)
+                    .is_some_and(|team| team == name) =>
+                {
+                    self.member_teams.remove(member);
+                    self.teams
+                        .get_mut(name)
+                        .expect("team checked above")
+                        .members
+                        .remove(member);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn remove_team(&mut self, name: &str) {
+        if let Some(team) = self.teams.remove(name) {
+            for member in team.members {
+                self.member_teams.remove(&member);
+            }
+        }
+    }
+
+    pub fn team_for_member(&self, member: &str) -> Option<&ScoreboardTeam> {
+        self.teams.get(self.member_teams.get(member)?)
+    }
+
+    /// Scoreboard-only part of vanilla's pushability predicate. Physics may
+    /// still reject a pair for other reasons (e.g. spectator, non-pushable mob).
+    pub fn team_allows_collision(&self, member: &str, other: &str) -> bool {
+        let (a, b) = (self.member_teams.get(member), self.member_teams.get(other));
+        let same = a.is_some() && a == b;
+        [a, b].into_iter().flatten().all(|name| {
+            match self.teams[name].info.collision_rule.as_str() {
+                "never" => false,
+                "pushOtherTeams" | "push_other_teams" => !same,
+                "pushOwnTeam" | "push_own_team" => same,
+                _ => true,
+            }
+        })
+    }
+
+    pub fn team_allows_seeing_invisible_member(&self, member: &str, viewer: &str) -> bool {
+        let (Some(team), Some(other)) =
+            (self.team_for_member(member), self.team_for_member(viewer))
+        else {
+            return false;
+        };
+        std::ptr::eq(team, other) && team.info.friendly_flags & 0x02 != 0
+    }
+
+    pub fn team_shows_nametag(&self, member: &str, viewer: &str) -> bool {
+        let Some(team) = self.team_for_member(member) else {
+            return true;
+        };
+        let viewer_team = self.member_teams.get(viewer);
+        let same = self.member_teams.get(member) == viewer_team;
+        match team.info.nametag_visibility.as_str() {
+            "never" => false,
+            "hideForOtherTeams" | "hide_for_other_teams" => viewer_team.is_none() || same,
+            "hideForOwnTeam" | "hide_for_own_team" => !same,
+            _ => true,
+        }
+    }
+
     /// Drop every row keyed by `eid` from the tracked-entity families.
     fn forget_entity(&mut self, eid: i32) {
+        if self.camera_entity_id == Some(eid) {
+            self.camera_entity_id = None;
+        }
         self.entities.remove(&eid);
         self.entity_metadata.remove(&eid);
         self.entity_poses.remove(&eid);
@@ -4727,6 +5081,7 @@ impl WorldState {
     /// Advance per-tick entity bookkeeping once per client tick: the
     /// hurt-flash timer counts down on every tracked entity.
     pub fn tick_entities(&mut self) {
+        self.combat.advance_ticks(1);
         for entity in self.entities.values_mut() {
             entity.hurt_ticks = entity.hurt_ticks.saturating_sub(1);
         }
@@ -4862,6 +5217,138 @@ pub fn evaluate_entity_easter_egg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_patches_preserve_pixels_and_optional_decorations() {
+        let mut world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
+        world
+            .apply_play_event(&PlayEvent::MapItemData {
+                map_id: 19,
+                scale: 2,
+                locked: false,
+                icons: Some(vec![MapItemIcon {
+                    kind: 0,
+                    x: -2,
+                    z: 4,
+                    direction: 12,
+                    name_nbt: None,
+                }]),
+                columns: 2,
+                rows: 2,
+                x: 126,
+                y: 126,
+                colors: vec![4, 5, 6, 7],
+            })
+            .unwrap();
+        let before = world.maps[&19].pixels.clone();
+        let p = |x, z| z * MAP_SIDE + x;
+        assert_eq!(before[p(126, 126)], [89, 125, 39, 255]);
+        assert_eq!(before[p(127, 126)], [109, 153, 48, 255]);
+        assert_eq!(before[p(126, 127)], [127, 178, 56, 255]);
+        assert_eq!(before[p(127, 127)], [67, 94, 29, 255]);
+        let patch = |columns, colors, icons| PlayEvent::MapItemData {
+            map_id: 19,
+            scale: 3,
+            locked: true,
+            icons,
+            columns,
+            rows: 1,
+            x: 127,
+            y: 126,
+            colors,
+        };
+        assert!(world
+            .apply_play_event(&patch(2, vec![18, 18], Some(vec![])))
+            .is_err());
+        assert_eq!(
+            world.maps[&19].icons.len(),
+            1,
+            "out-of-bounds patch is atomic"
+        );
+        world.apply_play_event(&patch(1, vec![18], None)).unwrap();
+        let updated = &world.maps[&19];
+        assert_eq!(updated.scale, 3);
+        assert!(updated.locked);
+        assert_eq!(updated.icons[0].direction, 12);
+        assert_eq!(updated.pixels[p(127, 126)], [255, 0, 0, 255]);
+        assert_eq!(updated.pixels[p(126, 126)], before[p(126, 126)]);
+        assert_eq!(updated.pixels[p(127, 127)], before[p(127, 127)]);
+        assert_eq!(updated.pixels[0], [0; 4]);
+        world
+            .apply_play_event(&patch(0, vec![], Some(vec![])))
+            .unwrap();
+        assert!(world.maps[&19].icons.is_empty());
+        assert_eq!(world.maps[&19].pixels[p(127, 126)], [255, 0, 0, 255]);
+        assert_eq!(map_pixel(255), [0; 4]);
+    }
+
+    #[test]
+    fn scoreboard_team_modes_move_members_and_apply_both_collision_rules() {
+        let mut world = WorldState::new(DimensionMeta::default(), BlockTable::load(None));
+        let info = |collision: &str, visibility: &str, color| {
+            Some(Box::new(PlayerTeamInfo {
+                display_name_nbt: vec![8, 0, 1, b'A'],
+                friendly_flags: 2,
+                nametag_visibility: visibility.to_owned(),
+                collision_rule: collision.to_owned(),
+                color,
+                prefix_nbt: vec![8, 0, 1, b'['],
+                suffix_nbt: vec![8, 0, 1, b']'],
+            }))
+        };
+        let team = |name: &str, mode, info, members: &[&str]| PlayEvent::SetPlayerTeam {
+            name: name.to_owned(),
+            mode,
+            info,
+            entities: members.iter().map(|s| (*s).to_owned()).collect(),
+        };
+        world
+            .apply_play_event(&team(
+                "red",
+                0,
+                info("pushOwnTeam", "hideForOtherTeams", 12),
+                &["Steve", "Alex"],
+            ))
+            .unwrap();
+        world
+            .apply_play_event(&team("blue", 0, info("always", "never", 9), &["Sam"]))
+            .unwrap();
+        assert!(world.team_allows_collision("Steve", "Alex"));
+        assert!(!world.team_allows_collision("Sam", "Alex"));
+        assert!(!world.team_shows_nametag("Alex", "Sam"));
+        assert!(world.team_shows_nametag("Alex", "Steve"));
+        assert!(world.team_allows_seeing_invisible_member("Alex", "Steve"));
+        assert!(!world.team_allows_seeing_invisible_member("Alex", "Sam"));
+        assert!(world.team_shows_nametag("Alex", "NoTeam"));
+        assert!(!world.team_shows_nametag("Sam", "NoTeam"));
+        world
+            .apply_play_event(&team(
+                "red",
+                2,
+                info("pushOtherTeams", "hideForOwnTeam", 4),
+                &[],
+            ))
+            .unwrap();
+        assert_eq!(world.team_for_member("Alex").unwrap().info.color, 4);
+        assert!(!world.team_allows_collision("Steve", "Alex"));
+        assert!(world.team_allows_collision("Sam", "Alex"));
+        assert!(!world.team_shows_nametag("Alex", "Steve"));
+        world
+            .apply_play_event(&team("blue", 3, None, &["Alex"]))
+            .unwrap();
+        world
+            .apply_play_event(&team("red", 4, None, &["Alex"]))
+            .unwrap();
+        assert!(!world.teams["red"].members.contains("Alex"));
+        assert!(world.teams["blue"].members.contains("Alex"));
+        assert_eq!(world.team_for_member("Alex").unwrap().info.color, 9);
+        world
+            .apply_play_event(&team("blue", 4, None, &["Alex"]))
+            .unwrap();
+        assert!(world.team_for_member("Alex").is_none());
+        world.apply_play_event(&team("red", 1, None, &[])).unwrap();
+        assert!(world.team_for_member("Steve").is_none());
+    }
 
     #[test]
     fn biome_tint_resolver_samples_optional_rgba_colormap() {

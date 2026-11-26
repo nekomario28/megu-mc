@@ -58,7 +58,10 @@ use megu_core::render_cs::{
 };
 use megu_kernel::debug_chords::DebugLine;
 use megu_kernel::entity_interp::{evaluate_sky_and_fog, SkyFogInput, SkyFogOutput};
-use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
+use megu_ui::draw::{font_atlas_rgba, UiMesh, UiRect, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH};
+use megu_ui::state::{HudMap, HudMapIcon};
+
+use crate::vanilla_atlas_extras::VanillaAtlasExtras;
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
@@ -3266,6 +3269,8 @@ pub struct GpuRenderer {
     ui_pipeline: wgpu::RenderPipeline,
     ui_layout: wgpu::BindGroupLayout,
     ui_bind_group: Option<wgpu::BindGroup>,
+    held_map_texture: Option<HeldMapTexture>,
+    held_map_viewport: Option<UiRect>,
     ui_texture: Option<wgpu::Texture>,
     ui_view: Option<wgpu::TextureView>,
     ui_sampler: wgpu::Sampler,
@@ -4136,6 +4141,136 @@ fn upload_rgba_texture(
         },
     );
     texture
+}
+
+struct HeldMapTexture {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    source: Arc<HudMap>,
+    with_assets: bool,
+}
+
+const MAP_EDGE: usize = megu_client::world::MAP_SIDE;
+
+fn compose_map_pixels(map: &HudMap, assets: Option<&VanillaAtlasExtras>) -> Vec<[u8; 4]> {
+    let mut rgba = vec![[213, 187, 135, 255]; MAP_EDGE * MAP_EDGE];
+    let background = assets.and_then(VanillaAtlasExtras::map_background);
+    for (i, pixel) in rgba.iter_mut().enumerate() {
+        if let Some(color) = map.pixels.get(i).filter(|color| color[3] != 0) {
+            *pixel = *color;
+        } else if let Some(bg) = background {
+            let x = (i % MAP_EDGE) * bg.width as usize / MAP_EDGE;
+            let y = (i / MAP_EDGE) * bg.height as usize / MAP_EDGE;
+            blend_map_pixel(pixel, image_pixel(bg, x, y));
+        }
+    }
+    for icon in &map.icons {
+        paint_map_icon(&mut rgba, icon, assets);
+    }
+    rgba
+}
+
+fn image_pixel(image: &crate::title_branding::RgbaImage, x: usize, y: usize) -> [u8; 4] {
+    let start = (y * image.width as usize + x) * 4;
+    image.rgba[start..start + 4]
+        .try_into()
+        .expect("RGBA image pixel")
+}
+
+fn blend_map_pixel(dst: &mut [u8; 4], src: [u8; 4]) {
+    let alpha = u16::from(src[3]);
+    for i in 0..3 {
+        dst[i] = ((u16::from(src[i]) * alpha + u16::from(dst[i]) * (255 - alpha)) / 255) as u8;
+    }
+}
+
+fn paint_map_icon(rgba: &mut [[u8; 4]], icon: &HudMapIcon, assets: Option<&VanillaAtlasExtras>) {
+    // Protocol 767's map_decoration_type registry order (not texture-atlas order).
+    const NAMES: [&str; 35] = [
+        "player",
+        "frame",
+        "red_marker",
+        "blue_marker",
+        "target_x",
+        "target_point",
+        "player_off_map",
+        "player_off_limits",
+        "woodland_mansion",
+        "ocean_monument",
+        "white_banner",
+        "orange_banner",
+        "magenta_banner",
+        "light_blue_banner",
+        "yellow_banner",
+        "lime_banner",
+        "pink_banner",
+        "gray_banner",
+        "light_gray_banner",
+        "cyan_banner",
+        "purple_banner",
+        "blue_banner",
+        "brown_banner",
+        "green_banner",
+        "red_banner",
+        "black_banner",
+        "red_x",
+        "desert_village",
+        "plains_village",
+        "savanna_village",
+        "snowy_village",
+        "taiga_village",
+        "jungle_temple",
+        "swamp_hut",
+        "trial_chambers",
+    ];
+    let sprite = NAMES
+        .get(icon.kind as usize)
+        .and_then(|name| assets?.map_decoration(name));
+    let cx = f32::from(icon.x) / 2.0 + 64.0;
+    let cy = f32::from(icon.z) / 2.0 + 64.0;
+    let (sin, cos) = (f32::from(icon.direction & 15) * std::f32::consts::TAU / 16.0).sin_cos();
+    // Inverse rotate and nearest-sample an 8×8 marker. Clip at the map
+    // edge instead of wrapping (off-map markers sit right on that edge).
+    for y in (cy as i32 - 6).max(0)..(cy as i32 + 7).min(MAP_EDGE as i32) {
+        for x in (cx as i32 - 6).max(0)..(cx as i32 + 7).min(MAP_EDGE as i32) {
+            let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+            let u = (cos * dx + sin * dy + 4.0) / 8.0;
+            let v = (-sin * dx + cos * dy + 4.0) / 8.0;
+            if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                continue;
+            }
+            let marker = sprite.map_or_else(
+                || fallback_map_icon(icon.kind, (u * 8.0) as i32, (v * 8.0) as i32),
+                |image| {
+                    image_pixel(
+                        image,
+                        (u * image.width as f32) as usize,
+                        (v * image.height as f32) as usize,
+                    )
+                },
+            );
+            blend_map_pixel(&mut rgba[y as usize * MAP_EDGE + x as usize], marker);
+        }
+    }
+}
+
+fn fallback_map_icon(kind: i32, x: i32, y: i32) -> [u8; 4] {
+    let dx = (x - 3).abs();
+    let dy = (y - 3).abs();
+    let fill = match kind {
+        0 => y <= 5 && dx <= (y / 2).min(2),
+        4 | 26 => dx == dy,
+        _ => dx + dy <= 3,
+    };
+    if !fill {
+        return [0; 4];
+    }
+    match kind {
+        0 | 6 | 7 => [252, 251, 233, 255],
+        2 | 4 | 26 => [171, 33, 24, 255],
+        3 | 9 => [22, 72, 159, 255],
+        _ => [47, 75, 40, 255],
+    }
 }
 
 fn decoded_texture_is_valid(ctx: &GpuDevice, width: u32, height: u32, rgba: &[u8]) -> bool {
@@ -8313,6 +8448,8 @@ impl GpuRenderer {
             ui_pipeline,
             ui_layout,
             ui_bind_group: None,
+            held_map_texture: None,
+            held_map_viewport: None,
             ui_texture: None,
             ui_view: None,
             ui_sampler,
@@ -12749,6 +12886,76 @@ impl GpuRenderer {
         }
     }
 
+    /// Retain one GUI map texture. Updates upload only when its snapshot
+    /// changes, never when the camera, HUD scale or viewport moves.
+    pub(crate) fn set_held_map_overlay(
+        &mut self,
+        overlay: Option<(&Arc<HudMap>, UiRect)>,
+        assets: Option<&VanillaAtlasExtras>,
+    ) {
+        self.held_map_viewport = overlay.map(|(_, rect)| rect);
+        let Some((map, _)) = overlay else { return };
+        if self.held_map_texture.as_ref().is_some_and(|cached| {
+            Arc::ptr_eq(&cached.source, map) && cached.with_assets == assets.is_some()
+        }) {
+            return;
+        }
+        let size = wgpu::Extent3d {
+            width: MAP_EDGE as u32,
+            height: MAP_EDGE as u32,
+            depth_or_array_layers: 1,
+        };
+        let cached = self.held_map_texture.get_or_insert_with(|| {
+            let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("held-map"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: OFFSCREEN_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("held-map"),
+                    layout: &self.ui_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.ui_sampler),
+                        },
+                    ],
+                });
+            HeldMapTexture {
+                texture,
+                bind_group,
+                source: map.clone(),
+                with_assets: assets.is_some(),
+            }
+        });
+        let pixels = compose_map_pixels(map, assets);
+        self.ctx.queue.write_texture(
+            cached.texture.as_image_copy(),
+            bytemuck::cast_slice(&pixels),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.width * 4),
+                rows_per_image: Some(size.height),
+            },
+            size,
+        );
+        cached.source = map.clone();
+        cached.with_assets = assets.is_some();
+    }
+
     /// Upload/replace the `client-ui` RGBA framebuffer texture. `rgba` must
     /// be `width * height * 4` bytes.
     pub fn update_ui_framebuffer(
@@ -13432,7 +13639,7 @@ impl GpuRenderer {
             self.record_world_without_camera(&mut encoder, view, sky);
         }
         self.encode_gameplay_screen_overlay(&mut encoder, view, width, height);
-        self.record_ui_overlay(&mut encoder, view);
+        self.record_ui_overlay(&mut encoder, view, width, height);
         self.ctx.queue.submit([encoder.finish()]);
     }
 
@@ -13542,10 +13749,28 @@ impl GpuRenderer {
     }
 
     /// UI draws at native resolution above the world and screen overlays.
-    fn record_ui_overlay(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+    fn record_ui_overlay(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) {
         let draw_quads = self.ui_quad.index_count > 0;
         let draw_branding = self.title_branding_pending();
-        if !draw_quads && !draw_branding && self.ui_bind_group.is_none() {
+        let map = self
+            .held_map_texture
+            .as_ref()
+            .zip(self.held_map_viewport)
+            .filter(|(_, rect)| {
+                rect.x >= 0
+                    && rect.y >= 0
+                    && rect.w > 0
+                    && rect.h > 0
+                    && rect.right() <= width as i32
+                    && rect.bottom() <= height as i32
+            });
+        if !draw_quads && !draw_branding && self.ui_bind_group.is_none() && map.is_none() {
             return;
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -13565,6 +13790,20 @@ impl GpuRenderer {
             multiview_mask: None,
         });
 
+        if let Some((map, rect)) = map {
+            pass.set_pipeline(&self.ui_pipeline);
+            pass.set_bind_group(0, &map.bind_group, &[]);
+            pass.set_viewport(
+                rect.x as f32,
+                rect.y as f32,
+                rect.w as f32,
+                rect.h as f32,
+                0.0,
+                1.0,
+            );
+            pass.draw(0..3, 0..1);
+            pass.set_viewport(0.0, 0.0, width as f32, height as f32, 0.0, 1.0);
+        }
         if draw_quads || draw_branding {
             if draw_quads {
                 self.draw_ui_quads(&mut pass);
@@ -16177,7 +16416,7 @@ impl GpuRenderer {
             }
         }
         self.encode_gameplay_screen_overlay(&mut encoder, &native_view, width, height);
-        self.record_ui_overlay(&mut encoder, &native_view);
+        self.record_ui_overlay(&mut encoder, &native_view, width, height);
 
         let padded_bpr = crate::aligned_copy_bytes_per_row(width);
         let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -16268,6 +16507,80 @@ fn index_buffer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_composition_rotates_player_arrow_and_clips_edge_markers() {
+        let mut map = HudMap {
+            id: 1,
+            scale: 0,
+            locked: false,
+            pixels: vec![[37, 111, 173, 255]; MAP_EDGE * MAP_EDGE].into(),
+            icons: vec![HudMapIcon {
+                kind: 0,
+                x: 0,
+                z: 0,
+                direction: 0,
+                label: None,
+            }],
+        };
+        let north = compose_map_pixels(&map, None);
+        let at = |x, y| y * MAP_EDGE + x;
+        assert_eq!(north[at(63, 60)], [252, 251, 233, 255]);
+        assert_eq!(north[at(67, 63)], [37, 111, 173, 255]);
+        map.icons[0].direction = 4;
+        map.icons.push(HudMapIcon {
+            kind: 2,
+            x: -128,
+            z: -128,
+            direction: 0,
+            label: None,
+        });
+        let east = compose_map_pixels(&map, None);
+        assert_eq!(east[at(67, 63)], [252, 251, 233, 255]);
+        assert_eq!(east[at(63, 60)], [37, 111, 173, 255]);
+        assert_eq!(east[at(0, 0)], [171, 33, 24, 255]);
+        assert_eq!(east[at(127, 0)], [37, 111, 173, 255]);
+    }
+
+    #[test]
+    fn held_map_overlay_blits_rgba_only_inside_viewport() {
+        let pref = RenderBackendPreference::Auto;
+        if probe_adapters(pref).is_empty() {
+            eprintln!("SKIP held map GPU readback: no Vulkan/DX12 adapter");
+            return;
+        }
+        let ctx = request_gpu_device(pref, None, None).unwrap();
+        eprintln!(
+            "held map GPU readback adapter: {:?} {}",
+            ctx.report.backend, ctx.report.name
+        );
+        let mut renderer = GpuRenderer::new(ctx, OFFSCREEN_FORMAT);
+        let camera = Camera::default();
+        let map = Arc::new(HudMap {
+            id: 1,
+            scale: 0,
+            locked: false,
+            pixels: vec![[37, 111, 173, 255]; MAP_EDGE * MAP_EDGE].into(),
+            icons: Vec::new(),
+        });
+        let base = renderer
+            .render_offscreen_rgba(96, 96, &camera, None)
+            .unwrap();
+        renderer.set_held_map_overlay(Some((&map, UiRect::new(48, 48, 32, 32))), None);
+        let result = renderer
+            .render_offscreen_rgba(96, 96, &camera, None)
+            .unwrap();
+        let inside = (60 * 96 + 60) * 4;
+        let outside = (60 * 96 + 84) * 4;
+        assert_ne!(&base[inside..inside + 4], &result[inside..inside + 4]);
+        assert_eq!(&result[inside..inside + 4], &[37, 111, 173, 255]);
+        assert_eq!(&result[outside..outside + 4], &base[outside..outside + 4]);
+        renderer.set_held_map_overlay(None, None);
+        let hidden = renderer
+            .render_offscreen_rgba(96, 96, &camera, None)
+            .unwrap();
+        assert_eq!(&hidden[inside..inside + 4], &base[inside..inside + 4]);
+    }
 
     #[test]
     fn smooth_lighting_changes_staged_vertex_ao_bits() {

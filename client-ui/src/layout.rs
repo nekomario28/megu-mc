@@ -3202,20 +3202,39 @@ struct PlayerListGeometry {
     rows_used: usize,
     shown: usize,
     extra: usize,
+    header_rows: usize,
+    footer_rows: usize,
 }
 
-fn player_list_geometry(
-    player_count: usize,
-    max_name_w: i32,
-    w: i32,
-    h: i32,
-    boss_bottom: i32,
-) -> PlayerListGeometry {
+const TAB_LINE_H: i32 = 11;
+
+fn player_list_geometry(hud: &HudState, w: i32, h: i32, boss_bottom: i32) -> PlayerListGeometry {
+    let player_count = hud.players.len();
+    let max_name_w = hud
+        .players
+        .iter()
+        .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
+        .max()
+        .unwrap_or(0);
     let py = boss_bottom + 4;
-    let rows_avail = ((h - 4 - (py + 14)) / 11).max(0) as usize;
-    let rows_per_col = rows_avail.min(20);
+    let available_rows = ((h - 4 - (py + 14)) / TAB_LINE_H).max(0) as usize;
+    // Leave room for at least one player row. Bound server-authored multiline
+    // text so neither the footer nor the roster is pushed off-screen.
+    let header_rows = hud
+        .tab_header
+        .lines()
+        .count()
+        .min(4)
+        .min(available_rows.saturating_sub(1) / 2);
+    let footer_rows = hud
+        .tab_footer
+        .lines()
+        .count()
+        .min(4)
+        .min(available_rows.saturating_sub(header_rows + 1));
+    let rows_per_col = (available_rows - header_rows - footer_rows).min(20);
     let fit_col_w = (w - 20).max(40);
-    let col_w = (max_name_w + 58).clamp(70, 150).min(fit_col_w);
+    let col_w = (max_name_w + 32).clamp(70, 256).min(fit_col_w);
     let max_cols = ((w - 8 - 12 + 4) / (col_w + 4)).max(1) as usize;
     let needed_cols = if rows_per_col == 0 {
         1
@@ -3236,8 +3255,18 @@ fn player_list_geometry(
     } else {
         occupied_slots.div_ceil(cols).min(rows_per_col.max(1))
     };
-    let panel_w = cols as i32 * col_w + (cols as i32 - 1) * 4 + 12;
-    let panel_h = 14 + rows_used as i32 * 11;
+    let chrome_w = hud
+        .tab_header
+        .lines()
+        .take(header_rows)
+        .chain(hud.tab_footer.lines().take(footer_rows))
+        .map(|line| {
+            text_width(crate::draw::first_px(line, (w - 20).max(0) as usize), 1) as i32 + 12
+        })
+        .max()
+        .unwrap_or(0);
+    let panel_w = (cols as i32 * col_w + (cols as i32 - 1) * 4 + 12).max(chrome_w);
+    let panel_h = 14 + (rows_used + header_rows + footer_rows) as i32 * TAB_LINE_H;
     PlayerListGeometry {
         panel_x: w / 2 - panel_w / 2,
         panel_y: py,
@@ -3247,6 +3276,8 @@ fn player_list_geometry(
         rows_used,
         shown,
         extra,
+        header_rows,
+        footer_rows,
     }
 }
 
@@ -3532,7 +3563,12 @@ fn hud(ctx: &mut Ctx) {
     let cx = w / 2;
 
     hud_screen_overlay(ctx, hud, w, h);
+    hud_entity_nametags(ctx, hud);
+    hud_held_map(ctx);
     hud_status_effects(ctx, hud, w);
+    if hud.combat.in_combat {
+        ctx.text(4, 14, 1, pal::WARNING, tr(lang, "In combat", "バトル中"));
+    }
 
     // Opt-in Compact Debug HUD lines — empty while disabled, so the disabled path
     // emits exactly zero commands.
@@ -3611,6 +3647,93 @@ fn hud(ctx: &mut Ctx) {
     }
 
     hud_magic_overlay(ctx, hud);
+}
+
+fn hud_color(color: Option<[u8; 3]>) -> UiColor {
+    color.map_or(pal::TEXT, |[r, g, b]| UiColor::rgb(r, g, b))
+}
+
+fn hud_entity_nametags(ctx: &mut Ctx, hud: &HudState) {
+    for tag in &hud.entity_nametags {
+        let [x, y] = tag.anchor;
+        let cx = (x * ctx.w as f32) as i32;
+        let y = (y * ctx.h as f32) as i32 - 9;
+        let text = hud_str(&tag.text, 48);
+        let text = crate::draw::first_px(&text, (ctx.w - 8).max(0) as usize);
+        let half = (text_width(text, 1) as i32 + 1) / 2;
+        let cx = cx.clamp(half + 2, (ctx.w - half - 2).max(half + 2));
+        ctx.fill(
+            cx - half - 2,
+            y - 1,
+            2 * half + 4,
+            10,
+            UiColor::rgba(0, 0, 0, 150),
+        );
+        ctx.ctext(cx, y, 1, hud_color(tag.color), text);
+    }
+}
+
+fn held_map_rect(state: &UiState, w: i32, h: i32) -> Option<UiRect> {
+    let hud = &state.hud;
+    let side = 128.min(w / 2 - 8).min(h - 116);
+    (state.screen == Screen::InGameHud
+        && !hud.hud_hidden
+        && !hud.show_player_list
+        && !hud.debug_overlay.enabled
+        && hud.game_mode != 3
+        && hud.held_map.is_some()
+        && side >= 32)
+        .then(|| lr(w - side - 8, h - side - 76, side, side))
+}
+
+/// Physical viewport for the GPU's nearest-filtered map texture; the HUD
+/// uses the same logical rectangle for its frame and decoration labels.
+pub fn held_map_viewport(state: &UiState, width: u32, height: u32) -> Option<UiRect> {
+    let scale = layout_scale(state, width, height);
+    held_map_rect(state, width as i32 / scale, height as i32 / scale)
+        .map(|rect| logical_rect_to_physical(rect, scale))
+}
+
+fn hud_held_map(ctx: &mut Ctx) {
+    let Some(rect) = held_map_rect(ctx.state, ctx.w, ctx.h) else {
+        return;
+    };
+    let map = ctx
+        .state
+        .hud
+        .held_map
+        .as_ref()
+        .expect("held map checked above");
+    let (x, y, side) = (rect.x, rect.y, rect.w as i32);
+    ctx.border(x - 2, y - 2, side + 4, side + 4, UiColor::rgb(100, 68, 42));
+    if map.locked {
+        ctx.ctext(
+            x + side / 2,
+            y - 11,
+            1,
+            pal::TEXT,
+            tr(ctx.lang, "Locked map", "ロック済みマップ"),
+        );
+    }
+    for icon in map
+        .icons
+        .iter()
+        .filter(|icon| icon.label.is_some())
+        .take(16)
+    {
+        let lx = x + (i32::from(icon.x) + 128) * side / 256;
+        let ly = y + (i32::from(icon.z) + 128) * side / 256 + 5;
+        if ly + 8 <= y + side {
+            let text = crate::draw::first_px(
+                icon.label.as_deref().unwrap_or_default(),
+                (side - 4) as usize,
+            );
+            let half = (text_width(text, 1) as i32 + 1) / 2;
+            let lx = lx.clamp(x + half + 2, (x + side - half - 2).max(x + half + 2));
+            ctx.fill(lx - half, ly, 2 * half, 8, UiColor::rgba(0, 0, 0, 180));
+            ctx.ctext(lx, ly, 1, pal::TEXT, text);
+        }
+    }
 }
 
 /// Full-viewport screen tints (damage, fire, water, portal, freezing,
@@ -4003,19 +4126,24 @@ fn hud_player_list(
     if !hud.show_player_list {
         return;
     }
-    let max_name_w = hud
-        .players
-        .iter()
-        .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
-        .max()
-        .unwrap_or(0);
-    let geo = player_list_geometry(hud.players.len(), max_name_w, stack.w, stack.h, boss_bottom);
+    let geo = player_list_geometry(hud, stack.w, stack.h, boss_bottom);
     let (px, py, pw, ph) = (geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
-    let name_cells = ((geo.col_w - 58) / 8).max(1) as usize;
+    let name_cells = ((geo.col_w - 30) / 8).max(1) as usize;
     ctx.panel(px, py, pw, ph);
+    for (index, line) in hud.tab_header.lines().take(geo.header_rows).enumerate() {
+        ctx.ctext(
+            stack.cx,
+            py + 4 + index as i32 * TAB_LINE_H,
+            1,
+            pal::TEXT,
+            line,
+        );
+    }
+    let title_y = py + 4 + geo.header_rows as i32 * TAB_LINE_H;
+    let roster_y = title_y + 10;
     ctx.ctext(
         stack.cx,
-        py + 4,
+        title_y,
         1,
         pal::TEXT,
         &format!(
@@ -4029,8 +4157,9 @@ fn hud_player_list(
         let col = i / rows_per_col;
         let row = i % rows_per_col;
         let x = px + 6 + col as i32 * (geo.col_w + 4);
-        let y = py + 14 + row as i32 * 11;
-        ctx.hud_text(x, y, 1, pal::TEXT, name, name_cells);
+        let y = roster_y + row as i32 * TAB_LINE_H;
+        let tint = hud_color(hud.player_colors.get(i).copied().flatten());
+        ctx.hud_text(x, y, 1, tint, name, name_cells);
         ping_bars(ctx, x + geo.col_w - 24, y, *ping);
     }
     if geo.extra > 0 {
@@ -4039,10 +4168,20 @@ fn hud_player_list(
         let row = slot % rows_per_col;
         ctx.text(
             px + 6 + col as i32 * (geo.col_w + 4),
-            py + 14 + row as i32 * 11,
+            roster_y + row as i32 * TAB_LINE_H,
             1,
             pal::TEXT_DIM,
             &format!("+{} more", geo.extra),
+        );
+    }
+    let footer_y = roster_y + geo.rows_used as i32 * TAB_LINE_H;
+    for (index, line) in hud.tab_footer.lines().take(geo.footer_rows).enumerate() {
+        ctx.ctext(
+            stack.cx,
+            footer_y + index as i32 * TAB_LINE_H,
+            1,
+            pal::TEXT,
+            line,
         );
     }
 }
@@ -4869,17 +5008,18 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             add(cx - row_w / 2, y, row_w, 14);
         }
 
-        // Player-list overlay panel.
+        // Player-list overlay panel and held map.
         if hud.show_player_list {
-            let max_name_w = hud
-                .players
-                .iter()
-                .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
-                .max()
-                .unwrap_or(0);
-            let geo =
-                player_list_geometry(hud.players.len(), max_name_w, w, h, hud_bossbar_bottom(hud));
+            let geo = player_list_geometry(hud, w, h, hud_bossbar_bottom(hud));
             add(geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
+        }
+        if let Some(rect) = held_map_rect(state, w, h) {
+            add(
+                rect.x - 2,
+                rect.y - 11,
+                rect.w as i32 + 4,
+                rect.h as i32 + 13,
+            );
         }
 
         // MagicHUD bottom bars + top-right status column (same frame the
@@ -5219,8 +5359,8 @@ fn crash(ctx: &mut Ctx) {
         pal::DANGER,
         tr(
             lang,
-            "The game crashed - your world is safe",
-            "ゲームがクラッシュ — ワールドは安全",
+            "The game encountered an error",
+            "ゲームでエラーが起きました",
         ),
     );
 
@@ -5260,21 +5400,35 @@ fn crash(ctx: &mut Ctx) {
     }
 
     let sent = ctx.state.crash_sent;
+    let bw = (pw - 8) / 3;
     ctx.button(
         WidgetId::CrashSendReport,
-        lr(cx - 140, by, 130, 20),
+        lr(px, by, bw, 20),
         tr(
             lang,
-            if sent { "Report Sent" } else { "Send Report" },
+            if sent { "Report Saved" } else { "Save Report" },
             if sent {
-                "送信済み"
+                "保存済み"
             } else {
-                "レポートを送信"
+                "レポートを保存"
             },
         ),
-        !sent && ctx.state.crash.is_some(),
+        !sent
+            && ctx.state.crash.is_some()
+            && ctx.state.settings.qol.crash_report_mode != crate::state::CrashReportMode::Off,
     );
-    ctx.tr_btn(WidgetId::CrashReturnTitle, lr(cx + 10, by, 130, 20), "Return to Title", "タイトルへ戻る");
+    ctx.button(
+        WidgetId::CrashCopyReport,
+        lr(px + bw + 4, by, bw, 20),
+        tr(lang, "Copy Report", "レポートをコピー"),
+        ctx.state.crash.is_some(),
+    );
+    ctx.tr_btn(
+        WidgetId::CrashReturnTitle,
+        lr(px + (bw + 4) * 2, by, bw, 20),
+        "Return to Title",
+        "タイトルへ戻る",
+    );
 }
 
 /// Modal overlays; only modal regions are live while open.
@@ -5296,14 +5450,14 @@ fn modal(ctx: &mut Ctx) {
                 my + 10,
                 1,
                 pal::TEXT,
-                &format!("{} {}", tr(lang, "Send report", "レポートを送信"), fp),
+                &format!("{} {}", tr(lang, "Save report", "レポートを保存"), fp),
             );
             ctx.ctext(
                 cx,
                 my + 24,
                 1,
                 pal::WARNING,
-                tr(lang, "Send OK?", "送信してもよい？"),
+                tr(lang, "Save a local copy?", "ローカルに保存しますか？"),
             );
             // OK + Cancel share the bottom of the modal, split evenly.
             let pair = mw - 22;
@@ -5436,6 +5590,62 @@ mod tests {
         state.ui_scale = requested_scale;
         state.hud.offhand = Some("Shield".to_string());
         state
+    }
+
+    #[test]
+    fn tab_header_and_footer_bracket_team_colored_rows() {
+        let mut ui = hotbar_geometry_state(1);
+        ui.hud.show_player_list = true;
+        ui.hud.tab_header = "Lobby\nWelcome".into();
+        ui.hud.tab_footer = "Server 1".into();
+        ui.hud.players = vec![("[Red] Alex".into(), 40)];
+        ui.hud.player_colors = vec![Some([255, 85, 85])];
+        let rendered = ui.render(800, 480);
+        let text_row = |expected: &str| {
+            rendered
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    UiCommand::Text { text, y, color, .. } if text == expected => {
+                        Some((*y, *color))
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let (member_y, tint) = text_row("[Red] Alex");
+        assert!(text_row("Lobby").0 < text_row("Welcome").0);
+        assert!(text_row("Welcome").0 < member_y && member_y < text_row("Server 1").0);
+        assert_eq!(tint, UiColor::rgb(255, 85, 85));
+        ui.hud.show_player_list = false;
+        assert!(!ui.render(800, 480).commands.iter().any(
+            |c| matches!(c, UiCommand::Text { text, .. } if text == "Lobby" || text == "Server 1")
+        ));
+    }
+
+    #[test]
+    fn held_map_has_a_bounded_viewport_and_respects_hud_visibility() {
+        let mut ui = hotbar_geometry_state(1);
+        ui.hud.held_map = Some(std::sync::Arc::new(crate::state::HudMap {
+            id: 3,
+            scale: 2,
+            locked: true,
+            pixels: vec![[0; 4]; 128 * 128].into(),
+            icons: Vec::new(),
+        }));
+        let rect = held_map_viewport(&ui, 800, 480).unwrap();
+        assert_eq!((rect.w, rect.h), (128, 128));
+        assert!(rect.x > 400 && rect.y > 0 && rect.bottom() < 480);
+        let list = ui.render(800, 480);
+        assert!(list
+            .commands
+            .iter()
+            .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "Locked map")));
+        ui.hud.show_player_list = true;
+        assert!(held_map_viewport(&ui, 800, 480).is_none());
+        ui.hud.show_player_list = false;
+        ui.hud.hud_hidden = true;
+        assert!(held_map_viewport(&ui, 800, 480).is_none());
     }
 
     #[test]
