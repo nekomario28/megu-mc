@@ -20,6 +20,7 @@
 pub mod atmosphere;
 pub mod clipboard;
 pub mod gpu_hiz;
+pub mod item_visuals_3d;
 pub mod live_session;
 pub mod linux_desktop;
 pub mod mesh_pool;
