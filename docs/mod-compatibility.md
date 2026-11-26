@@ -271,6 +271,25 @@ is normally one-way data loss. Megu keeps the bytes:
 - The capability bus models item/fluid/energy transfer. Mods that depend on
   other Forge capability types need those reached through data or a dedicated
   adapter.
+- **Loot table overlays & Global Loot Modifiers (Alpha 5 convergence):** Mod
+  JAR `data/<ns>/loot_table(s)/**.json` parsing and NeoForge/Forge
+  `data/<ns>/loot_modifiers/*.json` evaluation exist in `mod-adapter-core`;
+  live server overlay wiring, `global_loot_modifiers.json` ordering, and
+  Vanilla → Mod overwrite Provenance Diff tracking are scheduled in Alpha 5
+  Wave 2 (`M3`). Mods that alter chest loot purely through Java bytecode hooks
+  (such as Fabric `LootTableEvents.MODIFY` lambdas without JSON) are surfaced
+  honestly in the mod inspector rather than silently ignored.
+- **On-demand Mod translation & soft reload (Alpha 5 convergence):** Optional
+  Japanese auto-translation via Preferred Networks' **PLaMo 3 Translate** GGUF
+  models (`0.8B` / `2B` recommended / `8B`, never bundled; downloaded directly
+  from Hugging Face only after explicit consent under the PLaMo Community
+  License) runs `llama-server` transiently on `127.0.0.1` only during
+  translation and writes a standard toggleable Minecraft 1.21.1 Resource Pack
+  at `resourcepacks/megu_auto_ja_jp/`. Together with consent-gated Modrinth
+  missing-dependency auto-fetch, window-preserving in-process soft reload,
+  reload change-summary Diff toasts, and one-click transactional mod-profile
+  rollback, this is being integrated across Alpha 5 Wave 1 (`L1`, `M2`) and
+  Wave 2 (`W1`).
 
 ## Build features (root `Cargo.toml`)
 

@@ -178,7 +178,7 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 5. **P5 (ライト・M2物理/Mob・圧縮配信・PGO — 実装済 `d4fa504`, `0c88980`, `30d0346`, `d06032e`)**: 配信パレット書込 -89%、sky spill -52〜63%、`EntitySpatialGrid` 単一マップ化、512-entry `MapChunkCache`、`tools/pgo_build.sh`（PGO `full j=8` `2.971s -> 2.656s`、-10.6%）を統合。
 6. **残る M3 出口作業（未完了）**: Phase D-2（`Rule::Seq` ゼロアロケーション化・`OriginGrid` 疎バッチ保護）に加え、`a82df1a` の CPU／アロケーション削減（オフライン full 8-worker CPU `8.748 → 4.821 s`、アロケーション `10,762,088 → 565,305`（−94.7%）、全 dump SHA-256 と cross-seed/dimension ブロック・heightmap が byte 一致）を反映済み。`cfffac7` の octave-noise cache は [M3 計測](../evidence/perf/m3-warm-worldgen.md) で小さく混在した差（full 1-worker CPU −1.00%、8-worker +0.57%）にとどまり **end-to-end の利得なし**。**`WARM=1` live CPU は P1-3 永続 `LiveLightEngine`（`906eb2a`）で 16.670 s → 5.110 s（first warm）/ 3.290 s（second warm）に改善**（記録済み pre-change 中央値 16.82 s、Vanilla 参照 4.23 s）。ただし after 値は host contention 下の逐次実行で interleaved A/B ではなく、Vanilla 値は過去記録のまま。equal-work live throughput と G3 50 ms tick budget は未検証。統合候補 SHA での最終 back-to-back（`P4-1`）は未実施。
 
-**ライセンス境界:** 本体は `GPL-3.0-or-later`（寄稿およびファーストパーティコードは `LGPL-3.0-or-later`、`GPL-3.0-or-later`、および `AGPL-3.0-or-later` のトリプルライセンス、[LICENSING.md](../LICENSING.md)）。**C2ME (`MIT`)**、**Lithium (`LGPL-3.0`)**、`Soju06/hyperchunk` (`MIT`)、`valence-rs` (`MIT`)、`MCHPRS` (`MIT`)、`Azalea` (`MIT`) は `LGPL-3.0-or-later` / `GPL-3.0-or-later` / `AGPL-3.0-or-later` のすべてとライセンス互換である。外部からコード・手法を取り込む場合は帰属とライセンスを [THIRD_PARTY.md](../THIRD_PARTY.md) / [NOTICE](../NOTICE) に明記し、将来いつでも `LGPL-3.0-or-later`・`GPL-3.0-or-later`・`AGPL-3.0-or-later` の間を双方向に行き来できるよう、第三者の `GPL-3.0-only` / `AGPL-3.0-only` コードはファーストパーティファイルへ直接コピーせずアルゴリズム概念・ブラックボックス比較または専用モジュール境界で分離する。
+**ライセンス境界:** 本体および全マニフェストは 2026-11-22 に **`LGPL-3.0-or-later`** 単一表記へ統一済み（[LICENSING.md](../LICENSING.md)）。**C2ME (`MIT`)**、**Lithium (`LGPL-3.0`)**、`Soju06/hyperchunk` (`MIT`)、`valence-rs` (`MIT`)、`MCHPRS` (`MIT`)、`Azalea` (`MIT`) は `LGPL-3.0-or-later` とライセンス互換である。外部からコード・手法を取り込む場合は帰属とライセンスを [THIRD_PARTY.md](../THIRD_PARTY.md) / [NOTICE](../NOTICE) に明記し、第三者の `GPL-3.0-only` / `AGPL-3.0-only` コードはファーストパーティファイルへ直接コピーせずアルゴリズム概念・ブラックボックス比較または専用モジュール境界で分離する。また PLaMo 3 Translate 等の外部 AI モデル重みはリポジトリ・配布物へ同梱せず、利用者の明示同意後に公式配布元からローカル取得する。
 
 **出口:** PLANのM3条件を代表負荷で満たし、再現手順・ノイズ・未対応機能を記録する。機能不足で仕事量が減った結果や、地形が異なる条件の旧測定を性能改善へ読み替えない。
 
@@ -240,6 +240,29 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
    - `/fill`・`/clone`・`/execute`・`/scoreboard`・`/advancement`・`/worldborder`・`/locate`・`/spreadplayers`・`/damage` 等の未実装コマンド群、ワールドボーダー縮小・ダメージ、および進捗トリガ配信（`0x74` Update Advancements）を完成させる。Wave 5 で `/execute` の全 subcommand AST/parser（`35a075f`）・parsed pipeline 評価（`f6e2d98`）・wire expectation（`da6e5c0`; #180〜#189）を完了。`execute in ... if block` の dimension-scoped readback は実装済み（`execute_condition` の `Block` 分岐が `block_at_dim(source.dimension,…)` を読み、`In` が `coordinate_scale` を適用する。`execute_in_nether_and_end_if_block_reads_dimension_state` で固定）。
 
 **出口:** M2（遊べる基本セッション）から M4（準拠：全 130 エンティティ・レッドストーン回路・村人取引・高度プレイヤー機構・主要コマンド）までの機能ギャップがすべて R7 配下の検証付き実装で埋まり、同一入力の Vanilla 1.21.1 対照で一致を確認できる。
+
+## Alpha 5 — 1.21.1 ビジュアル・Mod 互換・監査収束 & 直感 Diff UX
+
+`alpha5/integration` にて、バニラ 1.21.1 のビジュアルパリティ（一人称ビューモデル・破壊クラック・360°パノラマ・公式テクスチャ空/天候/オーバーレイ・実ベイクモデル・エンティティ外見アトラス・3Dアイコン）、Codex 独立監査（Audit 1〜3）の全 P0/P1 閉鎖、および実用 Mod 運用基盤を3波構成で収束させる：
+
+1. **Wave 1（並列実装中）**:
+   - クライアント実描画統合（`blocks_1211.json` 由来カノニカル状態名・ベイク済地形 GPU 描画・`window.rs` 公式エクストラ配線）および Audit 2 アセット/UV/フォント/スキン修正。
+   - サーバー Audit 1 修正（P0 襲撃セーブ再起動不能バグ・原子的マルチファイル世代スナップショット＋親ディレクトリ `fsync`・Anvil シード先読み・`.mcc`/`entities/*.mca`・JAR 検証＆Protocol 767 構成交換・PortalForcer・ベッド爆発/再検証・エンドラ戦＆4クリスタル再召喚・ウィザー召喚・ウォーデン振動化・構造物ルート重み/ロール数/単一 RNG・特殊レシピ＆クラフター・村人取引コンポーネント・昼洞窟湧き）。
+   - Mod ワイヤ＆依存基盤（P0 `SW6D`/`SHLM` 共有コーデック・P0 `MRS1` v2 デコーダ・キネティック次元分離＆分割・汎用 NeoForge/Fabric/Quilt/Jar-in-Jar 依存ソルバ＆Modrinth 推移取得）。
+   - **PLaMo 3 Translate オンデマンド Mod 日本語自動翻訳バックエンド**（翻訳時のみローカル `llama-server` を一時起動し終了即破棄、0.8B/2B推奨/8B プリセット、PLaMo コミュニティライセンス明記＋同意後 HF 取得、プレースホルダ保護、`resourcepacks/megu_auto_ja_jp/` 標準パック出力＆差分キャッシュ）。
+2. **Wave 2（Wave 1 マージ直後に並列投入）**:
+   - **商標衛生一括中立化＋自動スキャンゲート（T1）**: ビルトイン機能名・UI ラベルの第三者 Mod 名を中立化し、`tools/trademark_hygiene_audit.py` を高速ゲートへ常設。
+   - **不足依存自動取得＋ウィンドウ維持インプロセス再起動＋Diff UX（W1）**: 欠落依存の Modrinth API 同意付き自動取得、ウィンドウ/パノラマ維持のインプロセス再起動、変更サマリー Diff トースト（増減ブロック/レシピ/チェスト改変/翻訳キー数）、Mod プロファイルの1クリック巻戻し（トランザクション履歴）、PLaMo 3 インストール/翻訳ボタン＆`megu_auto_ja_jp` 即時 ON/OFF トグル、残りクライアント P1 修正。
+   - **Create / Sable / Aeronautics サーバー権限＋Mod ルートチェスト/GLM ライブ配線＋Provenance Diff（M3）**: サーバー側 Aeronautics/Create 残件閉鎖に加え、全 Mod JAR の `data/<ns>/loot_table(s)/**` オーバーレイ・NeoForge/Forge Global Loot Modifiers（`global_loot_modifiers.json`）汎用評価をライブチェスト・Mob・ブロック・`/loot` へ接続し、バニラ→Mod の上書き履歴（Provenance Diff）を追跡・可視化（Java コード直書き系フックはインスペクタで明示）。
+3. **Wave 3（最終検証・出口）**:
+   - 最終独立監査（Audit 4: Live GPU / Visuals / Controls / Protocol 767 / Zero-Alloc）および同一 SHA での全クレート clippy/test・`perf_antipattern_audit`・`general_defect_audit --strict`・`playblocker_guard_audit`・`trademark_hygiene_audit`・`docs_sync_audit --strict`・`--dst-check`・`alpha_release_smoke`（7/7）・`live_playability_e2e`（5/5）・`export_public_branch.sh --verify` を通過させる。
+
+## Alpha 6 — Diff 駆動ワールド＆直感操作アーキテクチャ（次期計画）
+
+Alpha 5 の安定化後に着手する中核拡張：
+- **決定論 Delta ワールド保存＆タイムトラベルスナップショット**: シードから決定論再現できる未変更チャンクを 0 バイト化し、変更チャンクのみベース地形からのブロック差分（Delta）＋世代マニフェストで保存。ワールド容量を劇減させ、Mod 導入前／ボス戦前／建築ミス前への高速ロールバック・分岐試遊を実現する。
+- **マルチプレイヤー チャンクハッシュ差分同期**: クライアントのローカルチャンク Merkle ハッシュを照合し、再接続・再訪・ポータル移動時に変更ブロック差分だけ送信して帯域と待ち時間を削減する。
+- **ワールド内ゴースト Diff プレビュー＆1クリック Undo**: Create / Sable の船体組立てやクリエイティブ範囲編集の確定前に変更ブロックを半透明ゴーストで重ね表示し、確認・取り消しを直感化する。
 
 ## 横断規律
 
