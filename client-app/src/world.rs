@@ -658,14 +658,12 @@ impl BlockTable {
             return Err("inconsistent column lengths in block_states_1211.json".to_string());
         }
 
-        let mut names: Vec<&str> = vec![""; count];
         let mut owned_names: Vec<String> = vec![String::new(); count];
         let mut base_ids: Vec<u32> = vec![0; count];
         for (name, base, len) in &parsed.blocks {
             let start = *base as usize;
             let end = start.saturating_add(*len as usize).min(count);
             for idx in start..end {
-                names[idx] = name.as_str();
                 owned_names[idx] = name.clone();
                 base_ids[idx] = *base;
             }
@@ -676,142 +674,21 @@ impl BlockTable {
         let mut air_mask = Vec::with_capacity(count);
 
         for idx in 0..count {
-            let sid = idx as u32;
-            let name = names[idx];
+            let name = owned_names[idx].as_str();
             let short = name.strip_prefix("minecraft:").unwrap_or(name);
             let flag = parsed.flags[idx];
-            let full_sides = parsed.full_sides[idx] & ALL_FACES;
-            let is_air = flag & FLAG_AIR != 0;
-            let has_collision = !parsed.collision_shapes[idx].is_empty();
-            let is_ice = short == "ice" || short == "packed_ice" || short == "blue_ice";
-
-            air_mask.push(is_air);
-
-            if is_air {
-                mesh_blocks.push(Block::AIR);
-                fluid_cells.push(FluidCell::default());
-                continue;
-            }
-
-            if short == "water" {
-                let level = sid.saturating_sub(base_ids[idx]).min(15) as u8;
-                let falling = level >= 8;
-                let amount = if falling { 8 } else { 8 - level };
-                mesh_blocks.push(Block {
-                    state_id: sid,
-                    fluid_kind: WATER,
-                    fluid_level: level,
-                    flags: FLUID_TINTED,
-                    fluid_tint: 0x3f76e4,
-                    ..Block::AIR
-                });
-                fluid_cells.push(FluidCell {
-                    kind: Some(FluidKind::Water),
-                    amount,
-                    falling,
-                    blocks_motion: false,
-                    is_ice: false,
-                    sturdy_faces: 0,
-                });
-                continue;
-            }
-
-            if short == "lava" {
-                let level = sid.saturating_sub(base_ids[idx]).min(15) as u8;
-                let falling = level >= 8;
-                let amount = if falling { 8 } else { 8 - level };
-                mesh_blocks.push(Block {
-                    state_id: sid,
-                    fluid_kind: LAVA,
-                    fluid_level: level,
-                    ..Block::AIR
-                });
-                fluid_cells.push(FluidCell {
-                    kind: Some(FluidKind::Lava),
-                    amount,
-                    falling,
-                    blocks_motion: false,
-                    is_ice: false,
-                    sturdy_faces: 0,
-                });
-                continue;
-            }
-
-            let is_translucent = short.contains("stained_glass")
-                || short == "ice"
-                || short == "frosted_ice"
-                || short == "slime_block"
-                || short == "honey_block"
-                || short == "tinted_glass"
-                || short == "nether_portal";
-            let is_tinted = short == "grass_block"
-                || short.ends_with("_leaves")
-                || short == "short_grass"
-                || short == "tall_grass"
-                || short == "fern"
-                || short == "large_fern"
-                || short == "vine"
-                || short == "sugar_cane";
-            let tint = if is_tinted { 0x7cbd6b } else { 0 };
-            let tint_flag = if is_tinted { TINTED } else { 0 };
-
-            let block = if is_translucent {
-                Block {
-                    state_id: sid,
-                    tint,
-                    flags: TRANSLUCENT | SAME_STATE_CULL | tint_flag,
-                    occlusion: 0,
-                    fluid_kind: NO_FLUID,
-                    fluid_level: 0,
-                    fluid_tint: 0,
-                }
-            } else if full_sides == ALL_FACES && flag & FLAG_SOLID != 0 && !short.contains("glass")
-            {
-                Block {
-                    state_id: sid,
-                    tint,
-                    flags: OPAQUE | tint_flag,
-                    occlusion: ALL_FACES,
-                    fluid_kind: NO_FLUID,
-                    fluid_level: 0,
-                    fluid_tint: 0,
-                }
-            } else {
-                Block {
-                    state_id: sid,
-                    tint,
-                    flags: CUTOUT | tint_flag,
-                    occlusion: if short.contains("glass") || short.ends_with("_leaves") {
-                        0
-                    } else {
-                        full_sides
-                    },
-                    fluid_kind: NO_FLUID,
-                    fluid_level: 0,
-                    fluid_tint: 0,
-                }
-            };
-            let state_collision_shapes = &parsed.collision_shapes[idx];
-            let shape = classify_render_shape(short, &parsed.shapes, state_collision_shapes);
-            let mut block = block.with_shape(shape);
-            if shape == BlockShape::ThinLayer {
-                let height = state_collision_shapes
-                    .iter()
-                    .filter_map(|&shape_id| parsed.shapes.get(usize::from(shape_id)))
-                    .map(|shape| shape.max[1])
-                    .fold(0.0f64, f64::max);
-                let parameter = (height * 16.0).round().clamp(1.0, 2.0) as u8;
-                block = block.with_shape_parameter(parameter);
-            }
+            air_mask.push(flag & FLAG_AIR != 0);
+            let (block, cell) = classify_parsed_state(
+                idx as u32,
+                base_ids[idx],
+                short,
+                flag,
+                parsed.full_sides[idx] & ALL_FACES,
+                &parsed.collision_shapes[idx],
+                &parsed.shapes,
+            );
             mesh_blocks.push(block);
-            fluid_cells.push(FluidCell {
-                kind: None,
-                amount: 0,
-                falling: false,
-                blocks_motion: has_collision,
-                is_ice,
-                sturdy_faces: full_sides,
-            });
+            fluid_cells.push(cell);
         }
 
         Ok(Self {
@@ -1108,57 +985,142 @@ fn classify_render_shape(name: &str, shapes: &[LocalBox], collision_shapes: &[u1
     }
 }
 
+/// Mesh block + fluid cell for one water/lava flow level (`0..=15`; `>= 8`
+/// is the falling column form). Shared by the builtin table and the JSON
+/// loader so the two fluid representations cannot drift apart.
+fn fluid_block_and_cell(sid: u32, level: u8, water: bool) -> (Block, FluidCell) {
+    let falling = level >= 8;
+    let amount = if falling { 8 } else { 8 - level };
+    let cell = FluidCell {
+        kind: Some(if water {
+            FluidKind::Water
+        } else {
+            FluidKind::Lava
+        }),
+        amount,
+        falling,
+        blocks_motion: false,
+        is_ice: false,
+        sturdy_faces: 0,
+    };
+    let block = Block {
+        state_id: sid,
+        fluid_kind: if water { WATER } else { LAVA },
+        fluid_level: level,
+        flags: if water { FLUID_TINTED } else { 0 },
+        fluid_tint: if water { 0x3f76e4 } else { 0 },
+        ..Block::AIR
+    };
+    (block, cell)
+}
+
+/// Classify one `block_states_1211.json` row into its mesh block and fluid
+/// cell. Air rows get the air block and an empty cell; water/lava rows share
+/// [`fluid_block_and_cell`] with the builtin table.
+fn classify_parsed_state(
+    sid: u32,
+    base_id: u32,
+    short: &str,
+    flag: u8,
+    full_sides: u8,
+    collision_shapes: &[u16],
+    shapes: &[LocalBox],
+) -> (Block, FluidCell) {
+    if flag & FLAG_AIR != 0 {
+        return (Block::AIR, FluidCell::default());
+    }
+    if short == "water" || short == "lava" {
+        let level = sid.saturating_sub(base_id).min(15) as u8;
+        return fluid_block_and_cell(sid, level, short == "water");
+    }
+    let has_collision = !collision_shapes.is_empty();
+    let is_ice = short == "ice" || short == "packed_ice" || short == "blue_ice";
+    let is_translucent = short.contains("stained_glass")
+        || short == "ice"
+        || short == "frosted_ice"
+        || short == "slime_block"
+        || short == "honey_block"
+        || short == "tinted_glass"
+        || short == "nether_portal";
+    let is_tinted = short == "grass_block"
+        || short.ends_with("_leaves")
+        || short == "short_grass"
+        || short == "tall_grass"
+        || short == "fern"
+        || short == "large_fern"
+        || short == "vine"
+        || short == "sugar_cane";
+    let tint = if is_tinted { 0x7cbd6b } else { 0 };
+    let tint_flag = if is_tinted { TINTED } else { 0 };
+
+    let block = if is_translucent {
+        Block {
+            state_id: sid,
+            tint,
+            flags: TRANSLUCENT | SAME_STATE_CULL | tint_flag,
+            occlusion: 0,
+            fluid_kind: NO_FLUID,
+            fluid_level: 0,
+            fluid_tint: 0,
+        }
+    } else if full_sides == ALL_FACES && flag & FLAG_SOLID != 0 && !short.contains("glass") {
+        Block {
+            state_id: sid,
+            tint,
+            flags: OPAQUE | tint_flag,
+            occlusion: ALL_FACES,
+            fluid_kind: NO_FLUID,
+            fluid_level: 0,
+            fluid_tint: 0,
+        }
+    } else {
+        Block {
+            state_id: sid,
+            tint,
+            flags: CUTOUT | tint_flag,
+            occlusion: if short.contains("glass") || short.ends_with("_leaves") {
+                0
+            } else {
+                full_sides
+            },
+            fluid_kind: NO_FLUID,
+            fluid_level: 0,
+            fluid_tint: 0,
+        }
+    };
+    let shape = classify_render_shape(short, shapes, collision_shapes);
+    let mut block = block.with_shape(shape);
+    if shape == BlockShape::ThinLayer {
+        let height = collision_shapes
+            .iter()
+            .filter_map(|&shape_id| shapes.get(usize::from(shape_id)))
+            .map(|shape| shape.max[1])
+            .fold(0.0f64, f64::max);
+        let parameter = (height * 16.0).round().clamp(1.0, 2.0) as u8;
+        block = block.with_shape_parameter(parameter);
+    }
+    let cell = FluidCell {
+        kind: None,
+        amount: 0,
+        falling: false,
+        blocks_motion: has_collision,
+        is_ice,
+        sturdy_faces: full_sides,
+    };
+    (block, cell)
+}
+
 fn classify_builtin(sid: u32) -> (Block, Vec<u16>, FluidCell, bool) {
     // Canonical 1.21.1 state IDs for key blocks when block_states_1211.json is absent.
     match sid {
         0 => (Block::AIR, Vec::new(), FluidCell::default(), true),
         80..=95 => {
-            let level = (sid - 80) as u8;
-            let falling = level >= 8;
-            let amount = if falling { 8 } else { 8 - level };
-            (
-                Block {
-                    state_id: sid,
-                    fluid_kind: WATER,
-                    fluid_level: level,
-                    flags: FLUID_TINTED,
-                    fluid_tint: 0x3f76e4,
-                    ..Block::AIR
-                },
-                Vec::new(),
-                FluidCell {
-                    kind: Some(FluidKind::Water),
-                    amount,
-                    falling,
-                    blocks_motion: false,
-                    is_ice: false,
-                    sturdy_faces: 0,
-                },
-                false,
-            )
+            let (block, cell) = fluid_block_and_cell(sid, (sid - 80) as u8, true);
+            (block, Vec::new(), cell, false)
         }
         96..=111 => {
-            let level = (sid - 96) as u8;
-            let falling = level >= 8;
-            let amount = if falling { 8 } else { 8 - level };
-            (
-                Block {
-                    state_id: sid,
-                    fluid_kind: LAVA,
-                    fluid_level: level,
-                    ..Block::AIR
-                },
-                Vec::new(),
-                FluidCell {
-                    kind: Some(FluidKind::Lava),
-                    amount,
-                    falling,
-                    blocks_motion: false,
-                    is_ice: false,
-                    sturdy_faces: 0,
-                },
-                false,
-            )
+            let (block, cell) = fluid_block_and_cell(sid, (sid - 96) as u8, false);
+            (block, Vec::new(), cell, false)
         }
         519 => (
             Block {
@@ -1611,6 +1573,23 @@ impl StoredSection {
             .copied()
             .or_else(|| self.palette.get(index).ok())
             .unwrap_or(0)
+    }
+
+    /// Content identity between a freshly decoded section and the stored one.
+    /// Equal cells (including the sparse dynamic overlay), light and biomes
+    /// mean a remesh would reproduce the resident mesh byte for byte.
+    fn same_content(
+        &self,
+        decoded: &Self,
+        self_dynamic: &BTreeMap<usize, u32>,
+        decoded_dynamic: &BTreeMap<usize, u32>,
+    ) -> bool {
+        self.block_light == decoded.block_light
+            && self.sky_light == decoded.sky_light
+            && self.biomes == decoded.biomes
+            && (0..SECTION_CELLS).all(|idx| {
+                self.state_at(idx, self_dynamic) == decoded.state_at(idx, decoded_dynamic)
+            })
     }
 
     fn set_state(
@@ -2151,6 +2130,28 @@ fn quantize_pos_4096(v: f64) -> i64 {
     (floor + f64::from(scaled - floor >= 0.5)) as i64
 }
 
+/// Can `map` take `key` without exceeding `cap`? A present key always can
+/// (updates replace in place), which is the one bounded-growth rule every
+/// tracked-entity family shares.
+fn has_capacity<K: Ord, V>(map: &BTreeMap<K, V>, key: &K, cap: usize) -> bool {
+    map.contains_key(key) || map.len() < cap
+}
+
+/// Bounded upsert: replace a present key, drop a new key once `map` is full.
+fn bounded_insert<K: Ord, V>(map: &mut BTreeMap<K, V>, key: K, value: V, cap: usize) {
+    if has_capacity(map, &key, cap) {
+        map.insert(key, value);
+    }
+}
+
+/// Bounded push: keep the newest `cap` records of an arrival-ordered queue.
+fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, cap: usize) {
+    if queue.len() >= cap {
+        queue.pop_front();
+    }
+    queue.push_back(value);
+}
+
 /// One live entity tracked from the Protocol 767 S2C entity packets
 /// (`add_entity`, the `move_entity_*` family, `teleport_entity`,
 /// `rotate_head`, `set_entity_motion`, `hurt_animation`, `entity_event`,
@@ -2346,6 +2347,156 @@ fn nbt_bool(value: &NbtValue, key: &str) -> bool {
     nbt_i32(value, key).is_some_and(|value| value != 0)
 }
 
+fn nbt_u8(value: &NbtValue, key: &str) -> Option<u8> {
+    nbt_i32(value, key).and_then(|value| u8::try_from(value).ok())
+}
+
+fn nbt_u16(value: &NbtValue, key: &str) -> Option<u16> {
+    nbt_i32(value, key).and_then(|value| u16::try_from(value).ok())
+}
+
+/// Element count of an NBT list field, clamped to `u8`.
+fn nbt_list_len(value: &NbtValue, key: &str) -> Option<u8> {
+    match nbt_field(value, key)? {
+        NbtValue::List(items) => u8::try_from(items.len()).ok(),
+        _ => None,
+    }
+}
+
+/// Shulker-box dye color from its block-state base name
+/// (`minecraft:light_blue_shulker_box` -> `3`).
+fn shulker_color_from_name(block_base_name: &str) -> Option<u8> {
+    let color = block_base_name
+        .rsplit(':')
+        .next()?
+        .strip_suffix("_shulker_box")?;
+    Some(match color {
+        "white" => 0,
+        "orange" => 1,
+        "magenta" => 2,
+        "light_blue" => 3,
+        "yellow" => 4,
+        "lime" => 5,
+        "pink" => 6,
+        "gray" => 7,
+        "light_gray" => 8,
+        "cyan" => 9,
+        "purple" => 10,
+        "blue" => 11,
+        "brown" => 12,
+        "green" => 13,
+        "red" => 14,
+        "black" => 15,
+        _ => return None,
+    })
+}
+
+/// Project one tracked block entity's decoded facts (visual kind tail, block
+/// name, NBT, newest block event) into the typed visual enum.
+fn block_entity_visual_from(
+    id_tail: &str,
+    block_base_name: &str,
+    nbt: Option<&NbtValue>,
+    action: Option<u8>,
+    parameter: u8,
+) -> BlockEntityVisualState {
+    match id_tail {
+        "chest" | "trapped_chest" | "ender_chest" => BlockEntityVisualState::Chest {
+            open_count: match action {
+                Some(1) => parameter,
+                _ => nbt.and_then(|value| nbt_u8(value, "open")).unwrap_or(0),
+            },
+            trapped: id_tail == "trapped_chest" || block_base_name.ends_with("trapped_chest"),
+            ender: id_tail == "ender_chest" || block_base_name.ends_with("ender_chest"),
+        },
+        _ if id_tail.ends_with("shulker_box") => BlockEntityVisualState::ShulkerBox {
+            open_count: match action {
+                Some(1) => parameter,
+                _ => nbt
+                    .and_then(|value| nbt_u8(value, "Peek").or_else(|| nbt_u8(value, "peek")))
+                    .unwrap_or(0),
+            },
+            color: nbt
+                .and_then(|value| nbt_u8(value, "Color"))
+                .or_else(|| shulker_color_from_name(block_base_name))
+                .unwrap_or(10),
+        },
+        "bell" => BlockEntityVisualState::Bell {
+            ring_dir: parameter,
+            ringing_ticks: match action {
+                Some(1) => 50,
+                _ => nbt.and_then(|value| nbt_u16(value, "ticks")).unwrap_or(0),
+            },
+        },
+        "sign" | "hanging_sign" => BlockEntityVisualState::Sign {
+            front_lines: nbt
+                .map(|value| nbt_text_lines(value, "front_text"))
+                .unwrap_or_default(),
+            back_lines: nbt
+                .map(|value| nbt_text_lines(value, "back_text"))
+                .unwrap_or_default(),
+            front_glowing: nbt
+                .and_then(|value| nbt_field(value, "front_text"))
+                .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
+            back_glowing: nbt
+                .and_then(|value| nbt_field(value, "back_text"))
+                .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
+        },
+        "banner" | "wall_banner" => BlockEntityVisualState::Banner {
+            base_color: nbt.and_then(|value| nbt_u8(value, "Base")).unwrap_or(0),
+            pattern_count: nbt
+                .and_then(|value| nbt_list_len(value, "Patterns"))
+                .unwrap_or(0),
+        },
+        "beacon" => BlockEntityVisualState::Beacon {
+            level: nbt.and_then(|value| nbt_i32(value, "Levels")).unwrap_or(0),
+            primary_effect: nbt.and_then(|value| nbt_i32(value, "Primary")).unwrap_or(0),
+            secondary_effect: nbt
+                .and_then(|value| nbt_i32(value, "Secondary"))
+                .unwrap_or(0),
+        },
+        "enchanting_table" => BlockEntityVisualState::EnchantingTable {
+            book_open: nbt.is_some_and(|value| nbt_bool(value, "BookOpen")),
+        },
+        "campfire" | "soul_campfire" => BlockEntityVisualState::Campfire {
+            item_count: nbt
+                .and_then(|value| nbt_list_len(value, "Items"))
+                .unwrap_or(0),
+        },
+        "trial_spawner" => BlockEntityVisualState::TrialSpawner {
+            ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
+            active: nbt.is_some_and(|value| {
+                nbt_bool(value, "is_active")
+                    || nbt_string(value, "state")
+                        .is_some_and(|state| state.eq_ignore_ascii_case("active"))
+            }),
+        },
+        "vault" => BlockEntityVisualState::Vault {
+            ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
+            state: nbt
+                .and_then(|value| {
+                    nbt_u8(value, "state").or_else(|| {
+                        nbt_string(value, "state").and_then(|state| {
+                            match state.to_ascii_uppercase().as_str() {
+                                "INACTIVE" => Some(0),
+                                "ACTIVE" => Some(1),
+                                "UNLOCKING" => Some(2),
+                                "EJECTING" => Some(3),
+                                _ => None,
+                            }
+                        })
+                    })
+                })
+                .unwrap_or(0),
+        },
+        _ if block_base_name.contains("piston") => BlockEntityVisualState::Piston {
+            extending: action == Some(0),
+            facing: parameter,
+        },
+        _ => BlockEntityVisualState::Generic,
+    }
+}
+
 fn nbt_text_lines(value: &NbtValue, key: &str) -> [String; 4] {
     let lines = nbt_field(value, key)
         .and_then(|field| nbt_field(field, "messages"))
@@ -2388,6 +2539,22 @@ fn protocol_767_entity_name(entity_type: i32) -> Option<&'static str> {
         .get_or_init(megu_proto::ProtocolTable::v767_builtin)
         .registry_name("minecraft:entity_type", u32::try_from(entity_type).ok()?)
 }
+
+/// Vanilla entity types with a baby variant; metadata index 16 is the baby
+/// flag for exactly these types, never for the rest of the registry.
+const BABY_ENTITY_TYPES: &[&str] = &[
+    "minecraft:armadillo", "minecraft:axolotl", "minecraft:camel",
+    "minecraft:cat", "minecraft:chicken", "minecraft:cow",
+    "minecraft:donkey", "minecraft:fox", "minecraft:frog",
+    "minecraft:goat", "minecraft:hoglin", "minecraft:horse",
+    "minecraft:llama", "minecraft:mooshroom", "minecraft:mule",
+    "minecraft:ocelot", "minecraft:panda", "minecraft:pig",
+    "minecraft:polar_bear", "minecraft:rabbit", "minecraft:sheep",
+    "minecraft:sniffer", "minecraft:strider", "minecraft:tadpole",
+    "minecraft:trader_llama", "minecraft:turtle", "minecraft:villager",
+    "minecraft:wandering_trader", "minecraft:wolf", "minecraft:zoglin",
+    "minecraft:zombie", "minecraft:zombie_horse", "minecraft:zombie_villager",
+];
 
 #[derive(Clone, Debug)]
 pub struct MerchantPanelState {
@@ -2953,17 +3120,29 @@ impl WorldState {
             )?;
             stored.biomes = sec.biomes;
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
+            // Unchanged chunk section: a re-sent column whose cells, light
+            // and biomes all match leaves the resident mesh valid, so skip
+            // the remesh (and its revision bump) instead of rebuilding
+            // byte-identical geometry.
+            let unchanged = self
+                .columns
+                .get(&(decoded.cx, decoded.cz))
+                .and_then(|col| col.sections.get(idx))
+                .is_some_and(|old| {
+                    old.same_content(&stored, self.dynamic_overlay(coord), &dynamic)
+                });
             // A re-decoded chunk replaces the column: drop any overlay cells
             // the previous decode installed before meshing the fresh one.
             self.section_dynamic_states.remove(&coord);
-            if stored.has_non_air {
-                let mesh_sec =
-                    stored.to_compressed_mesh_section(&self.blocks, &dynamic);
-                self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
-                self.mesh_cache.insert_compressed(coord, mesh_sec);
-            } else {
-                self.remove_section_mesh(coord);
-                self.set_section_visibility(coord, FaceVisibility::uniform_air(), false);
+            if !unchanged {
+                if stored.has_non_air {
+                    let mesh_sec = stored.to_compressed_mesh_section(&self.blocks, &dynamic);
+                    self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
+                    self.mesh_cache.insert_compressed(coord, mesh_sec);
+                } else {
+                    self.remove_section_mesh(coord);
+                    self.set_section_visibility(coord, FaceVisibility::uniform_air(), false);
+                }
             }
             if !dynamic.is_empty() {
                 self.section_dynamic_states.insert(coord, dynamic);
@@ -3236,6 +3415,11 @@ impl WorldState {
     /// light queue last-write-wins, then drains once — one engine call
     /// per touched chunk instead of one call per edit.
     fn apply_block_updates(&mut self, updates: &[([i32; 3], u32)]) -> Result<(), String> {
+        // Idle no-op: an empty batch has nothing to queue and nothing to
+        // drain, so it must not reach the light engine.
+        if updates.is_empty() && self.light_queue.is_empty() {
+            return Ok(());
+        }
         let result = updates
             .iter()
             .try_for_each(|&(pos, state_id)| self.apply_block_update_inner(pos, state_id));
@@ -3263,11 +3447,27 @@ impl WorldState {
         let cz = z.div_euclid(16);
         let sec_idx = ((y64 - min_y) / 16) as usize;
         let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
-        if !self
+        let lx = x.rem_euclid(16) as usize;
+        let ly = (y64 - min_y).rem_euclid(16) as usize;
+        let lz = z.rem_euclid(16) as usize;
+        let cell_idx = section_index(lx, ly, lz);
+        let clamped = if state_id >= 0x8000 {
+            state_id
+        } else {
+            state_id.min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX))
+        };
+        let Some(previous) = self
             .columns
             .get(&(cx, cz))
-            .is_some_and(|col| col.sections.get(sec_idx).is_some())
-        {
+            .and_then(|col| col.sections.get(sec_idx))
+            .map(|sec| sec.state_at(cell_idx, self.dynamic_overlay(coord)))
+        else {
+            return Ok(());
+        };
+        // Idle no-op: receiving the state the cell already holds mutates
+        // nothing — no palette write, no block-entity drop, no mesh or light
+        // work, and therefore no revision bump to advertise.
+        if previous == clamped {
             return Ok(());
         }
         let dynamic = self.section_dynamic_states.entry(coord).or_default();
@@ -3279,26 +3479,17 @@ impl WorldState {
             .sections
             .get_mut(sec_idx)
             .expect("section presence checked above");
-
-        let lx = x.rem_euclid(16) as usize;
-        let ly = (y64 - min_y).rem_euclid(16) as usize;
-        let lz = z.rem_euclid(16) as usize;
-        let cell_idx = section_index(lx, ly, lz);
-        let clamped = if state_id >= 0x8000 {
-            state_id
-        } else {
-            state_id.min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX))
-        };
-        let previous = Some(sec.state_at(cell_idx, dynamic));
         sec.set_state(cell_idx, clamped, dynamic)?;
-        if previous != Some(clamped)
-            && !previous
-                .and_then(|state| self.blocks.state_name(state))
-                .is_some_and(|name| {
-                    self.blocks.state_name(clamped).is_some_and(|current| {
-                        block_state_base_name(name) == block_state_base_name(current)
-                    })
+        // A same-base swap (a `facing` flip, a fluid level) keeps the block
+        // entity; any other block change invalidates its cached NBT.
+        if !self
+            .blocks
+            .state_name(previous)
+            .is_some_and(|name| {
+                self.blocks.state_name(clamped).is_some_and(|current| {
+                    block_state_base_name(name) == block_state_base_name(current)
                 })
+            })
         {
             self.block_entities.remove(&pos);
             self.block_entity_visual_nbt.remove(&pos);
@@ -3847,42 +4038,7 @@ impl WorldState {
             swimming: flags & 0x10 != 0,
             invisible: flags & 0x20 != 0,
             glowing: flags & 0x40 != 0,
-            is_baby: matches!(
-                entity_name,
-                "minecraft:armadillo"
-                    | "minecraft:axolotl"
-                    | "minecraft:camel"
-                    | "minecraft:cat"
-                    | "minecraft:chicken"
-                    | "minecraft:cow"
-                    | "minecraft:donkey"
-                    | "minecraft:fox"
-                    | "minecraft:frog"
-                    | "minecraft:goat"
-                    | "minecraft:hoglin"
-                    | "minecraft:horse"
-                    | "minecraft:llama"
-                    | "minecraft:mooshroom"
-                    | "minecraft:mule"
-                    | "minecraft:ocelot"
-                    | "minecraft:panda"
-                    | "minecraft:pig"
-                    | "minecraft:polar_bear"
-                    | "minecraft:rabbit"
-                    | "minecraft:sheep"
-                    | "minecraft:sniffer"
-                    | "minecraft:strider"
-                    | "minecraft:tadpole"
-                    | "minecraft:trader_llama"
-                    | "minecraft:turtle"
-                    | "minecraft:villager"
-                    | "minecraft:wandering_trader"
-                    | "minecraft:wolf"
-                    | "minecraft:zoglin"
-                    | "minecraft:zombie"
-                    | "minecraft:zombie_horse"
-                    | "minecraft:zombie_villager"
-            ) && as_bool(16).unwrap_or(false),
+            is_baby: BABY_ENTITY_TYPES.contains(&entity_name) && as_bool(16).unwrap_or(false),
             health: match value(9) {
                 Some(crate::protocol::DecodedEntityMetadataValue::Float(health))
                     if health.is_finite() =>
@@ -3994,163 +4150,7 @@ impl WorldState {
         let id_tail = protocol_767_visual_block_entity(tracked.kind)
             .or_else(|| nbt.and_then(|value| nbt_string(value, "id")?.rsplit(':').next()))
             .unwrap_or("");
-        let state = match id_tail {
-            "chest" | "trapped_chest" | "ender_chest" => BlockEntityVisualState::Chest {
-                open_count: if action == Some(1) {
-                    parameter
-                } else {
-                    nbt.and_then(|value| nbt_i32(value, "open"))
-                        .and_then(|value| u8::try_from(value).ok())
-                        .unwrap_or(0)
-                },
-                trapped: id_tail == "trapped_chest" || block_base_name.ends_with("trapped_chest"),
-                ender: id_tail == "ender_chest" || block_base_name.ends_with("ender_chest"),
-            },
-            "shulker_box"
-            | "white_shulker_box"
-            | "orange_shulker_box"
-            | "magenta_shulker_box"
-            | "light_blue_shulker_box"
-            | "yellow_shulker_box"
-            | "lime_shulker_box"
-            | "pink_shulker_box"
-            | "gray_shulker_box"
-            | "light_gray_shulker_box"
-            | "cyan_shulker_box"
-            | "purple_shulker_box"
-            | "blue_shulker_box"
-            | "brown_shulker_box"
-            | "green_shulker_box"
-            | "red_shulker_box"
-            | "black_shulker_box" => BlockEntityVisualState::ShulkerBox {
-                open_count: if action == Some(1) {
-                    parameter
-                } else {
-                    nbt.and_then(|value| nbt_i32(value, "Peek").or_else(|| nbt_i32(value, "peek")))
-                        .and_then(|value| u8::try_from(value).ok())
-                        .unwrap_or(0)
-                },
-                color: nbt
-                    .and_then(|value| nbt_i32(value, "Color"))
-                    .and_then(|value| u8::try_from(value).ok())
-                    .or_else(|| {
-                        let color = block_base_name
-                            .rsplit(':')
-                            .next()?
-                            .strip_suffix("_shulker_box")?;
-                        Some(match color {
-                            "white" => 0,
-                            "orange" => 1,
-                            "magenta" => 2,
-                            "light_blue" => 3,
-                            "yellow" => 4,
-                            "lime" => 5,
-                            "pink" => 6,
-                            "gray" => 7,
-                            "light_gray" => 8,
-                            "cyan" => 9,
-                            "purple" => 10,
-                            "blue" => 11,
-                            "brown" => 12,
-                            "green" => 13,
-                            "red" => 14,
-                            "black" => 15,
-                            _ => return None,
-                        })
-                    })
-                    .unwrap_or(10),
-            },
-            "bell" => BlockEntityVisualState::Bell {
-                ring_dir: parameter,
-                ringing_ticks: if action == Some(1) {
-                    50
-                } else {
-                    nbt.and_then(|value| nbt_i32(value, "ticks"))
-                        .and_then(|value| u16::try_from(value).ok())
-                        .unwrap_or(0)
-                },
-            },
-            "sign" | "hanging_sign" => BlockEntityVisualState::Sign {
-                front_lines: nbt
-                    .map(|value| nbt_text_lines(value, "front_text"))
-                    .unwrap_or_default(),
-                back_lines: nbt
-                    .map(|value| nbt_text_lines(value, "back_text"))
-                    .unwrap_or_default(),
-                front_glowing: nbt
-                    .and_then(|value| nbt_field(value, "front_text"))
-                    .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
-                back_glowing: nbt
-                    .and_then(|value| nbt_field(value, "back_text"))
-                    .is_some_and(|side| nbt_bool(side, "has_glowing_text")),
-            },
-            "banner" | "wall_banner" => BlockEntityVisualState::Banner {
-                base_color: nbt
-                    .and_then(|value| nbt_i32(value, "Base"))
-                    .and_then(|value| u8::try_from(value).ok())
-                    .unwrap_or(0),
-                pattern_count: nbt
-                    .and_then(|value| nbt_field(value, "Patterns"))
-                    .and_then(|value| match value {
-                        NbtValue::List(items) => u8::try_from(items.len()).ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0),
-            },
-            "beacon" => BlockEntityVisualState::Beacon {
-                level: nbt.and_then(|value| nbt_i32(value, "Levels")).unwrap_or(0),
-                primary_effect: nbt.and_then(|value| nbt_i32(value, "Primary")).unwrap_or(0),
-                secondary_effect: nbt
-                    .and_then(|value| nbt_i32(value, "Secondary"))
-                    .unwrap_or(0),
-            },
-            "enchanting_table" => BlockEntityVisualState::EnchantingTable {
-                book_open: nbt.is_some_and(|value| nbt_bool(value, "BookOpen")),
-            },
-            "campfire" | "soul_campfire" => BlockEntityVisualState::Campfire {
-                item_count: nbt
-                    .and_then(|value| nbt_field(value, "Items"))
-                    .and_then(|value| match value {
-                        NbtValue::List(items) => u8::try_from(items.len()).ok(),
-                        _ => None,
-                    })
-                    .unwrap_or(0),
-            },
-            "trial_spawner" => BlockEntityVisualState::TrialSpawner {
-                ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
-                active: nbt.is_some_and(|value| {
-                    nbt_bool(value, "is_active")
-                        || nbt_string(value, "state")
-                            .is_some_and(|state| state.eq_ignore_ascii_case("active"))
-                }),
-            },
-            "vault" => BlockEntityVisualState::Vault {
-                ominous: nbt.is_some_and(|value| nbt_bool(value, "ominous")),
-                state: nbt
-                    .and_then(|value| {
-                        nbt_i32(value, "state")
-                            .and_then(|state| u8::try_from(state).ok())
-                            .or_else(|| {
-                                nbt_string(value, "state").and_then(|state| {
-                                    match state.to_ascii_uppercase().as_str() {
-                                        "INACTIVE" => Some(0),
-                                        "ACTIVE" => Some(1),
-                                        "UNLOCKING" => Some(2),
-                                        "EJECTING" => Some(3),
-                                        _ => None,
-                                    }
-                                })
-                            })
-                    })
-                    .unwrap_or(0),
-            },
-            _ if block_base_name.contains("piston") => BlockEntityVisualState::Piston {
-                extending: action == Some(0),
-                facing: parameter,
-            },
-            _ => BlockEntityVisualState::Generic,
-        };
-        Some(state)
+        Some(block_entity_visual_from(id_tail, block_base_name, nbt, action, parameter))
     }
 
     /// Project a retained `level_event` into the typed visual enum.
@@ -4162,117 +4162,87 @@ impl WorldState {
             .map(|(event, pos, data, global)| (visual_level_event(*event, *data), *pos, *global))
     }
 
-    /// Unified ingestion for decoded Protocol 767 play events: routes every
-    /// world-relevant family — chunks, block/light updates, entities, block
-    /// entities, world time/weather, and block-break overlays — into the live
-    /// [`WorldState`] deterministically. Player/session concerns (teleport,
-    /// health, chat, containers, HUD, particles) and unrecognized payloads
-    /// are acknowledged and ignored; the caller keeps owning those.
+    /// Unified ingestion for decoded Protocol 767 play events. The family
+    /// handlers below route chunk/block, entity, container, environment and
+    /// combat/effect payloads into the live [`WorldState`] deterministically.
+    /// Player/session concerns (teleport, health, chat, HUD, settings) and
+    /// unrecognized payloads are acknowledged and ignored; the caller keeps
+    /// owning those.
     pub fn apply_play_event(&mut self, event: &PlayEvent) -> Result<(), String> {
+        // Families are tried in order and the first owner wins, so no family
+        // has to restate the whole envelope to prove it handled the event.
+        let _ = self.apply_chunk_play_event(event)?
+            || self.apply_entity_play_event(event)?
+            || self.apply_container_play_event(event)?
+            || self.apply_world_play_event(event)?
+            || self.apply_combat_play_event(event)?;
+        Ok(())
+    }
+
+    /// Chunk / block / light: column ingest, light and block edits, chunk
+    /// unload, explosion removals and biome re-paints.
+    fn apply_chunk_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
         match event {
-            PlayEvent::JoinGame { dimension, .. } | PlayEvent::Respawn { dimension } => {
-                self.reset_dimension(dimension.clone());
-            }
             PlayEvent::ChunkData(chunk) => self.apply_chunk_borrowed(chunk)?,
-            PlayEvent::UpdateLight { cx, cz, light } => {
-                self.apply_light_update(*cx, *cz, light)?;
-            }
-            PlayEvent::BlockUpdate { pos, state_id } => {
-                self.apply_block_update(*pos, *state_id)?;
-            }
-            PlayEvent::SectionBlocksUpdate(updates) => {
-                self.apply_block_updates(updates)?;
-            }
+            PlayEvent::UpdateLight { cx, cz, light } => self.apply_light_update(*cx, *cz, light)?,
+            PlayEvent::BlockUpdate { pos, state_id } => self.apply_block_update(*pos, *state_id)?,
+            PlayEvent::SectionBlocksUpdate(updates) => self.apply_block_updates(updates)?,
             PlayEvent::UnloadChunk { cx, cz } => self.unload_chunk(*cx, *cz),
+            PlayEvent::Explosion { x, y, z, records, .. } => {
+                self.apply_explosion_removals(*x, *y, *z, records)?;
+            }
+            PlayEvent::ChunksBiomes { chunks } => self.apply_chunks_biomes(chunks),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Live entities: spawn/despawn, movement, rotation, metadata, attributes,
+    /// passengers, links and equipment.
+    fn apply_entity_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
+        match event {
             PlayEvent::AddEntity {
-                eid,
-                uuid,
-                entity_type,
-                x,
-                y,
-                z,
-                pitch,
-                yaw,
-                head_yaw,
-                vx,
-                vy,
-                vz,
-                ..
+                eid, uuid, entity_type, x, y, z, pitch, yaw, head_yaw, vx, vy, vz, ..
             } => {
                 // Bounded: a full table ignores excess spawns; re-spawning a
                 // tracked id replaces its row without growing the map.
-                if self.entities.contains_key(eid) || self.entities.len() < MAX_TRACKED_ENTITIES {
+                if has_capacity(&self.entities, eid, MAX_TRACKED_ENTITIES) {
                     let pos = [clean_f64(*x), clean_f64(*y), clean_f64(*z)];
-                    self.entities.insert(
-                        *eid,
-                        TrackedEntity {
-                            eid: *eid,
-                            uuid: *uuid,
-                            entity_type: *entity_type,
-                            pos_q: pos.map(quantize_pos_4096),
-                            pos,
-                            vel: [clean_f64(*vx), clean_f64(*vy), clean_f64(*vz)],
-                            yaw_deg: clean_f32(*yaw),
-                            pitch_deg: clean_f32(*pitch),
-                            head_yaw_deg: clean_f32(*head_yaw),
-                            on_ground: false,
-                            hurt_ticks: 0,
-                            last_animation: None,
-                            equipment_slots: 0,
-                        },
-                    );
+                    let entity = TrackedEntity {
+                        eid: *eid,
+                        uuid: *uuid,
+                        entity_type: *entity_type,
+                        pos_q: pos.map(quantize_pos_4096),
+                        pos,
+                        vel: [clean_f64(*vx), clean_f64(*vy), clean_f64(*vz)],
+                        yaw_deg: clean_f32(*yaw),
+                        pitch_deg: clean_f32(*pitch),
+                        head_yaw_deg: clean_f32(*head_yaw),
+                        on_ground: false,
+                        hurt_ticks: 0,
+                        last_animation: None,
+                        equipment_slots: 0,
+                    };
+                    self.entities.insert(*eid, entity);
                 }
             }
             PlayEvent::RemoveEntities { eids } => {
                 for &eid in eids {
-                    self.entities.remove(&eid);
-                    self.entity_metadata.remove(&eid);
-                    self.entity_poses.remove(&eid);
-                    self.entity_animation_ticks.remove(&eid);
-                    self.entity_equipment
-                        .retain(|(entity, _), _| *entity != eid);
-                    self.mob_effects.retain(|(entity, _), _| *entity != eid);
-                    self.entity_attributes.remove(&eid);
-                    self.passengers.remove(&eid);
-                    self.entity_links.remove(&eid);
-                    for passengers in self.passengers.values_mut() {
-                        passengers.retain(|&passenger| passenger != eid);
-                    }
-                    // A removed breaker stops cracking blocks.
-                    self.block_destructions.remove(&eid);
+                    self.forget_entity(eid);
                 }
             }
-            PlayEvent::MoveEntityPos {
-                eid,
-                dx,
-                dy,
-                dz,
-                on_ground,
-            } => self.move_tracked_entity(*eid, [*dx, *dy, *dz], None, *on_ground),
-            PlayEvent::MoveEntityPosRot {
-                eid,
-                dx,
-                dy,
-                dz,
-                yaw,
-                pitch,
-                on_ground,
-            } => self.move_tracked_entity(*eid, [*dx, *dy, *dz], Some((*yaw, *pitch)), *on_ground),
-            PlayEvent::MoveEntityRot {
-                eid,
-                yaw,
-                pitch,
-                on_ground,
-            } => self.move_tracked_entity(*eid, [0.0; 3], Some((*yaw, *pitch)), *on_ground),
-            PlayEvent::TeleportEntity {
-                eid,
-                x,
-                y,
-                z,
-                yaw,
-                pitch,
-                on_ground,
-            } => self.teleport_tracked_entity(*eid, [*x, *y, *z], *yaw, *pitch, *on_ground),
+            PlayEvent::MoveEntityPos { eid, dx, dy, dz, on_ground } => {
+                self.move_tracked_entity(*eid, [*dx, *dy, *dz], None, *on_ground);
+            }
+            PlayEvent::MoveEntityPosRot { eid, dx, dy, dz, yaw, pitch, on_ground } => {
+                self.move_tracked_entity(*eid, [*dx, *dy, *dz], Some((*yaw, *pitch)), *on_ground);
+            }
+            PlayEvent::MoveEntityRot { eid, yaw, pitch, on_ground } => {
+                self.move_tracked_entity(*eid, [0.0; 3], Some((*yaw, *pitch)), *on_ground);
+            }
+            PlayEvent::TeleportEntity { eid, x, y, z, yaw, pitch, on_ground } => {
+                self.teleport_tracked_entity(*eid, [*x, *y, *z], *yaw, *pitch, *on_ground);
+            }
             PlayEvent::RotateHead { eid, head_yaw } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
                     entity.head_yaw_deg = clean_f32(*head_yaw);
@@ -4283,119 +4253,18 @@ impl WorldState {
                     entity.vel = [clean_f64(*vx), clean_f64(*vy), clean_f64(*vz)];
                 }
             }
-            // `entity_event` status 2 is the vanilla hurt flash.
-            PlayEvent::EntityEvent { eid, status } if *status == 2 => {
-                if let Some(entity) = self.entities.get_mut(eid) {
-                    entity.hurt_ticks = HURT_FLASH_TICKS;
-                }
-            }
-            PlayEvent::HurtAnimation { eid, .. } => {
-                if let Some(entity) = self.entities.get_mut(eid) {
-                    entity.hurt_ticks = HURT_FLASH_TICKS;
-                }
-            }
-            // `damage_event` (1.19.4+) reports the same hurt the legacy
-            // `hurt_animation` carried — flash the victim identically.
-            PlayEvent::DamageEvent { eid, .. } => {
-                if let Some(entity) = self.entities.get_mut(eid) {
-                    entity.hurt_ticks = HURT_FLASH_TICKS;
-                }
-            }
-            PlayEvent::Animate { eid, animation } => {
-                if let Some(entity) = self.entities.get_mut(eid) {
-                    entity.last_animation = Some(*animation);
-                }
-                if self.entity_animation_ticks.len() < MAX_TRACKED_ENTITIES
-                    || self.entity_animation_ticks.contains_key(eid)
-                {
-                    self.entity_animation_ticks.insert(
-                        *eid,
-                        if *animation == 0 || *animation == 3 {
-                            6
-                        } else {
-                            5
-                        },
-                    );
-                }
-            }
             PlayEvent::SetEntityData { eid, raw_entries } => {
-                let entries = decode_entity_metadata(raw_entries)?;
-                if self.entity_metadata.contains_key(eid)
-                    || self.entity_metadata.len() < MAX_TRACKED_ENTITIES
-                {
-                    if let Some(pose) = entries
-                        .iter()
-                        .find_map(|entry| (entry.index == 6).then_some(&entry.value))
-                        .and_then(|value| match value {
-                            crate::protocol::DecodedEntityMetadataValue::Pose(pose) => Some(*pose),
-                            _ => None,
-                        })
-                    {
-                        self.entity_poses.insert(*eid, pose);
-                    }
-                    let current = self.entity_metadata.entry(*eid).or_default();
-                    for update in entries {
-                        if let Some(existing) =
-                            current.iter_mut().find(|entry| entry.index == update.index)
-                        {
-                            *existing = update;
-                        } else {
-                            current.push(update);
-                        }
-                    }
-                    current.sort_by_key(|entry| entry.index);
-                }
+                self.apply_entity_metadata(*eid, raw_entries)?;
             }
-            PlayEvent::UpdateAttributes { eid, attributes } => {
-                if self.entity_attributes.contains_key(eid)
-                    || self.entity_attributes.len() < MAX_TRACKED_ENTITIES
-                {
-                    self.entity_attributes.insert(*eid, attributes.clone());
-                }
-            }
-            PlayEvent::SetPassengers {
-                vehicle,
-                passengers,
-            } => {
-                if self.passengers.contains_key(vehicle)
-                    || self.passengers.len() < MAX_TRACKED_ENTITIES
-                {
-                    self.passengers.insert(*vehicle, passengers.clone());
-                }
-            }
-            PlayEvent::SetEntityLink {
-                source,
-                destination,
-            } => {
-                if self.entity_links.contains_key(source)
-                    || self.entity_links.len() < MAX_TRACKED_ENTITIES
-                {
-                    self.entity_links.insert(*source, *destination);
-                }
-            }
-            PlayEvent::BlockEvent {
-                pos,
-                action,
-                parameter,
-                block_type,
-            } => {
-                if self.block_events.len() == 64 {
-                    self.block_events.pop_front();
-                }
-                self.block_events
-                    .push_back((*pos, *action, *parameter, *block_type));
-            }
-            PlayEvent::TakeItemEntity {
-                item_entity,
-                player,
-                amount,
-            } => {
-                if self.item_pickups.len() == 64 {
-                    self.item_pickups.pop_front();
-                }
-                self.item_pickups
-                    .push_back((*item_entity, *player, *amount));
-            }
+            PlayEvent::UpdateAttributes { eid, attributes } => bounded_insert(
+                &mut self.entity_attributes, *eid, attributes.clone(), MAX_TRACKED_ENTITIES,
+            ),
+            PlayEvent::SetPassengers { vehicle, passengers } => bounded_insert(
+                &mut self.passengers, *vehicle, passengers.clone(), MAX_TRACKED_ENTITIES,
+            ),
+            PlayEvent::SetEntityLink { source, destination } => bounded_insert(
+                &mut self.entity_links, *source, *destination, MAX_TRACKED_ENTITIES,
+            ),
             PlayEvent::SetEquipment { eid, entries } => {
                 if let Some(entity) = self.entities.get_mut(eid) {
                     for entry in entries {
@@ -4403,8 +4272,7 @@ impl WorldState {
                             entity.equipment_slots |= 1u8 << entry.slot;
                         }
                         if entry.slot <= 6
-                            && (self.entity_equipment.len() < 4096
-                                || self.entity_equipment.contains_key(&(*eid, entry.slot)))
+                            && has_capacity(&self.entity_equipment, &(*eid, entry.slot), 4096)
                         {
                             self.entity_equipment
                                 .insert((*eid, entry.slot), entry.item_wire.clone());
@@ -4412,102 +4280,26 @@ impl WorldState {
                     }
                 }
             }
-            PlayEvent::UpdateMobEffect {
-                eid,
-                effect_id,
-                amplifier,
-                duration,
-                flags,
-            } => {
-                if self.mob_effects.len() < 4096
-                    || self.mob_effects.contains_key(&(*eid, *effect_id))
-                {
-                    self.mob_effects.insert(
-                        (*eid, *effect_id),
-                        TrackedMobEffect {
-                            amplifier: *amplifier,
-                            duration: *duration,
-                            flags: *flags,
-                        },
-                    );
-                }
-            }
-            PlayEvent::RemoveMobEffect { eid, effect_id } => {
-                self.mob_effects.remove(&(*eid, *effect_id));
-            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Containers / inventory: screen open-close, property updates and
+    /// merchant offers.
+    fn apply_container_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
+        match event {
             PlayEvent::OpenScreen { .. } | PlayEvent::HorseScreenOpen { .. } => {
                 self.merchant_panels.clear();
                 self.container_properties.retain(|(id, _), _| *id == 0);
             }
             PlayEvent::ContainerClose { window_id } => {
                 self.merchant_panels.remove(window_id);
-                self.container_properties
-                    .retain(|(id, _), _| id != window_id);
+                self.container_properties.retain(|(id, _), _| id != window_id);
             }
-            PlayEvent::ContainerSetData {
-                window_id,
-                property,
-                value,
-            } => {
-                if self.container_properties.len() < 1024
-                    || self
-                        .container_properties
-                        .contains_key(&(*window_id, *property))
-                {
-                    self.container_properties
-                        .insert((*window_id, *property), *value);
-                }
-            }
-            PlayEvent::BossEvent {
-                uuid,
-                action,
-                raw_payload,
-            } => match decode_boss_bar_action(*action, raw_payload)? {
-                DecodedBossBarAction::Add {
-                    name_nbt,
-                    progress,
-                    color,
-                    divisions,
-                    flags,
-                } => {
-                    if self.boss_bars.len() < 128 || self.boss_bars.contains_key(uuid) {
-                        self.boss_bars.insert(
-                            *uuid,
-                            TrackedBossBar {
-                                name_nbt,
-                                progress,
-                                color,
-                                divisions,
-                                flags,
-                            },
-                        );
-                    }
-                }
-                DecodedBossBarAction::Remove => {
-                    self.boss_bars.remove(uuid);
-                }
-                DecodedBossBarAction::UpdateProgress(progress) => {
-                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
-                        bar.progress = progress;
-                    }
-                }
-                DecodedBossBarAction::UpdateName(name_nbt) => {
-                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
-                        bar.name_nbt = name_nbt;
-                    }
-                }
-                DecodedBossBarAction::UpdateStyle { color, divisions } => {
-                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
-                        bar.color = color;
-                        bar.divisions = divisions;
-                    }
-                }
-                DecodedBossBarAction::UpdateFlags(flags) => {
-                    if let Some(bar) = self.boss_bars.get_mut(uuid) {
-                        bar.flags = flags;
-                    }
-                }
-            },
+            PlayEvent::ContainerSetData { window_id, property, value } => bounded_insert(
+                &mut self.container_properties, (*window_id, *property), *value, 1024,
+            ),
             PlayEvent::MerchantOffers {
                 window_id,
                 offers,
@@ -4518,53 +4310,48 @@ impl WorldState {
             } => {
                 if let Ok(window_id) = u8::try_from(*window_id) {
                     self.merchant_panels.retain(|id, _| *id == window_id);
-                    self.merchant_panels.insert(
-                        window_id,
-                        MerchantPanelState {
-                            offers: offers.clone(),
-                            villager_level: *villager_level,
-                            villager_xp: *villager_xp,
-                            show_progress: *show_progress,
-                            can_restock: *can_restock,
-                        },
-                    );
+                    let panel = MerchantPanelState {
+                        offers: offers.clone(),
+                        villager_level: *villager_level,
+                        villager_xp: *villager_xp,
+                        show_progress: *show_progress,
+                        can_restock: *can_restock,
+                    };
+                    self.merchant_panels.insert(window_id, panel);
                 }
             }
-            PlayEvent::SetTime {
-                world_age,
-                time_of_day,
-            } => {
-                self.world_age = *world_age;
-                self.time_of_day = *time_of_day;
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// World / environment: dimension resets, time, weather and game events,
+    /// block-entity data, block events/destruction and level effects.
+    fn apply_world_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
+        match event {
+            PlayEvent::JoinGame { dimension, .. } | PlayEvent::Respawn { dimension } => {
+                self.reset_dimension(dimension.clone());
             }
-            PlayEvent::GameEvent { event, value } => {
-                self.apply_game_event(*event, *value);
-            }
-            PlayEvent::BlockDestruction {
-                breaker_eid,
-                pos,
-                stage,
-            } => self.apply_block_destruction(*breaker_eid, *pos, *stage),
-            PlayEvent::Explosion {
-                x, y, z, records, ..
-            } => self.apply_explosion_removals(*x, *y, *z, records)?,
-            PlayEvent::BlockEntityData {
-                pos,
-                kind,
-                nbt_bytes,
-            } => self.apply_block_entity_data(*pos, *kind, nbt_bytes),
-            PlayEvent::LevelEvent {
-                event,
-                pos,
-                data,
-                disable_relative_volume,
-            } => {
-                if self.level_events.len() == 64 {
-                    self.level_events.pop_front();
+            PlayEvent::SetTime { world_age, time_of_day } => {
+                // Idle no-op: a repeated time sync mutates nothing.
+                if self.world_age != *world_age || self.time_of_day != *time_of_day {
+                    self.world_age = *world_age;
+                    self.time_of_day = *time_of_day;
                 }
-                self.level_events
-                    .push_back((*event, *pos, *data, *disable_relative_volume));
             }
+            PlayEvent::GameEvent { event, value } => self.apply_game_event(*event, *value),
+            PlayEvent::BlockDestruction { breaker_eid, pos, stage } => {
+                self.apply_block_destruction(*breaker_eid, *pos, *stage);
+            }
+            PlayEvent::BlockEvent { pos, action, parameter, block_type } => push_bounded(
+                &mut self.block_events, (*pos, *action, *parameter, *block_type), 64,
+            ),
+            PlayEvent::BlockEntityData { pos, kind, nbt_bytes } => {
+                self.apply_block_entity_data(*pos, *kind, nbt_bytes);
+            }
+            PlayEvent::LevelEvent { event, pos, data, disable_relative_volume } => push_bounded(
+                &mut self.level_events, (*event, *pos, *data, *disable_relative_volume), 64,
+            ),
             PlayEvent::LevelParticles {
                 particle_id,
                 long_distance,
@@ -4583,23 +4370,145 @@ impl WorldState {
                     self.level_particles.pop_front();
                     self.level_particle_options.pop_front();
                 }
-                self.level_particles.push_back(LevelParticleSpawn {
+                let spawn = LevelParticleSpawn {
                     particle_id: *particle_id,
                     long_distance: *long_distance,
                     pos: [*x, *y, *z],
                     offset: [*offset_x, *offset_y, *offset_z],
                     max_speed: *max_speed,
                     count: *count,
-                });
-                self.level_particle_options
-                    .push_back((*particle_id, options));
+                };
+                self.level_particles.push_back(spawn);
+                self.level_particle_options.push_back((*particle_id, options));
             }
-            // `chunks_biomes` — per-column biome paletted containers
-            // patched into the stored sections; columns that left the
-            // view distance simply have nothing to patch.
-            PlayEvent::ChunksBiomes { chunks } => self.apply_chunks_biomes(chunks),
-            _ => {}
+            _ => return Ok(false),
         }
+        Ok(true)
+    }
+
+    /// Player / combat / effects: hurt flashes, swing animation, mob effects,
+    /// boss bars and item pickups.
+    fn apply_combat_play_event(&mut self, event: &PlayEvent) -> Result<bool, String> {
+        match event {
+            // `entity_event` status 2 is the vanilla hurt flash; other
+            // statuses carry no tracked state.
+            PlayEvent::EntityEvent { eid, status } if *status == 2 => self.flash_hurt(*eid),
+            PlayEvent::EntityEvent { .. } => {}
+            // `damage_event` (1.19.4+) reports the same hurt the legacy
+            // `hurt_animation` carried — flash the victim identically.
+            PlayEvent::HurtAnimation { eid, .. } | PlayEvent::DamageEvent { eid, .. } => {
+                self.flash_hurt(*eid);
+            }
+            PlayEvent::Animate { eid, animation } => {
+                if let Some(entity) = self.entities.get_mut(eid) {
+                    entity.last_animation = Some(*animation);
+                }
+                // 0 and 3 are the arm-swing pair (6 ticks); the rest run 5.
+                let ticks = if *animation == 0 || *animation == 3 { 6 } else { 5 };
+                bounded_insert(
+                    &mut self.entity_animation_ticks, *eid, ticks, MAX_TRACKED_ENTITIES,
+                );
+            }
+            PlayEvent::UpdateMobEffect { eid, effect_id, amplifier, duration, flags } => {
+                let effect =
+                    TrackedMobEffect { amplifier: *amplifier, duration: *duration, flags: *flags };
+                bounded_insert(&mut self.mob_effects, (*eid, *effect_id), effect, 4096);
+            }
+            PlayEvent::RemoveMobEffect { eid, effect_id } => {
+                self.mob_effects.remove(&(*eid, *effect_id));
+            }
+            PlayEvent::TakeItemEntity { item_entity, player, amount } => push_bounded(
+                &mut self.item_pickups, (*item_entity, *player, *amount), 64,
+            ),
+            PlayEvent::BossEvent { uuid, action, raw_payload } => {
+                match decode_boss_bar_action(*action, raw_payload)? {
+                    DecodedBossBarAction::Add { name_nbt, progress, color, divisions, flags } => {
+                        let bar = TrackedBossBar { name_nbt, progress, color, divisions, flags };
+                        bounded_insert(&mut self.boss_bars, *uuid, bar, 128);
+                    }
+                    DecodedBossBarAction::Remove => {
+                        self.boss_bars.remove(uuid);
+                    }
+                    DecodedBossBarAction::UpdateProgress(progress) => {
+                        if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                            bar.progress = progress;
+                        }
+                    }
+                    DecodedBossBarAction::UpdateName(name_nbt) => {
+                        if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                            bar.name_nbt = name_nbt;
+                        }
+                    }
+                    DecodedBossBarAction::UpdateStyle { color, divisions } => {
+                        if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                            bar.color = color;
+                            bar.divisions = divisions;
+                        }
+                    }
+                    DecodedBossBarAction::UpdateFlags(flags) => {
+                        if let Some(bar) = self.boss_bars.get_mut(uuid) {
+                            bar.flags = flags;
+                        }
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Drop every row keyed by `eid` from the tracked-entity families.
+    fn forget_entity(&mut self, eid: i32) {
+        self.entities.remove(&eid);
+        self.entity_metadata.remove(&eid);
+        self.entity_poses.remove(&eid);
+        self.entity_animation_ticks.remove(&eid);
+        self.entity_equipment.retain(|(entity, _), _| *entity != eid);
+        self.mob_effects.retain(|(entity, _), _| *entity != eid);
+        self.entity_attributes.remove(&eid);
+        self.passengers.remove(&eid);
+        self.entity_links.remove(&eid);
+        for passengers in self.passengers.values_mut() {
+            passengers.retain(|&passenger| passenger != eid);
+        }
+        // A removed breaker stops cracking blocks.
+        self.block_destructions.remove(&eid);
+    }
+
+    /// Set the hurt-flash timer on a tracked entity; unknown ids are ignored.
+    fn flash_hurt(&mut self, eid: i32) {
+        if let Some(entity) = self.entities.get_mut(&eid) {
+            entity.hurt_ticks = HURT_FLASH_TICKS;
+        }
+    }
+
+    /// `set_entity_data`: merge the decoded metadata entries by index and keep
+    /// the shared pose field in its own map. Bounded like the rest of the
+    /// entity family — a full table drops the packet whole.
+    fn apply_entity_metadata(&mut self, eid: i32, raw_entries: &[u8]) -> Result<(), String> {
+        let entries = decode_entity_metadata(raw_entries)?;
+        if !has_capacity(&self.entity_metadata, &eid, MAX_TRACKED_ENTITIES) {
+            return Ok(());
+        }
+        if let Some(pose) = entries
+            .iter()
+            .find_map(|entry| (entry.index == 6).then_some(&entry.value))
+            .and_then(|value| match value {
+                crate::protocol::DecodedEntityMetadataValue::Pose(pose) => Some(*pose),
+                _ => None,
+            })
+        {
+            self.entity_poses.insert(eid, pose);
+        }
+        let current = self.entity_metadata.entry(eid).or_default();
+        for update in entries {
+            if let Some(existing) = current.iter_mut().find(|entry| entry.index == update.index) {
+                *existing = update;
+            } else {
+                current.push(update);
+            }
+        }
+        current.sort_by_key(|entry| entry.index);
         Ok(())
     }
 
@@ -4778,6 +4687,15 @@ impl WorldState {
     /// chunk-payload population in [`Self::refresh_chunk_block_entities`].
     /// Bounded by [`MAX_TRACKED_BLOCK_ENTITIES`].
     fn apply_block_entity_data(&mut self, pos: [i32; 3], kind: i32, nbt_bytes: &[u8]) {
+        // Idle no-op: a repeated payload for the tracked row re-derives the
+        // identical NBT projection, so skip the reparse entirely.
+        if self
+            .block_entities
+            .get(&pos)
+            .is_some_and(|entry| entry.kind == kind && entry.nbt_bytes == nbt_bytes)
+        {
+            return;
+        }
         if self.block_entities.len() >= MAX_TRACKED_BLOCK_ENTITIES
             && !self.block_entities.contains_key(&pos)
         {
