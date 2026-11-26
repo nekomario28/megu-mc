@@ -908,20 +908,7 @@ fn environment_time_tick() {
         }
         __t = __prof.then(std::time::Instant::now);
     }
-    // world clock advances every tick (20 tps => +20/s)
-    let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
-        WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
-    } else {
-        WORLD_TIME.load(Ordering::Relaxed) % 24000
-    };
-    every_ms(&TIME_NOTIFY_AT, TIME_NOTIFY_MS, || {
-        broadcast(0, |_c| {
-            let mut p = Vec::new();
-            p.extend_from_slice(&t.to_be_bytes()); // world age (i64)
-            p.extend_from_slice(&(wt as i64).to_be_bytes());
-            (0x64, p)
-        });
-    });
+    tick_environment_daylight(t);
     every_ms(&SIZE_LOG_AT, SIZE_LOG_MS, || {
         #[cfg(target_os = "linux")]
         let rss = std::fs::read_to_string("/proc/self/status")
@@ -940,6 +927,37 @@ fn environment_time_tick() {
             crops().lock().unwrap_or_else(|e| e.into_inner()).len(), world().len(), inv_store().lock().unwrap_or_else(|e| e.into_inner()).len(),
             clients().lock().unwrap_or_else(|e| e.into_inner()).len());
     });
+    tick_environment_weather(t, __prof, &mut __t);
+    tick_environment_players(&env_clients, t, __prof, &mut __t);
+    tick_environment_player_followups(&env_clients, __prof, &mut __t);
+    tick_environment_crops_and_autosave(&region, &env_clients, t, __prof, &mut __t);
+    tick_environment_spawns(t);
+    tick_environment_bobbers(&region, &env_clients);
+    tick_environment_pearls(&region, &env_clients);
+    tick_environment_end_gateway();
+    tick_environment_snowballs(&region, &env_clients);
+    tick_environment_xp_orbs(&region);
+    tick_environment_functions(t, __prof, &mut __t);
+}
+
+fn tick_environment_daylight(t: u64) {
+    // world clock advances every tick (20 tps => +20/s)
+    let wt = if GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed) == 1 {
+        WORLD_TIME.fetch_add(GAME_TICKS_PER_TICK as u64, Ordering::Relaxed) % 24000
+    } else {
+        WORLD_TIME.load(Ordering::Relaxed) % 24000
+    };
+    every_ms(&TIME_NOTIFY_AT, TIME_NOTIFY_MS, || {
+        broadcast(0, |_c| {
+            let mut p = Vec::new();
+            p.extend_from_slice(&t.to_be_bytes()); // world age (i64)
+            p.extend_from_slice(&(wt as i64).to_be_bytes());
+            (0x64, p)
+        });
+    });
+}
+
+fn tick_environment_weather(t: u64, __prof: bool, __t: &mut Option<std::time::Instant>) {
     // weather: occasional rain
     {
         let rt = RAINING.load(Ordering::Relaxed);
@@ -981,7 +999,7 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/weather+lightning", t.elapsed());
         }
-        __t = __prof.then(std::time::Instant::now);
+        *__t = __prof.then(std::time::Instant::now);
     }
     // transient lightning bolts: despawn after ~0.5s
     {
@@ -997,9 +1015,17 @@ fn environment_time_tick() {
             }
         }
     }
+}
+
+fn tick_environment_players(
+    env_clients: &[Arc<Client>],
+    t: u64,
+    __prof: bool,
+    __t: &mut Option<std::time::Instant>,
+) {
     // Player hunger and environmental damage.
     {
-        let cls: &[Arc<Client>] = &env_clients;
+        let cls: &[Arc<Client>] = env_clients;
         for c in cls.iter() {
             let gm = *c.gm.lock().unwrap_or_else(|e| e.into_inner());
             if matches!(gm, 1 | 3) || *c.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
@@ -1345,8 +1371,15 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/hunger+plates", t.elapsed());
         }
-        __t = __prof.then(std::time::Instant::now);
+        *__t = __prof.then(std::time::Instant::now);
     }
+}
+
+fn tick_environment_player_followups(
+    env_clients: &[Arc<Client>],
+    __prof: bool,
+    __t: &mut Option<std::time::Instant>,
+) {
     // pressure plates: dimension-scoped contact scan, see pressure_plate_tick
     pressure_plate_tick();
     // potion effects tick for ALL players
@@ -1354,7 +1387,7 @@ fn environment_time_tick() {
     // still apply there; damage effects are client-irrelevant in creative)
     {
         let __tsnap = __prof.then(std::time::Instant::now);
-        let cls: &[Arc<Client>] = &env_clients;
+        let cls: &[Arc<Client>] = env_clients;
         if let Some(t) = __tsnap {
             tickprof::add("env/client_snapshot", t.elapsed());
         }
@@ -1384,8 +1417,17 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/plates", t.elapsed());
         }
-        __t = __prof.then(std::time::Instant::now);
+        *__t = __prof.then(std::time::Instant::now);
     }
+}
+
+fn tick_environment_crops_and_autosave(
+    region: &Region,
+    env_clients: &[Arc<Client>],
+    t: u64,
+    __prof: bool,
+    __t: &mut Option<std::time::Instant>,
+) {
     // Crop writes acquire SAVE_LOCK; grow_crops releases CROPS before any block write.
     grow_crops(t, |x, z| region.is_warm(x, z));
     let autosave = server_ticks(AUTOSAVE_GT);
@@ -1420,8 +1462,11 @@ fn environment_time_tick() {
         if let Some(t) = __t {
             tickprof::add("env/crops", t.elapsed());
         }
-        __t = __prof.then(std::time::Instant::now);
+        *__t = __prof.then(std::time::Instant::now);
     }
+}
+
+fn tick_environment_spawns(t: u64) {
     if GR_MOB_SPAWNING.load(Ordering::Relaxed) == 1 {
         let cycle = server_ticks(SPAWN_CYCLE_GT);
         // The smoother's mob budget gates each natural-spawn pass; at full
@@ -1452,6 +1497,9 @@ fn environment_time_tick() {
             spawn_chunkgen_creatures(t);
         }
     }
+}
+
+fn tick_environment_bobbers(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // fishing bobbers: fly, land on water, bite after 3-7 s
         let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
@@ -1574,6 +1622,9 @@ fn environment_time_tick() {
             }
         }
     }
+}
+
+fn tick_environment_pearls(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // thrown pearls: fly, on expiry teleport owner
         let mut pl = pearls().lock().unwrap_or_else(|e| e.into_inner());
@@ -1622,7 +1673,7 @@ fn environment_time_tick() {
             if let Some(peid) = dead_pearl {
                 broadcast_seen_destroy(peid);
             }
-            let cls: &[Arc<Client>] = &env_clients;
+            let cls: &[Arc<Client>] = env_clients;
             if let Some(c) = cls.iter().find(|c| c.eid == owner) {
                 if is_end_gateway_state(hit_st) {
                     // A pearl that lands in a gateway beam warps its owner to
@@ -1657,12 +1708,18 @@ fn environment_time_tick() {
             }
         }
     }
+}
+
+fn tick_environment_end_gateway() {
     {
         // eyes of ender: fly toward their stronghold target, then shatter or
         // drop, and players or ridden boats inside an end_gateway beam warp.
         tick_eyes_of_ender();
         tick_end_gateway_entries();
     }
+}
+
+fn tick_environment_snowballs(region: &Region, env_clients: &[Arc<Client>]) {
     {
         // snowballs: fly, hit mob -> hurt flash
         // Snapshot Overworld mob hitboxes once for the whole pass instead of
@@ -1759,6 +1816,9 @@ fn environment_time_tick() {
             }
         }
     }
+}
+
+fn tick_environment_xp_orbs(region: &Region) {
     {
         // despawn xp orbs after 300s — plus the same hard cap as drops:
         // a farm can out-spawn the despawn window.
@@ -1808,6 +1868,13 @@ fn environment_time_tick() {
         }
         shrink_if_sparse(&mut xl);
     }
+}
+
+fn tick_environment_functions(
+    t: u64,
+    __prof: bool,
+    __t: &mut Option<std::time::Instant>,
+) {
     // #minecraft:tick functions run once per game tick (TICK_MS = 50ms = 20/s, the
     // vanilla rate)
     let ticks: Vec<Arc<str>> = packs()
