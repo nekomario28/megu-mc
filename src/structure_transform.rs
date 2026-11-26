@@ -1,12 +1,14 @@
 //! StructureTemplate geometry and state transforms from pinned native contracts.
 type Pos = (i32, i32, i32);
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 pub(crate) enum Mirror {
     None,
     LeftRight,
     FrontBack,
 }
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
 pub(crate) enum Rotation {
     None,
     Clockwise90,
@@ -203,35 +205,62 @@ fn transform_table() -> Option<&'static [u8]> {
         .as_deref()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum Dir {
+    North,
+    East,
+    South,
+    West,
+}
+
+impl Dir {
+    const ALL: [Self; 4] = [Self::North, Self::East, Self::South, Self::West];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::North => "north",
+            Self::East => "east",
+            Self::South => "south",
+            Self::West => "west",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|direction| direction.name() == name)
+    }
+}
+
+// Each row maps an input direction to its output. Mirror indices preserve the
+// template-file/native enum contract documented by `Mirror::from_index`.
+const DIRECTION_ROTATIONS: [[Dir; 4]; 4] = [
+    [Dir::North, Dir::East, Dir::South, Dir::West],
+    [Dir::East, Dir::South, Dir::West, Dir::North],
+    [Dir::South, Dir::West, Dir::North, Dir::East],
+    [Dir::West, Dir::North, Dir::East, Dir::South],
+];
+const DIRECTION_MIRRORS: [[Dir; 4]; 3] = [
+    [Dir::North, Dir::East, Dir::South, Dir::West],
+    [Dir::South, Dir::East, Dir::North, Dir::West],
+    [Dir::North, Dir::West, Dir::South, Dir::East],
+];
+const ROTATION_STEPS_16: [i32; 4] = [0, 4, 8, 12];
+const ROTATION_SWAPS_HORIZONTAL_AXIS: [bool; 4] = [false, true, false, true];
+
 fn turn_horizontal(direction: &str, rotation: Rotation) -> &str {
-    const DIRS: [&str; 4] = ["north", "east", "south", "west"];
-    let Some(i) = DIRS.iter().position(|d| *d == direction) else {
+    let Some(direction) = Dir::parse(direction) else {
         return direction;
     };
-    let delta = match rotation {
-        Rotation::None => 0,
-        Rotation::Clockwise90 => 1,
-        Rotation::Clockwise180 => 2,
-        Rotation::Counterclockwise90 => 3,
-    };
-    DIRS[(i + delta) & 3]
+    DIRECTION_ROTATIONS[rotation as usize][direction as usize].name()
 }
 
 fn mirror_horizontal(direction: &str, mirror: Mirror) -> &str {
-    match mirror {
-        Mirror::None => direction,
-        // This enum's FrontBack flips x and LeftRight flips z (see Mirror::from_index).
-        Mirror::FrontBack => match direction {
-            "east" => "west",
-            "west" => "east",
-            _ => direction,
-        },
-        Mirror::LeftRight => match direction {
-            "north" => "south",
-            "south" => "north",
-            _ => direction,
-        },
-    }
+    let Some(direction) = Dir::parse(direction) else {
+        return direction;
+    };
+    DIRECTION_MIRRORS[mirror as usize][direction as usize].name()
 }
 
 fn transform_direction(direction: &str, mirror: Mirror, rotation: Rotation) -> String {
@@ -253,15 +282,10 @@ fn derive_state_transform(state: u32, mirror: Mirror, rotation: Rotation) -> Opt
             out = reg.with_prop(out, &key, &mapped);
         } else if key == "rotation" {
             if let Ok(v) = value.parse::<i32>() {
-                let quarter = match rotation {
-                    Rotation::None => 0,
-                    Rotation::Clockwise90 => 4,
-                    Rotation::Clockwise180 => 8,
-                    Rotation::Counterclockwise90 => 12,
-                };
-                out = reg.with_prop(out, &key, &((v + quarter).rem_euclid(16)).to_string());
+                let steps = ROTATION_STEPS_16[rotation as usize];
+                out = reg.with_prop(out, &key, &((v + steps).rem_euclid(16)).to_string());
             }
-        } else if key == "axis" && !matches!(rotation, Rotation::None | Rotation::Clockwise180) {
+        } else if key == "axis" && ROTATION_SWAPS_HORIZONTAL_AXIS[rotation as usize] {
             let mapped = match value.as_str() {
                 "x" => "z",
                 "z" => "x",
@@ -293,9 +317,156 @@ pub(crate) fn state(state: u32, mirror: Mirror, rotation: Rotation) -> Option<u3
     derive_state_transform(state, mirror, rotation)
 }
 
+#[cfg(test)]
+fn inverse_transform(mirror: Mirror, rotation: Rotation) -> (Mirror, Rotation) {
+    let original: Vec<_> = Dir::ALL
+        .into_iter()
+        .map(|direction| {
+            DIRECTION_ROTATIONS[rotation as usize]
+                [DIRECTION_MIRRORS[mirror as usize][direction as usize] as usize]
+        })
+        .collect();
+    for candidate_mirror in [Mirror::None, Mirror::LeftRight, Mirror::FrontBack] {
+        for candidate_rotation in [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Clockwise180,
+            Rotation::Counterclockwise90,
+        ] {
+            let restores = original.iter().enumerate().all(|(index, direction)| {
+                DIRECTION_ROTATIONS[candidate_rotation as usize]
+                    [DIRECTION_MIRRORS[candidate_mirror as usize][*direction as usize] as usize]
+                    == Dir::ALL[index]
+            });
+            if restores {
+                return (candidate_mirror, candidate_rotation);
+            }
+        }
+    }
+    panic!("no inverse for {mirror:?} {rotation:?}");
+}
+
+#[cfg(test)]
+#[test]
+fn structure_transform_dihedral_tables_cover_all_symmetries_and_inverses() {
+    let mut symmetries = std::collections::HashSet::new();
+    for mirror in [Mirror::None, Mirror::FrontBack] {
+        for rotation in [
+            Rotation::None,
+            Rotation::Clockwise90,
+            Rotation::Clockwise180,
+            Rotation::Counterclockwise90,
+        ] {
+            let mapped: Vec<_> = Dir::ALL
+                .into_iter()
+                .map(|direction| {
+                    DIRECTION_ROTATIONS[rotation as usize]
+                        [DIRECTION_MIRRORS[mirror as usize][direction as usize] as usize]
+                })
+                .collect();
+            assert!(
+                symmetries.insert(mapped.clone()),
+                "duplicate {mirror:?} {rotation:?}"
+            );
+            let (inverse_mirror, inverse_rotation) = inverse_transform(mirror, rotation);
+            for (original, transformed) in Dir::ALL.into_iter().zip(mapped) {
+                let restored = DIRECTION_ROTATIONS[inverse_rotation as usize]
+                    [DIRECTION_MIRRORS[inverse_mirror as usize][transformed as usize] as usize];
+                assert_eq!(restored, original);
+                assert_eq!(
+                    transform_direction(original.name(), mirror, rotation),
+                    transformed.name()
+                );
+            }
+        }
+    }
+    assert_eq!(symmetries.len(), 8);
+}
+
 #[cfg(all(test, megu_vanilla_data))]
 mod tests {
     use super::*;
+    #[test]
+    fn directional_structure_states_round_trip_for_all_symmetries() {
+        let reg = crate::block_registry::breg().unwrap();
+        let mut seen = [false; 3];
+        let mut checked_horizontal_axis = [false; 2];
+        for state_id in 0..reg.state_count() as u32 {
+            let name = reg.name_of(state_id);
+            let family = if name.contains("stairs") {
+                Some(0)
+            } else if name.contains("rail") {
+                Some(1)
+            } else if name.contains("jigsaw") {
+                Some(2)
+            } else {
+                None
+            };
+            let Some(props) = reg.properties_of(state_id) else {
+                continue;
+            };
+            if let Some((_, axis)) = props.iter().find(|(key, _)| key == "axis") {
+                if matches!(axis.as_str(), "x" | "z") {
+                    for mirror in [Mirror::None, Mirror::FrontBack] {
+                        for rotation in [
+                            Rotation::None,
+                            Rotation::Clockwise90,
+                            Rotation::Clockwise180,
+                            Rotation::Counterclockwise90,
+                        ] {
+                            let transformed = state(state_id, mirror, rotation).unwrap();
+                            let expected = if ROTATION_SWAPS_HORIZONTAL_AXIS[rotation as usize] {
+                                if axis == "x" {
+                                    "z"
+                                } else {
+                                    "x"
+                                }
+                            } else {
+                                axis
+                            };
+                            assert_eq!(
+                                reg.get_prop(transformed, "axis").as_deref(),
+                                Some(expected)
+                            );
+                        }
+                    }
+                    checked_horizontal_axis[usize::from(axis == "z")] = true;
+                }
+            }
+            let Some(family) = family else { continue };
+            if !props.iter().any(|(key, _)| {
+                matches!(key.as_str(), "facing" | "orientation" | "axis" | "rotation")
+            }) {
+                continue;
+            }
+            seen[family] = true;
+            for mirror in [Mirror::None, Mirror::FrontBack] {
+                for rotation in [
+                    Rotation::None,
+                    Rotation::Clockwise90,
+                    Rotation::Clockwise180,
+                    Rotation::Counterclockwise90,
+                ] {
+                    let transformed = state(state_id, mirror, rotation).unwrap();
+                    let (inverse_mirror, inverse_rotation) = inverse_transform(mirror, rotation);
+                    assert_eq!(
+                        state(transformed, inverse_mirror, inverse_rotation),
+                        Some(state_id),
+                        "{name} state={state_id} {mirror:?} {rotation:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            seen.into_iter().all(|family| family),
+            "missing stairs/rail/jigsaw states: {seen:?}"
+        );
+        assert!(
+            checked_horizontal_axis.into_iter().all(|axis| axis),
+            "registry did not exercise both horizontal axes: {checked_horizontal_axis:?}"
+        );
+    }
+
     #[test]
     fn template_coordinate_and_bounds_transforms_match_native() {
         fn pos(s: &str) -> Pos {
