@@ -1639,6 +1639,7 @@ pub struct GpuApp {
     /// SHA-1-verified download) spawned at boot when no local JAR was
     /// found; polled non-blockingly from the event loop.
     vanilla_bootstrap: Option<crate::vanilla_bootstrap::VanillaJarBootstrap>,
+    server_blocks_bootstrap: Option<crate::vanilla_bootstrap::VanillaJarBootstrap>,
     /// `true` once the bootstrap was spawned (or deliberately skipped) so
     /// a `Failed` download is not retried on every surface re-creation.
     bootstrap_attempted: bool,
@@ -2319,6 +2320,7 @@ impl GpuApp {
             guest_link_grant: None,
             friend_join_sas: None,
             vanilla_bootstrap: None,
+            server_blocks_bootstrap: None,
             bootstrap_attempted: false,
             bootstrap_version: String::new(),
             bootstrap_banner: None,
@@ -2992,6 +2994,19 @@ impl GpuApp {
     /// but no complete Mojang object store. Resolve metadata and fill that
     /// store off-thread, then reload the runtime bundle in-place (P1.1).
     fn ensure_vanilla_assets_bootstrap(&mut self) {
+        if self.server_blocks_bootstrap.is_none()
+            && crate::vanilla_bootstrap::auto_fetch_enabled()
+        {
+            let game_dir = self
+                .config
+                .game_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            if crate::vanilla_bootstrap::discover_local_server_blocks(&game_dir).is_none() {
+                self.server_blocks_bootstrap =
+                    crate::vanilla_bootstrap::spawn_server_blocks_bootstrap(&game_dir);
+            }
+        }
         if self.vanilla_assets_bootstrap.is_some()
             || self.vanilla_assets_bootstrap_attempted
             || !crate::vanilla_bootstrap::auto_fetch_enabled()
@@ -6203,7 +6218,29 @@ impl GpuApp {
             "MEGU_LAZY_CATCHUP",
             lazy_catchup_env_value(settings.lazy_catchup_gameplay),
         );
-        integrated::launch(&cli)
+        if integrated::has_complete_runtime(&cli) {
+            return integrated::launch(&cli);
+        }
+        let session_paths = SessionPaths {
+            game_dir: config.game_dir.clone(),
+            assets_dir: config.assets_dir.clone(),
+            asset_index: config.asset_index.clone(),
+            version_id: config.version_id.clone(),
+            resource_pack_dir: config.resource_pack_dir.clone(),
+            server_mods_dir: None,
+        };
+        let vanilla_jar = crate::vanilla_bootstrap::discover_local_vanilla_jar(&session_paths);
+        let game_dir = cli
+            .game_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let blocks_json = crate::vanilla_bootstrap::discover_or_bootstrap_blocks_json(&game_dir)
+            .ok();
+        integrated::launch_with_runtime_assets(
+            &cli,
+            vanilla_jar.as_deref(),
+            blocks_json.as_deref(),
+        )
     }
 
     /// Title Singleplayer: launch the integrated loopback world named by
