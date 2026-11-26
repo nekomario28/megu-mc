@@ -225,7 +225,14 @@ def scan(root):
         rel_posix = rel.as_posix()
         if rel_posix == CANONICAL:
             continue
-        code = production_code(path.read_text(errors="replace"))
+        text = path.read_text(errors="replace")
+        # This raw-text prefilter is only a necessary-condition check:
+        # masking can remove tokens but cannot create a scalar const match.
+        # Comments/strings with candidate syntax still go through the
+        # unchanged production-code matcher before anything is reported.
+        if not CONST_ITEM.search(text):
+            continue
+        code = production_code(text)
         for match in CONST_ITEM.finditer(code):
             symbol, raw_value = match.group(1), match.group(2)
             if not VERSION_AXIS.search(symbol):

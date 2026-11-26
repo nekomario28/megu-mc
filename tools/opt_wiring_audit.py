@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import json
+from functools import lru_cache
 from pathlib import Path
 import re
 import sys
@@ -224,6 +225,7 @@ def _is_fn_definition(code, match_start):
     return bool(re.search(r"\bfn\s+$", prefix))
 
 
+@lru_cache(maxsize=None)
 def call_sites(code, name):
     """Positions of non-definition `name(` occurrences in masked code."""
     out = []
