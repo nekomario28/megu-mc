@@ -34,6 +34,8 @@ pub enum LoadError {
     SignatureMismatch(String),
     /// `megu_abi_version` returned a version this runtime cannot drive.
     UnsupportedAbi(i32),
+    /// The imports need a contract revision beyond the host's limit.
+    UnsupportedContract { required: u32, supported: u32 },
     /// The archive container (`.mmod`/`.jar`) could not be read.
     Archive(String),
     /// A declared limit exceeds the configured budget (memory pages,
@@ -50,6 +52,9 @@ impl fmt::Display for LoadError {
             LoadError::MissingExport(n) => write!(f, "missing required export `{n}`"),
             LoadError::SignatureMismatch(m) => write!(f, "ABI signature mismatch: {m}"),
             LoadError::UnsupportedAbi(v) => write!(f, "unsupported ABI version {v}"),
+            LoadError::UnsupportedContract { required, supported } => {
+                write!(f, "contract revision {required} exceeds host revision {supported}")
+            }
             LoadError::Archive(m) => write!(f, "archive error: {m}"),
             LoadError::LimitExceeded(m) => write!(f, "declared limit exceeds budget: {m}"),
         }
@@ -66,6 +71,12 @@ pub enum Trap {
     Unreachable,
     /// The per-call fuel budget ran out (infinite loops die here).
     FuelExhausted,
+    /// A host watchdog advanced the epoch of the running plugin.
+    EpochExceeded,
+    /// A key, value, or store size exceeded the plugin's KV limits.
+    KvLimitExceeded,
+    /// A candidate tried to mutate the live host during isolated startup.
+    StagedHostMutation { import: &'static str },
     /// Linear-memory access outside the allocated region.
     MemoryOutOfBounds { addr: u64, len: u64 },
     /// `memory.grow` or initial data exceeded the memory cap.
@@ -93,6 +104,11 @@ impl fmt::Display for Trap {
         match self {
             Trap::Unreachable => write!(f, "guest executed `unreachable`"),
             Trap::FuelExhausted => write!(f, "fuel budget exhausted"),
+            Trap::EpochExceeded => write!(f, "execution interrupted by the plugin watchdog"),
+            Trap::KvLimitExceeded => write!(f, "plugin KV limit exceeded"),
+            Trap::StagedHostMutation { import } => {
+                write!(f, "host mutation `{import}` unavailable during isolated startup")
+            }
             Trap::MemoryOutOfBounds { addr, len } => {
                 write!(f, "memory access out of bounds: addr={addr:#x} len={len:#x}")
             }
@@ -110,7 +126,7 @@ impl fmt::Display for Trap {
                 capability.manifest_key()
             ),
             Trap::HostMemoryAccess { ptr, len } => {
-                write!(f, "host string access out of bounds: ptr={ptr:#x} len={len:#x}")
+                write!(f, "host memory access out of bounds: ptr={ptr:#x} len={len:#x}")
             }
             Trap::StackOverflow => write!(f, "guest call depth exceeded bound"),
         }

@@ -3,12 +3,14 @@
 //! `WasmMod`: a loaded, instantiated, fault-isolated WASM mod.
 
 use crate::abi::{
-    CapabilitySet, HostBinding, MeguHost, ABI_VERSION, EXPORT_ABI_VERSION,
-    EXPORT_ON_BLOCK_INTERACT, EXPORT_ON_LOAD, EXPORT_ON_TICK,
+    CapabilitySet, HostBinding, MeguHost, ABI_VERSION, BASE_CONTRACT_REV, CURRENT_CONTRACT_REV,
+    EXPORT_ABI_VERSION, EXPORT_ON_BLOCK_INTERACT, EXPORT_ON_LOAD, EXPORT_ON_TICK,
 };
 use crate::decode::decode_module;
+use crate::epoch::EpochCheckpoint;
 use crate::error::{LoadError, ModFault, Trap};
 use crate::exec::{FuncAddr, Instance, LinearMem, Vm};
+use crate::kv::{PluginKvStore, TransactionalKvStore};
 use crate::module::{ConstExpr, ExternKind, ImportDesc, Module, ValType, Value};
 use crate::validate::validate;
 
@@ -68,90 +70,65 @@ fn expected_sig(name: &str) -> Option<(&'static [ValType], &'static [ValType])> 
     }
 }
 
-/// A loaded mod instance. Every entry point funnels through
-/// [`WasmMod::call_export`], which enforces fuel + quarantine semantics.
+/// A loaded mod instance with an owned host. The supervisor uses the same
+/// guest interpreter with a borrowed host and a store shared across generations.
 pub struct WasmMod {
-    inst: Instance,
+    guest: Guest,
     host: Box<dyn MeguHost>,
-    caps: CapabilitySet,
-    config: ModConfig,
-    quarantine: Option<ModFault>,
-    abi_version: i32,
+    kv: PluginKvStore,
 }
 
 impl WasmMod {
     /// Decode, validate, instantiate, and handshake a raw `.wasm` module.
     ///
-    /// Fails closed on: malformed/invalid binaries, non-function imports,
-    /// unknown or mis-signed host imports, absent `megu_abi_version`, a
-    /// version other than 1, or a trapping `start`/`megu_abi_version`
-    /// call.
+    /// Fails closed on malformed binaries, unknown or mis-signed imports,
+    /// absent or unsupported ABI versions, and traps during initialization.
+    /// Capability checks in this API take place when an import is called.
     pub fn from_wasm(
         bytes: &[u8],
-        host: Box<dyn MeguHost>,
+        mut host: Box<dyn MeguHost>,
         caps: CapabilitySet,
         config: ModConfig,
     ) -> Result<Self, ModFault> {
-        if bytes.len() > config.max_module_bytes {
-            return Err(LoadError::LimitExceeded("module byte size".into()).into());
-        }
-        let raw = decode_module(bytes)?;
-        let module = validate(raw)?;
-        check_export_signatures(&module)?;
-        let inst = instantiate(module, &config)?;
-        let mut m = WasmMod {
-            inst,
-            host,
-            caps,
-            config,
-            quarantine: None,
-            abi_version: -1,
+        let mut kv = PluginKvStore::new(Default::default());
+        let mut transaction = kv.transaction();
+        let mut context = CallContext {
+            host: host.as_mut(),
+            kv: &mut transaction,
+            epoch: None,
+            isolated: false,
         };
-
-        // Required handshake: `megu_abi_version` must exist and return 1.
-        let fuel = m.config.fuel_on_load;
-        let version = m.call_required(EXPORT_ABI_VERSION, &[], fuel)?;
-        m.abi_version = version;
-        if version != ABI_VERSION {
-            return Err(LoadError::UnsupportedAbi(version).into());
-        }
-
-        // Optional `start` runs under the load budget.
-        if let Some(start) = m.inst.module.start {
-            let fuel = m.config.fuel_on_load;
-            m.invoke(start, &[], fuel)?;
-        }
-        Ok(m)
+        let guest = Guest::prepare(bytes, caps, config, CURRENT_CONTRACT_REV, &mut context)?;
+        transaction.commit();
+        Ok(Self { guest, host, kv })
     }
 
-    /// The mod's declared capability set (from `megu-mod.toml` or the
-    /// caller's explicit grant).
+    /// The mod's capabilities from the manifest or caller's explicit grant.
     pub fn capabilities(&self) -> CapabilitySet {
-        self.caps
+        self.guest.caps
     }
 
-    /// ABI version reported by the guest (always 1 after a successful
-    /// load).
+    /// ABI version reported by the guest (always 1 after a successful load).
     pub fn abi_version(&self) -> i32 {
-        self.abi_version
+        self.guest.abi_version
     }
 
     /// The fault that quarantined this mod, if any.
     pub fn quarantined(&self) -> Option<&ModFault> {
-        self.quarantine.as_ref()
+        self.guest.quarantined()
     }
 
     /// `megu_on_load()` — missing export is a no-op returning 0.
     pub fn on_load(&mut self) -> Result<i32, ModFault> {
-        self.call_optional(EXPORT_ON_LOAD, &[], self.config.fuel_on_load)
+        self.call(EXPORT_ON_LOAD, &[], self.guest.config.fuel_on_load)
     }
 
     /// `megu_on_tick(tick)`.
     pub fn on_tick(&mut self, tick: i64) -> Result<i32, ModFault> {
-        self.call_optional(
+        self.call(
             EXPORT_ON_TICK,
             &[Value::I64(tick)],
-            self.config.fuel_per_tick,
+            self.guest.config.fuel_per_tick,
         )
     }
 
@@ -163,7 +140,7 @@ impl WasmMod {
         z: i32,
         player_id: i32,
     ) -> Result<i32, ModFault> {
-        self.call_optional(
+        self.call(
             EXPORT_ON_BLOCK_INTERACT,
             &[
                 Value::I32(x),
@@ -171,26 +148,111 @@ impl WasmMod {
                 Value::I32(z),
                 Value::I32(player_id),
             ],
-            self.config.fuel_per_event,
+            self.guest.config.fuel_per_event,
         )
     }
 
-    /// Direct access to the guest's exported function set (for wiring
-    /// additional events later without widening this struct).
+    /// Check whether the guest exports the named function.
     pub fn has_export(&self, name: &str) -> bool {
-        self.inst.module.export_func(name).is_some()
+        self.guest.inst.module.export_func(name).is_some()
     }
 
-    fn call_required(
-        &mut self,
-        name: &'static str,
-        args: &[Value],
-        fuel: u64,
-    ) -> Result<i32, ModFault> {
-        if self.inst.module.export_func(name).is_none() {
-            return Err(LoadError::MissingExport(name).into());
+    fn call(&mut self, name: &'static str, args: &[Value], fuel: u64) -> Result<i32, ModFault> {
+        let mut transaction = self.kv.transaction();
+        let mut context = CallContext {
+            host: self.host.as_mut(),
+            kv: &mut transaction,
+            epoch: None,
+            isolated: false,
+        };
+        let status = self.guest.call_optional(name, args, fuel, &mut context)?;
+        transaction.commit();
+        Ok(status)
+    }
+}
+
+pub(crate) struct CallContext<'a, 'kv> {
+    pub host: &'a mut dyn MeguHost,
+    pub kv: &'a mut TransactionalKvStore<'kv>,
+    pub epoch: Option<EpochCheckpoint<'a>>,
+    pub isolated: bool,
+}
+
+pub(crate) struct Guest {
+    inst: Instance,
+    caps: CapabilitySet,
+    config: ModConfig,
+    quarantine: Option<ModFault>,
+    abi_version: i32,
+}
+
+impl Guest {
+    pub(crate) fn prepare(
+        bytes: &[u8],
+        caps: CapabilitySet,
+        config: ModConfig,
+        max_contract_rev: u32,
+        context: &mut CallContext<'_, '_>,
+    ) -> Result<Self, ModFault> {
+        if bytes.len() > config.max_module_bytes {
+            return Err(LoadError::LimitExceeded("module byte size".into()).into());
         }
-        self.call_optional(name, args, fuel)
+        let raw = decode_module(bytes)?;
+        let module = validate(raw)?;
+        check_export_signatures(&module)?;
+        let inst = instantiate(
+            module,
+            &config,
+            context.isolated.then_some(caps),
+            max_contract_rev,
+        )?;
+        let mut guest = Self {
+            inst,
+            caps,
+            config,
+            quarantine: None,
+            abi_version: -1,
+        };
+
+        let fuel = guest.config.fuel_on_load;
+        if guest.inst.module.export_func(EXPORT_ABI_VERSION).is_none() {
+            return Err(LoadError::MissingExport(EXPORT_ABI_VERSION).into());
+        }
+        let version = guest.call_optional(EXPORT_ABI_VERSION, &[], fuel, context)?;
+        if version != ABI_VERSION {
+            return Err(LoadError::UnsupportedAbi(version).into());
+        }
+        guest.abi_version = version;
+
+        if let Some(start) = guest.inst.module.start {
+            guest.invoke(start, &[], fuel, context)?;
+        }
+        Ok(guest)
+    }
+
+    pub(crate) fn contract_rev(&self) -> u32 {
+        self.inst.contract_rev
+    }
+
+    pub(crate) fn quarantined(&self) -> Option<&ModFault> {
+        self.quarantine.as_ref()
+    }
+
+    pub(crate) fn on_load(&mut self, context: &mut CallContext<'_, '_>) -> Result<i32, ModFault> {
+        self.call_optional(EXPORT_ON_LOAD, &[], self.config.fuel_on_load, context)
+    }
+
+    pub(crate) fn on_tick(
+        &mut self,
+        tick: i64,
+        context: &mut CallContext<'_, '_>,
+    ) -> Result<i32, ModFault> {
+        self.call_optional(
+            EXPORT_ON_TICK,
+            &[Value::I64(tick)],
+            self.config.fuel_per_tick,
+            context,
+        )
     }
 
     fn call_optional(
@@ -198,16 +260,15 @@ impl WasmMod {
         name: &'static str,
         args: &[Value],
         fuel: u64,
+        context: &mut CallContext<'_, '_>,
     ) -> Result<i32, ModFault> {
         if self.quarantine.is_some() {
             return Err(ModFault::Quarantined);
         }
-        // Optional entry points are no-ops when the mod does not export
-        // them — `megu_abi_version` is the only required one.
         let Some(fidx) = self.inst.module.export_func(name) else {
             return Ok(0);
         };
-        match self.invoke(fidx, args, fuel) {
+        match self.invoke(fidx, args, fuel, context) {
             Ok(results) => Ok(results.first().map_or(0, |v| v.i32())),
             Err(t) => {
                 let fault = ModFault::Trap(t);
@@ -217,14 +278,23 @@ impl WasmMod {
         }
     }
 
-    fn invoke(&mut self, fidx: u32, args: &[Value], fuel: u64) -> Result<Vec<Value>, Trap> {
+    fn invoke(
+        &mut self,
+        fidx: u32,
+        args: &[Value],
+        fuel: u64,
+        context: &mut CallContext<'_, '_>,
+    ) -> Result<Vec<Value>, Trap> {
         let mut vm = Vm {
             m: &self.inst.module,
             funcs: &self.inst.funcs,
             mem: &mut self.inst.mem,
             globals: &mut self.inst.globals,
             table: &mut self.inst.table,
-            host: self.host.as_mut(),
+            host: &mut *context.host,
+            kv: &mut *context.kv,
+            epoch: context.epoch,
+            isolated: context.isolated,
             caps: self.caps,
             fuel,
             max_frames: self.config.max_frames,
@@ -238,24 +308,42 @@ impl WasmMod {
 
 /// Build the runtime instance: resolve imports, allocate memory/globals/
 /// table, apply element and data segments (bounds-checked).
-fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError> {
+fn instantiate(
+    module: Module,
+    config: &ModConfig,
+    required_grants: Option<CapabilitySet>,
+    max_contract_rev: u32,
+) -> Result<Instance, ModFault> {
     // Resolve every import against the ABI v1 host binding table.
     let mut funcs: Vec<FuncAddr> = Vec::new();
+    let mut contract_rev = BASE_CONTRACT_REV;
     for imp in &module.imports {
         let ImportDesc::Func(ty_idx) = imp.desc else {
             return Err(LoadError::Unsupported(format!(
                 "non-function import `{}.{}`",
                 imp.module, imp.name
-            )));
+            ))
+            .into());
         };
         let ft = &module.types[ty_idx as usize];
         let binding = HostBinding::resolve(&imp.module, &imp.name, &ft.params, &ft.results)
             .map_err(LoadError::SignatureMismatch)?;
+        if let (Some(caps), Some(capability)) = (required_grants, binding.capability()) {
+            caps.require(capability, binding.name())?;
+        }
+        contract_rev = contract_rev.max(binding.contract_rev());
         funcs.push(FuncAddr::Host {
             binding,
             params: ft.params.len(),
             results: ft.results.len(),
         });
+    }
+    if contract_rev > max_contract_rev {
+        return Err(LoadError::UnsupportedContract {
+            required: contract_rev,
+            supported: max_contract_rev,
+        }
+        .into());
     }
     for ty_idx in &module.func_types {
         let ft = &module.types[*ty_idx as usize];
@@ -271,9 +359,7 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
         Some(decl) => {
             let hard_max = config.max_mem_pages.min(MAX_MEM_PAGES_HARD_CAP);
             if decl.limits.min > hard_max {
-                return Err(LoadError::LimitExceeded(
-                    "memory minimum exceeds cap".into(),
-                ));
+                return Err(LoadError::LimitExceeded("memory minimum exceeds cap".into()).into());
             }
             let max_pages = decl.limits.max.unwrap_or(hard_max).min(hard_max);
             LinearMem {
@@ -307,7 +393,7 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
         Some(t) => {
             const MAX_TABLE: u32 = 1_000_000;
             if t.limits.min > MAX_TABLE {
-                return Err(LoadError::LimitExceeded("table size".into()));
+                return Err(LoadError::LimitExceeded("table size".into()).into());
             }
             vec![None; t.limits.min as usize]
         }
@@ -315,6 +401,7 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
     };
 
     let mut inst = Instance {
+        contract_rev,
         module,
         funcs,
         mem,
@@ -325,12 +412,12 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
     // Element segments.
     for e in &inst.module.elems {
         let ConstExpr::I32(off) = e.offset else {
-            return Err(LoadError::Invalid("elem offset not i32".into()));
+            return Err(LoadError::Invalid("elem offset not i32".into()).into());
         };
         let base = off as u32 as usize;
         let end = base.saturating_add(e.funcs.len());
         if end > inst.table.len() {
-            return Err(LoadError::Invalid("elem segment out of bounds".into()));
+            return Err(LoadError::Invalid("elem segment out of bounds".into()).into());
         }
         for (i, f) in e.funcs.iter().enumerate() {
             inst.table[base + i] = Some(*f);
@@ -340,12 +427,12 @@ fn instantiate(module: Module, config: &ModConfig) -> Result<Instance, LoadError
     // Data segments.
     for d in &inst.module.datas {
         let ConstExpr::I32(off) = d.offset else {
-            return Err(LoadError::Invalid("data offset not i32".into()));
+            return Err(LoadError::Invalid("data offset not i32".into()).into());
         };
         let base = off as u32 as usize;
         let end = base.saturating_add(d.bytes.len());
         if end > inst.mem.data.len() {
-            return Err(LoadError::Invalid("data segment out of bounds".into()));
+            return Err(LoadError::Invalid("data segment out of bounds".into()).into());
         }
         inst.mem.data[base..end].copy_from_slice(&d.bytes);
     }

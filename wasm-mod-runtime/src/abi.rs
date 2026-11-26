@@ -54,6 +54,20 @@ pub const IMPORT_BUMP_BLOCK: &str = "megu_bump_block";
 /// Retained-UI invalidation: `megu_ui_mark_dirty(layer: u32) -> i32`.
 /// Only `UiLayer::ModHud` (5) and `UiLayer::ModOverlay` (6) are accepted.
 pub const IMPORT_UI_MARK_DIRTY: &str = "megu_ui_mark_dirty";
+/// `host_kv_get(key_ptr, key_len, out_ptr, out_capacity) -> i32`.
+/// Returns -1 for a missing key, otherwise the value length. The value is
+/// copied into guest memory only when the output capacity is sufficient.
+pub const IMPORT_KV_GET: &str = "host_kv_get";
+/// `host_kv_set(key_ptr, key_len, value_ptr, value_len) -> i32`.
+/// Returns 0 on success. Exceeding a store limit traps the caller.
+pub const IMPORT_KV_SET: &str = "host_kv_set";
+/// `host_kv_delete(key_ptr, key_len) -> i32`. Returns 1 if a key was
+/// removed and 0 if it was absent.
+pub const IMPORT_KV_DELETE: &str = "host_kv_delete";
+
+pub(crate) const BASE_CONTRACT_REV: u32 = 1;
+pub(crate) const KV_CONTRACT_REV: u32 = 2;
+pub(crate) const CURRENT_CONTRACT_REV: u32 = KV_CONTRACT_REV;
 
 /// Guest return-code convention: `>= 0` is success, `< 0` is a
 /// mod-reported soft error (logged, not trapped).
@@ -74,6 +88,12 @@ pub enum Capability {
     EntityEvents,
     /// `megu_ui_mark_dirty` for mod-owned HUD/overlay surfaces.
     UiSurface,
+    /// Read and write blocks and their canonical spine revisions.
+    BlockRegistry,
+    /// Access the guest's private, transactional key-value store.
+    KvStore,
+    /// Reserved for command registration.
+    Commands,
 }
 
 impl Capability {
@@ -86,22 +106,30 @@ impl Capability {
             Capability::ChatBroadcast => "chat_broadcast",
             Capability::EntityEvents => "entity_events",
             Capability::UiSurface => "ui_surface",
+            Capability::BlockRegistry => "block_registry",
+            Capability::KvStore => "kv_store",
+            Capability::Commands => "commands",
         }
     }
 
-    /// Inverse of [`manifest_key`](Self::manifest_key).
+    /// Resolve a versionless key, including legacy manifest spellings.
     pub fn from_manifest_key(key: &str) -> Option<Self> {
         match key {
             "read_blocks" => Some(Capability::ReadBlocks),
             "write_blocks" => Some(Capability::WriteBlocks),
             "register_recipes" => Some(Capability::RegisterRecipes),
-            "chat_broadcast" => Some(Capability::ChatBroadcast),
-            "entity_events" => Some(Capability::EntityEvents),
-            "ui_surface" => Some(Capability::UiSurface),
+            "chat" | "chat_broadcast" => Some(Capability::ChatBroadcast),
+            "events" | "entity_events" => Some(Capability::EntityEvents),
+            "ui_overlay" | "ui_surface" => Some(Capability::UiSurface),
+            "block_registry" => Some(Capability::BlockRegistry),
+            "kv_store" => Some(Capability::KvStore),
+            "commands" => Some(Capability::Commands),
             _ => None,
         }
     }
 
+    /// Capabilities in the original runtime API. Iterate
+    /// [`CapabilitySet::all`] for the full set supported by this runtime.
     pub const ALL: [Capability; 6] = [
         Capability::ReadBlocks,
         Capability::WriteBlocks,
@@ -110,6 +138,12 @@ impl Capability {
         Capability::EntityEvents,
         Capability::UiSurface,
     ];
+
+    const PLUGIN_ADDITIONS: [Capability; 3] = [Self::BlockRegistry, Self::KvStore, Self::Commands];
+
+    fn supported() -> impl Iterator<Item = Capability> {
+        Self::ALL.into_iter().chain(Self::PLUGIN_ADDITIONS)
+    }
 }
 
 /// The set of capabilities a mod has been granted. Construction is by
@@ -122,11 +156,7 @@ impl CapabilitySet {
     pub const NONE: CapabilitySet = CapabilitySet(0);
 
     pub fn all() -> Self {
-        let mut s = CapabilitySet(0);
-        for c in Capability::ALL {
-            s = s.granted(c);
-        }
-        s
+        Capability::supported().fold(Self::NONE, Self::granted)
     }
 
     pub fn granted(mut self, c: Capability) -> Self {
@@ -135,7 +165,17 @@ impl CapabilitySet {
     }
 
     pub fn has(self, c: Capability) -> bool {
-        self.0 & (1 << c as u32) != 0
+        let mut mask = 1 << c as u32;
+        if matches!(c, Capability::ReadBlocks | Capability::WriteBlocks) {
+            mask |= 1 << Capability::BlockRegistry as u32;
+        }
+        self.0 & mask != 0
+    }
+
+    pub(crate) fn intersection(self, other: Self) -> Self {
+        self.iter()
+            .filter(|&cap| other.has(cap))
+            .fold(Self::NONE, Self::granted)
     }
 
     /// Fail closed: returns [`Trap::CapabilityDenied`] when `c` is absent.
@@ -166,7 +206,7 @@ impl CapabilitySet {
 
     /// All granted capabilities, ordered by enum discriminant.
     pub fn iter(self) -> impl Iterator<Item = Capability> {
-        Capability::ALL.into_iter().filter(move |c| self.has(*c))
+        Capability::supported().filter(move |c| self.has(*c))
     }
 }
 
@@ -289,9 +329,39 @@ pub(crate) enum HostBinding {
     ChunkRev,
     BumpBlock,
     UiMarkDirty,
+    KvGet,
+    KvSet,
+    KvDelete,
 }
 
 impl HostBinding {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Log => IMPORT_LOG,
+            Self::GetBlock => IMPORT_GET_BLOCK,
+            Self::SetBlock => IMPORT_SET_BLOCK,
+            Self::EmitChat => IMPORT_EMIT_CHAT,
+            Self::SectionRev => IMPORT_SECTION_REV,
+            Self::ChunkRev => IMPORT_CHUNK_REV,
+            Self::BumpBlock => IMPORT_BUMP_BLOCK,
+            Self::UiMarkDirty => IMPORT_UI_MARK_DIRTY,
+            Self::KvGet => IMPORT_KV_GET,
+            Self::KvSet => IMPORT_KV_SET,
+            Self::KvDelete => IMPORT_KV_DELETE,
+        }
+    }
+
+    pub(crate) fn contract_rev(self) -> u32 {
+        match self {
+            Self::KvGet | Self::KvSet | Self::KvDelete => KV_CONTRACT_REV,
+            _ => BASE_CONTRACT_REV,
+        }
+    }
+
+    pub(crate) fn mutates_host(self) -> bool {
+        matches!(self, Self::SetBlock | Self::EmitChat | Self::BumpBlock | Self::UiMarkDirty)
+    }
+
     /// Capability that gates this import; `None` for `host_log`, which
     /// is ungated (logging cannot mutate world state).
     pub(crate) fn capability(self) -> Option<Capability> {
@@ -303,6 +373,9 @@ impl HostBinding {
             HostBinding::SectionRev | HostBinding::ChunkRev => Some(Capability::ReadBlocks),
             HostBinding::BumpBlock => Some(Capability::WriteBlocks),
             HostBinding::UiMarkDirty => Some(Capability::UiSurface),
+            HostBinding::KvGet | HostBinding::KvSet | HostBinding::KvDelete => {
+                Some(Capability::KvStore)
+            }
         }
     }
 
@@ -327,6 +400,9 @@ impl HostBinding {
             IMPORT_CHUNK_REV => (HostBinding::ChunkRev, &[I32, I32, I32], &[I64]),
             IMPORT_BUMP_BLOCK => (HostBinding::BumpBlock, &[I32, I32, I32, I32], &[I64]),
             IMPORT_UI_MARK_DIRTY => (HostBinding::UiMarkDirty, &[I32], &[I32]),
+            IMPORT_KV_GET => (HostBinding::KvGet, &[I32, I32, I32, I32], &[I32]),
+            IMPORT_KV_SET => (HostBinding::KvSet, &[I32, I32, I32, I32], &[I32]),
+            IMPORT_KV_DELETE => (HostBinding::KvDelete, &[I32, I32], &[I32]),
             _ => return Err(format!("unknown import `{module}.{name}`")),
         };
         if params != want_p || results != want_r {
