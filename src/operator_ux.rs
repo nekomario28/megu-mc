@@ -4165,8 +4165,7 @@ impl RestartCountdownController {
     }
 
     fn ceil_secs(ticks: u64) -> u64 {
-        let tps = u64::from(TICKS_PER_SECOND);
-        ticks / tps + u64::from(ticks % tps != 0)
+        ticks.div_ceil(u64::from(TICKS_PER_SECOND))
     }
 
     /// Seconds remaining, rounded up to the player-visible whole second.
