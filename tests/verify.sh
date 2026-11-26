@@ -143,6 +143,7 @@ python3 tests/mod_suite_live_wire.py --self-test
 python3 tests/client_oracle_fuzz_wire.py --self-test
 python3 tests/multiplayer_stress_wire.py --self-test
 python3 tests/survival_journey_regression_wire.py --self-test
+python3 tests/survival_playthrough_e2e.py --self-test
 python3 tests/chaos_midplay_stress_wire.py --self-test
 python3 tests/client_parity_gate_test.py
 # The vertical-slice wiring audit is a real gate, not a report: it fails on any
