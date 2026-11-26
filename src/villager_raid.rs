@@ -1886,6 +1886,154 @@ fn detect_golem_construction<'a>(
     None
 }
 
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+struct WitherPatternMatch {
+    /// The seven non-air construction cells: three skulls followed by the four
+    /// soul blocks in vanilla pattern order. The two required air cells are
+    /// validated but intentionally not consumed.
+    consumed: [BlockPos; 7],
+    spawn_pos: [f64; 3],
+    yaw: f32,
+    forwards: [i32; 3],
+    up: [i32; 3],
+}
+
+fn wither_pattern_name(name: &str) -> &str {
+    name.strip_prefix("minecraft:").unwrap_or(name)
+}
+
+fn wither_pattern_soul_base(name: &str) -> bool {
+    matches!(wither_pattern_name(name), "soul_sand" | "soul_soil")
+}
+
+fn wither_pattern_skull(name: &str) -> bool {
+    matches!(
+        wither_pattern_name(name),
+        "wither_skeleton_skull" | "wither_skeleton_wall_skull"
+    )
+}
+
+fn wither_pattern_air(name: &str) -> bool {
+    matches!(wither_pattern_name(name), "air" | "cave_air" | "void_air")
+}
+
+fn wither_vec_mul(v: [i32; 3], n: i32) -> [i32; 3] {
+    v.map(|axis| axis * n)
+}
+
+fn wither_vec_add(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn wither_vec_sub(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn wither_vec_cross(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn wither_vec_dot(a: [i32; 3], b: [i32; 3]) -> i32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn wither_pos_vec(pos: BlockPos) -> [i32; 3] {
+    [pos.0, pos.1, pos.2]
+}
+
+fn wither_vec_pos(v: [i32; 3]) -> BlockPos {
+    (v[0], v[1], v[2])
+}
+
+/// `BlockPattern.translateAndRotate` for the single-depth wither pattern:
+/// width runs along `forwards x up`, height runs opposite `up`, and depth zero
+/// leaves no `forwards` offset.
+fn wither_pattern_translate(
+    front_top_left: BlockPos,
+    forwards: [i32; 3],
+    up: [i32; 3],
+    width: i32,
+    height: i32,
+) -> BlockPos {
+    let right = wither_vec_cross(forwards, up);
+    let mut pos = wither_pos_vec(front_top_left);
+    pos = wither_vec_sub(pos, wither_vec_mul(up, height));
+    pos = wither_vec_add(pos, wither_vec_mul(right, width));
+    wither_vec_pos(pos)
+}
+
+/// Match vanilla `WitherSkullBlock`'s full pattern (`^^^`/`###`/`~#~`) in every
+/// `BlockPattern` orientation: upright, upside-down, and sideways on either the
+/// X or Z axis. `skull_pos` may be any of the three skull cells, matching the
+/// placement-triggered lookup. The exact seven non-air cells are returned for
+/// atomic consumption; the two `~` cells must already be air and stay untouched.
+#[cfg_attr(not(test), allow(dead_code))]
+fn detect_wither_pattern<'a>(
+    get_block: impl Fn(i32, i32, i32) -> &'a str,
+    skull_pos: (i32, i32, i32),
+) -> Option<WitherPatternMatch> {
+    if !wither_pattern_skull(get_block(skull_pos.0, skull_pos.1, skull_pos.2)) {
+        return None;
+    }
+    const DIRECTIONS: [[i32; 3]; 6] = [
+        [0, 1, 0],  // up
+        [0, -1, 0], // down
+        [0, 0, -1], // north
+        [0, 0, 1],  // south
+        [-1, 0, 0], // west
+        [1, 0, 0],  // east
+    ];
+    let skull_vec = wither_pos_vec(skull_pos);
+    for forwards in DIRECTIONS {
+        for up in DIRECTIONS {
+            if wither_vec_dot(forwards, up) != 0 {
+                continue;
+            }
+            let right = wither_vec_cross(forwards, up);
+            for skull_slot in 0..3 {
+                let origin_vec = wither_vec_sub(skull_vec, wither_vec_mul(right, skull_slot));
+                let origin = wither_vec_pos(origin_vec);
+                let at = |width: i32, height: i32| {
+                    wither_pattern_translate(origin, forwards, up, width, height)
+                };
+                let skulls = [at(0, 0), at(1, 0), at(2, 0)];
+                let soul_row = [at(0, 1), at(1, 1), at(2, 1)];
+                let stem = at(1, 2);
+                let air_cells = [at(0, 2), at(2, 2)];
+                if !skulls.iter().all(|&(x, y, z)| wither_pattern_skull(get_block(x, y, z)))
+                    || !soul_row.iter().all(|&(x, y, z)| wither_pattern_soul_base(get_block(x, y, z)))
+                    || !wither_pattern_soul_base(get_block(stem.0, stem.1, stem.2))
+                    || !air_cells.iter().all(|&(x, y, z)| wither_pattern_air(get_block(x, y, z)))
+                {
+                    continue;
+                }
+                return Some(WitherPatternMatch {
+                    consumed: [
+                        skulls[0], skulls[1], skulls[2],
+                        soul_row[0], soul_row[1], soul_row[2],
+                        stem,
+                    ],
+                    spawn_pos: [
+                        stem.0 as f64 + 0.5,
+                        stem.1 as f64 + 0.55,
+                        stem.2 as f64 + 0.5,
+                    ],
+                    yaw: if forwards[0] != 0 { 0.0 } else { 90.0 },
+                    forwards,
+                    up,
+                });
+            }
+        }
+    }
+    None
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, Default)]
 struct IronGolemState {
@@ -3480,6 +3628,150 @@ fn trade_cost(item_name: &str, count: i32) -> Option<ItemCost> {
     Some(ItemCost { item: name_to_item(item_name)?, count, components: Vec::new() })
 }
 
+/// Highest legal level of each 1.21.1 enchantment registry id. Trade factories
+/// clamp their random level to this table instead of inventing impossible
+/// enchantment instances.
+fn trade_enchantment_max_level(id: i64) -> i64 {
+    match id {
+        0 | 2 | 12 | 16 | 23 | 31 | 33 | 35 | 37 | 40 | 41 => 1,
+        10 | 14 | 17 => 2,
+        7 | 13 | 18 | 19 | 20 | 21 | 29 | 30 | 36 | 39 => 3,
+        3 | 4 | 9 | 11 | 24 | 26 | 27 => 4,
+        1 | 6 | 8 | 15 | 22 | 25 | 32 | 34 | 38 => 5,
+        _ => 1,
+    }
+}
+
+/// Vanilla's `double_trade_price` enchantment tag: treasure enchantments cost
+/// twice the rolled emerald price in librarian book trades.
+fn trade_enchantment_double_price(id: i64) -> bool {
+    matches!(id, 2 | 14 | 22 | 35 | 37 | 40 | 41)
+}
+
+/// Pick one legal equipment enchantment for the traded item. The 5..19
+/// enchantment cost drives both the enchantment choice and the level so cheap
+/// rolls cannot mint maximum-level equipment.
+fn trade_tool_enchantment(item: i64, roll: u32) -> Option<(i64, i64)> {
+    let cost = 5 + (roll % 15) as i64;
+    let start = ((roll / 15) % 42) as i64;
+    for offset in 0..42 {
+        let id = (start + offset) % 42;
+        if enchant_applicable(item, id) {
+            let max = trade_enchantment_max_level(id);
+            let level = (1 + (cost / 5) % max).clamp(1, max);
+            return Some((id, level));
+        }
+    }
+    None
+}
+
+/// Tradeable book enchantments exclude the two curses. The level is clamped to
+/// the enchantment's own maximum, as `EnchantBookForEmeralds` does.
+fn trade_book_enchantment(roll: u32) -> (i64, i64) {
+    const TRADEABLE: &[i64] = &[
+        0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22,
+        23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 41,
+    ];
+    let id = TRADEABLE[(roll as usize / 5) % TRADEABLE.len()];
+    let max = trade_enchantment_max_level(id);
+    let level = 1 + (roll as i64 % max);
+    (id, level)
+}
+
+/// `minecraft:suspicious_stew_effects` entries are varint pairs of the
+/// one-based mob-effect registry id and the effect duration in game ticks.
+fn trade_stew_effects_data(roll: u32) -> Vec<u8> {
+    // Farmer expert trades in vanilla order: night vision, jump boost,
+    // weakness, blindness, poison, saturation with 100/160/140/120/280/7 ticks.
+    const EFFECTS: &[(i64, i64)] = &[(16, 100), (8, 160), (18, 140), (15, 120), (19, 280), (23, 7)];
+    let (id, duration) = EFFECTS[(roll as usize / 7) % EFFECTS.len()];
+    let mut data = Vec::new();
+    write_varint(&mut data, 1);
+    write_varint(&mut data, id);
+    write_varint(&mut data, duration);
+    data
+}
+
+/// Average one to three vanilla dye colors using the same bit-mixing shape as
+/// `DyedItemColor.applyDyes`; the returned payload is RGB plus `show_in_tooltip`.
+fn trade_dyed_color_data(roll: u32) -> Vec<u8> {
+    let mut colors = vec![DYE_RGB[(roll as usize) % 16]];
+    if (roll % 100) > 70 {
+        colors.push(DYE_RGB[((roll / 16) as usize) % 16]);
+    }
+    if (roll % 100) > 80 {
+        colors.push(DYE_RGB[((roll / 256) as usize) % 16]);
+    }
+    let (mut r, mut g, mut b) = (0i64, 0i64, 0i64);
+    for color in &colors {
+        r += (color >> 16) & 0xff;
+        g += (color >> 8) & 0xff;
+        b += color & 0xff;
+    }
+    let n = colors.len() as i64;
+    dyed_color_data(((r / n) << 16) | ((g / n) << 8) | (b / n))
+}
+
+/// Encode a potion holder-only `minecraft:potion_contents` patch:
+/// optional holder present, no custom color, no custom effects, no custom name.
+fn trade_potion_contents_data(roll: u32) -> Option<Vec<u8>> {
+    // Fletcher master arrows use any brewable non-empty potion. Prefer the
+    // combat-useful vanilla potions over water/mundane/thick/awkward bases.
+    const NAMES: &[&str] = &[
+        "night_vision", "invisibility", "leaping", "fire_resistance", "swiftness", "slowness",
+        "turtle_master", "water_breathing", "healing", "harming", "poison", "regeneration",
+        "strength", "weakness", "slow_falling", "wind_charged", "weaving", "oozing", "infested",
+    ];
+    let name = NAMES[(roll as usize / 11) % NAMES.len()];
+    let id = LIVE_POTIONS.iter().position(|&(candidate, _)| candidate == name)? as i64;
+    let mut data = vec![1];
+    write_varint(&mut data, id);
+    data.extend_from_slice(&[0, 0, 0]);
+    Some(data)
+}
+
+/// A translation text component encoded as anonymous network NBT.
+fn trade_translate_text_data(key: &str) -> Vec<u8> {
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        crate::nbt::NbtString::text("translate"),
+        crate::nbt::Tag::String(crate::nbt::NbtString::text(key)),
+    );
+    crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(fields)).unwrap_or_else(|_| nbt_string(key))
+}
+
+/// The three cartographer treasure-map trades carry their destination marker
+/// and translated item name in addition to the allocated map id.
+fn trade_map_components(price: i32) -> Comps {
+    let (name_key, decoration_type) = match price {
+        13 => ("filled_map.monument", "minecraft:ocean_monument"),
+        14 => ("filled_map.mansion", "minecraft:woodland_mansion"),
+        _ => ("filled_map.trial_chambers", "minecraft:trial_chambers"),
+    };
+    let mut decoration = std::collections::BTreeMap::new();
+    decoration.insert(
+        crate::nbt::NbtString::text("type"),
+        crate::nbt::Tag::String(crate::nbt::NbtString::text(decoration_type)),
+    );
+    decoration.insert(crate::nbt::NbtString::text("x"), crate::nbt::Tag::Double(0.0f64.to_bits()));
+    decoration.insert(crate::nbt::NbtString::text("z"), crate::nbt::Tag::Double(0.0f64.to_bits()));
+    decoration.insert(crate::nbt::NbtString::text("rotation"), crate::nbt::Tag::Float(0.0f32.to_bits()));
+    let mut decorations = std::collections::BTreeMap::new();
+    decorations.insert(
+        crate::nbt::NbtString::text("target"),
+        crate::nbt::Tag::Compound(decoration),
+    );
+    let decoration_data = crate::nbt::write_network_nbt(&crate::nbt::Tag::Compound(decorations))
+        .unwrap_or_else(|_| vec![10, 0]);
+    let mut map_id = Vec::new();
+    write_varint(&mut map_id, live_next_map_id());
+    vec![
+        (COMP_MAP_ID, map_id),
+        (COMP_MAP_DECORATIONS, decoration_data),
+        (COMP_ITEM_NAME, trade_translate_text_data(name_key)),
+    ]
+}
+
 /// Instantiate one vanilla trade factory. Enchantment and map NBT generation is
 /// owned by the item/component system; this preserves the exact item skeleton,
 /// stock, XP, multiplier, second cost, and Java price roll.
@@ -3496,9 +3788,12 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
             ("emerald", (bp.price + enchantment_cost).min(64), None, bp.result, 1)
         }
         TradeBlueprintKind::EnchantedBook => {
-            let level = 1 + (roll % 5) as i32;
-            let price = (2 + ((roll / 5) as i32 % (5 + level * 10)) + 3 * level).min(64);
-            ("emerald", price, Some(("book", 1)), "enchanted_book", 1)
+            let (enchantment, level) = trade_book_enchantment(roll);
+            let mut price = 2 + ((roll / 5) as i32 % (5 + level as i32 * 10)) + 3 * level as i32;
+            if trade_enchantment_double_price(enchantment) {
+                price *= 2;
+            }
+            ("emerald", price.min(64), Some(("book", 1)), "enchanted_book", 1)
         }
         TradeBlueprintKind::Map => ("emerald", bp.price, Some(("compass", 1)), bp.result, 1),
         TradeBlueprintKind::TippedArrow => ("emerald", bp.price, Some(("arrow", 5)), "tipped_arrow", 5),
@@ -3512,10 +3807,27 @@ fn instantiate_trade_blueprint(bp: TradeBlueprint, roll: u32) -> Option<Merchant
         name_to_item(result_name)?
     };
     let _ = emerald;
+    let components = match bp.kind {
+        TradeBlueprintKind::EnchantedTool => {
+            let (id, level) = trade_tool_enchantment(result_item, roll)?;
+            vec![(COMP_ENCHANTMENTS, enchantments_data(&[(id, level)], true))]
+        }
+        TradeBlueprintKind::EnchantedBook => {
+            let (id, level) = trade_book_enchantment(roll);
+            vec![(COMP_STORED_ENCHANTMENTS, enchantments_data(&[(id, level)], true))]
+        }
+        TradeBlueprintKind::DyedArmor => vec![(COMP_DYED_COLOR, trade_dyed_color_data(roll))],
+        TradeBlueprintKind::SuspiciousStew => {
+            vec![(COMP_SUSPICIOUS_STEW_EFFECTS, trade_stew_effects_data(roll))]
+        }
+        TradeBlueprintKind::TippedArrow => vec![(COMP_POTION_CONTENTS, trade_potion_contents_data(roll)?)],
+        TradeBlueprintKind::Map => trade_map_components(bp.price),
+        TradeBlueprintKind::Buy | TradeBlueprintKind::Sell | TradeBlueprintKind::Process => Vec::new(),
+    };
     Some(MerchantOffer {
         cost_a: trade_cost(cost_a_item, cost_a_count)?,
         cost_b: second.and_then(|(name, count)| trade_cost(name, count)),
-        result: (result_item, result_count.clamp(1, 255) as u8, Vec::new()),
+        result: (result_item, result_count.clamp(1, 255) as u8, components),
         uses: 0,
         max_uses: bp.max_uses,
         xp_reward: bp.xp,
@@ -4905,6 +5217,107 @@ fn eval_warden_summon(spawning_enabled: bool, warning_level: u8) -> bool {
     spawning_enabled && warning_level >= 4
 }
 
+const WARDEN_WARNING_COOLDOWN_TICKS: u64 = 200;
+const WARDEN_WARNING_DECAY_TICKS: u64 = 12_000;
+const WARDEN_DUPLICATE_CHECK_RADIUS: f64 = 48.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ShriekerTriggerResult {
+    warning_accepted: bool,
+    warning_level: u8,
+    spawn_warden: bool,
+    spawn_pos: Option<BlockPos>,
+}
+
+/// Accept at most one shrieker warning per player/shrieker pair in the vanilla
+/// 200-tick cooldown window. Movement while sneaking is not an accepted
+/// vibration source; passive proximity alone never reaches this function.
+fn accept_sculk_shrieker_warning(
+    state: &mut SpecialSpawnState,
+    player: VillageUuid,
+    shrieker_pos: BlockPos,
+    now_tick: u64,
+    is_sneaking: bool,
+) -> Option<u8> {
+    if is_sneaking
+        || now_tick < state.warden_warning_cooldowns.get(&player).copied().unwrap_or(0)
+        || now_tick < state.shrieker_cooldowns.get(&shrieker_pos).copied().unwrap_or(0)
+    {
+        return None;
+    }
+    let level = state.warden_warnings.entry(player).or_default();
+    *level = (*level + 1).min(4);
+    let level = *level;
+    let cooldown_end = now_tick.saturating_add(WARDEN_WARNING_COOLDOWN_TICKS);
+    state.warden_warning_cooldowns.insert(player, cooldown_end);
+    state.shrieker_cooldowns.insert(shrieker_pos, cooldown_end);
+    state.warden_warning_last.insert(player, now_tick);
+    Some(level)
+}
+
+/// Warning levels decay one step per vanilla ten-minute quiet interval. The
+/// passive tick also drops expired cooldown entries; it never creates warnings.
+fn passive_sculk_shrieker_maintenance(state: &mut SpecialSpawnState, now_tick: u64) {
+    let players: Vec<VillageUuid> = state.warden_warnings.keys().copied().collect();
+    for player in players {
+        let Some(level) = state.warden_warnings.get(&player).copied() else { continue };
+        if level == 0 {
+            state.warden_warnings.remove(&player);
+            state.warden_warning_last.remove(&player);
+            continue;
+        }
+        let last = state.warden_warning_last.get(&player).copied().unwrap_or(now_tick);
+        if now_tick.saturating_sub(last) >= WARDEN_WARNING_DECAY_TICKS {
+            let next = level - 1;
+            if next == 0 {
+                state.warden_warnings.remove(&player);
+                state.warden_warning_last.remove(&player);
+            } else {
+                state.warden_warnings.insert(player, next);
+                state.warden_warning_last.insert(player, last + WARDEN_WARNING_DECAY_TICKS);
+            }
+        }
+    }
+    state.warden_warning_cooldowns.retain(|_, until| *until > now_tick);
+    state.shrieker_cooldowns.retain(|_, until| *until > now_tick);
+}
+
+/// Apply one accepted shrieker activation. A nearby living warden suppresses
+/// only the duplicate summon, not the warning itself; a failed fourth warning
+/// stays at level four so a later activation can try again.
+fn process_sculk_shrieker_warning(
+    state: &mut SpecialSpawnState,
+    player: VillageUuid,
+    shrieker_pos: BlockPos,
+    now_tick: u64,
+    is_sneaking: bool,
+    warden_nearby: bool,
+    spawn_pos: Option<BlockPos>,
+) -> ShriekerTriggerResult {
+    let Some(level) = accept_sculk_shrieker_warning(
+        state,
+        player,
+        shrieker_pos,
+        now_tick,
+        is_sneaking,
+    ) else {
+        return ShriekerTriggerResult {
+            warning_level: state.warden_warnings.get(&player).copied().unwrap_or(0),
+            ..ShriekerTriggerResult::default()
+        };
+    };
+    // Warning level four is persistent (subject only to the normal ten-minute
+    // decay): vanilla does not reset it after a successful summon. The nearby
+    // warden check below is therefore what suppresses duplicate spawns.
+    let spawn_warden = eval_warden_summon(true, level) && !warden_nearby && spawn_pos.is_some();
+    ShriekerTriggerResult {
+        warning_accepted: true,
+        warning_level: level,
+        spawn_warden,
+        spawn_pos: spawn_pos.filter(|_| spawn_warden),
+    }
+}
+
 /// `PhantomSpawner`: phantoms circle a player whose `time_since_rest` passed
 /// 72000 ticks (three full days), at night, above the surface under open sky.
 fn eval_insomnia_spawn(time_since_rest: u64, night: bool, above_surface: bool, sky_visible: bool) -> bool {
@@ -4927,6 +5340,12 @@ struct SpecialSpawnState {
     time_since_rest: HashMap<VillageUuid, u64>,
     /// Per-player shrieker warning level (`WardenSpawnTracker`), 0..4.
     warden_warnings: HashMap<VillageUuid, u8>,
+    /// Tick when the player can accrue another shrieker warning.
+    warden_warning_cooldowns: HashMap<VillageUuid, u64>,
+    /// Last accepted warning tick, the basis of the ten-minute decay timer.
+    warden_warning_last: HashMap<VillageUuid, u64>,
+    /// Active 200-tick cooldown per shrieker block.
+    shrieker_cooldowns: HashMap<BlockPos, u64>,
 }
 
 impl Default for SpecialSpawnState {
@@ -4944,6 +5363,9 @@ impl Default for SpecialSpawnState {
             insomnia_next: 0,
             time_since_rest: HashMap::new(),
             warden_warnings: HashMap::new(),
+            warden_warning_cooldowns: HashMap::new(),
+            warden_warning_last: HashMap::new(),
+            shrieker_cooldowns: HashMap::new(),
         }
     }
 }
@@ -5057,6 +5479,115 @@ fn live_spawn_warden(dim: DimId, player_pos: (f64, f64, f64)) {
     };
     let yaw = world_rng::next_below(360) as f32;
     live_spawn_named(dim, "warden", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
+}
+
+/// Spawn the warden at a validated block position selected around the active
+/// shrieker. The y coordinate is the feet block, never a surface column derived
+/// from the player's position.
+#[cfg_attr(not(test), allow(dead_code))]
+fn live_spawn_warden_at(dim: DimId, pos: BlockPos) -> Option<Arc<Mob>> {
+    let yaw = world_rng::next_below(360) as f32;
+    live_spawn_named(
+        dim,
+        "warden",
+        (pos.0 as f64 + 0.5, pos.1 as f64, pos.2 as f64 + 0.5, yaw, 0.0),
+    )
+}
+
+/// Vanilla `WardenSpawnTracker.findSpawnPositionNear`: scan the shrieker-centred
+/// ±5 horizontal / ±6 vertical box and keep the nearest position with a solid
+/// support and two non-colliding body cells. The predicate seam keeps the scan
+/// itself deterministic and unit-testable.
+fn warden_spawn_position_in_box(
+    shrieker_pos: BlockPos,
+    mut spawnable: impl FnMut(BlockPos) -> bool,
+) -> Option<BlockPos> {
+    let mut candidates = Vec::new();
+    for dx in -5i32..=5 {
+        for dy in -6i32..=6 {
+            for dz in -5i32..=5 {
+                let pos = (shrieker_pos.0 + dx, shrieker_pos.1 + dy, shrieker_pos.2 + dz);
+                if spawnable(pos) {
+                    candidates.push((dx * dx + dy * dy + dz * dz, pos));
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|&(distance, pos)| (distance, pos));
+    candidates.first().map(|&(_, pos)| pos)
+}
+
+/// Live block-fact implementation of `warden_spawn_position_in_box`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn find_warden_spawn_position(dim: DimId, shrieker_pos: BlockPos) -> Option<BlockPos> {
+    let reg = crate::block_registry::breg()?;
+    warden_spawn_position_in_box(shrieker_pos, |(x, y, z)| {
+        live_spawn_clear(reg, dim, x, y, z)
+            && reg.is_collision_shape_full_block(block_at_dim(dim, x, y - 1, z))
+    })
+}
+
+/// Whether a living warden is inside the 48-block duplicate-summon suppression
+/// radius around the active shrieker.
+#[cfg_attr(not(test), allow(dead_code))]
+fn living_warden_near(dim: DimId, pos: BlockPos, radius: f64) -> bool {
+    let Some(warden_type) = name_to_etype("warden") else { return false };
+    let center = (pos.0 as f64 + 0.5, pos.1 as f64, pos.2 as f64 + 0.5);
+    let radius_sq = radius * radius;
+    mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+        mob.dim == dim && mob.etype == warden_type
+            && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+            && {
+                let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                (x - center.0).powi(2) + (y - center.1).powi(2) + (z - center.2).powi(2) <= radius_sq
+            }
+    })
+}
+
+/// Whether this exact block is a shrieker allowed to accrue warden warnings.
+#[cfg_attr(not(test), allow(dead_code))]
+fn can_summon_shrieker_at(dim: DimId, pos: BlockPos) -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    let state = block_at_dim(dim, pos.0, pos.1, pos.2);
+    reg.name_of(state) == "minecraft:sculk_shrieker"
+        && reg.get_prop(state, "can_summon").as_deref() == Some("true")
+}
+
+/// Event-driven entry point for shrieker vibrations, contact, non-sneaking
+/// movement, and actions. It returns whether the activation was accepted as a
+/// warning. Passive ticking deliberately has no path into this function.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn on_sculk_shrieker_vibration(
+    player_id: VillageUuid,
+    shrieker_pos: BlockPos,
+    is_sneaking: bool,
+    now_tick: u64,
+) -> bool {
+    if is_sneaking || gamerule_live_value("doWardenSpawning") == 0 {
+        return false;
+    }
+    let dim = DimId::Overworld;
+    if !can_summon_shrieker_at(dim, shrieker_pos) {
+        return false;
+    }
+    let spawn_pos = find_warden_spawn_position(dim, shrieker_pos);
+    let warden_nearby = living_warden_near(dim, shrieker_pos, WARDEN_DUPLICATE_CHECK_RADIUS);
+    let result = {
+        let mut state = special_spawn_state().lock().unwrap_or_else(|e| e.into_inner());
+        process_sculk_shrieker_warning(
+            &mut state,
+            player_id,
+            shrieker_pos,
+            now_tick,
+            is_sneaking,
+            warden_nearby,
+            spawn_pos,
+        )
+    };
+    if let Some(pos) = result.spawn_pos {
+        live_spawn_warden_at(dim, pos);
+    }
+    result.warning_accepted
 }
 
 /// Whether a `sculk_shrieker` with `can_summon=true` sits within 8 blocks of
@@ -5202,22 +5733,10 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
         }
     }
 
-    // `SculkShrieker` + `WardenSpawnTracker`: warning level 4 near a
-    // `can_summon` shrieker summons the warden. Warnings accrue on a
-    // twenty-tick cadence, matching the shrieker's own cooldown granularity.
-    if gamerule_live_value("doWardenSpawning") != 0 && now.is_multiple_of(20) {
-        for (uuid, pos, _) in &overworld_players {
-            let (bx, by, bz) = (pos.0.floor() as i32, pos.1.floor() as i32, pos.2.floor() as i32);
-            if can_summon_shrieker_near(DimId::Overworld, bx, by, bz) {
-                let level = state.warden_warnings.entry(*uuid).or_default();
-                *level = (*level + 1).min(4);
-                if eval_warden_summon(true, *level) {
-                    state.warden_warnings.insert(*uuid, 0);
-                    live_spawn_warden(DimId::Overworld, *pos);
-                }
-            }
-        }
-    }
+    // `WardenSpawnTracker` passive work is limited to ten-minute warning decay
+    // and expiry of active shrieker cooldowns. Warnings are fabricated only by
+    // `on_sculk_shrieker_vibration`, never by silent proximity in this tick.
+    passive_sculk_shrieker_maintenance(&mut state, now);
 }
 
 /// One game tick of live villager/raid work, called from `game_tick`. The
@@ -8311,4 +8830,338 @@ mod villager_raid_interact_dispatch_tests {
             None
         );
     }
+
+    fn trade_result_component(offer: &MerchantOffer, ty: i64) -> &[u8] {
+        comp_get(&offer.result.2, ty).expect("trade result component")
+    }
+
+    #[test]
+    fn trade_factories_emit_real_special_item_components() {
+        let tool = instantiate_trade_blueprint(tb_enchanted("diamond_sword", 8, 3, 30, 0.2), 137)
+            .expect("enchanted tool offer");
+        let enchanted = trade_result_component(&tool, COMP_ENCHANTMENTS);
+        let (count, mut cursor) = read_varint_at(enchanted, 0);
+        assert_eq!(count, 1, "one rolled tool enchantment");
+        let (enchantment, next) = read_varint_at(enchanted, cursor);
+        let (level, next) = read_varint_at(enchanted, next);
+        cursor = next;
+        assert!(enchant_name(enchantment).is_some(), "valid enchantment registry id");
+        assert!((1..=trade_enchantment_max_level(enchantment)).contains(&level));
+        assert!(enchant_applicable(tool.result.0, enchantment), "enchantment suits the tool");
+        assert_eq!(enchanted[cursor], 1, "tooltip flag present");
+
+        let book = instantiate_trade_blueprint(tb_book(15), 91).expect("enchanted book offer");
+        let stored = trade_result_component(&book, COMP_STORED_ENCHANTMENTS);
+        let (count, cursor) = read_varint_at(stored, 0);
+        assert_eq!(count, 1);
+        let (book_enchantment, cursor) = read_varint_at(stored, cursor);
+        let (book_level, cursor) = read_varint_at(stored, cursor);
+        assert!(enchant_name(book_enchantment).is_some());
+        assert!((1..=trade_enchantment_max_level(book_enchantment)).contains(&book_level));
+        assert_eq!(stored[cursor], 1);
+
+        let dyed = instantiate_trade_blueprint(tb_dyed("leather_chestplate", 7, 12, 10), 0x52f1)
+            .expect("dyed armor offer");
+        let color = trade_result_component(&dyed, COMP_DYED_COLOR);
+        assert_eq!(color.len(), 5, "rgb bytes plus tooltip flag");
+        assert_eq!(color[4], 1);
+
+        let stew = instantiate_trade_blueprint(tb_stew(15), 77).expect("suspicious stew offer");
+        let stew_effects = decode_suspicious_stew_effects(trade_result_component(
+            &stew,
+            COMP_SUSPICIOUS_STEW_EFFECTS,
+        ))
+        .expect("valid suspicious stew effects component");
+        assert_eq!(stew_effects.len(), 1);
+        assert!((1..=33).contains(&stew_effects[0].0), "one-based mob effect id");
+        assert!((7..=280).contains(&stew_effects[0].1), "vanilla tick duration");
+
+        let arrow = instantiate_trade_blueprint(tb_tipped_arrow(), 133).expect("tipped arrow offer");
+        let potion = trade_result_component(&arrow, COMP_POTION_CONTENTS);
+        assert_eq!(potion.first(), Some(&1), "potion holder present");
+        let mut rest = &potion[1..];
+        let potion_id = read_protocol_i32(&mut rest).expect("potion id");
+        assert!((0..LIVE_POTIONS.len() as i32).contains(&potion_id));
+        assert_eq!(rest, &[0, 0, 0], "no custom color, effects, or name");
+
+        let map = instantiate_trade_blueprint(tb_map(14, 12, 10), 55).expect("treasure map offer");
+        let map_id = comp_varint(&map.result.2, COMP_MAP_ID).expect("map id");
+        assert!(map_id >= 0);
+        let mut decorations_data = trade_result_component(&map, COMP_MAP_DECORATIONS);
+        let decorations = crate::nbt::read_network_nbt(&mut decorations_data)
+            .expect("map decorations network NBT");
+        let target = decorations.get("target").expect("target decoration");
+        assert!(target.get("x").is_some() && target.get("z").is_some() && target.get("type").is_some());
+        assert!(trade_result_component(&map, COMP_ITEM_NAME).len() > 2);
+    }
+
+    #[test]
+    fn ordinary_trade_factories_keep_empty_component_patches() {
+        for bp in [
+            tb_buy("wheat", 20, 16, 2),
+            tb_sell("bread", 1, 6, 16, 1, 0.05),
+            tb_process("cod", 6, 1, "cooked_cod", 6, 16, 1),
+        ] {
+            let offer = instantiate_trade_blueprint(bp, 3).expect("ordinary offer");
+            assert!(offer.result.2.is_empty(), "ordinary trades must not gain synthetic components");
+        }
+    }
+
+
+    #[test]
+    fn silent_shrieker_proximity_ticks_fabricate_no_warnings_or_wardens() {
+        let mut state = SpecialSpawnState::default();
+        let player: VillageUuid = [41; 16];
+        for tick in 0..200 {
+            passive_sculk_shrieker_maintenance(&mut state, tick);
+        }
+        assert_eq!(state.warden_warnings.get(&player), None);
+        assert!(state.warden_warnings.is_empty(), "passive proximity must not accrue warnings");
+        assert!(state.shrieker_cooldowns.is_empty());
+        // No vibration was accepted, so the spawn side-effect list a host would
+        // apply is empty: zero wardens after two hundred silent ticks.
+        let spawned_wardens: Vec<BlockPos> = Vec::new();
+        assert_eq!(spawned_wardens.len(), 0);
+    }
+
+    #[test]
+    fn cooldown_spaced_shrieker_vibrations_summon_one_warden_without_duplicate() {
+        let mut state = SpecialSpawnState::default();
+        let player: VillageUuid = [42; 16];
+        let shrieker = (20, 55, -7);
+        let spawn_site = (22, 55, -5);
+        let mut spawned = Vec::new();
+
+        // Cooldown is active for the full 200 ticks: a repeat one tick later is rejected.
+        let first = process_sculk_shrieker_warning(
+            &mut state, player, shrieker, 1_000, false, false, Some(spawn_site),
+        );
+        assert!(first.warning_accepted);
+        assert_eq!(first.warning_level, 1);
+        let repeat = process_sculk_shrieker_warning(
+            &mut state, player, shrieker, 1_001, false, false, Some(spawn_site),
+        );
+        assert!(!repeat.warning_accepted, "the 200-tick shrieker cooldown rejects repeat input");
+        assert_eq!(state.warden_warnings.get(&player), Some(&1));
+
+        for index in 1..4 {
+            let result = process_sculk_shrieker_warning(
+                &mut state,
+                player,
+                shrieker,
+                1_000 + index as u64 * WARDEN_WARNING_COOLDOWN_TICKS,
+                false,
+                false,
+                Some(spawn_site),
+            );
+            assert!(result.warning_accepted);
+            assert_eq!(result.warning_level, index as u8 + 1);
+            if result.spawn_warden {
+                spawned.push(result.spawn_pos.expect("validated spawn position"));
+            }
+        }
+        assert_eq!(spawned, vec![spawn_site], "exactly the fourth warning summons a warden");
+        assert_eq!(state.warden_warnings.get(&player), Some(&4), "warning four persists after a summon");
+
+        // The fifth properly spaced activation occurs while the spawned warden is
+        // still within 48 blocks. It is a warning, but not a duplicate summon.
+        let fifth = process_sculk_shrieker_warning(
+            &mut state,
+            player,
+            shrieker,
+            1_000 + 4 * WARDEN_WARNING_COOLDOWN_TICKS,
+            false,
+            true,
+            Some(spawn_site),
+        );
+        assert!(fifth.warning_accepted);
+        assert!(!fifth.spawn_warden, "a warden within 48 blocks suppresses the duplicate");
+        assert_eq!(spawned.len(), 1);
+
+        // Once that warden is gone, the persistent fourth warning can summon again.
+        let sixth = process_sculk_shrieker_warning(
+            &mut state,
+            player,
+            shrieker,
+            1_000 + 5 * WARDEN_WARNING_COOLDOWN_TICKS,
+            false,
+            false,
+            Some(spawn_site),
+        );
+        assert!(sixth.spawn_warden);
+        assert_eq!(spawned.len(), 1, "the test host has not applied the sixth result yet");
+    }
+
+    #[test]
+    fn sneaking_shrieker_vibration_is_not_an_accepted_warning_source() {
+        let mut state = SpecialSpawnState::default();
+        let player: VillageUuid = [43; 16];
+        let result = process_sculk_shrieker_warning(
+            &mut state,
+            player,
+            (0, 60, 0),
+            500,
+            true,
+            false,
+            Some((1, 60, 0)),
+        );
+        assert!(!result.warning_accepted);
+        assert!(!result.spawn_warden);
+        assert!(state.warden_warnings.is_empty());
+    }
+
+    #[test]
+    fn warden_spawn_search_uses_shrieker_box_not_player_surface() {
+        let shrieker = (100, 40, -100);
+        let corner = (105, 46, -105);
+        assert_eq!(
+            warden_spawn_position_in_box(shrieker, |pos| pos == corner),
+            Some(corner),
+            "the scan covers horizontal ±5 and vertical ±6 around the shrieker"
+        );
+        let outside = (106, 46, -105);
+        assert_eq!(
+            warden_spawn_position_in_box(shrieker, |pos| pos == outside),
+            None,
+            "positions outside the shrieker-local box are never selected"
+        );
+        assert_eq!(
+            warden_spawn_position_in_box(shrieker, |pos| pos.1 == 70),
+            None,
+            "no candidate can be fabricated at the surface far above the shrieker"
+        );
+    }
+
+    #[test]
+    fn shrieker_warning_decay_is_passive_and_one_level_per_ten_minutes() {
+        let mut state = SpecialSpawnState::default();
+        let player: VillageUuid = [44; 16];
+        state.warden_warnings.insert(player, 2);
+        state.warden_warning_last.insert(player, 1_000);
+        passive_sculk_shrieker_maintenance(&mut state, 1_000 + WARDEN_WARNING_DECAY_TICKS - 1);
+        assert_eq!(state.warden_warnings.get(&player), Some(&2));
+        passive_sculk_shrieker_maintenance(&mut state, 1_000 + WARDEN_WARNING_DECAY_TICKS);
+        assert_eq!(state.warden_warnings.get(&player), Some(&1));
+        passive_sculk_shrieker_maintenance(&mut state, 1_000 + 2 * WARDEN_WARNING_DECAY_TICKS);
+        assert_eq!(state.warden_warnings.get(&player), None);
+    }
+
+
+    fn wither_lookup<'a>(blocks: &'a HashMap<BlockPos, &'static str>) -> impl Fn(i32, i32, i32) -> &'a str {
+        move |x, y, z| blocks.get(&(x, y, z)).copied().unwrap_or("minecraft:air")
+    }
+
+    fn place_upright_wither_x(blocks: &mut HashMap<BlockPos, &'static str>, base: BlockPos, soul: &'static str) {
+        let (x, y, z) = base;
+        for dx in 0..3 {
+            blocks.insert((x + dx, y + 2, z), "minecraft:wither_skeleton_skull");
+            blocks.insert((x + dx, y + 1, z), soul);
+        }
+        blocks.insert((x + 1, y, z), soul);
+    }
+
+    #[test]
+    fn wither_pattern_matches_upright_x_soul_sand_and_returns_exact_consumption() {
+        let mut blocks = HashMap::new();
+        place_upright_wither_x(&mut blocks, (10, 60, 20), "minecraft:soul_sand");
+        let found = detect_wither_pattern(wither_lookup(&blocks), (11, 62, 20))
+            .expect("upright X-axis wither pattern");
+        let consumed: HashSet<_> = found.consumed.into_iter().collect();
+        let expected: HashSet<_> = [
+            (10, 62, 20), (11, 62, 20), (12, 62, 20),
+            (10, 61, 20), (11, 61, 20), (12, 61, 20),
+            (11, 60, 20),
+        ].into_iter().collect();
+        assert_eq!(consumed, expected, "exactly three skulls and four soul blocks are consumed");
+        assert_eq!(found.consumed.len(), 7);
+        assert!(!consumed.contains(&(10, 60, 20)));
+        assert!(!consumed.contains(&(12, 60, 20)), "required air cells are not consumed");
+        assert_eq!(found.spawn_pos, [11.5, 60.55, 20.5]);
+        assert!(matches!(found.yaw, 0.0 | 90.0));
+    }
+
+    #[test]
+    fn wither_pattern_matches_upright_z_soul_soil() {
+        let mut blocks = HashMap::new();
+        let (x, y, z) = (-30, 70, 40);
+        for dz in 0..3 {
+            blocks.insert((x, y + 2, z + dz), "minecraft:wither_skeleton_wall_skull");
+            blocks.insert((x, y + 1, z + dz), "minecraft:soul_soil");
+        }
+        blocks.insert((x, y, z + 1), "minecraft:soul_soil");
+        let found = detect_wither_pattern(wither_lookup(&blocks), (x, y + 2, z + 1))
+            .expect("upright Z-axis soul-soil wither pattern");
+        let consumed: HashSet<_> = found.consumed.into_iter().collect();
+        assert!(consumed.contains(&(x, y, z + 1)));
+        assert_eq!(found.spawn_pos, [x as f64 + 0.5, y as f64 + 0.55, z as f64 + 1.5]);
+    }
+
+    fn place_pattern_orientation(
+        blocks: &mut HashMap<BlockPos, &'static str>,
+        origin: BlockPos,
+        forwards: [i32; 3],
+        up: [i32; 3],
+        soul: &'static str,
+    ) -> (BlockPos, [BlockPos; 2], BlockPos) {
+        let at = |width, height| wither_pattern_translate(origin, forwards, up, width, height);
+        for width in 0..3 {
+            blocks.insert(at(width, 0), "minecraft:wither_skeleton_skull");
+            blocks.insert(at(width, 1), soul);
+        }
+        blocks.insert(at(1, 2), soul);
+        (at(1, 0), [at(0, 2), at(2, 2)], at(1, 2))
+    }
+
+    #[test]
+    fn wither_pattern_matches_every_vanilla_rotation_including_horizontal() {
+        const DIRECTIONS: [[i32; 3]; 6] = [
+            [0, 1, 0], [0, -1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0],
+        ];
+        let mut horizontal_cases = 0;
+        for forwards in DIRECTIONS {
+            for up in DIRECTIONS {
+                if wither_vec_dot(forwards, up) != 0 {
+                    continue;
+                }
+                let mut blocks = HashMap::new();
+                let (trigger, air_cells, stem) = place_pattern_orientation(
+                    &mut blocks,
+                    (200, 100, 200),
+                    forwards,
+                    up,
+                    "minecraft:soul_soil",
+                );
+                let found = detect_wither_pattern(wither_lookup(&blocks), trigger)
+                    .unwrap_or_else(|| panic!("rotation forwards={forwards:?} up={up:?}"));
+                let consumed: HashSet<_> = found.consumed.into_iter().collect();
+                assert_eq!(consumed.len(), 7);
+                assert!(consumed.contains(&stem));
+                assert!(!consumed.contains(&air_cells[0]));
+                assert!(!consumed.contains(&air_cells[1]));
+                if up[1] == 0 {
+                    horizontal_cases += 1;
+                }
+            }
+        }
+        assert_eq!(horizontal_cases, 16, "all non-vertical up rotations exercise sideways/upside-down forms");
+    }
+
+    #[test]
+    fn wither_pattern_rejects_missing_air_or_incomplete_construction() {
+        let mut blocks = HashMap::new();
+        place_upright_wither_x(&mut blocks, (0, 60, 0), "minecraft:soul_sand");
+        blocks.insert((0, 60, 0), "minecraft:stone");
+        assert_eq!(detect_wither_pattern(wither_lookup(&blocks), (1, 62, 0)), None, "occupied required air cell rejects");
+
+        let mut missing_skull = HashMap::new();
+        place_upright_wither_x(&mut missing_skull, (0, 60, 0), "minecraft:soul_sand");
+        missing_skull.insert((2, 62, 0), "minecraft:air");
+        assert_eq!(detect_wither_pattern(wither_lookup(&missing_skull), (1, 62, 0)), None);
+
+        let mut missing_soul = HashMap::new();
+        place_upright_wither_x(&mut missing_soul, (0, 60, 0), "minecraft:soul_sand");
+        missing_soul.insert((1, 60, 0), "minecraft:air");
+        assert_eq!(detect_wither_pattern(wither_lookup(&missing_soul), (1, 62, 0)), None);
+    }
+
 }
