@@ -1345,3 +1345,91 @@ fn regular_window_render_entry_uses_shadow_pass_when_selected() {
         .expect("resized window-path frame");
     assert_eq!(renderer.shadow_rerender_count, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Canonical SW6D/SHLM wire-contract interoperability
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gpu_decodes_server_shaped_spawn_pose_and_despawn_sw6d_frames() {
+    use megu_client_gpu::subworld_sync::{decode_sync_frame, decode_sync_frame_detailed};
+    use megu_proto::subworld_wire::{
+        encode_sw6d_frame, SubworldFrameMode, SubworldPoseRecord, SubworldSyncFrame as WireFrame,
+    };
+
+    let record = |voxels: Vec<([i16; 3], u32)>| SubworldPoseRecord {
+        subworld_id: 42,
+        dimension_id: 3,
+        revision: 9,
+        pos: [10.0, 20.0, 30.0],
+        quat: [0.0, 0.0, 0.0, 1.0],
+        vel: [1.0, 0.0, -1.0],
+        ang_vel: [0.0, 0.25, 0.0],
+        pivot: [2.0, 3.0, 4.0],
+        flags: 0,
+        voxels,
+    };
+    for (mode, voxels) in [
+        (SubworldFrameMode::Spawn, vec![([0, 0, 0], 10)]),
+        (SubworldFrameMode::Pose, Vec::new()),
+        (SubworldFrameMode::Despawn, Vec::new()),
+    ] {
+        let bytes = encode_sw6d_frame(&WireFrame {
+            mode,
+            records: vec![record(voxels)],
+        })
+        .expect("server-shaped frame encodes");
+        let detailed = decode_sync_frame_detailed(&bytes).expect("client detailed decode");
+        assert_eq!(detailed.mode, mode);
+        assert_eq!(detailed.records[0].dimension_id, 3);
+        assert_eq!(detailed.records[0].revision, 9);
+        assert_eq!(detailed.records[0].pivot, [2.0, 3.0, 4.0]);
+        let simple = decode_sync_frame(&bytes).expect("client render decode");
+        if mode == SubworldFrameMode::Despawn {
+            assert!(simple.poses.is_empty());
+        } else {
+            assert_eq!(simple.poses.len(), 1);
+            assert_eq!(simple.poses[0].pos, [8.0, 17.0, 26.0]);
+        }
+    }
+}
+
+#[test]
+fn gpu_client_shlm_output_matches_canonical_server_contract() {
+    use megu_client_gpu::subworld_sync::{decode_helm_cmd, encode_helm_cmd, SubWorldHelmCmd};
+    use megu_proto::subworld_wire::{
+        decode_shlm_command, encode_shlm_command, SubworldHelmCommand,
+    };
+
+    let cmd = SubWorldHelmCmd {
+        subworld_id: 42,
+        throttle: 0.5,
+        yaw_rate: 0.25,
+        pitch_rate: -0.25,
+        altitude_delta: 1.0,
+        flags: 0,
+    };
+    let bytes = encode_helm_cmd(&cmd);
+    let canonical = decode_shlm_command(&bytes).expect("server-side canonical decode");
+    assert_eq!(canonical.subworld_id, 42);
+    assert!(canonical.seq > 0);
+    assert_eq!(canonical.throttle, 0.5);
+    assert_eq!(canonical.yaw, 0.25);
+    assert_eq!(canonical.pitch, -0.25);
+    assert_eq!(canonical.roll, 0.0);
+    assert_eq!(canonical.vertical, 1.0);
+
+    let server_bytes = encode_shlm_command(&SubworldHelmCommand {
+        subworld_id: 42,
+        seq: 99,
+        throttle: 0.5,
+        yaw: 0.25,
+        pitch: -0.25,
+        roll: 0.75,
+        vertical: 1.0,
+        flags: 0,
+    })
+    .expect("canonical server-shaped command encodes");
+    let decoded = decode_helm_cmd(&server_bytes).expect("client compatibility decode");
+    assert_eq!(decoded, cmd);
+}

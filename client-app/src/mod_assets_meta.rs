@@ -225,6 +225,148 @@ fn icon_id(path: &str) -> Option<String> {
 pub struct ModBlockState {
     pub name: String,
     pub properties: BTreeMap<String, String>,
+    /// Packed `(luminance << 4) | opacity` lighting facts carried by MRS1 v2,
+    /// or derived through the server-compatible generic rules for MRS1 v1.
+    pub facts_byte: u8,
+}
+
+// The following shape/luminance/opacity rules mirror
+// `mod_adapter_core::live_registry_bridge` exactly. MRS1 v1 does not carry the
+// byte on the wire, so mixed-version clients and servers must derive the same
+// value rather than treating every modded block as opaque.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModShape {
+    Empty,
+    Thin,
+    Partial,
+    Leaves,
+    Liquid,
+    Full,
+}
+
+fn mod_block_shape(path: &str) -> ModShape {
+    if path == "block" || path.ends_with("_block") {
+        return ModShape::Full;
+    }
+    if ["water", "lava", "fluid", "liquid"]
+        .iter()
+        .any(|k| path.ends_with(k))
+    {
+        return ModShape::Liquid;
+    }
+    if path.contains("leaves") {
+        return ModShape::Leaves;
+    }
+    const EMPTY: &[&str] = &[
+        "torch", "rail", "flower", "sapling", "crop", "vine", "wire", "button", "lever", "sign",
+        "banner", "candle", "mushroom", "fern", "coral", "reed", "lichen", "grass", "plant",
+        "seed",
+    ];
+    if EMPTY.iter().any(|k| path.contains(k)) {
+        return ModShape::Empty;
+    }
+    const THIN: &[&str] = &[
+        "glass",
+        "pane",
+        "grate",
+        "bars",
+        "chain",
+        "lantern",
+        "pipe",
+        "shaft",
+        "belt",
+        "cogwheel",
+        "wheel",
+        "funnel",
+        "chute",
+        "spout",
+        "depot",
+        "basin",
+        "pump",
+        "bearing",
+        "ladder",
+        "scaffold",
+        "frame",
+        "pressure_plate",
+        "door",
+        "trapdoor",
+        "hopper",
+        "cauldron",
+        "anvil",
+        "conduit",
+    ];
+    if THIN.iter().any(|k| path.contains(k)) {
+        return ModShape::Thin;
+    }
+    const PARTIAL: &[&str] = &[
+        "slab", "stair", "fence", "wall", "carpet", "snow", "path", "farmland",
+    ];
+    if PARTIAL.iter().any(|k| path.contains(k)) || path.ends_with("_bed") {
+        return ModShape::Partial;
+    }
+    ModShape::Full
+}
+
+fn mod_state_luminance(path: &str, properties: &BTreeMap<String, String>) -> u8 {
+    let base = if path.contains("magma") {
+        7
+    } else if [
+        "lamp",
+        "lantern",
+        "torch",
+        "glow",
+        "blaze_burner",
+        "light",
+        "crystal",
+        "luminous",
+        "forge",
+    ]
+    .iter()
+    .any(|k| path.contains(k))
+    {
+        14
+    } else {
+        0
+    };
+    let mut luminance = base;
+    for (key, value) in properties {
+        match (key.as_str(), value.as_str()) {
+            ("lit", "true") => luminance = 15,
+            ("lit", _) => luminance = 0,
+            ("blaze", level) => {
+                luminance = match level {
+                    "seething" => 15,
+                    "kindled" => 11,
+                    "smouldering" => 7,
+                    _ => 0,
+                }
+            }
+            ("powered", "true") if base > 0 => luminance = 15,
+            _ => {}
+        }
+    }
+    luminance.min(15)
+}
+
+fn mod_state_opacity(path: &str, properties: &BTreeMap<String, String>) -> u8 {
+    let mut opacity = match mod_block_shape(path) {
+        ModShape::Empty | ModShape::Thin => 0,
+        ModShape::Partial | ModShape::Leaves | ModShape::Liquid => 1,
+        ModShape::Full => 15,
+    };
+    if opacity == 0
+        && properties
+            .iter()
+            .any(|(k, v)| k == "waterlogged" && v == "true")
+    {
+        opacity = 1;
+    }
+    opacity
+}
+
+pub fn derive_block_facts_byte(block_id: &str, properties: &BTreeMap<String, String>) -> u8 {
+    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    (mod_state_luminance(path, properties) << 4) | mod_state_opacity(path, properties)
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,12 +379,15 @@ pub struct ClientModRegistry {
 
 
 impl ClientModRegistry {
-    /// Decode MRS1 matching `mod_adapter_core::live_registry_bridge::encode_registry_sync_frame`:
-    /// magic (`MRS1`), version `u16` (1), `base_block_state_id` (`u32`), `base_item_id` (`u32`),
-    /// block count (`u32`), then each block as monotonic `state_id` (`u32`), UTF-8 `block_id`,
-    /// `u16` property count and UTF-8 key/value pairs; item count (`u32`) followed by monotonic
-    /// `item_id` (`u32`) and UTF-8 item name; trailing IEEE CRC32 (`u32`, big-endian).
-    /// All integers are big-endian and strings use `u16` byte lengths.
+    /// Decode MRS1 matching `mod_adapter_core::live_registry_bridge` byte-for-byte:
+    /// magic (`MRS1`), version `u16` (1 or 2), `base_block_state_id` (`u32`),
+    /// `base_item_id` (`u32`), block count (`u32`), then each block as monotonic
+    /// `state_id` (`u32`), UTF-8 `block_id`, `u16` property count and UTF-8
+    /// key/value pairs. Version 2 appends one lighting-facts byte per block
+    /// state; version 1 derives the same byte client-side. Item count (`u32`)
+    /// is followed by monotonic `item_id` (`u32`) and UTF-8 item name, then a
+    /// trailing IEEE CRC32 (`u32`, big-endian). All integers are big-endian and
+    /// strings use `u16` byte lengths.
     pub fn decode_mrs1_frame(frame: &[u8]) -> Result<Self, String> {
         if frame.len() > MAX_MRS_BYTES {
             return Err("MRS1 frame exceeds byte budget".into());
@@ -266,9 +411,11 @@ impl ClientModRegistry {
         if r.take(4)? != b"MRS1" {
             return Err("invalid MRS1 magic".into());
         }
-        if r.u16()? != 1 {
+        let version = r.u16()?;
+        if version != 1 && version != 2 {
             return Err("unsupported MRS1 version".into());
         }
+        let has_wire_facts = version == 2;
         let base_block_state_id = r.u32()?;
         let base_item_id = r.u32()?;
         let block_count = r.count()?;
@@ -295,7 +442,19 @@ impl ClientModRegistry {
                     return Err("duplicate MRS1 property".into());
                 }
             }
-            blocks.insert(state_id, ModBlockState { name, properties });
+            let facts_byte = if has_wire_facts {
+                r.take(1)?[0]
+            } else {
+                derive_block_facts_byte(&name, &properties)
+            };
+            blocks.insert(
+                state_id,
+                ModBlockState {
+                    name,
+                    properties,
+                    facts_byte,
+                },
+            );
         }
         let item_count = r.count()?;
         let mut items = BTreeMap::new();
@@ -525,12 +684,13 @@ mod tests {
             Some("y")
         );
         assert_eq!(registry.item_name(70), Some("create:wrench"));
+        assert_eq!(registry.block_state(40).map(|b| b.facts_byte), Some(0x00));
         for bad in [&b"NOPE"[..], &frame[..frame.len() - 1]] {
             assert!(decode_mrs1_frame(bad).is_err());
         }
         let mut wrong_version = frame[..frame.len() - 4].to_vec();
         wrong_version[4] = 0;
-        wrong_version[5] = 2;
+        wrong_version[5] = 3;
         let bad_ver_crc = megu_core::hash::crc32_ieee(&wrong_version);
         wrong_version.extend_from_slice(&bad_ver_crc.to_be_bytes());
         assert!(decode_mrs1_frame(&wrong_version).is_err());
@@ -539,5 +699,47 @@ mod tests {
         let last = bad_crc.len() - 1;
         bad_crc[last] ^= 0xFF;
         assert!(decode_mrs1_frame(&bad_crc).is_err());
+    }
+
+    #[test]
+    fn decodes_mrs1_v2_lighting_facts_without_dropping_entries() {
+        let mut frame = b"MRS1".to_vec();
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(&40u32.to_be_bytes());
+        frame.extend_from_slice(&70u32.to_be_bytes());
+        frame.extend_from_slice(&2u32.to_be_bytes());
+
+        frame.extend_from_slice(&40u32.to_be_bytes());
+        let block = "create:arc_lamp";
+        frame.extend_from_slice(&(block.len() as u16).to_be_bytes());
+        frame.extend_from_slice(block.as_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        for s in ["lit", "true"] {
+            frame.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            frame.extend_from_slice(s.as_bytes());
+        }
+        frame.push(0xff);
+
+        frame.extend_from_slice(&41u32.to_be_bytes());
+        let block = "create:framed_glass";
+        frame.extend_from_slice(&(block.len() as u16).to_be_bytes());
+        frame.extend_from_slice(block.as_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.push(0x00);
+
+        frame.extend_from_slice(&1u32.to_be_bytes());
+        frame.extend_from_slice(&70u32.to_be_bytes());
+        let item = "create:wrench";
+        frame.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        frame.extend_from_slice(item.as_bytes());
+        let crc = megu_core::hash::crc32_ieee(&frame);
+        frame.extend_from_slice(&crc.to_be_bytes());
+
+        let registry = decode_mrs1_frame(&frame).expect("valid v2 frame");
+        assert_eq!(registry.block_state_name(40), Some("create:arc_lamp"));
+        assert_eq!(registry.block_state_name(41), Some("create:framed_glass"));
+        assert_eq!(registry.item_name(70), Some("create:wrench"));
+        assert_eq!(registry.block_state(40).map(|b| b.facts_byte), Some(0xff));
+        assert_eq!(registry.block_state(41).map(|b| b.facts_byte), Some(0x00));
     }
 }

@@ -44,6 +44,8 @@ def audit(root, baseline):
     source = {}
     parsed = {}
     needed = set(HOTPATHS)
+    canonical_subworld = 'proto/src/subworld_wire.rs'
+    needed.add(canonical_subworld)
     for _channel, _magic, owner, peer in WIRES:
         needed.update((owner, peer))
     for path in sorted(needed):
@@ -72,10 +74,15 @@ def audit(root, baseline):
         # The peer may import the canonical definition instead of copying it.
         if channel.startswith('megu:subworld_') and f'"{channel}"' not in peer_visible:
             findings.append(f'{peer}: missing {channel} peer channel')
-        if f'b"{magic}"' not in owner_visible:
+        if not channel.startswith('megu:subworld_') and f'b"{magic}"' not in owner_visible:
             findings.append(f'{owner}: missing {magic} wire magic')
         if channel == 'megu:mod_registry_sync_v1' and f'b"{magic}"' not in peer_visible:
             findings.append(f'{peer}: missing {magic} decoder')
+        # SW6D/SHLM are canonicalized in proto/src/subworld_wire.rs. Their
+        # endpoint sharing and binary layout are checked by the dedicated
+        # contract assertions below rather than by copied per-endpoint magic.
+        if channel.startswith('megu:subworld_'):
+            continue
         # Check all four-byte magic definitions in both crates for collisions
         # with this protocol's symbol, including an accidentally changed copy.
         names = {
@@ -93,11 +100,10 @@ def audit(root, baseline):
         if not definition.search(owner_visible):
             findings.append(f'{owner}: missing canonical {magic} definition')
         # Pin the known frame versions; MRS1 deliberately supports both v1
-        # and v2, while the other three versioned frames use one u8 v1.
+        # and v2. SW6D/SHLM versions live in the canonical proto module and
+        # are pinned by the dedicated checks below.
         versions = {
             'MSP1': ('SEAMLESS_PORTAL_VERSION',),
-            'SW6D': ('SUBWORLD_SYNC_VERSION',),
-            'SHLM': ('VERSION',),
             'MRS1': ('WIRE_VERSION', 'WIRE_VERSION_V2'),
         }.get(magic, ())
         for index, name in enumerate(versions, 1):
@@ -110,6 +116,57 @@ def audit(root, baseline):
             for found in MAGIC_DEF.finditer(visible):
                 if found.group(1) == magic and not definition.fullmatch(found.group()):
                     findings.append(f'{path}: duplicate {magic} magic definition')
+
+    # Dedicated cross-endpoint contract checks for the alpha5 subworld codec.
+    # The server includes the canonical implementation by path and the GPU
+    # client imports the same proto module; requiring those bindings prevents
+    # a return to two superficially similar but byte-incompatible codecs.
+    canonical_path = 'proto/src/subworld_wire.rs'
+    canonical_syntax, canonical_visible = parsed[canonical_path]
+    server_path = 'create-adapter/src/aeronautics.rs'
+    client_path = 'client-gpu/src/subworld_sync.rs'
+    server_syntax, server_visible = parsed[server_path]
+    client_syntax, client_visible = parsed[client_path]
+    subworld_checks = (
+        (r'pub\s+const\s+SW6D_MAGIC\s*:\s*\[u8\s*;\s*4\]\s*=\s*\*?\s*b"SW6D"', 'missing canonical SW6D magic'),
+        (r'pub\s+const\s+SW6D_VERSION\s*:\s*u8\s*=\s*2\s*;', 'missing canonical SW6D version 2'),
+        (r'pub\s+const\s+SHLM_MAGIC\s*:\s*\[u8\s*;\s*4\]\s*=\s*\*?\s*b"SHLM"', 'missing canonical SHLM magic'),
+        (r'pub\s+const\s+SHLM_VERSION\s*:\s*u8\s*=\s*2\s*;', 'missing canonical SHLM version 2'),
+    )
+    for pattern, message in subworld_checks:
+        if not re.search(pattern, canonical_visible):
+            findings.append(f'{canonical_path}: {message}')
+    # Pin the wire-owned semantic fields, not merely the magic bytes.
+    for field in ('dimension_id', 'revision', 'pivot', 'voxels'):
+        if not re.search(r'pub\s+' + field + r'\s*:', canonical_syntax):
+            findings.append(f'{canonical_path}: SW6D record missing {field}')
+    for token in ('encode_sw6d_frame', 'decode_sw6d_frame', 'encode_shlm_command', 'decode_shlm_command'):
+        if token not in canonical_syntax:
+            findings.append(f'{canonical_path}: missing {token}')
+    if '#[path = "../../proto/src/subworld_wire.rs"]' not in server_visible:
+        findings.append(f'{server_path}: server no longer shares proto/src/subworld_wire.rs')
+    for token in ('subworld_wire::encode_sw6d_frame', 'subworld_wire::decode_sw6d_frame',
+                  'subworld_wire::encode_shlm_command', 'subworld_wire::decode_shlm_command'):
+        if token not in server_syntax:
+            findings.append(f'{server_path}: server does not use canonical {token}')
+    if 'use megu_proto::subworld_wire' not in client_visible:
+        findings.append(f'{client_path}: client does not import canonical proto subworld module')
+    for token in ('decode_sw6d_frame', 'encode_shlm_command', 'decode_shlm_command'):
+        if token not in client_syntax:
+            findings.append(f'{client_path}: client does not use canonical {token}')
+    if 'pivot_adjusted_position' not in client_syntax:
+        findings.append(f'{client_path}: client does not apply SW6D pivot semantics')
+
+    # MRS1 v2 acceptance is part of the wire contract: the client must not be
+    # a v1-only decoder and must preserve the per-state lighting facts byte
+    # instead of discarding the tail added by the server's default encoder.
+    registry_peer = 'client-app/src/mod_assets_meta.rs'
+    registry_syntax, _ = parsed[registry_peer]
+    if not re.search(r'version\s*!=\s*1\s*&&\s*version\s*!=\s*2', registry_syntax):
+        findings.append(f'{registry_peer}: MRS1 decoder does not accept both versions 1 and 2')
+    for token in ('has_wire_facts', 'facts_byte', 'derive_block_facts_byte'):
+        if token not in registry_syntax:
+            findings.append(f'{registry_peer}: MRS1 decoder does not preserve/derive lighting facts')
     return counts, findings
 
 
