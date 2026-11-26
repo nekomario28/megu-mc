@@ -101,6 +101,9 @@ pub use codec::{
     ProtocolCodec, RawComponent, RegistryDataEntry, S2CPacket, TeamInfo, TeamOperation,
     MAX_COOKIE_PAYLOAD_BYTES,
 };
+pub use data_v767::{
+    component_id_by_name, component_ids, component_name_by_id, item_id_by_name, item_name_by_id,
+};
 pub use channel_router::{
     classify_channel, decode_register_payload, encode_register_payload, validate_channel_name,
     ChannelDirection, ChannelFirewall, ChannelFirewallConfig, ChannelFirewallMetrics,
