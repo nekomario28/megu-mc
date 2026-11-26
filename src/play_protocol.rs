@@ -2656,7 +2656,12 @@ fn skip_night() {
     THUNDERING.store(0, Ordering::Relaxed);
     let sleepers: Vec<Arc<Client>> = client_snapshot()
         .into_iter()
-        .filter(|c| c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        .filter(|c| {
+            c.sleeping
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        })
         .collect();
     let mut tm = Vec::new();
     tm.extend_from_slice(&0i64.to_be_bytes());
@@ -2673,6 +2678,20 @@ fn skip_night() {
         let line = system_chat(&format!("{} slept through the night", sleeper.name));
         broadcast_packet(-1, 0x6c, &line);
     }
+}
+
+fn sleep_status_counts(
+    players: impl IntoIterator<Item = (DimId, bool, Option<u32>)>,
+) -> (i64, i64) {
+    players
+        .into_iter()
+        .filter(|(dim, spectator, _)| *dim == DimId::Overworld && !spectator)
+        .fold((0i64, 0i64), |(sleeping, active), (_, _, ticks)| {
+            (
+                sleeping + i64::from(ticks.is_some_and(|ticks| ticks >= 100)),
+                active + 1,
+            )
+        })
 }
 
 /// One server tick of sleep bookkeeping: wake on fresh damage, age every
@@ -2706,12 +2725,12 @@ fn sleep_tick() {
     }
     // Vanilla counts everyone in the Overworld (awake or asleep) in the
     // denominator; `playersSleepingPercentage` > 100 can never be met.
-    let (sleeping, all) = clients
-        .iter()
-        .filter(|c| *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == DimId::Overworld)
-        .fold((0i64, 0i64), |(s, a), c| {
-            (s + i64::from(c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).is_some()), a + 1)
-        });
+    let (sleeping, all) = sleep_status_counts(clients.iter().map(|c| {
+        let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
+        let spectator = c.is_spectator();
+        let ticks = c.sleeping.lock().unwrap_or_else(|e| e.into_inner()).map(|s| s.ticks);
+        (dim, spectator, ticks)
+    }));
     if all == 0 {
         return;
     }
@@ -2739,6 +2758,51 @@ fn enter_bed(me: &Client, x: i32, y: i32, z: i32) {
         last_hurt: *me.last_hurt.lock().unwrap_or_else(|e| e.into_inner()),
     });
     broadcast_sleep_pose(me, true, (x, y, z));
+}
+
+type BedBlockPos = (i32, i32, i32);
+
+fn bed_head_and_foot(
+    x: i32,
+    y: i32,
+    z: i32,
+    part: &str,
+    facing: &str,
+) -> Option<(BedBlockPos, BedBlockPos)> {
+    let (dx, dz) = match facing {
+        "north" => (0, -1),
+        "south" => (0, 1),
+        "east" => (1, 0),
+        "west" => (-1, 0),
+        _ => return None,
+    };
+    let clicked = (x, y, z);
+    let other = match part {
+        "head" => (x - dx, y, z - dz),
+        "foot" => (x + dx, y, z + dz),
+        _ => return None,
+    };
+    Some(if part == "head" {
+        (clicked, other)
+    } else {
+        (other, clicked)
+    })
+}
+
+fn bed_stand_position(dim: DimId, head: (i32, i32, i32)) -> Option<(f64, f64, f64)> {
+    let registry = block_registry::breg()?;
+    let (x, y, z) = head;
+    for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let (sx, sz) = (x + dx, z + dz);
+        let floor = block_at_dim(dim, sx, y - 1, sz);
+        if registry.is_solid_render(floor)
+            && block_at_dim(dim, sx, y, sz) == 0
+            && block_at_dim(dim, sx, y + 1, sz) == 0
+        {
+            return Some((sx as f64 + 0.5, y as f64, sz as f64 + 0.5));
+        }
+    }
+    None
 }
 fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_eid: i32, mk: F) {
     fanout_in(audience, |c| c.eid != me_eid, mk)
@@ -4962,8 +5026,26 @@ fn load_registry_overlays(base: &std::path::Path) -> Result<Vec<Vec<u8>>, String
     let mut sources = datapack_sources(base);
     // The built-in pack is the base. User packs follow in the server's pack order.
     sources.sort_by_key(|(name, _, _)| name != "vanilla");
-    let disabled = disabled_datapacks().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let disabled = disabled_datapacks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let mut packs = Vec::new();
+    if !sources.iter().any(|(name, _, _)| name == "vanilla") {
+        let mut jar_files = Vec::new();
+        for kind in SYNCED_REGISTRIES {
+            let prefix = format!("minecraft/{kind}/");
+            for (relative, bytes) in vanilla_jar_worldgen_files(&prefix) {
+                jar_files.push((format!("data/minecraft/{kind}/{relative}"), bytes.to_vec()));
+            }
+        }
+        if !jar_files.is_empty() {
+            // `jar_datapack` exposes the resolved (including bundler JAR) data
+            // through the same reader used by worldgen and recipes. Keep it as
+            // the lowest priority pack, before user datapacks.
+            packs.push(jar_files);
+        }
+    }
     for (name, path, zip) in sources {
         if !disabled.contains(&name) {
             packs
@@ -8446,29 +8528,63 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
     true
 }
 
-/// Materialise a safe landing in a Nether or Overworld destination: an obsidian floor under
-/// the teleported column, clear space above it, and a complete obsidian portal frame with a
-/// live portal inside. Materialising the frame matters for the bounce guard — the arrival
-/// portal is intentional, and a per-player flag (not the block's absence) stops the return.
-fn materialize_nether_landing(dim: DimId, bx: i32, by: i32, bz: i32) {
+fn find_safe_portal_site(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(i32, i32, i32)> {
+    let radius = if dim == DimId::Nether { 16 } else { 128 };
+    let min_y = crate::worldgen::min_y_dim(dim) + 1;
+    let max_y = crate::worldgen::min_y_dim(dim) + crate::worldgen::height_dim(dim) - 5;
     let obsidian = name_to_state("obsidian").unwrap_or(2354);
-    for dx in -2..=2 {
-        for dz in -2..=2 {
-            set_block_dim(dim, bx + dx, by - 1, bz + dz, obsidian);
-            for dy in by..by + 4 {
-                set_block_dim(dim, bx + dx, dy, bz + dz, 0);
+    let y0 = by.clamp(min_y, max_y);
+    for ring in 0i32..=radius {
+        for dz in -ring..=ring {
+            for dx in -ring..=ring {
+                if dx.abs().max(dz.abs()) != ring { continue; }
+                let (x, z) = (bx + dx, bz + dz);
+                for dy in 0..=16 {
+                    for y in [y0 - dy, y0 + dy] {
+                        if y < min_y || y > max_y { continue; }
+                        let floor_ok = (-1..=2).all(|ox| block_at_dim(dim, x + ox, y - 1, z) != 0);
+                        let clear = (0..=1).all(|ox| (0..=2).all(|oy| block_at_dim(dim, x + ox, y + oy, z) == 0));
+                        let frame_clear = [-1, 2].into_iter().all(|ox| (0..=2).all(|oy| {
+                            let state = block_at_dim(dim, x + ox, y + oy, z);
+                            state == 0 || state == obsidian
+                        }));
+                        if floor_ok && clear && frame_clear { return Some((x, y, z)); }
+                    }
+                }
             }
         }
     }
-    for dy in 0..4 {
-        set_block_dim(dim, bx - 1, by + dy, bz, obsidian);
-        set_block_dim(dim, bx + 1, by + dy, bz, obsidian);
+    None
+}
+
+/// Create a frame at a nearby safe site, preserving all non-air blocks in its
+/// surroundings. If none exists, use the clamped target as the last resort.
+fn materialize_nether_landing(dim: DimId, bx: i32, by: i32, bz: i32) -> (i32, i32, i32) {
+    let (bx, by, bz) = find_safe_portal_site(dim, bx, by, bz).unwrap_or((bx, by, bz));
+    let obsidian = name_to_state("obsidian").unwrap_or(2354);
+    for dx in -1..=2 {
+        for dy in [-1, 3] {
+            if block_at_dim(dim, bx + dx, by + dy, bz) == 0 {
+                set_block_dim(dim, bx + dx, by + dy, bz, obsidian);
+                note_block_update_dim(dim, bx + dx, by + dy, bz, obsidian);
+            }
+        }
     }
-    set_block_dim(dim, bx, by - 1, bz, obsidian);
-    set_block_dim(dim, bx, by + 3, bz, obsidian);
     for dy in 0..3 {
-        set_block_dim(dim, bx, by + dy, bz, 5864);
+        for dx in [-1, 2] {
+            if block_at_dim(dim, bx + dx, by + dy, bz) == 0 {
+                set_block_dim(dim, bx + dx, by + dy, bz, obsidian);
+                note_block_update_dim(dim, bx + dx, by + dy, bz, obsidian);
+            }
+        }
+        for dx in 0..=1 {
+            if block_at_dim(dim, bx + dx, by + dy, bz) == 0 {
+                set_block_dim(dim, bx + dx, by + dy, bz, 5864);
+                note_block_update_dim(dim, bx + dx, by + dy, bz, 5864);
+            }
+        }
     }
+    (bx, by, bz)
 }
 
 /// The End spawn platform: vanilla's obsidian 5x5 at (100, 48, 0) with three air layers
@@ -8504,6 +8620,11 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
     };
     let ratio = portal_coordinate_ratio(dim.coordinate_scale(), ndim.coordinate_scale());
     let (nx, nz) = (bx as f64 * ratio, bz as f64 * ratio);
+    let (min_x, min_z, max_x, max_z) = world_border()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .bounds(border_now_ms());
+    let (nx, nz) = (nx.clamp(min_x, max_x), nz.clamp(min_z, max_z));
     let ny = (by as f64).clamp(
         (ndim.min_y() + 4) as f64,
         (ndim.min_y() + ndim.height() - 8) as f64,
@@ -8515,27 +8636,47 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
 /// credits on the player's first exit from the End, 0.0 on every later one.
 /// Vanilla stores the flag as `seenCredits`/`wonGame` on the player; this port
 /// keys it on the session eid, same shape as the gateway cooldown map.
-fn send_win_game_event(me: &Client) {
-    /// First-win flags keyed by session eid: entries live until disconnect,
-    /// so the cap binds only a same-session End-exit storm of distinct eids.
-    const MAX_END_WINS_ENTRIES: usize = 8192;
-    static END_WINS: Registry<i32, ()> = OnceLock::new();
-    let first = {
-        let mut wins = END_WINS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if wins.len() >= MAX_END_WINS_ENTRIES && !wins.contains_key(&me.eid) {
-            // Evict one stale winner so the map cannot grow without bound;
-            // the evicted player simply re-sees credits on a later exit.
-            if let Some(&stale) = wins.keys().min() {
-                wins.remove(&stale);
-            }
+static SEEN_CREDITS: Registry<[u8; 16], ()> = OnceLock::new();
+static PORTAL_GAME_TICKS: Registry<[u8; 16], u32> = OnceLock::new();
+const MAX_SEEN_CREDIT_ENTRIES: usize = 1_000_000;
+const MAX_PORTAL_TICK_ENTRIES: usize = 8192;
+
+fn portal_game_ticks(uuid: [u8; 16]) -> u32 {
+    PORTAL_GAME_TICKS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .unwrap_or_else(|e| e.into_inner()).get(&uuid).copied().unwrap_or(0)
+}
+
+fn set_portal_game_ticks(uuid: [u8; 16], ticks: u32) {
+    let mut values = PORTAL_GAME_TICKS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if ticks == 0 {
+        values.remove(&uuid);
+    } else {
+        if values.len() >= MAX_PORTAL_TICK_ENTRIES && !values.contains_key(&uuid) {
+            if let Some(stale) = values.keys().next().copied() { values.remove(&stale); }
         }
-        wins.insert(me.eid, ()).is_none()
-    };
+        values.insert(uuid, ticks);
+    }
+}
+
+fn has_seen_credits(uuid: [u8; 16]) -> bool {
+    SEEN_CREDITS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .unwrap_or_else(|e| e.into_inner()).contains_key(&uuid)
+}
+
+fn mark_seen_credits(uuid: [u8; 16]) -> bool {
+    let mut credits = SEEN_CREDITS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if credits.len() >= MAX_SEEN_CREDIT_ENTRIES && !credits.contains_key(&uuid) {
+        if let Some(stale) = credits.keys().next().copied() { credits.remove(&stale); }
+    }
+    credits.insert(uuid, ()).is_none()
+}
+
+fn send_win_game_event(me: &Client) {
+    if has_seen_credits(me.uuid) || !mark_seen_credits(me.uuid) { return; }
     let mut ge = vec![4u8];
-    ge.extend_from_slice(&(if first { 1.0f32 } else { 0.0f32 }).to_be_bytes());
+    ge.extend_from_slice(&0.0f32.to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
 }
 
@@ -8603,8 +8744,8 @@ fn enter_portal(
         let Some((ndim, nx, ny, nz)) = nether_portal_target(dim, bx, by, bz) else {
             return;
         };
-        materialize_nether_landing(ndim, nx, ny, nz);
-        let landing = (nx as f64 + 0.5, ny as f64, nz as f64 + 0.5);
+        let (nx, ny, nz) = materialize_nether_landing(ndim, nx, ny, nz);
+        let landing = (nx as f64 + 1.0, ny as f64, nz as f64 + 0.5);
         switch_client_dimension(
             me,
             ndim,
@@ -8668,10 +8809,15 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     if !is_nether_portal_state(st) && !is_end_portal_state(st) {
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
         *me.portal_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        set_portal_game_ticks(me.uuid, 0);
         return false;
     }
     if *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) {
         return false; // arrival guard: wait until the player leaves the portal block
+    }
+    if is_end_portal_state(st) {
+        enter_portal(me, st, bx, by, bz, yaw, pitch, view);
+        return true;
     }
     // `in_portal` is set only by `enter_portal` — it is the arrival guard, not
     // a "seen portal" latch. Setting it on detection would short-circuit the
@@ -8682,21 +8828,21 @@ fn tick_portal(me: &Arc<Client>, view: i32) -> bool {
     // `playersNetherPortalCreativeDelay` (creative/spectator, 1 GT ≈ instant)
     // are vanilla game ticks of 50 ms; a delay of 0 disables the wait. The
     // gamerule read goes through the `player_mechanisms` hook (MEGA-W2 §2.3).
-    let delay_gt = players_nether_portal_delay_ticks(creative) as u64;
+    let delay_gt = players_nether_portal_delay_ticks(creative).max(0) as u32;
     if delay_gt == 0 || (creative && delay_gt <= 1) {
         enter_portal(me, st, bx, by, bz, yaw, pitch, view);
         return true;
     }
     let mut at = me.portal_at.lock().unwrap_or_else(|e| e.into_inner());
-    if at.is_none() {
-        *at = Some(Instant::now());
-        return false;
-    }
-    if at.unwrap().elapsed() < Duration::from_millis(50 * delay_gt) {
+    at.get_or_insert_with(Instant::now);
+    let ticks = portal_game_ticks(me.uuid).saturating_add(1);
+    set_portal_game_ticks(me.uuid, ticks);
+    if ticks < delay_gt {
         return false;
     }
     *at = None;
     drop(at);
+    set_portal_game_ticks(me.uuid, 0);
     enter_portal(me, st, bx, by, bz, yaw, pitch, view);
     true
 }
@@ -13464,71 +13610,58 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         continue;
                     }
                 }
-                // bed: right-click at night skips to morning — `#minecraft:beds`
-                // members plus any modded `*_bed` block (comforts, mymod, …).
+                // Bed interaction resolves the pair before occupancy or respawn state.
                 if block_registry::breg().is_some_and(|registry| {
                     let name = registry.name_of(clicked);
                     registry.in_tag(clicked, "minecraft:beds") || name.ends_with("_bed")
                 }) {
-                    let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-                    // Vanilla sleeps at night or during a thunderstorm, and
-                    // only in dimensions whose spec allows beds to work.
-                    let sleep_ok = (13000..=23500).contains(&wt)
-                        || THUNDERING.load(Ordering::Relaxed) > 0;
-                    // Vanilla dims hardcode this (Overworld yes, Nether/End
-                    // explode); custom dims read it from their spec.
-                    let bed_works = dim == DimId::Overworld
-                        || crate::worldgen::dimension_spec(dim)
-                            .is_some_and(|spec| spec.bed_works);
-                    let occupied = client_snapshot().iter().any(|c| {
-                        c.eid != me.eid
-                            && c.sleeping
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .is_some_and(|s| s.bed == (x, y, z))
+                    let state = block_at_dim(dim, x, y, z);
+                    let pair = block_registry::breg().and_then(|registry| {
+                        bed_head_and_foot(
+                            x, y, z,
+                            &registry.get_prop(state, "part")?,
+                            &registry.get_prop(state, "facing")?,
+                        )
                     });
-                    if bed_works && sleep_ok && !occupied {
-                        let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                        let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
-                        {
-                            let mut spawn_dim = me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
-                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some((position.0, position.1, position.2, angle));
-                            *spawn_dim = dim;
+                    let Some((head, foot)) = pair else {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    };
+                    let bed_works = !matches!(dim, DimId::Nether | DimId::End)
+                        && (dim == DimId::Overworld
+                            || crate::worldgen::dimension_spec(dim).is_some_and(|s| s.bed_works));
+                    if !bed_works {
+                        for (bx, by, bz) in [head, foot] {
+                            set_block_dim(dim, bx, by, bz, 0);
+                            note_block_update_dim(dim, bx, by, bz, 0);
                         }
+                        explode_at_dim(dim, x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5, 5.0);
+                    } else {
+                        let occupied = client_snapshot().iter().any(|c| {
+                            c.eid != me.eid && c.sleeping.lock().unwrap_or_else(|e| e.into_inner())
+                                .is_some_and(|s| s.bed == head)
+                        });
+                        let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                        let position = (head.0 as f64 + 0.5, head.1 as f64 + 1.0, head.2 as f64 + 0.5);
+                        *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
+                        *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
                         let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
-                        snapshot.respawn = Some(SpawnTarget {
-                            kind: SpawnTargetKind::Bed,
-                            dim,
-                            position,
-                            angle,
-                            forced: false,
-                        });
+                        snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Bed, dim, position, angle, forced: false });
                         saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
-                        let mut sp = Vec::new();
-                        write_pos(&mut sp, x, y, z);
-                        sp.extend_from_slice(&angle.to_be_bytes());
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, sp);
-                        // Vanilla `startSleepInBed`: the player lies down and
-                        // `sleep_tick` skips the night once enough Overworld
-                        // players have slept 100 ticks
-                        // (playersSleepingPercentage).
-                        enter_bed(&me, x, y, z);
-                    } else if bed_works {
-                        // vanilla `BedBlock`/`BedSleepingProblem` posts the
-                        // refusal to the action bar: occupied beats "can only
-                        // sleep at night or during thunderstorms".
-                        let key = if occupied {
-                            "block.minecraft.bed.occupied"
+                        let mut spawn = Vec::new();
+                        write_pos(&mut spawn, head.0, head.1, head.2);
+                        spawn.extend_from_slice(&angle.to_be_bytes());
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
+                        let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
+                        let sleep_ok = (13000..=23500).contains(&wt) || THUNDERING.load(Ordering::Relaxed) > 0;
+                        if sleep_ok && !occupied {
+                            enter_bed(&me, head.0, head.1, head.2);
                         } else {
-                            "block.minecraft.bed.no_sleep"
-                        };
-                        let _ = send_packet(
-                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                            0x4c,
-                            translate_component_nbt(key),
-                        );
+                            let key = if occupied { "block.minecraft.bed.occupied" } else { "block.minecraft.bed.no_sleep" };
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x4c, translate_component_nbt(key));
+                        }
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
@@ -14852,6 +14985,44 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     player_dismount(&me, false);
                     death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
                     close_live_menu(&me, true, true);
+                    let bed_respawn = saved_players()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&me.uuid)
+                        .and_then(|save| save.respawn)
+                        .filter(|target| target.kind == SpawnTargetKind::Bed);
+                    if let Some(target) = bed_respawn {
+                        let head = (
+                            target.position.0.floor() as i32,
+                            target.position.1.floor() as i32 - 1,
+                            target.position.2.floor() as i32,
+                        );
+                        let bed_exists = block_registry::breg().is_some_and(|registry| {
+                            let state = block_at_dim(target.dim, head.0, head.1, head.2);
+                            let name = registry.name_of(state);
+                            (registry.in_tag(state, "minecraft:beds") || name.ends_with("_bed"))
+                                && registry.get_prop(state, "part").as_deref() == Some("head")
+                        });
+                        if !bed_exists || bed_stand_position(target.dim, head).is_none() {
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+                            if let Some(save) = saved_players()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_mut(&me.uuid)
+                            {
+                                save.respawn = None;
+                            }
+                            let _ = send_packet(
+                                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                                0x4c,
+                                translate_component_nbt("block.minecraft.spawn.not_valid"),
+                            );
+                        } else if let Some((sx, sy, sz)) = bed_stand_position(target.dim, head) {
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((sx, sy, sz, target.angle));
+                        }
+                    }
                     // P2-3-S4: respawn in the dimension the spawn point belongs to. A
                     // death in the Nether returns to the Overworld bed/world spawn when that
                     // is where the spawn point was set, with a full window rebuild.
@@ -16659,6 +16830,47 @@ mod play_protocol_opt_s2_tests {
             nether_portal_target(DimId::Nether, 10, 64, -5),
             Some((DimId::Overworld, 80, 64, -40))
         );
+    }
+
+    #[test]
+    fn bed_part_and_facing_resolve_one_shared_head_coordinate() {
+        for (facing, dx, dz) in [
+            ("north", 0, -1),
+            ("south", 0, 1),
+            ("east", 1, 0),
+            ("west", -1, 0),
+        ] {
+            let head = (10, 64, 20);
+            let foot = (10 - dx, 64, 20 - dz);
+            assert_eq!(
+                bed_head_and_foot(head.0, head.1, head.2, "head", facing),
+                Some((head, foot))
+            );
+            assert_eq!(
+                bed_head_and_foot(foot.0, foot.1, foot.2, "foot", facing),
+                Some((head, foot))
+            );
+        }
+        assert_eq!(bed_head_and_foot(0, 0, 0, "side", "north"), None);
+        assert_eq!(bed_head_and_foot(0, 0, 0, "head", "up"), None);
+    }
+
+    #[test]
+    fn credits_state_is_persistent_identity_based_and_sleep_status_requires_deep_sleep() {
+        let uuid = [0xA5; 16];
+        assert!(!has_seen_credits(uuid));
+        mark_seen_credits(uuid);
+        assert!(has_seen_credits(uuid));
+        assert!(!has_seen_credits([0x5A; 16]));
+
+        let players = [
+            (DimId::Overworld, false, Some(100)),
+            (DimId::Overworld, false, Some(99)),
+            (DimId::Overworld, true, Some(200)),
+            (DimId::Nether, false, Some(200)),
+            (DimId::Overworld, false, None),
+        ];
+        assert_eq!(sleep_status_counts(players), (1, 3));
     }
 
     #[test]
@@ -21629,6 +21841,11 @@ mod p5c_live_tests {
         assert!(!tick_portal(&me, 2));
         assert!(me.portal_at.lock().unwrap_or_else(|e| e.into_inner()).is_some());
         assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Overworld);
+        for _ in 0..3 {
+            assert!(!tick_portal(&me, 2));
+        }
+        assert!(tick_portal(&me, 2), "the fifth game tick completes the configured delay");
+        assert_eq!(*me.dim.lock().unwrap_or_else(|e| e.into_inner()), DimId::Nether);
 
         // A zero delay enters on the same call.
         *me.in_portal.lock().unwrap_or_else(|e| e.into_inner()) = false;
