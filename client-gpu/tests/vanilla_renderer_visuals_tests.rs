@@ -2,10 +2,16 @@
 
 use std::path::PathBuf;
 
+use megu_client_gpu::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
 use megu_client_gpu::renderer::{
-    block_selection_outline_lines, screenshot_output_path, write_rgba_png,
+    block_selection_outline_lines, request_gpu_device, screenshot_output_path, write_rgba_png,
+    ComposedFrame, FirstPersonViewmodel, GameplayScreenOverlay, GpuRenderer, OFFSCREEN_FORMAT,
 };
+use megu_client_gpu::subworld_render::SubWorldRenderBank;
 use megu_client_gpu::vanilla_assets_bridge::VanillaRuntimeAssets;
+use megu_client_gpu::vanilla_world_assets::VanillaWorldAssets;
+use megu_client_gpu::Camera;
+use megu_client_mesh::RenderBackendPreference;
 
 #[test]
 fn selection_outline_is_a_twelve_edge_inflated_box() {
@@ -46,4 +52,235 @@ fn missing_local_assets_build_a_diagnostic_fallback_bundle() {
     assert!(!bundle.mob_effect_uvs.is_empty());
     assert!(bundle.gui_textures.width >= 256);
     assert!(summary.notes > 0);
+}
+
+fn visual_renderer() -> Option<GpuRenderer> {
+    match request_gpu_device(
+        RenderBackendPreference::Auto,
+        None,
+        None,
+    ) {
+        Ok(ctx) => Some(GpuRenderer::new(
+            ctx,
+            OFFSCREEN_FORMAT,
+        )),
+        Err(error) => {
+            eprintln!("SKIP renderer visual GPU test: no wgpu adapter available ({error})");
+            None
+        }
+    }
+}
+
+fn render_visual_frame(
+    renderer: &mut GpuRenderer,
+    camera: &Camera,
+) -> Vec<u8> {
+    let mut bank = SubWorldRenderBank::new();
+    let atmosphere = BiomeAtmosphereBlender::new(
+        AtmosphereParams::default(),
+    );
+    let fades = ChunkFadeTracker::new();
+    renderer
+        .render_offscreen_composed_frame(
+            96,
+            96,
+            camera,
+            &mut ComposedFrame {
+                subworlds: &mut bank,
+                lights: &[],
+                atmosphere: &atmosphere,
+                chunk_fades: &fades,
+                ui_rgba: None,
+                world_revision: 1,
+                world_time_ticks: 6000,
+            },
+        )
+        .expect("composed visual frame")
+}
+
+fn visual_camera() -> Camera {
+    Camera {
+        position: [0.5, 0.5, 2.5],
+        yaw_deg: 0.0,
+        pitch_deg: 0.0,
+        far: 128.0,
+        ..Camera::default()
+    }
+}
+
+fn changed_pixels(baseline: &[u8], changed: &[u8]) -> usize {
+    assert_eq!(baseline.len(), changed.len());
+    let (baseline, baseline_tail) = baseline.as_chunks::<4>();
+    let (changed, changed_tail) = changed.as_chunks::<4>();
+    assert!(baseline_tail.is_empty() && changed_tail.is_empty());
+    baseline
+        .iter()
+        .zip(changed.iter())
+        .filter(|(a, b)| a != b)
+        .count()
+}
+
+fn nonzero_rgb_pixels(pixels: &[u8]) -> usize {
+    let (pixels, tail) = pixels.as_chunks::<4>();
+    assert!(tail.is_empty());
+    pixels
+        .iter()
+        .filter(|px| px[..3].iter().any(|&channel| channel != 0))
+        .count()
+}
+
+fn upload_fallback_world_assets(renderer: &mut GpuRenderer) {
+    renderer.upload_world_env_assets(&VanillaWorldAssets::fallback());
+}
+
+#[test]
+fn gpu_block_break_overlay_renders_changed_crack_pixels() {
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    upload_fallback_world_assets(&mut renderer);
+    let camera = visual_camera();
+    let baseline = render_visual_frame(&mut renderer, &camera);
+    renderer.set_block_break_overlay(Some(([0, 0, -2], 9)));
+    let cracked = render_visual_frame(&mut renderer, &camera);
+    let changed = changed_pixels(&baseline, &cracked);
+    assert!(
+        changed > 16,
+        "block-break overlay must draw non-zero changed crack pixels, got {changed}"
+    );
+}
+
+#[test]
+fn gpu_first_person_viewmodel_renders_changed_hand_pixels() {
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let camera = visual_camera();
+    let baseline = render_visual_frame(&mut renderer, &camera);
+    renderer.upload_viewmodel_surface_texture(1, 1, &[220, 160, 120, 255]);
+    renderer.set_viewmodel_extras(None, false, [1.0, 1.0, 1.0], 1.25);
+    renderer.set_first_person_viewmodel(FirstPersonViewmodel {
+        visible: true,
+        held_item_name: Some("minecraft:stone".to_string()),
+        held_color_rgb: [0.45, 0.48, 0.50],
+        is_block: true,
+        equip_progress: 1.0,
+        ..FirstPersonViewmodel::default()
+    });
+    let with_hand = render_visual_frame(&mut renderer, &camera);
+    let changed = changed_pixels(&baseline, &with_hand);
+    assert!(
+        changed > 16,
+        "first-person viewmodel must draw non-zero changed hand pixels, got {changed}"
+    );
+}
+
+#[test]
+fn gpu_title_panorama_renders_nonzero_cubemap_pixels() {
+    use megu_client_gpu::title_branding::RgbaImage;
+    use megu_client_gpu::vanilla_gui_sprites::{VanillaGuiAssets, VanillaGuiSpriteId};
+
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let mut assets = VanillaGuiAssets::default();
+    for (index, id) in [
+        VanillaGuiSpriteId::Panorama0,
+        VanillaGuiSpriteId::Panorama1,
+        VanillaGuiSpriteId::Panorama2,
+        VanillaGuiSpriteId::Panorama3,
+        VanillaGuiSpriteId::Panorama4,
+        VanillaGuiSpriteId::Panorama5,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rgba = Vec::with_capacity(4 * 4 * 4);
+        for _ in 0..16 {
+            rgba.extend_from_slice(&[40 + index as u8 * 30, 90, 180, 255]);
+        }
+        assets.sprites.insert(
+            id,
+            RgbaImage {
+                width: 4,
+                height: 4,
+                rgba,
+            },
+        );
+    }
+    assert!(renderer.upload_title_panorama(&assets, None));
+    assert!(renderer.has_title_panorama());
+    renderer.set_title_panorama_state(true, 0.3, -0.1, 1.0);
+    let pixels = render_visual_frame(&mut renderer, &visual_camera());
+    let nonzero = nonzero_rgb_pixels(&pixels);
+    assert!(
+        nonzero > 1_000,
+        "active title panorama must fill the frame with non-zero cubemap pixels, got {nonzero}"
+    );
+}
+
+#[test]
+fn gpu_textured_gameplay_overlay_renders_changed_screen_pixels() {
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    upload_fallback_world_assets(&mut renderer);
+    let camera = visual_camera();
+    let baseline = render_visual_frame(&mut renderer, &camera);
+    renderer.set_spyglass_alpha(0.35);
+    renderer.set_gameplay_screen_overlay(GameplayScreenOverlay {
+        hurt_alpha: 0.45,
+        fire_alpha: 0.35,
+        underwater_alpha: 0.25,
+        vignette_alpha: 0.30,
+        time_secs: 2.0,
+        ..GameplayScreenOverlay::default()
+    });
+    let overlaid = render_visual_frame(&mut renderer, &camera);
+    let changed = changed_pixels(&baseline, &overlaid);
+    assert!(
+        changed > 16,
+        "textured gameplay overlay must draw non-zero changed screen pixels, got {changed}"
+    );
+}
+
+#[test]
+fn gpu_world_env_frame_renders_changed_environment_pixels() {
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    upload_fallback_world_assets(&mut renderer);
+    let camera = visual_camera();
+    let baseline = render_visual_frame(&mut renderer, &camera);
+    renderer.set_world_env_frame(2, 1.0, true, 3, [0.0, 1.0, 0.0], 2.0);
+    let environment = render_visual_frame(&mut renderer, &camera);
+    let changed = changed_pixels(&baseline, &environment);
+    assert!(
+        changed > 16,
+        "world environment frame must draw non-zero changed environment pixels, got {changed}"
+    );
+}
+
+#[test]
+fn gpu_render_to_view_path_encodes_first_person_viewmodel() {
+    let Some(mut renderer) = visual_renderer() else {
+        return;
+    };
+    let camera = visual_camera();
+    let baseline = renderer
+        .render_offscreen_rgba(96, 96, &camera, None)
+        .expect("baseline render_to_view frame");
+    renderer.set_first_person_viewmodel(FirstPersonViewmodel {
+        visible: true,
+        equip_progress: 1.0,
+        ..FirstPersonViewmodel::default()
+    });
+    let with_hand = renderer
+        .render_offscreen_rgba(96, 96, &camera, None)
+        .expect("viewmodel render_to_view frame");
+    let changed = changed_pixels(&baseline, &with_hand);
+    assert!(
+        changed > 16,
+        "render_to_view must encode the first-person viewmodel, got {changed} changed pixels"
+    );
 }

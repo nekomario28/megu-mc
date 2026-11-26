@@ -62,6 +62,7 @@ use megu_ui::draw::{font_atlas_rgba, UiMesh, FONT_ATLAS_HEIGHT, FONT_ATLAS_WIDTH
 use winit::event_loop::OwnedDisplayHandle;
 
 use crate::atmosphere::{AtmosphereParams, BiomeAtmosphereBlender, ChunkFadeTracker};
+use crate::crack_overlay_pass::BlockBreakCrackPass;
 use crate::gpu_hiz::{CullStats, CullUniforms, GpuHizCuller, IndirectArgs, SectionGpuRecord};
 use crate::live_session::hw_adaptive_engine::{
     detect_universal_hardware_profile, select_compute_strategy, ComputeStrategy,
@@ -73,6 +74,7 @@ use crate::mesh_pool::{
     build_hiz_stream, compute_opaque_bucket_ranges, HiZSplatSection, MeshJob, MeshJobPool,
     MeshResult,
 };
+use crate::panorama_pass::TitlePanoramaPass;
 use crate::subworld_render::{
     lit_wgsl, pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms,
     DebugLineVertex, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank,
@@ -83,6 +85,10 @@ use crate::subworld_render::{
 };
 use crate::vanilla_world_assets::{
     DecodedRgbaTexture, VanillaEnvTexture, VanillaMiscOverlay, VanillaWorldAssets,
+};
+use crate::viewmodel_pass::FirstPersonViewmodelPass;
+use crate::world_env_pass::{
+    CelestialWeatherFrame, TexturedCelestialWeatherPass, TexturedGameplayOverlayPass,
 };
 use crate::{
     build_index_buffer, gpu_capabilities_for, gpu_shader_caps_for, mat4_mul_vec4,
@@ -3738,7 +3744,29 @@ pub struct GpuRenderer {
     pub notice: Option<String>,
     first_person_viewmodel: FirstPersonViewmodel,
     gameplay_screen_overlay: GameplayScreenOverlay,
-    gameplay_overlay_gpu: GameplayOverlayGpu,
+    viewmodel_pass: FirstPersonViewmodelPass,
+    crack_overlay_pass: BlockBreakCrackPass,
+    panorama_pass: TitlePanoramaPass,
+    celestial_weather_pass: TexturedCelestialWeatherPass,
+    textured_overlay_pass: TexturedGameplayOverlayPass,
+    viewmodel_depth_texture: Option<wgpu::Texture>,
+    viewmodel_depth_view: Option<wgpu::TextureView>,
+    viewmodel_depth_size: (u32, u32),
+    title_panorama_active: bool,
+    title_panorama_yaw_rad: f32,
+    title_panorama_pitch_rad: f32,
+    title_panorama_fade_alpha: f32,
+    viewmodel_uv_rect: Option<[f32; 4]>,
+    viewmodel_enchanted: bool,
+    viewmodel_light_rgb: [f32; 3],
+    viewmodel_time_secs: f32,
+    world_env_dimension_kind: u8,
+    world_env_rain_level: f32,
+    world_env_snowy: bool,
+    world_env_moon_phase: u8,
+    world_env_sun_dir: [f32; 3],
+    world_env_time_secs: f32,
+    spyglass_alpha: f32,
     biome_tint: [f32; 3],
     biome_tint_strength: f32,
     entity_atlas_texture: wgpu::Texture,
@@ -3810,20 +3838,6 @@ pub struct GameplayScreenOverlay {
     pub pumpkin_alpha: f32,
     pub vignette_alpha: f32,
     pub time_secs: f32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct GameplayOverlayUniform {
-    effects: [f32; 4],
-    extra: [f32; 4],
-    target: [f32; 4],
-}
-
-struct GameplayOverlayGpu {
-    pipeline: wgpu::RenderPipeline,
-    uniform: wgpu::Buffer,
-    bind_group: wgpu::BindGroup,
 }
 
 pub const GAMEPLAY_OVERLAY_WGSL: &str = r#"
@@ -7123,6 +7137,7 @@ struct ComposedWorldTarget<'a> {
     view: &'a wgpu::TextureView,
     size: (u32, u32),
     view_proj: Mat4,
+    camera: Camera,
     clear_rgb: [f32; 3],
     chunk_fades: &'a ChunkFadeTracker,
     /// Camera position — seeds the [`GraphCuller`] search's camera section.
@@ -7924,7 +7939,6 @@ impl GpuRenderer {
             vertex_scratch: Vec::new(),
         };
         let composite = Self::build_composite(&ctx, target_format, &frame_layout, &frame_ubo);
-        let gameplay_overlay_gpu = GameplayOverlayGpu::new(&ctx.device, target_format);
         let particle_instancing = composite.billboard.is_some();
         // Shared stand-in uniform + bind group for sections the composed
         // pass never draws directly (arena-resident opaque with no
@@ -8051,6 +8065,24 @@ impl GpuRenderer {
         };
         let gpu_paradigm = profile.gpu_paradigm;
         let sky = SkyGpu::new(&ctx, target_format);
+        let visual_assets = VanillaWorldAssets::fallback();
+        let viewmodel_pass =
+            FirstPersonViewmodelPass::new(&ctx.device, target_format, DEPTH_FORMAT);
+        let crack_overlay_pass =
+            BlockBreakCrackPass::new(&ctx.device, target_format, DEPTH_FORMAT);
+        let panorama_pass = TitlePanoramaPass::new(&ctx.device, &ctx.queue, target_format);
+        let celestial_weather_pass = TexturedCelestialWeatherPass::new(
+            &ctx.device,
+            &ctx.queue,
+            target_format,
+            &visual_assets,
+        );
+        let textured_overlay_pass = TexturedGameplayOverlayPass::new(
+            &ctx.device,
+            &ctx.queue,
+            target_format,
+            &visual_assets,
+        );
         let entity_fallback =
             upload_rgba_texture(&ctx, "entity-texture-fallback-white", 1, 1, &[255; 4]);
         let particle_fallback =
@@ -8275,7 +8307,29 @@ impl GpuRenderer {
             notice: None,
             first_person_viewmodel: FirstPersonViewmodel::default(),
             gameplay_screen_overlay: GameplayScreenOverlay::default(),
-            gameplay_overlay_gpu,
+            viewmodel_pass,
+            crack_overlay_pass,
+            panorama_pass,
+            celestial_weather_pass,
+            textured_overlay_pass,
+            viewmodel_depth_texture: None,
+            viewmodel_depth_view: None,
+            viewmodel_depth_size: (0, 0),
+            title_panorama_active: false,
+            title_panorama_yaw_rad: 0.0,
+            title_panorama_pitch_rad: 0.0,
+            title_panorama_fade_alpha: 1.0,
+            viewmodel_uv_rect: None,
+            viewmodel_enchanted: false,
+            viewmodel_light_rgb: [1.0; 3],
+            viewmodel_time_secs: 0.0,
+            world_env_dimension_kind: 0,
+            world_env_rain_level: 0.0,
+            world_env_snowy: false,
+            world_env_moon_phase: 0,
+            world_env_sun_dir: [0.0; 3],
+            world_env_time_secs: 0.0,
+            spyglass_alpha: 0.0,
             biome_tint: [1.0; 3],
             biome_tint_strength: 0.0,
             entity_atlas_texture: entity_fallback,
@@ -8351,6 +8405,96 @@ impl GpuRenderer {
         self.gameplay_screen_overlay
     }
 
+    pub fn upload_title_panorama(
+        &mut self,
+        assets: &crate::vanilla_gui_sprites::VanillaGuiAssets,
+        overlay: Option<(&[u8], u32, u32)>,
+    ) -> bool {
+        self.panorama_pass.upload_from_gui_assets(
+            &self.ctx.device,
+            &self.ctx.queue,
+            assets,
+            overlay,
+        )
+    }
+
+    pub fn set_title_panorama_state(
+        &mut self,
+        active: bool,
+        yaw_rad: f32,
+        pitch_rad: f32,
+        fade_alpha: f32,
+    ) {
+        self.title_panorama_active = active;
+        self.title_panorama_yaw_rad = if yaw_rad.is_finite() { yaw_rad } else { 0.0 };
+        self.title_panorama_pitch_rad = if pitch_rad.is_finite() { pitch_rad } else { 0.0 };
+        self.title_panorama_fade_alpha = if fade_alpha.is_finite() {
+            fade_alpha.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+    }
+
+    pub fn has_title_panorama(&self) -> bool {
+        self.panorama_pass.has_panorama()
+    }
+
+    pub fn set_viewmodel_extras(
+        &mut self,
+        uv_rect: Option<[f32; 4]>,
+        enchanted: bool,
+        light_rgb: [f32; 3],
+        time_secs: f32,
+    ) {
+        self.viewmodel_uv_rect = uv_rect.filter(|rect| rect.iter().all(|v| v.is_finite()));
+        self.viewmodel_enchanted = enchanted;
+        self.viewmodel_light_rgb = light_rgb.map(|v| if v.is_finite() { v } else { 1.0 });
+        self.viewmodel_time_secs = if time_secs.is_finite() { time_secs } else { 0.0 };
+    }
+
+    pub fn upload_viewmodel_surface_texture(&mut self, width: u32, height: u32, rgba: &[u8]) {
+        self.viewmodel_pass.upload_surface_texture(
+            &self.ctx.device,
+            &self.ctx.queue,
+            width,
+            height,
+            rgba,
+        );
+    }
+
+    pub fn set_world_env_frame(
+        &mut self,
+        dimension_kind: u8,
+        rain_level: f32,
+        snowy: bool,
+        moon_phase: u8,
+        sun_dir: [f32; 3],
+        time_secs: f32,
+    ) {
+        self.world_env_dimension_kind = dimension_kind;
+        self.world_env_rain_level = if rain_level.is_finite() {
+            rain_level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.world_env_snowy = snowy;
+        self.world_env_moon_phase = moon_phase;
+        self.world_env_sun_dir = if sun_dir.iter().all(|v| v.is_finite()) {
+            sun_dir
+        } else {
+            [0.0; 3]
+        };
+        self.world_env_time_secs = if time_secs.is_finite() { time_secs } else { 0.0 };
+    }
+
+    pub fn set_spyglass_alpha(&mut self, alpha: f32) {
+        self.spyglass_alpha = if alpha.is_finite() {
+            alpha.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+
     fn encode_gameplay_screen_overlay(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -8358,37 +8502,14 @@ impl GpuRenderer {
         width: u32,
         height: u32,
     ) {
-        let o = self.gameplay_screen_overlay;
-        let alpha = |value: f32| if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 };
-        let uniform = GameplayOverlayUniform {
-            effects: [alpha(o.hurt_alpha), alpha(o.fire_alpha), alpha(o.underwater_alpha), alpha(o.portal_alpha)],
-            extra: [alpha(o.freezing_alpha), alpha(o.pumpkin_alpha), alpha(o.vignette_alpha), if o.time_secs.is_finite() { o.time_secs } else { 0.0 }],
-            target: [width as f32, height as f32, 0.0, 0.0],
-        };
-        if uniform.effects.iter().chain(uniform.extra[..3].iter()).all(|&v| v <= 0.0) {
-            return;
-        }
-        self.ctx.queue.write_buffer(
-            &self.gameplay_overlay_gpu.uniform,
-            0,
-            bytemuck::bytes_of(&uniform),
+        self.textured_overlay_pass.encode(
+            encoder,
+            target,
+            width,
+            height,
+            &self.gameplay_screen_overlay,
+            self.spyglass_alpha,
         );
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("gameplay-screen-overlays"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&self.gameplay_overlay_gpu.pipeline);
-        pass.set_bind_group(0, &self.gameplay_overlay_gpu.bind_group, &[]);
-        pass.draw(0..3, 0..1);
     }
 
     /// Configure section tint consumed by the terrain section uniforms.
@@ -8461,6 +8582,11 @@ impl GpuRenderer {
     /// Upload all ten destroy-stage crack images and retain them for the
     /// translucent block-break overlay path.
     pub fn upload_destroy_stage_textures(&mut self, assets: &VanillaWorldAssets) {
+        self.crack_overlay_pass.upload_destroy_stages(
+            &self.ctx.device,
+            &self.ctx.queue,
+            assets,
+        );
         self.destroy_stage_textures.clear();
         self.destroy_stage_textures
             .reserve(assets.destroy_stages.len());
@@ -8514,6 +8640,27 @@ impl GpuRenderer {
                     );
                 }
             }
+        }
+        self.celestial_weather_pass = TexturedCelestialWeatherPass::new(
+            &self.ctx.device,
+            &self.ctx.queue,
+            self.target_format,
+            assets,
+        );
+        self.textured_overlay_pass = TexturedGameplayOverlayPass::new(
+            &self.ctx.device,
+            &self.ctx.queue,
+            self.target_format,
+            assets,
+        );
+        if let Some(glint) = assets.misc_overlays.get(&VanillaMiscOverlay::EnchantedGlintItem) {
+            self.viewmodel_pass.upload_glint_texture(
+                &self.ctx.device,
+                &self.ctx.queue,
+                glint.width,
+                glint.height,
+                &glint.rgba,
+            );
         }
         self.upload_destroy_stage_textures(assets);
     }
@@ -12180,6 +12327,82 @@ impl GpuRenderer {
         self.depth_size = (width, height);
     }
 
+    fn ensure_viewmodel_depth(&mut self, width: u32, height: u32) {
+        let size = (width.max(1), height.max(1));
+        if self.viewmodel_depth_size == size && self.viewmodel_depth_view.is_some() {
+            return;
+        }
+        let texture = self.ctx.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("first-person-viewmodel-depth"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        self.viewmodel_depth_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.viewmodel_depth_texture = Some(texture);
+        self.viewmodel_depth_size = size;
+    }
+
+    fn encode_title_panorama_if_active(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        if !self.title_panorama_active || !self.panorama_pass.has_panorama() {
+            return false;
+        }
+        self.panorama_pass.encode(
+            encoder,
+            &self.ctx.queue,
+            target,
+            width,
+            height,
+            self.title_panorama_yaw_rad,
+            self.title_panorama_pitch_rad,
+            self.title_panorama_fade_alpha,
+        );
+        true
+    }
+
+    fn celestial_weather_frame(
+        &self,
+        camera: &Camera,
+        aspect: f32,
+        fallback_world_time_ticks: u64,
+    ) -> CelestialWeatherFrame {
+        let sun_len2 = self.world_env_sun_dir.iter().map(|v| v * v).sum::<f32>();
+        let world_time_ticks = if sun_len2 > 1.0e-6 {
+            let phase = self.world_env_sun_dir[1]
+                .atan2(self.world_env_sun_dir[0])
+                .rem_euclid(std::f32::consts::TAU);
+            ((phase / std::f32::consts::TAU) * 24_000.0).round() as u64 % 24_000
+        } else {
+            fallback_world_time_ticks
+        };
+        CelestialWeatherFrame {
+            camera: *camera,
+            aspect,
+            world_time_ticks,
+            moon_phase: self.world_env_moon_phase,
+            dimension_kind: u32::from(self.world_env_dimension_kind),
+            rain_level: self.world_env_rain_level,
+            snowy: self.world_env_snowy,
+            cloud_alpha: 1.0,
+            cloud_height: 192.0,
+            time_secs: self.world_env_time_secs,
+        }
+    }
+
     /// Upload/replace the `client-ui` RGBA framebuffer texture. `rgba` must
     /// be `width * height * 4` bytes.
     pub fn update_ui_framebuffer(
@@ -12842,7 +13065,13 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        if self.window_camera.get().is_some() {
+        let title_panorama = self.encode_title_panorama_if_active(
+            &mut encoder,
+            view,
+            width,
+            height,
+        );
+        if !title_panorama && self.window_camera.get().is_some() {
             self.encode_window_composed_world(
                 &mut encoder,
                 view,
@@ -12854,7 +13083,7 @@ impl GpuRenderer {
                 lights,
                 rain_wetness,
             );
-        } else {
+        } else if !title_panorama {
             // No camera => no composed pass; still run the per-frame upload
             // boundary so queued section uploads keep draining.
             self.begin_render_upload_frame();
@@ -12959,6 +13188,7 @@ impl GpuRenderer {
                 }
             }
         }
+        self.encode_gameplay_screen_overlay(&mut encoder, view, width, height);
         // Second pass: the UI overlay — tessellated GPU quads when
         // `update_ui_mesh` installed a mesh, else the legacy CPU-blit
         // framebuffer (no depth attachment; both pipelines are depthless).
@@ -13120,6 +13350,7 @@ impl GpuRenderer {
                     view: &target_view,
                     size: (world_w, world_h),
                     view_proj: camera.view_projection(world_w as f32 / world_h as f32),
+                    camera,
                     clear_rgb,
                     chunk_fades,
                     camera_position: camera.position,
@@ -13135,6 +13366,7 @@ impl GpuRenderer {
                     view,
                     size: (width, height),
                     view_proj: camera.view_projection(aspect),
+                    camera,
                     clear_rgb,
                     chunk_fades,
                     camera_position: camera.position,
@@ -14534,6 +14766,7 @@ impl GpuRenderer {
             view,
             size: (width, height),
             view_proj,
+            camera,
             clear_rgb,
             chunk_fades,
             camera_position,
@@ -14558,7 +14791,10 @@ impl GpuRenderer {
             // The GPU Hi-Z culler reads the depth attachment after the
             // pass to build next frame's pyramid — a real downstream
             // consumer forcing depth writeback.
-            graph.add_pass("gpu-hiz-depth-build", &[frame_depth], &[], false);
+            graph.add_pass("gpu-hiz-depth-build", &[frame_depth], &[], true);
+        }
+        if !self.title_panorama_active {
+            graph.add_pass("textured-celestial-weather", &[frame_depth], &[], true);
         }
         match graph.compile() {
             Ok(compiled) => {
@@ -15022,6 +15258,15 @@ impl GpuRenderer {
                 }
             }
 
+            if !self.title_panorama_active && self.block_break_overlay.is_some() {
+                self.crack_overlay_pass.encode(
+                    &mut pass,
+                    &self.ctx.queue,
+                    view_proj,
+                    self.block_break_overlay,
+                );
+            }
+
             // Translucent terrain (stained glass) through the
             // alpha-blended composite variant. Short-circuit before
             // `set_pipeline` when nothing in the world can draw here.
@@ -15168,6 +15413,32 @@ impl GpuRenderer {
                 pass.draw(0..*count, 0..1);
             }
         }
+
+        if !self.title_panorama_active {
+            let aspect = width.max(1) as f32 / height.max(1) as f32;
+            let env_frame = self.celestial_weather_frame(&camera, aspect, world_time_ticks);
+            self.celestial_weather_pass
+                .encode(encoder, view, depth_view, &env_frame);
+            if self.first_person_viewmodel.visible {
+                self.ensure_viewmodel_depth(width, height);
+                let viewmodel_depth = self
+                    .viewmodel_depth_view
+                    .as_ref()
+                    .expect("viewmodel depth ensured");
+                self.viewmodel_pass.encode(
+                    &self.ctx.queue,
+                    encoder,
+                    view,
+                    viewmodel_depth,
+                    &self.first_person_viewmodel,
+                    aspect,
+                    self.viewmodel_light_rgb,
+                    self.viewmodel_uv_rect,
+                    self.viewmodel_enchanted,
+                    self.viewmodel_time_secs,
+                );
+            }
+        }
         // H6: the indirect frame's `runs` buffer goes straight back into
         // the retained scratch — the next camera-crossing miss refills
         // the same allocation instead of dropping it and reallocating.
@@ -15283,42 +15554,52 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("composed-frame"),
             });
-        self.dispatch_shadow_work(&mut encoder, camera, aspect, decision);
-        if scaled {
-            let target_view = self
-                .scaled_target
-                .as_ref()
-                .map(|t| t.view.clone())
-                .expect("ensured above");
-            self.encode_composed_world(
-                &mut encoder,
-                &ComposedWorldTarget {
-                    view: &target_view,
-                    size: (world_w, world_h),
-                    view_proj,
-                    clear_rgb,
-                    chunk_fades: frame.chunk_fades,
-                    camera_position: camera.position,
-                    focal_y_px: camera_focal_y_px(camera, world_h),
-                    world_time_ticks: frame.world_time_ticks,
-                },
-            );
-            // Upscale the reduced-res world to native before the UI pass.
-            self.encode_sharpen_upscale(&mut encoder, &native_view, (world_w, world_h));
-        } else {
-            self.encode_composed_world(
-                &mut encoder,
-                &ComposedWorldTarget {
-                    view: &native_view,
-                    size: (width, height),
-                    view_proj,
-                    clear_rgb,
-                    chunk_fades: frame.chunk_fades,
-                    camera_position: camera.position,
-                    focal_y_px: camera_focal_y_px(camera, height),
-                    world_time_ticks: frame.world_time_ticks,
-                },
-            );
+        let title_panorama = self.encode_title_panorama_if_active(
+            &mut encoder,
+            &native_view,
+            width,
+            height,
+        );
+        if !title_panorama {
+            self.dispatch_shadow_work(&mut encoder, camera, aspect, decision);
+            if scaled {
+                let target_view = self
+                    .scaled_target
+                    .as_ref()
+                    .map(|t| t.view.clone())
+                    .expect("ensured above");
+                self.encode_composed_world(
+                    &mut encoder,
+                    &ComposedWorldTarget {
+                        view: &target_view,
+                        size: (world_w, world_h),
+                        view_proj,
+                        camera: *camera,
+                        clear_rgb,
+                        chunk_fades: frame.chunk_fades,
+                        camera_position: camera.position,
+                        focal_y_px: camera_focal_y_px(camera, world_h),
+                        world_time_ticks: frame.world_time_ticks,
+                    },
+                );
+                // Upscale the reduced-res world to native before the UI pass.
+                self.encode_sharpen_upscale(&mut encoder, &native_view, (world_w, world_h));
+            } else {
+                self.encode_composed_world(
+                    &mut encoder,
+                    &ComposedWorldTarget {
+                        view: &native_view,
+                        size: (width, height),
+                        view_proj,
+                        camera: *camera,
+                        clear_rgb,
+                        chunk_fades: frame.chunk_fades,
+                        camera_position: camera.position,
+                        focal_y_px: camera_focal_y_px(camera, height),
+                        world_time_ticks: frame.world_time_ticks,
+                    },
+                );
+            }
         }
         self.encode_gameplay_screen_overlay(&mut encoder, &native_view, width, height);
         // UI overlay at native resolution: tessellated GPU quads when
@@ -15418,64 +15699,6 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
             min_binding_size: None,
         },
         count: None,
-    }
-}
-
-impl GameplayOverlayGpu {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gameplay-overlay-layout"),
-            entries: &[uniform_entry(0)],
-        });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gameplay-overlay-shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GAMEPLAY_OVERLAY_WGSL)),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("gameplay-overlay-pipeline-layout"),
-            bind_group_layouts: &[Some(&layout)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gameplay-overlay-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(ALPHA_BLEND),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("gameplay-overlay-uniform"),
-            size: std::mem::size_of::<GameplayOverlayUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gameplay-overlay-bind-group"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
-        Self { pipeline, uniform, bind_group }
     }
 }
 
