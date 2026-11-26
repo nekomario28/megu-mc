@@ -160,6 +160,28 @@ const SYNTAX_ESCAPE: char = '\\';
 const SYNTAX_DOUBLE_QUOTE: char = '"';
 const SYNTAX_SINGLE_QUOTE: char = '\'';
 
+/// `readInt`/`readLong`/`readDouble`/`readFloat` differ only in their numeric type and in the
+/// built-in exception pair they report, so one body expands to all four. A token that does not
+/// parse leaves the cursor at its first character, as Java's readers do.
+macro_rules! reader_number {
+    ($($method:ident -> $ty:ty: $expected:ident / $invalid:ident),+ $(,)?) => {$(
+        pub fn $method(&mut self) -> Result<$ty, CommandSyntaxException> {
+            let (start, end) = self.scan_number();
+            let number = self.string[start..end].to_string();
+            if number.is_empty() {
+                return Err(BUILT_IN_EXCEPTIONS.$expected().create_with_context(self));
+            }
+            match number.parse::<$ty>() {
+                Ok(value) => Ok(value),
+                Err(_) => {
+                    self.cursor = start;
+                    Err(BUILT_IN_EXCEPTIONS.$invalid().create_with_context(self, &number))
+                }
+            }
+        }
+    )+};
+}
+
 impl StringReader {
     pub fn new(string: impl Into<String>) -> Self {
         Self {
@@ -256,64 +278,11 @@ impl StringReader {
         (start, self.cursor)
     }
 
-    pub fn read_int(&mut self) -> Result<i32, CommandSyntaxException> {
-        let (start, end) = self.scan_number();
-        let number = self.string[start..end].to_string();
-        if number.is_empty() {
-            return Err(BUILT_IN_EXCEPTIONS.reader_expected_int().create_with_context(self));
-        }
-        match number.parse::<i32>() {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                self.cursor = start;
-                Err(BUILT_IN_EXCEPTIONS.reader_invalid_int().create_with_context(self, &number))
-            }
-        }
-    }
-
-    pub fn read_long(&mut self) -> Result<i64, CommandSyntaxException> {
-        let (start, end) = self.scan_number();
-        let number = self.string[start..end].to_string();
-        if number.is_empty() {
-            return Err(BUILT_IN_EXCEPTIONS.reader_expected_long().create_with_context(self));
-        }
-        match number.parse::<i64>() {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                self.cursor = start;
-                Err(BUILT_IN_EXCEPTIONS.reader_invalid_long().create_with_context(self, &number))
-            }
-        }
-    }
-
-    pub fn read_double(&mut self) -> Result<f64, CommandSyntaxException> {
-        let (start, end) = self.scan_number();
-        let number = self.string[start..end].to_string();
-        if number.is_empty() {
-            return Err(BUILT_IN_EXCEPTIONS.reader_expected_double().create_with_context(self));
-        }
-        match number.parse::<f64>() {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                self.cursor = start;
-                Err(BUILT_IN_EXCEPTIONS.reader_invalid_double().create_with_context(self, &number))
-            }
-        }
-    }
-
-    pub fn read_float(&mut self) -> Result<f32, CommandSyntaxException> {
-        let (start, end) = self.scan_number();
-        let number = self.string[start..end].to_string();
-        if number.is_empty() {
-            return Err(BUILT_IN_EXCEPTIONS.reader_expected_float().create_with_context(self));
-        }
-        match number.parse::<f32>() {
-            Ok(value) => Ok(value),
-            Err(_) => {
-                self.cursor = start;
-                Err(BUILT_IN_EXCEPTIONS.reader_invalid_float().create_with_context(self, &number))
-            }
-        }
+    reader_number! {
+        read_int -> i32: reader_expected_int / reader_invalid_int,
+        read_long -> i64: reader_expected_long / reader_invalid_long,
+        read_double -> f64: reader_expected_double / reader_invalid_double,
+        read_float -> f32: reader_expected_float / reader_invalid_float,
     }
 
     pub fn is_allowed_in_unquoted_string(c: char) -> bool {
@@ -626,19 +595,14 @@ impl SelectorSpec {
     ) -> Result<(), CommandSyntaxException> {
         let mut locked = HashSet::new();
         let mut exclusions = HashSet::new();
+        // Leading whitespace must be consumed before the `]` test, so `@e[ ]` ends at once
+        // instead of reading an empty key.
         reader.skip_whitespace();
         while reader.can_read() && reader.peek() != Some(']') {
             reader.skip_whitespace();
             let key = reader.read_string()?;
-            if locked.contains(&key)
-                || (key == "type" && self.variable.players_only())
-                || (matches!(key.as_str(), "limit" | "sort")
-                    && self.variable == SelectorVariable::SelfEntity)
-            {
-                return Err(selector_error(
-                    reader,
-                    format!("Inapplicable selector option '{key}'"),
-                ));
+            if locked.contains(&key) || Self::variable_rejects_option(self.variable, &key) {
+                return Err(inapplicable_option(reader, &key));
             }
 
             reader.skip_whitespace();
@@ -650,65 +614,16 @@ impl SelectorSpec {
             ) && selector_take(reader, '!');
             reader.skip_whitespace();
             if exclusions.contains(&key) && !negated {
-                return Err(selector_error(
-                    reader,
-                    format!("Inapplicable selector option '{key}'"),
-                ));
+                return Err(inapplicable_option(reader, &key));
             }
 
-            let mut repeatable = false;
-            match key.as_str() {
-                "x" => self.origin[0] = Some(reader.read_double()?),
-                "y" => self.origin[1] = Some(reader.read_double()?),
-                "z" => self.origin[2] = Some(reader.read_double()?),
-                "dx" => self.delta[0] = Some(reader.read_double()?),
-                "dy" => self.delta[1] = Some(reader.read_double()?),
-                "dz" => self.delta[2] = Some(reader.read_double()?),
-                "distance" => self.distance = Some(read_selector_range(reader, Some(0.0), false)?),
-                "level" => self.level = Some(read_selector_range(reader, Some(0), false)?),
-                "x_rotation" => self.pitch = Some(read_selector_range(reader, None, true)?),
-                "y_rotation" => self.yaw = Some(read_selector_range(reader, None, true)?),
-                "limit" => {
-                    let limit = reader.read_int()?;
-                    if limit < 1 {
-                        return Err(selector_error(reader, "Selector limit must be positive"));
-                    }
-                    self.limit = limit as usize;
-                }
-                "sort" => {
-                    self.sort = match reader.read_unquoted_string().as_str() {
-                        "nearest" => SelectorSort::Nearest,
-                        "furthest" => SelectorSort::Furthest,
-                        "random" => SelectorSort::Random,
-                        "arbitrary" => SelectorSort::Arbitrary,
-                        _ => return Err(selector_error(reader, "Unknown selector sort")),
-                    };
-                }
-                "name" | "gamemode" | "team" | "type" | "tag" | "nbt" | "scores"
-                | "advancements" | "predicate" => {
-                    let filter = read_selector_filter(reader, &key, negated, &entity_type_exists)?;
-                    if negated && matches!(key.as_str(), "name" | "gamemode" | "type") {
-                        exclusions.insert(key.clone());
-                        repeatable = true;
-                    } else {
-                        repeatable = matches!(
-                            filter,
-                            SelectorFilter::Tag(..)
-                                | SelectorFilter::Nbt { .. }
-                                | SelectorFilter::Predicate(..)
-                                | SelectorFilter::Team(_, true)
-                                | SelectorFilter::Type { tag: true, .. }
-                        );
-                    }
-                    self.filters.push(filter);
-                }
-                _ => {
-                    return Err(selector_error(
-                        reader,
-                        format!("Unknown selector option '{key}'"),
-                    ))
-                }
-            }
+            let repeatable = self.read_option(
+                reader,
+                &key,
+                negated,
+                &entity_type_exists,
+                &mut exclusions,
+            )?;
             if !repeatable {
                 locked.insert(key);
             }
@@ -720,11 +635,88 @@ impl SelectorSpec {
         reader.expect(']')
     }
 
+    /// Options no variable accepts: `type` is meaningless for the player-only variables, and a
+    /// single self is not something to sort or cap.
+    fn variable_rejects_option(variable: SelectorVariable, key: &str) -> bool {
+        (key == "type" && variable.players_only())
+            || (matches!(key, "limit" | "sort") && variable == SelectorVariable::SelfEntity)
+    }
+
+    /// Apply one `key=value` option whose value starts at the reader. Returns whether a later
+    /// `key=` may repeat it: negated `name`/`gamemode`/`type` accumulate into `exclusions`, and
+    /// the remaining repeatable options are the inherently multi-valued filters. Everything
+    /// else is locked by the caller.
+    fn read_option(
+        &mut self,
+        reader: &mut StringReader,
+        key: &str,
+        negated: bool,
+        entity_type_exists: &impl Fn(&str) -> bool,
+        exclusions: &mut HashSet<String>,
+    ) -> Result<bool, CommandSyntaxException> {
+        let mut repeatable = false;
+        match key {
+            "x" => self.origin[0] = Some(reader.read_double()?),
+            "y" => self.origin[1] = Some(reader.read_double()?),
+            "z" => self.origin[2] = Some(reader.read_double()?),
+            "dx" => self.delta[0] = Some(reader.read_double()?),
+            "dy" => self.delta[1] = Some(reader.read_double()?),
+            "dz" => self.delta[2] = Some(reader.read_double()?),
+            "distance" => self.distance = Some(read_selector_range(reader, Some(0.0), false)?),
+            "level" => self.level = Some(read_selector_range(reader, Some(0), false)?),
+            "x_rotation" => self.pitch = Some(read_selector_range(reader, None, true)?),
+            "y_rotation" => self.yaw = Some(read_selector_range(reader, None, true)?),
+            "limit" => {
+                let limit = reader.read_int()?;
+                if limit < 1 {
+                    return Err(selector_error(reader, "Selector limit must be positive"));
+                }
+                self.limit = limit as usize;
+            }
+            "sort" => {
+                self.sort = match reader.read_unquoted_string().as_str() {
+                    "nearest" => SelectorSort::Nearest,
+                    "furthest" => SelectorSort::Furthest,
+                    "random" => SelectorSort::Random,
+                    "arbitrary" => SelectorSort::Arbitrary,
+                    _ => return Err(selector_error(reader, "Unknown selector sort")),
+                };
+            }
+            "name" | "gamemode" | "team" | "type" | "tag" | "nbt" | "scores"
+            | "advancements" | "predicate" => {
+                let filter = read_selector_filter(reader, key, negated, entity_type_exists)?;
+                repeatable = if negated && matches!(key, "name" | "gamemode" | "type") {
+                    exclusions.insert(key.to_owned());
+                    true
+                } else {
+                    matches!(
+                        filter,
+                        SelectorFilter::Tag(..)
+                            | SelectorFilter::Nbt { .. }
+                            | SelectorFilter::Predicate(..)
+                            | SelectorFilter::Team(_, true)
+                            | SelectorFilter::Type { tag: true, .. }
+                    )
+                };
+                self.filters.push(filter);
+            }
+            _ => {
+                return Err(selector_error(
+                    reader,
+                    format!("Unknown selector option '{key}'"),
+                ))
+            }
+        }
+        Ok(repeatable)
+    }
+
     pub(crate) fn filters(&self) -> &[SelectorFilter] {
         &self.filters
     }
 }
 
+/// The exception every selector error shares: a dispatcher parse failure pointing at the
+/// reader's cursor, which is why each message reports the offset it was raised at.
 fn selector_error(reader: &StringReader, message: impl Into<String>) -> CommandSyntaxException {
     CommandSyntaxException::with_context(
         CommandExceptionType::DispatcherParseException,
@@ -734,6 +726,11 @@ fn selector_error(reader: &StringReader, message: impl Into<String>) -> CommandS
     )
 }
 
+/// A selector option that this variable, or an earlier option, has already ruled out.
+fn inapplicable_option(reader: &StringReader, key: &str) -> CommandSyntaxException {
+    selector_error(reader, format!("Inapplicable selector option '{key}'"))
+}
+
 fn selector_take(reader: &mut StringReader, c: char) -> bool {
     if reader.peek() == Some(c) {
         reader.skip();
@@ -741,6 +738,18 @@ fn selector_take(reader: &mut StringReader, c: char) -> bool {
     } else {
         false
     }
+}
+
+/// Consume the `,` between two entries of a selector option list, map or SNBT collection.
+/// `false` means the list ends here. Surrounding whitespace is skipped either way, which is
+/// what every entry loop in this module does before testing for its closing delimiter.
+fn selector_take_comma(reader: &mut StringReader) -> bool {
+    reader.skip_whitespace();
+    if !selector_take(reader, ',') {
+        return false;
+    }
+    reader.skip_whitespace();
+    true
 }
 
 fn read_selector_range<T: Copy + PartialOrd + std::str::FromStr>(
@@ -833,66 +842,91 @@ fn read_selector_map<K: Eq + std::hash::Hash, V>(
     Ok(entries)
 }
 
+/// One filter option's value, keyed by the option name the caller already read. Every branch
+/// consumes exactly the text that option owns and leaves the cursor on the `,`/`]` that ends it.
 fn read_selector_filter(
     reader: &mut StringReader,
     key: &str,
     negated: bool,
     entity_type_exists: &impl Fn(&str) -> bool,
 ) -> Result<SelectorFilter, CommandSyntaxException> {
-    let word = |reader: &mut StringReader| Ok(reader.read_unquoted_string());
     Ok(match key {
         "name" => SelectorFilter::Name(reader.read_string()?, negated),
-        "gamemode" => {
-            let mode = match reader.read_unquoted_string().as_str() {
-                "survival" => SelectorGameMode::Survival,
-                "creative" => SelectorGameMode::Creative,
-                "adventure" => SelectorGameMode::Adventure,
-                "spectator" => SelectorGameMode::Spectator,
-                _ => return Err(selector_error(reader, "Unknown selector gamemode")),
-            };
-            SelectorFilter::GameMode(mode, negated)
-        }
+        "gamemode" => SelectorFilter::GameMode(selector_gamemode(reader)?, negated),
         "team" => SelectorFilter::Team(reader.read_unquoted_string(), negated),
-        "type" => {
-            let tag = selector_take(reader, '#');
-            reader.skip_whitespace();
-            let id = read_selector_resource(reader)?;
-            if !tag && !entity_type_exists(&id) {
-                return Err(selector_error(
-                    reader,
-                    format!("Unknown entity type '{id}'"),
-                ));
-            }
-            SelectorFilter::Type { id, tag, negated }
-        }
+        "type" => selector_type(reader, negated, entity_type_exists)?,
         "tag" => SelectorFilter::Tag(reader.read_unquoted_string(), negated),
-        "nbt" => {
-            let start = reader.cursor();
-            let value = SelectorNbt(read_selector_snbt_compound(reader, 0)?);
-            SelectorFilter::Nbt {
-                raw: reader.string()[start..reader.cursor()].to_owned(),
-                value,
-                negated,
-            }
-        }
-        "scores" => SelectorFilter::Scores(read_selector_map(reader, word, |reader| {
+        "nbt" => selector_nbt(reader, negated)?,
+        "scores" => SelectorFilter::Scores(read_selector_map(reader, selector_word, |reader| {
             read_selector_range(reader, None, false)
         })?),
         "advancements" => SelectorFilter::Advancements(read_selector_map(
             reader,
             read_selector_resource,
-            |reader| {
-                if reader.peek() == Some('{') {
-                    read_selector_map(reader, word, StringReader::read_boolean)
-                        .map(SelectorAdvancement::Criteria)
-                } else {
-                    reader.read_boolean().map(SelectorAdvancement::Done)
-                }
-            },
+            selector_advancement,
         )?),
         "predicate" => SelectorFilter::Predicate(read_selector_resource(reader)?, negated),
         _ => unreachable!("non-filter selector option"),
     })
+}
+
+/// An unquoted word, in the shape `read_selector_map` wants for a key or value reader.
+fn selector_word(reader: &mut StringReader) -> Result<String, CommandSyntaxException> {
+    Ok(reader.read_unquoted_string())
+}
+
+fn selector_gamemode(
+    reader: &mut StringReader,
+) -> Result<SelectorGameMode, CommandSyntaxException> {
+    Ok(match reader.read_unquoted_string().as_str() {
+        "survival" => SelectorGameMode::Survival,
+        "creative" => SelectorGameMode::Creative,
+        "adventure" => SelectorGameMode::Adventure,
+        "spectator" => SelectorGameMode::Spectator,
+        _ => return Err(selector_error(reader, "Unknown selector gamemode")),
+    })
+}
+
+/// `type=`: a `#`-prefixed entity type tag is resolved at match time, so only a plain type is
+/// checked against the registry here.
+fn selector_type(
+    reader: &mut StringReader,
+    negated: bool,
+    entity_type_exists: &impl Fn(&str) -> bool,
+) -> Result<SelectorFilter, CommandSyntaxException> {
+    let tag = selector_take(reader, '#');
+    reader.skip_whitespace();
+    let id = read_selector_resource(reader)?;
+    if !tag && !entity_type_exists(&id) {
+        return Err(selector_error(reader, format!("Unknown entity type '{id}'")));
+    }
+    Ok(SelectorFilter::Type { id, tag, negated })
+}
+
+/// `nbt=`: the raw text is kept for error reporting, the parsed compound for matching.
+fn selector_nbt(
+    reader: &mut StringReader,
+    negated: bool,
+) -> Result<SelectorFilter, CommandSyntaxException> {
+    let start = reader.cursor();
+    let value = SelectorNbt(read_selector_snbt_compound(reader, 0)?);
+    Ok(SelectorFilter::Nbt {
+        raw: reader.string()[start..reader.cursor()].to_owned(),
+        value,
+        negated,
+    })
+}
+
+/// One `advancements=` value: a bare boolean, or a criteria map that must all hold.
+fn selector_advancement(
+    reader: &mut StringReader,
+) -> Result<SelectorAdvancement, CommandSyntaxException> {
+    if reader.peek() == Some('{') {
+        read_selector_map(reader, selector_word, StringReader::read_boolean)
+            .map(SelectorAdvancement::Criteria)
+    } else {
+        reader.read_boolean().map(SelectorAdvancement::Done)
+    }
 }
 
 /// A parsed SNBT compound for selector queries or entity snapshots.
@@ -994,11 +1028,9 @@ fn read_selector_snbt_compound(
         reader.skip_whitespace();
         reader.expect(':')?;
         entries.insert(key, read_selector_snbt_value(reader, depth + 1)?);
-        reader.skip_whitespace();
-        if !selector_take(reader, ',') {
+        if !selector_take_comma(reader) {
             break;
         }
-        reader.skip_whitespace();
     }
     reader.expect('}')?;
     Ok(SnbtValue::Compound(entries))
@@ -1062,11 +1094,9 @@ fn read_selector_snbt_list(
             ));
         }
         entries.push(item);
-        reader.skip_whitespace();
-        if !selector_take(reader, ',') {
+        if !selector_take_comma(reader) {
             break;
         }
-        reader.skip_whitespace();
     }
     reader.expect(']')?;
     Ok(if kind == List {
@@ -1265,55 +1295,72 @@ fn selector_distance_squared(origin: [f64; 3], position: [f64; 3]) -> f64 {
     x * x + y * y + z * z
 }
 
-/// Filter eligible candidates, order them, then apply the selector's maximum result count.
-/// Supply eligible candidates in world iteration order with globally unique IDs. Candidates
-/// without NBT or a predicate result also fail negated checks against that data.
-/// `random_index(end)` draws a uniform index in `0..end` from the caller's RNG.
-pub(crate) fn select_entities<'a, 'data>(
-    spec: &SelectorSpec,
-    source: &SelectorSource<'_>,
-    candidates: &'a [SelectorCandidate<'data>],
-    mut check_predicate: impl FnMut(&SelectorCandidate<'_>, &str) -> Option<bool>,
-    mut random_index: impl FnMut(usize) -> usize,
-) -> Vec<&'a SelectorCandidate<'data>> {
-    let origin = std::array::from_fn(|axis| spec.origin[axis].unwrap_or(source.position[axis]));
-    let local = spec.origin.iter().any(Option::is_some)
-        || spec.delta.iter().any(Option::is_some)
-        || spec.distance.is_some();
-    let current = spec.variable == SelectorVariable::SelfEntity;
-    let volume: Option<[[f64; 3]; 2]> = if spec.delta.iter().any(Option::is_some) {
-        let delta = spec.delta.map(|size| size.unwrap_or(0.0));
-        Some([
-            std::array::from_fn(|axis| origin[axis] + delta[axis].min(0.0)),
-            std::array::from_fn(|axis| origin[axis] + (delta[axis].max(0.0) + 1.0)),
-        ])
-    } else {
-        spec.distance
-            .as_ref()
-            .and_then(|range| range.max)
-            .map(|max| {
-                [
-                    origin.map(|coordinate| coordinate - max),
-                    origin.map(|coordinate| coordinate + (max + 1.0)),
-                ]
-            })
-    };
-    let distance = spec.distance.as_ref().map(|range| SelectorRange {
-        min: range.min.map(|bound| bound * bound),
-        max: range.max.map(|bound| bound * bound),
-    });
+/// The bounds one selector scan tests every candidate against. They depend only on the spec
+/// and the source, so a scan computes them once instead of once per candidate.
+struct SelectorScan {
+    origin: [f64; 3],
+    local: bool,
+    current: bool,
+    volume: Option<[[f64; 3]; 2]>,
+    distance: Option<SelectorRange<f64>>,
+}
 
-    let mut selected = Vec::new();
-    for candidate in candidates {
+impl SelectorScan {
+    fn new(spec: &SelectorSpec, source: &SelectorSource<'_>) -> Self {
+        let origin = std::array::from_fn(|axis| spec.origin[axis].unwrap_or(source.position[axis]));
+        let local = spec.origin.iter().any(Option::is_some)
+            || spec.delta.iter().any(Option::is_some)
+            || spec.distance.is_some();
+        let volume = if spec.delta.iter().any(Option::is_some) {
+            let delta = spec.delta.map(|size| size.unwrap_or(0.0));
+            Some([
+                std::array::from_fn(|axis| origin[axis] + delta[axis].min(0.0)),
+                std::array::from_fn(|axis| origin[axis] + (delta[axis].max(0.0) + 1.0)),
+            ])
+        } else {
+            spec.distance
+                .as_ref()
+                .and_then(|range| range.max)
+                .map(|max| {
+                    [
+                        origin.map(|coordinate| coordinate - max),
+                        origin.map(|coordinate| coordinate + (max + 1.0)),
+                    ]
+                })
+        };
+        // Squaring the bounds once here lets every candidate comparison use the squared
+        // distance, which needs no square root.
+        let distance = spec.distance.as_ref().map(|range| SelectorRange {
+            min: range.min.map(|bound| bound * bound),
+            max: range.max.map(|bound| bound * bound),
+        });
+        Self {
+            origin,
+            local,
+            current: spec.variable == SelectorVariable::SelfEntity,
+            volume,
+            distance,
+        }
+    }
+
+    /// Every rejection rule of the selector, in evaluation order: variable and locality, each
+    /// filter, the rotation and level ranges, then the volume and squared-distance bounds.
+    fn accepts(
+        &self,
+        spec: &SelectorSpec,
+        source: &SelectorSource<'_>,
+        candidate: &SelectorCandidate<'_>,
+        check_predicate: &mut impl FnMut(&SelectorCandidate<'_>, &str) -> Option<bool>,
+    ) -> bool {
         let is_player = candidate.entity_type == "minecraft:player";
-        if (current && source.executor != Some(candidate.id))
-            || (!current && local && candidate.dimension != source.dimension)
+        if (self.current && source.executor != Some(candidate.id))
+            || (!self.current && self.local && candidate.dimension != source.dimension)
             || (spec.variable.players_only() && !is_player)
             || (spec.variable.requires_alive() && !candidate.alive)
             || !spec
                 .filters
                 .iter()
-                .all(|filter| filter.matches(candidate, &mut check_predicate))
+                .all(|filter| filter.matches(candidate, &mut *check_predicate))
             || spec
                 .pitch
                 .as_ref()
@@ -1326,9 +1373,9 @@ pub(crate) fn select_entities<'a, 'data>(
                 !is_player || !candidate.level.is_some_and(|level| range.contains(level))
             })
         {
-            continue;
+            return false;
         }
-        if let Some([min, max]) = volume {
+        if let Some([min, max]) = self.volume {
             let intersects = match candidate.bounds {
                 Some([entity_min, entity_max]) => (0..3)
                     .all(|axis| min[axis] < entity_max[axis] && max[axis] > entity_min[axis]),
@@ -1337,15 +1384,39 @@ pub(crate) fn select_entities<'a, 'data>(
                 }),
             };
             if !intersects {
-                continue;
+                return false;
             }
         }
-        if distance.as_ref().is_some_and(|range| {
-            !range.contains(selector_distance_squared(origin, candidate.position))
-        }) {
+        !self.distance.as_ref().is_some_and(|range| {
+            !range.contains(selector_distance_squared(self.origin, candidate.position))
+        })
+    }
+
+    fn distance_to(&self, candidate: &SelectorCandidate<'_>) -> f64 {
+        selector_distance_squared(self.origin, candidate.position)
+    }
+}
+
+/// Filter eligible candidates, order them, then apply the selector's maximum result count.
+/// Supply eligible candidates in world iteration order with globally unique IDs. Candidates
+/// without NBT or a predicate result also fail negated checks against that data.
+/// `random_index(end)` draws a uniform index in `0..end` from the caller's RNG.
+pub(crate) fn select_entities<'a, 'data>(
+    spec: &SelectorSpec,
+    source: &SelectorSource<'_>,
+    candidates: &'a [SelectorCandidate<'data>],
+    mut check_predicate: impl FnMut(&SelectorCandidate<'_>, &str) -> Option<bool>,
+    mut random_index: impl FnMut(usize) -> usize,
+) -> Vec<&'a SelectorCandidate<'data>> {
+    let scan = SelectorScan::new(spec, source);
+    let mut selected = Vec::new();
+    for candidate in candidates {
+        if !scan.accepts(spec, source, candidate, &mut check_predicate) {
             continue;
         }
         selected.push(candidate);
+        // An arbitrary sort keeps world iteration order, so it can stop at the limit; every
+        // other sort needs the whole set before it knows which entries survive.
         if spec.sort == SelectorSort::Arbitrary && selected.len() == spec.limit {
             break;
         }
@@ -1353,16 +1424,10 @@ pub(crate) fn select_entities<'a, 'data>(
 
     match spec.sort {
         SelectorSort::Nearest => {
-            selected.sort_by(|a, b| {
-                selector_distance_squared(origin, a.position)
-                    .total_cmp(&selector_distance_squared(origin, b.position))
-            });
+            selected.sort_by(|a, b| scan.distance_to(a).total_cmp(&scan.distance_to(b)));
         }
         SelectorSort::Furthest => {
-            selected.sort_by(|a, b| {
-                selector_distance_squared(origin, b.position)
-                    .total_cmp(&selector_distance_squared(origin, a.position))
-            });
+            selected.sort_by(|a, b| scan.distance_to(b).total_cmp(&scan.distance_to(a)));
         }
         SelectorSort::Random => {
             for end in (2..=selected.len()).rev() {
@@ -2481,53 +2546,31 @@ pub struct BuiltInExceptions;
 
 pub const BUILT_IN_EXCEPTIONS: BuiltInExceptions = BuiltInExceptions;
 
+/// The eight numeric bound exceptions share one message shape: `<Type> must not be <comparison>
+/// <bound>, found <value>`. Java passes the value and the bound as two `Object`s; the message
+/// interpolates them in that order here too.
+macro_rules! numeric_bound_exceptions {
+    ($($method:ident : $kind:ident, $message:literal),+ $(,)?) => {$(
+        pub const fn $method(&self) -> Dynamic2CommandExceptionType {
+            Dynamic2CommandExceptionType::new(CommandExceptionType::$kind, |found, bound| {
+                // Named arguments are explicit here: a format string that reaches `format!`
+                // through a macro metavariable cannot use implicit captures.
+                format!($message, bound = bound, found = found)
+            })
+        }
+    )+};
+}
+
 impl BuiltInExceptions {
-    pub const fn double_too_low(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::DoubleTooLow, |found, min| {
-            format!("Double must not be less than {min}, found {found}")
-        })
-    }
-
-    pub const fn double_too_high(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::DoubleTooHigh, |found, max| {
-            format!("Double must not be more than {max}, found {found}")
-        })
-    }
-
-    pub const fn float_too_low(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::FloatTooLow, |found, min| {
-            format!("Float must not be less than {min}, found {found}")
-        })
-    }
-
-    pub const fn float_too_high(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::FloatTooHigh, |found, max| {
-            format!("Float must not be more than {max}, found {found}")
-        })
-    }
-
-    pub const fn integer_too_low(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::IntegerTooLow, |found, min| {
-            format!("Integer must not be less than {min}, found {found}")
-        })
-    }
-
-    pub const fn integer_too_high(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::IntegerTooHigh, |found, max| {
-            format!("Integer must not be more than {max}, found {found}")
-        })
-    }
-
-    pub const fn long_too_low(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::LongTooLow, |found, min| {
-            format!("Long must not be less than {min}, found {found}")
-        })
-    }
-
-    pub const fn long_too_high(&self) -> Dynamic2CommandExceptionType {
-        Dynamic2CommandExceptionType::new(CommandExceptionType::LongTooHigh, |found, max| {
-            format!("Long must not be more than {max}, found {found}")
-        })
+    numeric_bound_exceptions! {
+        double_too_low: DoubleTooLow, "Double must not be less than {bound}, found {found}",
+        double_too_high: DoubleTooHigh, "Double must not be more than {bound}, found {found}",
+        float_too_low: FloatTooLow, "Float must not be less than {bound}, found {found}",
+        float_too_high: FloatTooHigh, "Float must not be more than {bound}, found {found}",
+        integer_too_low: IntegerTooLow, "Integer must not be less than {bound}, found {found}",
+        integer_too_high: IntegerTooHigh, "Integer must not be more than {bound}, found {found}",
+        long_too_low: LongTooLow, "Long must not be less than {bound}, found {found}",
+        long_too_high: LongTooHigh, "Long must not be more than {bound}, found {found}",
     }
 
     pub const fn literal_incorrect(&self) -> DynamicCommandExceptionType {
@@ -2745,42 +2788,60 @@ impl IntegerArgumentType {
     }
 }
 
-impl<S> ArgumentType<S> for IntegerArgumentType {
-    fn parse(&self, reader: &mut StringReader) -> Result<ArgumentValue, CommandSyntaxException> {
-        let start = reader.cursor();
-        let result = reader.read_int()?;
-        if result < self.minimum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.integer_too_low().create_with_context(
-                reader,
-                &result.to_string(),
-                &self.minimum.to_string(),
-            ));
-        }
-        if result > self.maximum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.integer_too_high().create_with_context(
-                reader,
-                &result.to_string(),
-                &self.maximum.to_string(),
-            ));
-        }
-        Ok(boxed(result))
-    }
+/// `IntegerArgumentType`/`LongArgumentType`/`DoubleArgumentType`/`FloatArgumentType` differ only
+/// in their numeric type, the reader that produces it, and the names of the exceptions. All four
+/// read a number, report the bound it broke together with the value that broke it, and rewind to
+/// the start of the token so the error offset still points at the number.
+macro_rules! bounded_argument_type {
+    ($type:ident as $variant:ident, read: $read:ident, render: $render:expr,
+     below: $too_low:ident, above: $too_high:ident, examples: $examples:expr) => {
+        impl<S> ArgumentType<S> for $type {
+            fn parse(
+                &self,
+                reader: &mut StringReader,
+            ) -> Result<ArgumentValue, CommandSyntaxException> {
+                let start = reader.cursor();
+                let result = reader.$read()?;
+                if result < self.minimum {
+                    reader.set_cursor(start);
+                    return Err(BUILT_IN_EXCEPTIONS.$too_low().create_with_context(
+                        reader,
+                        &($render)(result),
+                        &($render)(self.minimum),
+                    ));
+                }
+                if result > self.maximum {
+                    reader.set_cursor(start);
+                    return Err(BUILT_IN_EXCEPTIONS.$too_high().create_with_context(
+                        reader,
+                        &($render)(result),
+                        &($render)(self.maximum),
+                    ));
+                }
+                Ok(boxed(result))
+            }
 
-    fn examples(&self) -> Vec<&'static str> {
-        vec!["0", "123", "-123"]
-    }
-    fn type_info(&self) -> Option<ArgumentTypeInfo> {
-        Some(ArgumentTypeInfo::Integer {
-            minimum: self.minimum,
-            maximum: self.maximum,
-        })
-    }
-    fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
-        Box::new(*self)
-    }
+            fn examples(&self) -> Vec<&'static str> {
+                $examples
+            }
+
+            fn type_info(&self) -> Option<ArgumentTypeInfo> {
+                Some(ArgumentTypeInfo::$variant {
+                    minimum: self.minimum,
+                    maximum: self.maximum,
+                })
+            }
+
+            fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
+                Box::new(*self)
+            }
+        }
+    };
 }
+
+bounded_argument_type!(IntegerArgumentType as Integer, read: read_int,
+    render: |value: i32| value.to_string(), below: integer_too_low, above: integer_too_high,
+    examples: vec!["0", "123", "-123"]);
 
 /// `LongArgumentType`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2816,42 +2877,9 @@ impl LongArgumentType {
     }
 }
 
-impl<S> ArgumentType<S> for LongArgumentType {
-    fn parse(&self, reader: &mut StringReader) -> Result<ArgumentValue, CommandSyntaxException> {
-        let start = reader.cursor();
-        let result = reader.read_long()?;
-        if result < self.minimum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.long_too_low().create_with_context(
-                reader,
-                &result.to_string(),
-                &self.minimum.to_string(),
-            ));
-        }
-        if result > self.maximum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.long_too_high().create_with_context(
-                reader,
-                &result.to_string(),
-                &self.maximum.to_string(),
-            ));
-        }
-        Ok(boxed(result))
-    }
-
-    fn examples(&self) -> Vec<&'static str> {
-        vec!["0", "123", "-123"]
-    }
-    fn type_info(&self) -> Option<ArgumentTypeInfo> {
-        Some(ArgumentTypeInfo::Long {
-            minimum: self.minimum,
-            maximum: self.maximum,
-        })
-    }
-    fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
-        Box::new(*self)
-    }
-}
+bounded_argument_type!(LongArgumentType as Long, read: read_long,
+    render: |value: i64| value.to_string(), below: long_too_low, above: long_too_high,
+    examples: vec!["0", "123", "-123"]);
 
 /// `DoubleArgumentType`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2887,42 +2915,9 @@ impl DoubleArgumentType {
     }
 }
 
-impl<S> ArgumentType<S> for DoubleArgumentType {
-    fn parse(&self, reader: &mut StringReader) -> Result<ArgumentValue, CommandSyntaxException> {
-        let start = reader.cursor();
-        let result = reader.read_double()?;
-        if result < self.minimum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.double_too_low().create_with_context(
-                reader,
-                &java_decimal(result),
-                &java_decimal(self.minimum),
-            ));
-        }
-        if result > self.maximum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.double_too_high().create_with_context(
-                reader,
-                &java_decimal(result),
-                &java_decimal(self.maximum),
-            ));
-        }
-        Ok(boxed(result))
-    }
-
-    fn examples(&self) -> Vec<&'static str> {
-        vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]
-    }
-    fn type_info(&self) -> Option<ArgumentTypeInfo> {
-        Some(ArgumentTypeInfo::Double {
-            minimum: self.minimum,
-            maximum: self.maximum,
-        })
-    }
-    fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
-        Box::new(*self)
-    }
-}
+bounded_argument_type!(DoubleArgumentType as Double, read: read_double,
+    render: java_decimal, below: double_too_low, above: double_too_high,
+    examples: vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]);
 
 /// `FloatArgumentType`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2958,42 +2953,9 @@ impl FloatArgumentType {
     }
 }
 
-impl<S> ArgumentType<S> for FloatArgumentType {
-    fn parse(&self, reader: &mut StringReader) -> Result<ArgumentValue, CommandSyntaxException> {
-        let start = reader.cursor();
-        let result = reader.read_float()?;
-        if result < self.minimum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.float_too_low().create_with_context(
-                reader,
-                &java_decimal(result as f64),
-                &java_decimal(self.minimum as f64),
-            ));
-        }
-        if result > self.maximum {
-            reader.set_cursor(start);
-            return Err(BUILT_IN_EXCEPTIONS.float_too_high().create_with_context(
-                reader,
-                &java_decimal(result as f64),
-                &java_decimal(self.maximum as f64),
-            ));
-        }
-        Ok(boxed(result))
-    }
-
-    fn examples(&self) -> Vec<&'static str> {
-        vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]
-    }
-    fn type_info(&self) -> Option<ArgumentTypeInfo> {
-        Some(ArgumentTypeInfo::Float {
-            minimum: self.minimum,
-            maximum: self.maximum,
-        })
-    }
-    fn box_clone(&self) -> Box<dyn ArgumentType<S>> {
-        Box::new(*self)
-    }
-}
+bounded_argument_type!(FloatArgumentType as Float, read: read_float,
+    render: |value: f32| java_decimal(value as f64), below: float_too_low, above: float_too_high,
+    examples: vec!["0", "1.2", ".5", "-1", "-.5", "-1234.56"]);
 
 /// `BoolArgumentType`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4231,26 +4193,14 @@ impl<S> CommandNode<S> {
             inner.by_name.get(&name).map(|index| inner.ordered[*index].clone())
         };
         if let Some(existing) = existing {
-            if let Some(command) = node.command() {
-                existing.set_command(command);
-            }
-            for grandchild in node.children() {
-                existing.add_child(grandchild)?;
-            }
-            return Ok(());
+            return existing.absorb(&node);
         }
         let mut inner = write_lock(&self.data.inner);
         if let Some(index) = inner.by_name.get(&name) {
             // Another thread inserted the same name first; merge below the lock-free path.
             let existing = inner.ordered[*index].clone();
             drop(inner);
-            if let Some(command) = node.command() {
-                existing.set_command(command);
-            }
-            for grandchild in node.children() {
-                existing.add_child(grandchild)?;
-            }
-            return Ok(());
+            return existing.absorb(&node);
         }
         let index = inner.ordered.len();
         inner.by_name.insert(name.clone(), index);
@@ -4259,6 +4209,18 @@ impl<S> CommandNode<S> {
             inner.literals.insert(name, index);
         } else if node.is_argument() {
             inner.arguments.push(index);
+        }
+        Ok(())
+    }
+
+    /// Java's merge for a child name that is already present: this node keeps its identity,
+    /// takes the incoming command when it has one, and absorbs the incoming grandchildren.
+    fn absorb(&self, node: &CommandNode<S>) -> Result<(), TreeError> {
+        if let Some(command) = node.command() {
+            self.set_command(command);
+        }
+        for grandchild in node.children() {
+            self.add_child(grandchild)?;
         }
         Ok(())
     }
@@ -4908,25 +4870,12 @@ impl<S: Clone> CommandDispatcher<S> {
 
         if !potentials.is_empty() {
             if potentials.len() > 1 {
-                potentials.sort_by(|a, b| {
-                    let a_can_read = a.reader().can_read();
-                    let b_can_read = b.reader().can_read();
-                    if !a_can_read && b_can_read {
-                        return Ordering::Less;
-                    }
-                    if a_can_read && !b_can_read {
-                        return Ordering::Greater;
-                    }
-                    let a_empty = a.exceptions().is_empty();
-                    let b_empty = b.exceptions().is_empty();
-                    if a_empty && !b_empty {
-                        return Ordering::Less;
-                    }
-                    if !a_empty && b_empty {
-                        return Ordering::Greater;
-                    }
-                    Ordering::Equal
-                });
+                // Java's comparator: the parse that consumed the whole input wins, then the one
+                // without recorded exceptions. Both keys sort ascending, so `false` first.
+                fn rank<S>(parse: &ParseResults<S>) -> (bool, bool) {
+                    (parse.reader().can_read(), !parse.exceptions().is_empty())
+                }
+                potentials.sort_by_key(rank);
             }
             return potentials.remove(0);
         }
@@ -4994,26 +4943,27 @@ impl<S: Clone> CommandDispatcher<S> {
             result.push(prefix.to_string());
         }
         if let Some(redirect) = node.redirect() {
-            let redirect_text = if redirect.same_node(&self.root) {
-                "...".to_string()
-            } else {
-                format!("-> {}", redirect.usage_text())
-            };
             let base = if prefix.is_empty() {
                 node.usage_text()
             } else {
                 prefix.to_string()
             };
+            let redirect_text = self.redirect_usage(&redirect);
             result.push(format!("{base}{ARGUMENT_SEPARATOR}{redirect_text}"));
         } else if node.child_count() > 0 {
             for child in node.children() {
-                let child_prefix = if prefix.is_empty() {
-                    child.usage_text()
-                } else {
-                    format!("{prefix}{ARGUMENT_SEPARATOR}{}", child.usage_text())
-                };
+                let child_prefix = join_usage(prefix, &child);
                 self.collect_all_usage(&child, source, result, &child_prefix, restricted);
             }
+        }
+    }
+
+    /// `redirect`'s usage as a path suffix: `...` for the root, `-> <usage>` for anything else.
+    fn redirect_usage(&self, redirect: &CommandNode<S>) -> String {
+        if redirect.same_node(&self.root) {
+            "...".to_string()
+        } else {
+            format!("-> {}", redirect.usage_text())
         }
     }
 
@@ -5043,30 +4993,14 @@ impl<S: Clone> CommandDispatcher<S> {
         if !node.can_use(source) {
             return None;
         }
-        let self_text = if optional {
-            format!("{USAGE_OPTIONAL_OPEN}{}{USAGE_OPTIONAL_CLOSE}", node.usage_text())
-        } else {
-            node.usage_text()
-        };
+        let self_text = optional_usage(node.usage_text(), optional);
         let child_optional = node.command().is_some();
-        let open = if child_optional {
-            USAGE_OPTIONAL_OPEN
-        } else {
-            USAGE_REQUIRED_OPEN
-        };
-        let close = if child_optional {
-            USAGE_OPTIONAL_CLOSE
-        } else {
-            USAGE_REQUIRED_CLOSE
-        };
+        let open = if child_optional { USAGE_OPTIONAL_OPEN } else { USAGE_REQUIRED_OPEN };
+        let close = if child_optional { USAGE_OPTIONAL_CLOSE } else { USAGE_REQUIRED_CLOSE };
 
         if !deep {
             if let Some(redirect) = node.redirect() {
-                let redirect_text = if redirect.same_node(&self.root) {
-                    "...".to_string()
-                } else {
-                    format!("-> {}", redirect.usage_text())
-                };
+                let redirect_text = self.redirect_usage(&redirect);
                 return Some(format!("{self_text}{ARGUMENT_SEPARATOR}{redirect_text}"));
             }
             let children: Vec<CommandNode<S>> = node
@@ -5090,28 +5024,20 @@ impl<S: Clone> CommandDispatcher<S> {
                     }
                 }
                 if child_usages.len() == 1 {
-                    let usage = child_usages[0].clone();
-                    let wrapped = if child_optional {
-                        format!("{USAGE_OPTIONAL_OPEN}{usage}{USAGE_OPTIONAL_CLOSE}")
-                    } else {
-                        usage
-                    };
-                    return Some(format!("{self_text}{ARGUMENT_SEPARATOR}{wrapped}"));
+                    let usage = optional_usage(child_usages[0].clone(), child_optional);
+                    return Some(format!("{self_text}{ARGUMENT_SEPARATOR}{usage}"));
                 }
                 if child_usages.len() > 1 {
+                    // `children` holds at least two entries here, so the group is never empty.
                     let mut builder = String::from(open);
-                    let mut count = 0;
-                    for child in &children {
-                        if count > 0 {
+                    for (index, child) in children.iter().enumerate() {
+                        if index > 0 {
                             builder.push_str(USAGE_OR);
                         }
                         builder.push_str(&child.usage_text());
-                        count += 1;
                     }
-                    if count > 0 {
-                        builder.push_str(close);
-                        return Some(format!("{self_text}{ARGUMENT_SEPARATOR}{builder}"));
-                    }
+                    builder.push_str(close);
+                    return Some(format!("{self_text}{ARGUMENT_SEPARATOR}{builder}"));
                 }
             }
         }
@@ -5142,6 +5068,24 @@ impl<S: Clone> CommandDispatcher<S> {
             node = node.child(name)?;
         }
         Some(node)
+    }
+}
+
+/// `text` wrapped in the optional-usage brackets when the node it describes is optional.
+fn optional_usage(text: String, optional: bool) -> String {
+    if optional {
+        format!("{USAGE_OPTIONAL_OPEN}{text}{USAGE_OPTIONAL_CLOSE}")
+    } else {
+        text
+    }
+}
+
+/// `node`'s usage as a path segment, prefixed by the path that leads to it.
+fn join_usage<S>(prefix: &str, node: &CommandNode<S>) -> String {
+    if prefix.is_empty() {
+        node.usage_text()
+    } else {
+        format!("{prefix}{ARGUMENT_SEPARATOR}{}", node.usage_text())
     }
 }
 
