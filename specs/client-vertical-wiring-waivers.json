@@ -70,18 +70,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::MerchantOffers",
-      "priority": "P1",
-      "reason": "merchant_offers drops \u2014 villager trade list never populated"
-    },
-    {
-      "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::MoveVehicle",
-      "priority": "P1",
-      "reason": "move_vehicle drops \u2014 ridden-entity position never syncs"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::OpenBook",
       "priority": "P2",
       "reason": "open_book drops \u2014 book GUI unimplemented"

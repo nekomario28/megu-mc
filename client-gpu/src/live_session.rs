@@ -5415,7 +5415,9 @@ impl LiveSession {
         self.mining.swing_timer += dt_secs;
         if self.mining.swing_timer >= 0.3 { self.mining.swing_timer = 0.0; self.trigger_arm_swing(); }
         if self.mining.progress >= 1.0 {
-            let (pos, face) = self.mining.target.unwrap();
+            let Some((pos, face)) = self.mining.target else {
+                return false;
+            };
             self.dig_finish(pos, face);
             self.mining = MiningState { cooldown: 0.25, ..MiningState::default() };
             return true;
