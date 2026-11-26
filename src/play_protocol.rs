@@ -2632,6 +2632,12 @@ fn sleep_meta_pkt(eid: i32, sleeping: bool, bed: (i32, i32, i32)) -> Vec<u8> {
 fn broadcast_sleep_pose(me: &Client, sleeping: bool, bed: (i32, i32, i32)) {
     let pkt = sleep_meta_pkt(me.eid, sleeping, bed);
     broadcast_seen_packet(me.eid, 0x58, &pkt);
+    // A player normally does not track their own entity in `seen`, but the
+    // vanilla client still needs its own pose/optional-bed metadata to show
+    // the sleeping pose and the Leave Bed button.
+    if let Ok(mut sock) = me.sock.lock() {
+        let _ = send_packet(&mut sock, 0x58, pkt);
+    }
 }
 
 /// Wake the player if they are in a bed: clear the state and restore the pose
@@ -2804,6 +2810,30 @@ fn bed_stand_position(dim: DimId, head: (i32, i32, i32)) -> Option<(f64, f64, f6
     }
     None
 }
+/// Resolve the stand position for a respawn anchor. Unlike a bed, the anchor
+/// block itself is the support for the preferred top-center position; only
+/// after that do vanilla's horizontal fallback positions matter.
+fn respawn_anchor_stand_position(dim: DimId, anchor: (i32, i32, i32)) -> Option<(f64, f64, f64)> {
+    let registry = block_registry::breg()?;
+    let (x, y, z) = anchor;
+    let free_pair = |sx, sy, sz| {
+        block_at_dim(dim, sx, sy, sz) == 0 && block_at_dim(dim, sx, sy + 1, sz) == 0
+    };
+    if free_pair(x, y + 1, z) {
+        return Some((x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5));
+    }
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+        let (sx, sz) = (x + dx, z + dz);
+        for sy in [y + 1, y] {
+            let floor = block_at_dim(dim, sx, sy - 1, sz);
+            if registry.is_solid_render(floor) && free_pair(sx, sy, sz) {
+                return Some((sx as f64 + 0.5, sy as f64, sz as f64 + 0.5));
+            }
+        }
+    }
+    None
+}
+
 fn broadcast_in<F: Fn(&Client) -> (i64, Vec<u8>)>(audience: &[Arc<Client>], me_eid: i32, mk: F) {
     fanout_in(audience, |c| c.eid != me_eid, mk)
 }
@@ -3034,6 +3064,9 @@ fn interest_tick() {
         return;
     }
     sleep_tick();
+    villager_raid_tick();
+    live_end_dragon_fight_tick();
+    persist_live_enchantment_seeds();
     play_content_revision_sync();
     biome_override_sync_tick();
     // Build value descriptors once per tick; spawn packets are encoded only
@@ -3817,6 +3850,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
     #[cfg(not(feature = "neoforge-events"))]
     set_block_dim(dim, x, y, z, 0);
     note_block_update_dim(dim, x, y, z, 0);
+    dispatch_player_shrieker_vibration(me, (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5));
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.005; // block-break exhaustion
         // `Stats.BLOCK_MINED` for the block that was there — keyed by the
@@ -9249,7 +9283,8 @@ fn decay_portal_game_ticks(uuid: [u8; 16], tick: u64) -> u32 {
 }
 
 fn has_seen_credits(uuid: [u8; 16]) -> bool {
-    SEEN_CREDITS.get_or_init(|| Mutex::new(HashMap::new())).lock()
+    saved_player_seen_credits(&uuid)
+        || SEEN_CREDITS.get_or_init(|| Mutex::new(HashMap::new())).lock()
         .unwrap_or_else(|e| e.into_inner()).contains_key(&uuid)
 }
 
@@ -9263,10 +9298,15 @@ fn mark_seen_credits(uuid: [u8; 16]) -> bool {
 }
 
 fn send_win_game_event(me: &Client) {
-    if has_seen_credits(me.uuid) || !mark_seen_credits(me.uuid) { return; }
+    // Vanilla sends WIN_GAME on every End exit: 1.0 rolls the credits when
+    // `seenCredits` is false, 0.0 skips directly to respawn afterwards.
+    let first = !has_seen_credits(me.uuid);
     let mut ge = vec![4u8];
-    ge.extend_from_slice(&0.0f32.to_be_bytes());
+    ge.extend_from_slice(&(if first { 1.0f32 } else { 0.0f32 }).to_be_bytes());
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x22, ge);
+    if first && mark_seen_credits(me.uuid) {
+        set_saved_player_seen_credits(me.uuid, true);
+    }
 }
 
 /// Complete one portal trip. `st` is the block the player stood in, which decides whether
@@ -9305,6 +9345,7 @@ fn enter_portal(
                 (landing.0, landing.1, landing.2, yaw, pitch),
                 view,
             );
+            live_end_dragon_fight_arrival();
             (DimId::End, landing)
         } else {
             let (sdim, sx, sy, sz) = {
@@ -11940,6 +11981,365 @@ fn place_live_recipe(me: &Arc<Client>, place: &PlaceRecipe) {
     }
 }
 
+fn end_dragon_fight_controller() -> &'static Mutex<Option<EndDragonFightController>> {
+    static FIGHT: OnceLock<Mutex<Option<EndDragonFightController>>> = OnceLock::new();
+    FIGHT.get_or_init(Mutex::default)
+}
+
+fn end_dragon_fight_live_seen() -> &'static AtomicBool {
+    static SEEN: OnceLock<AtomicBool> = OnceLock::new();
+    SEEN.get_or_init(|| AtomicBool::new(false))
+}
+
+fn persist_end_dragon_fight(fight: &EndDragonFightController) {
+    let old = end_dragon_fight_save();
+    let dragon_uuid = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|mob| mob.dim == DimId::End && mob.etype == 31)
+        .map(|mob| mob.uuid)
+        .or(old.as_ref().and_then(|save| save.dragon_uuid));
+    let previously_killed = old.as_ref().is_some_and(|save| save.previously_killed)
+        || !fight.dragon_alive();
+    set_end_dragon_fight_save(Some(EndDragonFightSave {
+        dragon_killed: !fight.dragon_alive(),
+        previously_killed,
+        dragon_uuid,
+        exit_portal_origin: Some((0, live_dragon_portal_y(DimId::End), 0)),
+        crystals_alive: fight.active_pillar_crystals().len().min(u8::MAX as usize) as u8,
+    }));
+}
+
+fn live_end_dragon_fight_controller(
+) -> std::sync::MutexGuard<'static, Option<EndDragonFightController>> {
+    let mut slot = end_dragon_fight_controller().lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        let portal_y = live_dragon_portal_y(DimId::End);
+        let seed = WORLD_SEED.load(Ordering::Relaxed);
+        *slot = Some(match end_dragon_fight_save() {
+            Some(save) => EndDragonFightController::restored(
+                seed,
+                portal_y,
+                save.dragon_killed,
+                save.previously_killed,
+            ),
+            None => EndDragonFightController::new(seed, portal_y),
+        });
+    }
+    slot
+}
+
+fn spawn_end_crystal_entity(position: [f64; 3]) -> bool {
+    let exists = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+        if mob.dim != DimId::End || mob.etype != 30 {
+            return false;
+        }
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        (x - position[0]).powi(2) + (y - position[1]).powi(2) + (z - position[2]).powi(2) < 1.0
+    });
+    !exists && insert_live_mob(30, DimId::End, (position[0], position[1], position[2], 0.0, 0.0), 1.0, None)
+}
+
+fn apply_end_dragon_fight_events(events: Vec<EndDragonFightEvent>) {
+    for event in events {
+        match event {
+            EndDragonFightEvent::SpawnDragon { position, .. } => {
+                let exists = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+                    mob.dim == DimId::End && mob.etype == 31
+                        && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+                });
+                if !exists {
+                    insert_live_mob(31, DimId::End, (position[0], position[1], position[2], 0.0, 0.0), 200.0, None);
+                }
+            }
+            EndDragonFightEvent::MaterializeCrystal { position } => {
+                spawn_end_crystal_entity(position);
+            }
+            EndDragonFightEvent::CloseExitPortal => {
+                // The live exit portal owner already rebuilds the portal on
+                // dragon death. Closing it during the ritual only requires
+                // removing active portal cells in the podium footprint.
+                let y = live_dragon_portal_y(DimId::End);
+                for dx in -2..=2 {
+                    for dz in -2..=2 {
+                        let st = block_at_dim(DimId::End, dx, y, dz);
+                        if is_end_portal_state(st) {
+                            set_block_dim(DimId::End, dx, y, dz, 0);
+                            note_block_update_dim(DimId::End, dx, y, dz, 0);
+                        }
+                    }
+                }
+            }
+            EndDragonFightEvent::CrystalBeam { .. } | EndDragonFightEvent::BeamAt { .. } => {
+                // Beam rendering is client cosmetic; the crystal ownership and
+                // respawn sequence are authoritative in the controller events.
+            }
+        }
+    }
+}
+
+/// Activate the End-owned fight when the first player arrives. Initialization
+/// is synchronized with `EndDragonFightSave`: a killed dragon stays dead until
+/// the four-crystal ritual, while a live/restored fight materializes missing
+/// entities rather than duplicating them.
+fn live_end_dragon_fight_arrival() {
+    let events = {
+        let mut slot = live_end_dragon_fight_controller();
+        let fight = slot.as_mut().expect("controller initialized");
+        let mut events = fight.ensure_dragon_fight_initialized();
+        events.extend(fight.materialize_end_pillar_crystals());
+        events
+    };
+    apply_end_dragon_fight_events(events);
+    let slot = live_end_dragon_fight_controller();
+    if let Some(fight) = slot.as_ref() {
+        persist_end_dragon_fight(fight);
+    }
+}
+
+/// Advance the respawn ritual and reconcile the durable killed flag with the
+/// live dragon entity. The combat behavior owns damage/death rewards; this
+/// controller owns fight state, crystal inventory and respawn sequencing.
+fn live_end_dragon_fight_tick() {
+    let dragon = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|mob| {
+            mob.dim == DimId::End && mob.etype == 31
+                && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0
+        })
+        .cloned();
+    if dragon.is_some() {
+        end_dragon_fight_live_seen().store(true, Ordering::Relaxed);
+    }
+    let dragon_pos = dragon.as_ref().map(|mob| {
+        let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        [x, y, z]
+    });
+    let mut killed = false;
+    let events = {
+        let mut slot = live_end_dragon_fight_controller();
+        let Some(fight) = slot.as_mut() else { return };
+        if fight.dragon_alive() && dragon.is_none() && end_dragon_fight_live_seen().swap(false, Ordering::Relaxed) {
+            fight.on_dragon_killed();
+            killed = true;
+        }
+        fight.tick(dragon_pos.unwrap_or([0.0, 128.0, 0.0]))
+    };
+    apply_end_dragon_fight_events(events);
+    if killed {
+        let slot = live_end_dragon_fight_controller();
+        if let Some(fight) = slot.as_ref() {
+            persist_end_dragon_fight(fight);
+        }
+    }
+}
+
+/// Upper bound for transient use-item sessions; normal entries are consumed
+/// on release and swept on disconnect, so this is only a panic/leak backstop.
+const MAX_ITEM_USE_STARTS: usize = 4096;
+
+fn item_use_start_ticks() -> &'static Mutex<HashMap<i32, u64>> {
+    static STARTS: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+    STARTS.get_or_init(Mutex::default)
+}
+
+/// Mark the authoritative server tick at which a use-item packet started.
+/// Food, drinks, bows and crossbows measure their use duration by this tick
+/// count rather than wall time, so lag or a changed tick cadence cannot make
+/// a 32-tick use complete early.
+fn note_item_use_start(me: &Client) {
+    let mut starts = item_use_start_ticks().lock().unwrap_or_else(|e| e.into_inner());
+    if starts.len() >= MAX_ITEM_USE_STARTS && !starts.contains_key(&me.eid) {
+        if let Some(stale) = starts.keys().next().copied() {
+            starts.remove(&stale);
+        }
+    }
+    starts.insert(me.eid, TICK_IDX.load(Ordering::Relaxed));
+}
+
+fn take_item_use_ticks(me: &Client) -> Option<u64> {
+    let start = item_use_start_ticks()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&me.eid)?;
+    Some(TICK_IDX.load(Ordering::Relaxed).saturating_sub(start))
+}
+
+/// Whether action 8 may start fall-flying: an intact Elytra in the chest
+/// equipment slot and an airborne movement state. Durability is the vanilla
+/// `damage`/`max_damage` component pair, falling back to the armor table.
+fn can_start_fall_flying(me: &Client) -> bool {
+    if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+        return false;
+    }
+    let chest = me
+        .inv
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&6)
+        .cloned()
+        .unwrap_or((0, 0, Vec::new()));
+    if item_to_name(chest.0) != Some("elytra") || chest.1 == 0 {
+        return false;
+    }
+    let max_damage = comp_varint(&chest.2, COMP_MAX_DAMAGE)
+        .or_else(|| armor_max_damage(chest.0))
+        .unwrap_or(432);
+    if comp_varint(&chest.2, COMP_DAMAGE).unwrap_or(0) >= max_damage {
+        return false;
+    }
+    !me.pos.lock().unwrap_or_else(|e| e.into_inner()).5
+}
+
+/// Dispatch a player-caused vibration to every `can_summon` shrieker in the
+/// vanilla pickup box. Sneak movement is passed through and rejected by the
+/// shrieker owner, keeping the silence rule in one authoritative place.
+fn dispatch_player_shrieker_vibration(me: &Client, at: (f64, f64, f64)) {
+    if *me.dim.lock().unwrap_or_else(|e| e.into_inner()) != DimId::Overworld {
+        return;
+    }
+    let (bx, by, bz) = (at.0.floor() as i32, at.1.floor() as i32, at.2.floor() as i32);
+    // Cheap presence check before the positional scan: no summon-capable
+    // shrieker means no vibration can be relevant in this pickup box.
+    if !can_summon_shrieker_near(DimId::Overworld, bx, by, bz) {
+        return;
+    }
+    let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+    let now_tick = TICK.load(Ordering::Relaxed);
+    for dx in -8i32..=8 {
+        for dy in -4i32..=4 {
+            for dz in -8i32..=8 {
+                let pos = (bx + dx, by + dy, bz + dz);
+                on_sculk_shrieker_vibration(me.uuid, pos, sneaking, now_tick);
+            }
+        }
+    }
+}
+
+/// Vanilla-style crop bone meal: age-bearing crops gain 2..4 growth stages
+/// and saplings advance their `stage` property. Returns false when the target
+/// is not growable or is already mature, so the caller does not consume the
+/// bone meal for a no-op click.
+fn try_bonemeal_growth(dim: DimId, x: i32, y: i32, z: i32) -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    let state = block_at_dim(dim, x, y, z);
+    let name = reg.name_of(state);
+    if let Some(age) = reg.get_prop(state, "age").and_then(|value| value.parse::<u8>().ok()) {
+        let max_age = match name.strip_prefix("minecraft:").unwrap_or(name) {
+            "beetroots" | "nether_wart" => 3,
+            "cocoa" | "torchflower_crop" | "pitcher_crop" => 2,
+            "wheat" | "carrots" | "potatoes" | "sweet_berry_bush" => 7,
+            _ => return false,
+        };
+        if age >= max_age {
+            return false;
+        }
+        let bump = 2 + u8::from((x.wrapping_mul(7) ^ z.wrapping_mul(13) ^ y) & 1 != 0);
+        let new_age = (age + bump).min(max_age);
+        if new_age == age {
+            return false;
+        }
+        let new_state = reg.with_prop(state, "age", &new_age.to_string());
+        if !set_block_if_dim(dim, x, y, z, new_state, Some(state)) {
+            return false;
+        }
+        crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, x, y, z), new_age);
+        note_block_update_dim(dim, x, y, z, new_state);
+        return true;
+    }
+    if name.ends_with("_sapling") {
+        let stage = reg.get_prop(state, "stage").and_then(|value| value.parse::<u8>().ok()).unwrap_or(0);
+        if stage != 0 {
+            return false;
+        }
+        let new_state = reg.with_prop(state, "stage", "1");
+        if !set_block_if_dim(dim, x, y, z, new_state, Some(state)) {
+            return false;
+        }
+        note_block_update_dim(dim, x, y, z, new_state);
+        return true;
+    }
+    false
+}
+
+/// Consume one item from the active hotbar hand in survival-like modes and
+/// echo the hand slot. Returns false when the hand is already empty.
+fn consume_one_held_item(me: &Client, held_slot: i16) -> bool {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+        return true;
+    }
+    let key = 36 + held_slot;
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((item, count, comps)) = inv.get(&key).cloned() else { return false };
+    if count == 0 { return false; }
+    if count == 1 {
+        inv.remove(&key);
+    } else {
+        inv.insert(key, (item, count - 1, comps));
+    }
+    let stack = inv.get(&key).cloned().unwrap_or((0, 0, Vec::new()));
+    drop(inv);
+    let mut packet = vec![0u8];
+    write_varint(&mut packet, i64::from(inv_state_next(me)));
+    packet.extend_from_slice(&key.to_be_bytes());
+    packet.extend_from_slice(&slot_wire(&stack));
+    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);
+    true
+}
+
+/// Send one window-0 slot echo for every inventory slot whose value changed.
+fn sync_inventory_changes(me: &Client, before: &HashMap<i16, Stack>, after: &HashMap<i16, Stack>) {
+    let slots: std::collections::BTreeSet<i16> = before.keys().chain(after.keys()).copied().collect();
+    for slot in slots {
+        if before.get(&slot) == after.get(&slot) {
+            continue;
+        }
+        let stack = after.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
+        let mut packet = vec![0u8];
+        write_varint(&mut packet, i64::from(inv_state_next(me)));
+        packet.extend_from_slice(&slot.to_be_bytes());
+        packet.extend_from_slice(&slot_wire(&stack));
+        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, packet);
+    }
+}
+
+/// Vanilla `Inventory.add` followed by the dimension-correct overflow drop at
+/// the player's feet. Returns the inventory snapshot after the attempt.
+fn player_give_or_drop_dim(me: &Client, mut stack: Stack) {
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let selected = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+    let before = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    {
+        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        pickup_into_inventory(&mut inv, 36 + selected, creative, &mut stack);
+    }
+    let after = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    sync_inventory_changes(me, &before, &after);
+    if stack.1 > 0 {
+        let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+        drop_live_stack_dim(dim, (x, y + 1.3, z), stack);
+    }
+}
+
+/// Persist regenerated enchantment seeds through the save_v2 player-extra
+/// lane. Menu clicks mutate the live connection seed in menus_and_items.rs;
+/// this ownership-safe bridge snapshots the current value for connected
+/// players without changing that sibling-owned file.
+fn persist_live_enchantment_seeds() {
+    let sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    for client in client_snapshot() {
+        let Some(session) = sessions.get(&client.eid) else { continue };
+        let seed = *session.menus.enchantment_seed.lock().unwrap_or_else(|e| e.into_inner());
+        if saved_player_enchantment_seed(&client.uuid) != Some(seed) {
+            set_saved_player_enchantment_seed(client.uuid, Some(seed));
+        }
+    }
+}
+
 /// Entry point for one accepted socket (`main` spawns one thread per call).
 /// The whole connection body runs inside `run_isolated_connection`: a panic in
 /// any packet handler becomes one logged, counted disconnect — the listener
@@ -11985,6 +12385,7 @@ fn forget_per_eid_state(eid: i32) {
         .remove(&eid);
     lod_v1_forget(eid);
     player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    item_use_start_ticks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
     // PARITY-58-C2S: per-connection packet state dies with the connection.
@@ -12621,7 +13022,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 menus: Arc::new(LiveMenuConnection {
                     active: Mutex::new(None),
                     next_id: std::sync::atomic::AtomicU8::new(4),
-                    enchantment_seed: Mutex::new(i32::from_be_bytes(me.uuid[..4].try_into().unwrap())),
+                    enchantment_seed: Mutex::new(saved_player_enchantment_seed(&me.uuid)
+                        .unwrap_or_else(|| i32::from_be_bytes(me.uuid[..4].try_into().unwrap()))),
                 }),
             },
         );
@@ -12988,8 +13390,6 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     if !me.teleport.lock().unwrap_or_else(|e| e.into_inner()).movement_allowed() {
                         continue;
                     }
-                    // Vanilla wakes a sleeping player when they move.
-                    wake_if_sleeping(&me);
                     // Anti-cheat runs before any lock is taken: it reads attributes, effects
                     // and blocks around the player, and may pull the player back.
                     let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
@@ -13035,6 +13435,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let prev_gnd = p.5;
                     *p = (px, py, pz, yaw, pitch, gnd);
                     drop(p);
+                    // Vanilla wakes on an actual positional displacement. Idle
+                    // position/look keepalives that reassert the same coordinate
+                    // must not cancel sleep or hide the Leave Bed UI.
+                    let moved = (px - before.0).powi(2) + (py - before.1).powi(2) + (pz - before.2).powi(2) > 1.0e-6;
+                    if moved {
+                        wake_if_sleeping(&me);
+                        dispatch_player_shrieker_vibration(&me, (px, py, pz));
+                    }
                     drop(teleport);
                     landing::player_move(&me, prev_gnd);
                     // Portal waits advance on the game tick (vanilla
@@ -13128,9 +13536,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // inventory screen (`openHorseInventory`).
                             open_horse_screen(&me);
                         }
+                        // START_FALL_FLYING: only an intact Elytra in the
+                        // chest slot while airborne may enter pose 1.
+                        8 if can_start_fall_flying(&me) => {
+                            *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                        }
                         _ => {}
                     }
-                    if (0..=1).contains(&act) || (3..=4).contains(&act) {
+                    if (0..=1).contains(&act) || (3..=4).contains(&act) || act == 8 {
                         let sneak = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
                         let sprint = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
                         let glide = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
@@ -13253,21 +13666,26 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // finish using item (bow release / lower shield)
                     *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
                     let eat0 = me.eat_start.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    if let Some(t0) = eat0 {
-                        // vanilla: release after 32 ticks consumes; earlier release aborts
-                        if t0.elapsed().as_secs_f32() >= 1.4 {
+                    if let Some(_t0) = eat0 {
+                        // Vanilla releases after the 32-tick use duration;
+                        // an earlier release cancels consumption cleanly.
+                        if take_item_use_ticks(&me).is_some_and(|ticks| ticks >= server_ticks(32)) {
                             air_use_item(&me, held_slot, seq, None, true);
                             continue;
                         }
                     }
-                    let draw_t = me
+                    let draw_started = me
                         .bow_draw
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .take()
-                        .map(|st| st.elapsed().as_secs_f32())
-                        .unwrap_or(0.0);
-                    if draw_t > 0.0 {
+                        .is_some();
+                    let draw_t = if draw_started {
+                        take_item_use_ticks(&me).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if draw_t > 0 {
                         let arrow_slot = me
                             .inv
                             .lock()
@@ -13279,7 +13697,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             (inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0), 0)
                         };
-                        let charge_t = (draw_t / 1.19).min(1.0);
+                        let bow_full_ticks = server_ticks(20).max(1);
+                        let charge_t = ((draw_t as f32) / bow_full_ticks as f32).min(1.0);
                         let qc = {
                             let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             enchant_level(
@@ -13289,11 +13708,60 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 29,
                             )
                         };
+                        let quick_charge_ticks = u64::from((qc as u8).min(5)) * 5;
+                        let crossbow_charge_ticks = server_ticks(25_u64.saturating_sub(quick_charge_ticks).max(1));
                         let can_fire = if hit == 801 {
                             charge_t >= 0.1
                         } else {
-                            draw_t >= 1.25 - 0.25 * (qc as f32).min(5.0)
+                            draw_t >= crossbow_charge_ticks
                         };
+                        if hit == 1192 && can_fire {
+                            // Crossbows charge into `charged_projectiles` here;
+                            // the next right-click is what fires. Multishot stores
+                            // the vanilla three projectile entries.
+                            let selected = 36 + held_slot;
+                            let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+                            let ammo = arrow_slot.and_then(|slot| {
+                                me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned().map(|stack| (slot, stack))
+                            });
+                            if creative || ammo.is_some() {
+                                let projectile = ammo
+                                    .as_ref()
+                                    .map(|(_, stack)| (stack.0, 1, stack.2.clone()))
+                                    .unwrap_or((802, 1, Vec::new()));
+                                if !creative {
+                                    if let Some((slot, _)) = ammo {
+                                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                        if let Some(stack) = inv.get_mut(&slot) {
+                                            stack.1 = stack.1.saturating_sub(1);
+                                            if stack.1 == 0 {
+                                                inv.remove(&slot);
+                                            }
+                                        }
+                                    }
+                                }
+                                let multishot = {
+                                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                    enchant_level(&inv.get(&selected).map(|v| v.2.clone()).unwrap_or_default(), 23) > 0
+                                };
+                                let projectiles = if multishot {
+                                    vec![projectile.clone(), projectile.clone(), projectile]
+                                } else {
+                                    vec![projectile]
+                                };
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(crossbow) = inv.get_mut(&selected) {
+                                    comp_set(
+                                        &mut crossbow.2,
+                                        COMP_CHARGED_PROJECTILES,
+                                        encode_stack_list(&projectiles),
+                                    );
+                                }
+                                drop(inv);
+                                held_slot_resync(&me);
+                            }
+                            continue;
+                        }
                         if let (true, true, Some(asl)) =
                             ((hit == 801 || hit == 1192), can_fire, arrow_slot)
                         {
@@ -13428,7 +13896,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p2);
                             }
                         }
-                        if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= 0.1 {
+                        if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= server_ticks(10) {
                             // trident throw
                             let held_st = {
                                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
@@ -13757,6 +14225,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // {-1,255,-1}, face -1 — dispatch to the shared item-use path
                 if x == -1 && y == 255 && z == -1 && face == -1 {
                     if !try_use_ender_eye(&me, held_slot, seq) {
+                        note_item_use_start(&me);
                         air_use_item(&me, held_slot, seq, _hand, false);
                     }
                     continue;
@@ -13886,29 +14355,156 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     true
                 };
                 let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
-                if !sneaking
+                // `EndCrystalItem.useOn`: crystals place only on bedrock or
+                // obsidian. In the End they also feed the four-rim respawn
+                // ritual owned by `EndDragonFightController`.
+                if dim == DimId::End
                     && crate::block_registry::breg().is_some_and(|reg| {
-                        live_block_entity_id(reg.name_of(clicked)) == Some("minecraft:beacon")
+                        matches!(reg.name_of(clicked), "minecraft:bedrock" | "minecraft:obsidian")
                     })
+                    && me.inv.lock().unwrap_or_else(|e| e.into_inner())
+                        .get(&(36 + held_slot))
+                        .and_then(|stack| item_to_name(stack.0))
+                        == Some("end_crystal")
+                    && crate::block_registry::breg().is_some_and(|reg| reg.is_air(block_at_dim(dim, tx, ty, tz)))
                 {
-                    // vanilla BeaconBlock.useWithoutItem opens the beacon screen.
-                    // Until a live beacon window exists the held stack stands in
-                    // for its payment slot; the anchor is what a real
-                    // `set_beacon_effect` would resolve against.
-                    beacon_menu_anchors()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, (dim, x, y, z));
-                    with_save_guard(|| {
-                        if let Some(reg) = crate::block_registry::breg() {
-                            live_block_entities()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .at(reg, (dim, x, y, z), clicked);
+                    let occupied = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+                        if mob.dim != DimId::End || mob.etype != 30 {
+                            return false;
                         }
+                        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        (mx.floor() as i32, my.floor() as i32, mz.floor() as i32) == (tx, ty, tz)
                     });
+                    if !occupied {
+                        let position = [tx as f64 + 0.5, ty as f64, tz as f64 + 0.5];
+                        if spawn_end_crystal_entity(position) {
+                            let accepted = {
+                                let mut slot = live_end_dragon_fight_controller();
+                                slot.as_mut().is_some_and(|fight| fight.on_end_crystal_placed(tx, ty, tz))
+                            };
+                            if accepted {
+                                let slot = live_end_dragon_fight_controller();
+                                if let Some(fight) = slot.as_ref() {
+                                    persist_end_dragon_fight(fight);
+                                }
+                            }
+                            consume_one_held_item(&me, held_slot);
+                        }
+                    }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                     continue;
+                }
+                // `ComposterBlock.useItemOn`: compostables advance levels 0..6;
+                // level 7 is randomly ticked to 8 by the crop/random-tick owner,
+                // and level 8 harvests one bone meal and resets the composter.
+                if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:composter") {
+                    let mut handled = false;
+                    if let Some(reg) = crate::block_registry::breg() {
+                        let level = reg
+                            .get_prop(clicked, "level")
+                            .and_then(|value| value.parse::<u8>().ok())
+                            .unwrap_or(0);
+                        if level == 8 {
+                            if let Some((new_level, item)) = composter_harvest(level) {
+                                let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
+                                if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                    note_block_update_dim(dim, x, y, z, new_state);
+                                    drop_live_stack_dim(
+                                        dim,
+                                        (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5),
+                                        (name_to_item(item.strip_prefix("minecraft:").unwrap_or(item)).unwrap_or(0), 1, Vec::new()),
+                                    );
+                                }
+                            }
+                            handled = true;
+                        } else {
+                            let held_item = me
+                                .inv
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&(36 + held_slot))
+                                .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
+                            if let Some(item) = held_item {
+                                let roll = f64::from(world_rng::next_below(1_000_000)) / 1_000_000.0;
+                                match composter_insert(level, &format!("minecraft:{item}"), roll) {
+                                    ComposterInsert::Rejected => {}
+                                    ComposterInsert::ConsumedNoAdvance => {
+                                        consume_one_held_item(&me, held_slot);
+                                        handled = true;
+                                    }
+                                    ComposterInsert::Advanced { new_level, .. } => {
+                                        let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
+                                        if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                            note_block_update_dim(dim, x, y, z, new_state);
+                                            consume_one_held_item(&me, held_slot);
+                                        }
+                                        handled = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if handled {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
+                }
+                // `RespawnAnchorBlock.useItemOn`: glowstone charges the anchor;
+                // a charged anchor sets the typed respawn target where anchors
+                // work and explodes where they do not.
+                if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:respawn_anchor") {
+                    if let Some(reg) = crate::block_registry::breg() {
+                        let charges = reg
+                            .get_prop(clicked, "charges")
+                            .and_then(|value| value.parse::<u8>().ok())
+                            .unwrap_or(0);
+                        let held_item = me
+                            .inv
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&(36 + held_slot))
+                            .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
+                        let anchors_work = dim == DimId::Nether
+                            || crate::worldgen::dimension_spec(dim).is_some_and(|spec| spec.respawn_anchor_works);
+                        match respawn_anchor_use(charges, held_item.as_deref(), anchors_work) {
+                            AnchorOutcome::Charged { charges: new_charges } => {
+                                let new_state = reg.with_prop(clicked, "charges", &new_charges.to_string());
+                                if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                    note_block_update_dim(dim, x, y, z, new_state);
+                                    consume_one_held_item(&me, held_slot);
+                                }
+                            }
+                            AnchorOutcome::Full => {
+                                consume_one_held_item(&me, held_slot);
+                            }
+                            AnchorOutcome::RespawnSet => {
+                                let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                                let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
+                                *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
+                                *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+                                let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
+                                snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Anchor, dim, position, angle, forced: false });
+                                saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
+                                let mut spawn = Vec::new();
+                                write_pos(&mut spawn, x, y, z);
+                                spawn.extend_from_slice(&angle.to_be_bytes());
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
+                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
+                            }
+                            AnchorOutcome::Explode { power } => {
+                                set_block_dim(dim, x, y, z, 0);
+                                note_block_update_dim(dim, x, y, z, 0);
+                                let (ex, ey, ez) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+                                let before = explosion_fire_snapshot(dim, ex, ey, ez, f64::from(power));
+                                explode_at_dim(dim, ex, ey, ez, f64::from(power));
+                                ignite_explosion_fire(dim, &before, world_rng::next_below);
+                            }
+                            AnchorOutcome::Pass => {}
+                        }
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        continue;
+                    }
                 }
                 // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
                 // right-click while this player holds leashed mobs spawns (or
@@ -13926,6 +14522,18 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         ack(seq),
                     );
                     continue;
+                }
+                if !sneaking
+                    && live_block_entity_id(
+                        crate::block_registry::breg().map(|reg| reg.name_of(clicked)).unwrap_or(""),
+                    ) == Some("minecraft:beacon")
+                {
+                    // Recording the menu anchor must not swallow the click:
+                    // the dispatcher below still opens `LiveMenu::Beacon`.
+                    beacon_menu_anchors()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(me.eid, (dim, x, y, z));
                 }
                 if !sneaking
                     && (open_live_block_menu(&me, (dim, x, y, z), clicked)
@@ -14170,24 +14778,30 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         let fi = if src == 80 { 909 } else { 910 };
                         set_block_dim(dim, x, y, z, 0);
                         note_block_update_dim(dim, x, y, z, 0);
-                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                         if cnt > 1 {
-                            inv.insert(36 + held_slot, (908, cnt - 1, _hc));
-                            let free = (9..=44).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                            inv.insert(free, (fi, 1, Vec::new()));
+                            {
+                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                inv.insert(36 + held_slot, (908, cnt - 1, _hc));
+                            }
+                            let mut p = vec![0u8];
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
+                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&slot_wire(&(908, cnt - 1, Vec::new())));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                            // A stacked empty bucket never overwrites slot 9:
+                            // the filled bucket merges like a pickup and any
+                            // remainder is dropped in the player's dimension.
+                            player_give_or_drop_dim(&me, (fi, 1, Vec::new()));
                         } else {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             inv.insert(36 + held_slot, (fi, 1, Vec::new()));
+                            drop(inv);
+                            let mut p = vec![0u8];
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
+                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&slot_wire(&(fi, 1, Vec::new())));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
-                        let (i2, c2, _cc) =
-                            inv.get(&(36 + held_slot))
-                                .cloned()
-                                .unwrap_or((0, 0, Vec::new()));
-                        drop(inv);
-                        let mut p = vec![0u8];
-                        write_varint(&mut p, i64::from(inv_state_next(&me)));
-                        p.extend_from_slice(&(36 + held_slot).to_be_bytes());
-                        p.extend_from_slice(&slot_wire(&(i2, c2, _cc)));
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
@@ -14315,36 +14929,12 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     inv.get(&(36 + held_slot)).cloned()
                 };
-                // bone meal on crops: +2..4 stages, consume 1
-                if let Some((960, _, _)) = held {
-                    let cst = block_at_dim(dim, x, y, z);
-                    if (4278..=4285).contains(&cst) {
-                        let age = (cst - 4278) as u8;
-                        let bump = 2 + ((x.wrapping_mul(7) ^ z.wrapping_mul(13) ^ y) & 1) as u8;
-                        let nage = (age + bump).min(7);
-                        set_block_dim(dim, x, y, z, 4278 + nage as u32);
-                        crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, x, y, z), nage);
-                        note_block_update_dim(dim, x, y, z, 4278 + nage as u32);
-                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
-                                if c <= 1 {
-                                    inv.remove(&(36 + held_slot));
-                                } else {
-                                    inv.insert(36 + held_slot, (it, c - 1, _cc));
-                                }
-                            }
-                            let (it, c, _cc) =
-                                inv.get(&(36 + held_slot))
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                            drop(inv);
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                        }
+                // `BoneMealItem.useOn`: growth runs before generic placement,
+                // and exactly one item is consumed only when the target can
+                // actually grow. Mature crops pass the interaction through.
+                if let Some((item, _, _)) = held {
+                    if item_to_name(item) == Some("bone_meal") && try_bonemeal_growth(dim, x, y, z) {
+                        consume_one_held_item(&me, held_slot);
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
                         continue;
                     }
@@ -14480,6 +15070,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         };
                         if place((tx, ty, tz), st) {
                             ac_consume_placed_item(&me, held_slot);
+                            if matches!(item_to_name(item), Some("wither_skeleton_skull" | "wither_skeleton_wall_skull")) {
+                                consume_wither_pattern_at(dim, (tx, ty, tz));
+                            }
+                            dispatch_player_shrieker_vibration(&me, (tx as f64 + 0.5, ty as f64 + 0.5, tz as f64 + 0.5));
                         }
                     }
                 }
@@ -14518,6 +15112,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                 }
                 if !try_use_ender_eye(&me, held_slot, seq) {
+                    note_item_use_start(&me);
                     air_use_item(&me, held_slot, seq, _h, false);
                 }
             }
@@ -14804,29 +15399,25 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         };
                         if milkable {
                             let k = 36 + held_slot;
-                            {
+                            let c = {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
                                 if c <= 1 {
                                     inv.insert(k, (914, 1, Vec::new()));
                                 } else {
                                     inv.insert(k, (908, c - 1, Vec::new()));
-                                    let fs =
-                                        (9..=44i16).find(|sl| !inv.contains_key(sl)).unwrap_or(9);
-                                    inv.insert(fs, (914, 1, Vec::new()));
                                 }
-                            }
-                            let (it2, c2, _c2) =
-                                me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&k).cloned().unwrap_or((
-                                    0,
-                                    0,
-                                    Vec::new(),
-                                ));
+                                c
+                            };
+                            let hand_stack = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&k).cloned().unwrap_or((0, 0, Vec::new()));
                             let mut p = vec![0u8];
                             write_varint(&mut p, i64::from(inv_state_next(&me)));
                             p.extend_from_slice(&k.to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(it2, c2, _c2)));
+                            p.extend_from_slice(&slot_wire(&hand_stack));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                            if c > 1 {
+                                player_give_or_drop_dim(&me, (914, 1, Vec::new()));
+                            }
                             continue;
                         }
                     }
@@ -14844,8 +15435,17 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     _ => false,
                                 })
                             {
-                                *m.love.lock().unwrap_or_else(|e| e.into_inner()) = 80;
-                                loved = true;
+                                let mut love = m.love.lock().unwrap_or_else(|e| e.into_inner());
+                                // `AnimalMob.canFallInLove`: an animal already
+                                // in love (and vanilla's breed/age cooldowns,
+                                // which this live model represents by that same
+                                // timer) passes the interaction before the item
+                                // is consumed. This also makes the client's
+                                // INTERACT_AT + INTERACT pair idempotent.
+                                if *love == 0 {
+                                    *love = 80;
+                                    loved = true;
+                                }
                             }
                         }
                         if loved {
@@ -14881,6 +15481,38 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // `LeashFenceKnotEntity.hurt`: the knot breaks and every
                     // tether it anchored detaches with its lead.
                     if break_leash_knot(target) {
+                        continue;
+                    }
+                    // `Player.attack` on a large fireball: melee contact does
+                    // no damage; it reflects the projectile along the player's
+                    // look vector and transfers ownership to that player.
+                    let reflected_fireball = {
+                        let mut projectiles = live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner());
+                        projectiles.iter_mut().find_map(|projectile| {
+                            if projectile.eid != target || projectile.kind != MobProjectileKind::GhastFireball {
+                                return None;
+                            }
+                            let speed = mob_behavior_dot(projectile.velocity, projectile.velocity).sqrt().max(0.5);
+                            let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                            let yr = f64::from(yaw).to_radians();
+                            let pr = f64::from(pitch).to_radians();
+                            projectile.velocity = [
+                                -yr.sin() * pr.cos() * speed,
+                                -pr.sin() * speed,
+                                yr.cos() * pr.cos() * speed,
+                            ];
+                            projectile.owner = me.eid;
+                            Some(projectile.velocity)
+                        })
+                    };
+                    if let Some([vx, vy, vz]) = reflected_fireball {
+                        let packet = velocity_pkt(
+                            target,
+                            (vx * 8000.0) as i16,
+                            (vy * 8000.0) as i16,
+                            (vz * 8000.0) as i16,
+                        );
+                        broadcast_seen_packet(target, 0x5a, &packet);
                         continue;
                     }
                     // PvP: target may be another player
@@ -15501,18 +16133,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 target: None,
                                 thrower: None,
                             }
-                            .world_scatter(DimId::Overworld);
+                            .world_scatter(mob.dim);
                             drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
                         }
-                        let xeid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                        xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
-                            eid: xeid,
-                            x: mx,
-                            y: my,
-                            z: mz,
-                            val: mob_xp(etype),
-                            age: 0,
-                        });
+                        xp_spawn_dim(mob.dim, mx, my, mz, mob_xp(etype));
                         // spawn streams via interest_tick
                     }
                 }
@@ -15620,6 +16244,61 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 translate_component_nbt("block.minecraft.spawn.not_valid"),
                             );
                         } else if let Some((sx, sy, sz)) = bed_stand_position(target.dim, head) {
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((sx, sy, sz, target.angle));
+                        }
+                    }
+                    let anchor_respawn = saved_players()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&me.uuid)
+                        .and_then(|save| save.respawn)
+                        .filter(|target| target.kind == SpawnTargetKind::Anchor);
+                    if let Some(target) = anchor_respawn {
+                        let anchor = (
+                            target.position.0.floor() as i32,
+                            target.position.1.floor() as i32 - 1,
+                            target.position.2.floor() as i32,
+                        );
+                        let state = block_at_dim(target.dim, anchor.0, anchor.1, anchor.2);
+                        let charges = block_registry::breg().and_then(|registry| {
+                            (registry.name_of(state) == "minecraft:respawn_anchor")
+                                .then(|| registry.get_prop(state, "charges")?.parse::<u8>().ok())
+                                .flatten()
+                        });
+                        let anchor_works = target.dim == DimId::Nether
+                            || crate::worldgen::dimension_spec(target.dim).is_some_and(|spec| spec.respawn_anchor_works);
+                        let valid = anchor_works && charges.is_some_and(|charges| charges > 0);
+                        if !valid || respawn_anchor_stand_position(target.dim, anchor).is_none() {
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
+                            if let Some(save) = saved_players()
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_mut(&me.uuid)
+                            {
+                                save.respawn = None;
+                            }
+                            let _ = send_packet(
+                                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                                0x4c,
+                                translate_component_nbt("block.minecraft.spawn.not_valid"),
+                            );
+                        } else if let (Some(charges), Some((sx, sy, sz))) = (charges, respawn_anchor_stand_position(target.dim, anchor)) {
+                            // The typed target still names the anchor block;
+                            // only the live respawn coordinate is replaced by
+                            // the resolved stand position. A successful Nether
+                            // anchor respawn spends exactly one charge.
+                            if let Some(reg) = block_registry::breg() {
+                                let new_state = reg.with_prop(
+                                    state,
+                                    "charges",
+                                    &respawn_anchor_consume(charges).to_string(),
+                                );
+                                if set_block_if_dim(target.dim, anchor.0, anchor.1, anchor.2, new_state, Some(state)) {
+                                    note_block_update_dim(target.dim, anchor.0, anchor.1, anchor.2, new_state);
+                                }
+                            }
                             *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
                                 Some((sx, sy, sz, target.angle));
                         }
@@ -21827,7 +22506,7 @@ mod p5c_live_tests {
             .unwrap_or_else(|e| e.into_inner())
             .push(me.clone());
         let dirt = name_to_item("dirt").unwrap();
-        let stone = name_to_item("stone").unwrap();
+        let stone = 1;
         {
             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             for i in 0..9i16 {
@@ -25478,6 +26157,35 @@ mod security_hardening_tests {
         assert!(offline_public_bind_check("0.0.0.0", false, true, false).is_ok());
         // (d) the explicit operator override unlocks the public offline bind.
         assert!(offline_public_bind_check("0.0.0.0", false, false, true).is_ok());
+    }
+
+    #[test]
+    fn full_inventory_overflow_drop_never_overwrites_hotbar_slot_9() {
+        let _world = world_guard();
+        let (mut raw_client, _peer) = effect_tests::client_pair();
+        raw_client.eid = 97_002;
+        let client = Arc::new(raw_client);
+        *client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
+        let stone = 1;
+        for slot in 9..=44 {
+            client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, (stone, 64, Vec::new()));
+        }
+        let before_slot_9 = client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9).cloned();
+        let water_bucket = 909;
+        let drops_before: HashSet<i32> = drops().lock().unwrap_or_else(|e| e.into_inner()).iter().map(|drop| drop.eid).collect();
+        player_give_or_drop_dim(&client, (water_bucket, 1, Vec::new()));
+        assert_eq!(
+            client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9).cloned(),
+            before_slot_9,
+            "a full inventory must overflow to the world, never overwrite slot 9"
+        );
+        let spawned = {
+            let live_drops = drops().lock().unwrap_or_else(|e| e.into_inner());
+            live_drops.iter().find(|drop| !drops_before.contains(&drop.eid) && drop.item == water_bucket).map(|drop| drop.eid)
+        }.expect("overflow water bucket item entity");
+        assert_eq!(drop_dim_of(spawned), DimId::Nether);
+        drops().lock().unwrap_or_else(|e| e.into_inner()).retain(|drop| drop.eid != spawned);
+        drop_dims().lock().unwrap_or_else(|e| e.into_inner()).remove(&spawned);
     }
 
     /// H2: a panic inside the guarded connection scope still runs the full

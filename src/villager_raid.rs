@@ -1973,7 +1973,6 @@ fn wither_pattern_translate(
 /// X or Z axis. `skull_pos` may be any of the three skull cells, matching the
 /// placement-triggered lookup. The exact seven non-air cells are returned for
 /// atomic consumption; the two `~` cells must already be air and stay untouched.
-#[cfg_attr(not(test), allow(dead_code))]
 fn detect_wither_pattern<'a>(
     get_block: impl Fn(i32, i32, i32) -> &'a str,
     skull_pos: (i32, i32, i32),
@@ -2032,6 +2031,51 @@ fn detect_wither_pattern<'a>(
         }
     }
     None
+}
+
+/// Consume a complete live wither construction whose last-placed skull is at
+/// `skull_pos`, then spawn the invulnerable-stage Wither at the pattern stem.
+/// The seven cells are first snapshotted and then compare-and-set to air so a
+/// racing edit cannot delete a replacement block; placement updates are
+/// broadcast for every consumed cell.
+pub(crate) fn consume_wither_pattern_at(dim: DimId, skull_pos: BlockPos) -> bool {
+    let Some(reg) = crate::block_registry::breg() else { return false };
+    let lookup = |x: i32, y: i32, z: i32| reg.name_of(block_at_dim(dim, x, y, z));
+    let Some(pattern) = detect_wither_pattern(lookup, skull_pos) else { return false };
+    let expected: Vec<u32> = pattern
+        .consumed
+        .iter()
+        .map(|&(x, y, z)| block_at_dim(dim, x, y, z))
+        .collect();
+    with_save_guard(|| {
+        let mut cleared = Vec::new();
+        for (&(x, y, z), &old) in pattern.consumed.iter().zip(&expected) {
+            if !set_block_if_dim(dim, x, y, z, 0, Some(old)) {
+                // Roll back only the cells this caller actually converted. A
+                // failed construction must not leave a half-consumed pattern.
+                for (rx, ry, rz, rold) in cleared.iter().rev() {
+                    let _ = set_block_if_dim(dim, *rx, *ry, *rz, *rold, Some(0));
+                    note_block_update_dim(dim, *rx, *ry, *rz, *rold);
+                }
+                return false;
+            }
+            note_block_update_dim(dim, x, y, z, 0);
+            cleared.push((x, y, z, old));
+        }
+        insert_live_mob(
+            119,
+            dim,
+            (
+                pattern.spawn_pos[0],
+                pattern.spawn_pos[1],
+                pattern.spawn_pos[2],
+                pattern.yaw,
+                0.0,
+            ),
+            100.0,
+            None,
+        )
+    })
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3525,6 +3569,18 @@ fn live_raid_omens() -> &'static LockedMap<VillageUuid, RaidOmen> {
     OMENS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The village position where each active Raid Omen countdown was triggered.
+/// Vanilla keeps that original trigger as the raid candidate even if the
+/// player walks away before the countdown expires.
+/// Raid-omen origins share the player-count scale of the omen map. The cap is
+/// a leak backstop for disconnected players whose countdown never expired.
+const MAX_RAID_OMEN_ORIGINS: usize = 4096;
+
+fn live_raid_omen_origins() -> &'static LockedMap<VillageUuid, (DimId, BlockPos)> {
+    static ORIGINS: Registry<VillageUuid, (DimId, BlockPos)> = OnceLock::new();
+    ORIGINS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Live raider entity id -> (dimension, raid center, wave slot). A raider
 /// death is translated into `Raid::record_defeat` through this map.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -4650,23 +4706,40 @@ fn live_raid_omen_tick() {
         let (dim, x, y, z, ..) = client_dim_pos(client);
         let position = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
         if let Some(omen) = omens.get_mut(&client.uuid) {
+            // Milk (or any other effect-clearing path) cancels the pending
+            // raid countdown together with the visible Raid Omen effect.
+            let effect_active = raid_omen.is_some_and(|raid_omen| {
+                client.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|eff| eff.id == raid_omen)
+            });
+            if !effect_active {
+                omens.remove(&client.uuid);
+                live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner()).remove(&client.uuid);
+                continue;
+            }
             if !omen.tick() {
                 continue;
             }
             let mut omen = Some(*omen);
+            let (origin_dim, origin_pos) = live_raid_omen_origins()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&client.uuid)
+                .copied()
+                .unwrap_or((dim, position));
             let raid = {
                 let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-                registries.get(&dim).and_then(|pois| {
-                    Raid::try_start(pois, position, client.uuid, &mut omen, difficulty)
+                registries.get(&origin_dim).and_then(|pois| {
+                    Raid::try_start(pois, origin_pos, client.uuid, &mut omen, difficulty)
                 })
             };
             omens.remove(&client.uuid);
+            live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner()).remove(&client.uuid);
             if let Some(raid_omen) = raid_omen {
                 live_remove_effect(client, raid_omen);
             }
             if let Some(raid) = raid {
-                live_raid_bossbar_write(dim, raid.center, 0, 0, &clients);
-                saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((dim, raid));
+                live_raid_bossbar_write(origin_dim, raid.center, 0, 0, &clients);
+                saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((origin_dim, raid));
             }
             continue;
         }
@@ -4698,6 +4771,13 @@ fn live_raid_omen_tick() {
             }
             .enter_village(),
         );
+        let mut origins = live_raid_omen_origins().lock().unwrap_or_else(|e| e.into_inner());
+        if origins.len() >= MAX_RAID_OMEN_ORIGINS && !origins.contains_key(&client.uuid) {
+            if let Some(stale) = origins.keys().next().copied() {
+                origins.remove(&stale);
+            }
+        }
+        origins.insert(client.uuid, (dim, position));
         if let (Some(bad_omen), Some(raid_omen)) = (bad_omen, raid_omen) {
             live_remove_effect(client, bad_omen);
             live_grant_effect(
@@ -4782,8 +4862,10 @@ fn live_raid_bossbar_write(
         visible: true,
         players: HashSet::new(),
     });
-    bar.players = audience.iter().map(|client| client.uuid).collect();
+    let previous_players = bar.players.clone();
+    let audience_uuids: HashSet<_> = audience.iter().map(|client| client.uuid).collect();
     if action == 0 {
+        bar.players = audience_uuids;
         bar.max = total.max(1);
         bar.value = bar.max;
         let pkt = bossbar_pkt(&id, 0, Some(bar));
@@ -4793,12 +4875,28 @@ fn live_raid_bossbar_write(
             }
         }
     } else {
+        // Observers entering the 96-block audience first receive ADD carrying
+        // current progress; observers leaving receive REMOVE. Existing members
+        // receive only the progress update.
+        let entered: HashSet<_> = audience_uuids.difference(&previous_players).copied().collect();
+        let left: HashSet<_> = previous_players.difference(&audience_uuids).copied().collect();
+        bar.players = audience_uuids;
         bar.max = total.max(1);
         bar.value = remaining;
-        let pkt = bossbar_pkt(&id, 2, Some(bar));
+        let add = bossbar_pkt(&id, 0, Some(bar));
+        let update = bossbar_pkt(&id, 2, Some(bar));
+        let remove = bossbar_pkt(&id, 1, Some(bar));
         for client in audience {
             if let Ok(mut sock) = client.sock.lock() {
-                let _ = send_packet(&mut sock, 0x0a, pkt.clone());
+                if entered.contains(&client.uuid) {
+                    let _ = send_packet(&mut sock, 0x0a, add.clone());
+                }
+                let _ = send_packet(&mut sock, 0x0a, update.clone());
+            }
+        }
+        for client in clients.iter().filter(|client| left.contains(&client.uuid)) {
+            if let Ok(mut sock) = client.sock.lock() {
+                let _ = send_packet(&mut sock, 0x0a, remove.clone());
             }
         }
     }
@@ -5089,6 +5187,20 @@ fn live_raid_step() {
             }
         }
         for (dim, raid) in raids.iter_mut() {
+            // A raid restored from save_v2 has its roster but not the volatile
+            // wave-start denominator. Rebuild it once from the wave table so
+            // the bossbar drains against the original total rather than 1.
+            let wave_total = if raid.waves_spawned > 0 {
+                let row = usize::from(raid.waves_spawned.min(raid.regular_waves).saturating_sub(1));
+                RAID_BASE_WAVES.get(row).map(|counts| counts.iter().map(|&n| i32::from(n)).sum::<i32>()).unwrap_or(1)
+            } else {
+                raid.remaining.len().max(1) as i32
+            };
+            live_raid_wave_totals()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry((*dim, raid.center))
+                .or_insert(wave_total.max(1));
             let living = living_villagers_near(*dim, raid.center);
             let event = {
                 let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
@@ -5464,21 +5576,6 @@ fn live_spawn_phantoms(dim: DimId, player_pos: (f64, f64, f64)) {
         let yaw = world_rng::next_below(360) as f32;
         live_spawn_named(dim, "phantom", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
     }
-}
-
-/// `WardenSpawnTracker.spawnWarden`: the warden emerges near the player that
-/// tripped the fourth shrieker warning.
-#[cfg_attr(not(test), allow(dead_code))]
-fn live_spawn_warden(dim: DimId, player_pos: (f64, f64, f64)) {
-    let bx = player_pos.0.floor() as i32;
-    let bz = player_pos.2.floor() as i32;
-    let by = if dim == DimId::Overworld {
-        surface_y(bx, bz).floor() as i32
-    } else {
-        dim.min_y() + 64
-    };
-    let yaw = world_rng::next_below(360) as f32;
-    live_spawn_named(dim, "warden", (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, yaw, 0.0));
 }
 
 /// Spawn the warden at a validated block position selected around the active
@@ -9144,6 +9241,53 @@ mod villager_raid_interact_dispatch_tests {
             }
         }
         assert_eq!(horizontal_cases, 16, "all non-vertical up rotations exercise sideways/upside-down forms");
+    }
+
+    #[test]
+    #[cfg(megu_vanilla_data)]
+    fn live_wither_pattern_consumption_clears_exact_cells_and_spawns_wither() {
+        let _guard = crate::world_guard();
+        crate::test_support::require_vanilla_data();
+        let (x, y, z) = (41_000, 90, 41_000);
+        let soul = name_to_state("soul_sand").unwrap();
+        let skull = name_to_state("wither_skeleton_skull").unwrap();
+        let air = name_to_state("air").unwrap_or(0);
+        let mut old = Vec::new();
+        let mut put = |bx, by, bz, state| {
+            old.push((bx, by, bz, block_at_dim(DimId::Overworld, bx, by, bz)));
+            set_block_dim(DimId::Overworld, bx, by, bz, state);
+        };
+        for dx in 0..3 {
+            put(x + dx, y + 2, z, skull);
+            put(x + dx, y + 1, z, soul);
+        }
+        put(x + 1, y, z, soul);
+        put(x, y, z, air);
+        put(x + 2, y, z, air);
+
+        assert!(consume_wither_pattern_at(DimId::Overworld, (x + 1, y + 2, z)));
+        for dx in 0..3 {
+            assert_eq!(block_at_dim(DimId::Overworld, x + dx, y + 2, z), air);
+            assert_eq!(block_at_dim(DimId::Overworld, x + dx, y + 1, z), air);
+        }
+        assert_eq!(block_at_dim(DimId::Overworld, x + 1, y, z), air);
+        let spawned = {
+            let live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            live.iter().find(|mob| {
+                mob.dim == DimId::Overworld && mob.etype == 119 && {
+                    let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (mx - (x as f64 + 1.5)).abs() < 1.0e-6
+                        && (my - (y as f64 + 0.55)).abs() < 1.0e-6
+                        && (mz - (z as f64 + 0.5)).abs() < 1.0e-6
+                }
+            }).map(|mob| mob.eid)
+        }.expect("live invulnerable-stage wither entity");
+        if let Some(mob) = remove_live_mob(spawned) {
+            live_mount_forget(mob.eid);
+        }
+        for (bx, by, bz, state) in old.into_iter().rev() {
+            set_block_dim(DimId::Overworld, bx, by, bz, state);
+        }
     }
 
     #[test]
