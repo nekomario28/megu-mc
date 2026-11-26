@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Final window wiring checks for atlas-backed containers and local runtime assets.
 
-use megu_client::protocol::{ClientPlayEvent, PlayEvent};
+use megu_client::protocol::{
+    ClientPlayEvent, DecodedChunk, DecodedLightData, DecodedSection, DimensionMeta, PlayEvent,
+};
+use megu_client::world::{BlockTable, WorldState};
 use megu_client_gpu::live_session::LiveSession;
 use megu_client_gpu::renderer::{
     probe_adapters, request_gpu_device, GpuRenderer, OFFSCREEN_FORMAT,
@@ -231,10 +234,69 @@ fn app_loads_real_runtime_bundle_translates_menu_title_and_uploads_it_headlessly
     }
 }
 
+fn empty_light() -> DecodedLightData {
+    DecodedLightData {
+        sky_mask: Vec::new(),
+        block_mask: Vec::new(),
+        empty_sky_mask: Vec::new(),
+        empty_block_mask: Vec::new(),
+        sky_arrays: Vec::new(),
+        block_arrays: Vec::new(),
+    }
+}
+
+fn mining_world_with_stone_at(pos: [i32; 3]) -> WorldState {
+    let table = BlockTable::from_json_bytes(
+        br##"{
+            "blocks": [["minecraft:air", 0, 1], ["minecraft:stone", 1, 1]],
+            "flags": [1, 8],
+            "full_sides": [0, 63],
+            "shapes": [{"min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 1.0]}],
+            "collision_shapes": [[], [0]]
+        }"##,
+    )
+    .expect("synthetic mining block table");
+    let dimension = DimensionMeta::default();
+    let section_count = dimension.section_count();
+    let min_y = dimension.min_y;
+    let mut world = WorldState::new(dimension, table);
+    let section_y = (pos[1] - min_y).div_euclid(16);
+    let local_y = (pos[1] - min_y).rem_euclid(16) as usize;
+    let local_x = pos[0].rem_euclid(16) as usize;
+    let local_z = pos[2].rem_euclid(16) as usize;
+    let cell = local_y * 256 + local_z * 16 + local_x;
+    let sections = (0..section_count)
+        .map(|section| {
+            let mut states = Box::new([0u32; 4096]);
+            let target_here = section as i32 == section_y;
+            if target_here {
+                states[cell] = 1;
+            }
+            DecodedSection {
+                non_air: i16::from(target_here),
+                states,
+                biomes: [0; 64],
+            }
+        })
+        .collect();
+    world
+        .apply_chunk(DecodedChunk {
+            cx: pos[0].div_euclid(16),
+            cz: pos[2].div_euclid(16),
+            sections,
+            light: empty_light(),
+            block_entities: Vec::new(),
+        })
+        .expect("mining target chunk applies");
+    world
+}
+
 #[test]
 fn live_mining_item_use_hotkeys_creative_sleep_book_and_credits_dispatch() {
+    let target = [1, 64, -2];
     let mut live = LiveSession::offline_with_null_audio();
-    live.begin_mining([1, 64, -2], 1);
+    live.world = mining_world_with_stone_at(target);
+    live.begin_mining(target, 1);
     assert_eq!(live.active_block_break_overlay(), Some(([1, 64, -2], 0)));
     live.tick_mining(0.1, Some(([1, 64, -2], 1)));
     assert!(live.active_block_break_overlay().is_some());

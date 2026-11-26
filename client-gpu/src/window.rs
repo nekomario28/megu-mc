@@ -87,6 +87,7 @@ use megu_ui::state::{
     FriendShareMode as UiShareMode, FriendsScreenState, GpuBackend, LodMode, MinimapMode,
     MultiplayerScreenState, MultiplayerServerEntry, PlayerRadarScope, Screen, SettingsTab,
     UiAction, UiInputEvent, UiKey, UiSettings, UiState, VideoPreset, VisualStylePreset,
+    WorldLaunchOptions,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -3785,9 +3786,7 @@ impl GpuApp {
             UiAction::Back => {
                 if self.live.is_some() {
                     self.paused = self.ui.screen != Screen::InGameHud;
-                    if !self.paused {
-                        self.maybe_regrab();
-                    }
+                    self.maybe_regrab();
                 }
                 // Mod Manager Done/Back lands here (`ModManagerAction::Close`
                 // flattens to `Back`); a staged or applied
@@ -3821,7 +3820,20 @@ impl GpuApp {
                 }
             }
             UiAction::PlayWorld { name, seed } => {
-                if let Err(err) = self.start_singleplayer_world(name, *seed) {
+                let payload = self.ui.create_world_payload();
+                let blank_seed_create = payload.name == name.as_str()
+                    && !self
+                        .ui
+                        .singleplayer
+                        .worlds
+                        .iter()
+                        .any(|world| world == name);
+                let create_options =
+                    (seed.is_some() || blank_seed_create).then_some(WorldLaunchOptions {
+                        game_mode: payload.game_mode,
+                        difficulty: payload.difficulty,
+                    });
+                if let Err(err) = self.start_singleplayer_world(name, *seed, create_options) {
                     self.status_line(format!("Singleplayer {name:?}: {err}"));
                 }
             }
@@ -3969,6 +3981,7 @@ impl GpuApp {
                 // dropping it silently.
                 self.status_line(format!("Claims: {action:?} (no claims-capable session)"));
             }
+            UiAction::CloseSignEditor => self.finish_sign_editor(true),
             _ => {}
         }
         // Screen navigations change whether IME is allowed — settle the
@@ -5414,9 +5427,7 @@ impl GpuApp {
     /// unpaused, no chat bar, no sign editor, no container/inventory
     /// screen, no advancements overlay.
     fn wants_cursor_grab(&self) -> bool {
-        self.ui.screen == Screen::InGameHud
-            && !self.has_gameplay_modal()
-            && self.focused
+        self.ui.screen == Screen::InGameHud && !self.has_gameplay_modal() && self.focused
     }
 
     /// Central ownership check for overlays that suspend world input.
@@ -5479,10 +5490,14 @@ impl GpuApp {
     fn text_input_active(&self) -> bool {
         self.chat_bar.is_some()
             || self.book_editor.is_some()
-            || self.container_screen.as_ref().is_some_and(|s| s.rename_focused)
-            || self.creative_inventory.as_ref().is_some_and(|state| {
-                state.tab == megu_ui::creative_screen::CreativeTab::Search
-            })
+            || self
+                .container_screen
+                .as_ref()
+                .is_some_and(|s| s.rename_focused)
+            || self
+                .creative_inventory
+                .as_ref()
+                .is_some_and(|state| state.tab == megu_ui::creative_screen::CreativeTab::Search)
             || self.ui.sign_editor.is_some()
             || self.ui.fps_field_active()
             || self.ui.join_field_active()
@@ -5494,6 +5509,30 @@ impl GpuApp {
             || (self.ui.settings.qol.recipe_overlay_enabled
                 && self.container_screen.is_some()
                 && self.ui.recipe_browser.search_focused())
+    }
+
+    /// Forward device wheel motion to the scrollable menu screens owned by
+    /// `UiState`. Winit's positive vertical delta moves content down (the
+    /// scroll-up gesture), while `UiState::scroll_menu` positive values move
+    /// the menu downward, so the sign flips at this host boundary. Line
+    /// deltas use vanilla's 24px row pitch; pixel deltas keep their native
+    /// resolution.
+    fn scroll_menu_from_wheel(&mut self, delta: winit::event::MouseScrollDelta) -> bool {
+        let menu_pixels = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => -y * 24.0,
+            winit::event::MouseScrollDelta::PixelDelta(pos) => -pos.y as f32,
+        };
+        let scroll_px = menu_pixels.round() as i32;
+        if scroll_px == 0
+            || !matches!(
+                self.ui.screen,
+                Screen::Settings(_) | Screen::Singleplayer | Screen::Friends
+            )
+        {
+            return false;
+        }
+        self.ui.scroll_menu(scroll_px);
+        true
     }
 
     /// `Ctrl` (every platform) or `Cmd` (macOS) currently held — the
@@ -6090,29 +6129,43 @@ impl GpuApp {
             .quick_play_singleplayer
             .clone()
             .unwrap_or_else(|| "New World".to_owned());
-        self.start_singleplayer_world(&world, None)
+        self.start_singleplayer_world(&world, None, None)
     }
 
-    /// Singleplayer world-select/"Create & Play": launch the integrated
-    /// server for `world` (fail-closed `validate_world_name` inside
-    /// `integrated::launch`), honoring the UI seed when given and
-    /// falling back to `--seed` otherwise, then connect to it.
-    fn start_singleplayer_world(&mut self, world: &str, seed: Option<i64>) -> Result<(), String> {
-        let mut config = self.config.clone();
-        config.seed = seed.or(config.seed);
-        let game_mode = match self.ui.singleplayer.game_mode {
+    fn singleplayer_wire_options(
+        options: WorldLaunchOptions,
+    ) -> (&'static str, &'static str, bool) {
+        let game_mode = match options.game_mode {
             megu_ui::state::SingleplayerGameMode::Survival => "survival",
             megu_ui::state::SingleplayerGameMode::Creative => "creative",
             megu_ui::state::SingleplayerGameMode::Hardcore => "survival",
         };
-        let difficulty = match self.ui.singleplayer.difficulty {
+        let difficulty = match options.difficulty {
             megu_ui::state::SingleplayerDifficulty::Peaceful => "peaceful",
             megu_ui::state::SingleplayerDifficulty::Easy => "easy",
             megu_ui::state::SingleplayerDifficulty::Normal => "normal",
             megu_ui::state::SingleplayerDifficulty::Hard => "hard",
         };
-        let hardcore =
-            self.ui.singleplayer.game_mode == megu_ui::state::SingleplayerGameMode::Hardcore;
+        let hardcore = options.game_mode == megu_ui::state::SingleplayerGameMode::Hardcore;
+        (game_mode, difficulty, hardcore)
+    }
+
+    /// Singleplayer world-select/"Create & Play": launch the integrated
+    /// server for `world` (fail-closed `validate_world_name` inside
+    /// `integrated::launch`), honoring the UI seed when given and
+    /// falling back to `--seed` otherwise, then connect to it. New-world
+    /// launches carry the Create World form's game-mode/difficulty payload;
+    /// preexisting world-row launches keep the historical UI defaults.
+    fn start_singleplayer_world(
+        &mut self,
+        world: &str,
+        seed: Option<i64>,
+        create_options: Option<WorldLaunchOptions>,
+    ) -> Result<(), String> {
+        let mut config = self.config.clone();
+        config.seed = seed.or(config.seed);
+        let options = create_options.unwrap_or_else(|| self.ui.singleplayer.launch_options());
+        let (game_mode, difficulty, hardcore) = Self::singleplayer_wire_options(options);
         let server = Self::launch_singleplayer(
             &config,
             world,
@@ -7076,9 +7129,9 @@ impl GpuApp {
             Some("minecraft:writable_book") => {
                 let pages = component("minecraft:writable_book_content")
                     .and_then(|component| match component {
-                        megu_proto::item_components::VerifiedComponent::WritableBookContent(pages) => {
-                            Some(pages.into_iter().map(|page| page.text).collect())
-                        }
+                        megu_proto::item_components::VerifiedComponent::WritableBookContent(
+                            pages,
+                        ) => Some(pages.into_iter().map(|page| page.text).collect()),
                         _ => None,
                     })
                     .unwrap_or_default();
@@ -7149,19 +7202,19 @@ impl GpuApp {
                 // Inventory menu slots 36..=44 map to Protocol 767's
                 // hotbar slot indices 0..=8 in edit_book.
                 let Some(hotbar_slot) = book_hotbar_slot(slot) else {
-                    self.status_line("Book save failed: invalid hotbar slot; draft retained".to_owned());
+                    self.status_line(
+                        "Book save failed: invalid hotbar slot; draft retained".to_owned(),
+                    );
                     return;
                 };
                 let signed = title.is_some();
                 if live.send_edit_book(hotbar_slot, pages, title) {
                     self.book_editor = None;
-                    self.status_line(
-                        if signed {
-                            "Book signed and saved".to_owned()
-                        } else {
-                            "Book saved".to_owned()
-                        },
-                    );
+                    self.status_line(if signed {
+                        "Book signed and saved".to_owned()
+                    } else {
+                        "Book saved".to_owned()
+                    });
                     self.maybe_regrab();
                 } else {
                     self.status_line(
@@ -7573,7 +7626,9 @@ impl GpuApp {
                         .and_then(|live| live.open_screen.as_ref())
                         .and_then(|open| open.slots.get(&0))
                         .filter(|stack| stack.item_id != 0)
-                        .map(|stack| crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32))
+                        .map(|stack| {
+                            crate::recipe_ingest::item_name_for_id(stack.item_id.max(0) as u32)
+                        })
                 } else {
                     None
                 };
@@ -7908,7 +7963,9 @@ impl GpuApp {
                         if self.live.as_ref().is_some_and(|live| live.game_mode == 1) {
                             if let (Some(live), Some(stack)) = (
                                 self.live.as_mut(),
-                                screen.slot(slot_index as usize).filter(|stack| !stack.is_empty()),
+                                screen
+                                    .slot(slot_index as usize)
+                                    .filter(|stack| !stack.is_empty()),
                             ) {
                                 Self::forward_click_action(
                                     live,
@@ -7929,14 +7986,19 @@ impl GpuApp {
                     if screen.schema().menu_id == 7
                         && (0..9).contains(&slot_index)
                         && screen.cursor.is_none()
-                        && screen.slot(slot_index as usize).is_some_and(|stack| stack.is_empty())
+                        && screen
+                            .slot(slot_index as usize)
+                            .is_some_and(|stack| stack.is_empty())
                     {
                         if let Some(live) = &mut self.live {
                             live.toggle_crafter_slot(screen.window_id, i32::from(slot_index));
                         }
                         return true;
                     }
-                    if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+                    if screen
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|stack| !stack.is_empty())
                         && !self.keys.down
                         && matches!(button_id, 0 | 1)
                     {
@@ -7945,7 +8007,10 @@ impl GpuApp {
                                 Self::forward_click_action(live, action);
                             }
                         }
-                    } else if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+                    } else if screen
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|stack| !stack.is_empty())
                         && !self.keys.down
                         && !panel.contains(mx, my)
                     {
@@ -7966,7 +8031,9 @@ impl GpuApp {
                                 Self::forward_click_action(live, action);
                             }
                         }
-                    } else if let Some(action) = screen.click_with_shift(slot_index, button_id, self.keys.down) {
+                    } else if let Some(action) =
+                        screen.click_with_shift(slot_index, button_id, self.keys.down)
+                    {
                         self.last_container_click = Some((Instant::now(), slot_index));
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
@@ -7981,7 +8048,10 @@ impl GpuApp {
                         }
                     }
                 } else if !panel.contains(mx, my) {
-                    let action = if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+                    let action = if screen
+                        .cursor
+                        .as_ref()
+                        .is_some_and(|stack| !stack.is_empty())
                         && !self.keys.down
                         && matches!(button_id, 0 | 1)
                     {
@@ -8262,18 +8332,15 @@ impl GpuApp {
             .find(|slot| slot.rect.contains(mx, my))
             .map(|slot| (slot.index, usize::from(slot.index.max(0) as u16)));
         screen.hover(hovered.map(|(_, index)| index));
-        if !self.container_suspended_for_recipe
-            && (self.left_mouse_held || self.right_mouse_held)
-        {
+        if !self.container_suspended_for_recipe && (self.left_mouse_held || self.right_mouse_held) {
             if let Some(DragState { slots, .. }) = screen.drag_mode.as_ref() {
                 // The drag is armed: entering a new slot paints it into the
                 // quick-craft set (`click_mode` mode 5 handles dedup).
                 if let Some(&(slot_index, _)) = hovered.as_ref() {
                     if !slots.contains(&slot_index) {
-                        if let Some(action) = screen.drag_over(
-                            slot_index,
-                            if self.right_mouse_held { 1 } else { 0 },
-                        ) {
+                        if let Some(action) =
+                            screen.drag_over(slot_index, if self.right_mouse_held { 1 } else { 0 })
+                        {
                             if let Some(live) = &mut self.live {
                                 Self::forward_click_action(live, action);
                             }
@@ -8916,8 +8983,16 @@ impl GpuApp {
                         yaw: (self.camera.yaw_deg - 180.0).rem_euclid(360.0),
                         pitch: -self.camera.pitch_deg,
                     },
-                    strafe: if gameplay_modal_open { 0.0 } else { input.strafe },
-                    forward: if gameplay_modal_open { 0.0 } else { input.forward },
+                    strafe: if gameplay_modal_open {
+                        0.0
+                    } else {
+                        input.strafe
+                    },
+                    forward: if gameplay_modal_open {
+                        0.0
+                    } else {
+                        input.forward
+                    },
                     jump: !gameplay_modal_open && input.vertical > 0.0,
                     sneak: !gameplay_modal_open && self.keys.down,
                 });
@@ -9099,17 +9174,14 @@ impl GpuApp {
             live.record_frame_and_refresh_compact_debug_hud(dt, &mut self.ui);
             live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
-            let overlay_stack = |stack: &crate::live_session::LiveHotbarStack| {
-                LiveHotbarOverlayMeta {
+            let overlay_stack =
+                |stack: &crate::live_session::LiveHotbarStack| LiveHotbarOverlayMeta {
                     count: stack.count,
                     damage: stack.damage,
                     max_damage: stack.max_damage,
-                }
-            };
+                };
             live_hud_metadata = Some((
-                std::array::from_fn(|index| {
-                    feed.hotbar_stacks[index].as_ref().map(overlay_stack)
-                }),
+                std::array::from_fn(|index| feed.hotbar_stacks[index].as_ref().map(overlay_stack)),
                 feed.offhand_stack.as_ref().map(overlay_stack),
                 std::array::from_fn(|index| {
                     feed.bossbars.get(index).map(|bar| LiveBossBarStyle {
@@ -9380,9 +9452,9 @@ impl GpuApp {
         if !self.ui.hud.hud_hidden {
             if let Some(live) = &self.live {
                 if !live.magic.is_empty() {
-                self.ui_modhud_list
-                    .commands
-                    .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
+                    self.ui_modhud_list
+                        .commands
+                        .extend(build_magic_hud_draw_list(&live.magic, w, h).commands);
                 }
             }
         }
@@ -9424,7 +9496,11 @@ impl GpuApp {
         }
         // Server-driven container screen draws above the HUD — the
         // `Overlay` layer in the retained cache.
-        if let Some(screen) = self.container_screen.as_ref().filter(|_| !self.container_suspended_for_recipe) {
+        if let Some(screen) = self
+            .container_screen
+            .as_ref()
+            .filter(|_| !self.container_suspended_for_recipe)
+        {
             screen.render_with_atlas(
                 w as f32,
                 h as f32,
@@ -10031,9 +10107,7 @@ impl GpuApp {
                 if let Some(selection) = selection {
                     self.apply_shader_screen_selection(selection);
                 }
-                if code == KeyCode::Escape
-                    && self.ui.shader_packs.active_screen().is_none()
-                {
+                if code == KeyCode::Escape && self.ui.shader_packs.active_screen().is_none() {
                     self.shader_options_open = false;
                     self.maybe_regrab();
                 }
@@ -10095,7 +10169,14 @@ impl GpuApp {
             return;
         }
         if self.text_input_active()
-            && !matches!(code, KeyCode::Escape | KeyCode::Backspace | KeyCode::Enter | KeyCode::ArrowLeft | KeyCode::ArrowRight)
+            && !matches!(
+                code,
+                KeyCode::Escape
+                    | KeyCode::Backspace
+                    | KeyCode::Enter
+                    | KeyCode::ArrowLeft
+                    | KeyCode::ArrowRight
+            )
         {
             return;
         }
@@ -10190,9 +10271,10 @@ impl GpuApp {
         }
         if pressed
             && code == KeyCode::Backspace
-            && self.creative_inventory.as_ref().is_some_and(|state| {
-                state.tab == megu_ui::creative_screen::CreativeTab::Search
-            })
+            && self
+                .creative_inventory
+                .as_ref()
+                .is_some_and(|state| state.tab == megu_ui::creative_screen::CreativeTab::Search)
         {
             if let Some(creative) = &mut self.creative_inventory {
                 let mut search = creative.search.clone();
@@ -10602,7 +10684,11 @@ fn bossbar_segments(divisions: i32) -> i32 {
 /// `HudState` cannot carry. `client-ui` owns the base layout; this pass
 /// recolors the exact progress commands it emitted and adds the protocol's
 /// notched overlay ticks without changing hit layout or occupancy.
-fn apply_live_bossbar_metadata(width: u32, bars: &[Option<LiveBossBarStyle>; 3], out: &mut UiDrawList) {
+fn apply_live_bossbar_metadata(
+    width: u32,
+    bars: &[Option<LiveBossBarStyle>; 3],
+    out: &mut UiDrawList,
+) {
     let width = width as i32;
     let cx = width / 2;
     let bw = (width - 40).clamp(8, 200);
@@ -10647,7 +10733,12 @@ fn durability_color(fraction: f32) -> UiColor {
     UiColor::rgb(red, green, 32)
 }
 
-fn overlay_hotbar_stack_metadata(x: i32, y: i32, stack: &LiveHotbarOverlayMeta, out: &mut UiDrawList) {
+fn overlay_hotbar_stack_metadata(
+    x: i32,
+    y: i32,
+    stack: &LiveHotbarOverlayMeta,
+    out: &mut UiDrawList,
+) {
     if stack.count > 1 {
         let mut digits = [0u8; 10];
         let mut value = stack.count as u32;
@@ -10659,7 +10750,13 @@ fn overlay_hotbar_stack_metadata(x: i32, y: i32, stack: &LiveHotbarOverlayMeta, 
         }
         let count = std::str::from_utf8(&digits[start..]).unwrap_or("1");
         let tx = x + 20 - text_width(count, 1) as i32;
-        out.text_str(tx + 1, y + 13, 1, megu_ui::draw::palette::TEXT_SHADOW, count);
+        out.text_str(
+            tx + 1,
+            y + 13,
+            1,
+            megu_ui::draw::palette::TEXT_SHADOW,
+            count,
+        );
         out.text_str(tx, y + 12, 1, megu_ui::draw::palette::TEXT, count);
     }
     let (Some(damage), Some(max_damage)) = (stack.damage, stack.max_damage) else {
@@ -11437,7 +11534,10 @@ impl ApplicationHandler for GpuApp {
                         .map_or((0, 0), |a| (a.size.width, a.size.height));
                     let (x, y) = self.mouse_pos;
                     let rel_x = x - w as i32 / 2;
-                    let title_entry = self.book_editor.as_ref().is_some_and(|book| book.title_entry);
+                    let title_entry = self
+                        .book_editor
+                        .as_ref()
+                        .is_some_and(|book| book.title_entry);
                     if title_entry && y > h as i32 / 2 + 70 && rel_x > 24 {
                         if let Some(book) = self.book_editor.as_ref() {
                             let action = book.close();
@@ -11531,11 +11631,15 @@ impl ApplicationHandler for GpuApp {
                     }
                     return;
                 }
+                if self.scroll_menu_from_wheel(delta) {
+                    return;
+                }
                 if steps != 0
                     && self.container_screen.is_some()
-                    && self.recipe_overlay_regions.iter().any(|region| {
-                        region.contains(self.mouse_pos.0, self.mouse_pos.1)
-                    })
+                    && self
+                        .recipe_overlay_regions
+                        .iter()
+                        .any(|region| region.contains(self.mouse_pos.0, self.mouse_pos.1))
                 {
                     let (w, h) = self
                         .active
@@ -11543,10 +11647,10 @@ impl ApplicationHandler for GpuApp {
                         .map_or((0, 0), |active| (active.size.width, active.size.height));
                     let key = if steps > 0 { UiKey::Up } else { UiKey::Down };
                     for _ in 0..steps.unsigned_abs().min(64) {
-                        for action in self
-                            .ui
-                            .recipe_browser
-                            .handle_input(UiInputEvent::KeyPressed(key), w, h)
+                        for action in
+                            self.ui
+                                .recipe_browser
+                                .handle_input(UiInputEvent::KeyPressed(key), w, h)
                         {
                             self.dispatch_recipe_browser_action(&action);
                         }
@@ -11566,17 +11670,19 @@ impl ApplicationHandler for GpuApp {
                             return;
                         } else if screen.schema().menu_id == 18 {
                             let max = screen.loom_patterns.len().div_ceil(3).saturating_sub(4);
-                            screen.loom_scroll_row = (screen.loom_scroll_row as i64
-                                - i64::from(steps))
-                                .clamp(0, max as i64)
-                                as usize;
+                            screen.loom_scroll_row =
+                                (screen.loom_scroll_row as i64 - i64::from(steps))
+                                    .clamp(0, max as i64) as usize;
                             return;
                         } else if screen.schema().menu_id == 24 {
-                            let max = screen.stonecutter_recipes.len().div_ceil(4).saturating_sub(3);
-                            screen.stonecutter_scroll_row = (screen.stonecutter_scroll_row as i64
-                                - i64::from(steps))
-                                .clamp(0, max as i64)
-                                as usize;
+                            let max = screen
+                                .stonecutter_recipes
+                                .len()
+                                .div_ceil(4)
+                                .saturating_sub(3);
+                            screen.stonecutter_scroll_row =
+                                (screen.stonecutter_scroll_row as i64 - i64::from(steps))
+                                    .clamp(0, max as i64) as usize;
                             return;
                         }
                     }
@@ -14555,7 +14661,10 @@ mod tests {
             .unwrap();
         app.sync_container_screen();
         assert!(app.container_screen.is_some());
-        assert_eq!(app.container_screen.as_ref().unwrap().title, "Server Furnace");
+        assert_eq!(
+            app.container_screen.as_ref().unwrap().title,
+            "Server Furnace"
+        );
         assert!(app.container_screen.as_ref().unwrap().properties.is_empty());
 
         app.live
@@ -15257,6 +15366,76 @@ mod tests {
             }
             _ => panic!("expected UpdateSign command"),
         }
+    }
+
+    /// The UI-side Done button reaches the host as a notification action and
+    /// uses the same save-and-close path as Enter-on-last-line.
+    #[test]
+    fn close_sign_editor_action_ships_done_payload() {
+        use crate::live_session::WorkerCommand;
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let (_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let (outgoing, rx) = std::sync::mpsc::sync_channel(8);
+        let mut live = LiveSession::with_channels(incoming, outgoing);
+        live.status = SessionStatus::Playing;
+        app.attach_live(live);
+        app.ui.sign_editor = Some(SignEditorState::new((2, 64, 3), false, Default::default()));
+        app.ui
+            .sign_editor
+            .as_mut()
+            .expect("sign editor")
+            .insert_str("done");
+
+        app.dispatch_ui_action(&UiAction::CloseSignEditor);
+
+        assert!(app.ui.sign_editor.is_none());
+        match rx.try_recv() {
+            Ok(WorkerCommand::UpdateSign {
+                pos,
+                is_front,
+                lines,
+            }) => {
+                assert_eq!(pos, (2, 64, 3));
+                assert!(!is_front);
+                assert_eq!(lines[0], "done");
+            }
+            _ => panic!("CloseSignEditor must queue the sign update"),
+        }
+    }
+
+    /// Scrollable menu screens consume wheel input through `UiState::scroll_menu`;
+    /// the host sign-flips winit's positive scroll-up delta and keeps gameplay
+    /// screens on the hotbar/container paths.
+    #[test]
+    fn menu_wheel_forwarding_scrolls_settings_create_world_and_friends() {
+        let mut app = GpuApp::new(GpuCliConfig::default());
+        let _ = app.ui.render(320, 100);
+        let wheel_down = winit::event::MouseScrollDelta::LineDelta(0.0, -1.0);
+        let wheel_up = winit::event::MouseScrollDelta::LineDelta(0.0, 1.0);
+
+        app.ui.navigate(Screen::Settings(SettingsTab::Controls));
+        assert!(app.scroll_menu_from_wheel(wheel_down));
+        assert!(app.ui.menu_scroll.settings_controls > 0);
+        let scrolled = app.ui.menu_scroll.settings_controls;
+        assert!(app.scroll_menu_from_wheel(wheel_up));
+        assert!(app.ui.menu_scroll.settings_controls < scrolled);
+
+        app.ui.navigate(Screen::Singleplayer);
+        assert!(app.scroll_menu_from_wheel(wheel_down));
+        assert!(app.ui.menu_scroll.singleplayer_create > 0);
+
+        app.ui.navigate(Screen::Friends);
+        assert!(
+            app.scroll_menu_from_wheel(winit::event::MouseScrollDelta::PixelDelta(
+                PhysicalPosition::new(0.0, -18.0)
+            ))
+        );
+        assert!(app.ui.menu_scroll.friends > 0);
+
+        app.ui.navigate(Screen::InGameHud);
+        let before = app.ui.menu_scroll.friends;
+        assert!(!app.scroll_menu_from_wheel(wheel_down));
+        assert_eq!(app.ui.menu_scroll.friends, before);
     }
 
     /// The `sign_update` WorkerCommand encodes through to a wire body the

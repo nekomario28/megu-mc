@@ -78,6 +78,7 @@ use megu_kernel::raycast::{
 };
 use megu_kernel::Aabb;
 use megu_kernel::CommandDispatcher;
+use megu_proto::mod_wire as proto_mod_wire;
 use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
@@ -440,14 +441,8 @@ pub struct SessionPaths {
 }
 
 /// `megu:mod_sync_v1` (`MSY1`) channel shared with the integrated server.
-pub const CHANNEL_MOD_SYNC_V1: &str = "megu:mod_sync_v1";
-const MSY1_MAGIC: &[u8; 4] = b"MSY1";
+pub const CHANNEL_MOD_SYNC_V1: &str = proto_mod_wire::MOD_SYNC_CHANNEL;
 const MSH1_MAGIC: &[u8; 4] = b"MSH1";
-const MAX_MSY1_MODS: usize = 512;
-const MAX_MSY1_MOD_ID_LEN: usize = 128;
-const MAX_MSY1_FILE_NAME_LEN: usize = 255;
-const MAX_MSY1_URL_LEN: usize = 2048;
-const MAX_MSY1_JAR_BYTES: u64 = 256 * 1024 * 1024;
 
 /// One validated entry in a server `MSY1` manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -475,118 +470,21 @@ impl LiveModSyncDiff {
     }
 }
 
-struct Msy1Reader<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Msy1Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.pos.checked_add(n).ok_or("MSY1 offset overflow")?;
-        let out = self.bytes.get(self.pos..end).ok_or("truncated MSY1 body")?;
-        self.pos = end;
-        Ok(out)
-    }
-
-    fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, String> {
-        Ok(u16::from_be_bytes(
-            self.take(2)?.try_into().map_err(|_| "truncated u16")?,
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, String> {
-        Ok(u64::from_be_bytes(
-            self.take(8)?.try_into().map_err(|_| "truncated u64")?,
-        ))
-    }
-
-    fn string(&mut self, len: usize, cap: usize, what: &str) -> Result<String, String> {
-        if len == 0 || len > cap {
-            return Err(format!("invalid MSY1 {what} length"));
-        }
-        let bytes = self.take(len)?;
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|_| format!("invalid MSY1 {what} UTF-8"))
-    }
-}
-
-fn valid_msy1_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_MSY1_FILE_NAME_LEN
-        && name.ends_with(".jar")
-        && !name.contains(['/', '\\', '\0'])
-        && name != "."
-        && name != ".."
-}
-
-fn valid_msy1_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("https://") else {
-        return false;
-    };
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    url.len() <= MAX_MSY1_URL_LEN
-        && matches!(
-            host.as_str(),
-            "cdn.modrinth.com" | "edge.forgecdn.net" | "mediafilez.forgecdn.net"
-        )
-}
-
-/// Decode and validate the bounded `MSY1` manifest format without pulling the
-/// server adapter crate into the client dependency graph.
+/// Decode and validate the bounded `MSY1` manifest format through the
+/// canonical wire codec, then apply this client's trusted-CDN download policy.
 pub fn decode_msy1_manifest(bytes: &[u8]) -> Result<Vec<LiveModSyncEntry>, String> {
-    if bytes.len() < 6 {
-        return Err("MSY1 body shorter than header".into());
-    }
-    if &bytes[..4] != MSY1_MAGIC {
-        return Err("bad MSY1 magic".into());
-    }
-    let count = u16::from_be_bytes([bytes[4], bytes[5]]) as usize;
-    if count > MAX_MSY1_MODS {
-        return Err("MSY1 mod count exceeds cap".into());
-    }
-    if count > (bytes.len() - 6) / (1 + 1 + 2 + 8 + 32) {
-        return Err("MSY1 declared count exceeds remaining body".into());
-    }
-    let mut reader = Msy1Reader { bytes, pos: 6 };
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let id_len = usize::from(reader.u8()?);
-        let mod_id = reader.string(id_len, MAX_MSY1_MOD_ID_LEN, "mod id")?;
-        let file_len = usize::from(reader.u8()?);
-        let file_name = reader.string(file_len, MAX_MSY1_FILE_NAME_LEN, "file name")?;
-        let url_len = usize::from(reader.u16()?);
-        let download_url = reader.string(url_len, MAX_MSY1_URL_LEN, "download URL")?;
-        let size_bytes = reader.u64()?;
-        let digest = reader.take(32)?;
-        if !(1..=MAX_MSY1_JAR_BYTES).contains(&size_bytes) {
-            return Err("MSY1 jar size out of range".into());
-        }
-        if !valid_msy1_file_name(&file_name) {
-            return Err("unsafe MSY1 file name".into());
-        }
-        if !valid_msy1_url(&download_url) {
-            return Err("unsafe MSY1 download URL".into());
-        }
+    let manifest = proto_mod_wire::decode_msy1_manifest(bytes)?;
+    let mut entries = Vec::with_capacity(manifest.entries.len());
+    for entry in manifest.entries {
+        proto_mod_wire::validate_msy1_canonical_download_url(&entry.download_url)
+            .map_err(|_| "unsafe MSY1 download URL".to_owned())?;
         entries.push(LiveModSyncEntry {
-            mod_id,
-            file_name,
-            download_url,
-            sha256_hex: megu_core::crypto::hex_encode(digest),
-            size_bytes,
+            mod_id: entry.mod_id,
+            file_name: entry.file_name,
+            download_url: entry.download_url,
+            sha256_hex: entry.sha256_hex,
+            size_bytes: entry.size_bytes,
         });
-    }
-    if reader.pos != bytes.len() {
-        return Err("trailing bytes in MSY1 body".into());
     }
     Ok(entries)
 }
@@ -621,11 +519,11 @@ pub fn scan_local_mod_sync_inventory(game_dir: &std::path::Path) -> Vec<LiveModS
     }
     files.sort();
     let mut out = Vec::new();
-    for path in files.into_iter().take(MAX_MSY1_MODS) {
+    for path in files.into_iter().take(proto_mod_wire::MAX_MSY1_MODS) {
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
         };
-        if meta.len() == 0 || meta.len() > MAX_MSY1_JAR_BYTES {
+        if meta.len() == 0 || meta.len() > proto_mod_wire::MAX_MSY1_JAR_BYTES {
             continue;
         }
         let Ok(bytes) = std::fs::read(&path) else {
@@ -8165,12 +8063,8 @@ impl LiveSession {
         });
         let (block_id, dynamic) = resolved
             .map(|(state, name)| {
-                let vanilla = if let Some(registry) = &self.world.registry {
-                    registry.state_name(state).ok()
-                } else {
-                    self.world.blocks.state_name(state)
-                };
-                (name.to_owned(), vanilla.is_none())
+                let dynamic = self.world.blocks.dynamic_light_fact(state).is_some();
+                (name.to_owned(), dynamic)
             })
             .unwrap_or_else(|| ("create:kinetic_part".to_owned(), false));
         let display_name = if dynamic {
@@ -8347,21 +8241,15 @@ impl LiveSession {
     }
 
     /// Install dynamic `MRS1` states into the world before any subsequent
-    /// chunk/block packet can be meshed. The wire map is private inside
-    /// `ClientModRegistry`; probing the protocol's bounded row window keeps
-    /// this adapter read-only while remaining deterministic and allocation
-    /// capped.
+    /// chunk/block packet can be meshed. Iterate the decoded sparse rows
+    /// directly: one frame may mix the Create band (`26_684..`) with generic
+    /// mod states (`1_000_000..`), so dense probing from the base id would
+    /// silently drop every row outside its bounded window.
     fn install_mrs1_dynamic_registry(&mut self, registry: ClientModRegistry) {
-        let mut states = Vec::new();
-        for offset in 0..131_072u32 {
-            let Some(state_id) = registry.base_block_state_id.checked_add(offset) else {
-                break;
-            };
-            let Some(block) = registry.block_state(state_id) else {
-                continue;
-            };
-            states.push((state_id, block.name.clone(), block.facts_byte));
-        }
+        let states: Vec<_> = registry
+            .block_states()
+            .map(|(state_id, block)| (state_id, block.name.clone(), block.facts_byte))
+            .collect();
         self.world.install_dynamic_mod_registry_states(&states);
         self.mod_registry = Some(registry);
     }
@@ -10516,10 +10404,7 @@ impl LiveSession {
                             .subworlds
                             .entries()
                             .filter(|entry| {
-                                matches!(
-                                    entry.owner,
-                                    SubworldOwner::Network { dim_id: 0, .. }
-                                )
+                                matches!(entry.owner, SubworldOwner::Network { dim_id: 0, .. })
                             })
                             .map(|entry| entry.id)
                             .collect();
@@ -10529,10 +10414,7 @@ impl LiveSession {
                             // such a collision cannot be represented through the
                             // legacy unscoped `remove` API.
                             if self.subworlds.get(id).is_some_and(|entry| {
-                                matches!(
-                                    entry.owner,
-                                    SubworldOwner::Network { dim_id: 0, .. }
-                                )
+                                matches!(entry.owner, SubworldOwner::Network { dim_id: 0, .. })
                             }) {
                                 self.subworlds.remove(id);
                             }
