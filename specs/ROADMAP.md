@@ -257,12 +257,17 @@ M2で比較できる同じ機能・負荷・設定を固定し、back-to-back測
 3. **Wave 3（最終検証・出口）**:
    - 最終独立監査（Audit 4: Live GPU / Visuals / Controls / Protocol 767 / Zero-Alloc）および同一 SHA での全クレート clippy/test・`perf_antipattern_audit`・`general_defect_audit --strict`・`playblocker_guard_audit`・`trademark_hygiene_audit`・`docs_sync_audit --strict`・`--dst-check`・`alpha_release_smoke`（7/7）・`live_playability_e2e`（5/5）・`export_public_branch.sh --verify` を通過させる。
 
-## Alpha 6 — Diff 駆動ワールド＆直感操作アーキテクチャ（次期計画）
+## Alpha 6 — Diff 駆動ワールド＆超省 VRAM 描画アーキテクチャ（次期計画）
 
 Alpha 5 の安定化後に着手する中核拡張：
 - **決定論 Delta ワールド保存＆タイムトラベルスナップショット**: シードから決定論再現できる未変更チャンクを 0 バイト化し、変更チャンクのみベース地形からのブロック差分（Delta）＋世代マニフェストで保存。ワールド容量を劇減させ、Mod 導入前／ボス戦前／建築ミス前への高速ロールバック・分岐試遊を実現する。
 - **マルチプレイヤー チャンクハッシュ差分同期**: クライアントのローカルチャンク Merkle ハッシュを照合し、再接続・再訪・ポータル移動時に変更ブロック差分だけ送信して帯域と待ち時間を削減する。
 - **ワールド内ゴースト Diff プレビュー＆1クリック Undo**: Create / Sable の船体組立てやクリエイティブ範囲編集の確定前に変更ブロックを半透明ゴーストで重ね表示し、確認・取り消しを直感化する。
+- **S1. 面単位プル描画（Vertex Pulling：48 B/面 → 20〜24 B/面）**: 地形クワッドの 4 頂点展開を廃し、面レコード（始点・幅・高さ・面属性・4 隅 AO/光源）から GPU 上で 4 隅を数式復元することで VRAM と転送量を最大約 50% 削減する（`RenderRegion` 間接描画・影パス・外部シェーダーパック互換層＋独立ベンチ付きで段階導入）。
+- **S2. GPU Residency Manager（安全退避＋オンデマンド再ベイク）**: `evidence/mesh-residency-status.md` の未解決課題を解消し、`alive_but_evicted` 状態と常駐 `PalettedSection` からのオンデマンド再生成によって長描画距離・内蔵 GPU でも VRAM 使用量を予算内に抑える。
+- **A1. 実 WorldGen＋変更差分ベースの遠距離 LOD**: `FarHeightBiomeSampler` をテスト用ノイズから実サーバー決定論 WorldGen＋変更済みチャンク表面差分へ接続し、本物の地形と拠点を遠景へ反映する。
+- **S3. ブロックモデル形状テンプレートと材質の分離**: 階段・フェンス・ハーフ等の同一ジオメトリを状態間で共有し、テクスチャ/Tint のみ材質側へ分離してベイク負荷とキャッシュ RAM を削減する。
+- **A2. コールドチャンク／保存／転送限定の数理圧縮**: ホットパスのランダムアクセス性能を落とさないようライブチャンクは現行 `PalettedSection` を維持し、コールドチャンク・ディスク保存・ネットワーク同期に限定して Delta＋RLE／同一セクション共有を実測ベンチ付きで適用する。
 
 ## 横断規律
 
