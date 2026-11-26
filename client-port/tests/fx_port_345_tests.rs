@@ -4,6 +4,7 @@
 //! extrusion + prototype atlas cache, and SoA VFX particles.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::mem::{align_of, size_of};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -19,11 +20,19 @@ use megu_client_mesh::vfx_engine::*;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+    static COUNT_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+}
+
 struct CountingAlloc;
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        COUNT_THIS_THREAD.with(|count| {
+            if count.get() {
+                ALLOCS.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         unsafe { System.alloc(layout) }
     }
 
@@ -35,9 +44,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static ALLOCATOR: CountingAlloc = CountingAlloc;
 
-/// The counter is process-global, so a measured window must not overlap any
-/// other test body on a sibling thread. All three tests hold this lock for
-/// their whole body, which serializes them.
+/// Keep the test bodies serialized for shared fixture assumptions; allocation
+/// accounting itself is enabled only on the measuring thread.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -223,6 +231,18 @@ fn fx4_bitboard_extrusion_matches_naive_and_atlas_cache_reuses_prototypes() {
     // naive path builds a fresh mesh per block; the cache reuses both the
     // prototype and the caller's buffer).
     let mut out: Vec<ExtrudedQuad> = Vec::with_capacity(prototype.quads.len());
+
+    // Prove that the active-thread counter observes a real allocation before
+    // relying on it for the zero-allocation assertion. Other threads remain
+    // uncounted even while this window is active.
+    COUNT_THIS_THREAD.with(|count| count.set(true));
+    let self_check_before = alloc_count();
+    std::hint::black_box(Box::new(42_u8));
+    assert_eq!(
+        alloc_count(),
+        self_check_before + 1,
+        "allocation counter missed a current-thread allocation"
+    );
     let before = alloc_count();
     for i in 0..1000i32 {
         out.clear();
@@ -235,6 +255,7 @@ fn fx4_bitboard_extrusion_matches_naive_and_atlas_cache_reuses_prototypes() {
         before,
         "emitting cached prototypes allocated memory"
     );
+    COUNT_THIS_THREAD.with(|count| count.set(false));
     assert_eq!(cache.cache_hits(), 1000);
     assert_eq!(cache.bakes(), 1, "the 1,000-block field re-extruded");
     assert_eq!(cache.cache_misses(), 0);
