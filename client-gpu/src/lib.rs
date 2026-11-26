@@ -20,6 +20,7 @@
 pub mod atmosphere;
 pub mod clipboard;
 pub mod crack_overlay_pass;
+pub mod entity_appearance;
 pub mod gpu_hiz;
 pub mod item_visuals_3d;
 pub mod live_session;
