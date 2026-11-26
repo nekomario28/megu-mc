@@ -661,7 +661,7 @@ fn send_held_map_data(me: &Client, held_slot: i16) {
         .inv
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(36 + held_slot))
+        .get(&held_player_menu_slot(held_slot))
         .cloned();
     let Some(stack) = stack else {
         return;
@@ -3551,11 +3551,58 @@ fn combat_tick(cls: &[Arc<Client>]) {
 /// held slot for an empty hotbar slot, then for an unenchanted one
 /// (`ItemStack.isEnchanted` == a non-empty `enchantments` component), else
 /// keep the held slot. Hotbar slots are menu slots 36..=44.
+fn player_menu_hotbar_slot(
+    hotbar: megu_core::slot_coords::HotbarSlot,
+) -> megu_core::slot_coords::PlayerMenuSlot {
+    hotbar.into()
+}
+
+fn hotbar_menu_index(hotbar: i16) -> Option<i16> {
+    let index = u8::try_from(hotbar).ok()?;
+    let hotbar = megu_core::slot_coords::HotbarSlot::try_from(index).ok()?;
+    Some(i16::from(player_menu_hotbar_slot(hotbar).index()))
+}
+
+fn held_player_menu_slot(held_hotbar: i16) -> i16 {
+    hotbar_menu_index(held_hotbar).expect("held hotbar slot is validated")
+}
+
+fn player_hotbar_menu_slots() -> std::ops::RangeInclusive<i16> {
+    i16::from(megu_core::slot_coords::PlayerMenuSlot::HOTBAR_FIRST)
+        ..=i16::from(megu_core::slot_coords::PlayerMenuSlot::HOTBAR_LAST)
+}
+
+const DIG_REACH_POLICY: megu_core::pose_ray::ReachPolicy =
+    megu_core::pose_ray::ReachPolicy::with_server_acceptance(
+        megu_core::pose_ray::InteractionReach {
+            block_survival: 4.9,
+            block_creative: 5.6,
+            entity_survival: 3.0,
+            entity_creative: 5.0,
+        },
+    );
+
+const PLACEMENT_REACH_POLICY: megu_core::pose_ray::ReachPolicy =
+    megu_core::pose_ray::ReachPolicy::with_server_acceptance(
+        megu_core::pose_ray::InteractionReach {
+            block_survival: 5.5,
+            block_creative: 6.0,
+            entity_survival: 3.0,
+            entity_creative: 5.0,
+        },
+    );
+
+fn hotbar_slot_from_menu(menu: i16) -> Option<megu_core::slot_coords::HotbarSlot> {
+    let index = u8::try_from(menu).ok()?;
+    let menu = megu_core::slot_coords::PlayerMenuSlot::try_from(index).ok()?;
+    megu_core::slot_coords::HotbarSlot::try_from(menu).ok()
+}
+
 fn suitable_hotbar_slot(inv: &HashMap<i16, Stack>, held: i16) -> i16 {
     for i in 0..9i16 {
         let cand = (held + i) % 9;
         let empty = inv
-            .get(&(36 + cand))
+            .get(&hotbar_menu_index(cand).expect("wrapped hotbar index"))
             .is_none_or(|st| st.0 == 0 || st.1 == 0);
         if empty {
             return cand;
@@ -3564,7 +3611,7 @@ fn suitable_hotbar_slot(inv: &HashMap<i16, Stack>, held: i16) -> i16 {
     for i in 0..9i16 {
         let cand = (held + i) % 9;
         let enchanted = inv
-            .get(&(36 + cand))
+            .get(&hotbar_menu_index(cand).expect("wrapped hotbar index"))
             .is_some_and(|st| !enchantments_get(&st.2).is_empty());
         if !enchanted {
             return cand;
@@ -3600,6 +3647,9 @@ fn pick_item(me: &Arc<Client>, held_slot: &mut i16, slot: i64) {
     if slot < 9 {
         // Hotbar index: select it — the same visible result the vanilla
         // client produces locally for a hotbar match.
+        let hotbar = megu_core::slot_coords::HotbarSlot::try_from(slot as u8)
+            .expect("validated pick-item hotbar index");
+        let slot = i16::from(hotbar.index());
         *held_slot = slot;
         *me.held.lock().unwrap_or_else(|e| e.into_inner()) = slot;
         let _ = send_packet(
@@ -3614,7 +3664,9 @@ fn pick_item(me: &Arc<Client>, held_slot: &mut i16, slot: i64) {
         suitable_hotbar_slot(&inv, *held_slot)
     };
     // items index -> menu slot: hotbar i -> 36+i, main i -> i
-    let hot_menu = 36 + hslot;
+    let hotbar = megu_core::slot_coords::HotbarSlot::try_from(hslot as u8)
+        .expect("selected hotbar slot is valid");
+    let hot_menu = i16::from(player_menu_hotbar_slot(hotbar).index());
     let (st_hot, st_main) = {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let displaced = inv.get(&hot_menu).cloned().unwrap_or((0, 0, Vec::new()));
@@ -3813,7 +3865,7 @@ fn finish_block_break_one(me: &Arc<Client>, dim: DimId, x: i32, y: i32, z: i32, 
     let held = {
         let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        inv.get(&(36 + held_slot)).cloned().unwrap_or((0, 0, Vec::new()))
+        inv.get(&held_player_menu_slot(held_slot)).cloned().unwrap_or((0, 0, Vec::new()))
     };
     // Vanilla rechecks mayDestroy in `destroyAndAck`: an adventure-mode dig
     // still finishes only while the held stack's can_break matches.
@@ -4102,7 +4154,7 @@ fn live_mine_cut_all_plan(
         me.inv
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(36 + held_slot))
+            .get(&held_player_menu_slot(held_slot))
             .cloned()
             .unwrap_or((0, 0, Vec::new()))
     };
@@ -4609,7 +4661,8 @@ fn click_carried_stack(tail: &[u8]) -> Option<Stack> {
 }
 
 fn hotbar_swap_slot(button: i8) -> Option<i16> {
-    (0..=8).contains(&button).then_some(36 + i16::from(button))
+    let hotbar = megu_core::slot_coords::HotbarSlot::try_from(u8::try_from(button).ok()?).ok()?;
+    Some(i16::from(player_menu_hotbar_slot(hotbar).index()))
 }
 
 fn crafting_remainder(item: i64) -> Option<Stack> {
@@ -7712,13 +7765,14 @@ fn written_book_content_payload(title: &str, author: &str, pages: &[String]) -> 
 fn c2s_apply_edit_book(me: &Client, book: &EditBookUpdate) {
     // Vanilla raw inventory indices: 0..8 hotbar -> window 36..44, 9..35 main
     // -> window 9..35, 36..39 armor -> window 5..8, 40 offhand -> 45.
-    let wslot: i16 = match book.slot {
-        0..=8 => 36 + book.slot as i16,
-        9..=35 => book.slot as i16,
-        36..=39 => 44 - book.slot as i16,
-        40 => 45,
-        _ => return,
+    let wslot = match book.slot {
+        0..=8 => hotbar_menu_index(book.slot as i16),
+        9..=35 => Some(book.slot as i16),
+        36..=39 => Some(44 - book.slot as i16),
+        40 => Some(45),
+        _ => None,
     };
+    let Some(wslot) = wslot else { return };
     let st = {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let Some((item, count, _)) = inv.get(&wslot).cloned() else {
@@ -8730,13 +8784,37 @@ fn overlay_cell_pos(cx: i32, cz: i32, idx: u32) -> Option<(i32, i32, i32)> {
 /// tens of thousands of columns on a dimension hop. The ordering is vanilla's
 /// squared distance, then lowest Y; the remaining coordinates only make the
 /// tie total and deterministic.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PortalSearchPolicy {
+    horizontal_radius: i32,
+    scale_xz: f64,
+    landing_min_y_margin: i32,
+    landing_max_y_margin: i32,
+}
+
+/// Derive the shared portal search and landing policy from the source and
+/// destination dimensions. The destination selects the search radius and
+/// vertical safety margins; registered dimension scales determine X/Z mapping.
+fn portal_search_policy(source_dim: DimId, target_dim: DimId) -> PortalSearchPolicy {
+    PortalSearchPolicy {
+        horizontal_radius: if target_dim == DimId::Nether { 16 } else { 128 },
+        scale_xz: portal_coordinate_ratio(
+            source_dim.coordinate_scale(),
+            target_dim.coordinate_scale(),
+        ),
+        landing_min_y_margin: 4,
+        landing_max_y_margin: 8,
+    }
+}
+
 fn find_existing_nether_portal(
     dim: DimId,
     nx: i32,
     ny: i32,
     nz: i32,
+    policy: PortalSearchPolicy,
 ) -> Option<(NetherPortalFrame, (i32, i32, i32))> {
-    let radius = if dim == DimId::Nether { 16 } else { 128 };
+    let radius = policy.horizontal_radius;
     let (border_min_x, border_min_z, border_max_x, border_max_z) = world_border()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -8983,8 +9061,14 @@ fn try_ignite_nether_portal(reg: &block_registry::BReg, dim: DimId, x: i32, y: i
     true
 }
 
-fn find_safe_portal_site(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(i32, i32, i32)> {
-    let radius = if dim == DimId::Nether { 16 } else { 128 };
+fn find_safe_portal_site(
+    dim: DimId,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    policy: PortalSearchPolicy,
+) -> Option<(i32, i32, i32)> {
+    let radius = policy.horizontal_radius;
     let min_y = crate::worldgen::min_y_dim(dim) + 1;
     let max_y = crate::worldgen::min_y_dim(dim) + crate::worldgen::height_dim(dim) - 5;
     let obsidian = name_to_state("obsidian").unwrap_or(2354);
@@ -9014,8 +9098,14 @@ fn find_safe_portal_site(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(i32, 
 
 /// Create a frame at a nearby safe site, preserving all non-air blocks in its
 /// surroundings. If none exists, use the clamped target as the last resort.
-fn materialize_nether_landing(dim: DimId, bx: i32, by: i32, bz: i32) -> (i32, i32, i32) {
-    let (bx, by, bz) = find_safe_portal_site(dim, bx, by, bz).unwrap_or((bx, by, bz));
+fn materialize_nether_landing(
+    dim: DimId,
+    bx: i32,
+    by: i32,
+    bz: i32,
+    policy: PortalSearchPolicy,
+) -> (i32, i32, i32) {
+    let (bx, by, bz) = find_safe_portal_site(dim, bx, by, bz, policy).unwrap_or((bx, by, bz));
     let obsidian = name_to_state("obsidian").unwrap_or(2354);
     for dx in -1..=2 {
         for dy in [-1, 3] {
@@ -9198,16 +9288,16 @@ fn nether_portal_target(dim: DimId, bx: i32, by: i32, bz: i32) -> Option<(DimId,
     } else {
         DimId::Overworld
     };
-    let ratio = portal_coordinate_ratio(dim.coordinate_scale(), ndim.coordinate_scale());
-    let (nx, nz) = (bx as f64 * ratio, bz as f64 * ratio);
+    let policy = portal_search_policy(dim, ndim);
+    let (nx, nz) = (bx as f64 * policy.scale_xz, bz as f64 * policy.scale_xz);
     let (min_x, min_z, max_x, max_z) = world_border()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .bounds(border_now_ms());
     let (nx, nz) = (nx.clamp(min_x, max_x), nz.clamp(min_z, max_z));
     let ny = (by as f64).clamp(
-        (ndim.min_y() + 4) as f64,
-        (ndim.min_y() + ndim.height() - 8) as f64,
+        (ndim.min_y() + policy.landing_min_y_margin) as f64,
+        (ndim.min_y() + ndim.height() - policy.landing_max_y_margin) as f64,
     );
     Some((ndim, nx.floor() as i32, ny.floor() as i32, nz.floor() as i32))
 }
@@ -9374,9 +9464,12 @@ fn enter_portal(
         let Some((ndim, nx, ny, nz)) = nether_portal_target(dim, bx, by, bz) else {
             return;
         };
+        let portal_policy = portal_search_policy(dim, ndim);
         let source_frame = nether_portal_frame_at(dim, bx, by, bz);
         let (landing, yaw) =
-            if let Some((destination_frame, _)) = find_existing_nether_portal(ndim, nx, ny, nz) {
+            if let Some((destination_frame, _)) =
+                find_existing_nether_portal(ndim, nx, ny, nz, portal_policy)
+            {
                 // Reuse is strict: no frame, foundation or clearance writes run
                 // when a valid destination portal exists in range. The relative
                 // entry position rides across through vanilla's width/height
@@ -9393,7 +9486,8 @@ fn enter_portal(
                     };
                 (portal_position_in_frame(destination_frame, relative), yaw)
             } else {
-                let (nx, ny, nz) = materialize_nether_landing(ndim, nx, ny, nz);
+                let (nx, ny, nz) =
+                    materialize_nether_landing(ndim, nx, ny, nz, portal_policy);
                 ((nx as f64 + 1.0, ny as f64, nz as f64 + 0.5), yaw)
             };
         switch_client_dimension(
@@ -9617,7 +9711,7 @@ fn try_insert_ender_eye(
         .inv
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(36 + held_slot))
+        .get(&held_player_menu_slot(held_slot))
         .map(|s| s.0)
         .unwrap_or(0);
     if held != 1006 {
@@ -9629,7 +9723,7 @@ fn try_insert_ender_eye(
     note_block_update_dim(dim, x, y, z, eyed);
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        let hs = 36 + held_slot;
+        let hs = held_player_menu_slot(held_slot);
         if let Some((it, c, cc)) = inv.get(&hs).cloned() {
             if it == 1006 {
                 if c <= 1 {
@@ -9695,7 +9789,7 @@ fn try_use_ender_eye(me: &Arc<Client>, held_slot: i16, seq: i64) -> bool {
         .inv
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&(36 + held_slot))
+        .get(&held_player_menu_slot(held_slot))
         .map(|s| s.0)
         .unwrap_or(0);
     if held != 1006 {
@@ -9721,7 +9815,7 @@ fn try_use_ender_eye(me: &Arc<Client>, held_slot: i16, seq: i64) -> bool {
     spawn_eye_of_ender(me, hit.x as f64, hit.z as f64);
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        let hs = 36 + held_slot;
+        let hs = held_player_menu_slot(held_slot);
         if let Some((it, c, cc)) = inv.get(&hs).cloned() {
             if it == 1006 {
                 if c <= 1 {
@@ -10274,7 +10368,7 @@ fn use_sign_item(
     if !is_sign_block_state(st) {
         return false;
     }
-    let inv_slot = 36 + held_slot;
+    let inv_slot = held_player_menu_slot(held_slot);
     let held = me
         .inv
         .lock()
@@ -11261,7 +11355,7 @@ fn player_equipment(me: &Client) -> EntityEquipment {
     let held = *me.held.lock().unwrap_or_else(|e| e.into_inner());
     let stack = |slot: i16| inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new()));
     let mut eq = EntityEquipment::default();
-    eq.set(EquipmentSlot::MainHand, stack(36 + held));
+    eq.set(EquipmentSlot::MainHand, stack(held_player_menu_slot(held)));
     eq.set(EquipmentSlot::OffHand, stack(45));
     eq.set(EquipmentSlot::Feet, stack(8));
     eq.set(EquipmentSlot::Legs, stack(7));
@@ -12271,7 +12365,7 @@ fn consume_one_held_item(me: &Client, held_slot: i16) -> bool {
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
         return true;
     }
-    let key = 36 + held_slot;
+    let key = held_player_menu_slot(held_slot);
     let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
     let Some((item, count, comps)) = inv.get(&key).cloned() else { return false };
     if count == 0 { return false; }
@@ -12315,7 +12409,7 @@ fn player_give_or_drop_dim(me: &Client, mut stack: Stack) {
     let before = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        pickup_into_inventory(&mut inv, 36 + selected, creative, &mut stack);
+        pickup_into_inventory(&mut inv, held_player_menu_slot(selected), creative, &mut stack);
     }
     let after = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
     sync_inventory_changes(me, &before, &after);
@@ -13695,14 +13789,14 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .map(|(&sl, _)| sl);
                         let (hit, _) = {
                             let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            (inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0), 0)
+                            (inv.get(&held_player_menu_slot(held_slot)).map(|v| v.0).unwrap_or(0), 0)
                         };
                         let bow_full_ticks = server_ticks(20).max(1);
                         let charge_t = ((draw_t as f32) / bow_full_ticks as f32).min(1.0);
                         let qc = {
                             let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             enchant_level(
-                                &i2.get(&(36 + held_slot))
+                                &i2.get(&held_player_menu_slot(held_slot))
                                     .map(|v| v.2.clone())
                                     .unwrap_or_default(),
                                 29,
@@ -13719,7 +13813,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // Crossbows charge into `charged_projectiles` here;
                             // the next right-click is what fires. Multishot stores
                             // the vanilla three projectile entries.
-                            let selected = 36 + held_slot;
+                            let selected = held_player_menu_slot(held_slot);
                             let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
                             let ammo = arrow_slot.and_then(|slot| {
                                 me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned().map(|stack| (slot, stack))
@@ -13769,7 +13863,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             let inf = {
                                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 enchant_level(
-                                    &i2.get(&(36 + held_slot))
+                                    &i2.get(&held_player_menu_slot(held_slot))
                                         .map(|v| v.2.clone())
                                         .unwrap_or_default(),
                                     16,
@@ -13794,7 +13888,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // bow enchants: power scales arrow dmg, flame ignites, punch knocks
                             let held_c = {
                                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                i2.get(&(36 + held_slot))
+                                i2.get(&held_player_menu_slot(held_slot))
                                     .map(|v| v.2.clone())
                                     .unwrap_or_default()
                             };
@@ -13879,10 +13973,10 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned();
                                 let mut p = vec![4u8];
                                 write_varint(&mut p, 0);
-                                p.extend_from_slice(&(36i16 + held_slot).to_be_bytes());
+                                p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
                                 let held_now = {
                                     let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    i2.get(&(36 + held_slot))
+                                    i2.get(&held_player_menu_slot(held_slot))
                                         .cloned()
                                         .unwrap_or((0, 0, Vec::new()))
                                 };
@@ -13900,7 +13994,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // trident throw
                             let held_st = {
                                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                i2.get(&(36 + held_slot))
+                                i2.get(&held_player_menu_slot(held_slot))
                                     .cloned()
                                     .unwrap_or((0, 0, Vec::new()))
                             };
@@ -13911,7 +14005,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             // pickupable drop (or returns at owner's feet w/ loyalty)
                             if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let hs = 36 + held_slot;
+                                let hs = held_player_menu_slot(held_slot);
                                 if let Some(st) = inv.get_mut(&hs) {
                                     if st.1 <= 1 {
                                         inv.remove(&hs);
@@ -13953,7 +14047,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 }
                 if status == 6 {
                     // swap_item_in_hand: held <-> offhand (F key)
-                    let hs = 36 + held_slot;
+                    let hs = held_player_menu_slot(held_slot);
                     let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                     let a = inv.remove(&hs).unwrap_or((0, 0, Vec::new()));
                     let b = inv.remove(&45i16).unwrap_or((0, 0, Vec::new()));
@@ -13971,7 +14065,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     // DROP_ALL_ITEMS (ctrl+Q) / DROP_ITEM (Q)
                     {
                         // vanilla: Q-drop works in creative too
-                        let hs = 36 + held_slot;
+                        let hs = held_player_menu_slot(held_slot);
                         let it = {
                             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
@@ -14040,7 +14134,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
                     let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
                     let gm_creative = game_mode == 1;
-                    let reach = if gm_creative { 5.6f64 } else { 4.9 };
+                    let reach = DIG_REACH_POLICY.server_block_acceptance(gm_creative);
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     // Canonical pose-aware eye: a crawling, sneaking or
                     // swimming branch miner reaches from `0.40`/`1.27`, not
@@ -14055,7 +14149,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     let old = block_at_dim(dim, x, y, z);
                     let held = {
                         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        inv.get(&(36 + held_slot))
+                        inv.get(&held_player_menu_slot(held_slot))
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()))
                     };
@@ -14237,11 +14331,8 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // foot-Y: placing ahead while crawling must not misfire.
                 {
                     let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let reach = if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                        6.0f64
-                    } else {
-                        5.5
-                    };
+                    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+                    let reach = PLACEMENT_REACH_POLICY.server_block_acceptance(creative);
                     let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
                     let eye_y = client_eye_y(&me, dim, px, py, pz);
                     let (rx, ry, rz) = (
@@ -14315,7 +14406,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .inv
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .get(&(36 + held_slot))
+                            .get(&held_player_menu_slot(held_slot))
                             .cloned()
                             .unwrap_or((0, 0, Vec::new()));
                         let allowed = block_registry::breg().is_some_and(|reg| {
@@ -14363,7 +14454,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         matches!(reg.name_of(clicked), "minecraft:bedrock" | "minecraft:obsidian")
                     })
                     && me.inv.lock().unwrap_or_else(|e| e.into_inner())
-                        .get(&(36 + held_slot))
+                        .get(&held_player_menu_slot(held_slot))
                         .and_then(|stack| item_to_name(stack.0))
                         == Some("end_crystal")
                     && crate::block_registry::breg().is_some_and(|reg| reg.is_air(block_at_dim(dim, tx, ty, tz)))
@@ -14422,7 +14513,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 .inv
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .get(&(36 + held_slot))
+                                .get(&held_player_menu_slot(held_slot))
                                 .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
                             if let Some(item) = held_item {
                                 let roll = f64::from(world_rng::next_below(1_000_000)) / 1_000_000.0;
@@ -14462,7 +14553,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             .inv
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
-                            .get(&(36 + held_slot))
+                            .get(&held_player_menu_slot(held_slot))
                             .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
                         let anchors_work = dim == DimId::Nether
                             || crate::worldgen::dimension_spec(dim).is_some_and(|spec| spec.respawn_anchor_works);
@@ -14545,7 +14636,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // The older right-click handlers use Overworld-only block state.
                 // In another dimension, route the newly supported items before them.
                 if dim != DimId::Overworld {
-                    let held = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&(36 + held_slot)).map(|s| s.0);
+                    let held = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&held_player_menu_slot(held_slot)).map(|s| s.0);
                     if let Some(item) = held {
                         if try_live_block_placement(
                             &me,
@@ -14670,7 +14761,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .inv
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .get(&(36 + held_slot))
+                        .get(&held_player_menu_slot(held_slot))
                         .map(|v| v.0)
                         .unwrap_or(0)
                         == 798
@@ -14758,7 +14849,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // buckets: empty fills from source; filled places liquid
                 let held_b = {
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    inv.get(&(36 + held_slot)).cloned()
+                    inv.get(&held_player_menu_slot(held_slot)).cloned()
                 };
                 if let Some((item, cnt, _hc)) = held_b {
                     let src = block_at_dim(dim, x, y, z);
@@ -14781,11 +14872,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if cnt > 1 {
                             {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                inv.insert(36 + held_slot, (908, cnt - 1, _hc));
+                                inv.insert(held_player_menu_slot(held_slot), (908, cnt - 1, _hc));
                             }
                             let mut p = vec![0u8];
                             write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(908, cnt - 1, Vec::new())));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                             // A stacked empty bucket never overwrites slot 9:
@@ -14794,11 +14885,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                             player_give_or_drop_dim(&me, (fi, 1, Vec::new()));
                         } else {
                             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            inv.insert(36 + held_slot, (fi, 1, Vec::new()));
+                            inv.insert(held_player_menu_slot(held_slot), (fi, 1, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(fi, 1, Vec::new())));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
@@ -14817,11 +14908,11 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         }
                         if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            inv.insert(36 + held_slot, (908, 1, Vec::new()));
+                            inv.insert(held_player_menu_slot(held_slot), (908, 1, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
@@ -14927,7 +15018,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // hotbar slots are window slots 36..=44
                 let held = {
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    inv.get(&(36 + held_slot)).cloned()
+                    inv.get(&held_player_menu_slot(held_slot)).cloned()
                 };
                 // `BoneMealItem.useOn`: growth runs before generic placement,
                 // and exactly one item is consumed only when the target can
@@ -14963,21 +15054,21 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, tx, ty, tz), 0);
                         if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((it, c, _cc)) = inv.get(&(36 + held_slot)).cloned() {
+                            if let Some((it, c, _cc)) = inv.get(&held_player_menu_slot(held_slot)).cloned() {
                                 if c <= 1 {
-                                    inv.remove(&(36 + held_slot));
+                                    inv.remove(&held_player_menu_slot(held_slot));
                                 } else {
-                                    inv.insert(36 + held_slot, (it, c - 1, _cc));
+                                    inv.insert(held_player_menu_slot(held_slot), (it, c - 1, _cc));
                                 }
                             }
                             let (it, c, _cc) =
-                                inv.get(&(36 + held_slot))
+                                inv.get(&held_player_menu_slot(held_slot))
                                     .cloned()
                                     .unwrap_or((0, 0, Vec::new()));
                             drop(inv);
                             let mut p = vec![0u8];
                             write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&(36 + held_slot).to_be_bytes());
+                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
                             p.extend_from_slice(&slot_wire(&(it, c, _cc)));
                             let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                         }
@@ -15029,7 +15120,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 }
                             }
                             if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                                damage_inv_slot(&me, 36 + held_slot);
+                                damage_inv_slot(&me, held_player_menu_slot(held_slot));
                                 held_slot_resync(&me);
                             }
                         }
@@ -15099,7 +15190,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                 // `ClientboundOpenBookPacket` for the used hand.
                 let held_item = {
                     let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    let slot = if _h == Some(1) { 45 } else { 36 + held_slot };
+                    let slot = if _h == Some(1) { 45 } else { held_player_menu_slot(held_slot) };
                     inv.get(&slot).map(|v| v.0).unwrap_or(0)
                 };
                 if held_item == name_to_item("written_book").unwrap_or(-1) {
@@ -15311,19 +15402,19 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                     }
                     // `LeadItem`/`NameTagItem` `mobInteract`: leash toggle and
                     // custom-name application before the pet paths.
-                    if leash_name_tag_interact(&me, target, 36 + held_slot) {
+                    if leash_name_tag_interact(&me, target, held_player_menu_slot(held_slot)) {
                         continue;
                     }
-                    if pet_collar_or_parrot_interact(&me, target, 36 + held_slot) {
+                    if pet_collar_or_parrot_interact(&me, target, held_player_menu_slot(held_slot)) {
                         continue;
                     }
                     // `IronGolem`/`SnowGolem`/`Allay` `mobInteract` — ingot
                     // repair, pumpkin shear, and the allay's sample give/take
                     // ride the same lane as the pet paths.
-                    if utility_mob_interact(&me, target, 36 + held_slot) {
+                    if utility_mob_interact(&me, target, held_player_menu_slot(held_slot)) {
                         continue;
                     }
-                    if live_mob_interact(&me, target, 36 + held_slot) {
+                    if live_mob_interact(&me, target, held_player_menu_slot(held_slot)) {
                         continue;
                     }
                     // Boats, minecarts and the rideable mobs: `interact` on a
@@ -15345,7 +15436,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         .inv
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .get(&(36 + held_slot))
+                        .get(&held_player_menu_slot(held_slot))
                         .cloned()
                         .unwrap_or((0, 0, Vec::new()))
                         .0;
@@ -15398,7 +15489,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
                         };
                         if milkable {
-                            let k = 36 + held_slot;
+                            let k = held_player_menu_slot(held_slot);
                             let c = {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
@@ -15451,7 +15542,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         if loved {
                             if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                                 let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let k = 36 + held_slot;
+                                let k = held_player_menu_slot(held_slot);
                                 if let Some((it, c, _kc)) = inv.get(&k).cloned() {
                                     if c > 1 {
                                         inv.insert(k, (it, c - 1, _kc));
@@ -15546,7 +15637,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
                                     let held = {
                                         let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        i2.get(&(36 + held_slot)).cloned().unwrap_or((
+                                        i2.get(&held_player_menu_slot(held_slot)).cloned().unwrap_or((
                                             0,
                                             0,
                                             Vec::new(),
@@ -15749,7 +15840,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                     // item carries a custom name.
                                     let weapon = {
                                         let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        i2.get(&(36 + held_slot))
+                                        i2.get(&held_player_menu_slot(held_slot))
                                             .and_then(|st| renamed_custom_name(&st.2))
                                     };
                                     let message = format_vanilla_death_message(
@@ -15797,7 +15888,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                 *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
                                 let held = {
                                     let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    i2.get(&(36 + held_slot))
+                                    i2.get(&held_player_menu_slot(held_slot))
                                         .cloned()
                                         .unwrap_or((0, 0, Vec::new()))
                                 };
@@ -16106,7 +16197,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         // looting: +0..level extra count per drop
                         let held2 = {
                             let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            i2.get(&(36 + held_slot))
+                            i2.get(&held_player_menu_slot(held_slot))
                                 .cloned()
                                 .unwrap_or((0, 0, Vec::new()))
                         };
@@ -16533,7 +16624,7 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         else {
                             return false;
                         };
-                        let held_slot = 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner());
+                        let held_slot = held_player_menu_slot(*me.held.lock().unwrap_or_else(|e| e.into_inner()));
                         let stack = me
                             .inv
                             .lock()
@@ -17752,13 +17843,13 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                                             );
                                         } else {
                                             inv.remove(&slot);
-                                            let rem = move_to_slots(&mut inv, 36..=44, st);
+                                            let rem = move_to_slots(&mut inv, player_hotbar_menu_slots(), st);
                                             if rem.1 > 0 {
                                                 inv.insert(slot, rem);
                                             }
                                         }
                                     }
-                                } else if (36..=44).contains(&slot) {
+                                } else if hotbar_slot_from_menu(slot).is_some() {
                                     if let Some(st) = inv.get(&slot).cloned() {
                                         inv.remove(&slot);
                                         let rem = move_to_slots(&mut inv, 9..=35, st);
@@ -18096,6 +18187,53 @@ mod play_protocol_opt_s2_tests {
     use super::*;
 
     #[test]
+    fn hotbar_slot_and_player_menu_slot_boundaries_round_trip() {
+        use megu_core::slot_coords::{HotbarSlot, PlayerMenuSlot};
+
+        for (hotbar_index, menu_index) in [(0, 36), (8, 44)] {
+            let hotbar = HotbarSlot::new(hotbar_index).expect("valid hotbar boundary");
+            let menu: PlayerMenuSlot = hotbar.into();
+            assert_eq!(menu.index(), menu_index);
+            assert_eq!(HotbarSlot::try_from(menu).unwrap().index(), hotbar_index);
+            assert_eq!(player_menu_hotbar_slot(hotbar), menu);
+            assert_eq!(
+                hotbar_menu_index(i16::from(hotbar_index)),
+                Some(i16::from(menu_index))
+            );
+            assert_eq!(
+                hotbar_slot_from_menu(i16::from(menu_index)).map(HotbarSlot::index),
+                Some(hotbar_index)
+            );
+        }
+        assert!(HotbarSlot::new(9).is_none());
+        assert!(hotbar_slot_from_menu(35).is_none());
+        assert!(hotbar_slot_from_menu(45).is_none());
+    }
+
+    #[test]
+    fn portal_search_policy_matches_dimension_radii_scales_and_margins() {
+        let to_nether = portal_search_policy(DimId::Overworld, DimId::Nether);
+        assert_eq!(to_nether.horizontal_radius, 16);
+        assert_eq!(to_nether.scale_xz, 0.125);
+        assert_eq!(to_nether.landing_min_y_margin, 4);
+        assert_eq!(to_nether.landing_max_y_margin, 8);
+
+        let to_overworld = portal_search_policy(DimId::Nether, DimId::Overworld);
+        assert_eq!(to_overworld.horizontal_radius, 128);
+        assert_eq!(to_overworld.scale_xz, 8.0);
+        assert_eq!(to_overworld.landing_min_y_margin, 4);
+        assert_eq!(to_overworld.landing_max_y_margin, 8);
+    }
+
+    #[test]
+    fn reach_policy_dig_and_placement_keep_server_thresholds() {
+        assert_eq!(DIG_REACH_POLICY.server_block_acceptance(false), 4.9);
+        assert_eq!(DIG_REACH_POLICY.server_block_acceptance(true), 5.6);
+        assert_eq!(PLACEMENT_REACH_POLICY.server_block_acceptance(false), 5.5);
+        assert_eq!(PLACEMENT_REACH_POLICY.server_block_acceptance(true), 6.0);
+    }
+
+    #[test]
     fn portal_coordinate_scale_matches_vanilla_and_custom_ratios() {
         assert_eq!(portal_coordinate_ratio(1.0, 8.0), 0.125);
         assert_eq!(portal_coordinate_ratio(8.0, 1.0), 8.0);
@@ -18264,7 +18402,7 @@ fn disconnect_cleanup_with_login(
                     }
                 }
                 while left > 0 {
-                    if let Some(sl) = (9..=44).chain(36..=44).find(|sl| !inv.contains_key(sl)) {
+                    if let Some(sl) = (9..=44).chain(player_hotbar_menu_slots()).find(|sl| !inv.contains_key(sl)) {
                         let t = left.min(cap) as u8;
                         inv.insert(sl, (st.0, t, st.2.clone()));
                         left -= t as i64;
@@ -22370,7 +22508,7 @@ mod p5c_live_tests {
         // Full plain hotbar -> the held slot itself.
         let mut inv = HashMap::new();
         for i in 0..9i16 {
-            inv.insert(36 + i, (dirt, 1, Vec::new()));
+            inv.insert(held_player_menu_slot(i), (dirt, 1, Vec::new()));
         }
         assert_eq!(suitable_hotbar_slot(&inv, 4), 4);
         // Full hotbar with the first candidate enchanted -> first
@@ -22381,7 +22519,7 @@ mod p5c_live_tests {
         // Every slot enchanted -> held.
         for i in 0..9i16 {
             inv.insert(
-                36 + i,
+                held_player_menu_slot(i),
                 (
                     dirt,
                     1,
@@ -22510,7 +22648,7 @@ mod p5c_live_tests {
         {
             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
             for i in 0..9i16 {
-                inv.insert(36 + i, (dirt, 1, Vec::new()));
+                inv.insert(held_player_menu_slot(i), (dirt, 1, Vec::new()));
             }
             inv.insert(15, (stone, 4, Vec::new()));
         }
@@ -24145,7 +24283,7 @@ mod p5c_live_tests {
             me.inv
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(36 + held_slot, (item, 1, comps));
+                .insert(held_player_menu_slot(held_slot), (item, 1, comps));
             (me, peer)
         }
 
@@ -24361,7 +24499,7 @@ mod p5c_live_tests {
             me.inv
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(36 + held_slot, (item, 1, comps));
+                .insert(held_player_menu_slot(held_slot), (item, 1, comps));
             (me, peer)
         }
 
@@ -24370,7 +24508,7 @@ mod p5c_live_tests {
             me.inv
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(&(36 + held_slot))
+                .get(&held_player_menu_slot(held_slot))
                 .and_then(|s| comp_varint(&s.2, COMP_DAMAGE))
         }
 
@@ -27452,23 +27590,25 @@ mod audit1_finish_tests {
         let dim = DimId::Overworld;
         let mut restore = DimRestore::new();
         let (x, z) = (31_200, 31_200);
+        let policy = portal_search_policy(DimId::Nether, dim);
         write_test_portal(&mut restore, dim, x, 70, z, true);
         write_test_portal(&mut restore, dim, x, 90, z, true);
         // The nearest low cell is y=72 and the nearest high cell y=90, both
         // nine blocks from y=81; vanilla's lowest-y tiebreak chooses y=70's frame.
         let (frame, _) =
-            find_existing_nether_portal(dim, x, 81, z).expect("a portal inside the search radius");
+            find_existing_nether_portal(dim, x, 81, z, policy)
+                .expect("a portal inside the search radius");
         assert_eq!(frame.min_y, 70, "lowest y breaks an equal-distance tie");
 
         assert!(
-            find_existing_nether_portal(dim, x + 130, 81, z).is_none(),
+            find_existing_nether_portal(dim, x + 130, 81, z, policy).is_none(),
             "the horizontal radius is a hard bound"
         );
 
         let high_x = x + 1_000;
         write_test_portal(&mut restore, dim, high_x, 320, z, true);
         assert!(
-            find_existing_nether_portal(dim, high_x, 321, z).is_none(),
+            find_existing_nether_portal(dim, high_x, 321, z, policy).is_none(),
             "portal cells outside the dimension's valid y range are ignored"
         );
     }
