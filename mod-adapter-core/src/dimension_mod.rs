@@ -30,6 +30,81 @@ const MAX_POOL_CELLS: usize = 4096;
 /// `ac_expect_teleport` gives a vanilla `/execute in` transfer.
 pub const DEFAULT_TELEPORT_GRACE_TICKS: u32 = 20;
 
+/// Validated vertical build volume of one dimension. `height` is the number
+/// of buildable blocks and the exclusive top is [`Self::max_y_exclusive`];
+/// vanilla-compatible dimensions use positive 16-block-aligned heights and a
+/// 16-block-aligned `min_y`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildBounds {
+    pub min_y: i32,
+    pub height: u32,
+}
+
+/// Reason a [`BuildBounds`] pair is outside the dimension-type contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildBoundsError {
+    ZeroHeight,
+    HeightTooLarge,
+    MisalignedMinY,
+    MisalignedHeight,
+    TopOverflow,
+}
+
+impl BuildBounds {
+    /// Construct validated vanilla-compatible build bounds: positive height,
+    /// 16-block alignment on both edges, and an exactly representable
+    /// exclusive top.
+    pub fn new(min_y: i32, height: u32) -> Result<Self, BuildBoundsError> {
+        if height == 0 {
+            return Err(BuildBoundsError::ZeroHeight);
+        }
+        if height > i32::MAX as u32 {
+            return Err(BuildBoundsError::HeightTooLarge);
+        }
+        if min_y % 16 != 0 {
+            return Err(BuildBoundsError::MisalignedMinY);
+        }
+        if !height.is_multiple_of(16) {
+            return Err(BuildBoundsError::MisalignedHeight);
+        }
+        if min_y.checked_add(height as i32).is_none() {
+            return Err(BuildBoundsError::TopOverflow);
+        }
+        Ok(Self { min_y, height })
+    }
+
+    /// Exclusive top block Y (`min_y + height`).
+    pub fn max_y_exclusive(&self) -> i32 {
+        self.min_y
+            .saturating_add(i32::try_from(self.height).unwrap_or(i32::MAX))
+    }
+
+    /// Whether `y` lies inside `[min_y, max_y_exclusive)`.
+    pub fn contains_y(&self, y: i32) -> bool {
+        y >= self.min_y && y < self.max_y_exclusive()
+    }
+
+    /// Dimension-local 16-block section index of `y`, using Euclidean division
+    /// so negative coordinates map exactly like vanilla chunk sections. The
+    /// subtraction uses 64 bits to avoid overflow at opposite `i32` extremes.
+    pub fn section_index(&self, y: i32) -> i32 {
+        ((i64::from(y) - i64::from(self.min_y)).div_euclid(16)) as i32
+    }
+}
+
+/// Pure horizontal coordinate scaling for a dimension crossing. Positive,
+/// finite scales use the exact `source_scale / target_scale` ratio; malformed
+/// scales fall back to 1:1 rather than manufacturing NaN destinations.
+pub fn scale_xz(x: f64, z: f64, source_scale: f64, target_scale: f64) -> (f64, f64) {
+    let sane = |v: f64| v.is_finite() && v > 0.0;
+    let ratio = if sane(source_scale) && sane(target_scale) {
+        source_scale / target_scale
+    } else {
+        1.0
+    };
+    (x * ratio, z * ratio)
+}
+
 // ---------------------------------------------------------------------------
 // Dimension mod data discovery
 // ---------------------------------------------------------------------------
@@ -285,13 +360,10 @@ fn parse_dim_type(id: &str, bytes: &[u8]) -> Result<DimTypeDescriptor, DataLoadE
         obj.get(key)
             .and_then(JsonValue::as_f64)
             .map(|v| v as i32)
-            .ok_or_else(|| {
-                DataLoadError::Json(format!("dimension_type {id} missing '{key}'"))
-            })
+            .ok_or_else(|| DataLoadError::Json(format!("dimension_type {id} missing '{key}'")))
     };
-    let opt_bool = |key: &str, default: bool| {
-        obj.get(key).and_then(JsonValue::as_bool).unwrap_or(default)
-    };
+    let opt_bool =
+        |key: &str, default: bool| obj.get(key).and_then(JsonValue::as_bool).unwrap_or(default);
     let mut desc = DimTypeDescriptor::defaults(id, required_i32("min_y")?, required_i32("height")?);
     desc.coordinate_scale = obj
         .get("coordinate_scale")
@@ -311,6 +383,16 @@ fn parse_dim_type(id: &str, bytes: &[u8]) -> Result<DimTypeDescriptor, DataLoadE
     if let Some(effects) = obj.get("effects").and_then(JsonValue::as_str) {
         desc.effects = effects.to_string();
     }
+    if desc.height < 0 {
+        return Err(DataLoadError::Json(format!(
+            "dimension_type {id} has negative height"
+        )));
+    }
+    BuildBounds::new(desc.min_y, desc.height as u32).map_err(|error| {
+        DataLoadError::Json(format!(
+            "dimension_type {id} has invalid build bounds: {error:?}"
+        ))
+    })?;
     Ok(desc)
 }
 
@@ -455,7 +537,11 @@ pub struct PortalRule {
 }
 
 impl PortalRule {
-    pub fn new(name: impl Into<String>, trigger: PortalTrigger, target_dim: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        trigger: PortalTrigger,
+        target_dim: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             trigger,
@@ -528,8 +614,13 @@ impl PortalRegistry {
         self.rules.iter().find(|r| r.name == name)
     }
 
-    pub fn rules_to<'a>(&'a self, target_dim: &'a str) -> impl Iterator<Item = &'a PortalRule> + 'a {
-        self.rules.iter().filter(move |r| r.target_dim == target_dim)
+    pub fn rules_to<'a>(
+        &'a self,
+        target_dim: &'a str,
+    ) -> impl Iterator<Item = &'a PortalRule> + 'a {
+        self.rules
+            .iter()
+            .filter(move |r| r.target_dim == target_dim)
     }
 }
 
@@ -617,7 +708,10 @@ pub fn detect_vertical_portal(
 
     // Vertical interior extent.
     let mut bottom = ignite[1];
-    while is_open(at(ignite[0], bottom - 1, ignite[2]).as_deref(), portal_block) {
+    while is_open(
+        at(ignite[0], bottom - 1, ignite[2]).as_deref(),
+        portal_block,
+    ) {
         bottom -= 1;
         if ignite[1] - bottom > *max_height as i32 {
             return None;
@@ -821,19 +915,23 @@ pub fn compute_portal_destination(
     source_scale: f64,
     target: &DimTypeDescriptor,
 ) -> [f64; 3] {
-    let sane = |v: f64| v.is_finite() && v > 0.0;
-    let ratio = if sane(source_scale) && sane(target.coordinate_scale) {
-        source_scale / target.coordinate_scale
-    } else {
-        1.0
-    };
-    let lo = target.min_y.saturating_add(4) as f64;
-    let hi = target
-        .min_y
-        .saturating_add(target.height)
-        .saturating_sub(8) as f64;
+    let (x, z) = scale_xz(
+        source_pos[0],
+        source_pos[2],
+        source_scale,
+        target.coordinate_scale,
+    );
+    let (min_y, max_y_exclusive) = u32::try_from(target.height)
+        .ok()
+        .and_then(|height| BuildBounds::new(target.min_y, height).ok())
+        .map_or_else(
+            || (target.min_y, target.min_y.saturating_add(target.height)),
+            |bounds| (bounds.min_y, bounds.max_y_exclusive()),
+        );
+    let lo = min_y.saturating_add(4) as f64;
+    let hi = max_y_exclusive.saturating_sub(8) as f64;
     let y = source_pos[1].clamp(lo, hi.max(lo));
-    [source_pos[0] * ratio, y, source_pos[2] * ratio]
+    [x, y, z]
 }
 
 /// Assemble the [`TeleportIntent`] the server executes for a validated
@@ -882,11 +980,7 @@ pub struct DimensionEnvProfile {
 impl DimensionEnvProfile {
     /// Derive a profile from a `dimension_type` descriptor plus the mod's
     /// declared physics overrides.
-    pub fn derive(
-        dim: &DimTypeDescriptor,
-        gravity_multiplier: f64,
-        requires_oxygen: bool,
-    ) -> Self {
+    pub fn derive(dim: &DimTypeDescriptor, gravity_multiplier: f64, requires_oxygen: bool) -> Self {
         Self {
             dimension_id: dim.id.clone(),
             gravity_multiplier,
@@ -1014,7 +1108,13 @@ pub fn builtin_dimension_mod_profiles() -> Vec<DimensionModProfile> {
     let ad_astra_dims = [
         ("ad_astra:moon", 0.165, -64, 384, "ad_astra:tier_1_rocket"),
         ("ad_astra:mars", 0.38, -64, 384, "ad_astra:tier_2_rocket"),
-        ("ad_astra:earth_orbit", 0.05, -64, 384, "ad_astra:tier_1_rocket"),
+        (
+            "ad_astra:earth_orbit",
+            0.05,
+            -64,
+            384,
+            "ad_astra:tier_1_rocket",
+        ),
     ];
     let mut types = Vec::new();
     let mut dims = Vec::new();
@@ -1154,9 +1254,7 @@ mod tests {
         w.insert((x, y, z), id.to_string());
     }
 
-    fn block_at(
-        w: &Map<(i32, i32, i32), String>,
-    ) -> impl Fn(i32, i32, i32) -> Option<String> + '_ {
+    fn block_at(w: &Map<(i32, i32, i32), String>) -> impl Fn(i32, i32, i32) -> Option<String> + '_ {
         move |x, y, z| {
             Some(
                 w.get(&(x, y, z))
@@ -1235,12 +1333,11 @@ mod tests {
                 "data/aether/tags/block/ores.json".to_string(),
                 br##"{"values": ["aether:ambrosium_ore", "aether:zanite_ore",
                                  "#forge:ores"]}"##
-                .to_vec(),
+                    .to_vec(),
             ),
             (
                 "data/c/tags/blocks/chests.json".to_string(),
-                br#"{"values": [{"id": "aether:skyroot_chest", "required": false}]}"#
-                    .to_vec(),
+                br#"{"values": [{"id": "aether:skyroot_chest", "required": false}]}"#.to_vec(),
             ),
             (
                 "data/aether/recipes/enchanted_dart.json".to_string(),
@@ -1308,8 +1405,7 @@ mod tests {
     fn discovery_defaults_and_void_generator() {
         let entries = vec![(
             "data/flat/dimension/flat.json".to_string(),
-            br#"{"type": "flat:flat", "generator": {"type": "minecraft:flat"}}"#
-                .to_vec(),
+            br#"{"type": "flat:flat", "generator": {"type": "minecraft:flat"}}"#.to_vec(),
         )];
         let data = discover_dimension_mod_entries(entries).unwrap();
         assert!(!data.is_dimension_mod()); // no dimension_type entry
@@ -1390,15 +1486,13 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let at = block_at(&w);
-        let t = detect_horizontal_pool_portal(&rule, [4, 63, 4], &border, &at)
-            .expect("2x2 pool");
+        let t = detect_horizontal_pool_portal(&rule, [4, 63, 4], &border, &at).expect("2x2 pool");
         assert_eq!(t.target_dim, "twilightforest:twilight_forest");
         assert_eq!(t.cell_count, 4);
         assert_eq!(t.anchor, [4, 63, 4]);
 
         // A lone water cell under min_size never activates.
-        assert!(detect_horizontal_pool_portal(&rule, [4, 63, 4], &BTreeSet::new(), &at)
-            .is_none());
+        assert!(detect_horizontal_pool_portal(&rule, [4, 63, 4], &BTreeSet::new(), &at).is_none());
     }
 
     #[test]
@@ -1410,9 +1504,21 @@ mod tests {
             .iter()
             .find(|r| r.target_dim == "ad_astra:moon")
             .unwrap();
-        assert!(check_altitude_portal(moon_rule, 600.0, Some("ad_astra:tier_1_rocket")));
-        assert!(!check_altitude_portal(moon_rule, 599.9, Some("ad_astra:tier_1_rocket")));
-        assert!(!check_altitude_portal(moon_rule, 650.0, Some("minecraft:elytra")));
+        assert!(check_altitude_portal(
+            moon_rule,
+            600.0,
+            Some("ad_astra:tier_1_rocket")
+        ));
+        assert!(!check_altitude_portal(
+            moon_rule,
+            599.9,
+            Some("ad_astra:tier_1_rocket")
+        ));
+        assert!(!check_altitude_portal(
+            moon_rule,
+            650.0,
+            Some("minecraft:elytra")
+        ));
         assert!(!check_altitude_portal(moon_rule, 650.0, None));
 
         let pad = PortalRule::new(
@@ -1423,9 +1529,52 @@ mod tests {
             },
             "test:deep",
         );
-        assert!(check_interact_portal(&pad, "test:teleport_pad", Some("test:dim_key")));
+        assert!(check_interact_portal(
+            &pad,
+            "test:teleport_pad",
+            Some("test:dim_key")
+        ));
         assert!(!check_interact_portal(&pad, "test:teleport_pad", None));
-        assert!(!check_interact_portal(&pad, "minecraft:stone", Some("test:dim_key")));
+        assert!(!check_interact_portal(
+            &pad,
+            "minecraft:stone",
+            Some("test:dim_key")
+        ));
+    }
+
+    #[test]
+    fn build_bounds_are_validated_and_use_euclidean_sections() {
+        let overworld = BuildBounds::new(-64, 384).unwrap();
+        assert_eq!(overworld.max_y_exclusive(), 320);
+        assert!(overworld.contains_y(-64));
+        assert!(overworld.contains_y(319));
+        assert!(!overworld.contains_y(320));
+        assert_eq!(overworld.section_index(-64), 0);
+        assert_eq!(overworld.section_index(-49), 0);
+        assert_eq!(overworld.section_index(-65), -1);
+        assert_eq!(overworld.section_index(319), 23);
+
+        assert_eq!(BuildBounds::new(-64, 0), Err(BuildBoundsError::ZeroHeight));
+        assert_eq!(
+            BuildBounds::new(-63, 384),
+            Err(BuildBoundsError::MisalignedMinY)
+        );
+        assert_eq!(
+            BuildBounds::new(-64, 380),
+            Err(BuildBoundsError::MisalignedHeight)
+        );
+        assert_eq!(
+            BuildBounds::new(i32::MAX - 15, 32),
+            Err(BuildBoundsError::TopOverflow)
+        );
+    }
+
+    #[test]
+    fn scale_xz_is_pure_exact_ratio_scaling() {
+        assert_eq!(scale_xz(80.0, -160.0, 1.0, 8.0), (10.0, -20.0));
+        assert_eq!(scale_xz(10.0, -20.0, 8.0, 1.0), (80.0, -160.0));
+        assert_eq!(scale_xz(3.0, -7.0, 0.0, 8.0), (3.0, -7.0));
+        assert_eq!(scale_xz(3.0, -7.0, 1.0, f64::NAN), (3.0, -7.0));
     }
 
     #[test]
@@ -1486,7 +1635,10 @@ mod tests {
         let aether = &profiles[0].portal_rules[0];
         let platform = arrival_platform(aether);
         assert_eq!(platform.floor_block, "minecraft:glowstone");
-        assert_eq!(platform.portal_block.as_deref(), Some("aether:aether_portal"));
+        assert_eq!(
+            platform.portal_block.as_deref(),
+            Some("aether:aether_portal")
+        );
         assert_eq!((platform.portal_width, platform.portal_height), (2, 3));
 
         let ad_astra = profiles.iter().find(|p| p.mod_id == "ad_astra").unwrap();
@@ -1509,10 +1661,7 @@ mod tests {
         assert!(moon.supports_underground_occlusion); // skylight, no ceiling
         assert!((moon.effective_gravity() - 0.0132).abs() < 1e-9);
 
-        let undergarden = profiles
-            .iter()
-            .find(|p| p.mod_id == "undergarden")
-            .unwrap();
+        let undergarden = profiles.iter().find(|p| p.mod_id == "undergarden").unwrap();
         let ug = &undergarden.env_profiles[0];
         assert!(!ug.has_skylight && ug.has_ceiling);
         assert!(!ug.supports_underground_occlusion);
@@ -1522,8 +1671,17 @@ mod tests {
     fn builtin_profiles_cover_required_mods() {
         let profiles = builtin_dimension_mod_profiles();
         let ids: Vec<&str> = profiles.iter().map(|p| p.mod_id).collect();
-        for expected in ["aether", "twilightforest", "ad_astra", "undergarden", "deeperdarker"] {
-            assert!(ids.contains(&expected), "missing builtin profile {expected}");
+        for expected in [
+            "aether",
+            "twilightforest",
+            "ad_astra",
+            "undergarden",
+            "deeperdarker",
+        ] {
+            assert!(
+                ids.contains(&expected),
+                "missing builtin profile {expected}"
+            );
         }
         let registry = PortalRegistry::with_builtin_rules();
         assert!(registry.find("aether:the_aether_portal").is_some());

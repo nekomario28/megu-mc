@@ -8,7 +8,8 @@
 //! carry deltas for `megu`'s `ac_note_carried_motion` anti-cheat hook,
 //! and a deterministic binary `AERO` v1 Save codec.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use megu_core::world_view::{SubLevelTransform, WorldView};
 use mod_adapter_core::neoforge_wire::{read_mc_string, read_varint, write_mc_string, write_varint};
@@ -484,6 +485,177 @@ const MATERIAL_MASS_TABLE: &[(&str, f64)] = &[
     ("water", 100.0),
 ];
 
+/// The ordered compatibility rules behind [`material_mass_kg`]. Exposed
+/// read-only so conformance tests and future generated registries pin every
+/// shipped rule instead of copying the table.
+pub fn material_mass_rules() -> &'static [(&'static str, f64)] {
+    MATERIAL_MASS_TABLE
+}
+
+/// Which precedence tier resolved a block's material properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterialResolutionSource {
+    /// An exact canonical block id — including a ship-specific mass override.
+    ExactOverride,
+    /// A registry tag rule. Tag rules are ordered inside the policy.
+    Tag,
+    /// A material-family rule. Family rules are ordered inside the policy.
+    MaterialFamily,
+    /// The legacy ordered substring compatibility table.
+    Compatibility,
+    /// No rule matched; the policy fallback was used.
+    DefaultFallback,
+}
+
+/// Resolved physical material properties for one canonical block id.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialProps {
+    pub mass_kg: f64,
+    pub source: MaterialResolutionSource,
+}
+
+/// Validated material-policy descriptor with explicit precedence:
+/// exact canonical id, tag, material family, ordered substring
+/// compatibility, then fallback. Rule vectors are ordered deliberately: when
+/// two rules in the same tier match, the earlier rule wins. Masses must be
+/// finite and positive and every rule key must be non-empty; exact keys must
+/// be canonical block ids rather than blockstate strings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MaterialPolicy {
+    exact_overrides: BTreeMap<String, f64>,
+    tag_rules: Vec<(String, f64)>,
+    family_rules: Vec<(String, f64)>,
+    compatibility_rules: Vec<(String, f64)>,
+    fallback_mass_kg: f64,
+}
+
+impl MaterialPolicy {
+    /// Construct and validate a policy. Tags and material families are query
+    /// inputs supplied by a registry-aware caller; the Aeronautics default
+    /// currently has no such rules, preserving the legacy table exactly.
+    pub fn new(
+        exact_overrides: BTreeMap<String, f64>,
+        tag_rules: Vec<(String, f64)>,
+        family_rules: Vec<(String, f64)>,
+        compatibility_rules: Vec<(String, f64)>,
+        fallback_mass_kg: f64,
+    ) -> Result<Self, String> {
+        fn valid_mass(mass: f64) -> bool {
+            mass.is_finite() && mass > 0.0
+        }
+        fn valid_key(key: &str) -> bool {
+            !key.is_empty() && key.bytes().all(|b| b > 0x20 && b != 0x7f)
+        }
+        if !valid_mass(fallback_mass_kg) {
+            return Err("material fallback mass must be finite and positive".into());
+        }
+        for (id, mass) in &exact_overrides {
+            let (namespace, path) = id
+                .split_once(':')
+                .ok_or_else(|| format!("material exact id '{id}' is not namespaced"))?;
+            if namespace.is_empty()
+                || path.is_empty()
+                || id.contains('[')
+                || !valid_key(id)
+                || !valid_mass(*mass)
+            {
+                return Err(format!("invalid material exact override '{id}'"));
+            }
+        }
+        for (tier, rules) in [
+            ("tag", &tag_rules),
+            ("material family", &family_rules),
+            ("compatibility", &compatibility_rules),
+        ] {
+            for (key, mass) in rules {
+                if !valid_key(key) || !valid_mass(*mass) {
+                    return Err(format!("invalid material {tier} rule '{key}'"));
+                }
+            }
+        }
+        Ok(Self {
+            exact_overrides,
+            tag_rules,
+            family_rules,
+            compatibility_rules,
+            fallback_mass_kg,
+        })
+    }
+
+    /// Resolve `canonical_id` under the explicit precedence chain. `tags`
+    /// and `material_families` are the memberships an external registry has
+    /// already resolved for the block; membership ordering does not affect
+    /// precedence because the policy's own rule order is authoritative.
+    pub fn resolve(
+        &self,
+        canonical_id: &str,
+        tags: &[&str],
+        material_families: &[&str],
+    ) -> MaterialProps {
+        let id = canonical_block_id(canonical_id);
+        if let Some(mass_kg) = self.exact_overrides.get(id).copied() {
+            return MaterialProps {
+                mass_kg,
+                source: MaterialResolutionSource::ExactOverride,
+            };
+        }
+        for (tag, mass_kg) in &self.tag_rules {
+            if tags.iter().any(|candidate| candidate == tag) {
+                return MaterialProps {
+                    mass_kg: *mass_kg,
+                    source: MaterialResolutionSource::Tag,
+                };
+            }
+        }
+        for (family, mass_kg) in &self.family_rules {
+            if material_families
+                .iter()
+                .any(|candidate| candidate == family)
+            {
+                return MaterialProps {
+                    mass_kg: *mass_kg,
+                    source: MaterialResolutionSource::MaterialFamily,
+                };
+            }
+        }
+        let path = id_path(id);
+        for (needle, mass_kg) in &self.compatibility_rules {
+            if path.contains(needle) {
+                return MaterialProps {
+                    mass_kg: *mass_kg,
+                    source: MaterialResolutionSource::Compatibility,
+                };
+            }
+        }
+        MaterialProps {
+            mass_kg: self.fallback_mass_kg,
+            source: MaterialResolutionSource::DefaultFallback,
+        }
+    }
+
+    /// The exact ordered compatibility rules in this policy.
+    pub fn compatibility_rules(&self) -> &[(String, f64)] {
+        &self.compatibility_rules
+    }
+
+    /// The shipped Aeronautics policy: no exact/tag/family rewrite yet, and
+    /// the legacy ordered substring table copied one-for-one as the
+    /// compatibility tier. This constructor is fallible because the fallback
+    /// mass is caller-controlled.
+    pub fn aeronautics(fallback_mass_kg: f64) -> Result<Self, String> {
+        Self::new(
+            BTreeMap::new(),
+            Vec::new(),
+            Vec::new(),
+            MATERIAL_MASS_TABLE
+                .iter()
+                .map(|(needle, mass)| ((*needle).to_string(), *mass))
+                .collect(),
+            fallback_mass_kg,
+        )
+    }
+}
+
 /// Per-block mass (kg) for `block_id` (`"namespace:path[props]"` or bare
 /// `"namespace:path"`): the first [`MATERIAL_MASS_TABLE`] substring match
 /// on the resource path, `default_mass` when nothing matches. The table
@@ -497,6 +669,21 @@ pub fn material_mass_kg(block_id: &str, default_mass: f64) -> f64 {
         }
     }
     default_mass
+}
+
+#[derive(Debug, Default)]
+struct MaterialResolutionCache {
+    revision: u64,
+    entries: HashMap<String, MaterialProps>,
+    hits: u64,
+    misses: u64,
+}
+
+impl MaterialResolutionCache {
+    fn invalidate(&mut self, revision: u64) {
+        self.revision = revision;
+        self.entries.clear();
+    }
 }
 
 /// A flying 6-DOF rigid-body sub-world generalizing Create's 1-axis
@@ -548,8 +735,13 @@ pub struct RigidBodySubWorld {
     pub inv_inertia_tensor: [[f64; 3]; 3],
     /// Per-block-id mass overrides (kg) consulted before
     /// [`material_mass_kg`]'s table — a ship builder can declare heavier
-    /// plating or lighter composites without forking the table.
-    pub mass_overrides: BTreeMap<String, f64>,
+    /// plating or lighter composites without forking the table. Mutated only
+    /// through the override methods so the material-cache revision cannot go
+    /// stale.
+    mass_overrides: BTreeMap<String, f64>,
+    material_policy: MaterialPolicy,
+    material_cache: RefCell<MaterialResolutionCache>,
+    material_override_revision: u64,
     /// Physics substeps per [`Self::step_env_with_contacts`] call
     /// (`4` = 80 Hz internal integration per 20 TPS tick).
     pub substeps: u32,
@@ -623,6 +815,10 @@ impl RigidBodySubWorld {
             inertia_tensor: [[0.0; 3]; 3],
             inv_inertia_tensor: [[0.0; 3]; 3],
             mass_overrides: BTreeMap::new(),
+            material_policy: MaterialPolicy::aeronautics(block_mass)
+                .expect("validated positive block mass produces a valid material policy"),
+            material_cache: RefCell::new(MaterialResolutionCache::default()),
+            material_override_revision: 0,
             substeps: DEFAULT_PHYSICS_SUBSTEPS,
             awake: true,
             rest_substeps: 0,
@@ -738,6 +934,7 @@ impl RigidBodySubWorld {
         self.wake();
         self.mass_overrides
             .insert(canonical_block_id(block_id).to_string(), mass_kg);
+        self.bump_material_override_revision();
         self.preserve_world_geometry_during_physics_update();
         true
     }
@@ -753,18 +950,67 @@ impl RigidBodySubWorld {
             return false;
         }
         self.wake();
+        self.bump_material_override_revision();
         self.preserve_world_geometry_during_physics_update();
         true
     }
 
-    /// The mass (kg) of one block id on *this* ship: `mass_overrides`
-    /// first, then [`material_mass_kg`] with `block_mass` as fallback.
-    fn block_mass_kg(&self, canonical: &str) -> f64 {
+    /// Read-only view of the canonical exact mass override table.
+    pub fn mass_overrides(&self) -> &BTreeMap<String, f64> {
+        &self.mass_overrides
+    }
+
+    fn bump_material_override_revision(&mut self) {
+        self.material_override_revision = self.material_override_revision.wrapping_add(1);
+        self.material_cache
+            .borrow_mut()
+            .invalidate(self.material_override_revision);
+    }
+
+    /// Cache counters `(entries, hits, misses, revision)` used by the parity
+    /// tests to prove the hot paths really resolve through the O(1) cache.
+    pub fn material_cache_stats(&self) -> (usize, u64, u64, u64) {
+        let cache = self.material_cache.borrow();
+        (
+            cache.entries.len(),
+            cache.hits,
+            cache.misses,
+            cache.revision,
+        )
+    }
+
+    /// Resolve one block through the revision-aware O(1) cache. Exact ship
+    /// overrides are folded into the cached value, so once a voxel id has
+    /// been resolved neither the 66-rule compatibility scan nor the override
+    /// tree is consulted again until the override revision changes.
+    fn material_props(&self, canonical: &str) -> MaterialProps {
         let id = canonical_block_id(canonical);
-        self.mass_overrides
-            .get(id)
-            .copied()
-            .unwrap_or_else(|| material_mass_kg(id, self.block_mass))
+        let mut cache = self.material_cache.borrow_mut();
+        if cache.revision != self.material_override_revision {
+            cache.invalidate(self.material_override_revision);
+        }
+        if let Some(props) = cache.entries.get(id).copied() {
+            cache.hits = cache.hits.saturating_add(1);
+            return props;
+        }
+        let props = if let Some(mass_kg) = self.mass_overrides.get(id).copied() {
+            MaterialProps {
+                mass_kg,
+                source: MaterialResolutionSource::ExactOverride,
+            }
+        } else {
+            self.material_policy.resolve(id, &[], &[])
+        };
+        cache.entries.insert(id.to_string(), props);
+        cache.misses = cache.misses.saturating_add(1);
+        props
+    }
+
+    /// The mass (kg) of one block id on *this* ship: exact `mass_overrides`
+    /// first, then the validated material policy with `block_mass` as its
+    /// fallback.
+    fn block_mass_kg(&self, canonical: &str) -> f64 {
+        self.material_props(canonical).mass_kg
     }
 
     /// Dormancy: mark the ship awake so the next contact step actually
@@ -901,8 +1147,7 @@ impl RigidBodySubWorld {
             }
         }
         self.inertia_tensor = tensor;
-        self.inv_inertia_tensor =
-            mat3_invert(&tensor).unwrap_or_else(|| diag3([1.0, 1.0, 1.0]));
+        self.inv_inertia_tensor = mat3_invert(&tensor).unwrap_or_else(|| diag3([1.0, 1.0, 1.0]));
         self.inertia_diag = [
             tensor[0][0].max(1e-9),
             tensor[1][1].max(1e-9),
@@ -1231,13 +1476,7 @@ impl RigidBodySubWorld {
             ];
         }
         let next_quat = integrate_quat(self.quat, self.omega, dt);
-        Self::passenger_world_delta_exact(
-            self.pos,
-            self.quat,
-            next_pos,
-            next_quat,
-            local_offset,
-        )
+        Self::passenger_world_delta_exact(self.pos, self.quat, next_pos, next_quat, local_offset)
     }
 
     /// Local -> world transform of point `p` (local frame is centered on
@@ -1544,7 +1783,13 @@ impl BuiltinContactSolver {
                 // Shallowest exit through a non-solid neighbor face.
                 let mut best: Option<([f64; 3], f64)> = None;
                 for dir in FACE_DIRS {
-                    let axis = if dir[0] != 0 { 0 } else if dir[1] != 0 { 1 } else { 2 };
+                    let axis = if dir[0] != 0 {
+                        0
+                    } else if dir[1] != 0 {
+                        1
+                    } else {
+                        2
+                    };
                     let sign = dir[axis];
                     let depth = if sign > 0 {
                         f64::from(cell[axis] + 1) - w[axis]
@@ -1658,7 +1903,16 @@ impl SubLevelPhysicsBackend for BuiltinContactSolver {
                 let e = self.restitution_at(-vn);
                 let k = impulse_denominator(inv_m, i_world_inv, r, normal).max(1e-12);
                 let j_normal = -(1.0 + e) * vn / k;
-                apply_impulse(ship, i_world_inv, [j_normal * normal[0], j_normal * normal[1], j_normal * normal[2]], point);
+                apply_impulse(
+                    ship,
+                    i_world_inv,
+                    [
+                        j_normal * normal[0],
+                        j_normal * normal[1],
+                        j_normal * normal[2],
+                    ],
+                    point,
+                );
                 // Coulomb friction: stop tangential sliding, clamped by μ·j_n.
                 let v2 = contact_point_velocity(ship, r);
                 let tvn = v2[0] * normal[0] + v2[1] * normal[1] + v2[2] * normal[2];
@@ -1669,7 +1923,11 @@ impl SubLevelPhysicsBackend for BuiltinContactSolver {
                 ];
                 let t_len = norm3(tangential);
                 if t_len > 1e-9 {
-                    let t_hat = [tangential[0] / t_len, tangential[1] / t_len, tangential[2] / t_len];
+                    let t_hat = [
+                        tangential[0] / t_len,
+                        tangential[1] / t_len,
+                        tangential[2] / t_len,
+                    ];
                     let kt = impulse_denominator(inv_m, i_world_inv, r, t_hat).max(1e-12);
                     let jt = (t_len / kt).min(self.friction * j_normal);
                     apply_impulse(
@@ -1718,14 +1976,18 @@ impl SubLevelPhysicsBackend for BuiltinContactSolver {
                 let j = -(1.0 + e) * rn / k;
                 let impulse = [j * normal[0], j * normal[1], j * normal[2]];
                 apply_impulse(ship, i_world_inv, impulse, point);
-                apply_impulse(other, i_world_inv_o, [-impulse[0], -impulse[1], -impulse[2]], point);
+                apply_impulse(
+                    other,
+                    i_world_inv_o,
+                    [-impulse[0], -impulse[1], -impulse[2]],
+                    point,
+                );
                 other.wake();
             }
             // Positional depenetration split by inverse mass.
             let share = inv_m / (inv_m + inv_mo);
             let corr = depth.min(self.max_depenetration).max(0.0) * self.depenetration;
-            for ((pos, other_pos), &n) in
-                ship.pos.iter_mut().zip(other.pos.iter_mut()).zip(&normal)
+            for ((pos, other_pos), &n) in ship.pos.iter_mut().zip(other.pos.iter_mut()).zip(&normal)
             {
                 *pos = sanitize(*pos + n * corr * share);
                 *other_pos = sanitize(*other_pos - n * corr * (1.0 - share));
@@ -1968,6 +2230,10 @@ pub fn decode_aeronautics_snapshot(
             1.0 / inertia_diag[2].max(1e-9),
         ]),
         mass_overrides: BTreeMap::new(),
+        material_policy: MaterialPolicy::aeronautics(block_mass)
+            .expect("validated positive block mass produces a valid material policy"),
+        material_cache: RefCell::new(MaterialResolutionCache::default()),
+        material_override_revision: 0,
         substeps: DEFAULT_PHYSICS_SUBSTEPS,
         awake: true,
         rest_substeps: 0,
@@ -2146,9 +2412,21 @@ fn quat_rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
 fn quat_to_mat3(q: [f64; 4]) -> [[f64; 3]; 3] {
     let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
     [
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
     ]
 }
 
@@ -2190,9 +2468,8 @@ fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 /// inertia tensors are positive-definite by construction, so the `None`
 /// path is a defensive guard, not a reachable failure.
 fn mat3_invert(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    let c = |r0: usize, r1: usize, c0: usize, c1: usize| {
-        m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
-    };
+    let c =
+        |r0: usize, r1: usize, c0: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
     let cof = [
         [c(1, 2, 1, 2), -c(1, 2, 0, 2), c(1, 2, 0, 1)],
         [-c(0, 2, 1, 2), c(0, 2, 0, 2), -c(0, 2, 0, 1)],
@@ -3019,7 +3296,10 @@ mod tests {
     fn mass_weighted_com_and_full_inertia_tensor_are_exact() {
         // Two uniform stones: COM lands on the midpoint cell boundary,
         // diagonal terms get the m/6 self-inertia floor.
-        let sub = single_ship(&[([0, 0, 0], "minecraft:stone"), ([1, 0, 0], "minecraft:stone")]);
+        let sub = single_ship(&[
+            ([0, 0, 0], "minecraft:stone"),
+            ([1, 0, 0], "minecraft:stone"),
+        ]);
         assert!((sub.mass - 400.0).abs() < 1e-9);
         assert!((sub.center_of_mass[0] - 1.0).abs() < 1e-12);
         assert!((sub.center_of_mass[1] - 0.5).abs() < 1e-12);
@@ -3035,10 +3315,7 @@ mod tests {
         for (i, row) in product.iter().enumerate() {
             for (j, got) in row.iter().enumerate() {
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (*got - want).abs() < 1e-9,
-                    "I·I⁻¹[{i}][{j}] = {got}"
-                );
+                assert!((*got - want).abs() < 1e-9, "I·I⁻¹[{i}][{j}] = {got}");
             }
         }
     }
@@ -3129,11 +3406,7 @@ mod tests {
         sub.omega = [0.0; 3];
         assert_eq!(
             sub.passenger_world_delta([0.5, 1.0, -0.5], 0.05),
-            [
-                sub.vel[0] * 0.05,
-                sub.vel[1] * 0.05,
-                sub.vel[2] * 0.05,
-            ],
+            [sub.vel[0] * 0.05, sub.vel[1] * 0.05, sub.vel[2] * 0.05,],
             "with no rotation the finite-step rotational terms cancel exactly"
         );
     }
@@ -3154,7 +3427,11 @@ mod tests {
         // Zero radial drift: the endpoint stays exactly on the 20-block
         // sphere — the old tangent step placed it at r·√(1+θ²) ≈ 25.8.
         let endpoint_r = norm3([d[0] + 20.0, d[1], d[2]]);
-        assert!((endpoint_r - 20.0).abs() < 1e-9, "radial drift {}", endpoint_r - 20.0);
+        assert!(
+            (endpoint_r - 20.0).abs() < 1e-9,
+            "radial drift {}",
+            endpoint_r - 20.0
+        );
     }
 
     #[test]
@@ -3188,7 +3465,10 @@ mod tests {
 
     #[test]
     fn block_edits_shift_pos_so_existing_voxels_stay_world_exact() {
-        let mut sub = single_ship(&[([0, 0, 0], "minecraft:stone"), ([1, 0, 0], "minecraft:stone")]);
+        let mut sub = single_ship(&[
+            ([0, 0, 0], "minecraft:stone"),
+            ([1, 0, 0], "minecraft:stone"),
+        ]);
         // Nontrivial pose: 45° about +Y so the COM delta rotates too.
         let s = (45.0_f64 / 2.0).to_radians().sin();
         let c = (45.0_f64 / 2.0).to_radians().cos();
@@ -3337,7 +3617,14 @@ mod tests {
             {
                 let mut others = [&mut b];
                 a.step_env_with_contacts(
-                    0.05, 0.0, 0.0, 0.0, 0.0, &mut solver, &|_| false, &mut others,
+                    0.05,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    &mut solver,
+                    &|_| false,
+                    &mut others,
                 );
             }
             let p = momentum(&a, &b);
@@ -3388,8 +3675,4 @@ mod tests {
             }
         }
     }
-
-
-
-
 }
