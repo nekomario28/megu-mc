@@ -115,6 +115,18 @@ fn snowballs() -> &'static Mutex<Vec<Snowball>> {
     SNOWBALLS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Poison-tolerant guards: a panic while a store is held must never take the
+/// tick down. These are the file's only lock spellings.
+fn lk<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn rd<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+fn wr<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------- xp orbs ----------
 // age: server ticks since spawn. Vanilla counts entity age in game ticks, so a
 // despawn window cannot shift when a loaded world is ticked under lag.
@@ -165,9 +177,7 @@ fn entity_dims() -> &'static RwLock<HashMap<i32, DimId>> {
 
 /// The dimension `eid` was registered under, `DimId::Overworld` when none was.
 pub(crate) fn entity_dim_of(eid: i32) -> DimId {
-    entity_dims()
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
+    rd(entity_dims())
         .get(&eid)
         .copied()
         .unwrap_or(DimId::Overworld)
@@ -176,7 +186,7 @@ pub(crate) fn entity_dim_of(eid: i32) -> DimId {
 /// Record the dimension an entity lives in. `DimId::Overworld` removes the
 /// entry instead — it is already the default answer.
 pub(crate) fn set_entity_dim(eid: i32, dim: DimId) {
-    let mut dims = entity_dims().write().unwrap_or_else(|e| e.into_inner());
+    let mut dims = wr(entity_dims());
     if dim == DimId::Overworld {
         dims.remove(&eid);
     } else {
@@ -187,9 +197,7 @@ pub(crate) fn set_entity_dim(eid: i32, dim: DimId) {
 /// Forget an entity's dimension on despawn: eids are never reused, but the
 /// entry would otherwise sit in the table until process end.
 pub(crate) fn clear_entity_dim(eid: i32) {
-    entity_dims()
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
+    wr(entity_dims())
         .remove(&eid);
 }
 
@@ -218,7 +226,7 @@ const XP_ORB_MAX_VAL: u64 = i16::MAX as u64;
 /// field (it is built with struct literals outside this lane).
 fn xp_spawn_dim(dim: DimId, x: f64, y: f64, z: f64, val: i16) -> i32 {
     let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    xps().lock().unwrap_or_else(|e| e.into_inner()).push(Xp {
+    lk(xps()).push(Xp {
         eid,
         x,
         y,
@@ -227,9 +235,7 @@ fn xp_spawn_dim(dim: DimId, x: f64, y: f64, z: f64, val: i16) -> i32 {
         age: 0,
     });
     set_entity_dim(eid, dim);
-    xp_pending()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(xp_pending())
         .insert(eid);
     eid
 }
@@ -426,13 +432,13 @@ thread_local! {
 /// only spatial gate inside a same-dimension group.
 fn xp_merge_pending() {
     let pending: HashSet<i32> = {
-        let mut p = xp_pending().lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = lk(xp_pending());
         if p.is_empty() {
             return;
         }
         std::mem::take(&mut *p)
     };
-    let mut xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+    let mut xs = lk(xps());
     if xs.len() <= XP_MERGE_FLOOR {
         return;
     }
@@ -501,8 +507,8 @@ fn apply_item_attribute_modifiers(
 /// main hand, off hand, and the four armor slots. Stacks are cloned so no
 /// inventory lock is held while the modifiers are evaluated.
 fn equipped_pairs(c: &Client) -> Vec<(ItemAttrSlotGroup, Stack)> {
-    let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-    let held_slot = *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    let inv = lk(&c.inv);
+    let held_slot = *lk(&c.held);
     let mut out = Vec::with_capacity(6);
     if let Some(st) = inv.get(&(36 + held_slot)) {
         out.push((ItemAttrSlotGroup::MainHand, st.clone()));
@@ -569,7 +575,7 @@ fn refresh_equip_attrs(c: &Client) {
             m.insert(id, (add, mb, mt));
         }
     }
-    equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).insert(c.name.clone(), m);
+    lk(equip_attrs()).insert(c.name.clone(), m);
 }
 
 /// Vanilla `Player.currentItemAttackStrengthDelay` source: the effective
@@ -579,9 +585,7 @@ fn refresh_equip_attrs(c: &Client) {
 /// without one keeps the table speed — the table encodes `4.0 + item delta`,
 /// so the delta is preserved on top of any `/attribute`-set base.
 fn melee_attack_speed(me: &Client, item: i64) -> f64 {
-    let base = attrs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let base = lk(attrs())
         .get(&format!("p:{}", me.name))
         .and_then(|m| m.get("generic.attack_speed"))
         .copied()
@@ -627,7 +631,7 @@ fn attack_tickers() -> &'static Mutex<HashMap<i32, AttackTicker>> {
 /// swing paths outside this file.
 #[allow(dead_code)]
 fn reset_attack_ticker(eid: i32) {
-    let mut map = attack_tickers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = lk(attack_tickers());
     let tick = TICK_IDX.load(Ordering::Relaxed);
     map.entry(eid)
         .and_modify(|st| {
@@ -647,7 +651,7 @@ fn reset_attack_ticker(eid: i32) {
 // TICK_IDX so `/tick freeze` and tick lag freeze the recharge instead of
 // drifting on wall-clock time.
 fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
-    let speed_eff = me.effs.lock().unwrap_or_else(|e| e.into_inner()).iter().fold(1.0_f32, |speed, effect| {
+    let speed_eff = lk(&me.effs).iter().fold(1.0_f32, |speed, effect| {
         match effect.id {
             2 | 3 => speed * effects::effect_attribute_modifier(
                 effect.id + 1, effect.amp, effects::EffectAttribute::AttackSpeed,
@@ -658,11 +662,11 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
     let speed = melee_attack_speed(me, item) * f64::from(speed_eff.max(0.001));
     let delay_ticks = 20.0 / speed.max(0.001);
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
-    let held_slot = *me.held.lock().unwrap_or_else(|e| e.into_inner());
-    let mut lm = me.last_melee.lock().unwrap_or_else(|e| e.into_inner());
+    let held_slot = *lk(&me.held);
+    let mut lm = lk(&me.last_melee);
     let wall_ticks =
         u64::try_from(lm.elapsed().as_millis() / u128::from(TICK_MS)).unwrap_or(u64::MAX);
-    let mut map = attack_tickers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = lk(attack_tickers());
     let elapsed = match map.get(&me.eid) {
         // Ticker is live and the wall stamp is untouched: game ticks only.
         Some(st) if st.wall == Some(*lm) => {
@@ -695,63 +699,57 @@ fn melee_charge(me: &Arc<Client>, item: i64) -> f32 {
     refresh_equip_attrs(me);
     charge
 }
-// `#minecraft:undead` (1.21.1): every member Smite's +2.5/level bonus applies to.
+/// `#minecraft:undead` (1.21.1): every member Smite's +2.5/level bonus applies to.
+const ENCHANT_TARGET_UNDEAD: &[&str] = &[
+    "bogged",
+    "drowned",
+    "husk",
+    "phantom",
+    "skeleton",
+    "skeleton_horse",
+    "stray",
+    "wither",
+    "wither_skeleton",
+    "zombie",
+    "zombie_horse",
+    "zombie_villager",
+    "zombified_piglin",
+    "zoglin",
+];
+/// `#minecraft:arthropod` (1.21.1): Bane of Arthropods' damage/slowdown family.
+const ENCHANT_TARGET_ARTHROPOD: &[&str] =
+    &["bee", "cave_spider", "endermite", "silverfish", "spider"];
+/// `#minecraft:sensitive_to_impaling` (1.21.1) — the whole aquatic family. The
+/// tag name differs from the issue's `#minecraft:aquatic` shorthand; the
+/// membership is the same 12 rows vanilla lists.
+const ENCHANT_TARGET_AQUATIC: &[&str] = &[
+    "axolotl",
+    "cod",
+    "dolphin",
+    "elder_guardian",
+    "glow_squid",
+    "guardian",
+    "pufferfish",
+    "salmon",
+    "squid",
+    "tadpole",
+    "tropical_fish",
+    "turtle",
+];
+fn enchant_target_in(etype: i64, names: &[&str]) -> bool {
+    entity_spec_by_id(etype).is_some_and(|entity| {
+        names.contains(&entity.name.strip_prefix("minecraft:").unwrap_or(""))
+    })
+}
 fn enchantment_targets_undead(etype: i64) -> bool {
-    entity_spec_by_id(etype).is_some_and(|entity| {
-        matches!(
-            entity.name.strip_prefix("minecraft:"),
-            Some(
-                "bogged"
-                    | "drowned"
-                    | "husk"
-                    | "phantom"
-                    | "skeleton"
-                    | "skeleton_horse"
-                    | "stray"
-                    | "wither"
-                    | "wither_skeleton"
-                    | "zombie"
-                    | "zombie_horse"
-                    | "zombie_villager"
-                    | "zombified_piglin"
-                    | "zoglin"
-            )
-        )
-    })
+    enchant_target_in(etype, ENCHANT_TARGET_UNDEAD)
 }
-// `#minecraft:arthropod` (1.21.1): Bane of Arthropods' damage/slowdown family.
 fn enchantment_targets_arthropod(etype: i64) -> bool {
-    entity_spec_by_id(etype).is_some_and(|entity| {
-        matches!(
-            entity.name.strip_prefix("minecraft:"),
-            Some("bee" | "cave_spider" | "endermite" | "silverfish" | "spider")
-        )
-    })
+    enchant_target_in(etype, ENCHANT_TARGET_ARTHROPOD)
 }
-// `#minecraft:sensitive_to_impaling` (1.21.1) — the whole aquatic family. The
-// tag name differs from the issue's `#minecraft:aquatic` shorthand; the
-// membership is the same 12 rows vanilla lists.
 #[cfg_attr(not(test), allow(dead_code))]
 fn enchantment_targets_aquatic(etype: i64) -> bool {
-    entity_spec_by_id(etype).is_some_and(|entity| {
-        matches!(
-            entity.name.strip_prefix("minecraft:"),
-            Some(
-                "axolotl"
-                    | "cod"
-                    | "dolphin"
-                    | "elder_guardian"
-                    | "glow_squid"
-                    | "guardian"
-                    | "pufferfish"
-                    | "salmon"
-                    | "squid"
-                    | "tadpole"
-                    | "tropical_fish"
-                    | "turtle"
-            )
-        )
-    })
+    enchant_target_in(etype, ENCHANT_TARGET_AQUATIC)
 }
 /// `EnchantmentHelper.getDamageBonus` for the typed families (1.21.1): each
 /// pays a flat +2.5 per level against its tag and nothing otherwise.
@@ -879,7 +877,7 @@ fn mob_fire_ticks() -> &'static Mutex<HashMap<i32, u32>> {
 /// Vanilla `Entity.setRemainingFireTicks`: store a fresh burn without touching
 /// `Mob.fuse` or `Mob.fire_ticks` bookkeeping owned elsewhere.
 fn ignite_mob(eid: i32, ticks: u32) {
-    mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).insert(eid, ticks);
+    lk(mob_fire_ticks()).insert(eid, ticks);
 }
 /// Vanilla `Player.attack`'s `target.igniteForSeconds(4 * fireAspectLevel)`:
 /// Fire Aspect I burns 80 game ticks (4s), Fire Aspect II 160 (8s).
@@ -892,16 +890,14 @@ fn ignite_mob_fire_aspect(eid: i32, level: i64) {
 /// The mob's remaining weapon/environmental burn, in server ticks.
 #[cfg_attr(not(test), allow(dead_code))]
 fn mob_fire_ticks_of(eid: i32) -> u32 {
-    mob_fire_ticks()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(mob_fire_ticks())
         .get(&eid)
         .copied()
         .unwrap_or(0)
 }
 /// Vanilla water/rain extinguish (`Entity.isInWaterOrRain`): clears the burn.
 fn extinguish_mob_fire(eid: i32) {
-    mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+    lk(mob_fire_ticks()).remove(&eid);
 }
 /// One server tick of burning on the map store: decrements cleanly, pays
 /// `1.0` HP every `MOB_BURN_TICK_GT` game ticks, never damages a fire-immune
@@ -909,7 +905,7 @@ fn extinguish_mob_fire(eid: i32) {
 /// The per-tick driver is `mob_fire_and_persistence_tick_step`.
 #[allow(dead_code)] // driven by mob_fire_and_persistence_tick_step
 pub(crate) fn tick_mob_fire(eid: i32, tick: u64, fire_immune: bool, wet: bool) -> bool {
-    let mut map = mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = lk(mob_fire_ticks());
     if wet {
         map.remove(&eid);
         return false;
@@ -960,8 +956,8 @@ fn vanilla_shield_attempts(damage: f32) -> i64 {
 }
 fn damage_shield_attempts(me: &Arc<Client>, attempts: i64) {
     let sh = name_to_item("shield").unwrap_or(-9);
-    let slots = [45i16, 36 + *me.held.lock().unwrap_or_else(|e| e.into_inner())];
-    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let slots = [45i16, 36 + *lk(&me.held)];
+    let mut inv = lk(&me.inv);
     for slot in slots {
         let Some(st) = inv.get_mut(&slot) else {
             continue;
@@ -1088,7 +1084,7 @@ fn evaluate_wind_charge_burst(
 /// when falling below the Y level where the wind burst hit").
 fn wind_charge_reset_fall(c: &Client, burst_y: f64) {
     if burst_y.is_finite() {
-        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = burst_y;
+        *lk(&c.fall_from) = burst_y;
     }
 }
 
@@ -1229,11 +1225,11 @@ fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
             f64::from(pos.2) + 0.5,
         );
         broadcast_chunk_dim(dim, pos.0 >> 4, pos.2 >> 4, |_c| (0x5b, packet.clone()));
-        for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for mob in lk(mobs()).iter() {
             if Some(mob.etype) != name_to_etype("allay") {
                 continue;
             }
-            let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let (mx, my, mz, ..) = *lk(&mob.pos);
             let near = (mx - f64::from(pos.0)).powi(2)
                 + (my - f64::from(pos.1)).powi(2)
                 + (mz - f64::from(pos.2)).powi(2)
@@ -1251,19 +1247,19 @@ fn wind_charge_note_neighbors(dim: DimId, x: i32, y: i32, z: i32) {
 fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower_eid: i32) {
     let profile = wind_charge_profile(kind);
     for c in client_snapshot() {
-        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim
-            || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 3
+        if *lk(&c.dim) != dim
+            || *lk(&c.gm) == 3
         {
             continue;
         }
         let (x, y, z, ..) = {
-            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let p = lk(&c.pos);
             *p
         };
         let eye = y
             + f64::from(player_eye_height(
-                *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()),
-                *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
+                *lk(&c.sneaking),
+                *lk(&c.fall_fly),
             ));
         if let Some(dv) =
             evaluate_wind_charge_burst(kind, impact, [x, y, z], eye, 1.0, knockback_resist_of(&c))
@@ -1283,16 +1279,16 @@ fn wind_charge_burst(dim: DimId, kind: WindChargeKind, impact: [f64; 3], thrower
             wind_charge_reset_fall(&c, impact[1]);
         }
     }
-    for m in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for m in lk(mobs()).iter() {
         if m.dim != dim {
             continue;
         }
-        let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (mx, my, mz, ..) = *lk(&m.pos);
         let eye = my + f64::from(entity_eye_height_1211(m.etype));
         if let Some(dv) =
             evaluate_wind_charge_burst(kind, impact, [mx, my, mz], eye, 1.0, 0.0)
         {
-            let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&m.pos);
             p.0 += dv[0];
             p.1 += dv[1];
             p.2 += dv[2];
@@ -1379,11 +1375,11 @@ fn mace_attack_fall(me: &Client, item: i64) -> f32 {
     if item_to_name(item) != Some("mace") {
         return 0.0;
     }
-    let (_, y, _, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-    if grounded || *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+    let (_, y, _, _, _, grounded) = *lk(&me.pos);
+    if grounded || *lk(&me.fall_fly) {
         return 0.0;
     }
-    (*me.fall_from.lock().unwrap_or_else(|e| e.into_inner()) - y) as f32
+    (*lk(&me.fall_from) - y) as f32
 }
 
 /// Called after the victim accepts damage. Reset the fall immediately so a
@@ -1392,17 +1388,17 @@ fn queue_mace_smash(me: &Client, held: &Stack, fall: f32, target: i32, center: [
     if fall <= 1.5 {
         return;
     }
-    let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let (x, y, z, ..) = *lk(&me.pos);
     wind_charge_reset_fall(me, y);
     let smash = MaceSmash {
-        dim: *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+        dim: *lk(&me.dim),
         target,
         center,
         origin: [x, y, z],
         level: enchant_level(&held.2, 41),
         fall,
     };
-    mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).insert(me.eid, smash);
+    lk(mace_smashes()).insert(me.eid, smash);
 }
 
 fn mace_smash_impulse(center: [f64; 3], pos: [f64; 3], heavy: f64) -> Option<[f64; 3]> {
@@ -1419,9 +1415,7 @@ fn mace_smash_impulse(center: [f64; 3], pos: [f64; 3], heavy: f64) -> Option<[f6
 }
 
 fn mace_smash_pet_exempt(mob: &Arc<Mob>, attacker_uuid: [u8; 16]) -> bool {
-    live_mob_states()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(live_mob_states())
         .get(&mob.eid)
         .and_then(|state| state.behavior.as_ref())
         .is_some_and(|behavior| match behavior {
@@ -1435,18 +1429,18 @@ fn mace_smash_pet_exempt(mob: &Arc<Mob>, attacker_uuid: [u8; 16]) -> bool {
 fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     let heavy = if smash.fall > 5.0 { 2.0 } else { 1.0 };
     let attacker_uuid = c.uuid;
-    let nearby: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
+    let nearby: Vec<_> = lk(mobs()).iter().cloned().collect();
     for m in nearby {
         if m.dim != smash.dim
             || m.eid == smash.target
             || m.etype == 3 // armor stands are immune to the smash pulse
             || mace_smash_pet_exempt(&m, attacker_uuid)
-            || *m.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+            || *lk(&m.hp) <= 0.0
         {
             continue;
         }
         let (x, y, z, yaw, pitch) = {
-            let mut pos = m.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pos = lk(&m.pos);
             let Some(impulse) = mace_smash_impulse(smash.center, [pos.0, pos.1, pos.2], heavy) else {
                 continue;
             };
@@ -1455,7 +1449,7 @@ fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
             // old radial pulse rewrote the position directly, so a mob could
             // be shoved through a wall.
             {
-                let mut vel = m.vel.lock().unwrap_or_else(|e| e.into_inner());
+                let mut vel = lk(&m.vel);
                 vel[0] += impulse[0];
                 vel[1] += impulse[1];
                 vel[2] += impulse[2];
@@ -1484,13 +1478,13 @@ fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     for player in client_snapshot() {
         if player.eid == c.eid
             || player.eid == smash.target
-            || *player.dim.lock().unwrap_or_else(|e| e.into_inner()) != smash.dim
+            || *lk(&player.dim) != smash.dim
             || player.is_spectator()
-            || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+            || *lk(&player.hp) <= 0.0
         {
             continue;
         }
-        let (x, y, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, y, z, ..) = *lk(&player.pos);
         let Some(impulse) = mace_smash_impulse(smash.center, [x, y, z], heavy) else {
             continue;
         };
@@ -1566,10 +1560,10 @@ fn combat2_state_tick() {
     let now = TICK_IDX.load(Ordering::Relaxed);
     let cls = client_snapshot();
     let mut live = HashSet::with_capacity(cls.len());
-    let mut raised = shield_raised().lock().unwrap_or_else(|e| e.into_inner());
+    let mut raised = lk(shield_raised());
     for c in &cls {
         live.insert(c.eid);
-        if *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+        if *lk(&c.blocking) {
             raised.entry(c.eid).or_insert(now);
         } else {
             raised.remove(&c.eid);
@@ -1577,13 +1571,11 @@ fn combat2_state_tick() {
     }
     raised.retain(|eid, _| live.contains(eid));
     drop(raised);
-    riptide_spin()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(riptide_spin())
         .retain(|eid, _| live.contains(eid));
     {
         // Deliver the knockback and Wind Burst from accepted hits.
-        let mut smashes = mace_smashes().lock().unwrap_or_else(|e| e.into_inner());
+        let mut smashes = lk(mace_smashes());
         let mut drained = Vec::new();
         for c in &cls {
             if let Some(smash) = smashes.remove(&c.eid) {
@@ -1593,7 +1585,7 @@ fn combat2_state_tick() {
         smashes.retain(|eid, _| live.contains(eid));
         drop(smashes);
         for (c, smash) in drained {
-            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) == smash.dim {
+            if *lk(&c.dim) == smash.dim {
                 wind_burst_apply(&c, smash);
             }
         }
@@ -1608,7 +1600,7 @@ fn combat2_state_tick() {
 fn fireworks_step() {
     let mut expired = Vec::new();
     {
-        let mut fws = fireworks().lock().unwrap_or_else(|e| e.into_inner());
+        let mut fws = lk(fireworks());
         for f in fws.iter_mut() {
             f.ttl -= 1;
             f.x += f.dx;
@@ -1639,12 +1631,12 @@ fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64) {
     }
     let power = (5.0 + 2.0 * explosions as f64) as f32;
     for cl in client_snapshot() {
-        if *cl.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+        if *lk(&cl.dim) != dim {
             continue;
         }
-        let (px, py, pz, ..) = *cl.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (px, py, pz, ..) = *lk(&cl.pos);
         let dd = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-        if dd < 5.0 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        if dd < 5.0 && *lk(&cl.gm) != 1 {
             let raw = ((5.0 - dd) * (f64::from(power) / 5.0)) as f32;
             // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
             // or reshapes this player's share of the blast.
@@ -1654,34 +1646,21 @@ fn firework_explode(dim: DimId, x: f64, y: f64, z: f64, explosions: i64) {
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
-            let mut h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, accepted, 2))).max(0.0);
-            if *h <= 0.0 {
-                drop(h);
-                totem_check(&cl);
-                h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
-            }
-            let hh = *h;
-            drop(h);
-            damage_armor(&cl, raw);
-            if let Ok(mut w) = cl.sock.lock() {
-                let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
-                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, &cl));
-            }
+            player_hurt_apply(&cl, accepted, Some(2), Some(raw));
         }
     }
-    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for mob in lk(mobs()).iter() {
         if mob.dim != dim {
             continue;
         }
-        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (mx, my, mz, ..) = *lk(&mob.pos);
         let dd = ((mx - x).powi(2) + (my - y).powi(2) + (mz - z).powi(2)).sqrt();
         if dd < 5.0 {
             // Mod-suite `EntityDamagePre` for blast-damaged mobs.
             let Some(dmg) = live_mod_entity_damage_pre(power * (5.0 - dd) as f32) else {
                 continue;
             };
-            let mut hp = mob.hp.lock().unwrap_or_else(|e| e.into_inner());
+            let mut hp = lk(&mob.hp);
             *hp = (*hp - dmg).max(0.0);
         }
     }
@@ -1705,9 +1684,9 @@ fn wind_charge_projectile_step() {
     };
     let mut bursts = Vec::new();
     {
-        let mut ages = wind_charge_ages().lock().unwrap_or_else(|e| e.into_inner());
+        let mut ages = lk(wind_charge_ages());
         let mut seen = HashSet::new();
-        for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        for mob in lk(mobs()).iter() {
             let kind = if Some(mob.etype) == player_charge {
                 WindChargeKind::Player
             } else if Some(mob.etype) == breeze_charge {
@@ -1715,7 +1694,7 @@ fn wind_charge_projectile_step() {
             } else {
                 continue;
             };
-            let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let (mx, my, mz, ..) = *lk(&mob.pos);
             let age = ages.entry(mob.eid).or_insert(0);
             *age = age.saturating_add(1);
             let hit_solid = reg.is_solid(block_at_dim(
@@ -1726,7 +1705,7 @@ fn wind_charge_projectile_step() {
             ));
             if hit_solid || *age >= 200 {
                 ages.remove(&mob.eid);
-                *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+                *lk(&mob.hp) = 0.0;
                 bursts.push((mob.dim, kind, [mx, my, mz]));
             } else {
                 seen.insert(mob.eid);
@@ -1743,9 +1722,7 @@ fn wind_charge_projectile_step() {
 /// an unrecorded raise counts as 0 — vanilla refuses the block in that window.
 fn shield_raised_ticks(c: &Client) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
-    shield_raised()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(shield_raised())
         .get(&c.eid)
         .map_or(0, |since| {
             now.saturating_sub(*since) * u64::from(GAME_TICKS_PER_TICK)
@@ -1756,9 +1733,7 @@ fn shield_raised_ticks(c: &Client) -> u64 {
 #[cfg_attr(any(not(test), not(megu_vanilla_data)), allow(dead_code))]
 fn spin_attack_ticks_left(eid: i32) -> u64 {
     let now = TICK_IDX.load(Ordering::Relaxed);
-    riptide_spin()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(riptide_spin())
         .get(&eid)
         .map_or(0, |until| {
             until.saturating_sub(now) * u64::from(GAME_TICKS_PER_TICK)
@@ -1848,7 +1823,7 @@ fn evaluate_shield_block(ctx: &ShieldAttackCtx) -> ShieldBlock {
 /// horizontally-normalized direction vectors vanilla compares.
 fn shield_hit_ctx(c: &Client, attacker: [f64; 3], damage: f32) -> ShieldAttackCtx {
     let (px, _, pz, yaw, _, _) = {
-        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let p = lk(&c.pos);
         *p
     };
     let yr = (yaw as f64).to_radians();
@@ -1869,12 +1844,7 @@ fn shield_hit_ctx(c: &Client, attacker: [f64; 3], damage: f32) -> ShieldAttackCt
     };
     ShieldAttackCtx {
         raised_ticks: shield_raised_ticks(c),
-        cooldown_active: c
-            .shield_cd
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .elapsed()
-            <= SHIELD_DISABLE_DUR,
+        cooldown_active: lk(&c.shield_cd).elapsed() <= SHIELD_DISABLE_DUR,
         unblockable: false,
         look,
         to_attacker,
@@ -1895,8 +1865,8 @@ fn mob_can_disable_shield(etype: i64) -> bool {
 
 /// `LivingEntity.blockUsingShield`'s disable arm applied to the live fields.
 fn apply_shield_disable(c: &Client) {
-    *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *c.shield_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    *lk(&c.blocking) = false;
+    *lk(&c.shield_cd) = Instant::now();
 }
 
 // ---------- totem of undying ----------
@@ -1921,12 +1891,12 @@ enum TotemDamageKind {
 fn try_trigger_totem_of_undying(c: &Client, hp_after_damage: f32, kind: TotemDamageKind) -> bool {
     if kind != TotemDamageKind::Ordinary
         || hp_after_damage > 0.0
-        || *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1
+        || *lk(&c.gm) == 1
     {
         return false;
     }
-    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-    let held_k = 36i16 + (*c.held.lock().unwrap_or_else(|e| e.into_inner()));
+    let mut inv = lk(&c.inv);
+    let held_k = 36i16 + (*lk(&c.held));
     for k in [45i16, held_k] {
         if let Some(st) = inv.get(&k).cloned().filter(|s| s.0 == 1163) {
             if st.1 <= 1 {
@@ -1936,23 +1906,23 @@ fn try_trigger_totem_of_undying(c: &Client, hp_after_damage: f32, kind: TotemDam
             }
             let now = inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
             drop(inv);
-            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 1.0;
+            *lk(&c.hp) = 1.0;
             resync_slot(c, 0, k, &now);
             // entity_status 35 = totem use; i32 entity id + i8 status
             let mut st_pkt = Vec::new();
             st_pkt.extend_from_slice(&c.eid.to_be_bytes());
             st_pkt.push(35);
-            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x1f, st_pkt.clone());
+            let _ = send_packet(&mut lk(&c.sock), 0x1f, st_pkt.clone());
             broadcast_seen(c.eid, |_c| (0x1f, st_pkt.clone()));
             let (px, py, pz, ..) = {
-                let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let p = lk(&c.pos);
                 *p
             };
             let snd = sound_pkt_named("item.totem.use", px, py, pz);
             broadcast_seen(c.eid, |_c| (0x68, snd.clone()));
             // Death protection replaces existing effects with the vanilla grant set.
-            grant_totem_effects(c, &mut c.effs.lock().unwrap_or_else(|e| e.into_inner()));
-            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x5d, health_pkt_c(1.0, c));
+            grant_totem_effects(c, &mut lk(&c.effs));
+            let _ = send_packet(&mut lk(&c.sock), 0x5d, health_pkt_c(1.0, c));
             return true;
         }
     }
@@ -2091,12 +2061,12 @@ fn can_see_sky(dim: DimId, x: i32, y: i32, z: i32) -> bool {
 /// raining at a position with open sky.
 fn trident_thrower_wet(c: &Client) -> bool {
     let (x, y, z, ..) = {
-        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let p = lk(&c.pos);
         *p
     };
-    let dim = *c.dim.lock().unwrap_or_else(|e| e.into_inner());
-    let sneaking = *c.sneaking.lock().unwrap_or_else(|e| e.into_inner());
-    let fall_fly = *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
+    let dim = *lk(&c.dim);
+    let sneaking = *lk(&c.sneaking);
+    let fall_fly = *lk(&c.fall_fly);
     if aabb_in_water_with(player_bounding_box(x, y, z, sneaking, fall_fly), &|bx, by, bz| {
         block_at_dim(dim, bx, by, bz)
     }) {
@@ -2118,9 +2088,9 @@ fn trident_restore(c: &Arc<Client>, item: i64, comps: &Comps) {
     if item <= 0 {
         return;
     }
-    let hs = 36 + *c.held.lock().unwrap_or_else(|e| e.into_inner());
+    let hs = 36 + *lk(&c.held);
     {
-        let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inv = lk(&c.inv);
         if let std::collections::hash_map::Entry::Vacant(e) = inv.entry(hs) {
             e.insert((item, 1, comps.clone()));
             let st = inv.get(&hs).cloned().unwrap_or((0, 0, Vec::new()));
@@ -2130,12 +2100,10 @@ fn trident_restore(c: &Arc<Client>, item: i64, comps: &Comps) {
         }
     }
     let (x, y, z, ..) = {
-        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let p = lk(&c.pos);
         *p
     };
-    drops()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(drops())
         .push(Drop {
             eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
             x,
@@ -2155,7 +2123,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
     let per = (raw_dmg / 4.0).floor().max(1.0) as i64;
     let mut broke = false;
     {
-        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inv = lk(&me.inv);
         for slot in [5i16, 6, 7, 8] {
             let Some(st) = inv.get_mut(&slot) else {
                 continue;
@@ -2183,11 +2151,11 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
                 comp_set_varint(&mut st.2, COMP_DAMAGE, dmg);
             }
         }
-        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
+        *lk(&me.armor_pts) = armor_pts_of(&inv);
     }
     if broke {
         let (x, y, z, ..) = {
-            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let p = lk(&me.pos);
             *p
         };
         let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
@@ -2195,10 +2163,7 @@ fn damage_armor(me: &Arc<Client>, raw_dmg: f32) {
     }
     // resync the four armor slots (cheap: keeps client honest)
     for slot in [5i16, 6, 7, 8] {
-        let st = me
-            .inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let st = lk(&me.inv)
             .get(&slot)
             .cloned()
             .unwrap_or((0, 0, Vec::new()));
@@ -2268,20 +2233,26 @@ fn mob_xp(etype: i64) -> i16 {
 }
 // vanilla /kill applies void damage — the same loot+xp+cleanup path as
 // combat death, not a silent retain
-fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
-    extinguish_mob_fire(deid);
-    let Some((mob, state)) = remove_live_mob(deid) else { return };
-    let burning = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
-    live_mob_death(&mob, state, [mx, my, mz]);
-    broadcast_seen_destroy(deid);
-    let was_sheared = sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
+/// Shared post-death loot scatter: `mob_loot` gated on the mob-loot gamerule;
+/// `was_sheared` suppresses the sheared-mutton stack (player kills only).
+fn mob_death_drops(dim: DimId, etype: i64, pos: [f64; 3], burning: bool, was_sheared: bool) {
     for (item, cnt, comps) in mob_loot(etype, burning)
         .into_iter()
         .filter(|st| !(was_sheared && st.0 == 202))
         .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
     {
-        drop_spawn_scattered(mob.dim, mx, my, mz, item, cnt, comps, 0, None, None);
+        drop_spawn_scattered(dim, pos[0], pos[1], pos[2], item, cnt, comps, 0, None, None);
     }
+}
+
+fn kill_mob(deid: i32, etype: i64, mx: f64, my: f64, mz: f64) {
+    extinguish_mob_fire(deid);
+    let Some((mob, state)) = remove_live_mob(deid) else { return };
+    let burning = *lk(&mob.fire_ticks) > 0;
+    live_mob_death(&mob, state, [mx, my, mz]);
+    broadcast_seen_destroy(deid);
+    let was_sheared = lk(sheared()).remove(&deid);
+    mob_death_drops(mob.dim, etype, [mx, my, mz], burning, was_sheared);
     xp_spawn_dim(mob.dim, mx, my, mz, mob_xp(etype));
     // spawn streams via interest_tick
 }
@@ -2293,13 +2264,8 @@ fn mob_env_die(deid: i32, etype: i64, mx: f64, my: f64, mz: f64, burning: bool) 
     let Some((mob, state)) = remove_live_mob(deid) else { return };
     live_mob_death(&mob, state, [mx, my, mz]);
     broadcast_seen_destroy(deid);
-    sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
-    for (item, cnt, comps) in mob_loot(etype, burning)
-        .into_iter()
-        .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
-    {
-        drop_spawn_scattered(mob.dim, mx, my, mz, item, cnt, comps, 0, None, None);
-    }
+    lk(sheared()).remove(&deid);
+    mob_death_drops(mob.dim, etype, [mx, my, mz], burning, false);
 }
 static LOOT_SEQ: AtomicU64 = AtomicU64::new(0);
 fn roll_loot(pools: &[LootPool]) -> Vec<Stack> {
@@ -2384,24 +2350,19 @@ fn record_mob_loot_attacker(etype: i64, source: i32) {
     if source <= 0 {
         return;
     }
-    let Some(client) = clients()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let Some(client) = lk(clients())
         .iter()
         .find(|client| client.eid == source)
         .cloned()
     else {
         return;
     };
-    let held_slot = *client.held.lock().unwrap_or_else(|e| e.into_inner());
-    let held_item = client
-        .inv
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let held_slot = *lk(&client.held);
+    let held_item = lk(&client.inv)
         .get(&(36 + held_slot))
         .map(|(item, _, _)| *item);
     let held_name = held_item.and_then(|item| item_to_name(item).map(str::to_string));
-    let mut attackers = mob_loot_attackers().lock().unwrap_or_else(|e| e.into_inner());
+    let mut attackers = lk(mob_loot_attackers());
     if attackers.len() >= MAX_MOB_LOOT_ATTACKER_TYPES && !attackers.contains_key(&etype) {
         attackers.clear();
     }
@@ -2420,9 +2381,7 @@ fn mob_loot_table_id(etype: i64) -> String {
 
 fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
     let drops = mob_loot_base(etype, burning);
-    let attacker = mob_loot_attackers()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let attacker = lk(mob_loot_attackers())
         .get(&etype)
         .cloned();
     let now = TICK_IDX.load(Ordering::Relaxed);
@@ -2445,7 +2404,7 @@ fn mob_loot(etype: i64, burning: bool) -> Vec<Stack> {
 }
 
 fn mob_loot_base(etype: i64, burning: bool) -> Vec<Stack> {
-    if let Some(pools) = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner()).get(&etype).map(|p| {
+    let raw: Vec<Stack> = if let Some(pools) = lk(mob_loot_tables()).get(&etype).map(|p| {
         p.iter()
             .map(|pl| LootPool {
                 rolls: pl.rolls,
@@ -2464,31 +2423,24 @@ fn mob_loot_base(etype: i64, burning: bool) -> Vec<Stack> {
             })
             .collect::<Vec<_>>()
     }) {
-        return roll_loot(&pools)
-            .into_iter()
-            .map(|mut st| {
-                if burning {
-                    if let Some(c) = cooked_drop(st.0) {
-                        st.0 = c;
-                    }
-                }
-                st
-            })
-            .collect();
-    }
-    let names: &[&str] = match etype {
-        124 => &["rotten_flesh"],
-        22 => &["beef", "leather"],
-        23 => &["gunpowder"],
-        91 => &["bone", "arrow"],
-        19 => &["chicken", "feather"],
-        77 => &["porkchop"],
-        87 => &["mutton", "white_wool"],
-        _ => &[],
+        roll_loot(&pools)
+    } else {
+        let names: &[&str] = match etype {
+            124 => &["rotten_flesh"],
+            22 => &["beef", "leather"],
+            23 => &["gunpowder"],
+            91 => &["bone", "arrow"],
+            19 => &["chicken", "feather"],
+            77 => &["porkchop"],
+            87 => &["mutton", "white_wool"],
+            _ => &[],
+        };
+        names
+            .iter()
+            .filter_map(|n| name_to_item(n).map(|i| (i, 1u8, Vec::new())))
+            .collect()
     };
-    names
-        .iter()
-        .filter_map(|n| name_to_item(n).map(|i| (i, 1u8, Vec::new())))
+    raw.into_iter()
         .map(|mut st| {
             if burning {
                 if let Some(c) = cooked_drop(st.0) {
@@ -2519,38 +2471,52 @@ fn diff_expl_dmg(d: f32) -> f32 {
         _ => d,
     }
 }
+/// Vanilla armor piece rows: (item name, equipment slot group, armor points,
+/// default `generic.armor_toughness`, default `generic.knockback_resistance`).
+/// Points are the piece's baked-in attribute modifier; toughness/resistance
+/// only count while the piece carries no explicit `attribute_modifiers`
+/// component.
+const ARMOR_PIECES: &[(&str, ItemAttrSlotGroup, i32, f64, f64)] = &[
+    ("leather_helmet", ItemAttrSlotGroup::Head, 1, 0.0, 0.0),
+    ("golden_helmet", ItemAttrSlotGroup::Head, 2, 0.0, 0.0),
+    ("chainmail_helmet", ItemAttrSlotGroup::Head, 2, 0.0, 0.0),
+    ("iron_helmet", ItemAttrSlotGroup::Head, 2, 0.0, 0.0),
+    ("diamond_helmet", ItemAttrSlotGroup::Head, 3, 2.0, 0.0),
+    ("netherite_helmet", ItemAttrSlotGroup::Head, 3, 3.0, 0.1),
+    ("turtle_helmet", ItemAttrSlotGroup::Head, 2, 0.0, 0.0),
+    ("leather_chestplate", ItemAttrSlotGroup::Chest, 3, 0.0, 0.0),
+    ("golden_chestplate", ItemAttrSlotGroup::Chest, 5, 0.0, 0.0),
+    ("chainmail_chestplate", ItemAttrSlotGroup::Chest, 5, 0.0, 0.0),
+    ("iron_chestplate", ItemAttrSlotGroup::Chest, 6, 0.0, 0.0),
+    ("diamond_chestplate", ItemAttrSlotGroup::Chest, 8, 2.0, 0.0),
+    ("netherite_chestplate", ItemAttrSlotGroup::Chest, 8, 3.0, 0.1),
+    ("elytra", ItemAttrSlotGroup::Chest, 0, 0.0, 0.0),
+    ("leather_leggings", ItemAttrSlotGroup::Legs, 2, 0.0, 0.0),
+    ("golden_leggings", ItemAttrSlotGroup::Legs, 3, 0.0, 0.0),
+    ("chainmail_leggings", ItemAttrSlotGroup::Legs, 4, 0.0, 0.0),
+    ("iron_leggings", ItemAttrSlotGroup::Legs, 5, 0.0, 0.0),
+    ("diamond_leggings", ItemAttrSlotGroup::Legs, 6, 2.0, 0.0),
+    ("netherite_leggings", ItemAttrSlotGroup::Legs, 6, 3.0, 0.1),
+    ("leather_boots", ItemAttrSlotGroup::Feet, 1, 0.0, 0.0),
+    ("golden_boots", ItemAttrSlotGroup::Feet, 1, 0.0, 0.0),
+    ("chainmail_boots", ItemAttrSlotGroup::Feet, 1, 0.0, 0.0),
+    ("iron_boots", ItemAttrSlotGroup::Feet, 2, 0.0, 0.0),
+    ("diamond_boots", ItemAttrSlotGroup::Feet, 3, 2.0, 0.0),
+    ("netherite_boots", ItemAttrSlotGroup::Feet, 3, 3.0, 0.1),
+];
+fn armor_piece_row(item: i64, grp: Option<ItemAttrSlotGroup>) -> Option<&'static (&'static str, ItemAttrSlotGroup, i32, f64, f64)> {
+    ARMOR_PIECES.iter().find(|(n, g, ..)| {
+        grp.is_none_or(|want| *g == want) && name_to_item(n) == Some(item)
+    })
+}
 // Vanilla default `generic.armor_toughness` baked into armor items as their
 // default attribute_modifiers component (diamond +2, netherite +3 per piece).
 // The default only counts while the piece carries no explicit component.
 fn armor_default_toughness(item: i64) -> f64 {
-    for (n, t) in [
-        ("netherite_helmet", 3.0),
-        ("netherite_chestplate", 3.0),
-        ("netherite_leggings", 3.0),
-        ("netherite_boots", 3.0),
-        ("diamond_helmet", 2.0),
-        ("diamond_chestplate", 2.0),
-        ("diamond_leggings", 2.0),
-        ("diamond_boots", 2.0),
-    ] {
-        if name_to_item(n) == Some(item) {
-            return t;
-        }
-    }
-    0.0
+    armor_piece_row(item, None).map_or(0.0, |r| r.3)
 }
 fn armor_default_knockback_resistance(item: i64) -> f64 {
-    for n in [
-        "netherite_helmet",
-        "netherite_chestplate",
-        "netherite_leggings",
-        "netherite_boots",
-    ] {
-        if name_to_item(n) == Some(item) {
-            return 0.1;
-        }
-    }
-    0.0
+    armor_piece_row(item, None).map_or(0.0, |r| r.4)
 }
 fn armor_toughness_of(pairs: &[(ItemAttrSlotGroup, &Stack)]) -> f64 {
     let mut base = 0.0;
@@ -2607,7 +2573,7 @@ fn armor_dmg_factor(c: &Client, raw: f32) -> f64 {
         })
         .copied()
         .collect();
-    let armor = f64::from(*c.armor_pts.lock().unwrap_or_else(|e| e.into_inner()))
+    let armor = f64::from(*lk(&c.armor_pts))
         + apply_item_attribute_modifiers(0.0, &hand_pairs, ATTR_ARMOR);
     let f = 2.0 + armor_toughness_of(&pairs) / 4.0;
     let v = armor - f64::from(raw) / f;
@@ -2620,7 +2586,7 @@ fn armor_dmg_factor(c: &Client, raw: f32) -> f64 {
 // 1 fall (feather_falling 3x), 2 explosion (blast 2x), 3 projectile
 // (proj 2x), 4 fire (fire_prot 2x)
 fn enchant_epf(c: &Client, kind: u8) -> i64 {
-    let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let inv = lk(&c.inv);
     let mut epf = 0i64;
     for slot in [5i16, 6, 7, 8] {
         if let Some((_, _, comps)) = inv.get(&slot) {
@@ -2646,10 +2612,10 @@ fn dmg_after(c: &Client, raw: f32, kind: u8) -> f32 {
 // the main tick only applies it there), a `BYPASSES_INVULNERABILITY` source
 // vanilla's `checkTotemDeathProtection` never sees.
 fn totem_check(c: &Client) {
-    let hp = *c.hp.lock().unwrap_or_else(|e| e.into_inner());
+    let hp = *lk(&c.hp);
     let kind = {
-        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-        let below = p.1 < f64::from(c.dim.lock().unwrap_or_else(|e| e.into_inner()).min_y());
+        let p = lk(&c.pos);
+        let below = p.1 < f64::from(lk(&c.dim).min_y());
         if c.generic_kill_pending.load(Ordering::SeqCst) {
             TotemDamageKind::Kill
         } else if below {
@@ -2688,7 +2654,7 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
         broadcast_seen(c.eid, |_| (0x43, packet.clone()));
     }
     totem_effects(ef);
-    *c.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 8.0;
+    *lk(&c.absorb) = 8.0;
     for e in ef.iter() {
         // The wire uses game ticks even while the simulation stores server ticks.
         let packet = entity_effect_pkt(c.eid, e.id, e.amp, e.left);
@@ -2700,70 +2666,19 @@ fn grant_totem_effects(c: &Client, ef: &mut Vec<Eff>) {
 }
 fn armor_pts_of(inv: &HashMap<i16, Stack>) -> i32 {
     let mut pts = 0i32;
-    let slots: [(i16, &[(&str, i32)]); 4] = [
-        (
-            5,
-            &[
-                ("leather_helmet", 1),
-                ("golden_helmet", 2),
-                ("chainmail_helmet", 2),
-                ("iron_helmet", 2),
-                ("diamond_helmet", 3),
-                ("netherite_helmet", 3),
-                ("turtle_helmet", 2),
-            ],
-        ),
-        (
-            6,
-            &[
-                ("leather_chestplate", 3),
-                ("golden_chestplate", 5),
-                ("chainmail_chestplate", 5),
-                ("iron_chestplate", 6),
-                ("diamond_chestplate", 8),
-                ("netherite_chestplate", 8),
-                ("elytra", 0),
-            ],
-        ),
-        (
-            7,
-            &[
-                ("leather_leggings", 2),
-                ("golden_leggings", 3),
-                ("chainmail_leggings", 4),
-                ("iron_leggings", 5),
-                ("diamond_leggings", 6),
-                ("netherite_leggings", 6),
-            ],
-        ),
-        (
-            8,
-            &[
-                ("leather_boots", 1),
-                ("golden_boots", 1),
-                ("chainmail_boots", 1),
-                ("iron_boots", 2),
-                ("diamond_boots", 3),
-                ("netherite_boots", 3),
-            ],
-        ),
+    let slots = [
+        (5i16, ItemAttrSlotGroup::Head),
+        (6, ItemAttrSlotGroup::Chest),
+        (7, ItemAttrSlotGroup::Legs),
+        (8, ItemAttrSlotGroup::Feet),
     ];
     let mut pairs: Vec<(ItemAttrSlotGroup, &Stack)> = Vec::new();
-    for ((slot, mats), grp) in slots.iter().zip([
-        ItemAttrSlotGroup::Head,
-        ItemAttrSlotGroup::Chest,
-        ItemAttrSlotGroup::Legs,
-        ItemAttrSlotGroup::Feet,
-    ]) {
-        if let Some(st @ (item, _, comps)) = inv.get(slot) {
+    for (slot, grp) in slots {
+        if let Some(st @ (item, _, comps)) = inv.get(&slot) {
             // An explicit attribute_modifiers component replaces the piece's
             // vanilla default, so the table points only count without one.
             if comp_get(comps, COMP_ATTRIBUTE_MODIFIERS).is_none() {
-                for &(n, p) in *mats {
-                    if name_to_item(n) == Some(*item) {
-                        pts += p
-                    }
-                }
+                pts += armor_piece_row(*item, Some(grp)).map_or(0, |r| r.2);
             }
             pairs.push((grp, st));
         }
@@ -2892,13 +2807,13 @@ fn mob_hurt_window_tick() {
     let now_tick = TICK_IDX.load(Ordering::Relaxed);
     let now = Instant::now();
     let reg = breg();
-    for mob in mobs().lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for mob in lk(mobs()).iter() {
         // `LayeredCauldronBlock.entityInside`: a burning entity standing in a
         // water or powder-snow cauldron is extinguished; water drops a level
         // (level 1 empties) and powder snow becomes water at the same level.
-        if *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0 {
+        if *lk(&mob.fire_ticks) > 0 {
             if let Some(reg) = reg {
-                let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let (mx, my, mz, ..) = *lk(&mob.pos);
                 let (bx, by, bz) = (mx.floor() as i32, my.floor() as i32, mz.floor() as i32);
                 let st = block_at_dim(mob.dim, bx, by, bz);
                 if let Some(state) = cauldron_state_of(reg, st) {
@@ -2908,13 +2823,13 @@ fn mob_hurt_window_tick() {
                             set_block_dim(mob.dim, bx, by, bz, next);
                             note_block_update_dim(mob.dim, bx, by, bz, next);
                         }
-                        *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+                        *lk(&mob.fire_ticks) = 0;
                     }
                 }
             }
         }
-        let mut hurt_tick = mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner());
-        let mut hurt_at = mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hurt_tick = lk(&mob.last_hurt_tick);
+        let mut hurt_at = lk(&mob.hurt_at);
         match *hurt_tick {
             Some(t) if now_tick.saturating_sub(t) < MOB_HURT_WINDOW_GT => {
                 *hurt_at = now + Duration::from_secs(3600);
@@ -2938,7 +2853,7 @@ fn apply_arrow_punch(mob: &Mob, dx: f64, dz: f64, level: i32) {
     let speed = dx.hypot(dz).max(0.01);
     let distance = 0.3 * f64::from(level);
     let (x, y, z, yaw, pitch) = {
-        let mut pos = mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pos = lk(&mob.pos);
         pos.0 += dx / speed * distance;
         pos.2 += dz / speed * distance;
         *pos
@@ -2946,19 +2861,521 @@ fn apply_arrow_punch(mob: &Mob, dx: f64, dz: f64, level: i32) {
     broadcast_seen(mob.eid, |_| (0x70, entity_teleport(mob.eid, x, y, z, yaw, pitch, true)));
 }
 
+/// (victim eid, dmg, arrow x, z, owner eid, kind, custom-named stack)
+type ArrowHit = (i32, f32, f64, f64, i32, u8, Option<String>);
+
+/// Trident pre-flight gate for `arrow_tick`: Loyalty return flight and the
+/// first-observation Riptide resolve. `true` means the projectile was consumed
+/// this tick (the caller's `continue`).
+fn arrow_trident_gate(
+    a: &mut Arrow,
+    eid: i32,
+    dead: &mut Vec<i32>,
+    returning: &mut HashSet<i32>,
+    seen_tridents: &mut HashSet<i32>,
+) -> bool {
+    // Loyalty return flight (`ThrownTrident` after `dealtDamage`):
+    // `vel = vel*0.01 + dir(owner_eye)*0.05*loyalty` — no dimension
+    // floor gates it, so a trident below `min_y` still comes home.
+    if returning.contains(&eid) {
+        let owner_pos = lk(clients())
+            .iter()
+            .find(|c| c.eid == a.owner)
+            .map(|c| {
+                let p = lk(&c.pos);
+                (p.0, p.1 + 0.9, p.2)
+            });
+        let Some((ox, oy, oz)) = owner_pos else {
+            returning.remove(&eid);
+            dead.push(eid);
+            return true;
+        };
+        let eval = evaluate_trident_special(&TridentSpecialCtx {
+            loyalty: a.loy,
+            trident: [a.x, a.y, a.z],
+            owner: [ox, oy, oz],
+            ..Default::default()
+        });
+        let d = [ox - a.x, oy - a.y, oz - a.z];
+        let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if n <= 1.0 {
+            returning.remove(&eid);
+            dead.push(eid);
+            return true;
+        }
+        let imp = eval.loyalty_return.unwrap_or([0.0; 3]);
+        a.dx = a.dx * 0.01 + imp[0];
+        a.dy = a.dy * 0.01 + imp[1];
+        a.dz = a.dz * 0.01 + imp[2];
+        a.x += a.dx;
+        a.y += a.dy;
+        a.z += a.dz;
+        let (ax, ay, az) = (a.x, a.y, a.z);
+        broadcast_seen(eid, |_c| {
+            (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+        });
+        return true;
+    }
+    // Riptide resolves the first tick the projectile is observed:
+    // vanilla `releaseUsing` never spawns one — the thrower is
+    // propelled along the look vector (wet-only) and keeps the item.
+    if seen_tridents.insert(eid) {
+        let riptide = enchant_level(&a.ret_comps, 31);
+        if (1..=3).contains(&riptide) {
+            let owner = lk(clients())
+                .iter()
+                .find(|c| c.eid == a.owner)
+                .cloned();
+            if let Some(oc) = owner {
+                let (x, y, z, yaw, pitch, on_ground) = *lk(&oc.pos);
+                let (yr, pr) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
+                let eval = evaluate_trident_special(&TridentSpecialCtx {
+                    riptide,
+                    wet: trident_thrower_wet(&oc),
+                    on_ground,
+                    look: [
+                        -yr.sin() * pr.cos(),
+                        -pr.sin(),
+                        yr.cos() * pr.cos(),
+                    ],
+                    ..Default::default()
+                });
+                if let RiptideOutcome::Launch(launch) = eval.riptide {
+                    let pkt = velocity_pkt(
+                        oc.eid,
+                        (launch.velocity[0] * 8000.0) as i16,
+                        (launch.velocity[1] * 8000.0) as i16,
+                        (launch.velocity[2] * 8000.0) as i16,
+                    );
+                    if let Ok(mut w) = oc.sock.lock() {
+                        let _ = send_packet(&mut w, 0x5a, pkt.clone());
+                    }
+                    broadcast_seen_ex(oc.eid, oc.eid, |_c| (0x5a, pkt.clone()));
+                    lk(riptide_spin()).insert(
+                        oc.eid,
+                        TICK_IDX.load(Ordering::Relaxed) + server_ticks(u64::from(launch.spin_ticks)),
+                    );
+                    if launch.ground_boost > 0.0 {
+                        let mut p = lk(&oc.pos);
+                        p.1 += launch.ground_boost;
+                    }
+                    let snd = sound_pkt_named("entity.generic.explode", x, y, z);
+                    broadcast_seen(oc.eid, |_c| (0x68, snd.clone()));
+                }
+                // Refused launches also never leave the hand.
+                trident_restore(&oc, a.ret_item, &a.ret_comps);
+                a.ret_item = 0;
+                dead.push(eid);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Stuck-arrow TTL countdown and the survival pickup pass
+/// (`AbstractArrow.tryPickup`). Always consumes the tick.
+fn arrow_stuck_step(a: &mut Arrow, eid: i32, adim: DimId, dead: &mut Vec<i32>) {
+    a.ttl -= 1;
+    if a.ttl <= 0 {
+        dead.push(eid);
+        return;
+    }
+    // `intangible_projectile` arrows (pillager shots) are never
+    // picked up: vanilla `AbstractArrow.tryPickup` refuses them.
+    if comp_get(&a.ret_comps, COMP_INTANGIBLE_PROJECTILE).is_some() {
+        return;
+    }
+    // Vanilla: a stuck arrow is picked up on contact (survival only).
+    let (ax, ay, az) = (a.x, a.y, a.z);
+    let grab = {
+        lk(clients())
+            .iter()
+            .filter(|c| *lk(&c.gm) != 1)
+            .find(|c| {
+                if *lk(&c.dim) != adim {
+                    return false;
+                }
+                let p = lk(&c.pos);
+                let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
+                dx * dx + dy * dy + dz * dz < 1.3
+            })
+            .cloned()
+    };
+    if let Some(c) = grab {
+        let slot: i16 = {
+            let mut inv = lk(&c.inv);
+            let slot: i16 = (9..=44i16)
+                .find(|sl| {
+                    inv.get(sl)
+                        .map(|(i, c2, _)| *i == 802 && *c2 < 64)
+                        .unwrap_or(false)
+                })
+                .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)))
+                .unwrap_or(9);
+            let mut st = inv.get(&slot).cloned().unwrap_or((802, 0, Vec::new()));
+            st.1 += 1;
+            inv.insert(slot, st);
+            slot
+        };
+        let st = lk(&c.inv)
+            .get(&slot)
+            .cloned()
+            .unwrap_or((802, 1, Vec::new()));
+        let mut p = vec![0u8];
+        write_varint(&mut p, i64::from(inv_state_next(&c)));
+        p.extend_from_slice(&slot.to_be_bytes());
+        p.extend_from_slice(&slot_wire(&st));
+        if let Ok(mut w) = c.sock.lock() {
+            let _ = send_packet(&mut w, 0x15, p);
+        }
+        dead.push(eid);
+    }
+}
+
+/// One tick of arrow flight: drag, gravity, integration, block collision and
+/// the position broadcast. `Some` carries `(segment_start, segment_end, x, z)`
+/// for the hit tests; `None` means the arrow stuck or died this tick.
+fn arrow_flight_step(
+    a: &mut Arrow,
+    eid: i32,
+    adim: DimId,
+    dead: &mut Vec<i32>,
+    returning: &mut HashSet<i32>,
+) -> Option<([f64; 3], [f64; 3], f64, f64)> {
+    // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
+    // integrate position from that velocity. Applying drag to the
+    // displacement instead would leave the horizontal velocity undamped.
+    a.dx *= 0.99;
+    a.dy *= 0.99;
+    a.dz *= 0.99;
+    a.dy -= 0.05;
+    a.x += a.dx;
+    a.y += a.dy;
+    a.z += a.dz;
+    let (ax, ay, az) = (a.x, a.y, a.z);
+    let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
+    let segment_end = [ax, ay, az];
+    // block collision: arrows stick into solid blocks (vanilla)
+    let bst = block_at_dim(adim, ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
+    if bst != 0 && !mob_passable(bst) {
+        // tridents stick like arrows in vanilla too, but our trident
+        // return path handles its own landing — only plain arrows stick
+        if a.kind == 1 {
+            if a.loy > 0 {
+                returning.insert(eid);
+            } else {
+                dead.push(eid);
+            }
+        } else {
+            a.stuck = true;
+            a.ttl = server_ticks(ARROW_TTL_GT) as i32;
+            a.dx = 0.0;
+            a.dy = 0.0;
+            a.dz = 0.0;
+        }
+        return None;
+    }
+    broadcast_seen(eid, |_c| {
+        (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
+    });
+    Some((segment_start, segment_end, ax, az))
+}
+
+/// Channeling gate for a trident mob hit: thunder and open sky above the
+/// struck position (punch carries the enchant level for kind==1).
+fn arrow_channeling_hit(a: &Arrow, mx: f64, my: f64, mz: f64, adim: DimId) -> bool {
+    a.kind == 1
+        && a.punch > 0
+        && evaluate_trident_special(&TridentSpecialCtx {
+            channeling: i64::from(a.punch),
+            thundering: THUNDERING.load(Ordering::Relaxed) > 0,
+            open_sky: THUNDERING.load(Ordering::Relaxed) > 0
+                && can_see_sky(
+                    adim,
+                    mx.floor() as i32,
+                    my.floor() as i32,
+                    mz.floor() as i32,
+                ),
+            ..Default::default()
+        })
+        .channeling_lightning
+}
+
+/// The lightning a channeling trident calls on a mob hit: 5 damage, a creeper
+/// fuse and the thunder/bolt packets.
+fn arrow_channeling_effect(m: &Mob, mx: f64, my: f64, mz: f64) {
+    *lk(&m.hp) -= 5.0;
+    *lk(&m.fuse) = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
+    let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    lk(bolts()).push((be, server_ticks(BOLT_LIFE_GT) as i32));
+    broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
+    let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
+    broadcast(-1, |_c| (0x68, ts.clone()));
+}
+
+/// Damage, fire, punch, channeling and death bookkeeping for a player-shot
+/// projectile connecting with `m`, then the arrow's pierce/loyalty/stick fate.
+#[expect(clippy::too_many_arguments, reason = "preserve the established projectile hit call shape")]
+fn arrow_strike_mob(
+    a: &mut Arrow,
+    eid: i32,
+    adim: DimId,
+    m: &Mob,
+    mx: f64,
+    my: f64,
+    mz: f64,
+    dead: &mut Vec<i32>,
+    mob_dead: &mut Vec<(i32, i64, f64, f64, f64)>,
+    returning: &mut HashSet<i32>,
+) {
+    let kind = match a.kind {
+        0 => BossHit::Arrow,
+        1 => BossHit::Trident,
+        _ => BossHit::Other,
+    };
+    if !live_mob_hit_allowed(m, a.owner, kind) {
+        dead.push(eid);
+        return;
+    }
+    // Mod-suite `EntityDamagePre` for the struck mob: a
+    // cancelled hit is consumed like any other impact
+    // but deals nothing.
+    let Some(dmg) = live_mod_entity_damage_pre(a.dmg) else {
+        if a.pierce > 0 {
+            a.pierce -= 1;
+            a.last_hit = m.eid;
+        } else if a.kind == 1 && a.loy > 0 {
+            returning.insert(eid);
+        } else {
+            dead.push(eid);
+        }
+        return;
+    };
+    *lk(&m.hurt_at) = Instant::now();
+    *lk(&m.last_hurt_tick) = Some(TICK_IDX.load(Ordering::Relaxed));
+    let dh = {
+        let mut h = lk(&m.hp);
+        *h -= dmg;
+        *h
+    };
+    if a.fire > 0 && !mob_fire_immune(m.etype) {
+        *lk(&m.fire_ticks) = a.fire;
+        ignite_mob(m.eid, a.fire.max(0) as u32);
+    }
+    if a.punch > 0 && a.kind == 0 {
+        apply_arrow_punch(m, a.dx, a.dz, a.punch);
+    }
+    broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
+    if arrow_channeling_hit(a, mx, my, mz, adim) {
+        arrow_channeling_effect(m, mx, my, mz);
+    }
+    if dh <= 0.0 {
+        mob_dead.push((m.eid, m.etype, mx, my, mz));
+        let on = lk(clients())
+            .iter()
+            .find(|c| c.eid == a.owner)
+            .map(|c| c.name.clone());
+        if let Some(on) = on {
+            adv_event(&on, "player_killed_entity", Some(m.etype));
+        }
+    }
+    if a.pierce > 0 {
+        a.pierce -= 1;
+        a.last_hit = m.eid;
+    } else if a.kind == 1 && a.loy > 0 {
+        returning.insert(eid);
+    } else {
+        dead.push(eid);
+    }
+}
+
+/// Player-shot projectile vs the mob store: the first segment contact wins
+/// and resolves the arrow (pierce aside).
+fn arrow_hit_mobs(
+    a: &mut Arrow,
+    eid: i32,
+    adim: DimId,
+    shot: ([f64; 3], [f64; 3], f64, f64),
+    dead: &mut Vec<i32>,
+    mob_dead: &mut Vec<(i32, i64, f64, f64, f64)>,
+    returning: &mut HashSet<i32>,
+) {
+    // Player-shot arrow: intersect the whole segment with mobs and
+    // other players. The owner and last pierced target are skipped.
+    let ml = lk(mobs());
+    for m in ml.iter() {
+        if m.eid == a.last_hit || m.dim != adim {
+            continue;
+        }
+        let (mx, my, mz, ..) = *lk(&m.pos);
+        if projectile_segment_hits(shot.0, shot.1, (mx, my, mz), 1.2, 0.4, 2.1) {
+            arrow_strike_mob(a, eid, adim, m, mx, my, mz, dead, mob_dead, returning);
+            break;
+        }
+    }
+}
+
+/// Projectile vs players. `owned` marks a player shot (skips the owner and
+/// the last pierced target, honours pierce); mob-owned shots take the first
+/// contact without pierce bookkeeping.
+#[expect(clippy::too_many_arguments, reason = "preserve the established projectile hit call shape")]
+fn arrow_hit_players(
+    a: &mut Arrow,
+    eid: i32,
+    adim: DimId,
+    shot: ([f64; 3], [f64; 3], f64, f64),
+    dead: &mut Vec<i32>,
+    hits: &mut Vec<ArrowHit>,
+    returning: &mut HashSet<i32>,
+    owned: bool,
+) {
+    for c in client_snapshot().iter() {
+        if owned && c.eid == a.owner {
+            continue;
+        }
+        if *lk(&c.dim) != adim {
+            continue;
+        }
+        let (px, py, pz, ..) = *lk(&c.pos);
+        if owned && c.eid == a.last_hit {
+            continue;
+        }
+        if !projectile_segment_hits(shot.0, shot.1, (px, py, pz), 0.7, 0.3, 2.0) {
+            continue;
+        }
+        hits.push((
+            c.eid,
+            a.dmg,
+            shot.2,
+            shot.3,
+            a.owner,
+            a.kind,
+            renamed_custom_name(&a.ret_comps),
+        ));
+        if owned && a.pierce > 0 {
+            a.pierce -= 1;
+            a.last_hit = c.eid;
+        } else if a.kind == 1 && a.loy > 0 {
+            returning.insert(eid);
+        } else {
+            dead.push(eid);
+        }
+        break;
+    }
+}
+
+/// Thrown tridents land as pickupable drops; loyalty returns at the owner's feet.
+fn arrow_land_tridents(
+    ar: &mut Vec<Arrow>,
+    dead: &[i32],
+    returning: &mut HashSet<i32>,
+    seen_tridents: &mut HashSet<i32>,
+) {
+    let landed: Vec<(i32, f64, f64, f64, i64, i64, Comps)> = ar
+        .iter()
+        .filter(|a| dead.contains(&a.eid) && a.ret_item > 0)
+        .map(|a| {
+            (
+                a.owner,
+                a.x,
+                a.y,
+                a.z,
+                a.loy,
+                a.ret_item,
+                a.ret_comps.clone(),
+            )
+        })
+        .collect();
+    ar.retain(|a| !dead.contains(&a.eid));
+    returning.retain(|eid| ar.iter().any(|a| a.eid == *eid));
+    seen_tridents.retain(|eid| ar.iter().any(|a| a.eid == *eid));
+    for (ow, lx, ly, lz, loy, ri, rc) in landed {
+        let (tx, ty, tz) = if loy > 0 {
+            lk(clients())
+                .iter()
+                .find(|c| c.eid == ow)
+                .map(|c| {
+                    let p = lk(&c.pos);
+                    (p.0, p.1, p.2)
+                })
+                .unwrap_or((lx, ly, lz))
+        } else {
+            (lx, ly, lz)
+        };
+        drop_spawn(tx, ty, tz, ri, 1, rc, 0, None, None);
+    }
+}
+
+/// One recorded projectile hit on a player victim: shield gate,
+/// invulnerability, absorption/armor/totem and the hurt+health packets,
+/// then the vanilla death line when the hit killed.
+fn arrow_apply_hit(
+    veid: i32,
+    admg: f32,
+    ax: f64,
+    az: f64,
+    owner_eid: i32,
+    proj_kind: u8,
+    proj_weapon: Option<&str>,
+) {
+    let cls: Vec<Arc<Client>> = client_snapshot();
+    let Some(c) = cls.iter().find(|c| c.eid == veid) else {
+        return;
+    };
+    if *lk(&c.gm) == 1 {
+        return;
+    }
+    // Mod-suite `EntityDamagePre` for the struck player: a cancelled
+    // hit skips this victim entirely.
+    let Some(admg) = live_mod_entity_damage_pre(admg) else {
+        return;
+    };
+    // the evaluator's raise clock already tracks `blocking` — a lowered
+    // shield reports 0 raised ticks, below the warmup gate
+    let eval = evaluate_shield_block(&shield_hit_ctx(c, [ax, 0.0, az], admg));
+    let blocked_ar = eval.blocked && *lk(&c.blocking);
+    // a rejected hit must not cost shield durability (vanilla returns before that)
+    let Some((ad, _)) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
+    else {
+        return;
+    };
+    if blocked_ar {
+        damage_shield_attempts(c, eval.durability_attempts);
+    }
+    let hh = player_hurt_apply(c, ad, Some(0), (ad > 0.0).then_some(ad));
+    let vname = c.name.clone();
+    // Vanilla `DamageSource` attribution: the shooter's display name
+    // fills the attacker's message slot; a mob-owned projectile
+    // (owner < 0) is the skeleton that loosed it.
+    let attacker = if owner_eid >= 0 {
+        cls.iter().find(|p| p.eid == owner_eid).map(|p| p.name.clone())
+    } else {
+        Some("Skeleton".to_owned())
+    };
+    broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
+    if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
+        let line = system_chat(&format_vanilla_death_message(
+            &vname,
+            if proj_kind == 1 { "trident" } else { "arrow" },
+            attacker.as_deref(),
+            proj_weapon,
+        ));
+        broadcast(-1, |_c| (0x6c, line.clone()));
+    }
+}
+
 fn arrow_tick() {
     mob_hurt_window_tick();
     combat2_state_tick();
     let mut dead: Vec<i32> = vec![];
-    // (victim eid, dmg, arrow x, z, owner eid, kind, custom-named stack)
-    type ArrowHit = (i32, f32, f64, f64, i32, u8, Option<String>);
     let mut hits: Vec<ArrowHit> = vec![];
     let mut mob_dead: Vec<(i32, i64, f64, f64, f64)> = vec![];
     {
-        let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+        let mut ar = lk(arrows());
         let region = region_guard();
-        let mut returning = trident_returning().lock().unwrap_or_else(|e| e.into_inner());
-        let mut seen_tridents = trident_seen().lock().unwrap_or_else(|e| e.into_inner());
+        let mut returning = lk(trident_returning());
+        let mut seen_tridents = lk(trident_seen());
         for a in ar.iter_mut() {
             let eid = a.eid;
             // The projectile's own dimension: block probes, target filters and
@@ -2967,441 +3384,28 @@ fn arrow_tick() {
             if !region.is_hot(a.x as i32, a.z as i32) {
                 continue;
             }
-            if a.kind == 1 {
-                // Loyalty return flight (`ThrownTrident` after `dealtDamage`):
-                // `vel = vel*0.01 + dir(owner_eye)*0.05*loyalty` — no dimension
-                // floor gates it, so a trident below `min_y` still comes home.
-                if returning.contains(&eid) {
-                    let owner_pos = clients()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .find(|c| c.eid == a.owner)
-                        .map(|c| {
-                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            (p.0, p.1 + 0.9, p.2)
-                        });
-                    let Some((ox, oy, oz)) = owner_pos else {
-                        returning.remove(&eid);
-                        dead.push(eid);
-                        continue;
-                    };
-                    let eval = evaluate_trident_special(&TridentSpecialCtx {
-                        loyalty: a.loy,
-                        trident: [a.x, a.y, a.z],
-                        owner: [ox, oy, oz],
-                        ..Default::default()
-                    });
-                    let d = [ox - a.x, oy - a.y, oz - a.z];
-                    let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    if n <= 1.0 {
-                        returning.remove(&eid);
-                        dead.push(eid);
-                        continue;
-                    }
-                    let imp = eval.loyalty_return.unwrap_or([0.0; 3]);
-                    a.dx = a.dx * 0.01 + imp[0];
-                    a.dy = a.dy * 0.01 + imp[1];
-                    a.dz = a.dz * 0.01 + imp[2];
-                    a.x += a.dx;
-                    a.y += a.dy;
-                    a.z += a.dz;
-                    let (ax, ay, az) = (a.x, a.y, a.z);
-                    broadcast_seen(eid, |_c| {
-                        (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
-                    });
-                    continue;
-                }
-                // Riptide resolves the first tick the projectile is observed:
-                // vanilla `releaseUsing` never spawns one — the thrower is
-                // propelled along the look vector (wet-only) and keeps the item.
-                if seen_tridents.insert(eid) {
-                    let riptide = enchant_level(&a.ret_comps, 31);
-                    if (1..=3).contains(&riptide) {
-                        let owner = clients()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .iter()
-                            .find(|c| c.eid == a.owner)
-                            .cloned();
-                        if let Some(oc) = owner {
-                            let (x, y, z, yaw, pitch, on_ground) =
-                                *oc.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            let (yr, pr) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
-                            let eval = evaluate_trident_special(&TridentSpecialCtx {
-                                riptide,
-                                wet: trident_thrower_wet(&oc),
-                                on_ground,
-                                look: [
-                                    -yr.sin() * pr.cos(),
-                                    -pr.sin(),
-                                    yr.cos() * pr.cos(),
-                                ],
-                                ..Default::default()
-                            });
-                            if let RiptideOutcome::Launch(launch) = eval.riptide {
-                                let pkt = velocity_pkt(
-                                    oc.eid,
-                                    (launch.velocity[0] * 8000.0) as i16,
-                                    (launch.velocity[1] * 8000.0) as i16,
-                                    (launch.velocity[2] * 8000.0) as i16,
-                                );
-                                if let Ok(mut w) = oc.sock.lock() {
-                                    let _ = send_packet(&mut w, 0x5a, pkt.clone());
-                                }
-                                broadcast_seen_ex(oc.eid, oc.eid, |_c| (0x5a, pkt.clone()));
-                                riptide_spin()
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .insert(
-                                        oc.eid,
-                                        TICK_IDX.load(Ordering::Relaxed)
-                                            + server_ticks(u64::from(launch.spin_ticks)),
-                                    );
-                                if launch.ground_boost > 0.0 {
-                                    let mut p = oc.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                    p.1 += launch.ground_boost;
-                                }
-                                let snd = sound_pkt_named("entity.generic.explode", x, y, z);
-                                broadcast_seen(oc.eid, |_c| (0x68, snd.clone()));
-                            }
-                            // Refused launches also never leave the hand.
-                            trident_restore(&oc, a.ret_item, &a.ret_comps);
-                            a.ret_item = 0;
-                            dead.push(eid);
-                            continue;
-                        }
-                    }
-                }
+            if a.kind == 1
+                && arrow_trident_gate(a, eid, &mut dead, &mut returning, &mut seen_tridents)
+            {
+                continue;
             }
             if a.stuck {
-                a.ttl -= 1;
-                if a.ttl <= 0 {
-                    dead.push(eid);
-                    continue;
-                }
-                // `intangible_projectile` arrows (pillager shots) are never
-                // picked up: vanilla `AbstractArrow.tryPickup` refuses them.
-                if comp_get(&a.ret_comps, COMP_INTANGIBLE_PROJECTILE).is_some() {
-                    continue;
-                }
-                // Vanilla: a stuck arrow is picked up on contact (survival only).
-                let (ax, ay, az) = (a.x, a.y, a.z);
-                let grab = {
-                    clients()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .filter(|c| *c.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1)
-                        .find(|c| {
-                            if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
-                                return false;
-                            }
-                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            let (dx, dy, dz) = (p.0 - ax, (p.1 + 0.9) - ay, p.2 - az);
-                            dx * dx + dy * dy + dz * dz < 1.3
-                        })
-                        .cloned()
-                };
-                if let Some(c) = grab {
-                    let mut inv = c.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    let slot: i16 = (9..=44i16)
-                        .find(|sl| {
-                            inv.get(sl)
-                                .map(|(i, c2, _)| *i == 802 && *c2 < 64)
-                                .unwrap_or(false)
-                        })
-                        .or_else(|| (9..=44).find(|sl| !inv.contains_key(sl)))
-                        .unwrap_or(9);
-                    let mut st = inv.get(&slot).cloned().unwrap_or((802, 0, Vec::new()));
-                    st.1 += 1;
-                    inv.insert(slot, st);
-                    drop(inv);
-                    let st =
-                        c.inv
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&slot)
-                            .cloned()
-                            .unwrap_or((802, 1, Vec::new()));
-                    let mut p = vec![0u8];
-                    write_varint(&mut p, i64::from(inv_state_next(&c)));
-                    p.extend_from_slice(&slot.to_be_bytes());
-                    p.extend_from_slice(&slot_wire(&st));
-                    if let Ok(mut w) = c.sock.lock() {
-                        let _ = send_packet(&mut w, 0x15, p);
-                    }
-                    dead.push(eid);
-                }
+                arrow_stuck_step(a, eid, adim, &mut dead);
                 continue;
             }
-            // vanilla AbstractArrow: scale the velocity by 0.99, add -0.05, then
-            // integrate position from that velocity. Applying drag to the
-            // displacement instead would leave the horizontal velocity undamped.
-            a.dx *= 0.99;
-            a.dy *= 0.99;
-            a.dz *= 0.99;
-            a.dy -= 0.05;
-            a.x += a.dx;
-            a.y += a.dy;
-            a.z += a.dz;
-            let (ax, ay, az) = (a.x, a.y, a.z);
-            let segment_start = [ax - a.dx, ay - a.dy, az - a.dz];
-            let segment_end = [ax, ay, az];
-            // block collision: arrows stick into solid blocks (vanilla)
-            let bst =
-                block_at_dim(adim, ax.floor() as i32, ay.floor() as i32, az.floor() as i32);
-            if bst != 0 && !mob_passable(bst) {
-                // tridents stick like arrows in vanilla too, but our trident
-                // return path handles its own landing — only plain arrows stick
-                if a.kind == 1 {
-                    if a.loy > 0 {
-                        returning.insert(eid);
-                    } else {
-                        dead.push(eid);
-                    }
-                } else {
-                    a.stuck = true;
-                    a.ttl = server_ticks(ARROW_TTL_GT) as i32;
-                    a.dx = 0.0;
-                    a.dy = 0.0;
-                    a.dz = 0.0;
-                }
+            let Some(shot) = arrow_flight_step(a, eid, adim, &mut dead, &mut returning) else {
                 continue;
-            }
-            broadcast_seen(eid, |_c| {
-                (0x70, entity_teleport(eid, ax, ay, az, 0.0, 0.0, true))
-            });
-            if a.owner >= 0 {
-                // Player-shot arrow: intersect the whole segment with mobs and
-                // other players. The owner and last pierced target are skipped.
-                let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                'outer: for m in ml.iter() {
-                    if m.eid == a.last_hit || m.dim != adim {
-                        continue;
-                    }
-                    let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    if projectile_segment_hits(
-                        segment_start,
-                        segment_end,
-                        (mx, my, mz),
-                        1.2,
-                        0.4,
-                        2.1,
-                    ) {
-                        let kind = match a.kind {
-                            0 => BossHit::Arrow,
-                            1 => BossHit::Trident,
-                            _ => BossHit::Other,
-                        };
-                        if !live_mob_hit_allowed(m, a.owner, kind) {
-                            dead.push(eid);
-                            break;
-                        }
-                        // Mod-suite `EntityDamagePre` for the struck mob: a
-                        // cancelled hit is consumed like any other impact
-                        // but deals nothing.
-                        let Some(dmg) = live_mod_entity_damage_pre(a.dmg) else {
-                            if a.pierce > 0 {
-                                a.pierce -= 1;
-                                a.last_hit = m.eid;
-                            } else if a.kind == 1 && a.loy > 0 {
-                                returning.insert(eid);
-                            } else {
-                                dead.push(eid);
-                            }
-                            break 'outer;
-                        };
-                        *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                        *m.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) =
-                            Some(TICK_IDX.load(Ordering::Relaxed));
-                        let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                        *h -= dmg;
-                        let dh = *h;
-                        drop(h);
-                        if a.fire > 0 && !mob_fire_immune(m.etype) {
-                            *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = a.fire;
-                            ignite_mob(m.eid, a.fire.max(0) as u32);
-                        }
-                        if a.punch > 0 && a.kind == 0 {
-                            apply_arrow_punch(m, a.dx, a.dz, a.punch);
-                        }
-                        broadcast_seen(m.eid, |_c| (0x24, hurt_anim(m.eid)));
-                        // channeling: trident hit in thunder calls lightning
-                        // (punch slot carries the level for kind==1) — only
-                        // with open sky above the hit (vanilla canSeeSky)
-                        let channeling_hit = a.kind == 1
-                            && a.punch > 0
-                            && evaluate_trident_special(&TridentSpecialCtx {
-                                channeling: i64::from(a.punch),
-                                thundering: THUNDERING.load(Ordering::Relaxed) > 0,
-                                open_sky: THUNDERING.load(Ordering::Relaxed) > 0
-                                    && can_see_sky(
-                                        adim,
-                                        mx.floor() as i32,
-                                        my.floor() as i32,
-                                        mz.floor() as i32,
-                                    ),
-                                ..Default::default()
-                            })
-                            .channeling_lightning;
-                        if channeling_hit {
-                            {
-                                let mut h2 = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                *h2 -= 5.0;
-                            }
-                            *m.fuse.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(CREEPER_FUSE_GT) as i32; // ignite ~5s
-                            let be = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                            bolts()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push((be, server_ticks(BOLT_LIFE_GT) as i32));
-                            broadcast(-1, |_c| (0x01, spawn_typed_pkt(be, 64, mx, my, mz)));
-                            let ts = sound_pkt_named("entity.lightning_bolt.thunder", mx, my, mz);
-                            broadcast(-1, |_c| (0x68, ts.clone()));
-                        }
-                        if dh <= 0.0 {
-                            mob_dead.push((m.eid, m.etype, mx, my, mz));
-                            let on = clients()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .iter()
-                                .find(|c| c.eid == a.owner)
-                                .map(|c| c.name.clone());
-                            if let Some(on) = on {
-                                adv_event(&on, "player_killed_entity", Some(m.etype));
-                            }
-                        }
-                        if a.pierce > 0 {
-                            a.pierce -= 1;
-                            a.last_hit = m.eid;
-                        } else if a.kind == 1 && a.loy > 0 {
-                            returning.insert(eid);
-                        } else {
-                            dead.push(eid);
-                        }
-                        break 'outer;
-                    }
-                }
-                drop(ml);
-                if !dead.contains(&eid) {
-                    let cls: Vec<Arc<Client>> = client_snapshot();
-                    'p2: for c in cls.iter() {
-                        if c.eid == a.owner {
-                            continue;
-                        }
-                        if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
-                            continue;
-                        }
-                        let (px, py, pz, ..) = {
-                            let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            *p
-                        };
-                        if c.eid == a.last_hit {
-                            continue;
-                        }
-                        if projectile_segment_hits(
-                            segment_start,
-                            segment_end,
-                            (px, py, pz),
-                            0.7,
-                            0.3,
-                            2.0,
-                        ) {
-                            hits.push((
-                                c.eid,
-                                a.dmg,
-                                ax,
-                                az,
-                                a.owner,
-                                a.kind,
-                                renamed_custom_name(&a.ret_comps),
-                            ));
-                            if a.pierce > 0 {
-                                a.pierce -= 1;
-                                a.last_hit = c.eid;
-                            } else if a.kind == 1 && a.loy > 0 {
-                                returning.insert(eid);
-                            } else {
-                                dead.push(eid);
-                            }
-                            break 'p2;
-                        }
-                    }
-                }
-            } else {
-                let cls: Vec<Arc<Client>> = client_snapshot();
-                for c in cls.iter() {
-                    if *c.dim.lock().unwrap_or_else(|e| e.into_inner()) != adim {
-                        continue;
-                    }
-                    let (px, py, pz, ..) = {
-                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        *p
-                    };
-                    if projectile_segment_hits(
-                        segment_start,
-                        segment_end,
-                        (px, py, pz),
-                        0.7,
-                        0.3,
-                        2.0,
-                    ) {
-                        hits.push((
-                            c.eid,
-                            a.dmg,
-                            ax,
-                            az,
-                            a.owner,
-                            a.kind,
-                            renamed_custom_name(&a.ret_comps),
-                        ));
-                        if a.kind == 1 && a.loy > 0 {
-                            returning.insert(eid);
-                        } else {
-                            dead.push(eid);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-        // thrown tridents land as pickupable drops; loyalty returns at owner's feet
-        let landed: Vec<(i32, f64, f64, f64, i64, i64, Comps)> = ar
-            .iter()
-            .filter(|a| dead.contains(&a.eid) && a.ret_item > 0)
-            .map(|a| {
-                (
-                    a.owner,
-                    a.x,
-                    a.y,
-                    a.z,
-                    a.loy,
-                    a.ret_item,
-                    a.ret_comps.clone(),
-                )
-            })
-            .collect();
-        ar.retain(|a| !dead.contains(&a.eid));
-        returning.retain(|eid| ar.iter().any(|a| a.eid == *eid));
-        seen_tridents.retain(|eid| ar.iter().any(|a| a.eid == *eid));
-        for (ow, lx, ly, lz, loy, ri, rc) in landed {
-            let (tx, ty, tz) = if loy > 0 {
-                clients()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .iter()
-                    .find(|c| c.eid == ow)
-                    .map(|c| {
-                        let p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        (p.0, p.1, p.2)
-                    })
-                    .unwrap_or((lx, ly, lz))
-            } else {
-                (lx, ly, lz)
             };
-            drop_spawn(tx, ty, tz, ri, 1, rc, 0, None, None);
+            if a.owner >= 0 {
+                arrow_hit_mobs(a, eid, adim, shot, &mut dead, &mut mob_dead, &mut returning);
+                if !dead.contains(&eid) {
+                    arrow_hit_players(a, eid, adim, shot, &mut dead, &mut hits, &mut returning, true);
+                }
+            } else {
+                arrow_hit_players(a, eid, adim, shot, &mut dead, &mut hits, &mut returning, false);
+            }
         }
+        arrow_land_tridents(&mut ar, &dead, &mut returning, &mut seen_tridents);
     }
     for (deid, etype, mx, my, mz) in mob_dead {
         kill_mob(deid, etype, mx, my, mz);
@@ -3411,72 +3415,7 @@ fn arrow_tick() {
         clear_entity_dim(*eid);
     }
     for (veid, admg, ax, az, owner_eid, proj_kind, proj_weapon) in hits {
-        let cls: Vec<Arc<Client>> = client_snapshot();
-        if let Some(c) = cls.iter().find(|c| c.eid == veid) {
-            if *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                continue;
-            }
-            // Mod-suite `EntityDamagePre` for the struck player: a cancelled
-            // hit skips this victim entirely.
-            let Some(admg) = live_mod_entity_damage_pre(admg) else {
-                continue;
-            };
-            // the evaluator's raise clock already tracks `blocking` — a lowered
-            // shield reports 0 raised ticks, below the warmup gate
-            let eval = evaluate_shield_block(&shield_hit_ctx(c, [ax, 0.0, az], admg));
-            let blocked_ar = eval.blocked
-                && *c.blocking.lock().unwrap_or_else(|e| e.into_inner());
-            // a rejected hit must not cost shield durability (vanilla returns before that)
-            let Some((ad, _)) = damage_after_invulnerability(c, if blocked_ar { 0.0 } else { admg })
-            else {
-                continue;
-            };
-            if blocked_ar {
-                damage_shield_attempts(c, eval.durability_attempts);
-            }
-            let mut h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *h = (*h
-                - if ad > 0.0 {
-                    hurt_absorb(c, dmg_after(c, ad, 0))
-                } else {
-                    0.0
-                })
-            .max(0.0);
-            if *h <= 0.0 {
-                drop(h);
-                totem_check(c);
-                h = c.hp.lock().unwrap_or_else(|e| e.into_inner());
-            }
-            let hh = *h;
-            drop(h);
-            if ad > 0.0 {
-                damage_armor(c, ad);
-            }
-            if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut w, 0x24, hurt_anim(veid));
-                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
-            }
-            let vname = c.name.clone();
-            // Vanilla `DamageSource` attribution: the shooter's display name
-            // fills the attacker's message slot; a mob-owned projectile
-            // (owner < 0) is the skeleton that loosed it.
-            let attacker = if owner_eid >= 0 {
-                cls.iter().find(|p| p.eid == owner_eid).map(|p| p.name.clone())
-            } else {
-                Some("Skeleton".to_owned())
-            };
-            drop(cls);
-            broadcast_seen_ex(veid, veid, |_c| (0x24, hurt_anim(veid)));
-            if hh <= 0.0 && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                let line = system_chat(&format_vanilla_death_message(
-                    &vname,
-                    if proj_kind == 1 { "trident" } else { "arrow" },
-                    attacker.as_deref(),
-                    proj_weapon.as_deref(),
-                ));
-                broadcast(-1, |_c| (0x6c, line.clone()));
-            }
-        }
+        arrow_apply_hit(veid, admg, ax, az, owner_eid, proj_kind, proj_weapon.as_deref());
     }
 }
 // ---------- MEGA-SCALE T1: power-aware batched & tick-sliced explosions ----------
@@ -3647,9 +3586,7 @@ fn blast_compute(dim: DimId, origin: [f64; 3], power: f32, seed: u64) -> Option<
             },
         }
     };
-    blast_engine()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    lk(blast_engine())
         .blast(&source, origin, power, seed)
         .ok()
         .map(BlastOut::Offload)
@@ -3663,7 +3600,7 @@ fn blast_engine() -> &'static Mutex<mod_offload::explosion_batch::ExplosionBatch
 
 #[cfg(not(feature = "mod-suite"))]
 fn blast_compute(dim: DimId, origin: [f64; 3], power: f32, seed: u64) -> Option<BlastOut> {
-    let mut engine = blast_engine().lock().unwrap_or_else(|e| e.into_inner());
+    let mut engine = lk(blast_engine());
     if !(power.is_finite() && power > 0.0) || !engine.prepare(dim, origin, power) {
         return if engine.prepared_empty() {
             Some(BlastOut::Local(Vec::new()))
@@ -4112,7 +4049,7 @@ fn apply_blast_slice(
     for [tx, ty, tz] in primed_new {
         let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
         let jitter = ((tx.wrapping_mul(31) ^ tz.wrapping_mul(17) ^ ty) & 0x3ff) as u64;
-        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+        lk(primed()).push(Primed {
             eid,
             x: tx as f64 + 0.5,
             y: ty as f64,
@@ -4149,7 +4086,7 @@ fn apply_blast_slice(
 /// single tick.
 fn mega_blast_tick_drain() {
     let (dim, center, power, removals) = {
-        let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
+        let mut q = lk(mega_blast_queue());
         let Some(job) = q.front_mut() else {
             return;
         };
@@ -4209,7 +4146,7 @@ fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
         // first ring still lands immediately when the queue was empty.
         let job = MegaBlastJob::new(dim, origin, power as f32, out);
         {
-            let mut q = mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut q = lk(mega_blast_queue());
             if q.len() < MEGA_BLAST_QUEUE_CAP {
                 q.push_back(job);
             }
@@ -4227,15 +4164,15 @@ fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
     ac_note_explosion(dim, [ex, ey, ez], power);
     let cs: Vec<Arc<Client>> = client_snapshot();
     for cl in cs {
-        if *cl.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+        if *lk(&cl.dim) != dim {
             continue;
         }
         let (px, py, pz, ..) = {
-            let p = cl.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let p = lk(&cl.pos);
             *p
         };
         let dd = ((px - ex).powi(2) + (py - ey).powi(2) + (pz - ez).powi(2)).sqrt();
-        if dd < power * 1.5 && *cl.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+        if dd < power * 1.5 && *lk(&cl.gm) != 1 {
             let raw = ((power * 1.5 - dd) * 3.0) as f32;
             // Mod-suite `EntityDamagePre`: a cancelled/rewritten hit skips
             // or reshapes this player's share of the blast.
@@ -4245,20 +4182,7 @@ fn explode_at_dim(dim: DimId, ex: f64, ey: f64, ez: f64, power: f64) {
             let Some((accepted, _)) = damage_after_invulnerability(&cl, raw) else {
                 continue;
             };
-            let mut h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
-            *h = (*h - hurt_absorb(&cl, dmg_after(&cl, accepted, 2))).max(0.0);
-            if *h <= 0.0 {
-                drop(h);
-                totem_check(&cl);
-                h = cl.hp.lock().unwrap_or_else(|e| e.into_inner());
-            }
-            let hh = *h;
-            drop(h);
-            damage_armor(&cl, raw);
-            if let Ok(mut w) = cl.sock.lock() {
-                let _ = send_packet(&mut w, 0x24, hurt_anim(cl.eid));
-                let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, &cl));
-            }
+            player_hurt_apply(&cl, accepted, Some(2), Some(raw));
         }
     }
 }
@@ -4270,7 +4194,7 @@ fn primed_tick() {
     mega_blast_tick_drain();
     let mut boom: Vec<Primed> = Vec::new();
     {
-        let mut pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+        let mut pl = lk(primed());
         let region = region_guard();
         // Single stable partition: fuse counts down only while the chunk is
         // hot, survivors keep their order, and detonating entries are moved
@@ -4308,7 +4232,7 @@ fn live_mob_hit_allowed(mob: &Mob, source: i32, hit: BossHit) -> bool {
     if !matches!(mob.etype, 31 | 88 | 116 | 119) {
         return true;
     }
-    let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+    let mut states = lk(live_mob_states());
     let state = states
         .entry(mob.eid)
         .or_insert_with(|| LiveMobState::new(mob.etype));
@@ -4337,7 +4261,7 @@ fn live_mob_damage_player(
     protection_kind: Option<u8>,
     knockback_y: Option<f64>,
 ) -> bool {
-    if !matches!(*player.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+    if !matches!(*lk(&player.gm), 0 | 2) || *lk(&player.hp) <= 0.0 {
         return false;
     }
     // Mod-suite `EntityDamagePre` (the `Entity.hurt` HEAD equivalent): lifted
@@ -4351,7 +4275,7 @@ fn live_mob_damage_player(
         // Vanilla `isDamageSourceBlocked`: raise warmup, 180° attacker arc and
         // the running disable cooldown all gate the block before durability.
         let eval = evaluate_shield_block(&shield_hit_ctx(player, origin, damage));
-        if eval.blocked && *player.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+        if eval.blocked && *lk(&player.blocking) {
             damage_shield_attempts(player, eval.durability_attempts);
             return false;
         }
@@ -4364,19 +4288,19 @@ fn live_mob_damage_player(
     };
     let damage_taken = protection_kind.map_or(accepted, |kind| dmg_after(player, accepted, kind));
     {
-        let mut hp = player.hp.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hp = lk(&player.hp);
         *hp = (*hp - hurt_absorb(player, damage_taken)).max(0.0);
     }
     totem_check(player);
     if protection_kind.is_some() {
         damage_armor(player, damage);
     }
-    let health = *player.hp.lock().unwrap_or_else(|e| e.into_inner());
+    let health = *lk(&player.hp);
     // Vanilla LivingEntity.knockback scales the horizontal push by
     // (1 - knockback_resistance); the vertical component is unaffected.
     let kb_res = knockback_resist_of(player);
     let velocity = knockback_y.map(|up| {
-        let (x, _, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let (x, _, z, ..) = *lk(&player.pos);
         let [dx, _, dz] = mob_behavior_unit([x - origin[0], 0.0, z - origin[2]]);
         velocity_pkt(
             player.eid,
@@ -4407,7 +4331,7 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
         let mut ctx = shield_hit_ctx(player, pos, diff_mob_dmg(amount));
         ctx.attacker_can_disable = true;
         let eval = evaluate_shield_block(&ctx);
-        if eval.blocked && *player.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
+        if eval.blocked && *lk(&player.blocking) {
             damage_shield_attempts(player, eval.durability_attempts);
             if eval.disable_ticks.is_some() {
                 apply_shield_disable(player);
@@ -4419,27 +4343,25 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
         return;
     }
     let thorns = {
-        let inv = player.inv.lock().unwrap_or_else(|e| e.into_inner());
+        let inv = lk(&player.inv);
         (5i16..=8)
             .filter_map(|slot| inv.get(&slot))
             .map(|stack| enchant_level(&stack.2, 38))
             .sum::<i64>()
     };
     if thorns > 0 && world_rng::next_u64() % 100 < (thorns * 15) as u64 {
-        *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) -= (1 + world_rng::next_u64() % 4) as f32;
-        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-        *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = Some(TICK_IDX.load(Ordering::Relaxed));
+        *lk(&mob.hp) -= (1 + world_rng::next_u64() % 4) as f32;
+        *lk(&mob.hurt_at) = Instant::now();
+        *lk(&mob.last_hurt_tick) = Some(TICK_IDX.load(Ordering::Relaxed));
         broadcast_seen(mob.eid, |_| (0x24, hurt_anim(mob.eid)));
     }
-    if *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+    if *lk(&player.hp) <= 0.0
         && GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0
     {
         // Vanilla `DamageSources.mobAttack`: the attacker's display name is a
         // custom name when one is set, and a custom-named held item picks the
         // `... using <item>` line.
-        let name = mob_custom_names()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let name = lk(mob_custom_names())
             .get(&mob.eid)
             .cloned()
             .unwrap_or_else(|| {
@@ -4450,9 +4372,7 @@ fn live_mob_melee(mob: &Mob, player: &Arc<Client>, pos: [f64; 3], amount: f32, u
                         .to_owned()
                 })
             });
-        let weapon = mob_equipment()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let weapon = lk(mob_equipment())
             .get(&mob.eid)
             .and_then(|eq| renamed_custom_name(&eq.get(EquipmentSlot::MainHand).2));
         let line = system_chat(&format_vanilla_death_message(
@@ -4525,11 +4445,11 @@ fn live_witch_effect_id(potion: WitchPotion) -> i32 {
 }
 
 fn live_mob_player_effect(client: &Client, id: i32, ticks: u16) {
-    if !matches!(*client.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 2) || *client.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+    if !matches!(*lk(&client.gm), 0 | 2) || *lk(&client.hp) <= 0.0 {
         return;
     }
     let ticks = server_ticks(u64::from(ticks)) as i32;
-    let mut effects = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut effects = lk(&client.effs);
     if effects
         .iter()
         .any(|effect| effect.id == id && effect.left >= ticks)
@@ -4552,7 +4472,7 @@ fn live_mob_player_effect(client: &Client, id: i32, ticks: u16) {
 
 fn live_mob_death(mob: &Arc<Mob>, state: Option<LiveMobState>, pos: [f64; 3]) {
     let state = state.unwrap_or_else(|| LiveMobState::new(mob.etype));
-    sitting_cats().lock().unwrap_or_else(|e| e.into_inner()).remove(&mob.eid);
+    lk(sitting_cats()).remove(&mob.eid);
     if let Some(behavior) = state.behavior {
         apply_live_mob_effects(mob, mob.dim, pos, behavior.on_death(), &[]);
     }
@@ -4652,10 +4572,10 @@ fn broadcast_player_attack_damage(victim: i32, attacker: i32, dim: DimId) {
     fanout_in(
         &client_snapshot(),
         |client| {
-            if client.player_attack_damage_id.is_none() || *client.dim.lock().unwrap_or_else(|e| e.into_inner()) != dim {
+            if client.player_attack_damage_id.is_none() || *lk(&client.dim) != dim {
                 return false;
             }
-            client.eid == victim || client.seen.lock().unwrap_or_else(|e| e.into_inner()).contains(&victim)
+            client.eid == victim || lk(&client.seen).contains(&victim)
         },
         |client| {
             let mut body = Vec::new();
@@ -4696,13 +4616,13 @@ fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
     // Once per client per tick, before the health lock is taken downstream:
     // keep the equipment attribute view attr_of reports current.
     refresh_equip_attrs(c);
-    let (last_x, _, last_z) = std::mem::replace(&mut *c.lastp.lock().unwrap_or_else(|e| e.into_inner()), (x, y, z));
+    let (last_x, _, last_z) = std::mem::replace(&mut *lk(&c.lastp), (x, y, z));
     let distance = (x - last_x).hypot(z - last_z);
     let movement = if distance >= 10.0 {
         0.0
-    } else if *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) {
+    } else if *lk(&c.sprinting) {
         distance as f32 * 0.1
-    } else if *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) {
+    } else if *lk(&c.sneaking) {
         // Vanilla `generic.sneaking_speed` (Swift Sneak, id 37): the sneak
         // crawl rises from 0.3 by 0.15 per level (cap 1.0). Exhaustion tracks
         // the distance covered, normalized on the 0.3 base crawl so an
@@ -4716,10 +4636,7 @@ fn player_movement_exhaustion(c: &Client, (x, y, z): (f64, f64, f64)) -> f32 {
     // fishing rod's Lure / Luck of the Sea on the owner's live bobber.
     frost_walker_freeze(c);
     apply_fishing_enchants(c);
-    let hunger = c
-        .effs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let hunger = lk(&c.effs)
         .iter()
         .find(|effect| effect.id == HUNGER_EFFECT)
         .map_or(0.0, |effect| 0.005 * (effect.amp as f32 + 1.0));
@@ -4734,14 +4651,14 @@ fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u
         _ => HungerDifficulty::Normal,
     };
     let natural_regeneration = GR_NATURAL_REGEN.load(Ordering::Relaxed) != 0;
-    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut sessions = lk(player_mechanism_sessions());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return false;
     };
     let (mut food, mut sat, mut acc) = (
-        c.food.lock().unwrap_or_else(|e| e.into_inner()),
-        c.sat.lock().unwrap_or_else(|e| e.into_inner()),
-        c.walk_acc.lock().unwrap_or_else(|e| e.into_inner()),
+        lk(&c.food),
+        lk(&c.sat),
+        lk(&c.walk_acc),
     );
     let before = (*hp, *food, *sat);
     let mut data = FoodData {
@@ -4779,7 +4696,7 @@ fn tick_player_food(c: &Client, hp: &mut f32, max_hp: f32, exhaustion: f32, t: u
 }
 
 fn reset_player_food(c: &Client) {
-    let effects = std::mem::take(&mut *c.effs.lock().unwrap_or_else(|e| e.into_inner()));
+    let effects = std::mem::take(&mut *lk(&c.effs));
     for effect in effects {
         let packet = remove_effect_pkt(c.eid, effect.id);
         if let Ok(mut sock) = c.sock.lock() {
@@ -4787,25 +4704,25 @@ fn reset_player_food(c: &Client) {
         }
         broadcast_seen(c.eid, |_| (0x43, packet.clone()));
     }
-    *c.absorb.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
-    *c.air.lock().unwrap_or_else(|e| e.into_inner()) = server_ticks(AIR_SUPPLY_GT) as i32;
-    *c.invulnerable.lock().unwrap_or_else(|e| e.into_inner()) = 0;
-    *c.last_hurt.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    *lk(&c.absorb) = 0.0;
+    *lk(&c.air) = server_ticks(AIR_SUPPLY_GT) as i32;
+    *lk(&c.invulnerable) = 0;
+    *lk(&c.last_hurt) = 0.0;
     c.generic_kill_pending.store(false, Ordering::SeqCst);
-    *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *c.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *c.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    *c.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
-    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    *lk(&c.blocking) = false;
+    *lk(&c.sprinting) = false;
+    *lk(&c.sneaking) = false;
+    *lk(&c.fall_fly) = false;
+    let mut sessions = lk(player_mechanism_sessions());
     if let Some(session) = sessions.get_mut(&c.eid) {
         session.food_timer = 0;
     }
-    attack_tickers().lock().unwrap_or_else(|e| e.into_inner()).remove(&c.eid);
-    equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).remove(&c.name);
+    lk(attack_tickers()).remove(&c.eid);
+    lk(equip_attrs()).remove(&c.name);
     let data = FoodData::default();
-    *c.food.lock().unwrap_or_else(|e| e.into_inner()) = data.food_level;
-    *c.sat.lock().unwrap_or_else(|e| e.into_inner()) = data.saturation;
-    *c.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+    *lk(&c.food) = data.food_level;
+    *lk(&c.sat) = data.saturation;
+    *lk(&c.walk_acc) = 0.0;
 }
 
 fn add_player_xp_points(xp: &mut PlayerXpState, points: i32) -> Result<(), ExperienceSetError> {
@@ -4828,9 +4745,9 @@ fn dropped_experience_points(level: i32, progress: f32) -> i64 {
 }
 
 fn take_dropped_experience(c: &Client) -> i64 {
-    let mut total = c.xp.lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = lk(&c.xp);
     let previous_total = std::mem::take(&mut *total);
-    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut sessions = lk(player_mechanism_sessions());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return previous_total.clamp(0, 100);
     };
@@ -4843,8 +4760,8 @@ fn send_player_xp(
     update: impl FnOnce(&mut PlayerXpState) -> Result<(), ExperienceSetError>,
 ) -> Result<(), ExperienceSetError> {
     // Serialize changes and their packets for this player, including concurrent orb pickups.
-    let mut total = c.xp.lock().unwrap_or_else(|e| e.into_inner());
-    let mut sessions = player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let mut total = lk(&c.xp);
+    let mut sessions = lk(player_mechanism_sessions());
     let Some(session) = sessions.get_mut(&c.eid) else {
         return Ok(());
     };
@@ -4867,7 +4784,7 @@ fn send_player_xp(
 }
 
 fn health_pkt_c(hp: f32, c: &Client) -> Vec<u8> {
-    health_pkt(hp, *c.food.lock().unwrap_or_else(|e| e.into_inner()), *c.sat.lock().unwrap_or_else(|e| e.into_inner()))
+    health_pkt(hp, *lk(&c.food), *lk(&c.sat))
 }
 // vanilla food side-effects: (chance%%, effect id, amplifier, ticks@4/s)
 fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
@@ -4911,8 +4828,8 @@ fn food_effects(item: i64) -> &'static [(u64, i32, i32, i32)] {
 /// this starts a new hurt window. Vanilla sends Damage Event on that new window.
 /// A rejected hit leaves health, armour and the shield alone.
 fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<(f32, bool)> {
-    let mut invulnerable = c.invulnerable.lock().unwrap_or_else(|e| e.into_inner());
-    let mut last_hurt = c.last_hurt.lock().unwrap_or_else(|e| e.into_inner());
+    let mut invulnerable = lk(&c.invulnerable);
+    let mut last_hurt = lk(&c.last_hurt);
     if *invulnerable > 10 {
         if amount <= *last_hurt {
             return None;
@@ -4927,7 +4844,7 @@ fn damage_after_invulnerability(c: &Client, amount: f32) -> Option<(f32, bool)> 
 }
 
 fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
-    let mut a = c.absorb.lock().unwrap_or_else(|e| e.into_inner());
+    let mut a = lk(&c.absorb);
     if *a <= 0.0 {
         return dmg;
     }
@@ -4936,38 +4853,69 @@ fn hurt_absorb(c: &Client, dmg: f32) -> f32 {
     r
 }
 
+/// The shared tail of a player hurt: absorption, the hp write, the totem
+/// check, armor wear and the hurt/health packets to the victim's own socket.
+/// `kind` selects the `dmg_after` protection family (`None` skips it);
+/// `armor_basis` is the `hurtArmor` amount (`None` skips wear). Returns the
+/// post-totem hp.
+fn player_hurt_apply(c: &Arc<Client>, accepted: f32, kind: Option<u8>, armor_basis: Option<f32>) -> f32 {
+    let mut h = lk(&c.hp);
+    let taken = kind.map_or(accepted, |k| dmg_after(c, accepted, k));
+    *h = (*h - hurt_absorb(c, taken)).max(0.0);
+    if *h <= 0.0 {
+        drop(h);
+        totem_check(c);
+        h = lk(&c.hp);
+    }
+    let hh = *h;
+    drop(h);
+    if let Some(raw) = armor_basis {
+        damage_armor(c, raw);
+    }
+    if let Ok(mut w) = c.sock.lock() {
+        let _ = send_packet(&mut w, 0x24, hurt_anim(c.eid));
+        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, c));
+    }
+    hh
+}
+
 // entity attributes: p:<player-name> persistent | e:<eid> transient
 fn attrs() -> &'static Mutex<HashMap<String, HashMap<String, f64>>> {
     static R: OnceLock<Mutex<HashMap<String, HashMap<String, f64>>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
 }
+/// Attribute registry names (1.21.1), namespaced; the table index is the
+/// attribute id `attr_key_id`/`attr_key_name` exchange.
+const ATTR_KEY_NAMES: [&str; 22] = [
+    "minecraft:generic.armor",
+    "minecraft:generic.armor_toughness",
+    "minecraft:generic.attack_damage",
+    "minecraft:generic.attack_knockback",
+    "minecraft:generic.attack_speed",
+    "minecraft:player.block_break_speed",
+    "minecraft:player.block_interaction_range",
+    "minecraft:player.entity_interaction_range",
+    "minecraft:generic.fall_damage_multiplier",
+    "minecraft:generic.flying_speed",
+    "minecraft:generic.follow_range",
+    "minecraft:generic.gravity",
+    "minecraft:generic.jump_strength",
+    "minecraft:generic.knockback_resistance",
+    "minecraft:generic.luck",
+    "minecraft:generic.max_absorption",
+    "minecraft:generic.max_health",
+    "minecraft:generic.movement_speed",
+    "minecraft:generic.safe_fall_distance",
+    "minecraft:generic.scale",
+    "minecraft:zombie.spawn_reinforcements",
+    "minecraft:generic.step_height",
+];
 fn attr_key_id(name: &str) -> Option<i64> {
     let n = name.trim_start_matches("minecraft:");
-    Some(match n {
-        "generic.armor" => 0,
-        "generic.armor_toughness" => 1,
-        "generic.attack_damage" => 2,
-        "generic.attack_knockback" => 3,
-        "generic.attack_speed" => 4,
-        "player.block_break_speed" => 5,
-        "player.block_interaction_range" => 6,
-        "player.entity_interaction_range" => 7,
-        "generic.fall_damage_multiplier" => 8,
-        "generic.flying_speed" => 9,
-        "generic.follow_range" => 10,
-        "generic.gravity" => 11,
-        "generic.jump_strength" => 12,
-        "generic.knockback_resistance" => 13,
-        "generic.luck" => 14,
-        "generic.max_absorption" => 15,
-        "generic.max_health" => 16,
-        "generic.movement_speed" => 17,
-        "generic.safe_fall_distance" => 18,
-        "generic.scale" => 19,
-        "zombie.spawn_reinforcements" => 20,
-        "generic.step_height" => 21,
-        _ => return None,
-    })
+    ATTR_KEY_NAMES
+        .iter()
+        .position(|k| k.strip_prefix("minecraft:") == Some(n))
+        .map(|i| i as i64)
 }
 fn attr_default(name: &str) -> f64 {
     match name.trim_start_matches("minecraft:") {
@@ -4979,36 +4927,13 @@ fn attr_default(name: &str) -> f64 {
 }
 /// `attr_key_id`'s inverse for NBT export (`type` names are namespaced).
 fn attr_key_name(id: i64) -> Option<&'static str> {
-    Some(match id {
-        0 => "minecraft:generic.armor",
-        1 => "minecraft:generic.armor_toughness",
-        2 => "minecraft:generic.attack_damage",
-        3 => "minecraft:generic.attack_knockback",
-        4 => "minecraft:generic.attack_speed",
-        5 => "minecraft:player.block_break_speed",
-        6 => "minecraft:player.block_interaction_range",
-        7 => "minecraft:player.entity_interaction_range",
-        8 => "minecraft:generic.fall_damage_multiplier",
-        9 => "minecraft:generic.flying_speed",
-        10 => "minecraft:generic.follow_range",
-        11 => "minecraft:generic.gravity",
-        12 => "minecraft:generic.jump_strength",
-        13 => "minecraft:generic.knockback_resistance",
-        14 => "minecraft:generic.luck",
-        15 => "minecraft:generic.max_absorption",
-        16 => "minecraft:generic.max_health",
-        17 => "minecraft:generic.movement_speed",
-        18 => "minecraft:generic.safe_fall_distance",
-        19 => "minecraft:generic.scale",
-        20 => "minecraft:zombie.spawn_reinforcements",
-        21 => "minecraft:generic.step_height",
-        _ => return None,
-    })
+    usize::try_from(id)
+        .ok()
+        .and_then(|i| ATTR_KEY_NAMES.get(i))
+        .copied()
 }
 fn attr_of(key: &str, name: &str) -> f64 {
-    let base = attrs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let base = lk(attrs())
         .get(key)
         .and_then(|m| m.get(name))
         .copied()
@@ -5017,9 +4942,7 @@ fn attr_of(key: &str, name: &str) -> f64 {
     // base. The equipment side is cached (computed without taking locks here:
     // some callers hold the health lock, which orders after inventory).
     if let (Some(id), Some(pname)) = (attr_key_id(name), key.strip_prefix("p:")) {
-        if let Some((add, mb, mt)) = equip_attrs()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        if let Some((add, mb, mt)) = lk(equip_attrs())
             .get(pname)
             .and_then(|m| m.get(&(id as i32)))
             .copied()
@@ -5047,9 +4970,7 @@ fn attrs_pkt(eid: i32, m: &HashMap<String, f64>) -> Vec<u8> {
 }
 // send a client's full attribute set to themselves (join/set paths)
 fn send_attrs(c: &Arc<Client>) {
-    let m = attrs()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let m = lk(attrs())
         .get(&format!("p:{}", c.name))
         .cloned()
         .unwrap_or_default();
@@ -5089,16 +5010,12 @@ mod xp_death_drop_tests {
         struct SessionCleanup(i32);
         impl std::ops::Drop for SessionCleanup {
             fn drop(&mut self) {
-                player_mechanism_sessions()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                lk(player_mechanism_sessions())
                     .remove(&self.0);
             }
         }
         let _cleanup = SessionCleanup(eid);
-        player_mechanism_sessions()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(player_mechanism_sessions())
             .insert(
                 eid,
                 PlayerMechanismSession {
@@ -5121,23 +5038,19 @@ mod xp_death_drop_tests {
             (30, 0.75),
         ] {
             {
-                let mut sessions = player_mechanism_sessions()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut sessions = lk(player_mechanism_sessions());
                 sessions.get_mut(&eid).unwrap().xp_bar = (level, progress);
             }
-            *client.xp.lock().unwrap_or_else(|e| e.into_inner()) = 500;
+            *lk(&client.xp) = 500;
             let actual = take_dropped_experience(&client);
             let capped_level = level.min(8);
             let expected = (iterative_total_xp(capped_level)
                 + (progress * xp_needed_for_next_level(capped_level) as f32).round() as i64)
                 .clamp(0, 100);
             assert_eq!(actual, expected, "level {level} progress {progress}");
-            assert_eq!(*client.xp.lock().unwrap_or_else(|e| e.into_inner()), 0);
+            assert_eq!(*lk(&client.xp), 0);
             assert_eq!(
-                player_mechanism_sessions()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                lk(player_mechanism_sessions())
                     .get(&eid)
                     .unwrap()
                     .xp_bar,
@@ -5167,13 +5080,11 @@ mod p1_combat_tests {
     impl std::ops::Drop for CombatGuard {
         fn drop(&mut self) {
             TICK_IDX.store(self.time, Ordering::Relaxed);
-            attack_tickers().lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
-            equip_attrs().lock().unwrap_or_else(|e| e.into_inner()).remove("totem-test");
-            mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != 4242);
-            mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
-            clients()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(attack_tickers()).remove(&4242);
+            lk(equip_attrs()).remove("totem-test");
+            lk(mobs()).retain(|m| m.eid != 4242);
+            lk(mace_smashes()).remove(&4242);
+            lk(clients())
                 .retain(|c| c.eid != 4242);
         }
     }
@@ -5187,9 +5098,9 @@ mod p1_combat_tests {
         let _cleanup = CombatGuard::new();
         let (client, mut receiver) = client_pair();
         let mob = test_mob(4243);
-        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (9.0, 65.0, 8.5, 90.0, 15.0);
-        client.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid);
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
+        *lk(&mob.pos) = (9.0, 65.0, 8.5, 90.0, 15.0);
+        lk(&client.seen).insert(mob.eid);
+        lk(clients()).push(Arc::new(client));
 
         apply_arrow_punch(&mob, 2.0, 0.0, 2);
 
@@ -5257,7 +5168,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
+        lk(&client.inv).insert(36, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         // Never attacked: full charge (vanilla attackStrengthTicker starts ready).
         assert_eq!(melee_charge(&client, sword), 1.0);
@@ -5280,7 +5191,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
+        lk(&client.inv).insert(36, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         assert_eq!(melee_charge(&client, sword), 1.0);
         // Wall time passes but TICK_IDX stands still (as under /tick freeze):
@@ -5297,14 +5208,14 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (sword, 1, Vec::new()));
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(37, (sword, 1, Vec::new()));
+        lk(&client.inv).insert(36, (sword, 1, Vec::new()));
+        lk(&client.inv).insert(37, (sword, 1, Vec::new()));
         TICK_IDX.store(100, Ordering::Relaxed);
         assert_eq!(melee_charge(&client, sword), 1.0);
         TICK_IDX.store(112, Ordering::Relaxed);
         // 12 ticks of charge (0.76) on the old item, then vanilla
         // resetAttackStrengthTicker on the switch: the new item starts at 0.
-        *client.held.lock().unwrap_or_else(|e| e.into_inner()) = 1;
+        *lk(&client.held) = 1;
         let c = f64::from(melee_charge(&client, sword));
         assert!((c - 0.5 / 12.5).abs() < 1e-6, "{c}");
     }
@@ -5314,25 +5225,25 @@ mod p1_combat_tests {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        lk(mobs()).push(mob.clone());
         TICK_IDX.store(100, Ordering::Relaxed);
         // The melee gate writes only the wall stamp; the tick pass adopts it.
-        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *lk(&mob.hurt_at) = Instant::now();
         mob_hurt_window_tick();
-        assert_eq!(*mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()), Some(100));
+        assert_eq!(*lk(&mob.last_hurt_tick), Some(100));
         assert!(
-            mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500),
+            lk(&mob.hurt_at).elapsed() < Duration::from_millis(500),
             "window must be shut ten ticks"
         );
         // Frozen ticks: even after the wall window would have lapsed, the gate
         // stays shut.
         std::thread::sleep(Duration::from_millis(600));
-        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500));
+        assert!(lk(&mob.hurt_at).elapsed() < Duration::from_millis(500));
         // Ten game ticks later the window ends and the wall stamp is backed out
         // to the hurt instant (elapsed >= the 500ms gate).
         TICK_IDX.store(110, Ordering::Relaxed);
         mob_hurt_window_tick();
-        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500));
+        assert!(lk(&mob.hurt_at).elapsed() >= Duration::from_millis(500));
     }
 
     #[test]
@@ -5340,20 +5251,20 @@ mod p1_combat_tests {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob(4242);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        lk(mobs()).push(mob.clone());
         TICK_IDX.store(100, Ordering::Relaxed);
-        *mob.last_hurt_tick.lock().unwrap_or_else(|e| e.into_inner()) = Some(100);
-        *mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        *lk(&mob.last_hurt_tick) = Some(100);
+        *lk(&mob.hurt_at) = Instant::now();
         mob_hurt_window_tick();
         TICK_IDX.store(109, Ordering::Relaxed);
         mob_hurt_window_tick();
         assert!(
-            mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() < Duration::from_millis(500),
+            lk(&mob.hurt_at).elapsed() < Duration::from_millis(500),
             "still inside the 10-tick window at tick 109"
         );
         TICK_IDX.store(110, Ordering::Relaxed);
         mob_hurt_window_tick();
-        assert!(mob.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500));
+        assert!(lk(&mob.hurt_at).elapsed() >= Duration::from_millis(500));
     }
 
     #[test]
@@ -5436,7 +5347,7 @@ mod p1_combat_tests {
         let client = Arc::new(client);
         let sword = name_to_item("diamond_sword").unwrap();
         // +3 attack damage and a slower attack speed (1.2 < 1.6 table speed).
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        lk(&client.inv).insert(
             36,
             attr_stack(&[
                 attr_mod(ATTR_ATTACK_DAMAGE, 3.0, ItemAttrOp::AddValue, ItemAttrSlotGroup::MainHand),
@@ -5466,7 +5377,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         assert_eq!(knockback_resist_of(&client), 0.0);
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        lk(&client.inv).insert(
             45,
             attr_stack(&[attr_mod(
                 ATTR_KNOCKBACK_RESISTANCE,
@@ -5485,7 +5396,7 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let client = Arc::new(client);
         assert_eq!(max_hp_of(&client.name), 20.0);
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+        lk(&client.inv).insert(
             5,
             (
                 name_to_item("iron_helmet").unwrap(),
@@ -5541,10 +5452,10 @@ mod p1_combat_tests {
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
         let mace = enchanted_stack("mace", &[(6, 2)]);
-        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+        *lk(&client.pos) =
             (0.0, 63.5, 0.0, 0.0, 0.0, false);
-        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
-        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, mace.clone());
+        *lk(&client.fall_from) = 70.0;
+        lk(&client.inv).insert(36, mace.clone());
         refresh_equip_attrs(&client);
         assert_eq!(attr_of(&format!("p:{}", client.name), "generic.attack_damage"), 1.0);
         let bonus = |item| mace_smash_damage_bonus(
@@ -5552,9 +5463,9 @@ mod p1_combat_tests {
         );
         assert_eq!(bonus(mace.0), 25.5);
         assert_eq!(bonus(name_to_item("diamond_sword").unwrap()), 0.0);
-        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = true;
+        lk(&client.pos).5 = true;
         assert_eq!(bonus(mace.0), 0.0);
-        *client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+        *lk(&client.pos) =
             (0.0, 69.0, 0.0, 0.0, 0.0, false);
         assert_eq!(bonus(mace.0), 0.0);
     }
@@ -5566,48 +5477,41 @@ mod p1_combat_tests {
         let (client, mut rx) = client_pair();
         // Airborne 4 blocks into a fall, Wind Burst I mace in hand.
         {
-            let mut p = client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&client.pos);
             *p = (0.0, 66.0, 0.0, 0.0, 0.0, false);
         }
-        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
-        client
-            .inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        *lk(&client.fall_from) = 70.0;
+        lk(&client.inv)
             .insert(36, enchanted_stack("mace", &[(41, 1)]));
         let client = Arc::new(client);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .push(client.clone());
         let mob = test_mob(4243);
-        *mob.pos.lock().unwrap_or_else(|e| e.into_inner()) = (0.4, 66.4, 0.0, 0.0, 0.0);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
+        *lk(&mob.pos) = (0.4, 66.4, 0.0, 0.0, 0.0);
+        lk(mobs()).push(mob.clone());
 
         let mace = name_to_item("mace").unwrap();
         melee_charge(&client, mace);
-        assert!(mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
-        assert_eq!(*client.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 70.0);
+        assert!(lk(mace_smashes()).is_empty());
+        assert_eq!(*lk(&client.fall_from), 70.0);
         let held = enchanted_stack("mace", &[(41, 1)]);
         let fall = mace_attack_fall(&client, mace);
         queue_mace_smash(&client, &held, fall, 100, [0.0, 66.0, 0.0]);
         assert_eq!(mace_attack_fall(&client, mace), 0.0);
         assert!(
-            mace_smashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(mace_smashes())
                 .contains_key(&4242),
             "a qualifying mace smash queues the wind burst launch"
         );
         combat2_state_tick();
         assert!(
-            mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            lk(mace_smashes()).is_empty(),
             "the combat tick drains the queued smash"
         );
         // Fall distance resets to the burst Y so the combo only counts the
         // drop below it.
         assert_eq!(
-            *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            *lk(&client.fall_from),
             66.0
         );
         // The wielder gets the level I upward launch (1.2 blocks → vy 9600).
@@ -5616,9 +5520,9 @@ mod p1_combat_tests {
         let packet = read_packet(&mut rx, Instant::now() + Duration::from_secs(1)).unwrap();
         assert_eq!(packet, (0x5a, velocity_pkt(client.eid, 0, (1.2 * 8000.0) as i16, 0)));
         // The radial pulse knocked the nearby mob away from the burst.
-        let mp = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let mp = *lk(&mob.pos);
         assert!(mp.0 > 0.4, "mace smash pulse pushes mobs away, got {}", mp.0);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != 4243);
+        lk(mobs()).retain(|m| m.eid != 4243);
     }
 
     #[test]
@@ -5627,12 +5531,12 @@ mod p1_combat_tests {
         let (client, _rx) = client_pair();
         let mace = name_to_item("mace").unwrap();
         assert_eq!(mace_attack_fall(&client, mace), 0.0);
-        client.pos.lock().unwrap_or_else(|e| e.into_inner()).5 = false;
-        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
-        *client.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 80.0;
+        lk(&client.pos).5 = false;
+        *lk(&client.fall_fly) = true;
+        *lk(&client.fall_from) = 80.0;
         assert_eq!(mace_attack_fall(&client, mace), 0.0);
-        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        client.pos.lock().unwrap_or_else(|e| e.into_inner()).1 = 79.0;
+        *lk(&client.fall_fly) = false;
+        lk(&client.pos).1 = 79.0;
         assert_eq!(mace_smash_damage_bonus(mace_attack_fall(&client, mace), 3), 0.0);
         // Levels I–III bounce 1.2 / 2.1 / 3.0 blocks.
         assert!((wind_burst_bounce_velocity(1) - 1.2).abs() < 1e-9);
@@ -5654,12 +5558,9 @@ mod p1_combat_tests {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let (client, _rx) = client_pair();
-        client
-            .inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&client.inv)
             .insert(5, (name_to_item("diamond_chestplate").unwrap(), 1, Vec::new()));
-        *client.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = 20;
+        *lk(&client.armor_pts) = 20;
         let normal = dmg_after(&client, 20.0, 0);
         let breach = dmg_after_breach(&client, 20.0, 0, 4);
         assert_eq!(breach, 20.0);
@@ -5670,21 +5571,19 @@ mod p1_combat_tests {
         // fall distance; only the Wind Burst bounce is absent.
         let (plain, _plain_rx) = client_pair();
         let plain = Arc::new(plain);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .push(plain.clone());
         {
-            let mut pos = plain.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pos = lk(&plain.pos);
             *pos = (0.0, 60.0, 0.0, 0.0, 0.0, false);
         }
-        *plain.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 70.0;
+        *lk(&plain.fall_from) = 70.0;
         let held = enchanted_stack("mace", &[]);
         queue_mace_smash(&plain, &held, mace_attack_fall(&plain, held.0), 100, [1.0, 60.0, 0.0]);
-        assert_eq!(*plain.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 60.0);
+        assert_eq!(*lk(&plain.fall_from), 60.0);
         combat2_state_tick();
-        assert_eq!(*plain.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 60.0);
-        assert!(mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert_eq!(*lk(&plain.fall_from), 60.0);
+        assert!(lk(mace_smashes()).is_empty());
     }
 
     #[test]
@@ -5692,12 +5591,12 @@ mod p1_combat_tests {
         let _guard = crate::world_guard();
         let _g = CombatGuard::new();
         let mob = test_mob_etype(9200, 116);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
-        let mut states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        lk(mobs()).push(mob.clone());
+        let mut states = lk(live_mob_states());
         states.insert(9200, LiveMobState::new(116));
         drop(states);
         assert!(live_mob_hit_allowed(&mob, 33, BossHit::Other));
-        let states = live_mob_states().lock().unwrap_or_else(|e| e.into_inner());
+        let states = lk(live_mob_states());
         let Some(LiveMobState {
             behavior: Some(MobBehaviorState::Warden(warden)),
             ..
@@ -5728,7 +5627,7 @@ mod p5a_parity_tests {
     impl std::ops::Drop for FireGuard {
         fn drop(&mut self) {
             TICK_IDX.store(self.time, Ordering::Relaxed);
-            mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).clear();
+            lk(mob_fire_ticks()).clear();
         }
     }
 
@@ -5758,7 +5657,7 @@ mod p5a_parity_tests {
         let _guard = crate::world_guard();
         let _g = FireGuard::new();
         let creeper = mob(4243, name_to_etype("creeper").unwrap());
-        *creeper.fuse.lock().unwrap_or_else(|e| e.into_inner()) = 7;
+        *lk(&creeper.fuse) = 7;
         ignite_mob_fire_aspect(creeper.eid, 1);
         assert_eq!(
             mob_fire_ticks_of(creeper.eid),
@@ -5775,8 +5674,8 @@ mod p5a_parity_tests {
             server_ticks(160) as u32,
             "Fire Aspect II is 8s"
         );
-        assert_eq!(*creeper.fuse.lock().unwrap_or_else(|e| e.into_inner()), 7, "fuse untouched");
-        assert_eq!(*creeper.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()), 0, "sunlight field untouched");
+        assert_eq!(*lk(&creeper.fuse), 7, "fuse untouched");
+        assert_eq!(*lk(&creeper.fire_ticks), 0, "sunlight field untouched");
         ignite_mob_fire_aspect(creeper.eid, 0);
         assert_eq!(
             mob_fire_ticks_of(creeper.eid),
@@ -5818,7 +5717,7 @@ mod p5a_parity_tests {
         ignite_mob(eid, 1);
         assert!(!tick_mob_fire(eid, burn_interval * 4 + 1, false, false));
         assert_eq!(mob_fire_ticks_of(eid), 0);
-        assert!(mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()).get(&eid).is_none());
+        assert!(lk(mob_fire_ticks()).get(&eid).is_none());
     }
 
     // #78 — the immune list keeps covering the vanilla fireImmune family.
@@ -6128,31 +6027,21 @@ mod vanilla_combat2_tests {
             for (dim, x, y, z, st) in self.blocks.drain(..) {
                 set_block_dim(dim, x, y, z, st);
             }
-            clients()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(clients())
                 .retain(|c| c.eid != 4242);
-            arrows()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(arrows())
                 .retain(|a| a.eid != 99901);
-            drops()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(drops())
                 .retain(|d| d.item != 9999);
             for m in [
                 shield_raised(),
                 riptide_spin(),
             ] {
-                m.lock().unwrap_or_else(|e| e.into_inner()).remove(&4242);
+                lk(m).remove(&4242);
             }
-            trident_returning()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(trident_returning())
                 .remove(&99901);
-            trident_seen()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(trident_seen())
                 .remove(&99901);
         }
     }
@@ -6316,12 +6205,12 @@ mod vanilla_combat2_tests {
         let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
-        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 120.0;
+        *lk(&c.fall_from) = 120.0;
         wind_charge_reset_fall(&c, 64.5);
-        assert_eq!(*c.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 64.5);
+        assert_eq!(*lk(&c.fall_from), 64.5);
         // Non-finite burst heights never corrupt the fall baseline.
         wind_charge_reset_fall(&c, f64::NAN);
-        assert_eq!(*c.fall_from.lock().unwrap_or_else(|e| e.into_inner()), 64.5);
+        assert_eq!(*lk(&c.fall_from), 64.5);
     }
 
     #[test]
@@ -6414,22 +6303,20 @@ mod vanilla_combat2_tests {
         let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         let (c, mut r) = client_pair();
-        *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()) = 200.0;
+        *lk(&c.fall_from) = 200.0;
         {
-            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&c.pos);
             p.0 = 0.0;
             p.1 = 70.0;
             p.2 = 1.5; // 1.5 blocks north of the burst
         }
         let c = Arc::new(c);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .push(c.clone());
         wind_charge_burst(DimId::Overworld, WindChargeKind::Player, [0.0, 70.0, 0.0], 4242);
         // Thrower fall baseline snapped to the burst Y.
         assert_eq!(
-            *c.fall_from.lock().unwrap_or_else(|e| e.into_inner()),
+            *lk(&c.fall_from),
             70.0
         );
         // A velocity packet with a negative-Z push reached the wire.
@@ -6564,13 +6451,11 @@ mod vanilla_combat2_tests {
         let sh = name_to_item("shield").unwrap();
         let mut comps = Vec::new();
         comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (sh, 1, comps));
         damage_shield_attempts(&c, 5);
         let dmg = comp_varint(
-            &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+            &lk(&c.inv).get(&45).unwrap().2,
             COMP_DAMAGE,
         );
         assert_eq!(dmg, Some(5));
@@ -6584,14 +6469,12 @@ mod vanilla_combat2_tests {
         // No Unbreaking: every attempt lands — 10 attempts is exactly 10 damage.
         let mut comps = Vec::new();
         comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (sh, 1, comps));
         damage_shield_attempts(&c, 10);
         assert_eq!(
             comp_varint(
-                &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+                &lk(&c.inv).get(&45).unwrap().2,
                 COMP_DAMAGE
             ),
             Some(10)
@@ -6605,13 +6488,11 @@ mod vanilla_combat2_tests {
             COMP_ENCHANTMENTS,
             enchantments_data(&[(39, 3)], true),
         );
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (sh, 1, comps));
         damage_shield_attempts(&c, 400);
         let dmg = comp_varint(
-            &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+            &lk(&c.inv).get(&45).unwrap().2,
             COMP_DAMAGE,
         )
         .unwrap();
@@ -6620,14 +6501,12 @@ mod vanilla_combat2_tests {
         let mut comps = Vec::new();
         comp_set_varint(&mut comps, COMP_MAX_DAMAGE, 337);
         comp_set(&mut comps, COMP_UNBREAKABLE, vec![]);
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (sh, 1, comps));
         damage_shield_attempts(&c, 20);
         assert_eq!(
             comp_varint(
-                &c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45).unwrap().2,
+                &lk(&c.inv).get(&45).unwrap().2,
                 COMP_DAMAGE
             ),
             None
@@ -6640,15 +6519,13 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let c = Arc::new(c);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .push(c.clone());
         TICK_IDX.store(100, Ordering::Relaxed);
         combat2_state_tick();
         // Shield down: raised clock stays empty, ctx reports 0 -> below warmup.
         assert_eq!(shield_raised_ticks(&c), 0);
-        *c.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lk(&c.blocking) = true;
         combat2_state_tick();
         assert_eq!(shield_raised_ticks(&c), 0); // just raised
         TICK_IDX.store(105, Ordering::Relaxed);
@@ -6656,7 +6533,7 @@ mod vanilla_combat2_tests {
         assert_eq!(shield_raised_ticks(&c), 5);
         // apply_shield_disable drops the shield and arms the wall-clock cd.
         apply_shield_disable(&c);
-        assert!(!*c.blocking.lock().unwrap_or_else(|e| e.into_inner()));
+        assert!(!*lk(&c.blocking));
         let ctx = shield_hit_ctx(&c, [5.0, 0.0, 0.0], 5.0);
         assert!(ctx.cooldown_active);
         assert!(!evaluate_shield_block(&ctx).blocked);
@@ -6670,28 +6547,23 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, mut r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (totem, 2, Vec::new()));
-        c.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff {
+        lk(&c.effs).push(Eff {
             id: name_to_effect("poison").unwrap_or(19),
             amp: 2,
             left: 80,
         });
-        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *lk(&c.hp) = 0.0;
         assert!(try_trigger_totem_of_undying(&c, 0.0, TotemDamageKind::Ordinary));
         // Totem consumed (one of two), hp = 1.
         assert_eq!(
-            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            lk(&c.inv).get(&45),
             Some(&(totem, 1, Vec::new()))
         );
-        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+        assert_eq!(*lk(&c.hp), 1.0);
         // Negative effect cleared; exact vanilla grant.
-        let effs: Vec<(i32, i32, i32)> = c
-            .effs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let effs: Vec<(i32, i32, i32)> = lk(&c.effs)
             .iter()
             .map(|e| (e.id, e.amp, e.left))
             .collect();
@@ -6709,7 +6581,7 @@ mod vanilla_combat2_tests {
                 "missing effect id={id} amp={amp} left={left} in {effs:?}"
             );
         }
-        assert_eq!(*c.absorb.lock().unwrap_or_else(|e| e.into_inner()), 8.0);
+        assert_eq!(*lk(&c.absorb), 8.0);
         // Entity status 35 on the wire: i32 eid + i8 status.
         let dl = Instant::now() + Duration::from_secs(1);
         let mut saw = false;
@@ -6729,19 +6601,17 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
-        *c.held.lock().unwrap_or_else(|e| e.into_inner()) = 3;
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        *lk(&c.held) = 3;
+        lk(&c.inv)
             .insert(39, (totem, 1, Vec::new())); // main hand = 36 + held
-        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = -4.0;
+        *lk(&c.hp) = -4.0;
         assert!(try_trigger_totem_of_undying(
             &c,
             -4.0,
             TotemDamageKind::Ordinary
         ));
-        assert!(!c.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&39));
-        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+        assert!(!lk(&c.inv).contains_key(&39));
+        assert_eq!(*lk(&c.hp), 1.0);
     }
 
     #[test]
@@ -6751,20 +6621,18 @@ mod vanilla_combat2_tests {
         for kind in [TotemDamageKind::Void, TotemDamageKind::Kill] {
             let (c, _r) = client_pair();
             let totem = name_to_item("totem_of_undying").unwrap();
-            c.inv
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(&c.inv)
                 .insert(45, (totem, 1, Vec::new()));
-            *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+            *lk(&c.hp) = 0.0;
             assert!(
                 !try_trigger_totem_of_undying(&c, 0.0, kind),
                 "{kind:?} must bypass totem protection"
             );
             assert_eq!(
-                c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+                lk(&c.inv).get(&45),
                 Some(&(totem, 1, Vec::new()))
             );
-            assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+            assert_eq!(*lk(&c.hp), 0.0);
         }
     }
 
@@ -6774,29 +6642,27 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (totem, 1, Vec::new()));
         // Below the overworld floor: fellOutOfWorld bypasses protection.
         {
-            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&c.pos);
             p.1 = f64::from(DimId::Overworld.min_y()) - 5.0;
         }
-        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *lk(&c.hp) = 0.0;
         totem_check(&c);
-        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        assert_eq!(*lk(&c.hp), 0.0);
         assert_eq!(
-            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            lk(&c.inv).get(&45),
             Some(&(totem, 1, Vec::new()))
         );
         // Back inside the world the same lethal check pops the totem.
         {
-            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&c.pos);
             p.1 = 70.0;
         }
         totem_check(&c);
-        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+        assert_eq!(*lk(&c.hp), 1.0);
     }
 
     #[test]
@@ -6805,17 +6671,15 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (totem, 1, Vec::new()));
         c.generic_kill_pending.store(true, Ordering::SeqCst);
-        *c.hp.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
+        *lk(&c.hp) = 0.0;
         totem_check(&c);
         totem_check(&c);
-        assert_eq!(*c.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0);
+        assert_eq!(*lk(&c.hp), 0.0);
         assert_eq!(
-            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            lk(&c.inv).get(&45),
             Some(&(totem, 1, Vec::new()))
         );
         assert!(c.generic_kill_pending.load(Ordering::SeqCst));
@@ -6829,18 +6693,16 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         let totem = name_to_item("totem_of_undying").unwrap();
-        c.inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&c.inv)
             .insert(45, (totem, 1, Vec::new()));
         // Survived hit: hp still positive -> no pop.
         assert!(!try_trigger_totem_of_undying(&c, 0.5, TotemDamageKind::Ordinary));
         assert_eq!(
-            c.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&45),
+            lk(&c.inv).get(&45),
             Some(&(totem, 1, Vec::new()))
         );
         // Lethal but no totem anywhere: still no pop.
-        c.inv.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        lk(&c.inv).clear();
         assert!(!try_trigger_totem_of_undying(&c, 0.0, TotemDamageKind::Ordinary));
     }
 
@@ -7002,19 +6864,15 @@ mod vanilla_combat2_tests {
         let _g = LaneGuard::new();
         let (c, _r) = client_pair();
         {
-            let mut p = c.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&c.pos);
             p.0 = 16.0;
             p.1 = 70.0;
             p.2 = 10.0;
         }
         let c = Arc::new(c);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .push(c.clone());
-        region()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(region())
             .hot
             .insert((1, 0));
         let mut comps = Vec::new();
@@ -7023,7 +6881,7 @@ mod vanilla_combat2_tests {
             COMP_ENCHANTMENTS,
             enchantments_data(&[(19, 2)], true),
         );
-        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+        lk(arrows()).push(Arrow {
             eid: 99901,
             owner: 4242,
             x: 22.0,
@@ -7044,18 +6902,16 @@ mod vanilla_combat2_tests {
             last_hit: -1,
             stuck: false,
         });
-        trident_returning()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(trident_returning())
             .insert(99901);
         let before = {
-            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let ar = lk(arrows());
             let a = ar.iter().find(|a| a.eid == 99901).unwrap();
             ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
         };
         arrow_tick();
         let after = {
-            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let ar = lk(arrows());
             let a = ar.iter().find(|a| a.eid == 99901).unwrap();
             ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
         };
@@ -7065,27 +6921,21 @@ mod vanilla_combat2_tests {
         );
         // Drop it on the owner's eye: next tick lands it as a pickup there.
         {
-            let mut ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let mut ar = lk(arrows());
             let a = ar.iter_mut().find(|a| a.eid == 99901).unwrap();
             a.x = 16.0;
             a.y = 70.9;
             a.z = 10.0;
         }
         arrow_tick();
-        assert!(arrows()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        assert!(lk(arrows())
             .iter()
             .all(|a| a.eid != 99901));
-        let drop_at_owner = drops()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let drop_at_owner = lk(drops())
             .iter()
             .any(|d| d.item == 9999 && (d.x - 16.0).abs() < 1.0);
         assert!(drop_at_owner, "returned trident lands at the owner's feet");
-        region()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(region())
             .hot
             .remove(&(1, 0));
     }
@@ -7095,9 +6945,7 @@ mod vanilla_combat2_tests {
         let _guard = crate::world_guard();
         let _g = LaneGuard::new();
         TICK_IDX.store(1000, Ordering::Relaxed);
-        riptide_spin()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(riptide_spin())
             .insert(4242, 1000 + server_ticks(20));
         assert_eq!(spin_attack_ticks_left(4242), 20);
         TICK_IDX.store(1019, Ordering::Relaxed);
@@ -7124,13 +6972,13 @@ mod vanilla_combat2_tests {
             1.0,
             None,
         );
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(charge.clone());
+        lk(mobs()).push(charge.clone());
         lane.set_block(DimId::Overworld, 33_000, 81, 33_000,
             reg.state_of("minecraft:stone", None));
         combat2_state_tick();
-        assert_eq!(*charge.hp.lock().unwrap_or_else(|e| e.into_inner()), 0.0,
+        assert_eq!(*lk(&charge.hp), 0.0,
             "solid contact bursts the charge through wind_charge_burst");
-        mobs().lock().unwrap_or_else(|e| e.into_inner())
+        lk(mobs())
             .retain(|m| m.eid != charge.eid);
 
         // Cauldron extinguish: a burning mob standing in a water cauldron is
@@ -7144,45 +6992,42 @@ mod vanilla_combat2_tests {
             20.0,
             None,
         );
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob.clone());
-        *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = 80;
+        lk(mobs()).push(mob.clone());
+        *lk(&mob.fire_ticks) = 80;
         let cauldron = reg.with_prop(
             reg.state_of("minecraft:water_cauldron", None), "level", "2");
         lane.set_block(DimId::Overworld, 33_010, 81, 33_000, cauldron);
         mob_hurt_window_tick();
-        assert_eq!(*mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()), 0,
+        assert_eq!(*lk(&mob.fire_ticks), 0,
             "water cauldron quenches a burning entity");
         assert_eq!(
             reg.get_prop(block_at_dim(DimId::Overworld, 33_010, 81, 33_000), "level").as_deref(),
             Some("1"),
             "extinguishing drops one cauldron level",
         );
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|m| m.eid != mob.eid);
+        lk(mobs()).retain(|m| m.eid != mob.eid);
 
         // Totem: the live damage path's totem check keeps the holder alive.
         let (client, _rx) = client_pair();
-        client
-            .inv
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(&client.inv)
             .insert(45, (1163, 1, Vec::new()));
         assert!(try_trigger_totem_of_undying(&client, -1.0, TotemDamageKind::Ordinary));
-        assert_eq!(*client.hp.lock().unwrap_or_else(|e| e.into_inner()), 1.0);
+        assert_eq!(*lk(&client.hp), 1.0);
 
         // Trident: a returning loyalty trident closes on its owner through
         // `arrow_tick`'s live `trident_returning` pass.
         let (owner, _r2) = client_pair();
         {
-            let mut p = owner.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let mut p = lk(&owner.pos);
             p.0 = 16.0;
             p.1 = 70.0;
             p.2 = 10.0;
         }
-        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(owner));
-        region().lock().unwrap_or_else(|e| e.into_inner()).hot.insert((1, 0));
+        lk(clients()).push(Arc::new(owner));
+        lk(region()).hot.insert((1, 0));
         let mut comps = Vec::new();
         comp_set(&mut comps, COMP_ENCHANTMENTS, enchantments_data(&[(19, 2)], true));
-        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+        lk(arrows()).push(Arrow {
             eid: 99901,
             owner: 4242,
             x: 22.0,
@@ -7203,15 +7048,15 @@ mod vanilla_combat2_tests {
             last_hit: -1,
             stuck: false,
         });
-        trident_returning().lock().unwrap_or_else(|e| e.into_inner()).insert(99901);
+        lk(trident_returning()).insert(99901);
         let before = {
-            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let ar = lk(arrows());
             let a = ar.iter().find(|a| a.eid == 99901).unwrap();
             ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
         };
         arrow_tick();
         let after = {
-            let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+            let ar = lk(arrows());
             let a = ar.iter().find(|a| a.eid == 99901).unwrap();
             ((a.x - 16.0).powi(2) + (a.y - 70.9).powi(2)).sqrt()
         };
@@ -7250,27 +7095,27 @@ mod mega_scale_t1t3_tests {
             let tile_drops = GR_DO_TILE_DROPS.swap(1, Ordering::Relaxed);
             Self {
                 world: world().take_all(),
-                primed: std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner())),
-                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                primed: std::mem::take(&mut *lk(primed())),
+                drops: std::mem::take(&mut *lk(drops())),
                 drop_pending: std::mem::take(
-                    &mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(drop_pending()),
                 ),
-                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xps: std::mem::take(&mut *lk(xps())),
                 xp_pending: std::mem::take(
-                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(xp_pending()),
                 ),
                 queue: std::mem::take(
-                    &mut *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(mega_blast_queue()),
                 ),
-                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                clients: std::mem::take(&mut *lk(clients())),
                 forced: std::mem::take(
-                    &mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(forceloaded()),
                 ),
                 region: test_region(),
                 rng: world_rng::saved_state(),
                 tile_drops,
                 scheduled: std::mem::replace(
-                    &mut *block_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(block_ticks()),
                     scheduled_ticks::ScheduledTicks::new(),
                 ),
             }
@@ -7280,22 +7125,22 @@ mod mega_scale_t1t3_tests {
     impl std::ops::Drop for MegaWorld {
         fn drop(&mut self) {
             world().restore_all(std::mem::take(&mut self.world));
-            *primed().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.primed);
-            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
-            *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(primed()) = std::mem::take(&mut self.primed);
+            *lk(drops()) = std::mem::take(&mut self.drops);
+            *lk(drop_pending()) =
                 std::mem::take(&mut self.drop_pending);
-            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
-            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(xps()) = std::mem::take(&mut self.xps);
+            *lk(xp_pending()) =
                 std::mem::take(&mut self.xp_pending);
-            *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(mega_blast_queue()) =
                 std::mem::take(&mut self.queue);
-            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
-            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(clients()) = std::mem::take(&mut self.clients);
+            *lk(forceloaded()) =
                 std::mem::take(&mut self.forced);
             set_test_region(self.region.0.clone(), self.region.1.clone());
             world_rng::restore(self.rng);
             GR_DO_TILE_DROPS.store(self.tile_drops, Ordering::Relaxed);
-            *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::replace(
+            *lk(block_ticks()) = std::mem::replace(
                 &mut self.scheduled,
                 scheduled_ticks::ScheduledTicks::new(),
             );
@@ -7376,16 +7221,12 @@ mod mega_scale_t1t3_tests {
         let mut deltas = vec![before - prev];
         // The queue must still hold the continuation rings after the call.
         assert!(
-            !mega_blast_queue()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            !lk(mega_blast_queue())
                 .is_empty(),
             "a >{MEGA_BLAST_MAX_PER_TICK}-cell blast must leave queued rings"
         );
         for _ in 0..128 {
-            if mega_blast_queue()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            if lk(mega_blast_queue())
                 .is_empty()
             {
                 break;
@@ -7397,9 +7238,7 @@ mod mega_scale_t1t3_tests {
             prev = cur;
         }
         assert!(
-            mega_blast_queue()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            lk(mega_blast_queue())
                 .is_empty(),
             "the ring queue must drain to completion across ticks"
         );
@@ -7418,7 +7257,7 @@ mod mega_scale_t1t3_tests {
         }
         // Every destroyed cell dropped exactly one item, coalesced into full
         // stacks: total conserved, every stack <= 64.
-        let dp = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let dp = lk(drops());
         let blast_drops: Vec<&Drop> = dp.iter().filter(|d| d.item == drop_item).collect();
         assert!(!blast_drops.is_empty(), "the blast produced no drops");
         assert!(
@@ -7452,16 +7291,12 @@ mod mega_scale_t1t3_tests {
                 "{label} mutated cells"
             );
             assert!(
-                mega_blast_queue()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                lk(mega_blast_queue())
                     .is_empty(),
                 "{label} queued a ring plan"
             );
             assert!(
-                drops()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                lk(drops())
                     .is_empty(),
                 "{label} spawned drops"
             );
@@ -7517,7 +7352,7 @@ mod mega_scale_t1t3_tests {
         set_test_region(HashSet::from([chunk]), HashSet::from([chunk]));
         const N: i32 = 2000;
         {
-            let mut pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+            let mut pl = lk(primed());
             for i in 0..N {
                 pl.push(Primed {
                     eid: 7_000_000 + i,
@@ -7530,7 +7365,7 @@ mod mega_scale_t1t3_tests {
         }
         for expected in [2, 1] {
             primed_tick();
-            let pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+            let pl = lk(primed());
             assert_eq!(pl.len(), N as usize, "a fuse of {expected} must not detonate early");
             assert!(
                 pl.iter().all(|p| p.left == expected),
@@ -7538,7 +7373,7 @@ mod mega_scale_t1t3_tests {
             );
         }
         primed_tick();
-        let pl = primed().lock().unwrap_or_else(|e| e.into_inner());
+        let pl = lk(primed());
         // Only the chain-primed TNTs survive the wave; each destroyed TNT
         // block produced exactly one.
         let chained = tnt_cells
@@ -7603,46 +7438,46 @@ mod dim_entity_tests {
             let mob_loot = GR_MOB_LOOT.swap(1, Ordering::Relaxed);
             Self {
                 world: world().take_all(),
-                mobs: std::mem::take(&mut *mobs().lock().unwrap_or_else(|e| e.into_inner())),
+                mobs: std::mem::take(&mut *lk(mobs())),
                 live_mob_states: std::mem::take(
-                    &mut *live_mob_states().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(live_mob_states()),
                 ),
-                arrows: std::mem::take(&mut *arrows().lock().unwrap_or_else(|e| e.into_inner())),
-                primed: std::mem::take(&mut *primed().lock().unwrap_or_else(|e| e.into_inner())),
+                arrows: std::mem::take(&mut *lk(arrows())),
+                primed: std::mem::take(&mut *lk(primed())),
                 fireworks: std::mem::take(
-                    &mut *fireworks().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(fireworks()),
                 ),
-                drops: std::mem::take(&mut *drops().lock().unwrap_or_else(|e| e.into_inner())),
+                drops: std::mem::take(&mut *lk(drops())),
                 drop_pending: std::mem::take(
-                    &mut *drop_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(drop_pending()),
                 ),
-                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xps: std::mem::take(&mut *lk(xps())),
                 xp_pending: std::mem::take(
-                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(xp_pending()),
                 ),
                 entity_dims: std::mem::take(
-                    &mut *entity_dims().write().unwrap_or_else(|e| e.into_inner()),
+                    &mut *wr(entity_dims()),
                 ),
                 queue: std::mem::take(
-                    &mut *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(mega_blast_queue()),
                 ),
-                clients: std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner())),
+                clients: std::mem::take(&mut *lk(clients())),
                 forced: std::mem::take(
-                    &mut *forceloaded().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(forceloaded()),
                 ),
                 region: test_region(),
                 rng: world_rng::saved_state(),
                 tile_drops,
                 mob_loot,
                 scheduled: std::mem::replace(
-                    &mut *block_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(block_ticks()),
                     scheduled_ticks::ScheduledTicks::new(),
                 ),
                 fire_ticks: std::mem::take(
-                    &mut *mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(mob_fire_ticks()),
                 ),
                 sheared: std::mem::take(
-                    &mut *sheared().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(sheared()),
                 ),
                 tick: TICK_IDX.swap(0, Ordering::Relaxed),
                 thundering: THUNDERING.swap(0, Ordering::Relaxed),
@@ -7653,37 +7488,37 @@ mod dim_entity_tests {
     impl std::ops::Drop for DimWorld {
         fn drop(&mut self) {
             world().restore_all(std::mem::take(&mut self.world));
-            *mobs().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.mobs);
-            *live_mob_states().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(mobs()) = std::mem::take(&mut self.mobs);
+            *lk(live_mob_states()) =
                 std::mem::take(&mut self.live_mob_states);
-            *arrows().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.arrows);
-            *primed().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.primed);
-            *fireworks().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(arrows()) = std::mem::take(&mut self.arrows);
+            *lk(primed()) = std::mem::take(&mut self.primed);
+            *lk(fireworks()) =
                 std::mem::take(&mut self.fireworks);
-            *drops().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.drops);
-            *drop_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(drops()) = std::mem::take(&mut self.drops);
+            *lk(drop_pending()) =
                 std::mem::take(&mut self.drop_pending);
-            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
-            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(xps()) = std::mem::take(&mut self.xps);
+            *lk(xp_pending()) =
                 std::mem::take(&mut self.xp_pending);
-            *entity_dims().write().unwrap_or_else(|e| e.into_inner()) =
+            *wr(entity_dims()) =
                 std::mem::take(&mut self.entity_dims);
-            *mega_blast_queue().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(mega_blast_queue()) =
                 std::mem::take(&mut self.queue);
-            *clients().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.clients);
-            *forceloaded().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(clients()) = std::mem::take(&mut self.clients);
+            *lk(forceloaded()) =
                 std::mem::take(&mut self.forced);
             set_test_region(self.region.0.clone(), self.region.1.clone());
             world_rng::restore(self.rng);
             GR_DO_TILE_DROPS.store(self.tile_drops, Ordering::Relaxed);
             GR_MOB_LOOT.store(self.mob_loot, Ordering::Relaxed);
-            *block_ticks().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::replace(
+            *lk(block_ticks()) = std::mem::replace(
                 &mut self.scheduled,
                 scheduled_ticks::ScheduledTicks::new(),
             );
-            *mob_fire_ticks().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(mob_fire_ticks()) =
                 std::mem::take(&mut self.fire_ticks);
-            *sheared().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.sheared);
+            *lk(sheared()) = std::mem::take(&mut self.sheared);
             TICK_IDX.store(self.tick, Ordering::Relaxed);
             THUNDERING.store(self.thundering, Ordering::Relaxed);
         }
@@ -7773,9 +7608,9 @@ mod dim_entity_tests {
         set_test_region(HashSet::from([(0, 0)]), HashSet::new());
         let etype = name_to_etype("zombie").unwrap();
         let mob = mob_in(88_001, (8.0, 40.0, 8.0), DimId::Nether, "zombie");
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob);
+        lk(mobs()).push(mob);
         kill_mob(88_001, etype, 8.0, 40.0, 8.0);
-        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        let xs = lk(xps());
         assert_eq!(xs.len(), 1, "one XP orb for the killed zombie");
         assert_eq!(
             entity_dim_of(xs[0].eid),
@@ -7792,7 +7627,7 @@ mod dim_entity_tests {
         let _w = DimWorld::take();
         set_test_region(HashSet::from([(0, 0)]), HashSet::new());
         let etype = name_to_etype("zombie").unwrap();
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).push(mob_in(
+        lk(mobs()).push(mob_in(
             88_002,
             (8.0, 40.0, 8.0),
             DimId::from_raw(3),
@@ -7800,10 +7635,10 @@ mod dim_entity_tests {
         ));
         mob_env_die(88_002, etype, 8.0, 40.0, 8.0, false);
         // Environmental death: drops but no XP.
-        assert!(xps().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(lk(xps()).is_empty());
         // The scatter probe ran against the mob's dimension: with no datapack
         // generator the cells are air, so the drop lands near the death point.
-        let dl = drops().lock().unwrap_or_else(|e| e.into_inner());
+        let dl = lk(drops());
         assert!(!dl.is_empty(), "mob loot still drops in a custom dimension");
         for d in dl.iter() {
             assert!(
@@ -7833,9 +7668,7 @@ mod dim_entity_tests {
         let nether_before = count_in_cube_dim(DimId::Nether, at, half, mushroom);
         explode_at_dim(DimId::Nether, at.0 as f64 + 0.5, at.1 as f64, at.2 as f64 + 0.5, 4.0);
         for _ in 0..64 {
-            if mega_blast_queue()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            if lk(mega_blast_queue())
                 .is_empty()
             {
                 break;
@@ -7867,7 +7700,7 @@ mod dim_entity_tests {
         fill_cube_dim(DimId::Nether, at, half, mushroom);
         fill_cube_dim(DimId::Overworld, at, half, mushroom);
         set_test_region(HashSet::from([(0, 0)]), HashSet::new());
-        primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+        lk(primed()).push(Primed {
             eid: 88_010,
             x: 8.5,
             y: 60.5,
@@ -7878,7 +7711,7 @@ mod dim_entity_tests {
         let ow_before = count_in_cube_dim(DimId::Overworld, at, half, mushroom);
         let nether_before = count_in_cube_dim(DimId::Nether, at, half, mushroom);
         primed_tick();
-        assert!(primed().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(lk(primed()).is_empty());
         assert!(
             count_in_cube_dim(DimId::Nether, at, half, mushroom) < nether_before,
             "the fuse must detonate in the primed entity's own dimension"
@@ -7909,13 +7742,13 @@ mod dim_entity_tests {
                 .or_default()
                 .insert(local_idx(8, 100, 8), stone);
         }
-        arrows().lock().unwrap_or_else(|e| e.into_inner()).extend([
+        lk(arrows()).extend([
             arrow_at(88_020, 8.5, 100.5, 8.5, 0.0),
             arrow_at(88_021, 8.5, 100.5, 8.5, 0.0),
         ]);
         set_entity_dim(88_020, DimId::Nether);
         arrow_tick();
-        let ar = arrows().lock().unwrap_or_else(|e| e.into_inner());
+        let ar = lk(arrows());
         let nether_arrow = ar.iter().find(|a| a.eid == 88_020).unwrap();
         let ow_arrow = ar.iter().find(|a| a.eid == 88_021).unwrap();
         assert!(nether_arrow.stuck, "a Nether arrow sticks into a Nether block");
@@ -7937,28 +7770,14 @@ mod dim_entity_tests {
         // Nether mob stands in the same spot and takes the hit.
         let om = mob_in(88_030, (9.0, 100.0, 8.5), DimId::Overworld, "zombie");
         let nm = mob_in(88_031, (9.0, 100.0, 8.5), DimId::Nether, "zombie");
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([om, nm]);
-        arrows()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(mobs()).extend([om, nm]);
+        lk(arrows())
             .push(arrow_at(88_022, 8.0, 100.0, 8.5, 2.0));
         set_entity_dim(88_022, DimId::Nether);
         arrow_tick();
-        let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let ow_hp = *ml
-            .iter()
-            .find(|m| m.eid == 88_030)
-            .unwrap()
-            .hp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let nether_hp = *ml
-            .iter()
-            .find(|m| m.eid == 88_031)
-            .unwrap()
-            .hp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let ml = lk(mobs());
+        let ow_hp = *lk(&ml.iter().find(|m| m.eid == 88_030).unwrap().hp);
+        let nether_hp = *lk(&ml.iter().find(|m| m.eid == 88_031).unwrap().hp);
         assert_eq!(ow_hp, 20.0, "a Nether arrow passes through an Overworld mob");
         assert!(nether_hp < 20.0, "a Nether arrow damages a Nether mob");
     }
@@ -7970,30 +7789,16 @@ mod dim_entity_tests {
         let _w = DimWorld::take();
         let om = mob_in(88_040, (9.0, 100.0, 8.5), DimId::Overworld, "zombie");
         let nm = mob_in(88_041, (9.0, 100.0, 8.5), DimId::Nether, "zombie");
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([om, nm]);
+        lk(mobs()).extend([om, nm]);
         firework_explode(DimId::Nether, 9.0, 100.5, 8.5, 2);
-        let ml = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let ow_hp = *ml
-            .iter()
-            .find(|m| m.eid == 88_040)
-            .unwrap()
-            .hp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let nether_hp = *ml
-            .iter()
-            .find(|m| m.eid == 88_041)
-            .unwrap()
-            .hp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let ml = lk(mobs());
+        let ow_hp = *lk(&ml.iter().find(|m| m.eid == 88_040).unwrap().hp);
+        let nether_hp = *lk(&ml.iter().find(|m| m.eid == 88_041).unwrap().hp);
         assert_eq!(ow_hp, 20.0);
         assert!(nether_hp < 20.0, "the burst must hit same-dimension mobs");
         drop(ml);
         // The tick path resolves the dim off the side table and retires it.
-        fireworks()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(fireworks())
             .push(Firework {
                 eid: 88_042,
                 owner: 7,
@@ -8008,7 +7813,7 @@ mod dim_entity_tests {
             });
         set_entity_dim(88_042, DimId::from_raw(3));
         fireworks_step();
-        assert!(fireworks().lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        assert!(lk(fireworks()).is_empty());
         assert_eq!(entity_dim_of(88_042), DimId::Overworld);
     }
 
@@ -8022,22 +7827,20 @@ mod dim_entity_tests {
         // Overworld: only the Nether client takes blast damage.
         let (mut nether_client, _rx1) = client_pair();
         nether_client.eid = 4242;
-        *nether_client.dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Nether;
-        *nether_client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+        *lk(&nether_client.dim) = DimId::Nether;
+        *lk(&nether_client.pos) =
             (9.0, 100.0, 8.5, 0.0, 0.0, true);
         let (mut ow_client, _rx2) = client_pair();
         ow_client.eid = 4343;
-        *ow_client.pos.lock().unwrap_or_else(|e| e.into_inner()) =
+        *lk(&ow_client.pos) =
             (9.0, 100.0, 8.5, 0.0, 0.0, true);
         let nether_client = Arc::new(nether_client);
         let ow_client = Arc::new(ow_client);
-        clients()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        lk(clients())
             .extend([nether_client.clone(), ow_client.clone()]);
         explode_at_dim(DimId::Nether, 9.0, 100.5, 8.5, 4.0);
-        let nether_hp = *nether_client.hp.lock().unwrap_or_else(|e| e.into_inner());
-        let ow_hp = *ow_client.hp.lock().unwrap_or_else(|e| e.into_inner());
+        let nether_hp = *lk(&nether_client.hp);
+        let ow_hp = *lk(&ow_client.hp);
         assert!(nether_hp < 20.0, "a Nether blast hurts a Nether player");
         assert_eq!(ow_hp, 20.0, "a Nether blast cannot hurt an Overworld player");
     }
@@ -8063,12 +7866,12 @@ mod dim_entity_pure_tests {
     impl OrbStores {
         fn take() -> Self {
             Self {
-                xps: std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner())),
+                xps: std::mem::take(&mut *lk(xps())),
                 xp_pending: std::mem::take(
-                    &mut *xp_pending().lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut *lk(xp_pending()),
                 ),
                 entity_dims: std::mem::take(
-                    &mut *entity_dims().write().unwrap_or_else(|e| e.into_inner()),
+                    &mut *wr(entity_dims()),
                 ),
             }
         }
@@ -8076,10 +7879,10 @@ mod dim_entity_pure_tests {
 
     impl std::ops::Drop for OrbStores {
         fn drop(&mut self) {
-            *xps().lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.xps);
-            *xp_pending().lock().unwrap_or_else(|e| e.into_inner()) =
+            *lk(xps()) = std::mem::take(&mut self.xps);
+            *lk(xp_pending()) =
                 std::mem::take(&mut self.xp_pending);
-            *entity_dims().write().unwrap_or_else(|e| e.into_inner()) =
+            *wr(entity_dims()) =
                 std::mem::take(&mut self.entity_dims);
         }
     }
@@ -8098,9 +7901,7 @@ mod dim_entity_pure_tests {
         // Registering the Overworld stores no row — it is already the default.
         set_entity_dim(9_999_002, DimId::Nether);
         set_entity_dim(9_999_002, DimId::Overworld);
-        assert!(entity_dims()
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        assert!(rd(entity_dims())
             .get(&9_999_002)
             .is_none());
     }
@@ -8116,9 +7917,7 @@ mod dim_entity_pure_tests {
         // The compatibility wrapper keeps landing orbs in the Overworld.
         let eid = xp_spawn(1.0, 60.0, 1.0, 7);
         assert_eq!(entity_dim_of(eid), DimId::Overworld);
-        assert!(entity_dims()
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        assert!(rd(entity_dims())
             .get(&eid)
             .is_none());
     }
@@ -8131,14 +7930,14 @@ mod dim_entity_pure_tests {
         xp_spawn_dim(DimId::Nether, 4.0, 60.0, 4.0, 10);
         let b = xp_spawn_dim(DimId::from_raw(3), 4.0, 60.0, 4.0, 10);
         let eaten = {
-            let mut xs = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
-            let pending = xp_pending().lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut xs = std::mem::take(&mut *lk(xps()));
+            let pending = lk(xp_pending()).clone();
             let eaten = xp_merge_pending_locked(&mut xs, &pending);
-            *xps().lock().unwrap_or_else(|e| e.into_inner()) = xs;
+            *lk(xps()) = xs;
             eaten
         };
         assert!(eaten.is_empty(), "cross-dimension orbs must never merge");
-        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        let xs = lk(xps());
         assert_eq!(xs.len(), 2);
         assert_eq!(xs.iter().map(|x| x.val as i64).sum::<i64>(), 20);
         drop(xs);
@@ -8146,14 +7945,14 @@ mod dim_entity_pure_tests {
         clear_entity_dim(b);
         set_entity_dim(b, DimId::Nether);
         let eaten = {
-            let mut xs = std::mem::take(&mut *xps().lock().unwrap_or_else(|e| e.into_inner()));
-            let pending = xp_pending().lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut xs = std::mem::take(&mut *lk(xps()));
+            let pending = lk(xp_pending()).clone();
             let eaten = xp_merge_pending_locked(&mut xs, &pending);
-            *xps().lock().unwrap_or_else(|e| e.into_inner()) = xs;
+            *lk(xps()) = xs;
             eaten
         };
         assert_eq!(eaten.len(), 1, "same-dimension donors merge");
-        let xs = xps().lock().unwrap_or_else(|e| e.into_inner());
+        let xs = lk(xps());
         assert_eq!(xs.len(), 1);
         assert_eq!(xs[0].val, 20);
         assert_eq!(entity_dim_of(xs[0].eid), DimId::Nether);
@@ -8213,13 +8012,13 @@ mod audit1_mace_tests {
         let (mut bystander, mut bystander_rx) = client_pair();
         bystander.eid = 4244;
         bystander.uuid = [44; 16];
-        *bystander.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.0, 66.0, 0.0, 0.0, 0.0, false);
+        *lk(&bystander.pos) = (1.0, 66.0, 0.0, 0.0, 0.0, false);
         let attacker = Arc::new(attacker);
         let bystander = Arc::new(bystander);
-        clients().lock().unwrap_or_else(|e| e.into_inner()).extend([attacker.clone(), bystander.clone()]);
+        lk(clients()).extend([attacker.clone(), bystander.clone()]);
         let mob = audit_mob(4300, 124, 1.0);
         let armor_stand = audit_mob(4301, 3, -1.0);
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([mob.clone(), armor_stand.clone()]);
+        lk(mobs()).extend([mob.clone(), armor_stand.clone()]);
 
         wind_burst_apply(&attacker, MaceSmash {
             dim: DimId::Overworld,
@@ -8230,20 +8029,20 @@ mod audit1_mace_tests {
             fall: 4.0,
         });
 
-        let vel = *mob.vel.lock().unwrap_or_else(|e| e.into_inner());
+        let vel = *lk(&mob.vel);
         assert!(vel[0] > 1.0, "mob deltaMovement records the radial impulse: {vel:?}");
         assert!((vel[1] - 0.7).abs() < 1e-9, "mob impulse has the vanilla upward component: {vel:?}");
-        let pos = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = *lk(&mob.pos);
         assert!(pos.0 > 1.0, "mob movement uses the collision sweep instead of a raw teleport: {pos:?}");
-        assert_eq!(*armor_stand.vel.lock().unwrap_or_else(|e| e.into_inner()), [0.0; 3], "armor stands are exempt");
-        assert_eq!(armor_stand.pos.lock().unwrap_or_else(|e| e.into_inner()).0, -1.0);
+        assert_eq!(*lk(&armor_stand.vel), [0.0; 3], "armor stands are exempt");
+        assert_eq!(lk(&armor_stand.pos).0, -1.0);
 
         let packet = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))
             .expect("nearby player receives a velocity impulse packet");
         assert_eq!(packet.0, 0x5a);
         assert_eq!(packet.1, velocity_pkt(4244, 14000, 5600, 0));
 
-        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|mob| ![4300, 4301].contains(&mob.eid));
-        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|client| ![4242, 4244].contains(&client.eid));
+        lk(mobs()).retain(|mob| ![4300, 4301].contains(&mob.eid));
+        lk(clients()).retain(|client| ![4242, 4244].contains(&client.eid));
     }
 }
