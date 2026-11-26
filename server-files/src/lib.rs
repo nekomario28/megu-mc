@@ -100,6 +100,7 @@ pub mod installer;
 pub mod json;
 pub mod lists;
 pub mod modrinth_sync;
+pub mod modules_config;
 pub mod mods_dir;
 pub mod optifine_compat;
 pub mod pack_loader;
