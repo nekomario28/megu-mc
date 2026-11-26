@@ -38,7 +38,7 @@ python3 tools/megu_mod_dev.py watch ruby-starter --mods-dir ./mods --once
 `init` generates the native tree above. Java-loader manifests are emitted only
 with an explicit `--compat-jar`, so the default project stays pure data.
 
-> **バージョン非依存（Versionless `.mmod`）方針:** ネイティブ `.mmod` / `.mplugin` は将来にわたり特定の Minecraft バージョン番号の固定を必須にしない方向を採ります（`megu_api` 世代と必要ケイパビリティ／バニラ機能要求のみを宣言し、ID・コンポーネント形式差はランタイムの `VersionPack` / `IdRemapper` が吸収する。`--mc-version` は `--compat-jar` 出力や明示制限が必要な場合のみ指定）。
+> **バージョン非依存（Versionless `.mmod`）＆構造ベース互換検査方針:** ネイティブ `.mmod` / `.mplugin` は特定の Minecraft バージョン番号の固定を必須にしません。作者は `_v1` 等のノイズを省いた clean なケイパビリティ名（例: `requires = ["block_registry", "recipe", "fluid_bus"]`）のみを宣言でき、後方互換な拡張はエンジン内部の `contract_rev` で管理されます（未宣言の参照もバイトコード／WASM import／JSON／参照 ID の内部構造から自動検出されます）。ID・コンポーネント形式差は `VersionPack` / `IdRemapper` / `DataFixer` が吸収し、独立した任意機能（他版専用レシピ等）のみ非対応な場合はその機能だけ安全に除外・明示、ワールド生成（`worldgen_epoch`）やコア保存構造に関わる非互換は起動前に fail-closed で停止します（`--mc-version` は `--compat-jar` 出力や明示制限が必要な場合のみ指定）。
 
 | コマンド / command | 用途 / purpose |
 | --- | --- |

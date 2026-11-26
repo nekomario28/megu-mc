@@ -327,12 +327,37 @@ version** (`1.21.1`, `26.3`, …) onto **one canonical Rust runtime boundary**
    stream (`GuiGraphics` / `PoseStack` / `VertexConsumer` → batched `wgpu` draw
    commands) so custom client mod HUDs, screens, and block-entity renderers work
    generically without OpenGL.
-6. **Versionless Native `.mmod` / `.mplugin` Contract (Write Once, Run Across MC Versions):**
-   Native `.mmod` / `.mplugin` manifests target a stable `megu_api` generation
-   plus capability / feature requirements (rather than pinning a brittle
-   Minecraft version like `1.21.1`). All vanilla references use namespaced IDs
-   and tags, and `VersionPack` + `IdRemapper` + `DataFixer` translate across
-   `1.21.1`, `26.3`, and future targets automatically without author rewrites.
+6. **Versionless Native `.mmod` / `.mplugin` Contract & Structural Capability Inspection (Write Once, Fail Safely Across Versions):**
+   - **Clean capability names + internal `contract_rev`:** Authors declare
+     versionless capability names such as `requires = ["block_registry", "recipe", "fluid_bus"]`
+     (no `_v1` suffix noise). Backwards-compatible additions bump an internal
+     integer `contract_rev` inside the engine/ABI so Megu knows whether a mod
+     targets an older or newer contract and can apply a thin compatibility shim
+     automatically; only a true breaking redesign introduces a distinct
+     capability or explicit major revision.
+   - **Automatic inspection from internal structure:** Rather than trusting
+     manual manifests alone, the loader inspects actual internal artifacts
+     (bytecode class/method refs, WASM imports, JSON recipes/tags/worldgen, and
+     referenced vanilla block/item/biome IDs) against the active `WorldProfile`
+     (`TargetVersion`, pinned `worldgen_epoch`, and loaded registries) to report
+     exact unsupported references before touching the world.
+   - **Worldgen epoch pinning & non-destructive preservation:** Each world pins
+     one `TargetVersion` and `worldgen_epoch`. Removed or unknown block/item/NBT
+     IDs are never silently erased to air (preserved as opaque tombstones or
+     explicitly migrated via `DataFixer` with pre-migration snapshots).
+   - **Three-tier safe load (`full` / feature-scoped `partial` / fail-closed `blocked`):**
+     - `full`: every inferred and declared requirement is satisfied by the
+       active `WorldProfile`.
+     - `partial` (feature-isolated skip): when unsupported items are strictly
+       bounded, independent optional units (e.g., an optional recipe referencing
+       a newer-version or absent-mod item, an optional compat submodule, or a
+       non-critical client cosmetic hook) that cannot corrupt saves or core
+       logic, Megu may skip **only those unsupported feature units** and list
+       every skipped unit explicitly in the mod inspector / Diff summary.
+     - `blocked` (fail-closed): worldgen (`worldgen_epoch`) mismatches, core
+       block/entity/save-format incompatibilities, and un-liftable core Mixins
+       (`@Redirect`/`@Overwrite`) are **never** partially loaded; activation
+       stops before world mutation with the exact offending class/ID/feature.
 
 ## Build features (root `Cargo.toml`)
 
