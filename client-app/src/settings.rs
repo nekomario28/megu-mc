@@ -126,6 +126,51 @@ impl Default for KeyBindings {
     }
 }
 
+macro_rules! define_key_binding_accessors {
+    ($(($key:literal, $canonical:literal, $field:ident),)+) => {
+        impl KeyBindings {
+            fn field_mut(&mut self, key: &str) -> Option<(&mut String, &'static str)> {
+                $(
+                    if key == $key {
+                        return Some((&mut self.$field, $canonical));
+                    }
+                )+
+                None
+            }
+
+            fn copy_field(&mut self, other: &Self, key: &str) -> bool {
+                $(
+                    if key == $canonical {
+                        self.$field = other.$field.clone();
+                        return true;
+                    }
+                )+
+                false
+            }
+        }
+    };
+}
+
+define_key_binding_accessors! {
+    ("forward", "keys.forward", forward),
+    ("back", "keys.back", back),
+    ("left", "keys.left", left),
+    ("right", "keys.right", right),
+    ("jump", "keys.jump", jump),
+    ("sneak", "keys.sneak", sneak),
+    ("sprint", "keys.sprint", sprint),
+    ("inventory", "keys.inventory", inventory),
+    ("drop", "keys.drop", drop),
+    ("swap_offhand", "keys.swap_offhand", swap_offhand),
+    ("chat", "keys.chat", chat),
+    ("command", "keys.command", command),
+    ("zoom", "keys.zoom", zoom),
+    ("camera_toggle", "keys.camera_toggle", camera_toggle),
+    ("fullscreen", "keys.fullscreen", fullscreen),
+    ("advancements", "keys.advancements", advancements),
+    ("sort_inventory", "keys.sort_inventory", sort_inventory),
+}
+
 /// Named bundle of player-visible settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QualityPreset {
@@ -636,6 +681,220 @@ impl Default for ClientSettings {
 // derive in `cli.rs`.
 impl Eq for ClientSettings {}
 
+macro_rules! define_setting_key_handlers {
+    (
+        enum_keys { $(($enum_key:literal, $($enum_field:tt).+, $enum_ty:ty),)+ }
+        bool_keys { $(($bool_key:literal, $($bool_field:tt).+),)+ }
+        bool_aliases { $(($bool_alias_key:literal, $bool_alias:literal, $($bool_alias_field:tt).+),)+ }
+        int_keys { $(($int_key:literal, $($int_field:tt).+, $int_ty:ty, $int_min:expr, $int_max:expr),)+ }
+        int_aliases { $(($int_alias_key:literal, $int_alias:literal, $($int_alias_field:tt).+, $int_alias_ty:ty, $int_alias_min:expr, $int_alias_max:expr),)+ }
+        float_keys { $(($float_key:literal, $($float_field:tt).+, $float_min:expr, $float_max:expr),)+ }
+    ) => {
+        fn parse_declared_setting_key(
+            settings: &mut ClientSettings,
+            key: &str,
+            value: &str,
+            warnings: &mut Vec<String>,
+            seen: &mut Vec<&'static str>,
+        ) -> bool {
+            $(
+                if key == $enum_key {
+                    match <$enum_ty>::parse(value) {
+                        Some(parsed) => {
+                            settings.$($enum_field).+ = parsed;
+                            seen.push($enum_key);
+                        }
+                        None => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            $(
+                if key == $bool_key {
+                    match parse_bool(value) {
+                        Some(parsed) => {
+                            settings.$($bool_field).+ = parsed;
+                            seen.push($bool_key);
+                        }
+                        None => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            $(
+                if key == $bool_alias_key || key == $bool_alias {
+                    match parse_bool(value) {
+                        Some(parsed) => {
+                            settings.$($bool_alias_field).+ = parsed;
+                            seen.push($bool_alias_key);
+                        }
+                        None => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            $(
+                if key == $int_key {
+                    match value.parse::<i64>() {
+                        Ok(parsed) => {
+                            settings.$($int_field).+ =
+                                clamp_i64(parsed, $int_min, $int_max, key, warnings) as $int_ty;
+                            seen.push($int_key);
+                        }
+                        Err(_) => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            $(
+                if key == $int_alias_key || key == $int_alias {
+                    match value.parse::<i64>() {
+                        Ok(parsed) => {
+                            settings.$($int_alias_field).+ = clamp_i64(
+                                parsed,
+                                $int_alias_min,
+                                $int_alias_max,
+                                key,
+                                warnings,
+                            ) as $int_alias_ty;
+                            seen.push($int_alias_key);
+                        }
+                        Err(_) => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            $(
+                if key == $float_key {
+                    match value.parse::<f32>() {
+                        Ok(parsed) if parsed.is_finite() => {
+                            settings.$($float_field).+ =
+                                clamp_f32(parsed, $float_min, $float_max, key, warnings);
+                            seen.push($float_key);
+                        }
+                        _ => invalid_toml_value(key, value, warnings),
+                    }
+                    return true;
+                }
+            )+
+            false
+        }
+
+        fn apply_declared_setting_key(
+            target: &mut ClientSettings,
+            parsed: &ClientSettings,
+            key: &str,
+        ) -> bool {
+            $(
+                if key == $enum_key {
+                    target.$($enum_field).+ = parsed.$($enum_field).+;
+                    return true;
+                }
+            )+
+            $(
+                if key == $bool_key {
+                    target.$($bool_field).+ = parsed.$($bool_field).+;
+                    return true;
+                }
+            )+
+            $(
+                if key == $bool_alias_key {
+                    target.$($bool_alias_field).+ = parsed.$($bool_alias_field).+;
+                    return true;
+                }
+            )+
+            $(
+                if key == $int_key {
+                    target.$($int_field).+ = parsed.$($int_field).+;
+                    return true;
+                }
+            )+
+            $(
+                if key == $int_alias_key {
+                    target.$($int_alias_field).+ = parsed.$($int_alias_field).+;
+                    return true;
+                }
+            )+
+            $(
+                if key == $float_key {
+                    target.$($float_field).+ = parsed.$($float_field).+;
+                    return true;
+                }
+            )+
+            false
+        }
+    };
+}
+
+define_setting_key_handlers! {
+    enum_keys {
+        ("preset", preset, QualityPreset),
+        ("distant_horizon", distant_horizon, DistantHorizon),
+        ("clouds", clouds, CloudMode),
+        ("particles", particles, ParticleLevel),
+        ("gpu_backend", gpu_backend, RenderBackendPreference),
+        ("crash_report_mode", crash_report_mode, CrashReportMode),
+        ("player_radar_scope", map_fair_play.player_radar_scope, HostPlayerRadarScope),
+    }
+    bool_keys {
+        ("smooth_lighting", smooth_lighting),
+        ("entity_shadows", entity_shadows),
+        ("comfort_exposure", comfort_exposure),
+        ("dynamic_lights", dynamic_lights),
+        ("enchantment_glint", enchantment_glint),
+        ("indirect_light_bounce", indirect_light_bounce),
+        ("directional_shadow_gameplay", directional_shadow_gameplay),
+        ("lazy_catchup_gameplay", lazy_catchup_gameplay),
+        ("vsync", vsync),
+        ("fullscreen", fullscreen),
+        ("mouse_invert_y", mouse_invert_y),
+        ("shaders_enabled", shaders_enabled),
+        ("builtin_looking_at_hud", builtin_looking_at_hud),
+        ("builtin_inventory_sort", builtin_inventory_sort),
+        ("zsh_command_bar", zsh_command_bar),
+        ("allow_cave_map", map_fair_play.allow_cave_map),
+        ("allow_waypoint_teleport", map_fair_play.allow_waypoint_teleport),
+        ("prevent_tool_break", qol.prevent_tool_break),
+        ("retain_chat_on_reconnect", qol.retain_chat_on_reconnect),
+        ("auto_reconnect", seamless_qol.auto_reconnect),
+        ("auto_replenish", seamless_qol.auto_replenish),
+        ("quick_stack_nearby", seamless_qol.quick_stack_nearby),
+        ("food_saturation_preview", seamless_qol.food_saturation_preview),
+        ("shulker_tooltip_peek", seamless_qol.shulker_tooltip_peek),
+        ("chat_scroll_lock", seamless_qol.chat_scroll_lock),
+        ("toast_notifications", seamless_qol.toast_notifications),
+        ("recipe_overlay_enabled", seamless_qol.recipe_overlay_enabled),
+    }
+    bool_aliases {
+        ("inventory_drag_controls", "builtin_mouse_tweaks", inventory_drag_controls),
+        ("compact_debug_hud_enabled", "mini_hud_enabled", compact_debug_hud_enabled),
+    }
+    int_keys {
+        ("view_distance", view_distance, u8, i64::from(MIN_VIEW_DISTANCE), i64::from(MAX_VIEW_DISTANCE)),
+        ("fov", fov, u8, i64::from(MIN_FOV), i64::from(MAX_FOV)),
+        ("mouse_sensitivity_pct", mouse_sensitivity_pct, u16, 10, 200),
+        ("volume_master", volume_master, u8, 0, 100),
+        ("volume_music", volume_music, u8, 0, 100),
+        ("volume_blocks", volume_blocks, u8, 0, 100),
+        ("volume_hostile", volume_hostile, u8, 0, 100),
+        ("volume_friendly", volume_friendly, u8, 0, 100),
+        ("background_fps_limit", background_fps_limit, u16, 0, i64::from(MAX_BACKGROUND_FPS)),
+        ("ram_budget_mib", ram_budget_mib, u32, 0, i64::from(u32::MAX)),
+        ("gamma_pct", gamma_pct, u16, 50, 200),
+        ("gui_scale", gui_scale, u8, 0, 4),
+        ("max_concurrent_same_sound", qol.max_concurrent_same_sound, u8, i64::from(MIN_MAX_CONCURRENT_SAME_SOUND), i64::from(MAX_MAX_CONCURRENT_SAME_SOUND)),
+        ("tool_warn_percent", qol.tool_warn_percent, u8, 0, i64::from(MAX_TOOL_WARN_PERCENT)),
+        ("chat_history_lines", qol.chat_history_lines, usize, MIN_CHAT_HISTORY_LINES as i64, MAX_CHAT_HISTORY_LINES as i64),
+    }
+    int_aliases {
+        ("compact_debug_hud_segments", "mini_hud_segments", compact_debug_hud_segments, u16, 0, 511),
+    }
+    float_keys {
+        ("max_volume_cap", qol.max_volume_cap, 0.0, MAX_VOLUME_CAP),
+        ("zoom_divisor", qol.zoom_divisor, MIN_ZOOM_DIVISOR, MAX_ZOOM_DIVISOR),
+    }
+}
+
 impl ClientSettings {
     /// One named bundle. `Custom` seeds the same defaults as `Balanced`;
     /// the preset merely records that the player then tuned fields.
@@ -937,139 +1196,24 @@ impl ClientSettings {
     pub fn apply_toml(&mut self, text: &str) -> Vec<String> {
         let (parsed, warnings, seen) = Self::parse_toml(text);
         for key in seen {
+            if self.keys.copy_field(&parsed.keys, key)
+                || apply_declared_setting_key(self, &parsed, key)
+            {
+                continue;
+            }
             match key {
-                "preset" => self.preset = parsed.preset,
-                "view_distance" => self.view_distance = parsed.view_distance,
-                "distant_horizon" => self.distant_horizon = parsed.distant_horizon,
-                "clouds" => self.clouds = parsed.clouds,
-                "particles" => self.particles = parsed.particles,
-                "smooth_lighting" => self.smooth_lighting = parsed.smooth_lighting,
-                "entity_shadows" => self.entity_shadows = parsed.entity_shadows,
-                "comfort_exposure" => self.comfort_exposure = parsed.comfort_exposure,
-                "dynamic_lights" => self.dynamic_lights = parsed.dynamic_lights,
-                "enchantment_glint" => self.enchantment_glint = parsed.enchantment_glint,
-                "indirect_light_bounce" => {
-                    self.indirect_light_bounce = parsed.indirect_light_bounce;
-                }
-                "directional_shadow_gameplay" => {
-                    self.directional_shadow_gameplay =
-                        parsed.directional_shadow_gameplay;
-                }
-                "lazy_catchup_gameplay" => {
-                    self.lazy_catchup_gameplay = parsed.lazy_catchup_gameplay;
-                }
-                "fov" => self.fov = parsed.fov,
-                "mouse_sensitivity_pct" => {
-                    self.mouse_sensitivity_pct = parsed.mouse_sensitivity_pct;
-                }
-                "volume_master" => self.volume_master = parsed.volume_master,
-                "volume_music" => self.volume_music = parsed.volume_music,
-                "volume_blocks" => self.volume_blocks = parsed.volume_blocks,
-                "volume_hostile" => self.volume_hostile = parsed.volume_hostile,
-                "volume_friendly" => self.volume_friendly = parsed.volume_friendly,
-                "vsync" => self.vsync = parsed.vsync,
                 "max_fps" => self.max_fps = parsed.max_fps,
-                "background_fps_limit" => {
-                    self.background_fps_limit = parsed.background_fps_limit;
-                }
-                "ram_budget_mib" => self.ram_budget_mib = parsed.ram_budget_mib,
-                "gpu_backend" => self.gpu_backend = parsed.gpu_backend,
-                "fullscreen" => self.fullscreen = parsed.fullscreen,
-                "mouse_invert_y" => self.mouse_invert_y = parsed.mouse_invert_y,
-                "gamma_pct" => self.gamma_pct = parsed.gamma_pct,
-                "gui_scale" => self.gui_scale = parsed.gui_scale,
-                "keys.forward" => self.keys.forward = parsed.keys.forward.clone(),
-                "keys.back" => self.keys.back = parsed.keys.back.clone(),
-                "keys.left" => self.keys.left = parsed.keys.left.clone(),
-                "keys.right" => self.keys.right = parsed.keys.right.clone(),
-                "keys.jump" => self.keys.jump = parsed.keys.jump.clone(),
-                "keys.sneak" => self.keys.sneak = parsed.keys.sneak.clone(),
-                "keys.sprint" => self.keys.sprint = parsed.keys.sprint.clone(),
-                "keys.inventory" => self.keys.inventory = parsed.keys.inventory.clone(),
-                "keys.drop" => self.keys.drop = parsed.keys.drop.clone(),
-                "keys.swap_offhand" => self.keys.swap_offhand = parsed.keys.swap_offhand.clone(),
-                "keys.chat" => self.keys.chat = parsed.keys.chat.clone(),
-                "keys.command" => self.keys.command = parsed.keys.command.clone(),
-                "keys.zoom" => self.keys.zoom = parsed.keys.zoom.clone(),
-                "keys.camera_toggle" => self.keys.camera_toggle = parsed.keys.camera_toggle.clone(),
-                "keys.fullscreen" => self.keys.fullscreen = parsed.keys.fullscreen.clone(),
-                "keys.advancements" => self.keys.advancements = parsed.keys.advancements.clone(),
-                "keys.sort_inventory" => {
-                    self.keys.sort_inventory = parsed.keys.sort_inventory.clone()
-                }
                 "shader_pack" => self.shader_pack = parsed.shader_pack.clone(),
-                "shaders_enabled" => self.shaders_enabled = parsed.shaders_enabled,
-                "builtin_looking_at_hud" => {
-                    self.builtin_looking_at_hud = parsed.builtin_looking_at_hud
-                }
-                "inventory_drag_controls" => {
-                    self.inventory_drag_controls = parsed.inventory_drag_controls
-                }
-                "builtin_inventory_sort" => {
-                    self.builtin_inventory_sort = parsed.builtin_inventory_sort
-                }
-                "zsh_command_bar" => self.zsh_command_bar = parsed.zsh_command_bar,
-                "compact_debug_hud_enabled" => self.compact_debug_hud_enabled = parsed.compact_debug_hud_enabled,
-                "compact_debug_hud_segments" => {
-                    self.compact_debug_hud_segments = parsed.compact_debug_hud_segments
-                }
                 "shader_profile" => self.shader_profile = parsed.shader_profile.clone(),
                 "minimap_fair_play" | "minimap_mode" => {
                     // The mirrored pair is already consistent in `parsed`.
                     self.map_fair_play.minimap_fair_play = parsed.map_fair_play.minimap_fair_play;
                     self.map_fair_play.minimap_mode = parsed.map_fair_play.minimap_mode;
                 }
-                "allow_cave_map" => {
-                    self.map_fair_play.allow_cave_map = parsed.map_fair_play.allow_cave_map;
-                }
                 "allow_entity_radar" | "allow_mob_radar" => {
                     self.map_fair_play.allow_entity_radar = parsed.map_fair_play.allow_entity_radar;
                     self.map_fair_play.allow_mob_radar = parsed.map_fair_play.allow_mob_radar;
                 }
-                "player_radar_scope" => {
-                    self.map_fair_play.player_radar_scope = parsed.map_fair_play.player_radar_scope;
-                }
-                "allow_waypoint_teleport" => {
-                    self.map_fair_play.allow_waypoint_teleport =
-                        parsed.map_fair_play.allow_waypoint_teleport;
-                }
-                "max_volume_cap" => self.qol.max_volume_cap = parsed.qol.max_volume_cap,
-                "max_concurrent_same_sound" => {
-                    self.qol.max_concurrent_same_sound = parsed.qol.max_concurrent_same_sound;
-                }
-                "zoom_divisor" => self.qol.zoom_divisor = parsed.qol.zoom_divisor,
-                "tool_warn_percent" => {
-                    self.qol.tool_warn_percent = parsed.qol.tool_warn_percent;
-                }
-                "prevent_tool_break" => {
-                    self.qol.prevent_tool_break = parsed.qol.prevent_tool_break;
-                }
-                "chat_history_lines" => {
-                    self.qol.chat_history_lines = parsed.qol.chat_history_lines;
-                }
-                "retain_chat_on_reconnect" => {
-                    self.qol.retain_chat_on_reconnect = parsed.qol.retain_chat_on_reconnect;
-                }
-                "auto_reconnect" => self.seamless_qol.auto_reconnect = parsed.seamless_qol.auto_reconnect,
-                "auto_replenish" => self.seamless_qol.auto_replenish = parsed.seamless_qol.auto_replenish,
-                "quick_stack_nearby" => {
-                    self.seamless_qol.quick_stack_nearby = parsed.seamless_qol.quick_stack_nearby;
-                }
-                "food_saturation_preview" => {
-                    self.seamless_qol.food_saturation_preview = parsed.seamless_qol.food_saturation_preview;
-                }
-                "shulker_tooltip_peek" => {
-                    self.seamless_qol.shulker_tooltip_peek = parsed.seamless_qol.shulker_tooltip_peek;
-                }
-                "chat_scroll_lock" => self.seamless_qol.chat_scroll_lock = parsed.seamless_qol.chat_scroll_lock,
-                "toast_notifications" => {
-                    self.seamless_qol.toast_notifications = parsed.seamless_qol.toast_notifications;
-                }
-                "recipe_overlay_enabled" => {
-                    self.seamless_qol.recipe_overlay_enabled =
-                        parsed.seamless_qol.recipe_overlay_enabled;
-                }
-                "crash_report_mode" => self.crash_report_mode = parsed.crash_report_mode,
                 "report_endpoint" => self.report_endpoint = parsed.report_endpoint.clone(),
                 _ => {}
             }
@@ -1114,28 +1258,9 @@ impl ClientSettings {
             let key = key.trim();
             let value = unquote(raw_value.trim());
             if section == "keys" {
-                let slot = match key {
-                    "forward" => (&mut settings.keys.forward, "keys.forward"),
-                    "back" => (&mut settings.keys.back, "keys.back"),
-                    "left" => (&mut settings.keys.left, "keys.left"),
-                    "right" => (&mut settings.keys.right, "keys.right"),
-                    "jump" => (&mut settings.keys.jump, "keys.jump"),
-                    "sneak" => (&mut settings.keys.sneak, "keys.sneak"),
-                    "sprint" => (&mut settings.keys.sprint, "keys.sprint"),
-                    "inventory" => (&mut settings.keys.inventory, "keys.inventory"),
-                    "drop" => (&mut settings.keys.drop, "keys.drop"),
-                    "swap_offhand" => (&mut settings.keys.swap_offhand, "keys.swap_offhand"),
-                    "chat" => (&mut settings.keys.chat, "keys.chat"),
-                    "command" => (&mut settings.keys.command, "keys.command"),
-                    "zoom" => (&mut settings.keys.zoom, "keys.zoom"),
-                    "camera_toggle" => (&mut settings.keys.camera_toggle, "keys.camera_toggle"),
-                    "fullscreen" => (&mut settings.keys.fullscreen, "keys.fullscreen"),
-                    "advancements" => (&mut settings.keys.advancements, "keys.advancements"),
-                    "sort_inventory" => (&mut settings.keys.sort_inventory, "keys.sort_inventory"),
-                    _ => {
-                        warnings.push(format!("unknown key '{key}' in [keys]"));
-                        continue;
-                    }
+                let Some((slot, canonical)) = settings.keys.field_mut(key) else {
+                    warnings.push(format!("unknown key '{key}' in [keys]"));
+                    continue;
                 };
                 if !value.is_empty()
                     && value.len() <= 32
@@ -1143,172 +1268,17 @@ impl ClientSettings {
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || b == b'_')
                 {
-                    *slot.0 = value.to_owned();
-                    seen.push(slot.1);
+                    *slot = value.to_owned();
+                    seen.push(canonical);
                 } else {
-                    warnings.push(format!("invalid value for '{key}': '{value}'"));
+                    invalid_toml_value(key, value, &mut warnings);
                 }
                 continue;
             }
-            let invalid = |warnings: &mut Vec<String>| {
-                warnings.push(format!("invalid value for '{key}': '{value}'"));
-            };
+            if parse_declared_setting_key(&mut settings, key, value, &mut warnings, &mut seen) {
+                continue;
+            }
             match key {
-                "preset" => match QualityPreset::parse(value) {
-                    Some(p) => {
-                        settings.preset = p;
-                        seen.push("preset");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "view_distance" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.view_distance = clamp_u8(
-                            v,
-                            i64::from(MIN_VIEW_DISTANCE),
-                            i64::from(MAX_VIEW_DISTANCE),
-                            key,
-                            &mut warnings,
-                        );
-                        seen.push("view_distance");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "distant_horizon" => match DistantHorizon::parse(value) {
-                    Some(d) => {
-                        settings.distant_horizon = d;
-                        seen.push("distant_horizon");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "clouds" => match CloudMode::parse(value) {
-                    Some(c) => {
-                        settings.clouds = c;
-                        seen.push("clouds");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "particles" => match ParticleLevel::parse(value) {
-                    Some(p) => {
-                        settings.particles = p;
-                        seen.push("particles");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "smooth_lighting" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.smooth_lighting = b;
-                        seen.push("smooth_lighting");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "entity_shadows" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.entity_shadows = b;
-                        seen.push("entity_shadows");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "comfort_exposure" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.comfort_exposure = b;
-                        seen.push("comfort_exposure");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "dynamic_lights" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.dynamic_lights = b;
-                        seen.push("dynamic_lights");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "enchantment_glint" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.enchantment_glint = b;
-                        seen.push("enchantment_glint");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "indirect_light_bounce" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.indirect_light_bounce = b;
-                        seen.push("indirect_light_bounce");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "directional_shadow_gameplay" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.directional_shadow_gameplay = b;
-                        seen.push("directional_shadow_gameplay");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "lazy_catchup_gameplay" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.lazy_catchup_gameplay = b;
-                        seen.push("lazy_catchup_gameplay");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "fov" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.fov = clamp_u8(
-                            v,
-                            i64::from(MIN_FOV),
-                            i64::from(MAX_FOV),
-                            key,
-                            &mut warnings,
-                        );
-                        seen.push("fov");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "mouse_sensitivity_pct" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.mouse_sensitivity_pct =
-                            clamp_i64(v, 10, 200, key, &mut warnings) as u16;
-                        seen.push("mouse_sensitivity_pct");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "volume_master" | "volume_music" | "volume_blocks" | "volume_hostile"
-                | "volume_friendly" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        let volume = clamp_u8(v, 0, 100, key, &mut warnings);
-                        let canonical: &'static str = match key {
-                            "volume_master" => {
-                                settings.volume_master = volume;
-                                "volume_master"
-                            }
-                            "volume_music" => {
-                                settings.volume_music = volume;
-                                "volume_music"
-                            }
-                            "volume_blocks" => {
-                                settings.volume_blocks = volume;
-                                "volume_blocks"
-                            }
-                            "volume_hostile" => {
-                                settings.volume_hostile = volume;
-                                "volume_hostile"
-                            }
-                            _ => {
-                                settings.volume_friendly = volume;
-                                "volume_friendly"
-                            }
-                        };
-                        seen.push(canonical);
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "vsync" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.vsync = b;
-                        seen.push("vsync");
-                    }
-                    None => invalid(&mut warnings),
-                },
                 "max_fps" => {
                     if value.eq_ignore_ascii_case("unlimited") || value.eq_ignore_ascii_case("none")
                     {
@@ -1330,136 +1300,23 @@ impl ClientSettings {
                                 ));
                                 seen.push("max_fps");
                             }
-                            Err(_) => invalid(&mut warnings),
+                            Err(_) => invalid_toml_value(key, value, &mut warnings),
                         }
                     }
                 }
-                "background_fps_limit" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.background_fps_limit =
-                            clamp_i64(v, 0, i64::from(MAX_BACKGROUND_FPS), key, &mut warnings)
-                                as u16;
-                        seen.push("background_fps_limit");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "ram_budget_mib" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        // `0` = Auto; anything above clamps to u32::MAX —
-                        // the live OOM guard, not this cap, is the real
-                        // protection against host memory exhaustion.
-                        settings.ram_budget_mib =
-                            clamp_u32(v, 0, i64::from(u32::MAX), key, &mut warnings);
-                        seen.push("ram_budget_mib");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "gpu_backend" => match RenderBackendPreference::parse(value) {
-                    Some(g) => {
-                        settings.gpu_backend = g;
-                        seen.push("gpu_backend");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "fullscreen" | "mouse_invert_y" => match parse_bool(value) {
-                    Some(value) => {
-                        if key == "fullscreen" {
-                            settings.fullscreen = value;
-                        } else {
-                            settings.mouse_invert_y = value;
-                        }
-                        seen.push(if key == "fullscreen" {
-                            "fullscreen"
-                        } else {
-                            "mouse_invert_y"
-                        });
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "gamma_pct" => match value.parse::<i64>() {
-                    Ok(value) => {
-                        settings.gamma_pct = clamp_i64(value, 50, 200, key, &mut warnings) as u16;
-                        seen.push("gamma_pct");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "gui_scale" => match value.parse::<i64>() {
-                    Ok(value) => {
-                        settings.gui_scale = clamp_i64(value, 0, 4, key, &mut warnings) as u8;
-                        seen.push("gui_scale");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
                 "shader_pack" => match sanitize_shader_selector(value) {
                     Some(v) => {
                         settings.shader_pack = Some(v);
                         seen.push("shader_pack");
                     }
-                    None => invalid(&mut warnings),
-                },
-                "shaders_enabled" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.shaders_enabled = v;
-                        seen.push("shaders_enabled");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "builtin_looking_at_hud" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.builtin_looking_at_hud = v;
-                        seen.push("builtin_looking_at_hud");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "inventory_drag_controls" | "builtin_mouse_tweaks" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.inventory_drag_controls = v;
-                        seen.push("inventory_drag_controls");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "builtin_inventory_sort" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.builtin_inventory_sort = v;
-                        seen.push("builtin_inventory_sort");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "zsh_command_bar" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.zsh_command_bar = v;
-                        seen.push("zsh_command_bar");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "compact_debug_hud_enabled" | "mini_hud_enabled" => match parse_bool(value) {
-                    Some(v) => {
-                        settings.compact_debug_hud_enabled = v;
-                        seen.push("compact_debug_hud_enabled");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "compact_debug_hud_segments" | "mini_hud_segments" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.compact_debug_hud_segments =
-                            clamp_i64(v, 0, 511, key, &mut warnings) as u16;
-                        seen.push("compact_debug_hud_segments");
-                    }
-                    Err(_) => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 "shader_profile" => match sanitize_shader_selector(value) {
                     Some(v) => {
                         settings.shader_profile = Some(v);
                         seen.push("shader_profile");
                     }
-                    None => invalid(&mut warnings),
-                },
-                "crash_report_mode" => match CrashReportMode::parse(value) {
-                    Some(m) => {
-                        settings.crash_report_mode = m;
-                        seen.push("crash_report_mode");
-                    }
-                    None => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 "report_endpoint" => {
                     if value.is_empty() {
@@ -1492,7 +1349,7 @@ impl ClientSettings {
                         };
                         seen.push("minimap_fair_play");
                     }
-                    None => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 "minimap_mode" => match HostMinimapMode::parse(value) {
                     Some(m) => {
@@ -1501,14 +1358,7 @@ impl ClientSettings {
                             m != HostMinimapMode::Unrestricted;
                         seen.push("minimap_mode");
                     }
-                    None => invalid(&mut warnings),
-                },
-                "allow_cave_map" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.map_fair_play.allow_cave_map = b;
-                        seen.push("allow_cave_map");
-                    }
-                    None => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 "allow_entity_radar" => match parse_bool(value) {
                     Some(b) => {
@@ -1518,7 +1368,7 @@ impl ClientSettings {
                         settings.map_fair_play.allow_mob_radar = b;
                         seen.push("allow_entity_radar");
                     }
-                    None => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 "allow_mob_radar" => match parse_bool(value) {
                     Some(b) => {
@@ -1526,142 +1376,7 @@ impl ClientSettings {
                         settings.map_fair_play.allow_mob_radar = b;
                         seen.push("allow_mob_radar");
                     }
-                    None => invalid(&mut warnings),
-                },
-                "player_radar_scope" => match HostPlayerRadarScope::parse(value) {
-                    Some(s) => {
-                        settings.map_fair_play.player_radar_scope = s;
-                        seen.push("player_radar_scope");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "allow_waypoint_teleport" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.map_fair_play.allow_waypoint_teleport = b;
-                        seen.push("allow_waypoint_teleport");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "max_volume_cap" => match value.parse::<f32>() {
-                    Ok(v) if v.is_finite() => {
-                        settings.qol.max_volume_cap =
-                            clamp_f32(v, 0.0, MAX_VOLUME_CAP, key, &mut warnings);
-                        seen.push("max_volume_cap");
-                    }
-                    _ => invalid(&mut warnings),
-                },
-                "max_concurrent_same_sound" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.qol.max_concurrent_same_sound = clamp_i64(
-                            v,
-                            i64::from(MIN_MAX_CONCURRENT_SAME_SOUND),
-                            i64::from(MAX_MAX_CONCURRENT_SAME_SOUND),
-                            key,
-                            &mut warnings,
-                        ) as u8;
-                        seen.push("max_concurrent_same_sound");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "zoom_divisor" => match value.parse::<f32>() {
-                    Ok(v) if v.is_finite() => {
-                        settings.qol.zoom_divisor =
-                            clamp_f32(v, MIN_ZOOM_DIVISOR, MAX_ZOOM_DIVISOR, key, &mut warnings);
-                        seen.push("zoom_divisor");
-                    }
-                    _ => invalid(&mut warnings),
-                },
-                "tool_warn_percent" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.qol.tool_warn_percent =
-                            clamp_i64(v, 0, i64::from(MAX_TOOL_WARN_PERCENT), key, &mut warnings)
-                                as u8;
-                        seen.push("tool_warn_percent");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "prevent_tool_break" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.qol.prevent_tool_break = b;
-                        seen.push("prevent_tool_break");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "chat_history_lines" => match value.parse::<i64>() {
-                    Ok(v) => {
-                        settings.qol.chat_history_lines = clamp_i64(
-                            v,
-                            MIN_CHAT_HISTORY_LINES as i64,
-                            MAX_CHAT_HISTORY_LINES as i64,
-                            key,
-                            &mut warnings,
-                        ) as usize;
-                        seen.push("chat_history_lines");
-                    }
-                    Err(_) => invalid(&mut warnings),
-                },
-                "retain_chat_on_reconnect" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.qol.retain_chat_on_reconnect = b;
-                        seen.push("retain_chat_on_reconnect");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "auto_reconnect" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.auto_reconnect = b;
-                        seen.push("auto_reconnect");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "auto_replenish" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.auto_replenish = b;
-                        seen.push("auto_replenish");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "quick_stack_nearby" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.quick_stack_nearby = b;
-                        seen.push("quick_stack_nearby");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "food_saturation_preview" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.food_saturation_preview = b;
-                        seen.push("food_saturation_preview");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "shulker_tooltip_peek" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.shulker_tooltip_peek = b;
-                        seen.push("shulker_tooltip_peek");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "chat_scroll_lock" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.chat_scroll_lock = b;
-                        seen.push("chat_scroll_lock");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "toast_notifications" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.toast_notifications = b;
-                        seen.push("toast_notifications");
-                    }
-                    None => invalid(&mut warnings),
-                },
-                "recipe_overlay_enabled" => match parse_bool(value) {
-                    Some(b) => {
-                        settings.seamless_qol.recipe_overlay_enabled = b;
-                        seen.push("recipe_overlay_enabled");
-                    }
-                    None => invalid(&mut warnings),
+                    None => invalid_toml_value(key, value, &mut warnings),
                 },
                 other => warnings.push(format!("unknown key '{other}' ignored")),
             }
@@ -1953,6 +1668,10 @@ pub fn sanitize_shader_selector(value: &str) -> Option<String> {
     is_valid_shader_selector(trimmed).then(|| trimmed.to_owned())
 }
 
+fn invalid_toml_value(key: &str, value: &str, warnings: &mut Vec<String>) {
+    warnings.push(format!("invalid value for '{key}': '{value}'"));
+}
+
 fn unquote(value: &str) -> &str {
     let bytes = value.as_bytes();
     if bytes.len() >= 2
@@ -1977,10 +1696,6 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 fn parse_i64(value: &str) -> Option<i64> {
     value.parse::<i64>().ok()
-}
-
-fn clamp_u8(value: i64, min: i64, max: i64, key: &str, warnings: &mut Vec<String>) -> u8 {
-    clamp_i64(value, min, max, key, warnings) as u8
 }
 
 fn clamp_u32(value: i64, min: i64, max: i64, key: &str, warnings: &mut Vec<String>) -> u32 {

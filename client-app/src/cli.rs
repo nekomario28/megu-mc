@@ -575,54 +575,38 @@ impl CliConfig {
                 as u8;
             tuned = true;
         }
-        if let Some(value) = self.fov {
-            settings.fov = value;
-            tuned = true;
+        macro_rules! apply_tuned_overrides {
+            ($(($cli_field:ident, $settings_field:ident),)+) => {
+                $(
+                    if let Some(value) = self.$cli_field {
+                        settings.$settings_field = value;
+                        tuned = true;
+                    }
+                )+
+            };
         }
-        if let Some(value) = self.distant_horizon {
-            settings.distant_horizon = value;
-            tuned = true;
+        apply_tuned_overrides! {
+            (fov, fov),
+            (distant_horizon, distant_horizon),
+            (clouds, clouds),
+            (particles, particles),
+            (smooth_lighting, smooth_lighting),
+            (entity_shadows, entity_shadows),
+            (vsync, vsync),
+            (max_fps, max_fps),
+            (background_fps, background_fps_limit),
+            (gpu_backend, gpu_backend),
         }
-        if let Some(value) = self.clouds {
-            settings.clouds = value;
-            tuned = true;
+        macro_rules! apply_cloned_override {
+            ($field:ident) => {
+                if let Some(value) = &self.$field {
+                    settings.$field = Some(value.clone());
+                    tuned = true;
+                }
+            };
         }
-        if let Some(value) = self.particles {
-            settings.particles = value;
-            tuned = true;
-        }
-        if let Some(value) = self.smooth_lighting {
-            settings.smooth_lighting = value;
-            tuned = true;
-        }
-        if let Some(value) = self.entity_shadows {
-            settings.entity_shadows = value;
-            tuned = true;
-        }
-        if let Some(value) = self.vsync {
-            settings.vsync = value;
-            tuned = true;
-        }
-        if let Some(value) = self.max_fps {
-            settings.max_fps = value;
-            tuned = true;
-        }
-        if let Some(value) = self.background_fps {
-            settings.background_fps_limit = value;
-            tuned = true;
-        }
-        if let Some(value) = self.gpu_backend {
-            settings.gpu_backend = value;
-            tuned = true;
-        }
-        if let Some(value) = &self.shader_pack {
-            settings.shader_pack = Some(value.clone());
-            tuned = true;
-        }
-        if let Some(value) = &self.shader_profile {
-            settings.shader_profile = Some(value.clone());
-            tuned = true;
-        }
+        apply_cloned_override!(shader_pack);
+        apply_cloned_override!(shader_profile);
         // Crash-report policy flags: consent and egress configuration,
         // not quality-preset dimensions, so they do not mark `Custom`.
         if let Some(mode) = self.crash_report_mode {
@@ -810,6 +794,175 @@ fn parse_on_off(value: &str, flag: &str) -> Result<bool, String> {
     }
 }
 
+fn parse_cli_num<T: std::str::FromStr>(raw: &str, flag: &str) -> Result<T, String> {
+    raw.parse::<T>()
+        .map_err(|_| format!("invalid {flag} '{raw}'"))
+}
+
+macro_rules! define_cli_flag_handlers {
+    (
+        unit_flags { $(($unit_flag:literal, $unit_field:ident),)+ }
+        ignored_units { $($ignored_unit:literal,)+ }
+        string_values { $(($string_flag:literal, $string_field:ident),)+ }
+        optional_string_values { $(($optional_string_flag:literal, $optional_string_field:ident),)+ }
+        path_values { $(($path_flag:literal, $path_field:ident),)+ }
+        on_off_values { $(($on_off_flag:literal, $on_off_field:ident),)+ }
+        enum_values { $(($enum_flag:literal, $enum_field:ident, $enum_ty:ty, $enum_error:literal),)+ }
+        ignored_values { $($ignored_value:literal,)+ }
+    ) => {
+        fn parse_declared_cli_flag(
+            cfg: &mut CliConfig,
+            flag: &str,
+            idx: &mut usize,
+            take_val: &mut dyn FnMut(&str, &mut usize) -> Result<String, String>,
+        ) -> Result<bool, String> {
+            $(
+                if flag == $unit_flag {
+                    cfg.$unit_field = true;
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $ignored_unit {
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $string_flag {
+                    cfg.$string_field = take_val(flag, idx)?;
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $optional_string_flag {
+                    cfg.$optional_string_field =
+                        Some(take_val(flag, idx)?);
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $path_flag {
+                    cfg.$path_field =
+                        Some(PathBuf::from(take_val(flag, idx)?));
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $on_off_flag {
+                    cfg.$on_off_field =
+                        Some(parse_on_off(&take_val(flag, idx)?, flag)?);
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $enum_flag {
+                    let raw = take_val(flag, idx)?;
+                    cfg.$enum_field = Some(
+                        <$enum_ty>::parse(&raw)
+                            .ok_or_else(|| format!($enum_error, raw = raw))?,
+                    );
+                    return Ok(true);
+                }
+            )+
+            $(
+                if flag == $ignored_value {
+                    let _ = take_val(flag, idx)?;
+                    return Ok(true);
+                }
+            )+
+            Ok(false)
+        }
+    };
+}
+
+define_cli_flag_handlers! {
+    unit_flags {
+        ("-h", show_help),
+        ("--help", show_help),
+        ("--version-info", show_version_info),
+        ("--headless", headless),
+        ("--json", json_summary),
+        ("--json-summary", json_summary),
+        ("--hardcore", hardcore),
+        ("--auto-tune", auto_tune),
+        ("--fair-play", fair_play),
+        ("--flush-crash-reports", flush_crash_reports),
+        ("--confirm-send", confirm_send),
+    }
+    // Standard optional Minecraft launcher flags that take no value.
+    ignored_units {
+        "--demo",
+        "--fullscreen",
+        "--disableMultiplayer",
+        "--disableChat",
+    }
+    string_values {
+        ("--username", username),
+    }
+    optional_string_values {
+        ("--uuid", uuid),
+        ("--accessToken", access_token),
+        ("--clientToken", client_token),
+        ("--authToken", client_token),
+        ("--token", client_token),
+        ("--clientId", client_id),
+        ("--xuid", xuid),
+        ("--userType", user_type),
+        ("--version", version),
+        ("--versionType", version_type),
+        ("--assetIndex", asset_index),
+        ("--quickPlayMultiplayer", quick_play_multiplayer),
+        ("--quickPlaySingleplayer", quick_play_singleplayer),
+        ("--server", server),
+        ("--relay", relay),
+        ("--ping", ping),
+    }
+    path_values {
+        ("--gameDir", game_dir),
+        ("--assetsDir", assets_dir),
+        ("--server-bin", server_bin),
+        ("--settings", settings_path),
+        ("--import-vanilla-options", import_vanilla_options),
+        ("--write-settings", write_settings),
+        ("--write-default-settings", write_default_settings),
+        ("--version-dir", version_dir),
+        ("--assets-json", assets_json),
+        ("--render-png", render_png),
+        ("--crash-reports-dir", crash_reports_dir),
+    }
+    on_off_values {
+        ("--smooth-lighting", smooth_lighting),
+        ("--entity-shadows", entity_shadows),
+        ("--vsync", vsync),
+        ("--allow-cave-map", allow_cave_map),
+        ("--allow-entity-radar", allow_entity_radar),
+        ("--allow-mob-radar", allow_mob_radar),
+        ("--allow-waypoint-teleport", allow_waypoint_teleport),
+    }
+    enum_values {
+        ("--preset", preset, QualityPreset, "invalid --preset '{raw}' (expected fast, balanced, high, or ultra)"),
+        ("--distant-horizon", distant_horizon, DistantHorizon, "invalid --distant-horizon '{raw}' (expected off, medium, or far)"),
+        ("--clouds", clouds, CloudMode, "invalid --clouds '{raw}' (expected off, fast, or fancy)"),
+        ("--particles", particles, ParticleLevel, "invalid --particles '{raw}' (expected minimal, decreased, or all)"),
+        ("--gpu-backend", gpu_backend, RenderBackendPreference, "invalid --gpu-backend '{raw}' (expected auto, mesh-shader, compute-indirect, classic-low-spec, or classic)"),
+        ("--minimap-mode", minimap_mode, HostMinimapMode, "invalid --minimap-mode '{raw}' (expected unrestricted, fair_play, or disabled)"),
+        ("--player-radar", player_radar, HostPlayerRadarScope, "invalid --player-radar '{raw}' (expected all, party_only, or none)"),
+        ("--crash-report-mode", crash_report_mode, CrashReportMode, "invalid --crash-report-mode '{raw}' (expected ask, auto_crash_only, or off)"),
+    }
+    // Standard optional Minecraft launcher flags that take a single value.
+    ignored_values {
+        "--userProperties",
+        "--profileProperties",
+        "--quickPlayPath",
+        "--quickPlayRealms",
+        "--resourcePackDir",
+        "--proxyHost",
+        "--proxyPort",
+        "--proxyUser",
+        "--proxyPass",
+    }
+}
+
 pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<CliConfig, String> {
     let secrets = collect_secrets(args);
     parse_args_inner(args, secrets.clone()).map_err(|err| redact_with_secrets(&err, &secrets))
@@ -829,7 +982,7 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             _ => (raw, None),
         };
 
-        let take_val = |flag_name: &str, idx: &mut usize| -> Result<String, String> {
+        let mut take_val = |flag_name: &str, idx: &mut usize| -> Result<String, String> {
             if let Some(v) = inline_val {
                 return Ok(v.to_string());
             }
@@ -839,25 +992,12 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 .ok_or_else(|| format!("missing value for {flag_name}"))
         };
 
+        if parse_declared_cli_flag(&mut cfg, flag, &mut i, &mut take_val)? {
+            i += 1;
+            continue;
+        }
+
         match flag {
-            "-h" | "--help" => cfg.show_help = true,
-            "--version-info" => cfg.show_version_info = true,
-            "--headless" => cfg.headless = true,
-            "--json" | "--json-summary" => cfg.json_summary = true,
-            "--username" => cfg.username = take_val(flag, &mut i)?,
-            "--uuid" => cfg.uuid = Some(take_val(flag, &mut i)?),
-            "--accessToken" => cfg.access_token = Some(take_val(flag, &mut i)?),
-            "--clientToken" | "--authToken" | "--token" => {
-                cfg.client_token = Some(take_val(flag, &mut i)?);
-            }
-            "--clientId" => cfg.client_id = Some(take_val(flag, &mut i)?),
-            "--xuid" => cfg.xuid = Some(take_val(flag, &mut i)?),
-            "--userType" => cfg.user_type = Some(take_val(flag, &mut i)?),
-            "--version" => cfg.version = Some(take_val(flag, &mut i)?),
-            "--versionType" => cfg.version_type = Some(take_val(flag, &mut i)?),
-            "--gameDir" => cfg.game_dir = Some(PathBuf::from(take_val(flag, &mut i)?)),
-            "--assetsDir" => cfg.assets_dir = Some(PathBuf::from(take_val(flag, &mut i)?)),
-            "--assetIndex" => cfg.asset_index = Some(take_val(flag, &mut i)?),
             "--audio-sink" => {
                 let raw = take_val(flag, &mut i)?;
                 let raw = raw.to_ascii_lowercase();
@@ -879,13 +1019,6 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             "--audio-wav" => {
                 cfg.audio_sink = AudioSinkKind::Wav(PathBuf::from(take_val(flag, &mut i)?));
             }
-            "--quickPlayMultiplayer" => {
-                cfg.quick_play_multiplayer = Some(take_val(flag, &mut i)?);
-            }
-            "--quickPlaySingleplayer" => {
-                cfg.quick_play_singleplayer = Some(take_val(flag, &mut i)?);
-            }
-            "--server" => cfg.server = Some(take_val(flag, &mut i)?),
             "--gamemode" => {
                 let value = take_val(flag, &mut i)?.to_ascii_lowercase();
                 if !matches!(
@@ -903,7 +1036,6 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 }
                 cfg.difficulty = Some(value);
             }
-            "--hardcore" => cfg.hardcore = true,
             "--join-code" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.join_code = Some(
@@ -911,95 +1043,36 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                         .map_err(|e| format!("invalid --join-code '{raw}': {e}"))?,
                 );
             }
-            "--relay" => cfg.relay = Some(take_val(flag, &mut i)?),
-            "--server-bin" => cfg.server_bin = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--seed" => {
-                let raw_seed = take_val(flag, &mut i)?;
-                cfg.seed = Some(
-                    raw_seed
-                        .parse::<i64>()
-                        .map_err(|_| format!("invalid --seed '{raw_seed}'"))?,
-                );
+                let raw = take_val(flag, &mut i)?;
+                cfg.seed = Some(parse_cli_num::<i64>(&raw, flag)?);
             }
             "--port" => {
-                let raw_port = take_val(flag, &mut i)?;
-                cfg.port = raw_port
-                    .parse::<u16>()
-                    .map_err(|_| format!("invalid --port '{raw_port}'"))?;
+                let raw = take_val(flag, &mut i)?;
+                cfg.port = parse_cli_num::<u16>(&raw, flag)?;
             }
             "--ticks" => {
-                let raw_ticks = take_val(flag, &mut i)?;
-                cfg.ticks = raw_ticks
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid --ticks '{raw_ticks}'"))?;
+                let raw = take_val(flag, &mut i)?;
+                cfg.ticks = parse_cli_num::<u32>(&raw, flag)?;
             }
             "--view-distance" => {
                 let raw_vd = take_val(flag, &mut i)?;
-                let parsed = raw_vd
-                    .parse::<i32>()
-                    .map_err(|_| format!("invalid --view-distance '{raw_vd}'"))?;
+                let parsed = parse_cli_num::<i32>(&raw_vd, flag)?;
                 if !(2..=32).contains(&parsed) {
                     return Err(format!("--view-distance must be in 2..=32 (got {parsed})"));
                 }
                 cfg.view_distance = parsed as i8;
                 cfg.view_distance_explicit = true;
             }
-            "--settings" => cfg.settings_path = Some(PathBuf::from(take_val(flag, &mut i)?)),
-            "--preset" => {
-                let raw_preset = take_val(flag, &mut i)?;
-                cfg.preset = Some(QualityPreset::parse(&raw_preset).ok_or_else(|| {
-                    format!(
-                        "invalid --preset '{raw_preset}' (expected fast, balanced, high, or ultra)"
-                    )
-                })?);
-            }
-            "--import-vanilla-options" => {
-                cfg.import_vanilla_options = Some(PathBuf::from(take_val(flag, &mut i)?));
-            }
-            "--write-settings" => {
-                cfg.write_settings = Some(PathBuf::from(take_val(flag, &mut i)?));
-            }
-            "--write-default-settings" => {
-                cfg.write_default_settings = Some(PathBuf::from(take_val(flag, &mut i)?));
-            }
             "--fov" => {
                 let raw_fov = take_val(flag, &mut i)?;
-                let parsed = raw_fov
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid --fov '{raw_fov}'"))?;
+                let parsed = parse_cli_num::<i64>(&raw_fov, flag)?;
                 if !(i64::from(MIN_FOV)..=i64::from(MAX_FOV)).contains(&parsed) {
                     return Err(format!(
                         "--fov must be in {MIN_FOV}..={MAX_FOV} (got {parsed})"
                     ));
                 }
                 cfg.fov = Some(parsed as u8);
-            }
-            "--distant-horizon" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.distant_horizon = Some(DistantHorizon::parse(&raw).ok_or_else(|| {
-                    format!("invalid --distant-horizon '{raw}' (expected off, medium, or far)")
-                })?);
-            }
-            "--clouds" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.clouds = Some(CloudMode::parse(&raw).ok_or_else(|| {
-                    format!("invalid --clouds '{raw}' (expected off, fast, or fancy)")
-                })?);
-            }
-            "--particles" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.particles = Some(ParticleLevel::parse(&raw).ok_or_else(|| {
-                    format!("invalid --particles '{raw}' (expected minimal, decreased, or all)")
-                })?);
-            }
-            "--smooth-lighting" => {
-                cfg.smooth_lighting = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
-            "--entity-shadows" => {
-                cfg.entity_shadows = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
-            "--vsync" => {
-                cfg.vsync = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
             }
             "--max-fps" => {
                 let raw = take_val(flag, &mut i)?;
@@ -1009,9 +1082,7 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 ) {
                     cfg.max_fps = Some(None);
                 } else {
-                    let parsed = raw
-                        .parse::<i64>()
-                        .map_err(|_| format!("invalid --max-fps '{raw}'"))?;
+                    let parsed = parse_cli_num::<i64>(&raw, flag)?;
                     if parsed == 0 {
                         cfg.max_fps = Some(None);
                     } else {
@@ -1026,24 +1097,13 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
             }
             "--background-fps" => {
                 let raw = take_val(flag, &mut i)?;
-                let parsed = raw
-                    .parse::<i64>()
-                    .map_err(|_| format!("invalid --background-fps '{raw}'"))?;
+                let parsed = parse_cli_num::<i64>(&raw, flag)?;
                 if !(0..=i64::from(MAX_BACKGROUND_FPS)).contains(&parsed) {
                     return Err(format!(
                         "--background-fps must be in 0..={MAX_BACKGROUND_FPS} (got {parsed})"
                     ));
                 }
                 cfg.background_fps = Some(parsed as u16);
-            }
-            "--gpu-backend" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.gpu_backend = Some(RenderBackendPreference::parse(&raw).ok_or_else(|| {
-                    format!(
-                        "invalid --gpu-backend '{raw}' (expected auto, mesh-shader, \
-                         compute-indirect, classic-low-spec, or classic)"
-                    )
-                })?);
             }
             "--shader-pack" => {
                 let raw = take_val(flag, &mut i)?;
@@ -1063,94 +1123,27 @@ fn parse_args_inner<S: AsRef<str>>(args: &[S], secrets: Vec<String>) -> Result<C
                 };
                 cfg.shader_profile = Some(value);
             }
-            "--auto-tune" => cfg.auto_tune = true,
-            "--fair-play" => cfg.fair_play = true,
-            "--minimap-mode" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.minimap_mode = Some(HostMinimapMode::parse(&raw).ok_or_else(|| {
-                    format!(
-                        "invalid --minimap-mode '{raw}' (expected unrestricted, fair_play, or disabled)"
-                    )
-                })?);
-            }
-            "--allow-cave-map" => {
-                cfg.allow_cave_map = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
-            "--allow-entity-radar" => {
-                cfg.allow_entity_radar = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
-            "--allow-mob-radar" => {
-                cfg.allow_mob_radar = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
-            "--player-radar" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.player_radar = Some(HostPlayerRadarScope::parse(&raw).ok_or_else(|| {
-                    format!("invalid --player-radar '{raw}' (expected all, party_only, or none)")
-                })?);
-            }
-            "--allow-waypoint-teleport" => {
-                cfg.allow_waypoint_teleport = Some(parse_on_off(&take_val(flag, &mut i)?, flag)?);
-            }
             "--mc-version" => {
                 let raw = take_val(flag, &mut i)?;
                 cfg.mc_version = parse_mc_version(&raw)?;
             }
-            "--ping" => cfg.ping = Some(take_val(flag, &mut i)?),
-            "--version-dir" => {
-                cfg.version_dir = Some(PathBuf::from(take_val(flag, &mut i)?));
-            }
-            "--assets-json" => cfg.assets_json = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--script" => {
                 let raw_script = take_val(flag, &mut i)?;
                 cfg.script = ScriptMode::parse(&raw_script)?;
             }
-            "--render-png" => cfg.render_png = Some(PathBuf::from(take_val(flag, &mut i)?)),
             "--width" => {
                 let raw_w = take_val(flag, &mut i)?;
-                let parsed = raw_w
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid --width '{raw_w}'"))?;
-                cfg.render_width = parsed.clamp(64, 1920);
+                cfg.render_width = parse_cli_num::<u32>(&raw_w, flag)?.clamp(64, 1920);
             }
             "--height" => {
                 let raw_h = take_val(flag, &mut i)?;
-                let parsed = raw_h
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid --height '{raw_h}'"))?;
-                cfg.render_height = parsed.clamp(64, 1080);
-            }
-            "--crash-report-mode" => {
-                let raw = take_val(flag, &mut i)?;
-                cfg.crash_report_mode = Some(CrashReportMode::parse(&raw).ok_or_else(|| {
-                    format!(
-                        "invalid --crash-report-mode '{raw}' (expected ask, auto_crash_only, or off)"
-                    )
-                })?);
+                cfg.render_height = parse_cli_num::<u32>(&raw_h, flag)?.clamp(64, 1080);
             }
             "--report-endpoint" => {
                 let raw = take_val(flag, &mut i)?;
                 parse_report_url(&raw)
                     .map_err(|err| format!("invalid --report-endpoint '{raw}': {err}"))?;
                 cfg.report_endpoint = Some(raw);
-            }
-            "--crash-reports-dir" => {
-                cfg.crash_reports_dir = Some(PathBuf::from(take_val(flag, &mut i)?));
-            }
-            "--flush-crash-reports" => cfg.flush_crash_reports = true,
-            "--confirm-send" => cfg.confirm_send = true,
-            // Standard optional Minecraft launcher flags that take no value.
-            "--demo" | "--fullscreen" | "--disableMultiplayer" | "--disableChat" => {}
-            // Standard optional Minecraft launcher flags that take a single value.
-            "--userProperties"
-            | "--profileProperties"
-            | "--quickPlayPath"
-            | "--quickPlayRealms"
-            | "--resourcePackDir"
-            | "--proxyHost"
-            | "--proxyPort"
-            | "--proxyUser"
-            | "--proxyPass" => {
-                let _ = take_val(flag, &mut i)?;
             }
             other => {
                 return Err(format!("unrecognized argument '{other}'"));
