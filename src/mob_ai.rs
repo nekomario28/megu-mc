@@ -878,6 +878,59 @@ fn entity_distance_sq(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
+/// The closest cell accepted by `accept` in a `±horizontal` x `±vertical` box
+/// around the mob — the shared body of the vanilla block searches
+/// (`findNearestBlock`, `DoorInteractGoal`). Cells are visited y/x/z and ties on
+/// squared distance keep the first hit, which is the scan order those goals use.
+fn nearest_cell(
+    ctx: &GoalContext<'_>,
+    horizontal: i32,
+    vertical: i32,
+    accept: impl Fn(&dyn PathWorld, (i32, i32, i32)) -> bool,
+) -> Option<(i32, i32, i32)> {
+    let world = ctx.world?;
+    let (cx, cy, cz) = (
+        ctx.position.0.floor() as i32,
+        ctx.position.1.floor() as i32,
+        ctx.position.2.floor() as i32,
+    );
+    let mut best: Option<((i32, i32, i32), i64)> = None;
+    for dy in -vertical..=vertical {
+        for dx in -horizontal..=horizontal {
+            for dz in -horizontal..=horizontal {
+                let (Some(x), Some(y), Some(z)) =
+                    (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
+                else {
+                    continue;
+                };
+                if !accept(world, (x, y, z)) {
+                    continue;
+                }
+                let distance_sq = i64::from(dx) * i64::from(dx)
+                    + i64::from(dy) * i64::from(dy)
+                    + i64::from(dz) * i64::from(dz);
+                if best.is_none_or(|(_, old)| distance_sq < old) {
+                    best = Some(((x, y, z), distance_sq));
+                }
+            }
+        }
+    }
+    best.map(|(pos, _)| pos)
+}
+
+/// Whether a block cell's centre, raised `dy` above the cell floor, lies within
+/// `radius_sq` of the mob.
+fn cell_within(ctx: &GoalContext<'_>, cell: (i32, i32, i32), dy: f64, radius_sq: f64) -> bool {
+    entity_distance_sq(
+        ctx.position,
+        (
+            f64::from(cell.0) + 0.5,
+            f64::from(cell.1) + dy,
+            f64::from(cell.2) + 0.5,
+        ),
+    ) <= radius_sq
+}
+
 /// A projectile launch a ranged goal wants the caller to perform. The caller
 /// owns spawning, spread/inaccuracy, and damage application.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -956,7 +1009,11 @@ pub(crate) trait Goal {
     fn priority(&self) -> i32;
     fn flags(&self) -> u8;
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool;
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool;
+    /// Vanilla goals keep running while `canUse` still holds unless they track
+    /// extra state; that common case needs no override.
+    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
+        self.can_use(ctx)
+    }
     fn is_interruptable(&self) -> bool {
         true
     }
@@ -975,6 +1032,44 @@ pub(crate) trait Goal {
 struct RunningGoal {
     goal: Box<dyn Goal>,
     running: bool,
+}
+
+/// The two `Goal` accessors every goal repeats verbatim: the registration
+/// priority it stores and the vanilla mutex flag mask of its goal class.
+macro_rules! goal_accessors {
+    ($flags:expr) => {
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+        fn flags(&self) -> u8 {
+            $flags
+        }
+    };
+}
+
+/// `Goal` accessors for a wrapper that inherits its inner goal's class.
+macro_rules! delegated_accessors {
+    ($field:ident) => {
+        fn priority(&self) -> i32 {
+            self.$field.priority
+        }
+        fn flags(&self) -> u8 {
+            self.$field.flags()
+        }
+    };
+}
+
+/// `Goal` lifecycle passthroughs for the wrappers that decorate an inner goal;
+/// a wrapper only spells out the methods it changes.
+macro_rules! delegated_lifecycle {
+    () => {
+        fn start(&mut self, ctx: &GoalContext<'_>) {
+            self.inner.start(ctx);
+        }
+        fn stop(&mut self, ctx: &GoalContext<'_>) {
+            self.inner.stop(ctx);
+        }
+    };
 }
 
 #[derive(Default)]
@@ -1001,6 +1096,10 @@ impl GoalSelector {
     }
 
     pub fn tick(&mut self, ctx: &GoalContext<'_>) -> GoalOutput {
+        // Selector-less mobs skip the schedule entirely.
+        if self.goals.is_empty() {
+            return GoalOutput::default();
+        }
         for entry in &mut self.goals {
             entry.goal.perceive(ctx.position, &self.perception);
         }
@@ -1114,17 +1213,9 @@ pub(crate) struct FloatGoal {
 }
 
 impl Goal for FloatGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::JUMP
-    }
+    goal_accessors!(GoalFlags::JUMP);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.in_water || ctx.in_lava
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -1168,12 +1259,7 @@ impl SwellGoal {
 }
 
 impl Goal for SwellGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
         let max_sq = f64::from(self.avoid_dist) * f64::from(self.avoid_dist);
         self.avoid_threat = !self.avoid_etypes.is_empty()
@@ -1228,17 +1314,9 @@ impl MeleeAttackGoal {
 }
 
 impl Goal for MeleeAttackGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.target.is_some()
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -1345,12 +1423,7 @@ impl RandomLookAroundGoal {
 }
 
 impl Goal for RandomLookAroundGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
         self.armed
     }
@@ -1423,12 +1496,7 @@ impl LeapAtTargetGoal {
 }
 
 impl Goal for LeapAtTargetGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::JUMP
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::JUMP);
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
         self.armed
     }
@@ -1488,27 +1556,14 @@ impl SpiderAttackGoal {
 }
 
 impl Goal for SpiderAttackGoal {
-    fn priority(&self) -> i32 {
-        self.inner.priority
-    }
-    fn flags(&self) -> u8 {
-        self.inner.flags()
-    }
+    delegated_accessors!(inner);
+    delegated_lifecycle!();
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.inner.can_use(ctx)
             && !(mob_in_open_daylight(ctx, self.daytime) && !ctx.recently_hurt)
     }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
-    }
-    fn start(&mut self, ctx: &GoalContext<'_>) {
-        self.inner.start(ctx);
-    }
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
         self.inner.tick(ctx)
-    }
-    fn stop(&mut self, ctx: &GoalContext<'_>) {
-        self.inner.stop(ctx);
     }
     fn stop_output(&self) -> Option<GoalOutput> {
         self.inner.stop_output()
@@ -1532,28 +1587,15 @@ impl ZombieAttackGoal {
 }
 
 impl Goal for ZombieAttackGoal {
-    fn priority(&self) -> i32 {
-        self.inner.priority
-    }
-    fn flags(&self) -> u8 {
-        self.inner.flags()
-    }
+    delegated_accessors!(inner);
+    delegated_lifecycle!();
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.inner.can_use(ctx)
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
-    }
-    fn start(&mut self, ctx: &GoalContext<'_>) {
-        self.inner.start(ctx);
     }
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
         let mut output = self.inner.tick(ctx)?;
         output.arms_raised = Some(true);
         Some(output)
-    }
-    fn stop(&mut self, ctx: &GoalContext<'_>) {
-        self.inner.stop(ctx);
     }
     fn stop_output(&self) -> Option<GoalOutput> {
         Some(GoalOutput {
@@ -1596,44 +1638,14 @@ impl BreakDoorGoal {
     /// A closed wooden door within arm's reach — the cells vanilla's
     /// `DoorInteractGoal` sees from the mob's navigation node.
     fn find_door(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
-        let world = ctx.world?;
-        let (cx, cy, cz) = (
-            ctx.position.0.floor() as i32,
-            ctx.position.1.floor() as i32,
-            ctx.position.2.floor() as i32,
-        );
-        let mut best: Option<((i32, i32, i32), i64)> = None;
-        for dy in -1..=1_i32 {
-            for dx in -1..=1_i32 {
-                for dz in -1..=1_i32 {
-                    let (Some(x), Some(y), Some(z)) =
-                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
-                    else {
-                        continue;
-                    };
-                    if world.path_type(x, y, z) != BlockPathType::DoorWoodClosed {
-                        continue;
-                    }
-                    let distance_sq = i64::from(dx) * i64::from(dx)
-                        + i64::from(dy) * i64::from(dy)
-                        + i64::from(dz) * i64::from(dz);
-                    if best.is_none_or(|(_, old)| distance_sq < old) {
-                        best = Some(((x, y, z), distance_sq));
-                    }
-                }
-            }
-        }
-        best.map(|(pos, _)| pos)
+        nearest_cell(ctx, 1, 1, |world, (x, y, z)| {
+            world.path_type(x, y, z) == BlockPathType::DoorWoodClosed
+        })
     }
 }
 
 impl Goal for BreakDoorGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::JUMP
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::JUMP);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.mob_griefing.check()
             && self.difficulty_test.check()
@@ -1713,55 +1725,21 @@ impl ZombieAttackTurtleEggGoal {
     /// `findNearestBlock` — the closest turtle-egg cell in the vanilla
     /// MoveToBlockGoal search volume (24 horizontal, 3 vertical).
     fn find_egg(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
-        let world = ctx.world?;
-        let (cx, cy, cz) = (
-            ctx.position.0.floor() as i32,
-            ctx.position.1.floor() as i32,
-            ctx.position.2.floor() as i32,
-        );
-        let mut best: Option<((i32, i32, i32), i64)> = None;
-        for dy in -1..=1_i32 {
-            for dx in -12..=12_i32 {
-                for dz in -12..=12_i32 {
-                    let (Some(x), Some(y), Some(z)) =
-                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
-                    else {
-                        continue;
-                    };
-                    if world.block_name(x, y, z) != "minecraft:turtle_egg" {
-                        continue;
-                    }
-                    let distance_sq = i64::from(dx) * i64::from(dx)
-                        + i64::from(dy) * i64::from(dy)
-                        + i64::from(dz) * i64::from(dz);
-                    if best.is_none_or(|(_, old)| distance_sq < old) {
-                        best = Some(((x, y, z), distance_sq));
-                    }
-                }
-            }
-        }
-        best.map(|(pos, _)| pos)
+        nearest_cell(ctx, 12, 1, |world, (x, y, z)| {
+            world.block_name(x, y, z) == "minecraft:turtle_egg"
+        })
     }
 
     /// `isReachedTarget`: the mob stands on the egg — within vanilla's 1.14
     /// accepted distance of the block above it.
     fn reached_egg(&self, ctx: &GoalContext<'_>) -> bool {
-        self.egg.is_some_and(|(x, y, z)| {
-            entity_distance_sq(
-                ctx.position,
-                (f64::from(x) + 0.5, f64::from(y) + 1.0, f64::from(z) + 0.5),
-            ) <= 1.14_f64.powi(2)
-        })
+        self.egg
+            .is_some_and(|cell| cell_within(ctx, cell, 1.0, 1.14_f64.powi(2)))
     }
 }
 
 impl Goal for ZombieAttackTurtleEggGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::JUMP
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::JUMP);
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
         self.mob_griefing.check() && self.egg.is_some()
     }
@@ -1840,17 +1818,9 @@ impl RestrictSunGoal {
 }
 
 impl Goal for RestrictSunGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        0
-    }
+    goal_accessors!(0);
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
         self.daytime.check()
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -1890,49 +1860,18 @@ impl FleeSunGoal {
     /// `setHidePlacePosition` — the nearest standable cell within 11x5x11
     /// that daylight cannot reach.
     fn find_shade(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
-        let world = ctx.world?;
         let evaluator = WalkNodeEvaluator {
             mob_height: ctx.height,
             ..WalkNodeEvaluator::default()
         };
-        let (cx, cy, cz) = (
-            ctx.position.0.floor() as i32,
-            ctx.position.1.floor() as i32,
-            ctx.position.2.floor() as i32,
-        );
-        let mut best: Option<((i32, i32, i32), i64)> = None;
-        for dy in -2..=2_i32 {
-            for dx in -5..=5_i32 {
-                for dz in -5..=5_i32 {
-                    let (Some(x), Some(y), Some(z)) =
-                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
-                    else {
-                        continue;
-                    };
-                    let pos = (x, y, z);
-                    if world.sees_sky(x, y, z) || !evaluator.standable(world, pos) {
-                        continue;
-                    }
-                    let distance_sq = i64::from(dx) * i64::from(dx)
-                        + i64::from(dy) * i64::from(dy)
-                        + i64::from(dz) * i64::from(dz);
-                    if best.is_none_or(|(_, old)| distance_sq < old) {
-                        best = Some((pos, distance_sq));
-                    }
-                }
-            }
-        }
-        best.map(|(pos, _)| pos)
+        nearest_cell(ctx, 5, 2, |world, pos| {
+            !world.sees_sky(pos.0, pos.1, pos.2) && evaluator.standable(world, pos)
+        })
     }
 }
 
 impl Goal for FleeSunGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.daytime.check()
             && ctx.on_fire
@@ -1941,12 +1880,9 @@ impl Goal for FleeSunGoal {
     }
     fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.daytime.check()
-            && self.hide_pos.is_some_and(|(x, y, z)| {
-                entity_distance_sq(
-                    ctx.position,
-                    (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5),
-                ) > 0.25
-            })
+            && self
+                .hide_pos
+                .is_some_and(|cell| !cell_within(ctx, cell, 0.0, 0.25))
     }
     fn start(&mut self, ctx: &GoalContext<'_>) {
         self.hide_pos = self.find_shade(ctx);
@@ -1995,60 +1931,26 @@ impl MoveThroughVillageGoal {
     }
 
     fn find_doorway(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
-        let world = ctx.world?;
-        let (cx, cy, cz) = (
-            ctx.position.0.floor() as i32,
-            ctx.position.1.floor() as i32,
-            ctx.position.2.floor() as i32,
-        );
-        let mut best: Option<((i32, i32, i32), i64)> = None;
-        for dy in -2..=2_i32 {
-            for dx in -16..=16_i32 {
-                for dz in -16..=16_i32 {
-                    let (Some(x), Some(y), Some(z)) =
-                        (cx.checked_add(dx), cy.checked_add(dy), cz.checked_add(dz))
-                    else {
-                        continue;
-                    };
-                    let accepted = match world.path_type(x, y, z) {
-                        BlockPathType::WalkableDoor | BlockPathType::DoorOpen => true,
-                        BlockPathType::DoorWoodClosed => self.can_break_doors,
-                        _ => false,
-                    };
-                    if !accepted {
-                        continue;
-                    }
-                    let distance_sq = i64::from(dx) * i64::from(dx)
-                        + i64::from(dy) * i64::from(dy)
-                        + i64::from(dz) * i64::from(dz);
-                    if best.is_none_or(|(_, old)| distance_sq < old) {
-                        best = Some(((x, y, z), distance_sq));
-                    }
-                }
+        nearest_cell(ctx, 16, 2, |world, (x, y, z)| {
+            match world.path_type(x, y, z) {
+                BlockPathType::WalkableDoor | BlockPathType::DoorOpen => true,
+                BlockPathType::DoorWoodClosed => self.can_break_doors,
+                _ => false,
             }
-        }
-        best.map(|(pos, _)| pos)
+        })
     }
 }
 
 impl Goal for MoveThroughVillageGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
         !self.daytime.check() && self.dest.is_some()
     }
     fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
         !self.daytime.check()
-            && self.dest.is_some_and(|(x, y, z)| {
-                entity_distance_sq(
-                    ctx.position,
-                    (f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5),
-                ) > 1.0
-            })
+            && self
+                .dest
+                .is_some_and(|cell| !cell_within(ctx, cell, 0.0, 1.0))
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -2130,17 +2032,9 @@ impl RangedBowAttackGoal {
 }
 
 impl Goal for RangedBowAttackGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.target.is_some()
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -2325,17 +2219,9 @@ impl PanicGoal {
 }
 
 impl Goal for PanicGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.on_fire || ctx.recently_hurt
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, ctx: &GoalContext<'_>) {
         self.destination = Some(self.flee_position(ctx));
@@ -2371,21 +2257,13 @@ impl TemptGoal {
 }
 
 impl Goal for TemptGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         self.calm_down == 0
             && ctx.nearest_player.is_some_and(|player| {
                 player.held_item == Some(self.tempting_item)
                     && entity_distance_sq(ctx.position, player.position) < 100.0
             })
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -2434,17 +2312,9 @@ impl BreedGoal {
 }
 
 impl Goal for BreedGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         Self::valid_mate(ctx).is_some() && !self.completed
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {
         self.nearby_ticks = 0;
@@ -2536,12 +2406,7 @@ impl WaterAvoidingRandomStrollGoal {
 }
 
 impl Goal for WaterAvoidingRandomStrollGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.world.is_some() && self.destination.is_none()
     }
@@ -2570,20 +2435,12 @@ pub(crate) struct LookAtPlayerGoal {
 }
 
 impl Goal for LookAtPlayerGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.nearest_player.is_some_and(|player| {
             entity_distance_sq(ctx.position, player.position)
                 <= self.look_distance * self.look_distance
         })
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -2634,12 +2491,7 @@ impl AvoidEntityGoal {
 }
 
 impl Goal for AvoidEntityGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE
-    }
+    goal_accessors!(GoalFlags::MOVE);
     fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
         self.threat = perception.nearest(position, f64::from(self.spec.max_dist), |mob| {
             self.spec.flee_etypes.contains(&mob.etype)
@@ -2647,9 +2499,6 @@ impl Goal for AvoidEntityGoal {
         });
     }
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
-        self.threat.is_some()
-    }
-    fn can_continue_to_use(&self, _: &GoalContext<'_>) -> bool {
         self.threat.is_some()
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
@@ -2716,17 +2565,9 @@ impl RangedSnowballGoal {
 }
 
 impl Goal for RangedSnowballGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::MOVE | GoalFlags::LOOK
-    }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool {
         ctx.target.is_some()
-    }
-    fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.can_use(ctx)
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
     fn tick(&mut self, ctx: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -2842,20 +2683,12 @@ impl NearestAttackableMobGoal {
 }
 
 impl Goal for NearestAttackableMobGoal {
-    fn priority(&self) -> i32 {
-        self.priority
-    }
-    fn flags(&self) -> u8 {
-        GoalFlags::TARGET
-    }
+    goal_accessors!(GoalFlags::TARGET);
     fn perceive(&mut self, position: (f64, f64, f64), perception: &MobPerception) {
         self.candidate = perception
             .nearest(position, self.spec.max_dist, |mob| self.accepts(mob));
     }
     fn can_use(&self, _: &GoalContext<'_>) -> bool {
-        self.candidate.is_some()
-    }
-    fn can_continue_to_use(&self, _: &GoalContext<'_>) -> bool {
         self.candidate.is_some()
     }
     fn start(&mut self, _: &GoalContext<'_>) {}
@@ -2926,42 +2759,18 @@ impl OpenDoorGoal {
     }
 
     fn find_door(&self, ctx: &GoalContext<'_>) -> Option<(i32, i32, i32)> {
-        let world = ctx.world?;
-        let (cx, cy, cz) = (
-            ctx.position.0.floor() as i32,
-            ctx.position.1.floor() as i32,
-            ctx.position.2.floor() as i32,
-        );
-        let mut best: Option<((i32, i32, i32), i32)> = None;
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                for dz in -1..=1 {
-                    let pos = (cx + dx, cy + dy, cz + dz);
-                    if world.path_type(pos.0, pos.1, pos.2) != BlockPathType::DoorWoodClosed {
-                        continue;
-                    }
-                    let dist = dx * dx + dy * dy + dz * dz;
-                    if best.is_none_or(|(_, old)| dist < old) {
-                        best = Some((pos, dist));
-                    }
-                }
-            }
-        }
-        best.map(|(pos, _)| pos)
+        nearest_cell(ctx, 1, 1, |world, (x, y, z)| {
+            world.path_type(x, y, z) == BlockPathType::DoorWoodClosed
+        })
     }
 }
 
 impl Goal for OpenDoorGoal {
-    fn priority(&self) -> i32 { self.priority }
-    fn flags(&self) -> u8 { GoalFlags::MOVE | GoalFlags::LOOK }
+    goal_accessors!(GoalFlags::MOVE | GoalFlags::LOOK);
     fn can_use(&self, ctx: &GoalContext<'_>) -> bool { self.find_door(ctx).is_some() }
     fn can_continue_to_use(&self, ctx: &GoalContext<'_>) -> bool {
-        self.door.is_some_and(|(x, y, z)| {
-            entity_distance_sq(
-                ctx.position,
-                (f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5),
-            ) <= 9.0
-        })
+        self.door
+            .is_some_and(|cell| cell_within(ctx, cell, 0.5, 9.0))
     }
     fn start(&mut self, ctx: &GoalContext<'_>) { self.door = self.find_door(ctx); }
     fn tick(&mut self, _: &GoalContext<'_>) -> Option<GoalOutput> {
@@ -3316,37 +3125,20 @@ pub(crate) enum MobGoalKind {
 }
 
 /// Vanilla `AvoidEntityGoal` constants (maxDist 6.0, walk 1.0, sprint 1.2).
-const AVOID_OCELOT: AvoidEntitySpec = AvoidEntitySpec {
-    flee_etypes: &[72],
-    require_unscared: false,
-    max_dist: 6.0,
-    walk_speed: 1.0,
-    sprint_speed: 1.2,
-};
+const fn avoid(flee_etypes: &'static [i64], require_unscared: bool) -> AvoidEntitySpec {
+    AvoidEntitySpec {
+        flee_etypes,
+        require_unscared,
+        max_dist: 6.0,
+        walk_speed: 1.0,
+        sprint_speed: 1.2,
+    }
+}
 
-const AVOID_CAT: AvoidEntitySpec = AvoidEntitySpec {
-    flee_etypes: &[15],
-    require_unscared: false,
-    max_dist: 6.0,
-    walk_speed: 1.0,
-    sprint_speed: 1.2,
-};
-
-const AVOID_WOLF: AvoidEntitySpec = AvoidEntitySpec {
-    flee_etypes: &[122],
-    require_unscared: false,
-    max_dist: 6.0,
-    walk_speed: 1.0,
-    sprint_speed: 1.2,
-};
-
-const AVOID_UNROLLED_ARMADILLO: AvoidEntitySpec = AvoidEntitySpec {
-    flee_etypes: &[2],
-    require_unscared: true,
-    max_dist: 6.0,
-    walk_speed: 1.0,
-    sprint_speed: 1.2,
-};
+const AVOID_OCELOT: AvoidEntitySpec = avoid(&[72], false);
+const AVOID_CAT: AvoidEntitySpec = avoid(&[15], false);
+const AVOID_WOLF: AvoidEntitySpec = avoid(&[122], false);
+const AVOID_UNROLLED_ARMADILLO: AvoidEntitySpec = avoid(&[2], true);
 
 /// The equipment and door-breaking state that changes vanilla goal registration.
 #[derive(Clone, Copy, Default)]
@@ -3375,135 +3167,156 @@ const ZOMBIE_FAMILY: &[&str] = &[
     "minecraft:zombified_piglin",
 ];
 
+// `registerGoals` tables (1.21.1) in vanilla registration order. The stable
+// priority sort in `GoalSelector::add_goal` keeps that order inside a priority,
+// which is how vanilla resolves ties between equal-priority goals.
+const ZOMBIE_GOALS: &[(i32, MobGoalKind)] = &[
+    (2, MobGoalKind::ZombieAttack),
+    (4, MobGoalKind::ZombieAttackTurtleEgg),
+    (6, MobGoalKind::MoveThroughVillage { can_break_doors: false }),
+    (7, MobGoalKind::WaterAvoidingRandomStroll),
+    (8, MobGoalKind::LookAtPlayer),
+    (8, MobGoalKind::RandomLookAround),
+];
+
+// Stray and Bogged extend AbstractSkeleton and register Skeleton's table, each
+// with its own tipped arrow; `SKELETON_ATTACK_GOAL` swaps in the bow variant.
+const SKELETON_GOALS: &[(i32, MobGoalKind)] = &[
+    (2, MobGoalKind::RestrictSun),
+    (3, MobGoalKind::FleeSun),
+    (3, MobGoalKind::AvoidEntity(AVOID_WOLF)),
+    (4, MobGoalKind::MeleeAttack),
+    (5, MobGoalKind::WaterAvoidingRandomStroll),
+    (6, MobGoalKind::LookAtPlayer),
+    (6, MobGoalKind::RandomLookAround),
+];
+
+const CREEPER_GOALS: &[(i32, MobGoalKind)] = &[
+    (1, MobGoalKind::Float),
+    (2, MobGoalKind::Swell),
+    (3, MobGoalKind::AvoidEntity(AVOID_OCELOT)),
+    (3, MobGoalKind::AvoidEntity(AVOID_CAT)),
+    (4, MobGoalKind::MeleeAttack),
+    (5, MobGoalKind::WaterAvoidingRandomStroll),
+    (6, MobGoalKind::LookAtPlayer),
+    (6, MobGoalKind::RandomLookAround),
+];
+
+// CaveSpider inherits Spider.registerGoals unchanged in 1.21.1.
+const SPIDER_GOALS: &[(i32, MobGoalKind)] = &[
+    (1, MobGoalKind::Float),
+    (2, MobGoalKind::AvoidEntity(AVOID_UNROLLED_ARMADILLO)),
+    (3, MobGoalKind::LeapAtTarget),
+    (4, MobGoalKind::SpiderAttack),
+    (5, MobGoalKind::WaterAvoidingRandomStroll),
+    (6, MobGoalKind::LookAtPlayer),
+    (6, MobGoalKind::RandomLookAround),
+];
+
+const SNOW_GOLEM_GOALS: &[(i32, MobGoalKind)] = &[
+    (1, MobGoalKind::RangedSnowball),
+    (2, MobGoalKind::WaterAvoidingRandomStroll),
+    (3, MobGoalKind::LookAtPlayer),
+    (4, MobGoalKind::RandomLookAround),
+];
+
+const VILLAGER_GOALS: &[(i32, MobGoalKind)] = &[
+    (1, MobGoalKind::OpenDoor),
+    (5, MobGoalKind::WaterAvoidingRandomStroll),
+    (6, MobGoalKind::LookAtPlayer),
+    (7, MobGoalKind::RandomLookAround),
+];
+
+const VINDICATOR_GOALS: &[(i32, MobGoalKind)] = &[
+    (1, MobGoalKind::OpenDoor),
+    (2, MobGoalKind::MeleeAttack),
+    (5, MobGoalKind::WaterAvoidingRandomStroll),
+    (6, MobGoalKind::LookAtPlayer),
+    (7, MobGoalKind::RandomLookAround),
+];
+
+// Target goals the current engine cannot build: the vanilla
+// `registerTargetGoals` inventory for the pinned protocol-767 registry.
+const ZOMBIE_MISSING_TARGETS: &[(i32, &str)] = &[
+    (1, "HurtByTargetGoal (alerts allies, including zombified piglins)"),
+    (2, "NearestAttackableTargetGoal<Player>"),
+    (3, "NearestAttackableTargetGoal<AbstractVillager>"),
+    (3, "NearestAttackableTargetGoal<IronGolem>"),
+    (5, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+];
+
+const SKELETON_MISSING_TARGETS: &[(i32, &str)] = &[
+    (1, "HurtByTargetGoal"),
+    (2, "NearestAttackableTargetGoal<Player>"),
+    (3, "NearestAttackableTargetGoal<IronGolem>"),
+    (3, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
+];
+
+const CREEPER_MISSING_TARGETS: &[(i32, &str)] = &[
+    (1, "NearestAttackableTargetGoal<Player>"),
+    (2, "HurtByTargetGoal"),
+];
+
+const SPIDER_MISSING_TARGETS: &[(i32, &str)] = &[
+    (1, "HurtByTargetGoal"),
+    (2, "SpiderTargetGoal<Player>"),
+    (3, "SpiderTargetGoal<IronGolem>"),
+];
+
+/// The mobs whose every vanilla target goal is already implemented.
+const NO_MISSING_TARGETS: &[(i32, &str)] = &[];
+
+/// Table slots whose goal depends on registration-time equipment state.
+const ZOMBIE_VILLAGE_GOAL: usize = 2;
+const SKELETON_ATTACK_GOAL: usize = 3;
+
+/// Stray and Bogged extend AbstractSkeleton in 1.21.1 and register its goals.
+fn is_skeleton_etype(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged"
+    )
+}
+
+/// Tipped-arrow effect a bow-armed skeleton family member looses.
+fn skeleton_tipped_arrow(name: &str) -> Option<&'static str> {
+    match name {
+        "minecraft:stray" => Some("minecraft:slowness"),
+        "minecraft:bogged" => Some("minecraft:poison"),
+        _ => None,
+    }
+}
+
 impl MobGoalPlan {
     pub fn for_entity(etype: i64, settings: MobGoalSettings) -> Option<Self> {
         use MobGoalKind::*;
         let entity = entity_spec_by_id(etype)?;
-        let (mut goals, missing_targets): (Vec<_>, &[_]) = match entity.name {
-            name if ZOMBIE_FAMILY.contains(&name) => (
-                vec![
-                    (2, ZombieAttack),
-                    (4, ZombieAttackTurtleEgg),
-                    (
-                        6,
-                        MoveThroughVillage {
-                            can_break_doors: settings.zombie_can_break_doors,
-                        },
-                    ),
-                    (7, WaterAvoidingRandomStroll),
-                    (8, LookAtPlayer),
-                    (8, RandomLookAround),
-                ],
-                &[
-                    (
-                        1,
-                        "HurtByTargetGoal (alerts allies, including zombified piglins)",
-                    ),
-                    (2, "NearestAttackableTargetGoal<Player>"),
-                    (3, "NearestAttackableTargetGoal<AbstractVillager>"),
-                    (3, "NearestAttackableTargetGoal<IronGolem>"),
-                    (5, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
-                ],
-            ),
-            // Stray and Bogged extend AbstractSkeleton and register the same
-            // goal table as Skeleton in 1.21.1, each with their tipped arrow.
-            "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged" => (
-                vec![
-                    (2, RestrictSun),
-                    (3, FleeSun),
-                    (3, AvoidEntity(AVOID_WOLF)),
-                    (
-                        4,
-                        if settings.skeleton_has_bow {
-                            RangedBow {
-                                tipped: match entity.name {
-                                    "minecraft:stray" => Some("minecraft:slowness"),
-                                    "minecraft:bogged" => Some("minecraft:poison"),
-                                    _ => None,
-                                },
-                            }
-                        } else {
-                            MeleeAttack
-                        },
-                    ),
-                    (5, WaterAvoidingRandomStroll),
-                    (6, LookAtPlayer),
-                    (6, RandomLookAround),
-                ],
-                &[
-                    (1, "HurtByTargetGoal"),
-                    (2, "NearestAttackableTargetGoal<Player>"),
-                    (3, "NearestAttackableTargetGoal<IronGolem>"),
-                    (3, "NearestAttackableTargetGoal<Turtle> (baby on land)"),
-                ],
-            ),
-            "minecraft:creeper" => (
-                vec![
-                    (1, Float),
-                    (2, Swell),
-                    (3, AvoidEntity(AVOID_OCELOT)),
-                    (3, AvoidEntity(AVOID_CAT)),
-                    (4, MeleeAttack),
-                    (5, WaterAvoidingRandomStroll),
-                    (6, LookAtPlayer),
-                    (6, RandomLookAround),
-                ],
-                &[
-                    (1, "NearestAttackableTargetGoal<Player>"),
-                    (2, "HurtByTargetGoal"),
-                ],
-            ),
-            // CaveSpider inherits Spider.registerGoals unchanged in 1.21.1.
-            "minecraft:spider" | "minecraft:cave_spider" => (
-                vec![
-                    (1, Float),
-                    (2, AvoidEntity(AVOID_UNROLLED_ARMADILLO)),
-                    (3, LeapAtTarget),
-                    (4, SpiderAttack),
-                    (5, WaterAvoidingRandomStroll),
-                    (6, LookAtPlayer),
-                    (6, RandomLookAround),
-                ],
-                &[
-                    (1, "HurtByTargetGoal"),
-                    (2, "SpiderTargetGoal<Player>"),
-                    (3, "SpiderTargetGoal<IronGolem>"),
-                ],
-            ),
-            "minecraft:snow_golem" => (
-                vec![
-                    (1, RangedSnowball),
-                    (2, WaterAvoidingRandomStroll),
-                    (3, LookAtPlayer),
-                    (4, RandomLookAround),
-                ],
-                // The Enemy-mob target goal is implemented: it lives in
-                // `build_target_selector_for_etype`.
-                &[],
-            ),
-            "minecraft:villager" => (
-                vec![
-                    (1, OpenDoor),
-                    (5, WaterAvoidingRandomStroll),
-                    (6, LookAtPlayer),
-                    (7, RandomLookAround),
-                ],
-                &[],
-            ),
-            "minecraft:vindicator" => (
-                vec![
-                    (1, OpenDoor),
-                    (2, MeleeAttack),
-                    (5, WaterAvoidingRandomStroll),
-                    (6, LookAtPlayer),
-                    (7, RandomLookAround),
-                ],
-                &[],
-            ),
+        let zombie = ZOMBIE_FAMILY.contains(&entity.name);
+        let (base, missing_targets) = match entity.name {
+            _ if zombie => (ZOMBIE_GOALS, ZOMBIE_MISSING_TARGETS),
+            name if is_skeleton_etype(name) => (SKELETON_GOALS, SKELETON_MISSING_TARGETS),
+            "minecraft:creeper" => (CREEPER_GOALS, CREEPER_MISSING_TARGETS),
+            "minecraft:spider" | "minecraft:cave_spider" => (SPIDER_GOALS, SPIDER_MISSING_TARGETS),
+            // The Enemy-mob target goal is implemented: it lives in
+            // `build_target_selector_for_etype`.
+            "minecraft:snow_golem" => (SNOW_GOLEM_GOALS, NO_MISSING_TARGETS),
+            "minecraft:villager" => (VILLAGER_GOALS, NO_MISSING_TARGETS),
+            "minecraft:vindicator" => (VINDICATOR_GOALS, NO_MISSING_TARGETS),
             _ => return None,
         };
-        if ZOMBIE_FAMILY.contains(&entity.name) && settings.zombie_can_break_doors {
-            goals.insert(0, (1, BreakDoor));
+        let mut goals = base.to_vec();
+        // Equipment and griefing gates vanilla evaluates while registering.
+        if zombie {
+            goals[ZOMBIE_VILLAGE_GOAL].1 = MoveThroughVillage {
+                can_break_doors: settings.zombie_can_break_doors,
+            };
+            if settings.zombie_can_break_doors {
+                goals.insert(0, (1, BreakDoor));
+            }
+        } else if settings.skeleton_has_bow && is_skeleton_etype(entity.name) {
+            goals[SKELETON_ATTACK_GOAL].1 = RangedBow {
+                tipped: skeleton_tipped_arrow(entity.name),
+            };
         }
         Some(Self {
             goals,
@@ -3581,12 +3394,7 @@ pub(crate) fn build_goal_selector_for_etype(etype: i64) -> GoalSelector {
     if let Some(plan) = MobGoalPlan::for_entity(etype, settings) {
         let mut selector = plan.build_selector(seed);
         // The tick driver has fluid observations for the float behavior.
-        if ZOMBIE_FAMILY.contains(&spec.name)
-            || matches!(
-                spec.name,
-                "minecraft:skeleton" | "minecraft:stray" | "minecraft:bogged"
-            )
-        {
+        if ZOMBIE_FAMILY.contains(&spec.name) || is_skeleton_etype(spec.name) {
             selector.add_goal(Box::new(FloatGoal { priority: 0 }));
         }
         return selector;
@@ -3656,6 +3464,50 @@ impl MobAiProfile {
             requested_target: None,
         }
     }
+
+    /// Vanilla ticks `targetSelector` first: a mob-vs-mob target chosen this
+    /// tick already feeds the goal selector, and a supplied player target wins.
+    fn mob_target_perception(&self, targets: &GoalOutput) -> Option<AiEntityPerception> {
+        let mob = self
+            .perception
+            .nearby_mobs
+            .iter()
+            .find(|mob| Some(mob.entity_id) == targets.mob_target)?;
+        let mut target = AiEntityPerception::new(mob.entity_id, mob.position);
+        target.etype = mob.etype;
+        target.line_of_sight = mob.line_of_sight;
+        target.width = entity_spec_by_id(mob.etype).map_or(0.6, |spec| spec.width);
+        Some(target)
+    }
+
+    /// Re-paths toward the goal's move target when it changed or the route ran
+    /// out, then returns the waypoint the mob strides toward this tick.
+    fn follow_path(&mut self, ctx: &GoalContext<'_>, goal: &GoalOutput) -> Option<(f64, f64, f64)> {
+        let (Some(world), Some(target)) = (ctx.world, goal.move_target) else {
+            // No world to route in (or nothing to route to): drop the stale
+            // route and let the goal's own target stand as the waypoint.
+            self.navigation.stop();
+            self.requested_target = None;
+            return goal.move_target;
+        };
+        let destination = floor_cell(target);
+        if self.requested_target != Some(destination) || self.navigation.is_done() {
+            let finder = PathFinder {
+                evaluator: WalkNodeEvaluator {
+                    mob_height: ctx.height,
+                    can_pass_closed_wooden_doors: door_capable(self.etype),
+                    ..WalkNodeEvaluator::default()
+                },
+                ..PathFinder::default()
+            };
+            self.navigation
+                .navigate_to(&finder, world, floor_cell(ctx.position), destination);
+            self.requested_target = Some(destination);
+        }
+        self.navigation
+            .advance_if_reached(world, ctx.position, 0.45);
+        self.navigation.next_waypoint(world)
+    }
 }
 
 /// Intent to be applied by the live mob physics and interaction code.
@@ -3705,68 +3557,70 @@ pub(crate) fn tick_mob_ai_step(
     // Vanilla ticks the target selector first, so a mob-vs-mob target chosen
     // this tick already feeds the goal selector.
     let targets = profile.target_selector.tick(ctx);
-    let substituted;
-    let ctx = if ctx.target.is_none() {
-        match targets.mob_target.and_then(|eid| {
-            profile
-                .perception
-                .nearby_mobs
-                .iter()
-                .find(|mob| mob.entity_id == eid)
-        }) {
-            Some(mob) => {
-                let mut target = AiEntityPerception::new(mob.entity_id, mob.position);
-                target.etype = mob.etype;
-                target.line_of_sight = mob.line_of_sight;
-                target.width = entity_spec_by_id(mob.etype).map_or(0.6, |spec| spec.width);
-                substituted = GoalContext {
-                    target: Some(target),
-                    ..*ctx
-                };
-                &substituted
-            }
-            None => ctx,
-        }
-    } else {
-        ctx
+    let ctx = &GoalContext {
+        target: ctx.target.or_else(|| profile.mob_target_perception(&targets)),
+        ..*ctx
     };
     let mut goal = profile.selector.tick(ctx);
     goal.merge_missing(targets);
-    let mut waypoint = goal.move_target;
-    if let (Some(world), Some(target)) = (ctx.world, goal.move_target) {
-        let destination = (
-            target.0.floor() as i32,
-            target.1.floor() as i32,
-            target.2.floor() as i32,
-        );
-        if profile.requested_target != Some(destination) || profile.navigation.is_done() {
-            let start = (
-                ctx.position.0.floor() as i32,
-                ctx.position.1.floor() as i32,
-                ctx.position.2.floor() as i32,
-            );
-            let finder = PathFinder {
-                evaluator: WalkNodeEvaluator {
-                    mob_height: ctx.height,
-                    can_pass_closed_wooden_doors: matches!(profile.etype, 113 | 114 | 124 | 54 | 27 | 126 | 127),
-                    ..WalkNodeEvaluator::default()
-                },
-                ..PathFinder::default()
-            };
-            profile
-                .navigation
-                .navigate_to(&finder, world, start, destination);
-            profile.requested_target = Some(destination);
-        }
-        profile
-            .navigation
-            .advance_if_reached(world, ctx.position, 0.45);
-        waypoint = profile.navigation.next_waypoint(world);
-    } else {
+    let cramming_damage = step_cramming_damage(ctx);
+    // O(1) idle tick: no goal owns a channel this tick, so the route is dropped
+    // and only the cramming evaluation reaches the caller.
+    if goal == GoalOutput::default() {
         profile.navigation.stop();
         profile.requested_target = None;
+        return MobAiStepResult {
+            cramming_damage,
+            ..MobAiStepResult::default()
+        };
     }
+    let waypoint = profile.follow_path(ctx, &goal);
+    let (movement_delta, jump) = stride(ctx, profile, &goal, waypoint);
+    let (look_yaw, look_pitch) = look_direction(ctx, profile.eye_height, goal.look_target);
 
+    MobAiStepResult {
+        move_target: goal.move_target,
+        movement_delta,
+        look_yaw,
+        look_pitch,
+        jump,
+        attack_target: goal.attack_target,
+        mob_target: goal.mob_target,
+        ranged_attack: goal.ranged_attack,
+        swell: goal.swell,
+        breed_target: goal.breed_target,
+        destroy_block: goal.destroy_block,
+        door_break_progress: goal.door_break_progress,
+        arms_raised: goal.arms_raised,
+        restrict_sun: goal.restrict_sun,
+        open_door: goal.open_door,
+        cramming_damage,
+    }
+}
+
+/// Block cell a world-space point stands in.
+fn floor_cell(point: (f64, f64, f64)) -> (i32, i32, i32) {
+    (
+        point.0.floor() as i32,
+        point.1.floor() as i32,
+        point.2.floor() as i32,
+    )
+}
+
+/// Vanilla door-capable navigators: villagers and vindicators open a wooden
+/// door, the zombie and drowned families break one.
+fn door_capable(etype: i64) -> bool {
+    matches!(etype, 27 | 54 | 113 | 114 | 124 | 126 | 127)
+}
+
+/// Waypoint stride plus the goal-owned momentum that replaces it — a leap
+/// impulse or a bow strafe. The live mover applies `movement_delta` verbatim.
+fn stride(
+    ctx: &GoalContext<'_>,
+    profile: &MobAiProfile,
+    goal: &GoalOutput,
+    waypoint: Option<(f64, f64, f64)>,
+) -> ((f64, f64, f64), bool) {
     let mut movement_delta = (0.0, 0.0, 0.0);
     let mut jump = goal.jump;
     if let Some(point) = waypoint {
@@ -3780,27 +3634,6 @@ pub(crate) fn tick_mob_ai_step(
         }
         jump |= point.1 > ctx.position.1 + 0.5;
     }
-
-    let (look_yaw, look_pitch) = if let Some(point) = goal.look_target {
-        let dx = point.0 - ctx.position.0;
-        let dz = point.2 - ctx.position.2;
-        let dy = point.1 - (ctx.position.1 + profile.eye_height);
-        let horizontal_distance = dx.hypot(dz);
-        if horizontal_distance > 0.0 || dy != 0.0 {
-            (
-                Some((-dx.atan2(dz)).to_degrees() as f32),
-                Some((-dy.atan2(horizontal_distance)).to_degrees() as f32),
-            )
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
-    // Goal-owned momentum (1.21.1): a leap impulse or a bow-strafe replaces
-    // the waypoint stride while the goal emitting it is active.
-    // `movement_delta` is applied verbatim by the live mover.
     if let Some((dx, dz)) = goal.move_impulse {
         movement_delta = (dx, 0.0, dz);
     }
@@ -3814,42 +3647,48 @@ pub(crate) fn tick_mob_ai_step(
             movement_delta = (swim[0], 0.0, swim[2]);
         }
     }
-    let attack_target = goal.attack_target;
+    (movement_delta, jump)
+}
 
-    // `maxEntityCramming`: the live push engine owns the damage application;
-    // the step only reports this tick's evaluation for the caller.
-    let mut cramming_damage = 0.0f32;
-    if let Some(world) = ctx.world {
-        if let Some((pushable, non_passengers, roll_mod_4)) =
-            world.cramming_census(ctx.position.0, ctx.position.1, ctx.position.2)
-        {
-            cramming_damage = eval_entity_cramming_damage(
-                max_entity_cramming_limit(),
-                pushable,
-                non_passengers,
-                roll_mod_4,
-            );
-        }
+/// Yaw/pitch toward a goal's look point, measured from the mob's eye height.
+fn look_direction(
+    ctx: &GoalContext<'_>,
+    eye_height: f64,
+    look_target: Option<(f64, f64, f64)>,
+) -> (Option<f32>, Option<f32>) {
+    let Some(point) = look_target else {
+        return (None, None);
+    };
+    let dx = point.0 - ctx.position.0;
+    let dz = point.2 - ctx.position.2;
+    let dy = point.1 - (ctx.position.1 + eye_height);
+    let horizontal_distance = dx.hypot(dz);
+    if horizontal_distance == 0.0 && dy == 0.0 {
+        return (None, None);
     }
+    (
+        Some((-dx.atan2(dz)).to_degrees() as f32),
+        Some((-dy.atan2(horizontal_distance)).to_degrees() as f32),
+    )
+}
 
-    MobAiStepResult {
-        move_target: goal.move_target,
-        movement_delta,
-        look_yaw,
-        look_pitch,
-        jump,
-        attack_target,
-        mob_target: goal.mob_target,
-        ranged_attack: goal.ranged_attack,
-        swell: goal.swell,
-        breed_target: goal.breed_target,
-        destroy_block: goal.destroy_block,
-        door_break_progress: goal.door_break_progress,
-        arms_raised: goal.arms_raised,
-        restrict_sun: goal.restrict_sun,
-        open_door: goal.open_door,
-        cramming_damage,
-    }
+/// `maxEntityCramming`: the live push engine owns the damage application; the
+/// step only reports this tick's evaluation for the caller.
+fn step_cramming_damage(ctx: &GoalContext<'_>) -> f32 {
+    let Some(world) = ctx.world else {
+        return 0.0;
+    };
+    let Some((pushable, non_passengers, roll_mod_4)) =
+        world.cramming_census(ctx.position.0, ctx.position.1, ctx.position.2)
+    else {
+        return 0.0;
+    };
+    eval_entity_cramming_damage(
+        max_entity_cramming_limit(),
+        pushable,
+        non_passengers,
+        roll_mod_4,
+    )
 }
 
 #[cfg(test)]
