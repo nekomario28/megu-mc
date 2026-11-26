@@ -72,7 +72,13 @@ use crate::aeronautics::RigidBodySubWorld;
 use crate::contraption_adapter::{ContraptionError, ContraptionKind, LiveContraption};
 use crate::factory::CreateFactory;
 use crate::orbital::{
-    OrbitalDimension, OrbitalTransitionRouter, OrbitalTransitionRule, ShipDimensionTransition,
+    OrbitalDimension, OrbitalTransferCommit, OrbitalTransitionRouter, OrbitalTransitionRule,
+    ShipDimensionTransition,
+};
+use crate::rail_network::{
+    decode_snapshot as decode_rail_snapshot, encode_snapshot as encode_rail_snapshot,
+    train_replication_payloads, tick_rail_network, BlockId, ChunkKey, EdgeId, NodeId, RailError,
+    RailNetwork, SignalKind, TrainId, TrainReplicationPayload, TransitEvent,
 };
 
 /// Maximum simultaneously registered contraption assemblies.
@@ -366,6 +372,8 @@ pub struct OffloadTickReport {
     pub factory_records: usize,
     /// Orbital dimension transitions that fired this tick.
     pub orbital_transitions: usize,
+    /// Rail lifecycle events emitted this tick.
+    pub rail_events: usize,
     /// Combat-motion timelines still inside a non-idle phase this tick.
     pub combat_motions_active: usize,
     /// FNV-1a state digest after this tick — identical across worker counts.
@@ -438,6 +446,12 @@ pub struct OffloadBridge {
     /// [`take_orbital_transitions`](Self::take_orbital_transitions) drains
     /// them (teleport intents ride out to the wire layer).
     pending_orbital_transitions: Vec<ShipDimensionTransition>,
+    /// Server-owned rail graph, signals, stations, and articulated trains.
+    rail_network: RailNetwork,
+    /// Loaded chunk columns used for train virtual/loaded render transitions.
+    loaded_rail_chunks: BTreeSet<ChunkKey>,
+    /// Signal/station/render events queued for exactly one consumer drain.
+    pending_rail_events: Vec<TransitEvent>,
     /// Server-authoritative combat-motion timelines keyed by entity id —
     /// `BTreeMap` so stepping and the digest run in canonical order.
     combat_motions: BTreeMap<u64, CombatMotionEntry>,
@@ -509,6 +523,9 @@ impl OffloadBridge {
             orbital_router: OrbitalTransitionRouter::new(),
             orbital_ships: BTreeMap::new(),
             pending_orbital_transitions: Vec::new(),
+            rail_network: RailNetwork::new(),
+            loaded_rail_chunks: BTreeSet::new(),
+            pending_rail_events: Vec::new(),
             combat_motions: BTreeMap::new(),
             companion_storages: BTreeMap::new(),
         }
@@ -644,10 +661,23 @@ impl OffloadBridge {
     /// [`take_orbital_transitions`](Self::take_orbital_transitions) AND
     /// returned to the caller in ship-id order.
     pub fn step_orbital_ships(&mut self, dt: f64) -> Vec<ShipDimensionTransition> {
+        let server_tick = self.tick.saturating_add(1);
+        self.step_orbital_ships_at(dt, server_tick)
+    }
+
+    /// Step every registered ship once under the router at `dt` seconds,
+    /// using the absolute authoritative `server_tick` for transfer cooldowns.
+    /// Fleet size therefore cannot accelerate or delay any ship's hysteresis.
+    pub fn step_orbital_ships_at(
+        &mut self,
+        dt: f64,
+        server_tick: u64,
+    ) -> Vec<ShipDimensionTransition> {
         let mut fired = Vec::new();
         for ship in self.orbital_ships.values_mut() {
             if let Some(transition) =
-                self.orbital_router.step_with_dimension_transitions(ship, dt)
+                self.orbital_router
+                    .step_with_dimension_transitions_at(ship, dt, server_tick)
             {
                 fired.push(transition);
             }
@@ -660,6 +690,120 @@ impl OffloadBridge {
     /// for ship re-parenting and passenger teleport intents.
     pub fn take_orbital_transitions(&mut self) -> Vec<ShipDimensionTransition> {
         std::mem::take(&mut self.pending_orbital_transitions)
+    }
+
+    /// Drain single-owner orbital transfer commits exactly once. These are
+    /// the authoritative ownership hand-off records; diagnostic
+    /// [`ShipDimensionTransition`] values remain available through
+    /// [`take_orbital_transitions`](Self::take_orbital_transitions).
+    pub fn drain_orbital_transfer_commits(&mut self) -> Vec<OrbitalTransferCommit> {
+        self.orbital_router.drain_transfer_commits()
+    }
+
+    // ------------------------------------------------------------------
+    // Rail server lifecycle
+    // ------------------------------------------------------------------
+
+    /// Read-only access to the server-owned rail network.
+    pub fn rail_network(&self) -> &RailNetwork {
+        &self.rail_network
+    }
+
+    /// Mutable rail-network access for dimension-aware topology edits. Every
+    /// edit type also has a typed helper below; direct mutation callers must
+    /// use the network's own methods so occupancy epochs stay correct.
+    pub fn rail_network_mut(&mut self) -> &mut RailNetwork {
+        &mut self.rail_network
+    }
+
+    /// Add a track node in `dim` (dimension-aware track edit).
+    pub fn rail_add_node(&mut self, dim: crate::rail_network::DimId, pos: [f64; 3]) -> NodeId {
+        self.rail_network.add_node(dim, pos)
+    }
+
+    /// Add one cubic-bezier track edge between two dimension-scoped nodes.
+    pub fn rail_add_edge(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        gauge: crate::rail_network::TrackGauge,
+        control: [[f64; 3]; 4],
+    ) -> Result<EdgeId, RailError> {
+        self.rail_network.add_edge(from, to, gauge, control)
+    }
+
+    /// Remove a track edge and all dependent signal/block membership.
+    pub fn rail_remove_edge(&mut self, edge: EdgeId) -> bool {
+        self.rail_network.remove_edge(edge).is_some()
+    }
+
+    /// Partition edges into a signal block.
+    pub fn rail_add_block(&mut self, edges: &[EdgeId]) -> Result<BlockId, RailError> {
+        self.rail_network.add_block(edges)
+    }
+
+    /// Mount a block/chain signal on an edge.
+    pub fn rail_add_signal(&mut self, edge: EdgeId, kind: SignalKind) -> Result<(), RailError> {
+        self.rail_network.add_signal(edge, kind)
+    }
+
+    /// Register a named station anchor.
+    pub fn rail_add_station(&mut self, name: &str, edge: EdgeId, s: f64) -> Result<(), RailError> {
+        self.rail_network.add_station(name, edge, s)
+    }
+
+    /// Mark one chunk column loaded for train render-mode transitions.
+    pub fn rail_chunk_loaded(&mut self, chunk: ChunkKey) {
+        self.loaded_rail_chunks.insert(chunk);
+    }
+
+    /// Mark one chunk column unloaded. Trains inside keep advancing
+    /// virtually; no chunk data is loaded or accessed.
+    pub fn rail_chunk_unloaded(&mut self, chunk: &ChunkKey) {
+        self.loaded_rail_chunks.remove(chunk);
+    }
+
+    /// Replace the loaded rail chunk set in one batch update.
+    pub fn set_loaded_rail_chunks(&mut self, chunks: BTreeSet<ChunkKey>) {
+        self.loaded_rail_chunks = chunks;
+    }
+
+    /// Advance every train one rail tick, queueing station, signal-driven
+    /// render, and routing events for exactly one consumer drain.
+    pub fn step_rail_network(&mut self) -> Vec<TransitEvent> {
+        let events = tick_rail_network(&mut self.rail_network, &self.loaded_rail_chunks);
+        self.pending_rail_events.extend(events.iter().cloned());
+        events
+    }
+
+    /// Drain all queued rail lifecycle events exactly once.
+    pub fn drain_rail_events(&mut self) -> Vec<TransitEvent> {
+        std::mem::take(&mut self.pending_rail_events)
+    }
+
+    /// Deterministic client replication payloads for tracked trains, in
+    /// train-id order.
+    pub fn rail_replication_payloads(&self) -> Vec<TrainReplicationPayload> {
+        train_replication_payloads(&self.rail_network)
+    }
+
+    /// Deterministic CRC-framed rail snapshot bytes.
+    pub fn rail_save_bytes(&self) -> Vec<u8> {
+        encode_rail_snapshot(&self.rail_network)
+    }
+
+    /// Atomically replace the rail network from snapshot bytes; corrupt
+    /// input leaves the live graph untouched.
+    pub fn rail_load_bytes(&mut self, bytes: &[u8]) -> Result<(), RailError> {
+        let decoded = decode_rail_snapshot(bytes)?;
+        self.rail_network = decoded;
+        self.pending_rail_events.clear();
+        Ok(())
+    }
+
+    /// Remove one train and release every occupied/reserved signal block.
+    pub fn rail_remove_train(&mut self, train: TrainId) {
+        self.rail_network.remove_train(train);
     }
 
     /// Trigger the next combo step for `entity_id` at the authoritative
@@ -1266,7 +1410,11 @@ impl OffloadBridge {
         // post-step pose. Zero cost when no ship is registered.
         if !self.orbital_ships.is_empty() {
             report.orbital_transitions =
-                self.step_orbital_ships(ORBITAL_SHIP_STEP_DT).len();
+                self.step_orbital_ships_at(ORBITAL_SHIP_STEP_DT, tick).len();
+        }
+        if !self.rail_network.trains.is_empty() {
+            let events = self.step_rail_network();
+            report.rail_events = events.len();
         }
 
         // 6. Combat-motion timelines — advance every tracked entity to
@@ -1373,6 +1521,7 @@ impl OffloadTickReport {
             factory_regions: 0,
             factory_records: 0,
             orbital_transitions: 0,
+            rail_events: 0,
             combat_motions_active: 0,
             digest: 0,
         }

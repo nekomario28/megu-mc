@@ -447,6 +447,55 @@ pub struct ActorTickReport {
     pub drops: Vec<WorldItemDrop>,
 }
 
+/// Inventory effect associated with one staged actor edit. Effects are
+/// committed only after the external world write for that edit succeeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActorInventoryDelta {
+    /// Item enters onboard storage (mined/harvested).
+    Credit { item_id: String, count: u32 },
+    /// Item leaves onboard storage (deployed).
+    Debit { item_id: String, count: u32 },
+}
+
+/// One actor world edit plus the world pre-state it was staged against and
+/// the inventory effects that may commit only if the edit lands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedActorEdit {
+    pub edit: ActorWorldEdit,
+    pub expected_pre_state: ActorCell,
+    pub inventory_delta: Vec<ActorInventoryDelta>,
+    /// Overflow predicted if this edit's credits commit. The authoritative
+    /// overflow is recomputed at commit time; this copy is diagnostic and
+    /// makes a full batch inspectable before the world lock is taken.
+    pub overflow_drops: Vec<WorldItemDrop>,
+}
+
+/// A lock-free staged actor batch. It is produced while the offload bridge is
+/// locked, contains no world mutation, and is committed back into onboard
+/// inventory only after the caller has released that bridge lock and applied
+/// the world edits externally.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StagedActorEditBatch {
+    pub edits: Vec<StagedActorEdit>,
+    /// Storage snapshot the stage was simulated against. Preserved for
+    /// deterministic rollback/audit, never as a second authority.
+    pub storage_before: ContraptionStorage,
+}
+
+/// Result of committing the inventory side of a staged batch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActorInventoryCommitReport {
+    /// Indices into `StagedActorEditBatch::edits` whose inventory effects committed.
+    pub committed_edits: Vec<usize>,
+    /// Overflow drops produced by successful edits. These must be spawned or
+    /// otherwise persisted by the caller; they are never deleted.
+    pub drops: Vec<WorldItemDrop>,
+    /// Edits whose world side reportedly succeeded but whose staged debit
+    /// could no longer be satisfied. Callers should treat this as a failed
+    /// edit and roll back the world write; no partial debit is taken.
+    pub inventory_conflicts: Vec<usize>,
+}
+
 /// Active assembled contraption with rigid pose, previous pose for passenger
 /// carry delta, sparse local block cluster, onboard storage and actors.
 pub struct LiveContraption {
@@ -854,6 +903,181 @@ impl LiveContraption {
         }
     }
 
+    /// Stage one deterministic onboard-actor tick without mutating the live
+    /// onboard inventory or the world. Every edit carries the exact world cell
+    /// it was validated against; the caller can therefore CAS/apply edits
+    /// outside the offload lock and commit only successful inventory deltas.
+    pub fn step_actors_staged(
+        &self,
+        world_query: &dyn ContraptionWorldQuery,
+    ) -> StagedActorEditBatch {
+        let mut shadow = self.storage.clone();
+        let storage_before = self.storage.clone();
+        let mut batch = StagedActorEditBatch {
+            edits: Vec::new(),
+            storage_before,
+        };
+        for actor in &self.actors {
+            let cell_pos = actor_target_cell(&self.inner, actor);
+            let pos = DimBlockPos::new(self.dim, cell_pos[0], cell_pos[1], cell_pos[2]);
+            let cell = world_query.cell_at(cell_pos);
+            let mut inventory_delta = Vec::new();
+            let mut overflow_drops = Vec::new();
+            let edit = match &actor.kind {
+                ContraptionActorKind::MechanicalDrill
+                | ContraptionActorKind::MechanicalSaw
+                | ContraptionActorKind::MechanicalPlough => {
+                    if cell.is_empty() || cell.is_immovable() || !cell.breakable {
+                        continue;
+                    }
+                    let accepted = 1 - shadow.insert_item(&cell.name, 1);
+                    if accepted > 0 {
+                        inventory_delta.push(ActorInventoryDelta::Credit {
+                            item_id: cell.name.clone(),
+                            count: accepted,
+                        });
+                    } else {
+                        overflow_drops.push(WorldItemDrop {
+                            pos,
+                            item_id: cell.name.clone(),
+                            count: 1,
+                        });
+                    }
+                    ActorWorldEdit::BreakBlock { pos }
+                }
+                ContraptionActorKind::MechanicalHarvester => {
+                    let Some(crop) = &cell.crop else {
+                        continue;
+                    };
+                    if crop.age < crop.max_age {
+                        continue;
+                    }
+                    let remainder = shadow.insert_item(&crop.drop_item, crop.drop_count);
+                    let accepted = crop.drop_count - remainder;
+                    if accepted > 0 {
+                        inventory_delta.push(ActorInventoryDelta::Credit {
+                            item_id: crop.drop_item.clone(),
+                            count: accepted,
+                        });
+                    }
+                    if remainder > 0 {
+                        overflow_drops.push(WorldItemDrop {
+                            pos,
+                            item_id: crop.drop_item.clone(),
+                            count: remainder,
+                        });
+                    }
+                    ActorWorldEdit::ResetCrop { pos }
+                }
+                ContraptionActorKind::MechanicalDeployer { filter_item } => {
+                    if !cell.is_empty() {
+                        continue;
+                    }
+                    let selected = match filter_item {
+                        Some(item) => (shadow.total_count_of(item) > 0).then(|| {
+                            (item.clone(), world_query.place_state_for(item))
+                        }),
+                        None => shadow.slots().next().map(|(item, _)| {
+                            (item.to_string(), world_query.place_state_for(item))
+                        }),
+                    };
+                    let Some((item, state)) = selected else {
+                        continue;
+                    };
+                    let Some(state_id) = state else {
+                        continue;
+                    };
+                    if shadow.extract_item(&item, 1) != 1 {
+                        continue;
+                    }
+                    inventory_delta.push(ActorInventoryDelta::Debit {
+                        item_id: item.clone(),
+                        count: 1,
+                    });
+                    ActorWorldEdit::PlaceBlock {
+                        pos,
+                        state_id,
+                        item_id: item,
+                    }
+                }
+                ContraptionActorKind::PortableStorageInterface => continue,
+            };
+            batch.edits.push(StagedActorEdit {
+                edit,
+                expected_pre_state: cell,
+                inventory_delta,
+                overflow_drops,
+            });
+        }
+        batch
+    }
+
+    /// Commit inventory effects for staged edits whose world writes succeeded.
+    /// `succeeded[i]` corresponds to `batch.edits[i]`; missing entries count
+    /// as failure. Failed edits receive no debit/credit and produce no drops,
+    /// while successful credits recompute overflow against live storage so
+    /// items can neither vanish nor duplicate.
+    pub fn commit_staged_actor_inventory(
+        &mut self,
+        batch: &StagedActorEditBatch,
+        succeeded: &[bool],
+    ) -> ActorInventoryCommitReport {
+        let mut report = ActorInventoryCommitReport::default();
+        for (index, staged) in batch.edits.iter().enumerate() {
+            if !succeeded.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut conflict = false;
+            // Validate debits before mutating so a resource conflict is clean.
+            for delta in &staged.inventory_delta {
+                if let ActorInventoryDelta::Debit { item_id, count } = delta {
+                    if self.storage.total_count_of(item_id) < *count {
+                        conflict = true;
+                    }
+                }
+            }
+            if conflict {
+                report.inventory_conflicts.push(index);
+                continue;
+            }
+            let pos = match &staged.edit {
+                ActorWorldEdit::BreakBlock { pos }
+                | ActorWorldEdit::ResetCrop { pos }
+                | ActorWorldEdit::PlaceBlock { pos, .. } => *pos,
+            };
+            for delta in &staged.inventory_delta {
+                match delta {
+                    ActorInventoryDelta::Debit { item_id, count } => {
+                        let _ = self.storage.extract_item(item_id, *count);
+                    }
+                    ActorInventoryDelta::Credit { item_id, count } => {
+                        commit_credit_or_drop(&mut self.storage, pos, item_id, *count, &mut report);
+                    }
+                }
+            }
+            // Predicted overflow is the unaccepted part of the same staged
+            // credit, not an extra item. Offer it to live storage at commit
+            // time and emit only what still does not fit; failed edits skip
+            // this entire block, so nothing is lost or duplicated.
+            if staged
+                .inventory_delta
+                .iter()
+                .any(|delta| matches!(delta, ActorInventoryDelta::Credit { .. }))
+                || staged.overflow_drops.iter().any(|drop| {
+                    !staged.inventory_delta.iter().any(|delta| {
+                        matches!(delta, ActorInventoryDelta::Credit { item_id, .. } if item_id == &drop.item_id)
+                    })
+                })
+            {
+                for drop in &staged.overflow_drops {
+                    commit_credit_or_drop(&mut self.storage, pos, &drop.item_id, drop.count, &mut report);
+                }
+            }
+            report.committed_edits.push(index);
+        }
+        report
+    }
+
     /// Deterministic onboard-actor tick: every mounted actor acts on its
     /// swept world cell in mount order. Effects are reported, not applied —
     /// the caller commits them. Conservation is strict: mined/harvested items
@@ -1088,6 +1312,23 @@ impl WorldView for LiveContraption {
             translation: pose.translation(),
             pivot: [0.0; 3],
         }
+    }
+}
+
+fn commit_credit_or_drop(
+    storage: &mut ContraptionStorage,
+    pos: DimBlockPos,
+    item_id: &str,
+    count: u32,
+    report: &mut ActorInventoryCommitReport,
+) {
+    let remainder = storage.insert_item(item_id, count);
+    if remainder > 0 {
+        report.drops.push(WorldItemDrop {
+            pos,
+            item_id: item_id.to_string(),
+            count: remainder,
+        });
     }
 }
 

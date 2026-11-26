@@ -26,12 +26,17 @@ use create_adapter::blockstates::{core_create_registry, CreateBlockRegistry};
 use create_adapter::contraption_adapter::{
     is_immovable_block_id, ActorCell, ActorTickReport, ActorWorldEdit, ContraptionActor,
     ContraptionActorKind, ContraptionError, ContraptionKind, ContraptionSnapshot,
+    StagedActorEditBatch,
     ContraptionStorage, ContraptionWorldQuery, CropCell, LiveContraption, SuperGlueVolume,
     WorldBlockEdit, WorldItemDrop, DEFAULT_MAX_CONTRAPTION_BLOCKS,
 };
 use create_adapter::factory::{CreateFactory, DimBlockPos as ModBlockPos, KineticUpdateTag};
 use create_adapter::offload_bridge::{
     AssemblyStress, OffloadBridge, OffloadBudget, OffloadError,
+};
+use create_adapter::rail_network::{
+    ChunkKey as RailChunkKey, EdgeId as RailEdgeId, NodeId as RailNodeId,
+    TrainReplicationPayload, TransitEvent as RailTransitEvent,
 };
 use create_adapter::neoforge_wire as create_wire;
 use mod_adapter_core::blockstates::DEFAULT_BASE_STATE_ID;
@@ -61,7 +66,7 @@ const MOD_OFFLOAD_DEFAULT_WORKERS: usize = 4;
 #[allow(dead_code)]
 const MOD_OFFLOAD_SAVE_MAGIC: [u8; 4] = *b"MSMO";
 #[allow(dead_code)]
-const MOD_OFFLOAD_SAVE_VERSION: u8 = 1;
+const MOD_OFFLOAD_SAVE_VERSION: u8 = 2;
 
 /// A player riding an assembled contraption: `anchor` is their world-space point
 /// rigidly attached to the contraption frame, updated every stepped tick.
@@ -69,6 +74,15 @@ const MOD_OFFLOAD_SAVE_VERSION: u8 = 1;
 struct ContraptionRider {
     contraption: u32,
     anchor: [f64; 3],
+}
+
+/// Staged actor batch plus the world edits derived from each staged entry.
+/// `None` means the edit could not resolve to a concrete world write and is
+/// counted as failed during inventory commit.
+#[derive(Clone, Debug)]
+struct PendingActorBatch {
+    contraption: u32,
+    batch: StagedActorEditBatch,
 }
 
 /// Everything the feature-gated mod offload owns at runtime. Constructed empty;
@@ -115,6 +129,11 @@ struct ModOffloadBridge {
     kinetic_updates_emitted: u64,
     /// Ticks that produced no step output at all.
     idle_ticks_skipped: u64,
+    /// Actor batches awaiting external world application. Production commits
+    /// these only after the process-wide bridge mutex has been released.
+    pending_actor_batches: Vec<PendingActorBatch>,
+    /// Committed overflow drops not yet drained by the entity/wire layer.
+    committed_actor_drops: Vec<WorldItemDrop>,
 }
 
 /// Deterministic summary of one [`ModOffloadBridge::step_tick`]: every output
@@ -143,8 +162,15 @@ struct BridgeTickOutput {
     work_units_used: usize,
     /// Actor edits committed into the live world this tick.
     world_block_edits: Vec<WorldBlockEdit>,
+    /// Parallel grouped view of actor world edits, including unresolved
+    /// entries as `None`; used only for transactional external application.
+    actor_edit_groups: Vec<Vec<Option<WorldBlockEdit>>>,
     /// Items ejected by full onboard storage — reported, never silently lost.
     item_drops: Vec<WorldItemDrop>,
+    /// Rail signal/station/render lifecycle events emitted this tick.
+    rail_events: Vec<RailTransitEvent>,
+    /// Orbital transfer commits drained this tick (single-owner handoff).
+    orbital_transfer_commits: Vec<create_adapter::orbital::OrbitalTransferCommit>,
     /// The engine's deterministic post-tick digest.
     digest: u64,
     /// Fail-closed step error, if the engine refused the tick.
@@ -162,6 +188,8 @@ impl BridgeTickOutput {
             || !self.kinetic_updates.is_empty()
             || !self.world_block_edits.is_empty()
             || !self.item_drops.is_empty()
+            || !self.rail_events.is_empty()
+            || !self.orbital_transfer_commits.is_empty()
     }
 }
 
@@ -204,6 +232,8 @@ impl ModOffloadBridge {
             world_block_edits_applied: 0,
             kinetic_updates_emitted: 0,
             idle_ticks_skipped: 0,
+            pending_actor_batches: Vec::new(),
+            committed_actor_drops: Vec::new(),
         }
     }
 
@@ -324,6 +354,8 @@ impl ModOffloadBridge {
         self.offload.factory().is_some()
             || self.universal.is_some()
             || self.offload.assembly_count() > 0
+            || self.offload.orbital_ship_count() > 0
+            || !self.offload.rail_network().trains.is_empty()
             || !self.contraption_riders.is_empty()
             || !self.belt_riders.is_empty()
     }
@@ -337,7 +369,10 @@ impl ModOffloadBridge {
     /// Riders, tag caches and the universal runtime are re-derived at boot or
     /// next tick, so an otherwise-empty bridge still emits zero trailer bytes.
     fn has_persistent_state(&self) -> bool {
-        !self.placed_create.is_empty() || self.offload.assembly_count() > 0
+        !self.placed_create.is_empty()
+            || self.offload.assembly_count() > 0
+            || !self.offload.rail_network().trains.is_empty()
+            || !self.offload.rail_network().graph.edges.is_empty()
     }
 
     /// Place a Create block through the bridge so Save v2 can rebuild the same
@@ -654,21 +689,74 @@ impl ModOffloadBridge {
         out
     }
 
+    /// Dimension-aware rail edit/lifecycle facade forwarded to the offload
+    /// engine. Events are drained through `step_tick`; these helpers mutate
+    /// topology only through the network's occupancy-safe methods.
+    fn rail_add_node(&mut self, dim: String, pos: [f64; 3]) -> RailNodeId {
+        self.offload
+            .rail_add_node(create_adapter::rail_network::DimId::new(dim), pos)
+    }
+
+    fn rail_add_edge(
+        &mut self,
+        from: RailNodeId,
+        to: RailNodeId,
+        gauge: create_adapter::rail_network::TrackGauge,
+        control: [[f64; 3]; 4],
+    ) -> Result<RailEdgeId, create_adapter::rail_network::RailError> {
+        self.offload.rail_add_edge(from, to, gauge, control)
+    }
+
+    fn rail_remove_edge(&mut self, edge: RailEdgeId) -> bool {
+        self.offload.rail_remove_edge(edge)
+    }
+
+    fn rail_chunk_loaded(&mut self, dim: String, cx: i32, cz: i32) {
+        self.offload.rail_chunk_loaded(RailChunkKey::new(
+            create_adapter::rail_network::DimId::new(dim),
+            cx,
+            cz,
+        ));
+    }
+
+    fn rail_chunk_unloaded(&mut self, dim: String, cx: i32, cz: i32) {
+        self.offload.rail_chunk_unloaded(&RailChunkKey::new(
+            create_adapter::rail_network::DimId::new(dim),
+            cx,
+            cz,
+        ));
+    }
+
+    fn rail_replication_payloads(&self) -> Vec<TrainReplicationPayload> {
+        self.offload.rail_replication_payloads()
+    }
+
     /// Advance the whole bridge by one server tick and return every output the
     /// engine produced: parallel factory region + contraption motion step, the
     /// coalesced kinetic UpdateTag deltas, the universal runtime step, actor
     /// world edits committed into the live world through the CAS path, and the
     /// exact carry grants into anti-cheat.
     fn step_tick(&mut self, tick: u64) -> BridgeTickOutput {
-        self.step_tick_with_actor_query(tick, None)
+        self.step_tick_impl(tick, None, false)
     }
 
     /// Actor-query injection keeps the bridge integration test hermetic when
     /// the generated vanilla registry is absent from a clean-room checkout.
+    /// Injected-query tests commit inline for backwards compatibility; the
+    /// production tick uses the staged lock-free path.
     fn step_tick_with_actor_query(
         &mut self,
         tick: u64,
         actor_query: Option<&dyn ContraptionWorldQuery>,
+    ) -> BridgeTickOutput {
+        self.step_tick_impl(tick, actor_query, true)
+    }
+
+    fn step_tick_impl(
+        &mut self,
+        tick: u64,
+        actor_query: Option<&dyn ContraptionWorldQuery>,
+        commit_actors_inline: bool,
     ) -> BridgeTickOutput {
         self.ticks_stepped += 1;
         let mut out = BridgeTickOutput::default();
@@ -697,6 +785,8 @@ impl ModOffloadBridge {
                 return out;
             }
         }
+        out.rail_events = self.offload.drain_rail_events();
+        out.orbital_transfer_commits = self.offload.drain_orbital_transfer_commits();
         if let Some(universal) = &mut self.universal {
             out.universal_regions = universal
                 .step_tick(tick, MOD_OFFLOAD_REGION_STEPS, Some(MOD_OFFLOAD_REGION_US))
@@ -709,30 +799,51 @@ impl ModOffloadBridge {
         }
         self.kinetic_updates_emitted += out.kinetic_updates.len() as u64;
 
-        // Actor pass: every mounted actor acts on its swept cell of the live
-        // world. `step_actors` reports edits instead of applying them; the
-        // loop below commits each through the dimension-aware CAS write, so
-        // immovable or out-of-bounds cells fail closed.
+        // Actor pass: stage edits and inventory deltas while the bridge is
+        // locked, but do not mutate the world here. Production (`commit_inline
+        // == false`) leaves inventory uncommitted until `mod_offload_tick`
+        // releases the process-wide bridge mutex, applies the world edits, and
+        // reacquires the bridge to commit exactly the successful deltas.
+        self.pending_actor_batches.clear();
         for id in self.offload.assembly_ids().collect::<Vec<_>>() {
-            let Some(report) = self.with_contraption(id, |contraption| {
+            let Some((dim, batch)) = self.with_contraption(id, |contraption| {
                 let dim = contraption.dim;
-                match actor_query {
-                    Some(query) => contraption.step_actors(query),
-                    None => contraption.step_actors(&LiveModWorldQuery { dim }),
-                }
+                let batch = match actor_query {
+                    Some(query) => contraption.step_actors_staged(query),
+                    None => contraption.step_actors_staged(&LiveModWorldQuery { dim }),
+                };
+                (dim, batch)
             }) else {
                 continue;
             };
-            for edit in &report.edits {
-                let Some(edit) = mob_actor_world_edit(edit) else {
-                    continue;
-                };
-                if mob_commit_world_block_edit(&edit) {
-                    self.world_block_edits_applied += 1;
+            let _ = dim;
+            let world_edits: Vec<Option<WorldBlockEdit>> = batch
+                .edits
+                .iter()
+                .map(|staged| mob_actor_world_edit(&staged.edit))
+                .collect();
+            if commit_actors_inline {
+                let successes: Vec<bool> = world_edits
+                    .iter()
+                    .map(|edit| edit.as_ref().is_some_and(mob_commit_world_block_edit))
+                    .collect();
+                let commit = self.with_contraption(id, |contraption| {
+                    contraption.commit_staged_actor_inventory(&batch, &successes)
+                });
+                if let Some(commit) = commit {
+                    self.committed_actor_drops.extend(commit.drops);
                 }
-                out.world_block_edits.push(edit);
+                self.world_block_edits_applied += successes.iter().filter(|&&ok| ok).count() as u64;
+            } else {
+                self.pending_actor_batches.push(PendingActorBatch {
+                    contraption: id,
+                    batch,
+                });
+                out.actor_edit_groups.push(world_edits.clone());
             }
-            out.item_drops.extend(report.drops);
+            for edit in world_edits.iter().flatten() {
+                out.world_block_edits.push(edit.clone());
+            }
         }
 
         // Exact rigid-carry deltas: `passenger_delta` is the displacement the
@@ -760,6 +871,47 @@ impl ModOffloadBridge {
             self.idle_ticks_skipped += 1;
         }
         out
+    }
+
+    /// Commit staged actor inventory after world edits were applied outside
+    /// the bridge mutex. `success_groups` uses the same batch/edit ordering as
+    /// `actor_edit_groups` returned by the tick. Overflow drops are retained
+    /// for `drain_committed_actor_drops` — never silently destroyed.
+    fn finalize_staged_actor_batches(&mut self, success_groups: &[Vec<bool>]) -> Vec<WorldItemDrop> {
+        let pending = std::mem::take(&mut self.pending_actor_batches);
+        let mut drops = Vec::new();
+        for (index, staged) in pending.into_iter().enumerate() {
+            let empty = Vec::new();
+            let successes = success_groups.get(index).unwrap_or(&empty);
+            let report = self.with_contraption(staged.contraption, |contraption| {
+                contraption.commit_staged_actor_inventory(&staged.batch, successes)
+            });
+            if let Some(report) = report {
+                drops.extend(report.drops);
+            }
+        }
+        self.committed_actor_drops.extend(drops.iter().cloned());
+        drops
+    }
+
+    /// Drain item drops whose inventory effects have already committed.
+    fn drain_committed_actor_drops(&mut self) -> Vec<WorldItemDrop> {
+        std::mem::take(&mut self.committed_actor_drops)
+    }
+
+    /// Transactional contraption entry helper for bearings/pistons/glue
+    /// workflows: assemble through the normal checked path and return the
+    /// caller-visible world edits without hiding actor drops or partial
+    /// failures behind a fire-and-forget interaction result.
+    fn interact_contraption_trigger(
+        &mut self,
+        dim: DimId,
+        anchor: [i32; 3],
+        seed: [i32; 3],
+        attached_blocks: &BTreeMap<[i32; 3], u32>,
+        kind: ContraptionKind,
+    ) -> Result<(u32, Vec<WorldBlockEdit>), ContraptionError> {
+        self.assemble_contraption(dim, anchor, seed, attached_blocks, kind)
     }
 
     /// Deterministic Save v2 binary snapshot: placed Create blocks as canonical
@@ -797,6 +949,9 @@ impl ModOffloadBridge {
         for snap in &snapshots {
             mob_w_snapshot(&mut out, snap);
         }
+        let rail = self.offload.rail_save_bytes();
+        mod_wire::write_varint(&mut out, rail.len() as u32);
+        out.extend_from_slice(&rail);
         out
     }
 
@@ -808,7 +963,7 @@ impl ModOffloadBridge {
         if bytes.len() < 5 || bytes[..4] != MOD_OFFLOAD_SAVE_MAGIC {
             return Err(err("bad magic"));
         }
-        if bytes[4] != MOD_OFFLOAD_SAVE_VERSION {
+        if bytes[4] != MOD_OFFLOAD_SAVE_VERSION && bytes[4] != 1 {
             return Err(err("unsupported version"));
         }
         let mut cursor = 5usize;
@@ -854,6 +1009,19 @@ impl ModOffloadBridge {
                     .map_err(|e| err(&format!("corrupt contraption: {e:?}")))?,
             );
         }
+        let mut rail_snapshot = None;
+        if bytes[4] == MOD_OFFLOAD_SAVE_VERSION {
+            let rail_len = mod_wire::read_varint(bytes, &mut cursor)
+                .ok_or_else(|| err("truncated rail snapshot len"))? as usize;
+            let rail_bytes = bytes
+                .get(cursor..cursor.saturating_add(rail_len))
+                .ok_or_else(|| err("truncated rail snapshot"))?;
+            cursor = cursor.saturating_add(rail_len);
+            rail_snapshot = Some(
+                create_adapter::rail_network::decode_snapshot(rail_bytes)
+                    .map_err(|e| err(&format!("corrupt rail snapshot: {e:?}")))?,
+            );
+        }
         if cursor != bytes.len() {
             return Err(err("trailing bytes"));
         }
@@ -874,6 +1042,10 @@ impl ModOffloadBridge {
             let _ = self.offload.register_contraption(c, mob_zero_stress());
         }
         self.next_contraption_id = self.next_contraption_id.max(max_id + 1);
+        if let Some(rail) = rail_snapshot {
+            self.offload.rail_load_bytes(&create_adapter::rail_network::encode_snapshot(&rail))
+                .map_err(|e| err(&format!("rail restore failed: {e:?}")))?;
+        }
         Ok(())
     }
 }
@@ -1330,13 +1502,40 @@ fn mod_offload_bridge() -> &'static Mutex<ModOffloadBridge> {
 /// Per-tick entry wired from `game_tick` as `run("mod_offload", mod_offload_tick)`.
 fn mod_offload_tick() {
     let tick = TICK_IDX.load(Ordering::Relaxed);
-    let Ok(mut bridge) = mod_offload_bridge().lock() else {
-        return;
+    let (edit_groups, had_work) = {
+        let Ok(mut bridge) = mod_offload_bridge().lock() else {
+            return;
+        };
+        if !bridge.has_work() {
+            return;
+        }
+        let out = bridge.step_tick(tick);
+        { let had_work = out.did_any_work(); (out.actor_edit_groups, had_work) }
     };
-    if !bridge.has_work() {
-        return;
+    // The process-wide offload bridge mutex is released here, before any live
+    // world write. World application must never call back into a held bridge.
+    let mut success_groups = Vec::with_capacity(edit_groups.len());
+    for group in &edit_groups {
+        success_groups.push(
+            group
+                .iter()
+                .map(|edit| edit.as_ref().is_some_and(mob_commit_world_block_edit))
+                .collect::<Vec<bool>>(),
+        );
     }
-    bridge.step_tick(tick);
+    if let Ok(mut bridge) = mod_offload_bridge().lock() {
+        let applied: u64 = success_groups
+            .iter()
+            .flat_map(|group| group.iter())
+            .filter(|&&ok| ok)
+            .count() as u64;
+        bridge.world_block_edits_applied =
+            bridge.world_block_edits_applied.saturating_add(applied);
+        bridge.finalize_staged_actor_batches(&success_groups);
+        if !had_work && applied == 0 {
+            bridge.idle_ticks_skipped = bridge.idle_ticks_skipped.saturating_add(1);
+        }
+    }
 }
 
 /// Configuration-phase packets a joining NeoForge client needs for the custom
@@ -2010,4 +2209,75 @@ mod mod_offload_bridge_tests {
             assert_eq!(block_at_dim(dim, t[0], t[1], t[2]), 0);
         }
     }
+
+    #[test]
+    fn staged_actor_finalize_is_failure_atomic_and_surfaces_overflow_once() {
+        struct StoneAt;
+        impl ContraptionWorldQuery for StoneAt {
+            fn cell_at(&self, pos: [i32; 3]) -> ActorCell {
+                if pos == [11, 64, 10] {
+                    ActorCell::block("minecraft:stone", true)
+                } else {
+                    ActorCell::air()
+                }
+            }
+        }
+
+        let mut bridge = ModOffloadBridge::new();
+        let dim = DimId::from_raw(6);
+        let anchor = [10, 64, 10];
+        let shaft = bridge
+            .create_registry()
+            .map(|_| 0)
+            .unwrap_or(0);
+        let _ = shaft;
+        let registry = core_create_registry(DEFAULT_BASE_STATE_ID);
+        let shaft = registry.default_state("create:shaft").unwrap();
+        let mut blocks = BTreeMap::new();
+        blocks.insert(anchor, shaft);
+        let (cid, _) = bridge
+            .assemble_contraption(
+                dim,
+                anchor,
+                anchor,
+                &blocks,
+                ContraptionKind::Bearing { angular_deg_per_tick: 0.0 },
+            )
+            .unwrap();
+        assert!(bridge.mount_contraption_actor(
+            cid,
+            ContraptionActor {
+                local: [0, 0, 0],
+                facing: [1, 0, 0],
+                kind: ContraptionActorKind::MechanicalDrill,
+            },
+        ));
+        let batch = bridge
+            .with_contraption(cid, |contraption| {
+                contraption.storage = ContraptionStorage::new(0);
+                contraption.step_actors_staged(&StoneAt)
+            })
+            .unwrap();
+        assert_eq!(batch.edits.len(), 1);
+
+        bridge.pending_actor_batches.push(PendingActorBatch {
+            contraption: cid,
+            batch: batch.clone(),
+        });
+        assert!(bridge.finalize_staged_actor_batches(&[vec![false]]).is_empty());
+        assert!(bridge.pending_actor_batches.is_empty());
+        assert!(bridge.drain_committed_actor_drops().is_empty());
+
+        bridge.pending_actor_batches.push(PendingActorBatch {
+            contraption: cid,
+            batch,
+        });
+        let drops = bridge.finalize_staged_actor_batches(&[vec![true]]);
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].item_id, "minecraft:stone");
+        assert_eq!(drops[0].count, 1);
+        assert_eq!(bridge.drain_committed_actor_drops(), drops);
+        assert!(bridge.drain_committed_actor_drops().is_empty());
+    }
+
 }
