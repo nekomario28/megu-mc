@@ -1349,6 +1349,7 @@ struct DatapackContent {
     mob_loot: HashMap<i64, Vec<LootPool>>,
     item_mods: HashMap<String, Vec<LootFunc>>,
     advancements: HashMap<String, Advancement>,
+    advancement_extras: HashMap<String, AdvancementExtras>,
     predicates: HashMap<String, String>,
 }
 
@@ -1380,6 +1381,7 @@ impl DatapackContent {
             let mut mob_loot = mob_loot_tables().lock().unwrap_or_else(|e| e.into_inner());
             let mut mods = item_mods().lock().unwrap_or_else(|e| e.into_inner());
             let mut advs = advancements().lock().unwrap_or_else(|e| e.into_inner());
+            let mut extras = advancement_extras().lock().unwrap_or_else(|e| e.into_inner());
             let mut conditions = predicates().lock().unwrap_or_else(|e| e.into_inner());
             let mut ids = recipe_ids().lock().unwrap_or_else(|e| e.into_inner());
             let mut registry = datapack_registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -1393,7 +1395,9 @@ impl DatapackContent {
             *loot_raw = self.loot_raw;
             *mob_loot = self.mob_loot;
             *mods = self.item_mods;
+            drop_orphaned_advancement_extras(&mut self.advancement_extras, &self.advancements);
             *advs = self.advancements;
+            *extras = self.advancement_extras;
             *conditions = self.predicates;
             *registry = self.registry;
             *active = self.packs;
@@ -1714,40 +1718,77 @@ impl DatapackContent {
     }
 
     fn read_advancement(&mut self, key: String, rel: &str, body: &str) {
-        let Some(cb) = jblock(body, "criteria") else {
+        let Some(parsed) = crate::json::jparse(body.as_bytes()) else {
             return;
         };
-        let inner = &cb[1..cb.len() - 1];
+        let Some(criteria_obj) = parsed.get("criteria") else {
+            return;
+        };
+        let crate::json::J::Obj(criteria_fields) = criteria_obj else {
+            return;
+        };
         let mut criteria: Vec<(String, String, Option<i64>)> = Vec::new();
-        for co in jobjects(inner) {
-            // criterion key precedes the object: find its name backwards
-            let Some(cpos) = inner.find(co) else { continue };
-            let pre = &inner[..cpos];
-            let cn = pre
-                .rfind('"')
-                .and_then(|e2| pre[..e2].rfind('"').map(|s2| &pre[s2 + 1..e2]))
-                .unwrap_or("")
-                .to_string();
-            let tr = jstr(co, "trigger")
-                .unwrap_or("")
-                .trim_start_matches("minecraft:")
-                .to_string();
-            let want = jblock(co, "conditions")
-                .and_then(|cd| jblock(cd, "entity"))
-                .and_then(|en| jstr(en, "type"))
-                .and_then(|t| name_to_etype(t.trim_start_matches("minecraft:")));
-            criteria.push((cn, tr, want));
+        let mut predicates: HashMap<String, crate::json::J> = HashMap::new();
+        for (cn, criterion) in criteria_fields {
+            let tr = criterion
+                .get("trigger")
+                .map(|v| v.str().trim_start_matches("minecraft:").to_string())
+                .unwrap_or_default();
+            let conditions = criterion.get("conditions");
+            let want = conditions
+                .and_then(|cd| cd.get("entity"))
+                .and_then(|en| en.get("type"))
+                .and_then(|t| name_to_etype(t.str().trim_start_matches("minecraft:")));
+            if let Some(conditions) = conditions {
+                predicates.insert(cn.clone(), conditions.clone());
+            }
+            criteria.push((cn.clone(), tr, want));
         }
-        let title = jblock(body, "display")
+        // Vanilla encodes `requirements` as an outer AND of inner OR groups.
+        // When absent every criterion is its own group, which degenerates to
+        // the historical all-criteria rule.
+        let mut requirements: Vec<Vec<String>> = Vec::new();
+        if let Some(groups) = parsed.get("requirements").and_then(|v| v.as_arr()) {
+            for group in groups {
+                let alternatives = group
+                    .as_arr()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|item| item.str().to_string())
+                            .filter(|item| !item.is_empty())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !alternatives.is_empty() {
+                    requirements.push(alternatives);
+                }
+            }
+        }
+        let title = parsed
+            .get("display")
             .and_then(|d| {
-                jblock(d, "title")
-                    .and_then(|t| jstr(t, "text").map(|x| x.to_string()))
-                    .or_else(|| jstr(d, "title").map(|x| x.to_string()))
+                d.get("title")
+                    .and_then(|t| {
+                        t.get("text")
+                            .map(|x| x.str().to_string())
+                            .or_else(|| t.str().is_empty().then(String::new))
+                    })
+                    .filter(|t| !t.is_empty())
+                    .or_else(|| d.get("title").map(|t| t.str().to_string()))
             })
+            .filter(|t| !t.is_empty())
             .unwrap_or_else(|| rel.to_owned());
         if !criteria.is_empty() {
             self.advancements
-                .insert(key, Advancement { title, criteria });
+                .insert(key.clone(), Advancement { title, criteria });
+            self.advancement_extras.insert(
+                key,
+                AdvancementExtras {
+                    requirements,
+                    predicates,
+                },
+            );
         }
     }
 }
@@ -4564,9 +4605,33 @@ struct Advancement {
     title: String,
     criteria: Vec<(String, String, Option<i64>)>,
 }
+
+/// Requirement groups and trigger condition payloads belonging to a datapack
+/// advancement. `Advancement` keeps its long-standing tuple shape for the
+/// fast-path tests and cross-module users; this side table carries the JSON
+/// structure those tuples cannot represent.
+#[derive(Clone, Default)]
+struct AdvancementExtras {
+    /// Outer AND of inner OR alternative criterion names.
+    requirements: Vec<Vec<String>>,
+    /// Criterion name -> its unparsed `conditions` object. Retaining the JSON
+    /// preserves item/entity/location/recipe predicates even when a trigger
+    /// currently supplies only part of that runtime context.
+    predicates: HashMap<String, crate::json::J>,
+}
 fn advancements() -> &'static Mutex<HashMap<String, Advancement>> {
     static R: OnceLock<Mutex<HashMap<String, Advancement>>> = OnceLock::new();
     R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn advancement_extras() -> &'static Mutex<HashMap<String, AdvancementExtras>> {
+    static R: OnceLock<Mutex<HashMap<String, AdvancementExtras>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn drop_orphaned_advancement_extras(
+    extras: &mut HashMap<String, AdvancementExtras>,
+    advancements: &HashMap<String, Advancement>,
+) {
+    extras.retain(|id, _| advancements.contains_key(id));
 }
 // player -> granted adv ids (persisted); player -> adv -> completed criteria
 fn adv_done() -> &'static Mutex<HashMap<String, HashSet<String>>> {
@@ -5063,6 +5128,7 @@ fn tick_adv_settled(pname: &str) -> bool {
     let done = adv_done().lock().unwrap_or_else(|e| e.into_inner());
     let earned = done.get(pname);
     let progress = prog.get(pname);
+    let extras = advancement_extras().lock().unwrap_or_else(|e| e.into_inner());
     let settled = index
         .candidates
         .iter()
@@ -5075,10 +5141,10 @@ fn tick_adv_settled(pname: &str) -> bool {
             };
             // A replay is a no-op only when it can neither record a new
             // criterion nor grant: all recordable criteria already marked,
-            // and at least one criterion of the advancement still missing
-            // (otherwise the grant scan would award it right now).
+            // and at least one requirement group still has no completed
+            // alternative (otherwise the grant scan would award it right now).
             recordable.iter().all(|criterion| marked.contains(criterion))
-                && !all.iter().all(|criterion| marked.contains(criterion))
+                && !advancement_requirements_met(id, all, marked, &extras)
         });
     if settled {
         // The full path's only unconditional side effect past the candidate
@@ -5193,6 +5259,144 @@ mod perf_adv_tick_tests {
     }
 }
 
+fn advancement_requirement_groups(
+    id: &str,
+    criteria: &[String],
+    extras: &HashMap<String, AdvancementExtras>,
+) -> Vec<Vec<String>> {
+    let explicit = extras
+        .get(id)
+        .map(|extra| extra.requirements.clone())
+        .unwrap_or_default();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    // Missing `requirements` is vanilla's implicit all-criteria form: one
+    // singleton OR group per criterion, ANDed together.
+    criteria.iter().cloned().map(|criterion| vec![criterion]).collect()
+}
+
+fn advancement_requirements_met(
+    id: &str,
+    criteria: &[String],
+    marked: &HashSet<String>,
+    extras: &HashMap<String, AdvancementExtras>,
+) -> bool {
+    let groups = advancement_requirement_groups(id, criteria, extras);
+    !groups.is_empty()
+        && groups
+            .iter()
+            .all(|group| group.iter().any(|criterion| marked.contains(criterion)))
+}
+
+fn json_id_list(value: &crate::json::J) -> Vec<String> {
+    match value {
+        crate::json::J::Str(one) => vec![one.clone()],
+        crate::json::J::Arr(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                crate::json::J::Str(one) => Some(one.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Item ids constrained by a trigger condition. Supports both the 1.20-style
+/// `item` scalar and the 1.21 item-predicate `items` scalar/array, whether
+/// carried directly or inside the `inventory_changed` `items` predicate list.
+fn advancement_item_predicates(conditions: &crate::json::J) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["item", "items"] {
+        let Some(value) = conditions.get(key) else { continue };
+        match value {
+            crate::json::J::Arr(entries) => {
+                for entry in entries {
+                    if let Some(nested) = entry.get("items").or_else(|| entry.get("item")) {
+                        out.extend(json_id_list(nested));
+                    } else {
+                        out.extend(json_id_list(entry));
+                    }
+                }
+            }
+            crate::json::J::Obj(_) => {
+                if let Some(nested) = value.get("items").or_else(|| value.get("item")) {
+                    out.extend(json_id_list(nested));
+                }
+            }
+            crate::json::J::Str(_) => out.extend(json_id_list(value)),
+            _ => {}
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn player_inventory_has_item(pname: &str, item_ids: &[String]) -> bool {
+    if item_ids.is_empty() {
+        return true;
+    }
+    let wanted: HashSet<i64> = item_ids
+        .iter()
+        .filter_map(|id| name_to_item(id.trim_start_matches("minecraft:")))
+        .collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    client_snapshot().iter().any(|client| {
+        client.name == pname
+            && client
+                .inv
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|stack| stack.1 > 0 && wanted.contains(&stack.0))
+    })
+}
+
+fn advancement_location_dimension_matches(pname: &str, conditions: &crate::json::J) -> bool {
+    let Some(location) = conditions.get("location") else {
+        return true;
+    };
+    let Some(dimension) = location.get("dimension") else {
+        return true;
+    };
+    let Some(wanted) = DimId::parse_dimension_id(dimension.str()) else {
+        return false;
+    };
+    client_snapshot().iter().any(|client| {
+        client.name == pname
+            && *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == wanted
+    })
+}
+
+/// The event tuple supplies the trigger and entity type. Conditions retained
+/// in the advancement JSON additionally constrain item-carrying triggers by
+/// the player's inventory and location triggers by dimension. Recipe predicates
+/// are retained for the recipe-unlock path; this event API carries no recipe id,
+/// so they do not narrow a trigger that has already fired.
+fn advancement_criterion_event_matches(
+    pname: &str,
+    event: &str,
+    etype: Option<i64>,
+    want: Option<i64>,
+    conditions: Option<&crate::json::J>,
+) -> bool {
+    if want.is_some() && want != etype {
+        return false;
+    }
+    let Some(conditions) = conditions else {
+        return true;
+    };
+    let item_ids = advancement_item_predicates(conditions);
+    if !item_ids.is_empty() && (event != "inventory_changed" || !player_inventory_has_item(pname, &item_ids)) {
+        return false;
+    }
+    advancement_location_dimension_matches(pname, conditions)
+}
+
 fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
     static INDEX: Mutex<Option<(u64, u64, AdvancementEventIndex)>> = Mutex::new(None);
     let __t = tickprof::enabled().then(std::time::Instant::now);
@@ -5250,31 +5454,31 @@ fn adv_event(pname: &str, event: &str, etype: Option<i64>) {
         let granted = done.get(pname);
         // (advancement id -> the criteria this event satisfied), so an advancement
         // reached by several criteria is only walked once.
+        let extras = advancement_extras().lock().unwrap_or_else(|e| e.into_inner());
         let mut touched: HashMap<&str, ()> = HashMap::new();
         for (id, cn) in candidates {
             if granted.is_some_and(|g| g.contains(id)) {
                 continue;
             }
             let Some(a) = advs.get(id) else { continue };
-            if a.criteria
-                .iter()
-                .any(|(_, tr, want)| tr == event && (want.is_none() || *want == etype))
+            let Some((_, tr, want)) = a.criteria.iter().find(|(name, _, _)| name == cn) else {
+                continue;
+            };
+            let conditions = extras.get(id).and_then(|extra| extra.predicates.get(cn));
+            if tr == event
+                && advancement_criterion_event_matches(pname, event, etype, *want, conditions)
             {
                 let p = pp.entry(id.clone()).or_default();
-                for (cn2, tr, want) in &a.criteria {
-                    if tr == event && (want.is_none() || *want == etype) {
-                        p.insert(cn2.clone());
-                    }
-                }
+                p.insert(cn.clone());
                 touched.insert(id.as_str(), ());
-                let _ = cn;
             }
         }
         drop(done);
         for id in touched.keys() {
             let Some(a) = advs.get(*id) else { continue };
             let p = pp.entry((*id).to_string()).or_default();
-            if !a.criteria.is_empty() && a.criteria.iter().all(|(cn, _, _)| p.contains(cn)) {
+            let criteria: Vec<String> = a.criteria.iter().map(|(cn, _, _)| cn.clone()).collect();
+            if advancement_requirements_met(id, &criteria, p, &extras) {
                 grants.push((*id).to_string());
             }
         }
@@ -12569,5 +12773,130 @@ mod admin_wire_tests {
             Some(v) => std::env::set_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS", v),
             None => std::env::remove_var("MEGU_ALLOW_PLAYER_ADMIN_COMMANDS"),
         }
+    }
+}
+
+#[cfg(test)]
+mod audit1_advancement_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn cleanup(id: &str, pname: &str) {
+        advancements().lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        advancement_extras().lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        adv_prog().lock().unwrap_or_else(|e| e.into_inner()).remove(pname);
+        adv_done().lock().unwrap_or_else(|e| e.into_inner()).remove(pname);
+    }
+
+    fn read_one(key: &str, body: &str) -> (Advancement, AdvancementExtras) {
+        let mut content = DatapackContent::default();
+        content.read_advancement(key.to_string(), key.rsplit(':').next().unwrap_or(key), body);
+        let advancement = content.advancements.remove(key).expect("advancement parses");
+        let extras = content.advancement_extras.remove(key).unwrap_or_default();
+        (advancement, extras)
+    }
+
+    #[test]
+    fn audit_advancement_parser_retains_requirement_groups_and_predicates() {
+        let body = r#"{
+            "criteria": {
+                "has_the_recipe": {"trigger": "minecraft:inventory_changed", "conditions": {"items": [{"items": "minecraft:cobblestone"}]}},
+                "has_cobblestone": {"trigger": "minecraft:inventory_changed", "conditions": {"items": [{"items": "minecraft:cobblestone"}]}}
+            },
+            "requirements": [["has_the_recipe", "has_cobblestone"]],
+            "display": {"title": {"text": "Stone Age"}}
+        }"#;
+        let (advancement, extras) = read_one("test:stone_age", body);
+        assert_eq!(advancement.title, "Stone Age");
+        assert_eq!(advancement.criteria.len(), 2);
+        assert_eq!(extras.requirements, vec![vec!["has_the_recipe".to_string(), "has_cobblestone".to_string()]]);
+        assert!(extras.predicates.contains_key("has_the_recipe"));
+        assert!(extras.predicates.contains_key("has_cobblestone"));
+    }
+
+    #[test]
+    fn audit_advancement_or_requirement_group_grants_from_one_alternative() {
+        let _guard = crate::world_guard();
+        let id = "test:audit_or_group";
+        let pname = "AuditOrTester";
+        cleanup(id, pname);
+        advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            Advancement {
+                title: id.to_string(),
+                criteria: vec![
+                    ("recipe".to_string(), "tick".to_string(), None),
+                    ("cobblestone".to_string(), "inventory_changed".to_string(), None),
+                ],
+            },
+        );
+        advancement_extras().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            AdvancementExtras {
+                requirements: vec![vec!["recipe".to_string(), "cobblestone".to_string()]],
+                predicates: HashMap::new(),
+            },
+        );
+        adv_event(pname, "tick", None);
+        assert!(
+            adv_done().lock().unwrap_or_else(|e| e.into_inner())[pname].contains(id),
+            "one completed alternative satisfies the OR requirement group"
+        );
+        cleanup(id, pname);
+    }
+
+    #[test]
+    fn audit_advancement_omitted_requirements_still_means_all_criteria() {
+        let _guard = crate::world_guard();
+        let id = "test:audit_default_and";
+        let pname = "AuditAndTester";
+        cleanup(id, pname);
+        advancements().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.to_string(),
+            Advancement {
+                title: id.to_string(),
+                criteria: vec![
+                    ("seen".to_string(), "tick".to_string(), None),
+                    ("placed".to_string(), "inventory_changed".to_string(), None),
+                ],
+            },
+        );
+        adv_event(pname, "tick", None);
+        assert!(!adv_done().lock().unwrap_or_else(|e| e.into_inner()).contains_key(pname));
+        adv_event(pname, "inventory_changed", None);
+        assert!(adv_done().lock().unwrap_or_else(|e| e.into_inner())[pname].contains(id));
+        cleanup(id, pname);
+    }
+
+    #[test]
+    fn audit_inventory_trigger_item_predicate_must_match_inventory() {
+        let _guard = crate::world_guard();
+        let conditions = crate::json::jparse(
+            br#"{"items":[{"items":"minecraft:stone"}]}"#,
+        ).expect("item predicate parses");
+        assert!(
+            !advancement_criterion_event_matches(
+                "NoSuchPlayer",
+                "inventory_changed",
+                None,
+                None,
+                Some(&conditions),
+            ),
+            "an item predicate cannot be satisfied without the item in inventory"
+        );
+        let (client, _rx) = client_pair();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            36,
+            (name_to_item("stone").unwrap(), 1, Vec::new()),
+        );
+        clients().lock().unwrap_or_else(|e| e.into_inner()).push(Arc::new(client));
+        assert!(advancement_criterion_event_matches(
+            "totem-test",
+            "inventory_changed",
+            None,
+            None,
+            Some(&conditions),
+        ));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|client| client.eid != 4242);
     }
 }

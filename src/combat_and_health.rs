@@ -1405,33 +1405,106 @@ fn queue_mace_smash(me: &Client, held: &Stack, fall: f32, target: i32, center: [
     mace_smashes().lock().unwrap_or_else(|e| e.into_inner()).insert(me.eid, smash);
 }
 
+fn mace_smash_impulse(center: [f64; 3], pos: [f64; 3], heavy: f64) -> Option<[f64; 3]> {
+    let dx = pos[0] - center[0];
+    let dy = pos[1] - center[1];
+    let dz = pos[2] - center[2];
+    let distance = dx.hypot(dy).hypot(dz);
+    let power = (3.5 - distance) * 0.7 * heavy;
+    if power <= 0.0 {
+        return None;
+    }
+    let length = distance.max(0.01);
+    Some([dx / length * power, 0.7, dz / length * power])
+}
+
+fn mace_smash_pet_exempt(mob: &Arc<Mob>, attacker_uuid: [u8; 16]) -> bool {
+    live_mob_states()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&mob.eid)
+        .and_then(|state| state.behavior.as_ref())
+        .is_some_and(|behavior| match behavior {
+            MobBehaviorState::Wolf(pet) | MobBehaviorState::Cat(pet) => {
+                pet.owner == Some(attacker_uuid)
+            }
+            _ => false,
+        })
+}
+
 fn wind_burst_apply(c: &Arc<Client>, smash: MaceSmash) {
     let heavy = if smash.fall > 5.0 { 2.0 } else { 1.0 };
-    let nearby: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
-        .filter(|m| m.dim == smash.dim && m.eid != smash.target)
-        .cloned().collect();
+    let attacker_uuid = c.uuid;
+    let nearby: Vec<_> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect();
     for m in nearby {
-        if *m.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0 {
+        if m.dim != smash.dim
+            || m.eid == smash.target
+            || m.etype == 3 // armor stands are immune to the smash pulse
+            || mace_smash_pet_exempt(&m, attacker_uuid)
+            || *m.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+        {
             continue;
         }
-        let position = {
+        let (x, y, z, yaw, pitch) = {
             let mut pos = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-            let dx = pos.0 - smash.center[0];
-            let dy = pos.1 - smash.center[1];
-            let dz = pos.2 - smash.center[2];
-            let distance = dx.hypot(dy).hypot(dz);
-            let power = (3.5 - distance) * 0.7 * heavy;
-            if power <= 0.0 {
+            let Some(impulse) = mace_smash_impulse(smash.center, [pos.0, pos.1, pos.2], heavy) else {
                 continue;
+            };
+            // Record vanilla `deltaMovement`, then move this tick's impulse
+            // through the same collision sweep other entity motion uses. The
+            // old radial pulse rewrote the position directly, so a mob could
+            // be shoved through a wall.
+            {
+                let mut vel = m.vel.lock().unwrap_or_else(|e| e.into_inner());
+                vel[0] += impulse[0];
+                vel[1] += impulse[1];
+                vel[2] += impulse[2];
             }
-            let length = distance.max(0.01);
-            pos.0 += dx / length * power;
-            pos.1 += 0.7;
-            pos.2 += dz / length * power;
+            let (width, height) = mob_dimensions(m.etype);
+            let on_ground = mob_has_support_dim(m.dim, m.etype, pos.0, pos.1, pos.2);
+            let (next, _) = step_entity_move_dim(
+                m.dim,
+                [pos.0, pos.1, pos.2],
+                width,
+                height,
+                impulse,
+                on_ground,
+                0.6,
+            );
+            pos.0 = next[0];
+            pos.1 = next[1];
+            pos.2 = next[2];
             *pos
         };
-        let (x, y, z, yaw, pitch) = position;
         broadcast_seen(m.eid, |_| (0x70, entity_teleport(m.eid, x, y, z, yaw, pitch, true)));
+    }
+    // Nearby players are living entities for the radial pulse too. They receive
+    // a velocity packet rather than a position rewrite; the attacker's own Wind
+    // Burst launch below remains the only impulse the wielder gets.
+    for player in client_snapshot() {
+        if player.eid == c.eid
+            || player.eid == smash.target
+            || *player.dim.lock().unwrap_or_else(|e| e.into_inner()) != smash.dim
+            || player.is_spectator()
+            || *player.hp.lock().unwrap_or_else(|e| e.into_inner()) <= 0.0
+        {
+            continue;
+        }
+        let (x, y, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(impulse) = mace_smash_impulse(smash.center, [x, y, z], heavy) else {
+            continue;
+        };
+        let resistance = knockback_resist_of(&player);
+        let packet = velocity_pkt(
+            player.eid,
+            (impulse[0] * 8000.0 * (1.0 - resistance)) as i16,
+            (impulse[1] * 8000.0) as i16,
+            (impulse[2] * 8000.0 * (1.0 - resistance)) as i16,
+        );
+        if let Ok(mut sock) = player.sock.lock() {
+            let _ = send_packet(&mut sock, 0x5a, packet.clone());
+        }
+        broadcast_seen_ex(player.eid, player.eid, |_| (0x5a, packet.clone()));
     }
     let [x, y, z] = smash.center;
     let mut event = 2013i32.to_be_bytes().to_vec();
@@ -7946,5 +8019,71 @@ mod dim_entity_pure_tests {
         let merged = merge_xp_orbs(&mut xs);
         assert_eq!(merged, vec![2]);
         assert_eq!(xs[0].val, 20);
+    }
+}
+
+#[cfg(test)]
+mod audit1_mace_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn audit_mob(eid: i32, etype: i64, x: f64) -> Arc<Mob> {
+        Arc::new(Mob {
+            dim: DimId::Overworld,
+            eid,
+            uuid: [eid as u8; 16],
+            etype,
+            pos: Mutex::new((x, 66.0, 0.0, 0.0, 0.0)),
+            hp: Mutex::new(20.0),
+            last_hit: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            hurt_at: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_hurt_tick: Mutex::new(None),
+            fuse: Mutex::new(0),
+            fire_ticks: Mutex::new(0),
+            love: Mutex::new(0),
+            air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
+            vel: Mutex::new([0.0; 3]),
+        })
+    }
+
+    #[test]
+    fn audit_mace_smash_impulses_mobs_and_nearby_players() {
+        let _guard = crate::world_guard();
+        let (attacker, _attacker_rx) = client_pair();
+        let (mut bystander, mut bystander_rx) = client_pair();
+        bystander.eid = 4244;
+        bystander.uuid = [44; 16];
+        *bystander.pos.lock().unwrap_or_else(|e| e.into_inner()) = (1.0, 66.0, 0.0, 0.0, 0.0, false);
+        let attacker = Arc::new(attacker);
+        let bystander = Arc::new(bystander);
+        clients().lock().unwrap_or_else(|e| e.into_inner()).extend([attacker.clone(), bystander.clone()]);
+        let mob = audit_mob(4300, 124, 1.0);
+        let armor_stand = audit_mob(4301, 3, -1.0);
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).extend([mob.clone(), armor_stand.clone()]);
+
+        wind_burst_apply(&attacker, MaceSmash {
+            dim: DimId::Overworld,
+            target: 9999,
+            center: [0.0, 66.0, 0.0],
+            origin: [0.0, 66.0, 0.0],
+            level: 1,
+            fall: 4.0,
+        });
+
+        let vel = *mob.vel.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(vel[0] > 1.0, "mob deltaMovement records the radial impulse: {vel:?}");
+        assert!((vel[1] - 0.7).abs() < 1e-9, "mob impulse has the vanilla upward component: {vel:?}");
+        let pos = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(pos.0 > 1.0, "mob movement uses the collision sweep instead of a raw teleport: {pos:?}");
+        assert_eq!(*armor_stand.vel.lock().unwrap_or_else(|e| e.into_inner()), [0.0; 3], "armor stands are exempt");
+        assert_eq!(armor_stand.pos.lock().unwrap_or_else(|e| e.into_inner()).0, -1.0);
+
+        let packet = read_packet(&mut bystander_rx, Instant::now() + Duration::from_secs(1))
+            .expect("nearby player receives a velocity impulse packet");
+        assert_eq!(packet.0, 0x5a);
+        assert_eq!(packet.1, velocity_pkt(4244, 14000, 5600, 0));
+
+        mobs().lock().unwrap_or_else(|e| e.into_inner()).retain(|mob| ![4300, 4301].contains(&mob.eid));
+        clients().lock().unwrap_or_else(|e| e.into_inner()).retain(|client| ![4242, 4244].contains(&client.eid));
     }
 }
