@@ -808,9 +808,10 @@ fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static 
         if wave == 0 || wave != waves_spawned || state != RaidState::InProgress {
             return Err("invalid saved raider wave");
         }
-        let row = RAID_BASE_WAVES[usize::from(wave.min(regular_waves) - 1)];
-        let slots = row.into_iter().map(usize::from).sum();
-        if slot >= slots || !remaining.insert(RaidRaiderId { wave, slot }) {
+        // Realized waves can contain bonus raiders and ravager riders in
+        // addition to the base table. Bound corrupt input without rejecting
+        // valid expanded rosters.
+        if slot >= 64 || !remaining.insert(RaidRaiderId { wave, slot }) {
             return Err("invalid or duplicate saved raider");
         }
     }
@@ -833,6 +834,7 @@ fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static 
             countdown,
             ticks_elapsed,
             remaining,
+            roster: HashMap::new(),
             participants,
             omen_level,
         },
@@ -843,6 +845,8 @@ fn read_saved_raid(input: &mut SaveInput<'_>) -> Result<(DimId, Raid), &'static 
 // Outer readers still peel the same SED1, MDM1, BRS1 and dimension footers.
 const SAVE_STATE_MAGIC: &[u8; 4] = b"SVP1";
 const SAVE_ENTITY_RULES_MAGIC: &[u8; 4] = b"SVX1";
+const SAVE_ENTITY_RULES_V2_MAGIC: &[u8; 4] = b"SVX2";
+const SAVE_STATE_V2_MAGIC: &[u8; 4] = b"SVP2";
 
 // The live rules have dedicated atomics. All other rules live in the
 // command registry; capture the atomics as authoritative when saving.
@@ -1118,7 +1122,7 @@ fn append_save_state(
     }
     // SVX1 is inside SVP1, after the original records. Old SVP1 readers in
     // this version can still load older SVP1 bodies with no SVX1 suffix.
-    out.extend_from_slice(SAVE_ENTITY_RULES_MAGIC);
+    out.extend_from_slice(SAVE_ENTITY_RULES_V2_MAGIC);
     let rules = command_gamerules().lock().unwrap_or_else(|e| e.into_inner());
     megu_core::varint::write_varlong_i64(COMMAND_GAMERULE_DEFAULTS.len() as i64, out);
     for &(name, _, _) in COMMAND_GAMERULE_DEFAULTS.iter() {
@@ -1154,9 +1158,21 @@ fn append_save_state(
             save_numbers!(out, value);
         }
     }
+    megu_core::varint::write_varlong_i64(raids.len() as i64, out);
+    for (_, raid) in raids.iter() {
+        let mut roster: Vec<_> = raid.roster.iter().collect();
+        roster.sort_unstable_by_key(|(id, _)| (id.wave, id.slot));
+        megu_core::varint::write_varlong_i64(roster.len() as i64, out);
+        for (id, (uuid, captain)) in roster {
+            out.push(id.wave);
+            megu_core::varint::write_varlong_i64(id.slot as i64, out);
+            out.extend_from_slice(uuid);
+            out.push(u8::from(*captain));
+        }
+    }
     let size = (out.len() - start) as u64;
     save_numbers!(out, size);
-    out.extend_from_slice(SAVE_STATE_MAGIC);
+    out.extend_from_slice(SAVE_STATE_V2_MAGIC);
 }
 
 #[derive(Default)]
@@ -1198,7 +1214,9 @@ impl SaveState {
         let mut gamerules = None;
         let mut mob_attributes = Vec::new();
         if !input.0.is_empty() {
-            if input.take::<4>()? != *SAVE_ENTITY_RULES_MAGIC {
+            let ext_magic = input.take::<4>()?;
+            let ext_v2 = ext_magic == *SAVE_ENTITY_RULES_V2_MAGIC;
+            if ext_magic != *SAVE_ENTITY_RULES_MAGIC && !ext_v2 {
                 return Err("unknown save state extension");
             }
             let count = input.var_count(5)?;
@@ -1235,6 +1253,33 @@ impl SaveState {
                     }
                 }
                 mob_attributes.push((index, selector_key, entries));
+            }
+            if ext_v2 {
+                let roster_raid_count = input.var_count(2)?;
+                if roster_raid_count != raids.len() {
+                    return Err("saved raid roster count mismatch");
+                }
+                for (_, raid) in &mut raids {
+                    let roster_count = input.var_count(2)?;
+                    // SVP1 had no UUID association. Permit its active slots to
+                    // migrate with an empty roster; all newly spawned waves
+                    // are written with the complete realized UUID mapping.
+                    if roster_count > 64 || roster_count > raid.remaining.len() {
+                        return Err("saved raid roster size mismatch");
+                    }
+                    for _ in 0..roster_count {
+                        let wave = input.byte()?;
+                        let slot = usize::try_from(input.varint()?).map_err(|_| "invalid saved raider slot")?;
+                        let uuid = input.take()?;
+                        let captain = input.flag()?;
+                        let id = RaidRaiderId { wave, slot };
+                        if slot >= 64 || !raid.remaining.contains(&id)
+                            || raid.roster.insert(id, (uuid, captain)).is_some()
+                        {
+                            return Err("invalid saved raid UUID association");
+                        }
+                    }
+                }
             }
         }
         if !input.0.is_empty() {
@@ -2028,7 +2073,12 @@ fn write_world_file(
             tmp.display(),
             path.display()
         )
-    })
+    })?;
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| format!("cannot sync save directory {}: {e}", parent.display()))
 }
 
 // ---------- multi-file save batches ----------
@@ -4533,7 +4583,13 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     let before_ticks = tick_persistence::prefix(payload)?;
     let generated = generated_content::Snapshot::read(before_ticks)?;
     let (before_generated, _) = split_save_footer(before_ticks, b"GEN1")?;
-    let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
+    let (payload, body) = if before_generated.ends_with(SAVE_STATE_V2_MAGIC) {
+        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_V2_MAGIC)?;
+        (payload, body)
+    } else {
+        let (payload, body) = split_save_footer(before_generated, SAVE_STATE_MAGIC)?;
+        (payload, body)
+    };
     let mut state = body.map(SaveState::read).transpose()?;
     let (payload, advancements) = split_save_footer(payload, ADVANCEMENTS_MAGIC)?;
     let advancements = advancements.map(read_advancements_body).transpose()?;
@@ -5790,7 +5846,27 @@ fn decode_world_payload(payload: &[u8]) -> Result<(), &'static str> {
     restore_gamerules(state.gamerules.as_deref());
     *WORLD_SPAWN_PITCH.lock().unwrap_or_else(|e| e.into_inner()) = state.spawn_pitch;
     *saved_players().lock().unwrap_or_else(|e| e.into_inner()) = state.players;
-    *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = state.raids;
+    let raids = std::mem::take(&mut state.raids);
+    let mobs_by_uuid: HashMap<[u8; 16], (i32, i64)> = mobs()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|mob| (mob.uuid, (mob.eid, mob.etype)))
+        .collect();
+    let mut restored_raiders = HashMap::new();
+    let mut restored_captains = HashMap::new();
+    for (dim, raid) in &raids {
+        for (&id, &(uuid, captain)) in &raid.roster {
+            let Some(&(eid, _)) = mobs_by_uuid.get(&uuid) else { continue };
+            restored_raiders.insert(eid, (*dim, raid.center, id));
+            if captain {
+                restored_captains.insert(eid, (*dim, raid.center));
+            }
+        }
+    }
+    *live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()) = restored_raiders;
+    *live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()) = restored_captains;
+    *saved_raids().lock().unwrap_or_else(|e| e.into_inner()) = raids;
     *live_brewing_stands().lock().unwrap_or_else(|e| e.into_inner()) = brewing;
     restore_wbe_entries(wbe_entries);
     restore_saved_bossbars(saved_bossbars);
