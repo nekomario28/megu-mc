@@ -31,29 +31,11 @@
     },
     {
       "check": "dead_tick_or_bridge",
-      "symbol": "tick_rail_network",
-      "file": "create-adapter/src/rail_network.rs",
-      "line": 1173,
-      "reason": "Create rail-network scheduled-train tick implemented (virtual transit, reservations) but never stepped by the factory region tick; only perf tests call it.",
-      "lane": "CREATE-RAIL",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
       "symbol": "tick_lifecycle",
       "file": "mod-adapter-core/src/creature_primitives.rs",
       "line": 418,
       "reason": "Creature lifecycle tick (growth/breeding/aquatic suffocation) is fully implemented but only its crate tests call it; no runtime loop steps it.",
       "lane": "MOD-RUNTIME",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_tick_or_bridge",
-      "symbol": "aeronautics_bridge_discover_addon_jar",
-      "file": "src/aeronautics_and_dim_bridge.rs",
-      "line": 1002,
-      "reason": "Addon-jar discovery entrypoint staged alongside aeronautics_bridge_tick; never invoked from the mod-load path.",
-      "lane": "CREATE-OFFLOAD-LIVE",
       "date": "2026-11-24"
     },
     {
@@ -480,19 +462,6 @@
     },
     {
       "check": "one_sided_channel",
-      "symbol": "megu:mod_sync_v1",
-      "sites": [
-        "mod-adapter-core/src/mod_sync.rs:69",
-        "proto/src/channel_router.rs:154",
-        "src/live_mod_bridge.rs",
-        "src/play_protocol.rs"
-      ],
-      "reason": "Server-side mod-sync channel constant exists in mod_sync + bridge emission paths; no client-side handler ever references it.",
-      "lane": "MOD-SYNC",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "one_sided_channel",
       "symbol": "megu:vfx_v1",
       "sites": [
         "client-app/src/protocol.rs:24",
@@ -774,15 +743,6 @@
     },
     {
       "check": "dead_client_config_field",
-      "symbol": "UiSettings.language",
-      "file": "client-ui/src/state.rs",
-      "line": 800,
-      "reason": "Legacy LanguageSetting kept synchronized for backward compatibility; all live translation paths read UiSettings.locale instead \u2014 .language is never read outside state.rs.",
-      "lane": "CLIENT-SETTINGS",
-      "date": "2026-11-24"
-    },
-    {
-      "check": "dead_client_config_field",
       "symbol": "UiSettings.visual.external_shader_pack_name",
       "file": "client-ui/src/state.rs",
       "line": 730,
@@ -1014,6 +974,60 @@
       "reason": "Setting scoped the removed title-screen link row; the Vanilla-pure Title never renders links and About keeps all links regardless (pinned by title_link_row_removed_about_keeps_all_links). Kept for settings-file and programmatic compatibility.",
       "lane": "CLIENT-UI-QOL",
       "date": "2026-11-24"
+    },
+    {
+      "check": "asymmetric_save_tag",
+      "symbol": "SVP1",
+      "file": "src/save_v2.rs",
+      "line": 949,
+      "reason": "Legacy v1 state footer retained read-only for backward-compatible loading of older saves; new writes emit SVP2.",
+      "lane": "ALPHA5-SAVE-COMPAT",
+      "date": "2026-11-26"
+    },
+    {
+      "check": "asymmetric_save_tag",
+      "symbol": "SVX1",
+      "file": "src/save_v2.rs",
+      "line": 950,
+      "reason": "Legacy v1 entity/rules footer retained read-only for backward-compatible loading of older saves; new writes emit SVX2/SVX3.",
+      "lane": "ALPHA5-SAVE-COMPAT",
+      "date": "2026-11-26"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "aeronautics_bridge_assign_helm_seat",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 1997,
+      "reason": "Authoritative helm-seat lease assignment helper exercised by aeronautics permission tests and reserved for interactive helm-block placement.",
+      "lane": "ALPHA5-M3B",
+      "date": "2026-11-26"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "aeronautics_bridge_permit_ship_disassembly",
+      "file": "src/aeronautics_and_dim_bridge.rs",
+      "line": 2012,
+      "reason": "Authoritative ship-disassembly permit helper exercised by aeronautics permission tests and reserved for interactive helm-block disassembly.",
+      "lane": "ALPHA5-M3B",
+      "date": "2026-11-26"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "live_create_tick_body",
+      "file": "src/live_mod_bridge.rs",
+      "line": 6071,
+      "reason": "Single-frame legacy KNB1 tick-body helper retained for compatibility tests; production live tick uses chunked multi-frame KNB1 dispatch.",
+      "lane": "ALPHA5-M3C",
+      "date": "2026-11-26"
+    },
+    {
+      "check": "dead_tick_or_bridge",
+      "symbol": "step_tick_with_actor_query",
+      "file": "src/mod_offload_bridge.rs",
+      "line": 747,
+      "reason": "Parameterized actor-query step entrypoint exercised by lock-free parallel parity tests alongside step_tick.",
+      "lane": "ALPHA5-M3B",
+      "date": "2026-11-26"
     }
   ]
 }

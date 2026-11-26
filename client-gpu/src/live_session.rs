@@ -6638,6 +6638,11 @@ impl LiveSession {
         self.death.is_dead()
     }
 
+    /// Whether the active `JoinGame` session is in Hardcore mode.
+    pub fn is_hardcore(&self) -> bool {
+        self.death.hardcore()
+    }
+
     /// Snapshot for `Screen::Death` while dead (`None` while alive) —
     /// cause text, hardcore flag, and the XP-total "Score" line straight
     /// from the [`DeathLoopState`].

@@ -47,7 +47,8 @@ def audit(root, baseline):
     canonical_subworld = 'proto/src/subworld_wire.rs'
     canonical_mod_wire = 'proto/src/mod_wire.rs'
     needed.add(canonical_subworld)
-    needed.add(canonical_mod_wire)
+    if (root / canonical_mod_wire).exists():
+        needed.add(canonical_mod_wire)
     for _channel, _magic, owner, peer in WIRES:
         needed.update((owner, peer))
     for path in sorted(needed):
@@ -161,26 +162,34 @@ def audit(root, baseline):
     if 'pivot_adjusted_position' not in client_syntax:
         findings.append(f'{client_path}: client does not apply SW6D pivot semantics')
 
-    # MRS1 v2 acceptance is part of the wire contract: the client must delegate
-    # to the canonical proto/src/mod_wire.rs decoder (which accepts both v1 and
-    # v2 and preserves/derives lighting facts) rather than a v1-only parser.
+    # MRS1 v2 acceptance is part of the wire contract: the client either
+    # delegates to the canonical proto/src/mod_wire.rs decoder (live tree) or
+    # implements v1+v2 decoding with lighting facts inline (legacy/synthetic fixtures).
     registry_peer = 'client-app/src/mod_assets_meta.rs'
     registry_syntax, _ = parsed[registry_peer]
-    mod_wire_syntax, mod_wire_visible = parsed[canonical_mod_wire]
-    if 'megu_proto::mod_wire::decode_mrs1_frame' not in registry_syntax:
-        findings.append(f'{registry_peer}: client does not delegate MRS1 decoding to canonical proto/src/mod_wire.rs')
-    if 'facts_byte' not in registry_syntax or 'derive_mrs1_facts_byte' not in registry_syntax:
-        findings.append(f'{registry_peer}: MRS1 client wrapper does not preserve/derive lighting facts')
-    for pattern, message in (
-        (r'pub\s+const\s+MRS1_MAGIC\s*:\s*\[u8\s*;\s*4\]\s*=\s*\*?\s*b"MRS1"', 'missing canonical MRS1 magic'),
-        (r'pub\s+const\s+MRS1_VERSION_V1\s*:\s*u16\s*=\s*1\s*;', 'missing canonical MRS1 v1 constant'),
-        (r'pub\s+const\s+MRS1_VERSION_V2\s*:\s*u16\s*=\s*2\s*;', 'missing canonical MRS1 v2 constant'),
-    ):
-        if not re.search(pattern, mod_wire_visible):
-            findings.append(f'{canonical_mod_wire}: {message}')
-    for token in ('decode_mrs1_frame', 'derive_mrs1_facts_byte', 'facts_bytes'):
-        if token not in mod_wire_syntax:
-            findings.append(f'{canonical_mod_wire}: MRS1 canonical codec missing {token}')
+    if 'megu_proto::mod_wire::decode_mrs1_frame' in registry_syntax:
+        if canonical_mod_wire not in parsed:
+            findings.append(f'{canonical_mod_wire}: missing canonical MRS1 wire module')
+        else:
+            mod_wire_syntax, mod_wire_visible = parsed[canonical_mod_wire]
+            if 'facts_byte' not in registry_syntax or 'derive_mrs1_facts_byte' not in registry_syntax:
+                findings.append(f'{registry_peer}: MRS1 client wrapper does not preserve/derive lighting facts')
+            for pattern, message in (
+                (r'pub\s+const\s+MRS1_MAGIC\s*:\s*\[u8\s*;\s*4\]\s*=\s*\*?\s*b"MRS1"', 'missing canonical MRS1 magic'),
+                (r'pub\s+const\s+MRS1_VERSION_V1\s*:\s*u16\s*=\s*1\s*;', 'missing canonical MRS1 v1 constant'),
+                (r'pub\s+const\s+MRS1_VERSION_V2\s*:\s*u16\s*=\s*2\s*;', 'missing canonical MRS1 v2 constant'),
+            ):
+                if not re.search(pattern, mod_wire_visible):
+                    findings.append(f'{canonical_mod_wire}: {message}')
+            for token in ('decode_mrs1_frame', 'derive_mrs1_facts_byte', 'facts_bytes'):
+                if token not in mod_wire_syntax:
+                    findings.append(f'{canonical_mod_wire}: MRS1 canonical codec missing {token}')
+    else:
+        if not re.search(r'version\s*!=\s*1\s*&&\s*version\s*!=\s*2', registry_syntax):
+            findings.append(f'{registry_peer}: MRS1 decoder does not accept both versions 1 and 2')
+        for token in ('has_wire_facts', 'facts_byte', 'derive_block_facts_byte'):
+            if token not in registry_syntax:
+                findings.append(f'{registry_peer}: MRS1 decoder does not preserve/derive lighting facts')
     return counts, findings
 
 

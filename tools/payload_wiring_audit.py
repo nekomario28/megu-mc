@@ -48,7 +48,8 @@ def findings():
         problems.append("brushable payload is not materialized into the live block-entity store")
 
     checks = {
-        "desert_well": "ctx.push_brushable(first" in feature and "ctx.push_brushable(second" in feature,
+        "desert_well": bool(re.search(r"ctx\.push_brushable\(\s*first", feature))
+        and bool(re.search(r"ctx\.push_brushable\(\s*second", feature)),
         "desert_pyramid": "LootKind::Brushable =>" in single and "ctx.push_brushable(loot.pos" in single,
         "ocean_ruin": "minecraft:archaeology/ocean_ruin_warm" in ocean and "minecraft:archaeology/ocean_ruin_cold" in ocean
         and "GenerationPayload::Brushable" in template,

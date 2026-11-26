@@ -442,7 +442,7 @@ CHECKS = [
     {"id": "opt-gpu-render-into",
      "summary": "pooled UiState::render_into draw list (no per-frame ui.render())",
      "file": WINDOW_RS,
-     "requirements": [_call("render_into")]},
+     "requirements": [_call_any("render_into", "render_into_with_gui_atlas")]},
     {"id": "opt-external-sections-delta-sync",
      "summary": "external section delta sync (no full-map clone per frame)",
      "file": WINDOW_RS,
@@ -453,6 +453,7 @@ CHECKS = [
      "requirements": [_call_any(
          "set_lit_entity_ber_quads",
          "set_entity_and_ber_meshes_lit",
+         "set_entity_and_ber_meshes_textured",
          "set_entity_and_ber_meshes",
      )]},
     {"id": "opt-particle-billboards",

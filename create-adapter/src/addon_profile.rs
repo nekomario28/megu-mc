@@ -187,6 +187,30 @@ pub enum AddonProcessingRecipe {
     GenericMachine(MachineProcessingRecipe),
 }
 
+impl AddonProcessingRecipe {
+    /// Canonical recipe serializer id (`<ns>:<type>`) owned by `create-adapter`.
+    pub fn serializer_id(&self) -> &str {
+        match self {
+            Self::SequencedAssembly(_) => "create:sequenced_assembly",
+            Self::Pressing { .. } => "create:pressing",
+            Self::Mixing { .. } => "create:mixing",
+            Self::Milling { .. } => "create:milling",
+            Self::Crushing { .. } => "create:crushing",
+            Self::Cutting { .. } => "create:cutting",
+            Self::Filling { .. } => "create:filling",
+            Self::Compacting(recipe)
+            | Self::Splashing(recipe)
+            | Self::Haunting(recipe)
+            | Self::Deploying(recipe)
+            | Self::Emptying(recipe)
+            | Self::ItemApplication(recipe)
+            | Self::SandpaperPolishing(recipe)
+            | Self::MechanicalCrafting(recipe)
+            | Self::GenericMachine(recipe) => recipe.recipe_type.as_str(),
+        }
+    }
+}
+
 fn item_stack(ids: &mut ItemFluidIdTable, item_id: &str, amount: u32) -> Stack {
     Stack {
         resource: Resource {

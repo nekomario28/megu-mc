@@ -64,12 +64,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::OpenBook",
-      "priority": "P2",
-      "reason": "open_book drops \u2014 book GUI unimplemented"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::Other",
       "priority": "P2",
       "reason": "catch-all variant for undecoded packet ids \u2014 intentionally unhandled"
@@ -223,18 +217,6 @@
       "id": "Screen::CrashRecovery",
       "priority": "P1",
       "reason": "unreachable \u2014 UiState::show_crash is never invoked from client-gpu, so the recovery screen can never appear"
-    },
-    {
-      "check": "screen_state_reachability",
-      "id": "Screen::ModSyncConsent",
-      "priority": "P1",
-      "reason": "unreachable \u2014 nothing navigates to it and pending_mod_sync is never populated; the consent gate is dead code"
-    },
-    {
-      "check": "screen_state_reachability",
-      "id": "ShaderPackScreenState",
-      "priority": "P2",
-      "reason": "owned by UiState::shader_packs and drawn through Screen::Settings(SettingsTab::Shaders); the type name never appears in client-gpu"
     }
   ]
 }

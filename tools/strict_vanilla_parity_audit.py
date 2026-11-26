@@ -421,11 +421,13 @@ def gate3_structure_loot(texts):
         g["findings"].append("no live vault block-entity handling")
     live = _live(texts, "src/menus_and_items.rs")
     skel = _skel(texts, "src/menus_and_items.rs")
-    bodies = fn_bodies(skel, "roll_loot_container_slots")
+    bodies = fn_bodies(skel, "roll_loot_container_slots") + fn_bodies(
+        skel, "roll_loot_container_slots_at"
+    )
     if not bodies:
         g["findings"].append("roll_loot_container_slots not found")
     else:
-        body = live[bodies[0][0]:bodies[0][1]]
+        body = "\n".join(live[s:e] for s, e in bodies)
         if not any(n in body for n in BUILTIN_NEEDLES):
             builtins = _builtin_table_ids(texts)
             chests = sorted(t for t in builtins
@@ -634,9 +636,11 @@ def gate9_builtin_bypass(texts):
     g["evidence"].append(f"{len(builtins)} built-in vanilla loot tables")
     live = _live(texts, "src/menus_and_items.rs")
     skel = _skel(texts, "src/menus_and_items.rs")
-    bodies = fn_bodies(skel, "roll_loot_container_slots")
-    roller_ok = bool(bodies) and any(
-        n in live[bodies[0][0]:bodies[0][1]] for n in BUILTIN_NEEDLES)
+    bodies = fn_bodies(skel, "roll_loot_container_slots") + fn_bodies(
+        skel, "roll_loot_container_slots_at"
+    )
+    combined = "\n".join(live[s:e] for s, e in bodies)
+    roller_ok = bool(bodies) and any(n in combined for n in BUILTIN_NEEDLES)
     if not bodies:
         g["findings"].append("roll_loot_container_slots not found")
     elif not roller_ok:

@@ -4608,10 +4608,12 @@ impl GpuApp {
                 megu_ui::mod_manager::PlamoTranslatorStatus::Ready
             }
         };
-        let enabled = self
+        let pack_selected = self
             .resource_pack_selection
             .iter()
             .any(|pack| pack == crate::mod_translator::AUTO_TRANSLATION_PACK_DIR);
+        let enabled = pack_selected || self.ui.settings.plamo_auto_translation_pack;
+        self.ui.settings.plamo_auto_translation_pack = enabled;
         self.ui.mod_manager.set_plamo_status(
             ui_status,
             self.ui.mod_manager.plamo_panel.preset,
@@ -8813,6 +8815,25 @@ impl GpuApp {
             .iter()
             .map(|bar| (bar.title.clone(), bar.health.clamp(0.0, 1.0)))
             .collect();
+        ui.hud.bossbar_colors = feed
+            .bossbars
+            .iter()
+            .map(|bar| {
+                let idx = bar.color.clamp(0, (megu_ui::state::BossBarColor::ALL.len() - 1) as i32)
+                    as usize;
+                megu_ui::state::BossBarColor::ALL[idx]
+            })
+            .collect();
+        ui.hud.max_health = ui.hud.max_health.max(ui.hud.health).max(20.0);
+        ui.hud.heart_style = if feed.status_effects.iter().any(|e| e.effect_id == 20) {
+            megu_ui::state::HeartStyle::Withered
+        } else if feed.status_effects.iter().any(|e| e.effect_id == 19) {
+            megu_ui::state::HeartStyle::Poisoned
+        } else if ui.hud.hardcore {
+            megu_ui::state::HeartStyle::Hardcore
+        } else {
+            megu_ui::state::HeartStyle::Normal
+        };
         ui.hud.status_effects = feed
             .status_effects
             .iter()
@@ -8996,6 +9017,20 @@ impl GpuApp {
                     jump: !gameplay_modal_open && input.vertical > 0.0,
                     sneak: !gameplay_modal_open && self.keys.down,
                 });
+            }
+            self.ui.hud.hardcore = live.is_hardcore();
+            if !gameplay_modal_open && !player_dead {
+                if let Some(vpos) = live.riding_vehicle_position() {
+                    let yaw = (self.camera.yaw_deg - 180.0).rem_euclid(360.0);
+                    let pitch = -self.camera.pitch_deg;
+                    let yaw_rad = yaw.to_radians() as f64;
+                    let speed = 6.0 * f64::from(dt.min(0.1));
+                    let fwd = f64::from(input.forward) * speed;
+                    let strafe = f64::from(input.strafe) * speed;
+                    let vx = vpos[0] - yaw_rad.sin() * fwd + yaw_rad.cos() * strafe;
+                    let vz = vpos[2] + yaw_rad.cos() * fwd + yaw_rad.sin() * strafe;
+                    live.send_move_vehicle(vx, vpos[1], vz, yaw, pitch);
+                }
             }
             // Aeronautics helm: while an SW6D snapshot binds the player
             // to a sub-world, the same movement keys steer it.

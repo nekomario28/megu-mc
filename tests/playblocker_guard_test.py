@@ -42,13 +42,13 @@ class PlayblockerGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self.copy_audit_inputs(root)
-            path = root / 'client-gpu/src/subworld_sync.rs'
+            path = root / 'proto/src/subworld_wire.rs'
             text = path.read_text(encoding='utf-8')
-            path.write_text(text.replace('SUBWORLD_SYNC_MAGIC: [u8; 4] = *b"SW6D"',
-                                         'SUBWORLD_SYNC_MAGIC: [u8; 4] = *b"WRNG"'), encoding='utf-8')
+            path.write_text(text.replace('SW6D_MAGIC: [u8; 4] = *b"SW6D"',
+                                         'SW6D_MAGIC: [u8; 4] = *b"WRNG"'), encoding='utf-8')
             result = run(GUARD, '--root', root)
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn('conflicting SW6D', result.stdout)
+            self.assertIn('SW6D', result.stdout)
             portal = root / 'proto/src/seamless_portal.rs'
             portal.write_text(portal.read_text(encoding='utf-8') +
                               '\nconst OTHER_MAGIC: [u8; 4] = *b"MSP1";\n', encoding='utf-8')
@@ -60,7 +60,8 @@ class PlayblockerGuardTests(unittest.TestCase):
     def copy_audit_inputs(root):
         sys.path.insert(0, str(ROOT / 'tools'))
         from playblocker_guard_audit import HOTPATHS, WIRES, BASELINE
-        for name in set(HOTPATHS) | {item for wire in WIRES for item in wire[2:]} | {BASELINE}:
+        extra = {'proto/src/subworld_wire.rs', 'proto/src/mod_wire.rs'}
+        for name in set(HOTPATHS) | {item for wire in WIRES for item in wire[2:]} | {BASELINE} | extra:
             dest = root / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, dest)

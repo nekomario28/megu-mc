@@ -179,25 +179,7 @@ struct AddonCatalogReport {
 fn adb_processing_recipe_serializer(
     recipe: &create_adapter::addon_profile::AddonProcessingRecipe,
 ) -> String {
-    use create_adapter::addon_profile::AddonProcessingRecipe as R;
-    match recipe {
-        R::SequencedAssembly(_) => "create:sequenced_assembly".to_string(),
-        R::Pressing { .. } => "create:pressing".to_string(),
-        R::Mixing { .. } => "create:mixing".to_string(),
-        R::Milling { .. } => "create:milling".to_string(),
-        R::Crushing { .. } => "create:crushing".to_string(),
-        R::Cutting { .. } => "create:cutting".to_string(),
-        R::Filling { .. } => "create:filling".to_string(),
-        R::Compacting(recipe) => recipe.recipe_type.clone(),
-        R::Splashing(recipe) => recipe.recipe_type.clone(),
-        R::Haunting(recipe) => recipe.recipe_type.clone(),
-        R::Deploying(recipe) => recipe.recipe_type.clone(),
-        R::Emptying(recipe) => recipe.recipe_type.clone(),
-        R::ItemApplication(recipe) => recipe.recipe_type.clone(),
-        R::SandpaperPolishing(recipe) => recipe.recipe_type.clone(),
-        R::MechanicalCrafting(recipe) => recipe.recipe_type.clone(),
-        R::GenericMachine(recipe) => recipe.recipe_type.clone(),
-    }
+    recipe.serializer_id().to_string()
 }
 
 /// Everything the aeronautics side of the bridge owns at runtime: the shared
