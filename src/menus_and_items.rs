@@ -684,11 +684,7 @@ fn damage_inv_slot(me: &Client, slot: i16) -> bool {
     }
 }
 
-// resend the held slot to the owner after damage/break so the client
-// model stays honest
-fn held_slot_resync(me: &Client) {
-    let hs = *me.held.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = 36 + hs;
+fn inventory_slot_resync(me: &Client, slot: i16) {
     let st = me
         .inv
         .lock()
@@ -703,6 +699,13 @@ fn held_slot_resync(me: &Client) {
     if let Ok(mut w) = me.sock.lock() {
         let _ = send_packet(&mut w, 0x15, p);
     }
+}
+
+// resend the held slot to the owner after damage/break so the client
+// model stays honest
+fn held_slot_resync(me: &Client) {
+    let hs = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+    inventory_slot_resync(me, 36 + hs);
 }
 
 #[derive(Clone)]
@@ -1139,6 +1142,140 @@ fn drop_merge_pending() {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FurnaceKind {
+    Furnace,
+    BlastFurnace,
+    Smoker,
+}
+
+impl FurnaceKind {
+    fn menu_type(self) -> i64 {
+        match self {
+            Self::BlastFurnace => 10,
+            Self::Furnace => 14,
+            Self::Smoker => 22,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::BlastFurnace => "Blast Furnace",
+            Self::Furnace => "Furnace",
+            Self::Smoker => "Smoker",
+        }
+    }
+
+    fn cook_game_ticks(self) -> u64 {
+        match self {
+            Self::BlastFurnace | Self::Smoker => 100,
+            Self::Furnace => 200,
+        }
+    }
+}
+
+fn furnace_kind_name(name: &str) -> Option<FurnaceKind> {
+    match name {
+        "minecraft:furnace" => Some(FurnaceKind::Furnace),
+        "minecraft:blast_furnace" => Some(FurnaceKind::BlastFurnace),
+        "minecraft:smoker" => Some(FurnaceKind::Smoker),
+        _ => None,
+    }
+}
+
+fn furnace_kind_at(dim: DimId, x: i32, y: i32, z: i32) -> FurnaceKind {
+    breg()
+        .and_then(|reg| furnace_kind_name(reg.name_of(block_at_dim(dim, x, y, z))))
+        .unwrap_or(FurnaceKind::Furnace)
+}
+
+fn vanilla_smoking_input(item: i64) -> bool {
+    [
+        "beef", "chicken", "cod", "kelp", "mutton", "porkchop", "potato", "rabbit", "salmon",
+    ]
+    .iter()
+    .any(|name| name_to_item(name) == Some(item))
+}
+
+fn vanilla_blasting_input(item: i64) -> bool {
+    let Some(name) = item_to_name(item) else { return false };
+    let path = name.rsplit_once(':').map_or(name, |(_, path)| path);
+    path.starts_with("raw_")
+        || path.ends_with("_ore")
+        || path.starts_with("deepslate_") && path.ends_with("_ore")
+        || matches!(
+            path,
+            "ancient_debris"
+                | "iron_pickaxe" | "iron_shovel" | "iron_axe" | "iron_hoe" | "iron_sword"
+                | "iron_helmet" | "iron_chestplate" | "iron_leggings" | "iron_boots"
+                | "golden_pickaxe" | "golden_shovel" | "golden_axe" | "golden_hoe" | "golden_sword"
+                | "golden_helmet" | "golden_chestplate" | "golden_leggings" | "golden_boots"
+                | "chainmail_helmet" | "chainmail_chestplate" | "chainmail_leggings" | "chainmail_boots"
+                | "iron_horse_armor" | "golden_horse_armor"
+        )
+}
+
+fn furnace_recipe_out(kind: FurnaceKind, item: i64) -> Option<(i64, u8)> {
+    // Datapack cooking types are combined by the legacy loader. Built-in vanilla
+    // families are still filtered exactly; unknown datapack entries remain
+    // accepted by every cooking station rather than disappearing outright.
+    let custom = json_smelts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(ingredient, _, _, _)| ingr_match(ingredient, item, 0))
+        .map(|(_, output, count, _)| (*output, *count));
+    if custom.is_some() {
+        let smoking = vanilla_smoking_input(item);
+        let blasting = vanilla_blasting_input(item);
+        // The legacy datapack loader discards the cooking recipe type. Once an
+        // input is outside both vanilla families there is no remaining type
+        // evidence, so keep that datapack recipe available instead of deleting
+        // it from every specialized station.
+        let unknown = !smoking && !blasting;
+        return match kind {
+            FurnaceKind::Furnace => custom,
+            FurnaceKind::Smoker => custom.filter(|_| smoking || unknown),
+            FurnaceKind::BlastFurnace => custom.filter(|_| blasting || unknown),
+        };
+    }
+    let builtin = smelt_result(item).map(|output| (output, 1))?;
+    match kind {
+        FurnaceKind::Furnace => Some(builtin),
+        FurnaceKind::Smoker => vanilla_smoking_input(item).then_some(builtin),
+        FurnaceKind::BlastFurnace => vanilla_blasting_input(item).then_some(builtin),
+    }
+}
+
+fn furnace_xp_award_dim(px: f64, py: f64, pz: f64) -> DimId {
+    let bx = px.floor() as i32;
+    let by = py.floor() as i32;
+    let bz = pz.floor() as i32;
+    for client in client_snapshot() {
+        let (cx, cy, cz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if (cx - px).abs() < 0.001 && (cy - py).abs() < 0.001 && (cz - pz).abs() < 0.001 {
+            if let Some((dim, ..)) = *client.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) {
+                return dim;
+            }
+        }
+        let open = *client.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
+        if open.is_some_and(|(_, x, y, z)| (x, y, z) == (bx, by, bz)) {
+            return *client.dim.lock().unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let matching: Vec<DimId> = furnaces()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .filter(|(_, x, y, z)| (*x, *y, *z) == (bx, by, bz))
+        .map(|(dim, ..)| *dim)
+        .collect();
+    if matching.len() == 1 {
+        return matching[0];
+    }
+    DimId::Overworld
+}
+
 fn furnace_tick() {
     // The due queue's clock is the sequence of `furnace_tick` calls rather
     // than `TICK_IDX`: a re-armed deadline must fire on the very next call even
@@ -1182,7 +1319,9 @@ fn furnace_tick() {
             // for every furnace on every tick.
             let rev = content_revision();
             f.recipe_cache
-                .get_or_compute((f.input.0, rev), || smelt_out(f.input.0))
+                .get_or_compute((f.input.0, rev), || {
+                furnace_recipe_out(furnace_kind_at(pos.0, pos.1, pos.2, pos.3), f.input.0)
+            })
         } else {
             None
         };
@@ -1214,7 +1353,9 @@ fn furnace_tick() {
         if f.burn_left > 0 && can_smelt {
             f.burn_left -= 1;
             f.progress += 1;
-            if f.progress >= server_ticks(200) as i32 {
+            if f.progress
+                >= server_ticks(furnace_kind_at(pos.0, pos.1, pos.2, pos.3).cook_game_ticks()) as i32
+            {
                 f.progress = 0;
                 let r = out.unwrap();
                 f.xp += smelt_xp(f.input.0);
@@ -3045,7 +3186,7 @@ fn furnace_xp_pop(f: &mut Furnace, px: f64, py: f64, pz: f64) {
         };
     f.xp = 0.0;
     if whole > 0 {
-        xp_spawn(px, py + 1.0, pz, whole);
+        xp_spawn_dim(furnace_xp_award_dim(px, py, pz), px, py + 1.0, pz, whole);
     }
 }
 /// Whether `stem` names a wood family for fuel purposes: `{ns}:{stem}_planks`
@@ -3971,11 +4112,10 @@ fn container_kind(st: u32) -> Option<&'static str> {
     }
     None
 }
-/// `minecraft:furnace`: the plain furnace only — blast furnace and smoker are
-/// separate block names and keep their own stores.
+/// Vanilla furnace-family blocks share the legacy three-slot furnace store.
 fn furnace_named(st: u32) -> bool {
     match breg() {
-        Some(reg) => reg.name_of(st) == "minecraft:furnace",
+        Some(reg) => furnace_kind_name(reg.name_of(st)).is_some(),
         None => (4295..=4302).contains(&st),
     }
 }
@@ -8133,6 +8273,142 @@ fn block_entity_put_uuids(fields: &mut BlockEntityNbtFields, key: &str, uuids: &
     }
 }
 
+
+fn trial_spawner_compound(fields: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
+    Tag::Compound(
+        fields
+            .into_iter()
+            .map(|(key, value)| (NbtString::text(key), value))
+            .collect(),
+    )
+}
+
+fn trial_spawner_default_spawn_data() -> Tag {
+    trial_spawner_compound([(
+        "entity",
+        trial_spawner_compound([("id", block_entity_string("minecraft:zombie"))]),
+    )])
+}
+
+fn trial_spawner_entry_data(entry: &Tag) -> Option<Tag> {
+    entry
+        .get("data")
+        .filter(|value| matches!(value, Tag::Compound(_)))
+        .cloned()
+        .or_else(|| {
+            entry.get("Entity").map(|entity| {
+                trial_spawner_compound([("entity", entity.clone())])
+            })
+        })
+}
+
+fn trial_spawner_weighted_values<'a>(
+    config: &'a Tag,
+    key: &str,
+) -> Vec<(i32, &'a Tag)> {
+    block_entity_entries(config, key)
+        .iter()
+        .filter_map(|entry| {
+            let weight = block_entity_number(entry, "weight")
+                .or_else(|| block_entity_number(entry, "Weight"))
+                .and_then(|value| i32::try_from(value).ok())
+                .unwrap_or(1)
+                .max(1);
+            Some((weight, entry))
+        })
+        .collect()
+}
+
+fn trial_spawner_weighted_index(weights: &[i32], roll: u64) -> Option<usize> {
+    let total = weights.iter().try_fold(0u64, |total, &weight| {
+        total.checked_add(u64::try_from(weight.max(0)).ok()?)
+    })?;
+    if total == 0 {
+        return None;
+    }
+    let mut draw = roll % total;
+    for (index, &weight) in weights.iter().enumerate() {
+        let weight = weight.max(0) as u64;
+        if draw < weight {
+            return Some(index);
+        }
+        draw -= weight;
+    }
+    weights.iter().rposition(|&weight| weight > 0)
+}
+
+fn trial_spawner_config_for_key<'a>(
+    config: Option<&'a Tag>,
+    inherited: Option<&'a Tag>,
+    key: &str,
+) -> Option<&'a Tag> {
+    // In vanilla, omitted ominous-config fields inherit the normal config. An
+    // explicitly present list (even an empty one) is still the ominous value.
+    if config.is_some_and(|tag| tag.get(key).is_some()) {
+        return config;
+    }
+    if inherited.is_some_and(|tag| tag.get(key).is_some()) {
+        return inherited;
+    }
+    config.or(inherited)
+}
+
+fn trial_spawner_config_spawn_data(
+    config: Option<&Tag>,
+    inherited: Option<&Tag>,
+    roll: u64,
+) -> Option<Tag> {
+    let config = trial_spawner_config_for_key(config, inherited, "spawn_potentials")?;
+    let entries = trial_spawner_weighted_values(config, "spawn_potentials");
+    if entries.is_empty() {
+        return None;
+    }
+    let weights: Vec<i32> = entries.iter().map(|(weight, _)| *weight).collect();
+    let index = trial_spawner_weighted_index(&weights, roll)?;
+    entries.get(index).and_then(|(_, entry)| trial_spawner_entry_data(entry))
+}
+
+fn trial_spawner_loot_table_from_entry(entry: &Tag) -> Option<ResourceLocation> {
+    if let Some(value) = entry.string().and_then(|value| value.to_utf8().ok()) {
+        return ResourceLocation::parse(&value).ok();
+    }
+    for key in ["data", "loot_table", "table"] {
+        if let Some(table) = block_entity_resource(entry, key) {
+            return Some(table);
+        }
+    }
+    None
+}
+
+fn trial_spawner_config_loot_table(
+    config: Option<&Tag>,
+    inherited: Option<&Tag>,
+    roll: u64,
+) -> Option<ResourceLocation> {
+    let config = trial_spawner_config_for_key(config, inherited, "loot_tables_to_eject")?;
+    let entries = trial_spawner_weighted_values(config, "loot_tables_to_eject");
+    if entries.is_empty() {
+        return None;
+    }
+    let weights: Vec<i32> = entries.iter().map(|(weight, _)| *weight).collect();
+    let index = trial_spawner_weighted_index(&weights, roll)?;
+    entries
+        .get(index)
+        .and_then(|(_, entry)| trial_spawner_loot_table_from_entry(entry))
+}
+
+fn trial_spawner_fallback_loot_table(ominous: bool, roll: u64) -> ResourceLocation {
+    let base = if ominous {
+        "minecraft:spawners/ominous/trial_chamber"
+    } else {
+        "minecraft:spawners/trial_chamber"
+    };
+    // Vanilla's built-in configuration contains one consumables entry and one
+    // key entry, both at weight 1.
+    let path = if roll % 2 == 0 { "key" } else { "consumables" };
+    ResourceLocation::parse(&format!("{base}/{path}")).expect("built-in trial loot table")
+}
+
 #[derive(Debug, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TrialSpawner {
@@ -8149,6 +8425,8 @@ pub(crate) struct TrialSpawner {
     pub(crate) total_mobs_spawned: i32,
     pub(crate) target_cooldown_length: i32,
     pub(crate) required_player_range: i32,
+    spawn_data_inferred: bool,
+    inferred_spawn_data_ominous: bool,
 }
 
 impl Default for TrialSpawner {
@@ -8165,6 +8443,8 @@ impl Default for TrialSpawner {
             total_mobs_spawned: 0,
             target_cooldown_length: 36_000,
             required_player_range: 14,
+            spawn_data_inferred: false,
+            inferred_spawn_data_ominous: false,
         }
     }
 }
@@ -8173,7 +8453,7 @@ impl Default for TrialSpawner {
 impl TrialSpawner {
     pub(crate) fn from_nbt(tag: &Tag) -> Self {
         let defaults = Self::default();
-        Self {
+        let mut spawner = Self {
             normal_config: block_entity_compound_field(tag, "normal_config"),
             ominous_config: block_entity_compound_field(tag, "ominous_config"),
             spawn_data: block_entity_compound_field(tag, "spawn_data"),
@@ -8193,7 +8473,11 @@ impl TrialSpawner {
                 .and_then(Tag::int)
                 .filter(|value| (1..=128).contains(value))
                 .unwrap_or(defaults.required_player_range),
-        }
+            spawn_data_inferred: false,
+            inferred_spawn_data_ominous: false,
+        };
+        spawner.ensure_spawn_data(false, world_rng::next_u64());
+        spawner
     }
 
     pub(crate) fn to_nbt(&self) -> Tag {
@@ -8245,6 +8529,63 @@ impl TrialSpawner {
         Tag::Compound(fields)
     }
 
+    fn configs(&self, ominous: bool) -> (Option<&Tag>, Option<&Tag>) {
+        if ominous && self.ominous_config.is_some() {
+            (self.ominous_config.as_ref(), self.normal_config.as_ref())
+        } else if ominous {
+            (self.normal_config.as_ref(), None)
+        } else {
+            (self.normal_config.as_ref(), None)
+        }
+    }
+
+    pub(crate) fn ensure_spawn_data(&mut self, ominous: bool, roll: u64) {
+        if self.spawn_data.is_some()
+            && !(self.spawn_data_inferred && ominous && !self.inferred_spawn_data_ominous)
+        {
+            return;
+        }
+        let (config, inherited) = self.configs(ominous);
+        self.spawn_data = Some(
+            trial_spawner_config_spawn_data(config, inherited, roll)
+                .unwrap_or_else(trial_spawner_default_spawn_data),
+        );
+        self.spawn_data_inferred = true;
+        self.inferred_spawn_data_ominous = ominous;
+    }
+
+    pub(crate) fn reset_for_ominous_trial(&mut self, roll: u64) {
+        self.current_mobs.clear();
+        self.total_mobs_spawned = 0;
+        self.next_mob_spawns_at = 0;
+        self.ejecting_loot_table = None;
+        let (config, inherited) = self.configs(true);
+        if let Some(spawn) = trial_spawner_config_spawn_data(config, inherited, roll) {
+            self.spawn_data = Some(spawn);
+            self.spawn_data_inferred = true;
+            self.inferred_spawn_data_ominous = true;
+        } else if self.spawn_data.is_none() {
+            self.ensure_spawn_data(true, roll);
+        }
+    }
+
+    pub(crate) fn begin_rewards_for_config(&mut self, now: i64, ominous: bool, roll: u64) -> bool {
+        if !self.current_mobs.is_empty() {
+            return false;
+        }
+        if self.ejecting_loot_table.is_none() {
+            let (config, inherited) = self.configs(ominous);
+            self.ejecting_loot_table = Some(
+                trial_spawner_config_loot_table(config, inherited, roll)
+                    .unwrap_or_else(|| trial_spawner_fallback_loot_table(ominous, roll)),
+            );
+        }
+        self.cooldown_ends_at = now.saturating_add(i64::from(self.target_cooldown_length));
+        self.total_mobs_spawned = 0;
+        self.next_mob_spawns_at = 0;
+        true
+    }
+
     /// Record a successful world spawn while the caller's active encounter has capacity.
     pub(crate) fn record_spawn(&mut self, now: i64, interval: i32, mob: BlockEntityUuid) -> bool {
         if now < self.next_mob_spawns_at || self.current_mobs.contains(&mob) {
@@ -8266,14 +8607,12 @@ impl TrialSpawner {
     }
 
     /// The caller determines whether the encounter's spawn quota has been reached.
+    #[allow(dead_code)]
     pub(crate) fn begin_rewards(&mut self, now: i64) -> bool {
         if !self.current_mobs.is_empty() {
             return false;
         }
-        self.cooldown_ends_at = now.saturating_add(i64::from(self.target_cooldown_length));
-        self.total_mobs_spawned = 0;
-        self.next_mob_spawns_at = 0;
-        true
+        self.begin_rewards_for_config(now, false, world_rng::next_u64())
     }
 }
 
@@ -9441,6 +9780,37 @@ fn live_crafter_powered(reg: &'static BReg, (dim, x, y, z): DimBlockPos, now: i6
     rs_neighbor_signal(&adapter, RsPos(x, y, z), true) != 0
 }
 
+fn trial_spawner_convert_omen(client: &Arc<Client>) -> bool {
+    let Some(trial) = live_effect_id("trial_omen") else { return false };
+    let bad = live_effect_id("bad_omen");
+    let active_bad = {
+        let effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+        effs.iter()
+            .find(|eff| Some(eff.id) == bad)
+            .map(|eff| eff.amp)
+    };
+    if let (Some(bad), Some(amplifier)) = (bad, active_bad) {
+        live_remove_effect(client, bad);
+        let level = i64::from((amplifier + 1).clamp(1, 5));
+        let converted = server_ticks(18_000u64 * level as u64) as i32;
+        let remaining = client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|eff| eff.id == trial)
+            .map_or(0, |eff| eff.left);
+        live_grant_effect(client, trial, amplifier, converted.max(remaining));
+        return true;
+    }
+    client
+        .effs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|eff| eff.id == trial)
+}
+
 fn tick_live_trial_spawner(
     spawner: &mut TrialSpawner,
     reg: &BReg,
@@ -9451,7 +9821,56 @@ fn tick_live_trial_spawner(
     items: &mut Vec<BlockEntityItem>,
 ) -> u32 {
     let property = "trial_spawner_state";
-    let phase = reg.get_prop(state, property);
+    let mut state = state;
+    let mut phase = reg.get_prop(state, property);
+    if reg.get_prop(state, "ominous").as_deref() != Some("true")
+        && matches!(phase.as_deref(), Some("active" | "waiting_for_players"))
+    {
+        let center = [
+            x as f64 + 0.5,
+            y as f64 + 0.5,
+            z as f64 + 0.5,
+        ];
+        let reach = f64::from(spawner.required_player_range);
+        let mut ominous_visitor = false;
+        for client in players.iter().filter(|client| {
+            *client.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim
+                && *client.gm.lock().unwrap_or_else(|e| e.into_inner()) == 0
+        }) {
+            let (px, py, pz, ..) = *client.pos.lock().unwrap_or_else(|e| e.into_inner());
+            let outside = [px - center[0], py - center[1], pz - center[2]]
+                .iter()
+                .map(|axis| axis.abs() - 0.5)
+                .map(|axis| axis.max(0.0))
+                .fold(0.0, |sum, axis| sum + axis * axis)
+                .sqrt();
+            if outside <= reach && trial_spawner_convert_omen(client) {
+                ominous_visitor = true;
+            }
+        }
+        if ominous_visitor {
+            state = reg.with_prop(state, "ominous", "true");
+            let tracked: HashSet<[u8; 16]> = spawner.current_mobs.iter().copied().collect();
+            let removed_eids: Vec<i32> = {
+                let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+                mobs.iter()
+                    .filter(|mob| mob.dim == dim && tracked.contains(&mob.uuid))
+                    .map(|mob| mob.eid)
+                    .collect()
+            };
+            for eid in removed_eids {
+                if remove_live_mob(eid).is_some() {
+                    live_mount_forget(eid);
+                    mob_equipment().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid);
+                    broadcast_seen_destroy(eid);
+                }
+            }
+            spawner.reset_for_ominous_trial(world_rng::next_u64());
+            phase = reg.get_prop(state, property);
+        }
+    }
+    let ominous = reg.get_prop(state, "ominous").as_deref() == Some("true");
+    spawner.ensure_spawn_data(ominous, world_rng::next_u64());
     let Some(spawn) = spawner.spawn_data.as_ref() else {
         return reg.with_prop(state, property, "inactive");
     };
@@ -9478,9 +9897,6 @@ fn tick_live_trial_spawner(
                 return state;
             }
             if let Some(table) = &spawner.ejecting_loot_table {
-                if dim != DimId::Overworld {
-                    return state;
-                }
                 for _ in &spawner.registered_players {
                     items.extend(live_block_entity_loot(table, world_rng::next_u64() as i64));
                 }
@@ -9499,16 +9915,22 @@ fn tick_live_trial_spawner(
     if spawner.registered_players.is_empty() {
         return reg.with_prop(state, property, "waiting_for_players");
     }
-    let config = if reg.get_prop(state, "ominous").as_deref() == Some("true") {
-        spawner.ominous_config.as_ref()
-    } else {
-        spawner.normal_config.as_ref()
-    }
-    .unwrap_or(&Tag::End);
+    let ominous_active = reg.get_prop(state, "ominous").as_deref() == Some("true");
+    let (config, inherited_config) = spawner.configs(ominous_active);
+    let config_number = |key| {
+        config
+            .and_then(|tag| block_entity_number(tag, key))
+            .or_else(|| inherited_config.and_then(|tag| block_entity_number(tag, key)))
+    };
+    let config_double = |key| {
+        config
+            .and_then(|tag| block_entity_double_field(tag, key))
+            .or_else(|| inherited_config.and_then(|tag| block_entity_double_field(tag, key)))
+    };
     let additional = spawner.registered_players.len().saturating_sub(1) as f64;
     let quota = |base, per_player, default, default_extra| {
-        (block_entity_double_field(config, base).unwrap_or(default)
-            + additional * block_entity_double_field(config, per_player).unwrap_or(default_extra))
+        (config_double(base).unwrap_or(default)
+            + additional * config_double(per_player).unwrap_or(default_extra))
         .floor()
         .max(0.0) as i32
     };
@@ -9519,11 +9941,11 @@ fn tick_live_trial_spawner(
         2.0,
         1.0,
     );
-    let interval = block_entity_number(config, "ticks_between_spawn")
+    let interval = config_number("ticks_between_spawn")
         .and_then(|value| i32::try_from(value).ok())
         .filter(|&value| value >= 0)
         .unwrap_or(40);
-    let range = block_entity_number(config, "spawn_range")
+    let range = config_number("spawn_range")
         .filter(|value| (1..=128).contains(value))
         .unwrap_or(4);
     let mut mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
@@ -9536,7 +9958,7 @@ fn tick_live_trial_spawner(
         }
     }
     if spawner.total_mobs_spawned >= total {
-        if spawner.begin_rewards(now) {
+        if spawner.begin_rewards_for_config(now, ominous, world_rng::next_u64()) {
             spawner.next_mob_spawns_at = now.saturating_add(40);
             return reg.with_prop(state, property, "waiting_for_reward_ejection");
         }
@@ -9566,6 +9988,24 @@ fn tick_live_trial_spawner(
             );
             if spawner.record_spawn(now, interval, mob.uuid) {
                 mobs.push(mob);
+                let (next_config, next_inherited) = if ominous_active {
+                    if spawner.ominous_config.is_some() {
+                        (spawner.ominous_config.clone(), spawner.normal_config.clone())
+                    } else {
+                        (spawner.normal_config.clone(), None)
+                    }
+                } else {
+                    (spawner.normal_config.clone(), None)
+                };
+                if let Some(next) = trial_spawner_config_spawn_data(
+                    next_config.as_ref(),
+                    next_inherited.as_ref(),
+                    world_rng::next_u64(),
+                ) {
+                    spawner.spawn_data = Some(next);
+                    spawner.spawn_data_inferred = true;
+                    spawner.inferred_spawn_data_ominous = ominous_active;
+                }
             }
         }
     }
@@ -11504,10 +11944,19 @@ fn craft_result(grid: &HashMap<i16, Stack>) -> Option<Stack> {
     dyed_craft_any((1..=4).filter_map(|i| grid.get(&i)))
 }
 fn open_furnace_window(me: &Client, inv: &HashMap<i16, Stack>, slots: &[Stack; 3]) {
+    open_furnace_window_kind(me, inv, slots, FurnaceKind::Furnace);
+}
+
+fn open_furnace_window_kind(
+    me: &Client,
+    inv: &HashMap<i16, Stack>,
+    slots: &[Stack; 3],
+    kind: FurnaceKind,
+) {
     let mut p = Vec::new();
     write_varint(&mut p, 2); // windowId 2 (chest uses 1)
-    write_varint(&mut p, 14); // furnace menu
-    p.extend_from_slice(&chat_nbt("Furnace"));
+    write_varint(&mut p, kind.menu_type());
+    p.extend_from_slice(&chat_nbt(kind.title()));
     if let Ok(mut s) = me.sock.lock() {
         let _ = send_packet(&mut s, 0x33, p);
     }
@@ -12303,11 +12752,19 @@ struct LiveMenuConnection {
 fn live_menu_connection(c: &Client) -> Option<Arc<LiveMenuConnection>> {
     // Release the player-state registry before locking a menu. Menu actions
     // can update XP, which briefly reacquires the registry.
-    player_mechanism_sessions()
+    let connection = player_mechanism_sessions()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&c.eid)
-        .map(|session| Arc::clone(&session.menus))
+        .map(|session| Arc::clone(&session.menus))?;
+    if let Some(saved) = saved_player_enchantment_seed(&c.uuid) {
+        let uuid_seed = i32::from_be_bytes(c.uuid[..4].try_into().unwrap_or([0; 4]));
+        let mut seed = connection.enchantment_seed.lock().unwrap_or_else(|e| e.into_inner());
+        if *seed == uuid_seed {
+            *seed = saved;
+        }
+    }
+    Some(connection)
 }
 
 fn live_menu_id(c: &Client) -> Option<u8> {
@@ -12464,6 +12921,32 @@ fn open_live_merchant(c: &Client, mob: &Mob) {
 
 fn open_live_block_menu(c: &Client, key @ (dim, x, y, z): DimBlockPos, state: u32) -> bool {
     let Some(reg) = breg() else { return false };
+    if let Some(kind) = furnace_kind_name(reg.name_of(state)) {
+        if c.is_spectator()
+            || !container_lock_gate(c, key)
+            || !can_player_open_container(
+                dim,
+                x,
+                z,
+                &uuid_text(&c.uuid),
+                &c.name,
+                client_permission_level(c) >= 4,
+            )
+        {
+            return true;
+        }
+        with_save_guard(|| {
+            if block_at_dim(dim, x, y, z) != state {
+                return;
+            }
+            close_live_menu(c, false, true);
+            *c.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
+            let inv = c.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
+            open_furnace_window_kind(c, &inv, &slots, kind);
+        });
+        return true;
+    }
     let menu = match reg.name_of(state) {
         "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil" => {
             LiveMenu::Anvil(AnvilMenu::default())
@@ -13180,11 +13663,16 @@ fn live_enchant_button(c: &Client, window: i32, button: i32) {
         let creative = *c.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
         let mut seed = connection.enchantment_seed.lock().unwrap_or_else(|e| e.into_inner());
         let mut rng = generation_math::Lcg::new(i64::from(*seed) as u64);
+        let before = *seed;
         let _ = send_player_xp(c, |xp| {
             menu.click_button(button, xp, &mut seed, creative, &mut rng);
             Ok(())
         });
+        let updated = *seed;
         drop(seed);
+        if updated != before {
+            set_saved_player_enchantment_seed(c.uuid, Some(updated));
+        }
         sync_live_menu(c, session, false);
     }
 }
@@ -13729,6 +14217,8 @@ fn live_menu_valid(c: &Client, session: &LiveMenuSession) -> bool {
 
 fn live_menu_tick() {
     let players = client_snapshot();
+    tick_elytra_firework_boosts(&players);
+    tick_live_potion_projectiles(&players);
     tick_live_block_entities(&players);
     for c in players {
         let Some(connection) = live_menu_connection(&c) else {
@@ -13857,6 +14347,404 @@ fn update_live_potion(stack: &mut Stack, potion: BrewingPotion) {
     contents.extend_from_slice(previous);
     stack.0 = name_to_item(name).unwrap();
     comp_set(&mut stack.2, COMP_POTION_CONTENTS, contents);
+}
+
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PotionEffectSpec {
+    effect: &'static str,
+    amplifier: i32,
+    game_ticks: u32,
+}
+
+fn potion_effect_specs(kind: PotionKind) -> Vec<PotionEffectSpec> {
+    use PotionKind::*;
+    const fn spec(effect: &'static str, amplifier: i32, game_ticks: u32) -> PotionEffectSpec {
+        PotionEffectSpec { effect, amplifier, game_ticks }
+    }
+    match kind {
+        NightVision => vec![spec("night_vision", 0, 3600)],
+        LongNightVision => vec![spec("night_vision", 0, 9600)],
+        Invisibility => vec![spec("invisibility", 0, 3600)],
+        LongInvisibility => vec![spec("invisibility", 0, 9600)],
+        Leaping => vec![spec("jump_boost", 0, 3600)],
+        LongLeaping => vec![spec("jump_boost", 0, 9600)],
+        StrongLeaping => vec![spec("jump_boost", 1, 1800)],
+        FireResistance => vec![spec("fire_resistance", 0, 3600)],
+        LongFireResistance => vec![spec("fire_resistance", 0, 9600)],
+        Swiftness => vec![spec("speed", 0, 3600)],
+        LongSwiftness => vec![spec("speed", 0, 9600)],
+        StrongSwiftness => vec![spec("speed", 1, 1800)],
+        Slowness => vec![spec("slowness", 0, 1800)],
+        LongSlowness => vec![spec("slowness", 0, 4800)],
+        StrongSlowness => vec![spec("slowness", 3, 400)],
+        TurtleMaster => vec![
+            spec("slowness", 3, 400),
+            spec("resistance", 2, 400),
+        ],
+        LongTurtleMaster => vec![
+            spec("slowness", 3, 800),
+            spec("resistance", 2, 800),
+        ],
+        StrongTurtleMaster => vec![
+            spec("slowness", 5, 400),
+            spec("resistance", 3, 400),
+        ],
+        WaterBreathing => vec![spec("water_breathing", 0, 3600)],
+        LongWaterBreathing => vec![spec("water_breathing", 0, 9600)],
+        Poison => vec![spec("poison", 0, 900)],
+        LongPoison => vec![spec("poison", 0, 1800)],
+        StrongPoison => vec![spec("poison", 1, 432)],
+        Regeneration => vec![spec("regeneration", 0, 900)],
+        LongRegeneration => vec![spec("regeneration", 0, 1800)],
+        StrongRegeneration => vec![spec("regeneration", 1, 450)],
+        Strength => vec![spec("strength", 0, 3600)],
+        LongStrength => vec![spec("strength", 0, 9600)],
+        StrongStrength => vec![spec("strength", 1, 1800)],
+        Weakness => vec![spec("weakness", 0, 1800)],
+        LongWeakness => vec![spec("weakness", 0, 4800)],
+        Luck => vec![spec("luck", 0, 6000)],
+        SlowFalling => vec![spec("slow_falling", 0, 1800)],
+        LongSlowFalling => vec![spec("slow_falling", 0, 4800)],
+        WindCharged => vec![spec("wind_charged", 0, 3600)],
+        Weaving => vec![spec("weaving", 0, 3600)],
+        Oozing => vec![spec("oozing", 0, 3600)],
+        Infested => vec![spec("infested", 0, 3600)],
+        Water | Mundane | Thick | Awkward | Healing | StrongHealing | Harming | StrongHarming => Vec::new(),
+    }
+}
+
+fn potion_instant_health(kind: PotionKind) -> Option<f32> {
+    match kind {
+        PotionKind::Healing => Some(4.0),
+        PotionKind::StrongHealing => Some(8.0),
+        PotionKind::Harming => Some(-6.0),
+        PotionKind::StrongHarming => Some(-12.0),
+        _ => None,
+    }
+}
+
+fn potion_apply_instant(c: &Client, kind: PotionKind, scale: f32) {
+    let Some(amount) = potion_instant_health(kind) else { return };
+    let scaled = (amount * scale.max(0.0)).round();
+    if scaled.abs() < 0.5 {
+        return;
+    }
+    let now = {
+        let mut hp = c.hp.lock().unwrap_or_else(|e| e.into_inner());
+        if scaled > 0.0 {
+            *hp = (*hp + scaled).min(20.0);
+        } else {
+            *hp = (*hp + scaled).max(0.0);
+        }
+        *hp
+    };
+    let _ = send_packet(
+        &mut c.sock.lock().unwrap_or_else(|e| e.into_inner()),
+        0x5d,
+        health_pkt_c(now, c),
+    );
+}
+
+fn potion_apply_to_player(c: &Client, kind: PotionKind, duration_scale: f32, instant_scale: f32) {
+    for spec in potion_effect_specs(kind) {
+        let scaled = (f64::from(spec.game_ticks) * f64::from(duration_scale.max(0.0))).floor();
+        if scaled < 1.0 {
+            continue;
+        }
+        if let Some(id) = live_effect_id(spec.effect) {
+            live_grant_effect(c, id, spec.amplifier, server_ticks(scaled as u64) as i32);
+        }
+    }
+    potion_apply_instant(c, kind, instant_scale);
+}
+
+fn consume_exact_hand_stack(me: &Client, slot: i16, item: i64) {
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+        return;
+    }
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut stack) = inv.get(&slot).cloned() {
+        if stack.0 == item {
+            stack.1 = stack.1.saturating_sub(1);
+            if stack.1 == 0 {
+                inv.remove(&slot);
+            } else {
+                inv.insert(slot, stack);
+            }
+        }
+    }
+}
+
+fn give_stack_or_drop(me: &Arc<Client>, stack: Stack) {
+    if stack.1 == 0 {
+        return;
+    }
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let (x, y, z, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
+        return;
+    }
+    let held_index = *me.held.lock().unwrap_or_else(|e| e.into_inner());
+    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+    let before = inv.clone();
+    let mut candidate = inv.clone();
+    let mut remaining = stack;
+    pickup_into_inventory(&mut candidate, held_index, false, &mut remaining);
+    if remaining.1 == 0 {
+        let changed: Vec<_> = (5..=45)
+            .filter_map(|slot| {
+                candidate
+                    .get(&slot)
+                    .filter(|st| before.get(&slot) != Some(*st))
+                    .map(|st| (slot, st.clone()))
+            })
+            .collect();
+        *inv = candidate;
+        drop(inv);
+        for (slot, _) in changed {
+            inventory_slot_resync(me, slot);
+        }
+        return;
+    }
+    drop(inv);
+    drop_live_stack_dim(dim, (x, y + 1.3, z), remaining);
+}
+
+const MAX_USE_ITEM_HAND_ENTRIES: usize = 4096;
+
+fn use_item_hand_store() -> &'static Mutex<HashMap<i32, i64>> {
+    static HANDS: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
+    HANDS.get_or_init(Mutex::default)
+}
+
+fn remember_use_item_hand(me: &Client, hand: i64) {
+    let mut hands = use_item_hand_store().lock().unwrap_or_else(|e| e.into_inner());
+    if hands.len() >= MAX_USE_ITEM_HAND_ENTRIES && !hands.contains_key(&me.eid) {
+        hands.clear();
+    }
+    hands.insert(me.eid, hand);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LivePotionProjectile {
+    eid: i32,
+    owner: i32,
+    dim: DimId,
+    kind: PotionKind,
+    lingering: bool,
+    x: f64,
+    y: f64,
+    z: f64,
+    dx: f64,
+    dy: f64,
+    dz: f64,
+    age: u16,
+}
+
+fn live_potion_projectiles() -> &'static Mutex<Vec<LivePotionProjectile>> {
+    static PROJECTILES: OnceLock<Mutex<Vec<LivePotionProjectile>>> = OnceLock::new();
+    PROJECTILES.get_or_init(Mutex::default)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LivePotionCloud {
+    eid: i32,
+    dim: DimId,
+    kind: PotionKind,
+    x: f64,
+    y: f64,
+    z: f64,
+    left: u16,
+}
+
+fn live_potion_clouds() -> &'static Mutex<Vec<LivePotionCloud>> {
+    static CLOUDS: OnceLock<Mutex<Vec<LivePotionCloud>>> = OnceLock::new();
+    CLOUDS.get_or_init(Mutex::default)
+}
+
+fn broadcast_simple_entity_spawn(
+    dim: DimId,
+    eid: i32,
+    entity: &str,
+    x: f64,
+    y: f64,
+    z: f64,
+    velocity: [f64; 3],
+    data: i64,
+) {
+    let Some(etype) = name_to_etype(entity) else { return };
+    let mut packet = spawn_entity_pkt(eid, etype as u32, x, y, z, 0.0, 0.0, data);
+    let offset = packet.len().saturating_sub(6);
+    let wire = velocity.map(|axis| (axis * 8000.0) as i16);
+    packet[offset..].copy_from_slice(
+        &[wire[0].to_be_bytes(), wire[1].to_be_bytes(), wire[2].to_be_bytes()].concat(),
+    );
+    broadcast_near(dim, x, y, z, -1, |_| (0x01, packet.clone()));
+}
+
+fn spawn_brewed_potion_projectile(me: &Arc<Client>, potion: BrewingPotion, slot: i16, item: i64) {
+    let (x, y, z, yaw, pitch, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+    let yr = f64::from(yaw).to_radians();
+    let pr = f64::from(pitch + 20.0).to_radians();
+    let speed = 0.5;
+    let velocity = [
+        -yr.sin() * pr.cos() * speed,
+        -pr.sin() * speed,
+        yr.cos() * pr.cos() * speed,
+    ];
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    let projectile = LivePotionProjectile {
+        eid,
+        owner: me.eid,
+        dim,
+        kind: potion.kind,
+        lingering: potion.form == PotionForm::Lingering,
+        x,
+        y: y + 1.5,
+        z,
+        dx: velocity[0],
+        dy: velocity[1],
+        dz: velocity[2],
+        age: 0,
+    };
+    live_potion_projectiles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(projectile);
+    set_entity_dim(eid, dim);
+    broadcast_simple_entity_spawn(dim, eid, "potion", projectile.x, projectile.y, projectile.z, velocity, i64::from(me.eid));
+    consume_exact_hand_stack(me, slot, item);
+    inventory_slot_resync(me, slot);
+}
+
+fn potion_effect_area_apply(
+    dim: DimId,
+    pos: [f64; 3],
+    kind: PotionKind,
+    lingering: bool,
+    players: &[Arc<Client>],
+) {
+    for player in players.iter().filter(|player| {
+        *player.dim.lock().unwrap_or_else(|e| e.into_inner()) == dim && !player.is_spectator()
+    }) {
+        let (x, y, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+        let center_y = y + 0.9;
+        let distance = ((x - pos[0]).powi(2) + (center_y - pos[1]).powi(2) + (z - pos[2]).powi(2)).sqrt();
+        let direct = distance <= 0.75;
+        if distance > 4.0 {
+            continue;
+        }
+        let scale = if direct { 1.0 } else { (1.0 - distance / 4.0).max(0.0) };
+        let duration_scale = scale * if lingering { 0.25 } else { 1.0 };
+        potion_apply_to_player(player, kind, duration_scale as f32, scale as f32);
+    }
+}
+
+fn spawn_brewed_potion_cloud(dim: DimId, pos: [f64; 3], kind: PotionKind) {
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    live_potion_clouds()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(LivePotionCloud {
+            eid,
+            dim,
+            kind,
+            x: pos[0],
+            y: pos[1],
+            z: pos[2],
+            left: server_ticks(600) as u16,
+        });
+    set_entity_dim(eid, dim);
+    broadcast_simple_entity_spawn(dim, eid, "area_effect_cloud", pos[0], pos[1], pos[2], [0.0; 3], 0);
+}
+
+fn tick_live_potion_projectiles(players: &[Arc<Client>]) {
+    let mut impacts = Vec::new();
+    {
+        let mut projectiles = live_potion_projectiles()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        projectiles.retain_mut(|projectile| {
+            projectile.age = projectile.age.saturating_add(1);
+            if projectile.age > server_ticks(200) as u16 {
+                broadcast_seen_destroy(projectile.eid);
+                clear_entity_dim(projectile.eid);
+                return false;
+            }
+            projectile.dx *= 0.99;
+            projectile.dy *= 0.99;
+            projectile.dz *= 0.99;
+            projectile.dy -= 0.05;
+            projectile.x += projectile.dx;
+            projectile.y += projectile.dy;
+            projectile.z += projectile.dz;
+            let pos = [projectile.x, projectile.y, projectile.z];
+            let player_hit = players.iter().any(|player| {
+                player.eid != projectile.owner
+                    && *player.dim.lock().unwrap_or_else(|e| e.into_inner()) == projectile.dim
+                    && !player.is_spectator()
+                    && {
+                        let (x, y, z, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        (x - pos[0]).abs() < 0.6
+                            && (z - pos[2]).abs() < 0.6
+                            && pos[1] > y - 0.2
+                            && pos[1] < y + 2.0
+                    }
+            });
+            let blocked = block_at_dim(
+                projectile.dim,
+                pos[0].floor() as i32,
+                pos[1].floor() as i32,
+                pos[2].floor() as i32,
+            ) != 0;
+            if player_hit || blocked {
+                impacts.push(*projectile);
+                broadcast_seen_destroy(projectile.eid);
+                clear_entity_dim(projectile.eid);
+                return false;
+            }
+            broadcast_seen_net_budget(projectile.eid, (pos[0], pos[1], pos[2]), true, |_c| {
+                (0x70, entity_teleport(projectile.eid, pos[0], pos[1], pos[2], 0.0, 0.0, true))
+            });
+            true
+        });
+    }
+    for impact in impacts {
+        let pos = [impact.x, impact.y, impact.z];
+        potion_effect_area_apply(impact.dim, pos, impact.kind, impact.lingering, players);
+        if impact.lingering {
+            spawn_brewed_potion_cloud(impact.dim, pos, impact.kind);
+        }
+    }
+    let mut expired = Vec::new();
+    {
+        let mut clouds = live_potion_clouds()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clouds.retain_mut(|cloud| {
+            cloud.left = cloud.left.saturating_sub(1);
+            if cloud.left == 0 {
+                expired.push(cloud.eid);
+                return false;
+            }
+            if cloud.left % server_ticks(5).max(1) as u16 == 0 {
+                potion_effect_area_apply(
+                    cloud.dim,
+                    [cloud.x, cloud.y, cloud.z],
+                    cloud.kind,
+                    true,
+                    players,
+                );
+            }
+            true
+        });
+    }
+    for eid in expired {
+        broadcast_seen_destroy(eid);
+        clear_entity_dim(eid);
+    }
 }
 
 #[derive(Default)]
@@ -14332,10 +15220,23 @@ fn find_chorus_teleport_spot_dim(
 // food, shield). seq is acked here; callers must not ack again.
 fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat_release: bool) {
     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+    let use_hand = if eat_release {
+        use_item_hand_store()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&me.eid)
+            .or(_h)
+            .unwrap_or(0)
+    } else {
+        _h.unwrap_or(0)
+    };
+    let use_slot = if use_hand == 1 { 45 } else { 36 + held_slot };
     {
         let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         let main = inv.get(&(36 + held_slot)).map(|v| v.0).unwrap_or(0);
-        if main == 931 {
+        let used_stack = inv.get(&use_slot).cloned().unwrap_or_default();
+        let used_item = used_stack.0;
+        if main == 931 && use_hand != 1 {
             // fishing rod: cast or reel
             drop(inv);
             let mut fb = bobbers().lock().unwrap_or_else(|e| e.into_inner());
@@ -14542,7 +15443,38 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
             return;
         }
-        if main == 1162 || (_h == Some(1) && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
+        if let Some(potion) = live_potion_stack(&used_stack) {
+            match potion.form {
+                PotionForm::Drinkable => {
+                    if !eat_release {
+                        remember_use_item_hand(me, use_hand);
+                        *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                        ac_v2_note_use_item(me);
+                        return;
+                    }
+                    let kind = potion.kind;
+                    let item = used_item;
+                    drop(inv);
+                    potion_apply_to_player(me, kind, 1.0, 1.0);
+                    consume_exact_hand_stack(me, use_slot, item);
+                    if let Some(bottle) = name_to_item("glass_bottle") {
+                        give_stack_or_drop(me, (bottle, 1, Vec::new()));
+                    }
+                    inventory_slot_resync(me, use_slot);
+                    return;
+                }
+                PotionForm::Splash | PotionForm::Lingering => {
+                    if eat_release {
+                        return;
+                    }
+                    let item = used_item;
+                    drop(inv);
+                    spawn_brewed_potion_projectile(me, potion, use_slot, item);
+                    return;
+                }
+            }
+        }
+        if main == 1162 || (use_hand == 1 && inv.get(&45).map(|v| v.0).unwrap_or(0) == 1162) {
             *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = true;
             ac_v2_note_use_item(me);
             return;
@@ -14597,15 +15529,20 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
             return;
         }
-        if main == 914 {
+        if used_item == name_to_item("milk_bucket").unwrap_or(914) {
             // milk_bucket: clears all effects, leaves a bucket
             if !eat_release {
                 // vanilla: milk is a 32-tick drink like food
+                remember_use_item_hand(me, use_hand);
                 *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
                 ac_v2_note_use_item(me);
                 return;
             }
             drop(inv);
+            live_raid_omens()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&me.uuid);
             let gone: Vec<i32> = {
                 let mut ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
                 let g: Vec<i32> = ef.iter().map(|e| e.id).collect();
@@ -14619,8 +15556,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             }
             if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                 let mut iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                let hs = 36 + held_slot;
-                iv.insert(hs, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
+                iv.insert(use_slot, (name_to_item("bucket").unwrap_or(0), 1, Vec::new()));
             }
             held_slot_resync(me);
             return;
@@ -14648,10 +15584,10 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
             knowledge_book_use(me, held_slot);
             return;
         }
-        if main == 1112 {
+        if used_item == 1112 {
             // firework rocket: the `fireworks` component drives the launch.
             drop(inv);
-            firework_rocket_use(me, held_slot);
+            firework_rocket_use(me, use_slot);
             return;
         }
         if main == 801 || main == 1192 || main == name_to_item("trident").unwrap_or(-9) {
@@ -14661,19 +15597,15 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
         }
     }
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-        // prefer held slot; fall back to first food item in inventory
+        // Only the exact hand that started the use may feed the player. An
+        // empty hand is a pass, never a search through arbitrary inventory slots.
         let (slot, it, fc, eaten) = {
             let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-            let hs = 36 + held_slot;
-            match inv.get(&hs) {
+            match inv.get(&use_slot) {
                 Some(st) if stack_food(st).is_some() => {
-                    (hs, st.0, stack_food(st), st.clone())
+                    (use_slot, st.0, stack_food(st), st.clone())
                 }
-                _ => inv
-                    .iter()
-                    .find(|(_, st)| stack_food(st).is_some())
-                    .map(|(&sl, st)| (sl, st.0, stack_food(st), st.clone()))
-                    .unwrap_or((hs, 0, None, (0, 0, Vec::new()))),
+                _ => (use_slot, 0, None, (0, 0, Vec::new())),
             }
         };
         let cur_food = *me.food.lock().unwrap_or_else(|e| e.into_inner());
@@ -14687,6 +15619,7 @@ fn air_use_item(me: &Arc<Client>, held_slot: i16, seq: i64, _h: Option<i64>, eat
                 .is_some_and(|fc| cur_food < 20 || fc.can_always_eat);
         if edible && !eat_release {
             // vanilla: eating holds use for 32 ticks; nothing consumed yet
+            remember_use_item_hand(me, use_hand);
             *me.eat_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             ac_v2_note_use_item(me);
         }
@@ -19308,6 +20241,98 @@ fn comp_write_string(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
+fn vehicle_item_placement(item: i64) -> Option<(&'static str, VehicleKind, bool)> {
+    let name = item_to_name(item)?;
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    let boat = matches!(
+        path,
+        "oak_boat" | "spruce_boat" | "birch_boat" | "jungle_boat" | "acacia_boat"
+            | "dark_oak_boat" | "mangrove_boat" | "cherry_boat" | "bamboo_raft"
+    );
+    if boat {
+        return Some(("boat", VehicleKind::Boat, false));
+    }
+    let chest_boat = matches!(
+        path,
+        "oak_chest_boat" | "spruce_chest_boat" | "birch_chest_boat" | "jungle_chest_boat"
+            | "acacia_chest_boat" | "dark_oak_chest_boat" | "mangrove_chest_boat"
+            | "cherry_chest_boat" | "bamboo_chest_raft"
+    );
+    if chest_boat {
+        return Some(("chest_boat", VehicleKind::ChestBoat, false));
+    }
+    let cart = match path {
+        "minecart" => Some("minecart"),
+        "chest_minecart" => Some("chest_minecart"),
+        "furnace_minecart" => Some("furnace_minecart"),
+        "tnt_minecart" => Some("tnt_minecart"),
+        "hopper_minecart" => Some("hopper_minecart"),
+        "command_block_minecart" => Some("command_block_minecart"),
+        _ => None,
+    }?;
+    Some((cart, VehicleKind::Minecart, true))
+}
+
+fn place_vehicle_item(
+    c: &Client,
+    (dim, x, y, z): DimBlockPos,
+    state: u32,
+    slot: i16,
+    held: &Stack,
+) -> bool {
+    let Some((entity, kind, rail_vehicle)) = vehicle_item_placement(held.0) else {
+        return false;
+    };
+    let Some(reg) = breg() else { return false };
+    let block_name = reg.name_of(state);
+    let pos = if rail_vehicle {
+        if !is_rail_name(block_name) {
+            return false;
+        }
+        [x as f64 + 0.5, y as f64 + 0.0625, z as f64 + 0.5]
+    } else {
+        let water = reg.is_liquid(state) && block_name.contains("water");
+        let solid = state != 0 && !reg.is_liquid(state);
+        if !water && !solid {
+            return false;
+        }
+        [x as f64 + 0.5, y as f64 + if water { 0.8 } else { 1.0 }, z as f64 + 0.5]
+    };
+    spawn_vehicle_placement(c, dim, entity, kind, pos, slot, held.0)
+}
+
+fn spawn_vehicle_placement(
+    c: &Client,
+    dim: DimId,
+    entity: &str,
+    kind: VehicleKind,
+    pos: [f64; 3],
+    slot: i16,
+    item: i64,
+) -> bool {
+    let Some(etype) = name_to_etype(entity) else { return false };
+    let yaw = c.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+    let eid = {
+        let mut live = mobs().lock().unwrap_or_else(|e| e.into_inner());
+        if live.len() >= MOB_CAP {
+            return false;
+        }
+        let mob = new_live_mob(etype, dim, (pos[0], pos[1], pos[2], yaw, 0.0), 1.0, None);
+        let eid = mob.eid;
+        live.push(mob);
+        eid
+    };
+    set_entity_dim(eid, dim);
+    mounts()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .registry
+        .register_vehicle(eid, kind, pos);
+    consume_exact_hand_stack(c, slot, item);
+    inventory_slot_resync(c, slot);
+    true
+}
+
 /// `useItemOn` handling for component-driven block interactions that are not
 /// block-entity menus: lodestone compasses, cauldron dye washing, and debug
 /// sticks. Returns true when the interaction consumed the use.
@@ -19326,6 +20351,9 @@ fn use_item_component_on_block(
     };
     if held.1 == 0 {
         return false;
+    }
+    if place_vehicle_item(c, key, state, selected, &held) {
+        return true;
     }
     // LodestoneCompassItem.useOn: bind the compass to this lodestone.
     if block_name == "minecraft:lodestone"
@@ -19423,8 +20451,9 @@ fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
             let (flight, explosions) = comp_get(&proj.2, COMP_FIREWORKS)
                 .and_then(decode_fireworks)
                 .unwrap_or((1, 0));
+            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
             fireworks().lock().unwrap_or_else(|e| e.into_inner()).push(Firework {
-                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                eid,
                 owner: me.eid,
                 x,
                 y: y + 1.5,
@@ -19435,6 +20464,7 @@ fn crossbow_fire_loaded(me: &Arc<Client>, held_slot: i16) {
                 ttl: server_ticks((flight.max(0) * 10 + 11) as u64) as i32,
                 explosions,
             });
+            set_entity_dim(eid, *me.dim.lock().unwrap_or_else(|e| e.into_inner()));
         } else {
             arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
                 eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
@@ -19555,10 +20585,99 @@ fn knowledge_book_use(me: &Arc<Client>, held_slot: i16) {
     held_slot_resync(me);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ElytraFireworkBoost {
+    rocket: i32,
+    owner: i32,
+    dim: DimId,
+    left: u16,
+    velocity: [f64; 3],
+}
+
+const MAX_ELYTRA_FIREWORK_BOOSTS: usize = 4096;
+
+fn elytra_firework_boosts() -> &'static Mutex<HashMap<i32, ElytraFireworkBoost>> {
+    static BOOSTS: OnceLock<Mutex<HashMap<i32, ElytraFireworkBoost>>> = OnceLock::new();
+    BOOSTS.get_or_init(Mutex::default)
+}
+
+fn elytra_firework_boost_step(velocity: [f64; 3], look: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|axis| {
+        velocity[axis] + look[axis] * 0.1 + (look[axis] * 1.5 - velocity[axis]) * 0.5
+    })
+}
+
+fn player_look_vector(yaw: f32, pitch: f32) -> [f64; 3] {
+    let yr = f64::from(yaw).to_radians();
+    let pr = f64::from(pitch).to_radians();
+    [-yr.sin() * pr.cos(), -pr.sin(), yr.cos() * pr.cos()]
+}
+
+fn firework_lifetime_game_ticks(flight: i64, first_roll: u64, second_roll: u64) -> u64 {
+    (10 * (flight.max(0) + 1)) as u64 + first_roll % 6 + second_roll % 7
+}
+
+fn tick_elytra_firework_boosts(players: &[Arc<Client>]) {
+    let mut finished = Vec::new();
+    let mut updates = Vec::new();
+    {
+        let mut boosts = elytra_firework_boosts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (rocket, boost) in boosts.iter_mut() {
+            let Some(player) = players.iter().find(|player| player.eid == boost.owner) else {
+                finished.push(*rocket);
+                continue;
+            };
+            if boost.left == 0
+                || !*player.fall_fly.lock().unwrap_or_else(|e| e.into_inner())
+                || *player.dim.lock().unwrap_or_else(|e| e.into_inner()) != boost.dim
+            {
+                finished.push(*rocket);
+                continue;
+            }
+            boost.left -= 1;
+            let (x, y, z, yaw, pitch, ..) = *player.pos.lock().unwrap_or_else(|e| e.into_inner());
+            boost.velocity = elytra_firework_boost_step(boost.velocity, player_look_vector(yaw, pitch));
+            ac_expect_motion(boost.owner, boost.velocity);
+            let wire = boost.velocity.map(|axis| (axis.clamp(-3.9, 3.9) * 8000.0) as i16);
+            let packet = velocity_pkt(boost.owner, wire[0], wire[1], wire[2]);
+            let _ = send_packet(
+                &mut player.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                0x5a,
+                packet,
+            );
+            updates.push((*rocket, [x, y + 0.8, z]));
+            if boost.left == 0 {
+                finished.push(*rocket);
+            }
+        }
+        for rocket in &finished {
+            boosts.remove(rocket);
+        }
+    }
+    if updates.is_empty() {
+        return;
+    }
+    let mut rockets = fireworks().lock().unwrap_or_else(|e| e.into_inner());
+    for (eid, pos) in updates {
+        if let Some(rocket) = rockets.iter_mut().find(|rocket| rocket.eid == eid) {
+            rocket.x = pos[0];
+            rocket.y = pos[1];
+            rocket.z = pos[2];
+            rocket.dx = 0.0;
+            rocket.dy = 0.0;
+            rocket.dz = 0.0;
+            broadcast_seen_net_budget(eid, (pos[0], pos[1], pos[2]), true, |_c| {
+                (0x70, entity_teleport(eid, pos[0], pos[1], pos[2], 0.0, 0.0, true))
+            });
+        }
+    }
+}
+
 /// `fireworks` on a rocket item: launch a firework entity whose flight time
 /// and explosions come from the component.
-fn firework_rocket_use(me: &Arc<Client>, held_slot: i16) {
-    let selected = 36 + held_slot;
+fn firework_rocket_use(me: &Arc<Client>, selected: i16) {
     let held = me
         .inv
         .lock()
@@ -19575,8 +20694,15 @@ fn firework_rocket_use(me: &Arc<Client>, held_slot: i16) {
     let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
     let yr = (yaw as f64).to_radians();
     let pr = (pitch as f64).to_radians();
+    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+    let ttl = server_ticks(firework_lifetime_game_ticks(
+        flight.max(1),
+        world_rng::next_u64(),
+        world_rng::next_u64(),
+    )) as i32;
     fireworks().lock().unwrap_or_else(|e| e.into_inner()).push(Firework {
-        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+        eid,
         owner: me.eid,
         x,
         y: y + 1.5,
@@ -19584,10 +20710,28 @@ fn firework_rocket_use(me: &Arc<Client>, held_slot: i16) {
         dx: -yr.sin() * pr.cos() * 1.5,
         dy: -pr.sin() * 1.5 + 0.1,
         dz: yr.cos() * pr.cos() * 1.5,
-        ttl: server_ticks((flight.max(1) * 10 + 11) as u64) as i32
-            + (world_rng::next_u64() % 6) as i32,
+        ttl,
         explosions,
     });
+    set_entity_dim(eid, dim);
+    if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) {
+        let mut boosts = elytra_firework_boosts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        boosts.retain(|_, boost| boost.left > 0);
+        if boosts.len() < MAX_ELYTRA_FIREWORK_BOOSTS || boosts.contains_key(&eid) {
+            boosts.insert(
+                eid,
+                ElytraFireworkBoost {
+                    rocket: eid,
+                    owner: me.eid,
+                    dim,
+                    left: ttl.max(0) as u16,
+                    velocity: [0.0; 3],
+                },
+            );
+        }
+    }
     if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(st) = inv.get_mut(&selected) {
@@ -19597,7 +20741,7 @@ fn firework_rocket_use(me: &Arc<Client>, held_slot: i16) {
             }
         }
     }
-    held_slot_resync(me);
+    inventory_slot_resync(me, selected);
 }
 
 /// Shapeless `armor_dye`: exactly one dyeable armor piece plus at least one dye
@@ -21345,6 +22489,404 @@ mod audit1_s3_tests {
             }).cloned().expect("brewing ejects the dragon-breath bottle remainder");
             assert_eq!(drop_dim_of(dropped.eid), dim);
             remove_test_drop(dropped.eid);
+        }
+    }
+}
+
+#[cfg(test)]
+mod surv2_trials_furnaces_potions_tests {
+    use super::*;
+    use crate::effect_tests::client_pair;
+
+    fn nbt_compound(fields: impl IntoIterator<Item = (&'static str, Tag)>) -> Tag {
+        Tag::Compound(
+            fields
+                .into_iter()
+                .map(|(key, value)| (NbtString::text(key), value))
+                .collect(),
+        )
+    }
+
+    fn read_frames(rx: &mut TcpStream) -> Vec<(i64, Vec<u8>)> {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = rx.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        let mut frames = Vec::new();
+        let mut rest = buf.as_slice();
+        while !rest.is_empty() {
+            let mut view = rest;
+            let Some(len) = read_varint(&mut view) else { break };
+            let len = len as usize;
+            if view.len() < len {
+                break;
+            }
+            let mut body = &view[..len];
+            rest = &view[len..];
+            let Some(id) = read_varint(&mut body) else { break };
+            frames.push((id, body.to_vec()));
+        }
+        frames
+    }
+
+    fn trial_config(entity: &str, loot: &str) -> Tag {
+        let spawn = nbt_compound([(
+            "entity",
+            nbt_compound([("id", block_entity_string(entity))]),
+        )]);
+        nbt_compound([
+            (
+                "spawn_potentials",
+                Tag::List(
+                    10,
+                    vec![nbt_compound([
+                        ("data", spawn),
+                        ("weight", Tag::Int(1)),
+                    ])],
+                ),
+            ),
+            (
+                "loot_tables_to_eject",
+                Tag::List(
+                    10,
+                    vec![nbt_compound([
+                        ("data", block_entity_string(loot)),
+                        ("weight", Tag::Int(1)),
+                    ])],
+                ),
+            ),
+        ])
+    }
+
+    #[test]
+    fn menus_and_items_trial_spawner_initializes_spawn_data_and_persists_reward_table() {
+        let nbt = nbt_compound([(
+            "normal_config",
+            trial_config("minecraft:zombie", "minecraft:spawners/trial_chamber/key"),
+        )]);
+        let mut spawner = TrialSpawner::from_nbt(&nbt);
+        let entity = spawner
+            .spawn_data
+            .as_ref()
+            .and_then(|spawn| spawn.get("entity"))
+            .and_then(|entity| block_entity_str_field(entity, "id"))
+            .expect("spawn data initializes from normal_config spawn_potentials");
+        assert_eq!(entity, "minecraft:zombie");
+        assert!(spawner.begin_rewards_for_config(20, false, 0));
+        assert_eq!(
+            spawner.ejecting_loot_table.as_ref().map(ToString::to_string),
+            Some("minecraft:spawners/trial_chamber/key".to_string())
+        );
+        let nbt = spawner.to_nbt();
+        let restored = TrialSpawner::from_nbt(&nbt);
+        assert_eq!(restored.ejecting_loot_table, spawner.ejecting_loot_table);
+
+        let mut spawner = TrialSpawner {
+            ominous_config: Some(trial_config(
+                "minecraft:breeze",
+                "minecraft:spawners/ominous/trial_chamber/key",
+            )),
+            spawn_data: spawner.spawn_data.clone(),
+            total_mobs_spawned: 4,
+            next_mob_spawns_at: 99,
+            ..TrialSpawner::default()
+        };
+        spawner.reset_for_ominous_trial(0);
+        assert_eq!(spawner.total_mobs_spawned, 0);
+        assert_eq!(spawner.next_mob_spawns_at, 0);
+        let entity = spawner
+            .spawn_data
+            .as_ref()
+            .and_then(|spawn| spawn.get("entity"))
+            .and_then(|entity| block_entity_str_field(entity, "id"))
+            .expect("ominous reset selects ominous spawn potentials");
+        assert_eq!(entity, "minecraft:breeze");
+
+        let mut inherited = TrialSpawner {
+            normal_config: Some(trial_config(
+                "minecraft:zombie",
+                "minecraft:spawners/trial_chamber/key",
+            )),
+            ominous_config: Some(nbt_compound([])),
+            ..TrialSpawner::default()
+        };
+        inherited.ensure_spawn_data(true, 0);
+        let entity = inherited
+            .spawn_data
+            .as_ref()
+            .and_then(|spawn| spawn.get("entity"))
+            .and_then(|entity| block_entity_str_field(entity, "id"))
+            .expect("omitted ominous spawn potentials inherit the normal config");
+        assert_eq!(entity, "minecraft:zombie");
+        assert!(inherited.begin_rewards_for_config(20, true, 0));
+        assert_eq!(
+            inherited.ejecting_loot_table.as_ref().map(ToString::to_string),
+            Some("minecraft:spawners/trial_chamber/key".to_string())
+        );
+
+        let mut fallback_key = TrialSpawner::default();
+        assert!(fallback_key.begin_rewards_for_config(20, false, 0));
+        assert_eq!(
+            fallback_key.ejecting_loot_table.as_ref().map(ToString::to_string),
+            Some("minecraft:spawners/trial_chamber/key".to_string())
+        );
+        let mut fallback_consumables = TrialSpawner::default();
+        assert!(fallback_consumables.begin_rewards_for_config(20, false, 1));
+        assert_eq!(
+            fallback_consumables
+                .ejecting_loot_table
+                .as_ref()
+                .map(ToString::to_string),
+            Some("minecraft:spawners/trial_chamber/consumables".to_string())
+        );
+    }
+
+    #[test]
+    fn menus_and_items_furnace_family_filters_recipes_and_uses_fast_station_cook_times() {
+        let beef = name_to_item("beef").unwrap();
+        let iron = name_to_item("raw_iron").unwrap();
+        assert!(furnace_recipe_out(FurnaceKind::Smoker, beef).is_some());
+        assert!(furnace_recipe_out(FurnaceKind::Smoker, iron).is_none());
+        assert!(furnace_recipe_out(FurnaceKind::BlastFurnace, iron).is_some());
+        if let Some(debris) = name_to_item("ancient_debris") {
+            assert!(vanilla_blasting_input(debris));
+        }
+        assert!(furnace_recipe_out(FurnaceKind::BlastFurnace, beef).is_none());
+        assert!(furnace_recipe_out(FurnaceKind::Furnace, beef).is_some());
+        assert!(furnace_recipe_out(FurnaceKind::Furnace, iron).is_some());
+        assert_eq!(FurnaceKind::Smoker.cook_game_ticks(), 100);
+        assert_eq!(FurnaceKind::BlastFurnace.cook_game_ticks(), 100);
+        assert_eq!(FurnaceKind::Furnace.cook_game_ticks(), 200);
+        assert_eq!(FurnaceKind::Smoker.menu_type(), 22);
+        assert_eq!(FurnaceKind::BlastFurnace.menu_type(), 10);
+
+        let (client, mut rx) = client_pair();
+        let inv = HashMap::new();
+        let slots = [Stack::default(), Stack::default(), Stack::default()];
+        open_furnace_window_kind(&client, &inv, &slots, FurnaceKind::BlastFurnace);
+        open_furnace_window_kind(&client, &inv, &slots, FurnaceKind::Smoker);
+        let frames = read_frames(&mut rx);
+        let menu_frames: Vec<_> = frames.iter().filter(|frame| frame.0 == 0x33).collect();
+        assert_eq!(menu_frames.len(), 2);
+        for (frame, menu_type) in menu_frames.iter().zip([10, 22]) {
+            assert_eq!(frame.0, 0x33);
+            let mut body = frame.1.as_slice();
+            assert_eq!(read_varint(&mut body), Some(2));
+            assert_eq!(read_varint(&mut body), Some(menu_type));
+        }
+
+        let key = (DimId::Nether, 9_310_000, 70, -9_310_000);
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            Furnace {
+                input: (0, 0, Vec::new()),
+                fuel: (0, 0, Vec::new()),
+                output: (0, 0, Vec::new()),
+                burn_left: 0,
+                progress: 0,
+                dirty: false,
+                xp: 0.0,
+                recipe_cache: CachedLookup::default(),
+                fuel_cache: CachedLookup::default(),
+            },
+        );
+        assert_eq!(
+            furnace_xp_award_dim(key.1 as f64, key.2 as f64, key.3 as f64),
+            DimId::Nether,
+            "furnace XP is awarded in the furnace's own dimension"
+        );
+        furnaces().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+    }
+
+    #[test]
+    fn menus_and_items_potion_effects_and_firework_boost_math_cover_survival_uses() {
+        assert!(potion_effect_specs(PotionKind::Swiftness)
+            .iter()
+            .any(|spec| spec.effect == "speed" && spec.game_ticks == 3600));
+        assert_eq!(potion_instant_health(PotionKind::Healing), Some(4.0));
+        assert_eq!(potion_instant_health(PotionKind::StrongHarming), Some(-12.0));
+        let boosted = elytra_firework_boost_step([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        assert!(boosted[2] > 0.8, "the vanilla elytra rocket accelerates along look");
+        assert_eq!(firework_lifetime_game_ticks(1, 0, 0), 20);
+        assert_eq!(firework_lifetime_game_ticks(3, 5, 6), 51);
+        assert_eq!(vehicle_item_placement(name_to_item("oak_boat").unwrap()).map(|v| v.0), Some("boat"));
+        assert_eq!(vehicle_item_placement(name_to_item("bamboo_chest_raft").unwrap()).map(|v| v.0), Some("chest_boat"));
+        assert_eq!(vehicle_item_placement(name_to_item("hopper_minecart").unwrap()).map(|v| v.0), Some("hopper_minecart"));
+
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let bad = live_effect_id("bad_omen").unwrap();
+        let trial = live_effect_id("trial_omen").unwrap();
+        client.effs.lock().unwrap_or_else(|e| e.into_inner()).push(Eff { id: bad, amp: 1, left: 100 });
+        assert!(trial_spawner_convert_omen(&client));
+        let effs = client.effs.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!effs.iter().any(|eff| eff.id == bad));
+        let converted = effs.iter().find(|eff| eff.id == trial).expect("bad omen converts to trial omen");
+        assert_eq!(converted.amp, 1);
+        assert_eq!(converted.left, server_ticks(36_000) as i32);
+    }
+
+    #[test]
+    fn menus_and_items_live_item_use_uses_exact_hand_potions_shield_milk_and_vehicles() {
+        let _guard = world_guard();
+        let (client, _rx) = client_pair();
+        let client = Arc::new(client);
+        let bread = name_to_item("bread").unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(9, (bread, 1, Vec::new()));
+        *client.food.lock().unwrap_or_else(|e| e.into_inner()) = 10;
+        air_use_item(&client, 0, 0, Some(0), true);
+        assert_eq!(
+            client.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&9).map(|stack| stack.1),
+            Some(1),
+            "empty mainhand must not consume inventory food"
+        );
+        assert_eq!(*client.food.lock().unwrap_or_else(|e| e.into_inner()), 10);
+
+        let potion_item = name_to_item("potion").unwrap();
+        let swiftness = LIVE_POTIONS
+            .iter()
+            .position(|&(_, kind)| kind == PotionKind::Swiftness)
+            .unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            45,
+            (potion_item, 1, vec![(COMP_POTION_CONTENTS, vec![1, swiftness as u8])]),
+        );
+        air_use_item(&client, 0, 0, Some(1), true);
+        let speed = live_effect_id("speed").unwrap();
+        assert!(client
+            .effs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|eff| eff.id == speed));
+        assert!(client
+            .inv
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|stack| stack.0 == name_to_item("glass_bottle").unwrap()));
+
+        let splash_item = name_to_item("splash_potion").unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            45,
+            (splash_item, 1, vec![(COMP_POTION_CONTENTS, vec![1, swiftness as u8])]),
+        );
+        let before = live_potion_projectiles().lock().unwrap_or_else(|e| e.into_inner()).len();
+        air_use_item(&client, 0, 0, Some(1), false);
+        assert_eq!(
+            live_potion_projectiles().lock().unwrap_or_else(|e| e.into_inner()).len(),
+            before + 1,
+            "splash potion use dispatches a tracked projectile"
+        );
+        assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&45));
+
+        let lingering_item = name_to_item("lingering_potion").unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            45,
+            (lingering_item, 1, vec![(COMP_POTION_CONTENTS, vec![1, swiftness as u8])]),
+        );
+        air_use_item(&client, 0, 0, Some(1), false);
+        assert!(live_potion_projectiles()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|projectile| projectile.owner == client.eid && projectile.lingering));
+        assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&45));
+
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            36,
+            (name_to_item("iron_sword").unwrap(), 1, Vec::new()),
+        );
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            45,
+            (name_to_item("shield").unwrap(), 1, Vec::new()),
+        );
+        air_use_item(&client, 0, 0, Some(1), false);
+        assert!(*client.blocking.lock().unwrap_or_else(|e| e.into_inner()));
+        *client.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+
+        live_raid_omens().lock().unwrap_or_else(|e| e.into_inner()).insert(
+            client.uuid,
+            BadOmen { level: 1, duration_ticks: BAD_OMEN_TICKS }.enter_village(),
+        );
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            45,
+            (name_to_item("milk_bucket").unwrap(), 1, Vec::new()),
+        );
+        air_use_item(&client, 0, 0, Some(1), true);
+        assert!(!live_raid_omens()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&client.uuid));
+
+        let rocket = name_to_item("firework_rocket").unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(45, (rocket, 1, Vec::new()));
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        firework_rocket_use(&client, 45);
+        assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&45));
+        assert!(elytra_firework_boosts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|boost| boost.owner == client.eid));
+        tick_elytra_firework_boosts(std::slice::from_ref(&client));
+        assert!(elytra_firework_boosts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|boost| boost.owner == client.eid && boost.velocity.iter().any(|axis| axis.abs() > 0.0)));
+        elytra_firework_boosts()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, boost| boost.owner != client.eid);
+        fireworks()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|firework| firework.owner != client.eid);
+        *client.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = false;
+
+        let minecart = name_to_item("minecart").unwrap();
+        client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (minecart, 1, Vec::new()));
+        let mob_before = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert!(spawn_vehicle_placement(
+            &client,
+            DimId::Nether,
+            "minecart",
+            VehicleKind::Minecart,
+            [10.5, 70.0625, 10.5],
+            36,
+            minecart,
+        ));
+        assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), mob_before + 1);
+        assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&36));
+        if let Some(reg) = breg() {
+            let water = reg.state_of("minecraft:water", None);
+            let boat = name_to_item("oak_boat").unwrap();
+            client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (boat, 1, Vec::new()));
+            let before_boats = mobs().lock().unwrap_or_else(|e| e.into_inner()).len();
+            assert!(place_vehicle_item(
+                &client,
+                (DimId::Nether, 20, 70, 20),
+                water,
+                36,
+                &(boat, 1, Vec::new()),
+            ));
+            assert_eq!(mobs().lock().unwrap_or_else(|e| e.into_inner()).len(), before_boats + 1);
+            assert!(!client.inv.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&36));
+
+            let rail = reg.state_of("minecraft:rail", None);
+            client.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(36, (minecart, 1, Vec::new()));
+            assert!(place_vehicle_item(
+                &client,
+                (DimId::Nether, 10, 70, 10),
+                rail,
+                36,
+                &(minecart, 1, Vec::new()),
+            ));
         }
     }
 }
