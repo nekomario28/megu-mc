@@ -29,8 +29,8 @@ use megu_kernel::skeletal_anim::{
     SkeletonRig, MAX_CLIPS,
 };
 use megu_kernel::{
-    Aabb, FluidCell, FluidKind, LightEngine, LightFact, LightUpdateMultiWord, PalettedSection,
-    Registry, STATE_COUNT,
+    Aabb, FluidCell, FluidKind, LightEdit, LightEngine, LightFact, LightUpdateMultiWord,
+    PalettedSection, Registry, STATE_COUNT,
 };
 
 use crate::protocol::{
@@ -152,6 +152,32 @@ struct LocalBox {
     max: [f64; 3],
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicBlockState {
+    pub name: String,
+    pub opacity: u8,
+    pub luminance: u8,
+}
+
+impl DynamicBlockState {
+    fn from_facts_byte(name: String, facts_byte: u8) -> Self {
+        Self {
+            name,
+            opacity: facts_byte & 0x0f,
+            luminance: facts_byte >> 4,
+        }
+    }
+
+    fn light_fact(&self) -> LightFact {
+        let opaque = self.opacity >= 15;
+        LightFact {
+            opacity: self.opacity.min(15),
+            emission: self.luminance.min(15),
+            occlusion: if opaque { [0x0f; 6] } else { [0; 6] },
+        }
+    }
+}
+
 pub struct BlockTable {
     mesh_blocks: Vec<Block>,
     shapes: Vec<LocalBox>,
@@ -162,6 +188,12 @@ pub struct BlockTable {
     /// built from `block_states_1211.json`; empty in builtin fallback mode.
     state_names: Vec<String>,
     biome_tints: BiomeTintResolver,
+    /// Sparse registry for modded dynamic states. Dynamic ids start at
+    /// 1_000_000 on the mod protocol, so extending the dense per-state arrays
+    /// to the maximum id would waste tens of megabytes per table.
+    dynamic_states: BTreeMap<u32, DynamicBlockState>,
+    /// Exclusive state bound including installed dynamic ids.
+    dynamic_state_limit: usize,
     /// O(1) state→material table built once alongside `state_names`
     /// (empty → StoneLike fallback in builtin mode).
     acoustic_lut: crate::spatial_audio::AcousticMaterialLut,
@@ -220,14 +252,218 @@ impl BiomeColormap {
     }
 }
 
+/// Vanilla `grass_color_modifier` modes that affect colormap-derived grass
+/// colors after the temperature/downfall lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BiomeGrassColorModifier {
+    /// Dark forest: average the colormap color with `0x28340a`.
+    DarkForest,
+    /// Swamp family noise selects two fixed greens. The resolver has no
+    /// block-position input, so it uses vanilla's dominant `0x6a7039` branch.
+    Swamp,
+}
+
+/// One biome registry climate/tint record. Ids are the biome palette ids used
+/// by the chunk wire format (the canonical vanilla order is alphabetical for
+/// the 64 built-in 1.21.1 biomes). Colors are `0xRRGGBB`; `None` means the
+/// temperature/downfall colormap lookup is authoritative.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BiomeClimateEntry {
+    pub biome_id: u32,
+    pub temperature: f32,
+    pub downfall: f32,
+    pub grass_color: Option<u32>,
+    pub foliage_color: Option<u32>,
+    pub water_color: Option<u32>,
+    pub grass_color_modifier: Option<BiomeGrassColorModifier>,
+}
+
+const fn biome_climate(
+    biome_id: u32,
+    temperature: f32,
+    downfall: f32,
+    grass_color: Option<u32>,
+    foliage_color: Option<u32>,
+    water_color: u32,
+) -> BiomeClimateEntry {
+    BiomeClimateEntry {
+        biome_id,
+        temperature,
+        downfall,
+        grass_color,
+        foliage_color,
+        water_color: Some(water_color),
+        grass_color_modifier: None,
+    }
+}
+
+const fn biome_climate_mod(
+    biome_id: u32,
+    temperature: f32,
+    downfall: f32,
+    grass_color: Option<u32>,
+    foliage_color: Option<u32>,
+    water_color: u32,
+    grass_color_modifier: BiomeGrassColorModifier,
+) -> BiomeClimateEntry {
+    BiomeClimateEntry {
+        grass_color_modifier: Some(grass_color_modifier),
+        ..biome_climate(
+            biome_id,
+            temperature,
+            downfall,
+            grass_color,
+            foliage_color,
+            water_color,
+        )
+    }
+}
+
+/// Canonical vanilla 1.21.1 biome climates in registry/alphabetical order.
+/// Values mirror the vanilla `data/minecraft/worldgen/biome/*.json` records;
+/// explicit colors are the fixed `effects.*_color` overrides. Biomes without
+/// an override use the grass/foliage colormap and water color 0x3f76e4.
+pub const VANILLA_BIOME_CLIMATES_1_21_1: [BiomeClimateEntry; 64] = [
+    biome_climate(0, 2.0, 0.0, Some(0x90814d), Some(0x9e814d), 0x3f76e4), // badlands
+    biome_climate(1, 0.95, 0.9, None, None, 0x3f76e4),                    // bamboo_jungle
+    biome_climate(2, 2.0, 0.0, None, None, 0x3f76e4),                     // basalt_deltas
+    biome_climate(3, 0.8, 0.4, None, None, 0x3f76e4),                     // beach
+    biome_climate(4, 0.6, 0.6, None, None, 0x3f76e4),                     // birch_forest
+    biome_climate(5, 0.5, 0.8, Some(0xb6db61), Some(0xb6db61), 0x5db7ef), // cherry_grove
+    biome_climate(6, 0.5, 0.5, None, None, 0x3d57d6),                     // cold_ocean
+    biome_climate(7, 2.0, 0.0, None, None, 0x3f76e4),                     // crimson_forest
+    biome_climate_mod(
+        8,
+        0.7,
+        0.8,
+        None,
+        None,
+        0x3f76e4,
+        BiomeGrassColorModifier::DarkForest,
+    ), // dark_forest
+    biome_climate(9, 0.5, 0.5, None, None, 0x3d57d6),                     // deep_cold_ocean
+    biome_climate(10, 0.8, 0.4, None, None, 0x3f76e4),                    // deep_dark
+    biome_climate(11, 0.5, 0.5, None, None, 0x3938c9),                    // deep_frozen_ocean
+    biome_climate(12, 0.5, 0.5, None, None, 0x45adf2),                    // deep_lukewarm_ocean
+    biome_climate(13, 0.5, 0.5, None, None, 0x3f76e4),                    // deep_ocean
+    biome_climate(14, 2.0, 0.0, None, None, 0x3f76e4),                    // desert
+    biome_climate(15, 0.8, 0.4, None, None, 0x3f76e4),                    // dripstone_caves
+    biome_climate(16, 0.5, 0.5, None, None, 0x3f76e4),                    // end_barrens
+    biome_climate(17, 0.5, 0.5, None, None, 0x3f76e4),                    // end_highlands
+    biome_climate(18, 0.5, 0.5, None, None, 0x3f76e4),                    // end_midlands
+    biome_climate(19, 2.0, 0.0, Some(0x90814d), Some(0x9e814d), 0x3f76e4), // eroded_badlands
+    biome_climate(20, 0.7, 0.8, None, None, 0x3f76e4),                    // flower_forest
+    biome_climate(21, 0.7, 0.8, None, None, 0x3f76e4),                    // forest
+    biome_climate(22, 0.0, 0.5, None, None, 0x3938c9),                    // frozen_ocean
+    biome_climate(23, -0.7, 0.9, None, None, 0x3f76e4),                   // frozen_peaks
+    biome_climate(24, 0.0, 0.5, None, None, 0x3938c9),                    // frozen_river
+    biome_climate(25, -0.2, 0.8, None, None, 0x3f76e4),                   // grove
+    biome_climate(26, 0.0, 0.5, None, None, 0x3f76e4),                    // ice_spikes
+    biome_climate(27, -0.7, 0.9, None, None, 0x3f76e4),                   // jagged_peaks
+    biome_climate(28, 0.95, 0.9, None, None, 0x3f76e4),                   // jungle
+    biome_climate(29, 0.5, 0.5, None, None, 0x45adf2),                    // lukewarm_ocean
+    biome_climate(30, 0.5, 0.5, None, None, 0x3f76e4),                    // lush_caves
+    biome_climate_mod(
+        31,
+        0.8,
+        0.9,
+        None,
+        Some(0x8db127),
+        0x3a7a6a,
+        BiomeGrassColorModifier::Swamp,
+    ), // mangrove_swamp
+    biome_climate(32, 0.5, 0.8, None, None, 0x0e4ecf),                    // meadow
+    biome_climate(33, 0.9, 1.0, None, None, 0x3f76e4),                    // mushroom_fields
+    biome_climate(34, 2.0, 0.0, None, None, 0x3f76e4),                    // nether_wastes
+    biome_climate(35, 0.5, 0.5, None, None, 0x3f76e4),                    // ocean
+    biome_climate(36, 0.6, 0.6, None, None, 0x3f76e4),                    // old_growth_birch_forest
+    biome_climate(37, 0.3, 0.8, None, None, 0x3f76e4),                    // old_growth_pine_taiga
+    biome_climate(38, 0.25, 0.8, None, None, 0x3f76e4),                   // old_growth_spruce_taiga
+    biome_climate(39, 0.8, 0.4, None, None, 0x3f76e4),                    // plains
+    biome_climate(40, 0.5, 0.5, None, None, 0x3f76e4),                    // river
+    biome_climate(41, 2.0, 0.0, None, None, 0x3f76e4),                    // savanna
+    biome_climate(42, 2.0, 0.0, None, None, 0x3f76e4),                    // savanna_plateau
+    biome_climate(43, 0.5, 0.5, None, None, 0x3f76e4),                    // small_end_islands
+    biome_climate(44, 0.05, 0.3, None, None, 0x3d57d6),                   // snowy_beach
+    biome_climate(45, 0.0, 0.5, None, None, 0x3f76e4),                    // snowy_plains
+    biome_climate(46, -0.3, 0.9, None, None, 0x3f76e4),                   // snowy_slopes
+    biome_climate(47, -0.5, 0.4, None, None, 0x3d57d6),                   // snowy_taiga
+    biome_climate(48, 2.0, 0.0, None, None, 0x3f76e4),                    // soul_sand_valley
+    biome_climate(49, 0.95, 0.8, None, None, 0x3f76e4),                   // sparse_jungle
+    biome_climate(50, 1.0, 0.3, None, None, 0x3f76e4),                    // stony_peaks
+    biome_climate(51, 0.2, 0.3, None, None, 0x3f76e4),                    // stony_shore
+    biome_climate(52, 0.8, 0.4, None, None, 0x3f76e4),                    // sunflower_plains
+    biome_climate_mod(
+        53,
+        0.8,
+        0.9,
+        None,
+        Some(0x6a7039),
+        0x617b64,
+        BiomeGrassColorModifier::Swamp,
+    ), // swamp
+    biome_climate(54, 0.25, 0.8, None, None, 0x3f76e4),                   // taiga
+    biome_climate(55, 0.5, 0.5, None, None, 0x3f76e4),                    // the_end
+    biome_climate(56, 0.5, 0.5, None, None, 0x3f76e4),                    // the_void
+    biome_climate(57, 0.5, 0.5, None, None, 0x43d5ee),                    // warm_ocean
+    biome_climate(58, 2.0, 0.0, None, None, 0x3f76e4),                    // warped_forest
+    biome_climate(59, 0.2, 0.3, None, None, 0x3f76e4),                    // windswept_forest
+    biome_climate(60, 0.2, 0.3, None, None, 0x3f76e4), // windswept_gravelly_hills
+    biome_climate(61, 0.2, 0.3, None, None, 0x3f76e4), // windswept_hills
+    biome_climate(62, 2.0, 0.0, None, None, 0x3f76e4), // windswept_savanna
+    biome_climate(63, 2.0, 0.0, Some(0x90814d), Some(0x9e814d), 0x3f76e4), // wooded_badlands
+];
+
+fn climate_fallback_tint(kind: BiomeTintKind, temperature: f32, downfall: f32) -> u32 {
+    // Approximate the vanilla colormap ramp when the client JAR colormap is
+    // unavailable. This keeps canonical climates visually distinct instead
+    // of collapsing every biome to the historic flat green fallback.
+    let t = temperature.clamp(0.0, 1.0);
+    let d = downfall.clamp(0.0, 1.0) * t;
+    let (cold, hot, wet) = match kind {
+        BiomeTintKind::Grass => ((117, 167, 91), (191, 183, 85), (70, 170, 70)),
+        BiomeTintKind::Foliage => ((87, 130, 55), (174, 164, 42), (45, 145, 55)),
+        BiomeTintKind::Water => return 0x3f76e4,
+    };
+    let mix = |a: (u8, u8, u8), b: (u8, u8, u8), f: f32| {
+        [
+            (f32::from(a.0) * (1.0 - f) + f32::from(b.0) * f) as u32,
+            (f32::from(a.1) * (1.0 - f) + f32::from(b.1) * f) as u32,
+            (f32::from(a.2) * (1.0 - f) + f32::from(b.2) * f) as u32,
+        ]
+    };
+    let dry = mix(cold, hot, t);
+    let rgb = mix((dry[0] as u8, dry[1] as u8, dry[2] as u8), wet, d);
+    (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+}
+
 /// Resolves optional asset colormaps using the biome's vanilla temperature
-/// and downfall values. Biome registry ids can be populated from the active
-/// registry; unknown ids preserve the block's established fallback tint.
-#[derive(Clone, Debug, Default)]
+/// and downfall values. The canonical 1.21.1 climate table is installed by
+/// default; registry updates can replace or extend it at runtime. Unknown
+/// ids preserve the block's established fallback tint.
+#[derive(Clone, Debug)]
 pub struct BiomeTintResolver {
     colormap: BiomeColormap,
     climate: BTreeMap<u32, (f32, f32)>,
+    grass_colors: BTreeMap<u32, u32>,
+    grass_modifiers: BTreeMap<u32, BiomeGrassColorModifier>,
+    foliage_colors: BTreeMap<u32, u32>,
     water_colors: BTreeMap<u32, u32>,
+}
+
+impl Default for BiomeTintResolver {
+    fn default() -> Self {
+        let mut resolver = Self {
+            colormap: BiomeColormap::default(),
+            climate: BTreeMap::new(),
+            grass_colors: BTreeMap::new(),
+            grass_modifiers: BTreeMap::new(),
+            foliage_colors: BTreeMap::new(),
+            water_colors: BTreeMap::new(),
+        };
+        resolver.update_biome_climates_from_registry(&VANILLA_BIOME_CLIMATES_1_21_1);
+        resolver
+    }
 }
 
 impl BiomeTintResolver {
@@ -243,6 +479,46 @@ impl BiomeTintResolver {
         true
     }
 
+    /// Replace or extend climate records from the live biome registry.
+    /// Non-finite climate values are rejected; the return value is the number
+    /// of accepted records. Explicit color fields replace existing overrides,
+    /// while `None` clears a prior override and restores colormap lookup.
+    pub fn update_biome_climates_from_registry(&mut self, entries: &[BiomeClimateEntry]) -> usize {
+        let mut accepted = 0;
+        for entry in entries {
+            if !entry.temperature.is_finite() || !entry.downfall.is_finite() {
+                continue;
+            }
+            self.climate
+                .insert(entry.biome_id, (entry.temperature, entry.downfall));
+            if let Some(color) = entry.grass_color {
+                self.grass_colors
+                    .insert(entry.biome_id, color & 0x00ff_ffff);
+            } else {
+                self.grass_colors.remove(&entry.biome_id);
+            }
+            if let Some(modifier) = entry.grass_color_modifier {
+                self.grass_modifiers.insert(entry.biome_id, modifier);
+            } else {
+                self.grass_modifiers.remove(&entry.biome_id);
+            }
+            if let Some(color) = entry.foliage_color {
+                self.foliage_colors
+                    .insert(entry.biome_id, color & 0x00ff_ffff);
+            } else {
+                self.foliage_colors.remove(&entry.biome_id);
+            }
+            if let Some(color) = entry.water_color {
+                self.water_colors
+                    .insert(entry.biome_id, color & 0x00ff_ffff);
+            } else {
+                self.water_colors.remove(&entry.biome_id);
+            }
+            accepted += 1;
+        }
+        accepted
+    }
+
     pub fn set_water_color(&mut self, biome_id: u32, color: u32) {
         self.water_colors.insert(biome_id, color & 0x00ff_ffff);
     }
@@ -255,10 +531,33 @@ impl BiomeTintResolver {
                 .copied()
                 .unwrap_or(fallback);
         }
-        self.climate
+        let explicit = match kind {
+            BiomeTintKind::Grass => self.grass_colors.get(&biome_id),
+            BiomeTintKind::Foliage => self.foliage_colors.get(&biome_id),
+            BiomeTintKind::Water => None,
+        };
+        if let Some(&color) = explicit {
+            return color;
+        }
+        let base = self
+            .climate
             .get(&biome_id)
-            .and_then(|&(temperature, downfall)| self.colormap.sample(kind, temperature, downfall))
-            .unwrap_or(fallback)
+            .map(|&(temperature, downfall)| {
+                self.colormap
+                    .sample(kind, temperature, downfall)
+                    .unwrap_or_else(|| climate_fallback_tint(kind, temperature, downfall))
+            })
+            .unwrap_or(fallback);
+        if kind != BiomeTintKind::Grass {
+            return base;
+        }
+        match self.grass_modifiers.get(&biome_id) {
+            Some(BiomeGrassColorModifier::DarkForest) => {
+                ((base & 0x00fe_fefe).wrapping_add(0x0028_340a) >> 1) & 0x00ff_ffff
+            }
+            Some(BiomeGrassColorModifier::Swamp) => 0x006a_7039,
+            None => base,
+        }
     }
 }
 
@@ -326,6 +625,8 @@ impl BlockTable {
             fluid_cells,
             air_mask,
             state_names: Vec::new(),
+            dynamic_states: BTreeMap::new(),
+            dynamic_state_limit: 0,
             biome_tints: BiomeTintResolver::default(),
             acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&[]),
             loaded_from_json: false,
@@ -520,13 +821,63 @@ impl BlockTable {
             air_mask,
             acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&owned_names),
             state_names: owned_names,
+            dynamic_states: BTreeMap::new(),
+            dynamic_state_limit: 0,
             biome_tints: BiomeTintResolver::default(),
             loaded_from_json: true,
             source_path: None,
         })
     }
 
+    /// Install dynamic mod block states keyed by their global state id.
+    /// `facts_byte` uses the MRS1 packing `(luminance << 4) | opacity`.
+    /// Returns the number of accepted entries. The sparse representation
+    /// deliberately does not allocate dense arrays up to the dynamic id.
+    pub fn install_dynamic_mod_states(&mut self, states: &[(u32, String, u8)]) -> usize {
+        let mut accepted = 0;
+        for &(state_id, ref name, facts_byte) in states {
+            if state_id < 1_000_000 || name.is_empty() || name.len() > 512 {
+                continue;
+            }
+            self.dynamic_states.insert(
+                state_id,
+                DynamicBlockState::from_facts_byte(name.clone(), facts_byte),
+            );
+            accepted += 1;
+        }
+        if accepted != 0 {
+            self.dynamic_state_limit = self
+                .dynamic_states
+                .keys()
+                .next_back()
+                .and_then(|&id| usize::try_from(id).ok()?.checked_add(1))
+                .unwrap_or(usize::MAX);
+        }
+        accepted
+    }
+
+    /// Light facts for one installed dynamic block state.
+    pub fn dynamic_light_fact(&self, state_id: u32) -> Option<LightFact> {
+        self.dynamic_states
+            .get(&state_id)
+            .map(DynamicBlockState::light_fact)
+    }
+
     pub fn mesh_block(&self, state_id: u32) -> Block {
+        if let Some(dynamic) = self.dynamic_states.get(&state_id) {
+            if dynamic.opacity >= 15 {
+                return Block::opaque_cube(state_id);
+            }
+            return Block {
+                state_id,
+                flags: CUTOUT,
+                occlusion: 0,
+                fluid_kind: NO_FLUID,
+                fluid_level: 0,
+                tint: 0,
+                fluid_tint: 0,
+            };
+        }
         self.mesh_blocks
             .get(state_id as usize)
             .copied()
@@ -555,6 +906,9 @@ impl BlockTable {
     }
 
     pub fn is_air(&self, state_id: u32) -> bool {
+        if self.dynamic_states.contains_key(&state_id) {
+            return false;
+        }
         self.air_mask
             .get(state_id as usize)
             .copied()
@@ -564,15 +918,25 @@ impl BlockTable {
     /// Registry name for a block state (`"minecraft:oak_planks"`); `None`
     /// for out-of-range states or the builtin fallback table.
     pub fn state_name(&self, state_id: u32) -> Option<&str> {
+        if let Some(dynamic) = self.dynamic_states.get(&state_id) {
+            return Some(dynamic.name.as_str());
+        }
         self.state_names
             .get(state_id as usize)
             .map(String::as_str)
             .filter(|n| !n.is_empty())
     }
 
-    /// Number of global block states this table covers.
+    /// Number of global block states this table covers, including the sparse
+    /// dynamic-state limit when modded states have been installed.
     pub fn state_count(&self) -> usize {
-        self.mesh_blocks.len()
+        self.mesh_blocks.len().max(self.dynamic_state_limit)
+    }
+
+    /// Replace or extend biome climate records in this table's tint resolver.
+    pub fn update_biome_climates_from_registry(&mut self, entries: &[BiomeClimateEntry]) -> usize {
+        self.biome_tints
+            .update_biome_climates_from_registry(entries)
     }
 
     /// Per-state registry names indexed by state id (empty in builtin
@@ -588,6 +952,20 @@ impl BlockTable {
     }
 
     pub fn fluid_cell(&self, state_id: u32) -> FluidCell {
+        if self.dynamic_states.contains_key(&state_id) {
+            return FluidCell {
+                kind: None,
+                amount: 0,
+                falling: false,
+                blocks_motion: self.dynamic_states[&state_id].opacity != 0,
+                is_ice: false,
+                sturdy_faces: if self.dynamic_states[&state_id].opacity >= 15 {
+                    ALL_FACES
+                } else {
+                    0
+                },
+            };
+        }
         self.fluid_cells
             .get(state_id as usize)
             .copied()
@@ -602,6 +980,16 @@ impl BlockTable {
         bz: i32,
         out: &mut Vec<Aabb>,
     ) {
+        if let Some(dynamic) = self.dynamic_states.get(&state_id) {
+            if dynamic.opacity != 0 {
+                let (ox, oy, oz) = (f64::from(bx), f64::from(by), f64::from(bz));
+                out.push(Aabb {
+                    min: [ox, oy, oz],
+                    max: [ox + 1.0, oy + 1.0, oz + 1.0],
+                });
+            }
+            return;
+        }
         let Some(indices) = self.collision_shapes.get(state_id as usize) else {
             return;
         };
@@ -1184,6 +1572,9 @@ fn parse_block_states_json(raw: &[u8]) -> Result<ParsedBlockStates, String> {
 // Chunk Column + Live MeshCache World State
 // ---------------------------------------------------------------------------
 
+/// Shared empty overlay for sections without any dynamic mod states.
+static EMPTY_DYNAMIC_STATES: BTreeMap<usize, u32> = BTreeMap::new();
+
 pub struct StoredSection {
     pub palette: PalettedSection,
     pub block_light: [u8; LIGHT_BYTES],
@@ -1196,29 +1587,76 @@ pub struct StoredSection {
 }
 
 impl StoredSection {
+    fn palette_state(state: u32, bound: u32) -> (u32, Option<u32>) {
+        if state >= 0x8000 {
+            // Values at/above the 15-bit direct-encoding limit are dynamic
+            // mod states in this protocol. Store air in the legacy palette
+            // and retain the exact state in the sparse overlay.
+            (0, Some(state))
+        } else {
+            (state.min(bound), None)
+        }
+    }
+
+    fn state_at(&self, index: usize, dynamic: &BTreeMap<usize, u32>) -> u32 {
+        dynamic
+            .get(&index)
+            .copied()
+            .or_else(|| self.palette.get(index).ok())
+            .unwrap_or(0)
+    }
+
+    fn set_state(
+        &mut self,
+        index: usize,
+        state: u32,
+        dynamic: &mut BTreeMap<usize, u32>,
+    ) -> Result<(), String> {
+        if state >= 0x8000 {
+            dynamic.insert(index, state);
+            self.palette
+                .set(index, 0)
+                .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
+        } else {
+            dynamic.remove(&index);
+            self.palette
+                .set(index, state)
+                .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
+        }
+        Ok(())
+    }
+
     fn from_states(
         states: &[u32; SECTION_CELLS],
         block_light: [u8; LIGHT_BYTES],
         sky_light: [u8; LIGHT_BYTES],
         blocks: &BlockTable,
         state_count: usize,
+        dynamic_states: &mut BTreeMap<usize, u32>,
     ) -> Result<Self, String> {
         let bound = u32::try_from(state_count.saturating_sub(1)).unwrap_or(u32::MAX);
-        let first = states[0].min(bound);
+        let (first, first_dynamic) = Self::palette_state(states[0], bound);
         let mut palette = PalettedSection::new_single_bounded(first, state_count)
             .map_err(|e| format!("PalettedSection::new_single_bounded failed: {e:?}"))?;
-        let mut has_non_air = !blocks.is_air(first);
-        if states.iter().any(|&s| s != first) {
-            for (idx, &raw_state) in states.iter().enumerate() {
-                let clamped = raw_state.min(bound);
-                if clamped != first {
-                    palette
-                        .set(idx, clamped)
-                        .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
-                }
-                if !blocks.is_air(clamped) {
-                    has_non_air = true;
-                }
+        dynamic_states.clear();
+        if let Some(state) = first_dynamic {
+            dynamic_states.insert(0, state);
+        }
+        let first_exact = first_dynamic.unwrap_or(first);
+        let mut has_non_air = !blocks.is_air(first_exact);
+        for (idx, &raw_state) in states.iter().enumerate() {
+            let (stored, dynamic) = Self::palette_state(raw_state, bound);
+            if idx != 0 && stored != first {
+                palette
+                    .set(idx, stored)
+                    .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
+            }
+            if let Some(state) = dynamic {
+                dynamic_states.insert(idx, state);
+            }
+            let exact = dynamic.unwrap_or(stored);
+            if !blocks.is_air(exact) {
+                has_non_air = true;
             }
         }
         Ok(Self {
@@ -1230,9 +1668,12 @@ impl StoredSection {
         })
     }
 
-    fn to_mesh_section(&self, blocks: &BlockTable) -> Section {
+    fn to_mesh_section(&self, blocks: &BlockTable, dynamic: &BTreeMap<usize, u32>) -> Section {
         let mut unpacked = [0u32; SECTION_CELLS];
         self.palette.unpack_into(&mut unpacked);
+        for (&index, &state) in dynamic {
+            unpacked[index] = state;
+        }
         let mut mesh_blocks = Box::new([Block::AIR; SECTION_CELLS]);
         for (index, (dst, &sid)) in mesh_blocks.iter_mut().zip(unpacked.iter()).enumerate() {
             let x = index % 16;
@@ -1257,18 +1698,26 @@ impl StoredSection {
     /// block-storage heap bytes while staying bit-identical to
     /// [`to_mesh_section`](Self::to_mesh_section) plus the
     /// `CompressedSection::from` collapse.
-    fn to_compressed_mesh_section(&self, blocks: &BlockTable) -> CompressedSection {
+    fn to_compressed_mesh_section(
+        &self,
+        blocks: &BlockTable,
+        dynamic: &BTreeMap<usize, u32>,
+    ) -> CompressedSection {
         let uniform_biome = self.biomes[1..]
             .iter()
             .all(|&biome| biome == self.biomes[0]);
-        if let Some(state) = self.palette.uniform_state().filter(|_| uniform_biome) {
-            return CompressedSection {
-                blocks: SectionBlocks::Uniform(blocks.mesh_block_for_biome(state, self.biomes[0])),
-                block_light: self.block_light,
-                sky_light: self.sky_light,
-            };
+        if dynamic.is_empty() {
+            if let Some(state) = self.palette.uniform_state().filter(|_| uniform_biome) {
+                return CompressedSection {
+                    blocks: SectionBlocks::Uniform(
+                        blocks.mesh_block_for_biome(state, self.biomes[0]),
+                    ),
+                    block_light: self.block_light,
+                    sky_light: self.sky_light,
+                };
+            }
         }
-        CompressedSection::from(self.to_mesh_section(blocks))
+        CompressedSection::from(self.to_mesh_section(blocks, dynamic))
     }
 }
 
@@ -1964,6 +2413,12 @@ pub struct WorldState {
     light_queue: CoalescedLightQueue,
     pub columns: CoordMap<(i32, i32), ChunkColumn>,
     pub mesh_cache: MeshCache,
+    /// Sparse full-resolution block states that cannot survive the kernel
+    /// palette's 15-bit direct encoding, keyed by section then cell index.
+    /// Mod dynamic ids are u32 and start at 1_000_000; keeping them in this
+    /// side table prevents silent truncation while `StoredSection` retains
+    /// its stable public field layout for test helpers across the workspace.
+    section_dynamic_states: CoordMap<SectionCoord, BTreeMap<usize, u32>>,
     /// Official vanilla block-model catalog attached for exact shaped-block
     /// terrain meshing. `None` keeps the legacy greedy fast path untouched.
     block_model_catalog: Option<Arc<VanillaBlockModelCatalog>>,
@@ -2133,6 +2588,101 @@ fn light_engine_for(dimension: &DimensionMeta, enabled: bool) -> Option<LightEng
 }
 
 impl WorldState {
+    /// Install dynamic mod block states (`state_id`, canonical name, packed
+    /// `(luminance << 4) | opacity` facts) into this world's sparse registry.
+    /// Existing loaded sections containing dynamic ids are re-materialized so
+    /// meshing, collision and lighting pick up the new facts immediately.
+    pub fn install_dynamic_mod_registry_states(&mut self, states: &[(u32, String, u8)]) -> usize {
+        let accepted = self.blocks.install_dynamic_mod_states(states);
+        if accepted == 0 {
+            return 0;
+        }
+        self.state_count = self.state_count.max(self.blocks.state_count());
+        if self.light_engine.is_none() {
+            self.light_engine = light_engine_for(&self.dimension, true);
+        }
+
+        let min_sy = self.dimension.min_section_y();
+        let affected: Vec<SectionCoord> = self
+            .section_dynamic_states
+            .iter()
+            .filter(|(_, overlay)| !overlay.is_empty())
+            .map(|(&coord, _)| coord)
+            .collect();
+        for coord in affected {
+            let Some(column) = self.columns.get(&(coord.0, coord.2)) else {
+                continue;
+            };
+            let Some(section) = column.sections.get((coord.1 - min_sy) as usize) else {
+                continue;
+            };
+            let mesh_sec =
+                section.to_compressed_mesh_section(&self.blocks, self.dynamic_overlay(coord));
+            self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
+            self.mesh_cache.insert_compressed(coord, mesh_sec);
+        }
+        let chunks: Vec<(i32, i32)> = self.columns.keys().copied().collect();
+        for (cx, cz) in chunks {
+            self.load_light_chunk(cx, cz);
+        }
+        accepted
+    }
+
+    /// Apply live biome-registry climate updates and invalidate every loaded
+    /// section whose biome cells reference one of the updated biome ids.
+    /// Future chunk inserts use the updated resolver automatically.
+    pub fn update_biome_climates_from_registry(&mut self, entries: &[BiomeClimateEntry]) -> usize {
+        let accepted = self.blocks.update_biome_climates_from_registry(entries);
+        if accepted == 0 {
+            return 0;
+        }
+        let ids: BTreeSet<u32> = entries
+            .iter()
+            .filter(|entry| entry.temperature.is_finite() && entry.downfall.is_finite())
+            .map(|entry| entry.biome_id)
+            .collect();
+        let min_sy = self.dimension.min_section_y();
+        let mut affected = Vec::new();
+        for (&(cx, cz), column) in &self.columns {
+            for (index, section) in column.sections.iter().enumerate() {
+                if section.biomes.iter().any(|biome| ids.contains(biome)) {
+                    affected.push(SectionCoord(cx, min_sy + index as i32, cz));
+                }
+            }
+        }
+        for coord in affected {
+            let Some(column) = self.columns.get(&(coord.0, coord.2)) else {
+                continue;
+            };
+            let Some(section) = column.sections.get((coord.1 - min_sy) as usize) else {
+                continue;
+            };
+            if section.has_non_air {
+                let mesh_sec =
+                    section.to_compressed_mesh_section(&self.blocks, self.dynamic_overlay(coord));
+                self.mesh_cache.insert_compressed(coord, mesh_sec);
+                self.mesh_cache.mark_dirty(coord);
+            }
+        }
+        accepted
+    }
+
+    /// Lighting facts for a state in either the vanilla kernel registry or
+    /// the sparse dynamic mod-state registry.
+    fn light_fact_for_state(&self, state_id: u32) -> Option<LightFact> {
+        if let Some(fact) = self.blocks.dynamic_light_fact(state_id) {
+            return Some(fact);
+        }
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.facts(state_id).ok())
+            .map(|fact| LightFact {
+                opacity: fact.opacity,
+                emission: fact.luminance,
+                occlusion: fact.face_occlusion,
+            })
+    }
+
     pub fn new(dimension: DimensionMeta, blocks: BlockTable) -> Self {
         let registry = load_kernel_registry(blocks.source_path.as_deref());
         Self::with_registry(dimension, blocks, registry)
@@ -2170,6 +2720,7 @@ impl WorldState {
             light_queue: CoalescedLightQueue::new(),
             columns: CoordMap::default(),
             mesh_cache: MeshCache::new(MissingNeighbor::Air),
+            section_dynamic_states: CoordMap::default(),
             block_model_catalog: None,
             block_model_cache: None,
             baked_terrain: CoordMap::default(),
@@ -2293,6 +2844,7 @@ impl WorldState {
         // world — the fresh engine has no columns for them to apply to.
         self.light_queue = CoalescedLightQueue::new();
         self.columns.clear();
+        self.section_dynamic_states.clear();
         self.mesh_cache = MeshCache::new(MissingNeighbor::Air);
         self.baked_terrain.clear();
         self.unpacked_terrain.clear();
@@ -2354,7 +2906,8 @@ impl WorldState {
             (y - min_y).rem_euclid(16) as usize,
             z.rem_euclid(16) as usize,
         );
-        sec.palette.get(idx).ok()
+        let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
+        Some(sec.state_at(idx, self.dynamic_overlay(coord)))
     }
 
     pub fn apply_chunk(&mut self, decoded: DecodedChunk) -> Result<(), String> {
@@ -2381,17 +2934,31 @@ impl WorldState {
                 section_light_updates(&decoded.light, idx + 1, &mut sky_cursor, &mut block_cursor);
             let sky = sky_update.unwrap_or(default_sky);
             let blk = block_update.unwrap_or([0u8; LIGHT_BYTES]);
-            let mut stored =
-                StoredSection::from_states(&sec.states, blk, sky, &self.blocks, self.state_count)?;
+            let mut dynamic = BTreeMap::new();
+            let mut stored = StoredSection::from_states(
+                &sec.states,
+                blk,
+                sky,
+                &self.blocks,
+                self.state_count,
+                &mut dynamic,
+            )?;
             stored.biomes = sec.biomes;
             let coord = SectionCoord(decoded.cx, min_sy + idx as i32, decoded.cz);
+            // A re-decoded chunk replaces the column: drop any overlay cells
+            // the previous decode installed before meshing the fresh one.
+            self.section_dynamic_states.remove(&coord);
             if stored.has_non_air {
-                let mesh_sec = stored.to_compressed_mesh_section(&self.blocks);
+                let mesh_sec =
+                    stored.to_compressed_mesh_section(&self.blocks, &dynamic);
                 self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
                 self.mesh_cache.insert_compressed(coord, mesh_sec);
             } else {
                 self.remove_section_mesh(coord);
                 self.set_section_visibility(coord, FaceVisibility::uniform_air(), false);
+            }
+            if !dynamic.is_empty() {
+                self.section_dynamic_states.insert(coord, dynamic);
             }
             stored_sections.push(stored);
         }
@@ -2414,11 +2981,12 @@ impl WorldState {
     /// cells ordered y, z, x from the window bottom. Skipped silently when the
     /// engine or registry is absent or the column does not cover the window.
     fn load_light_chunk(&mut self, cx: i32, cz: i32) {
-        let (Some(engine), Some(registry), Some(col)) = (
-            self.light_engine.as_mut(),
-            self.registry.as_ref(),
-            self.columns.get(&(cx, cz)),
-        ) else {
+        let registry = self.registry.as_ref();
+        if registry.is_none() && self.blocks.dynamic_state_limit == 0 {
+            return;
+        }
+        let (Some(engine), Some(col)) = (self.light_engine.as_mut(), self.columns.get(&(cx, cz)))
+        else {
             return;
         };
         let cells_per_chunk = engine.cells_per_chunk();
@@ -2426,25 +2994,35 @@ impl WorldState {
         if col.sections.len() * SECTION_CELLS != cells_per_chunk {
             return;
         }
-        let bound = u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX);
         let mut cells = Vec::with_capacity(cells_per_chunk);
+        let min_sy = self.dimension.min_section_y();
         for y_off in 0..height_blocks {
             let sy = y_off / 16;
             let ly = y_off % 16;
             let sec = &col.sections[sy];
+            let coord = SectionCoord(cx, min_sy + sy as i32, cz);
             for lz in 0..16usize {
                 for lx in 0..16usize {
-                    let state = sec
-                        .palette
-                        .get(section_index(lx, ly, lz))
-                        .unwrap_or(0)
-                        .min(bound);
-                    let fact = registry.facts(state).unwrap_or_default();
-                    cells.push(LightFact {
-                        opacity: fact.opacity,
-                        emission: fact.luminance,
-                        occlusion: fact.face_occlusion,
-                    });
+                    let state = sec.state_at(
+                        section_index(lx, ly, lz),
+                        self.section_dynamic_states
+                            .get(&coord)
+                            .unwrap_or(&EMPTY_DYNAMIC_STATES),
+                    );
+                    let fact = self
+                        .blocks
+                        .dynamic_light_fact(state)
+                        .or_else(|| {
+                            registry
+                                .and_then(|registry| registry.facts(state).ok())
+                                .map(|fact| LightFact {
+                                    opacity: fact.opacity,
+                                    emission: fact.luminance,
+                                    occlusion: fact.face_occlusion,
+                                })
+                        })
+                        .unwrap_or_default();
+                    cells.push(fact);
                 }
             }
         }
@@ -2456,11 +3034,7 @@ impl WorldState {
     /// the former per-edit path dropped them; the queue drains through
     /// [`Self::flush_light_queue`] into the same engine + write-back path.
     fn queue_local_light_edit(&mut self, x: i32, y: i32, z: i32, state_id: u32) {
-        if self
-            .registry
-            .as_ref()
-            .is_some_and(|registry| registry.facts(state_id).is_ok())
-        {
+        if self.light_fact_for_state(state_id).is_some() {
             self.light_queue.push(QueuedLightEdit { x, y, z, state_id });
         }
     }
@@ -2478,14 +3052,22 @@ impl WorldState {
             return;
         }
         for batch in &batches {
-            let edits = match self
-                .registry
-                .as_ref()
-                .map(|registry| batch.to_light_edits(registry))
-            {
-                Some(Ok(edits)) => edits,
-                _ => continue,
-            };
+            let edits: Vec<LightEdit> = batch
+                .edits
+                .iter()
+                .filter_map(|edit| {
+                    self.light_fact_for_state(edit.state_id)
+                        .map(|fact| LightEdit {
+                            x: edit.x,
+                            y: edit.y,
+                            z: edit.z,
+                            fact,
+                        })
+                })
+                .collect();
+            if edits.is_empty() {
+                continue;
+            }
             let update = {
                 let engine = self.light_engine.as_mut().expect("checked above");
                 match engine.apply_edits_multi_word(&edits) {
@@ -2587,7 +3169,8 @@ impl WorldState {
                 let coord = SectionCoord(cx, min_sy + sy as i32, cz);
                 let mesh_sec = match self.columns.get(&(cx, cz)) {
                     Some(col) => match col.sections.get(sy) {
-                        Some(sec) => sec.to_compressed_mesh_section(&self.blocks),
+                        Some(sec) => sec
+                            .to_compressed_mesh_section(&self.blocks, self.dynamic_overlay(coord)),
                         None => continue,
                     },
                     None => continue,
@@ -2629,7 +3212,11 @@ impl WorldState {
             }
             if changed && sec.has_non_air {
                 let coord = SectionCoord(cx, min_sy + idx as i32, cz);
-                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                let dynamic = self
+                    .section_dynamic_states
+                    .get(&coord)
+                    .unwrap_or(&EMPTY_DYNAMIC_STATES);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks, dynamic);
                 self.mesh_cache.insert_compressed(coord, mesh_sec);
             }
         }
@@ -2666,24 +3253,36 @@ impl WorldState {
         }
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
-        let Some(col) = self.columns.get_mut(&(cx, cz)) else {
-            return Ok(());
-        };
         let sec_idx = ((y64 - min_y) / 16) as usize;
-        let Some(sec) = col.sections.get_mut(sec_idx) else {
+        let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
+        if !self
+            .columns
+            .get(&(cx, cz))
+            .is_some_and(|col| col.sections.get(sec_idx).is_some())
+        {
             return Ok(());
-        };
+        }
+        let dynamic = self.section_dynamic_states.entry(coord).or_default();
+        let col = self
+            .columns
+            .get_mut(&(cx, cz))
+            .expect("column presence checked above");
+        let sec = col
+            .sections
+            .get_mut(sec_idx)
+            .expect("section presence checked above");
 
         let lx = x.rem_euclid(16) as usize;
         let ly = (y64 - min_y).rem_euclid(16) as usize;
         let lz = z.rem_euclid(16) as usize;
         let cell_idx = section_index(lx, ly, lz);
-        let clamped =
-            state_id.min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX));
-        let previous = sec.palette.get(cell_idx).ok();
-        sec.palette
-            .set(cell_idx, clamped)
-            .map_err(|e| format!("PalettedSection::set failed: {e:?}"))?;
+        let clamped = if state_id >= 0x8000 {
+            state_id
+        } else {
+            state_id.min(u32::try_from(self.state_count.saturating_sub(1)).unwrap_or(u32::MAX))
+        };
+        let previous = Some(sec.state_at(cell_idx, dynamic));
+        sec.set_state(cell_idx, clamped, dynamic)?;
         if previous != Some(clamped)
             && !previous
                 .and_then(|state| self.blocks.state_name(state))
@@ -2697,7 +3296,6 @@ impl WorldState {
             self.block_entity_visual_nbt.remove(&pos);
         }
 
-        let coord = SectionCoord(cx, self.dimension.min_section_y() + sec_idx as i32, cz);
         let mesh_block = self
             .blocks
             .mesh_block_for_biome(clamped, sec.biome_at(lx, ly, lz));
@@ -2709,14 +3307,14 @@ impl WorldState {
         if !self.blocks.is_air(clamped) {
             if !sec.has_non_air {
                 sec.has_non_air = true;
-                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks, dynamic);
                 self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
                 self.mesh_cache.insert_compressed(coord, mesh_sec);
             } else if self
                 .mesh_cache
                 .set_cell(coord, [lx, ly, lz], mesh_block, light)
             {
-                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+                let mesh_sec = sec.to_compressed_mesh_section(&self.blocks, dynamic);
                 self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
             }
         } else if sec.has_non_air
@@ -2724,7 +3322,7 @@ impl WorldState {
                 .mesh_cache
                 .set_cell(coord, [lx, ly, lz], mesh_block, light)
         {
-            let mesh_sec = sec.to_compressed_mesh_section(&self.blocks);
+            let mesh_sec = sec.to_compressed_mesh_section(&self.blocks, dynamic);
             self.set_section_visibility(coord, face_visibility_of(&mesh_sec.blocks), true);
         }
         self.queue_local_light_edit(x, y, z, clamped);
@@ -2815,8 +3413,17 @@ impl WorldState {
         }
     }
 
+    /// Sparse dynamic-state overlay for one section, or the shared empty
+    /// map when the section holds only palette-representable states.
+    fn dynamic_overlay(&self, coord: SectionCoord) -> &BTreeMap<usize, u32> {
+        self.section_dynamic_states
+            .get(&coord)
+            .unwrap_or(&EMPTY_DYNAMIC_STATES)
+    }
+
     fn remove_section_mesh(&mut self, coord: SectionCoord) {
         self.mesh_cache.remove(coord);
+        self.section_dynamic_states.remove(&coord);
         self.baked_terrain.remove(&coord);
         self.unpacked_terrain.remove(&coord);
         self.packed_meshes.remove(&coord);
@@ -3048,11 +3655,16 @@ impl WorldState {
     /// loaded.
     pub fn column_sections(&self, cx: i32, cz: i32) -> Option<Vec<Section>> {
         let column = self.columns.get(&(cx, cz))?;
+        let min_sy = self.dimension.min_section_y();
         Some(
             column
                 .sections
                 .iter()
-                .map(|section| section.to_mesh_section(&self.blocks))
+                .enumerate()
+                .map(|(index, section)| {
+                    let coord = SectionCoord(cx, min_sy + index as i32, cz);
+                    section.to_mesh_section(&self.blocks, self.dynamic_overlay(coord))
+                })
                 .collect(),
         )
     }
@@ -4006,8 +4618,14 @@ impl WorldState {
                 section.biomes.copy_from_slice(&biomes);
                 if section.has_non_air {
                     let coord = SectionCoord(chunk.cx, min_sy + index as i32, chunk.cz);
-                    self.mesh_cache
-                        .insert_compressed(coord, section.to_compressed_mesh_section(&self.blocks));
+                    let dynamic = self
+                        .section_dynamic_states
+                        .get(&coord)
+                        .unwrap_or(&EMPTY_DYNAMIC_STATES);
+                    self.mesh_cache.insert_compressed(
+                        coord,
+                        section.to_compressed_mesh_section(&self.blocks, dynamic),
+                    );
                 }
             }
         }
@@ -4399,17 +5017,26 @@ mod tests {
             air_mask: vec![false],
             state_names: vec!["minecraft:short_grass".to_string()],
             biome_tints: resolver,
+            dynamic_states: BTreeMap::new(),
+            dynamic_state_limit: 0,
             acoustic_lut: crate::spatial_audio::AcousticMaterialLut::from_state_names(&[]),
             loaded_from_json: false,
             source_path: None,
         };
         let states = [0; SECTION_CELLS];
-        let mut stored =
-            StoredSection::from_states(&states, [0; LIGHT_BYTES], [0; LIGHT_BYTES], &blocks, 1)
-                .unwrap();
+        let mut dynamic = BTreeMap::new();
+        let mut stored = StoredSection::from_states(
+            &states,
+            [0; LIGHT_BYTES],
+            [0; LIGHT_BYTES],
+            &blocks,
+            1,
+            &mut dynamic,
+        )
+        .unwrap();
         stored.biomes[0] = 1;
         stored.biomes[1] = 2;
-        let mesh = stored.to_mesh_section(&blocks);
+        let mesh = stored.to_mesh_section(&blocks, &dynamic);
         assert_eq!(mesh.blocks[0].tint, 0x112233);
         assert_eq!(mesh.blocks[4].tint, 0xaabbcc);
     }
@@ -4425,20 +5052,23 @@ mod tests {
         blocks.biome_tints.set_water_color(1, 0x112233);
         blocks.biome_tints.set_water_color(2, 0x445566);
         let states = [1; SECTION_CELLS];
+        let mut dynamic = BTreeMap::new();
         let mut section = StoredSection::from_states(
             &states,
             [0; LIGHT_BYTES],
             [0; LIGHT_BYTES],
             &blocks,
             blocks.state_count(),
+            &mut dynamic,
         )
         .unwrap();
         section.biomes.fill(1);
         let mut world = WorldState::new(DimensionMeta::default(), blocks);
         let coord = SectionCoord(0, world.dimension.min_section_y(), 0);
-        world
-            .mesh_cache
-            .insert_compressed(coord, section.to_compressed_mesh_section(&world.blocks));
+        world.mesh_cache.insert_compressed(
+            coord,
+            section.to_compressed_mesh_section(&world.blocks, &dynamic),
+        );
         world.columns.insert(
             (0, 0),
             ChunkColumn {
@@ -4486,18 +5116,21 @@ mod tests {
         blocks.state_names[2] = "minecraft:oak_sign".into();
         let mut world = WorldState::new(DimensionMeta::default(), blocks);
         let states = [1; SECTION_CELLS];
+        let mut dynamic = BTreeMap::new();
         let section = StoredSection::from_states(
             &states,
             [0; LIGHT_BYTES],
             [0; LIGHT_BYTES],
             &world.blocks,
             world.state_count,
+            &mut dynamic,
         )
         .unwrap();
         let coord = SectionCoord(0, world.dimension.min_section_y(), 0);
-        world
-            .mesh_cache
-            .insert_compressed(coord, section.to_compressed_mesh_section(&world.blocks));
+        world.mesh_cache.insert_compressed(
+            coord,
+            section.to_compressed_mesh_section(&world.blocks, &dynamic),
+        );
         world.columns.insert(
             (0, 0),
             ChunkColumn {
@@ -4746,5 +5379,65 @@ mod tests {
         assert_eq!(after, 24 * (4096 * 2 + 2 * std::mem::size_of::<Block>()));
         assert_eq!(world.get_block_state(0, -64, 0), Some(2));
         assert_eq!(world.get_block_state(1, -64, 0), Some(1));
+    }
+    #[test]
+    fn dynamic_mod_states_keep_full_u32_identity_and_sparse_light_facts() {
+        let dynamic_id = 1_000_042;
+        let facts = (14u8 << 4) | 15;
+        let mut blocks = BlockTable::builtin();
+        assert_eq!(
+            blocks.install_dynamic_mod_states(&[(
+                dynamic_id,
+                "examplemod:lamp".to_string(),
+                facts,
+            )]),
+            1
+        );
+        assert_eq!(blocks.state_name(dynamic_id), Some("examplemod:lamp"));
+        let fact = blocks.dynamic_light_fact(dynamic_id).unwrap();
+        assert_eq!((fact.opacity, fact.emission), (15, 14));
+        assert!(fact.occlusion.iter().all(|&face| face == 0x0f));
+
+        // Force the kernel palette past its 256-entry indirect path. The
+        // dynamic overlay must still preserve the full u32 id even though
+        // the legacy direct encoding is only 15 bits wide.
+        let mut states = [0u32; SECTION_CELLS];
+        for (index, state) in states.iter_mut().enumerate() {
+            *state = (index % 300 + 1) as u32;
+        }
+        states[SECTION_CELLS - 1] = dynamic_id;
+        let mut dynamic = BTreeMap::new();
+        let section = StoredSection::from_states(
+            &states,
+            [0; LIGHT_BYTES],
+            [0; LIGHT_BYTES],
+            &blocks,
+            blocks.state_count(),
+            &mut dynamic,
+        )
+        .unwrap();
+        assert_eq!(section.state_at(SECTION_CELLS - 1, &dynamic), dynamic_id);
+        assert_eq!(
+            section.to_mesh_section(&blocks, &dynamic).blocks[SECTION_CELLS - 1].state_id,
+            dynamic_id
+        );
+    }
+
+    #[test]
+    fn vanilla_biome_defaults_and_grass_modifiers_are_seeded() {
+        let resolver = BiomeTintResolver::default();
+        let plains = resolver.resolve(39, BiomeTintKind::Grass, 0);
+        let desert = resolver.resolve(14, BiomeTintKind::Grass, 0);
+        let jungle = resolver.resolve(28, BiomeTintKind::Grass, 0);
+        let swamp = resolver.resolve(53, BiomeTintKind::Grass, 0);
+        assert!(plains != 0 && desert != 0 && jungle != 0);
+        assert_ne!(plains, desert);
+        assert_ne!(plains, jungle);
+        assert_ne!(desert, jungle);
+        assert_eq!(swamp, 0x6a7039);
+        assert_eq!(resolver.resolve(53, BiomeTintKind::Water, 0), 0x617b64);
+        let dark_forest = resolver.resolve(8, BiomeTintKind::Grass, 0);
+        let forest = resolver.resolve(21, BiomeTintKind::Grass, 0);
+        assert_ne!(dark_forest, forest);
     }
 }

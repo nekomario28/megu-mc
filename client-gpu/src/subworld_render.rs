@@ -24,8 +24,12 @@ use bytemuck::{Pod, Zeroable};
 use megu_client_mesh::ber_instancing::VanillaParticleQuad;
 use megu_client_mesh::builtin_shadow_wgsl::VfxLightUniforms;
 use megu_client_mesh::BerInstanceData;
+use megu_proto::subworld_wire::{
+    pivot_adjusted_position, SubworldFrameMode, SubworldPoseRecord,
+    SubworldSyncFrame as WireSubworldSyncFrame,
+};
 
-use crate::subworld_sync::{SubWorldPoseInterpolator, SubWorldSyncFrame};
+use crate::subworld_sync::{SubWorldPose, SubWorldPoseInterpolator, SubWorldSyncFrame};
 
 use crate::{mat4_mul, Mat4};
 
@@ -119,8 +123,7 @@ impl TerrainVertex {
 
     /// Write the material-flags byte, preserving packed rgb.
     pub fn set_material_flags(&mut self, flags: u8) {
-        self.packed_albedo =
-            (self.packed_albedo & 0x00ff_ffff) | (u32::from(flags) << 24);
+        self.packed_albedo = (self.packed_albedo & 0x00ff_ffff) | (u32::from(flags) << 24);
     }
 }
 
@@ -147,9 +150,8 @@ pub fn pack_normal_octahedral(normal: [f32; 3]) -> u32 {
         ex = folded.0;
         ey = folded.1;
     }
-    let quantize = |v: f32| -> u32 {
-        ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u32 & 0xffff
-    };
+    let quantize =
+        |v: f32| -> u32 { ((v.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u32 & 0xffff };
     quantize(ex) | (quantize(ey) << 16)
 }
 
@@ -559,9 +561,60 @@ pub fn quat_from_axis_angle(axis: [f32; 3], radians: f32) -> [f32; 4] {
     ]
 }
 
+fn sw6d_hull_cell(state: u32) -> SubWorldCell {
+    // Deterministic untextured placeholder material. The wire carries block
+    // state ids rather than a render palette; a gentle hash keeps adjacent
+    // states distinguishable without pretending to resolve modded textures.
+    let hash = state.wrapping_mul(0x9e37_79b1).rotate_left(13);
+    let shade = 0.45 + f32::from((hash >> 16) as u8) / 510.0;
+    SubWorldCell {
+        albedo: [shade, shade * 0.92 + 0.04, shade * 0.82 + 0.08],
+        material_flags: 0,
+        atlas_index: u32::MAX,
+    }
+}
+
+/// Mesh a sparse SW6D voxel hull in normalized, non-negative mesh space and
+/// return the minimum original voxel coordinate subtracted during that
+/// normalization. `pivot - origin` is therefore the pivot in mesh space.
+fn voxel_hull_mesh_from_sw6d(voxels: &[([i16; 3], u32)]) -> (SubWorldMesh, [f32; 3]) {
+    if voxels.is_empty() {
+        return (SubWorldMesh::default(), [0.0; 3]);
+    }
+    let mut min = [i16::MAX; 3];
+    let mut max = [i16::MIN; 3];
+    for (offset, _) in voxels {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(offset[axis]);
+            max[axis] = max[axis].max(offset[axis]);
+        }
+    }
+    let dims = std::array::from_fn(|axis| usize::from((max[axis] - min[axis]) as u16) + 1);
+    let mut cells = std::collections::BTreeMap::new();
+    for &(offset, state) in voxels {
+        let local = std::array::from_fn(|axis| usize::from((offset[axis] - min[axis]) as u16));
+        cells.insert(local, sw6d_hull_cell(state));
+    }
+    let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells.get(&[x, y, z]).copied());
+    (mesh, [min[0] as f32, min[1] as f32, min[2] as f32])
+}
+
 // ---------------------------------------------------------------------------
 // CPU-side sub-world bank (authoritative scene table)
 // ---------------------------------------------------------------------------
+
+/// Ownership provenance for a render-bank entry. Network entries are scoped
+/// by dimension and carry the latest accepted SW6D revision; local entries
+/// are owned by client-side contraption/geometry systems and are never
+/// removed by network snapshot reconciliation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SubworldOwner {
+    /// Client-local render geometry (Create-style contraptions, tests, debug).
+    #[default]
+    Local,
+    /// Server-owned SW6D network hull in one logical dimension.
+    Network { dim_id: u32, revision: u64 },
+}
 
 /// One rigid sub-world's render payload: shared `TerrainVertex` geometry
 /// plus the transform placing it this frame. `dirty` marks geometry the GPU
@@ -570,6 +623,11 @@ pub fn quat_from_axis_angle(axis: [f32; 3], radians: f32) -> [f32; 4] {
 pub struct SubWorldRenderEntry {
     /// Stable sub-world id (contraption/airship handle).
     pub id: u64,
+    /// Local or dimension-scoped network ownership.
+    pub owner: SubworldOwner,
+    /// Minimum voxel-grid coordinate subtracted when a sparse SW6D hull was
+    /// normalized into mesh space. The render pivot is `wire_pivot - origin`.
+    pub voxel_origin: [f32; 3],
     /// 6-DOF placement for the next frame.
     pub transform: SubWorldTransform,
     /// Placement before the latest tick update. Render-rate consumers use
@@ -603,9 +661,7 @@ pub const SUBWORLD_LIGHT_ENABLED: u32 = 1 << 8;
 /// Pack a nibble `(block_light, sky_light)` sample into the enabled
 /// world-light word.
 pub fn pack_subworld_light(block_light: u8, sky_light: u8) -> u32 {
-    u32::from(block_light.min(15))
-        | (u32::from(sky_light.min(15)) << 4)
-        | SUBWORLD_LIGHT_ENABLED
+    u32::from(block_light.min(15)) | (u32::from(sky_light.min(15)) << 4) | SUBWORLD_LIGHT_ENABLED
 }
 
 /// Inverse of [`pack_subworld_light`]: `Some((block_light, sky_light))`
@@ -627,6 +683,8 @@ impl SubWorldRenderEntry {
     ) -> Self {
         Self {
             id,
+            owner: SubworldOwner::Local,
+            voxel_origin: [0.0; 3],
             transform,
             prev_transform: transform,
             protrusion_margin: 0.0,
@@ -774,12 +832,11 @@ const PARTICLE_QUAD_ATTRS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
 }];
 
 /// Static unit-quad stream (buffer slot 0 of the billboard pipeline).
-pub const PARTICLE_QUAD_LAYOUT: wgpu::VertexBufferLayout<'static> =
-    wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &PARTICLE_QUAD_ATTRS,
-    };
+pub const PARTICLE_QUAD_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Vertex,
+    attributes: &PARTICLE_QUAD_ATTRS,
+};
 
 /// `@location(1..7)` mirror of [`ParticleInstance`].
 const PARTICLE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = [
@@ -821,12 +878,11 @@ const PARTICLE_INSTANCE_ATTRS: [wgpu::VertexAttribute; 7] = [
 ];
 
 /// Per-instance billboard stream (buffer slot 1 of the billboard pipeline).
-pub const PARTICLE_INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> =
-    wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Instance,
-        attributes: &PARTICLE_INSTANCE_ATTRS,
-    };
+pub const PARTICLE_INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
+    array_stride: std::mem::size_of::<ParticleInstance>() as wgpu::BufferAddress,
+    step_mode: wgpu::VertexStepMode::Instance,
+    attributes: &PARTICLE_INSTANCE_ATTRS,
+};
 
 /// How one CPU-expanded `VanillaParticleQuad` packs for the instanced
 /// billboard path.
@@ -854,16 +910,8 @@ pub fn pack_particle_billboard(quad: &VanillaParticleQuad) -> ParticleBillboardP
         return ParticleBillboardPack::Skip;
     }
     let p = &quad.positions;
-    let u = [
-        p[1][0] - p[0][0],
-        p[1][1] - p[0][1],
-        p[1][2] - p[0][2],
-    ];
-    let v = [
-        p[3][0] - p[0][0],
-        p[3][1] - p[0][1],
-        p[3][2] - p[0][2],
-    ];
+    let u = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+    let v = [p[3][0] - p[0][0], p[3][1] - p[0][1], p[3][2] - p[0][2]];
     let n = [
         u[1] * v[2] - u[2] * v[1],
         u[2] * v[0] - u[0] * v[2],
@@ -960,9 +1008,18 @@ impl InstancedPartBatch {
 /// The authoritative sub-world scene table. Entries and batches are keyed
 /// maps so a steady frame iterates in deterministic order and uploads
 /// nothing.
+type SubworldBankKey = (u64, Option<u32>);
+
+fn bank_key(entry: &SubWorldRenderEntry) -> SubworldBankKey {
+    match entry.owner {
+        SubworldOwner::Local => (entry.id, None),
+        SubworldOwner::Network { dim_id, .. } => (entry.id, Some(dim_id)),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SubWorldRenderBank {
-    entries: BTreeMap<u64, SubWorldRenderEntry>,
+    entries: BTreeMap<SubworldBankKey, SubWorldRenderEntry>,
     batches: BTreeMap<u32, InstancedPartBatch>,
     pose_interpolator: SubWorldPoseInterpolator,
 }
@@ -973,43 +1030,166 @@ impl SubWorldRenderBank {
         Self::default()
     }
 
-    /// Ingest one complete SW6D snapshot. Existing geometry remains attached
-    /// to surviving ids; new ids receive an empty, dirty render entry and ids
-    /// absent from the snapshot are removed.
+    /// Ingest one complete compatibility SW6D snapshot. Rows have no
+    /// dimension metadata in this legacy shape, so they reconcile network
+    /// dimension zero only; local-owned entries are always preserved.
     pub fn apply_sync_frame(&mut self, frame: &SubWorldSyncFrame) {
-        self.pose_interpolator.ingest(frame);
-        let live: std::collections::BTreeSet<u64> =
-            frame.poses.iter().map(|pose| pose.subworld_id).collect();
-        self.entries.retain(|id, _| live.contains(id));
-        for pose in &frame.poses {
-            let transform = SubWorldTransform {
-                position: pose.pos.map(|value| value as f32),
-                quaternion: pose.quat,
-                scale: 1.0,
-            };
-            self.entries.entry(pose.subworld_id).or_insert_with(|| {
-                SubWorldRenderEntry::new(pose.subworld_id, transform, Vec::new(), Vec::new())
-            });
-            if let Some(entry) = self.entries.get_mut(&pose.subworld_id) {
-                let jump = entry
-                    .transform
-                    .position
+        let records = frame
+            .poses
+            .iter()
+            .map(|pose| SubworldPoseRecord {
+                subworld_id: pose.subworld_id,
+                dimension_id: 0,
+                revision: 0,
+                pos: pose.pos,
+                quat: pose.quat,
+                vel: pose.vel,
+                ang_vel: pose.ang_vel,
+                pivot: [0.0; 3],
+                flags: pose.flags,
+                voxels: Vec::new(),
+            })
+            .collect();
+        self.apply_sync_frame_detailed(&WireSubworldSyncFrame {
+            mode: SubworldFrameMode::Baseline,
+            records,
+        });
+    }
+
+    /// Ingest the canonical SW6D v2 contract, preserving ownership,
+    /// dimension scope, monotonic hull revisions, pivot-adjusted asymmetric
+    /// voxel geometry and pose-only deltas. Baseline reconciliation removes
+    /// only network entries in dimensions represented by that baseline;
+    /// local entries and entries in other dimensions survive verbatim.
+    pub fn apply_sync_frame_detailed(&mut self, frame: &WireSubworldSyncFrame) {
+        let mut accepted_poses = Vec::new();
+
+        if frame.mode == SubworldFrameMode::Baseline {
+            let dims: std::collections::BTreeSet<u32> = frame
+                .records
+                .iter()
+                .map(|record| record.dimension_id)
+                .collect();
+            if !dims.is_empty() {
+                let live: std::collections::BTreeSet<(u64, u32)> = frame
+                    .records
                     .iter()
-                    .zip(transform.position.iter())
-                    .map(|(a, b)| f64::from(b - a))
-                    .map(|d| d * d)
-                    .sum::<f64>()
-                    .sqrt()
-                    > 32.0;
-                if jump {
-                    entry.prev_transform = transform;
-                entry.transform = transform;
-                } else {
-                    entry.prev_transform = entry.transform;
-                    entry.transform = transform;
-                }
+                    .map(|record| (record.subworld_id, record.dimension_id))
+                    .collect();
+                self.entries.retain(|_, entry| match entry.owner {
+                    SubworldOwner::Local => true,
+                    SubworldOwner::Network { dim_id, .. } => {
+                        !dims.contains(&dim_id) || live.contains(&(entry.id, dim_id))
+                    }
+                });
             }
         }
+
+        for record in &frame.records {
+            let key = (record.subworld_id, Some(record.dimension_id));
+            if frame.mode == SubworldFrameMode::Despawn {
+                if matches!(
+                    self.entries.get(&key).map(|entry| entry.owner),
+                    Some(SubworldOwner::Network { .. })
+                ) {
+                    self.entries.remove(&key);
+                }
+                continue;
+            }
+
+            let stale = matches!(
+                self.entries.get(&key).map(|entry| entry.owner),
+                Some(SubworldOwner::Network { revision, .. }) if revision > record.revision
+            );
+            if stale {
+                continue;
+            }
+
+            let exists = self.entries.contains_key(&key);
+            if frame.mode == SubworldFrameMode::Pose && !exists {
+                // Pose deltas are strictly pose-only. They must not mint an
+                // empty visible hull for an unknown or already-despawned id.
+                continue;
+            }
+
+            let mut voxel_origin = self
+                .entries
+                .get(&key)
+                .map(|entry| entry.voxel_origin)
+                .unwrap_or([0.0; 3]);
+            let mut geometry = None;
+            if !record.voxels.is_empty()
+                && matches!(
+                    frame.mode,
+                    SubworldFrameMode::Baseline | SubworldFrameMode::Spawn
+                )
+            {
+                let (mesh, origin) = voxel_hull_mesh_from_sw6d(&record.voxels);
+                voxel_origin = origin;
+                geometry = Some(mesh);
+            }
+            let effective_pivot = [
+                record.pivot[0] - voxel_origin[0],
+                record.pivot[1] - voxel_origin[1],
+                record.pivot[2] - voxel_origin[2],
+            ];
+            let render_pos = pivot_adjusted_position(record.pos, record.quat, effective_pivot);
+            let transform = SubWorldTransform {
+                position: render_pos.map(|value| value as f32),
+                quaternion: record.quat,
+                scale: 1.0,
+            };
+            accepted_poses.push(SubWorldPose {
+                subworld_id: record.subworld_id,
+                pos: render_pos,
+                quat: record.quat,
+                vel: record.vel,
+                ang_vel: record.ang_vel,
+                flags: record.flags,
+            });
+
+            let entry = self.entries.entry(key).or_insert_with(|| {
+                let mut entry =
+                    SubWorldRenderEntry::new(record.subworld_id, transform, Vec::new(), Vec::new());
+                entry.owner = SubworldOwner::Network {
+                    dim_id: record.dimension_id,
+                    revision: record.revision,
+                };
+                entry
+            });
+            entry.owner = SubworldOwner::Network {
+                dim_id: record.dimension_id,
+                revision: record.revision,
+            };
+            entry.voxel_origin = voxel_origin;
+            let jump = entry
+                .transform
+                .position
+                .iter()
+                .zip(transform.position.iter())
+                .map(|(a, b)| f64::from(b - a))
+                .map(|d| d * d)
+                .sum::<f64>()
+                .sqrt()
+                > 32.0;
+            if jump {
+                entry.prev_transform = transform;
+            } else {
+                entry.prev_transform = entry.transform;
+            }
+            entry.transform = transform;
+            if let Some(mesh) = geometry {
+                // Geometry revisions replace the hull in place. Pose-only
+                // frames never clear or replace the existing mesh.
+                entry.vertices = mesh.vertices;
+                entry.indices = mesh.indices;
+                entry.dirty = true;
+            }
+        }
+
+        self.pose_interpolator.ingest(&SubWorldSyncFrame {
+            poses: accepted_poses,
+        });
     }
 
     /// Apply an interpolated point between the previous and current SW6D
@@ -1018,18 +1198,31 @@ impl SubWorldRenderBank {
     pub fn interpolate_poses(&mut self, alpha: f32) {
         for (id, _) in self.pose_interpolator.poses() {
             if let Some(pose) = self.pose_interpolator.interpolate(id, alpha) {
-                if let Some(entry) = self.entries.get_mut(&id) {
-                    entry.transform.position = pose.pos.map(|value| value as f32);
-                    entry.transform.quaternion = pose.quat;
+                if let Some(key) = self.find_key(id) {
+                    if let Some(entry) = self.entries.get_mut(&key) {
+                        entry.transform.position = pose.pos.map(|value| value as f32);
+                        entry.transform.quaternion = pose.quat;
+                    }
                 }
             }
         }
     }
 
+    fn find_key(&self, id: u64) -> Option<SubworldBankKey> {
+        if self.entries.contains_key(&(id, None)) {
+            return Some((id, None));
+        }
+        if self.entries.contains_key(&(id, Some(0))) {
+            return Some((id, Some(0)));
+        }
+        self.entries.keys().find(|key| key.0 == id).copied()
+    }
+
     /// Insert or replace an entry; the geometry is (re)uploaded on the next
     /// GPU sync only when `entry.dirty` is set.
     pub fn upsert(&mut self, entry: SubWorldRenderEntry) {
-        self.entries.insert(entry.id, entry);
+        let key = bank_key(&entry);
+        self.entries.insert(key, entry);
     }
 
     /// Insert or update a rotating Create contraption — a windmill or
@@ -1056,7 +1249,7 @@ impl SubWorldRenderBank {
             quaternion: quat_from_axis_angle(axis, angle_rad),
             scale: 1.0,
         };
-        match self.entries.get_mut(&id) {
+        match self.entries.get_mut(&(id, None)) {
             Some(entry) => {
                 entry.prev_transform = entry.transform;
                 entry.transform = transform;
@@ -1068,7 +1261,7 @@ impl SubWorldRenderBank {
             }
             None => {
                 self.entries.insert(
-                    id,
+                    (id, None),
                     SubWorldRenderEntry::new(
                         id,
                         transform,
@@ -1083,7 +1276,7 @@ impl SubWorldRenderBank {
     /// Update an entry's transform without dirtying its geometry.
     /// Returns `false` for an unknown id.
     pub fn set_transform(&mut self, id: u64, transform: SubWorldTransform) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.prev_transform = entry.transform;
                 entry.transform = transform;
@@ -1096,7 +1289,7 @@ impl SubWorldRenderBank {
     /// Snap directly to `transform` with no interpolation smear. Teleports
     /// and large server corrections use this instead of [`Self::set_transform`].
     pub fn snap_transform(&mut self, id: u64, transform: SubWorldTransform) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.prev_transform = transform;
                 entry.transform = transform;
@@ -1108,8 +1301,8 @@ impl SubWorldRenderBank {
 
     /// Render-rate interpolated transform for `id`, if present.
     pub fn interpolated_transform(&self, id: u64, alpha: f32) -> Option<SubWorldTransform> {
-        self.entries
-            .get(&id)
+        self.find_key(id)
+            .and_then(|key| self.entries.get(&key))
             .map(|entry| entry.interpolated_transform(alpha))
     }
 
@@ -1117,7 +1310,7 @@ impl SubWorldRenderBank {
     /// geometry. Values are stored verbatim but non-finite/negative values
     /// fail closed to zero when read. Returns `false` for an unknown id.
     pub fn set_protrusion_margin(&mut self, id: u64, margin: f32) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.protrusion_margin = margin;
                 true
@@ -1134,7 +1327,7 @@ impl SubWorldRenderBank {
         vertices: Vec<TerrainVertex>,
         indices: Vec<u32>,
     ) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.vertices = vertices;
                 entry.indices = indices;
@@ -1152,7 +1345,7 @@ impl SubWorldRenderBank {
     /// update lands through the draw-uniform pool — geometry stays
     /// clean (no re-upload). Returns `false` for an unknown id.
     pub fn set_subworld_light(&mut self, id: u64, block_light: u8, sky_light: u8) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.world_light = pack_subworld_light(block_light, sky_light);
                 true
@@ -1164,7 +1357,7 @@ impl SubWorldRenderBank {
     /// Drop a sub-world's world-light override back to the legacy
     /// env-only shading. Returns `false` for an unknown id.
     pub fn clear_subworld_light(&mut self, id: u64) -> bool {
-        match self.entries.get_mut(&id) {
+        match self.find_key(id).and_then(|key| self.entries.get_mut(&key)) {
             Some(entry) => {
                 entry.world_light = 0;
                 true
@@ -1175,12 +1368,20 @@ impl SubWorldRenderBank {
 
     /// Drop a sub-world; its GPU buffers release on the next sync.
     pub fn remove(&mut self, id: u64) -> bool {
-        self.entries.remove(&id).is_some()
+        self.find_key(id)
+            .is_some_and(|key| self.entries.remove(&key).is_some())
     }
 
     /// Read an entry by id.
     pub fn get(&self, id: u64) -> Option<&SubWorldRenderEntry> {
-        self.entries.get(&id)
+        self.find_key(id).and_then(|key| self.entries.get(&key))
+    }
+
+    /// Read the network-owned entry scoped to one SW6D dimension.
+    pub fn get_network(&self, id: u64, dim_id: u32) -> Option<&SubWorldRenderEntry> {
+        self.entries.get(&(id, Some(dim_id))).filter(|entry| {
+            matches!(entry.owner, SubworldOwner::Network { dim_id: owner_dim, .. } if owner_dim == dim_id)
+        })
     }
 
     /// All entries in ascending id order (deterministic draw order).
@@ -1230,8 +1431,19 @@ impl SubWorldRenderBank {
         self.batches.values()
     }
 
-    pub(crate) fn entries_mut(&mut self) -> impl Iterator<Item = &mut SubWorldRenderEntry> {
-        self.entries.values_mut()
+    /// Key-aware entry access for the GPU mirror: the key carries the
+    /// dimension scope so same-id hulls in different dimensions never
+    /// collide in the device-side cache.
+    pub(crate) fn keyed_entries(
+        &self,
+    ) -> impl Iterator<Item = (SubworldBankKey, &SubWorldRenderEntry)> {
+        self.entries.iter().map(|(&key, entry)| (key, entry))
+    }
+
+    pub(crate) fn keyed_entries_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (SubworldBankKey, &mut SubWorldRenderEntry)> {
+        self.entries.iter_mut().map(|(&key, entry)| (key, entry))
     }
 
     pub(crate) fn batches_mut(&mut self) -> impl Iterator<Item = &mut InstancedPartBatch> {
@@ -1259,7 +1471,10 @@ mod subworld_sync_tests {
     fn sync_snapshot_inserts_updates_removes_and_interpolates() {
         let mut bank = SubWorldRenderBank::new();
         bank.apply_sync_frame(&SubWorldSyncFrame {
-            poses: vec![pose(1, 0.0, [0.0, 0.0, 0.0, 1.0]), pose(2, 8.0, [0.0, 0.0, 0.0, 1.0])],
+            poses: vec![
+                pose(1, 0.0, [0.0, 0.0, 0.0, 1.0]),
+                pose(2, 8.0, [0.0, 0.0, 0.0, 1.0]),
+            ],
         });
         assert_eq!(bank.len(), 2);
         bank.apply_sync_frame(&SubWorldSyncFrame {
@@ -1276,8 +1491,14 @@ mod subworld_sync_tests {
     #[test]
     fn subworld_light_packs_decodes_and_clears() {
         // The packed word round-trips and defaults to disabled.
-        assert_eq!(unpack_subworld_light(pack_subworld_light(14, 9)), Some((14, 9)));
-        assert_eq!(unpack_subworld_light(pack_subworld_light(0, 0)), Some((0, 0)));
+        assert_eq!(
+            unpack_subworld_light(pack_subworld_light(14, 9)),
+            Some((14, 9))
+        );
+        assert_eq!(
+            unpack_subworld_light(pack_subworld_light(0, 0)),
+            Some((0, 0))
+        );
         assert_eq!(unpack_subworld_light(0), None);
         assert_eq!(pack_subworld_light(255, 255) & 0xff, 0xff);
 
@@ -1557,7 +1778,7 @@ fn instance_upload_buffer(
 /// nothing and touches no geometry.
 #[derive(Default)]
 pub struct SubWorldGpuCache {
-    entries: BTreeMap<u64, GpuSubWorldEntry>,
+    entries: BTreeMap<SubworldBankKey, GpuSubWorldEntry>,
     batches: BTreeMap<u32, GpuInstancedBatch>,
 }
 
@@ -1598,14 +1819,14 @@ impl SubWorldGpuCache {
     ) {
         // Drop GPU entries whose sub-world was removed (both sides are
         // sorted, so binary search keeps this O(n log n)).
-        let live: Vec<u64> = bank.entries().map(|e| e.id).collect();
-        self.entries.retain(|id, _| live.binary_search(id).is_ok());
+        let live: Vec<SubworldBankKey> = bank.keyed_entries().map(|(key, _)| key).collect();
+        self.entries.retain(|key, _| live.binary_search(key).is_ok());
         let live_batches: Vec<u32> = bank.batches().map(|b| b.mesh_kind).collect();
         self.batches
             .retain(|kind, _| live_batches.binary_search(kind).is_ok());
 
-        for entry in bank.entries_mut() {
-            let gpu = match self.entries.remove(&entry.id) {
+        for (key, entry) in bank.keyed_entries_mut() {
+            let gpu = match self.entries.remove(&key) {
                 Some(mut gpu) => {
                     if entry.dirty {
                         let (vbuf, vcap) = vertex_upload_buffer(
@@ -1665,7 +1886,7 @@ impl SubWorldGpuCache {
             gpu.protrusion_margin = entry.effective_protrusion_margin();
             gpu.index_count = entry.indices.len() as u32;
             entry.dirty = false;
-            self.entries.insert(entry.id, gpu);
+            self.entries.insert(key, gpu);
         }
 
         for batch in bank.batches_mut() {
@@ -3080,8 +3301,7 @@ mod voxel_hull_tests {
                             let mut n = [x as i32, y as i32, z as i32];
                             n[axis] += step;
                             let exposed = !(0..dims[axis] as i32).contains(&n[axis])
-                                || cell_at(n[0] as usize, n[1] as usize, n[2] as usize)
-                                    .is_none();
+                                || cell_at(n[0] as usize, n[1] as usize, n[2] as usize).is_none();
                             if exposed {
                                 counts[axis * 2 + usize::from(step < 0)] += 1;
                             }
@@ -3190,9 +3410,7 @@ mod voxel_hull_tests {
     fn subworld_single_voxel_emits_six_unit_faces() {
         let dims = [1, 1, 1];
         let cells = grid(dims, |_, _, _| true);
-        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
         let areas = merged_areas(&mesh);
@@ -3218,27 +3436,22 @@ mod voxel_hull_tests {
     fn subworld_solid_cube_collapses_to_six_quads() {
         let dims = [4, 4, 4];
         let cells = grid(dims, |_, _, _| true);
-        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(merged_areas(&mesh), [16.0; 6]);
-        assert_eq!(naive_exposed_faces(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        }), [16; 6]);
+        assert_eq!(
+            naive_exposed_faces(dims, |x, y, z| { cells[(z * dims[1] + y) * dims[0] + x] }),
+            [16; 6]
+        );
     }
 
     #[test]
     fn subworld_airship_hull_reduces_quads_and_preserves_area() {
         let dims = [12, 7, 9];
         let cells = airship_hull(dims);
-        let naive = naive_exposed_faces(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let naive = naive_exposed_faces(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         let naive_total: usize = naive.iter().sum();
-        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         let merged_quads = mesh.vertices.len() / 4;
         assert!(
             merged_quads * 4 <= naive_total,
@@ -3276,9 +3489,7 @@ mod voxel_hull_tests {
                 cells[z * 4 + x] = Some(if x < 2 { DECK } else { CABIN });
             }
         }
-        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         let tops: Vec<_> = mesh
             .vertices
             .as_chunks::<4>()
@@ -3306,16 +3517,11 @@ mod voxel_hull_tests {
         let cells = grid(dims, |x, y, z| {
             (x < 4 && y == 0 && z < 4) || (x >= 2 && y == 1 && z < 2)
         });
-        let naive = naive_exposed_faces(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
-        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| {
-            cells[(z * dims[1] + y) * dims[0] + x]
-        });
+        let naive = naive_exposed_faces(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
+        let mesh = greedy_voxel_hull_mesh(dims, |x, y, z| cells[(z * dims[1] + y) * dims[0] + x]);
         let areas = merged_areas(&mesh);
         for face in 0..6 {
             assert_eq!(areas[face], naive[face] as f32, "face {face} area drifted");
         }
     }
 }
-
