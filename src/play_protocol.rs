@@ -12561,2572 +12561,912 @@ impl std::ops::Drop for ConnectionCleanupGuard {
     }
 }
 
-fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
-    s.set_nodelay(true).ok();
-    let mut peer = s
-        .peer_addr()
-        .map_or_else(|_| "unknown".to_string(), |a| a.ip().to_string());
-    // Applied before handshake/login: idle unauthenticated sockets must expire.
-    s.set_read_timeout(Some(Duration::from_secs(10))).ok();
-    s.set_write_timeout(Some(Duration::from_secs(10))).ok();
-    // One wall-clock budget for handshake, login and configuration together.
-    let login_deadline = Instant::now() + connection_limits::login_timeout();
-    // This budget spans handshake, login and configuration, rather than
-    // starting only after the client reaches play state.
-    let mut preplay_rate = connection_limits::PacketRateLimit::new(Instant::now());
-    let (id, hs) = match read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
-        Some(x) => x,
-        None => return,
-    };
-    if id != 0 {
-        return;
-    }
-    let Some((protocol, next)) = handshake_parts(&hs) else {
-        return;
-    };
-    if protocol != 767 {
-        let reason = if protocol < 767 { "Outdated client! Please use 1.21.1." } else { "Outdated server! Please use 1.21.1." };
-        if next == 1 {
-            status_version_mismatch(&mut s, reason, login_deadline);
-        } else {
-            login_disconnect(&mut s, reason);
-        }
-        return;
-    }
-    if next == 1 {
-        if let Some((0, _)) = read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
-            let online_players: Vec<(String, [u8; 16])> = clients()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|c| (c.name.clone(), c.uuid))
-                .collect();
-            let max = live_max_players();
-            let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".to_owned());
-            let json = build_status_json_rich(&motd, max, &online_players, status_favicon());
-            let mut pl = Vec::new();
-            write_str(&mut pl, &json);
-            let _ = send_packet(&mut s, 0, pl);
-        }
-        if let Some((1, ping)) = read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
-            let _ = send_packet(&mut s, 1, ping);
-        }
-        return;
-    }
-    if next != 2 {
-        return;
-    }
-    // ---- login ----
-    let (lid, lbody) = match read_preplay_frame(&mut s, login_deadline, None, &mut preplay_rate) {
-        Some(x) => x,
-        None => return,
-    };
-    if lid != 0 {
-        return;
-    }
-    let Some((mut name, mut uuid)) = login_identity(&lbody) else {
-        return;
-    };
-    // W4: identity-bearing login exchanges run before admission, so the ban and
-    // whitelist checks judge the *verified* identity — the Velocity-forwarded
-    // triple or the Mojang session profile — not whatever the socket claims.
-    let mut login_skin = None;
-    // `true` once an identity-bearing exchange verified this connection: every
-    // privilege decision below may then trust the UUID, not just the claimed name.
-    let mut authenticated = false;
-    if velocity_forwarding_enabled() {
-        match velocity_login(&mut s, login_deadline, &mut preplay_rate) {
-            Ok(fwd) => {
-                eprintln!("[spine] {peer} forwarded {} as {}", fwd.forwarded_ip, fwd.username);
-                peer = fwd.forwarded_ip;
-                uuid = fwd.uuid;
-                name = fwd.username;
-                login_skin = forwarded_skin(&fwd.properties);
-                authenticated = true;
-            }
-            Err(why) => {
-                eprintln!("[security] velocity forwarding refused for {name} from {peer}: {why}");
-                login_disconnect_text(&mut s, "This server requires connections through the proxy.");
-                return;
-            }
-        }
-    } else if online_mode_enabled() {
-        match online_login(&mut s, &name, &peer, login_deadline, &mut preplay_rate) {
-            Ok(profile) => {
-                uuid = profile.uuid;
-                name = profile.name;
-                login_skin = forwarded_skin(&profile.properties);
-                authenticated = true;
-            }
-            Err(why) => {
-                eprintln!("[security] online-mode login refused for {name} from {peer}: {why}");
-                login_disconnect(&mut s, "Failed to verify username!");
-                return;
-            }
-        }
-    }
-    // `LoginCompression` only guards the wire entry when a threshold was
-    // negotiated; a cipher armed above must not outlive this connection, or a
-    // later connection reusing the fd would read a dead keystream.
-    let _cipher_guard = conn_cipher(&s).map(|_| SocketCipherGuard(socket_key(&s)));
-    if let Some(list) = connection_limits::allowlist() {
-        if !list.permits(&name, &uuid) {
-            eprintln!("[security] login refused for {name} from {peer}: not on the allowlist");
-            login_disconnect(&mut s, "You are not white-listed on this server!");
-            return;
-        }
-    }
-    // Vanilla `PlayerList.canPlayerLogin`: IP ban, player ban, whitelist, then
-    // the player cap — evaluated before Login Success so the refusal arrives
-    // as a Login-state Disconnect like Vanilla's.
-    {
-        let online = clients().lock().unwrap_or_else(|e| e.into_inner()).len();
-        let mut live = live_admission().lock().unwrap_or_else(|e| e.into_inner());
-        let live = live.get_or_insert_with(|| LiveAdmission::load(std::path::Path::new(".")));
-        // A `/ban`, `/pardon`, `/whitelist` or `/op` issued since the last
-        // login — or a file an operator edited by hand — lands on the next
-        // admission check, not after a restart.
-        live.refresh();
-        if let Err(reason) = check_login_admission_verified(
-            &name,
-            &uuid_text(&uuid),
-            &peer,
-            online,
-            live.max_players,
-            &live.ops,
-            &live.bans,
-            &live.whitelist,
-            authenticated,
-        ) {
-            eprintln!("[security] login refused for {name} from {peer}: {reason}");
-            login_disconnect_text(&mut s, &reason);
-            return;
-        }
-    }
-    // Held until this function returns, i.e. through the player's save on
-    // logout: a second session under the same identity cannot start from stale
-    // saved state or write over this one.
-    let login = match LOGINS.reserve(&name, uuid) {
-        Ok(g) => g,
-        Err(why) => {
-            eprintln!("[security] duplicate login refused for {name} from {peer}: {why:?}");
-            login_disconnect(
-                &mut s,
-                "A player with that name or UUID is already logged in.",
-            );
-            return;
-        }
-    };
-    // Vanilla 1.21.1 compresses at 256 bytes by default; an explicit `-1`/`0`
-    // in the env keeps framing uncompressed. In-process live-TCP fixtures
-    // drive `handle` with a raw uncompressed client, so the test build keeps
-    // the old disabled default unless the env names a threshold.
-    let threshold =
-        connection_limits::compression_threshold_env(|name| std::env::var(name).ok());
-    let threshold = if cfg!(test)
-        && std::env::var_os("MEGU_COMPRESSION_THRESHOLD").is_none()
-    {
-        -1
-    } else {
-        threshold
-    };
-    let Ok(_compression_registration) = negotiate_compression(&mut s, threshold) else {
-        return;
-    };
-    let compression = usize::try_from(threshold).ok();
-    let mut ls = Vec::new();
-    ls.extend_from_slice(&uuid);
-    write_str(&mut ls, &name);
-    write_varint(&mut ls, 0);
-    ls.push(0);
-    if send_packet(&mut s, 2, ls).is_err() {
-        return;
-    }
-    match read_preplay_frame(&mut s, login_deadline, compression, &mut preplay_rate) {
-        Some((3, _)) => {}
-        _ => return,
-    }
-    // ---- config ----
-    let mut client_view: i32 = 8;
-    let cfg = load_config_packets();
-    // The phase runs on the shared exchange: the captured stream replays up
-    // to `select_known_packs`, the `0x07`/`0x03` answers are awaited while the
-    // `ConfigLink` keep-alive cadence, pong/cookie/pack-response servicing
-    // and rate limiting run inline — vanilla's configuration listener, not a
-    // bare replay. `rx` buffers partial frames across the poll timeouts.
-    let mut rx = RxBuf::new(compression);
-    let mut link = ConfigLink::new(client_view);
-    if !run_config_exchange(&mut s, &mut rx, &cfg, compression, &mut preplay_rate, &mut link, false) {
-        return;
-    }
-    client_view = link.client_view;
-    // ---- play ----
-    // P2-3-S4: read the saved dimension BEFORE 0x2b so Join Game and the first chunk
-    // window both name the world the player actually logged out in. The 0x2b payload and
-    // the camera position must agree or the client asks for chunks from the wrong generator.
-    let player_uuid: [u8; 16] = uuid.as_slice().try_into().unwrap();
-    let saved_player = saved_players().lock().unwrap_or_else(|e| e.into_inner()).get(&player_uuid).cloned();
-    let (saved_dim, sx, sy, sz, syaw, spitch) = saved_player
-        .as_ref()
-        .map(|save| save.position)
-        .or_else(|| pos_store().lock().unwrap_or_else(|e| e.into_inner()).get(&name).copied())
-        .unwrap_or_else(|| {
-            let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-            // `spawnRadius`: a first join scatters inside the radius square
-            // around world spawn instead of landing on the exact point.
-            let [bx, by, bz] = resolve_world_spawn_pos(
-                [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
-                spawn_radius_blocks(),
-                world_rng::next_u64(),
-            );
-            (DimId::Overworld, bx as f64 + 0.5, by as f64, bz as f64 + 0.5, w.3, 0.0)
-        });
-    let player_eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-    let initial_gm = saved_player
-        .as_ref()
-        .map_or_else(|| DEFAULT_GAME_MODE.load(Ordering::Relaxed), |save| save.gamemode);
-    let initial_held = saved_player.as_ref().map_or(0, |save| save.held.clamp(0, 8));
-    if send_packet(&mut s, 0x2b, join_game(saved_dim, initial_gm, player_eid)).is_err() {
-        return;
-    }
-    // vanilla `PlayerList.placeNewPlayer` follows Join Game with
-    // `ClientboundServerDataPacket`: the MOTD component plus the optional
-    // server icon (raw PNG bytes when `server-icon.png` validated).
-    {
-        let motd = std::env::var("MEGU_MOTD").unwrap_or_else(|_| "megu".to_owned());
-        let icon = if status_favicon().is_some() {
-            std::fs::read("server-icon.png").ok()
-        } else {
-            None
-        };
-        let _ = send_packet(
-            &mut s,
-            0x4b,
-            encode_play_server_data(&motd, icon.as_deref()).1,
-        );
-    }
-    send_view_distance(&mut s, client_view.clamp(2, live_view_distance()));
-    let login_admin = verified_permission_level(&uuid_text(&uuid), &name, authenticated) >= 2;
-    if send_commands(&mut s, login_admin).is_err() {
-        return;
-    }
-    let _ = send_packet(&mut s, 0x53, vec![initial_held as u8]);
-    let mut vp = Vec::new();
-    write_varint(&mut vp, i64::from((sx.floor() as i32).div_euclid(16)));
-    write_varint(&mut vp, i64::from((sz.floor() as i32).div_euclid(16)));
-    let _ = send_packet(&mut s, 0x54, vp);
-    let spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = send_packet(&mut s, 0x56, spawn_position_packet(spawn));
-    let mut gs = vec![13u8];
-    gs.extend_from_slice(&0f32.to_be_bytes());
-    let _ = send_packet(&mut s, 0x22, gs);
-    if RAINING.load(Ordering::Relaxed) > 0 {
-        let mut rp = vec![1u8];
-        rp.extend_from_slice(&0f32.to_be_bytes());
-        let _ = send_packet(&mut s, 0x22, rp);
-        if THUNDERING.load(Ordering::Relaxed) > 0 {
-            let mut tp = vec![8u8];
-            tp.extend_from_slice(&1f32.to_be_bytes());
-            let _ = send_packet(&mut s, 0x22, tp);
-        }
-    }
-    let mut sent: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
-    let mut gen: GenSources = GenSources::new();
-    let mut view = client_view.clamp(2, live_view_distance());
-    let mut chunk_ack = connection_limits::chunk_feedback(window_batch(view));
-    let mut chunk_delivery = connection_limits::ChunkDelivery::default();
-    let initial_window = initial_chunk_window(sx, sz);
-    // vanilla: a returning player resumes where they logged out — the chunk window,
-    // spawn teleport and authoritative pos all agree. The dimension was read above,
-    // before Join Game, and is threaded through the first stream as well. The join
-    // lane starts occluded unless the saved position is already underground.
-    let initial_occluded = should_occlude_underground(
-        saved_dim,
-        sy,
-        height_at_dim(saved_dim, sx.floor() as i32, sz.floor() as i32),
-        initial_gm,
-        false,
-    );
-    stream_chunks(
-        &mut s,
-        &mut sent,
-        &mut gen,
-        &mut chunk_ack,
-        saved_dim,
-        initial_window,
-        syaw,
-        true,
-        Some(&mut chunk_delivery),
-        initial_occluded,
-        initial_gm != 3 || gamerule_live_value("spectatorsGenerateChunks") != 0,
-    );
-    let mut tm = Vec::new();
-    tm.extend_from_slice(&0i64.to_be_bytes());
-    tm.extend_from_slice(&6000i64.to_be_bytes());
-    let _ = send_packet(&mut s, 0x64, tm);
-    let mut teleport = connection_limits::TeleportSync::default();
-    let initial_id = teleport.begin();
-    send_prepared_teleport(&mut s, &mut teleport, (sx, sy, sz, syaw, spitch), initial_id);
-    let mut ab = vec![0x0du8];
-    ab.extend_from_slice(&0.05f32.to_be_bytes());
-    ab.extend_from_slice(&0.1f32.to_be_bytes());
-    let _ = send_packet(&mut s, 0x38, ab);
-    let _ = send_packet(
-        &mut s,
-        0x0b,
-        vec![DIFFICULTY.load(Ordering::Relaxed), 0],
-    );
-    // `GameRules.sendGameRulesToPlayer` on `PlayerList.placeNewPlayer`: entity
-    // event 22 on the joining player's own entity turns reduced F3 debug on,
-    // 23 restores the full readout.
-    let debug_status: i8 = if gamerule_live_value("reducedDebugInfo") != 0 {
-        22
-    } else {
-        23
-    };
-    let _ = send_packet(&mut s, 0x1f, entity_event_pkt(player_eid, debug_status));
-    let mut xp = Vec::new();
-    xp.extend_from_slice(&saved_player.as_ref().map_or(0.0, |save| save.xp_progress).to_be_bytes());
-    write_varint(&mut xp, saved_player.as_ref().map_or(0, |save| save.xp_level) as i64);
-    write_varint(&mut xp, saved_player.as_ref().map_or(0, |save| save.xp_total));
-    let _ = send_packet(&mut s, 0x5c, xp);
-    let mut hp = Vec::new();
-    hp.extend_from_slice(&saved_player.as_ref().map_or_else(|| max_hp_of(&name), |save| save.health).to_be_bytes());
-    write_varint(&mut hp, saved_player.as_ref().map_or(20, |save| save.food) as i64);
-    hp.extend_from_slice(&saved_player.as_ref().map_or(5.0, |save| save.saturation).to_be_bytes());
-    let _ = send_packet(&mut s, 0x5d, hp);
-    // Live mod suite: the armed `megu:mod_sync_v1` (MSY1) manifest rides
-    // the play-phase 0x19 custom payload. No-op unless an operator manifest
-    // validated at boot (default builds send nothing new).
-    live_mod_sync_on_join(&mut s);
-    // Create (`mod-suite`): the current kinetic snapshot rides the same
-    // play-phase 0x19 channel so late joiners see spinning wheels/shafts.
-    live_create_sync_on_join(&mut s);
-    // Live mod suite (`mod-suite`): the dynamic `megu:mod_registry_sync_v1`
-    // (`MRS1`) block-state/item registry rides the same channel so clients
-    // can name modded ids from the first chunk packet. No-op on vanilla.
-    live_mod_registry_sync_on_join(&mut s);
-    if let Some(rp) = resource_pack_pkt() {
-        let _ = send_packet(&mut s, 0x46, rp);
-    }
-    // ---- configured session packets (all opt-in; a default server sends
-    // none of them) ----
-    // `cookie_request`/`store_cookie`: `MEGU_COOKIE_REQUEST` is a `;`-list
-    // of keys to query and `MEGU_STORE_COOKIE` a `;`-list of `key=value`
-    // pairs to persist — the answers land on the 0x11 cookie_response branch.
-    if let Ok(keys) = std::env::var("MEGU_COOKIE_REQUEST") {
-        for key in keys.split(';').map(str::trim).filter(|k| !k.is_empty()) {
-            let _ = send_play_cookie_request(&mut s, key);
-        }
-    }
-    if let Ok(pairs) = std::env::var("MEGU_STORE_COOKIE") {
-        for pair in pairs.split(';').map(str::trim).filter(|p| !p.is_empty()) {
-            if let Some((key, value)) = pair.split_once('=') {
-                let _ = send_play_store_cookie(&mut s, key, value.as_bytes());
-            }
-        }
-    }
-    // `custom_report_details` / `server_links` ride the play phase when
-    // configured, the same as a mid-session vanilla push.
-    if let Ok(details) = std::env::var("MEGU_REPORT_DETAILS") {
-        let entries: Vec<(&str, &str)> = details
-            .split(';')
-            .filter_map(|pair| pair.split_once('='))
-            .collect();
-        if !entries.is_empty() {
-            let (_, payload) = encode_play_custom_report_details(&entries);
-            let _ = send_packet(&mut s, 0x7a, payload);
-        }
-    }
-    if let Ok(links) = std::env::var("MEGU_SERVER_LINKS") {
-        // `builtin:<id>=<url>` or `<text>=<url>`; text labels ride a component
-        // built by the same `text_component_nbt` as /title.
-        let mut parsed: ParsedServerLinks<'_> = Vec::new();
-        for entry in links.split(';').map(str::trim).filter(|e| !e.is_empty()) {
-            let Some((label, url)) = entry.split_once('=') else {
-                continue;
-            };
-            if let Some(builtin) = label
-                .strip_prefix("builtin:")
-                .and_then(|v| v.trim().parse::<u32>().ok())
-            {
-                parsed.push((Some(builtin), None, url));
+fn play_c2s_world_interaction(
+    cx: &mut PlayPacketContext<'_>,
+    pid: i64,
+    b: &[u8],
+) -> PlayPacketControl {
+    let me = Arc::clone(cx.me);
+    let held_slot = *cx.held_slot;
+    match pid {
+        0x24 => {
+            // block_dig
+            let mut sl = b;
+            let status = read_varint(&mut sl).unwrap_or(-1);
+            let (x, y, z) = if sl.len() >= 8 {
+                read_pos(&sl[..8])
             } else {
-                parsed.push((None, Some(text_component_nbt(label)), url));
-            }
-        }
-        if !parsed.is_empty() {
-            let wire: Vec<(PlayServerLinkLabel<'_>, &str)> = parsed
-                .iter()
-                .filter_map(|(builtin, custom, url)| match (builtin, custom) {
-                    (Some(builtin), _) => Some((PlayServerLinkLabel::BuiltIn(*builtin), *url)),
-                    (_, Some(nbt)) => Some((PlayServerLinkLabel::Custom(nbt.as_slice()), *url)),
-                    _ => None,
-                })
-                .collect();
-            let (_, payload) = encode_play_server_links(&wire);
-            let _ = send_packet(&mut s, 0x7b, payload);
-        }
-    }
-    // `PlayerList.placeNewPlayer` recipe-book order: UpdateRecipes, then the
-    // recipe-book INIT carrying the player's settings and highlights; the
-    // tab-list header/footer pair is opt-in like Vanilla's dedicated server
-    // files rather than the single `header` key some forks expose.
-    {
-        let book = player_recipe_book(player_uuid);
-        let _ = send_packet(&mut s, 0x77, encode_update_recipes(&update_recipes_entries()));
-        let init = UpdateRecipesBook {
-            action: RecipeBookAction::Init,
-            settings: book.settings,
-            recipes: book.unlocked.iter().cloned().collect(),
-            to_highlight: book.to_highlight(),
-        };
-        let _ = send_packet(&mut s, 0x41, encode_update_recipes_book(&init));
-        if let Ok(header) = std::env::var("MEGU_TABLIST_HEADER") {
-            let footer = std::env::var("MEGU_TABLIST_FOOTER").unwrap_or_default();
-            let _ = send_packet(&mut s, 0x6d, encode_tab_list(&header, &footer));
-        }
-    }
-    // restore saved inventory for this name
-    let saved_inv = saved_player
-        .as_ref()
-        .map(|save| save.inventory.clone())
-        .or_else(|| inv_store().lock().unwrap_or_else(|e| e.into_inner()).get(&name).cloned());
-    eprintln!(
-        "[spine] {} joined from {} (uuid {})",
-        name,
-        peer,
-        hex(&uuid)
-    );
-    // ---- multiplayer: register self, tell others, learn others ----
-    let Ok(writer) = s.try_clone() else { return };
-    // The play writer is a second fd on the same socket; the cipher armed on
-    // `s` during the encryption handshake must cover it or broadcasts to this
-    // client would leave in the clear.
-    if let Some(cipher) = conn_cipher(&s) {
-        wire_state_or_insert(socket_key(&writer))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cipher = Some(cipher);
-    }
-    let me = Arc::new(Client {
-        eid: player_eid,
-        uuid: player_uuid,
-        name: name.clone(),
-        player_attack_damage_id: player_attack_damage_wire_id(&cfg),
-        pos: Mutex::new((sx, sy, sz, syaw, spitch, true)),
-        teleport: Mutex::new(teleport),
-        hp: Mutex::new(saved_player.as_ref().map_or(20.0, |save| save.health)),
-        sock: Mutex::new(writer),
-        inv: Mutex::new(saved_inv.unwrap_or_default()),
-        cursor: Mutex::new((0, 0, Vec::new())),
-        drag: Mutex::new((-1, Vec::new())),
-        open_chest: Mutex::new(None),
-        chest_sync: Mutex::new(None),
-        open_furnace: Mutex::new(None),
-        craft: Mutex::new(HashMap::new()),
-        craft9: Mutex::new(HashMap::new()),
-        open_table: Mutex::new(false),
-        #[cfg(test)]
-        open_merchant: Mutex::new(false),
-        #[cfg(test)]
-        trade_sel: Mutex::new(-1),
-        #[cfg(test)]
-        merchant_in: Mutex::new(Default::default()),
-        bow_draw: Mutex::new(None),
-        dig: Mutex::new(None),
-        eat_start: Mutex::new(None),
-        blocking: Mutex::new(false),
-        sprinting: Mutex::new(false),
-        sneaking: Mutex::new(false),
-        last_melee: Mutex::new(Instant::now() - Duration::from_secs(10)),
-        fall_fly: Mutex::new(false),
-        invulnerable: Mutex::new(0),
-        last_hurt: Mutex::new(0.0),
-        shield_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-        absorb: Mutex::new(saved_player.as_ref().map_or(0.0, |save| save.absorption)),
-        pearl_cd: Mutex::new(Instant::now() - Duration::from_secs(10)),
-        seen: Mutex::new(HashSet::new()),
-        chunks: Mutex::new(HashSet::new()),
-        chunk_ack: Mutex::new(chunk_ack),
-        gen_sources: Mutex::new(gen),
-        xp: Mutex::new(saved_player.as_ref().map_or(0, |save| save.xp_total)),
-        gm: Mutex::new(initial_gm),
-        fall_from: Mutex::new(sy),
-        food: Mutex::new(saved_player.as_ref().map_or(20, |save| save.food)),
-        air: Mutex::new(server_ticks(AIR_SUPPLY_GT) as i32),
-        armor_pts: Mutex::new(0),
-        sat: Mutex::new(saved_player.as_ref().map_or(5.0, |save| save.saturation)),
-        walk_acc: Mutex::new(saved_player.as_ref().map_or(0.0, |save| save.exhaustion)),
-        lastp: Mutex::new((sx, sy, sz)),
-        spawn_pt: Mutex::new(saved_player.as_ref().and_then(|save| save.respawn.map(|point| {
-            (point.position.0, point.position.1, point.position.2, point.angle)
-        }))),
-        dim: Mutex::new(saved_dim),
-        view: Mutex::new(view),
-        spawn_dim: Mutex::new(saved_player.as_ref().and_then(|save| save.respawn.map(|point| point.dim)).unwrap_or(saved_dim)),
-        in_portal: Mutex::new(false),
-        portal_at: Mutex::new(None),
-        skin: Mutex::new(login_skin.clone()),
-        held: Mutex::new(initial_held),
-        effs: Mutex::new(saved_player.as_ref().map_or_else(Vec::new, |save| {
-            save.effects.iter().map(|&(id, amp, left)| Eff { id, amp, left }).collect()
-        })),
-        lod_v1_enabled: AtomicBool::new(false),
-        underground_revealed: AtomicBool::new(!initial_occluded),
-        sleeping: Mutex::new(None),
-        inv_state_id: AtomicI32::new(0),
-        generic_kill_pending: AtomicBool::new(false),
-        use_on_resend: Mutex::new(None),
-    });
-    // Published to the panic cleanup in `handle` before the client list sees
-    // the player, so a panic anywhere below still unregisters this eid.
-    live_eid.store(me.eid, Ordering::SeqCst);
-    if authenticated {
-        mark_authenticated(me.eid);
-    }
-    let mut retry_chunks = chunk_delivery.has_pending();
-    if !me.enter_play_wire(compression, chunk_delivery) {
-        return;
-    }
-    // `PlayerList.placeNewPlayer` -> `inventoryMenu.sendAllDataToRemote`: the
-    // joining client gets one full window-0 SetContainerContent whose stateId
-    // consumes the first increment, so the first slot echo carries state 2.
-    resend_container_content(&me, 0);
-    {
-        let border = world_border().lock().unwrap_or_else(|e| e.into_inner());
-        let board = scoreboard().lock().unwrap_or_else(|e| e.into_inner());
-        let mut tracker = player_advancements().lock().unwrap_or_else(|e| e.into_inner());
-        restore_player_advancements(&mut tracker, &me.name);
-        {
-            let mut w = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-            let now = border_now_ms();
-            let mut snapshot = *border;
-            snapshot.finish_lerp(now);
-            let (id, body) = snapshot.initialize_packet(now);
-            let _ = send_packet(&mut w, id, body);
-            let _ = sync_scoreboard(&mut w, &board);
-        }
-        send_advancement_delta(&mut tracker, &me, true);
-        player_mechanism_sessions().lock().unwrap_or_else(|e| e.into_inner()).insert(
-            me.eid,
-            PlayerMechanismSession {
-                xp_bar: saved_player.as_ref().map_or((0, 0.0), |save| (save.xp_level, save.xp_progress)),
-                food_timer: 0,
-                menus: Arc::new(LiveMenuConnection {
-                    active: Mutex::new(None),
-                    next_id: std::sync::atomic::AtomicU8::new(4),
-                    enchantment_seed: Mutex::new(saved_player_enchantment_seed(&me.uuid)
-                        .unwrap_or_else(|| i32::from_be_bytes(me.uuid[..4].try_into().unwrap()))),
-                }),
-            },
-        );
-    }
-    if let Some(save) = saved_player.as_ref() {
-        chests().lock().unwrap_or_else(|e| e.into_inner()).insert(
-            ender_container_key(&me.uuid),
-            save.ender_chest.clone(),
-        );
-        for &(id, amp, left) in &save.effects {
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x76, entity_effect_pkt(me.eid, id, amp, left));
-        }
-    }
-    // Java sees the login before the tick thread can snapshot this player.
-    #[cfg(feature = "neoforge-events")]
-    if java_compat::NEOFORGE.get().is_some() {
-        let _ = neoforge_event(&me, java_compat::S1Event::PlayerLogin(me.eid, me.name.clone()));
-    }
-    {
-        // Match bossbar command lock order so a joining member receives one Add.
-        let bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
-        let mut cls = clients().lock().unwrap_or_else(|e| e.into_inner());
-        *me.chunks.lock().unwrap_or_else(|e| e.into_inner()) = sent;
-        for c in cls.iter() {
-            // tab-list info is global (vanilla keeps it world-wide);
-            // the ENTITY spawn is interest-gated — the sweep sends it
-            // only once the other player enters visible range.
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x3e, player_info_add(c));
-            let pi = player_info_add(&me);
-            if let Ok(mut w) = c.sock.lock() {
-                let _ = send_packet(&mut w, 0x3e, pi.clone());
-            }
-        }
-        cls.push(me.clone());
-        // Vanilla `PlayerList.placeNewPlayer` chat completions: the joiner
-        // gets `add` for every online name, everyone else `add` for theirs.
-        let names: Vec<String> = cls.iter().map(|c| c.name.clone()).collect();
-        let (_, all_names) = encode_play_custom_chat_completions(0, &names);
-        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, all_names);
-        let (_, joined_name) =
-            encode_play_custom_chat_completions(0, std::slice::from_ref(&me.name));
-        for c in cls.iter().filter(|c| c.eid != me.eid) {
-            let _ = send_packet(&mut c.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x18, joined_name.clone());
-        }
-        for (id, bar) in bars.iter().filter(|(_, bar)| bar.shown_to(&me)) {
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x0a, bossbar_pkt(id, 0, Some(bar)));
-        }
-    }
-    // Armed the moment the client is on the online list: the guard's `Drop`
-    // runs the whole disconnect teardown when this function's scope ends —
-    // a clean `'conn` break and a panic unwind take the same path. `handle`'s
-    // `forget_live_client` then sweeps anything a mid-unwind teardown missed.
-    let _disconnect_guard = ConnectionCleanupGuard::new(me.clone(), &peer, login);
-    // An operator change can happen during the initial chunk stream, before
-    // the client is present in the online list used by /op and /reload.
-    if login_admin != client_is_admin(&me) {
-        update_client_commands(&me);
-    }
-    // A forwarded or session-verified skin is already on `me`; only run the
-    // offline Mojang lookup when login left the player skinless.
-    if login_skin.is_none() {
-        kick_skin(name.clone(), &me);
-    }
-    // refresh armor points from restored inventory
-    {
-        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
-    }
-    // Answers that landed during the configuration phase carry over: a
-    // requested cookie response keyed by name and a pong probe keyed by eid,
-    // matching how the play-phase `0x11`/`0x27` handlers store them.
-    if !link.cookies.is_empty() {
-        client_cookies()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(me.eid, std::mem::take(&mut link.cookies));
-    }
-    if let Some(pong) = link.last_pong {
-        last_client_pongs()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(me.eid, pong);
-    }
-    send_attrs(&me);
-    // echo restored inventory slots so the client sees them
-    {
-        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-        for (&slot, st) in inv.iter() {
-            let mut p = vec![0u8];
-            write_varint(&mut p, i64::from(inv_state_next(&me)));
-            p.extend_from_slice(&slot.to_be_bytes());
-            p.extend_from_slice(&slot_wire(st));
-            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-        }
-    }
-    {
-        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-        // mobs/drops stream via interest_tick (distance-gated)
-        drop(ms);
-        // drops/xp/mobs stream via interest_tick (distance-gated)
-    }
-    // Opt-in minimap fair-play (`MEGU_FAIR_PLAY` or `/megu policy`
-    // `minimap_mode`, default off): the control code goes out once here, on
-    // play join. Off by default — nothing is sent unless the operator armed
-    // the flag or restricted the map.
-    {
-        let policy = map_fair_play_policy();
-        if policy.fair_play {
-            eprintln!(
-                "[spine] {} map fair-play on: cave_map={} entity_radar={}",
-                me.name, policy.allow_cave_map, policy.allow_entity_radar
-            );
-        }
-        for chat in map_fair_play_join_chats(&policy) {
-            let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-            let _ = send_packet(&mut sock, 0x6c, chat);
-        }
-    }
-    // ---- consume loop ----
-    s.set_write_timeout(Some(Duration::from_secs(2))).ok();
-    let mut keepalive = connection_limits::KeepaliveState::new(Instant::now());
-    let mut next_keepalive_id = 1i64;
-    // The instant the outstanding keepalive challenge went out, mirrored so a
-    // matching reply can be turned into a round-trip measurement.
-    let mut keepalive_sent_at: Option<Instant> = None;
-    let mut held_slot: i16 = initial_held;
-    // `EntityEquipment.setChanged` baseline: every consumed packet may touch
-    // the menu (hotbar switch, armor drag, plugin write), so the loop head
-    // diffs the live view and ships one sparse SetEquipment.
-    let mut last_equipment = player_equipment(&me);
-
-    // Reuse the configuration-phase reader: a pipelining client can already
-    // have play packets buffered behind its `0x03` finish acknowledgement,
-    // and a fresh buffer would silently drop them.
-    // Play-state packet inactivity is tracked separately from the keep-alive deadline.
-    let mut last_rx = Instant::now();
-    let mut chat_throttle = connection_limits::ChatThrottle::new(Instant::now());
-    let mut packet_rate = connection_limits::PacketRateLimit::new(Instant::now());
-    let mut move_guard = ingress_guard::MovementFloodGuard::new();
-    let mut read_timeout = None;
-    let mut last_chunk_retry_tick = TICK_IDX.load(Ordering::Relaxed);
-    'conn: loop {
-        drop_player_items_on_death(&me);
-        {
-            let equipment_now = player_equipment(&me);
-            if let Some(packet) =
-                encode_set_equipment_changes(me.eid, &last_equipment, &equipment_now)
-            {
-                last_equipment = equipment_now;
-                broadcast_seen_packet(me.eid, 0x5b, &packet);
-            }
-        }
-        use connection_limits::KeepaliveAction;
-        match keepalive.tick(Instant::now(), next_keepalive_id) {
-            KeepaliveAction::Send(id) => {
-                if send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x26, id.to_be_bytes().to_vec())
-                    .is_err()
-                {
-                    break 'conn;
-                }
-                // vanilla `ServerGamePacketListenerImpl.tick` also probes the
-                // client with ClientboundPingPacket on its connection-alive
-                // cadence; the C2S 0x27 answer lands on `last_client_pongs`.
-                if send_packet(
-                    &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                    0x35,
-                    encode_play_ping(id as i32).1,
-                )
-                .is_err()
-                {
-                    break 'conn;
-                }
-                keepalive_sent_at = Some(Instant::now());
-                next_keepalive_id = next_keepalive_id.wrapping_add(1);
-            }
-            KeepaliveAction::TimedOut => {
-                play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
-                break 'conn;
-            }
-            KeepaliveAction::Wait => {}
-        }
-        // ACKs and movement can wake delivery immediately. An eligible backlog
-        // gets another chance on the next tick, even during continuous input.
-        let tick = TICK_IDX.load(Ordering::Relaxed);
-        if retry_chunks && tick != last_chunk_retry_tick {
-            let __p0 = Instant::now();
-            retry_chunks = pump_client_chunks(&me, false);
-            let __pe = __p0.elapsed();
-            if conn_prof() && __pe > std::time::Duration::from_millis(50) {
-                eprintln!("[conn-prof] pump_client_chunks {:?}", __pe);
-            }
-            last_chunk_retry_tick = tick;
-        }
-        let timeout = if retry_chunks {
-            Duration::from_millis(TICK_MS)
-        } else {
-            Duration::from_secs(2)
-        };
-        if read_timeout != Some(timeout) {
-            s.set_read_timeout(Some(timeout)).ok();
-            read_timeout = Some(timeout);
-        }
-        // A client that stopped answering chunk batches is gone, even on an idle socket.
-        if me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner()).timed_out(Instant::now()) {
-            eprintln!(
-                "[spine] {} disconnected: chunk batch acknowledgement timeout",
-                me.name
-            );
-            break 'conn;
-        }
-        // A datapack publish that carries synced-registry content re-enters
-        // the configuration phase mid-play (`0x69`), the same lane vanilla's
-        // `startConfiguration` re-entry takes.
-        if reconfigure_pending()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&me.eid)
-        {
-            eprintln!("[spine] {} re-entering configuration after content revision", me.name);
-            if !play_reconfigure_exchange(&me, &mut s, &mut rx, compression, &mut packet_rate, &mut view) {
-                break 'conn;
-            }
-            // Vanilla's fresh common listener restarts the keep-alive clock on
-            // re-entry; the exchange just consumed every in-flight answer.
-            keepalive = connection_limits::KeepaliveState::new(Instant::now());
-            keepalive_sent_at = None;
-            last_rx = Instant::now();
-            read_timeout = None;
-        }
-        let (pid, b) = match rx.next(&mut s) {
-            RxOut::Closed => break 'conn,
-            RxOut::Idle => {
-                let idle_limit = connection_limits::idle_timeout();
-                if !idle_limit.is_zero() && last_rx.elapsed() > idle_limit {
-                    eprintln!(
-                        "[spine] {} disconnected: no packet for {:?}",
-                        me.name, idle_limit
-                    );
-                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
-                    break 'conn;
-                }
-                // A dimension change initiated by another connection can
-                // create a backlog even while this connection is idle.
-                let tick = TICK_IDX.load(Ordering::Relaxed);
-                if tick != last_chunk_retry_tick {
-                    let __p0 = Instant::now();
-                    retry_chunks = pump_client_chunks(&me, false);
-                    let __pe = __p0.elapsed();
-                    if conn_prof() && __pe > std::time::Duration::from_millis(50) {
-                        eprintln!("[conn-prof] idle pump_client_chunks {:?}", __pe);
-                    }
-                    last_chunk_retry_tick = tick;
-                }
-                continue;
-            }
-            RxOut::Frame(pid, b) => {
-                last_rx = Instant::now();
-                (pid, b)
-            }
-        };
-        drop_player_items_on_death(&me);
-
-        // Count every decoded Play packet before any downstream parsing or
-        // dispatch: a movement flood otherwise multiplies tracker fanout.
-        let received_at = Instant::now();
-        if !packet_rate.allow(received_at) {
-            if packet_rate.should_disconnect(received_at) {
-                eprintln!("[spine] {} disconnected after {} rate-limited play packets", me.name, packet_rate.dropped());
-                play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Packet rate limit exceeded");
-                break 'conn;
-            }
-            continue 'conn;
-        }
-
-        // vanilla refuses a movement update whose position is not finite or is
-        // outside the world; letting it through carries the value into worldgen,
-        // visibility and every float-to-int conversion behind them.
-        if !ingress_guard::valid_movement_frame(pid, &b) {
-            eprintln!("[spine] {} disconnected: malformed movement frame", me.name);
-            break 'conn;
-        }
-
-        let __d1 = Instant::now();
-        match pid {
-            0x00 => {
-                let mut payload = b.as_slice();
-                if let Some(id) = read_protocol_i32(&mut payload).filter(|_| payload.is_empty()) {
-                    me.teleport.lock().unwrap_or_else(|e| e.into_inner()).confirm(id);
-                    // v2: the confirm echoes the matching transaction —
-                    // pending velocity/teleport grants activate and the
-                    // confirmed RTT folds into lag compensation.
-                    ac_note_tx_confirm(&me, i64::from(id));
-                    retry_chunks = pump_client_chunks(&me, false);
-                }
-            }
-            0x18 => {
-                if !keepalive.reply(Instant::now(), &b) {
-                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Timed out");
-                    break 'conn;
-                }
-                // A reply that matched the pending challenge is a measured
-                // round-trip: feed it into the OPS-2 lag-compensation envelope
-                // so latency spikes do not read as movement cheats.
-                if let Some(sent_at) = keepalive_sent_at.take() {
-                    let rtt_ms =
-                        sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
-                    ac_note_player_rtt_ms(me.eid, rtt_ms);
-                }
-            }
-            0x02 => {
-                // Serverbound change difficulty: difficulty byte + locked flag.
-                // A `lock_difficulty`-locked world refuses further changes —
-                // vanilla `LevelData.setDifficulty` does the same refusal.
-                if DIFFICULTY_LOCKED.load(Ordering::Relaxed) == 0
-                    && b.len() == 2
-                    && b[0] <= 3
-                    && b[1] <= 1
-                    && client_is_admin(&me)
-                {
-                    set_difficulty(b[0]);
-                }
-            }
-            0x08 => {
-                // Java 1.21.1 Chunk Batch Received: desired chunks per tick, four
-                // big-endian f32 bytes. Answering it opens the next batch.
-                let acked = {
-                    let mut ack = me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner());
-                    ack.acknowledge(&b)
-                };
-                if let Err(why) = acked {
-                    eprintln!("[spine] {} disconnected: {why}", me.name);
-                    break 'conn;
-                }
-                retry_chunks = pump_client_chunks(&me, false);
-            }
-            0x0a => {
-                let Some(requested) = client_info_view_distance(&b) else {
-                    break 'conn;
-                };
-                let effective = requested.clamp(2, live_view_distance());
-                if effective != view {
-                    view = effective;
-                    *me.view.lock().unwrap_or_else(|e| e.into_inner()) = view;
-                    send_view_distance(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), view);
-                    connection_limits::set_chunk_feedback_window(
-                        &mut me.chunk_ack.lock().unwrap_or_else(|e| e.into_inner()),
-                        window_batch(view),
-                    );
-                    retry_chunks = pump_client_chunks(&me, true);
-                }
-            }
-            id if id == i64::from(brigadier_wire::SERVERBOUND_COMMAND_SUGGESTION) => {
-                reply_to_command_suggestion(&me, &b);
-            }
-            0x1a | 0x1b => {
-                // position / position_look: f64 x,y,z first
-                if b.len() >= 24 {
-                    if !move_guard.allow_tick(TICK.load(Ordering::Relaxed)) {
-                        continue;
-                    }
-                    let px = f64::from_be_bytes(b[..8].try_into().unwrap());
-                    let py = f64::from_be_bytes(b[8..16].try_into().unwrap());
-                    let pz = f64::from_be_bytes(b[16..24].try_into().unwrap());
-                    if !me.teleport.lock().unwrap_or_else(|e| e.into_inner()).movement_allowed() {
-                        continue;
-                    }
-                    // Anti-cheat runs before any lock is taken: it reads attributes, effects
-                    // and blocks around the player, and may pull the player back.
-                    let before = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let claimed = if pid == 0x1b && b.len() >= 33 {
-                        b[32] != 0
-                    } else if pid == 0x1a && b.len() >= 25 {
-                        b[24] != 0
-                    } else {
-                        before.5
-                    };
-                    // `disableElytraMovementCheck`: a gliding player's position
-                    // packets skip the anti-cheat envelope when the rule is on —
-                    // vanilla skips the same moved-too-quickly check for
-                    // `isFallFlying` under the gamerule.
-                    let checked_gnd = if *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner())
-                        && gamerule_live_value("disableElytraMovementCheck") != 0
-                    {
-                        claimed
-                    } else {
-                        match ac_check_move(
-                            &me,
-                            (before.0, before.1, before.2),
-                            (px, py, pz),
-                            claimed,
-                        ) {
-                            AcMoveVerdict::Accept { ground } => ground,
-                            AcMoveVerdict::Setback => {
-                                ac_setback(&me, before);
-                                continue;
-                            }
-                        }
-                    };
-                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
-                    if !teleport.movement_allowed() {
-                        continue;
-                    }
-                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let (mut yaw, mut pitch, gnd) = (p.3, p.4, checked_gnd);
-                    if pid == 0x1b && b.len() >= 33 {
-                        yaw = f32::from_be_bytes(b[24..28].try_into().unwrap());
-                        pitch = f32::from_be_bytes(b[28..32].try_into().unwrap());
-                    }
-                    let prev_gnd = p.5;
-                    *p = (px, py, pz, yaw, pitch, gnd);
-                    drop(p);
-                    // Vanilla wakes on an actual positional displacement. Idle
-                    // position/look keepalives that reassert the same coordinate
-                    // must not cancel sleep or hide the Leave Bed UI.
-                    let moved = (px - before.0).powi(2) + (py - before.1).powi(2) + (pz - before.2).powi(2) > 1.0e-6;
-                    if moved {
-                        wake_if_sleeping(&me);
-                        dispatch_player_shrieker_vibration(&me, (px, py, pz));
-                    }
-                    drop(teleport);
-                    landing::player_move(&me, prev_gnd);
-                    // Portal waits advance on the game tick (vanilla
-                    // `handleInsidePortal`), not on movement packets — a player
-                    // standing still in a portal must still transit, and a
-                    // single caller keeps the arrival guard race-free.
-                    // A vertical move inside the same chunk window still crosses the
-                    // occlusion hysteresis (descending into a cave); the lane flip
-                    // re-sends held chunks in the new lane. The window pump below
-                    // re-runs the same check as a no-op when nothing changed.
-                    if before.1 != py {
-                        update_underground_lane(&me);
-                    }
-                    let window = ChunkWindow::at(px, pz, view);
-                    let current = with_play_wire(&me.sock.lock().unwrap_or_else(|e| e.into_inner()), |play| {
-                        play.chunk_delivery.window()
-                    })
-                    .flatten();
-                    if current != Some(window) {
-                        if let Ok(pending) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            pump_client_chunks(&me, true)
-                        })) {
-                            retry_chunks = pending;
-                        }
-                    }
-                    if ingress_guard::movement_pose_changed(before, (px, py, pz, yaw, pitch, gnd)) {
-                        broadcast_seen(me.eid, |_c| {
-                            (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, gnd))
-                        });
-                        if pid == 0x1b {
-                            broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
-                        }
+                (0, 0, 0)
+            };
+            let seq = if sl.len() >= 9 {
+                let mut s2 = &sl[9..];
+                read_varint(&mut s2).unwrap_or(0)
+            } else {
+                0
+            };
+            if status == 5 {
+                // finish using item (bow release / lower shield)
+                *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                let eat0 = me.eat_start.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(_t0) = eat0 {
+                    // Vanilla releases after the 32-tick use duration;
+                    // an earlier release cancels consumption cleanly.
+                    if take_item_use_ticks(&me).is_some_and(|ticks| ticks >= server_ticks(32)) {
+                        air_use_item(&me, held_slot, seq, None, true);
+                        return PlayPacketControl::Skip;
                     }
                 }
-            }
-            0x1c => {
-                // look: yaw,pitch only
-                if b.len() >= 9 {
-                    let yaw = f32::from_be_bytes(b[..4].try_into().unwrap());
-                    let pitch = f32::from_be_bytes(b[4..8].try_into().unwrap());
-                    // The same rule `valid_movement_frame` applies to the
-                    // position packets: a non-finite angle must not reach `pos`,
-                    // the rotation broadcasts, or the projectile math that turns
-                    // yaw/pitch into velocities.
-                    if !yaw.is_finite() || !pitch.is_finite() {
-                        continue;
-                    }
-                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
-                    if !teleport.movement_allowed() {
-                        continue;
-                    }
-                    let at = {
-                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        (p.0, p.1, p.2)
-                    };
-                    let gnd = ac_effective_ground(&me, at, b[8] != 0);
-                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let prev_gnd = p.5;
-                    p.3 = yaw;
-                    p.4 = pitch;
-                    p.5 = gnd;
-                    let (px, py, pz, g) = (p.0, p.1, p.2, p.5);
-                    drop(p);
-                    drop(teleport);
-                    landing::player_move(&me, prev_gnd);
-                    broadcast_seen(me.eid, |_c| {
-                        (0x70, entity_teleport(me.eid, px, py, pz, yaw, pitch, g))
-                    });
-                    broadcast_seen(me.eid, |_c| (0x48, head_rot(me.eid, yaw)));
-                }
-            }
-            0x25 => {
-                // entity_action: sneak/sprint start/stop -> entity flags+pose
-                let mut sl = &b[..];
-                let _eid = read_varint(&mut sl);
-                if let Some(act) = read_varint(&mut sl) {
-                    match act {
-                        0 => *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = true,
-                        1 => *me.sneaking.lock().unwrap_or_else(|e| e.into_inner()) = false,
-                        2 => {
-                            wake_if_sleeping(&me);
-                        }
-                        3 | 4 => {
-                            *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = act == 3;
-                            // v2: sprint-while-using-item is impossible for
-                            // a vanilla client — the FSM keeps the proof.
-                            ac_v2_note_sprint(&me, act == 3);
-                        }
-                        7 => {
-                            // OPEN_INVENTORY: riding an equine opens its
-                            // inventory screen (`openHorseInventory`).
-                            open_horse_screen(&me);
-                        }
-                        // START_FALL_FLYING: only an intact Elytra in the
-                        // chest slot while airborne may enter pose 1.
-                        8 if can_start_fall_flying(&me) => {
-                            *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                        }
-                        _ => {}
-                    }
-                    if (0..=1).contains(&act) || (3..=4).contains(&act) || act == 8 {
-                        let sneak = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
-                        let sprint = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
-                        let glide = *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner());
-                        // flags: sneak=0x02 sprint=0x08 fall_flying=0x80 ; pose: sneak=5 fall_fly=1 else standing=0
-                        let mut p = Vec::new();
-                        write_varint(&mut p, me.eid as i64);
-                        p.push(0);
-                        p.push(0);
-                        p.push(((sneak as u8) * 2) | ((sprint as u8) * 8) | ((glide as u8) * 0x80));
-                        p.push(6);
-                        write_varint(&mut p, 21);
-                        write_varint(
-                            &mut p,
-                            if glide {
-                                1
-                            } else if sneak {
-                                5
-                            } else {
-                                0
-                            },
-                        );
-                        p.push(0xff);
-                        broadcast_seen_packet(me.eid, 0x58, &p);
-                    }
-                }
-            }
-            0x2f => {
-                // held_item_slot: i16 — `EntityEquipment.setChanged` for the
-                // new main hand is emitted by the loop-head equipment diff.
-                if b.len() >= 2 {
-                    held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
-                    *me.held.lock().unwrap_or_else(|e| e.into_inner()) = held_slot;
-                    // `MapItem.inventoryTick`: a filled_map in the new main
-                    // hand pushes its `map_item_data` once per map.
-                    send_held_map_data(&me, held_slot);
-                }
-            }
-            0x20 => {
-                // ServerboundPickItemPacket: one VarInt `slot` — an
-                // `Inventory.items` index the client already resolved
-                // (0..=8 hotbar, 9..=35 main inventory). The server runs
-                // `Inventory.pickSlot`; out-of-range values drop fail-closed.
-                let mut sl = &b[..];
-                if let Some(slot) = read_varint(&mut sl) {
-                    pick_item(&me, &mut held_slot, slot);
-                }
-            }
-            0x1d => {
-                // flying: onGround only
-                if !b.is_empty() {
-                    let teleport = me.teleport.lock().unwrap_or_else(|e| e.into_inner());
-                    if !teleport.movement_allowed() {
-                        continue;
-                    }
-                    let at = {
-                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        (p.0, p.1, p.2)
-                    };
-                    let gnd = ac_effective_ground(&me, at, b[0] != 0);
-                    let mut p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let prev_gnd = p.5;
-                    p.5 = gnd;
-                    drop(p);
-                    drop(teleport);
-                    landing::player_move(&me, prev_gnd);
-                }
-            }
-            0x1e => {
-                // ServerboundMoveVehiclePacket: the riding client drives the
-                // vehicle. `step_live_vehicle` runs the vanilla speed gate and
-                // credits the carry to anti-cheat, so riding never trips the
-                // mover checks.
-                if let Some(pkt) = decode_move_vehicle(&b) {
-                    step_live_vehicle(&me, &pkt);
-                }
-            }
-            0x1f => {
-                // ServerboundPaddleBoatPacket: remembered per vehicle for the
-                // boat-paddle animation state; it moves no world state itself.
-                if let Some(paddle) = decode_paddle_boat(&b) {
-                    if let Some(vehicle) = vehicle_of(me.eid) {
-                        mounts().lock().unwrap_or_else(|e| e.into_inner()).paddling.insert(vehicle, paddle);
-                    }
-                }
-            }
-            0x26 => {
-                // ServerboundPlayerInputPacket: the shift bit dismounts the
-                // rider (`Entity.stopRiding`), updating the vehicle's
-                // SetPassengers for every tracker. The rest of the input is
-                // the driver's steering for the live vehicle physics tick.
-                if let Some(input) = decode_player_input(&b) {
-                    if let Some(vehicle) = vehicle_of(me.eid) {
-                        if input.unmount {
-                            mounts().lock().unwrap_or_else(|e| e.into_inner()).steering.remove(&vehicle);
-                        } else {
-                            mounts().lock().unwrap_or_else(|e| e.into_inner()).steering.insert(vehicle, input);
-                        }
-                    }
-                    if input.unmount {
-                        player_dismount(&me, true);
-                    }
-                }
-            }
-            0x24 => {
-                // block_dig
-                let mut sl = &b[..];
-                let status = read_varint(&mut sl).unwrap_or(-1);
-                let (x, y, z) = if sl.len() >= 8 {
-                    read_pos(&sl[..8])
-                } else {
-                    (0, 0, 0)
-                };
-                let seq = if sl.len() >= 9 {
-                    let mut s2 = &sl[9..];
-                    read_varint(&mut s2).unwrap_or(0)
+                let draw_started = me
+                    .bow_draw
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                    .is_some();
+                let draw_t = if draw_started {
+                    take_item_use_ticks(&me).unwrap_or(0)
                 } else {
                     0
                 };
-                if status == 5 {
-                    // finish using item (bow release / lower shield)
-                    *me.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                    let eat0 = me.eat_start.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    if let Some(_t0) = eat0 {
-                        // Vanilla releases after the 32-tick use duration;
-                        // an earlier release cancels consumption cleanly.
-                        if take_item_use_ticks(&me).is_some_and(|ticks| ticks >= server_ticks(32)) {
-                            air_use_item(&me, held_slot, seq, None, true);
-                            continue;
-                        }
-                    }
-                    let draw_started = me
-                        .bow_draw
+                if draw_t > 0 {
+                    let arrow_slot = me
+                        .inv
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .take()
-                        .is_some();
-                    let draw_t = if draw_started {
-                        take_item_use_ticks(&me).unwrap_or(0)
-                    } else {
-                        0
+                        .iter()
+                        .find(|(_, (i, c, _))| *i == 802 && *c > 0)
+                        .map(|(&sl, _)| sl);
+                    let (hit, _) = {
+                        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        (inv.get(&held_player_menu_slot(held_slot)).map(|v| v.0).unwrap_or(0), 0)
                     };
-                    if draw_t > 0 {
-                        let arrow_slot = me
-                            .inv
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .iter()
-                            .find(|(_, (i, c, _))| *i == 802 && *c > 0)
-                            .map(|(&sl, _)| sl);
-                        let (hit, _) = {
-                            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            (inv.get(&held_player_menu_slot(held_slot)).map(|v| v.0).unwrap_or(0), 0)
-                        };
-                        let bow_full_ticks = server_ticks(20).max(1);
-                        let charge_t = ((draw_t as f32) / bow_full_ticks as f32).min(1.0);
-                        let qc = {
+                    let bow_full_ticks = server_ticks(20).max(1);
+                    let charge_t = ((draw_t as f32) / bow_full_ticks as f32).min(1.0);
+                    let qc = {
+                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        enchant_level(
+                            &i2.get(&held_player_menu_slot(held_slot))
+                                .map(|v| v.2.clone())
+                                .unwrap_or_default(),
+                            29,
+                        )
+                    };
+                    let quick_charge_ticks = u64::from((qc as u8).min(5)) * 5;
+                    let crossbow_charge_ticks = server_ticks(25_u64.saturating_sub(quick_charge_ticks).max(1));
+                    let can_fire = if hit == 801 {
+                        charge_t >= 0.1
+                    } else {
+                        draw_t >= crossbow_charge_ticks
+                    };
+                    if hit == 1192 && can_fire {
+                        // Crossbows charge into `charged_projectiles` here;
+                        // the next right-click is what fires. Multishot stores
+                        // the vanilla three projectile entries.
+                        let selected = held_player_menu_slot(held_slot);
+                        let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+                        let ammo = arrow_slot.and_then(|slot| {
+                            me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned().map(|stack| (slot, stack))
+                        });
+                        if creative || ammo.is_some() {
+                            let projectile = ammo
+                                .as_ref()
+                                .map(|(_, stack)| (stack.0, 1, stack.2.clone()))
+                                .unwrap_or((802, 1, Vec::new()));
+                            if !creative {
+                                if let Some((slot, _)) = ammo {
+                                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                    if let Some(stack) = inv.get_mut(&slot) {
+                                        stack.1 = stack.1.saturating_sub(1);
+                                        if stack.1 == 0 {
+                                            inv.remove(&slot);
+                                        }
+                                    }
+                                }
+                            }
+                            let multishot = {
+                                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                                enchant_level(&inv.get(&selected).map(|v| v.2.clone()).unwrap_or_default(), 23) > 0
+                            };
+                            let projectiles = if multishot {
+                                vec![projectile.clone(), projectile.clone(), projectile]
+                            } else {
+                                vec![projectile]
+                            };
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(crossbow) = inv.get_mut(&selected) {
+                                comp_set(
+                                    &mut crossbow.2,
+                                    COMP_CHARGED_PROJECTILES,
+                                    encode_stack_list(&projectiles),
+                                );
+                            }
+                            drop(inv);
+                            held_slot_resync(&me);
+                        }
+                        return PlayPacketControl::Skip;
+                    }
+                    if let (true, true, Some(asl)) =
+                        ((hit == 801 || hit == 1192), can_fire, arrow_slot)
+                    {
+                        let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
+                        let inf = {
                             let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                             enchant_level(
                                 &i2.get(&held_player_menu_slot(held_slot))
                                     .map(|v| v.2.clone())
                                     .unwrap_or_default(),
-                                29,
-                            )
+                                16,
+                            ) > 0
                         };
-                        let quick_charge_ticks = u64::from((qc as u8).min(5)) * 5;
-                        let crossbow_charge_ticks = server_ticks(25_u64.saturating_sub(quick_charge_ticks).max(1));
-                        let can_fire = if hit == 801 {
-                            charge_t >= 0.1
+                        if !inf {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            // `asl` was found under a previous guard; RCON
+                            // or console inventory edits (`/clear`, `/item
+                            // replace`) may have taken the stack since, so
+                            // the slot is consumed only if it is still there.
+                            if let Some(stack) = inv.get_mut(&asl) {
+                                stack.1 = stack.1.saturating_sub(1);
+                                if stack.1 == 0 {
+                                    inv.remove(&asl);
+                                }
+                            }
+                        }
+                        let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        let yr = (yaw as f64).to_radians();
+                        let pr = (pitch as f64).to_radians();
+                        // bow enchants: power scales arrow dmg, flame ignites, punch knocks
+                        let held_c = {
+                            let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            i2.get(&held_player_menu_slot(held_slot))
+                                .map(|v| v.2.clone())
+                                .unwrap_or_default()
+                        };
+                        let pw = enchant_level(&held_c, 25);
+                        let fl = enchant_level(&held_c, 12);
+                        let pu = enchant_level(&held_c, 28);
+                        let pi = if hit == 1192 {
+                            enchant_level(&held_c, 24)
                         } else {
-                            draw_t >= crossbow_charge_ticks
+                            0
                         };
-                        if hit == 1192 && can_fire {
-                            // Crossbows charge into `charged_projectiles` here;
-                            // the next right-click is what fires. Multishot stores
-                            // the vanilla three projectile entries.
-                            let selected = held_player_menu_slot(held_slot);
-                            let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
-                            let ammo = arrow_slot.and_then(|slot| {
-                                me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned().map(|stack| (slot, stack))
-                            });
-                            if creative || ammo.is_some() {
-                                let projectile = ammo
-                                    .as_ref()
-                                    .map(|(_, stack)| (stack.0, 1, stack.2.clone()))
-                                    .unwrap_or((802, 1, Vec::new()));
-                                if !creative {
-                                    if let Some((slot, _)) = ammo {
-                                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        if let Some(stack) = inv.get_mut(&slot) {
-                                            stack.1 = stack.1.saturating_sub(1);
-                                            if stack.1 == 0 {
-                                                inv.remove(&slot);
-                                            }
-                                        }
-                                    }
-                                }
-                                let multishot = {
-                                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    enchant_level(&inv.get(&selected).map(|v| v.2.clone()).unwrap_or_default(), 23) > 0
-                                };
-                                let projectiles = if multishot {
-                                    vec![projectile.clone(), projectile.clone(), projectile]
-                                } else {
-                                    vec![projectile]
-                                };
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(crossbow) = inv.get_mut(&selected) {
-                                    comp_set(
-                                        &mut crossbow.2,
-                                        COMP_CHARGED_PROJECTILES,
-                                        encode_stack_list(&projectiles),
-                                    );
-                                }
-                                drop(inv);
-                                held_slot_resync(&me);
-                            }
-                            continue;
-                        }
-                        if let (true, true, Some(asl)) =
-                            ((hit == 801 || hit == 1192), can_fire, arrow_slot)
-                        {
-                            let pow_f = (charge_t * charge_t + 2.0 * charge_t) / 3.0;
-                            let inf = {
-                                let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                enchant_level(
-                                    &i2.get(&held_player_menu_slot(held_slot))
-                                        .map(|v| v.2.clone())
-                                        .unwrap_or_default(),
-                                    16,
-                                ) > 0
-                            };
-                            if !inf {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                // `asl` was found under a previous guard; RCON
-                                // or console inventory edits (`/clear`, `/item
-                                // replace`) may have taken the stack since, so
-                                // the slot is consumed only if it is still there.
-                                if let Some(stack) = inv.get_mut(&asl) {
-                                    stack.1 = stack.1.saturating_sub(1);
-                                    if stack.1 == 0 {
-                                        inv.remove(&asl);
-                                    }
-                                }
-                            }
-                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            let yr = (yaw as f64).to_radians();
-                            let pr = (pitch as f64).to_radians();
-                            // bow enchants: power scales arrow dmg, flame ignites, punch knocks
-                            let held_c = {
-                                let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                i2.get(&held_player_menu_slot(held_slot))
-                                    .map(|v| v.2.clone())
-                                    .unwrap_or_default()
-                            };
-                            let pw = enchant_level(&held_c, 25);
-                            let fl = enchant_level(&held_c, 12);
-                            let pu = enchant_level(&held_c, 28);
-                            let pi = if hit == 1192 {
-                                enchant_level(&held_c, 24)
-                            } else {
-                                0
-                            };
-                            let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                            let a = Arrow {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                owner: me.eid,
-                                x,
-                                y: y + 1.5,
-                                z,
-                                dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64,
-                                dy: -pr.sin() * 2.5 * pow_f as f64,
-                                dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64,
-                                ttl: server_ticks(ARROW_TTL_GT) as i32,
-                                dmg: 6.0 * pow_f * (1.0 + 0.25 * pw as f32),
-                                fire: if fl > 0 { server_ticks(100) as i32 } else { 0 },
-                                punch: pu as i32,
-                                kind: 0,
-                                loy: 0,
-                                ret_item: 0,
-                                ret_comps: Vec::new(),
-                                pierce: pi as i32,
-                                last_hit: -1,
-                                stuck: false,
-                            };
-                            let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
-                            let arrow_eid = a.eid;
-                            arrows().lock().unwrap_or_else(|e| e.into_inner()).push(a);
-                            set_entity_dim(arrow_eid, projectile_dim);
-                            // multishot (crossbow): +2 arrows spread +-10deg
-                            if hit == 1192 && enchant_level(&held_c, 23) > 0 {
-                                for off in [-0.1745f64, 0.1745] {
-                                    let yr2 = yr + off;
-                                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                    arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
-                                        eid,
-                                        owner: me.eid,
-                                        x,
-                                        y: y + 1.5,
-                                        z,
-                                        dx: -yr2.sin() * pr.cos() * 2.5 * pow_f as f64,
-                                        dy: -pr.sin() * 2.5 * pow_f as f64,
-                                        dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64,
-                                        ttl: server_ticks(ARROW_TTL_GT) as i32,
-                                        dmg: admg,
-                                        fire: afire,
-                                        punch: apunch,
-                                        kind: 0,
-                                        loy: 0,
-                                        ret_item: 0,
-                                        ret_comps: Vec::new(),
-                                        pierce: apierce,
-                                        last_hit: -1,
-                                        stuck: false,
-                                    });
-                                    set_entity_dim(eid, projectile_dim);
-                                }
-                            }
-                            // spawn streams via interest_tick
-                            // vanilla: firing a bow/crossbow wears it
-                            if damage_held(&me) {
-                                let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
-                                broadcast_near_packet(
-                                    *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                        let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        let a = Arrow {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            owner: me.eid,
+                            x,
+                            y: y + 1.5,
+                            z,
+                            dx: -yr.sin() * pr.cos() * 2.5 * pow_f as f64,
+                            dy: -pr.sin() * 2.5 * pow_f as f64,
+                            dz: yr.cos() * pr.cos() * 2.5 * pow_f as f64,
+                            ttl: server_ticks(ARROW_TTL_GT) as i32,
+                            dmg: 6.0 * pow_f * (1.0 + 0.25 * pw as f32),
+                            fire: if fl > 0 { server_ticks(100) as i32 } else { 0 },
+                            punch: pu as i32,
+                            kind: 0,
+                            loy: 0,
+                            ret_item: 0,
+                            ret_comps: Vec::new(),
+                            pierce: pi as i32,
+                            last_hit: -1,
+                            stuck: false,
+                        };
+                        let (admg, afire, apunch, apierce) = (a.dmg, a.fire, a.punch, a.pierce);
+                        let arrow_eid = a.eid;
+                        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(a);
+                        set_entity_dim(arrow_eid, projectile_dim);
+                        // multishot (crossbow): +2 arrows spread +-10deg
+                        if hit == 1192 && enchant_level(&held_c, 23) > 0 {
+                            for off in [-0.1745f64, 0.1745] {
+                                let yr2 = yr + off;
+                                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                                arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+                                    eid,
+                                    owner: me.eid,
                                     x,
-                                    y + 1.0,
+                                    y: y + 1.5,
                                     z,
-                                    -1,
-                                    0x68,
-                                    &snd,
-                                );
-                            }
-                            {
-                                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned();
-                                let mut p = vec![4u8];
-                                write_varint(&mut p, 0);
-                                p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
-                                let held_now = {
-                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    i2.get(&held_player_menu_slot(held_slot))
-                                        .cloned()
-                                        .unwrap_or((0, 0, Vec::new()))
-                                };
-                                p.extend_from_slice(&slot_wire(&held_now));
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                                let mut p2 = vec![4u8];
-                                write_varint(&mut p2, 0);
-                                p2.extend_from_slice(&asl.to_be_bytes());
-                                let iv = inv.unwrap_or((0, 0, Vec::new()));
-                                p2.extend_from_slice(&slot_wire(&iv));
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p2);
+                                    dx: -yr2.sin() * pr.cos() * 2.5 * pow_f as f64,
+                                    dy: -pr.sin() * 2.5 * pow_f as f64,
+                                    dz: yr2.cos() * pr.cos() * 2.5 * pow_f as f64,
+                                    ttl: server_ticks(ARROW_TTL_GT) as i32,
+                                    dmg: admg,
+                                    fire: afire,
+                                    punch: apunch,
+                                    kind: 0,
+                                    loy: 0,
+                                    ret_item: 0,
+                                    ret_comps: Vec::new(),
+                                    pierce: apierce,
+                                    last_hit: -1,
+                                    stuck: false,
+                                });
+                                set_entity_dim(eid, projectile_dim);
                             }
                         }
-                        if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= server_ticks(10) {
-                            // trident throw
-                            let held_st = {
+                        // spawn streams via interest_tick
+                        // vanilla: firing a bow/crossbow wears it
+                        if damage_held(&me) {
+                            let snd = sound_pkt_named("entity.item.break", x, y + 1.0, z);
+                            broadcast_near_packet(
+                                *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
+                                x,
+                                y + 1.0,
+                                z,
+                                -1,
+                                0x68,
+                                &snd,
+                            );
+                        }
+                        {
+                            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned();
+                            let mut p = vec![4u8];
+                            write_varint(&mut p, 0);
+                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
+                            let held_now = {
                                 let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
                                 i2.get(&held_player_menu_slot(held_slot))
                                     .cloned()
                                     .unwrap_or((0, 0, Vec::new()))
                             };
-                            let loy = enchant_level(&held_st.2, 19);
-                            let imp = enchant_level(&held_st.2, 15) as f32 * 2.5;
-                            let chan = enchant_level(&held_st.2, 5);
-                            // survival consumes the thrown trident; it lands as a
-                            // pickupable drop (or returns at owner's feet w/ loyalty)
-                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let hs = held_player_menu_slot(held_slot);
-                                if let Some(st) = inv.get_mut(&hs) {
-                                    if st.1 <= 1 {
-                                        inv.remove(&hs);
-                                    } else {
-                                        st.1 -= 1;
-                                    }
-                                }
-                            }
-                            let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            let yr = (yaw as f64).to_radians();
-                            let pr = (pitch as f64).to_radians();
-                            let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                            let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                            arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
-                                eid,
-                                owner: me.eid,
-                                x,
-                                y: y + 1.5,
-                                z,
-                                dx: -yr.sin() * pr.cos() * 2.2,
-                                dy: -pr.sin() * 2.2,
-                                dz: yr.cos() * pr.cos() * 2.2,
-                                ttl: server_ticks(ARROW_TTL_GT) as i32,
-                                dmg: 8.0 + imp,
-                                fire: 0,
-                                punch: chan as i32,
-                                kind: 1,
-                                loy,
-                                ret_item: held_st.0,
-                                ret_comps: held_st.2.clone(),
-                                pierce: 0,
-                                last_hit: -1,
-                                stuck: false,
-                            });
-                            set_entity_dim(eid, projectile_dim);
-                            held_slot_resync(&me);
+                            p.extend_from_slice(&slot_wire(&held_now));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                            let mut p2 = vec![4u8];
+                            write_varint(&mut p2, 0);
+                            p2.extend_from_slice(&asl.to_be_bytes());
+                            let iv = inv.unwrap_or((0, 0, Vec::new()));
+                            p2.extend_from_slice(&slot_wire(&iv));
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p2);
                         }
                     }
-                }
-                if status == 6 {
-                    // swap_item_in_hand: held <-> offhand (F key)
-                    let hs = held_player_menu_slot(held_slot);
-                    let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    let a = inv.remove(&hs).unwrap_or((0, 0, Vec::new()));
-                    let b = inv.remove(&45i16).unwrap_or((0, 0, Vec::new()));
-                    if b.1 > 0 {
-                        inv.insert(hs, b.clone());
-                    }
-                    if a.1 > 0 {
-                        inv.insert(45, a.clone());
-                    }
-                    drop(inv);
-                    resync_slot(&me, 0, hs, &b);
-                    resync_slot(&me, 0, 45, &a);
-                }
-                if status == 3 || status == 4 {
-                    // DROP_ALL_ITEMS (ctrl+Q) / DROP_ITEM (Q)
-                    {
-                        // vanilla: Q-drop works in creative too
-                        let hs = held_player_menu_slot(held_slot);
-                        let it = {
+                    if hit == name_to_item("trident").unwrap_or(-9) && draw_t >= server_ticks(10) {
+                        // trident throw
+                        let held_st = {
+                            let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            i2.get(&held_player_menu_slot(held_slot))
+                                .cloned()
+                                .unwrap_or((0, 0, Vec::new()))
+                        };
+                        let loy = enchant_level(&held_st.2, 19);
+                        let imp = enchant_level(&held_st.2, 15) as f32 * 2.5;
+                        let chan = enchant_level(&held_st.2, 5);
+                        // survival consumes the thrown trident; it lands as a
+                        // pickupable drop (or returns at owner's feet w/ loyalty)
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                             let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
-                            take.and_then(|t| {
-                                inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone()))
-                            })
-                            .map(|(item, t, clear, comps)| {
-                                if clear {
+                            let hs = held_player_menu_slot(held_slot);
+                            if let Some(st) = inv.get_mut(&hs) {
+                                if st.1 <= 1 {
                                     inv.remove(&hs);
                                 } else {
-                                    inv.get_mut(&hs).unwrap().1 -= t;
-                                }
-                                (item, t, comps)
-                            })
-                        };
-                        if let Some((item, cnt, comps)) = it {
-                            let (px, py, pz, ..) = {
-                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                *p
-                            };
-                            drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: px,
-                                y: py + 1.3,
-                                z: pz,
-                                item,
-                                cnt,
-                                comps,
-                                age: 0,
-                                target: None,
-                                thrower: Some(me.uuid),
-                            });
-                            {
-                                let mut p = vec![0u8];
-                                write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                p.extend_from_slice(&hs.to_be_bytes());
-                                let now = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&hs).cloned().unwrap_or((
-                                    0,
-                                    0,
-                                    Vec::new(),
-                                ));
-                                p.extend_from_slice(&slot_wire(&now));
-                                if let Ok(mut w) = me.sock.lock() {
-                                    let _ = send_packet(&mut w, 0x15, p);
+                                    st.1 -= 1;
                                 }
                             }
                         }
-                    }
-                }
-                if status == 1 {
-                    // aborted dig: `Level.destroyBlockProgress(-1)` clears the
-                    // cracks on every viewer the stage broadcasts reached.
-                    if let Some(dig) = me.dig.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                        broadcast_block_destroy(
-                            &client_snapshot(),
-                            dig.pos.0,
-                            (dig.pos.1, dig.pos.2, dig.pos.3),
-                            me.eid,
-                            -1,
-                        );
-                    }
-                }
-                let mut instant_possible = true;
-                if status == 0 || status == 2 {
-                    // vanilla block_interaction_range: 4.5 survival / 5.0 creative
-                    let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
-                    let gm_creative = game_mode == 1;
-                    let reach = DIG_REACH_POLICY.server_block_acceptance(gm_creative);
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    // Canonical pose-aware eye: a crawling, sneaking or
-                    // swimming branch miner reaches from `0.40`/`1.27`, not
-                    // a hardcoded standing `py + 1.62`.
-                    let eye_y = client_eye_y(&me, dim, px, py, pz);
-                    let (ddx, ddy, ddz) = (
-                        x as f64 + 0.5 - px,
-                        y as f64 + 0.5 - eye_y,
-                        z as f64 + 0.5 - pz,
-                    );
-                    let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
-                    let old = block_at_dim(dim, x, y, z);
-                    let held = {
-                        let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        inv.get(&held_player_menu_slot(held_slot))
-                            .cloned()
-                            .unwrap_or((0, 0, Vec::new()))
-                    };
-                    let (req, instant) = if in_range {
-                        let (haste, fatigue) = {
-                            let effects = me.effs.lock().unwrap_or_else(|e| e.into_inner());
-                            (
-                                effects.iter().find(|effect| effect.id == 2).map(|effect| effect.amp),
-                                effects.iter().find(|effect| effect.id == 3).map(|effect| effect.amp),
-                            )
-                        };
-                        let underwater = block_registry::breg().is_some_and(|registry| {
-                            let (bx, by, bz) = (
-                                px.floor() as i32,
-                                eye_y.floor() as i32,
-                                pz.floor() as i32,
-                            );
-                            registry.has_water(block_at_dim(dim, bx, by, bz))
+                        let (x, y, z, yaw, pitch, _g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        let yr = (yaw as f64).to_radians();
+                        let pr = (pitch as f64).to_radians();
+                        let projectile_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                        let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                        arrows().lock().unwrap_or_else(|e| e.into_inner()).push(Arrow {
+                            eid,
+                            owner: me.eid,
+                            x,
+                            y: y + 1.5,
+                            z,
+                            dx: -yr.sin() * pr.cos() * 2.2,
+                            dy: -pr.sin() * 2.2,
+                            dz: yr.cos() * pr.cos() * 2.2,
+                            ttl: server_ticks(ARROW_TTL_GT) as i32,
+                            dmg: 8.0 + imp,
+                            fire: 0,
+                            punch: chan as i32,
+                            kind: 1,
+                            loy,
+                            ret_item: held_st.0,
+                            ret_comps: held_st.2.clone(),
+                            pierce: 0,
+                            last_hit: -1,
+                            stuck: false,
                         });
-                        let aqua_affinity = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&5)
-                            .is_some_and(|helmet| enchant_level(&helmet.2, 0) > 0);
-                        let base_speed = tool_dig_speed(&held, old as i64);
-                        let modified_speed = mining_speed_with_modifiers(
-                            base_speed,
-                            false,
-                            0,
-                            haste,
-                            fatigue,
-                            underwater && !aqua_affinity,
-                            on_ground,
-                        );
-                        // One canonical break-progress model for every tool
-                        // and breaker: `destroy_progress_per_tick` decides
-                        // insta-mine directly in `f32`, never via a
-                        // seconds round-trip.
-                        let can = if let (Some(tool), Some(reg)) =
-                            (tool_component_for(&held), block_registry::breg())
-                        {
-                            tool_component_correct(&tool, old, reg)
-                        } else {
-                            can_harvest(old as i64, held.0)
-                        };
-                        (
-                            dig_seconds(old as i64, &held).map(|seconds| {
-                                seconds * base_speed / modified_speed.max(f32::MIN_POSITIVE)
-                            }),
-                            instant_mining_break(
-                                modified_speed,
-                                block_hardness(old as i64),
-                                can,
-                            ),
-                        )
-                    } else {
-                        (None, false)
-                    };
-                    instant_possible = instant || !in_range;
-                    // vanilla dig timing: survival needs the destroy duration for
-                    // the block+tool; finish packets arriving early are rejected.
-                    let mut break_now = false;
-                    // Adventure `mayDestroy`: only a held stack whose
-                    // can_break predicates match the block may dig it.
-                    let may_destroy = game_mode != 2
-                        || block_registry::breg().is_some_and(|reg| {
-                            adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
-                        });
-                    // MEGA-W2 §3.1: claim/spawn protection — a non-OP dig inside
-                    // a protected chunk never mutates the world; the client
-                    // gets the authoritative block resynced instead.
-                    let can_modify = can_player_modify_block(
-                        dim,
-                        x,
-                        z,
-                        &me.name,
-                        client_permission_level(&me),
-                    );
-                    if in_range && old != 0 && may_destroy && can_modify {
-                        // `ServerPlayerGameMode`: an insta-minable block
-                        // breaks on START_DESTROY_BLOCK — the insta-mine
-                        // client never sends STOP_DESTROY_BLOCK.
-                        if (gm_creative && status == 0) || instant {
-                            break_now = true;
-                        } else if let Some(t) = req {
-                            if status == 0 {
-                                *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingDig {
-                                    pos: (dim, x, y, z),
-                                    state: old,
-                                    start_tick: TICK_IDX.load(Ordering::Relaxed),
-                                    seconds: t,
-                                    last_stage: -1,
-                                });
-                            } else {
-                                let started = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
-                                    if d.pos == (dim, x, y, z) && d.state == old {
-                                        Some(d.start_tick)
-                                    } else {
-                                        None
-                                    }
-                                });
-                                if started
-                                    .map(|tick| TICK_IDX.load(Ordering::Relaxed).saturating_sub(tick) >= dig_min_ticks(t))
-                                    .unwrap_or(false)
-                                {
-                                    break_now = true;
-                                }
-                            }
-                        }
-                    }
-                    if break_now {
-                        *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    }
-                    // Canonical resync-before-ack: EVERY rejected dig
-                    // outcome — a denied insta-mine START, an early FINISH,
-                    // a claim or reach failure — resyncs the authoritative
-                    // block BEFORE the 0x05 sequence ack, so the client can
-                    // never keep a phantom hole.
-                    if !break_now && old != 0 {
-                        note_block_update_dim(dim, x, y, z, old);
-                    }
-                    if break_now {
-                        finish_block_break(&me, dim, x, y, z, old);
-                        record_live_block_audit(
-                            dim,
-                            (x, y, z),
-                            &me.name,
-                            old,
-                            block_at_dim(dim, x, y, z),
-                            TICK_IDX.load(Ordering::Relaxed),
-                        );
+                        set_entity_dim(eid, projectile_dim);
+                        held_slot_resync(&me);
                     }
                 }
-                ac_v2_note_dig(&me, status, instant_possible, seq);
-                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
             }
-            0x38 => {
-                // block_place
-                let mut sl = &b[..];
-                let _hand = read_varint(&mut sl);
-                let (x, y, z) = if sl.len() >= 8 {
-                    read_pos(&sl[..8])
-                } else {
-                    (0, 0, 0)
+            if status == 6 {
+                // swap_item_in_hand: held <-> offhand (F key)
+                let hs = held_player_menu_slot(held_slot);
+                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                let a = inv.remove(&hs).unwrap_or((0, 0, Vec::new()));
+                let offhand_stack = inv.remove(&45i16).unwrap_or((0, 0, Vec::new()));
+                if offhand_stack.1 > 0 {
+                    inv.insert(hs, offhand_stack.clone());
+                }
+                if a.1 > 0 {
+                    inv.insert(45, a.clone());
+                }
+                drop(inv);
+                resync_slot(&me, 0, hs, &offhand_stack);
+                resync_slot(&me, 0, 45, &a);
+            }
+            if status == 3 || status == 4 {
+                // DROP_ALL_ITEMS (ctrl+Q) / DROP_ITEM (Q)
+                {
+                    // vanilla: Q-drop works in creative too
+                    let hs = held_player_menu_slot(held_slot);
+                    let it = {
+                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        let take = inv.get(&hs).map(|st| if status == 3 { st.1 } else { 1 });
+                        take.and_then(|t| {
+                            inv.get(&hs).map(|st| (st.0, t, st.1 <= t, st.2.clone()))
+                        })
+                        .map(|(item, t, clear, comps)| {
+                            if clear {
+                                inv.remove(&hs);
+                            } else {
+                                inv.get_mut(&hs).unwrap().1 -= t;
+                            }
+                            (item, t, comps)
+                        })
+                    };
+                    if let Some((item, cnt, comps)) = it {
+                        let (px, py, pz, ..) = {
+                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                            *p
+                        };
+                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
+                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
+                            x: px,
+                            y: py + 1.3,
+                            z: pz,
+                            item,
+                            cnt,
+                            comps,
+                            age: 0,
+                            target: None,
+                            thrower: Some(me.uuid),
+                        });
+                        {
+                            let mut p = vec![0u8];
+                            write_varint(&mut p, i64::from(inv_state_next(&me)));
+                            p.extend_from_slice(&hs.to_be_bytes());
+                            let now = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&hs).cloned().unwrap_or((
+                                0,
+                                0,
+                                Vec::new(),
+                            ));
+                            p.extend_from_slice(&slot_wire(&now));
+                            if let Ok(mut w) = me.sock.lock() {
+                                let _ = send_packet(&mut w, 0x15, p);
+                            }
+                        }
+                    }
+                }
+            }
+            if status == 1 {
+                // aborted dig: `Level.destroyBlockProgress(-1)` clears the
+                // cracks on every viewer the stage broadcasts reached.
+                if let Some(dig) = me.dig.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    broadcast_block_destroy(
+                        &client_snapshot(),
+                        dig.pos.0,
+                        (dig.pos.1, dig.pos.2, dig.pos.3),
+                        me.eid,
+                        -1,
+                    );
+                }
+            }
+            let mut instant_possible = true;
+            if status == 0 || status == 2 {
+                // vanilla block_interaction_range: 4.5 survival / 5.0 creative
+                let (px, py, pz, _, _, on_ground) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let game_mode = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
+                let gm_creative = game_mode == 1;
+                let reach = DIG_REACH_POLICY.server_block_acceptance(gm_creative);
+                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                // Canonical pose-aware eye: a crawling, sneaking or
+                // swimming branch miner reaches from `0.40`/`1.27`, not
+                // a hardcoded standing `py + 1.62`.
+                let eye_y = client_eye_y(&me, dim, px, py, pz);
+                let (ddx, ddy, ddz) = (
+                    x as f64 + 0.5 - px,
+                    y as f64 + 0.5 - eye_y,
+                    z as f64 + 0.5 - pz,
+                );
+                let in_range = ddx * ddx + ddy * ddy + ddz * ddz <= reach * reach;
+                let old = block_at_dim(dim, x, y, z);
+                let held = {
+                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                    inv.get(&held_player_menu_slot(held_slot))
+                        .cloned()
+                        .unwrap_or((0, 0, Vec::new()))
                 };
-                let mut s2 = &sl[8.min(sl.len())..];
-                // face is a protocol i32 VarInt: sign-extend so the air-use
-                // sentinel 0xFFFFFFFF decodes to -1, not 4294967295.
-                let face = read_varint(&mut s2)
-                    .map(|v| v as u32 as i32 as i64)
-                    .unwrap_or(1);
-                // cursor (3x f32) + inside-block byte feed the placement
-                // family's click-point rules (slab absorb, door hinge).
-                let cursor = if s2.len() >= 13 {
+                let (req, instant) = if in_range {
+                    let (haste, fatigue) = {
+                        let effects = me.effs.lock().unwrap_or_else(|e| e.into_inner());
+                        (
+                            effects.iter().find(|effect| effect.id == 2).map(|effect| effect.amp),
+                            effects.iter().find(|effect| effect.id == 3).map(|effect| effect.amp),
+                        )
+                    };
+                    let underwater = block_registry::breg().is_some_and(|registry| {
+                        let (bx, by, bz) = (
+                            px.floor() as i32,
+                            eye_y.floor() as i32,
+                            pz.floor() as i32,
+                        );
+                        registry.has_water(block_at_dim(dim, bx, by, bz))
+                    });
+                    let aqua_affinity = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&5)
+                        .is_some_and(|helmet| enchant_level(&helmet.2, 0) > 0);
+                    let base_speed = tool_dig_speed(&held, old as i64);
+                    let modified_speed = mining_speed_with_modifiers(
+                        base_speed,
+                        false,
+                        0,
+                        haste,
+                        fatigue,
+                        underwater && !aqua_affinity,
+                        on_ground,
+                    );
+                    // One canonical break-progress model for every tool
+                    // and breaker: `destroy_progress_per_tick` decides
+                    // insta-mine directly in `f32`, never via a
+                    // seconds round-trip.
+                    let can = if let (Some(tool), Some(reg)) =
+                        (tool_component_for(&held), block_registry::breg())
+                    {
+                        tool_component_correct(&tool, old, reg)
+                    } else {
+                        can_harvest(old as i64, held.0)
+                    };
                     (
-                        f32::from_be_bytes(s2[0..4].try_into().unwrap()),
-                        f32::from_be_bytes(s2[4..8].try_into().unwrap()),
-                        f32::from_be_bytes(s2[8..12].try_into().unwrap()),
+                        dig_seconds(old as i64, &held).map(|seconds| {
+                            seconds * base_speed / modified_speed.max(f32::MIN_POSITIVE)
+                        }),
+                        instant_mining_break(
+                            modified_speed,
+                            block_hardness(old as i64),
+                            can,
+                        ),
                     )
                 } else {
-                    (0.5, 0.5, 0.5)
+                    (None, false)
                 };
-                let seq = if s2.len() >= 13 {
-                    let mut s3 = &s2[13..];
-                    read_varint(&mut s3).unwrap_or(0)
-                } else {
-                    0
-                };
-                // air-use form (1.21+): use_item arrives as block_place
-                // {-1,255,-1}, face -1 — dispatch to the shared item-use path
-                if x == -1 && y == 255 && z == -1 && face == -1 {
-                    if !try_use_ender_eye(&me, held_slot, seq) {
-                        note_item_use_start(&me);
-                        air_use_item(&me, held_slot, seq, _hand, false);
-                    }
-                    continue;
-                }
-                // vanilla block_interaction_range: 4.5 survival / 5.0 creative
-                // (clicked block center vs eye) — gates placement AND
-                // block interactions (containers/signs/buckets all below).
-                // The eye is the canonical pose-aware height, never a raw
-                // foot-Y: placing ahead while crawling must not misfire.
-                {
-                    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
-                    let reach = PLACEMENT_REACH_POLICY.server_block_acceptance(creative);
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let eye_y = client_eye_y(&me, dim, px, py, pz);
-                    let (rx, ry, rz) = (
-                        x as f64 + 0.5 - px,
-                        y as f64 + 0.5 - eye_y,
-                        z as f64 + 0.5 - pz,
-                    );
-                    if rx * rx + ry * ry + rz * rz > reach * reach {
-                        // Rejected place: the client predicted the placement;
-                        // resync the clicked cell before the ack so it never
-                        // keeps a phantom block.
-                        ac_resync_block(&me, dim, (x, y, z));
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                    ac_v2_note_use_on(&me, face, seq, yaw);
-                }
-                let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
-                let (tx, ty, tz) = (x + dx, y + dy, z + dz);
-                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                // `handleUseItemOn` resends the clicked and face-adjacent cell
-                // states after the interaction; the next flush emits them so
-                // they carry the post-write states like vanilla's tail sends.
-                *me.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((dim, x, y, z, face));
-                let clicked = block_at_dim(dim, x, y, z);
-                // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
-                // frame sets its eye and tries the 5x5 ring activation.
-                if try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
-                    continue;
-                }
-                // `create:wrench` (`mod-suite`): right-clicking a tracked
-                // Create block cycles axis/facing and re-solves its kinetic
-                // network; the world write resyncs the blockstate.
-                #[cfg(feature = "mod-suite")]
-                if live_create_wrench_use(&me, dim, x, y, z, clicked, held_slot) {
-                    let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = send_packet(&mut socket, 0x05, ack(seq));
-                    continue;
-                }
-                // `create:depot`/`create:mechanical_belt`/`create:basin`
-                // (`mod-suite`): right-click inserts one held item into the
-                // machine slot; empty-handed or sneak-clicking pulls the
-                // stored/processed item back into the inventory.
-                #[cfg(feature = "mod-suite")]
-                if live_create_interact_block(&me, dim, x, y, z, clicked, held_slot) {
-                    let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = send_packet(&mut socket, 0x05, ack(seq));
-                    continue;
-                }
-                let place = |pos: BlockPos, state| {
-                    // MEGA-W2 §3.1: claim/spawn protection on the placement
-                    // target — the predicate is authoritative and a denied
-                    // place resyncs the client truth without mutating.
-                    let old_at = block_at_dim(dim, pos.0, pos.1, pos.2);
-                    if !can_player_modify_block(
-                        dim,
-                        pos.0,
-                        pos.2,
-                        &me.name,
-                        client_permission_level(&me),
-                    ) {
-                        ac_resync_block(&me, dim, pos);
-                        return false;
-                    }
-                    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
-                        // Adventure `mayPlace`: the held stack's can_place_on
-                        // predicates must match the clicked block.
-                        let held = me
-                            .inv
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&held_player_menu_slot(held_slot))
-                            .cloned()
-                            .unwrap_or((0, 0, Vec::new()));
-                        let allowed = block_registry::breg().is_some_and(|reg| {
-                            adventure_stack_allows(reg, clicked, &held, COMP_CAN_PLACE_ON)
-                        });
-                        if !allowed {
-                            return false;
+                instant_possible = instant || !in_range;
+                // vanilla dig timing: survival needs the destroy duration for
+                // the block+tool; finish packets arriving early are rejected.
+                let mut break_now = false;
+                // Adventure `mayDestroy`: only a held stack whose
+                // can_break predicates match the block may dig it.
+                let may_destroy = game_mode != 2
+                    || block_registry::breg().is_some_and(|reg| {
+                        adventure_stack_allows(reg, old, &held, COMP_CAN_BREAK)
+                    });
+                // MEGA-W2 §3.1: claim/spawn protection — a non-OP dig inside
+                // a protected chunk never mutates the world; the client
+                // gets the authoritative block resynced instead.
+                let can_modify = can_player_modify_block(
+                    dim,
+                    x,
+                    z,
+                    &me.name,
+                    client_permission_level(&me),
+                );
+                if in_range && old != 0 && may_destroy && can_modify {
+                    // `ServerPlayerGameMode`: an insta-minable block
+                    // breaks on START_DESTROY_BLOCK — the insta-mine
+                    // client never sends STOP_DESTROY_BLOCK.
+                    if (gm_creative && status == 0) || instant {
+                        break_now = true;
+                    } else if let Some(t) = req {
+                        if status == 0 {
+                            *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingDig {
+                                pos: (dim, x, y, z),
+                                state: old,
+                                start_tick: TICK_IDX.load(Ordering::Relaxed),
+                                seconds: t,
+                                last_stage: -1,
+                            });
+                        } else {
+                            let started = me.dig.lock().unwrap_or_else(|e| e.into_inner()).and_then(|d| {
+                                if d.pos == (dim, x, y, z) && d.state == old {
+                                    Some(d.start_tick)
+                                } else {
+                                    None
+                                }
+                            });
+                            if started
+                                .map(|tick| TICK_IDX.load(Ordering::Relaxed).saturating_sub(tick) >= dig_min_ticks(t))
+                                .unwrap_or(false)
+                            {
+                                break_now = true;
+                            }
                         }
                     }
-                    if !ac_check_place(&me, dim, (x, y, z), clicked, pos) {
-                        ac_resync_block(&me, dim, pos);
-                        return false;
-                    }
-                    #[cfg(feature = "neoforge-events")]
-                    if java_compat::NEOFORGE.get().is_some() {
-                        let (x, y, z) = pos;
-                        let old = block_at_dim(dim, x, y, z);
-                        if !neoforge_place_allowed(&me, (dim, x, y, z), old, state, clicked) {
-                            return false;
-                        }
-                        if !set_block_if_dim(dim, x, y, z, state, Some(old)) {
-                            neoforge_resync_block(&me, dim, pos);
-                            return false;
-                        }
-                        note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
-                        return true;
-                    }
-                    place_block_dim(dim, pos.0, pos.1, pos.2, state);
+                }
+                if break_now {
+                    *me.dig.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                // Canonical resync-before-ack: EVERY rejected dig
+                // outcome — a denied insta-mine START, an early FINISH,
+                // a claim or reach failure — resyncs the authoritative
+                // block BEFORE the 0x05 sequence ack, so the client can
+                // never keep a phantom hole.
+                if !break_now && old != 0 {
+                    note_block_update_dim(dim, x, y, z, old);
+                }
+                if break_now {
+                    finish_block_break(&me, dim, x, y, z, old);
                     record_live_block_audit(
                         dim,
-                        pos,
+                        (x, y, z),
                         &me.name,
-                        old_at,
-                        block_at_dim(dim, pos.0, pos.1, pos.2),
+                        old,
+                        block_at_dim(dim, x, y, z),
                         TICK_IDX.load(Ordering::Relaxed),
                     );
-                    true
-                };
-                let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
-                // `EndCrystalItem.useOn`: crystals place only on bedrock or
-                // obsidian. In the End they also feed the four-rim respawn
-                // ritual owned by `EndDragonFightController`.
-                if dim == DimId::End
-                    && crate::block_registry::breg().is_some_and(|reg| {
-                        matches!(reg.name_of(clicked), "minecraft:bedrock" | "minecraft:obsidian")
-                    })
-                    && me.inv.lock().unwrap_or_else(|e| e.into_inner())
-                        .get(&held_player_menu_slot(held_slot))
-                        .and_then(|stack| item_to_name(stack.0))
-                        == Some("end_crystal")
-                    && crate::block_registry::breg().is_some_and(|reg| reg.is_air(block_at_dim(dim, tx, ty, tz)))
-                {
-                    let occupied = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
-                        if mob.dim != DimId::End || mob.etype != 30 {
-                            return false;
-                        }
-                        let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        (mx.floor() as i32, my.floor() as i32, mz.floor() as i32) == (tx, ty, tz)
-                    });
-                    if !occupied {
-                        let position = [tx as f64 + 0.5, ty as f64, tz as f64 + 0.5];
-                        if spawn_end_crystal_entity(position) {
-                            let accepted = {
-                                let mut slot = live_end_dragon_fight_controller();
-                                slot.as_mut().is_some_and(|fight| fight.on_end_crystal_placed(tx, ty, tz))
-                            };
-                            if accepted {
-                                let slot = live_end_dragon_fight_controller();
-                                if let Some(fight) = slot.as_ref() {
-                                    persist_end_dragon_fight(fight);
-                                }
-                            }
-                            consume_one_held_item(&me, held_slot);
-                        }
-                    }
+                }
+            }
+            ac_v2_note_dig(&me, status, instant_possible, seq);
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+            PlayPacketControl::Handled
+        }
+        0x38 => {
+            // block_place
+            let mut sl = b;
+            let _hand = read_varint(&mut sl);
+            let (x, y, z) = if sl.len() >= 8 {
+                read_pos(&sl[..8])
+            } else {
+                (0, 0, 0)
+            };
+            let mut s2 = &sl[8.min(sl.len())..];
+            // face is a protocol i32 VarInt: sign-extend so the air-use
+            // sentinel 0xFFFFFFFF decodes to -1, not 4294967295.
+            let face = read_varint(&mut s2)
+                .map(|v| v as u32 as i32 as i64)
+                .unwrap_or(1);
+            // cursor (3x f32) + inside-block byte feed the placement
+            // family's click-point rules (slab absorb, door hinge).
+            let cursor = if s2.len() >= 13 {
+                (
+                    f32::from_be_bytes(s2[0..4].try_into().unwrap()),
+                    f32::from_be_bytes(s2[4..8].try_into().unwrap()),
+                    f32::from_be_bytes(s2[8..12].try_into().unwrap()),
+                )
+            } else {
+                (0.5, 0.5, 0.5)
+            };
+            let seq = if s2.len() >= 13 {
+                let mut s3 = &s2[13..];
+                read_varint(&mut s3).unwrap_or(0)
+            } else {
+                0
+            };
+            // air-use form (1.21+): use_item arrives as block_place
+            // {-1,255,-1}, face -1 — dispatch to the shared item-use path
+            if x == -1 && y == 255 && z == -1 && face == -1 {
+                if !try_use_ender_eye(&me, held_slot, seq) {
+                    note_item_use_start(&me);
+                    air_use_item(&me, held_slot, seq, _hand, false);
+                }
+                return PlayPacketControl::Skip;
+            }
+            // vanilla block_interaction_range: 4.5 survival / 5.0 creative
+            // (clicked block center vs eye) — gates placement AND
+            // block interactions (containers/signs/buckets all below).
+            // The eye is the canonical pose-aware height, never a raw
+            // foot-Y: placing ahead while crawling must not misfire.
+            {
+                let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
+                let reach = PLACEMENT_REACH_POLICY.server_block_acceptance(creative);
+                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+                let eye_y = client_eye_y(&me, dim, px, py, pz);
+                let (rx, ry, rz) = (
+                    x as f64 + 0.5 - px,
+                    y as f64 + 0.5 - eye_y,
+                    z as f64 + 0.5 - pz,
+                );
+                if rx * rx + ry * ry + rz * rz > reach * reach {
+                    // Rejected place: the client predicted the placement;
+                    // resync the clicked cell before the ack so it never
+                    // keeps a phantom block.
+                    ac_resync_block(&me, dim, (x, y, z));
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
+                    return PlayPacketControl::Skip;
                 }
-                // `ComposterBlock.useItemOn`: compostables advance levels 0..6;
-                // level 7 is randomly ticked to 8 by the crop/random-tick owner,
-                // and level 8 harvests one bone meal and resets the composter.
-                if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:composter") {
-                    let mut handled = false;
-                    if let Some(reg) = crate::block_registry::breg() {
-                        let level = reg
-                            .get_prop(clicked, "level")
-                            .and_then(|value| value.parse::<u8>().ok())
-                            .unwrap_or(0);
-                        if level == 8 {
-                            if let Some((new_level, item)) = composter_harvest(level) {
-                                let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
-                                if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
-                                    note_block_update_dim(dim, x, y, z, new_state);
-                                    drop_live_stack_dim(
-                                        dim,
-                                        (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5),
-                                        (name_to_item(item.strip_prefix("minecraft:").unwrap_or(item)).unwrap_or(0), 1, Vec::new()),
-                                    );
-                                }
-                            }
-                            handled = true;
-                        } else {
-                            let held_item = me
-                                .inv
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&held_player_menu_slot(held_slot))
-                                .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
-                            if let Some(item) = held_item {
-                                let roll = f64::from(world_rng::next_below(1_000_000)) / 1_000_000.0;
-                                match composter_insert(level, &format!("minecraft:{item}"), roll) {
-                                    ComposterInsert::Rejected => {}
-                                    ComposterInsert::ConsumedNoAdvance => {
-                                        consume_one_held_item(&me, held_slot);
-                                        handled = true;
-                                    }
-                                    ComposterInsert::Advanced { new_level, .. } => {
-                                        let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
-                                        if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
-                                            note_block_update_dim(dim, x, y, z, new_state);
-                                            consume_one_held_item(&me, held_slot);
-                                        }
-                                        handled = true;
-                                    }
-                                }
+                let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                ac_v2_note_use_on(&me, face, seq, yaw);
+            }
+            let (dx, dy, dz) = FACE_OFF[(face.clamp(0, 5)) as usize];
+            let (tx, ty, tz) = (x + dx, y + dy, z + dz);
+            let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
+            // `handleUseItemOn` resends the clicked and face-adjacent cell
+            // states after the interaction; the next flush emits them so
+            // they carry the post-write states like vanilla's tail sends.
+            *me.use_on_resend.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((dim, x, y, z, face));
+            let clicked = block_at_dim(dim, x, y, z);
+            // `EndPortalFrameBlock.useItemOn`: an `ender_eye` on an eyeless
+            // frame sets its eye and tries the 5x5 ring activation.
+            if try_insert_ender_eye(&me, dim, x, y, z, clicked, held_slot, seq) {
+                return PlayPacketControl::Skip;
+            }
+            // `create:wrench` (`mod-suite`): right-clicking a tracked
+            // Create block cycles axis/facing and re-solves its kinetic
+            // network; the world write resyncs the blockstate.
+            #[cfg(feature = "mod-suite")]
+            if live_create_wrench_use(&me, dim, x, y, z, clicked, held_slot) {
+                let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = send_packet(&mut socket, 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // `create:depot`/`create:mechanical_belt`/`create:basin`
+            // (`mod-suite`): right-click inserts one held item into the
+            // machine slot; empty-handed or sneak-clicking pulls the
+            // stored/processed item back into the inventory.
+            #[cfg(feature = "mod-suite")]
+            if live_create_interact_block(&me, dim, x, y, z, clicked, held_slot) {
+                let mut socket = me.sock.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = send_packet(&mut socket, 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            let place = |pos: BlockPos, state| {
+                // MEGA-W2 §3.1: claim/spawn protection on the placement
+                // target — the predicate is authoritative and a denied
+                // place resyncs the client truth without mutating.
+                let old_at = block_at_dim(dim, pos.0, pos.1, pos.2);
+                if !can_player_modify_block(
+                    dim,
+                    pos.0,
+                    pos.2,
+                    &me.name,
+                    client_permission_level(&me),
+                ) {
+                    ac_resync_block(&me, dim, pos);
+                    return false;
+                }
+                if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 2 {
+                    // Adventure `mayPlace`: the held stack's can_place_on
+                    // predicates must match the clicked block.
+                    let held = me
+                        .inv
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&held_player_menu_slot(held_slot))
+                        .cloned()
+                        .unwrap_or((0, 0, Vec::new()));
+                    let allowed = block_registry::breg().is_some_and(|reg| {
+                        adventure_stack_allows(reg, clicked, &held, COMP_CAN_PLACE_ON)
+                    });
+                    if !allowed {
+                        return false;
+                    }
+                }
+                if !ac_check_place(&me, dim, (x, y, z), clicked, pos) {
+                    ac_resync_block(&me, dim, pos);
+                    return false;
+                }
+                #[cfg(feature = "neoforge-events")]
+                if java_compat::NEOFORGE.get().is_some() {
+                    let (x, y, z) = pos;
+                    let old = block_at_dim(dim, x, y, z);
+                    if !neoforge_place_allowed(&me, (dim, x, y, z), old, state, clicked) {
+                        return false;
+                    }
+                    if !set_block_if_dim(dim, x, y, z, state, Some(old)) {
+                        neoforge_resync_block(&me, dim, pos);
+                        return false;
+                    }
+                    note_block_update_dim(dim, x, y, z, block_at_dim(dim, x, y, z));
+                    return true;
+                }
+                place_block_dim(dim, pos.0, pos.1, pos.2, state);
+                record_live_block_audit(
+                    dim,
+                    pos,
+                    &me.name,
+                    old_at,
+                    block_at_dim(dim, pos.0, pos.1, pos.2),
+                    TICK_IDX.load(Ordering::Relaxed),
+                );
+                true
+            };
+            let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+            // `EndCrystalItem.useOn`: crystals place only on bedrock or
+            // obsidian. In the End they also feed the four-rim respawn
+            // ritual owned by `EndDragonFightController`.
+            if dim == DimId::End
+                && crate::block_registry::breg().is_some_and(|reg| {
+                    matches!(reg.name_of(clicked), "minecraft:bedrock" | "minecraft:obsidian")
+                })
+                && me.inv.lock().unwrap_or_else(|e| e.into_inner())
+                    .get(&held_player_menu_slot(held_slot))
+                    .and_then(|stack| item_to_name(stack.0))
+                    == Some("end_crystal")
+                && crate::block_registry::breg().is_some_and(|reg| reg.is_air(block_at_dim(dim, tx, ty, tz)))
+            {
+                let occupied = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().any(|mob| {
+                    if mob.dim != DimId::End || mob.etype != 30 {
+                        return false;
+                    }
+                    let (mx, my, mz, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
+                    (mx.floor() as i32, my.floor() as i32, mz.floor() as i32) == (tx, ty, tz)
+                });
+                if !occupied {
+                    let position = [tx as f64 + 0.5, ty as f64, tz as f64 + 0.5];
+                    if spawn_end_crystal_entity(position) {
+                        let accepted = {
+                            let mut slot = live_end_dragon_fight_controller();
+                            slot.as_mut().is_some_and(|fight| fight.on_end_crystal_placed(tx, ty, tz))
+                        };
+                        if accepted {
+                            let slot = live_end_dragon_fight_controller();
+                            if let Some(fight) = slot.as_ref() {
+                                persist_end_dragon_fight(fight);
                             }
                         }
-                    }
-                    if handled {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
+                        consume_one_held_item(&me, held_slot);
                     }
                 }
-                // `RespawnAnchorBlock.useItemOn`: glowstone charges the anchor;
-                // a charged anchor sets the typed respawn target where anchors
-                // work and explodes where they do not.
-                if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:respawn_anchor") {
-                    if let Some(reg) = crate::block_registry::breg() {
-                        let charges = reg
-                            .get_prop(clicked, "charges")
-                            .and_then(|value| value.parse::<u8>().ok())
-                            .unwrap_or(0);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // `ComposterBlock.useItemOn`: compostables advance levels 0..6;
+            // level 7 is randomly ticked to 8 by the crop/random-tick owner,
+            // and level 8 harvests one bone meal and resets the composter.
+            if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:composter") {
+                let mut handled = false;
+                if let Some(reg) = crate::block_registry::breg() {
+                    let level = reg
+                        .get_prop(clicked, "level")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(0);
+                    if level == 8 {
+                        if let Some((new_level, item)) = composter_harvest(level) {
+                            let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
+                            if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                note_block_update_dim(dim, x, y, z, new_state);
+                                drop_live_stack_dim(
+                                    dim,
+                                    (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5),
+                                    (name_to_item(item.strip_prefix("minecraft:").unwrap_or(item)).unwrap_or(0), 1, Vec::new()),
+                                );
+                            }
+                        }
+                        handled = true;
+                    } else {
                         let held_item = me
                             .inv
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .get(&held_player_menu_slot(held_slot))
                             .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
-                        let anchors_work = dim == DimId::Nether
-                            || crate::worldgen::dimension_spec(dim).is_some_and(|spec| spec.respawn_anchor_works);
-                        match respawn_anchor_use(charges, held_item.as_deref(), anchors_work) {
-                            AnchorOutcome::Charged { charges: new_charges } => {
-                                let new_state = reg.with_prop(clicked, "charges", &new_charges.to_string());
-                                if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
-                                    note_block_update_dim(dim, x, y, z, new_state);
+                        if let Some(item) = held_item {
+                            let roll = f64::from(world_rng::next_below(1_000_000)) / 1_000_000.0;
+                            match composter_insert(level, &format!("minecraft:{item}"), roll) {
+                                ComposterInsert::Rejected => {}
+                                ComposterInsert::ConsumedNoAdvance => {
                                     consume_one_held_item(&me, held_slot);
+                                    handled = true;
+                                }
+                                ComposterInsert::Advanced { new_level, .. } => {
+                                    let new_state = reg.with_prop(clicked, "level", &new_level.to_string());
+                                    if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                        note_block_update_dim(dim, x, y, z, new_state);
+                                        consume_one_held_item(&me, held_slot);
+                                    }
+                                    handled = true;
                                 }
                             }
-                            AnchorOutcome::Full => {
-                                consume_one_held_item(&me, held_slot);
-                            }
-                            AnchorOutcome::RespawnSet => {
-                                let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                                let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
-                                *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
-                                *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
-                                let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
-                                snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Anchor, dim, position, angle, forced: false });
-                                saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
-                                let mut spawn = Vec::new();
-                                write_pos(&mut spawn, x, y, z);
-                                spawn.extend_from_slice(&angle.to_be_bytes());
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
-                            }
-                            AnchorOutcome::Explode { power } => {
-                                set_block_dim(dim, x, y, z, 0);
-                                note_block_update_dim(dim, x, y, z, 0);
-                                let (ex, ey, ez) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
-                                let before = explosion_fire_snapshot(dim, ex, ey, ez, f64::from(power));
-                                explode_at_dim(dim, ex, ey, ez, f64::from(power));
-                                ignite_explosion_fire(dim, &before, world_rng::next_below);
-                            }
-                            AnchorOutcome::Pass => {}
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                }
-                // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
-                // right-click while this player holds leashed mobs spawns (or
-                // reuses) the `leash_knot` on the clicked fence and re-anchors
-                // every held tether onto it.
-                if !sneaking
-                    && crate::block_registry::breg().is_some_and(|reg| {
-                        reg.name_of(clicked).ends_with("_fence")
-                    })
-                    && hitch_player_tethers(me.eid, dim, (x, y, z))
-                {
-                    let _ = send_packet(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        0x05,
-                        ack(seq),
-                    );
-                    continue;
-                }
-                if !sneaking
-                    && live_block_entity_id(
-                        crate::block_registry::breg().map(|reg| reg.name_of(clicked)).unwrap_or(""),
-                    ) == Some("minecraft:beacon")
-                {
-                    // Recording the menu anchor must not swallow the click:
-                    // the dispatcher below still opens `LiveMenu::Beacon`.
-                    beacon_menu_anchors()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, (dim, x, y, z));
-                }
-                if !sneaking
-                    && (open_live_block_menu(&me, (dim, x, y, z), clicked)
-                        || use_redstone_component(&me, (dim, x, y, z), clicked))
-                {
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // The older right-click handlers use Overworld-only block state.
-                // In another dimension, route the newly supported items before them.
-                if dim != DimId::Overworld {
-                    let held = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&held_player_menu_slot(held_slot)).map(|s| s.0);
-                    if let Some(item) = held {
-                        if try_live_block_placement(
-                            &me,
-                            (dim, x, y, z),
-                            face.clamp(0, 5) as usize,
-                            cursor,
-                            held_slot,
-                            item,
-                            clicked,
-                        ) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
                         }
                     }
                 }
-                // sign applicators (dye / glow ink / ink sac / honeycomb) run
-                // before the editor-open path, exactly like vanilla's
-                // `useItemOn` -> `useWithoutItem` order.
-                if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
-                    continue;
-                }
-                // existing sign: right-click reopens the editor (front text)
-                if (4302..=4589).contains(&block_at_dim(dim, x, y, z))
-                    || (19276..=19339).contains(&block_at_dim(dim, x, y, z))
-                {
-                    let mut op = Vec::new();
-                    write_pos(&mut op, x, y, z);
-                    op.push(1);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                if handled {
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
+                    return PlayPacketControl::Skip;
                 }
-                // chest: open container instead of placing
-                if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
-                    // Persistent claims: opening a container inside a claim
-                    // needs the container-interact permission.
-                    if !can_player_open_container(
-                        dim,
-                        x,
-                        z,
-                        &uuid_text(&me.uuid),
-                        &me.name,
-                        client_permission_level(&me) >= 4,
-                    ) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    // The window is `DoubleBlockCombiner` order, not click order: the
-                    // right half owns slots 0..=26 whichever half was right-clicked.
-                    let window = chest_window_for_player(dim, x, y, z);
-                    // `ChestBlock.getMenuProvider` (`dhb.b`): refuses single or double
-                    // chest if either half has a redstone conductor or sitting cat above.
-                    // `BarrelBlock` (`dfe.a`) does not check `isBlockedChestByBlock`.
-                    if (kind == "Chest" && chest_window_blocked_dim(dim, window))
-                        || (me.is_spectator() && window_has_pending_loot(window))
-                    {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    let audience = client_snapshot();
-                    let mut halves = chest_window_halves_dim(window);
-                    // A second container opening on the same client closes the first,
-                    // which drops the first one's opener count too.
-                    if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                        for half in client_window_halves_dim(previous, prev_anchor, dim) {
-                            if !halves.contains(&half) {
-                                halves.push(half);
-                            }
-                        }
-                    }
-                    let before = chest_opener_snapshot_dim(&audience, &halves);
-                    close_live_menu(&me, false, true);
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    open_chest_for_client(&me, window, None, &inv, kind);
-                    // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
-                    sync_chest_openers_dim(&audience, &before);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // ender chest: per-player shared storage (synthetic key, not world pos)
-                if (7513..=7520).contains(&block_at_dim(dim, x, y, z)) {
-                    // Persistent claims: ender chest open is a container
-                    // interact on the clicked cell.
-                    if !can_player_open_container(
-                        dim,
-                        x,
-                        z,
-                        &uuid_text(&me.uuid),
-                        &me.name,
-                        client_permission_level(&me) >= 4,
-                    ) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
-                    // above `isRedstoneConductor`.
-                    if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    let audience = client_snapshot();
-                    let mut halves = vec![(dim, x, y, z)];
-                    if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
-                        for half in client_window_halves_dim(previous, prev_anchor, dim) {
-                            if !halves.contains(&half) {
-                                halves.push(half);
-                            }
-                        }
-                    }
-                    let before = chest_opener_snapshot_dim(&audience, &halves);
-                    let key = ender_container_key(&me.uuid);
-                    close_live_menu(&me, false, true);
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
-                    sync_chest_openers_dim(&audience, &before);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // flint & steel on TNT -> ignite
-                if (2094..=2095).contains(&block_at_dim(dim, x, y, z))
-                    && me
+            }
+            // `RespawnAnchorBlock.useItemOn`: glowstone charges the anchor;
+            // a charged anchor sets the typed respawn target where anchors
+            // work and explodes where they do not.
+            if !sneaking && crate::block_registry::breg().is_some_and(|reg| reg.name_of(clicked) == "minecraft:respawn_anchor") {
+                if let Some(reg) = crate::block_registry::breg() {
+                    let charges = reg
+                        .get_prop(clicked, "charges")
+                        .and_then(|value| value.parse::<u8>().ok())
+                        .unwrap_or(0);
+                    let held_item = me
                         .inv
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .get(&held_player_menu_slot(held_slot))
-                        .map(|v| v.0)
-                        .unwrap_or(0)
-                        == 798
-                {
-                    // Persistent claims: priming TNT modifies the cell.
-                    if !can_player_modify_block(
-                        dim,
-                        x,
-                        z,
-                        &me.name,
-                        client_permission_level(&me),
-                    ) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    set_block_dim(dim, x, y, z, 0);
-                    note_block_update_dim(dim, x, y, z, 0);
-                    let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                    primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
-                        eid,
-                        x: x as f64 + 0.5,
-                        y: y as f64 + 0.5,
-                        z: z as f64 + 0.5,
-                        left: server_ticks(TNT_FUSE_GT) as i32,
-                    });
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                if block_at_dim(dim, x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
-                    close_live_menu(&me, false, true);
-                    *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = true;
-                    let mut p = Vec::new();
-                    write_varint(&mut p, 3); // windowId 3
-                    write_varint(&mut p, 12); // crafting menu
-                    p.extend_from_slice(&chat_nbt("Crafting"));
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x33, p);
-                    let mut q = vec![3u8];
-                    write_varint(&mut q, i64::from(inv_state_next(&me)));
-                    write_varint(&mut q, 46);
-                    for _ in 0..46 {
-                        q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    }
-                    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, q);
-                    // now fill: grid empty, inv slots
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let mut r = vec![3u8];
-                    write_varint(&mut r, i64::from(inv_state_next(&me)));
-                    write_varint(&mut r, 46);
-                    for _ in 0..10 {
-                        r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    }
-                    for wsl in 10..46i16 {
-                        let (it, c, _cc) =
-                            inv.get(&(wsl - 1)).cloned().unwrap_or((0, 0, Vec::new()));
-                        r.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                    }
-                    r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, r);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
-                    // Persistent claims: furnace open is a container
-                    // interact on the clicked cell.
-                    if !can_player_open_container(
-                        dim,
-                        x,
-                        z,
-                        &uuid_text(&me.uuid),
-                        &me.name,
-                        client_permission_level(&me) >= 4,
-                    ) {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    close_live_menu(&me, false, true);
-                    *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some((dim, x, y, z));
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
-                    open_furnace_window(&me, &inv, &slots);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // buckets: empty fills from source; filled places liquid
-                let held_b = {
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    inv.get(&held_player_menu_slot(held_slot)).cloned()
-                };
-                if let Some((item, cnt, _hc)) = held_b {
-                    let src = block_at_dim(dim, x, y, z);
-                    if item == 908 && (src == 80 || src == 96) {
-                        // Persistent claims: filling a bucket removes the
-                        // source cell — a block modification.
-                        if !can_player_modify_block(
-                            dim,
-                            x,
-                            z,
-                            &me.name,
-                            client_permission_level(&me),
-                        ) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
-                        }
-                        let fi = if src == 80 { 909 } else { 910 };
-                        set_block_dim(dim, x, y, z, 0);
-                        note_block_update_dim(dim, x, y, z, 0);
-                        if cnt > 1 {
-                            {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                inv.insert(held_player_menu_slot(held_slot), (908, cnt - 1, _hc));
-                            }
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(908, cnt - 1, Vec::new())));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                            // A stacked empty bucket never overwrites slot 9:
-                            // the filled bucket merges like a pickup and any
-                            // remainder is dropped in the player's dimension.
-                            player_give_or_drop_dim(&me, (fi, 1, Vec::new()));
-                        } else {
-                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            inv.insert(held_player_menu_slot(held_slot), (fi, 1, Vec::new()));
-                            drop(inv);
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(fi, 1, Vec::new())));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    let replaceable = matches!(
-                        block_at_dim(dim, tx, ty, tz),
-                        0 | 2005 | 2006 | 2007 | 2075 | 2077 | 10756 | 5772..=5779
-                    );
-                    if (item == 909 || item == 910) && replaceable {
-                        let st = if item == 909 { 80 } else { 96 };
-                        if !place((tx, ty, tz), st) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
-                        }
-                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            inv.insert(held_player_menu_slot(held_slot), (908, 1, Vec::new()));
-                            drop(inv);
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                }
-                // Bed interaction resolves the pair before occupancy or respawn state.
-                if block_registry::breg().is_some_and(|registry| {
-                    let name = registry.name_of(clicked);
-                    registry.in_tag(clicked, "minecraft:beds") || name.ends_with("_bed")
-                }) {
-                    let state = block_at_dim(dim, x, y, z);
-                    let pair = block_registry::breg().and_then(|registry| {
-                        bed_head_and_foot(
-                            x, y, z,
-                            &registry.get_prop(state, "part")?,
-                            &registry.get_prop(state, "facing")?,
-                        )
-                    });
-                    let Some((head, foot)) = pair else {
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    };
-                    let bed_works = !matches!(dim, DimId::Nether | DimId::End)
-                        && (dim == DimId::Overworld
-                            || crate::worldgen::dimension_spec(dim).is_some_and(|s| s.bed_works));
-                    if !bed_works {
-                        explode_nonworking_bed(dim, head, foot, x, y, z);
-                    } else {
-                        let occupied = client_snapshot().iter().any(|c| {
-                            c.eid != me.eid && c.sleeping.lock().unwrap_or_else(|e| e.into_inner())
-                                .is_some_and(|s| s.bed == head)
-                        });
-                        let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                        let position = (head.0 as f64 + 0.5, head.1 as f64 + 1.0, head.2 as f64 + 0.5);
-                        *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
-                        *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
-                        let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                        let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
-                        snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Bed, dim, position, angle, forced: false });
-                        saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
-                        let mut spawn = Vec::new();
-                        write_pos(&mut spawn, head.0, head.1, head.2);
-                        spawn.extend_from_slice(&angle.to_be_bytes());
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
-                        let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
-                        let sleep_ok = (13000..=23500).contains(&wt) || THUNDERING.load(Ordering::Relaxed) > 0;
-                        if sleep_ok && !occupied {
-                            enter_bed(&me, head.0, head.1, head.2);
-                        } else {
-                            let key = if occupied { "block.minecraft.bed.occupied" } else { "block.minecraft.bed.no_sleep" };
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x4c, translate_component_nbt(key));
-                        }
-                    }
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // door toggle: flip `open` on both halves. The target is a
-                // shared value, not an xor of each half's state: `note_doors`
-                // mirrors a written half into its partner, so toggling the
-                // partner again would undo the click.
-                if let Some(base) = door_base(block_at_dim(dim, x, y, z)) {
-                    if let Some(reg) = block_registry::breg() {
-                        let clicked = block_at_dim(dim, x, y, z);
-                        let was_open =
-                            reg.get_prop(clicked, "open").as_deref() == Some("true");
-                        let to = if was_open { "false" } else { "true" };
-                        for dy in [-1i32, 0, 1] {
-                            let st = block_at_dim(dim, x, y + dy, z);
-                            if door_base(st) == Some(base) {
-                                let nst = reg.with_prop(st, "open", to);
-                                set_block_dim(dim, x, y + dy, z, nst);
-                                note_block_update_dim(dim, x, y + dy, z, nst);
+                        .and_then(|stack| item_to_name(stack.0).map(str::to_owned));
+                    let anchors_work = dim == DimId::Nether
+                        || crate::worldgen::dimension_spec(dim).is_some_and(|spec| spec.respawn_anchor_works);
+                    match respawn_anchor_use(charges, held_item.as_deref(), anchors_work) {
+                        AnchorOutcome::Charged { charges: new_charges } => {
+                            let new_state = reg.with_prop(clicked, "charges", &new_charges.to_string());
+                            if set_block_if_dim(dim, x, y, z, new_state, Some(clicked)) {
+                                note_block_update_dim(dim, x, y, z, new_state);
+                                consume_one_held_item(&me, held_slot);
                             }
                         }
+                        AnchorOutcome::Full => {
+                            consume_one_held_item(&me, held_slot);
+                        }
+                        AnchorOutcome::RespawnSet => {
+                            let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                            let position = (x as f64 + 0.5, y as f64 + 1.0, z as f64 + 0.5);
+                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
+                            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+                            let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                            let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
+                            snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Anchor, dim, position, angle, forced: false });
+                            saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
+                            let mut spawn = Vec::new();
+                            write_pos(&mut spawn, x, y, z);
+                            spawn.extend_from_slice(&angle.to_be_bytes());
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
+                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
+                        }
+                        AnchorOutcome::Explode { power } => {
+                            set_block_dim(dim, x, y, z, 0);
+                            note_block_update_dim(dim, x, y, z, 0);
+                            let (ex, ey, ez) = (x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5);
+                            let before = explosion_fire_snapshot(dim, ex, ey, ez, f64::from(power));
+                            explode_at_dim(dim, ex, ey, ez, f64::from(power));
+                            ignite_explosion_fire(dim, &before, world_rng::next_below);
+                        }
+                        AnchorOutcome::Pass => {}
                     }
                     let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
+                    return PlayPacketControl::Skip;
                 }
-                // fence gate toggle: `FenceGateBlock.useWithoutItem` cycles the
-                // `open` property only — `in_wall`/`facing`/`powered` are left
-                // untouched (a stride-XOR here lands on facing/in_wall bits).
-                if gate_base(block_at_dim(dim, x, y, z)).is_some() {
-                    let st = block_at_dim(dim, x, y, z);
-                    if let Some(reg) = block_registry::breg() {
-                        if let Some(open) = reg.get_prop(st, "open").map(|v| v == "true") {
-                            let nst =
-                                reg.with_prop(st, "open", if open { "false" } else { "true" });
-                            set_block_dim(dim, x, y, z, nst);
-                            note_block_update_dim(dim, x, y, z, nst);
-                        }
-                    }
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                if trapdoor_state(block_at_dim(dim, x, y, z)) {
-                    try_toggle_trapdoor(dim, x, y, z);
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                    continue;
-                }
-                // hotbar slots are window slots 36..=44
-                let held = {
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    inv.get(&held_player_menu_slot(held_slot)).cloned()
-                };
-                // `BoneMealItem.useOn`: growth runs before generic placement,
-                // and exactly one item is consumed only when the target can
-                // actually grow. Mature crops pass the interaction through.
-                if let Some((item, _, _)) = held {
-                    if item_to_name(item) == Some("bone_meal") && try_bonemeal_growth(dim, x, y, z) {
-                        consume_one_held_item(&me, held_slot);
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                }
-                // hoe: convert dirt-family clicked block to farmland
-                if let Some((item, _, _)) = held {
-                    let is_hoe = (822..=847).contains(&item) && (item - 822) % 5 == 0;
-                    let tillable = matches!(block_at_dim(dim, x, y, z), 9 | 10 | 12513);
-                    if is_hoe && tillable && face == 1 {
-                        let fm = name_to_state("farmland").unwrap_or(0);
-                        if !place((x, y, z), fm) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    // wheat seeds on farmland -> wheat age0 + consume seed
-                    if item == 853
-                        && block_at_dim(dim, x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
-                    {
-                        if !place((tx, ty, tz), 4278) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
-                        }
-                        crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, tx, ty, tz), 0);
-                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((it, c, _cc)) = inv.get(&held_player_menu_slot(held_slot)).cloned() {
-                                if c <= 1 {
-                                    inv.remove(&held_player_menu_slot(held_slot));
-                                } else {
-                                    inv.insert(held_player_menu_slot(held_slot), (it, c - 1, _cc));
-                                }
-                            }
-                            let (it, c, _cc) =
-                                inv.get(&held_player_menu_slot(held_slot))
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                            drop(inv);
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                }
-                if let Some((item, _cnt, _)) = held {
-                    if let Some(sb) = sign_base_for_item(item) {
-                        let yaw = {
-                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            p.3
-                        } as f64;
-                        let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
-                        let st = sb + rot * 2 + 1;
-                        if !place((tx, ty, tz), st) {
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                            continue;
-                        }
-                        ac_consume_placed_item(&me, held_slot);
-                        let mut op = Vec::new();
-                        write_pos(&mut op, tx, ty, tz);
-                        op.push(1);
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
-                    // `FlintAndSteelItem.useOn` / `FireChargeItem`: fire on the
-                    // face-adjacent cell — soul_fire when clicked soul soil/sand.
-                    // Inside a complete obsidian frame the fire ignites the
-                    // portal (soul fire does not). Block interactions above keep
-                    // priority; the TNT special case is already handled.
-                    if item == 798 || item == 1089 {
-                        let soul = crate::block_registry::breg().is_some_and(|reg| {
-                            matches!(
-                                reg.name_of(clicked),
-                                "minecraft:soul_sand" | "minecraft:soul_soil"
-                            )
-                        });
-                        let fire = name_to_state(if soul { "soul_fire" } else { "fire" })
-                            .unwrap_or(u32::MAX);
-                        let target_st = block_at_dim(dim, tx, ty, tz);
-                        let can_place = crate::block_registry::breg()
-                            .is_some_and(|reg| reg.is_replaceable(target_st));
-                        if fire != u32::MAX && can_place && place((tx, ty, tz), fire) {
-                            if !soul {
-                                if let Some(reg) = crate::block_registry::breg() {
-                                    try_ignite_nether_portal(reg, dim, tx, ty, tz);
-                                }
-                            }
-                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                                damage_inv_slot(&me, held_player_menu_slot(held_slot));
-                                held_slot_resync(&me);
-                            }
-                        }
-                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
-                    }
+            }
+            // `FenceBlock.useItemOn` -> `LeadItem.bindPlayerMobs`: a fence
+            // right-click while this player holds leashed mobs spawns (or
+            // reuses) the `leash_knot` on the clicked fence and re-anchors
+            // every held tether onto it.
+            if !sneaking
+                && crate::block_registry::breg().is_some_and(|reg| {
+                    reg.name_of(clicked).ends_with("_fence")
+                })
+                && hitch_player_tethers(me.eid, dim, (x, y, z))
+            {
+                let _ = send_packet(
+                    &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
+                    0x05,
+                    ack(seq),
+                );
+                return PlayPacketControl::Skip;
+            }
+            if !sneaking
+                && live_block_entity_id(
+                    crate::block_registry::breg().map(|reg| reg.name_of(clicked)).unwrap_or(""),
+                ) == Some("minecraft:beacon")
+            {
+                // Recording the menu anchor must not swallow the click:
+                // the dispatcher below still opens `LiveMenu::Beacon`.
+                beacon_menu_anchors()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(me.eid, (dim, x, y, z));
+            }
+            if !sneaking
+                && (open_live_block_menu(&me, (dim, x, y, z), clicked)
+                    || use_redstone_component(&me, (dim, x, y, z), clicked))
+            {
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // The older right-click handlers use Overworld-only block state.
+            // In another dimension, route the newly supported items before them.
+            if dim != DimId::Overworld {
+                let held = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&held_player_menu_slot(held_slot)).map(|s| s.0);
+                if let Some(item) = held {
                     if try_live_block_placement(
                         &me,
                         (dim, x, y, z),
@@ -15137,3049 +13477,549 @@ fn handle_inner(mut s: TcpStream, live_eid: Arc<AtomicI32>) {
                         clicked,
                     ) {
                         let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
-                        continue;
+                        return PlayPacketControl::Skip;
                     }
-                    if let Some(st) = item_to_state(item) {
-                        // A chest is placed with the state vanilla computes for it:
-                        // facing from the player (opposite of the look direction),
-                        // `type` from the neighbour it may pair with, and
-                        // `waterlogged` from the fluid it replaces.
-                        let st = match chest_kind(st) {
-                            Some(name) => {
-                                let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
-                                let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
-                                chest_placement_state_dim(
-                                    dim,
-                                    name,
-                                    (tx, ty, tz),
-                                    yaw,
-                                    sneaking,
-                                    face.clamp(0, 5) as u8,
-                                )
-                            }
-                            None => st,
-                        };
-                        if place((tx, ty, tz), st) {
-                            ac_consume_placed_item(&me, held_slot);
-                            if matches!(item_to_name(item), Some("wither_skeleton_skull" | "wither_skeleton_wall_skull")) {
-                                consume_wither_pattern_at(dim, (tx, ty, tz));
-                            }
-                            dispatch_player_shrieker_vibration(&me, (tx as f64 + 0.5, ty as f64 + 0.5, tz as f64 + 0.5));
+                }
+            }
+            // sign applicators (dye / glow ink / ink sac / honeycomb) run
+            // before the editor-open path, exactly like vanilla's
+            // `useItemOn` -> `useWithoutItem` order.
+            if use_sign_item(&me, dim, x, y, z, held_slot, seq) {
+                return PlayPacketControl::Skip;
+            }
+            // existing sign: right-click reopens the editor (front text)
+            if (4302..=4589).contains(&block_at_dim(dim, x, y, z))
+                || (19276..=19339).contains(&block_at_dim(dim, x, y, z))
+            {
+                let mut op = Vec::new();
+                write_pos(&mut op, x, y, z);
+                op.push(1);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // chest: open container instead of placing
+            if let Some(kind) = container_kind(block_at_dim(dim, x, y, z)) {
+                // Persistent claims: opening a container inside a claim
+                // needs the container-interact permission.
+                if !can_player_open_container(
+                    dim,
+                    x,
+                    z,
+                    &uuid_text(&me.uuid),
+                    &me.name,
+                    client_permission_level(&me) >= 4,
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                // The window is `DoubleBlockCombiner` order, not click order: the
+                // right half owns slots 0..=26 whichever half was right-clicked.
+                let window = chest_window_for_player(dim, x, y, z);
+                // `ChestBlock.getMenuProvider` (`dhb.b`): refuses single or double
+                // chest if either half has a redstone conductor or sitting cat above.
+                // `BarrelBlock` (`dfe.a`) does not check `isBlockedChestByBlock`.
+                if (kind == "Chest" && chest_window_blocked_dim(dim, window))
+                    || (me.is_spectator() && window_has_pending_loot(window))
+                {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                let audience = client_snapshot();
+                let mut halves = chest_window_halves_dim(window);
+                // A second container opening on the same client closes the first,
+                // which drops the first one's opener count too.
+                if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
+                    for half in client_window_halves_dim(previous, prev_anchor, dim) {
+                        if !halves.contains(&half) {
+                            halves.push(half);
+                        }
+                    }
+                }
+                let before = chest_opener_snapshot_dim(&audience, &halves);
+                close_live_menu(&me, false, true);
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                open_chest_for_client(&me, window, None, &inv, kind);
+                // `ContainerOpenersCounter.incrementOpeners` -> openerCountChanged
+                sync_chest_openers_dim(&audience, &before);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // ender chest: per-player shared storage (synthetic key, not world pos)
+            if (7513..=7520).contains(&block_at_dim(dim, x, y, z)) {
+                // Persistent claims: ender chest open is a container
+                // interact on the clicked cell.
+                if !can_player_open_container(
+                    dim,
+                    x,
+                    z,
+                    &uuid_text(&me.uuid),
+                    &me.name,
+                    client_permission_level(&me) >= 4,
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                // `EnderChestBlock.useWithoutItem` (`dip.a`): refuses when the cell
+                // above `isRedstoneConductor`.
+                if is_blocked_chest_by_block_dim(dim, (x, y, z)) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                let audience = client_snapshot();
+                let mut halves = vec![(dim, x, y, z)];
+                if let Some((previous, prev_anchor)) = client_open_window_and_anchor(&me) {
+                    for half in client_window_halves_dim(previous, prev_anchor, dim) {
+                        if !halves.contains(&half) {
+                            halves.push(half);
+                        }
+                    }
+                }
+                let before = chest_opener_snapshot_dim(&audience, &halves);
+                let key = ender_container_key(&me.uuid);
+                close_live_menu(&me, false, true);
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                open_chest_for_client(&me, (key, None), Some((x, y, z)), &inv, "Ender Chest");
+                sync_chest_openers_dim(&audience, &before);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // flint & steel on TNT -> ignite
+            if (2094..=2095).contains(&block_at_dim(dim, x, y, z))
+                && me
+                    .inv
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&held_player_menu_slot(held_slot))
+                    .map(|v| v.0)
+                    .unwrap_or(0)
+                    == 798
+            {
+                // Persistent claims: priming TNT modifies the cell.
+                if !can_player_modify_block(
+                    dim,
+                    x,
+                    z,
+                    &me.name,
+                    client_permission_level(&me),
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                set_block_dim(dim, x, y, z, 0);
+                note_block_update_dim(dim, x, y, z, 0);
+                let eid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
+                primed().lock().unwrap_or_else(|e| e.into_inner()).push(Primed {
+                    eid,
+                    x: x as f64 + 0.5,
+                    y: y as f64 + 0.5,
+                    z: z as f64 + 0.5,
+                    left: server_ticks(TNT_FUSE_GT) as i32,
+                });
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            if block_at_dim(dim, x, y, z) == name_to_state("crafting_table").unwrap_or(u32::MAX) {
+                close_live_menu(&me, false, true);
+                *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                let mut p = Vec::new();
+                write_varint(&mut p, 3); // windowId 3
+                write_varint(&mut p, 12); // crafting menu
+                p.extend_from_slice(&chat_nbt("Crafting"));
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x33, p);
+                let mut q = vec![3u8];
+                write_varint(&mut q, i64::from(inv_state_next(&me)));
+                write_varint(&mut q, 46);
+                for _ in 0..46 {
+                    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                }
+                q.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, q);
+                // now fill: grid empty, inv slots
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut r = vec![3u8];
+                write_varint(&mut r, i64::from(inv_state_next(&me)));
+                write_varint(&mut r, 46);
+                for _ in 0..10 {
+                    r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                }
+                for wsl in 10..46i16 {
+                    let (it, c, _cc) =
+                        inv.get(&(wsl - 1)).cloned().unwrap_or((0, 0, Vec::new()));
+                    r.extend_from_slice(&slot_wire(&(it, c, _cc)));
+                }
+                r.extend_from_slice(&slot_wire(&(0, 0, Vec::new())));
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, r);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            if block_at_dim(dim, x, y, z) == name_to_state("furnace").unwrap_or(u32::MAX) {
+                // Persistent claims: furnace open is a container
+                // interact on the clicked cell.
+                if !can_player_open_container(
+                    dim,
+                    x,
+                    z,
+                    &uuid_text(&me.uuid),
+                    &me.name,
+                    client_permission_level(&me) >= 4,
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                close_live_menu(&me, false, true);
+                *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = Some((dim, x, y, z));
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let slots = furnace_slot_snapshot_dim(dim, (x, y, z));
+                open_furnace_window(&me, &inv, &slots);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // buckets: empty fills from source; filled places liquid
+            let held_b = {
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                inv.get(&held_player_menu_slot(held_slot)).cloned()
+            };
+            if let Some((item, cnt, _hc)) = held_b {
+                let src = block_at_dim(dim, x, y, z);
+                if item == 908 && (src == 80 || src == 96) {
+                    // Persistent claims: filling a bucket removes the
+                    // source cell — a block modification.
+                    if !can_player_modify_block(
+                        dim,
+                        x,
+                        z,
+                        &me.name,
+                        client_permission_level(&me),
+                    ) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
+                    }
+                    let fi = if src == 80 { 909 } else { 910 };
+                    set_block_dim(dim, x, y, z, 0);
+                    note_block_update_dim(dim, x, y, z, 0);
+                    if cnt > 1 {
+                        {
+                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                            inv.insert(held_player_menu_slot(held_slot), (908, cnt - 1, _hc));
+                        }
+                        let mut p = vec![0u8];
+                        write_varint(&mut p, i64::from(inv_state_next(&me)));
+                        p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
+                        p.extend_from_slice(&slot_wire(&(908, cnt - 1, Vec::new())));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                        // A stacked empty bucket never overwrites slot 9:
+                        // the filled bucket merges like a pickup and any
+                        // remainder is dropped in the player's dimension.
+                        player_give_or_drop_dim(&me, (fi, 1, Vec::new()));
+                    } else {
+                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        inv.insert(held_player_menu_slot(held_slot), (fi, 1, Vec::new()));
+                        drop(inv);
+                        let mut p = vec![0u8];
+                        write_varint(&mut p, i64::from(inv_state_next(&me)));
+                        p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
+                        p.extend_from_slice(&slot_wire(&(fi, 1, Vec::new())));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                    }
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                let replaceable = matches!(
+                    block_at_dim(dim, tx, ty, tz),
+                    0 | 2005 | 2006 | 2007 | 2075 | 2077 | 10756 | 5772..=5779
+                );
+                if (item == 909 || item == 910) && replaceable {
+                    let st = if item == 909 { 80 } else { 96 };
+                    if !place((tx, ty, tz), st) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
+                    }
+                    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                        let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                        inv.insert(held_player_menu_slot(held_slot), (908, 1, Vec::new()));
+                        drop(inv);
+                        let mut p = vec![0u8];
+                        write_varint(&mut p, i64::from(inv_state_next(&me)));
+                        p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
+                        p.extend_from_slice(&slot_wire(&(908, 1, Vec::new())));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
+                    }
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+            }
+            // Bed interaction resolves the pair before occupancy or respawn state.
+            if block_registry::breg().is_some_and(|registry| {
+                let name = registry.name_of(clicked);
+                registry.in_tag(clicked, "minecraft:beds") || name.ends_with("_bed")
+            }) {
+                let state = block_at_dim(dim, x, y, z);
+                let pair = block_registry::breg().and_then(|registry| {
+                    bed_head_and_foot(
+                        x, y, z,
+                        &registry.get_prop(state, "part")?,
+                        &registry.get_prop(state, "facing")?,
+                    )
+                });
+                let Some((head, foot)) = pair else {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                };
+                let bed_works = !matches!(dim, DimId::Nether | DimId::End)
+                    && (dim == DimId::Overworld
+                        || crate::worldgen::dimension_spec(dim).is_some_and(|s| s.bed_works));
+                if !bed_works {
+                    explode_nonworking_bed(dim, head, foot, x, y, z);
+                } else {
+                    let occupied = client_snapshot().iter().any(|c| {
+                        c.eid != me.eid && c.sleeping.lock().unwrap_or_else(|e| e.into_inner())
+                            .is_some_and(|s| s.bed == head)
+                    });
+                    let angle = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                    let position = (head.0 as f64 + 0.5, head.1 as f64 + 1.0, head.2 as f64 + 0.5);
+                    *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = Some((position.0, position.1, position.2, angle));
+                    *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = dim;
+                    let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let mut snapshot = PlayerSave::capture(&me, client_dim_pos(&me), &inventory);
+                    snapshot.respawn = Some(SpawnTarget { kind: SpawnTargetKind::Bed, dim, position, angle, forced: false });
+                    saved_players().lock().unwrap_or_else(|e| e.into_inner()).insert(me.uuid, snapshot);
+                    let mut spawn = Vec::new();
+                    write_pos(&mut spawn, head.0, head.1, head.2);
+                    spawn.extend_from_slice(&angle.to_be_bytes());
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x56, spawn);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x6c, system_chat("Respawn point set"));
+                    let wt = WORLD_TIME.load(Ordering::Relaxed) % 24000;
+                    let sleep_ok = (13000..=23500).contains(&wt) || THUNDERING.load(Ordering::Relaxed) > 0;
+                    if sleep_ok && !occupied {
+                        enter_bed(&me, head.0, head.1, head.2);
+                    } else {
+                        let key = if occupied { "block.minecraft.bed.occupied" } else { "block.minecraft.bed.no_sleep" };
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x4c, translate_component_nbt(key));
+                    }
+                }
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // door toggle: flip `open` on both halves. The target is a
+            // shared value, not an xor of each half's state: `note_doors`
+            // mirrors a written half into its partner, so toggling the
+            // partner again would undo the click.
+            if let Some(base) = door_base(block_at_dim(dim, x, y, z)) {
+                if let Some(reg) = block_registry::breg() {
+                    let clicked = block_at_dim(dim, x, y, z);
+                    let was_open =
+                        reg.get_prop(clicked, "open").as_deref() == Some("true");
+                    let to = if was_open { "false" } else { "true" };
+                    for dy in [-1i32, 0, 1] {
+                        let st = block_at_dim(dim, x, y + dy, z);
+                        if door_base(st) == Some(base) {
+                            let nst = reg.with_prop(st, "open", to);
+                            set_block_dim(dim, x, y + dy, z, nst);
+                            note_block_update_dim(dim, x, y + dy, z, nst);
                         }
                     }
                 }
                 let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
             }
-            0x36 => {
-                // arm_animation: relay swing to others
-                broadcast_seen(me.eid, |_c| {
-                    (0x03, {
-                        let mut p = Vec::new();
-                        write_varint(&mut p, me.eid as i64);
-                        p.push(0);
-                        p
-                    })
-                });
-            }
-            0x39 => {
-                // use_item: ack + eat + bow draw
-                let mut sl = &b[..];
-                let _h = read_varint(&mut sl);
-                let seq = read_varint(&mut sl).unwrap_or(0);
-                // vanilla `WrittenBookItem.use` → `openItemGui` sends
-                // `ClientboundOpenBookPacket` for the used hand.
-                let held_item = {
-                    let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                    let slot = if _h == Some(1) { 45 } else { held_player_menu_slot(held_slot) };
-                    inv.get(&slot).map(|v| v.0).unwrap_or(0)
-                };
-                if held_item == name_to_item("written_book").unwrap_or(-1) {
-                    if let Some((_, pl)) = encode_play_open_book(_h.unwrap_or(0) as u8) {
-                        let _ = send_packet(
-                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                            0x32,
-                            pl,
-                        );
+            // fence gate toggle: `FenceGateBlock.useWithoutItem` cycles the
+            // `open` property only — `in_wall`/`facing`/`powered` are left
+            // untouched (a stride-XOR here lands on facing/in_wall bits).
+            if gate_base(block_at_dim(dim, x, y, z)).is_some() {
+                let st = block_at_dim(dim, x, y, z);
+                if let Some(reg) = block_registry::breg() {
+                    if let Some(open) = reg.get_prop(st, "open").map(|v| v == "true") {
+                        let nst =
+                            reg.with_prop(st, "open", if open { "false" } else { "true" });
+                        set_block_dim(dim, x, y, z, nst);
+                        note_block_update_dim(dim, x, y, z, nst);
                     }
                 }
-                if !try_use_ender_eye(&me, held_slot, seq) {
-                    note_item_use_start(&me);
-                    air_use_item(&me, held_slot, seq, _h, false);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            if trapdoor_state(block_at_dim(dim, x, y, z)) {
+                try_toggle_trapdoor(dim, x, y, z);
+                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                return PlayPacketControl::Skip;
+            }
+            // hotbar slots are window slots 36..=44
+            let held = {
+                let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
+                inv.get(&held_player_menu_slot(held_slot)).cloned()
+            };
+            // `BoneMealItem.useOn`: growth runs before generic placement,
+            // and exactly one item is consumed only when the target can
+            // actually grow. Mature crops pass the interaction through.
+            if let Some((item, _, _)) = held {
+                if item_to_name(item) == Some("bone_meal") && try_bonemeal_growth(dim, x, y, z) {
+                    consume_one_held_item(&me, held_slot);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
                 }
             }
-            0x04 | 0x05 => {
-                // chat_command(+signed): command string (no leading /)
-                let mut sl = &b[..];
-                if let Some(mlen) = read_varint(&mut sl) {
-                    let m =
-                        String::from_utf8_lossy(&sl[..(mlen as usize).min(sl.len())]).to_string();
-                    if !connection_limits::chat_text_valid(&m) {
-                        eprintln!("[spine] {} disconnected: illegal chat command", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Illegal characters in chat");
-                        break 'conn;
+            // hoe: convert dirt-family clicked block to farmland
+            if let Some((item, _, _)) = held {
+                let is_hoe = (822..=847).contains(&item) && (item - 822) % 5 == 0;
+                let tillable = matches!(block_at_dim(dim, x, y, z), 9 | 10 | 12513);
+                if is_hoe && tillable && face == 1 {
+                    let fm = name_to_state("farmland").unwrap_or(0);
+                    if !place((x, y, z), fm) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
                     }
-                    if !chat_throttle.allow(Instant::now()) {
-                        eprintln!("[spine] {} disconnected: chat spam", me.name);
-                        play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), "Kicked for spamming!");
-                        break 'conn;
-                    }
-
-                    run_command(Some(&me), &format!("/{}", m), &mut Some(&me));
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
                 }
-            }
-            0x06 => {
-                // chat_message: the protocol-767 signed envelope runs the live
-                // admission + relay in `live_chat_message` (P7a / #132).
-                if let Err(text) = live_chat_message(&me, &b, &mut chat_throttle) {
-                    eprintln!("[spine] {} disconnected: {}", me.name, text);
-                    play_disconnect(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), text);
-                    break 'conn;
-                }
-            }
-            0x12 => {
-                // A1-SERVER: the airship helm channel is a Create-offload
-                // subworld input, not a mod payload — dispatch it before the
-                // generic register/lod handler sees it.
-                #[cfg(feature = "create-offload")]
-                let helm = aeronautics_helm_payload_c2s(&me, &b);
-                #[cfg(not(feature = "create-offload"))]
-                let helm = false;
-                if !helm {
-                    custom_payload_c2s(&me, &b);
-                }
-            }
-            0x16 => {
-                // use_entity: attack mobs
-                let mut sl = &b[..];
-                let target = read_varint(&mut sl).unwrap_or(-1) as i32;
-                let mouse = read_varint(&mut sl).unwrap_or(-1);
-                // vanilla entity_interaction_range = 3.0; gate all attack/interact
-                // uses so distant entities can't be hit/sheared/bred cross-map.
+                // wheat seeds on farmland -> wheat age0 + consume seed
+                if item == 853
+                    && block_at_dim(dim, x, y, z) == name_to_state("farmland").unwrap_or(u32::MAX)
                 {
-                    let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    let vt: Option<Arc<Client>> = {
-                        clients()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .iter()
-                            .find(|c| c.eid == target)
-                            .cloned()
-                    };
-                    let tp = vt
-                        .map(|v| {
-                            let p = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            (p.0, p.1, p.2, false)
-                        })
-                        .or_else(|| {
-                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                            ms.iter().find(|m| m.eid == target).map(|m| {
-                                let p = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                (p.0, p.1, p.2, false)
-                            })
-                        })
-                        .or_else(|| {
-                            let gen = generated_content().lock().unwrap_or_else(|e| e.into_inner());
-                            gen.carts
-                                .iter()
-                                .find(|c| c.eid == target)
-                                .and_then(|c| c.pos().ok())
-                                .map(|p| (p[0], p[1], p[2], true))
-                        })
-                        .or_else(|| {
-                            leash_knots()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get(&target)
-                                .map(|&(_, p)| {
-                                    (
-                                        p.0 as f64 + 0.5,
-                                        p.1 as f64 + 0.5,
-                                        p.2 as f64 + 0.5,
-                                        false,
-                                    )
-                                })
-                        });
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let eye_y = client_eye_y(&me, dim, px, py, pz);
-                    let ok = tp
-                        .map(|(tx, ty, tz, is_cart)| {
-                            let center_y = ty + if is_cart { 0.35 } else { 0.9 };
-                            let (dx, dy, dz) = (tx - px, center_y - eye_y, tz - pz);
-                            dx * dx + dy * dy + dz * dz <= 3.2 * 3.2
-                        })
-                        .unwrap_or(false);
-                    if !ok {
-                        continue;
+                    if !place((tx, ty, tz), 4278) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
                     }
-                    if mouse == 1 {
-                        if let Some((tx, ty, tz, is_cart)) = tp {
-                            let target_center = [tx, ty + if is_cart { 0.35 } else { 0.9 }, tz];
-                            if !ac_check_attack(&me, dim, target_center, target) {
-                                continue;
-                            }
-                            // Persistent claims: damaging an entity inside a
-                            // claim needs the entity-attack permission.
-                            if !can_player_damage_entity(
-                                dim,
-                                tx.floor() as i32,
-                                tz.floor() as i32,
-                                &uuid_text(&me.uuid),
-                                &me.name,
-                                client_permission_level(&me) >= 4,
-                            ) {
-                                continue;
-                            }
-                        }
-                    }
-                    if mouse == 0 || mouse == 2 {
-                        if let Some((tx, _ty, tz, _is_cart)) = tp {
-                            // Persistent claims: interacting with an entity
-                            // inside a claim needs the entity-interact
-                            // permission.
-                            if !can_player_interact_entity(
-                                *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
-                                tx.floor() as i32,
-                                tz.floor() as i32,
-                                &uuid_text(&me.uuid),
-                                &me.name,
-                                client_permission_level(&me) >= 4,
-                            ) {
-                                continue;
-                            }
-                        }
-                    }
-                }
-                if mouse == 0 || mouse == 2 {
-                    let cart_uuid = generated_content()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .carts
-                        .iter()
-                        .find(|c| c.eid == target)
-                        .and_then(|c| c.uuid().ok());
-                    if let Some(uuid) = cart_uuid {
-                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 3 {
-                            unpack_cart_loot_if_needed(uuid);
-                            let key = ContainerKey::Cart(uuid);
-                            let (audience, before) =
-                                if let Some((prev, prev_anchor)) = client_open_window_and_anchor(&me)
-                                {
-                                    let aud = client_snapshot();
-                                    let cdim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                                    let halves =
-                                        client_window_halves_dim(prev, prev_anchor, cdim);
-                                    let snap = chest_opener_snapshot_dim(&aud, &halves);
-                                    (aud, snap)
-                                } else {
-                                    (Vec::new(), Vec::new())
-                                };
-                            close_live_menu(&me, false, true);
-                            let inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            open_chest_for_client(
-                                &me,
-                                (key, None),
-                                None,
-                                &inv,
-                                "Minecart with Chest",
-                            );
-                            if !before.is_empty() {
-                                sync_chest_openers_dim(&audience, &before);
-                            }
-                        }
-                        continue;
-                    }
-                    // `LeashFenceKnotEntity.interact` runs `LeadItem.bindPlayerMobs`:
-                    // every mob leashed to this player re-anchors onto the knot.
-                    if let Some(&(kdim, kpos)) = leash_knots()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&target)
-                    {
-                        if kdim == *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
-                            hitch_player_tethers(me.eid, kdim, kpos);
-                        }
-                        continue;
-                    }
-                    // `LeadItem`/`NameTagItem` `mobInteract`: leash toggle and
-                    // custom-name application before the pet paths.
-                    if leash_name_tag_interact(&me, target, held_player_menu_slot(held_slot)) {
-                        continue;
-                    }
-                    if pet_collar_or_parrot_interact(&me, target, held_player_menu_slot(held_slot)) {
-                        continue;
-                    }
-                    // `IronGolem`/`SnowGolem`/`Allay` `mobInteract` — ingot
-                    // repair, pumpkin shear, and the allay's sample give/take
-                    // ride the same lane as the pet paths.
-                    if utility_mob_interact(&me, target, held_player_menu_slot(held_slot)) {
-                        continue;
-                    }
-                    if live_mob_interact(&me, target, held_player_menu_slot(held_slot)) {
-                        continue;
-                    }
-                    // Boats, minecarts and the rideable mobs: `interact` on a
-                    // free seat starts the ride and updates every tracker with
-                    // the new SetPassengers list.
-                    if try_mount_vehicle(&me, target) {
-                        continue;
-                    }
-                    // Interact with merchants, or use the held item on an animal.
-                    let merchant_types = [name_to_etype("villager"), name_to_etype("wandering_trader")];
-                    let merchant = mobs()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .iter()
-                        .find(|m| m.eid == target && merchant_types.contains(&Some(m.etype)))
-                        .cloned();
-                    let is_merchant = merchant.is_some();
-                    let held_it = me
-                        .inv
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&held_player_menu_slot(held_slot))
-                        .cloned()
-                        .unwrap_or((0, 0, Vec::new()))
-                        .0;
-                    if held_it == 983 && !is_merchant {
-                        // shears on sheep -> wool
-                        let is_sheep = {
-                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                            ms.iter().any(|m| m.eid == target && m.etype == 87)
-                        };
-                        if is_sheep && !sheared().lock().unwrap_or_else(|e| e.into_inner()).contains(&target) {
-                            sheared().lock().unwrap_or_else(|e| e.into_inner()).insert(target);
-                            // `Sheep.shear` plays `entity.sheep.shear` via
-                            // `playSound` on the sheep — entity-attached, in
-                            // the `neutral` source, for every tracker.
-                            broadcast_entity_sound(target, "minecraft:entity.sheep.shear", 6);
-                            let (mx, my, mz) = {
-                                let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                                ms.iter()
-                                    .find(|m| m.eid == target)
-                                    .map(|m| *m.pos.lock().unwrap_or_else(|e| e.into_inner()))
-                                    .map(|p| (p.0, p.1, p.2))
-                                    .unwrap_or((0.0, 0.0, 0.0))
-                            };
-                            let n = 1 + ((target as u64).wrapping_mul(2654435761) % 3) as u8;
-                            for _ in 0..n {
-                                let deid = NEXT_EID.fetch_add(1, Ordering::SeqCst);
-                                let d = Drop {
-                                    eid: deid,
-                                    x: mx,
-                                    y: my + 0.5,
-                                    z: mz,
-                                    item: 202,
-                                    cnt: 1,
-                                    comps: Vec::new(),
-                                    age: 0,
-                                    target: None,
-                                    thrower: None,
-                                }
-                                .world_scatter(DimId::Overworld);
-                                drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                            }
-                            continue;
-                        }
-                    }
-                    if held_it == 908 && !is_merchant {
-                        // bucket on cow/sheep -> milk
-                        let milkable = {
-                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                            ms.iter()
-                                .any(|m| m.eid == target && [22i64, 77].contains(&m.etype))
-                        };
-                        if milkable {
-                            let k = held_player_menu_slot(held_slot);
-                            let c = {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let c = inv.get(&k).map(|v| v.1).unwrap_or(0);
-                                if c <= 1 {
-                                    inv.insert(k, (914, 1, Vec::new()));
-                                } else {
-                                    inv.insert(k, (908, c - 1, Vec::new()));
-                                }
-                                c
-                            };
-                            let hand_stack = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-                            let mut p = vec![0u8];
-                            write_varint(&mut p, i64::from(inv_state_next(&me)));
-                            p.extend_from_slice(&k.to_be_bytes());
-                            p.extend_from_slice(&slot_wire(&hand_stack));
-                            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                            if c > 1 {
-                                player_give_or_drop_dim(&me, (914, 1, Vec::new()));
-                            }
-                            continue;
-                        }
-                    }
-                    if matches!(held_it, 853 | 854 | 1097) && !is_merchant {
-                        // Keep the legacy wheat interaction and accept the GP-1 temptation items.
-                        let mut loved = false;
-                        {
-                            let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(m) = ms
-                                .iter()
-                                .find(|m| m.eid == target && match m.etype {
-                                    19 => matches!(held_it, 853 | 854),
-                                    77 => matches!(held_it, 854 | 1097),
-                                    22 | 87 => held_it == 854,
-                                    _ => false,
-                                })
-                            {
-                                let mut love = m.love.lock().unwrap_or_else(|e| e.into_inner());
-                                // `AnimalMob.canFallInLove`: an animal already
-                                // in love (and vanilla's breed/age cooldowns,
-                                // which this live model represents by that same
-                                // timer) passes the interaction before the item
-                                // is consumed. This also makes the client's
-                                // INTERACT_AT + INTERACT pair idempotent.
-                                if *love == 0 {
-                                    *love = 80;
-                                    loved = true;
-                                }
-                            }
-                        }
-                        if loved {
-                            if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let k = held_player_menu_slot(held_slot);
-                                if let Some((it, c, _kc)) = inv.get(&k).cloned() {
-                                    if c > 1 {
-                                        inv.insert(k, (it, c - 1, _kc));
-                                    } else {
-                                        inv.remove(&k);
-                                    }
-                                }
-                                let (it, c, _cc) =
-                                    inv.get(&k).cloned().unwrap_or((0, 0, Vec::new()));
-                                drop(inv);
-                                let mut p = vec![0u8];
-                                write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                p.extend_from_slice(&k.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                            }
-                            continue;
-                        }
-                    }
-                    if let Some(merchant) = merchant {
-                        open_live_merchant(&me, &merchant);
-                        continue;
-                    }
-                }
-                if mouse == 1 {
-                    // attack
-                    // `LeashFenceKnotEntity.hurt`: the knot breaks and every
-                    // tether it anchored detaches with its lead.
-                    if break_leash_knot(target) {
-                        continue;
-                    }
-                    // `Player.attack` on a large fireball: melee contact does
-                    // no damage; it reflects the projectile along the player's
-                    // look vector and transfers ownership to that player.
-                    let reflected_fireball = {
-                        let mut projectiles = live_mob_projectiles().lock().unwrap_or_else(|e| e.into_inner());
-                        projectiles.iter_mut().find_map(|projectile| {
-                            if projectile.eid != target || projectile.kind != MobProjectileKind::GhastFireball {
-                                return None;
-                            }
-                            let speed = mob_behavior_dot(projectile.velocity, projectile.velocity).sqrt().max(0.5);
-                            let (_, _, _, yaw, pitch, _) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                            let yr = f64::from(yaw).to_radians();
-                            let pr = f64::from(pitch).to_radians();
-                            projectile.velocity = [
-                                -yr.sin() * pr.cos() * speed,
-                                -pr.sin() * speed,
-                                yr.cos() * pr.cos() * speed,
-                            ];
-                            projectile.owner = me.eid;
-                            Some(projectile.velocity)
-                        })
-                    };
-                    if let Some([vx, vy, vz]) = reflected_fireball {
-                        let packet = velocity_pkt(
-                            target,
-                            (vx * 8000.0) as i16,
-                            (vy * 8000.0) as i16,
-                            (vz * 8000.0) as i16,
-                        );
-                        broadcast_seen_packet(target, 0x5a, &packet);
-                        continue;
-                    }
-                    // PvP: target may be another player
-                    if target != me.eid {
-                        let gm = *me.gm.lock().unwrap_or_else(|e| e.into_inner());
-                        if gm != 3 && break_generated_cart(target, gm != 1) {
-                            continue;
-                        }
-                        let mut found: Option<(i32, String, f32, f32)> = None;
-                        {
-                            // LOCK ORDER: snapshot, never hold clients() while
-                            // broadcasting or touching per-client locks
-                            // (self-deadlock: broadcast re-locks clients()).
-                            let vic: Option<Arc<Client>> = {
-                                clients()
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .iter()
-                                    .find(|c| c.eid == target)
-                                    .cloned()
-                            };
-                            if let Some(v) = vic.as_ref() {
-                                if *v.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                                } else if !live_pvp_enabled() {
-                                    // `pvp=false`: a player's melee against
-                                    // another player does nothing, the same
-                                    // way Vanilla's `Player.attack` returns
-                                    // early on `!isPvpAllowed`.
-                                    continue;
-                                } else {
-                                    // vanilla: attack_damage attribute (fist=1) + held item bonus + sharpness
-                                    let held = {
-                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        i2.get(&held_player_menu_slot(held_slot)).cloned().unwrap_or((
-                                            0,
-                                            0,
-                                            Vec::new(),
-                                        ))
-                                    };
-                                    let band = if (818..=847).contains(&held.0) {
-                                        ((held.0 - 818) / 5) as i64
-                                    } else {
-                                        -1
-                                    };
-                                    let kind = if (818..=847).contains(&held.0) {
-                                        (held.0 - 818) % 5
-                                    } else {
-                                        -1
-                                    };
-                                    // vanilla tool attack damages by kind (sword,shovel,pick,axe,hoe)
-                                    // bands: wood,stone,gold,iron,diamond,netherite
-                                    let wep = match kind {
-                                        0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],  // swords
-                                        1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],  // shovels
-                                        2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],  // pickaxes
-                                        3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0], // axes
-                                        4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],  // hoes
-                                        _ => [1.0; 6],
-                                    }[band.clamp(0, 5) as usize];
-                                    let wep = if held.0 == 1188 {
-                                        9.0
-                                    } else if held.0 == 1093 {
-                                        5.0
-                                    } else {
-                                        wep
-                                    };
-                                    let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                                    // attr default 1 = fist; an attribute-set value adds on top
-                                    let chg = melee_charge(&me, held.0);
-                                    let mace_fall = mace_attack_fall(&me, held.0);
-                                    let smash_bonus = mace_smash_damage_bonus(
-                                        mace_fall, enchant_level(&held.2, 6) as i32,
-                                    );
-                                    let crt = {
-                                        let (_px, py, _pz, _, _, g) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
-                                        !g && py < ff - 0.1
-                                    };
-                                    let (strb, wkb) = {
-                                        let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
-                                        (
-                                            ef.iter()
-                                                .find(|e| e.id == 4)
-                                                .map(|e| e.amp + 1)
-                                                .unwrap_or(0)
-                                                as f32
-                                                * 3.0,
-                                            ef.iter()
-                                                .find(|e| e.id == 17)
-                                                .map(|e| e.amp + 1)
-                                                .unwrap_or(0)
-                                                as f32
-                                                * -4.0,
-                                        )
-                                    };
-                                    let dmg = ((attr_of(
-                                        &format!("p:{}", me.name),
-                                        "generic.attack_damage",
-                                    ) as f32
-                                        - 1.0)
-                                        .max(0.0)
-                                        + wep
-                                        + sharp
-                                        + strb
-                                        + wkb)
-                                        .max(0.0)
-                                        * (0.2 + 0.8 * chg * chg);
-                                    let dmg = (dmg + smash_bonus) * if crt { 1.5 } else { 1.0 };
-                                    let Some((accepted, starts_hurt_window)) =
-                                        damage_after_invulnerability(v, dmg)
-                                    else {
-                                        continue;
-                                    };
-                                    let dmg = accepted;
-                                    // vanilla `CombatTracker.recordDamage`:
-                                    // opens or refreshes the victim's combat
-                                    // window (`0x3b` on the first hit).
-                                    combat_note_damage(v);
-                                    *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
-                                    // vanilla: an axe hit disables a raised shield for 5s
-                                    if kind == 3 && *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) {
-                                        *v.blocking.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                                        *v.shield_cd.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                                    }
-                                    let vb = kind != 3
-                                        && *v.blocking.lock().unwrap_or_else(|e| e.into_inner())
-                                        && v.shield_cd.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
-                                            > Duration::from_secs(5);
-                                    if vb {
-                                        damage_shield(v, dmg);
-                                    }
-                                    let mut h = v.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                    *h = (*h
-                                        - if vb {
-                                            0.0
-                                        } else {
-                                            hurt_absorb(v, dmg_after_breach(
-                                                v, dmg, 0, enchant_level(&held.2, 4),
-                                            ))
-                                        })
-                                    .max(0.0);
-                                    if *h <= 0.0 {
-                                        drop(h);
-                                        totem_check(v);
-                                        h = v.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                    }
-                                    let hh = *h;
-                                    drop(h);
-                                    if !vb {
-                                        damage_armor(v, dmg);
-                                        if dmg > 0.0 {
-                                            let (x, y, z, ..) = *v.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            queue_mace_smash(&me, &held, mace_fall, v.eid, [x, y, z]);
-                                        }
-                                    }
-                                    if damage_held(&me) {
-                                        let (pxx, pyy, pzz, ..) = {
-                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        };
-                                        let snd =
-                                            sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                        broadcast_near_packet(
-                                            *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
-                                            pxx,
-                                            pyy,
-                                            pzz,
-                                            -1,
-                                            0x68,
-                                            &snd,
-                                        );
-                                    }
-                                    held_slot_resync(&me);
-                                    if starts_hurt_window && !vb && dmg > 0.0 {
-                                        let attacker_dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                                        let victim_dim = *v.dim.lock().unwrap_or_else(|e| e.into_inner());
-                                        if attacker_dim == victim_dim {
-                                            broadcast_player_attack_damage(
-                                                v.eid, me.eid, victim_dim,
-                                            );
-                                        }
-                                    }
-                                    let (pp, vp) = (
-                                        {
-                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        },
-                                        {
-                                            let p = v.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        },
-                                    );
-                                    // vanilla LivingEntity.hurt → indicateDamage:
-                                    // hurtDir = atan2(dz, dx) * 57.2957763671875 - victimYaw
-                                    // where (dx, dz) is attacker minus victim position.
-                                    let hurt_yaw = {
-                                        let dx = pp.0 - vp.0;
-                                        let dz = pp.2 - vp.2;
-                                        (dz.atan2(dx) * 57.2957763671875
-                                            - f64::from(vp.3)) as f32
-                                    };
-                                    let hurt_pkt = hurt_anim_yaw(v.eid, hurt_yaw);
-                                    if let Ok(mut w) = v.sock.lock() {
-                                        let _ = send_packet(&mut w, 0x24, hurt_pkt.clone());
-                                        let _ = send_packet(&mut w, 0x5d, health_pkt_c(hh, v));
-                                    }
-                                    // vanilla LivingEntity.knockback(0.4, dx, dz): the
-                                    // strength is scaled by (1 - knockback_resistance),
-                                    // the direction is the normalized attacker-minus-
-                                    // victim offset, and SetEntityMotion clamps each
-                                    // axis to +-3.9 and truncates velocity * 8000.
-                                    let kb = vanilla_knockback(&vp, &pp);
-                                    let vel = velocity_pkt(v.eid, kb.0, kb.1, kb.2);
-                                    if let Ok(mut w) = v.sock.lock() {
-                                        let _ = send_packet(&mut w, 0x5a, vel.clone());
-                                    }
-                                    found = Some((v.eid, v.name.clone(), hh, hurt_yaw));
-                                }
-                            }
-                        }
-                        if let Some((veid, vname, hh, hurt_yaw)) = found {
-                            let hurt_pkt = hurt_anim_yaw(veid, hurt_yaw);
-                            broadcast_seen_ex_packet(veid, veid, 0x24, &hurt_pkt);
-                            if hh <= 0.0 {
-                                let victim = {
-                                    clients().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|c| c.eid == veid).cloned()
-                                };
-                                if let Some(victim) = &victim {
-                                    drop_player_items_on_death(victim);
-                                }
-                                if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                                    // Vanilla `player_attack`: the `.item`
-                                    // variant only when the killer's held
-                                    // item carries a custom name.
-                                    let weapon = {
-                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        i2.get(&held_player_menu_slot(held_slot))
-                                            .and_then(|st| renamed_custom_name(&st.2))
-                                    };
-                                    let message = format_vanilla_death_message(
-                                        &vname,
-                                        "player_attack",
-                                        Some(me.name.as_str()),
-                                        weapon.as_deref(),
-                                    );
-                                    let line = system_chat(&message);
-                                    broadcast_packet(-1, 0x6c, &line);
-                                    // vanilla `ServerPlayer.die`: under
-                                    // showDeathMessages the combat tracker's
-                                    // death message also rides
-                                    // `player_combat_kill` to the dying client.
-                                    if let Some(victim) = &victim {
-                                        let _ = send_packet(
-                                            &mut victim.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                                            0x3c,
-                                            encode_play_player_combat_kill(veid, &message).1,
-                                        );
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    let mut dead: Vec<(i32, i64, f64, f64, f64)> = Vec::new();
-                    let mut swept: Vec<i32> = Vec::new();
-                    {
-                        let ms = mobs().lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(m) = ms.iter().find(|m| m.eid == target) {
-                            if m.dim != *me.dim.lock().unwrap_or_else(|e| e.into_inner()) {
-                                continue;
-                            }
-                            // vanilla hurtTime: 0.5s of invulnerability after a hit
-                            let fresh =
-                                m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()).elapsed() >= Duration::from_millis(500);
-                            if fresh {
-                                if !live_mob_hit_allowed(m, me.eid, BossHit::Other) {
-                                    continue;
-                                }
-                                *m.hurt_at.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                            }
-                            if fresh {
-                                *me.walk_acc.lock().unwrap_or_else(|e| e.into_inner()) += 0.1;
-                                let held = {
-                                    let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                    i2.get(&held_player_menu_slot(held_slot))
-                                        .cloned()
-                                        .unwrap_or((0, 0, Vec::new()))
-                                };
-                                // vanilla melee: weapon total by tool kind; sharpness adds 0.5*lvl
-                                let band = if (818..=847).contains(&held.0) {
-                                    ((held.0 - 818) / 5) as i64
-                                } else {
-                                    -1
-                                };
-                                let kind = if (818..=847).contains(&held.0) {
-                                    (held.0 - 818) % 5
-                                } else {
-                                    -1
-                                };
-                                let wep = match kind {
-                                    0 => [4.0, 5.0, 4.0, 6.0, 7.0, 8.0],
-                                    1 => [2.5, 3.5, 2.5, 4.5, 5.5, 6.5],
-                                    2 => [2.0, 3.0, 2.0, 4.0, 5.0, 6.0],
-                                    3 => [7.0, 9.0, 7.0, 9.0, 9.0, 10.0],
-                                    4 => [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-                                    _ => [1.0; 6],
-                                }[band.clamp(0, 5) as usize];
-                                let wep = if held.0 == 1188 {
-                                    9.0
-                                } else if held.0 == 1093 {
-                                    5.0
-                                } else {
-                                    wep
-                                };
-                                let sharp = enchant_level(&held.2, 32) as f32 * 0.5;
-                                // smite (+2.5/lvl vs undead) / bane (+2.5/lvl vs arthropods)
-                                let undead = enchantment_targets_undead(m.etype);
-                                let arthro = enchantment_targets_arthropod(m.etype);
-                                let spec = if undead {
-                                    enchant_level(&held.2, 34)
-                                } else if arthro {
-                                    enchant_level(&held.2, 1)
-                                } else {
-                                    0
-                                } as f32
-                                    * 2.5;
-                                // vanilla attack cooldown: charge<1 scales damage 0.2..1.0
-                                let charge = melee_charge(&me, held.0);
-                                let scale = 0.2 + 0.8 * charge * charge;
-                                let mace_fall = mace_attack_fall(&me, held.0);
-                                let smash_bonus = mace_smash_damage_bonus(
-                                    mace_fall, enchant_level(&held.2, 6) as i32,
-                                );
-                                // Vanilla criticals require a charged attack and exclude
-                                // sprinting, water, climbable blocks, and blindness.
-                                let (px, py, pz, _, _, grounded) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                                let (bx, by, bz) = (
-                                    px.floor() as i32,
-                                    py.floor() as i32,
-                                    pz.floor() as i32,
-                                );
-                                let reg = crate::block_registry::breg();
-                                let in_water = reg.is_some_and(|r| {
-                                    r.has_water(block_at_dim(dim, bx, by, bz))
-                                        || r.has_water(block_at_dim(dim, bx, by + 1, bz))
-                                });
-                                let climbing = reg.is_some_and(|r| {
-                                    [
-                                        block_at_dim(dim, bx, by, bz),
-                                        block_at_dim(dim, bx, by + 1, bz),
-                                    ]
-                                        .into_iter()
-                                        .any(|state| {
-                                            matches!(
-                                                r.name_of(state),
-                                                "minecraft:ladder"
-                                                    | "minecraft:vine"
-                                                    | "minecraft:scaffolding"
-                                                    | "minecraft:weeping_vines"
-                                                    | "minecraft:weeping_vines_plant"
-                                                    | "minecraft:twisting_vines"
-                                                    | "minecraft:twisting_vines_plant"
-                                                    | "minecraft:cave_vines"
-                                                    | "minecraft:cave_vines_plant"
-                                            )
-                                        })
-                                });
-                                let blind = me
-                                    .effs
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .iter()
-                                    .any(|effect| effect.id == 14);
-                                let ff = *me.fall_from.lock().unwrap_or_else(|e| e.into_inner());
-                                let crit = melee_critical_allowed(
-                                    charge,
-                                    grounded,
-                                    py < ff - 0.1,
-                                    *me.fall_fly.lock().unwrap_or_else(|e| e.into_inner()),
-                                    *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
-                                    in_water,
-                                    climbing,
-                                    blind,
-                                );
-                                let (strb, wkb) = {
-                                    let ef = me.effs.lock().unwrap_or_else(|e| e.into_inner());
-                                    (
-                                        ef.iter()
-                                            .find(|e| e.id == 4)
-                                            .map(|e| e.amp + 1)
-                                            .unwrap_or(0)
-                                            as f32
-                                            * 3.0,
-                                        ef.iter()
-                                            .find(|e| e.id == 17)
-                                            .map(|e| e.amp + 1)
-                                            .unwrap_or(0)
-                                            as f32
-                                            * -4.0,
-                                    )
-                                };
-                                // Registered multi-part layouts (mod
-                                // colossals): the melee ray is tested
-                                // against the part AABBs and the struck
-                                // part's damage multiplier scales the hit —
-                                // `1.0` for every ordinary mob.
-                                let (mx2, my2, mz2, ..) =
-                                    *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                let (_ew, eh2) = entity_dimensions_1211(m.etype);
-                                let dir = [
-                                    mx2 - px,
-                                    (my2 + f64::from(eh2) / 2.0) - (py + 1.62),
-                                    mz2 - pz,
-                                ];
-                                let ray_len =
-                                    (dir[0].powi(2) + dir[1].powi(2) + dir[2].powi(2)).sqrt();
-                                let colossal_scale = if ray_len > 1e-6 {
-                                    live_colossal_attack_scale(
-                                        [px, py + 1.62, pz],
-                                        [dir[0] / ray_len, dir[1] / ray_len, dir[2] / ray_len],
-                                        ray_len + 1.0,
-                                        m,
-                                    )
-                                } else {
-                                    1.0
-                                };
-                                let mut h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                let damage = ((wep + sharp + spec + strb + wkb).max(0.0) * scale
-                                    + smash_bonus)
-                                    * colossal_scale * if crit { 1.5 } else { 1.0 };
-                                if *h <= 0.0 || damage <= 0.0 {
-                                    continue;
-                                }
-                                *h -= damage;
-                                drop(h);
-                                queue_mace_smash(&me, &held, mace_fall, m.eid, [mx2, my2, mz2]);
-                                // Vanilla swords sweep even without Sweeping Edge.
-                                if kind == 0 {
-                                    let (mx, my, mz, ..) = *m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                    let (width, height) = entity_dimensions_1211(m.etype);
-                                    let target_box = PlayerAabb {
-                                        min: [mx - f64::from(width) / 2.0, my, mz - f64::from(width) / 2.0],
-                                        max: [mx + f64::from(width) / 2.0, my + f64::from(height), mz + f64::from(width) / 2.0],
-                                    };
-                                    for other in ms.iter().filter(|other| other.eid != m.eid && other.dim == dim) {
-                                        let (ox, oy, oz, ..) = *other.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        let (ow, oh) = entity_dimensions_1211(other.etype);
-                                        let candidate = PlayerAabb {
-                                            min: [ox - f64::from(ow) / 2.0, oy, oz - f64::from(ow) / 2.0],
-                                            max: [ox + f64::from(ow) / 2.0, oy + f64::from(oh), oz + f64::from(ow) / 2.0],
-                                        };
-                                        let sweep = sweeping_attack(
-                                            charge,
-                                            grounded,
-                                            *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()),
-                                            crit,
-                                            [px, py, pz],
-                                            target_box,
-                                            candidate,
-                                            (wep + sharp + strb + wkb).max(0.0),
-                                            enchant_level(&held.2, 36) as i32,
-                                        );
-                                        if !sweep.eligible || !live_mob_hit_allowed(other, me.eid, BossHit::Other) {
-                                            continue;
-                                        }
-                                        let mut hurt_at = other.hurt_at.lock().unwrap_or_else(|e| e.into_inner());
-                                        if hurt_at.elapsed() < Duration::from_millis(500) {
-                                            continue;
-                                        }
-                                        *hurt_at = Instant::now();
-                                        drop(hurt_at);
-                                        let mut health = other.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                        if *health <= 0.0 {
-                                            continue;
-                                        }
-                                        *health -= sweep.damage;
-                                        if *health <= 0.0 {
-                                            dead.push((other.eid, other.etype, ox, oy, oz));
-                                        }
-                                        drop(health);
-                                        swept.push(other.eid);
-                                    }
-                                }
-                                // Fire Aspect adds four seconds of independent burn time per level.
-                                let fa = enchant_level(&held.2, 10);
-                                if fa > 0 && !mob_fire_immune(m.etype) {
-                                    *m.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) = fire_aspect_duration_ticks(fa);
-                                }
-                                if damage_held(&me) {
-                                    let (pxx, pyy, pzz, ..) = {
-                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        *p
-                                    };
-                                    let snd = sound_pkt_named("entity.item.break", pxx, pyy, pzz);
-                                    broadcast_near_packet(
-                                        *me.dim.lock().unwrap_or_else(|e| e.into_inner()),
-                                        pxx,
-                                        pyy,
-                                        pzz,
-                                        -1,
-                                        0x68,
-                                        &snd,
-                                    );
-                                }
-                                held_slot_resync(&me);
-                                let h = m.hp.lock().unwrap_or_else(|e| e.into_inner());
-                                if *h <= 0.0 {
-                                    let (mx, my, mz, ..) = {
-                                        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        *p
-                                    };
-                                    dead.push((m.eid, m.etype, mx, my, mz));
-                                }
-                                let ha = hurt_anim(m.eid);
-                                let _ =
-                                    send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x24, ha.clone());
-                                broadcast_seen_ex_packet(me.eid, me.eid, 0x24, &ha);
-                                // knockback away from attacker
-                                let (pp, mp) = (
-                                    {
-                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        *p
-                                    },
-                                    {
-                                        let p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        *p
-                                    },
-                                );
-                                let (mut kx, mut kz) = (mp.0 - pp.0, mp.2 - pp.2);
-                                let kl = (kx * kx + kz * kz).sqrt().max(0.01);
-                                kx /= kl;
-                                kz /= kl;
-                                let vp = velocity_pkt(
-                                    m.eid,
-                                    (kx * 3200.0) as i16,
-                                    2800,
-                                    (kz * 3200.0) as i16,
-                                );
-                                broadcast_seen_packet(m.eid, 0x5a, &vp);
-                                // vanilla: sprint attacks add knockback and reset the sprint
-                                let sprint_hit = *me.sprinting.lock().unwrap_or_else(|e| e.into_inner());
-                                if sprint_hit {
-                                    *me.sprinting.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                                }
-                                let kbs = 0.6
-                                    + 0.6 * enchant_level(&held.2, 17) as f64
-                                    + if sprint_hit { 0.5 } else { 0.0 };
-                                let (nx, nz) = (mp.0 + kx * kbs, mp.2 + kz * kbs);
-                                {
-                                    let mut p = m.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                    p.0 = nx;
-                                    p.2 = nz;
-                                }
-                                let tp = entity_teleport(m.eid, nx, mp.1, nz, mp.3, mp.4, true);
-                                broadcast_seen_packet(m.eid, 0x70, &tp);
-                            }
-                        }
-                    }
-                    for target_eid in swept {
-                        broadcast_seen(target_eid, |_c| (0x24, hurt_anim(target_eid)));
-                    }
-                    for (deid, etype, mx, my, mz) in dead {
-                        adv_event(&me.name, "player_killed_entity", Some(etype));
-                        stat_increment(&me, StatCategory::Killed, etype as i32, 1);
-                        let mn = match etype {
-                            124 => "Zombie",
-                            22 => "Cow",
-                            23 => "Creeper",
-                            91 => "Skeleton",
-                            19 => "Chicken",
-                            77 => "Pig",
-                            87 => "Sheep",
-                            100 => "Spider",
-                            _ => "mob",
-                        };
-                        if GR_SHOW_DEATH_MESSAGES.load(Ordering::Relaxed) != 0 {
-                            let line =
-                                system_chat(&format!("{} was slain by {}", mn, me.name));
-                            broadcast_packet(-1, 0x6c, &line);
-                        }
-                        let Some((mob, state)) = remove_live_mob(deid) else { continue };
-                        let burn_kill = *mob.fire_ticks.lock().unwrap_or_else(|e| e.into_inner()) > 0;
-                        live_mob_death(&mob, state, [mx, my, mz]);
-                        broadcast_seen_destroy(deid);
-                        let was_sheared = sheared().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
-                        // A dead vehicle drops its riders, a dead rider leaves
-                        // its seat, and the mob's equipment record dies with it.
-                        live_mount_forget(deid);
-                        mob_equipment().lock().unwrap_or_else(|e| e.into_inner()).remove(&deid);
-                        // looting: +0..level extra count per drop
-                        let held2 = {
-                            let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            i2.get(&held_player_menu_slot(held_slot))
-                                .cloned()
-                                .unwrap_or((0, 0, Vec::new()))
-                        };
-                        let loot = enchant_level(&held2.2, 18).clamp(0, 3) as u64;
-                        for (item, cnt, comps) in mob_loot(etype, burn_kill)
-                            .into_iter()
-                            .filter(|st| !(was_sheared && st.0 == 202))
-                            .filter(|_| GR_MOB_LOOT.load(Ordering::Relaxed) == 1)
-                        {
-                            let extra = if loot > 0 {
-                                (world_rng::next_u64() % (loot + 1)) as u8
-                            } else {
-                                0
-                            };
-                            let d = Drop {
-                                eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                x: mx,
-                                y: my,
-                                z: mz,
-                                item,
-                                cnt: cnt + extra,
-                                comps,
-                                age: 0,
-                                target: None,
-                                thrower: None,
-                            }
-                            .world_scatter(mob.dim);
-                            drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                        }
-                        xp_spawn_dim(mob.dim, mx, my, mz, mob_xp(etype));
-                        // spawn streams via interest_tick
-                    }
-                }
-            }
-            0x28 => {
-                // ServerboundRecipeBookChangeSettingsPacket
-                let mut sl = &b[..];
-                if let Some(s) = decode_recipe_book_change_settings(&mut sl) {
-                    recipe_books()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(me.uuid)
-                        .or_default()
-                        .apply_book_settings(s.book_type, s.book_open, s.filter_active);
-                }
-            }
-            0x29 => {
-                // ServerboundRecipeBookSeenRecipePacket
-                let mut sl = &b[..];
-                if let Some(id) = decode_recipe_book_seen_recipe(&mut sl) {
-                    recipe_books()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(me.uuid)
-                        .or_default()
-                        .seen_recipe(&id);
-                }
-            }
-            0x22 => {
-                // ServerboundPlaceRecipePacket
-                let mut sl = &b[..];
-                if let Some(place) = decode_place_recipe(&mut sl) {
-                    place_live_recipe(&me, &place);
-                }
-            }
-            0x09 => {
-                // client_command: 0 = perform respawn, 1 = request stats
-                // (`ServerboundClientCommandPacket` actions).
-                let mut sl = &b[..];
-                let action = read_varint(&mut sl);
-                if action == Some(1) && sl.is_empty() {
-                    let body = {
-                        let mut stats = player_stats().lock().unwrap_or_else(|e| e.into_inner());
-                        let stats = stats.entry(me.uuid).or_default();
-                        // P8b-2: the protocol-767 `award_stats` payload comes
-                        // from the P8b-2 codec over the live counter book —
-                        // same `(category, stat, value)` triples the save codec
-                        // encodes, in `BTreeMap` order.
-                        let entries: Vec<(u8, i32, i32)> = stats
-                            .counts
-                            .iter()
-                            .map(|(&(category, stat_id), &value)| {
-                                (category.id() as u8, stat_id, value)
-                            })
-                            .collect();
-                        encode_award_stats_0x04(&entries)
-                    };
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x04, body);
-                } else if action == Some(0) && sl.is_empty() {
-                    drop_player_items_on_death(&me);
-                    let restored_health = max_hp_of(&me.name);
-                    {
-                        let mut health = me.hp.lock().unwrap_or_else(|e| e.into_inner());
-                        if *health > 0.0 {
-                            continue;
-                        }
-                        *health = restored_health;
-                    }
-                    // `ServerPlayer.stopRiding` on death: the respawn starts
-                    // unmounted wherever the death happened.
-                    player_dismount(&me, false);
-                    death_drop_marks().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
-                    close_live_menu(&me, true, true);
-                    let bed_respawn = saved_players()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&me.uuid)
-                        .and_then(|save| save.respawn)
-                        .filter(|target| target.kind == SpawnTargetKind::Bed);
-                    if let Some(target) = bed_respawn {
-                        let head = (
-                            target.position.0.floor() as i32,
-                            target.position.1.floor() as i32 - 1,
-                            target.position.2.floor() as i32,
-                        );
-                        let bed_exists = block_registry::breg().is_some_and(|registry| {
-                            let state = block_at_dim(target.dim, head.0, head.1, head.2);
-                            let name = registry.name_of(state);
-                            (registry.in_tag(state, "minecraft:beds") || name.ends_with("_bed"))
-                                && registry.get_prop(state, "part").as_deref() == Some("head")
-                        });
-                        if !bed_exists || bed_stand_position(target.dim, head).is_none() {
-                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
-                            if let Some(save) = saved_players()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get_mut(&me.uuid)
-                            {
-                                save.respawn = None;
-                            }
-                            let _ = send_packet(
-                                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                                0x4c,
-                                translate_component_nbt("block.minecraft.spawn.not_valid"),
-                            );
-                        } else if let Some((sx, sy, sz)) = bed_stand_position(target.dim, head) {
-                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some((sx, sy, sz, target.angle));
-                        }
-                    }
-                    let anchor_respawn = saved_players()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get(&me.uuid)
-                        .and_then(|save| save.respawn)
-                        .filter(|target| target.kind == SpawnTargetKind::Anchor);
-                    if let Some(target) = anchor_respawn {
-                        let anchor = (
-                            target.position.0.floor() as i32,
-                            target.position.1.floor() as i32 - 1,
-                            target.position.2.floor() as i32,
-                        );
-                        let state = block_at_dim(target.dim, anchor.0, anchor.1, anchor.2);
-                        let charges = block_registry::breg().and_then(|registry| {
-                            (registry.name_of(state) == "minecraft:respawn_anchor")
-                                .then(|| registry.get_prop(state, "charges")?.parse::<u8>().ok())
-                                .flatten()
-                        });
-                        let anchor_works = target.dim == DimId::Nether
-                            || crate::worldgen::dimension_spec(target.dim).is_some_and(|spec| spec.respawn_anchor_works);
-                        let valid = anchor_works && charges.is_some_and(|charges| charges > 0);
-                        if !valid || respawn_anchor_stand_position(target.dim, anchor).is_none() {
-                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                            *me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner()) = DimId::Overworld;
-                            if let Some(save) = saved_players()
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .get_mut(&me.uuid)
-                            {
-                                save.respawn = None;
-                            }
-                            let _ = send_packet(
-                                &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                                0x4c,
-                                translate_component_nbt("block.minecraft.spawn.not_valid"),
-                            );
-                        } else if let (Some(charges), Some((sx, sy, sz))) = (charges, respawn_anchor_stand_position(target.dim, anchor)) {
-                            // The typed target still names the anchor block;
-                            // only the live respawn coordinate is replaced by
-                            // the resolved stand position. A successful Nether
-                            // anchor respawn spends exactly one charge.
-                            if let Some(reg) = block_registry::breg() {
-                                let new_state = reg.with_prop(
-                                    state,
-                                    "charges",
-                                    &respawn_anchor_consume(charges).to_string(),
-                                );
-                                if set_block_if_dim(target.dim, anchor.0, anchor.1, anchor.2, new_state, Some(state)) {
-                                    note_block_update_dim(target.dim, anchor.0, anchor.1, anchor.2, new_state);
-                                }
-                            }
-                            *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some((sx, sy, sz, target.angle));
-                        }
-                    }
-                    // P2-3-S4: respawn in the dimension the spawn point belongs to. A
-                    // death in the Nether returns to the Overworld bed/world spawn when that
-                    // is where the spawn point was set, with a full window rebuild.
-                    let (sdim, (rx, ry, rz, yaw)) = {
-                        let sdim = me.spawn_dim.lock().unwrap_or_else(|e| e.into_inner());
-                        let point = *me.spawn_pt.lock().unwrap_or_else(|e| e.into_inner());
-                        match point {
-                            Some(point) => (*sdim, point),
-                            None => {
-                                // `spawnRadius`: a bedless respawn scatters
-                                // inside the radius square around world spawn.
-                                let w = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-                                let [bx, by, bz] = resolve_world_spawn_pos(
-                                    [w.0.floor() as i32, w.1.floor() as i32, w.2.floor() as i32],
-                                    spawn_radius_blocks(),
-                                    world_rng::next_u64(),
-                                );
-                                (
-                                    DimId::Overworld,
-                                    (bx as f64 + 0.5, by as f64, bz as f64 + 0.5, w.3),
-                                )
-                            }
-                        }
-                    };
-                    switch_client_dimension(&me, sdim, (rx, ry, rz, yaw, 0.0), view);
-                    reset_player_food(&me);
-                    let _ = send_player_xp(&me, |_| Ok(()));
-                    {
-                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
-                    }
-                    let _ = send_packet(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        0x5d,
-                        health_pkt_c(max_hp_of(&me.name), &me),
-                    );
-                    send_attrs(&me);
-                    // vanilla resyncs window 0 after respawn — without it
-                    // the client keeps showing the pre-death inventory.
-                    // Respawn builds a fresh InventoryMenu server- and
-                    // client-side, so the shared counter restarts too.
-                    me.inv_state_id.store(0, Ordering::Relaxed);
-                    let mut q = vec![0u8]; // window 0 = player inventory
-                    write_varint(&mut q, i64::from(inv_state_next(&me)));
-                    write_varint(&mut q, 46);
-                    {
-                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        for i in 0..46i16 {
-                            let (it, c, _cc) = iv.get(&i).cloned().unwrap_or((0, 0, Vec::new()));
-                            q.extend_from_slice(&slot_wire(&(it, c, _cc)));
-                        }
-                    }
-                    q.extend_from_slice(&slot_wire(&(0, 0, Vec::new()))); // carried
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x13, q);
-                    let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    save_live_player_snapshot(&me, client_dim_pos(&me), &inventory);
-                }
-            }
-            0x2b => {
-                // resource_pack_receive: status varint
-                let mut sl = &b[..];
-                let status = read_varint(&mut sl);
-                eprintln!("[spine] resource_pack status {status:?}");
-                if pack_info().is_none() && status.is_some() {
-                    // A pack status with nothing advertised means the client
-                    // still holds a stale pack; `resource_pack_pop` with no id
-                    // clears the whole stack.
-                    let _ = send_play_resource_pack_pop(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        None,
-                    );
-                }
-                if resource_pack_status_disconnects(status) {
-                    play_disconnect(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        "This server requires the configured resource pack.",
-                    );
-                    break 'conn;
-                }
-            }
-            0x35 => {
-                // update_sign: pos i64, front bool, 4 strings
-                if b.len() >= 10 {
-                    let (sx, sy, sz) = read_pos(&b[..8]);
-                    let front = if b[8] != 0 { 1u8 } else { 0u8 };
-                    let mut sl = &b[9..];
-                    let mut lines: [String; 4] = Default::default();
-                    // MEGA-W2 §3.1: `ac_sanitize_sign_line` strips control
-                    // characters for everyone and `§` formatting for
-                    // non-operators; operators keep legitimate formatting.
-                    let perm = client_permission_level(&me);
-                    for l in lines.iter_mut() {
-                        let n = read_varint(&mut sl).unwrap_or(0).clamp(0, 256) as usize;
-                        let m = n.min(sl.len());
-                        *l = ac_sanitize_sign_line(&String::from_utf8_lossy(&sl[..m]), perm).line;
-                        sl = &sl[m..];
-                    }
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let pos = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                    // ServerPlayer's sign edit path checks mayInteract and the
-                    // eight-block squared distance before changing the block entity.
-                    if !matches!(*me.gm.lock().unwrap_or_else(|e| e.into_inner()), 0 | 1)
-                        || !sign_edit_in_range((pos.0, pos.1, pos.2), sx, sy, sz)
-                        || !is_sign_block_state(block_at_dim(dim, sx, sy, sz))
-                        // a waxed sign's text is frozen; vanilla drops the edit
-                        || sign_meta_at(dim, sx, sy, sz).is_waxed
-                        // Persistent claims: editing sign text modifies the
-                        // block.
-                        || !can_player_modify_block(dim, sx, sz, &me.name, perm)
-                    {
-                        continue;
-                    }
-                    signs()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert((dim, sx, sy, sz, front), lines.clone());
-                    let sign_pkt = sign_entity_pkt(dim, sx, sy, sz);
-                    broadcast_chunk_dim_packet(
-                        dim,
-                        sx.div_euclid(16),
-                        sz.div_euclid(16),
-                        0x07,
-                        &sign_pkt,
-                    );
-                }
-            }
-            0x32 => {
-                // set_creative_slot: slot i16 + slot data (creative only)
-                if b.len() >= 3 && *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1 {
-                    let Some((slot, mut st)) = slot_read_wire(&b) else {
-                        continue;
-                    };
-                    // Player inventory menu slots are crafting output/input, armor,
-                    // inventory, hotbar and offhand (0..=45).
-                    if !creative_inventory_slot(slot) {
-                        continue;
-                    }
-                    // fail-closed bomb guard: a stack whose added components
-                    // exceed the wire bound is dropped before it can be
-                    // stored, echoed, or re-broadcast through drops/pickups
-                    if !creative_slot_acceptable(&st) {
-                        continue;
-                    }
-                    creative_slot_clamp(&mut st);
-                    // MEGA-W2 §3.1: `ac_sanitize_creative_item` clamps the
-                    // count for everyone and strips dangerous NBT-bearing
-                    // components (command/spawner/spawn data, attribute
-                    // modifiers) from non-operator submissions.
-                    ac_sanitize_creative_item(&mut st, client_permission_level(&me));
-                    if st.1 > 0 {
-                        me.inv.lock().unwrap_or_else(|e| e.into_inner()).insert(slot, st.clone());
-                    } else {
-                        me.inv.lock().unwrap_or_else(|e| e.into_inner()).remove(&slot);
-                    }
-                    {
-                        let iv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&iv);
-                    }
-                    // echo container set_slot (0x15): window 0 echoes carry the
-                    // shared inventory counter (`incrementStateId`), not 0.
-                    let mut p = vec![0u8];
-                    write_varint(&mut p, i64::from(inv_state_next(&me)));
-                    p.extend_from_slice(&slot.to_be_bytes());
-                    p.extend_from_slice(&slot_wire(&st));
-                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                }
-            }
-            0x0d => {
-                let mut payload = b.as_slice();
-                if let (Some(window), Some(button)) =
-                    (read_protocol_i32(&mut payload), read_protocol_i32(&mut payload))
-                {
-                    if payload.is_empty() {
-                        with_save_guard(|| live_enchant_button(&me, window, button));
-                    }
-                }
-            }
-            0x2a => {
-                let mut payload = b.as_slice();
-                if let Some(length) = read_protocol_i32(&mut payload) {
-                    if (0..=150).contains(&length) && payload.len() == length as usize {
-                        if let Ok(name) = std::str::from_utf8(payload) {
-                            with_save_guard(|| live_anvil_rename(&me, name));
-                        }
-                    }
-                }
-            }
-            0x2d => {
-                if let Some(index) = decode_select_trade(&b) {
-                    with_save_guard(|| live_select_trade(&me, index));
-                }
-            }
-            0x2e => {
-                // set_beacon_effect: Optional<varint> primary, Optional<varint>
-                // secondary — mob-effect registry ids, not BeaconEffect ordinals.
-                let mut sl = &b[..];
-                let opt = |sl: &mut &[u8]| -> Option<Option<i64>> {
-                    match *sl.first()? {
-                        0 => {
-                            *sl = &sl[1..];
-                            Some(None)
-                        }
-                        1 => {
-                            *sl = &sl[1..];
-                            read_varint(sl).map(Some)
-                        }
-                        _ => None,
-                    }
-                };
-                let Some(primary) = opt(&mut sl) else {
-                    continue;
-                };
-                let Some(secondary) = opt(&mut sl) else {
-                    continue;
-                };
-                let primary = primary.and_then(beacon_effect_from_wire);
-                let secondary = secondary.and_then(beacon_effect_from_wire);
-                let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((bdim, bx, by, bz)) = live_beacon_anchor(&me, dim) {
-                    let applied = with_save_guard(|| {
-                        let Some(reg) = crate::block_registry::breg() else {
-                            return false;
-                        };
-                        let state = block_at_dim(bdim, bx, by, bz);
-                        let mut store = live_block_entities().lock().unwrap_or_else(|e| e.into_inner());
-                        let Some(LiveBlockEntity::Beacon(beacon)) =
-                            store.at(reg, (bdim, bx, by, bz), state)
-                        else {
-                            return false;
-                        };
-                        let held_slot = held_player_menu_slot(*me.held.lock().unwrap_or_else(|e| e.into_inner()));
-                        let stack = me
-                            .inv
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&held_slot)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut payment = BlockEntityItem::from_stack(&stack);
-                        if !beacon.confirm(primary, secondary, &mut payment) {
-                            return false;
-                        }
-                        map_take(&mut me.inv.lock().unwrap_or_else(|e| e.into_inner()), held_slot, 1);
-                        true
-                    });
-                    if applied {
-                        // The beacon's changed state is the confirmation: the
-                        // updated block-entity data goes out to every holder of
-                        // its chunk, matching sendBlockUpdated.
-                        if let Some((_, tag)) =
-                            live_block_entity_snapshot((bdim, bx, by, bz))
-                        {
-                            if let Ok(nbt) = crate::nbt::write_network_nbt(&tag) {
-                                let mut pkt = Vec::new();
-                                write_pos(&mut pkt, bx, by, bz);
-                                write_varint(&mut pkt, 14); // block entity type: beacon
-                                pkt.extend_from_slice(&nbt);
-                                broadcast_chunk_dim_packet(bdim, bx >> 4, bz >> 4, 0x07, &pkt);
-                                held_slot_resync(&me);
-                            }
-                        }
-                    }
-                }
-            }
-            0x0f => {
-                if let Some(id) = live_menu_id(&me) {
-                    if b.as_slice() == [id] {
-                        close_live_menu_id(&me, Some(id), false, true);
-                    }
-                    continue;
-                }
-                if b.first().is_some_and(|&id| id >= 4) {
-                    continue;
-                }
-                // close_window
-                // `AbstractContainerMenu.removed` -> `Container.stopOpen`: the opener
-                // counters drop and each half that moved broadcasts its BlockEvent.
-                let chest_window = client_open_window_and_anchor(&me);
-                if let Some((open, anchor)) = chest_window {
-                    let audience = client_snapshot();
-                    let cdim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let halves = client_window_halves_dim(open, anchor, cdim);
-                    let before = chest_opener_snapshot_dim(&audience, &halves);
-                    *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    sync_chest_openers_dim(&audience, &before);
-                }
-                *me.open_chest.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *me.chest_sync.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) = false;
-                beacon_menu_anchors().lock().unwrap_or_else(|e| e.into_inner()).remove(&me.eid);
-                {
-                    // vanilla containerMenu.removed: the carried stack is
-                    // thrown into the world, crafting grid goes back to inv
-                    let cur =
-                        std::mem::take(&mut *me.cursor.lock().unwrap_or_else(|e| e.into_inner()));
-                    if cur.1 > 0 {
-                        let (px, py, pz, ..) = *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                            x: px,
-                            y: py + 1.3,
-                            z: pz,
-                            item: cur.0,
-                            cnt: cur.1,
-                            comps: cur.2,
-                            age: -(server_ticks(40) as i32), // pickup delay: 2s already elapsed,
-                            target: None,
-                            thrower: None,
-                        });
-                    }
-                    let mut leftovers = Vec::new();
-                    {
+                    crops().lock().unwrap_or_else(|e| e.into_inner()).insert((dim, tx, ty, tz), 0);
+                    if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
                         let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                        for g in [&me.craft, &me.craft9] {
-                            leftovers.extend(return_crafting_grid_to_inventory(
-                                &mut inv,
-                                &mut g.lock().unwrap_or_else(|e| e.into_inner()),
-                            ));
+                        if let Some((it, c, _cc)) = inv.get(&held_player_menu_slot(held_slot)).cloned() {
+                            if c <= 1 {
+                                inv.remove(&held_player_menu_slot(held_slot));
+                            } else {
+                                inv.insert(held_player_menu_slot(held_slot), (it, c - 1, _cc));
+                            }
                         }
+                        let (it, c, _cc) =
+                            inv.get(&held_player_menu_slot(held_slot))
+                                .cloned()
+                                .unwrap_or((0, 0, Vec::new()));
+                        drop(inv);
+                        let mut p = vec![0u8];
+                        write_varint(&mut p, i64::from(inv_state_next(&me)));
+                        p.extend_from_slice(&held_player_menu_slot(held_slot).to_be_bytes());
+                        p.extend_from_slice(&slot_wire(&(it, c, _cc)));
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
                     }
-                    return_live_inputs(&me, leftovers);
-                    *me.drag.lock().unwrap_or_else(|e| e.into_inner()) = (-1, Vec::new());
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
                 }
             }
-            0x0e
-                // window_click: window u8, stateId varint, slot i16, button i8, mode varint, ...
-                if b.len() >= 6 => {
-                    let mut sl = &b[..];
-                    let wid = sl[0];
-                    sl = &sl[1..];
-                    let Some(click_state_id) = read_protocol_i32(&mut sl) else {
-                        continue;
+            if let Some((item, _cnt, _)) = held {
+                if let Some(sb) = sign_base_for_item(item) {
+                    let yaw = {
+                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
+                        p.3
+                    } as f64;
+                    let rot = (((180.0 + yaw) * 16.0 / 360.0 + 0.5) as i64 & 15) as u32;
+                    let st = sb + rot * 2 + 1;
+                    if !place((tx, ty, tz), st) {
+                        let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                        return PlayPacketControl::Skip;
+                    }
+                    ac_consume_placed_item(&me, held_slot);
+                    let mut op = Vec::new();
+                    write_pos(&mut op, tx, ty, tz);
+                    op.push(1);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x34, op);
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                // `FlintAndSteelItem.useOn` / `FireChargeItem`: fire on the
+                // face-adjacent cell — soul_fire when clicked soul soil/sand.
+                // Inside a complete obsidian frame the fire ignites the
+                // portal (soul fire does not). Block interactions above keep
+                // priority; the TNT special case is already handled.
+                if item == 798 || item == 1089 {
+                    let soul = crate::block_registry::breg().is_some_and(|reg| {
+                        matches!(
+                            reg.name_of(clicked),
+                            "minecraft:soul_sand" | "minecraft:soul_soil"
+                        )
+                    });
+                    let fire = name_to_state(if soul { "soul_fire" } else { "fire" })
+                        .unwrap_or(u32::MAX);
+                    let target_st = block_at_dim(dim, tx, ty, tz);
+                    let can_place = crate::block_registry::breg()
+                        .is_some_and(|reg| reg.is_replaceable(target_st));
+                    if fire != u32::MAX && can_place && place((tx, ty, tz), fire) {
+                        if !soul {
+                            if let Some(reg) = crate::block_registry::breg() {
+                                try_ignite_nether_portal(reg, dim, tx, ty, tz);
+                            }
+                        }
+                        if *me.gm.lock().unwrap_or_else(|e| e.into_inner()) != 1 {
+                            damage_inv_slot(&me, held_player_menu_slot(held_slot));
+                            held_slot_resync(&me);
+                        }
+                    }
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                if try_live_block_placement(
+                    &me,
+                    (dim, x, y, z),
+                    face.clamp(0, 5) as usize,
+                    cursor,
+                    held_slot,
+                    item,
+                    clicked,
+                ) {
+                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+                    return PlayPacketControl::Skip;
+                }
+                if let Some(st) = item_to_state(item) {
+                    // A chest is placed with the state vanilla computes for it:
+                    // facing from the player (opposite of the look direction),
+                    // `type` from the neighbour it may pair with, and
+                    // `waterlogged` from the fluid it replaces.
+                    let st = match chest_kind(st) {
+                        Some(name) => {
+                            let yaw = me.pos.lock().unwrap_or_else(|e| e.into_inner()).3;
+                            let sneaking = *me.sneaking.lock().unwrap_or_else(|e| e.into_inner());
+                            chest_placement_state_dim(
+                                dim,
+                                name,
+                                (tx, ty, tz),
+                                yaw,
+                                sneaking,
+                                face.clamp(0, 5) as u8,
+                            )
+                        }
+                        None => st,
                     };
-                    if sl.len() >= 4 {
-                        let slot = i16::from_be_bytes(sl[..2].try_into().unwrap());
-                        let btn = sl[2];
-                        sl = &sl[3..];
-                        let Some(mode) = read_protocol_i32(&mut sl).map(i64::from) else {
-                            continue;
-                        };
-                        let click_tail = sl;
-                        if let Some(active) = live_menu_id(&me) {
-                            if wid == active {
-                                // Vanilla never rejects on a stale stateId: it
-                                // pushes the authoritative contents first, then
-                                // processes the click anyway.
-                                let _ = live_menu_connection(&me).is_some_and(|conn| {
-                                    let mut session = conn.active.lock().unwrap_or_else(|e| e.into_inner());
-                                    match session.as_mut() {
-                                        Some(s)
-                                            if s.id == wid && s.state_id != click_state_id =>
-                                        {
-                                            sync_live_menu(&me, s, false);
-                                            true
-                                        }
-                                        _ => false,
-                                    }
-                                });
-                                with_save_guard(|| live_menu_click(&me, wid, slot, btn as i8, mode));
-                            }
-                            continue;
+                    if place((tx, ty, tz), st) {
+                        ac_consume_placed_item(&me, held_slot);
+                        if matches!(item_to_name(item), Some("wither_skeleton_skull" | "wither_skeleton_wall_skull")) {
+                            consume_wither_pattern_at(dim, (tx, ty, tz));
                         }
-                        let active = if me.open_chest.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-                            1
-                        } else if me.open_furnace.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-                            2
-                        } else if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                            3
-                        } else {
-                            0
-                        };
-                        if wid != active {
-                            continue;
-                        }
-                        // Vanilla never rejects on a stale stateId (verified
-                        // in 1.21.1 ServerGamePacketListenerImpl.
-                        // handleContainerClick bytecode): the click applies
-                        // unconditionally; the flag only selects
-                        // broadcastFullState over broadcastChanges. We push
-                        // the authoritative SetContainerContent snapshot with
-                        // a fresh id first, then process the click anyway.
-                        if container_state_stale(&me, wid, click_state_id) {
-                            resend_container_content(&me, wid);
-                        }
-                        let creative = *me.gm.lock().unwrap_or_else(|e| e.into_inner()) == 1;
-                        if wid == 0 && (5..=8).contains(&slot) && matches!(mode, 0 | 1 | 4) {
-                            let stack = me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&slot).cloned();
-                            if armor_removal_blocked(slot, stack.as_ref(), creative) {
-                                resync_slot(&me, 0, slot, &stack.unwrap());
-                                let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                resync_slot(&me, 0, -1, &cursor);
-                                continue;
-                            }
-                        }
-                        if mode == 0 {
-                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((cp, cp2)) = chest_pos {
-                                if !window_live_for(&me, (cp, cp2)) {
-                                    invalidate_client_chest_window(
-                                        &client_snapshot(),
-                                        &me,
-                                        (cp, cp2),
-                                    );
-                                    continue;
-                                }
-                                // chest window: single 0-26 chest,27-62 inv | double 0-26 A,27-53 B,54-89 inv
-                                let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                if slot == -999 {
-                                    if cur.1 > 0 {
-                                        // vanilla: left-click outside = throw whole stack, right-click = one
-                                        let n = if btn == 1 { 1 } else { cur.1 };
-                                        let it = cur.clone();
-                                        if n >= cur.1 {
-                                            *cur = (0, 0, Vec::new());
-                                        } else {
-                                            cur.1 -= n;
-                                        }
-                                        let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        };
-                                        let d = Drop {
-                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px,
-                                            y: py + 1.3,
-                                            z: pz,
-                                            item: it.0,
-                                            cnt: n,
-                                            comps: it.2.clone(),
-                                            age: 0,
-                                            target: None,
-                                            thrower: Some(me.uuid),
-                                        };
-                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                                    }
-                                } else if slot >= 0 && slot < rows + 36 {
-                                    let (gslot, gmap): (i16, &mut HashMap<i16, Stack>) =
-                                        if slot < 27 {
-                                            (slot, all.entry(cp).or_default())
-                                        } else if slot < rows {
-                                            (slot - 27, all.entry(cp2.unwrap()).or_default())
-                                        } else {
-                                            (slot - rows + 9, &mut inv)
-                                        };
-                                    click_slot(gmap, &mut cur, gslot, btn as i8);
-                                    let st = gmap.get(&gslot).cloned().unwrap_or((0, 0, Vec::new()));
-                                    drop(all);
-                                    drop(inv);
-                                    drop(cur);
-                                    send_chest_slot(&me, slot, &st);
-                                }
-                                continue;
-                            }
-                            let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(fp) = furnace_pos {
-                                let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                                let f = fs.entry(fp).or_insert(Furnace {
-                                    input: (0, 0, Vec::new()),
-                                    fuel: (0, 0, Vec::new()),
-                                    output: (0, 0, Vec::new()),
-                                    burn_left: 0,
-                                    progress: 0,
-                                    dirty: false,
-                                    xp: 0.0,
-                                    recipe_cache: CachedLookup::default(),
-                                    fuel_cache: CachedLookup::default(),
-                                });
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                if slot == -999 {
-                                    if cur.1 > 0 {
-                                        // vanilla: left-click outside = throw whole stack, right-click = one
-                                        let n = if btn == 1 { 1 } else { cur.1 };
-                                        let it = cur.clone();
-                                        if n >= cur.1 {
-                                            *cur = (0, 0, Vec::new());
-                                        } else {
-                                            cur.1 -= n;
-                                        }
-                                        let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        };
-                                        let d = Drop {
-                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px,
-                                            y: py + 1.3,
-                                            z: pz,
-                                            item: it.0,
-                                            cnt: n,
-                                            comps: it.2.clone(),
-                                            age: 0,
-                                            target: None,
-                                            thrower: Some(me.uuid),
-                                        };
-                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                                    }
-                                } else if (0..39).contains(&slot) {
-                                    if slot == 2 {
-                                        // output: take only, merge onto cursor
-                                        if f.output.1 > 0
-                                            && (cur.1 == 0
-                                                || (cur.0 == f.output.0
-                                                    && cur.2 == f.output.2
-                                                    && cur.1 + f.output.1
-                                                        <= item_stack_max(f.output.0, &f.output.2)
-                                                            as u8))
-                                        {
-                                            let got = f.output.1;
-                                            *cur = (f.output.0, cur.1 + got, f.output.2.clone());
-                                            f.output = (0, 0, Vec::new());
-                                            f.dirty = true;
-                                            let (px, py, pz, ..) = {
-                                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                                *p
-                                            };
-                                            furnace_xp_pop(f, px, py, pz);
-                                        }
-                                    } else if slot == 0 || slot == 1 {
-                                        let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
-                                        let sv = if m.1 == 0 { None } else { Some(m.clone()) };
-                                        let cv = cur.clone();
-                                        if btn == 0 {
-                                            if cv.1 == 0 {
-                                                if let Some(s) = sv {
-                                                    *cur = s;
-                                                    *m = (0, 0, Vec::new());
-                                                }
-                                            } else {
-                                                match sv {
-                                                    None => {
-                                                        *m = cv;
-                                                        *cur = (0, 0, Vec::new());
-                                                    }
-                                                    Some((si, sc, _cc)) => {
-                                                        if si == cv.0
-                                                            && _cc == cv.2
-                                                            && sc as i64 + cv.1 as i64 <= item_stack_max(si, &_cc)
-                                                        {
-                                                            *m = (si, sc + cv.1, _cc);
-                                                            *cur = (0, 0, Vec::new());
-                                                        } else {
-                                                            *m = cv;
-                                                            *cur = (si, sc, _cc);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        } else if btn == 1 {
-                                            if cv.1 == 0 {
-                                                if let Some((si, sc, _cc)) = sv {
-                                                    let take = sc - sc / 2;
-                                                    *cur = (si, take, _cc.clone());
-                                                    if sc - take == 0 {
-                                                        *m = (0, 0, Vec::new());
-                                                    } else {
-                                                        *m = (si, sc - take, _cc);
-                                                    }
-                                                }
-                                            } else {
-                                                match sv {
-                                                    None => {
-                                                        *m = (cv.0, 1, cv.2.clone());
-                                                        *cur = (cv.0, cv.1 - 1, cv.2);
-                                                    }
-                                                    Some((si, sc, _cc)) => {
-                                                        if si == cv.0 && _cc == cv.2 && sc < item_stack_max(si, &_cc) as u8 {
-                                                            *m = (si, sc + 1, _cc);
-                                                            *cur = (cv.0, cv.1 - 1, cv.2);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        f.dirty = true;
-                                    } else {
-                                        let islot = slot + 6;
-                                        click_slot(&mut inv, &mut cur, islot, btn as i8);
-                                        *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                                    }
-                                }
-                                // Snapshot the changed slots before acquiring the socket mutex.
-                                let slots = [f.input.clone(), f.fuel.clone(), f.output.clone()];
-                                let player_slot = (3..39).contains(&slot).then(|| {
-                                    (slot, inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new())))
-                                });
-                                drop(cur);
-                                drop(inv);
-                                drop(fs);
-                                wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
-                                if (0..39).contains(&slot) {
-                                    let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-                                    for (wsl, st) in slots.iter().enumerate() {
-                                        let mut p = vec![2u8];
-                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                        p.extend_from_slice(&(wsl as i16).to_be_bytes());
-                                        p.extend_from_slice(&slot_wire(st));
-                                        let _ = send_packet(&mut sock, 0x15, p);
-                                    }
-                                    if let Some((slot, st)) = player_slot {
-                                        let mut p = vec![2u8];
-                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                        p.extend_from_slice(&slot.to_be_bytes());
-                                        p.extend_from_slice(&slot_wire(&st));
-                                        let _ = send_packet(&mut sock, 0x15, p);
-                                    }
-                                }
-                                continue;
-                            }
-                            if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                                let mut grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                if slot == -999 {
-                                    if cur.1 > 0 {
-                                        let n = if btn == 1 { 1 } else { cur.1 };
-                                        let it = cur.clone();
-                                        if n >= cur.1 {
-                                            *cur = (0, 0, Vec::new());
-                                        } else {
-                                            cur.1 -= n;
-                                        }
-                                        let (px, py, pz, ..) = {
-                                            let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            *p
-                                        };
-                                        let d = Drop {
-                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px,
-                                            y: py + 1.3,
-                                            z: pz,
-                                            item: it.0,
-                                            cnt: n,
-                                            comps: it.2.clone(),
-                                            age: 0,
-                                            target: None,
-                                            thrower: Some(me.uuid),
-                                        };
-                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                                        drop(cur);
-                                        drop(grid);
-                                        drop(inv);
-                                        // spawn streams via interest_tick
-                                        // drop meta streams via interest_tick
-                                        continue;
-                                    }
-                                } else if slot == 0 {
-                                    if let Some((ri, rc, _rc)) = craft3_result(&grid) {
-                                        if cur.1 == 0
-                                            || (cur.0 == ri
-                                                && cur.2 == _rc
-                                                && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
-                                        {
-                                            let overflow = consume_crafting_grid(&mut grid, 1..=9);
-                                            let (px, py, pz, ..) =
-                                                *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                            for remainder in overflow {
-                                                let remainder = move_to_slots(&mut inv, 9..=44, remainder);
-                                                if remainder.1 > 0 {
-                                                    drop_live_stack((px, py + 1.3, pz), remainder);
-                                                }
-                                            }
-                                            *cur = (ri, cur.1 + rc, _rc.clone());
-                                        }
-                                    }
-                                } else if (1..=9).contains(&slot) {
-                                    click_slot(&mut grid, &mut cur, slot, btn as i8);
-                                } else if (10..=45).contains(&slot) {
-                                    click_slot(&mut inv, &mut cur, slot - 1, btn as i8);
-                                    *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                                }
-                                // echo changed slot + result
-                                let (it, c, _ce) = if slot == 0 {
-                                    (0, 0, Vec::new())
-                                } else if (1..=9).contains(&slot) {
-                                    grid.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
-                                } else if slot >= 10 {
-                                    inv.get(&(slot - 1)).cloned().unwrap_or((0, 0, Vec::new()))
-                                } else {
-                                    (0, 0, Vec::new())
-                                };
-                                let out = craft3_result(&grid).unwrap_or((0, 0, Vec::new()));
-                                let grid_snapshot = (slot == 0).then(|| grid.clone());
-                                drop(grid);
-                                drop(inv);
-                                drop(cur);
-                                if slot >= 0 {
-                                    let mut p = vec![3u8];
-                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                    p.extend_from_slice(&slot.to_be_bytes());
-                                    p.extend_from_slice(&slot_wire(&(it, c, _ce)));
-                                    let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p);
-                                }
-                                let mut p0 = vec![3u8];
-                                write_varint(&mut p0, i64::from(inv_state_next(&me)));
-                                p0.extend_from_slice(&0i16.to_be_bytes());
-                                p0.extend_from_slice(&slot_wire(&(out.0, out.1, Vec::new())));
-                                let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x15, p0);
-                                if let Some(grid) = grid_snapshot {
-                                    for grid_slot in 1..=9i16 {
-                                        let mut p = vec![3u8];
-                                        write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                        p.extend_from_slice(&grid_slot.to_be_bytes());
-                                        p.extend_from_slice(&slot_wire(
-                                            &grid.get(&grid_slot).cloned().unwrap_or_default(),
-                                        ));
-                                        let _ = send_packet(
-                                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                                            0x15,
-                                            p,
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-                            // Window 0 (player inventory + 2x2 craft grid). Vanilla's
-                            // post-click broadcast emits only the slots whose content
-                            // changed, in menu order (result, grid, armor, inventory,
-                            // offhand), then the carried stack when it differs from the
-                            // stack the client acknowledged in this click.
-                            let pre_grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let pre_inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let pre_result =
-                                craft_result(&pre_grid).unwrap_or((0, 0, Vec::new()));
-                            if slot == -999 {
-                                let cur = {
-                                    let c = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                    c.clone()
-                                };
-                                if cur.1 > 0 {
-                                    let n = if btn == 1 { 1 } else { cur.1 };
-                                    if n >= cur.1 {
-                                        *me.cursor.lock().unwrap_or_else(|e| e.into_inner()) = (0, 0, Vec::new());
-                                    } else {
-                                        me.cursor.lock().unwrap_or_else(|e| e.into_inner()).1 -= n;
-                                    }
-                                    let (px, py, pz, ..) = {
-                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                        *p
-                                    };
-                                    let d = Drop {
-                                        eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                        x: px,
-                                        y: py + 1.3,
-                                        z: pz,
-                                        item: cur.0,
-                                        cnt: n,
-                                        comps: cur.2.clone(),
-                                        age: 0,
-                                        target: None,
-                                        thrower: Some(me.uuid),
-                                    };
-                                    drops().lock().unwrap_or_else(|e| e.into_inner()).push(d);
-                                }
-                            } else if slot == 0 {
-                                // craft output: take result, consume one of each ingredient
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some((ri, rc, _rc)) = craft_result(&grid) {
-                                    if cur.1 == 0
-                                        || (cur.0 == ri
-                                            && cur.2 == _rc
-                                            && cur.1 + rc <= item_stack_max(ri, &_rc) as u8)
-                                    {
-                                        let overflow = consume_crafting_grid(&mut grid, 1..=4);
-                                        drop(grid);
-                                        return_live_inputs(&me, overflow);
-                                        *cur = (ri, cur.1 + rc, _rc.clone());
-                                    }
-                                }
-                            } else if (1..=4).contains(&slot) {
-                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                click_slot(&mut grid, &mut cur, slot, btn as i8);
-                            } else if (5..=8).contains(&slot) || slot == 45 {
-                                // armor + offhand: vanilla restricts armor
-                                // slots to their matching piece type
-                                let armor_slot_ok = |it: i64, sl: i16| -> bool {
-                                    if it == 0 {
-                                        return true;
-                                    }
-                                    let n = |x: &str| name_to_item(x).unwrap_or(-1);
-                                    match sl {
-                                        5 => {
-                                            it == n("leather_helmet")
-                                                || it == n("golden_helmet")
-                                                || it == n("chainmail_helmet")
-                                                || it == n("iron_helmet")
-                                                || it == n("diamond_helmet")
-                                                || it == n("netherite_helmet")
-                                                || it == n("turtle_helmet")
-                                        }
-                                        6 => {
-                                            it == n("leather_chestplate")
-                                                || it == n("golden_chestplate")
-                                                || it == n("chainmail_chestplate")
-                                                || it == n("iron_chestplate")
-                                                || it == n("diamond_chestplate")
-                                                || it == n("netherite_chestplate")
-                                                || it == n("elytra")
-                                        }
-                                        7 => {
-                                            it == n("leather_leggings")
-                                                || it == n("golden_leggings")
-                                                || it == n("chainmail_leggings")
-                                                || it == n("iron_leggings")
-                                                || it == n("diamond_leggings")
-                                                || it == n("netherite_leggings")
-                                        }
-                                        8 => {
-                                            it == n("leather_boots")
-                                                || it == n("golden_boots")
-                                                || it == n("chainmail_boots")
-                                                || it == n("iron_boots")
-                                                || it == n("diamond_boots")
-                                                || it == n("netherite_boots")
-                                        }
-                                        _ => true,
-                                    }
-                                };
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                if cur.1 > 0 && armor_slot_ok(cur.0, slot) || cur.1 == 0 {
-                                    click_slot(&mut inv, &mut cur, slot, btn as i8);
-                                    *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                                }
-                            } else if (9..=44).contains(&slot) {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                                click_slot(&mut inv, &mut cur, slot, btn as i8);
-                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                            }
-                            let post_grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let post_inv = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let post_cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                            let post_result =
-                                craft_result(&post_grid).unwrap_or((0, 0, Vec::new()));
-                            let carried = click_carried_stack(click_tail);
-                            let mut sock = me.sock.lock().unwrap_or_else(|e| e.into_inner());
-                            if post_result != pre_result {
-                                let mut p = vec![0u8];
-                                write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                p.extend_from_slice(&0i16.to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&post_result));
-                                let _ = send_packet(&mut sock, 0x15, p);
-                            }
-                            for i in 1..=4i16 {
-                                let now = post_grid
-                                    .get(&i)
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                                let was = pre_grid
-                                    .get(&i)
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                                if now != was {
-                                    let mut p = vec![0u8];
-                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                    p.extend_from_slice(&i.to_be_bytes());
-                                    p.extend_from_slice(&slot_wire(&now));
-                                    let _ = send_packet(&mut sock, 0x15, p);
-                                }
-                            }
-                            for i in 5..=45i16 {
-                                let now = post_inv
-                                    .get(&i)
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                                let was = pre_inv
-                                    .get(&i)
-                                    .cloned()
-                                    .unwrap_or((0, 0, Vec::new()));
-                                if now != was {
-                                    let mut p = vec![0u8];
-                                    write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                    p.extend_from_slice(&i.to_be_bytes());
-                                    p.extend_from_slice(&slot_wire(&now));
-                                    let _ = send_packet(&mut sock, 0x15, p);
-                                }
-                            }
-                            let cursor_differs = match carried {
-                                Some(st) => st != post_cur,
-                                None => post_cur.1 > 0,
-                            };
-                            if cursor_differs {
-                                let mut p = vec![0xFFu8];
-                                write_varint(&mut p, i64::from(inv_state_next(&me)));
-                                p.extend_from_slice(&(-1i16).to_be_bytes());
-                                p.extend_from_slice(&slot_wire(&post_cur));
-                                let _ = send_packet(&mut sock, 0x15, p);
-                            }
-                        } else if mode == 2 {
-                            // number-key swap: hovered slot <-> hotbar slot btn (0-8)
-                            if let Some(hb) = hotbar_swap_slot(btn as i8) {
-                                let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some((cp, cp2)) = chest_pos {
-                                    if !window_live_for(&me, (cp, cp2)) {
-                                        invalidate_client_chest_window(
-                                            &client_snapshot(),
-                                            &me,
-                                            (cp, cp2),
-                                        );
-                                        continue;
-                                    }
-                                }
-                                let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some((cp, cp2)) = chest_pos {
-                                    let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-                                    if slot >= 0 && slot < rows + 36 {
-                                        let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                                        if slot < rows {
-                                            let (pos, gslot) = if slot < 27 {
-                                                (cp, slot)
-                                            } else {
-                                                (cp2.unwrap(), slot - 27)
-                                            };
-                                            let m = all.entry(pos).or_default();
-                                            let sst =
-                                                m.remove(&gslot).unwrap_or((0, 0, Vec::new()));
-                                            if hst.1 > 0 {
-                                                m.insert(gslot, hst.clone());
-                                            }
-                                            if sst.1 > 0 {
-                                                inv.insert(hb, sst);
-                                            }
-                                        } else {
-                                            let g = slot - rows + 9;
-                                            let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                                            if sst.1 > 0 {
-                                                inv.insert(hb, sst);
-                                            }
-                                            if hst.1 > 0 {
-                                                inv.insert(g, hst.clone());
-                                            }
-                                            resync_slot(&me, 1, slot, &hst);
-                                            resync_slot(
-                                                &me,
-                                                1,
-                                                rows + (hb - 9),
-                                                &inv.get(&hb).cloned().unwrap_or((
-                                                    0,
-                                                    0,
-                                                    Vec::new(),
-                                                )),
-                                            );
-                                            drop(all);
-                                            drop(inv);
-                                            continue;
-                                        }
-                                        let cur_st = {
-                                            let (pos, gslot) = if slot < 27 {
-                                                (cp, slot)
-                                            } else {
-                                                (cp2.unwrap(), slot - 27)
-                                            };
-                                            all.get(&pos)
-                                                .and_then(|m| m.get(&gslot))
-                                                .cloned()
-                                                .unwrap_or((0, 0, Vec::new()))
-                                        };
-                                        resync_slot(&me, 1, slot, &cur_st);
-                                        resync_slot(
-                                            &me,
-                                            1,
-                                            rows + (hb - 9),
-                                            &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
-                                        );
-                                    }
-                                } else if let Some(fp) = furnace_pos {
-                                    let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                                    if (0..39).contains(&slot) {
-                                        let hst = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                                        if slot >= 3 {
-                                            let g = slot + 6;
-                                            let sst = inv.remove(&g).unwrap_or((0, 0, Vec::new()));
-                                            if sst.1 > 0 {
-                                                inv.insert(hb, sst);
-                                            }
-                                            if hst.1 > 0 {
-                                                inv.insert(g, hst.clone());
-                                            }
-                                            resync_slot(&me, 2, slot, &hst);
-                                        } else {
-                                            let f = fs.entry(fp).or_insert(Furnace {
-                                                input: (0, 0, Vec::new()),
-                                                fuel: (0, 0, Vec::new()),
-                                                output: (0, 0, Vec::new()),
-                                                burn_left: 0,
-                                                progress: 0,
-                                                dirty: false,
-                                                xp: 0.0,
-                                                recipe_cache: CachedLookup::default(),
-                                                fuel_cache: CachedLookup::default(),
-                                            });
-                                            if slot == 2 {
-                                                // output is take-only — push it to hotbar, don't swap in
-                                                if f.output.1 > 0 {
-                                                    let st = std::mem::take(&mut f.output);
-                                                    f.dirty = true;
-                                                    let (px, py, pz, ..) = {
-                                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                                        *p
-                                                    };
-                                                    furnace_xp_pop(f, px, py, pz);
-                                                    let rem = move_to_slots(&mut inv, 9..=44, st);
-                                                    if rem.1 > 0 {
-                                                        fs.get_mut(&fp).unwrap().output = rem;
-                                                    }
-                                                }
-                                            } else {
-                                                let m = if slot == 0 {
-                                                    &mut f.input
-                                                } else {
-                                                    &mut f.fuel
-                                                };
-                                                let sst = std::mem::take(m);
-                                                if hst.1 > 0 {
-                                                    *m = hst.clone();
-                                                }
-                                                f.dirty = true;
-                                                if sst.1 > 0 {
-                                                    inv.insert(hb, sst);
-                                                }
-                                            }
-                                        }
-                                        resync_slot(
-                                            &me,
-                                            2,
-                                            hb - 6,
-                                            &inv.get(&hb).cloned().unwrap_or((0, 0, Vec::new())),
-                                        ); // inv hotbar window slot = 30 + (hb-36)+9?
-                                        wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
-                                    }
-                                } else {
-                                    // inventory window: swap slot with hotbar (armor slots refuse)
-                                    let swappables = (9..=44).contains(&slot) || slot == 45;
-                                    if swappables {
-                                        let a = inv.remove(&slot).unwrap_or((0, 0, Vec::new()));
-                                        let b = inv.remove(&hb).unwrap_or((0, 0, Vec::new()));
-                                        if b.1 > 0 {
-                                            inv.insert(slot, b.clone());
-                                        }
-                                        if a.1 > 0 {
-                                            inv.insert(hb, a.clone());
-                                        }
-                                        resync_slot(&me, 0, slot, &b);
-                                        resync_slot(&me, 0, hb, &a);
-                                    }
-                                }
-                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                            }
-                        } else if mode == 6 {
-                            // double-click: gather all matching stacks in the
-                            // window onto the cursor (up to stack cap)
-                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((cp, cp2)) = chest_pos {
-                                if !window_live_for(&me, (cp, cp2)) {
-                                    invalidate_client_chest_window(
-                                        &client_snapshot(),
-                                        &me,
-                                        (cp, cp2),
-                                    );
-                                    continue;
-                                }
-                            }
-                            let mut cur = me.cursor.lock().unwrap_or_else(|e| e.into_inner());
-                            let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                            if cur.1 > 0 {
-                                let cap = item_stack_max(cur.0, &cur.2) as i64;
-                                if let Some((cp, cp2)) = chest_pos {
-                                    let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-                                    for pos in [cp].into_iter().chain(cp2) {
-                                        let m = all.entry(pos).or_default();
-                                        let ks: Vec<i16> = m
-                                            .iter()
-                                            .filter(|(_, v)| v.0 == cur.0 && v.2 == cur.2)
-                                            .map(|(&k, _)| k)
-                                            .collect();
-                                        for k in ks {
-                                            if cur.1 as i64 >= cap {
-                                                break;
-                                            }
-                                            let take =
-                                                (cap - cur.1 as i64).min(m[&k].1 as i64) as u8;
-                                            m.get_mut(&k).unwrap().1 -= take;
-                                            cur.1 += take;
-                                            if m[&k].1 == 0 {
-                                                m.remove(&k);
-                                            }
-                                        }
-                                    }
-                                }
-                                if (cur.1 as i64) < cap {
-                                    let ks: Vec<i16> = inv
-                                        .iter()
-                                        .filter(|(&slot, stack)| {
-                                            stack.0 == cur.0
-                                                && stack.2 == cur.2
-                                                && !armor_removal_blocked(slot, Some(stack), creative)
-                                        })
-                                        .map(|(&k, _)| k)
-                                        .collect();
-                                    for k in ks {
-                                        if cur.1 as i64 >= cap {
-                                            break;
-                                        }
-                                        let take = (cap - cur.1 as i64).min(inv[&k].1 as i64) as u8;
-                                        inv.get_mut(&k).unwrap().1 -= take;
-                                        cur.1 += take;
-                                        if inv[&k].1 == 0 {
-                                            inv.remove(&k);
-                                        }
-                                    }
-                                }
-                            }
-                            let cp2 = cur.clone();
-                            drop(inv);
-                            drop(cur);
-                            // cursor echo (window slot -1) + whole-inventory refresh is cheapest
-                            let mut pc = vec![0u8];
-                            write_varint(&mut pc, i64::from(inv_state_next(&me)));
-                            pc.extend_from_slice(&(-1i16).to_be_bytes());
-                            pc.extend_from_slice(&slot_wire(&cp2));
-                            if let Ok(mut w) = me.sock.lock() {
-                                let _ = send_packet(&mut w, 0x15, pc);
-                            }
-                        } else if mode == 5 {
-                            // drag-paint: btn 0/4 start (left/right), 1/5 add slot, 2/6 end
-                            drag_paint_click(&me, slot, btn as i32);
-                        } else if mode == 4 || mode == 1 {
-                            // vanilla click modes: 4=throw hovered slot (btn 0=one,
-                            // 1=whole stack); 1=shift-move between regions
-                            let chest_pos = *me.open_chest.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some((cp, cp2)) = chest_pos {
-                                if !window_live_for(&me, (cp, cp2)) {
-                                    invalidate_client_chest_window(
-                                        &client_snapshot(),
-                                        &me,
-                                        (cp, cp2),
-                                    );
-                                    continue;
-                                }
-                            }
-                            let furnace_pos = *me.open_furnace.lock().unwrap_or_else(|e| e.into_inner());
-                            let (px, py, pz, ..) = {
-                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                *p
-                            };
-                            macro_rules! throw {
-                                ($st:expr) => {{
-                                    let st: Stack = $st;
-                                    if st.1 > 0 {
-                                        drops().lock().unwrap_or_else(|e| e.into_inner()).push(Drop {
-                                            eid: NEXT_EID.fetch_add(1, Ordering::SeqCst),
-                                            x: px,
-                                            y: py + 1.3,
-                                            z: pz,
-                                            item: st.0,
-                                            cnt: st.1,
-                                            comps: st.2,
-                                            age: 0,
-                                            target: None,
-                                            thrower: Some(me.uuid),
-                                        });
-                                    }
-                                }};
-                            }
-                            if let Some((cp, cp2)) = chest_pos {
-                                // window slots: 0..rows chest | rows..rows+36 inv(key=slot-rows+9)
-                                let rows = if cp2.is_some() { 54i16 } else { 27i16 };
-                                let mut all = chests().lock().unwrap_or_else(|e| e.into_inner());
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                if slot >= 0 && slot < rows + 36 {
-                                    let in_cont = slot < rows;
-                                    if mode == 4 {
-                                        let n = if btn == 1 { 255 } else { 1 };
-                                        let got = if in_cont {
-                                            let (pos, gslot) = if slot < 27 {
-                                                (cp, slot)
-                                            } else {
-                                                (cp2.unwrap(), slot - 27)
-                                            };
-                                            map_take(all.entry(pos).or_default(), gslot, n)
-                                        } else {
-                                            map_take(&mut inv, slot - rows + 9, n)
-                                        };
-                                        if let Some(st) = got {
-                                            throw!(st);
-                                        }
-                                    } else {
-                                        quick_move_chest(&mut all, &mut inv, cp, cp2, slot);
-                                    }
-                                    // resync touched slot + inventory/chest echo kept cheap
-                                    let cur_st = if in_cont {
-                                        let (pos, gslot) = if slot < 27 {
-                                            (cp, slot)
-                                        } else {
-                                            (cp2.unwrap(), slot - 27)
-                                        };
-                                        all.get(&pos)
-                                            .and_then(|m| m.get(&gslot))
-                                            .cloned()
-                                            .unwrap_or((0, 0, Vec::new()))
-                                    } else {
-                                        inv.get(&(slot - rows + 9)).cloned().unwrap_or((
-                                            0,
-                                            0,
-                                            Vec::new(),
-                                        ))
-                                    };
-                                    resync_slot(&me, 1, slot, &cur_st);
-                                }
-                                continue;
-                            }
-                            if let Some(fp) = furnace_pos {
-                                // window: 0 input,1 fuel,2 output | 3..38 inv(key=slot+6)
-                                let mut fs = furnaces().lock().unwrap_or_else(|e| e.into_inner());
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                if (0..39).contains(&slot) {
-                                    if mode == 4 {
-                                        if slot >= 3 {
-                                            if let Some(st) = map_take(
-                                                &mut inv,
-                                                slot + 6,
-                                                if btn == 1 { 255 } else { 1 },
-                                            ) {
-                                                throw!(st);
-                                            }
-                                        } else {
-                                            let f = fs.entry(fp).or_insert(Furnace {
-                                                input: (0, 0, Vec::new()),
-                                                fuel: (0, 0, Vec::new()),
-                                                output: (0, 0, Vec::new()),
-                                                burn_left: 0,
-                                                progress: 0,
-                                                dirty: false,
-                                                xp: 0.0,
-                                                recipe_cache: CachedLookup::default(),
-                                                fuel_cache: CachedLookup::default(),
-                                            });
-                                            let m = if slot == 0 {
-                                                &mut f.input
-                                            } else if slot == 1 {
-                                                &mut f.fuel
-                                            } else {
-                                                &mut f.output
-                                            };
-                                            let n = if btn == 1 { m.1 } else { 1.min(m.1) };
-                                            if n > 0 {
-                                                let st = (m.0, n, m.2.clone());
-                                                m.1 -= n;
-                                                if m.1 == 0 {
-                                                    *m = (0, 0, Vec::new());
-                                                }
-                                                f.dirty = true;
-                                                if slot == 2 {
-                                                    let (px, py, pz, ..) = {
-                                                        let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                                        *p
-                                                    };
-                                                    furnace_xp_pop(f, px, py, pz);
-                                                }
-                                                throw!(st);
-                                            }
-                                        }
-                                    } else if slot == 2 {
-                                        // shift-take output into inventory
-                                        let f = fs.entry(fp).or_insert(Furnace {
-                                            input: (0, 0, Vec::new()),
-                                            fuel: (0, 0, Vec::new()),
-                                            output: (0, 0, Vec::new()),
-                                            burn_left: 0,
-                                            progress: 0,
-                                            dirty: false,
-                                            xp: 0.0,
-                                            recipe_cache: CachedLookup::default(),
-                                            fuel_cache: CachedLookup::default(),
-                                        });
-                                        if f.output.1 > 0 {
-                                            let st = std::mem::take(&mut f.output);
-                                            f.dirty = true;
-                                            let (px, py, pz, ..) = {
-                                                let p = me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                                *p
-                                            };
-                                            furnace_xp_pop(f, px, py, pz);
-                                            let rem = move_to_slots(&mut inv, 9..=44, st);
-                                            if rem.1 > 0 {
-                                                fs.get_mut(&fp).unwrap().output = rem;
-                                            }
-                                        }
-                                    } else if slot <= 1 {
-                                        // shift input/fuel -> inv
-                                        let f = fs.entry(fp).or_insert(Furnace {
-                                            input: (0, 0, Vec::new()),
-                                            fuel: (0, 0, Vec::new()),
-                                            output: (0, 0, Vec::new()),
-                                            burn_left: 0,
-                                            progress: 0,
-                                            dirty: false,
-                                            xp: 0.0,
-                                            recipe_cache: CachedLookup::default(),
-                                            fuel_cache: CachedLookup::default(),
-                                        });
-                                        let m = if slot == 0 { &mut f.input } else { &mut f.fuel };
-                                        if m.1 > 0 {
-                                            let st = std::mem::take(m);
-                                            f.dirty = true;
-                                            let rem = move_to_slots(&mut inv, 9..=44, st);
-                                            if rem.1 > 0 {
-                                                let f2 = fs.get_mut(&fp).unwrap();
-                                                if slot == 0 {
-                                                    f2.input = rem
-                                                } else {
-                                                    f2.fuel = rem
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        // shift inv -> furnace input/fuel by type, else stays
-                                        if let Some(st) = inv.get(&(slot + 6)).cloned() {
-                                            let f = fs.entry(fp).or_insert(Furnace {
-                                                input: (0, 0, Vec::new()),
-                                                fuel: (0, 0, Vec::new()),
-                                                output: (0, 0, Vec::new()),
-                                                burn_left: 0,
-                                                progress: 0,
-                                                dirty: false,
-                                                xp: 0.0,
-                                                recipe_cache: CachedLookup::default(),
-                                                fuel_cache: CachedLookup::default(),
-                                            });
-                                            let dst: i16 = if smelt_out(st.0).is_some() {
-                                                0
-                                            } else if fuel_ticks(st.0) > 0 {
-                                                1
-                                            } else {
-                                                -1
-                                            };
-                                            if dst >= 0 {
-                                                let m = if dst == 0 {
-                                                    &mut f.input
-                                                } else {
-                                                    &mut f.fuel
-                                                };
-                                                let fits = m.1 == 0
-                                                    || (m.0 == st.0
-                                                        && m.2 == st.2
-                                                        && (m.1 as i64)
-                                                            < item_stack_max(m.0, &m.2));
-                                                if fits {
-                                                    inv.remove(&(slot + 6));
-                                                    let room = item_stack_max(st.0, &st.2)
-                                                        .min(255)
-                                                        as u8;
-                                                    let t = if m.1 == 0 {
-                                                        room.min(st.1)
-                                                    } else {
-                                                        (room - m.1).min(st.1)
-                                                    };
-                                                    if m.1 == 0 {
-                                                        *m = (st.0, t, st.2.clone());
-                                                    } else {
-                                                        m.1 += t;
-                                                    }
-                                                    f.dirty = true;
-                                                    if t < st.1 {
-                                                        inv.insert(
-                                                            slot + 6,
-                                                            (st.0, st.1 - t, st.2),
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    let cur_st = if slot >= 3 {
-                                        inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()))
-                                    } else {
-                                        let f2 = fs.get(&fp).unwrap();
-                                        match slot {
-                                            0 => f2.input.clone(),
-                                            1 => f2.fuel.clone(),
-                                            _ => f2.output.clone(),
-                                        }
-                                    };
-                                    resync_slot(&me, 2, slot, &cur_st);
-                                    wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
-                                }
-                                continue;
-                            }
-                            // inventory window: 5-8 armor | 45 offhand | 1-4 craft | 9-44 inv
-                            {
-                                let mut inv = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                let mut grid = me.craft.lock().unwrap_or_else(|e| e.into_inner());
-                                if mode == 4 {
-                                    let got = if (5..=8).contains(&slot)
-                                        || (9..=44).contains(&slot)
-                                        || slot == 45
-                                    {
-                                        map_take(&mut inv, slot, if btn == 1 { 255 } else { 1 })
-                                    } else if (1..=4).contains(&slot) {
-                                        map_take(&mut grid, slot, if btn == 1 { 255 } else { 1 })
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(st) = got {
-                                        throw!(st);
-                                    }
-                                    resync_slot(
-                                        &me,
-                                        0,
-                                        slot,
-                                        &inv.get(&slot).cloned().unwrap_or((0, 0, Vec::new())),
-                                    );
-                                } else if slot == 0 {
-                                    let overflow = if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                                        let mut grid9 = me.craft9.lock().unwrap_or_else(|e| e.into_inner());
-                                        quick_move_crafting_result(&mut inv, &mut grid9, 1..=9, craft3_result)
-                                    } else {
-                                        quick_move_crafting_result(&mut inv, &mut grid, 1..=4, craft_result)
-                                    };
-                                    let (px, py, pz, ..) =
-                                        *me.pos.lock().unwrap_or_else(|e| e.into_inner());
-                                    for remainder in overflow {
-                                        drop_live_stack((px, py + 1.3, pz), remainder);
-                                    }
-                                } else if (9..=35).contains(&slot) {
-                                    // shift from main inv: armor equips, else -> hotbar
-                                    if let Some(st) = inv.get(&slot).cloned() {
-                                        let asl = armor_slot_for(st.0);
-                                        if asl >= 0 && !inv.contains_key(&asl) {
-                                            inv.remove(&slot);
-                                            inv.insert(asl, st);
-                                            resync_slot(
-                                                &me,
-                                                0,
-                                                asl,
-                                                &inv.get(&asl).cloned().unwrap(),
-                                            );
-                                        } else {
-                                            inv.remove(&slot);
-                                            let rem = move_to_slots(&mut inv, player_hotbar_menu_slots(), st);
-                                            if rem.1 > 0 {
-                                                inv.insert(slot, rem);
-                                            }
-                                        }
-                                    }
-                                } else if hotbar_slot_from_menu(slot).is_some() {
-                                    if let Some(st) = inv.get(&slot).cloned() {
-                                        inv.remove(&slot);
-                                        let rem = move_to_slots(&mut inv, 9..=35, st);
-                                        if rem.1 > 0 {
-                                            inv.insert(slot, rem);
-                                        }
-                                    }
-                                } else if (5..=8).contains(&slot) || slot == 45 {
-                                    // unequip into inventory
-                                    if let Some(st) = inv.get(&slot).cloned() {
-                                        inv.remove(&slot);
-                                        let rem = move_to_slots(&mut inv, 9..=44, st);
-                                        if rem.1 > 0 {
-                                            inv.insert(slot, rem);
-                                        }
-                                    }
-                                } else if (1..=4).contains(&slot) {
-                                    if let Some(st) = grid.get(&slot).cloned() {
-                                        grid.remove(&slot);
-                                        let rem = move_to_slots(&mut inv, 9..=44, st);
-                                        if rem.1 > 0 {
-                                            grid.insert(slot, rem);
-                                        }
-                                    }
-                                }
-                                *me.armor_pts.lock().unwrap_or_else(|e| e.into_inner()) = armor_pts_of(&inv);
-                                drop(grid);
-                                drop(inv);
-                                if slot == 0 {
-                                    if *me.open_table.lock().unwrap_or_else(|e| e.into_inner()) {
-                                        resend_container_content(&me, 3);
-                                        let grid = me.craft9.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                        resync_slot(
-                                            &me,
-                                            3,
-                                            0,
-                                            &craft3_result(&grid).unwrap_or_default(),
-                                        );
-                                    } else {
-                                        let grid = me.craft.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                        resync_slot(
-                                            &me,
-                                            0,
-                                            0,
-                                            &craft_result(&grid).unwrap_or_default(),
-                                        );
-                                        for craft_slot in 1..=4i16 {
-                                            resync_slot(
-                                                &me,
-                                                0,
-                                                craft_slot,
-                                                &grid.get(&craft_slot).cloned().unwrap_or_default(),
-                                            );
-                                        }
-                                        let inventory = me.inv.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                        for inventory_slot in 5..=45i16 {
-                                            resync_slot(
-                                                &me,
-                                                0,
-                                                inventory_slot,
-                                                &inventory.get(&inventory_slot).cloned().unwrap_or_default(),
-                                            );
-                                        }
-                                        let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                        resync_slot(&me, 0, -1, &cursor);
-                                    }
-                                } else {
-                                    resync_slot(&me, 0, slot, &{
-                                        let i2 = me.inv.lock().unwrap_or_else(|e| e.into_inner());
-                                        i2.get(&slot).cloned().unwrap_or((0, 0, Vec::new()))
-                                    });
-                                }
-                                // armor/offhand moves need armor slot echo too
-                                if (5..=8).contains(&slot) || slot == 45 || mode == 1 {
-                                    for asl in 5..=8i16 {
-                                        let st2 =
-                                            me.inv.lock().unwrap_or_else(|e| e.into_inner()).get(&asl).cloned().unwrap_or((
-                                                0,
-                                                0,
-                                                Vec::new(),
-                                            ));
-                                        resync_slot(&me, 0, asl, &st2);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            0x01 => {
-                // block_entity_tag_query: the OP>=2 debug-stick query; the
-                // block's live NBT answers on `tag_query` (S2C 0x6e).
-                if let Some((tx_id, pos)) = decode_block_entity_tag_query(&b) {
-                    if client_permission_level(&me) >= 2 {
-                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        let nbt = live_block_entity_snapshot((dim, pos.0, pos.1, pos.2))
-                            .map(|(_, tag)| tag);
-                        let _ = send_packet(
-                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                            0x6e,
-                            tag_query_reply(tx_id, nbt),
-                        );
+                        dispatch_player_shrieker_vibration(&me, (tx as f64 + 0.5, ty as f64 + 0.5, tz as f64 + 0.5));
                     }
                 }
             }
-            0x03 => {
-                // chat_ack: fold the acknowledged offset into the connection's
-                // last-seen counter — saturating so a hostile offset cannot
-                // wrap it backwards.
-                if let Some(offset) = decode_chat_ack(&b) {
-                    let mut offsets =
-                        chat_ack_offsets().lock().unwrap_or_else(|e| e.into_inner());
-                    let entry = offsets.entry(me.eid).or_insert(0);
-                    *entry = entry.saturating_add(offset);
-                }
-            }
-            0x07 => {
-                // chat_session_update: record the signed-chat session metadata
-                // for the P7a lane; strict bounds refuse oversized keys.
-                if let Some(meta) = decode_chat_session_update(&b) {
-                    chat_sessions()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, meta);
-                }
-            }
-            0x0c => {
-                // configuration_acknowledged: the client finished a mid-play
-                // reconfigure exchange — record it; a stray empty ack is
-                // harmless on a server that does not currently reconfigure.
-                if b.is_empty() {
-                    reconfigure_acked()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid);
-                }
-            }
-            0x10 => {
-                // container_slot_state_changed: crafter slot toggles land on
-                // the live Crafter block entity the menu anchors to.
-                if let Some((slot_id, window_id, new_state)) = decode_container_slot_state(&b) {
-                    c2s_apply_container_slot_state(&me, slot_id, window_id, new_state);
-                }
-            }
-            0x11 => {
-                // cookie_response: per-connection store, 5 KiB cap enforced
-                // in the decoder.
-                if let Some((key, payload)) = decode_cookie_response(&b) {
-                    client_cookies()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .entry(me.eid)
-                        .or_default()
-                        .insert(key, payload);
-                }
-            }
-            0x13 => {
-                // debug_sample_subscription: OP>=2 subscribes to the per-tick
-                // `debug_sample` push; everyone else is refused fail-closed.
-                if let Some(sample_type) = decode_debug_sample_subscription(&b) {
-                    if client_permission_level(&me) >= 2 {
-                        debug_sample_subscribers()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(me.eid, sample_type);
-                    }
-                }
-            }
-            0x14 => {
-                if let Some(book) = decode_edit_book(&b) {
-                    c2s_apply_edit_book(&me, &book);
-                }
-            }
-            0x15 => {
-                // entity_tag_query: OP>=2, answers with the target's
-                // `id`/`Pos`/`Rotation` NBT on `tag_query` (S2C 0x6e).
-                if let Some((tx_id, entity_id)) = decode_entity_tag_query(&b) {
-                    if client_permission_level(&me) >= 2 {
-                        let _ = send_packet(
-                            &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                            0x6e,
-                            tag_query_reply(tx_id, entity_tag_nbt(entity_id)),
-                        );
-                    }
-                }
-            }
-            0x17 => {
-                // jigsaw_generate: OP>=2 + creative; the request is recorded
-                // against the block position like a structure edit.
-                if let Some((pos, levels, keep_jigsaws)) = decode_jigsaw_generate(&b) {
-                    if sender_gamemaster_permitted(&me) {
-                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        jigsaw_generate_requests()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert((dim, pos.0, pos.1, pos.2), (levels, keep_jigsaws));
-                    }
-                }
-            }
-            0x19 => {
-                // lock_difficulty: OP>=2 only — locks the world difficulty and
-                // broadcasts `ChangeDifficulty` with the locked flag.
-                if let Some(locked) = decode_lock_difficulty(&b) {
-                    c2s_apply_lock_difficulty(&me, locked);
-                }
-            }
-            0x21 => {
-                // ping_request: mirror the i64 straight back on `pong_response`
-                // (S2C 0x36) — the client's play-phase latency readout.
-                if let Some(payload) = decode_ping_request(&b) {
-                    let _ = send_packet(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        0x36,
-                        payload.to_be_bytes().to_vec(),
-                    );
-                }
-            }
-            0x23 => {
-                // player_abilities: honour the flying bit only under `mayfly` —
-                // a survival fly-hack request is refused, never stored.
-                if let Some(flags) = decode_player_abilities(&b) {
-                    c2s_apply_player_abilities(&me, flags);
-                }
-            }
-            0x27 => {
-                // pong: the client answered a `ClientboundPingPacket`; the id
-                // lands on the per-connection ledger.
-                if let Some(id) = decode_pong(&b) {
-                    last_client_pongs()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, id);
-                }
-            }
-            0x2c => {
-                // seen_advancements: OpenedTab carries the tab id,
-                // ClosedScreen carries nothing.
-                if let Some(state) = decode_seen_advancements(&b) {
-                    seen_advancement_state()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(me.eid, state.clone());
-                    // vanilla `PlayerAdvancements.setSelectedTab` answers the
-                    // request: OpenedTab echoes the tab, ClosedScreen sends
-                    // an empty selection.
-                    let _ = send_packet(
-                        &mut me.sock.lock().unwrap_or_else(|e| e.into_inner()),
-                        0x4a,
-                        encode_play_select_advancements_tab(state.1.as_deref()).1,
-                    );
-                }
-            }
-            0x30 => {
-                // set_command_block: the VANILLA-CMDBLK decoder + apply —
-                // OP>=2, creative and `enable-command-block` are all enforced
-                // inside `apply_set_command_block`.
-                if let Some(update) = decode_set_command_block_c2s(&b) {
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = apply_set_command_block(
-                        client_permission_level(&me),
-                        *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
-                        true,
-                        dim,
-                        update,
-                    );
-                }
-            }
-            0x31 => {
-                // set_command_minecart: identical gate under
-                // `apply_set_command_minecart`.
-                if let Some(update) = decode_set_command_minecart_c2s(&b) {
-                    let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                    let _ = apply_set_command_minecart(
-                        client_permission_level(&me),
-                        *me.gm.lock().unwrap_or_else(|e| e.into_inner()),
-                        true,
-                        dim,
-                        update,
-                    );
-                }
-            }
-            0x33 => {
-                // set_jigsaw_block: OP>=2 + creative; the edit metadata is
-                // recorded against the block position.
-                if let Some((pos, update)) = decode_set_jigsaw_block(&b) {
-                    if sender_gamemaster_permitted(&me) {
-                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        jigsaw_block_updates()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert((dim, pos.0, pos.1, pos.2), update);
-                    }
-                }
-            }
-            0x34 => {
-                // set_structure_block: OP>=2 + creative; same recorded-edit
-                // contract as the jigsaw arm.
-                if let Some((pos, update)) = decode_set_structure_block(&b) {
-                    if sender_gamemaster_permitted(&me) {
-                        let dim = *me.dim.lock().unwrap_or_else(|e| e.into_inner());
-                        structure_block_updates()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert((dim, pos.0, pos.1, pos.2), update);
-                    }
-                }
-            }
-            0x37 => {
-                // teleport_to_entity: spectator-only — vanilla refuses anyone
-                // else outright before resolving the target.
-                if let Some(uuid) = decode_teleport_to_entity(&b) {
-                    if me.is_spectator() {
-                        c2s_spectate_teleport(&me, &uuid);
-                    }
-                }
-            }
-            _ => {}
+            let _ = send_packet(&mut me.sock.lock().unwrap_or_else(|e| e.into_inner()), 0x05, ack(seq));
+            PlayPacketControl::Handled
         }
-        let __dd = __d1.elapsed();
-        if conn_prof() && __dd > std::time::Duration::from_millis(50) {
-            eprintln!("[conn-prof] dispatch pid={pid:#x} {:?}", __dd);
-        }
-        let __d0 = Instant::now();
-        apply_queued_block_updates();
-        let __de = __d0.elapsed();
-        if conn_prof() && __de > std::time::Duration::from_millis(50) {
-            eprintln!("[conn-prof] post-dispatch flush pid={pid:#x} {:?}", __de);
-        }
+        _ => PlayPacketControl::Handled,
     }
-    // The `_disconnect_guard` armed at registration runs `disconnect_cleanup`
-    // here — and on any panic unwind — so every exit takes the same teardown.
+}
+
+include!("play_protocol_movement.rs");
+include!("play_protocol_world.rs");
+include!("play_protocol_inventory.rs");
+include!("play_protocol_combat.rs");
+include!("play_protocol_chat_client.rs");
+include!("play_protocol_channels.rs");
+include!("play_protocol_session.rs");
+
+fn handle_inner(s: TcpStream, live_eid: Arc<AtomicI32>) {
+    let Some(preplay) = negotiate_preplay_session(s) else {
+        return;
+    };
+    let Some(session) = enter_play_session(preplay, live_eid) else {
+        return;
+    };
+    run_play_session(session);
 }
 
 #[cfg(test)]
