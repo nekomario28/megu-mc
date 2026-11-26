@@ -37,9 +37,9 @@ use megu_client_mesh::ffi::PackedVertex;
 use megu_client_mesh::vanilla_plus_3d::ExtrudedMesh;
 use megu_client_mesh::vfx_engine::DynamicColoredLight;
 use megu_client_mesh::{
-    box_in_frustum, face_dir_direction, ChunkUploadBudget, DirectionBuckets, HiZPyramid,
-    RenderRegions, SectionCoord, SectionGraph, DIRECTION_BUCKETS, DIRECTION_BUCKET_UNASSIGNED,
-    EDGE, REGION_X, REGION_Y, REGION_Z,
+    box_in_frustum, face_dir_direction, BakedTerrainFace, ChunkUploadBudget, DirectionBuckets,
+    HiZPyramid, Layer, Quad, RenderRegions, SectionCoord, SectionGraph, DIRECTION_BUCKETS,
+    DIRECTION_BUCKET_UNASSIGNED, EDGE, REGION_X, REGION_Y, REGION_Z,
 };
 use megu_client_mesh::{
     is_megu_wgsl_pack, BackendResolution, GpuCapabilities, GpuShaderCaps, MeguWgslPack, PassKind,
@@ -78,7 +78,7 @@ use crate::panorama_pass::TitlePanoramaPass;
 use crate::subworld_render::{
     lit_wgsl, pack_particle_billboard, CompositeDrawUniforms, CompositeEnvUniforms,
     DebugLineVertex, ParticleBillboardPack, ParticleInstance, SubWorldGpuCache, SubWorldRenderBank,
-    SubWorldTransform, TerrainVertex, VfxLightsGpu, COMPOSITE_TERRAIN_WGSL,
+    SubWorldRenderEntry, SubWorldTransform, TerrainVertex, VfxLightsGpu, COMPOSITE_TERRAIN_WGSL,
     DEBUG_LINE_VERTEX_LAYOUT, DEBUG_LINE_WGSL, DRAW_UNIFORM_STRIDE, LIT_VERTEX_LAYOUT,
     PARTICLE_BILLBOARD_CORNERS, PARTICLE_BILLBOARD_INDICES, PARTICLE_INSTANCE_LAYOUT,
     PARTICLE_QUAD_LAYOUT, PART_INSTANCE_LAYOUT,
@@ -1665,6 +1665,235 @@ impl PendingSectionUpload {
             && self.packed.as_ref() == packed
             && self.order.as_ref() == order
     }
+}
+
+const SHAPED_TERRAIN_ID_BASE: u64 = 1u64 << 63;
+
+fn zigzag21(value: i32) -> u64 {
+    (((value << 1) ^ (value >> 31)) as u32 as u64) & 0x1f_ffff
+}
+
+fn shaped_terrain_entry_id(coord: SectionCoord, translucent: bool) -> u64 {
+    let x = zigzag21(coord.0);
+    let z = zigzag21(coord.2);
+    let y = (((coord.1 << 1) ^ (coord.1 >> 31)) as u32 as u64) & 0xffff;
+    SHAPED_TERRAIN_ID_BASE | (x << 37) | (z << 16) | (y << 1) | u64::from(translucent)
+}
+
+fn shaped_section_transform(coord: SectionCoord) -> SubWorldTransform {
+    SubWorldTransform {
+        position: [
+            coord.0 as f32 * 16.0,
+            coord.1 as f32 * 16.0,
+            coord.2 as f32 * 16.0,
+        ],
+        ..SubWorldTransform::IDENTITY
+    }
+}
+
+fn shaped_entry_coord(entry: &crate::subworld_render::GpuSubWorldEntry) -> SectionCoord {
+    SectionCoord(
+        (entry.transform.position[0] / 16.0).floor() as i32,
+        (entry.transform.position[1] / 16.0).floor() as i32,
+        (entry.transform.position[2] / 16.0).floor() as i32,
+    )
+}
+
+fn face_shade_for_normal(normal: [f32; 3], enabled: bool) -> f32 {
+    if !enabled {
+        return 1.0;
+    }
+    // Vanilla's diffuse face shade is axis based: Y+ = 1.0, Y- = 0.5,
+    // Z faces = 0.8 and X faces = 0.6. Model normals can be diagonal after
+    // rotation, so choose the dominant axis exactly like the nearest-face
+    // lighting approximation used by the rest of this renderer.
+    let abs = [normal[0].abs(), normal[1].abs(), normal[2].abs()];
+    if abs[1] >= abs[0] && abs[1] >= abs[2] {
+        if normal[1] >= 0.0 { 1.0 } else { 0.5 }
+    } else if abs[2] >= abs[0] {
+        0.8
+    } else {
+        0.6
+    }
+}
+
+fn shaped_light_scale(block_light: u8, sky_light: u8) -> f32 {
+    // Vanilla lightmap brightness ramp `l / (3 - 2l)`, with `l` the
+    // stronger of block and sky light. Mesh-side light is a multiplier;
+    // the lit shader's environment term still supplies scene ambience.
+    let light = block_light.max(sky_light) as f32 / 15.0;
+    light / (3.0 - 2.0 * light)
+}
+
+fn registry_tint_rgb(tint: u32) -> [f32; 3] {
+    [
+        ((tint >> 16) & 0xff) as f32 / 255.0,
+        ((tint >> 8) & 0xff) as f32 / 255.0,
+        (tint & 0xff) as f32 / 255.0,
+    ]
+}
+
+fn quad_normal(positions: &[[f32; 3]; 4]) -> [f32; 3] {
+    let a = [
+        positions[1][0] - positions[0][0],
+        positions[1][1] - positions[0][1],
+        positions[1][2] - positions[0][2],
+    ];
+    let b = [
+        positions[3][0] - positions[0][0],
+        positions[3][1] - positions[0][1],
+        positions[3][2] - positions[0][2],
+    ];
+    let n = [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ];
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+    if len.is_finite() && len > 1.0e-12 {
+        [n[0] / len, n[1] / len, n[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    }
+}
+
+#[derive(Default)]
+struct ShapedTerrainGeometry {
+    opaque_vertices: Vec<TerrainVertex>,
+    opaque_indices: Vec<u32>,
+    translucent_vertices: Vec<TerrainVertex>,
+    translucent_indices: Vec<u32>,
+}
+
+impl ShapedTerrainGeometry {
+    fn is_empty(&self) -> bool {
+        self.opaque_indices.is_empty() && self.translucent_indices.is_empty()
+    }
+
+    fn push_vertex(
+        &mut self,
+        translucent: bool,
+        position: [f32; 3],
+        normal: [f32; 3],
+        albedo: [f32; 3],
+        uv: [f32; 2],
+        atlas_index: u32,
+    ) -> u32 {
+        let (vertices, _) = if translucent {
+            (
+                &mut self.translucent_vertices,
+                &mut self.translucent_indices,
+            )
+        } else {
+            (&mut self.opaque_vertices, &mut self.opaque_indices)
+        };
+        let index = vertices.len() as u32;
+        vertices.push(TerrainVertex::new(
+            position,
+            normal,
+            albedo,
+            uv,
+            atlas_index,
+        ));
+        index
+    }
+
+    fn push_indices(&mut self, translucent: bool, base: u32, corners: [u8; 6]) {
+        let indices = if translucent {
+            &mut self.translucent_indices
+        } else {
+            &mut self.opaque_indices
+        };
+        indices.extend(corners.map(|corner| base + u32::from(corner)));
+    }
+}
+
+fn append_baked_face(
+    geometry: &mut ShapedTerrainGeometry,
+    face: &BakedTerrainFace,
+    atlas_index: impl Fn(&str) -> Option<u32>,
+) {
+    let translucent = face.layer == Layer::Translucent;
+    let normal = face.quad.normal;
+    let shade = face_shade_for_normal(normal, face.quad.shade)
+        * shaped_light_scale(face.light.block(), face.light.sky());
+    let tint = face
+        .biome_tint
+        .map(registry_tint_rgb)
+        .unwrap_or([1.0, 1.0, 1.0]);
+    let albedo = [
+        (tint[0] * shade).min(1.0),
+        (tint[1] * shade).min(1.0),
+        (tint[2] * shade).min(1.0),
+    ];
+    let sprite = atlas_index(face.quad.texture.as_str()).unwrap_or(u32::MAX);
+    let base = (if translucent {
+        geometry.translucent_vertices.len()
+    } else {
+        geometry.opaque_vertices.len()
+    }) as u32;
+    for corner in 0..4 {
+        let uv = [
+            face.quad.uv[corner][0] / 16.0,
+            face.quad.uv[corner][1] / 16.0,
+        ];
+        geometry.push_vertex(
+            translucent,
+            face.quad.positions[corner],
+            normal,
+            albedo,
+            uv,
+            sprite,
+        );
+    }
+    geometry.push_indices(translucent, base, [0, 1, 2, 0, 2, 3]);
+}
+
+fn append_unpacked_quad(
+    geometry: &mut ShapedTerrainGeometry,
+    quad: &Quad,
+    state_sprite: impl Fn(u32) -> Option<u32>,
+) {
+    let translucent = quad.layer == Layer::Translucent;
+    let normal = quad_normal(&quad.positions);
+    let (u_axis, v_axis) = match quad.direction as u8 {
+        0 | 1 => (0, 2),
+        2 | 3 => (0, 1),
+        _ => (2, 1),
+    };
+    let shade = face_shade_for_normal(normal, true);
+    let tint = if quad.tint != 0 {
+        registry_tint_rgb(quad.tint)
+    } else {
+        [1.0, 1.0, 1.0]
+    };
+    let sprite = state_sprite(quad.state_id).unwrap_or(u32::MAX);
+    let base = (if translucent {
+        geometry.translucent_vertices.len()
+    } else {
+        geometry.opaque_vertices.len()
+    }) as u32;
+    const AO_SHADE: [f32; 4] = [0.4, 0.6, 0.8, 1.0];
+    for corner in 0..4 {
+        let light = shaped_light_scale(quad.block_light[corner], quad.sky_light[corner]);
+        let ao = AO_SHADE[usize::from(quad.ao[corner].min(3))];
+        let factor = shade * light * ao;
+        let albedo = [
+            (tint[0] * factor).min(1.0),
+            (tint[1] * factor).min(1.0),
+            (tint[2] * factor).min(1.0),
+        ];
+        let position = quad.positions[corner];
+        geometry.push_vertex(
+            translucent,
+            position,
+            normal,
+            albedo,
+            [position[u_axis], position[v_axis]],
+            sprite,
+        );
+    }
+    geometry.push_indices(translucent, base, quad.indices());
 }
 
 /// Apply a drained [`ExternalSectionsDelta`] to a renderer-side
@@ -3256,6 +3485,23 @@ pub struct GpuRenderer {
     /// yet. An entry is authoritative while its coord is still loaded and
     /// has no `packed_meshes` entry; the world publish retires it.
     pub external_sections: BTreeMap<SectionCoord, ExternalSectionMesh>,
+    /// Worker-produced official baked-model face sidecars mirrored beside
+    /// `external_sections`; keyed by section and shared by `Arc`, so delta
+    /// sync stays cheap and uploads are revision-gated.
+    external_baked_sections: HashMap<SectionCoord, Arc<[BakedTerrainFace]>>,
+    /// CPU-side shaped-terrain draw entries, one opaque/cutout and one
+    /// translucent entry per section when replacement geometry exists.
+    shaped_terrain_bank: SubWorldRenderBank,
+    /// GPU mirror dedicated to static shaped terrain (kept separate from
+    /// moving contraption sub-worlds so either domain can sync without
+    /// evicting the other).
+    shaped_terrain_gpu: SubWorldGpuCache,
+    /// `(mesh/content revision, atlas epoch)` per section currently mirrored
+    /// in `shaped_terrain_bank`; equality skips all conversion work.
+    shaped_terrain_revisions: HashMap<SectionCoord, (u64, u64)>,
+    /// Cumulative shaped-terrain vertex uploads admitted through the
+    /// revision-gated lane (test/telemetry surface).
+    pub shaped_terrain_uploads: u64,
     /// `LiveSession::external_sections_rev` the mirror is synced to —
     /// `None` until the first [`Self::sync_external_sections_from`]
     /// (a fresh attach mirrors the full map once).
@@ -4321,8 +4567,7 @@ pub struct EntityBerGeometry {
 }
 
 /// One staged entity/BER mesh plus its optional normalized atlas UV window.
-pub type TexturedEntityBerMesh<'a> =
-    (&'a ExtrudedMesh, [f32; 3], [f32; 3], Option<[f32; 4]>);
+pub type TexturedEntityBerMesh<'a> = (&'a ExtrudedMesh, [f32; 3], [f32; 3], Option<[f32; 4]>);
 
 /// Pack articulated-entity and block-entity meshes into the two renderer
 /// vertex formats without creating a GPU device. Use
@@ -4348,7 +4593,9 @@ pub fn build_entity_ber_geometry_into(
 ) {
     build_entity_ber_geometry_mapped_into(
         out,
-        meshes.iter().map(|&(mesh, origin, tint)| (mesh, origin, tint, None)),
+        meshes
+            .iter()
+            .map(|&(mesh, origin, tint)| (mesh, origin, tint, None)),
         sample_light,
         daylight_factor,
     );
@@ -4415,7 +4662,8 @@ fn build_entity_ber_geometry_mapped_into<'a>(
             }
             let brightness = vanilla_light_brightness(block_light, sky_light, daylight_factor);
             let uv = uv_rect.map_or(quad.uv, |[u0, v0, u1, v1]| {
-                quad.uv.map(|[u, v]| [u0 + (u1 - u0) * u, v0 + (v1 - v0) * v])
+                quad.uv
+                    .map(|[u, v]| [u0 + (u1 - u0) * u, v0 + (v1 - v0) * v])
             });
             let appended = append_dynamic_quad(
                 &mut out.vertices,
@@ -4561,7 +4809,9 @@ mod entity_lighting_tests {
     fn textured_entity_uvs_remap_into_atlas_rect_without_losing_material_flag() {
         let mut source = quad(0.0, [0.0, 1.0, 0.0], -1);
         source.uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let mesh = ExtrudedMesh { quads: vec![source] };
+        let mesh = ExtrudedMesh {
+            quads: vec![source],
+        };
         let mut geometry = EntityBerGeometry::default();
         build_entity_ber_geometry_mapped_into(
             &mut geometry,
@@ -4572,7 +4822,10 @@ mod entity_lighting_tests {
         assert_eq!(geometry.vertices[0].uv, [0.2, 0.3]);
         assert_eq!(geometry.vertices[1].uv, [0.6, 0.3]);
         assert_eq!(geometry.vertices[2].uv, [0.6, 0.9]);
-        assert!(geometry.vertices.iter().all(|vertex| vertex.material_flags() == 2));
+        assert!(geometry
+            .vertices
+            .iter()
+            .all(|vertex| vertex.material_flags() == 2));
     }
 
     #[test]
@@ -4694,6 +4947,95 @@ fn particle_instancing_supported(device: &wgpu::Device) -> bool {
         && limits.max_vertex_buffer_array_stride >= std::mem::size_of::<ParticleInstance>() as u32
 }
 
+/// Clone the composite lit module with alpha testing enabled for shaped
+/// terrain's opaque/cutout entry point. The explicit atlas UV path already
+/// reads texel alpha; transparent leaf/plant texels must not rasterize as
+/// black opaque fragments.
+fn shaped_cutout_lit_wgsl(source: &str) -> String {
+    const FRAGMENT_ANCHOR: &str = "@fragment\nfn lit_fs";
+    const TEXEL: &str = "var texel = vec4<f32>(atlas_sample(in.atlas_index, in.uv), 1.0);";
+    const SURFACE: &str = "let surface = in.albedo * texel.rgb;";
+    const ALPHA_SAMPLE: &str = r#"
+fn shaped_atlas_sample(sprite_id: u32, uv: vec2<f32>) -> vec4<f32> {
+    if sprite_id >= arrayLength(&atlas_rects.rects) {
+        return vec4<f32>(1.0);
+    }
+    let frame = atlas_rects.rects[sprite_id];
+    let rect = frame.rect;
+    let duv_dx = dpdx(uv) * rect.zw;
+    let duv_dy = dpdy(uv) * rect.zw;
+    let cur = textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        rect.xy + fract(uv) * rect.zw,
+        duv_dx, duv_dy,
+    );
+    if frame.anim.y <= 0.0 {
+        return cur;
+    }
+    let next = textureSampleGrad(
+        atlas_tex, atlas_sampler,
+        vec2<f32>(rect.x + fract(uv.x) * rect.z,
+                  frame.anim.x + fract(uv.y) * rect.w),
+        duv_dx, duv_dy,
+    );
+    return mix(cur, next, frame.anim.y);
+}
+
+"#;
+    let Some(split) = source.find(FRAGMENT_ANCHOR) else {
+        return source.to_owned();
+    };
+    if !source.contains(TEXEL) || !source.contains(SURFACE) {
+        return source.to_owned();
+    }
+    // The shared sub-world helper deliberately drops texture alpha for
+    // opaque entity/voxel materials. Shaped terrain needs the alpha lane
+    // for vanilla cutout holes, so clone the sampler as vec4 locally and
+    // leave every other lighting/fog/f16 instruction untouched.
+    let mut shaped = format!(
+        "{}{}{}",
+        &source[..split],
+        ALPHA_SAMPLE,
+        &source[split..]
+    );
+    shaped = shaped.replace(
+        TEXEL,
+        "var texel = shaped_atlas_sample(in.atlas_index, in.uv);",
+    );
+    shaped.replacen(
+        SURFACE,
+        "if texel.a < 0.5 {\n            discard;\n        }\n    let surface = in.albedo * texel.rgb;",
+        1,
+    )
+}
+
+#[cfg(test)]
+mod shaped_cutout_wgsl_tests {
+    use super::{lit_wgsl, shaped_cutout_lit_wgsl};
+
+    #[test]
+    fn shaped_cutout_shader_reads_texture_alpha_before_discard() {
+        for shader_f16 in [false, true] {
+            let shaped = shaped_cutout_lit_wgsl(&lit_wgsl(shader_f16));
+            assert!(
+                shaped.contains("fn shaped_atlas_sample"),
+                "alpha-aware sampler missing (f16={shader_f16})"
+            );
+            assert!(
+                shaped.contains("var texel = shaped_atlas_sample(in.atlas_index, in.uv);"),
+                "fragment does not use alpha-aware sampler (f16={shader_f16})"
+            );
+            assert!(
+                !shaped.contains("var texel = vec4<f32>(atlas_sample(in.atlas_index, in.uv), 1.0);"),
+                "alpha-dropping texel assignment survived (f16={shader_f16})"
+            );
+            assert!(
+                shaped.contains("if texel.a < 0.5"),
+                "cutout discard missing (f16={shader_f16})"
+            );
+        }
+    }
+}
 /// GPU state for the composed pass: the fade/light-aware terrain pipeline,
 /// the lit `TerrainVertex` pipelines (opaque + alpha), the instanced-part
 /// pipeline, the dynamic-offset draw-uniform pool, and the shared
@@ -4705,6 +5047,13 @@ struct CompositeGpu {
     terrain_region_pipeline: wgpu::RenderPipeline,
     terrain_alpha_pipeline: wgpu::RenderPipeline,
     lit_pipeline: wgpu::RenderPipeline,
+    /// Explicit-UV shaped-terrain variant of `lit_pipeline` with alpha
+    /// testing (stairs/fences share the same opaque depth-writing lane as
+    /// cutout plants, whose transparent texels must discard).
+    shaped_lit_pipeline: wgpu::RenderPipeline,
+    /// Alpha-blended counterpart sharing the shaped module's texture-alpha
+    /// sampler so translucent shaped blocks keep partial cutout coverage.
+    shaped_lit_alpha_pipeline: wgpu::RenderPipeline,
     lit_alpha_pipeline: wgpu::RenderPipeline,
     instanced_pipeline: wgpu::RenderPipeline,
     /// Instanced particle billboard state — `None` when the device's
@@ -4753,6 +5102,9 @@ struct AtlasGpu {
     /// blend)` pair `.mcmeta` playback rewrites each animation tick.
     rects: wgpu::Buffer,
     state_sprites: wgpu::Buffer,
+    /// CPU copy of the state→sprite table for explicit shaped-terrain
+    /// fallback quads (the GPU storage buffer remains the packed path's copy).
+    state_sprite_indices: Vec<u32>,
     sprite_indices: HashMap<String, u32>,
     /// Whole-strip tile rect per sprite index — the base each animated
     /// frame window is cut from.
@@ -4843,12 +5195,30 @@ fn visual_env_bind_group(
         label: Some("composite-visual-texture-bind-group"),
         layout: &composite.env_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: composite.env_ubo.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: composite.lights_ubo.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&composite.atlas.sampler) },
-            wgpu::BindGroupEntry { binding: 4, resource: composite.atlas.rects.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: composite.atlas.state_sprites.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: composite.env_ubo.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: composite.lights_ubo.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&composite.atlas.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: composite.atlas.rects.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: composite.atlas.state_sprites.as_entire_binding(),
+            },
         ],
     })
 }
@@ -7185,8 +7555,8 @@ impl GpuRenderer {
             return Err("screenshot dimensions must be nonzero".into());
         }
         let row = width.checked_mul(4).ok_or("screenshot row overflow")?;
-        let padded = row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded =
+            row.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let size = u64::from(padded)
             .checked_mul(u64::from(height))
             .ok_or("screenshot buffer overflow")?;
@@ -7196,9 +7566,12 @@ impl GpuRenderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = self.ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("f2-screenshot-readback"),
-        });
+        let mut encoder = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("f2-screenshot-readback"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
@@ -7214,16 +7587,25 @@ impl GpuRenderer {
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.ctx.queue.submit([encoder.finish()]);
         let slice = buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| { let _ = tx.send(result); });
-        self.ctx.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_secs(10)),
-        }).map_err(|error| error.to_string())?;
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.ctx
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .map_err(|error| error.to_string())?;
         rx.recv_timeout(std::time::Duration::from_secs(10))
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
@@ -7382,6 +7764,7 @@ impl GpuRenderer {
             sampler,
             rects: rects_buffer,
             state_sprites,
+            state_sprite_indices: Vec::new(),
             sprite_indices,
             tiles,
             animated: Vec::new(),
@@ -7418,6 +7801,7 @@ impl GpuRenderer {
         self.ctx
             .queue
             .write_buffer(&state_sprites, 0, bytemuck::cast_slice(&states));
+        self.composite.atlas.state_sprite_indices = states;
         self.composite.atlas.state_sprites = state_sprites;
         self.composite.env_bg = self
             .composite
@@ -8068,8 +8452,7 @@ impl GpuRenderer {
         let visual_assets = VanillaWorldAssets::fallback();
         let viewmodel_pass =
             FirstPersonViewmodelPass::new(&ctx.device, target_format, DEPTH_FORMAT);
-        let crack_overlay_pass =
-            BlockBreakCrackPass::new(&ctx.device, target_format, DEPTH_FORMAT);
+        let crack_overlay_pass = BlockBreakCrackPass::new(&ctx.device, target_format, DEPTH_FORMAT);
         let panorama_pass = TitlePanoramaPass::new(&ctx.device, &ctx.queue, target_format);
         let celestial_weather_pass = TexturedCelestialWeatherPass::new(
             &ctx.device,
@@ -8124,6 +8507,11 @@ impl GpuRenderer {
             upload_budget,
             pending_uploads: BTreeMap::new(),
             external_sections: BTreeMap::new(),
+            external_baked_sections: HashMap::new(),
+            shaped_terrain_bank: SubWorldRenderBank::new(),
+            shaped_terrain_gpu: SubWorldGpuCache::new(),
+            shaped_terrain_revisions: HashMap::new(),
+            shaped_terrain_uploads: 0,
             external_sections_rev: None,
             external_section_full_syncs: 0,
             external_section_delta_syncs: 0,
@@ -8427,7 +8815,11 @@ impl GpuRenderer {
     ) {
         self.title_panorama_active = active;
         self.title_panorama_yaw_rad = if yaw_rad.is_finite() { yaw_rad } else { 0.0 };
-        self.title_panorama_pitch_rad = if pitch_rad.is_finite() { pitch_rad } else { 0.0 };
+        self.title_panorama_pitch_rad = if pitch_rad.is_finite() {
+            pitch_rad
+        } else {
+            0.0
+        };
         self.title_panorama_fade_alpha = if fade_alpha.is_finite() {
             fade_alpha.clamp(0.0, 1.0)
         } else {
@@ -8449,7 +8841,11 @@ impl GpuRenderer {
         self.viewmodel_uv_rect = uv_rect.filter(|rect| rect.iter().all(|v| v.is_finite()));
         self.viewmodel_enchanted = enchanted;
         self.viewmodel_light_rgb = light_rgb.map(|v| if v.is_finite() { v } else { 1.0 });
-        self.viewmodel_time_secs = if time_secs.is_finite() { time_secs } else { 0.0 };
+        self.viewmodel_time_secs = if time_secs.is_finite() {
+            time_secs
+        } else {
+            0.0
+        };
     }
 
     pub fn upload_viewmodel_surface_texture(&mut self, width: u32, height: u32, rgba: &[u8]) {
@@ -8484,7 +8880,11 @@ impl GpuRenderer {
         } else {
             [0.0; 3]
         };
-        self.world_env_time_secs = if time_secs.is_finite() { time_secs } else { 0.0 };
+        self.world_env_time_secs = if time_secs.is_finite() {
+            time_secs
+        } else {
+            0.0
+        };
     }
 
     pub fn set_spyglass_alpha(&mut self, alpha: f32) {
@@ -8582,11 +8982,8 @@ impl GpuRenderer {
     /// Upload all ten destroy-stage crack images and retain them for the
     /// translucent block-break overlay path.
     pub fn upload_destroy_stage_textures(&mut self, assets: &VanillaWorldAssets) {
-        self.crack_overlay_pass.upload_destroy_stages(
-            &self.ctx.device,
-            &self.ctx.queue,
-            assets,
-        );
+        self.crack_overlay_pass
+            .upload_destroy_stages(&self.ctx.device, &self.ctx.queue, assets);
         self.destroy_stage_textures.clear();
         self.destroy_stage_textures
             .reserve(assets.destroy_stages.len());
@@ -8653,7 +9050,10 @@ impl GpuRenderer {
             self.target_format,
             assets,
         );
-        if let Some(glint) = assets.misc_overlays.get(&VanillaMiscOverlay::EnchantedGlintItem) {
+        if let Some(glint) = assets
+            .misc_overlays
+            .get(&VanillaMiscOverlay::EnchantedGlintItem)
+        {
             self.viewmodel_pass.upload_glint_texture(
                 &self.ctx.device,
                 &self.ctx.queue,
@@ -9136,9 +9536,15 @@ impl GpuRenderer {
                 &compact_terrain_wgsl(&terrain_wgsl(ctx.report.shader_f16), Some("terrain_vs")),
             ))),
         });
+        let lit_source = lit_wgsl(ctx.report.shader_f16);
+        let shaped_lit_source = shaped_cutout_lit_wgsl(&lit_source);
         let lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite-lit"),
-            source: wgpu::ShaderSource::Wgsl(lit_wgsl(ctx.report.shader_f16)),
+            source: wgpu::ShaderSource::Wgsl(lit_source),
+        });
+        let shaped_lit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("composite-lit-shaped-terrain"),
+            source: wgpu::ShaderSource::Wgsl(Cow::Owned(shaped_lit_source)),
         });
 
         let composite_pipeline =
@@ -9218,6 +9624,28 @@ impl GpuRenderer {
             &lit_buffers,
             None,
             true,
+            None,
+        );
+        let shaped_lit_pipeline = composite_pipeline(
+            "composite-lit-shaped-terrain-opaque",
+            &lit_layout,
+            &shaped_lit_module,
+            "lit_vs",
+            "lit_fs",
+            &lit_buffers,
+            None,
+            true,
+            None,
+        );
+        let shaped_lit_alpha_pipeline = composite_pipeline(
+            "composite-lit-shaped-terrain-alpha",
+            &lit_layout,
+            &shaped_lit_module,
+            "lit_vs",
+            "lit_fs",
+            &lit_buffers,
+            Some(ALPHA_BLEND),
+            false,
             None,
         );
         let lit_alpha_pipeline = composite_pipeline(
@@ -9368,6 +9796,7 @@ impl GpuRenderer {
             _texture: atlas_texture,
             rects: atlas_rects,
             state_sprites,
+            state_sprite_indices: Vec::new(),
             sprite_indices: HashMap::new(),
             tiles: Vec::new(),
             animated: Vec::new(),
@@ -9427,6 +9856,8 @@ impl GpuRenderer {
             terrain_region_pipeline,
             terrain_alpha_pipeline,
             lit_pipeline,
+            shaped_lit_pipeline,
+            shaped_lit_alpha_pipeline,
             lit_alpha_pipeline,
             instanced_pipeline,
             billboard,
@@ -10025,6 +10456,131 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// Remove both shaped-terrain draw entries for one section.
+    fn remove_shaped_terrain_section(&mut self, coord: SectionCoord) {
+        self.shaped_terrain_bank
+            .remove(shaped_terrain_entry_id(coord, false));
+        self.shaped_terrain_bank
+            .remove(shaped_terrain_entry_id(coord, true));
+        self.shaped_terrain_revisions.remove(&coord);
+    }
+
+    /// Mirror one section's official baked faces plus unrepresentable legacy
+    /// quads into the shaped-terrain bank. Conversion and upload are strictly
+    /// revision gated: unchanged sections cost one hash lookup, while a mesh
+    /// or atlas replacement rebuilds only this section's two small entries.
+    fn sync_shaped_terrain_section(&mut self, world: &WorldState, coord: SectionCoord) {
+        let use_external = self
+            .external_sections
+            .get(&coord)
+            .is_some_and(|_| external_section_valid(world, coord));
+        let revision = if use_external {
+            self.external_sections
+                .get(&coord)
+                .map(|external| external.content_epoch)
+        } else {
+            world.section_mesh_revision(coord).filter(|_| {
+                world.packed_mesh(coord).is_some() || world.released_mesh_meta(coord).is_some()
+            })
+        };
+        let Some(revision) = revision else {
+            self.remove_shaped_terrain_section(coord);
+            return;
+        };
+        let key = (revision, self.atlas_epoch);
+        if self.shaped_terrain_revisions.get(&coord) == Some(&key) {
+            return;
+        }
+
+        let mut geometry = ShapedTerrainGeometry::default();
+        let sprite_indices = &self.composite.atlas.sprite_indices;
+        let state_sprites = &self.composite.atlas.state_sprite_indices;
+        if use_external {
+            if let Some(faces) = self.external_baked_sections.get(&coord).cloned() {
+                for face in faces.iter() {
+                    append_baked_face(&mut geometry, face, |texture| {
+                        sprite_index_of(sprite_indices, texture)
+                    });
+                }
+            }
+        } else {
+            if let Some(faces) = world.baked_terrain_faces(coord) {
+                for face in faces {
+                    append_baked_face(&mut geometry, face, |texture| {
+                        sprite_index_of(sprite_indices, texture)
+                    });
+                }
+            }
+            if let Some(quads) = world.unpacked_terrain_quads(coord) {
+                for quad in quads {
+                    append_unpacked_quad(&mut geometry, quad, |state| {
+                        state_sprites
+                            .get(state as usize)
+                            .copied()
+                            .filter(|index| *index != u32::MAX)
+                    });
+                }
+            }
+        }
+
+        let opaque_id = shaped_terrain_entry_id(coord, false);
+        let translucent_id = shaped_terrain_entry_id(coord, true);
+        let transform = shaped_section_transform(coord);
+        if geometry.opaque_indices.is_empty() {
+            self.shaped_terrain_bank.remove(opaque_id);
+        } else {
+            let mut entry = SubWorldRenderEntry::new(
+                opaque_id,
+                transform,
+                std::mem::take(&mut geometry.opaque_vertices),
+                std::mem::take(&mut geometry.opaque_indices),
+            );
+            entry.alpha = 1.0;
+            entry.protrusion_margin = 1.0;
+            self.shaped_terrain_bank.upsert(entry);
+            self.shaped_terrain_uploads += 1;
+        }
+        if geometry.translucent_indices.is_empty() {
+            self.shaped_terrain_bank.remove(translucent_id);
+        } else {
+            let mut entry = SubWorldRenderEntry::new(
+                translucent_id,
+                transform,
+                std::mem::take(&mut geometry.translucent_vertices),
+                std::mem::take(&mut geometry.translucent_indices),
+            );
+            entry.alpha = 0.72;
+            entry.protrusion_margin = 1.0;
+            self.shaped_terrain_bank.upsert(entry);
+            self.shaped_terrain_uploads += 1;
+        }
+        if geometry.is_empty() {
+            // Empty shaped geometry still records the revision: the next
+            // section mesh with the same content must not pay conversion
+            // again just because it produced no replacement faces.
+        }
+        self.shaped_terrain_revisions.insert(coord, key);
+    }
+
+    /// Shaped-terrain GPU entry count (test/diagnostic surface).
+    pub fn shaped_terrain_gpu_entry_count(&self) -> usize {
+        self.shaped_terrain_gpu.entry_count()
+    }
+
+    /// CPU-side shaped entry count before the GPU sync drops dirty flags.
+    pub fn shaped_terrain_entry_count(&self) -> usize {
+        self.shaped_terrain_bank.len()
+    }
+
+    /// Total explicit shaped-terrain vertices currently staged in the CPU
+    /// bank (baked-model faces plus unrepresentable legacy quads).
+    pub fn shaped_terrain_vertex_count(&self) -> usize {
+        self.shaped_terrain_bank
+            .entries()
+            .map(|entry| entry.vertices.len())
+            .sum()
+    }
+
     /// Sync [`Self::external_sections`] from a live session's
     /// `external_sections_rev` + delta stream — the zero-clone path that
     /// replaces the old per-frame `BTreeMap::clone_from`. Steady frames
@@ -10045,6 +10601,8 @@ impl GpuRenderer {
             // First attach: the delta stream predates this renderer —
             // mirror the map wholesale and discard pending events.
             self.external_sections.clone_from(&live.external_sections);
+            self.external_baked_sections
+                .clone_from(&live.baked_sections);
             live.discard_external_sections_delta();
             self.external_section_full_syncs += 1;
         } else if let Some(delta) = live.take_external_sections_delta() {
@@ -10053,6 +10611,20 @@ impl GpuRenderer {
                 &delta,
                 &live.external_sections,
             );
+            if delta.cleared {
+                self.external_baked_sections.clear();
+            }
+            for coord in &delta.removals {
+                self.external_baked_sections.remove(coord);
+            }
+            for coord in &delta.upserts {
+                if let Some(faces) = live.baked_sections.get(coord) {
+                    self.external_baked_sections
+                        .insert(*coord, Arc::clone(faces));
+                } else {
+                    self.external_baked_sections.remove(coord);
+                }
+            }
             self.external_section_delta_syncs += 1;
         }
         self.external_sections_rev = Some(live.external_sections_rev);
@@ -10120,6 +10692,7 @@ impl GpuRenderer {
         self.region_arenas
             .retain(|_, arena| !arena.slots.is_empty() || arena.empty_frames < grace);
         for (coord, packed) in world.packed_meshes() {
+            self.sync_shaped_terrain_section(world, coord);
             let order = world.translucent_order(coord).unwrap_or(&[]);
             scheduled += usize::from(self.queue_live_section_upload(world, coord, packed, order));
         }
@@ -10129,6 +10702,7 @@ impl GpuRenderer {
             .map(|(coord, ext)| (*coord, ext.clone()))
             .collect();
         for (coord, external) in &externals {
+            self.sync_shaped_terrain_section(world, *coord);
             scheduled += usize::from(self.queue_external_section_upload(*coord, external));
         }
         if scheduled > 0 {
@@ -10277,6 +10851,7 @@ impl GpuRenderer {
         let mut scheduled = 0;
         let mut removed_any = false;
         for &coord in dirty {
+            self.sync_shaped_terrain_section(world, coord);
             match world.packed_mesh(coord) {
                 None if self.external_sections.contains_key(&coord)
                     && external_section_valid(world, coord) =>
@@ -12346,7 +12921,8 @@ impl GpuRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        self.viewmodel_depth_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.viewmodel_depth_view =
+            Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
         self.viewmodel_depth_texture = Some(texture);
         self.viewmodel_depth_size = size;
     }
@@ -13065,12 +13641,8 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame"),
             });
-        let title_panorama = self.encode_title_panorama_if_active(
-            &mut encoder,
-            view,
-            width,
-            height,
-        );
+        let title_panorama =
+            self.encode_title_panorama_if_active(&mut encoder, view, width, height);
         if !title_panorama && self.window_camera.get().is_some() {
             self.encode_window_composed_world(
                 &mut encoder,
@@ -13324,6 +13896,7 @@ impl GpuRenderer {
             // scene + translucent + one GPU-indirect arena slot
             + 3
             + self.subworld_gpu.entry_count()
+            + self.shaped_terrain_gpu.entry_count()
             + self.subworld_gpu.batch_count()
             + usize::from(self.entity_ber.is_some())
             + self.particle_draw_slots();
@@ -14133,6 +14706,14 @@ impl GpuRenderer {
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, bank);
+        // `window.rs` already calls this hook every frame; syncing the
+        // renderer-owned shaped-terrain bank here is what uplifts live
+        // gameplay without any concurrent `window.rs` edit.
+        self.shaped_terrain_gpu.sync(
+            &self.ctx.device,
+            &self.ctx.queue,
+            &mut self.shaped_terrain_bank,
+        );
         self.last_shadow_casters = digest;
     }
 
@@ -14919,6 +15500,7 @@ impl GpuRenderer {
         let mut arena_regions = 0usize;
         let mut instanced_draws = 0u64;
         let subworld_gpu = &self.subworld_gpu;
+        let shaped_terrain_gpu = &self.shaped_terrain_gpu;
         let entity_ber = &self.entity_ber;
         let particles = &self.particles;
         let particle_instances = &self.particle_instances;
@@ -14945,6 +15527,8 @@ impl GpuRenderer {
         let lit_opaque_pipeline = pack_subworld
             .and_then(|p| p.lit.clone())
             .unwrap_or_else(|| shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color).clone());
+        let shaped_lit_pipeline = gpu.shaped_lit_pipeline.clone();
+        let shaped_lit_alpha_pipeline = gpu.shaped_lit_alpha_pipeline.clone();
         let instanced_pipeline = pack_subworld
             .and_then(|p| p.instanced.clone())
             .unwrap_or_else(|| {
@@ -15173,17 +15757,18 @@ impl GpuRenderer {
             let scratch = &mut gpu.draw_scratch;
             // `world_light` is the packed sub-world light word
             // (`pack_subworld_light`/`0`) carried in `params2.z`.
-            let mut slot = |model: Mat4, fade: f32, alpha: f32, world_light: u32, visual: f32| -> u32 {
-                let index = scratch.len();
-                scratch.push(CompositeDrawUniforms {
-                    mvp: mat4_mul(&view_proj, &model),
-                    model,
-                    params: [fade, alpha, 0.0, 0.0],
-                    params2: [0.0, 0.0, f32::from_bits(world_light), visual],
-                    _stride_pad: [0.0; 24],
-                });
-                index as u32 * DRAW_UNIFORM_STRIDE
-            };
+            let mut slot =
+                |model: Mat4, fade: f32, alpha: f32, world_light: u32, visual: f32| -> u32 {
+                    let index = scratch.len();
+                    scratch.push(CompositeDrawUniforms {
+                        mvp: mat4_mul(&view_proj, &model),
+                        model,
+                        params: [fade, alpha, 0.0, 0.0],
+                        params2: [0.0, 0.0, f32::from_bits(world_light), visual],
+                        _stride_pad: [0.0; 24],
+                    });
+                    index as u32 * DRAW_UNIFORM_STRIDE
+                };
             let identity: Mat4 = [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -15214,6 +15799,33 @@ impl GpuRenderer {
                 }
                 let model = entry.transform.model_matrix();
                 let off = slot(model, 1.0, entry.alpha, entry.world_light, 0.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+            // Static shaped terrain (stairs, fences, plants and other
+            // non-cube official models). Entries live in the same explicit-
+            // UV lit lane but use the alpha-tested pipeline so cutout plant
+            // texels never become opaque black fragments; section culling
+            // mirrors the packed terrain pass.
+            let mut drew_shaped_opaque = false;
+            for entry in shaped_terrain_gpu.entries() {
+                if entry.index_count == 0 || entry.alpha < 0.999 {
+                    continue;
+                }
+                let coord = shaped_entry_coord(entry);
+                if culled_sections.contains(&coord) {
+                    continue;
+                }
+                if !drew_shaped_opaque {
+                    pass.set_pipeline(&shaped_lit_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_shaped_opaque = true;
+                }
+                let model = entry.transform.model_matrix();
+                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                let off = slot(model, fade, entry.alpha, entry.world_light, 0.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
                 pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
                 pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
@@ -15364,6 +15976,31 @@ impl GpuRenderer {
                 pass.draw_indexed(0..entry.index_count, 0, 0..1);
             }
 
+            // Translucent shaped terrain (rare non-cube translucent blocks)
+            // uses the same explicit UVs and the regular lit alpha pipeline.
+            let mut drew_shaped_alpha = false;
+            for entry in shaped_terrain_gpu.entries() {
+                if entry.index_count == 0 || entry.alpha >= 0.999 {
+                    continue;
+                }
+                let coord = shaped_entry_coord(entry);
+                if culled_sections.contains(&coord) {
+                    continue;
+                }
+                if !drew_shaped_alpha {
+                    pass.set_pipeline(&shaped_lit_alpha_pipeline);
+                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                    drew_shaped_alpha = true;
+                }
+                let model = entry.transform.model_matrix();
+                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                let off = slot(model, fade, entry.alpha, entry.world_light, 0.0);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+            }
+
             // GPU-instanced billboards: one indexed draw expands the
             // static unit quad per staged `ParticleInstance` — the VS
             // rebuilds each quad's corners from its center + billboard
@@ -15488,6 +16125,11 @@ impl GpuRenderer {
         }
         self.subworld_gpu
             .sync(&self.ctx.device, &self.ctx.queue, frame.subworlds);
+        self.shaped_terrain_gpu.sync(
+            &self.ctx.device,
+            &self.ctx.queue,
+            &mut self.shaped_terrain_bank,
+        );
         self.last_shadow_casters = caster_digest;
         if let Some(rgba) = frame.ui_rgba {
             self.update_ui_framebuffer(width, height, rgba)?;
@@ -15554,12 +16196,8 @@ impl GpuRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("composed-frame"),
             });
-        let title_panorama = self.encode_title_panorama_if_active(
-            &mut encoder,
-            &native_view,
-            width,
-            height,
-        );
+        let title_panorama =
+            self.encode_title_panorama_if_active(&mut encoder, &native_view, width, height);
         if !title_panorama {
             self.dispatch_shadow_work(&mut encoder, camera, aspect, decision);
             if scaled {
