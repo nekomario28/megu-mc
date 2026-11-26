@@ -33,7 +33,7 @@ use crate::data_loader::{parse_json, JsonValue};
 use crate::fallback::is_builtin_superseded_mod;
 use crate::loader_extensions::{self, JarExtensionReport};
 use crate::modpack;
-use crate::version_compat::VersionRange;
+use crate::version_compat::{ModVersion, VersionRange};
 
 // ===========================================================================
 // 1. Map-mod fair-play mode
@@ -1037,7 +1037,7 @@ fn get_str(body: &[u8], cur: &mut usize) -> Result<String, AccessoryError> {
 // ===========================================================================
 
 /// Which loader ecosystem a mod JAR declares.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ModLoaderKind {
     /// `fabric.mod.json` only.
     Fabric,
@@ -1045,8 +1045,10 @@ pub enum ModLoaderKind {
     NeoForge,
     /// `META-INF/mods.toml` only (legacy Forge layout).
     ForgeLegacy,
-    /// Both `fabric.mod.json` and a Forge-family manifest coexist in the
-    /// same JAR (real "unified"/multi-loader releases).
+    /// Both Fabric-family and Forge-family manifests coexist in the same JAR
+    /// (real "unified"/multi-loader releases). Individual dependency edges
+    /// still carry their own manifest loader, so the table never flattens
+    /// loader-specific constraints together.
     DualFabricNeoForge,
     /// Neither loader manifest — a pure datapack/resource archive.
     DatapackOnly,
@@ -1062,11 +1064,44 @@ impl ModLoaderKind {
             Self::DatapackOnly => "datapack",
         }
     }
+
+    /// Loader shims this kind needs for virtual capability checks.
+    pub fn runtime_loader_ids(&self) -> &'static [&'static str] {
+        match self {
+            Self::Fabric => &["fabricloader", "fabric"],
+            Self::NeoForge => &["neoforge"],
+            Self::ForgeLegacy => &["forge"],
+            Self::DualFabricNeoForge => &["fabricloader", "fabric", "neoforge"],
+            Self::DatapackOnly => &[],
+        }
+    }
 }
 
 impl fmt::Display for ModLoaderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Identity of one concrete loader manifest inside an archive. Unlike the
+/// aggregate [`ModLoaderKind`] compatibility class, this preserves Quilt as
+/// Quilt and keeps multi-loader manifests distinct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ManifestLoaderKind {
+    Fabric,
+    Quilt,
+    NeoForge,
+    ForgeLegacy,
+}
+
+impl ManifestLoaderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fabric => "fabric",
+            Self::Quilt => "quilt",
+            Self::NeoForge => "neoforge",
+            Self::ForgeLegacy => "forge",
+        }
     }
 }
 
@@ -1081,17 +1116,320 @@ pub enum ModEnvironment {
     Both,
 }
 
-/// One declared dependency of a scanned mod.
+/// Dependency strength/polarity preserved from the declaring manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModDependencyKind {
+    Required,
+    Optional,
+    /// Fabric `suggests` — weaker than `recommends`, still non-fatal.
+    Suggested,
+    /// NeoForge/Forge `incompatible` or Fabric `breaks`.
+    Incompatible,
+    /// NeoForge `discouraged` (including the legacy `disc` spelling) or
+    /// Fabric `conflicts` — present-but-warn polarity, not a hard conflict.
+    Discouraged,
+}
+
+impl ModDependencyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::Suggested => "suggested",
+            Self::Incompatible => "incompatible",
+            Self::Discouraged => "discouraged",
+        }
+    }
+
+    pub fn is_required(self) -> bool {
+        self == Self::Required
+    }
+}
+
+/// NeoForge/Forge dependency ordering constraint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ModDependencyOrdering {
+    None,
+    /// The dependency must load before the declaring mod.
+    Before,
+    /// The dependency must load after the declaring mod.
+    After,
+}
+
+impl ModDependencyOrdering {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Before => "BEFORE",
+            Self::After => "AFTER",
+        }
+    }
+}
+
+/// One declared dependency edge of a scanned mod. The original boolean
+/// `required` remains for existing callers, while `kind`, `side`,
+/// `ordering`, `owner_mod_id`, and `loader` preserve the manifest edge
+/// faithfully for the solver and UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModDependency {
     /// The depended-on mod id.
     pub mod_id: String,
     /// Declared version constraint in the loader's syntax, if any.
     pub version_range: Option<String>,
-    /// `true` when absence is fatal (Fabric `depends`, NeoForge
-    /// `type="required"` / legacy `mandatory=true`); `false` for
-    /// recommendations and optional integrations.
+    /// `true` when absence is fatal for an unconditional non-alternative
+    /// edge. Kept in sync with `kind == Required` by parsers.
     pub required: bool,
+    /// Mod id inside the declaring archive that owns this edge.
+    pub owner_mod_id: String,
+    /// Loader manifest this edge came from (`Quilt` is never flattened to
+    /// Fabric, even when the ecosystems overlap).
+    pub loader: ManifestLoaderKind,
+    /// Side constraint (`CLIENT`, `SERVER`, or `BOTH`).
+    pub side: ModEnvironment,
+    pub kind: ModDependencyKind,
+    pub ordering: ModDependencyOrdering,
+    /// Quilt conditional expression (`only_if` / `unless` / container key),
+    /// preserved as source text instead of being flattened away.
+    pub condition: Option<String>,
+    /// Stable alternative-group key for Quilt/Fabric OR dependencies. A
+    /// required group is satisfied when at least one member is satisfied.
+    pub alternative_group: Option<String>,
+}
+
+impl ModDependency {
+    pub fn new(mod_id: impl Into<String>, version_range: Option<String>, required: bool) -> Self {
+        Self {
+            mod_id: mod_id.into(),
+            version_range,
+            required,
+            owner_mod_id: String::new(),
+            loader: ManifestLoaderKind::Fabric,
+            side: ModEnvironment::Both,
+            kind: if required {
+                ModDependencyKind::Required
+            } else {
+                ModDependencyKind::Optional
+            },
+            ordering: ModDependencyOrdering::None,
+            condition: None,
+            alternative_group: None,
+        }
+    }
+
+    pub fn with_kind(mut self, kind: ModDependencyKind) -> Self {
+        self.kind = kind;
+        self.required = kind.is_required();
+        self
+    }
+
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner_mod_id = owner.into();
+        self
+    }
+
+    pub fn with_loader(mut self, loader: ManifestLoaderKind) -> Self {
+        self.loader = loader;
+        self
+    }
+
+    pub fn with_side(mut self, side: ModEnvironment) -> Self {
+        self.side = side;
+        self
+    }
+
+    pub fn with_ordering(mut self, ordering: ModDependencyOrdering) -> Self {
+        self.ordering = ordering;
+        self
+    }
+
+    pub fn with_condition(mut self, condition: Option<String>) -> Self {
+        self.condition = condition;
+        self
+    }
+
+    pub fn with_alternative_group(mut self, group: Option<String>) -> Self {
+        self.alternative_group = group;
+        self
+    }
+
+    /// Whether this edge creates a hard requirement during solving. Quilt
+    /// conditionals are preserved but are not treated as unconditional fatal
+    /// requirements until their condition can be proven active.
+    pub fn solver_required(&self) -> bool {
+        self.required && self.kind == ModDependencyKind::Required && self.condition.is_none()
+    }
+}
+
+/// A nested archive that could not contribute a trustworthy solver candidate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsolatedNestedJar {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Independent Jar-in-Jar candidate identity. Identity is the tuple
+/// `(mod_id, version, sha256, parent_chain)`; exact duplicates across parents
+/// deduplicate cleanly, while distinct versions remain independent providers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedModCandidate {
+    pub mod_id: String,
+    pub version: String,
+    pub sha256: String,
+    pub parent_chain: String,
+    pub member_path: String,
+    pub depth: usize,
+    pub loader: ManifestLoaderKind,
+    pub declared_mod_ids: Vec<String>,
+    pub dependencies: Vec<ModDependency>,
+}
+
+impl NestedModCandidate {
+    pub fn identity_key(&self) -> (String, String, String, String) {
+        (
+            self.mod_id.clone(),
+            self.version.clone(),
+            self.sha256.clone(),
+            self.parent_chain.clone(),
+        )
+    }
+}
+
+/// Tier of a virtual capability the runtime itself provides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VirtualCapabilityTier {
+    Game,
+    Runtime,
+    LoaderShim,
+    NativeAdapter,
+}
+
+/// Exact versioned virtual capability (never a blind name-only satisfaction).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualProvider {
+    pub mod_id: String,
+    pub version: String,
+    pub tier: VirtualCapabilityTier,
+}
+
+/// Registry of capabilities megu itself provides to the dependency solver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VirtualProviderTable {
+    pub providers: BTreeMap<String, VirtualProvider>,
+}
+
+impl VirtualProviderTable {
+    /// Empty table for callers that explicitly compose capabilities.
+    pub fn empty() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+        }
+    }
+
+    /// Canonical dedicated-server capabilities: Minecraft 1.21.1, Java 21,
+    /// and every loader shim the universal solver admits natively.
+    pub fn canonical() -> Self {
+        let mut table = Self::empty();
+        for (id, version, tier) in [
+            ("minecraft", "1.21.1", VirtualCapabilityTier::Game),
+            ("java", "21", VirtualCapabilityTier::Runtime),
+            ("fabricloader", "0.16.9", VirtualCapabilityTier::LoaderShim),
+            ("fabric-loader", "0.16.9", VirtualCapabilityTier::LoaderShim),
+            ("fabric", "0.16.9", VirtualCapabilityTier::LoaderShim),
+            ("fabric-api", "0.102.0+1.21.1", VirtualCapabilityTier::LoaderShim),
+            ("fabric_api", "0.102.0+1.21.1", VirtualCapabilityTier::LoaderShim),
+            ("neoforge", "21.1.172", VirtualCapabilityTier::LoaderShim),
+            ("forge", "47.4.0", VirtualCapabilityTier::LoaderShim),
+            ("javafml", "4.0.39", VirtualCapabilityTier::LoaderShim),
+            ("quilt_loader", "0.26.0", VirtualCapabilityTier::LoaderShim),
+            ("quilted_fabric_loader", "0.26.0", VirtualCapabilityTier::LoaderShim),
+            ("quilt", "0.26.0", VirtualCapabilityTier::LoaderShim),
+        ] {
+            table.insert(id, version, tier);
+        }
+        table
+    }
+
+    pub fn insert(&mut self, mod_id: &str, version: &str, tier: VirtualCapabilityTier) {
+        let provider = VirtualProvider {
+            mod_id: mod_id.to_string(),
+            version: version.to_string(),
+            tier,
+        };
+        self.providers.insert(mod_id.to_ascii_lowercase(), provider);
+    }
+
+    /// Admit a native adapter capability explicitly (for example `create`
+    /// only when the native adapter is enabled); nothing is implicitly active.
+    pub fn admit_native_adapter(&mut self, mod_id: &str, version: &str) {
+        self.insert(mod_id, version, VirtualCapabilityTier::NativeAdapter);
+    }
+
+    pub fn get(&self, mod_id: &str) -> Option<&VirtualProvider> {
+        self.providers.get(&mod_id.to_ascii_lowercase())
+    }
+}
+
+impl Default for VirtualProviderTable {
+    fn default() -> Self {
+        Self::canonical()
+    }
+}
+
+/// A present provider whose concrete version does not satisfy the edge range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyVersionMismatch {
+    pub mod_id: String,
+    pub required_mod_id: String,
+    pub version_range: String,
+    pub provider_id: String,
+    pub provider_version: String,
+}
+
+/// An incompatibility/discouraged edge whose target is present.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyConflict {
+    pub mod_id: String,
+    pub other_mod_id: String,
+    pub kind: ModDependencyKind,
+    pub version_range: Option<String>,
+}
+
+/// One real strongly connected dependency/ordering cycle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyCycle {
+    pub members: Vec<String>,
+}
+
+/// Modrinth fetch candidate descriptor derived directly from a missing edge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModrinthDependencyCandidate {
+    pub required_mod_id: String,
+    pub required_by: String,
+    pub version_range: Option<String>,
+    pub query_slug: String,
+}
+
+/// Structured, UI/startup-ready dependency resolution report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModDependencyResolutionReport {
+    pub admitted: Vec<String>,
+    pub isolated_unsatisfied: Vec<MissingDependency>,
+    pub missing_required: Vec<MissingDependency>,
+    pub version_mismatches: Vec<DependencyVersionMismatch>,
+    pub conflicts: Vec<DependencyConflict>,
+    pub cycles: Vec<DependencyCycle>,
+    pub client_only_skipped: Vec<String>,
+    pub modrinth_candidates: Vec<ModrinthDependencyCandidate>,
+}
+
+/// Alias kept explicit for the one-click auto-fetch planner UI.
+pub type MissingDependencyPlan = ModDependencyResolutionReport;
+
+/// Side the dependency solver is planning for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModSolveSide {
+    Client,
+    Server,
 }
 
 /// Everything the unified mod table needs out of one JAR.
@@ -1124,14 +1462,54 @@ pub struct ModJarDescriptor {
     /// Fabric `entrypoints` (all arrays flattened; `{adapter, value}`
     /// objects contribute their `value`). Empty for pure-Forge jars.
     pub entrypoints: Vec<String>,
-    /// Merged dependency table (`required` wins on id collisions).
+    /// Loader manifests physically present in this archive, in scan order.
+    /// Quilt stays `quilt` here even though the aggregate loader class is the
+    /// Fabric-family compatibility surface.
+    pub loader_manifests: Vec<ManifestLoaderKind>,
+    /// Dependency edges preserved per loader/owner (multi-loader manifests are
+    /// deliberately not flattened into one anonymous edge set).
     pub dependencies: Vec<ModDependency>,
+    /// Independent nested Jar-in-Jar solver candidates discovered in this archive.
+    pub nested_candidates: Vec<NestedModCandidate>,
+    /// Nested archives isolated as malformed without rejecting the healthy outer JAR.
+    pub isolated_nested_jars: Vec<IsolatedNestedJar>,
     /// Secondary loader-extension surface of the JAR: `quilt.mod.json`
     /// contents (the `loader` field still reports the Fabric-family
     /// ecosystem for Quilt-only archives), the bounded
     /// `META-INF/jarjar/` scan, and any `accesstransformer.cfg`
     /// directives — see [`crate::loader_extensions::inspect_jar_extensions`].
     pub extensions: JarExtensionReport,
+}
+
+impl ModJarDescriptor {
+    /// Ids declared by nested Jar-in-Jar candidates only (not the outer JAR's
+    /// own ids), in deterministic scan order.
+    pub fn nested_mod_ids(&self) -> Vec<&str> {
+        let mut out = Vec::new();
+        for candidate in &self.nested_candidates {
+            for id in &candidate.declared_mod_ids {
+                if !out.contains(&id.as_str()) {
+                    out.push(id.as_str());
+                }
+            }
+        }
+        out
+    }
+
+    /// Compatibility helper for registry/content consumers: every mod id
+    /// available inside this archive, including independent nested candidates.
+    /// Dependency solving must still use `declared_mod_ids` plus the exact
+    /// versioned candidates separately rather than treating this union as the
+    /// outer archive's identity.
+    pub fn all_contained_mod_ids(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = self.declared_mod_ids.iter().map(String::as_str).collect();
+        for id in self.nested_mod_ids() {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
 }
 
 /// Error produced by [`scan_mod_jar`]. Every variant is fail-closed: the
@@ -1184,13 +1562,11 @@ pub const RUNTIME_PROVIDED_MOD_IDS: &[&str] = &[
     "neoforge",
     "forge",
     "javafml",
+    "quilt_loader",
+    "quilted_fabric_loader",
+    "quilt",
 ];
 
-fn is_runtime_provided_mod(mod_id: &str) -> bool {
-    RUNTIME_PROVIDED_MOD_IDS
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(mod_id))
-}
 
 // ---------------------------------------------------------------------------
 // Minimal fail-closed TOML subset (enough for mods.toml / neoforge.mods.toml)
@@ -1950,6 +2326,7 @@ struct FabricMeta {
     mixin_configs: Vec<String>,
     entrypoints: Vec<String>,
     dependencies: Vec<ModDependency>,
+    provides: Vec<String>,
 }
 
 fn json_map_str<'a>(
@@ -1957,6 +2334,34 @@ fn json_map_str<'a>(
     key: &str,
 ) -> Option<&'a str> {
     obj.get(key).and_then(JsonValue::as_str)
+}
+
+fn fabric_range_value(dep_val: &JsonValue, ctx: &str) -> Result<Option<String>, JarScanError> {
+    match dep_val {
+        JsonValue::String(v) => Ok(Some(v.clone())),
+        JsonValue::Array(items) => {
+            if items.is_empty() {
+                return Ok(None);
+            }
+            let mut arms = Vec::new();
+            for item in items {
+                let Some(v) = item.as_str() else {
+                    return Err(jar_err(format!(
+                        "{ctx} array entries must be version strings"
+                    )));
+                };
+                arms.push(v.to_string());
+            }
+            // Fabric range arrays are alternatives; preserving every arm as a
+            // SemVer union retains exact semantics instead of taking only the
+            // first or last range.
+            Ok(Some(arms.join(" || ")))
+        }
+        JsonValue::Null => Ok(None),
+        _ => Err(jar_err(format!(
+            "{ctx} must be a version string or string array"
+        ))),
+    }
 }
 
 fn valid_fabric_mod_id(id: &str) -> bool {
@@ -2008,7 +2413,13 @@ fn parse_fabric_meta(bytes: &[u8]) -> Result<FabricMeta, JarScanError> {
 
     let mut dependencies = Vec::new();
     let mut mc_range = None;
-    for (table_key, required) in [("depends", true), ("recommends", false)] {
+    for (table_key, kind) in [
+        ("depends", ModDependencyKind::Required),
+        ("recommends", ModDependencyKind::Optional),
+        ("suggests", ModDependencyKind::Suggested),
+        ("breaks", ModDependencyKind::Incompatible),
+        ("conflicts", ModDependencyKind::Discouraged),
+    ] {
         let Some(table) = obj.get(table_key) else { continue };
         let Some(table) = table.as_object() else {
             return Err(jar_err(format!(
@@ -2016,19 +2427,37 @@ fn parse_fabric_meta(bytes: &[u8]) -> Result<FabricMeta, JarScanError> {
             )));
         };
         for (dep_id, dep_val) in table {
-            let Some(range) = dep_val.as_str() else {
-                return Err(jar_err(format!(
-                    "fabric.mod.json: '{table_key}.{dep_id}' must be a version string"
-                )));
-            };
+            let range = fabric_range_value(
+                dep_val,
+                &format!("fabric.mod.json: '{table_key}.{dep_id}'"),
+            )?;
             if dep_id == "minecraft" {
-                mc_range = Some(range.to_string());
+                mc_range = range.clone();
             }
-            dependencies.push(ModDependency {
-                mod_id: dep_id.clone(),
-                version_range: Some(range.to_string()),
-                required,
-            });
+            dependencies.push(
+                ModDependency::new(dep_id.clone(), range, kind.is_required())
+                    .with_kind(kind)
+                    .with_owner(mod_id.clone())
+                    .with_loader(ManifestLoaderKind::Fabric),
+            );
+        }
+    }
+
+    let mut provides = Vec::new();
+    if let Some(value) = obj.get("provides") {
+        let Some(items) = value.as_array() else {
+            return Err(jar_err("fabric.mod.json: 'provides' must be a string array"));
+        };
+        for item in items {
+            let Some(id) = item.as_str() else {
+                return Err(jar_err("fabric.mod.json: 'provides' entries must be strings"));
+            };
+            if !valid_fabric_mod_id(id) {
+                return Err(jar_err(format!(
+                    "fabric.mod.json: invalid provided mod id '{id}'"
+                )));
+            }
+            provides.push(id.to_string());
         }
     }
 
@@ -2098,6 +2527,7 @@ fn parse_fabric_meta(bytes: &[u8]) -> Result<FabricMeta, JarScanError> {
         mixin_configs,
         entrypoints,
         dependencies,
+        provides,
     })
 }
 
@@ -2184,45 +2614,73 @@ fn parse_forge_meta(bytes: &[u8], ctx: &str) -> Result<ForgeMeta, JarScanError> 
                 let dep_type = dt
                     .get("type")
                     .and_then(TomlValue::as_str)
-                    .unwrap_or("required");
-                let required = match dep_type {
-                    "required" => true,
-                    "optional" => false,
-                    // Conflicts/discs are not load requirements.
-                    "incompatible" | "disc" => continue,
+                    .unwrap_or("required")
+                    .to_ascii_lowercase();
+                let mut kind = match dep_type.as_str() {
+                    "required" => ModDependencyKind::Required,
+                    "optional" => ModDependencyKind::Optional,
+                    "incompatible" => ModDependencyKind::Incompatible,
+                    // NeoForge spells the polarity `discouraged`; some old
+                    // manifests carry the truncated `disc` form. Accept both.
+                    "discouraged" | "disc" => ModDependencyKind::Discouraged,
                     other => {
                         return Err(jar_err(format!("{dctx}: unknown type '{other}'")))
                     }
                 };
-                // Legacy `mandatory = false` overrides `required`.
-                let required = match dt.get("mandatory").and_then(TomlValue::as_bool) {
-                    Some(false) => false,
-                    _ => required,
-                };
+                // Legacy `mandatory = false` downgrades only a required edge.
+                if dt.get("mandatory").and_then(TomlValue::as_bool) == Some(false)
+                    && kind == ModDependencyKind::Required
+                {
+                    kind = ModDependencyKind::Optional;
+                }
+                let required = kind.is_required();
                 let version_range = dt
                     .get("versionRange")
                     .and_then(TomlValue::as_str)
                     .map(str::to_string);
-                let side = dt
+                let side_text = dt
                     .get("side")
                     .and_then(TomlValue::as_str)
-                    .unwrap_or("BOTH");
+                    .unwrap_or("BOTH")
+                    .to_ascii_uppercase();
+                let side = match side_text.as_str() {
+                    "BOTH" => ModEnvironment::Both,
+                    "CLIENT" => ModEnvironment::Client,
+                    "SERVER" => ModEnvironment::Server,
+                    other => {
+                        return Err(jar_err(format!("{dctx}: unknown side '{other}'")))
+                    }
+                };
+                let ordering = match dt
+                    .get("ordering")
+                    .and_then(TomlValue::as_str)
+                    .unwrap_or("NONE")
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "NONE" => ModDependencyOrdering::None,
+                    "BEFORE" => ModDependencyOrdering::Before,
+                    "AFTER" => ModDependencyOrdering::After,
+                    other => {
+                        return Err(jar_err(format!("{dctx}: unknown ordering '{other}'")))
+                    }
+                };
                 if dep_id == "minecraft" {
                     meta.mc_range = version_range.clone();
-                    meta.environment = match side {
-                        "BOTH" => ModEnvironment::Both,
-                        "CLIENT" => ModEnvironment::Client,
-                        "SERVER" => ModEnvironment::Server,
-                        other => {
-                            return Err(jar_err(format!("{dctx}: unknown side '{other}'")))
-                        }
-                    };
+                    meta.environment = side;
                 }
-                meta.dependencies.push(ModDependency {
-                    mod_id: dep_id,
-                    version_range,
-                    required,
-                });
+                meta.dependencies.push(
+                    ModDependency::new(dep_id, version_range, required)
+                        .with_kind(kind)
+                        .with_owner(owner_id.clone())
+                        .with_loader(if ctx.contains("neoforge") {
+                            ManifestLoaderKind::NeoForge
+                        } else {
+                            ManifestLoaderKind::ForgeLegacy
+                        })
+                        .with_side(side)
+                        .with_ordering(ordering),
+                );
             }
         }
     }
@@ -2247,7 +2705,18 @@ fn merge_dependencies(
 ) -> Vec<ModDependency> {
     let mut out: Vec<ModDependency> = Vec::new();
     for dep in a.into_iter().chain(b) {
-        match out.iter_mut().find(|d| d.mod_id == dep.mod_id) {
+        // Multi-loader manifests stay distinct. Only a truly duplicate edge
+        // (same loader, owner, target, polarity, ordering and side) merges.
+        match out.iter_mut().find(|d| {
+            d.mod_id == dep.mod_id
+                && d.loader == dep.loader
+                && d.owner_mod_id == dep.owner_mod_id
+                && d.kind == dep.kind
+                && d.side == dep.side
+                && d.ordering == dep.ordering
+                && d.condition == dep.condition
+                && d.alternative_group == dep.alternative_group
+        }) {
             Some(existing) => {
                 existing.required |= dep.required;
                 if existing.version_range.is_none() {
@@ -2278,6 +2747,7 @@ fn dedup_keep_order(list: Vec<String>) -> Vec<String> {
 /// simply contributes nothing here (the data-extraction pass records
 /// the same member in `rejected_members`); only a failure to list the
 /// outer archive itself propagates.
+#[allow(dead_code)]
 fn nested_jar_mod_surface(
     jar_bytes: &[u8],
     display: &str,
@@ -2320,6 +2790,148 @@ fn nested_jar_mod_surface(
     Ok((dedup_keep_order(ids), deps))
 }
 
+fn manifest_implementation_version(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut unfolded = String::new();
+    for line in text.replace("\r\n", "\n").lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            unfolded.push_str(line.trim_start());
+        } else {
+            unfolded.push('\n');
+            unfolded.push_str(line);
+        }
+    }
+    for line in unfolded.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case("Implementation-Version") {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn substitute_file_jar_version(version: &mut String, implementation_version: Option<&str>) {
+    if version == "${file.jarVersion}" {
+        if let Some(v) = implementation_version {
+            *version = v.to_string();
+        }
+    }
+}
+
+/// Scan nested archives as independent solver candidates. A malformed child
+/// is isolated in `isolated` while the healthy outer archive and valid sibling
+/// candidates survive; JarJar metadata still supplies an artifact/version
+/// fallback for library JARs that carry no loader manifest.
+fn scan_nested_candidates(
+    jar_bytes: &[u8],
+    display: &str,
+) -> Result<(Vec<NestedModCandidate>, Vec<IsolatedNestedJar>), JarScanError> {
+    let report = loader_extensions::extract_embedded_jars(jar_bytes, display)
+        .map_err(|e| jar_err(e.reason()))?;
+    let mut isolated: Vec<IsolatedNestedJar> = report
+        .rejected
+        .iter()
+        .map(|note| {
+            let path = note
+                .rsplit_once(" (")
+                .map(|(path, _)| path)
+                .unwrap_or(note.as_str())
+                .to_string();
+            IsolatedNestedJar {
+                path,
+                reason: note.clone(),
+            }
+        })
+        .collect();
+    let inspection = loader_extensions::inspect_jar_in_jar(jar_bytes, display).unwrap_or_default();
+    let mut candidates = Vec::new();
+    for embedded in &report.jars {
+        let sha256 = megu_core::crypto::sha256_hex(&embedded.bytes);
+        let parent_chain = embedded
+            .path
+            .rsplit_once('!')
+            .map(|(parent, _)| parent.to_string())
+            .unwrap_or_else(|| display.to_string());
+        let declared = inspection
+            .declared
+            .iter()
+            .find(|d| embedded.member_path.ends_with(&d.path) || embedded.path.ends_with(&d.path));
+        match scan_mod_jar_named(&embedded.bytes, &embedded.path) {
+            Ok(desc) => {
+                for id in &desc.declared_mod_ids {
+                    candidates.push(NestedModCandidate {
+                        mod_id: id.clone(),
+                        version: if desc.version.is_empty() {
+                            declared.map(|d| d.version.clone()).unwrap_or_default()
+                        } else {
+                            desc.version.clone()
+                        },
+                        sha256: sha256.clone(),
+                        parent_chain: parent_chain.clone(),
+                        member_path: embedded.member_path.clone(),
+                        depth: embedded.depth,
+                        loader: if desc.loader == ModLoaderKind::NeoForge {
+                            ManifestLoaderKind::NeoForge
+                        } else if desc.loader == ModLoaderKind::ForgeLegacy {
+                            ManifestLoaderKind::ForgeLegacy
+                        } else {
+                            ManifestLoaderKind::Fabric
+                        },
+                        declared_mod_ids: desc.declared_mod_ids.clone(),
+                        dependencies: desc.dependencies.clone(),
+                    });
+                }
+            }
+            Err(scan_err) => {
+                if let Some(desc) = declared {
+                    candidates.push(NestedModCandidate {
+                        mod_id: desc.artifact.clone(),
+                        version: desc.version.clone(),
+                        sha256: sha256.clone(),
+                        parent_chain: parent_chain.clone(),
+                        member_path: embedded.member_path.clone(),
+                        depth: embedded.depth,
+                        loader: ManifestLoaderKind::NeoForge,
+                        declared_mod_ids: vec![desc.artifact.clone()],
+                        dependencies: Vec::new(),
+                    });
+                } else {
+                    isolated.push(IsolatedNestedJar {
+                        path: embedded.path.clone(),
+                        reason: scan_err.reason().to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Byte-identical artifacts duplicated by two parents are one candidate in
+    // practice, not a fatal duplicate: retain the lexicographically earliest
+    // parent chain for determinism while preserving distinct versions/hashes.
+    let mut by_content: BTreeMap<(String, String, String), NestedModCandidate> = BTreeMap::new();
+    for candidate in candidates {
+        let key = (
+            candidate.mod_id.clone(),
+            candidate.version.clone(),
+            candidate.sha256.clone(),
+        );
+        match by_content.get(&key) {
+            None => {
+                by_content.insert(key, candidate);
+            }
+            Some(existing) if candidate.parent_chain < existing.parent_chain => {
+                by_content.insert(key, candidate);
+            }
+            _ => {}
+        }
+    }
+    Ok((by_content.into_values().collect(), isolated))
+}
+
 /// Scan one complete mod JAR in memory, reading `fabric.mod.json` and
 /// `META-INF/neoforge.mods.toml` / `META-INF/mods.toml` through
 /// [`crate::modpack`]'s fail-closed ZIP reader (traversal, zip-bomb,
@@ -2343,6 +2955,7 @@ pub fn scan_mod_jar_named(
     let mut fabric_member = None;
     let mut neoforge_member = None;
     let mut forge_member = None;
+    let mut manifest_member = None;
     let mut has_pack_mcmeta = false;
     let mut has_data_dir = false;
     for entry in &entries {
@@ -2350,6 +2963,7 @@ pub fn scan_mod_jar_named(
             "fabric.mod.json" => fabric_member = Some(entry),
             "META-INF/neoforge.mods.toml" => neoforge_member = Some(entry),
             "META-INF/mods.toml" => forge_member = Some(entry),
+            "META-INF/MANIFEST.MF" => manifest_member = Some(entry),
             "pack.mcmeta" => has_pack_mcmeta = true,
             _ => {
                 if entry.name.starts_with("data/") {
@@ -2367,6 +2981,10 @@ pub fn scan_mod_jar_named(
     let fabric = fabric_member
         .map(|e| read(e).and_then(|b| parse_fabric_meta(&b)))
         .transpose()?;
+    let implementation_version = manifest_member
+        .map(|e| read(e).map(|b| manifest_implementation_version(&b)))
+        .transpose()?
+        .flatten();
     let forge_file = neoforge_member.is_some();
     let forge = neoforge_member
         .or(forge_member)
@@ -2380,6 +2998,10 @@ pub fn scan_mod_jar_named(
             })
         })
         .transpose()?;
+    let mut forge = forge;
+    if let Some(f) = forge.as_mut() {
+        substitute_file_jar_version(&mut f.version, implementation_version.as_deref());
+    }
 
     // Secondary loader-extension surface: `quilt.mod.json`, bounded
     // `META-INF/jarjar/` nested-JAR scan, and `accesstransformer.cfg` —
@@ -2403,7 +3025,10 @@ pub fn scan_mod_jar_named(
                 declared_mc_range: None,
                 mixin_configs: Vec::new(),
                 entrypoints: Vec::new(),
+                loader_manifests: Vec::new(),
                 dependencies: Vec::new(),
+                nested_candidates: Vec::new(),
+                isolated_nested_jars: Vec::new(),
                 extensions,
             });
         }
@@ -2431,6 +3056,9 @@ pub fn scan_mod_jar_named(
     let mut declared_mod_ids = Vec::new();
     if let Some(id) = fab_id {
         declared_mod_ids.push(id.to_string());
+    }
+    if let Some(f) = &fabric {
+        declared_mod_ids.extend(f.provides.iter().cloned());
     }
     if let Some(f) = &forge {
         declared_mod_ids.extend(
@@ -2522,14 +3150,28 @@ pub fn scan_mod_jar_named(
             .unwrap_or_default(),
     );
 
-    // Jar-in-Jar: every embedded JAR's own loader manifest contributes
-    // its declared mod ids and dependencies, so bundled mods (NeoForge
-    // `META-INF/jarjar/*`, Fabric `META-INF/jars/*`) register as
-    // provided in the unified table and satisfy cross-dependencies.
-    let (nested_ids, nested_deps) = nested_jar_mod_surface(jar_bytes, display)?;
-    let declared_mod_ids =
-        dedup_keep_order(declared_mod_ids.into_iter().chain(nested_ids).collect());
-    let dependencies = merge_dependencies(dependencies, nested_deps);
+    // Jar-in-Jar members stay independent solver candidates. Their ids are
+    // *not* flattened into the outer JAR's own identity — doing so lets a
+    // rejected outer JAR poison a valid sibling or hides version conflicts.
+    let (nested_candidates, isolated_nested_jars) = scan_nested_candidates(jar_bytes, display)?;
+
+    let loader_manifests = {
+        let mut manifests = Vec::new();
+        if fabric.is_some() {
+            manifests.push(ManifestLoaderKind::Fabric);
+        }
+        if quilt.is_some() {
+            manifests.push(ManifestLoaderKind::Quilt);
+        }
+        if forge.is_some() {
+            manifests.push(if forge_file {
+                ManifestLoaderKind::NeoForge
+            } else {
+                ManifestLoaderKind::ForgeLegacy
+            });
+        }
+        manifests
+    };
 
     Ok(ModJarDescriptor {
         loader,
@@ -2539,6 +3181,7 @@ pub fn scan_mod_jar_named(
         environment,
         declared_mc_range,
         mixin_configs,
+        loader_manifests,
         entrypoints: fabric
             .map(|f| f.entrypoints)
             .unwrap_or_default()
@@ -2551,6 +3194,8 @@ pub fn scan_mod_jar_named(
             )
             .collect(),
         dependencies,
+        nested_candidates,
+        isolated_nested_jars,
         extensions,
     })
 }
@@ -2584,6 +3229,10 @@ pub struct PlannedMod {
     pub mixin_configs: Vec<String>,
     pub entrypoints: Vec<String>,
     pub dependencies: Vec<ModDependency>,
+    /// Independent nested candidates carried by this archive.
+    pub nested_candidates: Vec<NestedModCandidate>,
+    /// Concrete loader manifests present in this archive.
+    pub loader_manifests: Vec<ManifestLoaderKind>,
 }
 
 /// A JAR that could not be scanned at all (corrupt archive, bad manifest).
@@ -2631,8 +3280,17 @@ pub struct DualLoaderPlan {
     /// Mod ids claimed by more than one live JAR (the first claimant in
     /// sorted order stays in `unified_mods`).
     pub duplicate_conflicts: Vec<DuplicateModId>,
-    /// Required dependencies no live JAR provides.
+    /// Required dependencies no live JAR or exact virtual capability provides.
     pub missing_dependencies: Vec<MissingDependency>,
+    /// Present providers rejected because the declaring edge's exact version
+    /// range does not admit their version.
+    pub version_mismatches: Vec<DependencyVersionMismatch>,
+    /// Incompatible/discouraged edges whose target is present.
+    pub dependency_conflicts: Vec<DependencyConflict>,
+    /// Real strongly connected dependency/ordering cycles.
+    pub dependency_cycles: Vec<DependencyCycle>,
+    /// Structured report consumed by startup and the one-click recovery UI.
+    pub resolution: ModDependencyResolutionReport,
 }
 
 impl DualLoaderPlan {
@@ -2677,7 +3335,271 @@ fn planned_from(
         mixin_configs: desc.mixin_configs.clone(),
         entrypoints: desc.entrypoints.clone(),
         dependencies: desc.dependencies.clone(),
+        nested_candidates: desc.nested_candidates.clone(),
+        loader_manifests: desc.loader_manifests.clone(),
     }
+}
+
+#[derive(Clone, Debug)]
+struct ProviderCandidate {
+    id: String,
+    version: String,
+    owner_mod_id: String,
+    nested: bool,
+}
+
+fn edge_side_active(side: ModEnvironment, solve_side: ModSolveSide) -> bool {
+    matches!(
+        (side, solve_side),
+        (ModEnvironment::Both, _)
+            | (ModEnvironment::Client, ModSolveSide::Client)
+            | (ModEnvironment::Server, ModSolveSide::Server)
+    )
+}
+
+fn version_satisfies_edge(range: Option<&str>, version: &str) -> bool {
+    match range {
+        None => true,
+        Some(range) => VersionRange::parse(range)
+            .ok()
+            .is_some_and(|r| r.matches_str(version)),
+    }
+}
+
+fn choose_provider<'a>(
+    dep: &ModDependency,
+    providers: &'a BTreeMap<String, Vec<ProviderCandidate>>,
+) -> Result<Option<&'a ProviderCandidate>, Option<&'a ProviderCandidate>> {
+    let Some(candidates) = providers.get(&dep.mod_id) else {
+        return Ok(None);
+    };
+    let mut matching: Vec<&ProviderCandidate> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.version.is_empty()
+                && version_satisfies_edge(dep.version_range.as_deref(), &candidate.version)
+        })
+        .collect();
+    if dep.version_range.is_none() {
+        matching = candidates.iter().collect();
+    }
+    if matching.is_empty() {
+        // Highest-version candidate is the most useful mismatch diagnostic.
+        return Err(candidates
+            .iter()
+            .filter_map(|candidate| {
+                ModVersion::parse(&candidate.version).map(|v| (v, candidate))
+            })
+            .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.id.cmp(&b.1.id)))
+            .map(|(_, candidate)| candidate)
+            .or_else(|| candidates.first()));
+    }
+    // Pick the highest compatible version when nested/top-level versions
+    // coexist; ties prefer a top-level mod, then deterministic owner/id order.
+    matching.sort_by(|a, b| {
+        let av = ModVersion::parse(&a.version);
+        let bv = ModVersion::parse(&b.version);
+        match (&bv, &av) {
+            (Some(bv), Some(av)) => bv.cmp(av),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => b.version.cmp(&a.version),
+        }
+        .then_with(|| a.nested.cmp(&b.nested))
+            .then_with(|| a.owner_mod_id.cmp(&b.owner_mod_id))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(matching.first().copied())
+}
+
+fn choose_virtual_provider<'a>(
+    dep: &ModDependency,
+    table: &'a VirtualProviderTable,
+) -> Result<Option<&'a VirtualProvider>, Option<&'a VirtualProvider>> {
+    let Some(provider) = table.get(&dep.mod_id) else {
+        return Ok(None);
+    };
+    if version_satisfies_edge(dep.version_range.as_deref(), &provider.version) {
+        Ok(Some(provider))
+    } else {
+        Err(Some(provider))
+    }
+}
+
+fn build_dependency_graph(plan: &DualLoaderPlan, solve_side: ModSolveSide) -> BTreeMap<String, BTreeSet<String>> {
+    let mut provider_owner: BTreeMap<String, String> = BTreeMap::new();
+    for m in &plan.unified_mods {
+        for id in &m.declared_mod_ids {
+            provider_owner.entry(id.clone()).or_insert_with(|| m.mod_id.clone());
+        }
+    }
+    let mut graph: BTreeMap<String, BTreeSet<String>> = plan
+        .unified_mods
+        .iter()
+        .map(|m| (m.mod_id.clone(), BTreeSet::new()))
+        .collect();
+    for m in &plan.unified_mods {
+        for dep in &m.dependencies {
+            if dep.condition.is_some()
+                || dep.kind == ModDependencyKind::Incompatible
+                || !edge_side_active(dep.side, solve_side)
+            {
+                continue;
+            }
+            let Some(provider) = provider_owner.get(&dep.mod_id) else {
+                continue;
+            };
+            let required_edge = dep.solver_required();
+            let ordering_edge = dep.ordering != ModDependencyOrdering::None;
+            if !required_edge && !ordering_edge {
+                continue;
+            }
+            match dep.ordering {
+                // BEFORE always constrains ordering, even for an optional edge;
+                // an unordered edge contributes only when it is required.
+                ModDependencyOrdering::Before => {
+                    graph
+                        .entry(provider.clone())
+                        .or_default()
+                        .insert(m.mod_id.clone());
+                }
+                ModDependencyOrdering::None if required_edge => {
+                    graph
+                        .entry(provider.clone())
+                        .or_default()
+                        .insert(m.mod_id.clone());
+                }
+                // Dependency after the declaring mod: reverse edge.
+                ModDependencyOrdering::After => {
+                    graph
+                        .entry(m.mod_id.clone())
+                        .or_default()
+                        .insert(provider.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    graph
+}
+
+fn tarjan_cycles(graph: &BTreeMap<String, BTreeSet<String>>) -> Vec<DependencyCycle> {
+    #[allow(clippy::too_many_arguments)]
+    fn strongconnect(
+        node: &str,
+        graph: &BTreeMap<String, BTreeSet<String>>,
+        index: &mut usize,
+        indices: &mut BTreeMap<String, usize>,
+        lowlink: &mut BTreeMap<String, usize>,
+        stack: &mut Vec<String>,
+        on_stack: &mut BTreeSet<String>,
+        cycles: &mut Vec<Vec<String>>,
+    ) {
+        indices.insert(node.to_string(), *index);
+        lowlink.insert(node.to_string(), *index);
+        *index += 1;
+        stack.push(node.to_string());
+        on_stack.insert(node.to_string());
+        if let Some(nexts) = graph.get(node) {
+            for next in nexts {
+                if !indices.contains_key(next) {
+                    strongconnect(next, graph, index, indices, lowlink, stack, on_stack, cycles);
+                    let low = lowlink[next].min(lowlink[node]);
+                    lowlink.insert(node.to_string(), low);
+                } else if on_stack.contains(next) {
+                    let low = indices[next].min(lowlink[node]);
+                    lowlink.insert(node.to_string(), low);
+                }
+            }
+        }
+        if lowlink[node] == indices[node] {
+            let mut component = Vec::new();
+            while let Some(member) = stack.pop() {
+                on_stack.remove(&member);
+                component.push(member.clone());
+                if member == node {
+                    break;
+                }
+            }
+            component.sort();
+            if component.len() > 1
+                || component
+                    .first()
+                    .is_some_and(|only| graph.get(only).is_some_and(|n| n.contains(only)))
+            {
+                cycles.push(component);
+            }
+        }
+    }
+
+    let mut index = 0usize;
+    let mut indices = BTreeMap::new();
+    let mut lowlink = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut on_stack = BTreeSet::new();
+    let mut raw = Vec::new();
+    for node in graph.keys() {
+        if !indices.contains_key(node) {
+            strongconnect(
+                node,
+                graph,
+                &mut index,
+                &mut indices,
+                &mut lowlink,
+                &mut stack,
+                &mut on_stack,
+                &mut raw,
+            );
+        }
+    }
+    raw.sort();
+    raw.into_iter()
+        .map(|members| DependencyCycle { members })
+        .collect()
+}
+
+fn deterministic_load_order(
+    ids: &[String],
+    graph: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    let mut indegree: BTreeMap<String, usize> = ids.iter().map(|id| (id.clone(), 0)).collect();
+    for targets in graph.values() {
+        for target in targets {
+            if let Some(v) = indegree.get_mut(target) {
+                *v += 1;
+            }
+        }
+    }
+    let mut ready: BTreeSet<String> = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut order = Vec::new();
+    while let Some(node) = ready.iter().next().cloned() {
+        ready.remove(&node);
+        order.push(node.clone());
+        if let Some(targets) = graph.get(&node) {
+            for target in targets {
+                if let Some(degree) = indegree.get_mut(target) {
+                    *degree -= 1;
+                    if *degree == 0 {
+                        ready.insert(target.clone());
+                    }
+                }
+            }
+        }
+    }
+    // Cyclic members remain present after the orderable prefix, sorted for
+    // determinism and separately reported in `dependency_cycles`.
+    let mut leftovers: Vec<String> = ids
+        .iter()
+        .filter(|id| !order.contains(*id))
+        .cloned()
+        .collect();
+    leftovers.sort();
+    order.extend(leftovers);
+    order
 }
 
 /// Merge a `mods/` directory holding any mix of Fabric and NeoForge/Forge
@@ -2699,6 +3621,23 @@ fn planned_from(
 ///   `missing_dependencies` (loader/game ids in
 ///   [`RUNTIME_PROVIDED_MOD_IDS`] are always satisfied).
 pub fn plan_dual_loader_mods_dir<'a, I>(jars: I) -> DualLoaderPlan
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
+    plan_dual_loader_mods_dir_with_side_and_virtual_providers(
+        jars,
+        ModSolveSide::Server,
+        &VirtualProviderTable::canonical(),
+    )
+}
+
+/// Full dependency-solving entry point used by the default dedicated-server
+/// wrapper and by tests/UI code that needs an explicit side/capability table.
+pub fn plan_dual_loader_mods_dir_with_side_and_virtual_providers<'a, I>(
+    jars: I,
+    solve_side: ModSolveSide,
+    virtual_providers: &VirtualProviderTable,
+) -> DualLoaderPlan
 where
     I: IntoIterator<Item = (&'a str, &'a [u8])>,
 {
@@ -2730,7 +3669,9 @@ where
             modpack::infer_candidate_mod_id(name).unwrap_or_else(|| name.to_string())
         };
         let planned = planned_from(name, &desc, declared_ids, effective_id);
-        if desc.environment == ModEnvironment::Client {
+        let wrong_side = (desc.environment == ModEnvironment::Client && solve_side == ModSolveSide::Server)
+            || (desc.environment == ModEnvironment::Server && solve_side == ModSolveSide::Client);
+        if wrong_side {
             plan.skipped_client_only.push(planned);
         } else if planned
             .declared_mod_ids
@@ -2743,79 +3684,257 @@ where
         }
     }
 
-    // Duplicate detection: every declared id of a surviving candidate is
-    // claimed; a later claimant loses its whole JAR to the conflict (fail
-    // closed — aliases cannot silently merge two different mods).
-    let mut claimed: BTreeMap<String, usize> = BTreeMap::new();
+    // Duplicate resolution is two-pass by design: effective primary ids are
+    // solved before secondary aliases are claimed. Thus a JAR rejected for a
+    // duplicate primary id can never poison a valid sibling merely because it
+    // also declares a secondary alias first in scan order.
     let mut keep = vec![true; candidates.len()];
+    let mut conflict_pairs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut primary_claimed: BTreeMap<String, usize> = BTreeMap::new();
     for (i, cand) in candidates.iter().enumerate() {
-        for id in &cand.declared_mod_ids {
-            match claimed.get(id) {
+        match primary_claimed.get(&cand.mod_id) {
+            Some(&first) => {
+                keep[i] = false;
+                conflict_pairs
+                    .entry(cand.mod_id.clone())
+                    .or_insert_with(|| vec![candidates[first].jar_name.clone()])
+                    .push(cand.jar_name.clone());
+            }
+            None => {
+                primary_claimed.insert(cand.mod_id.clone(), i);
+            }
+        }
+    }
+    let mut secondary_claimed: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, cand) in candidates.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+        if let Some(primary_index) = primary_claimed.get(&cand.mod_id) {
+            if *primary_index == i {
+                secondary_claimed.insert(cand.mod_id.clone(), i);
+            }
+        }
+        for id in cand
+            .declared_mod_ids
+            .iter()
+            .filter(|id| **id != cand.mod_id)
+        {
+            match secondary_claimed.get(id) {
                 Some(&first) => {
                     keep[i] = false;
-                    let first_jar = candidates[first].jar_name.clone();
-                    match plan
-                        .duplicate_conflicts
-                        .iter_mut()
-                        .find(|c| c.mod_id == *id)
-                    {
-                        Some(c) => {
-                            if !c.jar_names.contains(&cand.jar_name) {
-                                c.jar_names.push(cand.jar_name.clone());
-                            }
-                        }
-                        None => plan.duplicate_conflicts.push(DuplicateModId {
-                            mod_id: id.clone(),
-                            jar_names: vec![first_jar, cand.jar_name.clone()],
-                        }),
-                    }
+                    conflict_pairs
+                        .entry(id.clone())
+                        .or_insert_with(|| vec![candidates[first].jar_name.clone()])
+                        .push(cand.jar_name.clone());
                 }
                 None => {
-                    claimed.insert(id.clone(), i);
+                    secondary_claimed.insert(id.clone(), i);
                 }
             }
         }
     }
+    plan.duplicate_conflicts = conflict_pairs
+        .into_iter()
+        .map(|(mod_id, mut jar_names)| {
+            jar_names.sort();
+            jar_names.dedup();
+            DuplicateModId { mod_id, jar_names }
+        })
+        .collect();
     plan.unified_mods = candidates
         .into_iter()
         .zip(keep)
         .filter_map(|(m, k)| k.then_some(m))
         .collect();
-    plan.unified_mods.sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
-    plan.duplicate_conflicts
-        .sort_by(|a, b| a.mod_id.cmp(&b.mod_id));
 
-    // Dependency satisfaction counts every id a live JAR provides,
-    // including mod ids declared only inside its embedded
-    // Jar-in-Jar/`META-INF/jars/` members — bundling a dependency inside
-    // the outer JAR (Create's Flywheel/Ponder/Registrate) satisfies it
-    // exactly like a sibling `mods/` entry.
-    let provided: BTreeSet<&str> = plan
-        .unified_mods
-        .iter()
-        .flat_map(|m| {
-            m.declared_mod_ids
-                .iter()
-                .chain(m.embedded_mod_ids.iter())
-                .map(String::as_str)
-        })
-        .collect();
+    // Exact provider table: every primary/alias id carries its own version;
+    // nested Jar-in-Jar candidates remain independent versioned providers.
+    let mut providers: BTreeMap<String, Vec<ProviderCandidate>> = BTreeMap::new();
     for m in &plan.unified_mods {
-        for dep in &m.dependencies {
-            if !dep.required || is_runtime_provided_mod(&dep.mod_id) {
-                continue;
-            }
-            if !provided.contains(dep.mod_id.as_str()) {
-                plan.missing_dependencies.push(MissingDependency {
-                    mod_id: m.mod_id.clone(),
-                    required_mod_id: dep.mod_id.clone(),
-                    version_range: dep.version_range.clone(),
+        for id in &m.declared_mod_ids {
+            providers.entry(id.clone()).or_default().push(ProviderCandidate {
+                id: id.clone(),
+                version: m.version.clone(),
+                owner_mod_id: m.mod_id.clone(),
+                nested: false,
+            });
+        }
+        for nested in &m.nested_candidates {
+            for id in nested
+                .declared_mod_ids
+                .iter()
+                .chain(std::slice::from_ref(&nested.mod_id))
+            {
+                providers.entry(id.clone()).or_default().push(ProviderCandidate {
+                    id: id.clone(),
+                    version: nested.version.clone(),
+                    owner_mod_id: m.mod_id.clone(),
+                    nested: true,
                 });
             }
         }
     }
-    plan.missing_dependencies
-        .sort_by(|a, b| (&a.mod_id, &a.required_mod_id).cmp(&(&b.mod_id, &b.required_mod_id)));
+    for values in providers.values_mut() {
+        values.sort_by(|a, b| {
+            (&a.id, &a.version, &a.owner_mod_id, a.nested).cmp(&(&b.id, &b.version, &b.owner_mod_id, b.nested))
+        });
+        values.dedup_by(|a, b| {
+            a.id == b.id && a.version == b.version && a.owner_mod_id == b.owner_mod_id && a.nested == b.nested
+        });
+    }
+
+    let mut skipped_dependency_sides = BTreeSet::new();
+    let mut alternative_groups: BTreeMap<(String, String), Vec<&ModDependency>> = BTreeMap::new();
+    for m in &plan.unified_mods {
+        for dep in &m.dependencies {
+            if !edge_side_active(dep.side, solve_side) {
+                skipped_dependency_sides.insert(format!("{}:{}", m.mod_id, dep.mod_id));
+                continue;
+            }
+            if matches!(dep.kind, ModDependencyKind::Incompatible | ModDependencyKind::Discouraged) {
+                let present = choose_provider(dep, &providers).ok().flatten().is_some()
+                    || virtual_providers.get(&dep.mod_id).is_some();
+                let range_matches = dep.version_range.is_none()
+                    || choose_provider(dep, &providers).ok().flatten().is_some()
+                    || choose_virtual_provider(dep, virtual_providers).ok().flatten().is_some();
+                if present && range_matches {
+                    plan.dependency_conflicts.push(DependencyConflict {
+                        mod_id: m.mod_id.clone(),
+                        other_mod_id: dep.mod_id.clone(),
+                        kind: dep.kind,
+                        version_range: dep.version_range.clone(),
+                    });
+                }
+                continue;
+            }
+            if !dep.solver_required() {
+                continue;
+            }
+            if let Some(group) = &dep.alternative_group {
+                alternative_groups
+                    .entry((m.mod_id.clone(), group.clone()))
+                    .or_default()
+                    .push(dep);
+                continue;
+            }
+            let virtual_result = choose_virtual_provider(dep, virtual_providers);
+            if let Ok(Some(_)) = virtual_result {
+                continue;
+            }
+            match choose_provider(dep, &providers) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(Some(vp)) = virtual_result {
+                        plan.version_mismatches.push(DependencyVersionMismatch {
+                            mod_id: m.mod_id.clone(),
+                            required_mod_id: dep.mod_id.clone(),
+                            version_range: dep.version_range.clone().unwrap_or_default(),
+                            provider_id: vp.mod_id.clone(),
+                            provider_version: vp.version.clone(),
+                        });
+                    } else {
+                        plan.missing_dependencies.push(MissingDependency {
+                            mod_id: m.mod_id.clone(),
+                            required_mod_id: dep.mod_id.clone(),
+                            version_range: dep.version_range.clone(),
+                        });
+                    }
+                }
+                Err(provider) => {
+                    if let Some(provider) = provider {
+                        plan.version_mismatches.push(DependencyVersionMismatch {
+                            mod_id: m.mod_id.clone(),
+                            required_mod_id: dep.mod_id.clone(),
+                            version_range: dep.version_range.clone().unwrap_or_default(),
+                            provider_id: provider.id.clone(),
+                            provider_version: provider.version.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Quilt/Fabric alternative groups are satisfied when at least one member
+    // is present and range-compatible. Only a wholly unsatisfied group becomes
+    // one deterministic missing diagnostic (the lexicographically first member).
+    for ((owner, _group), deps) in alternative_groups {
+        if deps.iter().any(|dep| {
+            choose_virtual_provider(dep, virtual_providers)
+                .ok()
+                .flatten()
+                .is_some()
+                || choose_provider(dep, &providers).ok().flatten().is_some()
+        }) {
+            continue;
+        }
+        if let Some(dep) = deps.iter().min_by(|a, b| a.mod_id.cmp(&b.mod_id)) {
+            plan.missing_dependencies.push(MissingDependency {
+                mod_id: owner,
+                required_mod_id: dep.mod_id.clone(),
+                version_range: dep.version_range.clone(),
+            });
+        }
+    }
+
+    plan.missing_dependencies.sort_by(|a, b| {
+        (&a.mod_id, &a.required_mod_id, &a.version_range).cmp(&(&b.mod_id, &b.required_mod_id, &b.version_range))
+    });
+    plan.missing_dependencies.dedup();
+    plan.version_mismatches.sort_by(|a, b| {
+        (&a.mod_id, &a.required_mod_id, &a.provider_id).cmp(&(&b.mod_id, &b.required_mod_id, &b.provider_id))
+    });
+    plan.version_mismatches.dedup();
+    plan.dependency_conflicts.sort_by(|a, b| {
+        (&a.mod_id, &a.other_mod_id, a.kind).cmp(&(&b.mod_id, &b.other_mod_id, b.kind))
+    });
+    plan.dependency_conflicts.dedup();
+
+    // Real dependency+ordering SCCs. Downstream dependents blocked by a cycle
+    // are not falsely labelled cyclic: Tarjan reports only the SCC itself.
+    let graph = build_dependency_graph(&plan, solve_side);
+    plan.dependency_cycles = tarjan_cycles(&graph);
+
+    // Deterministic dependency-first load order: ties always choose the
+    // lexicographically smallest ready mod; cyclic members are appended sorted
+    // but explicitly reported above rather than silently ordered.
+    let ids: Vec<String> = plan.unified_mods.iter().map(|m| m.mod_id.clone()).collect();
+    let load_order = deterministic_load_order(&ids, &graph);
+    plan.unified_mods.sort_by_key(|m| {
+        load_order
+            .iter()
+            .position(|id| id == &m.mod_id)
+            .unwrap_or(usize::MAX)
+    });
+
+    let admitted: Vec<String> = plan.unified_mods.iter().map(|m| m.mod_id.clone()).collect();
+    let client_only_skipped: Vec<String> = plan
+        .skipped_client_only
+        .iter()
+        .map(|m| m.mod_id.clone())
+        .chain(skipped_dependency_sides)
+        .collect();
+    let modrinth_candidates = plan
+        .missing_dependencies
+        .iter()
+        .map(|missing| ModrinthDependencyCandidate {
+            required_mod_id: missing.required_mod_id.clone(),
+            required_by: missing.mod_id.clone(),
+            version_range: missing.version_range.clone(),
+            query_slug: missing.required_mod_id.clone(),
+        })
+        .collect();
+    plan.resolution = ModDependencyResolutionReport {
+        admitted,
+        isolated_unsatisfied: plan.missing_dependencies.clone(),
+        missing_required: plan.missing_dependencies.clone(),
+        version_mismatches: plan.version_mismatches.clone(),
+        conflicts: plan.dependency_conflicts.clone(),
+        cycles: plan.dependency_cycles.clone(),
+        client_only_skipped,
+        modrinth_candidates,
+    };
 
     plan
 }

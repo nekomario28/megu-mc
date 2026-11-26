@@ -527,6 +527,7 @@ def pick_artifact(versions, mc_version, loaders, loopback_ok):
             continue
         candidate = best[1]
         deps = version.get("dependencies")
+        required_edges = []
         required_ids = []
         if isinstance(deps, list):
             for dep in deps:
@@ -535,8 +536,17 @@ def pick_artifact(versions, mc_version, loaders, loopback_ok):
                 if dep.get("dependency_type") != "required":
                     continue
                 project_id = dep.get("project_id")
-                if isinstance(project_id, str) and MOD_ID_RE.match(project_id):
-                    required_ids.append(project_id)
+                if not (isinstance(project_id, str) and MOD_ID_RE.match(project_id)):
+                    continue
+                edge = {"project_id": project_id}
+                dep_version_id = dep.get("version_id")
+                if isinstance(dep_version_id, str) and dep_version_id:
+                    edge["version_id"] = dep_version_id
+                dep_range = dep.get("version_range") or dep.get("versionRange")
+                if isinstance(dep_range, str) and dep_range:
+                    edge["version_range"] = dep_range
+                required_edges.append(edge)
+                required_ids.append(project_id)
         scored.append({
             "project_id": version.get("project_id") or "",
             "version_id": version_id,
@@ -544,6 +554,7 @@ def pick_artifact(versions, mc_version, loaders, loopback_ok):
             "version_type": version.get("version_type") or "",
             "date_published": version.get("date_published") or "",
             "required_project_ids": required_ids,
+            "required_dependencies": required_edges,
             **candidate,
         })
     if not scored:
@@ -624,20 +635,172 @@ def existing_matches(mods_dir, artifact):
 
 
 # ---------------------------------------------------------------------------
+# Exact dependency version selection + declared range enforcement
+# ---------------------------------------------------------------------------
+
+def _split_version_identifiers(text):
+    ident = text.lower()
+    if ident.isdigit():
+        return [(0, int(ident))]
+    split = re.match(r"^([a-z-]*?)(\d+)$", ident)
+    if split:
+        return [(1, split.group(1)), (0, int(split.group(2)))]
+    return [(1, ident)]
+
+
+def _version_key(text):
+    """Best-effort Maven/SemVer precedence key for mod version numbers."""
+    main = str(text).strip().lstrip("vV").split("+", 1)[0]
+    core, sep, pre = main.partition("-")
+    nums = []
+    for part in core.split(".")[:3]:
+        nums.append(int(part) if part.isdigit() else 0)
+    while len(nums) < 3:
+        nums.append(0)
+    pre_key = []
+    if sep and pre:
+        pre_key = [_split_version_identifiers(p) for p in pre.split(".")]
+    # Release sorts after every prerelease of the same numeric core.
+    return (nums, 1 if not pre_key else 0, pre_key)
+
+
+def version_satisfies_declared_range(version, declared):
+    """Evaluate the common Maven/SemVer dependency predicates fail-closed.
+
+    Supports exact pins, `[lo,hi]`/`(lo,hi)` intervals, wildcard bands,
+    and space-separated `>=`/`>`/`<=`/`<` comparator sets. Unknown syntax is
+    treated as unsatisfied rather than ignored.
+    """
+    if not declared:
+        return True
+    try:
+        key = _version_key(version)
+    except Exception:
+        return False
+
+    def cmp_key(other):
+        a, b = key, _version_key(other)
+        return (a > b) - (a < b)
+
+    def one_maven(member):
+        member = member.strip()
+        if not member or member[0] not in "[(":
+            return cmp_key(member) == 0
+        close = "]" if member.endswith("]") else ")" if member.endswith(")") else ""
+        if not close:
+            return False
+        inner = member[1:-1]
+        if "," not in inner:
+            return cmp_key(inner) == 0
+        lo, hi = (x.strip() for x in inner.split(",", 1))
+        if lo:
+            c = cmp_key(lo)
+            if c < 0 or (c == 0 and member[0] == "("):
+                return False
+        if hi:
+            c = cmp_key(hi)
+            if c > 0 or (c == 0 and close == ")"):
+                return False
+        return True
+
+    text = declared.strip()
+    if text.startswith("[") or text.startswith("("):
+        return any(one_maven(m) for m in re.findall(r"[\[(][^\])]*[\])]", text))
+
+    def comparator(token):
+        m = re.match(r"^(>=|<=|>|<|=|~|\^)?(.+)$", token)
+        if not m:
+            return False
+        op, body = m.groups()
+        op = op or "="
+        if body in ("*", "x", "X"):
+            return True
+        parts = body.split("+", 1)[0].split("-", 1)[0].split(".")
+        if any(p in ("x", "X", "*") for p in parts):
+            prefix = []
+            for p in parts:
+                if p in ("x", "X", "*"):
+                    break
+                if not p.isdigit():
+                    return False
+                prefix.append(int(p))
+            nums = key[0][:len(prefix)]
+            if op == "=":
+                return nums == prefix
+            return nums >= prefix if op in (">=", ">") else nums <= prefix
+        c = cmp_key(body)
+        if op == "=":
+            return c == 0
+        if op == ">=":
+            return c >= 0
+        if op == "<=":
+            return c <= 0
+        if op == ">":
+            return c > 0
+        if op == "<":
+            return c < 0
+        nums = body.split(".")
+        if not all(p.isdigit() for p in nums):
+            return False
+        width = 1 if op == "^" else 2
+        upper = [int(p) for p in nums[:3]]
+        while len(upper) < 3:
+            upper.append(0)
+        idx = 0 if op == "^" else min(width - 1, len(nums) - 1)
+        upper[idx] += 1
+        for j in range(idx + 1, 3):
+            upper[j] = 0
+        return c >= 0 and key < _version_key(".".join(str(n) for n in upper))
+
+    for arm in text.split("||"):
+        raw_tokens = [t for t in arm.strip().split() if t]
+        tokens = []
+        i = 0
+        while i < len(raw_tokens):
+            if raw_tokens[i] in (">=", "<=", ">", "<", "=", "~", "^") and i + 1 < len(raw_tokens):
+                tokens.append(raw_tokens[i] + raw_tokens[i + 1])
+                i += 2
+            else:
+                tokens.append(raw_tokens[i])
+                i += 1
+        if tokens and all(comparator(t) for t in tokens):
+            return True
+    return False
+
+
+def pick_exact_artifact(versions, exact_version_id, mc_version, loaders, loopback_ok):
+    """Select one exact Modrinth version id through the same trust gates."""
+    return pick_artifact(
+        [v for v in versions if isinstance(v, dict) and v.get("id") == exact_version_id],
+        mc_version, loaders, loopback_ok)
+
+
+# ---------------------------------------------------------------------------
 # Recursive required-dependency resolution
 # ---------------------------------------------------------------------------
 
 def resolve_with_deps(client, slug_or_id, mc_version, loaders, notes):
-    """Resolve a project and its transitive required deps, depth-capped and
-    cycle-safe. Returns artifacts in install order (deps before users)."""
+    """Resolve a project and transitive required deps in dependency-first order.
+
+    Exact Modrinth dependency `version_id` pins are preserved and enforced;
+    cycles are returned in the artifact plan metadata instead of being silently
+    swallowed by the visited set.
+    """
     plan = []
     visited = set()
+    visiting = []
+    cycles = []
     planned_files = set()
 
-    def resolve(key, depth):
+    def resolve(key, depth, pinned_version=None, declared_range=None):
+        if key in visiting:
+            cycle = visiting[visiting.index(key):] + [key]
+            if cycle not in cycles:
+                cycles.append(cycle)
+                notes.append("dependency cycle: " + " -> ".join(cycle))
+            return
         if key in visited:
             return
-        visited.add(key)
         if depth > MAX_DEP_DEPTH:
             notes.append(
                 f"dependency depth cap ({MAX_DEP_DEPTH}) reached — "
@@ -645,16 +808,32 @@ def resolve_with_deps(client, slug_or_id, mc_version, loaders, notes):
                 "install them manually")
             return
         versions = get_versions(client, key)
-        artifact = pick_artifact(versions, mc_version, loaders, client.loopback)
+        artifact = (pick_exact_artifact(versions, pinned_version, mc_version,
+                                        loaders, client.loopback)
+                    if pinned_version else
+                    pick_artifact(versions, mc_version, loaders, client.loopback))
+        if artifact is not None and declared_range and not version_satisfies_declared_range(
+                artifact["version_number"], declared_range):
+            artifact = None
         if artifact is None:
+            detail = f" pinned version '{pinned_version}'" if pinned_version else ""
+            detail += f" satisfying '{declared_range}'" if declared_range else ""
             raise MeguModsError(
-                f"no verified compatible release found for '{key}' "
-                f"(mc {mc_version or 'any'}, loader "
-                f"{'/'.join(loaders)})")
+                f"no verified compatible release found for '{key}'{detail} "
+                f"(mc {mc_version or 'any'}, loader {'/'.join(loaders)})")
         artifact = dict(artifact)
         artifact["slug"] = key
-        for dep_id in artifact["required_project_ids"]:
-            resolve(dep_id, depth + 1)
+        if pinned_version:
+            artifact["pinned_by_version_id"] = pinned_version
+        if declared_range:
+            artifact["declared_range"] = declared_range
+        visiting.append(key)
+        for edge in artifact.get("required_dependencies") or [
+                {"project_id": p} for p in artifact["required_project_ids"]]:
+            resolve(edge["project_id"], depth + 1,
+                    edge.get("version_id"), edge.get("version_range"))
+        visiting.pop()
+        visited.add(key)
         if artifact["file_name"] in planned_files:
             notes.append(
                 f"'{key}' resolves to already-planned file "
@@ -664,6 +843,9 @@ def resolve_with_deps(client, slug_or_id, mc_version, loaders, notes):
         plan.append(artifact)
 
     resolve(slug_or_id, 0)
+    if cycles:
+        for artifact in plan:
+            artifact.setdefault("dependency_cycles", cycles)
     return plan
 
 
@@ -1169,10 +1351,18 @@ def cmd_resolve_deps(args):
     visited = set()
     planned_files = set()
 
-    def resolve(key, depth):
+    visiting = []
+    cycles = []
+
+    def resolve(key, depth, pinned_version=None, declared_range=None):
+        if key in visiting:
+            cycle = visiting[visiting.index(key):] + [key]
+            if cycle not in cycles:
+                cycles.append(cycle)
+                notes.append("dependency cycle: " + " -> ".join(cycle))
+            return
         if key in visited:
             return
-        visited.add(key)
         if depth > MAX_DEP_DEPTH:
             notes.append(
                 f"dependency depth cap ({MAX_DEP_DEPTH}) reached at '{key}'")
@@ -1182,26 +1372,41 @@ def cmd_resolve_deps(args):
         except MeguModsError:
             manual.append(key)
             return
-        artifact = pick_artifact(
-            versions, args.mc_version, loaders, client.loopback)
+        artifact = (pick_exact_artifact(versions, pinned_version, args.mc_version,
+                                        loaders, client.loopback)
+                    if pinned_version else
+                    pick_artifact(
+                        versions, args.mc_version, loaders, client.loopback))
+        if artifact is not None and declared_range and not version_satisfies_declared_range(
+                artifact["version_number"], declared_range):
+            artifact = None
         if artifact is None:
             manual.append(key)
             return
         artifact = dict(artifact)
         artifact["slug"] = key
-        for dep_id in artifact["required_project_ids"]:
-            resolve(dep_id, depth + 1)
+        if pinned_version:
+            artifact["pinned_by_version_id"] = pinned_version
+        if declared_range:
+            artifact["declared_range"] = declared_range
+        visiting.append(key)
+        for edge in artifact.get("required_dependencies") or [
+                {"project_id": p} for p in artifact["required_project_ids"]]:
+            resolve(edge["project_id"], depth + 1,
+                    edge.get("version_id"), edge.get("version_range"))
+        visiting.pop()
+        visited.add(key)
         if artifact["file_name"] in planned_files:
             return
         planned_files.add(artifact["file_name"])
         plan.append(artifact)
 
-    for _mod_id, dep_id, _rng in missing:
+    for _mod_id, dep_id, rng in missing:
         dep_key = dep_id.lower()
         if not SLUG_RE.match(dep_key):
             manual.append(dep_id)
             continue
-        resolve(dep_key, 1)
+        resolve(dep_key, 1, None, rng)
 
     if args.json and (not plan or args.dry_run):
         print_json({
@@ -1214,6 +1419,7 @@ def cmd_resolve_deps(args):
             "plan": plan,
             "manual": manual,
             "notes": notes,
+            "cycles": cycles,
             "rejected": [{"jar": n, "reason": r} for n, r in rejected],
         })
     elif not args.json:
@@ -1249,6 +1455,7 @@ def cmd_resolve_deps(args):
             "mods_dir": str(mods_dir),
             "installed": installed,
             "manual": manual,
+            "cycles": cycles,
             "adapt_check": report,
             "adapt_check_binary": binary,
             "adapt_check_warning": warning,

@@ -197,31 +197,48 @@ fn collect_quilt_dependency(
     out: &mut Vec<ModDependency>,
 ) -> Result<(), LoaderExtensionError> {
     if let Some(id) = value.as_str() {
-        out.push(ModDependency {
-            mod_id: id.to_string(),
-            version_range: None,
-            required,
-        });
+        out.push(
+            ModDependency::new(id.to_string(), None, required)
+                .with_loader(crate::ecosystem_compat::ManifestLoaderKind::Quilt),
+        );
         return Ok(());
     }
     let obj = value
         .as_object()
         .ok_or_else(|| err(format!("{ctx}: depends entry must be a string or object")))?;
-    for (key, sub_required) in [
-        ("any", false),
-        ("unless", false),
-        ("only_if", false),
-        ("all", true),
-    ] {
+
+    // Quilt conditional/alternative containers are semantic dependency
+    // structure, not merely optional decoration. `any` members form one
+    // alternative group; `all` keeps every member at the parent strength;
+    // `only_if`/`unless` preserve their condition text and are therefore not
+    // treated as unconditional fatal requirements by the solver.
+    for key in ["any", "all", "only_if", "unless"] {
         if let Some(inner) = obj.get(key) {
+            let start_len = out.len();
             let items: &[JsonValue] = inner.as_array().map_or(std::slice::from_ref(inner), |a| a);
             for item in items {
-                collect_quilt_dependency(item, required && sub_required, ctx, out)?;
+                collect_quilt_dependency(item, required, ctx, out)?;
+            }
+            let group = if key == "any" {
+                Some(format!("{ctx}:{key}:{}", out.len()))
+            } else {
+                None
+            };
+            for dep in &mut out[start_len..] {
+                if key == "any" {
+                    dep.alternative_group = group.clone();
+                } else if matches!(key, "only_if" | "unless") {
+                    dep.condition = Some(format!("{key}:{}", quilt_json_compact(inner)));
+                }
+            }
+            // A pure container entry has no direct id.
+            if !obj.contains_key("id") {
+                return Ok(());
             }
         }
     }
+
     let Some(id) = obj.get("id").and_then(JsonValue::as_str) else {
-        // A pure container entry (only any/all/only_if/unless) is fine.
         if obj.keys().all(|k| {
             matches!(
                 k.as_str(),
@@ -237,12 +254,35 @@ fn collect_quilt_dependency(
         .get("versions")
         .or_else(|| obj.get("version"))
         .and_then(quilt_versions_to_string);
-    out.push(ModDependency {
-        mod_id: id.to_string(),
-        version_range,
-        required: required && !optional,
-    });
+    out.push(
+        ModDependency::new(id.to_string(), version_range, required && !optional)
+            .with_loader(crate::ecosystem_compat::ManifestLoaderKind::Quilt),
+    );
     Ok(())
+}
+
+fn quilt_json_compact(value: &JsonValue) -> String {
+    match value {
+        JsonValue::Null => "null".to_string(),
+        JsonValue::Bool(v) => v.to_string(),
+        JsonValue::Number(v) => v.to_string(),
+        JsonValue::String(v) => format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")),
+        JsonValue::Array(items) => format!(
+            "[{}]",
+            items.iter().map(quilt_json_compact).collect::<Vec<_>>().join(",")
+        ),
+        JsonValue::Object(map) => format!(
+            "{{{}}}",
+            map.iter()
+                .map(|(k, v)| format!(
+                    "\"{}\":{}",
+                    k.replace('\\', "\\\\").replace('"', "\\\""),
+                    quilt_json_compact(v)
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
 }
 
 /// Parse `quilt.mod.json` bytes. Fail-closed: a malformed root, missing
@@ -335,11 +375,8 @@ pub fn parse_quilt_mod_json(bytes: &[u8]) -> Result<QuiltMeta, LoaderExtensionEr
                     .and_then(|o| o.get("optional"))
                     .and_then(JsonValue::as_bool)
                     == Some(true);
-                dependencies.push(ModDependency {
-                    mod_id: dep_id.clone(),
-                    version_range,
-                    required: !optional,
-                });
+                dependencies.push(ModDependency::new(dep_id.clone(), version_range, !optional)
+                    .with_loader(crate::ecosystem_compat::ManifestLoaderKind::Quilt));
             }
         }
         Some(_) => {
@@ -347,6 +384,9 @@ pub fn parse_quilt_mod_json(bytes: &[u8]) -> Result<QuiltMeta, LoaderExtensionEr
                 "{ctx}: 'depends' must be an array or object"
             )))
         }
+    }
+    for dep in &mut dependencies {
+        dep.owner_mod_id = mod_id.clone();
     }
     for dep in &dependencies {
         if dep.mod_id == "minecraft" {

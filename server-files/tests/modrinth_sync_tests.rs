@@ -490,14 +490,8 @@ fn manifest_round_trips_json() {
     e.sha512 = Some(SHA512.to_owned());
     e.required = false;
     e.dependencies = vec![
-        ModDependencyEdge {
-            project_id: "B".to_owned(),
-            kind: DependencyKind::Required,
-        },
-        ModDependencyEdge {
-            project_id: "C".to_owned(),
-            kind: DependencyKind::Incompatible,
-        },
+        ModDependencyEdge::new("B", DependencyKind::Required),
+        ModDependencyEdge::new("C", DependencyKind::Incompatible),
     ];
     let m = manifest(vec![e]);
     let reparsed = ServerModSyncManifest::parse_manifest(&m.to_manifest_string()).unwrap();
@@ -623,10 +617,7 @@ fn node(project: &str, deps: &[(&str, DependencyKind)]) -> ModNode {
         version_id: "v".to_owned(),
         dependencies: deps
             .iter()
-            .map(|(p, k)| ModDependencyEdge {
-                project_id: (*p).to_owned(),
-                kind: *k,
-            })
+            .map(|(p, k)| ModDependencyEdge::new(*p, *k))
             .collect(),
     }
 }
@@ -661,6 +652,8 @@ fn resolver_reports_missing_required_ignores_missing_optional() {
         vec![MissingDependency {
             project_id: "app".to_owned(),
             missing_project_id: "gone".to_owned(),
+            version_id: None,
+            version_range: None,
         }]
     );
     // Orderable nodes still resolve; missing deps do not block them.
@@ -709,6 +702,71 @@ fn resolver_reports_cycles_without_hanging() {
 #[test]
 fn resolver_empty_set_is_a_clean_resolution() {
     assert_eq!(resolve_dependencies(&[]), ResolvedModSet::default());
+}
+
+#[test]
+fn resolver_repeated_edges_do_not_create_false_cycles() {
+    let mut app = node("app", &[("lib", DependencyKind::Required)]);
+    app.dependencies.push(ModDependencyEdge::new("lib", DependencyKind::Required));
+    let set = resolve_dependencies(&[app, node("lib", &[])]);
+    assert_eq!(set.install_order, vec!["lib", "app"]);
+    assert!(set.cyclic.is_empty());
+    assert!(set.cycle_components.is_empty());
+}
+
+#[test]
+fn resolver_reports_only_real_cycle_members_not_blocked_downstream() {
+    let set = resolve_dependencies(&[
+        node("a", &[("b", DependencyKind::Required)]),
+        node("b", &[("a", DependencyKind::Required)]),
+        node("downstream", &[("a", DependencyKind::Required)]),
+    ]);
+    assert_eq!(set.cycle_components, vec![vec!["a".to_owned(), "b".to_owned()]]);
+    assert_eq!(set.cyclic, vec!["a", "b"]);
+    assert!(!set.cyclic.iter().any(|id| id == "downstream"));
+}
+
+#[test]
+fn resolver_preserves_and_enforces_exact_dependency_version_ids() {
+    let mut app = node("app", &[]);
+    app.dependencies.push(
+        ModDependencyEdge::new("lib", DependencyKind::Required)
+            .with_version_id("lib-v2")
+            .with_version_range("[2.0,3.0)"),
+    );
+    let mut lib = node("lib", &[]);
+    lib.version_id = "lib-v1".to_owned();
+    let set = resolve_dependencies(&[app, lib]);
+    assert_eq!(set.version_mismatches.len(), 1);
+    assert_eq!(set.version_mismatches[0].required_version_id, "lib-v2");
+    assert_eq!(set.version_mismatches[0].actual_version_id, "lib-v1");
+    assert_eq!(
+        set.version_mismatches[0].version_range.as_deref(),
+        Some("[2.0,3.0)")
+    );
+
+    let mut app = node("app", &[]);
+    app.dependencies.push(
+        ModDependencyEdge::new("lib", DependencyKind::Required).with_version_id("lib-v2"),
+    );
+    let mut lib = node("lib", &[]);
+    lib.version_id = "lib-v2".to_owned();
+    let set = resolve_dependencies(&[app, lib]);
+    assert!(set.version_mismatches.is_empty());
+}
+
+#[test]
+fn manifest_round_trips_dependency_version_pins() {
+    let mut e = entry("A", "v1", "a.jar", SHA, CDN);
+    e.dependencies = vec![
+        ModDependencyEdge::new("B", DependencyKind::Required)
+            .with_version_id("B-version-2")
+            .with_version_range("[2.0,3.0)"),
+    ];
+    let m = manifest(vec![e]);
+    let reparsed = ServerModSyncManifest::parse_manifest(&m.to_manifest_string()).unwrap();
+    assert_eq!(reparsed.entries[0].dependencies[0].version_id.as_deref(), Some("B-version-2"));
+    assert_eq!(reparsed.entries[0].dependencies[0].version_range.as_deref(), Some("[2.0,3.0)"));
 }
 
 // -------------------------------------------------------------- sha256 gate

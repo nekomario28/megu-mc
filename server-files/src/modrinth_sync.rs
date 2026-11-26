@@ -801,6 +801,33 @@ impl DependencyKind {
 pub struct ModDependencyEdge {
     pub project_id: String,
     pub kind: DependencyKind,
+    /// Exact Modrinth dependency version id when the API/pack declares one.
+    /// This is never collapsed away: it is serialized, enforced against a
+    /// directly installed provider, and carried into mismatch diagnostics.
+    pub version_id: Option<String>,
+    /// Declaring-edge version predicate when a modpack supplies one.
+    pub version_range: Option<String>,
+}
+
+impl ModDependencyEdge {
+    pub fn new(project_id: impl Into<String>, kind: DependencyKind) -> Self {
+        Self {
+            project_id: project_id.into(),
+            kind,
+            version_id: None,
+            version_range: None,
+        }
+    }
+
+    pub fn with_version_id(mut self, version_id: impl Into<String>) -> Self {
+        self.version_id = Some(version_id.into());
+        self
+    }
+
+    pub fn with_version_range(mut self, range: impl Into<String>) -> Self {
+        self.version_range = Some(range.into());
+        self
+    }
 }
 
 /// One mod the server expects clients to run. Bytes are never carried —
@@ -898,10 +925,19 @@ impl ServerModSyncManifest {
                         e.dependencies
                             .iter()
                             .map(|d| {
-                                Json::Object(vec![
-                                    ("projectId".to_owned(), Json::String(d.project_id.clone())),
-                                    ("kind".to_owned(), Json::String(d.kind.as_str().to_owned())),
-                                ])
+                                {
+                                    let mut members = vec![
+                                        ("projectId".to_owned(), Json::String(d.project_id.clone())),
+                                        ("kind".to_owned(), Json::String(d.kind.as_str().to_owned())),
+                                    ];
+                                    if let Some(version_id) = &d.version_id {
+                                        members.push(("versionId".to_owned(), Json::String(version_id.clone())));
+                                    }
+                                    if let Some(range) = &d.version_range {
+                                        members.push(("versionRange".to_owned(), Json::String(range.clone())));
+                                    }
+                                    Json::Object(members)
+                                }
                             })
                             .collect(),
                     ),
@@ -945,9 +981,17 @@ fn parse_server_mod_entry(json: &Json) -> Result<ServerModEntry, ModrinthSyncErr
     };
     let mut dependencies = Vec::with_capacity(deps_json.len());
     for d in deps_json {
+        let optional_string = |key: &'static str| -> Result<Option<String>, ModrinthSyncError> {
+            match d.get(key) {
+                None | Some(Json::Null) => Ok(None),
+                Some(v) => Ok(Some(v.as_str().ok_or(ModrinthSyncError::WrongType(key))?.to_owned())),
+            }
+        };
         dependencies.push(ModDependencyEdge {
             project_id: required_str(d, "projectId")?.to_owned(),
             kind: DependencyKind::parse(required_str(d, "kind")?)?,
+            version_id: optional_string("versionId")?,
+            version_range: optional_string("versionRange")?,
         });
     }
     Ok(ServerModEntry {
@@ -1156,6 +1200,19 @@ pub struct ModNode {
 pub struct MissingDependency {
     pub project_id: String,
     pub missing_project_id: String,
+    pub version_id: Option<String>,
+    pub version_range: Option<String>,
+}
+
+/// A dependency whose provider is present but not the exact version the
+/// declaring edge pinned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyVersionMismatch {
+    pub project_id: String,
+    pub dependency_project_id: String,
+    pub required_version_id: String,
+    pub actual_version_id: String,
+    pub version_range: Option<String>,
 }
 
 /// An `incompatible` edge where both ends are present (reported once per
@@ -1175,6 +1232,10 @@ pub struct ResolvedModSet {
     pub install_order: Vec<String>,
     /// Required deps no installed or embedded project provides.
     pub missing_required: Vec<MissingDependency>,
+    /// Exact dependency version pins contradicted by the selected provider.
+    pub version_mismatches: Vec<DependencyVersionMismatch>,
+    /// SCCs of the dependency graph, one member list per real cycle.
+    pub cycle_components: Vec<Vec<String>>,
     /// Incompatible pairs both present in the set.
     pub conflicts: Vec<ModConflict>,
     /// Project ids listed more than once (duplicate installs).
@@ -1182,6 +1243,87 @@ pub struct ResolvedModSet {
     /// Nodes that could not be ordered because they sit on a dependency
     /// cycle. Sorted; empty in every acyclic resolution.
     pub cyclic: Vec<String>,
+}
+
+fn dependency_cycle_components(dependents: &BTreeMap<&str, BTreeSet<&str>>, node_ids: &BTreeSet<&str>) -> Vec<Vec<String>> {
+    #[allow(clippy::too_many_arguments)]
+    fn strongconnect(
+        node: &str,
+        graph: &BTreeMap<String, BTreeSet<String>>,
+        index: &mut usize,
+        indices: &mut BTreeMap<String, usize>,
+        lowlink: &mut BTreeMap<String, usize>,
+        stack: &mut Vec<String>,
+        on_stack: &mut BTreeSet<String>,
+        components: &mut Vec<Vec<String>>,
+    ) {
+        indices.insert(node.to_string(), *index);
+        lowlink.insert(node.to_string(), *index);
+        *index += 1;
+        stack.push(node.to_string());
+        on_stack.insert(node.to_string());
+        for next in graph.get(node).into_iter().flatten() {
+            if !indices.contains_key(next) {
+                strongconnect(next, graph, index, indices, lowlink, stack, on_stack, components);
+                let low = lowlink[next].min(lowlink[node]);
+                lowlink.insert(node.to_string(), low);
+            } else if on_stack.contains(next) {
+                let low = indices[next].min(lowlink[node]);
+                lowlink.insert(node.to_string(), low);
+            }
+        }
+        if lowlink[node] == indices[node] {
+            let mut component = Vec::new();
+            while let Some(member) = stack.pop() {
+                on_stack.remove(&member);
+                component.push(member.clone());
+                if member == node {
+                    break;
+                }
+            }
+            component.sort();
+            if component.len() > 1
+                || component
+                    .first()
+                    .is_some_and(|only| graph.get(only).is_some_and(|n| n.contains(only)))
+            {
+                components.push(component);
+            }
+        }
+    }
+
+    let mut graph: BTreeMap<String, BTreeSet<String>> = node_ids
+        .iter()
+        .map(|id| ((*id).to_string(), BTreeSet::new()))
+        .collect();
+    for (provider, targets) in dependents {
+        graph
+            .entry((*provider).to_string())
+            .or_default()
+            .extend(targets.iter().map(|target| (*target).to_string()));
+    }
+    let mut components = Vec::new();
+    let mut index = 0usize;
+    let mut indices = BTreeMap::new();
+    let mut lowlink = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut on_stack = BTreeSet::new();
+    for node in graph.keys().cloned().collect::<Vec<_>>() {
+        if !indices.contains_key(&node) {
+            strongconnect(
+                &node,
+                &graph,
+                &mut index,
+                &mut indices,
+                &mut lowlink,
+                &mut stack,
+                &mut on_stack,
+                &mut components,
+            );
+        }
+    }
+    components.sort();
+    components
 }
 
 /// Resolve a mod set: topological order, missing-required, incompatible
@@ -1220,8 +1362,13 @@ pub fn resolve_dependencies(mods: &[ModNode]) -> ResolvedModSet {
     let node_ids: BTreeSet<&str> = mods.iter().map(|m| m.project_id.as_str()).collect();
     let mut dependents: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut indegree: BTreeMap<&str, usize> = node_ids.iter().map(|id| (*id, 0usize)).collect();
-    let mut missing: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut missing: BTreeSet<(String, String, Option<String>, Option<String>)> = BTreeSet::new();
     let mut conflicts: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut version_mismatches: BTreeSet<(String, String, String, String, Option<String>)> = BTreeSet::new();
+    let versions: BTreeMap<&str, &str> = mods
+        .iter()
+        .map(|m| (m.project_id.as_str(), m.version_id.as_str()))
+        .collect();
 
     for m in mods {
         for d in &m.dependencies {
@@ -1229,18 +1376,43 @@ pub fn resolve_dependencies(mods: &[ModNode]) -> ResolvedModSet {
                 DependencyKind::Required | DependencyKind::Optional => {
                     match provider.get(d.project_id.as_str()).copied() {
                         Some(prov) if prov != m.project_id.as_str() && node_ids.contains(prov) => {
-                            dependents
+                            // Duplicate occurrences of the same provider ->
+                            // dependent edge are one graph edge. Counting each
+                            // occurrence used to leave indegree permanently
+                            // elevated and hallucinate a cycle.
+                            let inserted = dependents
                                 .entry(prov)
                                 .or_default()
                                 .insert(m.project_id.as_str());
-                            if let Some(n) = indegree.get_mut(m.project_id.as_str()) {
-                                *n += 1;
+                            if inserted {
+                                if let Some(n) = indegree.get_mut(m.project_id.as_str()) {
+                                    *n += 1;
+                                }
+                            }
+                            if let (Some(required_version), Some(actual_version)) = (
+                                d.version_id.as_deref(),
+                                versions.get(prov).copied(),
+                            ) {
+                                if prov == d.project_id.as_str() && required_version != actual_version {
+                                    version_mismatches.insert((
+                                        m.project_id.clone(),
+                                        d.project_id.clone(),
+                                        required_version.to_owned(),
+                                        actual_version.to_owned(),
+                                        d.version_range.clone(),
+                                    ));
+                                }
                             }
                         }
                         Some(_) => {}
                         None => {
                             if d.kind == DependencyKind::Required {
-                                missing.insert((m.project_id.clone(), d.project_id.clone()));
+                                missing.insert((
+                                    m.project_id.clone(),
+                                    d.project_id.clone(),
+                                    d.version_id.clone(),
+                                    d.version_range.clone(),
+                                ));
                             }
                         }
                     }
@@ -1259,10 +1431,26 @@ pub fn resolve_dependencies(mods: &[ModNode]) -> ResolvedModSet {
 
     result.missing_required = missing
         .into_iter()
-        .map(|(project_id, missing_project_id)| MissingDependency {
+        .map(|(project_id, missing_project_id, version_id, version_range)| MissingDependency {
             project_id,
             missing_project_id,
+            version_id,
+            version_range,
         })
+        .collect();
+    result.version_mismatches = version_mismatches
+        .into_iter()
+        .map(
+            |(project_id, dependency_project_id, required_version_id, actual_version_id, version_range)| {
+                DependencyVersionMismatch {
+                    project_id,
+                    dependency_project_id,
+                    required_version_id,
+                    actual_version_id,
+                    version_range,
+                }
+            },
+        )
         .collect();
     result.conflicts = conflicts
         .into_iter()
@@ -1292,11 +1480,14 @@ pub fn resolve_dependencies(mods: &[ModNode]) -> ResolvedModSet {
             }
         }
     }
-    let ordered: BTreeSet<&str> = result.install_order.iter().map(String::as_str).collect();
-    result.cyclic = node_ids
+    result.cycle_components = dependency_cycle_components(&dependents, &node_ids);
+    result.cyclic = result
+        .cycle_components
         .iter()
-        .filter(|id| !ordered.contains(**id))
-        .map(|id| (*id).to_owned())
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
     result
 }
