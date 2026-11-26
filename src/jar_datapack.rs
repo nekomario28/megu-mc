@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Bounded fallback reader for the vanilla 1.21.1 data resources in a game JAR.
 // Included from commands_core.rs so the fallback can feed the existing
 // datapack pipeline without adding a crate dependency or module-graph edge.
@@ -159,7 +160,8 @@ fn discover_vanilla_jar() -> Option<PathBuf> {
         .next()
 }
 
-fn vanilla_jar_data_read(rel_path: &str) -> Option<Vec<u8>> {
+#[allow(dead_code)]
+pub(crate) fn vanilla_jar_data_read(rel_path: &str) -> Option<Vec<u8>> {
     static FALLBACK: std::sync::OnceLock<Option<VanillaJarDataFallback>> =
         std::sync::OnceLock::new();
     FALLBACK
@@ -362,7 +364,7 @@ mod jar_datapack_tests {
             central.extend_from_slice(&(packed.len() as u32).to_le_bytes());
             central.extend_from_slice(&(body.len() as u32).to_le_bytes());
             central.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
-            central.extend_from_slice(&[0; 6]);
+            central.extend_from_slice(&[0; 8]);
             central.extend_from_slice(&0u32.to_le_bytes());
             central.extend_from_slice(&(offset as u32).to_le_bytes());
             central.extend_from_slice(name_bytes);
