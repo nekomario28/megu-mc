@@ -34,9 +34,7 @@ static ANVIL_SAVE_TRANSACTION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new
 static ANVIL_ATOMIC_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn anvil_save_transaction_lock() -> std::sync::MutexGuard<'static, ()> {
-    ANVIL_SAVE_TRANSACTION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    anvil_lock(&ANVIL_SAVE_TRANSACTION_LOCK)
 }
 
 /// Capture the on-disk Anvil world before importing or migrating it. The
@@ -266,6 +264,25 @@ fn anvil_f32(t: &AnvilNbt, key: &str) -> Option<f32> {
 fn anvil_str(t: &AnvilNbt, key: &str) -> Option<String> {
     t.get(key).and_then(anvil_str_of)
 }
+/// A numeric field coerced from any integer tag (Byte/Short/Int/Long), with
+/// `fallback` for a missing or non-numeric entry.
+fn anvil_num(t: &AnvilNbt, key: &str, fallback: i64) -> i64 {
+    t.get(key).and_then(nbt_int_val).unwrap_or(fallback)
+}
+/// Write one compound entry keyed by a `&str`; the `NbtString` wrapper is pure
+/// noise at every call site.
+fn anvil_put(
+    fields: &mut std::collections::BTreeMap<crate::nbt::NbtString, AnvilNbt>,
+    key: &str,
+    value: AnvilNbt,
+) {
+    fields.insert(crate::nbt::NbtString::text(key), value);
+}
+/// Poison-tolerant guard for the module's global stores: a panic while a store
+/// is held must never take the codec down.
+fn anvil_lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 fn anvil_s(v: &str) -> AnvilNbt {
     AnvilNbt::String(crate::nbt::NbtString::text(v))
 }
@@ -488,9 +505,7 @@ fn read_region_file(path: &std::path::Path) -> Result<AnvilRegion, String> {
 /// `path.tmp` -> `path`, fsynced before the rename — the same discipline
 /// `write_world_file` uses for the v2 save, minus its backup generations.
 fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
-    let _write = ANVIL_ATOMIC_WRITE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _write = anvil_lock(&ANVIL_ATOMIC_WRITE_LOCK);
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp_name);
@@ -515,6 +530,34 @@ fn anvil_atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
     // even though every staged byte was fsynced first.
     anvil_sync_parent_dir(path);
     Ok(())
+}
+
+/// Append one `len | compression | payload` record to a region body, padded to
+/// the next sector; returns its start sector.
+fn anvil_region_record(body: &mut Vec<u8>, len: u32, compression: u8, payload: &[u8]) -> usize {
+    let offset = 2 + body.len() / ANVIL_SECTOR;
+    body.extend_from_slice(&len.to_be_bytes());
+    body.push(compression);
+    body.extend_from_slice(payload);
+    body.resize(body.len().div_ceil(ANVIL_SECTOR) * ANVIL_SECTOR, 0);
+    offset
+}
+
+/// Point one chunk slot at `offset`/`sectors` and stamp its record time.
+fn anvil_region_locate(
+    locations: &mut [u8; ANVIL_SECTOR],
+    timestamps: &mut [u8; ANVIL_SECTOR],
+    cx: i32,
+    cz: i32,
+    offset: usize,
+    sectors: u8,
+    timestamp: u32,
+) {
+    let slot = ((cx & 31) + (cz & 31) * 32) as usize;
+    let offset = (offset as u32).to_be_bytes();
+    locations[slot * 4..slot * 4 + 3].copy_from_slice(&offset[1..]);
+    locations[slot * 4 + 3] = sectors;
+    timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&timestamp.to_be_bytes());
 }
 
 /// Write `region` to `path`, which must be named `r.<rx>.<rz>.mca` for the chunk
@@ -544,29 +587,28 @@ fn write_region_file(path: &std::path::Path, region: &AnvilRegion) -> Result<(),
                 other => return Err(format!("unknown chunk compression type {other}")),
             };
             anvil_write_external_chunk(path, cx, cz, &compressed)?;
-            let offset = 2 + body.len() / ANVIL_SECTOR;
-            body.extend_from_slice(&1u32.to_be_bytes());
-            body.push(compression);
-            body.resize(body.len().div_ceil(ANVIL_SECTOR) * ANVIL_SECTOR, 0);
-            let slot = ((cx & 31) + (cz & 31) * 32) as usize;
-            locations[slot * 4] = ((offset >> 16) & 0xff) as u8;
-            locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
-            locations[slot * 4 + 2] = (offset & 0xff) as u8;
-            locations[slot * 4 + 3] = 1;
-            timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&record.timestamp.to_be_bytes());
+            let offset = anvil_region_record(&mut body, 1, compression, &[]);
+            anvil_region_locate(
+                &mut locations,
+                &mut timestamps,
+                cx,
+                cz,
+                offset,
+                1,
+                record.timestamp,
+            );
             continue;
         }
-        let offset = 2 + body.len() / ANVIL_SECTOR;
-        body.extend_from_slice(&(len as u32).to_be_bytes());
-        body.push(record.compression);
-        body.extend_from_slice(&compressed);
-        body.resize(body.len().div_ceil(ANVIL_SECTOR) * ANVIL_SECTOR, 0);
-        let slot = ((cx & 31) + (cz & 31) * 32) as usize;
-        locations[slot * 4] = ((offset >> 16) & 0xff) as u8;
-        locations[slot * 4 + 1] = ((offset >> 8) & 0xff) as u8;
-        locations[slot * 4 + 2] = (offset & 0xff) as u8;
-        locations[slot * 4 + 3] = sectors as u8;
-        timestamps[slot * 4..slot * 4 + 4].copy_from_slice(&record.timestamp.to_be_bytes());
+        let offset = anvil_region_record(&mut body, len as u32, record.compression, &compressed);
+        anvil_region_locate(
+            &mut locations,
+            &mut timestamps,
+            cx,
+            cz,
+            offset,
+            sectors as u8,
+            record.timestamp,
+        );
     }
     let mut file = Vec::with_capacity(2 * ANVIL_SECTOR + body.len());
     file.extend_from_slice(&locations);
@@ -897,9 +939,7 @@ fn anvil_playerdata_preserved(
 fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
     let extras = anvil_preserved_root_fields(root, ANVIL_CHUNK_EMITTED_KEYS);
     {
-        let mut map = anvil_chunk_preserved()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = anvil_lock(anvil_chunk_preserved());
         if extras.is_empty() {
             map.remove(&(dim, chunk.cx, chunk.cz));
         } else {
@@ -912,9 +952,7 @@ fn anvil_remember_chunk(dim: DimId, chunk: &AnvilChunk, root: &AnvilNbt) {
             tombstones.insert(section.y, section.tombstones.clone());
         }
     }
-    let mut map = anvil_block_tombstones()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = anvil_lock(anvil_block_tombstones());
     if tombstones.is_empty() {
         map.remove(&(dim, chunk.cx, chunk.cz));
     } else {
@@ -1068,9 +1106,7 @@ fn anvil_chunk_to_nbt(dim: DimId, chunk: &AnvilChunk, y_pos: i32) -> AnvilNbt {
         ("block_entities", anvil_list(chunk.block_entities.clone())),
     ]);
     if let AnvilNbt::Compound(fields) = &mut root {
-        let preserved = anvil_chunk_preserved()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let preserved = anvil_lock(anvil_chunk_preserved())
             .get(&(dim, chunk.cx, chunk.cz))
             .cloned();
         if let Some(extras) = preserved {
@@ -1208,7 +1244,7 @@ impl AnvilLevelDat {
     /// One field write into the `Data` compound.
     fn set(&mut self, key: &str, value: AnvilNbt) {
         if let AnvilNbt::Compound(values) = self.data_mut() {
-            values.insert(crate::nbt::NbtString::text(key), value);
+            anvil_put(values, key, value);
         }
     }
 }
@@ -1269,9 +1305,7 @@ fn anvil_gamerule_string(is_bool: bool, value: i32) -> String {
 /// Live `GameRules` compound from `command_gamerules()` + the eight atomic rules
 /// `gamerule_value` treats as authoritative.
 fn anvil_gamerules_nbt() -> AnvilNbt {
-    let rules = command_gamerules()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let rules = anvil_lock(command_gamerules());
     anvil_obj(
         &COMMAND_GAMERULE_DEFAULTS
             .iter()
@@ -1291,9 +1325,7 @@ fn anvil_gamerules_nbt() -> AnvilNbt {
 /// Apply a parsed `GameRules` compound: known rules update both the command
 /// registry and the eight live atomics; unknown names are ignored.
 fn anvil_apply_gamerules(rules: &std::collections::BTreeMap<String, String>) {
-    let mut map = command_gamerules()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut map = anvil_lock(command_gamerules());
     for &(name, is_bool, _) in COMMAND_GAMERULE_DEFAULTS {
         let Some(text) = rules.get(name) else {
             continue;
@@ -1378,8 +1410,9 @@ fn anvil_level_dimensions() -> AnvilNbt {
     // real window instead of the fallback's.
     if let AnvilNbt::Compound(fields) = &mut dims {
         for spec in worldgen::custom_dimension_specs() {
-            fields.insert(
-                crate::nbt::NbtString::text(spec.key),
+            anvil_put(
+                fields,
+                spec.key,
                 anvil_obj(&[
                     ("type", anvil_dimension_type_nbt(&spec)),
                     ("generator", anvil_custom_dim_generator_nbt(&spec)),
@@ -1485,9 +1518,9 @@ fn anvil_custom_dim_generator_nbt(spec: &worldgen::DimensionSpec) -> AnvilNbt {
 /// release that version names.
 fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevelDat {
     let schema = AnvilSchemaVersion::from_data_version(data_version);
-    let spawn = *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let spawn = *anvil_lock(&WORLD_SPAWN);
     let now_ms = border_now_ms();
-    let border = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+    let border = *anvil_lock(world_border());
     let raining = RAINING.load(Ordering::Relaxed);
     let thundering = THUNDERING.load(Ordering::Relaxed);
     let seed = WORLD_SEED.load(Ordering::Relaxed) as i64;
@@ -1582,7 +1615,7 @@ fn anvil_level_dat_from_state(level_name: &str, data_version: i32) -> AnvilLevel
 fn anvil_apply_level_dat(level: &AnvilLevelDat) {
     WORLD_SEED.store(level.seed() as u64, Ordering::Relaxed);
     let (sx, sy, sz, angle) = level.spawn();
-    *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (
+    *anvil_lock(&WORLD_SPAWN) = (
         f64::from(sx) + 0.5,
         f64::from(sy),
         f64::from(sz) + 0.5,
@@ -1613,7 +1646,7 @@ fn anvil_apply_level_dat(level: &AnvilLevelDat) {
     );
     let (cx, cz, size, warn_blocks, warn_time, damage, safe) = level.border();
     {
-        let mut border = world_border().lock().unwrap_or_else(|e| e.into_inner());
+        let mut border = anvil_lock(world_border());
         border.center_x = cx;
         border.center_z = cz;
         border.old_size = size.clamp(1.0, WORLD_BORDER_MAX_SIZE);
@@ -1944,10 +1977,8 @@ fn apply_anvil_import(report: &AnvilImportReport) {
         }
     }
     {
-        let mut entities = anvil_block_entities()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut sign_map = signs().lock().unwrap_or_else(|e| e.into_inner());
+        let mut entities = anvil_lock(anvil_block_entities());
+        let mut sign_map = anvil_lock(signs());
         for chunk in &report.chunks {
             for entity in &chunk.block_entities {
                 let (Some(x), Some(y), Some(z)) = (
@@ -2162,6 +2193,18 @@ fn anvil_nbt_to_json(tag: &AnvilNbt) -> String {
     out
 }
 
+/// Append one JSON array from already-stringifiable items.
+fn anvil_json_array<T: std::fmt::Display>(out: &mut String, items: impl IntoIterator<Item = T>) {
+    out.push('[');
+    for (i, item) in items.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&item.to_string());
+    }
+    out.push(']');
+}
+
 fn anvil_nbt_to_json_into(tag: &AnvilNbt, out: &mut String) {
     match tag {
         AnvilNbt::End => out.push_str("null"),
@@ -2171,16 +2214,7 @@ fn anvil_nbt_to_json_into(tag: &AnvilNbt, out: &mut String) {
         AnvilNbt::Long(v) => out.push_str(&v.to_string()),
         AnvilNbt::Float(v) => anvil_json_f64(f64::from(f32::from_bits(*v)), out),
         AnvilNbt::Double(v) => anvil_json_f64(f64::from_bits(*v), out),
-        AnvilNbt::ByteArray(v) => {
-            out.push('[');
-            for (i, b) in v.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&b.to_string());
-            }
-            out.push(']');
-        }
+        AnvilNbt::ByteArray(v) => anvil_json_array(out, v.iter()),
         AnvilNbt::String(s) => anvil_json_string(&String::from_utf16_lossy(&s.0), out),
         AnvilNbt::List(_, items) => {
             out.push('[');
@@ -2204,26 +2238,8 @@ fn anvil_nbt_to_json_into(tag: &AnvilNbt, out: &mut String) {
             }
             out.push('}');
         }
-        AnvilNbt::IntArray(v) => {
-            out.push('[');
-            for (i, n) in v.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&n.to_string());
-            }
-            out.push(']');
-        }
-        AnvilNbt::LongArray(v) => {
-            out.push('[');
-            for (i, n) in v.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&n.to_string());
-            }
-            out.push(']');
-        }
+        AnvilNbt::IntArray(v) => anvil_json_array(out, v.iter()),
+        AnvilNbt::LongArray(v) => anvil_json_array(out, v.iter()),
     }
 }
 
@@ -2334,9 +2350,7 @@ fn anvil_export_sections(
     overlay: &HashMap<u32, u32>,
 ) -> Vec<AnvilSection> {
     let min_y = worldgen::min_y_dim(dim);
-    let tombstones = anvil_block_tombstones()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let tombstones = anvil_lock(anvil_block_tombstones())
         .get(&(dim, cx, cz))
         .cloned()
         .unwrap_or_default();
@@ -2415,25 +2429,15 @@ fn anvil_export_biomes(dim: DimId, cx: i32, sy: i32, cz: i32) -> Option<Box<[Str
 /// registry owns, the sign text registries, and generated spawners. Position
 /// dedup prefers the live registry over an imported record.
 fn anvil_export_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
-    let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let mut by_pos: std::collections::BTreeMap<(i32, i32, i32), AnvilNbt> = Default::default();
-    for (&(d, x, y, z), tag) in anvil_block_entities()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        if d == dim && in_chunk(x, z) {
+    for (&(d, x, y, z), tag) in anvil_lock(anvil_block_entities()).iter() {
+        if d == dim && anvil_in_chunk(cx, cz, x, z) {
             by_pos.insert((x, y, z), tag.clone());
         }
     }
     // Generated spawners are keyed by dimension and carry full entity NBT.
-    for (&(spawner_dim, (x, y, z)), tag) in generated_content()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .spawners
-        .iter()
-    {
-        if spawner_dim == dim && in_chunk(x, z) {
+    for (&(spawner_dim, (x, y, z)), tag) in anvil_lock(generated_content()).spawners.iter() {
+        if spawner_dim == dim && anvil_in_chunk(cx, cz, x, z) {
             by_pos.insert((x, y, z), tag.clone());
         }
     }
@@ -2515,16 +2519,7 @@ fn export_anvil_world_with_options(
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> = world().snapshot();
-    let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
-        Default::default();
-    for &(dim, cx, cz) in snapshot.keys() {
-        if anvil_dim_region_dir(dim).is_some() {
-            by_region
-                .entry((dim, cx.div_euclid(32), cz.div_euclid(32)))
-                .or_default()
-                .push((cx, cz));
-        }
-    }
+    let by_region = anvil_overlay_regions(&snapshot);
     for ((dim, rx, rz), chunks) in by_region {
         let rel =
             anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
@@ -2534,16 +2529,14 @@ fn export_anvil_world_with_options(
         let mut region = AnvilRegion::default();
         for (cx, cz) in chunks {
             let overlay = snapshot.get(&(dim, cx, cz)).cloned().unwrap_or_default();
-            let chunk = AnvilChunk {
+            let chunk = anvil_live_chunk(
+                dim,
                 cx,
                 cz,
-                data_version: options.target_data_version,
-                status: "minecraft:full".to_string(),
-                sections: anvil_export_sections(dim, cx, cz, &overlay),
-                block_entities: anvil_export_block_entities(dim, cx, cz),
-                unknown_states: 0,
-                dropped_sections: 0,
-            };
+                options.target_data_version,
+                &overlay,
+                anvil_export_block_entities(dim, cx, cz),
+            );
             region.chunks.insert(
                 (cx, cz),
                 AnvilChunkRecord {
@@ -2848,11 +2841,9 @@ impl PlayerInventorySlot {
         if bits < PLAYER_NBT_MAIN_BASE {
             return Some(Self::Hotbar(bits));
         }
-        if let Some(index) = checked_slot_index(
-            raw,
-            i16::from(PLAYER_NBT_MAIN_BASE),
-            PLAYER_MAIN_SLOT_COUNT,
-        ) {
+        if let Some(index) =
+            checked_slot_index(raw, i16::from(PLAYER_NBT_MAIN_BASE), PLAYER_MAIN_SLOT_COUNT)
+        {
             return Some(Self::Main(index));
         }
         if let Some(index) = checked_slot_index(
@@ -3013,7 +3004,20 @@ mod anvil_slot_conversion_tests {
             assert_eq!(playerdata_slot_to_vanilla(menu), None, "menu {menu}");
             assert_eq!(PlayerMenuSlot::from_raw(menu), None, "menu {menu}");
         }
-        for nbt in [i16::MIN, -107, -105, -1, 36, 99, 104, 149, 151, 255, 256, i16::MAX] {
+        for nbt in [
+            i16::MIN,
+            -107,
+            -105,
+            -1,
+            36,
+            99,
+            104,
+            149,
+            151,
+            255,
+            256,
+            i16::MAX,
+        ] {
             assert_eq!(playerdata_slot_from_vanilla(nbt), None, "nbt {nbt}");
             assert_eq!(PlayerNbtSlot::from_raw(nbt), None, "nbt {nbt}");
         }
@@ -3149,37 +3153,17 @@ fn playerdata_nbt_of(save: &PlayerSave) -> AnvilNbt {
         })
         .collect();
     if let AnvilNbt::Compound(map) = &mut root {
-        map.insert(
-            crate::nbt::NbtString::text("ActiveEffects"),
-            anvil_list(effects),
-        );
+        anvil_put(map, "ActiveEffects", anvil_list(effects));
         if let Some(point) = save.respawn {
-            map.insert(
-                crate::nbt::NbtString::text("SpawnDimension"),
-                anvil_s(&dim_key(point.dim)),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnX"),
-                AnvilNbt::Int(point.position.0 as i32),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnY"),
-                AnvilNbt::Int(point.position.1 as i32),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnZ"),
-                AnvilNbt::Int(point.position.2 as i32),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnAngle"),
-                AnvilNbt::Float(point.angle.to_bits()),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnForced"),
-                AnvilNbt::Byte(i8::from(point.forced)),
-            );
-            map.insert(
-                crate::nbt::NbtString::text("SpawnKind"),
+            anvil_put(map, "SpawnDimension", anvil_s(&dim_key(point.dim)));
+            anvil_put(map, "SpawnX", AnvilNbt::Int(point.position.0 as i32));
+            anvil_put(map, "SpawnY", AnvilNbt::Int(point.position.1 as i32));
+            anvil_put(map, "SpawnZ", AnvilNbt::Int(point.position.2 as i32));
+            anvil_put(map, "SpawnAngle", AnvilNbt::Float(point.angle.to_bits()));
+            anvil_put(map, "SpawnForced", AnvilNbt::Byte(i8::from(point.forced)));
+            anvil_put(
+                map,
+                "SpawnKind",
                 AnvilNbt::Byte(match point.kind {
                     SpawnTargetKind::Legacy => 0,
                     SpawnTargetKind::Bed => 1,
@@ -3226,8 +3210,35 @@ fn playerdata_from_nbt(tag: &AnvilNbt) -> Result<PlayerSave, String> {
         anvil_str(tag, "Dimension").unwrap_or_else(|| "minecraft:overworld".to_string());
     let dim = DimId::parse_dimension_id(&dimension)
         .ok_or_else(|| format!("playerdata dimension {dimension} is unregistered"))?;
-    let pos = tag
-        .get("Pos")
+    let pos = playerdata_pos(tag)?;
+    let rotation = playerdata_rotation(tag)?;
+    let inventory = playerdata_items(tag, "Inventory")?
+        .map(playerdata_slots_from_vanilla)
+        .unwrap_or_default();
+    let ender_chest = playerdata_items(tag, "EnderItems")?.unwrap_or_default();
+    Ok(PlayerSave {
+        position: (dim, pos[0], pos[1], pos[2], rotation[0], rotation[1]),
+        inventory,
+        ender_chest,
+        held: anvil_i32(tag, "SelectedItemSlot").unwrap_or(0).clamp(0, 8) as i16,
+        health: anvil_f32(tag, "Health").unwrap_or(20.0),
+        absorption: anvil_f32(tag, "AbsorptionAmount").unwrap_or(0.0),
+        food: anvil_i32(tag, "foodLevel").unwrap_or(20),
+        saturation: anvil_f32(tag, "foodSaturationLevel").unwrap_or(5.0),
+        exhaustion: f64::from(anvil_f32(tag, "foodExhaustionLevel").unwrap_or(0.0)),
+        xp_level: anvil_i32(tag, "XpLevel").unwrap_or(0),
+        xp_progress: anvil_f32(tag, "XpP").unwrap_or(0.0),
+        xp_total: anvil_i64(tag, "XpTotal").unwrap_or(0),
+        gamemode: anvil_i32(tag, "playerGameType").unwrap_or(0).clamp(0, 3) as u8,
+        effects: playerdata_effects(tag)?,
+        respawn: playerdata_respawn(tag)?,
+    })
+}
+
+/// The `Pos` triple, required: a player file without a well-formed position is
+/// unroutable.
+fn playerdata_pos(tag: &AnvilNbt) -> Result<[f64; 3], String> {
+    tag.get("Pos")
         .and_then(AnvilNbt::list)
         .filter(|p| p.len() == 3)
         .and_then(|p| {
@@ -3237,91 +3248,75 @@ fn playerdata_from_nbt(tag: &AnvilNbt) -> Result<PlayerSave, String> {
                 playerdata_f64(&p[2])?,
             ])
         })
-        .ok_or("playerdata has no Pos list")?;
-    let rotation = tag
-        .get("Rotation")
+        .ok_or_else(|| "playerdata has no Pos list".to_string())
+}
+
+/// The required `Rotation` pair.
+fn playerdata_rotation(tag: &AnvilNbt) -> Result<[f32; 2], String> {
+    tag.get("Rotation")
         .and_then(AnvilNbt::list)
         .filter(|r| r.len() == 2)
         .and_then(|r| Some([playerdata_f64(&r[0])? as f32, playerdata_f64(&r[1])? as f32]))
-        .ok_or("playerdata has no Rotation list")?;
-    let inventory = tag
-        .get("Inventory")
+        .ok_or_else(|| "playerdata has no Rotation list".to_string())
+}
+
+/// One inventory-style `Items` list, `None` when the field is absent.
+fn playerdata_items(tag: &AnvilNbt, key: &str) -> Result<Option<HashMap<i16, Stack>>, String> {
+    tag.get(key)
         .map(items_nbt_to_stacks)
         .transpose()
-        .map_err(|e| format!("playerdata Inventory: {e}"))?
-        .map(playerdata_slots_from_vanilla)
-        .unwrap_or_default();
-    let ender_chest = tag
-        .get("EnderItems")
-        .map(items_nbt_to_stacks)
-        .transpose()
-        .map_err(|e| format!("playerdata EnderItems: {e}"))?
-        .unwrap_or_default();
-    let held = anvil_i32(tag, "SelectedItemSlot").unwrap_or(0).clamp(0, 8) as i16;
-    let gamemode = anvil_i32(tag, "playerGameType").unwrap_or(0).clamp(0, 3) as u8;
+        .map_err(|e| format!("playerdata {key}: {e}"))
+}
+
+/// The `ActiveEffects` list, dropping entries without a valid numeric id.
+fn playerdata_effects(tag: &AnvilNbt) -> Result<Vec<(i32, i32, i32)>, String> {
+    let Some(list) = tag.get("ActiveEffects").and_then(AnvilNbt::list) else {
+        return Ok(Vec::new());
+    };
+    if list.len() > 64 {
+        return Err("playerdata has too many ActiveEffects".to_string());
+    }
     let mut effects = Vec::new();
-    if let Some(list) = tag.get("ActiveEffects").and_then(AnvilNbt::list) {
-        if list.len() > 64 {
-            return Err("playerdata has too many ActiveEffects".to_string());
-        }
-        for effect in list {
-            let id =
-                nbt_int_val(effect.get("Id").unwrap_or(&AnvilNbt::Int(-1))).unwrap_or(-1) as i32;
-            if id < 0 {
-                continue;
-            }
+    for effect in list {
+        let id = anvil_num(effect, "Id", -1) as i32;
+        if id >= 0 {
             effects.push((
                 id,
-                nbt_int_val(effect.get("Amplifier").unwrap_or(&AnvilNbt::Byte(0))).unwrap_or(0)
-                    as i32,
-                nbt_int_val(effect.get("Duration").unwrap_or(&AnvilNbt::Int(0))).unwrap_or(0)
-                    as i32,
+                anvil_num(effect, "Amplifier", 0) as i32,
+                anvil_num(effect, "Duration", 0) as i32,
             ));
         }
     }
-    let respawn = match (
+    Ok(effects)
+}
+
+/// The optional respawn target; a `Spawn*` set naming an unregistered dimension
+/// aborts the file.
+fn playerdata_respawn(tag: &AnvilNbt) -> Result<Option<SpawnTarget>, String> {
+    let (Some(x), Some(y), Some(z), Some(key)) = (
         anvil_i32(tag, "SpawnX"),
         anvil_i32(tag, "SpawnY"),
         anvil_i32(tag, "SpawnZ"),
         anvil_str(tag, "SpawnDimension"),
-    ) {
-        (Some(x), Some(y), Some(z), Some(dim_key_str)) => {
-            let Some(sdim) = DimId::parse_dimension_id(&dim_key_str) else {
-                return Err(format!(
-                    "playerdata respawn dimension {dim_key_str} is unregistered"
-                ));
-            };
-            Some(SpawnTarget {
-                kind: match anvil_i8(tag, "SpawnKind").unwrap_or(0) {
-                    1 => SpawnTargetKind::Bed,
-                    2 => SpawnTargetKind::Anchor,
-                    _ => SpawnTargetKind::Legacy,
-                },
-                dim: sdim,
-                position: (f64::from(x), f64::from(y), f64::from(z)),
-                angle: anvil_f32(tag, "SpawnAngle").unwrap_or(0.0),
-                forced: anvil_i8(tag, "SpawnForced").unwrap_or(0) != 0,
-            })
-        }
-        _ => None,
+    ) else {
+        return Ok(None);
     };
-    Ok(PlayerSave {
-        position: (dim, pos[0], pos[1], pos[2], rotation[0], rotation[1]),
-        inventory,
-        ender_chest,
-        held,
-        health: anvil_f32(tag, "Health").unwrap_or(20.0),
-        absorption: anvil_f32(tag, "AbsorptionAmount").unwrap_or(0.0),
-        food: anvil_i32(tag, "foodLevel").unwrap_or(20),
-        saturation: anvil_f32(tag, "foodSaturationLevel").unwrap_or(5.0),
-        exhaustion: f64::from(anvil_f32(tag, "foodExhaustionLevel").unwrap_or(0.0)),
-        xp_level: anvil_i32(tag, "XpLevel").unwrap_or(0),
-        xp_progress: anvil_f32(tag, "XpP").unwrap_or(0.0),
-        xp_total: anvil_i64(tag, "XpTotal").unwrap_or(0),
-        gamemode,
-        effects,
-        respawn,
-    })
+    let Some(dim) = DimId::parse_dimension_id(&key) else {
+        return Err(format!(
+            "playerdata respawn dimension {key} is unregistered"
+        ));
+    };
+    Ok(Some(SpawnTarget {
+        kind: match anvil_i8(tag, "SpawnKind").unwrap_or(0) {
+            1 => SpawnTargetKind::Bed,
+            2 => SpawnTargetKind::Anchor,
+            _ => SpawnTargetKind::Legacy,
+        },
+        dim,
+        position: (f64::from(x), f64::from(y), f64::from(z)),
+        angle: anvil_f32(tag, "SpawnAngle").unwrap_or(0.0),
+        forced: anvil_i8(tag, "SpawnForced").unwrap_or(0) != 0,
+    }))
 }
 
 /// The complete playerdata root compound (`PlayerSave` fields + `UUID` int
@@ -3330,20 +3325,13 @@ fn playerdata_from_nbt(tag: &AnvilNbt) -> Result<PlayerSave, String> {
 fn playerdata_nbt_root(uuid: &[u8; 16], save: &PlayerSave) -> AnvilNbt {
     let mut root = playerdata_nbt_of(save);
     if let AnvilNbt::Compound(map) = &mut root {
-        map.insert(
-            crate::nbt::NbtString::text("UUID"),
-            AnvilNbt::IntArray(uuid_to_int_array(uuid)),
-        );
+        anvil_put(map, "UUID", AnvilNbt::IntArray(uuid_to_int_array(uuid)));
         // Everything this record carried that `PlayerSave` does not own
         // (`neoforge:attachments`, `ForgeData`, `recipeBook`,
         // `fabric:attachments`, `warden_spawn_tracker`,
         // `ShoulderEntityLeft`/`Right`, `RootVehicle`, ...) merges back
         // verbatim — never over an emitted key.
-        let preserved = anvil_playerdata_preserved()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(uuid)
-            .cloned();
+        let preserved = anvil_lock(anvil_playerdata_preserved()).get(uuid).cloned();
         if let Some(extras) = preserved {
             for (key, value) in extras {
                 map.entry(key).or_insert(value);
@@ -3420,16 +3408,12 @@ fn write_playerdata_dat(
 /// still matches what the last save committed is skipped outright — no gzip
 /// re-encode, no staging write — as long as its file is still on disk.
 fn write_all_playerdata_dat(world_dir: &std::path::Path) -> Result<(usize, usize), String> {
-    let players: Vec<([u8; 16], PlayerSave)> = saved_players()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    let players: Vec<([u8; 16], PlayerSave)> = anvil_lock(saved_players())
         .iter()
         .map(|(uuid, save)| (*uuid, save.clone()))
         .collect();
     let dir = world_dir.join("playerdata");
-    let mut hashes = anvil_playerdata_hashes()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut hashes = anvil_lock(anvil_playerdata_hashes());
     let mut written = 0;
     let mut skipped = 0;
     for (uuid, save) in &players {
@@ -3503,19 +3487,14 @@ fn load_all_playerdata_dat(world_dir: &std::path::Path) -> Result<usize, String>
             eprintln!("[spine] {name}: NBT UUID does not match file name; keeping the file name");
         }
         {
-            let mut preserved = anvil_playerdata_preserved()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let mut preserved = anvil_lock(anvil_playerdata_preserved());
             if extras.is_empty() {
                 preserved.remove(&uuid);
             } else {
                 preserved.insert(uuid, extras);
             }
         }
-        saved_players()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(uuid, save);
+        anvil_lock(saved_players()).insert(uuid, save);
         loaded += 1;
     }
     Ok(loaded)
@@ -3580,89 +3559,21 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     let timestamp = (border_now_ms() / 1000).min(u64::from(u32::MAX)) as u32;
     // Snapshot the overlay once: no `world()` borrow crosses a worldgen call.
     let snapshot: HashMap<DimChunkKey, HashMap<u32, u32>> = world().snapshot();
-    let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
-        Default::default();
-    for &(dim, cx, cz) in snapshot.keys() {
-        if anvil_dim_region_dir(dim).is_some() {
-            by_region
-                .entry((dim, cx.div_euclid(32), cz.div_euclid(32)))
-                .or_default()
-                .push((cx, cz));
-        }
-    }
+    let by_region = anvil_overlay_regions(&snapshot);
     // Full-save and incremental paths take the transaction lock before the
     // persisted-hash lock, keeping one lock order across both writers.
     let _transaction = anvil_save_transaction_lock();
-    let mut hashes = anvil_persisted_hashes()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut hashes = anvil_lock(anvil_persisted_hashes());
     for ((dim, rx, rz), chunks) in by_region {
-        let rel =
-            anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
-        let region_dir = dir.join(rel);
-        std::fs::create_dir_all(&region_dir)
-            .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
-        let region_path = region_dir.join(format!("r.{rx}.{rz}.mca"));
-        // Merge, never blindly overwrite: an existing region file keeps its
-        // untouched chunks; one that fails to read aborts the save outright —
-        // a partial file must never replace a good one. Only the dirty slots are
-        // decoded for the hash compare; every other slot is copied as its raw
-        // sector run by the updater, so a one-chunk edit no longer pays the
-        // 1,024-slot inflate/NBT/deflate cost.
-        let wanted: HashSet<(i32, i32)> = chunks.iter().copied().collect();
-        let (existing, on_disk) = read_region_file_selected(&region_path, &wanted)?;
-        let mut updates: HashMap<(i32, i32), AnvilChunkRecord> = HashMap::new();
-        let mut committed_hashes: Vec<(AnvilPersistedKey, u64)> = Vec::new();
-        for (cx, cz) in chunks {
-            let overlay = snapshot.get(&(dim, cx, cz)).cloned().unwrap_or_default();
-            let chunk = AnvilChunk {
-                cx,
-                cz,
-                data_version: ANVIL_DATA_VERSION,
-                status: "minecraft:full".to_string(),
-                sections: anvil_export_sections(dim, cx, cz, &overlay),
-                block_entities: anvil_export_block_entities(dim, cx, cz),
-                unknown_states: 0,
-                dropped_sections: 0,
-            };
-            let fresh_nbt = anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4);
-            let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
-            // Dirty-but-identical: the payload on disk already holds exactly
-            // this content, so re-encoding and rewriting it would be pure
-            // SSD wear. The on-disk record (its timestamp, its compression
-            // flavour, every preserved field) stays untouched.
-            let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
-            if anvil_payload_unchanged(
-                key.clone(),
-                fresh_hash,
-                on_disk.get(&(cx, cz)).map(|record| &record.nbt),
-                &mut hashes,
-            ) {
-                summary.skipped_unchanged_writes += 1;
-                continue;
-            }
-            updates.insert(
-                (cx, cz),
-                AnvilChunkRecord {
-                    timestamp,
-                    compression: 2,
-                    nbt: fresh_nbt,
-                },
-            );
-            committed_hashes.push((key, fresh_hash));
-            summary.chunks_written += 1;
-        }
-        if !updates.is_empty() {
-            update_region_file_raw_with_existing(&region_path, &updates, existing.as_deref())?;
-            summary.region_files += 1;
-            summary.region_bytes_written = summary
-                .region_bytes_written
-                .saturating_add(anvil_file_len(&region_path));
-            // The new payload is only "persisted" once the rename landed.
-            for (key, hash) in committed_hashes {
-                hashes.insert(key, hash);
-            }
-        }
+        let region = LiveSaveRegion {
+            dir,
+            dim,
+            rx,
+            rz,
+            chunks,
+            snapshot: &snapshot,
+        };
+        live_anvil_save_region(region, timestamp, &mut hashes, &mut summary)?;
     }
     drop(hashes);
     drop(_transaction);
@@ -3672,11 +3583,142 @@ fn live_anvil_save_dir(dir: &std::path::Path) -> Result<AnvilSaveSummary, String
     // A merged full save persists everything the incremental queue tracked:
     // the queued entries are durable now, so the queue starts the next tick
     // empty rather than re-checking what was just written.
-    anvil_incremental_saves()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .drain_pending();
+    anvil_lock(anvil_incremental_saves()).drain_pending();
     Ok(summary)
+}
+
+/// Group every overlay chunk by the region file that holds it, skipping
+/// dimensions with no vanilla region path.
+fn anvil_overlay_regions(
+    snapshot: &HashMap<DimChunkKey, HashMap<u32, u32>>,
+) -> std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> {
+    let mut by_region: std::collections::BTreeMap<(DimId, i32, i32), Vec<(i32, i32)>> =
+        std::collections::BTreeMap::new();
+    for &(dim, cx, cz) in snapshot.keys() {
+        if anvil_dim_region_dir(dim).is_some() {
+            by_region
+                .entry((dim, cx.div_euclid(32), cz.div_euclid(32)))
+                .or_default()
+                .push((cx, cz));
+        }
+    }
+    by_region
+}
+
+/// The chunk record one live overlay flush encodes: generated base sections
+/// plus the caller's block-entity records.
+fn anvil_live_chunk(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    data_version: i32,
+    overlay: &HashMap<u32, u32>,
+    block_entities: Vec<AnvilNbt>,
+) -> AnvilChunk {
+    AnvilChunk {
+        cx,
+        cz,
+        data_version,
+        status: "minecraft:full".to_string(),
+        sections: anvil_export_sections(dim, cx, cz, overlay),
+        block_entities,
+        unknown_states: 0,
+        dropped_sections: 0,
+    }
+}
+
+/// One region file's share of a full save: where it lives and which overlay
+/// chunks it owns.
+struct LiveSaveRegion<'a> {
+    dir: &'a std::path::Path,
+    dim: DimId,
+    rx: i32,
+    rz: i32,
+    chunks: Vec<(i32, i32)>,
+    snapshot: &'a HashMap<DimChunkKey, HashMap<u32, u32>>,
+}
+
+/// Merge one region file's dirty overlay chunks, counting what the write
+/// committed and skipping payloads whose hash already matches the record on
+/// disk.
+fn live_anvil_save_region(
+    region: LiveSaveRegion<'_>,
+    timestamp: u32,
+    hashes: &mut HashMap<AnvilPersistedKey, u64>,
+    summary: &mut AnvilSaveSummary,
+) -> Result<(), String> {
+    let LiveSaveRegion {
+        dir,
+        dim,
+        rx,
+        rz,
+        chunks,
+        snapshot,
+    } = region;
+    let rel = anvil_dim_region_dir(dim).expect("region dir resolved for a registered dimension");
+    let region_dir = dir.join(rel);
+    std::fs::create_dir_all(&region_dir)
+        .map_err(|e| format!("cannot create {}: {e}", region_dir.display()))?;
+    let region_path = region_dir.join(format!("r.{rx}.{rz}.mca"));
+    // Merge, never blindly overwrite: an existing region file keeps its
+    // untouched chunks; one that fails to read aborts the save outright — a
+    // partial file must never replace a good one. Only the dirty slots are
+    // decoded for the hash compare; every other slot is copied as its raw
+    // sector run by the updater, so a one-chunk edit no longer pays the
+    // 1,024-slot inflate/NBT/deflate cost.
+    let wanted: HashSet<(i32, i32)> = chunks.iter().copied().collect();
+    let (existing, on_disk) = read_region_file_selected(&region_path, &wanted)?;
+    let mut updates: HashMap<(i32, i32), AnvilChunkRecord> = HashMap::new();
+    let mut committed_hashes: Vec<(AnvilPersistedKey, u64)> = Vec::new();
+    for (cx, cz) in chunks {
+        let overlay = snapshot.get(&(dim, cx, cz)).cloned().unwrap_or_default();
+        let chunk = anvil_live_chunk(
+            dim,
+            cx,
+            cz,
+            ANVIL_DATA_VERSION,
+            &overlay,
+            anvil_export_block_entities(dim, cx, cz),
+        );
+        let fresh_nbt = anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4);
+        let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
+        // Dirty-but-identical: the payload on disk already holds exactly this
+        // content, so re-encoding and rewriting it would be pure SSD wear. The
+        // on-disk record (its timestamp, its compression flavour, every
+        // preserved field) stays untouched.
+        let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
+        if anvil_payload_unchanged(
+            key.clone(),
+            fresh_hash,
+            on_disk.get(&(cx, cz)).map(|record| &record.nbt),
+            hashes,
+        ) {
+            summary.skipped_unchanged_writes += 1;
+            continue;
+        }
+        updates.insert(
+            (cx, cz),
+            AnvilChunkRecord {
+                timestamp,
+                compression: 2,
+                nbt: fresh_nbt,
+            },
+        );
+        committed_hashes.push((key, fresh_hash));
+        summary.chunks_written += 1;
+    }
+    if !updates.is_empty() {
+        update_region_file_raw_with_existing(&region_path, &updates, existing.as_deref())?;
+        summary.region_files += 1;
+        summary.region_bytes_written = summary
+            .region_bytes_written
+            .saturating_add(anvil_file_len(&region_path));
+        // The new payload is only "persisted" once the rename landed.
+        for (key, hash) in committed_hashes {
+            hashes.insert(key, hash);
+        }
+    }
+    Ok(())
 }
 
 /// File length for `region_bytes_written` accounting; `0` when the file is
@@ -3711,9 +3753,7 @@ fn live_anvil_save_tick(dir: &std::path::Path) -> Result<AnvilIncrementalSaveSum
         .collect();
     let mut summary = AnvilIncrementalSaveSummary::default();
     {
-        let mut queue = anvil_incremental_saves()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut queue = anvil_lock(anvil_incremental_saves());
         for (&(dim, cx, cz), cells) in &snapshot {
             // Pacing estimate only: ~8 bytes per overlay cell plus one sector
             // of header/NBT slack bounds the tick's byte leg within an order
@@ -3783,7 +3823,6 @@ fn live_chunk_be_id(dim: DimId, x: i32, y: i32, z: i32, fallback: &str) -> Strin
 /// tag an earlier import parked.
 #[allow(dead_code)]
 fn evict_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
-    let in_chunk = |x: i32, z: i32| x >> 4 == cx && z >> 4 == cz;
     let mut by_pos: std::collections::BTreeMap<(i32, i32, i32), AnvilNbt> = Default::default();
     for entity in anvil_export_block_entities(dim, cx, cz) {
         if let (Some(x), Some(y), Some(z)) = (
@@ -3794,54 +3833,86 @@ fn evict_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
             by_pos.insert((x, y, z), entity);
         }
     }
-    let store_keys: Vec<DimBlockPos> = live_block_entities()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+    evict_live_entity_records(dim, cx, cz, &mut by_pos);
+    // Positions whose contents already materialized: a `LootTable` must not be
+    // written next to live `Items`, or a reload would roll the table over the
+    // real contents.
+    let mut items_at = HashSet::new();
+    evict_chest_records(dim, cx, cz, &mut by_pos, &mut items_at);
+    evict_furnace_records(dim, cx, cz, &mut by_pos, &mut items_at);
+    evict_brewing_stand_records(dim, cx, cz, &mut by_pos, &mut items_at);
+    evict_pending_loot_records(dim, cx, cz, &mut by_pos, &items_at);
+    by_pos.into_values().collect()
+}
+
+fn anvil_in_chunk(cx: i32, cz: i32, x: i32, z: i32) -> bool {
+    x >> 4 == cx && z >> 4 == cz
+}
+
+/// Merge the live block-entity payloads (`beacon`, `lectern`, …) the export pass
+/// cannot see for one chunk into the position map.
+fn evict_live_entity_records(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    by_pos: &mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+) {
+    let keys: Vec<DimBlockPos> = anvil_lock(live_block_entities())
         .entries
         .keys()
         .copied()
-        .filter(|&(d, x, _, z)| d == dim && in_chunk(x, z))
+        .filter(|&(d, x, _, z)| d == dim && anvil_in_chunk(cx, cz, x, z))
         .collect();
-    for key @ (_, x, y, z) in store_keys {
+    for key @ (_, x, y, z) in keys {
         if let Some((_, tag)) = live_block_entity_snapshot(key) {
             by_pos.insert((x, y, z), tag);
         }
     }
-    // Positions whose contents already materialized: a `LootTable` must not be
-    // written next to live `Items`, or a reload would roll the table over the
-    // real contents.
-    let mut items_at: HashSet<(i32, i32, i32)> = HashSet::new();
-    let chest_entries: Vec<(DimBlockPos, HashMap<i16, Stack>)> = chests()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Merge the chest/barrel/hopper stores' `Items` for one chunk, recording the
+/// positions whose contents are real.
+fn evict_chest_records(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    by_pos: &mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+    items_at: &mut HashSet<(i32, i32, i32)>,
+) {
+    let entries: Vec<(DimBlockPos, HashMap<i16, Stack>)> = anvil_lock(chests())
         .iter()
         .filter_map(|(key, slots)| match key {
-            ContainerKey::Block(pos) if pos.0 == dim && in_chunk(pos.1, pos.3) => {
+            ContainerKey::Block(pos) if pos.0 == dim && anvil_in_chunk(cx, cz, pos.1, pos.3) => {
                 Some((*pos, slots.clone()))
             }
             _ => None,
         })
         .collect();
-    for ((_, x, y, z), slots) in chest_entries {
+    for ((_, x, y, z), slots) in entries {
         let id = live_chunk_be_id(dim, x, y, z, "minecraft:chest");
-        if let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) {
-            fields.insert(
-                crate::nbt::NbtString::text("Items"),
-                stacks_to_items_nbt(&slots),
-            );
+        if let Some(fields) = anvil_be_fields(by_pos, x, y, z, &id) {
+            anvil_put(fields, "Items", stacks_to_items_nbt(&slots));
             items_at.insert((x, y, z));
         }
     }
-    let furnace_entries: Vec<(DimBlockPos, Furnace)> = furnaces()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Merge the three-slot furnace stores, including their burn/cook progress.
+fn evict_furnace_records(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    by_pos: &mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+    items_at: &mut HashSet<(i32, i32, i32)>,
+) {
+    let entries: Vec<(DimBlockPos, Furnace)> = anvil_lock(furnaces())
         .iter()
-        .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
+        .filter(|&(&(d, x, _, z), _)| d == dim && anvil_in_chunk(cx, cz, x, z))
         .map(|(key, fr)| (*key, clone_furnace_for_footer(fr)))
         .collect();
-    for ((_, x, y, z), fr) in furnace_entries {
+    for ((_, x, y, z), fr) in entries {
         let id = live_chunk_be_id(dim, x, y, z, "minecraft:furnace");
-        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) else {
+        let Some(fields) = anvil_be_fields(by_pos, x, y, z, &id) else {
             continue;
         };
         let mut slots = HashMap::new();
@@ -3850,82 +3921,91 @@ fn evict_chunk_block_entities(dim: DimId, cx: i32, cz: i32) -> Vec<AnvilNbt> {
                 slots.insert(slot, stack.clone());
             }
         }
-        fields.insert(
-            crate::nbt::NbtString::text("Items"),
-            stacks_to_items_nbt(&slots),
-        );
-        fields.insert(
-            crate::nbt::NbtString::text("BurnTime"),
+        anvil_put(fields, "Items", stacks_to_items_nbt(&slots));
+        anvil_put(
+            fields,
+            "BurnTime",
             AnvilNbt::Short(fr.burn_left.clamp(0, i32::from(i16::MAX)) as i16),
         );
-        fields.insert(
-            crate::nbt::NbtString::text("CookTime"),
+        anvil_put(
+            fields,
+            "CookTime",
             AnvilNbt::Short(fr.progress.clamp(0, i32::from(i16::MAX)) as i16),
         );
         items_at.insert((x, y, z));
     }
-    let stand_entries: Vec<(DimBlockPos, HashMap<i16, Stack>, u16, u8)> = live_brewing_stands()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-        .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
-        .map(|(key, live)| {
-            let slots = live
-                .menu
-                .slots
-                .iter()
-                .enumerate()
-                .filter(|(_, stack)| stack.1 > 0)
-                .map(|(slot, stack)| (slot as i16, stack.clone()))
-                .collect();
-            (*key, slots, live.stand.brew_time, live.stand.fuel)
-        })
-        .collect();
-    for ((_, x, y, z), slots, brew_time, fuel) in stand_entries {
-        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, "minecraft:brewing_stand") else {
+}
+
+/// Merge the five-slot brewing-stand stores with their brew/fuel counters.
+fn evict_brewing_stand_records(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    by_pos: &mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+    items_at: &mut HashSet<(i32, i32, i32)>,
+) {
+    let entries: Vec<(DimBlockPos, HashMap<i16, Stack>, u16, u8)> =
+        anvil_lock(live_brewing_stands())
+            .iter()
+            .filter(|&(&(d, x, _, z), _)| d == dim && anvil_in_chunk(cx, cz, x, z))
+            .map(|(key, live)| {
+                let slots = live
+                    .menu
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, stack)| stack.1 > 0)
+                    .map(|(slot, stack)| (slot as i16, stack.clone()))
+                    .collect();
+                (*key, slots, live.stand.brew_time, live.stand.fuel)
+            })
+            .collect();
+    for ((_, x, y, z), slots, brew_time, fuel) in entries {
+        let Some(fields) = anvil_be_fields(by_pos, x, y, z, "minecraft:brewing_stand") else {
             continue;
         };
-        fields.insert(
-            crate::nbt::NbtString::text("Items"),
-            stacks_to_items_nbt(&slots),
-        );
-        fields.insert(
-            crate::nbt::NbtString::text("BrewTime"),
+        anvil_put(fields, "Items", stacks_to_items_nbt(&slots));
+        anvil_put(
+            fields,
+            "BrewTime",
             AnvilNbt::Short(i32::from(brew_time).clamp(0, i32::from(i16::MAX)) as i16),
         );
-        fields.insert(
-            crate::nbt::NbtString::text("Fuel"),
+        anvil_put(
+            fields,
+            "Fuel",
             AnvilNbt::Byte(i8::try_from(fuel).unwrap_or(i8::MAX)),
         );
         items_at.insert((x, y, z));
     }
-    let loot_entries: Vec<(DimBlockPos, PendingBlockLoot)> = pending_block_loot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Merge pending `LootTable`s for positions whose contents never materialized:
+/// writing one beside live `Items` would roll the table over real contents.
+fn evict_pending_loot_records(
+    dim: DimId,
+    cx: i32,
+    cz: i32,
+    by_pos: &mut std::collections::BTreeMap<(i32, i32, i32), AnvilNbt>,
+    items_at: &HashSet<(i32, i32, i32)>,
+) {
+    let entries: Vec<(DimBlockPos, PendingBlockLoot)> = anvil_lock(pending_block_loot())
         .iter()
-        .filter(|&(&(d, x, _, z), _)| d == dim && in_chunk(x, z))
+        .filter(|&(&(d, x, _, z), _)| d == dim && anvil_in_chunk(cx, cz, x, z))
         .map(|(key, loot)| (*key, loot.clone()))
         .collect();
-    for ((_, x, y, z), loot) in loot_entries {
+    for ((_, x, y, z), loot) in entries {
         if items_at.contains(&(x, y, z)) {
             continue;
         }
         let id = live_chunk_be_id(dim, x, y, z, "minecraft:chest");
-        let Some(fields) = anvil_be_fields(&mut by_pos, x, y, z, &id) else {
+        let Some(fields) = anvil_be_fields(by_pos, x, y, z, &id) else {
             continue;
         };
-        fields.insert(
-            crate::nbt::NbtString::text("LootTable"),
-            anvil_s(&loot.loot_table),
-        );
+        anvil_put(fields, "LootTable", anvil_s(&loot.loot_table));
         if let Some(seed) = loot.loot_seed {
-            fields.insert(
-                crate::nbt::NbtString::text("LootTableSeed"),
-                AnvilNbt::Long(seed),
-            );
+            anvil_put(fields, "LootTableSeed", AnvilNbt::Long(seed));
         }
     }
-    by_pos.into_values().collect()
 }
 
 /// A live brewing stand rebuilt from its vanilla `Items`/`BrewTime`/`Fuel`
@@ -3954,16 +4034,8 @@ fn live_brewing_stand_from_nbt(entity: &AnvilNbt, slots: &HashMap<i16, Stack>) -
             ],
             ingredient,
             blaze_powder: menu_slots[4].1,
-            fuel: entity
-                .get("Fuel")
-                .and_then(nbt_int_val)
-                .unwrap_or(0)
-                .clamp(0, i64::from(u8::MAX)) as u8,
-            brew_time: entity
-                .get("BrewTime")
-                .and_then(nbt_int_val)
-                .unwrap_or(0)
-                .clamp(0, i64::from(u16::MAX)) as u16,
+            fuel: anvil_num(entity, "Fuel", 0).clamp(0, i64::from(u8::MAX)) as u8,
+            brew_time: anvil_num(entity, "BrewTime", 0).clamp(0, i64::from(u16::MAX)) as u16,
             active_ingredient: None,
         },
         menu: BrewingMenu { slots: menu_slots },
@@ -4015,16 +4087,14 @@ fn flush_single_chunk_to_anvil_dir_outcome(
     let (existing, on_disk) = read_region_file_selected(&region_path, &wanted)?;
     let overlay = world().get_cloned(&(dim, cx, cz)).unwrap_or_default();
     let flushed = overlay.len();
-    let chunk = AnvilChunk {
+    let chunk = anvil_live_chunk(
+        dim,
         cx,
         cz,
-        data_version: ANVIL_DATA_VERSION,
-        status: "minecraft:full".to_string(),
-        sections: anvil_export_sections(dim, cx, cz, &overlay),
-        block_entities: evict_chunk_block_entities(dim, cx, cz),
-        unknown_states: 0,
-        dropped_sections: 0,
-    };
+        ANVIL_DATA_VERSION,
+        &overlay,
+        evict_chunk_block_entities(dim, cx, cz),
+    );
     let fresh_nbt = anvil_chunk_to_nbt(dim, &chunk, dim.min_y() >> 4);
     let fresh_hash = anvil_nbt_fingerprint(&fresh_nbt);
     let key: AnvilPersistedKey = (dir.to_path_buf(), dim, cx, cz);
@@ -4034,9 +4104,7 @@ fn flush_single_chunk_to_anvil_dir_outcome(
         skipped_unchanged: false,
     };
     {
-        let mut hashes = anvil_persisted_hashes()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut hashes = anvil_lock(anvil_persisted_hashes());
         if anvil_payload_unchanged(
             key.clone(),
             fresh_hash,
@@ -4073,7 +4141,6 @@ fn flush_single_chunk_to_anvil_dir_outcome(
 /// treatment `apply_anvil_import` gives an imported chunk.
 #[allow(dead_code)]
 fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
-    use crate::generation_payload::ContainerKind;
     for entity in entities {
         let (Some(x), Some(y), Some(z)) = (
             anvil_i32(entity, "x"),
@@ -4084,103 +4151,106 @@ fn apply_chunk_block_entities(dim: DimId, entities: &[AnvilNbt]) {
         };
         let key: DimBlockPos = (dim, x, y, z);
         let id = anvil_str(entity, "id").unwrap_or_default();
-        anvil_block_entities()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, entity.clone());
+        anvil_lock(anvil_block_entities()).insert(key, entity.clone());
         if id.ends_with(":sign") || id.ends_with(":hanging_sign") {
-            let mut sign_map = signs().lock().unwrap_or_else(|e| e.into_inner());
-            let front = anvil_sign_lines(entity.get("front_text"));
-            if front.iter().any(|line| !line.is_empty()) {
-                sign_map.insert((dim, x, y, z, 1), front);
-            }
-            let back = anvil_sign_lines(entity.get("back_text"));
-            if back.iter().any(|line| !line.is_empty()) {
-                sign_map.insert((dim, x, y, z, 0), back);
-            }
-            drop(sign_map);
-            let side_meta = |side: Option<&AnvilNbt>| SignSideMeta {
-                color: side
-                    .and_then(|s| anvil_str(s, "color"))
-                    .unwrap_or_else(|| "black".to_string()),
-                has_glowing_text: side
-                    .and_then(|s| s.get("has_glowing_text"))
-                    .and_then(nbt_int_val)
-                    .unwrap_or(0)
-                    != 0,
-            };
-            let meta = SignBlockMeta {
-                front: side_meta(entity.get("front_text")),
-                back: side_meta(entity.get("back_text")),
-                is_waxed: entity.get("is_waxed").and_then(nbt_int_val).unwrap_or(0) != 0,
-            };
-            sign_meta()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert((dim, x, y, z), meta);
+            apply_chunk_sign(key, entity);
         }
         let _ = restore_live_block_entity(key, entity);
-        let mut items_owned = false;
-        if let Some(items) = entity.get("Items") {
-            if let Ok(slots) = items_nbt_to_stacks(items) {
-                items_owned = match ContainerKind::for_block(&id) {
-                    Some(ContainerKind::Furnace) => {
-                        furnaces().lock().unwrap_or_else(|e| e.into_inner()).insert(
-                            key,
-                            Furnace {
-                                input: slots.get(&0).cloned().unwrap_or_default(),
-                                fuel: slots.get(&1).cloned().unwrap_or_default(),
-                                output: slots.get(&2).cloned().unwrap_or_default(),
-                                burn_left: entity.get("BurnTime").and_then(nbt_int_val).unwrap_or(0)
-                                    as i32,
-                                progress: entity.get("CookTime").and_then(nbt_int_val).unwrap_or(0)
-                                    as i32,
-                                dirty: false,
-                                xp: 0.0,
-                                recipe_cache: CachedLookup::default(),
-                                fuel_cache: CachedLookup::default(),
-                            },
-                        );
-                        wake_furnace_at(key.0, key.1, key.2, key.3);
-                        true
-                    }
-                    Some(_) => {
-                        chests()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(ContainerKey::Block(key), slots);
-                        true
-                    }
-                    None if id == "minecraft:brewing_stand" => {
-                        live_brewing_stands()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(key, live_brewing_stand_from_nbt(entity, &slots));
-                        true
-                    }
-                    None => false,
-                };
-            }
-        }
         // A `LootTable` next to materialized `Items` was already rolled: the
         // live container owns the cell, so only an Items-less record restores
         // a pending roll.
-        if !items_owned {
-            if let Some(table) = anvil_str(entity, "LootTable") {
-                pending_block_loot()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        key,
-                        PendingBlockLoot {
-                            kind: ContainerKind::for_block(&id).unwrap_or(ContainerKind::Chest),
-                            loot_table: table,
-                            loot_seed: anvil_i64(entity, "LootTableSeed"),
-                        },
-                    );
-            }
+        if !apply_chunk_container(key, &id, entity) {
+            apply_chunk_loot(key, &id, entity);
         }
     }
+}
+
+/// Re-home one sign/hanging-sign record's front/back text and flags.
+fn apply_chunk_sign(key: DimBlockPos, entity: &AnvilNbt) {
+    let (dim, x, y, z) = key;
+    let mut sign_map = anvil_lock(signs());
+    let front = anvil_sign_lines(entity.get("front_text"));
+    if front.iter().any(|line| !line.is_empty()) {
+        sign_map.insert((dim, x, y, z, 1), front);
+    }
+    let back = anvil_sign_lines(entity.get("back_text"));
+    if back.iter().any(|line| !line.is_empty()) {
+        sign_map.insert((dim, x, y, z, 0), back);
+    }
+    drop(sign_map);
+    let side_meta = |side: Option<&AnvilNbt>| SignSideMeta {
+        color: side
+            .and_then(|s| anvil_str(s, "color"))
+            .unwrap_or_else(|| "black".to_string()),
+        has_glowing_text: side
+            .map(|s| anvil_num(s, "has_glowing_text", 0))
+            .unwrap_or(0)
+            != 0,
+    };
+    let meta = SignBlockMeta {
+        front: side_meta(entity.get("front_text")),
+        back: side_meta(entity.get("back_text")),
+        is_waxed: anvil_num(entity, "is_waxed", 0) != 0,
+    };
+    anvil_lock(sign_meta()).insert((dim, x, y, z), meta);
+}
+
+/// Hand one record's `Items` to the store its container kind owns; `false` when
+/// no store took them (an unknown kind or no parseable `Items`).
+fn apply_chunk_container(key: DimBlockPos, id: &str, entity: &AnvilNbt) -> bool {
+    use crate::generation_payload::ContainerKind;
+    let Some(items) = entity.get("Items") else {
+        return false;
+    };
+    let Ok(slots) = items_nbt_to_stacks(items) else {
+        return false;
+    };
+    match ContainerKind::for_block(id) {
+        Some(ContainerKind::Furnace) => {
+            anvil_lock(furnaces()).insert(
+                key,
+                Furnace {
+                    input: slots.get(&0).cloned().unwrap_or_default(),
+                    fuel: slots.get(&1).cloned().unwrap_or_default(),
+                    output: slots.get(&2).cloned().unwrap_or_default(),
+                    burn_left: anvil_num(entity, "BurnTime", 0) as i32,
+                    progress: anvil_num(entity, "CookTime", 0) as i32,
+                    dirty: false,
+                    xp: 0.0,
+                    recipe_cache: CachedLookup::default(),
+                    fuel_cache: CachedLookup::default(),
+                },
+            );
+            wake_furnace_at(key.0, key.1, key.2, key.3);
+            true
+        }
+        Some(_) => {
+            anvil_lock(chests()).insert(ContainerKey::Block(key), slots);
+            true
+        }
+        None if id == "minecraft:brewing_stand" => {
+            anvil_lock(live_brewing_stands())
+                .insert(key, live_brewing_stand_from_nbt(entity, &slots));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Restore one unspent `LootTable` for a position no live container owns.
+fn apply_chunk_loot(key: DimBlockPos, id: &str, entity: &AnvilNbt) {
+    use crate::generation_payload::ContainerKind;
+    let Some(table) = anvil_str(entity, "LootTable") else {
+        return;
+    };
+    anvil_lock(pending_block_loot()).insert(
+        key,
+        PendingBlockLoot {
+            kind: ContainerKind::for_block(id).unwrap_or(ContainerKind::Chest),
+            loot_table: table,
+            loot_seed: anvil_i64(entity, "LootTableSeed"),
+        },
+    );
 }
 
 /// Re-hydrate one chunk from `dir`'s vanilla region file: the stored sections
@@ -4790,20 +4860,17 @@ mod anvil_io_tests {
     impl AnvilWorldFixture {
         fn capture(sign_keys: &[SignKey]) -> Self {
             let w = world().read_all();
-            let s = signs().lock().unwrap_or_else(|e| e.into_inner());
+            let s = anvil_lock(signs());
             Self {
                 seed: WORLD_SEED.load(Ordering::Relaxed),
-                spawn: *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
+                spawn: *anvil_lock(&WORLD_SPAWN),
                 time: WORLD_TIME.load(Ordering::Relaxed),
                 difficulty: DIFFICULTY.load(Ordering::Relaxed),
                 raining: RAINING.load(Ordering::Relaxed),
                 thundering: THUNDERING.load(Ordering::Relaxed),
                 game_mode: DEFAULT_GAME_MODE.load(Ordering::Relaxed),
-                border: *world_border().lock().unwrap_or_else(|e| e.into_inner()),
-                rules: command_gamerules()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                border: *anvil_lock(world_border()),
+                rules: anvil_lock(command_gamerules()).clone(),
                 rule_keep: GR_KEEP_INVENTORY.load(Ordering::Relaxed),
                 rule_day: GR_DAYLIGHT_CYCLE.load(Ordering::Relaxed),
                 rule_weather: GR_WEATHER_CYCLE.load(Ordering::Relaxed),
@@ -4813,10 +4880,7 @@ mod anvil_io_tests {
                 rule_loot: GR_MOB_LOOT.load(Ordering::Relaxed),
                 rule_cram: GR_MAX_ENTITY_CRAMMING.load(Ordering::Relaxed),
                 world_snapshot: w.to_map(),
-                entities: anvil_block_entities()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                entities: anvil_lock(anvil_block_entities()).clone(),
                 sign_entries: sign_keys.iter().map(|&k| (k, s.get(&k).cloned())).collect(),
             }
         }
@@ -4825,20 +4889,18 @@ mod anvil_io_tests {
     impl std::ops::Drop for AnvilWorldFixture {
         fn drop(&mut self) {
             WORLD_SEED.store(self.seed, Ordering::Relaxed);
-            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = self.spawn;
+            *anvil_lock(&WORLD_SPAWN) = self.spawn;
             WORLD_TIME.store(self.time, Ordering::Relaxed);
             DIFFICULTY.store(self.difficulty, Ordering::Relaxed);
             RAINING.store(self.raining, Ordering::Relaxed);
             THUNDERING.store(self.thundering, Ordering::Relaxed);
             DEFAULT_GAME_MODE.store(self.game_mode, Ordering::Relaxed);
-            *world_border().lock().unwrap_or_else(|e| e.into_inner()) = self.border;
+            *anvil_lock(world_border()) = self.border;
             let restored = std::mem::take(&mut self.rules);
             for (&name, &val) in &restored {
                 gamerule_atomic_store(name, val);
             }
-            *command_gamerules()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = restored;
+            *anvil_lock(command_gamerules()) = restored;
             GR_KEEP_INVENTORY.store(self.rule_keep, Ordering::Relaxed);
             GR_DAYLIGHT_CYCLE.store(self.rule_day, Ordering::Relaxed);
             GR_WEATHER_CYCLE.store(self.rule_weather, Ordering::Relaxed);
@@ -4848,10 +4910,8 @@ mod anvil_io_tests {
             GR_MOB_LOOT.store(self.rule_loot, Ordering::Relaxed);
             GR_MAX_ENTITY_CRAMMING.store(self.rule_cram, Ordering::Relaxed);
             world().restore_all(std::mem::take(&mut self.world_snapshot));
-            *anvil_block_entities()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.entities);
-            let mut s = signs().lock().unwrap_or_else(|e| e.into_inner());
+            *anvil_lock(anvil_block_entities()) = std::mem::take(&mut self.entities);
+            let mut s = anvil_lock(signs());
             for (key, entry) in self.sign_entries.drain(..) {
                 match entry {
                     Some(lines) => {
@@ -4891,11 +4951,8 @@ mod anvil_io_tests {
             w.insert(nether, HashMap::from([(local_idx(2, 40, 3), netherrack)]));
             w.insert(end, HashMap::from([(local_idx(4, 50, 5), end_stone)]));
         }
-        anvil_block_entities()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        signs().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        anvil_lock(anvil_block_entities()).clear();
+        anvil_lock(signs()).insert(
             sign_key,
             [
                 "first".into(),
@@ -4905,23 +4962,17 @@ mod anvil_io_tests {
             ],
         );
         WORLD_SEED.store(0x1234_5678_9abc_def0, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (12.5, 72.0, -34.5, 45.0);
+        *anvil_lock(&WORLD_SPAWN) = (12.5, 72.0, -34.5, 45.0);
         WORLD_TIME.store(131_000, Ordering::Relaxed);
         DIFFICULTY.store(3, Ordering::Relaxed);
         RAINING.store(5_000, Ordering::Relaxed);
         THUNDERING.store(300, Ordering::Relaxed);
-        command_gamerules()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert("keepInventory", 1);
+        anvil_lock(command_gamerules()).insert("keepInventory", 1);
         GR_KEEP_INVENTORY.store(1, Ordering::Relaxed);
-        command_gamerules()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert("randomTickSpeed", 9);
+        anvil_lock(command_gamerules()).insert("randomTickSpeed", 9);
         gamerule_atomic_store("randomTickSpeed", 9);
         {
-            let mut border = world_border().lock().unwrap_or_else(|e| e.into_inner());
+            let mut border = anvil_lock(world_border());
             border.center_x = 100.5;
             border.center_z = -20.25;
             border.old_size = 8_000.0;
@@ -5032,29 +5083,16 @@ mod anvil_io_tests {
         assert_eq!(overlay_block_dim(DimId::Nether, 2, 40, 3), Some(netherrack));
         assert_eq!(overlay_block_dim(DimId::End, 4, 50, 5), Some(end_stone));
         assert_eq!(WORLD_SEED.load(Ordering::Relaxed), 0x1234_5678_9abc_def0);
-        assert_eq!(
-            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
-            (12.5, 72.0, -34.5, 45.0)
-        );
+        assert_eq!(*anvil_lock(&WORLD_SPAWN), (12.5, 72.0, -34.5, 45.0));
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 131_000);
         assert_eq!(DIFFICULTY.load(Ordering::Relaxed), 3);
         assert_eq!(RAINING.load(Ordering::Relaxed), 5_000);
         assert_eq!(THUNDERING.load(Ordering::Relaxed), 300);
-        assert_eq!(
-            command_gamerules()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())["keepInventory"],
-            1
-        );
+        assert_eq!(anvil_lock(command_gamerules())["keepInventory"], 1);
         assert_eq!(GR_KEEP_INVENTORY.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            command_gamerules()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())["randomTickSpeed"],
-            9
-        );
+        assert_eq!(anvil_lock(command_gamerules())["randomTickSpeed"], 9);
         {
-            let b = *world_border().lock().unwrap_or_else(|e| e.into_inner());
+            let b = *anvil_lock(world_border());
             assert_eq!(
                 (b.center_x, b.center_z, b.new_size),
                 (100.5, -20.25, 8_000.0)
@@ -5062,13 +5100,10 @@ mod anvil_io_tests {
             assert_eq!((b.warning_blocks, b.warning_time_secs), (10, 20));
         }
         assert_eq!(
-            signs().lock().unwrap_or_else(|e| e.into_inner())[&sign_key][..2],
+            anvil_lock(signs())[&sign_key][..2],
             ["first".to_string(), "second".to_string()]
         );
-        assert!(anvil_block_entities()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&(DimId::Overworld, 3, 80, 3)));
+        assert!(anvil_lock(anvil_block_entities()).contains_key(&(DimId::Overworld, 3, 80, 3)));
 
         // Second cycle: export the now-applied world and re-import it; both the
         // blocks and the sign entity survive a full export -> import -> export
@@ -5415,7 +5450,7 @@ mod anvil_io_tests {
             );
         }
         WORLD_SEED.store(0x0123_4567_89ab_cdef, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (8.5, 65.0, -3.5, 90.0);
+        *anvil_lock(&WORLD_SPAWN) = (8.5, 65.0, -3.5, 90.0);
         WORLD_TIME.store(77_000, Ordering::Relaxed);
 
         let dir = anvil_tmp_dir("live-rt");
@@ -5436,7 +5471,7 @@ mod anvil_io_tests {
         // Wipe live state, then the load must bring it all back.
         world().clear();
         WORLD_SEED.store(0, Ordering::Relaxed);
-        *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()) = (0.5, 0.0, 0.5, 0.0);
+        *anvil_lock(&WORLD_SPAWN) = (0.5, 0.0, 0.5, 0.0);
         WORLD_TIME.store(0, Ordering::Relaxed);
         let load = live_anvil_load_dir(&dir).unwrap();
         assert!(!load.initialized);
@@ -5453,10 +5488,7 @@ mod anvil_io_tests {
         );
         assert_eq!(overlay_block_dim(DimId::End, 4, 50, -5), Some(end_stone));
         assert_eq!(WORLD_SEED.load(Ordering::Relaxed), 0x0123_4567_89ab_cdef);
-        assert_eq!(
-            *WORLD_SPAWN.lock().unwrap_or_else(|e| e.into_inner()),
-            (8.5, 65.0, -3.5, 90.0)
-        );
+        assert_eq!(*anvil_lock(&WORLD_SPAWN), (8.5, 65.0, -3.5, 90.0));
         assert_eq!(WORLD_TIME.load(Ordering::Relaxed), 77_000);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5623,10 +5655,7 @@ mod anvil_io_tests {
                 forced: true,
             }),
         };
-        saved_players()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(uuid, save.clone());
+        anvil_lock(saved_players()).insert(uuid, save.clone());
 
         let written = live_anvil_save_dir(&dir).unwrap();
         assert_eq!(written.players_written, 1);
@@ -5639,15 +5668,10 @@ mod anvil_io_tests {
         assert!(!file.with_extension("tmp").exists());
 
         // Fresh state: the reload must restore every field from disk alone.
-        saved_players()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        anvil_lock(saved_players()).clear();
         let loaded = live_anvil_load_dir(&dir).unwrap();
         assert_eq!(loaded.players_loaded, 1);
-        let restored = saved_players()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let restored = anvil_lock(saved_players())
             .get(&uuid)
             .cloned()
             .expect("player restored");
@@ -5707,10 +5731,7 @@ mod anvil_io_tests {
             load_all_playerdata_dat(&dir).is_err(),
             "corrupt .dat fails closed"
         );
-        assert!(saved_players()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty());
+        assert!(anvil_lock(saved_players()).is_empty());
         // Remove the corrupt file; the malformed name stays and is skipped.
         std::fs::remove_file(playerdata.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.dat")).unwrap();
         // A malformed uuid name is skipped rather than misfiled.
@@ -5926,10 +5947,7 @@ mod anvil_io_tests {
             }
         }
         // A tight budget forces multi-tick drainage.
-        anvil_incremental_saves()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .budget = IncrementalSaveBudget {
+        anvil_lock(anvil_incremental_saves()).budget = IncrementalSaveBudget {
             max_chunks_per_tick: 1,
             max_bytes_per_tick: usize::MAX,
         };
@@ -5962,21 +5980,12 @@ mod anvil_io_tests {
         assert_eq!(skipped, flushed, "every drain of an unchanged chunk skips");
         assert_eq!(bytes, 0, "skipped chunks commit zero bytes");
         // Restore the default budget for other tests sharing the process.
-        anvil_incremental_saves()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .budget = IncrementalSaveBudget::default();
+        anvil_lock(anvil_incremental_saves()).budget = IncrementalSaveBudget::default();
         // A full save after partial queue work drains everything and clears
         // the queue.
         let save = live_anvil_save_dir(&dir).unwrap();
         assert!(save.chunks_written <= 2);
-        assert_eq!(
-            anvil_incremental_saves()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len(),
-            0
-        );
+        assert_eq!(anvil_lock(anvil_incremental_saves()).len(), 0);
         let region = read_region_file(&dir.join("region").join("r.0.0.mca")).unwrap();
         assert!(region.chunks.contains_key(&(0, 0)));
         assert!(region.chunks.contains_key(&(1, 0)));
@@ -6280,7 +6289,7 @@ mod anvil_dim_tests {
     fn custom_dimension_maps_to_the_vanilla_dimensions_path() {
         let _world = crate::world_guard();
         let _gen = worldgen::lock_gen_for_tests();
-        let _guard = ANVIL_DIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = anvil_lock(&ANVIL_DIM_LOCK);
         worldgen::reset_dimension_registry();
         let sources = vec![worldgen::DatapackDimensionSource::Entries(vec![
             (
@@ -6388,73 +6397,29 @@ mod anvil_lossless_tests {
         fn new() -> Self {
             let _world = crate::world_guard();
             let _gen = worldgen::lock_gen_for_tests();
-            let _dim = ANVIL_LOSSLESS_DIM_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let _dim = anvil_lock(&ANVIL_LOSSLESS_DIM_LOCK);
             worldgen::reset_dimension_registry();
             let fixture = LosslessFixture {
                 world: world().snapshot(),
-                block_entities: anvil_block_entities()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                chunk_preserved: anvil_chunk_preserved()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                tombstones: anvil_block_tombstones()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                player_preserved: anvil_playerdata_preserved()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                saved: saved_players()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                persisted: anvil_persisted_hashes()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                playerdata_hashes: anvil_playerdata_hashes()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
+                block_entities: anvil_lock(anvil_block_entities()).clone(),
+                chunk_preserved: anvil_lock(anvil_chunk_preserved()).clone(),
+                tombstones: anvil_lock(anvil_block_tombstones()).clone(),
+                player_preserved: anvil_lock(anvil_playerdata_preserved()).clone(),
+                saved: anvil_lock(saved_players()).clone(),
+                persisted: anvil_lock(anvil_persisted_hashes()).clone(),
+                playerdata_hashes: anvil_lock(anvil_playerdata_hashes()).clone(),
                 _world,
                 _gen,
                 _dim,
             };
             world().clear();
-            anvil_block_entities()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            anvil_chunk_preserved()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            anvil_block_tombstones()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            anvil_playerdata_preserved()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            saved_players()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            anvil_persisted_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
-            anvil_playerdata_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clear();
+            anvil_lock(anvil_block_entities()).clear();
+            anvil_lock(anvil_chunk_preserved()).clear();
+            anvil_lock(anvil_block_tombstones()).clear();
+            anvil_lock(anvil_playerdata_preserved()).clear();
+            anvil_lock(saved_players()).clear();
+            anvil_lock(anvil_persisted_hashes()).clear();
+            anvil_lock(anvil_playerdata_hashes()).clear();
             fixture
         }
     }
@@ -6462,26 +6427,13 @@ mod anvil_lossless_tests {
     impl std::ops::Drop for LosslessFixture {
         fn drop(&mut self) {
             world().restore_all(std::mem::take(&mut self.world));
-            *anvil_block_entities()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.block_entities);
-            *anvil_chunk_preserved()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.chunk_preserved);
-            *anvil_block_tombstones()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.tombstones);
-            *anvil_playerdata_preserved()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.player_preserved);
-            *saved_players().lock().unwrap_or_else(|e| e.into_inner()) =
-                std::mem::take(&mut self.saved);
-            *anvil_persisted_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.persisted);
-            *anvil_playerdata_hashes()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut self.playerdata_hashes);
+            *anvil_lock(anvil_block_entities()) = std::mem::take(&mut self.block_entities);
+            *anvil_lock(anvil_chunk_preserved()) = std::mem::take(&mut self.chunk_preserved);
+            *anvil_lock(anvil_block_tombstones()) = std::mem::take(&mut self.tombstones);
+            *anvil_lock(anvil_playerdata_preserved()) = std::mem::take(&mut self.player_preserved);
+            *anvil_lock(saved_players()) = std::mem::take(&mut self.saved);
+            *anvil_lock(anvil_persisted_hashes()) = std::mem::take(&mut self.persisted);
+            *anvil_lock(anvil_playerdata_hashes()) = std::mem::take(&mut self.playerdata_hashes);
             worldgen::reset_dimension_registry();
         }
     }
