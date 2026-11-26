@@ -73,7 +73,7 @@ use megu_ui::container_screen::{
 };
 use megu_ui::draw::tessellate_draw_list;
 use megu_ui::draw::{text_width, UiColor, UiCommand, UiDrawList, UiRect};
-use megu_ui::gui_bridge::{lower_bridge_batch_to_draw_cmds, GuiBridgeBatch};
+use megu_ui::gui_bridge::{lower_bridge_batch_to_draw_list, GuiBridgeBatch};
 use megu_ui::hud_widgets::{F3DebugOverlay, ScoreboardEntry};
 use megu_ui::magic_hud::build_magic_hud_draw_list;
 use megu_ui::magic_hud::LookingAtBlockState;
@@ -1664,10 +1664,10 @@ pub struct GpuApp {
     /// cadence keeps `/proc` reads cheap.
     f3_metrics_probe: CpuSampler,
     /// `true` once the local-Minecraft font probe produced a
-    /// `GlyphAtlas` (Unifont and/or `ascii.png`) and installed it —
-    /// retried while `false` so a late bootstrap download can still
-    /// deliver the assets.
-    vanilla_fonts_loaded: bool,
+    /// `GlyphAtlas` components installed; each stays retryable until its
+    /// own late bootstrap asset arrives.
+    vanilla_ascii_loaded: bool,
+    vanilla_unifont_loaded: bool,
     /// Mouse deltas accumulated while the loop slept, applied once
     /// immediately before `render_frame` derives the view camera — the
     /// late-latch: input sampled as close to the draw as possible.
@@ -2251,7 +2251,8 @@ impl GpuApp {
             f3_overlay: F3DebugOverlay::default(),
             f3_overlay_built: None,
             f3_metrics_probe: CpuSampler::new(),
-            vanilla_fonts_loaded: false,
+            vanilla_ascii_loaded: false,
+            vanilla_unifont_loaded: false,
             pending_mouse_delta: (0.0, 0.0),
             last_subworld_helm: None,
             live_strategy_pending: true,
@@ -2744,21 +2745,18 @@ impl GpuApp {
         self.player_skin_cache.as_ref()?.get_skin(uuid)
     }
 
-    /// One-shot local-Minecraft font probe: installs the shared
-    /// `GlyphAtlas` (Unifont `.hex` + vanilla `ascii.png`) when a local
-    /// 1.21.1 install yields one; retries while `vanilla_fonts_loaded`
-    /// is `false` so a late bootstrap download can still deliver the
-    /// assets. Never blocks, never errors — `None` keeps the built-in
-    /// fonts.
+    /// Probe until both independent Minecraft font components are ready.
+    /// A partial ASCII result must not suppress a later Unifont load.
     fn maybe_load_vanilla_fonts(&mut self) {
-        if self.vanilla_fonts_loaded {
+        if self.vanilla_ascii_loaded && self.vanilla_unifont_loaded {
             return;
         }
-        if let Some(atlas) =
-            crate::vanilla_font::try_load_local_minecraft_fonts(&self.session_paths)
+        if let Some(load) =
+            crate::vanilla_font::try_load_local_minecraft_fonts_detailed(&self.session_paths)
         {
-            megu_ui::font_cjk::install_external_font(atlas);
-            self.vanilla_fonts_loaded = true;
+            self.vanilla_ascii_loaded |= load.ascii_ready();
+            self.vanilla_unifont_loaded |= load.unifont_ready();
+            megu_ui::font_cjk::install_external_font(load.into_atlas());
         }
     }
 
@@ -6936,6 +6934,21 @@ impl GpuApp {
         self.set_cursor_grab(false);
     }
 
+    /// Open a signed book in the read-only page viewer.
+    pub fn open_written_book_viewer(
+        &mut self,
+        slot: i16,
+        pages: Vec<String>,
+        title: impl Into<String>,
+        author: impl Into<String>,
+    ) {
+        self.book_editor = Some(megu_ui::gameplay_screens::BookEditorState::new_written(
+            slot, pages, title, author,
+        ));
+        self.clear_gameplay_controls();
+        self.set_cursor_grab(false);
+    }
+
     /// Open the local writable-book editor for the selected hotbar stack.
     /// Component decoding is bounded by the protocol's verified component
     /// decoder; no network or disk work occurs on the window thread.
@@ -7767,6 +7780,15 @@ impl GpuApp {
                     }
                     if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
                         && !self.keys.down
+                        && matches!(button_id, 0 | 1)
+                    {
+                        if let Some(action) = screen.drag_start(slot_index, button_id) {
+                            if let Some(live) = &mut self.live {
+                                Self::forward_click_action(live, action);
+                            }
+                        }
+                    } else if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+                        && !self.keys.down
                         && !panel.contains(mx, my)
                     {
                         if let Some(action) = screen.drag_start(-999, button_id) {
@@ -7801,7 +7823,15 @@ impl GpuApp {
                         }
                     }
                 } else if !panel.contains(mx, my) {
-                    if let Some(action) = screen.click_mode(-999, button_id, 0) {
+                    let action = if screen.cursor.as_ref().is_some_and(|stack| !stack.is_empty())
+                        && !self.keys.down
+                        && matches!(button_id, 0 | 1)
+                    {
+                        screen.drag_start(-999, button_id)
+                    } else {
+                        screen.click_mode(-999, button_id, 0)
+                    };
+                    if let Some(action) = action {
                         if let Some(live) = &mut self.live {
                             Self::forward_click_action(live, action);
                         }
@@ -9264,13 +9294,12 @@ impl GpuApp {
         // the mod-overlay layer list (scissor-safe inside the frame's
         // clip), zero cost while no mod recorded ops this frame.
         if !self.gui_bridge_batch.ops.is_empty() {
-            self.ui_modoverlay_list
-                .commands
-                .extend(lower_bridge_batch_to_draw_cmds(
-                    &self.gui_bridge_batch,
-                    w,
-                    h,
-                ));
+            let lowered = lower_bridge_batch_to_draw_list(&self.gui_bridge_batch, w, h);
+            let clips = lowered.command_clips().to_vec();
+            for (index, command) in lowered.commands.into_iter().enumerate() {
+                self.ui_modoverlay_list
+                    .push_with_clip(command, clips.get(index).copied().flatten());
+            }
         }
         // Declarative mod-UI manifest: the shared Vanilla widget kit
         // renders it on the same layer (Vanilla 1.21.1 sprite atlas when
@@ -9301,7 +9330,10 @@ impl GpuApp {
                 ),
             ];
             for (layer, list) in &layer_lists {
-                let fp = fingerprint_draw_list(w, h, list);
+                let mut fp = fingerprint_draw_list(w, h, list);
+                if *layer == megu_core::rev::UiLayer::Screen {
+                    fp ^= crate::vanilla_font::font_revision().wrapping_mul(FNV1A64_PRIME);
+                }
                 if self.ui_layer_fps[layer.index()] != fp {
                     self.ui_layer_fps[layer.index()] = fp;
                     layer.bump(&mut self.ui_layer_bus);
