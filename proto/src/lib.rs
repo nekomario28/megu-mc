@@ -78,6 +78,7 @@
 
 pub mod codec;
 pub mod item_components;
+pub mod mod_wire;
 pub mod channel_router;
 mod data_v767;
 mod data_v777;
