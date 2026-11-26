@@ -338,6 +338,13 @@ impl BlockTable {
             std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
         let mut table = Self::from_json_bytes(&raw)?;
         table.source_path = Some(path.to_path_buf());
+        if let Some(blocks_path) = path.parent().map(|dir| dir.join("blocks_1211.json")) {
+            if blocks_path.is_file() {
+                let blocks_raw = std::fs::read(&blocks_path)
+                    .map_err(|e| format!("failed to read {}: {e}", blocks_path.display()))?;
+                enrich_state_names_from_blocks_json(&mut table.state_names, &blocks_raw)?;
+            }
+        }
         Ok(table)
     }
 
@@ -531,7 +538,7 @@ impl BlockTable {
         if block.flags & TINTED != 0 {
             let kind = if self
                 .state_name(state_id)
-                .is_some_and(|name| name.ends_with("_leaves"))
+                .is_some_and(|name| block_state_base_name(name).ends_with("_leaves"))
             {
                 BiomeTintKind::Foliage
             } else {
@@ -795,6 +802,210 @@ fn classify_builtin(sid: u32) -> (Block, Vec<u16>, FluidCell, bool) {
             false,
         ),
     }
+}
+
+/// Strip the trailing canonical property list from a block-state name.
+///
+/// Block-state ids are often compared only by their owning block type
+/// (`minecraft:oak_stairs`), while enriched canonical names append vanilla
+/// properties (`minecraft:oak_stairs[facing=north,...]`). Every block-type
+/// classification in this module must use this base form.
+pub fn block_state_base_name(name: &str) -> &str {
+    name.split_once('[').map_or(name, |(base, _)| base)
+}
+
+fn canonical_state_name(block_name: &str) -> String {
+    if block_name.contains(':') {
+        block_name.to_owned()
+    } else {
+        format!("minecraft:{block_name}")
+    }
+}
+
+/// Expand the one-name-per-state table loaded from `block_states_1211.json`
+/// into canonical, property-complete vanilla state strings using the sibling
+/// `blocks_1211.json` manifest.
+///
+/// `blocks_1211.json` lists each block's properties in registry Cartesian
+/// order. State zero of a block starts at its first property values; the last
+/// property is the fastest-varying digit (`offset % num_values`), matching the
+/// pinned wire/oracle decoders. Property keys in the emitted string are sorted
+/// lexicographically, exactly like vanilla's canonical `BlockState#toString`
+/// form.
+///
+/// The input asset is depth/size bounded and expansion is capped by the target
+/// state table length, so malformed manifests cannot cause unbounded work.
+/// Returns the number of state names rewritten. Blocks without properties or
+/// outside the target table leave their existing names unchanged.
+pub fn enrich_state_names_from_blocks_json(
+    state_names: &mut [String],
+    blocks_json: &[u8],
+) -> Result<usize, String> {
+    const MAX_BLOCKS_JSON_BYTES: usize = 16 * 1024 * 1024;
+    if blocks_json.len() > MAX_BLOCKS_JSON_BYTES {
+        return Err("blocks_1211.json exceeds the 16 MiB input bound".to_string());
+    }
+    let text = std::str::from_utf8(blocks_json)
+        .map_err(|_| "blocks_1211.json is not valid UTF-8".to_string())?;
+    let limits = megu_core::json::JsonLimits {
+        max_depth: 24,
+        max_nodes: 2_000_000,
+        max_bytes: MAX_BLOCKS_JSON_BYTES,
+    };
+    let root = megu_core::json::parse_json_with_limits(text, limits, false)
+        .map_err(|e| format!("blocks_1211.json: {e}"))?;
+    let blocks = root
+        .as_array()
+        .ok_or_else(|| "blocks_1211.json: top level is not an array".to_string())?;
+
+    let mut rewritten = 0usize;
+    for (block_index, entry) in blocks.iter().enumerate() {
+        let object = entry
+            .as_object()
+            .ok_or_else(|| format!("blocks_1211.json: entry {block_index} is not an object"))?;
+        let get_field = |key: &str| {
+            object
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value)
+        };
+        let raw_name = get_field("name")
+            .and_then(megu_core::json::JsonValue::as_str)
+            .ok_or_else(|| format!("blocks_1211.json: entry {block_index} has no string name"))?;
+        let min_state = get_field("minStateId")
+            .and_then(megu_core::json::JsonValue::as_f64)
+            .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= u32::MAX as f64)
+            .ok_or_else(|| format!("blocks_1211.json: {raw_name} has a bad minStateId"))?
+            as u32;
+        let max_state = get_field("maxStateId")
+            .and_then(megu_core::json::JsonValue::as_f64)
+            .filter(|n| n.fract() == 0.0 && *n >= 0.0 && *n <= u32::MAX as f64)
+            .ok_or_else(|| format!("blocks_1211.json: {raw_name} has a bad maxStateId"))?
+            as u32;
+        if max_state < min_state {
+            return Err(format!(
+                "blocks_1211.json: {raw_name} maxStateId is below minStateId"
+            ));
+        }
+        let state_len = u64::from(max_state) - u64::from(min_state) + 1;
+        let Some(properties_value) = get_field("states") else {
+            continue;
+        };
+        let properties = properties_value
+            .as_array()
+            .ok_or_else(|| format!("blocks_1211.json: {raw_name} states is not an array"))?;
+        if properties.is_empty() {
+            continue;
+        }
+
+        let mut decoded = Vec::with_capacity(properties.len());
+        let mut expected_len = 1u64;
+        for (property_index, property) in properties.iter().enumerate() {
+            let property_object = property.as_object().ok_or_else(|| {
+                format!("blocks_1211.json: {raw_name} states[{property_index}] is not an object")
+            })?;
+            let property_field = |key: &str| {
+                property_object
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value)
+            };
+            let property_name = property_field("name")
+                .and_then(megu_core::json::JsonValue::as_str)
+                .ok_or_else(|| {
+                    format!("blocks_1211.json: {raw_name} states[{property_index}] has no name")
+                })?
+                .to_owned();
+            let values = property_field("values")
+                .and_then(megu_core::json::JsonValue::as_array)
+                .ok_or_else(|| {
+                    format!("blocks_1211.json: {raw_name}.{property_name} has no values array")
+                })?;
+            if values.is_empty() || values.len() > 4096 {
+                return Err(format!(
+                    "blocks_1211.json: {raw_name}.{property_name} has an unsupported value count"
+                ));
+            }
+            if let Some(num_values) = property_field("num_values")
+                .and_then(megu_core::json::JsonValue::as_f64)
+                .filter(|n| n.fract() == 0.0 && *n >= 1.0)
+            {
+                if num_values as usize != values.len() {
+                    return Err(format!(
+                        "blocks_1211.json: {raw_name}.{property_name} num_values disagrees with values"
+                    ));
+                }
+            }
+            let mut names = Vec::with_capacity(values.len());
+            for value in values {
+                // minecraft-data writes most values as strings, but integer
+                // properties may be numeric JSON values depending on export
+                // lineage. Canonical state strings use bare scalar text.
+                let text = match value {
+                    megu_core::json::JsonValue::String(text) => text.clone(),
+                    megu_core::json::JsonValue::Bool(value) => value.to_string(),
+                    megu_core::json::JsonValue::Number(value) if value.is_finite() => {
+                        if value.fract() == 0.0 && value.abs() <= i64::MAX as f64 {
+                            (*value as i64).to_string()
+                        } else {
+                            value.to_string()
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "blocks_1211.json: {raw_name}.{property_name} value is not scalar"
+                        ));
+                    }
+                };
+                names.push(text);
+            }
+            expected_len = expected_len
+                .checked_mul(names.len() as u64)
+                .ok_or_else(|| format!("blocks_1211.json: {raw_name} state count overflows"))?;
+            if expected_len > state_len.max(1) && expected_len > state_names.len() as u64 {
+                return Err(format!(
+                    "blocks_1211.json: {raw_name} state count exceeds its input bounds"
+                ));
+            }
+            decoded.push((property_name, names));
+        }
+        if expected_len != state_len {
+            return Err(format!(
+                "blocks_1211.json: {raw_name} property product {expected_len} does not match state span {state_len}"
+            ));
+        }
+
+        let base_name = canonical_state_name(raw_name);
+        for offset in 0..state_len {
+            let state = min_state.saturating_add(offset as u32) as usize;
+            if state >= state_names.len() {
+                break;
+            }
+            let mut remaining = offset;
+            let mut pairs = Vec::with_capacity(decoded.len());
+            for (property_name, values) in decoded.iter().rev() {
+                let index = (remaining % values.len() as u64) as usize;
+                remaining /= values.len() as u64;
+                pairs.push((property_name.as_str(), values[index].as_str()));
+            }
+            pairs.sort_unstable_by_key(|(name, _)| *name);
+            let mut canonical = String::with_capacity(base_name.len() + 2 + decoded.len() * 20);
+            canonical.push_str(&base_name);
+            canonical.push('[');
+            for (index, (property, value)) in pairs.iter().enumerate() {
+                if index != 0 {
+                    canonical.push(',');
+                }
+                canonical.push_str(property);
+                canonical.push('=');
+                canonical.push_str(value);
+            }
+            canonical.push(']');
+            state_names[state] = canonical;
+            rewritten += 1;
+        }
+    }
+    Ok(rewritten)
 }
 
 // ---------------------------------------------------------------------------
@@ -2476,7 +2687,11 @@ impl WorldState {
         if previous != Some(clamped)
             && !previous
                 .and_then(|state| self.blocks.state_name(state))
-                .is_some_and(|name| Some(name) == self.blocks.state_name(clamped))
+                .is_some_and(|name| {
+                    self.blocks.state_name(clamped).is_some_and(|current| {
+                        block_state_base_name(name) == block_state_base_name(current)
+                    })
+                })
         {
             self.block_entities.remove(&pos);
             self.block_entity_visual_nbt.remove(&pos);
@@ -3140,8 +3355,9 @@ impl WorldState {
                     .and_then(|state| self.blocks.state_name(state))
             })
             .unwrap_or("");
+        let block_base_name = block_state_base_name(block_name);
         let Some(tracked) = tracked else {
-            return block_name
+            return block_base_name
                 .contains("piston")
                 .then(|| BlockEntityVisualState::Piston {
                     extending: action == Some(0),
@@ -3160,8 +3376,8 @@ impl WorldState {
                         .and_then(|value| u8::try_from(value).ok())
                         .unwrap_or(0)
                 },
-                trapped: id_tail == "trapped_chest" || block_name.ends_with("trapped_chest"),
-                ender: id_tail == "ender_chest" || block_name.ends_with("ender_chest"),
+                trapped: id_tail == "trapped_chest" || block_base_name.ends_with("trapped_chest"),
+                ender: id_tail == "ender_chest" || block_base_name.ends_with("ender_chest"),
             },
             "shulker_box"
             | "white_shulker_box"
@@ -3191,7 +3407,7 @@ impl WorldState {
                     .and_then(|value| nbt_i32(value, "Color"))
                     .and_then(|value| u8::try_from(value).ok())
                     .or_else(|| {
-                        let color = block_name
+                        let color = block_base_name
                             .rsplit(':')
                             .next()?
                             .strip_suffix("_shulker_box")?;
@@ -3301,7 +3517,7 @@ impl WorldState {
                     })
                     .unwrap_or(0),
             },
-            _ if block_name.contains("piston") => BlockEntityVisualState::Piston {
+            _ if block_base_name.contains("piston") => BlockEntityVisualState::Piston {
                 extending: action == Some(0),
                 facing: parameter,
             },

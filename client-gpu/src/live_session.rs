@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use megu_client::audio_out::{
@@ -31,7 +32,10 @@ use megu_client::render::ClientVfxHost;
 use megu_client::render_graph::GpuPipelineKind;
 use megu_client::session::{AudioStats, DeathLoopState, WorldAcousticSnapshot};
 use megu_client::spatial_audio::{SpatialAudioPreset, SpatialSubtitleCue, SubtitleDirection};
-use megu_client::world::{pack_vertices, sort_translucent, BlockTable, WorldState};
+use megu_client::world::{
+    block_state_base_name, pack_vertices, sort_translucent, BlockAtlasSpriteLookup, BlockTable,
+    WorldState,
+};
 use megu_client_mesh::asset_pipeline::{CompiledAssetBundle, ResourcePackLayer};
 use megu_client_mesh::atlas::{AtlasMip, PackedAtlas, SpriteAnimation, SpritePlacement};
 use megu_client_mesh::builtin_shadow_wgsl::{enchantment_glint_rgb, BuiltinShadowQuality};
@@ -51,14 +55,15 @@ use megu_client_mesh::tactile_effects::{
     EnvironmentAudioHint, FluidEntryEvent, GroundSurfaceKind, ImpactMaterial, LeafCanopyKind,
     NightSkyDrama, TactileEffectsConfig, TactileEffectsSim,
 };
+use megu_client_mesh::vanilla_block_models::VanillaBlockModelCatalog;
 use megu_client_mesh::vanilla_plus_nature::{
     compute_cloud_lighting, generate_layered_voxel_clouds_with_atmosphere, tick_nature_ambience,
     ActiveSeasonKind, CloudLighting, NatureAmbienceEnv, NatureAmbienceState, NatureModRegistry,
     SeasonAmbienceInput, CLOUD_CELL_BLOCKS, CLOUD_SCROLL_BLOCKS_PER_TICK,
 };
 use megu_client_mesh::{
-    box_in_frustum, section_index, BuiltSectionMesh, DirectionBuckets, SectionCoord,
-    DIRECTION_BUCKETS, SECTION_CELLS,
+    box_in_frustum, section_index, BakedTerrainFace, BuiltSectionMesh, DirectionBuckets,
+    SectionCoord, DIRECTION_BUCKETS, SECTION_CELLS,
 };
 use megu_kernel::player_physics::{
     step_player_physics, PlayerInputState, PlayerPhysicsState, SurfaceKind,
@@ -109,7 +114,7 @@ use hw_adaptive_engine::{
 };
 use sys_metrics::{sample_host_metrics, CpuSampler, FrameTimingStats};
 
-use crate::mesh_pool::{MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
+use crate::mesh_pool::{BakedSectionMeshResult, MeshJob, MeshJobPool, MeshResult, SectionMeshLane};
 use crate::renderer::{
     external_packed_digest, translucent_order_digest, ExternalSectionMesh, FirstPersonUseKind,
     FirstPersonViewmodel, GameplayScreenOverlay, GpuRenderer,
@@ -513,11 +518,30 @@ pub(crate) enum WorkerCommand {
         flags: u8,
     },
     ReleaseUseItem,
-    MoveVehicle { x: f64, y: f64, z: f64, yaw: f32, pitch: f32 },
-    PaddleBoat { left: bool, right: bool },
-    PickItem { slot: i32 },
-    CreativeModeSlot { slot: i16, item_id: i32, count: i32 },
-    EditBook { slot: i32, pages: Vec<String>, title: Option<String> },
+    MoveVehicle {
+        x: f64,
+        y: f64,
+        z: f64,
+        yaw: f32,
+        pitch: f32,
+    },
+    PaddleBoat {
+        left: bool,
+        right: bool,
+    },
+    PickItem {
+        slot: i32,
+    },
+    CreativeModeSlot {
+        slot: i16,
+        item_id: i32,
+        count: i32,
+    },
+    EditBook {
+        slot: i32,
+        pages: Vec<String>,
+        title: Option<String>,
+    },
     /// `sign_update` — the sign-edit screen's Done/Escape packet: packed
     /// block position, front/back face flag, and the four text lines.
     UpdateSign {
@@ -714,26 +738,65 @@ fn adjacent_block_pos(pos: [i32; 3], face: i32) -> [i32; 3] {
 }
 
 fn ground_surface_for_name(name: &str) -> GroundSurfaceKind {
-    let name = name.rsplit(':').next().unwrap_or(name);
-    if name.contains("sand") || name.contains("terracotta") { GroundSurfaceKind::Sand }
-    else if name.contains("snow") { GroundSurfaceKind::Snow }
-    else if name.contains("gravel") { GroundSurfaceKind::Gravel }
-    else if name.contains("mud") || name.contains("clay") { GroundSurfaceKind::MudOrShallowWater }
-    else if name.contains("leaves") || name.contains("leaf_litter") { GroundSurfaceKind::FallenLeaves }
-    else { GroundSurfaceKind::StoneOrWood }
+    let name = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
+    if name.contains("sand") || name.contains("terracotta") {
+        GroundSurfaceKind::Sand
+    } else if name.contains("snow") {
+        GroundSurfaceKind::Snow
+    } else if name.contains("gravel") {
+        GroundSurfaceKind::Gravel
+    } else if name.contains("mud") || name.contains("clay") {
+        GroundSurfaceKind::MudOrShallowWater
+    } else if name.contains("leaves") || name.contains("leaf_litter") {
+        GroundSurfaceKind::FallenLeaves
+    } else {
+        GroundSurfaceKind::StoneOrWood
+    }
 }
 
 fn status_effect_name(id: i32) -> &'static str {
     // Protocol 767 (Minecraft 1.21.1) 0-based `minecraft:mob_effect` registry IDs.
     match id {
-        0 => "speed", 1 => "slowness", 2 => "haste", 3 => "mining_fatigue", 4 => "strength",
-        5 => "instant_health", 6 => "instant_damage", 7 => "jump_boost", 8 => "nausea", 9 => "regeneration",
-        10 => "resistance", 11 => "fire_resistance", 12 => "water_breathing", 13 => "invisibility", 14 => "blindness",
-        15 => "night_vision", 16 => "hunger", 17 => "weakness", 18 => "poison", 19 => "wither", 20 => "health_boost",
-        21 => "absorption", 22 => "saturation", 23 => "glowing", 24 => "levitation", 25 => "luck", 26 => "unluck",
-        27 => "slow_falling", 28 => "conduit_power", 29 => "dolphins_grace", 30 => "bad_omen", 31 => "hero_of_the_village",
-        32 => "darkness", 33 => "trial_omen", 34 => "raid_omen", 35 => "wind_charged", 36 => "weaving",
-        37 => "oozing", 38 => "infested", _ => "unknown",
+        0 => "speed",
+        1 => "slowness",
+        2 => "haste",
+        3 => "mining_fatigue",
+        4 => "strength",
+        5 => "instant_health",
+        6 => "instant_damage",
+        7 => "jump_boost",
+        8 => "nausea",
+        9 => "regeneration",
+        10 => "resistance",
+        11 => "fire_resistance",
+        12 => "water_breathing",
+        13 => "invisibility",
+        14 => "blindness",
+        15 => "night_vision",
+        16 => "hunger",
+        17 => "weakness",
+        18 => "poison",
+        19 => "wither",
+        20 => "health_boost",
+        21 => "absorption",
+        22 => "saturation",
+        23 => "glowing",
+        24 => "levitation",
+        25 => "luck",
+        26 => "unluck",
+        27 => "slow_falling",
+        28 => "conduit_power",
+        29 => "dolphins_grace",
+        30 => "bad_omen",
+        31 => "hero_of_the_village",
+        32 => "darkness",
+        33 => "trial_omen",
+        34 => "raid_omen",
+        35 => "wind_charged",
+        36 => "weaving",
+        37 => "oozing",
+        38 => "infested",
+        _ => "unknown",
     }
 }
 
@@ -1172,6 +1235,44 @@ pub fn split_compiled_bundle(
     (meta, PendingAtlasPixels { atlas, mipmaps })
 }
 
+/// Convert the session asset pipeline's normalized layer maps back into
+/// vanilla asset paths and load the official blockstate/model catalog.
+/// `ResourcePackLayer` keys are `namespace:path`; the catalog parser owns the
+/// `assets/<ns>/{blockstates,models}/<path>.json` contract.
+fn block_model_catalog_from_layers(layers: &[ResourcePackLayer]) -> VanillaBlockModelCatalog {
+    let mut converted = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let mut entries = Vec::with_capacity(layer.blockstates.len() + layer.models.len());
+        for (id, text) in &layer.blockstates {
+            if let Some((namespace, path)) = id.split_once(':') {
+                entries.push((
+                    format!("assets/{namespace}/blockstates/{path}.json"),
+                    text.clone(),
+                ));
+            }
+        }
+        for (id, text) in &layer.models {
+            if let Some((namespace, path)) = id.split_once(':') {
+                entries.push((
+                    format!("assets/{namespace}/models/{path}.json"),
+                    text.clone(),
+                ));
+            }
+        }
+        converted.push(entries);
+    }
+    VanillaBlockModelCatalog::new(converted)
+}
+
+fn sprite_lookup_closure(lookup: Arc<BTreeMap<String, u32>>) -> BlockAtlasSpriteLookup {
+    Arc::new(move |name: &str| {
+        lookup.get(name).copied().or_else(|| {
+            name.split_once(':')
+                .and_then(|(_, path)| lookup.get(path).copied())
+        })
+    })
+}
+
 /// Namespaced block name of a block-state id — the kernel registry when
 /// loaded, else the `BlockTable`'s per-state names (empty in builtin
 /// fallback mode, so no names resolve there). Dynamic mod block-state
@@ -1283,7 +1384,7 @@ fn level_event_sound(event: i32, _data: i32) -> Option<(&'static str, i32, f32, 
 /// piston extend/retract (0/1), note block play (0), bell ring (1),
 /// container open/close (action 1, `parameter` = viewer count).
 fn block_event_sound(name: &str, action: u8, parameter: u8) -> Option<&'static str> {
-    let short = name.rsplit(':').next().unwrap_or(name);
+    let short = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
     let open = parameter > 0;
     match (short, action) {
         ("piston" | "sticky_piston", 0) => Some("minecraft:block.piston.extend"),
@@ -1318,7 +1419,7 @@ fn block_event_sound(name: &str, action: u8, parameter: u8) -> Option<&'static s
 /// packet carries only a block-state id, so the family is inferred from
 /// the registry name like the data-driven `SoundType` table does.
 fn break_sound_for_block(name: &str) -> &'static str {
-    let short = name.rsplit(':').next().unwrap_or(name);
+    let short = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
     if short.contains("glass")
         || short.contains("amethyst")
         || short == "ice"
@@ -1621,7 +1722,10 @@ const PLACED_LIGHT_SCAN_RADIUS: i32 = 8;
 /// modded `*_wire`/`*_repeater`/`*_comparator`/`*_observer` names join
 /// automatically.
 fn is_always_dark_signal_block(block_id: &str) -> bool {
-    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    let path = block_state_base_name(block_id)
+        .rsplit(':')
+        .next()
+        .unwrap_or(block_id);
     path.split('_')
         .any(|token| matches!(token, "wire" | "repeater" | "comparator" | "observer"))
 }
@@ -2164,6 +2268,21 @@ pub struct LiveSession {
     /// per coord, so the drain carries each touched section exactly once
     /// no matter how many mutations landed between frames.
     external_section_delta: ExternalSectionsDelta,
+    /// Worker-emitted official baked model faces by section. Entries are
+    /// installed only after the matching packed mesh result passes the
+    /// lane revision check, then shared into `ExternalSectionMesh` for the
+    /// renderer's shaped-terrain upload lane.
+    pub baked_sections: HashMap<SectionCoord, Arc<[BakedTerrainFace]>>,
+    /// Bumped whenever shaped terrain provenance changes (worker face
+    /// sidecar install/removal or external-section clear). Render-side
+    /// caches key rebuilds off their section mesh revisions; this counter
+    /// is the session-visible proof that the sidecar domain moved.
+    pub shaped_terrain_revision: u64,
+    /// Catalog/sprite table captured when the runtime asset bundle was
+    /// built. Retained so the lazily-spawned section mesh pool receives
+    /// the same configuration as the synchronous world mesher.
+    block_model_catalog: Option<Arc<VanillaBlockModelCatalog>>,
+    block_model_sprite_lookup: Option<Arc<BTreeMap<String, u32>>>,
     /// World-side coords whose CPU mesh copies were released after VRAM
     /// upload. A fresh renderer (device loss / surface re-create) owns no
     /// GPU copy of them, so [`Self::requeue_cpu_released_sections`]
@@ -3281,6 +3400,10 @@ impl LiveSession {
             terrain_full_sync: true,
             terrain_order_sweep: false,
             external_sections: BTreeMap::new(),
+            baked_sections: HashMap::new(),
+            shaped_terrain_revision: 0,
+            block_model_catalog: None,
+            block_model_sprite_lookup: None,
             external_sections_rev: 0,
             external_section_delta: ExternalSectionsDelta::default(),
             cpu_released_world_coords: BTreeSet::new(),
@@ -3470,7 +3593,7 @@ impl LiveSession {
                             let Some(name) = self.world.blocks.state_name(state) else {
                                 continue;
                             };
-                            let path = name.rsplit(':').next().unwrap_or(name);
+                            let path = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
                             let block_center = |s: i32, r: &std::ops::RangeInclusive<i32>| {
                                 s.wrapping_mul(16)
                                     .wrapping_add(8.clamp(*r.start(), *r.end()))
@@ -3537,7 +3660,7 @@ impl LiveSession {
                                     let Some(name) = self.world.blocks.state_name(state) else {
                                         continue;
                                     };
-                                    let path = name.rsplit(':').next().unwrap_or(name);
+                                    let path = block_state_base_name(name).rsplit(':').next().unwrap_or(name);
                                     let pos = [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5];
                                     if path.contains("leaves") {
                                         if path.contains("blossom")
@@ -4440,7 +4563,15 @@ impl LiveSession {
     /// concentric [`WaterRippleRing`]s, or lava sizzle sparks and steam.
     /// Silent while the preset is `Off`.
     pub fn on_fluid_entry(&mut self, event: FluidEntryEvent) {
-        self.emit_player_sound(if event.is_lava { "minecraft:entity.generic.extinguish_fire" } else { "minecraft:entity.player.splash" }, 0.8, 1.0);
+        self.emit_player_sound(
+            if event.is_lava {
+                "minecraft:entity.generic.extinguish_fire"
+            } else {
+                "minecraft:entity.player.splash"
+            },
+            0.8,
+            1.0,
+        );
         self.tactile_sim.emit_fluid_entry(&event);
     }
 
@@ -4479,7 +4610,13 @@ impl LiveSession {
             GroundSurfaceKind::StoneOrWood => "minecraft:block.stone.step",
         };
         let pos = [pos[0], pos[1], pos[2]];
-        self.emit_effect_sound(sound, 4, if landing_speed > 0.0 { 0.8 } else { 0.35 }, 0.8, pos);
+        self.emit_effect_sound(
+            sound,
+            4,
+            if landing_speed > 0.0 { 0.8 } else { 0.35 },
+            0.8,
+            pos,
+        );
         if landing_speed.is_finite() && landing_speed > 0.0 {
             self.tactile_landing_impulse = self.tactile_landing_impulse.max(landing_speed);
         }
@@ -4837,6 +4974,9 @@ impl LiveSession {
     /// removal only when an entry actually existed.
     pub fn remove_external_section(&mut self, coord: SectionCoord) -> Option<ExternalSectionMesh> {
         let removed = self.external_sections.remove(&coord);
+        if self.baked_sections.remove(&coord).is_some() {
+            self.shaped_terrain_revision = self.shaped_terrain_revision.wrapping_add(1);
+        }
         if removed.is_some() {
             self.mark_external_removed(coord);
         }
@@ -4848,6 +4988,10 @@ impl LiveSession {
     /// wipes in the same order the map did.
     pub fn clear_external_sections(&mut self) {
         self.external_sections.clear();
+        if !self.baked_sections.is_empty() {
+            self.baked_sections.clear();
+            self.shaped_terrain_revision = self.shaped_terrain_revision.wrapping_add(1);
+        }
         self.mark_external_cleared();
     }
 
@@ -4890,6 +5034,9 @@ impl LiveSession {
         });
         for coord in pruned {
             // `retain` already dropped the entry — record the removal.
+            if self.baked_sections.remove(&coord).is_some() {
+                self.shaped_terrain_revision = self.shaped_terrain_revision.wrapping_add(1);
+            }
             self.mark_external_removed(coord);
         }
     }
@@ -4903,8 +5050,12 @@ impl LiveSession {
     fn drain_offthread_sections(&mut self, camera_position: [f32; 3]) {
         self.prune_external_sections();
         let mut results = Vec::new();
+        let mut baked_results: HashMap<SectionCoord, BakedSectionMeshResult> = HashMap::new();
         if let Some(workers) = &self.section_mesh_workers {
             workers.drain(|result| results.push(result));
+            workers.drain_baked(|result| {
+                baked_results.insert(result.coord, result);
+            });
         }
         for result in results {
             let MeshResult::SectionMesh { built } = result else {
@@ -4925,7 +5076,11 @@ impl LiveSession {
                 continue;
             }
             self.offthread_mesh_completed += 1;
-            self.install_built_external(built, camera_position);
+            let baked = baked_results
+                .remove(&built.coord)
+                .filter(|result| result.revision == built.revision)
+                .map(|result| result.faces);
+            self.install_built_external(built, camera_position, baked);
         }
     }
 
@@ -4990,9 +5145,24 @@ impl LiveSession {
             else {
                 continue;
             };
+            if self.section_mesh_workers.is_none() {
+                let mut pool = MeshJobPool::new(threads);
+                if let (Some(catalog), Some(sprite_lookup)) = (
+                    self.block_model_catalog.clone(),
+                    self.block_model_sprite_lookup.clone(),
+                ) {
+                    pool.set_block_model_catalog_with_sprite_lookup(
+                        Some(catalog),
+                        Arc::from(self.world.blocks.state_names().to_vec()),
+                        Some(sprite_lookup_closure(sprite_lookup)),
+                    );
+                }
+                self.section_mesh_workers = Some(pool);
+            }
             let workers = self
                 .section_mesh_workers
-                .get_or_insert_with(|| MeshJobPool::new(threads));
+                .as_mut()
+                .expect("worker pool initialized above");
             if workers.try_submit(MeshJob::SectionMesh { input }) {
                 debug_assert_eq!(self.section_mesh_lane.note_submitted(coord), revision);
                 self.offthread_mesh_submitted += 1;
@@ -5006,7 +5176,12 @@ impl LiveSession {
     /// back-to-front — the same stream `section_geometry` consumes from
     /// the world path, with opaque-only direction buckets recovered from
     /// the worker's vertex ranges.
-    fn install_built_external(&mut self, built: BuiltSectionMesh, camera_position: [f32; 3]) {
+    fn install_built_external(
+        &mut self,
+        built: BuiltSectionMesh,
+        camera_position: [f32; 3],
+        baked_faces: Option<Vec<BakedTerrainFace>>,
+    ) {
         let coord = built.coord;
         let opaque_quads = built.opaque_packed.len() as u32 / 4;
         let mut packed = built.opaque_packed;
@@ -5041,6 +5216,14 @@ impl LiveSession {
         let content_epoch = self.section_mesh_lane.epoch_of(coord);
         let digest = external_packed_digest(&packed);
         let order_digest = translucent_order_digest(&order);
+        let baked_faces: Arc<[BakedTerrainFace]> =
+            baked_faces.map(Arc::from).unwrap_or_else(|| Arc::from([]));
+        if !baked_faces.is_empty() {
+            self.baked_sections.insert(coord, Arc::clone(&baked_faces));
+            self.shaped_terrain_revision = self.shaped_terrain_revision.wrapping_add(1);
+        } else if self.baked_sections.remove(&coord).is_some() {
+            self.shaped_terrain_revision = self.shaped_terrain_revision.wrapping_add(1);
+        }
         self.insert_external_section(
             coord,
             ExternalSectionMesh {
@@ -5114,9 +5297,21 @@ impl LiveSession {
             self.physics_state.in_water = false;
             self.physics_state.in_lava = false;
             let pose = PlayerPose { feet, yaw, pitch };
-            self.send_movement(PlayerMovement { pose, strafe, forward, jump, sneak });
+            self.send_movement(PlayerMovement {
+                pose,
+                strafe,
+                forward,
+                jump,
+                sneak,
+            });
             self.eye_height = 1.62;
-            return Some(LocalPhysicsOutput { pose, eye_height: self.eye_height, walk_bob: (0.0, 0.0), on_ground: false, submerged: false });
+            return Some(LocalPhysicsOutput {
+                pose,
+                eye_height: self.eye_height,
+                walk_bob: (0.0, 0.0),
+                on_ground: false,
+                submerged: false,
+            });
         }
         self.physics_state.is_creative_flying = false;
         self.physics_accumulator = (self.physics_accumulator + dt).min(0.2);
@@ -5129,7 +5324,9 @@ impl LiveSession {
             let was_wet = self.was_submerged;
             let previous_fall_velocity_y = self.physics_state.vel[1] as f32;
             let old = self.pose.unwrap_or(base);
-            if let Some(pose) = self.predict_movement(strafe, forward, jump, sneak, sprint, yaw, pitch) {
+            if let Some(pose) =
+                self.predict_movement(strafe, forward, jump, sneak, sprint, yaw, pitch)
+            {
                 let dx = pose.feet[0] - old.feet[0];
                 let dz = pose.feet[2] - old.feet[2];
                 let distance = (dx * dx + dz * dz).sqrt() as f32;
@@ -5139,20 +5336,38 @@ impl LiveSession {
                 let wet = self.physics_state.in_water || self.physics_state.in_lava;
                 if !was_wet && wet {
                     let seed_tick = self.next_tactile_event_tick();
-                    self.on_fluid_entry(FluidEntryEvent { pos: pose.feet.map(|v| v as f32), impact_speed: (-self.physics_state.vel[1] as f32).max(0.0), body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob, is_lava: self.physics_state.in_lava, seed_tick });
+                    self.on_fluid_entry(FluidEntryEvent {
+                        pos: pose.feet.map(|v| v as f32),
+                        impact_speed: (-self.physics_state.vel[1] as f32).max(0.0),
+                        body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob,
+                        is_lava: self.physics_state.in_lava,
+                        seed_tick,
+                    });
                 }
                 self.was_submerged = wet;
                 if !was_ground && self.physics_state.on_ground {
                     let speed = (-self.fall_velocity_y).max(0.0);
-                    let under = [pose.feet[0].floor() as i32, (pose.feet[1] - 0.05).floor() as i32, pose.feet[2].floor() as i32];
+                    let under = [
+                        pose.feet[0].floor() as i32,
+                        (pose.feet[1] - 0.05).floor() as i32,
+                        pose.feet[2].floor() as i32,
+                    ];
                     let kind = ground_surface_for_name(&self.block_name_at(under));
                     self.on_footstep_or_landing(pose.feet.map(|v| v as f32), kind, speed);
                 } else if distance > 0.0 && self.physics_state.on_ground {
                     self.next_step_dist += distance;
                     if self.next_step_dist >= 0.7 {
                         self.next_step_dist = 0.0;
-                        let under = [pose.feet[0].floor() as i32, (pose.feet[1] - 0.05).floor() as i32, pose.feet[2].floor() as i32];
-                        self.on_footstep_or_landing(pose.feet.map(|v| v as f32), ground_surface_for_name(&self.block_name_at(under)), 0.0);
+                        let under = [
+                            pose.feet[0].floor() as i32,
+                            (pose.feet[1] - 0.05).floor() as i32,
+                            pose.feet[2].floor() as i32,
+                        ];
+                        self.on_footstep_or_landing(
+                            pose.feet.map(|v| v as f32),
+                            ground_surface_for_name(&self.block_name_at(under)),
+                            0.0,
+                        );
                     }
                 }
                 self.was_on_ground = self.physics_state.on_ground;
@@ -5161,11 +5376,36 @@ impl LiveSession {
         }
         let pose = self.pose?;
         let swimming = self.physics_state.swimming || self.physics_state.elytra_flying;
-        let target_eye = if swimming { 0.4 } else if sneak { 1.27 } else { 1.62 };
+        let target_eye = if swimming {
+            0.4
+        } else if sneak {
+            1.27
+        } else {
+            1.62
+        };
         self.eye_height += (target_eye - self.eye_height) * (1.0 - (-dt * 12.0).exp());
-        self.send_movement(PlayerMovement { pose, strafe, forward, jump, sneak });
-        let bob = if self.physics_state.on_ground { ((self.walk_bob_phase).sin() * 0.035, (self.walk_bob_phase * 2.0).cos() * 0.025) } else { (0.0, 0.0) };
-        Some(LocalPhysicsOutput { pose, eye_height: self.eye_height, walk_bob: bob, on_ground: self.physics_state.on_ground, submerged: self.physics_state.in_water || self.physics_state.in_lava })
+        self.send_movement(PlayerMovement {
+            pose,
+            strafe,
+            forward,
+            jump,
+            sneak,
+        });
+        let bob = if self.physics_state.on_ground {
+            (
+                (self.walk_bob_phase).sin() * 0.035,
+                (self.walk_bob_phase * 2.0).cos() * 0.025,
+            )
+        } else {
+            (0.0, 0.0)
+        };
+        Some(LocalPhysicsOutput {
+            pose,
+            eye_height: self.eye_height,
+            walk_bob: bob,
+            on_ground: self.physics_state.on_ground,
+            submerged: self.physics_state.in_water || self.physics_state.in_lava,
+        })
     }
 
     /// `chat`/`chat_command` — send one chat line; a leading `/` rides the
@@ -5376,59 +5616,122 @@ impl LiveSession {
             self.trigger_arm_swing();
             return;
         }
-        let block = name.rsplit(':').next().unwrap_or(&name);
+        let block = block_state_base_name(&name).rsplit(':').next().unwrap_or(&name);
         let base = if block == "bedrock" || block == "barrier" || block == "end_portal_frame" {
             f32::INFINITY
-        } else if block.contains("obsidian") { 10.0 }
-        else if block.contains("stone") || block.contains("ore") || block.contains("deepslate") { 2.5 }
-        else if block.contains("log") || block.contains("wood") || block.contains("planks") { 2.0 }
-        else if block.contains("dirt") || block.contains("sand") || block.contains("gravel") { 0.6 }
-        else if block.contains("leaves") || block.contains("grass") || block.contains("flower") || block.contains("torch") { 0.18 }
-        else { 1.5 };
+        } else if block.contains("obsidian") {
+            10.0
+        } else if block.contains("stone") || block.contains("ore") || block.contains("deepslate") {
+            2.5
+        } else if block.contains("log") || block.contains("wood") || block.contains("planks") {
+            2.0
+        } else if block.contains("dirt") || block.contains("sand") || block.contains("gravel") {
+            0.6
+        } else if block.contains("leaves")
+            || block.contains("grass")
+            || block.contains("flower")
+            || block.contains("torch")
+        {
+            0.18
+        } else {
+            1.5
+        };
         let hotbar_slot = 36 + self.hud.selected_slot as i32;
-        let tool = self.player_inventory.get(&hotbar_slot).map(|s| crate::recipe_ingest::item_name_for_id(s.item_id as u32)).unwrap_or_default();
-        let suitable = (block.contains("stone") || block.contains("ore") || block.contains("obsidian")) && tool.contains("pickaxe")
-            || (block.contains("log") || block.contains("wood") || block.contains("planks")) && tool.contains("axe")
-            || (block.contains("dirt") || block.contains("sand") || block.contains("gravel")) && tool.contains("shovel")
-            || block.contains("leaves") && (tool.contains("shears") || tool.contains("hoe"));
-        let tier = if tool.contains("netherite") { 8.0 } else if tool.contains("diamond") { 7.0 } else if tool.contains("iron") { 6.0 } else if tool.contains("stone") { 4.0 } else if tool.contains("gold") { 12.0 } else if tool.contains("wooden") { 2.0 } else { 1.0 };
+        let tool = self
+            .player_inventory
+            .get(&hotbar_slot)
+            .map(|s| crate::recipe_ingest::item_name_for_id(s.item_id as u32))
+            .unwrap_or_default();
+        let suitable =
+            (block.contains("stone") || block.contains("ore") || block.contains("obsidian"))
+                && tool.contains("pickaxe")
+                || (block.contains("log") || block.contains("wood") || block.contains("planks"))
+                    && tool.contains("axe")
+                || (block.contains("dirt") || block.contains("sand") || block.contains("gravel"))
+                    && tool.contains("shovel")
+                || block.contains("leaves") && (tool.contains("shears") || tool.contains("hoe"));
+        let tier = if tool.contains("netherite") {
+            8.0
+        } else if tool.contains("diamond") {
+            7.0
+        } else if tool.contains("iron") {
+            6.0
+        } else if tool.contains("stone") {
+            4.0
+        } else if tool.contains("gold") {
+            12.0
+        } else if tool.contains("wooden") {
+            2.0
+        } else {
+            1.0
+        };
         let speed = if suitable { tier } else { 1.0 };
-        let penalty = if self.physics_state.on_ground { 1.0 } else { 5.0 } * if self.physics_state.eye_in_water { 5.0 } else { 1.0 };
-        self.mining = MiningState { target: Some((pos, face)), progress: 0.0, duration: base * penalty / speed, cooldown: 0.0, swing_timer: 0.0 };
+        let penalty = if self.physics_state.on_ground {
+            1.0
+        } else {
+            5.0
+        } * if self.physics_state.eye_in_water {
+            5.0
+        } else {
+            1.0
+        };
+        self.mining = MiningState {
+            target: Some((pos, face)),
+            progress: 0.0,
+            duration: base * penalty / speed,
+            cooldown: 0.0,
+            swing_timer: 0.0,
+        };
     }
 
     pub fn tick_mining(&mut self, dt_secs: f32, current_target: Option<([i32; 3], i8)>) -> bool {
-        if !dt_secs.is_finite() || dt_secs <= 0.0 { return false; }
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return false;
+        }
         self.mining.cooldown = (self.mining.cooldown - dt_secs).max(0.0);
-        if self.mining.cooldown > 0.0 { return false; }
+        if self.mining.cooldown > 0.0 {
+            return false;
+        }
         if let Some(target) = self.mining.target {
             if current_target != Some(target) {
                 self.dig_abort(target.0, target.1);
                 self.mining = MiningState::default();
-                if let Some((pos, face)) = current_target { self.begin_mining(pos, face); }
+                if let Some((pos, face)) = current_target {
+                    self.begin_mining(pos, face);
+                }
                 return false;
             }
         } else if let Some((pos, face)) = current_target {
             self.begin_mining(pos, face);
             return false;
         }
-        if self.mining.target.is_none() || !self.mining.duration.is_finite() { return false; }
+        if self.mining.target.is_none() || !self.mining.duration.is_finite() {
+            return false;
+        }
         self.mining.progress += dt_secs / self.mining.duration.max(0.05);
         self.mining.swing_timer += dt_secs;
-        if self.mining.swing_timer >= 0.3 { self.mining.swing_timer = 0.0; self.trigger_arm_swing(); }
+        if self.mining.swing_timer >= 0.3 {
+            self.mining.swing_timer = 0.0;
+            self.trigger_arm_swing();
+        }
         if self.mining.progress >= 1.0 {
             let Some((pos, face)) = self.mining.target else {
                 return false;
             };
             self.dig_finish(pos, face);
-            self.mining = MiningState { cooldown: 0.25, ..MiningState::default() };
+            self.mining = MiningState {
+                cooldown: 0.25,
+                ..MiningState::default()
+            };
             return true;
         }
         false
     }
 
     pub fn cancel_mining(&mut self) {
-        if let Some((pos, face)) = self.mining.target { self.dig_abort(pos, face); }
+        if let Some((pos, face)) = self.mining.target {
+            self.dig_abort(pos, face);
+        }
         self.mining = MiningState::default();
     }
 
@@ -5440,21 +5743,67 @@ impl LiveSession {
     }
 
     pub fn begin_item_use(&mut self, hand: i32, on_block: bool) {
-        let name = if hand == 1 { self.hud.offhand.clone() } else { self.hud.hotbar.get(self.hud.selected_slot).cloned().flatten() }.unwrap_or_default();
-        let kind = if ["apple", "bread", "beef", "porkchop", "chicken", "carrot", "potato", "cookie", "melon", "berry", "chorus_fruit", "stew", "pie"].iter().any(|s| name.contains(s)) { FirstPersonUseKind::Eat }
-            else if name.contains("potion") || name.contains("milk") || name.contains("honey_bottle") { FirstPersonUseKind::Drink }
-            else if name.ends_with(":bow") { FirstPersonUseKind::BowDraw }
-            else if name.ends_with(":crossbow") { FirstPersonUseKind::CrossbowCharge }
-            else if name.ends_with(":shield") { FirstPersonUseKind::ShieldBlock }
-            else if name.ends_with(":trident") { FirstPersonUseKind::TridentThrow }
-            else { FirstPersonUseKind::None };
-        self.item_use = ItemUseState { active: true, on_block, elapsed: 0.0, place_timer: 0.0, kind };
-        if on_block { self.trigger_arm_swing(); }
-        else { self.use_item(hand); }
+        let name = if hand == 1 {
+            self.hud.offhand.clone()
+        } else {
+            self.hud
+                .hotbar
+                .get(self.hud.selected_slot)
+                .cloned()
+                .flatten()
+        }
+        .unwrap_or_default();
+        let kind = if [
+            "apple",
+            "bread",
+            "beef",
+            "porkchop",
+            "chicken",
+            "carrot",
+            "potato",
+            "cookie",
+            "melon",
+            "berry",
+            "chorus_fruit",
+            "stew",
+            "pie",
+        ]
+        .iter()
+        .any(|s| name.contains(s))
+        {
+            FirstPersonUseKind::Eat
+        } else if name.contains("potion") || name.contains("milk") || name.contains("honey_bottle")
+        {
+            FirstPersonUseKind::Drink
+        } else if name.ends_with(":bow") {
+            FirstPersonUseKind::BowDraw
+        } else if name.ends_with(":crossbow") {
+            FirstPersonUseKind::CrossbowCharge
+        } else if name.ends_with(":shield") {
+            FirstPersonUseKind::ShieldBlock
+        } else if name.ends_with(":trident") {
+            FirstPersonUseKind::TridentThrow
+        } else {
+            FirstPersonUseKind::None
+        };
+        self.item_use = ItemUseState {
+            active: true,
+            on_block,
+            elapsed: 0.0,
+            place_timer: 0.0,
+            kind,
+        };
+        if on_block {
+            self.trigger_arm_swing();
+        } else {
+            self.use_item(hand);
+        }
     }
 
     pub fn tick_item_use(&mut self, dt_secs: f32) -> bool {
-        if !self.item_use.active || !dt_secs.is_finite() || dt_secs <= 0.0 { return false; }
+        if !self.item_use.active || !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return false;
+        }
         self.item_use.elapsed += dt_secs;
         self.item_use.place_timer += dt_secs;
         if self.item_use.on_block && self.item_use.place_timer >= 0.2 {
@@ -5465,7 +5814,9 @@ impl LiveSession {
     }
 
     pub fn release_item_use(&mut self) {
-        if !self.item_use.active { return; }
+        if !self.item_use.active {
+            return;
+        }
         let _ = self.outgoing.try_send(WorkerCommand::ReleaseUseItem);
         self.item_use.active = false;
         self.item_use.kind = FirstPersonUseKind::None;
@@ -5477,9 +5828,36 @@ impl LiveSession {
         self.swing(0);
     }
 
-    pub fn first_person_viewmodel(&self, visible: bool, walk_bob: (f32, f32)) -> FirstPersonViewmodel {
-        let name = self.hud.hotbar.get(self.hud.selected_slot).cloned().flatten();
-        FirstPersonViewmodel { visible, held_item_name: name.clone(), held_color_rgb: [1.0; 3], is_block: name.as_deref().is_some_and(|n| !["sword", "pickaxe", "axe", "shovel", "hoe", "bow", "crossbow", "trident", "shield", "potion", "apple", "bread", "bucket", "elytra"].iter().any(|kind| n.contains(kind))), swing_progress: self.swing_progress, use_progress: (self.item_use.elapsed / 1.6).clamp(0.0, 1.0), using_kind: self.item_use.kind, walk_bob_x: walk_bob.0, walk_bob_y: walk_bob.1, equip_progress: 1.0 }
+    pub fn first_person_viewmodel(
+        &self,
+        visible: bool,
+        walk_bob: (f32, f32),
+    ) -> FirstPersonViewmodel {
+        let name = self
+            .hud
+            .hotbar
+            .get(self.hud.selected_slot)
+            .cloned()
+            .flatten();
+        FirstPersonViewmodel {
+            visible,
+            held_item_name: name.clone(),
+            held_color_rgb: [1.0; 3],
+            is_block: name.as_deref().is_some_and(|n| {
+                ![
+                    "sword", "pickaxe", "axe", "shovel", "hoe", "bow", "crossbow", "trident",
+                    "shield", "potion", "apple", "bread", "bucket", "elytra",
+                ]
+                .iter()
+                .any(|kind| n.contains(kind))
+            }),
+            swing_progress: self.swing_progress,
+            use_progress: (self.item_use.elapsed / 1.6).clamp(0.0, 1.0),
+            using_kind: self.item_use.kind,
+            walk_bob_x: walk_bob.0,
+            walk_bob_y: walk_bob.1,
+            equip_progress: 1.0,
+        }
     }
 
     /// `set_carried_item` — tell the server which hotbar slot (0..=8) is
@@ -5491,24 +5869,47 @@ impl LiveSession {
     }
 
     pub fn send_move_vehicle(&mut self, x: f64, y: f64, z: f64, yaw: f32, pitch: f32) {
-        let _ = self.outgoing.try_send(WorkerCommand::MoveVehicle { x, y, z, yaw, pitch });
+        let _ = self.outgoing.try_send(WorkerCommand::MoveVehicle {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+        });
     }
 
     pub fn send_paddle_boat(&mut self, left: bool, right: bool) {
-        let _ = self.outgoing.try_send(WorkerCommand::PaddleBoat { left, right });
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::PaddleBoat { left, right });
     }
 
     pub fn send_pick_item_for_block(&mut self, block_name: &str) -> bool {
-        let found = self.player_inventory.iter().filter_map(|(&slot, stack)| ((9..=44).contains(&slot) && stack.count > 0).then_some((slot, stack)))
-            .find(|(_, stack)| crate::recipe_ingest::item_name_for_id(stack.item_id as u32) == block_name).map(|(slot, _)| slot);
+        let found = self
+            .player_inventory
+            .iter()
+            .filter_map(|(&slot, stack)| {
+                ((9..=44).contains(&slot) && stack.count > 0).then_some((slot, stack))
+            })
+            .find(|(_, stack)| {
+                crate::recipe_ingest::item_name_for_id(stack.item_id as u32) == block_name
+            })
+            .map(|(slot, _)| slot);
         let Some(slot) = found else { return false };
-        if (36..=44).contains(&slot) { self.set_carried_item(slot - 36); }
-        else { let _ = self.outgoing.try_send(WorkerCommand::PickItem { slot }); }
+        if (36..=44).contains(&slot) {
+            self.set_carried_item(slot - 36);
+        } else {
+            let _ = self.outgoing.try_send(WorkerCommand::PickItem { slot });
+        }
         true
     }
 
     pub fn send_creative_mode_slot(&mut self, slot: i16, item_id: i32, count: i32) {
-        let _ = self.outgoing.try_send(WorkerCommand::CreativeModeSlot { slot, item_id, count });
+        let _ = self.outgoing.try_send(WorkerCommand::CreativeModeSlot {
+            slot,
+            item_id,
+            count,
+        });
     }
 
     pub fn send_stop_sleeping(&mut self) {
@@ -5517,20 +5918,36 @@ impl LiveSession {
     }
 
     pub fn send_edit_book(&mut self, slot: i32, pages: Vec<String>, title: Option<String>) {
-        let _ = self.outgoing.try_send(WorkerCommand::EditBook { slot, pages, title });
+        let _ = self
+            .outgoing
+            .try_send(WorkerCommand::EditBook { slot, pages, title });
     }
 
-    pub fn riding_vehicle_id(&self) -> Option<i32> { self.riding_vehicle }
+    pub fn riding_vehicle_id(&self) -> Option<i32> {
+        self.riding_vehicle
+    }
 
     pub fn riding_vehicle_position(&self) -> Option<[f64; 3]> {
-        self.riding_vehicle.and_then(|id| self.entity_positions.get(&id).copied().or_else(|| self.world.entities.get(&id).map(|entity| entity.pos)))
+        self.riding_vehicle.and_then(|id| {
+            self.entity_positions
+                .get(&id)
+                .copied()
+                .or_else(|| self.world.entities.get(&id).map(|entity| entity.pos))
+        })
     }
 
     pub fn is_sleeping(&self) -> bool {
-        self.sleeping || self.player_entity_id.and_then(|id| self.entity_metadata.get(&id)).and_then(|meta| meta.pose).is_some_and(|pose| pose == 2)
+        self.sleeping
+            || self
+                .player_entity_id
+                .and_then(|id| self.entity_metadata.get(&id))
+                .and_then(|meta| meta.pose)
+                .is_some_and(|pose| pose == 2)
     }
 
-    pub fn set_sleeping(&mut self, sleeping: bool) { self.sleeping = sleeping; }
+    pub fn set_sleeping(&mut self, sleeping: bool) {
+        self.sleeping = sleeping;
+    }
 
     /// `player_command` — entity action id (0 start-sneak, 1 stop-sneak,
     /// 3 start-sprint, 4 stop-sprint, 8 start-flying-elytra). Needs the
@@ -6489,6 +6906,31 @@ impl LiveSession {
     /// and its linear-sRGB mip chain; `window.rs` uploads it via
     /// `upload_block_atlas`. What was resolved (and skipped) lands in
     /// [`Self::asset_discovery`].
+    /// Attach the official baked block-model catalog to both mesh lanes.
+    /// `sprite_lookup` is the atlas texture-name table used only to certify
+    /// greedy-compatible full-cube materials; exact shaped-face texture indices
+    /// are resolved by the renderer from the same atlas names at upload time.
+    pub fn attach_block_model_catalog(
+        &mut self,
+        catalog: Arc<VanillaBlockModelCatalog>,
+        sprite_lookup: Arc<BTreeMap<String, u32>>,
+    ) {
+        self.world.set_block_model_catalog(
+            Arc::clone(&catalog),
+            sprite_lookup_closure(Arc::clone(&sprite_lookup)),
+        );
+        let state_names: Arc<[String]> = Arc::from(self.world.blocks.state_names().to_vec());
+        if let Some(workers) = self.section_mesh_workers.as_mut() {
+            workers.set_block_model_catalog_with_sprite_lookup(
+                Some(Arc::clone(&catalog)),
+                state_names,
+                Some(sprite_lookup_closure(Arc::clone(&sprite_lookup))),
+            );
+        }
+        self.block_model_catalog = Some(catalog);
+        self.block_model_sprite_lookup = Some(sprite_lookup);
+    }
+
     fn ensure_asset_bundle(&mut self) {
         if self.asset_bundle_tried {
             return;
@@ -6516,6 +6958,7 @@ impl LiveSession {
         for dir in &cem_dirs {
             self.register_cem_models(dir);
         }
+        let block_model_catalog = block_model_catalog_from_layers(&layers);
         match CompiledAssetBundle::build(&layers) {
             Ok(bundle) => {
                 if !bundle.skipped_errors.is_empty() {
@@ -6525,6 +6968,16 @@ impl LiveSession {
                     );
                 }
                 let (meta, pixels) = split_compiled_bundle(bundle);
+                if block_model_catalog.loaded_blockstates() != 0 {
+                    let sprite_lookup = Arc::new(
+                        meta.placements
+                            .keys()
+                            .enumerate()
+                            .map(|(index, name)| (name.clone(), index as u32))
+                            .collect::<BTreeMap<_, _>>(),
+                    );
+                    self.attach_block_model_catalog(Arc::new(block_model_catalog), sprite_lookup);
+                }
                 self.atlas_meta = Some(meta);
                 self.pending_atlas_pixels = Some(pixels);
                 self.asset_bundle_pending_upload = true;
@@ -8026,7 +8479,9 @@ impl LiveSession {
                 self.advancements_tab = tab;
             }
             PlayEvent::SetHealth { health, food, .. } => {
-                if health < self.hud.health { self.hurt_flash_alpha = 1.0; }
+                if health < self.hud.health {
+                    self.hurt_flash_alpha = 1.0;
+                }
                 self.hud.health = health;
                 self.hud.hunger = food.clamp(0, 20) as u8;
                 self.hud_revision += 1;
@@ -8157,16 +8612,25 @@ impl LiveSession {
                         },
                     );
                 }
-                if Some(eid) == self.player_entity_id { self.sync_hud_status_effects(); }
+                if Some(eid) == self.player_entity_id {
+                    self.sync_hud_status_effects();
+                }
             }
             PlayEvent::RemoveMobEffect { eid, effect_id } => {
                 if let Some(effects) = self.mob_effects.get_mut(&eid) {
                     effects.remove(&effect_id);
                 }
-                if Some(eid) == self.player_entity_id { self.sync_hud_status_effects(); }
+                if Some(eid) == self.player_entity_id {
+                    self.sync_hud_status_effects();
+                }
             }
-            PlayEvent::HurtAnimation { eid, .. } if Some(eid) == self.player_entity_id => { self.hurt_flash_alpha = 1.0; }
-            PlayEvent::SetPassengers { vehicle, passengers } => {
+            PlayEvent::HurtAnimation { eid, .. } if Some(eid) == self.player_entity_id => {
+                self.hurt_flash_alpha = 1.0;
+            }
+            PlayEvent::SetPassengers {
+                vehicle,
+                passengers,
+            } => {
                 let local = self.player_entity_id;
                 if passengers.iter().any(|id| Some(*id) == local) {
                     self.riding_vehicle = Some(vehicle);
@@ -8185,23 +8649,47 @@ impl LiveSession {
                     self.hud_revision = self.hud_revision.wrapping_add(1);
                 }
             }
-            PlayEvent::MoveVehicle { x, y, z, yaw, pitch } => {
-                if !x.is_finite() || !y.is_finite() || !z.is_finite() || !yaw.is_finite() || !pitch.is_finite() {
+            PlayEvent::MoveVehicle {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || !z.is_finite()
+                    || !yaw.is_finite()
+                    || !pitch.is_finite()
+                {
                     return Ok(());
                 }
                 let Some(vehicle) = self.riding_vehicle else {
                     return Ok(());
                 };
                 self.entity_positions.insert(vehicle, [x, y, z]);
-                if let Some(entity) = self.world.entities.get_mut(&vehicle) { entity.pos = [x, y, z]; }
-                if let Some(mut pose) = self.pose { pose.feet = [x, y, z]; pose.yaw = yaw; pose.pitch = pitch; self.pose = Some(pose); self.physics_state.pos = [x, y, z]; }
+                if let Some(entity) = self.world.entities.get_mut(&vehicle) {
+                    entity.pos = [x, y, z];
+                }
+                if let Some(mut pose) = self.pose {
+                    pose.feet = [x, y, z];
+                    pose.yaw = yaw;
+                    pose.pitch = pitch;
+                    self.pose = Some(pose);
+                    self.physics_state.pos = [x, y, z];
+                }
             }
-            PlayEvent::BlockDestruction { breaker_eid, pos, stage } => {
+            PlayEvent::BlockDestruction {
+                breaker_eid,
+                pos,
+                stage,
+            } => {
                 if (0..=9).contains(&stage)
                     && (self.remote_block_destruction.len() < 128
                         || self.remote_block_destruction.contains_key(&breaker_eid))
                 {
-                    self.remote_block_destruction.insert(breaker_eid, (pos, stage as u8));
+                    self.remote_block_destruction
+                        .insert(breaker_eid, (pos, stage as u8));
                 } else {
                     self.remote_block_destruction.remove(&breaker_eid);
                 }
@@ -8667,7 +9155,10 @@ impl LiveSession {
     }
 
     fn sync_hud_status_effects(&mut self) {
-        let Some(eid) = self.player_entity_id else { self.hud.status_effects.clear(); return; };
+        let Some(eid) = self.player_entity_id else {
+            self.hud.status_effects.clear();
+            return;
+        };
         self.hud.status_effects = self
             .mob_effects
             .get(&eid)
@@ -8686,7 +9177,24 @@ impl LiveSession {
                 // Protocol 767 0-based beneficial effect registry IDs.
                 beneficial: matches!(
                     *id,
-                    0 | 2 | 4 | 5 | 7 | 9 | 10 | 11 | 12 | 13 | 15 | 20 | 21 | 22 | 25 | 27 | 28 | 29 | 31
+                    0 | 2
+                        | 4
+                        | 5
+                        | 7
+                        | 9
+                        | 10
+                        | 11
+                        | 12
+                        | 13
+                        | 15
+                        | 20
+                        | 21
+                        | 22
+                        | 25
+                        | 27
+                        | 28
+                        | 29
+                        | 31
                 ),
             })
             .collect();
@@ -8695,7 +9203,9 @@ impl LiveSession {
 
     /// Advance per-frame gameplay animation, overlay, effect and ambience state.
     pub fn tick_gameplay_frame(&mut self, dt_secs: f32) {
-        if !dt_secs.is_finite() || dt_secs <= 0.0 { return; }
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return;
+        }
         let dt = dt_secs.min(0.25);
         self.swing_progress = (self.swing_progress + dt / 0.3).min(1.0);
         self.attack_cooldown = (self.attack_cooldown + dt * self.attack_speed / 0.9).min(1.0);
@@ -8708,29 +9218,54 @@ impl LiveSession {
         let effect_ticks = (self.status_effect_accumulator / 0.05).floor() as i32;
         if effect_ticks > 0 {
             self.status_effect_accumulator -= effect_ticks as f32 * 0.05;
-            if let Some(effects) = self.player_entity_id.and_then(|id| self.mob_effects.get_mut(&id)) {
-                for effect in effects.values_mut() { if effect.duration > 0 { effect.duration = (effect.duration - effect_ticks).max(0); } }
+            if let Some(effects) = self
+                .player_entity_id
+                .and_then(|id| self.mob_effects.get_mut(&id))
+            {
+                for effect in effects.values_mut() {
+                    if effect.duration > 0 {
+                        effect.duration = (effect.duration - effect_ticks).max(0);
+                    }
+                }
                 effects.retain(|_, effect| effect.duration != 0);
                 self.sync_hud_status_effects();
             }
         }
-        let flags = self.player_entity_id.and_then(|id| self.entity_metadata.get(&id)).and_then(|meta| meta.flags).unwrap_or(0);
+        let flags = self
+            .player_entity_id
+            .and_then(|id| self.entity_metadata.get(&id))
+            .and_then(|meta| meta.flags)
+            .unwrap_or(0);
         let overlay = megu_ui::state::HudScreenOverlay {
             hurt_alpha: self.hurt_flash_alpha,
             fire_alpha: if flags & 0x01 != 0 { 0.75 } else { 0.0 },
-            underwater_alpha: if self.physics_state.eye_in_water { 1.0 } else { 0.0 },
+            underwater_alpha: if self.physics_state.eye_in_water {
+                1.0
+            } else {
+                0.0
+            },
             portal_alpha: self.hud.screen_overlay.portal_alpha,
             freezing_alpha: self.hud.screen_overlay.freezing_alpha,
             pumpkin_blur: self.hud.screen_overlay.pumpkin_blur,
-            vignette_alpha: self.hud.screen_overlay.vignette_alpha.max(self.thunder_flash),
+            vignette_alpha: self
+                .hud
+                .screen_overlay
+                .vignette_alpha
+                .max(self.thunder_flash),
         };
         self.hud.screen_overlay = overlay;
         if self.ambient_bgm_cooldown <= 0.0 && self.ambient_bgm_clock >= 600.0 {
-            let name = if self.world.dimension.name == "minecraft:the_nether" { "minecraft:music.nether.nether_wastes" }
-                else if self.world.dimension.name == "minecraft:the_end" { "minecraft:music.end" }
-                else if self.hud.game_mode == 1 { "minecraft:music.creative" }
-                else if self.physics_state.eye_in_water { "minecraft:music.under_water" }
-                else { "minecraft:music.game" };
+            let name = if self.world.dimension.name == "minecraft:the_nether" {
+                "minecraft:music.nether.nether_wastes"
+            } else if self.world.dimension.name == "minecraft:the_end" {
+                "minecraft:music.end"
+            } else if self.hud.game_mode == 1 {
+                "minecraft:music.creative"
+            } else if self.physics_state.eye_in_water {
+                "minecraft:music.under_water"
+            } else {
+                "minecraft:music.game"
+            };
             self.emit_player_sound(name, 1.0, 1.0);
             self.ambient_bgm_clock = 0.0;
             self.ambient_bgm_cooldown = 600.0;
@@ -8738,20 +9273,46 @@ impl LiveSession {
     }
 
     pub fn gameplay_screen_overlay(&self) -> GameplayScreenOverlay {
-        GameplayScreenOverlay { hurt_alpha: self.hud.screen_overlay.hurt_alpha, fire_alpha: self.hud.screen_overlay.fire_alpha, underwater_alpha: self.hud.screen_overlay.underwater_alpha, portal_alpha: self.hud.screen_overlay.portal_alpha, freezing_alpha: self.hud.screen_overlay.freezing_alpha, pumpkin_alpha: if self.hud.screen_overlay.pumpkin_blur { 1.0 } else { 0.0 }, vignette_alpha: self.hud.screen_overlay.vignette_alpha, time_secs: self.ambient_bgm_clock }
+        GameplayScreenOverlay {
+            hurt_alpha: self.hud.screen_overlay.hurt_alpha,
+            fire_alpha: self.hud.screen_overlay.fire_alpha,
+            underwater_alpha: self.hud.screen_overlay.underwater_alpha,
+            portal_alpha: self.hud.screen_overlay.portal_alpha,
+            freezing_alpha: self.hud.screen_overlay.freezing_alpha,
+            pumpkin_alpha: if self.hud.screen_overlay.pumpkin_blur {
+                1.0
+            } else {
+                0.0
+            },
+            vignette_alpha: self.hud.screen_overlay.vignette_alpha,
+            time_secs: self.ambient_bgm_clock,
+        }
     }
 
-    pub fn thunder_flash(&self) -> f32 { self.thunder_flash }
+    pub fn thunder_flash(&self) -> f32 {
+        self.thunder_flash
+    }
 
     pub fn take_pending_end_credits(&mut self) -> bool {
         std::mem::replace(&mut self.pending_end_credits, false)
     }
 
-    pub fn play_ui_click(&mut self) { self.emit_player_sound("minecraft:ui.button.click", 0.25, 1.0); }
+    pub fn play_ui_click(&mut self) {
+        self.emit_player_sound("minecraft:ui.button.click", 0.25, 1.0);
+    }
 
-    pub fn apply_biome_colormaps(&mut self, assets: &crate::vanilla_world_assets::VanillaWorldAssets) {
-        let grass = assets.colormaps.get(&crate::vanilla_world_assets::VanillaColormap::Grass).map(|texture| texture.rgba.clone());
-        let foliage = assets.colormaps.get(&crate::vanilla_world_assets::VanillaColormap::Foliage).map(|texture| texture.rgba.clone());
+    pub fn apply_biome_colormaps(
+        &mut self,
+        assets: &crate::vanilla_world_assets::VanillaWorldAssets,
+    ) {
+        let grass = assets
+            .colormaps
+            .get(&crate::vanilla_world_assets::VanillaColormap::Grass)
+            .map(|texture| texture.rgba.clone());
+        let foliage = assets
+            .colormaps
+            .get(&crate::vanilla_world_assets::VanillaColormap::Foliage)
+            .map(|texture| texture.rgba.clone());
         if let Ok(map) = megu_client::world::BiomeColormap::from_rgba(grass, foliage) {
             let mut resolver = megu_client::world::BiomeTintResolver::default();
             resolver.set_colormap(map);
@@ -8791,7 +9352,13 @@ impl LiveSession {
             self.on_tree_shake(center, None, (data.max(1) as f32 / 20.0).clamp(0.2, 1.0));
         } else if matches!(event, 2002 | 2007) {
             let tick = self.next_tactile_event_tick();
-            self.tactile_sim.emit_fluid_entry(&FluidEntryEvent { pos: center, impact_speed: 0.0, body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob, is_lava: false, seed_tick: tick });
+            self.tactile_sim.emit_fluid_entry(&FluidEntryEvent {
+                pos: center,
+                impact_speed: 0.0,
+                body: megu_client_mesh::tactile_effects::FluidEntryBody::PlayerOrMediumMob,
+                is_lava: false,
+                seed_tick: tick,
+            });
         }
         if let Some((name, category, volume, pitch)) = level_event_sound(event, data) {
             self.emit_effect_sound(name, category, volume, pitch, center);
@@ -9407,10 +9974,22 @@ fn run_connection(
                     client.send_player_abilities(flags)?;
                 }
                 Ok(WorkerCommand::ReleaseUseItem) => client.send_release_use_item()?,
-                Ok(WorkerCommand::MoveVehicle { x, y, z, yaw, pitch }) => client.send_move_vehicle(x, y, z, yaw, pitch)?,
-                Ok(WorkerCommand::PaddleBoat { left, right }) => client.send_paddle_boat(left, right)?,
+                Ok(WorkerCommand::MoveVehicle {
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    pitch,
+                }) => client.send_move_vehicle(x, y, z, yaw, pitch)?,
+                Ok(WorkerCommand::PaddleBoat { left, right }) => {
+                    client.send_paddle_boat(left, right)?
+                }
                 Ok(WorkerCommand::PickItem { slot }) => client.send_pick_item(slot)?,
-                Ok(WorkerCommand::CreativeModeSlot { slot, item_id, count }) => client.send_set_creative_mode_slot(slot, item_id, count)?,
+                Ok(WorkerCommand::CreativeModeSlot {
+                    slot,
+                    item_id,
+                    count,
+                }) => client.send_set_creative_mode_slot(slot, item_id, count)?,
                 Ok(WorkerCommand::EditBook { slot, pages, title }) => {
                     let pages: Vec<&str> = pages.iter().map(String::as_str).collect();
                     client.send_edit_book(slot, &pages, title.as_deref())?;
@@ -10001,7 +10580,10 @@ const fn ducb_submit_cap(arm: usize) -> usize {
 /// material families win over shared substrings (`sandstone` is
 /// pickaxe-class, `iron_door` pickaxe over axe).
 fn preferred_harvest_tool(block_id: &str) -> Option<HarvestTool> {
-    let path = block_id.rsplit(':').next().unwrap_or(block_id);
+    let path = block_state_base_name(block_id)
+        .rsplit(':')
+        .next()
+        .unwrap_or(block_id);
     const PICKAXE: &[&str] = &[
         "stone",
         "ore",
@@ -10824,12 +11406,7 @@ mod tests {
                     assert_eq!(body, vec![2]);
                     trade_selected = true;
                 }
-                if keep_alive
-                    && accepted_teleport
-                    && renamed
-                    && beacon_set
-                    && trade_selected
-                {
+                if keep_alive && accepted_teleport && renamed && beacon_set && trade_selected {
                     break;
                 }
             }
