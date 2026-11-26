@@ -1041,30 +1041,33 @@ impl ContainerScreenState {
             let lx = x - panel.x - CONTENT_PAD;
             let ly = y - panel.y - CONTENT_PAD;
             let level = self.property(0).clamp(0, 4);
+            // Protocol 767 0-based `minecraft:mob_effect` registry IDs:
+            // Speed=0, Haste=2, Strength=4, Jump=7, Regeneration=9, Resistance=10.
+            // `-1` marks the tier-4 secondary mirror of the chosen primary effect.
             let choices: &[(i32, i32, i32, i32, i32)] = &[
-                (1, 24, 54, 44, 14),
-                (3, 72, 54, 44, 14),
-                (11, 24, 72, 44, 14),
-                (8, 72, 72, 44, 14),
-                (5, 24, 90, 44, 14),
-                (10, 24, 108, 44, 14),
-                (0, 72, 108, 44, 14),
+                (0, 24, 54, 44, 14),
+                (2, 72, 54, 44, 14),
+                (10, 24, 72, 44, 14),
+                (7, 72, 72, 44, 14),
+                (4, 24, 90, 44, 14),
+                (9, 24, 108, 44, 14),
+                (-1, 72, 108, 44, 14),
             ];
             for &(id, bx, by, bw, bh) in choices {
-                let tier = if id == 1 || id == 3 {
+                let tier = if id == 0 || id == 2 {
                     1
-                } else if id == 11 || id == 8 {
+                } else if id == 10 || id == 7 {
                     2
-                } else if id == 5 {
+                } else if id == 4 {
                     3
                 } else {
                     4
                 };
                 if level >= tier && UiRect::new(bx, by, bw as u32, bh as u32).contains(lx, ly) {
-                    if id == 0 {
+                    if id == -1 {
                         self.beacon_secondary = self.beacon_primary;
-                    } else if id == 10 {
-                        self.beacon_secondary = Some(10);
+                    } else if id == 9 {
+                        self.beacon_secondary = Some(9);
                     } else {
                         self.beacon_primary = Some(id);
                     }
@@ -1095,7 +1098,7 @@ impl ContainerScreenState {
         let panel = self.panel_rect(viewport_w, viewport_h);
         let local_x = x - panel.x - CONTENT_PAD;
         let local_y = y - panel.y - CONTENT_PAD;
-        if self.schema.menu_id == 7 {
+        if self.schema.menu_id == 7 && self.cursor.as_ref().is_none_or(UiItemStack::is_empty) {
             for (slot, def) in CRAFTER_GRID.iter().enumerate() {
                 if UiRect::new(def.x, def.y, SLOT_SIZE as u32, SLOT_SIZE as u32)
                     .contains(local_x, local_y)
@@ -1615,8 +1618,7 @@ impl ContainerScreenState {
             out.border_rect(panel, palette::PANEL_BORDER, 1);
         }
         if panel.w >= 20 && panel.h >= 12 {
-            let title = format!("{}  #{}", self.title, self.schema.menu_id);
-            let clipped = clip_text(&title, (panel.w as i32 - 12).max(0));
+            let clipped = clip_text(&self.title, (panel.w as i32 - 12).max(0));
             out.text(panel.x + 6, panel.y + 4, 1, palette::TEXT, clipped);
         }
         if viewport_w < self.schema.panel_w || viewport_h < self.schema.panel_h {
@@ -1940,20 +1942,22 @@ impl ContainerScreenState {
             }
             9 => {
                 let controls = [
-                    (1, 24, 54, "Speed", 1),
-                    (3, 72, 54, "Haste", 1),
-                    (11, 24, 72, "Resist", 2),
-                    (8, 72, 72, "Jump", 2),
-                    (5, 24, 90, "Strength", 3),
-                    (10, 24, 108, "Regen", 4),
-                    (0, 72, 108, "Secondary", 4),
+                    (0, 24, 54, "Speed", 1),
+                    (2, 72, 54, "Haste", 1),
+                    (10, 24, 72, "Resist", 2),
+                    (7, 72, 72, "Jump", 2),
+                    (4, 24, 90, "Strength", 3),
+                    (9, 24, 108, "Regen", 4),
+                    (-1, 72, 108, "Secondary", 4),
                 ];
                 let level = self.property(0).clamp(0, 4);
                 for (id, x, y, label, tier) in controls {
                     let rect = UiRect::new(px + x, py + y, 44, 14);
                     let enabled = level >= tier;
-                    let selected = if id == 0 {
+                    let selected = if id == -1 {
                         self.beacon_secondary.is_some()
+                    } else if id == 9 {
+                        self.beacon_secondary == Some(9)
                     } else {
                         self.beacon_primary == Some(id)
                     };
@@ -2290,7 +2294,6 @@ impl ContainerScreenState {
 
 fn default_loom_patterns() -> Vec<String> {
     [
-        "base",
         "square_bottom_left",
         "square_bottom_right",
         "square_top_left",
@@ -2343,7 +2346,7 @@ fn ghost_item(menu_id: u32, slot: i16) -> Option<&'static str> {
         (9, 0) => Some("minecraft:iron_ingot"),
         (10 | 14 | 22, 0) => Some("minecraft:iron_ore"),
         (10 | 14 | 22, 1) => Some("minecraft:coal"),
-        (11, 1..=3) => Some("minecraft:glass_bottle"),
+        (11, 0..=2) => Some("minecraft:glass_bottle"),
         (11, 4) => Some("minecraft:blaze_powder"),
         (12, 1..=9) => Some("minecraft:oak_planks"),
         (13, 0) => Some("minecraft:book"),
@@ -2437,7 +2440,12 @@ impl ContainerScreenState {
                 if !self.accepts_placement(slot_index, &carried) {
                     return Some(self.finish_action(slot_index, button, 0, &changed));
                 }
-                let place = u32::from(carried.count).min(u32::from(carried.max_stack));
+                let place = if button == 1 {
+                    1u32
+                } else {
+                    u32::from(carried.count)
+                }
+                .min(u32::from(carried.max_stack));
                 let place = place as u8;
                 let mut placed = carried.clone();
                 placed.count = place;
@@ -2469,7 +2477,19 @@ impl ContainerScreenState {
                 changed.insert(slot_index);
             }
             (false, Some(mut carried)) => {
-                if slot_stack.same_stackable(&carried) {
+                if !self.accepts_placement(slot_index, &carried) {
+                    // Output slot with matching cursor: Vanilla takes the output into cursor if space permits.
+                    if matches!(self.slot_kind(slot_index), Some(SlotKind::Output))
+                        && slot_stack.same_stackable(&carried)
+                        && u32::from(carried.count) + u32::from(slot_stack.count)
+                            <= u32::from(carried.max_stack)
+                    {
+                        carried.count += slot_stack.count;
+                        self.slots[index] = UiItemStack::empty();
+                        self.cursor = Some(carried);
+                        changed.insert(slot_index);
+                    }
+                } else if slot_stack.same_stackable(&carried) {
                     let capacity =
                         u32::from(slot_stack.max_stack).saturating_sub(u32::from(slot_stack.count));
                     let amount = if button == 1 {
@@ -2492,7 +2512,7 @@ impl ContainerScreenState {
                         Some(carried)
                     };
                     changed.insert(slot_index);
-                } else if self.accepts_placement(slot_index, &carried) {
+                } else {
                     let old_slot = self.slots[index].clone();
                     self.slots[index] = carried;
                     self.cursor = Some(old_slot);
@@ -2510,6 +2530,7 @@ impl ContainerScreenState {
             return None;
         }
         let mut changed = BTreeSet::new();
+        // Pass 1 (Vanilla order): merge into existing compatible partial stacks first.
         for &target in targets {
             if stack.is_empty() {
                 break;
@@ -2519,14 +2540,7 @@ impl ContainerScreenState {
                 continue;
             }
             let current = self.slots[t].clone();
-            if current.is_empty() {
-                let amount = u32::from(stack.count).min(u32::from(stack.max_stack));
-                let mut placed = stack.clone();
-                placed.count = amount as u8;
-                stack.count -= amount as u8;
-                self.slots[t] = placed;
-                changed.insert(target);
-            } else if current.same_stackable(&stack) {
+            if !current.is_empty() && current.same_stackable(&stack) {
                 let capacity =
                     u32::from(current.max_stack).saturating_sub(u32::from(current.count));
                 let amount = u32::from(stack.count).min(capacity);
@@ -2537,6 +2551,24 @@ impl ContainerScreenState {
                 merged.count += amount as u8;
                 stack.count -= amount as u8;
                 self.slots[t] = merged;
+                changed.insert(target);
+            }
+        }
+        // Pass 2: fill empty slots with whatever remains.
+        for &target in targets {
+            if stack.is_empty() {
+                break;
+            }
+            let t = usize::try_from(target).ok()?;
+            if t >= self.slots.len() || !self.accepts_placement(target, &stack) {
+                continue;
+            }
+            if self.slots[t].is_empty() {
+                let amount = u32::from(stack.count).min(u32::from(stack.max_stack));
+                let mut placed = stack.clone();
+                placed.count = amount as u8;
+                stack.count -= amount as u8;
+                self.slots[t] = placed;
                 changed.insert(target);
             }
         }
@@ -2580,8 +2612,27 @@ impl ContainerScreenState {
     fn hotbar_swap(&mut self, slot_index: i16, hotbar_index: i8) -> Option<ClickWindowAction> {
         if hotbar_index == 40 {
             let index = usize::try_from(slot_index).ok()?;
-            if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX { return None; }
-            return Some(self.finish_action(slot_index, hotbar_index, 2, &BTreeSet::new()));
+            if index >= self.slots.len() || slot_index == EMPTY_SLOT_INDEX {
+                return None;
+            }
+            let mut changed = BTreeSet::new();
+            // Window-0 player inventory carries the offhand at slot 45; predict its swap locally.
+            if self.slots.len() == 46
+                && self.slot_kind(45) == Some(SlotKind::Offhand)
+                && index != 45
+            {
+                let a = self.slots[index].clone();
+                let b = self.slots[45].clone();
+                if (a.is_empty() || self.accepts_placement(45, &a))
+                    && (b.is_empty() || self.accepts_placement(slot_index, &b))
+                {
+                    self.slots[index] = b;
+                    self.slots[45] = a;
+                    changed.insert(slot_index);
+                    changed.insert(45);
+                }
+            }
+            return Some(self.finish_action(slot_index, hotbar_index, 2, &changed));
         }
         if !(0..=8).contains(&hotbar_index) || !self.schema.has_player_inventory {
             return None;
@@ -2636,37 +2687,62 @@ impl ContainerScreenState {
         Some(self.finish_action(slot_index, button, 4, &changed))
     }
 
+    fn drag_can_admit(&self, slot_index: i16, carried: &UiItemStack) -> bool {
+        let Ok(index) = usize::try_from(slot_index) else {
+            return false;
+        };
+        let Some(existing) = self.slots.get(index) else {
+            return false;
+        };
+        self.accepts_placement(slot_index, carried)
+            && (existing.is_empty() || existing.same_stackable(carried))
+    }
+
     fn drag_click(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {
         if slot_index == EMPTY_SLOT_INDEX {
+            if self.drag_mode.is_none() {
+                let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
+                let mouse_button = if button == 1 || button == 4 { 1u8 } else { 0u8 };
+                self.drag_mode = Some(DragState {
+                    button: mouse_button,
+                    slots: Vec::new(),
+                });
+                let start_btn = if mouse_button == 0 { 0i8 } else { 4i8 };
+                let _ = carried;
+                return Some(self.finish_action(EMPTY_SLOT_INDEX, start_btn, 5, &BTreeSet::new()));
+            }
             return self.drag_end();
         }
         let index = usize::try_from(slot_index).ok()?;
         if index >= self.slots.len() {
             return None;
         }
+        let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
         if self.drag_mode.is_none() {
-            let carried = self.cursor.clone()?;
-            if carried.is_empty() || !self.accepts_placement(slot_index, &carried) {
+            if !self.drag_can_admit(slot_index, &carried) {
                 return None;
             }
+            let mouse_button = if button == 1 || button == 4 || button == 5 {
+                1u8
+            } else {
+                0u8
+            };
             self.drag_mode = Some(DragState {
-                button: button.max(0) as u8,
+                button: mouse_button,
                 slots: vec![slot_index],
             });
-            let mut changed = BTreeSet::new();
-            changed.insert(slot_index);
-            return Some(self.finish_action(slot_index, button, 5, &changed));
+            let add_btn = if mouse_button == 0 { 1i8 } else { 5i8 };
+            return Some(self.finish_action(slot_index, add_btn, 5, &BTreeSet::new()));
         }
-        let probe = self.cursor.clone().unwrap_or_else(UiItemStack::empty);
-        let accepts = self.accepts_placement(slot_index, &probe);
+        let admits = self.drag_can_admit(slot_index, &carried);
+        let max_slots = usize::from(carried.count);
         let drag = self.drag_mode.as_mut()?;
-        if !drag.slots.contains(&slot_index) && accepts {
+        let add_btn = if drag.button == 0 { 1i8 } else { 5i8 };
+        if admits && !drag.slots.contains(&slot_index) && drag.slots.len() < max_slots {
             drag.slots.push(slot_index);
             drag.slots.sort_unstable();
         }
-        let mut changed = BTreeSet::new();
-        changed.insert(slot_index);
-        Some(self.finish_action(slot_index, button, 5, &changed))
+        Some(self.finish_action(slot_index, add_btn, 5, &BTreeSet::new()))
     }
 
     /// Begin or extend a protocol-mode-5 distribution gesture at `slot`.
@@ -2685,17 +2761,18 @@ impl ContainerScreenState {
 
     pub fn drag_end(&mut self) -> Option<ClickWindowAction> {
         let drag = self.drag_mode.take()?;
+        let end_btn = if drag.button == 0 { 2i8 } else { 6i8 };
         let carried = self.cursor.clone().filter(|s| !s.is_empty())?;
         let slots: Vec<i16> = drag
             .slots
             .iter()
             .copied()
-            .filter(|&s| self.accepts_placement(s, &carried))
+            .filter(|&s| self.drag_can_admit(s, &carried))
             .collect();
         if slots.is_empty() {
             return Some(self.finish_action(
                 EMPTY_SLOT_INDEX,
-                drag.button as i8,
+                end_btn,
                 5,
                 &BTreeSet::new(),
             ));
@@ -2709,7 +2786,7 @@ impl ContainerScreenState {
         if per == 0 {
             return Some(self.finish_action(
                 EMPTY_SLOT_INDEX,
-                drag.button as i8,
+                end_btn,
                 5,
                 &BTreeSet::new(),
             ));
@@ -2749,7 +2826,7 @@ impl ContainerScreenState {
             cursor.count = remaining as u8;
             self.cursor = if remaining == 0 { None } else { Some(cursor) };
         }
-        Some(self.finish_action(EMPTY_SLOT_INDEX, drag.button as i8, 5, &changed))
+        Some(self.finish_action(EMPTY_SLOT_INDEX, end_btn, 5, &changed))
     }
 
     fn collect_to_cursor(&mut self, slot_index: i16, button: i8) -> Option<ClickWindowAction> {

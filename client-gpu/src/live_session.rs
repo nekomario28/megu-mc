@@ -724,14 +724,16 @@ fn ground_surface_for_name(name: &str) -> GroundSurfaceKind {
 }
 
 fn status_effect_name(id: i32) -> &'static str {
+    // Protocol 767 (Minecraft 1.21.1) 0-based `minecraft:mob_effect` registry IDs.
     match id {
-        1 => "speed", 2 => "slowness", 3 => "haste", 4 => "mining_fatigue", 5 => "strength",
-        6 => "instant_health", 7 => "instant_damage", 8 => "jump_boost", 9 => "nausea", 10 => "regeneration",
-        11 => "resistance", 12 => "fire_resistance", 13 => "water_breathing", 14 => "invisibility", 15 => "blindness",
-        16 => "night_vision", 17 => "hunger", 18 => "weakness", 19 => "poison", 20 => "wither", 21 => "health_boost",
-        22 => "absorption", 23 => "saturation", 24 => "glowing", 25 => "levitation", 26 => "luck", 27 => "bad_luck",
-        28 => "slow_falling", 29 => "conduit_power", 30 => "dolphins_grace", 31 => "bad_omen", 32 => "hero_of_the_village",
-        33 => "darkness", _ => "unknown",
+        0 => "speed", 1 => "slowness", 2 => "haste", 3 => "mining_fatigue", 4 => "strength",
+        5 => "instant_health", 6 => "instant_damage", 7 => "jump_boost", 8 => "nausea", 9 => "regeneration",
+        10 => "resistance", 11 => "fire_resistance", 12 => "water_breathing", 13 => "invisibility", 14 => "blindness",
+        15 => "night_vision", 16 => "hunger", 17 => "weakness", 18 => "poison", 19 => "wither", 20 => "health_boost",
+        21 => "absorption", 22 => "saturation", 23 => "glowing", 24 => "levitation", 25 => "luck", 26 => "unluck",
+        27 => "slow_falling", 28 => "conduit_power", 29 => "dolphins_grace", 30 => "bad_omen", 31 => "hero_of_the_village",
+        32 => "darkness", 33 => "trial_omen", 34 => "raid_omen", 35 => "wind_charged", 36 => "weaving",
+        37 => "oozing", 38 => "infested", _ => "unknown",
     }
 }
 
@@ -5497,7 +5499,7 @@ impl LiveSession {
     }
 
     pub fn send_pick_item_for_block(&mut self, block_name: &str) -> bool {
-        let found = self.player_inventory.iter().filter_map(|(&slot, stack)| ((0..=44).contains(&slot) && stack.count > 0).then_some((slot, stack)))
+        let found = self.player_inventory.iter().filter_map(|(&slot, stack)| ((9..=44).contains(&slot) && stack.count > 0).then_some((slot, stack)))
             .find(|(_, stack)| crate::recipe_ingest::item_name_for_id(stack.item_id as u32) == block_name).map(|(slot, _)| slot);
         let Some(slot) = found else { return false };
         if (36..=44).contains(&slot) { self.set_carried_item(slot - 36); }
@@ -5926,11 +5928,12 @@ impl LiveSession {
                 else {
                     return false;
                 };
+                // Protocol 767 `container_slot_state_changed` (`0x10`): `state = true` enables the slot.
                 self.outgoing
                     .try_send(WorkerCommand::ContainerSlotStateChanged {
                         slot_id: *slot,
                         window_id,
-                        state: *disabled,
+                        state: !*disabled,
                     })
                     .is_ok()
             }
@@ -5953,7 +5956,7 @@ impl LiveSession {
             .try_send(WorkerCommand::ContainerSlotStateChanged {
                 slot_id,
                 window_id: i32::from(window_id),
-                state: disabled,
+                state: !disabled,
             })
             .is_err()
         {
@@ -6811,7 +6814,9 @@ impl LiveSession {
             self.hud_sync_skips += 1;
             return false;
         }
+        let hud_hidden = hud.hud_hidden;
         *hud = self.hud.clone();
+        hud.hud_hidden = hud_hidden;
         self.last_synced_hud_revision = self.hud_revision;
         true
     }
@@ -7689,13 +7694,25 @@ impl LiveSession {
             PlayEvent::JoinGame { entity_id, .. } => {
                 self.player_entity_id = Some(entity_id);
                 self.reset_dimension();
+                if let Some(mode) = self.world.game_mode {
+                    self.game_mode = i32::from(mode);
+                    self.hud.game_mode = i32::from(mode);
+                    self.hud_revision = self.hud_revision.wrapping_add(1);
+                }
             }
             PlayEvent::PlayerCombatKill { .. } => {
                 // `death.apply` above already folded the kill into the
                 // death loop (dead + cause + victim id); the UI sync
                 // turns it into `Screen::Death`.
             }
-            PlayEvent::Respawn { .. } => self.reset_dimension(),
+            PlayEvent::Respawn { .. } => {
+                self.reset_dimension();
+                if let Some(mode) = self.world.game_mode {
+                    self.game_mode = i32::from(mode);
+                    self.hud.game_mode = i32::from(mode);
+                    self.hud_revision = self.hud_revision.wrapping_add(1);
+                }
+            }
             PlayEvent::Teleport(teleport) => {
                 let previous = self.pose;
                 let pose = PlayerPose::from_teleport(&teleport, self.pose);
@@ -8151,19 +8168,43 @@ impl LiveSession {
             PlayEvent::HurtAnimation { eid, .. } if Some(eid) == self.player_entity_id => { self.hurt_flash_alpha = 1.0; }
             PlayEvent::SetPassengers { vehicle, passengers } => {
                 let local = self.player_entity_id;
-                if passengers.iter().any(|id| Some(*id) == local) { self.riding_vehicle = Some(vehicle); }
-                else if self.riding_vehicle == Some(vehicle) { self.riding_vehicle = None; }
+                if passengers.iter().any(|id| Some(*id) == local) {
+                    self.riding_vehicle = Some(vehicle);
+                    let hp = self
+                        .entity_metadata
+                        .get(&vehicle)
+                        .and_then(|meta| meta.living_health)
+                        .filter(|v| v.is_finite() && *v > 0.0);
+                    self.hud.mount_health = hp.map(|h| (h, h.max(20.0)));
+                    self.hud.mount_jump_charge = Some(0.0);
+                    self.hud_revision = self.hud_revision.wrapping_add(1);
+                } else if self.riding_vehicle == Some(vehicle) {
+                    self.riding_vehicle = None;
+                    self.hud.mount_health = None;
+                    self.hud.mount_jump_charge = None;
+                    self.hud_revision = self.hud_revision.wrapping_add(1);
+                }
             }
             PlayEvent::MoveVehicle { x, y, z, yaw, pitch } => {
-                if let Some(vehicle) = self.riding_vehicle {
-                    self.entity_positions.insert(vehicle, [x, y, z]);
-                    if let Some(entity) = self.world.entities.get_mut(&vehicle) { entity.pos = [x, y, z]; }
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() || !yaw.is_finite() || !pitch.is_finite() {
+                    return Ok(());
                 }
+                let Some(vehicle) = self.riding_vehicle else {
+                    return Ok(());
+                };
+                self.entity_positions.insert(vehicle, [x, y, z]);
+                if let Some(entity) = self.world.entities.get_mut(&vehicle) { entity.pos = [x, y, z]; }
                 if let Some(mut pose) = self.pose { pose.feet = [x, y, z]; pose.yaw = yaw; pose.pitch = pitch; self.pose = Some(pose); self.physics_state.pos = [x, y, z]; }
             }
             PlayEvent::BlockDestruction { breaker_eid, pos, stage } => {
-                if stage <= 9 && (self.remote_block_destruction.len() < 128 || self.remote_block_destruction.contains_key(&breaker_eid)) { self.remote_block_destruction.insert(breaker_eid, (pos, stage.max(0) as u8)); }
-                else { self.remote_block_destruction.remove(&breaker_eid); }
+                if (0..=9).contains(&stage)
+                    && (self.remote_block_destruction.len() < 128
+                        || self.remote_block_destruction.contains_key(&breaker_eid))
+                {
+                    self.remote_block_destruction.insert(breaker_eid, (pos, stage as u8));
+                } else {
+                    self.remote_block_destruction.remove(&breaker_eid);
+                }
             }
             PlayEvent::SetTitle {
                 fade_in,
@@ -8584,10 +8625,15 @@ impl LiveSession {
                 self.hud_revision += 1;
             }
             GAME_EVENT_WIN_GAME => {
-                // `value != 0` rolls credits before the respawn; the
-                // credits screen is not implemented, so the request is
-                // recorded until the dimension reset clears it.
-                self.pending_end_credits = value != 0.0;
+                // Protocol 767: value 0 immediately requests `PERFORM_RESPAWN`
+                // so exiting the End never strands the player; value != 0 opens
+                // the End Credits screen (respawn triggers on close/finish).
+                if value == 0.0 {
+                    self.pending_end_credits = false;
+                    self.request_respawn();
+                } else {
+                    self.pending_end_credits = true;
+                }
             }
             GAME_EVENT_DEMO => {
                 if let Some(line) = demo_hint_line(value as i32) {
@@ -8622,15 +8668,28 @@ impl LiveSession {
 
     fn sync_hud_status_effects(&mut self) {
         let Some(eid) = self.player_entity_id else { self.hud.status_effects.clear(); return; };
-        self.hud.status_effects = self.mob_effects.get(&eid).into_iter().flat_map(|effects| effects.iter()).map(|(id, effect)| {
-            megu_ui::state::LiveStatusEffect {
+        self.hud.status_effects = self
+            .mob_effects
+            .get(&eid)
+            .into_iter()
+            .flat_map(|effects| effects.iter())
+            .filter(|(_, effect)| effect.flags == 0 || (effect.flags & 0x04) != 0)
+            .map(|(id, effect)| megu_ui::state::LiveStatusEffect {
                 effect_id: *id,
                 name: status_effect_name(*id).to_string(),
                 amplifier: effect.amplifier.clamp(0, u8::MAX as i32) as u8,
-                duration_ticks: effect.duration.max(0) as u32,
-                beneficial: matches!(*id, 1 | 3 | 5 | 8 | 10 | 11 | 12 | 13 | 16 | 18 | 25 | 26 | 29 | 30 | 32 | 33 | 34),
-            }
-        }).collect();
+                duration_ticks: if effect.duration < 0 {
+                    u32::MAX
+                } else {
+                    effect.duration as u32
+                },
+                // Protocol 767 0-based beneficial effect registry IDs.
+                beneficial: matches!(
+                    *id,
+                    0 | 2 | 4 | 5 | 7 | 9 | 10 | 11 | 12 | 13 | 15 | 20 | 21 | 22 | 25 | 27 | 28 | 29 | 31
+                ),
+            })
+            .collect();
         self.hud_revision = self.hud_revision.wrapping_add(1);
     }
 
@@ -10194,7 +10253,7 @@ mod tests {
             WorkerCommand::ContainerSlotStateChanged {
                 slot_id: 8,
                 window_id: 4,
-                state: true
+                state: false
             }
         ));
         assert!(matches!(
@@ -10202,7 +10261,7 @@ mod tests {
             WorkerCommand::ContainerSlotStateChanged {
                 slot_id: 8,
                 window_id: 4,
-                state: false
+                state: true
             }
         ));
         assert!(rx.try_recv().is_err());
@@ -13112,7 +13171,7 @@ mod tests {
         assert_eq!(live.world.block_events.len(), 1);
 
         live.apply_event(ClientPlayEvent::Play(PlayEvent::LevelParticles {
-            particle_id: 14,
+            particle_id: 13,
             long_distance: false,
             x: 1.0,
             y: 65.0,

@@ -52,12 +52,6 @@
     },
     {
       "check": "s2c_play_event_consumption",
-      "id": "PlayEvent::HorseScreenOpen",
-      "priority": "P2",
-      "reason": "horse_screen_open drops \u2014 horse inventory screen unimplemented"
-    },
-    {
-      "check": "s2c_play_event_consumption",
       "id": "PlayEvent::InitializeBorder",
       "priority": "P2",
       "reason": "initialize_border drops \u2014 world border state ignored"

@@ -297,7 +297,7 @@ fn beacon_selection_is_tier_gated_and_confirm_emits_selection() {
     );
     state.set_property(0, 3);
     state.click_at(x, y, 854.0, 480.0);
-    assert_eq!(state.beacon_primary, Some(1));
+    assert_eq!(state.beacon_primary, Some(0));
     let (x, y) = point(24, 108);
     state.click_at(x, y, 854.0, 480.0);
     assert_eq!(
@@ -306,13 +306,13 @@ fn beacon_selection_is_tier_gated_and_confirm_emits_selection() {
     );
     state.set_property(0, 4);
     state.click_at(x, y, 854.0, 480.0);
-    assert_eq!(state.beacon_secondary, Some(10));
+    assert_eq!(state.beacon_secondary, Some(9));
     let (x, y) = point(158, 72);
     assert_eq!(
         state.click_at(x, y, 854.0, 480.0),
         Some(WorkstationAction::SetBeacon {
-            primary: Some(1),
-            secondary: Some(10)
+            primary: Some(0),
+            secondary: Some(9)
         })
     );
 }

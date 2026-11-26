@@ -3844,7 +3844,7 @@ struct Out { @builtin(position) position: vec4<f32> };
     color = mix(color, vec3<f32>(0.85, 0.015, 0.01), hurt); alpha = max(alpha, hurt * 0.62);
     let water = overlay.effects.z * (0.24 + 0.035 * sin(uv.x * 31.0 + sin(uv.y * 17.0 + t) * 2.0));
     color = mix(color, vec3<f32>(0.02, 0.33, 0.48), water); alpha = max(alpha, water * 0.58);
-    let fire_edge = (1.0 - smoothstep(0.03, 0.50, uv.y)) * (0.72 + 0.28 * sin(uv.x * 43.0 + t * 4.0 + sin(uv.x * 15.0)));
+    let fire_edge = (1.0 - smoothstep(0.03, 0.50, 1.0 - uv.y)) * (0.72 + 0.28 * sin(uv.x * 43.0 + t * 4.0 + sin(uv.x * 15.0)));
     let fire = overlay.effects.y * fire_edge * 0.72;
     color = mix(color, vec3<f32>(1.0, 0.27 + 0.35 * fire_edge, 0.015), fire); alpha = max(alpha, fire);
     let radius = length(p); let angle = atan2(p.y, p.x);
@@ -3949,7 +3949,29 @@ pub fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Resu
     append_png_chunk(&mut png, *b"IHDR", &ihdr);
     append_png_chunk(&mut png, *b"IDAT", &zlib);
     append_png_chunk(&mut png, *b"IEND", &[]);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+    }
     std::fs::write(path, png).map_err(|error| error.to_string())
+}
+
+/// Write a screenshot PNG off the render thread so F2 never blocks frame pacing.
+pub fn spawn_rgba_png_write(
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+) -> Result<(), String> {
+    std::thread::Builder::new()
+        .name("megu-screenshot".into())
+        .spawn(move || match write_rgba_png(&path, width, height, &rgba) {
+            Ok(()) => eprintln!("[screenshot] saved {}", path.display()),
+            Err(error) => eprintln!("[screenshot] failed: {error}"),
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Minecraft-style screenshot name under `<game_dir>/screenshots`.
@@ -4020,10 +4042,17 @@ fn upload_rgba_texture(
     texture
 }
 
-fn decoded_texture_is_valid(width: u32, height: u32, rgba: &[u8]) -> bool {
+fn decoded_texture_is_valid(ctx: &GpuDevice, width: u32, height: u32, rgba: &[u8]) -> bool {
+    let max_dim = ctx.device.limits().max_texture_dimension_2d;
     width > 0
         && height > 0
-        && usize::try_from(u64::from(width) * u64::from(height) * 4).ok() == Some(rgba.len())
+        && width <= max_dim
+        && height <= max_dim
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|px| px.checked_mul(4))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            == Some(rgba.len())
 }
 
 fn upload_world_image(ctx: &GpuDevice, label: &str, image: &DecodedRgbaTexture) -> wgpu::Texture {
@@ -8392,7 +8421,7 @@ impl GpuRenderer {
         &mut self,
         atlas: &crate::vanilla_jar::VanillaEntityTextureAtlas,
     ) {
-        if decoded_texture_is_valid(atlas.width, atlas.height, &atlas.rgba) {
+        if decoded_texture_is_valid(&self.ctx, atlas.width, atlas.height, &atlas.rgba) {
             self.entity_atlas_texture = upload_rgba_texture(
                 &self.ctx,
                 "entity-texture-atlas",
@@ -8413,7 +8442,7 @@ impl GpuRenderer {
         &mut self,
         atlas: &crate::vanilla_jar::VanillaParticleTextureAtlas,
     ) {
-        if decoded_texture_is_valid(atlas.width, atlas.height, &atlas.rgba) {
+        if decoded_texture_is_valid(&self.ctx, atlas.width, atlas.height, &atlas.rgba) {
             self.particle_atlas_texture = upload_rgba_texture(
                 &self.ctx,
                 "particle-texture-atlas",
@@ -8436,7 +8465,7 @@ impl GpuRenderer {
         self.destroy_stage_textures
             .reserve(assets.destroy_stages.len());
         for image in &assets.destroy_stages {
-            if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+            if decoded_texture_is_valid(&self.ctx, image.width, image.height, &image.rgba) {
                 self.destroy_stage_textures.push(upload_rgba_texture(
                     &self.ctx,
                     "destroy-stage-texture",
@@ -8467,7 +8496,7 @@ impl GpuRenderer {
         self.world_env_textures.clear();
         for key in VanillaEnvTexture::ALL {
             if let Some(image) = assets.env_textures.get(&key) {
-                if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+                if decoded_texture_is_valid(&self.ctx, image.width, image.height, &image.rgba) {
                     self.world_env_textures.insert(
                         key,
                         upload_world_image(&self.ctx, "world-environment-texture", image),
@@ -8478,7 +8507,7 @@ impl GpuRenderer {
         self.world_overlay_textures.clear();
         for key in VanillaMiscOverlay::ALL {
             if let Some(image) = assets.misc_overlays.get(&key) {
-                if decoded_texture_is_valid(image.width, image.height, &image.rgba) {
+                if decoded_texture_is_valid(&self.ctx, image.width, image.height, &image.rgba) {
                     self.world_overlay_textures.insert(
                         key,
                         upload_world_image(&self.ctx, "world-screen-overlay-texture", image),

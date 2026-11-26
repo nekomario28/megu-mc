@@ -3075,7 +3075,12 @@ fn hud(ctx: &mut Ctx) {
         let color=if effect.beneficial {UiColor::rgb(60,150,70)} else {UiColor::rgb(160,55,55)};
         ctx.fill(x,y,16,16,color); ctx.text(x+3,y+4,1,pal::TEXT,&effect.effect_id.rem_euclid(10).to_string());
         let level=match effect.amplifier {0=>"",1=>" II",2=>" III",3=>" IV",n=>if n>=4 {" V"} else {""}};
-        let secs=effect.duration_ticks/20; let label=format!("{}{level} {:02}:{:02}",effect.name,secs/60,secs%60);
+        let label=if effect.duration_ticks == u32::MAX {
+            format!("{}{level} **:**", effect.name)
+        } else {
+            let secs=effect.duration_ticks/20;
+            format!("{}{level} {:02}:{:02}",effect.name,secs/60,secs%60)
+        };
         ctx.text(x+19,y+4,1,pal::TEXT,&label);
     }
 
@@ -3154,9 +3159,19 @@ fn hud(ctx: &mut Ctx) {
             icon_row(ctx, hx0, vy - 20, hud.absorption, 20.0, pal::ABSORPTION);
         }
         icon_row_r(ctx, rx, vy, hud.hunger as f32, 20.0, pal::HUNGER);
-        if let Some((health,max))=hud.mount_health { icon_row_r(ctx,rx,vy-10,health,max.max(1.0),pal::HEALTH); }
+        let mut right_row_y = vy - 10;
+        if let Some((health, max)) = hud.mount_health {
+            let max_hp = max.max(1.0);
+            let rows = ((max_hp / 20.0).ceil() as i32).clamp(1, 3);
+            for row in 0..rows {
+                let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
+                let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
+                icon_row_r(ctx, rx, right_row_y, row_hp, row_max, pal::HEALTH);
+                right_row_y -= 10;
+            }
+        }
         if hud.air < 300 {
-            icon_row_r(ctx, rx, vy - 10, hud.air as f32 / 30.0, 10.0, pal::AIR);
+            icon_row_r(ctx, rx, right_row_y, hud.air as f32 / 30.0, 10.0, pal::AIR);
         }
 
         // XP bar + level.

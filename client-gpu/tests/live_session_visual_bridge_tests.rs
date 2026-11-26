@@ -80,7 +80,7 @@ fn beacon_confirm_emits_the_selected_effects() {
     assert_eq!(
         action,
         WorkstationAction::SetBeacon {
-            primary: Some(1),
+            primary: Some(0),
             secondary: None,
         }
     );

@@ -5260,14 +5260,21 @@ impl GpuApp {
             (MouseButton::Right, ElementState::Pressed) => {
                 match live.crosshair_pick() {
                     Some(CrosshairPick::Entity(hit)) => {
+                        let entity_origin = live
+                            .world
+                            .entities
+                            .get(&hit.entity_id)
+                            .map(|entity| entity.pos)
+                            .unwrap_or([0.0; 3]);
                         live.interact_entity(
                             hit.entity_id,
                             Some([
-                                hit.hit_pos[0] as f32,
-                                hit.hit_pos[1] as f32,
-                                hit.hit_pos[2] as f32,
+                                (hit.hit_pos[0] - entity_origin[0]) as f32,
+                                (hit.hit_pos[1] - entity_origin[1]) as f32,
+                                (hit.hit_pos[2] - entity_origin[2]) as f32,
                             ]),
                         );
+                        live.interact_entity(hit.entity_id, None);
                     }
                     Some(CrosshairPick::Block(hit)) => {
                         if let Some((damage, max_damage)) = held_tool_durability(live) {
@@ -5303,6 +5310,7 @@ impl GpuApp {
                         live.begin_item_use(0, false);
                     }
                 }
+                live.swing(0);
             }
             (MouseButton::Right, ElementState::Released) => live.release_item_use(),
             (MouseButton::Middle, ElementState::Pressed) => {
@@ -7053,20 +7061,16 @@ impl GpuApp {
                                 active.surface_format
                             ));
                         }
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                        }
                         let mut rgba = active.renderer.read_texture_rgba(&frame.texture, w, h)?;
                         if bgra {
                             for pixel in rgba.as_chunks_mut::<4>().0 {
                                 pixel.swap(0, 2);
                             }
                         }
-                        crate::renderer::write_rgba_png(&path, w, h, &rgba)
+                        crate::renderer::spawn_rgba_png_write(path.clone(), w, h, rgba)
                     })();
-                    match result {
-                        Ok(()) => eprintln!("[screenshot] saved {}", path.display()),
-                        Err(error) => eprintln!("[screenshot] failed: {error}"),
+                    if let Err(error) = result {
+                        eprintln!("[screenshot] failed: {error}");
                     }
                 }
                 active.renderer.gpu().queue.present(frame);
@@ -7275,7 +7279,7 @@ impl GpuApp {
             self.dispatch_creative_action(megu_ui::creative_screen::CreativeInventoryAction::Close);
             return;
         }
-        if pressed && code == KeyCode::Escape && self.live.as_ref().is_some_and(LiveSession::is_sleeping) {
+        if pressed && code == KeyCode::Escape && self.live_is_sleeping() {
             self.leave_bed();
             return;
         }
@@ -7436,6 +7440,9 @@ impl GpuApp {
                 }
             }
             KeyCode::KeyC => self.camera_controller.set_zoomed(pressed && !self.paused),
+            KeyCode::F1 if pressed && !self.paused => {
+                self.ui.hud.hud_hidden = !self.ui.hud.hud_hidden;
+            }
             KeyCode::F2 if pressed => self.screenshot_pending = true,
             KeyCode::F11 if pressed => {
                 toggle_fullscreen_setting(&mut self.ui.settings);
