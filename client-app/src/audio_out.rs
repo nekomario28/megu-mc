@@ -19,7 +19,7 @@ use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Condvar, LockResult, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -29,8 +29,8 @@ use crate::audio_qol::AudioLimiter;
 use crate::protocol::{WireSoundEvent, WireStopSound};
 use crate::session::{AudioStats, OpenAirWorld, PlaySoundEvent, SoundMixer};
 use crate::sound_assets::{
-    normalize_sound_name, placeholder_pcm, sound_name_for_id, DecodedPcm, SoundEventRegistry,
-    SoundLibrary, SoundSourceData, MIX_SAMPLE_RATE,
+    normalize_sound_name, placeholder_pcm, sound_name_for_id, DecodedPcm, ResolvedSound,
+    SoundEventRegistry, SoundLibrary, SoundSourceData, MIX_SAMPLE_RATE,
 };
 use crate::spatial_audio::{
     ListenerPose, SharedListenerFdnBus, SoundSource, SpatialAudioEngine, SpatialAudioPreset,
@@ -241,11 +241,22 @@ pub fn detect_available_sinks_for_os(
 /// Serialize `pcm` (interleaved s16 stereo) to little-endian bytes — the
 /// on-the-wire/on-disk format every PCM sink shares.
 pub fn encode_pcm_le(pcm: &[i16]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(pcm.len() * 2);
-    for s in pcm {
-        bytes.extend_from_slice(&s.to_le_bytes());
-    }
-    bytes
+    pcm.iter().flat_map(|s| s.to_le_bytes()).collect()
+}
+
+/// Quantize one `-1..=1` mix sample to s16 — the single conversion every
+/// PCM path shares (identical clamp/round/scale everywhere).
+#[inline]
+fn f32_to_s16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16
+}
+
+/// Recover a poisoned lock guard — every mutex/rwlock in this file uses
+/// the same recover-and-continue policy (`LockResult` covers `Mutex`,
+/// `RwLock` reads and writes, and condvar waits uniformly).
+#[inline]
+fn unpoison<T>(res: LockResult<T>) -> T {
+    res.unwrap_or_else(|e| e.into_inner())
 }
 
 /// Exact 44-byte RIFF/WAVE header for `data_bytes` of s16 stereo PCM at
@@ -400,7 +411,7 @@ impl PcmQueue {
     /// Enqueue `chunk`, dropping the oldest queued chunks first when over
     /// capacity. Chunks larger than the whole queue are dropped outright.
     fn push(&self, chunk: Vec<u8>) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         if chunk.len() > g.cap_bytes {
             g.dropped_chunks += 1;
             return;
@@ -422,7 +433,7 @@ impl PcmQueue {
     /// for new data so the writer can notice shutdown promptly.
     #[cfg(test)]
     fn pop(&self, wait: Duration) -> Option<Vec<u8>> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         let deadline = Instant::now() + wait;
         loop {
             if let Some(chunk) = g.chunks.pop_front() {
@@ -433,10 +444,7 @@ impl PcmQueue {
                 return None;
             }
             let rem = deadline.checked_duration_since(Instant::now())?;
-            let (guard, _timeout) = self
-                .not_empty
-                .wait_timeout(g, rem)
-                .unwrap_or_else(|e| e.into_inner());
+            let (guard, _timeout) = unpoison(self.not_empty.wait_timeout(g, rem));
             g = guard;
         }
     }
@@ -444,7 +452,7 @@ impl PcmQueue {
     /// Block until a chunk arrives, or return `None` once closed and drained.
     /// Unlike [`Self::pop`], idle silence never terminates the stream.
     fn pop_blocking(&self) -> Option<Vec<u8>> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         loop {
             if let Some(chunk) = g.chunks.pop_front() {
                 g.bytes = g.bytes.saturating_sub(chunk.len());
@@ -453,25 +461,19 @@ impl PcmQueue {
             if g.closed {
                 return None;
             }
-            g = self
-                .not_empty
-                .wait(g)
-                .unwrap_or_else(|e| e.into_inner());
+            g = unpoison(self.not_empty.wait(g));
         }
     }
 
     fn close(&self) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         g.closed = true;
         drop(g);
         self.not_empty.notify_all();
     }
 
     fn dropped_chunks(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .dropped_chunks
+        unpoison(self.inner.lock()).dropped_chunks
     }
 }
 
@@ -768,15 +770,10 @@ mod coreaudio {
         /// Take a free buffer, allocating one when under the cap; `None`
         /// when every buffer is in flight.
         fn take(&self, queue: AudioQueueRef) -> Option<AudioQueueBufferRef> {
-            if let Some(buf) = self
-                .free
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .pop()
-            {
+            if let Some(buf) = super::unpoison(self.free.lock()).pop() {
                 return Some(buf);
             }
-            let mut allocated = self.allocated.lock().unwrap_or_else(|e| e.into_inner());
+            let mut allocated = super::unpoison(self.allocated.lock());
             if *allocated >= NATIVE_MAX_BUFS {
                 return None;
             }
@@ -803,31 +800,24 @@ mod coreaudio {
                 let rem = deadline
                     .checked_duration_since(Instant::now())
                     .ok_or_else(|| "coreaudio device is not draining buffers".to_string())?;
-                let mut g = self.free.lock().unwrap_or_else(|e| e.into_inner());
+                let mut g = super::unpoison(self.free.lock());
                 if let Some(buf) = g.pop() {
                     return Ok(buf);
                 }
-                let (guard, _) = self
-                    .cond
-                    .wait_timeout(g, rem)
-                    .unwrap_or_else(|e| e.into_inner());
+                let (guard, _) = super::unpoison(self.cond.wait_timeout(g, rem));
                 g = guard;
                 drop(g);
             }
         }
 
         fn release(&self, buf: AudioQueueBufferRef) {
-            self.free
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(buf);
+            super::unpoison(self.free.lock()).push(buf);
             self.cond.notify_one();
         }
 
         /// `true` when every allocated buffer is back on the free list.
         fn drained(&self) -> bool {
-            self.free.lock().unwrap_or_else(|e| e.into_inner()).len()
-                == *self.allocated.lock().unwrap_or_else(|e| e.into_inner())
+            super::unpoison(self.free.lock()).len() == *super::unpoison(self.allocated.lock())
         }
     }
 
@@ -974,12 +964,7 @@ mod coreaudio {
             // before the pool is reclaimed below.
             let _ = unsafe { AudioQueueDispose(self.queue, true) };
             let pool = unsafe { &*self.pool };
-            for buf in pool
-                .free
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .drain(..)
-            {
+            for buf in super::unpoison(pool.free.lock()).drain(..) {
                 // SAFETY: queue is disposed; freeing owned buffers.
                 let _ = unsafe { AudioQueueFreeBuffer(self.queue, buf) };
             }
@@ -1345,6 +1330,23 @@ fn open_native(kind: &AudioSinkKind) -> Result<Box<dyn AudioSink>, String> {
     }
 }
 
+/// Warning text for a successfully opened `auto` candidate: silent on a
+/// clean first pick, explains fallback-to-null or prior backend failures.
+fn auto_sink_warning(
+    errors: &[String],
+    candidate: &AudioSinkKind,
+    label: &'static str,
+) -> Option<String> {
+    if errors.is_empty() {
+        return (candidate == &AudioSinkKind::Null)
+            .then(|| "no native audio backend on this OS; audio sink is null".to_string());
+    }
+    Some(format!(
+        "audio backends failed ({}); using {label}",
+        errors.join(", ")
+    ))
+}
+
 /// Open a sink for `kind`, returning the sink plus an optional warning.
 /// `Auto` walks [`detect_available_sinks_for_os`] for the host OS
 /// (`pw-cat`→`paplay`→`aplay` on Linux, CoreAudio on macOS, WinMM on
@@ -1369,20 +1371,8 @@ pub fn open_sink(kind: &AudioSinkKind) -> (Box<dyn AudioSink>, Option<String>) {
                         if sink.label() == "null" && candidate != AudioSinkKind::Null {
                             continue;
                         }
-                        let warn = if errors.is_empty() && candidate == AudioSinkKind::Null
-                        {
-                            Some("no native audio backend on this OS; audio sink is null"
-                                .to_string())
-                        } else if errors.is_empty() {
-                            None
-                        } else {
-                            Some(format!(
-                                "audio backends failed ({}); using {}",
-                                errors.join(", "),
-                                sink.label()
-                            ))
-                        };
-                        return (sink, warn);
+                        let label = sink.label();
+                        return (sink, auto_sink_warning(&errors, &candidate, label));
                     }
                     Err(e) => errors.push(format!("{candidate:?}: {e}")),
                 }
@@ -1443,25 +1433,18 @@ static SESSION_AUDIO_CONFIG: Mutex<Option<AudioSessionConfig>> = Mutex::new(None
 /// session runs). [`crate::protocol::ProtocolClient`] picks it up when a
 /// connection is established.
 pub fn install_session_audio_config(cfg: AudioSessionConfig) {
-    *SESSION_AUDIO_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(cfg);
+    *unpoison(SESSION_AUDIO_CONFIG.lock()) = Some(cfg);
 }
 
 /// Remove the installed configuration (tests; a fresh install always
 /// overwrites, so this is only needed to prove the no-audio path).
 pub fn clear_session_audio_config() {
-    *SESSION_AUDIO_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+    *unpoison(SESSION_AUDIO_CONFIG.lock()) = None;
 }
 
 /// Snapshot of the installed configuration.
 pub fn session_audio_config() -> Option<AudioSessionConfig> {
-    SESSION_AUDIO_CONFIG
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone()
+    unpoison(SESSION_AUDIO_CONFIG.lock()).clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1591,7 +1574,7 @@ impl DecodeQueue {
     /// larger than the whole byte cap is accepted only into an empty
     /// queue — the cap bounds backlog, not a lone oversized source.
     fn push(&self, job: DecodeJob) -> PushResult {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         if g.closed {
             g.dropped += 1;
             return PushResult {
@@ -1663,7 +1646,7 @@ impl DecodeQueue {
     /// worker is never polled. `close` discards the backlog so shutdown
     /// does not decode sounds nobody will hear.
     fn pop_blocking(&self) -> Option<DecodeJob> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         loop {
             if let Some(job) = g.jobs.pop_front() {
                 g.bytes = g.bytes.saturating_sub(job.size_hint);
@@ -1672,17 +1655,14 @@ impl DecodeQueue {
             if g.closed {
                 return None;
             }
-            g = self
-                .not_empty
-                .wait(g)
-                .unwrap_or_else(|e| e.into_inner());
+            g = unpoison(self.not_empty.wait(g));
         }
     }
 
     /// Stop accepting and discard the backlog; the worker exits after its
     /// in-flight decode.
     fn close(&self) {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = unpoison(self.inner.lock());
         g.closed = true;
         g.jobs.clear();
         g.bytes = 0;
@@ -1770,27 +1750,15 @@ fn pcm_payload(pcm: &DecodedPcm) -> SharedPcmPayload {
 /// locks; the expensive OGG decode runs under a *read* lock shared with
 /// ingest's `resolve`, so a large decode never stalls the packet path.
 fn decode_one(job: &DecodeJob) -> DecodeOutcome {
-    if let Some(pcm) = job
-        .library
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .cached_pcm(&job.source)
-    {
+    if let Some(pcm) = unpoison(job.library.write()).cached_pcm(&job.source) {
         let (mono, stereo) = pcm_payload(&pcm);
         return DecodeOutcome::Decoded { mono, stereo };
     }
-    let decoded = job
-        .library
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .decode_uncached(&job.source);
+    let decoded = unpoison(job.library.read()).decode_uncached(&job.source);
     match decoded {
         Ok(dpcm) => {
             let (mono, stereo) = pcm_payload(&dpcm);
-            job.library
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .cache_pcm(&job.source, Arc::new(dpcm));
+            unpoison(job.library.write()).cache_pcm(&job.source, Arc::new(dpcm));
             DecodeOutcome::Decoded { mono, stereo }
         }
         Err(e) => DecodeOutcome::Failed(e),
@@ -1875,62 +1843,48 @@ pub struct ArmorFoleyCue {
     pub duration_ms: u16,
 }
 
+/// Per-material synthesis recipes indexed by [`ArmorFoleyMaterial`]
+/// discriminant (`None` first). `None` yields a zero-length, effectively
+/// `-inf` cue so synthesis stays strictly silent.
+const FOLEY_CUES: [ArmorFoleyCue; 7] = [
+    ArmorFoleyCue { gain_db: -120.0, center_hz: 0.0, duration_ms: 0 },
+    ArmorFoleyCue { gain_db: -34.0, center_hz: 950.0, duration_ms: 60 },
+    ArmorFoleyCue { gain_db: -31.0, center_hz: 5200.0, duration_ms: 48 },
+    ArmorFoleyCue { gain_db: -28.0, center_hz: 3400.0, duration_ms: 50 },
+    ArmorFoleyCue { gain_db: -29.0, center_hz: 4200.0, duration_ms: 45 },
+    ArmorFoleyCue { gain_db: -27.0, center_hz: 4900.0, duration_ms: 42 },
+    ArmorFoleyCue { gain_db: -26.0, center_hz: 2800.0, duration_ms: 55 },
+];
+
+/// Item-name token → foley material, scanned in order so the material
+/// token nearest the slot word wins (later matches overwrite earlier).
+const FOLEY_TOKEN_MATERIALS: &[(&[&str], ArmorFoleyMaterial)] = &[
+    (&["leather", "hide"], ArmorFoleyMaterial::Leather),
+    (
+        &["chain", "chainmail", "mail"],
+        ArmorFoleyMaterial::Chainmail,
+    ),
+    (&["iron", "steel"], ArmorFoleyMaterial::Iron),
+    (&["gold", "golden"], ArmorFoleyMaterial::Gold),
+    (&["diamond"], ArmorFoleyMaterial::Diamond),
+    (&["netherite"], ArmorFoleyMaterial::Netherite),
+];
+
 impl ArmorFoleyMaterial {
     /// Per-material synthesis recipe; `None` yields a zero-length,
     /// effectively `-inf` cue so synthesis stays strictly silent.
     pub const fn cue(self) -> ArmorFoleyCue {
-        match self {
-            Self::None => ArmorFoleyCue {
-                gain_db: -120.0,
-                center_hz: 0.0,
-                duration_ms: 0,
-            },
-            Self::Leather => ArmorFoleyCue {
-                gain_db: -34.0,
-                center_hz: 950.0,
-                duration_ms: 60,
-            },
-            Self::Chainmail => ArmorFoleyCue {
-                gain_db: -31.0,
-                center_hz: 5200.0,
-                duration_ms: 48,
-            },
-            Self::Iron => ArmorFoleyCue {
-                gain_db: -28.0,
-                center_hz: 3400.0,
-                duration_ms: 50,
-            },
-            Self::Gold => ArmorFoleyCue {
-                gain_db: -29.0,
-                center_hz: 4200.0,
-                duration_ms: 45,
-            },
-            Self::Diamond => ArmorFoleyCue {
-                gain_db: -27.0,
-                center_hz: 4900.0,
-                duration_ms: 42,
-            },
-            Self::Netherite => ArmorFoleyCue {
-                gain_db: -26.0,
-                center_hz: 2800.0,
-                duration_ms: 55,
-            },
-        }
+        FOLEY_CUES[self as usize]
     }
 
-    /// Vanilla armor-tier rank used to pick the dominant material when a
-    /// loadout mixes several (`None < Leather < Gold < Chainmail < Iron
-    /// < Diamond < Netherite`).
+    /// Vanilla armor-tier rank indexed by discriminant — picks the
+    /// dominant material when a loadout mixes several
+    /// (`None < Leather < Gold < Chainmail < Iron < Diamond < Netherite`).
     const fn classify_rank(self) -> u8 {
-        match self {
-            Self::None => 0,
-            Self::Leather => 1,
-            Self::Gold => 2,
-            Self::Chainmail => 3,
-            Self::Iron => 4,
-            Self::Diamond => 5,
-            Self::Netherite => 6,
-        }
+        // Enum order is None, Leather, Chainmail, Iron, Gold, Diamond,
+        // Netherite; rank order swaps Gold ahead of Chainmail/Iron.
+        const RANKS: [u8; 7] = [0, 1, 3, 4, 2, 5, 6];
+        RANKS[self as usize]
     }
 }
 
@@ -1938,23 +1892,8 @@ impl ArmorFoleyMaterial {
 /// feet). Required for classification so `"iron_golem_spawn_egg"` or
 /// `"diamond_pickaxe"` never count as armor.
 const ARMOR_SLOT_SUFFIXES: &[&str] = &[
-    "helmet",
-    "helm",
-    "cap",
-    "hat",
-    "coif",
-    "hood",
-    "mask",
-    "chestplate",
-    "tunic",
-    "vest",
-    "leggings",
-    "pants",
-    "greaves",
-    "trousers",
-    "boots",
-    "sabatons",
-    "shoes",
+    "helmet", "helm", "cap", "hat", "coif", "hood", "mask", "chestplate", "tunic", "vest",
+    "leggings", "pants", "greaves", "trousers", "boots", "sabatons", "shoes",
 ];
 
 /// `true` when `name` (an item id path, namespace already stripped) ends
@@ -1984,26 +1923,11 @@ pub fn classify_armor_foley(equipped_armor_ids: &[&str]) -> ArmorFoleyMaterial {
         }
         let mut material = ArmorFoleyMaterial::None;
         for token in name.split('_') {
-            material = match token {
-                t if t.eq_ignore_ascii_case("leather") || t.eq_ignore_ascii_case("hide") => {
-                    ArmorFoleyMaterial::Leather
+            for (tokens, m) in FOLEY_TOKEN_MATERIALS {
+                if tokens.iter().any(|t| token.eq_ignore_ascii_case(t)) {
+                    material = *m;
                 }
-                t if t.eq_ignore_ascii_case("chain")
-                    || t.eq_ignore_ascii_case("chainmail")
-                    || t.eq_ignore_ascii_case("mail") =>
-                {
-                    ArmorFoleyMaterial::Chainmail
-                }
-                t if t.eq_ignore_ascii_case("iron") || t.eq_ignore_ascii_case("steel") => {
-                    ArmorFoleyMaterial::Iron
-                }
-                t if t.eq_ignore_ascii_case("gold") || t.eq_ignore_ascii_case("golden") => {
-                    ArmorFoleyMaterial::Gold
-                }
-                t if t.eq_ignore_ascii_case("diamond") => ArmorFoleyMaterial::Diamond,
-                t if t.eq_ignore_ascii_case("netherite") => ArmorFoleyMaterial::Netherite,
-                _ => material,
-            };
+            }
         }
         if material.classify_rank() > best.classify_rank() {
             best = material;
@@ -2071,65 +1995,15 @@ pub fn synthesize_armor_foley_pcm(
 
     match material {
         ArmorFoleyMaterial::Leather => {
-            // Bandpassed noise rustle: the difference between two one-pole
-            // lowpasses behaves like a cheap bandpass around `center_hz`,
-            // under a sin^2 hump envelope with a seeded fabric wobble.
-            let lp_fast = 1.0 - (-TAU_F * cue.center_hz / rate_f).exp();
-            let lp_slow = 1.0 - (-TAU_F * cue.center_hz * 0.20 / rate_f).exp();
-            let wobble = 6.0 + 6.0 * foley_f01(&mut rng);
-            let mut fast = 0.0f32;
-            let mut slow = 0.0f32;
-            for (i, s) in buf.iter_mut().enumerate() {
-                let x = foley_f01(&mut rng) * 2.0 - 1.0;
-                fast += lp_fast * (x - fast);
-                slow += lp_slow * (x - slow);
-                let t = i as f32 / n as f32;
-                let env = PI_F * t;
-                let env = env.sin() * env.sin() * (0.8 + 0.2 * (wobble * t).sin());
-                *s = (fast - slow) * env * 4.0;
-            }
+            foley_leather_rustle(&mut buf, cue.center_hz, rate_f, &mut rng)
         }
-        _ => {
-            // Inharmonic plate clink: four decaying partials around
-            // `center_hz` with seeded detune, a fast attack and a short
-            // noise transient at the strike.
-            const RATIOS: [f32; 4] = [1.0, 1.51, 2.42, 3.94];
-            const AMPS: [f32; 4] = [1.0, 0.5, 0.24, 0.11];
-            let dur = n as f32 / rate_f;
-            let mut ratio = [0.0f32; 4];
-            let mut phase = [0.0f32; 4];
-            for k in 0..4 {
-                ratio[k] = RATIOS[k] * (0.97 + 0.06 * foley_f01(&mut rng));
-                phase[k] = foley_f01(&mut rng) * TAU_F;
-            }
-            let echo = matches!(material, ArmorFoleyMaterial::Chainmail);
-            for (i, s) in buf.iter_mut().enumerate() {
-                let t = i as f32 / rate_f;
-                let attack = 1.0 - (-t / 0.0018).exp();
-                let mut v = 0.0f32;
-                for k in 0..4 {
-                    let tau = dur * (0.30 + 0.22 * k as f32);
-                    v += AMPS[k]
-                        * (TAU_F * cue.center_hz * ratio[k] * t + phase[k]).sin()
-                        * (-t / tau).exp();
-                }
-                if echo {
-                    // Mail jingle: a second, lighter clink partway through.
-                    let t2 = t - dur * 0.52;
-                    if t2 > 0.0 {
-                        v += 0.4
-                            * (TAU_F * cue.center_hz * 1.33 * t2 + phase[1]).sin()
-                            * (-t2 / (dur * 0.18)).exp();
-                    }
-                }
-                let trans = if t < 0.002 {
-                    (foley_f01(&mut rng) * 2.0 - 1.0) * 0.12 * (-t / 0.0009).exp()
-                } else {
-                    0.0
-                };
-                *s = (v * attack + trans) * 0.6;
-            }
-        }
+        _ => foley_metal_clink(
+            &mut buf,
+            cue.center_hz,
+            rate_f,
+            matches!(material, ArmorFoleyMaterial::Chainmail),
+            &mut rng,
+        ),
     }
 
     let lin = 10f32.powf(cue.gain_db / 20.0) * intensity;
@@ -2139,9 +2013,67 @@ pub fn synthesize_armor_foley_pcm(
     } else {
         lin
     };
-    buf.iter()
-        .map(|s| ((s * scale).clamp(-1.0, 1.0) * 32_767.0).round() as i16)
-        .collect()
+    buf.iter().map(|s| f32_to_s16(s * scale)).collect()
+}
+
+/// Leather foley: bandpassed noise rustle — the difference between two
+/// one-pole lowpasses behaves like a cheap bandpass around `center_hz`,
+/// under a sin^2 hump envelope with a seeded fabric wobble.
+fn foley_leather_rustle(buf: &mut [f32], center_hz: f32, rate_f: f32, rng: &mut u64) {
+    let lp_fast = 1.0 - (-TAU_F * center_hz / rate_f).exp();
+    let lp_slow = 1.0 - (-TAU_F * center_hz * 0.20 / rate_f).exp();
+    let wobble = 6.0 + 6.0 * foley_f01(rng);
+    let n = buf.len() as f32;
+    let mut fast = 0.0f32;
+    let mut slow = 0.0f32;
+    for (i, s) in buf.iter_mut().enumerate() {
+        let x = foley_f01(rng) * 2.0 - 1.0;
+        fast += lp_fast * (x - fast);
+        slow += lp_slow * (x - slow);
+        let t = i as f32 / n;
+        let env = PI_F * t;
+        let env = env.sin() * env.sin() * (0.8 + 0.2 * (wobble * t).sin());
+        *s = (fast - slow) * env * 4.0;
+    }
+}
+
+/// Metallic foley: four decaying inharmonic partials around `center_hz`
+/// with seeded detune, a fast attack and a short noise transient at the
+/// strike. `echo` (Chainmail) adds a second, lighter jingle partway
+/// through.
+fn foley_metal_clink(buf: &mut [f32], center_hz: f32, rate_f: f32, echo: bool, rng: &mut u64) {
+    const RATIOS: [f32; 4] = [1.0, 1.51, 2.42, 3.94];
+    const AMPS: [f32; 4] = [1.0, 0.5, 0.24, 0.11];
+    let dur = buf.len() as f32 / rate_f;
+    let mut ratio = [0.0f32; 4];
+    let mut phase = [0.0f32; 4];
+    for k in 0..4 {
+        ratio[k] = RATIOS[k] * (0.97 + 0.06 * foley_f01(rng));
+        phase[k] = foley_f01(rng) * TAU_F;
+    }
+    for (i, s) in buf.iter_mut().enumerate() {
+        let t = i as f32 / rate_f;
+        let attack = 1.0 - (-t / 0.0018).exp();
+        let mut v = 0.0f32;
+        for k in 0..4 {
+            let tau = dur * (0.30 + 0.22 * k as f32);
+            v += AMPS[k] * (TAU_F * center_hz * ratio[k] * t + phase[k]).sin() * (-t / tau).exp();
+        }
+        if echo {
+            let t2 = t - dur * 0.52;
+            if t2 > 0.0 {
+                v += 0.4
+                    * (TAU_F * center_hz * 1.33 * t2 + phase[1]).sin()
+                    * (-t2 / (dur * 0.18)).exp();
+            }
+        }
+        let trans = if t < 0.002 {
+            (foley_f01(rng) * 2.0 - 1.0) * 0.12 * (-t / 0.0009).exp()
+        } else {
+            0.0
+        };
+        *s = (v * attack + trans) * 0.6;
+    }
 }
 
 /// `2.0 * PI` as `f32` — local alias so the synth stays terse.
@@ -2371,6 +2303,56 @@ impl AudioRuntime {
         self.mixer.remove_entity_position(entity_id);
     }
 
+    /// Resolve a wire event to `(sound name, label)` — the packet name
+    /// wins, then the `sound_event` registry table (Mod-aware), then the
+    /// bundled id table; a total miss counts `unknown_sound_id` and falls
+    /// back to `sound.<id>`. `None` when the packet carries neither.
+    fn wire_sound_name(&mut self, ev: &WireSoundEvent) -> Option<(String, String)> {
+        match (&ev.name, ev.registry_id) {
+            (Some(n), _) => Some((n.clone(), n.clone())),
+            (None, Some(id)) => {
+                let n = self
+                    .sound_registry
+                    .name(id)
+                    .map(str::to_string)
+                    .or_else(|| sound_name_for_id(id).map(str::to_string));
+                match n {
+                    Some(n) => Some((n.clone(), n)),
+                    None => {
+                        self.mixer.stats.unknown_sound_id += 1;
+                        let n = format!("sound.{id}");
+                        Some((n.clone(), n))
+                    }
+                }
+            }
+            (None, None) => None,
+        }
+    }
+
+    /// Resolve `name` against the shared library under the read lock —
+    /// shared with the decode worker's long decode, so ingest never
+    /// waits on it. No library counts `missing_assets`; an event the
+    /// library does not know counts `missing_event_def`. Returns the
+    /// resolved sound plus its encoded-size queue hint.
+    fn resolve_sound(
+        &mut self,
+        lib: &Option<Arc<RwLock<SoundLibrary>>>,
+        name: &str,
+        seed: i64,
+    ) -> (Option<ResolvedSound>, usize) {
+        let Some(l) = lib else {
+            self.mixer.stats.missing_assets += 1;
+            return (None, 0);
+        };
+        let g = unpoison(l.read());
+        let r = g.resolve(name, seed);
+        let hint = r.as_ref().map_or(0, |res| g.source_size_hint(&res.source));
+        if r.is_none() {
+            self.mixer.stats.missing_event_def += 1;
+        }
+        (r, hint)
+    }
+
     /// Ingest one decoded `sound_effect`/`sound_entity` packet. Resolution
     /// and scalar math stay on this thread; the OGG decode itself is
     /// handed to the bounded decode worker so a large decode cannot stall
@@ -2378,22 +2360,8 @@ impl AudioRuntime {
     /// via [`Self::drain_decode_results`].
     pub fn ingest(&mut self, ev: &WireSoundEvent) {
         self.drain_decode_results();
-        let (name, label) = match (&ev.name, ev.registry_id) {
-            (Some(n), _) => (n.clone(), n.clone()),
-            (None, Some(id)) => {
-                if let Some(n) = self.sound_registry.name(id) {
-                    (n.to_string(), n.to_string())
-                } else {
-                    match sound_name_for_id(id) {
-                        Some(n) => (n.to_string(), n.to_string()),
-                        None => {
-                            self.mixer.stats.unknown_sound_id += 1;
-                            (format!("sound.{id}"), format!("sound.{id}"))
-                        }
-                    }
-                }
-            }
-            (None, None) => return,
+        let Some((name, label)) = self.wire_sound_name(ev) else {
+            return;
         };
 
         // Asset resolution: real OGG when the layered sound library maps
@@ -2401,23 +2369,7 @@ impl AudioRuntime {
         // such. The read lock is shared with the decode worker's
         // long-running decode, so resolve never waits on it.
         let lib = self.library();
-        let (resolved, size_hint) = match &lib {
-            Some(l) => {
-                let g = l.read().unwrap_or_else(|e| e.into_inner());
-                let r = g.resolve(&name, ev.seed);
-                let hint = r
-                    .as_ref()
-                    .map_or(0, |res| g.source_size_hint(&res.source));
-                if r.is_none() {
-                    self.mixer.stats.missing_event_def += 1;
-                }
-                (r, hint)
-            }
-            None => {
-                self.mixer.stats.missing_assets += 1;
-                (None, 0)
-            }
-        };
+        let (resolved, size_hint) = self.resolve_sound(&lib, &name, ev.seed);
         let Some(resolved) = resolved else {
             self.submit_placeholder_sound(&name, &label, ev, 1.0, 1.0, None);
             return;
@@ -2507,11 +2459,14 @@ impl AudioRuntime {
     /// completed sounds reach the mixer without waiting for the next
     /// packet.
     fn drain_decode_results(&mut self) {
+        // O(1) idle path: no pipeline means no results can ever arrive —
+        // `decode_outstanding` is only nonzero while a pipeline exists.
+        let Some(pipe) = &self.decode else {
+            return;
+        };
         let mut done = Vec::new();
-        if let Some(pipe) = &self.decode {
-            while let Ok(result) = pipe.results.try_recv() {
-                done.push(result);
-            }
+        while let Ok(result) = pipe.results.try_recv() {
+            done.push(result);
         }
         for (job, outcome) in done {
             self.decode_outstanding = self.decode_outstanding.saturating_sub(1);
@@ -2524,60 +2479,59 @@ impl AudioRuntime {
         }
     }
 
-    /// Complete one decode job: a `stop_sound` recorded after its ingest
-    /// cancels it; otherwise submit the decoded PCM, or the placeholder
-    /// fallback on failure.
-    fn finish_decode(&mut self, job: DecodeJob, outcome: DecodeOutcome) {
-        let stopped = self.pending_decode_stops.iter().any(|s| {
+    /// `true` when a retained `stop_sound` postdates `job`'s ingest and
+    /// matches its category/name — the same rule the mixer applies to
+    /// already-queued events.
+    fn decode_stopped(&self, job: &DecodeJob) -> bool {
+        self.pending_decode_stops.iter().any(|s| {
             s.order > job.order
                 && s.category.is_none_or(|c| c == job.category)
                 && s.name
                     .as_deref()
                     .map(normalize_sound_name)
                     .is_none_or(|n| n == normalize_sound_name(&job.label))
-        });
-        if stopped {
+        })
+    }
+
+    /// Complete one decode job: a `stop_sound` recorded after its ingest
+    /// cancels it; otherwise submit the decoded PCM, or the placeholder
+    /// fallback on failure.
+    fn finish_decode(&mut self, job: DecodeJob, outcome: DecodeOutcome) {
+        if self.decode_stopped(&job) {
             return;
         }
-        match outcome {
-            DecodeOutcome::Decoded { mono, stereo } => self.submit_play(PlaySoundEvent {
-                label: job.label,
-                pcm: mono,
-                stereo_pcm: stereo,
-                is_placeholder: false,
-                category: job.category,
-                position: job.position,
-                entity_id: job.entity_id,
-                volume: job.volume,
-                pitch: job.pitch,
-                seed: job.seed,
-                max_range_m: job.max_range_m,
-            }),
+        let (pcm, stereo_pcm, is_placeholder) = match outcome {
+            DecodeOutcome::Decoded { mono, stereo } => (mono, stereo, false),
             DecodeOutcome::Failed(e) => {
                 self.mixer.stats.decode_errors += 1;
                 if self.mixer.stats.decode_errors <= 3 {
                     eprintln!("megu-client audio: {e}");
                 }
                 self.mixer.stats.placeholder_voices += 1;
-                self.submit_play(PlaySoundEvent {
-                    label: job.label,
-                    pcm: Arc::new(placeholder_pcm(
+                (
+                    Arc::new(placeholder_pcm(
                         &job.name,
                         job.category,
                         self.mixer.sample_rate(),
                     )),
-                    stereo_pcm: None,
-                    is_placeholder: true,
-                    category: job.category,
-                    position: job.position,
-                    entity_id: job.entity_id,
-                    volume: job.volume,
-                    pitch: job.pitch,
-                    seed: job.seed,
-                    max_range_m: job.max_range_m,
-                });
+                    None,
+                    true,
+                )
             }
-        }
+        };
+        self.submit_play(PlaySoundEvent {
+            label: job.label,
+            pcm,
+            stereo_pcm,
+            is_placeholder,
+            category: job.category,
+            position: job.position,
+            entity_id: job.entity_id,
+            volume: job.volume,
+            pitch: job.pitch,
+            seed: job.seed,
+            max_range_m: job.max_range_m,
+        });
     }
 
     /// Immediate `PlaySoundEvent` for events with no decodable asset —
@@ -2768,10 +2722,8 @@ impl AudioRuntime {
         self.mixer.render(&mut self.scratch_f32);
         self.scratch_i16.clear();
         self.scratch_i16.reserve(frames * 2);
-        for &s in &self.scratch_f32 {
-            self.scratch_i16
-                .push((s.clamp(-1.0, 1.0) * 32_767.0).round() as i16);
-        }
+        self.scratch_i16
+            .extend(self.scratch_f32.iter().map(|&s| f32_to_s16(s)));
         if let Err(reason) = self.sink.push(&self.scratch_i16) {
             let failed = self.sink.label();
             eprintln!("megu-client audio: {failed} sink failed: {reason}");
@@ -3296,7 +3248,9 @@ impl MixVoiceSlot {
     }
 
     /// 2D bypass render straight into the stereo mix: stereo keeps L/R,
-    /// mono duplicates — no engine, no reverb send.
+    /// mono duplicates — no engine, no reverb send. One interpolated
+    /// stereo frame per output frame; mono frames read as `[s, s]`, which
+    /// reproduces the old per-channel math bit-for-bit.
     fn render_2d(&mut self, out: &mut [f32]) {
         let Some(pcm) = &self.pcm else {
             self.active = false;
@@ -3304,37 +3258,43 @@ impl MixVoiceSlot {
         };
         let frames = pcm.frames();
         let gain = self.gain;
-        match &**pcm {
-            DecodedPcm::Stereo(v) => {
-                for i in 0..out.len() / 2 {
-                    let idx = self.cursor as usize;
-                    if idx + 1 < frames {
-                        let frac = (self.cursor - idx as f64) as f32;
-                        let a = v[idx];
-                        let b = v[idx + 1];
-                        out[2 * i] += (a[0] + (b[0] - a[0]) * frac) * gain;
-                        out[2 * i + 1] += (a[1] + (b[1] - a[1]) * frac) * gain;
-                    }
-                    self.cursor += self.step;
-                }
+        let frame_at = |i: usize| -> [f32; 2] {
+            match &**pcm {
+                DecodedPcm::Stereo(v) => v[i],
+                DecodedPcm::Mono(v) => [v[i], v[i]],
             }
-            DecodedPcm::Mono(v) => {
-                for i in 0..out.len() / 2 {
-                    let idx = self.cursor as usize;
-                    if idx + 1 < frames {
-                        let frac = (self.cursor - idx as f64) as f32;
-                        let s = v[idx] + (v[idx + 1] - v[idx]) * frac;
-                        out[2 * i] += s * gain;
-                        out[2 * i + 1] += s * gain;
-                    }
-                    self.cursor += self.step;
-                }
+        };
+        for i in 0..out.len() / 2 {
+            let idx = self.cursor as usize;
+            if idx + 1 < frames {
+                let frac = (self.cursor - idx as f64) as f32;
+                let a = frame_at(idx);
+                let b = frame_at(idx + 1);
+                out[2 * i] += (a[0] + (b[0] - a[0]) * frac) * gain;
+                out[2 * i + 1] += (a[1] + (b[1] - a[1]) * frac) * gain;
             }
+            self.cursor += self.step;
         }
         if self.cursor as usize >= frames.saturating_sub(1) {
             self.active = false;
         }
     }
+}
+
+/// Slot for a new voice: the first inactive slot, else the slot with the
+/// oldest admission order (the steal victim when all 64 are busy).
+fn voice_slot_index(slots: &[MixVoiceSlot; AUDIO_MIX_VOICE_SLOTS]) -> usize {
+    slots
+        .iter()
+        .position(|s| !s.active)
+        .unwrap_or_else(|| {
+            slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.order)
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        })
 }
 
 /// The deterministic mixing core the dedicated thread drives. Owns the
@@ -3369,6 +3329,13 @@ pub struct AudioMixCore {
     send_scratch: [f32; AUDIO_MIX_BLOCK_FRAMES],
     stereo_scratch: Vec<f32>,
     out_i16: [i16; AUDIO_MIX_BLOCK_SAMPLES],
+    /// `true` once any block fed a nonzero wet send into the shared FDN.
+    /// Before that the bus is provably all-zero state (it starts zeroed
+    /// and `step_input(0.0)` is a fixed point), so [`Self::mix_block`]
+    /// skips the per-sample tail loop entirely — bit-identical output,
+    /// zero compute while nothing has ever excited the reverb. Once set
+    /// the flag never clears: the decaying tail must keep stepping.
+    reverb_seeded: bool,
     /// `AudioCmd::Shutdown` drained — the run loop exits at block end.
     wants_shutdown: bool,
 }
@@ -3396,6 +3363,7 @@ impl AudioMixCore {
             send_scratch: [0.0; AUDIO_MIX_BLOCK_FRAMES],
             stereo_scratch: Vec::with_capacity(AUDIO_MIX_BLOCK_SAMPLES),
             out_i16: [0; AUDIO_MIX_BLOCK_SAMPLES],
+            reverb_seeded: false,
             wants_shutdown: false,
         }
     }
@@ -3441,20 +3409,7 @@ impl AudioMixCore {
                 yaw_deg,
                 pitch_deg,
                 submerged,
-            } => {
-                self.listener = ListenerPose {
-                    position: pos,
-                    yaw_deg,
-                    pitch_deg,
-                    velocity: vel,
-                    submerged,
-                };
-                for slot in &mut self.slots {
-                    if let Some(engine) = &mut slot.engine {
-                        engine.set_listener(self.listener);
-                    }
-                }
-            }
+            } => self.set_listener_pose(pos, vel, yaw_deg, pitch_deg, submerged),
             AudioCmd::PlayDecoded {
                 voice_id,
                 pcm,
@@ -3480,70 +3435,17 @@ impl AudioMixCore {
                 master,
                 categories,
                 max_volume_cap,
-            } => {
-                self.master_gain = if master.is_finite() {
-                    master.clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                for (slot, gain) in self.category_gain.iter_mut().zip(categories.iter()) {
-                    *slot = if gain.is_finite() {
-                        gain.clamp(0.0, 1.0)
-                    } else {
-                        1.0
-                    };
-                }
-                if max_volume_cap.is_finite() {
-                    self.max_volume_cap = max_volume_cap.clamp(0.0, 1.0);
-                }
-            }
+            } => self.set_voice_volumes(master, categories, max_volume_cap),
             AudioCmd::UpdateEntityPos {
                 entity_id,
                 pos,
                 vel,
-            } => {
-                self.entities.insert(entity_id, (pos, vel));
-                for slot in &mut self.slots {
-                    if slot.entity_id == Some(entity_id) {
-                        slot.position = pos;
-                        if let Some(engine) = &mut slot.engine {
-                            engine.set_source(SoundSource {
-                                position: pos,
-                                velocity: vel,
-                            });
-                        }
-                    }
-                }
-            }
+            } => self.update_entity_pos(entity_id, pos, vel),
             AudioCmd::ApplyAcousticResult {
                 voice_id,
                 occlusion_db,
                 reverb_send,
-            } => {
-                if let Some(engine) = self
-                    .slots
-                    .iter_mut()
-                    .find(|s| s.active && s.voice_id == voice_id)
-                    .and_then(|s| s.engine.as_mut())
-                {
-                    let mut scene = engine.scene().clone();
-                    scene.occlusion.transmission_loss_db = if occlusion_db.is_finite() {
-                        occlusion_db.max(0.0)
-                    } else {
-                        0.0
-                    };
-                    scene.wet_gain = if reverb_send.is_finite() {
-                        reverb_send.clamp(0.0, 1.0)
-                    } else {
-                        scene.wet_gain
-                    };
-                    engine.set_scene(scene);
-                    // `set_scene` restores RT60s but geometry targets
-                    // (direct_gain/wet_send/er_gain) only recompute on a
-                    // pose update — nudge it with the current listener.
-                    engine.set_listener(self.listener);
-                }
-            }
+            } => self.apply_acoustic_result(voice_id, occlusion_db, reverb_send),
             AudioCmd::StopAll => {
                 self.pending.clear();
                 for slot in &mut self.slots {
@@ -3555,58 +3457,125 @@ impl AudioMixCore {
         }
     }
 
+    /// `UpdateListener`: store the pose and fan it out to every live
+    /// spatialized voice's engine.
+    fn set_listener_pose(
+        &mut self,
+        pos: [f32; 3],
+        vel: [f32; 3],
+        yaw_deg: f32,
+        pitch_deg: f32,
+        submerged: bool,
+    ) {
+        self.listener = ListenerPose {
+            position: pos,
+            yaw_deg,
+            pitch_deg,
+            velocity: vel,
+            submerged,
+        };
+        for slot in &mut self.slots {
+            if let Some(engine) = &mut slot.engine {
+                engine.set_listener(self.listener);
+            }
+        }
+    }
+
+    /// `SetVolumes`: master + per-category gains fold into admission
+    /// gain; the bus ceiling retunes the limiter. Non-finite gains fall
+    /// back to unity, a non-finite cap is ignored.
+    fn set_voice_volumes(&mut self, master: f32, categories: [f32; 10], max_volume_cap: f32) {
+        self.master_gain = if master.is_finite() {
+            master.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        for (slot, gain) in self.category_gain.iter_mut().zip(categories.iter()) {
+            *slot = if gain.is_finite() {
+                gain.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+        }
+        if max_volume_cap.is_finite() {
+            self.max_volume_cap = max_volume_cap.clamp(0.0, 1.0);
+        }
+    }
+
+    /// `UpdateEntityPos`: record the pose and push it into every slot
+    /// bound to that entity.
+    fn update_entity_pos(&mut self, entity_id: i32, pos: [f32; 3], vel: [f32; 3]) {
+        self.entities.insert(entity_id, (pos, vel));
+        for slot in &mut self.slots {
+            if slot.entity_id == Some(entity_id) {
+                slot.position = pos;
+                if let Some(engine) = &mut slot.engine {
+                    engine.set_source(SoundSource {
+                        position: pos,
+                        velocity: vel,
+                    });
+                }
+            }
+        }
+    }
+
+    /// `ApplyAcousticResult`: fold a Lane B raycast result into the
+    /// running voice's scene, then nudge the engine with the current
+    /// listener so geometry targets recompute (`set_scene` alone only
+    /// restores RT60s).
+    fn apply_acoustic_result(&mut self, voice_id: u64, occlusion_db: f32, reverb_send: f32) {
+        if let Some(engine) = self
+            .slots
+            .iter_mut()
+            .find(|s| s.active && s.voice_id == voice_id)
+            .and_then(|s| s.engine.as_mut())
+        {
+            let mut scene = engine.scene().clone();
+            scene.occlusion.transmission_loss_db = if occlusion_db.is_finite() {
+                occlusion_db.max(0.0)
+            } else {
+                0.0
+            };
+            scene.wet_gain = if reverb_send.is_finite() {
+                reverb_send.clamp(0.0, 1.0)
+            } else {
+                scene.wet_gain
+            };
+            engine.set_scene(scene);
+            engine.set_listener(self.listener);
+        }
+    }
+
     /// Admit one decoded clip into a slot (free slot first, oldest-slot
     /// steal when all 64 are busy). Runs on the command path only.
     fn admit_voice(&mut self, voice: PendingVoice) {
-        let PendingVoice {
-            voice_id,
-            pcm,
-            pos,
-            entity_id,
-            volume,
-            pitch,
-            attenuation_distance,
-            is_2d,
-            category,
-        } = voice;
         self.order += 1;
         let order = self.order;
-        let idx = self
-            .slots
-            .iter()
-            .position(|s| !s.active)
-            .unwrap_or_else(|| {
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, s)| s.order)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            });
+        let idx = voice_slot_index(&self.slots);
         // Entity-bound voices start at the latest tracked pose when the
         // command's position is still the caller's best guess — the same
         // fallback the synchronous mixer applies.
-        let (position, velocity) = entity_id
+        let (position, velocity) = voice
+            .entity_id
             .and_then(|eid| self.entities.get(&eid).copied())
-            .unwrap_or((pos, [0.0; 3]));
-        let gain = if volume.is_finite() {
-            volume.clamp(0.0, 1.0)
+            .unwrap_or((voice.pos, [0.0; 3]));
+        let gain = if voice.volume.is_finite() {
+            voice.volume.clamp(0.0, 1.0)
         } else {
             0.0
         };
         // Volume sliders fold in at admission: `master * category[source]`
         // scales the voice gain only — the vanilla range law above keeps
         // using the raw packet volume.
-        let gain = (gain
-            * self.master_gain
-            * self.category_gain[category.clamp(0, 9) as usize])
-            .clamp(0.0, 1.0);
-        let engine = if is_2d {
+        let gain =
+            (gain * self.master_gain * self.category_gain[voice.category.clamp(0, 9) as usize])
+                .clamp(0.0, 1.0);
+        let engine = if voice.is_2d {
             None
         } else {
             let mut engine = SpatialAudioEngine::new(self.sample_rate, self.preset);
             // Vanilla range law: `attenuation_distance * max(volume, 1.0)`.
-            engine.set_max_range(attenuation_distance * volume.max(1.0));
+            engine.set_max_range(voice.attenuation_distance * voice.volume.max(1.0));
             engine.set_source(SoundSource { position, velocity });
             // Default open-air scene until a Lane B worker posts
             // `ApplyAcousticResult` — the engine never raycasts here.
@@ -3617,12 +3586,12 @@ impl AudioMixCore {
         *slot = MixVoiceSlot {
             active: true,
             order,
-            voice_id,
-            pcm: Some(pcm),
+            voice_id: voice.voice_id,
+            pcm: Some(voice.pcm),
             cursor: 0.0,
-            step: f64::from(pitch.clamp(0.5, 2.0)),
+            step: f64::from(voice.pitch.clamp(0.5, 2.0)),
             gain,
-            entity_id,
+            entity_id: voice.entity_id,
             engine,
             position,
         };
@@ -3663,14 +3632,23 @@ impl AudioMixCore {
         }
         // The shared bus runs even with zero voices so a finishing tail
         // decays instead of cutting off — same semantics as `SoundMixer`.
-        for f in 0..AUDIO_MIX_BLOCK_FRAMES {
-            let (wet_l, wet_r) = self.reverb_bus.step_input(self.send_scratch[f]);
-            self.mix_f32[2 * f] += wet_l;
-            self.mix_f32[2 * f + 1] += wet_r;
+        // Before the first nonzero send the FDN is provably all-zero
+        // state (`step_input(0.0)` is a fixed point), so the tail loop is
+        // skipped entirely until `reverb_seeded` latches — the mix is
+        // bit-identical either way.
+        if self.send_scratch.iter().any(|&s| s != 0.0) {
+            self.reverb_seeded = true;
+        }
+        if self.reverb_seeded {
+            for f in 0..AUDIO_MIX_BLOCK_FRAMES {
+                let (wet_l, wet_r) = self.reverb_bus.step_input(self.send_scratch[f]);
+                self.mix_f32[2 * f] += wet_l;
+                self.mix_f32[2 * f + 1] += wet_r;
+            }
         }
         AudioLimiter::limit_mix_buffer(&mut self.mix_f32, self.max_volume_cap);
         for (i, &s) in self.mix_f32.iter().enumerate() {
-            self.out_i16[i] = (s.clamp(-1.0, 1.0) * 32_767.0).round() as i16;
+            self.out_i16[i] = f32_to_s16(s);
         }
         telemetry.active_voices.store(active, Ordering::Relaxed);
         if self.sink.push(&self.out_i16).is_err() {
@@ -3971,7 +3949,7 @@ mod tests {
         assert_eq!(q.pop(Duration::from_millis(0)), Some(vec![9, 9]));
         // Oversized chunks are rejected wholesale.
         q.push(vec![0; 9]);
-        let g = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = unpoison(q.inner.lock());
         assert!(g.chunks.is_empty());
         drop(g);
         q.close();
@@ -4051,7 +4029,7 @@ mod tests {
         // The remaining backlog is discarded, not drained.
         assert!(q.pop_blocking().is_none());
         assert!(!q.push(test_decode_job(9, "late", 10)).accepted);
-        let g = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = unpoison(q.inner.lock());
         assert_eq!(g.dropped, 1, "only the post-close push counts as dropped");
     }
 
@@ -4079,7 +4057,7 @@ mod tests {
         let r = q.push(test_decode_job(13, "d", 30));
         assert!(!r.accepted, "unrelated-source job must be declined");
         assert_eq!(r.evicted, 0, "decline must not evict other sources");
-        let g = q.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let g = unpoison(q.inner.lock());
         assert_eq!(g.jobs.len(), 3);
         drop(g);
         q.close();
