@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Focused proofs for the client-gpu optimization wiring:
 //!
-//! 1. mini-HUD `/proc` + DRM sysfs sampling is throttled to
-//!    `MINIHUD_SYS_SAMPLE_INTERVAL_MS` while frame stats update every frame.
+//! 1. compact debug HUD `/proc` + DRM sysfs sampling is throttled to
+//!    `COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS` while frame stats update every frame.
 //! 2. The connect-time `ComputeStrategy`/`KernelAutotuner` are consumed by
 //!    the session and pushed into `GpuRenderer`.
 //! 3. Dirty section uploads drain through `ChunkUploadBudget` with a
@@ -112,17 +112,17 @@ fn try_gpu_renderer() -> Option<GpuRenderer> {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Mini-HUD host-metric sampling throttle
+// 1. Compact Debug HUD host-metric sampling throttle
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mini_hud_host_sampling_is_throttled_while_frame_stats_update() {
+fn compact_debug_hud_host_sampling_is_throttled_while_frame_stats_update() {
     let mut live = LiveSession::offline_with_null_audio();
     let mut ui = UiState::new();
-    ui.settings.qol.cycle_mini_hud(); // Off -> Basic
+    ui.settings.qol.cycle_compact_debug_hud(); // Off -> Basic
     assert_ne!(
-        ui.settings.qol.mini_hud_preset(),
-        megu_ui::state::MiniHudPreset::Off
+        ui.settings.qol.compact_debug_hud_preset(),
+        megu_ui::state::CompactDebugHudPreset::Off
     );
 
     // 120 frames at ~120 fps ~= 1.0 s of accumulated frame time. The
@@ -130,7 +130,7 @@ fn mini_hud_host_sampling_is_throttled_while_frame_stats_update() {
     // 500 ms — never once per frame.
     let dt = 1.0f32 / 120.0;
     for _ in 0..120 {
-        live.record_frame_and_refresh_minihud(dt, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(dt, &mut ui);
     }
 
     assert_eq!(live.frame_timings.frame_count(), 120);
@@ -147,9 +147,9 @@ fn mini_hud_host_sampling_is_throttled_while_frame_stats_update() {
     // cached snapshot: 120 frames of 8.33 ms is ~120 fps.
     let fps = ui
         .hud
-        .mini_hud_data
+        .compact_debug_hud_data
         .fps
-        .expect("mini-HUD fps telemetry still published");
+        .expect("compact debug HUD fps telemetry still published");
     assert!(
         (110.0..130.0).contains(&fps),
         "frame stats must keep updating every frame, fps={fps}"
@@ -179,9 +179,9 @@ fn compute_strategy_and_kernel_autotuner_are_consumed() {
         ComputeKernelMode::RecomputeSwar
     };
     assert_eq!(live.active_kernel_mode(), expected_mode);
-    let mut ui = UiState::new(); // mini-HUD stays Off: autotuner still feeds
+    let mut ui = UiState::new(); // compact debug HUD stays Off: autotuner still feeds
     for _ in 0..8 {
-        live.record_frame_and_refresh_minihud(0.008, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(0.008, &mut ui);
     }
     assert!(
         live.kernel_autotuner()

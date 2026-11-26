@@ -25,7 +25,7 @@ CRATES = (
 # a reference for the contract to pass (GPU explicitly requires both files).
 WIRING_CONTRACTS = {
     "client-ui": {
-        "mod_menu": (("client-ui/src/state.rs", "client-ui/src/layout.rs"),),
+        "mod_manager": (("client-ui/src/state.rs", "client-ui/src/layout.rs"),),
         "recipe_browser": (("client-ui/src/state.rs", "client-ui/src/layout.rs"),),
         "magic_hud": (("client-ui/src/state.rs", "client-ui/src/layout.rs"),),
     },

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! End-to-end tests for the ModMenu-style Mods & Packs screen: forgiving
+//! End-to-end tests for the ModManager-style Mods & Packs screen: forgiving
 //! multi-token search with `@author`/`#tag` filters, filter pills, sort
 //! modes, staged enable/disable with `ApplyChanges` restart semantics,
 //! Modrinth missing-dependency and link actions, keyboard/gamepad routing,
@@ -7,16 +7,16 @@
 //! `640×360` through `3840×2160` in English and Japanese.
 
 use megu_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
-use megu_client_ui::mod_menu::{
-    ModAdaptationBadge, ModLoaderTag, ModMenuAction, ModMenuEntry, ModMenuFilter, ModMenuHitRegion,
-    ModMenuSort, ModMenuState, ModMenuWidgetId, ModReloadBadge,
+use megu_client_ui::mod_manager::{
+    ModAdaptationBadge, ModLoaderTag, ModManagerAction, ModManagerEntry, ModManagerFilter, ModManagerHitRegion,
+    ModManagerSort, ModManagerState, ModManagerWidgetId, ModReloadBadge,
 };
 use megu_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
 
 const SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
 
-fn mk(id: &str, name: &str, version: &str) -> ModMenuEntry {
-    ModMenuEntry::new(id, name, version)
+fn mk(id: &str, name: &str, version: &str) -> ModManagerEntry {
+    ModManagerEntry::new(id, name, version)
 }
 
 /// A varied mod list covering every tier, loader, reload mode, link
@@ -25,7 +25,7 @@ fn mk(id: &str, name: &str, version: &str) -> ModMenuEntry {
 /// With `show_libraries` off and the default A-Z sort the visible order is:
 /// brokenmod, create, create_aero, minimap, jei, nolink, oldmod
 /// (megu_lib hidden).
-fn fixture() -> ModMenuState {
+fn fixture() -> ModManagerState {
     let mut create = mk("create", "Create", "0.5.1f");
     create.summary = "Rotation, contraptions and kinetic logistics.".into();
     create.authors = vec!["simibubi".into(), "Fozzie".into()];
@@ -72,11 +72,11 @@ fn fixture() -> ModMenuState {
 
     let nolink = mk("nolink", "No Links", "1.0");
 
-    ModMenuState::new(vec![create, aero, jei, broken, lib, old, minimap, nolink])
+    ModManagerState::new(vec![create, aero, jei, broken, lib, old, minimap, nolink])
 }
 
 /// 25+ entries so the list pane needs scrolling at every test size.
-fn big_fixture() -> ModMenuState {
+fn big_fixture() -> ModManagerState {
     let mut entries = Vec::new();
     for i in 0..27 {
         let mut e = mk(
@@ -93,11 +93,11 @@ fn big_fixture() -> ModMenuState {
         }
         entries.push(e);
     }
-    ModMenuState::new(entries)
+    ModManagerState::new(entries)
 }
 
 /// Visible mod ids in display order.
-fn ids(state: &ModMenuState) -> Vec<String> {
+fn ids(state: &ModManagerState) -> Vec<String> {
     state
         .visible_indices()
         .iter()
@@ -105,29 +105,29 @@ fn ids(state: &ModMenuState) -> Vec<String> {
         .collect()
 }
 
-fn type_str(state: &mut ModMenuState, w: u32, h: u32, text: &str) {
+fn type_str(state: &mut ModManagerState, w: u32, h: u32, text: &str) {
     for c in text.chars() {
         state.handle_input(UiInputEvent::CharTyped(c), w, h);
     }
 }
 
-fn key(state: &mut ModMenuState, w: u32, h: u32, k: UiKey) -> Vec<ModMenuAction> {
+fn key(state: &mut ModManagerState, w: u32, h: u32, k: UiKey) -> Vec<ModManagerAction> {
     state.handle_input(UiInputEvent::KeyPressed(k), w, h)
 }
 
-fn find(hits: &[ModMenuHitRegion], id: ModMenuWidgetId) -> Option<UiRect> {
+fn find(hits: &[ModManagerHitRegion], id: ModManagerWidgetId) -> Option<UiRect> {
     hits.iter().find(|r| r.id == id).map(|r| r.rect)
 }
 
 /// Click the center of `id`'s hit region in a `w`×`h` frame.
-fn click(state: &mut ModMenuState, w: u32, h: u32, id: ModMenuWidgetId) -> Vec<ModMenuAction> {
+fn click(state: &mut ModManagerState, w: u32, h: u32, id: ModManagerWidgetId) -> Vec<ModManagerAction> {
     let (_, hits) = state.render(w, h);
     let rect = find(&hits, id).unwrap_or_else(|| panic!("no hit region for {id:?}"));
     let (x, y) = (rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
     state.handle_input(UiInputEvent::Click { x, y }, w, h)
 }
 
-fn assert_no_overlaps(regions: &[ModMenuHitRegion]) {
+fn assert_no_overlaps(regions: &[ModManagerHitRegion]) {
     for (i, a) in regions.iter().enumerate() {
         for (j, b) in regions.iter().enumerate() {
             if i >= j {
@@ -151,7 +151,7 @@ fn assert_non_blank(rgba: &[u8]) {
     assert!(different > 100, "frame is a flat fill");
 }
 
-fn texts(state: &ModMenuState, w: u32, h: u32) -> Vec<String> {
+fn texts(state: &ModManagerState, w: u32, h: u32) -> Vec<String> {
     state
         .render(w, h)
         .0
@@ -262,13 +262,13 @@ fn search_clear_button_restores_list() {
 
     // The clear button only exists while there is text to clear.
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::SearchClear).is_some());
+    assert!(find(&hits, ModManagerWidgetId::SearchClear).is_some());
 
-    click(&mut s, w, h, ModMenuWidgetId::SearchClear);
+    click(&mut s, w, h, ModManagerWidgetId::SearchClear);
     assert_eq!(s.search, "");
     assert_eq!(ids(&s).len(), 7);
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::SearchClear).is_none());
+    assert!(find(&hits, ModManagerWidgetId::SearchClear).is_none());
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn typing_focuses_search_and_click_unfocuses() {
     assert!(s.search_focused());
 
     // Clicking a row takes focus off the search field.
-    click(&mut s, w, h, ModMenuWidgetId::ModRow(1));
+    click(&mut s, w, h, ModManagerWidgetId::ModRow(1));
     assert!(!s.search_focused());
 
     // Typing refocuses the field and appends.
@@ -287,7 +287,7 @@ fn typing_focuses_search_and_click_unfocuses() {
     assert_eq!(s.search, "jei");
 
     // Clicking the field itself keeps typing focus.
-    click(&mut s, w, h, ModMenuWidgetId::SearchField);
+    click(&mut s, w, h, ModManagerWidgetId::SearchField);
     assert!(s.search_focused());
 }
 
@@ -300,20 +300,20 @@ fn filter_pills() {
     let mut s = fixture();
     assert_eq!(ids(&s).len(), 7);
 
-    s.activate(ModMenuWidgetId::FilterEnabled);
-    assert_eq!(s.filter, ModMenuFilter::Enabled);
+    s.activate(ModManagerWidgetId::FilterEnabled);
+    assert_eq!(s.filter, ModManagerFilter::Enabled);
     assert_eq!(
         ids(&s),
         ["create", "create_aero", "minimap", "jei", "nolink"]
     );
 
-    s.activate(ModMenuWidgetId::FilterIssues);
+    s.activate(ModManagerWidgetId::FilterIssues);
     assert_eq!(ids(&s), ["brokenmod", "jei"]);
 
-    s.activate(ModMenuWidgetId::FilterNative);
+    s.activate(ModManagerWidgetId::FilterNative);
     assert_eq!(ids(&s), ["create", "create_aero", "nolink"]);
 
-    s.activate(ModMenuWidgetId::FilterAll);
+    s.activate(ModManagerWidgetId::FilterAll);
     assert_eq!(ids(&s).len(), 7);
 }
 
@@ -322,7 +322,7 @@ fn libraries_pill_toggle() {
     let mut s = fixture();
     assert_eq!(ids(&s).len(), 7);
 
-    s.activate(ModMenuWidgetId::ToggleLibraries);
+    s.activate(ModManagerWidgetId::ToggleLibraries);
     assert!(s.show_libraries);
     // "megu core library" sorts between "just enough items" and "no links".
     assert_eq!(
@@ -339,7 +339,7 @@ fn libraries_pill_toggle() {
         ]
     );
 
-    s.activate(ModMenuWidgetId::ToggleLibraries);
+    s.activate(ModManagerWidgetId::ToggleLibraries);
     assert!(!s.show_libraries);
     assert_eq!(ids(&s).len(), 7);
 }
@@ -347,7 +347,7 @@ fn libraries_pill_toggle() {
 #[test]
 fn sort_modes() {
     let mut s = fixture();
-    assert_eq!(s.sort, ModMenuSort::NameAsc);
+    assert_eq!(s.sort, ModManagerSort::NameAsc);
     assert_eq!(
         ids(&s),
         [
@@ -361,8 +361,8 @@ fn sort_modes() {
         ]
     );
 
-    s.activate(ModMenuWidgetId::SortMode);
-    assert_eq!(s.sort, ModMenuSort::NameDesc);
+    s.activate(ModManagerWidgetId::SortMode);
+    assert_eq!(s.sort, ModManagerSort::NameDesc);
     assert_eq!(
         ids(&s),
         [
@@ -376,8 +376,8 @@ fn sort_modes() {
         ]
     );
 
-    s.activate(ModMenuWidgetId::SortMode);
-    assert_eq!(s.sort, ModMenuSort::Status);
+    s.activate(ModManagerWidgetId::SortMode);
+    assert_eq!(s.sort, ModManagerSort::Status);
     // Issues first (missing deps / Tier 3), then enabled, then disabled.
     assert_eq!(
         ids(&s),
@@ -392,8 +392,8 @@ fn sort_modes() {
         ]
     );
 
-    s.activate(ModMenuWidgetId::SortMode);
-    assert_eq!(s.sort, ModMenuSort::NameAsc);
+    s.activate(ModManagerWidgetId::SortMode);
+    assert_eq!(s.sort, ModManagerSort::NameAsc);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,21 +404,21 @@ fn sort_modes() {
 fn toggle_and_apply_no_restart() {
     let mut s = fixture();
     // Row 1 is "create" (HotReload, enabled).
-    s.activate(ModMenuWidgetId::ModRow(1));
+    s.activate(ModManagerWidgetId::ModRow(1));
     assert_eq!(
         s.selected_entry().map(|e| e.mod_id.as_str()),
         Some("create")
     );
 
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(s.is_dirty());
     assert_eq!(s.pending_change("create"), Some(false));
     assert_eq!(s.effective_enabled("create"), Some(false));
 
-    let actions = s.activate(ModMenuWidgetId::ApplyChanges);
+    let actions = s.activate(ModManagerWidgetId::ApplyChanges);
     assert_eq!(
         actions,
-        [ModMenuAction::ApplyChanges {
+        [ModManagerAction::ApplyChanges {
             enabled_ids: vec![],
             disabled_ids: vec!["create".to_owned()],
             requires_soft_restart: false,
@@ -439,13 +439,13 @@ fn toggle_and_apply_no_restart() {
 fn apply_requires_soft_restart_for_soft_restart_mods() {
     let mut s = fixture();
     // Row 0 is "brokenmod" (SoftRestart, disabled + missing deps).
-    s.activate(ModMenuWidgetId::ModRow(0));
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ModRow(0));
+    s.activate(ModManagerWidgetId::ToggleEnabled);
 
-    let actions = s.activate(ModMenuWidgetId::ApplyChanges);
+    let actions = s.activate(ModManagerWidgetId::ApplyChanges);
     assert_eq!(
         actions,
-        [ModMenuAction::ApplyChanges {
+        [ModManagerAction::ApplyChanges {
             enabled_ids: vec!["brokenmod".to_owned()],
             disabled_ids: vec![],
             requires_soft_restart: true,
@@ -458,27 +458,27 @@ fn apply_label_reflects_restart_cost() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
     // Only a HotReload mod staged → "(No Restart)".
-    s.activate(ModMenuWidgetId::ModRow(1)); // create
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ModRow(1)); // create
+    s.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(texts(&s, w, h).iter().any(|t| t.contains("No Restart")));
 
     // A SoftRestart mod staged → "(Soft Reload)".
-    s.activate(ModMenuWidgetId::ApplyChanges);
-    s.activate(ModMenuWidgetId::ModRow(0)); // brokenmod
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ApplyChanges);
+    s.activate(ModManagerWidgetId::ModRow(0)); // brokenmod
+    s.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(texts(&s, w, h).iter().any(|t| t.contains("Soft Reload")));
 }
 
 #[test]
 fn toggling_twice_cancels_the_pending_change() {
     let mut s = fixture();
-    s.activate(ModMenuWidgetId::ModRow(1));
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ModRow(1));
+    s.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(s.is_dirty());
-    s.activate(ModMenuWidgetId::ToggleEnabled);
+    s.activate(ModManagerWidgetId::ToggleEnabled);
     assert!(!s.is_dirty());
     assert_eq!(s.effective_enabled("create"), Some(true));
-    assert!(s.activate(ModMenuWidgetId::ApplyChanges).is_empty());
+    assert!(s.activate(ModManagerWidgetId::ApplyChanges).is_empty());
 }
 
 #[test]
@@ -486,8 +486,8 @@ fn apply_button_absent_when_nothing_staged() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::ApplyChanges).is_none());
-    assert!(s.activate(ModMenuWidgetId::ApplyChanges).is_empty());
+    assert!(find(&hits, ModManagerWidgetId::ApplyChanges).is_none());
+    assert!(s.activate(ModManagerWidgetId::ApplyChanges).is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -500,23 +500,23 @@ fn missing_deps_download_emits_exact_ids_only_on_click() {
     let mut s = fixture();
     // Row 0 = brokenmod with missing_deps [megu_core, fancy_lib].
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::DownloadMissingDeps).is_some());
+    assert!(find(&hits, ModManagerWidgetId::DownloadMissingDeps).is_some());
 
     // Nothing is emitted until the button is actually clicked.
-    let actions = click(&mut s, w, h, ModMenuWidgetId::DownloadMissingDeps);
+    let actions = click(&mut s, w, h, ModManagerWidgetId::DownloadMissingDeps);
     assert_eq!(
         actions,
-        [ModMenuAction::DownloadMissingFromModrinth {
+        [ModManagerAction::DownloadMissingFromModrinth {
             mod_id: "brokenmod".to_owned(),
             missing_deps: vec!["megu_core".to_owned(), "fancy_lib".to_owned()],
         }]
     );
 
     // A mod without missing deps has no button and emits nothing.
-    s.activate(ModMenuWidgetId::ModRow(1)); // create
+    s.activate(ModManagerWidgetId::ModRow(1)); // create
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::DownloadMissingDeps).is_none());
-    assert!(s.activate(ModMenuWidgetId::DownloadMissingDeps).is_empty());
+    assert!(find(&hits, ModManagerWidgetId::DownloadMissingDeps).is_none());
+    assert!(s.activate(ModManagerWidgetId::DownloadMissingDeps).is_empty());
 }
 
 #[test]
@@ -525,52 +525,52 @@ fn link_buttons_render_only_when_url_present() {
     let mut s = fixture();
 
     // "nolink" (index 5): every URL empty → no link buttons at all.
-    s.activate(ModMenuWidgetId::ModRow(5));
+    s.activate(ModManagerWidgetId::ModRow(5));
     assert_eq!(
         s.selected_entry().map(|e| e.mod_id.as_str()),
         Some("nolink")
     );
     let (_, hits) = s.render(w, h);
     for id in [
-        ModMenuWidgetId::LinkWebsite,
-        ModMenuWidgetId::LinkIssues,
-        ModMenuWidgetId::LinkSource,
-        ModMenuWidgetId::LinkModrinth,
+        ModManagerWidgetId::LinkWebsite,
+        ModManagerWidgetId::LinkIssues,
+        ModManagerWidgetId::LinkSource,
+        ModManagerWidgetId::LinkModrinth,
     ] {
         assert!(find(&hits, id).is_none(), "{id:?} should be hidden");
     }
 
     // "minimap" (index 3): only a Modrinth URL.
-    s.activate(ModMenuWidgetId::ModRow(3));
+    s.activate(ModManagerWidgetId::ModRow(3));
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::LinkModrinth).is_some());
-    assert!(find(&hits, ModMenuWidgetId::LinkWebsite).is_none());
-    assert!(find(&hits, ModMenuWidgetId::LinkIssues).is_none());
-    assert!(find(&hits, ModMenuWidgetId::LinkSource).is_none());
+    assert!(find(&hits, ModManagerWidgetId::LinkModrinth).is_some());
+    assert!(find(&hits, ModManagerWidgetId::LinkWebsite).is_none());
+    assert!(find(&hits, ModManagerWidgetId::LinkIssues).is_none());
+    assert!(find(&hits, ModManagerWidgetId::LinkSource).is_none());
 
-    let actions = click(&mut s, w, h, ModMenuWidgetId::LinkModrinth);
+    let actions = click(&mut s, w, h, ModManagerWidgetId::LinkModrinth);
     assert_eq!(
         actions,
-        [ModMenuAction::OpenUrl(
+        [ModManagerAction::OpenUrl(
             "https://modrinth.example/minimap".to_owned()
         )]
     );
 
     // "create" has all four links; Website opens its URL.
-    s.activate(ModMenuWidgetId::ModRow(1));
+    s.activate(ModManagerWidgetId::ModRow(1));
     let (_, hits) = s.render(w, h);
     for id in [
-        ModMenuWidgetId::LinkWebsite,
-        ModMenuWidgetId::LinkIssues,
-        ModMenuWidgetId::LinkSource,
-        ModMenuWidgetId::LinkModrinth,
+        ModManagerWidgetId::LinkWebsite,
+        ModManagerWidgetId::LinkIssues,
+        ModManagerWidgetId::LinkSource,
+        ModManagerWidgetId::LinkModrinth,
     ] {
         assert!(find(&hits, id).is_some(), "{id:?} should be visible");
     }
-    let actions = click(&mut s, w, h, ModMenuWidgetId::LinkWebsite);
+    let actions = click(&mut s, w, h, ModManagerWidgetId::LinkWebsite);
     assert_eq!(
         actions,
-        [ModMenuAction::OpenUrl(
+        [ModManagerAction::OpenUrl(
             "https://example.com/create".to_owned()
         )]
     );
@@ -582,15 +582,15 @@ fn configure_only_enabled_with_config() {
     let mut s = fixture();
 
     // "nolink" has no config → disabled, no region, no action.
-    s.activate(ModMenuWidgetId::ModRow(5));
+    s.activate(ModManagerWidgetId::ModRow(5));
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::ConfigureMod).is_none());
-    assert!(s.activate(ModMenuWidgetId::ConfigureMod).is_empty());
+    assert!(find(&hits, ModManagerWidgetId::ConfigureMod).is_none());
+    assert!(s.activate(ModManagerWidgetId::ConfigureMod).is_empty());
 
     // "create" has a config → clickable and emits the mod id.
-    s.activate(ModMenuWidgetId::ModRow(1));
-    let actions = click(&mut s, w, h, ModMenuWidgetId::ConfigureMod);
-    assert_eq!(actions, [ModMenuAction::ConfigureMod("create".to_owned())]);
+    s.activate(ModManagerWidgetId::ModRow(1));
+    let actions = click(&mut s, w, h, ModManagerWidgetId::ConfigureMod);
+    assert_eq!(actions, [ModManagerAction::ConfigureMod("create".to_owned())]);
 }
 
 #[test]
@@ -598,16 +598,16 @@ fn footer_actions() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
     assert_eq!(
-        click(&mut s, w, h, ModMenuWidgetId::AddFromModrinth),
-        [ModMenuAction::OpenModrinthBrowser]
+        click(&mut s, w, h, ModManagerWidgetId::AddFromModrinth),
+        [ModManagerAction::OpenModrinthBrowser]
     );
     assert_eq!(
-        click(&mut s, w, h, ModMenuWidgetId::OpenModsFolder),
-        [ModMenuAction::OpenModsFolder]
+        click(&mut s, w, h, ModManagerWidgetId::OpenModsFolder),
+        [ModManagerAction::OpenModsFolder]
     );
     assert_eq!(
-        click(&mut s, w, h, ModMenuWidgetId::Done),
-        [ModMenuAction::Close]
+        click(&mut s, w, h, ModManagerWidgetId::Done),
+        [ModManagerAction::Close]
     );
 }
 
@@ -619,7 +619,7 @@ fn footer_actions() {
 fn layout_has_zero_overlaps_and_non_blank_pixels() {
     for &(w, h) in &SIZES {
         for lang in [UiLang::En, UiLang::Ja] {
-            for mut state in [ModMenuState::new(vec![]), fixture(), big_fixture()] {
+            for mut state in [ModManagerState::new(vec![]), fixture(), big_fixture()] {
                 state.lang = lang;
                 let (list, hits) = state.render(w, h);
                 assert!(!list.is_empty(), "{w}x{h} {lang:?} produced no commands");
@@ -637,23 +637,23 @@ fn scrollable_list_shows_scroll_controls_and_clipped_rows() {
     let (w, h) = (1280, 720);
     let mut s = big_fixture(); // 27 entries, libraries hidden → 24 visible
     let (_, hits) = s.render(w, h);
-    assert!(find(&hits, ModMenuWidgetId::ListScrollUp).is_some());
-    assert!(find(&hits, ModMenuWidgetId::ListScrollDown).is_some());
+    assert!(find(&hits, ModManagerWidgetId::ListScrollUp).is_some());
+    assert!(find(&hits, ModManagerWidgetId::ListScrollDown).is_some());
     // Only one page of rows gets a region.
     let rows = hits
         .iter()
-        .filter(|r| matches!(r.id, ModMenuWidgetId::ModRow(_)))
+        .filter(|r| matches!(r.id, ModManagerWidgetId::ModRow(_)))
         .count();
     assert!(rows < 24, "rows should be clipped to one page, got {rows}");
 
-    s.activate(ModMenuWidgetId::ListScrollDown);
-    s.activate(ModMenuWidgetId::ListScrollDown);
+    s.activate(ModManagerWidgetId::ListScrollDown);
+    s.activate(ModManagerWidgetId::ListScrollDown);
     assert_eq!(s.scroll_offset(), 2);
-    s.activate(ModMenuWidgetId::ListScrollUp);
+    s.activate(ModManagerWidgetId::ListScrollUp);
     assert_eq!(s.scroll_offset(), 1);
 
     // Row clicks select by visible index.
-    click(&mut s, w, h, ModMenuWidgetId::ModRow(3));
+    click(&mut s, w, h, ModManagerWidgetId::ModRow(3));
     assert_eq!(s.selected_row(), 3);
 }
 
@@ -662,11 +662,11 @@ fn click_resolves_through_widget_at() {
     let (w, h) = (1280, 720);
     let s = fixture();
     let (_, hits) = s.render(w, h);
-    let rect = find(&hits, ModMenuWidgetId::ModRow(2)).unwrap();
+    let rect = find(&hits, ModManagerWidgetId::ModRow(2)).unwrap();
     let (x, y) = (rect.x + rect.w as i32 / 2, rect.y + rect.h as i32 / 2);
     assert_eq!(
         s.widget_at(w, h, x, y),
-        Some(ModMenuWidgetId::ModRow(2)),
+        Some(ModManagerWidgetId::ModRow(2)),
         "click should land on the third visible row"
     );
 }
@@ -706,14 +706,14 @@ fn keyboard_navigation() {
     assert!(s.search_focused());
 
     // Escape closes the screen.
-    assert_eq!(key(&mut s, w, h, UiKey::Escape), [ModMenuAction::Close]);
+    assert_eq!(key(&mut s, w, h, UiKey::Escape), [ModManagerAction::Close]);
 }
 
 #[test]
 fn gamepad_navigation() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
-    let pad = |s: &mut ModMenuState, b: GamepadButton| {
+    let pad = |s: &mut ModManagerState, b: GamepadButton| {
         s.handle_input(UiInputEvent::GamepadPressed(b), w, h)
     };
 
@@ -732,19 +732,19 @@ fn gamepad_navigation() {
     assert_eq!(s.pending_change("brokenmod"), Some(true));
 
     // East and Start both back out.
-    assert_eq!(pad(&mut s, GamepadButton::East), [ModMenuAction::Close]);
-    assert_eq!(pad(&mut s, GamepadButton::Start), [ModMenuAction::Close]);
+    assert_eq!(pad(&mut s, GamepadButton::East), [ModManagerAction::Close]);
+    assert_eq!(pad(&mut s, GamepadButton::Start), [ModManagerAction::Close]);
 }
 
 #[test]
 fn gamepad_dpad_left_right_pages_the_list() {
     let (w, h) = (1920, 1080);
     let mut s = big_fixture(); // 24 visible rows after hiding libraries
-    s.activate(ModMenuWidgetId::ModRow(0));
+    s.activate(ModManagerWidgetId::ModRow(0));
     let page = {
         let (_, hits) = s.render(w, h);
         hits.iter()
-            .filter(|r| matches!(r.id, ModMenuWidgetId::ModRow(_)))
+            .filter(|r| matches!(r.id, ModManagerWidgetId::ModRow(_)))
             .count()
     };
     s.handle_input(UiInputEvent::GamepadPressed(GamepadButton::DpadRight), w, h);

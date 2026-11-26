@@ -14,15 +14,16 @@
 //! regions are returned, so the dimmed screen is truly inert.
 
 use megu_core::i18n::UiTextKey;
-use megu_core::sys_metrics::{MiniHudAnchor, format_mini_hud_lines};
+use megu_core::sys_metrics::{format_mini_hud_lines as format_compact_debug_hud_lines};
+use crate::state::CompactDebugHudAnchor;
 
-use crate::draw::{UiColor, UiCommand, UiDrawList, UiRect, palette as pal, text_width};
+use crate::draw::{hud_sprite_ids, GuiSpriteAtlas, UiColor, UiCommand, UiDrawList, UiRect, palette as pal, text_width};
 use crate::mod_sync_ui::ModSyncDiffKind;
 use crate::hud_widgets::{HudSnapshot, HudWidgetsRenderer};
 use crate::magic_hud::MagicHudState;
 use crate::sign_and_chat::SIGN_LINE_COUNT;
 use crate::state::{
-    FPS_CAP_STEPS, HitRegion, HudState, HudSubtitle, MiniHudPreset, ModSyncChange, Screen,
+    FPS_CAP_STEPS, HitRegion, HudState, HudSubtitle, CompactDebugHudPreset, ModSyncChange, Screen,
     SettingKey, SettingsTab, SubtitleDirection, UiLang, UiModal, UiState, WidgetId, tr,
 };
 use crate::subtitle_hud::SubtitleHudState;
@@ -49,6 +50,20 @@ pub fn layout_screen_into(
     out: &mut UiDrawList,
     regions: &mut Vec<HitRegion>,
 ) {
+    layout_screen_into_with_gui_atlas(state, width, height, out, regions, None);
+}
+
+/// [`layout_screen_into`] plus the host's optional GUI sprite atlas. HUD
+/// elements bind stable logical sprite rectangles when present and keep
+/// their procedural vectors when any individual sprite is absent.
+pub fn layout_screen_into_with_gui_atlas(
+    state: &UiState,
+    width: u32,
+    height: u32,
+    out: &mut UiDrawList,
+    regions: &mut Vec<HitRegion>,
+    gui_atlas: Option<&GuiSpriteAtlas>,
+) {
     out.clear();
     regions.clear();
     let ctx = build_ctx(
@@ -57,6 +72,7 @@ pub fn layout_screen_into(
         height,
         std::mem::take(out),
         std::mem::take(regions),
+        gui_atlas,
     );
     *out = ctx.list;
     *regions = ctx.regions;
@@ -68,7 +84,7 @@ pub fn layout_screen_into(
 /// (`"WidgetId: <intended label>"` entries). An empty list means every
 /// player-facing caption renders whole at that resolution.
 pub fn truncated_widget_labels(state: &UiState, width: u32, height: u32) -> Vec<String> {
-    build_ctx(state, width, height, UiDrawList::new(), Vec::new()).truncated
+    build_ctx(state, width, height, UiDrawList::new(), Vec::new(), None).truncated
 }
 
 /// Shared frame builder behind [`layout_screen_into`] and
@@ -80,6 +96,7 @@ fn build_ctx<'a>(
     height: u32,
     list: UiDrawList,
     regions: Vec<HitRegion>,
+    gui_atlas: Option<&'a GuiSpriteAtlas>,
 ) -> Ctx<'a> {
     let s = layout_scale(state, width, height);
     let mut ctx = Ctx {
@@ -94,6 +111,7 @@ fn build_ctx<'a>(
         s,
         lang: state.lang(),
         state,
+        gui_atlas,
         band_top: i32::MAX,
     };
     match state.screen {
@@ -105,7 +123,7 @@ fn build_ctx<'a>(
         Screen::Friends => friends(&mut ctx),
         Screen::ModSyncConsent => mod_sync(&mut ctx),
         Screen::ModSyncPrompt => mod_sync_prompt(&mut ctx),
-        Screen::ModMenu => embedded_mod_menu(&mut ctx),
+        Screen::ModManager => embedded_mod_manager(&mut ctx),
         Screen::RecipeBrowser => embedded_recipe_browser(&mut ctx),
         Screen::InGameHud => hud(&mut ctx),
         Screen::Death => death(&mut ctx),
@@ -154,6 +172,7 @@ struct Ctx<'a> {
     s: i32,
     lang: UiLang,
     state: &'a UiState,
+    gui_atlas: Option<&'a GuiSpriteAtlas>,
     /// Reserved band top (logical px): content widgets that would cross
     /// it are dropped entirely so they can never collide with footer
     /// chrome. `i32::MAX` disables the band.
@@ -203,6 +222,28 @@ impl Ctx<'_> {
         if let Some(r) = self.vis(lr(x, y, w, h)) {
             self.list
                 .border_rect(self.phys(r), color, self.s.max(1) as u32);
+        }
+    }
+
+    /// Draw one stable logical HUD sprite. Returns `false` when the host
+    /// atlas does not contain that key so callers emit their procedural
+    /// fallback instead of an invisible sprite command.
+    fn hud_sprite(&mut self, key: &str, x: i32, y: i32, w: i32, h: i32) -> bool {
+        let Some(entry) = self.gui_atlas.and_then(|atlas| atlas.named_sprite(key)) else {
+            return false;
+        };
+        if let Some(r) = self.vis(lr(x, y, w, h)) {
+            self.list.texture_uv(self.phys(r), entry);
+        }
+        // The binding exists even when this frame clips it away; do not
+        // draw fallback vectors underneath unrelated viewport content.
+        true
+    }
+
+    /// Draw a pre-resolved sprite entry (used for cropped progress fills).
+    fn hud_sprite_entry(&mut self, entry: crate::draw::GuiSpriteUv, x: i32, y: i32, w: i32, h: i32) {
+        if let Some(r) = self.vis(lr(x, y, w, h)) {
+            self.list.texture_uv(self.phys(r), entry);
         }
     }
 
@@ -2042,7 +2083,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let q = &ctx.state.settings.qol;
     // Below 400 logical px the tab tightens to an 18px/16px rhythm so
-    // every toggle plus the MiniHUD chip grid clears Done/About at the
+    // every toggle plus the Compact Debug HUD chip grid clears Done/About at the
     // standard 360px-tall window; larger screens keep the standard
     // 24px/20px grid.
     let compact = ctx.h < 400;
@@ -2078,7 +2119,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, qy(1) + (bh - 8) / 2);
 
     // Boolean toggles share compact two-per-row cells — the same
-    // 156px pairing the MiniHUD/Subtitles row already uses — so every
+    // 156px pairing the Compact Debug HUD/Subtitles row already uses — so every
     // setting stays reachable at the smallest sane window. Labels that
     // need the full width (Support Links, Crash mode) keep their own
     // row.
@@ -2118,23 +2159,24 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    let minihud_label = match q.mini_hud_preset() {
-        MiniHudPreset::Off => "OFF",
-        MiniHudPreset::Basic => tr(lang, "Basic", "基本"),
-        MiniHudPreset::Advanced => tr(lang, "Advanced", "詳細"),
+    let compact_debug_hud_label = match q.compact_debug_hud_preset() {
+        CompactDebugHudPreset::Off => "OFF",
+        CompactDebugHudPreset::Basic => tr(lang, "Basic", "基本"),
+        CompactDebugHudPreset::Advanced => tr(lang, "Advanced", "詳細"),
     };
-    pair(
-        ctx,
-        3,
-        0,
-        WidgetId::QolMiniHud,
-        SettingKey::QolMiniHud,
-        &format!("MiniHUD: {minihud_label}"),
+    // Long neutral feature names get the full row so their captions never
+    // clip at compact GUI scales.
+    ctx.btn(
+        WidgetId::QolCompactDebugHud,
+        lr(x, qy(3), 320, bh),
+        &format!("{}: {}", tr(lang, "Compact Debug HUD", "コンパクトデバッグHUD"), compact_debug_hud_label),
     );
+    ctx.dirty_dot(SettingKey::QolCompactDebugHud, x + 326, qy(3) + (bh - 8) / 2);
+
     pair(
         ctx,
-        3,
-        1,
+        4,
+        0,
         WidgetId::QolSubtitles,
         SettingKey::QolShowSubtitles,
         &format!(
@@ -2143,11 +2185,10 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.show_subtitles)
         ),
     );
-
     pair(
         ctx,
         4,
-        0,
+        1,
         WidgetId::QolRetainChat,
         SettingKey::QolRetainChatOnReconnect,
         &format!(
@@ -2156,10 +2197,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.retain_chat_on_reconnect)
         ),
     );
+
     pair(
         ctx,
-        4,
-        1,
+        5,
+        0,
         WidgetId::QolToasts,
         SettingKey::QolToastNotifications,
         &format!(
@@ -2168,7 +2210,6 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.toast_notifications)
         ),
     );
-
     // Engine-quality essentials only. The mod-overlapping helpers
     // (auto-replenish, quick-stack, food/saturation preview, shulker
     // peek) deliberately have no toggle here — `QolSettings` keeps the
@@ -2178,7 +2219,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     pair(
         ctx,
         5,
-        0,
+        1,
         WidgetId::QolAutoReconnect,
         SettingKey::QolAutoReconnect,
         &format!(
@@ -2187,10 +2228,11 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.auto_reconnect)
         ),
     );
+
     pair(
         ctx,
-        5,
-        1,
+        6,
+        0,
         WidgetId::QolChatScrollLock,
         SettingKey::QolChatScrollLock,
         &format!(
@@ -2199,22 +2241,10 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.chat_scroll_lock)
         ),
     );
-
-    ctx.btn(
-        WidgetId::QolCrashMode,
-        lr(x, qy(6), 320, bh),
-        &format!(
-            "{}: {}",
-            tr(lang, "Crash Report Mode", "クラッシュレポート"),
-            q.crash_report_mode.label(lang)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(6) + (bh - 8) / 2);
-
     pair(
         ctx,
-        7,
-        0,
+        6,
+        1,
         WidgetId::QolShowSupportLinks,
         SettingKey::QolShowSupportLinks,
         &format!(
@@ -2223,11 +2253,23 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.show_support_links)
         ),
     );
+
+    ctx.btn(
+        WidgetId::QolCrashMode,
+        lr(x, qy(7), 320, bh),
+        &format!(
+            "{}: {}",
+            tr(lang, "Crash Report Mode", "クラッシュレポート"),
+            q.crash_report_mode.label(lang)
+        ),
+    );
+    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(7) + (bh - 8) / 2);
+
     // `Ctrl+O` flips the same setting in-game.
     pair(
         ctx,
-        7,
-        1,
+        8,
+        0,
         WidgetId::QolRecipeOverlay,
         SettingKey::QolRecipeOverlay,
         &format!(
@@ -2236,12 +2278,10 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(q.recipe_overlay_enabled)
         ),
     );
-
-    // -- Built-in helper toggles (relocated from the Controls tab) ----
     pair(
         ctx,
         8,
-        0,
+        1,
         WidgetId::QolBuiltin(0),
         SettingKey::QolLookingAtHud,
         &format!(
@@ -2250,21 +2290,21 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             onoff(ctx.state.settings.qol_looking_at_hud)
         ),
     );
-    pair(
-        ctx,
-        8,
-        1,
+
+    // -- Built-in helper toggles (relocated from the Controls tab) ----
+    ctx.btn(
         WidgetId::QolBuiltin(1),
-        SettingKey::QolMouseTweaks,
+        lr(x, qy(9), 320, bh),
         &format!(
             "{}: {}",
-            tr(lang, "Mouse Tweaks", "マウス操作補助"),
-            onoff(ctx.state.settings.qol_mouse_tweaks)
+            tr(lang, "Inventory Drag Controls", "インベントリドラッグ操作"),
+            onoff(ctx.state.settings.inventory_drag_controls)
         ),
     );
+    ctx.dirty_dot(SettingKey::QolInventoryDragControls, x + 326, qy(9) + (bh - 8) / 2);
     pair(
         ctx,
-        9,
+        10,
         0,
         WidgetId::QolBuiltin(2),
         SettingKey::QolInventorySort,
@@ -2276,7 +2316,7 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     );
     pair(
         ctx,
-        9,
+        10,
         1,
         WidgetId::QolBuiltin(3),
         SettingKey::ZshCommandBar,
@@ -2287,30 +2327,30 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 
-    // MiniHUD segment chips: only meaningful while MiniHUD itself is
+    // Compact Debug HUD segment chips: only meaningful while the HUD itself is
     // on — hidden (not greyed) when the preset is Off. Keybind conflicts
     // are surfaced on the dedicated Controls tab now, so nothing else
     // renders below this grid.
-    let mini = &q.mini_hud;
-    let last_row = if mini.enabled { 12 } else { 9 };
-    if mini.enabled {
+    let hud_config = &q.compact_debug_hud;
+    let last_row = if hud_config.enabled { 13 } else { 10 };
+    if hud_config.enabled {
         let segments = [
-            ("FPS", mini.show_fps),
-            ("Coords", mini.show_coords),
-            ("Biome", mini.show_biome),
-            ("Facing", mini.show_facing),
-            ("Ping", mini.show_ping),
-            ("TPS", mini.show_mspt_tps),
-            ("Light", mini.show_light_level),
-            ("Chunks", mini.show_chunks_entities),
-            ("Memory", mini.show_ram),
+            ("FPS", hud_config.show_fps),
+            ("Coords", hud_config.show_coords),
+            ("Biome", hud_config.show_biome),
+            ("Facing", hud_config.show_facing),
+            ("Ping", hud_config.show_ping),
+            ("TPS", hud_config.show_mspt_tps),
+            ("Light", hud_config.show_light_level),
+            ("Chunks", hud_config.show_chunks_entities),
+            ("Memory", hud_config.show_ram),
         ];
         for (index, (label, enabled)) in segments.iter().enumerate() {
             let column = (index % 3) as i32;
             let row_index = (index / 3) as i32;
             ctx.btn(
-                WidgetId::MiniHudSegment(index),
-                lr(x + column * 108, qy(10 + row_index), 104, bh),
+                WidgetId::CompactDebugHudSegment(index),
+                lr(x + column * 108, qy(11 + row_index), 104, bh),
                 &format!("{label}: {}", onoff(*enabled)),
             );
         }
@@ -3018,7 +3058,7 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// Embedded screens (ModMenu + recipe browser)
+// Embedded screens (ModManager + recipe browser)
 //
 // Both sub-screens produce their own `(UiDrawList, Vec<..HitRegion>)` in
 // physical pixels. Their draw commands merge verbatim; their regions are
@@ -3027,12 +3067,12 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
 // browser's Done button) can sit on top.
 // ---------------------------------------------------------------------------
 
-fn embedded_mod_menu(ctx: &mut Ctx) {
-    let (list, hits) = ctx.state.mod_menu.render(ctx.pw, ctx.ph);
+fn embedded_mod_manager(ctx: &mut Ctx) {
+    let (list, hits) = ctx.state.mod_manager.render(ctx.pw, ctx.ph);
     ctx.list.commands.extend(list.commands);
     ctx.regions.extend(
         hits.into_iter()
-            .map(|h| HitRegion::new(WidgetId::ModMenu(h.id), h.rect)),
+            .map(|h| HitRegion::new(WidgetId::ModManager(h.id), h.rect)),
     );
 }
 
@@ -3072,8 +3112,16 @@ fn hud(ctx: &mut Ctx) {
     if overlay.pumpkin_blur { ctx.fill(0,0,w,h,UiColor::rgba(35,20,0,28)); }
     for (i,effect) in hud.status_effects.iter().enumerate() {
         let x=w-104; let y=8+i as i32*18;
-        let color=if effect.beneficial {UiColor::rgb(60,150,70)} else {UiColor::rgb(160,55,55)};
-        ctx.fill(x,y,16,16,color); ctx.text(x+3,y+4,1,pal::TEXT,&effect.effect_id.rem_euclid(10).to_string());
+        let effect_key = format!(
+            "{}{}",
+            hud_sprite_ids::MOB_EFFECT_PREFIX,
+            effect.name.to_ascii_lowercase().replace(' ', "_")
+        );
+        if !ctx.hud_sprite(&effect_key, x, y, 18, 18) {
+            let color=if effect.beneficial {UiColor::rgb(60,150,70)} else {UiColor::rgb(160,55,55)};
+            ctx.fill(x,y,16,16,color);
+            ctx.text(x+3,y+4,1,pal::TEXT,&effect.effect_id.rem_euclid(10).to_string());
+        }
         let level=match effect.amplifier {0=>"",1=>" II",2=>" III",3=>" IV",n=>if n>=4 {" V"} else {""}};
         let label=if effect.duration_ticks == u32::MAX {
             format!("{}{level} **:**", effect.name)
@@ -3084,10 +3132,10 @@ fn hud(ctx: &mut Ctx) {
         ctx.text(x+19,y+4,1,pal::TEXT,&label);
     }
 
-    // Opt-in MiniHUD lines — empty while disabled, so the disabled path
+    // Opt-in Compact Debug HUD lines — empty while disabled, so the disabled path
     // emits exactly zero commands.
-    let mini_lines = if qol.mini_hud.enabled {
-        format_mini_hud_lines(&qol.mini_hud, &hud.mini_hud_data)
+    let compact_debug_hud_lines = if qol.compact_debug_hud.enabled {
+        format_compact_debug_hud_lines(&qol.compact_debug_hud, &hud.compact_debug_hud_data)
     } else {
         Vec::new()
     };
@@ -3121,9 +3169,11 @@ fn hud(ctx: &mut Ctx) {
 
     // Crosshair.
     if hud.game_mode != 3 {
-        let cc = UiColor::rgba(230, 230, 230, 190);
-        ctx.fill(cx - 5, h / 2, 11, 1, cc);
-        ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+        if !ctx.hud_sprite(hud_sprite_ids::CROSSHAIR, cx - 7, h / 2 - 7, 15, 15) {
+            let cc = UiColor::rgba(230, 230, 230, 190);
+            ctx.fill(cx - 5, h / 2, 11, 1, cc);
+            ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+        }
         if hud.attack_cooldown < 1.0 { ctx.progress(lr(cx-45,h/2+8,90,4),hud.attack_cooldown.clamp(0.0,1.0),pal::TEXT,UiColor::rgb(35,35,35),pal::BUTTON_BORDER); }
     }
 
@@ -3133,6 +3183,8 @@ fn hud(ctx: &mut Ctx) {
     let hx = cx - (hw + slot + 4) / 2;
     let hy = h - slot - 4;
     if show_hotbar {
+        let hotbar_x = hx + slot + 4;
+        let _hotbar_skinned = ctx.hud_sprite(hud_sprite_ids::HOTBAR, hotbar_x, hy, hw, slot);
         if let Some(item) = &hud.offhand {
             slot_cell(ctx, hx, hy, Some(item), false);
             if let Some(frac) = hud.item_cooldowns.get(item) {
@@ -3153,12 +3205,56 @@ fn hud(ctx: &mut Ctx) {
     let vy = hy - 12;
     let rx = hx0 + hw;
     if show_vitals {
-        icon_row(ctx, hx0, vy, hud.health, 20.0, pal::HEALTH);
-        icon_row(ctx, hx0, vy - 10, hud.armor as f32, 20.0, pal::ARMOR);
+        sprite_icon_row(
+            ctx,
+            hx0,
+            vy,
+            false,
+            hud.health,
+            20.0,
+            pal::HEALTH,
+            hud_sprite_ids::HEART_CONTAINER,
+            hud_sprite_ids::HEART_FULL,
+            hud_sprite_ids::HEART_HALF,
+        );
+        sprite_icon_row(
+            ctx,
+            hx0,
+            vy - 10,
+            false,
+            hud.armor as f32,
+            20.0,
+            pal::ARMOR,
+            hud_sprite_ids::ARMOR_EMPTY,
+            hud_sprite_ids::ARMOR_FULL,
+            hud_sprite_ids::ARMOR_HALF,
+        );
         if hud.absorption > 0.0 {
-            icon_row(ctx, hx0, vy - 20, hud.absorption, 20.0, pal::ABSORPTION);
+            sprite_icon_row(
+                ctx,
+                hx0,
+                vy - 20,
+                false,
+                hud.absorption,
+                20.0,
+                pal::ABSORPTION,
+                hud_sprite_ids::HEART_CONTAINER,
+                hud_sprite_ids::HEART_FULL,
+                hud_sprite_ids::HEART_HALF,
+            );
         }
-        icon_row_r(ctx, rx, vy, hud.hunger as f32, 20.0, pal::HUNGER);
+        sprite_icon_row(
+            ctx,
+            rx,
+            vy,
+            true,
+            hud.hunger as f32,
+            20.0,
+            pal::HUNGER,
+            hud_sprite_ids::FOOD_EMPTY,
+            hud_sprite_ids::FOOD_FULL,
+            hud_sprite_ids::FOOD_HALF,
+        );
         let mut right_row_y = vy - 10;
         if let Some((health, max)) = hud.mount_health {
             let max_hp = max.max(1.0);
@@ -3166,7 +3262,18 @@ fn hud(ctx: &mut Ctx) {
             for row in 0..rows {
                 let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
                 let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
-                icon_row_r(ctx, rx, right_row_y, row_hp, row_max, pal::HEALTH);
+                sprite_icon_row(
+                    ctx,
+                    rx,
+                    right_row_y,
+                    true,
+                    row_hp,
+                    row_max,
+                    pal::HEALTH,
+                    hud_sprite_ids::HEART_CONTAINER,
+                    hud_sprite_ids::HEART_FULL,
+                    hud_sprite_ids::HEART_HALF,
+                );
                 right_row_y -= 10;
             }
         }
@@ -3174,14 +3281,31 @@ fn hud(ctx: &mut Ctx) {
             icon_row_r(ctx, rx, right_row_y, hud.air as f32 / 30.0, 10.0, pal::AIR);
         }
 
-        // XP bar + level.
-        ctx.progress(
-            lr(cx - 91, hy - 4, 182, 3),
-            hud.xp_progress.clamp(0.0, 1.0),
-            pal::XP,
-            UiColor::rgb(20, 30, 14),
-            pal::BUTTON_BORDER,
-        );
+        // XP bar + level. The textured bar crops its fill in source
+        // pixels; the procedural bar remains the clean fallback.
+        let xp_frac = hud.xp_progress.clamp(0.0, 1.0);
+        let xp_entries = ctx.gui_atlas.and_then(|atlas| {
+            Some((
+                atlas.named_sprite(hud_sprite_ids::EXPERIENCE_BAR_BACKGROUND)?,
+                atlas.named_sprite(hud_sprite_ids::EXPERIENCE_BAR_PROGRESS)?,
+            ))
+        });
+        if let Some((bg, fill)) = xp_entries {
+            ctx.hud_sprite_entry(bg, cx - 91, hy - 5, 182, 5);
+            let src_w = (fill.width as f32 * xp_frac).round() as u32;
+            let dst_w = (182.0 * xp_frac).round() as i32;
+            if src_w > 0 && dst_w > 0 {
+                ctx.hud_sprite_entry(fill.subrect(0, 0, src_w, fill.height), cx - 91, hy - 5, dst_w, 5);
+            }
+        } else {
+            ctx.progress(
+                lr(cx - 91, hy - 4, 182, 3),
+                xp_frac,
+                pal::XP,
+                UiColor::rgb(20, 30, 14),
+                pal::BUTTON_BORDER,
+            );
+        }
         if let Some(charge)=hud.mount_jump_charge { ctx.progress(lr(cx-91,hy-4,182,3),charge.clamp(0.0,1.0),pal::XP,UiColor::rgb(20,30,14),pal::BUTTON_BORDER); }
         if hud.xp_level > 0 {
             ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
@@ -3194,7 +3318,7 @@ fn hud(ctx: &mut Ctx) {
     //   * the vitals icon columns flank the hotbar (always drawn),
     //   * the actionbar sits centered at a fixed band above them,
     //   * subtitles stack upward from the hotbar on the right, and
-    //   * the crafting-conflict button and the MiniHUD box stack above
+    //   * the crafting-conflict button and the Compact Debug HUD box stack above
     //     whatever came before (or drop lines that cannot fit).
     // ------------------------------------------------------------------
     let hotbar_top = hy - 4;
@@ -3483,13 +3607,13 @@ fn hud(ctx: &mut Ctx) {
         }
     }
 
-    if mini_lines.is_empty() {
+    if compact_debug_hud_lines.is_empty() {
         ctx.text(4, 4, 1, pal::TEXT_DIM, "megu HUD");
     }
 
     // MagicHUD occupies the centered bottom stack and the top-right
     // status column at its own internal scale; convert to logical px so
-    // the MiniHUD box can stack around it.
+    // the Compact Debug HUD box can stack around it.
     let magic_frame = magic_frame(
         &hud.magic,
         (ctx.w * ctx.s) as u32,
@@ -3497,21 +3621,21 @@ fn hud(ctx: &mut Ctx) {
         ctx.s,
     );
 
-    // MiniHUD: translucent backing + clipped lines anchored to the
+    // Compact Debug HUD: translucent backing + clipped lines anchored to the
     // configured corner. The box is width-capped against the centered
     // player list and height-capped against the top stacks (bossbars,
     // magic statuses) and bottom stacks (chat, subtitles, conflict
     // button, vitals, hotbar, magic bars); lines that cannot fit are
     // dropped rather than drawn on top of another element.
-    if !mini_lines.is_empty() {
+    if !compact_debug_hud_lines.is_empty() {
         let pad = 3;
-        let anchor = qol.mini_hud.anchor;
+        let anchor = qol.compact_debug_hud.anchor;
         let mut max_box_w = (w - 8).max(8);
         if hud.show_player_list {
             max_box_w = max_box_w.min(cx - 106).max(8);
         }
         let max_chars = ((max_box_w - 2 * pad) / 8).max(1) as usize;
-        let clipped: Vec<String> = mini_lines
+        let clipped: Vec<String> = compact_debug_hud_lines
             .iter()
             .map(|line| hud_str(line, max_chars))
             .collect();
@@ -3522,8 +3646,8 @@ fn hud(ctx: &mut Ctx) {
             .unwrap_or(0);
         let box_w = (text_w + 2 * pad).min(max_box_w);
         let bx = match anchor {
-            MiniHudAnchor::TopLeft | MiniHudAnchor::BottomLeft => 4,
-            MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => (w - 4 - box_w).max(4),
+            CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::BottomLeft => 4,
+            CompactDebugHudAnchor::TopRight | CompactDebugHudAnchor::BottomRight => (w - 4 - box_w).max(4),
         };
         let box_x = bx..(bx + box_w);
 
@@ -3534,9 +3658,9 @@ fn hud(ctx: &mut Ctx) {
             top_edge = top_edge.max(boss_bottom + 2);
         }
         let mut bottom_edge = match anchor {
-            MiniHudAnchor::TopLeft | MiniHudAnchor::TopRight => h - 4,
-            MiniHudAnchor::BottomLeft => hotbar_top,
-            MiniHudAnchor::BottomRight => stack_bottom,
+            CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => h - 4,
+            CompactDebugHudAnchor::BottomLeft => hotbar_top,
+            CompactDebugHudAnchor::BottomRight => stack_bottom,
         };
         // The right stack (subtitles + conflict button) bounds anything
         // reaching its column on the right.
@@ -3579,12 +3703,12 @@ fn hud(ctx: &mut Ctx) {
                 .unwrap_or(0);
             let box_w = (text_w + 2 * pad).min(max_box_w);
             let bx = match anchor {
-                MiniHudAnchor::TopLeft | MiniHudAnchor::BottomLeft => 4,
-                MiniHudAnchor::TopRight | MiniHudAnchor::BottomRight => (w - 4 - box_w).max(4),
+                CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::BottomLeft => 4,
+                CompactDebugHudAnchor::TopRight | CompactDebugHudAnchor::BottomRight => (w - 4 - box_w).max(4),
             };
             let box_h = 2 * pad + shown.len() as i32 * 10 - 2;
             let by = match anchor {
-                MiniHudAnchor::TopLeft | MiniHudAnchor::TopRight => top_edge,
+                CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => top_edge,
                 _ => bottom_edge - box_h,
             };
             ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
@@ -4168,7 +4292,7 @@ pub fn layout_toast_stack(state: &UiState, width: u32, height: u32, out: &mut Ui
 /// overlays that composite after [`layout_screen`]. Mirrors the `hud()`
 /// collision model exactly — same scale, same constants, same clip math —
 /// so a later overlay can prove zero overlap against bossbars, MagicHUD,
-/// chat, the hotbar stack, and the rest. The MiniHUD box is deliberately
+/// chat, the hotbar stack, and the rest. The Compact Debug HUD box is deliberately
 /// absent: it is itself managed against the legacy subtitle stack and
 /// anchors to corners the spatial panel only reaches on degenerate
 /// layouts.
@@ -4416,7 +4540,7 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
         }
 
         // MagicHUD bottom bars + top-right status column (same frame the
-        // MiniHUD collision code uses).
+        // Compact Debug HUD collision code uses).
         if let Some(mf) = magic_frame(&hud.magic, (w * s) as u32, (h * s) as u32, s) {
             add(
                 mf.panel.start,
@@ -4444,18 +4568,27 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
 }
 
 fn slot_cell(ctx: &mut Ctx, x: i32, y: i32, item: Option<&String>, selected: bool) {
-    ctx.fill(x, y, 22, 22, pal::SLOT);
-    ctx.border(
-        x,
-        y,
-        22,
-        22,
-        if selected {
-            pal::BUTTON_BORDER_HOVER
-        } else {
-            pal::PANEL_BORDER
-        },
-    );
+    let hotbar_frame = ctx
+        .gui_atlas
+        .is_some_and(|atlas| atlas.has_named_sprite(hud_sprite_ids::HOTBAR));
+    if !hotbar_frame {
+        ctx.fill(x, y, 22, 22, pal::SLOT);
+        ctx.border(
+            x,
+            y,
+            22,
+            22,
+            if selected {
+                pal::BUTTON_BORDER_HOVER
+            } else {
+                pal::PANEL_BORDER
+            },
+        );
+    } else if selected
+        && !ctx.hud_sprite(hud_sprite_ids::HOTBAR_SELECTION, x - 1, y - 1, 24, 24)
+    {
+        ctx.border(x, y, 22, 22, pal::BUTTON_BORDER_HOVER);
+    }
     if let Some(name) = item {
         // Two cells max: three glyphs would spill into the next slot.
         ctx.hud_text(x + 3, y + 7, 1, pal::TEXT_DIM, name, 2);
@@ -4479,6 +4612,46 @@ fn slot_cooldown_wipe(ctx: &mut Ctx, x: i32, y: i32, frac: f32) {
         1,
         UiColor::rgba(40, 40, 40, 160),
     );
+}
+
+/// Sprite-backed icon row with the procedural swatch row as fallback.
+/// Vanilla HUD icons are 9×9 on an 8 px pitch, so neighboring transparent
+/// edges overlap exactly like the original renderer.
+#[allow(clippy::too_many_arguments)]
+fn sprite_icon_row(
+    ctx: &mut Ctx,
+    x: i32,
+    y: i32,
+    right_aligned: bool,
+    value: f32,
+    max: f32,
+    color: UiColor,
+    empty: &str,
+    full: &str,
+    half: &str,
+) {
+    let available = ctx.gui_atlas.is_some_and(|atlas| {
+        atlas.has_named_sprite(empty) && atlas.has_named_sprite(full) && atlas.has_named_sprite(half)
+    });
+    if !available {
+        if right_aligned {
+            icon_row_r(ctx, x, y, value, max, color);
+        } else {
+            icon_row(ctx, x, y, value, max, color);
+        }
+        return;
+    }
+    let icons = ((max / 2.0).ceil() as i32).clamp(0, 10);
+    for i in 0..icons {
+        let cx = if right_aligned { x - 8 - i * 8 } else { x + i * 8 };
+        let units = (value - i as f32 * 2.0).clamp(0.0, 2.0);
+        ctx.hud_sprite(empty, cx, y, 9, 9);
+        if units >= 2.0 {
+            ctx.hud_sprite(full, cx, y, 9, 9);
+        } else if units >= 1.0 {
+            ctx.hud_sprite(half, cx, y, 9, 9);
+        }
+    }
 }
 
 /// `count`-icon row of 8px cells (half-unit granularity like vanilla
@@ -5126,7 +5299,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Every menu screen a player can reach without live session data.
-    /// Embedded sub-screens (`ModMenu`, `RecipeBrowser`) and the in-game
+    /// Embedded sub-screens (`ModManager`, `RecipeBrowser`) and the in-game
     /// HUD render their own trees with dedicated test modules — this
     /// list covers the native chrome and tab chrome.
     fn menu_screens() -> Vec<(String, Screen)> {
@@ -5219,16 +5392,16 @@ mod tests {
                     "{id:?} must render only on Video at {w}x{h}"
                 );
             }
-            // The relocated built-ins and MiniHUD chips are QoL-only.
+            // The relocated built-ins and Compact Debug HUD chips are QoL-only.
             assert_eq!(
                 tabs_of(&|i| matches!(i, WidgetId::QolBuiltin(_))),
                 [SettingsTab::Qol],
                 "QolBuiltin leaked off the QoL tab at {w}x{h}"
             );
             assert_eq!(
-                tabs_of(&|i| matches!(i, WidgetId::MiniHudSegment(_))),
+                tabs_of(&|i| matches!(i, WidgetId::CompactDebugHudSegment(_))),
                 [] as [SettingsTab; 0],
-                "MiniHudSegment rendered with MiniHUD off at {w}x{h}"
+                "CompactDebugHudSegment rendered with Compact Debug HUD off at {w}x{h}"
             );
             // Rebind cells and the mouse-Y toggle are Controls-only.
             assert_eq!(
@@ -5254,21 +5427,21 @@ mod tests {
                     "{id:?} missing from Video at {w}x{h}"
                 );
             }
-            // With MiniHUD on, its chips still belong to QoL alone.
+            // With Compact Debug HUD on, its chips still belong to QoL alone.
             let mut ui = menu_state(UiLang::En, Screen::Settings(SettingsTab::Qol));
-            ui.settings.qol.mini_hud.enabled = true;
+            ui.settings.qol.compact_debug_hud.enabled = true;
             let (_, regions) = layout_screen(&ui, w, h);
             assert!(
                 regions
                     .iter()
-                    .any(|r| matches!(r.id, WidgetId::MiniHudSegment(_))),
-                "MiniHudSegment missing on QoL with MiniHUD on at {w}x{h}"
+                    .any(|r| matches!(r.id, WidgetId::CompactDebugHudSegment(_))),
+                "CompactDebugHudSegment missing on QoL with Compact Debug HUD on at {w}x{h}"
             );
         }
         // The chips never render outside QoL even when enabled.
         for tab in SettingsTab::ALL {
             let mut ui = menu_state(UiLang::En, Screen::Settings(tab));
-            ui.settings.qol.mini_hud.enabled = true;
+            ui.settings.qol.compact_debug_hud.enabled = true;
             let (_, regions) = layout_screen(&ui, 1280, 720);
             if tab == SettingsTab::Qol {
                 continue;
@@ -5276,8 +5449,8 @@ mod tests {
             assert!(
                 !regions
                     .iter()
-                    .any(|r| matches!(r.id, WidgetId::MiniHudSegment(_))),
-                "MiniHudSegment leaked onto {tab:?}"
+                    .any(|r| matches!(r.id, WidgetId::CompactDebugHudSegment(_))),
+                "CompactDebugHudSegment leaked onto {tab:?}"
             );
         }
     }
@@ -5342,7 +5515,7 @@ mod tests {
             "GUI Scale:",
             "Invert Y:",
             "Looking-at HUD",
-            "Mouse tweaks",
+            "Inventory Drag Controls",
             "Inventory sort",
             "Press any key",
         ];

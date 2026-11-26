@@ -16,7 +16,7 @@
 //!      overlays, every hitbox inside the viewport and mutually
 //!      non-overlapping;
 //!    * the in-game HUD (9-slot hotbar at the exact 22px pitch, hearts,
-//!      armor, hunger, air, XP bar, bossbars, chat, subtitles, MiniHUD,
+//!      armor, hunger, air, XP bar, bossbars, chat, subtitles, Compact Debug HUD,
 //!      MagicHUD) keeps every draw command inside the viewport and every
 //!      occupancy rectangle in the shared collision model
 //!      non-overlapping;
@@ -24,7 +24,7 @@
 //!      slots plus the container grid on the exact non-overlapping 18×18
 //!      vanilla pitch, with durability bars inside their slots.
 //! 2. **Exhaustive screen state-machine transitions** — Title →
-//!    Singleplayer / Multiplayer / Settings / ModMenu → Back/Esc, and
+//!    Singleplayer / Multiplayer / Settings / ModManager → Back/Esc, and
 //!    InGame → Pause / RecipeBrowser / Claims → Esc back to InGame,
 //!    asserting screen, nav-stack, focus and cursor invariants after
 //!    every hop.
@@ -79,7 +79,7 @@ use megu_client_ui::vanilla_widgets::{
 };
 use megu_core::crash_report::CrashContext;
 use megu_core::rev::{DirtyLayers, UiLayer, UiLayerBus};
-use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
+use megu_client_ui::state::{CompactDebugHudAnchor, CompactDebugHudConfig, CompactDebugHudData};
 
 /// Mission viewport sweep (physical pixels).
 const SIZES: [(u32, u32); 5] = [
@@ -185,10 +185,10 @@ fn all_texts(list: &UiDrawList) -> Vec<String> {
         .collect()
 }
 
-/// MiniHUD data with every field set so Basic *and* Advanced presets
+/// Compact Debug HUD data with every field set so Basic *and* Advanced presets
 /// emit their full line sets.
-fn populated_mini_hud_data() -> MiniHudData {
-    MiniHudData {
+fn populated_compact_debug_hud_data() -> CompactDebugHudData {
+    CompactDebugHudData {
         fps: Some(60.0),
         fps_one_percent_low: Some(9.0),
         mspt: Some(4.2),
@@ -213,9 +213,9 @@ fn populated_mini_hud_data() -> MiniHudData {
     }
 }
 
-/// MiniHUD config with every segment on (the Advanced preset).
-fn all_minihud_segments(anchor: MiniHudAnchor) -> MiniHudConfig {
-    MiniHudConfig {
+/// Compact Debug HUD config with every segment on (the Advanced preset).
+fn all_compact_debug_hud_segments(anchor: CompactDebugHudAnchor) -> CompactDebugHudConfig {
+    CompactDebugHudConfig {
         enabled: true,
         anchor,
         show_one_percent_low: true,
@@ -227,7 +227,7 @@ fn all_minihud_segments(anchor: MiniHudAnchor) -> MiniHudConfig {
         show_chunks_entities: true,
         show_light_level: true,
         show_shader_audio_status: true,
-        ..MiniHudConfig::default()
+        ..CompactDebugHudConfig::default()
     }
 }
 
@@ -255,7 +255,7 @@ fn loaded_hud() -> HudState {
     hud.players = (0..24)
         .map(|i| (format!("Player{i:02}"), 10 + i as u16 * 7))
         .collect();
-    hud.mini_hud_data = populated_mini_hud_data();
+    hud.compact_debug_hud_data = populated_compact_debug_hud_data();
     hud.subtitles = vec![
         HudSubtitle {
             label: "Zombie groans".into(),
@@ -528,17 +528,17 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
     for &(w, h) in &SIZES {
         for &scale in &SCALES {
             for anchor in [
-                MiniHudAnchor::TopLeft,
-                MiniHudAnchor::TopRight,
-                MiniHudAnchor::BottomLeft,
-                MiniHudAnchor::BottomRight,
+                CompactDebugHudAnchor::TopLeft,
+                CompactDebugHudAnchor::TopRight,
+                CompactDebugHudAnchor::BottomLeft,
+                CompactDebugHudAnchor::BottomRight,
             ] {
                 let mut ui = UiState::new();
                 ui.ui_scale = scale;
                 ui.screen = Screen::InGameHud;
                 ui.hud = loaded_hud();
                 ui.settings.qol.show_subtitles = true;
-                ui.settings.qol.mini_hud = all_minihud_segments(anchor);
+                ui.settings.qol.compact_debug_hud = all_compact_debug_hud_segments(anchor);
                 let s = (ui.effective_scale(h) as i32).min((w / 224).max(1) as i32);
                 let list = ui.render(w, h);
                 let context = format!("hud {w}x{h} scale {scale} anchor {anchor:?}");
@@ -556,7 +556,7 @@ fn hud_vitals_hotbar_xp_and_overlays_stay_in_bounds_and_non_overlapping() {
                 // no-overlap assertion is held as future work. Green here
                 // must not be read as proof of total overlay non-overlap.
                 // Evidence in `layout.rs`: `hud_occupied_rects_into` says
-                // the MiniHUD box is deliberately absent, while MagicHUD is
+                // the Compact Debug HUD box is deliberately absent, while MagicHUD is
                 // represented by one bottom-to-top conservative column that
                 // includes empty space and does not model its actual mana/
                 // cast/cooldown rectangles. The fixture also enables modded
@@ -970,12 +970,12 @@ fn title_to_subscreens_and_back_restores_state_and_focus() {
     assert_eq!(ui.screen, Screen::Title);
     ui.render(1920, 1080);
 
-    // ModMenu -> Escape -> Title.
+    // ModManager -> Escape -> Title.
     assert_eq!(
         click_region(&mut ui, WidgetId::TitleMods),
-        vec![UiAction::OpenScreen(Screen::ModMenu)]
+        vec![UiAction::OpenScreen(Screen::ModManager)]
     );
-    assert_eq!(ui.screen, Screen::ModMenu);
+    assert_eq!(ui.screen, Screen::ModManager);
     assert_eq!(
         ui.handle_input(UiInputEvent::KeyPressed(UiKey::Escape)),
         vec![UiAction::Back]
@@ -1278,7 +1278,7 @@ fn mouse_and_keyboard_replay_is_deterministic() {
     assert_eq!(log_a[10], vec![UiAction::Back]);
     assert_eq!(log_a[11], vec![UiAction::OpenScreen(Screen::Multiplayer)]);
     assert_eq!(log_a[12], vec![UiAction::Back]);
-    assert_eq!(log_a[13], vec![UiAction::OpenScreen(Screen::ModMenu)]);
+    assert_eq!(log_a[13], vec![UiAction::OpenScreen(Screen::ModManager)]);
     assert_eq!(log_a[14], vec![UiAction::Back]);
     assert_eq!(log_a[17], vec![UiAction::OpenScreen(Screen::Pause)]);
     assert_eq!(log_a[18], vec![UiAction::Back]);

@@ -323,7 +323,7 @@ const SEARCH_CATALOG: &[SettingsSearchEntry] = &[
     entry(SettingKey::MouseSensitivityPct, SettingsTab::Controls, "Mouse Sensitivity", "マウス感度", &["sensitivity", "sens", "mouse", "感度", "マウス"]),
     entry(SettingKey::ZoomDivisorTenths, SettingsTab::Qol, "Zoom Divisor", "ズーム倍率", &["zoom", "ズーム", "divisor", "望遠"]),
     entry(SettingKey::QolLookingAtHud, SettingsTab::Qol, "Looking-At HUD", "注視HUD", &["hud", "jade", "waila", "注視", "looking"]),
-    entry(SettingKey::QolMouseTweaks, SettingsTab::Qol, "Mouse Tweaks", "マウス操作強化", &["mouse", "tweaks", "drag", "マウス", "ドラッグ"]),
+    entry(SettingKey::QolInventoryDragControls, SettingsTab::Qol, "Inventory Drag Controls", "インベントリドラッグ操作", &["mouse", "tweaks", "mousetweaks", "drag", "マウス", "ドラッグ"]), // trademark-hygiene:allow external-mod search aliases
     entry(SettingKey::QolInventorySort, SettingsTab::Qol, "Inventory Sort", "インベントリ整理", &["inventory", "sort", "整理", "インベントリ", "ソート"]),
     entry(SettingKey::ZshCommandBar, SettingsTab::Qol, "Command Bar", "コマンドバー", &["command", "bar", "zsh", "コマンド"]),
     entry(SettingKey::QolSmoothZoom, SettingsTab::Qol, "Smooth Zoom", "スムーズズーム", &["zoom", "smooth", "ズーム", "スムーズ"]),
@@ -333,7 +333,7 @@ const SEARCH_CATALOG: &[SettingsSearchEntry] = &[
     entry(SettingKey::QolRetainChatOnReconnect, SettingsTab::Qol, "Keep Chat on Reconnect", "再接続時にチャットを保持", &["chat", "reconnect", "チャット", "再接続", "保持"]),
     entry(SettingKey::QolCrashReportMode, SettingsTab::Qol, "Crash Report Mode", "クラッシュレポート方式", &["crash", "report", "クラッシュ", "レポート"]),
     entry(SettingKey::QolShowSupportLinks, SettingsTab::Qol, "Support Links", "サポートリンク", &["support", "links", "サポート", "リンク", "help"]),
-    entry(SettingKey::QolMiniHud, SettingsTab::Qol, "Mini HUD", "ミニHUD", &["hud", "mini", "ミニ", "overlay"]),
+    entry(SettingKey::QolCompactDebugHud, SettingsTab::Qol, "Compact Debug HUD", "コンパクトデバッグHUD", &["hud", "mini", "minihud", "ミニ", "overlay"]), // trademark-hygiene:allow external-mod search aliases
     entry(SettingKey::QolShowSubtitles, SettingsTab::Qol, "Subtitles", "字幕", &["subtitles", "字幕", "captions", "caption"]),
     entry(SettingKey::QolAutoReconnect, SettingsTab::Qol, "Auto Reconnect", "自動再接続", &["reconnect", "auto", "再接続", "自動"]),
     entry(SettingKey::QolAutoReplenish, SettingsTab::Qol, "Auto Replenish", "自動補充", &["replenish", "補充", "auto", "refill"]),
@@ -342,7 +342,7 @@ const SEARCH_CATALOG: &[SettingsSearchEntry] = &[
     entry(SettingKey::QolShulkerPeek, SettingsTab::Qol, "Shulker Peek", "シュルカーボックス中身表示", &["shulker", "peek", "シュルカー", "中身"]),
     entry(SettingKey::QolChatScrollLock, SettingsTab::Qol, "Chat Scroll Lock", "チャットスクロール固定", &["chat", "scroll", "lock", "スクロール", "固定"]),
     entry(SettingKey::QolToastNotifications, SettingsTab::Qol, "Toast Notifications", "トースト通知", &["toast", "notification", "通知", "トースト"]),
-    entry(SettingKey::QolRecipeOverlay, SettingsTab::Qol, "Recipe Overlay", "レシピオーバーレイ", &["recipe", "overlay", "レシピ", "jei", "rei"]),
+    entry(SettingKey::QolRecipeOverlay, SettingsTab::Qol, "Recipe Overlay", "レシピオーバーレイ", &["recipe", "overlay", "レシピ", "jei", "rei"]), // trademark-hygiene:allow external-mod search aliases
     entry(SettingKey::FpMinimapMode, SettingsTab::FairPlay, "Minimap", "ミニマップ", &["minimap", "map", "ミニマップ", "マップ"]),
     entry(SettingKey::FpAllowCaveMap, SettingsTab::FairPlay, "Cave Mapping", "洞窟マッピング", &["cave", "map", "洞窟", "マッピング", "mapping"]),
     entry(SettingKey::FpAllowMobRadar, SettingsTab::FairPlay, "Mob Radar", "モブレーダー", &["radar", "mob", "レーダー", "mob radar"]),

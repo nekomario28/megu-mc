@@ -149,7 +149,7 @@ fn live_session_streams_p2_pid_and_ducb_through_real_frames() {
     assert_eq!(live.frame_budget_scale(), 1.0);
 
     for _ in 0..8 {
-        live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
     }
     let p95 = live
         .p95_frame_ms()
@@ -175,7 +175,7 @@ fn live_session_streams_p2_pid_and_ducb_through_real_frames() {
     // Sustained over-budget frames push the anti-windup PID down: the
     // rebuild budget must shrink but never drop below one section.
     for _ in 0..40 {
-        live.record_frame_and_refresh_minihud(0.100, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(0.100, &mut ui);
     }
     let scale = live.frame_budget_scale();
     assert!(
@@ -357,7 +357,7 @@ fn live_session_looking_at_hud_uses_qol_gameplay_projection() {
 
     assert!(live.looking_at_hud.is_none());
     let mut ui = UiState::new();
-    live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+    live.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
 
     let info = live
         .looking_at_hud

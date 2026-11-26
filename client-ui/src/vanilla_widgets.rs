@@ -3,7 +3,7 @@
 
 //! The one shared Vanilla 1.21.1 widget kit.
 //!
-//! Every surface — vanilla screens, Megu's own UX screens (JEI overlay,
+//! Every surface — vanilla screens, Megu's own UX screens (recipe browser overlay,
 //! ModSync browser, settings, claim map) and [`ModUiManifest`] mod UIs —
 //! draws through these same primitives, which take their colors
 //! exclusively from [`megu_core::ui_contract::VANILLA_1_21_1`] (via

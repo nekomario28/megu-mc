@@ -586,11 +586,11 @@ pub struct ClientSettings {
     /// Whether the selected shader pack is active.
     pub shaders_enabled: bool,
     pub builtin_looking_at_hud: bool,
-    pub builtin_mouse_tweaks: bool,
+    pub inventory_drag_controls: bool,
     pub builtin_inventory_sort: bool,
     pub zsh_command_bar: bool,
-    pub mini_hud_enabled: bool,
-    pub mini_hud_segments: u16,
+    pub compact_debug_hud_enabled: bool,
+    pub compact_debug_hud_segments: u16,
     /// Optional `profile.<NAME>` inside the pack's `shaders.properties`
     /// activated on load; `None` uses the pack's own defaults.
     pub shader_profile: Option<String>,
@@ -669,11 +669,11 @@ impl ClientSettings {
             shader_pack: None,
             shaders_enabled: false,
             builtin_looking_at_hud: true,
-            builtin_mouse_tweaks: true,
+            inventory_drag_controls: true,
             builtin_inventory_sort: true,
             zsh_command_bar: true,
-            mini_hud_enabled: false,
-            mini_hud_segments: 0b1_1111,
+            compact_debug_hud_enabled: false,
+            compact_debug_hud_segments: 0b1_1111,
             shader_profile: None,
             map_fair_play: HostMapFairPlaySettings::default(),
             qol: ClientQolSettings::default(),
@@ -763,16 +763,22 @@ impl ClientSettings {
             self.builtin_looking_at_hud
         ));
         shader_lines.push_str(&format!(
-            "builtin_mouse_tweaks = {}\n",
-            self.builtin_mouse_tweaks
+            "inventory_drag_controls = {}\n",
+            self.inventory_drag_controls
         ));
         shader_lines.push_str(&format!(
             "builtin_inventory_sort = {}\n",
             self.builtin_inventory_sort
         ));
         shader_lines.push_str(&format!("zsh_command_bar = {}\n", self.zsh_command_bar));
-        shader_lines.push_str(&format!("mini_hud_enabled = {}\n", self.mini_hud_enabled));
-        shader_lines.push_str(&format!("mini_hud_segments = {}\n", self.mini_hud_segments));
+        shader_lines.push_str(&format!(
+            "compact_debug_hud_enabled = {}\n",
+            self.compact_debug_hud_enabled
+        ));
+        shader_lines.push_str(&format!(
+            "compact_debug_hud_segments = {}\n",
+            self.compact_debug_hud_segments
+        ));
         // The report endpoint is omitted entirely when unset so a default
         // file configures no egress; only values that still pass the
         // transport URL allowlist are ever written back out.
@@ -996,13 +1002,17 @@ impl ClientSettings {
                 "builtin_looking_at_hud" => {
                     self.builtin_looking_at_hud = parsed.builtin_looking_at_hud
                 }
-                "builtin_mouse_tweaks" => self.builtin_mouse_tweaks = parsed.builtin_mouse_tweaks,
+                "inventory_drag_controls" => {
+                    self.inventory_drag_controls = parsed.inventory_drag_controls
+                }
                 "builtin_inventory_sort" => {
                     self.builtin_inventory_sort = parsed.builtin_inventory_sort
                 }
                 "zsh_command_bar" => self.zsh_command_bar = parsed.zsh_command_bar,
-                "mini_hud_enabled" => self.mini_hud_enabled = parsed.mini_hud_enabled,
-                "mini_hud_segments" => self.mini_hud_segments = parsed.mini_hud_segments,
+                "compact_debug_hud_enabled" => self.compact_debug_hud_enabled = parsed.compact_debug_hud_enabled,
+                "compact_debug_hud_segments" => {
+                    self.compact_debug_hud_segments = parsed.compact_debug_hud_segments
+                }
                 "shader_profile" => self.shader_profile = parsed.shader_profile.clone(),
                 "minimap_fair_play" | "minimap_mode" => {
                     // The mirrored pair is already consistent in `parsed`.
@@ -1401,10 +1411,10 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
-                "builtin_mouse_tweaks" => match parse_bool(value) {
+                "inventory_drag_controls" | "builtin_mouse_tweaks" => match parse_bool(value) {
                     Some(v) => {
-                        settings.builtin_mouse_tweaks = v;
-                        seen.push("builtin_mouse_tweaks");
+                        settings.inventory_drag_controls = v;
+                        seen.push("inventory_drag_controls");
                     }
                     None => invalid(&mut warnings),
                 },
@@ -1422,18 +1432,18 @@ impl ClientSettings {
                     }
                     None => invalid(&mut warnings),
                 },
-                "mini_hud_enabled" => match parse_bool(value) {
+                "compact_debug_hud_enabled" | "mini_hud_enabled" => match parse_bool(value) {
                     Some(v) => {
-                        settings.mini_hud_enabled = v;
-                        seen.push("mini_hud_enabled");
+                        settings.compact_debug_hud_enabled = v;
+                        seen.push("compact_debug_hud_enabled");
                     }
                     None => invalid(&mut warnings),
                 },
-                "mini_hud_segments" => match value.parse::<i64>() {
+                "compact_debug_hud_segments" | "mini_hud_segments" => match value.parse::<i64>() {
                     Ok(v) => {
-                        settings.mini_hud_segments =
+                        settings.compact_debug_hud_segments =
                             clamp_i64(v, 0, 511, key, &mut warnings) as u16;
-                        seen.push("mini_hud_segments");
+                        seen.push("compact_debug_hud_segments");
                     }
                     Err(_) => invalid(&mut warnings),
                 },
@@ -2088,11 +2098,11 @@ mod tests {
             shader_pack: Some("shaderpacks/Complementary.zip".to_owned()),
             shaders_enabled: true,
             builtin_looking_at_hud: false,
-            builtin_mouse_tweaks: false,
+            inventory_drag_controls: false,
             builtin_inventory_sort: false,
             zsh_command_bar: false,
-            mini_hud_enabled: true,
-            mini_hud_segments: 0b101_001_011,
+            compact_debug_hud_enabled: true,
+            compact_debug_hud_segments: 0b101_001_011,
             shader_profile: Some("HIGH".to_owned()),
             map_fair_play: HostMapFairPlaySettings {
                 minimap_fair_play: true,
@@ -2143,6 +2153,40 @@ mod tests {
         let (back, warnings) = ClientSettings::from_toml(&s.to_toml());
         assert_eq!(back.max_fps, None);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn neutral_qol_keys_write_and_legacy_keys_migrate() {
+        let settings = ClientSettings {
+            inventory_drag_controls: false,
+            compact_debug_hud_enabled: true,
+            compact_debug_hud_segments: 0b101_001_011,
+            ..ClientSettings::default()
+        };
+        let text = settings.to_toml();
+        assert!(text.contains("inventory_drag_controls = false"));
+        assert!(text.contains("compact_debug_hud_enabled = true"));
+        assert!(text.contains("compact_debug_hud_segments = 331"));
+        assert!(!text.contains("builtin_mouse_tweaks"));
+        assert!(!text.contains("mini_hud_enabled"));
+        assert!(!text.contains("mini_hud_segments"));
+        let (back, warnings) = ClientSettings::from_toml(&text);
+        assert_eq!(back, settings);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        let legacy = "builtin_mouse_tweaks = false\nmini_hud_enabled = true\nmini_hud_segments = 331\n";
+        let (migrated, warnings) = ClientSettings::from_toml(legacy);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!migrated.inventory_drag_controls);
+        assert!(migrated.compact_debug_hud_enabled);
+        assert_eq!(migrated.compact_debug_hud_segments, 0b101_001_011);
+
+        let mut overlaid = ClientSettings::default();
+        let warnings = overlaid.apply_toml(legacy);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!overlaid.inventory_drag_controls);
+        assert!(overlaid.compact_debug_hud_enabled);
+        assert_eq!(overlaid.compact_debug_hud_segments, 0b101_001_011);
     }
 
     #[test]

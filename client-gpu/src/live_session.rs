@@ -81,7 +81,7 @@ use megu_proto::seamless_portal::SEAMLESS_PORTAL_CHANNEL;
 use megu_ui::create_goggles_hud::GogglesTargetTelemetry;
 use megu_ui::death_screen::DeathScreenState;
 use megu_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
-use megu_ui::state::{HudState, MiniHudPreset, UiState};
+use megu_ui::state::{CompactDebugHudData, CompactDebugHudPreset, HudState, UiState};
 use megu_ui::subtitle_hud::{SubtitleArrow, DEFAULT_TTL_SECS};
 
 // Re-exported so embedders and tests keep the historical
@@ -230,10 +230,10 @@ const PREFETCH_BOOST_BLOCKS_PER_RANK: f32 = 4.0;
 const KERNEL_PROBE_INTERVAL_POLLS: u64 = 61;
 
 /// Minimum accumulated frame time between `sample_host_metrics` calls while
-/// the mini-HUD is enabled. The `/proc` + DRM sysfs reads are throttled to
+/// the compact debug HUD is enabled. The `/proc` + DRM sysfs reads are throttled to
 /// 2 Hz; frame-time statistics still update every frame and the latest
 /// [`sys_metrics::HostMetricsSnapshot`] is reused between samples.
-pub const MINIHUD_SYS_SAMPLE_INTERVAL_MS: u64 = 500;
+pub const COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS: u64 = 500;
 
 /// The [`UnifiedOptimizationPlan`] domain projections `client-gpu`
 /// applies on startup and every settings/strategy push:
@@ -479,7 +479,7 @@ pub(crate) enum WorkerCommand {
     SeenAdvancements {
         tab: Option<String>,
     },
-    /// `place_recipe` — the recipe-book/JEI `+` fill request: window id,
+    /// `place_recipe` — the recipe-book/recipe browser `+` fill request: window id,
     /// recipe id, and the shift-click fill-all flag.
     PlaceRecipe {
         window_id: u8,
@@ -709,7 +709,7 @@ pub enum CrosshairPick {
 }
 
 /// Owned snapshot of the server-driven HUD channels handed to the window's
-/// UI sync each frame (`record_frame_and_refresh_minihud` refreshes the
+/// UI sync each frame (`record_frame_and_refresh_compact_debug_hud` refreshes the
 /// `looking_at_*` picks first).
 #[derive(Clone, Debug)]
 pub struct LiveHudFeed {
@@ -2333,17 +2333,17 @@ pub struct LiveSession {
     pub metrics_probe: CpuSampler,
     pub frame_timings: FrameTimingStats,
     /// Latest cached `/proc` + DRM host snapshot; refreshed at most every
-    /// [`MINIHUD_SYS_SAMPLE_INTERVAL_MS`] of accumulated frame time while
-    /// the mini-HUD is enabled.
-    mini_hud_host: Option<sys_metrics::HostMetricsSnapshot>,
+    /// [`COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS`] of accumulated frame time while
+    /// the compact debug HUD is enabled.
+    compact_debug_hud_host: Option<sys_metrics::HostMetricsSnapshot>,
     /// Frame milliseconds accumulated since the last host-metric sample.
-    mini_hud_sys_accum_ms: f32,
+    compact_debug_hud_sys_accum_ms: f32,
     /// Lifetime count of `sample_host_metrics` calls — the throttled
-    /// `/proc`/DRM reads the mini-HUD would otherwise do every frame.
+    /// `/proc`/DRM reads the compact debug HUD would otherwise do every frame.
     pub sys_sample_count: u64,
     /// Adaptive packed-nibble kernel autotuner seeded from
     /// `compute_strategy` and fed real frame times by
-    /// `record_frame_and_refresh_minihud` and real mesh-batch durations
+    /// `record_frame_and_refresh_compact_debug_hud` and real mesh-batch durations
     /// by [`Self::poll`].
     kernel_autotuner: KernelAutotuner,
     /// Counted `kernel_autotuner.observe_sample` feeds — proves the
@@ -3251,7 +3251,7 @@ impl LiveSession {
         let hw_caps = detect_host_hardware_caps();
         let compute_strategy = select_compute_strategy(&hw_caps);
         // Seed the autotuner with the strategy's static kernel preference;
-        // `record_frame_and_refresh_minihud` feeds it real frame times.
+        // `record_frame_and_refresh_compact_debug_hud` feeds it real frame times.
         let kernel_autotuner =
             KernelAutotuner::new(if compute_strategy.prefer_lut_over_recompute() {
                 ComputeKernelMode::LutBatch
@@ -3428,8 +3428,8 @@ impl LiveSession {
             prefetcher: SpeculativeChunkPrefetcher::new(),
             metrics_probe: CpuSampler::new(),
             frame_timings: FrameTimingStats::new(),
-            mini_hud_host: None,
-            mini_hud_sys_accum_ms: 0.0,
+            compact_debug_hud_host: None,
+            compact_debug_hud_sys_accum_ms: 0.0,
             sys_sample_count: 0,
             kernel_autotuner,
             autotuner_sample_count: 0,
@@ -4908,7 +4908,7 @@ impl LiveSession {
             let tactile_active =
                 self.tactile_sim.config().preset.is_active() || !self.tactile_sim.is_empty();
             for _ in 0..elapsed_ticks {
-                // Time each client sim-tick step so the MiniHUD's MSPT/TPS
+                // Time each client sim-tick step so the Compact Debug HUD's MSPT/TPS
                 // segments get a live reading — `FrameTimingStats::push_tick`
                 // is the only producer of the tick ring it samples.
                 let tick_start = Instant::now();
@@ -6399,7 +6399,7 @@ impl LiveSession {
             .then_some(next)
     }
 
-    /// `place_recipe` — the JEI `+` / recipe-book grid-fill request for
+    /// `place_recipe` — the recipe browser `+` / recipe-book grid-fill request for
     /// `recipe` in window `window_id` (`0` is the window-0 player
     /// inventory's 2×2 grid). `make_all` is vanilla's shift-click flag
     /// (fill as many times as ingredients allow).
@@ -6823,7 +6823,7 @@ impl LiveSession {
     /// at all — feeding it only `selected_mode()` kept every challenger
     /// statistic at zero samples forever. The dispatched mode is
     /// recorded in `executed_kernel_mode` so the frame-time feed in
-    /// `record_frame_and_refresh_minihud` credits the same arm the poll
+    /// `record_frame_and_refresh_compact_debug_hud` credits the same arm the poll
     /// ran.
     fn dispatch_kernel_mode(&mut self) -> ComputeKernelMode {
         self.kernel_probe_polls = self.kernel_probe_polls.wrapping_add(1);
@@ -7812,7 +7812,7 @@ impl LiveSession {
     }
 
     /// Record frame timing and advance visual transitions before HUD rendering.
-    pub fn record_frame_and_refresh_minihud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
+    pub fn record_frame_and_refresh_compact_debug_hud(&mut self, frame_dt_sec: f32, ui: &mut UiState) {
         self.sync_kinetic_live_parts(frame_dt_sec);
         let frame_us = f64::from(frame_dt_sec) * 1_000_000.0;
         let frame_ms = frame_us / 1_000.0;
@@ -7841,7 +7841,7 @@ impl LiveSession {
             self.budget_scale = self.pid_budget.update(p95_ms);
         }
         if frame_dt_sec.is_finite() && frame_dt_sec > 0.0 {
-            self.mini_hud_sys_accum_ms += frame_dt_sec * 1_000.0;
+            self.compact_debug_hud_sys_accum_ms += frame_dt_sec * 1_000.0;
         }
         self.chunk_fades.tick(frame_dt_sec);
         self.atmosphere_blender.advance(frame_dt_sec);
@@ -7850,26 +7850,26 @@ impl LiveSession {
         self.ensure_asset_bundle();
         self.refresh_voxel_clouds();
 
-        if ui.settings.qol.mini_hud_preset() == MiniHudPreset::Off {
+        if ui.settings.qol.compact_debug_hud_preset() == CompactDebugHudPreset::Off {
             return;
         }
 
         // `/proc` + DRM sysfs reads are throttled to
-        // `MINIHUD_SYS_SAMPLE_INTERVAL_MS` of accumulated frame time; the
+        // `COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS` of accumulated frame time; the
         // cached snapshot feeds every frame's telemetry below.
-        if self.mini_hud_host.is_none()
-            || self.mini_hud_sys_accum_ms >= MINIHUD_SYS_SAMPLE_INTERVAL_MS as f32
+        if self.compact_debug_hud_host.is_none()
+            || self.compact_debug_hud_sys_accum_ms >= COMPACT_DEBUG_HUD_SYS_SAMPLE_INTERVAL_MS as f32
         {
-            self.mini_hud_host = Some(sample_host_metrics(&mut self.metrics_probe));
+            self.compact_debug_hud_host = Some(sample_host_metrics(&mut self.metrics_probe));
             self.sys_sample_count += 1;
-            self.mini_hud_sys_accum_ms = 0.0;
+            self.compact_debug_hud_sys_accum_ms = 0.0;
         }
         let host = self
-            .mini_hud_host
+            .compact_debug_hud_host
             .as_ref()
             .expect("host metrics sampled above");
-        let telemetry = sys_metrics::MiniHudData::from_telemetry(host, &self.frame_timings);
-        let hud = &mut ui.hud.mini_hud_data;
+        let telemetry = CompactDebugHudData::from_telemetry(host, &self.frame_timings);
+        let hud = &mut ui.hud.compact_debug_hud_data;
         hud.fps = telemetry.fps;
         hud.fps_one_percent_low = telemetry.fps_one_percent_low;
         hud.mspt = telemetry.mspt;
@@ -11117,9 +11117,9 @@ mod tests {
         assert!(live.chunk_fades.is_fading(0, 0));
 
         let mut ui = UiState::new();
-        live.record_frame_and_refresh_minihud(0.125, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(0.125, &mut ui);
         assert!((live.chunk_fades.fade_alpha(0, 0) - 0.5).abs() < 0.001);
-        live.record_frame_and_refresh_minihud(0.125, &mut ui);
+        live.record_frame_and_refresh_compact_debug_hud(0.125, &mut ui);
         assert!(!live.chunk_fades.is_fading(0, 0));
 
         live.apply_event(ClientPlayEvent::Play(PlayEvent::UnloadChunk {
@@ -11131,28 +11131,28 @@ mod tests {
     }
 
     #[test]
-    fn basic_and_advanced_minihud_receive_frame_and_host_telemetry() {
+    fn basic_and_advanced_compact_debug_hud_receive_frame_and_host_telemetry() {
         let (mut live, _) = session();
         let mut ui = UiState::new();
-        ui.settings.qol.mini_hud.enabled = false;
-        live.record_frame_and_refresh_minihud(0.02, &mut ui);
+        ui.settings.qol.compact_debug_hud.enabled = false;
+        live.record_frame_and_refresh_compact_debug_hud(0.02, &mut ui);
         assert_eq!(live.frame_timings.frame_count(), 1);
-        assert_eq!(ui.hud.mini_hud_data.fps, None);
+        assert_eq!(ui.hud.compact_debug_hud_data.fps, None);
 
-        ui.settings.qol.cycle_mini_hud();
-        assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Basic);
-        live.record_frame_and_refresh_minihud(0.02, &mut ui);
-        assert!((ui.hud.mini_hud_data.fps.unwrap() - 50.0).abs() < 0.01);
-        assert!((ui.hud.mini_hud_data.fps_one_percent_low.unwrap() - 50.0).abs() < 0.01);
-        assert_eq!(ui.hud.mini_hud_data.loaded_chunks, Some(0));
+        ui.settings.qol.cycle_compact_debug_hud();
+        assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Basic);
+        live.record_frame_and_refresh_compact_debug_hud(0.02, &mut ui);
+        assert!((ui.hud.compact_debug_hud_data.fps.unwrap() - 50.0).abs() < 0.01);
+        assert!((ui.hud.compact_debug_hud_data.fps_one_percent_low.unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(ui.hud.compact_debug_hud_data.loaded_chunks, Some(0));
 
-        ui.settings.qol.cycle_mini_hud();
-        assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
-        live.record_frame_and_refresh_minihud(0.04, &mut ui);
+        ui.settings.qol.cycle_compact_debug_hud();
+        assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Advanced);
+        live.record_frame_and_refresh_compact_debug_hud(0.04, &mut ui);
         assert_eq!(live.frame_timings.frame_count(), 3);
         assert!((live.frame_timings.frame_ms_avg() - 26.666_666).abs() < 0.001);
-        assert!((ui.hud.mini_hud_data.fps.unwrap() - 37.5).abs() < 0.01);
-        assert!((ui.hud.mini_hud_data.fps_one_percent_low.unwrap() - 25.0).abs() < 0.01);
+        assert!((ui.hud.compact_debug_hud_data.fps.unwrap() - 37.5).abs() < 0.01);
+        assert!((ui.hud.compact_debug_hud_data.fps_one_percent_low.unwrap() - 25.0).abs() < 0.01);
     }
 
     fn varint(out: &mut Vec<u8>, mut value: u32) {
@@ -13419,7 +13419,7 @@ mod tests {
         for _ in 0..4 {
             live.poll([8.0, 20.0, 24.0], &[]);
             caps.push((live.ducb_selected_arm(), live.offthread_submit_cap()));
-            live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+            live.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
         }
         assert_eq!(
             caps,
@@ -13577,13 +13577,13 @@ mod tests {
             "a live mspt gives a positive TPS estimate"
         );
 
-        // The samples must flow into the MiniHUD copy path as well.
+        // The samples must flow into the Compact Debug HUD copy path as well.
         let mut ui = megu_ui::state::UiState::new();
-        ui.settings.qol.mini_hud.enabled = true;
-        live.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+        ui.settings.qol.compact_debug_hud.enabled = true;
+        live.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
         assert!(
-            ui.hud.mini_hud_data.mspt.is_some() && ui.hud.mini_hud_data.tps.is_some(),
-            "live tick samples must reach MiniHUD mspt/tps"
+            ui.hud.compact_debug_hud_data.mspt.is_some() && ui.hud.compact_debug_hud_data.tps.is_some(),
+            "live tick samples must reach Compact Debug HUD mspt/tps"
         );
     }
 

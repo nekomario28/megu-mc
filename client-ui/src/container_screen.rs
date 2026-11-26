@@ -1612,7 +1612,43 @@ impl ContainerScreenState {
             palette::BACKGROUND_BOTTOM,
         );
         if let Some(uv) = panel_uv {
-            out.texture_uv(panel, uv);
+            // Vanilla's chests are not the six-row texture scaled vertically.
+            // `generic_54.png` is a 176×222 sheet at 1×: blit the chest top
+            // crop (`17 + rows * 18` px from the top), then blit the shared
+            // 96 px player-inventory footer from source y=126. Menu ids
+            // 0..=5 encode rows 1..=6. Integral high-DPI sheets use the same
+            // logical crop scaled in source pixels.
+            let texture_scale = if uv.width >= 176
+                && uv.height >= 222
+                && uv.width % 176 == 0
+                && uv.height % 222 == 0
+                && uv.width / 176 == uv.height / 222
+            {
+                uv.width / 176
+            } else {
+                0
+            };
+            if self.schema.menu_id <= 5 && texture_scale > 0 {
+                let rows = self.schema.menu_id + 1;
+                let top_h = 17 + rows * 18;
+                let footer_h = 96;
+                let source_scale = texture_scale;
+                out.texture_uv(
+                    UiRect::new(panel.x, panel.y, panel.w, top_h),
+                    uv.subrect(0, 0, 176 * source_scale, top_h * source_scale),
+                );
+                out.texture_uv(
+                    UiRect::new(panel.x, panel.y + top_h as i32, panel.w, footer_h),
+                    uv.subrect(
+                        0,
+                        126 * source_scale,
+                        176 * source_scale,
+                        footer_h * source_scale,
+                    ),
+                );
+            } else {
+                out.texture_uv(panel, uv);
+            }
         } else {
             out.fill_rect(panel, palette::PANEL);
             out.border_rect(panel, palette::PANEL_BORDER, 1);
@@ -2951,7 +2987,7 @@ impl ContainerScreenState {
     }
 }
 
-/// QoL inventory-sort state (Inventory-Sort / MouseTweaks semantics).
+/// QoL inventory-sort state (Inventory-Sort / inventory drag controls semantics).
 ///
 /// Tracks the sort-key toggle/hover state and performs deterministic
 /// vanilla-mod-style sorting over a [`ContainerScreenState`]: partial

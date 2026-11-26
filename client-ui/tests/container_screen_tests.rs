@@ -351,3 +351,114 @@ fn button_click_emits_deterministic_container_button_click() {
     );
     assert!(lectern.button_click(4).is_none());
 }
+
+fn decode_gui_uv(item_id: &str) -> Option<([f32; 2], [f32; 2])> {
+    let mut parts = item_id.strip_prefix("@gui_uv:")?.split(':');
+    let mut next = || {
+        Some(f32::from_bits(
+            u32::from_str_radix(parts.next()?, 16).ok()?,
+        ))
+    };
+    let u0 = next()?;
+    let v0 = next()?;
+    let u1 = next()?;
+    let v1 = next()?;
+    Some(([u0, v0], [u1, v1]))
+}
+
+#[test]
+fn generic_chests_use_vanilla_two_blit_uv_crops() {
+    use megu_client_ui::draw::{GuiSpriteAtlas, GuiSpriteEntry};
+
+    let packed = GuiSpriteEntry {
+        uv_min: [0.25, 0.5],
+        uv_max: [0.75, 1.0],
+        width: 176,
+        height: 222,
+        nine_slice_border: [0, 0, 0, 0],
+    };
+    let assert_rows = |menu_id: u32, rows: u32| {
+        let atlas = GuiSpriteAtlas::from_packed_with_container_panels(
+            2,
+            1,
+            vec![0; 8],
+            Vec::new(),
+            vec![(menu_id, packed)],
+        );
+        let screen = state(menu_id);
+        let mut draw = UiDrawList::new();
+        screen.render_with_atlas(800.0, 600.0, None, &atlas, &mut draw);
+        let icons: Vec<_> = draw
+            .commands
+            .iter()
+            .filter_map(|cmd| match cmd {
+                UiCommand::ItemIcon { rect, item_id } if item_id.starts_with("@gui_uv:") => {
+                    Some((*rect, decode_gui_uv(item_id).expect("encoded gui uv")))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(icons.len(), 2, "menu {menu_id} must use two texture blits");
+        let top_h = 17 + rows * 18;
+        assert_eq!(icons[0].0.h, top_h);
+        assert_eq!(icons[1].0.h, 96);
+        assert_eq!(icons[1].0.y, icons[0].0.y + top_h as i32);
+
+        let du = packed.uv_max[0] - packed.uv_min[0];
+        let dv = packed.uv_max[1] - packed.uv_min[1];
+        let expect_v = |src_y: u32| packed.uv_min[1] + dv * (src_y as f32 / 222.0);
+        let eps = 1e-6;
+        assert!((icons[0].1.0[0] - packed.uv_min[0]).abs() < eps);
+        assert!((icons[0].1.0[1] - packed.uv_min[1]).abs() < eps);
+        assert!((icons[0].1.1[0] - (packed.uv_min[0] + du)).abs() < eps);
+        assert!((icons[0].1.1[1] - expect_v(top_h)).abs() < eps);
+        assert!((icons[1].1.0[1] - expect_v(126)).abs() < eps);
+        assert!((icons[1].1.1[1] - expect_v(222)).abs() < eps);
+    };
+    assert_rows(0, 1);
+    assert_rows(2, 3);
+    assert_rows(5, 6);
+}
+
+#[test]
+fn generic_chest_two_blit_scales_source_crops_for_high_dpi_sheet() {
+    use megu_client_ui::draw::{GuiSpriteAtlas, GuiSpriteEntry};
+
+    let packed = GuiSpriteEntry {
+        uv_min: [0.25, 0.5],
+        uv_max: [0.75, 1.0],
+        width: 352,
+        height: 444,
+        nine_slice_border: [0, 0, 0, 0],
+    };
+    let atlas = GuiSpriteAtlas::from_packed_with_container_panels(
+        2,
+        1,
+        vec![0; 8],
+        Vec::new(),
+        vec![(0, packed)],
+    );
+    let screen = state(0);
+    let mut draw = UiDrawList::new();
+    screen.render_with_atlas(800.0, 600.0, None, &atlas, &mut draw);
+    let icons: Vec<_> = draw
+        .commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            UiCommand::ItemIcon { rect, item_id } if item_id.starts_with("@gui_uv:") => {
+                Some((*rect, decode_gui_uv(item_id).expect("encoded gui uv")))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(icons.len(), 2);
+    assert_eq!(icons[0].0.h, 35, "destination crop stays logical 1× height");
+    assert_eq!(icons[1].0.h, 96);
+
+    let dv = packed.uv_max[1] - packed.uv_min[1];
+    let expect_v = |src_y: u32| packed.uv_min[1] + dv * (src_y as f32 / 444.0);
+    let eps = 1e-6;
+    assert!((icons[0].1.1[1] - expect_v(70)).abs() < eps);
+    assert!((icons[1].1.0[1] - expect_v(252)).abs() < eps);
+    assert!((icons[1].1.1[1] - expect_v(444)).abs() < eps);
+}

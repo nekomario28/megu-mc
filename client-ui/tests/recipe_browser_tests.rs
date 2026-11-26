@@ -4,7 +4,7 @@
 //! the bookmarks panel, EMI recipe-tree recursion with cycle safety and
 //! raw-material math (including Create sequenced-assembly loops), JER
 //! mob/ore/trade/loot/enchant tabs, datapack JSON ingestion, the Create
-//! 3D Ponder renderer, keyboard/gamepad routing, and a layout that must
+//! 3D MachineTutorial renderer, keyboard/gamepad routing, and a layout that must
 //! never overlap hit regions or rasterize blank at `640×360` through
 //! `3840×2160` in English and Japanese.
 
@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 use megu_client_ui::draw::{rasterize_draw_list, UiCommand, UiRect};
 use megu_client_ui::recipe_browser::{
     AnimatedPart, BrowserTab, DetailMode, DungeonLootEntry, EnchantmentCompat, FuelEntry,
-    HeatRequirement, ItemEntry, JerTab, MobDropEntry, OreDistribution, PonderAnim, PonderAxis,
-    PonderScene, PonderStep, Recipe, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
+    HeatRequirement, ItemEntry, WorldDropsTab, MobDropEntry, OreDistribution, MachineTutorialAnimation, MachineTutorialAxis,
+    MachineTutorialScene, MachineTutorialStep, Recipe, RecipeBrowserAction, RecipeBrowserState, RecipeCategory,
     RecipeHitRegion, RecipeIndex, RecipeIngredient, RecipeWidgetId, VillagerTradeEntry,
 };
 use megu_client_ui::state::{GamepadButton, UiInputEvent, UiKey, UiLang};
@@ -710,19 +710,19 @@ fn ore_distribution_histogram_is_deterministic_and_peaks() {
 }
 
 #[test]
-fn jer_tabs_render_all_sub_lists() {
+fn world_drops_tabs_render_all_sub_lists() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
-    s.tab = BrowserTab::Jer;
+    s.tab = BrowserTab::WorldDropsInfo;
     for tab in [
-        JerTab::MobDrops,
-        JerTab::OreGen,
-        JerTab::Trades,
-        JerTab::Loot,
-        JerTab::Enchants,
-        JerTab::Fuels,
+        WorldDropsTab::MobDrops,
+        WorldDropsTab::OreGen,
+        WorldDropsTab::Trades,
+        WorldDropsTab::Loot,
+        WorldDropsTab::Enchants,
+        WorldDropsTab::Fuels,
     ] {
-        s.jer_tab = tab;
+        s.world_drops_tab = tab;
         let (list, hits) = s.render(w, h);
         let rgba = rasterize_draw_list(w, h, &list);
         assert_non_blank(&rgba);
@@ -735,12 +735,12 @@ fn jer_tabs_render_all_sub_lists() {
             })
             .collect();
         match tab {
-            JerTab::MobDrops => assert!(texts.iter().any(|t| t.contains("zombie"))),
-            JerTab::OreGen => assert!(texts.iter().any(|t| t.contains("peak"))),
-            JerTab::Trades => assert!(texts.iter().any(|t| t.contains("librarian"))),
-            JerTab::Loot => assert!(texts.iter().any(|t| t.contains("simple_dungeon"))),
-            JerTab::Enchants => assert!(texts.iter().any(|t| t.contains("sharpness"))),
-            JerTab::Fuels => {
+            WorldDropsTab::MobDrops => assert!(texts.iter().any(|t| t.contains("zombie"))),
+            WorldDropsTab::OreGen => assert!(texts.iter().any(|t| t.contains("peak"))),
+            WorldDropsTab::Trades => assert!(texts.iter().any(|t| t.contains("librarian"))),
+            WorldDropsTab::Loot => assert!(texts.iter().any(|t| t.contains("simple_dungeon"))),
+            WorldDropsTab::Enchants => assert!(texts.iter().any(|t| t.contains("sharpness"))),
+            WorldDropsTab::Fuels => {
                 // Burn-time column — a fuel row must print its ticks.
                 assert!(
                     texts
@@ -753,7 +753,7 @@ fn jer_tabs_render_all_sub_lists() {
         assert_no_overlaps(&hits);
     }
     // Ore histogram draws many vertical bars (FillRects) inside the chart.
-    s.jer_tab = JerTab::OreGen;
+    s.world_drops_tab = WorldDropsTab::OreGen;
     let (list, _) = s.render(w, h);
     let fills = list
         .commands
@@ -764,12 +764,12 @@ fn jer_tabs_render_all_sub_lists() {
 }
 
 // ---------------------------------------------------------------------------
-// Ponder 3D viewer
+// MachineTutorial 3D viewer
 // ---------------------------------------------------------------------------
 
-fn fixture_ponder() -> PonderScene {
+fn fixture_machine_tutorial() -> MachineTutorialScene {
     use megu_client_ui::draw::UiColor;
-    let mut scene = PonderScene::new("Crushing Wheels");
+    let mut scene = MachineTutorialScene::new("Crushing Wheels");
     // 3x3 stone floor.
     for x in 0..3 {
         for z in 0..3 {
@@ -779,20 +779,20 @@ fn fixture_ponder() -> PonderScene {
     // Machine blocks.
     scene.add_block(1, 1, 1, UiColor::rgb(180, 140, 60));
     scene.add_block(1, 2, 1, UiColor::rgb(200, 60, 60));
-    let mut step0 = PonderStep::new("The crushing wheel spins", "粉砕ホイールが回転", 20);
+    let mut step0 = MachineTutorialStep::new("The crushing wheel spins", "粉砕ホイールが回転", 20);
     step0.animated_parts.push(AnimatedPart {
         pos: (1, 2, 1),
-        anim: PonderAnim::Spin {
-            axis: PonderAxis::Y,
+        anim: MachineTutorialAnimation::Spin {
+            axis: MachineTutorialAxis::Y,
             rpm: 64.0,
         },
     });
     step0.highlight = Some((1, 1, 1));
-    let mut step1 = PonderStep::new("A deployer places items", "デプロイヤーが設置", 20);
+    let mut step1 = MachineTutorialStep::new("A deployer places items", "デプロイヤーが設置", 20);
     step1.animated_parts.push(AnimatedPart {
         pos: (0, 2, 1),
-        anim: PonderAnim::Oscillate {
-            axis: PonderAxis::Y,
+        anim: MachineTutorialAnimation::Oscillate {
+            axis: MachineTutorialAxis::Y,
             amplitude: 0.4,
             period_ticks: 10,
         },
@@ -802,11 +802,11 @@ fn fixture_ponder() -> PonderScene {
 }
 
 #[test]
-fn ponder_scene_renders_depth_sorted_faces_and_highlights() {
+fn machine_tutorial_scene_renders_depth_sorted_faces_and_highlights() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
-    s.ponder = Some(fixture_ponder());
-    s.tab = BrowserTab::Ponder;
+    s.machine_tutorial = Some(fixture_machine_tutorial());
+    s.tab = BrowserTab::MachineTutorials;
     let (list, hits) = s.render(w, h);
     let fills = list
         .commands
@@ -830,16 +830,16 @@ fn ponder_scene_renders_depth_sorted_faces_and_highlights() {
 
     // Rotating the camera changes the rasterized frame (faces move).
     let (before, _) = s.render(w, h);
-    s.ponder.as_mut().unwrap().rotate(90.0);
+    s.machine_tutorial.as_mut().unwrap().rotate(90.0);
     let (after, _) = s.render(w, h);
     assert_ne!(before, after, "rotation must change the projection");
 }
 
 #[test]
-fn ponder_steps_play_pause_and_wrap() {
+fn machine_tutorial_steps_play_pause_and_wrap() {
     let mut s = fixture();
-    s.ponder = Some(fixture_ponder());
-    let p = s.ponder.as_mut().unwrap();
+    s.machine_tutorial = Some(fixture_machine_tutorial());
+    let p = s.machine_tutorial.as_mut().unwrap();
     assert_eq!(p.step_index, 0);
     // Paused: tick frozen.
     p.playing = false;
@@ -865,25 +865,25 @@ fn ponder_steps_play_pause_and_wrap() {
 }
 
 #[test]
-fn ponder_controls_via_widgets_and_keys() {
+fn machine_tutorial_controls_via_widgets_and_keys() {
     let (w, h) = (1280, 720);
     let mut s = fixture();
-    s.ponder = Some(fixture_ponder());
-    s.tab = BrowserTab::Ponder;
+    s.machine_tutorial = Some(fixture_machine_tutorial());
+    s.tab = BrowserTab::MachineTutorials;
     // Widgets: rotate right, next step, pause.
-    click(&mut s, w, h, RecipeWidgetId::PonderRotateRight);
-    assert!((s.ponder.as_ref().unwrap().yaw_deg - 60.0).abs() < 0.01);
-    click(&mut s, w, h, RecipeWidgetId::PonderNext);
-    assert_eq!(s.ponder.as_ref().unwrap().step_index, 1);
-    click(&mut s, w, h, RecipeWidgetId::PonderPlay);
-    assert!(!s.ponder.as_ref().unwrap().playing);
-    click(&mut s, w, h, RecipeWidgetId::PonderPrev);
-    assert_eq!(s.ponder.as_ref().unwrap().step_index, 0);
+    click(&mut s, w, h, RecipeWidgetId::MachineTutorialRotateRight);
+    assert!((s.machine_tutorial.as_ref().unwrap().yaw_deg - 60.0).abs() < 0.01);
+    click(&mut s, w, h, RecipeWidgetId::MachineTutorialNext);
+    assert_eq!(s.machine_tutorial.as_ref().unwrap().step_index, 1);
+    click(&mut s, w, h, RecipeWidgetId::MachineTutorialPlay);
+    assert!(!s.machine_tutorial.as_ref().unwrap().playing);
+    click(&mut s, w, h, RecipeWidgetId::MachineTutorialPrev);
+    assert_eq!(s.machine_tutorial.as_ref().unwrap().step_index, 0);
     // Keyboard: left/right rotate, up/down step, space toggles play.
     key(&mut s, w, h, UiKey::Left);
-    assert!((s.ponder.as_ref().unwrap().yaw_deg - 45.0).abs() < 0.01);
+    assert!((s.machine_tutorial.as_ref().unwrap().yaw_deg - 45.0).abs() < 0.01);
     key(&mut s, w, h, UiKey::Space);
-    assert!(s.ponder.as_ref().unwrap().playing);
+    assert!(s.machine_tutorial.as_ref().unwrap().playing);
 }
 
 // ---------------------------------------------------------------------------
@@ -975,7 +975,7 @@ fn layout_has_zero_overlaps_and_non_blank_frames() {
         for lang in [UiLang::En, UiLang::Ja] {
             let mut s = fixture();
             s.lang = lang;
-            s.ponder = Some(fixture_ponder());
+            s.machine_tutorial = Some(fixture_machine_tutorial());
             for tab in BrowserTab::ALL {
                 s.tab = tab;
                 let (list, hits) = s.render(w, h);
@@ -1271,8 +1271,8 @@ fn side_overlay_never_overlaps_container_panel() {
 #[test]
 fn jer_fuels_tab_lists_burn_ticks_and_smelted_counts() {
     let mut s = fixture();
-    s.tab = BrowserTab::Jer;
-    s.jer_tab = JerTab::Fuels;
+    s.tab = BrowserTab::WorldDropsInfo;
+    s.world_drops_tab = WorldDropsTab::Fuels;
     let (list, hits) = s.render(1280, 720);
     let texts: Vec<&str> = list
         .commands
@@ -1288,7 +1288,7 @@ fn jer_fuels_tab_lists_burn_ticks_and_smelted_counts() {
         "fuel row missing burn/smelted readout: {texts:?}"
     );
     // The Fuels sub-tab button is a live hit region.
-    assert!(hits.iter().any(|h| h.id == RecipeWidgetId::JerTabFuels));
+    assert!(hits.iter().any(|h| h.id == RecipeWidgetId::WorldDropsTabFuels));
 }
 
 // ---------------------------------------------------------------------------

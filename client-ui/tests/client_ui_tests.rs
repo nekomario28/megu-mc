@@ -10,18 +10,18 @@ use megu_client_ui::draw::{
     font_atlas_rgba, glyph_for, rasterize_draw_list, tessellate_draw_list, text_height, text_width,
 };
 use megu_client_ui::magic_hud::{CastBarState, CooldownSlotState, MagicHudState, StatusBadgeState};
-use megu_client_ui::mod_menu::{ModMenuEntry, ModMenuState, ModMenuWidgetId};
+use megu_client_ui::mod_manager::{ModManagerEntry, ModManagerState, ModManagerWidgetId};
 use megu_client_ui::recipe_browser::{
-    BrowserTab, ItemEntry, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeWidgetId,
+    BrowserTab, ItemEntry, MachineTutorialScene, MachineTutorialStep, RecipeBrowserState, RecipeIndex, RecipeWidgetId,
 };
 use megu_client_ui::state::{
     CRASH_PREVIEW_MAX_BYTES, CraftingConflictOverlay, CrashReportMode, GamepadButton, HitRegion,
-    HudSubtitle, LanguageSetting, MiniHudPreset, MinimapMode, ModSyncEntry, PlayerRadarScope,
+    HudSubtitle, LanguageSetting, CompactDebugHudPreset, MinimapMode, ModSyncEntry, PlayerRadarScope,
     Screen, SettingsTab, SubtitleDirection, UiAction, UiInputEvent, UiKey, UiLang, UiModal,
     UiState, WidgetId, invite_code_display, invite_code_parse,
 };
 use megu_core::crash_report::CrashContext;
-use megu_core::sys_metrics::{MiniHudAnchor, MiniHudConfig, MiniHudData};
+use megu_client_ui::state::{CompactDebugHudAnchor, CompactDebugHudConfig, CompactDebugHudData};
 
 const SIZES: [(u32, u32); 2] = [(1280, 720), (640, 360)];
 const HIT_SIZES: [(u32, u32); 4] = [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)];
@@ -50,7 +50,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         "1.21.1",
         "contraption NPE at /home/alice/mods/x.jar — Bearer sekret",
     ));
-    ui.mod_menu = demo_mod_menu();
+    ui.mod_manager = demo_mod_manager();
     ui.recipe_browser = demo_recipe_browser();
     ui.singleplayer.worlds = vec!["First World".into(), "Second World".into()];
     ui.death = megu_client_ui::death_screen::DeathScreenState {
@@ -71,7 +71,7 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
         Screen::AboutMegu,
         Screen::Friends,
         Screen::ModSyncConsent,
-        Screen::ModMenu,
+        Screen::ModManager,
         Screen::RecipeBrowser,
         Screen::InGameHud,
         Screen::Death,
@@ -81,10 +81,10 @@ fn all_screens(ui: &mut UiState) -> Vec<Screen> {
 }
 
 /// A two-entry Mods & Packs screen for the integrated-screen tests.
-fn demo_mod_menu() -> ModMenuState {
-    ModMenuState::new(vec![
-        ModMenuEntry::new("create", "Create", "0.5.1f"),
-        ModMenuEntry::new("jei", "Just Enough Items", "15.3.0"),
+fn demo_mod_manager() -> ModManagerState {
+    ModManagerState::new(vec![
+        ModManagerEntry::new("create", "Create", "0.5.1f"),
+        ModManagerEntry::new("jei", "Just Enough Items", "15.3.0"),
     ])
 }
 
@@ -155,10 +155,10 @@ fn assert_draws_within_viewport(list: &UiDrawList, w: u32, h: u32) {
     }
 }
 
-/// A fully populated telemetry snapshot: every MiniHudData field set so
+/// A fully populated telemetry snapshot: every CompactDebugHudData field set so
 /// both the Basic and Advanced segments have real content to draw.
-fn populated_mini_hud_data() -> MiniHudData {
-    MiniHudData {
+fn populated_compact_debug_hud_data() -> CompactDebugHudData {
+    CompactDebugHudData {
         fps: Some(60.0),
         fps_one_percent_low: Some(9.0),
         mspt: Some(4.2),
@@ -1178,54 +1178,54 @@ fn hud_tab_list_toggles_and_rasterizes() {
 }
 
 // ---------------------------------------------------------------------------
-// MiniHUD + directional subtitles (both strictly opt-in)
+// Compact Debug HUD + directional subtitles (both strictly opt-in)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn minihud_and_subtitles_default_off_and_emit_zero_commands() {
+fn compact_debug_hud_and_subtitles_default_off_and_emit_zero_commands() {
     let mut ui = UiState::new();
     ui.screen = Screen::InGameHud;
-    assert!(!ui.settings.qol.mini_hud.enabled);
+    assert!(!ui.settings.qol.compact_debug_hud.enabled);
     assert!(!ui.settings.qol.show_subtitles);
-    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
-    assert!(ui.hud.mini_hud_data.fps.is_none());
+    assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Off);
+    assert!(ui.hud.compact_debug_hud_data.fps.is_none());
     assert!(ui.hud.subtitles.is_empty());
     assert!(
         !megu_client_ui::state::QolSettings::default()
-            .mini_hud
+            .compact_debug_hud
             .enabled
     );
 
     for &(w, h) in &HIT_SIZES {
         let baseline = ui.render(w, h);
         // Fully populated data stays invisible while both features off.
-        ui.hud.mini_hud_data = populated_mini_hud_data();
+        ui.hud.compact_debug_hud_data = populated_compact_debug_hud_data();
         ui.hud.subtitles = demo_subtitles();
         let drawn = ui.render(w, h);
         assert_eq!(
             drawn, baseline,
             "opt-out overlays emitted commands at {w}x{h}"
         );
-        ui.hud.mini_hud_data = MiniHudData::default();
+        ui.hud.compact_debug_hud_data = CompactDebugHudData::default();
         ui.hud.subtitles.clear();
     }
 }
 
 #[test]
-fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
+fn qol_tab_wires_compact_debug_hud_preset_and_subtitles_without_overlap() {
     let mut ui = UiState::new();
     for &(w, h) in &HIT_SIZES {
         ui.screen = Screen::Settings(SettingsTab::Qol);
         let list = ui.render(w, h);
         assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
         assert_draws_within_viewport(&list, w, h);
-        for id in [WidgetId::QolMiniHud, WidgetId::QolSubtitles] {
+        for id in [WidgetId::QolCompactDebugHud, WidgetId::QolSubtitles] {
             assert!(
                 ui.hit_regions.iter().any(|r| r.id == id),
                 "{id:?} missing at {w}x{h}"
             );
         }
-        for label in ["MiniHUD: OFF", "Subtitles: OFF"] {
+        for label in ["Compact Debug HUD: OFF", "Subtitles: OFF"] {
             assert!(
                 list.commands
                     .iter()
@@ -1235,29 +1235,29 @@ fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
         }
     }
 
-    // Cycle the MiniHUD preset OFF → Basic → Advanced → OFF.
+    // Cycle the Compact Debug HUD preset OFF → Basic → Advanced → OFF.
     ui.screen = Screen::Settings(SettingsTab::Qol);
     assert_eq!(
-        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        click(&mut ui, WidgetId::QolCompactDebugHud, 640, 360),
         vec![UiAction::SettingsChanged]
     );
-    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Basic);
-    assert!(ui.settings.qol.mini_hud.enabled);
-    assert!(ui.settings.qol.mini_hud.show_fps);
-    assert!(!ui.settings.qol.mini_hud.show_ram);
+    assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Basic);
+    assert!(ui.settings.qol.compact_debug_hud.enabled);
+    assert!(ui.settings.qol.compact_debug_hud.show_fps);
+    assert!(!ui.settings.qol.compact_debug_hud.show_ram);
     let list = ui.render(640, 360);
     assert!(
         list.commands
             .iter()
-            .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "MiniHUD: Basic"))
+            .any(|c| matches!(c, UiCommand::Text { text, .. } if text == "Compact Debug HUD: Basic"))
     );
 
     assert_eq!(
-        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        click(&mut ui, WidgetId::QolCompactDebugHud, 640, 360),
         vec![UiAction::SettingsChanged]
     );
-    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
-    let m = &ui.settings.qol.mini_hud;
+    assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Advanced);
+    let m = &ui.settings.qol.compact_debug_hud;
     assert!(
         m.show_one_percent_low
             && m.show_mspt_tps
@@ -1271,11 +1271,11 @@ fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
     );
 
     assert_eq!(
-        click(&mut ui, WidgetId::QolMiniHud, 640, 360),
+        click(&mut ui, WidgetId::QolCompactDebugHud, 640, 360),
         vec![UiAction::SettingsChanged]
     );
-    assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Off);
-    assert!(!ui.settings.qol.mini_hud.enabled);
+    assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Off);
+    assert!(!ui.settings.qol.compact_debug_hud.enabled);
 
     // Subtitles toggle flips through the real input router.
     assert!(!ui.settings.qol.show_subtitles);
@@ -1292,34 +1292,34 @@ fn qol_tab_wires_minihud_preset_and_subtitles_without_overlap() {
 }
 
 #[test]
-fn minihud_basic_and_advanced_render_in_bounds_at_every_anchor() {
+fn compact_debug_hud_basic_and_advanced_render_in_bounds_at_every_anchor() {
     for anchor in [
-        MiniHudAnchor::TopLeft,
-        MiniHudAnchor::TopRight,
-        MiniHudAnchor::BottomLeft,
-        MiniHudAnchor::BottomRight,
+        CompactDebugHudAnchor::TopLeft,
+        CompactDebugHudAnchor::TopRight,
+        CompactDebugHudAnchor::BottomLeft,
+        CompactDebugHudAnchor::BottomRight,
     ] {
         let mut ui = UiState::new();
         ui.screen = Screen::InGameHud;
         ui.hud = megu_client_ui::state::HudState::demo();
-        ui.hud.mini_hud_data = populated_mini_hud_data();
-        ui.settings.qol.mini_hud = MiniHudConfig {
+        ui.hud.compact_debug_hud_data = populated_compact_debug_hud_data();
+        ui.settings.qol.compact_debug_hud = CompactDebugHudConfig {
             enabled: true,
             anchor,
-            ..MiniHudConfig::default()
+            ..CompactDebugHudConfig::default()
         };
         for &(w, h) in &HIT_SIZES {
-            ui.settings.qol.mini_hud = MiniHudConfig {
+            ui.settings.qol.compact_debug_hud = CompactDebugHudConfig {
                 enabled: false,
                 anchor,
-                ..MiniHudConfig::default()
+                ..CompactDebugHudConfig::default()
             };
             let baseline = ui.render(w, h);
-            ui.settings.qol.mini_hud.enabled = true;
+            ui.settings.qol.compact_debug_hud.enabled = true;
             let drawn = ui.render(w, h);
             assert!(
                 drawn.len() > baseline.len(),
-                "Basic MiniHUD drew nothing at {w}x{h} ({anchor:?})"
+                "Basic Compact Debug HUD drew nothing at {w}x{h} ({anchor:?})"
             );
             assert_draws_within_viewport(&drawn, w, h);
             for needle in ["60 FPS", "XYZ 10.0 64.0 -3.0", "Ping 24ms"] {
@@ -1332,8 +1332,8 @@ fn minihud_basic_and_advanced_render_in_bounds_at_every_anchor() {
             assert_non_blank(&rasterize_draw_list(w, h, &drawn));
 
             // Advanced preset adds the hardware/world segments.
-            ui.settings.qol.cycle_mini_hud();
-            assert_eq!(ui.settings.qol.mini_hud_preset(), MiniHudPreset::Advanced);
+            ui.settings.qol.cycle_compact_debug_hud();
+            assert_eq!(ui.settings.qol.compact_debug_hud_preset(), CompactDebugHudPreset::Advanced);
             let adv = ui.render(w, h);
             assert!(adv.len() > drawn.len());
             assert_draws_within_viewport(&adv, w, h);
@@ -1560,20 +1560,20 @@ fn render_into_matches_render_output_on_every_screen() {
 }
 
 // ---------------------------------------------------------------------------
-// Integrated ModMenu + recipe browser + crafting-conflict overlay (WIRE-UI-1)
+// Integrated ModManager + recipe browser + crafting-conflict overlay (WIRE-UI-1)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mod_menu_opens_from_title_and_settings_and_closes_back() {
+fn mod_manager_opens_from_title_and_settings_and_closes_back() {
     let mut ui = UiState::new();
-    ui.mod_menu = demo_mod_menu();
+    ui.mod_manager = demo_mod_manager();
     let (w, h) = (1280u32, 720u32);
     ui.render(w, h);
 
     // Title "Mods & Packs" navigates into the embedded screen.
     let acts = click(&mut ui, WidgetId::TitleMods, w, h);
-    assert_eq!(ui.screen, Screen::ModMenu);
-    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModMenu)]);
+    assert_eq!(ui.screen, Screen::ModManager);
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModManager)]);
 
     // The sub-screen's own widgets are re-tagged into the unified
     // WidgetId space: search field, filter pills, mod rows, footer Done.
@@ -1583,35 +1583,35 @@ fn mod_menu_opens_from_title_and_settings_and_closes_back() {
         UiCommand::Text { text, .. } if text.starts_with("Mods & Packs")
     )));
     for inner in [
-        ModMenuWidgetId::SearchField,
-        ModMenuWidgetId::FilterAll,
-        ModMenuWidgetId::ModRow(1),
-        ModMenuWidgetId::Done,
+        ModManagerWidgetId::SearchField,
+        ModManagerWidgetId::FilterAll,
+        ModManagerWidgetId::ModRow(1),
+        ModManagerWidgetId::Done,
     ] {
         assert!(
             ui.hit_regions
                 .iter()
-                .any(|r| r.id == WidgetId::ModMenu(inner)),
-            "missing ModMenu::{inner:?} region"
+                .any(|r| r.id == WidgetId::ModManager(inner)),
+            "missing ModManager::{inner:?} region"
         );
     }
     assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
 
     // Embedded widgets are clickable through the router.
-    let acts = click(&mut ui, WidgetId::ModMenu(ModMenuWidgetId::ModRow(1)), w, h);
+    let acts = click(&mut ui, WidgetId::ModManager(ModManagerWidgetId::ModRow(1)), w, h);
     assert!(acts.is_empty());
-    assert_eq!(ui.mod_menu.selected_row(), 1);
+    assert_eq!(ui.mod_manager.selected_row(), 1);
 
     // Done backs out to Title through the nav stack.
-    let acts = click(&mut ui, WidgetId::ModMenu(ModMenuWidgetId::Done), w, h);
+    let acts = click(&mut ui, WidgetId::ModManager(ModManagerWidgetId::Done), w, h);
     assert_eq!(acts, vec![UiAction::Back]);
     assert_eq!(ui.screen, Screen::Title);
 
     // Settings chrome exposes the same screen.
     click(&mut ui, WidgetId::TitleSettings, w, h);
     let acts = click(&mut ui, WidgetId::SettingsMods, w, h);
-    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModMenu)]);
-    assert_eq!(ui.screen, Screen::ModMenu);
+    assert_eq!(acts, vec![UiAction::OpenScreen(Screen::ModManager)]);
+    assert_eq!(ui.screen, Screen::ModManager);
 
     // Escape closes via the sub-screen's own Close action.
     let acts = key(&mut ui, UiKey::Escape);
@@ -1620,7 +1620,7 @@ fn mod_menu_opens_from_title_and_settings_and_closes_back() {
 }
 
 #[test]
-fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
+fn recipe_browser_opens_from_pause_with_machine_tutorial_and_done_back() {
     let mut ui = UiState::new();
     ui.recipe_browser = demo_recipe_browser();
     let (w, h) = (1280u32, 720u32);
@@ -1640,7 +1640,7 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
     ui.render(w, h);
     for inner in [
         RecipeWidgetId::SearchField,
-        RecipeWidgetId::TabPonder,
+        RecipeWidgetId::TabMachineTutorials,
         RecipeWidgetId::ItemSlot(0),
     ] {
         assert!(
@@ -1657,16 +1657,16 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
     );
     assert_hit_regions_within_viewport(&ui.hit_regions, w, h);
 
-    // The 3D Ponder tab renders its isometric scene when loaded.
-    let mut scene = PonderScene::new("Water Wheel");
+    // The 3D MachineTutorial tab renders its isometric scene when loaded.
+    let mut scene = MachineTutorialScene::new("Water Wheel");
     scene.add_block(0, 0, 0, UiColor::rgb(120, 80, 40));
     scene.add_block(1, 0, 0, UiColor::rgb(120, 80, 40));
     scene.add_block(0, 1, 0, UiColor::rgb(160, 120, 60));
     scene
         .steps
-        .push(PonderStep::new("power the wheel", "動力", 40));
-    ui.recipe_browser.ponder = Some(scene);
-    ui.recipe_browser.tab = BrowserTab::Ponder;
+        .push(MachineTutorialStep::new("power the wheel", "動力", 40));
+    ui.recipe_browser.machine_tutorial = Some(scene);
+    ui.recipe_browser.tab = BrowserTab::MachineTutorials;
     let list = ui.render(w, h);
     assert!(list.commands.iter().any(|c| matches!(
         c,
@@ -1679,7 +1679,7 @@ fn recipe_browser_opens_from_pause_with_ponder_and_done_back() {
     assert!(
         ui.hit_regions
             .iter()
-            .any(|r| r.id == WidgetId::Recipe(RecipeWidgetId::PonderNext))
+            .any(|r| r.id == WidgetId::Recipe(RecipeWidgetId::MachineTutorialNext))
     );
 
     // Done returns to the Pause screen (the nav stack remembers it).

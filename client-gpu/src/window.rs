@@ -121,6 +121,62 @@ use crate::{
 /// Window title.
 pub const WINDOW_TITLE: &str = "Megu 1.21.1";
 
+fn gui_entry(entry: crate::vanilla_gui_sprites::SpriteAtlasEntry) -> megu_ui::draw::GuiSpriteEntry {
+    let border = entry.nine_slice_border.unwrap_or_default();
+    megu_ui::draw::GuiSpriteEntry {
+        uv_min: entry.uv_min,
+        uv_max: entry.uv_max,
+        width: entry.width,
+        height: entry.height,
+        nine_slice_border: [border.left, border.top, border.right, border.bottom],
+    }
+}
+
+/// Re-key the loaded Vanilla HUD rectangles onto Megu's stable logical
+/// sprite IDs. `VanillaGuiTextureAtlas::to_gui_sprite_atlas` intentionally
+/// keeps only widget chrome in the legacy contract map, so the window —
+/// the boundary that owns host asset loading — installs these additional
+/// bindings without changing the shared atlas loader.
+fn install_logical_hud_sprite_bindings(
+    atlas: &mut megu_ui::draw::GuiSpriteAtlas,
+    textures: &crate::vanilla_gui_sprites::VanillaGuiTextureAtlas,
+) {
+    use crate::vanilla_gui_sprites::VanillaGuiSpriteId as V;
+    use megu_ui::draw::hud_sprite_ids as hud;
+    const TYPED: &[(&str, V)] = &[
+        (hud::HOTBAR, V::Hotbar),
+        (hud::HOTBAR_SELECTION, V::HotbarSelection),
+        (hud::CROSSHAIR, V::Crosshair),
+        (hud::EXPERIENCE_BAR_BACKGROUND, V::XpBarBg),
+        (hud::EXPERIENCE_BAR_PROGRESS, V::XpBarFill),
+        (hud::HEART_CONTAINER, V::HeartContainer),
+        (hud::HEART_FULL, V::HeartFull),
+        (hud::HEART_HALF, V::HeartHalf),
+        (hud::FOOD_EMPTY, V::FoodEmpty),
+        (hud::FOOD_FULL, V::FoodFull),
+        (hud::ARMOR_EMPTY, V::ArmorEmpty),
+        (hud::ARMOR_FULL, V::ArmorFull),
+    ];
+    for (key, id) in TYPED {
+        if let Some(entry) = textures.entry(*id) {
+            atlas.insert_named_sprite(*key, gui_entry(*entry));
+        }
+    }
+    for (name, entry) in &textures.named_entries {
+        let key = if let Some(rest) = name
+            .strip_prefix("sprites/hud/")
+            .and_then(|rest| rest.strip_suffix(".png"))
+        {
+            format!("hud/{rest}")
+        } else if name.starts_with(hud::MOB_EFFECT_PREFIX) {
+            name.clone()
+        } else {
+            continue;
+        };
+        atlas.insert_named_sprite(key, gui_entry(*entry));
+    }
+}
+
 /// Event-loop wake interval while the surface is occluded: slow enough for
 /// zero-GPU sleep, fast enough to keep a live session's network pump alive.
 const OCCLUDED_TICK: Duration = Duration::from_millis(50);
@@ -266,15 +322,15 @@ pub static PLAYER_INVENTORY_SCHEMA: MenuScreenSchema = MenuScreenSchema {
     property_bars: &[],
 };
 
-/// Which JEI-style focus the R/U/W hotkeys request on the hovered stack.
+/// Which recipe-browser-style focus the R/U/W hotkeys request on the hovered stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecipeFocus {
     /// `R` — "recipes producing this item" detail view.
     Recipes,
     /// `U` — "uses consuming this item" detail view.
     Uses,
-    /// `W` — Create-Ponder-style 3D scene for the item.
-    Ponder,
+    /// `W` — Create-MachineTutorial-style 3D scene for the item.
+    MachineTutorial,
 }
 
 /// Display-independent output of the Minecraft keyboard bindings.
@@ -294,7 +350,7 @@ pub enum WindowInputEvent {
     SetTabListVisible(bool),
     SortInventory,
     OpenAdvancements,
-    /// JEI-style hover hotkey resolved from `R`/`U`/`W` while a container
+    /// recipe-browser-style hover hotkey resolved from `R`/`U`/`W` while a container
     /// surface is up — opens the recipe browser focused on the hovered
     /// stack (no-op when nothing resolvable is under the cursor).
     RecipeBrowserFocus(RecipeFocus),
@@ -1074,7 +1130,7 @@ pub struct GpuApp {
     ui_layer_fps: [u64; 7],
     /// Retained layer lists composited beside `ui_draw_list` each frame:
     /// mod HUD (goggles, magic HUD, hotbar glint), vanilla overlay
-    /// (container, JEI sidebar, advancements, container glint) and the
+    /// (container, recipe browser sidebar, advancements, container glint) and the
     /// mod-GUI bridge batch.
     ui_modhud_list: UiDrawList,
     ui_overlay_list: UiDrawList,
@@ -1594,7 +1650,7 @@ impl GpuApp {
         for message in startup_status {
             app.status_line(message);
         }
-        // Lane GPU-JEI-PONDER-WIRE: feed `ui.recipe_browser.index` real
+        // Lane GPU-RECIPE-TUTORIAL-WIRE: feed `ui.recipe_browser.index` real
         // datapack content — `<gameDir>/mods/*.jar`, the vanilla version
         // JAR, and datapack dirs — all through the lazy ZIP index with
         // zero extraction. The report rides `status_line` exactly like the
@@ -1788,7 +1844,7 @@ impl GpuApp {
                 .and_then(|name| name.to_str())
                 .map(|name| name.trim_end_matches(".zip").to_owned());
             let enabled = self.configured_builtin_pack_enabled(&id);
-            let existing = self.ui.mod_menu.entries.iter_mut().find(|entry| {
+            let existing = self.ui.mod_manager.entries.iter_mut().find(|entry| {
                 entry.mod_id == id
                     || entry.mod_id == namespaced_id
                     || entry.name == display_name
@@ -1801,24 +1857,24 @@ impl GpuApp {
                 entry.summary = "Official built-in Minecraft resource pack".into();
             } else {
                 let mut entry =
-                    megu_ui::mod_menu::ModMenuEntry::new(&namespaced_id, &display_name, "1.21.1");
+                    megu_ui::mod_manager::ModManagerEntry::new(&namespaced_id, &display_name, "1.21.1");
                 entry.enabled = enabled;
                 entry.summary = "Official built-in Minecraft resource pack".into();
-                entry.loader = megu_ui::mod_menu::ModLoaderTag::MeguNative;
-                entry.tier = megu_ui::mod_menu::ModAdaptationBadge::Tier1Native;
-                entry.reload_mode = megu_ui::mod_menu::ModReloadBadge::HotReload;
-                self.ui.mod_menu.entries.push(entry);
+                entry.loader = megu_ui::mod_manager::ModLoaderTag::MeguNative;
+                entry.tier = megu_ui::mod_manager::ModAdaptationBadge::Tier1Native;
+                entry.reload_mode = megu_ui::mod_manager::ModReloadBadge::HotReload;
+                self.ui.mod_manager.entries.push(entry);
             }
             present += 1;
         }
         present
     }
 
-    /// Decode the local client JAR's `widget/*` GUI sprites into
-    /// `gui_sprite_atlas` (re-keyed to the `SpriteId` contract) and push
+    /// Decode the local client JAR's GUI sprites into
+    /// `gui_sprite_atlas` (widget keys plus stable HUD/effect bindings) and push
     /// the texture to `ui_quad` binding 5 when a renderer is live.
     /// Clean-room hosts keep the empty atlas — `UiCommand::Sprite` then
-    /// never emits and `vanilla_widgets` draws the vector bevel chrome.
+    /// never emits and procedural widget/HUD chrome remains the fallback.
     /// Runs once per JAR arrival (`gui_sprites_loaded` gates rescans).
     fn load_gui_sprite_atlas(&mut self) {
         if self.vanilla_runtime_assets.is_some() {
@@ -1847,6 +1903,7 @@ impl GpuApp {
             self.ui.settings.locale.code(),
         );
         self.gui_sprite_atlas = runtime.gui_atlas.clone();
+        install_logical_hud_sprite_bindings(&mut self.gui_sprite_atlas, &runtime.gui_textures);
         self.gui_sprites_loaded = true;
         self.rebuild_entity_appearance();
         self.sync_official_builtin_pack_menu_entries();
@@ -2271,7 +2328,7 @@ impl GpuApp {
         self.mod_ui_manifest = manifest;
     }
 
-    /// The recipe/resource browser state (JEI/EMI/JER/Ponder index, tabs,
+    /// The recipe/resource browser state (recipe overlay/world-drops data/MachineTutorial index, tabs,
     /// focused detail) — read-only view for host code and tests.
     pub fn recipe_browser(&self) -> &RecipeBrowserState {
         &self.ui.recipe_browser
@@ -2874,7 +2931,7 @@ impl GpuApp {
             UiAction::Back => {
                 self.ui
                     .handle_input(UiInputEvent::KeyPressed(UiKey::Escape));
-                // Mod Menu Done/Back lands here (`ModMenuAction::Close`
+                // Mod Manager Done/Back lands here (`ModManagerAction::Close`
                 // flattens to `Back`); a staged or applied
                 // non-hot-reload toggle kicks the in-process reload.
                 self.maybe_soft_reload_mods();
@@ -3058,13 +3115,13 @@ impl GpuApp {
         self.update_ime();
     }
 
-    /// Mod Menu close hook: when a non-hot-reload mod was toggled or
+    /// Mod Manager close hook: when a non-hot-reload mod was toggled or
     /// applied, refresh mod assets + translations in-process (the window
     /// never leaves the loop), surface the localized status line, then
     /// acknowledge so a clean close stays cheap. Poll-style: the menu
     /// owns the sticky flag, so this is a no-op on every other `Back`.
     fn maybe_soft_reload_mods(&mut self) {
-        if !self.ui.mod_menu.needs_soft_reload_on_close() {
+        if !self.ui.mod_manager.needs_soft_reload_on_close() {
             return;
         }
         if let Some(live) = &mut self.live {
@@ -3081,9 +3138,9 @@ impl GpuApp {
             live.set_ui_locale("und");
             live.set_ui_locale(&locale);
         }
-        let status = self.ui.mod_menu.soft_reload_status(self.ui.lang());
+        let status = self.ui.mod_manager.soft_reload_status(self.ui.lang());
         self.status_line(status);
-        self.ui.mod_menu.acknowledge_soft_reload();
+        self.ui.mod_manager.acknowledge_soft_reload();
     }
 
     /// Enter the mismatch flow when a caller has a structured server mod manifest.
@@ -3187,10 +3244,10 @@ impl GpuApp {
         }
     }
 
-    /// The recipe browser's only host-facing actions today are the JEI `+`
+    /// The recipe browser's only host-facing actions today are the recipe browser `+`
     /// transfer and `Close` (bookmark/toggle mutations are state-internal,
-    /// and Ponder opens through the `W` hotkey or the browser's own `P`
-    /// key — both feed `browser.ponder`, no host action is emitted).
+    /// and MachineTutorial opens through the `W` hotkey or the browser's own `P`
+    /// key — both feed `browser.machine_tutorial`, no host action is emitted).
     /// `TransferToCraftingGrid` sends the serverbound `place_recipe`
     /// packet on a live session or surfaces an explicit status when
     /// offline — it is never dropped on the floor.
@@ -3499,7 +3556,7 @@ impl GpuApp {
             || self.ui.world_seed_field_active()
             || self.ui.server_address_field_active()
             || (self.ui.screen == Screen::RecipeBrowser && self.ui.recipe_browser.search_focused())
-            || (self.ui.screen == Screen::ModMenu && self.ui.mod_menu.search_focused())
+            || (self.ui.screen == Screen::ModManager && self.ui.mod_manager.search_focused())
             || (self.ui.settings.qol.recipe_overlay_enabled
                 && self.container_screen.is_some()
                 && self.ui.recipe_browser.search_focused())
@@ -3629,7 +3686,7 @@ impl GpuApp {
             }
             return Vec::new();
         }
-        // JEI/EMI overlay search: the container keeps `Screen::InGameHud`
+        // recipe overlay overlay search: the container keeps `Screen::InGameHud`
         // underneath, so `ui_wants_input` is false — the browser's
         // `CharTyped` arm owns the text surface instead.
         if self.ui.settings.qol.recipe_overlay_enabled
@@ -5649,9 +5706,9 @@ impl GpuApp {
         };
         match state {
             ElementState::Pressed => {
-                // JEI/EMI overlay widgets (search, grid, bookmarks,
+                // recipe overlay overlay widgets (search, grid, bookmarks,
                 // detail slots) outrank container slots — same rule as
-                // JEI: sidebar clicks never touch the hovered slot.
+                // recipe browser: sidebar clicks never touch the hovered slot.
                 if self.ui.settings.qol.recipe_overlay_enabled {
                     if let Some(id) = self
                         .recipe_overlay_regions
@@ -5741,11 +5798,11 @@ impl GpuApp {
         live.dispatch_workstation_action(&action);
     }
 
-    /// Mouse Tweaks style wheel transfer: while a container owns the pointer,
+    /// Inventory Drag Controls style wheel transfer: while a container owns the pointer,
     /// each wheel notch quick-moves the hovered stack. Vanilla grabbed-wheel
     /// hotbar selection remains the fallback when the feature is disabled.
     fn container_scroll_tweak(&mut self, steps: i32) -> bool {
-        if steps == 0 || !self.ui.settings.builtin_mouse_tweaks_active(false) {
+        if steps == 0 || !self.ui.settings.builtin_inventory_drag_controls_active(false) {
             return false;
         }
         let Some(screen) = &mut self.container_screen else {
@@ -5806,13 +5863,13 @@ impl GpuApp {
     }
 
     /// Item under the cursor across both surfaces: a container slot, or
-    /// a sidebar/detail slot in the JEI/EMI overlay's hit regions.
+    /// a sidebar/detail slot in the recipe overlay overlay's hit regions.
     fn overlay_focused_item(&self) -> Option<String> {
         self.hovered_item_name()
             .or_else(|| self.ui.recipe_browser.hovered_item())
     }
 
-    /// JEI/EMI side-overlay key chord — `true` when the press was
+    /// recipe overlay side-overlay key chord — `true` when the press was
     /// consumed:
     /// `Ctrl`/`Cmd`+`O` toggles `recipe_overlay_enabled` in place;
     /// `A` bookmarks the hovered stack (container or sidebar slot);
@@ -5890,9 +5947,9 @@ impl GpuApp {
         false
     }
 
-    /// JEI-style `R`/`U`/`W` open: navigate to the recipe browser focused
-    /// on `item` (recipes/uses detail, or a Ponder scene on the Ponder
-    /// tab). A hovered stack is ground truth, so the id lands in the
+    /// Recipe-browser `R`/`U`/`W` open: navigate to the recipe browser focused
+    /// on `item` (recipes/uses detail, or a machine-tutorial scene on the Machine
+    /// Tutorials tab). A hovered stack is ground truth, so the id lands in the
     /// catalog even when no JAR declared it.
     fn open_recipe_browser_focused(&mut self, item: &str, focus: RecipeFocus) {
         if self.ui.recipe_browser.index.item(item).is_none() {
@@ -5908,11 +5965,11 @@ impl GpuApp {
                 .recipe_browser
                 .open_detail(item, DetailMode::Recipes),
             RecipeFocus::Uses => self.ui.recipe_browser.open_detail(item, DetailMode::Uses),
-            RecipeFocus::Ponder => {
+            RecipeFocus::MachineTutorial => {
                 let scene =
-                    crate::recipe_ingest::ponder_scene_for(&self.ui.recipe_browser.index, item);
-                self.ui.recipe_browser.ponder = Some(scene);
-                self.ui.recipe_browser.tab = BrowserTab::Ponder;
+                    crate::recipe_ingest::machine_tutorial_scene_for(&self.ui.recipe_browser.index, item);
+                self.ui.recipe_browser.machine_tutorial = Some(scene);
+                self.ui.recipe_browser.tab = BrowserTab::MachineTutorials;
             }
         }
         for action in self.ui.open_recipe_browser() {
@@ -5990,7 +6047,7 @@ impl GpuApp {
                 }
             }
         }
-        // JEI/EMI overlay hover: the tooltip anchor and `hovered_item`
+        // recipe overlay overlay hover: the tooltip anchor and `hovered_item`
         // read `overlay_mouse`/`hover`, fed from the last frame's hit
         // regions (stale-rect clicks are rejected in `activate` anyway).
         let overlay_on = self.ui.settings.qol.recipe_overlay_enabled;
@@ -6728,24 +6785,24 @@ impl GpuApp {
             // Revision-gated HUD sync: unchanged server state skips the
             // `HudState` clone entirely (`live.hud_sync_skips` counts hits).
             live.sync_hud_to(&mut self.ui.hud);
-            let mini_hud = &mut self.ui.settings.qol.mini_hud;
-            let mini_segments = self.persisted_settings.mini_hud_segments;
-            mini_hud.enabled = self.persisted_settings.mini_hud_enabled;
-            mini_hud.show_fps = mini_segments & (1 << 0) != 0;
-            mini_hud.show_coords = mini_segments & (1 << 1) != 0;
-            mini_hud.show_biome = mini_segments & (1 << 2) != 0;
-            mini_hud.show_facing = mini_segments & (1 << 3) != 0;
-            mini_hud.show_ping = mini_segments & (1 << 4) != 0;
-            mini_hud.show_mspt_tps = mini_segments & (1 << 5) != 0;
-            mini_hud.show_light_level = mini_segments & (1 << 6) != 0;
-            mini_hud.show_chunks_entities = mini_segments & (1 << 7) != 0;
-            mini_hud.show_ram = mini_segments & (1 << 8) != 0;
+            let compact_debug_hud = &mut self.ui.settings.qol.compact_debug_hud;
+            let compact_debug_hud_segments = self.persisted_settings.compact_debug_hud_segments;
+            compact_debug_hud.enabled = self.persisted_settings.compact_debug_hud_enabled;
+            compact_debug_hud.show_fps = compact_debug_hud_segments & (1 << 0) != 0;
+            compact_debug_hud.show_coords = compact_debug_hud_segments & (1 << 1) != 0;
+            compact_debug_hud.show_biome = compact_debug_hud_segments & (1 << 2) != 0;
+            compact_debug_hud.show_facing = compact_debug_hud_segments & (1 << 3) != 0;
+            compact_debug_hud.show_ping = compact_debug_hud_segments & (1 << 4) != 0;
+            compact_debug_hud.show_mspt_tps = compact_debug_hud_segments & (1 << 5) != 0;
+            compact_debug_hud.show_light_level = compact_debug_hud_segments & (1 << 6) != 0;
+            compact_debug_hud.show_chunks_entities = compact_debug_hud_segments & (1 << 7) != 0;
+            compact_debug_hud.show_ram = compact_debug_hud_segments & (1 << 8) != 0;
             // Visual-style preset x `Clouds` decides the deck layout
             // every frame: Vanilla stays one authentic cubic deck, Megu
             // Natural + Fancy opts into the hybrid parallax set.
             live.cloud_deck_mode =
                 cloud_deck_mode(self.ui.settings.visual.preset, self.render_config.clouds);
-            live.record_frame_and_refresh_minihud(dt, &mut self.ui);
+            live.record_frame_and_refresh_compact_debug_hud(dt, &mut self.ui);
             live.set_ui_locale(self.ui.settings.locale.code());
             let feed = live.hud_feed();
             Self::apply_live_hud(
@@ -6943,7 +7000,12 @@ impl GpuApp {
         // nothing (text payloads recycle inside the list). The command
         // stream is identical to `self.ui.render(w, h)` — the
         // fingerprint below feeds the same dirty-check either way.
-        self.ui.render_into(w, h, &mut self.ui_draw_list);
+        self.ui.render_into_with_gui_atlas(
+            w,
+            h,
+            &mut self.ui_draw_list,
+            self.gui_sprites_loaded.then_some(&self.gui_sprite_atlas),
+        );
         let draw_list = &mut self.ui_draw_list;
         // Per-layer overlay lists: rebuilt every frame, fingerprinted
         // below so only layers whose content actually moved bump their
@@ -7042,7 +7104,7 @@ impl GpuApp {
                 &self.gui_sprite_atlas,
                 &mut self.ui_overlay_list,
             );
-            // JEI/EMI side overlay: bookmark column left, search+grid
+            // recipe overlay side overlay: bookmark column left, search+grid
             // right — only when the QoL toggle is on and both columns
             // fit without overlapping the container panel.
             if self.ui.settings.qol.recipe_overlay_enabled {
@@ -7739,15 +7801,15 @@ impl GpuApp {
             }
             return;
         }
-        // JEI/EMI side overlay hotkeys (`Ctrl+O` toggle, `A` bookmark,
+        // recipe overlay side overlay hotkeys (`Ctrl+O` toggle, `A` bookmark,
         // `R`/`U` detail, `Backspace`/`Esc` history) — the whole chord
         // lives in `handle_overlay_key` so headless tests drive the same
         // code path without `ActiveEventLoop`.
         if self.handle_overlay_key(code, pressed) {
             return;
         }
-        // JEI hover hotkeys while a container/inventory surface is up:
-        // `R` shows recipes, `U` uses, `W` the Ponder scene — but only when
+        // recipe browser hover hotkeys while a container/inventory surface is up:
+        // `R` shows recipes, `U` uses, `W` the MachineTutorial scene — but only when
         // a resolvable stack is under the cursor. Otherwise the key keeps
         // its usual binding (`R` sorts, `W` moves forward).
         if pressed
@@ -7759,7 +7821,7 @@ impl GpuApp {
             let focus = match code {
                 KeyCode::KeyR => RecipeFocus::Recipes,
                 KeyCode::KeyU => RecipeFocus::Uses,
-                _ => RecipeFocus::Ponder,
+                _ => RecipeFocus::MachineTutorial,
             };
             self.apply_window_input(WindowInputEvent::RecipeBrowserFocus(focus));
             return;
@@ -8979,19 +9041,19 @@ fn apply_client_settings_to_ui(src: &ClientSettings, ui: &mut UiSettings) {
     };
     ui.shader_quick.shaders_enabled = src.shaders_enabled;
     ui.qol_looking_at_hud = src.builtin_looking_at_hud;
-    ui.qol_mouse_tweaks = src.builtin_mouse_tweaks;
+    ui.inventory_drag_controls = src.inventory_drag_controls;
     ui.qol_inventory_sort = src.builtin_inventory_sort;
     ui.zsh_command_bar = src.zsh_command_bar;
-    ui.qol.mini_hud.enabled = src.mini_hud_enabled;
-    ui.qol.mini_hud.show_fps = src.mini_hud_segments & (1 << 0) != 0;
-    ui.qol.mini_hud.show_coords = src.mini_hud_segments & (1 << 1) != 0;
-    ui.qol.mini_hud.show_biome = src.mini_hud_segments & (1 << 2) != 0;
-    ui.qol.mini_hud.show_facing = src.mini_hud_segments & (1 << 3) != 0;
-    ui.qol.mini_hud.show_ping = src.mini_hud_segments & (1 << 4) != 0;
-    ui.qol.mini_hud.show_mspt_tps = src.mini_hud_segments & (1 << 5) != 0;
-    ui.qol.mini_hud.show_light_level = src.mini_hud_segments & (1 << 6) != 0;
-    ui.qol.mini_hud.show_chunks_entities = src.mini_hud_segments & (1 << 7) != 0;
-    ui.qol.mini_hud.show_ram = src.mini_hud_segments & (1 << 8) != 0;
+    ui.qol.compact_debug_hud.enabled = src.compact_debug_hud_enabled;
+    ui.qol.compact_debug_hud.show_fps = src.compact_debug_hud_segments & (1 << 0) != 0;
+    ui.qol.compact_debug_hud.show_coords = src.compact_debug_hud_segments & (1 << 1) != 0;
+    ui.qol.compact_debug_hud.show_biome = src.compact_debug_hud_segments & (1 << 2) != 0;
+    ui.qol.compact_debug_hud.show_facing = src.compact_debug_hud_segments & (1 << 3) != 0;
+    ui.qol.compact_debug_hud.show_ping = src.compact_debug_hud_segments & (1 << 4) != 0;
+    ui.qol.compact_debug_hud.show_mspt_tps = src.compact_debug_hud_segments & (1 << 5) != 0;
+    ui.qol.compact_debug_hud.show_light_level = src.compact_debug_hud_segments & (1 << 6) != 0;
+    ui.qol.compact_debug_hud.show_chunks_entities = src.compact_debug_hud_segments & (1 << 7) != 0;
+    ui.qol.compact_debug_hud.show_ram = src.compact_debug_hud_segments & (1 << 8) != 0;
     ui.video.preset = match src.preset {
         QualityPreset::Fast => VideoPreset::Fast,
         QualityPreset::Balanced => VideoPreset::Balanced,
@@ -9180,20 +9242,20 @@ fn ui_to_client_settings(ui: &UiSettings, base: &ClientSettings) -> ClientSettin
     let mut out = base.clone();
     out.shaders_enabled = ui.shader_quick.shaders_enabled;
     out.builtin_looking_at_hud = ui.qol_looking_at_hud;
-    out.builtin_mouse_tweaks = ui.qol_mouse_tweaks;
+    out.inventory_drag_controls = ui.inventory_drag_controls;
     out.builtin_inventory_sort = ui.qol_inventory_sort;
     out.zsh_command_bar = ui.zsh_command_bar;
-    let mini = &ui.qol.mini_hud;
-    out.mini_hud_enabled = mini.enabled;
-    out.mini_hud_segments = u16::from(mini.show_fps)
-        | (u16::from(mini.show_coords) << 1)
-        | (u16::from(mini.show_biome) << 2)
-        | (u16::from(mini.show_facing) << 3)
-        | (u16::from(mini.show_ping) << 4)
-        | (u16::from(mini.show_mspt_tps) << 5)
-        | (u16::from(mini.show_light_level) << 6)
-        | (u16::from(mini.show_chunks_entities) << 7)
-        | (u16::from(mini.show_ram) << 8);
+    let compact_debug_hud = &ui.qol.compact_debug_hud;
+    out.compact_debug_hud_enabled = compact_debug_hud.enabled;
+    out.compact_debug_hud_segments = u16::from(compact_debug_hud.show_fps)
+        | (u16::from(compact_debug_hud.show_coords) << 1)
+        | (u16::from(compact_debug_hud.show_biome) << 2)
+        | (u16::from(compact_debug_hud.show_facing) << 3)
+        | (u16::from(compact_debug_hud.show_ping) << 4)
+        | (u16::from(compact_debug_hud.show_mspt_tps) << 5)
+        | (u16::from(compact_debug_hud.show_light_level) << 6)
+        | (u16::from(compact_debug_hud.show_chunks_entities) << 7)
+        | (u16::from(compact_debug_hud.show_ram) << 8);
     out.fullscreen = ui.fullscreen;
     out.mouse_invert_y = ui.mouse_invert_y;
     out.gamma_pct = ui.gamma_pct.clamp(50, 200);
@@ -12962,5 +13024,65 @@ mod title_text_filter_tests {
         assert!(!is_builtin_title_text(&text_cmd(2, "MEGU EDITION")));
         assert!(!is_builtin_title_text(&text_cmd(1, "MINECRAFT")));
         assert!(!is_builtin_title_text(&text_cmd(1, "unrelated label")));
+    }
+}
+
+#[cfg(test)]
+mod hud_sprite_binding_tests {
+    use super::*;
+    use crate::vanilla_gui_sprites::{SpriteAtlasEntry, VanillaGuiSpriteId, VanillaGuiTextureAtlas};
+    use megu_ui::draw::hud_sprite_ids;
+
+    fn placement(width: u32, height: u32) -> SpriteAtlasEntry {
+        SpriteAtlasEntry {
+            uv_min: [0.25, 0.5],
+            uv_max: [0.75, 1.0],
+            width,
+            height,
+            nine_slice_border: None,
+        }
+    }
+
+    #[test]
+    fn logical_hud_bindings_include_typed_named_and_effect_sprites() {
+        let mut textures = VanillaGuiTextureAtlas::default();
+        textures
+            .entries
+            .push((VanillaGuiSpriteId::Hotbar, placement(182, 22)));
+        textures.named_entries.push((
+            "sprites/hud/food_half.png".to_string(),
+            placement(9, 9),
+        ));
+        textures.named_entries.push((
+            "sprites/hud/heart/poisoned_full.png".to_string(),
+            placement(9, 9),
+        ));
+        textures
+            .named_entries
+            .push(("mob_effect/speed".to_string(), placement(18, 18)));
+        textures.named_entries.push((
+            "sprites/container/furnace/burn_progress.png".to_string(),
+            placement(16, 16),
+        ));
+
+        let mut atlas = megu_ui::draw::GuiSpriteAtlas::default();
+        install_logical_hud_sprite_bindings(&mut atlas, &textures);
+
+        for key in [
+            hud_sprite_ids::HOTBAR,
+            hud_sprite_ids::FOOD_HALF,
+            "hud/heart/poisoned_full",
+            "mob_effect/speed",
+        ] {
+            let bound = atlas
+                .named_sprite(key)
+                .unwrap_or_else(|| panic!("missing logical HUD binding {key}"));
+            assert_eq!(bound.uv_min, [0.25, 0.5], "{key}");
+            assert_eq!(bound.uv_max, [0.75, 1.0], "{key}");
+        }
+        assert!(
+            atlas.named_sprite("hud/container/furnace/burn_progress").is_none(),
+            "non-HUD atlas rectangles must not become stable HUD bindings"
+        );
     }
 }

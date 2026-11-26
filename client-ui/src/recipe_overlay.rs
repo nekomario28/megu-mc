@@ -1,20 +1,20 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! JEI/EMI-style *native* container overlay — the side-by-side item list
+//! Native recipe overlay for container screens — the side-by-side item list
 //! that renders *alongside* any centered container GUI (inventory,
 //! crafting table, furnace, chest, anvil, ...) instead of replacing the
 //! screen like the full [`crate::recipe_browser`] does.
 //!
 //! 100% clean-room Rust drawing on top of [`crate::draw`]
-//! ([`UiDrawList`]/[`UiRect`]/[`UiColor`]) — zero JEI/EMI code, zero
-//! external textures, zero external dependencies. The look is a
+//! ([`UiDrawList`]/[`UiRect`]/[`UiColor`]) — no external mod code, external
+//! textures, or external dependencies. The look is a
 //! byte-faithful *palette* match of the classic mods:
 //!
-//! * **Non-overlapping 3-zone geometry** — [`JeiEmiGeometry::compute`]
+//! * **Non-overlapping 3-zone geometry** — [`RecipeOverlayGeometry::compute`]
 //!   keeps the center container zone untouched and parks a
 //!   right item-list sidebar and a left bookmarks/craft-tree sidebar in
 //!   the slack space, guaranteed never to intersect the container from
 //!   `640×360` through `3840×2160`.
-//! * **Right sidebar (JEI/EMI item list)** — auto-sized grid of classic
+//! * **Right sidebar (recipe overlay item list)** — auto-sized grid of classic
 //!   18×18 recessed-bevel slots (dark `#373737` top/left, `#FFFFFF`
 //!   bottom/right, `#8B8B8B` inner, `rgba(255,255,255,128)` hover), a
 //!   `< page / total >` top pager, and a bottom row with the classic
@@ -22,11 +22,12 @@
 //!   search mode) plus a compact funnel filter toggle.
 //! * **Left sidebar** — toggleable [`LeftPanelMode::Bookmarks`] slot
 //!   grid (items pinned with `A`) and [`LeftPanelMode::CraftTree`]
-//!   EMI-style live raw-material/missing-ingredient checklist.
+//!   live raw-material/missing-ingredient craft checklist.
 //! * **Recipe popup card** — [`render_recipe_popup`]: vanilla light-grey
 //!   `#C6C6C6` beveled card, category tab strip (Crafting 3×3, Smelting,
-//!   Blasting, Smoking, Stonecutting, Smithing, Brewing, Create, JER,
-//!   Ponder), `< n / N >` recipe pager, EMI "View Recipe Tree" button,
+//!   Blasting, Smoking, Stonecutting, Smithing, Brewing, Machine Recipes,
+//!   Drops & World Info, Machine Tutorials), `< n / N >` recipe pager,
+//!   "View Recipe Tree" button,
 //!   exact 3×18px crafting-grid → arrow → 26×26 output + green `+`
 //!   transfer (hovering `+` with missing materials red-tints the
 //!   missing slots), and a furnace card with flame burn icon, fuel
@@ -50,11 +51,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::draw::{first_px, text_width, UiColor, UiDrawList, UiRect};
 
 // ---------------------------------------------------------------------------
-// Classic JEI/EMI / vanilla palette
+// Classic recipe overlay / vanilla palette
 // ---------------------------------------------------------------------------
 
 /// Classic 18×18 item slot (logical GUI px).
-pub const JEI_SLOT: i32 = 18;
+pub const RECIPE_SLOT: i32 = 18;
 /// Recessed slot inner fill `#8B8B8B`.
 pub const SLOT_INNER: UiColor = UiColor::rgb(0x8B, 0x8B, 0x8B);
 /// Recessed slot dark bevel (top/left) `#373737`.
@@ -95,8 +96,8 @@ pub const MISSING_TINT: UiColor = UiColor::rgba(220, 40, 40, 120);
 const SEARCH_BG: UiColor = UiColor::rgb(0x00, 0x00, 0x00);
 /// Search field idle border.
 const SEARCH_EDGE: UiColor = UiColor::rgb(0xA0, 0xA0, 0xA0);
-/// Sidebar slot-grid backdrop (JEI leaves items floating; a whisper of
-/// dark keeps the grid legible over bright scenes).
+/// Sidebar slot-grid backdrop. A whisper of dark keeps the grid legible
+/// over bright scenes.
 const GRID_TINT: UiColor = UiColor::rgba(0, 0, 0, 72);
 
 const EDGE: i32 = 2;
@@ -161,7 +162,7 @@ impl OverlaySlot {
     }
 }
 
-/// Recipe-popup category tabs (JEI/EMI top strip).
+/// Recipe-popup category tabs (recipe overlay top strip).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PopupTab {
     /// 3×3 crafting grid → arrow → 26×26 output.
@@ -174,9 +175,9 @@ pub enum PopupTab {
     Stonecutting,
     Smithing,
     Brewing,
-    Create,
-    Jer,
-    Ponder,
+    MachineRecipes,
+    WorldDropsInfo,
+    MachineTutorials,
 }
 
 impl PopupTab {
@@ -188,9 +189,9 @@ impl PopupTab {
         Self::Stonecutting,
         Self::Smithing,
         Self::Brewing,
-        Self::Create,
-        Self::Jer,
-        Self::Ponder,
+        Self::MachineRecipes,
+        Self::WorldDropsInfo,
+        Self::MachineTutorials,
     ];
 
     /// 2-glyph tab label (tab strip is only 20px wide).
@@ -203,9 +204,9 @@ impl PopupTab {
             Self::Stonecutting => "Ct",
             Self::Smithing => "Si",
             Self::Brewing => "Br",
-            Self::Create => "Ce",
-            Self::Jer => "JE",
-            Self::Ponder => "Po",
+            Self::MachineRecipes => "Ma",
+            Self::WorldDropsInfo => "DW",
+            Self::MachineTutorials => "MT",
         }
     }
 
@@ -219,9 +220,9 @@ impl PopupTab {
             Self::Stonecutting => "Stonecutting",
             Self::Smithing => "Smithing",
             Self::Brewing => "Brewing",
-            Self::Create => "Create",
-            Self::Jer => "JER",
-            Self::Ponder => "Ponder",
+            Self::MachineRecipes => "Machine Recipes",
+            Self::WorldDropsInfo => "Drops & World Info",
+            Self::MachineTutorials => "Machine Tutorials",
         }
     }
 
@@ -303,7 +304,7 @@ pub enum LeftPanelMode {
     /// `A`-pinned items in an 18×18 slot grid.
     #[default]
     Bookmarks,
-    /// EMI-style pinned craft checklist (raw materials vs inventory).
+    /// Pinned craft checklist (raw materials vs inventory).
     CraftTree,
 }
 
@@ -316,8 +317,8 @@ pub struct PinnedMaterial {
     pub need: u64,
 }
 
-/// EMI-style pinned recipe: target + flat material checklist. `have`
-/// is re-read from [`JeiEmiOverlayState::inventory`] every frame, so the
+/// Pinned craft tree: target + flat material checklist. `have`
+/// is re-read from [`RecipeOverlayState::inventory`] every frame, so the
 /// checklist is live.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PinnedTree {
@@ -366,12 +367,13 @@ pub enum OverlayWidgetId {
     LeftTabTree,
     /// A craft-tree material row; payload = `materials` index.
     TreeMaterial(usize),
-    /// A popup category tab; payload = index into [`PopupTab::ALL`].
+    /// A popup category tab; payload = index into the dynamic visible-tab list
+    /// for the open popup (only categories with matching recipes are emitted).
     PopupTab(usize),
     /// Popup `<` / `>` recipe pager.
     PopupPrev,
     PopupNext,
-    /// Popup `+` transfer button (JEI "fill the crafting grid").
+    /// Popup `+` transfer button (recipe browser "fill the crafting grid").
     PopupTransfer,
     /// Popup "View Recipe Tree" button.
     PopupTree,
@@ -406,7 +408,7 @@ pub enum OverlayAction {
     },
 }
 
-/// Device-agnostic overlay input for [`JeiEmiOverlayState::handle_key`].
+/// Device-agnostic overlay input for [`RecipeOverlayState::handle_key`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OverlayKey {
     /// A printable key press (`R`, `U`, `A`, digits, ...).
@@ -441,7 +443,7 @@ pub struct OverlayFrame {
 /// Static layout of the overlay around `container_rect`, in logical px
 /// (physical px = logical × [`scale`](Self::scale)).
 #[derive(Clone, Debug)]
-pub struct JeiEmiGeometry {
+pub struct RecipeOverlayGeometry {
     /// Effective GUI scale (`>= 1`); `gui_scale = 0` = auto.
     pub scale: i32,
     /// Logical viewport size.
@@ -477,7 +479,7 @@ pub struct JeiEmiGeometry {
     pub popup_card: UiRect,
 }
 
-impl JeiEmiGeometry {
+impl RecipeOverlayGeometry {
     /// Lay the sidebars into the slack left/right of `container_rect`
     /// (physical px). `gui_scale = 0` picks `height/270` clamped `1..=4`
     /// like the rest of the UI; an explicit scale is clamped `1..=4`.
@@ -557,8 +559,8 @@ impl JeiEmiGeometry {
                 r.w - 8,
                 (r.h as i32 - 17 - 19).max(0) as u32,
             );
-            g.cols = ((g.grid.w as i32) / JEI_SLOT).max(1) as usize;
-            g.rows = ((g.grid.h as i32) / JEI_SLOT).max(1) as usize;
+            g.cols = ((g.grid.w as i32) / RECIPE_SLOT).max(1) as usize;
+            g.rows = ((g.grid.h as i32) / RECIPE_SLOT).max(1) as usize;
         }
 
         // Left sidebar: mirror image.
@@ -580,8 +582,8 @@ impl JeiEmiGeometry {
                 l.w - 4,
                 (l.h as i32 - 19).max(0) as u32,
             );
-            g.left_cols = ((g.left_body.w as i32) / JEI_SLOT).max(1) as usize;
-            g.left_rows = ((g.left_body.h as i32) / JEI_SLOT).max(1) as usize;
+            g.left_cols = ((g.left_body.w as i32) / RECIPE_SLOT).max(1) as usize;
+            g.left_rows = ((g.left_body.h as i32) / RECIPE_SLOT).max(1) as usize;
         }
 
         // Popup card centered on the container, clamped to the viewport.
@@ -609,20 +611,20 @@ impl JeiEmiGeometry {
     /// Right-grid slot rect for the `k`-th slot on the page (row-major).
     pub fn slot_rect(&self, k: usize) -> UiRect {
         UiRect::new(
-            self.grid.x + (k % self.cols.max(1)) as i32 * JEI_SLOT,
-            self.grid.y + (k / self.cols.max(1)) as i32 * JEI_SLOT,
-            JEI_SLOT as u32,
-            JEI_SLOT as u32,
+            self.grid.x + (k % self.cols.max(1)) as i32 * RECIPE_SLOT,
+            self.grid.y + (k / self.cols.max(1)) as i32 * RECIPE_SLOT,
+            RECIPE_SLOT as u32,
+            RECIPE_SLOT as u32,
         )
     }
 
     /// Left-grid slot rect for the `k`-th bookmark (row-major).
     pub fn left_slot_rect(&self, k: usize) -> UiRect {
         UiRect::new(
-            self.left_body.x + (k % self.left_cols.max(1)) as i32 * JEI_SLOT,
-            self.left_body.y + (k / self.left_cols.max(1)) as i32 * JEI_SLOT,
-            JEI_SLOT as u32,
-            JEI_SLOT as u32,
+            self.left_body.x + (k % self.left_cols.max(1)) as i32 * RECIPE_SLOT,
+            self.left_body.y + (k / self.left_cols.max(1)) as i32 * RECIPE_SLOT,
+            RECIPE_SLOT as u32,
+            RECIPE_SLOT as u32,
         )
     }
 }
@@ -731,7 +733,7 @@ fn mini_button(cv: &mut Canvas, r: UiRect, label: &str, hovered: bool) {
     cv.ctext(r, PANEL_TEXT, label);
 }
 
-/// JEI right-arrow indicator (shaft + tapering head).
+/// recipe browser right-arrow indicator (shaft + tapering head).
 fn draw_arrow(cv: &mut Canvas, x: i32, y: i32, w: i32, h: i32, color: UiColor) {
     let mid = h / 2;
     cv.fill(x, y + mid - 1, (w - 5).max(1), 2, color);
@@ -884,9 +886,9 @@ pub fn render_item_tooltip(
 // Overlay state
 // ---------------------------------------------------------------------------
 
-/// Interactive state of the JEI/EMI container overlay.
+/// Interactive state of the recipe overlay container overlay.
 #[derive(Clone, Debug)]
-pub struct JeiEmiOverlayState {
+pub struct RecipeOverlayState {
     /// Host-supplied item catalog (right grid).
     pub items: Vec<OverlayItem>,
     /// Host-supplied recipes (popup cards + craftability checks).
@@ -910,7 +912,7 @@ pub struct JeiEmiOverlayState {
     pub page: usize,
     /// Open recipe popup card.
     pub popup: Option<RecipePopup>,
-    /// EMI pinned craft checklist.
+    /// recipe tree pinned craft checklist.
     pub pinned_tree: Option<PinnedTree>,
     /// Widget under the cursor (hover highlight).
     pub hovered: Option<OverlayWidgetId>,
@@ -921,18 +923,18 @@ pub struct JeiEmiOverlayState {
     pub inventory: BTreeMap<String, u64>,
     /// Last rendered geometry + hit regions — lets `handle_click` and
     /// `handle_mouse_move` hit-test without the caller re-passing them.
-    last_geo: Option<JeiEmiGeometry>,
+    last_geo: Option<RecipeOverlayGeometry>,
     last_hits: Vec<OverlayHitRegion>,
     last_search_click_ms: Option<u64>,
 }
 
-impl Default for JeiEmiOverlayState {
+impl Default for RecipeOverlayState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl JeiEmiOverlayState {
+impl RecipeOverlayState {
     pub fn new() -> Self {
         Self {
             items: Vec::new(),
@@ -1033,8 +1035,28 @@ impl JeiEmiOverlayState {
         self.recipes_for(&pop.item_id, pop.tab, pop.mode)
     }
 
+    /// Category tabs that actually have recipes for `item` in `mode`, in
+    /// stable [`PopupTab::ALL`] order. Generic machine recipes navigate under
+    /// the neutral Machine Recipes tab; source item/recipe identifiers keep
+    /// their original namespaces in the card itself.
+    fn available_popup_tabs(&self, item: &str, mode: PopupMode) -> Vec<PopupTab> {
+        PopupTab::ALL
+            .iter()
+            .copied()
+            .filter(|tab| !self.recipes_for(item, *tab, mode).is_empty())
+            .collect()
+    }
+
+    /// Dynamic tab strip for the open popup (empty when the popup is stale).
+    fn popup_tabs(&self) -> Vec<PopupTab> {
+        let Some(pop) = &self.popup else {
+            return Vec::new();
+        };
+        self.available_popup_tabs(&pop.item_id, pop.mode)
+    }
+
     /// Total grid pages for the filtered list at this geometry.
-    pub fn total_pages(&self, geo: &JeiEmiGeometry) -> usize {
+    pub fn total_pages(&self, geo: &RecipeOverlayGeometry) -> usize {
         let per = (geo.cols * geo.rows).max(1);
         self.filtered_items().len().div_ceil(per).max(1)
     }
@@ -1094,10 +1116,7 @@ impl JeiEmiOverlayState {
         let Some(item) = self.hovered_item_id() else {
             return;
         };
-        let Some(&tab) = PopupTab::ALL
-            .iter()
-            .find(|&&t| !self.recipes_for(&item, t, mode).is_empty())
-        else {
+        let Some(&tab) = self.available_popup_tabs(&item, mode).first() else {
             return;
         };
         self.popup = Some(RecipePopup {
@@ -1110,10 +1129,7 @@ impl JeiEmiOverlayState {
 
     /// Recipes popup for an explicit item id (bookmark/tree/popup slot).
     fn open_popup_for(&mut self, item: &str, mode: PopupMode) {
-        let Some(&tab) = PopupTab::ALL
-            .iter()
-            .find(|&&t| !self.recipes_for(item, t, mode).is_empty())
-        else {
+        let Some(&tab) = self.available_popup_tabs(item, mode).first() else {
             return;
         };
         self.popup = Some(RecipePopup {
@@ -1217,7 +1233,7 @@ impl JeiEmiOverlayState {
                             }
                         }
                         c if (' '..='~').contains(&c) => {
-                            // JEI-style: any other keystroke jumps into
+                            // recipe-browser-style: any other keystroke jumps into
                             // the search box.
                             self.search_focused = true;
                             self.search.push(c);
@@ -1303,9 +1319,8 @@ impl JeiEmiOverlayState {
                 }
             }
             OverlayWidgetId::PopupTab(i) => {
-                if let (Some(pop), Some(&tab)) =
-                    (&mut self.popup, PopupTab::ALL.get(i))
-                {
+                let tab = self.popup_tabs().get(i).copied();
+                if let (Some(pop), Some(tab)) = (&mut self.popup, tab) {
                     pop.tab = tab;
                     pop.page = 0;
                 }
@@ -1367,7 +1382,7 @@ impl JeiEmiOverlayState {
 
     /// Build the frame: `(draw_list, hit_regions, sprite_slots,
     /// search_matches)`. All geometry is computed in logical px and
-    /// multiplied by [`JeiEmiGeometry::scale`] on emit. The container
+    /// multiplied by [`RecipeOverlayGeometry::scale`] on emit. The container
     /// zone is never touched — the sidebars park strictly outside it.
     pub fn render(
         &mut self,
@@ -1376,7 +1391,7 @@ impl JeiEmiOverlayState {
         container_rect: UiRect,
         gui_scale: u32,
     ) -> OverlayFrame {
-        let geo = JeiEmiGeometry::compute(viewport_w, viewport_h, container_rect, gui_scale);
+        let geo = RecipeOverlayGeometry::compute(viewport_w, viewport_h, container_rect, gui_scale);
         let mut list = UiDrawList::new();
         let mut hits = Vec::new();
         let mut sprites = Vec::new();
@@ -1445,7 +1460,7 @@ impl JeiEmiOverlayState {
     fn render_right(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
     ) {
@@ -1508,7 +1523,7 @@ impl JeiEmiOverlayState {
             cv.text_fit(sb.x + 4, sb.y + 2, TEXT_WHITE, &shown, budget);
         }
         push_hit(hits, geo, OverlayWidgetId::SearchBox, sb);
-        // Funnel filter/config toggle (EMI-style compact button).
+        // Funnel filter/config toggle.
         let fb = geo.filter_button;
         raised_panel(cv, fb);
         const FUNNEL: [&str; 7] = [
@@ -1545,7 +1560,7 @@ impl JeiEmiOverlayState {
     fn render_left(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
     ) {
@@ -1672,14 +1687,14 @@ impl JeiEmiOverlayState {
         }
     }
 
-    /// The JEI/EMI recipe popup card layer: category tabs, `< n / N >`
-    /// pager, EMI "Recipe Tree" button and the per-category diagram —
+    /// The recipe overlay recipe popup card layer: category tabs, `< n / N >`
+    /// pager, recipe tree "Recipe Tree" button and the per-category diagram —
     /// 3×3 crafting grid → arrow → 26×26 output + `+` transfer, or the
     /// furnace card (input + flame + fuel → output, XP/cook readout).
     /// Rendered centered over the container zone (modal card).
     pub fn render_recipe_popup(
         &self,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
     ) -> (UiDrawList, Vec<OverlayHitRegion>, Vec<ItemSpriteSlot>) {
         let mut list = UiDrawList::new();
         let mut hits = Vec::new();
@@ -1695,8 +1710,11 @@ impl JeiEmiOverlayState {
             };
 
             // Card panel + floating tab strip (active tab raised into it).
+            // Only categories with matching recipes are navigation targets;
+            // machine mods never get an unconditional branded tab.
+            let popup_tabs = self.popup_tabs();
             raised_panel(&mut cv, card);
-            for (i, tab) in PopupTab::ALL.iter().enumerate() {
+            for (i, tab) in popup_tabs.iter().enumerate() {
                 let active = pop.tab == *tab;
                 let tr = UiRect::new(
                     card.x + i as i32 * POPUP_TAB_W,
@@ -1723,7 +1741,7 @@ impl JeiEmiOverlayState {
                 push_hit(&mut hits, geo, OverlayWidgetId::PopupTab(i), tr);
             }
 
-            // Header: `< n / N >` pager + "Recipe Tree" EMI button.
+            // Header: `< n / N >` pager + "Recipe Tree" recipe tree button.
             let prev = UiRect::new(card.x + 4, card.y + 4, 10, 10);
             let next = UiRect::new(card.x + 88, card.y + 4, 10, 10);
             mini_button(&mut cv, prev, "<", self.hovered == Some(OverlayWidgetId::PopupPrev));
@@ -1792,7 +1810,7 @@ impl JeiEmiOverlayState {
     fn card_slot(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
         r: UiRect,
@@ -1836,7 +1854,7 @@ impl JeiEmiOverlayState {
     fn card_crafting(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
         recipe: &OverlayRecipe,
@@ -1908,7 +1926,7 @@ impl JeiEmiOverlayState {
     fn card_furnace(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
         recipe: &OverlayRecipe,
@@ -1998,13 +2016,13 @@ impl JeiEmiOverlayState {
         }
     }
 
-    /// Generic inline card (stonecutting/smithing/brewing/Create/JER/
-    /// Ponder): input slots in a row → arrow → 26×26 output.
+    /// Generic inline card (stonecutting/smithing/brewing/machine/world-drop/
+    /// tutorial categories): input slots in a row → arrow → 26×26 output.
     #[allow(clippy::too_many_arguments)]
     fn card_inline(
         &self,
         cv: &mut Canvas,
-        geo: &JeiEmiGeometry,
+        geo: &RecipeOverlayGeometry,
         hits: &mut Vec<OverlayHitRegion>,
         sprites: &mut Vec<ItemSpriteSlot>,
         recipe: &OverlayRecipe,
@@ -2054,7 +2072,7 @@ impl JeiEmiOverlayState {
 /// Emit a physical-px hit region clamped inside the viewport.
 fn push_hit(
     hits: &mut Vec<OverlayHitRegion>,
-    geo: &JeiEmiGeometry,
+    geo: &RecipeOverlayGeometry,
     id: OverlayWidgetId,
     logical: UiRect,
 ) {

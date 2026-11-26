@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 //! Live subtitle wiring: drained spatial audio cues reach
 //! `SubtitleHudState` and the in-game HUD draw list through
-//! `record_frame_and_refresh_minihud` + `UiState::render`.
+//! `record_frame_and_refresh_compact_debug_hud` + `UiState::render`.
 
 use megu_client::protocol::{ClientPlayEvent, PlayEvent, TeleportSync, WireSoundEvent};
 use megu_client_gpu::live_session::LiveSession;
@@ -55,7 +55,7 @@ fn drained_spatial_cues_reach_subtitle_hud_state() {
     let mut ui = playing_ui();
     // Mirror the window loop: clone the live HUD snapshot, then refresh.
     ui.hud = session.hud.clone();
-    session.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
 
     assert_eq!(ui.hud.subtitle_hud.len(), 1, "spatial cue feeds the HUD");
     let entry = &ui.hud.subtitle_hud.entries()[0];
@@ -76,12 +76,12 @@ fn repeat_sound_dedups_onto_one_row_and_ttl_ticks_down() {
 
     let mut ui = playing_ui();
     ui.hud = session.hud.clone();
-    session.record_frame_and_refresh_minihud(0.5, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(0.5, &mut ui);
     assert_eq!(ui.hud.subtitle_hud.len(), 1);
     assert_eq!(ui.hud.subtitle_hud.entries()[0].count, 2);
     let first_ttl = ui.hud.subtitle_hud.entries()[0].ttl_secs;
 
-    session.record_frame_and_refresh_minihud(1.0, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(1.0, &mut ui);
     let entry = &ui.hud.subtitle_hud.entries()[0];
     assert!(entry.ttl_secs < first_ttl, "frame clock drains the row");
     assert!((entry.ttl_secs - (first_ttl - 1.0)).abs() < 1e-4);
@@ -92,12 +92,12 @@ fn subtitle_rows_appear_in_live_hud_draw_list() {
     let mut session = teleport_session();
     let mut ui = playing_ui();
     ui.hud = session.hud.clone();
-    session.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
     let baseline = ui.render(1280, 720);
 
     session.ingest_sound_event(sound_event());
     session.pump_audio_frames(480);
-    session.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
     let with_cue = ui.render(1280, 720);
 
     assert!(with_cue.commands.len() > baseline.commands.len());
@@ -120,7 +120,7 @@ fn subtitles_stay_hidden_when_opt_in_is_off() {
     let mut ui = UiState::new();
     ui.navigate(Screen::InGameHud);
     ui.hud = session.hud.clone();
-    session.record_frame_and_refresh_minihud(1.0 / 60.0, &mut ui);
+    session.record_frame_and_refresh_compact_debug_hud(1.0 / 60.0, &mut ui);
     assert_eq!(ui.hud.subtitle_hud.len(), 1, "state still tracks cues");
 
     let list = ui.render(1280, 720);

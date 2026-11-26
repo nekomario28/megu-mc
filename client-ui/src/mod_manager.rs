@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! ModMenu-inspired Mods & Packs manager screen for the client UI.
+//! ModManager-inspired Mods & Packs manager screen for the client UI.
 //!
-//! The host supplies plain [`ModMenuEntry`] metadata (parsed by its own mod
+//! The host supplies plain [`ModManagerEntry`] metadata (parsed by its own mod
 //! loader); the screen owns the interactive state: a forgiving multi-token
 //! search with `@author` / `#tag` prefix filters, clickable filter pills, a
 //! sort cycle, a two-pane master-detail layout with a scrollable mod list,
@@ -9,8 +9,8 @@
 //! `Apply`, and one-click Modrinth actions for missing dependencies.
 //!
 //! Like [`crate::shader_screen`], rendering produces a deterministic
-//! [`UiDrawList`] plus a parallel `Vec<`[`ModMenuHitRegion`]`>`; input arrives
-//! as device-agnostic [`UiInputEvent`]s and returns [`ModMenuAction`]s the
+//! [`UiDrawList`] plus a parallel `Vec<`[`ModManagerHitRegion`]`>`; input arrives
+//! as device-agnostic [`UiInputEvent`]s and returns [`ModManagerAction`]s the
 //! embedding application performs. Everything is pure `std` — no client-port
 //! types, no GPU resources, no I/O.
 
@@ -137,7 +137,7 @@ impl ModReloadBadge {
 /// The four `*_url` fields are optional — an empty string hides that link
 /// button entirely.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ModMenuEntry {
+pub struct ModManagerEntry {
     pub mod_id: String,
     pub name: String,
     pub version: String,
@@ -157,7 +157,7 @@ pub struct ModMenuEntry {
     pub modrinth_url: String,
 }
 
-impl ModMenuEntry {
+impl ModManagerEntry {
     /// Minimal entry: `enabled`, Tier-1 native, hot-reloadable, no links.
     pub fn new(mod_id: &str, name: &str, version: &str) -> Self {
         Self {
@@ -204,7 +204,7 @@ impl QolSubCategory {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BuiltinQolFeature {
     LookingAtHud,
-    MouseTweaksGestures,
+    InventoryDragControls,
     InventorySort,
     HungerSaturationPreview,
     ContainerTooltipPreview,
@@ -277,7 +277,7 @@ pub const CURATED_MODRINTH_QOL_MODS: [CuratedModrinthQolMod; 15] = [
         category: QolSubCategory::InventoryInput,
         loaders: QOL_LOADERS,
         target_version: "1.21.1",
-        yields_builtin_qol: Some(BuiltinQolFeature::MouseTweaksGestures),
+        yields_builtin_qol: Some(BuiltinQolFeature::InventoryDragControls),
     },
     CuratedModrinthQolMod {
         slug: "inventory-profiles-next",
@@ -475,8 +475,8 @@ pub fn active_builtin_qol_overrides(installed_mod_ids: &[&str]) -> BuiltinQolDef
     deference
 }
 
-fn curated_entry(mod_info: &CuratedModrinthQolMod) -> ModMenuEntry {
-    let mut entry = ModMenuEntry::new(mod_info.slug, mod_info.name, "MC 1.21.1");
+fn curated_entry(mod_info: &CuratedModrinthQolMod) -> ModManagerEntry {
+    let mut entry = ModManagerEntry::new(mod_info.slug, mod_info.name, "MC 1.21.1");
     entry.summary = mod_info.summary_en.to_owned();
     entry.enabled = false;
     entry.loader = mod_info.loaders[0];
@@ -646,8 +646,8 @@ pub fn recommended_community_mods() -> &'static [RecommendedModEntry] {
     &RECOMMENDED_COMMUNITY_MODS
 }
 
-fn community_entry(info: &RecommendedModEntry) -> ModMenuEntry {
-    let mut entry = ModMenuEntry::new(info.slug, info.name, "MC 1.21.1");
+fn community_entry(info: &RecommendedModEntry) -> ModManagerEntry {
+    let mut entry = ModManagerEntry::new(info.slug, info.name, "MC 1.21.1");
     entry.summary = info.en_summary.to_owned();
     entry.authors = vec![info.author.to_owned()];
     entry.license = info.license_spdx.to_owned();
@@ -800,7 +800,7 @@ enum CatalogMeta<'a> {
 
 /// The clickable filter-pill selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ModMenuFilter {
+pub enum ModManagerFilter {
     /// Every entry (subject to the library toggle and search).
     #[default]
     All,
@@ -822,7 +822,7 @@ pub enum ModMenuFilter {
 
 /// The clickable sort toggle.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ModMenuSort {
+pub enum ModManagerSort {
     /// Name ascending.
     #[default]
     NameAsc,
@@ -832,7 +832,7 @@ pub enum ModMenuSort {
     Status,
 }
 
-impl ModMenuSort {
+impl ModManagerSort {
     /// Cycle order: A-Z → Z-A → Status → A-Z.
     pub fn next(self) -> Self {
         match self {
@@ -854,10 +854,10 @@ impl ModMenuSort {
 /// Every interactive element on the screen.
 ///
 /// `ModRow` carries the row's index in the *currently visible* (filtered,
-/// searched, sorted) list — the same ordering [`ModMenuState::visible_indices`]
+/// searched, sorted) list — the same ordering [`ModManagerState::visible_indices`]
 /// reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModMenuWidgetId {
+pub enum ModManagerWidgetId {
     /// The search text field — clicking focuses it for typing.
     SearchField,
     /// The `x` button clearing the search text.
@@ -916,12 +916,12 @@ pub enum ModMenuWidgetId {
 
 /// A clickable rectangle emitted alongside the draw list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ModMenuHitRegion {
+pub struct ModManagerHitRegion {
     pub rect: UiRect,
-    pub id: ModMenuWidgetId,
+    pub id: ModManagerWidgetId,
 }
 
-impl ModMenuHitRegion {
+impl ModManagerHitRegion {
     /// Point containment test (right/bottom exclusive).
     pub const fn contains(self, x: i32, y: i32) -> bool {
         self.rect.contains(x, y)
@@ -930,7 +930,7 @@ impl ModMenuHitRegion {
 
 /// What the embedding application must perform after an interaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ModMenuAction {
+pub enum ModManagerAction {
     /// Open the Modrinth browser/install flow ("+ Add from Modrinth").
     OpenModrinthBrowser,
     /// Reveal the on-disk mods directory.
@@ -1053,7 +1053,7 @@ fn field_rank(token: &str, field: &str) -> Option<u32> {
 /// Best score a free-text token gets across an entry's searchable fields;
 /// `None` when the token matches none of them. Field weights keep name hits
 /// ahead of summary hits.
-fn text_token_score(entry: &ModMenuEntry, token: &str) -> Option<u32> {
+fn text_token_score(entry: &ModManagerEntry, token: &str) -> Option<u32> {
     let name = entry.name.to_lowercase();
     let id = entry.mod_id.to_lowercase();
     let summary = entry.summary.to_lowercase();
@@ -1068,7 +1068,7 @@ fn text_token_score(entry: &ModMenuEntry, token: &str) -> Option<u32> {
     best
 }
 
-fn tag_matches(tag: Tag, entry: &ModMenuEntry, enabled: bool) -> bool {
+fn tag_matches(tag: Tag, entry: &ModManagerEntry, enabled: bool) -> bool {
     match tag {
         Tag::Native => entry.tier == ModAdaptationBadge::Tier1Native,
         Tag::Shim => entry.tier == ModAdaptationBadge::Tier2Shim,
@@ -1088,17 +1088,17 @@ fn tag_matches(tag: Tag, entry: &ModMenuEntry, enabled: bool) -> bool {
 /// Interactive state of the Mods & Packs screen.
 ///
 /// `entries` is host-owned metadata; enable toggles stage into `pending`
-/// until [`ModMenuAction::ApplyChanges`] commits them back onto the entries.
+/// until [`ModManagerAction::ApplyChanges`] commits them back onto the entries.
 #[derive(Clone, Debug)]
-pub struct ModMenuState {
+pub struct ModManagerState {
     /// All installed mods/packs/libraries, in host-supplied order.
-    pub entries: Vec<ModMenuEntry>,
+    pub entries: Vec<ModManagerEntry>,
     /// Curated recommendations kept separate from host-owned installations.
-    recommended_entries: Vec<ModMenuEntry>,
+    recommended_entries: Vec<ModManagerEntry>,
     /// The unified Browse view's deduplicated catalog: every community
     /// entry plus the curated QoL picks the community list does not
     /// already cover (the richer community metadata wins shared slugs).
-    browse_entries: Vec<ModMenuEntry>,
+    browse_entries: Vec<ModManagerEntry>,
     /// Parallel to `browse_entries`: which catalog each row came from.
     browse_sources: Vec<BrowseSource>,
     /// Live search text for the installed/Recommended-QoL views (edited
@@ -1107,22 +1107,22 @@ pub struct ModMenuState {
     /// Live search text for the Browse view — filters the local catalog
     /// and feeds [`build_modrinth_search_url`] for online results.
     pub browse_query: String,
-    /// Active shelf inside [`ModMenuFilter::Browse`].
+    /// Active shelf inside [`ModManagerFilter::Browse`].
     pub browse_category: BrowseCategory,
     /// `project_type` facet for the live Modrinth search.
     pub browse_project_kind: ModrinthProjectKind,
     /// Sticky flag: a non-hot-reload change was applied, so closing the
     /// menu should run the host's in-process soft reload. Staged (not
     /// yet applied) non-hot toggles are covered separately by the
-    /// pending scan in [`ModMenuState::needs_soft_reload_on_close`].
-    /// Cleared via [`ModMenuState::acknowledge_soft_reload`].
+    /// pending scan in [`ModManagerState::needs_soft_reload_on_close`].
+    /// Cleared via [`ModManagerState::acknowledge_soft_reload`].
     pub dirty_requires_soft_reload: bool,
     /// Active filter pill.
-    pub filter: ModMenuFilter,
+    pub filter: ModManagerFilter,
     /// Optional sub-category when browsing Recommended QoL.
     pub recommended_category: Option<QolSubCategory>,
     /// Active sort mode.
-    pub sort: ModMenuSort,
+    pub sort: ModManagerSort,
     /// Whether `is_library` entries appear without a `#lib` query.
     pub show_libraries: bool,
     /// UI language for chrome labels.
@@ -1130,7 +1130,7 @@ pub struct ModMenuState {
     /// `0` = auto (`height/270`, clamped `1..=4`), else a fixed GUI scale.
     pub ui_scale: u8,
     /// Widget under the mouse cursor (for hover highlight).
-    pub hover: Option<ModMenuWidgetId>,
+    pub hover: Option<ModManagerWidgetId>,
     /// Whether the search field owns typed characters.
     search_focused: bool,
     /// Selection as an index into the *visible* list.
@@ -1143,8 +1143,8 @@ pub struct ModMenuState {
 
 /// Build the Browse catalog: all community entries first, then the
 /// curated QoL picks whose slug no community entry already covers.
-fn build_browse_catalog() -> (Vec<ModMenuEntry>, Vec<BrowseSource>) {
-    let mut entries: Vec<ModMenuEntry> = RECOMMENDED_COMMUNITY_MODS
+fn build_browse_catalog() -> (Vec<ModManagerEntry>, Vec<BrowseSource>) {
+    let mut entries: Vec<ModManagerEntry> = RECOMMENDED_COMMUNITY_MODS
         .iter()
         .map(community_entry)
         .collect();
@@ -1164,7 +1164,7 @@ fn build_browse_catalog() -> (Vec<ModMenuEntry>, Vec<BrowseSource>) {
     (entries, sources)
 }
 
-impl Default for ModMenuState {
+impl Default for ModManagerState {
     fn default() -> Self {
         let (browse_entries, browse_sources) = build_browse_catalog();
         Self {
@@ -1180,9 +1180,9 @@ impl Default for ModMenuState {
             browse_category: BrowseCategory::QolHud,
             browse_project_kind: ModrinthProjectKind::Mod,
             dirty_requires_soft_reload: false,
-            filter: ModMenuFilter::All,
+            filter: ModManagerFilter::All,
             recommended_category: None,
-            sort: ModMenuSort::NameAsc,
+            sort: ModManagerSort::NameAsc,
             show_libraries: false,
             lang: UiLang::En,
             ui_scale: 0,
@@ -1195,8 +1195,8 @@ impl Default for ModMenuState {
     }
 }
 
-impl ModMenuState {
-    pub fn new(entries: Vec<ModMenuEntry>) -> Self {
+impl ModManagerState {
+    pub fn new(entries: Vec<ModManagerEntry>) -> Self {
         Self {
             entries,
             ..Self::default()
@@ -1229,7 +1229,7 @@ impl ModMenuState {
     }
 
     /// Selected entry, if the visible list is non-empty.
-    pub fn selected_entry(&self) -> Option<&ModMenuEntry> {
+    pub fn selected_entry(&self) -> Option<&ModManagerEntry> {
         self.visible_indices()
             .get(self.selected)
             .and_then(|&i| self.browsed_entries().get(i))
@@ -1240,17 +1240,17 @@ impl ModMenuState {
     pub fn browsing_catalog(&self) -> bool {
         matches!(
             self.filter,
-            ModMenuFilter::RecommendedQol | ModMenuFilter::Browse
+            ModManagerFilter::RecommendedQol | ModManagerFilter::Browse
         )
     }
 
     /// Entry slice indexed by [`visible_indices`](Self::visible_indices).
     /// In a catalog filter these are metadata-only entries awaiting an
     /// install initiated on Modrinth.
-    pub fn browsed_entries(&self) -> &[ModMenuEntry] {
+    pub fn browsed_entries(&self) -> &[ModManagerEntry] {
         match self.filter {
-            ModMenuFilter::RecommendedQol => &self.recommended_entries,
-            ModMenuFilter::Browse => &self.browse_entries,
+            ModManagerFilter::RecommendedQol => &self.recommended_entries,
+            ModManagerFilter::Browse => &self.browse_entries,
             _ => &self.entries,
         }
     }
@@ -1259,7 +1259,7 @@ impl ModMenuState {
     /// `browse_query` (it doubles as the live-Modrinth-search input),
     /// every other view edits `search`.
     fn active_query(&self) -> &str {
-        if self.filter == ModMenuFilter::Browse {
+        if self.filter == ModManagerFilter::Browse {
             &self.browse_query
         } else {
             &self.search
@@ -1267,7 +1267,7 @@ impl ModMenuState {
     }
 
     fn active_query_mut(&mut self) -> &mut String {
-        if self.filter == ModMenuFilter::Browse {
+        if self.filter == ModManagerFilter::Browse {
             &mut self.browse_query
         } else {
             &mut self.search
@@ -1277,10 +1277,10 @@ impl ModMenuState {
     /// Metadata backing a catalog row (`None` for installed entries).
     fn catalog_meta(&self, entry_index: usize) -> Option<CatalogMeta<'_>> {
         match self.filter {
-            ModMenuFilter::RecommendedQol => {
+            ModManagerFilter::RecommendedQol => {
                 Some(CatalogMeta::Curated(&CURATED_MODRINTH_QOL_MODS[entry_index]))
             }
-            ModMenuFilter::Browse => self
+            ModManagerFilter::Browse => self
                 .browse_sources
                 .get(entry_index)
                 .copied()
@@ -1331,7 +1331,7 @@ impl ModMenuState {
     /// Whether closing the menu should kick off the host's in-process
     /// soft reload of mod containers: `true` once a non-hot-reload mod
     /// has been toggled or applied, so Done/Back re-initializes loaders
-    /// without a full process restart. `ModMenuAction::Close` stays a
+    /// without a full process restart. `ModManagerAction::Close` stays a
     /// unit variant — hosts poll this after handling it.
     pub fn needs_soft_reload_on_close(&self) -> bool {
         self.dirty_requires_soft_reload || self.pending_requires_soft_reload()
@@ -1410,8 +1410,8 @@ impl ModMenuState {
     /// so libraries can be found without flipping the pill.
     pub fn visible_indices(&self) -> Vec<usize> {
         let tokens = parse_query(self.active_query());
-        let recommended = self.filter == ModMenuFilter::RecommendedQol;
-        let browse = self.filter == ModMenuFilter::Browse;
+        let recommended = self.filter == ModManagerFilter::RecommendedQol;
+        let browse = self.filter == ModManagerFilter::Browse;
         let entries = self.browsed_entries();
         let lib_requested = tokens
             .iter()
@@ -1433,11 +1433,11 @@ impl ModMenuState {
             }
             let enabled = self.enabled_at(index);
             let passes_pill = match self.filter {
-                ModMenuFilter::All => true,
-                ModMenuFilter::Enabled => enabled,
-                ModMenuFilter::Issues => entry.has_issue(),
-                ModMenuFilter::Native => entry.tier == ModAdaptationBadge::Tier1Native,
-                ModMenuFilter::RecommendedQol | ModMenuFilter::Browse => true,
+                ModManagerFilter::All => true,
+                ModManagerFilter::Enabled => enabled,
+                ModManagerFilter::Issues => entry.has_issue(),
+                ModManagerFilter::Native => entry.tier == ModAdaptationBadge::Tier1Native,
+                ModManagerFilter::RecommendedQol | ModManagerFilter::Browse => true,
             };
             if !passes_pill {
                 continue;
@@ -1499,14 +1499,14 @@ impl ModMenuState {
         let entries = self.browsed_entries();
         let ea = &entries[a];
         let eb = &entries[b];
-        let name = |e: &ModMenuEntry| e.name.to_lowercase();
+        let name = |e: &ModManagerEntry| e.name.to_lowercase();
         let by_name = name(ea)
             .cmp(&name(eb))
             .then_with(|| ea.mod_id.cmp(&eb.mod_id));
         match self.sort {
-            ModMenuSort::NameAsc => by_name,
-            ModMenuSort::NameDesc => by_name.reverse(),
-            ModMenuSort::Status => {
+            ModManagerSort::NameAsc => by_name,
+            ModManagerSort::NameDesc => by_name.reverse(),
+            ModManagerSort::Status => {
                 let rank = |i: usize| {
                     let e = &entries[i];
                     if e.has_issue() {
@@ -1563,7 +1563,7 @@ impl ModMenuState {
 
     /// Stage pending changes into the apply action and commit them onto the
     /// entries. `None` when nothing is staged.
-    fn apply(&mut self) -> Option<ModMenuAction> {
+    fn apply(&mut self) -> Option<ModManagerAction> {
         if self.pending.is_empty() {
             return None;
         }
@@ -1594,7 +1594,7 @@ impl ModMenuState {
                 entry.enabled = want;
             }
         }
-        Some(ModMenuAction::ApplyChanges {
+        Some(ModManagerAction::ApplyChanges {
             enabled_ids,
             disabled_ids,
             requires_soft_restart,
@@ -1604,134 +1604,134 @@ impl ModMenuState {
     /// Activate a widget (from a click, or directly in tests). Returns the
     /// outward actions the host must perform — usually empty, one element
     /// for buttons.
-    pub fn activate(&mut self, id: ModMenuWidgetId) -> Vec<ModMenuAction> {
+    pub fn activate(&mut self, id: ModManagerWidgetId) -> Vec<ModManagerAction> {
         match id {
-            ModMenuWidgetId::SearchField => self.search_focused = true,
-            ModMenuWidgetId::SearchClear => {
+            ModManagerWidgetId::SearchField => self.search_focused = true,
+            ModManagerWidgetId::SearchClear => {
                 if !self.active_query().is_empty() {
                     self.active_query_mut().clear();
                     self.after_view_change();
                 }
             }
-            ModMenuWidgetId::FilterAll => self.set_filter(ModMenuFilter::All),
-            ModMenuWidgetId::FilterEnabled => self.set_filter(ModMenuFilter::Enabled),
-            ModMenuWidgetId::FilterIssues => self.set_filter(ModMenuFilter::Issues),
-            ModMenuWidgetId::FilterNative => self.set_filter(ModMenuFilter::Native),
-            ModMenuWidgetId::FilterRecommendedQol => {
-                if self.filter == ModMenuFilter::RecommendedQol {
+            ModManagerWidgetId::FilterAll => self.set_filter(ModManagerFilter::All),
+            ModManagerWidgetId::FilterEnabled => self.set_filter(ModManagerFilter::Enabled),
+            ModManagerWidgetId::FilterIssues => self.set_filter(ModManagerFilter::Issues),
+            ModManagerWidgetId::FilterNative => self.set_filter(ModManagerFilter::Native),
+            ModManagerWidgetId::FilterRecommendedQol => {
+                if self.filter == ModManagerFilter::RecommendedQol {
                     self.recommended_category = None;
                     self.after_view_change();
                 } else {
-                    self.set_filter(ModMenuFilter::RecommendedQol);
+                    self.set_filter(ModManagerFilter::RecommendedQol);
                 }
             }
-            ModMenuWidgetId::FilterBrowse => self.set_filter(ModMenuFilter::Browse),
-            ModMenuWidgetId::BrowseQolHud => {
+            ModManagerWidgetId::FilterBrowse => self.set_filter(ModManagerFilter::Browse),
+            ModManagerWidgetId::BrowseQolHud => {
                 self.set_browse_category(BrowseCategory::QolHud)
             }
-            ModMenuWidgetId::BrowseContent => {
+            ModManagerWidgetId::BrowseContent => {
                 self.set_browse_category(BrowseCategory::Content)
             }
-            ModMenuWidgetId::BrowsePacks => self.set_browse_category(BrowseCategory::Packs),
-            ModMenuWidgetId::BrowseKind => {
+            ModManagerWidgetId::BrowsePacks => self.set_browse_category(BrowseCategory::Packs),
+            ModManagerWidgetId::BrowseKind => {
                 self.browse_project_kind = self.browse_project_kind.next();
                 self.after_view_change();
             }
-            ModMenuWidgetId::ModrinthSearch => {
-                if self.filter == ModMenuFilter::Browse {
-                    return vec![ModMenuAction::OpenUrl(build_modrinth_search_url(
+            ModManagerWidgetId::ModrinthSearch => {
+                if self.filter == ModManagerFilter::Browse {
+                    return vec![ModManagerAction::OpenUrl(build_modrinth_search_url(
                         &self.browse_query,
                         self.browse_project_kind,
                         RECOMMENDED_MC_VERSION,
                     ))];
                 }
             }
-            ModMenuWidgetId::QolHudInfo => self.set_recommended_category(QolSubCategory::HudInfo),
-            ModMenuWidgetId::QolInventoryInput => {
+            ModManagerWidgetId::QolHudInfo => self.set_recommended_category(QolSubCategory::HudInfo),
+            ModManagerWidgetId::QolInventoryInput => {
                 self.set_recommended_category(QolSubCategory::InventoryInput)
             }
-            ModMenuWidgetId::QolRecipes => self.set_recommended_category(QolSubCategory::Recipes),
-            ModMenuWidgetId::QolVisualsCompat => {
+            ModManagerWidgetId::QolRecipes => self.set_recommended_category(QolSubCategory::Recipes),
+            ModManagerWidgetId::QolVisualsCompat => {
                 self.set_recommended_category(QolSubCategory::VisualsCompat)
             }
-            ModMenuWidgetId::ToggleLibraries => {
+            ModManagerWidgetId::ToggleLibraries => {
                 self.show_libraries = !self.show_libraries;
                 self.after_view_change();
             }
-            ModMenuWidgetId::SortMode => {
+            ModManagerWidgetId::SortMode => {
                 self.sort = self.sort.next();
                 self.after_view_change();
             }
-            ModMenuWidgetId::ListScrollUp => {
+            ModManagerWidgetId::ListScrollUp => {
                 self.scroll = self.scroll.saturating_sub(1);
             }
-            ModMenuWidgetId::ListScrollDown => {
+            ModManagerWidgetId::ListScrollDown => {
                 let len = self.visible_indices().len();
                 self.scroll = (self.scroll + 1).min(len.saturating_sub(1));
             }
-            ModMenuWidgetId::ModRow(row) => {
+            ModManagerWidgetId::ModRow(row) => {
                 if row < self.visible_indices().len() {
                     self.selected = row;
                 }
             }
-            ModMenuWidgetId::ToggleEnabled => self.toggle_selected(),
-            ModMenuWidgetId::DownloadMissingDeps => {
+            ModManagerWidgetId::ToggleEnabled => self.toggle_selected(),
+            ModManagerWidgetId::DownloadMissingDeps => {
                 if let Some(entry) = self.selected_entry() {
                     if !entry.missing_deps.is_empty() {
-                        return vec![ModMenuAction::DownloadMissingFromModrinth {
+                        return vec![ModManagerAction::DownloadMissingFromModrinth {
                             mod_id: entry.mod_id.clone(),
                             missing_deps: entry.missing_deps.clone(),
                         }];
                     }
                 }
             }
-            ModMenuWidgetId::ConfigureMod => {
+            ModManagerWidgetId::ConfigureMod => {
                 if let Some(entry) = self.selected_entry() {
                     if entry.has_config {
-                        return vec![ModMenuAction::ConfigureMod(entry.mod_id.clone())];
+                        return vec![ModManagerAction::ConfigureMod(entry.mod_id.clone())];
                     }
                 }
             }
-            ModMenuWidgetId::LinkWebsite
-            | ModMenuWidgetId::LinkIssues
-            | ModMenuWidgetId::LinkSource
-            | ModMenuWidgetId::LinkModrinth => {
+            ModManagerWidgetId::LinkWebsite
+            | ModManagerWidgetId::LinkIssues
+            | ModManagerWidgetId::LinkSource
+            | ModManagerWidgetId::LinkModrinth => {
                 if let Some(entry) = self.selected_entry() {
                     let url = match id {
-                        ModMenuWidgetId::LinkWebsite => &entry.website_url,
-                        ModMenuWidgetId::LinkIssues => &entry.issues_url,
-                        ModMenuWidgetId::LinkSource => &entry.source_url,
+                        ModManagerWidgetId::LinkWebsite => &entry.website_url,
+                        ModManagerWidgetId::LinkIssues => &entry.issues_url,
+                        ModManagerWidgetId::LinkSource => &entry.source_url,
                         _ => &entry.modrinth_url,
                     };
                     if !url.is_empty() {
-                        return vec![ModMenuAction::OpenUrl(url.clone())];
+                        return vec![ModManagerAction::OpenUrl(url.clone())];
                     }
                 }
             }
-            ModMenuWidgetId::InstallRecommended => {
+            ModManagerWidgetId::InstallRecommended => {
                 if self.browsing_catalog() {
                     if let Some(entry) = self.selected_entry() {
-                        return vec![ModMenuAction::OpenUrl(entry.modrinth_url.clone())];
+                        return vec![ModManagerAction::OpenUrl(entry.modrinth_url.clone())];
                     }
                 }
             }
-            ModMenuWidgetId::AddFromModrinth => {
-                return vec![ModMenuAction::OpenModrinthBrowser];
+            ModManagerWidgetId::AddFromModrinth => {
+                return vec![ModManagerAction::OpenModrinthBrowser];
             }
-            ModMenuWidgetId::OpenModsFolder => {
-                return vec![ModMenuAction::OpenModsFolder];
+            ModManagerWidgetId::OpenModsFolder => {
+                return vec![ModManagerAction::OpenModsFolder];
             }
-            ModMenuWidgetId::ApplyChanges => {
+            ModManagerWidgetId::ApplyChanges => {
                 if let Some(action) = self.apply() {
                     return vec![action];
                 }
             }
-            ModMenuWidgetId::Done => return vec![ModMenuAction::Close],
+            ModManagerWidgetId::Done => return vec![ModManagerAction::Close],
         }
         Vec::new()
     }
 
-    fn set_filter(&mut self, filter: ModMenuFilter) {
+    fn set_filter(&mut self, filter: ModManagerFilter) {
         if self.filter != filter {
             self.filter = filter;
             self.after_view_change();
@@ -1739,7 +1739,7 @@ impl ModMenuState {
     }
 
     fn set_recommended_category(&mut self, category: QolSubCategory) {
-        if self.filter == ModMenuFilter::RecommendedQol {
+        if self.filter == ModManagerFilter::RecommendedQol {
             self.recommended_category =
                 (self.recommended_category != Some(category)).then_some(category);
             self.after_view_change();
@@ -1747,7 +1747,7 @@ impl ModMenuState {
     }
 
     fn set_browse_category(&mut self, category: BrowseCategory) {
-        if self.filter == ModMenuFilter::Browse && self.browse_category != category {
+        if self.filter == ModManagerFilter::Browse && self.browse_category != category {
             self.browse_category = category;
             self.after_view_change();
         }
@@ -1755,7 +1755,7 @@ impl ModMenuState {
 
     /// The widget under `(x, y)` in a `width`×`height` frame, if any
     /// (physical pixels; regions are recomputed from the current state).
-    pub fn widget_at(&self, width: u32, height: u32, x: i32, y: i32) -> Option<ModMenuWidgetId> {
+    pub fn widget_at(&self, width: u32, height: u32, x: i32, y: i32) -> Option<ModManagerWidgetId> {
         self.render(width, height)
             .1
             .iter()
@@ -1768,7 +1768,7 @@ impl ModMenuState {
     /// must perform. `width`/`height` are the frame's physical pixels, used
     /// for pointer hit-testing and page-step size.
     ///
-    /// Keyboard/gamepad semantics (ModMenu-style):
+    /// Keyboard/gamepad semantics (ModManager-style):
     ///
     /// * typing appends to the search and focuses it; `Backspace` edits it;
     /// * `Up`/`Down` wrap through the visible list, `Left`/`Right` page it;
@@ -1781,7 +1781,7 @@ impl ModMenuState {
         ev: UiInputEvent,
         width: u32,
         height: u32,
-    ) -> Vec<ModMenuAction> {
+    ) -> Vec<ModManagerAction> {
         match ev {
             UiInputEvent::MouseMove { x, y } => {
                 self.hover = self.widget_at(width, height, x, y);
@@ -1789,7 +1789,7 @@ impl ModMenuState {
             }
             UiInputEvent::Click { x, y } => match self.widget_at(width, height, x, y) {
                 Some(id) => {
-                    if id != ModMenuWidgetId::SearchField {
+                    if id != ModManagerWidgetId::SearchField {
                         self.search_focused = false;
                     }
                     self.activate(id)
@@ -1812,13 +1812,13 @@ impl ModMenuState {
                 GamepadButton::DpadRight => self.handle_key(UiKey::Right, height),
                 GamepadButton::South => self.handle_key(UiKey::Enter, height),
                 GamepadButton::East | GamepadButton::Start => {
-                    vec![ModMenuAction::Close]
+                    vec![ModManagerAction::Close]
                 }
             },
         }
     }
 
-    fn handle_key(&mut self, key: UiKey, height: u32) -> Vec<ModMenuAction> {
+    fn handle_key(&mut self, key: UiKey, height: u32) -> Vec<ModManagerAction> {
         match key {
             UiKey::Up => self.move_selection(-1, true),
             UiKey::Down => self.move_selection(1, true),
@@ -1831,7 +1831,7 @@ impl ModMenuState {
                 if self.search_focused {
                     self.search_focused = false;
                 } else if self.browsing_catalog() {
-                    return self.activate(ModMenuWidgetId::InstallRecommended);
+                    return self.activate(ModManagerWidgetId::InstallRecommended);
                 } else {
                     self.toggle_selected();
                 }
@@ -1841,7 +1841,7 @@ impl ModMenuState {
                     self.after_view_change();
                 }
             }
-            UiKey::Escape => return vec![ModMenuAction::Close],
+            UiKey::Escape => return vec![ModManagerAction::Close],
         }
         Vec::new()
     }
@@ -1860,7 +1860,7 @@ impl ModMenuState {
     /// in logical pixels and multiplied by [`effective_scale`](Self::effective_scale)
     /// on emit, so the same layout serves `640×360` through `3840×2160` and
     /// every emitted hit region is pixel-identical to its widget's visuals.
-    pub fn render(&self, width: u32, height: u32) -> (UiDrawList, Vec<ModMenuHitRegion>) {
+    pub fn render(&self, width: u32, height: u32) -> (UiDrawList, Vec<ModManagerHitRegion>) {
         let mut lay = Lay::new(self, width, height);
         let mut hits = Vec::new();
         if lay.w < 220 || lay.h < 150 {
@@ -1897,15 +1897,15 @@ impl ModMenuState {
         (lay.finish(), hits)
     }
 
-    fn render_header(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
+    fn render_header(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let lang = self.lang;
         let visible = self.visible_indices().len();
         let total = self.browsed_entries().len();
         let title = format!(
             "{} ({} / {})",
             match self.filter {
-                ModMenuFilter::RecommendedQol => tr(lang, "Recommended QoL", "おすすめQoL"),
-                ModMenuFilter::Browse => tr(lang, "Recommended", "おすすめ Mod"),
+                ModManagerFilter::RecommendedQol => tr(lang, "Recommended QoL", "おすすめQoL"),
+                ModManagerFilter::Browse => tr(lang, "Recommended", "おすすめ Mod"),
                 _ => tr(lang, "Mods & Packs", "Modとパック"),
             },
             visible,
@@ -1944,7 +1944,7 @@ impl ModMenuState {
         let cells = ((field.w as i32 - 10) / 8).max(1) as usize;
         let query = self.active_query();
         if query.is_empty() && !self.search_focused {
-            let placeholder = if self.filter == ModMenuFilter::Browse {
+            let placeholder = if self.filter == ModManagerFilter::Browse {
                 tr(lang, "Search Modrinth...", "Modrinthを検索...")
             } else {
                 tr(lang, "Search mods...", "Modを検索...")
@@ -1972,12 +1972,12 @@ impl ModMenuState {
             }
             lay.text_fit(field.x + 5, field.y + 4, 1, palette::TEXT, &shown, cells);
         }
-        lay.region(hits, ModMenuWidgetId::SearchField, field);
+        lay.region(hits, ModManagerWidgetId::SearchField, field);
 
         let clear = UiRect::new(field.right() + 4, SEARCH_Y, clear_w as u32, 16);
         let clear_bg = if query.is_empty() {
             palette::BUTTON_DISABLED
-        } else if self.hover == Some(ModMenuWidgetId::SearchClear) {
+        } else if self.hover == Some(ModManagerWidgetId::SearchClear) {
             palette::DANGER
         } else {
             palette::BUTTON
@@ -1994,11 +1994,11 @@ impl ModMenuState {
             "x",
         );
         if !query.is_empty() {
-            lay.region(hits, ModMenuWidgetId::SearchClear, clear);
+            lay.region(hits, ModManagerWidgetId::SearchClear, clear);
         }
 
         let sort = UiRect::new(lay.w - MARGIN - sort_w, SEARCH_Y, sort_w as u32, 16);
-        let sort_bg = if self.hover == Some(ModMenuWidgetId::SortMode) {
+        let sort_bg = if self.hover == Some(ModManagerWidgetId::SortMode) {
             palette::BUTTON_HOVER
         } else {
             palette::BUTTON
@@ -2006,34 +2006,34 @@ impl ModMenuState {
         lay.fill_rect(sort, sort_bg);
         lay.border_rect(sort, palette::BUTTON_BORDER);
         lay.ctext_in(sort, 1, palette::TEXT, &fit_text(&sort_label, 12));
-        lay.region(hits, ModMenuWidgetId::SortMode, sort);
+        lay.region(hits, ModManagerWidgetId::SortMode, sort);
     }
 
-    fn render_filter_row(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
+    fn render_filter_row(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let lang = self.lang;
-        let pills: Vec<(String, ModMenuWidgetId, bool)> = if self.filter == ModMenuFilter::Browse
+        let pills: Vec<(String, ModManagerWidgetId, bool)> = if self.filter == ModManagerFilter::Browse
         {
             // Unified browse: Installed keeps the left slot, then the
             // three shelves and the live-search project kind.
             vec![
                 (
                     tr(lang, "Installed", "インストール済").to_owned(),
-                    ModMenuWidgetId::FilterAll,
+                    ModManagerWidgetId::FilterAll,
                     false,
                 ),
                 (
                     BrowseCategory::QolHud.label(lang).to_owned(),
-                    ModMenuWidgetId::BrowseQolHud,
+                    ModManagerWidgetId::BrowseQolHud,
                     self.browse_category == BrowseCategory::QolHud,
                 ),
                 (
                     BrowseCategory::Content.label(lang).to_owned(),
-                    ModMenuWidgetId::BrowseContent,
+                    ModManagerWidgetId::BrowseContent,
                     self.browse_category == BrowseCategory::Content,
                 ),
                 (
                     BrowseCategory::Packs.label(lang).to_owned(),
-                    ModMenuWidgetId::BrowsePacks,
+                    ModManagerWidgetId::BrowsePacks,
                     self.browse_category == BrowseCategory::Packs,
                 ),
                 (
@@ -2042,40 +2042,40 @@ impl ModMenuState {
                         tr(lang, "Kind", "タイプ"),
                         self.browse_project_kind.label()
                     ),
-                    ModMenuWidgetId::BrowseKind,
+                    ModManagerWidgetId::BrowseKind,
                     false,
                 ),
             ]
-        } else if self.filter == ModMenuFilter::RecommendedQol {
+        } else if self.filter == ModManagerFilter::RecommendedQol {
             vec![
                 (
                     tr(lang, "Installed", "インストール済").to_owned(),
-                    ModMenuWidgetId::FilterAll,
+                    ModManagerWidgetId::FilterAll,
                     false,
                 ),
                 (
                     "Recommended QoL".to_owned(),
-                    ModMenuWidgetId::FilterRecommendedQol,
+                    ModManagerWidgetId::FilterRecommendedQol,
                     self.recommended_category.is_none(),
                 ),
                 (
                     "HUD".to_owned(),
-                    ModMenuWidgetId::QolHudInfo,
+                    ModManagerWidgetId::QolHudInfo,
                     self.recommended_category == Some(QolSubCategory::HudInfo),
                 ),
                 (
                     "Inventory".to_owned(),
-                    ModMenuWidgetId::QolInventoryInput,
+                    ModManagerWidgetId::QolInventoryInput,
                     self.recommended_category == Some(QolSubCategory::InventoryInput),
                 ),
                 (
                     "Recipes".to_owned(),
-                    ModMenuWidgetId::QolRecipes,
+                    ModManagerWidgetId::QolRecipes,
                     self.recommended_category == Some(QolSubCategory::Recipes),
                 ),
                 (
                     "Visuals".to_owned(),
-                    ModMenuWidgetId::QolVisualsCompat,
+                    ModManagerWidgetId::QolVisualsCompat,
                     self.recommended_category == Some(QolSubCategory::VisualsCompat),
                 ),
             ]
@@ -2083,32 +2083,32 @@ impl ModMenuState {
             vec![
                 (
                     tr(lang, "All", "すべて").to_owned(),
-                    ModMenuWidgetId::FilterAll,
-                    self.filter == ModMenuFilter::All,
+                    ModManagerWidgetId::FilterAll,
+                    self.filter == ModManagerFilter::All,
                 ),
                 (
                     tr(lang, "Enabled", "有効").to_owned(),
-                    ModMenuWidgetId::FilterEnabled,
-                    self.filter == ModMenuFilter::Enabled,
+                    ModManagerWidgetId::FilterEnabled,
+                    self.filter == ModManagerFilter::Enabled,
                 ),
                 (
                     tr(lang, "Issues", "問題あり").to_owned(),
-                    ModMenuWidgetId::FilterIssues,
-                    self.filter == ModMenuFilter::Issues,
+                    ModManagerWidgetId::FilterIssues,
+                    self.filter == ModManagerFilter::Issues,
                 ),
                 (
                     tr(lang, "Native", "ネイティブ").to_owned(),
-                    ModMenuWidgetId::FilterNative,
-                    self.filter == ModMenuFilter::Native,
+                    ModManagerWidgetId::FilterNative,
+                    self.filter == ModManagerFilter::Native,
                 ),
                 (
                     "QoL".to_owned(),
-                    ModMenuWidgetId::FilterRecommendedQol,
+                    ModManagerWidgetId::FilterRecommendedQol,
                     false,
                 ),
                 (
                     tr(lang, "+ Browse", "+ ブラウズ").to_owned(),
-                    ModMenuWidgetId::FilterBrowse,
+                    ModManagerWidgetId::FilterBrowse,
                     false,
                 ),
                 (
@@ -2118,7 +2118,7 @@ impl ModMenuState {
                         tr(lang, "Libs: OFF", "ライブラリ: OFF")
                     }
                     .to_owned(),
-                    ModMenuWidgetId::ToggleLibraries,
+                    ModManagerWidgetId::ToggleLibraries,
                     self.show_libraries,
                 ),
             ]
@@ -2154,7 +2154,7 @@ impl ModMenuState {
         }
     }
 
-    fn render_panes(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
+    fn render_panes(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let inner_w = lay.w - 2 * MARGIN - 8;
         // Keep at least a sliver of detail pane at minimum-width windows.
         let min_list_w = 140.min((inner_w - PANE_GAP - 40).max(30));
@@ -2215,7 +2215,7 @@ impl ModMenuState {
             let entry = &self.browsed_entries()[entry_index];
             let enabled = self.enabled_at(entry_index);
             let is_sel = row_slot == self.selected;
-            let is_hover = self.hover == Some(ModMenuWidgetId::ModRow(row_slot));
+            let is_hover = self.hover == Some(ModManagerWidgetId::ModRow(row_slot));
             lay.fill_rect(
                 row,
                 if is_sel {
@@ -2282,7 +2282,7 @@ impl ModMenuState {
                 &fit_text(&sub, ((rows_w - 10) / 8).max(1) as usize),
                 ((rows_w - 10) / 8).max(1) as usize,
             );
-            lay.region(hits, ModMenuWidgetId::ModRow(row_slot), row);
+            lay.region(hits, ModManagerWidgetId::ModRow(row_slot), row);
         }
 
         if scrollable {
@@ -2304,8 +2304,8 @@ impl ModMenuState {
                     track.y + ((scroll as i64 * travel) / max_scroll.max(1) as i64) as i32;
                 lay.fill_rect(UiRect::new(sb_x, thumb_y, 10, thumb_h), palette::TEXT_DIM);
             }
-            lay.region(hits, ModMenuWidgetId::ListScrollUp, up);
-            lay.region(hits, ModMenuWidgetId::ListScrollDown, down);
+            lay.region(hits, ModManagerWidgetId::ListScrollUp, up);
+            lay.region(hits, ModManagerWidgetId::ListScrollDown, down);
         }
 
         // ---- right pane: selected mod details --------------------------
@@ -2316,7 +2316,7 @@ impl ModMenuState {
             // The Packs shelf holds no curated metadata — point the
             // empty view at the live Modrinth search for the selected
             // project kind instead of a bare "Select a mod".
-            if self.filter == ModMenuFilter::Browse
+            if self.filter == ModManagerFilter::Browse
                 && self.browse_category == BrowseCategory::Packs
             {
                 let cells = ((detail_w - 12) / 8).max(1) as usize;
@@ -2346,7 +2346,7 @@ impl ModMenuState {
                 let kind_btn = UiRect::new(detail_x + 6, top + 16, kind_w.max(24) as u32, 14);
                 lay.fill_rect(
                     kind_btn,
-                    if self.hover == Some(ModMenuWidgetId::BrowseKind) {
+                    if self.hover == Some(ModManagerWidgetId::BrowseKind) {
                         palette::BUTTON_HOVER
                     } else {
                         palette::BUTTON
@@ -2354,13 +2354,13 @@ impl ModMenuState {
                 );
                 lay.border_rect(kind_btn, palette::BUTTON_BORDER);
                 lay.ctext_in(kind_btn, 1, palette::TEXT, &kind_label);
-                lay.region(hits, ModMenuWidgetId::BrowseKind, kind_btn);
+                lay.region(hits, ModManagerWidgetId::BrowseKind, kind_btn);
                 let label = tr(self.lang, "Search Modrinth", "Modrinthで検索");
                 let btn_w = (crate::draw::text_width(label, 1) as i32 + 12).min(detail_w - 12);
                 let btn = UiRect::new(detail_x + 6, top + 34, btn_w.max(24) as u32, 14);
                 lay.fill_rect(
                     btn,
-                    if self.hover == Some(ModMenuWidgetId::ModrinthSearch) {
+                    if self.hover == Some(ModManagerWidgetId::ModrinthSearch) {
                         palette::BUTTON_HOVER
                     } else {
                         palette::BUTTON
@@ -2368,7 +2368,7 @@ impl ModMenuState {
                 );
                 lay.border_rect(btn, palette::BUTTON_BORDER);
                 lay.ctext_in(btn, 1, palette::TEXT, label);
-                lay.region(hits, ModMenuWidgetId::ModrinthSearch, btn);
+                lay.region(hits, ModManagerWidgetId::ModrinthSearch, btn);
                 return;
             }
             lay.text_fit(
@@ -2387,7 +2387,7 @@ impl ModMenuState {
     fn render_detail(
         &self,
         lay: &mut Lay,
-        hits: &mut Vec<ModMenuHitRegion>,
+        hits: &mut Vec<ModManagerHitRegion>,
         pane: UiRect,
         entry_index: usize,
     ) {
@@ -2395,7 +2395,7 @@ impl ModMenuState {
         let entry = &self.browsed_entries()[entry_index];
         let meta_info = self.catalog_meta(entry_index);
         let catalog = meta_info.is_some();
-        let browse = self.filter == ModMenuFilter::Browse;
+        let browse = self.filter == ModManagerFilter::Browse;
         let enabled = self.enabled_at(entry_index);
         let tx = pane.x + 6;
         let tw = (pane.w as i32 - 12).max(8);
@@ -2403,7 +2403,7 @@ impl ModMenuState {
 
         // ---- action row geometry (anchored to the pane bottom) ---------
         // Buttons: Enable/Disable + Configure + optional links.
-        let mut buttons: Vec<(ModMenuWidgetId, String, bool)> = Vec::new();
+        let mut buttons: Vec<(ModManagerWidgetId, String, bool)> = Vec::new();
         let toggle_label = if enabled {
             tr(lang, "Disable", "無効化")
         } else {
@@ -2411,47 +2411,47 @@ impl ModMenuState {
         };
         if catalog {
             buttons.push((
-                ModMenuWidgetId::InstallRecommended,
+                ModManagerWidgetId::InstallRecommended,
                 tr(lang, "Get on Modrinth", "Modrinthで入手").to_owned(),
                 true,
             ));
             if browse {
                 buttons.push((
-                    ModMenuWidgetId::ModrinthSearch,
+                    ModManagerWidgetId::ModrinthSearch,
                     tr(lang, "Search Modrinth", "Modrinthで検索").to_owned(),
                     true,
                 ));
             }
         } else {
             buttons.push((
-                ModMenuWidgetId::ToggleEnabled,
+                ModManagerWidgetId::ToggleEnabled,
                 toggle_label.to_owned(),
                 true,
             ));
             buttons.push((
-                ModMenuWidgetId::ConfigureMod,
+                ModManagerWidgetId::ConfigureMod,
                 tr(lang, "Configure", "設定").to_owned(),
                 entry.has_config,
             ));
         }
         for (id, url, label) in [
             (
-                ModMenuWidgetId::LinkWebsite,
+                ModManagerWidgetId::LinkWebsite,
                 &entry.website_url,
                 tr(lang, "Website", "サイト"),
             ),
             (
-                ModMenuWidgetId::LinkIssues,
+                ModManagerWidgetId::LinkIssues,
                 &entry.issues_url,
                 tr(lang, "Issues", "課題"),
             ),
             (
-                ModMenuWidgetId::LinkSource,
+                ModManagerWidgetId::LinkSource,
                 &entry.source_url,
                 tr(lang, "Source", "ソース"),
             ),
             (
-                ModMenuWidgetId::LinkModrinth,
+                ModManagerWidgetId::LinkModrinth,
                 &entry.modrinth_url,
                 "Modrinth",
             ),
@@ -2463,7 +2463,7 @@ impl ModMenuState {
         // Flow-wrap buttons into rows anchored at the pane bottom.
         let btn_h = 14;
         let btn_gap = 4;
-        let mut rows: Vec<Vec<(ModMenuWidgetId, String, bool, i32)>> = vec![Vec::new()];
+        let mut rows: Vec<Vec<(ModManagerWidgetId, String, bool, i32)>> = vec![Vec::new()];
         let mut row_w = 0;
         for (id, label, live) in buttons {
             let w = (crate::draw::text_width(&label, 1) as i32 + 12).min(tw);
@@ -2546,7 +2546,7 @@ impl ModMenuState {
             }
             let btn_w = (crate::draw::text_width(missing_label, 1) as i32 + 12).min(tw - 8);
             let btn = UiRect::new(warn.x + 4, warn.bottom() - 16, btn_w.max(0) as u32, 14);
-            let bg = if self.hover == Some(ModMenuWidgetId::DownloadMissingDeps) {
+            let bg = if self.hover == Some(ModManagerWidgetId::DownloadMissingDeps) {
                 palette::BUTTON_HOVER
             } else {
                 palette::WARNING
@@ -2559,7 +2559,7 @@ impl ModMenuState {
                 palette::TEXT_DARK,
                 &fit_text(missing_label, ((btn_w - 8) / 8).max(1) as usize),
             );
-            lay.region(hits, ModMenuWidgetId::DownloadMissingDeps, btn);
+            lay.region(hits, ModManagerWidgetId::DownloadMissingDeps, btn);
             warn_bottom = warn.y - 4;
         }
 
@@ -2834,18 +2834,18 @@ impl ModMenuState {
         w + 4
     }
 
-    fn render_footer(&self, lay: &mut Lay, hits: &mut Vec<ModMenuHitRegion>) {
+    fn render_footer(&self, lay: &mut Lay, hits: &mut Vec<ModManagerHitRegion>) {
         let lang = self.lang;
         // Row 1 (upper): [+ Add from Modrinth] [Open Mods Folder]
         let y1 = lay.h - 4 - 16 - 4 - 16;
         let mut x = MARGIN + 4;
         for (id, label) in [
             (
-                ModMenuWidgetId::AddFromModrinth,
+                ModManagerWidgetId::AddFromModrinth,
                 tr(lang, "+ Add from Modrinth", "Modrinthから追加"),
             ),
             (
-                ModMenuWidgetId::OpenModsFolder,
+                ModManagerWidgetId::OpenModsFolder,
                 tr(lang, "Open Mods Folder", "Modフォルダを開く"),
             ),
         ] {
@@ -2897,7 +2897,7 @@ impl ModMenuState {
             let apply = UiRect::new(done.x - 6 - apply_w, y2, apply_w as u32, 16);
             let apply_bg = if !dirty {
                 palette::BUTTON_DISABLED
-            } else if self.hover == Some(ModMenuWidgetId::ApplyChanges) {
+            } else if self.hover == Some(ModManagerWidgetId::ApplyChanges) {
                 palette::BUTTON_HOVER
             } else {
                 palette::ACCENT
@@ -2915,11 +2915,11 @@ impl ModMenuState {
                 &apply_label,
             );
             if dirty {
-                lay.region(hits, ModMenuWidgetId::ApplyChanges, apply);
+                lay.region(hits, ModManagerWidgetId::ApplyChanges, apply);
             }
         }
 
-        let done_bg = if self.hover == Some(ModMenuWidgetId::Done) {
+        let done_bg = if self.hover == Some(ModManagerWidgetId::Done) {
             palette::BUTTON_HOVER
         } else {
             palette::BUTTON
@@ -2927,7 +2927,7 @@ impl ModMenuState {
         lay.fill_rect(done, done_bg);
         lay.border_rect(done, palette::BUTTON_BORDER);
         lay.ctext_in(done, 1, palette::TEXT, done_label);
-        lay.region(hits, ModMenuWidgetId::Done, done);
+        lay.region(hits, ModManagerWidgetId::Done, done);
     }
 }
 
@@ -2959,7 +2959,7 @@ struct Lay {
 }
 
 impl Lay {
-    fn new(state: &ModMenuState, width: u32, height: u32) -> Self {
+    fn new(state: &ModManagerState, width: u32, height: u32) -> Self {
         let s = state.effective_scale(height) as i32;
         Self {
             list: UiDrawList::new(),
@@ -3030,7 +3030,7 @@ impl Lay {
             .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
-    fn region(&self, hits: &mut Vec<ModMenuHitRegion>, id: ModMenuWidgetId, r: UiRect) {
+    fn region(&self, hits: &mut Vec<ModManagerHitRegion>, id: ModManagerWidgetId, r: UiRect) {
         let p = self.phys(r);
         let (x0, y0) = (p.x.max(0), p.y.max(0));
         let (x1, y1) = (
@@ -3040,7 +3040,7 @@ impl Lay {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
-        hits.push(ModMenuHitRegion {
+        hits.push(ModManagerHitRegion {
             rect: UiRect::new(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32),
             id,
         });
@@ -3217,7 +3217,7 @@ mod tests {
 
     #[test]
     fn browse_dedupes_shared_slugs_and_community_metadata_wins() {
-        let menu = ModMenuState::default();
+        let menu = ModManagerState::default();
         // 7 community entries + 11 curated picks the community list does
         // not already cover = 18 unique rows.
         assert_eq!(menu.browse_entries.len(), 18);
@@ -3244,32 +3244,32 @@ mod tests {
 
     #[test]
     fn browse_categories_split_the_catalog_cleanly() {
-        let mut menu = ModMenuState::new(vec![ModMenuEntry::new("mine", "Mine", "1.0")]);
-        menu.activate(ModMenuWidgetId::FilterBrowse);
-        assert_eq!(menu.filter, ModMenuFilter::Browse);
+        let mut menu = ModManagerState::new(vec![ModManagerEntry::new("mine", "Mine", "1.0")]);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
+        assert_eq!(menu.filter, ModManagerFilter::Browse);
         assert_eq!(menu.browse_category, BrowseCategory::QolHud);
         // QoL & HUD: 4 community HUD/inventory picks + all 11
         // non-overlapping curated QoL mods.
         assert_eq!(menu.visible_indices().len(), 15);
-        menu.activate(ModMenuWidgetId::BrowseContent);
+        menu.activate(ModManagerWidgetId::BrowseContent);
         assert_eq!(menu.browse_category, BrowseCategory::Content);
         assert_eq!(menu.visible_indices().len(), 3);
         // The Packs shelf is empty: no pack metadata ships in the client.
-        menu.activate(ModMenuWidgetId::BrowsePacks);
+        menu.activate(ModManagerWidgetId::BrowsePacks);
         assert_eq!(menu.browse_category, BrowseCategory::Packs);
         assert!(menu.visible_indices().is_empty());
         // Switching categories re-clamps the selection.
-        menu.activate(ModMenuWidgetId::BrowseQolHud);
+        menu.activate(ModManagerWidgetId::BrowseQolHud);
         // Browse never lists installed entries and never stages changes.
         assert!(!menu.is_dirty());
-        menu.activate(ModMenuWidgetId::FilterAll);
+        menu.activate(ModManagerWidgetId::FilterAll);
         assert_eq!(menu.entries.len(), 1);
     }
 
     #[test]
     fn browse_query_filters_locally_and_feeds_live_search_url() {
-        let mut menu = ModMenuState::new(vec![]);
-        menu.activate(ModMenuWidgetId::FilterBrowse);
+        let mut menu = ModManagerState::new(vec![]);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
         // Typing in Browse mode writes `browse_query`, not `search`.
         menu.handle_input(UiInputEvent::CharTyped('j'), 1280, 720);
         menu.handle_input(UiInputEvent::CharTyped('a'), 1280, 720);
@@ -3280,8 +3280,8 @@ mod tests {
         // pinned to the current kind + target version.
         menu.browse_query = "create&a".to_owned();
         menu.browse_project_kind = ModrinthProjectKind::ResourcePack;
-        let actions = menu.activate(ModMenuWidgetId::ModrinthSearch);
-        let [ModMenuAction::OpenUrl(url)] = actions.as_slice() else {
+        let actions = menu.activate(ModManagerWidgetId::ModrinthSearch);
+        let [ModManagerAction::OpenUrl(url)] = actions.as_slice() else {
             panic!("expected one OpenUrl, got {actions:?}");
         };
         assert!(url.starts_with("https://api.modrinth.com/v2/search?"));
@@ -3298,8 +3298,8 @@ mod tests {
 
     #[test]
     fn browse_kind_pill_cycles_project_kinds() {
-        let mut menu = ModMenuState::new(vec![]);
-        menu.activate(ModMenuWidgetId::FilterBrowse);
+        let mut menu = ModManagerState::new(vec![]);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
         assert_eq!(menu.browse_project_kind, ModrinthProjectKind::Mod);
         for expected in [
             ModrinthProjectKind::ResourcePack,
@@ -3307,12 +3307,12 @@ mod tests {
             ModrinthProjectKind::Datapack,
             ModrinthProjectKind::Mod,
         ] {
-            menu.activate(ModMenuWidgetId::BrowseKind);
+            menu.activate(ModManagerWidgetId::BrowseKind);
             assert_eq!(menu.browse_project_kind, expected);
         }
         // The kind lands in the live-search facets.
-        let actions = menu.activate(ModMenuWidgetId::ModrinthSearch);
-        let [ModMenuAction::OpenUrl(url)] = actions.as_slice() else {
+        let actions = menu.activate(ModManagerWidgetId::ModrinthSearch);
+        let [ModManagerAction::OpenUrl(url)] = actions.as_slice() else {
             panic!("expected OpenUrl, got {actions:?}");
         };
         assert!(url.contains("project_type%3Amod"), "{url}");
@@ -3320,14 +3320,14 @@ mod tests {
 
     #[test]
     fn packs_shelf_offers_live_search_button_in_detail_pane() {
-        let mut menu = ModMenuState::new(vec![]);
+        let mut menu = ModManagerState::new(vec![]);
         menu.lang = crate::state::UiLang::Ja;
-        menu.activate(ModMenuWidgetId::FilterBrowse);
-        menu.activate(ModMenuWidgetId::BrowsePacks);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
+        menu.activate(ModManagerWidgetId::BrowsePacks);
         let (draw, hits) = menu.render(1280, 720);
         let search = hits
             .iter()
-            .find(|h| h.id == ModMenuWidgetId::ModrinthSearch)
+            .find(|h| h.id == ModManagerWidgetId::ModrinthSearch)
             .expect("Packs detail pane must offer live search");
         assert!(search.rect.w > 20);
         let texts: Vec<&str> = draw
@@ -3343,7 +3343,7 @@ mod tests {
 
     #[test]
     fn browse_pill_labels_and_status_copy_are_glyph_covered() {
-        let menu = ModMenuState::default();
+        let menu = ModManagerState::default();
         for s in [
             tr(crate::state::UiLang::Ja, "+ Browse", "+ ブラウズ"),
             BrowseCategory::QolHud.label(crate::state::UiLang::Ja),
@@ -3371,9 +3371,9 @@ mod tests {
 
     #[test]
     fn soft_reload_flag_tracks_non_hot_toggles_and_applies() {
-        let mut entry = ModMenuEntry::new("heavy", "Heavy", "1.0");
+        let mut entry = ModManagerEntry::new("heavy", "Heavy", "1.0");
         entry.reload_mode = ModReloadBadge::SoftRestart;
-        let mut menu = ModMenuState::new(vec![entry]);
+        let mut menu = ModManagerState::new(vec![entry]);
         assert!(!menu.needs_soft_reload_on_close());
         // Staging a non-hot toggle marks the close path for soft reload.
         menu.toggle_selected();
@@ -3383,10 +3383,10 @@ mod tests {
         assert!(!menu.needs_soft_reload_on_close());
         // Applying one keeps the flag sticky until the host acknowledges.
         menu.toggle_selected();
-        let actions = menu.activate(ModMenuWidgetId::ApplyChanges);
+        let actions = menu.activate(ModManagerWidgetId::ApplyChanges);
         assert!(matches!(
             actions.as_slice(),
-            [ModMenuAction::ApplyChanges {
+            [ModManagerAction::ApplyChanges {
                 requires_soft_restart: true,
                 ..
             }]
@@ -3396,38 +3396,38 @@ mod tests {
         menu.acknowledge_soft_reload();
         assert!(!menu.needs_soft_reload_on_close());
         // A hot-reload mod alone never trips the flag.
-        let mut hot = ModMenuEntry::new("hot", "Hot", "1.0");
+        let mut hot = ModManagerEntry::new("hot", "Hot", "1.0");
         hot.reload_mode = ModReloadBadge::HotReload;
-        let mut menu = ModMenuState::new(vec![hot]);
+        let mut menu = ModManagerState::new(vec![hot]);
         menu.toggle_selected();
         assert!(!menu.needs_soft_reload_on_close());
     }
 
     #[test]
     fn browse_view_lists_every_entry_and_installs_via_modrinth() {
-        let mut menu = ModMenuState::new(vec![ModMenuEntry::new("mine", "Mine", "1.0")]);
-        menu.activate(ModMenuWidgetId::FilterBrowse);
-        assert_eq!(menu.filter, ModMenuFilter::Browse);
+        let mut menu = ModManagerState::new(vec![ModManagerEntry::new("mine", "Mine", "1.0")]);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
+        assert_eq!(menu.filter, ModManagerFilter::Browse);
         // Search narrows the catalog by name and by author.
         menu.browse_query = "jade".into();
         assert_eq!(menu.selected_entry().unwrap().mod_id, "jade");
-        let actions = menu.activate(ModMenuWidgetId::InstallRecommended);
+        let actions = menu.activate(ModManagerWidgetId::InstallRecommended);
         assert_eq!(
             actions,
-            [ModMenuAction::OpenUrl(
+            [ModManagerAction::OpenUrl(
                 "https://modrinth.com/mod/jade".to_owned()
             )]
         );
         // Catalog browsing never stages enable/disable changes.
         assert!(!menu.is_dirty());
-        menu.activate(ModMenuWidgetId::FilterAll);
+        menu.activate(ModManagerWidgetId::FilterAll);
         assert_eq!(menu.entries.len(), 1);
     }
 
     #[test]
     fn browse_detail_pane_shows_author_license_and_bridge_badge() {
-        let mut menu = ModMenuState::new(vec![]);
-        menu.activate(ModMenuWidgetId::FilterBrowse);
+        let mut menu = ModManagerState::new(vec![]);
+        menu.activate(ModManagerWidgetId::FilterBrowse);
         menu.browse_query = "jade".into();
         let (draw, hits) = menu.render(1280, 720);
         let texts: Vec<&str> = draw
@@ -3447,17 +3447,17 @@ mod tests {
         // The install hook + live search are the only actions offered.
         assert!(hits
             .iter()
-            .any(|h| h.id == ModMenuWidgetId::InstallRecommended));
+            .any(|h| h.id == ModManagerWidgetId::InstallRecommended));
         assert!(hits
             .iter()
-            .any(|h| h.id == ModMenuWidgetId::ModrinthSearch));
-        assert!(!hits.iter().any(|h| h.id == ModMenuWidgetId::ToggleEnabled));
+            .any(|h| h.id == ModManagerWidgetId::ModrinthSearch));
+        assert!(!hits.iter().any(|h| h.id == ModManagerWidgetId::ToggleEnabled));
         // The browse pill exists in the installed filter row too.
-        let mut menu = ModMenuState::new(vec![]);
+        let mut menu = ModManagerState::new(vec![]);
         menu.lang = crate::state::UiLang::Ja;
         let (_, hits) = menu.render(1280, 720);
         assert!(hits
             .iter()
-            .any(|h| h.id == ModMenuWidgetId::FilterBrowse));
+            .any(|h| h.id == ModManagerWidgetId::FilterBrowse));
     }
 }

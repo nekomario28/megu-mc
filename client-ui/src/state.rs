@@ -25,7 +25,14 @@
 
 use megu_core::crash_report::CrashContext;
 use megu_core::i18n::{ALL_BUILTIN_LOCALES, BuiltinLocale, I18nCatalog, UiTextKey};
-use megu_core::sys_metrics::{CpuSampler, MiniHudConfig, MiniHudData, sample_host_metrics};
+use megu_core::sys_metrics::{CpuSampler, sample_host_metrics};
+
+/// Neutral public name for the core compact telemetry overlay configuration.
+pub type CompactDebugHudConfig = megu_core::sys_metrics::MiniHudConfig;
+/// Neutral public name for the core compact telemetry overlay frame data.
+pub type CompactDebugHudData = megu_core::sys_metrics::MiniHudData;
+/// Neutral public name for the core compact telemetry overlay anchor.
+pub type CompactDebugHudAnchor = megu_core::sys_metrics::MiniHudAnchor;
 use std::collections::HashMap;
 
 use crate::draw::UiRect;
@@ -177,10 +184,10 @@ pub enum Screen {
     ModSyncConsent,
     /// Per-server missing/version-mismatched mod diagnosis and download.
     ModSyncPrompt,
-    /// Integrated ModMenu-style Mods & Packs manager — draw and input are
-    /// delegated to [`UiState::mod_menu`].
-    ModMenu,
-    /// JEI-style recipe & resource browser — draw and input are delegated
+    /// Integrated ModManager-style Mods & Packs manager — draw and input are
+    /// delegated to [`UiState::mod_manager`].
+    ModManager,
+    /// recipe and resource browser — draw and input are delegated
     /// to [`UiState::recipe_browser`].
     RecipeBrowser,
     /// In-game HUD (hotbar, vitals, bossbars, chat, tab list).
@@ -669,9 +676,9 @@ pub struct QolSettings {
     pub crash_report_mode: CrashReportMode,
     /// Whether optional Support/Contribute links appear on the title screen.
     pub show_support_links: bool,
-    /// Opt-in MiniHUD overlay; `enabled` stays `false` by default so the
+    /// Opt-in Compact Debug HUD overlay; `enabled` stays `false` by default so the
     /// vanilla-style HUD is untouched until the player turns it on.
-    pub mini_hud: MiniHudConfig,
+    pub compact_debug_hud: CompactDebugHudConfig,
     /// Directional accessibility subtitles — opt-in (`false` by default).
     pub show_subtitles: bool,
     /// Opt-in auto-reconnect on unexpected drops
@@ -697,7 +704,7 @@ pub struct QolSettings {
     pub chat_scroll_lock: bool,
     /// Non-intrusive top-right toast stack — `true` by default.
     pub toast_notifications: bool,
-    /// JEI/EMI-style recipe browser side panels beside open container
+    /// Recipe browser side panels beside open container
     /// screens — `false` by default (opt-in; `Ctrl+O` toggles it
     /// in-game too).
     pub recipe_overlay_enabled: bool,
@@ -713,7 +720,7 @@ impl Default for QolSettings {
             retain_chat_on_reconnect: true,
             crash_report_mode: CrashReportMode::Ask,
             show_support_links: true,
-            mini_hud: MiniHudConfig::default(),
+            compact_debug_hud: CompactDebugHudConfig::default(),
             show_subtitles: false,
             // Opinionated gameplay helpers are strictly opt-in; pure-UX
             // improvements ship on. The four mod-overlapping helpers
@@ -732,9 +739,9 @@ impl Default for QolSettings {
     }
 }
 
-/// Coarse MiniHUD preset the QoL toggle cycles through.
+/// Coarse Compact Debug HUD preset the QoL toggle cycles through.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum MiniHudPreset {
+pub enum CompactDebugHudPreset {
     /// Overlay hidden (default).
     #[default]
     Off,
@@ -746,21 +753,21 @@ pub enum MiniHudPreset {
 }
 
 impl QolSettings {
-    /// The preset the QoL MiniHUD toggle reports: `Off` while
-    /// `mini_hud.enabled` is `false`, `Advanced` when every advanced
+    /// The preset the QoL Compact Debug HUD toggle reports: `Off` while
+    /// `compact_debug_hud.enabled` is `false`, `Advanced` when every advanced
     /// segment is on, `Basic` otherwise.
-    pub fn mini_hud_preset(&self) -> MiniHudPreset {
-        if !self.mini_hud.enabled {
-            MiniHudPreset::Off
-        } else if self.mini_hud_is_advanced() {
-            MiniHudPreset::Advanced
+    pub fn compact_debug_hud_preset(&self) -> CompactDebugHudPreset {
+        if !self.compact_debug_hud.enabled {
+            CompactDebugHudPreset::Off
+        } else if self.compact_debug_hud_is_advanced() {
+            CompactDebugHudPreset::Advanced
         } else {
-            MiniHudPreset::Basic
+            CompactDebugHudPreset::Basic
         }
     }
 
-    fn mini_hud_is_advanced(&self) -> bool {
-        let m = &self.mini_hud;
+    fn compact_debug_hud_is_advanced(&self) -> bool {
+        let m = &self.compact_debug_hud;
         m.show_one_percent_low
             && m.show_mspt_tps
             && m.show_ram
@@ -772,20 +779,20 @@ impl QolSettings {
             && m.show_shader_audio_status
     }
 
-    /// Cycle the MiniHUD Off → Basic → Advanced → Off, preserving the
+    /// Cycle the Compact Debug HUD Off → Basic → Advanced → Off, preserving the
     /// configured anchor and the player's individual segment choices
     /// while the overlay stays enabled.
-    pub fn cycle_mini_hud(&mut self) {
-        match self.mini_hud_preset() {
-            MiniHudPreset::Off => {
-                self.mini_hud = MiniHudConfig {
+    pub fn cycle_compact_debug_hud(&mut self) {
+        match self.compact_debug_hud_preset() {
+            CompactDebugHudPreset::Off => {
+                self.compact_debug_hud = CompactDebugHudConfig {
                     enabled: true,
-                    anchor: self.mini_hud.anchor,
-                    ..MiniHudConfig::default()
+                    anchor: self.compact_debug_hud.anchor,
+                    ..CompactDebugHudConfig::default()
                 };
             }
-            MiniHudPreset::Basic => {
-                let m = &mut self.mini_hud;
+            CompactDebugHudPreset::Basic => {
+                let m = &mut self.compact_debug_hud;
                 m.show_one_percent_low = true;
                 m.show_mspt_tps = true;
                 m.show_ram = true;
@@ -796,8 +803,8 @@ impl QolSettings {
                 m.show_light_level = true;
                 m.show_shader_audio_status = true;
             }
-            MiniHudPreset::Advanced => {
-                self.mini_hud.enabled = false;
+            CompactDebugHudPreset::Advanced => {
+                self.compact_debug_hud.enabled = false;
             }
         }
     }
@@ -1145,8 +1152,8 @@ pub struct UiSettings {
     pub zoom_divisor_tenths: u16,
     /// Built-in Jade-style looking-at HUD, yielded when Jade is installed.
     pub qol_looking_at_hud: bool,
-    /// Built-in mouse drag tweaks, yielded when Mouse Tweaks is installed.
-    pub qol_mouse_tweaks: bool,
+    /// Built-in inventory drag controls, yielded when an external drag-controls mod is installed.
+    pub inventory_drag_controls: bool,
     /// Built-in inventory sorting, yielded when Inventory Sort is installed.
     pub qol_inventory_sort: bool,
     /// Zsh-style command bar with ghost completions and 8x8 inline badges.
@@ -1178,7 +1185,7 @@ impl Default for UiSettings {
             mouse_sensitivity_pct: 100,
             zoom_divisor_tenths: 40,
             qol_looking_at_hud: true,
-            qol_mouse_tweaks: true,
+            inventory_drag_controls: true,
             qol_inventory_sort: true,
             zsh_command_bar: true,
             fair_play: FairPlaySettings::default(),
@@ -1222,9 +1229,9 @@ impl UiSettings {
         self.qol_looking_at_hud && !jade_installed
     }
 
-    /// Enable the built-in drag behavior only if Mouse Tweaks does not own it.
-    pub fn builtin_mouse_tweaks_active(&self, mouse_tweaks_installed: bool) -> bool {
-        self.qol_mouse_tweaks && !mouse_tweaks_installed
+    /// Enable the built-in drag behavior only if an external drag-controls mod does not own it.
+    pub fn builtin_inventory_drag_controls_active(&self, external_drag_controls_installed: bool) -> bool {
+        self.inventory_drag_controls && !external_drag_controls_installed
     }
 
     /// Enable the built-in sorting only if Inventory Sort does not own it.
@@ -1322,7 +1329,7 @@ pub enum SettingKey {
     MouseSensitivityPct,
     ZoomDivisorTenths,
     QolLookingAtHud,
-    QolMouseTweaks,
+    QolInventoryDragControls,
     QolInventorySort,
     ZshCommandBar,
     QolSmoothZoom,
@@ -1332,7 +1339,7 @@ pub enum SettingKey {
     QolRetainChatOnReconnect,
     QolCrashReportMode,
     QolShowSupportLinks,
-    QolMiniHud,
+    QolCompactDebugHud,
     QolShowSubtitles,
     QolAutoReconnect,
     QolAutoReplenish,
@@ -1440,7 +1447,7 @@ impl SettingsTransaction {
             K::MouseSensitivityPct => current.mouse_sensitivity_pct == opened.mouse_sensitivity_pct,
             K::ZoomDivisorTenths => current.zoom_divisor_tenths == opened.zoom_divisor_tenths,
             K::QolLookingAtHud => current.qol_looking_at_hud == opened.qol_looking_at_hud,
-            K::QolMouseTweaks => current.qol_mouse_tweaks == opened.qol_mouse_tweaks,
+            K::QolInventoryDragControls => current.inventory_drag_controls == opened.inventory_drag_controls,
             K::QolInventorySort => current.qol_inventory_sort == opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar == opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom == opened.qol.smooth_zoom,
@@ -1458,7 +1465,7 @@ impl SettingsTransaction {
             K::QolShowSupportLinks => {
                 current.qol.show_support_links == opened.qol.show_support_links
             }
-            K::QolMiniHud => current.qol.mini_hud == opened.qol.mini_hud,
+            K::QolCompactDebugHud => current.qol.compact_debug_hud == opened.qol.compact_debug_hud,
             K::QolShowSubtitles => current.qol.show_subtitles == opened.qol.show_subtitles,
             K::QolAutoReconnect => current.qol.auto_reconnect == opened.qol.auto_reconnect,
             K::QolAutoReplenish => current.qol.auto_replenish == opened.qol.auto_replenish,
@@ -1572,7 +1579,7 @@ impl SettingsTransaction {
             K::MouseSensitivityPct => current.mouse_sensitivity_pct = opened.mouse_sensitivity_pct,
             K::ZoomDivisorTenths => current.zoom_divisor_tenths = opened.zoom_divisor_tenths,
             K::QolLookingAtHud => current.qol_looking_at_hud = opened.qol_looking_at_hud,
-            K::QolMouseTweaks => current.qol_mouse_tweaks = opened.qol_mouse_tweaks,
+            K::QolInventoryDragControls => current.inventory_drag_controls = opened.inventory_drag_controls,
             K::QolInventorySort => current.qol_inventory_sort = opened.qol_inventory_sort,
             K::ZshCommandBar => current.zsh_command_bar = opened.zsh_command_bar,
             K::QolSmoothZoom => current.qol.smooth_zoom = opened.qol.smooth_zoom,
@@ -1590,7 +1597,7 @@ impl SettingsTransaction {
             K::QolShowSupportLinks => {
                 current.qol.show_support_links = opened.qol.show_support_links
             }
-            K::QolMiniHud => current.qol.mini_hud = opened.qol.mini_hud.clone(),
+            K::QolCompactDebugHud => current.qol.compact_debug_hud = opened.qol.compact_debug_hud.clone(),
             K::QolShowSubtitles => current.qol.show_subtitles = opened.qol.show_subtitles,
             K::QolAutoReconnect => current.qol.auto_reconnect = opened.qol.auto_reconnect,
             K::QolAutoReplenish => current.qol.auto_replenish = opened.qol.auto_replenish,
@@ -1873,8 +1880,8 @@ pub struct HudState {
     pub players: Vec<(String, u16)>,
     /// Optional mana, casting, cooldown, and custom status overlays.
     pub magic: crate::magic_hud::MagicHudState,
-    /// Telemetry snapshot the opt-in MiniHUD overlay reads.
-    pub mini_hud_data: MiniHudData,
+    /// Telemetry snapshot the opt-in Compact Debug HUD overlay reads.
+    pub compact_debug_hud_data: CompactDebugHudData,
     /// Directional subtitle rows, newest last (drawn only when
     /// [`QolSettings::show_subtitles`] is on).
     pub subtitles: Vec<HudSubtitle>,
@@ -2151,7 +2158,7 @@ impl Default for HudState {
             show_player_list: false,
             players: Vec::new(),
             magic: crate::magic_hud::MagicHudState::default(),
-            mini_hud_data: MiniHudData::default(),
+            compact_debug_hud_data: CompactDebugHudData::default(),
             subtitles: Vec::new(),
             subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
@@ -2202,7 +2209,7 @@ impl HudState {
                 ("Megu".to_string(), 88),
             ],
             magic: crate::magic_hud::MagicHudState::default(),
-            mini_hud_data: MiniHudData::default(),
+            compact_debug_hud_data: CompactDebugHudData::default(),
             subtitles: Vec::new(),
             subtitle_hud: crate::subtitle_hud::SubtitleHudState::default(),
             crafting_conflict: CraftingConflictOverlay::default(),
@@ -2431,7 +2438,7 @@ pub enum UiAction {
     /// staged toggles, open the mods folder, fetch deps, ...). `Close`
     /// and `OpenUrl` are flattened into [`UiAction::Back`] /
     /// [`UiAction::OpenUrl`] instead of appearing here.
-    ModMenu(crate::mod_menu::ModMenuAction),
+    ModManager(crate::mod_manager::ModManagerAction),
     /// The recipe & resource browser produced a host action (crafting
     /// grid transfer). `Close` is flattened into [`UiAction::Back`].
     RecipeBrowser(crate::recipe_browser::RecipeBrowserAction),
@@ -2517,7 +2524,7 @@ pub enum WidgetId {
     TabControls,
     ControlKey(usize),
     QolBuiltin(usize),
-    MiniHudSegment(usize),
+    CompactDebugHudSegment(usize),
     VideoFullscreen,
     VideoInvertY,
     VideoGamma,
@@ -2571,7 +2578,7 @@ pub enum WidgetId {
     QolRetainChat,
     QolCrashMode,
     QolShowSupportLinks,
-    QolMiniHud,
+    QolCompactDebugHud,
     QolSubtitles,
     QolAutoReconnect,
     QolAutoReplenish,
@@ -2650,7 +2657,7 @@ pub enum WidgetId {
     // Embedded screens — every region the delegated sub-screens emit is
     // re-tagged into this id space so the unified router stays in charge.
     /// A widget inside the integrated Mods & Packs screen.
-    ModMenu(crate::mod_menu::ModMenuWidgetId),
+    ModManager(crate::mod_manager::ModManagerWidgetId),
     /// A widget inside the recipe & resource browser.
     Recipe(crate::recipe_browser::RecipeWidgetId),
     /// Native chrome on the recipe browser: the close/back button the
@@ -2681,7 +2688,7 @@ impl WidgetId {
                 | Self::VideoEntityShadows
                 | Self::VideoRamBudget
                 | Self::QolBuiltin(_)
-                | Self::MiniHudSegment(_)
+                | Self::CompactDebugHudSegment(_)
                 | Self::ShadersEnabled
                 | Self::VisualPreset
                 | Self::VisualBlocks3d
@@ -2703,7 +2710,7 @@ impl WidgetId {
                 | Self::QolRetainChat
                 | Self::QolCrashMode
                 | Self::QolShowSupportLinks
-                | Self::QolMiniHud
+                | Self::QolCompactDebugHud
                 | Self::QolSubtitles
                 | Self::QolAutoReconnect
                 | Self::QolAutoReplenish
@@ -3232,12 +3239,12 @@ pub struct UiState {
     /// and the `Boot: N ms` telemetry badge.
     pub startup_timeline: Option<StartupTimeline>,
 
-    /// The integrated ModMenu-style Mods & Packs screen
-    /// ([`Screen::ModMenu`]). The host fills `entries`; `lang`/`ui_scale`
+    /// The integrated ModManager-style Mods & Packs screen
+    /// ([`Screen::ModManager`]). The host fills `entries`; `lang`/`ui_scale`
     /// are re-synced from this state on every [`render`](Self::render).
-    pub mod_menu: crate::mod_menu::ModMenuState,
+    pub mod_manager: crate::mod_manager::ModManagerState,
     /// The integrated recipe & resource browser
-    /// ([`Screen::RecipeBrowser`]). The host fills `index`/`ponder`;
+    /// ([`Screen::RecipeBrowser`]). The host fills `index`/`machine_tutorial`;
     /// `lang`/`ui_scale` are re-synced every frame.
     pub recipe_browser: crate::recipe_browser::RecipeBrowserState,
 
@@ -3317,7 +3324,7 @@ impl Default for UiState {
             settings_tx: SettingsTransaction::default(),
             i18n_catalog: None,
             startup_timeline: None,
-            mod_menu: crate::mod_menu::ModMenuState::default(),
+            mod_manager: crate::mod_manager::ModManagerState::default(),
             recipe_browser: crate::recipe_browser::RecipeBrowserState::default(),
             toasts: crate::qol_helpers::ToastQueue::default(),
             keybinds: crate::qol_helpers::KeyBindings::vanilla_defaults(),
@@ -3591,19 +3598,31 @@ impl UiState {
     /// frames emit no text allocations), and `self.hit_regions` is rebuilt
     /// in place keeping its capacity.
     pub fn render_into(&mut self, width: u32, height: u32, out: &mut crate::draw::UiDrawList) {
+        self.render_into_with_gui_atlas(width, height, out, None);
+    }
+
+    /// Buffer-reusing render with the host GUI atlas threaded into HUD
+    /// sprite binding. Passing `None` is identical to [`Self::render_into`].
+    pub fn render_into_with_gui_atlas(
+        &mut self,
+        width: u32,
+        height: u32,
+        out: &mut crate::draw::UiDrawList,
+        gui_atlas: Option<&crate::draw::GuiSpriteAtlas>,
+    ) {
         self.render_w = width;
         self.render_h = height;
         // The embedded screens own their own language/scale mirrors so
         // they can also run standalone; when routed through `UiState`
         // this state is the source of truth.
         let lang = self.lang();
-        self.mod_menu.lang = lang;
-        self.mod_menu.ui_scale = self.ui_scale;
+        self.mod_manager.lang = lang;
+        self.mod_manager.ui_scale = self.ui_scale;
         self.recipe_browser.lang = lang;
         self.recipe_browser.ui_scale = self.ui_scale;
         self.recipe_browser.active_locale = self.settings.locale.code().to_ascii_lowercase();
         let mut regions = std::mem::take(&mut self.hit_regions);
-        layout::layout_screen_into(self, width, height, out, &mut regions);
+        layout::layout_screen_into_with_gui_atlas(self, width, height, out, &mut regions, gui_atlas);
         if self.screen == Screen::InGameHud {
             layout::layout_subtitle_hud(self, &self.hud.subtitle_hud, width, height, out);
             layout::layout_scoreboard_sidebar(self, width, height, out);
@@ -3722,11 +3741,11 @@ impl UiState {
     /// hotkey. Pushes the nav stack so Back returns to the caller's
     /// screen; `lang`/`ui_scale` are copied across immediately (and kept
     /// in sync on every later render).
-    pub fn open_mod_menu(&mut self) -> Vec<UiAction> {
-        self.mod_menu.lang = self.lang();
-        self.mod_menu.ui_scale = self.ui_scale;
-        self.navigate(Screen::ModMenu);
-        vec![UiAction::OpenScreen(Screen::ModMenu)]
+    pub fn open_mod_manager(&mut self) -> Vec<UiAction> {
+        self.mod_manager.lang = self.lang();
+        self.mod_manager.ui_scale = self.ui_scale;
+        self.navigate(Screen::ModManager);
+        vec![UiAction::OpenScreen(Screen::ModManager)]
     }
 
     /// Open the integrated recipe & resource browser — the Pause
@@ -3855,7 +3874,7 @@ impl UiState {
         // back into [`UiAction`]s.
         if self.modal.is_none() {
             match self.screen {
-                Screen::ModMenu => return self.forward_to_mod_menu(ev),
+                Screen::ModManager => return self.forward_to_mod_manager(ev),
                 Screen::RecipeBrowser => return self.forward_to_recipe_browser(ev),
                 _ => {}
             }
@@ -3919,15 +3938,15 @@ impl UiState {
         out
     }
 
-    /// Forward `ev` into [`crate::mod_menu::ModMenuState`] and map its
+    /// Forward `ev` into [`crate::mod_manager::ModManagerState`] and map its
     /// actions back onto [`UiAction`]. Clicks on native chrome (any
-    /// non-`ModMenu` region) are routed by [`handle_click`](Self::handle_click)
+    /// non-`ModManager` region) are routed by [`handle_click`](Self::handle_click)
     /// instead — everything else reaches the sub-screen untouched.
-    fn forward_to_mod_menu(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
+    fn forward_to_mod_manager(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
         match ev {
             UiInputEvent::Click { x, y } => {
                 if let Some(region) = self.hit_regions.iter().find(|r| r.contains(x, y)).copied() {
-                    if !matches!(region.id, WidgetId::ModMenu(_)) {
+                    if !matches!(region.id, WidgetId::ModManager(_)) {
                         return self.handle_click(x, y);
                     }
                 }
@@ -3941,24 +3960,24 @@ impl UiState {
             }
             _ => {}
         }
-        let acts = self.mod_menu.handle_input(ev, self.render_w, self.render_h);
+        let acts = self.mod_manager.handle_input(ev, self.render_w, self.render_h);
         let mut out = Vec::with_capacity(acts.len());
         for action in acts {
             match action {
-                crate::mod_menu::ModMenuAction::Close => {
+                crate::mod_manager::ModManagerAction::Close => {
                     self.back();
                     out.push(UiAction::Back);
                 }
-                crate::mod_menu::ModMenuAction::OpenUrl(url) => {
+                crate::mod_manager::ModManagerAction::OpenUrl(url) => {
                     out.push(UiAction::OpenUrl(url));
                 }
-                other => out.push(UiAction::ModMenu(other)),
+                other => out.push(UiAction::ModManager(other)),
             }
         }
         out
     }
 
-    /// Recipe-browser counterpart of [`forward_to_mod_menu`](Self::forward_to_mod_menu).
+    /// Recipe-browser counterpart of [`forward_to_mod_manager`](Self::forward_to_mod_manager).
     fn forward_to_recipe_browser(&mut self, ev: UiInputEvent) -> Vec<UiAction> {
         match ev {
             UiInputEvent::Click { x, y } => {
@@ -4442,7 +4461,7 @@ impl UiState {
                 self.navigate(Screen::Friends);
                 vec![UiAction::OpenScreen(Screen::Friends)]
             }
-            WidgetId::TitleMods => self.open_mod_menu(),
+            WidgetId::TitleMods => self.open_mod_manager(),
             WidgetId::TitleSettings => {
                 let s = Screen::Settings(SettingsTab::Video);
                 self.navigate(s);
@@ -4624,7 +4643,7 @@ impl UiState {
                 self.navigate(Screen::AboutMegu);
                 vec![UiAction::OpenScreen(Screen::AboutMegu)]
             }
-            WidgetId::SettingsMods => self.open_mod_menu(),
+            WidgetId::SettingsMods => self.open_mod_manager(),
             WidgetId::AboutBack => {
                 self.back();
                 vec![UiAction::Back]
@@ -5080,7 +5099,7 @@ impl UiState {
                     true
                 }
                 1 => {
-                    self.settings.qol_mouse_tweaks = !self.settings.qol_mouse_tweaks;
+                    self.settings.inventory_drag_controls = !self.settings.inventory_drag_controls;
                     true
                 }
                 2 => {
@@ -5093,22 +5112,22 @@ impl UiState {
                 }
                 _ => false,
             },
-            WidgetId::MiniHudSegment(index) => {
+            WidgetId::CompactDebugHudSegment(index) => {
                 if index >= 9 {
                     false
                 } else {
-                    let mini = &mut q.mini_hud;
-                    mini.enabled = true;
+                    let compact_debug_hud = &mut q.compact_debug_hud;
+                    compact_debug_hud.enabled = true;
                     let enabled = match index {
-                        0 => &mut mini.show_fps,
-                        1 => &mut mini.show_coords,
-                        2 => &mut mini.show_biome,
-                        3 => &mut mini.show_facing,
-                        4 => &mut mini.show_ping,
-                        5 => &mut mini.show_mspt_tps,
-                        6 => &mut mini.show_light_level,
-                        7 => &mut mini.show_chunks_entities,
-                        _ => &mut mini.show_ram,
+                        0 => &mut compact_debug_hud.show_fps,
+                        1 => &mut compact_debug_hud.show_coords,
+                        2 => &mut compact_debug_hud.show_biome,
+                        3 => &mut compact_debug_hud.show_facing,
+                        4 => &mut compact_debug_hud.show_ping,
+                        5 => &mut compact_debug_hud.show_mspt_tps,
+                        6 => &mut compact_debug_hud.show_light_level,
+                        7 => &mut compact_debug_hud.show_chunks_entities,
+                        _ => &mut compact_debug_hud.show_ram,
                     };
                     *enabled = !*enabled;
                     true
@@ -5206,8 +5225,8 @@ impl UiState {
                 q.show_support_links = !q.show_support_links;
                 true
             }
-            WidgetId::QolMiniHud => {
-                q.cycle_mini_hud();
+            WidgetId::QolCompactDebugHud => {
+                q.cycle_compact_debug_hud();
                 true
             }
             WidgetId::QolSubtitles => {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
-//! Lane GPU-JEI-PONDER-WIRE: feeds real datapack content into the recipe
+//! Lane GPU-RECIPE-TUTORIAL-WIRE: feeds real datapack content into the recipe
 //! browser's [`RecipeIndex`].
 //!
 //! Sources (all read **without extracting a single byte to disk**):
@@ -25,8 +25,8 @@
 //!   instead of silently failing closed.
 //! * `data/<ns>/tags/item(s)/**/*.json` — item tag membership, including
 //!   nested `#ns:tag` references resolved with a bounded fixpoint.
-//! * `data/<ns>/loot_table(s)/entities/**/*.json` — JER mob drops.
-//! * `data/<ns>/loot_table(s)/chests/**/*.json` — JER dungeon loot.
+//! * `data/<ns>/loot_table(s)/entities/**/*.json` — world-drop mob drops.
+//! * `data/<ns>/loot_table(s)/chests/**/*.json` — world-drop dungeon loot.
 //!
 //! Everything is bounded (caps below) and fail-closed per entry: one
 //! malformed JSON is recorded in [`IngestReport::notes`] and never aborts
@@ -43,8 +43,8 @@ use megu_core::zip_archive::LazyZipIndex;
 use megu_proto::table::ProtocolTable;
 use megu_ui::draw::UiColor;
 use megu_ui::recipe_browser::{
-    item_color, AnimatedPart, DungeonLootEntry, FuelEntry, ItemEntry, MobDropEntry, PonderAnim,
-    PonderAxis, PonderScene, PonderStep, RecipeBrowserState, RecipeIndex, RecipeIngredient,
+    item_color, AnimatedPart, DungeonLootEntry, FuelEntry, ItemEntry, MobDropEntry, MachineTutorialAnimation,
+    MachineTutorialAxis, MachineTutorialScene, MachineTutorialStep, RecipeBrowserState, RecipeIndex, RecipeIngredient,
 };
 use megu_ui::state::UiLang;
 
@@ -108,7 +108,7 @@ pub struct IngestReport {
     pub dungeon_loot: usize,
     /// New [`ItemEntry`] catalog rows created.
     pub items_registered: usize,
-    /// `furnace_fuels` data-map rows loaded (JER Fuels tab).
+    /// `furnace_fuels` data-map rows loaded (world-resource Fuels tab).
     pub fuels: usize,
     /// Total `data/` JSONs that could not be parsed at all.
     pub json_failed: usize,
@@ -290,7 +290,7 @@ fn classify(entry: &str) -> Option<DataKind<'_>> {
 // ---------------------------------------------------------------------------
 
 /// Boot-time ingestion: scans every source [`SessionPaths`] implies and
-/// folds recipes, item tags and JER loot into `browser.index`.
+/// folds recipes, item tags and world-drop loot into `browser.index`.
 ///
 /// Zero disk extraction: archives are indexed by [`LazyZipIndex`]'s EOCD +
 /// Central Directory pass and entries inflate in memory only.
@@ -489,12 +489,12 @@ pub fn item_name_for_id(item_id: u32) -> String {
         .unwrap_or_else(|| format!("unknown:item_{item_id}"))
 }
 
-/// Deterministic Ponder scene for `item`: a small platform, the item as a
+/// Deterministic machine-tutorial scene for `item`: a small platform, the item as a
 /// colored center voxel, and — when the index knows a producing recipe —
 /// the recipe's inputs arranged in a ring with a narrated assembly step.
-pub fn ponder_scene_for(index: &RecipeIndex, item: &str) -> PonderScene {
+pub fn machine_tutorial_scene_for(index: &RecipeIndex, item: &str) -> MachineTutorialScene {
     let name = index.display_name(item);
-    let mut scene = PonderScene::new(&name);
+    let mut scene = MachineTutorialScene::new(&name);
     for x in -2..=2 {
         for z in -2..=2 {
             scene.add_block(x, 0, z, UiColor::rgb(88, 88, 98));
@@ -502,7 +502,7 @@ pub fn ponder_scene_for(index: &RecipeIndex, item: &str) -> PonderScene {
     }
     scene.add_block(0, 1, 0, item_color(item));
 
-    let mut intro = PonderStep::new(
+    let mut intro = MachineTutorialStep::new(
         &format!("{name} — how it is made"),
         &format!("{name} の作り方"),
         60,
@@ -527,7 +527,7 @@ pub fn ponder_scene_for(index: &RecipeIndex, item: &str) -> PonderScene {
         }
         let cat = recipe.category.title(UiLang::En);
         let cat_ja = recipe.category.title(UiLang::Ja);
-        let mut step = PonderStep::new(
+        let mut step = MachineTutorialStep::new(
             &format!("{name} ← {cat}"),
             &format!("{name} ← {cat_ja}"),
             90,
@@ -535,8 +535,8 @@ pub fn ponder_scene_for(index: &RecipeIndex, item: &str) -> PonderScene {
         step.highlight = Some((0, 1, 0));
         step.animated_parts.push(AnimatedPart {
             pos: (0, 1, 0),
-            anim: PonderAnim::Spin {
-                axis: PonderAxis::Y,
+            anim: MachineTutorialAnimation::Spin {
+                axis: MachineTutorialAxis::Y,
                 rpm: 6.0,
             },
         });
@@ -561,7 +561,7 @@ struct IngestWork<'a> {
     recipe_ids_seen: BTreeSet<String>,
     /// Loot doc ids already walked — a table duplicated between a parent
     /// JAR and its nested jar (or re-encountered via `loot_table` +
-    /// `loot_tables`) must not emit doubled JER rows.
+    /// `loot_tables`) must not emit doubled world-drop rows.
     loot_docs_seen: BTreeSet<String>,
 }
 
@@ -1379,7 +1379,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<String>) {
 // wrap real ingredients in `{"type":"neoforge:compound","children":[...]}` (or
 // `"ingredients":[...]`) and nest result stacks as `{"item":{"id","count"}}`.
 // Rather than teaching client-ui new syntax, the ingest layer rewrites those
-// two forms to the plain vanilla shape before parsing — JEI's deterministic
+// two forms to the plain vanilla shape before parsing — recipe browser's deterministic
 // "first alternative" pick, matching the array-of-alternatives rule.
 
 fn normalize_recipe_document(text: &str) -> String {

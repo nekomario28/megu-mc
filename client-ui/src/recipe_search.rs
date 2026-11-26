@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #![forbid(unsafe_code)]
 //! Fast recipe search index and nearby-chest craft planner — the pure-logic
-//! core a JEI/EMI-style overlay wires into its screen.
+//! core the container recipe overlay wires into its screen.
 //!
 //! Three cooperating layers, all `std`-only and fully deterministic (no
 //! clock reads, no I/O, no unsafe):
@@ -22,7 +22,7 @@
 //!   item catalog (`mod → items`, `tag → items`, `output item →
 //!   producing recipes`, `input item → consuming recipes` with tag
 //!   slots resolved against the catalog) plus a per-item normalized
-//!   match document for plain-text terms. Query syntax is the JEI set:
+//!   match document for plain-text terms. Query syntax is the recipe browser set:
 //!   plain text AND-ed across tokens, `@mod` namespace filters,
 //!   `#tag` item-tag filters — `@create 歯車`, `#planks oak` just work.
 //!   Plain text is a pure substring match because every fuzzy
@@ -895,7 +895,7 @@ fn parse_query(query: &str) -> Vec<QueryToken> {
     out
 }
 
-/// The inverted index a JEI/EMI-style overlay searches.
+/// The inverted index searched by the container recipe overlay.
 ///
 /// Fill it with [`add_item`](Self::add_item) for every catalog entry,
 /// then [`add_recipe`](Self::add_recipe) for every recipe — registering
@@ -1048,7 +1048,7 @@ impl RecipeSearchIndex {
             .unwrap_or_default()
     }
 
-    /// JEI-style search: whitespace-separated `@mod`, `#tag` and plain
+    /// recipe-browser-style search: whitespace-separated `@mod`, `#tag` and plain
     /// text tokens AND-ed together. Plain text matches across the item
     /// id, `name_en`, `name_ja`, the kana-normalized reading and its
     /// glide-folded romaji rendering. Results are catalog order.
@@ -1372,7 +1372,7 @@ struct ResolvedReq {
 }
 
 /// Plans 1-click crafts that pull from the player inventory and every
-/// chest within reach — the logic behind the JEI `+` button plus the
+/// chest within reach — the logic behind the recipe browser `+` button plus the
 /// Polymorph-style "grab it from the chest next to you" extension.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NearbyChestCraftPlanner {

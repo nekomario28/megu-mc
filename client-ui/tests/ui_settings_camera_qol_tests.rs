@@ -19,7 +19,7 @@ fn edits() -> [SettingEdit; 7] {
         (SettingKey::QolLookingAtHud, |s| {
             s.qol_looking_at_hud = false
         }),
-        (SettingKey::QolMouseTweaks, |s| s.qol_mouse_tweaks = false),
+        (SettingKey::QolInventoryDragControls, |s| s.inventory_drag_controls = false),
         (SettingKey::QolInventorySort, |s| {
             s.qol_inventory_sort = false
         }),
@@ -57,15 +57,15 @@ fn defaults_and_effective_values() {
     assert_eq!(s.mouse_sensitivity_f32(), 1.0);
     assert_eq!(s.zoom_divisor_f32(), 4.0);
     assert!(s.qol_looking_at_hud);
-    assert!(s.qol_mouse_tweaks);
+    assert!(s.inventory_drag_controls);
     assert!(s.qol_inventory_sort);
     assert!(s.zsh_command_bar);
 
     assert!(s.builtin_looking_at_hud_active(false));
-    assert!(s.builtin_mouse_tweaks_active(false));
+    assert!(s.builtin_inventory_drag_controls_active(false));
     assert!(s.builtin_inventory_sort_active(false));
     assert!(!s.builtin_looking_at_hud_active(true));
-    assert!(!s.builtin_mouse_tweaks_active(true));
+    assert!(!s.builtin_inventory_drag_controls_active(true));
     assert!(!s.builtin_inventory_sort_active(true));
 }
 
@@ -192,6 +192,6 @@ fn no_op_edits_preserve_history_and_a_new_edit_clears_redo() {
     ui.undo_settings();
     assert_eq!(ui.settings.fov_deg, 70);
     assert_eq!(ui.settings_tx.redo_stack.len(), 1);
-    ui.edit_settings(|s| s.qol_mouse_tweaks = false);
+    ui.edit_settings(|s| s.inventory_drag_controls = false);
     assert!(ui.settings_tx.redo_stack.is_empty());
 }
