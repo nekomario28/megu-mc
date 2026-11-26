@@ -389,7 +389,7 @@ pub fn ingest_lang_into_index(
                 report.json_failed += 1;
                 continue;
             };
-            let Some(root) = parse_json(&text) else {
+            let Some(root) = parse_recipe_json(&text) else {
                 report.json_failed += 1;
                 continue;
             };
@@ -735,7 +735,7 @@ impl<'a> IngestWork<'a> {
                 // Auto-register the recipe *type*'s namespace (not the
                 // file's) so `my_factory` files can declare `create:mixing`
                 // AND unknown `other_mod:type` recipes still categorize.
-                match parse_json(text).and_then(|j| {
+                match parse_recipe_json(text).and_then(|j| {
                     j.as_object()
                         .and_then(|o| o.get("type"))
                         .and_then(Json::as_str)
@@ -790,7 +790,7 @@ impl<'a> IngestWork<'a> {
     /// Entries keyed by `#tag` stay symbolic — the Fuels tab resolves
     /// them through the item-tag index.
     fn ingest_fuel_map(&mut self, source: &str, text: &str) {
-        let Some(root) = parse_json(text) else {
+        let Some(root) = parse_recipe_json(text) else {
             self.report.json_failed += 1;
             self.report
                 .note(source, "furnace_fuels", "data map malformed");
@@ -865,7 +865,7 @@ impl<'a> IngestWork<'a> {
         if self.tag_defs.len() >= MAX_TAGS {
             return;
         }
-        let Some(root) = parse_json(text) else {
+        let Some(root) = parse_recipe_json(text) else {
             self.report.json_failed += 1;
             self.report
                 .note(source, &format!("{ns}:{rel}"), "tag json malformed");
@@ -938,7 +938,7 @@ impl<'a> IngestWork<'a> {
     /// that depend on runtime-only composite branching are represented by
     /// NaN rather than a fabricated weighted percentage.
     fn ingest_loot(&mut self, source: &str, mob: &str, chest: Option<&str>, text: &str) {
-        let Some(root) = parse_json(text) else {
+        let Some(root) = parse_recipe_json(text) else {
             self.report.json_failed += 1;
             self.report
                 .note(source, mob, "loot table json malformed");
@@ -1493,7 +1493,7 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<String>) {
 // "first alternative" pick, matching the array-of-alternatives rule.
 
 fn normalize_recipe_document(text: &str) -> String {
-    let Some(mut root) = parse_json(text) else {
+    let Some(mut root) = parse_recipe_json(text) else {
         return text.to_owned();
     };
     let Some(obj) = root.as_object_mut() else {
@@ -1822,7 +1822,7 @@ impl Json {
     }
 }
 
-/// Bounds for [`parse_json`], matching the retired parser: nesting deeper
+/// Bounds for [`parse_recipe_json`], matching the retired parser: nesting deeper
 /// than [`MAX_JSON_DEPTH`] levels rejected, at most [`MAX_JSON_NODES`]
 /// value nodes, and no byte ceiling of its own — callers already bound
 /// each document at [`MAX_JSON_BYTES`].
@@ -1832,7 +1832,7 @@ const JSON_LIMITS: JsonLimits = JsonLimits {
     max_bytes: usize::MAX,
 };
 
-fn parse_json(src: &str) -> Option<Json> {
+fn parse_recipe_json(src: &str) -> Option<Json> {
     let value = parse_json_with_limits(src, JSON_LIMITS, false).ok()?;
     Some(json_value_to_json(&value))
 }

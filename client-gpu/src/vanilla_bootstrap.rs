@@ -414,7 +414,7 @@ pub fn bootstrap_dest_dir(paths: &SessionPaths) -> Option<PathBuf> {
 // Verified-download JSON parsing — canonical megu-core reader
 // ---------------------------------------------------------------------------
 
-/// Bounds for [`parse_json`]: the retired parser capped container nesting
+/// Bounds for [`parse_vanilla_json`]: the retired parser capped container nesting
 /// at 32 levels and the document at [`MAX_MANIFEST_BYTES`], with no node
 /// ceiling of its own.
 const JSON_LIMITS: JsonLimits = JsonLimits {
@@ -423,7 +423,7 @@ const JSON_LIMITS: JsonLimits = JsonLimits {
     max_bytes: MAX_MANIFEST_BYTES as usize,
 };
 
-fn parse_json(text: &str) -> Result<JsonValue, String> {
+fn parse_vanilla_json(text: &str) -> Result<JsonValue, String> {
     parse_json_with_limits(text, JSON_LIMITS, false).map_err(|e| e.to_string())
 }
 
@@ -443,7 +443,7 @@ fn strict_u64(value: &JsonValue) -> Option<u64> {
 /// `version_id`. The extracted URL is re-checked against the Mojang
 /// allowlist so a poisoned manifest can never redirect the fetch.
 fn manifest_version_url(manifest_text: &str, version_id: &str) -> Result<String, String> {
-    let manifest = parse_json(manifest_text)?;
+    let manifest = parse_vanilla_json(manifest_text)?;
     let versions = manifest
         .get("versions")
         .and_then(JsonValue::as_array)
@@ -473,7 +473,7 @@ struct ClientDownload {
 /// Per-version metadata JSON -> `downloads.client.{url,sha1,size}` with
 /// every field range-checked and the URL allowlisted.
 fn client_download_info(version_text: &str) -> Result<ClientDownload, String> {
-    let json = parse_json(version_text)?;
+    let json = parse_vanilla_json(version_text)?;
     let client = json
         .get("downloads")
         .and_then(|d| d.get("client"))
@@ -973,7 +973,7 @@ fn safe_asset_index_id(value: &str) -> bool {
 
 /// Parse and validate `assetIndex` from Mojang's version metadata.
 pub fn parse_asset_index_ref(version_text: &str) -> Result<AssetIndexRef, String> {
-    let json = parse_json(version_text)?;
+    let json = parse_vanilla_json(version_text)?;
     let index = json
         .get("assetIndex")
         .ok_or_else(|| "version JSON has no assetIndex".to_owned())?;
