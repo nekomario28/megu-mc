@@ -934,7 +934,22 @@ enum CpEntry {
         name_index: u16,
         descriptor_index: u16,
     },
-    /// MethodHandle/MethodType/Dynamic/InvokeDynamic/Module/Package.
+    /// `CONSTANT_MethodHandle`: the reference kind plus the indexed
+    /// `Methodref`/`InterfaceMethodref` it points to. The subset VM never
+    /// executes through it, but class-level lambda bootstrap metadata uses
+    /// it to identify the synthetic implementation method.
+    MethodHandle {
+        reference_kind: u8,
+        reference_index: u16,
+    },
+    /// `CONSTANT_InvokeDynamic`: bootstrap table index plus call-site
+    /// name-and-type. Dynamic execution remains rejected by the verifier;
+    /// the retained indexes let static extractors inspect the bootstrap.
+    InvokeDynamic {
+        bootstrap_method_attr_index: u16,
+        nat_index: u16,
+    },
+    /// MethodType/Dynamic/Module/Package.
     Other,
 }
 
@@ -1078,16 +1093,29 @@ fn read_constant_pool(r: &mut Cursor<'_>, count: u16) -> Result<ConstantPool, Vm
                 descriptor_index: r.u2("CONSTANT_NameAndType descriptor_index")?,
             },
             15 => {
-                r.skip(3, "CONSTANT_MethodHandle")?;
-                CpEntry::Other
+                let reference_kind = r.u1("CONSTANT_MethodHandle reference_kind")?;
+                let reference_index = r.u2("CONSTANT_MethodHandle reference_index")?;
+                CpEntry::MethodHandle {
+                    reference_kind,
+                    reference_index,
+                }
             }
             16 | 19 | 20 => {
                 r.skip(2, "CONSTANT_MethodType/Module/Package")?;
                 CpEntry::Other
             }
-            17 | 18 => {
-                r.skip(4, "CONSTANT_Dynamic/InvokeDynamic")?;
+            17 => {
+                r.skip(4, "CONSTANT_Dynamic")?;
                 CpEntry::Other
+            }
+            18 => {
+                let bootstrap_method_attr_index =
+                    r.u2("CONSTANT_InvokeDynamic bootstrap_method_attr_index")?;
+                let nat_index = r.u2("CONSTANT_InvokeDynamic name_and_type_index")?;
+                CpEntry::InvokeDynamic {
+                    bootstrap_method_attr_index,
+                    nat_index,
+                }
             }
             other => return Err(VmError::UnsupportedConstantPoolTag(other)),
         };
@@ -1121,6 +1149,37 @@ pub struct ParsedMethod {
     pub code: Vec<u8>,
 }
 
+/// One `BootstrapMethods` table entry: the bootstrap method handle plus
+/// its static constant-pool arguments. Java lambda bootstraps place the
+/// implementation `MethodHandle` in argument slot 1.
+#[derive(Clone, Debug)]
+struct BootstrapMethod {
+    bootstrap_method_ref: u16,
+    arguments: Vec<u16>,
+}
+
+/// The implementation method a lambda `invokedynamic` bootstraps to,
+/// when that target is present in the same parsed class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LambdaImplementation {
+    /// Synthetic implementation method name (commonly `lambda$...`).
+    pub name: String,
+    /// Synthetic implementation method descriptor.
+    pub descriptor: String,
+}
+
+/// Constant-pool data resolved for one `invokedynamic` call site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvokeDynamicReference {
+    /// Call-site name from the `NameAndType`.
+    pub name: String,
+    /// Call-site descriptor from the `NameAndType`.
+    pub descriptor: String,
+    /// Same-class lambda implementation method, when the bootstrap table
+    /// exposes one through the standard Java lambda metafactory shape.
+    pub lambda_implementation: Option<LambdaImplementation>,
+}
+
 /// The methods of one parsed `.class`, plus everything the verifier
 /// needs to resolve their constant-pool references.
 #[derive(Clone, Debug)]
@@ -1132,6 +1191,119 @@ pub struct ParsedClassMethods {
     /// (verification reports [`VmError::MethodNotFound`] for them).
     pub methods: Vec<ParsedMethod>,
     cp: ConstantPool,
+    bootstrap_methods: Vec<BootstrapMethod>,
+}
+
+impl ParsedClassMethods {
+    /// Resolve a `CONSTANT_Class` index to its internal class name.
+    pub fn resolve_class_name(&self, index: u16) -> Result<String, VmError> {
+        Ok(self.cp.class_name(index, "class reference")?.to_string())
+    }
+
+    /// Resolve the constant loaded by `ldc`/`ldc_w` for int, float, and
+    /// string constants. Other loadable kinds fail closed, matching the
+    /// subset VM's reflective-literal rejection boundary.
+    pub fn resolve_ldc_constant(&self, index: u16) -> Result<LdcConst, VmError> {
+        match self.cp.entry(index, "ldc constant")? {
+            CpEntry::Integer(v) => Ok(LdcConst::Int(*v)),
+            CpEntry::Float(v) => Ok(LdcConst::Float(*v)),
+            CpEntry::String { utf8_index } => Ok(LdcConst::Str(
+                self.cp.utf8(*utf8_index, "ldc string")?.to_string(),
+            )),
+            _ => Err(VmError::BadConstantPoolTag(
+                "ldc constant is not int/float/string",
+            )),
+        }
+    }
+
+    /// Resolve a `Methodref`/`InterfaceMethodref` constant-pool index to
+    /// `(owner_class, method_name, method_descriptor)`.
+    pub fn resolve_method_reference(
+        &self,
+        index: u16,
+    ) -> Result<(String, String, String), VmError> {
+        let (class, name, descriptor) = self.cp.method_ref(index)?;
+        Ok((class.to_string(), name.to_string(), descriptor.to_string()))
+    }
+
+    /// Resolve one `CONSTANT_InvokeDynamic` call site. When the class has
+    /// a `BootstrapMethods` attribute in the shape emitted by `javac` for
+    /// a lambda, this also resolves the synthetic implementation method
+    /// through bootstrap argument slot 1's `MethodHandle`.
+    pub fn resolve_invoke_dynamic(&self, index: u16) -> Result<InvokeDynamicReference, VmError> {
+        let (bootstrap_index, nat_index) = match self.cp.entry(index, "invokedynamic constant")? {
+            CpEntry::InvokeDynamic {
+                bootstrap_method_attr_index,
+                nat_index,
+            } => (*bootstrap_method_attr_index, *nat_index),
+            _ => {
+                return Err(VmError::BadConstantPoolTag(
+                    "invokedynamic constant is not InvokeDynamic",
+                ))
+            }
+        };
+        let (name_index, descriptor_index) = match self.cp.entry(nat_index, "indy name_and_type")? {
+            CpEntry::NameAndType {
+                name_index,
+                descriptor_index,
+            } => (*name_index, *descriptor_index),
+            _ => return Err(VmError::BadConstantPoolTag("indy target name_and_type")),
+        };
+        let name = self.cp.utf8(name_index, "indy call-site name")?.to_string();
+        let descriptor = self
+            .cp
+            .utf8(descriptor_index, "indy call-site descriptor")?
+            .to_string();
+
+        let mut lambda_implementation = None;
+        if let Some(bootstrap) = self.bootstrap_methods.get(usize::from(bootstrap_index)) {
+            match self
+                .cp
+                .entry(bootstrap.bootstrap_method_ref, "bootstrap method handle")?
+            {
+                CpEntry::MethodHandle { .. } => {}
+                _ => {
+                    return Err(VmError::BadConstantPoolTag(
+                        "bootstrap method is not a MethodHandle",
+                    ))
+                }
+            }
+            let mut handles = bootstrap.arguments.iter().skip(1);
+            if let Some(handle_index) = handles.next() {
+                if let CpEntry::MethodHandle {
+                    reference_kind,
+                    reference_index,
+                } = self
+                    .cp
+                    .entry(*handle_index, "lambda implementation handle")?
+                {
+                    if (5..=9).contains(reference_kind) {
+                        if let Ok((owner, method_name, method_descriptor)) =
+                            self.cp.method_ref(*reference_index)
+                        {
+                            if owner == self.class_name
+                                && self.methods.iter().any(|method| {
+                                    method.name == method_name
+                                        && method.descriptor == method_descriptor
+                                })
+                            {
+                                lambda_implementation = Some(LambdaImplementation {
+                                    name: method_name.to_string(),
+                                    descriptor: method_descriptor.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(InvokeDynamicReference {
+            name,
+            descriptor,
+            lambda_implementation,
+        })
+    }
 }
 
 /// Skip an `attribute_info` table (fields, `Exceptions`, etc.) by
@@ -1268,7 +1440,47 @@ pub fn parse_class_methods(bytes: &[u8]) -> Result<ParsedClassMethods, VmError> 
         }
     }
 
-    skip_attributes(&mut r, "class attributes_count")?;
+    let class_attr_count = usize::from(r.u2("class attributes_count")?);
+    if class_attr_count > MAX_ATTRIBUTES {
+        return Err(VmError::LimitExceeded("class attributes_count"));
+    }
+    let mut bootstrap_methods = Vec::new();
+    for _ in 0..class_attr_count {
+        let attr_name = cp.utf8(r.u2("attribute_name_index")?, "attribute name")?;
+        let len = r.u4("attribute_length")? as usize;
+        let payload = r.take(len, "class attribute payload")?;
+        if attr_name != "BootstrapMethods" {
+            continue;
+        }
+        if !bootstrap_methods.is_empty() {
+            return Err(VmError::Malformed("duplicate BootstrapMethods attribute"));
+        }
+        let mut b = Cursor::new(payload);
+        let count = usize::from(b.u2("BootstrapMethods num_bootstrap_methods")?);
+        if count > MAX_ATTRIBUTES {
+            return Err(VmError::LimitExceeded("BootstrapMethods count"));
+        }
+        for _ in 0..count {
+            let bootstrap_method_ref = b.u2("bootstrap_method_ref")?;
+            let argument_count = usize::from(b.u2("num_bootstrap_arguments")?);
+            if argument_count > MAX_ATTRIBUTES {
+                return Err(VmError::LimitExceeded("bootstrap argument count"));
+            }
+            let mut arguments = Vec::with_capacity(argument_count.min(16));
+            for _ in 0..argument_count {
+                arguments.push(b.u2("bootstrap argument")?);
+            }
+            bootstrap_methods.push(BootstrapMethod {
+                bootstrap_method_ref,
+                arguments,
+            });
+        }
+        if b.pos != payload.len() {
+            return Err(VmError::Malformed(
+                "trailing bytes in BootstrapMethods attribute",
+            ));
+        }
+    }
     if r.pos != bytes.len() {
         return Err(VmError::Malformed("trailing bytes after class file"));
     }
@@ -1276,6 +1488,7 @@ pub fn parse_class_methods(bytes: &[u8]) -> Result<ParsedClassMethods, VmError> 
         class_name,
         methods,
         cp,
+        bootstrap_methods,
     })
 }
 

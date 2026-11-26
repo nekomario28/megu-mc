@@ -110,6 +110,10 @@
 //!   26-neighbor 3D BFS over ore veins and log/tree trunks with data-driven
 //!   block/item tags, claim protection, exact exhaustion, and a durability
 //!   budget that preserves the tool's last point by default.
+//! - [`bytecode_property_extractor`]: pure-`std` zero-JVM static abstract
+//!   interpreter for mod `.class` files and in-memory JARs — constant-folds
+//!   block/item/food property-builder chains (including same-class constant
+//!   light lambdas) under explicit class/method/instruction/archive budgets.
 //! - [`bytecode_subset_vm`]: pure-`std` bounded `.class` bytecode subset
 //!   evaluator — zero-JVM execution of safe mod event/logic methods with
 //!   a fail-closed static verifier (opcode allowlist, instruction-boundary
@@ -204,6 +208,7 @@
 
 pub mod auto_adapter;
 pub mod blockstates;
+pub mod bytecode_property_extractor;
 pub mod bytecode_subset_vm;
 pub mod capability_bus;
 pub mod class_mixin_scanner;

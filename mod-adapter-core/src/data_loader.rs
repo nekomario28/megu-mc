@@ -683,10 +683,12 @@ impl JsonValue {
     }
 }
 
+pub use decode_data_json as parse_json;
+
 /// Parse a complete JSON document under [`MAX_JSON_BYTES`] /
 /// [`MAX_JSON_DEPTH`] via the canonical `megu_core::json` reader, then lower
 /// it into this module's [`JsonValue`] shape.
-pub fn parse_json(bytes: &[u8]) -> Result<JsonValue, DataLoadError> {
+pub fn decode_data_json(bytes: &[u8]) -> Result<JsonValue, DataLoadError> {
     if bytes.len() > MAX_JSON_BYTES {
         return Err(DataLoadError::Json("JSON exceeds max size".into()));
     }
