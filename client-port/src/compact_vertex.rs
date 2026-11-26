@@ -13,7 +13,7 @@ pub const COMPACT_VERTEX_MAX_STATE_ID: u32 = (1 << 19) - 1;
 /// Largest tint value representable by the compact format (`0x00RRGGBB`).
 pub const COMPACT_VERTEX_MAX_TINT: u32 = 0x00ff_ffff;
 
-const POSITION_INDEX_MASK: u32 = 0x007f_ffff;
+const POSITION_INDEX_MASK: u32 = COMPACT_VERTEX_SCHEMA[0].mask();
 const POSITION_BASE: u32 = COMPACT_VERTEX_MAX_EDGE + 1;
 const POSITION_Y_STRIDE: u32 = POSITION_BASE * POSITION_BASE;
 const PACKED_ATTRIBUTE_LOW_MASK: u32 = 0x000f_ffff;
@@ -21,6 +21,129 @@ const PACKED_WIDTH_SHIFT: u32 = 20;
 const PACKED_HEIGHT_SHIFT: u32 = 25;
 const PACKED_CORNER_SHIFT: u32 = 30;
 const POSITION_Y_SCALE: f32 = 1024.0;
+
+/// One occupied bit range in the three-word compact vertex stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitFieldSpec {
+    pub name: &'static str,
+    pub word: u8,
+    pub shift: u8,
+    pub bits: u8,
+}
+
+impl BitFieldSpec {
+    pub const fn mask(self) -> u32 {
+        if self.bits == 32 {
+            u32::MAX
+        } else {
+            ((1u32 << self.bits) - 1) << self.shift
+        }
+    }
+}
+
+/// Single source of truth for all occupied compact vertex word ranges.
+pub const COMPACT_VERTEX_SCHEMA: &[BitFieldSpec] = &[
+    BitFieldSpec {
+        name: "position_index",
+        word: 0,
+        shift: 0,
+        bits: 23,
+    },
+    BitFieldSpec {
+        name: "attributes_low",
+        word: 0,
+        shift: 23,
+        bits: 9,
+    },
+    BitFieldSpec {
+        name: "attributes_high",
+        word: 1,
+        shift: 0,
+        bits: 21,
+    },
+    BitFieldSpec {
+        name: "state_id_low",
+        word: 1,
+        shift: 21,
+        bits: 11,
+    },
+    BitFieldSpec {
+        name: "state_id_high",
+        word: 2,
+        shift: 0,
+        bits: 8,
+    },
+    BitFieldSpec {
+        name: "tint",
+        word: 2,
+        shift: 8,
+        bits: 24,
+    },
+];
+
+const fn compact_schema_is_valid() -> bool {
+    let mut i = 0;
+    while i < COMPACT_VERTEX_SCHEMA.len() {
+        let a = COMPACT_VERTEX_SCHEMA[i];
+        if a.bits == 0 || a.bits > 32 || a.shift as u16 + a.bits as u16 > 32 || a.word > 2 {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < COMPACT_VERTEX_SCHEMA.len() {
+            let b = COMPACT_VERTEX_SCHEMA[j];
+            if a.word == b.word && (a.mask() & b.mask()) != 0 {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+const _: () = assert!(compact_schema_is_valid());
+
+/// Emits WGSL masks and offsets from [`COMPACT_VERTEX_SCHEMA`], followed by
+/// the compact unpack helper used as the format's reference implementation.
+pub fn emit_wgsl_unpack_helpers() -> String {
+    let mut out = String::new();
+    for field in COMPACT_VERTEX_SCHEMA {
+        out.push_str(&format!(
+            "const CV_{}_SHIFT: u32 = {}u;\nconst CV_{}_MASK: u32 = 0x{:08x}u;\n",
+            field.name.to_ascii_uppercase(),
+            field.shift,
+            field.name.to_ascii_uppercase(),
+            field.mask(),
+        ));
+    }
+    out.push_str(
+        r#"
+struct CompactVoxelVertexInput { @location(0) word0: u32, @location(1) word1: u32, @location(2) word2: u32, }
+struct PackedVoxelVertexWords { position: u32, state_id: u32, attributes: u32, tint: u32, }
+fn unpack_compact_voxel_vertex(input: CompactVoxelVertexInput) -> PackedVoxelVertexWords {
+    let pos_index = (input.word0 & CV_POSITION_INDEX_MASK) >> CV_POSITION_INDEX_SHIFT;
+    let attr_lo = (input.word0 & CV_ATTRIBUTES_LOW_MASK) >> CV_ATTRIBUTES_LOW_SHIFT;
+    let attr_hi = (input.word1 & CV_ATTRIBUTES_HIGH_MASK) >> CV_ATTRIBUTES_HIGH_SHIFT;
+    let attr = attr_lo | (attr_hi << 9u);
+    let y_fixed = pos_index / 289u;
+    let rem = pos_index - y_fixed * 289u;
+    let z = rem / 17u;
+    let x = rem - z * 17u;
+    var out: PackedVoxelVertexWords;
+    out.position = x | (z << 5u) | (y_fixed << 10u);
+    out.state_id = ((input.word1 & CV_STATE_ID_LOW_MASK) >> CV_STATE_ID_LOW_SHIFT)
+        | (((input.word2 & CV_STATE_ID_HIGH_MASK) >> CV_STATE_ID_HIGH_SHIFT) << 11u);
+    out.attributes = (attr & 0xfffffu)
+        | ((((attr >> 20u) & 15u) + 1u) << 20u)
+        | ((((attr >> 24u) & 15u) + 1u) << 25u)
+        | ((attr & 0x30000000u) << 2u);
+    out.tint = (input.word2 & CV_TINT_MASK) >> CV_TINT_SHIFT;
+    return out;
+}
+"#,
+    );
+    out
+}
 
 /// WGSL unpacking for the three-`u32` compact vertex stream.
 ///
@@ -133,9 +256,9 @@ impl CompactVoxelVertex {
         let tint = vertex.tint;
 
         Some(Self {
-            word0: position_index | ((compact_attributes & 0x1ff) << 23),
-            word1: ((compact_attributes >> 9) & 0x1f_ffff) | ((state_id & 0x7ff) << 21),
-            word2: ((state_id >> 11) & 0xff) | (tint << 8),
+            word0: put_compact_field(position_index, 0) | put_compact_field(compact_attributes, 1),
+            word1: put_compact_field(compact_attributes >> 9, 2) | put_compact_field(state_id, 3),
+            word2: put_compact_field(state_id >> 11, 4) | put_compact_field(tint, 5),
         })
     }
 
@@ -213,14 +336,324 @@ impl CompactVoxelVertex {
 
     #[inline(always)]
     fn unpack_fields(self) -> (u32, u32, u32, u32) {
-        let position_index = self.word0 & POSITION_INDEX_MASK;
-        let attr_lo = self.word0 >> 23;
-        let attr_hi = self.word1 & 0x1f_ffff;
+        let position_index = get_compact_field(self.word0, 0);
+        let attr_lo = get_compact_field(self.word0, 1);
+        let attr_hi = get_compact_field(self.word1, 2);
         let attributes = attr_lo | (attr_hi << 9);
-        let state_id = ((self.word1 >> 21) & 0x7ff) | ((self.word2 & 0xff) << 11);
-        let tint = self.word2 >> 8;
+        let state_id = get_compact_field(self.word1, 3) | (get_compact_field(self.word2, 4) << 11);
+        let tint = get_compact_field(self.word2, 5);
         (position_index, attributes, state_id, tint)
     }
+}
+
+#[inline(always)]
+fn put_compact_field(value: u32, spec_index: usize) -> u32 {
+    let field = COMPACT_VERTEX_SCHEMA[spec_index];
+    (value << field.shift) & field.mask()
+}
+
+#[inline(always)]
+fn get_compact_field(word: u32, spec_index: usize) -> u32 {
+    let field = COMPACT_VERTEX_SCHEMA[spec_index];
+    (word & field.mask()) >> field.shift
+}
+
+/// Logical fields packed after the full-width state id in a planar record.
+/// Offsets count from the least-significant bit of `payload[0]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuadFieldSpec {
+    name: &'static str,
+    offset: u8,
+    bits: u8,
+}
+
+const PLANAR_QUAD_SCHEMA: &[QuadFieldSpec] = &[
+    QuadFieldSpec {
+        name: "origin_x_fixed",
+        offset: 0,
+        bits: 15,
+    },
+    QuadFieldSpec {
+        name: "origin_y_fixed",
+        offset: 15,
+        bits: 15,
+    },
+    QuadFieldSpec {
+        name: "origin_z_fixed",
+        offset: 30,
+        bits: 15,
+    },
+    QuadFieldSpec {
+        name: "span_u_fixed",
+        offset: 45,
+        bits: 15,
+    },
+    QuadFieldSpec {
+        name: "span_v_fixed",
+        offset: 60,
+        bits: 15,
+    },
+    QuadFieldSpec {
+        name: "face",
+        offset: 75,
+        bits: 3,
+    },
+    QuadFieldSpec {
+        name: "diagonal",
+        offset: 78,
+        bits: 1,
+    },
+    QuadFieldSpec {
+        name: "ao",
+        offset: 79,
+        bits: 8,
+    },
+    QuadFieldSpec {
+        name: "corner_light",
+        offset: 87,
+        bits: 32,
+    },
+    QuadFieldSpec {
+        name: "tint",
+        offset: 119,
+        bits: 24,
+    },
+    QuadFieldSpec {
+        name: "material_flags",
+        offset: 143,
+        bits: 8,
+    },
+];
+
+/// Opaque planar quad record: full-width state id plus a 151-bit payload.
+/// Coordinates and spans use 1/1024 block units, matching packed vertex Y.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PlanarQuadRecord {
+    pub state_id: u32,
+    payload: [u32; 5],
+}
+
+const _: () = assert!(std::mem::size_of::<PlanarQuadRecord>() == 24);
+
+/// One expanded vertex pulled from a [`PlanarQuadRecord`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ExpandedQuadCorner {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub ao: u8,
+    pub block_light: u8,
+    pub sky_light: u8,
+    pub state_id: u32,
+    pub tint: u32,
+    pub material_flags: u8,
+    pub corner: u8,
+}
+
+impl PlanarQuadRecord {
+    /// Packs a section-local planar quad. `origin_fixed` is corner 0 and all
+    /// coordinates/spans are in 1/1024-block units. Returns `None` for values
+    /// the 24-byte schema cannot represent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack(
+        state_id: u32,
+        origin_fixed: [u32; 3],
+        span_fixed: [u32; 2],
+        face: u8,
+        diagonal: bool,
+        ao: [u8; 4],
+        block_light: [u8; 4],
+        sky_light: [u8; 4],
+        tint: u32,
+        material_flags: u8,
+    ) -> Option<Self> {
+        if origin_fixed.iter().any(|&v| v > 16_384)
+            || span_fixed.iter().any(|&v| v == 0 || v > 16_384)
+            || face >= 6
+            || ao.iter().any(|&v| v > 3)
+            || block_light.iter().chain(&sky_light).any(|&v| v > 15)
+            || tint > COMPACT_VERTEX_MAX_TINT
+        {
+            return None;
+        }
+        if !origin_fixed[0].is_multiple_of(1024)
+            || !origin_fixed[2].is_multiple_of(1024)
+            || span_fixed.iter().any(|&value| !value.is_multiple_of(1024))
+        {
+            return None;
+        }
+        let tangents = QUAD_TANGENTS[usize::from(face)];
+        for (span, tangent) in span_fixed.iter().zip(tangents) {
+            let axis = usize::from(tangent.unsigned_abs() - 1);
+            if origin_fixed[axis] + span > 16_384 {
+                return None;
+            }
+        }
+
+        let mut payload = [0; 5];
+        let values = [
+            origin_fixed[0],
+            origin_fixed[1],
+            origin_fixed[2],
+            span_fixed[0],
+            span_fixed[1],
+            u32::from(face),
+            u32::from(diagonal),
+            u32::from(ao[0])
+                | (u32::from(ao[1]) << 2)
+                | (u32::from(ao[2]) << 4)
+                | (u32::from(ao[3]) << 6),
+            u32::from(block_light[0] | (sky_light[0] << 4))
+                | (u32::from(block_light[1] | (sky_light[1] << 4)) << 8)
+                | (u32::from(block_light[2] | (sky_light[2] << 4)) << 16)
+                | (u32::from(block_light[3] | (sky_light[3] << 4)) << 24),
+            tint,
+            u32::from(material_flags),
+        ];
+        for (field, value) in PLANAR_QUAD_SCHEMA.iter().zip(values) {
+            write_bits(
+                &mut payload,
+                usize::from(field.offset),
+                usize::from(field.bits),
+                value,
+            );
+        }
+        Some(Self { state_id, payload })
+    }
+
+    /// Triangle indices matching the greedy mesher's two diagonal choices.
+    pub const fn indices(&self) -> [u8; 6] {
+        if read_bits_const(&self.payload, 78, 1) == 0 {
+            [0, 1, 2, 0, 2, 3]
+        } else {
+            [0, 1, 3, 1, 2, 3]
+        }
+    }
+
+    /// Expands corners in their original order with cardinal face normal,
+    /// planar UV projection, AO, and packed block/sky light.
+    pub fn expand_corners(&self) -> [ExpandedQuadCorner; 4] {
+        let origin = [
+            read_bits(&self.payload, 0, 15) as f32 / 1024.0,
+            read_bits(&self.payload, 15, 15) as f32 / 1024.0,
+            read_bits(&self.payload, 30, 15) as f32 / 1024.0,
+        ];
+        let spans = [
+            read_bits(&self.payload, 45, 15) as f32 / 1024.0,
+            read_bits(&self.payload, 60, 15) as f32 / 1024.0,
+        ];
+        let face = read_bits(&self.payload, 75, 3) as usize;
+        let ao_word = read_bits(&self.payload, 79, 8);
+        let light_word = read_bits(&self.payload, 87, 32);
+        let tangent = QUAD_TANGENTS[face];
+        let normal = QUAD_NORMALS[face];
+        let uv_axes = QUAD_UV_AXES[face];
+        let tint = read_bits(&self.payload, 119, 24);
+        let material_flags = read_bits(&self.payload, 143, 8) as u8;
+        std::array::from_fn(|corner| {
+            let mut position = origin;
+            if corner == 1 || corner == 2 {
+                position[tangent[0].unsigned_abs() as usize - 1] +=
+                    spans[0] * f32::from(tangent[0].signum());
+            }
+            if corner >= 2 {
+                position[tangent[1].unsigned_abs() as usize - 1] +=
+                    spans[1] * f32::from(tangent[1].signum());
+            }
+            let packed_light = (light_word >> (corner * 8)) as u8;
+            ExpandedQuadCorner {
+                position,
+                normal,
+                uv: [position[uv_axes[0]], position[uv_axes[1]]],
+                ao: ((ao_word >> (corner * 2)) & 3) as u8,
+                block_light: packed_light & 15,
+                sky_light: packed_light >> 4,
+                state_id: self.state_id,
+                tint,
+                material_flags,
+                corner: corner as u8,
+            }
+        })
+    }
+}
+
+const QUAD_TANGENTS: [[i8; 2]; 6] = [[1, 3], [3, 1], [2, 1], [1, 2], [3, 2], [2, 3]];
+const QUAD_NORMALS: [[f32; 3]; 6] = [
+    [0.0, -1.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, -1.0],
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [1.0, 0.0, 0.0],
+];
+const QUAD_UV_AXES: [[usize; 2]; 6] = [[0, 2], [0, 2], [0, 1], [0, 1], [2, 1], [2, 1]];
+
+fn write_bits(words: &mut [u32; 5], offset: usize, bits: usize, mut value: u32) {
+    let mut remaining = bits;
+    let mut cursor = offset;
+    while remaining != 0 {
+        let word = cursor / 32;
+        let shift = cursor % 32;
+        let count = remaining.min(32 - shift);
+        let mask = if count == 32 {
+            u32::MAX
+        } else {
+            (1u32 << count) - 1
+        };
+        words[word] |= (value & mask) << shift;
+        value >>= count;
+        cursor += count;
+        remaining -= count;
+    }
+}
+
+fn read_bits(words: &[u32; 5], offset: usize, bits: usize) -> u32 {
+    let mut value = 0;
+    let mut written = 0;
+    let mut remaining = bits;
+    let mut cursor = offset;
+    while remaining != 0 {
+        let word = cursor / 32;
+        let shift = cursor % 32;
+        let count = remaining.min(32 - shift);
+        let mask = if count == 32 {
+            u32::MAX
+        } else {
+            (1u32 << count) - 1
+        };
+        value |= ((words[word] >> shift) & mask) << written;
+        cursor += count;
+        written += count;
+        remaining -= count;
+    }
+    value
+}
+
+const fn read_bits_const(words: &[u32; 5], offset: usize, bits: usize) -> u32 {
+    let word = offset / 32;
+    let shift = offset % 32;
+    let mask = (1u32 << bits) - 1;
+    (words[word] >> shift) & mask
+}
+
+/// WGSL decode constants and planar vertex-pulling helper from the same field
+/// offsets used by [`PlanarQuadRecord::pack`].
+pub fn emit_wgsl_quad_pull_unpack() -> String {
+    let mut out =
+        String::from("struct PlanarQuadRecord { state_id: u32, payload: array<u32, 5>, }\n");
+    for field in PLANAR_QUAD_SCHEMA {
+        let mask = (1u64 << field.bits) - 1;
+        out.push_str(&format!(
+            "const PQ_{}_OFFSET: u32 = {}u;\nconst PQ_{}_MASK: u32 = 0x{:x}u;\n",
+            field.name.to_ascii_uppercase(),
+            field.offset,
+            field.name.to_ascii_uppercase(),
+            mask,
+        ));
+    }
+    out.push_str("fn planar_quad_field(payload: array<u32, 5>, bit_offset: u32, width: u32) -> u32 {\n    let word_index = bit_offset / 32u;\n    let shift = bit_offset % 32u;\n    var value = payload[word_index] >> shift;\n    if shift + width > 32u { value = value | (payload[word_index + 1u] << (32u - shift)); }\n    var mask = 0xffffffffu;\n    if width < 32u { mask = (1u << width) - 1u; }\n    return value & mask;\n}\n");
+    out
 }
 
 /// Converts a slice of [`PackedVertex`] values to the compact GPU layout.
