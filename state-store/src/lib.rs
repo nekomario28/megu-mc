@@ -80,6 +80,11 @@
 //! * [`lz4_region`] — the compact `MLZ4` chunk-region container backed by
 //!   canonical `megu_core` LZ4/CRC32 primitives, with per-chunk and aggregate
 //!   128 MiB decompression budgets plus atomic saves.
+//! * [`delta_world`] — the deterministic `MDW1` delta world save and
+//!   content-addressed time-travel generation store: zero-byte base chunks,
+//!   sparse invertible block edits, unknown-block tombstones, Merkle-rooted
+//!   immutable generations, fail-closed epoch checks and atomic blob/manifest
+//!   persistence.
 //! * [`namespace_guard`] — the unknown-namespace preservation router
 //!   ([`namespace_guard::NamespaceTombstoneSidecar`]): when a mod is removed
 //!   or disabled, its `modid:block`/`modid:item`/`modid:entity` payloads are
@@ -94,6 +99,7 @@ pub mod anvil_inspect;
 pub mod audit_log;
 pub mod chunk_packet_cache;
 pub mod datafix;
+pub mod delta_world;
 pub mod incremental_save;
 pub mod lz4_region;
 pub mod migrate;
@@ -117,6 +123,14 @@ pub use audit_log::{
     AuditAction, AuditLog, AuditQuery, AuditRecord, BlockRollbackDelta,
 };
 pub use datafix::{DataFixError, DataFixReport, DataFixStep, DataFixer, DataValue, DV_1_21_1, DV_26_3};
+pub use delta_world::{
+    apply_chunk_delta, compute_chunk_delta, decode_chunk_delta, encode_chunk_delta,
+    invert_chunk_delta, try_compute_chunk_delta, validate_chunk_delta, BlockDeltaEdit,
+    BlockStateDiff, CheckedOutGeneration, ChunkDelta, ChunkGenerationDiff, ChunkStorage,
+    CommitGenerationOptions, DeltaError, DeltaGcReport, DeltaGenerationStore, DeltaStoreError,
+    GenerationChunkRef, GenerationDiff, GenerationRecord, UnknownBlockDiff, UnknownBlockEntry,
+    CHUNK_DELTA_MAGIC, DELTA_WORLD_SCHEMA_VERSION, MAX_CHUNK_STATES,
+};
 pub use incremental_save::{
     content_fingerprint, DrainStats, FlushOutcome, IncrementalSaveBudget, IncrementalSaveQueue,
     PersistedFingerprints, QueuedSave,
