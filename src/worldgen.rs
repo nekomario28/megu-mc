@@ -3612,6 +3612,27 @@ pub(crate) static EVAL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) static DF_HITS: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU64>> =
     std::sync::OnceLock::new();
 
+type ReadVanillaJarResource = fn(&str) -> Option<&'static [u8]>;
+type ListVanillaJarResources = fn(&str) -> Vec<(&'static str, &'static [u8])>;
+
+struct VanillaJarResources {
+    read: ReadVanillaJarResource,
+    list: ListVanillaJarResources,
+}
+
+static VANILLA_JAR_RESOURCES: std::sync::OnceLock<VanillaJarResources> = std::sync::OnceLock::new();
+
+pub(crate) fn register_vanilla_jar_resources(
+    read: ReadVanillaJarResource,
+    list: ListVanillaJarResources,
+) {
+    let _ = VANILLA_JAR_RESOURCES.set(VanillaJarResources { read, list });
+}
+
+fn read_vanilla_jar_resource(path: &str) -> Option<&'static [u8]> {
+    (VANILLA_JAR_RESOURCES.get()?.read)(path)
+}
+
 impl Gen {
     /// Allocate the per-node visit counters for this generator's `dfs` (diagnostic only).
     fn df_hits_init(&self) {
@@ -3678,21 +3699,31 @@ impl Gen {
         {
             return None;
         }
+        let kinds: &[_] = if kind == "structure" && extension == "nbt" {
+            &["structure", "structures"]
+        } else {
+            &[kind]
+        };
         for pack in packs.iter().rev() {
-            let file = pack
-                .join("data")
-                .join(namespace)
-                .join(kind)
-                .join(format!("{path}.{extension}"));
-            match std::fs::read(file) {
-                Ok(bytes) => return Some(bytes),
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::NotADirectory => {}
-                Err(_) => return None,
+            for kind in kinds {
+                let file = pack
+                    .join("data")
+                    .join(namespace)
+                    .join(kind)
+                    .join(format!("{path}.{extension}"));
+                match std::fs::read(file) {
+                    Ok(bytes) => return Some(bytes),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            || e.kind() == std::io::ErrorKind::NotADirectory => {}
+                    Err(_) => return None,
+                }
             }
         }
-        None
+        kinds.iter().find_map(|kind| {
+            read_vanilla_jar_resource(&format!("{namespace}/{kind}/{path}.{extension}"))
+                .map(<[u8]>::to_vec)
+        })
     }
 
     pub(crate) fn dp_files(subdir: &str) -> HashMap<String, Vec<u8>> {
@@ -3714,7 +3745,15 @@ impl Gen {
     }
 
     fn dp_files_one(subdir: &str) -> HashMap<String, Vec<u8>> {
-        let mut m = HashMap::default();
+        let prefix = format!("minecraft/worldgen/{subdir}/");
+        let mut m: HashMap<_, _> = VANILLA_JAR_RESOURCES.get()
+            .map(|source| (source.list)(&prefix))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(path, bytes)| {
+                Some((format!("minecraft:{}", path.strip_suffix(".json")?), bytes.to_vec()))
+            })
+            .collect();
         {
             for p in Gen::packs() {
                 let root = p.join("data");
@@ -3972,6 +4011,12 @@ impl Gen {
                 break 'outer;
             }
         }
+        if g.base.is_empty() {
+            ns_json = read_vanilla_jar_resource(&format!(
+                "minecraft/worldgen/noise_settings/{}.json",
+                preset.name()
+            )).and_then(jparse);
+        }
         let ns = match ns_json {
             Some(j) => j,
             None => {
@@ -4017,21 +4062,21 @@ impl Gen {
                 candidates.push(std::path::PathBuf::from(&g.base));
             }
             candidates.extend(Gen::packs());
-            for p in candidates {
-                let f = p.join(format!("data/minecraft/dimension_type/{file}.json"));
-                let Ok(b) = std::fs::read(&f) else { continue };
-                let Some(j) = jparse(&b) else {
-                    Self::load_trace(&format!(
-                        "dimension_type/{file}.json is not JSON; the world window stays {}/{}",
-                        g.min_y, g.height
-                    ));
-                    break;
-                };
-                match dimension_window(&j, g.min_y, g.height) {
+            let resource = format!("minecraft/dimension_type/{file}.json");
+            let jar = read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec);
+            let (before, after) = if g.base.is_empty() { (jar, None) } else { (None, jar) };
+            let disk = candidates.iter().filter_map(|p| std::fs::read(p.join("data").join(&resource)).ok());
+            if let Some(b) = before.into_iter().chain(disk).chain(after).next() {
+                let json = jparse(&b);
+                match json.as_ref().and_then(|j| dimension_window(j, g.min_y, g.height)) {
                     Some((min_y, height)) => {
                         g.world_min_y = min_y;
                         g.world_height = height;
                     }
+                    None if json.is_none() => Self::load_trace(&format!(
+                        "dimension_type/{file}.json is not JSON; the world window stays {}/{}",
+                        g.min_y, g.height
+                    )),
                     // Fail closed: a window that is not whole sections or that does not
                     // contain the terrain the generator makes would truncate it.
                     None => Self::load_trace(&format!(
@@ -4040,7 +4085,6 @@ impl Gen {
                         g.min_y, g.height
                     )),
                 }
-                break;
             }
         }
         // 1.21.1 writes the router entries as inline density functions (the newer
@@ -4157,21 +4201,52 @@ impl Gen {
                 g.bleaf.insert(name.to_string(), leaf);
             }
         } else {
-            let tp = std::path::Path::new(&g.base).join("multi_noise_biome_tree.json");
-            if let Ok(b) = std::fs::read(&tp) {
-                if let Some(j) = jparse(&b) {
-                    if let Some(ow) = j.get(preset.name()) {
-                        let d = std::sync::Arc::make_mut(&mut g.data);
-                        d.btree = bt_parse(ow, &mut d.biome_names, &mut d.bleaf, &mut d.leaf_ps);
-                    }
+            let tree_file = "multi_noise_biome_tree.json";
+            let dp_tree = std::path::Path::new(&g.base).join(tree_file);
+            let exported = std::fs::read(&dp_tree).ok().or_else(|| {
+                if !g.base.is_empty() {
+                    return None;
+                }
+                let asset_dir = std::env::var_os("MEGU_VERSION_DIR")
+                    .map_or_else(|| std::path::PathBuf::from("assets"), std::path::PathBuf::from);
+                std::fs::read(asset_dir.join(tree_file)).ok()
+            });
+            if let Some(tree) = exported.as_deref().and_then(jparse) {
+                if let Some(branch) = tree.get(preset.name()) {
+                    let d = std::sync::Arc::make_mut(&mut g.data);
+                    d.btree = bt_parse(branch, &mut d.biome_names, &mut d.bleaf, &mut d.leaf_ps);
                 }
             }
             if g.btree.is_none() {
                 Self::load_trace(&format!(
                     "no valid {} biome tree at {}",
                     preset.name(),
-                    tp.display()
+                    dp_tree.display()
                 ));
+                // The official JAR stores the preset name and biome JSONs, but
+                // builds the interval tree in Java. Use a single biome until an
+                // exported tree is supplied alongside the generated assets.
+                if g.base.is_empty() {
+                    let biome = if preset == NoisePreset::Overworld {
+                        "minecraft:plains"
+                    } else {
+                        "minecraft:nether_wastes"
+                    };
+                    eprintln!("[wg] {} biome tree unavailable; using {biome}", preset.name());
+                    let d = std::sync::Arc::make_mut(&mut g.data);
+                    let bounds = [[i32::MIN, i32::MAX]; 7];
+                    d.biome_names = vec![biome.to_owned()];
+                    d.bleaf = HashMap::from([(biome.to_owned(), 0)]);
+                    d.leaf_ps = vec![bounds];
+                    d.btree = Some(BT {
+                        nodes: vec![BTNode {
+                            bounds,
+                            child_start: 0,
+                            child_len: 0,
+                            off6_sq: 0,
+                        }],
+                    });
+                }
             }
         }
         // SurfaceRules.Temperature reads biome weather, not the noise-router
@@ -4761,12 +4836,15 @@ impl Gen {
                 return Some(id);
             }
         }
-        let path = format!(
-            "{}/data/minecraft/worldgen/noise/{}.json",
-            self.base,
-            name.rsplit(':').next().unwrap_or(name)
-        );
-        let b = std::fs::read(&path).ok()?;
+        let key = name.rsplit(':').next().unwrap_or(name);
+        let resource = format!("minecraft/worldgen/noise/{key}.json");
+        let b = if self.base.is_empty() {
+            read_vanilla_jar_resource(&resource)?.to_vec()
+        } else {
+            std::fs::read(std::path::Path::new(&self.base).join("data").join(&resource))
+                .ok()
+                .or_else(|| read_vanilla_jar_resource(&resource).map(<[u8]>::to_vec))?
+        };
         let j = jparse(&b)?;
         // 1.21.1 noise files: `firstOctave` + `amplitudes`. The converted pack re-encoded
         // the same octaves as `base_octave`/`base_amplitude`/`octave_count`; both load,

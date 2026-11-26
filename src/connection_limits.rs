@@ -1147,7 +1147,7 @@ impl Default for ClientTxQueue {
 /// packet)` uses for a positioned world-effect packet, read from the packet
 /// itself: sounds (`0x68`) carry `16 * volume` with a 16-block floor, level
 /// particles (`0x29`) reach 512 blocks only under their long-distance flag
-/// (otherwise 32), and explosions (`0x20`) reach 64. `None` means the packet
+/// (otherwise 32), and explosions (`0x20`) and level events (`0x28`) reach 64. `None` means the packet
 /// has no vanilla range contract — a culled broadcast must refuse to send it
 /// rather than silently reach everyone.
 pub(crate) fn broadcast_radius(id: i64, payload: &[u8]) -> Option<f64> {
@@ -1162,7 +1162,7 @@ pub(crate) fn broadcast_radius(id: i64, payload: &[u8]) -> Option<f64> {
             Some((16.0 * f64::from(volume)).max(16.0))
         }
         0x29 => Some(if payload.first() == Some(&1) { 512.0 } else { 32.0 }),
-        0x20 => Some(64.0),
+        0x20 | 0x28 => Some(64.0),
         _ => None,
     }
 }

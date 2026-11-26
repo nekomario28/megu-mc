@@ -3724,6 +3724,12 @@ struct VillagerFamilyState {
     gift_cooldown: u32,
 }
 
+struct LiveWanderingTrader {
+    despawn_delay: u32,
+    offers: Vec<MerchantOffer>,
+    customer: Option<VillageUuid>,
+}
+
 const MAX_LIVE_VILLAGER_REGISTRY_ENTRIES: usize = 4_096;
 
 fn live_villager_family_states() -> &'static LockedMap<i32, VillagerFamilyState> {
@@ -3736,8 +3742,9 @@ fn live_zombie_villager_cures() -> &'static LockedMap<i32, ZombieVillagerCure> {
     CURES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn live_wandering_traders() -> &'static LockedMap<i32, (u32, Vec<MerchantOffer>)> {
-    static TRADERS: Registry<i32, (u32, Vec<MerchantOffer>)> = OnceLock::new();
+
+fn live_wandering_traders() -> &'static LockedMap<i32, LiveWanderingTrader> {
+    static TRADERS: Registry<i32, LiveWanderingTrader> = OnceLock::new();
     TRADERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -3837,7 +3844,6 @@ fn live_villager_tick(tick: u64) {
             )
         })
         .collect();
-    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
 
     // A villager killed by a zombie zombifies at the difficulty-dependent
     // vanilla rate. Preserve its profession, XP and offers for the later cure.
@@ -3863,7 +3869,8 @@ fn live_villager_tick(tick: u64) {
         if percent == 0 || world_rng::next_below(100) >= u32::from(percent) {
             continue;
         }
-        let (profession, xp, offers) = villagers.get(&eid)
+        let (profession, xp, offers) = live_villagers()
+            .lock().unwrap_or_else(|e| e.into_inner()).get(&eid)
             .map(|villager| (villager.profession, villager.villager_xp, villager.offers.clone()))
             .unwrap_or((VillagerProfession::None, 0, Vec::new()));
         if zombie_villager_etype.is_some() {
@@ -3884,6 +3891,7 @@ fn live_villager_tick(tick: u64) {
         }
     }
 
+    let mut villagers = live_villagers().lock().unwrap_or_else(|e| e.into_inner());
     let live_eids: HashSet<i32> = live.iter().map(|&(eid, ..)| eid).collect();
     // A removed or dead villager releases its POI claims before its record
     // goes; without this a village stays claimed by ghosts.
@@ -3912,6 +3920,7 @@ fn live_villager_tick(tick: u64) {
     let hero_effect = live_effect_id("hero_of_the_village");
     let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
     family.retain(|eid, _| live_eids.contains(eid));
+    let mut farmer_jobs = Vec::new();
     for &(eid, uuid, dim, position) in &live {
         let villager = villagers
             .entry(eid)
@@ -3937,12 +3946,7 @@ fn live_villager_tick(tick: u64) {
                 && villager.profession == VillagerProfession::Farmer
             {
                 if let Some(site) = villager.job_site {
-                    if let Some(reg) = crate::block_registry::breg() {
-                        if let Some(points) = farmer_harvest_replant_nearby_crop(reg, dim, site) {
-                            state.food_points = (state.food_points + points).min(24);
-                        }
-                    }
-                    farmer_composter_work(dim, position, site, tick);
+                    farmer_jobs.push((eid, dim, position, site));
                 }
             }
 
@@ -3986,8 +3990,29 @@ fn live_villager_tick(tick: u64) {
         }
     }
 
+    // World writes enter SAVE_LOCK. The snapshot takes that lock before
+    // visiting the villager registry.
+    drop(family);
+    drop(villagers);
+    if gamerule_live_value("mobGriefing") != 0 {
+        if let Some(reg) = breg() {
+            for (eid, dim, position, site) in farmer_jobs {
+                if let Some(points) = farmer_harvest_replant_nearby_crop(reg, dim, position, site) {
+                    if let Some(state) = live_villager_family_states()
+                        .lock().unwrap_or_else(|e| e.into_inner()).get_mut(&eid)
+                    {
+                        state.food_points = (state.food_points + points).min(24);
+                    }
+                }
+                farmer_composter_work(dim, position, site, tick);
+            }
+        }
+    }
+
     // Food sharing and breeding run on the vanilla once-per-second brain tick.
     if tick.is_multiple_of(20) {
+        let mut breeding = Vec::new();
+        let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
         for i in 0..live.len() {
             for j in i + 1..live.len() {
                 let (aeid, _, adim, apos) = live[i];
@@ -4005,28 +4030,50 @@ fn live_villager_tick(tick: u64) {
                     family.get_mut(&donor_eid).unwrap().food_points = donor_points;
                     family.get_mut(&recipient_eid).unwrap().food_points = recipient_points;
                 }
-                let willing = villager_willing(af.food_points.max(donor_points)) && villager_willing(bf.food_points.max(recipient_points));
+                let willing = [aeid, beid].into_iter()
+                    .all(|eid| villager_willing(family[&eid].food_points));
                 if !willing { continue; }
-                let can_breed = {
-                    let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-                    let empty = PoiRegistry::default();
-                    let pois = registries.get(&adim).unwrap_or(&empty);
-                    villager_can_breed(pois, apos, 48, 2)
-                };
-                if !can_breed { continue; }
-                if let Some(child) = live_spawn_named(adim, "villager", (
-                    (apos.0 + bpos.0) as f64 / 2.0 + 0.5,
-                    apos.1 as f64,
-                    (apos.2 + bpos.2) as f64 / 2.0 + 0.5,
-                    0.0, 0.0,
-                )) {
-                    family.insert(child.eid, VillagerFamilyState { age_ticks: -VILLAGER_BABY_GROWTH_TICKS, food_points: 0, gift_cooldown: 0 });
-                    for parent in [aeid, beid] {
-                        if let Some(state) = family.get_mut(&parent) { state.food_points = 0; }
-                    }
+                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+                if !registries.get(&adim).is_some_and(|pois| villager_can_breed(pois, apos, 48, 2)) {
+                    continue;
                 }
+                breeding.push((aeid, beid, adim, apos, bpos));
                 break;
             }
+        }
+        drop(family);
+        for (aeid, beid, dim, apos, bpos) in breeding {
+            with_save_guard(|| {
+                let mut family = live_villager_family_states().lock().unwrap_or_else(|e| e.into_inner());
+                if ![aeid, beid].into_iter().all(|eid| family.get(&eid)
+                    .is_some_and(|state| villager_willing(state.food_points)))
+                {
+                    return;
+                }
+                let both_alive = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
+                    .filter(|mob| [aeid, beid].contains(&mob.eid)
+                        && *mob.hp.lock().unwrap_or_else(|e| e.into_inner()) > 0.0)
+                    .count() == 2;
+                if !both_alive {
+                    return;
+                }
+                if let Some(child) = live_spawn_named(dim, "villager", (
+                    (f64::from(apos.0) + f64::from(bpos.0)) / 2.0 + 0.5,
+                    f64::from(apos.1),
+                    (f64::from(apos.2) + f64::from(bpos.2)) / 2.0 + 0.5,
+                    0.0, 0.0,
+                )) {
+                    family.insert(child.eid, VillagerFamilyState {
+                        age_ticks: -VILLAGER_BABY_GROWTH_TICKS,
+                        ..VillagerFamilyState::default()
+                    });
+                    for parent in [aeid, beid] {
+                        if let Some(state) = family.get_mut(&parent) {
+                            state.food_points = 0;
+                        }
+                    }
+                }
+            });
         }
     }
 }
@@ -4051,13 +4098,17 @@ fn live_zombie_villager_cure_tick() {
     let mut finished = Vec::new();
     for (&eid, cure) in cures.iter_mut() {
         let Some(&(dim, pos)) = positions.get(&eid) else { continue };
-        let accelerants = zombie_cure_accelerants_in_cube(pos, |block| {
-            crate::block_registry::breg().is_some_and(|reg| {
+        let scan_roll = world_rng::next_below(100);
+        let (accelerants, block_roll) = if scan_roll == 0 {
+            let accelerants = breg().map_or(0, |reg| zombie_cure_accelerants_in_cube(pos, |block| {
                 let name = reg.name_of(block_at_dim(dim, block.0, block.1, block.2));
                 name == "minecraft:iron_bars" || name.ends_with("_bed")
-            })
-        });
-        if cure.tick_with_rolls(accelerants, world_rng::next_below(100), world_rng::next_below(100)) {
+            }));
+            (accelerants, world_rng::next_below(100))
+        } else {
+            (0, 0)
+        };
+        if cure.tick_with_rolls(accelerants, scan_roll, block_roll) {
             finished.push((eid, dim, pos));
         }
     }
@@ -4101,8 +4152,11 @@ fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u
         .unwrap_or(0);
     let write = |level: u8| {
         let next = reg.with_prop(st, "level", &level.to_string());
-        set_block_dim(dim, site.0, site.1, site.2, next);
-        note_block_update_dim(dim, site.0, site.1, site.2, next);
+        let changed = set_block_if_dim(dim, site.0, site.1, site.2, next, Some(st));
+        if changed {
+            note_block_update_dim(dim, site.0, site.1, site.2, next);
+        }
+        changed
     };
     if level < 7 {
         // Farmers carry seeds: use the wheat-seed row of the compostables
@@ -4116,8 +4170,9 @@ fn farmer_composter_work(dim: DimId, position: BlockPos, site: BlockPos, tick: u
     } else if level == 7 {
         write(composter_mature(level));
     } else if let Some((rest, _produce)) = composter_harvest(level) {
-        write(rest);
-        farmer_bonemeal_nearby_crop(reg, dim, site);
+        if write(rest) {
+            farmer_bonemeal_nearby_crop(reg, dim, site);
+        }
     }
 }
 
@@ -4141,12 +4196,16 @@ fn farmer_crop_max_age(name: &str) -> u8 {
 fn farmer_harvest_replant_nearby_crop(
     reg: &crate::block_registry::BReg,
     dim: DimId,
+    position: BlockPos,
     site: BlockPos,
 ) -> Option<i32> {
     for dy in -1..=1 {
         for dx in -2..=2 {
             for dz in -2..=2 {
                 let pos = (site.0 + dx, site.1 + dy, site.2 + dz);
+                if !villager_within(position, pos, 2) {
+                    continue;
+                }
                 let st = block_at_dim(dim, pos.0, pos.1, pos.2);
                 let name = reg.name_of(st);
                 if !matches!(name, "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" | "minecraft:beetroots") {
@@ -4157,9 +4216,10 @@ fn farmer_harvest_replant_nearby_crop(
                     continue;
                 }
                 let replanted = reg.with_prop(st, "age", "0");
-                set_block_dim(dim, pos.0, pos.1, pos.2, replanted);
-                note_block_update_dim(dim, pos.0, pos.1, pos.2, replanted);
-                return Some(farmer_crop_food_points(name));
+                if set_block_if_dim(dim, pos.0, pos.1, pos.2, replanted, Some(st)) {
+                    note_block_update_dim(dim, pos.0, pos.1, pos.2, replanted);
+                    return Some(farmer_crop_food_points(name));
+                }
             }
         }
     }
@@ -4192,13 +4252,15 @@ fn farmer_bonemeal_nearby_crop(
                     .get_prop(st, "age")
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(0);
-                if age >= 7 {
+                let max_age = farmer_crop_max_age(reg.name_of(st));
+                if age >= max_age {
                     continue;
                 }
-                let grown = reg.with_prop(st, "age", &(age + 2).min(7).to_string());
-                set_block_dim(dim, pos.0, pos.1, pos.2, grown);
-                note_block_update_dim(dim, pos.0, pos.1, pos.2, grown);
-                return;
+                let grown = reg.with_prop(st, "age", &(age + 2).min(max_age).to_string());
+                if set_block_if_dim(dim, pos.0, pos.1, pos.2, grown, Some(st)) {
+                    note_block_update_dim(dim, pos.0, pos.1, pos.2, grown);
+                    return;
+                }
             }
         }
     }
@@ -4282,7 +4344,7 @@ fn live_raid_omen_tick() {
                 live_remove_effect(client, raid_omen);
             }
             if let Some(raid) = raid {
-                live_raid_bossbar_write(dim, raid.center, None, 0, &clients);
+                live_raid_bossbar_write(dim, raid.center, 0, 0, &clients);
                 saved_raids().lock().unwrap_or_else(|e| e.into_inner()).push((dim, raid));
             }
             continue;
@@ -4361,12 +4423,12 @@ fn live_raid_audience(
 }
 
 /// Write one bossbar action for a raid: 0 add, 1 remove, 2 progress update.
-/// `raid` supplies the remaining/total raider counts for the progress bar.
+/// The progress bar uses the live wave total and the current remaining count.
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_bossbar_write(
     dim: DimId,
     center: BlockPos,
-    raid: Option<&Raid>,
+    remaining: i32,
     action: u8,
     clients: &[Arc<Client>],
 ) {
@@ -4389,7 +4451,6 @@ fn live_raid_bossbar_write(
         .copied()
         .unwrap_or(1)
         .max(1);
-    let remaining = raid.map_or(0, |raid| raid.remaining.len() as i32);
     let mut bars = bossbars().lock().unwrap_or_else(|e| e.into_inner());
     let bar = bars.entry(id.clone()).or_insert_with(|| Bossbar {
         name: "Raid".into(),
@@ -4437,8 +4498,13 @@ fn raider_entity_name(kind: RaiderType) -> &'static str {
 /// hunts down from the village's surface for each slot; a rotated ring on the
 /// terrain surface is the bounded version of that search.
 #[cfg_attr(not(test), allow(dead_code))]
-fn live_raid_spawn_wave(dim: DimId, raid: &Raid, mut wave: RaidWave) {
-    let bonus_wave = wave.number > raid.regular_waves;
+fn live_raid_spawn_wave(
+    dim: DimId,
+    center: BlockPos,
+    regular_waves: u8,
+    mut wave: RaidWave,
+) -> (HashSet<RaidRaiderId>, Option<i32>) {
+    let bonus_wave = wave.number > regular_waves;
     let riders = raid_wave_adjustments(
         raid_difficulty(), wave.number, bonus_wave, &mut wave.counts,
         world_rng::next_below(u32::MAX), world_rng::next_below(u32::MAX),
@@ -4448,8 +4514,10 @@ fn live_raid_spawn_wave(dim: DimId, raid: &Raid, mut wave: RaidWave) {
     }
     let total = wave.raiders().count().max(1);
     let mut first_raider_eid = None;
-    let cx = raid.center.0 as f64 + 0.5;
-    let cz = raid.center.2 as f64 + 0.5;
+    let mut remaining = HashSet::new();
+    let mut captain_spawned = false;
+    let cx = center.0 as f64 + 0.5;
+    let cz = center.2 as f64 + 0.5;
     for (index, (raider_id, kind)) in wave.raiders().enumerate() {
         let Some(spec) = entity_spec_by_name(raider_entity_name(kind)) else {
             continue;
@@ -4483,22 +4551,22 @@ fn live_raid_spawn_wave(dim: DimId, raid: &Raid, mut wave: RaidWave) {
             if first_raider_eid.is_none() {
                 first_raider_eid = Some(mob.eid);
             }
-            if wave.captain == Some(raider_id) {
-                live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, (dim, raid.center));
+            remaining.insert(raider_id);
+            if !captain_spawned && matches!(kind, RaiderType::Vindicator | RaiderType::Evoker | RaiderType::Pillager) {
+                captain_spawned = true;
+                live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).insert(mob.eid, (dim, center));
             }
             live_raid_mobs()
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(mob.eid, (dim, raid.center, raider_id));
+                .insert(mob.eid, (dim, center, raider_id));
         }
-    }
-    if let Some(eid) = first_raider_eid {
-        broadcast_entity_sound(eid, "minecraft:event.raid.horn", 6);
     }
     live_raid_wave_totals()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert((dim, raid.center), total as i32);
+        .insert((dim, center), remaining.len() as i32);
+    (remaining, first_raider_eid)
 }
 
 const RAID_BELL_GLOWING_TICKS: u64 = 60;
@@ -4538,9 +4606,10 @@ fn live_consume_powered_bells(dim: DimId) -> Vec<BlockPos> {
             continue;
         }
         let reset = reg.with_prop(st, "powered", "false");
-        set_block_dim(dim, pos.0, pos.1, pos.2, reset);
-        note_block_update_dim(dim, pos.0, pos.1, pos.2, reset);
-        ringing.push(pos);
+        if set_block_if_dim(dim, pos.0, pos.1, pos.2, reset, Some(st)) {
+            note_block_update_dim(dim, pos.0, pos.1, pos.2, reset);
+            ringing.push(pos);
+        }
     }
     ringing
 }
@@ -4625,10 +4694,12 @@ fn living_villagers_near(dim: DimId, center: BlockPos) -> usize {
 #[cfg_attr(not(test), allow(dead_code))]
 fn live_raid_step() {
     let clients = client_snapshot();
-    let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
-    if raids.is_empty() {
+    let raid_dims: HashSet<DimId> = saved_raids().lock().unwrap_or_else(|e| e.into_inner())
+        .iter().map(|(dim, _)| *dim).collect();
+    if raid_dims.is_empty() {
         live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner()).clear();
-        return;
+        live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).clear();
+        live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     let now = TICK.load(Ordering::Relaxed);
     {
@@ -4640,7 +4711,9 @@ fn live_raid_step() {
             broadcast_seen(*eid, |_| (0x58, live_mob_metadata(*eid, 0, 0, 0)));
         }
     }
-    let raid_dims: HashSet<DimId> = raids.iter().map(|(dim, _)| *dim).collect();
+    if raid_dims.is_empty() {
+        return;
+    }
     for dim in raid_dims {
         for bell in live_consume_powered_bells(dim) {
             live_apply_bell_glowing(dim, bell, now);
@@ -4664,39 +4737,85 @@ fn live_raid_step() {
             }
         }
     }
-    if !defeated.is_empty() {
-        let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
-        for (eid, dim, center, raider, killer) in defeated {
-            tracked.remove(&eid);
-            if live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid).is_some() {
-                if let Some(banner) = name_to_item("ominous_banner") {
-                    let pos = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid)
-                        .map(|mob| *mob.pos.lock().unwrap_or_else(|e| e.into_inner()));
-                    if let Some((x, y, z, ..)) = pos {
-                        drop_spawn_in_dim(dim, DropSpawn {
-                            x, y, z, item: banner, cnt: 1, comps: Vec::new(), age: 0, target: None, thrower: killer,
-                        });
+    // Keep the raid advance and its actual mobs in the same save transaction,
+    // but release the raid registry before any spawn or network update.
+    let (events, horns, ended) = with_save_guard(|| {
+        let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+        let mut events = Vec::new();
+        if !defeated.is_empty() {
+            let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+            for (eid, dim, center, raider, killer) in defeated {
+                tracked.remove(&eid);
+                if live_raid_captains().lock().unwrap_or_else(|e| e.into_inner()).remove(&eid).is_some() {
+                    if let Some(banner) = name_to_item("ominous_banner") {
+                        let pos = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter().find(|mob| mob.eid == eid)
+                            .map(|mob| *mob.pos.lock().unwrap_or_else(|e| e.into_inner()));
+                        if let Some((x, y, z, ..)) = pos {
+                            drop_spawn_in_dim(dim, DropSpawn {
+                                x, y, z, item: banner, cnt: 1, comps: Vec::new(), age: 0, target: None, thrower: killer,
+                            });
+                        }
                     }
                 }
-            }
-            if let Some((_, raid)) = raids
-                .iter_mut()
-                .find(|(d, raid)| *d == dim && raid.center == center)
-            {
-                raid.record_defeat(raider, killer);
+                if let Some((_, raid)) = raids
+                    .iter_mut()
+                    .find(|(d, raid)| *d == dim && raid.center == center)
+                {
+                    raid.record_defeat(raider, killer);
+                }
             }
         }
+        for (dim, raid) in raids.iter_mut() {
+            let living = living_villagers_near(*dim, raid.center);
+            let event = {
+                let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
+                let empty = PoiRegistry::default();
+                let pois = registries.get(dim).unwrap_or(&empty);
+                raid.tick(pois, living)
+            };
+            if raid.state != RaidState::Stopped {
+                events.push((*dim, raid.center, raid.regular_waves, raid.remaining.len() as i32, event));
+            }
+        }
+        let ended: Vec<(DimId, BlockPos)> = raids
+            .iter()
+            .filter(|(_, raid)| raid.state == RaidState::Stopped)
+            .map(|(dim, raid)| (*dim, raid.center))
+            .collect();
+        if !ended.is_empty() {
+            let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
+            let mut totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
+            let mut captains = live_raid_captains().lock().unwrap_or_else(|e| e.into_inner());
+            for (dim, center) in &ended {
+                captains.retain(|_, raid| *raid != (*dim, *center));
+                tracked.retain(|_, (d, c, _)| !(*d == *dim && *c == *center));
+                totals.remove(&(*dim, *center));
+            }
+        }
+        raids.retain(|(_, raid)| raid.state != RaidState::Stopped);
+        drop(raids);
+        let mut horns = Vec::new();
+        for (dim, center, regular_waves, count, event) in &mut events {
+            let Some(RaidEvent::SpawnWave(wave)) = event else {
+                continue;
+            };
+            let (remaining, horn) = live_raid_spawn_wave(*dim, *center, *regular_waves, *wave);
+            *count = remaining.len() as i32;
+            let mut raids = saved_raids().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, raid)) = raids.iter_mut().find(|(d, raid)| {
+                *d == *dim && raid.center == *center && raid.waves_spawned == wave.number
+            }) {
+                raid.remaining = remaining;
+            }
+            horns.extend(horn);
+        }
+        (events, horns, ended)
+    });
+    for eid in horns {
+        broadcast_entity_sound(eid, "minecraft:event.raid.horn", 6);
     }
-    for (dim, raid) in raids.iter_mut() {
-        let living = living_villagers_near(*dim, raid.center);
-        let event = {
-            let registries = live_pois().lock().unwrap_or_else(|e| e.into_inner());
-            let empty = PoiRegistry::default();
-            let pois = registries.get(dim).unwrap_or(&empty);
-            raid.tick(pois, living)
-        };
+    for (dim, center, _, count, event) in events {
         match event {
-            Some(RaidEvent::SpawnWave(wave)) => live_raid_spawn_wave(*dim, raid, wave),
             Some(RaidEvent::Victory {
                 participants,
                 effect,
@@ -4716,10 +4835,10 @@ fn live_raid_step() {
                     .map(|client| client.eid)
                     .unwrap_or(0);
                 let positions: Vec<(f64, f64, f64)> = mobs().lock().unwrap_or_else(|e| e.into_inner()).iter()
-                    .filter(|mob| mob.dim == *dim && Some(mob.etype) == villager_etype)
+                    .filter(|mob| mob.dim == dim && Some(mob.etype) == villager_etype)
                     .filter_map(|mob| {
                         let (x, y, z, ..) = *mob.pos.lock().unwrap_or_else(|e| e.into_inner());
-                        villager_within((x.floor() as i32, y.floor() as i32, z.floor() as i32), raid.center, 64)
+                        villager_within((x.floor() as i32, y.floor() as i32, z.floor() as i32), center, 64)
                             .then_some((x, y, z))
                     }).collect();
                 let mut live_fireworks = fireworks().lock().unwrap_or_else(|e| e.into_inner());
@@ -4734,29 +4853,20 @@ fn live_raid_step() {
                     });
                 }
                 drop(live_fireworks);
-                live_raid_bossbar_write(*dim, raid.center, None, 1, &clients);
+                live_raid_bossbar_write(dim, center, 0, 1, &clients);
             }
             Some(RaidEvent::Loss) => {
-                live_raid_bossbar_write(*dim, raid.center, None, 1, &clients);
+                live_raid_bossbar_write(dim, center, 0, 1, &clients);
             }
-            None => live_raid_bossbar_write(*dim, raid.center, Some(raid), 2, &clients),
+            Some(RaidEvent::SpawnWave(_)) | None => {
+                live_raid_bossbar_write(dim, center, count, 2, &clients);
+            }
         }
     }
-    let ended: Vec<(DimId, BlockPos)> = raids
-        .iter()
-        .filter(|(_, raid)| raid.state == RaidState::Stopped)
-        .map(|(dim, raid)| (*dim, raid.center))
-        .collect();
-    if !ended.is_empty() {
-        let mut tracked = live_raid_mobs().lock().unwrap_or_else(|e| e.into_inner());
-        let mut totals = live_raid_wave_totals().lock().unwrap_or_else(|e| e.into_inner());
-        for (dim, center) in &ended {
-            tracked.retain(|_, (d, c, _)| !(*d == *dim && *c == *center));
-            totals.remove(&(*dim, *center));
-            live_raid_bossbar_write(*dim, *center, None, 1, &clients);
-        }
+    for (dim, center) in ended {
+        live_raid_bossbar_write(dim, center, 0, 1, &clients);
     }
-    raids.retain(|(_, raid)| raid.state != RaidState::Stopped);
+
 }
 
 // ---------- P2: patrol / trader / warden / phantom spawner gamerules ----------
@@ -4887,7 +4997,11 @@ fn live_spawn_trader(dim: DimId, center: (f64, f64, f64)) -> bool {
         ) {
             let offers = wandering_trader_offers(|bound| world_rng::next_below(bound as u32) as usize);
             live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner())
-                .insert(trader.eid, (WANDERING_TRADER_DESPAWN_TICKS, offers));
+                .insert(trader.eid, LiveWanderingTrader {
+                    despawn_delay: WANDERING_TRADER_DESPAWN_TICKS,
+                    offers,
+                    customer: None,
+                });
             spawned = Some((bx, by, bz));
             break;
         }
@@ -5032,10 +5146,17 @@ fn live_special_spawn_tick(clients: &[Arc<Client>]) {
     // natural despawn scanner.
     {
         let mut traders = live_wandering_traders().lock().unwrap_or_else(|e| e.into_inner());
+        if !traders.is_empty() {
+            let mobs = mobs().lock().unwrap_or_else(|e| e.into_inner());
+            traders.retain(|eid, _| mobs.iter().any(|mob| mob.eid == *eid));
+        }
         let mut expired = Vec::new();
-        for (&eid, (delay, _)) in traders.iter_mut() {
-            let (next, done) = wandering_trader_despawn_tick(*delay);
-            *delay = next;
+        for (&eid, trader) in traders.iter_mut() {
+            if trader.customer.is_some() {
+                continue;
+            }
+            let (next, done) = wandering_trader_despawn_tick(trader.despawn_delay);
+            trader.despawn_delay = next;
             if done { expired.push(eid); }
         }
         if !expired.is_empty() {
