@@ -158,8 +158,9 @@ ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
 # other top-level copy is a duplicate. Test modules are excluded by the
 # column-0 anchor and the */tests/* path filter.
 # 3 -> 2: Wave 3 routed root CRC32 loops to megu_core::hash::crc32.
+# 2 -> 1: offload_ffi_probe calls megu_core::hash::crc32_ieee directly.
 ratchet_ws "duplicate crc32 impls outside core/src/hash.rs" \
-  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 2 \
+  '^(pub(\(crate\)|\(super\))? )?(const )?fn crc32\(' 1 \
   "CRC32 belongs in core/src/hash.rs; a new copy is a new table to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/hash.rs'
 

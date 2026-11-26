@@ -3,10 +3,6 @@ pub const MAX_FRAME: usize = 64 * 1024;
 const MAGIC: u32 = 0x3546_464f; // OFF5, little endian
 const MAX_RECORDS: usize = 4096;
 
-fn crc32(bytes: &[u8]) -> u32 {
-    megu_core::hash::crc32_ieee(bytes)
-}
-
 fn u16at(b: &[u8], i: usize) -> usize {
     u16::from_le_bytes(b[i..i + 2].try_into().unwrap()) as usize
 }
@@ -46,7 +42,7 @@ pub fn validate(frame: &[u8], generations: &[u64; 3]) -> Result<Validated, i32> 
     let payload = &frame[HEADER..];
     if count > MAX_RECORDS
         || u32at(frame, 16) as usize != payload.len()
-        || crc32(payload) != u32at(frame, 20)
+        || megu_core::hash::crc32_ieee(payload) != u32at(frame, 20)
     {
         return Err(-2);
     }

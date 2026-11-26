@@ -3,8 +3,8 @@ fn play_c2s_held_item_slot(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPack
     let mut held_slot = *cx.held_slot;
     // held_item_slot: i16 — `EntityEquipment.setChanged` for the
     // new main hand is emitted by the loop-head equipment diff.
-    if b.len() >= 2 {
-        held_slot = i16::from_be_bytes(b[..2].try_into().unwrap()).clamp(0, 8);
+    if let Some(raw) = b.get(..2).and_then(|s| <[u8; 2]>::try_from(s).ok()) {
+        held_slot = i16::from_be_bytes(raw).clamp(0, 8);
         *me.held.lock().unwrap_or_else(|e| e.into_inner()) = held_slot;
         // `MapItem.inventoryTick`: a filled_map in the new main
         // hand pushes its `map_item_data` once per map.
@@ -359,7 +359,10 @@ fn play_c2s_window_click_mode0(
             let (gslot, gmap): (i16, &mut HashMap<i16, Stack>) = if slot < 27 {
                 (slot, all.entry(cp).or_default())
             } else if slot < rows {
-                (slot - 27, all.entry(cp2.unwrap()).or_default())
+                let Some(partner) = cp2 else {
+                    return PlayPacketControl::Skip;
+                };
+                (slot - 27, all.entry(partner).or_default())
             } else {
                 (slot - rows + 9, &mut inv)
             };
@@ -825,7 +828,10 @@ fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPack
                     let (pos, gslot) = if slot < 27 {
                         (cp, slot)
                     } else {
-                        (cp2.unwrap(), slot - 27)
+                        let Some(partner) = cp2 else {
+                            return PlayPacketControl::Skip;
+                        };
+                        (partner, slot - 27)
                     };
                     let m = all.entry(pos).or_default();
                     let sst = m.remove(&gslot).unwrap_or((0, 0, Vec::new()));
@@ -858,8 +864,10 @@ fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPack
                 let cur_st = {
                     let (pos, gslot) = if slot < 27 {
                         (cp, slot)
+                    } else if let Some(partner) = cp2 {
+                        (partner, slot - 27)
                     } else {
-                        (cp2.unwrap(), slot - 27)
+                        return PlayPacketControl::Skip;
                     };
                     all.get(&pos)
                         .and_then(|m| m.get(&gslot))
@@ -912,7 +920,9 @@ fn play_c2s_window_click_mode2(me: &Arc<Client>, slot: i16, btn: u8) -> PlayPack
                             furnace_xp_pop(f, px, py, pz);
                             let rem = move_to_slots(&mut inv, 9..=44, st);
                             if rem.1 > 0 {
-                                fs.get_mut(&fp).unwrap().output = rem;
+                                if let Some(f_mut) = fs.get_mut(&fp) {
+                                    f_mut.output = rem;
+                                }
                             }
                         }
                     } else {
@@ -983,10 +993,14 @@ fn play_c2s_window_click_mode6(me: &Arc<Client>, creative: bool) -> PlayPacketCo
                     if cur.1 as i64 >= cap {
                         break;
                     }
-                    let take = (cap - cur.1 as i64).min(m[&k].1 as i64) as u8;
-                    m.get_mut(&k).unwrap().1 -= take;
-                    cur.1 += take;
-                    if m[&k].1 == 0 {
+                    let mut remove = false;
+                    if let Some(entry) = m.get_mut(&k) {
+                        let take = (cap - cur.1 as i64).min(entry.1 as i64) as u8;
+                        entry.1 -= take;
+                        cur.1 += take;
+                        remove = entry.1 == 0;
+                    }
+                    if remove {
                         m.remove(&k);
                     }
                 }
@@ -1006,10 +1020,14 @@ fn play_c2s_window_click_mode6(me: &Arc<Client>, creative: bool) -> PlayPacketCo
                 if cur.1 as i64 >= cap {
                     break;
                 }
-                let take = (cap - cur.1 as i64).min(inv[&k].1 as i64) as u8;
-                inv.get_mut(&k).unwrap().1 -= take;
-                cur.1 += take;
-                if inv[&k].1 == 0 {
+                let mut remove = false;
+                if let Some(entry) = inv.get_mut(&k) {
+                    let take = (cap - cur.1 as i64).min(entry.1 as i64) as u8;
+                    entry.1 -= take;
+                    cur.1 += take;
+                    remove = entry.1 == 0;
+                }
+                if remove {
                     inv.remove(&k);
                 }
             }
@@ -1083,8 +1101,10 @@ fn play_c2s_window_click_mode14(
                 let got = if in_cont {
                     let (pos, gslot) = if slot < 27 {
                         (cp, slot)
+                    } else if let Some(partner) = cp2 {
+                        (partner, slot - 27)
                     } else {
-                        (cp2.unwrap(), slot - 27)
+                        return PlayPacketControl::Skip;
                     };
                     map_take(all.entry(pos).or_default(), gslot, n)
                 } else {
@@ -1100,8 +1120,10 @@ fn play_c2s_window_click_mode14(
             let cur_st = if in_cont {
                 let (pos, gslot) = if slot < 27 {
                     (cp, slot)
+                } else if let Some(partner) = cp2 {
+                    (partner, slot - 27)
                 } else {
-                    (cp2.unwrap(), slot - 27)
+                    return PlayPacketControl::Skip;
                 };
                 all.get(&pos)
                     .and_then(|m| m.get(&gslot))
@@ -1186,7 +1208,9 @@ fn play_c2s_window_click_mode14(
                     furnace_xp_pop(f, px, py, pz);
                     let rem = move_to_slots(&mut inv, 9..=44, st);
                     if rem.1 > 0 {
-                        fs.get_mut(&fp).unwrap().output = rem;
+                        if let Some(f2) = fs.get_mut(&fp) {
+                            f2.output = rem;
+                        }
                     }
                 }
             } else if slot <= 1 {
@@ -1208,11 +1232,12 @@ fn play_c2s_window_click_mode14(
                     f.dirty = true;
                     let rem = move_to_slots(&mut inv, 9..=44, st);
                     if rem.1 > 0 {
-                        let f2 = fs.get_mut(&fp).unwrap();
-                        if slot == 0 {
-                            f2.input = rem
-                        } else {
-                            f2.fuel = rem
+                        if let Some(f2) = fs.get_mut(&fp) {
+                            if slot == 0 {
+                                f2.input = rem
+                            } else {
+                                f2.fuel = rem
+                            }
                         }
                     }
                 }
@@ -1266,13 +1291,14 @@ fn play_c2s_window_click_mode14(
             }
             let cur_st = if slot >= 3 {
                 inv.get(&(slot + 6)).cloned().unwrap_or((0, 0, Vec::new()))
-            } else {
-                let f2 = fs.get(&fp).unwrap();
+            } else if let Some(f2) = fs.get(&fp) {
                 match slot {
                     0 => f2.input.clone(),
                     1 => f2.fuel.clone(),
                     _ => f2.output.clone(),
                 }
+            } else {
+                (0, 0, Vec::new())
             };
             resync_slot(me, 2, slot, &cur_st);
             wake_furnace_at(fp.0, fp.1, fp.2, fp.3);
@@ -1317,8 +1343,8 @@ fn play_c2s_window_click_mode14(
                 let asl = armor_slot_for(st.0);
                 if asl >= 0 && !inv.contains_key(&asl) {
                     inv.remove(&slot);
+                    resync_slot(me, 0, asl, &st);
                     inv.insert(asl, st);
-                    resync_slot(me, 0, asl, &inv.get(&asl).cloned().unwrap());
                 } else {
                     inv.remove(&slot);
                     let rem = move_to_slots(&mut inv, player_hotbar_menu_slots(), st);
@@ -1409,14 +1435,17 @@ fn play_c2s_window_click_mode14(
 
 fn play_c2s_window_click(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacketControl {
     let me = Arc::clone(cx.me);
-    let mut sl = b;
-    let wid = sl[0];
-    sl = &sl[1..];
+    let Some((&wid, mut sl)) = b.split_first() else {
+        return PlayPacketControl::Skip;
+    };
     let Some(click_state_id) = read_protocol_i32(&mut sl) else {
         return PlayPacketControl::Skip;
     };
     if sl.len() >= 4 {
-        let slot = i16::from_be_bytes(sl[..2].try_into().unwrap());
+        let Some(slot_bytes) = sl.get(..2).and_then(|s| <[u8; 2]>::try_from(s).ok()) else {
+            return PlayPacketControl::Skip;
+        };
+        let slot = i16::from_be_bytes(slot_bytes);
         let btn = sl[2];
         sl = &sl[3..];
         let Some(mode) = read_protocol_i32(&mut sl).map(i64::from) else {
@@ -1483,7 +1512,9 @@ fn play_c2s_window_click(cx: &mut PlayPacketContext<'_>, b: &[u8]) -> PlayPacket
                 .get(&slot)
                 .cloned();
             if armor_removal_blocked(slot, stack.as_ref(), creative) {
-                resync_slot(&me, 0, slot, &stack.unwrap());
+                if let Some(blocked) = stack.as_ref() {
+                    resync_slot(&me, 0, slot, blocked);
+                }
                 let cursor = me.cursor.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 resync_slot(&me, 0, -1, &cursor);
                 return PlayPacketControl::Skip;
