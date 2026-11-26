@@ -431,6 +431,16 @@
     },
     {
       "check": "one_sided_channel",
+      "symbol": "megu:chunk_hash_sync_v1",
+      "sites": [
+        "proto/src/chunk_hash_sync.rs:10"
+      ],
+      "reason": "Alpha6 CKH1 codec and sans-IO planner only; no live server sender or client receiver. Remove this waiver when both endpoints are wired.",
+      "lane": "CHUNK-HASH-SYNC",
+      "date": "2026-11-27"
+    },
+    {
+      "check": "one_sided_channel",
       "symbol": "megu:claims_v1",
       "sites": [
         "server-files/src/claims_wire.rs:52",

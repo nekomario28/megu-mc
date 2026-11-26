@@ -26,7 +26,7 @@ def run(*args):
 
 class PerfAntipatternTests(unittest.TestCase):
     def test_live_repository_passes(self):
-        result = run()
+        result = run('--fail-on-stale')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_clean_fixture_passes(self):
@@ -81,6 +81,49 @@ class PerfAntipatternTests(unittest.TestCase):
                     self.assertIn(f'{name}:', result.stdout)
                     self.assertIn(rule, result.stdout)
                     path.write_text(original, encoding='utf-8')
+
+    def test_window_frame_audits_helpers_with_no_render_prefix(self):
+        name = 'client-gpu/src/window.rs'
+        cases = (
+            ('fn advance_frame(&mut self, dt: f32) -> (f32, f32) {',
+             'std::fs::write("x", b"y");', 'frame_blocking'),
+            ('fn poll_live_frame(&mut self, dt: f32, gameplay_modal_open: bool) -> Vec<Vec<u8>> {',
+             'let _ = device.create_texture(&descriptor);', 'frame_gpu_create'),
+            ('fn stage_live_particles(',
+             'let _ = device.create_buffer(&descriptor);', 'frame_gpu_create'),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.copy_audit_inputs(root)
+            path = root / name
+            original = path.read_text(encoding='utf-8')
+            for anchor, snippet, rule in cases:
+                with self.subTest(helper=anchor):
+                    self.assertEqual(original.count(anchor), 1)
+                    start = original.index(anchor)
+                    body = original.index('{', start) + 1
+                    path.write_text(original[:body] + '\n' + snippet + original[body:],
+                                    encoding='utf-8')
+                    result = run('--root', root, '--json')
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    findings = json.loads(result.stdout)['findings']
+                    self.assertEqual([(f['file'], f['rule'], f['line']) for f in findings],
+                                     [(name, rule, original.count('\n', 0, body) + 2)])
+
+    def test_window_does_not_treat_unreachable_helpers_as_hot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.copy_audit_inputs(root)
+            path = root / 'client-gpu/src/window.rs'
+            original = path.read_text(encoding='utf-8')
+            body = 'fn render_frame(&mut self) {'
+            self.assertEqual(original.count(body), 1)
+            path.write_text(
+                'fn audit_cold_probe() { std::fs::write("x", b"y"); }\n'
+                + original.replace(body, body + '\n        // audit_cold_probe();'),
+                encoding='utf-8')
+            result = run('--root', root, '--fail-on-stale')
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_masked_regions_cannot_trip_checks(self):
         # The same violations inside a comment, a string literal or a

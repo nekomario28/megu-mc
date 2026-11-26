@@ -12,13 +12,20 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PLAY = "src/play_protocol.rs"
+SESSION = "src/play_protocol_session.rs"
+# Keep the network source scan over the code split out of play_protocol.rs.
 NETWORK_FILES = (
-    "src/play_protocol.rs", "src/connection_limits.rs", "src/ingress_guard.rs",
-    "src/server_reliability.rs", "server-files/src/claims.rs",
-    "mod-adapter-core/src/mod_sync.rs",
+    PLAY, SESSION,
+    "src/play_protocol_movement.rs", "src/play_protocol_world.rs",
+    "src/play_protocol_inventory.rs", "src/play_protocol_combat.rs",
+    "src/play_protocol_chat_client.rs", "src/play_protocol_channels.rs",
+    "src/connection_limits.rs", "src/ingress_guard.rs", "src/server_reliability.rs",
+    "server-files/src/claims.rs", "mod-adapter-core/src/mod_sync.rs",
 )
 FILES = (
     *NETWORK_FILES,
+    "src/server_ops.rs",
     "src/nbt.rs",
     "client-app/src/integrated.rs",
     "src/main.rs",
@@ -83,10 +90,21 @@ def audit(root):
     def has(path, pattern):
         return bool(re.search(pattern, sources[path], re.S))
 
-    play = "src/play_protocol.rs"
+    play = PLAY
     limits = "src/connection_limits.rs"
     reliability = "src/server_reliability.rs"
     mod = "mod-adapter-core/src/mod_sync.rs"
+    ops = "src/server_ops.rs"
+    exec_rs = "wasm-mod-runtime/src/exec.rs"
+    live_preplay = (
+        has(play, r'include!\("play_protocol_session\.rs"\);')
+        and has(play, r"move \|\| handle_inner\(s, live_eid\)")
+        and has(play, r"fn handle_inner\([^\n]*\)\s*\{\s*"
+                      r"let Some\(preplay\) = negotiate_preplay_session\(s\) else\s*\{\s*return;\s*\};")
+    )
+    host_string_read = (r"[^{}]*?if len > self\.max_string\s*\{\s*"
+                        r"return Err\(Trap::HostMemoryAccess \{ ptr, len \}\);\s*\}\s*"
+                        r"let bytes = self\.mem\.read\(ptr, len\)\?;")
     checks = {
         "offline public bind refusal": (
             has(play, r"fn offline_public_bind_check\s*\([^)]*allow_insecure_offline_public:\s*bool[^)]*\)\s*->\s*Result<\(\), String>\s*\{\s*if\s+connection_limits::is_loopback_bind\(bind\)\s*\|\|\s*online_mode\s*\|\|\s*velocity_forwarding\s*\|\|\s*allow_insecure_offline_public\s*\{\s*return Ok\(\(\)\);\s*\}\s*Err\(")
@@ -119,15 +137,54 @@ def audit(root):
             and has(limits, r"max_uncompressed\.min\(MAX_UNCOMPRESSED_PACKET_BYTES\)")
             and has(limits, r"length\s*<\s*threshold\s*\|\|\s*length\s*>\s*max_uncompressed")),
         "pre-login packet rate and slowloris deadlines": (
-            has(play, r"fn read_preplay_frame\([\s\S]*?rate\.allow\(now\)[\s\S]*?rate\.should_disconnect\(now\)")
-            and has(play, r"set_read_timeout\(Some\(Duration::from_secs\(10\)\)\)[\s\S]{0,120}?set_write_timeout\(Some\(Duration::from_secs\(10\)\)\)")
-            and has(play, r"Instant::now\(\)\s*\+\s*connection_limits::login_timeout\(\)")
+            live_preplay
+            and has(SESSION, r"set_read_timeout\(Some\(Duration::from_secs\(10\)\)\)\.ok\(\);\s*"
+                             r"s\.set_write_timeout\(Some\(Duration::from_secs\(10\)\)\)\.ok\(\);\s*"
+                             r"let login_deadline = Instant::now\(\)\s*\+\s*connection_limits::login_timeout\(\);\s*"
+                             r"let mut preplay_rate = connection_limits::PacketRateLimit::new\(Instant::now\(\)\);\s*"
+                             r"let \(id, hs\) = read_preplay_frame\(&mut s, login_deadline, None, &mut preplay_rate\)\?;")
+            and has(SESSION, r"let \(lid, lbody\) = read_preplay_frame\(&mut s, login_deadline, None, &mut preplay_rate\)\?;")
+            and has(SESSION, r"match read_preplay_frame\(&mut s, login_deadline, compression, &mut preplay_rate\)")
+            and has(SESSION, r"run_config_exchange\(\s*&mut s,\s*&mut rx,\s*&cfg,\s*compression,\s*&mut preplay_rate,")
+            and has(play, r"if !rate\.allow\(received\)\s*\{\s*if rate\.should_disconnect\(received\)\s*\{\s*"
+                          r"send_config_disconnect\([^;]*;\s*return ConfigPoll::Abort;\s*\}\s*return ConfigPoll::Serviced;")
+            and has(play, r"fn read_preplay_frame\([^{}]*\{\s*loop\s*\{\s*"
+                          r"let packet = read_login_frame\(s, deadline, compression\)\?;\s*let now = Instant::now\(\);\s*"
+                          r"if rate\.allow\(now\)\s*\{\s*return Some\(packet\);\s*\}\s*"
+                          r"if rate\.should_disconnect\(now\)\s*\{\s*return None;\s*\}")
+            and has(play, r"fn read_before\([^{}]*\{\s*while !out\.is_empty\(\)\s*\{\s*"
+                          r"let remaining = deadline\.checked_duration_since\(Instant::now\(\)\)\?;\s*"
+                          r"s\.set_read_timeout\(Some\(remaining\)\)\.ok\(\)\?;\s*let n = s\.read\(out\)\.ok\(\)\?;")
+            and has(play, r"read_before\(s, &mut b, deadline\)\?;")
+            and has(play, r"read_before\(s, &mut body, deadline\)\?;")
             and has(limits, r"fn login_timeout\(\)[\s\S]*?unwrap_or\(15\)[\s\S]*?\.max\(1\)")
             and has(limits, r"fn idle_timeout_secs\(\)[\s\S]*?MEGU_IDLE_TIMEOUT_SECS")),
         "verified UUID binding before admission": (
-            has(play, r"let mut authenticated\s*=\s*false\s*;")
-            and len(re.findall(r"authenticated\s*=\s*true\s*;", sources[play])) == 2
-            and has(play, r"check_login_admission_verified\([\s\S]*?authenticated\s*,\s*\)")),
+            live_preplay
+            and has(SESSION, r"let mut authenticated\s*=\s*false\s*;\s*"
+                             r"if velocity_forwarding_enabled\(\)\s*\{\s*"
+                             r"match velocity_login\(&mut s, login_deadline, &mut preplay_rate\)\s*\{\s*"
+                             r"Ok\(fwd\)\s*=>\s*\{\s*eprintln!\([^;]*;\s*peer = fwd\.forwarded_ip;\s*"
+                             r"uuid = fwd\.uuid;\s*name = fwd\.username;\s*"
+                             r"login_skin = forwarded_skin\(&fwd\.properties\);\s*authenticated = true;\s*\}\s*"
+                             r"Err\(why\)\s*=>\s*\{[^;]*;[^;]*;\s*return None;\s*\}\s*\}\s*\}\s*"
+                             r"else if online_mode_enabled\(\)\s*\{\s*"
+                             r"match online_login\(&mut s, &name, &peer, login_deadline, &mut preplay_rate\)\s*\{\s*"
+                             r"Ok\(profile\)\s*=>\s*\{\s*uuid = profile\.uuid;\s*name = profile\.name;\s*"
+                             r"login_skin = forwarded_skin\(&profile\.properties\);\s*authenticated = true;\s*\}\s*"
+                             r"Err\(why\)\s*=>\s*\{[^;]*;[^;]*;\s*return None;\s*\}\s*\}\s*\}.*?"
+                             r"if let Err\(reason\) = check_login_admission_verified\(\s*&name,\s*&uuid_text\(&uuid\),\s*"
+                             r"&peer,\s*online,\s*live\.max_players,\s*&live\.ops,\s*&live\.bans,\s*&live\.whitelist,\s*"
+                             r"authenticated,\s*\)\s*\{\s*eprintln!\([^;]*;\s*"
+                             r"login_disconnect_text\(&mut s, &reason\);\s*return None;\s*\}")
+            and len(re.findall(r"authenticated\s*=\s*true\s*;", sources[SESSION])) == 2
+            and has(play, r"verify_velocity_forwarding\(secret\.as_bytes\(\), rest\)\s*\}")
+            and has(play, r"let profile = auth\.has_joined\(name, &hash, Some\(peer\)\)\?;\s*"
+                          r"enable_conn_encryption\(s, &secret\);\s*Ok\(profile\)")
+            and all(has(ops, rf"\b{re.escape(rule)}\(uuid, name, authenticated\)") for rule in (
+                "bans.player_ban_authenticated", "whitelist.contains_authenticated",
+                "ops.is_op_authenticated", "ops.bypasses_player_limit_authenticated",
+            ))),
         "login state machine cannot skip success": (
             has("proto/src/session.rs", r"duplicate login_start")
             and has("proto/src/session.rs", r"login_acknowledged before login_success")
@@ -139,8 +196,15 @@ def audit(root):
             and has("wasm-mod-runtime/src/wasm_mod.rs", r"decl\.limits\.min\s*>\s*hard_max")
             and has("wasm-mod-runtime/src/exec.rs", r"if\s+new\s*>\s*self\.max_pages\s*\{\s*return -1;\s*\}")),
         "WASM hostcall memory and string caps": (
-            len(re.findall(r"if\s+len\s*>\s*self\.max_string\s*\{\s*return Err\(Trap::HostMemoryAccess", sources["wasm-mod-runtime/src/exec.rs"])) >= 2
-            and len(re.findall(r"pub fn read\(&self, ptr: u32, len: u32\)[\s\S]*?end > self\.data\.len\(\) as u64[\s\S]*?Trap::HostMemoryAccess", sources["wasm-mod-runtime/src/exec.rs"])) >= 1),
+            has(exec_rs, r"HostBinding::Log\s*=>\s*\{" + host_string_read)
+            and has(exec_rs, r"HostBinding::EmitChat\s*=>\s*\{" + host_string_read)
+            and has(exec_rs, r"fn read\(&self, ptr: u32, len: u32\)\s*->\s*XResult<&\[u8\]>\s*\{\s*"
+                             r"Ok\(&self\.data\[self\.host_range\(ptr, len\)\?\]\)\s*\}")
+            and has(exec_rs, r"fn host_range\(&self, ptr: u32, len: u32\)\s*->\s*XResult<Range<usize>>\s*\{\s*"
+                             r"let end = u64::from\(ptr\)\s*\+\s*u64::from\(len\);\s*"
+                             r"if end > self\.data\.len\(\) as u64\s*\{\s*"
+                             r"return Err\(Trap::HostMemoryAccess \{ ptr, len \}\);\s*\}\s*"
+                             r"Ok\(ptr as usize\.\.end as usize\)\s*\}")),
         "installer hash verification fail closed": (
             has("server-files/src/bin/megu_installer.rs", r"parse_expected_sha256\(&sums_text, fname\)")
             and has("server-files/src/bin/megu_installer.rs", r"installer::sha256_file\(path\)")
@@ -157,7 +221,7 @@ def audit(root):
     for name in NETWORK_FILES:
         text = sources[name]
         matches = list(forbidden.finditer(text))
-        if name == "src/play_protocol.rs":
+        if name == PLAY:
             known = Counter(hashlib.sha256(text[m.start()-65:m.end()+45].encode()).hexdigest()[:16]
                             for m in matches)
             checks[f"no new wall-clock/panic locks: {name}"] = not (known - LEGACY_PLAY_LOCKS)

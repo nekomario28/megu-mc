@@ -70,6 +70,17 @@ SLEEP_ZERO_FILES = (
 # the draw_* helpers; the two named live_session fns run every frame.
 FRAME_FN = re.compile(
     rb'^(?:render|compose|draw|encode)(?:_|$)|^(?:collect_dynamic_lights|refresh_voxel_clouds)$')
+WINDOW_FILE = 'client-gpu/src/window.rs'
+# Same-file unqualified calls and self/Self methods; not a Rust type resolver.
+WINDOW_CALL = re.compile(
+    rb'(?:\b(?:self\s*\.\s*|Self\s*::\s*)|(?<![\w.:]))([A-Za-z_]\w*)\s*\(')
+# Conditional paths, not steady-state work. Keep the callers under audit and
+# exclude only these call edges (not other uses of the same helpers).
+WINDOW_COLD_EDGES = {
+    (b'advance_frame', b'load_gui_sprite_atlas'),  # asset initialization
+    (b'open_recipe_browser_focused', b'dispatch_ui_action'),  # input-triggered actions
+    (b'present_surface_frame', b'dump_surface_frame'),  # opt-in one-shot debug capture
+}
 BLOCKING = re.compile(
     rb'(?:std::)?thread::sleep'
     rb'|std::fs::(?:read|read_to_string|read_dir|write|create_dir_all)'
@@ -443,6 +454,28 @@ def _line(arr, offset):
 # ---------------------------------------------------------------------------
 
 
+def frame_ranges(arr, fns, path):
+    """Scan named frame entry points and the window's local helper call graph."""
+    roots = [fn for fn in fns if FRAME_FN.match(fn[0])]
+    if path != WINDOW_FILE:
+        return [(start, end) for _, start, end in roots]
+    by_name = {}
+    for fn in fns:
+        by_name.setdefault(fn[0], []).append(fn)
+    visited = set()
+    while roots:
+        fn = roots.pop()
+        if fn in visited:
+            continue
+        visited.add(fn)
+        name, start, end = fn
+        for match in WINDOW_CALL.finditer(arr, start, end):
+            callee = match.group(1)
+            if (name, callee) not in WINDOW_COLD_EDGES:
+                roots.extend(by_name.get(callee, ()))
+    return sorted((start, end) for _, start, end in visited)
+
+
 def rule_counts(ctx, rule, path):
     """`(count, [(line, excerpt), ...])` for one rule on one masked file.
 
@@ -463,11 +496,12 @@ def rule_counts(ctx, rule, path):
     if rule in ('frame_blocking', 'frame_gpu_create'):
         if 'fns' not in ctx:
             ctx['fns'] = fn_ranges(arr, ctx['toks'], ctx['kw'])
+        if 'frame_ranges' not in ctx:
+            ctx['frame_ranges'] = frame_ranges(arr, ctx['fns'], path)
         pattern = BLOCKING if rule == 'frame_blocking' else GPU_CREATE
-        hits = []
-        for name, start, end in ctx['fns']:
-            if FRAME_FN.match(name):
-                hits.extend(at(m.start()) for m in pattern.finditer(arr, start, end))
+        offsets = {m.start() for start, end in ctx['frame_ranges']
+                   for m in pattern.finditer(arr, start, end)}
+        hits = [at(offset) for offset in sorted(offsets)]
         return len(hits), hits
     if rule == 'uncached_cube_scan':
         if 'fns' not in ctx:
