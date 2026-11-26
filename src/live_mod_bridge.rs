@@ -2311,14 +2311,7 @@ fn live_mod_class_members(jar: &[u8]) -> Result<Vec<(String, Vec<u8>)>, &'static
         if decoded.len() != expanded || decoded_total > MAX_TOTAL_CLASS_BYTES {
             return Err("class expanded size mismatch or total bound exceeded");
         }
-        let mut checksum = !0u32;
-        for &byte in &decoded {
-            checksum ^= u32::from(byte);
-            for _ in 0..8 {
-                checksum = (checksum >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(checksum & 1));
-            }
-        }
-        if !checksum != crc {
+        if megu_core::hash::crc32_ieee(&decoded) != crc {
             return Err("class crc mismatch");
         }
         classes.push((name.to_string(), decoded));
@@ -9137,15 +9130,7 @@ mod wire_mods_tests {
     // ---------- ZIP/JAR builder (stored members, real central directory) ----------
 
     fn lmb_crc32(data: &[u8]) -> u32 {
-        let mut crc = !0u32;
-        for &byte in data {
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = 0u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            }
-        }
-        !crc
+        megu_core::hash::crc32_ieee(data)
     }
 
     /// Pack `entries` (name → bytes) into a real ZIP archive with stored

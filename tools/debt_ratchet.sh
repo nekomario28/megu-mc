@@ -132,21 +132,23 @@ ratchet "lock/rwlock unwraps (no new poison cascades)" \
 # pairs and removed or wired staged helpers across lanes.
 # 2439 -> 2436: the branch-mining helpers went live through the canonical
 # break-progress model and shed their silencers.
-ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2436 \
+# 2436 -> 2420: removed 49 stale dead_code allowances across src/.
+ratchet_ws "allow(dead_code) attributes (workspace)" 'allow\(dead_code\)' 2420 \
   "Dead code should be deleted or wired, not silenced. A new allowance needs an explicit decision."
 
 # SHA-256 keeps being re-implemented per crate (mod-adapter-core, proto,
 # server-files, state-store, root) instead of shared through megu-core. The
 # ceiling freezes today's duplicates; consolidation lowers it.
+# 4 -> 2: server-files/installer and src/generation_math now re-export core::crypto::Sha256/sha256.
 ratchet_ws "duplicate sha256/Sha256 impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 4 \
+  '^(pub(\(crate\)|\(super\))? )?(struct Sha256|fn sha256)\b' 2 \
   "SHA-256 belongs in megu-core; a new copy is a new thing to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 
-# Same story for the hand-rolled JSON parsers: five crates carry their own
-# JsonParser/parse_json. Frozen at today's count until they share one.
+# Hand-rolled JSON parsers outside core are extinct: every crate delegates to
+# megu_core::json, so the ceiling is locked at 0 permanently.
 ratchet_ws "duplicate JsonParser/parse_json impls outside core" \
-  '^(pub(\(crate\)|\(super\))? )?(struct JsonParser|fn parse_json)\b' 9 \
+  '^(pub(\(crate\)|\(super\))? )?(struct JsonParser|fn parse_json)\b' 0 \
   "JSON parsing belongs in megu-core; a new copy is a new parser to keep correct." \
   -not -path '*/tests/*' -not -path './core/src/*'
 

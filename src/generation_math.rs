@@ -2222,13 +2222,8 @@ mod tests {
 
 // ---------- SHA-256 (for `BiomeManager`'s zoom seed) ----------
 
-/// `BiomeManager.obfuscateSeed` is `Hashing.sha256().hashLong(seed).asLong()`:
-/// Guava's `putLong` is little-endian and `HashCode.asLong` reads the first eight
-/// digest bytes little-endian. Vanilla uses it as the biome-blend zoom seed, so
-/// the value has to match byte for byte.
-pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
-    megu_core::crypto::sha256(data)
-}
+/// Shared canonical SHA-256 primitive used for vanilla-compatible generation hashes.
+pub(crate) use megu_core::crypto::sha256;
 
 #[cfg(test)]
 mod sha_tests {
