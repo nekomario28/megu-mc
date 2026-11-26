@@ -85,8 +85,8 @@ impl ItemEntry {
         }
     }
 
-    /// Name shown for `locale` (`"ja_jp"`): the translated entry when the
-    /// lang file declared one, else the English [`display_name`].
+    /// Name shown for `locale` (`"ja_jp"`): the translated entry when the lang file declared one,
+    /// else the English [`display_name`].
     pub fn name_for_locale(&self, locale: &str) -> &str {
         if locale == "en_us" {
             return &self.display_name;
@@ -112,8 +112,8 @@ pub struct FluidStack {
     pub amount_mb: u32,
 }
 
-/// One recipe input slot: either a concrete item or a tag that resolves
-/// against the [`RecipeIndex`] item catalog.
+/// One recipe input slot: either a concrete item or a tag that resolves against the [`RecipeIndex`]
+/// item catalog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeIngredient {
     /// A specific item id plus count.
@@ -171,8 +171,8 @@ fn humanize_item_id(id: &str) -> String {
     }
 }
 
-/// Deterministic swatch color for an item id (no item textures exist in
-/// this crate, so the grid paints a stable per-id color + first letter).
+/// Deterministic swatch color for an item id (no item textures exist in this crate, so the grid
+/// paints a stable per-id color + first letter).
 pub fn item_color(item_id: &str) -> UiColor {
     // FNV-1a over the id bytes → index into a fixed 16-color ramp.
     const RAMP: [UiColor; 16] = [
@@ -235,13 +235,10 @@ impl HeatRequirement {
     }
 }
 
-/// Every recipe category the browser understands.
-///
-/// Vanilla covers the full crafting/cooking/smithing set; the `Create*`
-/// family covers the kinetic machine ecosystem; and
-/// [`CustomModCategory`](Self::CustomModCategory) lets **any** mod or
-/// Create addon register its own categories declaratively — see
-/// [`RecipeIndex::register_custom_category`] and
+/// Every recipe category the browser understands.  Vanilla covers the full
+/// crafting/cooking/smithing set; the `Create*` family covers the kinetic machine ecosystem; and
+/// [`CustomModCategory`](Self::CustomModCategory) lets **any** mod or Create addon register its own
+/// categories declaratively — see [`RecipeIndex::register_custom_category`] and
 /// [`RecipeIndex::register_mod_namespace`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum RecipeCategory {
@@ -406,18 +403,17 @@ impl RecipeCategory {
     }
 }
 
-/// One operation inside a [`RecipeCategory::CreateSequencedAssembly`]
-/// recipe (`deploying`, `pressing`, `filling`, `cutting`, … from any mod).
+/// One operation inside a [`RecipeCategory::CreateSequencedAssembly`] recipe (`deploying`,
+/// `pressing`, `filling`, `cutting`, … from any mod).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SequenceStep {
     /// The operation's category (parsed from the nested recipe `"type"`).
     pub category: RecipeCategory,
-    /// Extra ingredients this step consumes. The transitional
-    /// in-progress item is skipped during material accounting — only
-    /// genuinely consumed inputs (e.g. the deployed item) are kept.
+    /// Extra ingredients this step consumes. The transitional in-progress item is skipped during
+    /// material accounting — only genuinely consumed inputs (e.g. the deployed item) are kept.
     pub inputs: Vec<RecipeIngredient>,
-    /// Create deploying's `keepHeldItem` flag: the deployed item returns
-    /// to the belt instead of being consumed.
+    /// Create deploying's `keepHeldItem` flag: the deployed item returns to the belt instead of
+    /// being consumed.
     pub keep_held_item: bool,
 }
 
@@ -493,12 +489,10 @@ impl Recipe {
         self.output_count_for(item) > 0 || self.chanced_outputs.iter().any(|(i, ..)| i == item)
     }
 
-    /// Effective per-craft material cost as `(resolved_item, count)`
-    /// pairs: tag slots resolve to the lexicographically-first catalog
-    /// item carrying the tag (unresolved tags stay as `#tag` so they
-    /// surface in the raw-material total instead of vanishing), and
-    /// sequenced-assembly steps contribute their non-transitional inputs
-    /// multiplied by `loops`.
+    /// Effective per-craft material cost as `(resolved_item, count)` pairs: tag slots resolve to
+    /// the lexicographically-first catalog item carrying the tag (unresolved tags stay as `#tag` so
+    /// they surface in the raw-material total instead of vanishing), and sequenced-assembly steps
+    /// contribute their non-transitional inputs multiplied by `loops`.
     pub fn effective_inputs(&self, index: &RecipeIndex) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = Vec::new();
         let push = |out: &mut Vec<(String, u64)>, id: String, count: u64| {
@@ -540,8 +534,8 @@ pub struct MobDropEntry {
     pub item_id: String,
     pub min_count: u32,
     pub max_count: u32,
-    /// Drop chance `0.0..=1.0` (`1.0` = guaranteed common drop); a non-finite
-    /// value means the runtime-dependent probability is honestly unknown.
+    /// Drop chance `0.0..=1.0` (`1.0` = guaranteed common drop); a non-finite value means the
+    /// runtime-dependent probability is honestly unknown.
     pub chance: f32,
     /// Extra items gained per Looting level.
     pub looting_bonus: u32,
@@ -615,8 +609,8 @@ pub struct DungeonLootEntry {
     pub max_count: u32,
     /// Table weight used for the displayed chance.
     pub weight: u32,
-    /// Expected chance `0.0..=1.0` of seeing the item per chest roll; a
-    /// non-finite value means the runtime-dependent probability is unknown.
+    /// Expected chance `0.0..=1.0` of seeing the item per chest roll; a non-finite value means the
+    /// runtime-dependent probability is unknown.
     pub chance: f32,
 }
 
@@ -628,9 +622,9 @@ pub struct EnchantmentCompat {
     pub enchantments: Vec<(String, u32)>,
 }
 
-/// Compare probabilities with unknown/non-finite values grouped after every
-/// finite chance. `NaN` values compare equal to one another so callers can
-/// apply their normal row tie-breakers instead of depending on float bits.
+/// Compare probabilities with unknown/non-finite values grouped after every finite chance. `NaN`
+/// values compare equal to one another so callers can apply their normal row tie-breakers instead
+/// of depending on float bits.
 pub fn compare_loot_chance(a: f32, b: f32) -> std::cmp::Ordering {
     match (a.is_finite(), b.is_finite()) {
         (true, true) => a.total_cmp(&b),
@@ -640,10 +634,9 @@ pub fn compare_loot_chance(a: f32, b: f32) -> std::cmp::Ordering {
     }
 }
 
-/// Player-facing percentage for a loot probability. Runtime-dependent table
-/// branches are represented as non-finite values by ingestion; displaying
-/// them as `0%` or `NaN%` would invent information, so they render as an
-/// explicit localized unknown instead.
+/// Player-facing percentage for a loot probability. Runtime-dependent table branches are
+/// represented as non-finite values by ingestion; displaying them as `0%` or `NaN%` would invent
+/// information, so they render as an explicit localized unknown instead.
 pub fn format_loot_chance(chance: f32, lang: UiLang) -> String {
     if chance.is_finite() {
         format!("{}%", (chance * 100.0).round() as u32)
@@ -666,8 +659,8 @@ pub fn format_loot_chance_compact(chance: f32, lang: UiLang) -> String {
 // this module's `Json` tree (recipe datapack ingestion)
 // ---------------------------------------------------------------------------
 
-/// Parsed JSON value. Numbers are `f64` — recipe files only carry small
-/// ints and unit chances, so precision is a non-issue.
+/// Parsed JSON value. Numbers are `f64` — recipe files only carry small ints and unit chances, so
+/// precision is a non-issue.
 #[derive(Clone, Debug, PartialEq)]
 enum Json {
     Null,
@@ -725,13 +718,13 @@ impl Json {
     }
 }
 
-/// Deepest accepted nesting — recipe JSONs are flat, so anything beyond
-/// this is hostile/cyclic input and rejected instead of overflowing.
+/// Deepest accepted nesting — recipe JSONs are flat, so anything beyond this is hostile/cyclic
+/// input and rejected instead of overflowing.
 const JSON_MAX_DEPTH: usize = 48;
 
-/// Bounds for [`decode_recipe_json`], matching the retired parser: nesting deeper
-/// than [`JSON_MAX_DEPTH`] levels rejected, no node or byte ceiling of its
-/// own — recipe documents are already small and caller-bounded.
+/// Bounds for [`decode_recipe_json`], matching the retired parser: nesting deeper than
+/// [`JSON_MAX_DEPTH`] levels rejected, no node or byte ceiling of its own — recipe documents are
+/// already small and caller-bounded.
 const JSON_LIMITS: JsonLimits = JsonLimits {
     max_depth: JSON_MAX_DEPTH + 1,
     max_nodes: usize::MAX,
@@ -744,9 +737,9 @@ fn decode_recipe_json(src: &str) -> Option<Json> {
     Some(json_value_to_json(&value))
 }
 
-/// Fold the canonical [`JsonValue`] tree into this module's [`Json`]:
-/// document-ordered members collapse into a `BTreeMap` with
-/// last-duplicate-key wins, exactly like the retired parser's `insert`.
+/// Fold the canonical [`JsonValue`] tree into this module's [`Json`]: document-ordered members
+/// collapse into a `BTreeMap` with last-duplicate-key wins, exactly like the retired parser's
+/// `insert`.
 fn json_value_to_json(value: &JsonValue) -> Json {
     match value {
         JsonValue::Null => Json::Null,
@@ -768,12 +761,10 @@ fn json_value_to_json(value: &JsonValue) -> Json {
 // Recipe index: catalog, recipes, world resource data, custom categories
 // ---------------------------------------------------------------------------
 
-/// The universal data-driven item + recipe + resource index the browser
-/// renders. The host (datapack loader, mod adapter) fills it; the UI only
-/// reads it.
-/// One furnace fuel row (the world-resource "Fuels" tab): `burn_ticks` is the
-/// NeoForge `furnace_fuels` data-map `burn_time`; vanilla smelts one
-/// item per 200 ticks.
+/// The universal data-driven item + recipe + resource index the browser renders. The host (datapack
+/// loader, mod adapter) fills it; the UI only reads it. One furnace fuel row (the world-resource
+/// "Fuels" tab): `burn_ticks` is the NeoForge `furnace_fuels` data-map `burn_time`; vanilla smelts
+/// one item per 200 ticks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FuelEntry {
     /// Fuel item id (`"minecraft:coal"`) or tag (`"#minecraft:logs"`).
@@ -817,11 +808,9 @@ pub struct RecipeIndex {
     /// reuses internal scratch (`&mut`) while
     /// [`RecipeBrowserState::visible_items`] is a `&self` API.
     text_trigram: RefCell<TrigramIndex>,
-    /// Fingerprint [`Self::search_fingerprint`] the trigram index was
-    /// built against — `None` until first build. The fingerprint
-    /// hashes every scored byte, so mutation through the `pub` fields
-    /// (direct `items` pushes, in-place renames, lang merges) can
-    /// never serve a stale shortlist.
+    /// Fingerprint [`Self::search_fingerprint`] the trigram index was built against — `None` until
+    /// first build. The fingerprint hashes every scored byte, so mutation through the `pub` fields
+    /// (direct `items` pushes, in-place renames, lang merges) can never serve a stale shortlist.
     text_trigram_fp: Cell<Option<u64>>,
 }
 
@@ -846,10 +835,9 @@ impl Clone for RecipeIndex {
     }
 }
 
-/// Every field `item_text_score` can score, as index documents:
-/// English + each localized name (raw lowercase, kana-folded and
-/// romaji-folded — the same transforms the search fallback applies),
-/// id, mod, tags and tooltips.
+/// Every field `item_text_score` can score, as index documents: English + each localized name (raw
+/// lowercase, kana-folded and romaji-folded — the same transforms the search fallback applies), id,
+/// mod, tags and tooltips.
 fn search_doc_fields(item: &ItemEntry) -> Vec<String> {
     let mut fields = vec![
         item.display_name.to_lowercase(),
@@ -880,10 +868,9 @@ impl RecipeIndex {
         Self::default()
     }
 
-    /// FNV-1a over every byte `item_text_score` can score. Compared
-    /// against [`Self::text_trigram_fp`] to decide whether the trigram
-    /// shortlist is still fresh — hashing the field bytes themselves
-    /// (not just lengths) means even in-place `pub`-field edits are
+    /// FNV-1a over every byte `item_text_score` can score. Compared against
+    /// [`Self::text_trigram_fp`] to decide whether the trigram shortlist is still fresh — hashing
+    /// the field bytes themselves (not just lengths) means even in-place `pub`-field edits are
     /// detected.
     fn search_fingerprint(&self) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
@@ -913,8 +900,8 @@ impl RecipeIndex {
         h
     }
 
-    /// Build the trigram shortlist when the catalog moved since the
-    /// last build (or it was never built). No-op when fresh.
+    /// Build the trigram shortlist when the catalog moved since the last build (or it was never
+    /// built). No-op when fresh.
     fn ensure_text_index(&self) {
         let fp = self.search_fingerprint();
         if self.text_trigram_fp.get() == Some(fp) {
@@ -931,11 +918,10 @@ impl RecipeIndex {
         self.text_trigram_fp.set(Some(fp));
     }
 
-    /// Item indices the trigram shortlist admits for `token` — the
-    /// union of hits for the token itself plus every
-    /// [`recipe_search::query_variants`] expansion, so the kana/romaji
-    /// fallback in `item_text_score` stays inside the candidate set.
-    /// Always a superset of the token's true match set.
+    /// Item indices the trigram shortlist admits for `token` — the union of hits for the token
+    /// itself plus every [`recipe_search::query_variants`] expansion, so the kana/romaji fallback
+    /// in `item_text_score` stays inside the candidate set. Always a superset of the token's true
+    /// match set.
     fn text_candidates(&self, token: &str, out_ids: &mut Vec<u32>) {
         self.ensure_text_index();
         let index = &mut *self.text_trigram.borrow_mut();
@@ -971,8 +957,8 @@ impl RecipeIndex {
         });
     }
 
-    /// Declare a whole mod namespace: every `ns:whatever` recipe type
-    /// loads as a declared custom category named after the mod.
+    /// Declare a whole mod namespace: every `ns:whatever` recipe type loads as a declared custom
+    /// category named after the mod.
     pub fn register_mod_namespace(&mut self, namespace: &str, title_en: &str, title_ja: &str) {
         self.custom_namespaces.push((
             namespace.to_owned(),
@@ -993,9 +979,8 @@ impl RecipeIndex {
             .unwrap_or_else(|| id.to_owned())
     }
 
-    /// Display name for `id` under `locale` (`"ja_jp"`, `"fr_fr"`, ...):
-    /// the item's `assets/*/lang/<locale>.json` name when loaded, else
-    /// the English name, else the raw id.
+    /// Display name for `id` under `locale` (`"ja_jp"`, `"fr_fr"`, ...): the item's
+    /// `assets/*/lang/<locale>.json` name when loaded, else the English name, else the raw id.
     pub fn display_name_for_locale(&self, id: &str, locale: &str) -> String {
         self.item(id)
             .map(|e| e.name_for_locale(locale).to_owned())
@@ -1050,8 +1035,8 @@ impl RecipeIndex {
         out
     }
 
-    /// First catalog item carrying `tag` (lexicographic order — the
-    /// deterministic pick used by the material calculator).
+    /// First catalog item carrying `tag` (lexicographic order — the deterministic pick used by the
+    /// material calculator).
     pub fn first_in_tag(&self, tag: &str) -> Option<String> {
         self.items
             .iter()
@@ -1060,8 +1045,8 @@ impl RecipeIndex {
             .min()
     }
 
-    /// Resolve an ingredient slot to a concrete item id (or `#tag` when
-    /// the tag is unknown to the catalog).
+    /// Resolve an ingredient slot to a concrete item id (or `#tag` when the tag is unknown to the
+    /// catalog).
     pub fn resolve_ingredient(&self, ing: &RecipeIngredient) -> String {
         match ing {
             RecipeIngredient::Item { id, .. } => id.clone(),
@@ -1071,9 +1056,9 @@ impl RecipeIndex {
         }
     }
 
-    /// Like [`resolve_ingredient`](Self::resolve_ingredient) but cycles
-    /// tag slots through their members — `tick/20` picks the shown item
-    /// (~1 Hz at 20 tps), matching recipe overlay tag cycling.
+    /// Like [`resolve_ingredient`](Self::resolve_ingredient) but cycles tag slots through their
+    /// members — `tick/20` picks the shown item (~1 Hz at 20 tps), matching recipe overlay tag
+    /// cycling.
     pub fn resolve_ingredient_cycled(&self, ing: &RecipeIngredient, tick: u64) -> String {
         match ing {
             RecipeIngredient::Item { id, .. } => id.clone(),
@@ -1099,14 +1084,13 @@ impl RecipeIndex {
         }
     }
 
-    /// Every recipe producing `item` (guaranteed or chanced), in index
-    /// order.
+    /// Every recipe producing `item` (guaranteed or chanced), in index order.
     pub fn recipes_producing(&self, item: &str) -> Vec<&Recipe> {
         self.recipes.iter().filter(|r| r.produces(item)).collect()
     }
 
-    /// Every recipe consuming `item` — direct id match, tag-slot match,
-    /// or a sequenced-assembly step input.
+    /// Every recipe consuming `item` — direct id match, tag-slot match, or a sequenced-assembly
+    /// step input.
     pub fn recipes_consuming(&self, item: &str) -> Vec<&Recipe> {
         self.recipes
             .iter()
@@ -1211,9 +1195,8 @@ impl RecipeIndex {
         Some(recipe)
     }
 
-    /// Like [`load_recipe_json`](Self::load_recipe_json) but only parses —
-    /// used for the nested `sequence` steps of sequenced assembly so they
-    /// never land in the index themselves.
+    /// Like [`load_recipe_json`](Self::load_recipe_json) but only parses — used for the nested
+    /// `sequence` steps of sequenced assembly so they never land in the index themselves.
     fn parse_recipe_json(&self, recipe_id: &str, json_str: &str) -> Option<Recipe> {
         let root = decode_recipe_json(json_str)?;
         let obj = root.as_object()?;
@@ -1321,8 +1304,8 @@ impl RecipeIndex {
         self.parse_results_field(obj.get("result"), r)
     }
 
-    /// Sequenced assembly: base `ingredient`, `transitionalItem`, the
-    /// nested `sequence` recipes, `loops` and `results`.
+    /// Sequenced assembly: base `ingredient`, `transitionalItem`, the nested `sequence` recipes,
+    /// `loops` and `results`.
     fn parse_sequenced(&self, obj: &BTreeMap<String, Json>, r: &mut Recipe) -> Option<()> {
         self.parse_ingredients_field(obj.get("ingredient"), r)?;
         r.transitional_item = obj
@@ -1363,9 +1346,9 @@ impl RecipeIndex {
         self.parse_results_field(obj.get("results").or_else(|| obj.get("result")), r)
     }
 
-    /// Step ingredient list: same grammar as a recipe's `ingredients`,
-    /// but fluids inside a sequence stay ignored for material accounting
-    /// (they surface through `fluid_inputs` on real recipe types).
+    /// Step ingredient list: same grammar as a recipe's `ingredients`, but fluids inside a sequence
+    /// stay ignored for material accounting (they surface through `fluid_inputs` on real recipe
+    /// types).
     fn parse_step_ingredients(
         &self,
         obj: &BTreeMap<String, Json>,
@@ -1462,8 +1445,8 @@ impl RecipeIndex {
     }
 }
 
-/// One parsed input value: item/tag slot or `None` when the value is a
-/// fluid object (handled by `parse_fluid_value`).
+/// One parsed input value: item/tag slot or `None` when the value is a fluid object (handled by
+/// `parse_fluid_value`).
 fn parse_ingredient_value(v: &Json) -> Option<RecipeIngredient> {
     match v {
         Json::Str(s) => Some(RecipeIngredient::item(s, 1)),
@@ -1522,8 +1505,8 @@ pub struct TreeNode {
     pub needed: u64,
     /// Recipe chosen for this node, if any.
     pub recipe_id: Option<String>,
-    /// How many times `recipe_id` runs (ceil division of `needed` by the
-    /// recipe's per-craft output of `item`).
+    /// How many times `recipe_id` runs (ceil division of `needed` by the recipe's per-craft output
+    /// of `item`).
     pub crafts: u64,
     /// Produced per craft (what `crafts` divides `needed` by).
     pub per_craft: u64,
@@ -1565,8 +1548,8 @@ impl TreeNode {
     }
 }
 
-/// The fully expanded craft plan for `(root_item, root_count)` plus the
-/// aggregated totals the resource panel shows.
+/// The fully expanded craft plan for `(root_item, root_count)` plus the aggregated totals the
+/// resource panel shows.
 #[derive(Clone, Debug, Default)]
 pub struct RecipeTree {
     pub root_item: String,
@@ -1576,8 +1559,7 @@ pub struct RecipeTree {
     pub raw_materials: BTreeMap<String, u64>,
     /// Total fluid inputs across all crafts, `fluid id → mB`.
     pub raw_fluids: BTreeMap<String, u64>,
-    /// Extra guaranteed products of chosen recipes (item id → count)
-    /// plus expected chanced rolls.
+    /// Extra guaranteed products of chosen recipes (item id → count) plus expected chanced rolls.
     pub byproducts: BTreeMap<String, u64>,
     /// Set when the node budget stopped some expansion.
     pub truncated: bool,
@@ -1597,13 +1579,13 @@ impl RecipeTree {
     }
 }
 
-/// Hard bounds so a pathological recipe graph (a tree doubling per
-/// level, or 10⁶-input "recipes") can never hang the UI thread.
+/// Hard bounds so a pathological recipe graph (a tree doubling per level, or 10⁶-input "recipes")
+/// can never hang the UI thread.
 const MAX_TREE_DEPTH: usize = 48;
 const MAX_TREE_NODES: usize = 4096;
 
-/// Mutable expansion context threaded through [`RecipeIndex::expand_node`]
-/// (keeps the recursion signature small).
+/// Mutable expansion context threaded through [`RecipeIndex::expand_node`] (keeps the recursion
+/// signature small).
 struct TreeBuild<'a> {
     selections: &'a BTreeMap<String, String>,
     /// Items currently being expanded — the cycle detector's stack.
@@ -1707,10 +1689,9 @@ impl RecipeIndex {
         node
     }
 
-    /// How many times `recipe` can run on the given `inventory`
-    /// (item id → count). When the inventory is empty — the host simply
-    /// did not supply one — this reports a full stack (`64`) so the `+`
-    /// transfer button stays meaningful.
+    /// How many times `recipe` can run on the given `inventory` (item id → count). When the
+    /// inventory is empty — the host simply did not supply one — this reports a full stack (`64`)
+    /// so the `+` transfer button stays meaningful.
     pub fn max_craft(&self, recipe: &Recipe, inventory: &BTreeMap<String, u64>) -> u32 {
         let inputs = recipe.effective_inputs(self);
         if inputs.is_empty() {
@@ -1771,9 +1752,8 @@ pub enum MachineTutorialAnimation {
     },
 }
 
-/// The voxel position an animation applies to. When no [`MachineTutorialVoxel`]
-/// sits at `pos`, a small marker cube is drawn instead (a moving arm or
-/// item gliding along a belt).
+/// The voxel position an animation applies to. When no [`MachineTutorialVoxel`] sits at `pos`, a
+/// small marker cube is drawn instead (a moving arm or item gliding along a belt).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnimatedPart {
     pub pos: (i32, i32, i32),
@@ -1864,8 +1844,8 @@ impl MachineTutorialScene {
         self.steps.get(self.step_index)
     }
 
-    /// Advance the animation/step clock by one tick (no-op while paused).
-    /// Steps wrap around like a looping Create machine tutorial.
+    /// Advance the animation/step clock by one tick (no-op while paused). Steps wrap around like a
+    /// looping Create machine tutorial.
     pub fn advance_tick(&mut self) {
         if !self.playing {
             return;
@@ -1917,145 +1897,217 @@ impl MachineTutorialScene {
     }
 }
 
-/// Render `scene` into `list`, clipped to physical-pixel viewport `vp`.
-///
-/// Pipeline: per-voxel corners are animated (spin/oscillate from the
-/// current step), the scene is yaw+pitch rotated about its center and
-/// orthographically projected; each cube's three camera-facing faces are
-/// depth-sorted (painter's algorithm, far → near) and rasterized as 1px
-/// scanline `FillRect`s, so the whole thing rides the existing
-/// software/wgpu quad pipeline with no extra primitives.
+/// Cube-face definition: corner indices, outward normal, shade factor.
+type TutorialFaceDef = ([usize; 4], (f32, f32, f32), f32);
+
+/// The six cube faces; corner index bits are `x + 2y + 4z`.
+const TUTORIAL_FACES: [TutorialFaceDef; 6] = [
+    ([2, 3, 7, 6], (0.0, 1.0, 0.0), 1.00),   // +y top
+    ([0, 4, 5, 1], (0.0, -1.0, 0.0), 0.45),  // -y bottom
+    ([1, 5, 7, 3], (1.0, 0.0, 0.0), 0.85),   // +x
+    ([0, 2, 6, 4], (-1.0, 0.0, 0.0), 0.70),  // -x
+    ([4, 6, 7, 5], (0.0, 0.0, 1.0), 0.80),   // +z
+    ([0, 1, 3, 2], (0.0, 0.0, -1.0), 0.62),  // -z
+];
+
+/// A projected, shade-lit cube face queued for the painter's-algorithm pass.
+struct TutorialFace {
+    quad: [(f32, f32); 4],
+    color: UiColor,
+    depth: f32,
+}
+
+/// Yaw+pitch rotation about the scene center plus orthographic projection fitted into the
+/// physical-pixel viewport.
+struct TutorialProjection {
+    cx: f32,
+    cy: f32,
+    cz: f32,
+    ox: f32,
+    oy: f32,
+    size: f32,
+    cyw: f32,
+    syw: f32,
+    cpt: f32,
+    spt: f32,
+}
+
+impl TutorialProjection {
+    fn new(vp: UiRect, scene: &MachineTutorialScene) -> Self {
+        let (min_x, max_x) = bounds_axis(&scene.blocks, |v| v.x);
+        let (min_y, max_y) = bounds_axis(&scene.blocks, |v| v.y);
+        let (min_z, max_z) = bounds_axis(&scene.blocks, |v| v.z);
+        let extent = (max_x - min_x + 1)
+            .max(max_y - min_y + 1)
+            .max(max_z - min_z + 1) as f32;
+        // Block edge length in px — fit the rotated scene with headroom.
+        let size = (vp.w.min(vp.h) as f32 / (extent * 1.55 + 0.8)).clamp(3.0, 64.0);
+        let yaw = scene.yaw_deg.to_radians();
+        let pitch = scene.pitch_deg.to_radians();
+        Self {
+            cx: (min_x + max_x + 1) as f32 / 2.0,
+            cy: (min_y + max_y + 1) as f32 / 2.0,
+            cz: (min_z + max_z + 1) as f32 / 2.0,
+            ox: vp.x as f32 + vp.w as f32 / 2.0,
+            oy: vp.y as f32 + vp.h as f32 * 0.58,
+            size,
+            cyw: Mth::cos(yaw),
+            syw: Mth::sin(yaw),
+            cpt: Mth::cos(pitch),
+            spt: Mth::sin(pitch),
+        }
+    }
+
+    /// Rotate a world-space point about the scene center → screen + depth.
+    fn project(&self, px: f32, py: f32, pz: f32) -> (f32, f32, f32) {
+        let dx = px - self.cx;
+        let dy = py - self.cy;
+        let dz = pz - self.cz;
+        let x1 = dx * self.cyw - dz * self.syw;
+        let z1 = dx * self.syw + dz * self.cyw;
+        let y2 = dy * self.cpt - z1 * self.spt;
+        let z2 = dy * self.spt + z1 * self.cpt;
+        (self.ox + x1 * self.size, self.oy - y2 * self.size, z2)
+    }
+}
+
+/// Push the camera-facing faces of one (possibly animated) voxel into `faces`. `half` is the cube
+/// half-extent (`0.5` fills a voxel, smaller values draw accent markers); `tick` drives
+/// spin/oscillate.
+fn collect_tutorial_faces(
+    faces: &mut Vec<TutorialFace>,
+    proj: &TutorialProjection,
+    tick: u32,
+    pos: (f32, f32, f32),
+    half: f32,
+    anim: Option<MachineTutorialAnimation>,
+    base: UiColor,
+) {
+    let (bx, by, bz) = pos;
+    let lo = 0.5 - half;
+    let hi = 0.5 + half;
+    let mut pts = [(0.0f32, 0.0f32, 0.0f32); 8];
+    for (i, p) in pts.iter_mut().enumerate() {
+        let mut lx = if i & 1 == 0 { lo } else { hi };
+        let mut ly = if i & 2 == 0 { lo } else { hi };
+        let mut lz = if i & 4 == 0 { lo } else { hi };
+        match anim {
+            Some(MachineTutorialAnimation::Spin { axis, rpm }) => {
+                let ang = tick as f32 * rpm * std::f32::consts::TAU / 1200.0;
+                let (s, c) = (Mth::sin(ang), Mth::cos(ang));
+                let (mx, my, mz) = (lx - 0.5, ly - 0.5, lz - 0.5);
+                match axis {
+                    MachineTutorialAxis::X => {
+                        ly = 0.5 + my * c - mz * s;
+                        lz = 0.5 + my * s + mz * c;
+                    }
+                    MachineTutorialAxis::Y => {
+                        lx = 0.5 + mx * c - mz * s;
+                        lz = 0.5 + mx * s + mz * c;
+                    }
+                    MachineTutorialAxis::Z => {
+                        lx = 0.5 + mx * c - my * s;
+                        ly = 0.5 + mx * s + my * c;
+                    }
+                }
+            }
+            Some(MachineTutorialAnimation::Oscillate {
+                axis,
+                amplitude,
+                period_ticks,
+            }) => {
+                let phase = tick as f32 * std::f32::consts::TAU / period_ticks.max(1) as f32;
+                let off = amplitude * Mth::sin(phase);
+                match axis {
+                    MachineTutorialAxis::X => lx += off,
+                    MachineTutorialAxis::Y => ly += off,
+                    MachineTutorialAxis::Z => lz += off,
+                }
+            }
+            None => {}
+        }
+        *p = (bx + lx, by + ly, bz + lz);
+    }
+    for (idxs, n, shade) in TUTORIAL_FACES {
+        // Camera sits on +z looking -z: a face shows when its rotated
+        // normal still points at the camera.
+        let z1 = n.0 * proj.syw + n.2 * proj.cyw;
+        if n.1 * proj.spt + z1 * proj.cpt <= 0.0 {
+            continue;
+        }
+        let mut quad = [(0.0f32, 0.0f32); 4];
+        let mut depth = 0.0f32;
+        for (k, &ci) in idxs.iter().enumerate() {
+            let (sx, sy, z2) = proj.project(pts[ci].0, pts[ci].1, pts[ci].2);
+            quad[k] = (sx, sy);
+            depth += z2;
+        }
+        faces.push(TutorialFace {
+            quad,
+            color: shade_color(base, shade),
+            depth: depth / 4.0,
+        });
+    }
+}
+
+/// Highlight wireframe over the step's highlighted voxel.
+fn draw_tutorial_highlight(
+    list: &mut UiDrawList,
+    vp: UiRect,
+    proj: &TutorialProjection,
+    highlight: (i32, i32, i32),
+) {
+    let (hx, hy, hz) = highlight;
+    let mut pc = [(0.0f32, 0.0f32); 8];
+    for (i, p) in pc.iter_mut().enumerate() {
+        let lx = if i & 1 == 0 { 0.0 } else { 1.0 };
+        let ly = if i & 2 == 0 { 0.0 } else { 1.0 };
+        let lz = if i & 4 == 0 { 0.0 } else { 1.0 };
+        let (sx, sy, _) = proj.project(hx as f32 + lx, hy as f32 + ly, hz as f32 + lz);
+        *p = (sx, sy);
+    }
+    const EDGES: [(usize, usize); 12] = [
+        (0, 1),
+        (0, 2),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (2, 3),
+        (2, 6),
+        (3, 7),
+        (4, 5),
+        (4, 6),
+        (5, 7),
+        (6, 7),
+    ];
+    for (a, b) in EDGES {
+        rasterize_line(list, vp, pc[a], pc[b], palette::ACCENT);
+    }
+}
+
+/// Render `scene` into `list`, clipped to physical-pixel viewport `vp`.  Pipeline: per-voxel
+/// corners are animated (spin/oscillate from the current step), the scene is yaw+pitch rotated
+/// about its center and orthographically projected; each cube's three camera-facing faces are
+/// depth-sorted (painter's algorithm, far → near) and rasterized as 1px scanline `FillRect`s, so
+/// the whole thing rides the existing software/wgpu quad pipeline with no extra primitives.
 pub fn draw_machine_tutorial_scene(list: &mut UiDrawList, vp: UiRect, scene: &MachineTutorialScene) {
     if vp.w < 8 || vp.h < 8 || scene.blocks.is_empty() {
         return;
     }
-    let (min_x, max_x) = bounds_axis(&scene.blocks, |v| v.x);
-    let (min_y, max_y) = bounds_axis(&scene.blocks, |v| v.y);
-    let (min_z, max_z) = bounds_axis(&scene.blocks, |v| v.z);
-    let cx = (min_x + max_x + 1) as f32 / 2.0;
-    let cy = (min_y + max_y + 1) as f32 / 2.0;
-    let cz = (min_z + max_z + 1) as f32 / 2.0;
-    let extent = (max_x - min_x + 1)
-        .max(max_y - min_y + 1)
-        .max(max_z - min_z + 1) as f32;
-    // Block edge length in px — fit the rotated scene with headroom.
-    let size = (vp.w.min(vp.h) as f32 / (extent * 1.55 + 0.8)).clamp(3.0, 64.0);
-    let ox = vp.x as f32 + vp.w as f32 / 2.0;
-    let oy = vp.y as f32 + vp.h as f32 * 0.58;
-
-    let yaw = scene.yaw_deg.to_radians();
-    let pitch = scene.pitch_deg.to_radians();
-    let (cyw, syw) = (Mth::cos(yaw), Mth::sin(yaw));
-    let (cpt, spt) = (Mth::cos(pitch), Mth::sin(pitch));
-
-    // Rotate a world-space point about the scene center → screen + depth.
-    let project = |px: f32, py: f32, pz: f32| -> (f32, f32, f32) {
-        let dx = px - cx;
-        let dy = py - cy;
-        let dz = pz - cz;
-        let x1 = dx * cyw - dz * syw;
-        let z1 = dx * syw + dz * cyw;
-        let y2 = dy * cpt - z1 * spt;
-        let z2 = dy * spt + z1 * cpt;
-        (ox + x1 * size, oy - y2 * size, z2)
-    };
-    // Same rotation for face normals (no translation); only the z depth
-    // is needed for back-face culling.
-    let rotate_n = |nx: f32, ny: f32, nz: f32| -> f32 {
-        let z1 = nx * syw + nz * cyw;
-        ny * spt + z1 * cpt
-    };
-
-    // Corner index bits: x + 2y + 4z.
-    type FaceDef = ([usize; 4], (f32, f32, f32), f32);
-    const FACES: [FaceDef; 6] = [
-        ([2, 3, 7, 6], (0.0, 1.0, 0.0), 1.00),   // +y top
-        ([0, 4, 5, 1], (0.0, -1.0, 0.0), 0.45),  // -y bottom
-        ([1, 5, 7, 3], (1.0, 0.0, 0.0), 0.85),   // +x
-        ([0, 2, 6, 4], (-1.0, 0.0, 0.0), 0.70),  // -x
-        ([4, 6, 7, 5], (0.0, 0.0, 1.0), 0.80),   // +z
-        ([0, 1, 3, 2], (0.0, 0.0, -1.0), 0.62),  // -z
-    ];
-
-    struct Proj {
-        quad: [(f32, f32); 4],
-        color: UiColor,
-        depth: f32,
-    }
-    let mut faces: Vec<Proj> = Vec::with_capacity(scene.blocks.len() * 3);
-
-    // Collect one cube's faces: `corner(i)` yields local offsets in
-    // {0,1}³; `half` shrinks marker cubes (0.5 = full voxel).
-    let mut collect = |bx: f32, by: f32, bz: f32, half: f32, anim: Option<MachineTutorialAnimation>, base: UiColor| {
-        let lo = 0.5 - half;
-        let hi = 0.5 + half;
-        let mut pts = [(0.0f32, 0.0f32, 0.0f32); 8];
-        for (i, p) in pts.iter_mut().enumerate() {
-            let mut lx = if i & 1 == 0 { lo } else { hi };
-            let mut ly = if i & 2 == 0 { lo } else { hi };
-            let mut lz = if i & 4 == 0 { lo } else { hi };
-            match anim {
-                Some(MachineTutorialAnimation::Spin { axis, rpm }) => {
-                    let ang = scene.tick as f32 * rpm * std::f32::consts::TAU / 1200.0;
-                    let (s, c) = (Mth::sin(ang), Mth::cos(ang));
-                    let (mx, my, mz) = (lx - 0.5, ly - 0.5, lz - 0.5);
-                    match axis {
-                        MachineTutorialAxis::X => {
-                            ly = 0.5 + my * c - mz * s;
-                            lz = 0.5 + my * s + mz * c;
-                        }
-                        MachineTutorialAxis::Y => {
-                            lx = 0.5 + mx * c - mz * s;
-                            lz = 0.5 + mx * s + mz * c;
-                        }
-                        MachineTutorialAxis::Z => {
-                            lx = 0.5 + mx * c - my * s;
-                            ly = 0.5 + mx * s + my * c;
-                        }
-                    }
-                }
-                Some(MachineTutorialAnimation::Oscillate {
-                    axis,
-                    amplitude,
-                    period_ticks,
-                }) => {
-                    let phase = scene.tick as f32 * std::f32::consts::TAU
-                        / period_ticks.max(1) as f32;
-                    let off = amplitude * Mth::sin(phase);
-                    match axis {
-                        MachineTutorialAxis::X => lx += off,
-                        MachineTutorialAxis::Y => ly += off,
-                        MachineTutorialAxis::Z => lz += off,
-                    }
-                }
-                None => {}
-            }
-            *p = (bx + lx, by + ly, bz + lz);
-        }
-        for (idxs, n, shade) in FACES {
-            // Camera sits on +z looking -z: a face shows when its rotated
-            // normal still points at the camera.
-            if rotate_n(n.0, n.1, n.2) <= 0.0 {
-                continue;
-            }
-            let mut quad = [(0.0f32, 0.0f32); 4];
-            let mut depth = 0.0f32;
-            for (k, &ci) in idxs.iter().enumerate() {
-                let (sx, sy, z2) = project(pts[ci].0, pts[ci].1, pts[ci].2);
-                quad[k] = (sx, sy);
-                depth += z2;
-            }
-            faces.push(Proj {
-                quad,
-                color: shade_color(base, shade),
-                depth: depth / 4.0,
-            });
-        }
-    };
+    let proj = TutorialProjection::new(vp, scene);
+    let mut faces: Vec<TutorialFace> = Vec::with_capacity(scene.blocks.len() * 3);
 
     for v in &scene.blocks {
         let anim = scene.anim_at((v.x, v.y, v.z));
-        collect(v.x as f32, v.y as f32, v.z as f32, 0.5, anim, v.color);
+        collect_tutorial_faces(
+            &mut faces,
+            &proj,
+            scene.tick,
+            (v.x as f32, v.y as f32, v.z as f32),
+            0.5,
+            anim,
+            v.color,
+        );
     }
     // Animated positions with no block → accent marker cube.
     if let Some(step) = scene.current_step() {
@@ -2068,10 +2120,11 @@ pub fn draw_machine_tutorial_scene(list: &mut UiDrawList, vp: UiRect, scene: &Ma
             {
                 continue;
             }
-            collect(
-                px as f32,
-                py as f32,
-                pz as f32,
+            collect_tutorial_faces(
+                &mut faces,
+                &proj,
+                scene.tick,
+                (px as f32, py as f32, pz as f32),
                 0.28,
                 Some(part.anim),
                 palette::WARNING,
@@ -2086,32 +2139,8 @@ pub fn draw_machine_tutorial_scene(list: &mut UiDrawList, vp: UiRect, scene: &Ma
     }
 
     // Highlight wireframe over the step's highlighted voxel.
-    if let Some((hx, hy, hz)) = scene.current_step().and_then(|s| s.highlight) {
-        let mut pc = [(0.0f32, 0.0f32); 8];
-        for (i, p) in pc.iter_mut().enumerate() {
-            let lx = if i & 1 == 0 { 0.0 } else { 1.0 };
-            let ly = if i & 2 == 0 { 0.0 } else { 1.0 };
-            let lz = if i & 4 == 0 { 0.0 } else { 1.0 };
-            let (sx, sy, _) = project(hx as f32 + lx, hy as f32 + ly, hz as f32 + lz);
-            *p = (sx, sy);
-        }
-        const EDGES: [(usize, usize); 12] = [
-            (0, 1),
-            (0, 2),
-            (0, 4),
-            (1, 3),
-            (1, 5),
-            (2, 3),
-            (2, 6),
-            (3, 7),
-            (4, 5),
-            (4, 6),
-            (5, 7),
-            (6, 7),
-        ];
-        for (a, b) in EDGES {
-            rasterize_line(list, vp, pc[a], pc[b], palette::ACCENT);
-        }
+    if let Some(h) = scene.current_step().and_then(|s| s.highlight) {
+        draw_tutorial_highlight(list, vp, &proj, h);
     }
 }
 
@@ -2193,8 +2222,7 @@ fn rasterize_line(list: &mut UiDrawList, vp: UiRect, a: (f32, f32), b: (f32, f32
 // Browser state: tabs, views, widget ids, actions
 // ---------------------------------------------------------------------------
 
-/// The top-level browser tab (item grid, craft tree, world resources,
-/// machine tutorials).
+/// The top-level browser tab (item grid, craft tree, world resources, machine tutorials).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BrowserTab {
     #[default]
@@ -2344,9 +2372,9 @@ impl RecipeHitRegion {
 /// What the embedding application must perform after an interaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecipeBrowserAction {
-    /// recipe-browser-style `+` button: fill the player's crafting grid with this
-    /// recipe. `max_craft` is how many times the recipe can run on the
-    /// host-supplied `inventory` (or `64` when none was supplied).
+    /// recipe-browser-style `+` button: fill the player's crafting grid with this recipe.
+    /// `max_craft` is how many times the recipe can run on the host-supplied `inventory` (or `64`
+    /// when none was supplied).
     TransferToCraftingGrid { recipe_id: String, max_craft: u32 },
     /// Leave the screen (Escape / gamepad East with nothing to back out).
     Close,
@@ -2421,8 +2449,8 @@ fn is_subsequence(needle: &str, hay: &str) -> bool {
     !needle.is_empty()
 }
 
-/// Match rank of a lowercase token against a lowercase field:
-/// exact > prefix > substring > subsequence.
+/// Match rank of a lowercase token against a lowercase field: exact > prefix > substring >
+/// subsequence.
 fn field_rank(token: &str, field: &str) -> Option<u32> {
     if token.is_empty() {
         return Some(0);
@@ -2493,8 +2521,7 @@ pub struct RecipeBrowserState {
     history: Vec<(String, DetailMode)>,
     /// Host-fed tick counter driving tag-slot icon cycling (~1 Hz).
     pub clock_ticks: u64,
-    /// Last overlay-space mouse position (physical px) — feeds the
-    /// hover tooltip anchor.
+    /// Last overlay-space mouse position (physical px) — feeds the hover tooltip anchor.
     pub overlay_mouse: Option<(i32, i32)>,
 }
 
@@ -2778,9 +2805,8 @@ impl RecipeBrowserState {
 
     // -- detail / tree ---------------------------------------------------
 
-    /// Open the recipes (`R`) or uses (`U`) detail for `item`. The
-    /// current detail — if any — is pushed onto the `Backspace`
-    /// navigation history (capped at 64 entries).
+    /// Open the recipes (`R`) or uses (`U`) detail for `item`. The current detail — if any — is
+    /// pushed onto the `Backspace` navigation history (capped at 64 entries).
     pub fn open_detail(&mut self, item: &str, mode: DetailMode) {
         if let Some(prev) = self.detail.take() {
             if prev != (item.to_owned(), mode) && self.history.len() < 64 {
@@ -2793,8 +2819,8 @@ impl RecipeBrowserState {
         self.detail_scroll = 0;
     }
 
-    /// Item id behind the current hover widget, if it names one —
-    /// grid slots, bookmark/pinned rows and recipe-diagram slots.
+    /// Item id behind the current hover widget, if it names one — grid slots, bookmark/pinned rows
+    /// and recipe-diagram slots.
     pub fn hovered_item(&self) -> Option<String> {
         match self.hover? {
             RecipeWidgetId::ItemSlot(vi) => self
@@ -2808,9 +2834,8 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Resolve a `DetailSlot(n)` id against the selected detail recipe —
-    /// slot space is `inputs ++ outputs ++ chanced_outputs` (tag inputs
-    /// cycle by [`clock_ticks`](Self::clock_ticks)).
+    /// Resolve a `DetailSlot(n)` id against the selected detail recipe — slot space is `inputs ++
+    /// outputs ++ chanced_outputs` (tag inputs cycle by [`clock_ticks`](Self::clock_ticks)).
     pub fn detail_slot_item(&self, n: usize) -> Option<String> {
         let recipes = self.detail_recipes();
         let recipe = recipes.get(self.recipe_selected)?;
@@ -2855,6 +2880,25 @@ impl RecipeBrowserState {
     /// Activate a widget (from a click, or directly in tests).
     pub fn activate(&mut self, id: RecipeWidgetId) -> Vec<RecipeBrowserAction> {
         match id {
+            RecipeWidgetId::DetailBack => return self.back_or_close(),
+            RecipeWidgetId::TransferRecipe(i) => {
+                if let Some(&recipe) = self.detail_recipes().get(i) {
+                    let max_craft = self.index.max_craft(recipe, &self.inventory);
+                    return vec![RecipeBrowserAction::TransferToCraftingGrid {
+                        recipe_id: recipe.id.clone(),
+                        max_craft,
+                    }];
+                }
+            }
+            _ => self.activate_state(id),
+        }
+        Vec::new()
+    }
+
+    /// State-mutating half of [`activate`](Self::activate): every widget that only changes browser
+    /// state (the two action-returning arms live in [`activate`](Self::activate) itself).
+    fn activate_state(&mut self, id: RecipeWidgetId) {
+        match id {
             RecipeWidgetId::SearchField => self.search_focused = true,
             RecipeWidgetId::SearchClear => {
                 if !self.search.is_empty() {
@@ -2862,22 +2906,13 @@ impl RecipeBrowserState {
                     self.after_view_change();
                 }
             }
-            RecipeWidgetId::TabItems => {
-                self.tab = BrowserTab::Items;
-            }
-            RecipeWidgetId::TabTree => {
-                self.tab = BrowserTab::Tree;
-            }
+            RecipeWidgetId::TabItems => self.tab = BrowserTab::Items,
+            RecipeWidgetId::TabTree => self.tab = BrowserTab::Tree,
             RecipeWidgetId::TabWorldDropsInfo => {
                 self.tab = BrowserTab::WorldDropsInfo;
                 self.world_drops_scroll = 0;
             }
-            RecipeWidgetId::TabMachineTutorials => {
-                self.tab = BrowserTab::MachineTutorials;
-            }
-            RecipeWidgetId::DetailBack => {
-                return self.back_or_close();
-            }
+            RecipeWidgetId::TabMachineTutorials => self.tab = BrowserTab::MachineTutorials,
             RecipeWidgetId::ItemSlot(slot) => {
                 let len = self.visible_items().len();
                 if slot < len {
@@ -2903,15 +2938,6 @@ impl RecipeBrowserState {
             RecipeWidgetId::RecipeRow(i) => {
                 if i < self.detail_recipes().len() {
                     self.recipe_selected = i;
-                }
-            }
-            RecipeWidgetId::TransferRecipe(i) => {
-                if let Some(&recipe) = self.detail_recipes().get(i) {
-                    let max_craft = self.index.max_craft(recipe, &self.inventory);
-                    return vec![RecipeBrowserAction::TransferToCraftingGrid {
-                        recipe_id: recipe.id.clone(),
-                        max_craft,
-                    }];
                 }
             }
             RecipeWidgetId::DetailSlot(n) => {
@@ -2959,7 +2985,9 @@ impl RecipeBrowserState {
             RecipeWidgetId::WorldDropsTabOres => self.set_world_drops_tab(WorldDropsTab::OreGen),
             RecipeWidgetId::WorldDropsTabTrades => self.set_world_drops_tab(WorldDropsTab::Trades),
             RecipeWidgetId::WorldDropsTabLoot => self.set_world_drops_tab(WorldDropsTab::Loot),
-            RecipeWidgetId::WorldDropsTabEnchants => self.set_world_drops_tab(WorldDropsTab::Enchants),
+            RecipeWidgetId::WorldDropsTabEnchants => {
+                self.set_world_drops_tab(WorldDropsTab::Enchants)
+            }
             RecipeWidgetId::WorldDropsTabFuels => self.set_world_drops_tab(WorldDropsTab::Fuels),
             RecipeWidgetId::WorldDropsScrollUp => {
                 self.world_drops_scroll = self.world_drops_scroll.saturating_sub(1);
@@ -2967,33 +2995,24 @@ impl RecipeBrowserState {
             RecipeWidgetId::WorldDropsScrollDown => {
                 self.world_drops_scroll += 1;
             }
-            RecipeWidgetId::MachineTutorialPrev => {
-                if let Some(p) = &mut self.machine_tutorial {
-                    p.prev_step();
-                }
-            }
-            RecipeWidgetId::MachineTutorialNext => {
-                if let Some(p) = &mut self.machine_tutorial {
-                    p.next_step();
-                }
-            }
-            RecipeWidgetId::MachineTutorialPlay => {
-                if let Some(p) = &mut self.machine_tutorial {
-                    p.playing = !p.playing;
-                }
-            }
+            RecipeWidgetId::MachineTutorialPrev => self.tutorial_step(|p| p.prev_step()),
+            RecipeWidgetId::MachineTutorialNext => self.tutorial_step(|p| p.next_step()),
+            RecipeWidgetId::MachineTutorialPlay => self.tutorial_step(|p| p.playing = !p.playing),
             RecipeWidgetId::MachineTutorialRotateLeft => {
-                if let Some(p) = &mut self.machine_tutorial {
-                    p.rotate(-15.0);
-                }
+                self.tutorial_step(|p| p.rotate(-15.0))
             }
             RecipeWidgetId::MachineTutorialRotateRight => {
-                if let Some(p) = &mut self.machine_tutorial {
-                    p.rotate(15.0);
-                }
+                self.tutorial_step(|p| p.rotate(15.0))
             }
+            RecipeWidgetId::DetailBack | RecipeWidgetId::TransferRecipe(_) => {}
         }
-        Vec::new()
+    }
+
+    /// Run `f` against the loaded machine-tutorial scene, if any.
+    fn tutorial_step(&mut self, f: impl FnOnce(&mut MachineTutorialScene)) {
+        if let Some(p) = &mut self.machine_tutorial {
+            f(p);
+        }
     }
 
     fn set_world_drops_tab(&mut self, tab: WorldDropsTab) {
@@ -3149,9 +3168,8 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Overlay hit-region click: same focus bookkeeping as
-    /// [`handle_input`](Self::handle_input)'s `Click` arm, but driven by
-    /// the host's own `RecipeHitRegion` hit test instead of the
+    /// Overlay hit-region click: same focus bookkeeping as [`handle_input`](Self::handle_input)'s
+    /// `Click` arm, but driven by the host's own `RecipeHitRegion` hit test instead of the
     /// full-screen widget layout.
     pub fn activate_region(&mut self, id: RecipeWidgetId) -> Vec<RecipeBrowserAction> {
         if id != RecipeWidgetId::SearchField {
@@ -3182,8 +3200,8 @@ impl RecipeBrowserState {
         }]
     }
 
-    /// Navigate back: pop the detail history stack, else clear an open
-    /// detail, else ask the host to close the surface.
+    /// Navigate back: pop the detail history stack, else clear an open detail, else ask the host to
+    /// close the surface.
     pub fn back_or_close(&mut self) -> Vec<RecipeBrowserAction> {
         if let Some(prev) = self.history.pop() {
             self.detail = Some(prev);
@@ -3212,21 +3230,17 @@ impl RecipeBrowserState {
                             self.move_selection(dir * cols, false);
                         }
                     }
-                    BrowserTab::Tree => {
-                        self.tree_scroll = (self.tree_scroll as i64 + dir).max(0) as usize;
-                    }
+                    BrowserTab::Tree => nudge_scroll(&mut self.tree_scroll, dir),
                     BrowserTab::WorldDropsInfo => {
-                        self.world_drops_scroll = (self.world_drops_scroll as i64 + dir).max(0) as usize;
+                        nudge_scroll(&mut self.world_drops_scroll, dir)
                     }
-                    BrowserTab::MachineTutorials => {
-                        if let Some(p) = &mut self.machine_tutorial {
-                            if dir < 0 {
-                                p.prev_step();
-                            } else {
-                                p.next_step();
-                            }
+                    BrowserTab::MachineTutorials => self.tutorial_step(|p| {
+                        if dir < 0 {
+                            p.prev_step();
+                        } else {
+                            p.next_step();
                         }
-                    }
+                    }),
                 }
             }
             UiKey::Left | UiKey::Right => {
@@ -3240,17 +3254,11 @@ impl RecipeBrowserState {
                             self.move_selection(dir, false);
                         }
                     }
-                    BrowserTab::MachineTutorials => {
-                        if let Some(p) = &mut self.machine_tutorial {
-                            p.rotate(if dir < 0 { -15.0 } else { 15.0 });
-                        }
-                    }
-                    BrowserTab::Tree => {
-                        let page = 10i64;
-                        self.tree_scroll = (self.tree_scroll as i64 + dir * page).max(0) as usize;
-                    }
+                    BrowserTab::MachineTutorials => self
+                        .tutorial_step(|p| p.rotate(if dir < 0 { -15.0 } else { 15.0 })),
+                    BrowserTab::Tree => nudge_scroll(&mut self.tree_scroll, dir * 10),
                     BrowserTab::WorldDropsInfo => {
-                        self.world_drops_scroll = (self.world_drops_scroll as i64 + dir * 5).max(0) as usize;
+                        nudge_scroll(&mut self.world_drops_scroll, dir * 5)
                     }
                 }
             }
@@ -3310,9 +3318,8 @@ impl RecipeBrowserState {
 }
 
 impl RecipeBrowserState {
-    /// Best score a text token gets across an item's searchable fields —
-    /// English name AND the active display locale's name (plus id, mod,
-    /// tags, tooltips) so both always match.
+    /// Best score a text token gets across an item's searchable fields — English name AND the
+    /// active display locale's name (plus id, mod, tags, tooltips) so both always match.
     fn item_text_score(&self, item: &ItemEntry, token: &str) -> Option<u32> {
         let name = item.display_name.to_lowercase();
         let id = item.id.to_lowercase();
@@ -3369,11 +3376,10 @@ impl RecipeBrowserState {
 // ---------------------------------------------------------------------------
 
 impl RecipeBrowserState {
-    /// Build the frame: `(draw_list, hit_regions)`. Everything is computed
-    /// in logical pixels and multiplied by
-    /// [`effective_scale`](Self::effective_scale) on emit, so the same
-    /// layout serves `640×360` through `3840×2160` and every hit region is
-    /// pixel-identical to its widget's visuals.
+    /// Build the frame: `(draw_list, hit_regions)`. Everything is computed in logical pixels and
+    /// multiplied by [`effective_scale`](Self::effective_scale) on emit, so the same layout serves
+    /// `640×360` through `3840×2160` and every hit region is pixel-identical to its widget's
+    /// visuals.
     pub fn render(&self, width: u32, height: u32) -> (UiDrawList, Vec<RecipeHitRegion>) {
         let mut lay = Lay::new(self, width, height);
         let mut hits = Vec::new();
@@ -3412,11 +3418,10 @@ impl RecipeBrowserState {
         (lay.finish(), hits)
     }
 
-    /// recipe overlay side-panel overlay for an open container screen. `panel`
-    /// is the container's physical-pixel rect; the browser draws a
-    /// bookmarks/pinned-trees column to its left and a search + item
-    /// grid (or recipe detail) column to its right. Returns `None` when
-    /// either side lacks room — panels never overlap `panel`.
+    /// recipe overlay side-panel overlay for an open container screen. `panel` is the container's
+    /// physical-pixel rect; the browser draws a bookmarks/pinned-trees column to its left and a
+    /// search + item grid (or recipe detail) column to its right. Returns `None` when either side
+    /// lacks room — panels never overlap `panel`.
     pub fn render_overlay(
         &self,
         width: u32,
@@ -3457,138 +3462,20 @@ impl RecipeBrowserState {
             panel_l.h,
         );
         let right = UiRect::new(panel_l.right() + GAP, panel_l.y, right_w as u32, panel_l.h);
-        self.render_overlay_bookmarks(&mut lay, &mut hits, left);
+        // Left column: bookmarks + pinned trees, each row live-compared
+        // against `inventory` (remaining count, or a green check when the
+        // player can craft it right now).
+        self.render_bookmark_column(&mut lay, &mut hits, left, false);
         self.render_overlay_right(&mut lay, &mut hits, right);
         self.render_overlay_tooltip(&mut lay);
         Some((lay.finish(), hits))
     }
 
-    /// Left overlay column: bookmarks + pinned trees, each row live-
-    /// compared against `self.inventory` (remaining count, or a green
-    /// check when the player can craft it right now).
-    fn render_overlay_bookmarks(
-        &self,
-        lay: &mut Lay,
-        hits: &mut Vec<RecipeHitRegion>,
-        panel: UiRect,
-    ) {
-        let lang = self.lang;
-        lay.fill_rect(panel, DETAIL_BG);
-        lay.border_rect(panel, palette::PANEL_BORDER);
-        lay.text_fit(
-            panel.x + 4,
-            panel.y + 3,
-            1,
-            palette::TEXT_DIM,
-            tr(lang, "Bookmarks", "ブックマーク"),
-            ((panel.w as i32 - 8) / 8).max(1) as usize,
-        );
-        let list_top = panel.y + 14;
-        let list_bottom = panel.bottom() - 14;
-        let rows = ((list_bottom - list_top) / BOOKMARK_PITCH).max(0) as usize;
-        let mut y = list_top;
-        let mut row_i = 0usize;
-        for (i, (item, count)) in self.pinned_trees.iter().enumerate() {
-            if row_i >= rows {
-                break;
-            }
-            let rect = UiRect::new(panel.x + 2, y, panel.w - 4, BOOKMARK_H as u32);
-            let hovered = self.hover == Some(RecipeWidgetId::PinnedTreeRow(i));
-            lay.fill_rect(
-                rect,
-                if hovered {
-                    palette::BUTTON
-                } else {
-                    palette::SLOT
-                },
-            );
-            let tree = self
-                .index
-                .recipe_tree(item, (*count).max(1), &self.recipe_selections);
-            let remaining = tree.remaining_needed(&self.inventory);
-            let name = self
-                .index
-                .display_name_for_locale(item, &self.active_locale);
-            let label = if remaining.is_empty() {
-                format!("T: {count}x {name} [OK]")
-            } else {
-                let lack: String = remaining
-                    .iter()
-                    .take(2)
-                    .map(|(id, n)| format!(" {n}x{}", self.index.display_name(id)))
-                    .collect();
-                format!("T: {count}x {name} -{lack}")
-            };
-            lay.text_fit(
-                rect.x + 3,
-                rect.y + 3,
-                1,
-                if remaining.is_empty() {
-                    UiColor::rgb(120, 220, 120)
-                } else {
-                    palette::AIR
-                },
-                &label,
-                ((rect.w as i32 - 6) / 8).max(1) as usize,
-            );
-            lay.region(hits, RecipeWidgetId::PinnedTreeRow(i), rect);
-            y += BOOKMARK_PITCH;
-            row_i += 1;
-        }
-        for (i, item) in self.bookmarks.iter().enumerate() {
-            if row_i >= rows {
-                break;
-            }
-            let rect = UiRect::new(panel.x + 2, y, panel.w - 4, BOOKMARK_H as u32);
-            let hovered = self.hover == Some(RecipeWidgetId::BookmarkRow(i));
-            lay.fill_rect(
-                rect,
-                if hovered {
-                    palette::BUTTON
-                } else {
-                    palette::SLOT
-                },
-            );
-            lay.icon(UiRect::new(rect.x + 2, rect.y + 1, 12, 12), item);
-            let name = self
-                .index
-                .display_name_for_locale(item, &self.active_locale);
-            let have = self.inventory.get(item).copied().unwrap_or(0);
-            let label = if have > 0 {
-                format!("{name} x{have}")
-            } else {
-                name
-            };
-            lay.text_fit(
-                rect.x + 17,
-                rect.y + 3,
-                1,
-                palette::TEXT,
-                &label,
-                ((rect.w as i32 - 21) / 8).max(1) as usize,
-            );
-            lay.region(hits, RecipeWidgetId::BookmarkRow(i), rect);
-            y += BOOKMARK_PITCH;
-            row_i += 1;
-        }
-        if self.bookmarks.is_empty() && self.pinned_trees.is_empty() {
-            lay.text_fit(
-                panel.x + 6,
-                list_top + 4,
-                1,
-                palette::TEXT_DIM,
-                tr(lang, "(press A on an item)", "(Aで追加)"),
-                ((panel.w as i32 - 12) / 8).max(1) as usize,
-            );
-        }
-    }
-
-    /// Right overlay column: search row + `x` clear + craftable-only
-    /// toggle, then either the recipe-detail card or the item grid.
+    /// Right overlay column: search row + `x` clear + craftable-only toggle, then either the
+    /// recipe-detail card or the item grid.
     fn render_overlay_right(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, panel: UiRect) {
         let lang = self.lang;
-        lay.fill_rect(panel, DETAIL_BG);
-        lay.border_rect(panel, palette::PANEL_BORDER);
+        detail_pane(lay, panel);
 
         // Search row: [field][x]
         let clear_w = 16;
@@ -3598,58 +3485,16 @@ impl RecipeBrowserState {
             (panel.w as i32 - 6 - clear_w - 2).max(24) as u32,
             14,
         );
-        lay.fill_rect(
+        self.search_field(
+            lay,
+            hits,
             field,
-            if self.search_focused {
-                palette::SLOT
-            } else {
-                palette::BUTTON_DISABLED
-            },
+            tr(lang, "Search...", "検索..."),
+            4,
+            true,
         );
-        lay.border_rect(
-            field,
-            if self.search_focused {
-                palette::ACCENT
-            } else {
-                palette::BUTTON_BORDER
-            },
-        );
-        let cells = ((field.w as i32 - 8) / 8).max(1) as usize;
-        if self.search.is_empty() && !self.search_focused {
-            lay.text_fit(
-                field.x + 4,
-                field.y + 3,
-                1,
-                palette::TEXT_DIM,
-                tr(lang, "Search...", "検索..."),
-                cells,
-            );
-        } else {
-            let mut shown = self.search.clone();
-            if self.search_focused {
-                shown.push('_');
-            }
-            if crate::draw::text_cells(&shown) > cells {
-                shown = format!("...{}", crate::draw::last_cells(&shown, cells - 3));
-            }
-            lay.text_fit(field.x + 4, field.y + 3, 1, palette::TEXT, &shown, cells);
-        }
-        lay.region(hits, RecipeWidgetId::SearchField, field);
         let clear = UiRect::new(field.right() + 2, panel.y + 3, clear_w as u32, 14);
-        lay.fill_rect(
-            clear,
-            if self.search.is_empty() {
-                palette::BUTTON_DISABLED
-            } else if self.hover == Some(RecipeWidgetId::SearchClear) {
-                palette::DANGER
-            } else {
-                palette::BUTTON
-            },
-        );
-        lay.ctext_in(clear, 1, palette::TEXT, "x");
-        if !self.search.is_empty() {
-            lay.region(hits, RecipeWidgetId::SearchClear, clear);
-        }
+        self.search_clear(lay, hits, clear, true);
 
         // Craftable-only toggle: [x] Craftable.
         let tog = UiRect::new(panel.x + 3, panel.y + 19, panel.w - 6, 12);
@@ -3692,13 +3537,11 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Icon-only item grid inside the right overlay column (recipe browser sidebar
-    /// semantics: `ItemSlot` regions, scroll buttons at the bottom).
+    /// Icon-only item grid inside the right overlay column (recipe browser sidebar semantics:
+    /// `ItemSlot` regions, scroll buttons at the bottom).
     fn render_overlay_grid(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, body: UiRect) {
         let cols = ((body.w as i32) / SLOT_PITCH).max(1) as usize;
         let visible = self.visible_items();
-        let max_vi = visible.len().saturating_sub(1);
-        let _ = max_vi;
         let rows = ((body.h as i32 - 12) / SLOT_PITCH).max(1) as usize;
         let per_page = cols * rows;
         let page = self
@@ -3745,9 +3588,9 @@ impl RecipeBrowserState {
         }
     }
 
-    /// recipe-browser-style hover card for whichever item the pointer rests on:
-    /// localized name, English name when it differs, `@mod`, `#tags`
-    /// (abbreviated), inventory count, and the `R`/`U`/`A` hint row.
+    /// recipe-browser-style hover card for whichever item the pointer rests on: localized name,
+    /// English name when it differs, `@mod`, `#tags` (abbreviated), inventory count, and the
+    /// `R`/`U`/`A` hint row.
     fn render_overlay_tooltip(&self, lay: &mut Lay) {
         let lang = self.lang;
         let Some(item_id) = self.hovered_item() else {
@@ -3799,12 +3642,11 @@ impl RecipeBrowserState {
         );
     }
 
-    /// Compact single-column layout for narrow frames. The regular desktop
-    /// layout needs the bookmarks sidebar plus a detail grid and therefore
-    /// starts at 220 logical px; below that this fallback keeps the search,
-    /// tabs, visible items/detail, scrolling and keyboard selection fully
-    /// interactive down to 160 logical px (and still paints a bounded frame
-    /// below that rather than the old blank screen).
+    /// Compact single-column layout for narrow frames. The regular desktop layout needs the
+    /// bookmarks sidebar plus a detail grid and therefore starts at 220 logical px; below that this
+    /// fallback keeps the search, tabs, visible items/detail, scrolling and keyboard selection
+    /// fully interactive down to 160 logical px (and still paints a bounded frame below that rather
+    /// than the old blank screen).
     fn render_compact(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
         let lang = self.lang;
         lay.fill(0, 0, lay.w, lay.h, palette::BACKGROUND_TOP);
@@ -3831,34 +3673,9 @@ impl RecipeBrowserState {
         // Keep the host shell's 52 logical px Done button corner clear.
         let field_w = (lay.w - 8 - clear_w - 2 - 56).max(20);
         let field = UiRect::new(4, 14, field_w as u32, 13);
-        lay.fill_rect(
-            field,
-            if self.search_focused { palette::SLOT } else { palette::BUTTON_DISABLED },
-        );
-        lay.border_rect(
-            field,
-            if self.search_focused { palette::ACCENT } else { palette::BUTTON_BORDER },
-        );
-        let cells = ((field.w as i32 - 8) / 8).max(1) as usize;
-        if self.search.is_empty() && !self.search_focused {
-            lay.text_fit(field.x + 4, field.y + 3, 1, palette::TEXT_DIM, tr(lang, "Search...", "検索..."), cells);
-        } else {
-            let mut shown = self.search.clone();
-            if self.search_focused {
-                shown.push('_');
-            }
-            lay.text_fit(field.x + 4, field.y + 3, 1, palette::TEXT, &shown, cells);
-        }
-        lay.region(hits, RecipeWidgetId::SearchField, field);
+        self.search_field(lay, hits, field, tr(lang, "Search...", "検索..."), 4, false);
         let clear = UiRect::new(field.right() + 2, 14, clear_w as u32, 13);
-        lay.fill_rect(
-            clear,
-            if self.search.is_empty() { palette::BUTTON_DISABLED } else { palette::BUTTON },
-        );
-        lay.ctext_in(clear, 1, palette::TEXT, "x");
-        if !self.search.is_empty() {
-            lay.region(hits, RecipeWidgetId::SearchClear, clear);
-        }
+        self.search_clear(lay, hits, clear, false);
 
         // Abbreviated one-row tab strip: the full localized labels cannot fit
         // honestly at 160px, while these stable targets retain every mode.
@@ -3905,12 +3722,11 @@ impl RecipeBrowserState {
         );
     }
 
-    /// Single-column item browser used by [`render_compact`](Self::render_compact).
-    /// Rows expose the same `ItemSlot(visible_index)` hit ids as the wide
-    /// grid, so keyboard/mouse activation does not fork semantically.
+    /// Single-column item browser used by [`render_compact`](Self::render_compact). Rows expose the
+    /// same `ItemSlot(visible_index)` hit ids as the wide grid, so keyboard/mouse activation does
+    /// not fork semantically.
     fn render_compact_items(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
+        detail_pane(lay, main);
         let visible = self.visible_items();
         if visible.is_empty() {
             lay.text_fit(
@@ -3999,6 +3815,63 @@ impl RecipeBrowserState {
         let field_x = MARGIN + 4;
         let field_w = lay.w - field_x - MARGIN - 4 - clear_w - 4 - MARGIN;
         let field = UiRect::new(field_x, SEARCH_Y, field_w.max(24) as u32, 16);
+        self.search_field(
+            lay,
+            hits,
+            field,
+            tr(lang, "Search items... (@mod #tag $cat)", "アイテムを検索..."),
+            5,
+            true,
+        );
+        let clear = UiRect::new(field.right() + 4, SEARCH_Y, clear_w as u32, 16);
+        self.search_clear(lay, hits, clear, true);
+    }
+
+    // -- shared draw helpers ---------------------------------------------
+
+    /// One labeled tab pill; the caller performs the overflow check and advances `x` past `w +
+    /// gap`.
+    fn tab_pill(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        rect: UiRect,
+        label: &str,
+        id: RecipeWidgetId,
+        active: bool,
+    ) {
+        lay.fill_rect(
+            rect,
+            if active {
+                palette::ACCENT
+            } else if self.hover == Some(id) {
+                palette::BUTTON_HOVER
+            } else {
+                palette::BUTTON
+            },
+        );
+        lay.border_rect(rect, palette::BUTTON_BORDER);
+        lay.ctext_in(
+            rect,
+            1,
+            if active { palette::TEXT_DARK } else { palette::TEXT },
+            label,
+        );
+        lay.region(hits, id, rect);
+    }
+
+    /// Search field well + fitted query text + field hit region. `pad` is the inner text inset
+    /// (wide layouts 5, compact panels 4); `truncate` elides overlong queries with a leading
+    /// ellipsis.
+    fn search_field(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        field: UiRect,
+        placeholder: &str,
+        pad: i32,
+        truncate: bool,
+    ) {
         lay.fill_rect(
             field,
             if self.search_focused {
@@ -4015,14 +3888,14 @@ impl RecipeBrowserState {
                 palette::BUTTON_BORDER
             },
         );
-        let cells = ((field.w as i32 - 10) / 8).max(1) as usize;
+        let cells = ((field.w as i32 - 2 * pad) / 8).max(1) as usize;
         if self.search.is_empty() && !self.search_focused {
             lay.text_fit(
-                field.x + 5,
-                field.y + 4,
+                field.x + pad,
+                field.y + pad - 1,
                 1,
                 palette::TEXT_DIM,
-                tr(lang, "Search items... (@mod #tag $cat)", "アイテムを検索..."),
+                placeholder,
                 cells,
             );
         } else {
@@ -4030,19 +3903,22 @@ impl RecipeBrowserState {
             if self.search_focused {
                 shown.push('_');
             }
-            if crate::draw::text_cells(&shown) > cells {
+            if truncate && crate::draw::text_cells(&shown) > cells {
                 shown = format!("...{}", crate::draw::last_cells(&shown, cells - 3));
             }
-            lay.text_fit(field.x + 5, field.y + 4, 1, palette::TEXT, &shown, cells);
+            lay.text_fit(field.x + pad, field.y + pad - 1, 1, palette::TEXT, &shown, cells);
         }
         lay.region(hits, RecipeWidgetId::SearchField, field);
+    }
 
-        let clear = UiRect::new(field.right() + 4, SEARCH_Y, clear_w as u32, 16);
+    /// The `x` clear button beside a search field; `danger` paints it red while hovered (wide
+    /// layouts only).
+    fn search_clear(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, clear: UiRect, danger: bool) {
         lay.fill_rect(
             clear,
             if self.search.is_empty() {
                 palette::BUTTON_DISABLED
-            } else if self.hover == Some(RecipeWidgetId::SearchClear) {
+            } else if danger && self.hover == Some(RecipeWidgetId::SearchClear) {
                 palette::DANGER
             } else {
                 palette::BUTTON
@@ -4054,68 +3930,50 @@ impl RecipeBrowserState {
         }
     }
 
-    fn render_tabs(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
-        let lang = self.lang;
-        let tabs = [
-            (BrowserTab::Items, RecipeWidgetId::TabItems),
-            (BrowserTab::Tree, RecipeWidgetId::TabTree),
-            (BrowserTab::WorldDropsInfo, RecipeWidgetId::TabWorldDropsInfo),
-            (BrowserTab::MachineTutorials, RecipeWidgetId::TabMachineTutorials),
-        ];
-        let mut x = MARGIN + 4;
-        for (tab, id) in tabs {
-            let label = tab.label(lang);
-            let w = crate::draw::text_width(label, 1) as i32 + 12;
-            if x + w > lay.w - MARGIN {
-                break;
-            }
-            let rect = UiRect::new(x, TABS_Y, w as u32, 14);
-            let active = self.tab == tab;
-            let bg = if active {
-                palette::ACCENT
-            } else if self.hover == Some(id) {
-                palette::BUTTON_HOVER
-            } else {
-                palette::BUTTON
-            };
-            lay.fill_rect(rect, bg);
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(
-                rect,
-                1,
-                if active { palette::TEXT_DARK } else { palette::TEXT },
-                label,
-            );
-            lay.region(hits, id, rect);
-            x += w + 4;
-        }
-    }
-
-    fn render_bookmarks(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
-        let lang = self.lang;
-        let panel = UiRect::new(
-            MARGIN + 4,
-            CONTENT_TOP,
-            BOOKMARK_W as u32,
-            (lay.h - 4 - FOOTER_H - CONTENT_TOP).max(8) as u32,
-        );
-        lay.fill_rect(panel, DETAIL_BG);
-        lay.border_rect(panel, palette::PANEL_BORDER);
+    /// Shared "Bookmarks" panel chrome (fill, border, header) plus the visible-row budget;
+    /// `bottom_pad` reserves space under the list (reorder controls in the wide layout, padding in
+    /// the overlay).
+    fn bookmark_panel(&self, lay: &mut Lay, panel: UiRect, bottom_pad: i32) -> (i32, usize) {
+        detail_pane(lay, panel);
         lay.text_fit(
             panel.x + 4,
             panel.y + 3,
             1,
             palette::TEXT_DIM,
-            tr(lang, "Bookmarks", "ブックマーク"),
+            tr(self.lang, "Bookmarks", "ブックマーク"),
             ((panel.w as i32 - 8) / 8).max(1) as usize,
         );
-
-        // Pinned trees first, then bookmarked items; action buttons stay
-        // pinned to the panel bottom so rows never overlap them.
-        let controls_h = 18;
         let list_top = panel.y + 14;
-        let list_bottom = panel.bottom() - controls_h - 2;
-        let rows = ((list_bottom - list_top) / BOOKMARK_PITCH).max(0) as usize;
+        let rows = ((panel.bottom() - bottom_pad - list_top) / BOOKMARK_PITCH).max(0) as usize;
+        (list_top, rows)
+    }
+
+    /// Empty-state hint inside a bookmarks panel.
+    fn bookmark_empty_hint(&self, lay: &mut Lay, panel: UiRect, list_top: i32) {
+        lay.text_fit(
+            panel.x + 6,
+            list_top + 4,
+            1,
+            palette::TEXT_DIM,
+            tr(self.lang, "(press A on an item)", "(Aで追加)"),
+            ((panel.w as i32 - 12) / 8).max(1) as usize,
+        );
+    }
+
+    /// Bookmarks + pinned-trees column shared by the wide sidebar (`wide`) and the container
+    /// overlay. Wide mode reserves the bottom strip for reorder/remove controls, highlights the
+    /// selected row and uses color swatches + English names; the overlay compares rows live against
+    /// `inventory`/`active_locale` and shows icons.
+    fn render_bookmark_column(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        panel: UiRect,
+        wide: bool,
+    ) {
+        let controls_h = 18;
+        let bottom_pad = if wide { controls_h + 2 } else { 14 };
+        let (list_top, rows) = self.bookmark_panel(lay, panel, bottom_pad);
         let mut y = list_top;
         let mut row_i = 0usize;
         for (i, (item, count)) in self.pinned_trees.iter().enumerate() {
@@ -4125,15 +3983,47 @@ impl RecipeBrowserState {
             let rect = UiRect::new(panel.x + 2, y, panel.w - 4, BOOKMARK_H as u32);
             let hovered = self.hover == Some(RecipeWidgetId::PinnedTreeRow(i));
             lay.fill_rect(rect, if hovered { palette::BUTTON } else { palette::SLOT });
-            let label = format!("T: {}x {}", count, self.index.display_name(item));
-            lay.text_fit(
-                rect.x + 4,
-                rect.y + 3,
-                1,
-                palette::AIR,
-                &label,
-                ((rect.w as i32 - 8) / 8).max(1) as usize,
-            );
+            if wide {
+                let label = format!("T: {}x {}", count, self.index.display_name(item));
+                lay.text_fit(
+                    rect.x + 4,
+                    rect.y + 3,
+                    1,
+                    palette::AIR,
+                    &label,
+                    ((rect.w as i32 - 8) / 8).max(1) as usize,
+                );
+            } else {
+                let tree = self
+                    .index
+                    .recipe_tree(item, (*count).max(1), &self.recipe_selections);
+                let remaining = tree.remaining_needed(&self.inventory);
+                let name = self
+                    .index
+                    .display_name_for_locale(item, &self.active_locale);
+                let label = if remaining.is_empty() {
+                    format!("T: {count}x {name} [OK]")
+                } else {
+                    let lack: String = remaining
+                        .iter()
+                        .take(2)
+                        .map(|(id, n)| format!(" {n}x{}", self.index.display_name(id)))
+                        .collect();
+                    format!("T: {count}x {name} -{lack}")
+                };
+                lay.text_fit(
+                    rect.x + 3,
+                    rect.y + 3,
+                    1,
+                    if remaining.is_empty() {
+                        UiColor::rgb(120, 220, 120)
+                    } else {
+                        palette::AIR
+                    },
+                    &label,
+                    ((rect.w as i32 - 6) / 8).max(1) as usize,
+                );
+            }
             lay.region(hits, RecipeWidgetId::PinnedTreeRow(i), rect);
             y += BOOKMARK_PITCH;
             row_i += 1;
@@ -4143,7 +4033,7 @@ impl RecipeBrowserState {
                 break;
             }
             let rect = UiRect::new(panel.x + 2, y, panel.w - 4, BOOKMARK_H as u32);
-            let sel = self.bookmark_selected == Some(i);
+            let sel = wide && self.bookmark_selected == Some(i);
             let hovered = self.hover == Some(RecipeWidgetId::BookmarkRow(i));
             lay.fill_rect(
                 rect,
@@ -4155,37 +4045,47 @@ impl RecipeBrowserState {
                     palette::SLOT
                 },
             );
-            lay.fill(
-                rect.x + 3,
-                rect.y + 2,
-                10,
-                10,
-                item_color(item),
-            );
-            let name = self.index.display_name(item);
-            lay.text_fit(
-                rect.x + 16,
-                rect.y + 3,
-                1,
-                palette::TEXT,
-                &name,
-                ((rect.w as i32 - 20) / 8).max(1) as usize,
-            );
+            if wide {
+                lay.fill(rect.x + 3, rect.y + 2, 10, 10, item_color(item));
+                let name = self.index.display_name(item);
+                lay.text_fit(
+                    rect.x + 16,
+                    rect.y + 3,
+                    1,
+                    palette::TEXT,
+                    &name,
+                    ((rect.w as i32 - 20) / 8).max(1) as usize,
+                );
+            } else {
+                lay.icon(UiRect::new(rect.x + 2, rect.y + 1, 12, 12), item);
+                let name = self
+                    .index
+                    .display_name_for_locale(item, &self.active_locale);
+                let have = self.inventory.get(item).copied().unwrap_or(0);
+                let label = if have > 0 {
+                    format!("{name} x{have}")
+                } else {
+                    name
+                };
+                lay.text_fit(
+                    rect.x + 17,
+                    rect.y + 3,
+                    1,
+                    palette::TEXT,
+                    &label,
+                    ((rect.w as i32 - 21) / 8).max(1) as usize,
+                );
+            }
             lay.region(hits, RecipeWidgetId::BookmarkRow(i), rect);
             y += BOOKMARK_PITCH;
             row_i += 1;
         }
         if self.bookmarks.is_empty() && self.pinned_trees.is_empty() {
-            lay.text_fit(
-                panel.x + 6,
-                list_top + 4,
-                1,
-                palette::TEXT_DIM,
-                tr(lang, "(press A on an item)", "(Aで追加)"),
-                ((panel.w as i32 - 12) / 8).max(1) as usize,
-            );
+            self.bookmark_empty_hint(lay, panel, list_top);
         }
-
+        if !wide {
+            return;
+        }
         // Reorder/remove controls for the selected bookmark.
         let cy = panel.bottom() - controls_h + 1;
         let buttons = [
@@ -4215,6 +4115,43 @@ impl RecipeBrowserState {
         }
     }
 
+    fn render_tabs(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
+        let lang = self.lang;
+        let tabs = [
+            (BrowserTab::Items, RecipeWidgetId::TabItems),
+            (BrowserTab::Tree, RecipeWidgetId::TabTree),
+            (BrowserTab::WorldDropsInfo, RecipeWidgetId::TabWorldDropsInfo),
+            (BrowserTab::MachineTutorials, RecipeWidgetId::TabMachineTutorials),
+        ];
+        let mut x = MARGIN + 4;
+        for (tab, id) in tabs {
+            let label = tab.label(lang);
+            let w = crate::draw::text_width(label, 1) as i32 + 12;
+            if x + w > lay.w - MARGIN {
+                break;
+            }
+            self.tab_pill(
+                lay,
+                hits,
+                UiRect::new(x, TABS_Y, w as u32, 14),
+                label,
+                id,
+                self.tab == tab,
+            );
+            x += w + 4;
+        }
+    }
+
+    fn render_bookmarks(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
+        let panel = UiRect::new(
+            MARGIN + 4,
+            CONTENT_TOP,
+            BOOKMARK_W as u32,
+            (lay.h - 4 - FOOTER_H - CONTENT_TOP).max(8) as u32,
+        );
+        self.render_bookmark_column(lay, hits, panel, true);
+    }
+
     fn render_main(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>) {
         let main = UiRect::new(
             MARGIN + 4 + BOOKMARK_W + PANE_GAP,
@@ -4238,8 +4175,7 @@ impl RecipeBrowserState {
 
     /// recipe browser item grid: 18px slots, deterministic swatch + initial letter.
     fn render_grid(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
+        detail_pane(lay, main);
         let visible = self.visible_items();
         let rows = ((main.h as i32 - 8) / SLOT_PITCH).max(1) as usize;
         // Reserve the scrollbar gutter up front when the grid overflows.
@@ -4254,17 +4190,15 @@ impl RecipeBrowserState {
             * cols;
 
         if visible.is_empty() {
-            lay.text_fit(
-                main.x + 6,
+            pane_hint(
+                lay,
+                main,
                 main.y + 8,
-                1,
-                palette::TEXT_DIM,
                 if self.index.items.is_empty() {
                     tr(self.lang, "No items indexed", "アイテムなし")
                 } else {
                     tr(self.lang, "No matches", "一致なし")
                 },
-                ((main.w as i32 - 12) / 8).max(1) as usize,
             );
             return;
         }
@@ -4302,23 +4236,22 @@ impl RecipeBrowserState {
 
         // Scroll buttons only when the grid overflows its page.
         if scrollable {
-            let sb_x = main.right() - 12;
-            let up = UiRect::new(sb_x, main.y + 2, 10, 12);
-            let down = UiRect::new(sb_x, main.bottom() - 14, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, RecipeWidgetId::GridScrollUp, up);
-            lay.region(hits, RecipeWidgetId::GridScrollDown, down);
+            scroll_vpair(
+                lay,
+                hits,
+                RecipeWidgetId::GridScrollUp,
+                RecipeWidgetId::GridScrollDown,
+                main.y + 2,
+                main.bottom() - 2,
+                main.right(),
+            );
         }
     }
 
     /// Recipes/uses detail list inside the Items tab.
     fn render_detail(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
+        detail_pane(lay, main);
         let Some((item, mode)) = self.detail.clone() else {
             return;
         };
@@ -4326,17 +4259,7 @@ impl RecipeBrowserState {
         let back_label = tr(lang, "< Back", "< 戻る");
         let back_w = crate::draw::text_width(back_label, 1) as i32 + 12;
         let back = UiRect::new(main.x + 4, main.y + 4, back_w as u32, 14);
-        lay.fill_rect(
-            back,
-            if self.hover == Some(RecipeWidgetId::DetailBack) {
-                palette::BUTTON_HOVER
-            } else {
-                palette::BUTTON
-            },
-        );
-        lay.border_rect(back, palette::BUTTON_BORDER);
-        lay.ctext_in(back, 1, palette::TEXT, back_label);
-        lay.region(hits, RecipeWidgetId::DetailBack, back);
+        self.tab_pill(lay, hits, back, back_label, RecipeWidgetId::DetailBack, false);
         let header = format!("{} {}", mode.label(lang), self.index.display_name(&item));
         lay.text_fit(
             back.right() + 8,
@@ -4356,133 +4279,152 @@ impl RecipeBrowserState {
         let scroll = self.detail_scroll.min(recipes.len().saturating_sub(rows.max(1)));
 
         if recipes.is_empty() {
-            lay.text_fit(
-                main.x + 6,
+            pane_hint(
+                lay,
+                main,
                 list_top + 4,
-                1,
-                palette::TEXT_DIM,
                 tr(lang, "No recipes found", "レシピが見つかりません"),
-                ((main.w as i32 - 12) / 8).max(1) as usize,
             );
         }
         for (ri, recipe) in recipes.iter().enumerate().skip(scroll).take(rows) {
             let y = list_top + (ri - scroll) as i32 * RECIPE_ROW_PITCH;
             let row = UiRect::new(main.x + 2, y, row_w, RECIPE_ROW_H as u32);
-            let sel = ri == self.recipe_selected;
-            let hovered = self.hover == Some(RecipeWidgetId::RecipeRow(ri));
-            lay.fill_rect(
-                row,
-                if sel {
-                    palette::BUTTON_HOVER
-                } else if hovered {
-                    palette::BUTTON
-                } else {
-                    palette::SLOT
-                },
-            );
-            // Transfer "+" button occupies the right column; the row hit
-            // region stops before it so regions never overlap. The
-            // button is craftability-colored like recipe browser: green = fully
-            // craftable now, amber = some inputs on hand, dim = missing.
-            let plus = UiRect::new(row.right() - 20, y + 4, 16, 16);
-            let max_craft = self.index.max_craft(recipe, &self.inventory);
-            let partial = max_craft == 0
-                && recipe.inputs.iter().any(|ing| {
-                    self.inventory
-                        .keys()
-                        .any(|k| self.index.ingredient_accepts(ing, k))
-                });
-            lay.fill_rect(
-                plus,
-                if self.hover == Some(RecipeWidgetId::TransferRecipe(ri)) {
-                    palette::ACCENT
-                } else if max_craft > 0 {
-                    UiColor::rgb(70, 150, 70)
-                } else if partial {
-                    UiColor::rgb(170, 130, 50)
-                } else {
-                    palette::BUTTON
-                },
-            );
-            lay.border_rect(plus, palette::BUTTON_BORDER);
-            lay.ctext_in(plus, 1, palette::TEXT, "+");
-            lay.region(hits, RecipeWidgetId::TransferRecipe(ri), plus);
-            // Row-select hit strip: the title band only — the diagram's
-            // `DetailSlot` regions own the body (nested regions are
-            // forbidden by the layout audit), `+` owns its column.
-            let row_hit = UiRect::new(row.x, row.y, row.w.saturating_sub(22), 13);
-            lay.region(hits, RecipeWidgetId::RecipeRow(ri), row_hit);
-
-            // Line 1: category title + dim recipe id.
-            let line1 = format!("{} · {}", recipe.category.title(lang), recipe.id);
-            lay.text_fit(
-                row.x + 5,
-                y + 3,
-                1,
-                palette::TEXT_DIM,
-                &line1,
-                ((row.w as i32 - 32) / 8).max(1) as usize,
-            );
-            // Body: per-category visual slot diagram (real item icons),
-            // then a machine-metadata line under it.
-            let area = UiRect::new(
-                row.x + 4,
-                y + 13,
-                (row.w as i32 - 34).max(0) as u32,
-                (RECIPE_ROW_H - 27).max(0) as u32,
-            );
-            self.render_recipe_diagram(lay, hits, recipe, area);
-            let mut meta: Vec<String> = Vec::new();
-            if recipe.heat != HeatRequirement::None {
-                meta.push(recipe.heat.label(lang).to_owned());
-            }
-            if let Some(rpm) = recipe.rpm_min {
-                meta.push(format!(">= {rpm} RPM"));
-            }
-            if let Some(su) = recipe.su_cost {
-                meta.push(format!("{su} SU"));
-            }
-            if recipe.loops > 1 {
-                meta.push(format!("x{} {}", recipe.loops, tr(lang, "loops", "ループ")));
-            }
-            if !recipe.sequence_steps.is_empty() {
-                meta.push(format!("{} steps", recipe.sequence_steps.len()));
-            }
-            if recipe.processing_ticks > 0 {
-                meta.push(format!("{}t", recipe.processing_ticks));
-            }
-            for f in &recipe.fluid_inputs {
-                meta.push(format!("{} mB {}", f.amount_mb, f.fluid));
-            }
-            if !meta.is_empty() {
-                lay.text_fit(
-                    row.x + 5,
-                    y + RECIPE_ROW_H - 11,
-                    1,
-                    palette::AIR,
-                    &meta.join(" · "),
-                    ((row.w as i32 - 32) / 8).max(1) as usize,
-                );
-            }
+            self.render_detail_row(lay, hits, recipe, ri, row);
         }
 
         if scrollable {
-            let sb_x = main.right() - 12;
-            let up = UiRect::new(sb_x, list_top, 10, 12);
-            let down = UiRect::new(sb_x, list_bottom - 12, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, RecipeWidgetId::DetailScrollUp, up);
-            lay.region(hits, RecipeWidgetId::DetailScrollDown, down);
+            scroll_vpair(
+                lay,
+                hits,
+                RecipeWidgetId::DetailScrollUp,
+                RecipeWidgetId::DetailScrollDown,
+                list_top,
+                list_bottom,
+                main.right(),
+            );
         }
     }
 
-    /// Per-category visual recipe diagram drawn with real item slots
-    /// (18px wells + `ItemIcon` glyphs). `area` is the row body under the
-    /// title line; every slot registers a `DetailSlot` hit region whose
-    /// index follows `inputs ++ outputs ++ chanced_outputs` order —
+    /// One recipe row in the detail list: `+` transfer button, select strip, category line,
+    /// per-category visual diagram and the machine-metadata line.
+    fn render_detail_row(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        recipe: &Recipe,
+        ri: usize,
+        row: UiRect,
+    ) {
+        let lang = self.lang;
+        let y = row.y;
+        let sel = ri == self.recipe_selected;
+        let hovered = self.hover == Some(RecipeWidgetId::RecipeRow(ri));
+        lay.fill_rect(
+            row,
+            if sel {
+                palette::BUTTON_HOVER
+            } else if hovered {
+                palette::BUTTON
+            } else {
+                palette::SLOT
+            },
+        );
+        // Transfer "+" button occupies the right column; the row hit
+        // region stops before it so regions never overlap. The
+        // button is craftability-colored like recipe browser: green = fully
+        // craftable now, amber = some inputs on hand, dim = missing.
+        let plus = UiRect::new(row.right() - 20, y + 4, 16, 16);
+        let max_craft = self.index.max_craft(recipe, &self.inventory);
+        let partial = max_craft == 0
+            && recipe.inputs.iter().any(|ing| {
+                self.inventory
+                    .keys()
+                    .any(|k| self.index.ingredient_accepts(ing, k))
+            });
+        lay.fill_rect(
+            plus,
+            if self.hover == Some(RecipeWidgetId::TransferRecipe(ri)) {
+                palette::ACCENT
+            } else if max_craft > 0 {
+                UiColor::rgb(70, 150, 70)
+            } else if partial {
+                UiColor::rgb(170, 130, 50)
+            } else {
+                palette::BUTTON
+            },
+        );
+        lay.border_rect(plus, palette::BUTTON_BORDER);
+        lay.ctext_in(plus, 1, palette::TEXT, "+");
+        lay.region(hits, RecipeWidgetId::TransferRecipe(ri), plus);
+        // Row-select hit strip: the title band only — the diagram's
+        // `DetailSlot` regions own the body (nested regions are
+        // forbidden by the layout audit), `+` owns its column.
+        let row_hit = UiRect::new(row.x, row.y, row.w.saturating_sub(22), 13);
+        lay.region(hits, RecipeWidgetId::RecipeRow(ri), row_hit);
+
+        // Line 1: category title + dim recipe id.
+        let line1 = format!("{} · {}", recipe.category.title(lang), recipe.id);
+        lay.text_fit(
+            row.x + 5,
+            y + 3,
+            1,
+            palette::TEXT_DIM,
+            &line1,
+            ((row.w as i32 - 32) / 8).max(1) as usize,
+        );
+        // Body: per-category visual slot diagram (real item icons),
+        // then a machine-metadata line under it.
+        let area = UiRect::new(
+            row.x + 4,
+            y + 13,
+            (row.w as i32 - 34).max(0) as u32,
+            (RECIPE_ROW_H - 27).max(0) as u32,
+        );
+        self.render_recipe_diagram(lay, hits, recipe, area);
+        if let Some(meta) = self.recipe_meta_line(recipe) {
+            lay.text_fit(
+                row.x + 5,
+                y + RECIPE_ROW_H - 11,
+                1,
+                palette::AIR,
+                &meta,
+                ((row.w as i32 - 32) / 8).max(1) as usize,
+            );
+        }
+    }
+
+    /// Machine/processing metadata line under a detail row's diagram: heat, RPM floor, SU cost,
+    /// loop count, sequence steps, tick cost and fluid inputs, ` · `-joined.
+    fn recipe_meta_line(&self, recipe: &Recipe) -> Option<String> {
+        let lang = self.lang;
+        let mut meta: Vec<String> = Vec::new();
+        if recipe.heat != HeatRequirement::None {
+            meta.push(recipe.heat.label(lang).to_owned());
+        }
+        if let Some(rpm) = recipe.rpm_min {
+            meta.push(format!(">= {rpm} RPM"));
+        }
+        if let Some(su) = recipe.su_cost {
+            meta.push(format!("{su} SU"));
+        }
+        if recipe.loops > 1 {
+            meta.push(format!("x{} {}", recipe.loops, tr(lang, "loops", "ループ")));
+        }
+        if !recipe.sequence_steps.is_empty() {
+            meta.push(format!("{} steps", recipe.sequence_steps.len()));
+        }
+        if recipe.processing_ticks > 0 {
+            meta.push(format!("{}t", recipe.processing_ticks));
+        }
+        for f in &recipe.fluid_inputs {
+            meta.push(format!("{} mB {}", f.amount_mb, f.fluid));
+        }
+        (!meta.is_empty()).then(|| meta.join(" · "))
+    }
+
+    /// Per-category visual recipe diagram drawn with real item slots (18px wells + `ItemIcon`
+    /// glyphs). `area` is the row body under the title line; every slot registers a `DetailSlot`
+    /// hit region whose index follows `inputs ++ outputs ++ chanced_outputs` order —
     /// [`detail_slot_item`](Self::detail_slot_item) decodes it.
     fn render_recipe_diagram(
         &self,
@@ -4566,8 +4508,52 @@ impl RecipeBrowserState {
         x + 16
     }
 
-    /// 3×3 crafting matrix (shaped rows/cols preserved via `recipe.grid`)
-    /// → arrow → output; a "Shapeless" badge marks unordered recipes.
+    /// Guaranteed outputs then chanced outputs (with `%` badges), advancing 22px per slot until
+    /// `right`. Slot ordinals start at `recipe.inputs.len()`.
+    fn diagram_output_run(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        recipe: &Recipe,
+        mut ox: i32,
+        y: i32,
+        right: i32,
+    ) {
+        let base = recipe.inputs.len();
+        for (j, out) in recipe.outputs.iter().enumerate() {
+            if ox + 18 > right {
+                break;
+            }
+            self.diagram_out(lay, hits, ox, y, &out.item, out.count, base + j);
+            ox += 22;
+        }
+        for (k, (id, count, chance)) in recipe.chanced_outputs.iter().enumerate() {
+            if ox + 18 > right {
+                break;
+            }
+            self.diagram_out(
+                lay,
+                hits,
+                ox,
+                y,
+                id,
+                *count,
+                base + recipe.outputs.len() + k,
+            );
+            lay.text_fit(
+                ox + 2,
+                y + 19,
+                1,
+                palette::WARNING,
+                &format_loot_chance_compact(*chance, self.lang),
+                4,
+            );
+            ox += 22;
+        }
+    }
+
+    /// 3×3 crafting matrix (shaped rows/cols preserved via `recipe.grid`) → arrow → output; a
+    /// "Shapeless" badge marks unordered recipes.
     fn diagram_crafting(
         &self,
         lay: &mut Lay,
@@ -4594,11 +4580,7 @@ impl RecipeBrowserState {
                 });
             match input_idx.and_then(|i| recipe.inputs.get(i).map(|ing| (i, ing))) {
                 Some((i, ing)) => self.diagram_ing(lay, hits, x, y, ing, i),
-                None => {
-                    let r = lay.rect(x, y, 18, 18);
-                    lay.fill_rect(r, UiColor::rgba(12, 12, 16, 140));
-                    lay.border_rect(r, UiColor::rgba(96, 96, 108, 120));
-                }
+                None => lay.empty_well(x, y),
             }
         }
         let mid_y = area.y + 27;
@@ -4669,42 +4651,10 @@ impl RecipeBrowserState {
             cx += 22;
         }
         let ox = self.diagram_arrow(lay, cx + 2, y + 9);
-        let mut ox = ox;
-        let base = recipe.inputs.len();
-        for (j, out) in recipe.outputs.iter().enumerate() {
-            if ox + 18 > area.right() {
-                break;
-            }
-            self.diagram_out(lay, hits, ox, y, &out.item, out.count, base + j);
-            ox += 22;
-        }
-        for (k, (id, count, chance)) in recipe.chanced_outputs.iter().enumerate() {
-            if ox + 18 > area.right() {
-                break;
-            }
-            self.diagram_out(
-                lay,
-                hits,
-                ox,
-                y,
-                id,
-                *count,
-                base + recipe.outputs.len() + k,
-            );
-            lay.text_fit(
-                ox + 2,
-                y + 19,
-                1,
-                palette::WARNING,
-                &format_loot_chance_compact(*chance, self.lang),
-                4,
-            );
-            ox += 22;
-        }
+        self.diagram_output_run(lay, hits, recipe, ox, y, area.right());
     }
 
-    /// Brewing stand: ingredient on top, three bottle wells below,
-    /// arrow → result slot.
+    /// Brewing stand: ingredient on top, three bottle wells below, arrow → result slot.
     fn diagram_brewing(
         &self,
         lay: &mut Lay,
@@ -4722,11 +4672,7 @@ impl RecipeBrowserState {
             let y = area.y + 24;
             match recipe.inputs.get(1 + b) {
                 Some(ing) => self.diagram_ing(lay, hits, x, y, ing, 1 + b),
-                None => {
-                    let r = lay.rect(x, y, 18, 18);
-                    lay.fill_rect(r, UiColor::rgba(12, 12, 16, 140));
-                    lay.border_rect(r, UiColor::rgba(96, 96, 108, 120));
-                }
+                None => lay.empty_well(x, y),
             }
         }
         let ox = self.diagram_arrow(lay, area.x + 64, area.y + 22);
@@ -4736,8 +4682,8 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Sequenced assembly: start item → per-step operation slots →
-    /// result, with the transitional item carried between steps.
+    /// Sequenced assembly: start item → per-step operation slots → result, with the transitional
+    /// item carried between steps.
     fn diagram_sequenced(
         &self,
         lay: &mut Lay,
@@ -4803,8 +4749,8 @@ impl RecipeBrowserState {
         }
     }
 
-    /// Create-family machine and custom categories: machine title chip,
-    /// heat badge, input row → arrow → outputs with `%` chance badges.
+    /// Create-family machine and custom categories: machine title chip, heat badge, input row →
+    /// arrow → outputs with `%` chance badges.
     fn diagram_machine(
         &self,
         lay: &mut Lay,
@@ -4850,62 +4796,68 @@ impl RecipeBrowserState {
             cx += 20;
         }
         let ox = self.diagram_arrow(lay, cx + 2, y + 9);
-        let mut ox = ox;
-        let base = recipe.inputs.len();
-        for (j, out) in recipe.outputs.iter().enumerate() {
-            if ox + 18 > area.right() {
-                break;
-            }
-            self.diagram_out(lay, hits, ox, y, &out.item, out.count, base + j);
-            ox += 22;
-        }
-        for (k, (id, count, chance)) in recipe.chanced_outputs.iter().enumerate() {
-            if ox + 18 > area.right() {
-                break;
-            }
-            self.diagram_out(
-                lay,
-                hits,
-                ox,
-                y,
-                id,
-                *count,
-                base + recipe.outputs.len() + k,
-            );
-            lay.text_fit(
-                ox + 2,
-                y + 19,
-                1,
-                palette::WARNING,
-                &format_loot_chance_compact(*chance, self.lang),
-                4,
-            );
-            ox += 22;
-        }
+        self.diagram_output_run(lay, hits, recipe, ox, y, area.right());
     }
 
     /// Craft-tree view: indented node list left, totals right.
     fn render_tree(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
+        detail_pane(lay, main);
         let Some(tree) = &self.tree else {
-            lay.text_fit(
-                main.x + 6,
+            pane_hint(
+                lay,
+                main,
                 main.y + 8,
-                1,
-                palette::TEXT_DIM,
                 tr(
                     lang,
                     "Select an item and press T to build a recipe tree",
                     "アイテムを選んでTでツリー表示",
                 ),
-                ((main.w as i32 - 12) / 8).max(1) as usize,
             );
             return;
         };
+        self.render_tree_header(lay, hits, main, tree);
 
-        // Header: target + count controls + pin.
+        // Split: node list | totals. The totals column yields first on
+        // narrow panes so the node list keeps a usable width.
+        let totals_w = (main.w as i32 / 3)
+            .clamp(120, 200)
+            .min((main.w as i32 - 52).max(24));
+        let list_w = (main.w as i32 - totals_w - 8).max(8);
+        let list_top = main.y + 20;
+        let list_bottom = main.bottom() - 4;
+        let rows = ((list_bottom - list_top) / TREE_ROW_PITCH).max(0) as usize;
+
+        let Some(root) = &tree.root else {
+            return;
+        };
+        let flat = root.flatten();
+        let scrollable = flat.len() > rows;
+        self.render_tree_nodes(lay, hits, main.x + 2, &flat, (list_w, list_top, rows));
+        if scrollable {
+            scroll_vpair(
+                lay,
+                hits,
+                RecipeWidgetId::TreeScrollUp,
+                RecipeWidgetId::TreeScrollDown,
+                list_top,
+                list_bottom,
+                main.x + 2 + list_w,
+            );
+        }
+        self.render_tree_totals(lay, main, list_w, list_top, tree);
+    }
+
+    /// Tree header: target line, pin toggle and ×2/÷2 count controls, all right-aligned chrome
+    /// hidden when the pane is too narrow.
+    fn render_tree_header(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        main: UiRect,
+        tree: &RecipeTree,
+    ) {
+        let lang = self.lang;
         let header = format!(
             "{}: {} x {}",
             tr(lang, "Craft", "作成"),
@@ -4965,40 +4917,30 @@ impl RecipeBrowserState {
                 let x =
                     pin.x - 8 - w - if id == RecipeWidgetId::TreeCountDown { 20 } else { 0 };
                 let rect = UiRect::new(x, main.y + 3, w as u32, 13);
-                lay.fill_rect(
-                    rect,
-                    if self.hover == Some(id) {
-                        palette::BUTTON_HOVER
-                    } else {
-                        palette::BUTTON
-                    },
-                );
-                lay.border_rect(rect, palette::BUTTON_BORDER);
-                lay.ctext_in(rect, 1, palette::TEXT, label);
-                lay.region(hits, id, rect);
+                self.tab_pill(lay, hits, rect, label, id, false);
             }
         }
+    }
 
-        // Split: node list | totals. The totals column yields first on
-        // narrow panes so the node list keeps a usable width.
-        let totals_w = (main.w as i32 / 3)
-            .clamp(120, 200)
-            .min((main.w as i32 - 52).max(24));
-        let list_w = (main.w as i32 - totals_w - 8).max(8);
-        let list_top = main.y + 20;
-        let list_bottom = main.bottom() - 4;
-        let rows = ((list_bottom - list_top) / TREE_ROW_PITCH).max(0) as usize;
-
-        let Some(root) = &tree.root else {
-            return;
-        };
-        let flat = root.flatten();
+    /// Flattened pre-order node rows, indented by depth and windowed by `tree_scroll`;
+    /// recipe-bearing rows register `TreeNodeRow` hits. `list` is `(column width, top y, visible
+    /// rows)`; `list_x` is the column's left edge.
+    fn render_tree_nodes(
+        &self,
+        lay: &mut Lay,
+        hits: &mut Vec<RecipeHitRegion>,
+        list_x: i32,
+        flat: &[(usize, &TreeNode)],
+        list: (i32, i32, usize),
+    ) {
+        let (list_w, list_top, rows) = list;
+        let lang = self.lang;
         let scrollable = flat.len() > rows;
         let row_w = list_w - if scrollable { 16 } else { 0 };
         let scroll = self.tree_scroll.min(flat.len().saturating_sub(rows.max(1)));
         for (fi, (depth, node)) in flat.iter().enumerate().skip(scroll).take(rows) {
             let y = list_top + (fi - scroll) as i32 * TREE_ROW_PITCH;
-            let rect = UiRect::new(main.x + 2, y, row_w.max(8) as u32, (TREE_ROW_PITCH - 1) as u32);
+            let rect = UiRect::new(list_x, y, row_w.max(8) as u32, (TREE_ROW_PITCH - 1) as u32);
             if node.recipe_id.is_some() {
                 lay.region(hits, RecipeWidgetId::TreeNodeRow(fi), rect);
             }
@@ -5012,22 +4954,18 @@ impl RecipeBrowserState {
             } else {
                 ""
             };
-            let line = if node.recipe_id.is_some() {
-                format!(
-                    "{}x {} ({}){}",
-                    node.needed,
-                    self.index.display_name(&node.item),
-                    node.recipe_id.as_deref().unwrap_or(""),
-                    marker
-                )
-            } else {
-                format!(
-                    "{}x {}{}",
-                    node.needed,
-                    self.index.display_name(&node.item),
-                    marker
-                )
-            };
+            let recipe = node
+                .recipe_id
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            let line = format!(
+                "{}x {}{}{}",
+                node.needed,
+                self.index.display_name(&node.item),
+                recipe,
+                marker
+            );
             lay.text_fit(
                 rect.x + 4 + indent,
                 rect.y + 2,
@@ -5041,19 +4979,18 @@ impl RecipeBrowserState {
                 ((list_w - indent - 8) / 8).max(1) as usize,
             );
         }
-        if scrollable {
-            let sb_x = main.x + 2 + list_w - 12;
-            let up = UiRect::new(sb_x, list_top, 10, 12);
-            let down = UiRect::new(sb_x, list_bottom - 12, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, RecipeWidgetId::TreeScrollUp, up);
-            lay.region(hits, RecipeWidgetId::TreeScrollDown, down);
-        }
+    }
 
-        // Totals column.
+    /// Totals column: raw materials, fluids, byproducts and the amounts the inventory still lacks.
+    fn render_tree_totals(
+        &self,
+        lay: &mut Lay,
+        main: UiRect,
+        list_w: i32,
+        list_top: i32,
+        tree: &RecipeTree,
+    ) {
+        let lang = self.lang;
         let tx = main.x + 4 + list_w + 4;
         let tw = (main.right() - tx - 4).max(8);
         let cells = ((tw - 8) / 8).max(1) as usize;
@@ -5092,7 +5029,8 @@ impl RecipeBrowserState {
         if !self.inventory.is_empty() {
             lay.text_fit(tx, ty, 1, palette::WARNING, tr(lang, "Still needed", "不足分"), cells);
             ty += 10;
-            for (id, n) in tree.remaining_needed(&self.inventory).iter().take(6) {
+            let remaining = tree.remaining_needed(&self.inventory);
+            for (id, n) in remaining.iter().take(6) {
                 let line = format!("{}x {}", n, self.index.display_name(id));
                 lay.text_fit(tx + 4, ty, 1, palette::DANGER, &line, cells - 1);
                 ty += 10;
@@ -5102,10 +5040,109 @@ impl RecipeBrowserState {
 
     /// World resource tabs: mob drops, ore histograms, trades, loot, enchants.
     fn render_world_drops_info(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
+        detail_pane(lay, main);
+        self.render_world_subtabs(lay, hits, main);
+
+        let list_top = main.y + 22;
+        let list_bottom = main.bottom() - 4;
+        let cells = ((main.w as i32 - 30) / 8).max(1) as usize;
+        match self.world_drops_tab {
+            WorldDropsTab::MobDrops => self.world_info_rows(lay, main, (list_top, list_bottom), cells, &self.index.mob_drops, |s, e| {
+                let cond = if e.condition.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", e.condition)
+                };
+                let line = format!(
+                    "{} -> {} x{}-{} ({}){}{}",
+                    e.mob_id,
+                    s.index.display_name(&e.item_id),
+                    e.min_count,
+                    e.max_count,
+                    format_loot_chance(e.chance, s.lang),
+                    if e.looting_bonus > 0 {
+                        format!(" +{}/L", e.looting_bonus)
+                    } else {
+                        String::new()
+                    },
+                    cond
+                );
+                (line, e.item_id.clone())
+                }),
+            WorldDropsTab::OreGen => self.world_ore_gen(lay, main, list_top, list_bottom, cells),
+            WorldDropsTab::Trades => self.world_info_rows(lay, main, (list_top, list_bottom), cells, &self.index.villager_trades, |s, e| {
+                let buy_b = e
+                    .buy_b
+                    .as_ref()
+                    .map(|(i, c)| format!(" + {}x {}", c, s.index.display_name(i)))
+                    .unwrap_or_default();
+                let line = format!(
+                    "{} L{}: {}x {}{} -> {}x {} ({} uses)",
+                    e.profession,
+                    e.level,
+                    e.buy_a.1,
+                    s.index.display_name(&e.buy_a.0),
+                    buy_b,
+                    e.sell.1,
+                    s.index.display_name(&e.sell.0),
+                    e.max_uses
+                );
+                (line, e.sell.0.clone())
+                }),
+            WorldDropsTab::Loot => self.world_info_rows(lay, main, (list_top, list_bottom), cells, &self.index.dungeon_loot, |s, e| {
+                let line = format!(
+                    "{}: {} x{}-{} w{} ({})",
+                    e.chest,
+                    s.index.display_name(&e.item_id),
+                    e.min_count,
+                    e.max_count,
+                    e.weight,
+                    format_loot_chance(e.chance, s.lang)
+                );
+                (line, e.item_id.clone())
+                }),
+            WorldDropsTab::Enchants => self.world_info_rows(lay, main, (list_top, list_bottom), cells, &self.index.enchant_compat, |s, e| {
+                let enchs = e
+                    .enchantments
+                    .iter()
+                    .map(|(id, lvl)| {
+                        format!("{} {}", id.split(':').nth(1).unwrap_or(id), roman(*lvl))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (format!("{}: {}", s.index.display_name(&e.item_id), enchs), e.item_id.clone())
+                }),
+            WorldDropsTab::Fuels => self.world_fuels(lay, main, list_top, list_bottom, cells),
+        }
+        // Shared scroll buttons.
+        if self.world_drops_len() > 0 {
+            scroll_vpair(
+                lay,
+                hits,
+                RecipeWidgetId::WorldDropsScrollUp,
+                RecipeWidgetId::WorldDropsScrollDown,
+                list_top,
+                list_bottom,
+                main.right(),
+            );
+        }
+    }
+
+    /// Row count of the active world-info sub-tab (drives scroll buttons).
+    fn world_drops_len(&self) -> usize {
+        match self.world_drops_tab {
+            WorldDropsTab::MobDrops => self.index.mob_drops.len(),
+            WorldDropsTab::OreGen => self.index.ore_distributions.len(),
+            WorldDropsTab::Trades => self.index.villager_trades.len(),
+            WorldDropsTab::Loot => self.index.dungeon_loot.len(),
+            WorldDropsTab::Enchants => self.index.enchant_compat.len(),
+            WorldDropsTab::Fuels => self.index.fuels.len(),
+        }
+    }
+
+    /// Sub-tab pill strip across the top of the world-info pane.
+    fn render_world_subtabs(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
-        // Sub-tab pills.
         let subs = [
             (WorldDropsTab::MobDrops, RecipeWidgetId::WorldDropsTabMobs),
             (WorldDropsTab::OreGen, RecipeWidgetId::WorldDropsTabOres),
@@ -5121,295 +5158,193 @@ impl RecipeBrowserState {
             if x + w > main.right() - 4 {
                 break;
             }
-            let rect = UiRect::new(x, main.y + 4, w as u32, 13);
-            let active = self.world_drops_tab == tab;
-            lay.fill_rect(
-                rect,
-                if active {
-                    palette::ACCENT
-                } else if self.hover == Some(id) {
-                    palette::BUTTON_HOVER
-                } else {
-                    palette::BUTTON
-                },
-            );
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(
-                rect,
-                1,
-                if active { palette::TEXT_DARK } else { palette::TEXT },
+            self.tab_pill(
+                lay,
+                hits,
+                UiRect::new(x, main.y + 4, w as u32, 13),
                 label,
+                id,
+                self.world_drops_tab == tab,
             );
-            lay.region(hits, id, rect);
             x += w + 3;
         }
+    }
 
-        let list_top = main.y + 22;
-        let list_bottom = main.bottom() - 4;
-        let cells = ((main.w as i32 - 30) / 8).max(1) as usize;
-        match self.world_drops_tab {
-            WorldDropsTab::MobDrops => {
-                let rows = ((list_bottom - list_top) / 12).max(0) as usize;
-                let scroll = self.world_drops_scroll.min(self.index.mob_drops.len().saturating_sub(rows));
-                for (ri, e) in self.index.mob_drops.iter().enumerate().skip(scroll).take(rows) {
-                    let y = list_top + (ri - scroll) as i32 * 12;
-                    let cond = if e.condition.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", e.condition)
-                    };
-                    let line = format!(
-                        "{} -> {} x{}-{} ({}){}{}",
-                        e.mob_id,
-                        self.index.display_name(&e.item_id),
-                        e.min_count,
-                        e.max_count,
-                        format_loot_chance(e.chance, lang),
-                        if e.looting_bonus > 0 {
-                            format!(" +{}/L", e.looting_bonus)
-                        } else {
-                            String::new()
-                        },
-                        cond
-                    );
-                    lay.fill(main.x + 4, y + 1, 10, 10, item_color(&e.item_id));
-                    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
+    /// `(visible rows, scroll offset)` window for a world-info sub-tab list of `pitch`-high rows
+    /// driven by `world_drops_scroll`.
+    fn world_window(&self, len: usize, top: i32, bottom: i32, pitch: i32) -> (usize, usize) {
+        let rows = ((bottom - top) / pitch).max(0) as usize;
+        let scroll = self.world_drops_scroll.min(len.saturating_sub(rows));
+        (rows, scroll)
+    }
+
+    /// Shared 12px-row window for the world-info sub-tabs: scroll-windowed iteration where `row`
+    /// formats each entry into `(line, swatch id)`.
+    fn world_info_rows<T>(
+        &self,
+        lay: &mut Lay,
+        main: UiRect,
+        span: (i32, i32),
+        cells: usize,
+        items: &[T],
+        row: impl Fn(&Self, &T) -> (String, String),
+    ) {
+        let (top, bottom) = span;
+        let (rows, scroll) = self.world_window(items.len(), top, bottom, 12);
+        for (ri, e) in items.iter().enumerate().skip(scroll).take(rows) {
+            let y = top + (ri - scroll) as i32 * 12;
+            let (line, item) = row(self, e);
+            world_info_row(lay, main, y, &item, &line, cells);
+        }
+    }
+
+    /// Ore distribution rows: block header + per-Y weight histogram.
+    fn world_ore_gen(
+        &self,
+        lay: &mut Lay,
+        main: UiRect,
+        list_top: i32,
+        list_bottom: i32,
+        cells: usize,
+    ) {
+        let row_h = 44;
+        let (rows, scroll) =
+            self.world_window(self.index.ore_distributions.len(), list_top, list_bottom, row_h);
+        for (ri, e) in self
+            .index
+            .ore_distributions
+            .iter()
+            .enumerate()
+            .skip(scroll)
+            .take(rows)
+        {
+            let y = list_top + (ri - scroll) as i32 * row_h;
+            let head = format!(
+                "{} · {} · Y {}..{} peak {}",
+                self.index.display_name(&e.block_id),
+                e.dimension,
+                e.min_y,
+                e.max_y,
+                e.peak_y
+            );
+            lay.fill(main.x + 4, y, 10, 10, item_color(&e.block_id));
+            lay.text_fit(main.x + 18, y + 1, 1, palette::TEXT, &head, cells);
+            // Per-Y histogram bar chart.
+            let hist = e.histogram();
+            let chart = UiRect::new(
+                main.x + 18,
+                y + 14,
+                (main.w as i32 - 30).max(16) as u32,
+                26,
+            );
+            lay.fill_rect(chart, palette::SLOT);
+            lay.border_rect(chart, palette::BUTTON_BORDER);
+            let max_w = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
+            let n = hist.len().max(1) as i32;
+            let inner_w = chart.w as i32 - 4;
+            for (i, w) in hist.iter().enumerate() {
+                let bx0 = chart.x + 2 + (i as i32 * inner_w) / n;
+                let bx1 = chart.x + 2 + ((i as i32 + 1) * inner_w) / n;
+                let bh = ((*w as f32 / max_w) * 22.0) as i32;
+                if bh <= 0 {
+                    continue;
                 }
-            }
-            WorldDropsTab::OreGen => {
-                let row_h = 44;
-                let rows = ((list_bottom - list_top) / row_h).max(0) as usize;
-                let scroll = self
-                    .world_drops_scroll
-                    .min(self.index.ore_distributions.len().saturating_sub(rows));
-                for (ri, e) in self
-                    .index
-                    .ore_distributions
-                    .iter()
-                    .enumerate()
-                    .skip(scroll)
-                    .take(rows)
-                {
-                    let y = list_top + (ri - scroll) as i32 * row_h;
-                    let head = format!(
-                        "{} · {} · Y {}..{} peak {}",
-                        self.index.display_name(&e.block_id),
-                        e.dimension,
-                        e.min_y,
-                        e.max_y,
-                        e.peak_y
-                    );
-                    lay.fill(main.x + 4, y, 10, 10, item_color(&e.block_id));
-                    lay.text_fit(main.x + 18, y + 1, 1, palette::TEXT, &head, cells);
-                    // Per-Y histogram bar chart.
-                    let hist = e.histogram();
-                    let chart = UiRect::new(
-                        main.x + 18,
-                        y + 14,
-                        (main.w as i32 - 30).max(16) as u32,
-                        26,
-                    );
-                    lay.fill_rect(chart, palette::SLOT);
-                    lay.border_rect(chart, palette::BUTTON_BORDER);
-                    let max_w = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
-                    let n = hist.len().max(1) as i32;
-                    let inner_w = chart.w as i32 - 4;
-                    for (i, w) in hist.iter().enumerate() {
-                        let bx0 = chart.x + 2 + (i as i32 * inner_w) / n;
-                        let bx1 = chart.x + 2 + ((i as i32 + 1) * inner_w) / n;
-                        let bh = ((*w as f32 / max_w) * 22.0) as i32;
-                        if bh <= 0 {
-                            continue;
-                        }
-                        let color = if e.min_y + i as i32 == e.peak_y {
-                            palette::ACCENT
-                        } else {
-                            palette::AIR
-                        };
-                        lay.fill(
-                            bx0,
-                            chart.bottom() - 2 - bh,
-                            (bx1 - bx0 - 1).max(1),
-                            bh,
-                            color,
-                        );
-                    }
-                }
-            }
-            WorldDropsTab::Trades => {
-                let rows = ((list_bottom - list_top) / 12).max(0) as usize;
-                let scroll = self
-                    .world_drops_scroll
-                    .min(self.index.villager_trades.len().saturating_sub(rows));
-                for (ri, e) in self
-                    .index
-                    .villager_trades
-                    .iter()
-                    .enumerate()
-                    .skip(scroll)
-                    .take(rows)
-                {
-                    let y = list_top + (ri - scroll) as i32 * 12;
-                    let buy_b = e
-                        .buy_b
-                        .as_ref()
-                        .map(|(i, c)| format!(" + {}x {}", c, self.index.display_name(i)))
-                        .unwrap_or_default();
-                    let line = format!(
-                        "{} L{}: {}x {}{} -> {}x {} ({} uses)",
-                        e.profession,
-                        e.level,
-                        e.buy_a.1,
-                        self.index.display_name(&e.buy_a.0),
-                        buy_b,
-                        e.sell.1,
-                        self.index.display_name(&e.sell.0),
-                        e.max_uses
-                    );
-                    lay.fill(main.x + 4, y + 1, 10, 10, item_color(&e.sell.0));
-                    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
-                }
-            }
-            WorldDropsTab::Loot => {
-                let rows = ((list_bottom - list_top) / 12).max(0) as usize;
-                let scroll = self
-                    .world_drops_scroll
-                    .min(self.index.dungeon_loot.len().saturating_sub(rows));
-                for (ri, e) in self.index.dungeon_loot.iter().enumerate().skip(scroll).take(rows) {
-                    let y = list_top + (ri - scroll) as i32 * 12;
-                    let line = format!(
-                        "{}: {} x{}-{} w{} ({})",
-                        e.chest,
-                        self.index.display_name(&e.item_id),
-                        e.min_count,
-                        e.max_count,
-                        e.weight,
-                        format_loot_chance(e.chance, lang)
-                    );
-                    lay.fill(main.x + 4, y + 1, 10, 10, item_color(&e.item_id));
-                    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
-                }
-            }
-            WorldDropsTab::Enchants => {
-                let rows = ((list_bottom - list_top) / 12).max(0) as usize;
-                let scroll = self
-                    .world_drops_scroll
-                    .min(self.index.enchant_compat.len().saturating_sub(rows));
-                for (ri, e) in self.index.enchant_compat.iter().enumerate().skip(scroll).take(rows) {
-                    let y = list_top + (ri - scroll) as i32 * 12;
-                    let enchs = e
-                        .enchantments
-                        .iter()
-                        .map(|(id, lvl)| {
-                            format!("{} {}", id.split(':').nth(1).unwrap_or(id), roman(*lvl))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let line = format!("{}: {}", self.index.display_name(&e.item_id), enchs);
-                    lay.fill(main.x + 4, y + 1, 10, 10, item_color(&e.item_id));
-                    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
-                }
-            }
-            WorldDropsTab::Fuels => {
-                // Furnace fuels: icon + name + burn ticks + a live
-                // burn bar proportional to the hottest fuel in the list.
-                let rows = ((list_bottom - list_top) / 14).max(0) as usize;
-                let scroll = self
-                    .world_drops_scroll
-                    .min(self.index.fuels.len().saturating_sub(rows));
-                let max_burn = self
-                    .index
-                    .fuels
-                    .iter()
-                    .map(|f| f.burn_ticks)
-                    .max()
-                    .unwrap_or(1)
-                    .max(1) as f32;
-                if self.index.fuels.is_empty() {
-                    lay.text_fit(
-                        main.x + 6,
-                        list_top + 4,
-                        1,
-                        palette::TEXT_DIM,
-                        tr(lang, "No fuels registered", "燃料データなし"),
-                        cells,
-                    );
-                }
-                for (ri, f) in self.index.fuels.iter().enumerate().skip(scroll).take(rows) {
-                    let y = list_top + (ri - scroll) as i32 * 14;
-                    let shown = if let Some(tag) = f.item.strip_prefix('#') {
-                        format!("#{tag}")
-                    } else {
-                        self.index.resolve_ingredient_cycled(
-                            &RecipeIngredient::item(&f.item, 1),
-                            self.clock_ticks,
-                        )
-                    };
-                    let name = self
-                        .index
-                        .display_name_for_locale(&shown, &self.active_locale);
-                    let smelted = f.items_smelted();
-                    let smelted_str = if (smelted.fract()).abs() < f32::EPSILON {
-                        format!("{smelted:.0}")
-                    } else {
-                        format!("{smelted:.1}")
-                    };
-                    lay.fill(main.x + 4, y + 1, 10, 10, item_color(&shown));
-                    let line = format!(
-                        "{name} · {}t · {} {}",
-                        f.burn_ticks,
-                        smelted_str,
-                        tr(lang, "items", "個分")
-                    );
-                    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, &line, cells);
-                    // Burn bar under the row, proportional to max burn.
-                    let bar_w = main.w.saturating_sub(26);
-                    let bw = ((f.burn_ticks as f32 / max_burn) * bar_w as f32) as i32;
-                    lay.fill(
-                        main.x + 18,
-                        y + 12,
-                        bw.max(1),
-                        1,
-                        UiColor::rgb(230, 150, 40),
-                    );
-                }
+                let color = if e.min_y + i as i32 == e.peak_y {
+                    palette::ACCENT
+                } else {
+                    palette::AIR
+                };
+                lay.fill(
+                    bx0,
+                    chart.bottom() - 2 - bh,
+                    (bx1 - bx0 - 1).max(1),
+                    bh,
+                    color,
+                );
             }
         }
-        // Shared scroll buttons.
-        let count = match self.world_drops_tab {
-            WorldDropsTab::MobDrops => self.index.mob_drops.len(),
-            WorldDropsTab::OreGen => self.index.ore_distributions.len(),
-            WorldDropsTab::Trades => self.index.villager_trades.len(),
-            WorldDropsTab::Loot => self.index.dungeon_loot.len(),
-            WorldDropsTab::Enchants => self.index.enchant_compat.len(),
-            WorldDropsTab::Fuels => self.index.fuels.len(),
-        };
-        if count > 0 {
-            let sb_x = main.right() - 12;
-            let up = UiRect::new(sb_x, list_top, 10, 12);
-            let down = UiRect::new(sb_x, list_bottom - 12, 10, 12);
-            lay.fill_rect(up, palette::BUTTON);
-            lay.fill_rect(down, palette::BUTTON);
-            lay.ctext_in(up, 1, palette::TEXT, "^");
-            lay.ctext_in(down, 1, palette::TEXT, "v");
-            lay.region(hits, RecipeWidgetId::WorldDropsScrollUp, up);
-            lay.region(hits, RecipeWidgetId::WorldDropsScrollDown, down);
+    }
+
+    /// Furnace fuel rows: name + burn ticks + items smelted + burn bar.
+    fn world_fuels(
+        &self,
+        lay: &mut Lay,
+        main: UiRect,
+        list_top: i32,
+        list_bottom: i32,
+        cells: usize,
+    ) {
+        let lang = self.lang;
+        // Furnace fuels: icon + name + burn ticks + a live
+        // burn bar proportional to the hottest fuel in the list.
+        let (rows, scroll) = self.world_window(self.index.fuels.len(), list_top, list_bottom, 14);
+        let max_burn = self
+            .index
+            .fuels
+            .iter()
+            .map(|f| f.burn_ticks)
+            .max()
+            .unwrap_or(1)
+            .max(1) as f32;
+        if self.index.fuels.is_empty() {
+            lay.text_fit(
+                main.x + 6,
+                list_top + 4,
+                1,
+                palette::TEXT_DIM,
+                tr(lang, "No fuels registered", "燃料データなし"),
+                cells,
+            );
+        }
+        for (ri, f) in self.index.fuels.iter().enumerate().skip(scroll).take(rows) {
+            let y = list_top + (ri - scroll) as i32 * 14;
+            let shown = if let Some(tag) = f.item.strip_prefix('#') {
+                format!("#{tag}")
+            } else {
+                self.index.resolve_ingredient_cycled(
+                    &RecipeIngredient::item(&f.item, 1),
+                    self.clock_ticks,
+                )
+            };
+            let name = self
+                .index
+                .display_name_for_locale(&shown, &self.active_locale);
+            let smelted = f.items_smelted();
+            let smelted_str = if (smelted.fract()).abs() < f32::EPSILON {
+                format!("{smelted:.0}")
+            } else {
+                format!("{smelted:.1}")
+            };
+            let line = format!(
+                "{name} · {}t · {} {}",
+                f.burn_ticks,
+                smelted_str,
+                tr(lang, "items", "個分")
+            );
+            world_info_row(lay, main, y, &shown, &line, cells);
+            // Burn bar under the row, proportional to max burn.
+            let bar_w = main.w.saturating_sub(26);
+            let bw = ((f.burn_ticks as f32 / max_burn) * bar_w as f32) as i32;
+            lay.fill(
+                main.x + 18,
+                y + 12,
+                bw.max(1),
+                1,
+                UiColor::rgb(230, 150, 40),
+            );
         }
     }
 
     /// Machine Tutorials tab: 3D viewport + transport controls + caption.
     fn render_machine_tutorial(&self, lay: &mut Lay, hits: &mut Vec<RecipeHitRegion>, main: UiRect) {
         let lang = self.lang;
-        lay.fill_rect(main, DETAIL_BG);
-        lay.border_rect(main, palette::PANEL_BORDER);
+        detail_pane(lay, main);
         let Some(scene) = &self.machine_tutorial else {
-            lay.text_fit(
-                main.x + 6,
+            pane_hint(
+                lay,
+                main,
                 main.y + 8,
-                1,
-                palette::TEXT_DIM,
                 tr(lang, "No machine tutorial loaded", "機械チュートリアルなし"),
-                ((main.w as i32 - 12) / 8).max(1) as usize,
             );
             return;
         };
@@ -5427,20 +5362,9 @@ impl RecipeBrowserState {
         ];
         let mut x = main.x + 4;
         for (id, label) in controls {
-            let w = 22;
-            let rect = UiRect::new(x, main.y + 4, w as u32, 14);
-            lay.fill_rect(
-                rect,
-                if self.hover == Some(id) {
-                    palette::BUTTON_HOVER
-                } else {
-                    palette::BUTTON
-                },
-            );
-            lay.border_rect(rect, palette::BUTTON_BORDER);
-            lay.ctext_in(rect, 1, palette::TEXT, label);
-            lay.region(hits, id, rect);
-            x += w + 4;
+            let rect = UiRect::new(x, main.y + 4, 22, 14);
+            self.tab_pill(lay, hits, rect, label, id, false);
+            x += 26;
         }
         let step_text = format!(
             "{} {}/{} · {}",
@@ -5549,8 +5473,8 @@ const TREE_ROW_PITCH: i32 = 12;
 /// Right/detail pane fill: a hair lighter than the main panel.
 const DETAIL_BG: UiColor = UiColor::rgba(26, 29, 38, 235);
 
-/// Scales logical-pixel geometry to physical pixels on emit so visuals
-/// and hit regions never diverge.
+/// Scales logical-pixel geometry to physical pixels on emit so visuals and hit regions never
+/// diverge.
 struct Lay {
     list: UiDrawList,
     w: i32,
@@ -5617,9 +5541,8 @@ impl Lay {
         );
     }
 
-    /// Horizontally centered text inside `r` (8px glyph cell, `mult`×).
-    /// Labels are elided to the rect first so they never spill past the
-    /// widget's edges.
+    /// Horizontally centered text inside `r` (8px glyph cell, `mult`×). Labels are elided to the
+    /// rect first so they never spill past the widget's edges.
     fn ctext_in(&mut self, r: UiRect, mult: u32, color: UiColor, text: &str) {
         let text = fit_text(text, ((r.w as i32 - 4) / (8 * mult as i32)).max(0) as usize);
         let scale = (mult as i32 * self.s).max(1) as u32;
@@ -5630,14 +5553,21 @@ impl Lay {
             .text_str(cx * self.s - w / 2, ty * self.s, scale, color, &text);
     }
 
+    /// Empty 18×18 recipe-diagram well (crafting-matrix hole, brewing bottle).
+    fn empty_well(&mut self, x: i32, y: i32) {
+        let r = self.rect(x, y, 18, 18);
+        self.fill_rect(r, UiColor::rgba(12, 12, 16, 140));
+        self.border_rect(r, UiColor::rgba(96, 96, 108, 120));
+    }
+
     /// MachineTutorial scene rasterized directly in physical pixels inside `r`.
     fn machine_tutorial(&mut self, r: UiRect, scene: &MachineTutorialScene) {
         let vp = self.phys(r);
         draw_machine_tutorial_scene(&mut self.list, vp, scene);
     }
 
-    /// Emit an `ItemIcon` inside logical rect `r` — the GPU paints the
-    /// atlas sprite; the software rasterizer falls back to the swatch.
+    /// Emit an `ItemIcon` inside logical rect `r` — the GPU paints the atlas sprite; the software
+    /// rasterizer falls back to the swatch.
     fn icon(&mut self, r: UiRect, item_id: &str) {
         self.list.item_icon_str(self.phys(r), item_id);
     }
@@ -5690,9 +5620,60 @@ impl Lay {
     }
 }
 
-/// Elide a label to `cells` glyph cells so text never overflows.
-/// Control characters are flattened first — a hostile name must not
-/// wrap its widget into a second line.
+/// Vertical `^`/`v` scroll-button pair (10×12) anchored to a list column's right edge.
+/// `top`/`bottom` bound the scrollable strip; `right` is the column's right edge.
+fn scroll_vpair(
+    lay: &mut Lay,
+    hits: &mut Vec<RecipeHitRegion>,
+    up: RecipeWidgetId,
+    down: RecipeWidgetId,
+    top: i32,
+    bottom: i32,
+    right: i32,
+) {
+    let up_r = UiRect::new(right - 12, top, 10, 12);
+    let down_r = UiRect::new(right - 12, bottom - 12, 10, 12);
+    lay.fill_rect(up_r, palette::BUTTON);
+    lay.fill_rect(down_r, palette::BUTTON);
+    lay.ctext_in(up_r, 1, palette::TEXT, "^");
+    lay.ctext_in(down_r, 1, palette::TEXT, "v");
+    lay.region(hits, up, up_r);
+    lay.region(hits, down, down_r);
+}
+
+/// Clamp a scroll offset by `delta`, never below zero.
+fn nudge_scroll(scroll: &mut usize, delta: i64) {
+    *scroll = (*scroll as i64 + delta).max(0) as usize;
+}
+
+/// DETAIL_BG fill + PANEL_BORDER frame shared by every sub-pane.
+fn detail_pane(lay: &mut Lay, r: UiRect) {
+    lay.fill_rect(r, DETAIL_BG);
+    lay.border_rect(r, palette::PANEL_BORDER);
+}
+
+/// Dim empty-state hint line inset 6px inside `main`, sized to the standard `(w - 12) / 8` cell
+/// budget.
+fn pane_hint(lay: &mut Lay, main: UiRect, y: i32, text: &str) {
+    lay.text_fit(
+        main.x + 6,
+        y,
+        1,
+        palette::TEXT_DIM,
+        text,
+        ((main.w as i32 - 12) / 8).max(1) as usize,
+    );
+}
+
+/// 10px item swatch + one fitted text line — the shared row shape for the mob/trade/loot/enchant
+/// world-info sub-tabs.
+fn world_info_row(lay: &mut Lay, main: UiRect, y: i32, item_id: &str, line: &str, cells: usize) {
+    lay.fill(main.x + 4, y + 1, 10, 10, item_color(item_id));
+    lay.text_fit(main.x + 18, y + 2, 1, palette::TEXT, line, cells);
+}
+
+/// Elide a label to `cells` glyph cells so text never overflows. Control characters are flattened
+/// first — a hostile name must not wrap its widget into a second line.
 fn fit_text(label: &str, cells: usize) -> String {
     let label = if label.chars().any(|c| c.is_control()) {
         label
