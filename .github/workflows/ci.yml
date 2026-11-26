@@ -27,6 +27,9 @@ jobs:
     timeout-minutes: 45
     env:
       CARGO_BUILD_JOBS: 2
+      # Standalone manifests resolve separately; share compatible build outputs
+      # across them while preserving every per-manifest lint/test invocation.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -49,6 +52,16 @@ jobs:
         with:
           toolchain: 1.98.0
           components: clippy
+      # Cache only Cargo's downloaded sources, not executable build products.
+      # --locked still verifies the inputs against the checked-in lockfiles.
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-sources-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: cargo-sources-${{ runner.os }}-
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
         with:
           distribution: temurin
@@ -179,25 +192,28 @@ jobs:
           fi
       - name: Check Java & mod-suite feature compilation
         run: |
+          # mod-suite enables neither Java feature nor the create-offload cfg.
+          # Keep isolation checks: combined features could hide a missing edge.
           cargo check --locked --features fabric-probe
           cargo check --locked --features neoforge-events
           cargo check --locked --features create-offload
           cargo check --locked --features mod-suite
           cargo test --locked --features mod-suite,create-offload --bin megu -- --test-threads=1
+          # Cargo's test harness is not the server executable used by the live gate.
           cargo build --locked --features mod-suite,create-offload --bin megu
           cargo build --locked --manifest-path mod-adapter-core/Cargo.toml --bin megu-mod-check
           cargo build --locked --manifest-path client-app/Cargo.toml --bin megu-client
           python3 tools/ci_playability_gate.py \
-            --mod-check-bin mod-adapter-core/target/debug/megu-mod-check \
-            --client-bin client-app/target/debug/megu-client \
-            --server-bin target/debug/megu
+            --mod-check-bin "$CARGO_TARGET_DIR/debug/megu-mod-check" \
+            --client-bin "$CARGO_TARGET_DIR/debug/megu-client" \
+            --server-bin "$CARGO_TARGET_DIR/debug/megu"
           # Real-client multiplayer soak: four megu-client bots decode chunks and
           # move concurrently; fail-closed on any client crash/decode error.
           if [ ! -f assets/block_states_1211.json ] || [ ! -d datapacks/vanilla ]; then
             echo "::notice::Skipping Mojang-fixture multiplayer_stress_wire.py on the public clean-room checkout (assets/*_1211* and datapacks/vanilla are generated from the pinned jar and excluded from public git)."
           else
-            timeout 300 python3 tests/multiplayer_stress_wire.py target/debug/megu \
-              --clients 4 --client-bin client-app/target/debug/megu-client
+            timeout 300 python3 tests/multiplayer_stress_wire.py "$CARGO_TARGET_DIR/debug/megu" \
+              --clients 4 --client-bin "$CARGO_TARGET_DIR/debug/megu-client"
           fi
 
   # Separate from the suite on purpose: a green suite is not evidence that a gate works. This job
