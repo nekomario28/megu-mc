@@ -548,6 +548,26 @@ impl Ctx<'_> {
         }
     }
 
+    /// Textured progress bar: background sprite plus its fill cropped in
+    /// source pixels to `frac`. Returns `false` when either sprite is
+    /// missing from the host atlas so the caller emits its procedural
+    /// fallback instead of an invisible bar.
+    fn sprite_bar(&mut self, bg_key: &str, fill_key: &str, r: UiRect, frac: f32) -> bool {
+        let Some((bg, fill)) = self.gui_atlas.and_then(|atlas| {
+            Some((atlas.named_sprite(bg_key)?, atlas.named_sprite(fill_key)?))
+        }) else {
+            return false;
+        };
+        let (x, y, w, h) = (r.x, r.y, r.w as i32, r.h as i32);
+        self.hud_sprite_entry(bg, x, y, w, h);
+        let src_w = (fill.width as f32 * frac).round() as u32;
+        let dst_w = ((w as f32) * frac).round() as i32;
+        if src_w > 0 && dst_w > 0 {
+            self.hud_sprite_entry(fill.subrect(0, 0, src_w, fill.height), x, y, dst_w, h);
+        }
+        true
+    }
+
     fn text(&mut self, x: i32, y: i32, mult: u32, color: UiColor, s: &str) {
         if x < 0 || x >= self.w || y < self.clip_top || y + 8 * mult as i32 > self.h {
             return;
@@ -928,7 +948,94 @@ fn onoff(v: bool) -> &'static str {
     if v { "ON" } else { "OFF" }
 }
 
+/// `"Label: value"` caption shared by every cycled or numeric setting row.
+fn value_label(lang: UiLang, en: &str, ja: &str, value: impl std::fmt::Display) -> String {
+    format!("{}: {value}", tr(lang, en, ja))
+}
+
+/// `"Label: ON"` / `"Label: OFF"` caption shared by every toggle row.
+fn toggle_label(lang: UiLang, en: &str, ja: &str, on: bool) -> String {
+    value_label(lang, en, ja, onoff(on))
+}
+
+/// Visible row window of a fixed-height scrolling list panel:
+/// `(visible rows, clamped first index)`. The pager chrome reserves one
+/// extra row once the list overflows.
+fn list_window(body_h: i32, row_h: i32, len: usize, scroll: usize) -> (usize, usize) {
+    let mut visible = (body_h / row_h) as usize;
+    if len > visible {
+        visible = ((body_h - 18) / row_h).max(0) as usize;
+    }
+    (visible, scroll.min(len.saturating_sub(visible)))
+}
+
 impl Ctx<'_> {
+    /// Accent-colored section header above a group of rows.
+    fn section(&mut self, x: i32, y: i32, label: &str) {
+        self.text(x, y, 1, pal::ACCENT, label);
+    }
+
+    /// One settings row of width `w`: a button plus its dirty marker.
+    fn setting_row_w(&mut self, id: WidgetId, key: SettingKey, x: i32, y: i32, w: i32, label: &str) {
+        self.btn(id, lr(x, y, w, 20), label);
+        self.dirty_dot(key, x + w + 6, y + 6);
+    }
+
+    /// Standard 320px settings button row with its dirty marker.
+    fn setting_row(&mut self, id: WidgetId, key: SettingKey, x: i32, y: i32, label: &str) {
+        self.setting_row_w(id, key, x, y, 320, label);
+    }
+
+    /// Settings slider row occupying `r` (logical px) with its dirty
+    /// marker just right of the track.
+    fn slider_row_r(&mut self, id: WidgetId, key: SettingKey, r: UiRect, frac: f32, label: &str) {
+        self.slider(id, r, frac, label);
+        self.dirty_dot(key, r.x + r.w as i32 + 6, r.y + 6);
+    }
+
+    /// Standard 320px settings slider row.
+    fn slider_row(&mut self, id: WidgetId, key: SettingKey, x: i32, y: i32, frac: f32, label: &str) {
+        self.slider_row_r(id, key, lr(x, y, 320, 20), frac, label);
+    }
+
+    /// Button whose caption is one bilingual literal.
+    fn tr_btn(&mut self, id: WidgetId, r: UiRect, en: &str, ja: &str) {
+        self.btn(id, r, tr(self.lang, en, ja));
+    }
+
+    /// [`Ctx::tr_btn`] with an explicit enabled state.
+    fn tr_button(&mut self, id: WidgetId, r: UiRect, en: &str, ja: &str, enabled: bool) {
+        self.button(id, r, tr(self.lang, en, ja), enabled);
+    }
+
+    /// [`Ctx::tr_btn`] without the reserved-band check — footer chrome.
+    fn tr_button_unchecked(&mut self, id: WidgetId, r: UiRect, en: &str, ja: &str) {
+        self.button_unchecked(id, r, tr(self.lang, en, ja), true);
+    }
+
+    /// Up / `a-b` counter / Down pager chrome of one scrolling list
+    /// panel, anchored to its `x`, `w` and row `y` in logical px.
+    fn pager(
+        &mut self,
+        x: i32,
+        w: i32,
+        y: i32,
+        up: WidgetId,
+        down: WidgetId,
+        span: (usize, usize),
+    ) {
+        let lang = self.lang;
+        self.btn(up, lr(x + 4, y, 60, 16), tr(lang, "Up", "上"));
+        self.ctext(
+            x + w / 2,
+            y + 4,
+            1,
+            pal::TEXT_DIM,
+            &format!("{}-{}", span.0, span.1),
+        );
+        self.btn(down, lr(x + w - 64, y, 60, 16), tr(lang, "Down", "下"));
+    }
+
     /// The `●` dirty marker drawn just right of a settings widget whose
     /// value differs from the session-open snapshot. Kept out of the
     /// widget label so button text stays byte-identical; off-viewport
@@ -997,16 +1104,8 @@ fn title(ctx: &mut Ctx) {
     );
     // Vanilla's Realms/Mods slot splits into two half-width buttons.
     let y3 = y + 2 * step;
-    ctx.btn(
-        WidgetId::TitleMods,
-        lr(x, y3, half, bh),
-        tr(lang, "Mods&Packs", "Modとパック"),
-    );
-    ctx.btn(
-        WidgetId::TitleFriends,
-        lr(x + bw - half, y3, half, bh),
-        tr(lang, "Friends", "フレンドと遊ぶ"),
-    );
+    ctx.tr_btn(WidgetId::TitleMods, lr(x, y3, half, bh), "Mods&Packs", "Modとパック");
+    ctx.tr_btn(WidgetId::TitleFriends, lr(x + bw - half, y3, half, bh), "Friends", "フレンドと遊ぶ");
     // Bottom row: the corner chips hang off the column ends exactly
     // where vanilla parks its globe and accessibility buttons.
     let y4 = y3 + bh + 8;
@@ -1133,11 +1232,7 @@ fn singleplayer(ctx: &mut Ctx) {
     // rows themselves stay clickable at any size.
     let py = list_top + 4 + visible as i32 * row_h;
     if worlds.len() > visible && pw >= 176 && py + 16 <= list_bottom {
-        ctx.btn(
-            WidgetId::SingleplayerListUp,
-            lr(px + 4, py, 60, 16),
-            tr(lang, "Up", "上"),
-        );
+        ctx.tr_btn(WidgetId::SingleplayerListUp, lr(px + 4, py, 60, 16), "Up", "上");
         ctx.ctext(
             cx,
             py + 4,
@@ -1145,11 +1240,7 @@ fn singleplayer(ctx: &mut Ctx) {
             pal::TEXT_DIM,
             &format!("{}-{}", scroll + 1, (scroll + visible).min(worlds.len())),
         );
-        ctx.btn(
-            WidgetId::SingleplayerListDown,
-            lr(px + pw - 64, py, 60, 16),
-            tr(lang, "Down", "下"),
-        );
+        ctx.tr_btn(WidgetId::SingleplayerListDown, lr(px + pw - 64, py, 60, 16), "Down", "下");
     }
 
     // --- Create New World --------------------------------------------
@@ -1199,11 +1290,7 @@ fn singleplayer(ctx: &mut Ctx) {
         lr(px + pw / 2 + 2, create_top + 56, pw / 2 - 2, 18),
         &format!("{}: {difficulty}", tr(lang, "Difficulty", "難易度")),
     );
-    ctx.btn(
-        WidgetId::SingleplayerCreate,
-        lr(px, create_top + 78, pw, 18),
-        tr(lang, "Create & Play", "作成してプレイ"),
-    );
+    ctx.tr_btn(WidgetId::SingleplayerCreate, lr(px, create_top + 78, pw, 18), "Create & Play", "作成してプレイ");
     ctx.clip_top = 0;
     ctx.band_top = i32::MAX;
 
@@ -1212,12 +1299,7 @@ fn singleplayer(ctx: &mut Ctx) {
     if let Some(status) = &ctx.state.title_status {
         ctx.hud_ctext(cx, ctx.h - 41, 1, pal::WARNING, status, 56);
     }
-    ctx.button_unchecked(
-        WidgetId::SingleplayerBack,
-        lr(cx - 50, ctx.h - 30, 100, 20),
-        tr(lang, "Back", "戻る"),
-        true,
-    );
+    ctx.tr_button_unchecked(WidgetId::SingleplayerBack, lr(cx - 50, ctx.h - 30, 100, 20), "Back", "戻る");
 }
 
 fn multiplayer(ctx: &mut Ctx) {
@@ -1260,17 +1342,12 @@ fn multiplayer(ctx: &mut Ctx) {
     let saved_top = saved_label_y + 10;
     let saved_bottom = list_bottom;
 
-    ctx.text(
-        px + 2,
-        list_top,
-        1,
-        pal::ACCENT,
-        tr(lang, "Friends & LAN", "フレンドとLAN"),
-    );
-    ctx.btn(
+    ctx.section(px + 2, list_top, tr(lang, "Friends & LAN", "フレンドとLAN"));
+    ctx.tr_btn(
         WidgetId::MultiplayerManageFriends,
         lr(px + pw - 120, list_top - 3, 120, 14),
-        tr(lang, "Manage Friends", "フレンド管理"),
+        "Manage Friends",
+        "フレンド管理",
     );
 
     let friend_worlds = &ctx.state.multiplayer.friend_worlds;
@@ -1278,16 +1355,12 @@ fn multiplayer(ctx: &mut Ctx) {
     let fl_total = friend_worlds.len() + lan_worlds.len();
     ctx.panel(px, fl_top, pw, fl_panel_h);
     let fl_row_h = 18;
-    let fl_body = (fl_panel_h - 6).max(0);
-    let mut fl_visible = (fl_body / fl_row_h) as usize;
-    if fl_total > fl_visible {
-        fl_visible = ((fl_body - 18) / fl_row_h).max(0) as usize;
-    }
-    let fl_scroll = ctx
-        .state
-        .multiplayer
-        .friend_lan_scroll
-        .min(fl_total.saturating_sub(fl_visible));
+    let (fl_visible, fl_scroll) = list_window(
+        (fl_panel_h - 6).max(0),
+        fl_row_h,
+        fl_total,
+        ctx.state.multiplayer.friend_lan_scroll,
+    );
     if fl_total == 0 && fl_panel_h >= 22 {
         ctx.ctext(
             cx,
@@ -1331,47 +1404,32 @@ fn multiplayer(ctx: &mut Ctx) {
     }
     let fl_py = fl_top + 4 + fl_visible as i32 * fl_row_h;
     if fl_total > fl_visible && pw >= 176 && fl_py + 16 <= fl_top + fl_panel_h {
-        ctx.btn(
+        ctx.pager(
+            px,
+            pw,
+            fl_py,
             WidgetId::MultiplayerFriendLanUp,
-            lr(px + 4, fl_py, 60, 16),
-            tr(lang, "Up", "上"),
-        );
-        ctx.ctext(
-            cx,
-            fl_py + 4,
-            1,
-            pal::TEXT_DIM,
-            &format!("{}-{}", fl_scroll + 1, (fl_scroll + fl_visible).min(fl_total)),
-        );
-        ctx.btn(
             WidgetId::MultiplayerFriendLanDown,
-            lr(px + pw - 64, fl_py, 60, 16),
-            tr(lang, "Down", "下"),
+            (fl_scroll + 1, (fl_scroll + fl_visible).min(fl_total)),
         );
     }
 
     // --- Saved servers -----------------------------------------------
     if saved_bottom > saved_top + 8 {
-        ctx.text(
+        ctx.section(
             px + 2,
             saved_label_y,
-            1,
-            pal::ACCENT,
             tr(lang, "Saved Servers", "保存したサーバー"),
         );
         let servers = &ctx.state.multiplayer.servers;
         ctx.panel(px, saved_top, pw, (saved_bottom - saved_top).max(10));
         let row_h = 20;
-        let body_h = (saved_bottom - saved_top - 6).max(0);
-        let mut visible = (body_h / row_h) as usize;
-        if servers.len() > visible {
-            visible = ((body_h - 18) / row_h).max(0) as usize;
-        }
-        let scroll = ctx
-            .state
-            .multiplayer
-            .scroll
-            .min(servers.len().saturating_sub(visible));
+        let (visible, scroll) = list_window(
+            (saved_bottom - saved_top - 6).max(0),
+            row_h,
+            servers.len(),
+            ctx.state.multiplayer.scroll,
+        );
         if servers.is_empty() {
             ctx.ctext(
                 cx,
@@ -1399,22 +1457,13 @@ fn multiplayer(ctx: &mut Ctx) {
         }
         let py = saved_top + 4 + visible as i32 * row_h;
         if servers.len() > visible && pw >= 176 && py + 16 <= saved_bottom {
-            ctx.btn(
+            ctx.pager(
+                px,
+                pw,
+                py,
                 WidgetId::MultiplayerListUp,
-                lr(px + 4, py, 60, 16),
-                tr(lang, "Up", "上"),
-            );
-            ctx.ctext(
-                cx,
-                py + 4,
-                1,
-                pal::TEXT_DIM,
-                &format!("{}-{}", scroll + 1, (scroll + visible).min(servers.len())),
-            );
-            ctx.btn(
                 WidgetId::MultiplayerListDown,
-                lr(px + pw - 64, py, 60, 16),
-                tr(lang, "Down", "下"),
+                (scroll + 1, (scroll + visible).min(servers.len())),
             );
         }
     }
@@ -1436,21 +1485,14 @@ fn multiplayer(ctx: &mut Ctx) {
     );
     let bw = ((pw - 8) / 3).max(24);
     let by = direct_top + 34;
-    ctx.btn(
-        WidgetId::MultiplayerJoin,
-        lr(px, by, bw, 18),
-        tr(lang, "Join", "参加"),
-    );
-    ctx.btn(
-        WidgetId::MultiplayerAdd,
-        lr(px + bw + 4, by, bw, 18),
-        tr(lang, "Add", "追加"),
-    );
-    ctx.btn(
-        WidgetId::MultiplayerDelete,
-        lr(px + 2 * (bw + 4), by, bw, 18),
-        tr(lang, "Delete", "削除"),
-    );
+    let actions = [
+        (WidgetId::MultiplayerJoin, tr(lang, "Join", "参加")),
+        (WidgetId::MultiplayerAdd, tr(lang, "Add", "追加")),
+        (WidgetId::MultiplayerDelete, tr(lang, "Delete", "削除")),
+    ];
+    for (i, (id, label)) in actions.into_iter().enumerate() {
+        ctx.btn(id, lr(px + i as i32 * (bw + 4), by, bw, 18), label);
+    }
     ctx.band_top = i32::MAX;
 
     // Inline status (bad address, store failures, "select a server")
@@ -1464,12 +1506,7 @@ fn multiplayer(ctx: &mut Ctx) {
     {
         ctx.hud_ctext(cx, ctx.h - 41, 1, pal::WARNING, status, 56);
     }
-    ctx.button_unchecked(
-        WidgetId::MultiplayerBack,
-        lr(cx - 50, ctx.h - 30, 100, 20),
-        tr(lang, "Back", "戻る"),
-        true,
-    );
+    ctx.tr_button_unchecked(WidgetId::MultiplayerBack, lr(cx - 50, ctx.h - 30, 100, 20), "Back", "戻る");
 }
 
 fn disconnected(ctx: &mut Ctx) {
@@ -1494,10 +1531,11 @@ fn disconnected(ctx: &mut Ctx) {
         ctx.hud_ctext(cx, ty + 24, 1, pal::TEXT, &state.reason, 72);
     }
     let bw = 140.min(ctx.w - 12).max(24);
-    ctx.btn(
+    ctx.tr_btn(
         WidgetId::DisconnectedBack,
         lr(cx - bw / 2, (ty + 44).min((ctx.h - 22).max(2)), bw, 20),
-        tr(lang, "Back to Title", "タイトルへ戻る"),
+        "Back to Title",
+        "タイトルへ戻る",
     );
 }
 
@@ -1830,11 +1868,7 @@ fn about_megu(ctx: &mut Ctx) {
             y += 24;
         }
     }
-    ctx.btn(
-        WidgetId::AboutBack,
-        lr(cx - 50, by, 100, 20),
-        tr(lang, "Back", "戻る"),
-    );
+    ctx.tr_btn(WidgetId::AboutBack, lr(cx - 50, by, 100, 20), "Back", "戻る");
     // 150 keeps the badge right of the optional link buttons (cx+144)
     // and Back (cx+50); the panel itself already ends above it.
     boot_badge(ctx, 150);
@@ -1925,20 +1959,23 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
         );
     }
     let x = cx - 160;
-    ctx.btn(
+    let shaders_enabled = ctx.state.settings.shader_quick.shaders_enabled;
+    ctx.setting_row(
         WidgetId::ShadersEnabled,
-        lr(x, y0 + 44, 320, 20),
-        if ctx.state.settings.shader_quick.shaders_enabled {
+        SettingKey::ShadersEnabled,
+        x,
+        y0 + 44,
+        if shaders_enabled {
             tr(lang, "Shaders: ON", "シェーダー: ON")
         } else {
             tr(lang, "Shaders: OFF", "シェーダー: OFF")
         },
     );
-    ctx.dirty_dot(SettingKey::ShadersEnabled, x + 326, y0 + 50);
-    ctx.btn(
+    ctx.tr_btn(
         WidgetId::ShadersOpenOptions,
         lr(x, y0 + 68, 320, 20),
-        tr(lang, "Open Shader Options...", "シェーダー設定を開く..."),
+        "Open Shader Options...",
+        "シェーダー設定を開く...",
     );
     if let Some(pack) = ctx.state.shader_packs.selected() {
         let label = if pack.title.is_empty() {
@@ -1962,57 +1999,47 @@ fn shaders_tab(ctx: &mut Ctx, y0: i32) {
     if let Some(status) = vs.external_shader_status(lang) {
         ctx.hud_ctext(cx, y0 + 126, 1, pal::ACCENT, &status, 44);
     } else {
-        ctx.btn(
+        ctx.setting_row(
             WidgetId::VisualPreset,
-            lr(x, y0 + 124, 320, 20),
-            &format!(
-                "{}: {}",
-                tr(lang, "Visual Style", "ビジュアルスタイル"),
-                vs.preset.label(lang)
-            ),
+            SettingKey::VisualStylePreset,
+            x,
+            y0 + 124,
+            &value_label(lang, "Visual Style", "ビジュアルスタイル", vs.preset.label(lang)),
         );
-        ctx.dirty_dot(SettingKey::VisualStylePreset, x + 326, y0 + 130);
     }
-    ctx.btn(
-        WidgetId::VisualBlocks3d,
-        lr(x, y0 + 148, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "3D Blocks & Skins", "立体ブロック＆スキン"),
-            onoff(vs.blocks_and_skins_3d)
+    let rows = [
+        (
+            WidgetId::VisualBlocks3d,
+            SettingKey::BlocksAndSkins3d,
+            "3D Blocks & Skins",
+            "立体ブロック＆スキン",
+            vs.blocks_and_skins_3d,
         ),
-    );
-    ctx.dirty_dot(SettingKey::BlocksAndSkins3d, x + 326, y0 + 154);
-    ctx.btn(
-        WidgetId::VisualWorldEffects,
-        lr(x, y0 + 172, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "World Effects", "環境エフェクト"),
-            onoff(vs.world_effects)
+        (
+            WidgetId::VisualWorldEffects,
+            SettingKey::WorldEffects,
+            "World Effects",
+            "環境エフェクト",
+            vs.world_effects,
         ),
-    );
-    ctx.dirty_dot(SettingKey::WorldEffects, x + 326, y0 + 178);
-    ctx.btn(
-        WidgetId::VisualCameraMotion,
-        lr(x, y0 + 196, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Camera Motion", "カメラの微揺れ"),
-            onoff(vs.camera_micro_motion)
+        (
+            WidgetId::VisualCameraMotion,
+            SettingKey::CameraMicroMotion,
+            "Camera Motion",
+            "カメラの微揺れ",
+            vs.camera_micro_motion,
         ),
-    );
-    ctx.dirty_dot(SettingKey::CameraMicroMotion, x + 326, y0 + 202);
-    ctx.btn(
-        WidgetId::VisualNightSky,
-        lr(x, y0 + 220, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Night Sky", "よぞら"),
-            onoff(vs.world_effects_detail.night_sky)
+        (
+            WidgetId::VisualNightSky,
+            SettingKey::WorldEffectsDetail,
+            "Night Sky",
+            "よぞら",
+            vs.world_effects_detail.night_sky,
         ),
-    );
-    ctx.dirty_dot(SettingKey::WorldEffectsDetail, x + 326, y0 + 226);
+    ];
+    for (i, (id, key, en, ja, on)) in rows.iter().enumerate() {
+        ctx.setting_row(*id, *key, x, y0 + 148 + i as i32 * 24, &toggle_label(lang, en, ja, *on));
+    }
 }
 
 fn video_tab(ctx: &mut Ctx, y0: i32) {
@@ -2030,35 +2057,26 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
     let bw = 312;
     let step = if ctx.h < 300 { 22 } else { 24 };
     let vy = |i: i32| y0 + i * step;
-    let pair = |ctx: &mut Ctx,
-                i: i32,
-                col: i32,
-                id: WidgetId,
-                key: SettingKey,
-                label: &str| {
+    let pair = |ctx: &mut Ctx, i: i32, col: i32, id: WidgetId, key: SettingKey, label: &str| {
         let bx = lx + col * 160;
         ctx.btn(id, lr(bx, vy(i), 150, 20), label);
         ctx.dirty_dot(key, bx + 154, vy(i) + 6);
     };
 
-    let (x, y) = (lx, vy(0));
-    ctx.btn(
+    ctx.setting_row_w(
         WidgetId::VideoPreset,
-        lr(x, y, bw, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Preset", "プリセット"),
-            v.preset.label(lang)
-        ),
+        SettingKey::VideoPreset,
+        lx,
+        vy(0),
+        bw,
+        &value_label(lang, "Preset", "プリセット", v.preset.label(lang)),
     );
-    ctx.dirty_dot(SettingKey::VideoPreset, x + bw + 6, y + 6);
 
-    let (x, y) = (lx, vy(1));
-    let frac = v.view_distance.saturating_sub(6) as f32 / 26.0;
-    ctx.slider(
+    ctx.slider_row_r(
         WidgetId::VideoViewDistance,
-        lr(x, y, bw, 20),
-        frac,
+        SettingKey::VideoViewDistance,
+        lr(lx, vy(1), bw, 20),
+        v.view_distance.saturating_sub(6) as f32 / 26.0,
         &format!(
             "{}: {} {}",
             tr(lang, "View Distance", "描画距離"),
@@ -2066,96 +2084,31 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "chunks", "チャンク")
         ),
     );
-    ctx.dirty_dot(SettingKey::VideoViewDistance, x + bw + 6, y + 6);
 
-    pair(
-        ctx,
-        2,
-        0,
-        WidgetId::VideoFullscreen,
-        SettingKey::DisplayFullscreen,
-        &format!(
-            "{}: {}",
-            tr(lang, "Fullscreen", "フルスクリーン"),
-            onoff(ctx.state.settings.fullscreen)
-        ),
-    );
+    pair(ctx, 2, 0, WidgetId::VideoFullscreen, SettingKey::DisplayFullscreen,
+         &toggle_label(lang, "Fullscreen", "フルスクリーン", ctx.state.settings.fullscreen));
     let scale = if ctx.state.settings.gui_scale == 0 {
         tr(lang, "Auto", "自動").to_string()
     } else {
         ctx.state.settings.gui_scale.to_string()
     };
-    pair(
-        ctx,
-        2,
-        1,
-        WidgetId::VideoGuiScale,
-        SettingKey::DisplayGuiScale,
-        &format!("{}: {scale}", tr(lang, "GUI Scale", "GUIサイズ")),
-    );
+    pair(ctx, 2, 1, WidgetId::VideoGuiScale, SettingKey::DisplayGuiScale,
+         &value_label(lang, "GUI Scale", "GUIサイズ", scale));
 
-    pair(
-        ctx,
-        3,
-        0,
-        WidgetId::VideoGamma,
-        SettingKey::DisplayGamma,
-        &format!(
-            "{}: {}%",
-            tr(lang, "Brightness", "明るさ"),
-            ctx.state.settings.gamma_pct
-        ),
-    );
-    pair(
-        ctx,
-        3,
-        1,
-        WidgetId::VideoClouds,
-        SettingKey::VideoClouds,
-        &format!(
-            "{}: {}",
-            tr(lang, "Clouds", "雲"),
-            v.clouds.label(lang)
-        ),
-    );
+    pair(ctx, 3, 0, WidgetId::VideoGamma, SettingKey::DisplayGamma,
+         &value_label(lang, "Brightness", "明るさ", format!("{}%", ctx.state.settings.gamma_pct)));
+    pair(ctx, 3, 1, WidgetId::VideoClouds, SettingKey::VideoClouds,
+         &value_label(lang, "Clouds", "雲", v.clouds.label(lang)));
 
-    pair(
-        ctx,
-        4,
-        0,
-        WidgetId::VideoLod,
-        SettingKey::VideoLod,
-        &format!("{}: {}", tr(lang, "LOD", "遠景LOD"), v.lod.label(lang)),
-    );
-    pair(
-        ctx,
-        4,
-        1,
-        WidgetId::VideoGpuBackend,
-        SettingKey::VideoGpuBackend,
-        &format!("{}: {}", tr(lang, "GPU", "GPU"), v.gpu_backend.label(lang)),
-    );
+    pair(ctx, 4, 0, WidgetId::VideoLod, SettingKey::VideoLod,
+         &value_label(lang, "LOD", "遠景LOD", v.lod.label(lang)));
+    pair(ctx, 4, 1, WidgetId::VideoGpuBackend, SettingKey::VideoGpuBackend,
+         &value_label(lang, "GPU", "GPU", v.gpu_backend.label(lang)));
 
-    pair(
-        ctx,
-        5,
-        0,
-        WidgetId::VideoVsync,
-        SettingKey::VideoVsync,
-        &format!("VSync: {}", onoff(v.vsync)),
-    );
-    pair(
-        ctx,
-        5,
-        1,
-        WidgetId::VideoSmoothLighting,
-        SettingKey::VideoSmoothLighting,
-        &format!(
-            "{}: {}",
-            tr(lang, "Smooth Light", "スムースライト"),
-            onoff(v.smooth_lighting)
-        ),
-    );
+    pair(ctx, 5, 0, WidgetId::VideoVsync, SettingKey::VideoVsync,
+         &format!("VSync: {}", onoff(v.vsync)));
+    pair(ctx, 5, 1, WidgetId::VideoSmoothLighting, SettingKey::VideoSmoothLighting,
+         &toggle_label(lang, "Smooth Light", "スムースライト", v.smooth_lighting));
 
     // FPS cap: slider + custom numeric field on the same row (no overlap).
     let (x, y) = (lx, vy(6));
@@ -2164,11 +2117,7 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         WidgetId::VideoFpsSlider,
         lr(x, y, 200, 20),
         frac,
-        &format!(
-            "{}: {}",
-            tr(lang, "FPS Cap", "FPS上限"),
-            v.fps_cap_label(lang)
-        ),
+        &value_label(lang, "FPS Cap", "FPS上限", v.fps_cap_label(lang)),
     );
     ctx.textfield(
         WidgetId::VideoFpsField,
@@ -2188,119 +2137,66 @@ fn video_tab(ctx: &mut Ctx, y0: i32) {
         );
     }
 
-    let (x, y) = (lx, vy(7));
     let bg_label = if v.background_fps == 0 {
         tr(lang, "Off", "オフ").to_string()
     } else {
         format!("{} fps", v.background_fps)
     };
-    ctx.btn(
+    ctx.setting_row_w(
         WidgetId::VideoBackgroundFps,
-        lr(x, y, bw, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Background FPS", "バックグラウンドFPS"),
-            bg_label
-        ),
+        SettingKey::VideoBackgroundFps,
+        lx,
+        vy(7),
+        bw,
+        &value_label(lang, "Background FPS", "バックグラウンドFPS", bg_label),
     );
-    ctx.dirty_dot(SettingKey::VideoBackgroundFps, x + bw + 6, y + 6);
 
     // Host-RAM cache budget: free 512-MiB slider steps from Auto (0) up
     // to the detected host total — no artificial ceiling. The runtime's
     // live OOM guard trims distant caches early when the OS runs low, so
     // even a maxed-out cap can never get the process killed.
-    let (x, y) = (lx, vy(8));
-    ctx.slider(
+    ctx.slider_row_r(
         WidgetId::VideoRamBudget,
-        lr(x, y, bw, 20),
+        SettingKey::VideoRamBudget,
+        lr(lx, vy(8), bw, 20),
         v.ram_budget_frac(),
-        &format!(
-            "{}: {}",
-            tr(lang, "Host RAM Budget", "ホストRAM上限"),
-            v.ram_budget_label(lang)
-        ),
+        &value_label(lang, "Host RAM Budget", "ホストRAM上限", v.ram_budget_label(lang)),
     );
-    ctx.dirty_dot(SettingKey::VideoRamBudget, x + bw + 6, y + 6);
 
     // --- Lighting & world-scoped toggles (right column) ----------------
+    ctx.section(rx, vy(0), tr(lang, "LIGHTING", "ライティング"));
     let lighting: [(WidgetId, SettingKey, &str, &str, bool); 5] = [
+        (WidgetId::VideoEntityShadows, SettingKey::VideoEntityShadows, "Shadows", "影", v.entity_shadows),
         (
-            WidgetId::VideoEntityShadows,
-            SettingKey::VideoEntityShadows,
-            "Shadows",
-            "影",
-            v.entity_shadows,
+            WidgetId::VideoComfortExposure, SettingKey::VideoComfortExposure,
+            "Eye-Comfort Exposure", "まぶしさを抑制", v.comfort_exposure,
+        ),
+        (WidgetId::VideoDynamicLights, SettingKey::VideoDynamicLights, "Dynamic Lights", "動くライト", v.dynamic_lights),
+        (
+            WidgetId::VideoEnchantmentGlint, SettingKey::VideoEnchantmentGlint,
+            "Enchantment Glint", "エンチャントきらめき", v.enchantment_glint,
         ),
         (
-            WidgetId::VideoComfortExposure,
-            SettingKey::VideoComfortExposure,
-            "Eye-Comfort Exposure",
-            "まぶしさを抑制",
-            v.comfort_exposure,
-        ),
-        (
-            WidgetId::VideoDynamicLights,
-            SettingKey::VideoDynamicLights,
-            "Dynamic Lights",
-            "動くライト",
-            v.dynamic_lights,
-        ),
-        (
-            WidgetId::VideoEnchantmentGlint,
-            SettingKey::VideoEnchantmentGlint,
-            "Enchantment Glint",
-            "エンチャントきらめき",
-            v.enchantment_glint,
-        ),
-        (
-            WidgetId::VideoIndirectLightBounce,
-            SettingKey::VideoIndirectLightBounce,
-            "Indirect Light Bounce",
-            "間接バウンスライト",
-            v.indirect_light_bounce,
+            WidgetId::VideoIndirectLightBounce, SettingKey::VideoIndirectLightBounce,
+            "Indirect Light Bounce", "間接バウンスライト", v.indirect_light_bounce,
         ),
     ];
-    ctx.text(rx, vy(0), 1, pal::ACCENT, tr(lang, "LIGHTING", "ライティング"));
     for (i, (id, key, en, ja, on)) in lighting.iter().enumerate() {
-        let (x, y) = (rx, vy(i as i32 + 1));
-        ctx.btn(
-            *id,
-            lr(x, y, bw, 20),
-            &format!("{}: {}", tr(lang, en, ja), onoff(*on)),
-        );
-        ctx.dirty_dot(*key, x + bw + 6, y + 6);
+        ctx.setting_row_w(*id, *key, rx, vy(i as i32 + 1), bw, &toggle_label(lang, en, ja, *on));
     }
-    ctx.text(
-        rx,
-        vy(6),
-        1,
-        pal::ACCENT,
-        tr(lang, "WORLD (LOCAL)", "ワールド（ローカル）"),
-    );
+    ctx.section(rx, vy(6), tr(lang, "WORLD (LOCAL)", "ワールド（ローカル）"));
     let world: [(WidgetId, SettingKey, &str, &str, bool); 2] = [
         (
-            WidgetId::VideoDirectionalShadowGameplay,
-            SettingKey::VideoDirectionalShadowGameplay,
-            "Shadow Light Gameplay",
-            "シャドウゲームプレイ",
-            v.directional_shadow_gameplay,
+            WidgetId::VideoDirectionalShadowGameplay, SettingKey::VideoDirectionalShadowGameplay,
+            "Shadow Light Gameplay", "シャドウゲームプレイ", v.directional_shadow_gameplay,
         ),
         (
-            WidgetId::VideoLazyCatchupGameplay,
-            SettingKey::VideoLazyCatchupGameplay,
-            "Unloaded Catch-Up",
-            "追いつき処理",
-            v.lazy_catchup_gameplay,
+            WidgetId::VideoLazyCatchupGameplay, SettingKey::VideoLazyCatchupGameplay,
+            "Unloaded Catch-Up", "追いつき処理", v.lazy_catchup_gameplay,
         ),
     ];
     for (i, (id, key, en, ja, on)) in world.iter().enumerate() {
-        let (x, y) = (rx, vy(i as i32 + 7));
-        ctx.btn(
-            *id,
-            lr(x, y, bw, 20),
-            &format!("{}: {}", tr(lang, en, ja), onoff(*on)),
-        );
-        ctx.dirty_dot(*key, x + bw + 6, y + 6);
+        ctx.setting_row_w(*id, *key, rx, vy(i as i32 + 7), bw, &toggle_label(lang, en, ja, *on));
     }
     // Scope hint for the opt-in gameplay toggles: local/hosted worlds
     // only — remote servers keep their own host settings.
@@ -2425,11 +2321,7 @@ fn controls_tab(ctx: &mut Ctx, y0: i32) {
     ctx.btn(
         WidgetId::VideoInvertY,
         lr(left, y, 168, 18),
-        &format!(
-            "{}: {}",
-            tr(lang, "Invert Y", "Y軸反転"),
-            onoff(ctx.state.settings.mouse_invert_y)
-        ),
+        &toggle_label(lang, "Invert Y", "Y軸反転", ctx.state.settings.mouse_invert_y),
     );
     ctx.dirty_dot(SettingKey::DisplayInvertY, left + 174, y + 5);
     if ctx.state.capturing_key_binding.is_some() {
@@ -2452,36 +2344,11 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
     let a = &ctx.state.settings.audio;
 
     let rows: [(WidgetId, SettingKey, &str, u8); 7] = [
-        (
-            WidgetId::AudioMaster,
-            SettingKey::AudioMaster,
-            tr(lang, "Master Volume", "マスター音量"),
-            a.master,
-        ),
-        (
-            WidgetId::AudioMusic,
-            SettingKey::AudioMusic,
-            tr(lang, "Music", "BGM"),
-            a.music,
-        ),
-        (
-            WidgetId::AudioBlocks,
-            SettingKey::AudioBlocks,
-            tr(lang, "Blocks", "ブロック"),
-            a.blocks,
-        ),
-        (
-            WidgetId::AudioHostile,
-            SettingKey::AudioHostile,
-            tr(lang, "Hostile Mobs", "敵モブ"),
-            a.hostile,
-        ),
-        (
-            WidgetId::AudioFriendly,
-            SettingKey::AudioFriendly,
-            tr(lang, "Friendly Mobs", "友好モブ"),
-            a.friendly,
-        ),
+        (WidgetId::AudioMaster, SettingKey::AudioMaster, tr(lang, "Master Volume", "マスター音量"), a.master),
+        (WidgetId::AudioMusic, SettingKey::AudioMusic, tr(lang, "Music", "BGM"), a.music),
+        (WidgetId::AudioBlocks, SettingKey::AudioBlocks, tr(lang, "Blocks", "ブロック"), a.blocks),
+        (WidgetId::AudioHostile, SettingKey::AudioHostile, tr(lang, "Hostile Mobs", "敵モブ"), a.hostile),
+        (WidgetId::AudioFriendly, SettingKey::AudioFriendly, tr(lang, "Friendly Mobs", "友好モブ"), a.friendly),
         (
             WidgetId::AudioMaxVolumeCap,
             SettingKey::AudioMaxVolumeCap,
@@ -2507,27 +2374,28 @@ fn audio_tab(ctx: &mut Ctx, y0: i32) {
         } else if *id == WidgetId::AudioMaxVolumeCap {
             // Intuitive dB readout (OFF/Muted/Gentle/Medium/Strong)
             // instead of a bare percent.
-            format!("{name}: {}", a.max_volume_cap_label(lang))
+            value_label(lang, "Loud Sound Limiter", "音量ガード", a.max_volume_cap_label(lang))
         } else {
             format!("{name}: {val}%")
         };
-        ctx.slider(*id, lr(x, y, 320, 20), frac, &label);
-        ctx.dirty_dot(*key, x + 326, y + 6);
+        ctx.slider_row(*id, *key, x, y, frac, &label);
     }
 
     // 3D Audio: a plain OFF/ON toggle — full 64-ray quality internally,
     // no ray-count dropdown to mis-set.
     let (x, y) = row(ctx, 7, y0);
-    ctx.btn(
+    ctx.setting_row(
         WidgetId::AudioSpatial3d,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "3D Audio", "立体音響"),
-            onoff(ctx.state.settings.visual.spatial_audio_3d)
+        SettingKey::AudioSpatial3d,
+        x,
+        y,
+        &toggle_label(
+            lang,
+            "3D Audio",
+            "立体音響",
+            ctx.state.settings.visual.spatial_audio_3d,
         ),
     );
-    ctx.dirty_dot(SettingKey::AudioSpatial3d, x + 326, y + 6);
 
     ctx.ctext(
         ctx.w / 2,
@@ -2554,24 +2422,40 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     let x = ctx.w / 2 - 160;
     let y0 = if compact { y0 - 2 } else { y0 };
     let qy = |i: i32| y0 + i * step;
+    let dot_y = |i: i32| qy(i) + (bh - 8) / 2;
+    // Full-width row: one control plus its dirty marker. Labels that
+    // need the whole width (Compact Debug HUD, Crash mode, drag controls)
+    // keep their own row.
+    let wide = |ctx: &mut Ctx, i: i32, id: WidgetId, key: SettingKey, label: &str| {
+        ctx.btn(id, lr(x, qy(i), 320, bh), label);
+        ctx.dirty_dot(key, x + 326, dot_y(i));
+    };
+    // Boolean toggles share compact two-per-row cells — the same
+    // 156px pairing the Compact Debug HUD/Subtitles row already uses — so every
+    // setting stays reachable at the smallest sane window.
+    let pair = |ctx: &mut Ctx, i: i32, col: i32, id: WidgetId, key: SettingKey, label: &str| {
+        let bx = x + col * 164;
+        ctx.btn(id, lr(bx, qy(i), 156, bh), label);
+        ctx.dirty_dot(key, bx + 162, dot_y(i));
+    };
 
     ctx.slider(
         WidgetId::QolToolWarn,
         lr(x, qy(0), 320, bh),
         q.tool_warn_percent as f32 / 100.0,
-        &format!(
-            "{}: {}%",
-            tr(lang, "Low-Durability Warning", "耐久低下の警告"),
-            q.tool_warn_percent
+        &value_label(
+            lang,
+            "Low-Durability Warning",
+            "耐久低下の警告",
+            format!("{}%", q.tool_warn_percent),
         ),
     );
-    ctx.dirty_dot(SettingKey::QolToolWarnPercent, x + 326, qy(0) + (bh - 8) / 2);
+    ctx.dirty_dot(SettingKey::QolToolWarnPercent, x + 326, dot_y(0));
 
-    let frac = (q.chat_history_lines as f32 - 100.0) / 4900.0;
     ctx.slider(
         WidgetId::QolChatHistory,
         lr(x, qy(1), 320, bh),
-        frac,
+        (q.chat_history_lines as f32 - 100.0) / 4900.0,
         &format!(
             "{}: {} {}",
             tr(lang, "Chat History", "チャット履歴"),
@@ -2579,48 +2463,12 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
             tr(lang, "lines", "行")
         ),
     );
-    ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, qy(1) + (bh - 8) / 2);
+    ctx.dirty_dot(SettingKey::QolChatHistoryLines, x + 326, dot_y(1));
 
-    // Boolean toggles share compact two-per-row cells — the same
-    // 156px pairing the Compact Debug HUD/Subtitles row already uses — so every
-    // setting stays reachable at the smallest sane window. Labels that
-    // need the full width (Support Links, Crash mode) keep their own
-    // row.
-    let pair = |ctx: &mut Ctx,
-                i: i32,
-                col: i32,
-                id: WidgetId,
-                key: SettingKey,
-                label: &str| {
-        let bx = x + col * 164;
-        ctx.btn(id, lr(bx, qy(i), 156, bh), label);
-        ctx.dirty_dot(key, bx + 162, qy(i) + (bh - 8) / 2);
-    };
-
-    pair(
-        ctx,
-        2,
-        0,
-        WidgetId::QolSmoothZoom,
-        SettingKey::QolSmoothZoom,
-        &format!(
-            "{}: {}",
-            tr(lang, "Smooth Zoom", "ズーム"),
-            onoff(q.smooth_zoom)
-        ),
-    );
-    pair(
-        ctx,
-        2,
-        1,
-        WidgetId::QolPreventBreak,
-        SettingKey::QolPreventToolBreak,
-        &format!(
-            "{}: {}",
-            tr(lang, "Break Guard", "破壊ガード"),
-            onoff(q.prevent_tool_break)
-        ),
-    );
+    pair(ctx, 2, 0, WidgetId::QolSmoothZoom, SettingKey::QolSmoothZoom,
+         &toggle_label(lang, "Smooth Zoom", "ズーム", q.smooth_zoom));
+    pair(ctx, 2, 1, WidgetId::QolPreventBreak, SettingKey::QolPreventToolBreak,
+         &toggle_label(lang, "Break Guard", "破壊ガード", q.prevent_tool_break));
 
     let compact_debug_hud_label = match q.compact_debug_hud_preset() {
         CompactDebugHudPreset::Off => "OFF",
@@ -2629,166 +2477,47 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
     };
     // Long neutral feature names get the full row so their captions never
     // clip at compact GUI scales.
-    ctx.btn(
-        WidgetId::QolCompactDebugHud,
-        lr(x, qy(3), 320, bh),
-        &format!("{}: {}", tr(lang, "Compact Debug HUD", "コンパクトデバッグHUD"), compact_debug_hud_label),
-    );
-    ctx.dirty_dot(SettingKey::QolCompactDebugHud, x + 326, qy(3) + (bh - 8) / 2);
+    wide(ctx, 3, WidgetId::QolCompactDebugHud, SettingKey::QolCompactDebugHud,
+         &value_label(lang, "Compact Debug HUD", "コンパクトデバッグHUD", compact_debug_hud_label));
 
-    pair(
-        ctx,
-        4,
-        0,
-        WidgetId::QolSubtitles,
-        SettingKey::QolShowSubtitles,
-        &format!(
-            "{}: {}",
-            tr(lang, "Subtitles", "字幕"),
-            onoff(q.show_subtitles)
-        ),
-    );
-    pair(
-        ctx,
-        4,
-        1,
-        WidgetId::QolRetainChat,
-        SettingKey::QolRetainChatOnReconnect,
-        &format!(
-            "{}: {}",
-            tr(lang, "Keep Chat", "履歴保持"),
-            onoff(q.retain_chat_on_reconnect)
-        ),
-    );
+    pair(ctx, 4, 0, WidgetId::QolSubtitles, SettingKey::QolShowSubtitles,
+         &toggle_label(lang, "Subtitles", "字幕", q.show_subtitles));
+    pair(ctx, 4, 1, WidgetId::QolRetainChat, SettingKey::QolRetainChatOnReconnect,
+         &toggle_label(lang, "Keep Chat", "履歴保持", q.retain_chat_on_reconnect));
 
-    pair(
-        ctx,
-        5,
-        0,
-        WidgetId::QolToasts,
-        SettingKey::QolToastNotifications,
-        &format!(
-            "{}: {}",
-            tr(lang, "Toasts", "トースト"),
-            onoff(q.toast_notifications)
-        ),
-    );
+    pair(ctx, 5, 0, WidgetId::QolToasts, SettingKey::QolToastNotifications,
+         &toggle_label(lang, "Toasts", "トースト", q.toast_notifications));
     // Engine-quality essentials only. The mod-overlapping helpers
     // (auto-replenish, quick-stack, food/saturation preview, shulker
     // peek) deliberately have no toggle here — `QolSettings` keeps the
     // fields default-false for settings-file compatibility, and the
     // footer points players at Mods > Recommended for the dedicated
     // community mods that do those jobs better.
-    pair(
-        ctx,
-        5,
-        1,
-        WidgetId::QolAutoReconnect,
-        SettingKey::QolAutoReconnect,
-        &format!(
-            "{}: {}",
-            tr(lang, "Reconnect", "再接続"),
-            onoff(q.auto_reconnect)
-        ),
-    );
+    pair(ctx, 5, 1, WidgetId::QolAutoReconnect, SettingKey::QolAutoReconnect,
+         &toggle_label(lang, "Reconnect", "再接続", q.auto_reconnect));
 
-    pair(
-        ctx,
-        6,
-        0,
-        WidgetId::QolChatScrollLock,
-        SettingKey::QolChatScrollLock,
-        &format!(
-            "{}: {}",
-            tr(lang, "Scroll Lock", "スクロール保持"),
-            onoff(q.chat_scroll_lock)
-        ),
-    );
-    pair(
-        ctx,
-        6,
-        1,
-        WidgetId::QolShowSupportLinks,
-        SettingKey::QolShowSupportLinks,
-        &format!(
-            "{}: {}",
-            tr(lang, "Support Links", "支援リンク"),
-            onoff(q.show_support_links)
-        ),
-    );
+    pair(ctx, 6, 0, WidgetId::QolChatScrollLock, SettingKey::QolChatScrollLock,
+         &toggle_label(lang, "Scroll Lock", "スクロール保持", q.chat_scroll_lock));
+    pair(ctx, 6, 1, WidgetId::QolShowSupportLinks, SettingKey::QolShowSupportLinks,
+         &toggle_label(lang, "Support Links", "支援リンク", q.show_support_links));
 
-    ctx.btn(
-        WidgetId::QolCrashMode,
-        lr(x, qy(7), 320, bh),
-        &format!(
-            "{}: {}",
-            tr(lang, "Crash Report Mode", "クラッシュレポート"),
-            q.crash_report_mode.label(lang)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::QolCrashReportMode, x + 326, qy(7) + (bh - 8) / 2);
+    wide(ctx, 7, WidgetId::QolCrashMode, SettingKey::QolCrashReportMode,
+         &value_label(lang, "Crash Report Mode", "クラッシュレポート", q.crash_report_mode.label(lang)));
 
     // `Ctrl+O` flips the same setting in-game.
-    pair(
-        ctx,
-        8,
-        0,
-        WidgetId::QolRecipeOverlay,
-        SettingKey::QolRecipeOverlay,
-        &format!(
-            "{}: {}",
-            tr(lang, "Recipe Search", "レシピ検索UI"),
-            onoff(q.recipe_overlay_enabled)
-        ),
-    );
-    pair(
-        ctx,
-        8,
-        1,
-        WidgetId::QolBuiltin(0),
-        SettingKey::QolLookingAtHud,
-        &format!(
-            "{}: {}",
-            tr(lang, "Look-at HUD", "注視HUD"),
-            onoff(ctx.state.settings.qol_looking_at_hud)
-        ),
-    );
+    pair(ctx, 8, 0, WidgetId::QolRecipeOverlay, SettingKey::QolRecipeOverlay,
+         &toggle_label(lang, "Recipe Search", "レシピ検索UI", q.recipe_overlay_enabled));
+    pair(ctx, 8, 1, WidgetId::QolBuiltin(0), SettingKey::QolLookingAtHud,
+         &toggle_label(lang, "Look-at HUD", "注視HUD", ctx.state.settings.qol_looking_at_hud));
 
     // -- Built-in helper toggles (relocated from the Controls tab) ----
-    ctx.btn(
-        WidgetId::QolBuiltin(1),
-        lr(x, qy(9), 320, bh),
-        &format!(
-            "{}: {}",
-            tr(lang, "Inventory Drag Controls", "インベントリドラッグ操作"),
-            onoff(ctx.state.settings.inventory_drag_controls)
-        ),
-    );
-    ctx.dirty_dot(SettingKey::QolInventoryDragControls, x + 326, qy(9) + (bh - 8) / 2);
-    pair(
-        ctx,
-        10,
-        0,
-        WidgetId::QolBuiltin(2),
-        SettingKey::QolInventorySort,
-        &format!(
-            "{}: {}",
-            tr(lang, "Item Sort", "アイテム整理"),
-            onoff(ctx.state.settings.qol_inventory_sort)
-        ),
-    );
-    pair(
-        ctx,
-        10,
-        1,
-        WidgetId::QolBuiltin(3),
-        SettingKey::ZshCommandBar,
-        &format!(
-            "{}: {}",
-            tr(lang, "Cmd Hints", "コマンド補完"),
-            onoff(ctx.state.settings.zsh_command_bar)
-        ),
-    );
+    wide(ctx, 9, WidgetId::QolBuiltin(1), SettingKey::QolInventoryDragControls,
+         &toggle_label(lang, "Inventory Drag Controls", "インベントリドラッグ操作",
+                       ctx.state.settings.inventory_drag_controls));
+    pair(ctx, 10, 0, WidgetId::QolBuiltin(2), SettingKey::QolInventorySort,
+         &toggle_label(lang, "Item Sort", "アイテム整理", ctx.state.settings.qol_inventory_sort));
+    pair(ctx, 10, 1, WidgetId::QolBuiltin(3), SettingKey::ZshCommandBar,
+         &toggle_label(lang, "Cmd Hints", "コマンド補完", ctx.state.settings.zsh_command_bar));
 
     // Compact Debug HUD segment chips: only meaningful while the HUD itself is
     // on — hidden (not greyed) when the preset is Off. Keybind conflicts
@@ -2855,66 +2584,47 @@ fn qol_tab(ctx: &mut Ctx, y0: i32) {
 fn fairplay_tab(ctx: &mut Ctx, y0: i32) {
     let lang = ctx.lang;
     let f = &ctx.state.settings.fair_play;
-
-    let (x, y) = row(ctx, 0, y0);
-    ctx.btn(
-        WidgetId::FpMinimapMode,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Minimap Mode", "ミニマップ"),
-            f.minimap_mode.label(lang)
+    let rows = [
+        (
+            WidgetId::FpMinimapMode,
+            SettingKey::FpMinimapMode,
+            value_label(lang, "Minimap Mode", "ミニマップ", f.minimap_mode.label(lang)),
         ),
-    );
-    ctx.dirty_dot(SettingKey::FpMinimapMode, x + 326, y + 6);
-
-    let (x, y) = row(ctx, 1, y0);
-    ctx.btn(
-        WidgetId::FpCaveMap,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Allow Cave Map", "洞窟マップ許可"),
-            onoff(f.allow_cave_map)
+        (
+            WidgetId::FpCaveMap,
+            SettingKey::FpAllowCaveMap,
+            toggle_label(lang, "Allow Cave Map", "洞窟マップ許可", f.allow_cave_map),
         ),
-    );
-    ctx.dirty_dot(SettingKey::FpAllowCaveMap, x + 326, y + 6);
-
-    let (x, y) = row(ctx, 2, y0);
-    ctx.btn(
-        WidgetId::FpMobRadar,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Allow Mob Radar", "モブレーダー許可"),
-            onoff(f.allow_mob_radar)
+        (
+            WidgetId::FpMobRadar,
+            SettingKey::FpAllowMobRadar,
+            toggle_label(lang, "Allow Mob Radar", "モブレーダー許可", f.allow_mob_radar),
         ),
-    );
-    ctx.dirty_dot(SettingKey::FpAllowMobRadar, x + 326, y + 6);
-
-    let (x, y) = row(ctx, 3, y0);
-    ctx.btn(
-        WidgetId::FpRadarScope,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Player Radar Scope", "プレイヤーレーダー"),
-            f.player_radar_scope.label(lang)
+        (
+            WidgetId::FpRadarScope,
+            SettingKey::FpPlayerRadarScope,
+            value_label(
+                lang,
+                "Player Radar Scope",
+                "プレイヤーレーダー",
+                f.player_radar_scope.label(lang),
+            ),
         ),
-    );
-    ctx.dirty_dot(SettingKey::FpPlayerRadarScope, x + 326, y + 6);
-
-    let (x, y) = row(ctx, 4, y0);
-    ctx.btn(
-        WidgetId::FpWaypointTeleport,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Waypoint Teleport", "ウェイポイントTP"),
-            onoff(f.allow_waypoint_teleport)
+        (
+            WidgetId::FpWaypointTeleport,
+            SettingKey::FpAllowWaypointTeleport,
+            toggle_label(
+                lang,
+                "Waypoint Teleport",
+                "ウェイポイントTP",
+                f.allow_waypoint_teleport,
+            ),
         ),
-    );
-    ctx.dirty_dot(SettingKey::FpAllowWaypointTeleport, x + 326, y + 6);
+    ];
+    for (i, (id, key, label)) in rows.iter().enumerate() {
+        let (x, y) = row(ctx, i as i32, y0);
+        ctx.setting_row(*id, *key, x, y, label);
+    }
 
     ctx.ctext(
         ctx.w / 2,
@@ -2936,16 +2646,13 @@ fn language_tab(ctx: &mut Ctx, y0: i32) {
     // built-in locales, each shown by its native autonym.
     let (x, y) = row(ctx, 0, y0);
     let name = ctx.state.language_display_name();
-    ctx.btn(
+    ctx.setting_row(
         WidgetId::LanguageChoice,
-        lr(x, y, 320, 20),
-        &format!(
-            "{}: {}",
-            tr(lang, "Language", "言語"),
-            first_chars(&name, 30)
-        ),
+        SettingKey::Language,
+        x,
+        y,
+        &value_label(lang, "Language", "言語", first_chars(&name, 30)),
     );
-    ctx.dirty_dot(SettingKey::Language, x + 326, y + 6);
 
     // Auto-detect via the OS locale environment (LC_ALL/LANG).
     let (x, y) = row(ctx, 1, y0);
@@ -2971,9 +2678,6 @@ fn language_tab(ctx: &mut Ctx, y0: i32) {
         ),
     );
 }
-
-// ---------------------------------------------------------------------------
-// Friends
 // ---------------------------------------------------------------------------
 
 /// `megu-id:` strings are 66 chars — far wider than any row. Show a
@@ -3008,8 +2712,7 @@ fn friend_row(ctx: &mut Ctx, x0: i32, y: i32, rw: i32, i: usize) {
     let label = format!("{}  {}", entry.name, friend_id_short(&entry.friend_id));
     ctx.hud_text(x0 + 4, y + 5, 1, pal::TEXT, &label, (text_w / 8).max(2) as usize);
 
-    let mut rx = x0 + rw;
-    rx -= 60;
+    let mut rx = x0 + rw - 60;
     ctx.btn(WidgetId::FriendRemove(i), lr(rx, y + 1, 56, 16), tr(ctx.lang, "Remove", "削除"));
     if show_cb {
         rx -= 36;
@@ -3047,24 +2750,16 @@ fn friends(ctx: &mut Ctx) {
     ctx.band_top = ctx.h - 40;
 
     let wide = ctx.w >= 620;
-    let gap = 8;
     let (lx, col_w) = if wide {
-        let col_w = ((ctx.w - 24) / 2).max(40);
-        (8, col_w)
+        (8, ((ctx.w - 24) / 2).max(40))
     } else {
         (cx - (ctx.w - 8).max(40) / 2, (ctx.w - 8).max(40))
     };
-    let rx = lx + col_w + gap;
+    let rx = lx + col_w + 8;
     let f = &ctx.state.friends;
 
     // --- "Your Friend ID" row (left column top) -----------------------
-    ctx.text(
-        lx + 2,
-        28,
-        1,
-        pal::ACCENT,
-        tr(lang, "Your Friend ID", "あなたのフレンドID"),
-    );
+    ctx.section(lx + 2, 28, tr(lang, "Your Friend ID", "あなたのフレンドID"));
     let id_y = 40;
     let id_short = if f.my_friend_id.is_empty() {
         tr(lang, "(identity not loaded)", "(IDが読み込まれていません)").to_string()
@@ -3072,24 +2767,14 @@ fn friends(ctx: &mut Ctx) {
         friend_id_short(&f.my_friend_id)
     };
     ctx.hud_text(lx + 4, id_y + 5, 1, pal::TEXT, &id_short, ((col_w - 96) / 8).max(4) as usize);
-    ctx.btn(
-        WidgetId::FriendsCopyId,
-        lr(lx + col_w - 88, id_y, 84, 16),
-        tr(lang, "Copy ID", "IDをコピー"),
-    );
+    ctx.tr_btn(WidgetId::FriendsCopyId, lr(lx + col_w - 88, id_y, 84, 16), "Copy ID", "IDをコピー");
 
     // --- Add Friend row -----------------------------------------------
     // Wide: top of the right column. Narrow: under the identity row.
     let add_x = if wide { rx } else { lx };
     let add_y = if wide { 40 } else { id_y + 22 };
     if wide {
-        ctx.text(
-            add_x + 2,
-            28,
-            1,
-            pal::ACCENT,
-            tr(lang, "Add Friend", "フレンド追加"),
-        );
+        ctx.section(add_x + 2, 28, tr(lang, "Add Friend", "フレンド追加"));
     }
     let name_w = (col_w * 30 / 100).max(24);
     let add_btn_w = 52.min(col_w / 5).max(24);
@@ -3108,11 +2793,7 @@ fn friends(ctx: &mut Ctx) {
         f.add_id_field_active(),
         "megu-id:…",
     );
-    ctx.btn(
-        WidgetId::FriendsAdd,
-        lr(add_x + name_w + 4 + id_w + 4, add_y, add_btn_w, 18),
-        tr(lang, "Add", "追加"),
-    );
+    ctx.tr_btn(WidgetId::FriendsAdd, lr(add_x + name_w + 4 + id_w + 4, add_y, add_btn_w, 18), "Add", "追加");
     if let Some(err) = &f.add_error {
         ctx.hud_text(
             add_x + 4,
@@ -3148,22 +2829,16 @@ fn friends(ctx: &mut Ctx) {
 
     let share_x = if wide { rx } else { lx };
     let share_w = col_w;
-    ctx.text(
+    ctx.section(
         share_x + 2,
         share_top,
-        1,
-        pal::ACCENT,
         tr(lang, "Host World Sharing (1-hop only)", "ワールド共有（1ホップのみ）"),
     );
     let mode_y = share_top + 10;
     ctx.btn(
         WidgetId::FriendsShareMode,
         lr(share_x, mode_y, share_w, 18),
-        &format!(
-            "{}: {}",
-            tr(lang, "Sharing", "共有"),
-            f.share_mode.label(lang)
-        ),
+        &value_label(lang, "Sharing", "共有", f.share_mode.label(lang)),
     );
     ctx.text(
         share_x + 2,
@@ -3181,33 +2856,35 @@ fn friends(ctx: &mut Ctx) {
     );
     let gl_y = mode_y + 42;
     let gl_w = (share_w * 3 / 5).max(24);
-    ctx.btn(
+    ctx.tr_btn(
         WidgetId::FriendsGenerateGuestLink,
         lr(share_x, gl_y, gl_w, 18),
-        tr(lang, "Gen 128-bit Guest Link", "ゲストリンク生成"),
+        "Gen 128-bit Guest Link",
+        "ゲストリンク生成",
     );
-    ctx.btn(
+    ctx.tr_btn(
         WidgetId::FriendsCopyGuestLink,
         lr(share_x + gl_w + 4, gl_y, (share_w - gl_w - 4).max(24), 18),
-        tr(lang, "Copy Link", "リンクをコピー"),
+        "Copy Link",
+        "リンクをコピー",
     );
-    let link_y = gl_y + 22;
+    let link_cells = ((share_w - 8) / 8).max(4) as usize;
     match (&f.guest_link, &f.status) {
         (Some(link), _) => ctx.hud_text(
             share_x + 4,
-            link_y,
+            gl_y + 22,
             1,
             pal::TEXT,
             &friend_id_short(link),
-            ((share_w - 8) / 8).max(4) as usize,
+            link_cells,
         ),
         (None, Some(status)) => ctx.hud_text(
             share_x + 4,
-            link_y,
+            gl_y + 22,
             1,
             pal::TEXT_DIM,
             status,
-            ((share_w - 8) / 8).max(4) as usize,
+            link_cells,
         ),
         (None, None) => {}
     }
@@ -3215,28 +2892,21 @@ fn friends(ctx: &mut Ctx) {
     // --- Legacy invite-code block --------------------------------------
     // Wide: bottom of the right column. Narrow: above the footer, only
     // when the friends list still gets its minimum height.
-    let inv_x = if wide { rx } else { lx };
     if wide || want_invite {
+        let inv_x = if wide { rx } else { lx };
         let inv_top = invite_top;
-        ctx.text(
-            inv_x + 2,
-            inv_top,
-            1,
-            pal::ACCENT,
-            tr(lang, "Invite Codes", "招待コード"),
-        );
+        ctx.section(inv_x + 2, inv_top, tr(lang, "Invite Codes", "招待コード"));
         let code = ctx.state.invite_display();
         ctx.text(inv_x + 4, inv_top + 12, 1, pal::TEXT, &code);
         let by = inv_top + 24;
         let bw3 = ((col_w - 12) / 3).clamp(0, 90);
-        let mut bx = inv_x;
-        for (id, label) in [
+        let buttons = [
             (WidgetId::FriendsGenerate, tr(lang, "Generate", "生成")),
             (WidgetId::FriendsCopy, tr(lang, "Copy", "コピー")),
             (WidgetId::FriendsRevoke, tr(lang, "Revoke", "無効化")),
-        ] {
-            ctx.btn(id, lr(bx, by, bw3, 16), label);
-            bx += bw3 + 6;
+        ];
+        for (i, (id, label)) in buttons.into_iter().enumerate() {
+            ctx.btn(id, lr(inv_x + i as i32 * (bw3 + 6), by, bw3, 16), label);
         }
         let join_btn_w = 50.min(col_w / 4).max(24);
         let field_w = (col_w - join_btn_w - 6).max(24);
@@ -3247,11 +2917,7 @@ fn friends(ctx: &mut Ctx) {
             ctx.state.join_field_active(),
             "MEGU-XXXX-XXXX",
         );
-        ctx.btn(
-            WidgetId::FriendsJoin,
-            lr(inv_x + field_w + 6, by + 20, join_btn_w, 18),
-            tr(lang, "Join", "参加"),
-        );
+        ctx.tr_btn(WidgetId::FriendsJoin, lr(inv_x + field_w + 6, by + 20, join_btn_w, 18), "Join", "参加");
         if ctx.state.join_error {
             ctx.hud_text(
                 inv_x + 4,
@@ -3270,23 +2936,12 @@ fn friends(ctx: &mut Ctx) {
 
     // --- Friends allowlist (left column, absorbs remaining height) -----
     let list_bottom = if wide { content_bottom } else { share_top - 4 };
-    ctx.text(
-        lx + 2,
-        list_top,
-        1,
-        pal::ACCENT,
-        tr(lang, "Friends", "フレンド"),
-    );
+    ctx.section(lx + 2, list_top, tr(lang, "Friends", "フレンド"));
     let panel_top = list_top + 10;
     let panel_h = (list_bottom - panel_top).max(0);
     ctx.panel(lx, panel_top, col_w, panel_h);
     let row_h = 20;
-    let body_h = (panel_h - 6).max(0);
-    let mut visible = (body_h / row_h) as usize;
-    if f.friends.len() > visible {
-        visible = ((body_h - 18) / row_h).max(0) as usize;
-    }
-    let scroll = f.scroll.min(f.friends.len().saturating_sub(visible));
+    let (visible, scroll) = list_window((panel_h - 6).max(0), row_h, f.friends.len(), f.scroll);
     if f.friends.is_empty() && panel_h >= 22 {
         ctx.ctext(
             lx + col_w / 2,
@@ -3309,22 +2964,13 @@ fn friends(ctx: &mut Ctx) {
     }
     let py = panel_top + 4 + visible as i32 * row_h;
     if f.friends.len() > visible && col_w >= 176 && py + 16 <= list_bottom {
-        ctx.btn(
+        ctx.pager(
+            lx,
+            col_w,
+            py,
             WidgetId::FriendsListUp,
-            lr(lx + 4, py, 60, 16),
-            tr(lang, "Up", "上"),
-        );
-        ctx.ctext(
-            lx + col_w / 2,
-            py + 4,
-            1,
-            pal::TEXT_DIM,
-            &format!("{}-{}", scroll + 1, (scroll + visible).min(f.friends.len())),
-        );
-        ctx.btn(
             WidgetId::FriendsListDown,
-            lr(lx + col_w - 64, py, 60, 16),
-            tr(lang, "Down", "下"),
+            (scroll + 1, (scroll + visible).min(f.friends.len())),
         );
     }
 
@@ -3334,12 +2980,7 @@ fn friends(ctx: &mut Ctx) {
         ctx.hud_ctext(cx, ctx.h - 37, 1, pal::WARNING, status, 56);
     }
     let bw = 90.min(ctx.w - 8).max(24);
-    ctx.button_unchecked(
-        WidgetId::FriendsBack,
-        lr(cx - bw / 2, ctx.h - 28, bw, 20),
-        tr(lang, "Back", "戻る"),
-        true,
-    );
+    ctx.tr_button_unchecked(WidgetId::FriendsBack, lr(cx - bw / 2, ctx.h - 28, bw, 20), "Back", "戻る");
 }
 
 // ---------------------------------------------------------------------------
@@ -3455,22 +3096,10 @@ fn mod_sync(ctx: &mut Ctx) {
     // off-screen on short windows (the list panel above is static).
     let missing = !ctx.state.missing_mod_deps.is_empty();
     let by = 214.min(ctx.h - 26 - if missing { 28 } else { 0 }).max(44);
-    ctx.btn(
-        WidgetId::ModSyncAccept,
-        lr(cx - 150, by, 140, 20),
-        tr(lang, "Accept & Install", "承認してインストール"),
-    );
-    ctx.btn(
-        WidgetId::ModSyncDecline,
-        lr(cx + 10, by, 140, 20),
-        tr(lang, "Decline", "拒否"),
-    );
+    ctx.tr_btn(WidgetId::ModSyncAccept, lr(cx - 150, by, 140, 20), "Accept & Install", "承認してインストール");
+    ctx.tr_btn(WidgetId::ModSyncDecline, lr(cx + 10, by, 140, 20), "Decline", "拒否");
     if missing {
-        ctx.btn(
-            WidgetId::ModSyncDownloadMissing,
-            lr(cx - 120, by + 28, 240, 20),
-            tr(lang, "Get Missing (Modrinth)", "不足ModをModrinthから取得"),
-        );
+        ctx.tr_btn(WidgetId::ModSyncDownloadMissing, lr(cx - 120, by + 28, 240, 20), "Get Missing (Modrinth)", "不足ModをModrinthから取得");
     }
 }
 
@@ -3516,8 +3145,8 @@ fn mod_sync_prompt(ctx: &mut Ctx) {
         ctx.fill(x, y, w * i32::from(percent.min(100)) / 100, 6, pal::ACCENT);
     }
     let by = ctx.h - 44;
-    ctx.btn(WidgetId::ModSyncPromptConfirm, lr(cx - 170, by, 220, 22), tr(lang, "Download & Reconnect", "ダウンロードして再接続"));
-    ctx.btn(WidgetId::ModSyncPromptCancel, lr(cx + 58, by, 112, 22), tr(lang, "Cancel", "キャンセル"));
+    ctx.tr_btn(WidgetId::ModSyncPromptConfirm, lr(cx - 170, by, 220, 22), "Download & Reconnect", "ダウンロードして再接続");
+    ctx.tr_btn(WidgetId::ModSyncPromptCancel, lr(cx + 58, by, 112, 22), "Cancel", "キャンセル");
 }
 
 // ---------------------------------------------------------------------------
@@ -3621,6 +3250,279 @@ fn player_list_geometry(
     }
 }
 
+/// Shared lower-screen HUD stack geometry: the centered actionbar band,
+/// the right-aligned subtitle block, the crafting-conflict switcher, the
+/// chat scrollback window, and every column/edge they lift around.
+///
+/// The painter draws exactly these rows and [`hud_occupied_rects_into`]
+/// adds exactly these rectangles, so overlay placement, hit regions, and
+/// the occupancy mirror cannot drift apart.
+struct HudStackGeom {
+    w: i32,
+    h: i32,
+    cx: i32,
+    hy: i32,
+    hotbar_top: i32,
+    hotbar_block: UiRect,
+    vl: std::ops::Range<i32>,
+    vr: std::ops::Range<i32>,
+    vtop_l: i32,
+    vtop_r: i32,
+    vitals_right_x: i32,
+    vitals_bottom: i32,
+    /// Actionbar text and its centered span.
+    abar_text: Option<String>,
+    abar: Option<std::ops::Range<i32>>,
+    /// Actionbar occupancy rectangle (`None` while the text is empty).
+    abar_rect: Option<UiRect>,
+    /// Drawn subtitle rows as `(label, y, fill_left)`.
+    subtitle_rows: Vec<(String, i32, i32)>,
+    stack_left: i32,
+    stack_bottom: i32,
+    /// Crafting-conflict switcher: `(label, rect)`.
+    conflict: Option<(String, UiRect)>,
+    /// Drawn chat rows as `(text, y, width)`.
+    chat_rows: Vec<(String, i32, i32)>,
+    /// Scroll-lock badge as `(label, y, width)`.
+    chat_badge: Option<(String, i32, i32)>,
+    chat_top: i32,
+    chat_right: i32,
+}
+
+impl HudStackGeom {
+    /// `scrolled_fallback` is the scroll-lock badge text when the chat has
+    /// no unread counter; the painter and the mirror historically differ
+    /// there, so the caller supplies it verbatim.
+    fn new(
+        state: &UiState,
+        w: i32,
+        h: i32,
+        hotbar: HotbarLayout,
+        show_vitals: bool,
+        scrolled_fallback: &str,
+    ) -> Self {
+        let hud = &state.hud;
+        let qol = &state.settings.qol;
+        let lang = state.lang();
+        let cx = w / 2;
+        let hy = hotbar.y0();
+        let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
+        let vitals = HudVitalsGeometry::new(hud, hotbar);
+        // Empty ranges while the rows are gated off — the lift/clip math
+        // below then no-ops exactly like the invisible chrome it models.
+        let (vl, vr) = if show_vitals {
+            vitals.column_ranges()
+        } else {
+            (0..0, 0..0)
+        };
+        let vtop_l = vitals.left_top();
+        let vtop_r = vitals.right_top();
+        let vitals_bottom = vitals.bottom();
+
+        // Actionbar: one centered line in the band directly above the vitals.
+        let (abar_text, abar, abar_rect) = if hud.actionbar.is_empty() {
+            (None, None, None)
+        } else {
+            let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
+            let aw = text_width(&text, 1) as i32;
+            let rect = (aw > 0).then(|| lr(cx - aw / 2, hy - 44, aw, 8));
+            (Some(text), Some(cx - aw / 2..cx + aw / 2), rect)
+        };
+        let abar_band = (hy - 44)..(hy - 36);
+
+        // Directional accessibility subtitles (opt-in): up to 4 compact
+        // right-aligned rows stacked above the hotbar — "< sound" left,
+        // "sound >" right, "v sound" behind, no marker when centered.
+        // The stack lifts above the right vitals column when a row reaches
+        // it, and again above the actionbar when it shares that band; rows
+        // still outside the viewport are dropped, never drawn off-screen.
+        let mut subtitle_rows: Vec<(String, i32, i32)> = Vec::new();
+        let mut stack_left = w;
+        let mut stack_bottom = hotbar_top;
+        if qol.show_subtitles && !hud.subtitles.is_empty() {
+            let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
+            let build_rows = |base: i32| -> Vec<(String, i32)> {
+                shown
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sub)| {
+                        let label = match sub.direction {
+                            SubtitleDirection::Left => format!("< {}", sub.label),
+                            SubtitleDirection::Center => sub.label.clone(),
+                            SubtitleDirection::Right => format!("{} >", sub.label),
+                            SubtitleDirection::Behind => format!("v {}", sub.label),
+                        };
+                        // Newest row at the bottom.
+                        let y = base - (shown.len() - i) as i32 * 10;
+                        let cells = ((w - 14) / 8).max(1) as usize;
+                        (hud_str(&label, cells), y)
+                    })
+                    .collect()
+            };
+            let mut sub_base = hotbar_top;
+            let mut rows = build_rows(sub_base);
+            // A row whose left edge reaches into either vitals column
+            // (hearts/armor left, hunger/air right) lifts the whole stack
+            // above that column — the label is never cut by an icon.
+            for (i, (label, y)) in rows.iter().enumerate() {
+                let rw = text_width(label, 1) as i32 + 6;
+                if w - 4 - rw < vr.end && *y < vitals_bottom && *y + 10 > vtop_r {
+                    sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
+                }
+                if w - 4 - rw < vl.end && *y < vitals_bottom && *y + 10 > vtop_l {
+                    sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
+                }
+            }
+            rows = build_rows(sub_base);
+            if abar.is_some()
+                && rows.iter().any(|(label, y)| {
+                    let rw = text_width(label, 1) as i32 + 6;
+                    *y < abar_band.end
+                        && *y + 10 > abar_band.start
+                        && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
+                })
+            {
+                sub_base = (hy - 46).min(sub_base);
+                rows = build_rows(sub_base);
+            }
+            // Drop rows that still cannot fit inside the viewport rather
+            // than emitting off-screen commands.
+            for (label, y) in rows.into_iter().filter(|(_, y)| *y >= 0 && *y + 10 <= h) {
+                let left = w - 4 - (text_width(&label, 1) as i32 + 6);
+                stack_left = stack_left.min(left);
+                subtitle_rows.push((label, y, left));
+            }
+            // Anything else bottom-right stacks above the subtitle block.
+            stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
+        }
+
+        // Crafting-conflict switcher: exactly one compact `< k/N >` cycle
+        // button while the game reports two or more candidate recipes —
+        // right-aligned above the subtitle stack, lifted clear of the right
+        // vitals column when it reaches it. `total_candidates <= 1` emits
+        // no commands and no region at all.
+        let mut conflict = None;
+        if hud.crafting_conflict.is_active() {
+            let label = format!(
+                "< {}/{} >",
+                hud.crafting_conflict.selected() + 1,
+                hud.crafting_conflict.total_candidates
+            );
+            let bw = (text_width(&label, 1) as i32 + 8).min(w - 8);
+            let bx = w - 4 - bw;
+            let mut bottom = stack_bottom - 2;
+            if bx < vl.end {
+                bottom = bottom.min(vtop_l - 2);
+            }
+            if bx < vr.end {
+                bottom = bottom.min(vtop_r - 2);
+            }
+            let by = (bottom - 14).max(2);
+            stack_left = stack_left.min(bx);
+            stack_bottom = by - 2;
+            conflict = Some((label, lr(bx, by, bw, 14)));
+        }
+
+        // Chat scrollback, bottom-left. Lines clip to the viewport, to the
+        // left vitals column, to the actionbar, and to whatever subtitle row
+        // shares their band. While the scroll-lock is engaged the window
+        // shifts `scroll_offset` lines up and the freed bottom slot carries
+        // the "+N new" badge instead of the newest line.
+        let scroll_locked = qol.chat_scroll_lock && state.chat_scroll.scrolled_up;
+        let scroll_off = if scroll_locked {
+            state.chat_scroll.scroll_offset
+        } else {
+            0
+        };
+        let chat_take = if scroll_locked { 5 } else { 6 };
+        let mut chat_top = i32::MAX;
+        let mut chat_right = 0i32;
+        let mut chat_rows: Vec<(String, i32, i32)> = Vec::new();
+        for (k, line) in hud
+            .chat_lines
+            .iter()
+            .rev()
+            .skip(scroll_off)
+            .take(chat_take)
+            .enumerate()
+        {
+            let i = k + usize::from(scroll_locked);
+            let y = hy - 12 - i as i32 * 10;
+            let (band_top, band_bot) = (y - 1, y + 9);
+            let mut cells = ((w - 14) / 8).max(0) as usize;
+            if band_top < vitals_bottom && band_bot > vtop_l {
+                cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
+            }
+            if let Some(ab) = &abar {
+                if band_top < abar_band.end && band_bot > abar_band.start {
+                    cells = cells.min(((ab.start - 10) / 8).max(0) as usize);
+                }
+            }
+            for (_, sy, sx) in &subtitle_rows {
+                if band_top < *sy + 10 && band_bot > *sy {
+                    cells = cells.min(((*sx - 10) / 8).max(0) as usize);
+                }
+            }
+            if cells == 0 {
+                continue;
+            }
+            let text = hud_str(line, cells);
+            let tw = text_width(&text, 1) as i32;
+            chat_top = chat_top.min(y - 1);
+            chat_right = chat_right.max(8 + tw);
+            chat_rows.push((text, y, tw));
+        }
+        // Scroll-lock badge in the freed bottom slot.
+        let mut chat_badge = None;
+        if scroll_locked && hy - 12 >= 0 {
+            let badge = state
+                .chat_scroll
+                .unread_label(lang)
+                .unwrap_or_else(|| scrolled_fallback.to_string());
+            let bw = text_width(&badge, 1) as i32 + 6;
+            chat_top = chat_top.min(hy - 13);
+            chat_right = chat_right.max(8 + bw);
+            chat_badge = Some((badge, hy - 12, bw));
+        }
+
+        Self {
+            w,
+            h,
+            cx,
+            hy,
+            hotbar_top,
+            hotbar_block: hotbar.occupied_rect(),
+            vl,
+            vr,
+            vtop_l,
+            vtop_r,
+            vitals_right_x: vitals.right_x,
+            vitals_bottom,
+            abar_text,
+            abar,
+            abar_rect,
+            subtitle_rows,
+            stack_left,
+            stack_bottom,
+            conflict,
+            chat_rows,
+            chat_badge,
+            chat_top,
+            chat_right,
+        }
+    }
+}
+
+/// Bottom edge of the bossbar stack (empty stack => just the top margin).
+fn hud_bossbar_bottom(hud: &HudState) -> i32 {
+    let boss_count = hud.bossbars.len().min(3) as i32;
+    if boss_count == 0 {
+        4
+    } else {
+        16 * boss_count + 4
+    }
+}
+
 fn hud(ctx: &mut Ctx) {
     let hud: &HudState = &ctx.state.hud;
     if hud.hud_hidden { return; }
@@ -3629,33 +3531,8 @@ fn hud(ctx: &mut Ctx) {
     let (w, h) = (ctx.w, ctx.h);
     let cx = w / 2;
 
-    let overlay = hud.screen_overlay;
-    for (alpha,color) in [(overlay.hurt_alpha, UiColor::rgb(180,0,0)), (overlay.fire_alpha, UiColor::rgb(255,90,0)), (overlay.underwater_alpha, UiColor::rgb(20,70,180)), (overlay.portal_alpha, UiColor::rgb(110,20,150)), (overlay.freezing_alpha, UiColor::rgb(120,210,255)), (overlay.vignette_alpha, UiColor::rgb(0,0,0))] {
-        let a=(alpha.clamp(0.0,1.0)*100.0) as u8;
-        if a>0 { ctx.fill(0,0,w,h,UiColor::rgba(color.r,color.g,color.b,a)); }
-    }
-    if overlay.pumpkin_blur { ctx.fill(0,0,w,h,UiColor::rgba(35,20,0,28)); }
-    for (i,effect) in hud.status_effects.iter().enumerate() {
-        let x=w-104; let y=8+i as i32*18;
-        let effect_key = format!(
-            "{}{}",
-            hud_sprite_ids::MOB_EFFECT_PREFIX,
-            effect.name.to_ascii_lowercase().replace(' ', "_")
-        );
-        if !ctx.hud_sprite(&effect_key, x, y, 18, 18) {
-            let color=if effect.beneficial {UiColor::rgb(60,150,70)} else {UiColor::rgb(160,55,55)};
-            ctx.fill(x,y,16,16,color);
-            ctx.text(x+3,y+4,1,pal::TEXT,&effect.effect_id.rem_euclid(10).to_string());
-        }
-        let level=match effect.amplifier {0=>"",1=>" II",2=>" III",3=>" IV",n=>if n>=4 {" V"} else {""}};
-        let label=if effect.duration_ticks == u32::MAX {
-            format!("{}{level} **:**", effect.name)
-        } else {
-            let secs=effect.duration_ticks/20;
-            format!("{}{level} {:02}:{:02}",effect.name,secs/60,secs%60)
-        };
-        ctx.text(x+19,y+4,1,pal::TEXT,&label);
-    }
+    hud_screen_overlay(ctx, hud, w, h);
+    hud_status_effects(ctx, hud, w);
 
     // Opt-in Compact Debug HUD lines — empty while disabled, so the disabled path
     // emits exactly zero commands.
@@ -3665,54 +3542,7 @@ fn hud(ctx: &mut Ctx) {
         Vec::new()
     };
 
-    // Bossbars, stacked from the top (host names: sanitized + clipped).
-    // Vanilla colors drive both the textured `boss_bar/*` sprites (when the
-    // host atlas binds them) and the procedural fallback tint.
-    let boss_count = hud.bossbars.len().min(3) as i32;
-    for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
-        let y = 6 + i as i32 * 16;
-        let bw = (w - 40).clamp(8, 182);
-        let frac = frac.clamp(0.0, 1.0);
-        let color = hud.bossbar_colors.get(i).copied().unwrap_or_default();
-        ctx.hud_ctext(cx, y, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
-        let bar_x = cx - bw / 2;
-        let bg_key = format!("boss_bar/{}_background", color.name());
-        let fill_key = format!("boss_bar/{}_progress", color.name());
-        let textured = ctx.gui_atlas.and_then(|atlas| {
-            Some((atlas.named_sprite(&bg_key)?, atlas.named_sprite(&fill_key)?))
-        });
-        if let Some((bg, fill)) = textured {
-            ctx.hud_sprite_entry(bg, bar_x, y + 9, bw, 5);
-            let src_w = (fill.width as f32 * frac).round() as u32;
-            let dst_w = ((bw as f32) * frac).round() as i32;
-            if src_w > 0 && dst_w > 0 {
-                ctx.hud_sprite_entry(fill.subrect(0, 0, src_w, fill.height), bar_x, y + 9, dst_w, 5);
-            }
-        } else {
-            let tint = match color {
-                crate::state::BossBarColor::Pink => UiColor::rgb(226, 76, 156),
-                crate::state::BossBarColor::Blue => UiColor::rgb(74, 122, 226),
-                crate::state::BossBarColor::Red => UiColor::rgb(210, 62, 62),
-                crate::state::BossBarColor::Green => UiColor::rgb(86, 184, 82),
-                crate::state::BossBarColor::Yellow => UiColor::rgb(232, 190, 62),
-                crate::state::BossBarColor::Purple => UiColor::rgb(170, 60, 200),
-                crate::state::BossBarColor::White => UiColor::rgb(226, 226, 226),
-            };
-            ctx.progress(
-                lr(bar_x, y + 9, bw, 5),
-                frac,
-                tint,
-                UiColor::rgb(30, 20, 34),
-                pal::BUTTON_BORDER,
-            );
-        }
-    }
-    // Bottom edge of the bossbar stack (empty stack => just the top margin).
-    let boss_bottom = if boss_count == 0 {
-        4
-    } else {
-        16 * boss_count + 4
-    };
+    let boss_bottom = hud_bossbars(ctx, hud, cx, w);
 
     // Game-mode draw gates: vanilla creative (1) and spectator (3) hide
     // the hearts/armor/hunger/air/XP rows; spectator also drops the
@@ -3720,498 +3550,33 @@ fn hud(ctx: &mut Ctx) {
     let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
     let show_hotbar = hud.game_mode != 3;
 
-    // Crosshair.
-    if hud.game_mode != 3 {
-        if !ctx.hud_sprite(hud_sprite_ids::CROSSHAIR, cx - 7, h / 2 - 7, 15, 15) {
-            let cc = UiColor::rgba(230, 230, 230, 190);
-            ctx.fill(cx - 5, h / 2, 11, 1, cc);
-            ctx.fill(cx, h / 2 - 5, 1, 11, cc);
-        }
-        if hud.attack_cooldown < 1.0 { ctx.progress(lr(cx-45,h/2+8,90,4),hud.attack_cooldown.clamp(0.0,1.0),pal::TEXT,UiColor::rgb(35,35,35),pal::BUTTON_BORDER); }
-    }
+    hud_crosshair(ctx, hud, cx, h);
 
     // Hotbar: offhand + 9 slots, all positioned from the shared logical
     // geometry consumed by hit/overlay reservations and downstream renderers.
     let hotbar_layout = HotbarLayout::new(w, h);
-    let hotbar_panel = hotbar_layout.panel_rect();
-    let hotbar_block = hotbar_layout.occupied_rect();
-    let hx = hotbar_block.x;
-    let hy = hotbar_layout.y0();
     if show_hotbar {
-        let _hotbar_skinned = ctx.hud_sprite(
-            hud_sprite_ids::HOTBAR,
-            hotbar_panel.x,
-            hotbar_panel.y,
-            hotbar_panel.w as i32,
-            hotbar_panel.h as i32,
-        );
-        let offhand = hotbar_layout.offhand_rect();
-        if let Some(item) = &hud.offhand {
-            slot_cell(ctx, offhand.x, offhand.y, Some(item), false);
-            if let Some(frac) = hud.item_cooldowns.get(item) {
-                slot_cooldown_wipe(ctx, offhand.x, offhand.y, *frac);
-            }
-        }
-        for (i, item) in hud.hotbar.iter().enumerate() {
-            let slot = hotbar_layout.slot_rect(i);
-            slot_cell(ctx, slot.x, slot.y, item.as_ref(), i == hud.selected_slot);
-            if let Some(frac) = item.as_ref().and_then(|n| hud.item_cooldowns.get(n)) {
-                slot_cooldown_wipe(ctx, slot.x, slot.y, *frac);
-            }
-        }
+        hud_hotbar(ctx, hud, hotbar_layout);
     }
 
-    // Vitals: hearts left, hunger right, above the hotbar.
     let vitals = HudVitalsGeometry::new(hud, hotbar_layout);
-    let rx = vitals.right_x;
     if show_vitals {
-        // Dynamic max-health rows: each vanilla row carries at most twenty
-        // half-heart units and additional rows stack upward. Status effects
-        // and hardcore swap only the fill sprites; the backing container row
-        // remains shared exactly like vanilla.
-        let max_health = normalized_max_health(hud.max_health);
-        let mut style = if hud.hardcore {
-            HeartStyle::Hardcore
-        } else {
-            hud.heart_style
-        };
-        if style == HeartStyle::Normal {
-            if hud
-                .status_effects
-                .iter()
-                .any(|effect| effect.name.to_ascii_lowercase().contains("wither"))
-            {
-                style = HeartStyle::Withered;
-            } else if hud
-                .status_effects
-                .iter()
-                .any(|effect| effect.name.to_ascii_lowercase().contains("poison"))
-            {
-                style = HeartStyle::Poisoned;
-            } else if hud.screen_overlay.freezing_alpha > 0.0 {
-                style = HeartStyle::Frozen;
-            }
-        }
-        let (heart_full, heart_half) = match style {
-            HeartStyle::Normal => (hud_sprite_ids::HEART_FULL, hud_sprite_ids::HEART_HALF),
-            HeartStyle::Poisoned => ("hud/heart/poisoned_full", "hud/heart/poisoned_half"),
-            HeartStyle::Withered => ("hud/heart/withered_full", "hud/heart/withered_half"),
-            HeartStyle::Frozen => ("hud/heart/frozen_full", "hud/heart/frozen_half"),
-            HeartStyle::Hardcore => ("hud/heart/hardcore_full", "hud/heart/hardcore_half"),
-        };
-        let heart_color = match style {
-            HeartStyle::Normal | HeartStyle::Hardcore => pal::HEALTH,
-            HeartStyle::Poisoned => UiColor::rgb(92, 150, 62),
-            HeartStyle::Withered => UiColor::rgb(52, 48, 48),
-            HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
-        };
-        for row in 0..vitals.health_rows {
-            let base = row as f32 * 20.0;
-            let row_value = (hud.health - base).clamp(0.0, 20.0);
-            let row_max = (max_health - base).clamp(0.0, 20.0).max(1.0);
-            sprite_icon_row(
-                ctx,
-                vitals.health_row(row),
-                row_value,
-                row_max,
-                heart_color,
-                hud_sprite_ids::HEART_CONTAINER,
-                heart_full,
-                heart_half,
-            );
-        }
-        sprite_icon_row(
-            ctx,
-            vitals.armor_row(),
-            hud.armor as f32,
-            20.0,
-            pal::ARMOR,
-            hud_sprite_ids::ARMOR_EMPTY,
-            hud_sprite_ids::ARMOR_FULL,
-            hud_sprite_ids::ARMOR_HALF,
-        );
-        if let Some(absorption_row) = vitals.absorption_row() {
-            sprite_icon_row(
-                ctx,
-                absorption_row,
-                hud.absorption,
-                20.0,
-                pal::ABSORPTION,
-                hud_sprite_ids::HEART_CONTAINER,
-                "hud/heart/absorbing_full",
-                "hud/heart/absorbing_half",
-            );
-        }
-        sprite_icon_row(
-            ctx,
-            vitals.hunger_row(),
-            hud.hunger as f32,
-            20.0,
-            pal::HUNGER,
-            hud_sprite_ids::FOOD_EMPTY,
-            hud_sprite_ids::FOOD_FULL,
-            hud_sprite_ids::FOOD_HALF,
-        );
-        if let Some((health, max)) = hud.mount_health {
-            let max_hp = max.max(1.0);
-            for row in 0..vitals.mount_rows {
-                let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
-                let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
-                sprite_icon_row(
-                    ctx,
-                    vitals.mount_row(row),
-                    row_hp,
-                    row_max,
-                    pal::HEALTH,
-                    hud_sprite_ids::HEART_CONTAINER,
-                    "hud/heart/vehicle_full",
-                    "hud/heart/vehicle_half",
-                );
-            }
-        }
-        if let Some(air_row) = vitals.air_row() {
-            // Vanilla air bubbles are discrete sprites rather than empty
-            // containers; one bubble is thirty supply units.
-            if !air_bubble_sprites(ctx, air_row, hud.air) {
-                procedural_icon_row(ctx, air_row, hud.air as f32 / 15.0, 20.0, pal::AIR);
-            }
-        }
-
-        // XP bar + level. The textured bar crops its fill in source
-        // pixels; the procedural bar remains the clean fallback.
-        let xp_frac = hud.xp_progress.clamp(0.0, 1.0);
-        let xp_entries = ctx.gui_atlas.and_then(|atlas| {
-            Some((
-                atlas.named_sprite(hud_sprite_ids::EXPERIENCE_BAR_BACKGROUND)?,
-                atlas.named_sprite(hud_sprite_ids::EXPERIENCE_BAR_PROGRESS)?,
-            ))
-        });
-        if let Some((bg, fill)) = xp_entries {
-            ctx.hud_sprite_entry(bg, cx - 91, hy - 5, 182, 5);
-            let src_w = (fill.width as f32 * xp_frac).round() as u32;
-            let dst_w = (182.0 * xp_frac).round() as i32;
-            if src_w > 0 && dst_w > 0 {
-                ctx.hud_sprite_entry(fill.subrect(0, 0, src_w, fill.height), cx - 91, hy - 5, dst_w, 5);
-            }
-        } else {
-            ctx.progress(
-                lr(cx - 91, hy - 4, 182, 3),
-                xp_frac,
-                pal::XP,
-                UiColor::rgb(20, 30, 14),
-                pal::BUTTON_BORDER,
-            );
-        }
-        if let Some(charge)=hud.mount_jump_charge { ctx.progress(lr(cx-91,hy-4,182,3),charge.clamp(0.0,1.0),pal::XP,UiColor::rgb(20,30,14),pal::BUTTON_BORDER); }
-        if hud.xp_level > 0 {
-            ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
-        }
+        hud_vitals(ctx, hud, vitals, hotbar_layout, cx);
     }
 
-    // ------------------------------------------------------------------
-    // Lower-screen stacking. Everything bottom-anchored shares one
-    // collision model so overlays can never overlap:
-    //   * the vitals icon columns flank the hotbar (always drawn),
-    //   * the actionbar sits centered at a fixed band above them,
-    //   * subtitles stack upward from the hotbar on the right, and
-    //   * the crafting-conflict button and the Compact Debug HUD box stack above
-    //     whatever came before (or drop lines that cannot fit).
-    // ------------------------------------------------------------------
-    let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
-    // Hearts/armor/(absorption) column left, hunger/(air) column right —
-    // empty ranges while creative/spectator keeps the rows undrawn so no
-    // overlay ever lifts for invisible chrome.
-    let (vl, vr) = if show_vitals {
-        vitals.column_ranges()
-    } else {
-        (0..0, 0..0)
-    };
-    let vtop_l = vitals.left_top();
-    let vtop_r = vitals.right_top();
-    let vitals_bottom = vitals.bottom();
-
-    // Actionbar: one centered line in the band directly above the vitals.
-    let abar = if hud.actionbar.is_empty() {
-        None
-    } else {
-        let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
-        let aw = text_width(&text, 1) as i32;
-        ctx.ctext(cx, hy - 44, 1, pal::TEXT, &text);
-        Some(cx - aw / 2..cx + aw / 2)
-    };
-    // Band the actionbar text occupies (used to clip colliding rows).
-    let abar_band = (hy - 44)..(hy - 36);
-    // Drawn subtitle rows as `(fill_left, y)` — chat clips around them.
-    let mut subtitle_rows: Vec<(i32, i32)> = Vec::new();
-    // Leftmost x of the right-hand stack (subtitles, conflict button):
-    // corner boxes reaching into it must stay above `stack_bottom`.
-    let mut stack_left = w;
-
-    // Directional accessibility subtitles (opt-in): up to 4 compact
-    // right-aligned rows stacked above the hotbar — "< sound" left,
-    // "sound >" right, "v sound" behind, no marker when centered.
-    // The stack lifts above the right vitals column when a row reaches
-    // it, and again above the actionbar when it shares that band; rows
-    // still outside the viewport are dropped, never drawn off-screen.
-    let mut stack_bottom = hotbar_top;
-    if qol.show_subtitles && !hud.subtitles.is_empty() {
-        let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
-        let build_rows = |base: i32| -> Vec<(String, i32)> {
-            shown
-                .iter()
-                .enumerate()
-                .map(|(i, sub)| {
-                    let label = match sub.direction {
-                        SubtitleDirection::Left => format!("< {}", sub.label),
-                        SubtitleDirection::Center => sub.label.clone(),
-                        SubtitleDirection::Right => format!("{} >", sub.label),
-                        SubtitleDirection::Behind => format!("v {}", sub.label),
-                    };
-                    // Newest row at the bottom.
-                    let y = base - (shown.len() - i) as i32 * 10;
-                    let cells = ((w - 14) / 8).max(1) as usize;
-                    (hud_str(&label, cells), y)
-                })
-                .collect()
-        };
-        let mut sub_base = hotbar_top;
-        let mut rows = build_rows(sub_base);
-        // A row whose left edge reaches into either vitals column
-        // (hearts/armor left, hunger/air right) lifts the whole stack
-        // above that column — the label is never cut by an icon.
-        for (i, (label, y)) in rows.iter().enumerate() {
-            let rw = text_width(label, 1) as i32 + 6;
-            if w - 4 - rw < vr.end && *y < vitals_bottom && *y + 10 > vtop_r {
-                sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
-            }
-            if w - 4 - rw < vl.end && *y < vitals_bottom && *y + 10 > vtop_l {
-                sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
-            }
-        }
-        rows = build_rows(sub_base);
-        if abar.is_some()
-            && rows.iter().any(|(label, y)| {
-                let rw = text_width(label, 1) as i32 + 6;
-                *y < abar_band.end
-                    && *y + 10 > abar_band.start
-                    && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
-            })
-        {
-            sub_base = (hy - 46).min(sub_base);
-            rows = build_rows(sub_base);
-        }
-        // Drop rows that still cannot fit inside the viewport rather
-        // than emitting off-screen commands.
-        let rows: Vec<(String, i32)> = rows
-            .into_iter()
-            .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
-            .collect();
-        for (label, y) in &rows {
-            let rw = text_width(label, 1) as i32 + 6;
-            ctx.fill(w - 4 - rw, *y, rw, 10, UiColor::rgba(0, 0, 0, 110));
-            ctx.text(w - 4 - rw + 3, *y + 1, 1, pal::TEXT, label);
-        }
-        // Rows' x ranges for the chat clip below.
-        subtitle_rows = rows
-            .iter()
-            .map(|(label, y)| (w - 4 - (text_width(label, 1) as i32 + 6), *y))
-            .collect();
-        for (sx, _) in &subtitle_rows {
-            stack_left = stack_left.min(*sx);
-        }
-        // Anything else bottom-right stacks above the subtitle block.
-        stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
-    }
-
-    // Crafting-conflict switcher: exactly one compact `< k/N >` cycle
-    // button while the game reports two or more candidate recipes —
-    // right-aligned above the subtitle stack, lifted clear of the right
-    // vitals column when it reaches it. `total_candidates <= 1` emits
-    // no commands and no region at all.
-    if hud.crafting_conflict.is_active() {
-        let label = format!(
-            "< {}/{} >",
-            hud.crafting_conflict.selected() + 1,
-            hud.crafting_conflict.total_candidates
-        );
-        let bw = (text_width(&label, 1) as i32 + 8).min(w - 8);
-        let bx = w - 4 - bw;
-        let mut bottom = stack_bottom - 2;
-        if bx < vl.end {
-            bottom = bottom.min(vtop_l - 2);
-        }
-        if bx < vr.end {
-            bottom = bottom.min(vtop_r - 2);
-        }
-        let by = (bottom - 14).max(2);
-        ctx.btn(WidgetId::CraftConflictNext, lr(bx, by, bw, 14), &label);
-        stack_left = stack_left.min(bx);
-        stack_bottom = by - 2;
-    }
-
-    // Chat scrollback, bottom-left. Lines clip to the viewport, to the
-    // left vitals column, to the actionbar, and to whatever subtitle row
-    // shares their band. While the scroll-lock is engaged the window
-    // shifts `scroll_offset` lines up and the freed bottom slot carries
-    // the "+N new" badge instead of the newest line.
-    let scroll_locked = qol.chat_scroll_lock && ctx.state.chat_scroll.scrolled_up;
-    let scroll_off = if scroll_locked {
-        ctx.state.chat_scroll.scroll_offset
-    } else {
-        0
-    };
-    let chat_take = if scroll_locked { 5 } else { 6 };
-    let mut chat_top = i32::MAX;
-    let mut chat_right = 0i32;
-    for (k, line) in hud
-        .chat_lines
-        .iter()
-        .rev()
-        .skip(scroll_off)
-        .take(chat_take)
-        .enumerate()
-    {
-        let i = k + usize::from(scroll_locked);
-        let y = hy - 12 - i as i32 * 10;
-        let (band_top, band_bot) = (y - 1, y + 9);
-        let mut cells = ((w - 14) / 8).max(0) as usize;
-        if band_top < vitals_bottom && band_bot > vtop_l {
-            cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
-        }
-        if let Some(ab) = &abar {
-            if band_top < abar_band.end && band_bot > abar_band.start {
-                cells = cells.min(((ab.start - 10) / 8).max(0) as usize);
-            }
-        }
-        for (sx, sy) in &subtitle_rows {
-            if band_top < *sy + 10 && band_bot > *sy {
-                cells = cells.min(((*sx - 10) / 8).max(0) as usize);
-            }
-        }
-        if cells == 0 {
-            continue;
-        }
-        let text = hud_str(line, cells);
-        let tw = text_width(&text, 1) as i32;
-        ctx.fill(2, y - 1, tw + 6, 10, UiColor::rgba(0, 0, 0, 110));
-        ctx.text(4, y, 1, pal::TEXT, &text);
-        chat_top = chat_top.min(y - 1);
-        chat_right = chat_right.max(8 + tw);
-    }
-    // Scroll-lock badge in the freed bottom slot.
-    if scroll_locked && hy - 12 >= 0 {
-        let badge = ctx
-            .state
-            .chat_scroll
-            .unread_label(lang)
-            .unwrap_or_else(|| tr(lang, "scrolled", "保持中").to_string());
-        let bw = text_width(&badge, 1) as i32 + 6;
-        ctx.fill(2, hy - 13, bw + 2, 10, UiColor::rgba(0, 0, 0, 110));
-        ctx.text(4, hy - 12, 1, pal::WARNING, &badge);
-        chat_top = chat_top.min(hy - 13);
-        chat_right = chat_right.max(8 + bw);
-    }
-
-    // Chat/command input bar (open chat screen): a dark input strip at
-    // the bottom-left with a caret, plus the vanilla-style suggestion
-    // popup stacked above it listing `completions` with the applied
-    // candidate highlighted.
-    if hud.chat_input.open {
-        // Clamp bounds in safe order: at ultra-narrow logical widths the
-        // maximum can be below the preferred 80px minimum, and reversing
-        // those operands panics in `clamp`.
-        let max_w = (w - 8).max(16);
-        let min_w = 80.min(max_w);
-        let box_w = ((w * 3) / 5).clamp(min_w, max_w);
-        let box_y = h - 13;
-        ctx.fill(2, box_y, box_w, 11, UiColor::rgba(0, 0, 0, 160));
-        ctx.border(2, box_y, box_w, 11, pal::PANEL_BORDER);
-        let avail_px = (box_w - 8).max(0) as usize;
-        let full = hud_str(&hud.chat_input.text, crate::hud_widgets::MAX_CHAT_INPUT_CELLS);
-        let (text, caret_px) = chat_input_window(&full, hud.chat_input.cursor(), avail_px);
-        ctx.text(4, box_y + 2, 1, pal::TEXT, &text);
-        let caret_x = (4 + caret_px).min(2 + box_w - 3);
-        ctx.fill(caret_x, box_y + 2, 1, 7, pal::TEXT);
-        let rows = hud.chat_input.completions.len().min(10);
-        if rows > 0 {
-            let widest = hud
-                .chat_input
-                .completions
-                .iter()
-                .take(rows)
-                .map(|cand| crate::draw::text_width(&hud_str(cand, 40), 1) as i32)
-                .max()
-                .unwrap_or(0);
-            let pop_w = (widest + 8).min(w - 8);
-            let pop_h = rows as i32 * 10 + 2;
-            let pop_y = (box_y - 2 - pop_h).max(2);
-            let selected = hud.chat_input.selected_completion();
-            ctx.fill(4, pop_y, pop_w, pop_h, UiColor::rgba(8, 10, 14, 220));
-            ctx.border(4, pop_y, pop_w, pop_h, pal::PANEL_BORDER);
-            for (i, cand) in hud.chat_input.completions.iter().take(rows).enumerate() {
-                let ry = pop_y + 1 + i as i32 * 10;
-                if Some(i) == selected {
-                    ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
-                }
-                ctx.hud_text(
-                    7,
-                    ry + 1,
-                    1,
-                    pal::TEXT,
-                    cand,
-                    ((pop_w - 10) / 8).max(1) as usize,
-                );
-            }
-        }
-    }
-
-    // Player list overlay (hold-Tab): vanilla-style column-major rows
-    // below the bossbars, height-capped to the viewport with a "+N more"
-    // tail only when even the widest fitting column set cannot show all.
-    if hud.show_player_list {
-        let max_name_w = hud
-            .players
-            .iter()
-            .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
-            .max()
-            .unwrap_or(0);
-        let geo = player_list_geometry(hud.players.len(), max_name_w, w, h, boss_bottom);
-        let (px, py, pw, ph) = (geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
-        let name_cells = ((geo.col_w - 58) / 8).max(1) as usize;
-        ctx.panel(px, py, pw, ph);
-        ctx.ctext(
-            cx,
-            py + 4,
-            1,
-            pal::TEXT,
-            &format!(
-                "{} ({})",
-                tr(lang, "Players", "プレイヤー"),
-                hud.players.len()
-            ),
-        );
-        let rows_per_col = geo.rows_used.max(1);
-        for (i, (name, ping)) in hud.players.iter().take(geo.shown).enumerate() {
-            let col = i / rows_per_col;
-            let row = i % rows_per_col;
-            let x = px + 6 + col as i32 * (geo.col_w + 4);
-            let y = py + 14 + row as i32 * 11;
-            ctx.hud_text(x, y, 1, pal::TEXT, name, name_cells);
-            ping_bars(ctx, x + geo.col_w - 24, y, *ping);
-        }
-        if geo.extra > 0 {
-            let slot = geo.shown;
-            let col = slot / rows_per_col;
-            let row = slot % rows_per_col;
-            ctx.text(
-                px + 6 + col as i32 * (geo.col_w + 4),
-                py + 14 + row as i32 * 11,
-                1,
-                pal::TEXT_DIM,
-                &format!("+{} more", geo.extra),
-            );
-        }
-    }
+    // Lower-screen stacking: the actionbar, subtitle block, conflict
+    // switcher, and chat window all resolve through one geometry pass so
+    // the occupancy mirror sees exactly the same rows.
+    let stack = HudStackGeom::new(
+        ctx.state,
+        w,
+        h,
+        hotbar_layout,
+        show_vitals,
+        tr(lang, "scrolled", "保持中"),
+    );
+    hud_lower_stack(ctx, hud, &stack);
+    hud_player_list(ctx, hud, &stack, boss_bottom, lang);
 
     if compact_debug_hud_lines.is_empty() {
         ctx.text(4, 4, 1, pal::TEXT_DIM, "megu HUD");
@@ -4234,115 +3599,579 @@ fn hud(ctx: &mut Ctx) {
     // button, vitals, hotbar, magic bars); lines that cannot fit are
     // dropped rather than drawn on top of another element.
     if !compact_debug_hud_lines.is_empty() {
-        let pad = 3;
-        let anchor = qol.compact_debug_hud.anchor;
-        let mut max_box_w = (w - 8).max(8);
-        if hud.show_player_list {
-            max_box_w = max_box_w.min(cx - 106).max(8);
-        }
-        let max_chars = ((max_box_w - 2 * pad) / 8).max(1) as usize;
-        let clipped: Vec<String> = compact_debug_hud_lines
-            .iter()
-            .map(|line| hud_str(line, max_chars))
-            .collect();
-        let text_w = clipped
-            .iter()
-            .map(|line| text_width(line, 1) as i32)
-            .max()
-            .unwrap_or(0);
-        let box_w = (text_w + 2 * pad).min(max_box_w);
-        let bx = match anchor {
-            CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::BottomLeft => 4,
-            CompactDebugHudAnchor::TopRight | CompactDebugHudAnchor::BottomRight => (w - 4 - box_w).max(4),
-        };
-        let box_x = bx..(bx + box_w);
+        hud_compact_debug(
+            ctx,
+            hud,
+            qol.compact_debug_hud.anchor,
+            &stack,
+            &compact_debug_hud_lines,
+            boss_bottom,
+            magic_frame.as_ref(),
+        );
+    }
 
-        // Nothing may cross below these elements:
-        let mut top_edge = 4;
-        // Bossbars sit centered at the top.
-        if box_x.start < cx + 104 && box_x.end > cx - 104 {
-            top_edge = top_edge.max(boss_bottom + 2);
-        }
-        let mut bottom_edge = match anchor {
-            CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => h - 4,
-            CompactDebugHudAnchor::BottomLeft => hotbar_top,
-            CompactDebugHudAnchor::BottomRight => stack_bottom,
-        };
-        // The right stack (subtitles + conflict button) bounds anything
-        // reaching its column on the right.
-        if box_x.end > stack_left && box_x.start < w - 4 {
-            bottom_edge = bottom_edge.min(stack_bottom);
-        }
-        // Vitals icon columns.
-        if box_x.start < vl.end && box_x.end > vl.start {
-            bottom_edge = bottom_edge.min(vtop_l - 2);
-        }
-        if box_x.start < vr.end && box_x.end > vr.start {
-            bottom_edge = bottom_edge.min(vtop_r - 2);
-        }
-        // Hotbar slot cells + XP bar + actionbar band are center-bottom.
-        if box_x.start < rx && box_x.end > hx {
-            bottom_edge = bottom_edge.min(if abar.is_some() { hy - 46 } else { hy - 2 });
-        }
-        // Chat occupies the left band up to its widest drawn line.
-        if chat_right > 0 && box_x.start < chat_right {
-            bottom_edge = bottom_edge.min(chat_top - 2);
-        }
-        // MagicHUD: centered bottom bars + top-right status badges.
-        if let Some(mf) = &magic_frame {
-            if box_x.start < mf.panel.end && box_x.end > mf.panel.start {
-                bottom_edge = bottom_edge.min(mf.stack_top - 2);
-            }
-            if box_x.start < mf.statuses.end && box_x.end > mf.statuses.start {
-                top_edge = top_edge.max(mf.status_bottom + 2);
-            }
-        }
+    hud_magic_overlay(ctx, hud);
+}
 
-        let avail = bottom_edge - top_edge;
-        let max_lines = ((avail - 2 * pad + 2) / 10).max(0) as usize;
-        if max_lines > 0 {
-            let shown: Vec<&String> = clipped.iter().take(max_lines).collect();
-            let text_w = shown
-                .iter()
-                .map(|line| text_width(line, 1) as i32)
-                .max()
-                .unwrap_or(0);
-            let box_w = (text_w + 2 * pad).min(max_box_w);
-            let bx = match anchor {
-                CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::BottomLeft => 4,
-                CompactDebugHudAnchor::TopRight | CompactDebugHudAnchor::BottomRight => (w - 4 - box_w).max(4),
+/// Full-viewport screen tints (damage, fire, water, portal, freezing,
+/// vignette) and the pumpkin blur, drawn under everything else.
+fn hud_screen_overlay(ctx: &mut Ctx, hud: &HudState, w: i32, h: i32) {
+    let overlay = hud.screen_overlay;
+    for (alpha, color) in [
+        (overlay.hurt_alpha, UiColor::rgb(180, 0, 0)),
+        (overlay.fire_alpha, UiColor::rgb(255, 90, 0)),
+        (overlay.underwater_alpha, UiColor::rgb(20, 70, 180)),
+        (overlay.portal_alpha, UiColor::rgb(110, 20, 150)),
+        (overlay.freezing_alpha, UiColor::rgb(120, 210, 255)),
+        (overlay.vignette_alpha, UiColor::rgb(0, 0, 0)),
+    ] {
+        let a = (alpha.clamp(0.0, 1.0) * 100.0) as u8;
+        if a > 0 {
+            ctx.fill(0, 0, w, h, UiColor::rgba(color.r, color.g, color.b, a));
+        }
+    }
+    if overlay.pumpkin_blur {
+        ctx.fill(0, 0, w, h, UiColor::rgba(35, 20, 0, 28));
+    }
+}
+
+/// Top-right status-effect icons with their `name MM:SS` labels.
+fn hud_status_effects(ctx: &mut Ctx, hud: &HudState, w: i32) {
+    for (i, effect) in hud.status_effects.iter().enumerate() {
+        let x = w - 104;
+        let y = 8 + i as i32 * 18;
+        let effect_key = format!(
+            "{}{}",
+            hud_sprite_ids::MOB_EFFECT_PREFIX,
+            effect.name.to_ascii_lowercase().replace(' ', "_")
+        );
+        if !ctx.hud_sprite(&effect_key, x, y, 18, 18) {
+            let color = if effect.beneficial {
+                UiColor::rgb(60, 150, 70)
+            } else {
+                UiColor::rgb(160, 55, 55)
             };
-            let box_h = 2 * pad + shown.len() as i32 * 10 - 2;
-            let by = match anchor {
-                CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => top_edge,
-                _ => bottom_edge - box_h,
-            };
-            ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
-            for (i, line) in shown.iter().enumerate() {
-                ctx.text(bx + pad, by + pad + i as i32 * 10, 1, pal::TEXT, line);
-            }
+            ctx.fill(x, y, 16, 16, color);
+            ctx.text(
+                x + 3,
+                y + 4,
+                1,
+                pal::TEXT,
+                &effect.effect_id.rem_euclid(10).to_string(),
+            );
+        }
+        let level = match effect.amplifier {
+            0 => "",
+            1 => " II",
+            2 => " III",
+            3 => " IV",
+            n => if n >= 4 { " V" } else { "" },
+        };
+        let label = if effect.duration_ticks == u32::MAX {
+            format!("{}{level} **:**", effect.name)
+        } else {
+            let secs = effect.duration_ticks / 20;
+            format!("{}{level} {:02}:{:02}", effect.name, secs / 60, secs % 60)
+        };
+        ctx.text(x + 19, y + 4, 1, pal::TEXT, &label);
+    }
+}
+
+/// Procedural tint of one vanilla bossbar color, used when the host atlas
+/// does not bind the textured `boss_bar/*` sprites.
+fn bossbar_tint(color: crate::state::BossBarColor) -> UiColor {
+    match color {
+        crate::state::BossBarColor::Pink => UiColor::rgb(226, 76, 156),
+        crate::state::BossBarColor::Blue => UiColor::rgb(74, 122, 226),
+        crate::state::BossBarColor::Red => UiColor::rgb(210, 62, 62),
+        crate::state::BossBarColor::Green => UiColor::rgb(86, 184, 82),
+        crate::state::BossBarColor::Yellow => UiColor::rgb(232, 190, 62),
+        crate::state::BossBarColor::Purple => UiColor::rgb(170, 60, 200),
+        crate::state::BossBarColor::White => UiColor::rgb(226, 226, 226),
+    }
+}
+
+/// Bossbars, stacked from the top (host names: sanitized + clipped).
+/// Vanilla colors drive both the textured `boss_bar/*` sprites (when the
+/// host atlas binds them) and the procedural fallback tint.
+fn hud_bossbars(ctx: &mut Ctx, hud: &HudState, cx: i32, w: i32) -> i32 {
+    for (i, (name, frac)) in hud.bossbars.iter().take(3).enumerate() {
+        let y = 6 + i as i32 * 16;
+        let bw = (w - 40).clamp(8, 182);
+        let frac = frac.clamp(0.0, 1.0);
+        let color = hud.bossbar_colors.get(i).copied().unwrap_or_default();
+        ctx.hud_ctext(cx, y, 1, pal::TEXT, name, ((w - 8) / 8).max(0) as usize);
+        let bar_x = cx - bw / 2;
+        let bg_key = format!("boss_bar/{}_background", color.name());
+        let fill_key = format!("boss_bar/{}_progress", color.name());
+        if !ctx.sprite_bar(&bg_key, &fill_key, lr(bar_x, y + 9, bw, 5), frac) {
+            ctx.progress(
+                lr(bar_x, y + 9, bw, 5),
+                frac,
+                bossbar_tint(color),
+                UiColor::rgb(30, 20, 34),
+                pal::BUTTON_BORDER,
+            );
+        }
+    }
+    hud_bossbar_bottom(hud)
+}
+
+/// Crosshair plus the attack-cooldown sweep under it.
+fn hud_crosshair(ctx: &mut Ctx, hud: &HudState, cx: i32, h: i32) {
+    if hud.game_mode == 3 {
+        return;
+    }
+    if !ctx.hud_sprite(hud_sprite_ids::CROSSHAIR, cx - 7, h / 2 - 7, 15, 15) {
+        let cc = UiColor::rgba(230, 230, 230, 190);
+        ctx.fill(cx - 5, h / 2, 11, 1, cc);
+        ctx.fill(cx, h / 2 - 5, 1, 11, cc);
+    }
+    if hud.attack_cooldown < 1.0 {
+        ctx.progress(
+            lr(cx - 45, h / 2 + 8, 90, 4),
+            hud.attack_cooldown.clamp(0.0, 1.0),
+            pal::TEXT,
+            UiColor::rgb(35, 35, 35),
+            pal::BUTTON_BORDER,
+        );
+    }
+}
+
+/// Offhand cell plus the nine hotbar slots (items, selection, cooldown wipes).
+fn hud_hotbar(ctx: &mut Ctx, hud: &HudState, hotbar: HotbarLayout) {
+    let panel = hotbar.panel_rect();
+    let _hotbar_skinned = ctx.hud_sprite(
+        hud_sprite_ids::HOTBAR,
+        panel.x,
+        panel.y,
+        panel.w as i32,
+        panel.h as i32,
+    );
+    let offhand = hotbar.offhand_rect();
+    if let Some(item) = &hud.offhand {
+        slot_cell(ctx, offhand.x, offhand.y, Some(item), false);
+        if let Some(frac) = hud.item_cooldowns.get(item) {
+            slot_cooldown_wipe(ctx, offhand.x, offhand.y, *frac);
+        }
+    }
+    for (i, item) in hud.hotbar.iter().enumerate() {
+        let slot = hotbar.slot_rect(i);
+        slot_cell(ctx, slot.x, slot.y, item.as_ref(), i == hud.selected_slot);
+        if let Some(frac) = item.as_ref().and_then(|n| hud.item_cooldowns.get(n)) {
+            slot_cooldown_wipe(ctx, slot.x, slot.y, *frac);
+        }
+    }
+}
+
+/// Vitals: hearts left, hunger right, above the hotbar.
+fn hud_vitals(
+    ctx: &mut Ctx,
+    hud: &HudState,
+    vitals: HudVitalsGeometry,
+    hotbar: HotbarLayout,
+    cx: i32,
+) {
+    let hy = hotbar.y0();
+    // Dynamic max-health rows: each vanilla row carries at most twenty
+    // half-heart units and additional rows stack upward. Status effects
+    // and hardcore swap only the fill sprites; the backing container row
+    // remains shared exactly like vanilla.
+    let max_health = normalized_max_health(hud.max_health);
+    let mut style = if hud.hardcore {
+        HeartStyle::Hardcore
+    } else {
+        hud.heart_style
+    };
+    if style == HeartStyle::Normal {
+        if hud
+            .status_effects
+            .iter()
+            .any(|effect| effect.name.to_ascii_lowercase().contains("wither"))
+        {
+            style = HeartStyle::Withered;
+        } else if hud
+            .status_effects
+            .iter()
+            .any(|effect| effect.name.to_ascii_lowercase().contains("poison"))
+        {
+            style = HeartStyle::Poisoned;
+        } else if hud.screen_overlay.freezing_alpha > 0.0 {
+            style = HeartStyle::Frozen;
+        }
+    }
+    let (heart_full, heart_half) = match style {
+        HeartStyle::Normal => (hud_sprite_ids::HEART_FULL, hud_sprite_ids::HEART_HALF),
+        HeartStyle::Poisoned => ("hud/heart/poisoned_full", "hud/heart/poisoned_half"),
+        HeartStyle::Withered => ("hud/heart/withered_full", "hud/heart/withered_half"),
+        HeartStyle::Frozen => ("hud/heart/frozen_full", "hud/heart/frozen_half"),
+        HeartStyle::Hardcore => ("hud/heart/hardcore_full", "hud/heart/hardcore_half"),
+    };
+    let heart_color = match style {
+        HeartStyle::Normal | HeartStyle::Hardcore => pal::HEALTH,
+        HeartStyle::Poisoned => UiColor::rgb(92, 150, 62),
+        HeartStyle::Withered => UiColor::rgb(52, 48, 48),
+        HeartStyle::Frozen => UiColor::rgb(132, 188, 226),
+    };
+    for row in 0..vitals.health_rows {
+        let base = row as f32 * 20.0;
+        let row_value = (hud.health - base).clamp(0.0, 20.0);
+        let row_max = (max_health - base).clamp(0.0, 20.0).max(1.0);
+        sprite_icon_row(
+            ctx,
+            vitals.health_row(row),
+            row_value,
+            row_max,
+            heart_color,
+            hud_sprite_ids::HEART_CONTAINER,
+            heart_full,
+            heart_half,
+        );
+    }
+    sprite_icon_row(
+        ctx,
+        vitals.armor_row(),
+        hud.armor as f32,
+        20.0,
+        pal::ARMOR,
+        hud_sprite_ids::ARMOR_EMPTY,
+        hud_sprite_ids::ARMOR_FULL,
+        hud_sprite_ids::ARMOR_HALF,
+    );
+    if let Some(absorption_row) = vitals.absorption_row() {
+        sprite_icon_row(
+            ctx,
+            absorption_row,
+            hud.absorption,
+            20.0,
+            pal::ABSORPTION,
+            hud_sprite_ids::HEART_CONTAINER,
+            "hud/heart/absorbing_full",
+            "hud/heart/absorbing_half",
+        );
+    }
+    sprite_icon_row(
+        ctx,
+        vitals.hunger_row(),
+        hud.hunger as f32,
+        20.0,
+        pal::HUNGER,
+        hud_sprite_ids::FOOD_EMPTY,
+        hud_sprite_ids::FOOD_FULL,
+        hud_sprite_ids::FOOD_HALF,
+    );
+    if let Some((health, max)) = hud.mount_health {
+        let max_hp = max.max(1.0);
+        for row in 0..vitals.mount_rows {
+            let row_hp = (health - row as f32 * 20.0).clamp(0.0, 20.0);
+            let row_max = (max_hp - row as f32 * 20.0).clamp(1.0, 20.0);
+            sprite_icon_row(
+                ctx,
+                vitals.mount_row(row),
+                row_hp,
+                row_max,
+                pal::HEALTH,
+                hud_sprite_ids::HEART_CONTAINER,
+                "hud/heart/vehicle_full",
+                "hud/heart/vehicle_half",
+            );
+        }
+    }
+    if let Some(air_row) = vitals.air_row() {
+        // Vanilla air bubbles are discrete sprites rather than empty
+        // containers; one bubble is thirty supply units.
+        if !air_bubble_sprites(ctx, air_row, hud.air) {
+            procedural_icon_row(ctx, air_row, hud.air as f32 / 15.0, 20.0, pal::AIR);
         }
     }
 
-    if !hud.magic.is_empty() {
-        let overlay = crate::magic_hud::build_magic_hud_draw_list(
-            &hud.magic,
-            (ctx.w * ctx.s) as u32,
-            (ctx.h * ctx.s) as u32,
+    // XP bar + level. The textured bar crops its fill in source
+    // pixels; the procedural bar remains the clean fallback.
+    let xp_frac = hud.xp_progress.clamp(0.0, 1.0);
+    if !ctx.sprite_bar(
+        hud_sprite_ids::EXPERIENCE_BAR_BACKGROUND,
+        hud_sprite_ids::EXPERIENCE_BAR_PROGRESS,
+        lr(cx - 91, hy - 5, 182, 5),
+        xp_frac,
+    ) {
+        ctx.progress(
+            lr(cx - 91, hy - 4, 182, 3),
+            xp_frac,
+            pal::XP,
+            UiColor::rgb(20, 30, 14),
+            pal::BUTTON_BORDER,
         );
-        for command in overlay.commands {
-            if let UiCommand::Text {
-                x,
-                y,
-                scale,
-                color,
-                ref text,
-            } = command
-            {
-                ctx.list.text_str(x, y, scale, color, text);
-            } else {
-                ctx.list.push(command);
+    }
+    if let Some(charge) = hud.mount_jump_charge {
+        ctx.progress(
+            lr(cx - 91, hy - 4, 182, 3),
+            charge.clamp(0.0, 1.0),
+            pal::XP,
+            UiColor::rgb(20, 30, 14),
+            pal::BUTTON_BORDER,
+        );
+    }
+    if hud.xp_level > 0 {
+        ctx.ctext(cx, hy - 14, 1, pal::XP, &hud.xp_level.to_string());
+    }
+}
+
+/// Bottom-left stack: actionbar, subtitles, conflict switcher, chat
+/// scrollback (+ scroll-lock badge), and the open chat/command input.
+fn hud_lower_stack(ctx: &mut Ctx, hud: &HudState, stack: &HudStackGeom) {
+    if let Some(text) = &stack.abar_text {
+        ctx.ctext(stack.cx, stack.hy - 44, 1, pal::TEXT, text);
+    }
+    for (label, y, left) in &stack.subtitle_rows {
+        let rw = stack.w - 4 - left;
+        ctx.fill(*left, *y, rw, 10, UiColor::rgba(0, 0, 0, 110));
+        ctx.text(left + 3, y + 1, 1, pal::TEXT, label);
+    }
+    if let Some((label, r)) = &stack.conflict {
+        ctx.btn(WidgetId::CraftConflictNext, *r, label);
+    }
+    for (text, y, tw) in &stack.chat_rows {
+        ctx.fill(2, y - 1, tw + 6, 10, UiColor::rgba(0, 0, 0, 110));
+        ctx.text(4, *y, 1, pal::TEXT, text);
+    }
+    if let Some((badge, y, bw)) = &stack.chat_badge {
+        ctx.fill(2, y - 1, bw + 2, 10, UiColor::rgba(0, 0, 0, 110));
+        ctx.text(4, *y, 1, pal::WARNING, badge);
+    }
+    hud_chat_input(ctx, hud, stack.w, stack.h);
+}
+
+/// Chat/command input bar (open chat screen): a dark input strip at the
+/// bottom-left with a caret, plus the vanilla-style suggestion popup
+/// stacked above it listing `completions` with the applied candidate
+/// highlighted.
+fn hud_chat_input(ctx: &mut Ctx, hud: &HudState, w: i32, h: i32) {
+    if !hud.chat_input.open {
+        return;
+    }
+    // Clamp bounds in safe order: at ultra-narrow logical widths the
+    // maximum can be below the preferred 80px minimum, and reversing
+    // those operands panics in `clamp`.
+    let max_w = (w - 8).max(16);
+    let min_w = 80.min(max_w);
+    let box_w = ((w * 3) / 5).clamp(min_w, max_w);
+    let box_y = h - 13;
+    ctx.fill(2, box_y, box_w, 11, UiColor::rgba(0, 0, 0, 160));
+    ctx.border(2, box_y, box_w, 11, pal::PANEL_BORDER);
+    let avail_px = (box_w - 8).max(0) as usize;
+    let full = hud_str(&hud.chat_input.text, crate::hud_widgets::MAX_CHAT_INPUT_CELLS);
+    let (text, caret_px) = chat_input_window(&full, hud.chat_input.cursor(), avail_px);
+    ctx.text(4, box_y + 2, 1, pal::TEXT, &text);
+    let caret_x = (4 + caret_px).min(2 + box_w - 3);
+    ctx.fill(caret_x, box_y + 2, 1, 7, pal::TEXT);
+    let rows = hud.chat_input.completions.len().min(10);
+    if rows > 0 {
+        let widest = hud
+            .chat_input
+            .completions
+            .iter()
+            .take(rows)
+            .map(|cand| crate::draw::text_width(&hud_str(cand, 40), 1) as i32)
+            .max()
+            .unwrap_or(0);
+        let pop_w = (widest + 8).min(w - 8);
+        let pop_h = rows as i32 * 10 + 2;
+        let pop_y = (box_y - 2 - pop_h).max(2);
+        let selected = hud.chat_input.selected_completion();
+        ctx.fill(4, pop_y, pop_w, pop_h, UiColor::rgba(8, 10, 14, 220));
+        ctx.border(4, pop_y, pop_w, pop_h, pal::PANEL_BORDER);
+        for (i, cand) in hud.chat_input.completions.iter().take(rows).enumerate() {
+            let ry = pop_y + 1 + i as i32 * 10;
+            if Some(i) == selected {
+                ctx.fill(5, ry, pop_w - 2, 10, UiColor::rgba(80, 88, 110, 120));
             }
+            ctx.hud_text(7, ry + 1, 1, pal::TEXT, cand, ((pop_w - 10) / 8).max(1) as usize);
+        }
+    }
+}
+
+/// Player list overlay (hold-Tab): vanilla-style column-major rows
+/// below the bossbars, height-capped to the viewport with a "+N more"
+/// tail only when even the widest fitting column set cannot show all.
+fn hud_player_list(
+    ctx: &mut Ctx,
+    hud: &HudState,
+    stack: &HudStackGeom,
+    boss_bottom: i32,
+    lang: UiLang,
+) {
+    if !hud.show_player_list {
+        return;
+    }
+    let max_name_w = hud
+        .players
+        .iter()
+        .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
+        .max()
+        .unwrap_or(0);
+    let geo = player_list_geometry(hud.players.len(), max_name_w, stack.w, stack.h, boss_bottom);
+    let (px, py, pw, ph) = (geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
+    let name_cells = ((geo.col_w - 58) / 8).max(1) as usize;
+    ctx.panel(px, py, pw, ph);
+    ctx.ctext(
+        stack.cx,
+        py + 4,
+        1,
+        pal::TEXT,
+        &format!(
+            "{} ({})",
+            tr(lang, "Players", "プレイヤー"),
+            hud.players.len()
+        ),
+    );
+    let rows_per_col = geo.rows_used.max(1);
+    for (i, (name, ping)) in hud.players.iter().take(geo.shown).enumerate() {
+        let col = i / rows_per_col;
+        let row = i % rows_per_col;
+        let x = px + 6 + col as i32 * (geo.col_w + 4);
+        let y = py + 14 + row as i32 * 11;
+        ctx.hud_text(x, y, 1, pal::TEXT, name, name_cells);
+        ping_bars(ctx, x + geo.col_w - 24, y, *ping);
+    }
+    if geo.extra > 0 {
+        let slot = geo.shown;
+        let col = slot / rows_per_col;
+        let row = slot % rows_per_col;
+        ctx.text(
+            px + 6 + col as i32 * (geo.col_w + 4),
+            py + 14 + row as i32 * 11,
+            1,
+            pal::TEXT_DIM,
+            &format!("+{} more", geo.extra),
+        );
+    }
+}
+
+/// Compact Debug HUD box: clipped lines in the configured corner, capped
+/// against every other HUD element so nothing is ever drawn on top of
+/// another element.
+fn hud_compact_debug(
+    ctx: &mut Ctx,
+    hud: &HudState,
+    anchor: CompactDebugHudAnchor,
+    stack: &HudStackGeom,
+    lines: &[String],
+    boss_bottom: i32,
+    magic: Option<&MagicFrame>,
+) {
+    let pad = 3;
+    let mut max_box_w = (stack.w - 8).max(8);
+    if hud.show_player_list {
+        max_box_w = max_box_w.min(stack.cx - 106).max(8);
+    }
+    let max_chars = ((max_box_w - 2 * pad) / 8).max(1) as usize;
+    let clipped: Vec<String> = lines.iter().map(|line| hud_str(line, max_chars)).collect();
+    let text_w = clipped
+        .iter()
+        .map(|line| text_width(line, 1) as i32)
+        .max()
+        .unwrap_or(0);
+    let box_w = (text_w + 2 * pad).min(max_box_w);
+    let left = |box_w: i32| match anchor {
+        CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::BottomLeft => 4,
+        CompactDebugHudAnchor::TopRight | CompactDebugHudAnchor::BottomRight => {
+            (stack.w - 4 - box_w).max(4)
+        }
+    };
+    let bx = left(box_w);
+    let box_x = bx..(bx + box_w);
+
+    // Nothing may cross below these elements:
+    let mut top_edge = 4;
+    // Bossbars sit centered at the top.
+    if box_x.start < stack.cx + 104 && box_x.end > stack.cx - 104 {
+        top_edge = top_edge.max(boss_bottom + 2);
+    }
+    let mut bottom_edge = match anchor {
+        CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => stack.h - 4,
+        CompactDebugHudAnchor::BottomLeft => stack.hotbar_top,
+        CompactDebugHudAnchor::BottomRight => stack.stack_bottom,
+    };
+    // The right stack (subtitles + conflict button) bounds anything
+    // reaching its column on the right.
+    if box_x.end > stack.stack_left && box_x.start < stack.w - 4 {
+        bottom_edge = bottom_edge.min(stack.stack_bottom);
+    }
+    // Vitals icon columns.
+    if box_x.start < stack.vl.end && box_x.end > stack.vl.start {
+        bottom_edge = bottom_edge.min(stack.vtop_l - 2);
+    }
+    if box_x.start < stack.vr.end && box_x.end > stack.vr.start {
+        bottom_edge = bottom_edge.min(stack.vtop_r - 2);
+    }
+    // Hotbar slot cells + XP bar + actionbar band are center-bottom.
+    if box_x.start < stack.vitals_right_x && box_x.end > stack.hotbar_block.x {
+        bottom_edge = bottom_edge.min(if stack.abar.is_some() {
+            stack.hy - 46
+        } else {
+            stack.hy - 2
+        });
+    }
+    // Chat occupies the left band up to its widest drawn line.
+    if stack.chat_right > 0 && box_x.start < stack.chat_right {
+        bottom_edge = bottom_edge.min(stack.chat_top - 2);
+    }
+    // MagicHUD: centered bottom bars + top-right status badges.
+    if let Some(mf) = magic {
+        if box_x.start < mf.panel.end && box_x.end > mf.panel.start {
+            bottom_edge = bottom_edge.min(mf.stack_top - 2);
+        }
+        if box_x.start < mf.statuses.end && box_x.end > mf.statuses.start {
+            top_edge = top_edge.max(mf.status_bottom + 2);
+        }
+    }
+
+    let avail = bottom_edge - top_edge;
+    let max_lines = ((avail - 2 * pad + 2) / 10).max(0) as usize;
+    if max_lines == 0 {
+        return;
+    }
+    let shown: Vec<&String> = clipped.iter().take(max_lines).collect();
+    let text_w = shown
+        .iter()
+        .map(|line| text_width(line, 1) as i32)
+        .max()
+        .unwrap_or(0);
+    let box_w = (text_w + 2 * pad).min(max_box_w);
+    let bx = left(box_w);
+    let box_h = 2 * pad + shown.len() as i32 * 10 - 2;
+    let by = match anchor {
+        CompactDebugHudAnchor::TopLeft | CompactDebugHudAnchor::TopRight => top_edge,
+        _ => bottom_edge - box_h,
+    };
+    ctx.fill(bx, by, box_w, box_h, UiColor::rgba(0, 0, 0, 110));
+    for (i, line) in shown.iter().enumerate() {
+        ctx.text(bx + pad, by + pad + i as i32 * 10, 1, pal::TEXT, line);
+    }
+}
+
+/// MagicHUD command overlay, routed through the shared draw list.
+fn hud_magic_overlay(ctx: &mut Ctx, hud: &HudState) {
+    if hud.magic.is_empty() {
+        return;
+    }
+    let overlay = crate::magic_hud::build_magic_hud_draw_list(
+        &hud.magic,
+        (ctx.w * ctx.s) as u32,
+        (ctx.h * ctx.s) as u32,
+    );
+    for command in overlay.commands {
+        if let UiCommand::Text {
+            x,
+            y,
+            scale,
+            color,
+            ref text,
+        } = command
+        {
+            ctx.list.text_str(x, y, scale, color, text);
+        } else {
+            ctx.list.push(command);
         }
     }
 }
@@ -4956,7 +4785,6 @@ fn hud_occupied_rects(state: &UiState, width: u32, height: u32) -> Vec<UiRect> {
 pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: &mut Vec<UiRect>) {
     rects.clear();
     let hud = &state.hud;
-    let qol = &state.settings.qol;
     let s = layout_scale(state, width, height);
     if s <= 0 {
         return;
@@ -4968,6 +4796,16 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
     }
     let cx = w / 2;
 
+    // Hotbar block (offhand + gap + 9 slots), vitals columns, XP —
+    // the same creative/spectator gates `hud()` applies to the draw.
+    let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
+    let show_hotbar = hud.game_mode != 3;
+    let hotbar_layout = HotbarLayout::new(w, h);
+    let hy = hotbar_layout.y0();
+    // Every lower-screen row (actionbar, subtitles, conflict switcher,
+    // chat, badge) resolves through the painter's own geometry pass.
+    let stack = HudStackGeom::new(state, w, h, hotbar_layout, show_vitals, "scrolled");
+
     // Logical-px accumulator; converted to physical at the end.
     {
         let mut add = |x: i32, y: i32, rw: i32, rh: i32| {
@@ -4976,25 +4814,7 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
             }
         };
 
-        // Hotbar block (offhand + gap + 9 slots), vitals columns, XP —
-        // the same creative/spectator gates `hud()` applies to the draw.
-        let show_vitals = hud.game_mode != 1 && hud.game_mode != 3;
-        let show_hotbar = hud.game_mode != 3;
-        let hotbar_layout = HotbarLayout::new(w, h);
-        let hotbar_block = hotbar_layout.occupied_rect();
-        let hy = hotbar_layout.y0();
-        let hotbar_top = hy - HotbarLayout::BOTTOM_MARGIN;
-        let vitals = HudVitalsGeometry::new(hud, hotbar_layout);
-        // Empty ranges while the rows are gated off — the lift/clip math
-        // below then no-ops exactly like the invisible chrome it models.
-        let (vl, vr) = if show_vitals {
-            vitals.column_ranges()
-        } else {
-            (0..0, 0..0)
-        };
-        let vtop_l = vitals.left_top();
-        let vtop_r = vitals.right_top();
-        let vitals_bottom = vitals.bottom();
+        let hotbar_block = stack.hotbar_block;
         if show_hotbar {
             add(
                 hotbar_block.x,
@@ -5009,174 +4829,37 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
                 add(cx - 24, hy - 14, 48, 8);
             }
             add(
-                vl.start,
-                vtop_l,
+                stack.vl.start,
+                stack.vtop_l,
                 VitalRow::OCCUPIED_WIDTH,
-                vitals_bottom - vtop_l,
+                stack.vitals_bottom - stack.vtop_l,
             );
             add(
-                vr.start,
-                vtop_r,
+                stack.vr.start,
+                stack.vtop_r,
                 VitalRow::OCCUPIED_WIDTH,
-                vitals_bottom - vtop_r,
+                stack.vitals_bottom - stack.vtop_r,
             );
         }
 
-        // Actionbar: centered band directly above the vitals.
-        let abar = if hud.actionbar.is_empty() {
-            None
-        } else {
-            let text = hud_str(&hud.actionbar, ((w - 8) / 8).max(0) as usize);
-            let aw = text_width(&text, 1) as i32;
-            if aw > 0 {
-                add(cx - aw / 2, hy - 44, aw, 8);
-            }
-            Some(cx - aw / 2..cx + aw / 2)
-        };
-        let abar_band = (hy - 44)..(hy - 36);
-
-        // Legacy directional subtitle rows (same opt-in + same lift
-        // math as `hud()`), remembered as `(fill_left, y)` for the chat
-        // clip below, plus the stack bottom the conflict button uses.
-        let mut subtitle_rows: Vec<(i32, i32)> = Vec::new();
-        let mut stack_bottom = hotbar_top;
-        if state.settings.qol.show_subtitles && !hud.subtitles.is_empty() {
-            let shown: Vec<&HudSubtitle> = hud.subtitles.iter().rev().take(4).collect();
-            let build_rows = |base: i32| -> Vec<(String, i32)> {
-                shown
-                    .iter()
-                    .enumerate()
-                    .map(|(i, sub)| {
-                        let label = match sub.direction {
-                            SubtitleDirection::Left => format!("< {}", sub.label),
-                            SubtitleDirection::Center => sub.label.clone(),
-                            SubtitleDirection::Right => format!("{} >", sub.label),
-                            SubtitleDirection::Behind => format!("v {}", sub.label),
-                        };
-                        let y = base - (shown.len() - i) as i32 * 10;
-                        let cells = ((w - 14) / 8).max(1) as usize;
-                        (hud_str(&label, cells), y)
-                    })
-                    .collect()
-            };
-            let mut sub_base = hotbar_top;
-            let mut rows = build_rows(sub_base);
-            for (i, (label, y)) in rows.iter().enumerate() {
-                let rw = text_width(label, 1) as i32 + 6;
-                if w - 4 - rw < vr.end && *y < vitals_bottom && *y + 10 > vtop_r {
-                    sub_base = sub_base.min(vtop_r - 10 + (shown.len() - i) as i32 * 10);
-                }
-                if w - 4 - rw < vl.end && *y < vitals_bottom && *y + 10 > vtop_l {
-                    sub_base = sub_base.min(vtop_l - 10 + (shown.len() - i) as i32 * 10);
-                }
-            }
-            rows = build_rows(sub_base);
-            if abar.is_some()
-                && rows.iter().any(|(label, y)| {
-                    let rw = text_width(label, 1) as i32 + 6;
-                    *y < abar_band.end
-                        && *y + 10 > abar_band.start
-                        && w - 4 - rw < abar.as_ref().map_or(i32::MAX, |ab| ab.end)
-                })
-            {
-                sub_base = (hy - 46).min(sub_base);
-                rows = build_rows(sub_base);
-            }
-            let rows: Vec<(String, i32)> = rows
-                .into_iter()
-                .filter(|(_, y)| *y >= 0 && *y + 10 <= h)
-                .collect();
-            for (label, y) in &rows {
-                let rw = text_width(label, 1) as i32 + 6;
-                add(w - 4 - rw, *y, rw, 10);
-            }
-            subtitle_rows = rows
-                .iter()
-                .map(|(label, y)| (w - 4 - (text_width(label, 1) as i32 + 6), *y))
-                .collect();
-            stack_bottom = sub_base - shown.len() as i32 * 10 - 2;
+        if let Some(r) = stack.abar_rect {
+            add(r.x, r.y, r.w as i32, r.h as i32);
         }
-
-        // Crafting-conflict switcher (same position math as `hud()`).
-        if hud.crafting_conflict.is_active() {
-            let label = format!(
-                "< {}/{} >",
-                hud.crafting_conflict.selected() + 1,
-                hud.crafting_conflict.total_candidates
-            );
-            let bw = (text_width(&label, 1) as i32 + 8).min(w - 8);
-            let bx = w - 4 - bw;
-            let mut bottom = stack_bottom - 2;
-            if bx < vl.end {
-                bottom = bottom.min(vtop_l - 2);
-            }
-            if bx < vr.end {
-                bottom = bottom.min(vtop_r - 2);
-            }
-            let by = (bottom - 14).max(2);
-            add(bx, by, bw, 14);
+        for (_, y, left) in &stack.subtitle_rows {
+            add(*left, *y, w - 4 - left, 10);
         }
-
-        // Chat scrollback rows, clipped exactly like `hud()` — scroll-
-        // lock shifts the window and frees the bottom slot for the
-        // unread badge.
-        let scroll_locked =
-            qol.chat_scroll_lock && state.chat_scroll.scrolled_up;
-        let scroll_off = if scroll_locked {
-            state.chat_scroll.scroll_offset
-        } else {
-            0
-        };
-        let chat_take = if scroll_locked { 5 } else { 6 };
-        for (k, line) in hud
-            .chat_lines
-            .iter()
-            .rev()
-            .skip(scroll_off)
-            .take(chat_take)
-            .enumerate()
-        {
-            let i = k + usize::from(scroll_locked);
-            let y = hy - 12 - i as i32 * 10;
-            let (band_top, band_bot) = (y - 1, y + 9);
-            let mut cells = ((w - 14) / 8).max(0) as usize;
-            if band_top < vitals_bottom && band_bot > vtop_l {
-                cells = cells.min(((vl.start - 10) / 8).max(0) as usize);
-            }
-            if let Some(ab) = &abar {
-                if band_top < abar_band.end && band_bot > abar_band.start {
-                    cells = cells.min(((ab.start - 10) / 8).max(0) as usize);
-                }
-            }
-            for (sx, sy) in &subtitle_rows {
-                if band_top < *sy + 10 && band_bot > *sy {
-                    cells = cells.min(((*sx - 10) / 8).max(0) as usize);
-                }
-            }
-            if cells == 0 {
-                continue;
-            }
-            let text = hud_str(line, cells);
-            let tw = text_width(&text, 1) as i32;
+        if let Some((_, r)) = &stack.conflict {
+            add(r.x, r.y, r.w as i32, r.h as i32);
+        }
+        for (_, y, tw) in &stack.chat_rows {
             add(2, y - 1, tw + 6, 10);
         }
         // Scroll-lock badge in the freed bottom slot (`hud()` mirror).
-        if scroll_locked && hy - 12 >= 0 {
-            let badge = state
-                .chat_scroll
-                .unread_label(state.lang())
-                .unwrap_or_else(|| "scrolled".to_string());
-            let bw = text_width(&badge, 1) as i32 + 6;
-            add(2, hy - 13, bw + 2, 10);
+        if let Some((_, y, bw)) = &stack.chat_badge {
+            add(2, y - 1, bw + 2, 10);
         }
 
         // Bossbar stack (name text + progress bar per row).
-        let boss_count = hud.bossbars.len().min(3) as i32;
-        let boss_bottom = if boss_count == 0 {
-            4
-        } else {
-            16 * boss_count + 4
-        };
         for (i, (name, _)) in hud.bossbars.iter().take(3).enumerate() {
             let y = 6 + i as i32 * 16;
             let bw = (w - 40).clamp(8, 182);
@@ -5194,7 +4877,8 @@ pub fn hud_occupied_rects_into(state: &UiState, width: u32, height: u32, rects: 
                 .map(|(name, _)| text_width(&hud_str(name, 32), 1) as i32)
                 .max()
                 .unwrap_or(0);
-            let geo = player_list_geometry(hud.players.len(), max_name_w, w, h, boss_bottom);
+            let geo =
+                player_list_geometry(hud.players.len(), max_name_w, w, h, hud_bossbar_bottom(hud));
             add(geo.panel_x, geo.panel_y, geo.panel_w, geo.panel_h);
         }
 
@@ -5437,36 +5121,16 @@ fn pause(ctx: &mut Ctx) {
         lr(x, y(2), half, bh),
         ctx.state.translate("menu.options", tr(lang, "Options...", "設定...")),
     );
-    ctx.btn(
-        WidgetId::PauseInvite,
-        lr(xr, y(2), half, bh),
-        tr(lang, "Invite Friend", "フレンドを招待"),
-    );
-    ctx.btn(
-        WidgetId::PauseRecipeBrowser,
-        lr(x, y(3), half, bh),
-        tr(lang, "Recipe Browser", "レシピブラウザ"),
-    );
-    ctx.btn(
-        WidgetId::PauseSaveReplay,
-        lr(xr, y(3), half, bh),
-        tr(lang, "Save Replay", "リプレイ保存"),
-    );
-    ctx.btn(
-        WidgetId::PauseSaveQuit,
-        lr(x, y(4), bw, bh),
-        tr(lang, "Save & Quit to Title", "保存してタイトルへ"),
-    );
+    ctx.tr_btn(WidgetId::PauseInvite, lr(xr, y(2), half, bh), "Invite Friend", "フレンドを招待");
+    ctx.tr_btn(WidgetId::PauseRecipeBrowser, lr(x, y(3), half, bh), "Recipe Browser", "レシピブラウザ");
+    ctx.tr_btn(WidgetId::PauseSaveReplay, lr(xr, y(3), half, bh), "Save Replay", "リプレイ保存");
+    ctx.tr_btn(WidgetId::PauseSaveQuit, lr(x, y(4), bw, bh), "Save & Quit to Title", "保存してタイトルへ");
 
     // Megu's support shortcut is deliberately secondary chrome and appears
     // only when the fixed vanilla grid leaves a disjoint footer strip.
     let report_y = y0 + total + 6;
     if !ctx.state.report_url.is_empty() && report_y + 14 <= ctx.h - 4 {
-        ctx.btn(
-            WidgetId::PauseReportBug,
-            lr(ctx.w - 88, report_y, 80, 14),
-            tr(lang, "Report Bug", "不具合を報告"),
-        );
+        ctx.tr_btn(WidgetId::PauseReportBug, lr(ctx.w - 88, report_y, 80, 14), "Report Bug", "不具合を報告");
     }
 }
 
@@ -5517,24 +5181,17 @@ fn death(ctx: &mut Ctx) {
     let by = (y + 16).min((ctx.h - 22).max(2));
     if state.hardcore {
         let bw = 140.min(ctx.w - 12).max(24);
-        ctx.btn(
-            WidgetId::DeathTitleScreen,
-            lr(cx - bw / 2, by, bw, 20),
-            tr(lang, "Title Screen", "タイトル画面へ"),
-        );
+        ctx.tr_btn(WidgetId::DeathTitleScreen, lr(cx - bw / 2, by, bw, 20), "Title Screen", "タイトル画面へ");
     } else {
         let bw = 110.min((ctx.w - 12) / 2).max(24);
-        ctx.button(
+        ctx.tr_button(
             WidgetId::DeathRespawn,
             lr(cx - bw - 2, by, bw, 20),
-            tr(lang, "Respawn", "リスポーン"),
+            "Respawn",
+            "リスポーン",
             state.can_respawn(),
         );
-        ctx.btn(
-            WidgetId::DeathTitleScreen,
-            lr(cx + 2, by, bw, 20),
-            tr(lang, "Title Screen", "タイトル画面へ"),
-        );
+        ctx.tr_btn(WidgetId::DeathTitleScreen, lr(cx + 2, by, bw, 20), "Title Screen", "タイトル画面へ");
     }
 }
 
@@ -5617,11 +5274,7 @@ fn crash(ctx: &mut Ctx) {
         ),
         !sent && ctx.state.crash.is_some(),
     );
-    ctx.btn(
-        WidgetId::CrashReturnTitle,
-        lr(cx + 10, by, 130, 20),
-        tr(lang, "Return to Title", "タイトルへ戻る"),
-    );
+    ctx.tr_btn(WidgetId::CrashReturnTitle, lr(cx + 10, by, 130, 20), "Return to Title", "タイトルへ戻る");
 }
 
 /// Modal overlays; only modal regions are live while open.
@@ -5657,19 +5310,11 @@ fn modal(ctx: &mut Ctx) {
             let ok_w = (pair - 6) / 2;
             let cancel_w = pair - 6 - ok_w;
             let ox = mx + (mw - pair) / 2;
-            ctx.btn(
-                WidgetId::ModalOk,
-                lr(ox, my + mh - 34, ok_w, 20),
-                tr(lang, "OK", "OK"),
-            );
+            ctx.tr_btn(WidgetId::ModalOk, lr(ox, my + mh - 34, ok_w, 20), "OK", "OK");
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
-            ctx.btn(
-                WidgetId::ModalCancel,
-                lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20),
-                tr(lang, "Cancel", "キャンセル"),
-            );
+            ctx.tr_btn(WidgetId::ModalCancel, lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20), "Cancel", "キャンセル");
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
@@ -5706,19 +5351,11 @@ fn modal(ctx: &mut Ctx) {
             let ok_w = (pair - 6) / 2;
             let cancel_w = pair - 6 - ok_w;
             let ox = mx + (mw - pair) / 2;
-            ctx.btn(
-                WidgetId::ModalOk,
-                lr(ox, my + mh - 34, ok_w, 20),
-                tr(lang, "OK", "OK"),
-            );
+            ctx.tr_btn(WidgetId::ModalOk, lr(ox, my + mh - 34, ok_w, 20), "OK", "OK");
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
-            ctx.btn(
-                WidgetId::ModalCancel,
-                lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20),
-                tr(lang, "Cancel", "キャンセル"),
-            );
+            ctx.tr_btn(WidgetId::ModalCancel, lr(ox + ok_w + 6, my + mh - 34, cancel_w, 20), "Cancel", "キャンセル");
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
@@ -5772,11 +5409,7 @@ fn modal(ctx: &mut Ctx) {
                     ),
                 );
             }
-            ctx.btn(
-                WidgetId::ModalOk,
-                lr(cx - 40, my + mh - 30, 80, 20),
-                tr(lang, "OK", "OK"),
-            );
+            ctx.tr_btn(WidgetId::ModalOk, lr(cx - 40, my + mh - 30, 80, 20), "OK", "OK");
             if let Some(r) = ctx.regions.last_mut() {
                 r.modal = true;
             }
