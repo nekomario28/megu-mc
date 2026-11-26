@@ -65,6 +65,8 @@ use mod_adapter_core::mixin_lifter::{
 use mod_adapter_core::modpack::{
     analyze_modpack, infer_candidate_mod_id, ModpackManifest, ModpackReadiness,
 };
+use mod_adapter_core::structural_compat::{CompatLoadVerdict, InspectableModUnit, WorldProfile};
+use mod_adapter_core::unified_bundle::DeclarativeModBundle;
 use mod_adapter_core::version_compat::McVersion;
 
 const USAGE: &str = "\
@@ -78,6 +80,7 @@ Usage: megu-mod-check --modpack <path> [options]
        megu-mod-check --adapt-jar <mod.jar> [--out <dir>] [--include-client-mixins] [--json]
        megu-mod-check --adapt-mods-dir <dir> [--out <dir>] [--include-client-mixins] [--json]
        megu-mod-check --scaffold-native <mod_id> [--name <display>] [--version <ver>] [--out <file>]
+       megu-mod-check --structural <mod.jar|mod.mmod|bundle.json> [--target-version 1.21.1|26.3] [--worldgen-epoch <epoch>] [--json]
 
 --modpack accepts a Modrinth .mrpack archive, a standalone modrinth.index.json,
 or a CurseForge manifest.json / pack .zip, and reports — before anything is
@@ -117,6 +120,12 @@ Options:
                           classified fallback verdict
   --adapt-mods-dir <dir>  directory of mod JARs to auto-adapt together
   --scaffold-native <id>  bare mod id to emit a starter native bundle for
+  --structural <path>     inspect a raw mod archive or declarative bundle for
+                          structural capabilities and evaluate the three-tier
+                          Full/Partial/Blocked safe-load verdict
+  --target-version <ver>  structural world target: 1.21.1 or 26.3
+                          (default: 1.21.1)
+  --worldgen-epoch <id>   explicit structural worldgen epoch override
   --out <path>            output directory for adapted bundles and
                           adaptation-report.json (--adapt-*), or the exact
                           bundle file to write (--scaffold-native)
@@ -136,8 +145,8 @@ Options:
   -h, --help              show this help and exit
 
 Exactly one of --modpack, --scan-jar, --scan-mods-dir, --adapt-jar,
---adapt-mods-dir or --scaffold-native is required; they are mutually
-exclusive.
+--adapt-mods-dir, --scaffold-native or --structural is required; they are
+mutually exclusive.
 
 Exit status: for --modpack, 0 the pack can run on this server (native, with
 automatic skips, or pending a bytecode inspection), 2 the pack targets a
@@ -153,7 +162,9 @@ Tier 2 shim), 2 at least one JAR needs a Tier 3 fallback or the arguments
 were invalid, 1 an input could not be read or failed the fail-closed
 archive checks. For --scaffold-native, 0 the bundle document was emitted,
 2 the mod id / name / version was invalid, 1 the --out file could not be
-written.";
+written. For --structural, 0 the verdict is Full or feature-scoped Partial,
+2 the verdict is Blocked or the arguments were invalid, 1 the artifact could
+not be read or failed fail-closed structural parsing.";
 
 #[derive(Debug)]
 struct Cli {
@@ -196,6 +207,14 @@ struct AdaptCli {
 }
 
 #[derive(Debug)]
+struct StructuralCli {
+    path: PathBuf,
+    target: McVersion,
+    worldgen_epoch: Option<String>,
+    json: bool,
+}
+
+#[derive(Debug)]
 struct ScaffoldCli {
     mod_id: String,
     /// `--name` — validated, report-only; the v1 bundle schema is closed.
@@ -215,6 +234,7 @@ enum Action {
     AdaptJar(AdaptCli),
     AdaptModsDir(AdaptCli),
     ScaffoldNative(ScaffoldCli),
+    Structural(StructuralCli),
 }
 
 fn csv_ids(value: &OsString) -> Result<BTreeSet<String>, String> {
@@ -240,12 +260,15 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
     let mut adapt_jar: Option<PathBuf> = None;
     let mut adapt_dir: Option<PathBuf> = None;
     let mut scaffold: Option<String> = None;
+    let mut structural: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut name: Option<String> = None;
     let mut version: Option<String> = None;
     let mut mc_version: Option<String> = None;
     let mut flagship: Option<BTreeSet<String>> = None;
     let mut profiles: Option<BTreeSet<String>> = None;
+    let mut target_version: Option<String> = None;
+    let mut worldgen_epoch: Option<String> = None;
     let mut include_client_mixins = false;
     let mut json = false;
     let mut help = false;
@@ -319,6 +342,26 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                         .to_string(),
                 );
             }
+            "--structural" => {
+                let v = take_value(argv, &mut i, "--structural", inline_os.as_ref())?;
+                structural = Some(PathBuf::from(v));
+            }
+            "--target-version" => {
+                let v = take_value(argv, &mut i, "--target-version", inline_os.as_ref())?;
+                target_version = Some(
+                    v.to_str()
+                        .ok_or_else(|| format!("invalid non-UTF-8 --target-version '{v:?}'"))?
+                        .to_string(),
+                );
+            }
+            "--worldgen-epoch" => {
+                let v = take_value(argv, &mut i, "--worldgen-epoch", inline_os.as_ref())?;
+                worldgen_epoch = Some(
+                    v.to_str()
+                        .ok_or_else(|| format!("invalid non-UTF-8 --worldgen-epoch '{v:?}'"))?
+                        .to_string(),
+                );
+            }
             "--out" => {
                 let v = take_value(argv, &mut i, "--out", inline_os.as_ref())?;
                 out = Some(PathBuf::from(v));
@@ -371,14 +414,15 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
         + mods_dir.is_some() as usize
         + adapt_jar.is_some() as usize
         + adapt_dir.is_some() as usize
-        + scaffold.is_some() as usize;
+        + scaffold.is_some() as usize
+        + structural.is_some() as usize;
     match modes {
         0 => {
-            return Err("one of --modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir or --scaffold-native is required".to_string())
+            return Err("one of --modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir, --scaffold-native or --structural is required".to_string())
         }
         1 => {}
         _ => {
-            return Err("the mode flags (--modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir, --scaffold-native) are mutually exclusive".to_string())
+            return Err("the mode flags (--modpack, --scan-jar, --scan-mods-dir, --adapt-jar, --adapt-mods-dir, --scaffold-native, --structural) are mutually exclusive".to_string())
         }
     }
     let reject_modpack_only = |mode: &str| -> Result<(), String> {
@@ -389,6 +433,17 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
         ] {
             if present {
                 return Err(format!("{flag} only applies to --modpack, not {mode}"));
+            }
+        }
+        Ok(())
+    };
+    let reject_structural_only = |mode: &str| -> Result<(), String> {
+        for (flag, present) in [
+            ("--target-version", target_version.is_some()),
+            ("--worldgen-epoch", worldgen_epoch.is_some()),
+        ] {
+            if present {
+                return Err(format!("{flag} only applies to --structural, not {mode}"));
             }
         }
         Ok(())
@@ -406,9 +461,12 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
         }
         Ok(())
     };
-    match (modpack, scan_jar, mods_dir, adapt_jar, adapt_dir, scaffold) {
-        (None, None, Some(dir), None, None, None) => {
+    match (
+        modpack, scan_jar, mods_dir, adapt_jar, adapt_dir, scaffold, structural,
+    ) {
+        (None, None, Some(dir), None, None, None, None) => {
             reject_modpack_only("--scan-mods-dir")?;
+            reject_structural_only("--scan-mods-dir")?;
             reject_adapt_scaffold_flags("--scan-mods-dir", &[])?;
             Ok(Action::ScanModsDir(ModsDirCli {
                 dir,
@@ -416,8 +474,9 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
-        (None, Some(jar), None, None, None, None) => {
+        (None, Some(jar), None, None, None, None, None) => {
             reject_modpack_only("--scan-jar")?;
+            reject_structural_only("--scan-jar")?;
             reject_adapt_scaffold_flags("--scan-jar", &[])?;
             Ok(Action::ScanJar(JarCli {
                 jar,
@@ -425,13 +484,14 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
-        (Some(modpack), None, None, None, None, None) => {
+        (Some(modpack), None, None, None, None, None, None) => {
             if include_client_mixins {
                 return Err(
                     "--include-client-mixins only applies to the scan and adapt modes"
                         .to_string(),
                 );
             }
+            reject_structural_only("--modpack")?;
             reject_adapt_scaffold_flags("--modpack", &[])?;
             let declared = mc_version.unwrap_or_else(|| "1.21.1".to_string());
             let target = McVersion::parse(declared.trim())
@@ -447,8 +507,9 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
-        (None, None, None, Some(path), None, None) => {
+        (None, None, None, Some(path), None, None, None) => {
             reject_modpack_only("--adapt-jar")?;
+            reject_structural_only("--adapt-jar")?;
             reject_adapt_scaffold_flags("--adapt-jar", &["--out"])?;
             Ok(Action::AdaptJar(AdaptCli {
                 path,
@@ -457,8 +518,9 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
-        (None, None, None, None, Some(path), None) => {
+        (None, None, None, None, Some(path), None, None) => {
             reject_modpack_only("--adapt-mods-dir")?;
+            reject_structural_only("--adapt-mods-dir")?;
             reject_adapt_scaffold_flags("--adapt-mods-dir", &["--out"])?;
             Ok(Action::AdaptModsDir(AdaptCli {
                 path,
@@ -467,8 +529,9 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 json,
             }))
         }
-        (None, None, None, None, None, Some(mod_id)) => {
+        (None, None, None, None, None, Some(mod_id), None) => {
             reject_modpack_only("--scaffold-native")?;
+            reject_structural_only("--scaffold-native")?;
             reject_adapt_scaffold_flags("--scaffold-native", &["--out", "--name", "--version"])?;
             if include_client_mixins {
                 return Err(
@@ -483,6 +546,30 @@ fn parse_args(argv: &[OsString]) -> Result<Action, String> {
                 name,
                 version,
                 out,
+            }))
+        }
+        (None, None, None, None, None, None, Some(path)) => {
+            reject_modpack_only("--structural")?;
+            reject_adapt_scaffold_flags("--structural", &[])?;
+            if include_client_mixins {
+                return Err("--include-client-mixins does not apply to --structural".to_string());
+            }
+            let declared = target_version.unwrap_or_else(|| "1.21.1".to_string());
+            let target = McVersion::parse(declared.trim())
+                .filter(|v| *v == McVersion::V1_21_1 || *v == McVersion::V26_3)
+                .ok_or_else(|| {
+                    format!("invalid --target-version '{declared}' (expected 1.21.1 or 26.3)")
+                })?;
+            if let Some(epoch) = &worldgen_epoch {
+                if epoch.is_empty() || epoch.len() > 128 {
+                    return Err("--worldgen-epoch must be 1..=128 bytes".to_string());
+                }
+            }
+            Ok(Action::Structural(StructuralCli {
+                path,
+                target,
+                worldgen_epoch,
+                json,
             }))
         }
         // More than one mode flag was rejected above.
@@ -1424,6 +1511,135 @@ fn run_scaffold_native(cli: &ScaffoldCli) -> ExitCode {
     }
 }
 
+// ---------------------------------------------------------------------------
+// --structural
+// ---------------------------------------------------------------------------
+
+fn inspect_structural_artifact(path: &Path) -> Result<InspectableModUnit, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("'{}': cannot read structural input: {e}", path.display()))?;
+    let display = path.display().to_string();
+    if bytes.starts_with(b"PK") {
+        InspectableModUnit::from_jar_bytes(&bytes, &display).map_err(|e| e.to_string())
+    } else {
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("'{display}' is neither a ZIP archive nor UTF-8 bundle JSON"))?;
+        let bundle = DeclarativeModBundle::from_json(&text)
+            .map_err(|e| format!("'{display}': invalid declarative bundle: {e}"))?;
+        Ok(InspectableModUnit::from_bundle(&bundle))
+    }
+}
+
+fn structural_profile(cli: &StructuralCli) -> WorldProfile {
+    let mut profile = if cli.target == McVersion::V26_3 {
+        WorldProfile::vanilla_26_3()
+    } else {
+        WorldProfile::vanilla_1_21_1()
+    };
+    if let Some(epoch) = &cli.worldgen_epoch {
+        profile.worldgen_epoch = epoch.clone();
+    }
+    profile
+}
+
+fn format_structural_human(
+    path: &Path,
+    profile: &WorldProfile,
+    verdict: &CompatLoadVerdict,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Structural compatibility report for \"{}\"",
+        path.display()
+    );
+    let _ = writeln!(
+        out,
+        "Target {} / worldgen epoch {}",
+        profile.target_version, profile.worldgen_epoch
+    );
+    match verdict {
+        CompatLoadVerdict::Full {
+            capabilities_used,
+            inferred_count,
+            declared_count,
+        } => {
+            let _ = writeln!(
+                out,
+                "Verdict: FULL — every requirement is satisfied ({inferred_count} inferred, {declared_count} declared)."
+            );
+            for capability in capabilities_used {
+                let shim = if capability.shimmed {
+                    " via compatibility shim"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "  capability {} contract_rev {}{}",
+                    capability.name, capability.supported_rev, shim
+                );
+            }
+        }
+        CompatLoadVerdict::Partial {
+            skipped_features,
+            active_features,
+            reason_summary,
+        } => {
+            let _ = writeln!(
+                out,
+                "Verdict: PARTIAL — loading continues with only isolated optional feature(s) skipped."
+            );
+            let _ = writeln!(out, "Reason: {reason_summary}");
+            for feature in active_features {
+                let _ = writeln!(out, "  active: {feature}");
+            }
+            for feature in skipped_features {
+                let _ = writeln!(
+                    out,
+                    "  skipped: {} [{}] — {} ({})",
+                    feature.feature_id, feature.kind, feature.reason, feature.evidence
+                );
+            }
+        }
+        CompatLoadVerdict::Blocked { blockers } => {
+            let _ = writeln!(out, "Verdict: BLOCKED — fail-closed before world mutation.");
+            for blocker in blockers {
+                let _ = writeln!(
+                    out,
+                    "  blocker [{}]: {} ({})",
+                    blocker.kind.as_str(),
+                    blocker.message,
+                    blocker.evidence
+                );
+            }
+        }
+    }
+    out
+}
+
+fn run_structural(cli: &StructuralCli) -> ExitCode {
+    let unit = match inspect_structural_artifact(&cli.path) {
+        Ok(unit) => unit,
+        Err(e) => {
+            eprintln!("megu-mod-check: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let profile = structural_profile(cli);
+    let verdict = unit.evaluate(&profile);
+    if cli.json {
+        print!("{}", verdict.to_json());
+    } else {
+        println!("{}", format_structural_human(&cli.path, &profile, &verdict));
+    }
+    match verdict {
+        CompatLoadVerdict::Full { .. } | CompatLoadVerdict::Partial { .. } => ExitCode::SUCCESS,
+        CompatLoadVerdict::Blocked { .. } => ExitCode::from(2),
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<OsString> = env::args_os().skip(1).collect();
     match parse_args(&argv) {
@@ -1437,6 +1653,7 @@ fn main() -> ExitCode {
         Ok(Action::AdaptJar(cli)) => run_adapt_jar(&cli),
         Ok(Action::AdaptModsDir(cli)) => run_adapt_mods_dir(&cli),
         Ok(Action::ScaffoldNative(cli)) => run_scaffold_native(&cli),
+        Ok(Action::Structural(cli)) => run_structural(&cli),
         Err(msg) => {
             eprintln!("megu-mod-check: {msg}");
             eprintln!("Try 'megu-mod-check --help' for usage.");
@@ -1596,7 +1813,10 @@ mod tests {
         let bundle = DeclarativeModBundle::from_json(&json).unwrap();
         assert_eq!(bundle.mod_id, "mymod");
         assert_eq!(bundle.mc_version_range, "1.21.1");
-        assert_eq!(bundle_file_name(&bundle.mod_id).unwrap(), "mymod.bundle.json");
+        assert_eq!(
+            bundle_file_name(&bundle.mod_id).unwrap(),
+            "mymod.bundle.json"
+        );
 
         for bad in ["", "bad id", "..", "ns:id", "UPPER"] {
             assert!(scaffold_native_bundle(bad, "", "").is_err(), "{bad:?}");

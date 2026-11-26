@@ -191,6 +191,11 @@
 //!   [`capability_bus::SimpleFluidTank`] /
 //!   [`capability_bus::SimpleEnergyBuffer`] /
 //!   [`capability_bus::CookingPotItemAdapter`] endpoints.
+//! - [`structural_compat`]: structural versionless capability inspection —
+//!   clean capability names with internal `contract_rev`, exact
+//!   bytecode/datapack/bundle/WASM evidence, pinned `worldgen_epoch` safety,
+//!   and deterministic `Full` / feature-scoped `Partial` / fail-closed
+//!   `Blocked` load verdicts for declarative bundles and raw JAR/ZIP archives.
 //! - [`recipe_conflict_unify`]: always-on recipe conflict index —
 //!   Vanilla's silent same-input collisions become a deterministic,
 //!   vanilla-first `< i/N >` selector over
@@ -235,6 +240,7 @@ pub mod provenance_diff;
 pub mod recipe_conflict_unify;
 pub mod season_primitives;
 pub mod spine_bridge;
+pub mod structural_compat;
 pub mod unified_bundle;
 pub mod unified_tags;
 pub mod vanilla_qol_and_holidays;
