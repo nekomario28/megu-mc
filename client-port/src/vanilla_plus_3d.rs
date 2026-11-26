@@ -338,6 +338,36 @@ pub struct ExtrudedQuad {
     pub tint_index: i32,
 }
 
+/// Per-direction UVs for a cuboid net fitted into the unit texture rectangle.
+/// The four side faces wrap in west, north, east, south order, with the
+/// top and bottom faces in the row above them.
+pub(crate) fn cuboid_face_uvs([width, height, depth]: [f32; 3]) -> [[[f32; 2]; 4]; 6] {
+    // Calculate in f64 so a positive, thin cuboid still has a usable net
+    // even when its dimensions differ greatly.
+    let [w, h, d] = [width, height, depth].map(f64::from);
+    let net_width = 2.0 * (w + d);
+    let net_height = h + d;
+    let rect = |left, top, right, bottom| {
+        let u = |x: f64| (x / net_width) as f32;
+        let v = |y: f64| (y / net_height) as f32;
+        [
+            [u(left), v(bottom)],
+            [u(right), v(bottom)],
+            [u(right), v(top)],
+            [u(left), v(top)],
+        ]
+    };
+    // Indexed by crate::Direction: down, up, north, south, west, east.
+    [
+        rect(d + w, 0.0, d + 2.0 * w, d),
+        rect(d, 0.0, d + w, d),
+        rect(d, d, d + w, d + h),
+        rect(2.0 * d + w, d, net_width, d + h),
+        rect(0.0, d, d, d + h),
+        rect(d + w, d, 2.0 * d + w, d + h),
+    ]
+}
+
 /// An upgraded mesh: a bounded list of [`ExtrudedQuad`]s.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtrudedMesh {

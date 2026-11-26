@@ -199,9 +199,8 @@ pub struct BuiltSectionMesh {
     /// Core render descriptors of the built section: `vis_bits` is the
     /// portal connectivity [`megu_core::render_cs::bfs_visible_sections`]
     /// consumes, `has_protruding_bounds`/`max_protrusion_blocks` come from
-    /// the actual quad extents, and `has_non_axis_geometry` reports
-    /// `DrawBucket::UnculledCustom` quads a directional culler must never
-    /// clip.
+    /// the actual quad extents, and `has_non_axis_geometry` reports geometry
+    /// a directional culler must keep conservative.
     pub render_meta: SectionRenderMetadata,
     /// Greedily merged strict-occluder surface — the quads
     /// [`megu_core::render_cs::BinaryGreedyMesher`] emits for the same
@@ -231,6 +230,25 @@ fn push_normalized_packed_quad(quad: &Quad, out: &mut Vec<PackedVertex>) {
 /// pass. Holds no shared mutable state, so N workers can call it concurrently
 /// on independent [`SectionMeshInput`] snapshots.
 pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh {
+    build_section_mesh(input, None)
+}
+
+/// Build the packed terrain streams and a separate stream of original quads
+/// whose geometry cannot be represented by the packed format.
+///
+/// The second stream preserves input order, layers, lighting and triangle
+/// diagonals. Consumers draw its opaque/cutout quads with depth writes and
+/// sort its translucent quads together with their packed translucent stream.
+pub fn build_section_mesh_with_unpacked(input: &SectionMeshInput) -> (BuiltSectionMesh, Vec<Quad>) {
+    let mut unpacked = Vec::new();
+    let packed = build_section_mesh(input, Some(&mut unpacked));
+    (packed, unpacked)
+}
+
+fn build_section_mesh(
+    input: &SectionMeshInput,
+    mut unpacked: Option<&mut Vec<Quad>>,
+) -> BuiltSectionMesh {
     let coord = input.coord;
     let mut out = BuiltSectionMesh {
         coord,
@@ -305,6 +323,12 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
     let mut buckets: SixAxisBuckets<Quad> = SixAxisBuckets::new();
     for quad in &quads {
         out.visibility_mask |= quad.direction.bit();
+        if let Some(out) = unpacked.as_deref_mut() {
+            if quad.needs_unpacked_terrain() {
+                out.push(*quad);
+                continue;
+            }
+        }
         if is_translucent(quad) {
             out.translucent_quads.push(*quad);
         } else {
@@ -345,9 +369,8 @@ pub fn build_and_pack_section_mesh(input: &SectionMeshInput) -> BuiltSectionMesh
 /// The geometric half of [`SectionRenderMetadata`] measured on built
 /// quads: `max_protrusion_blocks` from vertex positions escaping the
 /// `16³` cell (sub-millimeter float noise rounded away) and
-/// `has_non_axis_geometry` when any quad classifies outside the six
-/// cardinal buckets — the same predicate the [`SixAxisBuckets`] split
-/// applies. `vis_bits` stays EMPTY; the caller owns connectivity.
+/// `has_non_axis_geometry` when a quad deviates from its cardinal face
+/// plane. `vis_bits` stays EMPTY; the caller owns connectivity.
 fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
     let mut max_protrusion = 0f32;
     let mut non_axis = false;
@@ -357,7 +380,7 @@ fn quads_render_meta(quads: &[Quad]) -> SectionRenderMetadata {
                 max_protrusion = max_protrusion.max(-value).max(value - EDGE as f32);
             }
         }
-        non_axis |= DirectionBuckets::index_of(quad.direction) == DIRECTION_BUCKET_UNASSIGNED;
+        non_axis |= !quad.lies_in_face_plane();
     }
     let protrusion_blocks = (max_protrusion - 0.0001)
         .max(0.0)

@@ -5,8 +5,8 @@
 //! the greedy mesher entirely.
 
 use crate::section::{
-    section_index, Block, Direction, SectionView, ALL_FACES, CUTOUT, EDGE, FACE_CELLS, NO_FLUID,
-    OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TRANSLUCENT,
+    section_index, Block, BlockShape, Direction, SectionView, ALL_FACES, CUTOUT, EDGE, FACE_CELLS,
+    NO_FLUID, OPAQUE, SAME_STATE_CULL, SECTION_CELLS, TRANSLUCENT,
 };
 
 /// Flags that mark a block as a renderable cube, matching the mesher's
@@ -147,6 +147,7 @@ impl SectionVis {
 fn seals(block: Block) -> bool {
     block.flags & OPAQUE != 0
         && block.occlusion & ALL_FACES == ALL_FACES
+        && block.shape() == BlockShape::Cube
         && block.fluid() == NO_FLUID
 }
 

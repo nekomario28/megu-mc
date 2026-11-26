@@ -10,6 +10,80 @@ fn air() -> Section {
     Section::filled(Block::AIR, DAY)
 }
 
+#[test]
+fn terrain_worker_preserves_fractional_and_non_axis_faces_after_caching() {
+    fn assert_triangle_area(positions: [[f32; 3]; 4], indices: [u8; 6]) {
+        for triangle in indices.as_chunks::<3>().0 {
+            let a = positions[triangle[0] as usize];
+            let b = positions[triangle[1] as usize];
+            let c = positions[triangle[2] as usize];
+            let u = std::array::from_fn::<_, 3, _>(|axis| b[axis] - a[axis]);
+            let v = std::array::from_fn::<_, 3, _>(|axis| c[axis] - a[axis]);
+            let area_squared = (0..3)
+                .map(|axis| {
+                    let i = (axis + 1) % 3;
+                    let j = (axis + 2) % 3;
+                    (u[i] * v[j] - u[j] * v[i]).powi(2)
+                })
+                .sum::<f32>();
+            assert!(area_squared > 0.0, "{positions:?} {triangle:?}");
+        }
+    }
+
+    let mut section = air();
+    let mut cache = MeshCache::new(MissingNeighbor::Air);
+    let coord = SectionCoord(4, -2, 3);
+    for (i, shape) in [
+        BlockShape::Torch,
+        BlockShape::FencePost,
+        BlockShape::SlabBottom,
+        BlockShape::CrossPlant,
+        BlockShape::Cube,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let block = Block {
+            state_id: i as u32 + 1,
+            flags: CUTOUT,
+            ..Block::AIR
+        }
+        .with_shape(shape);
+        section.set(2 * i + 2, 3, 4, block, Light::new(7, 13));
+    }
+    cache.insert(coord, section);
+    assert_eq!(cache.rebuild_dirty(1), vec![coord]);
+    let cached = cache.mesh(coord).unwrap();
+    let input = cache.snapshot_section_input(coord, 7).unwrap();
+    let (packed, unpacked) = build_section_mesh_with_unpacked(&input);
+    assert_eq!(packed.revision, 7);
+    assert!(packed.render_meta.has_non_axis_geometry);
+    assert!(packed.translucent_quads.is_empty());
+    let mut counts = [0; 5];
+    for quad in &unpacked {
+        assert!(cached.contains(quad));
+        assert_triangle_area(quad.positions, quad.indices());
+        counts[quad.state_id as usize - 1] += 1;
+    }
+    assert_eq!(counts, [6, 6, 4, 4, 0]);
+    let (packed_quads, remainder) = packed.opaque_packed.as_chunks::<4>();
+    assert!(remainder.is_empty());
+    for vertices in packed_quads {
+        let positions = std::array::from_fn(|i| {
+            let word = vertices[i].position;
+            [
+                (word & 31) as f32,
+                (word >> 10) as f32 / 1024.0,
+                ((word >> 5) & 31) as f32,
+            ]
+        });
+        assert_triangle_area(positions, [0, 1, 2, 0, 2, 3]);
+        counts[vertices[0].state_id as usize - 1] += 1;
+    }
+    assert_eq!(counts, [6, 6, 6, 4, 6]);
+    assert_eq!(cached.len(), counts.into_iter().sum::<usize>());
+}
+
 fn fluid(kind: u8, level: u8) -> Block {
     let base = if kind == WATER { 80 } else { 96 };
     Block {

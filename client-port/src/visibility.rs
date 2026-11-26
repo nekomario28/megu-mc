@@ -19,7 +19,7 @@
 use megu_core::bloom::VoxelBitset4096;
 use megu_core::render_cs::{compute_section_visibility, FaceDir, SectionVisBits};
 
-use crate::section::{Block, Direction, ALL_FACES, OPAQUE, SECTION_CELLS};
+use crate::section::{Block, BlockShape, Direction, ALL_FACES, OPAQUE, SECTION_CELLS};
 
 const FACES: usize = 6;
 /// All 36 entries of the 6x6 matrix, bit `enter * 6 + exit` per pair.
@@ -62,7 +62,9 @@ pub const fn face_dir_direction(face: FaceDir) -> Direction {
 /// Whether `block` stops sight traversal through its cell.
 #[inline(always)]
 pub(crate) fn blocks_sight(block: Block) -> bool {
-    block.flags & OPAQUE != 0 && block.occlusion & ALL_FACES == ALL_FACES
+    block.flags & OPAQUE != 0
+        && block.occlusion & ALL_FACES == ALL_FACES
+        && block.shape() == BlockShape::Cube
 }
 
 /// Symmetric 6x6 face-to-face reachability for one 16x16x16 section. Bit

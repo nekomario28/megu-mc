@@ -87,6 +87,8 @@ pub const WATERLOGGED: u8 = 1 << 3;
 pub const TINTED: u8 = 1 << 4;
 pub const FLUID_TINTED: u8 = 1 << 5;
 pub const SAME_STATE_CULL: u8 = 1 << 6;
+/// A waterlogged cell's level byte holds its solid shape and parameter.
+pub const WATERLOGGED_SHAPE: u8 = 1 << 7;
 pub const ALL_FACES: u8 = 0x3f;
 
 pub const NO_FLUID: u8 = 0;
@@ -94,8 +96,8 @@ pub const WATER: u8 = 1;
 pub const LAVA: u8 = 2;
 
 /// Compact render geometry class. The value is packed into `fluid_level` for
-/// non-fluid blocks so the stable `Block` layout and existing struct literals
-/// remain unchanged.
+/// dry blocks and explicitly shaped waterlogged blocks. In waterlogged
+/// cells, water remains a source independently of the solid shape.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum BlockShape {
@@ -145,14 +147,19 @@ impl Block {
     }
 
     pub const fn with_shape(mut self, shape: BlockShape) -> Self {
-        if self.fluid_kind == NO_FLUID && self.flags & WATERLOGGED == 0 {
+        if self.flags & WATERLOGGED != 0 {
+            self.flags |= WATERLOGGED_SHAPE;
+            self.fluid_level = shape as u8;
+        } else if self.fluid_kind == NO_FLUID {
             self.fluid_level = shape as u8;
         }
         self
     }
 
     pub const fn shape(self) -> BlockShape {
-        if self.fluid() != NO_FLUID || self.flags & WATERLOGGED != 0 {
+        if self.fluid() != NO_FLUID
+            && self.flags & (WATERLOGGED | WATERLOGGED_SHAPE) != (WATERLOGGED | WATERLOGGED_SHAPE)
+        {
             return BlockShape::Cube;
         }
         match self.fluid_level & 0x0f {
@@ -171,7 +178,9 @@ impl Block {
 
     /// Pack a small shape-specific parameter in the spare high nibble.
     pub const fn with_shape_parameter(mut self, parameter: u8) -> Self {
-        if self.fluid_kind == NO_FLUID && self.flags & WATERLOGGED == 0 {
+        if (self.fluid_kind == NO_FLUID && self.flags & WATERLOGGED == 0)
+            || self.flags & (WATERLOGGED | WATERLOGGED_SHAPE) == (WATERLOGGED | WATERLOGGED_SHAPE)
+        {
             let parameter = if parameter > 15 { 15 } else { parameter };
             self.fluid_level = (self.fluid_level & 0x0f) | (parameter << 4);
         }
@@ -183,7 +192,9 @@ impl Block {
     }
 
     pub(crate) fn occludes(self, side: Direction) -> bool {
-        self.flags & OPAQUE != 0 && self.occlusion & side.bit() != 0
+        self.flags & OPAQUE != 0
+            && self.occlusion & side.bit() != 0
+            && self.shape() == BlockShape::Cube
     }
 
     /// Mesher-level "can draw something": a renderable cube flag or any fluid.
