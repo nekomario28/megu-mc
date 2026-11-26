@@ -15923,6 +15923,7 @@ mod sleep_protocol_parity_tests {
 
     #[test]
     fn bed_sleep_respects_100_ticks_and_players_sleeping_percentage() {
+        let _guard = world_guard();
         let _serial = SLEEP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old_clients = std::mem::take(&mut *clients().lock().unwrap_or_else(|e| e.into_inner()));
         let old_world_time = WORLD_TIME.load(Ordering::Relaxed);

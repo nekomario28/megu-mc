@@ -1721,7 +1721,13 @@ impl LiveModSuite {
             })
     }
 
-    fn adopt_adapted_jars(&mut self, adapted: &[LiveAdaptedJar]) {
+    fn adopt_adapted_jars(&mut self, adapted: &[LiveAdaptedJar], plan: &DualLoaderPlan) {
+        let skipped: BTreeSet<_> = plan
+            .skipped_superseded
+            .iter()
+            .chain(&plan.skipped_client_only)
+            .map(|jar| jar.jar_name.as_str())
+            .collect();
         for (file_name, result) in adapted {
             let solver_admitted = self.admitted_jars.contains(file_name);
             match result {
@@ -1729,12 +1735,18 @@ impl LiveModSuite {
                     self.adopt_jar_result(file_name, result)
                 }
                 Ok(result) => {
-                    let reason = if !solver_admitted {
+                    let reason = if result.tier == AdaptationTier::AutoSkipped
+                        && (solver_admitted || skipped.contains(file_name.as_str()))
+                    {
+                        // Record the skip without adopting any content from the JAR.
+                        result.audit_notes.join("; ")
+                    } else if !solver_admitted {
                         "dependency admission rejected this JAR before activation".to_string()
                     } else {
                         format!(
-                            "adaptation tier {} is not a verified native/Tier-2 activation",
-                            result.tier.as_str()
+                            "adaptation tier {} is not a verified native/Tier-2 activation: {}",
+                            result.tier.as_str(),
+                            result.blockers.join("; ")
                         )
                     };
                     eprintln!("[live-mods] {file_name}: {reason}");
@@ -1862,7 +1874,7 @@ impl LiveModSuite {
         );
         self.apply_dependency_admission(&plan);
         let adapted = Self::adapt_jars(dir, &jars);
-        self.adopt_adapted_jars(&adapted);
+        self.adopt_adapted_jars(&adapted, &plan);
         self.build_registry_plan(dir, &adapted);
         self.load_admitted_jar_data(&bounded_jars, &adapted, &plan);
         self.dual_loader = plan;
@@ -1963,8 +1975,7 @@ impl LiveModSuite {
     /// Fold one [`JarAdaptationResult`] into the live suite: install the
     /// emitted bundle, aggregate the culinary stats, arm the lifted hook
     /// bindings, and record the audit/summary rows the boot report reads.
-    /// Auto-skipped JARs report their skip but onboard nothing — exactly
-    /// what a superseded perf mod must do.
+    /// Called only for solver-admitted, verified native/Tier-2 JARs.
     fn adopt_jar_result(&mut self, file_name: &str, result: &JarAdaptationResult) {
         if let Some(bundle) = &result.bundle {
             self.install_bundle(bundle, file_name);
@@ -8710,7 +8721,13 @@ mod wire_mods_tests {
     static WIRE_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_suite() {
-        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = LiveModSuite::new();
+        {
+            let suite = live_mod_suite();
+            let mut guard = suite.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = LiveModSuite::new();
+            // Recover the replaced test fixture, not production lock failures.
+            suite.clear_poison();
+        }
         live_cap_reset();
         live_mod_refresh_hook_gate();
     }
@@ -9445,7 +9462,10 @@ mod wire_mods_tests {
     /// Read one framed server packet from the client peer. TCP may coalesce
     /// or split frames, so `stash` buffers bytes across calls: only the
     /// varint-delimited frame is consumed per call.
-    fn lmb_read_frame(peer: &mut TcpStream, stash: &mut Vec<u8>) -> Option<(i64, Vec<u8>)> {
+    pub(super) fn lmb_read_frame(
+        peer: &mut TcpStream,
+        stash: &mut Vec<u8>,
+    ) -> Option<(i64, Vec<u8>)> {
         peer.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
         loop {
             {
@@ -9463,12 +9483,15 @@ mod wire_mods_tests {
             }
             let mut buf = [0u8; 4096];
             let n = peer.read(&mut buf).ok()?;
+            if n == 0 {
+                return None;
+            }
             stash.extend_from_slice(&buf[..n]);
         }
     }
 
     /// Decode a `custom_payload` S2C body into `(channel, payload)`.
-    fn lmb_decode_payload(body: &[u8]) -> (String, Vec<u8>) {
+    pub(super) fn lmb_decode_payload(body: &[u8]) -> (String, Vec<u8>) {
         let mut sl = body;
         let len = read_varint(&mut sl).expect("channel varint") as usize;
         let (channel, payload) = sl.split_at(len);
@@ -9533,7 +9556,11 @@ mod wire_mods_tests {
         let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = lmb_temp_dir("jar-boot");
-        std::fs::write(dir.join("sodium-0.6.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
+        std::fs::write(
+            dir.join("sodium-0.6.jar"),
+            lmb_test_jar(&[("fabric.mod.json", &lmb_fabric_manifest("sodium"))]),
+        )
+        .unwrap();
         std::fs::write(
             dir.join("delightaddon-1.jar"),
             lmb_culinary_jar("delightaddon"),
@@ -9565,44 +9592,43 @@ mod wire_mods_tests {
         } else {
             std::env::remove_var("MEGU_MODS_DIR");
         }
-        let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(suite.auto_adapted.len(), 3);
-        assert_eq!(suite.culinary_stats.cooking_recipes, 1);
+        let (adapted, cooking_recipes, hooks, reports) = {
+            let suite = live_mod_suite().lock().unwrap_or_else(|e| e.into_inner());
+            (
+                suite.auto_adapted.clone(),
+                suite.culinary_stats.cooking_recipes,
+                suite.lifted_hooks.clone(),
+                suite.reports.clone(),
+            )
+        };
+        fresh_suite();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The active list excludes both skipped and Tier 3 JARs; they still
+        // have report rows. Only the verified Tier 2 JAR installs a hook.
+        assert_eq!(adapted.len(), 2);
+        assert_eq!(cooking_recipes, 1);
         assert_eq!(
-            suite
-                .auto_adapted
+            adapted
                 .iter()
                 .find(|m| m.mod_id == "delightaddon")
                 .unwrap()
                 .tag_files,
             1
         );
-        let safe = suite
-            .auto_adapted
-            .iter()
-            .find(|m| m.mod_id == "safemod")
-            .unwrap();
+        let safe = adapted.iter().find(|m| m.mod_id == "safemod").unwrap();
         assert_eq!(safe.tier, AdaptationTier::Tier2LiftedShim);
         assert_eq!(safe.lifted_hooks.len(), 1);
-        assert_eq!(suite.lifted_hooks.len(), 1);
-        assert_eq!(
-            suite.lifted_hooks[0].1.hook,
-            StandardEventHook::EntityDamagePre
-        );
-        let fallback = suite
-            .auto_adapted
-            .iter()
-            .find(|m| m.mod_id == "redirectmod")
-            .unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].1.hook, StandardEventHook::EntityDamagePre);
+        assert!(!adapted.iter().any(|m| m.mod_id == "redirectmod"));
+        let fallback = reports.iter().find(|r| r.mod_id == "redirectmod").unwrap();
         assert_eq!(fallback.tier, AdaptationTier::Tier3FallbackRequired);
-        assert!(fallback.lifted_hooks.is_empty());
-        assert!(suite
-            .reports
-            .iter()
-            .any(|r| r.mod_id == "sodium" && r.tier == AdaptationTier::AutoSkipped));
-        drop(suite);
-        fresh_suite();
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(reports.iter().any(|r| {
+            r.mod_id == "sodium"
+                && r.tier == AdaptationTier::AutoSkipped
+                && r.diagnostic.contains(REASON_SUPERSEDED)
+        }));
     }
 
     #[test]
@@ -9612,7 +9638,7 @@ mod wire_mods_tests {
         let dir = lmb_temp_dir("scan");
         std::fs::write(
             dir.join("sodium-0.6.13.jar"),
-            lmb_test_jar(&[("x.bin", b"x")]),
+            lmb_test_jar(&[("fabric.mod.json", &lmb_fabric_manifest("sodium"))]),
         )
         .unwrap();
         std::fs::write(
@@ -9769,6 +9795,8 @@ mod wire_mods_tests {
             lmb_test_jar(&[("fabric.mod.json", manifest)]),
         )
         .unwrap();
+        // A superseded-looking filename cannot stand in for loader metadata.
+        std::fs::write(dir.join("sodium-0.6.jar"), lmb_test_jar(&[("x.bin", b"x")])).unwrap();
         let mut suite = LiveModSuite::new();
         suite.scan_mods_dir(&dir);
         let report = suite
@@ -9786,8 +9814,15 @@ mod wire_mods_tests {
             "{}",
             report.diagnostic
         );
-        // A skipped jar reports its skip but onboards nothing.
-        assert!(suite.auto_adapted.iter().all(|m| m.mod_id != "lithium"));
+        let rejected = suite
+            .reports
+            .iter()
+            .find(|r| r.file_name == "sodium-0.6.jar")
+            .expect("manifest-less report");
+        assert!(rejected.diagnostic.contains("dependency admission rejected"));
+        // Neither the skipped nor the rejected JAR onboards anything.
+        assert!(suite.admitted_jars.is_empty());
+        assert!(suite.auto_adapted.is_empty());
         assert!(suite.lifted_hooks.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -10108,6 +10143,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_progression_barrier_locks_and_allows() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         live_mod_suite()
@@ -10171,10 +10207,12 @@ mod wire_mods_tests {
             ),
             LiveProgressionVerdict::Allowed
         );
+        fresh_suite();
     }
 
     #[test]
     fn wire_mods_progression_denies_break_and_resyncs() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         {
@@ -10255,6 +10293,7 @@ mod wire_mods_tests {
 
     #[test]
     fn wire_mods_msy1_manifest_served_on_join() {
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         let dir = lmb_temp_dir("sync");
@@ -10432,67 +10471,35 @@ version="3.0.0"
 
     #[test]
     fn w_mod_live_cafebabe_damage_hook_executes_without_jvm() {
-        use mod_adapter_core::bytecode_subset_vm::testkit::{ClassAssembler, MethodSpec};
-
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
-        let mut asm = ClassAssembler::new("example/ThresholdDamage");
-        let get = asm.cp.method_ref("megu/api/Event", "getDamage", "()F");
-        let set = asm.cp.method_ref("megu/api/Event", "setDamage", "(F)V");
-        let ten = asm.cp.float(10.0);
-        let half = asm.cp.float(0.5);
-        let code = vec![
-            0x2a,
-            0xb6,
-            (get >> 8) as u8,
-            get as u8,
-            0x12,
-            ten as u8,
-            0x95,
-            0x9e,
-            0,
-            14,
-            0x2a,
-            0x2a,
-            0xb6,
-            (get >> 8) as u8,
-            get as u8,
-            0x12,
-            half as u8,
-            0x6a,
-            0xb6,
-            (set >> 8) as u8,
-            set as u8,
-            0xb1,
-        ];
-        let class = asm.finish(&[MethodSpec::new(
-            "onDamage",
-            "(Lmegu/api/Event;)V",
-            4,
-            1,
-            code,
-        )]);
+        let class = lmb_halve_damage_class();
         assert_eq!(&class[..4], &[0xca, 0xfe, 0xba, 0xbe]);
+
+        // A valid onDamage method alone is not enough to activate a Tier 3 JAR.
         let dir = lmb_temp_dir("damage-class");
-        let manifest = br#"{"schemaVersion":1,"id":"damagehook","version":"1.0.0"}"#;
         std::fs::write(
             dir.join("damagehook-1.jar"),
             lmb_test_jar(&[
-                ("fabric.mod.json", manifest),
-                ("example/ThresholdDamage.class", &class),
+                ("fabric.mod.json", &lmb_fabric_manifest("damagehook")),
+                ("example/DamageHook.class", &class),
             ]),
         )
         .unwrap();
         let mut suite = LiveModSuite::new();
         suite.scan_mods_dir(&dir);
-        assert_eq!(suite.damage_hooks.len(), 1);
-        suite.active = true;
-        *live_mod_suite().lock().unwrap_or_else(|e| e.into_inner()) = suite;
-        live_mod_refresh_hook_gate();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(suite.admitted_jars.contains("damagehook-1.jar"));
+        assert_eq!(suite.reports[0].tier, AdaptationTier::Tier3FallbackRequired);
+        assert!(suite.damage_hooks.is_empty());
+
+        // The exact same bytecode can execute in an admitted Tier 2 JAR.
+        lmb_arm_damage_dispatch(&lmb_damage_dispatch_jar(&class));
         assert_eq!(live_mod_eval_damage_hooks(14.0), 7.0);
         assert_eq!(live_mod_eval_damage_hooks(6.0), 6.0);
         assert!(live_mod_eval_damage_hooks(f32::NAN).is_nan());
-        let _ = std::fs::remove_dir_all(dir);
+        fresh_suite();
     }
 
     // ---------- live EntityDamagePre dispatch ----------
@@ -10867,6 +10874,7 @@ version="3.0.0"
     fn mega_w3_live_mod_bridge_culinary_season_magic_and_harvest_execute() {
         use mod_adapter_core::dimension_mod as dim_mod;
 
+        let _guard = crate::world_guard();
         let _serial = WIRE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         fresh_suite();
         *live_magic_state().lock().unwrap_or_else(|e| e.into_inner()) = LiveMagicState::default();
@@ -12593,6 +12601,8 @@ mod live_create_tests {
 
     #[test]
     fn create_join_snapshot_and_tick_frame_shape() {
+        use wire_mods_tests::{lmb_decode_payload, lmb_read_frame, lmb_socket_pair};
+
         let _g = world_guard();
         arm();
         let (wx, wy, wz) = W4;
@@ -12605,33 +12615,33 @@ mod live_create_tests {
         let shaft = state_of("create:shaft", &[("axis", "x")]);
         put(DimId::Overworld, wx + 2, wy, wz, shaft);
 
-        // The join packet: a real socket pair carries the exact S2C frame —
-        // packet id 0x19, channel create:kinetic_sync_v1, batch payload.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let mut send = std::net::TcpStream::connect(addr).unwrap();
+        // Join sends the dynamic registry before the dimension-scoped snapshot.
+        let (mut send, mut recv) = lmb_socket_pair();
         live_create_sync_on_join(&mut send);
         drop(send);
-        let (mut recv, _) = listener.accept().unwrap();
-        use std::io::Read;
-        let mut buf = Vec::new();
-        recv.read_to_end(&mut buf).unwrap();
-        assert!(!buf.is_empty(), "join snapshot emitted");
-        let mut frame: &[u8] = &buf;
-        // Outer packet length varint, then packet id 0x19.
-        let plen = read_varint(&mut frame).expect("frame len") as usize;
-        assert_eq!(frame.len(), plen);
-        let id = read_varint(&mut frame).expect("packet id");
+        let mut stash = Vec::new();
+        let (id, body) = lmb_read_frame(&mut recv, &mut stash).expect("registry frame");
         assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
-        let chan_len = read_varint(&mut frame).expect("channel len") as usize;
-        let channel = std::str::from_utf8(&frame[..chan_len]).unwrap();
+        let (channel, payload) = lmb_decode_payload(&body);
+        assert_eq!(channel, MOD_REGISTRY_SYNC_CHANNEL);
+        mod_adapter_core::live_registry_bridge::decode_registry_sync_frame(&payload)
+            .expect("registry decodes");
+
+        let (id, body) = lmb_read_frame(&mut recv, &mut stash).expect("kinetic frame");
+        assert_eq!(id, LIVE_MOD_S2C_CUSTOM_PAYLOAD_ID);
+        let (channel, payload) = lmb_decode_payload(&body);
         assert_eq!(
             channel,
             create_adapter::neoforge_wire::CHANNEL_CREATE_KINETIC_SYNC
         );
-        let tags = create_adapter::neoforge_wire::decode_kinetic_update_batch(&frame[chan_len..])
-            .expect("snapshot decodes");
-        assert!(tags.iter().any(|t| t.pos == pos_of(W4)));
+        let chunk = create_adapter::neoforge_wire::decode_kinetic_batch_chunk(&payload)
+            .expect("snapshot chunk decodes");
+        assert_eq!(chunk.dimension_id, DimId::Overworld.raw() as i32);
+        assert_eq!(chunk.snapshot_generation, TICK_IDX.load(Ordering::Relaxed));
+        assert_eq!((chunk.chunk_index, chunk.chunk_total), (0, 1));
+        assert!(chunk.tags.iter().any(|t| t.pos == pos_of(W4)));
+        assert!(lmb_read_frame(&mut recv, &mut stash).is_none());
+        assert!(stash.is_empty(), "no partial frame after the snapshot");
 
         for c in [(wx, wy, wz), (wx + 1, wy, wz), (wx + 2, wy, wz)] {
             clear(c.0, c.1, c.2);

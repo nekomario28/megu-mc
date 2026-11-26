@@ -1893,6 +1893,7 @@ mod admin_wire_config_tests {
     /// unknown-key check accepts them.
     #[test]
     fn operator_tables_parse_without_unknown_key_warnings() {
+        let _guard = world_guard();
         let text = r#"
 [servers]
 fallback = "lobby"
