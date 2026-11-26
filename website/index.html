@@ -49,125 +49,361 @@
 </head>
 <body>
 
-  <header class="nav">
-    <div class="nav-inner">
-      <a class="brand" href="#top">
-        <img class="brand-logo" src="logo.svg" alt="" width="26" height="26" aria-hidden="true">
+  <!-- Scroll-reactive luminous Moon & night-sky horizon backdrop (100% local SVG/CSS) -->
+  <div class="moon-sky" aria-hidden="true">
+    <div class="sky-stars">
+      <span class="sky-star" style="top:11%;left:9%;width:2px;height:2px;opacity:.65;"></span>
+      <span class="sky-star warm" style="top:18%;left:23%;width:3px;height:3px;opacity:.75;"></span>
+      <span class="sky-star" style="top:8%;left:41%;width:2px;height:2px;opacity:.5;"></span>
+      <span class="sky-star rose" style="top:24%;left:54%;width:2px;height:2px;opacity:.6;"></span>
+      <span class="sky-star" style="top:14%;left:68%;width:2px;height:2px;opacity:.55;"></span>
+      <span class="sky-star warm" style="top:31%;left:15%;width:2px;height:2px;opacity:.5;"></span>
+      <span class="sky-star" style="top:42%;left:84%;width:3px;height:3px;opacity:.65;"></span>
+      <span class="sky-star" style="top:49%;left:32%;width:2px;height:2px;opacity:.45;"></span>
+      <span class="sky-star rose" style="top:58%;left:74%;width:2px;height:2px;opacity:.55;"></span>
+      <span class="sky-star warm" style="top:64%;left:11%;width:2px;height:2px;opacity:.5;"></span>
+      <span class="sky-star" style="top:72%;left:48%;width:2px;height:2px;opacity:.45;"></span>
+      <span class="sky-star" style="top:81%;left:89%;width:2px;height:2px;opacity:.55;"></span>
+    </div>
+    <div class="sky-stars sky-stars-near">
+      <span class="sky-star warm" style="top:15%;left:34%;width:3px;height:3px;opacity:.8;"></span>
+      <span class="sky-star" style="top:27%;left:79%;width:2px;height:2px;opacity:.7;"></span>
+      <span class="sky-star rose" style="top:38%;left:7%;width:3px;height:3px;opacity:.65;"></span>
+      <span class="sky-star" style="top:53%;left:61%;width:2px;height:2px;opacity:.6;"></span>
+      <span class="sky-star warm" style="top:69%;left:26%;width:3px;height:3px;opacity:.7;"></span>
+      <span class="sky-star" style="top:86%;left:67%;width:2px;height:2px;opacity:.55;"></span>
+    </div>
+
+    <div class="moon-orb-wrap">
+      <div class="moon-halo"></div>
+      <svg class="moon-svg" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <radialGradient id="meguMoonFace" cx="38%" cy="34%" r="68%">
+            <stop offset="0%" stop-color="#fff8e6"/>
+            <stop offset="48%" stop-color="#e5d7ff"/>
+            <stop offset="82%" stop-color="#a78bda"/>
+            <stop offset="100%" stop-color="#5d428f"/>
+          </radialGradient>
+          <linearGradient id="meguMoonRim" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#ffefba" stop-opacity="0.9"/>
+            <stop offset="55%" stop-color="#d3bcff" stop-opacity="0.45"/>
+            <stop offset="100%" stop-color="#ffb3b7" stop-opacity="0.25"/>
+          </linearGradient>
+        </defs>
+        <circle cx="100" cy="100" r="82" fill="url(#meguMoonFace)" stroke="url(#meguMoonRim)" stroke-width="2"/>
+        <!-- Subtle lunar maria & voxel-inspired craters -->
+        <circle cx="72" cy="76" r="18" fill="#8b6ec2" opacity="0.28"/>
+        <circle cx="122" cy="68" r="11" fill="#7c5eb5" opacity="0.24"/>
+        <circle cx="128" cy="118" r="22" fill="#6b4da3" opacity="0.26"/>
+        <circle cx="84" cy="126" r="10" fill="#7c5eb5" opacity="0.22"/>
+        <circle cx="104" cy="96" r="6" fill="#fff8e6" opacity="0.25"/>
+        <rect x="64" y="68" width="12" height="12" rx="3" fill="#fff8e6" opacity="0.16"/>
+        <rect x="118" y="110" width="14" height="14" rx="3" fill="#50378a" opacity="0.18"/>
+      </svg>
+    </div>
+
+    <div class="sky-horizon far">
+      <svg viewBox="0 0 1440 280" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M0 280 L0 190 L160 155 L310 175 L480 120 L650 160 L820 112 L990 152 L1170 96 L1330 144 L1440 122 L1440 280 Z"
+              fill="#1d182b"/>
+      </svg>
+    </div>
+    <div class="sky-horizon near">
+      <svg viewBox="0 0 1440 260" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M0 260 L0 208 L120 184 L260 202 L420 168 L580 196 L740 160 L920 192 L1100 154 L1280 186 L1440 164 L1440 260 Z"
+              fill="#15121f"/>
+      </svg>
+    </div>
+  </div>
+
+  <!-- Clean Sticky Top App Bar -->
+  <div class="topbar-wrap">
+    <header class="topbar">
+      <a class="nav-brand" href="#top">
+        <img class="brand-logo" src="logo.svg" alt="Megu" width="28" height="28">
         <span data-cfg="projectName">Megu</span>
       </a>
-      <nav class="nav-links" aria-label="Primary">
-        <a href="#downloads" data-i18n="nav_downloads">Downloads</a>
-        <a href="#benchmarks" data-i18n="nav_bench">Benchmarks</a>
-        <a href="#checker" data-i18n="nav_checker">Modpack check</a>
-        <a href="#how" data-i18n="nav_how">Architecture</a>
-        <a href="#mods" data-i18n="nav_mods">Mods &amp; shaders</a>
-        <a href="#support" data-i18n="nav_support">Support &amp; Hosts</a>
-        <a href="https://github.com/nekomario28/megu-mc"
-           data-cfg-href="githubUrl">GitHub</a>
+
+      <nav class="nav-pills" aria-label="Primary navigation">
+        <a href="#benchmarks" data-route="benchmarks" data-i18n="nav_bench">Benchmarks</a>
+        <a href="#features" data-route="features" data-i18n="nav_feat">Features</a>
+        <a href="#downloads" data-route="downloads" data-i18n="nav_dl">Download</a>
+        <a href="#status" data-route="status" data-i18n="nav_status">Status</a>
+        <a href="#checker" data-route="checker" data-i18n="nav_check">Modpack Check</a>
+        <a href="#support" data-route="support" data-i18n="nav_support">Support</a>
       </nav>
-      <button class="lang-toggle" id="lang-toggle" type="button" aria-label="Switch language">日本語</button>
-    </div>
-  </header>
 
-  <main id="top">
-
-    <section class="hero">
-      <div class="wrap">
-        <p class="eyebrow">
-          <span>Minecraft: Java Edition</span>
-          <span class="pills" id="target-pills">
-            <span class="pill">1.21.1</span>
-          </span>
-          <span class="sep" aria-hidden="true">·</span>
-          <span>Written in Rust</span>
-          <span class="sep" aria-hidden="true">·</span>
-          <span data-cfg="statusBadge">Experimental Alpha</span>
-          <a class="pill" id="latest-release-pill" href="https://github.com/nekomario28/megu-mc/releases"
-             data-cfg-href="releasesUrl" hidden></a>
-        </p>
-
-        <h1 class="hero-title">
-          <span data-cfg="projectName">Megu</span>
-          <span class="hero-sub" data-i18n="hero_headline">Native Rust + wgpu Minecraft 1.21.1 engine.</span>
-        </h1>
-
-        <p class="lead" data-i18n="hero_lead">
-          Open-source LGPL-3.0 Minecraft: Java Edition 1.21.1 client &amp; server written in Rust. Native Vulkan / DX12 / Metal rendering via wgpu (zero OpenGL), no JVM on either side, and automatic NeoForge / Fabric mod inspection.
-        </p>
-
-        <div class="hero-kpis" aria-label="Measured highlights">
-          <div class="kpi-card">
-            <span class="kpi-val">9.6× <span class="kpi-unit" data-i18n="kpi_ram_unit">less RAM vs Vanilla</span></span>
-            <span class="kpi-sub" data-i18n="kpi_ram_sub">122 MiB vs 1,168 MiB (1.21.1 server measured)</span>
-          </div>
+      <div class="nav-right">
+        <div class="m3-seg-sm" role="group" aria-label="Language">
+          <button type="button" class="locale-btn" data-lang="ja">JP</button>
+          <button type="button" class="locale-btn active" data-lang="en">EN</button>
         </div>
+        <a class="nav-gh" href="https://github.com/nekomario28/megu-mc"
+           data-cfg-href="githubUrl" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+      </div>
+    </header>
+  </div>
 
-        <div class="hero-actions">
-          <a class="btn primary" href="#downloads" data-i18n="cta_download">Get Megu</a>
-          <a class="btn" href="#checker" data-i18n="cta_check">Check a modpack</a>
-          <a class="btn ghost" href="https://github.com/nekomario28/megu-mc"
-             data-cfg-href="githubUrl" data-i18n="cta_github">View on GitHub</a>
+  <main>
+    <!-- Hero -->
+    <section id="top" class="hero-card">
+      <div class="hero-eyebrow">
+        <span class="m3-badge"><span class="m3-dot"></span><span data-cfg="statusBadge">Experimental Alpha</span></span>
+        <span class="pills" id="target-pills"><span class="pill">1.21.1</span></span>
+        <a class="m3-badge" id="latest-release-pill"
+           href="https://github.com/nekomario28/megu-mc/releases"
+           data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" hidden></a>
+      </div>
+
+      <div class="hero-title-row">
+        <img class="brand-logo" src="logo.svg" alt="Megu icon" width="52" height="52">
+        <h1 data-cfg="projectName">Megu</h1>
+      </div>
+
+      <p class="hero-sub" data-i18n="hero_sub">Minecraft: Java Edition 1.21.1 client &amp; server in Rust</p>
+      <p class="hero-lead" data-i18n="hero_lead">
+        A Java-free 1.21.1 dedicated server and native Vulkan / DX12 / Metal client via wgpu (zero OpenGL). Supports existing 1.21.1 servers, worlds, and Fabric / NeoForge mods.
+      </p>
+
+      <div class="hero-actions">
+        <a href="#downloads" class="m3-btn-filled" data-i18n="hero_cta_dl">Download</a>
+        <a href="#checker" class="m3-btn-tonal" data-i18n="hero_cta_check">Check Modpack</a>
+        <a href="https://github.com/nekomario28/megu-mc/tree/main/docs"
+           data-cfg-href="docsBaseUrl" target="_blank" rel="noopener noreferrer"
+           class="m3-btn-text" data-i18n="hero_docs">Docs ↗</a>
+      </div>
+
+      <div class="hero-stats" aria-label="Measured highlights">
+        <div class="m3-stat">
+          <div class="m3-stat-val"><span class="hi">122</span> MiB</div>
+          <div class="m3-stat-label" data-i18n="hm1_label">Measured server RAM (Vanilla 1,168 MiB)</div>
+        </div>
+        <div class="m3-stat">
+          <div class="m3-stat-val">Vulkan / DX12 / Metal</div>
+          <div class="m3-stat-label" data-i18n="hm2_label">Native GPU rendering without OpenGL</div>
+        </div>
+        <div class="m3-stat">
+          <div class="m3-stat-val">Fabric / NeoForge</div>
+          <div class="m3-stat-label" data-i18n="hm3_label">Data-driven mods &amp; server mod sync</div>
         </div>
       </div>
     </section>
 
-    <section id="downloads" class="downloads-section">
-      <div class="wrap">
-        <div class="section-head">
-          <h2 data-i18n="dl_title">Downloads &amp; Distribution Hub</h2>
-          <p class="section-note" data-i18n="dl_note">Standalone Rust binaries · Target 1.21.1</p>
-        </div>
-        <p class="section-desc" data-i18n="dl_desc">
-          Choose your path — standalone wgpu client, Rust dedicated server with JSON release API, or NeoForge / Fabric JAR inspection and native mod scaffolding.
-        </p>
+    <!-- 01 Benchmarks -->
+    <section id="benchmarks">
+      <div class="sec-head">
+        <h2 data-i18n="bench_title">Compared to Vanilla 1.21.1</h2>
+        <span class="sec-note">Linux x86_64 · seed 0 · rd 4</span>
+      </div>
 
-        <div class="dl-hub">
-          <div class="dl-tabs" role="tablist" aria-label="Distribution target" data-i18n-aria-label="dl_tabs_aria">
-            <button class="dl-tab active" id="tab-client" role="tab" type="button"
-                    aria-selected="true" aria-controls="panel-client" data-dl-tab="client">
-              <span class="dl-tab-title" data-i18n="dl_tab_client">Players · Client</span>
-              <span class="dl-tab-sub" data-i18n="dl_tab_client_sub">Pure wgpu · Zero OpenGL · Zero JVM</span>
-            </button>
-            <button class="dl-tab" id="tab-server" role="tab" type="button"
-                    aria-selected="false" aria-controls="panel-server" data-dl-tab="server">
-              <span class="dl-tab-title" data-i18n="dl_tab_server">Servers &amp; Hosts</span>
-              <span class="dl-tab-sub" data-i18n="dl_tab_server_sub">122 MiB RAM · /api/latest</span>
-            </button>
-            <button class="dl-tab" id="tab-dev" role="tab" type="button"
-                    aria-selected="false" aria-controls="panel-dev" data-dl-tab="dev">
-              <span class="dl-tab-title" data-i18n="dl_tab_dev">Mod Authors · MDK</span>
-              <span class="dl-tab-sub" data-i18n="dl_tab_dev_sub">Inspect JARs · Native Bundle</span>
-            </button>
+      <div class="bench-stack">
+        <!-- Real Measured RAM -->
+        <div class="m3-card">
+          <div class="bench-head">
+            <span class="bench-title" data-i18n="bg_ram">Server Memory Usage (RAM)</span>
+            <span class="m3-pill-tag">9.6× lower</span>
+          </div>
+          <div class="bench-rows">
+            <div class="bench-row">
+              <span class="bench-name" data-cfg="projectName">Megu</span>
+              <div class="m3-track"><div class="m3-fill megu" style="width:10.45%;"></div></div>
+              <span class="bench-val" id="valMegu">122 MiB</span>
+            </div>
+            <div class="bench-row">
+              <span class="bench-name muted">Vanilla 1.21.1</span>
+              <div class="m3-track"><div class="m3-fill vanilla"></div></div>
+              <span class="bench-val muted" id="valVanilla">1,168 MiB</span>
+            </div>
           </div>
 
-          <div class="dl-panel active" id="panel-client" role="tabpanel" aria-labelledby="tab-client">
-            <div class="dl-panel-grid">
-              <div class="dl-card featured">
-                <div class="dl-card-head">
-                  <span class="dl-badge accent">1-Click Installer</span>
-                  <span class="dl-badge" id="dl-os-badge">Windows .exe · Linux · macOS</span>
-                </div>
-                <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Native wgpu Client</h3>
-                <p data-i18n="dl_client_body">
-                  megu-installer needs no Java. GUI (double-click or megu-installer gui) and CLI modes register the Megu (1.21.1) profile in the Official Launcher and stage megu-client-gpu, the native client. Windows requires Windows 10/11; macOS requires macOS 11 or later.
-                </p>
-                <p class="section-note" data-i18n="dl_client_zero_manual">
-                  Zero manual steps: megu-client-gpu is pure wgpu (Vulkan / DX12 / Metal) with zero OpenGL and zero JVM. On first launch it reuses an existing Vanilla 1.21.1 install when present, otherwise downloads the client JAR from Mojang's official HTTPS hosts, verifies SHA-1, and starts.
-                </p>
-                <div class="dl-meta-row">
-                  <span class="dl-chip">1.21.1</span>
-                  <span class="dl-chip">LGPL-3.0</span>
-                  <span class="dl-chip" id="download-count" hidden></span>
-                </div>
-                <div class="dl-actions">
-                  <a class="btn primary" id="dl-client-btn" href="https://github.com/nekomario28/megu-mc/releases"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Recommended installer</a>
-                  <a class="btn" href="https://github.com/nekomario28/megu-mc/releases"
-                     data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_all_releases_btn">All OS Archives</a>
-                </div>
-                <h4 data-i18n="dl_targets_title">All 8 native installer targets</h4>
+          <div class="bench-scale">
+            <label for="instanceSlider">
+              <span data-i18n="bench_instances">Servers</span>:
+              <strong id="instanceCount" style="color:var(--md-on-surface);">1</strong>
+              <input type="range" id="instanceSlider" min="1" max="8" value="1">
+            </label>
+            <span class="bench-diff" id="benchDiff">Delta: −1,046 MiB</span>
+          </div>
+        </div>
+
+        <!-- Planned Placeholder: Full-World Chunk Generation -->
+        <div class="m3-card dummy">
+          <div class="bench-head">
+            <span class="bench-title" data-i18n="bg_worldgen">Full-World Chunk Generation Speed</span>
+            <span class="m3-pill-tag planned" data-i18n="dummy_badge">Planned · Placeholder</span>
+          </div>
+          <div class="bench-rows">
+            <div class="bench-row">
+              <span class="bench-name">Megu</span>
+              <div class="m3-track"><div class="m3-fill dummy-megu" style="width:72%;"></div></div>
+              <span class="bench-val muted">-- chunks/s</span>
+            </div>
+            <div class="bench-row">
+              <span class="bench-name muted">Vanilla 1.21.1</span>
+              <div class="m3-track"><div class="m3-fill dummy-vanilla" style="width:32%;"></div></div>
+              <span class="bench-val muted">-- chunks/s</span>
+            </div>
+          </div>
+          <p class="bench-subnote" data-i18n="worldgen_note">
+            Full-world generation throughput (terrain, biomes, and structures) on the same seed and render distance vs Vanilla 1.21.1 will be updated after benchmarking.
+          </p>
+        </div>
+
+        <!-- Planned Placeholder: Create Mod Load -->
+        <div class="m3-card dummy">
+          <div class="bench-head">
+            <span class="bench-title" data-i18n="bg_create">Create Mod Load (Kinetics, Belts &amp; Fluids)</span>
+            <span class="m3-pill-tag planned" data-i18n="dummy_badge">Planned · Placeholder</span>
+          </div>
+          <div class="bench-rows">
+            <div class="bench-row">
+              <span class="bench-name">Megu (Rust)</span>
+              <div class="m3-track"><div class="m3-fill dummy-megu" style="width:18%;"></div></div>
+              <span class="bench-val muted">-- ms/tick</span>
+            </div>
+            <div class="bench-row">
+              <span class="bench-name muted">NeoForge 1.21.1</span>
+              <div class="m3-track"><div class="m3-fill dummy-vanilla" style="width:82%;"></div></div>
+              <span class="bench-val muted">-- ms/tick</span>
+            </div>
+          </div>
+          <p class="bench-subnote" data-i18n="create_note">
+            Tick time (MSPT) under large kinetic networks, belts, and fluid pipes with Megu Rust-native offload vs NeoForge 1.21.1 will be updated after benchmarking.
+          </p>
+        </div>
+
+        <!-- Other Upcoming Benchmarks -->
+        <div class="m3-card">
+          <div class="bench-head">
+            <span class="bench-title" data-i18n="bg_planned">Other Planned Benchmarks</span>
+            <span class="sec-note">upcoming</span>
+          </div>
+          <div class="planned-grid">
+            <div class="planned-tile">
+              <div>
+                <span class="planned-name" data-i18n="pl2_name">Client FPS</span>
+                <span class="planned-meta" data-i18n="pl2_meta">Average &amp; 1% low FPS across render distances vs Vanilla 1.21.1</span>
+              </div>
+              <div><span class="m3-pill-tag planned" data-i18n="pl_tag">Planned</span></div>
+            </div>
+            <div class="planned-tile">
+              <div>
+                <span class="planned-name" data-i18n="pl3_name">Multiplayer Server Load</span>
+                <span class="planned-meta" data-i18n="pl3_meta">CPU and memory scaling across concurrent players and exploration</span>
+              </div>
+              <div><span class="m3-pill-tag planned" data-i18n="pl_tag">Planned</span></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Comparison Matrix -->
+        <div class="m3-card">
+          <div class="bench-head">
+            <span class="bench-title" data-i18n="cmp_title">How Megu Compares</span>
+            <div class="cmp-legend">
+              <span><strong style="color:var(--md-ok);">✓</strong> <span data-i18n="leg_y">Yes</span></span>
+              <span><strong style="color:var(--md-warn);">!</strong> <span data-i18n="leg_p">Partial</span></span>
+              <span><strong style="color:var(--md-outline);">✕</strong> <span data-i18n="leg_n">No</span></span>
+            </div>
+          </div>
+          <div class="cmp-table-wrap">
+            <table class="cmp-table">
+              <thead>
+                <tr>
+                  <th data-i18n="cmp_th_feat">Feature</th>
+                  <th class="col-c">Megu</th>
+                  <th class="col-c">Vanilla 1.21.1</th>
+                  <th class="col-c">NeoForge / Fabric</th>
+                </tr>
+              </thead>
+              <tbody id="cmpBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <p class="bench-cond" data-i18n="bench_cond">RAM: tools/load_compare.sh · 20s movement · 3-run avg · v0.1.0-alpha.5 (Alpha implements fewer vanilla features than server.jar)</p>
+    </section>
+
+    <!-- 02 Features -->
+    <section id="features">
+      <div class="sec-head">
+        <h2 data-i18n="feat_title">Key Features</h2>
+        <span class="sec-note">client · server · mods &amp; shaders</span>
+      </div>
+
+      <div class="m3-connected" role="tablist" aria-label="Feature categories">
+        <button type="button" class="m3-conn-btn feat-tab active" role="tab" aria-selected="true" data-feat="client" data-i18n="ft_client">Client</button>
+        <button type="button" class="m3-conn-btn feat-tab" role="tab" aria-selected="false" data-feat="server" data-i18n="ft_server">Server</button>
+        <button type="button" class="m3-conn-btn feat-tab" role="tab" aria-selected="false" data-feat="mods" data-i18n="ft_mods">Mods &amp; Shaders</button>
+      </div>
+
+      <div class="feat-stage" id="featStage" role="tabpanel"></div>
+    </section>
+
+    <!-- 03 Downloads -->
+    <section id="downloads">
+      <div class="sec-head">
+        <h2 data-i18n="dl_title">Downloads &amp; Distribution Hub</h2>
+        <span class="sec-note">v0.1.0-alpha.5 · x86_64 &amp; arm64</span>
+      </div>
+
+      <div class="m3-card">
+        <div class="dl-bar">
+          <div class="m3-connected" role="tablist" aria-label="Distribution target" data-i18n-aria-label="dl_tabs_aria">
+            <button type="button" class="m3-conn-btn active" id="tab-client" role="tab" aria-selected="true" aria-controls="panel-client" data-dl-tab="client" data-i18n="tab_client">Client</button>
+            <button type="button" class="m3-conn-btn" id="tab-server" role="tab" aria-selected="false" aria-controls="panel-server" data-dl-tab="server" data-i18n="tab_server">Server</button>
+            <button type="button" class="m3-conn-btn" id="tab-dev" role="tab" aria-selected="false" aria-controls="panel-dev" data-dl-tab="dev" data-i18n="tab_modcheck">Mod / CLI</button>
+          </div>
+
+          <div class="ver-picker">
+            <label for="mcVersionSelect">MC</label>
+            <select id="mcVersionSelect" class="ver-select" aria-label="Target Minecraft version">
+              <option value="1.21.1" selected>1.21.1</option>
+              <option value="26.3">26.3 (tools)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Client Panel -->
+        <div class="dl-panel active" id="panel-client" role="tabpanel" aria-labelledby="tab-client">
+          <div class="dl-stack">
+            <div class="dl-subcard">
+              <div class="dl-card-head">
+                <span class="m3-pill-tag">1-Click Installer</span>
+                <span class="m3-pill-tag planned" id="dl-os-badge">Windows .exe · Linux · macOS</span>
+              </div>
+              <h3 data-i18n="dl_client_title">1. Official Launcher &amp; Native wgpu Client</h3>
+              <p data-i18n="dl_client_body">
+                megu-installer needs no Java. GUI (double-click or megu-installer gui) and CLI modes register the Megu (1.21.1) profile in the Official Launcher and stage megu-client-gpu, the native client. Windows requires Windows 10/11; macOS requires macOS 11 or later.
+              </p>
+              <p data-i18n="dl_client_zero_manual">
+                Zero manual steps: megu-client-gpu is pure wgpu (Vulkan / DX12 / Metal) with zero OpenGL and zero JVM. On first launch it reuses an existing Vanilla 1.21.1 install when present, otherwise downloads the client JAR from Mojang's official HTTPS hosts, verifies SHA-1, and starts.
+              </p>
+              <div class="dl-meta-row">
+                <span class="dl-chip">1.21.1</span>
+                <span class="dl-chip">LGPL-3.0</span>
+                <span class="dl-chip" id="download-count" hidden></span>
+              </div>
+              <div class="dl-actions">
+                <a class="m3-btn-filled" id="dl-client-btn"
+                   href="https://github.com/nekomario28/megu-mc/releases"
+                   target="_blank" rel="noopener noreferrer" data-i18n="dl_releases_btn">Recommended installer</a>
+                <a class="m3-btn-tonal" href="https://github.com/nekomario28/megu-mc/releases"
+                   data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer"
+                   data-i18n="dl_all_releases_btn">All OS Archives</a>
+              </div>
+
+              <h4 data-i18n="dl_targets_title">All 8 native installer targets</h4>
+              <div class="cmp-table-wrap">
                 <table class="data-table" id="release-targets">
-                  <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th data-i18n="dl_target_platform">Platform</th>
+                      <th data-i18n="dl_target_notes">Notes</th>
+                      <th data-i18n="dl_target_download">Download</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-linux-x86_64" data-release-target="linux-x86_64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
                     <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-linux-arm64" data-release-target="linux-arm64" target="_blank" rel="noopener noreferrer">Download</a></td></tr>
@@ -179,58 +415,71 @@
                     <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-installer-windows-arm64.exe" data-release-target="windows-arm64" target="_blank" rel="noopener noreferrer">Download (.exe)</a></td></tr>
                   </tbody>
                 </table>
-                <p class="section-note" data-i18n="dl_targets_caveat">Linux architecture is detected locally; choose the musl build for Alpine/musl systems. Linux distribution names indicate likely libc families and are not a compatibility guarantee.</p>
-                <pre class="code"><button class="copy-btn" type="button">copy</button><code># Linux 1-line automatic install:
-curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh</code></pre>
               </div>
-              <div class="dl-card">
-                <div class="dl-card-head">
-                  <span class="dl-badge">Prism Launcher · Native client / ネイティブクライアント</span>
+              <p class="sec-note" style="margin-top:0.65rem;" data-i18n="dl_targets_caveat">
+                Linux architecture is detected locally; choose the musl build for Alpine/musl systems. Linux distribution names indicate likely libc families and are not a compatibility guarantee.
+              </p>
+
+              <div class="cmd-list">
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">Linux</span><span data-i18n="client_linux">One-line install script</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code>curl -fsSL https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_linux.sh | sh</code></pre>
                 </div>
-                <h3>2. Prism Launcher custom-patch instance / カスタムパッチ済みインスタンス</h3>
-                <p>
-                  Import megu-prism-1.21.1.zip into Prism Launcher for a ready-to-use Megu custom-patch instance (requires megu-client-gpu installed via megu-installer or an OS archive), or run megu-installer prism.
-                </p>
-                <p lang="ja">
-                  megu-prism-1.21.1.zip を Prism Launcher にインポートすると、すぐ使える Megu カスタムパッチ済みインスタンスが作成されます（megu-installer または OS アーカイブから megu-client-gpu をインストールしてください）。または megu-installer prism を実行してください。
-                </p>
-                <p>
-                  Modrinth App users do not need a .mrpack: run megu-client-gpu directly; it reads existing Modrinth App, Prism, or Official Launcher installs, worlds, and mods/.
-                </p>
-                <p lang="ja">
-                  Modrinth App ユーザーに .mrpack は不要です。megu-client-gpu を直接実行すれば、既存の Modrinth App / Prism / 公式ランチャーのインストール、ワールド、mods/ を読み込みます。
-                </p>
-                <div class="dl-actions">
-                  <a class="btn primary" id="dl-prism-btn" href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-prism-1.21.1.zip"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_prism_zip_btn">Prism Launcher (.zip)</a>
-                  <a class="btn" href="#checker" data-i18n="dl_check_pack_btn">Pre-flight your Modpack</a>
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">Windows</span><span data-i18n="client_win">PowerShell one-line installer</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code>irm https://raw.githubusercontent.com/nekomario28/megu-mc/main/tools/install_windows.ps1 | iex</code></pre>
                 </div>
-                <pre class="code"><button class="copy-btn" type="button">copy</button><code># Or generate a Prism instance via the native installer:
-megu-installer prism</code></pre>
               </div>
             </div>
-          </div>
 
-          <div class="dl-panel" id="panel-server" role="tabpanel" aria-labelledby="tab-server" hidden>
-            <div class="dl-panel-grid">
-              <div class="dl-card featured">
-                <div class="dl-card-head">
-                  <span class="dl-badge green">122 MiB RAM</span>
-                  <span class="dl-badge">1.21.1</span>
+            <div class="dl-subcard">
+              <div class="dl-card-head">
+                <span class="m3-pill-tag planned">Prism Launcher · Native client</span>
+              </div>
+              <h3 data-i18n="dl_prism_title">2. Prism Launcher Custom-Patch Instance</h3>
+              <p data-i18n="dl_prism_body">
+                Import megu-prism-1.21.1.zip into Prism Launcher for a ready-to-use Megu custom-patch instance (requires megu-client-gpu installed via megu-installer or an OS archive), or run megu-installer prism. Modrinth App users do not need a .mrpack: run megu-client-gpu directly to read existing installs, worlds, and mods/.
+              </p>
+              <div class="dl-actions">
+                <a class="m3-btn-filled" id="dl-prism-btn"
+                   href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-prism-1.21.1.zip"
+                   target="_blank" rel="noopener noreferrer" data-i18n="dl_prism_zip_btn">Prism Launcher (.zip)</a>
+                <a class="m3-btn-tonal" href="#checker" data-i18n="dl_check_pack_btn">Pre-flight your Modpack</a>
+              </div>
+              <pre class="code"><button type="button" class="copy-btn">copy</button><code>megu-installer prism</code></pre>
+            </div>
+          </div>
+        </div>
+
+        <!-- Server Panel -->
+        <div class="dl-panel" id="panel-server" role="tabpanel" aria-labelledby="tab-server" hidden>
+          <div class="dl-stack">
+            <div class="dl-subcard">
+              <div class="dl-card-head">
+                <span class="m3-pill-tag ok">122 MiB RAM</span>
+                <span class="m3-pill-tag planned">1.21.1</span>
+              </div>
+              <h3 data-i18n="dl_server_title">Megu Dedicated Server (megu)</h3>
+              <p data-i18n="server_intro">
+                Provision a server with megu-installer, accept eula.txt, and launch. Online-mode AES-CFB8 auth, Velocity Modern Forwarding, RCON, Docker, and systemd are supported without a JVM.
+              </p>
+              <div class="cmd-list">
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">01</span><span data-i18n="step_1">Create server directory</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code id="initCmdText">./megu-installer server --dir ./megu-server</code></pre>
                 </div>
-                <h3 data-i18n="dl_server_title">Megu Dedicated Server (megu)</h3>
-                <p data-i18n="dl_server_body">
-                  Dedicated server binary (megu) for 1.21.1 with online-mode AES-CFB8 auth, Velocity Modern Forwarding, RCON, and async backups. The server is a separate Rust binary from the native client and needs no JVM.
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">02</span><span data-i18n="step_2">Accept eula.txt and launch</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code>cd ./megu-server &amp;&amp; ./megu --port 25565</code></pre>
+                </div>
+              </div>
+
+              <details class="verify-box">
+                <summary data-i18n="dl_verify_summary">Verify a pinned Linux archive before installing (SHA-256)</summary>
+                <p style="margin-top:0.75rem;" data-i18n="dl_verify_note">
+                  Release tag: v0.1.0-alpha.5. Download SHA256SUMS-all.txt, extract your target archive into SHA256SUMS.txt, and verify with sha256sum -c before extracting.
                 </p>
-                <div class="dl-actions">
-                  <a class="btn primary" href="https://github.com/nekomario28/megu-mc/releases"
-                     data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_server_btn">Get Server Binaries</a>
-                  <a class="btn" href="#quickstart" data-i18n="dl_qs_jump">3-Step Quickstart</a>
-                </div>
-                <details class="section-note">
-                  <summary>Verify a pinned Linux archive before installing / 固定タグの Linux アーカイブをインストール前に検証</summary>
-                  <p>Release tag: <code>v0.1.0-alpha.5</code>. The release publishes <code>SHA256SUMS-all.txt</code>; this selects the chosen archive into <code>SHA256SUMS.txt</code> for a focused check. / リリースの <code>SHA256SUMS-all.txt</code> から対象アーカイブの行を選び、検証します。</p>
-                  <pre class="code"><code>TAG=v0.1.0-alpha.5
+                <pre class="code"><button type="button" class="copy-btn">copy</button><code>TAG=v0.1.0-alpha.5
 TARGET=linux-x86_64
 ARCHIVE="megu-${TAG}-${TARGET}.tar.gz"
 BASE="https://github.com/nekomario28/megu-mc/releases/download/${TAG}"
@@ -241,10 +490,18 @@ test "$(wc -l &lt; SHA256SUMS.txt)" -eq 1
 sha256sum -c SHA256SUMS.txt
 tar -xzf "${ARCHIVE}"
 "./megu-${TAG}-${TARGET}/megu-installer" server --dir ./megu-server</code></pre>
-                </details>
-                <h4 data-i18n="dl_server_archive_title">Primary platform archives</h4>
+              </details>
+
+              <h4 data-i18n="dl_server_archive_title">Primary platform archives</h4>
+              <div class="cmp-table-wrap">
                 <table class="data-table" id="server-archives">
-                  <thead><tr><th data-i18n="dl_target_platform">Platform</th><th data-i18n="dl_target_notes">Notes</th><th data-i18n="dl_target_download">Download</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th data-i18n="dl_target_platform">Platform</th>
+                      <th data-i18n="dl_target_notes">Notes</th>
+                      <th data-i18n="dl_target_download">Download</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     <tr><td>Linux x86_64 (glibc)</td><td data-i18n="dl_linux_glibc_note">Debian, Ubuntu, Fedora, Arch, NixOS, Void</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-x86_64.tar.gz" data-server-archive="linux-x86_64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
                     <tr><td>Linux ARM64 (glibc)</td><td data-i18n="dl_linux_arm_glibc_note">64-bit ARM Linux</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-linux-arm64.tar.gz" data-server-archive="linux-arm64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
@@ -256,393 +513,236 @@ tar -xzf "${ARCHIVE}"
                     <tr><td>Windows ARM64</td><td data-i18n="dl_windows_arm_note">Windows 11 · Snapdragon ARM64</td><td><a href="https://github.com/nekomario28/megu-mc/releases/download/v0.1.0-alpha.5/megu-v0.1.0-alpha.5-windows-arm64.tar.gz" data-server-archive="windows-arm64" target="_blank" rel="noopener noreferrer">.tar.gz</a></td></tr>
                   </tbody>
                 </table>
-                <p class="section-note" data-i18n="dl_server_archive_note">
-                  Desktop archives bundle megu, megu-client-gpu, and megu-installer. Static musl, FreeBSD, and RISC-V archives are server-only: megu + megu-installer; dynamic musl-client archives carry megu-client-gpu alone.
-                </p>
               </div>
-              <div class="dl-card">
-                <div class="dl-card-head">
-                  <span class="dl-badge blue">Automation API</span>
-                  <span class="dl-badge">Edge Cached · 10 min</span>
-                </div>
-                <h3 data-i18n="dl_api_title">Panel &amp; Fleet Update Endpoint</h3>
-                <p data-i18n="dl_api_body">
-                  Hosting panels, Pterodactyl eggs, and CI pipelines can query the latest published release metadata directly from Cloudflare's edge API.
-                </p>
-                <pre class="code"><button class="copy-btn" type="button">copy</button><code>curl -s https://megu.megumin.tech/api/latest</code></pre>
+              <p class="sec-note" style="margin-top:0.65rem;" data-i18n="dl_server_archive_note">
+                Desktop archives bundle megu, megu-client-gpu, and megu-installer. Static musl, FreeBSD, and RISC-V archives are server-only: megu + megu-installer; dynamic musl-client archives carry megu-client-gpu alone.
+              </p>
+            </div>
+
+            <div class="dl-subcard">
+              <div class="dl-card-head">
+                <span class="m3-pill-tag blue">Automation API</span>
+                <span class="m3-pill-tag planned">Edge Cached · 10 min</span>
               </div>
+              <h3 data-i18n="dl_api_title">Panel &amp; Fleet Update Endpoint</h3>
+              <p data-i18n="dl_api_body">
+                Hosting panels, Pterodactyl eggs, and CI pipelines can query the latest published release metadata directly from Cloudflare's edge API.
+              </p>
+              <pre class="code"><button type="button" class="copy-btn">copy</button><code>curl -s https://megu.megumin.tech/api/latest</code></pre>
             </div>
           </div>
+        </div>
 
-          <div class="dl-panel" id="panel-dev" role="tabpanel" aria-labelledby="tab-dev" hidden>
-            <div class="dl-panel-grid">
-              <div class="dl-card featured">
-                <div class="dl-card-head">
-                  <span class="dl-badge accent">NeoForge · Fabric</span>
-                  <span class="dl-badge">CLI Tool</span>
-                </div>
-                <h3 data-i18n="dl_dev_title">Inspect JARs &amp; Scaffold Native Bundles</h3>
-                <p data-i18n="dl_dev_body">
-                  Audit existing NeoForge / Fabric JARs for Mixin/.class compatibility or generate a validated megu-mod-bundle/1 starter pack with one CLI command.
-                </p>
-                <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --scan-mods-dir ./mods
-{{cli}}-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json">megu-mod-check --scan-mods-dir ./mods
-megu-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json</code></pre>
+        <!-- Mod / CLI Panel -->
+        <div class="dl-panel" id="panel-dev" role="tabpanel" aria-labelledby="tab-dev" hidden>
+          <div class="dl-stack">
+            <div class="dl-subcard">
+              <div class="dl-card-head">
+                <span class="m3-pill-tag">NeoForge · Fabric</span>
+                <span class="m3-pill-tag planned">JVM-free CLI</span>
               </div>
-              <div class="dl-card">
-                <div class="dl-card-head">
-                  <span class="dl-badge">Docs &amp; Specs</span>
+              <h3 data-i18n="dl_dev_title">Inspect JARs &amp; Scaffold Native Bundles</h3>
+              <p data-i18n="mod_intro">
+                Audit existing Fabric / NeoForge JARs for Mixin/.class compatibility without Java, or scaffold a validated megu-mod-bundle/1 starter pack.
+              </p>
+              <div class="cmd-list">
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">01</span><span data-i18n="mod_step_1">Scan local mods directory</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code data-cli="{{cli}}-mod-check --scan-mods-dir ./mods">megu-mod-check --scan-mods-dir ./mods</code></pre>
                 </div>
-                <h3 data-i18n="dl_docs_title">Authoring &amp; WGSL Shader Specs</h3>
-                <p data-i18n="dl_docs_body">
-                  Read the clean-room architecture, declarative bundle schema, and native megu-shader.toml WGSL pipeline docs directly on GitHub.
-                </p>
-                <div class="dl-actions">
-                  <a class="btn primary small" href="https://github.com/nekomario28/megu-mc/blob/main/docs/mod-author-guide.md"
-                     target="_blank" rel="noopener noreferrer" data-i18n="dl_author_guide">Mod &amp; Shader Guide</a>
-                  <a class="btn small" href="https://github.com/nekomario28/megu-mc/tree/main/docs"
-                     data-cfg-href="docsBaseUrl" target="_blank" rel="noopener noreferrer" data-i18n="dl_all_docs">Browse Docs</a>
+                <div>
+                  <div class="cmd-step-label"><span class="step-n">02</span><span data-i18n="mod_step_2">Scaffold native mod template</span></div>
+                  <pre class="code"><button type="button" class="copy-btn">copy</button><code data-cli="{{cli}}-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json">megu-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json</code></pre>
                 </div>
               </div>
+              <div class="dl-actions">
+                <a class="m3-btn-tonal" href="#checker" data-i18n="mod_webcheck">Browser Modpack Check ↓</a>
+                <a class="m3-btn-text" href="https://github.com/nekomario28/megu-mc/blob/main/docs/mod-compatibility.md" target="_blank" rel="noopener noreferrer" data-i18n="mod_docs">Mod Compatibility Guide ↗</a>
+                <a class="m3-btn-text" href="https://github.com/nekomario28/megu-mc/blob/main/docs/mod-author-guide.md" target="_blank" rel="noopener noreferrer" data-i18n="dl_author_guide">Mod &amp; Shader Author Guide ↗</a>
+              </div>
             </div>
           </div>
         </div>
       </div>
     </section>
 
-    <section id="benchmarks">
-      <div class="wrap">
-        <div class="section-head">
-          <h2 data-i18n="bench_title">Compared with Vanilla 1.21.1</h2>
-          <p class="section-note" data-i18n="bench_meta">Same PC · 20s player movement test · seed 0 · view distance 4</p>
-        </div>
-
-        <div class="bench-grid">
-          <div class="bench-card">
-            <div class="bench-label" data-i18n="bench_ram_label">Server memory usage (RAM)</div>
-            <div class="bar-row">
-              <span class="bar-name" data-cfg="projectName">Megu</span>
-              <div class="bar-track"><div class="bar-fill accent" style="width:10.5%"></div></div>
-              <span class="bar-val">122 MiB</span>
-            </div>
-            <div class="bar-row">
-              <span class="bar-name">Vanilla 1.21.1</span>
-              <div class="bar-track"><div class="bar-fill muted" style="width:100%"></div></div>
-              <span class="bar-val">1,168 MiB</span>
-            </div>
-          </div>
-        </div>
-
-        <p class="bench-caveat" data-i18n="bench_caveat">
-          Measured with tools/load_compare.sh on Linux x86_64 (3-run mean). Alpha implements fewer vanilla features than server.jar; FPS, chunk generation speed, and CPU/GPU comparisons against Vanilla 1.21.1 will be added after real-world benchmarking.
-        </p>
+    <!-- 04 Status -->
+    <section id="status">
+      <div class="sec-head">
+        <h2 data-i18n="subsys_title">Status &amp; Technical Details</h2>
+        <span class="sec-note">Rust + wgpu · Protocol 767</span>
       </div>
-    </section>
 
-    <section id="checker">
-      <div class="wrap">
-        <div class="section-head">
-          <h2 data-i18n="checker_title">Check your modpack right here.</h2>
-          <p class="section-note" data-i18n="checker_note">Runs 100% locally in your browser — nothing is uploaded.</p>
-        </div>
-        <p class="section-desc" data-i18n="checker_desc">
-          Inspect a Modrinth .mrpack or CurseForge .zip manifest for candidate auto-skips and mod families. This browser check cannot inspect JAR bytecode or certify runtime compatibility; use the local megu-mod-check CLI for JAR inspection.
-        </p>
-
-        <div class="checker">
-          <div class="checker-controls">
-            <label class="target-select">
-              <span data-i18n="checker_target">Target</span>
-              <select id="mc-target-select">
-                <option value="1.21.1" selected>1.21.1</option>
-                <option value="26.3">26.3</option>
-              </select>
-            </label>
-            <button class="btn small" id="sample-pack-btn" type="button" data-i18n="checker_sample">
-              Load sample pack
-            </button>
-          </div>
-
-          <div class="dropzone" id="dropzone" role="button" tabindex="0"
-               aria-label="Drop a modpack archive or manifest here or click to browse">
-            <strong data-i18n="checker_drop">Drop a <code>.mrpack</code>, CurseForge <code>.zip</code>, or manifest <code>.json</code></strong>
-            <span class="hint" data-i18n="checker_hint">or click to browse</span>
-            <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
-          </div>
-          <div class="checker-paste">
-            <label for="paste-json" data-i18n="checker_paste_label">Or paste Modrinth modrinth.index.json / CurseForge manifest.json</label>
-            <textarea id="paste-json" rows="5" spellcheck="false" aria-describedby="checker-limit"
-                      placeholder="Paste the manifest JSON here" data-i18n-placeholder="checker_paste_placeholder"></textarea>
-            <div class="checker-paste-actions">
-              <span id="checker-limit" class="hint" data-i18n="checker_limit">Maximum input size: 2 MiB (file or pasted JSON).</span>
-              <button class="btn small" id="paste-analyze-btn" type="button" data-i18n="checker_paste_button">Analyze pasted JSON</button>
-            </div>
-          </div>
-
-          <div class="checker-error" id="checker-error" role="alert"></div>
-
-          <div class="report" id="report" aria-live="polite">
-            <div class="readiness" id="readiness"><span class="r-icon" id="readiness-icon"></span><span id="readiness-text"></span></div>
-            <div class="report-stats" id="report-stats" aria-label="Compatibility summary" data-i18n-aria-label="checker_stats_aria"></div>
-            <p class="checker-inspection-note" data-i18n="checker_inspection">Needs megu-mod-check --scan-mods-dir for Mixin/.class inspection — never guesses arbitrary Java compatibility!</p>
-            <div class="report-grid" id="report-groups"></div>
-            <div class="entries-table-wrap">
-              <table class="entries-table">
-                <thead>
-                  <tr><th data-i18n="checker_col_path">Path</th><th>Mod</th><th data-i18n="checker_col_handling">Handling</th><th data-i18n="checker_col_note">Note</th></tr>
-                </thead>
-                <tbody id="entries-body"></tbody>
-              </table>
-            </div>
-            <details class="report-details">
-              <summary data-i18n="checker_raw">JSON report &amp; plain-text summary</summary>
-              <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-json"></code></pre>
-              <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-summary"></code></pre>
-            </details>
-          </div>
-        </div>
+      <div class="chip-row" role="group" aria-label="Subsystem filter">
+        <button type="button" class="m3-chip filter-btn active" data-filter="all" data-i18n="f_all">All (6)</button>
+        <button type="button" class="m3-chip filter-btn" data-filter="working" data-i18n="f_working">Working (3)</button>
+        <button type="button" class="m3-chip filter-btn" data-filter="partial" data-i18n="f_partial">Partial (3)</button>
       </div>
-    </section>
 
-    <section id="how">
-      <div class="wrap">
-        <h2 data-i18n="how_title">Implemented components and boundaries</h2>
-        <div class="pillars">
-          <article class="pillar">
-            <h3 data-i18n="p1_title">Native simulation paths</h3>
-            <p data-i18n="p1_body">
-              Rust systems cover selected Create kinetics, belts, fluids, and culinary data. The supported behaviors and workloads are still being checked against Minecraft and mod implementations.
-            </p>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="p2_title">Client and rendering work</h3>
-            <p data-i18n="p2_body">
-              The client implements protocol probing, Magic/VFX/Animation/Combat-Motion handling, and shaderpack capability planning with conservative fallback. The isolated client-gpu crate has a real winit + wgpu window and offscreen rendering, with a recorded non-blank Vulkan offscreen frame on AMD RX 7800 XT (RADV).
-            </p>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="p3_title">Automatic mod adaptation at boot</h3>
-            <p data-i18n="p3_body">
-              The mods/ startup scan skips a catalog of 54 superseded performance mods and attempts bounded data, culinary, and Mixin lifting through live_mod_bridge / auto_adapter. Unsupported code is classified for fallback or quarantine.
-            </p>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="p4_title">Standalone binaries</h3>
-            <p data-i18n="p4_body">
-              Desktop release archives carry three end-user binaries: megu (dedicated server), megu-client-gpu (native wgpu game client), and megu-installer (launcher setup). megu-client, megu-mod-check, megu-world-migrate, megu-init, and megu-admin remain source-buildable internal tools.
-            </p>
-          </article>
-        </div>
-      </div>
-    </section>
+      <div class="subsys-list" id="subsysList"></div>
 
-    <section id="mods">
-      <div class="wrap">
-        <h2 data-i18n="mods_title">Mod adaptation and native authoring</h2>
-        <p class="section-desc" data-i18n="mods_intro">
-          Put existing NeoForge or Fabric JARs in mods/ for automatic startup inspection. The Rust live_mod_bridge / auto_adapter can skip superseded performance mods and lift supported data, culinary, and Mixin patterns without launching a JVM.
-        </p>
-        <div class="pillars">
-          <article class="pillar">
-            <h3 data-i18n="mods_auto_title">Automatic boot-time classification</h3>
-            <p data-i18n="mods_auto_body">
-              Supported JAR contents can become native bundles or bounded lifted shims. Unsupported Tier 3 Java/Mixin behavior is reported for fallback, delegation, or quarantine; arbitrary existing mods are not guaranteed to run.
-            </p>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="mods_native_title">Native mods without a JVM</h3>
-            <p data-i18n="mods_native_body">
-              Authors can use megu-mod-check --scaffold-native to generate a validated megu-mod-bundle/1 starter. This declarative format supports native authoring; additional mod data and behavior must still be implemented.
-            </p>
-          </article>
-        </div>
-        <p class="feature-link"><a href="https://github.com/nekomario28/megu-mc/blob/main/docs/mod-author-guide.md" data-i18n="mods_guide">Read the mod and shaderpack author guide →</a></p>
-      </div>
-    </section>
+      <details class="cli-more">
+        <summary data-i18n="cli_more_summary">Developer commands (source build, Docker, world migration)</summary>
+        <pre class="code"><button type="button" class="copy-btn">copy</button><code data-cli="# Build from source (Rust 1.98.0 + Python 3)
+python3 tools/dev_check.py
+cargo build --locked --release
 
-    <section id="shaderpacks">
-      <div class="wrap">
-        <h2 data-i18n="shader_title">External shaderpack formats and native WGSL</h2>
-        <p class="section-desc" data-i18n="shader_intro">
-          The Alpha parses user-provided shaderpacks and plans pipelines against GPU capabilities. No third-party shaders are bundled. Unsupported GPU features select a safe built-in rendering fallback in the planner.
-        </p>
-        <div class="pillars">
-          <article class="pillar">
-            <h3 data-i18n="shader_classic_title">Classic OptiFine and Iris</h3>
-            <p data-i18n="shader_classic_body">
-              Classic OptiFine GLSL 120–330 passes are recognized. The Iris 1.7–1.11+ specification covers GLSL 430–460 compute shaders, SSBOs, images, and dual-hand uniforms.
-            </p>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="shader_dh_title">DistantHorizons LOD and Megu WGSL</h3>
-            <p data-i18n="shader_dh_body">
-              DistantHorizons LOD stages include dh_shadow, dh_terrain, and dh_water. Native WGSL packs use megu-shader.toml with explicit pass declarations and .wgsl files.
-            </p>
-          </article>
-        </div>
-        <p class="feature-note" data-i18n="shader_boundary">
-          Shaderpack support currently covers parsing and fallback planning. A real winit + wgpu GPU client exists; live third-party shaderpack visual fidelity and server/modpack interoperability remain unverified.
-        </p>
-      </div>
-    </section>
+# Docker
+docker build -f docker/Dockerfile .
 
-    <section id="quickstart">
-      <div class="wrap">
-        <h2 data-i18n="qs_title">Start a server with explicit EULA acceptance</h2>
-        <p class="section-note" data-i18n="qs_client_note">The native client needs no manual setup: install megu-installer, pick the Megu (1.21.1) profile, and let the first launch fetch SHA-1-verified Vanilla assets automatically.</p>
-        <div class="steps">
-          <div class="step">
-            <div class="step-label" data-i18n="qs_1">1. Initialize for 1.21.1 and accept the EULA explicitly</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-init --dir ./server --mc-version 1.21.1 --accept-eula">megu-init --dir ./server --mc-version 1.21.1 --accept-eula</code></pre>
-          </div>
-          <div class="step">
-            <div class="step-label" data-i18n="qs_2">2. Optionally scan the mods/ folder without a JVM</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="{{cli}}-mod-check --scan-mods-dir ./server/mods">megu-mod-check --scan-mods-dir ./server/mods</code></pre>
-          </div>
-          <div class="step">
-            <div class="step-label" data-i18n="qs_3">3. Start the server from its directory</div>
-            <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="cd ./server &amp;&amp; {{cli}}">cd ./server &amp;&amp; megu</code></pre>
-          </div>
-        </div>
-
-        <details class="more-cmds">
-          <summary data-i18n="qs_more">All six mod-check modes, 26.3 initialization, world migration and client ping</summary>
-          <pre class="code"><button class="copy-btn" type="button">copy</button><code data-cli="# Initialize a 26.3 server (requires explicit EULA acceptance)
-{{cli}}-init --dir ./server-26.3 --mc-version 26.3 --accept-eula
-
-# Six mutually exclusive mod-check modes
-{{cli}}-mod-check --modpack ./pack.mrpack
-{{cli}}-mod-check --scan-jar ./mods/example.jar
-{{cli}}-mod-check --scan-mods-dir ./mods
-{{cli}}-mod-check --adapt-jar ./mods/example.jar --out ./adapted
-{{cli}}-mod-check --adapt-mods-dir ./mods --out ./adapted
-{{cli}}-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json
-
-# Inspect or migrate a world between 1.21.1 and 26.3
+# World migration (1.21.1 &lt;-&gt; 26.3) &amp; server ping
 {{cli}}-world-migrate inspect-anvil ./world
 {{cli}}-world-migrate migrate-level --in ./world/level.dat --out ./converted-level.dat --to 26.3
+{{cli}}-client --ping localhost:25565"># Build from source (Rust 1.98.0 + Python 3)
+python3 tools/dev_check.py
+cargo build --locked --release
 
-# Ping a running server
-{{cli}}-client --ping localhost:25565"># Initialize a 26.3 server (requires explicit EULA acceptance)
-megu-init --dir ./server-26.3 --mc-version 26.3 --accept-eula
+# Docker
+docker build -f docker/Dockerfile .
 
-# Six mutually exclusive mod-check modes
-megu-mod-check --modpack ./pack.mrpack
-megu-mod-check --scan-jar ./mods/example.jar
-megu-mod-check --scan-mods-dir ./mods
-megu-mod-check --adapt-jar ./mods/example.jar --out ./adapted
-megu-mod-check --adapt-mods-dir ./mods --out ./adapted
-megu-mod-check --scaffold-native my_mod --out ./my_mod.bundle.json
-
-# Inspect or migrate a world between 1.21.1 and 26.3
+# World migration (1.21.1 &lt;-&gt; 26.3) &amp; server ping
 megu-world-migrate inspect-anvil ./world
 megu-world-migrate migrate-level --in ./world/level.dat --out ./converted-level.dat --to 26.3
-
-# Ping a running server
 megu-client --ping localhost:25565</code></pre>
-        </details>
-      </div>
+      </details>
     </section>
 
-    <section id="scope">
-      <div class="wrap">
-        <h2 data-i18n="scope_title">Current status</h2>
-        <div class="scope-grid">
-          <div class="scope-col">
-            <h3 data-i18n="scope_now_h">Available in Alpha</h3>
-            <ul>
-              <li data-i18n="scope_now_1">Vanilla 1.21.1 protocol, online-mode AES-CFB8 auth, and Velocity modern forwarding</li>
-              <li data-i18n="scope_now_2">Deterministic worldgen, random ticks, villagers, commands, ops/bans/whitelist, RCON, and async backups</li>
-              <li data-i18n="scope_now_3">Twelve standalone crates (eleven without third-party dependencies plus the isolated client-gpu), plus three end-user release binaries on desktop archives: megu, megu-client-gpu, and megu-installer</li>
-            </ul>
+    <!-- 05 Modpack Checker (full 54-mod catalog & bounded ZIP engine via app.js) -->
+    <section id="checker">
+      <div class="sec-head">
+        <h2 data-i18n="checker_title">Modpack Inspector</h2>
+        <span class="sec-note" data-i18n="checker_note">Runs 100% locally in your browser — nothing is uploaded.</span>
+      </div>
+
+      <div class="m3-card">
+        <p class="check-desc" data-i18n="checker_desc">
+          Inspect a Modrinth .mrpack or CurseForge .zip manifest for candidate auto-skips (54 superseded perf mods) and mod families. This browser check cannot inspect JAR bytecode or certify runtime compatibility; use the local megu-mod-check CLI for JAR inspection.
+        </p>
+
+        <div class="checker-controls">
+          <div class="ver-picker">
+            <label for="mc-target-select" data-i18n="checker_target">Target</label>
+            <select id="mc-target-select" class="ver-select">
+              <option value="1.21.1" selected>1.21.1</option>
+              <option value="26.3">26.3</option>
+            </select>
           </div>
-          <div class="scope-col">
-            <h3 data-i18n="scope_wip_h">Still in progress</h3>
-            <ul>
-              <li data-i18n="scope_wip_1">Full Vanilla parity across general-seed worldgen and gameplay interactions</li>
-              <li data-i18n="scope_wip_2">Native Anvil live world storage and broader live modpack execution</li>
-              <li data-i18n="scope_wip_3">Third-party shaderpack visual fidelity, live modpack E2E, and wider GPU hardware/platform coverage</li>
-            </ul>
+          <button class="btn small" id="sample-pack-btn" type="button" data-i18n="checker_sample">Load sample pack</button>
+        </div>
+
+        <div class="dropzone" id="dropzone" role="button" tabindex="0"
+             aria-label="Drop a modpack archive or manifest here or click to browse">
+          <strong data-i18n="checker_drop">Drop a .mrpack, CurseForge .zip, or manifest .json</strong>
+          <span class="hint" data-i18n="checker_hint">or click to browse</span>
+          <input type="file" id="file-input" accept=".mrpack,.zip,.json" hidden>
+        </div>
+
+        <div class="checker-paste">
+          <label for="paste-json" data-i18n="checker_paste_label">Or paste Modrinth modrinth.index.json / CurseForge manifest.json</label>
+          <textarea id="paste-json" rows="4" spellcheck="false" aria-describedby="checker-limit"
+                    placeholder="Paste the manifest JSON here" data-i18n-placeholder="checker_paste_placeholder"></textarea>
+          <div class="checker-paste-actions">
+            <span id="checker-limit" class="hint" data-i18n="checker_limit">Maximum input size: 2 MiB (file or pasted JSON).</span>
+            <button class="btn primary small" id="paste-analyze-btn" type="button" data-i18n="checker_paste_button">Analyze pasted JSON</button>
           </div>
+        </div>
+
+        <div class="checker-error" id="checker-error" role="alert"></div>
+
+        <div class="report" id="report" aria-live="polite">
+          <div class="readiness" id="readiness"><span class="r-icon" id="readiness-icon"></span><span id="readiness-text"></span></div>
+          <div class="report-stats" id="report-stats" aria-label="Compatibility summary" data-i18n-aria-label="checker_stats_aria"></div>
+          <p class="checker-inspection-note" data-i18n="checker_inspection">Needs megu-mod-check --scan-mods-dir for Mixin/.class inspection — never guesses arbitrary Java compatibility!</p>
+          <div class="report-grid" id="report-groups"></div>
+          <div class="entries-table-wrap">
+            <table class="entries-table">
+              <thead>
+                <tr>
+                  <th data-i18n="checker_col_path">Path</th>
+                  <th>Mod</th>
+                  <th data-i18n="checker_col_handling">Handling</th>
+                  <th data-i18n="checker_col_note">Note</th>
+                </tr>
+              </thead>
+              <tbody id="entries-body"></tbody>
+            </table>
+          </div>
+          <details class="report-details">
+            <summary data-i18n="checker_raw">JSON report &amp; plain-text summary</summary>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-json"></code></pre>
+            <pre class="code"><button class="copy-btn" type="button">copy</button><code id="report-summary"></code></pre>
+          </details>
         </div>
       </div>
     </section>
 
+    <!-- 06 Support & Hosting Partners -->
     <section id="support">
-      <div class="wrap">
-        <div class="section-head">
-          <h2 data-i18n="support_title">Support development &amp; hosting partners</h2>
-          <p class="section-note" data-i18n="support_note">100% LGPL-3.0 open source — free forever for players, modders, and self-hosters.</p>
-        </div>
-        <div class="pillars">
-          <article class="pillar">
-            <h3 data-i18n="support_ind_title">Back Megu as a player or sponsor</h3>
-            <p data-i18n="support_ind_body">
-              All client features, pure wgpu rendering, spatial audio, and single-node server performance stay free and open source. Sponsors help fund hardware testing, CI, and 1.21.1 modpack parity.
-            </p>
-            <div class="support-actions">
-              <a class="btn primary small" data-opt-url="githubSponsorsUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>GitHub Sponsors</a>
-              <a class="btn small" data-opt-url="kofiUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Ko-fi</a>
-              <a class="btn small" data-opt-url="ofuseUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>OFUSE / FANBOX</a>
-              <a class="btn small" data-opt-url="discordUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Join Discord</a>
-              <a class="btn small" href="https://github.com/nekomario28/megu-mc" data-cfg-href="githubUrl" data-i18n="support_star_btn">Star on GitHub</a>
-            </div>
-          </article>
-          <article class="pillar">
-            <h3 data-i18n="support_host_title">For server hosts, events &amp; enterprise</h3>
-            <p data-i18n="support_host_body">
-              Running a Minecraft hosting platform or a 300+ player event? Megu's low-memory Rust server (122 MiB vs 1,168 MiB VmRSS) unlocks far higher density per node. Reach out for Certified Host partnerships, PoC trials, or event SLA support.
-            </p>
-            <div class="support-actions">
-              <a class="btn primary small" id="partner-mail-btn" href="#" hidden data-i18n="support_partner_mail">Contact partners</a>
-              <a class="btn small" id="certified-host-btn" href="#" target="_blank" rel="noopener noreferrer" hidden>Recommended Host</a>
-              <a class="btn small" data-opt-url="discussionsUrl" href="#" target="_blank" rel="noopener noreferrer" hidden data-i18n="support_discuss_btn">GitHub Discussions</a>
-            </div>
-          </article>
-        </div>
+      <div class="sec-head">
+        <h2 data-i18n="support_title">Support Development &amp; Hosting Partners</h2>
+        <span class="sec-note" data-i18n="support_note">100% LGPL-3.0 OSS — free forever</span>
+      </div>
+
+      <div class="support-grid">
+        <article class="m3-card support-card">
+          <h3 data-i18n="support_ind_title">Back Megu as a player or sponsor</h3>
+          <p data-i18n="support_ind_body">
+            All client features, pure wgpu rendering, spatial audio, and single-node server performance stay free and open source. Sponsors help fund hardware testing, CI, and 1.21.1 modpack parity.
+          </p>
+          <div class="support-actions">
+            <a class="btn primary small" data-opt-url="githubSponsorsUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>GitHub Sponsors</a>
+            <a class="btn small" data-opt-url="kofiUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Ko-fi</a>
+            <a class="btn small" data-opt-url="ofuseUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>OFUSE / FANBOX</a>
+            <a class="btn small" data-opt-url="discordUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Join Discord</a>
+            <a class="btn small" href="https://github.com/nekomario28/megu-mc" data-cfg-href="githubUrl" target="_blank" rel="noopener noreferrer" data-i18n="support_star_btn">Star on GitHub</a>
+          </div>
+        </article>
+
+        <article class="m3-card support-card">
+          <h3 data-i18n="support_host_title">For server hosts, events &amp; enterprise</h3>
+          <p data-i18n="support_host_body">
+            Running a Minecraft hosting platform or a 300+ player event? Megu's low-memory Rust server (122 MiB vs 1,168 MiB VmRSS) unlocks higher density per node. Reach out for Certified Host partnerships, PoC trials, or event SLA support.
+          </p>
+          <div class="support-actions">
+            <a class="btn primary small" id="partner-mail-btn" href="#" hidden data-i18n="support_partner_mail">Contact partners</a>
+            <a class="btn small" id="certified-host-btn" href="#" target="_blank" rel="noopener noreferrer" hidden>Recommended Host</a>
+            <a class="btn small" data-opt-url="discussionsUrl" href="#" target="_blank" rel="noopener noreferrer" hidden data-i18n="support_discuss_btn">GitHub Discussions</a>
+          </div>
+        </article>
       </div>
     </section>
 
-  </main>
-
-  <footer>
-    <div class="wrap">
+    <footer>
       <div class="foot-row">
-        <div>
-          <strong data-cfg="projectName">Megu</strong> ·
-          <span data-cfg="tagline">A Minecraft-compatible engine written in Rust (codename: megu)</span>
-        </div>
+        <span><strong data-cfg="projectName">Megu</strong> · LGPL-3.0-or-later</span>
         <div class="foot-links">
           <button class="foot-feedback" id="feedback-open" type="button"
                   aria-haspopup="dialog" aria-controls="feedback-dialog"
                   data-i18n="feedback_open">Report bug / Send idea</button>
-          <a href="https://github.com/nekomario28/megu-mc" data-cfg-href="githubUrl">GitHub</a>
-          <a href="https://github.com/nekomario28/megu-mc" data-cfg-href="githubUrl">Contribute</a>
-          <a href="https://github.com/nekomario28/megu-mc/releases" data-cfg-href="releasesUrl">Releases</a>
-          <a href="https://github.com/nekomario28/megu-mc/tree/main/docs" data-cfg-href="docsBaseUrl">Docs</a>
-          <a class="opt-link" data-opt-url="discussionsUrl" href="#" hidden>Requests</a>
-          <a class="opt-link" data-opt-url="discordUrl" href="#" hidden>Discord</a>
-          <a class="opt-link" data-opt-url="sponsorUrl" href="#" hidden>Support</a>
+          <a href="https://github.com/nekomario28/megu-mc" data-cfg-href="githubUrl" target="_blank" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/nekomario28/megu-mc/releases" data-cfg-href="releasesUrl" target="_blank" rel="noopener noreferrer">Releases</a>
+          <a href="https://github.com/nekomario28/megu-mc/tree/main/docs" data-cfg-href="docsBaseUrl" target="_blank" rel="noopener noreferrer">Docs</a>
+          <a data-opt-url="discussionsUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Discussions</a>
+          <a data-opt-url="sponsorUrl" href="#" target="_blank" rel="noopener noreferrer" hidden>Support</a>
+          <a href="https://megumin.tech/" target="_blank" rel="noopener noreferrer">megumin.tech</a>
         </div>
       </div>
       <p class="foot-legal" data-i18n="footer_legal">
         Independent clean-room open-source project. Not affiliated with or endorsed by Mojang, Microsoft, or any listed mod authors.
       </p>
       <p class="deploy-note" id="deploy-note"></p>
-    </div>
-  </footer>
+    </footer>
+  </main>
 
+  <!-- Masked Feedback Dialog (wired to website/app.js + Cloudflare Turnstile) -->
   <div class="feedback-overlay" id="feedback-overlay" hidden>
-    <section class="feedback-dialog" id="feedback-dialog" role="dialog"
-             aria-modal="true" aria-labelledby="feedback-title"
-             aria-describedby="feedback-desc" tabindex="-1">
-      <div class="feedback-heading">
-        <h2 id="feedback-title" data-i18n="feedback_title">Report a crash, bug or idea</h2>
-        <button class="feedback-close" id="feedback-close" type="button"
-                aria-label="Close" data-i18n-aria-label="feedback_close">×</button>
+    <section class="feedback-dialog" id="feedback-dialog" role="dialog" aria-modal="true" aria-labelledby="feedback-title">
+      <div class="feedback-head">
+        <h2 id="feedback-title" data-i18n="feedback_title">Report crash, bug, or idea</h2>
+        <button class="btn small" id="feedback-close" type="button" data-i18n="feedback_close">Close</button>
       </div>
-      <p class="feedback-desc" id="feedback-desc" data-i18n="feedback_desc">
-        Prepare a masked report without an account. Direct sending is available when site reporting is enabled.
+      <p class="feedback-hint" data-i18n="feedback_desc">
+        Create a redacted report without an account. Direct submission works when reporting is enabled on this deployment.
       </p>
       <form id="feedback-form">
         <div class="feedback-fields">
@@ -684,10 +784,10 @@ megu-client --ping localhost:25565</code></pre>
           <button class="btn primary" id="feedback-send" type="submit" data-i18n="feedback_send">Send</button>
         </div>
         <div class="feedback-fallback" id="feedback-fallback" hidden>
-          <button class="btn" id="feedback-copy" type="button" data-i18n="feedback_copy">Copy masked report</button>
-          <a class="btn" id="feedback-github" target="_blank" rel="noopener noreferrer"
+          <button class="btn small" id="feedback-copy" type="button" data-i18n="feedback_copy">Copy masked report</button>
+          <a class="btn small" id="feedback-github" target="_blank" rel="noopener noreferrer"
              data-i18n="feedback_github">Open pre-filled GitHub Issue</a>
-          <a class="feedback-search" id="feedback-search" target="_blank" rel="noopener noreferrer"
+          <a class="m3-btn-text" id="feedback-search" target="_blank" rel="noopener noreferrer"
              data-i18n="feedback_search">Search existing fingerprint</a>
         </div>
         <p class="feedback-result" id="feedback-result" hidden>
@@ -699,11 +799,31 @@ megu-client --ping localhost:25565</code></pre>
     </section>
   </div>
 
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
   <script>
   (function () {
     "use strict";
-    // Optional footer links (Requests/Discord/Support) stay hidden until
-    // site-config.js gives them a real URL.
+
+    // --- Scroll-reactive Moon & Night-Sky parallax ---
+    var rootEl = document.documentElement;
+    var scrollTicking = false;
+    function syncMoonScroll() {
+      scrollTicking = false;
+      var maxScroll = Math.max(1, rootEl.scrollHeight - window.innerHeight);
+      var p = Math.min(1, Math.max(0, window.scrollY / maxScroll));
+      rootEl.style.setProperty("--scroll-p", p.toFixed(4));
+    }
+    window.addEventListener("scroll", function () {
+      if (!scrollTicking) {
+        scrollTicking = true;
+        window.requestAnimationFrame(syncMoonScroll);
+      }
+    }, { passive: true });
+    window.addEventListener("resize", syncMoonScroll, { passive: true });
+    syncMoonScroll();
+
+    // --- Optional links from site-config.js ---
     var siteCfg = window.SITE_CONFIG || {};
     Array.prototype.forEach.call(
       document.querySelectorAll("[data-opt-url]"), function (el) {
@@ -726,6 +846,21 @@ megu-client --ping localhost:25565</code></pre>
       }
       certifiedHostBtn.removeAttribute("hidden");
     }
+
+    // --- Snackbar toast ---
+    var toastEl = document.getElementById("toast");
+    var toastTimer = null;
+    function showToast(msg) {
+      if (!toastEl) return;
+      toastEl.textContent = msg;
+      toastEl.classList.add("show");
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(function () {
+        toastEl.classList.remove("show");
+      }, 1700);
+    }
+
+    // --- Download tabs ---
     var dlTabs = document.querySelectorAll("[data-dl-tab]");
     function activateDlTab(key) {
       Array.prototype.forEach.call(dlTabs, function (tab) {
@@ -756,6 +891,8 @@ megu-client --ping localhost:25565</code></pre>
         }
       });
     });
+
+    // --- OS badge auto-detect ---
     var osBadge = document.getElementById("dl-os-badge");
     if (osBadge && navigator.userAgent) {
       var ua = navigator.userAgent;
@@ -767,36 +904,207 @@ megu-client --ping localhost:25565</code></pre>
         osBadge.textContent = "Linux x86_64 · Vulkan";
       }
     }
+
+    // --- MC version picker for server init command ---
+    var mcVersionSelect = document.getElementById("mcVersionSelect");
+    var initCmdText = document.getElementById("initCmdText");
+    if (mcVersionSelect && initCmdText) {
+      mcVersionSelect.addEventListener("change", function () {
+        initCmdText.textContent = mcVersionSelect.value === "26.3"
+          ? "megu-init --dir ./megu-server-26.3 --mc-version 26.3 --accept-eula"
+          : "./megu-installer server --dir ./megu-server";
+      });
+    }
+
+    // --- Scrollspy for top nav ---
+    var sections = Array.prototype.slice.call(document.querySelectorAll("main section[id]"));
+    var routeLinks = Array.prototype.slice.call(document.querySelectorAll("[data-route]"));
+    if ("IntersectionObserver" in window) {
+      var io = new IntersectionObserver(function (entries) {
+        var visible = entries
+          .filter(function (e) { return e.isIntersecting; })
+          .sort(function (a, b) { return a.boundingClientRect.top - b.boundingClientRect.top; });
+        if (visible.length > 0) {
+          var id = visible[0].target.id;
+          routeLinks.forEach(function (a) {
+            a.classList.toggle("active", a.getAttribute("data-route") === id);
+          });
+        }
+      }, { rootMargin: "-20% 0px -60% 0px", threshold: 0 });
+      sections.forEach(function (s) { io.observe(s); });
+    }
+
+    // --- Comparison Matrix data ---
+    var CMP_ROWS = {
+      ja: [
+        { name: "Java 不要の単体起動", note: "ランタイム導入やメモリ設定なしで起動", m: "y", v: "n", nf: "n" },
+        { name: "省メモリ動作（122 MiB 実測）", note: "バニラ比 9.6× の軽量サーバー", m: "y", v: "n", nf: "n" },
+        { name: "Vulkan / DX12 / Metal 描画", note: "OpenGL を使わないネイティブ GPU 描画", m: "y", v: "n", nf: "n" },
+        { name: "Create 等の Rust 最適化", note: "動力・ベルト・流体をネイティブ処理", m: "y", v: "n", nf: "n" },
+        { name: "既存 Fabric / NeoForge Mod", note: "データ駆動 Mod に対応（複雑な Mixin は開発中）", m: "p", v: "n", nf: "y" },
+        { name: "バニラ 1.21.1 完全パリティ", note: "地形生成・AI の完全網羅は開発中", m: "p", v: "y", nf: "y" },
+        { name: "本体フル OSS（LGPL-3.0）", note: "クライアント・サーバーともに公開", m: "y", v: "n", nf: "p" }
+      ],
+      en: [
+        { name: "Single binary, no Java", note: "Runs without installing a JVM", m: "y", v: "n", nf: "n" },
+        { name: "Low memory (122 MiB)", note: "9.6× lower RAM than Vanilla 1.21.1", m: "y", v: "n", nf: "n" },
+        { name: "Vulkan / DX12 / Metal", note: "Native GPU rendering without OpenGL", m: "y", v: "n", nf: "n" },
+        { name: "Rust-native Create offload", note: "Kinetics, belts, and fluids in Rust", m: "y", v: "n", nf: "n" },
+        { name: "Existing Fabric / NeoForge Mods", note: "Data-driven mods work; complex Mixins in progress", m: "p", v: "n", nf: "y" },
+        { name: "Full Vanilla 1.21.1 parity", note: "Complete terrain & AI parity in progress", m: "p", v: "y", nf: "y" },
+        { name: "Full engine open source", note: "LGPL-3.0-or-later client & server", m: "y", v: "n", nf: "p" }
+      ]
+    };
+    var MARK_CHAR = { y: "✓", p: "!", n: "✕" };
+
+    // --- Feature Showcase Tabs ---
+    var FEATURES = {
+      ja: {
+        client: {
+          title: "OpenGL なしのネイティブ GPU クライアント",
+          desc: "Vulkan / DX12 / Metal で直接描画する純 wgpu クライアント。目に優しい光学表現や日本語 IME、E2EE フレンドプレイまで標準で備えています。",
+          points: [
+            "動的ライティング・コンタクトシャドウ・3層雲・水面屈折",
+            "ビデオ設定のホスト RAM 上限スライダー（OOM ガード付き）",
+            "日本語 IME・4行看板エディタ・ネイティブ OS テーマ同期",
+            "初期音量 50%・音楽 45%＋dB 表示付きリミッター・E2EE フレンドプレイ"
+          ],
+          previewTitle: "megu-client-gpu · runtime",
+          previewCode: "<span class=\"k\">backend</span>    = <span class=\"v\">\"wgpu (Vulkan / DX12 / Metal)\"</span>\n<span class=\"k\">optics</span>     = <span class=\"v\">\"comfort_exposure, contact_shadows\"</span>\n<span class=\"k\">ram_guard</span>  = <span class=\"ok\">\"auto (host budget slider)\"</span>\n<span class=\"k\">audio</span>      = <span class=\"v\">\"master 50% / music 45% / 85% dB\"</span>"
+        },
+        server: {
+          title: "単体バイナリで完結するマルチプレイ運用",
+          desc: "Java 環境の構築なしで 1.21.1 サーバーを起動でき、土地保護・ハブ移動・管理画面まで標準搭載しています。",
+          points: [
+            "TNT・コンテナ・看板・装置にも対応した土地保護（クレーム）",
+            "ハブ移動（<code>/server</code>・<code>/hub</code>・<code>/world</code>）と Velocity 転送",
+            "Pure-Rust TUI 管理画面・RCON・非同期バックアップ・<code>systemd</code>",
+            "任意有効化の拡張（カスタムポータル・アンロードチャンク追いつき等）"
+          ],
+          previewTitle: "megu server · console",
+          previewCode: "<span class=\"ok\">●</span> <span class=\"v\">megu v0.1.0-alpha.5</span> <span class=\"dim\">:25565 (MC 1.21.1)</span>\n  <span class=\"k\">ram</span>: <span class=\"v\">122 MiB</span>   <span class=\"k\">claims</span>: <span class=\"ok\">active</span>\n  <span class=\"k\">proxy</span>: <span class=\"v\">Velocity Modern</span>\n  <span class=\"k\">cmd</span>: <span class=\"v\">/hub  /server  /world  /megu</span>"
+        },
+        mods: {
+          title: "Create の Rust 最適化と Mod / シェーダー対応",
+          desc: "Create の動力・ベルト・流体を Rust 側で高速処理するほか、Fabric / NeoForge のデータ駆動 Mod 適応・サーバー Mod 同期・WGSL シェーダーに対応します。",
+          points: [
+            "Create の動力ネットワーク・ベルト・流体パイプを Rust ネイティブ処理",
+            "<code>.mmod</code> / GitHub / CurseForge / Modrinth の 4 ソース Mod 同期",
+            "レシピ競合解決・JVM 不要の <code>megu-mod-check</code> 事前検査",
+            "OptiFine / Iris / DistantHorizons 解析とネイティブ WGSL シェーダー"
+          ],
+          previewTitle: "mod-adapter · pipeline",
+          previewCode: "<span class=\"k\">scan</span>  <span class=\"v\">create-1.21.1.jar</span>  -&gt; <span class=\"ok\">native offload</span>\n<span class=\"k\">scan</span>  <span class=\"v\">FarmersDelight.jar</span> -&gt; <span class=\"ok\">data bundle</span>\n<span class=\"k\">sync</span>  <span class=\"v\">.mmod | GitHub | CF | Modrinth</span>"
+        }
+      },
+      en: {
+        client: {
+          title: "Native GPU client without OpenGL",
+          desc: "A pure wgpu client running directly on Vulkan, DX12, and Metal, with eye-comfort optics, Japanese IME, and E2EE friend play built in.",
+          points: [
+            "Dynamic lighting, contact shadows, 3-layer clouds, and water refraction",
+            "Host RAM budget slider with built-in OOM guard",
+            "Japanese IME, 4-line sign editor, and native OS theme sync",
+            "Ear-safe default audio (50% master, 45% music), dB limiter, E2EE friend play"
+          ],
+          previewTitle: "megu-client-gpu · runtime",
+          previewCode: "<span class=\"k\">backend</span>    = <span class=\"v\">\"wgpu (Vulkan / DX12 / Metal)\"</span>\n<span class=\"k\">optics</span>     = <span class=\"v\">\"comfort_exposure, contact_shadows\"</span>\n<span class=\"k\">ram_guard</span>  = <span class=\"ok\">\"auto (host budget slider)\"</span>\n<span class=\"k\">audio</span>      = <span class=\"v\">\"master 50% / music 45% / 85% dB\"</span>"
+        },
+        server: {
+          title: "Single-binary multiplayer hosting",
+          desc: "Launch a 1.21.1 server without Java setup—land claims, hub routing, and operations tooling are built right in.",
+          points: [
+            "Persistent land claims covering TNT, containers, signs, and contraptions",
+            "Built-in hub commands (<code>/server</code>, <code>/hub</code>, <code>/world</code>) &amp; Velocity forwarding",
+            "Pure-Rust TUI console, RCON, async world backups, and <code>systemd</code>",
+            "Optional opt-in extensions (custom portal shapes, unloaded chunk catch-up)"
+          ],
+          previewTitle: "megu server · console",
+          previewCode: "<span class=\"ok\">●</span> <span class=\"v\">megu v0.1.0-alpha.5</span> <span class=\"dim\">:25565 (MC 1.21.1)</span>\n  <span class=\"k\">ram</span>: <span class=\"v\">122 MiB</span>   <span class=\"k\">claims</span>: <span class=\"ok\">active</span>\n  <span class=\"k\">proxy</span>: <span class=\"v\">Velocity Modern</span>\n  <span class=\"k\">cmd</span>: <span class=\"v\">/hub  /server  /world  /megu</span>"
+        },
+        mods: {
+          title: "Create offload, Mod sync & WGSL shaders",
+          desc: "Runs Create kinetics, belts, and fluid pipes natively in Rust, alongside Fabric / NeoForge data-driven mod adaptation, 4-source sync, and native WGSL shaders.",
+          points: [
+            "Rust-native offload for Create kinetic networks, belts, and fluid pipes",
+            "4-source server sync (<code>.mmod</code>, GitHub, CurseForge, Modrinth)",
+            "Recipe conflict resolver and JVM-free <code>megu-mod-check</code> scanning",
+            "OptiFine / Iris / DistantHorizons parsing &amp; Megu native WGSL shaders"
+          ],
+          previewTitle: "mod-adapter · pipeline",
+          previewCode: "<span class=\"k\">scan</span>  <span class=\"v\">create-1.21.1.jar</span>  -&gt; <span class=\"ok\">native offload</span>\n<span class=\"k\">scan</span>  <span class=\"v\">FarmersDelight.jar</span> -&gt; <span class=\"ok\">data bundle</span>\n<span class=\"k\">sync</span>  <span class=\"v\">.mmod | GitHub | CF | Modrinth</span>"
+        }
+      }
+    };
+
+    // --- Segmented Status List data ---
+    var SUBSYSTEMS = {
+      ja: [
+        { idx: "01", name: "サーバー・プロトコル・運用", desc: "Minecraft 1.21.1（Protocol 767）、online-mode 認証、Velocity Modern Forwarding、土地保護（クレーム）、ハブ（<code>/server</code>・<code>/hub</code>）、Pure-Rust TUI、<code>systemd sd_notify</code>。", status: "working", tag: "動作中" },
+        { idx: "02", name: "ワールド・ゲームプレイ", desc: "3ディメンション、ポータル、全48種ダメージ型・エンチャント・エフェクト・クラフト・かまど・天候・流体、<code>/execute</code>、構造物。バニラ完全一致の地形生成と AI 網羅は開発中。", status: "partial", tag: "一部対応" },
+        { idx: "03", name: "ネイティブ GPU クライアント", desc: "<code>winit + wgpu</code>（Vulkan / DX12 / Metal）の実ウィンドウ起動・動的ライティング・コンタクトシャドウ・3層雲・日本語 IME・E2EE フレンド＆LAN プレイ・RAM 上限スライダー（<code>megu-client-gpu</code>）。", status: "working", tag: "動作中" },
+        { idx: "04", name: "Mod 互換・サーバー Mod 同期", desc: "置き換え済み軽量化 Mod 54 種スキップ、データ駆動型 Fabric / NeoForge 適応、4ソース（<code>.mmod</code> / GitHub / CurseForge / Modrinth）同期、JVM 不要の JAR 検査（<code>megu-mod-check</code>）。複雑な任意 Java Mixin 実行は開発中。", status: "partial", tag: "一部対応" },
+        { idx: "05", name: "シェーダーパック・WGSL", desc: "OptiFine / Iris / DistantHorizons の解析・パス計画と、Megu ネイティブ WGSL シェーダーの検証・描画（汎用 GLSL→WGSL 自動変換は未実装）。", status: "partial", tag: "一部対応" },
+        { idx: "06", name: "導入・CLI ツール", desc: "<code>megu-installer</code>（Win / Mac / Linux <code>x86_64 &amp; arm64</code>・Prism・サーバー）、<code>megu-mod-check</code>、<code>megu-world-migrate</code>（1.21.1 ↔ 26.3）。", status: "working", tag: "動作中" }
+      ],
+      en: [
+        { idx: "01", name: "Server, Protocol & Ops", desc: "Minecraft 1.21.1 (Protocol 767), online-mode auth, Velocity Modern Forwarding, land claims, hub commands (<code>/server</code>, <code>/hub</code>), Pure-Rust TUI, and <code>systemd sd_notify</code>.", status: "working", tag: "Working" },
+        { idx: "02", name: "World & Gameplay", desc: "Three dimensions, portals, 48 typed damage sources, enchantments, status effects, crafting, furnaces, weather, fluids, <code>/execute</code>, and structures. Full vanilla terrain & AI parity is in progress.", status: "partial", tag: "Partial" },
+        { idx: "03", name: "Native GPU Client", desc: "Live <code>winit + wgpu</code> (Vulkan / DX12 / Metal) window, dynamic lighting, contact shadows, 3-layer clouds, Japanese IME, E2EE friend & LAN play, and host RAM budget slider (<code>megu-client-gpu</code>).", status: "working", tag: "Working" },
+        { idx: "04", name: "Mod Adaptation & Server Sync", desc: "54 superseded perf-mod auto-skips, data-driven Fabric / NeoForge adaptation, 4-source sync (<code>.mmod</code> / GitHub / CurseForge / Modrinth), and JVM-free JAR inspection (<code>megu-mod-check</code>). Complex arbitrary Java Mixins are in progress.", status: "partial", tag: "Partial" },
+        { idx: "05", name: "Shader Packs & WGSL", desc: "OptiFine / Iris / DistantHorizons pack parsing & pass planning, plus Megu native WGSL shader execution (generic GLSL→WGSL transpilation is not implemented).", status: "partial", tag: "Partial" },
+        { idx: "06", name: "Installer & CLI Tools", desc: "<code>megu-installer</code> (Win / Mac / Linux <code>x86_64 &amp; arm64</code>, Prism, server), <code>megu-mod-check</code>, and <code>megu-world-migrate</code> (1.21.1 ↔ 26.3).", status: "working", tag: "Working" }
+      ]
+    };
+
     var JA = {
-      nav_downloads: "ダウンロード",
-      nav_bench: "実測値",
-      nav_checker: "Modpack診断",
-      nav_how: "設計",
-      nav_mods: "Mod・シェーダー",
+      nav_bench: "比較",
+      nav_feat: "機能",
+      nav_dl: "ダウンロード",
+      nav_status: "対応状況",
+      nav_check: "Modpack 検査",
       nav_support: "支援・法人",
-      hero_headline: "Rust + wgpu の Minecraft 1.21.1 エンジン。",
-      hero_lead: "Minecraft: Java Edition 1.21.1 向けのオープンソース（LGPL-3.0）Rust 製クライアント＆サーバー。wgpu（Vulkan / DX12 / Metal）ネイティブ描画（OpenGL 不要）、双方とも JVM 不要、NeoForge / Fabric Mod の自動検査・適応を備えます。",
-      kpi_ram_unit: "バニラ比で省メモリ",
-      kpi_ram_sub: "122 MiB vs バニラ 1,168 MiB（1.21.1 サーバー実測）",
-      cta_download: "Megu を入手",
-      cta_check: "Modpackを診断",
-      cta_github: "GitHub を見る",
+      hero_sub: "Rust 製の Minecraft: Java Edition 1.21.1 クライアント & サーバー",
+      hero_lead: "Java 不要で動く 1.21.1 互換の専用サーバーと、Vulkan / DX12 / Metal 対応の純 wgpu ネイティブクライアント（OpenGL 不要）。既存の 1.21.1 サーバー・ワールドに加え、Fabric / NeoForge Mod にも対応します。",
+      hero_cta_dl: "ダウンロード",
+      hero_cta_check: "Modpack 検査",
+      hero_docs: "ドキュメント ↗",
+      hm1_label: "サーバー RAM 実測（Vanilla 1,168 MiB）",
+      hm2_label: "OpenGL なしのネイティブ GPU 描画",
+      hm3_label: "データ駆動 Mod・サーバー Mod 同期に対応",
+      bench_title: "Vanilla 1.21.1 との比較",
+      bg_ram: "サーバーメモリ使用量 (RAM)",
+      bench_instances: "サーバー台数",
+      bg_worldgen: "チャンク生成速度（世界全体）",
+      dummy_badge: "計測予定 · ダミー表示",
+      worldgen_note: "同一シード・同一描画距離でのワールド全体生成速度（地形・構造物・バイオーム込み）を Vanilla 1.21.1 と比較して実測後に更新予定です。",
+      bg_create: "Create Mod 負荷比較（動力・ベルト・流体）",
+      create_note: "Rust ネイティブ最適化による大規模な動力ネットワーク・ベルト・流体パイプ稼働時の 1 ティック処理時間（MSPT）を NeoForge 1.21.1 と比較して実測後に更新予定です。",
+      bg_planned: "その他の計測予定ベンチマーク",
+      pl2_name: "クライアント FPS",
+      pl2_meta: "通常プレイ・描画距離ごとの平均 FPS / 1% Low（Vanilla 1.21.1 比）",
+      pl3_name: "多人数サーバー負荷",
+      pl3_meta: "複数人での同時探索・移動時の CPU / メモリ推移",
+      pl_tag: "計測予定",
+      cmp_title: "Vanilla / NeoForge との違い",
+      leg_y: "対応",
+      leg_p: "一部・開発中",
+      leg_n: "非対応",
+      cmp_th_feat: "項目",
+      bench_cond: "RAM: tools/load_compare.sh · 20 秒移動負荷 · 3 回平均 · v0.1.0-alpha.5（Alpha 版は本家より未実装機能があるため同等機能比較ではありません）",
+      feat_title: "主な機能",
+      ft_client: "クライアント",
+      ft_server: "サーバー",
+      ft_mods: "Mod & シェーダー",
       dl_title: "ダウンロード・配布ハブ",
-      dl_note: "単体 Rust バイナリ · 対象 1.21.1",
-      dl_desc: "用途に合わせて選択できます — 純 wgpu クライアント、JSON API 付き Rust 専用サーバー、または NeoForge / Fabric Mod 検査＆ネイティブ雛形生成。",
       dl_tabs_aria: "配布ターゲットを選択",
-      dl_tab_client: "プレイヤー・クライアント",
-      dl_tab_client_sub: "純 wgpu · OpenGL 不要 · JVM 不要",
-      dl_tab_server: "サーバー・ホスティング",
-      dl_tab_server_sub: "122 MiB RAM · /api/latest",
-      dl_tab_dev: "Mod 作者・MDK",
-      dl_tab_dev_sub: "JAR 検査 · ネイティブ雛形",
+      tab_client: "クライアント",
+      tab_server: "サーバー",
+      tab_modcheck: "Mod / CLI",
       dl_client_title: "1. 公式ランチャー＆ネイティブ wgpu クライアント",
       dl_client_body: "megu-installer は Java 不要です。GUI（ダブルクリックまたは megu-installer gui）と CLI の両モードで、公式ランチャーに Megu (1.21.1) プロファイルを登録し、ネイティブクライアント megu-client-gpu を配置します。Windows は Windows 10/11、macOS は macOS 11 以降が必要です。",
       dl_client_zero_manual: "手動設定は不要です。megu-client-gpu は Vulkan / DX12 / Metal 対応の純 wgpu クライアントで、OpenGL も JVM も使いません。初回起動時は既存の Vanilla 1.21.1 を再利用し、無い場合は Mojang 公式 HTTPS ホストからクライアント JAR を取得して SHA-1 を検証してから起動します。",
       dl_releases_btn: "この端末向けの推奨版",
-      dl_linux_installer_btn: "Linux x86_64",
-      dl_macos_installer_btn: "macOS arm64",
       dl_all_releases_btn: "全 OS アーカイブ一覧",
       dl_targets_title: "ネイティブインストーラー 8 種",
       dl_target_platform: "プラットフォーム",
@@ -810,90 +1118,56 @@ megu-client --ping localhost:25565</code></pre>
       dl_windows_note: "Windows 10/11 · Intel/AMD 64-bit",
       dl_windows_arm_note: "Windows 11 · Snapdragon ARM64",
       dl_targets_caveat: "Linux の CPU アーキテクチャは端末内で判定します。Alpine/musl では musl 版を選んでください。Linux ディストリビューション名は libc 系統の目安であり、互換性を保証するものではありません。",
-      dl_mrpack_btn: "Modrinth App（.mrpack）",
-      dl_prism_zip_btn: "Prism Launcher（.zip）",
-      dl_check_pack_btn: "手元の Modpack を事前診断",
-      dl_source_badge: "Modrinth App · Prism Launcher",
-      dl_client_src_title: "2. Modpack として 1 発インポート（.mrpack / .zip）",
-      dl_client_src_body: "Modrinth App には megu-1.21.1.mrpack、Prism Launcher には megu-prism-1.21.1.zip をインポートしてください。megu-installer prism でも導入できます。",
+      client_linux: "ワンライン導入スクリプト",
+      client_win: "PowerShell ワンライン導入",
+      dl_prism_title: "2. Prism Launcher カスタムパッチ済みインスタンス",
+      dl_prism_body: "megu-prism-1.21.1.zip を Prism Launcher にインポートすると、すぐ使える Megu カスタムパッチ済みインスタンスが作成されます（megu-installer または OS アーカイブから megu-client-gpu を導入してください）。または megu-installer prism を実行してください。Modrinth App ユーザーに .mrpack は不要で、megu-client-gpu を直接起動すれば既存のインストール・ワールド・mods/ を読み込みます。",
+      dl_prism_zip_btn: "Prism Launcher (.zip)",
+      dl_check_pack_btn: "手元の Modpack を事前検査",
       dl_server_title: "Megu 専用サーバー（megu）",
-      dl_server_body: "1.21.1 対応の専用サーバーバイナリ（megu）。online-mode AES-CFB8 認証、Velocity Modern Forwarding、RCON、非同期バックアップを搭載します。ネイティブクライアントとは別の Rust バイナリで、JVM は不要です。",
+      server_intro: "megu-installer でサーバーを構築し、eula.txt に同意して起動します。online-mode AES-CFB8 認証、Velocity Modern Forwarding、RCON、Docker・systemd に JVM 不要で対応します。",
+      step_1: "サーバーディレクトリを作成",
+      step_2: "eula.txt に同意して起動",
+      dl_verify_summary: "固定タグの Linux アーカイブをインストール前に検証（SHA-256）",
+      dl_verify_note: "リリースタグ: v0.1.0-alpha.5。SHA256SUMS-all.txt から対象アーカイブの行を SHA256SUMS.txt に抽出し、sha256sum -c で検証してから展開してください。",
       dl_server_archive_title: "サーバー用フルアーカイブ 8 種",
       dl_server_only_note: "静的リンク · サーバー専用（megu + megu-installer）",
       dl_server_archive_note: "デスクトップ版には megu・megu-client-gpu・megu-installer が同梱されます。静的 musl・FreeBSD・RISC-V 版はサーバー専用（megu + megu-installer）、動的 musl-client 版は megu-client-gpu のみです。",
-      dl_server_btn: "サーバーバイナリを入手",
-      dl_qs_jump: "3 ステップ起動手順へ",
       dl_api_title: "管理パネル・自動更新用 JSON API",
       dl_api_body: "ホスティングパネル・Pterodactyl Egg・CI パイプラインから、Cloudflare エッジ経由で最新リリースのメタデータを自動取得できます。",
       dl_dev_title: "JAR 事前検査＆ネイティブ Mod 雛形生成",
-      dl_dev_body: "既存の NeoForge / Fabric JAR の Mixin/.class 互換性をローカル検査するか、検証済みの megu-mod-bundle/1 雛形を 1 コマンドで生成できます。",
-      dl_docs_title: "Mod 制作・WGSL シェーダー仕様書",
-      dl_docs_body: "クリーンルーム設計、宣言的バンドル仕様、ネイティブ megu-shader.toml WGSL パイプラインのドキュメントを GitHub で公開しています。",
-      dl_author_guide: "Mod・シェーダー作者ガイド",
-      dl_all_docs: "ドキュメント一覧",
-      bench_title: "バニラ 1.21.1 との実測比較",
-      bench_meta: "同一 PC · 20 秒の移動負荷 · 3 回平均 · seed 0 · 描画距離 4",
-      bench_ram_label: "サーバーのメモリ使用量 (RAM)",
-      bench_caveat: "Linux x86_64 での tools/load_compare.sh 実測値（3 回平均）。Alpha 版は本家より未実装機能があるため同等機能での比較ではありません。FPS・チャンク生成速度・CPU/GPU 負荷のバニラ比較は実機ベンチ計測後に追記します。",
-      checker_title: "手元の Modpack をその場で診断。",
+      mod_intro: "既存の Fabric / NeoForge JAR の Mixin/.class 互換性を Java なしで検査したり、検証済みの megu-mod-bundle/1 雛形を生成できます。",
+      mod_step_1: "mods フォルダをローカル検査",
+      mod_step_2: "ネイティブ Mod 雛形を生成",
+      mod_webcheck: "ブラウザ版 Modpack 検査 ↓",
+      mod_docs: "Mod 互換性ガイド ↗",
+      dl_author_guide: "Mod・シェーダー作者ガイド ↗",
+      subsys_title: "対応状況と技術詳細",
+      f_all: "すべて (6)",
+      f_working: "動作中 (3)",
+      f_partial: "一部対応 (3)",
+      cli_more_summary: "開発者向けコマンド（ソースビルド・Docker・ワールド移行）",
+      checker_title: "Modpack 事前検査",
       checker_note: "ブラウザ内で完結します — ファイルは一切送信されません。",
-      checker_desc: "Modrinth .mrpack や CurseForge .zip の manifest から、自動スキップ候補と既知の Mod 系統を確認できます。ブラウザでは JAR バイトコードの検査や実行互換性の保証はできません。詳細はローカルの megu-mod-check CLI で検査してください。",
+      checker_desc: "Modrinth .mrpack や CurseForge .zip の manifest から、置き換え済み軽量化 Mod 54 種の自動スキップ候補と既知の Mod 系統を確認できます。ブラウザでは JAR バイトコード検査や実行互換性の保証はできません。詳細はローカルの megu-mod-check CLI で検査してください。",
       checker_target: "対象バージョン",
-      checker_sample: "サンプルパックを試す",
+      checker_sample: "サンプルで試す",
       checker_drop: ".mrpack / CurseForge .zip / manifest .json をドロップ",
       checker_hint: "またはクリックしてファイルを選択",
       checker_paste_label: "または Modrinth modrinth.index.json / CurseForge manifest.json を貼り付け",
       checker_paste_placeholder: "manifest の JSON を貼り付けてください",
       checker_limit: "入力上限: 2 MiB（ファイル・貼り付け JSON）。",
-      checker_paste_button: "貼り付けた JSON を診断",
+      checker_paste_button: "貼り付けた JSON を検査",
       checker_inspection: "任意の Java Mod の互換性を推測しません。Mixin/.class の検査には megu-mod-check --scan-mods-dir が必要です。",
       checker_stats_aria: "互換性の概要",
       checker_col_path: "パス",
       checker_col_handling: "処理区分",
       checker_col_note: "備考",
       checker_raw: "JSON レポートとテキスト要約",
-      how_title: "実装済みの構成要素と対応範囲",
-      p1_title: "ネイティブなシミュレーション処理",
-      p1_body: "Rust 実装は Create の一部の動力・ベルト・流体や調理データに対応しています。対応する動作・負荷条件について、Minecraft と Mod の実装との比較検証を継続しています。",
-      p2_title: "クライアントと描画の実装状況",
-      p2_body: "クライアントにはプロトコル Ping、Magic/VFX/Animation/Combat-Motion 処理、保守的なシェーダーパック機能計画があります。独立した client-gpu には winit + wgpu の実ウィンドウ／オフスクリーン描画があり、AMD RX 7800 XT（RADV）で非空の Vulkan オフスクリーン描画を確認した記録があります。",
-      p3_title: "起動時の Mod 自動適応",
-      p3_body: "mods/ の起動時スキャンで、置き換え済みの軽量化 Mod 54 種をスキップし、live_mod_bridge / auto_adapter によりデータ・調理・Mixin の対応範囲を適応します。未対応コードはフォールバック・隔離の必要性を分類します。",
-      p4_title: "独立バイナリ",
-      p4_body: "デスクトップ向けリリースアーカイブのエンドユーザー向けバイナリは megu（専用サーバー）、megu-client-gpu（ネイティブ wgpu ゲームクライアント）、megu-installer（ランチャー導入）の 3 個です。megu-client・megu-mod-check・megu-world-migrate・megu-init・megu-admin はソースビルド可能な内部ツールです。",
-      mods_title: "Mod の自動適応とネイティブ制作",
-      mods_intro: "既存の NeoForge / Fabric JAR を mods/ に配置すると、起動時に自動解析されます。Rust の live_mod_bridge / auto_adapter は、置き換え済み軽量化 Mod のスキップと、対応するデータ・調理・Mixin の JVM 不要な変換を試みます。",
-      mods_auto_title: "起動時に自動分類",
-      mods_auto_body: "対応する JAR の内容はネイティブ Bundle または限定的なリフト済み shim に変換できます。未対応の Tier 3 Java / Mixin 動作はフォールバック・委譲・隔離の対象として報告します。すべての既存 Mod が動作する保証はありません。",
-      mods_native_title: "JVM 不要のネイティブ Mod 制作",
-      mods_native_body: "作者は megu-mod-check --scaffold-native で、検証済みの megu-mod-bundle/1 雛形を生成できます。宣言形式によるネイティブ制作の出発点であり、必要なデータと動作は別途実装します。",
-      mods_guide: "Mod・シェーダーパック作者ガイドを読む →",
-      shader_title: "外部シェーダーパック仕様とネイティブ WGSL",
-      shader_intro: "Alpha はユーザーが配置したシェーダーパックを解析し、GPU 機能に応じたパイプラインを計画します。第三者製シェーダーは同梱していません。非対応の GPU 機能には組み込み描画への安全なフォールバックを選択します。",
-      shader_classic_title: "Classic OptiFine と Iris",
-      shader_classic_body: "Classic OptiFine の GLSL 120–330 パスに対応する解析機構があります。Iris 1.7–1.11+ 仕様は GLSL 430–460 の compute・SSBO・image・両手照明 uniform を扱います。",
-      shader_dh_title: "DistantHorizons LOD と Megu WGSL",
-      shader_dh_body: "DistantHorizons LOD の dh_shadow・dh_terrain・dh_water パスを扱います。ネイティブ WGSL パックは megu-shader.toml のパス宣言と .wgsl ファイルを使用します。",
-      shader_boundary: "シェーダーパックの対応範囲は現時点で解析・フォールバック計画です。winit + wgpu の GPU クライアントは実装済みですが、第三者シェーダーの描画再現度とサーバー／Modpack での相互運用は未検証です。",
-      qs_title: "EULA に明示同意してサーバーを開始",
-      qs_client_note: "ネイティブクライアント側の手動設定はありません。megu-installer で導入し、Megu (1.21.1) プロファイルを選ぶだけで、初回起動時に SHA-1 検証済みの Vanilla アセットを自動取得します。",
-      qs_1: "1. 1.21.1 用のサーバーを初期化し、EULA に明示同意",
-      qs_2: "2. 必要なら mods/ を JVM 不要でスキャン",
-      qs_3: "3. サーバーディレクトリから起動",
-      qs_more: "Mod 検査の 6 モード・26.3 初期化・ワールド移行・クライアント Ping",
-      scope_title: "現在の対応状況",
-      scope_now_h: "Alpha で動作するもの",
-      scope_now_1: "Vanilla 1.21.1 プロトコル、online-mode AES-CFB8 認証、Velocity Modern Forwarding",
-      scope_now_2: "決定論的ワールド生成、ランダムティック、村人・取引、管理コマンド、ops/BAN/ホワイトリスト、RCON、非同期バックアップ",
-      scope_now_3: "独立した 12 クレート（外部依存ゼロの 11 クレート＋分離した client-gpu）と、デスクトップアーカイブのエンドユーザー向け 3 バイナリ（megu、megu-client-gpu、megu-installer）",
-      scope_wip_h: "開発中・対象外",
-      scope_wip_1: "一般シードの地形生成とゲームプレイ全体の完全 Vanilla パリティ",
-      scope_wip_2: "ライブサーバーのネイティブ Anvil 保存と実 Mod 実行範囲の拡大",
-      scope_wip_3: "第三者シェーダーパックの描画再現度、実 Modpack E2E、GPU 実機・OS 検証範囲の拡大",
       support_title: "開発支援・ホスティング提携",
-      support_note: "完全 LGPL-3.0 OSS — 個人・Mod 作者・セルフホストは永久無料です。",
+      support_note: "完全 LGPL-3.0 OSS — 永久無料",
       support_ind_title: "個人サポーター・スポンサーとして応援する",
-      support_ind_body: "純 wgpu 描画・物理立体音響・単体サーバーの高性能機能はすべて完全無料 OSS のまま提供します。いただいたご支援は実機検証環境・CI 維持・1.21.1 Modpack 互換強化に充てられます。",
+      support_ind_body: "純 wgpu 描画・物理立体音響・単体サーバーの高性能機能はすべて完全無料 OSS のまま提供します。ご支援は実機検証環境・CI 維持・1.21.1 Modpack 互換強化に充てられます。",
       support_star_btn: "GitHub で Star を付ける",
       support_host_title: "ホスティング事業者・大型イベント・法人の方へ",
       support_host_body: "Minecraft レンタルサーバー事業や 300 人超の大型配信イベントを運営されていますか？Megu の超省メモリ Rust サーバー（実測 122 MiB vs 1,168 MiB）でノード収容密度を大幅に高められます。公式認証ホスト提携・PoC 検証・イベント支援はお気軽にご相談ください。",
@@ -923,13 +1197,14 @@ megu-client --ping localhost:25565</code></pre>
       feedback_search: "既存のフィンガープリントを検索",
       feedback_issue: "GitHub Issue"
     };
+
     var EN = {};
-    var nodes = document.querySelectorAll("[data-i18n]");
-    var attributeNodes = document.querySelectorAll("[data-i18n-placeholder], [data-i18n-aria-label]");
-    Array.prototype.forEach.call(nodes, function (el) {
+    var i18nNodes = document.querySelectorAll("[data-i18n]");
+    var attrNodes = document.querySelectorAll("[data-i18n-placeholder], [data-i18n-aria-label]");
+    Array.prototype.forEach.call(i18nNodes, function (el) {
       EN[el.getAttribute("data-i18n")] = el.textContent;
     });
-    Array.prototype.forEach.call(attributeNodes, function (el) {
+    Array.prototype.forEach.call(attrNodes, function (el) {
       if (el.hasAttribute("data-i18n-placeholder")) {
         EN[el.getAttribute("data-i18n-placeholder")] = el.getAttribute("placeholder");
       }
@@ -937,40 +1212,136 @@ megu-client --ping localhost:25565</code></pre>
         EN[el.getAttribute("data-i18n-aria-label")] = el.getAttribute("aria-label");
       }
     });
-    var btn = document.getElementById("lang-toggle");
+
+    var lang = "en";
+    var currentFeat = "client";
+    var currentFilter = "all";
+
+    var cmpBody = document.getElementById("cmpBody");
+    var featStage = document.getElementById("featStage");
+    var subsysListEl = document.getElementById("subsysList");
+    var instanceSlider = document.getElementById("instanceSlider");
+    var instanceCount = document.getElementById("instanceCount");
+    var valMegu = document.getElementById("valMegu");
+    var valVanilla = document.getElementById("valVanilla");
+    var benchDiff = document.getElementById("benchDiff");
+
+    function renderComparison() {
+      if (!cmpBody) return;
+      cmpBody.innerHTML = CMP_ROWS[lang].map(function (r) {
+        return "<tr><td><span class=\"cmp-feat-name\">" + r.name +
+          "</span><span class=\"cmp-feat-note\">" + r.note +
+          "</span></td><td class=\"col-c\"><span class=\"mk " + r.m + "\">" + MARK_CHAR[r.m] +
+          "</span></td><td class=\"col-c\"><span class=\"mk " + r.v + "\">" + MARK_CHAR[r.v] +
+          "</span></td><td class=\"col-c\"><span class=\"mk " + r.nf + "\">" + MARK_CHAR[r.nf] +
+          "</span></td></tr>";
+      }).join("");
+    }
+
+    function renderFeature() {
+      if (!featStage) return;
+      var f = FEATURES[lang][currentFeat];
+      featStage.innerHTML =
+        "<div><h3 class=\"feat-title\">" + f.title + "</h3>" +
+        "<p class=\"feat-desc\">" + f.desc + "</p>" +
+        "<ul class=\"feat-points\">" +
+        f.points.map(function (pt) { return "<li>" + pt + "</li>"; }).join("") +
+        "</ul></div>" +
+        "<div class=\"feat-preview\"><div class=\"feat-preview-head\"><span>" +
+        f.previewTitle + "</span><span>megu</span></div><pre>" + f.previewCode + "</pre></div>";
+    }
+
+    function renderSubsystems() {
+      if (!subsysListEl) return;
+      var items = SUBSYSTEMS[lang].filter(function (item) {
+        return currentFilter === "all" || item.status === currentFilter;
+      });
+      subsysListEl.innerHTML = items.map(function (item, i) {
+        var cls = "subsys-row" + (i === 0 ? " first-vis" : "") + (i === items.length - 1 ? " last-vis" : "");
+        return "<div class=\"" + cls + "\"><span class=\"subsys-idx\">" + item.idx +
+          "</span><div><div class=\"subsys-name\">" + item.name +
+          "</div><div class=\"subsys-desc\">" + item.desc +
+          "</div></div><span class=\"subsys-tag " + item.status + "\">" + item.tag + "</span></div>";
+      }).join("");
+    }
+
+    function formatMem(mib) {
+      return mib >= 1024 ? (mib / 1024).toFixed(2) + " GiB" : mib.toLocaleString("en-US") + " MiB";
+    }
+
+    function updateBenchmark() {
+      if (!instanceSlider) return;
+      var n = Number(instanceSlider.value) || 1;
+      var meguTotal = 122 * n;
+      var vanillaTotal = 1168 * n;
+      var saved = vanillaTotal - meguTotal;
+      instanceCount.textContent = String(n);
+      valMegu.textContent = n === 1 ? "122 MiB" : formatMem(meguTotal);
+      valVanilla.textContent = n === 1 ? "1,168 MiB" : formatMem(vanillaTotal);
+      benchDiff.textContent = (lang === "ja" ? "差分: −" : "Delta: −") + formatMem(saved);
+    }
+
+    if (instanceSlider) {
+      instanceSlider.addEventListener("input", updateBenchmark);
+    }
+
+    var featBtns = document.querySelectorAll(".feat-tab");
+    Array.prototype.forEach.call(featBtns, function (btn) {
+      btn.addEventListener("click", function () {
+        currentFeat = btn.getAttribute("data-feat") || "client";
+        Array.prototype.forEach.call(featBtns, function (b) {
+          var on = b === btn;
+          b.classList.toggle("active", on);
+          b.setAttribute("aria-selected", on ? "true" : "false");
+        });
+        renderFeature();
+      });
+    });
+
+    var filterBtns = document.querySelectorAll(".filter-btn");
+    Array.prototype.forEach.call(filterBtns, function (btn) {
+      btn.addEventListener("click", function () {
+        currentFilter = btn.getAttribute("data-filter") || "all";
+        Array.prototype.forEach.call(filterBtns, function (b) {
+          b.classList.toggle("active", b === btn);
+        });
+        renderSubsystems();
+      });
+    });
+
+    // Show M3 toast when any copy button is clicked (app.js handles clipboard write)
+    document.addEventListener("click", function (ev) {
+      if (ev.target && ev.target.classList && ev.target.classList.contains("copy-btn")) {
+        showToast(lang === "ja" ? "コピーしました" : "Copied to clipboard");
+      }
+    });
+
     var STORAGE_KEY = "megu_site_lang";
     function detectDefaultLang() {
       try {
         var saved = window.localStorage && window.localStorage.getItem(STORAGE_KEY);
-        if (saved === "ja" || saved === "en") {
-          return saved;
-        }
+        if (saved === "ja" || saved === "en") return saved;
       } catch (_) {}
       var list = (navigator.languages && navigator.languages.length)
         ? navigator.languages
         : [navigator.language || "en"];
       for (var i = 0; i < list.length; i++) {
-        if (/^ja\b/i.test(String(list[i] || ""))) {
-          return "ja";
-        }
-        if (/^en\b/i.test(String(list[i] || ""))) {
-          return "en";
-        }
+        if (/^ja\b/i.test(String(list[i] || ""))) return "ja";
+        if (/^en\b/i.test(String(list[i] || ""))) return "en";
       }
       return "en";
     }
-    var lang = "en";
+
+    var langBtns = document.querySelectorAll(".locale-btn");
     function applyLang(next, persist) {
       lang = next === "ja" ? "ja" : "en";
       document.documentElement.lang = lang;
       var dict = lang === "ja" ? JA : EN;
-      Array.prototype.forEach.call(nodes, function (el) {
+      Array.prototype.forEach.call(i18nNodes, function (el) {
         var key = el.getAttribute("data-i18n");
-        if (dict[key]) {
-          el.textContent = dict[key];
-        }
+        if (dict[key]) el.textContent = dict[key];
       });
-      Array.prototype.forEach.call(attributeNodes, function (el) {
+      Array.prototype.forEach.call(attrNodes, function (el) {
         if (el.hasAttribute("data-i18n-placeholder")) {
           el.setAttribute("placeholder", dict[el.getAttribute("data-i18n-placeholder")]);
         }
@@ -978,27 +1349,29 @@ megu-client --ping localhost:25565</code></pre>
           el.setAttribute("aria-label", dict[el.getAttribute("data-i18n-aria-label")]);
         }
       });
-      if (btn) {
-        btn.textContent = lang === "ja" ? "EN" : "日本語";
-        btn.setAttribute("aria-label", lang === "ja" ? "英語に切り替え" : "Switch to Japanese");
-      }
+      Array.prototype.forEach.call(langBtns, function (b) {
+        b.classList.toggle("active", b.getAttribute("data-lang") === lang);
+      });
+      renderComparison();
+      renderFeature();
+      renderSubsystems();
+      updateBenchmark();
       document.dispatchEvent(new CustomEvent("megu:languagechange", { detail: { lang: lang } }));
       if (persist) {
         try {
-          if (window.localStorage) {
-            window.localStorage.setItem(STORAGE_KEY, lang);
-          }
+          if (window.localStorage) window.localStorage.setItem(STORAGE_KEY, lang);
         } catch (_) {}
       }
     }
-    applyLang(detectDefaultLang(), false);
-    if (btn) {
-      btn.addEventListener("click", function () {
-        applyLang(lang === "en" ? "ja" : "en", true);
+
+    Array.prototype.forEach.call(langBtns, function (b) {
+      b.addEventListener("click", function () {
+        applyLang(b.getAttribute("data-lang"), true);
       });
-    }
+    });
+
+    applyLang(detectDefaultLang(), false);
   })();
   </script>
-
 </body>
 </html>
