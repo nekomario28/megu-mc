@@ -3103,245 +3103,32 @@ fn emitted_section_count(
     scratch.len()
 }
 
-/// Encode the opaque-terrain portion of the composed world pass into any
-/// [`wgpu::util::RenderEncoder`] — the live `RenderPass` or a
-/// `RenderBundleEncoder` when the frame's opaque terrain is being cached
-/// for steady-state replay. Writes its draw-uniform slots into `scratch`
-/// (the persistent terrain slice at `draw_ubo` offsets `0..len`).
-///
-/// Returns `(skipped_buckets, arena_draws, arena_sections, arena_regions)`
-/// for the renderer counters. Pipelines arrive pre-resolved for shadow
-/// state; `scratch` is deliberately not `'a`-bound — pushing CPU-side
-/// draw-uniform records must end when the call returns.
-#[allow(clippy::too_many_arguments)]
-fn encode_opaque_terrain<'a>(
-    pass: &mut impl wgpu::util::RenderEncoder<'a>,
-    opaque_pipeline: &'a wgpu::RenderPipeline,
-    region_pipeline: &'a wgpu::RenderPipeline,
-    draw_bg: &'a wgpu::BindGroup,
-    scratch: &mut Vec<CompositeDrawUniforms>,
-    scene: Option<&'a TerrainBuffers>,
-    live_sections: &'a HashMap<SectionCoord, LiveTerrainSection>,
-    region_arenas: &'a BTreeMap<[i32; 3], RegionArena>,
-    shared_index: &'a wgpu::Buffer,
-    culled_sections: &CullVerdicts,
-    camera_position: [f32; 3],
-    render_meta: &'a HashMap<SectionCoord, SectionRenderMetadata>,
-    chunk_fades: &ChunkFadeTracker,
-    frame_bind_group: &'a wgpu::BindGroup,
-    env_bind_group: &'a wgpu::BindGroup,
-    shadow_receiver_bg: Option<&'a wgpu::BindGroup>,
+const COMPOSITE_IDENTITY: Mat4 = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+// Append the per-draw uniform at the dynamic offset the pass records.
+fn push_lit_draw(
+    draws: &mut Vec<CompositeDrawUniforms>,
     view_proj: &Mat4,
-    // `include_arenas == false` when the GPU-driven indirect path
-    // submits the arena sections — per-section fallback draws still
-    // emit here.
-    include_arenas: bool,
-    // Packed frame lights — each emitted draw record carries the
-    // sphere∩AABB mask for its section/region volume in `params2.xy`.
-    lights: &'a VfxLightsGpu,
-    // Retained dedup set for the per-region emitted-section count —
-    // `.clear()`ed per region so no `HashSet` is allocated per frame
-    // (AUDIT-2 H5).
-    emitted_scratch: &mut HashSet<SectionCoord>,
-) -> (u64, u64, usize, usize) {
-    // Bundle-recorded passes start with empty bind-group state, so the
-    // environment (group 2) and optional shadow receiver (group 3) the
-    // composite pipeline layouts expect are bound here once — the same
-    // bind the inline pass relied on persisting from before the loop.
-    pass.set_bind_group(2, Some(env_bind_group), &[]);
-    if let Some(receiver) = shadow_receiver_bg {
-        pass.set_bind_group(3, Some(receiver), &[]);
-    }
-    let mut skipped_buckets = 0u64;
-    let mut arena_draws = 0u64;
-    let mut arena_sections = 0usize;
-    let mut arena_regions = 0usize;
-    let identity: Mat4 = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    let mut slot = |model: Mat4, fade: f32, alpha: f32, light_mask: u64| -> u32 {
-        let index = scratch.len();
-        scratch.push(CompositeDrawUniforms {
-            mvp: mat4_mul(view_proj, &model),
-            model,
-            params: [fade, alpha, 0.0, 0.0],
-            params2: [
-                f32::from_bits(light_mask as u32),
-                f32::from_bits((light_mask >> 32) as u32),
-                0.0,
-                0.0,
-            ],
-            _stride_pad: [0.0; 24],
-        });
-        index as u32 * DRAW_UNIFORM_STRIDE
-    };
-    // Opaque terrain: the demo scene, then every live section —
-    // arena-resident sections as merged per-region bucket draws,
-    // the rest through per-section buffers with the same facing
-    // cull applied per bucket.
-    pass.set_pipeline(opaque_pipeline);
-    if let Some(scene) = scene {
-        if scene.opaque_index_count > 0 {
-            let off = slot(identity, 1.0, 1.0, 0);
-            pass.set_bind_group(0, Some(frame_bind_group), &[]);
-            pass.set_bind_group(1, Some(draw_bg), &[off]);
-            pass.set_vertex_buffer(0, Some(scene.opaque_vertices.slice(..)));
-            pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
-        }
-    }
-    // S4 shared region arena: one bind group + buffer pair per
-    // 8x4x8 region; seven direction-bucket record sets merge into a few
-    // draws per region, all indexed positionally into the one shared
-    // canonical quad index buffer.
-    if include_arenas && !region_arenas.is_empty() {
-        pass.set_pipeline(region_pipeline);
-        pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
-        // Front-to-back: nearest regions rasterize first so hardware
-        // Early-Z/Hi-Z rejects occluded far terrain before it shades.
-        let mut arena_order: Vec<[i32; 3]> = region_arenas.keys().copied().collect();
-        sort_regions_front_to_back(&mut arena_order, camera_position);
-        for origin in arena_order {
-            let arena = &region_arenas[&origin];
-            if arena.draw_empty() {
-                continue;
-            }
-            // Every merged run in this arena shades within one region
-            // AABB — one sphere∩AABB pass gives the per-draw light mask
-            // the WGSL walk ANDs against `light_count.yz`.
-            let (region_min, region_max) = region_world_aabb(origin);
-            let region_mask = draw_light_mask(region_min, region_max, lights);
-            let mut bound = false;
-            for (bucket, records) in arena.bucket_records.iter().enumerate() {
-                // Merged run of consecutive kept records sharing
-                // one fade value: (start, end, fade_bits).
-                let mut run: Option<(u32, u32, u32)> = None;
-                for record in records {
-                    let coord = &record.coord;
-                    let culled = culled_sections.contains(coord);
-                    let kept = !culled
-                        && section_draw_mask(
-                            *coord,
-                            camera_position,
-                            section_protrusion(render_meta, *coord),
-                        ) >> bucket
-                            & 1
-                            != 0;
-                    if !kept {
-                        if !culled {
-                            skipped_buckets += 1;
-                        }
-                        if let Some((start, end, fade_bits)) = run.take() {
-                            let off = slot(identity, f32::from_bits(fade_bits), 1.0, region_mask);
-                            pass.set_bind_group(1, Some(draw_bg), &[off]);
-                            pass.draw_indexed(start..end, 0, 0..1);
-                            arena_draws += 1;
-                        }
-                        continue;
-                    }
-                    if !bound {
-                        pass.set_bind_group(0, Some(&arena.bind_group), &[]);
-                        pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
-                        bound = true;
-                    }
-                    let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                    match run {
-                        Some((start, end, bits))
-                            if end == record.start && bits == fade.to_bits() =>
-                        {
-                            run = Some((start, record.end, bits));
-                        }
-                        _ => {
-                            if let Some((start, end, bits)) = run.take() {
-                                let off = slot(identity, f32::from_bits(bits), 1.0, region_mask);
-                                pass.set_bind_group(1, Some(draw_bg), &[off]);
-                                pass.draw_indexed(start..end, 0, 0..1);
-                                arena_draws += 1;
-                            }
-                            run = Some((record.start, record.end, fade.to_bits()));
-                        }
-                    }
-                }
-                if let Some((start, end, bits)) = run.take() {
-                    let off = slot(identity, f32::from_bits(bits), 1.0, region_mask);
-                    pass.set_bind_group(1, Some(draw_bg), &[off]);
-                    pass.draw_indexed(start..end, 0, 0..1);
-                    arena_draws += 1;
-                }
-            }
-            arena_sections += emitted_section_count(
-                &arena.bucket_records,
-                culled_sections,
-                camera_position,
-                render_meta,
-                emitted_scratch,
-            );
-            arena_regions += usize::from(bound);
-        }
-        // Restore the per-section pipeline for the fallback path.
-        pass.set_pipeline(opaque_pipeline);
-    }
-    let mut per_section_index_bound = false;
-    for (coord, section) in live_sections.iter() {
-        if section.arena.is_some()
-            || culled_sections.contains(coord)
-            || section.opaque_index_total == 0
-        {
-            continue;
-        }
-        if !per_section_index_bound {
-            // The fallback path draws the same canonical pattern — the
-            // shared buffer serves local index space identically.
-            pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
-            per_section_index_bound = true;
-        }
-        let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-        let min = [
-            coord.0 as f32 * EDGE as f32,
-            coord.1 as f32 * EDGE as f32,
-            coord.2 as f32 * EDGE as f32,
-        ];
-        // The section's 16³ box is the tightest possible draw AABB —
-        // one sphere∩AABB pass narrows its light walk to the lights
-        // that can actually reach it.
-        let edge = EDGE as f32;
-        let section_mask =
-            draw_light_mask(min, [min[0] + edge, min[1] + edge, min[2] + edge], lights);
-        match section.opaque_bucket_ranges {
-            Some(ranges) => {
-                let draw_mask = section_draw_mask(
-                    *coord,
-                    camera_position,
-                    section_protrusion(render_meta, *coord),
-                );
-                for (bucket, &(start, count)) in ranges.iter().enumerate() {
-                    if count == 0 {
-                        continue;
-                    }
-                    if draw_mask >> bucket & 1 == 0 {
-                        skipped_buckets += 1;
-                        continue;
-                    }
-                    let off = slot(identity, fade, 1.0, section_mask);
-                    pass.set_bind_group(0, Some(&section.bind_group), &[]);
-                    pass.set_bind_group(1, Some(draw_bg), &[off]);
-                    pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
-                    pass.draw_indexed(start..start + count, 0, 0..1);
-                }
-            }
-            None => {
-                let off = slot(identity, fade, 1.0, section_mask);
-                pass.set_bind_group(0, Some(&section.bind_group), &[]);
-                pass.set_bind_group(1, Some(draw_bg), &[off]);
-                pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
-                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
-            }
-        }
-    }
-    (skipped_buckets, arena_draws, arena_sections, arena_regions)
+    model: Mat4,
+    fade: f32,
+    alpha: f32,
+    world_light: u32,
+    visual: f32,
+) -> u32 {
+    let offset = draws.len() as u32 * DRAW_UNIFORM_STRIDE;
+    draws.push(CompositeDrawUniforms {
+        mvp: mat4_mul(view_proj, &model),
+        model,
+        params: [fade, alpha, 0.0, 0.0],
+        params2: [0.0, 0.0, f32::from_bits(world_light), visual],
+        _stride_pad: [0.0; 24],
+    });
+    offset
 }
 
 /// GPU state for the tessellated-quad UI overlay ([`UI_QUAD_WGSL`]):
@@ -3570,6 +3357,7 @@ pub struct GpuRenderer {
     /// `MeshResult::HiZDepth::sections` — capacity survives the
     /// round-trip so steady frames allocate nothing.
     hiz_splat_scratch: Vec<HiZSplatSection>,
+    mesh_result_scratch: Vec<MeshResult>,
     /// Worker-returned splat buffers recycled into `hiz_splat_scratch`,
     /// cumulative — proves the capacity round-trip executes live.
     pub hiz_splat_recycled: u64,
@@ -3609,6 +3397,8 @@ pub struct GpuRenderer {
     /// `depth_store_op`. `None` before the first compiled frame keeps the
     /// conservative `Store`.
     graph_depth_consumed: Option<bool>,
+    /// Size and consumers of the last successfully compiled depth graph.
+    depth_graph_key: Option<((u32, u32), bool, bool)>,
     /// Dead passes culled by the most recent render-graph compile,
     /// cumulative.
     pub render_graph_culled_passes: u64,
@@ -3731,13 +3521,7 @@ pub struct GpuRenderer {
     gpu_indirect_record_scratch: Vec<SectionGpuRecord>,
     /// Retained pack scratch for the matching record coords.
     gpu_indirect_coord_scratch: Vec<SectionCoord>,
-    /// Retained scratch for the front-to-back region origin list.
-    gpu_indirect_origin_scratch: Vec<[i32; 3]>,
-    /// Retained scratch for the frame's per-region `GpuIndirectRun`
-    /// list — `mem::take`n into each repack, moved into the returned
-    /// [`GpuIndirectFrame`], then handed back once the frame's draws are
-    /// encoded so a camera-crossing miss reuses its capacity verbatim
-    /// (AUDIT-2 H6).
+    /// Refilled on a pack miss, then swapped with the submitted run list.
     gpu_indirect_run_scratch: Vec<GpuIndirectRun>,
     /// Retained scratch for one region's sorted `(coord, slot)` list —
     /// cleared and refilled per region inside the repack loop so no
@@ -3891,6 +3675,7 @@ pub struct GpuRenderer {
     composite: CompositeGpu,
     debug_line_pipeline: wgpu::RenderPipeline,
     debug_lines: Option<(wgpu::Buffer, u32)>,
+    debug_line_vertices: Vec<DebugLineVertex>,
     entity_ber: Option<DynamicGeometryRing>,
     entity_ber_scratch: EntityBerGeometry,
     particles: Option<DynamicGeometryRing>,
@@ -5124,16 +4909,11 @@ struct CompositeGpu {
     draw_bg: wgpu::BindGroup,
     draw_ubo: wgpu::Buffer,
     draw_capacity: u64,
-    draw_scratch: Vec<CompositeDrawUniforms>,
+    frame_scratch: ComposedDrawScratch,
     /// Draw uniforms baked into the recorded opaque-terrain bundle; they
     /// persist at `draw_ubo` offsets `0..len` while the bundle is live so
     /// replays need no re-upload.
     terrain_draw_scratch: Vec<CompositeDrawUniforms>,
-    /// Retained per-region dedup set for [`encode_opaque_terrain`]'s
-    /// `arena_sections` accounting — cleared per region and carried
-    /// across frames so the fallback terrain path never allocates a
-    /// fresh `HashSet` (AUDIT-2 H5).
-    arena_emitted_scratch: HashSet<SectionCoord>,
     env_ubo: wgpu::Buffer,
     lights_ubo: wgpu::Buffer,
     env_bg: wgpu::BindGroup,
@@ -5463,20 +5243,14 @@ struct CasterScratch {
     batch_offsets: Vec<u32>,
 }
 
-fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
-    // ShadowUniforms is repr(C), but does not implement Pod in client-port.
-    // Write its documented WGSL fields explicitly, with no unsafe casting.
-    let mut floats = Vec::with_capacity(std::mem::size_of::<ShadowUniforms>() / 4);
-    for matrix in value
-        .light_view_proj
-        .iter()
-        .chain([&value.camera_view_proj])
-    {
-        for column in matrix {
-            floats.extend_from_slice(column);
-        }
-    }
-    for field in [
+fn pack_shadow_uniforms(value: &ShadowUniforms) -> [[f32; 4]; 27] {
+    // The four matrices come first, followed by the WGSL vec4 fields.
+    // Keep the packed representation on the stack for every UBO write.
+    const { assert!(std::mem::size_of::<ShadowUniforms>() == 27 * 16) };
+    let mut packed = [[0.0; 4]; 27];
+    packed[..12].copy_from_slice(value.light_view_proj.as_flattened());
+    packed[12..16].copy_from_slice(&value.camera_view_proj);
+    packed[16..].copy_from_slice(&[
         value.cascade_splits,
         value.sun_direction,
         value.sun_color,
@@ -5488,11 +5262,8 @@ fn shadow_uniform_bytes(value: &ShadowUniforms) -> Vec<u8> {
         value.shadow_params,
         value.render_params,
         value.celestial_params,
-    ] {
-        floats.extend_from_slice(&field);
-    }
-    assert_eq!(floats.len() * 4, std::mem::size_of::<ShadowUniforms>());
-    bytemuck::cast_slice(&floats).to_vec()
+    ]);
+    packed
 }
 
 /// Write the packed lighting-feature bits into the `camera_forward.w`
@@ -6187,6 +5958,19 @@ pub fn sort_regions_front_to_back(origins: &mut [[i32; 3]], camera: [f32; 3]) {
     origins.sort_by_key(|origin| region_center_dist2(*origin, camera).to_bits());
 }
 
+/// Arena keys already arrive in origin order. Including the origin in
+/// the key preserves stable distance-sort ties without allocating sort
+/// storage or recomputing distances during comparisons.
+fn order_regions(
+    order: &mut Vec<(u32, [i32; 3])>,
+    origins: impl Iterator<Item = [i32; 3]>,
+    camera: [f32; 3],
+) {
+    order.clear();
+    order.extend(origins.map(|origin| (region_center_dist2(origin, camera).to_bits(), origin)));
+    order.sort_unstable();
+}
+
 /// Positive-vertex (p-vertex) six-plane AABB frustum test, branchless:
 /// each plane is tested against the box corner farthest along its
 /// normal, so a box is rejected only when it lies *entirely* outside at
@@ -6362,17 +6146,6 @@ struct GpuIndirectRun {
     first: u32,
     /// Consecutive args in the run.
     count: u32,
-}
-
-/// Everything the opaque pass needs to submit the GPU-culled arena
-/// draws: the args buffer plus one contiguous run per region, ordered
-/// front-to-back by region.
-struct GpuIndirectFrame {
-    /// GPU-written `IndirectArgs` (a clone of the persistent buffer's
-    /// handle — wgpu refcounts keep it alive for the pass).
-    args: wgpu::Buffer,
-    /// Per-region contiguous runs, front-to-back.
-    runs: Vec<GpuIndirectRun>,
 }
 
 /// One region's indirect-pack step (AUDIT-2 H6): collect the
@@ -7550,6 +7323,14 @@ struct ScaledTarget {
 /// One composed world-pass invocation: the color view to draw into, its
 /// pixel size and matching `view_proj`, the atmosphere clear color, and the
 /// chunk-fade ages consulted per live section.
+#[derive(Default)]
+struct ComposedDrawScratch {
+    draws: Vec<CompositeDrawUniforms>,
+    /// Distance bits and origin, with origin as the tie-breaker.
+    region_order: Vec<(u32, [i32; 3])>,
+    arena_emitted: HashSet<SectionCoord>,
+}
+
 struct ComposedWorldTarget<'a> {
     view: &'a wgpu::TextureView,
     size: (u32, u32),
@@ -8564,6 +8345,7 @@ impl GpuRenderer {
             external_section_delta_syncs: 0,
             external_section_sync_skips: 0,
             hiz_splat_scratch: Vec::new(),
+            mesh_result_scratch: Vec::new(),
             hiz_splat_recycled: 0,
             section_graphs: HashMap::new(),
             section_render_meta: HashMap::new(),
@@ -8573,6 +8355,7 @@ impl GpuRenderer {
             upload_ring: FramePacingUploadRing::new(),
             upload_ring_scratch: Vec::new(),
             graph_depth_consumed: None,
+            depth_graph_key: None,
             render_graph_culled_passes: 0,
             render_graph_aliased_bytes: 0,
             render_graph_compiles: 0,
@@ -8611,7 +8394,6 @@ impl GpuRenderer {
             gpu_indirect_sections_submitted: 0,
             gpu_indirect_record_scratch: Vec::new(),
             gpu_indirect_coord_scratch: Vec::new(),
-            gpu_indirect_origin_scratch: Vec::new(),
             gpu_indirect_run_scratch: Vec::new(),
             gpu_indirect_slot_scratch: Vec::new(),
             gpu_indirect_record_uploads: 0,
@@ -8671,6 +8453,7 @@ impl GpuRenderer {
             composite,
             debug_line_pipeline,
             debug_lines: None,
+            debug_line_vertices: Vec::new(),
             entity_ber: None,
             entity_ber_scratch: EntityBerGeometry {
                 lit_vertices: Vec::with_capacity(MAX_DYNAMIC_QUADS * 4),
@@ -8781,7 +8564,9 @@ impl GpuRenderer {
     /// Upload world-space F3+G/F3+B segments. Invalid segments are omitted,
     /// and uploads are capped to keep remote diagnostics bounded.
     pub fn set_debug_lines(&mut self, lines: &[DebugLine]) {
-        let mut vertices = Vec::with_capacity(lines.len().min(MAX_DEBUG_LINES) * 2);
+        let vertices = &mut self.debug_line_vertices;
+        vertices.clear();
+        vertices.reserve(lines.len().min(MAX_DEBUG_LINES) * 2);
         for line in lines {
             if vertices.len() >= MAX_DEBUG_LINES * 2 {
                 break;
@@ -8815,7 +8600,7 @@ impl GpuRenderer {
             });
             self.ctx
                 .queue
-                .write_buffer(&buffer, 0, bytemuck::cast_slice(&vertices));
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(vertices));
             Some((buffer, vertices.len() as u32))
         };
     }
@@ -9917,9 +9702,11 @@ impl GpuRenderer {
             draw_bg,
             draw_ubo,
             draw_capacity,
-            draw_scratch: Vec::with_capacity(64),
+            frame_scratch: ComposedDrawScratch {
+                draws: Vec::with_capacity(64),
+                ..Default::default()
+            },
             terrain_draw_scratch: Vec::with_capacity(64),
-            arena_emitted_scratch: HashSet::new(),
             env_ubo,
             lights_ubo,
             env_bg,
@@ -11469,9 +11256,9 @@ impl GpuRenderer {
     /// Pull finished worker results: geometry completions are parked for
     /// the pending-upload drain, Hi-Z pyramids install directly.
     fn drain_mesh_results(&mut self) {
-        let mut results = Vec::new();
+        let results = &mut self.mesh_result_scratch;
         self.mesh_pool.drain(|result| results.push(result));
-        for result in results {
+        for result in results.drain(..) {
             match result {
                 MeshResult::SectionMesh { built } => {
                     // The session's own pool drains `SectionMesh` through
@@ -11747,20 +11534,18 @@ impl GpuRenderer {
     /// Windowed P95 of recent rendered-frame intervals, in microseconds —
     /// the input [`ChunkUploadBudget::adapt`] expects. `0.0` on an empty
     /// window reads as "no evidence of stress" and lets the cap regrow.
-    /// The sort buffer is retained (`upload_p95_scratch`) — this runs on
+    /// The selection buffer is retained (`upload_p95_scratch`) — this runs on
     /// every rendered frame.
     fn upload_frame_p95_us(&mut self) -> f64 {
         if self.upload_frame_ms.is_empty() {
             return 0.0;
         }
-        let mut sorted = std::mem::take(&mut self.upload_p95_scratch);
-        sorted.clear();
-        sorted.extend(self.upload_frame_ms.iter().copied());
-        sorted.sort_by(f64::total_cmp);
-        let rank = (sorted.len() * 95).div_ceil(100).max(1) - 1;
-        let p95_us = sorted[rank.min(sorted.len() - 1)] * 1_000.0;
-        self.upload_p95_scratch = sorted;
-        p95_us
+        let samples = &mut self.upload_p95_scratch;
+        samples.clear();
+        samples.extend(self.upload_frame_ms.iter().copied());
+        let rank = (samples.len() * 95).div_ceil(100) - 1;
+        let (_, p95, _) = samples.select_nth_unstable_by(rank, f64::total_cmp);
+        *p95 * 1_000.0
     }
 
     /// The last player world position reported through
@@ -12518,7 +12303,7 @@ impl GpuRenderer {
     /// camera-distance ring + Morton Z-order — upload them, then
     /// dispatch `SECTION_CULL_WGSL` so the GPU writes `instance_count`
     /// 0/1 straight into the args buffer the opaque pass consumes (zero
-    /// CPU readback). Returns `None` when the path is unavailable: flag
+    /// CPU readback). Returns `false` when the path is unavailable: flag
     /// off, no `INDIRECT_EXECUTION`, or no committed arena geometry.
     /// Hi-Z occlusion arms only while the pyramid was built under this
     /// exact view-projection — a camera cut or frame 0 dispatches with
@@ -12528,9 +12313,9 @@ impl GpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         view_proj: &Mat4,
         camera_position: [f32; 3],
-    ) -> Option<GpuIndirectFrame> {
+    ) -> bool {
         if !self.gpu_indirect_enabled || !self.indirect_execution_supported {
-            return None;
+            return false;
         }
         let edge = EDGE as f32;
         let cam_section = [
@@ -12549,89 +12334,55 @@ impl GpuRenderer {
                 && b.packed_morton == self.morton_order_enabled
         });
         if fast_hit {
-            let count = self.gpu_indirect.as_ref().expect("fast hit").cached_count;
-            let occlusion_armed = self.gpu_hiz.as_ref().is_some_and(|hiz| hiz.pyramid_ready())
-                && self.gpu_hiz_frame_vp == Some(*view_proj);
-            let (depth_w, depth_h) = self.depth_size;
-            let (hiz_w, hiz_h, mip_count) = {
-                let culler = self.gpu_hiz_culler(depth_w, depth_h);
-                (
-                    culler.resolution().0,
-                    culler.resolution().1,
-                    culler.mip_count(),
-                )
-            };
-            let uniforms = CullUniforms {
-                view_proj: *view_proj,
-                planes: frustum_planes_from_view_proj(view_proj),
-                camera_pos: [
-                    camera_position[0],
-                    camera_position[1],
-                    camera_position[2],
-                    0.0,
-                ],
-                params: [
-                    hiz_w as f32,
-                    hiz_h as f32,
-                    if occlusion_armed {
-                        mip_count as f32
-                    } else {
-                        0.0
-                    },
-                    count as f32,
-                ],
-            };
-            let buffers = self.gpu_indirect.as_mut().expect("fast hit");
-            self.ctx
-                .queue
-                .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
-            self.ctx.queue.write_buffer(
-                &buffers.stats,
-                0,
-                bytemuck::bytes_of(&CullStats::default()),
-            );
             self.gpu_indirect_record_uploads_skipped += 1;
-            let culler = self.gpu_hiz.as_mut().expect("created above");
-            culler.cull_sections_into_indirect_buffer(
-                &self.ctx.device,
-                encoder,
-                &buffers.uniforms,
+        } else {
+            self.pack_gpu_indirect_regions(camera_position);
+            let count = self.gpu_indirect_record_scratch.len();
+            if count == 0 {
+                return false;
+            }
+            self.ensure_gpu_indirect_capacity(count);
+            let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
+            buffers
+                .record_coords
+                .clone_from(&self.gpu_indirect_coord_scratch);
+            // Differential record upload: diff the pack against the shadow
+            // of the last uploaded copy — an identical frame costs zero
+            // `write_buffer` calls, a residency change costs only the
+            // coalesced dirty spans, a grow-realloc (fresh shadow) costs one
+            // full-slice write.
+            let (span_writes, span_bytes) = write_indirect_record_diff(
+                &self.ctx.queue,
                 &buffers.sections,
-                &buffers.args,
-                &buffers.stats,
-                &buffers.masks,
-                count,
+                &mut buffers.record_shadow,
+                &self.gpu_indirect_record_scratch,
             );
-            self.gpu_indirect_sections_submitted += u64::from(count);
-            // Reuse the retained run scratch for the cached-runs copy so
-            // even the fast-hit path performs no fresh `Vec` alloc.
-            let mut runs = std::mem::take(&mut self.gpu_indirect_run_scratch);
-            runs.clone_from(&buffers.cached_runs);
-            return Some(GpuIndirectFrame {
-                args: buffers.args.clone(),
-                runs,
-            });
+            if span_writes == 0 {
+                self.gpu_indirect_record_uploads_skipped += 1;
+            }
+            self.gpu_indirect_record_uploads += span_writes;
+            self.gpu_indirect_record_bytes_uploaded += span_bytes;
+            buffers.packed_world_revision = self.cull_world_revision;
+            buffers.packed_camera_section = cam_section;
+            buffers.packed_morton = self.morton_order_enabled;
+            std::mem::swap(&mut buffers.cached_runs, &mut self.gpu_indirect_run_scratch);
+            buffers.cached_count = count as u32;
         }
-        // Retained scratch: `mem::take` moves the capacity out of `self`
-        // for the duration of the pack (the loops below borrow
-        // `self.region_arenas` immutably) and the tail of the function
-        // returns it — steady frames never allocate.
-        let mut records = std::mem::take(&mut self.gpu_indirect_record_scratch);
-        let mut record_coords = std::mem::take(&mut self.gpu_indirect_coord_scratch);
-        let mut origins = std::mem::take(&mut self.gpu_indirect_origin_scratch);
-        // H6: the run list and the per-region slot list reuse retained
-        // capacity the same way; `runs` comes back from the caller's
-        // finished `GpuIndirectFrame` so a camera-crossing miss costs
-        // zero fresh `Vec` allocations.
-        let mut runs = std::mem::take(&mut self.gpu_indirect_run_scratch);
-        let mut slots = std::mem::take(&mut self.gpu_indirect_slot_scratch);
+        self.dispatch_gpu_indirect_cull(encoder, view_proj, camera_position);
+        true
+    }
+
+    fn pack_gpu_indirect_regions(&mut self, camera_position: [f32; 3]) {
+        let records = &mut self.gpu_indirect_record_scratch;
+        let record_coords = &mut self.gpu_indirect_coord_scratch;
         records.clear();
         record_coords.clear();
-        origins.clear();
+        let runs = &mut self.gpu_indirect_run_scratch;
         runs.clear();
-        origins.extend(self.region_arenas.keys().copied());
-        sort_regions_front_to_back(&mut origins, camera_position);
-        for origin in origins.iter().copied() {
+        let slots = &mut self.gpu_indirect_slot_scratch;
+        let order = &mut self.composite.frame_scratch.region_order;
+        order_regions(order, self.region_arenas.keys().copied(), camera_position);
+        for &(_, origin) in order.iter() {
             let arena = &self.region_arenas[&origin];
             if arena.draw_empty() {
                 continue;
@@ -12644,23 +12395,26 @@ impl GpuRenderer {
                 &arena.pending_vertex_writes,
                 camera_position,
                 self.morton_order_enabled,
-                &mut slots,
-                &mut record_coords,
-                &mut records,
+                slots,
+                record_coords,
+                records,
             ) {
                 runs.push(run);
             }
         }
-        if records.is_empty() {
-            self.gpu_indirect_record_scratch = records;
-            self.gpu_indirect_coord_scratch = record_coords;
-            self.gpu_indirect_origin_scratch = origins;
-            self.gpu_indirect_run_scratch = runs;
-            self.gpu_indirect_slot_scratch = slots;
-            return None;
-        }
-        let count = records.len() as u32;
-        self.ensure_gpu_indirect_capacity(records.len());
+    }
+
+    fn dispatch_gpu_indirect_cull(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view_proj: &Mat4,
+        camera_position: [f32; 3],
+    ) {
+        let count = self
+            .gpu_indirect
+            .as_ref()
+            .expect("packed indirect records")
+            .cached_count;
         // Arm occlusion only when the pyramid is fresh for this exact
         // view; the WGSL early-outs `hiz_occluded` on `params.z == 0`.
         let occlusion_armed = self.gpu_hiz.as_ref().is_some_and(|hiz| hiz.pyramid_ready())
@@ -12694,27 +12448,10 @@ impl GpuRenderer {
                 count as f32,
             ],
         };
-        let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
-        buffers.record_coords.clone_from(&record_coords);
+        let buffers = self.gpu_indirect.as_ref().expect("packed indirect records");
         self.ctx
             .queue
             .write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
-        // Differential record upload: diff the pack against the shadow
-        // of the last uploaded copy — an identical frame costs zero
-        // `write_buffer` calls, a residency change costs only the
-        // coalesced dirty spans, a grow-realloc (fresh shadow) costs one
-        // full-slice write.
-        let (span_writes, span_bytes) = write_indirect_record_diff(
-            &self.ctx.queue,
-            &buffers.sections,
-            &mut buffers.record_shadow,
-            &records,
-        );
-        if span_writes == 0 {
-            self.gpu_indirect_record_uploads_skipped += 1;
-        }
-        self.gpu_indirect_record_uploads += span_writes;
-        self.gpu_indirect_record_bytes_uploaded += span_bytes;
         self.ctx
             .queue
             .write_buffer(&buffers.stats, 0, bytemuck::bytes_of(&CullStats::default()));
@@ -12730,20 +12467,6 @@ impl GpuRenderer {
             count,
         );
         self.gpu_indirect_sections_submitted += u64::from(count);
-        let buffers = self.gpu_indirect.as_mut().expect("capacity ensured");
-        buffers.packed_world_revision = self.cull_world_revision;
-        buffers.packed_camera_section = cam_section;
-        buffers.packed_morton = self.morton_order_enabled;
-        buffers.cached_runs.clone_from(&runs);
-        buffers.cached_count = count;
-        self.gpu_indirect_record_scratch = records;
-        self.gpu_indirect_coord_scratch = record_coords;
-        self.gpu_indirect_origin_scratch = origins;
-        self.gpu_indirect_slot_scratch = slots;
-        Some(GpuIndirectFrame {
-            args: buffers.args.clone(),
-            runs,
-        })
     }
 
     /// Record the Hi-Z pyramid build into `encoder` — the caller orders
@@ -13706,164 +13429,156 @@ impl GpuRenderer {
             // No camera => no composed pass; still run the per-frame upload
             // boundary so queued section uploads keep draining.
             self.begin_render_upload_frame();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terrain"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(sky.fog_rgb[0]),
-                            g: f64::from(sky.fog_rgb[1]),
-                            b: f64::from(sky.fog_rgb[2]),
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: self.depth_view.as_ref().expect("depth ensured"),
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        // Same transient-depth policy as the composed pass:
-                        // TBDR keeps the tile on-chip when no Hi-Z or
-                        // post pass consumes it afterwards.
-                        store: self.depth_store_op(),
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(0, &self.frame_bind_group, &[]);
-            if let Some(scene) = &self.scene {
-                if scene.opaque_index_count > 0 {
-                    pass.set_pipeline(&self.terrain_pipeline);
-                    pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
-                    pass.set_index_buffer(
-                        scene.opaque_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
-                }
-                if scene.translucent_index_count > 0 {
-                    pass.set_pipeline(&self.translucent_pipeline);
-                    pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
-                    pass.set_index_buffer(
-                        scene.translucent_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
-                }
-            }
-            if !self.live_sections.is_empty() {
-                pass.set_pipeline(&self.terrain_pipeline);
-                for section in self.live_sections.values() {
-                    if section.arena.is_some() || section.terrain.opaque_index_count == 0 {
-                        continue;
-                    }
-                    pass.set_bind_group(0, &section.bind_group, &[]);
-                    pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
-                    pass.set_index_buffer(
-                        self.shared_quad_index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
-                }
-                // No camera in this path => no facing cull; every
-                // committed live range of each region draws positionally
-                // through the shared index buffer.
-                if !self.region_arenas.is_empty() {
-                    pass.set_pipeline(&self.terrain_region_pipeline);
-                    pass.set_index_buffer(
-                        self.shared_quad_index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    for arena in self.region_arenas.values() {
-                        if arena.draw_empty() {
-                            continue;
-                        }
-                        pass.set_bind_group(0, &arena.bind_group, &[]);
-                        pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
-                        arena.for_each_live_range(|start, end| {
-                            pass.draw_indexed(start..end, 0, 0..1);
-                        });
-                    }
-                }
-                pass.set_pipeline(&self.translucent_pipeline);
-                for section in self.live_sections.values() {
-                    if section.terrain.translucent_index_count == 0 {
-                        continue;
-                    }
-                    pass.set_bind_group(0, &section.bind_group, &[]);
-                    pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
-                    pass.set_index_buffer(
-                        section.terrain.translucent_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
-                }
-            }
+            self.record_world_without_camera(&mut encoder, view, sky);
         }
         self.encode_gameplay_screen_overlay(&mut encoder, view, width, height);
-        // Second pass: the UI overlay — tessellated GPU quads when
-        // `update_ui_mesh` installed a mesh, else the legacy CPU-blit
-        // framebuffer (no depth attachment; both pipelines are depthless).
-        // The `MEGU EDITION` title branding rides the same pass after the
-        // UI quads so banners + the splash sit above the screen widgets.
-        let mut drew_quad_ui = false;
-        if self.ui_quad.index_count > 0 || self.title_branding_pending() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ui-overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if self.ui_quad.index_count > 0 {
-                self.draw_ui_quads(&mut pass);
-                drew_quad_ui = true;
+        self.record_ui_overlay(&mut encoder, view);
+        self.ctx.queue.submit([encoder.finish()]);
+    }
+
+    fn record_world_without_camera(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        sky: &SkyFogOutput,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("terrain"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: f64::from(sky.fog_rgb[0]),
+                        g: f64::from(sky.fog_rgb[1]),
+                        b: f64::from(sky.fog_rgb[2]),
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: self.depth_view.as_ref().expect("depth ensured"),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    // Same transient-depth policy as the composed pass:
+                    // TBDR keeps the tile on-chip when no Hi-Z or
+                    // post pass consumes it afterwards.
+                    store: self.depth_store_op(),
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        if let Some(scene) = &self.scene {
+            if scene.opaque_index_count > 0 {
+                pass.set_pipeline(&self.terrain_pipeline);
+                pass.set_vertex_buffer(0, scene.opaque_vertices.slice(..));
+                pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
             }
-            if self.title_branding_pending() {
+            if scene.translucent_index_count > 0 {
+                pass.set_pipeline(&self.translucent_pipeline);
+                pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
+                pass.set_index_buffer(
+                    scene.translucent_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
+            }
+        }
+        if !self.live_sections.is_empty() {
+            pass.set_pipeline(&self.terrain_pipeline);
+            for section in self.live_sections.values() {
+                if section.arena.is_some() || section.terrain.opaque_index_count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(0, &section.bind_group, &[]);
+                pass.set_vertex_buffer(0, section.terrain.opaque_vertices.slice(..));
+                pass.set_index_buffer(
+                    self.shared_quad_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
+            }
+            // No camera in this path => no facing cull; every
+            // committed live range of each region draws positionally
+            // through the shared index buffer.
+            if !self.region_arenas.is_empty() {
+                pass.set_pipeline(&self.terrain_region_pipeline);
+                pass.set_index_buffer(
+                    self.shared_quad_index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                for arena in self.region_arenas.values() {
+                    if arena.draw_empty() {
+                        continue;
+                    }
+                    pass.set_bind_group(0, &arena.bind_group, &[]);
+                    pass.set_vertex_buffer(0, arena.vertex_buffer.slice(..));
+                    arena.for_each_live_range(|start, end| {
+                        pass.draw_indexed(start..end, 0, 0..1);
+                    });
+                }
+            }
+            pass.set_pipeline(&self.translucent_pipeline);
+            for section in self.live_sections.values() {
+                if section.terrain.translucent_index_count == 0 {
+                    continue;
+                }
+                pass.set_bind_group(0, &section.bind_group, &[]);
+                pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
+                pass.set_index_buffer(
+                    section.terrain.translucent_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
+            }
+        }
+    }
+
+    /// UI draws at native resolution above the world and screen overlays.
+    fn record_ui_overlay(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView) {
+        let draw_quads = self.ui_quad.index_count > 0;
+        let draw_branding = self.title_branding_pending();
+        if !draw_quads && !draw_branding && self.ui_bind_group.is_none() {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ui-overlay"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        if draw_quads || draw_branding {
+            if draw_quads {
+                self.draw_ui_quads(&mut pass);
+                self.ui_gpu_quad_frames += 1;
+            }
+            if draw_branding {
                 self.draw_title_branding(&mut pass);
                 self.title_branding_frames += 1;
             }
         } else if let Some(ui_bind_group) = &self.ui_bind_group {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ui-overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
             pass.set_pipeline(&self.ui_pipeline);
             pass.set_bind_group(0, ui_bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
-        if drew_quad_ui {
-            self.ui_gpu_quad_frames += 1;
-        }
-        self.ctx.queue.submit([encoder.finish()]);
     }
 
     /// Window camera renders the live world at its true server time —
@@ -14285,7 +14000,7 @@ impl GpuRenderer {
         self.ctx.queue.write_buffer(
             &shadow.receiver_uniform,
             0,
-            &shadow_uniform_bytes(&uniforms),
+            bytemuck::bytes_of(&pack_shadow_uniforms(&uniforms)),
         );
     }
 
@@ -14313,7 +14028,9 @@ impl GpuRenderer {
             self.ctx.queue.write_buffer(
                 buffer,
                 0,
-                &shadow_uniform_bytes(&stable.uniforms.with_active_cascade(layer as u32)),
+                bytemuck::bytes_of(&pack_shadow_uniforms(
+                    &stable.uniforms.with_active_cascade(layer as u32),
+                )),
             );
         }
         let identity: Mat4 = [
@@ -14580,8 +14297,12 @@ impl GpuRenderer {
         // Lazy stained-glass transmission: the RGBA shadow-color pass
         // only runs while casters were staged — zero cost otherwise.
         if !self.pending_stained_casters.is_empty() {
-            let casters = std::mem::take(&mut self.pending_stained_casters);
-            shadow.write_stained_casters(&self.ctx.device, &self.ctx.queue, &casters);
+            shadow.write_stained_casters(
+                &self.ctx.device,
+                &self.ctx.queue,
+                &self.pending_stained_casters,
+            );
+            self.pending_stained_casters.clear();
         }
         if shadow.stained.as_ref().is_some_and(|s| s.vertex_count > 0) {
             for layer in 0..count {
@@ -15359,18 +15080,38 @@ impl GpuRenderer {
         encoder: &mut wgpu::CommandEncoder,
         target: &ComposedWorldTarget<'_>,
     ) {
-        let ComposedWorldTarget {
-            view,
-            size: (width, height),
-            view_proj,
-            camera,
-            clear_rgb,
-            chunk_fades,
-            camera_position,
-            focal_y_px,
-            world_time_ticks,
-        } = *target;
-        self.ensure_depth(width, height);
+        self.ensure_depth(target.size.0, target.size.1);
+        self.prepare_depth_graph(target.size);
+        self.write_water_and_sky_uniforms(target);
+        self.begin_render_upload_frame();
+        self.cull_live_sections(&target.view_proj, target.camera_position, target.focal_y_px);
+        self.culled_sections += self.cull_result.len() as u64;
+        self.last_frame_culled_sections = self.cull_result.len();
+        self.submit_hiz_job(&target.view_proj, target.camera_position);
+        let indirect =
+            self.encode_gpu_indirect_cull(encoder, &target.view_proj, target.camera_position);
+
+        // The CPU and GPU paths share the retained region ordering buffer.
+        // Move scratch out while recording so GPU resources can be borrowed
+        // independently of the CPU data staged for upload.
+        let mut scratch = std::mem::take(&mut self.composite.frame_scratch);
+        scratch.draws.clear();
+        self.prepare_opaque_terrain_bundle(target, &mut scratch, !indirect);
+        self.record_composed_world_pass(encoder, target, &mut scratch, indirect);
+        self.encode_composed_post_world(encoder, target);
+        if self.gpu_hiz.is_some() {
+            self.encode_gpu_hiz_build(encoder);
+            self.gpu_hiz_frame_vp = Some(target.view_proj);
+        }
+        self.ctx.queue.write_buffer(
+            &self.composite.draw_ubo,
+            0,
+            bytemuck::cast_slice(&scratch.draws),
+        );
+        self.composite.frame_scratch = scratch;
+    }
+
+    fn prepare_depth_graph(&mut self, size: (u32, u32)) {
         // Composed-frame render graph: the transient frame depth plus
         // every post-world consumer registered this frame. The compiled
         // plan's `lifetime(frame_depth)` answers "does anything past the
@@ -15378,19 +15119,26 @@ impl GpuRenderer {
         // alias-coloured view of the same dependency the depth store op
         // needs — and the aliasing telemetry reports how much transient
         // VRAM the frame's pass set could share.
+        let (width, height) = size;
+        let gpu_hiz = self.gpu_hiz.is_some();
+        let world_env = !self.title_panorama_active;
+        let key = (size, gpu_hiz, world_env);
+        if self.depth_graph_key == Some(key) {
+            return;
+        }
         let mut graph = RenderGraph::new();
         let frame_depth = graph.add_transient_resource(ResourceDesc {
             bytes: u64::from(width) * u64::from(height) * 4,
             kind_tag: 1, // depth32 target family
         });
         let world_pass = graph.add_pass("composed-world", &[], &[frame_depth], true);
-        if self.gpu_hiz.is_some() {
+        if gpu_hiz {
             // The GPU Hi-Z culler reads the depth attachment after the
             // pass to build next frame's pyramid — a real downstream
             // consumer forcing depth writeback.
             graph.add_pass("gpu-hiz-depth-build", &[frame_depth], &[], true);
         }
-        if !self.title_panorama_active {
+        if world_env {
             // `world_env_pass` samples the world depth attachment for
             // celestial bodies, precipitation and clouds. Registering it as
             // a reader is mandatory on TBDR: without this edge the first
@@ -15399,6 +15147,7 @@ impl GpuRenderer {
         }
         match graph.compile() {
             Ok(compiled) => {
+                self.depth_graph_key = Some(key);
                 self.render_graph_compiles += 1;
                 self.render_graph_culled_passes += compiled.culled_passes.len() as u64;
                 self.render_graph_aliased_bytes += compiled.vram_saved_bytes;
@@ -15414,9 +15163,13 @@ impl GpuRenderer {
             Err(_) => {
                 // A failed compile must never drop the depth writeback —
                 // fail closed so the attachment stays readable.
+                self.depth_graph_key = None;
                 self.graph_depth_consumed = Some(true);
             }
         }
+    }
+
+    fn write_water_and_sky_uniforms(&mut self, target: &ComposedWorldTarget<'_>) {
         // Lazily stand up the dedicated water pass the first frame any
         // resident section carries decoded water geometry, and refresh
         // its shadow-uniform (stable frame state when shadow resources
@@ -15427,54 +15180,71 @@ impl GpuRenderer {
                 .frame_stable_shadow
                 .map(|s| s.uniforms)
                 .unwrap_or_else(|| {
-                    water_fallback_uniforms(view_proj, camera_position, world_time_ticks)
+                    water_fallback_uniforms(
+                        target.view_proj,
+                        target.camera_position,
+                        target.world_time_ticks,
+                    )
                 });
             // The water shader does not use camera-right. Reuse its existing
             // vec4 only in this water-specific UBO to pass the same biome
             // depth tint/filter as underwater fog, without a new binding.
             uniforms.camera_right = self.water_depth_tint;
             let water = self.water.as_ref().expect("ensured");
-            self.ctx
-                .queue
-                .write_buffer(&water.uniform, 0, &shadow_uniform_bytes(&uniforms));
+            self.ctx.queue.write_buffer(
+                &water.uniform,
+                0,
+                bytemuck::bytes_of(&pack_shadow_uniforms(&uniforms)),
+            );
         }
-        self.begin_render_upload_frame();
-        self.cull_live_sections(&view_proj, camera_position, focal_y_px);
-        self.culled_sections += self.cull_result.len() as u64;
-        self.last_frame_culled_sections = self.cull_result.len();
-        // Hand the drawn occluder set to the worker pool while the GPU
-        // encodes: the finished Hi-Z pyramid lands on a later frame's
-        // upload boundary.
-        self.submit_hiz_job(&view_proj, camera_position);
-        // GPU-driven opaque path (audit GPU-INDIRECT-AND-OPT-WIRE): cull
-        // the committed arena sections straight into the indirect args
-        // buffer before the pass encodes draws — the compute dispatch
-        // orders ahead of the render pass inside this same encoder, and
-        // the pass below consumes the GPU-written args with zero CPU
-        // readback. `None` keeps the CPU arena path (flag off, no
-        // INDIRECT_EXECUTION, or no committed geometry yet).
-        let gpu_indirect = self.encode_gpu_indirect_cull(encoder, &view_proj, camera_position);
+        if let Some(stable) = &self.frame_stable_shadow {
+            // The dome reads only camera vectors, sun, render/celestial
+            // params — all carried by the frame's stable uniform build.
+            self.ctx.queue.write_buffer(
+                &self.sky.uniform,
+                0,
+                bytemuck::bytes_of(&pack_shadow_uniforms(&stable.uniforms)),
+            );
+        }
+    }
+
+    fn prepare_opaque_terrain_bundle(
+        &mut self,
+        target: &ComposedWorldTarget<'_>,
+        scratch: &mut ComposedDrawScratch,
+        include_arenas: bool,
+    ) {
+        // Indirect draws depend on mutable args buffers, and fades bake
+        // into draw uniforms. Neither can use the recorded commands.
+        if !include_arenas || target.chunk_fades.any_fading() {
+            self.terrain_bundle = None;
+            self.terrain_bundle_key = None;
+            return;
+        }
         // Opaque-terrain bundle key: every input the recorded commands
         // depend on. `world_revision` covers residency/graph/cull-set
         // changes (and arena buffer replacement bumps it too), the
         // view-proj bits pin the camera and culled set, `fades_active`
         // gates caching entirely — animated fades bake into draw
         // uniforms and must re-encode every frame.
+        let camera_position = target.camera_position;
         let camera_section = SectionCoord(
             (camera_position[0] / EDGE as f32).floor() as i32,
             (camera_position[1] / EDGE as f32).floor() as i32,
             (camera_position[2] / EDGE as f32).floor() as i32,
         );
         let mut view_proj_bits = [0u32; 16];
-        for (dst, src) in view_proj_bits.iter_mut().zip(view_proj.iter().flatten()) {
+        for (dst, src) in view_proj_bits
+            .iter_mut()
+            .zip(target.view_proj.iter().flatten())
+        {
             *dst = src.to_bits();
         }
         // Indirect draws carry no per-section uniforms, so bundles are
         // only eligible when the CPU path owns the frame — recording an
         // indirect-args submission would snapshot a buffer handle the
         // next frame's record rebuild may have grown past.
-        let bundle_eligible = !chunk_fades.any_fading() && gpu_indirect.is_none();
-        let terrain_bundle_key = bundle_eligible.then_some(TerrainBundleKey {
+        let key = TerrainBundleKey {
             camera_section: (camera_section.0, camera_section.1, camera_section.2),
             view_proj_bits,
             world_revision: self.cull_world_revision,
@@ -15483,597 +15253,770 @@ impl GpuRenderer {
             fades_active: false,
             shadow_active: self.shadow_active,
             lights_epoch: self.lights_epoch,
-        });
-        let bundle_hit = terrain_bundle_key.is_some()
-            && self.terrain_bundle_key == terrain_bundle_key
-            && self.terrain_bundle.is_some();
-        let terrain_bundle = if bundle_hit {
-            self.terrain_bundle_hits += 1;
-            self.terrain_bundle.as_ref()
-        } else {
-            if bundle_eligible && self.terrain_bundle.is_some() {
-                // Key rotated: the recorded commands no longer apply.
-                self.terrain_bundle = None;
-                self.terrain_bundle_key = None;
-            }
-            None
         };
-        let bundle_stats = self.terrain_bundle_stats;
-        let depth_store = self.depth_store_op();
-        if depth_store == wgpu::StoreOp::Discard {
-            self.tbdr_depth_discards += 1;
+        if self.terrain_bundle_key == Some(key) && self.terrain_bundle.is_some() {
+            self.terrain_bundle_hits += 1;
+            scratch
+                .draws
+                .extend_from_slice(&self.composite.terrain_draw_scratch);
+            return;
         }
-        // Split disjoint field borrows so the scratch writer and the GPU
-        // handles can coexist inside the render pass.
-        let culled_sections = &self.cull_result;
-        let frame_lights = &self.frame_packed_lights;
-        let gpu = &mut self.composite;
-        let shadow = self.shadow.as_ref().filter(|_| self.shadow_active);
-        let scene = &self.scene;
+        let mut encoder =
+            self.ctx
+                .device
+                .create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                    label: Some("terrain-opaque-bundle"),
+                    color_formats: &[Some(self.target_format)],
+                    depth_stencil: Some(wgpu::RenderBundleDepthStencil {
+                        format: DEPTH_FORMAT,
+                        depth_read_only: false,
+                        stencil_read_only: true,
+                    }),
+                    sample_count: 1,
+                    multiview: None,
+                });
+        let stats = self.encode_opaque_terrain(&mut encoder, target, scratch, true);
+        self.terrain_bundle = Some(encoder.finish(&wgpu::RenderBundleDescriptor {
+            label: Some("terrain-opaque-bundle"),
+        }));
+        self.composite
+            .terrain_draw_scratch
+            .clone_from(&scratch.draws);
+        self.terrain_bundle_key = Some(key);
+        self.terrain_bundle_stats = stats;
+        self.terrain_bundle_records += 1;
+    }
+
+    /// Record CPU opaque draws into the live pass or its cached bundle.
+    fn encode_opaque_terrain<'a>(
+        &'a self,
+        pass: &mut impl wgpu::util::RenderEncoder<'a>,
+        target: &ComposedWorldTarget<'_>,
+        frame_scratch: &mut ComposedDrawScratch,
+        include_arenas: bool,
+    ) -> (u64, u64, usize, usize) {
+        let gpu = &self.composite;
+        let shadow = self.active_shadow_gpu();
+        let opaque_pipeline = shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color);
+        let region_pipeline =
+            shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color);
+        let draw_bg = &gpu.draw_bg;
+        let scratch = &mut frame_scratch.draws;
+        let scene = self.scene.as_ref();
         let live_sections = &self.live_sections;
         let region_arenas = &self.region_arenas;
         let shared_index = &self.shared_quad_index_buffer;
+        let culled_sections = &self.cull_result;
+        let camera_position = target.camera_position;
         let render_meta = &self.section_render_meta;
+        let chunk_fades = target.chunk_fades;
+        let frame_bind_group = &self.frame_bind_group;
+        let env_bind_group = &gpu.env_bg;
+        let shadow_receiver_bg = shadow.map(|s| &s.receiver_bg);
+        let view_proj = &target.view_proj;
+        let lights = &self.frame_packed_lights;
+        // Bundle-recorded passes start with empty bind-group state, so the
+        // environment (group 2) and optional shadow receiver (group 3) the
+        // composite pipeline layouts expect are bound here once — the same
+        // bind the inline pass relied on persisting from before the loop.
+        pass.set_bind_group(2, Some(env_bind_group), &[]);
+        if let Some(receiver) = shadow_receiver_bg {
+            pass.set_bind_group(3, Some(receiver), &[]);
+        }
         let mut skipped_buckets = 0u64;
         let mut arena_draws = 0u64;
         let mut arena_sections = 0usize;
         let mut arena_regions = 0usize;
-        let mut instanced_draws = 0u64;
-        let subworld_gpu = &self.subworld_gpu;
-        let shaped_terrain_gpu = &self.shaped_terrain_gpu;
-        let entity_ber = &self.entity_ber;
-        let particles = &self.particles;
-        let particle_instances = &self.particle_instances;
-        let particle_alphas = &self.particle_alphas;
-        let debug_lines = &self.debug_lines;
-        let debug_line_pipeline = &self.debug_line_pipeline;
-        let frame_bind_group = &self.frame_bind_group;
-        let entity_env_bg = &self.entity_env_bg;
-        let particle_env_bg = &self.particle_env_bg;
-        let depth_view = self.depth_view.as_ref().expect("depth ensured");
-        let sky = &self.sky;
-        let water = &self.water;
-        let lit_terrain = &self.lit_terrain;
-        // Pack `gbuffers_*` sub-world pipelines take over the
-        // lit/instanced draws when a `MeguWgslPack` installed them;
-        // modules binding group 3 (the shadow receiver) only run while
-        // cascades are live, so shadow-free frames keep the built-in
-        // pairs. Handles are cheap `Arc` clones — copying them here
-        // keeps the pass scope free of `self` borrows.
-        let pack_subworld = self
-            .pack_subworld
-            .as_ref()
-            .filter(|p| !p.needs_shadow || shadow.is_some());
-        let lit_opaque_pipeline = pack_subworld
-            .and_then(|p| p.lit.clone())
-            .unwrap_or_else(|| shadow.map_or(&gpu.lit_pipeline, |s| &s.lit_color).clone());
-        let shaped_lit_pipeline = gpu.shaped_lit_pipeline.clone();
-        let shaped_lit_alpha_pipeline = gpu.shaped_lit_alpha_pipeline.clone();
-        let instanced_pipeline = pack_subworld
-            .and_then(|p| p.instanced.clone())
-            .unwrap_or_else(|| {
-                shadow
-                    .map_or(&gpu.instanced_pipeline, |s| &s.instanced_color)
-                    .clone()
+        let mut slot = |model: Mat4, fade: f32, alpha: f32, light_mask: u64| -> u32 {
+            let index = scratch.len();
+            scratch.push(CompositeDrawUniforms {
+                mvp: mat4_mul(view_proj, &model),
+                model,
+                params: [fade, alpha, 0.0, 0.0],
+                params2: [
+                    f32::from_bits(light_mask as u32),
+                    f32::from_bits((light_mask >> 32) as u32),
+                    0.0,
+                    0.0,
+                ],
+                _stride_pad: [0.0; 24],
             });
-        let lit_alpha_pipeline = pack_subworld
-            .and_then(|p| p.lit_alpha.clone())
-            .unwrap_or_else(|| {
-                shadow
-                    .map_or(&gpu.lit_alpha_pipeline, |s| &s.lit_alpha_color)
-                    .clone()
-            });
-        if let Some(stable) = &self.frame_stable_shadow {
-            // The dome reads only camera vectors, sun, render/celestial
-            // params — all carried by the frame's stable uniform build.
-            self.ctx
-                .queue
-                .write_buffer(&sky.uniform, 0, &shadow_uniform_bytes(&stable.uniforms));
+            index as u32 * DRAW_UNIFORM_STRIDE
+        };
+        // Opaque terrain: the demo scene, then every live section —
+        // arena-resident sections as merged per-region bucket draws,
+        // the rest through per-section buffers with the same facing
+        // cull applied per bucket.
+        pass.set_pipeline(opaque_pipeline);
+        if let Some(scene) = scene {
+            if scene.opaque_index_count > 0 {
+                let off = slot(COMPOSITE_IDENTITY, 1.0, 1.0, 0);
+                pass.set_bind_group(0, Some(frame_bind_group), &[]);
+                pass.set_bind_group(1, Some(draw_bg), &[off]);
+                pass.set_vertex_buffer(0, Some(scene.opaque_vertices.slice(..)));
+                pass.set_index_buffer(scene.opaque_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..scene.opaque_index_count, 0, 0..1);
+            }
         }
-        gpu.draw_scratch.clear();
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("composed-world"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: f64::from(clear_rgb[0]),
-                            g: f64::from(clear_rgb[1]),
-                            b: f64::from(clear_rgb[2]),
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: depth_store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_bind_group(2, &gpu.env_bg, &[]);
-            if let Some(shadow) = shadow {
-                pass.set_bind_group(3, &shadow.receiver_bg, &[]);
-            }
-
-            // Opaque terrain: replayed from the pre-recorded RenderBundle
-            // when (camera section, view-proj bits, world/hi-z/scene
-            // revisions, fade-activity, shadow pipeline) all match the
-            // record key — one `execute_bundles` call, zero Rust draw
-            // loop, zero `HashSet` allocs. Chunk-fade animation bakes its
-            // values into the recorded draw uniforms, so while any fade
-            // is live the pass encodes directly instead. Terrain slots
-            // always occupy `draw_scratch[0..T]` — seeded from the
-            // recorded `terrain_draw_scratch` slice on replay so the
-            // bundle's dynamic offsets still resolve.
-            if let Some(bundle) = terrain_bundle {
-                pass.execute_bundles(std::iter::once(bundle));
-                gpu.draw_scratch
-                    .extend_from_slice(&gpu.terrain_draw_scratch);
-                skipped_buckets += bundle_stats.0;
-                arena_draws += bundle_stats.1;
-                arena_sections += bundle_stats.2;
-                arena_regions += bundle_stats.3;
-            } else {
-                let stats = if bundle_eligible {
-                    let mut bundle_encoder = self.ctx.device.create_render_bundle_encoder(
-                        &wgpu::RenderBundleEncoderDescriptor {
-                            label: Some("terrain-opaque-bundle"),
-                            color_formats: &[Some(self.target_format)],
-                            depth_stencil: Some(wgpu::RenderBundleDepthStencil {
-                                format: DEPTH_FORMAT,
-                                depth_read_only: false,
-                                stencil_read_only: true,
-                            }),
-                            sample_count: 1,
-                            multiview: None,
-                        },
-                    );
-                    let stats = encode_opaque_terrain(
-                        &mut bundle_encoder,
-                        shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
-                        shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
-                        &gpu.draw_bg,
-                        &mut gpu.draw_scratch,
-                        scene.as_ref(),
-                        live_sections,
-                        region_arenas,
-                        shared_index,
-                        culled_sections,
-                        camera_position,
-                        render_meta,
-                        chunk_fades,
-                        frame_bind_group,
-                        &gpu.env_bg,
-                        shadow.map(|s| &s.receiver_bg),
-                        &view_proj,
-                        true,
-                        frame_lights,
-                        &mut gpu.arena_emitted_scratch,
-                    );
-                    let bundle = bundle_encoder.finish(&wgpu::RenderBundleDescriptor {
-                        label: Some("terrain-opaque-bundle"),
-                    });
-                    pass.execute_bundles(std::iter::once(&bundle));
-                    gpu.terrain_draw_scratch.clone_from(&gpu.draw_scratch);
-                    self.terrain_bundle = Some(bundle);
-                    self.terrain_bundle_key = terrain_bundle_key;
-                    self.terrain_bundle_stats = stats;
-                    self.terrain_bundle_records += 1;
-                    stats
-                } else {
-                    self.terrain_bundle = None;
-                    self.terrain_bundle_key = None;
-                    encode_opaque_terrain(
-                        &mut pass,
-                        shadow.map_or(&gpu.terrain_opaque_pipeline, |s| &s.terrain_color),
-                        shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
-                        &gpu.draw_bg,
-                        &mut gpu.draw_scratch,
-                        scene.as_ref(),
-                        live_sections,
-                        region_arenas,
-                        shared_index,
-                        culled_sections,
-                        camera_position,
-                        render_meta,
-                        chunk_fades,
-                        frame_bind_group,
-                        &gpu.env_bg,
-                        shadow.map(|s| &s.receiver_bg),
-                        &view_proj,
-                        gpu_indirect.is_none(),
-                        frame_lights,
-                        &mut gpu.arena_emitted_scratch,
-                    )
-                };
-                skipped_buckets += stats.0;
-                arena_draws += stats.1;
-                arena_sections += stats.2;
-                arena_regions += stats.3;
-            }
-            // `execute_bundles` clears the pass's bind-group state, so
-            // re-bind env (group 2) and the shadow receiver (group 3)
-            // for the translucent/entity/UI draws that follow.
-            pass.set_bind_group(2, &gpu.env_bg, &[]);
-            if let Some(shadow) = shadow {
-                pass.set_bind_group(3, &shadow.receiver_bg, &[]);
-            }
-            // GPU-driven arena draws: one contiguous args run per
-            // region in front-to-back order — `multi_draw_indexed_indirect`
-            // for multi-section runs, the portable per-slot
-            // `draw_indexed_indirect` for single-record runs. Culled
-            // sections carry `instance_count == 0` and cost no draws.
-            if let Some(indirect) = gpu_indirect.as_ref() {
-                pass.set_pipeline(
-                    shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color),
-                );
-                pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
-                let index = gpu.draw_scratch.len();
-                gpu.draw_scratch.push(CompositeDrawUniforms {
-                    mvp: view_proj,
-                    model: [
-                        [1.0, 0.0, 0.0, 0.0],
-                        [0.0, 1.0, 0.0, 0.0],
-                        [0.0, 0.0, 1.0, 0.0],
-                        [0.0, 0.0, 0.0, 1.0],
-                    ],
-                    params: [1.0, 1.0, 0.0, 0.0],
-                    params2: [0.0; 4],
-                    _stride_pad: [0.0; 24],
-                });
-                let off = index as u32 * DRAW_UNIFORM_STRIDE;
-                for run in &indirect.runs {
-                    let arena = &region_arenas[&run.origin];
-                    pass.set_bind_group(0, Some(&arena.bind_group), &[]);
-                    pass.set_bind_group(1, Some(&gpu.draw_bg), &[off]);
-                    pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
-                    if run.count > 1 {
-                        pass.multi_draw_indexed_indirect(
-                            &indirect.args,
-                            u64::from(run.first) * 20,
-                            run.count,
-                        );
-                    } else {
-                        pass.draw_indexed_indirect(&indirect.args, u64::from(run.first) * 20);
+        // S4 shared region arena: one bind group + buffer pair per
+        // 8x4x8 region; seven direction-bucket record sets merge into a few
+        // draws per region, all indexed positionally into the one shared
+        // canonical quad index buffer.
+        if include_arenas && !region_arenas.is_empty() {
+            pass.set_pipeline(region_pipeline);
+            pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
+            // Front-to-back: nearest regions rasterize first so hardware
+            // Early-Z/Hi-Z rejects occluded far terrain before it shades.
+            order_regions(
+                &mut frame_scratch.region_order,
+                region_arenas.keys().copied(),
+                camera_position,
+            );
+            for &(_, origin) in &frame_scratch.region_order {
+                let arena = &region_arenas[&origin];
+                if arena.draw_empty() {
+                    continue;
+                }
+                // Every merged run in this arena shades within one region
+                // AABB — one sphere∩AABB pass gives the per-draw light mask
+                // the WGSL walk ANDs against `light_count.yz`.
+                let (region_min, region_max) = region_world_aabb(origin);
+                let region_mask = draw_light_mask(region_min, region_max, lights);
+                let mut bound = false;
+                for (bucket, records) in arena.bucket_records.iter().enumerate() {
+                    // Merged run of consecutive kept records sharing
+                    // one fade value: (start, end, fade_bits).
+                    let mut run: Option<(u32, u32, u32)> = None;
+                    for record in records {
+                        let coord = &record.coord;
+                        let culled = culled_sections.contains(coord);
+                        let kept = !culled
+                            && section_draw_mask(
+                                *coord,
+                                camera_position,
+                                section_protrusion(render_meta, *coord),
+                            ) >> bucket
+                                & 1
+                                != 0;
+                        if !kept {
+                            if !culled {
+                                skipped_buckets += 1;
+                            }
+                            if let Some((start, end, fade_bits)) = run.take() {
+                                let off = slot(
+                                    COMPOSITE_IDENTITY,
+                                    f32::from_bits(fade_bits),
+                                    1.0,
+                                    region_mask,
+                                );
+                                pass.set_bind_group(1, Some(draw_bg), &[off]);
+                                pass.draw_indexed(start..end, 0, 0..1);
+                                arena_draws += 1;
+                            }
+                            continue;
+                        }
+                        if !bound {
+                            pass.set_bind_group(0, Some(&arena.bind_group), &[]);
+                            pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
+                            bound = true;
+                        }
+                        let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+                        match run {
+                            Some((start, end, bits))
+                                if end == record.start && bits == fade.to_bits() =>
+                            {
+                                run = Some((start, record.end, bits));
+                            }
+                            _ => {
+                                if let Some((start, end, bits)) = run.take() {
+                                    let off = slot(
+                                        COMPOSITE_IDENTITY,
+                                        f32::from_bits(bits),
+                                        1.0,
+                                        region_mask,
+                                    );
+                                    pass.set_bind_group(1, Some(draw_bg), &[off]);
+                                    pass.draw_indexed(start..end, 0, 0..1);
+                                    arena_draws += 1;
+                                }
+                                run = Some((record.start, record.end, fade.to_bits()));
+                            }
+                        }
                     }
-                    arena_draws += 1;
-                    arena_sections += run.count as usize;
-                    arena_regions += 1;
+                    if let Some((start, end, bits)) = run.take() {
+                        let off = slot(COMPOSITE_IDENTITY, f32::from_bits(bits), 1.0, region_mask);
+                        pass.set_bind_group(1, Some(draw_bg), &[off]);
+                        pass.draw_indexed(start..end, 0, 0..1);
+                        arena_draws += 1;
+                    }
                 }
-                self.gpu_indirect_draw_passes += 1;
+                arena_sections += emitted_section_count(
+                    &arena.bucket_records,
+                    culled_sections,
+                    camera_position,
+                    render_meta,
+                    &mut frame_scratch.arena_emitted,
+                );
+                arena_regions += usize::from(bound);
             }
-            // `MEGU_TERRAIN_LIT_WGSL` receiver draws — explicitly
-            // uploaded decoded-vertex terrain with sky/block light in
-            // the attribute word (the packed section path stays on the
-            // atlas composite pipelines).
-            if let Some(lit) = lit_terrain {
-                if lit.index_count > 0 {
-                    pass.set_pipeline(&lit.pipeline);
-                    pass.set_bind_group(0, &lit.bind_group, &[]);
-                    pass.set_vertex_buffer(0, lit.vertices.slice(..));
-                    pass.set_index_buffer(lit.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..lit.index_count, 0, 0..1);
-                }
+            // Restore the per-section pipeline for the fallback path.
+            pass.set_pipeline(opaque_pipeline);
+        }
+        let mut per_section_index_bound = false;
+        for (coord, section) in live_sections.iter() {
+            if section.arena.is_some()
+                || culled_sections.contains(coord)
+                || section.opaque_index_total == 0
+            {
+                continue;
             }
-            // Sky dome behind all opaque geometry: the depth-1.0
-            // fullscreen triangle passes `CompareFunction::Equal` only on
-            // untouched pixels, so terrain-occluded sky never runs a
-            // fragment — identical final image, minimal sky shading.
-            pass.set_pipeline(&sky.pipeline);
-            pass.set_bind_group(0, &sky.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-            // Non-terrain draws continue in `draw_scratch` past the
-            // terrain slice so one `write_buffer` covers the whole frame.
-            let scratch = &mut gpu.draw_scratch;
-            // `world_light` is the packed sub-world light word
-            // (`pack_subworld_light`/`0`) carried in `params2.z`.
-            let mut slot =
-                |model: Mat4, fade: f32, alpha: f32, world_light: u32, visual: f32| -> u32 {
-                    let index = scratch.len();
-                    scratch.push(CompositeDrawUniforms {
-                        mvp: mat4_mul(&view_proj, &model),
-                        model,
-                        params: [fade, alpha, 0.0, 0.0],
-                        params2: [0.0, 0.0, f32::from_bits(world_light), visual],
-                        _stride_pad: [0.0; 24],
-                    });
-                    index as u32 * DRAW_UNIFORM_STRIDE
-                };
-            let identity: Mat4 = [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
+            if !per_section_index_bound {
+                // The fallback path draws the same canonical pattern — the
+                // shared buffer serves local index space identically.
+                pass.set_index_buffer(shared_index.slice(..), wgpu::IndexFormat::Uint32);
+                per_section_index_bound = true;
+            }
+            let fade = chunk_fades.fade_alpha(coord.0, coord.2);
+            let min = [
+                coord.0 as f32 * EDGE as f32,
+                coord.1 as f32 * EDGE as f32,
+                coord.2 as f32 * EDGE as f32,
             ];
-
-            // Draw-order contract: every depth-writing opaque draw —
-            // terrain (above), opaque 6-DOF sub-worlds, instanced
-            // mechanical parts, entities/BER — lands before the first
-            // alpha-blended one, so translucent terrain water
-            // depth-tests against and blends over submerged Create
-            // water wheels, cogwheels, shafts and contraptions.
-            // Alpha-blended sub-worlds and particles follow water;
-            // debug lines draw last.
-
-            // 6-DOF sub-worlds, opaque entries (airship hulls, planets,
-            // contraptions).
-            let mut drew_opaque_subworld = false;
-            for entry in subworld_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha < 0.999 || is_cloud_subworld_id(entry.id) {
-                    continue;
+            // The section's 16³ box is the tightest possible draw AABB —
+            // one sphere∩AABB pass narrows its light walk to the lights
+            // that can actually reach it.
+            let edge = EDGE as f32;
+            let section_mask =
+                draw_light_mask(min, [min[0] + edge, min[1] + edge, min[2] + edge], lights);
+            match section.opaque_bucket_ranges {
+                Some(ranges) => {
+                    let draw_mask = section_draw_mask(
+                        *coord,
+                        camera_position,
+                        section_protrusion(render_meta, *coord),
+                    );
+                    for (bucket, &(start, count)) in ranges.iter().enumerate() {
+                        if count == 0 {
+                            continue;
+                        }
+                        if draw_mask >> bucket & 1 == 0 {
+                            skipped_buckets += 1;
+                            continue;
+                        }
+                        let off = slot(COMPOSITE_IDENTITY, fade, 1.0, section_mask);
+                        pass.set_bind_group(0, Some(&section.bind_group), &[]);
+                        pass.set_bind_group(1, Some(draw_bg), &[off]);
+                        pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+                        pass.draw_indexed(start..start + count, 0, 0..1);
+                    }
                 }
-                if !drew_opaque_subworld {
-                    pass.set_pipeline(&lit_opaque_pipeline);
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_opaque_subworld = true;
+                None => {
+                    let off = slot(COMPOSITE_IDENTITY, fade, 1.0, section_mask);
+                    pass.set_bind_group(0, Some(&section.bind_group), &[]);
+                    pass.set_bind_group(1, Some(draw_bg), &[off]);
+                    pass.set_vertex_buffer(0, Some(section.terrain.opaque_vertices.slice(..)));
+                    pass.draw_indexed(0..section.terrain.opaque_index_count, 0, 0..1);
                 }
-                let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha, entry.world_light, 0.0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
             }
-            // Static shaped terrain (stairs, fences, plants and other
-            // non-cube official models). Entries live in the same explicit-
-            // UV lit lane but use the alpha-tested pipeline so cutout plant
-            // texels never become opaque black fragments; section culling
-            // mirrors the packed terrain pass.
-            let mut drew_shaped_opaque = false;
-            for entry in shaped_terrain_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha < 0.999 {
-                    continue;
+        }
+        (skipped_buckets, arena_draws, arena_sections, arena_regions)
+    }
+
+    fn record_composed_world_pass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &ComposedWorldTarget<'_>,
+        scratch: &mut ComposedDrawScratch,
+        use_indirect: bool,
+    ) {
+        let ComposedWorldTarget {
+            view, clear_rgb, ..
+        } = *target;
+        let depth_view = self.depth_view.as_ref().expect("depth ensured");
+        let depth_store = self.depth_store_op();
+        if depth_store == wgpu::StoreOp::Discard {
+            self.tbdr_depth_discards += 1;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("composed-world"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: f64::from(clear_rgb[0]),
+                        g: f64::from(clear_rgb[1]),
+                        b: f64::from(clear_rgb[2]),
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: depth_store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        let (skipped_buckets, mut arena_draws, mut arena_sections, mut arena_regions) =
+            if let Some(bundle) = &self.terrain_bundle {
+                pass.execute_bundles(std::iter::once(bundle));
+                // Bundle execution clears the bind groups needed by later draws.
+                pass.set_bind_group(2, &self.composite.env_bg, &[]);
+                if let Some(shadow) = self.active_shadow_gpu() {
+                    pass.set_bind_group(3, &shadow.receiver_bg, &[]);
                 }
-                let coord = shaped_entry_coord(entry);
-                if culled_sections.contains(&coord) {
-                    continue;
-                }
-                if !drew_shaped_opaque {
-                    pass.set_pipeline(&shaped_lit_pipeline);
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_shaped_opaque = true;
-                }
-                let model = entry.transform.model_matrix();
-                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                let off = slot(model, fade, entry.alpha, entry.world_light, 0.0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                self.terrain_bundle_stats
+            } else {
+                self.encode_opaque_terrain(&mut pass, target, scratch, !use_indirect)
+            };
+        if use_indirect {
+            let indirect = self.gpu_indirect.as_ref().expect("indirect draws prepared");
+            arena_sections += self.record_indirect_terrain(
+                &mut pass,
+                &target.view_proj,
+                &mut scratch.draws,
+                indirect,
+            );
+            arena_draws += indirect.cached_runs.len() as u64;
+            arena_regions += indirect.cached_runs.len();
+        }
+        // `MEGU_TERRAIN_LIT_WGSL` receiver draws — explicitly
+        // uploaded decoded-vertex terrain with sky/block light in
+        // the attribute word (the packed section path stays on the
+        // atlas composite pipelines).
+        if let Some(lit) = &self.lit_terrain {
+            if lit.index_count > 0 {
+                pass.set_pipeline(&lit.pipeline);
+                pass.set_bind_group(0, &lit.bind_group, &[]);
+                pass.set_vertex_buffer(0, lit.vertices.slice(..));
+                pass.set_index_buffer(lit.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..lit.index_count, 0, 0..1);
             }
-            // Opaque GPU-instanced mechanical parts (Create water
-            // wheels, cogwheels, shafts, presses).
-            let mut drew_instanced = false;
-            for batch in subworld_gpu.batches() {
-                if batch.index_count == 0 || batch.instance_count == 0 {
-                    continue;
-                }
-                if !drew_instanced {
-                    pass.set_pipeline(&instanced_pipeline);
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_instanced = true;
-                }
-                let model = batch.transform.model_matrix();
-                let off = slot(model, 1.0, 1.0, 0, 0.0);
+        }
+        // Sky dome behind all opaque geometry: the depth-1.0
+        // fullscreen triangle passes `CompareFunction::Equal` only on
+        // untouched pixels, so terrain-occluded sky never runs a
+        // fragment — identical final image, minimal sky shading.
+        pass.set_pipeline(&self.sky.pipeline);
+        pass.set_bind_group(0, &self.sky.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+
+        // All depth-writing world objects precede glass and water. Alpha
+        // sub-worlds, particles and debug lines draw over those surfaces.
+        let draws = &mut scratch.draws;
+        let instanced_draws = self.record_opaque_objects(&mut pass, target, draws);
+        self.record_translucent_terrain(&mut pass, target, draws);
+        self.record_alpha_subworlds(&mut pass, target, draws);
+        self.record_shaped_entries(&mut pass, target, draws, true);
+        self.record_particles_and_debug_lines(&mut pass, &target.view_proj, draws);
+        drop(pass);
+
+        self.direction_buckets_skipped += skipped_buckets;
+        self.region_arena_draws += arena_draws;
+        self.bind_group_switches_saved += arena_sections.saturating_sub(arena_regions) as u64;
+        self.instanced_kinetic_draws = instanced_draws;
+        self.gpu_indirect_draw_passes += u64::from(use_indirect);
+    }
+
+    fn record_indirect_terrain(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        view_proj: &Mat4,
+        draws: &mut Vec<CompositeDrawUniforms>,
+        indirect: &GpuIndirectBuffers,
+    ) -> usize {
+        let gpu = &self.composite;
+        let shadow = self.active_shadow_gpu();
+        pass.set_pipeline(shadow.map_or(&gpu.terrain_region_pipeline, |s| &s.terrain_region_color));
+        pass.set_index_buffer(
+            self.shared_quad_index_buffer.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        let index = draws.len();
+        draws.push(CompositeDrawUniforms {
+            mvp: *view_proj,
+            model: COMPOSITE_IDENTITY,
+            params: [1.0, 1.0, 0.0, 0.0],
+            params2: [0.0; 4],
+            _stride_pad: [0.0; 24],
+        });
+        let off = index as u32 * DRAW_UNIFORM_STRIDE;
+        let mut sections = 0;
+        for run in &indirect.cached_runs {
+            let arena = &self.region_arenas[&run.origin];
+            pass.set_bind_group(0, Some(&arena.bind_group), &[]);
+            pass.set_bind_group(1, Some(&gpu.draw_bg), &[off]);
+            pass.set_vertex_buffer(0, Some(arena.vertex_buffer.slice(..)));
+            if run.count > 1 {
+                pass.multi_draw_indexed_indirect(
+                    &indirect.args,
+                    u64::from(run.first) * 20,
+                    run.count,
+                );
+            } else {
+                pass.draw_indexed_indirect(&indirect.args, u64::from(run.first) * 20);
+            }
+            sections += run.count as usize;
+        }
+        sections
+    }
+
+    fn record_opaque_objects(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        target: &ComposedWorldTarget<'_>,
+        draws: &mut Vec<CompositeDrawUniforms>,
+    ) -> u64 {
+        let gpu = &self.composite;
+        let subworld_gpu = &self.subworld_gpu;
+        let entries = subworld_gpu.entries().filter(|entry| {
+            !(entry.index_count == 0 || entry.alpha < 0.999 || is_cloud_subworld_id(entry.id))
+        });
+        let mut entries = entries.peekable();
+        if entries.peek().is_some() {
+            let lit_opaque_pipeline = self.subworld_lit_pipeline(false).clone();
+            pass.set_pipeline(&lit_opaque_pipeline);
+            pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+            for entry in entries {
+                self.record_lit_entry(pass, &target.view_proj, draws, entry, 1.0);
+            }
+        }
+        self.record_shaped_entries(pass, target, draws, false);
+        let instanced_pipeline = self
+            .active_pack_subworld()
+            .and_then(|p| p.instanced.as_ref())
+            .unwrap_or_else(|| {
+                self.active_shadow_gpu()
+                    .map_or(&gpu.instanced_pipeline, |s| &s.instanced_color)
+            });
+        let mut instanced_draws = 0;
+        // Opaque GPU-instanced mechanical parts (Create water
+        // wheels, cogwheels, shafts, presses).
+        let mut drew_instanced = false;
+        for batch in subworld_gpu.batches() {
+            if batch.index_count == 0 || batch.instance_count == 0 {
+                continue;
+            }
+            if !drew_instanced {
+                pass.set_pipeline(instanced_pipeline);
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                drew_instanced = true;
+            }
+            let model = batch.transform.model_matrix();
+            let off = push_lit_draw(draws, &target.view_proj, model, 1.0, 1.0, 0, 0.0);
+            pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+            pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
+            pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
+            pass.set_index_buffer(
+                batch.template_index_buffer().slice(..),
+                wgpu::IndexFormat::Uint32,
+            );
+            pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
+            instanced_draws += 1;
+        }
+        // Opaque entities and block entities.
+        let entity_ber = &self.entity_ber;
+        if self.lit_terrain.is_none() {
+            if let Some(mesh) = entity_ber {
+                pass.set_pipeline(self.subworld_lit_pipeline(false));
+                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+                pass.set_bind_group(2, &self.entity_env_bg, &[]);
+                let off = push_lit_draw(
+                    draws,
+                    &target.view_proj,
+                    COMPOSITE_IDENTITY,
+                    1.0,
+                    1.0,
+                    0,
+                    0.0,
+                );
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, batch.template_vertex_buffer().slice(..));
-                pass.set_vertex_buffer(1, batch.instance_buffer().slice(..));
+                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                pass.set_bind_group(2, &gpu.env_bg, &[]);
+            }
+        }
+
+        if !self.title_panorama_active && self.block_break_overlay.is_some() {
+            self.crack_overlay_pass.encode(
+                pass,
+                &self.ctx.queue,
+                target.view_proj,
+                self.block_break_overlay,
+            );
+        }
+        instanced_draws
+    }
+
+    fn record_shaped_entries(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        target: &ComposedWorldTarget<'_>,
+        draws: &mut Vec<CompositeDrawUniforms>,
+        alpha: bool,
+    ) {
+        let pipeline = if alpha {
+            &self.composite.shaped_lit_alpha_pipeline
+        } else {
+            // The cutout pipeline discards transparent plant and model texels.
+            &self.composite.shaped_lit_pipeline
+        };
+        let entries = self.shaped_terrain_gpu.entries().filter_map(|entry| {
+            if entry.index_count == 0
+                || if alpha {
+                    entry.alpha >= 0.999
+                } else {
+                    entry.alpha < 0.999
+                }
+            {
+                return None;
+            }
+            let coord = shaped_entry_coord(entry);
+            if self.cull_result.contains(&coord) {
+                return None;
+            }
+            Some((entry, target.chunk_fades.fade_alpha(coord.0, coord.2)))
+        });
+        let mut entries = entries.peekable();
+        if entries.peek().is_none() {
+            return;
+        }
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.composite.lit_frame_bg, &[]);
+        for (entry, fade) in entries {
+            self.record_lit_entry(pass, &target.view_proj, draws, entry, fade);
+        }
+    }
+
+    fn record_lit_entry(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        view_proj: &Mat4,
+        draws: &mut Vec<CompositeDrawUniforms>,
+        entry: &crate::subworld_render::GpuSubWorldEntry,
+        fade: f32,
+    ) {
+        let model = entry.transform.model_matrix();
+        let off = push_lit_draw(
+            draws,
+            view_proj,
+            model,
+            fade,
+            entry.alpha,
+            entry.world_light,
+            0.0,
+        );
+        pass.set_bind_group(1, &self.composite.draw_bg, &[off]);
+        pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
+        pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..entry.index_count, 0, 0..1);
+    }
+
+    fn active_shadow_gpu(&self) -> Option<&ShadowGpu> {
+        self.shadow.as_ref().filter(|_| self.shadow_active)
+    }
+
+    fn active_pack_subworld(&self) -> Option<&PackSubworldGpu> {
+        // Pack modules that use the receiver layout require live cascades.
+        self.pack_subworld
+            .as_ref()
+            .filter(|p| !p.needs_shadow || self.active_shadow_gpu().is_some())
+    }
+
+    fn subworld_lit_pipeline(&self, alpha: bool) -> &wgpu::RenderPipeline {
+        let pack = self.active_pack_subworld();
+        let shadow = self.active_shadow_gpu();
+        if alpha {
+            pack.and_then(|p| p.lit_alpha.as_ref()).unwrap_or_else(|| {
+                shadow.map_or(&self.composite.lit_alpha_pipeline, |s| &s.lit_alpha_color)
+            })
+        } else {
+            pack.and_then(|p| p.lit.as_ref())
+                .unwrap_or_else(|| shadow.map_or(&self.composite.lit_pipeline, |s| &s.lit_color))
+        }
+    }
+
+    fn record_translucent_terrain(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        target: &ComposedWorldTarget<'_>,
+        draws: &mut Vec<CompositeDrawUniforms>,
+    ) {
+        let gpu = &self.composite;
+        let scene = self
+            .scene
+            .iter()
+            .map(|scene| (scene, &self.frame_bind_group, 1.0));
+        let live = self.live_sections.iter().filter_map(|(coord, section)| {
+            if self.cull_result.contains(coord) || section.terrain.translucent_index_count == 0 {
+                return None;
+            }
+            let fade = target.chunk_fades.fade_alpha(coord.0, coord.2);
+            Some((&section.terrain, &section.bind_group, fade))
+        });
+        let mut glass = scene
+            .chain(live)
+            .filter(|(terrain, _, _)| terrain.translucent_index_count > 0)
+            .peekable();
+        if glass.peek().is_some() {
+            pass.set_pipeline(&gpu.terrain_alpha_pipeline);
+            for (terrain, section_bg, fade) in glass {
+                let off = push_lit_draw(
+                    draws,
+                    &target.view_proj,
+                    COMPOSITE_IDENTITY,
+                    fade,
+                    1.0,
+                    0,
+                    0.0,
+                );
+                pass.set_bind_group(0, section_bg, &[]);
+                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
+                pass.set_vertex_buffer(0, terrain.translucent_vertices.slice(..));
                 pass.set_index_buffer(
-                    batch.template_index_buffer().slice(..),
+                    terrain.translucent_indices.slice(..),
                     wgpu::IndexFormat::Uint32,
                 );
-                pass.draw_indexed(0..batch.index_count, 0, 0..batch.instance_count);
-                instanced_draws += 1;
+                pass.draw_indexed(0..terrain.translucent_index_count, 0, 0..1);
             }
-            // Opaque entities and block entities.
-            if lit_terrain.is_none() {
-                if let Some(mesh) = entity_ber {
-                    pass.set_pipeline(&lit_opaque_pipeline);
+        }
+
+        // Dedicated water pass: decoded world-space stream through
+        // `MEGU_WATER_SURFACE_WGSL` (waves, depth tint, sun/moon
+        // specular via the shadow uniform written above). Encoded
+        // after every opaque stream so the surface depth-tests
+        // against and alpha-blends over submerged water wheels,
+        // shafts, contraptions and entities.
+        if let Some(water) = &self.water {
+            let mut pipeline_set = false;
+            for (coord, section) in &self.live_sections {
+                if self.cull_result.contains(coord) || section.terrain.water_index_count == 0 {
+                    continue;
+                }
+                if !pipeline_set {
+                    pass.set_pipeline(&water.pipeline);
+                    pass.set_bind_group(0, &water.bind_group, &[]);
+                    pipeline_set = true;
+                }
+                pass.set_vertex_buffer(0, section.terrain.water_vertices.slice(..));
+                pass.set_index_buffer(
+                    section.terrain.water_indices.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                pass.draw_indexed(0..section.terrain.water_index_count, 0, 0..1);
+            }
+        }
+    }
+
+    fn record_alpha_subworlds(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        target: &ComposedWorldTarget<'_>,
+        draws: &mut Vec<CompositeDrawUniforms>,
+    ) {
+        // Cloud decks always draw in the alpha stage, even at full opacity.
+        let mut entries = self
+            .subworld_gpu
+            .entries()
+            .filter(|entry| {
+                entry.index_count > 0 && !(entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id))
+            })
+            .peekable();
+        if entries.peek().is_none() {
+            return;
+        }
+        let lit_alpha_pipeline = self.subworld_lit_pipeline(true).clone();
+        pass.set_pipeline(&lit_alpha_pipeline);
+        pass.set_bind_group(0, &self.composite.lit_frame_bg, &[]);
+        for entry in entries {
+            self.record_lit_entry(pass, &target.view_proj, draws, entry, 1.0);
+        }
+    }
+
+    fn record_particles_and_debug_lines(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        view_proj: &Mat4,
+        draws: &mut Vec<CompositeDrawUniforms>,
+    ) {
+        let gpu = &self.composite;
+        let shadow = self.active_shadow_gpu();
+        // GPU-instanced billboards: one indexed draw expands the
+        // static unit quad per staged `ParticleInstance` — the VS
+        // rebuilds each quad's corners from its center + billboard
+        // axes and `lit_fs` blends `color.a` exactly like the old
+        // per-draw uniform alpha did.
+        if let Some(ring) = &self.particle_instances {
+            if ring.count > 0 {
+                if let Some(billboards) = gpu.billboard.as_ref() {
+                    pass.set_pipeline(
+                        shadow
+                            .and_then(|s| s.billboard_color.as_ref())
+                            .unwrap_or(&billboards.pipeline),
+                    );
                     pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    pass.set_bind_group(2, entity_env_bg, &[]);
-                    let off = slot(identity, 1.0, 1.0, 0, 0.0);
+                    pass.set_bind_group(2, &self.particle_env_bg, &[]);
+                    let off = push_lit_draw(draws, view_proj, COMPOSITE_IDENTITY, 1.0, 1.0, 0, 2.0);
                     pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    pass.set_vertex_buffer(0, billboards.quad_vertices.slice(..));
+                    pass.set_vertex_buffer(1, ring.buffer.slice(..));
+                    pass.set_index_buffer(
+                        billboards.quad_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..6, 0, 0..ring.count);
                     pass.set_bind_group(2, &gpu.env_bg, &[]);
                 }
             }
-
-            if !self.title_panorama_active && self.block_break_overlay.is_some() {
-                self.crack_overlay_pass.encode(
-                    &mut pass,
-                    &self.ctx.queue,
-                    view_proj,
-                    self.block_break_overlay,
-                );
-            }
-
-            // Translucent terrain (stained glass) through the
-            // alpha-blended composite variant. Short-circuit before
-            // `set_pipeline` when nothing in the world can draw here.
-            let any_translucent = scene
-                .as_ref()
-                .is_some_and(|s| s.translucent_index_count > 0)
-                || live_sections
-                    .values()
-                    .any(|s| s.terrain.translucent_index_count > 0);
-            if any_translucent {
-                pass.set_pipeline(&gpu.terrain_alpha_pipeline);
-            }
-            if let Some(scene) = scene {
-                if scene.translucent_index_count > 0 {
-                    let off = slot(identity, 1.0, 1.0, 0, 0.0);
-                    pass.set_bind_group(0, frame_bind_group, &[]);
-                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                    pass.set_vertex_buffer(0, scene.translucent_vertices.slice(..));
-                    pass.set_index_buffer(
-                        scene.translucent_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..scene.translucent_index_count, 0, 0..1);
-                }
-            }
-            if any_translucent {
-                for (coord, section) in live_sections.iter() {
-                    if culled_sections.contains(coord)
-                        || section.terrain.translucent_index_count == 0
-                    {
-                        continue;
-                    }
-                    let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                    let off = slot(identity, fade, 1.0, 0, 0.0);
-                    pass.set_bind_group(0, &section.bind_group, &[]);
-                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                    pass.set_vertex_buffer(0, section.terrain.translucent_vertices.slice(..));
-                    pass.set_index_buffer(
-                        section.terrain.translucent_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..section.terrain.translucent_index_count, 0, 0..1);
-                }
-            }
-
-            // Dedicated water pass: decoded world-space stream through
-            // `MEGU_WATER_SURFACE_WGSL` (waves, depth tint, sun/moon
-            // specular via the shadow uniform written above). Encoded
-            // after every opaque stream so the surface depth-tests
-            // against and alpha-blends over submerged water wheels,
-            // shafts, contraptions and entities.
-            if let Some(water) = water {
-                let mut pipeline_set = false;
-                for (coord, section) in live_sections.iter() {
-                    if culled_sections.contains(coord) || section.terrain.water_index_count == 0 {
-                        continue;
-                    }
-                    if !pipeline_set {
-                        pass.set_pipeline(&water.pipeline);
-                        pass.set_bind_group(0, &water.bind_group, &[]);
-                        pipeline_set = true;
-                    }
-                    pass.set_vertex_buffer(0, section.terrain.water_vertices.slice(..));
-                    pass.set_index_buffer(
-                        section.terrain.water_indices.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    pass.draw_indexed(0..section.terrain.water_index_count, 0, 0..1);
-                }
-            }
-
-            // Alpha-blended sub-world entries (cloud shells, glass
-            // contraptions) — the last world geometry, over water.
-            // Cloud decks are *always* alpha draws: the opaque loop
-            // above skips them unconditionally, so a hybrid deck whose
-            // spec alpha reads ~1.0 must still land here or it would
-            // never draw.
-            let mut drew_alpha = false;
-            for entry in subworld_gpu.entries() {
-                if entry.index_count == 0
-                    || (entry.alpha >= 0.999 && !is_cloud_subworld_id(entry.id))
-                {
-                    continue;
-                }
-                if !drew_alpha {
-                    pass.set_pipeline(&lit_alpha_pipeline);
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_alpha = true;
-                }
-                let model = entry.transform.model_matrix();
-                let off = slot(model, 1.0, entry.alpha, entry.world_light, 0.0);
+        }
+        let particles = &self.particles;
+        if let Some(mesh) = particles {
+            pass.set_pipeline(self.subworld_lit_pipeline(true));
+            pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+            pass.set_bind_group(2, &self.particle_env_bg, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            for (i, &alpha) in self.particle_alphas.iter().enumerate() {
+                let off = push_lit_draw(draws, view_proj, COMPOSITE_IDENTITY, 1.0, alpha, 0, 2.0);
                 pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
+                pass.draw_indexed((i as u32 * 6)..((i as u32 + 1) * 6), 0, 0..1);
             }
-
-            // Translucent shaped terrain (rare non-cube translucent blocks)
-            // uses the same explicit UVs and the regular lit alpha pipeline.
-            let mut drew_shaped_alpha = false;
-            for entry in shaped_terrain_gpu.entries() {
-                if entry.index_count == 0 || entry.alpha >= 0.999 {
-                    continue;
-                }
-                let coord = shaped_entry_coord(entry);
-                if culled_sections.contains(&coord) {
-                    continue;
-                }
-                if !drew_shaped_alpha {
-                    pass.set_pipeline(&shaped_lit_alpha_pipeline);
-                    pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                    drew_shaped_alpha = true;
-                }
-                let model = entry.transform.model_matrix();
-                let fade = chunk_fades.fade_alpha(coord.0, coord.2);
-                let off = slot(model, fade, entry.alpha, entry.world_light, 0.0);
-                pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                pass.set_vertex_buffer(0, entry.vertex_buffer().slice(..));
-                pass.set_index_buffer(entry.index_buffer().slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..entry.index_count, 0, 0..1);
-            }
-
-            // GPU-instanced billboards: one indexed draw expands the
-            // static unit quad per staged `ParticleInstance` — the VS
-            // rebuilds each quad's corners from its center + billboard
-            // axes and `lit_fs` blends `color.a` exactly like the old
-            // per-draw uniform alpha did.
-            if let Some(ring) = particle_instances {
-                if ring.count > 0 {
-                    if let Some(billboards) = gpu.billboard.as_ref() {
-                        pass.set_pipeline(
-                            shadow
-                                .and_then(|s| s.billboard_color.as_ref())
-                                .unwrap_or(&billboards.pipeline),
-                        );
-                        pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                        pass.set_bind_group(2, particle_env_bg, &[]);
-                        let off = slot(identity, 1.0, 1.0, 0, 2.0);
-                        pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                        pass.set_vertex_buffer(0, billboards.quad_vertices.slice(..));
-                        pass.set_vertex_buffer(1, ring.buffer.slice(..));
-                        pass.set_index_buffer(
-                            billboards.quad_indices.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        pass.draw_indexed(0..6, 0, 0..ring.count);
-                        pass.set_bind_group(2, &gpu.env_bg, &[]);
-                    }
-                }
-            }
-            if let Some(mesh) = particles {
-                pass.set_pipeline(&lit_alpha_pipeline);
-                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                pass.set_bind_group(2, particle_env_bg, &[]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                for (i, &alpha) in particle_alphas.iter().enumerate() {
-                    let off = slot(identity, 1.0, alpha, 0, 2.0);
-                    pass.set_bind_group(1, &gpu.draw_bg, &[off]);
-                    pass.draw_indexed((i as u32 * 6)..((i as u32 + 1) * 6), 0, 0..1);
-                }
-                pass.set_bind_group(2, &gpu.env_bg, &[]);
-            }
-
-            if let Some((buffer, count)) = debug_lines {
-                pass.set_pipeline(debug_line_pipeline);
-                pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
-                pass.set_vertex_buffer(0, buffer.slice(..));
-                pass.draw(0..*count, 0..1);
-            }
+            pass.set_bind_group(2, &gpu.env_bg, &[]);
         }
 
+        let debug_lines = &self.debug_lines;
+        if let Some((buffer, count)) = debug_lines {
+            pass.set_pipeline(&self.debug_line_pipeline);
+            pass.set_bind_group(0, &gpu.lit_frame_bg, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(0..*count, 0..1);
+        }
+    }
+
+    fn encode_composed_post_world(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &ComposedWorldTarget<'_>,
+    ) {
+        let ComposedWorldTarget {
+            view,
+            size: (width, height),
+            ..
+        } = *target;
+        let depth_view = self.depth_view.as_ref().expect("depth ensured");
         if !self.title_panorama_active {
             let aspect = width.max(1) as f32 / height.max(1) as f32;
-            let env_frame = self.celestial_weather_frame(&camera, aspect, world_time_ticks);
+            let env_frame =
+                self.celestial_weather_frame(&target.camera, aspect, target.world_time_ticks);
             self.celestial_weather_pass
                 .encode(encoder, view, depth_view, &env_frame);
             if self.first_person_viewmodel.visible {
@@ -16096,32 +16039,6 @@ impl GpuRenderer {
                 );
             }
         }
-        // H6: the indirect frame's `runs` buffer goes straight back into
-        // the retained scratch — the next camera-crossing miss refills
-        // the same allocation instead of dropping it and reallocating.
-        if let Some(frame) = gpu_indirect {
-            self.gpu_indirect_run_scratch = frame.runs;
-        }
-        // GPU Hi-Z: build next frame's occlusion pyramid from this
-        // frame's depth in the same encoder — the build's compute
-        // dispatches order after the render pass on the queue (an active
-        // culler already forced `depth_store_op` to Store, so the
-        // attachment is intact to read).
-        if self.gpu_hiz.is_some() {
-            self.encode_gpu_hiz_build(encoder);
-            self.gpu_hiz_frame_vp = Some(view_proj);
-        }
-        self.direction_buckets_skipped += skipped_buckets;
-        self.region_arena_draws += arena_draws;
-        self.instanced_kinetic_draws = instanced_draws;
-        // One bind group per emitting region replaces one per emitting
-        // section; the difference is real `set_bind_group` traffic saved.
-        self.bind_group_switches_saved += arena_sections.saturating_sub(arena_regions) as u64;
-        // Upload the recorded draw uniforms ahead of this frame's submit.
-        let gpu = &self.composite;
-        self.ctx
-            .queue
-            .write_buffer(&gpu.draw_ubo, 0, bytemuck::cast_slice(&gpu.draw_scratch));
     }
 
     /// Render a full composed frame offscreen and read the pixels back:
@@ -16260,59 +16177,7 @@ impl GpuRenderer {
             }
         }
         self.encode_gameplay_screen_overlay(&mut encoder, &native_view, width, height);
-        // UI overlay at native resolution: tessellated GPU quads when
-        // `update_ui_mesh` installed a mesh, else the legacy CPU-blit.
-        // The `MEGU EDITION` title branding draws in the same pass.
-        let mut drew_quad_ui = false;
-        if self.ui_quad.index_count > 0 || self.title_branding_pending() {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ui-overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &native_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            if self.ui_quad.index_count > 0 {
-                self.draw_ui_quads(&mut pass);
-                drew_quad_ui = true;
-            }
-            if self.title_branding_pending() {
-                self.draw_title_branding(&mut pass);
-                self.title_branding_frames += 1;
-            }
-        } else if let Some(ui_bind_group) = &self.ui_bind_group {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("ui-overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &native_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.ui_pipeline);
-            pass.set_bind_group(0, ui_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        if drew_quad_ui {
-            self.ui_gpu_quad_frames += 1;
-        }
+        self.record_ui_overlay(&mut encoder, &native_view);
 
         let padded_bpr = crate::aligned_copy_bytes_per_row(width);
         let buffer = self.ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -16539,6 +16404,29 @@ mod tests {
     /// an unchanged bucket capacity across an identical-output re-run is
     /// a bit-exact zero-allocation proof (a `HashSet` never relinquishes
     /// buckets without growing).
+    #[test]
+    fn region_order_retains_capacity_and_stable_distance_ties() {
+        let origins: Vec<_> = (-8..8)
+            .flat_map(|x| (-8..8).map(move |z| [x * 8, 0, z * 8]))
+            .collect();
+        let mut order = Vec::new();
+        let mut expected = origins.clone();
+        let camera = [0.0, 32.0, 0.0];
+        sort_regions_front_to_back(&mut expected, camera);
+        order_regions(&mut order, origins.iter().copied(), camera);
+        assert!(order.iter().map(|&(_, origin)| origin).eq(expected));
+        let initial_buffer = order.as_ptr();
+        let initial_capacity = order.capacity();
+
+        let moved_camera = [128.0, 32.0, 128.0];
+        let mut expected = origins.clone();
+        sort_regions_front_to_back(&mut expected, moved_camera);
+        order_regions(&mut order, origins.into_iter(), moved_camera);
+        assert_eq!(order.as_ptr(), initial_buffer);
+        assert_eq!(order.capacity(), initial_capacity);
+        assert!(order.iter().map(|&(_, origin)| origin).eq(expected));
+    }
+
     #[test]
     fn emitted_section_count_reuses_scratch_set_across_frames() {
         let camera = [8.0, 40.0, 8.0];
